@@ -1,0 +1,380 @@
+{
+  "tool": "obc-bench",
+  "version": "0.1.0",
+  "environment": {
+    "unix_time_s": 1794055830,
+    "date_utc": "2026-11-07T12:50:30Z",
+    "gstreamer": "GStreamer 1.28.8",
+    "kernel": "7.2.15-1-omarchy",
+    "cpu_model": "Intel(R) Core(TM) Ultra 9 275HX",
+    "online_cpus": 24
+  },
+  "config": {
+    "camera": {
+      "path": "/dev/video4",
+      "card": "MX Brio",
+      "driver": "uvcvideo",
+      "usb": {
+        "vendor": 1133,
+        "product": 2372
+      },
+      "caps": 69206017,
+      "capture": true,
+      "loopback": false,
+      "source": "device_monitor"
+    },
+    "sink": {
+      "path": "/dev/video10",
+      "card": "NVbroadcast",
+      "driver": "v4l2 loopback",
+      "usb": null,
+      "caps": null,
+      "capture": false,
+      "loopback": true,
+      "source": "sysfs"
+    },
+    "camera_discovery": "DeviceMonitor",
+    "camera_discovery_note": null,
+    "sink_discovery": "sysfs (/sys/class/video4linux/*/name, virtual parent + v4l2loopback attributes)",
+    "camera_controls": {
+      "exposure_dynamic_framerate_before": 1,
+      "exposure_dynamic_framerate_during": 0,
+      "changed_and_restored": {
+        "Ok": null
+      }
+    },
+    "pipeline": {
+      "camera": "/dev/video4",
+      "sink": "/dev/video10",
+      "mode": {
+        "format": "Nv12",
+        "width": 1920,
+        "height": 1080,
+        "fps_num": 60,
+        "fps_den": 1
+      },
+      "gpu_stage": "roundtrip",
+      "output": "Nv12",
+      "queue_buffers": 2,
+      "camera_io_mode": "mmap"
+    },
+    "mode": "NV12:1920x1080@60",
+    "duration_s": 600.0,
+    "warmup_s": 3.0,
+    "consumer": true
+  },
+  "fps": {
+    "target": 60.0,
+    "sink": {
+      "overall": 59.99666666666667,
+      "min_1s": 59.0,
+      "max_1s": 61.0,
+      "windows": 600,
+      "windows_below_target": 0,
+      "frames": 35998
+    },
+    "consumer": {
+      "overall": 59.99666666666667,
+      "min_1s": 59.0,
+      "max_1s": 61.0,
+      "windows": 600,
+      "windows_below_target": 0,
+      "frames": 35998
+    },
+    "camera_src": {
+      "overall": 59.998333333333335,
+      "min_1s": 59.0,
+      "max_1s": 61.0,
+      "windows": 600,
+      "windows_below_target": 0,
+      "frames": 35999
+    },
+    "sink_stalls": 5,
+    "camera_src_stalls": 0,
+    "consumer_stalls": 8,
+    "camera_missing_frames_by_pts": 0,
+    "pipeline_lost_frames": 1,
+    "queue_overruns": 0,
+    "qos_dropped_by_element": {
+      "consumer_src": 1
+    }
+  },
+  "latency": {
+    "method": "Primary: pad probes on the v4l2src src pad and the v4l2sink sink pad stamp each buffer with CLOCK_MONOTONIC, keyed by buffer PTS (unchanged through queue/cudaupload/cudaconvert/cudadownload); added latency = sink-ready time - src-pad time, i.e. the delay our stages add over an app reading the camera directly (which receives the same buffer at the src-pad moment). Sink-ready = after the sink probe maps the buffer readable: cudadownload hands v4l2sink GstCudaMemory-backed buffers and CUDA work is asynchronous, so kernels and the device->host copy complete on first map; the probe's map does exactly the work v4l2sink's own map would do next. added_at_sink_pad_ms (before that map) is reported as a secondary figure and under-states the cost. Via consumer: a bench-only probe writes the PTS into the first 16 luma bytes just before v4l2sink; an in-process consumer pipeline (v4l2src on the loopback ! fakesink) decodes it on arrival on the same clock: camera src pad -> consumer receipt. Limits: excludes sensor exposure and USB transfer (identical for a direct reader, so it cancels); excludes the consumer app's own render/display (no glass-to-glass measurement); the stamp alters 16 luma pixels in bench mode only. gst_latency_query is what elements declare, not a measurement.",
+    "budget_ms": 16.666666,
+    "added_primary_ms": {
+      "count": 35998,
+      "mean": 2.750690392021781,
+      "min": 0.612771,
+      "p50": 2.7333855,
+      "p95": 4.90149435,
+      "p99": 6.06569226,
+      "max": 7.957442
+    },
+    "added_at_sink_pad_ms": {
+      "count": 35998,
+      "mean": 0.5753841730096165,
+      "min": 0.284417,
+      "p50": 0.422572,
+      "p95": 1.4092458,
+      "p99": 1.5375505999999999,
+      "max": 3.042006
+    },
+    "via_consumer_ms": {
+      "count": 35998,
+      "mean": 3.477861012306226,
+      "min": 1.030724,
+      "p50": 3.4387535,
+      "p95": 5.7299375,
+      "p99": 6.81722432,
+      "max": 9.007888
+    },
+    "gst_latency_query": {
+      "live": true,
+      "min_ms": 16.666666,
+      "max_ms": null
+    },
+    "stamp_mean_us": 0.5943646089624858,
+    "stamp_copies": 0
+  },
+  "cpu": {
+    "one_core_pct": 21.82833503303302,
+    "all_cores_pct": 0.9095139597097092,
+    "per_second_one_core_pct": {
+      "count": 600,
+      "mean": 21.828315570256475,
+      "min": 15.997933402960939,
+      "p50": 21.997024902382904,
+      "p95": 27.996417187910644,
+      "p99": 29.996125731296985,
+      "max": 32.995812567418696
+    },
+    "online_cpus": 24,
+    "ticks_per_sec": 100
+  },
+  "gpu": {
+    "source": "NVML (nvmlDeviceGetUtilizationRates / GetMemoryInfo / GetComputeRunningProcesses / GetProcessUtilization), the data behind nvidia-smi dmon",
+    "info": {
+      "index": 0,
+      "name": "NVIDIA GeForce RTX 5080 Laptop GPU",
+      "pci_bus_id": "00000000:01:00.0",
+      "driver_version": "615.78.08",
+      "memory_total_bytes": 17094934528
+    },
+    "baseline": {
+      "samples": 3,
+      "util_gpu_pct": {
+        "count": 3,
+        "mean": 84.66666666666667,
+        "min": 83.0,
+        "p50": 84.0,
+        "p95": 86.7,
+        "p99": 86.94,
+        "max": 87.0
+      },
+      "util_mem_pct": {
+        "count": 3,
+        "mean": 24.333333333333332,
+        "min": 24.0,
+        "p50": 24.0,
+        "p95": 24.9,
+        "p99": 24.98,
+        "max": 25.0
+      },
+      "mem_used_mib": {
+        "count": 3,
+        "mean": 3774.375,
+        "min": 3774.375,
+        "p50": 3774.375,
+        "p95": 3774.375,
+        "p99": 3774.375,
+        "max": 3774.375
+      },
+      "proc_mem_mib": null,
+      "proc_sm_pct": null
+    },
+    "running": {
+      "samples": 600,
+      "util_gpu_pct": {
+        "count": 600,
+        "mean": 91.09833333333333,
+        "min": 38.0,
+        "p50": 91.0,
+        "p95": 100.0,
+        "p99": 100.0,
+        "max": 100.0
+      },
+      "util_mem_pct": {
+        "count": 600,
+        "mean": 24.688333333333333,
+        "min": 12.0,
+        "p50": 25.0,
+        "p95": 26.0,
+        "p99": 26.00999999999999,
+        "max": 27.0
+      },
+      "mem_used_mib": {
+        "count": 600,
+        "mean": 4002.4375,
+        "min": 4002.4375,
+        "p50": 4002.4375,
+        "p95": 4002.4375,
+        "p99": 4002.4375,
+        "max": 4002.4375
+      },
+      "proc_mem_mib": {
+        "count": 600,
+        "mean": 220.0,
+        "min": 220.0,
+        "p50": 220.0,
+        "p95": 220.0,
+        "p99": 220.0,
+        "max": 220.0
+      },
+      "proc_sm_pct": {
+        "count": 91,
+        "mean": 39.53846153846154,
+        "min": 10.0,
+        "p50": 36.0,
+        "p95": 88.0,
+        "p99": 92.0,
+        "max": 92.0
+      }
+    },
+    "other_gpu_pids": [
+      1591,
+      2805542,
+      2805730
+    ],
+    "nvml_shutdown": {
+      "Ok": null
+    }
+  },
+  "caps": {
+    "cuda_memory_between_upload_and_download": true,
+    "sink_buffer_memory": "GstCudaPoolAllocator (gst.cuda.memory)",
+    "links": [
+      {
+        "from": "camera:src",
+        "to": "camera_caps:sink",
+        "caps": "video/x-raw, format=(string)NV12, width=(int)1920, height=(int)1080, framerate=(fraction)60/1, pixel-aspect-ratio=(fraction)1/1, interlace-mode=(string)progressive, colorimetry=(string)2:4:5:1",
+        "cuda_memory": false
+      },
+      {
+        "from": "camera_caps:src",
+        "to": "queue:sink",
+        "caps": "video/x-raw, format=(string)NV12, width=(int)1920, height=(int)1080, framerate=(fraction)60/1, pixel-aspect-ratio=(fraction)1/1, interlace-mode=(string)progressive, colorimetry=(string)2:4:5:1",
+        "cuda_memory": false
+      },
+      {
+        "from": "queue:src",
+        "to": "upload:sink",
+        "caps": "video/x-raw, format=(string)NV12, width=(int)1920, height=(int)1080, framerate=(fraction)60/1, pixel-aspect-ratio=(fraction)1/1, interlace-mode=(string)progressive, colorimetry=(string)2:4:5:1",
+        "cuda_memory": false
+      },
+      {
+        "from": "upload:src",
+        "to": "cuda_caps:sink",
+        "caps": "video/x-raw(memory:CUDAMemory), format=(string)NV12, width=(int)1920, height=(int)1080, framerate=(fraction)60/1, pixel-aspect-ratio=(fraction)1/1, interlace-mode=(string)progressive, colorimetry=(string)2:4:5:1",
+        "cuda_memory": true
+      },
+      {
+        "from": "cuda_caps:src",
+        "to": "to_bgr:sink",
+        "caps": "video/x-raw(memory:CUDAMemory), format=(string)NV12, width=(int)1920, height=(int)1080, framerate=(fraction)60/1, pixel-aspect-ratio=(fraction)1/1, interlace-mode=(string)progressive, colorimetry=(string)2:4:5:1",
+        "cuda_memory": true
+      },
+      {
+        "from": "to_bgr:src",
+        "to": "bgr_caps:sink",
+        "caps": "video/x-raw(memory:CUDAMemory), width=(int)1920, height=(int)1080, framerate=(fraction)60/1, pixel-aspect-ratio=(fraction)1/1, interlace-mode=(string)progressive, format=(string)BGR, colorimetry=(string)1:1:5:1",
+        "cuda_memory": true
+      },
+      {
+        "from": "bgr_caps:src",
+        "to": "to_out:sink",
+        "caps": "video/x-raw(memory:CUDAMemory), width=(int)1920, height=(int)1080, framerate=(fraction)60/1, pixel-aspect-ratio=(fraction)1/1, interlace-mode=(string)progressive, format=(string)BGR, colorimetry=(string)1:1:5:1",
+        "cuda_memory": true
+      },
+      {
+        "from": "to_out:src",
+        "to": "out_cuda_caps:sink",
+        "caps": "video/x-raw(memory:CUDAMemory), width=(int)1920, height=(int)1080, framerate=(fraction)60/1, pixel-aspect-ratio=(fraction)1/1, interlace-mode=(string)progressive, format=(string)NV12, colorimetry=(string)2:4:7:1",
+        "cuda_memory": true
+      },
+      {
+        "from": "out_cuda_caps:src",
+        "to": "download:sink",
+        "caps": "video/x-raw(memory:CUDAMemory), width=(int)1920, height=(int)1080, framerate=(fraction)60/1, pixel-aspect-ratio=(fraction)1/1, interlace-mode=(string)progressive, format=(string)NV12, colorimetry=(string)2:4:7:1",
+        "cuda_memory": true
+      },
+      {
+        "from": "download:src",
+        "to": "out_caps:sink",
+        "caps": "video/x-raw, width=(int)1920, height=(int)1080, framerate=(fraction)60/1, pixel-aspect-ratio=(fraction)1/1, interlace-mode=(string)progressive, format=(string)NV12, colorimetry=(string)2:4:7:1",
+        "cuda_memory": false
+      },
+      {
+        "from": "out_caps:src",
+        "to": "loopback:sink",
+        "caps": "video/x-raw, width=(int)1920, height=(int)1080, framerate=(fraction)60/1, pixel-aspect-ratio=(fraction)1/1, interlace-mode=(string)progressive, format=(string)NV12, colorimetry=(string)2:4:7:1",
+        "cuda_memory": false
+      }
+    ],
+    "consumer_links": [
+      {
+        "from": "consumer_src:src",
+        "to": "consumer_caps:sink",
+        "caps": "video/x-raw, format=(string)NV12, width=(int)1920, height=(int)1080, pixel-aspect-ratio=(fraction)1/1, framerate=(fraction)60/1, interlace-mode=(string)progressive, colorimetry=(string)2:4:7:1",
+        "cuda_memory": false
+      },
+      {
+        "from": "consumer_caps:src",
+        "to": "consumer_sink:sink",
+        "caps": "video/x-raw, format=(string)NV12, width=(int)1920, height=(int)1080, pixel-aspect-ratio=(fraction)1/1, framerate=(fraction)60/1, interlace-mode=(string)progressive, colorimetry=(string)2:4:7:1",
+        "cuda_memory": false
+      }
+    ]
+  },
+  "totals": {
+    "src_buffers": 36173,
+    "sink_buffers": 36173,
+    "consumer_buffers": 36174,
+    "src_without_pts": 0,
+    "sink_unmatched": 0,
+    "consumer_unstamped": 0,
+    "consumer_unmatched": 1,
+    "stamps_written": 36173,
+    "stamp_copies": 0,
+    "stamp_time_ns_total": 21499951
+  },
+  "warnings": [],
+  "teardown": {
+    "main_pipeline_null": {
+      "Ok": null
+    },
+    "consumer_pipeline_null": {
+      "Ok": null
+    },
+    "nvidia_fds_after_teardown": [
+      "fd 25 -> /dev/nvidiactl",
+      "fd 26 -> /dev/nvidia-uvm",
+      "fd 27 -> /dev/nvidia-uvm",
+      "fd 28 -> /dev/nvidia0",
+      "fd 29 -> /dev/nvidia0",
+      "fd 30 -> /dev/nvidia0",
+      "fd 31 -> /dev/nvidia0"
+    ],
+    "libcuda_mapped_after_teardown": true,
+    "note": "GStreamer destroys its CUDA context when the pipeline reaches NULL; remaining /dev/nvidia* fds (if any) are the CUDA driver's process-wide handles from cuInit, released only at process exit",
+    "dgpu_runtime_status_after_teardown": "active",
+    "linger_s": 5.0
+  },
+  "criteria": {
+    "fps_sustained": true,
+    "no_pipeline_drops": false,
+    "added_latency_p95_within_one_frame": true,
+    "added_latency_p99_within_one_frame": true,
+    "cuda_memory_links": true
+  }
+}

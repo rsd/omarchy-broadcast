@@ -1,0 +1,22 @@
+# Rust build output
+/target/
+
+# NVIDIA Maxine: the SDK, runtime and models are never vendored (see
+# docs/adr/0003-maxine-first-behind-backend-seam.md and docs/setup/maxine.md).
+# Users install them under $MAXINE_VFX_ROOT (default ~/.local/opt/maxine/VideoFX);
+# nothing of it may land in this repository, and no negation rule may override this block.
+VideoFX/
+**/VideoFX/
+*.trtpkg
+*.engine
+models/
+**/models/
+.ngc/
+ngc-cli/
+*maxine*.tar*
+*maxine*.zip
+*VFX*.tar*
+*VFX*.zip
+*vfx_sdk*
+nvVideoEffects*.tar*
+*.run
