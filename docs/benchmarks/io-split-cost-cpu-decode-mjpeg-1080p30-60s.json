@@ -1,0 +1,538 @@
+{
+  "tool": "obc-bench",
+  "version": "0.1.0",
+  "environment": {
+    "unix_time_s": 1794080771,
+    "date_utc": "2026-11-07T19:46:11Z",
+    "gstreamer": "GStreamer 1.28.8",
+    "kernel": "7.2.15-1-omarchy",
+    "cpu_model": "Intel(R) Core(TM) Ultra 9 275HX",
+    "online_cpus": 24
+  },
+  "config": {
+    "cameras": [
+      {
+        "camera": {
+          "path": "/dev/video0",
+          "card": "FHD Camera: FHD Camera",
+          "driver": "uvcvideo",
+          "usb": {
+            "vendor": 22918,
+            "product": 4499
+          },
+          "caps": 69206017,
+          "capture": true,
+          "loopback": false,
+          "source": "device_monitor"
+        },
+        "how": "selected by --camera usb 5986:1193",
+        "mode": "MJPEG:1920x1080@30",
+        "mode_exact": true,
+        "mode_differences": [],
+        "ingest": "cpu-decode"
+      },
+      {
+        "camera": {
+          "path": "/dev/video4",
+          "card": "MX Brio",
+          "driver": "uvcvideo",
+          "usb": {
+            "vendor": 1133,
+            "product": 2372
+          },
+          "caps": 69206017,
+          "capture": true,
+          "loopback": false,
+          "source": "device_monitor"
+        },
+        "how": "discovered (next in the switching cycle)",
+        "mode": "MJPEG:1920x1080@30",
+        "mode_exact": true,
+        "mode_differences": [],
+        "ingest": "cpu-decode"
+      }
+    ],
+    "sink": {
+      "path": "/dev/video11",
+      "card": "Omarchy Broadcast",
+      "driver": "v4l2 loopback",
+      "usb": null,
+      "caps": null,
+      "capture": false,
+      "loopback": true,
+      "source": "sysfs"
+    },
+    "camera_discovery": "DeviceMonitor",
+    "camera_discovery_note": null,
+    "sink_discovery": "sysfs (/sys/class/video4linux/*/name, virtual parent + v4l2loopback attributes)",
+    "camera_auto_picked": false,
+    "requested_mode": "MJPEG:1920x1080@30",
+    "output": {
+      "format": "Nv12",
+      "width": 1920,
+      "height": 1080,
+      "fps_num": 30,
+      "fps_den": 1,
+      "range": "limited"
+    },
+    "output_caps": "video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1,colorimetry=2:4:5:4",
+    "aspect": "crop",
+    "process": "passthrough",
+    "input_gap_ms": 500,
+    "queue_buffers": 2,
+    "camera_io_mode": "mmap",
+    "camera_fixed_framerate": true,
+    "switch_every_s": null,
+    "streaming": false,
+    "duration_s": 60.0,
+    "measured_s": 60.0,
+    "interrupted": false,
+    "warmup_s": 3.0,
+    "consumer": true,
+    "consumer_stamp": true
+  },
+  "fps": {
+    "target": 30.0,
+    "output": {
+      "overall": 30.0,
+      "min_1s": 30.0,
+      "max_1s": 30.0,
+      "windows": 60,
+      "windows_below_target": 0,
+      "frames": 1800
+    },
+    "consumer": {
+      "overall": 30.0,
+      "min_1s": 30.0,
+      "max_1s": 30.0,
+      "windows": 60,
+      "windows_below_target": 0,
+      "frames": 1800
+    },
+    "output_grid": {
+      "windows": 59,
+      "windows_off_grid": 0,
+      "min_1s": 30,
+      "max_1s": 30,
+      "frames": 1800,
+      "expected_frames": 1800.0,
+      "exact": true
+    },
+    "consumer_grid": {
+      "windows": 59,
+      "windows_off_grid": 0,
+      "min_1s": 30,
+      "max_1s": 30,
+      "frames": 1800,
+      "expected_frames": 1800.0,
+      "exact": true
+    },
+    "output_stalls": 0,
+    "consumer_stalls": 0,
+    "inputs": [
+      {
+        "source_id": 1,
+        "camera": "FHD Camera: FHD Camera (/dev/video0)",
+        "mode": "MJPEG:1920x1080@30",
+        "ingest": "cpu-decode",
+        "span_s": 59.969695355,
+        "fps": {
+          "overall": 29.981809801708305,
+          "min_1s": 29.0,
+          "max_1s": 30.0,
+          "windows": 59,
+          "windows_below_target": 0,
+          "frames": 1798
+        },
+        "missing_frames_by_pts": 0,
+        "stalls": 0
+      }
+    ]
+  },
+  "frames": {
+    "output": {
+      "input_frames": 1799,
+      "fresh": 1767,
+      "repeat": 33,
+      "placeholder": 0,
+      "superseded": 32,
+      "late": 0,
+      "skipped": 0,
+      "emitted": 1800,
+      "queue_dropped": 0,
+      "push_failed": 0
+    },
+    "camera_src_frames": 1798,
+    "ingest_lost_frames": -1,
+    "queue_overruns": 0,
+    "qos_dropped_by_element": {
+      "FHD Camera: FHD Camera (/dev/video0)/camera": 1
+    },
+    "decoder_dropped_frames": 0
+  },
+  "switches": {
+    "initial_start_ms": 363.083937,
+    "count": 0,
+    "completed": 0,
+    "failed": 0,
+    "abandoned_at_end": 0,
+    "gap_ms": null,
+    "repeats_during_gaps": 0,
+    "placeholders_during_gaps": 0,
+    "whole_run_switches": 0,
+    "abandoned": 0,
+    "records": [
+      {
+        "from": null,
+        "to": "FHD Camera: FHD Camera (/dev/video0)",
+        "trigger": "start",
+        "source_id": 1,
+        "requested_at_s": -3.401721703,
+        "gap_ms": 363.083937,
+        "repeats": 0,
+        "placeholders": 10,
+        "previous_fresh": 0,
+        "error": null,
+        "abandoned": false
+      }
+    ]
+  },
+  "latency": {
+    "method": "Primary: a pad probe on each ingest pipeline's v4l2src src pad stamps every camera buffer with CLOCK_MONOTONIC, keyed by (source, camera PTS); the PTS is unchanged through the ingest pipeline into the latest-frame slot. The output clock's emit observer reports every tick: its output PTS (tick x period), whether it emitted a fresh frame, a repeat or a placeholder, and the frame's source and camera PTS; a bounded side table maps the output PTS to that emission and to the fresh frame's camera src-pad time. A pad probe on the output's v4l2sink sink pad joins the buffer by output PTS. Added latency = sink-ready time - camera src-pad time, fresh frames only: the delay our stages add over an app reading the camera directly, including the wait for the next output tick (0 to 1 output period). Sink-ready = after the sink probe maps the buffer readable: cudadownload hands v4l2sink GstCudaMemory-backed buffers and CUDA work is asynchronous, so kernels and the device->host copy complete on first map; the probe's map does exactly the work v4l2sink's own map would do next. added_at_sink_pad_ms (before that map) is a secondary figure and under-states the cost. Output fps counts every buffer at the v4l2sink sink pad by arrival time, in 1 s windows. Via consumer (measured runs only): a bench-only probe writes the output PTS into the first 16 luma bytes just before v4l2sink; an in-process consumer pipeline (v4l2src on the loopback ! fakesink) decodes it on arrival on the same clock: camera src pad -> consumer receipt, fresh frames only. Limits: excludes sensor exposure and USB transfer (identical for a direct reader, so it cancels); excludes the consumer app's own render/display (no glass-to-glass measurement); the stamp alters 16 luma pixels in measured runs only. gst_latency_query is what elements declare, not a measurement.",
+    "output_period_ms": 33.333333,
+    "budget_ms": 66.666666,
+    "added_primary_ms": {
+      "count": 1767,
+      "mean": 23.197345181097923,
+      "min": 7.390681,
+      "p50": 23.375421,
+      "p95": 36.680049,
+      "p99": 39.207099379999995,
+      "max": 40.721299
+    },
+    "added_at_sink_pad_ms": {
+      "count": 1767,
+      "mean": 23.19707105149971,
+      "min": 7.390456,
+      "p50": 23.374984,
+      "p95": 36.679818,
+      "p99": 39.20679814,
+      "max": 40.721057
+    },
+    "via_consumer_ms": {
+      "count": 1767,
+      "mean": 24.026394899264314,
+      "min": 7.969153,
+      "p50": 24.229999,
+      "p95": 37.4969011,
+      "p99": 39.89798932,
+      "max": 41.445154
+    },
+    "gst_latency_query": {
+      "live": true,
+      "min_ms": 0.0,
+      "max_ms": 0.0
+    },
+    "stamp_mean_us": 0.661593273778245,
+    "stamp_buffer_copies": 0,
+    "stamp_memory_copies": 0
+  },
+  "cpu": {
+    "one_core_pct": 22.816707311208233,
+    "all_cores_pct": 0.9506961379670097,
+    "per_second_one_core_pct": {
+      "count": 60,
+      "mean": 22.8167468886325,
+      "min": 19.997988942238003,
+      "p50": 22.999650773365808,
+      "p95": 24.998411275214213,
+      "p99": 25.00125448703855,
+      "max": 25.00274015030403
+    },
+    "online_cpus": 24,
+    "ticks_per_sec": 100
+  },
+  "gpu": {
+    "source": "NVML (nvmlDeviceGetUtilizationRates / GetMemoryInfo / GetComputeRunningProcesses / GetProcessUtilization), the data behind nvidia-smi dmon",
+    "info": {
+      "index": 0,
+      "name": "NVIDIA GeForce RTX 5080 Laptop GPU",
+      "pci_bus_id": "00000000:01:00.0",
+      "driver_version": "615.78.08",
+      "memory_total_bytes": 17094934528
+    },
+    "baseline": {
+      "samples": 3,
+      "util_gpu_pct": {
+        "count": 3,
+        "mean": 15.333333333333334,
+        "min": 15.0,
+        "p50": 15.0,
+        "p95": 15.9,
+        "p99": 15.98,
+        "max": 16.0
+      },
+      "util_mem_pct": {
+        "count": 3,
+        "mean": 1.0,
+        "min": 1.0,
+        "p50": 1.0,
+        "p95": 1.0,
+        "p99": 1.0,
+        "max": 1.0
+      },
+      "mem_used_mib": {
+        "count": 3,
+        "mean": 173.625,
+        "min": 173.625,
+        "p50": 173.625,
+        "p95": 173.625,
+        "p99": 173.625,
+        "max": 173.625
+      },
+      "proc_mem_mib": null,
+      "proc_sm_pct": null
+    },
+    "running": {
+      "samples": 60,
+      "util_gpu_pct": {
+        "count": 60,
+        "mean": 16.533333333333335,
+        "min": 16.0,
+        "p50": 17.0,
+        "p95": 17.0,
+        "p99": 17.0,
+        "max": 17.0
+      },
+      "util_mem_pct": {
+        "count": 60,
+        "mean": 1.0,
+        "min": 1.0,
+        "p50": 1.0,
+        "p95": 1.0,
+        "p99": 1.0,
+        "max": 1.0
+      },
+      "mem_used_mib": {
+        "count": 60,
+        "mean": 395.6875,
+        "min": 395.6875,
+        "p50": 395.6875,
+        "p95": 395.6875,
+        "p99": 395.6875,
+        "max": 395.6875
+      },
+      "proc_mem_mib": {
+        "count": 60,
+        "mean": 214.0,
+        "min": 214.0,
+        "p50": 214.0,
+        "p95": 214.0,
+        "p99": 214.0,
+        "max": 214.0
+      },
+      "proc_sm_pct": {
+        "count": 20,
+        "mean": 14.65,
+        "min": 4.0,
+        "p50": 16.0,
+        "p95": 17.0,
+        "p99": 17.0,
+        "max": 17.0
+      }
+    },
+    "other_gpu_pids": [
+      1591
+    ],
+    "nvml_shutdown": {
+      "Ok": null
+    }
+  },
+  "caps": {
+    "output_cuda_memory": true,
+    "sink_buffer_memory": "GstAllocatorSysmem",
+    "output_links": [
+      {
+        "from": "frames_src:src",
+        "to": "download:sink",
+        "caps": "video/x-raw(memory:CUDAMemory), format=(string)NV12, width=(int)1920, height=(int)1080, pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)2:4:5:1, framerate=(fraction)30/1",
+        "cuda_memory": true
+      },
+      {
+        "from": "download:src",
+        "to": "download_caps:sink",
+        "caps": "video/x-raw, format=(string)NV12, width=(int)1920, height=(int)1080, pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)2:4:5:1, framerate=(fraction)30/1",
+        "cuda_memory": false
+      },
+      {
+        "from": "download_caps:src",
+        "to": "relabel:sink",
+        "caps": "video/x-raw, format=(string)NV12, width=(int)1920, height=(int)1080, pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)2:4:5:1, framerate=(fraction)30/1",
+        "cuda_memory": false
+      },
+      {
+        "from": "relabel:src",
+        "to": "out_caps:sink",
+        "caps": "video/x-raw, format=(string)NV12, width=(int)1920, height=(int)1080, pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)2:4:5:4, framerate=(fraction)30/1",
+        "cuda_memory": false
+      },
+      {
+        "from": "out_caps:src",
+        "to": "loopback:sink",
+        "caps": "video/x-raw, format=(string)NV12, width=(int)1920, height=(int)1080, pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)2:4:5:4, framerate=(fraction)30/1",
+        "cuda_memory": false
+      }
+    ],
+    "ingest": [
+      {
+        "camera": "FHD Camera: FHD Camera (/dev/video0)",
+        "mode": "MJPEG:1920x1080@30",
+        "ingest": "cpu-decode",
+        "cuda_memory_upload_to_slot": true,
+        "links": [
+          {
+            "from": "camera:src",
+            "to": "camera_caps:sink",
+            "caps": "image/jpeg, width=(int)1920, height=(int)1080, framerate=(fraction)30/1, pixel-aspect-ratio=(fraction)1/1, parsed=(boolean)true, interlace-mode=(string)progressive, colorimetry=(string)2:4:5:1",
+            "cuda_memory": false
+          },
+          {
+            "from": "camera_caps:src",
+            "to": "queue:sink",
+            "caps": "image/jpeg, width=(int)1920, height=(int)1080, framerate=(fraction)30/1, pixel-aspect-ratio=(fraction)1/1, parsed=(boolean)true, interlace-mode=(string)progressive, colorimetry=(string)2:4:5:1",
+            "cuda_memory": false
+          },
+          {
+            "from": "queue:src",
+            "to": "decode:sink",
+            "caps": "image/jpeg, width=(int)1920, height=(int)1080, framerate=(fraction)30/1, pixel-aspect-ratio=(fraction)1/1, parsed=(boolean)true, interlace-mode=(string)progressive, colorimetry=(string)2:4:5:1",
+            "cuda_memory": false
+          },
+          {
+            "from": "decode:src",
+            "to": "ingest_caps:sink",
+            "caps": "video/x-raw, format=(string)I420, width=(int)1920, height=(int)1080, interlace-mode=(string)progressive, multiview-mode=(string)mono, multiview-flags=(GstVideoMultiviewFlagsSet)0:ffffffff:/right-view-first/left-flipped/left-flopped/right-flipped/right-flopped/half-aspect/mixed-mono, pixel-aspect-ratio=(fraction)1/1, chroma-site=(string)jpeg, colorimetry=(string)1:4:0:0, framerate=(fraction)30/1",
+            "cuda_memory": false
+          },
+          {
+            "from": "ingest_caps:src",
+            "to": "upload:sink",
+            "caps": "video/x-raw, format=(string)I420, width=(int)1920, height=(int)1080, interlace-mode=(string)progressive, multiview-mode=(string)mono, multiview-flags=(GstVideoMultiviewFlagsSet)0:ffffffff:/right-view-first/left-flipped/left-flopped/right-flipped/right-flopped/half-aspect/mixed-mono, pixel-aspect-ratio=(fraction)1/1, chroma-site=(string)jpeg, colorimetry=(string)1:4:0:0, framerate=(fraction)30/1",
+            "cuda_memory": false
+          },
+          {
+            "from": "upload:src",
+            "to": "cuda_caps:sink",
+            "caps": "video/x-raw(memory:CUDAMemory), format=(string)I420, width=(int)1920, height=(int)1080, interlace-mode=(string)progressive, multiview-mode=(string)mono, multiview-flags=(GstVideoMultiviewFlagsSet)0:ffffffff:/right-view-first/left-flipped/left-flopped/right-flipped/right-flopped/half-aspect/mixed-mono, pixel-aspect-ratio=(fraction)1/1, chroma-site=(string)jpeg, colorimetry=(string)1:4:0:0, framerate=(fraction)30/1",
+            "cuda_memory": true
+          },
+          {
+            "from": "cuda_caps:src",
+            "to": "crop:sink",
+            "caps": "video/x-raw(memory:CUDAMemory), format=(string)I420, width=(int)1920, height=(int)1080, interlace-mode=(string)progressive, multiview-mode=(string)mono, multiview-flags=(GstVideoMultiviewFlagsSet)0:ffffffff:/right-view-first/left-flipped/left-flopped/right-flipped/right-flopped/half-aspect/mixed-mono, pixel-aspect-ratio=(fraction)1/1, chroma-site=(string)jpeg, colorimetry=(string)1:4:0:0, framerate=(fraction)30/1",
+            "cuda_memory": true
+          },
+          {
+            "from": "crop:src",
+            "to": "scale:sink",
+            "caps": "video/x-raw(memory:CUDAMemory), format=(string)I420, width=(int)1920, height=(int)1080, interlace-mode=(string)progressive, multiview-mode=(string)mono, multiview-flags=(GstVideoMultiviewFlagsSet)0:ffffffff:/right-view-first/left-flipped/left-flopped/right-flipped/right-flopped/half-aspect/mixed-mono, pixel-aspect-ratio=(fraction)1/1, chroma-site=(string)jpeg, colorimetry=(string)1:4:0:0, framerate=(fraction)30/1",
+            "cuda_memory": true
+          },
+          {
+            "from": "scale:src",
+            "to": "canonical_caps:sink",
+            "caps": "video/x-raw(memory:CUDAMemory), width=(int)1920, height=(int)1080, interlace-mode=(string)progressive, multiview-mode=(string)mono, multiview-flags=(GstVideoMultiviewFlagsSet)0:ffffffff:/right-view-first/left-flipped/left-flopped/right-flipped/right-flopped/half-aspect/mixed-mono, pixel-aspect-ratio=(fraction)1/1, framerate=(fraction)30/1, format=(string)NV12, colorimetry=(string)2:4:5:1, chroma-site=(string)jpeg",
+            "cuda_memory": true
+          },
+          {
+            "from": "canonical_caps:src",
+            "to": "frames_sink:sink",
+            "caps": "video/x-raw(memory:CUDAMemory), width=(int)1920, height=(int)1080, interlace-mode=(string)progressive, multiview-mode=(string)mono, multiview-flags=(GstVideoMultiviewFlagsSet)0:ffffffff:/right-view-first/left-flipped/left-flopped/right-flipped/right-flopped/half-aspect/mixed-mono, pixel-aspect-ratio=(fraction)1/1, framerate=(fraction)30/1, format=(string)NV12, colorimetry=(string)2:4:5:1, chroma-site=(string)jpeg",
+            "cuda_memory": true
+          }
+        ]
+      }
+    ],
+    "consumer_links": [
+      {
+        "from": "consumer_src:src",
+        "to": "consumer_caps:sink",
+        "caps": "video/x-raw, format=(string)NV12, width=(int)1920, height=(int)1080, pixel-aspect-ratio=(fraction)1/1, framerate=(fraction)30/1, interlace-mode=(string)progressive, colorimetry=(string)2:4:5:4",
+        "cuda_memory": false
+      },
+      {
+        "from": "consumer_caps:src",
+        "to": "consumer_sink:sink",
+        "caps": "video/x-raw, format=(string)NV12, width=(int)1920, height=(int)1080, pixel-aspect-ratio=(fraction)1/1, framerate=(fraction)30/1, interlace-mode=(string)progressive, colorimetry=(string)2:4:5:4",
+        "cuda_memory": false
+      }
+    ]
+  },
+  "camera_controls": [
+    {
+      "camera": "/dev/video0",
+      "exposure_dynamic_framerate_skipped": null,
+      "exposure_dynamic_framerate_before": 1,
+      "exposure_dynamic_framerate_during": 0,
+      "pinned": true,
+      "read_only": false,
+      "exposure_dynamic_framerate_after_exit": 1,
+      "restored": true
+    }
+  ],
+  "totals": {
+    "src_buffers": 1889,
+    "src_without_pts": 0,
+    "emits": 1903,
+    "emits_not_pushed": 0,
+    "fresh_without_src": 0,
+    "sink_buffers": 1903,
+    "sink_without_pts": 0,
+    "consumer_buffers": 1892,
+    "consumer_unstamped": 0,
+    "consumer_unmatched": 0,
+    "consumer_duplicates": 0,
+    "stamps_written": 1903,
+    "stamp_buffer_copies": 0,
+    "stamp_memory_copies": 0,
+    "stamp_time_ns_total": 1259012,
+    "switches_abandoned": 0
+  },
+  "warnings": [],
+  "warnings_suppressed": 0,
+  "teardown": {
+    "session_stop": {
+      "Ok": null
+    },
+    "consumer_pipeline_null": {
+      "Ok": null
+    },
+    "nvidia_fds_after_teardown": [
+      "fd 21 -> /dev/nvidiactl",
+      "fd 24 -> /dev/nvidia-uvm",
+      "fd 25 -> /dev/nvidia-uvm",
+      "fd 26 -> /dev/nvidia0",
+      "fd 27 -> /dev/nvidia0",
+      "fd 28 -> /dev/nvidia0",
+      "fd 29 -> /dev/nvidia0"
+    ],
+    "libcuda_mapped_after_teardown": true,
+    "note": "GStreamer destroys its CUDA context when the pipelines reach NULL; remaining /dev/nvidia* fds (if any) are the CUDA driver's process-wide handles from cuInit, released only at process exit",
+    "dgpu_runtime_status_after_teardown": "active",
+    "linger_s": 0.0
+  },
+  "criteria": {
+    "run_completed": true,
+    "fps_sustained": true,
+    "no_output_drops": true,
+    "no_skipped_ticks": true,
+    "switches_completed": true,
+    "no_placeholders_outside_switches": true,
+    "no_ingest_errors": true,
+    "inputs_delivered": true,
+    "no_ingest_drops": true,
+    "added_latency_p95_within_budget": true,
+    "added_latency_p99_within_budget": true,
+    "cuda_memory_links": true
+  }
+}

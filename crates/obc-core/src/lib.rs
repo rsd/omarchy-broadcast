@@ -28,6 +28,14 @@ pub enum CoreError {
     InvalidPixelFormat(String),
     #[error("unsupported output format {0:?} (supported: nv12, i420)")]
     InvalidOutputFormat(String),
+    #[error(
+        "invalid output contract {input:?}: {reason} (expected WxH@FPS, e.g. 1920x1080@30 or 1920x1080@30000/1001)"
+    )]
+    InvalidOutputContract { input: String, reason: String },
+    #[error("unsupported colour range {0:?} (supported: limited, full)")]
+    InvalidColourRange(String),
+    #[error("unsupported aspect policy {0:?} (supported: crop, letterbox)")]
+    InvalidAspectPolicy(String),
     #[error("invalid USB id {0:?} (expected vid:pid in hex, e.g. 1234:abcd)")]
     InvalidUsbId(String),
     #[error(
@@ -172,6 +180,202 @@ impl FromStr for OutputFormat {
             "i420" => Ok(OutputFormat::I420),
             _ => Err(CoreError::InvalidOutputFormat(s.to_string())),
         }
+    }
+}
+
+/// Colour range of the frames the output delivers.
+///
+/// Limited range (Y 16..235, chroma 16..240) is what most consumers assume
+/// whatever the caps say; full range (0..255) is available for those that
+/// honour the label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColourRange {
+    #[default]
+    Limited,
+    Full,
+}
+
+impl fmt::Display for ColourRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ColourRange::Limited => "limited",
+            ColourRange::Full => "full",
+        })
+    }
+}
+
+impl FromStr for ColourRange {
+    type Err = CoreError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "limited" => Ok(ColourRange::Limited),
+            "full" => Ok(ColourRange::Full),
+            _ => Err(CoreError::InvalidColourRange(s.to_string())),
+        }
+    }
+}
+
+/// How a source whose aspect ratio differs from the output's is fitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AspectPolicy {
+    /// Centre crop to fill the whole output frame (no borders).
+    #[default]
+    Crop,
+    /// Scale the whole source into the frame and pad it with black borders.
+    Letterbox,
+}
+
+impl fmt::Display for AspectPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            AspectPolicy::Crop => "crop",
+            AspectPolicy::Letterbox => "letterbox",
+        })
+    }
+}
+
+impl FromStr for AspectPolicy {
+    type Err = CoreError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "crop" => Ok(AspectPolicy::Crop),
+            "letterbox" => Ok(AspectPolicy::Letterbox),
+            _ => Err(CoreError::InvalidAspectPolicy(s.to_string())),
+        }
+    }
+}
+
+/// What the output delivers, whatever feeds it: format, size, frame rate and
+/// colour range. Set by configuration and never derived from a source (see
+/// `docs/adr/0009-ingest-process-output.md`).
+///
+/// Parsed from `WxH@FPS` (the format and range keep their defaults; set them
+/// separately). Both dimensions must be even: every output format is 4:2:0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct OutputContract {
+    pub format: OutputFormat,
+    pub width: u32,
+    pub height: u32,
+    pub fps_num: u32,
+    pub fps_den: u32,
+    pub range: ColourRange,
+}
+
+impl Default for OutputContract {
+    /// NV12, 1920x1080 at 30 fps, limited range.
+    fn default() -> Self {
+        OutputContract {
+            format: OutputFormat::Nv12,
+            width: 1920,
+            height: 1080,
+            fps_num: 30,
+            fps_den: 1,
+            range: ColourRange::Limited,
+        }
+    }
+}
+
+impl OutputContract {
+    /// Highest output frame rate accepted, in frames per second.
+    pub const MAX_FPS: u32 = 240;
+    /// Largest output width or height accepted, in pixels (the largest
+    /// frame v4l2loopback accepts).
+    pub const MAX_DIMENSION: u32 = 8192;
+
+    /// Frame rate as a float.
+    pub fn fps(&self) -> f64 {
+        f64::from(self.fps_num) / f64::from(self.fps_den)
+    }
+
+    /// Duration of one output frame in nanoseconds, rounded down (the exact
+    /// value is `1e9 * fps_den / fps_num`; use the fraction for timestamps).
+    pub fn frame_duration_ns(&self) -> u64 {
+        (1_000_000_000u64 * u64::from(self.fps_den)) / u64::from(self.fps_num)
+    }
+
+    /// GStreamer colorimetry label of the output frames: BT.601 matrix (the
+    /// matrix UVC cameras and JPEG use), BT.709 transfer and primaries, and
+    /// the contract's range. Limited is `2:4:5:1`, full is `1:4:5:1`.
+    pub fn colorimetry(&self) -> &'static str {
+        match self.range {
+            ColourRange::Limited => "2:4:5:1",
+            ColourRange::Full => "1:4:5:1",
+        }
+    }
+
+    /// Checks the invariants [`FromStr`] enforces, for contracts built
+    /// field by field: non-zero even size up to [`Self::MAX_DIMENSION`],
+    /// non-zero frame rate up to [`Self::MAX_FPS`].
+    pub fn validate(&self) -> Result<(), CoreError> {
+        let bad = |reason: &str| CoreError::InvalidOutputContract {
+            input: self.to_string(),
+            reason: reason.to_string(),
+        };
+        if self.width == 0 || self.height == 0 {
+            return Err(bad("width and height must be non-zero"));
+        }
+        if self.fps_num == 0 || self.fps_den == 0 {
+            return Err(bad("frame rate must be non-zero"));
+        }
+        if !self.width.is_multiple_of(2) || !self.height.is_multiple_of(2) {
+            return Err(bad("width and height must be even (4:2:0 output)"));
+        }
+        if self.width > Self::MAX_DIMENSION || self.height > Self::MAX_DIMENSION {
+            return Err(bad(&format!(
+                "width and height must be at most {}",
+                Self::MAX_DIMENSION
+            )));
+        }
+        // fps_num / fps_den > MAX_FPS, without overflow.
+        if u64::from(self.fps_num) > u64::from(Self::MAX_FPS) * u64::from(self.fps_den) {
+            return Err(bad(&format!(
+                "frame rate must be at most {} fps",
+                Self::MAX_FPS
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for OutputContract {
+    /// `nv12:1920x1080@30 limited`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:", self.format)?;
+        fmt_size_rate(f, self.width, self.height, self.fps_num, self.fps_den)?;
+        write!(f, " {}", self.range)
+    }
+}
+
+impl FromStr for OutputContract {
+    type Err = CoreError;
+
+    /// Parses `WxH@FPS` (FPS optionally `N/D`) with the default format and
+    /// range.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bad = |reason: &str| CoreError::InvalidOutputContract {
+            input: s.to_string(),
+            reason: reason.to_string(),
+        };
+        let (width, height, fps_num, fps_den) = parse_size_rate(s.trim(), &bad)?;
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(bad("width and height must be even (4:2:0 output)"));
+        }
+        let contract = OutputContract {
+            width,
+            height,
+            fps_num,
+            fps_den,
+            ..OutputContract::default()
+        };
+        contract.validate().map_err(|e| match e {
+            CoreError::InvalidOutputContract { reason, .. } => bad(&reason),
+            other => other,
+        })?;
+        Ok(contract)
     }
 }
 
@@ -660,6 +864,119 @@ mod tests {
         assert!("yuyv".parse::<OutputFormat>().is_err());
         assert_eq!(OutputFormat::I420.gst_name(), "I420");
         assert_eq!(OutputFormat::default(), OutputFormat::Nv12);
+    }
+
+    #[test]
+    fn output_contract_default_and_labels() {
+        let c = OutputContract::default();
+        assert_eq!(
+            (c.format, c.width, c.height, c.fps_num, c.fps_den, c.range),
+            (OutputFormat::Nv12, 1920, 1080, 30, 1, ColourRange::Limited)
+        );
+        assert_eq!(c.colorimetry(), "2:4:5:1");
+        assert_eq!(c.frame_duration_ns(), 33_333_333);
+        assert_eq!(c.to_string(), "nv12:1920x1080@30 limited");
+        let full = OutputContract {
+            range: ColourRange::Full,
+            format: OutputFormat::I420,
+            ..c
+        };
+        assert_eq!(full.colorimetry(), "1:4:5:1");
+        assert_eq!(full.to_string(), "i420:1920x1080@30 full");
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn output_contract_parse() {
+        let c: OutputContract = "1280x720@60".parse().unwrap();
+        assert_eq!(
+            (c.width, c.height, c.fps_num, c.fps_den),
+            (1280, 720, 60, 1)
+        );
+        assert_eq!(c.format, OutputFormat::Nv12);
+        assert_eq!(c.range, ColourRange::Limited);
+        let ntsc: OutputContract = " 1920X1080@30000/1001 ".parse().unwrap();
+        assert_eq!((ntsc.fps_num, ntsc.fps_den), (30000, 1001));
+        assert_eq!(ntsc.frame_duration_ns(), 33_366_666);
+        assert!((ntsc.fps() - 29.97).abs() < 0.001);
+        assert_eq!(ntsc.to_string(), "nv12:1920x1080@30000/1001 limited");
+        for bad in [
+            "",
+            "1920x1080",
+            "1920@30",
+            "0x1080@30",
+            "1920x0@30",
+            "1920x1080@0",
+            "1920x1080@30/0",
+            "1921x1080@30",
+            "1920x1081@30",
+            "NV12:1920x1080@30",
+            "axb@30",
+            "1920x1080@241",
+            "1920x1080@481/2",
+            "8194x1080@30",
+            "1920x8194@30",
+        ] {
+            let e = bad.parse::<OutputContract>();
+            assert!(
+                matches!(e, Err(CoreError::InvalidOutputContract { .. })),
+                "{bad:?} should fail: {e:?}"
+            );
+        }
+        let odd = OutputContract {
+            width: 641,
+            ..OutputContract::default()
+        };
+        assert!(odd.validate().is_err());
+        let zero_rate = OutputContract {
+            fps_num: 0,
+            ..OutputContract::default()
+        };
+        assert!(zero_rate.validate().is_err());
+    }
+
+    #[test]
+    fn output_contract_bounds() {
+        let at = |width, height, fps_num, fps_den| OutputContract {
+            width,
+            height,
+            fps_num,
+            fps_den,
+            ..OutputContract::default()
+        };
+        assert!(at(8192, 8192, 240, 1).validate().is_ok());
+        assert!(at(2, 2, 1, 1000).validate().is_ok());
+        assert!(at(1920, 1080, 480, 2).validate().is_ok());
+        assert!(at(1920, 1080, 240_001, 1000).validate().is_err());
+        assert!(at(1920, 1080, 241, 1).validate().is_err());
+        assert!(at(1920, 1080, u32::MAX, 1).validate().is_err());
+        assert!(at(8194, 1080, 30, 1).validate().is_err());
+        assert!(at(1920, 8194, 30, 1).validate().is_err());
+        let e = at(1920, 1080, 300, 1).validate().unwrap_err().to_string();
+        assert!(e.contains("240"), "{e}");
+        let parsed: OutputContract = "8192x4320@240".parse().unwrap();
+        assert_eq!((parsed.width, parsed.fps_num), (8192, 240));
+    }
+
+    #[test]
+    fn colour_range_and_aspect_parse() {
+        assert_eq!(
+            "Limited".parse::<ColourRange>().unwrap(),
+            ColourRange::Limited
+        );
+        assert_eq!("full".parse::<ColourRange>().unwrap(), ColourRange::Full);
+        assert!("tv".parse::<ColourRange>().is_err());
+        assert_eq!(ColourRange::Full.to_string(), "full");
+        assert_eq!(ColourRange::default(), ColourRange::Limited);
+
+        assert_eq!("crop".parse::<AspectPolicy>().unwrap(), AspectPolicy::Crop);
+        assert_eq!(
+            " LETTERBOX".parse::<AspectPolicy>().unwrap(),
+            AspectPolicy::Letterbox
+        );
+        assert!("stretch".parse::<AspectPolicy>().is_err());
+        assert_eq!(AspectPolicy::Letterbox.to_string(), "letterbox");
+        assert_eq!(AspectPolicy::default(), AspectPolicy::Crop);
     }
 
     #[test]

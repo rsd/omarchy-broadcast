@@ -1,59 +1,26 @@
-//! GStreamer pipeline construction, link-caps inspection and teardown.
+//! Shared GStreamer building blocks: element construction, the CPU ingest
+//! adapters, colorimetry pinning, the owned [`MediaPipeline`], link-caps
+//! inspection and the loopback format check.
 //!
-//! The main pipeline (built element by element so every pad is addressable):
-//!
-//! ```text
-//! v4l2src device=<camera> io-mode=mmap
-//!   ! capsfilter  <camera mode>: video/x-raw,format=F,... or image/jpeg,...
-//!   ! queue       max-size-buffers=2 leaky=downstream
-//!   [ ! videoconvert ! capsfilter video/x-raw,format=NV12 ]   CPU convert (YUY2, UYVY)
-//!   [ ! jpegdec      ! capsfilter video/x-raw,format=I420 ]   CPU decode (MJPEG)
-//!   ! cudaupload
-//!   ! capsfilter  video/x-raw(memory:CUDAMemory),format=<uploaded format>
-//!   [ ! cudaconvert ! capsfilter (CUDAMemory) BGR ]          roundtrip only
-//!   [ ! cudaconvert ! capsfilter (CUDAMemory) NV12|I420 ]    roundtrip, output != uploaded,
-//!                                                            or CPU decode (to limited range)
-//!   ! cudadownload
-//!   ! capsfilter  video/x-raw,format=NV12|I420
-//!   ! v4l2sink device=<loopback> sync=false
-//! ```
+//! The stream itself is two pipelines joined by a latest-frame slot
+//! (`docs/adr/0009-ingest-process-output.md`): one ingest pipeline per source
+//! ([`crate::ingest`]) and one long-lived output pipeline
+//! ([`crate::output`]).
 //!
 //! **Ingest adapters.** The camera format decides what runs before
 //! `cudaupload` ([`IngestPath`]): formats `cudaconvert` accepts are uploaded
 //! as captured (GPU-direct); YUY2/UYVY are converted to NV12 by
 //! `videoconvert` on the CPU (`cudaconvert` does not accept packed 4:2:2);
-//! MJPEG is decoded by `jpegdec` on the CPU into I420, which uploads and
-//! always goes through `cudaconvert` (see the colorimetry note below). A GPU
-//! (nvJPEG) decode is future work.
+//! MJPEG is decoded by `jpegdec` on the CPU into I420. A GPU (nvJPEG) decode
+//! is future work. The CPU convert path keeps the camera's colorimetry label
+//! through `videoconvert` ([`pinned_caps`]).
 //!
 //! **CUDA memory from `cudaupload` on.** The CUDAMemory capsfilter right
-//! after `cudaupload` is load-bearing: without it, `cudaupload` and
-//! `cudadownload` may negotiate plain system memory and silently pass frames
+//! after `cudaupload` is load-bearing: without it, `cudaupload` and the next
+//! CUDA element may negotiate plain system memory and silently pass frames
 //! through on the CPU. The "CUDAMemory on every link" guarantee
-//! ([`all_cuda_between`] with [`names::UPLOAD`] and [`names::DOWNLOAD`])
-//! starts at `cudaupload`: the ingest adapters before it are CPU stages by
-//! design and run in system memory.
-//!
-//! When a `cudaconvert` produces the output format from a YUV upload, the
-//! colorimetry of the frames handed to `cudaupload` is copied onto the output
-//! CUDA capsfilter as soon as those caps are known, so the label round-trips
-//! unchanged (without it the BGR hop relabels BT.709 `2:4:5:1` as
-//! sRGB-transfer `2:4:7:1`). An RGB/BGR upload is not pinned: its label
-//! carries an RGB matrix, which is not a valid YUV colorimetry, so
-//! `cudaconvert` picks the YUV one ([`pinned_caps`]). The CPU convert path
-//! pins the camera's label onto `videoconvert`'s output the same way.
-//!
-//! The CPU decode path is the exception: `jpegdec` outputs full-range BT.601
-//! (`1:4:0:0`, as JPEG data is), and apps that ignore the range flag would
-//! crush its blacks and clip its whites. Its output CUDA capsfilter is fixed
-//! to [`DECODE_OUTPUT_COLORIMETRY`] (limited range, same BT.601 matrix), so
-//! `cudaconvert` rescales the levels on the GPU (Y 0..255 -> 16..235, chroma
-//! -> 16..240; verified on frames) and the loopback gets the limited-range
-//! label the other paths deliver. That conversion runs for I420 output too.
-
-use std::fmt;
-use std::path::PathBuf;
-use std::str::FromStr;
+//! ([`all_cuda_between`]) starts at `cudaupload`: the ingest adapters before
+//! it are CPU stages by design and run in system memory.
 
 use gst::glib;
 use gst::prelude::*;
@@ -61,8 +28,9 @@ use obc_core::{OutputFormat, VideoMode};
 use serde::Serialize;
 
 use crate::capability::IngestPath;
+pub use crate::process::GpuStage;
 
-/// Element names in the main pipeline.
+/// Element names in the ingest, output and consumer pipelines.
 pub mod names {
     pub const CAMERA: &str = "camera";
     pub const CAMERA_CAPS: &str = "camera_caps";
@@ -80,8 +48,30 @@ pub mod names {
     pub const TO_OUT: &str = "to_out";
     pub const OUT_CUDA_CAPS: &str = "out_cuda_caps";
     pub const DOWNLOAD: &str = "download";
+    /// Output: system-memory capsfilter after `cudadownload` (canonical
+    /// colour label).
+    pub const DOWNLOAD_CAPS: &str = "download_caps";
+    /// Output: `capssetter` giving the frames the sink's colour label.
+    pub const RELABEL: &str = "relabel";
     pub const OUT_CAPS: &str = "out_caps";
+    /// The output pipeline's sink: `v4l2sink`, or `fakesink` without a
+    /// loopback device.
     pub const LOOPBACK: &str = "loopback";
+
+    /// Ingest: `videocrop` (crop-to-fill policy only).
+    pub const CROP: &str = "crop";
+    /// Ingest: `cudaconvertscale` to the canonical frame.
+    pub const SCALE: &str = "scale";
+    /// Ingest: capsfilter with the canonical caps.
+    pub const CANONICAL_CAPS: &str = "canonical_caps";
+    /// Ingest: the `appsink` that writes canonical frames into the slot.
+    pub const FRAMES_SINK: &str = "frames_sink";
+    /// Output: the `appsrc` the output clock pushes canonical frames into.
+    pub const FRAMES_SRC: &str = "frames_src";
+    /// Output, roundtrip process stage: `cudaconvert` back to NV12.
+    pub const FROM_BGR: &str = "from_bgr";
+    /// Output, roundtrip process stage: the NV12 capsfilter after it.
+    pub const PROCESS_CAPS: &str = "process_caps";
 
     pub const CONSUMER_SRC: &str = "consumer_src";
     pub const CONSUMER_CAPS: &str = "consumer_caps";
@@ -90,75 +80,6 @@ pub mod names {
 
 /// The caps feature that marks buffers living in CUDA device memory.
 pub const CUDA_MEMORY_FEATURE: &str = "memory:CUDAMemory";
-
-/// What happens to frames while they are in CUDA memory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GpuStage {
-    /// Upload and download only (plus an output conversion if the output
-    /// format differs from the camera's).
-    #[default]
-    Passthrough,
-    /// NV12 -> BGR -> NV12/I420 with `cudaconvert`, in CUDA memory: the
-    /// conversion cost an effect stage working on BGR pays.
-    Roundtrip,
-}
-
-impl FromStr for GpuStage {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "passthrough" => Ok(GpuStage::Passthrough),
-            "roundtrip" => Ok(GpuStage::Roundtrip),
-            _ => Err(format!("unknown GPU stage {s:?} (passthrough|roundtrip)")),
-        }
-    }
-}
-
-impl fmt::Display for GpuStage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            GpuStage::Passthrough => "passthrough",
-            GpuStage::Roundtrip => "roundtrip",
-        })
-    }
-}
-
-/// Everything needed to build the main pipeline. Device paths are resolved
-/// by discovery at runtime, never configured.
-#[derive(Debug, Clone, Serialize)]
-pub struct PipelineConfig {
-    pub camera: PathBuf,
-    pub sink: PathBuf,
-    pub mode: VideoMode,
-    pub gpu_stage: GpuStage,
-    pub output: OutputFormat,
-    /// `queue max-size-buffers` (leaky=downstream).
-    pub queue_buffers: u32,
-    /// `v4l2src io-mode` nick (`mmap`, `dmabuf`, `auto`, ...).
-    pub camera_io_mode: String,
-}
-
-impl PipelineConfig {
-    /// `mode` is a concrete mode the camera offers (see
-    /// [`crate::capability::choose_mode`]); its format decides the ingest path.
-    pub fn new(camera: PathBuf, sink: PathBuf, mode: VideoMode) -> Self {
-        PipelineConfig {
-            camera,
-            sink,
-            mode,
-            gpu_stage: GpuStage::default(),
-            output: OutputFormat::default(),
-            queue_buffers: 2,
-            camera_io_mode: "mmap".to_string(),
-        }
-    }
-
-    /// How frames of the configured mode reach CUDA memory.
-    pub fn ingest(&self) -> IngestPath {
-        IngestPath::of(self.mode.format)
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
@@ -186,6 +107,18 @@ pub enum PipelineError {
         accepted: String,
         wanted: String,
     },
+    /// The loopback's accepted caps are not held by a consumer, but still
+    /// do not admit the output contract.
+    #[error("loopback {device} does not accept {wanted} (it accepts {accepted})")]
+    LoopbackRefused {
+        device: String,
+        accepted: String,
+        wanted: String,
+    },
+    #[error("CUDA: {0}")]
+    Cuda(String),
+    #[error("camera control on {device}: {message}")]
+    Control { device: String, message: String },
     #[error("invalid {property} {value:?} for {factory} (valid: {valid})")]
     InvalidProperty {
         factory: String,
@@ -195,7 +128,7 @@ pub enum PipelineError {
     },
 }
 
-fn make(factory: &str, name: &str) -> Result<gst::Element, PipelineError> {
+pub(crate) fn make(factory: &str, name: &str) -> Result<gst::Element, PipelineError> {
     gst::ElementFactory::make(factory)
         .name(name)
         .build()
@@ -207,7 +140,11 @@ fn make(factory: &str, name: &str) -> Result<gst::Element, PipelineError> {
 
 /// Sets enum property `property` from its nick, returning an error (instead
 /// of `set_property_from_str`'s panic) when the nick is not a valid value.
-fn set_enum(element: &gst::Element, property: &str, nick: &str) -> Result<(), PipelineError> {
+pub(crate) fn set_enum(
+    element: &gst::Element,
+    property: &str,
+    nick: &str,
+) -> Result<(), PipelineError> {
     let factory = || {
         element
             .factory()
@@ -295,7 +232,7 @@ fn pin_colorimetry(from: &gst::Element, to: &gst::Element, base: String) {
 /// The CPU convert adapter: `videoconvert ! capsfilter video/x-raw,format=NV12`
 /// ([`names::INGEST_CONVERT`], [`names::INGEST_CAPS`]), with the colorimetry
 /// of the caps leaving `camera_caps` pinned onto the capsfilter.
-fn cpu_convert_stage(
+pub(crate) fn cpu_convert_stage(
     camera_caps: &gst::Element,
     format: &str,
 ) -> Result<[gst::Element; 2], PipelineError> {
@@ -305,7 +242,7 @@ fn cpu_convert_stage(
     Ok([make("videoconvert", names::INGEST_CONVERT)?, ingest_caps])
 }
 
-fn capsfilter(name: &str, caps: &str) -> Result<gst::Element, PipelineError> {
+pub(crate) fn capsfilter(name: &str, caps: &str) -> Result<gst::Element, PipelineError> {
     let caps: gst::Caps = caps
         .parse()
         .map_err(|_| PipelineError::Caps(caps.to_string()))?;
@@ -314,14 +251,9 @@ fn capsfilter(name: &str, caps: &str) -> Result<gst::Element, PipelineError> {
     Ok(e)
 }
 
-fn cuda_caps(format: &str) -> String {
+pub(crate) fn cuda_caps(format: &str) -> String {
     format!("video/x-raw({CUDA_MEMORY_FEATURE}),format={format}")
 }
-
-/// Output colorimetry of the CPU decode path: limited range, BT.601 matrix
-/// (the JPEG matrix, so only the range changes), BT.709 transfer and
-/// primaries, the label UVC cameras give their raw formats.
-pub const DECODE_OUTPUT_COLORIMETRY: &str = "2:4:5:1";
 
 /// An owned GStreamer pipeline. [`MediaPipeline::shutdown`] tears it down and
 /// reports the outcome; dropping it without that (an error path) still sets
@@ -329,112 +261,83 @@ pub const DECODE_OUTPUT_COLORIMETRY: &str = "2:4:5:1";
 #[derive(Debug)]
 pub struct MediaPipeline {
     pipeline: gst::Pipeline,
-    /// The raw caps the main pipeline feeds its loopback (format, size,
-    /// rate), checked against what the device accepts by [`Self::play`].
-    /// `None` for the consumer pipeline.
+    /// The raw caps the pipeline feeds its loopback (format, size, rate),
+    /// checked against what the device accepts by [`Self::prepare`]. `None`
+    /// for a pipeline without a loopback (ingest, consumer).
     loopback_caps: Option<gst::Caps>,
 }
 
-impl MediaPipeline {
-    /// Builds (but does not start) the main capture -> CUDA -> loopback pipeline.
-    pub fn build(cfg: &PipelineConfig) -> Result<Self, PipelineError> {
-        use names::*;
-        let pipeline = gst::Pipeline::with_name("obc-main");
+/// The camera end of an ingest chain, up to (not including) `cudaupload`:
+/// `v4l2src ! capsfilter (mode) ! queue (leaky) [! CPU adapter]`. The last
+/// element carries the system-memory frames handed to `cudaupload`, in
+/// [`IngestPath::upload_format`].
+pub(crate) fn camera_head(
+    camera: &std::path::Path,
+    mode: &VideoMode,
+    io_mode: &str,
+    queue_buffers: u32,
+) -> Result<Vec<gst::Element>, PipelineError> {
+    use names::*;
+    let src = make("v4l2src", CAMERA)?;
+    src.set_property("device", camera.to_string_lossy().as_ref());
+    set_enum(&src, "io-mode", io_mode)?;
 
-        let camera = make("v4l2src", CAMERA)?;
-        camera.set_property("device", cfg.camera.to_string_lossy().as_ref());
-        set_enum(&camera, "io-mode", &cfg.camera_io_mode)?;
+    let queue = make("queue", QUEUE)?;
+    queue.set_property("max-size-buffers", queue_buffers.max(1));
+    queue.set_property("max-size-bytes", 0u32);
+    queue.set_property("max-size-time", 0u64);
+    set_enum(&queue, "leaky", "downstream")?;
 
-        let queue = make("queue", QUEUE)?;
-        queue.set_property("max-size-buffers", cfg.queue_buffers.max(1));
-        queue.set_property("max-size-bytes", 0u32);
-        queue.set_property("max-size-time", 0u64);
-        set_enum(&queue, "leaky", "downstream")?;
-
-        let ingest = cfg.ingest();
-        let in_format = ingest.upload_format(cfg.mode.format);
-        let out_format = cfg.output.gst_name();
-
-        let camera_caps = capsfilter(CAMERA_CAPS, &cfg.mode.to_caps_string())?;
-        let mut chain = vec![camera, camera_caps.clone(), queue];
-        // CPU ingest adapters (see the module docs). The last system-memory
-        // element before cudaupload carries the colorimetry of what is uploaded.
-        match ingest {
-            IngestPath::GpuDirect => {}
-            IngestPath::CpuConvert => {
-                // Keep the camera's colorimetry label through the CPU
-                // conversion (videoconvert would otherwise pick its own).
-                chain.extend(cpu_convert_stage(&camera_caps, in_format)?);
-            }
-            IngestPath::CpuDecode => {
-                chain.push(make("jpegdec", DECODE)?);
-                chain.push(capsfilter(
-                    INGEST_CAPS,
-                    &format!("video/x-raw,format={in_format}"),
-                )?);
-            }
+    let ingest = IngestPath::of(mode.format);
+    let in_format = ingest.upload_format(mode.format);
+    let camera_caps = capsfilter(CAMERA_CAPS, &mode.to_caps_string())?;
+    let mut chain = vec![src, camera_caps.clone(), queue];
+    // CPU ingest adapters (see the module docs).
+    match ingest {
+        IngestPath::GpuDirect => {}
+        IngestPath::CpuConvert => {
+            // Keep the camera's colorimetry label through the CPU
+            // conversion (videoconvert would otherwise pick its own).
+            chain.extend(cpu_convert_stage(&camera_caps, in_format)?);
         }
-        let upload_input = chain.last().cloned().expect("chain is not empty");
-        chain.push(make("cudaupload", UPLOAD)?);
-        chain.push(capsfilter(CUDA_CAPS, &cuda_caps(in_format))?);
-        if cfg.gpu_stage == GpuStage::Roundtrip {
-            chain.push(make("cudaconvert", TO_BGR)?);
-            chain.push(capsfilter(BGR_CAPS, &cuda_caps("BGR"))?);
-        }
-        if ingest == IngestPath::CpuDecode {
-            // Full-range JPEG levels -> limited range (see the module docs).
-            chain.push(make("cudaconvert", TO_OUT)?);
+        IngestPath::CpuDecode => {
+            chain.push(make("jpegdec", DECODE)?);
             chain.push(capsfilter(
-                OUT_CUDA_CAPS,
-                &format!(
-                    "{},colorimetry={DECODE_OUTPUT_COLORIMETRY}",
-                    cuda_caps(out_format)
-                ),
+                INGEST_CAPS,
+                &format!("video/x-raw,format={in_format}"),
             )?);
-        } else if cfg.gpu_stage == GpuStage::Roundtrip || in_format != out_format {
-            chain.push(make("cudaconvert", TO_OUT)?);
-            let out_cuda_caps = capsfilter(OUT_CUDA_CAPS, &cuda_caps(out_format))?;
-            // Pinned only for a YUV upload (see `pinned_caps`).
-            pin_colorimetry(&upload_input, &out_cuda_caps, cuda_caps(out_format));
-            chain.push(out_cuda_caps);
         }
-        chain.push(make("cudadownload", DOWNLOAD)?);
-        chain.push(capsfilter(
-            OUT_CAPS,
-            &format!("video/x-raw,format={out_format}"),
-        )?);
+    }
+    Ok(chain)
+}
 
-        let sink = make("v4l2sink", LOOPBACK)?;
-        sink.set_property("device", cfg.sink.to_string_lossy().as_ref());
-        // Present frames as soon as they arrive: pacing comes from the camera.
-        sink.set_property("sync", false);
-        // Do not pin the last frame (one fewer buffer held from the pool).
-        sink.set_property("enable-last-sample", false);
-        chain.push(sink);
+/// Adds `chain` to `pipeline` and links it in order.
+pub(crate) fn add_linked(
+    pipeline: &gst::Pipeline,
+    chain: &[gst::Element],
+) -> Result<(), PipelineError> {
+    pipeline
+        .add_many(chain)
+        .map_err(|e| PipelineError::Link(e.to_string()))?;
+    gst::Element::link_many(chain).map_err(|e| PipelineError::Link(e.to_string()))
+}
 
-        pipeline
-            .add_many(&chain)
-            .map_err(|e| PipelineError::Link(e.to_string()))?;
-        gst::Element::link_many(&chain).map_err(|e| PipelineError::Link(e.to_string()))?;
-        let loopback_caps = format!(
-            "video/x-raw,format={out_format},width={},height={},framerate={}/{}",
-            cfg.mode.width, cfg.mode.height, cfg.mode.fps_num, cfg.mode.fps_den
-        );
-        let loopback_caps = loopback_caps
-            .parse()
-            .map_err(|_| PipelineError::Caps(loopback_caps))?;
-        Ok(MediaPipeline {
+impl MediaPipeline {
+    /// Wraps a built pipeline. `loopback_caps`: the raw caps it feeds its
+    /// loopback (`None` when it has none), checked by [`Self::prepare`].
+    pub(crate) fn from_parts(pipeline: gst::Pipeline, loopback_caps: Option<gst::Caps>) -> Self {
+        MediaPipeline {
             pipeline,
-            loopback_caps: Some(loopback_caps),
-        })
+            loopback_caps,
+        }
     }
 
     /// Builds the bench consumer: `v4l2src device=<loopback> ! capsfilter ! fakesink`.
-    /// `mode` is the camera mode feeding the loopback (only its size is used).
+    /// `size` is the `(width, height)` of the stream feeding the loopback.
     /// It reads the virtual camera exactly as a video-call app would.
     pub fn build_consumer(
         loopback: &std::path::Path,
-        mode: &VideoMode,
+        size: (u32, u32),
         output: OutputFormat,
     ) -> Result<Self, PipelineError> {
         use names::*;
@@ -447,18 +350,14 @@ impl MediaPipeline {
             &format!(
                 "video/x-raw,format={},width={},height={}",
                 output.gst_name(),
-                mode.width,
-                mode.height
+                size.0,
+                size.1
             ),
         )?;
         let sink = make("fakesink", CONSUMER_SINK)?;
         sink.set_property("sync", false);
         sink.set_property("enable-last-sample", false);
-        let chain = [src, caps, sink];
-        pipeline
-            .add_many(&chain)
-            .map_err(|e| PipelineError::Link(e.to_string()))?;
-        gst::Element::link_many(&chain).map_err(|e| PipelineError::Link(e.to_string()))?;
+        add_linked(&pipeline, &[src, caps, sink])?;
         Ok(MediaPipeline {
             pipeline,
             loopback_caps: None,
@@ -477,27 +376,35 @@ impl MediaPipeline {
         self.pipeline.bus().expect("a pipeline always has a bus")
     }
 
-    /// Starts the pipeline. The main pipeline first goes to READY (devices
-    /// open) and checks that the loopback accepts its output
-    /// ([`PipelineError::LoopbackFormatHeld`] otherwise, instead of a
-    /// `not-negotiated` streaming error once the camera runs).
+    /// Starts the pipeline: [`Self::prepare`], then PLAYING.
     pub fn play(&self) -> Result<(), PipelineError> {
-        if let Some(wanted) = &self.loopback_caps {
-            self.check_loopback(wanted)?;
-        }
+        self.prepare()?;
         self.pipeline
             .set_state(gst::State::Playing)
             .map(|_| ())
             .map_err(|e| PipelineError::State(e.to_string()))
     }
 
+    /// Takes the pipeline to READY (devices open). A pipeline that feeds a
+    /// loopback then checks that the device accepts its caps:
+    /// [`PipelineError::LoopbackFormatHeld`] or
+    /// [`PipelineError::LoopbackRefused`] otherwise, instead of a
+    /// `not-negotiated` streaming error once frames flow. On error the
+    /// pipeline is back in NULL.
+    pub fn prepare(&self) -> Result<(), PipelineError> {
+        self.pipeline
+            .set_state(gst::State::Ready)
+            .map_err(|e| PipelineError::State(e.to_string()))?;
+        if let Some(wanted) = &self.loopback_caps {
+            self.check_loopback(wanted)?;
+        }
+        Ok(())
+    }
+
     /// At READY, `v4l2sink` has opened the loopback and probed the formats
     /// it accepts now. A device a consumer still holds offers only the
     /// format, size and rate of the stream that fed it last.
     fn check_loopback(&self, wanted: &gst::Caps) -> Result<(), PipelineError> {
-        self.pipeline
-            .set_state(gst::State::Ready)
-            .map_err(|e| PipelineError::State(e.to_string()))?;
         let Some(sink) = self.element(names::LOOPBACK) else {
             return Ok(());
         };
@@ -505,19 +412,26 @@ impl MediaPipeline {
             return Ok(());
         };
         let accepted = pad.query_caps(None);
-        match loopback_mismatch(wanted, &accepted) {
-            None => Ok(()),
-            Some((accepted, wanted)) => {
-                let _ = self.pipeline.set_state(gst::State::Null);
-                Err(PipelineError::LoopbackFormatHeld {
-                    device: sink
-                        .property::<Option<String>>("device")
-                        .unwrap_or_default(),
-                    accepted,
-                    wanted,
-                })
+        let Some(m) = loopback_mismatch(wanted, &accepted) else {
+            return Ok(());
+        };
+        let _ = self.pipeline.set_state(gst::State::Null);
+        let device = sink
+            .property::<Option<String>>("device")
+            .unwrap_or_default();
+        Err(if m.held {
+            PipelineError::LoopbackFormatHeld {
+                device,
+                accepted: m.accepted,
+                wanted: m.wanted,
             }
-        }
+        } else {
+            PipelineError::LoopbackRefused {
+                device,
+                accepted: m.accepted,
+                wanted: m.wanted,
+            }
+        })
     }
 
     /// Latency query sent upstream from the last element's sink pad:
@@ -598,13 +512,122 @@ impl Drop for MediaPipeline {
     }
 }
 
-/// `None` when the loopback's `accepted` caps admit the `wanted` output;
-/// otherwise both, described for an error message (`NV12 1920x1080@60`).
-pub fn loopback_mismatch(wanted: &gst::Caps, accepted: &gst::Caps) -> Option<(String, String)> {
-    if accepted.can_intersect(wanted) {
+/// Why a loopback refuses a stream ([`loopback_mismatch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopbackMismatch {
+    /// What the device accepts, for an error message (`NV12 1920x1080@60`).
+    pub accepted: String,
+    /// What the stream would send.
+    pub wanted: String,
+    /// The accepted caps (DMABuf variants aside) are fixed: a consumer holds
+    /// the device in the format of an earlier stream.
+    pub held: bool,
+}
+
+/// `None` when the loopback's `accepted` caps admit the `wanted` stream;
+/// otherwise both, described, and whether a consumer holds the device in
+/// another fixed format (as opposed to a device that does not accept the
+/// format at all).
+///
+/// A held device lists its colour label, but also lists each format a
+/// second time without one, so caps intersection alone admits any label;
+/// and GStreamer compares labels as strings (`bt601` vs `2:4:5:4`). When
+/// the held structures list a label, the `wanted` label is compared with
+/// them by meaning ([`same_colorimetry`]), and a mismatch is a held format:
+/// `v4l2sink` would refuse it with `not-negotiated` once frames flow.
+pub fn loopback_mismatch(wanted: &gst::Caps, accepted: &gst::Caps) -> Option<LoopbackMismatch> {
+    if !accepted.can_intersect(wanted) {
+        return Some(LoopbackMismatch {
+            accepted: describe_raw_caps(accepted),
+            wanted: describe_raw_caps(wanted),
+            held: is_held(accepted),
+        });
+    }
+    if !is_held(accepted) {
         return None;
     }
-    Some((describe_raw_caps(accepted), describe_raw_caps(wanted)))
+    let listed = held_colorimetries(accepted);
+    let wanted_label = wanted
+        .structure(0)
+        .and_then(|s| s.get::<String>("colorimetry").ok())?;
+    if listed.is_empty() || listed.iter().any(|l| same_colorimetry(l, &wanted_label)) {
+        return None;
+    }
+    Some(LoopbackMismatch {
+        accepted: format!(
+            "{} colorimetry {}",
+            describe_raw_caps(accepted),
+            listed.join("|")
+        ),
+        wanted: format!("{} colorimetry {wanted_label}", describe_raw_caps(wanted)),
+        held: true,
+    })
+}
+
+/// The colour labels the system-memory structures of `caps` list (a
+/// string or a list of strings), deduplicated.
+fn held_colorimetries(caps: &gst::Caps) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (s, features) in caps.iter_with_features() {
+        if features.contains("memory:DMABuf") {
+            continue;
+        }
+        let Ok(v) = s.value("colorimetry") else {
+            continue;
+        };
+        let labels: Vec<String> = if let Ok(one) = v.get::<String>() {
+            vec![one]
+        } else if let Ok(list) = v.get::<gst::List>() {
+            list.iter().filter_map(|l| l.get::<String>().ok()).collect()
+        } else {
+            Vec::new()
+        };
+        for l in labels {
+            if !out.contains(&l) {
+                out.push(l);
+            }
+        }
+    }
+    out
+}
+
+/// Whether two GStreamer colorimetry strings describe the same colour
+/// handling (`bt601` and `2:4:5:4` do), as `v4l2sink` compares them: equal
+/// range, matrix and primaries, and transfer functions that are
+/// interchangeable at 8 bits. Unparsable labels compare as strings.
+pub fn same_colorimetry(a: &str, b: &str) -> bool {
+    use std::str::FromStr;
+    match (
+        gst_video::VideoColorimetry::from_str(a),
+        gst_video::VideoColorimetry::from_str(b),
+    ) {
+        (Ok(x), Ok(y)) => x.is_equivalent(8, &y, 8),
+        _ => a == b,
+    }
+}
+
+/// Whether every system-memory structure of `caps` (and there is at least
+/// one) fixes the stream format: one format, width, height and frame rate.
+/// That is the shape of a loopback a consumer holds. Other fields are not
+/// considered: a held v4l2loopback lists its colorimetry as a one-element
+/// list (`{ bt601 }`), which GStreamer does not count as fixed. `v4l2sink`
+/// also lists DMABuf variants of the same format, which are ignored.
+fn is_held(caps: &gst::Caps) -> bool {
+    let mut any = false;
+    for (s, features) in caps.iter_with_features() {
+        if features.contains("memory:DMABuf") {
+            continue;
+        }
+        let fixed = s.get::<&str>("format").is_ok()
+            && s.get::<i32>("width").is_ok()
+            && s.get::<i32>("height").is_ok()
+            && s.get::<gst::Fraction>("framerate").is_ok();
+        if !fixed {
+            return false;
+        }
+        any = true;
+    }
+    any
 }
 
 /// `FORMAT WxH@RATE` for each fixed system-memory raw-video structure
@@ -716,20 +739,6 @@ mod tests {
     }
 
     #[test]
-    fn gpu_stage_parse() {
-        assert_eq!(
-            "roundtrip".parse::<GpuStage>().unwrap(),
-            GpuStage::Roundtrip
-        );
-        assert_eq!(
-            "Passthrough".parse::<GpuStage>().unwrap(),
-            GpuStage::Passthrough
-        );
-        assert!("blur".parse::<GpuStage>().is_err());
-        assert_eq!(GpuStage::Roundtrip.to_string(), "roundtrip");
-    }
-
-    #[test]
     fn invalid_enum_nick_is_an_error_not_a_panic() {
         gst::init().unwrap();
         let q = make("queue", "q").unwrap();
@@ -773,108 +782,6 @@ mod tests {
         drop(p);
         let (_, cur, _) = pipeline.state(gst::ClockTime::ZERO);
         assert_eq!(cur, gst::State::Null);
-    }
-
-    /// The builder inserts the CPU adapter the camera format needs, uploads the
-    /// adapter's output format, and converts to the loopback format on the GPU.
-    #[test]
-    fn ingest_adapters_per_format() {
-        gst::init().unwrap();
-        for f in [
-            "v4l2src",
-            "cudaupload",
-            "cudaconvert",
-            "jpegdec",
-            "videoconvert",
-        ] {
-            if gst::ElementFactory::find(f).is_none() {
-                eprintln!("SKIPPED: GStreamer element {f} is not installed");
-                return;
-            }
-        }
-        let caps_of = |p: &MediaPipeline, name: &str| {
-            p.element(name)
-                .map(|e| e.property::<gst::Caps>("caps").to_string())
-        };
-        for (mode, output, adapter, upload_fmt, converts) in [
-            ("NV12:1920x1080@60", OutputFormat::Nv12, None, "NV12", false),
-            ("NV12:1920x1080@60", OutputFormat::I420, None, "NV12", true),
-            (
-                "YUY2:1920x1080@60",
-                OutputFormat::Nv12,
-                Some(names::INGEST_CONVERT),
-                "NV12",
-                false,
-            ),
-            (
-                "YUY2:1920x1080@60",
-                OutputFormat::I420,
-                Some(names::INGEST_CONVERT),
-                "NV12",
-                true,
-            ),
-            (
-                "MJPEG:1920x1080@30",
-                OutputFormat::Nv12,
-                Some(names::DECODE),
-                "I420",
-                true,
-            ),
-            (
-                "MJPEG:1920x1080@30",
-                OutputFormat::I420,
-                Some(names::DECODE),
-                "I420",
-                true, // range conversion
-            ),
-        ] {
-            let mut cfg = PipelineConfig::new(
-                "/dev/null-camera".into(),
-                "/dev/null-sink".into(),
-                mode.parse().unwrap(),
-            );
-            cfg.output = output;
-            let p = MediaPipeline::build(&cfg).unwrap();
-            let tag = format!("{mode} -> {output}");
-            for a in [names::DECODE, names::INGEST_CONVERT] {
-                assert_eq!(p.element(a).is_some(), adapter == Some(a), "{tag}: {a}");
-            }
-            assert_eq!(p.element(names::INGEST_CAPS).is_some(), adapter.is_some());
-            if adapter.is_some() {
-                assert_eq!(
-                    caps_of(&p, names::INGEST_CAPS).unwrap(),
-                    format!("video/x-raw, format=(string){upload_fmt}"),
-                    "{tag}"
-                );
-            }
-            assert_eq!(
-                caps_of(&p, names::CUDA_CAPS).unwrap(),
-                format!("video/x-raw(memory:CUDAMemory), format=(string){upload_fmt}"),
-                "{tag}"
-            );
-            assert_eq!(p.element(names::TO_OUT).is_some(), converts, "{tag}");
-            if adapter == Some(names::DECODE) {
-                assert_eq!(
-                    caps_of(&p, names::OUT_CUDA_CAPS).unwrap(),
-                    format!(
-                        "video/x-raw(memory:CUDAMemory), format=(string){}, colorimetry=(string){DECODE_OUTPUT_COLORIMETRY}",
-                        output.gst_name()
-                    ),
-                    "{tag}"
-                );
-            }
-            assert_eq!(
-                caps_of(&p, names::OUT_CAPS).unwrap(),
-                format!("video/x-raw, format=(string){}", output.gst_name()),
-                "{tag}"
-            );
-            let camera_caps = caps_of(&p, names::CAMERA_CAPS).unwrap();
-            assert_eq!(
-                camera_caps.starts_with("image/jpeg"),
-                mode.starts_with("MJPEG"),
-                "{tag}: {camera_caps}"
-            );
-        }
     }
 
     #[test]
@@ -976,46 +883,129 @@ mod tests {
     }
 
     /// A loopback a consumer still holds offers one fixed format: a stream
-    /// differing in rate, size or format is reported with both sides; a free
-    /// loopback (formats and ranges) admits it.
+    /// differing in rate, size or format is reported with both sides as
+    /// held; a free loopback (formats and ranges) admits it; a free loopback
+    /// that does not offer the format is refused, not held.
     #[test]
     fn loopback_mismatch_reports_held_format() {
         gst::init().unwrap();
         let caps = |s: &str| s.parse::<gst::Caps>().unwrap();
-        let wanted = caps("video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1");
+        let wanted = caps(
+            "video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1,colorimetry=2:4:5:4",
+        );
+        // As v4l2sink reports a held device (GStreamer 1.28): each raw
+        // structure with and without a one-element colorimetry list, each
+        // with its DMABuf variant.
         let held = |rate: &str, format: &str, width: u32| {
-            caps(&format!(
-                "video/x-raw,format={format},width={width},height=1080,framerate={rate},\
-                 colorimetry=2:4:5:1"
-            ))
+            let one = |colorimetry: &str| {
+                format!(
+                    "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={format},\
+                     width={width},height=1080,pixel-aspect-ratio=1/1{colorimetry},\
+                     framerate={rate}; \
+                     video/x-raw,format={format},width={width},height=1080,\
+                     pixel-aspect-ratio=1/1{colorimetry},framerate={rate}"
+                )
+            };
+            caps(&format!("{}; {}", one(",colorimetry={ bt601 }"), one("")))
+        };
+        let mismatch = |accepted: &str, wanted: &str, held: bool| LoopbackMismatch {
+            accepted: accepted.to_string(),
+            wanted: wanted.to_string(),
+            held,
         };
         assert_eq!(
             loopback_mismatch(&wanted, &held("30/1", "NV12", 1920)),
             None
         );
+        // The held label is compared by meaning: `bt601` is `2:4:5:4`, and
+        // a stream labelled otherwise (here BT.709 primaries, or full
+        // range) is refused before streaming, as v4l2sink would refuse it.
+        for other in ["2:4:5:1", "1:4:5:4", "bt709"] {
+            let relabelled = caps(&format!(
+                "video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1,\
+                 colorimetry={other}"
+            ));
+            assert_eq!(
+                loopback_mismatch(&relabelled, &held("30/1", "NV12", 1920)),
+                Some(mismatch(
+                    "NV12 1920x1080@30 colorimetry bt601",
+                    &format!("NV12 1920x1080@30 colorimetry {other}"),
+                    true
+                )),
+                "{other}"
+            );
+        }
+        // An unlabelled stream, or a held device that lists no label, is
+        // not compared.
+        let unlabelled = caps("video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1");
+        assert_eq!(
+            loopback_mismatch(&unlabelled, &held("30/1", "NV12", 1920)),
+            None
+        );
+        let held_unlabelled = caps("video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1");
+        assert_eq!(loopback_mismatch(&wanted, &held_unlabelled), None);
         assert_eq!(
             loopback_mismatch(&wanted, &held("60/1", "NV12", 1920)),
-            Some((
-                "NV12 1920x1080@60".to_string(),
-                "NV12 1920x1080@30".to_string()
-            ))
+            Some(mismatch("NV12 1920x1080@60", "NV12 1920x1080@30", true))
         );
         let ntsc = caps("video/x-raw,format=I420,width=1920,height=1080,framerate=30000/1001");
         assert_eq!(
             loopback_mismatch(&ntsc, &held("30/1", "NV12", 1920)),
-            Some((
-                "NV12 1920x1080@30".to_string(),
-                "I420 1920x1080@30000/1001".to_string()
+            Some(mismatch(
+                "NV12 1920x1080@30",
+                "I420 1920x1080@30000/1001",
+                true
             ))
         );
-        assert!(loopback_mismatch(&wanted, &held("30/1", "NV12", 1280)).is_some());
+        assert!(
+            loopback_mismatch(&wanted, &held("30/1", "NV12", 1280))
+                .unwrap()
+                .held
+        );
+
         let free = caps(
             "video/x-raw,format={ I420, NV12, YUY2 },width=[ 2, 8192 ],height=[ 1, 8192 ],\
-             framerate=[ 0/1, 2147483647/1 ]",
+             framerate=[ 0/1, 2147483647/1 ]; \
+             video/x-raw(memory:DMABuf),format=DMA_DRM,width=[ 2, 8192 ],height=[ 1, 8192 ]",
         );
         assert_eq!(loopback_mismatch(&wanted, &free), None);
-        let (accepted, _) = loopback_mismatch(&wanted, &gst::Caps::new_empty()).unwrap();
-        assert_eq!(accepted, "nothing");
+        // Free, but without the wanted format: not held, a plain refusal.
+        let no_nv12 = caps(
+            "video/x-raw,format={ YUY2, UYVY },width=[ 2, 8192 ],height=[ 1, 8192 ],\
+             framerate=[ 0/1, 2147483647/1 ]",
+        );
+        let m = loopback_mismatch(&wanted, &no_nv12).unwrap();
+        assert!(!m.held, "{m:?}");
+        assert_eq!(m.wanted, "NV12 1920x1080@30");
+        assert!(m.accepted.contains("YUY2"), "{m:?}");
+        // Several formats at a fixed size and rate: not held.
+        let formats =
+            caps("video/x-raw,format={ NV12, YUY2 },width=1920,height=1080,framerate=15/1");
+        assert!(!loopback_mismatch(&wanted, &formats).unwrap().held);
+        // A fixed size with a range of rates is not held either.
+        let ranged = caps("video/x-raw,format=NV12,width=1920,height=1080,framerate=[ 1/1, 60/1 ]");
+        let m = loopback_mismatch(
+            &caps("video/x-raw,format=NV12,width=1280,height=720,framerate=30/1"),
+            &ranged,
+        )
+        .unwrap();
+        assert!(!m.held, "{m:?}");
+
+        let m = loopback_mismatch(&wanted, &gst::Caps::new_empty()).unwrap();
+        assert_eq!(m.accepted, "nothing");
+        assert!(!m.held, "an empty answer is not a held format");
+    }
+
+    #[test]
+    fn colorimetry_labels_compare_by_meaning() {
+        gst::init().unwrap();
+        assert!(same_colorimetry("bt601", "2:4:5:4"));
+        assert!(same_colorimetry("2:4:5:1", "2:4:5:1"));
+        assert!(!same_colorimetry("2:4:5:1", "2:4:5:4"), "primaries differ");
+        assert!(!same_colorimetry("1:4:5:4", "2:4:5:4"), "range differs");
+        assert!(!same_colorimetry("bt709", "bt601"));
+        assert!(same_colorimetry("not-a-label", "not-a-label"));
+        assert!(!same_colorimetry("not-a-label", "bt601"));
     }
 
     #[test]
