@@ -1,0 +1,23 @@
+# ADR-0006: On-demand lifecycle; idle means zero CUDA contexts
+
+- **Status:** Accepted
+
+## Context
+- The target is a hybrid laptop.
+- The NVIDIA dGPU can only runtime-suspend when no process holds a CUDA context. Pausing frames does not release the GPU.
+
+## Decision
+- Lifecycle states: Idle, Starting, Streaming, Draining, then back to Idle.
+- **Idle:** no CUDA context and the camera is closed. Only the D-Bus service and the consumer watcher run.
+- **Start:** when a consumer opens the virtual camera, or on ForceOn.
+- **Teardown:** after the last consumer closes and a grace period passes (about 5 s, configurable). Teardown releases every GPU resource.
+
+## Consequences
+- Start-up latency is paid on each first open: CUDA init, backend load, pipeline build. It must be measured and kept low, for example by keeping model files on disk and rebuilding the cache once.
+- Consumer detection on v4l2loopback (open count, events or inotify) is still to be chosen.
+- Acceptance check: `/sys/bus/pci/devices/<dGPU>/power/runtime_status` shows `suspended` while the daemon is idle. `scripts/dgpu-idle-check.sh` performs it.
+- **Measured caveat:** the CUDA context is released when the pipeline goes to NULL, but libcuda driver handles (7 `/dev/nvidia*` fds) persist until process exit. Whether they block runtime suspend is not yet known; if they do, the GPU work must live in a worker process that exits at teardown. See [../benchmarks/dgpu-idle.md](../benchmarks/dgpu-idle.md).
+
+## Alternatives considered
+- Keeping the pipeline paused while idle: pausing frames does not release the GPU, so the dGPU never suspends.
+- A separate worker process per stream: the fallback described above, deferred until the measurement shows it is needed.

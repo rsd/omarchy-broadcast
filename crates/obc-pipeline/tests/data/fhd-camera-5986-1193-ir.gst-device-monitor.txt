@@ -1,0 +1,20 @@
+# gst-device-monitor-1.0 Video/Source (GStreamer 1.28.8, PipeWire provider), one device.
+# Sanitised: bus paths, node names, object ids/serials and the pipewiresrc hint removed.
+Device found:
+	name  : FHD Camera (V4L2)
+	class : Video/Source
+	caps  : video/x-raw(memory:DMABuf), drm-format="R8\ \ ", format=DMA_DRM, interlace-mode=progressive, width=640, height=360, framerate=15/1, colorimetry=1:4:5:1
+	        video/x-raw, format=GRAY8, interlace-mode=progressive, width=640, height=360, framerate=15/1, colorimetry=1:4:5:1
+	properties:
+		object.path = v4l2:/dev/video2
+		device.api = v4l2
+		media.class = Video/Source
+		device.product.id = 0x1193
+		device.vendor.id = 0x5986
+		api.v4l2.path = /dev/video2
+		api.v4l2.cap.driver = uvcvideo
+		api.v4l2.cap.card = FHD Camera: FHD IR Camera
+		api.v4l2.cap.capabilities = 0x84a00001
+		api.v4l2.cap.device-caps = 0x04200001
+		node.description = FHD Camera (V4L2)
+		node.nick = FHD Camera

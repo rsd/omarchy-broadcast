@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/obc-core",
+    "crates/obc-gpu",
+    "crates/obc-backend",
+    "crates/obc-backend-maxine",
+    "crates/gst-obc",
+    "crates/obc-pipeline",
+    "crates/obc-ipc",
+    "crates/oma-broadcastd",
+    "crates/oma-broadcast",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Raul Dias"]
+rust-version = "1.92"
+
+[workspace.dependencies]
+obc-core = { path = "crates/obc-core" }
+gst = { package = "gstreamer", version = "0.25", features = ["v1_28"] }
+gst-video = { package = "gstreamer-video", version = "0.25", features = ["v1_28"] }
+clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+libc = "0.2"
+nvml-wrapper = "0.13"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
