@@ -1,0 +1,65 @@
+# ADR-0009: Ingest, Process and Output stages with a fixed output contract
+
+- **Status:** Accepted
+
+## Context
+- Until now the stream was one linear GStreamer pipeline from `v4l2src` to `v4l2sink`. The loopback's caps followed the camera mode: its size, its frame rate and, through the ingest adapter, its colour label.
+- Consumers of a virtual camera expect a stable device. v4l2loopback keeps the format of the last stream while any consumer holds the device open and refuses every other format ([../testing.md](../testing.md), manual test). So changing the camera or its mode meant stopping the output and failing in the consumer.
+- Camera frame rates are not stable. With `exposure_dynamic_framerate` enabled, a camera lowers its rate in dim light. A stall or an unplugged camera stops frames entirely, and v4l2loopback then keeps showing the last raw camera frame indefinitely.
+- Effects ([ADR-0003](0003-maxine-first-behind-backend-seam.md)) need one known frame format and size whatever camera feeds them, and should not be reloaded when the source changes.
+- Dynamic relinking inside a running pipeline is fragile ([ADR-0002](0002-gstreamer-engine.md)), and caps renegotiation propagates downstream to the sink.
+
+## Decision
+
+### Three stages
+- **Ingest (one per source):** the camera and its controls (mode, frame rate, exposure options where present), the ingest adapter of [ADR-0008](0008-cpu-ingest-adapters.md) (GPU-direct NV12, CPU convert, or CPU decode), upload to CUDA memory, then crop and scale to the processing size. Its result is the **canonical frame: NV12 in CUDA memory, at the processing size, with a fixed colour label**. The processing size equals the output size for now.
+- **Process:** the effect chain, applied to canonical frames. It is empty in this step; the seam exists so effects can be added without touching ingest or output. An effect that needs another format (for example BGR) gets converters inserted around it, in CUDA memory; the passthrough path stays NV12 and pays no conversion.
+- **Output (one per sink):** a **fixed contract** of format, size, frame rate and colour range, set by configuration and never derived from the source. The default is NV12, 1920x1080, 30 fps, limited range. NV12 and I420 are supported. A v4l2loopback sink accepts limited range only (see below).
+
+### Implementation: two pipelines joined by a latest-frame slot
+- **Ingest pipeline** (rebuilt per source):
+  `v4l2src ! capsfilter (camera mode) ! queue (leaky) ! [CPU adapter] ! cudaupload ! capsfilter (CUDA) ! videocrop ! cudaconvertscale ! capsfilter (canonical caps) ! appsink`.
+  - **Crop-to-fill** (the default aspect policy) is a centre crop. `videocrop` only attaches a crop region to the buffer (`GstVideoCropMeta`), and `cudaconvertscale` honours it while scaling, so cropping costs no copy. **Letterbox** (an option) skips the crop and lets `cudaconvertscale` add black borders.
+  - The canonical caps fix the colorimetry, so the full-range to limited-range conversion of decoded MJPEG happens in the same `cudaconvertscale` pass as the scale. A camera mode that already matches the canonical caps passes through without a conversion kernel (the upload to CUDA memory still runs).
+  - `appsink` keeps at most one buffer and drops older ones; its callback writes into the slot.
+- **Latest-frame slot:** holds a reference to the newest canonical frame, a sequence number and its arrival time. Ingest replaces the frame; a frame replaced before the output used it is counted as dropped. Only references move; the CUDA memory is never copied.
+- **Output pipeline** (lives for the whole stream):
+  `appsrc (canonical caps, live) ! [Process] ! [cudaconvert to the contract format, if not NV12] ! cudadownload ! capsfilter (contract caps, canonical label) ! capssetter (colorimetry = 2:4:5:4) ! capsfilter (contract caps) ! v4l2sink`.
+  Its caps are fixed at start and never change. `appsrc` holds at most as many buffers as the clock may emit in one catch-up burst and drops the oldest beyond that (counted as `queue_dropped`).
+  - **Relabel stage.** v4l2loopback stores no colour description of its own: it reports every stream back as BT.601 (`2:4:5:4`) whatever the producer set, and while a consumer holds the device it refuses any other label. The frames keep the canonical label through every CUDA stage and are relabelled `2:4:5:4` after the download, without touching a pixel (`capssetter` between two capsfilters). A producer that labelled its frames otherwise could start on a free device but could not restart while a consumer held it.
+  - **Colour range.** Because the loopback carries no range, every consumer reads its stream as limited range. A **full-range contract is therefore refused for a v4l2loopback sink**, before anything streams (`LoopbackRefused`, "limited range only"). Delivering full-range pixels under a limited label would crush blacks and clip whites in every consumer, and converting them to limited range would silently change the configured contract. Sinks that can carry a range (a `fakesink` in tests, future sinks) accept both ranges.
+- **Output clock:** a dedicated thread emits one frame per period of the contract frame rate, on an absolute grid of deadlines on the monotonic clock, so timing errors do not accumulate. Buffer timestamps are `n x period`. On each tick:
+  - a frame newer than the last one emitted is emitted (**fresh**);
+  - otherwise, while the last input is younger than the gap threshold, the last frame is emitted again (**repeat**);
+  - after the gap threshold without input (default 500 ms, configurable), a black canonical frame prepared at output start is emitted (**placeholder**), so stale camera content is never shown indefinitely.
+
+  A source faster than the contract is thinned by the slot. A slower or stalled source is padded by repeats and then placeholders. `v4l2sink` runs with `sync=false`, because the pacing is ours. A tick missed through a short scheduling delay is emitted late, in a burst, so the count of frames per second stays exact. The grid is resynchronised, and the skipped ticks are counted, when the clock falls a second (the resync threshold) behind or more ticks are due than one burst may hold; the burst cap is derived from the threshold, so the two conditions coincide.
+- **Clock health:** the clock thread runs under a panic guard. If it ends without being stopped (for example a panicking observer), nothing is emitted any more and v4l2loopback would show the last frame indefinitely, so the output reports it: `is_running()` turns false and `health()` carries the reason. The bench treats it as a run error.
+- **One CUDA context:** the output pipeline's `GstCudaContext` is handed to every ingest pipeline as a `gst::Context` before it starts, so canonical frames cross from ingest to output as CUDA memory without a copy. Starting an ingest requires that context; there is no fallback to a context of its own.
+- **Loopback check once, at output start:** the device's accepted caps are compared with the contract. The error is `LoopbackFormatHeld` **only when the device caps are fixed**, that is every non-DMABuf structure names one format, size and frame rate: a consumer holds the device in that format, and the message names both formats and tells the user to close or reopen the consumer's source. A held device also lists a colour label, and the label is compared **by meaning** (`bt601` and `2:4:5:4` are the same), not as a string; a different label is a held format too, since `v4l2sink` would refuse it once frames flow. Any other mismatch (a free device that does not offer the format) is the generic refusal, `LoopbackRefused`, which says what the device accepts and what was wanted.
+- **Source switching:** a switch stops the current ingest pipeline (closing the camera and restoring its controls), then builds and starts the next one. Stopping first lets the same camera be reopened in another mode. The output pipeline is not touched: during the gap it repeats the last frame, and after the gap threshold sends placeholders. Every attempt, including a failed one, is recorded with its timings and error; a failed switch leaves the stream on placeholders until the next switch. Measured on two cameras (a GPU-direct NV12 camera and an MJPEG one, switched every 10 s for 130 s), the gap from the request to the new camera's first frame was **0.65 to 1.05 s**, so a switch shows repeats of the last frame and then black placeholders (about 14 repeats and 12 placeholders per switch), while the consumer saw one caps negotiation for the whole run ([../benchmarks/io-split.md](../benchmarks/io-split.md)). The development binary switches on `SIGUSR1` (next camera) or every `--switch-every` seconds, only while it is measuring or streaming (a `SIGUSR1` during warm-up is discarded).
+
+### Why Process sits at the head of the output pipeline
+- Its elements persist across source switches, so effect models are loaded once per stream rather than once per camera.
+- It runs at the output rate, which bounds the effect cost: a 60 fps camera feeding a 30 fps contract is processed 30 times per second.
+- With several sinks later, the processed frame is shared by every sink branch after the Process stage.
+
+## Alternatives considered
+
+| Alternative | Why rejected |
+|---|---|
+| One pipeline with `input-selector` or relinking on source change | New source caps renegotiate down to the sink; relinking live pads is fragile ([ADR-0002](0002-gstreamer-engine.md)) |
+| `videorate` in a single pipeline | Its output follows input timestamps: a stalled camera stops the output, and a source change still renegotiates |
+| `intervideosink` / `intervideosrc` | Fixed output rate and a black frame on timeout, but system memory only: frames would leave the GPU twice |
+| `proxysink` / `proxysrc` | Forwards the input's caps and timing to the output pipeline, which is what must be isolated |
+| An aggregator such as `cudacompositor` as the clock | Output pacing would depend on the live latency negotiation of the source, and switching still adds and removes live sources in a running pipeline |
+| Effects at the end of each ingest pipeline | Effect models reload on every source switch, and effects run at the input rate |
+
+## Consequences
+- The output never renegotiates or stops while sources change, and holds the contract frame rate however the camera behaves.
+- **Added latency** now includes the wait for the next output tick: between zero and one output period (33.3 ms at 30 fps), about half a period on average. Measured figures are in [../benchmarks/io-split.md](../benchmarks/io-split.md), set against the single-pipeline figures in [../benchmarks/ingest-paths.md](../benchmarks/ingest-paths.md).
+- Every emitted frame, including a repeat, is downloaded to the loopback: one device-to-host copy per output frame.
+- The CPU adapters of [ADR-0008](0008-cpu-ingest-adapters.md) are unchanged; they now feed `cudaconvertscale` instead of `cudaconvert`.
+- Effects see canonical NV12 frames. This replaces the earlier plan in which effects saw BGR ([../architecture.md](../architecture.md), section 2).
+- **Later lifecycle work ([ADR-0006](0006-on-demand-gpu-lifecycle.md)), not part of this decision:** an idle, CPU-only placeholder producer that keeps an `exclusive_caps` loopback visible to applications without holding a CUDA context; consumer-count detection; D-Bus control.
+- The processing size is the output size for now. With several sinks of different sizes it becomes a setting of its own, and each sink scales from it.

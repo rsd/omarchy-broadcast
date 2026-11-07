@@ -21,8 +21,15 @@ flowchart LR
         CFG["Config<br/>~/.config/oma-broadcast/config.toml<br/>inotify hot-reload + write-back"]
         WATCH["Consumer watcher<br/>(v4l2loopback device)"]
         PB["Pipeline builder<br/>(obc-pipeline)"]
-        subgraph GST["GStreamer pipeline (exists only while Streaming)"]
-            SRC["v4l2src<br/>any UVC webcam"] --> UP["obcupload<br/>→ CUDA"] --> FX["obc effects<br/>blur / replace"] --> DOWN["obcconvert<br/>→ NV12/YUYV"] --> SINK["v4l2sink<br/>v4l2loopback"]
+        subgraph GST["GStreamer pipelines (exist only while Streaming)"]
+            subgraph ING["Ingest pipeline (per source, rebuilt on switch)"]
+                SRC["v4l2src<br/>any UVC webcam"] --> UP["adapter + cudaupload<br/>→ CUDA"] --> CS["crop + scale<br/>→ canonical NV12"]
+            end
+            SLOT[("latest-frame slot")]
+            subgraph OUTP["Output pipeline (fixed contract, own clock)"]
+                FX["Process: obc effects<br/>blur / replace"] --> DOWN["convert → contract format<br/>download + relabel"] --> SINK["v4l2sink<br/>v4l2loopback"]
+            end
+            CS --> SLOT --> FX
         end
         BE["InferenceBackend trait"]
         MX["obc-backend-maxine<br/>(dlopen, user-installed SDK)"]
@@ -58,51 +65,55 @@ For example, a camera offering only MJPEG 1080p30 and YUYV up to 960x540@15, ask
 | CPU convert | YUYV, UYVY | `v4l2src` → `videoconvert` → NV12 → `cudaupload` |
 | CPU decode | MJPEG | `v4l2src` → `jpegdec` → `cudaupload` |
 
-`cudaconvert`, `cudaconvertscale` and `cudascale` accept no YUY2/UYVY input, hence the CPU convert step. The colour label (colorimetry) is preserved on the convert path; decoded MJPEG is full-range BT.601 (`1:4:0:0`), and `cudaconvert` rescales it to limited-range BT.601 (`2:4:5:1`) before the loopback, because many consumer apps ignore the range flag and would otherwise crush blacks and clip whites. After the adapter, every source looks the same to the rest of the pipeline. Effects only ever see `video/x-raw(memory:CUDAMemory), format=BGR`. They do not know which source fed them or which sink they feed. Measured cost per path is in [benchmarks/ingest-paths.md](benchmarks/ingest-paths.md); the rationale is in [ADR-0008](adr/0008-cpu-ingest-adapters.md).
+`cudaconvert`, `cudaconvertscale` and `cudascale` accept no YUY2/UYVY input, hence the CPU convert step. The colour label (colorimetry) is preserved on the convert path. Decoded MJPEG is full-range BT.601 (`1:4:0:0`); the canonical caps fix the label of the contract, and `cudaconvertscale` (the crop and scale step of the ingest pipeline) converts to it in the same pass as the scale. For the default limited-range contract that is `2:4:5:1`, which matters because many consumer apps ignore the range flag and would otherwise crush blacks and clip whites. After the ingest pipeline, every source looks the same to the rest of the stream. Measured cost per path is in [benchmarks/ingest-paths.md](benchmarks/ingest-paths.md) and [benchmarks/io-split.md](benchmarks/io-split.md); the rationale is in [ADR-0008](adr/0008-cpu-ingest-adapters.md).
 
-**UVC controls.** `exposure_auto_priority` (`exposure_dynamic_framerate`) is probed and used only if the camera exposes it. `--camera-fixed-framerate` pins it to 0 for the run and restores it on exit, including Ctrl-C and SIGTERM. No per-camera quirks are needed.
+**Ingest, Process, Output.** The stream is split into three stages ([ADR-0009](adr/0009-ingest-process-output.md)):
+- **Ingest** (per source) crops and scales every camera to the **canonical frame**: `video/x-raw(memory:CUDAMemory), format=NV12` at the processing size (the output size for now), with the colour label of the contract's range (`2:4:5:1` limited, `1:4:5:1` full). The default aspect policy is a centre crop to fill the frame; letterbox is an option.
+- **Process** applies the effect chain to canonical frames. Effects do not know which source fed them or which sink they feed. An effect that needs another format gets converters inserted around it in CUDA memory.
+- **Output** (per sink) holds a fixed contract of format (NV12 or I420), size, frame rate and colour range (default NV12 1920x1080@30, limited range) and runs on its own clock: it repeats the latest frame when the source is slower, drops frames when it is faster, and sends a black placeholder after a gap without input (default 500 ms). The source can be switched while the output keeps running; a switch took 0.65 to 1.05 s in measurement ([benchmarks/io-split.md](benchmarks/io-split.md)).
+- **v4l2loopback constraints.** The device carries no colour description: it reports every stream as BT.601 (`2:4:5:4`) and, while a consumer holds it, refuses any other label. The output therefore relabels frames `2:4:5:4` after download (labels only, no pixel change), and a **full-range contract is refused** for a loopback sink, because consumers would read it as limited. At start the output compares the device's accepted caps with the contract: if the device is held by a consumer in another format, size or rate (its caps are fixed), the error says so (`LoopbackFormatHeld`); a colour label is compared by meaning. Any other mismatch is a generic refusal.
+
+**UVC controls.** `exposure_auto_priority` (`exposure_dynamic_framerate`) is probed and used only if the camera exposes it. `--camera-fixed-framerate` pins it to 0 while a camera streams and restores it when that camera's ingest stops (on a source switch and on exit, including Ctrl-C and SIGTERM, but not SIGKILL). No per-camera quirks are needed.
 
 ```mermaid
 flowchart LR
-    subgraph Sources
-        S1["v4l2src (raw-capable camera)<br/>video/x-raw, e.g. NV12 or YUYV<br/>system memory<br/>(YUYV/UYVY: videoconvert → NV12 first)"]
-        S2["v4l2src (MJPEG camera or mode)<br/>image/jpeg"]
+    subgraph Ingest["Ingest pipeline — per source, rebuilt on source switch"]
+        S1["v4l2src (raw mode)<br/>NV12, or YUYV/UYVY<br/>(YUYV/UYVY: videoconvert → NV12 on the CPU)"]
+        S2["v4l2src (MJPEG mode)<br/>jpegdec on the CPU"]
+        UP["cudaupload<br/>→ CUDAMemory"]
+        CROP["videocrop<br/>(crop region only, no copy;<br/>skipped for letterbox)"]
+        SCALE["cudaconvertscale<br/>→ canonical frame:<br/>CUDAMemory NV12, processing size,<br/>contract colour label"]
+        AS["appsink<br/>(newest frame only)"]
+        S1 --> UP
+        S2 --> UP
+        UP --> CROP --> SCALE --> AS
     end
 
-    subgraph Adapters["Adapters (auto-inserted by caps)"]
-        DEC["MJPEG decode adapter<br/>jpegdec (CPU) → cudaupload"]
-        UP["obcupload<br/>→ video/x-raw(memory:CUDAMemory), NV12"]
-        CONV1["obcconvert NV12 → BGR<br/>(GPU)"]
+    SLOT[("latest-frame slot<br/>buffer reference + sequence")]
+
+    subgraph Output["Output pipeline — fixed contract, lives for the whole stream"]
+        CLK["output clock<br/>one tick per contract period:<br/>fresh / repeat / placeholder"]
+        SRC["appsrc<br/>canonical caps"]
+        subgraph Process["Process — effect chain (empty in this step)"]
+            E1["obcblur / obcreplace<br/>(converters around effects<br/>that need another format)"]
+        end
+        CONV["cudaconvert<br/>(only if the contract format is not NV12)"]
+        DL["cudadownload<br/>(the only GPU→CPU copy)"]
+        RL["capssetter<br/>relabel 2:4:5:4 (loopback)"]
+        K1["v4l2sink → v4l2loopback<br/>contract caps, sync=false"]
+        CLK --> SRC --> E1 --> CONV --> DL --> RL --> K1
     end
 
-    subgraph Effects["Effects — CUDAMemory BGR in/out, one CUDA stream"]
-        E0["passthrough"]
-        E1["obcblur<br/>(Maxine Background Blur)"]
-        E2["obcreplace<br/>(Maxine AIGS matte + composite)"]
-    end
-
-    subgraph Out["Output adapters"]
-        CONV2["obcconvert BGR → NV12/YUYV<br/>(GPU)"]
-        DL["download to system memory<br/>(the only GPU→CPU copy)"]
-    end
-
-    subgraph Sinks
-        K1["v4l2sink → v4l2loopback"]
-        K2["pipewiresink (planned)"]
-    end
-
-    S1 --> UP --> CONV1
-    S2 --> DEC --> CONV1
-    CONV1 --> E0 --> E1 --> E2 --> CONV2 --> DL
-    DL --> K1
+    AS --> SLOT --> CLK
+    K2["pipewiresink (planned)"]
     DL -.-> K2
 ```
 
 These are the extension points, and each is a trait or element boundary:
 - **New source:** another camera or a screen capture. It is a new source element, and adapters cover format gaps (for example the MJPEG decode adapter).
-- **New effect:** a new element that accepts CUDAMemory BGR, backed by any `InferenceBackend`.
+- **New effect:** a new element in the Process stage that accepts canonical CUDAMemory NV12 (or gets converters around it), backed by any `InferenceBackend`.
 - **New backend:** TensorRT, CPU, or another vendor. It is a new `InferenceBackend` impl, and the effect elements are unchanged.
-- **New sink:** PipeWire or recording. It is a new sink element after the output adapters.
+- **New sink:** PipeWire or recording. It is a new output with its own contract, fed after the Process stage.
 
 ## 3. On-demand lifecycle
 
@@ -123,7 +134,7 @@ stateDiagram-v2
     Streaming --> Draining: last consumer closed
     Draining --> Streaming: consumer reopens
     Draining --> Idle: grace expired → teardown,<br/>release CUDA ctx, close camera
-    Streaming --> Starting: camera / source change (rebuild)
+    Streaming --> Streaming: camera / source change<br/>(rebuild the ingest pipeline only;<br/>output keeps its contract and clock)
     Failed --> Idle: reset / retry
 ```
 

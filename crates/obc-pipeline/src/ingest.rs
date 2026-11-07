@@ -1,0 +1,540 @@
+//! The Ingest stage: one pipeline per source, from the camera to canonical
+//! frames in the output's slot (`docs/adr/0009-ingest-process-output.md`).
+//!
+//! ```text
+//! v4l2src device=<camera> io-mode=mmap
+//!   ! capsfilter  <camera mode>
+//!   ! queue       max-size-buffers=2 leaky=downstream
+//!   [ ! videoconvert ! capsfilter video/x-raw,format=NV12 ]   CPU convert (YUY2, UYVY)
+//!   [ ! jpegdec      ! capsfilter video/x-raw,format=I420 ]   CPU decode (MJPEG)
+//!   ! cudaupload
+//!   ! capsfilter  video/x-raw(memory:CUDAMemory),format=<uploaded format>
+//!   [ ! videocrop ]                                          crop-to-fill policy only
+//!   ! cudaconvertscale add-borders=<letterbox>
+//!   ! capsfilter  <canonical caps>
+//!   ! appsink     max-buffers=1 leaky-type=downstream -> latest-frame slot
+//! ```
+//!
+//! Everything from `cudaupload` on is the **canonical tail**
+//! ([`canonical_tail`]), shared by every source: it can be fed from any
+//! system-memory source (a test pattern, in the GPU-only tests).
+//!
+//! **Crop and scale in one pass.** `videocrop` on CUDA memory copies
+//! nothing: it attaches a crop region (`GstVideoCropMeta`), which
+//! `cudaconvertscale` honours while scaling. The crop rectangle comes from
+//! [`crate::geometry::crop_for`]. With the letterbox policy there is no
+//! `videocrop`, and `cudaconvertscale` adds the black borders.
+//!
+//! **Colour.** The canonical caps fix the colorimetry, so `cudaconvertscale`
+//! converts whatever was uploaded to the contract's label in the same pass:
+//! the full-range BT.601 output of `jpegdec` (`1:4:0:0`) becomes limited
+//! range for a limited contract, and a camera label that differs from the
+//! contract's is converted. A camera mode that already matches the canonical
+//! caps passes through without CUDA work. The CPU convert adapter keeps the
+//! camera's label up to `cudaupload` ([`crate::pipeline::pinned_caps`]).
+//!
+//! **One CUDA context.** [`Ingest::start`] sets the output pipeline's CUDA
+//! context on the ingest pipeline before it opens anything, so canonical
+//! frames reach the output as CUDA memory of the same context, without a
+//! copy.
+//!
+//! **Camera controls.** An ingest optionally pins the UVC
+//! `exposure_dynamic_framerate` control off while it runs (a camera with it
+//! on may lower its frame rate in dim light) and restores it when stopped or
+//! dropped.
+
+use std::path::PathBuf;
+
+use gst::prelude::*;
+use obc_core::{AspectPolicy, VideoMode};
+
+use crate::capability::IngestPath;
+use crate::controls::{CID_EXPOSURE_AUTO_PRIORITY, ControlGuard, CtrlSkip, get_ctrl, probe_ctrl};
+use crate::frame::{Canonical, FrameWriter};
+use crate::geometry::{Crop, crop_for};
+use crate::pipeline::{
+    MediaPipeline, PipelineError, add_linked, camera_head, capsfilter, cuda_caps, make, names,
+};
+
+/// The GStreamer context type that carries a `GstCudaContext`.
+pub const CUDA_CONTEXT_TYPE: &str = "gst.cuda.context";
+
+/// The `GstCudaContext` object a `gst.cuda.context` context carries: two
+/// pipelines share CUDA memory without copies when these are the same
+/// object.
+pub fn cuda_context_object(ctx: &gst::Context) -> Option<gst::Object> {
+    ctx.structure().get::<gst::Object>(CUDA_CONTEXT_TYPE).ok()
+}
+
+/// One camera source.
+#[derive(Debug, Clone)]
+pub struct IngestConfig {
+    pub camera: PathBuf,
+    /// A concrete mode the camera offers (see
+    /// [`crate::capability::choose_mode`]); its format decides the adapter.
+    pub mode: VideoMode,
+    pub aspect: AspectPolicy,
+    /// `queue max-size-buffers` (leaky=downstream).
+    pub queue_buffers: u32,
+    /// `v4l2src io-mode` nick (`mmap`, `dmabuf`, `auto`, ...).
+    pub camera_io_mode: String,
+    /// Pin `exposure_dynamic_framerate` off while this ingest runs.
+    pub fixed_framerate: bool,
+}
+
+impl IngestConfig {
+    pub fn new(camera: PathBuf, mode: VideoMode) -> Self {
+        IngestConfig {
+            camera,
+            mode,
+            aspect: AspectPolicy::default(),
+            queue_buffers: 2,
+            camera_io_mode: "mmap".to_string(),
+            fixed_framerate: false,
+        }
+    }
+
+    /// How frames of the configured mode reach CUDA memory.
+    pub fn ingest_path(&self) -> IngestPath {
+        IngestPath::of(self.mode.format)
+    }
+}
+
+/// The canonical tail of an ingest pipeline (see the module docs):
+/// `cudaupload ! capsfilter (CUDA, upload_format) [! videocrop] !
+/// cudaconvertscale ! capsfilter (canonical)`, for system-memory frames of
+/// `upload_format` at `width` x `height`. Returns the elements in link order
+/// and the crop applied.
+pub fn canonical_tail(
+    upload_format: &str,
+    width: u32,
+    height: u32,
+    canonical: &Canonical,
+    aspect: AspectPolicy,
+) -> Result<(Vec<gst::Element>, Crop), PipelineError> {
+    use names::*;
+    let crop = crop_for(aspect, width, height, canonical.width, canonical.height);
+    let mut tail = vec![
+        make("cudaupload", UPLOAD)?,
+        capsfilter(CUDA_CAPS, &cuda_caps(upload_format))?,
+    ];
+    if aspect == AspectPolicy::Crop {
+        let c = make("videocrop", CROP)?;
+        for (side, v) in [
+            ("left", crop.left),
+            ("right", crop.right),
+            ("top", crop.top),
+            ("bottom", crop.bottom),
+        ] {
+            c.set_property(side, i32::try_from(v).unwrap_or(i32::MAX));
+        }
+        tail.push(c);
+    }
+    let scale = make("cudaconvertscale", SCALE)?;
+    scale.set_property("add-borders", aspect == AspectPolicy::Letterbox);
+    tail.push(scale);
+    tail.push(capsfilter(CANONICAL_CAPS, &canonical.caps_string())?);
+    Ok((tail, crop))
+}
+
+/// The `appsink` ending an ingest pipeline: keeps at most one frame, drops
+/// older ones, and hands each frame to `writer` (O(1), see
+/// [`FrameWriter::put`]).
+pub fn frames_sink(name: &str, writer: FrameWriter) -> gst::Element {
+    let sink = gst_app::AppSink::builder()
+        .name(name)
+        .sync(false)
+        .max_buffers(1)
+        .leaky_type(gst_app::AppLeakyType::Downstream)
+        .wait_on_eos(false)
+        .enable_last_sample(false)
+        .build();
+    sink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Flushing)?;
+                if let Some(buffer) = sample.buffer_owned() {
+                    writer.put(buffer);
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+    sink.upcast()
+}
+
+/// What happened to the camera's `exposure_dynamic_framerate` control.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ControlReport {
+    /// Why the control was not read (absent, disabled, unreadable).
+    pub skipped: Option<CtrlSkip>,
+    /// Its value before this ingest started.
+    pub before: Option<i32>,
+    /// Its value while this ingest runs.
+    pub during: Option<i32>,
+    /// This ingest set it (and restores it on stop).
+    pub pinned: bool,
+    /// Pinning was asked for but the control is read-only.
+    pub read_only: bool,
+}
+
+/// One running (or ready-to-run) source. See the module docs.
+///
+/// Dropping it stops the pipeline (NULL: camera closed) and then restores
+/// the camera control it pinned; [`Ingest::stop`] does the same and reports
+/// the outcome.
+#[derive(Debug)]
+pub struct Ingest {
+    // Field order is drop order: the pipeline goes to NULL before the
+    // control is restored.
+    pipeline: MediaPipeline,
+    guard: Option<ControlGuard>,
+    camera: Option<PathBuf>,
+    fixed_framerate: bool,
+    source_id: u64,
+    path: Option<IngestPath>,
+    crop: Crop,
+    controls: ControlReport,
+}
+
+impl Ingest {
+    /// Builds (but does not start) a camera ingest writing into `writer`.
+    pub fn build(cfg: &IngestConfig, writer: FrameWriter) -> Result<Self, PipelineError> {
+        let path = cfg.ingest_path();
+        let head = camera_head(
+            &cfg.camera,
+            &cfg.mode,
+            &cfg.camera_io_mode,
+            cfg.queue_buffers,
+        )?;
+        let mut ingest = Self::from_head(
+            head,
+            path.upload_format(cfg.mode.format),
+            (cfg.mode.width, cfg.mode.height),
+            cfg.aspect,
+            writer,
+        )?;
+        ingest.camera = Some(cfg.camera.clone());
+        ingest.fixed_framerate = cfg.fixed_framerate;
+        ingest.path = Some(path);
+        Ok(ingest)
+    }
+
+    /// Builds an ingest from any system-memory source: `head` (linked in
+    /// order) delivers `upload_format` frames of `size`; the canonical tail
+    /// and the slot writer are appended. No camera control is involved.
+    pub fn from_head(
+        head: Vec<gst::Element>,
+        upload_format: &str,
+        size: (u32, u32),
+        aspect: AspectPolicy,
+        writer: FrameWriter,
+    ) -> Result<Self, PipelineError> {
+        let source_id = writer.source_id();
+        let pipeline = gst::Pipeline::with_name(&format!("obc-ingest-{source_id}"));
+        let (tail, crop) =
+            canonical_tail(upload_format, size.0, size.1, &writer.canonical(), aspect)?;
+        let mut chain = head;
+        chain.extend(tail);
+        chain.push(frames_sink(names::FRAMES_SINK, writer));
+        add_linked(&pipeline, &chain)?;
+        Ok(Ingest {
+            pipeline: MediaPipeline::from_parts(pipeline, None),
+            guard: None,
+            camera: None,
+            fixed_framerate: false,
+            source_id,
+            path: None,
+            crop,
+            controls: ControlReport::default(),
+        })
+    }
+
+    /// Starts the source: applies the camera-control policy, shares the
+    /// output's CUDA context (`cuda`, see [`crate::output::Output::cuda_context`])
+    /// and goes to PLAYING. The context is required: an ingest with a
+    /// context of its own would hand the output frames of another context.
+    /// On error the pipeline is back in NULL and any control already pinned
+    /// is restored when the ingest is dropped.
+    pub fn start(&mut self, cuda: &gst::Context) -> Result<(), PipelineError> {
+        if cuda.context_type() != CUDA_CONTEXT_TYPE {
+            return Err(PipelineError::Cuda(format!(
+                "an ingest needs a {CUDA_CONTEXT_TYPE} context, not {}",
+                cuda.context_type()
+            )));
+        }
+        self.apply_controls()?;
+        // Before NULL -> READY: the CUDA elements take it instead of
+        // creating their own.
+        self.pipeline.pipeline().set_context(cuda);
+        if let Err(e) = self.pipeline.play() {
+            let _ = self.pipeline.pipeline().set_state(gst::State::Null);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn apply_controls(&mut self) -> Result<(), PipelineError> {
+        let Some(camera) = &self.camera else {
+            return Ok(());
+        };
+        if self.guard.is_some() {
+            return Ok(());
+        }
+        let mut report = ControlReport::default();
+        match probe_ctrl(camera, CID_EXPOSURE_AUTO_PRIORITY) {
+            Err(skip) => report.skipped = Some(skip),
+            Ok((info, value)) => {
+                report.before = Some(value);
+                if self.fixed_framerate && value != 0 {
+                    if info.read_only() {
+                        report.read_only = true;
+                    } else {
+                        let guard = ControlGuard::set(camera, CID_EXPOSURE_AUTO_PRIORITY, value, 0)
+                            .map_err(|e| PipelineError::Control {
+                                device: camera.display().to_string(),
+                                message: format!("setting exposure_dynamic_framerate=0: {e}"),
+                            })?;
+                        self.guard = Some(guard);
+                        report.pinned = true;
+                    }
+                }
+                report.during = get_ctrl(camera, CID_EXPOSURE_AUTO_PRIORITY).ok();
+            }
+        }
+        self.controls = report;
+        Ok(())
+    }
+
+    /// Stops the source: the pipeline goes to NULL (the camera is closed
+    /// when this returns), then a pinned control is restored.
+    pub fn stop(self) -> Result<(), PipelineError> {
+        let Ingest {
+            pipeline,
+            guard,
+            camera,
+            ..
+        } = self;
+        let stopped = pipeline.shutdown();
+        let restored = match guard {
+            Some(g) => g.restore().map_err(|e| PipelineError::Control {
+                device: camera.map(|c| c.display().to_string()).unwrap_or_default(),
+                message: format!("restoring exposure_dynamic_framerate: {e}"),
+            }),
+            None => Ok(()),
+        };
+        stopped.and(restored)
+    }
+
+    pub fn pipeline(&self) -> &MediaPipeline {
+        &self.pipeline
+    }
+
+    /// The id of the source in the frames it writes ([`crate::frame::Frame::source_id`]).
+    pub fn source_id(&self) -> u64 {
+        self.source_id
+    }
+
+    /// The camera adapter (`None` for a non-camera source).
+    pub fn ingest_path(&self) -> Option<IngestPath> {
+        self.path
+    }
+
+    /// The crop applied to the source frames.
+    pub fn crop(&self) -> Crop {
+        self.crop
+    }
+
+    /// The camera-control outcome of [`Self::start`].
+    pub fn controls(&self) -> &ControlReport {
+        &self.controls
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use obc_core::OutputContract;
+
+    use super::*;
+    use crate::slot::Slot;
+
+    fn writer(contract: &OutputContract) -> FrameWriter {
+        FrameWriter::new(
+            Arc::new(Slot::new()),
+            Instant::now(),
+            1,
+            Canonical::of(contract),
+        )
+    }
+
+    fn have(factories: &[&str]) -> bool {
+        gst::init().unwrap();
+        for f in factories {
+            if gst::ElementFactory::find(f).is_none() {
+                eprintln!("SKIPPED: GStreamer element {f} is not installed");
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The builder inserts the CPU adapter the camera format needs, uploads
+    /// the adapter's output format, and ends in the canonical caps whatever
+    /// the camera delivers.
+    #[test]
+    fn ingest_adapters_per_format() {
+        if !have(&[
+            "v4l2src",
+            "cudaupload",
+            "cudaconvertscale",
+            "videocrop",
+            "jpegdec",
+            "videoconvert",
+        ]) {
+            return;
+        }
+        let caps_of = |p: &Ingest, name: &str| {
+            p.pipeline()
+                .element(name)
+                .map(|e| e.property::<gst::Caps>("caps").to_string())
+        };
+        let contract = OutputContract::default();
+        for (mode, adapter, upload_fmt) in [
+            ("NV12:1920x1080@60", None, "NV12"),
+            ("YUY2:1920x1080@60", Some(names::INGEST_CONVERT), "NV12"),
+            ("MJPEG:1920x1080@30", Some(names::DECODE), "I420"),
+            ("MJPEG:640x480@30", Some(names::DECODE), "I420"),
+        ] {
+            let cfg = IngestConfig::new("/dev/null-camera".into(), mode.parse().unwrap());
+            let p = Ingest::build(&cfg, writer(&contract)).unwrap();
+            for a in [names::DECODE, names::INGEST_CONVERT] {
+                assert_eq!(
+                    p.pipeline().element(a).is_some(),
+                    adapter == Some(a),
+                    "{mode}: {a}"
+                );
+            }
+            assert_eq!(
+                p.pipeline().element(names::INGEST_CAPS).is_some(),
+                adapter.is_some()
+            );
+            if adapter.is_some() {
+                assert_eq!(
+                    caps_of(&p, names::INGEST_CAPS).unwrap(),
+                    format!("video/x-raw, format=(string){upload_fmt}"),
+                    "{mode}"
+                );
+            }
+            assert_eq!(
+                caps_of(&p, names::CUDA_CAPS).unwrap(),
+                format!("video/x-raw(memory:CUDAMemory), format=(string){upload_fmt}"),
+                "{mode}"
+            );
+            assert_eq!(
+                caps_of(&p, names::CANONICAL_CAPS).unwrap(),
+                "video/x-raw(memory:CUDAMemory), format=(string)NV12, width=(int)1920, \
+                 height=(int)1080, pixel-aspect-ratio=(fraction)1/1, \
+                 colorimetry=(string)2:4:5:1",
+                "{mode}"
+            );
+            assert!(p.pipeline().element(names::TO_OUT).is_none());
+            assert!(p.pipeline().element(names::DOWNLOAD).is_none());
+            let camera_caps = caps_of(&p, names::CAMERA_CAPS).unwrap();
+            assert_eq!(
+                camera_caps.starts_with("image/jpeg"),
+                mode.starts_with("MJPEG"),
+                "{mode}: {camera_caps}"
+            );
+            assert_eq!(p.ingest_path(), Some(cfg.ingest_path()));
+            // Crop-to-fill: only the 4:3 mode is cropped, 60 rows each side.
+            let crop = p.pipeline().element(names::CROP).expect("videocrop");
+            let want = if mode.ends_with("640x480@30") {
+                (60, 60)
+            } else {
+                (0, 0)
+            };
+            assert_eq!(
+                (crop.property::<i32>("top"), crop.property::<i32>("bottom")),
+                want,
+                "{mode}"
+            );
+            assert_eq!(
+                (p.crop().top, p.crop().bottom),
+                (want.0 as u32, want.1 as u32)
+            );
+            let scale = p.pipeline().element(names::SCALE).unwrap();
+            assert!(!scale.property::<bool>("add-borders"));
+        }
+    }
+
+    #[test]
+    fn letterbox_has_no_crop_and_adds_borders() {
+        if !have(&["videotestsrc", "cudaupload", "cudaconvertscale"]) {
+            return;
+        }
+        let src = make("videotestsrc", "src").unwrap();
+        let p = Ingest::from_head(
+            vec![src],
+            "NV12",
+            (640, 480),
+            AspectPolicy::Letterbox,
+            writer(&OutputContract::default()),
+        )
+        .unwrap();
+        assert!(p.pipeline().element(names::CROP).is_none());
+        assert!(p.crop().is_empty());
+        let scale = p.pipeline().element(names::SCALE).unwrap();
+        assert!(scale.property::<bool>("add-borders"));
+        assert!(p.pipeline().element(names::FRAMES_SINK).is_some());
+        assert_eq!(p.source_id(), 1);
+        assert_eq!(p.controls(), &ControlReport::default());
+    }
+
+    #[test]
+    fn starting_with_a_context_of_another_type_is_refused() {
+        if !have(&[
+            "videotestsrc",
+            "cudaupload",
+            "cudaconvertscale",
+            "videocrop",
+        ]) {
+            return;
+        }
+        let mut p = Ingest::from_head(
+            vec![make("videotestsrc", "src").unwrap()],
+            "NV12",
+            (640, 480),
+            AspectPolicy::Crop,
+            writer(&OutputContract::default()),
+        )
+        .unwrap();
+        let other = gst::Context::new("not.a.cuda.context", true);
+        assert!(matches!(p.start(&other), Err(PipelineError::Cuda(_))));
+        let (_, state, _) = p.pipeline().pipeline().state(gst::ClockTime::ZERO);
+        assert_eq!(state, gst::State::Null);
+    }
+
+    #[test]
+    fn stopping_an_unstarted_ingest_is_clean() {
+        if !have(&[
+            "videotestsrc",
+            "cudaupload",
+            "cudaconvertscale",
+            "videocrop",
+        ]) {
+            return;
+        }
+        let p = Ingest::from_head(
+            vec![make("videotestsrc", "src").unwrap()],
+            "NV12",
+            (640, 480),
+            AspectPolicy::Crop,
+            writer(&OutputContract::default()),
+        )
+        .unwrap();
+        p.stop().unwrap();
+    }
+}

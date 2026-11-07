@@ -1,14 +1,35 @@
-//! `obc-bench`: passthrough benchmark.
+//! `obc-bench`: benchmark and development runner for the stream.
 //!
-//! Captures from the selected camera, moves frames through CUDA memory and
-//! writes them to a v4l2loopback device, measuring sink fps, added latency,
-//! process CPU, GPU utilisation/memory and the caps on every link. See
-//! `docs/benchmarks/passthrough.md` for the method and results.
+//! Runs the three-stage stream of `docs/adr/0009-ingest-process-output.md`:
+//! one ingest pipeline per camera feeding a latest-frame slot, and one output
+//! pipeline with a fixed contract (`--output`, `--output-format`,
+//! `--output-range`) paced by its own clock, writing to a v4l2loopback
+//! device. It measures output fps, input fps per camera, the frames the
+//! output clock emitted (fresh, repeat, placeholder) and the input frames it
+//! superseded, source-switch gaps, added latency, process CPU, GPU
+//! utilisation/memory and the caps on every link. See
+//! `docs/benchmarks/io-split.md` for the method and results.
+//!
+//! Switching: `--switch-every N` moves to the next camera every N seconds,
+//! and SIGUSR1 moves to it at once. The cycle is the `--camera` list when it
+//! names two or more cameras; otherwise the selected camera, then every other
+//! discovered colour camera. Each camera's mode is chosen from `--mode`
+//! against its own capabilities. Both act inside the measurement window
+//! only: a SIGUSR1 received before it opens (camera start, warm-up) is
+//! discarded when it opens, and a timer switch never fires at or after its
+//! end. A switch whose new camera has not emitted its first frame when the
+//! window closes is reported as abandoned.
+//!
+//! `--output-range full` is refused for the loopback before anything
+//! streams: v4l2loopback carries no colour range, so a consumer would read
+//! the stream as limited range.
 //!
 //! `--duration 0` streams until SIGINT/SIGTERM instead, printing a status
-//! line every 5 s (no luma stamp, no loopback consumer).
+//! line every 5 s and one line per switch. `--consumer` is allowed there for
+//! the consumer frame rate only: the luma stamp the end-to-end latency needs
+//! is applied in measured runs only.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17,34 +38,40 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use gst::prelude::*;
-use obc_core::{CameraSelector, DEFAULT_SINK_LABEL, ModeRequest, OutputFormat, SinkSelector};
-use obc_pipeline::capability::choose_mode;
-use obc_pipeline::controls::{
-    CID_EXPOSURE_AUTO_PRIORITY, ControlGuard, CtrlSkip, get_ctrl, probe_ctrl,
+use obc_core::{
+    AspectPolicy, CameraSelector, ColourRange, DEFAULT_SINK_LABEL, ModeRequest, OutputContract,
+    OutputFormat, SinkSelector,
 };
-use obc_pipeline::discovery::resolve_node_path;
+use obc_pipeline::capability::choose_mode;
+use obc_pipeline::controls::{CID_EXPOSURE_AUTO_PRIORITY, get_ctrl};
+use obc_pipeline::discovery::{CameraList, resolve_node_path};
 use obc_pipeline::gpu::{GpuInfo, GpuSample, GpuSampler};
-use obc_pipeline::instrument::{Recorder, Samples, Totals};
+use obc_pipeline::instrument::{Recorder, Samples, SwitchGap, Totals};
+use obc_pipeline::output::{check_sink_range, contract_caps_string};
 use obc_pipeline::pipeline::names;
 use obc_pipeline::stats::{self, FpsReport, Summary};
 use obc_pipeline::{
-    DeviceInfo, DiscoveryRoute, GpuStage, IngestPath, LinkCaps, MediaPipeline, ModeChoice,
-    PipelineConfig, all_cuda_between, list_cameras, scan_sysfs, select_camera, select_sink,
+    ControlReport, DeviceInfo, DiscoveryRoute, GpuStage, IngestConfig, IngestPath, LinkCaps,
+    MediaPipeline, ModeChoice, Output, OutputConfig, OutputCounts, OutputSink, Session,
+    all_cuda_between, list_cameras, scan_sysfs, select_camera, select_sink,
 };
 use serde::Serialize;
 
-const METHOD: &str = "Primary: pad probes on the v4l2src src pad and the v4l2sink sink pad stamp each buffer with CLOCK_MONOTONIC, keyed by buffer PTS (unchanged through queue/cudaupload/cudaconvert/cudadownload); added latency = sink-ready time - src-pad time, i.e. the delay our stages add over an app reading the camera directly (which receives the same buffer at the src-pad moment). Sink-ready = after the sink probe maps the buffer readable: cudadownload hands v4l2sink GstCudaMemory-backed buffers and CUDA work is asynchronous, so kernels and the device->host copy complete on first map; the probe's map does exactly the work v4l2sink's own map would do next. added_at_sink_pad_ms (before that map) is reported as a secondary figure and under-states the cost. Via consumer: a bench-only probe writes the PTS into the first 16 luma bytes just before v4l2sink; an in-process consumer pipeline (v4l2src on the loopback ! fakesink) decodes it on arrival on the same clock: camera src pad -> consumer receipt. Limits: excludes sensor exposure and USB transfer (identical for a direct reader, so it cancels); excludes the consumer app's own render/display (no glass-to-glass measurement); the stamp alters 16 luma pixels in bench mode only. gst_latency_query is what elements declare, not a measurement.";
+const METHOD: &str = "Primary: a pad probe on each ingest pipeline's v4l2src src pad stamps every camera buffer with CLOCK_MONOTONIC, keyed by (source, camera PTS); the PTS is unchanged through the ingest pipeline into the latest-frame slot. The output clock's emit observer reports every tick: its output PTS (tick x period), whether it emitted a fresh frame, a repeat or a placeholder, and the frame's source and camera PTS; a bounded side table maps the output PTS to that emission and to the fresh frame's camera src-pad time. A pad probe on the output's v4l2sink sink pad joins the buffer by output PTS. Added latency = sink-ready time - camera src-pad time, fresh frames only: the delay our stages add over an app reading the camera directly, including the wait for the next output tick (0 to 1 output period). Sink-ready = after the sink probe maps the buffer readable: cudadownload hands v4l2sink GstCudaMemory-backed buffers and CUDA work is asynchronous, so kernels and the device->host copy complete on first map; the probe's map does exactly the work v4l2sink's own map would do next. added_at_sink_pad_ms (before that map) is a secondary figure and under-states the cost. Output fps counts every buffer at the v4l2sink sink pad by arrival time, in 1 s windows. Via consumer (measured runs only): a bench-only probe writes the output PTS into the first 16 luma bytes just before v4l2sink; an in-process consumer pipeline (v4l2src on the loopback ! fakesink) decodes it on arrival on the same clock: camera src pad -> consumer receipt, fresh frames only. Limits: excludes sensor exposure and USB transfer (identical for a direct reader, so it cancels); excludes the consumer app's own render/display (no glass-to-glass measurement); the stamp alters 16 luma pixels in measured runs only. gst_latency_query is what elements declare, not a measurement.";
 
-/// Passthrough benchmark: camera -> CUDA memory -> v4l2loopback.
+/// Benchmark and development runner: cameras -> ingest -> latest-frame slot
+/// -> output clock -> v4l2loopback.
 #[derive(Debug, Parser)]
 #[command(name = "obc-bench", version)]
 struct Args {
     /// Camera: a card-name substring (case-insensitive), a USB vid:pid
     /// (exactly hhhh:hhhh), or a /dev/videoN path (or /dev/v4l/... link).
-    /// Omitted: the first colour camera offering --mode exactly, else the
-    /// best degraded match.
+    /// Repeatable: two or more give the switching cycle, in order. Omitted:
+    /// the first colour camera offering --mode exactly, else the best
+    /// degraded match. With one or none, the cycle continues with every
+    /// other discovered colour camera.
     #[arg(long, value_name = "NAME|VID:PID|/dev/videoN")]
-    camera: Option<CameraSelector>,
+    camera: Vec<CameraSelector>,
     /// v4l2loopback card label of the output device.
     #[arg(long, default_value = DEFAULT_SINK_LABEL)]
     sink_label: String,
@@ -52,41 +79,60 @@ struct Args {
     #[arg(long)]
     sink_device: Option<PathBuf>,
     /// Requested capture mode, WxH@FPS (any format) or FORMAT:WxH@FPS
-    /// (FORMAT: NV12, YUY2/YUYV, MJPEG, ...). Resolved against the camera's
-    /// capabilities; a mode it does not offer degrades (logged).
+    /// (FORMAT: NV12, YUY2/YUYV, MJPEG, ...). Resolved against each camera's
+    /// capabilities; a mode a camera does not offer degrades (logged).
     #[arg(long, default_value = "1920x1080@60")]
     mode: ModeRequest,
-    /// GPU stage: passthrough | roundtrip (NV12 -> BGR -> out, in CUDA memory).
-    #[arg(long, default_value = "passthrough")]
-    gpu_stage: GpuStage,
-    /// Loopback pixel format: nv12 | i420.
+    /// Output contract size and frame rate, WxH@FPS (FPS may be N/D).
+    #[arg(long, default_value = "1920x1080@30")]
+    output: OutputContract,
+    /// Output pixel format: nv12 | i420.
     #[arg(long, default_value = "nv12")]
     output_format: OutputFormat,
+    /// Output colour range: limited | full.
+    #[arg(long, default_value = "limited")]
+    output_range: ColourRange,
+    /// How a source of another aspect ratio is fitted: crop (centre crop to
+    /// fill) | letterbox (black borders).
+    #[arg(long, default_value = "crop")]
+    aspect: AspectPolicy,
+    /// Milliseconds without input after which the output sends placeholder
+    /// (black) frames instead of repeating the last one.
+    #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(1..=60_000))]
+    input_gap_ms: u64,
+    /// Move to the next camera every this many seconds (after warm-up).
+    #[arg(long, value_parser = positive_secs)]
+    switch_every: Option<f64>,
+    /// Process stage: passthrough | roundtrip (NV12 -> BGR -> NV12, in CUDA
+    /// memory; the conversion cost of an effect working on BGR).
+    #[arg(long, default_value = "passthrough")]
+    gpu_stage: GpuStage,
     /// Measured seconds (after warm-up). 0 streams until SIGINT/SIGTERM with
-    /// a status line every 5 s (no --consumer, no luma stamp).
+    /// a status line every 5 s (--consumer then measures consumer fps only).
     #[arg(long, default_value_t = 30.0, value_parser = non_negative_secs)]
     duration: f64,
-    /// Seconds after the first frame reaches the sink before measuring.
+    /// Seconds after the first camera frame reaches the output before measuring.
     #[arg(long, default_value_t = 3.0, value_parser = non_negative_secs)]
     warmup: f64,
     /// Write the full JSON report here.
     #[arg(long)]
     json: Option<PathBuf>,
-    /// Also read the loopback with an in-process consumer (consumer fps and
-    /// end-to-end latency via a luma stamp). Not with --duration 0.
+    /// Also read the loopback with an in-process consumer: consumer fps,
+    /// and in measured runs the end-to-end latency via a luma stamp.
     #[arg(long)]
     consumer: bool,
     /// After teardown and dropping all GStreamer/NVML objects, stay alive this
     /// many seconds (for external dGPU-suspend checks).
     #[arg(long, default_value_t = 0.0, value_parser = non_negative_secs)]
     linger_after_teardown: f64,
-    /// Dump the pipeline graph (.dot, caps on every link) here once PLAYING.
+    /// Dump the output and current ingest graphs (.dot, caps on every link)
+    /// here once PLAYING.
     #[arg(long)]
     dot_dir: Option<PathBuf>,
     /// Camera discovery route: auto | monitor | sysfs.
     #[arg(long, default_value = "auto")]
     discovery: DiscoveryRoute,
-    /// queue max-size-buffers (leaky=downstream).
+    /// Ingest queue max-size-buffers (leaky=downstream).
     #[arg(long, default_value_t = 2)]
     queue_buffers: u32,
     /// v4l2src io-mode (mmap, dmabuf, auto, ...); checked against v4l2src's
@@ -102,16 +148,17 @@ struct Args {
     /// NVML sampling interval in milliseconds.
     #[arg(long, default_value_t = 1000)]
     gpu_interval_ms: u64,
-    /// Seconds of GPU baseline sampling before the pipeline is built.
+    /// Seconds of GPU baseline sampling before the pipelines are built.
     #[arg(long, default_value_t = 3.0, value_parser = non_negative_secs)]
     gpu_baseline: f64,
-    /// Temporarily set the camera's exposure_dynamic_framerate (UVC "exposure
-    /// auto priority") to 0 so it cannot lower its frame rate in dim light;
-    /// the original value is restored on every exit path that unwinds
-    /// (success, error, panic, SIGINT/SIGTERM), not on SIGKILL/SIGQUIT.
+    /// While a camera streams, set its exposure_dynamic_framerate (UVC
+    /// "exposure auto priority") to 0 so it cannot lower its frame rate in
+    /// dim light. Each camera's original value is restored when its ingest
+    /// stops (on a switch and on every exit path that unwinds: success,
+    /// error, panic, SIGINT/SIGTERM), not on SIGKILL/SIGQUIT.
     #[arg(long)]
     camera_fixed_framerate: bool,
-    /// Print debug details (camera candidates, skipped camera controls).
+    /// Print debug details (camera candidates).
     #[arg(short, long)]
     verbose: bool,
 }
@@ -122,14 +169,19 @@ impl Args {
         self.duration == 0.0
     }
 
-    /// Cross-argument checks, before any device is touched.
-    fn validate(&self) -> Result<()> {
-        if self.streaming() && self.consumer {
-            bail!(
-                "--consumer cannot be combined with --duration 0: the consumer measurement needs the luma stamp, which is never applied while streaming"
-            );
+    /// The consumer reads the luma stamp: measured runs only.
+    fn consumer_stamp(&self) -> bool {
+        self.consumer && !self.streaming()
+    }
+
+    /// The output contract: `--output` with `--output-format` and
+    /// `--output-range`.
+    fn contract(&self) -> OutputContract {
+        OutputContract {
+            format: self.output_format,
+            range: self.output_range,
+            ..self.output
         }
-        Ok(())
     }
 
     fn debug(&self, msg: impl AsRef<str>) {
@@ -155,7 +207,6 @@ fn parse_secs(s: &str, allow_zero: bool) -> Result<f64, String> {
     Ok(v)
 }
 
-#[cfg(test)]
 fn positive_secs(s: &str) -> Result<f64, String> {
     parse_secs(s, false)
 }
@@ -167,38 +218,56 @@ fn non_negative_secs(s: &str) -> Result<f64, String> {
 /// Set by SIGINT/SIGTERM; the run loop checks it and falls through to the
 /// normal teardown, control restore and report.
 static STOP: AtomicBool = AtomicBool::new(false);
+/// Set by SIGUSR1; the run loop clears it and switches to the next camera.
+static NEXT: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_stop_signal(_sig: libc::c_int) {
     // Async-signal-safe: a single atomic store.
     STOP.store(true, Ordering::SeqCst);
 }
 
+extern "C" fn on_next_signal(_sig: libc::c_int) {
+    // Async-signal-safe: a single atomic store.
+    NEXT.store(true, Ordering::SeqCst);
+}
+
 fn stop_requested() -> bool {
     STOP.load(Ordering::SeqCst)
 }
 
-/// Routes SIGINT and SIGTERM to [`STOP`]. Repeats are idempotent and never
-/// fall back to the default action: `timeout(1)` and a terminal both deliver
-/// the same signal twice in quick succession (to the child, then to its
-/// process group), and dying on the second would skip the control restore.
-/// A stuck teardown is ended with SIGQUIT or SIGKILL (no restore then).
-fn install_stop_handlers() -> Result<()> {
-    for sig in [libc::SIGINT, libc::SIGTERM] {
-        // SAFETY: `sa` is zero-initialised (a valid empty mask and flags)
-        // before the handler, flags and mask are set; the handler only stores
-        // to an atomic, which is async-signal-safe.
-        let rc = unsafe {
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = on_stop_signal as *const () as libc::sighandler_t;
-            sa.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut sa.sa_mask);
-            libc::sigaction(sig, &sa, std::ptr::null_mut())
-        };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error()).context("installing signal handler");
-        }
+fn next_requested() -> bool {
+    NEXT.load(Ordering::SeqCst)
+}
+
+/// Installs `handler` for `sig` with `SA_RESTART`.
+fn install_handler(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) -> Result<()> {
+    // SAFETY: `sa` is zero-initialised (a valid empty mask and flags) before
+    // the handler, flags and mask are set; the handlers only store to an
+    // atomic, which is async-signal-safe.
+    let rc = unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handler as *const () as libc::sighandler_t;
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(sig, &sa, std::ptr::null_mut())
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("installing signal handler");
     }
     Ok(())
+}
+
+/// Routes SIGINT and SIGTERM to [`STOP`] and SIGUSR1 to [`NEXT`]. Repeats
+/// are idempotent and never fall back to the default action: `timeout(1)`
+/// and a terminal both deliver the same signal twice in quick succession (to
+/// the child, then to its process group), and dying on the second would
+/// skip the control restore. A stuck teardown is ended with SIGQUIT or
+/// SIGKILL (no restore then).
+fn install_signal_handlers() -> Result<()> {
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        install_handler(sig, on_stop_signal)?;
+    }
+    install_handler(libc::SIGUSR1, on_next_signal)
 }
 
 /// Sleeps `secs`, returning early once a stop signal arrived.
@@ -213,21 +282,53 @@ fn sleep_unless_stopped(secs: f64) {
     }
 }
 
+/// Warnings kept for the report; later ones are only counted, so a long
+/// run (`--duration 0`) holds a bounded list.
+const WARNINGS_KEPT: usize = 200;
+
+/// The first [`WARNINGS_KEPT`] warnings of a run, and how many more there
+/// were.
+#[derive(Debug, Default)]
+struct Warnings {
+    kept: Vec<String>,
+    suppressed: u64,
+}
+
+impl Warnings {
+    fn push(&mut self, msg: String) {
+        if self.kept.len() < WARNINGS_KEPT {
+            self.kept.push(msg);
+        } else {
+            self.suppressed += 1;
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct BusCounters {
+    /// QoS drops by `source/element`, whole run: the output pipeline's, and
+    /// those of every ingest run that ended, summed per camera. Keyed by
+    /// camera rather than by ingest pipeline, so switching adds no keys.
     qos_dropped: BTreeMap<String, u64>,
-    warnings: Vec<String>,
-    /// Nominal frame duration of the camera mode, to turn a QoS message's
-    /// lost-time `duration` into frames (see [`account_qos_drop`]).
-    frame_ns: u64,
+    /// The running ingest's QoS drops by `source/element`. Running totals
+    /// (see [`account_qos_drop`]) restart with each ingest pipeline, so a
+    /// run is folded into [`Self::qos_dropped`] when it ends.
+    qos_run: BTreeMap<String, u64>,
+    warnings: Warnings,
 }
 
 impl BusCounters {
-    fn new(frame_ns: u64) -> Self {
-        BusCounters {
-            frame_ns,
-            ..BusCounters::default()
+    /// Adds the ended ingest run's QoS drops to the whole-run totals.
+    fn end_ingest_run(&mut self) {
+        for (k, v) in std::mem::take(&mut self.qos_run) {
+            *self.qos_dropped.entry(k).or_default() += v;
         }
+    }
+
+    /// Whole-run QoS drops, including the running ingest's.
+    fn take_qos_dropped(&mut self) -> BTreeMap<String, u64> {
+        self.end_ingest_run();
+        std::mem::take(&mut self.qos_dropped)
     }
 }
 
@@ -263,9 +364,20 @@ fn account_qos_drop(
     }
 }
 
-/// Drains `bus`, waiting up to `wait` for the first message.
-fn drain_bus(p: &MediaPipeline, c: &mut BusCounters, wait: Duration) -> Result<()> {
+/// Drains `p`'s bus, waiting up to `wait` for the first message. QoS drops
+/// go into `qos`, keyed `source/element`; `frame_ns` is the nominal frame
+/// duration of the pipeline's frames (see [`account_qos_drop`]). An error
+/// or EOS is returned as its description.
+fn drain_bus(
+    p: &MediaPipeline,
+    source: &str,
+    qos: &mut BTreeMap<String, u64>,
+    warnings: &mut Warnings,
+    wait: Duration,
+    frame_ns: u64,
+) -> Result<(), String> {
     let bus = p.bus();
+    let name = p.pipeline().name();
     let mut timeout = gst::ClockTime::from_nseconds(wait.as_nanos() as u64);
     while let Some(msg) = bus.timed_pop(timeout) {
         timeout = gst::ClockTime::ZERO;
@@ -276,21 +388,20 @@ fn drain_bus(p: &MediaPipeline, c: &mut BusCounters, wait: Duration) -> Result<(
             .unwrap_or_else(|| "?".into());
         match msg.view() {
             MessageView::Error(e) => {
-                bail!(
-                    "{} error from {src}: {} ({})",
-                    p.pipeline().name(),
+                return Err(format!(
+                    "{name} error from {src}: {} ({})",
                     e.error(),
                     e.debug().map(|d| d.to_string()).unwrap_or_default()
-                );
+                ));
             }
-            MessageView::Eos(_) => bail!("{}: unexpected EOS", p.pipeline().name()),
+            MessageView::Eos(_) => return Err(format!("{name}: unexpected EOS")),
             MessageView::Warning(w) => {
-                c.warnings.push(format!("{src}: {}", w.error()));
+                warnings.push(format!("{name}/{src}: {}", w.error()));
             }
             MessageView::Qos(q) => {
                 let (_processed, dropped) = q.stats();
-                let entry = c.qos_dropped.entry(src).or_default();
-                account_qos_drop(entry, dropped, q.duration(), c.frame_ns);
+                let entry = qos.entry(format!("{source}/{src}")).or_default();
+                account_qos_drop(entry, dropped, q.duration(), frame_ns);
             }
             MessageView::Latency(_) => {
                 let _ = p.pipeline().recalculate_latency();
@@ -318,34 +429,29 @@ struct Environment {
     online_cpus: usize,
 }
 
-#[derive(Debug, Serialize)]
-struct CameraControls {
-    /// Why exposure_dynamic_framerate was skipped (absent, disabled,
-    /// unreadable); None when the camera exposes it.
-    exposure_dynamic_framerate_skipped: Option<String>,
-    /// exposure_dynamic_framerate before the run (None: skipped).
-    exposure_dynamic_framerate_before: Option<i32>,
-    /// Value in effect during the run.
-    exposure_dynamic_framerate_during: Option<i32>,
-    /// `Some` when the bench changed it: whether the original value was put
-    /// back (None: unchanged, nothing to restore).
-    changed_and_restored: Option<Result<(), String>>,
+/// One camera of the switching cycle and the mode chosen for it.
+#[derive(Debug, Clone)]
+struct CycleCamera {
+    device: DeviceInfo,
+    choice: ModeChoice,
+    /// How it entered the cycle.
+    how: String,
+    /// Picked automatically (no selector named it).
+    auto: bool,
+}
+
+impl CycleCamera {
+    fn label(&self) -> String {
+        format!("{} ({})", self.device.card, self.device.path.display())
+    }
 }
 
 #[derive(Debug, Serialize)]
-struct ConfigReport {
+struct CameraEntry {
     camera: DeviceInfo,
-    sink: DeviceInfo,
-    camera_discovery: String,
-    camera_discovery_note: Option<String>,
-    sink_discovery: &'static str,
-    camera_controls: CameraControls,
-    /// No --camera: the camera was picked automatically.
-    camera_auto_picked: bool,
-    pipeline: PipelineConfig,
-    /// The --mode request, as given.
-    requested_mode: String,
-    /// The camera mode chosen for it.
+    /// How it entered the cycle.
+    how: String,
+    /// The camera mode chosen for --mode.
     mode: String,
     /// The chosen mode matches the request exactly.
     mode_exact: bool,
@@ -353,6 +459,67 @@ struct ConfigReport {
     mode_differences: Vec<String>,
     /// How frames reach CUDA memory (gpu-direct, cpu-convert, cpu-decode).
     ingest: IngestPath,
+}
+
+/// The `exposure_dynamic_framerate` control of one camera over the run.
+#[derive(Debug, Clone, Serialize)]
+struct CameraControls {
+    camera: PathBuf,
+    /// Why the control was skipped (absent, disabled, unreadable); None when
+    /// the camera exposes it.
+    exposure_dynamic_framerate_skipped: Option<String>,
+    /// Before the camera's first ingest started.
+    exposure_dynamic_framerate_before: Option<i32>,
+    /// While its (last) ingest ran.
+    exposure_dynamic_framerate_during: Option<i32>,
+    /// The bench set it while streaming (`--camera-fixed-framerate`).
+    pinned: bool,
+    /// Pinning was asked for but the control is read-only.
+    read_only: bool,
+    /// Read back after teardown.
+    exposure_dynamic_framerate_after_exit: Option<i32>,
+    /// The value after teardown equals the value before (None: skipped or
+    /// unreadable).
+    restored: Option<bool>,
+}
+
+impl CameraControls {
+    fn first(camera: &Path, r: &ControlReport) -> Self {
+        CameraControls {
+            camera: camera.to_path_buf(),
+            exposure_dynamic_framerate_skipped: r.skipped.as_ref().map(|s| s.to_string()),
+            exposure_dynamic_framerate_before: r.before,
+            exposure_dynamic_framerate_during: r.during,
+            pinned: r.pinned,
+            read_only: r.read_only,
+            exposure_dynamic_framerate_after_exit: None,
+            restored: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigReport {
+    /// The switching cycle, in order; the first one streams first.
+    cameras: Vec<CameraEntry>,
+    sink: DeviceInfo,
+    camera_discovery: String,
+    camera_discovery_note: Option<String>,
+    sink_discovery: &'static str,
+    /// No --camera: the first camera was picked automatically.
+    camera_auto_picked: bool,
+    /// The --mode request, as given.
+    requested_mode: String,
+    output: OutputContract,
+    /// The caps the output delivers to the loopback.
+    output_caps: String,
+    aspect: AspectPolicy,
+    process: GpuStage,
+    input_gap_ms: u64,
+    queue_buffers: u32,
+    camera_io_mode: String,
+    camera_fixed_framerate: bool,
+    switch_every_s: Option<f64>,
     /// --duration 0: streamed until a stop signal.
     streaming: bool,
     duration_s: f64,
@@ -362,41 +529,137 @@ struct ConfigReport {
     interrupted: bool,
     warmup_s: f64,
     consumer: bool,
+    /// The consumer measured end-to-end latency through the luma stamp.
+    consumer_stamp: bool,
+}
+
+/// Input frame rate of one ingest run (one camera, from its start to the
+/// switch away from it), within the measured span.
+#[derive(Debug, Serialize)]
+struct InputFps {
+    source_id: u64,
+    camera: String,
+    mode: String,
+    ingest: IngestPath,
+    /// Seconds covered: from its first frame in the span to its end.
+    span_s: f64,
+    fps: FpsReport,
+    /// Frames missing in the camera's own PTS sequence (camera/USB side).
+    missing_frames_by_pts: u64,
+    /// Camera src-pad inter-arrival gaps > 1.5 frame durations.
+    stalls: usize,
 }
 
 #[derive(Debug, Serialize)]
 struct FpsSection {
+    /// The contract frame rate.
     target: f64,
-    sink: FpsReport,
+    /// Every output buffer at the v4l2sink sink pad, by arrival time.
+    output: FpsReport,
     consumer: Option<FpsReport>,
-    camera_src: FpsReport,
-    /// Sink inter-arrival gaps > 1.5 frame durations (late or missing frames).
-    sink_stalls: usize,
-    /// The same at the camera src pad: stalls that originate before our stages.
-    camera_src_stalls: usize,
+    /// The same arrivals on 1 s windows placed on the output's frame grid
+    /// (see [`grid_fps`]): what `criteria.fps_sustained` judges.
+    output_grid: GridFps,
+    consumer_grid: Option<GridFps>,
+    /// Output inter-arrival gaps > 1.5 output periods.
+    output_stalls: usize,
     consumer_stalls: Option<usize>,
-    /// Frames missing in the camera's own PTS sequence (camera/USB side).
-    camera_missing_frames_by_pts: u64,
-    /// Frames that left v4l2src in the window minus frames that reached the sink.
-    pipeline_lost_frames: i64,
-    /// queue overrun signals; with leaky=downstream each drops one stale buffer.
+    /// Per ingest run, at the camera src pad.
+    inputs: Vec<InputFps>,
+}
+
+/// What the output clock did over the measured window (counter deltas).
+#[derive(Debug, Serialize)]
+struct FramesSection {
+    /// fresh / repeat / placeholder ticks, input frames written into the
+    /// slot, input frames superseded before any tick emitted them (expected
+    /// when a camera is faster than the contract), late ticks (emitted
+    /// after their successor was due), ticks skipped by a resync, and
+    /// buffers the output's `appsrc` accepted (`emitted`) and then dropped
+    /// from a full queue (`queue_dropped`).
+    output: OutputCounts,
+    /// Frames that left a camera src pad in the window.
+    camera_src_frames: u64,
+    /// Camera frames that never reached the slot: `camera_src_frames -
+    /// output.input_frames` (frames in flight at the window edges and at
+    /// each switch make this a few frames either way).
+    ingest_lost_frames: i64,
+    /// Ingest queue overrun signals, whole run; with leaky=downstream each
+    /// drops one stale buffer.
     queue_overruns: u64,
-    /// QoS "dropped" totals posted on the bus, by element, whole run. v4l2src
-    /// posts one message per gap in the driver's sequence numbers, without
-    /// stats: its count is the sum of `round(duration / frame duration)`
-    /// (at least 1 per message). Elements that report a running total
-    /// (jpegdec, base transforms) contribute their latest total.
+    /// QoS "dropped" totals posted on the buses, by `source/element`, whole
+    /// run: the source is the output pipeline or a camera (all its ingest
+    /// runs summed). v4l2src posts one message per gap in the driver's sequence
+    /// numbers, without stats: its count is the sum of `round(duration /
+    /// frame duration)` (at least 1 per message). Elements that report a
+    /// running total (jpegdec, base transforms) contribute their latest total
+    /// of each ingest run.
     qos_dropped_by_element: BTreeMap<String, u64>,
-    /// Frames `jpegdec` dropped, whole run (CPU decode path only): JPEG data
-    /// the camera sent that does not decode. Camera-side, but they count in
-    /// `pipeline_lost_frames` because they leave v4l2src.
+    /// Frames `jpegdec` dropped, whole run, when a camera on the CPU decode
+    /// path streamed: JPEG data the camera sent that does not decode.
     decoder_dropped_frames: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SwitchReport {
+    /// None: no camera was streaming (the first start, or a switch after a
+    /// failed one).
+    from: Option<String>,
+    to: String,
+    trigger: &'static str,
+    source_id: Option<u64>,
+    /// Seconds after the measurement window opened (negative: before it).
+    requested_at_s: f64,
+    /// From the request to the new source's first emitted frame.
+    gap_ms: Option<f64>,
+    repeats: Option<u64>,
+    placeholders: Option<u64>,
+    /// Fresh frames of the previous camera emitted after the request.
+    previous_fresh: Option<u64>,
+    error: Option<String>,
+    /// The new camera had not emitted its first frame when the window
+    /// closed.
+    abandoned: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SwitchSection {
+    /// From the first camera's start to its first emitted frame.
+    initial_start_ms: Option<f64>,
+    /// Switches (the first start excluded; switches made with no camera
+    /// streaming included) in the records below.
+    count: usize,
+    /// Of those, reached the new camera's first frame.
+    completed: usize,
+    /// Of those, the new camera did not start.
+    failed: usize,
+    /// Of those, still waiting for the new camera's first frame when the
+    /// window closed (also counted in `abandoned`).
+    abandoned_at_end: usize,
+    /// Request -> first fresh frame of the new camera, completed switches.
+    gap_ms: Option<Summary>,
+    /// Repeats and placeholders emitted during those gaps, summed.
+    repeats_during_gaps: u64,
+    placeholders_during_gaps: u64,
+    /// Switches over the whole run (streaming may drop old records).
+    whole_run_switches: u64,
+    /// Switches requested while the previous one still waited for its
+    /// first frame, and one still waiting when the window closed.
+    abandoned: u64,
+    records: Vec<SwitchReport>,
 }
 
 #[derive(Debug, Serialize)]
 struct LatencySection {
     method: &'static str,
+    output_period_ms: f64,
+    /// One output period plus one camera frame period: the wait for the
+    /// next output tick (up to one output period, ADR-0009) plus one camera
+    /// frame period for the stages themselves (the slowest camera's among
+    /// those that delivered frames in the window). See
+    /// [`latency_budget_ms`].
     budget_ms: f64,
+    /// Camera src pad -> sink ready, fresh frames.
     added_primary_ms: Option<Summary>,
     added_at_sink_pad_ms: Option<Summary>,
     via_consumer_ms: Option<Summary>,
@@ -404,7 +667,8 @@ struct LatencySection {
     stamp_mean_us: Option<f64>,
     /// Stamps whose GstBuffer struct was copied (`make_mut`; pixels shared).
     stamp_buffer_copies: u64,
-    /// Stamps that made GStreamer copy the pixel data (memory replaced on map).
+    /// Stamps that made GStreamer copy the pixel data (memory replaced on
+    /// map; expected when the output buffer shares the slot frame's memory).
     stamp_memory_copies: u64,
 }
 
@@ -443,17 +707,31 @@ struct GpuSection {
 }
 
 #[derive(Debug, Serialize)]
+struct IngestCaps {
+    camera: String,
+    mode: String,
+    ingest: IngestPath,
+    /// CUDAMemory on every link from cudaupload to the appsink.
+    cuda_memory_upload_to_slot: bool,
+    links: Vec<LinkCaps>,
+}
+
+#[derive(Debug, Serialize)]
 struct CapsSection {
-    cuda_memory_between_upload_and_download: bool,
+    /// CUDAMemory on every link from the output's appsrc to cudadownload.
+    output_cuda_memory: bool,
     /// Allocator of the buffers arriving at v4l2sink (after cudadownload).
     sink_buffer_memory: Option<String>,
-    links: Vec<LinkCaps>,
+    output_links: Vec<LinkCaps>,
+    /// One per camera that streamed (its first run).
+    ingest: Vec<IngestCaps>,
     consumer_links: Vec<LinkCaps>,
 }
 
 #[derive(Debug, Serialize)]
 struct TeardownSection {
-    main_pipeline_null: Result<(), String>,
+    /// The current ingest, then the output pipeline, to NULL.
+    session_stop: Result<(), String>,
     consumer_pipeline_null: Option<Result<(), String>>,
     /// /dev/nvidia* fds held by this process right after teardown.
     nvidia_fds_after_teardown: Vec<String>,
@@ -469,19 +747,44 @@ struct TeardownSection {
 
 #[derive(Debug, Serialize)]
 struct Criteria {
-    /// Sink (and consumer, if run) overall >= 99% of target and no complete 1 s
-    /// window more than 1 frame below target.
+    /// The measured run covered the requested duration: not stopped early
+    /// by a signal. Always true when streaming (which ends on a signal).
+    run_completed: bool,
+    /// The output held the contract rate exactly: every complete 1 s
+    /// window on the output's frame grid held the frames the grid puts in
+    /// it (the rate; for an N/D rate its floor or ceiling), and the whole
+    /// window within 0.1 % (at least one frame) of the rate. The same for
+    /// the consumer in measured runs with `--consumer` (streaming cannot
+    /// tell the loopback's re-delivered frames apart without the stamp).
     fps_sustained: bool,
-    /// Every frame the camera delivered reached the sink (and the consumer, if
-    /// run): no queue overruns, src/sink counts within the frames in flight at
-    /// the window edges, and no consumer frame without a src record
-    /// (re-delivered duplicates are counted separately, not as drops).
-    /// Separates our drops from camera-side drops.
-    no_pipeline_drops: bool,
-    /// p95 of primary added latency <= one frame.
-    added_latency_p95_within_one_frame: bool,
-    /// p99 of primary added latency <= one frame.
-    added_latency_p99_within_one_frame: bool,
+    /// The output's `appsrc` dropped (full queue) or refused no buffer; in
+    /// measured runs with `--consumer`, the consumer received the frames
+    /// that reached the sink (within 3 in flight at the window edges) and
+    /// every stamp it read matched an emission.
+    no_output_drops: bool,
+    /// No output tick skipped by a resynchronisation in the window.
+    no_skipped_ticks: bool,
+    /// Every switch reached the new camera's first frame; one still waiting
+    /// when the window closed counts as abandoned, not as incomplete.
+    switches_completed: bool,
+    /// No placeholder emitted in the window outside a switch gap: the
+    /// output always had a camera frame to send.
+    no_placeholders_outside_switches: bool,
+    /// No ingest pipeline posted an error or an EOS (whole run).
+    no_ingest_errors: bool,
+    /// Every ingest run in the window delivered camera frames (except one
+    /// started by a switch still waiting when the window closed).
+    inputs_delivered: bool,
+    /// No ingest queue overruns, and camera src-pad frames match the frames
+    /// written into the slot within the frames in flight (3 per ingest run).
+    no_ingest_drops: bool,
+    /// p95 of primary added latency <= the budget (one output period plus
+    /// one camera frame period).
+    added_latency_p95_within_budget: bool,
+    /// p99 of primary added latency <= the budget.
+    added_latency_p99_within_budget: bool,
+    /// CUDAMemory from cudaupload to the slot in every ingest, and from the
+    /// output's appsrc to cudadownload.
     cuda_memory_links: bool,
 }
 
@@ -492,12 +795,18 @@ struct Report {
     environment: Environment,
     config: ConfigReport,
     fps: FpsSection,
+    frames: FramesSection,
+    switches: SwitchSection,
     latency: LatencySection,
     cpu: CpuSection,
     gpu: Option<GpuSection>,
     caps: CapsSection,
+    camera_controls: Vec<CameraControls>,
     totals: Totals,
+    /// The first warnings of the run (at most 200).
     warnings: Vec<String>,
+    /// Warnings beyond those, counted only.
+    warnings_suppressed: u64,
     teardown: TeardownSection,
     criteria: Criteria,
     /// `--duration 0` only: what the per-frame figures cover.
@@ -511,14 +820,16 @@ struct Report {
 struct RetentionSection {
     /// `whole_run` (nothing was dropped) or `retained_window`.
     scope: &'static str,
-    /// Per-frame samples older than this are dropped while streaming.
+    /// Per-frame samples (and switch records) older than this are dropped
+    /// while streaming.
     retain_cap_s: f64,
     /// Start of the span the per-frame figures cover, in seconds after the
     /// measurement window opened (0 for `whole_run`).
     retained_from_s: f64,
     /// Length of that span (ends with the run).
     retained_s: f64,
-    /// Frames that left v4l2src / reached the sink over the whole run.
+    /// Frames that left a camera src pad / reached the output sink over the
+    /// whole run.
     whole_run_src_frames: u64,
     whole_run_sink_frames: u64,
     note: &'static str,
@@ -636,39 +947,6 @@ fn environment() -> Environment {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Wait {
-    Done,
-    Deadline,
-    Interrupted,
-}
-
-fn wait_until(
-    rec: &Recorder,
-    pipes: &[&MediaPipeline],
-    bus: &mut BusCounters,
-    deadline_ns: u64,
-    done: &dyn Fn() -> bool,
-) -> Result<Wait> {
-    loop {
-        if done() {
-            return Ok(Wait::Done);
-        }
-        if stop_requested() {
-            return Ok(Wait::Interrupted);
-        }
-        let now = rec.now_ns();
-        if now >= deadline_ns {
-            return Ok(Wait::Deadline);
-        }
-        let step = Duration::from_nanos((deadline_ns - now).min(50_000_000));
-        let per = step / pipes.len().max(1) as u32;
-        for p in pipes {
-            drain_bus(p, bus, per)?;
-        }
-    }
-}
-
 fn secs_ns(s: f64) -> u64 {
     (s.max(0.0) * 1e9) as u64
 }
@@ -689,21 +967,84 @@ fn main() {
     }
 }
 
-/// The selected camera and how it was chosen.
-struct Selected {
-    camera: DeviceInfo,
-    choice: ModeChoice,
-    auto: bool,
+/// A path selector may be a stable link (`/dev/v4l/by-id/...`): match the node.
+fn resolve_selector(s: &CameraSelector) -> CameraSelector {
+    match s {
+        CameraSelector::Path(p) => CameraSelector::Path(resolve_node_path(p)),
+        other => other.clone(),
+    }
 }
 
-fn select(args: &Args, cams: &mut obc_pipeline::discovery::CameraList) -> Result<Selected> {
-    // A path may be a stable link (/dev/v4l/by-id/...): match the node.
-    let selector = args.camera.clone().map(|s| match s {
-        CameraSelector::Path(p) => CameraSelector::Path(resolve_node_path(&p)),
-        other => other,
-    });
-    if let Some(CameraSelector::Path(p)) = &selector {
-        cams.include_node(p);
+/// The switching cycle: every `selectors` entry in order when there are two
+/// or more; otherwise the selected camera (or the automatic pick) followed
+/// by every other colour camera in discovery order. Each camera's mode is
+/// chosen for `request` from its own capabilities.
+fn camera_cycle(
+    devices: &[DeviceInfo],
+    selectors: &[CameraSelector],
+    request: &ModeRequest,
+) -> Result<Vec<CycleCamera>> {
+    let entry = |picked: obc_pipeline::CameraChoice<'_>, how: String| CycleCamera {
+        device: picked.device.clone(),
+        choice: picked.choice,
+        how,
+        auto: picked.auto,
+    };
+    if selectors.len() >= 2 {
+        return selectors
+            .iter()
+            .map(|s| {
+                let picked = select_camera(devices, Some(s), request)?;
+                Ok(entry(picked, format!("selected by --camera {s}")))
+            })
+            .collect();
+    }
+    let selector = selectors.first();
+    let picked = select_camera(devices, selector, request)?;
+    let how = match (selector, picked.choice.exact) {
+        (Some(s), _) => format!("selected by --camera {s}"),
+        (None, true) => format!("auto-picked: first colour camera offering {request} exactly"),
+        (None, false) => {
+            format!("auto-picked: no colour camera offers {request} exactly; best degraded match")
+        }
+    };
+    let first = entry(picked, how);
+    let mut cycle = vec![first];
+    for d in devices.iter().filter(|d| d.is_colour_camera()) {
+        if cycle.iter().any(|c| c.device.path == d.path) {
+            continue;
+        }
+        if let Some(choice) = d
+            .capabilities
+            .as_ref()
+            .and_then(|c| choose_mode(c, request))
+        {
+            cycle.push(CycleCamera {
+                device: d.clone(),
+                choice,
+                how: "discovered (next in the switching cycle)".into(),
+                auto: true,
+            });
+        }
+    }
+    Ok(cycle)
+}
+
+fn run(args: &Args) -> Result<()> {
+    install_signal_handlers()?;
+    gst::init().context("gst::init")?;
+    // Validate every input before any device is touched.
+    args.contract().validate()?;
+    obc_pipeline::pipeline::check_io_mode(&args.io_mode)?;
+    let env = environment();
+
+    // ---- device and mode selection (from enumerated capabilities) ----
+    let mut cams = list_cameras(args.discovery, Some(&args.mode));
+    let selectors: Vec<CameraSelector> = args.camera.iter().map(resolve_selector).collect();
+    for s in &selectors {
+        if let CameraSelector::Path(p) = s {
+            cams.include_node(p);
+        }
     }
     if args.verbose {
         for d in &cams.devices {
@@ -718,193 +1059,730 @@ fn select(args: &Args, cams: &mut obc_pipeline::discovery::CameraList) -> Result
             ));
         }
     }
-    let picked = select_camera(&cams.devices, selector.as_ref(), &args.mode)?;
-    Ok(Selected {
-        camera: picked.device.clone(),
-        choice: picked.choice,
-        auto: picked.auto,
-    })
-}
-
-fn run(args: &Args) -> Result<()> {
-    install_stop_handlers()?;
-    gst::init().context("gst::init")?;
-    // Validate every input before any device is touched.
-    args.validate()?;
-    obc_pipeline::pipeline::check_io_mode(&args.io_mode)?;
-    let env = environment();
-
-    // ---- device and mode selection (from enumerated capabilities) ----
-    let mut cams = list_cameras(args.discovery, Some(&args.mode));
-    let sel = select(args, &mut cams)?;
+    let cycle = camera_cycle(&cams.devices, &selectors, &args.mode)?;
     let sink_sel = match &args.sink_device {
         Some(p) => SinkSelector::Path(p.clone()),
         None => SinkSelector::Label(args.sink_label.clone()),
     };
     let sysfs = scan_sysfs();
     let sink = select_sink(&sysfs, &sink_sel)?.clone();
-    let how = match (&args.camera, sel.choice.exact) {
-        (Some(s), _) => format!("selected by --camera {s}"),
-        (None, true) => format!(
-            "auto-picked: first colour camera offering {} exactly",
-            args.mode
-        ),
-        (None, false) => format!(
-            "auto-picked: no colour camera offers {} exactly; best degraded match",
-            args.mode
-        ),
-    };
+    // Before any device is touched: a range the loopback cannot carry.
+    check_sink_range(&args.contract(), &OutputSink::Loopback(sink.path.clone()))?;
     println!(
-        "camera: {} ({how}; via {:?}{})",
-        sel.camera,
+        "cameras (via {:?}{}):",
         cams.used,
         cams.note
             .as_deref()
             .map(|n| format!("; {n}"))
             .unwrap_or_default()
     );
-    println!("mode:   requested {} -> {}", args.mode, sel.choice);
-    println!("sink:   {sink}");
-
-    // ---- camera frame-rate control (optional; read always, pin only if asked) ----
-    // Probed with VIDIOC_QUERYCTRL first: a camera without the control (or
-    // with it disabled) is skipped with a debug line only. The guard restores
-    // the original value when dropped: on early returns and panics, and on
-    // SIGINT/SIGTERM via the normal teardown below.
-    let edf = probe_ctrl(&sel.camera.path, CID_EXPOSURE_AUTO_PRIORITY);
-    let edf_skipped: Option<CtrlSkip> = edf.as_ref().err().cloned();
-    if let Some(skip) = &edf_skipped {
-        args.debug(format!(
-            "camera control exposure_dynamic_framerate skipped: {skip}"
-        ));
-    }
-    let edf_before = edf.as_ref().ok().map(|(_, v)| *v);
-    let mut edf_guard = match &edf {
-        Ok((info, v)) if args.camera_fixed_framerate && *v != 0 => {
-            if info.read_only() {
-                args.debug("exposure_dynamic_framerate is read-only; not pinned");
-                None
-            } else {
-                Some(
-                    ControlGuard::set(&sel.camera.path, CID_EXPOSURE_AUTO_PRIORITY, *v, 0)
-                        .context("setting exposure_dynamic_framerate=0")?,
-                )
-            }
-        }
-        _ => None,
-    };
-    let edf_during =
-        edf_before.and_then(|_| get_ctrl(&sel.camera.path, CID_EXPOSURE_AUTO_PRIORITY).ok());
-    if edf_during == Some(1) {
+    for (i, c) in cycle.iter().enumerate() {
         println!(
-            "note: camera exposure_dynamic_framerate=1: it may lower its frame rate in dim light (see --camera-fixed-framerate)"
+            "  {}. {} [{}]: requested {} -> {}",
+            i + 1,
+            c.device,
+            c.how,
+            args.mode,
+            c.choice
         );
     }
-
-    run_measured(
-        args,
-        env,
-        &cams,
-        sel,
-        sink,
-        CameraControls {
-            exposure_dynamic_framerate_skipped: edf_skipped.map(|s| s.to_string()),
-            exposure_dynamic_framerate_before: edf_before,
-            exposure_dynamic_framerate_during: edf_during,
-            changed_and_restored: None,
-        },
-        &mut edf_guard,
-    )
+    println!("sink:   {sink}");
+    println!(
+        "output: {} ({}, process {}, input gap {} ms)",
+        args.contract(),
+        args.aspect,
+        args.gpu_stage,
+        args.input_gap_ms
+    );
+    run_session(args, env, &cams, cycle, sink)
 }
 
-/// Streaming: per-frame samples older than this are dropped, so memory stays
-/// bounded however long the run; the exit report describes this last span
-/// (or the whole run, if shorter) and says which.
+/// Streaming: per-frame samples and switch records older than this are
+/// dropped, so memory stays bounded however long the run; the exit report
+/// describes this last span (or the whole run, if shorter) and says which.
 const STREAM_RETAIN_S: f64 = 600.0;
 
-/// Streaming status: a frame that has not reached the sink this long after
-/// leaving the camera counts as a pipeline drop (added latency is a few ms).
-/// Each status line reports drops for frames that left the camera between
-/// the previous line's cut-off and `now - DROP_GRACE_NS`.
-const DROP_GRACE_NS: u64 = 1_000_000_000;
+/// One ingest run: a camera from its start to the switch away from it.
+#[derive(Debug, Clone)]
+struct SourceRun {
+    source_id: u64,
+    camera: usize,
+    /// When its ingest reached PLAYING.
+    started_ns: u64,
+    /// When its ingest was asked to stop (a switch) or the window closed.
+    stopped_ns: Option<u64>,
+}
 
-/// Camera-side drops in a status window: the PTS gaps of its frames, plus
-/// the gap from the last frame before the window (`prev_pts`) to its first,
-/// so a gap spanning a status boundary is counted once, in the later window.
-fn window_camera_drops(prev_pts: Option<u64>, pts: &[u64], frame_ns: u64) -> u64 {
-    match (prev_pts, pts.first()) {
-        (Some(p), Some(_)) => {
-            let mut all = Vec::with_capacity(pts.len() + 1);
-            all.push(p);
-            all.extend_from_slice(pts);
-            stats::missing_frames_from_gaps(&all, frame_ns)
+/// One switch request and its outcome.
+#[derive(Debug, Clone)]
+struct SwitchRecord {
+    from: Option<usize>,
+    to: usize,
+    trigger: &'static str,
+    requested_ns: u64,
+    source_id: Option<u64>,
+    gap: Option<SwitchGap>,
+    error: Option<String>,
+    /// Still waiting for the new camera's first frame when the window
+    /// closed.
+    abandoned: bool,
+}
+
+/// The trigger of the first camera's start (not a switch).
+const START_TRIGGER: &str = "start";
+
+/// Whether a timer switch due at `due_ns` fires at `now_ns`, in a window
+/// ending at `end_ns`: only inside the window, never at or after its end
+/// (a switch there could not complete in it).
+fn timer_switch_due(now_ns: u64, due_ns: u64, end_ns: u64) -> bool {
+    now_ns >= due_ns && now_ns < end_ns && due_ns < end_ns
+}
+
+/// Whether the run measured what was asked for: a measured run not stopped
+/// early (the window is the requested duration); a streaming run always.
+fn run_completed(streaming: bool, interrupted: bool, measured_ns: u64, duration_s: f64) -> bool {
+    streaming || (!interrupted && measured_ns >= secs_ns(duration_s))
+}
+
+/// The ingest runs overlapping `[from, to)`.
+fn runs_overlapping(runs: &[SourceRun], from: u64, to: u64) -> impl Iterator<Item = &SourceRun> {
+    runs.iter()
+        .filter(move |r| r.started_ns < to && r.stopped_ns.is_none_or(|s| s > from))
+}
+
+/// Camera frames of `run` that left its src pad in `[from, to)`.
+fn run_frames(samples: &Samples, run: &SourceRun, from: u64, to: u64) -> usize {
+    samples
+        .src_source
+        .iter()
+        .zip(&samples.src_times)
+        .filter(|(s, t)| **s == run.source_id && (from..to).contains(*t))
+        .count()
+}
+
+/// The frame period of the slowest camera that delivered frames in
+/// `[from, to)` (0: none did).
+fn streamed_camera_period_ns(
+    runs: &[SourceRun],
+    cycle: &[CycleCamera],
+    samples: &Samples,
+    from: u64,
+    to: u64,
+) -> u64 {
+    runs_overlapping(runs, from, to)
+        .filter(|r| run_frames(samples, r, from, to) > 0)
+        .map(|r| cycle[r.camera].choice.mode.frame_duration_ns())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether every ingest run overlapping `[from, to)` delivered at least one
+/// camera frame in it, `waiting` (the source of a switch still waiting for
+/// its first frame when the window closed) excepted. False when no run
+/// counts.
+fn inputs_delivered(
+    runs: &[SourceRun],
+    samples: &Samples,
+    from: u64,
+    to: u64,
+    waiting: Option<u64>,
+) -> bool {
+    let mut any = false;
+    for r in runs_overlapping(runs, from, to).filter(|r| Some(r.source_id) != waiting) {
+        if run_frames(samples, r, from, to) == 0 {
+            return false;
         }
-        _ => stats::missing_frames_from_gaps(pts, frame_ns),
+        any = true;
+    }
+    any
+}
+
+/// Frame counts on 1 s windows placed on the output's frame grid.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct GridFps {
+    /// Complete windows.
+    windows: usize,
+    /// Of those, windows holding another count than the grid puts in them.
+    windows_off_grid: usize,
+    min_1s: Option<usize>,
+    max_1s: Option<usize>,
+    /// Frames over the whole span, and the contract rate times its length.
+    frames: usize,
+    expected_frames: f64,
+    /// Every window on the grid, and the span within 0.1 % (at least one
+    /// frame) of the rate.
+    exact: bool,
+}
+
+/// Counts arrival `times` on complete windows of about 1 s within
+/// `[from, to)`, for a stream of `fps_num / fps_den`. The boundaries are
+/// placed half a frame period away from the arrivals: at the arrivals'
+/// mean phase on the period grid (a circular mean, so a phase near zero
+/// does not split), plus half a period, and each window ends at the first
+/// such point at or after the next whole second. Arrival jitter under half
+/// a period then never moves a frame across a boundary, and a window
+/// holds exactly the grid points it spans: the rate, or for an N/D rate
+/// whose second is not a whole number of periods, its floor or ceiling.
+/// A lost or extra frame shows as a window off the grid, and so does a
+/// frame late by half a period or more across a window boundary.
+fn grid_fps(times: &[u64], from: u64, to: u64, fps_num: u32, fps_den: u32) -> GridFps {
+    use std::f64::consts::TAU;
+    let mut t: Vec<u64> = times
+        .iter()
+        .copied()
+        .filter(|&x| x >= from && x < to)
+        .collect();
+    t.sort_unstable();
+    let rate = f64::from(fps_num) / f64::from(fps_den.max(1));
+    let expected_frames = rate * to.saturating_sub(from) as f64 / 1e9;
+    let mut out = GridFps {
+        windows: 0,
+        windows_off_grid: 0,
+        min_1s: None,
+        max_1s: None,
+        frames: t.len(),
+        expected_frames,
+        exact: false,
+    };
+    if t.is_empty() || fps_num == 0 {
+        return out;
+    }
+    let period = 1e9 / rate;
+    let (mut sx, mut sy) = (0.0f64, 0.0f64);
+    for &x in &t {
+        let a = ((x - from) as f64 % period) / period * TAU;
+        sx += a.cos();
+        sy += a.sin();
+    }
+    let phase = (sy.atan2(sx) / TAU).rem_euclid(1.0) * period;
+    // Boundary points: from + offset + j x period, j >= 0.
+    let offset = (phase + period / 2.0) % period;
+    let point = |j: u64| from as f64 + offset + j as f64 * period;
+    let first_point_at = |at: f64| ((at - from as f64 - offset) / period).ceil().max(0.0) as u64;
+    let count_before = |at: f64| t.partition_point(|&x| (x as f64) < at);
+    let mut counts = Vec::new();
+    for k in 0u64.. {
+        let j0 = first_point_at(from as f64 + k as f64 * 1e9);
+        let j1 = first_point_at(from as f64 + (k + 1) as f64 * 1e9);
+        let (a, b) = (point(j0), point(j1));
+        if b > to as f64 {
+            break;
+        }
+        let n = count_before(b) - count_before(a);
+        counts.push(n);
+        if n as u64 != j1 - j0 {
+            out.windows_off_grid += 1;
+        }
+    }
+    out.windows = counts.len();
+    out.min_1s = counts.iter().copied().min();
+    out.max_1s = counts.iter().copied().max();
+    let tolerance = (expected_frames * 0.001).max(1.0);
+    out.exact = out.windows > 0
+        && out.windows_off_grid == 0
+        && (t.len() as f64 - expected_frames).abs() <= tolerance;
+    out
+}
+
+/// The added-latency budget in ms: up to one output period waiting for
+/// the next output tick, plus one camera frame period (`camera_period_ns`,
+/// the slowest camera's) for the ingest, slot and output stages.
+fn latency_budget_ms(output_period_ns: u64, camera_period_ns: u64) -> f64 {
+    output_period_ns.saturating_add(camera_period_ns) as f64 / 1e6
+}
+
+/// Field-wise `b - a` of two output counter snapshots.
+fn counts_delta(a: &OutputCounts, b: &OutputCounts) -> OutputCounts {
+    OutputCounts {
+        input_frames: b.input_frames.saturating_sub(a.input_frames),
+        fresh: b.fresh.saturating_sub(a.fresh),
+        repeat: b.repeat.saturating_sub(a.repeat),
+        placeholder: b.placeholder.saturating_sub(a.placeholder),
+        superseded: b.superseded.saturating_sub(a.superseded),
+        late: b.late.saturating_sub(a.late),
+        skipped: b.skipped.saturating_sub(a.skipped),
+        emitted: b.emitted.saturating_sub(a.emitted),
+        queue_dropped: b.queue_dropped.saturating_sub(a.queue_dropped),
+        push_failed: b.push_failed.saturating_sub(a.push_failed),
     }
 }
 
-/// Pipeline drops among `sent` frames of which `delivered` reached the sink
-/// ([`Recorder::delivery_between`]). More delivered than sent is a
-/// bookkeeping bug, not a measurement: it is logged (and asserted in debug
-/// builds) and the negative value is shown as is, never clamped to 0.
-fn window_pipeline_drops(sent: u64, delivered: u64) -> i64 {
-    let drops = sent as i64 - delivered as i64;
-    if drops < 0 {
-        eprintln!(
-            "warning: status window counts {delivered} delivered frames of {sent} sent (bookkeeping bug)"
-        );
+/// The switch section from the retained records; times relative to
+/// `window_start`.
+fn summarize_switches(
+    records: &[SwitchRecord],
+    cycle: &[CycleCamera],
+    window_start: u64,
+    whole_run_switches: u64,
+    abandoned: u64,
+) -> SwitchSection {
+    let gap_ms = |r: &SwitchRecord| r.gap.map(|g| g.gap_ns() as f64 / 1e6);
+    let switches: Vec<&SwitchRecord> = records
+        .iter()
+        .filter(|r| r.trigger != START_TRIGGER)
+        .collect();
+    let completed: Vec<&SwitchGap> = switches.iter().filter_map(|r| r.gap.as_ref()).collect();
+    SwitchSection {
+        initial_start_ms: records
+            .iter()
+            .find(|r| r.trigger == START_TRIGGER)
+            .and_then(gap_ms),
+        count: switches.len(),
+        completed: completed.len(),
+        failed: switches.iter().filter(|r| r.error.is_some()).count(),
+        abandoned_at_end: switches.iter().filter(|r| r.abandoned).count(),
+        gap_ms: stats::summarize(
+            &completed
+                .iter()
+                .map(|g| g.gap_ns() as f64 / 1e6)
+                .collect::<Vec<_>>(),
+        ),
+        repeats_during_gaps: completed.iter().map(|g| g.repeats).sum(),
+        placeholders_during_gaps: completed.iter().map(|g| g.placeholders).sum(),
+        whole_run_switches,
+        abandoned,
+        records: records
+            .iter()
+            .map(|r| SwitchReport {
+                from: r.from.map(|i| cycle[i].label()),
+                to: cycle[r.to].label(),
+                trigger: r.trigger,
+                source_id: r.source_id,
+                requested_at_s: (r.requested_ns as f64 - window_start as f64) / 1e9,
+                gap_ms: gap_ms(r),
+                repeats: r.gap.map(|g| g.repeats),
+                placeholders: r.gap.map(|g| g.placeholders),
+                previous_fresh: r.gap.map(|g| g.previous_fresh),
+                error: r.error.clone(),
+                abandoned: r.abandoned,
+            })
+            .collect(),
     }
-    debug_assert!(drops >= 0, "delivered {delivered} > sent {sent}");
-    drops
 }
 
-/// One streaming status line. `w`: the samples of the last status window;
-/// `pipeline_drops` and `camera_drops` from [`window_pipeline_drops`] and
-/// [`window_camera_drops`].
+/// Input frame rate per ingest run over `[from, to)`.
+fn input_reports(
+    samples: &Samples,
+    runs: &[SourceRun],
+    cycle: &[CycleCamera],
+    from: u64,
+    to: u64,
+) -> Vec<InputFps> {
+    let mut out = Vec::new();
+    for run in runs {
+        let cam = &cycle[run.camera];
+        let (times, pts) = samples.source(run.source_id);
+        let Some(&first) = times.iter().find(|&&t| t >= from) else {
+            continue;
+        };
+        let end = run.stopped_ns.unwrap_or(to).min(to);
+        if end <= first {
+            continue;
+        }
+        let mode = cam.choice.mode;
+        out.push(InputFps {
+            source_id: run.source_id,
+            camera: cam.label(),
+            mode: mode.to_string(),
+            ingest: cam.choice.ingest,
+            span_s: (end - first) as f64 / 1e9,
+            fps: stats::fps_report(&times, first, end, mode.fps(), 1.0),
+            missing_frames_by_pts: stats::missing_frames_from_gaps(&pts, mode.frame_duration_ns()),
+            stalls: stats::count_stalls(&times, mode.frame_duration_ns(), 1.5),
+        });
+    }
+    out
+}
+
+/// One streaming status line over a status window of `window_s` seconds:
+/// `w` its samples, `delta` the output counters over it.
 fn status_line(
-    sel: &Selected,
+    camera: Option<&CycleCamera>,
     w: &Samples,
     window_s: f64,
+    delta: &OutputCounts,
+    consumer: bool,
     cpu_one_core_pct: f64,
-    pipeline_drops: i64,
-    camera_drops: u64,
 ) -> String {
-    let sink_fps = w.sink_times.len() as f64 / window_s.max(1e-9);
+    let rate = |n: usize| n as f64 / window_s.max(1e-9);
     let p50 = stats::summarize(&ms(&w.added_latency_ns))
         .map_or("n/a".to_string(), |s| format!("{:.2} ms", s.p50));
+    let source = camera.map_or("no camera".to_string(), |c| {
+        format!(
+            "{} {} | {} {}",
+            c.device.card,
+            c.device.path.display(),
+            c.choice.mode,
+            c.choice.ingest
+        )
+    });
+    let consumer = if consumer {
+        format!(" | consumer {:.1} fps", rate(w.consumer_times.len()))
+    } else {
+        String::new()
+    };
     format!(
-        "{} {} | {} {} | sink {:.1} fps | added p50 {} | drops {} (camera-side {}) | cpu {:.1}%",
-        sel.camera.card,
-        sel.camera.path.display(),
-        sel.choice.mode,
-        sel.choice.ingest,
-        sink_fps,
-        p50,
-        pipeline_drops,
-        camera_drops,
-        cpu_one_core_pct
+        "{source} | in {:.1} fps | out {:.1} fps{consumer} | fresh {} repeat {} placeholder {} superseded {} | added p50 {p50} | cpu {cpu_one_core_pct:.1}%",
+        rate(w.src_times.len()),
+        rate(w.sink_times.len()),
+        delta.fresh,
+        delta.repeat,
+        delta.placeholder,
+        delta.superseded,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_measured(
+/// The line printed when a switch reaches the new camera's first frame.
+fn switch_line(r: &SwitchRecord, g: &SwitchGap, cycle: &[CycleCamera]) -> String {
+    let gap = g.gap_ns() as f64 / 1e6;
+    if r.trigger == START_TRIGGER {
+        return format!(
+            "camera live: {}: first fresh frame {gap:.1} ms after the start",
+            cycle[r.to].label()
+        );
+    }
+    format!(
+        "switch ({}): {} -> {}: first fresh frame {gap:.1} ms after the request; {} repeats, {} placeholders during the gap",
+        r.trigger,
+        r.from.map_or("no camera".to_string(), |f| cycle[f].label()),
+        cycle[r.to].label(),
+        g.repeats,
+        g.placeholders
+    )
+}
+
+/// Outcome of a wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wait {
+    Done,
+    Deadline,
+    Interrupted,
+}
+
+/// The running stream and everything the bench tracks about it.
+struct Stream<'a> {
+    args: &'a Args,
+    cycle: &'a [CycleCamera],
+    rec: Arc<Recorder>,
+    session: Session,
+    /// Index of the camera streaming now (None: none, after a failed switch).
+    current: Option<usize>,
+    /// Index of the camera tried last; the next switch tries the one after.
+    cursor: usize,
+    runs: VecDeque<SourceRun>,
+    switches: VecDeque<SwitchRecord>,
+    whole_run_switches: u64,
+    /// The current ingest posted an error; reported once.
+    ingest_failed: bool,
+    /// Errors (and EOS) posted by ingest pipelines, whole run.
+    ingest_errors: u64,
+    overruns: Arc<AtomicU64>,
+    bus: BusCounters,
+    controls: BTreeMap<usize, CameraControls>,
+    ingest_links: BTreeMap<usize, Vec<LinkCaps>>,
+}
+
+impl<'a> Stream<'a> {
+    fn current_frame_ns(&self) -> u64 {
+        self.current
+            .map_or(0, |i| self.cycle[i].choice.mode.frame_duration_ns())
+    }
+
+    /// Drains the buses for up to `step` and collects completed switches. An
+    /// output pipeline error, or an output clock that stopped, ends the run;
+    /// an ingest error is counted and reported once per ingest (the output
+    /// then repeats and sends placeholders).
+    fn poll(&mut self, step: Duration) -> Result<()> {
+        let half = step / 2;
+        let frame_ns = self.current_frame_ns();
+        let output_wait = if self.session.ingest().is_some() {
+            half
+        } else {
+            step
+        };
+        let output = self.session.output().pipeline();
+        drain_bus(
+            output,
+            &output.pipeline().name(),
+            &mut self.bus.qos_dropped,
+            &mut self.bus.warnings,
+            output_wait,
+            self.session.output().contract().frame_duration_ns(),
+        )
+        .map_err(|e| anyhow!(e))?;
+        self.session.output().health()?;
+        let source = self
+            .current
+            .map_or("?".to_string(), |i| self.cycle[i].label());
+        if let Some(ingest) = self.session.ingest()
+            && let Err(e) = drain_bus(
+                ingest.pipeline(),
+                &source,
+                &mut self.bus.qos_run,
+                &mut self.bus.warnings,
+                half,
+                frame_ns,
+            )
+        {
+            self.ingest_errors += 1;
+            if !self.ingest_failed {
+                self.ingest_failed = true;
+                let msg = format!("ingest {source}: {e}");
+                eprintln!("warning: {msg}; the output sends repeats, then placeholders");
+                self.bus.warnings.push(msg);
+            }
+        }
+        self.collect_switches();
+        Ok(())
+    }
+
+    /// Polls until `done`, a stop signal or `deadline_ns`.
+    fn wait_until(&mut self, deadline_ns: u64, done: fn(&Self) -> bool) -> Result<Wait> {
+        loop {
+            if done(self) {
+                return Ok(Wait::Done);
+            }
+            if stop_requested() {
+                return Ok(Wait::Interrupted);
+            }
+            let now = self.rec.now_ns();
+            if now >= deadline_ns {
+                return Ok(Wait::Deadline);
+            }
+            self.poll(Duration::from_nanos((deadline_ns - now).min(20_000_000)))?;
+        }
+    }
+
+    /// The first camera's first frame was emitted.
+    fn live(&self) -> bool {
+        self.switches.front().is_some_and(|r| r.gap.is_some())
+    }
+
+    /// Matches completed switch gaps to their records and prints them.
+    fn collect_switches(&mut self) {
+        for gap in self.rec.take_switches() {
+            if let Some(r) = self
+                .switches
+                .iter_mut()
+                .rev()
+                .find(|r| r.source_id == Some(gap.target))
+            {
+                r.gap = Some(gap);
+                println!("{}", switch_line(r, &gap, self.cycle));
+            }
+        }
+    }
+
+    /// Drops records older than the retention (streaming).
+    fn trim_records(&mut self) {
+        if !self.args.streaming() {
+            return;
+        }
+        let cutoff = self.rec.now_ns().saturating_sub(secs_ns(STREAM_RETAIN_S));
+        while self.switches.len() > 1
+            && self
+                .switches
+                .front()
+                .is_some_and(|r| r.requested_ns < cutoff && r.gap.is_some())
+        {
+            self.switches.pop_front();
+        }
+        while self
+            .runs
+            .front()
+            .is_some_and(|r| r.stopped_ns.is_some_and(|s| s < cutoff))
+        {
+            self.runs.pop_front();
+        }
+    }
+
+    fn ingest_config(&self, camera: usize) -> IngestConfig {
+        let c = &self.cycle[camera];
+        let mut cfg = IngestConfig::new(c.device.path.clone(), c.choice.mode);
+        cfg.aspect = self.args.aspect;
+        cfg.queue_buffers = self.args.queue_buffers;
+        cfg.camera_io_mode = self.args.io_mode.clone();
+        cfg.fixed_framerate = self.args.camera_fixed_framerate;
+        cfg
+    }
+
+    /// Keeps the negotiated links of the running ingest (first run of each
+    /// camera).
+    fn capture_ingest_links(&mut self) {
+        if let (Some(i), Some(ingest)) = (self.current, self.session.ingest()) {
+            self.ingest_links
+                .entry(i)
+                .or_insert_with(|| ingest.pipeline().links());
+        }
+    }
+
+    fn end_current_run(&mut self, t: u64) {
+        if let Some(r) = self.runs.back_mut()
+            && r.stopped_ns.is_none()
+        {
+            r.stopped_ns = Some(t);
+        }
+    }
+
+    /// Switches to camera `to`: builds its ingest, stops the current one
+    /// (camera closed, controls restored) and starts the new one. On error
+    /// the record keeps it, and the stream has no source if the old one was
+    /// already stopped.
+    fn switch_to(&mut self, to: usize, trigger: &'static str) -> Result<()> {
+        let requested_ns = self.rec.now_ns();
+        self.rec.begin_switch(requested_ns);
+        self.cursor = to;
+        let mut record = SwitchRecord {
+            from: self.current,
+            to,
+            trigger,
+            requested_ns,
+            source_id: None,
+            gap: None,
+            error: None,
+            abandoned: false,
+        };
+        let res = self.try_switch(to, &mut record);
+        if let Err(e) = &res {
+            self.rec.cancel_switch();
+            record.error = Some(format!("{e:#}"));
+            if self.session.ingest().is_none() {
+                self.end_current_run(self.rec.now_ns());
+                self.current = None;
+            }
+        }
+        if trigger != START_TRIGGER {
+            self.whole_run_switches += 1;
+        }
+        self.switches.push_back(record);
+        self.trim_records();
+        res
+    }
+
+    fn try_switch(&mut self, to: usize, record: &mut SwitchRecord) -> Result<()> {
+        let cfg = self.ingest_config(to);
+        let ingest = self.session.build_ingest(&cfg)?;
+        let id = ingest.source_id();
+        record.source_id = Some(id);
+        self.rec.switch_target(id);
+        self.rec
+            .attach_camera(ingest.pipeline(), id)
+            .map_err(|e| anyhow!(e))?;
+        if let Some(q) = ingest.pipeline().element(names::QUEUE) {
+            let c = Arc::clone(&self.overruns);
+            q.connect("overrun", false, move |_| {
+                c.fetch_add(1, Ordering::Relaxed);
+                None
+            });
+        }
+        self.capture_ingest_links();
+        // The current run ends when its ingest is asked to stop.
+        let stopping = self.rec.now_ns();
+        let res = self.session.switch_to(ingest);
+        self.end_current_run(stopping);
+        self.bus.end_ingest_run();
+        let timing = res?;
+        self.ingest_failed = false;
+        self.current = Some(to);
+        self.runs.push_back(SourceRun {
+            source_id: id,
+            camera: to,
+            started_ns: timing
+                .started
+                .map_or_else(|| self.rec.now_ns(), |t| self.rec.ns_at(t)),
+            stopped_ns: None,
+        });
+        if let Some(report) = self.session.ingest().map(|i| i.controls().clone()) {
+            self.note_controls(to, &report);
+        }
+        Ok(())
+    }
+
+    /// Records a camera's control state when its ingest starts.
+    fn note_controls(&mut self, camera: usize, r: &ControlReport) {
+        let path = &self.cycle[camera].device.path;
+        match self.controls.get_mut(&camera) {
+            None => {
+                if r.during == Some(1) {
+                    println!(
+                        "note: {} exposure_dynamic_framerate=1: it may lower its frame rate in dim light (see --camera-fixed-framerate)",
+                        self.cycle[camera].label()
+                    );
+                }
+                if r.read_only {
+                    self.args.debug(format!(
+                        "{} exposure_dynamic_framerate is read-only; not pinned",
+                        path.display()
+                    ));
+                }
+                if let Some(skip) = &r.skipped {
+                    self.args.debug(format!(
+                        "{} exposure_dynamic_framerate skipped: {skip}",
+                        path.display()
+                    ));
+                }
+                self.controls.insert(camera, CameraControls::first(path, r));
+            }
+            Some(c) => {
+                // A later run starts from the value the previous one restored.
+                if r.before != c.exposure_dynamic_framerate_before {
+                    let msg = format!(
+                        "{}: exposure_dynamic_framerate was {:?} at a restart, {:?} originally (not restored by the previous run?)",
+                        path.display(),
+                        r.before,
+                        c.exposure_dynamic_framerate_before
+                    );
+                    eprintln!("warning: {msg}");
+                    self.bus.warnings.push(msg);
+                }
+                c.exposure_dynamic_framerate_during = r.during;
+                c.pinned |= r.pinned;
+            }
+        }
+    }
+
+    /// Switches to the next camera of the cycle; a failure is a warning.
+    fn switch_next(&mut self, trigger: &'static str) {
+        let to = (self.cursor + 1) % self.cycle.len();
+        if let Err(e) = self.switch_to(to, trigger) {
+            let msg = format!(
+                "switch ({trigger}) to {} failed: {e:#}",
+                self.cycle[to].label()
+            );
+            eprintln!("warning: {msg}");
+            self.bus.warnings.push(msg);
+        }
+    }
+}
+
+/// What the measurement loop hands to the report.
+struct Measured {
+    cpu: stats::CpuUsage,
+    per_sec: Vec<f64>,
+    latency_q: Option<(bool, u64, Option<u64>)>,
+    output_links: Vec<LinkCaps>,
+    consumer_links: Vec<LinkCaps>,
+    interrupted: bool,
+    counts_start: OutputCounts,
+    counts_end: OutputCounts,
+}
+
+fn run_session(
     args: &Args,
     env: Environment,
-    cams: &obc_pipeline::discovery::CameraList,
-    sel: Selected,
+    cams: &CameraList,
+    cycle: Vec<CycleCamera>,
     sink: DeviceInfo,
-    mut controls: CameraControls,
-    edf_guard: &mut Option<ControlGuard>,
 ) -> Result<()> {
-    let mode = sel.choice.mode;
+    let contract = args.contract();
     let streaming = args.streaming();
-    let rec = Recorder::new(args.consumer);
+    let rec = Recorder::new(args.consumer, args.consumer_stamp());
     if streaming {
         rec.set_retention(Some(secs_ns(STREAM_RETAIN_S)));
     }
-    let mut bus = BusCounters::new(mode.frame_duration_ns());
 
-    // ---- GPU baseline (before the pipeline exists) ----
+    // ---- GPU baseline (before any pipeline exists) ----
+    let mut early_warnings = Warnings::default();
     let sampler = if args.no_gpu_stats {
         None
     } else {
@@ -920,83 +1798,103 @@ fn run_measured(
                 Some(s)
             }
             Err(e) => {
-                bus.warnings.push(format!("GPU stats disabled: {e}"));
+                early_warnings.push(format!("GPU stats disabled: {e}"));
                 None
             }
         }
     };
     let t_build = rec.now_ns();
 
-    // ---- build + start ----
-    let mut cfg = PipelineConfig::new(sel.camera.path.clone(), sink.path.clone(), mode);
-    cfg.gpu_stage = args.gpu_stage;
-    cfg.output = args.output_format;
-    cfg.queue_buffers = args.queue_buffers;
-    cfg.camera_io_mode = args.io_mode.clone();
-    let main_p = MediaPipeline::build(&cfg)?;
-    rec.attach_main(&main_p).map_err(|e| anyhow!(e))?;
-    let overruns = Arc::new(AtomicU64::new(0));
-    {
-        let q = main_p.element(names::QUEUE).context("queue element")?;
-        let c = Arc::clone(&overruns);
-        q.connect("overrun", false, move |_| {
-            c.fetch_add(1, Ordering::Relaxed);
-            None
-        });
+    // ---- output: build, instrument, start ----
+    let mut ocfg = OutputConfig::new(contract, OutputSink::Loopback(sink.path.clone()));
+    ocfg.process = args.gpu_stage;
+    ocfg.gap_threshold = Duration::from_millis(args.input_gap_ms);
+    let mut output = Output::build(ocfg)?;
+    output.set_observer(Some(rec.observer()));
+    rec.attach_output(output.pipeline())
+        .map_err(|e| anyhow!(e))?;
+    if stop_requested() {
+        bail!("interrupted by signal before the measurement window");
     }
+    let session = Session::new(output)?;
+    let mut s = Stream {
+        args,
+        cycle: &cycle,
+        rec: Arc::clone(&rec),
+        session,
+        current: None,
+        cursor: 0,
+        runs: VecDeque::new(),
+        switches: VecDeque::new(),
+        whole_run_switches: 0,
+        ingest_failed: false,
+        ingest_errors: 0,
+        overruns: Arc::new(AtomicU64::new(0)),
+        bus: BusCounters {
+            warnings: early_warnings,
+            ..BusCounters::default()
+        },
+        controls: BTreeMap::new(),
+        ingest_links: BTreeMap::new(),
+    };
 
     let interrupted_before = || anyhow!("interrupted by signal before the measurement window");
-    let outcome = (|| -> Result<_> {
-        if stop_requested() {
-            return Err(interrupted_before());
-        }
-        main_p.play()?;
-        let r = Arc::clone(&rec);
-        match wait_until(
-            &rec,
-            &[&main_p],
-            &mut bus,
-            rec.now_ns() + secs_ns(15.0),
-            &|| r.first_sink_ns().is_some(),
-        )? {
+    // `consumer` is declared after `s`, so an early return drops it (NULL,
+    // loopback released) before the session.
+    let mut consumer: Option<MediaPipeline> = None;
+    let outcome = (|| -> Result<Measured> {
+        match s.wait_until(rec.now_ns() + secs_ns(15.0), |s| {
+            s.rec.first_sink_ns().is_some()
+        })? {
             Wait::Done => {}
             Wait::Interrupted => return Err(interrupted_before()),
-            Wait::Deadline => bail!("no frame reached the loopback sink within 15 s"),
+            Wait::Deadline => bail!("no output frame reached the loopback sink within 15 s"),
         }
-        let t_first = rec.first_sink_ns().unwrap_or_default();
+        s.switch_to(0, "start")?;
+        match s.wait_until(rec.now_ns() + secs_ns(15.0), Stream::live)? {
+            Wait::Done => {}
+            Wait::Interrupted => return Err(interrupted_before()),
+            Wait::Deadline => bail!(
+                "no frame of {} reached the output within 15 s",
+                cycle[0].label()
+            ),
+        }
+        let t_first = rec.now_ns();
 
-        let consumer_p = if args.consumer {
-            let c = MediaPipeline::build_consumer(&sink.path, &mode, args.output_format)?;
+        if args.consumer {
+            let c = MediaPipeline::build_consumer(
+                &sink.path,
+                (contract.width, contract.height),
+                contract.format,
+            )?;
             rec.attach_consumer(&c).map_err(|e| anyhow!(e))?;
             c.play()?;
-            let r = Arc::clone(&rec);
-            // On an early return `c` is dropped, which sets it to NULL.
-            match wait_until(
-                &rec,
-                &[&main_p, &c],
-                &mut bus,
-                rec.now_ns() + secs_ns(10.0),
-                &|| r.first_consumer_ns().is_some(),
-            )? {
+            consumer = Some(c);
+            match s.wait_until(rec.now_ns() + secs_ns(10.0), |s| {
+                s.rec.first_consumer_ns().is_some()
+            })? {
                 Wait::Done => {}
                 Wait::Interrupted => return Err(interrupted_before()),
                 Wait::Deadline => bail!("the loopback consumer received no frame within 10 s"),
             }
-            Some(c)
-        } else {
-            None
-        };
-        let pipes: Vec<&MediaPipeline> = std::iter::once(&main_p)
-            .chain(consumer_p.as_ref())
-            .collect();
+        }
 
-        // Dump the graph before the window opens, so writing it costs
+        // Dump the graphs before the window opens, so writing them costs
         // neither measured CPU nor measured frames.
         if let Some(dir) = &args.dot_dir {
             std::fs::create_dir_all(dir)?;
-            let tag = format!("{}-{}", args.gpu_stage, args.output_format);
-            std::fs::write(dir.join(format!("obc-main-{tag}.dot")), main_p.dot())?;
-            if let Some(c) = &consumer_p {
+            let tag = format!("{}-{}", args.gpu_stage, contract.format);
+            std::fs::write(
+                dir.join(format!("obc-output-{tag}.dot")),
+                s.session.output().pipeline().dot(),
+            )?;
+            if let Some(i) = s.session.ingest() {
+                std::fs::write(
+                    dir.join(format!("obc-ingest-{}.dot", i.source_id())),
+                    i.pipeline().dot(),
+                )?;
+            }
+            if let Some(c) = &consumer {
                 std::fs::write(dir.join(format!("obc-consumer-{tag}.dot")), c.dot())?;
             }
         }
@@ -1009,26 +1907,36 @@ fn run_measured(
             start + secs_ns(args.duration)
         };
         rec.set_window(start, end);
+        let switching = args
+            .switch_every
+            .map_or(String::new(), |p| format!(", next camera every {p} s"));
         if streaming {
             println!(
-                "streaming until SIGINT/SIGTERM after {:.1} s warm-up ({mode} {}, {}, output {}); status every 5 s",
-                args.warmup, sel.choice.ingest, args.gpu_stage, args.output_format
+                "streaming until SIGINT/SIGTERM after {:.1} s warm-up (output {contract}, {}{switching}); status every 5 s, SIGUSR1 switches to the next camera",
+                args.warmup, args.gpu_stage
             );
         } else {
             println!(
-                "measuring {:.0} s after {:.1} s warm-up ({mode} {}, {}, output {})",
-                args.duration, args.warmup, sel.choice.ingest, args.gpu_stage, args.output_format
+                "measuring {:.0} s after {:.1} s warm-up (output {contract}, {}{switching})",
+                args.duration, args.warmup, args.gpu_stage
             );
         }
-        if wait_until(&rec, &pipes, &mut bus, start, &|| false)? == Wait::Interrupted {
+        if s.wait_until(start, |_| false)? == Wait::Interrupted {
             return Err(interrupted_before());
         }
+        // Switching acts inside the window only: a SIGUSR1 received during
+        // the camera start or the warm-up is discarded here.
+        if NEXT.swap(false, Ordering::SeqCst) {
+            println!("note: SIGUSR1 received before the measurement window; ignored");
+        }
+        let counts_start = s.session.output().counts();
         let ticks_start = stats::self_cpu_ticks().unwrap_or(0);
         let wall_start = rec.now_ns();
 
         // Streaming keeps the last STREAM_RETAIN_S 1 s segments only.
-        let mut per_sec: std::collections::VecDeque<f64> = std::collections::VecDeque::new();
+        let mut per_sec: VecDeque<f64> = VecDeque::new();
         let (mut last_ticks, mut last_t) = (ticks_start, wall_start);
+        let mut next_sec = wall_start + 1_000_000_000;
         let report_every: u64 = if streaming {
             5_000_000_000
         } else {
@@ -1036,50 +1944,62 @@ fn run_measured(
         };
         let mut next_report = wall_start + report_every;
         let (mut status_ticks, mut status_t) = (ticks_start, wall_start);
-        // Pipeline drops are reported for frames that left the camera up to
-        // DROP_GRACE_NS ago; this is where the previous line stopped.
-        let mut drops_t = wall_start;
+        let mut status_counts = counts_start;
+        let switch_period = args.switch_every.map(secs_ns);
+        let mut next_switch = switch_period.map(|p| wall_start + p);
         let mut interrupted = false;
-        for k in 1u64.. {
-            // 1 s segments on a fixed grid from wall_start (no drift).
-            let next = (wall_start + k * 1_000_000_000).min(end);
-            if wait_until(&rec, &pipes, &mut bus, next, &|| false)? == Wait::Interrupted {
+        loop {
+            let mut deadline = next_sec.min(next_report).min(end);
+            if let Some(t) = next_switch {
+                deadline = deadline.min(t);
+            }
+            if s.wait_until(deadline, |_| next_requested())? == Wait::Interrupted {
                 // Close the window here: the report covers what was measured.
                 interrupted = true;
                 end = rec.now_ns().max(start);
                 rec.set_window(start, end);
             }
-            let now = rec.now_ns();
-            let ticks = stats::self_cpu_ticks().unwrap_or(last_ticks);
-            let seg_s = (now - last_t) as f64 / 1e9;
-            if seg_s >= 0.5 {
-                if streaming && per_sec.len() >= STREAM_RETAIN_S as usize {
-                    per_sec.pop_front();
-                }
-                per_sec.push_back(
-                    stats::cpu_usage(
-                        ticks.saturating_sub(last_ticks),
-                        stats::ticks_per_sec(),
-                        seg_s,
-                        stats::online_cpus(),
-                    )
-                    .one_core_pct,
-                );
+            if !interrupted && NEXT.swap(false, Ordering::SeqCst) {
+                s.switch_next("SIGUSR1");
             }
-            (last_ticks, last_t) = (ticks, now);
+            if let (Some(t), Some(p)) = (next_switch, switch_period)
+                && !interrupted
+                && timer_switch_due(rec.now_ns(), t, end)
+            {
+                s.switch_next("timer");
+                let now = rec.now_ns();
+                next_switch = Some(if t + p > now { t + p } else { now + p });
+            }
+            let now = rec.now_ns();
+            if now >= next_sec || interrupted || now >= end {
+                let ticks = stats::self_cpu_ticks().unwrap_or(last_ticks);
+                let seg_s = (now - last_t) as f64 / 1e9;
+                if seg_s >= 0.5 {
+                    if streaming && per_sec.len() >= STREAM_RETAIN_S as usize {
+                        per_sec.pop_front();
+                    }
+                    per_sec.push_back(
+                        stats::cpu_usage(
+                            ticks.saturating_sub(last_ticks),
+                            stats::ticks_per_sec(),
+                            seg_s,
+                            stats::online_cpus(),
+                        )
+                        .one_core_pct,
+                    );
+                }
+                (last_ticks, last_t) = (ticks, now);
+                // 1 s segments on a fixed grid from wall_start (no drift).
+                while next_sec <= now {
+                    next_sec += 1_000_000_000;
+                }
+            }
             if now >= next_report && !interrupted {
                 let elapsed = (now - wall_start) as f64 / 1e9;
                 if streaming {
+                    let ticks = stats::self_cpu_ticks().unwrap_or(status_ticks);
                     let w = rec.samples_between(status_t, now);
-                    let camera_drops = window_camera_drops(
-                        rec.last_src_pts_before(status_t),
-                        &w.src_pts,
-                        mode.frame_duration_ns(),
-                    );
-                    let drops_to = now.saturating_sub(DROP_GRACE_NS).max(drops_t);
-                    let (sent, delivered) = rec.delivery_between(drops_t, drops_to);
-                    let pipeline_drops = window_pipeline_drops(sent, delivered);
-                    drops_t = drops_to;
+                    let counts = s.session.output().counts();
                     let window_s = (now - status_t) as f64 / 1e9;
                     let cpu = stats::cpu_usage(
                         ticks.saturating_sub(status_ticks),
@@ -1090,93 +2010,129 @@ fn run_measured(
                     println!(
                         "[t+{elapsed:>5.0}s] {}",
                         status_line(
-                            &sel,
+                            s.current.map(|i| &cycle[i]),
                             &w,
                             window_s,
-                            cpu.one_core_pct,
-                            pipeline_drops,
-                            camera_drops
+                            &counts_delta(&status_counts, &counts),
+                            args.consumer,
+                            cpu.one_core_pct
                         )
                     );
-                    (status_ticks, status_t) = (ticks, now);
+                    (status_ticks, status_t, status_counts) = (ticks, now, counts);
                 } else {
                     let t = rec.totals();
                     println!(
-                        "  t+{elapsed:>4.0}s  sink frames {}  consumer frames {}",
+                        "  t+{elapsed:>4.0}s  output frames {}  consumer frames {}",
                         t.sink_buffers, t.consumer_buffers
                     );
                 }
-                next_report += report_every;
+                while next_report <= now {
+                    next_report += report_every;
+                }
             }
             if interrupted || now >= end {
                 break;
             }
         }
+        let counts_end = s.session.output().counts();
         let ticks_end = stats::self_cpu_ticks().unwrap_or(0);
         let wall_end = rec.now_ns();
+        // A switch still waiting for its first frame is abandoned, not
+        // incomplete: the window closed under it.
+        s.collect_switches();
+        if rec.abandon_open_switch()
+            && let Some(r) = s.switches.back_mut()
+            && r.gap.is_none()
+            && r.error.is_none()
+        {
+            r.abandoned = true;
+        }
         let cpu = stats::cpu_usage(
             ticks_end.saturating_sub(ticks_start),
             stats::ticks_per_sec(),
             (wall_end - wall_start) as f64 / 1e9,
             stats::online_cpus(),
         );
-        let latency_q = main_p.query_latency();
-        let links = main_p.links();
-        let consumer_links = consumer_p.as_ref().map(|c| c.links()).unwrap_or_default();
-        Ok((
-            consumer_p,
+        s.capture_ingest_links();
+        Ok(Measured {
             cpu,
-            Vec::from(per_sec),
-            latency_q,
-            links,
-            consumer_links,
+            per_sec: Vec::from(per_sec),
+            latency_q: s.session.output().pipeline().query_latency(),
+            output_links: s.session.output().pipeline().links(),
+            consumer_links: consumer.as_ref().map(|c| c.links()).unwrap_or_default(),
             interrupted,
-        ))
+            counts_start,
+            counts_end,
+        })
     })();
 
-    // ---- teardown: NVML first, then consumer, then main pipeline ----
+    // ---- teardown: NVML first, then consumer, then ingest and output ----
     let (gpu_samples, nvml_shutdown, gpu_info) = match sampler {
-        Some(s) => {
-            let info = s.info().clone();
-            let (samples, res) = s.stop();
+        Some(smp) => {
+            let info = smp.info().clone();
+            let (samples, res) = smp.stop();
             (samples, Some(res), Some(info))
         }
         None => (Vec::new(), None, None),
     };
-    let (consumer_p, cpu, per_sec, latency_q, links, consumer_links, interrupted) = match outcome {
-        Ok(v) => v,
-        Err(e) => {
-            // The consumer (if any) was dropped inside the closure (-> NULL);
-            // the caller's control guard restores on return.
-            let _ = main_p.shutdown();
-            return Err(e);
-        }
-    };
-    let consumer_null = consumer_p.map(|c| c.shutdown().map_err(|e| e.to_string()));
+    let consumer_null = consumer.map(|c| c.shutdown().map_err(|e| e.to_string()));
+    // On error, dropping the stream stops the ingest (restoring its
+    // controls) and then the output.
+    let m = outcome?;
+    s.collect_switches();
     let samples: Samples = rec.samples();
     let (win_start, win_end) = rec.window().unwrap_or((0, 0));
-    let main_null = main_p.shutdown().map_err(|e| e.to_string());
-    controls.changed_and_restored = edf_guard
-        .take()
-        .map(|g| g.restore().map_err(|e| e.to_string()));
+    let Stream {
+        session,
+        runs,
+        switches,
+        whole_run_switches,
+        ingest_errors,
+        overruns,
+        mut bus,
+        mut controls,
+        ingest_links,
+        ..
+    } = s;
+    let mut runs: Vec<SourceRun> = runs.into();
+    if let Some(r) = runs.last_mut()
+        && r.stopped_ns.is_none()
+    {
+        r.stopped_ns = Some(win_end);
+    }
+    let session_stop = session.stop().map_err(|e| e.to_string());
+    for (&i, c) in controls.iter_mut() {
+        if c.exposure_dynamic_framerate_before.is_some() {
+            c.exposure_dynamic_framerate_after_exit =
+                get_ctrl(&cycle[i].device.path, CID_EXPOSURE_AUTO_PRIORITY).ok();
+            c.restored = c
+                .exposure_dynamic_framerate_after_exit
+                .map(|a| Some(a) == c.exposure_dynamic_framerate_before);
+        }
+    }
     let nv_fds = nvidia_fds();
     let cuda_mapped = libcuda_mapped();
 
     // ---- report ----
-    let target = mode.fps();
-    let frame_ns = mode.frame_duration_ns();
+    let target = contract.fps();
+    let period_ns = contract.frame_duration_ns();
     // Streaming may have dropped old samples: per-frame figures then cover
     // the retained span [stats_start, win_end), stated in the report.
     let stats_start = samples
         .retained_from_ns
         .map_or(win_start, |f| f.max(win_start));
-    let sink_fps = stats::fps_report(&samples.sink_times, stats_start, win_end, target, 1.0);
+    let output_fps = stats::fps_report(&samples.sink_times, stats_start, win_end, target, 1.0);
     let consumer_fps = args
         .consumer
         .then(|| stats::fps_report(&samples.consumer_times, stats_start, win_end, target, 1.0));
-    let camera_fps = stats::fps_report(&samples.src_times, stats_start, win_end, target, 1.0);
-    // Whole-window counts: identical to the sample counts unless trimmed.
-    let lost_frames = samples.counts.src as i64 - samples.counts.sink as i64;
+    let inputs = input_reports(&samples, &runs, &cycle, stats_start, win_end);
+    let delta = counts_delta(&m.counts_start, &m.counts_end);
+    let ingest_lost = samples.counts.src as i64 - delta.input_frames as i64;
+    let runs_in_window = runs
+        .iter()
+        .filter(|r| r.stopped_ns.is_none_or(|t| t > win_start) && r.started_ns < win_end)
+        .count()
+        .max(1);
     let retention = streaming.then(|| RetentionSection {
         scope: if samples.retained_from_ns.is_some() {
             "retained_window"
@@ -1188,26 +2144,82 @@ fn run_measured(
         retained_s: win_end.saturating_sub(stats_start) as f64 / 1e9,
         whole_run_src_frames: samples.counts.src,
         whole_run_sink_frames: samples.counts.sink,
-        note: "Streaming keeps per-frame samples for the last retain_cap_s only. scope=whole_run: the run was shorter, every figure covers it all. scope=retained_window: fps, stalls, camera_missing_frames_by_pts, latency and per_second_one_core_pct cover the last retained_s (from retained_from_s after the window opened); config.measured_s, cpu.one_core_pct, fps.pipeline_lost_frames, criteria.no_pipeline_drops, totals and qos_dropped_by_element cover the whole run.",
+        note: "Streaming keeps per-frame samples and switch records for the last retain_cap_s only. scope=whole_run: the run was shorter, every figure covers it all. scope=retained_window: fps, stalls, inputs, latency, switches and per_second_one_core_pct cover the last retained_s (from retained_from_s after the window opened); config.measured_s, cpu.one_core_pct, frames, criteria.no_ingest_drops, totals and qos_dropped_by_element cover the whole run.",
     });
     let added = stats::summarize(&ms(&samples.added_latency_ns));
     let via_consumer = stats::summarize(&ms(&samples.consumer_latency_ns));
-    let budget_ms = frame_ns as f64 / 1e6;
-    let cuda_ok = all_cuda_between(&links, names::UPLOAD, names::DOWNLOAD) == Some(true);
+    // Cameras that never delivered a frame in the window do not set it.
+    let camera_period_ns = streamed_camera_period_ns(&runs, &cycle, &samples, stats_start, win_end);
+    let budget_ms = latency_budget_ms(period_ns, camera_period_ns);
+    let output_cuda =
+        all_cuda_between(&m.output_links, names::FRAMES_SRC, names::DOWNLOAD) == Some(true);
+    let ingest_caps: Vec<IngestCaps> = ingest_links
+        .into_iter()
+        .map(|(i, links)| IngestCaps {
+            camera: cycle[i].label(),
+            mode: cycle[i].choice.mode.to_string(),
+            ingest: cycle[i].choice.ingest,
+            cuda_memory_upload_to_slot: all_cuda_between(&links, names::UPLOAD, names::FRAMES_SINK)
+                == Some(true),
+            links,
+        })
+        .collect();
+    let switches: Vec<SwitchRecord> = switches.into();
+    let switch_section = summarize_switches(
+        &switches,
+        &cycle,
+        win_start,
+        whole_run_switches,
+        samples.totals.switches_abandoned,
+    );
+    let queue_overruns = overruns.load(Ordering::Relaxed);
 
-    let fps_ok =
-        |r: &FpsReport| r.overall >= target * 0.99 && r.windows_below_target == 0 && r.windows > 0;
+    let grid = |times: &[u64]| {
+        grid_fps(
+            times,
+            stats_start,
+            win_end,
+            contract.fps_num,
+            contract.fps_den,
+        )
+    };
+    let output_grid = grid(&samples.sink_times);
+    let consumer_grid = args.consumer.then(|| grid(&samples.consumer_times));
+    // The consumer is judged where the stamp tells re-delivered frames
+    // apart (measured runs).
+    let judge_consumer = args.consumer_stamp();
+    let consumer_received_all = !judge_consumer
+        || ((samples.counts.consumer as i64 - samples.counts.sink as i64).abs() <= 3
+            && samples.totals.consumer_unmatched == 0);
+    let waiting_source = switches
+        .iter()
+        .rev()
+        .find(|r| r.abandoned)
+        .and_then(|r| r.source_id);
     let criteria = Criteria {
-        fps_sustained: fps_ok(&sink_fps) && consumer_fps.as_ref().is_none_or(fps_ok),
-        no_pipeline_drops: overruns.load(Ordering::Relaxed) == 0
-            && lost_frames.abs() <= 3
-            && consumer_fps
-                .as_ref()
-                .is_none_or(|c| (samples.counts.src as i64 - c.frames as i64).abs() <= 3)
-            && samples.totals.consumer_unmatched == 0,
-        added_latency_p95_within_one_frame: added.is_some_and(|s| s.p95 <= budget_ms),
-        added_latency_p99_within_one_frame: added.is_some_and(|s| s.p99 <= budget_ms),
-        cuda_memory_links: cuda_ok,
+        run_completed: run_completed(
+            streaming,
+            m.interrupted,
+            win_end.saturating_sub(win_start),
+            args.duration,
+        ),
+        fps_sustained: output_grid.exact
+            && (!judge_consumer || consumer_grid.as_ref().is_some_and(|g| g.exact)),
+        no_output_drops: delta.queue_dropped == 0
+            && delta.push_failed == 0
+            && consumer_received_all,
+        no_skipped_ticks: delta.skipped == 0,
+        switches_completed: switch_section.failed == 0
+            && switch_section.completed + switch_section.abandoned_at_end == switch_section.count,
+        no_placeholders_outside_switches: samples.counts.placeholders_outside_switches == 0,
+        no_ingest_errors: ingest_errors == 0,
+        inputs_delivered: inputs_delivered(&runs, &samples, stats_start, win_end, waiting_source),
+        no_ingest_drops: queue_overruns == 0 && ingest_lost.abs() <= 3 * runs_in_window as i64,
+        added_latency_p95_within_budget: added.is_some_and(|s| s.p95 <= budget_ms),
+        added_latency_p99_within_budget: added.is_some_and(|s| s.p99 <= budget_ms),
+        cuda_memory_links: output_cuda
+            && !ingest_caps.is_empty()
+            && ingest_caps.iter().all(|c| c.cuda_memory_upload_to_slot),
     };
 
     let gpu = gpu_info.map(|info| {
@@ -1233,58 +2245,86 @@ fn run_measured(
         }
     });
 
+    let qos_dropped = bus.take_qos_dropped();
+    let decoder_dropped_frames = ingest_caps
+        .iter()
+        .any(|c| c.ingest == IngestPath::CpuDecode)
+        .then(|| {
+            qos_dropped
+                .iter()
+                .filter(|(k, _)| k.ends_with(&format!("/{}", names::DECODE)))
+                .map(|(_, v)| v)
+                .sum()
+        });
+
     let report = Report {
         tool: "obc-bench",
         version: env!("CARGO_PKG_VERSION"),
         environment: env,
         config: ConfigReport {
-            camera: sel.camera,
+            cameras: cycle
+                .iter()
+                .map(|c| CameraEntry {
+                    camera: c.device.clone(),
+                    how: c.how.clone(),
+                    mode: c.choice.mode.to_string(),
+                    mode_exact: c.choice.exact,
+                    mode_differences: c.choice.differences.clone(),
+                    ingest: c.choice.ingest,
+                })
+                .collect(),
             sink,
             camera_discovery: format!("{:?}", cams.used),
             camera_discovery_note: cams.note.clone(),
-            camera_controls: controls,
-            camera_auto_picked: sel.auto,
             sink_discovery: "sysfs (/sys/class/video4linux/*/name, virtual parent + v4l2loopback attributes)",
-            pipeline: cfg,
+            camera_auto_picked: cycle[0].auto,
             requested_mode: args.mode.to_string(),
-            mode: mode.to_string(),
-            mode_exact: sel.choice.exact,
-            mode_differences: sel.choice.differences,
-            ingest: sel.choice.ingest,
+            output: contract,
+            output_caps: contract_caps_string(&contract),
+            aspect: args.aspect,
+            process: args.gpu_stage,
+            input_gap_ms: args.input_gap_ms,
+            queue_buffers: args.queue_buffers,
+            camera_io_mode: args.io_mode.clone(),
+            camera_fixed_framerate: args.camera_fixed_framerate,
+            switch_every_s: args.switch_every,
             streaming,
             duration_s: args.duration,
             measured_s: win_end.saturating_sub(win_start) as f64 / 1e9,
-            interrupted,
+            interrupted: m.interrupted,
             warmup_s: args.warmup,
             consumer: args.consumer,
+            consumer_stamp: args.consumer_stamp(),
         },
         fps: FpsSection {
             target,
-            sink_stalls: stats::count_stalls(&samples.sink_times, frame_ns, 1.5),
-            camera_src_stalls: stats::count_stalls(&samples.src_times, frame_ns, 1.5),
+            output_stalls: stats::count_stalls(&samples.sink_times, period_ns, 1.5),
             consumer_stalls: args
                 .consumer
-                .then(|| stats::count_stalls(&samples.consumer_times, frame_ns, 1.5)),
-            camera_missing_frames_by_pts: stats::missing_frames_from_gaps(
-                &samples.src_pts,
-                frame_ns,
-            ),
-            pipeline_lost_frames: lost_frames,
-            queue_overruns: overruns.load(Ordering::Relaxed),
-            decoder_dropped_frames: (sel.choice.ingest == IngestPath::CpuDecode)
-                .then(|| bus.qos_dropped.get(names::DECODE).copied().unwrap_or(0)),
-            qos_dropped_by_element: std::mem::take(&mut bus.qos_dropped),
-            sink: sink_fps,
+                .then(|| stats::count_stalls(&samples.consumer_times, period_ns, 1.5)),
+            output: output_fps,
             consumer: consumer_fps,
-            camera_src: camera_fps,
+            output_grid,
+            consumer_grid,
+            inputs,
         },
+        frames: FramesSection {
+            output: delta,
+            camera_src_frames: samples.counts.src,
+            ingest_lost_frames: ingest_lost,
+            queue_overruns,
+            qos_dropped_by_element: qos_dropped,
+            decoder_dropped_frames,
+        },
+        switches: switch_section,
         latency: LatencySection {
             method: METHOD,
+            output_period_ms: period_ns as f64 / 1e6,
             budget_ms,
             added_primary_ms: added,
             added_at_sink_pad_ms: stats::summarize(&ms(&samples.added_at_pad_ns)),
             via_consumer_ms: via_consumer,
-            gst_latency_query: latency_q.map(|(live, min, max)| LatencyQuery {
+            gst_latency_query: m.latency_q.map(|(live, min, max)| LatencyQuery {
                 live,
                 min_ms: min as f64 / 1e6,
                 max_ms: max.map(|m| m as f64 / 1e6),
@@ -1298,27 +2338,30 @@ fn run_measured(
             stamp_memory_copies: samples.totals.stamp_memory_copies,
         },
         cpu: CpuSection {
-            one_core_pct: cpu.one_core_pct,
-            all_cores_pct: cpu.all_cores_pct,
-            per_second_one_core_pct: stats::summarize(&per_sec),
+            one_core_pct: m.cpu.one_core_pct,
+            all_cores_pct: m.cpu.all_cores_pct,
+            per_second_one_core_pct: stats::summarize(&m.per_sec),
             online_cpus: stats::online_cpus(),
             ticks_per_sec: stats::ticks_per_sec(),
         },
         gpu,
         caps: CapsSection {
-            cuda_memory_between_upload_and_download: cuda_ok,
+            output_cuda_memory: output_cuda,
             sink_buffer_memory: rec.sink_memory(),
-            links,
-            consumer_links,
+            output_links: m.output_links,
+            ingest: ingest_caps,
+            consumer_links: m.consumer_links,
         },
+        camera_controls: controls.into_values().collect(),
         totals: samples.totals,
-        warnings: std::mem::take(&mut bus.warnings),
+        warnings: std::mem::take(&mut bus.warnings.kept),
+        warnings_suppressed: bus.warnings.suppressed,
         teardown: TeardownSection {
-            main_pipeline_null: main_null,
+            session_stop,
             consumer_pipeline_null: consumer_null,
             nvidia_fds_after_teardown: nv_fds,
             libcuda_mapped_after_teardown: cuda_mapped,
-            note: "GStreamer destroys its CUDA context when the pipeline reaches NULL; remaining /dev/nvidia* fds (if any) are the CUDA driver's process-wide handles from cuInit, released only at process exit",
+            note: "GStreamer destroys its CUDA context when the pipelines reach NULL; remaining /dev/nvidia* fds (if any) are the CUDA driver's process-wide handles from cuInit, released only at process exit",
             dgpu_runtime_status_after_teardown: runtime_status(),
             linger_s: args.linger_after_teardown,
         },
@@ -1388,18 +2431,19 @@ fn print_summary(r: &Report) {
             x.windows_below_target
         )
     };
+    let c = &r.config;
     println!(
-        "== obc-bench {} ({}) {} -> {} ==",
-        r.config.mode, r.config.ingest, r.config.pipeline.gpu_stage, r.config.pipeline.output
+        "== obc-bench output {} ({}, {}) ==",
+        c.output, c.aspect, c.process
     );
-    if r.config.streaming {
+    if c.streaming {
         println!(
             "streamed {:.1} s (measured after warm-up) until a stop signal",
-            r.config.measured_s
+            c.measured_s
         );
         if let Some(k) = &r.retention {
             println!(
-                "per-frame figures cover: {} ({:.1} s from t+{:.1}s; samples kept for the last {:.0} s); whole run: {} frames from the camera, {} at the sink",
+                "per-frame figures cover: {} ({:.1} s from t+{:.1}s; samples kept for the last {:.0} s); whole run: {} camera frames, {} output frames",
                 k.scope,
                 k.retained_s,
                 k.retained_from_s,
@@ -1408,66 +2452,123 @@ fn print_summary(r: &Report) {
                 k.whole_run_sink_frames
             );
         }
-    } else if r.config.interrupted {
+    } else if c.interrupted {
         println!(
             "INTERRUPTED by signal: figures cover {:.1} s of the requested {:.0} s",
-            r.config.measured_s, r.config.duration_s
+            c.measured_s, c.duration_s
         );
     }
-    let cc = &r.config.camera_controls;
     let opt = |v: Option<i32>| v.map_or("unreadable".to_string(), |v| v.to_string());
-    match &cc.changed_and_restored {
-        None if cc.exposure_dynamic_framerate_skipped.is_some() => println!(
-            "camera exposure_dynamic_framerate: skipped ({})",
-            cc.exposure_dynamic_framerate_skipped
-                .as_deref()
-                .unwrap_or("")
-        ),
-        None => println!(
-            "camera exposure_dynamic_framerate: {} (unchanged)",
-            opt(cc.exposure_dynamic_framerate_before)
-        ),
-        Some(Ok(())) => println!(
-            "camera exposure_dynamic_framerate: {} during the run, restored to {}",
-            opt(cc.exposure_dynamic_framerate_during),
-            opt(cc.exposure_dynamic_framerate_before)
-        ),
-        Some(Err(e)) => println!(
-            "camera exposure_dynamic_framerate: RESTORE FAILED (still {}, was {}): {e}",
-            opt(cc.exposure_dynamic_framerate_during),
-            opt(cc.exposure_dynamic_framerate_before)
-        ),
+    for cc in &r.camera_controls {
+        let cam = cc.camera.display();
+        match (
+            &cc.exposure_dynamic_framerate_skipped,
+            cc.pinned,
+            cc.restored,
+        ) {
+            (Some(skip), _, _) => {
+                println!("{cam} exposure_dynamic_framerate: skipped ({skip})")
+            }
+            (None, false, _) => println!(
+                "{cam} exposure_dynamic_framerate: {} (unchanged)",
+                opt(cc.exposure_dynamic_framerate_before)
+            ),
+            (None, true, Some(true)) => println!(
+                "{cam} exposure_dynamic_framerate: {} while streaming, restored to {}",
+                opt(cc.exposure_dynamic_framerate_during),
+                opt(cc.exposure_dynamic_framerate_before)
+            ),
+            (None, true, _) => println!(
+                "{cam} exposure_dynamic_framerate: RESTORE FAILED (now {}, was {})",
+                opt(cc.exposure_dynamic_framerate_after_exit),
+                opt(cc.exposure_dynamic_framerate_before)
+            ),
+        }
     }
-    println!("fps (target {:.0}):", f.target);
-    fps_line("camera", &f.camera_src);
-    fps_line("sink", &f.sink);
-    if let Some(c) = &f.consumer {
-        fps_line("consumer", c);
+    let grid_line = |name: &str, g: &GridFps| {
+        println!(
+            "  {name:<9} on the frame grid: {} of {} 1 s windows off the grid (min {} max {}); {} frames, {:.1} expected; exact {}",
+            g.windows_off_grid,
+            g.windows,
+            g.min_1s.map_or("-".into(), |v| v.to_string()),
+            g.max_1s.map_or("-".into(), |v| v.to_string()),
+            g.frames,
+            g.expected_frames,
+            g.exact
+        )
+    };
+    println!("fps (contract {:.2}):", f.target);
+    fps_line("output", &f.output);
+    grid_line("output", &f.output_grid);
+    if let Some(cf) = &f.consumer {
+        fps_line("consumer", cf);
     }
+    if let Some(cg) = &f.consumer_grid {
+        grid_line("consumer", cg);
+    }
+    for i in &f.inputs {
+        println!(
+            "  input #{} {} {} {}: {:.2} fps over {:.1} s, 1 s windows min {} max {}; camera-side drops {} (PTS gaps)",
+            i.source_id,
+            i.camera,
+            i.mode,
+            i.ingest,
+            i.fps.overall,
+            i.span_s,
+            i.fps.min_1s.map_or("-".into(), |v| format!("{v:.0}")),
+            i.fps.max_1s.map_or("-".into(), |v| format!("{v:.0}")),
+            i.missing_frames_by_pts
+        );
+    }
+    let o = &r.frames.output;
     println!(
-        "  drops: camera-side {} (PTS gaps), pipeline {}, queue overruns {}, stalls camera/sink {}/{}, qos {:?}",
-        f.camera_missing_frames_by_pts,
-        f.pipeline_lost_frames,
-        f.queue_overruns,
-        f.camera_src_stalls,
-        f.sink_stalls,
-        f.qos_dropped_by_element
+        "frames: fresh {} repeat {} placeholder {} | input {} superseded {} | late {} skipped {} | output queue dropped {} | ingest lost {}, queue overruns {}, qos {:?}",
+        o.fresh,
+        o.repeat,
+        o.placeholder,
+        o.input_frames,
+        o.superseded,
+        o.late,
+        o.skipped,
+        o.queue_dropped,
+        r.frames.ingest_lost_frames,
+        r.frames.queue_overruns,
+        r.frames.qos_dropped_by_element
     );
-    if let Some(n) = f.decoder_dropped_frames {
+    if let Some(n) = r.frames.decoder_dropped_frames {
         println!("  jpegdec dropped {n} undecodable camera frames (whole run)");
     }
-    println!("latency (budget {:.2} ms):", r.latency.budget_ms);
+    let sw = &r.switches;
     println!(
-        "  added (src pad -> sink ready): {}",
+        "switches: {} ({} completed, {} failed, {} abandoned at the end); gap {}; repeats {} placeholders {} during gaps; first start {}",
+        sw.count,
+        sw.completed,
+        sw.failed,
+        sw.abandoned_at_end,
+        sw.gap_ms.map_or("n/a".into(), |g| format!(
+            "min {:.1} p50 {:.1} max {:.1} ms",
+            g.min, g.p50, g.max
+        )),
+        sw.repeats_during_gaps,
+        sw.placeholders_during_gaps,
+        sw.initial_start_ms
+            .map_or("n/a".into(), |g| format!("{g:.1} ms"))
+    );
+    println!(
+        "latency (output period {:.2} ms, budget {:.2} ms):",
+        r.latency.output_period_ms, r.latency.budget_ms
+    );
+    println!(
+        "  added (camera src pad -> sink ready, fresh): {}",
         fmt_sum(&r.latency.added_primary_ms, " ms")
     );
     println!(
-        "  (src pad -> sink pad arrival): {}",
+        "  (camera src pad -> sink pad arrival): {}",
         fmt_sum(&r.latency.added_at_sink_pad_ms, " ms")
     );
-    if r.config.consumer {
+    if c.consumer_stamp {
         println!(
-            "  via consumer (src pad -> consumer): {}",
+            "  via consumer (camera src pad -> consumer): {}",
             fmt_sum(&r.latency.via_consumer_ms, " ms")
         );
         println!(
@@ -1479,7 +2580,7 @@ fn print_summary(r: &Report) {
     }
     if let Some(q) = &r.latency.gst_latency_query {
         println!(
-            "  gst latency query: live={} min {:.2} ms max {}",
+            "  gst latency query (output): live={} min {:.2} ms max {}",
             q.live,
             q.min_ms,
             q.max_ms.map_or("none".into(), |m| format!("{m:.2} ms"))
@@ -1505,41 +2606,65 @@ fn print_summary(r: &Report) {
         );
     }
     println!(
-        "caps: CUDAMemory on every link upload..download: {}; buffers at v4l2sink: {}",
-        r.caps.cuda_memory_between_upload_and_download,
+        "caps: output CUDAMemory appsrc..download: {}; buffers at v4l2sink: {}",
+        r.caps.output_cuda_memory,
         r.caps.sink_buffer_memory.as_deref().unwrap_or("?")
     );
-    for l in &r.caps.links {
+    let links = |l: &[LinkCaps]| {
+        for l in l {
+            println!(
+                "    {} -> {}: {}",
+                l.from,
+                l.to,
+                l.caps.as_deref().unwrap_or("-")
+            );
+        }
+    };
+    println!("  output:");
+    links(&r.caps.output_links);
+    for i in &r.caps.ingest {
         println!(
-            "  {} -> {}: {}",
-            l.from,
-            l.to,
-            l.caps.as_deref().unwrap_or("-")
+            "  ingest {} {} ({}), CUDAMemory upload..slot: {}",
+            i.camera, i.mode, i.ingest, i.cuda_memory_upload_to_slot
         );
+        links(&i.links);
     }
     println!(
-        "teardown: main {:?}, /dev/nvidia* fds after: {}, libcuda still mapped: {}",
-        r.teardown.main_pipeline_null,
+        "teardown: session {:?}, /dev/nvidia* fds after: {}, libcuda still mapped: {}",
+        r.teardown.session_stop,
         r.teardown.nvidia_fds_after_teardown.len(),
         r.teardown.libcuda_mapped_after_teardown
     );
     for w in &r.warnings {
         println!("warning: {w}");
     }
-    let c = &r.criteria;
+    if r.warnings_suppressed > 0 {
+        println!("warning: {} more warnings not kept", r.warnings_suppressed);
+    }
+    let k = &r.criteria;
     println!(
-        "criteria: fps_sustained={} no_pipeline_drops={} latency_p95<=1frame={} latency_p99<=1frame={} cuda_links={}",
-        c.fps_sustained,
-        c.no_pipeline_drops,
-        c.added_latency_p95_within_one_frame,
-        c.added_latency_p99_within_one_frame,
-        c.cuda_memory_links
+        "criteria: run_completed={} fps_sustained={} no_output_drops={} no_skipped_ticks={} switches_completed={} no_placeholders_outside_switches={} no_ingest_errors={} inputs_delivered={} no_ingest_drops={} latency_p95<=budget={} latency_p99<=budget={} cuda_links={}",
+        k.run_completed,
+        k.fps_sustained,
+        k.no_output_drops,
+        k.no_skipped_ticks,
+        k.switches_completed,
+        k.no_placeholders_outside_switches,
+        k.no_ingest_errors,
+        k.inputs_delivered,
+        k.no_ingest_drops,
+        k.added_latency_p95_within_budget,
+        k.added_latency_p99_within_budget,
+        k.cuda_memory_links
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use obc_core::UsbId;
+    use obc_pipeline::DiscoverySource;
+    use obc_pipeline::capability::parse_v4l2_ctl;
 
     #[test]
     fn seconds_are_validated() {
@@ -1552,6 +2677,10 @@ mod tests {
         assert!(positive_secs("0").is_err());
     }
 
+    fn parse(extra: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(std::iter::once("obc-bench").chain(extra.iter().copied()))
+    }
+
     #[test]
     fn bad_arguments_are_rejected_by_clap() {
         for (flag, v) in [
@@ -1559,48 +2688,676 @@ mod tests {
             ("--duration", "-5"),
             ("--warmup", "NaN"),
             ("--linger-after-teardown", "1e300"),
+            ("--switch-every", "0"),
+            ("--switch-every", "-1"),
+            ("--input-gap-ms", "0"),
+            ("--output", "1921x1080@30"),
+            ("--output", "1920x1080"),
+            ("--output-range", "tv"),
+            ("--aspect", "stretch"),
         ] {
-            assert!(
-                Args::try_parse_from(["obc-bench", flag, v]).is_err(),
-                "{flag} {v}"
-            );
+            assert!(parse(&[flag, v]).is_err(), "{flag} {v}");
         }
-        assert!(Args::try_parse_from(["obc-bench", "--duration", "0.5"]).is_ok());
+        assert!(parse(&["--duration", "0.5"]).is_ok());
         // --camera-usb is folded into --camera.
-        assert!(Args::try_parse_from(["obc-bench", "--camera-usb", "046d:0944"]).is_err());
-        assert!(Args::try_parse_from(["obc-bench", "--camera", ""]).is_err());
-        assert!(Args::try_parse_from(["obc-bench", "--mode", "H264:1920x1080@30"]).is_err());
+        assert!(parse(&["--camera-usb", "046d:0944"]).is_err());
+        assert!(parse(&["--camera", ""]).is_err());
+        assert!(parse(&["--mode", "H264:1920x1080@30"]).is_err());
     }
 
     #[test]
-    fn camera_takes_three_forms() {
-        let cam = |v: &str| {
-            Args::try_parse_from(["obc-bench", "--camera", v])
-                .unwrap()
-                .camera
-                .unwrap()
-        };
-        assert!(matches!(cam("/dev/video4"), CameraSelector::Path(_)));
-        assert!(matches!(cam("5986:1193"), CameraSelector::Usb(_)));
-        assert!(matches!(cam("MX Brio"), CameraSelector::Name(_)));
-        let none = Args::try_parse_from(["obc-bench"]).unwrap();
-        assert_eq!(none.camera, None, "no default camera");
-        assert_eq!(none.mode, ModeRequest::default());
-        assert_eq!(none.duration, 30.0, "the benchmark default is unchanged");
+    fn defaults() {
+        let a = parse(&[]).unwrap();
+        assert!(a.camera.is_empty(), "no default camera");
+        assert_eq!(a.mode, ModeRequest::default());
+        assert_eq!(a.duration, 30.0, "the benchmark default is unchanged");
+        assert_eq!(a.contract(), OutputContract::default());
+        assert_eq!(a.aspect, AspectPolicy::Crop);
+        assert_eq!(a.input_gap_ms, 500);
+        assert_eq!(a.switch_every, None);
+        assert_eq!(a.gpu_stage, GpuStage::Passthrough);
+        assert!(!a.consumer_stamp());
     }
 
     #[test]
-    fn mode_takes_both_forms() {
-        let m = |v: &str| {
-            Args::try_parse_from(["obc-bench", "--mode", v])
-                .unwrap()
-                .mode
-        };
-        assert_eq!(m("1920x1080@30").format, None);
+    fn output_contract_combines_size_rate_format_and_range() {
+        let a = parse(&[
+            "--output",
+            "1280x720@30000/1001",
+            "--output-format",
+            "i420",
+            "--output-range",
+            "full",
+            "--aspect",
+            "letterbox",
+            "--input-gap-ms",
+            "250",
+            "--switch-every",
+            "2.5",
+        ])
+        .unwrap();
+        let c = a.contract();
+        assert_eq!((c.width, c.height), (1280, 720));
+        assert_eq!((c.fps_num, c.fps_den), (30000, 1001));
+        assert_eq!(c.format, OutputFormat::I420);
+        assert_eq!(c.range, ColourRange::Full);
+        assert_eq!(c.colorimetry(), "1:4:5:1");
+        assert_eq!(a.aspect, AspectPolicy::Letterbox);
+        assert_eq!(a.input_gap_ms, 250);
+        assert_eq!(a.switch_every, Some(2.5));
+    }
+
+    #[test]
+    fn camera_is_repeatable_and_takes_three_forms() {
+        let a = parse(&[
+            "--camera",
+            "/dev/video4",
+            "--camera",
+            "5986:1193",
+            "--camera",
+            "MX Brio",
+        ])
+        .unwrap();
+        assert!(matches!(a.camera[0], CameraSelector::Path(_)));
+        assert!(matches!(a.camera[1], CameraSelector::Usb(_)));
+        assert!(matches!(a.camera[2], CameraSelector::Name(_)));
+    }
+
+    #[test]
+    fn consumer_is_allowed_while_streaming_without_the_stamp() {
+        let a = parse(&["--duration", "0", "--consumer"]).unwrap();
+        assert!(a.streaming() && a.consumer && !a.consumer_stamp());
+        let bench = parse(&["--consumer"]).unwrap();
+        assert!(!bench.streaming() && bench.consumer_stamp());
+    }
+
+    const BRIO_CTL: &str = include_str!("../../tests/data/mx-brio-046d-0944.v4l2-ctl.txt");
+    const FHD_CTL: &str = include_str!("../../tests/data/fhd-camera-5986-1193-colour.v4l2-ctl.txt");
+    const FHD_IR_CTL: &str = include_str!("../../tests/data/fhd-camera-5986-1193-ir.v4l2-ctl.txt");
+
+    fn dev(path: &str, card: &str, usb: (u16, u16), fixture: Option<&str>) -> DeviceInfo {
+        DeviceInfo {
+            path: PathBuf::from(path),
+            card: card.to_string(),
+            driver: Some(
+                if fixture.is_some() {
+                    "uvcvideo"
+                } else {
+                    "v4l2 loopback"
+                }
+                .into(),
+            ),
+            usb: Some(UsbId {
+                vendor: usb.0,
+                product: usb.1,
+            }),
+            caps: Some(0x0420_0001),
+            capture: true,
+            loopback: fixture.is_none(),
+            source: DiscoverySource::Synthetic,
+            capabilities: fixture.map(parse_v4l2_ctl),
+        }
+    }
+
+    /// A laptop camera (colour and IR nodes), an external MX Brio and a
+    /// loopback being fed (so it shows capture caps).
+    fn devices() -> Vec<DeviceInfo> {
+        vec![
+            dev(
+                "/dev/vidtest0",
+                "FHD Camera",
+                (0x5986, 0x1193),
+                Some(FHD_CTL),
+            ),
+            dev(
+                "/dev/vidtest2",
+                "FHD Camera IR",
+                (0x5986, 0x1193),
+                Some(FHD_IR_CTL),
+            ),
+            dev("/dev/vidtest4", "MX Brio", (0x046d, 0x0944), Some(BRIO_CTL)),
+            dev("/dev/vidtest11", "Omarchy Broadcast", (0, 0), None),
+        ]
+    }
+
+    fn summary(cycle: &[CycleCamera]) -> Vec<(String, String)> {
+        cycle
+            .iter()
+            .map(|c| (c.device.card.clone(), c.choice.mode.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn cycle_follows_repeated_cameras_with_a_mode_each() {
+        let devices = devices();
+        let req: ModeRequest = "1920x1080@60".parse().unwrap();
+        let sel = |s: &str| s.parse::<CameraSelector>().unwrap();
+        let cycle = camera_cycle(&devices, &[sel("046d:0944"), sel("FHD Camera")], &req);
+        // "FHD Camera" matches the colour node only (the IR node is not colour).
+        let cycle = cycle.unwrap();
         assert_eq!(
-            m("YUY2:1920x1080@60").format,
-            Some(obc_core::PixelFormat::Yuy2)
+            summary(&cycle),
+            vec![
+                ("MX Brio".into(), "NV12:1920x1080@60".into()),
+                ("FHD Camera".into(), "MJPEG:1920x1080@30".into()),
+            ]
         );
+        assert_eq!(cycle[0].choice.ingest, IngestPath::GpuDirect);
+        assert_eq!(cycle[1].choice.ingest, IngestPath::CpuDecode);
+        assert!(!cycle[0].auto && !cycle[1].auto);
+    }
+
+    #[test]
+    fn single_or_no_camera_cycles_through_every_colour_camera() {
+        let devices = devices();
+        let req: ModeRequest = "1920x1080@60".parse().unwrap();
+        // No selector: the exact match comes first, then the rest in order;
+        // neither the IR node nor the loopback is a candidate.
+        let auto = camera_cycle(&devices, &[], &req).unwrap();
+        assert_eq!(
+            summary(&auto),
+            vec![
+                ("MX Brio".into(), "NV12:1920x1080@60".into()),
+                ("FHD Camera".into(), "MJPEG:1920x1080@30".into()),
+            ]
+        );
+        assert!(auto[0].auto && auto[0].how.contains("exactly"));
+        let one = camera_cycle(&devices, &["5986:1193".parse().unwrap()], &req).unwrap();
+        assert_eq!(one[0].device.card, "FHD Camera");
+        assert_eq!(one[1].device.card, "MX Brio");
+        assert!(!one[0].auto && one[1].auto);
+        // A selector matching nothing is an error, not a fallback.
+        assert!(camera_cycle(&devices, &["1234:5678".parse().unwrap()], &req).is_err());
+    }
+
+    #[test]
+    fn latency_budget_is_one_output_period_plus_one_camera_period() {
+        // 30 fps contract fed at 60 fps: 33.3 + 16.7 ms.
+        let b = latency_budget_ms(33_333_333, 16_666_666);
+        assert!((b - 50.0).abs() < 0.001, "{b}");
+        // 30 fps contract fed at 30 fps: two 33.3 ms periods.
+        let b = latency_budget_ms(33_333_333, 33_333_333);
+        assert!((b - 66.667).abs() < 0.001, "{b}");
+        // No camera: the output period alone.
+        let b = latency_budget_ms(33_333_333, 0);
+        assert!((b - 33.333).abs() < 0.001, "{b}");
+    }
+
+    #[test]
+    fn warnings_are_capped_and_counted() {
+        let mut w = Warnings::default();
+        for i in 0..WARNINGS_KEPT + 25 {
+            w.push(format!("w{i}"));
+        }
+        assert_eq!(w.kept.len(), WARNINGS_KEPT);
+        assert_eq!(w.kept[0], "w0");
+        assert_eq!(w.suppressed, 25);
+    }
+
+    #[test]
+    fn qos_drops_are_keyed_by_camera_across_ingest_runs() {
+        gst::init().unwrap();
+        let frame = 33_333_333u64;
+        let mut c = BusCounters::default();
+        let running = |n| gst::GenericFormattedValue::new(gst::Format::Buffers, n);
+        // Fifty switches between two cameras: each run's decoder reports a
+        // running total from 0, and its camera one lost frame.
+        for run in 0..50 {
+            let cam = if run % 2 == 0 {
+                "A (/dev/video0)"
+            } else {
+                "B (/dev/video4)"
+            };
+            for total in [1, 2] {
+                account_qos_drop(
+                    c.qos_run.entry(format!("{cam}/decode")).or_default(),
+                    running(total),
+                    None,
+                    frame,
+                );
+            }
+            account_qos_drop(
+                c.qos_run.entry(format!("{cam}/camera")).or_default(),
+                gst::GenericFormattedValue::new(gst::Format::Undefined, -1),
+                Some(gst::ClockTime::from_nseconds(frame)),
+                frame,
+            );
+            c.end_ingest_run();
+        }
+        c.qos_run.insert("A (/dev/video0)/decode".into(), 3);
+        let all = c.take_qos_dropped();
+        assert_eq!(all.len(), 4, "{all:?}");
+        // 25 runs per camera, 2 decoder drops each (the latest total).
+        assert_eq!(all["A (/dev/video0)/decode"], 25 * 2 + 3);
+        assert_eq!(all["B (/dev/video4)/decode"], 25 * 2);
+        assert_eq!(all["A (/dev/video0)/camera"], 25);
+        assert!(c.qos_run.is_empty() && c.qos_dropped.is_empty());
+    }
+
+    #[test]
+    fn output_counter_deltas_per_window() {
+        let a = OutputCounts {
+            input_frames: 100,
+            fresh: 50,
+            repeat: 2,
+            placeholder: 0,
+            superseded: 48,
+            late: 1,
+            skipped: 0,
+            emitted: 52,
+            queue_dropped: 1,
+            push_failed: 0,
+        };
+        let b = OutputCounts {
+            input_frames: 400,
+            fresh: 200,
+            repeat: 5,
+            placeholder: 10,
+            superseded: 198,
+            late: 1,
+            skipped: 3,
+            emitted: 215,
+            queue_dropped: 4,
+            push_failed: 1,
+        };
+        let d = counts_delta(&a, &b);
+        assert_eq!(
+            d,
+            OutputCounts {
+                input_frames: 300,
+                fresh: 150,
+                repeat: 3,
+                placeholder: 10,
+                superseded: 150,
+                late: 0,
+                skipped: 3,
+                emitted: 163,
+                queue_dropped: 3,
+                push_failed: 1,
+            }
+        );
+        assert_eq!(d.fresh + d.repeat + d.placeholder, d.emitted);
+        // Never negative, even for snapshots in the wrong order.
+        assert_eq!(counts_delta(&b, &a), OutputCounts::default());
+    }
+
+    /// Output fps per 1 s window counts arrivals on a fixed grid; a tick
+    /// late into the next window shows up as 29 + 31, not as a drop overall.
+    #[test]
+    fn output_fps_windows() {
+        let period = 33_333_333u64;
+        let start = 5_000_000_000u64;
+        let mut times: Vec<u64> = (0..90).map(|i| start + i * period + 1_000).collect();
+        // Tick 29 (last of window 0) arrives 2 ms into window 1.
+        times[29] = start + 1_000_000_000 + 2_000_000;
+        let r = stats::fps_report(&times, start, start + 3_000_000_000, 30.0, 1.0);
+        assert_eq!(r.windows, 3);
+        assert_eq!((r.min_1s, r.max_1s), (Some(29.0), Some(31.0)));
+        assert_eq!(r.windows_below_target, 0, "within the 1-frame tolerance");
+        assert!((r.overall - 30.0).abs() < 1e-9);
+    }
+
+    /// A camera with the MX Brio's capabilities (NV12 1080p60 chosen), or
+    /// with `fixture`'s.
+    fn cam_with(card: &str, path: &str, fixture: &str) -> CycleCamera {
+        let d = dev(path, card, (1, 1), Some(fixture));
+        let choice =
+            choose_mode(d.capabilities.as_ref().unwrap(), &ModeRequest::default()).unwrap();
+        CycleCamera {
+            device: d,
+            choice,
+            how: String::new(),
+            auto: false,
+        }
+    }
+
+    fn cam(card: &str, path: &str) -> CycleCamera {
+        cam_with(card, path, BRIO_CTL)
+    }
+
+    fn record(
+        from: Option<usize>,
+        to: usize,
+        id: u64,
+        requested_ns: u64,
+        gap: Option<(u64, u64, u64)>,
+    ) -> SwitchRecord {
+        SwitchRecord {
+            from,
+            to,
+            trigger: "timer",
+            requested_ns,
+            source_id: Some(id),
+            gap: gap.map(|(gap_ns, repeats, placeholders)| SwitchGap {
+                target: id,
+                requested_ns,
+                first_fresh_ns: requested_ns + gap_ns,
+                repeats,
+                placeholders,
+                previous_fresh: 0,
+            }),
+            error: None,
+            abandoned: false,
+        }
+    }
+
+    #[test]
+    fn switch_gaps_exclude_the_first_start_and_count_failures() {
+        let cycle = [cam("A", "/dev/a"), cam("B", "/dev/b")];
+        let ms = 1_000_000u64;
+        let mut start = record(None, 0, 1, 1_000 * ms, Some((900 * ms, 0, 27)));
+        start.trigger = START_TRIGGER;
+        let mut failed = record(Some(1), 0, 4, 40_000 * ms, None);
+        failed.error = Some("busy".into());
+        // After the failed switch no camera streams: the next switch starts
+        // from none. It is a switch like any other, not the first start.
+        let from_none = record(None, 1, 5, 45_000 * ms, Some((600 * ms, 0, 18)));
+        // Requested, first frame not yet out when the window closed.
+        let mut waiting = record(Some(1), 0, 6, 50_000 * ms, None);
+        waiting.abandoned = true;
+        let records = [
+            start,
+            record(Some(0), 1, 2, 10_000 * ms, Some((400 * ms, 12, 0))),
+            record(Some(1), 0, 3, 20_000 * ms, Some((800 * ms, 15, 9))),
+            failed,
+            from_none,
+            waiting,
+        ];
+        let s = summarize_switches(&records, &cycle, 5_000 * ms, 5, 1);
+        assert_eq!(s.initial_start_ms, Some(900.0));
+        assert_eq!(
+            (s.count, s.completed, s.failed, s.abandoned_at_end),
+            (5, 3, 1, 1)
+        );
+        let g = s.gap_ms.unwrap();
+        assert_eq!((g.min, g.max, g.count), (400.0, 800.0, 3));
+        assert_eq!(
+            (s.repeats_during_gaps, s.placeholders_during_gaps),
+            (27, 27)
+        );
+        assert_eq!(s.records.len(), 6);
+        assert_eq!(s.records[0].requested_at_s, -4.0);
+        assert_eq!(s.records[1].from.as_deref(), Some("A (/dev/a)"));
+        assert_eq!(s.records[1].to, "B (/dev/b)");
+        assert_eq!(s.records[3].error.as_deref(), Some("busy"));
+        assert_eq!(s.records[4].from, None);
+        assert!(s.records[5].abandoned && !s.records[4].abandoned);
+        assert_eq!((s.whole_run_switches, s.abandoned), (5, 1));
+        // The first start alone: no switch.
+        let s = summarize_switches(&records[..1], &cycle, 0, 0, 0);
+        assert_eq!((s.count, s.initial_start_ms), (0, Some(900.0)));
+        // Without a start record (trimmed while streaming), a switch from
+        // no camera is not taken for the first start.
+        let s = summarize_switches(&records[4..5], &cycle, 0, 1, 0);
+        assert_eq!((s.count, s.completed, s.initial_start_ms), (1, 1, None));
+    }
+
+    #[test]
+    fn a_timer_switch_never_fires_at_or_after_the_window_end() {
+        let end = 130_000_000_000u64;
+        // Due at the end (duration a multiple of the period), woken just
+        // after it: no switch.
+        assert!(!timer_switch_due(end + 200_000, end, end));
+        assert!(!timer_switch_due(end, end - 1_000, end));
+        // Due before the end and woken before it: fires.
+        assert!(timer_switch_due(end - 1, end - 1_000, end));
+        assert!(timer_switch_due(end - 1_000, end - 1_000, end));
+        // Not due yet.
+        assert!(!timer_switch_due(end - 2_000, end - 1_000, end));
+        // Streaming (open window): any due switch fires.
+        assert!(timer_switch_due(5_000, 4_000, u64::MAX - 1));
+    }
+
+    #[test]
+    fn a_run_is_complete_only_when_it_measured_the_requested_duration() {
+        let s = 1_000_000_000u64;
+        assert!(run_completed(false, false, 585 * s, 585.0));
+        // Stopped by a signal after 15 s of 585 s.
+        assert!(!run_completed(false, true, 15 * s + 340_000_000, 585.0));
+        // Shorter than requested without the flag.
+        assert!(!run_completed(false, false, 15 * s, 585.0));
+        // Fractional durations.
+        assert!(run_completed(false, false, secs_ns(2.5), 2.5));
+        // Streaming ends on a signal by design.
+        assert!(run_completed(true, true, 12 * s, 0.0));
+    }
+
+    /// Arrivals of a stream at `num/den`, `latency` after each grid point
+    /// from `t0`, with a per-frame jitter.
+    fn arrivals(
+        t0: u64,
+        frames: u64,
+        num: u32,
+        den: u32,
+        latency: u64,
+        jitter: impl Fn(u64) -> i64,
+    ) -> Vec<u64> {
+        let cfg = obc_pipeline::clock::PacerConfig::new(num, den);
+        (0..frames)
+            .map(|i| (t0 + cfg.deadline_ns(i) + latency).saturating_add_signed(jitter(i)))
+            .collect()
+    }
+
+    #[test]
+    fn grid_windows_hold_exactly_the_contract_rate() {
+        let s = 1_000_000_000u64;
+        let from = 7 * s + 123_456_789;
+        let to = from + 30 * s;
+        // 30 fps for 31 s, arriving 3 ms after the grid with +-5 ms jitter.
+        let times = arrivals(from - s / 2, 31 * 30, 30, 1, 3_000_000, |i| {
+            [5_000_000, -5_000_000, 1_000_000][i as usize % 3]
+        });
+        let g = grid_fps(&times, from, to, 30, 1);
+        assert_eq!((g.windows, g.windows_off_grid), (29, 0), "{g:?}");
+        assert_eq!((g.min_1s, g.max_1s), (Some(30), Some(30)));
+        assert!(g.exact, "{g:?}");
+        assert!((g.frames as f64 - 900.0).abs() <= 1.0, "{g:?}");
+
+        // Arrivals right on the period boundary (phase near 0 and near a
+        // full period): the circular mean keeps them together.
+        let times = arrivals(from, 30 * 30, 30, 1, 0, |i| {
+            if i % 2 == 0 { 300_000 } else { -300_000 }
+        });
+        assert!(grid_fps(&times, from, to, 30, 1).exact);
+
+        // One frame lost: one window off the grid.
+        let mut lost = arrivals(from - s / 2, 31 * 30, 30, 1, 3_000_000, |_| 0);
+        lost.remove(400);
+        let g = grid_fps(&lost, from, to, 30, 1);
+        assert_eq!(g.windows_off_grid, 1, "{g:?}");
+        assert!(!g.exact);
+
+        // The last frame of a window late by more than half a period:
+        // 29 + 31. Arrivals sit at phase 3 ms on the grid from `from`, so
+        // the boundaries sit at 19.7 ms; the first window ends at
+        // from + 1019.7 ms, after frame 45 (from + 1003 ms).
+        let mut late = arrivals(from - s / 2, 31 * 30, 30, 1, 3_000_000, |_| 0);
+        late[45] += 20_000_000;
+        let g = grid_fps(&late, from, to, 30, 1);
+        assert_eq!((g.min_1s, g.max_1s), (Some(29), Some(31)), "{g:?}");
+        assert!(!g.exact);
+
+        // 99 % of the rate (one frame in 100 missing) fails.
+        let ninety_nine: Vec<u64> = arrivals(from - s / 2, 31 * 30, 30, 1, 3_000_000, |_| 0)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| i % 100 != 50)
+            .map(|(_, t)| t)
+            .collect();
+        assert!(!grid_fps(&ninety_nine, from, to, 30, 1).exact);
+
+        // No frame at all.
+        let g = grid_fps(&[], from, to, 30, 1);
+        assert_eq!((g.windows, g.exact), (0, false));
+    }
+
+    #[test]
+    fn grid_windows_allow_floor_and_ceiling_for_fractional_rates() {
+        let s = 1_000_000_000u64;
+        let from = 3 * s;
+        let to = from + 60 * s;
+        let times = arrivals(from - s, 62 * 30, 30000, 1001, 2_000_000, |i| {
+            [4_000_000, -4_000_000, 0, 2_500_000][i as usize % 4]
+        });
+        let g = grid_fps(&times, from, to, 30000, 1001);
+        assert!(g.exact, "{g:?}");
+        assert_eq!((g.min_1s, g.max_1s), (Some(29), Some(30)), "{g:?}");
+        assert!(g.windows >= 58, "{g:?}");
+        // A lost frame is still caught.
+        let mut lost = times.clone();
+        lost.remove(900);
+        assert!(!grid_fps(&lost, from, to, 30000, 1001).exact);
+    }
+
+    #[test]
+    fn budget_and_delivery_count_only_cameras_that_streamed() {
+        // A: NV12 1080p60 (16.7 ms); B: MJPEG 1080p30 (33.3 ms).
+        let cycle = [cam("A", "/dev/a"), cam_with("B", "/dev/b", FHD_CTL)];
+        let s = 1_000_000_000u64;
+        let (from, to) = (10 * s, 20 * s);
+        let mut samples = Samples::default();
+        for i in 0..600u64 {
+            samples.src_times.push(from + i * s / 60);
+            samples.src_source.push(1);
+            samples.src_pts.push(i);
+        }
+        let a = SourceRun {
+            source_id: 1,
+            camera: 0,
+            started_ns: 5 * s,
+            stopped_ns: None,
+        };
+        // B is in the cycle but never streamed: the budget uses A alone.
+        assert_eq!(
+            streamed_camera_period_ns(std::slice::from_ref(&a), &cycle, &samples, from, to),
+            cycle[0].choice.mode.frame_duration_ns()
+        );
+        assert!(inputs_delivered(
+            std::slice::from_ref(&a),
+            &samples,
+            from,
+            to,
+            None
+        ));
+        // B started inside the window and delivered nothing: a dead input.
+        let mut a_until = a.clone();
+        a_until.stopped_ns = Some(15 * s);
+        let b = SourceRun {
+            source_id: 2,
+            camera: 1,
+            started_ns: 15 * s,
+            stopped_ns: None,
+        };
+        let runs = [a_until, b];
+        assert_eq!(
+            streamed_camera_period_ns(&runs, &cycle, &samples, from, to),
+            cycle[0].choice.mode.frame_duration_ns()
+        );
+        assert!(!inputs_delivered(&runs, &samples, from, to, None));
+        // ... unless its switch was still waiting when the window closed.
+        assert!(inputs_delivered(&runs, &samples, from, to, Some(2)));
+        // Once B delivers, its slower period sets the budget.
+        samples.src_times.push(16 * s);
+        samples.src_source.push(2);
+        samples.src_pts.push(0);
+        assert_eq!(
+            streamed_camera_period_ns(&runs, &cycle, &samples, from, to),
+            cycle[1].choice.mode.frame_duration_ns()
+        );
+        assert!(inputs_delivered(&runs, &samples, from, to, None));
+        // A run that ended before the window does not count.
+        let old = SourceRun {
+            source_id: 9,
+            camera: 1,
+            started_ns: 0,
+            stopped_ns: Some(from),
+        };
+        assert!(inputs_delivered(
+            &[old.clone(), runs[0].clone()],
+            &samples,
+            from,
+            to,
+            None
+        ));
+        // No run in the window at all: nothing was delivered.
+        assert!(!inputs_delivered(&[old], &samples, from, to, None));
+    }
+
+    #[test]
+    fn input_fps_per_run_covers_its_own_span() {
+        // A: NV12 1080p60; B: MJPEG 1080p30.
+        let cycle = [cam("A", "/dev/a"), cam_with("B", "/dev/b", FHD_CTL)];
+        let s = 1_000_000_000u64;
+        // Source 1 at 60 fps for 2 s, then source 2 at 30 fps for 2 s.
+        let mut samples = Samples::default();
+        for i in 0..120u64 {
+            samples.src_times.push(i * s / 60);
+            samples.src_source.push(1);
+            samples.src_pts.push(i * s / 60);
+        }
+        for i in 0..60u64 {
+            samples.src_times.push(2 * s + 300_000_000 + i * s / 30);
+            samples.src_source.push(2);
+            samples.src_pts.push(i * s / 30);
+        }
+        let runs = [
+            SourceRun {
+                source_id: 1,
+                camera: 0,
+                started_ns: 0,
+                stopped_ns: Some(2 * s),
+            },
+            SourceRun {
+                source_id: 2,
+                camera: 1,
+                started_ns: 2 * s,
+                stopped_ns: None,
+            },
+        ];
+        let r = input_reports(&samples, &runs, &cycle, 0, 4 * s + 300_000_000);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].fps.frames, 120);
+        assert!((r[0].fps.overall - 60.0).abs() < 1e-9);
+        assert_eq!(r[0].fps.windows, 2);
+        // Run 2 is measured from its first frame, not from the switch.
+        assert!((r[1].span_s - 2.0).abs() < 1e-9);
+        assert_eq!(r[1].fps.frames, 60);
+        assert_eq!(r[1].missing_frames_by_pts, 0);
+    }
+
+    #[test]
+    fn status_line_reports_window_rates_and_counts() {
+        let c = cam("MX Brio", "/dev/video4");
+        let w = Samples {
+            src_times: vec![0; 300],
+            sink_times: vec![0; 150],
+            consumer_times: vec![0; 150],
+            added_latency_ns: vec![10_000_000, 20_000_000, 30_000_000],
+            ..Samples::default()
+        };
+        let delta = OutputCounts {
+            fresh: 140,
+            repeat: 6,
+            placeholder: 4,
+            superseded: 160,
+            ..OutputCounts::default()
+        };
+        let line = status_line(Some(&c), &w, 5.0, &delta, true, 12.34);
+        assert!(
+            line.starts_with("MX Brio /dev/video4 | NV12:1920x1080@60 gpu-direct"),
+            "{line}"
+        );
+        for part in [
+            "in 60.0 fps",
+            "out 30.0 fps",
+            "consumer 30.0 fps",
+            "fresh 140 repeat 6 placeholder 4 superseded 160",
+            "added p50 20.00 ms",
+            "cpu 12.3%",
+        ] {
+            assert!(line.contains(part), "{part}: {line}");
+        }
+        assert!(status_line(None, &w, 5.0, &delta, false, 0.0).starts_with("no camera |"));
     }
 
     #[test]
@@ -1686,52 +3443,5 @@ mod tests {
         let mut m = 3;
         account_qos_drop(&mut m, q.stats().1, q.duration(), frame);
         assert_eq!(m, 7);
-    }
-
-    #[test]
-    fn camera_gap_across_a_status_boundary_counts_once() {
-        let f = 10u64;
-        // Window 1 ends with PTS 30; window 2 starts at 60: 2 frames missing
-        // (40, 50), visible only with the previous window's last PTS.
-        let w1 = [0, 10, 20, 30];
-        let w2 = [60, 70];
-        assert_eq!(window_camera_drops(None, &w1, f), 0);
-        assert_eq!(window_camera_drops(Some(30), &w2, f), 2);
-        assert_eq!(window_camera_drops(None, &w2, f), 0, "the old, blind count");
-        // Same total as over the unsplit sequence.
-        assert_eq!(
-            stats::missing_frames_from_gaps(&[0, 10, 20, 30, 60, 70], f),
-            2
-        );
-        // An empty window carries nothing; the gap shows up when frames resume.
-        assert_eq!(window_camera_drops(Some(30), &[], f), 0);
-    }
-
-    #[test]
-    fn pipeline_drops_are_signed() {
-        assert_eq!(window_pipeline_drops(300, 300), 0);
-        assert_eq!(window_pipeline_drops(300, 297), 3);
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "delivered 5 > sent 3")]
-    fn more_delivered_than_sent_is_asserted() {
-        window_pipeline_drops(3, 5);
-    }
-
-    #[test]
-    fn streaming_rejects_the_consumer() {
-        let a = Args::try_parse_from(["obc-bench", "--duration", "0", "--consumer"]).unwrap();
-        assert!(a.streaming());
-        let e = a.validate().unwrap_err().to_string();
-        assert!(
-            e.contains("--consumer") && e.contains("--duration 0"),
-            "{e}"
-        );
-        let ok = Args::try_parse_from(["obc-bench", "--duration", "0"]).unwrap();
-        assert!(ok.validate().is_ok());
-        let bench = Args::try_parse_from(["obc-bench", "--consumer"]).unwrap();
-        assert!(!bench.streaming() && bench.validate().is_ok());
     }
 }
