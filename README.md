@@ -40,7 +40,7 @@ Tests, including the manual check with OBS or Chrome, are described in [docs/tes
 
 ## Documentation
 
-See [docs/README.md](docs/README.md) for the architecture, decision records, setup guides and benchmarks.
+See [docs/README.md](docs/README.md) for the architecture, decision records, setup guides and benchmarks. The Omarchy bar widget (status icon, on/off, camera selection) is described in [clients/omarchy-bar/README.md](clients/omarchy-bar/README.md).
 
 ## Licence
 

@@ -7,6 +7,7 @@
 | [setup/daemon.md](setup/daemon.md) | Installing and running `oma-broadcastd` as a systemd user service: `cargo install`, unit and optional D-Bus activation and WirePlumber drop-in files, configuration and state files, reload, logs |
 | [dbus-api.md](dbus-api.md) | Reference for `br.com.dias.OmaBroadcast1`: states, properties, methods, errors, the `Stats` signal, activation without starting the daemon, `busctl` and `gdbus` examples |
 | [cli-json.md](cli-json.md) | The `oma-broadcast` commands, exit codes and the JSON line format (`status`, `cameras`, `watch --json`) for clients that cannot speak D-Bus |
+| [../clients/omarchy-bar/README.md](../clients/omarchy-bar/README.md) | Omarchy shell bar widget, a client of the daemon through `oma-broadcast watch --json`: icon states, clicks and panel, install by symlink, the `cliPath` setting and CLI resolution order, troubleshooting messages, tests, removal |
 | [config.example.toml](config.example.toml) | Every `config.toml` key with its default, as a commented example |
 | [setup/maxine.md](setup/maxine.md) | Step-by-step NVIDIA Maxine VFX SDK setup on Arch/Omarchy: NGC access and key, user-prefix install under `$MAXINE_VFX_ROOT`, os-release override, verification with the probe, troubleshooting, licence notes, uninstall |
 | [research/maxine-linux.md](research/maxine-linux.md) | Technical notes on Maxine on Linux: distribution, licence, versions, Blackwell support, features, API shape, existing projects |
