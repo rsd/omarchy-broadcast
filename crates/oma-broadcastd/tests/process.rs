@@ -61,10 +61,12 @@ fn a_second_instance_exits_with_its_own_status_before_touching_a_device() {
 #[test]
 fn without_a_session_bus_it_fails() {
     let dir = tempfile::tempdir().unwrap();
+    // A short socket path: the bus is missing, not unaddressable.
+    let sockets = common::socket_dir();
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_oma-broadcastd"));
     cmd.env(
         "DBUS_SESSION_BUS_ADDRESS",
-        format!("unix:path={}", dir.path().join("no-bus").display()),
+        format!("unix:path={}", sockets.path().join("no-bus").display()),
     )
     .env("XDG_CONFIG_HOME", dir.path())
     .env("XDG_STATE_HOME", dir.path());

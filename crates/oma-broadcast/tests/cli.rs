@@ -94,10 +94,48 @@ fn collect(mut r: impl Read + Send + 'static) -> JoinHandle<String> {
 
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
+/// A directory with a short path for a bus socket, removed when dropped. A
+/// unix socket path is limited to 108 bytes, which a long `TMPDIR` or
+/// target directory exceeds: `$XDG_RUNTIME_DIR` when it is set, short and
+/// writable, else `/tmp`.
+struct SocketDir(PathBuf);
+
+impl SocketDir {
+    fn new() -> SocketDir {
+        use std::os::unix::fs::DirBuilderExt;
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|d| d.is_absolute() && d.as_os_str().len() <= 64);
+        for base in runtime.into_iter().chain([PathBuf::from("/tmp")]) {
+            loop {
+                let dir = base.join(format!(
+                    "obc-{}-{}",
+                    std::process::id(),
+                    NEXT_DIR.fetch_add(1, Ordering::SeqCst)
+                ));
+                match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                    Ok(()) => return SocketDir(dir),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+        panic!("no writable directory for the test bus socket ($XDG_RUNTIME_DIR, /tmp)");
+    }
+}
+
+impl Drop for SocketDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 struct Bus {
     address: String,
     dir: PathBuf,
     daemon: Guard,
+    /// Where the bus socket is (after `daemon`: removed once it stopped).
+    socket_dir: SocketDir,
 }
 
 impl Bus {
@@ -123,6 +161,7 @@ impl Bus {
             ),
         )
         .unwrap();
+        let socket_dir = SocketDir::new();
         let config = dir.join("bus.conf");
         std::fs::write(
             &config,
@@ -141,7 +180,7 @@ impl Bus {
   </policy>
 </busconfig>
 "#,
-                dir.join("bus").display(),
+                socket_dir.0.join("bus").display(),
                 services.display()
             ),
         )
@@ -181,6 +220,7 @@ impl Bus {
             address,
             dir,
             daemon,
+            socket_dir,
         }
     }
 
@@ -1138,7 +1178,7 @@ fn daemon_not_running_has_its_own_exit_code_and_reads_never_activate() {
 #[test]
 fn no_session_bus_is_daemon_not_running() {
     let bus = Bus::start();
-    let missing = bus.dir.join("no-such-bus");
+    let missing = bus.socket_dir.0.join("no-such-bus");
     let mut cmd = bus.cli(&["status", "--json"]);
     cmd.env(
         "DBUS_SESSION_BUS_ADDRESS",

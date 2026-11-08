@@ -31,7 +31,7 @@ use obc_pipeline::{
 };
 
 use super::{EffectReport, EffectStatus, Failure, MediaBackend, SessionParams};
-use crate::camera::{Camera, stable_id};
+use crate::camera::{Camera, stable_id, usb_origin};
 use crate::consumers::{NodeId, count_holders};
 
 /// Environment variable that makes the daemon stamp every frame it
@@ -193,10 +193,16 @@ impl MediaBackend for GstBackend {
                     .capabilities
                     .as_ref()
                     .and_then(|c| choose_mode(c, request))?;
+                let (serial, usb_path) = usb_origin(&d.path);
+                // The display name is set from the card name once the
+                // whole list is known (`camera::display_names`).
                 Some(Camera {
                     id: stable_id(&d.path),
                     name: d.card.trim().to_string(),
+                    card: d.card.clone(),
                     usb: d.usb,
+                    serial,
+                    usb_path,
                     path: d.path.clone(),
                     mode: choice.mode,
                 })

@@ -1224,6 +1224,127 @@ fn a_camera_whose_id_changes_between_scans_is_renamed_not_lost() {
     assert_eq!(h.world().ingests, ["usb-b"]);
 }
 
+/// A USB camera at `node` with a serial number and a port.
+fn usb_cam(id: &str, usb: &str, serial: &str, port: &str, node: &str) -> Camera {
+    let mut c = cam(id, "Cam", Some(usb), node);
+    c.serial = Some(serial.into());
+    c.usb_path = Some(port.into());
+    c
+}
+
+#[test]
+fn a_node_reused_by_another_camera_is_no_rename() {
+    let first = usb_cam("usb-Cam_S1", "1111:0001", "S1", "3-4", "/dev/video2");
+    // Unplugged, and another camera plugged in, between two scans: the
+    // newcomer gets the same node.
+    let other = usb_cam("usb-Other_S9", "3333:0003", "S9", "3-4", "/dev/video2");
+    let mut h = H::new("", |w| w.cameras = vec![alpha(), first.clone()]);
+    h.call(|r| Command::SelectCamera("usb-Cam_S1".into(), r), 0)
+        .unwrap();
+    h.fake.world().cameras = vec![alpha(), other.clone()];
+    h.rescan(1000);
+    assert_eq!(ids(&h.snap()), ["usb-a", "usb-Other_S9"]);
+    assert_eq!(
+        h.persisted().camera.as_deref(),
+        Some("usb-Cam_S1"),
+        "the selection stays on the camera that left"
+    );
+    assert_eq!(h.snap().active_camera, "usb-a", "first in order meanwhile");
+    // It comes back (at another node): it is the choice again.
+    let mut back = first.clone();
+    back.path = "/dev/video4".into();
+    h.fake.world().cameras = vec![alpha(), other.clone(), back];
+    h.rescan(2000);
+    assert_eq!(h.snap().active_camera, "usb-Cam_S1");
+
+    // The same while streaming from it: its loss is a loss, and the
+    // newcomer at its node may take over.
+    let mut h = H::new("", |w| w.cameras = vec![first.clone()]);
+    h.call(|r| Command::SelectCamera("usb-Cam_S1".into(), r), 0)
+        .unwrap();
+    h.activate(0);
+    h.fake.world().cameras = vec![other.clone()];
+    h.rescan(3000);
+    h.tick(3300);
+    assert_eq!(h.state(), State::Active, "{:?}", h.snap());
+    assert_eq!(h.world().ingests, ["usb-Cam_S1", "usb-Other_S9"]);
+    assert_eq!(h.snap().active_camera, "usb-Other_S9");
+    assert_eq!(h.persisted().camera.as_deref(), Some("usb-Cam_S1"));
+
+    // A camera known by its node only that a different model replaced: no
+    // rename either.
+    let early = cam("/dev/video2", "Cam", Some("1111:0001"), "/dev/video2");
+    let mut h = H::new("", |w| w.cameras = vec![alpha(), early]);
+    h.call(|r| Command::SelectCamera("/dev/video2".into(), r), 0)
+        .unwrap();
+    h.fake.world().cameras = vec![alpha(), other];
+    h.rescan(1000);
+    assert_eq!(h.persisted().camera.as_deref(), Some("/dev/video2"));
+    assert_eq!(h.snap().active_camera, "usb-a");
+}
+
+#[test]
+fn the_same_device_under_a_new_id_is_renamed() {
+    // Its by-path name first, its by-id name once udev added that link:
+    // the same serial at the same port.
+    let by_path = usb_cam(
+        "pci-0:14.0-usb-0:4:1.0-video-index0",
+        "1111:0001",
+        "S1",
+        "3-4",
+        "/dev/video2",
+    );
+    let by_id = usb_cam(
+        "usb-Cam_S1-video-index0",
+        "1111:0001",
+        "S1",
+        "3-4",
+        "/dev/video2",
+    );
+    let mut h = H::new("", |w| w.cameras = vec![alpha(), by_path.clone()]);
+    h.call(|r| Command::SelectCamera(by_path.id.clone(), r), 0)
+        .unwrap();
+    h.activate(0);
+    h.drain();
+    h.fake.world().cameras = vec![alpha(), by_id.clone()];
+    h.rescan(3000);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.snap().active_camera, by_id.id);
+    assert_eq!(h.persisted().camera.as_deref(), Some(by_id.id.as_str()));
+    {
+        let w = h.world();
+        assert_eq!(w.ingests, [by_path.id.as_str()], "no camera switch");
+        assert_eq!((w.session_starts, w.session_stops), (1, 0));
+    }
+    let changes = h.drain().0;
+    assert!(
+        !changes.iter().any(|c| matches!(c, Change::State(_))),
+        "{changes:?}"
+    );
+}
+
+#[test]
+fn cameras_are_listed_under_clean_unique_names() {
+    let twin = |id: &str, node: &str| {
+        let mut c = cam(id, "x", Some("1111:0001"), node);
+        c.card = "Desk Cam: Desk Cam".into();
+        c
+    };
+    let mut h = H::new("", |w| {
+        w.cameras = vec![
+            twin("usb-Desk_S2", "/dev/video0"),
+            twin("usb-Desk_S1", "/dev/video2"),
+        ]
+    });
+    let names: Vec<String> = h.snap().cameras.iter().map(|c| c.name.clone()).collect();
+    assert_eq!(names, ["Desk Cam (2)", "Desk Cam"]);
+    // Selecting by the numbered name picks that camera; the selection is
+    // saved by id.
+    h.call(|r| Command::SelectCamera("desk cam (2)".into(), r), 0)
+        .unwrap();
+    assert_eq!(h.persisted().camera.as_deref(), Some("usb-Desk_S2"));
+}
+
 #[test]
 fn a_disable_requested_during_the_output_build_never_opens_the_camera() {
     let mut h = H::new("", |_| {});

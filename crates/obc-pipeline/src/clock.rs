@@ -46,14 +46,17 @@
 //!   simply moves to its other frame train, half a period away, without a
 //!   repeat;
 //! * the lock is engaged only while it can follow the input: the input
-//!   runs at about the output rate or a multiple of it, within the drift
-//!   the slew can follow.
+//!   runs at about the output rate, a multiple of it or half of it, within
+//!   the drift the slew can follow.
 //!   Two conditions, both over the frames of the same run (same source, no
-//!   placeholder, hold or arrival gap over 2.5 periods in between):
+//!   placeholder, hold or arrival gap over 2.5 periods in between; over
+//!   2.5 input frame intervals for an input slower than the coarse limit
+//!   below, at whatever rate):
 //!   - the frame interval over the kept frames is at most
 //!     [`PhaseLockConfig::max_input_interval_permille`] of a period, a
 //!     coarse check that reacts within a window to a camera lowering its
-//!     rate in dim light or a 15 fps mode;
+//!     rate in dim light or a 15 fps mode. Over it, the input is
+//!     **sub-rate**, and is followed only at half the rate (see below);
 //!   - the input's frame train drifts against the ticks by at most
 //!     [`PhaseLockConfig::slew_ns`] per tick when it moves earlier (an
 //!     input faster than `k` x the output rate), and at most half of it
@@ -73,6 +76,21 @@
 //!     let go with a full window, the lock engages again only within half
 //!     the limit, so an estimate near the limit cannot switch it on and
 //!     off.
+//!   - a **sub-rate** input is followed only at a frame interval of two
+//!     periods (15 fps against 30 fps, 30 fps against 60 fps), once a full
+//!     window of 64 arrivals measures it, and only while its cadence is
+//!     steady (the median distance of an arrival from the fitted line at
+//!     most an eighth of a period). Every frame then arrives at the same
+//!     phase of the ticks: the lock steers the tick after it to the margin
+//!     like any other, and the repeat goes out on the tick in between. The
+//!     drift is `2 x period - interval` per frame, against the same limits.
+//!     An arrival gap of two frame intervals (a frame the camera dropped;
+//!     a longer gap ends the run) counts as two frames in the fit. The
+//!     early-edge wrap hysteresis is at least the 4 ms step on which
+//!     cameras deliver their frames, so one step at an edge cannot wrap
+//!     the phase there and back. At other rates (20 or 24 fps against
+//!     30 fps) the frames fall on several phases of the ticks, and the lock
+//!     is not engaged.
 //!
 //!   Not engaged, the phase is held: the output pads a slow input with
 //!   repeats, and thins a fast one, exactly as a free-running clock at
@@ -136,12 +154,14 @@ pub struct PhaseLockConfig {
     /// (the waits grow by up to this much). Past the late edge (0) it wraps
     /// at once, since waits shorter than the margin risk missed ticks. One
     /// edge with a hysteresis is enough to keep arrival jitter from
-    /// wrapping back and forth.
+    /// wrapping back and forth. A sub-rate input uses at least 4 ms (see
+    /// the module docs).
     pub wrap_hysteresis_ns: u64,
     /// The lock is engaged while the input frame interval (over the kept
     /// frames) is at most this many thousandths of the output period, and
     /// the input's drift against the ticks is within what the slew can
-    /// follow (see the module docs).
+    /// follow; over it, only an input at half the output rate is followed
+    /// (see the module docs).
     pub max_input_interval_permille: u32,
 }
 
@@ -303,8 +323,8 @@ pub struct PacerCounts {
     /// long before (negative) their timestamps.
     pub phase_offset_ns: i64,
     /// The lock is acquired and engaged (the input runs at about the
-    /// output rate or a multiple of it, within the drift the slew can
-    /// follow).
+    /// output rate, a multiple of it or half of it, within the drift the
+    /// slew can follow).
     pub phase_locked: bool,
     /// Holds armed ([`Pacer::hold`]).
     pub holds: u64,
@@ -345,9 +365,12 @@ struct PhaseLock {
     /// The source of the current run.
     source: Option<u64>,
     samples: VecDeque<Sample>,
-    /// `(seq, arrived_ns)` of the run's last [`RATE_WINDOW`] fresh frames:
-    /// the input's frame interval, for the drift gate.
-    arrivals: VecDeque<(u64, u64)>,
+    /// `(index, seq, arrived_ns)` of the run's last [`RATE_WINDOW`] fresh
+    /// frames: the input's frame interval, for the drift gate. The index
+    /// counts the input's frames: the sequence number, except that a
+    /// sub-rate input's arrival gap of two frame intervals (a frame the
+    /// camera dropped; a longer gap ends the run) counts as two frames.
+    arrivals: VecDeque<(u64, u64, u64)>,
     /// The drift gate let go of the run with a full window of arrivals:
     /// it lets the lock engage again only within half its limit.
     let_go: bool,
@@ -388,9 +411,22 @@ impl PhaseLock {
     /// ([`RATE_WINDOW`] arrivals), the gate takes the lock back only within
     /// half the limit, so an estimate near the limit cannot switch it on
     /// and off with every frame.
-    fn drift_followable(&mut self, period: u64, slew: u64) -> bool {
+    ///
+    /// A **sub-rate** input (`sub_rate`: the coarse interval is over its
+    /// limit) is followed only at an interval of [`SUB_RATE_RATIO`] periods
+    /// (15 fps against 30 fps), only once a full window of arrivals
+    /// measures it, and only while its cadence is steady (the median
+    /// distance of an arrival from the fitted line at most a
+    /// [`SUB_RATE_JITTER_DIVISOR`]th of a period). Each frame then has a
+    /// tick of its own, and the frame train moves against the ticks by
+    /// `2 x period - interval` per frame (per fresh tick), against the same
+    /// limits.
+    fn drift_followable(&mut self, period: u64, slew: u64, sub_rate: bool) -> bool {
         let n = self.arrivals.len();
-        let Some(&(seq0, t0)) = self.arrivals.front() else {
+        if sub_rate && n < RATE_WINDOW {
+            return false;
+        }
+        let Some(&(index0, _, t0)) = self.arrivals.front() else {
             return true;
         };
         if n < 3 {
@@ -399,27 +435,34 @@ impl PhaseLock {
         let pts: Vec<(f64, f64)> = self
             .arrivals
             .iter()
-            .map(|&(seq, t)| ((seq - seq0) as f64, t as f64 - t0 as f64))
+            .map(|&(index, _, t)| ((index - index0) as f64, t as f64 - t0 as f64))
             .collect();
         let nf = n as f64;
         let mx = pts.iter().map(|p| p.0).sum::<f64>() / nf;
         let my = pts.iter().map(|p| p.1).sum::<f64>() / nf;
         let sxx: f64 = pts.iter().map(|p| (p.0 - mx).powi(2)).sum();
         if sxx <= 0.0 {
-            return true;
+            return !sub_rate;
         }
         let interval = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum::<f64>() / sxx;
         if interval <= 0.0 {
             return false;
         }
-        let residuals: f64 = pts
-            .iter()
-            .map(|p| (p.1 - my - interval * (p.0 - mx)).powi(2))
-            .sum();
+        let residual = |p: &(f64, f64)| p.1 - my - interval * (p.0 - mx);
+        let residuals: f64 = pts.iter().map(|p| residual(p).powi(2)).sum();
         let standard_error = (residuals / (nf - 2.0) / sxx).sqrt();
         let period = period as f64;
-        let k = (period / interval).round().max(1.0);
-        let drift = period - k * interval;
+        let (k, drift) = if sub_rate {
+            let mut abs: Vec<f64> = pts.iter().map(|p| residual(p).abs()).collect();
+            abs.sort_unstable_by(f64::total_cmp);
+            if abs[n / 2] > period / SUB_RATE_JITTER_DIVISOR {
+                return false;
+            }
+            (1.0, SUB_RATE_RATIO * period - interval)
+        } else {
+            let k = (period / interval).round().max(1.0);
+            (k, period - k * interval)
+        };
         let cap = if drift < 0.0 {
             slew as f64 / 2.0
         } else {
@@ -444,9 +487,38 @@ const RATE_WINDOW: usize = 64;
 /// still count as followable (see [`PhaseLock::drift_followable`]).
 const DRIFT_STANDARD_ERRORS: f64 = 3.0;
 
-/// An arrival gap longer than this many half periods (2.5 periods) ends
-/// the input run: the source stalled, and its frames may come back at
-/// another phase.
+/// The input frame interval, in output periods, at which a sub-rate input
+/// is followed (see [`PhaseLock::drift_followable`]): 15 fps against
+/// 30 fps, 30 fps against 60 fps. Every frame then arrives at the same
+/// phase of the ticks and leaves on the next one; the repeat goes out on
+/// the tick in between. At other ratios the frames fall on several phases
+/// of the ticks (two, half a period apart, at 20 fps against 30 fps), and
+/// arrivals that step by a few milliseconds at once, as on cameras that
+/// deliver on a coarse host-side grid, make the frames of the phase the
+/// lock is steered to miss their ticks; those inputs are not followed.
+const SUB_RATE_RATIO: f64 = 2.0;
+
+/// A sub-rate input is followed only while the median distance of its
+/// arrivals from their fitted line is at most this fraction of a period
+/// (4.2 ms at 30 fps): a steady cadence with jitter, not an irregular one.
+const SUB_RATE_JITTER_DIVISOR: f64 = 8.0;
+
+/// The smallest early-edge wrap hysteresis
+/// ([`PhaseLockConfig::wrap_hysteresis_ns`]) for a sub-rate input, at
+/// least the 4 ms grid on which the reference cameras deliver their
+/// frames. With [`PhaseLockConfig::DEFAULT_WRAP_HYSTERESIS_NS`] a phase
+/// wrapped past the early edge lands within a millisecond of the late
+/// edge, where the next arrival a grid step later wraps it back: two
+/// wraps, and two fresh or repeat ticks in a row, for no drift. In
+/// simulation (15 fps cameras at 14.98 to 15.03 fps on a 4 ms arrival
+/// grid) the wraps fell to the band crossings of the drift from 3 ms on;
+/// it is under [`PhaseLockConfig::DEFAULT_JUMP_NS`], so the waits it lets
+/// grow at the early edge never trigger a jump.
+const SUB_RATE_WRAP_HYSTERESIS_NS: u64 = 4_000_000;
+
+/// An arrival gap longer than this many half periods (2.5 periods; half
+/// input frame intervals for a sub-rate input) ends the input run: the
+/// source stalled, and its frames may come back at another phase.
 const STALL_HALF_PERIODS: u128 = 5;
 
 /// The phase wrap: the multiple of the input interval nearest half a
@@ -643,11 +715,20 @@ impl Pacer {
         }
         let period = i64::try_from(self.cfg.period_ns()).unwrap_or(i64::MAX);
         let st = &mut self.lock;
+        let is_sub_rate = |interval: Option<u64>| {
+            interval.filter(|i| {
+                u128::from(*i) * 1000
+                    > u128::from(self.cfg.period_ns()) * u128::from(lc.max_input_interval_permille)
+            })
+        };
         // A new source, or the same one after a stall (an arrival gap over
-        // `STALL_HALF_PERIODS` half periods): a new run, acquired anew.
+        // `STALL_HALF_PERIODS` half periods, or half input intervals for a
+        // sub-rate input): a new run, acquired anew.
+        let slow_interval = is_sub_rate(st.input_interval());
+        let stall_unit = slow_interval.unwrap_or(self.cfg.period_ns());
         let stalled = st.samples.back().is_some_and(|s| {
             u128::from(l.arrived_ns.saturating_sub(s.arrived_ns)) * 2
-                > u128::from(self.cfg.period_ns()) * STALL_HALF_PERIODS
+                > u128::from(stall_unit) * STALL_HALF_PERIODS
         });
         if st.source != Some(l.source_id) || stalled {
             st.break_run();
@@ -662,17 +743,21 @@ impl Pacer {
         while st.samples.len() > lc.window.max(2) {
             st.samples.pop_front();
         }
-        st.arrivals.push_back((l.seq, l.arrived_ns));
+        let index = st.arrivals.back().map_or(0, |&(index, seq, t)| {
+            let frames = l.seq.saturating_sub(seq).max(1);
+            let elapsed =
+                slow_interval.map_or(0, |i| (l.arrived_ns.saturating_sub(t) + i / 2) / i.max(1));
+            index + frames.max(elapsed)
+        });
+        st.arrivals.push_back((index, l.seq, l.arrived_ns));
         while st.arrivals.len() > RATE_WINDOW {
             st.arrivals.pop_front();
         }
         let interval = st.input_interval();
+        let sub_rate = is_sub_rate(interval).is_some();
         let engaged = st.samples.len() >= lc.acquire_after.clamp(2, lc.window.max(2))
-            && interval.is_some_and(|i| {
-                u128::from(i) * 1000
-                    <= u128::from(self.cfg.period_ns()) * u128::from(lc.max_input_interval_permille)
-            })
-            && st.drift_followable(self.cfg.period_ns(), lc.slew_ns);
+            && interval.is_some()
+            && st.drift_followable(self.cfg.period_ns(), lc.slew_ns, sub_rate);
         st.engaged = engaged;
         if !engaged {
             // Held phase: the output pads a slow input as without the lock.
@@ -685,7 +770,14 @@ impl Pacer {
         let min_wait = st.samples.iter().map(|s| s.q).min().unwrap_or(0) + st.corrections;
         let error = min_wait - ns(lc.margin_ns);
         let desired = st.phase - error;
-        let hysteresis = ns(lc.wrap_hysteresis_ns);
+        // A sub-rate input's frames arrive on the camera's coarser steps:
+        // a larger hysteresis keeps one step from wrapping the phase there
+        // and back.
+        let hysteresis = if sub_rate {
+            ns(lc.wrap_hysteresis_ns.max(SUB_RATE_WRAP_HYSTERESIS_NS))
+        } else {
+            ns(lc.wrap_hysteresis_ns)
+        };
         let jump = !st.locked || error > ns(lc.jump_ns);
         let target = if jump {
             st.locked = true;
@@ -1508,22 +1600,33 @@ mod tests {
         assert!(p50(waits) <= M + MS, "{c:?}");
     }
 
+    /// Slower inputs other than a steady 15 fps (against 30 fps): 20 and
+    /// 24 fps, 14.97 fps (its frames drift later by 0.13 ms a frame, more
+    /// than half the slew), an irregular ~20 fps (40 to 60 ms between
+    /// frames) and an irregular ~15 fps (55 to 78 ms). The lock never
+    /// engages, and the output is exactly the free-running clock's.
     #[test]
-    fn phase_lock_is_not_engaged_for_slower_input() {
-        // 15 fps, and an irregular ~20 fps (40 to 60 ms between frames).
-        let mut rng = Rng(99);
-        let mut irregular = Vec::new();
-        let mut t = 3 * MS;
-        while t < 10_000 * MS {
-            irregular.push((t, 1));
-            t += 40 * MS + rng.next() % (20 * MS);
-        }
+    fn phase_lock_is_not_engaged_for_slower_input_off_its_ratio() {
+        let irregular = |seed: u64, from: u64, span: u64| {
+            let mut rng = Rng(seed);
+            let mut out = Vec::new();
+            let mut t = 3 * MS;
+            while t < 20_000 * MS {
+                out.push((t, 1));
+                t += from + rng.next() % span;
+            }
+            out
+        };
         for (name, arrivals) in [
-            ("15 fps", train(1, 3 * MS, 15.0, 10_000 * MS, MS, 21)),
-            ("~20 fps", irregular),
+            ("20 fps", train(1, 3 * MS, 20.0, 20_000 * MS, MS, 21)),
+            ("19.98 fps", train(1, 3 * MS, 19.98, 20_000 * MS, MS, 23)),
+            ("24 fps", train(1, 3 * MS, 24.0, 20_000 * MS, MS, 25)),
+            ("14.97 fps", train(1, 3 * MS, 14.97, 20_000 * MS, MS, 27)),
+            ("~20 fps", irregular(99, 40 * MS, 20 * MS)),
+            ("~15 fps", irregular(97, 55 * MS, 23 * MS)),
         ] {
-            let locked = Sim::new(arrivals.clone(), 10_000 * MS);
-            let mut free = Sim::new(arrivals, 10_000 * MS);
+            let locked = Sim::new(arrivals.clone(), 20_000 * MS);
+            let mut free = Sim::new(arrivals, 20_000 * MS);
             free.cfg.lock = PhaseLockConfig::disabled();
             let (a, pa) = locked.run();
             let (b, _) = free.run();
@@ -1539,6 +1642,244 @@ mod tests {
             );
             assert!(pa.counts().repeat > 100, "{name}: {:?}", pa.counts());
         }
+    }
+
+    /// Median wait of the fresh frames per wall-clock second from `from_ns`
+    /// to the last whole second before `end_ns`.
+    fn median_wait_per_second(out: &[Emit], from_ns: u64, end_ns: u64) -> Vec<f64> {
+        let s = 1_000_000_000;
+        (from_ns / s..end_ns / s - 1)
+            .filter_map(|sec| {
+                let w: Vec<u64> = out
+                    .iter()
+                    .filter(|e| e.at / s == sec)
+                    .filter_map(|e| e.wait)
+                    .collect();
+                (!w.is_empty()).then(|| p50(w) as f64)
+            })
+            .collect()
+    }
+
+    fn spread(v: &[f64]) -> f64 {
+        v.iter().cloned().fold(f64::MIN, f64::max) - v.iter().cloned().fold(f64::MAX, f64::min)
+    }
+
+    /// A camera at half the contract rate (15 fps against 30 fps, the rate
+    /// a camera falls to in dim light; and 30 fps against 60 fps), with
+    /// clock drift either way, uniform arrival jitter up to 2 ms, arrivals
+    /// on a 4 ms grid (as measured on two UVC cameras), and a dropped
+    /// frame every 400. Once a full window of arrivals measures the
+    /// cadence (about 4 s), the lock engages for good: every fresh frame
+    /// leaves on the next tick about the margin after its arrival, the
+    /// repeat on the tick in between, and the median wait per second stays
+    /// within a few milliseconds instead of sweeping the whole period as
+    /// with the free-running clock. The phase wraps only as often as the
+    /// drift carries it across its band, not back and forth at an edge
+    /// where the arrivals step by the grid. The output contract is unchanged:
+    /// timestamps on the grid, every index once, 30 +- 1 frames in every
+    /// wall-clock second, nothing skipped, late or superseded.
+    #[test]
+    fn phase_lock_follows_an_input_at_half_the_rate() {
+        let t_s = 120u64;
+        let end = t_s * 1_000_000_000;
+        // (camera fps, output fps, arrival jitter, arrival grid step, a
+        // dropped frame every so many, first arrival, seed). The starts and
+        // seeds of the last three put arrivals a grid step apart at a band
+        // edge: with the 1 ms hysteresis of the contract-rate lock they
+        // wrapped 145, 7 and 15 times in two minutes, for no, 2 and 2.4
+        // crossings of the band.
+        for (fps, out_fps, jitter, grid, drop_every, start, seed) in [
+            (15.0, 30, MS, 0, 0, 7 * MS, 303),
+            (14.99, 30, MS / 2, 0, 0, 7 * MS, 305),
+            (14.99, 30, 2 * MS, 0, 0, 7 * MS, 307),
+            (14.985, 30, MS, 0, 0, 7 * MS, 309),
+            (15.02, 30, MS, 0, 0, 7 * MS, 311),
+            (15.02, 30, 2 * MS, 0, 0, 7 * MS, 313),
+            (14.99, 30, MS / 2, 4 * MS, 0, 7 * MS, 315),
+            (15.02, 30, MS / 2, 4 * MS, 0, 7 * MS, 317),
+            (14.99, 30, MS, 0, 400, 7 * MS, 319),
+            (29.99, 60, MS / 2, 0, 0, 7 * MS, 321),
+            (15.0, 30, MS / 2, 4 * MS, 0, 32 * MS, 55_434),
+            (15.01, 30, MS / 2, 4 * MS, 0, 10 * MS, 47_515),
+            (14.99, 30, MS, 4 * MS, 0, 28 * MS, 55_434),
+        ] {
+            let mut arrivals = train(1, start, fps, end + 100 * MS, jitter, seed);
+            if let Some(step) = std::num::NonZeroU64::new(grid) {
+                for a in &mut arrivals {
+                    a.0 = a.0 / step * step.get();
+                }
+            }
+            if drop_every > 0 {
+                arrivals = arrivals
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| i % drop_every != drop_every / 2)
+                    .map(|(_, a)| a)
+                    .collect();
+            }
+            let mut sim = Sim::new(arrivals.clone(), end);
+            sim.cfg = PacerConfig::new(out_fps, 1);
+            let (out, p) = sim.run();
+            let c = p.counts();
+            let tag = format!("{fps} fps into {out_fps}, jitter {jitter}, grid {grid}: {c:?}");
+            let period = sim.cfg.period_ns();
+            assert_grid(&out, &sim.cfg);
+            assert_eq!((c.skipped, c.late, c.placeholder), (0, 0, 1), "{tag}");
+            assert_eq!(c.superseded, 0, "{tag}");
+            let at: Vec<u64> = out.iter().map(|e| e.at).collect();
+            let emitted = at.iter().filter(|t| **t < end).count() as i64;
+            assert!(
+                (emitted - i64::from(out_fps) * t_s as i64).abs() <= 1,
+                "{tag}: {emitted}"
+            );
+            // The run records the ticks timestamped before `end`, emitted
+            // up to a period earlier: the windows end a period before it.
+            let (lo, hi) = sliding_1s(&at, 0, end - period);
+            let rate = out_fps as usize;
+            assert!(lo + 1 >= rate && hi <= rate + 1, "{tag}: {lo}..={hi}");
+            // Engaged within about a window of arrivals, for good: a
+            // dropped frame (an arrival gap of two frame intervals) counts
+            // as two frames and neither ends the run nor upsets the fit.
+            let first = out.iter().position(|e| e.locked).expect(&tag);
+            assert!(
+                out[first].at < 5_000 * MS,
+                "{tag}: locked at {}",
+                out[first].at
+            );
+            assert!(out[first..].iter().all(|e| e.locked), "{tag}");
+            assert_eq!(c.lock_acquisitions, 1, "{tag}");
+            let drops = arrivals.len().checked_div(drop_every).map_or(0, |n| n + 1);
+            // Every fresh frame leaves on its next tick, about the margin
+            // after its arrival. With 2 ms of jitter (or 1 ms on the 4 ms
+            // grid) and drift a few miss it and leave a period later, at the
+            // rate of the lock at the contract rate with the same drift per
+            // fresh frame (in 20 seeds: 0.37 % at 14.99 fps, 0.21 % for a
+            // 29.97 fps camera against 30 fps); hardly any with less.
+            let settled = out[first].at + 1_000 * MS;
+            let waits: Vec<u64> = out
+                .iter()
+                .filter(|e| e.at > settled)
+                .filter_map(|e| e.wait)
+                .collect();
+            let missed = waits.iter().filter(|w| **w > 2 * period / 3).count();
+            let allowed = if jitter + grid / 2 >= 2 * MS {
+                waits.len() / 200
+            } else {
+                2
+            };
+            assert!(
+                missed <= allowed,
+                "{tag}: {missed} frames missed their tick"
+            );
+            let median = p50(waits.clone());
+            // The margin, plus the arrival jitter the lock waits for (the
+            // grid adds up to half its step either way).
+            assert!(
+                median <= M + jitter + grid / 2 + MS,
+                "{tag}: p50 wait {median}"
+            );
+            // The phase wraps only where the drift carries it across its
+            // band: a 4 ms step of the arrival grid at an edge does not wrap
+            // it there and back.
+            let fresh_locked = out[first..].iter().filter(|e| e.wait.is_some()).count();
+            let crossings =
+                (2.0 * period as f64 - 1e9 / fps).abs() * fresh_locked as f64 / period as f64;
+            assert!(
+                c.lock_wraps as f64 <= crossings + 1.0,
+                "{tag}: {} wraps for {crossings:.1} crossings of the band",
+                c.lock_wraps
+            );
+            // Fresh and repeat alternate (two exceptions at each wrap, each
+            // missed tick and each dropped frame).
+            let after: Vec<TickKind> = out
+                .iter()
+                .filter(|e| e.at > settled)
+                .map(|e| e.kind)
+                .collect();
+            let doubled = after.windows(2).filter(|w| w[0] == w[1]).count();
+            assert!(
+                doubled as u64 <= 2 * (c.lock_wraps + (drops + missed) as u64) + 2,
+                "{tag}: {doubled} fresh or repeat ticks in a row"
+            );
+            // No sawtooth: the median wait per second stays within a few
+            // milliseconds, and the wrap hysteresis (a faster camera's waits
+            // grow by up to it at the early edge before the phase wraps).
+            let per_s = median_wait_per_second(&out, settled, end);
+            let mut free = Sim::new(arrivals, end);
+            free.cfg = sim.cfg;
+            free.cfg.lock = PhaseLockConfig::disabled();
+            let (fo, _) = free.run();
+            let free_per_s = median_wait_per_second(&fo, settled, end);
+            let free_waits: Vec<u64> = fo
+                .iter()
+                .filter(|e| e.at > settled)
+                .filter_map(|e| e.wait)
+                .collect();
+            let free_missed = free_waits.iter().filter(|w| **w > 2 * period / 3).count();
+            if fps != 15.0 {
+                assert!(
+                    missed * 4 < free_missed,
+                    "{tag}: free running {free_missed}"
+                );
+            }
+            eprintln!(
+                "{fps} fps into {out_fps}, jitter {:.1} ms, grid {} ms: locked after {:.2} s, \
+                 acquisitions {} wraps {}, wait p50 {:.2} ms, per-second p50 {:.2}..{:.2} ms, \
+                 missed {missed}; free running p50 {:.2} ms, per-second p50 {:.2}..{:.2} ms, \
+                 {free_missed} waits over two thirds of a period",
+                jitter as f64 / 1e6,
+                grid / MS,
+                out[first].at as f64 / 1e9,
+                c.lock_acquisitions,
+                c.lock_wraps,
+                median as f64 / 1e6,
+                per_s.iter().cloned().fold(f64::MAX, f64::min) / 1e6,
+                per_s.iter().cloned().fold(f64::MIN, f64::max) / 1e6,
+                p50(free_waits) as f64 / 1e6,
+                free_per_s.iter().cloned().fold(f64::MAX, f64::min) / 1e6,
+                free_per_s.iter().cloned().fold(f64::MIN, f64::max) / 1e6,
+            );
+            assert!(
+                spread(&per_s) <= (4 * MS + SUB_RATE_WRAP_HYSTERESIS_NS) as f64,
+                "{tag}: per-second p50 wait {per_s:?}"
+            );
+            if fps != 15.0 {
+                // A drifting camera sweeps the free-running clock's wait
+                // over most of the period in two minutes.
+                assert!(spread(&free_per_s) > period as f64 / 2.0, "{tag}");
+            }
+        }
+    }
+
+    /// A switch between two 15 fps cameras at different phases, through a
+    /// hold: the second camera is a new run, measured anew and acquired in
+    /// one jump once its cadence is known; its frames then wait about the
+    /// margin.
+    #[test]
+    fn phase_lock_reacquires_a_half_rate_input_after_a_switch() {
+        let period = cfg30().period_ns();
+        let mut arrivals = train(1, 11 * MS, 15.0, 10_000 * MS, MS / 2, 5);
+        let start_2 = 10_000 * MS + 600 * MS + 19 * MS;
+        arrivals.extend(train(2, start_2, 14.99, 20_000 * MS, MS / 2, 7));
+        let mut sim = Sim::new(arrivals, 30_000 * MS);
+        sim.holds.push((10_000 * MS, 2, 13_000 * MS));
+        let (out, p) = sim.run();
+        let c = p.counts();
+        assert_grid(&out, &sim.cfg);
+        assert_eq!((c.placeholder, c.skipped, c.late), (1, 0, 0), "{c:?}");
+        assert_eq!((c.holds_released, c.lock_acquisitions), (1, 2), "{c:?}");
+        let first_2 = out.iter().position(|e| e.source == Some(2)).unwrap();
+        let relocked = out[first_2..].iter().position(|e| e.locked).unwrap() + first_2;
+        assert!(
+            out[relocked].at < start_2 + 5_000 * MS,
+            "re-locked at {}",
+            out[relocked].at
+        );
+        assert!(out[relocked..].iter().all(|e| e.locked));
+        let waits: Vec<u64> = out[relocked + 1..].iter().filter_map(|e| e.wait).collect();
+        assert!(waits.len() > 200);
+        assert!(p50(waits.clone()) <= M + MS, "{:?}", p50(waits.clone()));
+        assert!(waits.iter().all(|w| *w < period / 3), "{waits:?}");
     }
 
     #[test]

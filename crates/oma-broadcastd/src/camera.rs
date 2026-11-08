@@ -1,6 +1,7 @@
-//! The cameras the daemon can stream from: their stable ids, their order
-//! (configured preference first, then discovery order) and how a
-//! `SelectCamera` selector picks one.
+//! The cameras the daemon can stream from: their stable ids, their display
+//! names, their order (configured preference first, then discovery order),
+//! how a `SelectCamera` selector picks one and whether a camera found at a
+//! known node is still the same device.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,8 @@ use obc_ipc::CameraInfo;
 
 /// Where udev keeps the stable camera links.
 pub const V4L_LINKS: &str = "/dev/v4l";
+/// The video4linux class directory in sysfs.
+pub const SYSFS_V4L: &str = "/sys/class/video4linux";
 
 /// One colour camera that is present, with the mode chosen for it from the
 /// configured request.
@@ -18,9 +21,17 @@ pub struct Camera {
     /// Stable id ([`stable_id`]); what `SelectCamera` accepts and
     /// `ActiveCamera` reports.
     pub id: String,
-    /// V4L2 card name.
+    /// Display name: the card name made readable and unique among the
+    /// cameras present ([`display_names`]).
     pub name: String,
+    /// V4L2 card name, as the driver reports it.
+    pub card: String,
     pub usb: Option<UsbId>,
+    /// Serial number of the parent USB device, if it has one.
+    pub serial: Option<String>,
+    /// Kernel path of the parent USB device on its bus (`3-4`, `1-2.3`):
+    /// the port it is plugged into.
+    pub usb_path: Option<String>,
     /// The device node (`/dev/videoN`).
     pub path: PathBuf,
     /// The capture mode the ingest opens it in.
@@ -76,15 +87,136 @@ pub fn stable_id_in(v4l_dir: &Path, node: &Path) -> String {
     node.display().to_string()
 }
 
+/// The parent USB device of the video node `node`: its serial number and
+/// its kernel bus path ([`Camera::serial`], [`Camera::usb_path`]). Both
+/// `None` for a node that is not on USB.
+pub fn usb_origin(node: &Path) -> (Option<String>, Option<String>) {
+    usb_origin_in(Path::new(SYSFS_V4L), node)
+}
+
+/// [`usb_origin`] with the video4linux class directory at `sysfs_v4l`.
+pub fn usb_origin_in(sysfs_v4l: &Path, node: &Path) -> (Option<String>, Option<String>) {
+    let Some(class_dir) = node.file_name().map(|n| sysfs_v4l.join(n)) else {
+        return (None, None);
+    };
+    let Ok(real) = fs::canonicalize(class_dir) else {
+        return (None, None);
+    };
+    // .../usb3/3-4/3-4:1.0/video4linux/video2: the USB device directory is
+    // the nearest ancestor with a vendor id.
+    let Some(device) = real
+        .ancestors()
+        .skip(1)
+        .take(5)
+        .find(|d| d.join("idVendor").is_file())
+    else {
+        return (None, None);
+    };
+    let serial = fs::read_to_string(device.join("serial"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let usb_path = device
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string);
+    (serial, usb_path)
+}
+
+/// The display name of a V4L2 card name: trimmed, and a name the driver
+/// built as `<product>: <product>` (the same text on both sides of a
+/// colon) reduced to one copy. Any other name is kept as it is.
+pub fn display_name(card: &str) -> String {
+    let card = card.trim();
+    for (i, _) in card.match_indices(':') {
+        let (prefix, rest) = (card[..i].trim(), card[i + 1..].trim());
+        if !prefix.is_empty() && prefix == rest {
+            return prefix.to_string();
+        }
+    }
+    card.to_string()
+}
+
+/// Sets every camera's [`Camera::name`] from its card name
+/// ([`display_name`]) and makes the names unique: of cameras with the same
+/// name, the first by id (then node; cameras with only the fallback node id
+/// after those with a link id) keeps it and the others get ` (2)`,
+/// ` (3)`, ... (the lowest number no other camera's name uses). The order
+/// of `cameras` is left as it is.
+pub fn display_names(cameras: &mut [Camera]) {
+    for c in cameras.iter_mut() {
+        c.name = display_name(&c.card);
+    }
+    let mut by_id: Vec<usize> = (0..cameras.len()).collect();
+    // A camera still known by its node (the fallback id) goes last: its
+    // by-id/by-path links appear a moment after it is plugged in, and it must
+    // not take a plain name from a camera that already has one meanwhile.
+    let key = |c: &Camera| {
+        (
+            c.id == c.path.display().to_string(),
+            c.id.clone(),
+            c.path.clone(),
+        )
+    };
+    by_id.sort_by_key(|&i| key(&cameras[i]));
+    let mut taken: Vec<String> = cameras.iter().map(|c| c.name.clone()).collect();
+    let mut kept: Vec<String> = Vec::new();
+    for i in by_id {
+        let name = cameras[i].name.clone();
+        if !kept.contains(&name) {
+            kept.push(name);
+            continue;
+        }
+        let unique = (2..)
+            .map(|k| format!("{name} ({k})"))
+            .find(|n| !taken.contains(n))
+            .expect("a free number");
+        taken.push(unique.clone());
+        cameras[i].name = unique;
+    }
+}
+
+/// Whether `now`, found at the node where `was` was, is the same camera,
+/// so that a different id is a rename of `was` rather than another camera
+/// that took over its node (one unplugged and another plugged in between
+/// two scans). It is when the ids are equal; when `was` was known by its
+/// node only (the fallback id of [`stable_id`]) and nothing shows the two
+/// to differ; or when both are the same USB model (vendor:product) and
+/// either both report the same serial number or, without a serial on
+/// both, they sit at the same USB port.
+pub fn same_camera(was: &Camera, now: &Camera) -> bool {
+    if was.id == now.id {
+        return true;
+    }
+    let same_model = matches!((was.usb, now.usb), (Some(a), Some(b)) if a == b);
+    let serials = was.serial.as_ref().zip(now.serial.as_ref());
+    if was.id == was.path.display().to_string() {
+        let model_differs = matches!((was.usb, now.usb), (Some(a), Some(b)) if a != b);
+        let serial_differs = serials.is_some_and(|(a, b)| a != b);
+        return !model_differs && !serial_differs;
+    }
+    if !same_model {
+        return false;
+    }
+    match serials {
+        Some((a, b)) => a == b,
+        None => matches!((&was.usb_path, &now.usb_path), (Some(a), Some(b)) if a == b),
+    }
+}
+
 /// Whether `selector` names `camera`. A path selector is resolved first, so
-/// a `/dev/v4l/by-id/...` link names the node it points at.
+/// a `/dev/v4l/by-id/...` link names the node it points at. A name
+/// selector matches the display name or the card name.
 pub fn selector_matches(selector: &CameraSelector, camera: &Camera) -> bool {
     match selector {
         CameraSelector::Path(p) => {
             let resolved = fs::canonicalize(p).unwrap_or_else(|_| p.clone());
             resolved == camera.path || p == &camera.path
         }
-        other => other.matches(&camera.path, &camera.name, camera.usb),
+        other => {
+            other.matches(&camera.path, &camera.name, camera.usb)
+                || other.matches(&camera.path, &camera.card, camera.usb)
+        }
     }
 }
 
@@ -144,7 +276,10 @@ pub(crate) mod tests {
         Camera {
             id: id.into(),
             name: name.into(),
+            card: name.into(),
             usb: usb.map(|u| u.parse().unwrap()),
+            serial: None,
+            usb_path: None,
             path: PathBuf::from(node),
             mode: "NV12:1920x1080@30".parse().unwrap(),
         }
@@ -216,6 +351,204 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(cam("y", "Y", None, "/dev/video1").info().usb, "");
+    }
+
+    #[test]
+    fn display_name_drops_a_repeated_product_name_only() {
+        for (card, want) in [
+            // The same text on both sides of the colon: one copy.
+            ("Laptop Camera: Laptop Camera", "Laptop Camera"),
+            ("  Laptop Camera :   Laptop Camera  ", "Laptop Camera"),
+            ("Laptop Camera:Laptop Camera", "Laptop Camera"),
+            ("A: B: A: B", "A: B"),
+            // Different text: kept as it is (trimmed).
+            (
+                "Laptop Camera: Laptop IR Camera",
+                "Laptop Camera: Laptop IR Camera",
+            ),
+            ("Studio: Pro", "Studio: Pro"),
+            ("Cam: cam", "Cam: cam"),
+            ("  Plain Cam  ", "Plain Cam"),
+            ("Plain Cam", "Plain Cam"),
+            (":", ":"),
+            (" : ", ":"),
+            ("", ""),
+        ] {
+            assert_eq!(display_name(card), want, "{card:?}");
+        }
+    }
+
+    fn names(c: &[Camera]) -> Vec<&str> {
+        c.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    fn carded(id: &str, card: &str, node: &str) -> Camera {
+        let mut c = cam(id, "", Some("1111:0001"), node);
+        c.card = card.into();
+        c
+    }
+
+    #[test]
+    fn display_names_are_clean_and_unique_in_id_order() {
+        // Already unique: only cleaned.
+        let mut c = vec![
+            carded("usb-a", "Laptop Camera: Laptop Camera", "/dev/video0"),
+            carded("usb-b", "Desk Cam", "/dev/video2"),
+        ];
+        display_names(&mut c);
+        assert_eq!(names(&c), ["Laptop Camera", "Desk Cam"]);
+        assert_eq!(c[0].card, "Laptop Camera: Laptop Camera", "the card stays");
+        // Two identical cameras: the first by id keeps the name, whatever
+        // the list order; the order is kept.
+        let mut c = vec![
+            carded("usb-z", "Desk Cam", "/dev/video0"),
+            carded("usb-y", "Desk Cam", "/dev/video2"),
+        ];
+        display_names(&mut c);
+        assert_eq!(names(&c), ["Desk Cam (2)", "Desk Cam"]);
+        assert_eq!(ids(&c), ["usb-z", "usb-y"]);
+        // Three, two of them with the repeated name: all clean, all unique.
+        let mut c = vec![
+            carded("usb-c", "Desk Cam: Desk Cam", "/dev/video4"),
+            carded("usb-a", "Desk Cam", "/dev/video0"),
+            carded("usb-b", "Desk Cam: Desk Cam", "/dev/video2"),
+        ];
+        display_names(&mut c);
+        assert_eq!(names(&c), ["Desk Cam (3)", "Desk Cam", "Desk Cam (2)"]);
+        // The same set scanned in another order: the same names.
+        c.reverse();
+        display_names(&mut c);
+        assert_eq!(names(&c), ["Desk Cam (2)", "Desk Cam", "Desk Cam (3)"]);
+        // A suffix never collides with a camera's own name.
+        let mut c = vec![
+            carded("usb-a", "Desk Cam", "/dev/video0"),
+            carded("usb-b", "Desk Cam", "/dev/video2"),
+            carded("usb-c", "Desk Cam (2)", "/dev/video4"),
+        ];
+        display_names(&mut c);
+        assert_eq!(names(&c), ["Desk Cam", "Desk Cam (3)", "Desk Cam (2)"]);
+        // Equal ids (fallback node ids never are, but still): by node.
+        let mut c = vec![
+            carded("x", "Desk Cam", "/dev/video2"),
+            carded("x", "Desk Cam", "/dev/video0"),
+        ];
+        display_names(&mut c);
+        assert_eq!(names(&c), ["Desk Cam (2)", "Desk Cam"]);
+    }
+
+    #[test]
+    fn a_newcomer_with_a_fallback_id_does_not_take_the_plain_name() {
+        // "/dev/video0" sorts before "usb-..." but the camera with the link
+        // id keeps the plain name until the newcomer's links appear.
+        let mut c = vec![
+            carded("/dev/video0", "Desk Cam", "/dev/video0"),
+            carded("usb-1", "Desk Cam", "/dev/video2"),
+        ];
+        display_names(&mut c);
+        assert_eq!(names(&c), ["Desk Cam (2)", "Desk Cam"]);
+        // Once it has its link id, which sorts after, the names stay.
+        c[0].id = "usb-2".into();
+        display_names(&mut c);
+        assert_eq!(names(&c), ["Desk Cam (2)", "Desk Cam"]);
+    }
+
+    #[test]
+    fn a_name_selector_matches_the_display_and_the_card_name() {
+        let mut c = vec![
+            carded("usb-a", "Laptop Camera: Laptop Camera", "/dev/video0"),
+            carded("usb-b", "Desk Cam", "/dev/video2"),
+            carded("usb-c", "Desk Cam", "/dev/video4"),
+        ];
+        display_names(&mut c);
+        // As before the clean-up: the card name selects.
+        assert_eq!(find(&c, "Laptop Camera: Laptop").unwrap().id, "usb-a");
+        assert_eq!(find(&c, "laptop camera").unwrap().id, "usb-a");
+        // The first of two identical cameras, or the numbered one.
+        assert_eq!(find(&c, "desk cam").unwrap().id, "usb-b");
+        assert_eq!(find(&c, "Desk Cam (2)").unwrap().id, "usb-c");
+        let pref = ["desk cam (2)".parse().unwrap()];
+        assert_eq!(ids(&order(c, &pref)), ["usb-c", "usb-a", "usb-b"]);
+    }
+
+    fn device(id: &str, usb: &str, serial: Option<&str>, port: Option<&str>) -> Camera {
+        let mut c = cam(id, "Cam", Some(usb), "/dev/video2");
+        c.serial = serial.map(str::to_string);
+        c.usb_path = port.map(str::to_string);
+        c
+    }
+
+    #[test]
+    fn same_camera_needs_the_same_device_unless_known_by_node_only() {
+        let by_path = device("pci-usb-0:4:1.0", "1111:0001", Some("S1"), Some("3-4"));
+        let by_id = device("usb-Cam_S1", "1111:0001", Some("S1"), Some("3-4"));
+        // Same id; same device under a new id (serial, or port without one).
+        assert!(same_camera(&by_path, &by_path.clone()));
+        assert!(same_camera(&by_path, &by_id));
+        let other_port = device("usb-Cam_S1", "1111:0001", Some("S1"), Some("1-2"));
+        assert!(same_camera(&by_path, &other_port), "the serial decides");
+        let no_serial = device("a", "1111:0001", None, Some("3-4"));
+        let no_serial_b = device("b", "1111:0001", None, Some("3-4"));
+        assert!(same_camera(&no_serial, &no_serial_b));
+        // Another camera that took the node over.
+        let other_model = device("usb-Other_S1", "2222:0002", Some("S1"), Some("3-4"));
+        assert!(!same_camera(&by_path, &other_model));
+        let other_unit = device("usb-Cam_S2", "1111:0001", Some("S2"), Some("3-4"));
+        assert!(!same_camera(&by_path, &other_unit), "a different serial");
+        let elsewhere = device("b", "1111:0001", None, Some("1-2"));
+        assert!(!same_camera(&no_serial, &elsewhere));
+        let unknown = device("b", "1111:0001", None, None);
+        assert!(!same_camera(&no_serial, &unknown), "nothing to compare");
+        let mut no_usb = by_id.clone();
+        no_usb.usb = None;
+        assert!(!same_camera(&by_path, &no_usb));
+        // Known by its node only: a rename unless shown to differ.
+        let fallback = device("/dev/video2", "1111:0001", None, None);
+        assert!(same_camera(&fallback, &by_id));
+        assert!(same_camera(&fallback, &no_usb));
+        assert!(!same_camera(&fallback, &other_model));
+        let fallback_s1 = device("/dev/video2", "1111:0001", Some("S1"), None);
+        assert!(same_camera(&fallback_s1, &by_id));
+        assert!(!same_camera(&fallback_s1, &other_unit));
+    }
+
+    #[test]
+    fn usb_origin_reads_the_parent_usb_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = dir.path();
+        let usb = sys.join("devices/pci0/usb3/3-4");
+        let colour = usb.join("3-4:1.0/video4linux/video2");
+        let bare = usb.join("3-4:1.2/video4linux/video4");
+        let virt = sys.join("devices/virtual/video4linux/video11");
+        for d in [&colour, &bare, &virt] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::write(usb.join("idVendor"), "1111\n").unwrap();
+        fs::write(usb.join("serial"), " S1 \n").unwrap();
+        let class = sys.join("class/video4linux");
+        fs::create_dir_all(&class).unwrap();
+        let link =
+            |to: &Path, name: &str| std::os::unix::fs::symlink(to, class.join(name)).unwrap();
+        link(&colour, "video2");
+        link(&virt, "video11");
+        assert_eq!(
+            usb_origin_in(&class, Path::new("/dev/video2")),
+            (Some("S1".into()), Some("3-4".into()))
+        );
+        // No serial file (or an empty one): the port only.
+        fs::write(usb.join("serial"), "\n").unwrap();
+        assert_eq!(
+            usb_origin_in(&class, Path::new("/dev/video2")),
+            (None, Some("3-4".into()))
+        );
+        // Not on USB, or not in sysfs.
+        assert_eq!(
+            usb_origin_in(&class, Path::new("/dev/video11")),
+            (None, None)
+        );
+        assert_eq!(
+            usb_origin_in(&class, Path::new("/dev/video9")),
+            (None, None)
+        );
     }
 
     #[test]

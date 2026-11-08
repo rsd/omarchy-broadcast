@@ -85,16 +85,40 @@ impl Drop for Guard {
 pub struct PrivateBus {
     pub address: String,
     _guard: Guard,
+    /// Where the socket is (after `_guard`: removed once the bus stopped).
+    _socket_dir: tempfile::TempDir,
+}
+
+/// A new directory with a short path for a bus socket, removed when
+/// dropped. A unix socket path is limited to 108 bytes, which a long
+/// `TMPDIR` or target directory exceeds: `$XDG_RUNTIME_DIR` when it is
+/// set, short and writable, else `/tmp`.
+pub fn socket_dir() -> tempfile::TempDir {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute() && d.as_os_str().len() <= 64);
+    runtime
+        .into_iter()
+        .chain([PathBuf::from("/tmp")])
+        .find_map(|base| {
+            tempfile::Builder::new()
+                .prefix("obc-")
+                .tempdir_in(base)
+                .ok()
+        })
+        .expect("no writable directory for the test bus socket ($XDG_RUNTIME_DIR, /tmp)")
 }
 
 impl PrivateBus {
-    /// Starts the bus; fails the test, naming the binary, without it.
+    /// Starts the bus (its config in `dir`, its socket in a [`socket_dir`]);
+    /// fails the test, naming the binary, without it.
     pub fn start(dir: &Path) -> PrivateBus {
         assert!(
             Path::new(DBUS_DAEMON).exists(),
             "this test needs {DBUS_DAEMON} (the reference D-Bus daemon, package `dbus`) to run a \
              private session bus"
         );
+        let socket_dir = socket_dir();
         let config = dir.join("bus.conf");
         std::fs::write(
             &config,
@@ -112,7 +136,7 @@ impl PrivateBus {
   </policy>
 </busconfig>
 "#,
-                dir.display()
+                socket_dir.path().display()
             ),
         )
         .unwrap();
@@ -136,6 +160,7 @@ impl PrivateBus {
         PrivateBus {
             address,
             _guard: Guard::new(child, "dbus-daemon", Duration::from_secs(2)),
+            _socket_dir: socket_dir,
         }
     }
 }
