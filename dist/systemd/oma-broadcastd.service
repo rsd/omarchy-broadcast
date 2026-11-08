@@ -1,13 +1,16 @@
 # oma-broadcastd as a systemd user service.
 #
-# Install (nothing is installed by the build):
-#   cargo install --path crates/oma-broadcastd      # -> ~/.cargo/bin/oma-broadcastd
-#   install -Dm644 dist/systemd/oma-broadcastd.service \
-#       ~/.config/systemd/user/oma-broadcastd.service
-#   install -Dm644 dist/dbus-1/services/br.com.dias.OmaBroadcast.service \
-#       ~/.local/share/dbus-1/services/br.com.dias.OmaBroadcast.service
-#   systemctl --user daemon-reload
-#   systemctl --user enable --now oma-broadcastd.service
+# Install: the Arch package (packaging/arch) installs this unit to
+# /usr/lib/systemd/user/ and the binary to /usr/bin; nothing else is needed
+# before `systemctl --user enable --now oma-broadcastd.service`. From a
+# source checkout, scripts/install-user.sh installs the binaries under
+# ~/.local/bin and a copy of this unit whose ExecStart= names the binary it
+# installed. The manual steps are in docs/setup/daemon.md: cargo install
+# into ~/.cargo/bin, then install a copy of this unit with ExecStart=
+# rewritten to that location, for example
+#   sed 's|^ExecStart=/usr/bin/|ExecStart=%h/.cargo/bin/|' \
+#       dist/systemd/oma-broadcastd.service \
+#       > ~/.config/systemd/user/oma-broadcastd.service
 #
 # Reload the configuration with `systemctl --user reload oma-broadcastd`
 # (SIGHUP). Logs: `journalctl --user -u oma-broadcastd`.
@@ -32,7 +35,7 @@ Description=oma-broadcast virtual camera daemon
 # the daemon reports why not in State/Error).
 Type=dbus
 BusName=br.com.dias.OmaBroadcast
-ExecStart=%h/.cargo/bin/oma-broadcastd
+ExecStart=/usr/bin/oma-broadcastd
 ExecReload=/bin/kill -HUP $MAINPID
 # Readiness (the bus name) comes after the first loopback writer attempt,
 # which normally takes well under a second. The first start after a

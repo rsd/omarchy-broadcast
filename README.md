@@ -14,7 +14,7 @@ Early development. The camera -> CUDA -> virtual camera passthrough works, with 
 - CUDA toolkit (for `nvrtc`)
 - GStreamer 1.x with the `nvcodec` plugin (`cudaupload`, `cudaconvert`, `cudadownload`) and the base/good/bad plugin sets (`videoconvert`, `jpegdec`)
 - v4l2loopback, configured as described in [docs/setup/loopback.md](docs/setup/loopback.md)
-- Rust toolchain
+- Rust toolchain (only to build from source; the Arch package is built with it, and installed without it)
 - Optional, for effects: the NVIDIA Maxine VFX SDK ([docs/setup/maxine.md](docs/setup/maxine.md))
 
 ## Build
@@ -22,6 +22,39 @@ Early development. The camera -> CUDA -> virtual camera passthrough works, with 
 ```sh
 cargo build --release
 ```
+
+## Install
+
+Three routes; the daemon, the unit files and the other steps are described in [docs/setup/daemon.md](docs/setup/daemon.md). None of them configures the v4l2loopback device or installs the Maxine SDK.
+
+### Arch package
+
+`packaging/arch/PKGBUILD` builds `oma-broadcast-git` from the committed HEAD of the local checkout. Build from `packaging/arch`:
+
+```sh
+cd packaging/arch
+makepkg -s
+sudo pacman -U oma-broadcast-git-*.pkg.tar.zst
+systemctl --user enable --now oma-broadcastd
+```
+
+The package installs the daemon and the client in `/usr/bin`, the systemd user unit, the D-Bus activation file, the Omarchy bar plugin and the documentation. It enables nothing: each user runs the last command. The loopback device is still configured as in [docs/setup/loopback.md](docs/setup/loopback.md). The NVIDIA Maxine SDK is never packaged; install it as in [docs/setup/maxine.md](docs/setup/maxine.md).
+
+### Developer install
+
+`scripts/install-user.sh` builds the release binaries and installs them for the current user, without root: the binaries in `~/.local/bin`, the unit and the D-Bus file under `~/.local/share`. It never runs `systemctl`; it prints the next steps. `--dry-run` shows the actions and `--uninstall` removes only what the script installed.
+
+```sh
+scripts/install-user.sh
+systemctl --user daemon-reload
+systemctl --user enable --now oma-broadcastd
+```
+
+### Manual install
+
+`cargo install` of the two crates and a copy of the unit file with `ExecStart=` rewritten: see [docs/setup/daemon.md](docs/setup/daemon.md#install).
+
+The continuous integration (`.github/workflows/ci.yml`) runs the format check, clippy, the workspace tests and shellcheck in an Arch Linux container without a GPU.
 
 ## Run
 
