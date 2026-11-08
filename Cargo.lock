@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "gst-obc"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "gstreamer"
@@ -586,15 +586,15 @@ dependencies = [
 
 [[package]]
 name = "obc-backend"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "obc-backend-maxine"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "obc-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -602,15 +602,15 @@ dependencies = [
 
 [[package]]
 name = "obc-gpu"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "obc-ipc"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "obc-pipeline"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -627,11 +627,11 @@ dependencies = [
 
 [[package]]
 name = "oma-broadcast"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "oma-broadcastd"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "once_cell_polyfill"

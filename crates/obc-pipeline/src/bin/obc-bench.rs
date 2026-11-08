@@ -24,6 +24,17 @@
 //! streams: v4l2loopback carries no colour range, so a consumer would read
 //! the stream as limited range.
 //!
+//! A switch holds the last frame until the next camera's first frame (at
+//! most `--hold-timeout` seconds), so a switch shows no black frames unless
+//! the next camera takes longer than that to start.
+//!
+//! The output clock locks the phase of its ticks to the camera's frames
+//! (`docs/adr/0010-phase-locked-output-clock.md`); `--no-phase-lock` emits
+//! on the fixed grid instead, for comparison. Because emission instants
+//! then follow the camera within one period, `fps_sustained` judges the
+//! output by its PTS sequence, its frame count and the deviation of its
+//! arrivals from the PTS grid (see [`FpsSection`]).
+//!
 //! `--duration 0` streams until SIGINT/SIGTERM instead, printing a status
 //! line every 5 s and one line per switch. `--consumer` is allowed there for
 //! the consumer frame rate only: the luma stamp the end-to-end latency needs
@@ -43,6 +54,7 @@ use obc_core::{
     OutputFormat, SinkSelector,
 };
 use obc_pipeline::capability::choose_mode;
+use obc_pipeline::clock::{PacerConfig, PhaseLockConfig};
 use obc_pipeline::controls::{CID_EXPOSURE_AUTO_PRIORITY, get_ctrl};
 use obc_pipeline::discovery::{CameraList, resolve_node_path};
 use obc_pipeline::gpu::{GpuInfo, GpuSample, GpuSampler};
@@ -103,6 +115,29 @@ struct Args {
     /// Move to the next camera every this many seconds (after warm-up).
     #[arg(long, value_parser = positive_secs)]
     switch_every: Option<f64>,
+    /// Seconds a switch holds the last frame while waiting for the next
+    /// camera's first frame; placeholders follow if it has not arrived.
+    #[arg(long, default_value_t = 3.0, value_parser = positive_secs)]
+    hold_timeout: f64,
+    /// Buffers the output's appsrc queues before dropping the oldest (also
+    /// the clock's longest catch-up burst).
+    #[arg(long, default_value_t = OutputConfig::DEFAULT_QUEUE_BUFFERS, value_parser = clap::value_parser!(u32).range(1..=64))]
+    output_queue_buffers: u32,
+    /// Emit every tick at its timestamp instead of locking the ticks'
+    /// phase to the camera (the behaviour before the phase lock).
+    #[arg(long)]
+    no_phase_lock: bool,
+    /// Phase lock margin in ms: how long after the latest-arriving frame
+    /// of the window a tick fires (tuning; default from the library).
+    #[arg(long, value_parser = non_negative_ms)]
+    phase_margin_ms: Option<f64>,
+    /// Phase lock window: fresh ticks whose waits are kept (tuning).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(2..=256))]
+    phase_window: Option<u32>,
+    /// Phase lock jump threshold in ms: a larger error re-acquires in one
+    /// jump instead of slewing (tuning).
+    #[arg(long, value_parser = non_negative_ms)]
+    phase_jump_ms: Option<f64>,
     /// Process stage: passthrough | roundtrip (NV12 -> BGR -> NV12, in CUDA
     /// memory; the conversion cost of an effect working on BGR).
     #[arg(long, default_value = "passthrough")]
@@ -202,6 +237,20 @@ fn parse_secs(s: &str, allow_zero: bool) -> Result<f64, String> {
         return Err(format!(
             "{s:?}: expected seconds in {}..={MAX_SECS}",
             if allow_zero { "0" } else { "(0" }
+        ));
+    }
+    Ok(v)
+}
+
+/// Upper bound for a milliseconds tuning argument (the phase lock's
+/// margin and jump threshold work within one output period).
+const MAX_TUNING_MS: f64 = 1000.0;
+
+fn non_negative_ms(s: &str) -> Result<f64, String> {
+    let v: f64 = s.trim().parse().map_err(|e| format!("{s:?}: {e}"))?;
+    if !v.is_finite() || !(0.0..=MAX_TUNING_MS).contains(&v) {
+        return Err(format!(
+            "{s:?}: expected milliseconds in 0..={MAX_TUNING_MS}"
         ));
     }
     Ok(v)
@@ -516,6 +565,10 @@ struct ConfigReport {
     aspect: AspectPolicy,
     process: GpuStage,
     input_gap_ms: u64,
+    hold_timeout_s: f64,
+    output_queue_buffers: u32,
+    /// The output clock's phase lock settings; `None`: disabled.
+    phase_lock: Option<PhaseLockConfig>,
     queue_buffers: u32,
     camera_io_mode: String,
     camera_fixed_framerate: bool,
@@ -548,17 +601,74 @@ struct InputFps {
     missing_frames_by_pts: u64,
     /// Camera src-pad inter-arrival gaps > 1.5 frame durations.
     stalls: usize,
+    /// Arrival jitter at the src pad: each frame's arrival minus a straight
+    /// line fitted through all arrivals by frame number (from the camera
+    /// PTS), as percentiles (`[percentile, ms]`). The phase-locked output
+    /// clock has to wait for the late side of this spread.
+    arrival_jitter_ms: Vec<(u8, f64)>,
+    /// The same for the camera's own PTS (driver timestamps): jitter that
+    /// is already in the camera's timestamps, not added by the dequeue.
+    pts_jitter_ms: Vec<(u8, f64)>,
 }
+
+/// Residuals of `values` (ns) against a least-squares line over the frame
+/// numbers derived from `pts` (ns) and the nominal frame duration, in ms.
+/// Frame numbers advance by each PTS step rounded to whole frames, so a
+/// camera whose real rate differs from the nominal one keeps its numbering.
+fn line_residuals_ms(values: &[u64], pts: &[u64], frame_ns: u64) -> Vec<f64> {
+    if values.len() < 3 || values.len() != pts.len() || frame_ns == 0 {
+        return Vec::new();
+    }
+    let v0 = values[0];
+    let mut k = 0f64;
+    let xs: Vec<f64> = std::iter::once(0.0)
+        .chain(pts.windows(2).map(|w| {
+            k += (w[1].saturating_sub(w[0]) as f64 / frame_ns as f64)
+                .round()
+                .max(1.0);
+            k
+        }))
+        .collect();
+    let ys: Vec<f64> = values.iter().map(|&v| v as f64 - v0 as f64).collect();
+    let n = xs.len() as f64;
+    let (mx, my) = (xs.iter().sum::<f64>() / n, ys.iter().sum::<f64>() / n);
+    let sxx: f64 = xs.iter().map(|x| (x - mx) * (x - mx)).sum();
+    let sxy: f64 = xs.iter().zip(&ys).map(|(x, y)| (x - mx) * (y - my)).sum();
+    let b = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+    let a = my - b * mx;
+    xs.iter()
+        .zip(&ys)
+        .map(|(x, y)| (y - (a + b * x)) / 1e6)
+        .collect()
+}
+
+/// How `criteria.fps_sustained` judges the output rate.
+const FPS_METHOD: &str = "fps_sustained: the output PTS sequence at the v4l2sink sink pad is exact over the window (every tick index once, in order), the frame count is within max(0.1 %, 1 frame) of the contract rate times the window, and the deviation of each frame's sink-pad arrival from its PTS grid instant (clock start + PTS) spans at most one output period plus a jitter allowance (deviation.limit_ms). A deviation span of at most one period bounds every wall-clock 1 s window to the contract rate +-1 frame; sliding_1s reports the fewest and most frames actually seen in any 1 s window. With --consumer in measured runs the same is required of the consumer, by the output PTS stamped into each frame. The phase-locked clock emits each tick within one period before its timestamp, following the camera, so the grid-window figure (output_grid: windows on one mean arrival phase) is kept for comparison only.";
+
+/// Allowance over one output period for the spread of the sink-pad
+/// deviation (wake-up and hand-off jitter of the output thread).
+const DEVIATION_ALLOWANCE_NS: u64 = 5_000_000;
 
 #[derive(Debug, Serialize)]
 struct FpsSection {
     /// The contract frame rate.
     target: f64,
+    method: &'static str,
     /// Every output buffer at the v4l2sink sink pad, by arrival time.
     output: FpsReport,
     consumer: Option<FpsReport>,
-    /// The same arrivals on 1 s windows placed on the output's frame grid
-    /// (see [`grid_fps`]): what `criteria.fps_sustained` judges.
+    /// The output PTS of the frames at the sink pad, in arrival order.
+    output_pts: PtsSequence,
+    consumer_pts: Option<PtsSequence>,
+    /// Sink-pad arrival minus PTS grid instant, every frame.
+    output_deviation: Deviation,
+    consumer_deviation: Option<Deviation>,
+    /// The fewest and most arrivals in any 1 s wall-clock window.
+    output_sliding_1s: Sliding,
+    consumer_sliding_1s: Option<Sliding>,
+    /// The same arrivals on 1 s windows placed on one mean arrival phase
+    /// of the output's frame grid (see [`grid_fps`]): the criterion before
+    /// the phase lock, kept for comparison.
     output_grid: GridFps,
     consumer_grid: Option<GridFps>,
     /// Output inter-arrival gaps > 1.5 output periods.
@@ -600,6 +710,49 @@ struct FramesSection {
     decoder_dropped_frames: Option<u64>,
 }
 
+/// The output clock over the window.
+#[derive(Debug, Serialize)]
+struct ClockSection {
+    /// The phase lock settings; `None`: disabled (`--no-phase-lock`).
+    phase_lock: Option<PhaseLockConfig>,
+    /// Phase jumps (first lock per camera run, re-acquisitions) and wraps
+    /// in the window.
+    lock_acquisitions: u64,
+    lock_wraps: u64,
+    /// At the end of the window.
+    phase_offset_ms: f64,
+    phase_locked: bool,
+    /// How long fresh frames waited in the slot for their tick, and the
+    /// same at more percentiles (`[percentile, ms]`).
+    slot_wait_ms: Option<Summary>,
+    slot_wait_percentiles_ms: Vec<(u8, f64)>,
+    /// Fresh frames that waited in the slot longer than one camera frame
+    /// interval (the mode's nominal one): the camera's next frame was due
+    /// before the tick and missed it, so the tick took the frame before.
+    /// This holds for a camera faster than the output (a 60 fps camera
+    /// thinned to 30 fps), where a frame the camera itself dropped counts
+    /// too when it is the one a tick would have caught (see
+    /// `fps.inputs[].missing_frames_by_pts`). At the output's own rate a
+    /// missed tick or a dropped frame shows as a repeat instead (a late
+    /// frame waits less than a frame interval for the next tick, or is
+    /// superseded), so this count stays at zero there. Windows with one
+    /// camera mode only; `None` otherwise.
+    slot_wait_over_camera_frame: Option<u64>,
+    /// Camera src pad to slot for the same frames: the ingest pipeline's
+    /// own time, whose spread (with the camera's) the lock must wait for.
+    ingest_ms: Option<Summary>,
+    ingest_percentiles_ms: Vec<(u8, f64)>,
+    /// The `appsrc` queue bound, and the highest level seen after a push
+    /// in the window.
+    queue_bound: u32,
+    queue_level_max: u64,
+    /// Holds armed by switches in the window, ended by the new camera's
+    /// first frame, and ended by the timeout.
+    holds: u64,
+    holds_released: u64,
+    holds_expired: u64,
+}
+
 #[derive(Debug, Serialize)]
 struct SwitchReport {
     /// None: no camera was streaming (the first start, or a switch after a
@@ -612,7 +765,11 @@ struct SwitchReport {
     requested_at_s: f64,
     /// From the request to the new source's first emitted frame.
     gap_ms: Option<f64>,
+    /// From the previous camera's last emitted frame to the new camera's
+    /// first: how long the output showed no new image.
+    held_ms: Option<f64>,
     repeats: Option<u64>,
+    /// Black frames emitted during the switch.
     placeholders: Option<u64>,
     /// Fresh frames of the previous camera emitted after the request.
     previous_fresh: Option<u64>,
@@ -638,6 +795,11 @@ struct SwitchSection {
     abandoned_at_end: usize,
     /// Request -> first fresh frame of the new camera, completed switches.
     gap_ms: Option<Summary>,
+    /// Previous camera's last frame -> new camera's first, completed
+    /// switches.
+    held_ms: Option<Summary>,
+    /// The most black frames (placeholders) in one completed switch.
+    placeholders_max_per_switch: Option<u64>,
     /// Repeats and placeholders emitted during those gaps, summed.
     repeats_during_gaps: u64,
     placeholders_during_gaps: u64,
@@ -796,6 +958,7 @@ struct Report {
     config: ConfigReport,
     fps: FpsSection,
     frames: FramesSection,
+    clock: ClockSection,
     switches: SwitchSection,
     latency: LatencySection,
     cpu: CpuSection,
@@ -1284,6 +1447,131 @@ fn grid_fps(times: &[u64], from: u64, to: u64, fps_num: u32, fps_den: u32) -> Gr
     out
 }
 
+/// The 1st, 5th, 10th, 25th, 50th, 75th, 90th, 95th and 99th percentiles.
+fn percentiles(values: &[f64]) -> Vec<(u8, f64)> {
+    let mut v = values.to_vec();
+    v.sort_by(f64::total_cmp);
+    [1u8, 5, 10, 25, 50, 75, 90, 95, 99]
+        .into_iter()
+        .filter_map(|p| stats::percentile_sorted(&v, f64::from(p)).map(|x| (p, x)))
+        .collect()
+}
+
+/// Whether `frames` is within max(0.1 %, 1 frame) of `expected`.
+fn count_within(frames: usize, expected: f64) -> bool {
+    (frames as f64 - expected).abs() <= (expected * 0.001).max(1.0)
+}
+
+/// The output PTS of the frames at a pad, in arrival order, checked
+/// against the grid of `fps_num / fps_den`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct PtsSequence {
+    frames: usize,
+    first_index: Option<u64>,
+    last_index: Option<u64>,
+    /// Ticks between the first and the last that never arrived.
+    missing: u64,
+    /// Frames whose index is not above the previous one's (repeated or out
+    /// of order).
+    out_of_order: u64,
+    /// Frames without a PTS, or with one off the tick grid.
+    off_grid: u64,
+    /// Every index from the first to the last once, in order.
+    exact: bool,
+}
+
+fn pts_sequence(pts: &[u64], fps_num: u32, fps_den: u32) -> PtsSequence {
+    let grid = PacerConfig::new(fps_num.max(1), fps_den.max(1));
+    let mut out = PtsSequence {
+        frames: pts.len(),
+        first_index: None,
+        last_index: None,
+        missing: 0,
+        out_of_order: 0,
+        off_grid: 0,
+        exact: false,
+    };
+    let mut prev: Option<u64> = None;
+    for &p in pts {
+        let i = grid.index_at(p);
+        if p == u64::MAX || grid.deadline_ns(i) != p {
+            out.off_grid += 1;
+            continue;
+        }
+        out.first_index.get_or_insert(i);
+        match prev {
+            Some(q) if i <= q => out.out_of_order += 1,
+            Some(q) => {
+                out.missing += i - q - 1;
+                prev = Some(i);
+            }
+            None => prev = Some(i),
+        }
+    }
+    out.last_index = prev;
+    out.exact = out.frames > 0 && out.missing == 0 && out.out_of_order == 0 && out.off_grid == 0;
+    out
+}
+
+/// Arrival minus PTS grid instant over the window.
+#[derive(Debug, Clone, Serialize)]
+struct Deviation {
+    ms: Option<Summary>,
+    /// Max minus min.
+    spread_ms: Option<f64>,
+    /// One output period plus [`DEVIATION_ALLOWANCE_NS`].
+    limit_ms: f64,
+    within: bool,
+}
+
+fn deviation(dev_ns: &[i64], period_ns: u64) -> Deviation {
+    let ms: Vec<f64> = dev_ns.iter().map(|&d| d as f64 / 1e6).collect();
+    let summary = stats::summarize(&ms);
+    let spread_ms = summary.map(|s| s.max - s.min);
+    let limit_ms = (period_ns + DEVIATION_ALLOWANCE_NS) as f64 / 1e6;
+    Deviation {
+        ms: summary,
+        spread_ms,
+        limit_ms,
+        within: spread_ms.is_some_and(|s| s <= limit_ms),
+    }
+}
+
+/// The fewest and most arrivals in any 1 s window `[t, t + 1 s)` lying in
+/// `[from, to)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct Sliding {
+    min_1s: Option<usize>,
+    max_1s: Option<usize>,
+}
+
+/// The extremes are at windows starting on an arrival (most) and just
+/// after one (fewest), and at the span's ends.
+fn sliding_1s(times: &[u64], from: u64, to: u64) -> Sliding {
+    const S: u64 = 1_000_000_000;
+    let mut t: Vec<u64> = times
+        .iter()
+        .copied()
+        .filter(|&x| x >= from && x < to)
+        .collect();
+    t.sort_unstable();
+    let count = |a: u64| t.partition_point(|&x| x < a + S) - t.partition_point(|&x| x < a);
+    let mut starts: Vec<u64> = vec![from];
+    for &x in &t {
+        starts.push(x);
+        starts.push(x + 1);
+    }
+    let counts: Vec<usize> = starts
+        .into_iter()
+        .filter(|&a| a >= from && a.saturating_add(S) <= to)
+        .map(count)
+        .collect();
+    Sliding {
+        min_1s: counts.iter().copied().min(),
+        max_1s: counts.iter().copied().max(),
+    }
+}
+
 /// The added-latency budget in ms: up to one output period waiting for
 /// the next output tick, plus one camera frame period (`camera_period_ns`,
 /// the slowest camera's) for the ingest, slot and output stages.
@@ -1304,6 +1592,15 @@ fn counts_delta(a: &OutputCounts, b: &OutputCounts) -> OutputCounts {
         emitted: b.emitted.saturating_sub(a.emitted),
         queue_dropped: b.queue_dropped.saturating_sub(a.queue_dropped),
         push_failed: b.push_failed.saturating_sub(a.push_failed),
+        // Running maxima and states: the later snapshot's.
+        queue_level_max: b.queue_level_max,
+        lock_acquisitions: b.lock_acquisitions.saturating_sub(a.lock_acquisitions),
+        lock_wraps: b.lock_wraps.saturating_sub(a.lock_wraps),
+        phase_offset_ns: b.phase_offset_ns,
+        phase_locked: b.phase_locked,
+        holds: b.holds.saturating_sub(a.holds),
+        holds_released: b.holds_released.saturating_sub(a.holds_released),
+        holds_expired: b.holds_expired.saturating_sub(a.holds_expired),
     }
 }
 
@@ -1337,6 +1634,14 @@ fn summarize_switches(
                 .map(|g| g.gap_ns() as f64 / 1e6)
                 .collect::<Vec<_>>(),
         ),
+        held_ms: stats::summarize(
+            &completed
+                .iter()
+                .filter_map(|g| g.held_ns())
+                .map(|n| n as f64 / 1e6)
+                .collect::<Vec<_>>(),
+        ),
+        placeholders_max_per_switch: completed.iter().map(|g| g.placeholders).max(),
         repeats_during_gaps: completed.iter().map(|g| g.repeats).sum(),
         placeholders_during_gaps: completed.iter().map(|g| g.placeholders).sum(),
         whole_run_switches,
@@ -1350,6 +1655,7 @@ fn summarize_switches(
                 source_id: r.source_id,
                 requested_at_s: (r.requested_ns as f64 - window_start as f64) / 1e9,
                 gap_ms: gap_ms(r),
+                held_ms: r.gap.and_then(|g| g.held_ns()).map(|n| n as f64 / 1e6),
                 repeats: r.gap.map(|g| g.repeats),
                 placeholders: r.gap.map(|g| g.placeholders),
                 previous_fresh: r.gap.map(|g| g.previous_fresh),
@@ -1389,9 +1695,37 @@ fn input_reports(
             fps: stats::fps_report(&times, first, end, mode.fps(), 1.0),
             missing_frames_by_pts: stats::missing_frames_from_gaps(&pts, mode.frame_duration_ns()),
             stalls: stats::count_stalls(&times, mode.frame_duration_ns(), 1.5),
+            arrival_jitter_ms: percentiles(&line_residuals_ms(
+                &times,
+                &pts,
+                mode.frame_duration_ns(),
+            )),
+            pts_jitter_ms: percentiles(&line_residuals_ms(&pts, &pts, mode.frame_duration_ns())),
         });
     }
     out
+}
+
+/// The nominal frame duration of the camera mode that fed the window, when
+/// every input in it ran in the same mode; `None` with no input or with
+/// several modes.
+fn single_camera_frame_ns(
+    inputs: &[InputFps],
+    runs: &[SourceRun],
+    cycle: &[CycleCamera],
+) -> Option<u64> {
+    let mut frames = inputs.iter().filter_map(|i| {
+        runs.iter()
+            .find(|r| r.source_id == i.source_id)
+            .map(|r| cycle[r.camera].choice.mode.frame_duration_ns())
+    });
+    let first = frames.next()?;
+    frames.all(|f| f == first).then_some(first)
+}
+
+/// How many of `values` exceed `limit`.
+fn count_over(values: &[u64], limit: u64) -> u64 {
+    values.iter().filter(|v| **v > limit).count() as u64
 }
 
 /// One streaming status line over a status window of `window_s` seconds:
@@ -1441,8 +1775,11 @@ fn switch_line(r: &SwitchRecord, g: &SwitchGap, cycle: &[CycleCamera]) -> String
             cycle[r.to].label()
         );
     }
+    let held = g
+        .held_ns()
+        .map_or("n/a".to_string(), |h| format!("{:.1} ms", h as f64 / 1e6));
     format!(
-        "switch ({}): {} -> {}: first fresh frame {gap:.1} ms after the request; {} repeats, {} placeholders during the gap",
+        "switch ({}): {} -> {}: first fresh frame {gap:.1} ms after the request; last frame held {held}; {} repeats, {} placeholders during the gap",
         r.trigger,
         r.from.map_or("no camera".to_string(), |f| cycle[f].label()),
         cycle[r.to].label(),
@@ -1809,6 +2146,21 @@ fn run_session(
     let mut ocfg = OutputConfig::new(contract, OutputSink::Loopback(sink.path.clone()));
     ocfg.process = args.gpu_stage;
     ocfg.gap_threshold = Duration::from_millis(args.input_gap_ms);
+    ocfg.hold_timeout = Duration::from_secs_f64(args.hold_timeout);
+    ocfg.queue_buffers = args.output_queue_buffers;
+    if let Some(m) = args.phase_margin_ms {
+        ocfg.phase_lock.margin_ns = (m * 1e6) as u64;
+    }
+    if let Some(k) = args.phase_window {
+        ocfg.phase_lock.window = k as usize;
+    }
+    if let Some(j) = args.phase_jump_ms {
+        ocfg.phase_lock.jump_ns = (j * 1e6) as u64;
+    }
+    if args.no_phase_lock {
+        ocfg.phase_lock = PhaseLockConfig::disabled();
+    }
+    let phase_lock = ocfg.phase_lock.enabled.then_some(ocfg.phase_lock);
     let mut output = Output::build(ocfg)?;
     output.set_observer(Some(rec.observer()));
     rec.attach_output(output.pipeline())
@@ -2126,6 +2478,8 @@ fn run_session(
         .consumer
         .then(|| stats::fps_report(&samples.consumer_times, stats_start, win_end, target, 1.0));
     let inputs = input_reports(&samples, &runs, &cycle, stats_start, win_end);
+    let slot_wait_over_camera_frame = single_camera_frame_ns(&inputs, &runs, &cycle)
+        .map(|frame_ns| count_over(&samples.slot_wait_ns, frame_ns));
     let delta = counts_delta(&m.counts_start, &m.counts_end);
     let ingest_lost = samples.counts.src as i64 - delta.input_frames as i64;
     let runs_in_window = runs
@@ -2185,9 +2539,27 @@ fn run_session(
     };
     let output_grid = grid(&samples.sink_times);
     let consumer_grid = args.consumer.then(|| grid(&samples.consumer_times));
+    let output_pts = pts_sequence(&samples.sink_pts, contract.fps_num, contract.fps_den);
+    let output_deviation = deviation(&samples.sink_deviation_ns, period_ns);
+    let output_sliding = sliding_1s(&samples.sink_times, stats_start, win_end);
     // The consumer is judged where the stamp tells re-delivered frames
     // apart (measured runs).
     let judge_consumer = args.consumer_stamp();
+    let consumer_pts = judge_consumer
+        .then(|| pts_sequence(&samples.consumer_pts, contract.fps_num, contract.fps_den));
+    let consumer_deviation =
+        judge_consumer.then(|| deviation(&samples.consumer_deviation_ns, period_ns));
+    let consumer_sliding = args
+        .consumer
+        .then(|| sliding_1s(&samples.consumer_times, stats_start, win_end));
+    let expected_frames = output_grid.expected_frames;
+    let output_rate_held = output_pts.exact
+        && count_within(samples.sink_times.len(), expected_frames)
+        && output_deviation.within;
+    let consumer_rate_held = !judge_consumer
+        || (consumer_pts.as_ref().is_some_and(|p| p.exact)
+            && count_within(samples.consumer_times.len(), expected_frames)
+            && consumer_deviation.as_ref().is_some_and(|d| d.within));
     let consumer_received_all = !judge_consumer
         || ((samples.counts.consumer as i64 - samples.counts.sink as i64).abs() <= 3
             && samples.totals.consumer_unmatched == 0);
@@ -2203,8 +2575,7 @@ fn run_session(
             win_end.saturating_sub(win_start),
             args.duration,
         ),
-        fps_sustained: output_grid.exact
-            && (!judge_consumer || consumer_grid.as_ref().is_some_and(|g| g.exact)),
+        fps_sustained: output_rate_held && consumer_rate_held,
         no_output_drops: delta.queue_dropped == 0
             && delta.push_failed == 0
             && consumer_received_all,
@@ -2284,6 +2655,9 @@ fn run_session(
             aspect: args.aspect,
             process: args.gpu_stage,
             input_gap_ms: args.input_gap_ms,
+            hold_timeout_s: args.hold_timeout,
+            output_queue_buffers: args.output_queue_buffers,
+            phase_lock,
             queue_buffers: args.queue_buffers,
             camera_io_mode: args.io_mode.clone(),
             camera_fixed_framerate: args.camera_fixed_framerate,
@@ -2298,6 +2672,13 @@ fn run_session(
         },
         fps: FpsSection {
             target,
+            method: FPS_METHOD,
+            output_pts,
+            consumer_pts,
+            output_deviation,
+            consumer_deviation,
+            output_sliding_1s: output_sliding,
+            consumer_sliding_1s: consumer_sliding,
             output_stalls: stats::count_stalls(&samples.sink_times, period_ns, 1.5),
             consumer_stalls: args
                 .consumer
@@ -2315,6 +2696,23 @@ fn run_session(
             queue_overruns,
             qos_dropped_by_element: qos_dropped,
             decoder_dropped_frames,
+        },
+        clock: ClockSection {
+            phase_lock,
+            lock_acquisitions: delta.lock_acquisitions,
+            lock_wraps: delta.lock_wraps,
+            phase_offset_ms: delta.phase_offset_ns as f64 / 1e6,
+            phase_locked: delta.phase_locked,
+            slot_wait_ms: stats::summarize(&ms(&samples.slot_wait_ns)),
+            slot_wait_percentiles_ms: percentiles(&ms(&samples.slot_wait_ns)),
+            slot_wait_over_camera_frame,
+            ingest_ms: stats::summarize(&ms(&samples.ingest_ns)),
+            ingest_percentiles_ms: percentiles(&ms(&samples.ingest_ns)),
+            queue_bound: args.output_queue_buffers,
+            queue_level_max: samples.counts.queue_level_max,
+            holds: delta.holds,
+            holds_released: delta.holds_released,
+            holds_expired: delta.holds_expired,
         },
         switches: switch_section,
         latency: LatencySection {
@@ -2497,11 +2895,43 @@ fn print_summary(r: &Report) {
             g.exact
         )
     };
+    let timing_line = |name: &str, p: &PtsSequence, d: &Deviation, w: &Sliding| {
+        println!(
+            "  {name:<9} PTS sequence: {} frames, missing {} out of order {} off grid {} (exact {}); deviation from the grid {} spread {} ms (limit {:.2}, within {}); any 1 s window {}..={}",
+            p.frames,
+            p.missing,
+            p.out_of_order,
+            p.off_grid,
+            p.exact,
+            d.ms.map_or("n/a".into(), |s| format!(
+                "min {:.2} p50 {:.2} max {:.2} ms",
+                s.min, s.p50, s.max
+            )),
+            d.spread_ms.map_or("n/a".into(), |v| format!("{v:.2}")),
+            d.limit_ms,
+            d.within,
+            w.min_1s.map_or("-".into(), |v| v.to_string()),
+            w.max_1s.map_or("-".into(), |v| v.to_string()),
+        )
+    };
     println!("fps (contract {:.2}):", f.target);
     fps_line("output", &f.output);
+    timing_line(
+        "output",
+        &f.output_pts,
+        &f.output_deviation,
+        &f.output_sliding_1s,
+    );
     grid_line("output", &f.output_grid);
     if let Some(cf) = &f.consumer {
         fps_line("consumer", cf);
+    }
+    if let (Some(p), Some(d), Some(w)) = (
+        &f.consumer_pts,
+        &f.consumer_deviation,
+        &f.consumer_sliding_1s,
+    ) {
+        timing_line("consumer", p, d, w);
     }
     if let Some(cg) = &f.consumer_grid {
         grid_line("consumer", cg);
@@ -2538,9 +2968,31 @@ fn print_summary(r: &Report) {
     if let Some(n) = r.frames.decoder_dropped_frames {
         println!("  jpegdec dropped {n} undecodable camera frames (whole run)");
     }
+    let k = &r.clock;
+    println!(
+        "clock: phase lock {}; {} acquisitions, {} wraps, phase {:.2} ms at the end (locked {}); slot wait {}; queue level max {} of {}; holds {} ({} released, {} expired)",
+        if k.phase_lock.is_some() { "on" } else { "off" },
+        k.lock_acquisitions,
+        k.lock_wraps,
+        k.phase_offset_ms,
+        k.phase_locked,
+        k.slot_wait_ms.map_or("n/a".into(), |s| format!(
+            "p50 {:.2} p95 {:.2} max {:.2} ms, {} over a camera frame",
+            s.p50,
+            s.p95,
+            s.max,
+            k.slot_wait_over_camera_frame
+                .map_or("n/a".into(), |n| n.to_string())
+        )),
+        k.queue_level_max,
+        k.queue_bound,
+        k.holds,
+        k.holds_released,
+        k.holds_expired
+    );
     let sw = &r.switches;
     println!(
-        "switches: {} ({} completed, {} failed, {} abandoned at the end); gap {}; repeats {} placeholders {} during gaps; first start {}",
+        "switches: {} ({} completed, {} failed, {} abandoned at the end); gap {}; held {}; repeats {} placeholders {} during gaps (at most {} per switch); first start {}",
         sw.count,
         sw.completed,
         sw.failed,
@@ -2549,8 +3001,14 @@ fn print_summary(r: &Report) {
             "min {:.1} p50 {:.1} max {:.1} ms",
             g.min, g.p50, g.max
         )),
+        sw.held_ms.map_or("n/a".into(), |g| format!(
+            "min {:.1} p50 {:.1} max {:.1} ms",
+            g.min, g.p50, g.max
+        )),
         sw.repeats_during_gaps,
         sw.placeholders_during_gaps,
+        sw.placeholders_max_per_switch
+            .map_or("-".into(), |v| v.to_string()),
         sw.initial_start_ms
             .map_or("n/a".into(), |g| format!("{g:.1} ms"))
     );
@@ -2675,6 +3133,27 @@ mod tests {
             assert!(positive_secs(bad).is_err(), "{bad}");
         }
         assert!(positive_secs("0").is_err());
+    }
+
+    #[test]
+    fn waits_over_a_camera_frame_are_counted() {
+        let frame = 16_666_667;
+        assert_eq!(
+            count_over(&[1_500_000, frame, frame + 1, 21_000_000], frame),
+            2
+        );
+        assert_eq!(count_over(&[], frame), 0);
+    }
+
+    #[test]
+    fn milliseconds_are_validated() {
+        assert_eq!(non_negative_ms("0"), Ok(0.0));
+        assert_eq!(non_negative_ms("1.5"), Ok(1.5));
+        for bad in ["inf", "NaN", "-1", "1001", "x"] {
+            assert!(non_negative_ms(bad).is_err(), "{bad}");
+        }
+        let err = non_negative_ms("-1").unwrap_err();
+        assert!(err.contains("milliseconds"), "{err}");
     }
 
     fn parse(extra: &[&str]) -> Result<Args, clap::Error> {
@@ -2947,6 +3426,14 @@ mod tests {
             emitted: 52,
             queue_dropped: 1,
             push_failed: 0,
+            queue_level_max: 2,
+            lock_acquisitions: 1,
+            lock_wraps: 0,
+            phase_offset_ns: -5_000_000,
+            phase_locked: true,
+            holds: 1,
+            holds_released: 1,
+            holds_expired: 0,
         };
         let b = OutputCounts {
             input_frames: 400,
@@ -2959,6 +3446,14 @@ mod tests {
             emitted: 215,
             queue_dropped: 4,
             push_failed: 1,
+            queue_level_max: 3,
+            lock_acquisitions: 3,
+            lock_wraps: 2,
+            phase_offset_ns: -20_000_000,
+            phase_locked: false,
+            holds: 4,
+            holds_released: 3,
+            holds_expired: 1,
         };
         let d = counts_delta(&a, &b);
         assert_eq!(
@@ -2974,11 +3469,28 @@ mod tests {
                 emitted: 163,
                 queue_dropped: 3,
                 push_failed: 1,
+                // The running maximum and the states are the later ones.
+                queue_level_max: 3,
+                lock_acquisitions: 2,
+                lock_wraps: 2,
+                phase_offset_ns: -20_000_000,
+                phase_locked: false,
+                holds: 3,
+                holds_released: 2,
+                holds_expired: 1,
             }
         );
         assert_eq!(d.fresh + d.repeat + d.placeholder, d.emitted);
         // Never negative, even for snapshots in the wrong order.
-        assert_eq!(counts_delta(&b, &a), OutputCounts::default());
+        assert_eq!(
+            counts_delta(&b, &a),
+            OutputCounts {
+                queue_level_max: 2,
+                phase_offset_ns: -5_000_000,
+                phase_locked: true,
+                ..OutputCounts::default()
+            }
+        );
     }
 
     /// Output fps per 1 s window counts arrivals on a fixed grid; a tick
@@ -3035,6 +3547,7 @@ mod tests {
                 repeats,
                 placeholders,
                 previous_fresh: 0,
+                held_from_ns: Some(requested_ns.saturating_sub(10_000_000)),
             }),
             error: None,
             abandoned: false,
@@ -3136,6 +3649,115 @@ mod tests {
         (0..frames)
             .map(|i| (t0 + cfg.deadline_ns(i) + latency).saturating_add_signed(jitter(i)))
             .collect()
+    }
+
+    #[test]
+    fn line_residuals_measure_jitter_around_the_cadence() {
+        let f = 16_666_667u64;
+        let pts: Vec<u64> = (0..100).map(|i| 1_000 + i * f).collect();
+        // Arrivals on a slightly faster clock, every 10th 2 ms late.
+        let times: Vec<u64> = (0..100u64)
+            .map(|i| 5_000_000 + i * (f - 1_000) + if i % 10 == 3 { 2_000_000 } else { 0 })
+            .collect();
+        let r = line_residuals_ms(&times, &pts, f);
+        let late: Vec<f64> = (0..100).filter(|i| i % 10 == 3).map(|i| r[i]).collect();
+        assert!(late.iter().all(|v| (v - 1.8).abs() < 0.05), "{late:?}");
+        assert!(
+            r.iter()
+                .enumerate()
+                .filter(|(i, _)| i % 10 != 3)
+                .all(|(_, v)| (v + 0.2).abs() < 0.05)
+        );
+        // A dropped frame keeps the numbering from the PTS.
+        let mut p2 = pts.clone();
+        let mut t2 = times.clone();
+        p2.remove(50);
+        t2.remove(50);
+        assert_eq!(line_residuals_ms(&t2, &p2, f).len(), 99);
+        assert!(
+            line_residuals_ms(&pts, &pts, f)
+                .iter()
+                .all(|v| v.abs() < 1e-3)
+        );
+        // A camera 0.1 % slower than nominal over 2000 frames (33 ms of
+        // drift): still numbered frame by frame, no residual.
+        let slow: Vec<u64> = (0..2000u64).map(|i| i * (f + f / 1000)).collect();
+        assert!(
+            line_residuals_ms(&slow, &slow, f)
+                .iter()
+                .all(|v| v.abs() < 1e-3)
+        );
+    }
+
+    #[test]
+    fn pts_sequence_requires_every_tick_once_in_order() {
+        let d = |i: u64| PacerConfig::new(30, 1).deadline_ns(i);
+        let all: Vec<u64> = (100..400).map(d).collect();
+        let s = pts_sequence(&all, 30, 1);
+        assert!(s.exact, "{s:?}");
+        assert_eq!(
+            (s.first_index, s.last_index, s.frames),
+            (Some(100), Some(399), 300)
+        );
+        // A missing tick, a repeated one, one without PTS, one off the grid.
+        let mut v = all.clone();
+        v.remove(10);
+        let s = pts_sequence(&v, 30, 1);
+        assert_eq!((s.missing, s.exact), (1, false));
+        let mut v = all.clone();
+        v.insert(20, d(119));
+        assert_eq!(pts_sequence(&v, 30, 1).out_of_order, 1);
+        let mut v = all.clone();
+        v[5] = u64::MAX;
+        v[6] += 1;
+        let s = pts_sequence(&v, 30, 1);
+        assert_eq!((s.off_grid, s.missing, s.exact), (2, 2, false));
+        // N/D rates: the exact grid.
+        let ntsc: Vec<u64> = (0..100)
+            .map(|i| PacerConfig::new(30000, 1001).deadline_ns(i))
+            .collect();
+        assert!(pts_sequence(&ntsc, 30000, 1001).exact);
+        assert!(!pts_sequence(&[], 30, 1).exact);
+    }
+
+    #[test]
+    fn deviation_spread_is_judged_against_one_period_plus_the_allowance() {
+        let period = 33_333_333;
+        // A phase that moved across the whole band: within.
+        let d = deviation(&[-33_000_000, -1_000_000, 0, 2_000_000], period);
+        assert!(d.within, "{d:?}");
+        assert!((d.spread_ms.unwrap() - 35.0).abs() < 1e-9);
+        assert!((d.limit_ms - 38.333_333).abs() < 1e-3);
+        // Beyond: a frame 10 ms late on top of a full band.
+        assert!(!deviation(&[-33_000_000, 0, 10_000_000], period).within);
+        assert!(!deviation(&[], period).within);
+    }
+
+    #[test]
+    fn sliding_windows_find_the_extremes_anywhere() {
+        let s = 1_000_000_000u64;
+        let p = 33_333_333u64;
+        // Exactly 30 fps (on the exact grid): 30 in every window, wherever
+        // it starts.
+        let grid = PacerConfig::new(30, 1);
+        let times: Vec<u64> = (0..300).map(|i| s + grid.deadline_ns(i)).collect();
+        let w = sliding_1s(&times, s, 11 * s);
+        assert_eq!((w.min_1s, w.max_1s), (Some(30), Some(30)));
+        // Two frames moved 30 ms earlier and later around one point: a window
+        // can catch one more or one less, never two.
+        let mut v = times.clone();
+        v[100] -= 30_000_000;
+        v[131] += 30_000_000;
+        let w = sliding_1s(&v, s, 11 * s);
+        assert_eq!((w.min_1s, w.max_1s), (Some(29), Some(31)));
+        // A doubled interval (one tick late by a period, the next early):
+        // still 29..=31.
+        let mut v = times.clone();
+        v[150] += p - 1;
+        let w = sliding_1s(&v, s, 11 * s);
+        assert!(w.min_1s >= Some(29) && w.max_1s <= Some(31), "{w:?}");
+        assert!(count_within(300, 300.0) && count_within(301, 300.0));
+        assert!(!count_within(302, 300.0));
     }
 
     #[test]
