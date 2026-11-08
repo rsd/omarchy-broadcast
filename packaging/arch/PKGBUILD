@@ -29,7 +29,7 @@
 
 pkgname=oma-broadcast-git
 _pkgname=oma-broadcast
-pkgver=0.8.0
+pkgver=0.8.1
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API, a CLI and an Omarchy bar widget'
 arch=('x86_64')

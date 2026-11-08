@@ -1455,11 +1455,35 @@ fn pattern_ingest(
 
 /// Per output buffer: PTS, the luma at the frame centre (at the sink), and
 /// the address of the first memory pushed into the output (at `appsrc`).
+/// With [`trace_effect_input`], also the PTS of each buffer entering the
+/// effect element.
 #[derive(Default)]
 struct OutputTrace {
     emitted: Vec<EmitInfo>,
     centre_luma: Vec<(u64, u8)>,
     memory: Vec<(u64, usize)>,
+    effect_in: Vec<u64>,
+}
+
+/// Records in `trace` the PTS of each buffer entering the output's effect
+/// element, before the element decides what the frame gets. One streaming
+/// thread runs from `appsrc` to the sink, so a buffer recorded here reaches
+/// the sink (or is refused there while the sink is flushing, which the +1
+/// tolerance at stop covers) before the next one enters; read under the
+/// trace's lock, the two counts differ by at most the frame in flight.
+fn trace_effect_input(output: &Output, trace: &Arc<Mutex<OutputTrace>>) {
+    let t = Arc::clone(trace);
+    output
+        .pipeline()
+        .element(names::EFFECT)
+        .and_then(|e| e.static_pad("sink"))
+        .unwrap()
+        .add_probe(gst::PadProbeType::BUFFER, move |_, probe| {
+            if let Some(pts) = probe.buffer().and_then(|b| b.pts()) {
+                t.lock().unwrap().effect_in.push(pts.nseconds());
+            }
+            gst::PadProbeReturn::Ok
+        });
 }
 
 fn trace_output(output: &mut Output) -> Arc<Mutex<OutputTrace>> {
@@ -2828,6 +2852,11 @@ fn wait_effect_ready(
 /// sink sees the source (luma 235), black (16) only while the first effect
 /// loads, the fake blur (200) and replace (100), never the source while an
 /// effect is requested, and one caps event in all.
+///
+/// "Black only while the first effect loads" is checked on the frames that
+/// entered the effect element after the test saw it ready: a frame decided
+/// (black) just before the effect became ready can still be on its way to
+/// the sink when the status changes.
 #[test]
 #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
 fn gpu_an_output_switches_effects_while_streaming() {
@@ -2854,6 +2883,7 @@ fn gpu_an_output_switches_effects_while_streaming() {
     let mut output = Output::build(cfg).expect("build output");
     assert!(output.pipeline().element(names::EFFECT).is_some());
     let trace = trace_output(&mut output);
+    trace_effect_input(&output, &trace);
     let caps_events = count_caps_events(output.pipeline(), names::LOOPBACK);
     let mut session = Session::new(output).expect("start output");
     session
@@ -2894,8 +2924,29 @@ fn gpu_an_output_switches_effects_while_streaming() {
         .unwrap();
     let a = len();
     wait_effect_ready(&session, &mut out_log, &mut in_log, Duration::from_secs(10));
-    let b = len();
+    // Every frame entering the effect from here on is decided after the
+    // effect was ready. The one in flight (entered, not yet at the sink)
+    // may have been decided before, so it belongs to the warm-up.
+    let (b, at_sink) = {
+        let t = trace.lock().unwrap();
+        (t.effect_in.len(), t.centre_luma.len())
+    };
+    assert!(
+        (at_sink..=at_sink + 1).contains(&b),
+        "at most the frame in flight: {b} entered the effect, {at_sink} at the sink"
+    );
     idle(&session, &mut out_log, &mut in_log, 500);
+    assert!(
+        run_until(
+            &session,
+            &mut out_log,
+            &mut in_log,
+            Duration::from_secs(10),
+            |_| len() >= b + 10
+        ),
+        "at 30 fps, 10 frames reach the sink after ready: {b}..{}",
+        len()
+    );
     let c = len();
     let warm = lumas(a, b);
     let first_black = warm.iter().position(|v| *v == 16).expect("black warm-up");
@@ -2906,11 +2957,21 @@ fn gpu_an_output_switches_effects_while_streaming() {
             .all(|v| *v == 16 || *v == FAKE_BLUR_Y),
         "{warm:?}"
     );
+    if let Some(first_blur) = warm.iter().position(|v| *v == FAKE_BLUR_Y) {
+        assert!(
+            warm[first_blur..].iter().all(|v| *v == FAKE_BLUR_Y),
+            "black, then processed; never processed, then black: {warm:?}"
+        );
+    }
     assert!(
-        warm.len() >= 15,
-        "the 800 ms load is about 24 frames: {warm:?}"
+        warm.iter().filter(|v| **v == 16).count() >= 15,
+        "the 800 ms load is about 24 black frames: {warm:?}"
     );
-    assert!(lumas(b, c).iter().all(|v| *v == FAKE_BLUR_Y));
+    assert!(
+        lumas(b, c).iter().all(|v| *v == FAKE_BLUR_Y),
+        "after ready (sink frames {b}..{c}): {:?}",
+        lumas(b, c)
+    );
 
     // blur -> replace.
     session
@@ -2953,6 +3014,18 @@ fn gpu_an_output_switches_effects_while_streaming() {
         "{out_log:?} {in_log:?}"
     );
     eprintln!("{stats:?}; {counts:?}");
+    {
+        // What makes `b` a sink index: the frames entering the effect are,
+        // in order, the frames reaching the sink.
+        let t = trace.lock().unwrap();
+        let at_sink: Vec<u64> = t.centre_luma.iter().map(|(pts, _)| *pts).collect();
+        assert!(
+            t.effect_in.starts_with(&at_sink) && t.effect_in.len() <= at_sink.len() + 1,
+            "{} frames entered the effect, {} reached the sink",
+            t.effect_in.len(),
+            at_sink.len()
+        );
+    }
     assert_eq!(caps_events.load(Ordering::Relaxed), 1, "one negotiation");
     assert!(stats.frames_processed > 20 && stats.frames_black >= 15);
     assert!(stats.frames_passthrough > 20);
