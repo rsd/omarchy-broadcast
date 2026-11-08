@@ -819,6 +819,21 @@ struct ClockSection {
     /// superseded), so this count stays at zero there. Windows with one
     /// camera mode only; `None` otherwise.
     slot_wait_over_camera_frame: Option<u64>,
+    /// The same count split by the phase lock's state at the tick that
+    /// emitted the frame, with the fresh frames behind each part. Before
+    /// the lock engages the clock free-runs and a camera slower than the
+    /// contract (15 fps into 30) has its frames wait out the unlocked grid;
+    /// the first seconds of a window opened soon after the start can hold
+    /// many of those, which say nothing about the locked clock. The sum of
+    /// both parts is `slot_wait_over_camera_frame`. With no frame in the
+    /// locked part (`slot_wait_fresh_locked` is 0) the lock did not engage
+    /// in the window (an input rate it does not follow, or the lock off):
+    /// the whole-window count is then the one to read. Same windows as
+    /// that count; `None` otherwise.
+    slot_wait_over_camera_frame_locked: Option<u64>,
+    slot_wait_over_camera_frame_unlocked: Option<u64>,
+    slot_wait_fresh_locked: Option<u64>,
+    slot_wait_fresh_unlocked: Option<u64>,
     /// Camera src pad to slot for the same frames: the ingest pipeline's
     /// own time, whose spread (with the camera's) the lock must wait for.
     ingest_ms: Option<Summary>,
@@ -1909,6 +1924,65 @@ fn count_over(values: &[u64], limit: u64) -> u64 {
     values.iter().filter(|v| **v > limit).count() as u64
 }
 
+/// Slot waits over a limit, split by the phase lock's state at the tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WaitSplit {
+    locked_over: u64,
+    locked_total: u64,
+    unlocked_over: u64,
+    unlocked_total: u64,
+}
+
+/// Counts the `waits` over `limit` and the waits themselves, apart for the
+/// ticks emitted with the phase lock engaged and for the others. `locked`
+/// holds the lock state of each wait; a wait without one (the slices differ
+/// in length) counts as unlocked.
+fn split_over_by_lock(waits: &[u64], locked: &[bool], limit: u64) -> WaitSplit {
+    let mut s = WaitSplit {
+        locked_over: 0,
+        locked_total: 0,
+        unlocked_over: 0,
+        unlocked_total: 0,
+    };
+    for (i, &w) in waits.iter().enumerate() {
+        let over = u64::from(w > limit);
+        if locked.get(i).copied().unwrap_or(false) {
+            s.locked_total += 1;
+            s.locked_over += over;
+        } else {
+            s.unlocked_total += 1;
+            s.unlocked_over += over;
+        }
+    }
+    s
+}
+
+/// The suffix of the summary's missed-tick figure: where the waits over a
+/// camera frame fell relative to the lock engaging. Empty when the figure is
+/// not available.
+fn lock_split_note(split: Option<WaitSplit>) -> String {
+    match split {
+        None => String::new(),
+        Some(w) if w.locked_total == 0 => " (lock not engaged)".into(),
+        Some(w) => format!(
+            " ({} of {} after the lock engaged, {} of {} before)",
+            w.locked_over, w.locked_total, w.unlocked_over, w.unlocked_total
+        ),
+    }
+}
+
+impl ClockSection {
+    /// The split of the slot waits by lock state, as reported.
+    fn wait_split(&self) -> Option<WaitSplit> {
+        Some(WaitSplit {
+            locked_over: self.slot_wait_over_camera_frame_locked?,
+            locked_total: self.slot_wait_fresh_locked?,
+            unlocked_over: self.slot_wait_over_camera_frame_unlocked?,
+            unlocked_total: self.slot_wait_fresh_unlocked?,
+        })
+    }
+}
+
 /// One streaming status line over a status window of `window_s` seconds:
 /// `w` its samples, `delta` the output counters over it.
 fn status_line(
@@ -2754,8 +2828,12 @@ fn run_session(
         .consumer
         .then(|| stats::fps_report(&samples.consumer_times, stats_start, win_end, target, 1.0));
     let inputs = input_reports(&samples, &runs, &cycle, stats_start, win_end);
-    let slot_wait_over_camera_frame = single_camera_frame_ns(&inputs, &runs, &cycle)
-        .map(|frame_ns| count_over(&samples.slot_wait_ns, frame_ns));
+    let camera_frame_ns = single_camera_frame_ns(&inputs, &runs, &cycle);
+    let slot_wait_over_camera_frame =
+        camera_frame_ns.map(|frame_ns| count_over(&samples.slot_wait_ns, frame_ns));
+    let wait_split = camera_frame_ns.map(|frame_ns| {
+        split_over_by_lock(&samples.slot_wait_ns, &samples.slot_wait_locked, frame_ns)
+    });
     let delta = counts_delta(&m.counts_start, &m.counts_end);
     let ingest_lost = samples.counts.src as i64 - delta.input_frames as i64;
     let runs_in_window = runs
@@ -2983,6 +3061,10 @@ fn run_session(
             slot_wait_ms: stats::summarize(&ms(&samples.slot_wait_ns)),
             slot_wait_percentiles_ms: percentiles(&ms(&samples.slot_wait_ns)),
             slot_wait_over_camera_frame,
+            slot_wait_over_camera_frame_locked: wait_split.map(|w| w.locked_over),
+            slot_wait_over_camera_frame_unlocked: wait_split.map(|w| w.unlocked_over),
+            slot_wait_fresh_locked: wait_split.map(|w| w.locked_total),
+            slot_wait_fresh_unlocked: wait_split.map(|w| w.unlocked_total),
             ingest_ms: stats::summarize(&ms(&samples.ingest_ns)),
             ingest_percentiles_ms: percentiles(&ms(&samples.ingest_ns)),
             queue_bound: args.output_queue_buffers,
@@ -3284,12 +3366,13 @@ fn print_summary(r: &Report) {
         k.phase_offset_ms,
         k.phase_locked,
         k.slot_wait_ms.map_or("n/a".into(), |s| format!(
-            "p50 {:.2} p95 {:.2} max {:.2} ms, {} over a camera frame",
+            "p50 {:.2} p95 {:.2} max {:.2} ms, {} over a camera frame{}",
             s.p50,
             s.p95,
             s.max,
             k.slot_wait_over_camera_frame
-                .map_or("n/a".into(), |n| n.to_string())
+                .map_or("n/a".into(), |n| n.to_string()),
+            lock_split_note(k.wait_split())
         )),
         k.queue_level_max,
         k.queue_bound,
@@ -3836,6 +3919,67 @@ mod tests {
         assert_eq!(all["B (/dev/video4)/decode"], 25 * 2);
         assert_eq!(all["A (/dev/video0)/camera"], 25);
         assert!(c.qos_run.is_empty() && c.qos_dropped.is_empty());
+    }
+
+    /// The miss count over a window that opens before the half-rate lock
+    /// engages: the free-running frames before it are counted apart.
+    #[test]
+    fn slot_waits_over_a_frame_split_at_the_lock() {
+        let frame = 66_666_667u64;
+        let ms = 1_000_000u64;
+        // 15 fps into 30: 17 frames before the lock, 8 after it. Before the
+        // lock 15 of the waits are over a camera frame; after it one is.
+        let mut waits = vec![70 * ms; 15];
+        waits.extend([20 * ms, 30 * ms]);
+        waits.extend([
+            25 * ms,
+            31 * ms,
+            69 * ms,
+            28 * ms,
+            33 * ms,
+            20 * ms,
+            29 * ms,
+            32 * ms,
+        ]);
+        let mut locked = vec![false; 17];
+        locked.extend(vec![true; 8]);
+        let s = split_over_by_lock(&waits, &locked, frame);
+        assert_eq!(
+            s,
+            WaitSplit {
+                locked_over: 1,
+                locked_total: 8,
+                unlocked_over: 15,
+                unlocked_total: 17,
+            }
+        );
+        assert_eq!(
+            lock_split_note(Some(s)),
+            " (1 of 8 after the lock engaged, 15 of 17 before)"
+        );
+        // The whole-window count is the sum, as before.
+        assert_eq!(count_over(&waits, frame), s.locked_over + s.unlocked_over);
+        // Exactly the limit is not over it, in either part.
+        let edge = split_over_by_lock(&[frame, frame + 1], &[true, false], frame);
+        assert_eq!((edge.locked_over, edge.unlocked_over), (0, 1));
+    }
+
+    /// A lock that never engages (20 fps into 30): every wait is in the
+    /// unlocked part, which then equals the whole-window count, and the
+    /// summary says so.
+    #[test]
+    fn slot_waits_without_a_lock_are_all_unlocked() {
+        let frame = 50_000_000u64;
+        let waits = [10_000_000, 60_000_000, 51_000_000, 40_000_000];
+        let s = split_over_by_lock(&waits, &[false; 4], frame);
+        assert_eq!((s.locked_over, s.locked_total), (0, 0));
+        assert_eq!((s.unlocked_over, s.unlocked_total), (2, 4));
+        assert_eq!(s.unlocked_over, count_over(&waits, frame));
+        // No lock state recorded at all counts as unlocked too.
+        assert_eq!(split_over_by_lock(&waits, &[], frame), s);
+        assert_eq!(split_over_by_lock(&[], &[], frame).unlocked_total, 0);
+        assert_eq!(lock_split_note(Some(s)), " (lock not engaged)");
+        assert_eq!(lock_split_note(None), "");
     }
 
     #[test]

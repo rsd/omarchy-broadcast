@@ -247,6 +247,7 @@ mod tests {
             emitted_at: at,
             grid_at: at,
             phase_offset_ns: 0,
+            phase_locked: false,
             pushed: true,
             queue_level: 0,
         }

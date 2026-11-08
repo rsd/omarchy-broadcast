@@ -125,6 +125,8 @@ struct TickRecord {
     queue_level: u64,
     /// When the frame entered the slot.
     arrived_t: Option<u64>,
+    /// The phase lock was engaged at the tick.
+    phase_locked: bool,
 }
 
 /// A buffer seen at the sink before its emission was reported.
@@ -278,6 +280,9 @@ struct Inner {
     /// Slot wait of each fresh emission (pushed), and its emission time.
     wait_t: VecDeque<u64>,
     slot_wait_ns: VecDeque<u64>,
+    /// Of the same emissions: 1 when the phase lock was engaged at the tick
+    /// (a `u64` so the series trims with the others).
+    wait_locked: VecDeque<u64>,
     /// Of the same frames: camera src pad to slot (`UNSET`: unknown).
     ingest_ns: VecDeque<u64>,
     /// Sink-ready time of each fresh frame with a latency sample.
@@ -350,7 +355,11 @@ impl Inner {
             | trim_series(&mut self.sink_dev_t, &mut [&mut self.sink_dev_ns], cutoff)
             | trim_series(
                 &mut self.wait_t,
-                &mut [&mut self.slot_wait_ns, &mut self.ingest_ns],
+                &mut [
+                    &mut self.slot_wait_ns,
+                    &mut self.wait_locked,
+                    &mut self.ingest_ns,
+                ],
                 cutoff,
             );
         let c = trim_series(
@@ -399,6 +408,10 @@ impl Inner {
             sink_pts: collect(&self.sink_pts, sink),
             sink_deviation_ns: collect(&self.sink_dev_ns, index_range(&self.sink_dev_t, from, to)),
             slot_wait_ns: collect(&self.slot_wait_ns, index_range(&self.wait_t, from, to)),
+            slot_wait_locked: collect(&self.wait_locked, index_range(&self.wait_t, from, to))
+                .into_iter()
+                .map(|l| l != 0)
+                .collect(),
             ingest_ns: collect(&self.ingest_ns, index_range(&self.wait_t, from, to))
                 .into_iter()
                 .filter(|&n| n != UNSET)
@@ -500,6 +513,10 @@ pub struct Samples {
     pub sink_deviation_ns: Vec<i64>,
     /// How long each fresh frame waited in the slot before its tick.
     pub slot_wait_ns: Vec<u64>,
+    /// Whether the phase lock was engaged at the tick that emitted each
+    /// `slot_wait_ns` frame: before it engages the clock free-runs and the
+    /// first frames wait out the unlocked grid.
+    pub slot_wait_locked: Vec<bool>,
     /// Camera src pad to slot, the same frames (where the src-pad record
     /// was found): the ingest pipeline's own time.
     pub ingest_ns: Vec<u64>,
@@ -749,6 +766,7 @@ impl Recorder {
             grid_t: None,
             queue_level: 0,
             arrived_t: None,
+            phase_locked: false,
         });
     }
 
@@ -788,6 +806,7 @@ impl Recorder {
         if let (TickKind::Fresh, Some(arrived), true) = (kind, k.arrived_t, self.in_window(t)) {
             g.wait_t.push_back(t);
             g.slot_wait_ns.push_back(t.saturating_sub(arrived));
+            g.wait_locked.push_back(u64::from(k.phase_locked));
             g.ingest_ns
                 .push_back(src_t.map_or(UNSET, |s| arrived.saturating_sub(s)));
             self.retain(&mut g, t);
@@ -967,6 +986,7 @@ impl Recorder {
                 grid_t: Some(rec.ns_at(e.grid_at)),
                 queue_level: e.queue_level,
                 arrived_t: e.origin.map(|o| rec.ns_at(o.arrived_at)),
+                phase_locked: e.phase_locked,
             });
         })
     }
@@ -1154,6 +1174,8 @@ mod tests {
             grid_t: Some(grid_t),
             queue_level: level,
             arrived_t,
+            // The lock engages from tick 3 on.
+            phase_locked: pts >= 3,
         };
         // Before the window: nothing recorded.
         r.on_tick(tick(0, Fresh, 500, 520, 3, Some(490)));
@@ -1166,12 +1188,15 @@ mod tests {
         r.on_sink(1_140, 1_141, Some(2));
         r.on_tick(tick(2, Repeat, 1_135, 1_153, 2, None));
         r.on_sink(1_150, 1_151, None);
+        // A fresh frame once the lock is engaged: its wait is kept apart.
+        r.on_tick(tick(3, Fresh, 1_200, 1_220, 1, Some(1_150)));
         let s = r.samples();
         assert_eq!(s.sink_pts, vec![1, 2, u64::MAX]);
         assert_eq!(s.sink_deviation_ns, vec![-15, -13]);
         assert_eq!(s.consumer_pts, vec![1]);
         assert_eq!(s.consumer_deviation_ns, vec![10]);
-        assert_eq!(s.slot_wait_ns, vec![10], "fresh frames only");
+        assert_eq!(s.slot_wait_ns, vec![10, 50], "fresh frames only");
+        assert_eq!(s.slot_wait_locked, vec![false, true], "lock state per wait");
         assert_eq!(s.counts.queue_level_max, 2, "in the window");
     }
 
@@ -1284,6 +1309,7 @@ mod tests {
         assert!(s.src_times.len() <= 11 && s.sink_times.len() <= 11);
         assert_eq!(s.src_times.len(), s.src_pts.len());
         assert_eq!(s.src_times.len(), s.src_source.len());
+        assert_eq!(s.slot_wait_ns.len(), s.slot_wait_locked.len());
         assert_eq!(s.fresh_times.len(), s.added_latency_ns.len());
         assert_eq!(s.fresh_times.len(), s.added_at_pad_ns.len());
         assert_eq!(s.consumer_times.len(), s.consumer_latency_ns.len());
