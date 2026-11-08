@@ -76,6 +76,25 @@ impl Server {
         self.call(|r| Command::ReloadConfig(Some(r))).await
     }
 
+    /// Selects the effect: `none`, `blur` or `replace` (which needs a
+    /// background image). Applies to a running stream at once; persists
+    /// across restarts.
+    async fn set_effect(&self, effect: String) -> Result<(), IpcError> {
+        self.call(|r| Command::SetEffect(effect, r)).await
+    }
+
+    /// Sets the blur strength, 0.0 to 1.0. Persists across restarts.
+    async fn set_blur_strength(&self, strength: f64) -> Result<(), IpcError> {
+        self.call(|r| Command::SetBlurStrength(strength, r)).await
+    }
+
+    /// Sets the background image of `replace`: an absolute path to a
+    /// readable regular file of at most 32 MiB; empty clears it. Persists
+    /// across restarts.
+    async fn set_background_image(&self, path: String) -> Result<(), IpcError> {
+        self.call(|r| Command::SetBackgroundImage(path, r)).await
+    }
+
     /// About once per second while `active`; `-1` marks a value that cannot
     /// be measured.
     #[zbus(signal)]
@@ -123,6 +142,16 @@ impl Server {
     }
 
     #[zbus(property)]
+    fn blur_strength(&self) -> f64 {
+        self.snap().blur_strength
+    }
+
+    #[zbus(property)]
+    fn background_image(&self) -> String {
+        self.snap().background_image
+    }
+
+    #[zbus(property)]
     fn consumers(&self) -> u32 {
         self.snap().consumers
     }
@@ -157,9 +186,12 @@ async fn emit_change(emitter: &SignalEmitter<'_>, change: &Change) -> zbus::Resu
     let name = change.name();
     match change {
         Change::State(v) => emit_changed(emitter, name, v).await,
-        Change::Error(v) | Change::ActiveCamera(v) | Change::OutputMode(v) => {
-            emit_changed(emitter, name, v).await
-        }
+        Change::Error(v)
+        | Change::ActiveCamera(v)
+        | Change::OutputMode(v)
+        | Change::Effect(v)
+        | Change::BackgroundImage(v) => emit_changed(emitter, name, v).await,
+        Change::BlurStrength(v) => emit_changed(emitter, name, v).await,
         Change::Enabled(v) => emit_changed(emitter, name, v).await,
         Change::Cameras(v) => emit_changed(emitter, name, v).await,
         Change::Consumers(v) => emit_changed(emitter, name, v).await,

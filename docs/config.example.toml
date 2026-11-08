@@ -8,7 +8,9 @@
 # reported instead of silently ignored.
 #
 # The daemon never writes this file. Runtime changes (on/off, the selected
-# camera) are kept in $XDG_STATE_HOME/oma-broadcast/state.toml instead.
+# camera, the effect and its settings) are kept in
+# $XDG_STATE_HOME/oma-broadcast/state.toml instead, and take precedence
+# over the values here.
 #
 # Reload after editing by sending SIGHUP to the daemon
 # (`systemctl --user kill -s HUP oma-broadcastd`) or with the ReloadConfig()
@@ -99,3 +101,45 @@ idle_grace_s = 5.0
 # 0 to 10000; 0 starts at once.
 # Default: 300
 start_debounce_ms = 300
+
+[effect]
+# Video effects run on the GPU with the NVIDIA Maxine Video Effects SDK,
+# which is not part of oma-broadcast and must be installed separately; see
+# docs/setup/maxine.md. Without it the daemon runs normally, and a requested
+# effect fails as described under on_failure.
+#
+# An effect selected at run time (SetEffect, SetBlurStrength,
+# SetBackgroundImage, `oma-broadcast effect ...`) is kept in the state file
+# and takes precedence over the keys of this section.
+
+# The effect applied to the camera image:
+#   "none"    the camera image as it is;
+#   "blur"    blur the background behind the person;
+#   "replace" replace the background with background_image.
+# Default: "none"
+mode = "none"
+
+# Strength of the "blur" effect, from 0.0 (lightest) to 1.0 (strongest).
+# Default: 0.5
+blur_strength = 0.5
+
+# Image shown behind the person with "replace": an absolute path to an
+# PNG or JPEG file (at most 32 MiB and 8192x8192 pixels; only the first
+# image of the file is used, so data after it, such as the gain map or video
+# of a phone photo, is ignored), scaled with a centre crop to fill the
+# frame. Required when mode = "replace".
+# The file is read when the effect starts; a file that is missing or cannot
+# be decoded then is an effect failure (see on_failure).
+# Default: "" (no image). Example:
+# background_image = "/home/user/Pictures/background.png"
+
+# What the virtual camera shows when the requested effect cannot run (the
+# SDK is missing, a model or the background image fails to load):
+#   "black" black frames: the camera is closed, the daemon reports the
+#           reason in its Error property and enters the error state, so
+#           the background is never shown. It retries on the next control
+#           call (e.g. selecting the effect again), configuration reload
+#           or camera change;
+#   "none"  the camera image without the effect, with the reason in Error.
+# Default: "black"
+on_failure = "black"

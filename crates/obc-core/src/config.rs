@@ -7,8 +7,9 @@
 //!   refused. The daemon reads it and never writes it. The commented
 //!   reference is `docs/config.example.toml`.
 //! - [`RuntimeState`]: `$XDG_STATE_HOME/oma-broadcast/state.toml`, what
-//!   changes at run time (`Enabled`, the selected camera). Written
-//!   atomically by the daemon; a damaged file falls back to the defaults.
+//!   changes at run time (`Enabled`, the selected camera, the effect and its
+//!   settings). Written atomically by the daemon; a damaged file falls back
+//!   to the defaults (the daemon then starts `off`).
 
 use std::ffi::OsString;
 use std::fmt;
@@ -21,8 +22,8 @@ use std::time::Duration;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    AspectPolicy, CameraSelector, ColourRange, DEFAULT_SINK_LABEL, ModeRequest, OutputContract,
-    OutputFormat, SinkSelector, fmt_size_rate,
+    AspectPolicy, CameraSelector, ColourRange, DEFAULT_SINK_LABEL, EffectMode, EffectOnFailure,
+    ModeRequest, OutputContract, OutputFormat, SinkSelector, fmt_size_rate,
 };
 
 /// Config schema version this build reads.
@@ -41,6 +42,10 @@ pub mod limits {
     pub const MAX_IDLE_GRACE_S: f64 = 3600.0;
     /// `lifecycle.start_debounce_ms`: 0 to this.
     pub const MAX_START_DEBOUNCE_MS: u64 = 10_000;
+    /// `effect.blur_strength`: this to [`MAX_BLUR_STRENGTH`].
+    pub const MIN_BLUR_STRENGTH: f64 = 0.0;
+    /// `effect.blur_strength`: [`MIN_BLUR_STRENGTH`] to this.
+    pub const MAX_BLUR_STRENGTH: f64 = 1.0;
 }
 
 /// A config file that cannot be used. The previous config stays in force.
@@ -96,6 +101,7 @@ pub struct Config {
     pub output: OutputConfig,
     pub loopback: LoopbackConfig,
     pub lifecycle: LifecycleConfig,
+    pub effect: EffectConfig,
 }
 
 /// `[camera]`: which camera, and what to ask it for.
@@ -193,6 +199,65 @@ impl Default for LifecycleConfig {
     }
 }
 
+/// `[effect]`: the video effect (see
+/// `docs/adr/0012-video-effects-and-maxine-backend.md`). Also the type of
+/// the effective settings the daemon runs with, once the state file's
+/// overrides are applied ([`RuntimeState::effect_over`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EffectConfig {
+    /// The effect: `none`, `blur` or `replace`.
+    #[serde(serialize_with = "ser_display", deserialize_with = "de_from_str")]
+    pub mode: EffectMode,
+    /// Strength of `blur`, 0.0 to 1.0.
+    #[serde(deserialize_with = "de_blur_strength")]
+    pub blur_strength: f64,
+    /// The image `replace` puts behind the person: an absolute path. Empty
+    /// (`None`) by default; required with `mode = "replace"`. Whether the
+    /// file exists is found out when the effect starts, not here.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_background_image"
+    )]
+    pub background_image: Option<PathBuf>,
+    /// What the virtual camera shows when the effect cannot run.
+    #[serde(serialize_with = "ser_display", deserialize_with = "de_from_str")]
+    pub on_failure: EffectOnFailure,
+}
+
+impl EffectConfig {
+    /// The default blur strength.
+    pub const DEFAULT_BLUR_STRENGTH: f64 = 0.5;
+
+    /// Checks the values and that `replace` has an image. The key named in
+    /// the error is the dotted config key.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let invalid =
+            |key: &'static str| move |reason: String| ConfigError::Invalid { key, reason };
+        check_blur_strength(self.blur_strength).map_err(invalid("effect.blur_strength"))?;
+        if let Some(p) = &self.background_image {
+            check_background_image(p).map_err(invalid("effect.background_image"))?;
+        }
+        if self.mode == EffectMode::Replace && self.background_image.is_none() {
+            return Err(invalid("effect.mode")(
+                "\"replace\" needs a background image: set effect.background_image".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for EffectConfig {
+    fn default() -> Self {
+        EffectConfig {
+            mode: EffectMode::None,
+            blur_strength: Self::DEFAULT_BLUR_STRENGTH,
+            background_image: None,
+            on_failure: EffectOnFailure::Black,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -201,6 +266,7 @@ impl Default for Config {
             output: OutputConfig::default(),
             loopback: LoopbackConfig::default(),
             lifecycle: LifecycleConfig::default(),
+            effect: EffectConfig::default(),
         }
     }
 }
@@ -222,9 +288,19 @@ impl Config {
     /// Parses and validates `text`; `path` only names the origin in errors.
     pub fn parse(text: &str, path: &Path) -> Result<Config, ConfigError> {
         let config: Config = toml::from_str(text).map_err(|e| parse_error(&e, text, path))?;
-        // Every key is checked while deserializing; this only catches what
-        // spans keys (nothing yet) and keeps the two paths in agreement.
-        config.validate()?;
+        // Every key is checked while deserializing; this catches what spans
+        // keys (`replace` without an image) and keeps the two paths in
+        // agreement. Its error names the file and the line of the key.
+        config.validate().map_err(|e| match e {
+            ConfigError::Invalid { key, reason } => ConfigError::Parse {
+                path: path.to_path_buf(),
+                line: line_of_key(text, key),
+                column: None,
+                key: Some(key.to_string()),
+                message: reason,
+            },
+            other => other,
+        })?;
         Ok(config)
     }
 
@@ -261,7 +337,7 @@ impl Config {
         check_idle_grace(self.lifecycle.idle_grace_s).map_err(invalid("lifecycle.idle_grace_s"))?;
         check_start_debounce(self.lifecycle.start_debounce_ms)
             .map_err(invalid("lifecycle.start_debounce_ms"))?;
-        Ok(())
+        self.effect.validate()
     }
 
     /// The output contract: `output.mode`'s size and rate, `output.format`,
@@ -359,6 +435,27 @@ fn key_at(text: &str, line: usize) -> Option<String> {
     })
 }
 
+/// The 1-based line of the dotted `key` (`table.key`, or a top-level key)
+/// in `text`, best effort: the line of `key = ...` inside `[table]`.
+fn line_of_key(text: &str, key: &str) -> Option<usize> {
+    let (table, bare) = key.rsplit_once('.').unwrap_or(("", key));
+    let mut current = "";
+    for (i, line) in text.lines().enumerate() {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix('[') {
+            current = rest.split(']').next().unwrap_or("").trim();
+            continue;
+        }
+        if current == table
+            && let Some((k, _)) = l.split_once('=')
+            && k.trim() == bare
+        {
+            return Some(i + 1);
+        }
+    }
+    None
+}
+
 fn check_version(v: u32) -> Result<(), String> {
     if v == CONFIG_VERSION {
         Ok(())
@@ -427,6 +524,29 @@ fn check_device(v: &Path) -> Result<(), String> {
     }
 }
 
+fn check_blur_strength(v: f64) -> Result<(), String> {
+    if v.is_finite() && (limits::MIN_BLUR_STRENGTH..=limits::MAX_BLUR_STRENGTH).contains(&v) {
+        Ok(())
+    } else {
+        Err(format!(
+            "must be between {} and {}, got {v}",
+            limits::MIN_BLUR_STRENGTH,
+            limits::MAX_BLUR_STRENGTH
+        ))
+    }
+}
+
+fn check_background_image(v: &Path) -> Result<(), String> {
+    if v.is_absolute() {
+        Ok(())
+    } else {
+        Err(format!(
+            "must be an absolute path (or empty), got {:?}",
+            v.display().to_string()
+        ))
+    }
+}
+
 /// A value checked by `check`; the error carries the span of the value.
 fn de_checked<'de, D, T>(d: D, check: fn(T) -> Result<(), String>) -> Result<T, D::Error>
 where
@@ -447,11 +567,21 @@ fn de_secs<'de, D: Deserializer<'de>>(
     d: D,
     check: fn(f64) -> Result<(), String>,
 ) -> Result<f64, D::Error> {
-    struct Secs;
-    impl serde::de::Visitor<'_> for Secs {
+    de_number(d, "a number of seconds", check)
+}
+
+/// A number, float or integer, checked by `check`; `what` is what the
+/// error says was expected.
+fn de_number<'de, D: Deserializer<'de>>(
+    d: D,
+    what: &'static str,
+    check: fn(f64) -> Result<(), String>,
+) -> Result<f64, D::Error> {
+    struct Number(&'static str);
+    impl serde::de::Visitor<'_> for Number {
         type Value = f64;
         fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("a number of seconds")
+            f.write_str(self.0)
         }
         fn visit_f64<E>(self, v: f64) -> Result<f64, E> {
             Ok(v)
@@ -463,9 +593,34 @@ fn de_secs<'de, D: Deserializer<'de>>(
             Ok(v as f64)
         }
     }
-    let v = d.deserialize_any(Secs)?;
+    let v = d.deserialize_any(Number(what))?;
     check(v).map_err(serde::de::Error::custom)?;
     Ok(v)
+}
+
+fn de_blur_strength<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    de_number(d, "a number from 0 to 1", check_blur_strength)
+}
+
+/// `effect.background_image`: empty is `None`, anything else an absolute
+/// path.
+fn de_background_image<'de, D: Deserializer<'de>>(d: D) -> Result<Option<PathBuf>, D::Error> {
+    let v = String::deserialize(d)?;
+    if v.is_empty() {
+        return Ok(None);
+    }
+    let p = PathBuf::from(v);
+    check_background_image(&p).map_err(serde::de::Error::custom)?;
+    Ok(Some(p))
+}
+
+/// The state file's effect: `Some` of a known name.
+fn de_state_effect<'de, D: Deserializer<'de>>(d: D) -> Result<Option<EffectMode>, D::Error> {
+    de_from_str(d).map(Some)
+}
+
+fn de_state_blur_strength<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    de_blur_strength(d).map(Some)
 }
 
 fn de_hold_timeout<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
@@ -546,7 +701,15 @@ pub fn selector_form(s: &CameraSelector) -> String {
 }
 
 /// What the daemon changes at run time and keeps across restarts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The effect keys override the config's `[effect]` keys of the same name
+/// while set (`None`: the config's value applies). A value that is not
+/// valid (an unknown effect, a strength outside 0 to 1, a relative image
+/// path) makes the whole file unparseable, so the daemon's fail-closed rule
+/// for a damaged state file applies: it starts `off`, with the camera
+/// closed, and never streams the raw image in place of an effect it could
+/// not read. Unknown keys (a newer daemon's) are ignored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RuntimeState {
     /// `Enabled` (false = the privacy state `off`).
@@ -554,6 +717,27 @@ pub struct RuntimeState {
     /// The camera chosen with `SelectCamera` / `NextCamera` (its id), if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camera: Option<String>,
+    /// The effect chosen with `SetEffect`.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_state_effect"
+    )]
+    pub effect: Option<EffectMode>,
+    /// The blur strength set with `SetBlurStrength`, 0.0 to 1.0.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_state_blur_strength"
+    )]
+    pub blur_strength: Option<f64>,
+    /// The background image set with `SetBackgroundImage`: an absolute
+    /// path. Clearing it (`SetBackgroundImage("")`) removes the override, so
+    /// the config's image applies again; an empty value in the file is read
+    /// the same way, as no override.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_background_image"
+    )]
+    pub background_image: Option<PathBuf>,
 }
 
 impl Default for RuntimeState {
@@ -561,11 +745,29 @@ impl Default for RuntimeState {
         RuntimeState {
             enabled: true,
             camera: None,
+            effect: None,
+            blur_strength: None,
+            background_image: None,
         }
     }
 }
 
 impl RuntimeState {
+    /// The effect settings in force: each key of `config` overridden by
+    /// this state's value when it has one (`on_failure` is config only).
+    pub fn effect_over(&self, config: &EffectConfig) -> EffectConfig {
+        EffectConfig {
+            mode: self.effect.unwrap_or(config.mode),
+            blur_strength: self.blur_strength.unwrap_or(config.blur_strength),
+            // An empty path is no override, as in the file.
+            background_image: match &self.background_image {
+                Some(p) if !p.as_os_str().is_empty() => Some(p.clone()),
+                _ => config.background_image.clone(),
+            },
+            on_failure: config.on_failure,
+        }
+    }
+
     /// Reads `path`. Never fails: a missing file is the defaults, and a file
     /// that cannot be read or parsed is the defaults plus a warning saying
     /// why.
@@ -784,6 +986,12 @@ device = "/dev/video11"
 [lifecycle]
 idle_grace_s = 0
 start_debounce_ms = 0
+
+[effect]
+mode = "replace"
+blur_strength = 1
+background_image = "/home/u/Pictures/office.png"
+on_failure = "none"
 "#;
         let c = parse(text).unwrap();
         assert_eq!(
@@ -813,6 +1021,15 @@ start_debounce_ms = 0
         assert_eq!(c.loopback.label, "My Cam");
         assert_eq!(c.idle_grace(), Duration::ZERO);
         assert_eq!(c.start_debounce(), Duration::ZERO);
+        assert_eq!(
+            c.effect,
+            EffectConfig {
+                mode: EffectMode::Replace,
+                blur_strength: 1.0,
+                background_image: Some("/home/u/Pictures/office.png".into()),
+                on_failure: EffectOnFailure::None,
+            }
+        );
 
         let again = parse(&c.to_toml()).unwrap();
         assert_eq!(again, c);
@@ -852,6 +1069,7 @@ start_debounce_ms = 0
             CameraSelector::Path("/dev/v4l/by-id/usb-046d_MX_Brio-video-index0".into()),
         ];
         expected.loopback.device = Some("/dev/video11".into());
+        expected.effect.background_image = Some("/home/user/Pictures/background.png".into());
         assert_eq!(c, expected);
         // Every key of the schema appears in the example.
         for key in [
@@ -867,6 +1085,9 @@ start_debounce_ms = 0
             "device",
             "idle_grace_s",
             "start_debounce_ms",
+            "blur_strength",
+            "background_image",
+            "on_failure",
         ] {
             assert!(
                 EXAMPLE.lines().any(|l| l
@@ -1005,6 +1226,51 @@ start_debounce_ms = 0
                 "lifecycle.idle_grace_s",
                 "expected a number of seconds",
             ),
+            (
+                "[effect]\nmode = \"sparkle\"",
+                "effect.mode",
+                "unknown effect \"sparkle\"",
+            ),
+            (
+                "[effect]\nblur_strength = 1.5",
+                "effect.blur_strength",
+                "between 0 and 1",
+            ),
+            (
+                "[effect]\nblur_strength = -0.1",
+                "effect.blur_strength",
+                "between 0 and 1",
+            ),
+            (
+                "[effect]\nblur_strength = nan",
+                "effect.blur_strength",
+                "between 0 and 1",
+            ),
+            (
+                "[effect]\nblur_strength = \"0.5\"",
+                "effect.blur_strength",
+                "expected a number from 0 to 1",
+            ),
+            (
+                "[effect]\nbackground_image = \"office.png\"",
+                "effect.background_image",
+                "absolute path",
+            ),
+            (
+                "[effect]\non_failure = \"raw\"",
+                "effect.on_failure",
+                "unsupported effect failure policy",
+            ),
+            (
+                "[effect]\nmode = \"replace\"",
+                "effect.mode",
+                "needs a background image",
+            ),
+            (
+                "[effect]\nbackground_image = \"\"\nmode = \"replace\"",
+                "effect.mode",
+                "needs a background image",
+            ),
         ];
         for (text, key, reason) in cases {
             let e = parse(text).unwrap_err();
@@ -1048,6 +1314,55 @@ start_debounce_ms = 0
         let mut c = Config::default();
         c.lifecycle.start_debounce_ms = 10_001;
         assert!(c.validate().is_err());
+        let mut c = Config::default();
+        c.effect.blur_strength = f64::INFINITY;
+        assert!(matches!(
+            c.validate(),
+            Err(ConfigError::Invalid {
+                key: "effect.blur_strength",
+                ..
+            })
+        ));
+        let mut c = Config::default();
+        c.effect.mode = EffectMode::Replace;
+        let e = c.validate().unwrap_err();
+        assert!(e.to_string().starts_with("effect.mode: "), "{e}");
+        c.effect.background_image = Some("relative.png".into());
+        assert!(matches!(
+            c.validate(),
+            Err(ConfigError::Invalid {
+                key: "effect.background_image",
+                ..
+            })
+        ));
+        c.effect.background_image = Some("/a/b.png".into());
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn effect_defaults_and_a_cross_key_error_names_the_file_and_line() {
+        let c = parse("[effect]\n").unwrap();
+        assert_eq!(c.effect, EffectConfig::default());
+        assert_eq!(c.effect.mode, EffectMode::None);
+        assert_eq!(c.effect.blur_strength, 0.5);
+        assert_eq!(c.effect.background_image, None);
+        assert_eq!(c.effect.on_failure, EffectOnFailure::Black);
+        // An empty image is the default, and is not written back.
+        let c = parse("[effect]\nbackground_image = \"\"\n").unwrap();
+        assert_eq!(c.effect.background_image, None);
+        assert!(!c.to_toml().contains("background_image"));
+        // A file that does not exist is accepted here: it is a run-time
+        // failure of the effect.
+        let c =
+            parse("[effect]\nmode = \"replace\"\nbackground_image = \"/nowhere/x.png\"\n").unwrap();
+        assert_eq!(parse(&c.to_toml()).unwrap(), c);
+        let e = parse_err("version = 1\n\n[effect]\nblur_strength = 0.2\nmode = \"replace\"\n");
+        assert!(
+            e.starts_with("/home/u/.config/oma-broadcast/config.toml:5: effect.mode: "),
+            "{e}"
+        );
+        assert!(!parse_err("[effect]\nstrength = 1\n").is_empty());
+        assert!(parse_err("[effect]\nstrength = 1\n").contains("unknown field `strength`"));
     }
 
     #[test]
@@ -1083,6 +1398,9 @@ start_debounce_ms = 0
         let st = RuntimeState {
             enabled: false,
             camera: Some("usb-046d_0944".into()),
+            effect: Some(EffectMode::Blur),
+            blur_strength: Some(0.25),
+            background_image: Some("/home/u/bg.png".into()),
         };
         st.save(&path).unwrap();
         assert_eq!(RuntimeState::load(&path), (st.clone(), None));
@@ -1107,6 +1425,7 @@ start_debounce_ms = 0
             .map(|i| RuntimeState {
                 enabled: i % 2 == 0,
                 camera: Some(format!("camera-{i}-{}", "x".repeat(i * 512))),
+                ..RuntimeState::default()
             })
             .collect();
         std::thread::scope(|scope| {
@@ -1192,6 +1511,107 @@ start_debounce_ms = 0
         let (st, warning) = RuntimeState::load(dir.path());
         assert_eq!(st, RuntimeState::default());
         assert!(warning.is_some());
+    }
+
+    #[test]
+    fn state_effect_keys_round_trip_and_override_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let st = RuntimeState {
+            effect: Some(EffectMode::Replace),
+            background_image: Some("/state/bg.png".into()),
+            ..RuntimeState::default()
+        };
+        st.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("effect = \"replace\""), "{text}");
+        assert!(
+            text.contains("background_image = \"/state/bg.png\""),
+            "{text}"
+        );
+        assert_eq!(RuntimeState::load(&path), (st.clone(), None));
+        // No image override: no key written.
+        let cleared = RuntimeState {
+            effect: Some(EffectMode::Replace),
+            ..RuntimeState::default()
+        };
+        cleared.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("background_image"), "{text}");
+        // An empty image in the file (as an older daemon wrote for a
+        // cleared one) is no override either.
+        fs::write(&path, "enabled = true\nbackground_image = \"\"\n").unwrap();
+        let (read, warning) = RuntimeState::load(&path);
+        assert_eq!(warning, None);
+        assert_eq!(read.background_image, None);
+
+        let config = EffectConfig {
+            mode: EffectMode::Blur,
+            blur_strength: 0.8,
+            background_image: Some("/cfg/bg.png".into()),
+            on_failure: EffectOnFailure::None,
+        };
+        // Nothing set: the config.
+        assert_eq!(RuntimeState::default().effect_over(&config), config);
+        // Each key set: the state's value.
+        let over = RuntimeState {
+            effect: Some(EffectMode::None),
+            blur_strength: Some(0.1),
+            background_image: Some("/state/bg.png".into()),
+            ..RuntimeState::default()
+        }
+        .effect_over(&config);
+        assert_eq!(
+            over,
+            EffectConfig {
+                mode: EffectMode::None,
+                blur_strength: 0.1,
+                background_image: Some("/state/bg.png".into()),
+                on_failure: EffectOnFailure::None,
+            }
+        );
+        // No image in the state: the config's image applies.
+        assert_eq!(
+            cleared.effect_over(&config).background_image,
+            Some("/cfg/bg.png".into())
+        );
+        assert_eq!(cleared.effect_over(&config).mode, EffectMode::Replace);
+        assert_eq!(
+            read.effect_over(&config).background_image,
+            Some("/cfg/bg.png".into())
+        );
+        let empty = RuntimeState {
+            background_image: Some(PathBuf::new()),
+            ..RuntimeState::default()
+        };
+        assert_eq!(
+            empty.effect_over(&config).background_image,
+            Some("/cfg/bg.png".into())
+        );
+        // An integer strength is a number too.
+        fs::write(&path, "enabled = true\nblur_strength = 1\n").unwrap();
+        assert_eq!(RuntimeState::load(&path).0.blur_strength, Some(1.0));
+    }
+
+    #[test]
+    fn an_invalid_effect_value_damages_the_whole_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        for text in [
+            "enabled = true\neffect = \"sparkle\"\n",
+            "enabled = true\neffect = 1\n",
+            "enabled = true\nblur_strength = 2.0\n",
+            "enabled = true\nblur_strength = nan\n",
+            "enabled = true\nbackground_image = \"bg.png\"\n",
+        ] {
+            fs::write(&path, text).unwrap();
+            let (st, warning) = RuntimeState::load(&path);
+            // The defaults plus a warning: the daemon then fails closed
+            // (off), it never runs without the effect it could not read.
+            assert_eq!(st, RuntimeState::default(), "{text}");
+            let w = warning.unwrap_or_else(|| panic!("no warning for {text:?}"));
+            assert!(w.contains("state.toml:2:"), "{w}");
+        }
     }
 
     #[test]

@@ -9,8 +9,11 @@
 //!   and scale to the canonical frame (NV12 in CUDA memory at the output
 //!   size, with the contract's colour label), written into a latest-frame
 //!   slot ([`slot`]).
-//! * **Process** ([`process`]): the effect chain on canonical frames, at the
-//!   head of the output pipeline; empty by default.
+//! * **Process** ([`process`], [`effect`]): the effect on canonical frames,
+//!   at the head of the output pipeline: nothing by default, or the
+//!   `obceffect` element when [`OutputConfig::effect`] is set, whose effect
+//!   (`none`, `blur`, `replace`) changes while the output streams
+//!   ([`Output::set_effect`]; `docs/adr/0012-video-effects-and-maxine-backend.md`).
 //! * **Output** ([`output`]), one long-lived pipeline per sink with a fixed
 //!   contract ([`obc_core::OutputContract`]): a clock thread ([`clock`])
 //!   emits one frame per period (fresh, repeated, or a black placeholder),
@@ -29,6 +32,7 @@ pub mod clock;
 pub mod controls;
 pub mod device;
 pub mod discovery;
+pub mod effect;
 pub mod frame;
 pub mod geometry;
 pub mod gpu;
@@ -52,6 +56,10 @@ pub use device::{
     CameraChoice, DeviceInfo, DiscoverySource, SelectError, select_camera, select_sink,
 };
 pub use discovery::{DiscoveryRoute, list_cameras, scan_sysfs};
+pub use effect::{
+    EffectBackend, EffectFallback, EffectKind, EffectSettings, EffectStats, EffectStatus,
+    effect_backend_available,
+};
 pub use frame::{Canonical, Frame, FrameWriter};
 pub use geometry::{Crop, crop_for};
 pub use ingest::{ControlReport, Ingest, IngestConfig};

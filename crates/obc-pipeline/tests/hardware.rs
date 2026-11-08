@@ -29,6 +29,12 @@
 //!   `output_restarts_while_a_consumer_holds_the_loopback` needs no camera
 //!   and requires `OBC_TEST_SINK`, never the labelled default.
 //!
+//! * The effect tests: `gpu_an_output_switches_effects_while_streaming`
+//!   uses the fake backend of `gst-obc/tests/support/fake_backend.rs` (GPU
+//!   only); `maxine_*` needs `OBC_TEST_CAMERA` and the NVIDIA Maxine SDK
+//!   (`MAXINE_VFX_ROOT`, `source tools/maxine-probe/env.sh`) run under the
+//!   os-release override (`docs/setup/maxine.md`, section 7).
+//!
 //! Check `fuser -v /dev/video*` first. Examples:
 //! `cargo test -p obc-pipeline --test hardware -- --ignored gpu_ --test-threads=1` (GPU only);
 //! `OBC_TEST_CAMERA=1234:abcd OBC_TEST_SINK=/dev/video11 cargo test -p obc-pipeline --test hardware -- --ignored --test-threads=1` (all).
@@ -49,10 +55,15 @@ use obc_pipeline::ingest::{CUDA_CONTEXT_TYPE, canonical_tail, cuda_context_objec
 use obc_pipeline::output::SINK_COLORIMETRY;
 use obc_pipeline::pipeline::names;
 use obc_pipeline::{
-    Canonical, DeviceInfo, DiscoveryRoute, EmitInfo, GpuStage, Ingest, IngestConfig, LinkCaps,
-    MediaPipeline, Output, OutputConfig, OutputCounts, OutputSink, PipelineError, Session,
-    TickKind, all_cuda_between, crop_for, list_cameras, scan_sysfs, select_camera, select_sink,
+    Canonical, DeviceInfo, DiscoveryRoute, EffectBackend, EffectKind, EffectSettings, EffectStatus,
+    EmitInfo, GpuStage, Ingest, IngestConfig, LinkCaps, MediaPipeline, Output, OutputConfig,
+    OutputCounts, OutputSink, PipelineError, Session, TickKind, all_cuda_between, crop_for,
+    list_cameras, scan_sysfs, select_camera, select_sink,
 };
+
+/// The fake effect backend shared with gst-obc's GPU tests.
+#[path = "../../gst-obc/tests/support/fake_backend.rs"]
+mod fake_backend;
 
 /// The camera can only be opened by one test at a time.
 static CAMERA: Mutex<()> = Mutex::new(());
@@ -2766,4 +2777,365 @@ fn a_consumer_keeps_one_stream_across_idle_active_idle() {
         "consumer silent {consumer_silence:?}"
     );
     assert!(sink_silence <= limit, "writer sink silent {sink_silence:?}");
+}
+
+/// A PNG background of `width` x `height` (a test pattern) in `dir`.
+fn background_png(dir: &std::path::Path, width: u32, height: u32) -> std::path::PathBuf {
+    let path = dir.join("background.png");
+    let p = gst::parse::launch(&format!(
+        "videotestsrc num-buffers=1 pattern=smpte ! video/x-raw,width={width},height={height} \
+         ! pngenc snapshot=true ! filesink location={}",
+        path.display()
+    ))
+    .unwrap();
+    p.set_state(gst::State::Playing).unwrap();
+    let m = p
+        .bus()
+        .unwrap()
+        .timed_pop_filtered(
+            gst::ClockTime::from_seconds(10),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        )
+        .expect("the background was written");
+    assert_eq!(m.type_(), gst::MessageType::Eos, "{m:?}");
+    p.set_state(gst::State::Null).unwrap();
+    path
+}
+
+/// Waits (draining both buses) until the output's effect is ready; panics
+/// with the status otherwise.
+fn wait_effect_ready(
+    session: &Session,
+    out_log: &mut BusLog,
+    in_log: &mut BusLog,
+    timeout: Duration,
+) {
+    let ready = run_until(session, out_log, in_log, timeout, |s| {
+        matches!(
+            s.output().effect_status(),
+            EffectStatus::Ready | EffectStatus::Failed(_)
+        )
+    });
+    assert!(
+        ready && session.output().effect_status() == EffectStatus::Ready,
+        "effect {:?}; {out_log:?} {in_log:?}",
+        session.output().effect_status()
+    );
+}
+
+/// GPU only, fake effect backend: an output built with the effect element
+/// switches none -> blur -> replace -> none while a source streams. The
+/// sink sees the source (luma 235), black (16) only while the first effect
+/// loads, the fake blur (200) and replace (100), never the source while an
+/// effect is requested, and one caps event in all.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_an_output_switches_effects_while_streaming() {
+    use fake_backend::{FAKE_BLUR_Y, FAKE_REPLACE_Y, FakeConfig, FakeFactory, FakeLog};
+    init();
+    require_elements(&[
+        "videotestsrc",
+        "cudaupload",
+        "cudaconvertscale",
+        "videocrop",
+        "cudadownload",
+        "pngenc",
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let bg = background_png(dir.path(), 640, 480);
+    let fake = FakeFactory::new(FakeConfig {
+        load_delay: Duration::from_millis(800),
+        switch_delay: Duration::from_millis(20),
+        ..FakeConfig::default()
+    });
+    let mut cfg = OutputConfig::new(OutputContract::default(), OutputSink::Fake);
+    cfg.effect = Some(EffectSettings::default());
+    cfg.effect_backend = EffectBackend::new(fake.clone());
+    let mut output = Output::build(cfg).expect("build output");
+    assert!(output.pipeline().element(names::EFFECT).is_some());
+    let trace = trace_output(&mut output);
+    let caps_events = count_caps_events(output.pipeline(), names::LOOPBACK);
+    let mut session = Session::new(output).expect("start output");
+    session
+        .switch_to(test_pattern_ingest(session.output(), 30, 30 * 30))
+        .expect("start source");
+    let (mut out_log, mut in_log) = (BusLog::default(), BusLog::default());
+    assert!(run_until(
+        &session,
+        &mut out_log,
+        &mut in_log,
+        Duration::from_secs(10),
+        |s| s.output().counts().fresh > 10
+    ));
+    let len = || trace.lock().unwrap().centre_luma.len();
+    let lumas = |from: usize, to: usize| -> Vec<u8> {
+        trace.lock().unwrap().centre_luma[from..to]
+            .iter()
+            .map(|(_, v)| *v)
+            .collect()
+    };
+    let idle = |session: &Session, out_log: &mut BusLog, in_log: &mut BusLog, ms: u64| {
+        run_until(session, out_log, in_log, Duration::from_millis(ms), |_| {
+            false
+        });
+    };
+    idle(&session, &mut out_log, &mut in_log, 500);
+    let none_end = len();
+    assert!(
+        lumas(none_end - 10, none_end).iter().all(|v| *v == 235),
+        "{:?}",
+        lumas(none_end - 10, none_end)
+    );
+
+    // none -> blur.
+    session
+        .output()
+        .set_effect(&EffectSettings::of(EffectKind::Blur))
+        .unwrap();
+    let a = len();
+    wait_effect_ready(&session, &mut out_log, &mut in_log, Duration::from_secs(10));
+    let b = len();
+    idle(&session, &mut out_log, &mut in_log, 500);
+    let c = len();
+    let warm = lumas(a, b);
+    let first_black = warm.iter().position(|v| *v == 16).expect("black warm-up");
+    assert!(first_black <= 1, "at most the frame in flight: {warm:?}");
+    assert!(
+        warm[first_black..]
+            .iter()
+            .all(|v| *v == 16 || *v == FAKE_BLUR_Y),
+        "{warm:?}"
+    );
+    assert!(
+        warm.len() >= 15,
+        "the 800 ms load is about 24 frames: {warm:?}"
+    );
+    assert!(lumas(b, c).iter().all(|v| *v == FAKE_BLUR_Y));
+
+    // blur -> replace.
+    session
+        .output()
+        .set_effect(&EffectSettings {
+            background: Some(bg.clone()),
+            ..EffectSettings::of(EffectKind::Replace)
+        })
+        .unwrap();
+    let d = len();
+    wait_effect_ready(&session, &mut out_log, &mut in_log, Duration::from_secs(10));
+    idle(&session, &mut out_log, &mut in_log, 500);
+    let e = len();
+    let switch = lumas(d, e);
+    let blur_run = switch.iter().take_while(|v| **v == FAKE_BLUR_Y).count();
+    assert!(
+        switch[blur_run..].iter().all(|v| *v == FAKE_REPLACE_Y) && blur_run < switch.len(),
+        "{switch:?}"
+    );
+
+    // replace -> none: the source at once (after the frame in flight).
+    session
+        .output()
+        .set_effect(&EffectSettings::default())
+        .unwrap();
+    let f = len();
+    idle(&session, &mut out_log, &mut in_log, 500);
+    let g = len();
+    let back = lumas(f, g);
+    let first_input = back.iter().position(|v| *v == 235).expect("the source");
+    assert!(first_input <= 1, "{back:?}");
+    assert!(back[first_input..].iter().all(|v| *v == 235), "{back:?}");
+    assert_eq!(session.output().effect_status(), EffectStatus::Off);
+
+    let stats = session.output().effect_stats().unwrap();
+    let counts = session.output().counts();
+    session.stop().expect("teardown");
+    assert!(
+        out_log.errors.is_empty() && in_log.errors.is_empty(),
+        "{out_log:?} {in_log:?}"
+    );
+    eprintln!("{stats:?}; {counts:?}");
+    assert_eq!(caps_events.load(Ordering::Relaxed), 1, "one negotiation");
+    assert!(stats.frames_processed > 20 && stats.frames_black >= 15);
+    assert!(stats.frames_passthrough > 20);
+    assert_eq!(counts.queue_dropped, 0);
+    assert_eq!(FakeLog::get(&fake.log.wrong_context), 0);
+    assert_eq!(FakeLog::get(&fake.log.wrong_stream), 0);
+    assert_eq!(
+        FakeLog::get(&fake.log.drops),
+        1,
+        "the instance went with the output"
+    );
+}
+
+/// `nvidia-smi`'s compute processes with their used memory in MiB.
+fn cuda_apps() -> Vec<(u32, u64)> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-compute-apps=pid,used_memory",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .expect("this test needs nvidia-smi (it comes with the NVIDIA driver)");
+    assert!(out.status.success(), "nvidia-smi failed: {out:?}");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split(',').map(str::trim);
+            Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// End to end with the Maxine backend: camera -> session -> output with the
+/// effect blur from the start, then replace, then none. Every phase keeps
+/// the contract rate at the sink; the effect becomes ready, its statistics
+/// are sane, and after the output stops this process holds no CUDA context
+/// (so its GPU memory is back).
+///
+/// Run with the SDK set up and the os-release shim (`make -C
+/// tools/os-release-shim`), e.g. `source tools/maxine-probe/env.sh;
+/// OMA_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release
+/// CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env
+/// LD_PRELOAD=$PWD/target/os-release-shim/os-release-shim.so" cargo test -p
+/// obc-pipeline --test hardware -- --ignored maxine_ --test-threads=1`.
+#[test]
+#[ignore = "needs OBC_TEST_CAMERA, an NVIDIA GPU and the NVIDIA Maxine VFX SDK with the os-release override"]
+fn maxine_effects_end_to_end_keep_the_rate_and_release_the_gpu() {
+    init();
+    let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(reason) = obc_pipeline::effect_backend_available() {
+        panic!(
+            "this test needs the Maxine SDK: {reason} (set MAXINE_VFX_ROOT and source \
+             tools/maxine-probe/env.sh)"
+        );
+    }
+    let sel = test_camera();
+    let (camera, choice) = select_with(&sel, &test_mode(), DiscoveryRoute::Auto);
+    let dir = tempfile::tempdir().unwrap();
+    let bg = background_png(dir.path(), 2560, 1440);
+    let pid = std::process::id();
+    assert!(
+        !cuda_apps().iter().any(|(p, _)| *p == pid),
+        "this process already holds a CUDA context"
+    );
+    let contract = OutputContract::default();
+    let mut cfg = OutputConfig::new(contract, OutputSink::Fake);
+    cfg.effect = Some(EffectSettings::of(EffectKind::Blur));
+    let output = Output::build(cfg).expect("build output");
+    let arrivals = record_arrival_times(output.pipeline(), names::LOOPBACK);
+    let caps_events = count_caps_events(output.pipeline(), names::LOOPBACK);
+    let mut session = Session::new(output).expect("start output");
+    session
+        .switch_to_camera(&IngestConfig::new(camera.path.clone(), choice.mode))
+        .expect("start ingest");
+    let (mut out_log, mut in_log) = (BusLog::default(), BusLog::default());
+    let t_start = Instant::now();
+    wait_effect_ready(&session, &mut out_log, &mut in_log, Duration::from_secs(30));
+    let ready_after = t_start.elapsed();
+    // The effect may be ready before the camera delivers.
+    assert!(
+        run_until(
+            &session,
+            &mut out_log,
+            &mut in_log,
+            Duration::from_secs(15),
+            |s| s.output().counts().fresh > 30
+        ),
+        "no camera frames: {out_log:?} {in_log:?}"
+    );
+
+    // Frames at the sink over `secs` seconds, after a settling second.
+    let phase = |session: &Session, out_log: &mut BusLog, in_log: &mut BusLog, secs: u64| {
+        run_until(session, out_log, in_log, Duration::from_secs(1), |_| false);
+        let c0 = session.output().counts();
+        let from = Instant::now();
+        run_until(session, out_log, in_log, Duration::from_secs(secs), |_| {
+            false
+        });
+        let to = Instant::now();
+        let c1 = session.output().counts();
+        let n = arrivals
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| **t >= from && **t < to)
+            .count();
+        (
+            n,
+            c1.placeholder - c0.placeholder,
+            c1.queue_dropped - c0.queue_dropped,
+        )
+    };
+    let mut report = Vec::new();
+    let (n, ph, dropped) = phase(&session, &mut out_log, &mut in_log, 5);
+    let blur_stats = session.output().effect_stats().unwrap();
+    let during = cuda_apps();
+    report.push(("blur", n, ph, dropped));
+
+    session
+        .output()
+        .set_effect(&EffectSettings {
+            background: Some(bg),
+            ..EffectSettings::of(EffectKind::Replace)
+        })
+        .unwrap();
+    wait_effect_ready(&session, &mut out_log, &mut in_log, Duration::from_secs(15));
+    let (n, ph, dropped) = phase(&session, &mut out_log, &mut in_log, 5);
+    let replace_stats = session.output().effect_stats().unwrap();
+    report.push(("replace", n, ph, dropped));
+
+    session
+        .output()
+        .set_effect(&EffectSettings::default())
+        .unwrap();
+    let (n, ph, dropped) = phase(&session, &mut out_log, &mut in_log, 5);
+    let none_stats = session.output().effect_stats().unwrap();
+    report.push(("none", n, ph, dropped));
+    session.stop().expect("teardown");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut after = cuda_apps();
+    while after.iter().any(|(p, _)| *p == pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        after = cuda_apps();
+    }
+    eprintln!(
+        "ready after {ready_after:?}; phases (effect, sink frames in 5 s, placeholders, \
+         queue drops): {report:?}"
+    );
+    eprintln!("blur: {blur_stats:?}");
+    eprintln!("replace: {replace_stats:?}");
+    eprintln!("none: {none_stats:?}");
+    eprintln!("CUDA apps while streaming {during:?}; after teardown {after:?}");
+    assert!(
+        out_log.errors.is_empty() && in_log.errors.is_empty(),
+        "{out_log:?} {in_log:?}"
+    );
+    for (name, n, ph, dropped) in &report {
+        assert!(
+            (147..=153).contains(n),
+            "{name}: {n} frames in 5 s at 30 fps"
+        );
+        assert_eq!(*ph, 0, "{name}: placeholders");
+        assert_eq!(*dropped, 0, "{name}: queue drops");
+    }
+    assert_eq!(caps_events.load(Ordering::Relaxed), 1, "one negotiation");
+    for s in [&blur_stats, &replace_stats] {
+        assert!(s.frames_processed > 100, "{s:?}");
+        let (p50, p95) = (s.gpu_ms_p50.unwrap(), s.gpu_ms_p95.unwrap());
+        assert!(p50 > 0.0 && p95 >= p50 && p95 < 20.0, "{s:?}");
+        assert!(s.last_load_ms.is_some() && s.cuda_active, "{s:?}");
+    }
+    assert!(
+        replace_stats.last_load_reused,
+        "the switch reused the model"
+    );
+    assert!(none_stats.frames_passthrough > 100);
+    assert!(
+        during.iter().any(|(p, _)| *p == pid),
+        "streaming holds one CUDA context: {during:?}"
+    );
+    assert!(
+        !after.iter().any(|(p, _)| *p == pid),
+        "a CUDA context outlived the output: {after:?}"
+    );
 }

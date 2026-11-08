@@ -5,7 +5,7 @@ use obc_ipc::{CameraInfo, Snapshot};
 
 /// The JSON names of the scalar fields of a `state` line, in output order
 /// (`docs/cli-json.md`).
-pub const STATE_FIELDS: [&str; 9] = [
+pub const STATE_FIELDS: [&str; 11] = [
     "state",
     "enabled",
     "error",
@@ -14,6 +14,8 @@ pub const STATE_FIELDS: [&str; 9] = [
     "consumers",
     "output_mode",
     "effect",
+    "blur_strength",
+    "background_image",
     "interface_revision",
 ];
 
@@ -56,6 +58,9 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Changes {
         old.consumers != new.consumers,
         old.output_mode != new.output_mode,
         old.effect != new.effect,
+        // Bitwise, so that a NaN does not count as a change every time.
+        old.blur_strength.to_bits() != new.blur_strength.to_bits(),
+        old.background_image != new.background_image,
         old.interface_revision != new.interface_revision,
     ];
     Changes {
@@ -110,15 +115,27 @@ mod tests {
         // A renamed active camera changes the derived name and the list.
         let mut new = old.clone();
         new.cameras[0].name = "A2".into();
+        new.effect = "blur".into();
+        new.blur_strength = 0.8;
+        new.background_image = "/bg.png".into();
         assert_eq!(
             diff(&old, &new),
             Changes {
-                fields: vec!["active_camera_name"],
+                fields: vec![
+                    "active_camera_name",
+                    "effect",
+                    "blur_strength",
+                    "background_image"
+                ],
                 cameras: true
             }
         );
         assert_eq!(active_camera_name(&new), Some("A2"));
         new.active_camera = "gone".into();
         assert_eq!(active_camera_name(&new), None);
+
+        let mut nan = old.clone();
+        nan.blur_strength = f64::NAN;
+        assert!(diff(&nan, &nan.clone()).is_empty());
     }
 }

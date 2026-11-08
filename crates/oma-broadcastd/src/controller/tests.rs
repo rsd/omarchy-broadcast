@@ -203,7 +203,7 @@ fn disabled_in_the_state_file_starts_off_with_the_writer_running() {
     let state = dir.path().join("state.toml");
     RuntimeState {
         enabled: false,
-        camera: None,
+        ..RuntimeState::default()
     }
     .save(&state)
     .unwrap();
@@ -935,6 +935,9 @@ fn every_transition_of_the_lifecycle_is_announced_in_order() {
             Change::ActiveCamera(a) => format!("active={a}"),
             Change::Error(e) => format!("error={e}"),
             Change::OutputMode(m) => format!("mode={m}"),
+            Change::Effect(e) => format!("effect={e}"),
+            Change::BlurStrength(v) => format!("strength={v}"),
+            Change::BackgroundImage(p) => format!("image={p}"),
         })
         .collect();
     assert_eq!(
@@ -1295,4 +1298,562 @@ fn a_writer_rebuild_recounts_the_holders_and_waits_for_them() {
         h.world().writer.as_ref().unwrap().0,
         PathBuf::from("/dev/video12")
     );
+}
+
+// ---- effects (docs/adr/0012-video-effects-and-maxine-backend.md) ----
+
+impl H {
+    fn set_effect(&mut self, name: &str, ms: u64) -> Result<(), IpcError> {
+        let name = name.to_string();
+        self.call(|r| Command::SetEffect(name, r), ms)
+    }
+
+    fn set_strength(&mut self, v: f64, ms: u64) -> Result<(), IpcError> {
+        self.call(|r| Command::SetBlurStrength(v, r), ms)
+    }
+
+    fn set_image(&mut self, path: &str, ms: u64) -> Result<(), IpcError> {
+        let path = path.to_string();
+        self.call(|r| Command::SetBackgroundImage(path, r), ms)
+    }
+
+    /// A background image file in the test's directory.
+    fn image(&self) -> String {
+        let p = self._dir.path().join("office.png");
+        fs::write(&p, b"an image").unwrap();
+        p.display().to_string()
+    }
+
+    /// The effect the running session applies.
+    fn applied(&self) -> Option<EffectMode> {
+        self.world().effect.as_ref().map(|e| e.mode)
+    }
+}
+
+fn effect_changes(changes: &[Change]) -> Vec<String> {
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::Effect(e) => Some(format!("effect={e}")),
+            Change::BlurStrength(v) => Some(format!("strength={v}")),
+            Change::BackgroundImage(p) => Some(format!("image={p}")),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_effect_methods_persist_publish_and_survive_a_restart() {
+    let mut h = H::new("", |_| {});
+    let s = h.snap();
+    assert_eq!(
+        (
+            s.effect.as_str(),
+            s.blur_strength,
+            s.background_image.as_str()
+        ),
+        ("none", 0.5, "")
+    );
+    let image = h.image();
+    h.set_strength(0.2, 0).unwrap();
+    h.set_image(&image, 0).unwrap();
+    h.set_effect("replace", 0).unwrap();
+    let s = h.snap();
+    assert_eq!(
+        (
+            s.effect.as_str(),
+            s.blur_strength,
+            s.background_image.as_str()
+        ),
+        ("replace", 0.2, image.as_str())
+    );
+    assert_eq!(
+        effect_changes(&h.drain().0),
+        [
+            "strength=0.2".to_string(),
+            format!("image={image}"),
+            "effect=replace".into()
+        ]
+    );
+    let st = h.persisted();
+    assert_eq!(st.effect, Some(EffectMode::Replace));
+    assert_eq!(st.blur_strength, Some(0.2));
+    assert_eq!(st.background_image, Some(PathBuf::from(&image)));
+    assert!(st.enabled, "the other keys are kept");
+    // Setting the same value again announces nothing.
+    h.set_effect("replace", 0).unwrap();
+    assert!(effect_changes(&h.drain().0).is_empty());
+    // A restart serves the saved effect, before and after the controller
+    // runs.
+    let pre = preliminary_snapshot(&h.paths);
+    assert_eq!((pre.effect.as_str(), pre.blur_strength), ("replace", 0.2));
+    h.restart();
+    assert_eq!(h.snap().effect, "replace");
+    assert_eq!(h.snap().background_image, image);
+    // An empty image removes the run-time image (once another effect is
+    // selected; the config has none to fall back to), and the state file no
+    // longer holds one.
+    h.set_effect("blur", 0).unwrap();
+    h.set_image("", 0).unwrap();
+    assert_eq!(h.snap().background_image, "");
+    assert_eq!(h.persisted().background_image, None);
+}
+
+#[test]
+fn clearing_the_image_brings_back_the_configs_image() {
+    let cfg_image = "/cfg/office.png";
+    let config = format!("[effect]\nmode = \"replace\"\nbackground_image = \"{cfg_image}\"\n");
+    let mut h = H::new(&config, |_| {});
+    let image = h.image();
+    h.set_image(&image, 0).unwrap();
+    assert_eq!(h.snap().background_image, image);
+    // Clearing is allowed under replace: the config's image takes over.
+    h.set_image("", 0).unwrap();
+    assert_eq!(h.snap().background_image, cfg_image);
+    assert_eq!(h.snap().effect, "replace");
+    assert_eq!(h.persisted().background_image, None);
+    // An empty image in the state file (as an earlier daemon wrote for a
+    // cleared one) is no override: the config's image applies, no error.
+    fs::write(
+        &h.paths.state,
+        "enabled = true\neffect = \"replace\"\nbackground_image = \"\"\n",
+    )
+    .unwrap();
+    h.restart();
+    assert_eq!(h.snap().background_image, cfg_image);
+    assert_eq!(h.snap().error, "");
+    h.activate(1000);
+    assert_eq!(h.applied(), Some(EffectMode::Replace));
+    assert_eq!(h.snap().error, "");
+    // A reload that adds a config image under a state that never set one
+    // uses it.
+    let mut h = H::new("", |_| {});
+    h.set_effect("blur", 0).unwrap();
+    h.set_image("", 0).unwrap();
+    h.reload(&config, 1000).unwrap();
+    assert_eq!(h.snap().background_image, cfg_image);
+}
+
+#[test]
+fn a_repeated_setting_neither_rewrites_the_state_nor_reloads_the_effect() {
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |_| {});
+    h.activate(0);
+    h.tick(500);
+    assert_eq!(h.ctrl.effect_seen, Some(EffectStatus::Ready));
+    // A strength change reaches the session; the effect stays ready (its
+    // load is not reported again).
+    h.set_effect("blur", 900).unwrap();
+    assert_eq!(h.ctrl.effect_seen, Some(EffectStatus::Ready));
+    h.set_strength(0.4, 1000).unwrap();
+    assert_eq!(h.persisted().blur_strength, Some(0.4));
+    assert_eq!(h.ctrl.effect_seen, Some(EffectStatus::Ready));
+    let sets = h.world().effect_sets.len();
+    assert_eq!(h.world().effect.as_ref().unwrap().blur_strength, 0.4);
+    // The same strength again: no write, no call to the session.
+    fs::remove_file(&h.paths.state).unwrap();
+    h.set_strength(0.4, 1100).unwrap();
+    h.set_effect("blur", 1200).unwrap();
+    h.tick(1500);
+    assert!(!h.paths.state.exists(), "the state file was rewritten");
+    assert_eq!(h.world().effect_sets.len(), sets);
+    assert_eq!(h.ctrl.effect_seen, Some(EffectStatus::Ready));
+    // A reload of the same config does not reload the effect either.
+    h.reload("[effect]\nmode = \"blur\"\n", 2000).unwrap();
+    assert_eq!(h.world().effect_sets.len(), sets);
+    assert_eq!(h.ctrl.effect_seen, Some(EffectStatus::Ready));
+    // Another effect is saved, given to the session and followed.
+    h.set_effect("none", 3000).unwrap();
+    assert!(h.paths.state.exists());
+    assert_eq!(h.world().effect_sets.len(), sets + 1);
+    assert_eq!(h.ctrl.effect_seen, Some(EffectStatus::Off));
+}
+
+#[test]
+fn an_effect_error_with_none_ends_with_the_session() {
+    let config = "[effect]\nmode = \"blur\"\non_failure = \"none\"\n\
+                  [lifecycle]\nidle_grace_s = 0.0\nstart_debounce_ms = 0\n";
+    let mut h = H::new(config, |_| {});
+    h.activate(0);
+    h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
+    h.tick(1000);
+    assert_eq!(h.state(), State::Active);
+    assert!(h.snap().error.contains("without the effect"));
+    // The consumer leaves: idle, and the effect's error is gone with it.
+    h.consumers(0, 2000);
+    h.tick(3000);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.snap().error, "");
+    // Off ends it too.
+    h.activate(4000);
+    h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
+    h.tick(5000);
+    assert!(h.snap().error.contains("without the effect"));
+    h.call(|r| Command::SetEnabled(false, r), 6000).unwrap();
+    assert_eq!(h.state(), State::Off);
+    assert_eq!(h.snap().error, "");
+}
+
+#[test]
+fn a_fifo_in_place_of_the_image_is_refused_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("bg.png");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: mkfifo(3) on a NUL-terminated path we own.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = fifo.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(check_background_file(&path));
+    });
+    // A blocking open would wait for a writer forever.
+    let got = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("checking a FIFO blocked");
+    let e = got.unwrap_err();
+    assert!(e.contains("not a regular file"), "{e}");
+    // A regular file is still accepted, an absent one is unreadable.
+    let file = dir.path().join("ok.png");
+    fs::write(&file, b"x").unwrap();
+    check_background_file(&file).unwrap();
+    let e = check_background_file(&dir.path().join("none.png")).unwrap_err();
+    assert!(e.contains("unreadable"), "{e}");
+}
+
+#[test]
+fn the_state_file_takes_precedence_over_the_config_across_reloads() {
+    let image = "/cfg/office.png";
+    let config = format!(
+        "[effect]\nmode = \"replace\"\nblur_strength = 0.9\nbackground_image = \"{image}\"\n"
+    );
+    let mut h = H::new(&config, |_| {});
+    let s = h.snap();
+    assert_eq!(
+        (
+            s.effect.as_str(),
+            s.blur_strength,
+            s.background_image.as_str()
+        ),
+        ("replace", 0.9, image)
+    );
+    h.set_effect("blur", 0).unwrap();
+    assert_eq!(h.snap().effect, "blur");
+    // A reload keeps the state's effect, and takes the config's keys the
+    // state does not set.
+    h.reload(
+        &format!(
+            "[effect]\nmode = \"none\"\nblur_strength = 0.3\nbackground_image = \"{image}\"\n"
+        ),
+        1000,
+    )
+    .unwrap();
+    assert_eq!(h.snap().effect, "blur");
+    assert_eq!(h.snap().blur_strength, 0.3);
+    // While active, a reload that changes the effect in force applies it
+    // to the session without restarting it.
+    h.activate(2000);
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    assert_eq!(
+        h.world().session.as_ref().unwrap().0.effect.blur_strength,
+        0.3
+    );
+    h.reload("[effect]\nblur_strength = 0.6\n", 3000).unwrap();
+    assert_eq!(h.snap().blur_strength, 0.6);
+    let w = h.world();
+    assert_eq!(w.session_starts, 1);
+    assert_eq!(w.effect.as_ref().unwrap().blur_strength, 0.6);
+}
+
+#[test]
+fn invalid_effect_arguments_are_refused_and_change_nothing() {
+    let mut h = H::new("", |_| {});
+    let image = h.image();
+    let invalid = |r: Result<(), IpcError>| match r {
+        Err(IpcError::InvalidArgument(m)) => m,
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    };
+    assert!(invalid(h.set_effect("sparkle", 0)).contains("unknown effect"));
+    assert!(invalid(h.set_effect("replace", 0)).contains("needs a background image"));
+    for v in [-0.01, 1.01, f64::NAN, f64::NEG_INFINITY] {
+        assert!(
+            invalid(h.set_strength(v, 0)).contains("outside 0 to 1"),
+            "{v}"
+        );
+    }
+    assert!(invalid(h.set_image("office.png", 0)).contains("not absolute"));
+    let dir = h._dir.path().display().to_string();
+    assert!(invalid(h.set_image(&dir, 0)).contains("not a regular file"));
+    assert!(invalid(h.set_image("/no/such/file.png", 0)).contains("unreadable"));
+    // Larger than 32 MiB (a sparse file).
+    let big = h._dir.path().join("big.png");
+    fs::File::create(&big)
+        .unwrap()
+        .set_len(MAX_BACKGROUND_BYTES + 1)
+        .unwrap();
+    assert!(invalid(h.set_image(&big.display().to_string(), 0)).contains("32 MiB"));
+    // Exactly the limit is accepted.
+    let edge = h._dir.path().join("edge.png");
+    fs::File::create(&edge)
+        .unwrap()
+        .set_len(MAX_BACKGROUND_BYTES)
+        .unwrap();
+    h.set_image(&edge.display().to_string(), 0).unwrap();
+    h.set_image(&image, 0).unwrap();
+    h.set_effect("replace", 0).unwrap();
+    assert!(invalid(h.set_image("", 0)).contains("select another effect"));
+    // Nothing of the refused calls reached the state file.
+    let st = h.persisted();
+    assert_eq!(st.effect, Some(EffectMode::Replace));
+    assert_eq!(st.blur_strength, None);
+    assert_eq!(st.background_image, Some(PathBuf::from(&image)));
+}
+
+#[test]
+fn switching_effects_while_active_never_restarts_the_session() {
+    let mut h = H::new("", |_| {});
+    let image = h.image();
+    h.activate(0);
+    assert_eq!(h.applied(), Some(EffectMode::None));
+    h.drain();
+    h.set_effect("blur", 1000).unwrap();
+    h.set_strength(0.8, 1100).unwrap();
+    h.set_image(&image, 1200).unwrap();
+    h.set_effect("replace", 1300).unwrap();
+    h.set_effect("none", 1400).unwrap();
+    h.set_effect("blur", 1500).unwrap();
+    h.tick(2000);
+    assert_eq!(h.state(), State::Active);
+    assert!(h.states().is_empty(), "the state never left active");
+    let w = h.world();
+    assert_eq!((w.session_starts, w.session_stops), (1, 0));
+    assert_eq!(w.ingests, ["usb-a"], "the camera was not reopened");
+    let modes: Vec<EffectMode> = w.effect_sets.iter().map(|e| e.mode).collect();
+    use EffectMode::{Blur, None as Off, Replace};
+    assert_eq!(modes, [Blur, Blur, Blur, Replace, Off, Blur]);
+    assert_eq!(w.effect_sets[1].blur_strength, 0.8);
+    assert_eq!(
+        w.effect_sets[3].background_image,
+        Some(PathBuf::from(&image))
+    );
+}
+
+#[test]
+fn off_and_idle_stop_the_session_whatever_the_effect() {
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |_| {});
+    h.activate(0);
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    h.call(|r| Command::SetEnabled(false, r), 1000).unwrap();
+    assert_eq!(h.state(), State::Off);
+    assert!(h.world().session.is_none());
+    assert_eq!(h.snap().effect, "blur", "the selection stays");
+    h.call(|r| Command::SetEnabled(true, r), 2000).unwrap();
+    h.tick(2300);
+    assert_eq!(h.state(), State::Active);
+    h.consumers(0, 3000);
+    h.tick(3000 + 5000);
+    assert_eq!(h.state(), State::Idle);
+    assert!(h.world().session.is_none());
+    assert_eq!(h.world().effect, None, "the models went with the session");
+    // An effect selected while idle starts nothing.
+    h.set_effect("none", 9000).unwrap();
+    assert_eq!(h.world().session_starts, 2);
+}
+
+#[test]
+fn an_unavailable_effect_with_black_is_an_error_before_the_camera_opens() {
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+        w.effect_unavailable = Some("libVideoFX.so not found".into())
+    });
+    h.activate_expecting_error();
+    assert_eq!(
+        h.snap().error,
+        "effect blur unavailable: libVideoFX.so not found"
+    );
+    {
+        let w = h.world();
+        assert_eq!(w.session_starts, 0, "no output was built");
+        assert!(w.ingests.is_empty(), "no camera was opened");
+        assert_eq!(w.effect_probes, 1);
+    }
+    // No retry by itself, and no spinning.
+    h.tick(10_000);
+    assert_eq!(h.world().effect_probes, 1);
+    // A control call retries: still unavailable, still error.
+    h.set_effect("blur", 11_000).unwrap();
+    assert_eq!(h.state(), State::Error);
+    assert_eq!(h.world().effect_probes, 2);
+    // Selecting no effect: the camera starts.
+    h.set_effect("none", 12_000).unwrap();
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.snap().error, "");
+    assert_eq!(h.applied(), Some(EffectMode::None));
+}
+
+#[test]
+fn an_unavailable_effect_with_none_streams_without_it_and_says_why() {
+    let mut h = H::new("[effect]\nmode = \"blur\"\non_failure = \"none\"\n", |w| {
+        w.effect_unavailable = Some("libVideoFX.so not found".into())
+    });
+    h.activate(0);
+    assert_eq!(h.applied(), Some(EffectMode::None), "started without it");
+    let e = h.snap().error;
+    assert!(
+        e.starts_with("effect blur unavailable: libVideoFX.so not found;")
+            && e.contains("without the effect"),
+        "{e}"
+    );
+    assert_eq!(h.snap().effect, "blur", "the selection is still blur");
+    h.tick(2000);
+    assert_eq!(h.snap().error, e, "the error stays while it streams");
+    // A replace with no image cannot run either: the same rule.
+    let mut h = H::new("[effect]\non_failure = \"none\"\n", |_| {});
+    h.runtime_effect(EffectMode::Replace);
+    h.activate(0);
+    assert!(
+        h.snap().error.contains("needs a background image"),
+        "{}",
+        h.snap().error
+    );
+}
+
+impl H {
+    /// Puts `mode` in the state file, as an earlier run would have, and
+    /// restarts on it.
+    fn runtime_effect(&mut self, mode: EffectMode) {
+        RuntimeState {
+            effect: Some(mode),
+            ..RuntimeState::default()
+        }
+        .save(&self.paths.state)
+        .unwrap();
+        self.restart();
+    }
+}
+
+#[test]
+fn an_effect_failure_with_black_stops_the_session_in_error_and_a_call_retries() {
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| w.effect_slow = true);
+    h.activate(0);
+    assert_eq!(h.world().effect_status, EffectStatus::Loading);
+    h.world().effect_status = EffectStatus::Ready;
+    h.tick(500);
+    h.drain();
+    // The effect fails while streaming (a frame, the GPU).
+    h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
+    h.tick(1000);
+    assert_eq!(h.state(), State::Error);
+    assert_eq!(
+        h.snap().error,
+        "effect blur unavailable: processing a frame failed"
+    );
+    assert!(h.world().session.is_none(), "camera closed, GPU released");
+    assert_eq!(h.world().writer_starts, 1, "the writer keeps the stream");
+    assert_eq!(h.states(), [State::Error]);
+    // Nothing restarts by itself while the consumer stays.
+    h.tick(20_000);
+    assert_eq!(h.world().session_starts, 1);
+    // A control call leaves error: the session starts again.
+    h.set_strength(0.4, 21_000).unwrap();
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().session_starts, 2);
+    assert_eq!(h.snap().error, "");
+    // A failure at load, at start, is an error in the same step.
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+        w.effect_fail = Some("the model did not load".into())
+    });
+    h.activate_expecting_error();
+    assert_eq!(
+        h.snap().error,
+        "effect blur unavailable: the model did not load"
+    );
+    assert!(h.world().session.is_none());
+    // The consumer leaves: idle, and back: tried again.
+    h.consumers(0, 1000);
+    assert_eq!(h.state(), State::Idle);
+    h.world().effect_fail = None;
+    h.activate(2000);
+    assert_eq!(h.snap().error, "");
+}
+
+#[test]
+fn an_effect_failure_with_none_keeps_streaming_with_the_reason_in_error() {
+    let mut h = H::new("[effect]\nmode = \"blur\"\non_failure = \"none\"\n", |_| {});
+    h.activate(0);
+    h.drain();
+    h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
+    h.tick(1000);
+    assert_eq!(h.state(), State::Active);
+    assert!(h.world().session.is_some());
+    let e = h.snap().error;
+    assert!(
+        e.starts_with("effect blur unavailable: processing a frame failed;"),
+        "{e}"
+    );
+    // Reported once, not on every poll.
+    h.tick(1250);
+    h.tick(1500);
+    let errors = h
+        .drain()
+        .0
+        .into_iter()
+        .filter(|c| matches!(c, Change::Error(_)))
+        .count();
+    assert_eq!(errors, 1);
+    // A retry that fails the same way is reported again.
+    h.world().effect_fail = Some("processing a frame failed".into());
+    h.set_effect("blur", 1800).unwrap();
+    assert_eq!(h.snap().error, e, "the same failure, reported again");
+    h.world().effect_fail = None;
+    // A call retries the effect on the running session; ready clears it.
+    h.set_effect("blur", 2000).unwrap();
+    assert_eq!(h.snap().error, "");
+    assert_eq!(h.world().session_starts, 1);
+    assert_eq!(h.world().effect_status, EffectStatus::Ready);
+    // A setting the session refuses (the image vanished): Failed, and the
+    // stream goes on without the effect.
+    let image = h.image();
+    h.set_image(&image, 3000).unwrap();
+    h.world().fail_set_effect = Some("the background image is unreadable".into());
+    match h.set_effect("replace", 3100) {
+        Err(IpcError::Failed(m)) => assert!(m.contains("unreadable"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.applied(), Some(EffectMode::None));
+    assert!(h.snap().error.contains("unreadable"));
+}
+
+#[test]
+fn a_setting_the_session_refuses_with_black_is_an_error() {
+    let mut h = H::new("", |_| {});
+    let image = h.image();
+    h.set_image(&image, 0).unwrap();
+    h.activate(0);
+    h.world().fail_set_effect = Some("the background image is unreadable".into());
+    match h.set_effect("replace", 1000) {
+        Err(IpcError::Failed(m)) => assert_eq!(
+            m,
+            "effect replace unavailable: the background image is unreadable"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(h.state(), State::Error);
+    assert!(h.world().session.is_none());
+    assert_eq!(h.persisted().effect, Some(EffectMode::Replace), "saved");
+}
+
+#[test]
+fn an_effect_value_the_daemon_does_not_accept_fails_closed() {
+    let mut h = H::new("", |_| {});
+    std::fs::create_dir_all(h.paths.state.parent().unwrap()).unwrap();
+    std::fs::write(&h.paths.state, "enabled = true\neffect = \"sparkle\"\n").unwrap();
+    h.restart();
+    assert_eq!(h.state(), State::Off);
+    assert!(
+        h.snap().error.contains("unknown effect"),
+        "{}",
+        h.snap().error
+    );
+    h.consumers(1, 0);
+    h.tick(1000);
+    assert_eq!(h.world().session_starts, 0, "no raw image instead");
 }

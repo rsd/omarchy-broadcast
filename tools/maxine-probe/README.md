@@ -29,8 +29,11 @@ source tools/maxine-probe/env.sh
 P=$MAXINE_VFX_ROOT
 gcc -O2 -o /tmp/probe tools/maxine-probe/probe.c \
   -I$P/include -I$P/external/cuda/include -L$P/lib -lVideoFX -lNVCVImage -lcuda
-# On a distribution the SDK does not recognise, run under the os-release override:
-unshare -Urm sh -c "mount --bind tools/maxine-probe/fake-os-release /etc/os-release && /tmp/probe $P/lib/models"
+# On a distribution the SDK does not recognise, run with the os-release shim
+# (make -C tools/os-release-shim); set LD_PRELOAD on the probe itself:
+env LD_PRELOAD=$PWD/target/os-release-shim/os-release-shim.so \
+    OMA_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release \
+    /tmp/probe $P/lib/models
 ```
 
 Arguments: `probe [model_dir] [aigs_mode]`. `model_dir` defaults to `./models`, which usually does not exist; pass `$MAXINE_VFX_ROOT/lib/models`. `aigs_mode` defaults to 0.

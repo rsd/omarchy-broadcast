@@ -30,7 +30,20 @@
 //!
 //! A state file that cannot be read or parsed fails closed: the daemon
 //! starts `off`, with `Error` naming the file, and does not rewrite the
-//! file until `SetEnabled` is called.
+//! file until `SetEnabled` is called. That includes a state file with an
+//! effect value this daemon does not accept: it never streams the raw
+//! image in place of an effect it could not read.
+//!
+//! The effect (`docs/adr/0012-video-effects-and-maxine-backend.md`): the
+//! effective settings are the state file's (set by `SetEffect`,
+//! `SetBlurStrength`, `SetBackgroundImage`) over the config's `[effect]`.
+//! A change applies to the running session without restarting it. When the
+//! effect cannot run, `effect.on_failure` decides: `black` is a fault (the
+//! session stops, so the camera is closed and the GPU released, and the
+//! writer's placeholder keeps the stream black); `none` keeps streaming
+//! without the effect, with the reason in `Error`. An effect that is
+//! unavailable before the session starts is found out before the camera
+//! is opened.
 //!
 //! The streaming camera is followed by its device node, not by its id: an
 //! id can change between two scans of the same camera (udev adds the
@@ -43,12 +56,12 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use obc_core::OutputContract;
-use obc_core::config::{Config, RuntimeState};
+use obc_core::config::{Config, EffectConfig, RuntimeState};
+use obc_core::{EffectMode, EffectOnFailure, OutputContract};
 use obc_ipc::{CameraInfo, INTERFACE_REVISION, IpcError, Snapshot, State, Stats};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::backend::{Failure, MediaBackend, SessionParams};
+use crate::backend::{EffectReport, EffectStatus, Failure, MediaBackend, SessionParams};
 use crate::camera::{self, Camera};
 use crate::{debug, error, info, warning};
 
@@ -65,6 +78,11 @@ const POLL_STARTING: Duration = Duration::from_millis(50);
 const POLL_RUNNING: Duration = Duration::from_millis(250);
 /// The longest sleep with nothing scheduled.
 const IDLE_WAKE: Duration = Duration::from_secs(60);
+/// How often the effect's GPU time is logged (debug) while it runs.
+const EFFECT_LOG_PERIOD: Duration = Duration::from_secs(60);
+/// The largest background image `SetBackgroundImage` accepts (the effect
+/// element's limit).
+pub const MAX_BACKGROUND_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The reply channel of a D-Bus method.
 pub type Reply = tokio::sync::oneshot::Sender<Result<(), IpcError>>;
@@ -75,6 +93,12 @@ pub enum Command {
     SetEnabled(bool, Reply),
     SelectCamera(String, Reply),
     NextCamera(Reply),
+    /// `SetEffect(s)`.
+    SetEffect(String, Reply),
+    /// `SetBlurStrength(d)`.
+    SetBlurStrength(f64, Reply),
+    /// `SetBackgroundImage(s)` (empty: clear it).
+    SetBackgroundImage(String, Reply),
     /// `ReloadConfig()` (with its reply) or SIGHUP (without).
     ReloadConfig(Option<Reply>),
     /// The consumer watcher's count of processes holding the loopback.
@@ -94,6 +118,9 @@ pub enum Change {
     Cameras(Vec<CameraInfo>),
     ActiveCamera(String),
     OutputMode(String),
+    Effect(String),
+    BlurStrength(f64),
+    BackgroundImage(String),
     Consumers(u32),
 }
 
@@ -107,6 +134,9 @@ impl Change {
             Change::Cameras(_) => "Cameras",
             Change::ActiveCamera(_) => "ActiveCamera",
             Change::OutputMode(_) => "OutputMode",
+            Change::Effect(_) => "Effect",
+            Change::BlurStrength(_) => "BlurStrength",
+            Change::BackgroundImage(_) => "BackgroundImage",
             Change::Consumers(_) => "Consumers",
         }
     }
@@ -217,6 +247,15 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Vec<Change> {
     if old.output_mode != new.output_mode {
         out.push(Change::OutputMode(new.output_mode.clone()));
     }
+    if old.effect != new.effect {
+        out.push(Change::Effect(new.effect.clone()));
+    }
+    if old.blur_strength.to_bits() != new.blur_strength.to_bits() {
+        out.push(Change::BlurStrength(new.blur_strength));
+    }
+    if old.background_image != new.background_image {
+        out.push(Change::BackgroundImage(new.background_image.clone()));
+    }
     if old.consumers != new.consumers {
         out.push(Change::Consumers(new.consumers));
     }
@@ -247,8 +286,11 @@ pub struct Paths {
 }
 
 /// The runtime state from `path`. A file that cannot be read or parsed
-/// fails closed: not enabled, no selection, and the second value is the
-/// `Error` text naming the file (`None`: the file is fine or absent).
+/// (including one with an effect value that is not accepted) fails closed:
+/// not enabled, no selection, no effect override (the config's effect is
+/// the one in force, and `SetEnabled` rewrites the file without the saved
+/// effect choice), and the second value is the `Error` text naming the file
+/// and saying so (`None`: the file is fine or absent).
 pub fn load_runtime_state(path: &Path) -> (RuntimeState, Option<String>) {
     match RuntimeState::load(path) {
         (state, None) => (state, None),
@@ -257,11 +299,12 @@ pub fn load_runtime_state(path: &Path) -> (RuntimeState, Option<String>) {
             (
                 RuntimeState {
                     enabled: false,
-                    camera: None,
+                    ..RuntimeState::default()
                 },
                 Some(format!(
                     "{why}; the virtual camera stays off until SetEnabled is called, which \
-                     rewrites the state file"
+                     rewrites the state file; any effect choice saved there is dropped in favour \
+                     of the configuration's effect"
                 )),
             )
         }
@@ -273,6 +316,7 @@ pub fn load_runtime_state(path: &Path) -> (RuntimeState, Option<String>) {
 pub fn preliminary_snapshot(paths: &Paths) -> Snapshot {
     let config = Config::load(&paths.config).unwrap_or_default();
     let (runtime, damaged) = load_runtime_state(&paths.state);
+    let effect = runtime.effect_over(&config.effect);
     Snapshot {
         state: if runtime.enabled {
             State::Idle
@@ -284,9 +328,73 @@ pub fn preliminary_snapshot(paths: &Paths) -> Snapshot {
         cameras: Vec::new(),
         active_camera: String::new(),
         output_mode: output_mode_string(&config.output_contract()),
-        effect: "none".into(),
+        effect: effect.mode.as_str().into(),
+        blur_strength: effect.blur_strength,
+        background_image: image_string(&effect),
         consumers: 0,
         interface_revision: INTERFACE_REVISION,
+    }
+}
+
+/// `BackgroundImage`: the path, or empty.
+fn image_string(effect: &EffectConfig) -> String {
+    effect
+        .background_image
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default()
+}
+
+/// Checks a background image for `SetBackgroundImage`: an absolute path to
+/// a readable regular file of at most [`MAX_BACKGROUND_BYTES`]. Whether it
+/// decodes is found out when the effect loads it.
+///
+/// The file is opened without blocking (`O_NONBLOCK`: a FIFO, or a device,
+/// put in its place cannot hang the controller's thread; `O_NOCTTY`; std
+/// adds `O_CLOEXEC`) and then examined through that handle, so what is
+/// checked is what was opened, not what the path names a moment later.
+pub fn check_background_file(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !path.is_absolute() {
+        return Err(format!(
+            "the background image path {} is not absolute",
+            path.display()
+        ));
+    }
+    let unreadable =
+        |e: std::io::Error| format!("the background image {} is unreadable: {e}", path.display());
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+        .map_err(unreadable)?;
+    let meta = file.metadata().map_err(unreadable)?;
+    if !meta.is_file() {
+        return Err(format!(
+            "the background image {} is not a regular file",
+            path.display()
+        ));
+    }
+    if meta.len() > MAX_BACKGROUND_BYTES {
+        return Err(format!(
+            "the background image {} is {} bytes, more than the {} MiB limit",
+            path.display(),
+            meta.len(),
+            MAX_BACKGROUND_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(())
+}
+
+/// The `Error` text of an effect that cannot run.
+fn effect_failure_text(effect: &EffectConfig, reason: &str) -> String {
+    match effect.on_failure {
+        EffectOnFailure::Black => format!("effect {} unavailable: {reason}", effect.mode),
+        EffectOnFailure::None => format!(
+            "effect {} unavailable: {reason}; the camera image is shown without the effect \
+             (effect.on_failure = \"none\")",
+            effect.mode
+        ),
     }
 }
 
@@ -341,6 +449,23 @@ pub struct Controller<B: MediaBackend> {
     /// The state file could not be read or parsed: why (the `Error` text).
     /// The daemon runs `off` and leaves the file alone until `SetEnabled`.
     state_damaged: Option<String>,
+    /// The effect cannot run and `effect.on_failure` is `none`: the
+    /// session streams without it, and this is the `Error` text. Cleared
+    /// when the effect becomes ready, by an effect method, a reload, the
+    /// next session start or the end of the session.
+    effect_failure: Option<String>,
+    /// The effect status last polled in this session (`None`: not polled
+    /// since the session started or the effect was last applied, so the
+    /// next status is reported even if it is the same failure again).
+    effect_seen: Option<EffectStatus>,
+    /// The effect has been polled in this session.
+    effect_polled: bool,
+    /// The effect settings the running session was last given (`None`: no
+    /// session). Only a change of the effect or its image, or a failure,
+    /// starts a new load to follow; a strength change does not.
+    effect_applied: Option<EffectConfig>,
+    /// When the effect's GPU time is logged next.
+    effect_log_at: Option<Instant>,
     consumers: u32,
     /// Since when a consumer has been present (debounce).
     present_since: Option<Instant>,
@@ -382,11 +507,12 @@ impl<B: MediaBackend> Controller<B> {
             None => error,
         };
         info!(
-            "config {}, state {} (enabled: {}, camera: {})",
+            "config {}, state {} (enabled: {}, camera: {}, effect: {})",
             paths.config.display(),
             paths.state.display(),
             runtime.enabled,
-            runtime.camera.as_deref().unwrap_or("not selected")
+            runtime.camera.as_deref().unwrap_or("not selected"),
+            runtime.effect_over(&config.effect).mode
         );
         let mut c = Controller {
             backend,
@@ -402,6 +528,11 @@ impl<B: MediaBackend> Controller<B> {
             fault: None,
             error,
             state_damaged,
+            effect_failure: None,
+            effect_seen: None,
+            effect_polled: false,
+            effect_applied: None,
+            effect_log_at: None,
             consumers: 0,
             present_since: None,
             absent_since: None,
@@ -430,6 +561,18 @@ impl<B: MediaBackend> Controller<B> {
             }
             Command::NextCamera(reply) => {
                 let res = self.next_camera(now);
+                let _ = reply.send(res);
+            }
+            Command::SetEffect(name, reply) => {
+                let res = self.set_effect(&name, now);
+                let _ = reply.send(res);
+            }
+            Command::SetBlurStrength(v, reply) => {
+                let res = self.set_blur_strength(v, now);
+                let _ = reply.send(res);
+            }
+            Command::SetBackgroundImage(path, reply) => {
+                let res = self.set_background_image(&path, now);
                 let _ = reply.send(res);
             }
             Command::ReloadConfig(reply) => {
@@ -543,7 +686,15 @@ impl<B: MediaBackend> Controller<B> {
         if let Some(f) = &self.fault {
             return f.clone();
         }
+        if let Some(e) = &self.effect_failure {
+            return e.clone();
+        }
         self.state_damaged.clone().unwrap_or_default()
+    }
+
+    /// The effect settings in force: the state file's over the config's.
+    pub fn effect(&self) -> EffectConfig {
+        self.runtime.effect_over(&self.config.effect)
     }
 
     /// The camera of the running session, found by its node.
@@ -602,6 +753,7 @@ impl<B: MediaBackend> Controller<B> {
             hold_timeout: self.config.hold_timeout(),
             input_gap: self.config.input_gap(),
             fixed_framerate: self.config.camera.fixed_framerate,
+            effect: self.effect(),
         }
     }
 
@@ -620,6 +772,7 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     fn publish(&mut self) {
+        let effect = self.effect();
         let snap = Snapshot {
             state: self.state(),
             error: self.error.clone(),
@@ -627,7 +780,9 @@ impl<B: MediaBackend> Controller<B> {
             cameras: self.cameras.iter().map(Camera::info).collect(),
             active_camera: self.active_camera(),
             output_mode: output_mode_string(&self.output_contract()),
-            effect: "none".into(),
+            effect: effect.mode.as_str().into(),
+            blur_strength: effect.blur_strength,
+            background_image: image_string(&effect),
             consumers: self.consumers,
             interface_revision: INTERFACE_REVISION,
         };
@@ -764,6 +919,9 @@ impl<B: MediaBackend> Controller<B> {
             self.camera_failed(msg, now);
             return;
         }
+        if self.poll_effect(now) {
+            return;
+        }
         let Some(s) = &self.session else { return };
         if let Some(since) = s.awaiting {
             if self.backend.first_frame() {
@@ -788,6 +946,82 @@ impl<B: MediaBackend> Controller<B> {
                     START_TIMEOUT.as_secs()
                 );
                 self.camera_failed(msg, now);
+            }
+        }
+    }
+
+    /// Follows the running session's effect: logs its transitions and acts
+    /// on a failure ([`Self::effect_failed`]). Returns whether the session
+    /// was stopped.
+    fn poll_effect(&mut self, now: Instant) -> bool {
+        let Some(EffectReport {
+            status,
+            load_ms,
+            reused,
+            gpu_ms_p50,
+        }) = self.backend.effect_report()
+        else {
+            return false;
+        };
+        let mode = self.effect().mode;
+        if status == EffectStatus::Ready
+            && let Some(gpu) = gpu_ms_p50
+            && self.effect_log_at.is_none_or(|t| now >= t)
+        {
+            if self.effect_log_at.is_some() {
+                debug!("effect {mode}: {gpu:.2} ms of GPU time per frame (median)");
+            }
+            self.effect_log_at = Some(now + EFFECT_LOG_PERIOD);
+        }
+        if self.effect_seen.as_ref() == Some(&status) {
+            return false;
+        }
+        self.effect_seen = Some(status.clone());
+        let first = !std::mem::replace(&mut self.effect_polled, true);
+        match status {
+            EffectStatus::Off => {
+                if !first {
+                    info!("effect off: the camera image passes through");
+                }
+            }
+            EffectStatus::Loading => info!("effect {mode}: loading"),
+            EffectStatus::Ready => {
+                let took = match (load_ms, reused) {
+                    (Some(ms), true) => format!(" (models reused, {ms:.0} ms)"),
+                    (Some(ms), false) => format!(" (loaded in {ms:.0} ms)"),
+                    (None, _) => String::new(),
+                };
+                info!("effect {mode} ready{took}");
+                if let Some(old) = self.effect_failure.take()
+                    && self.error == old
+                {
+                    self.error = self.standing_error();
+                }
+            }
+            EffectStatus::Failed(reason) => return self.effect_failed(&reason),
+        }
+        false
+    }
+
+    /// The running session's effect cannot run, for `reason`. With
+    /// `on_failure = "black"` the session stops and the state is `error`;
+    /// with `"none"` it keeps streaming without the effect and `Error` says
+    /// why. Returns whether the session was stopped.
+    fn effect_failed(&mut self, reason: &str) -> bool {
+        let effect = self.effect();
+        let msg = effect_failure_text(&effect, reason);
+        match effect.on_failure {
+            EffectOnFailure::Black => {
+                info!("stopping the camera: the effect cannot run");
+                self.drop_session();
+                self.set_fault(msg);
+                true
+            }
+            EffectOnFailure::None => {
+                warning!("{msg}");
+                self.error = msg.clone();
+                self.effect_failure = Some(msg);
+                false
             }
         }
     }
@@ -936,6 +1170,30 @@ impl<B: MediaBackend> Controller<B> {
             self.set_fault("no camera is available".into());
             return;
         };
+        // The effect is checked before the camera is opened: with
+        // `on_failure = "black"`, one that cannot run is a fault and the
+        // camera stays closed.
+        let mut params = self.session_params();
+        self.effect_failure = None;
+        if params.effect.mode != EffectMode::None
+            && let Err(reason) = self.effect_check(&params.effect)
+        {
+            let msg = effect_failure_text(&params.effect, &reason);
+            match params.effect.on_failure {
+                EffectOnFailure::Black => {
+                    self.set_fault(msg);
+                    return;
+                }
+                EffectOnFailure::None => {
+                    warning!("{msg}");
+                    self.error = msg.clone();
+                    self.effect_failure = Some(msg);
+                    params.effect.mode = EffectMode::None;
+                }
+            }
+        }
+        let first = first.clone();
+        self.effect_applied = Some(params.effect.clone());
         info!("an application opened the virtual camera: starting");
         self.session = Some(Streaming {
             camera: first.id.clone(),
@@ -946,7 +1204,7 @@ impl<B: MediaBackend> Controller<B> {
         });
         // `starting` is announced before the (slow) start.
         self.publish();
-        if let Err(e) = self.backend.start_session(&self.session_params()) {
+        if let Err(e) = self.backend.start_session(&params) {
             self.drop_session();
             self.set_fault(e);
             return;
@@ -964,11 +1222,32 @@ impl<B: MediaBackend> Controller<B> {
         }
     }
 
+    /// Whether `effect` can run: `replace` has an image, and the backend
+    /// says the effect is available.
+    fn effect_check(&mut self, effect: &EffectConfig) -> Result<(), String> {
+        if effect.mode == EffectMode::Replace && effect.background_image.is_none() {
+            return Err("the replace effect needs a background image".into());
+        }
+        self.backend.effect_available(effect)
+    }
+
+    /// Stops the session. An effect failure of that session (with
+    /// `on_failure = "none"`) ends with it: its `Error` gives way to the
+    /// causes still standing.
     fn drop_session(&mut self) {
         if self.session.take().is_some() {
             self.backend.stop_session();
         }
         self.next_stats = None;
+        self.effect_seen = None;
+        self.effect_polled = false;
+        self.effect_applied = None;
+        self.effect_log_at = None;
+        if let Some(e) = self.effect_failure.take()
+            && self.error == e
+        {
+            self.error = self.standing_error();
+        }
     }
 
     fn set_fault(&mut self, msg: String) {
@@ -1103,8 +1382,9 @@ impl<B: MediaBackend> Controller<B> {
     fn set_enabled(&mut self, on: bool, now: Instant) -> Result<(), IpcError> {
         info!("{}", if on { "enabled" } else { "disabled (off)" });
         self.runtime.enabled = on;
-        self.fault = None;
-        // The camera is released before anything is written to disk.
+        let fault = self.fault.take();
+        // The camera is released before anything is written to disk (which
+        // also ends an effect failure of the session).
         if !on {
             self.drop_session();
         }
@@ -1112,9 +1392,8 @@ impl<B: MediaBackend> Controller<B> {
         // damaged.
         let damaged = self.state_damaged.take();
         let saved = self.save_state();
-        if let Some(d) = damaged
-            && self.error == d
-        {
+        // The errors whose cause is gone give way to those still standing.
+        if [fault, damaged].iter().flatten().any(|e| *e == self.error) {
             self.error = self.standing_error();
         }
         self.reconcile(now);
@@ -1168,6 +1447,130 @@ impl<B: MediaBackend> Controller<B> {
         res
     }
 
+    fn set_effect(&mut self, name: &str, now: Instant) -> Result<(), IpcError> {
+        let mode: EffectMode = name
+            .parse()
+            .map_err(|e: obc_core::CoreError| IpcError::InvalidArgument(e.to_string()))?;
+        if mode == EffectMode::Replace && self.effect().background_image.is_none() {
+            return Err(IpcError::InvalidArgument(
+                "the replace effect needs a background image: set one with SetBackgroundImage \
+                 first"
+                    .into(),
+            ));
+        }
+        info!("effect selected: {mode}");
+        let changed = self.runtime.effect.replace(mode) != Some(mode);
+        self.effect_changed(changed, now)
+    }
+
+    fn set_blur_strength(&mut self, strength: f64, now: Instant) -> Result<(), IpcError> {
+        if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+            return Err(IpcError::InvalidArgument(format!(
+                "blur strength {strength} is outside 0 to 1"
+            )));
+        }
+        // A slider sends many: not worth the journal.
+        debug!("blur strength: {strength}");
+        let changed = self.runtime.blur_strength.replace(strength) != Some(strength);
+        self.effect_changed(changed, now)
+    }
+
+    /// `SetBackgroundImage`: a path sets the run-time image; `""` removes
+    /// it, so the config's image (if any) applies again. Removing it is
+    /// refused while `replace` is in force and the config has no image to
+    /// fall back to.
+    fn set_background_image(&mut self, path: &str, now: Instant) -> Result<(), IpcError> {
+        let new = if path.is_empty() {
+            if self.effect().mode == EffectMode::Replace
+                && self.config.effect.background_image.is_none()
+            {
+                return Err(IpcError::InvalidArgument(
+                    "the replace effect is selected and needs its background image: select \
+                     another effect before clearing it"
+                        .into(),
+                ));
+            }
+            match &self.config.effect.background_image {
+                Some(p) => info!(
+                    "background image cleared: the configuration's ({}) applies",
+                    p.display()
+                ),
+                None => info!("background image cleared"),
+            }
+            None
+        } else {
+            let p = PathBuf::from(path);
+            check_background_file(&p).map_err(IpcError::InvalidArgument)?;
+            info!("background image: {}", p.display());
+            Some(p)
+        };
+        let changed = self.runtime.background_image != new;
+        self.runtime.background_image = new;
+        self.effect_changed(changed, now)
+    }
+
+    /// The effect settings changed by a method: saved (unless `changed` is
+    /// false: the state file already holds them), applied to the running
+    /// session without restarting it, and published before the reply. A
+    /// control call clears a fault (an effect that could not run is tried
+    /// again) and the `Error` of an effect running without its effect.
+    fn effect_changed(&mut self, changed: bool, now: Instant) -> Result<(), IpcError> {
+        if let Some(f) = self.fault.take()
+            && self.error == f
+        {
+            self.error = self.standing_error();
+        }
+        if let Some(e) = self.effect_failure.take()
+            && self.error == e
+        {
+            self.error = self.standing_error();
+        }
+        let mut res = if changed { self.save_state() } else { Ok(()) };
+        if self.session.is_some()
+            && let Err(e) = self.apply_effect()
+        {
+            res = Err(e);
+        }
+        self.reconcile(now);
+        res
+    }
+
+    /// Applies the effect in force to the running session. Settings the
+    /// session already has are not given again, unless the effect failed
+    /// (a retry). A new effect or image, or a retry, is followed from its
+    /// load (its status is reported again); a strength change is not. A
+    /// setting the session cannot take is an effect failure
+    /// ([`Self::effect_failed`]), and the method's error.
+    fn apply_effect(&mut self) -> Result<(), IpcError> {
+        let effect = self.effect();
+        let failed = matches!(self.effect_seen, Some(EffectStatus::Failed(_)));
+        match &self.effect_applied {
+            Some(prev) if !failed && *prev == effect => return Ok(()),
+            Some(prev)
+                if !failed
+                    && prev.mode == effect.mode
+                    && prev.background_image == effect.background_image => {}
+            _ => self.effect_seen = None,
+        }
+        self.effect_applied = Some(effect.clone());
+        let Err(reason) = self.backend.set_effect(&effect) else {
+            return Ok(());
+        };
+        let msg = effect_failure_text(&effect, &reason);
+        if !self.effect_failed(&reason) {
+            // Streaming on without the effect, as `none` says.
+            let off = EffectConfig {
+                mode: EffectMode::None,
+                ..effect
+            };
+            if let Err(e) = self.backend.set_effect(&off) {
+                warning!("turning the effect off: {e}");
+            }
+            self.effect_applied = Some(off);
+        }
+        Err(IpcError::Failed(msg))
+    }
+
     fn reload(&mut self, now: Instant) -> Result<(), IpcError> {
         let res = match Config::load(&self.paths.config) {
             Ok(new) => {
@@ -1197,9 +1600,15 @@ impl<B: MediaBackend> Controller<B> {
             }
         );
         self.fault = None;
+        self.effect_failure = None;
         // Only the errors whose cause is gone are cleared: a missing
         // writer or a damaged state file still stands.
         self.error = self.standing_error();
+        // The effect in force may have changed (or failed before): applied
+        // again, which retries a failed effect.
+        if self.session.is_some() {
+            let _ = self.apply_effect();
+        }
         let old_cameras = self.rescan_cameras();
         // The streaming camera's mode changed: reopen it in the new mode.
         if let Some(s) = &self.session {

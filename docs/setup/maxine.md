@@ -20,9 +20,8 @@ PREFIX=$(dirname "$MAXINE_VFX_ROOT")                 # holds VideoFX/ and env.sh
 | GPU | NVIDIA, compute capability 7.5 or newer (Turing and up). Tested on the reference machine: RTX 5080 Laptop, CC 12.0 (sm_120) | `nvidia-smi --query-gpu=name,compute_cap --format=csv` |
 | Driver | 570.26 or newer. Tested: 615.78.08 | `nvidia-smi --query-gpu=driver_version --format=csv,noheader` |
 | System CUDA toolkit | Not needed. The SDK bundles CUDA 12.8, cuDNN 9.7.1 and TensorRT 10.9 and only takes `libcuda.so.1` from the driver (`nvidia-utils`) | |
-| Tools | `curl`, `unzip`, `jq`, `gcc`, `unshare` (util-linux) | `pacman -S --needed curl unzip jq gcc util-linux` |
+| Tools | `curl`, `unzip`, `jq`, `gcc` (also builds the os-release shim in step 7), `make` | `pacman -S --needed curl unzip jq gcc make` |
 | Disk | About 4.5 GB for the final install. Peak about 8 GB while the downloads (2.7 GB) and the extracted tree coexist | `df -h ~` |
-| Kernel | Unprivileged user namespaces enabled (default on Arch) for the os-release override in step 7 | `unshare -Urm true && echo ok` |
 
 ## 1. NVIDIA account and access (Manual)
 
@@ -166,7 +165,7 @@ rm -rf ~/Downloads/maxine          # optional, frees 2.7 GB
 
 ## 7. The os-release override
 
-**Why.** The model-package loader inside `libnvVFXGreenScreen.so` reads `/etc/os-release` and refuses distributions that are not on NVIDIA's list. Omarchy reports `ID=omarchy`, so `NvVFX_Load` fails with `-1209` ("no kernel image is available for execution on the device"). That message is misleading: no CUDA error occurs (verified with compute-sanitizer), the models do contain sm_120 code, and the failure is purely the distro check. Findings on what passes:
+**Why.** The model-package loader inside `libnvVFXGreenScreen.so` reads `/etc/os-release` (with `fopen`, twice per load) and refuses distributions that are not on NVIDIA's list. Omarchy reports `ID=omarchy`, so `NvVFX_Load` fails with `-1209` ("no kernel image is available for execution on the device"). That message is misleading: no CUDA error occurs (verified with compute-sanitizer), the models do contain sm_120 code, and the failure is purely the distro check. Findings on what passes:
 
 | os-release | Result |
 |---|---|
@@ -176,38 +175,64 @@ rm -rf ~/Downloads/maxine          # optional, frees 2.7 GB
 | `ID=arch` (any `VERSION_ID`), or `ID_LIKE=ubuntu` | Fails (-1209). Only the `ID` / `VERSION_ID` pair is read |
 | `ID=ubuntu` without `VERSION_ID` | No output at all in testing, probably a crash. Always give `VERSION_ID` |
 
-**How.** Bind-mount a fake file over `/etc/os-release` inside a private user + mount namespace. Only the process you start sees it; the real file is untouched and no root is needed. The repository ships a working fake file at [../../tools/maxine-probe/fake-os-release](../../tools/maxine-probe/fake-os-release); install a copy where the daemon can find it:
+**How.** A small `LD_PRELOAD` library, [`tools/os-release-shim`](../../tools/os-release-shim/README.md), makes one process see a replacement `/etc/os-release`: inside a process that preloads it, a read-only open of exactly `/etc/os-release` opens the file named by `OMA_BROADCAST_OS_RELEASE` instead, and every other call passes through unchanged. Only that process is affected, the real file is untouched, and no root is needed.
+
+**Why not a namespace.** Hiding the file with a bind mount needs a user and mount namespace (`unshare -Urm`, or `PrivateUsers=` and `BindReadOnlyPaths=` in the unit). The daemon finds out that an application has opened the virtual camera by reading `/proc/<pid>/fd/N` of the user's other processes, and inside a user namespace the kernel refuses `readlink` on those entries (listing the directory still works). The daemon would then never see a consumer and would stay idle, sending black. `unshare -Urm` also presents the user as uid 0 to the session bus, so authentication fails. The reasoning is in [ADR-0012](../adr/0012-video-effects-and-maxine-backend.md). The shim needs no namespace: the process keeps its uid, its mounts and `/proc`.
+
+### Build and install
+
+From the repository root:
 
 ```bash
-mkdir -p ~/.local/share/oma-broadcast
-cat > ~/.local/share/oma-broadcast/fake-os-release <<'EOF'
+make -C tools/os-release-shim                     # -> target/os-release-shim/os-release-shim.so
+make -C tools/os-release-shim test                # optional: the shim's own test
+install -Dm644 target/os-release-shim/os-release-shim.so ~/.local/lib/oma-broadcast/os-release-shim.so
+install -Dm644 tools/maxine-probe/fake-os-release ~/.local/share/oma-broadcast/fake-os-release
+```
+
+The repository ships a working replacement file at [../../tools/maxine-probe/fake-os-release](../../tools/maxine-probe/fake-os-release); its content is:
+
+```
 NAME="Ubuntu"
 VERSION_ID="24.04"
 ID=ubuntu
 ID_LIKE=debian
 VERSION_CODENAME=noble
 PRETTY_NAME="Ubuntu 24.04 LTS"
-EOF
 ```
 
-### 7a. Per-process (tested)
+### 7a. The daemon (systemd user unit)
+
+The optional drop-in [`dist/systemd/oma-broadcastd.service.d/maxine.conf`](../../dist/systemd/oma-broadcastd.service.d/maxine.conf) sets `LD_PRELOAD`, `OMA_BROADCAST_OS_RELEASE`, `MAXINE_VFX_ROOT` and `LD_LIBRARY_PATH` for the daemon, with the install locations above and the SDK in `~/.local/opt/maxine/VideoFX`. Adjust the paths in the file if you installed elsewhere. Install it, then restart the daemon:
 
 ```bash
-unshare -Urm sh -c 'mount --bind ~/.local/share/oma-broadcast/fake-os-release /etc/os-release && exec <command> [args]'
+install -Dm644 dist/systemd/oma-broadcastd.service.d/maxine.conf \
+    ~/.config/systemd/user/oma-broadcastd.service.d/maxine.conf
+systemctl --user daemon-reload
+systemctl --user restart oma-broadcastd.service
 ```
 
-Inside, the process runs as uid 0 *in the namespace* (still your real user on the host) and sees the fake distro. Use this form for the probe in step 9 and for manual runs of the daemon.
+Remove the file (then `daemon-reload` and restart) to go back to the default unit. If the shim file is missing, the dynamic loader prints `ld.so: object '...' from LD_PRELOAD cannot be preloaded ... ignored` in the journal and the daemon starts normally; the first effect then fails with the reason in the `Error` property (see troubleshooting). Without the drop-in the daemon runs as usual and effects fail the same way.
 
-### 7b. systemd user unit (not yet validated)
+### 7b. A manual run (probe, `obc-bench`, the daemon, tests)
 
-The equivalent for `oma-broadcastd.service`, run as a user unit:
+Set the two variables on the program that loads the SDK:
 
-```ini
-[Service]
-BindReadOnlyPaths=%h/.local/share/oma-broadcast/fake-os-release:/etc/os-release
+```bash
+env LD_PRELOAD=~/.local/lib/oma-broadcast/os-release-shim.so \
+    OMA_BROADCAST_OS_RELEASE=$HOME/.local/share/oma-broadcast/fake-os-release \
+    <command> [args]
 ```
 
-Unprivileged user units can only use mount-namespace options together with a user namespace (`PrivateUsers=` / `PrivateMounts=`); whether this directive works unmodified in a `systemd --user` unit, and how it interacts with the D-Bus session bus and `/dev/video*` access (uid mapping), is untested. If it does not work, the fallback is `ExecStart=unshare -Urm sh -c '...'` (form 7a), or an `LD_PRELOAD` shim intercepting `open`/`fopen` of `/etc/os-release` (also untested).
+**Set `LD_PRELOAD` on the final program, never on a wrapper in front of it.** The shim removes `LD_PRELOAD` from the environment of the process that loads it, so that no child inherits it. A wrapper such as `timeout`, `sh -c` or `cargo` that carries `LD_PRELOAD` loads the shim itself, drops the variable, and starts the program without it, which then fails with `-1209`. Write `timeout 60 env LD_PRELOAD=... prog`, not `LD_PRELOAD=... timeout 60 prog`. For `cargo test`, use a runner so that only the test binary is preloaded:
+
+```bash
+OMA_BROADCAST_OS_RELEASE=$HOME/.local/share/oma-broadcast/fake-os-release \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env LD_PRELOAD=$HOME/.local/lib/oma-broadcast/os-release-shim.so" \
+    cargo test -p obc-backend-maxine --test hardware -- --ignored --test-threads=1
+```
+
+`OMA_BROADCAST_OS_RELEASE_DEBUG=1` makes the shim log each redirect on stderr, which shows whether it is active.
 
 Licence note on this workaround: see section 11.
 
@@ -227,7 +252,7 @@ EOF
 source "$PREFIX/env.sh"
 ```
 
-- `MAXINE_VFX_ROOT` is the one variable the project reads: the SDK root (the directory containing `lib/`, `features/`, `external/`). The daemon derives the model directory (`$MAXINE_VFX_ROOT/lib/models`, passed to the SDK as `NVVFX_MODEL_DIRECTORY`) and the library paths from it, and the systemd unit will set the same variables in `Environment=`.
+- `MAXINE_VFX_ROOT` is the one variable the project reads: the SDK root (the directory containing `lib/`, `features/`, `external/`). The daemon derives the model directory (`$MAXINE_VFX_ROOT/lib/models`, passed to the SDK as `NVVFX_MODEL_DIRECTORY`) and the library paths from it, and the systemd drop-in of step 7 sets the same variables in `Environment=`.
 - Do not `source` this from `~/.bashrc` or `~/.profile`. The bundled CUDA 12 libraries would shadow system libraries for every program you start. Source it per shell, or set it per process/unit.
 
 ## 9. Verify with the probe
@@ -240,10 +265,12 @@ P=$MAXINE_VFX_ROOT
 cd "$(mktemp -d)"
 gcc -O2 -o probe <repo root>/tools/maxine-probe/probe.c \
   -I$P/include -I$P/external/cuda/include -L$P/lib -lVideoFX -lNVCVImage -lcuda
-unshare -Urm sh -c "mount --bind ~/.local/share/oma-broadcast/fake-os-release /etc/os-release && ./probe $P/lib/models"
+env LD_PRELOAD=~/.local/lib/oma-broadcast/os-release-shim.so \
+    OMA_BROADCAST_OS_RELEASE=$HOME/.local/share/oma-broadcast/fake-os-release \
+    ./probe $P/lib/models
 ```
 
-Expected output on the reference machine (RTX 5080 Laptop, driver 615.78; the numbers vary by GPU, the shape does not):
+Expected output on the reference machine (RTX 5080 Laptop, driver 615.78; timings are shown as `<t>`; they vary by GPU and are not published here, per the NVIDIA Maxine SDK licence):
 
 ```
 NvVFX_GetVersion = 0x01030000  (major 1 minor 3 build 0)
@@ -259,15 +286,24 @@ DONE
 
 Pass criteria: version `0x01030000`, `NvVFX_Load -> 0`, `DONE`, no `FAIL` line. Set `VFX_LOG=1` for the SDK's own log on stderr.
 
-Observation, cause unconfirmed: on the very first probe run the first `NvVFX_Run` took seconds (plausibly a one-time warm-up of the TensorRT context, cuDNN and CUDA graph capture); later runs were much shorter, plausibly because of a CUDA JIT or file cache. Budget for a cold first run of a few seconds: the daemon is meant to show a black or "starting..." frame while an effect loads.
+Observation, cause unconfirmed: on the very first probe run the first `NvVFX_Run` took much longer than later ones (plausibly a one-time warm-up of the TensorRT context, cuDNN and CUDA graph capture); later runs were faster, plausibly because of a CUDA JIT or file cache. Budget for a cold first run of a few seconds: the daemon is meant to show a black or "starting..." frame while an effect loads.
 
-Without the override the same probe stops at `NvVFX_Load -> -1209`, which confirms the distro gate.
+Without the shim the same probe stops at `NvVFX_Load -> -1209`, which confirms the distro gate.
+
+### Using the effects
+
+With the SDK installed and the daemon running with the drop-in (step 7a), the effects are selected in two ways:
+
+- In `config.toml`, the `[effect]` section (`mode`, `blur_strength`, `background_image`, `on_failure`); see [../config.example.toml](../config.example.toml).
+- At run time, with `oma-broadcast effect none|blur|replace [--strength X] [--image PATH]`, which the daemon remembers across restarts; see [../cli-json.md](../cli-json.md) and [../dbus-api.md](../dbus-api.md).
+
+The background image for `replace` must be a PNG or JPEG file. Until an effect is ready, the virtual camera shows black rather than the unprocessed camera image; if the SDK cannot be loaded, the daemon enters the `error` state (default) instead of showing the unprocessed image. The design is in [ADR-0012](../adr/0012-video-effects-and-maxine-backend.md). Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence; reproduce locally with `obc-bench` (see [../testing.md](../testing.md)).
 
 ## 10. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `NvVFX_Load` returns `-1209`, "no kernel image is available", log line `Loading TRTModel failed in Aigs` | `/etc/os-release` is not an accepted distro (`ID=omarchy`). Not a real CUDA error | Step 7: run under `unshare -Urm` with the fake os-release. Check that the file has both `ID=` and `VERSION_ID=` |
+| `NvVFX_Load` returns `-1209`, "no kernel image is available", log line `Loading TRTModel failed in Aigs` | `/etc/os-release` is not an accepted distro (`ID=omarchy`). Not a real CUDA error | Step 7: the shim is missing or not applied to this process. Check that the library exists at the path in `LD_PRELOAD`, that `OMA_BROADCAST_OS_RELEASE` is an absolute path to a file with both `ID=` and `VERSION_ID=`, that `LD_PRELOAD` is set on the program itself and not on a wrapper (`timeout`, `sh -c`, `cargo`), and run with `OMA_BROADCAST_OS_RELEASE_DEBUG=1` to see the redirect |
 | `NvVFX_CreateEffect` returns `-2` (unimplemented) | `libnvVFXGreenScreen.so` / `libnvVFXBackgroundBlur.so` not found by `dlopen` | Put `features/nvvfxgreenscreen/lib` and `features/nvvfxbackgroundblur/lib` on `LD_LIBRARY_PATH` (step 8); confirm the feature was extracted in step 6 |
 | `NvVFX_Load` returns `-13` ("file could not be found") | Model directory wrong or models missing | Pass `$MAXINE_VFX_ROOT/lib/models` (probe argv[1]; the default `./models` does not exist). Check `ls $MAXINE_VFX_ROOT/lib/models` shows 8 `.trtpkg` files for your SM |
 | `error while loading shared libraries: libcudart.so.12` / `libnpp*.so.12` / `libcudnn.so.9` / `libnvinfer.so.10` not found (or linker warnings about `.so.12`) | Bundled `external/cuda/lib` and `external/tensorrt/lib` not on `LD_LIBRARY_PATH` | `source "$PREFIX/env.sh"`, then check `ldd $MAXINE_VFX_ROOT/lib/libVideoFXLocal.so \| grep 'not found'` is empty |
@@ -276,7 +312,8 @@ Without the override the same probe stops at `NvVFX_Load -> -1209`, which confir
 | `ngc registry ...` returns 401/402/403 or an empty list, "not authorized" | API key from another account or org than the Developer Program access, or "NGC Catalog" service not included, or access not yet granted | Redo step 1 with the same account that owns the key; regenerate the key with the NGC Catalog service (step 2); run `ngc config set` again with the right org; `ngc config current` shows what is active |
 | No `models_linux_sm<SM>` for your GPU | GPU architecture not in the 1.3.0.0 matrix | List with step 5; Turing/Ampere/Ada/Hopper/Blackwell (sm75 to sm120) are covered |
 | `NvVFX_Load` succeeds but a program hangs at start | Cold first run (see step 9 observation) | Wait a few seconds; the probe prints the time |
-| `unshare: unshare failed: Operation not permitted` | Unprivileged user namespaces disabled | `sysctl kernel.unprivileged_userns_clone` (hardened kernels); enable it or use the `LD_PRELOAD` alternative |
+| The daemon's `Error` property reads `effect blur unavailable: NvVFX_Load(GreenScreen) returned -1209 (...): the SDK rejected this distribution (its model loader reads /etc/os-release). Run the process with the os-release override (docs/setup/maxine.md, section 7)` and the state is `error` | The daemon runs without the shim: the drop-in is not installed, `daemon-reload` and a restart were skipped, or its paths do not match your installation. With the default `on_failure = "black"` the virtual camera stays black | Install the drop-in (step 7a) and check `systemctl --user show oma-broadcastd -p Environment`; a `cannot be preloaded` line in `journalctl --user -u oma-broadcastd` means the library path is wrong |
+| `ld.so: object '...os-release-shim.so' from LD_PRELOAD cannot be preloaded` | The shim library is not at the path in `LD_PRELOAD`; the program runs without it | Build and install it (step 7) |
 
 ## 11. Licence notes
 
@@ -285,7 +322,7 @@ Summary of the licence terms as read from the SDK licence documents. This is not
 - The SDK and models are under the NVIDIA Software License Agreement plus the AI Product-Specific Terms. The Developer Program path is "solely for internal evaluation, development or test non-production purposes ... not for use, distribution or deployment in production" (terms 1.2.8). Personal use on your own machine and development are fine; shipping the SDK inside a product needs an NVIDIA enterprise agreement.
 - **No redistribution.** SLA 8.5 forbids copying, distributing or sublicensing any part of the Software, "including in any publicly accessible software repositories". Never commit the SDK, the models (`*.trtpkg`), the NGC key or `~/.ngc/` to this repo, never put them in a package or release artifact (users download from NGC themselves, the daemon only points at the install directory). Keep the install directory outside the working tree.
 - No reverse engineering of the binaries (SLA 8.4); no publishing benchmark results without written permission (SLA 8.9). The timings above are for local verification, not for publication.
-- The os-release override changes only what one process of yours reads on your own machine. It does not decrypt or bypass the model encryption, but SLA 8.7 forbids bypassing "encryption ... or authentication mechanism"; treat this as a grey area, keep it per-process, and do not ship it as a feature of a distributed package.
+- The os-release override (the shim of step 7) changes only what one process of yours reads on your own machine. It does not decrypt or bypass the model encryption, but SLA 8.7 forbids bypassing "encryption ... or authentication mechanism"; treat this as a grey area. It is per-user configuration that you build and install yourself: oma-broadcast neither installs it nor enables it by default, and it must not be shipped as a feature of a distributed package.
 - NVIDIA documents the Linux SDK as server-side and does not officially support local, client-side use or Arch. That is a support statement, not a technical block. Expect no vendor support.
 
 ## 12. Uninstall
@@ -293,6 +330,8 @@ Summary of the licence terms as read from the SDK licence documents. This is not
 ```bash
 rm -rf "$PREFIX"                         # SDK, models and env.sh
 rm -rf ~/.local/share/oma-broadcast/fake-os-release
+rm -f ~/.local/lib/oma-broadcast/os-release-shim.so
+rm -f ~/.config/systemd/user/oma-broadcastd.service.d/maxine.conf   # then: systemctl --user daemon-reload
 rm -rf ~/Downloads/maxine                # downloads, if kept
 # NGC CLI (only if nothing else uses it)
 rm -rf ~/.local/opt/ngc-cli ~/.local/bin/ngc

@@ -182,6 +182,100 @@ Applications that open `/dev/video*` directly find the virtual camera whenever t
 
 While one application streams from the virtual camera, a second one cannot open it: v4l2loopback refuses the second reader's format request (`S_FMT`, "Device or resource busy"). This was seen with a second `gst-launch-1.0 v4l2src` and `obc-consumer`; it is a property of the loopback device, not of the daemon.
 
+## Video effects
+
+The effects ([ADR-0012](adr/0012-video-effects-and-maxine-backend.md)) are tested in layers, so that everything except the real SDK runs without it.
+
+### Default suite (no SDK, no GPU, no camera)
+
+```sh
+cargo test -p obc-core -p obc-gpu -p obc-backend -p obc-backend-maxine -p gst-obc \
+  -p obc-pipeline -p obc-ipc -p oma-broadcastd -p oma-broadcast
+```
+
+To show that nothing in this run depends on the SDK, run it with the SDK variables removed:
+
+```sh
+env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u OMA_BROADCAST_OS_RELEASE \
+  cargo test -p obc-core -p obc-gpu -p obc-backend -p obc-backend-maxine -p gst-obc \
+    -p obc-pipeline -p obc-ipc -p oma-broadcastd -p oma-broadcast
+```
+
+On the reference machine this gave 424 passed, 0 failed and 41 ignored (the hardware tests), and `ldd` on `oma-broadcastd` and `obc-bench` shows no link to the SDK, CUDA or TensorRT libraries. What the default suite covers:
+
+- **Backend seam** (`obc-backend`, `obc-gpu`, `obc-backend-maxine`): the trait types, the validation of load requests, the error texts, and a Maxine backend that reports itself unavailable with the reason when the SDK is not found.
+- **The element** (`crates/gst-obc`): registration and caps (CUDA NV12 on both pads), properties and their validation, status messages on the bus, the background image (crop to fill, the size limit, a JPEG, an undecodable or missing file), and the refusal of hostile images in under half a second: a 50-byte PNG declaring 60000x60000 pixels and a JPEG declaring 65000x65000 are refused from their headers before a decoder runs; a file that is a FIFO is refused without blocking. The first-image rule is tested too: a valid image followed by a second one declaring a huge size is decoded as the first image only, data after the image (random bytes, an MP4 box, zero padding) is ignored, and a truncated image is refused.
+- **The pipeline** (`obc-pipeline`): the effect settings and their checks, the effect statistics, that an output built without the element refuses an effect, and that an effect is refused with the roundtrip stage or with a system-memory output.
+- **The daemon** (`oma-broadcastd`), against its fake backend: the `[effect]` configuration, the runtime state keys, the setters and their errors, persistence and precedence, the `Error` and `State` outcomes of an effect failure with `on_failure` `"black"` and `"none"`, the clearing of that error when the session ends, and a damaged state file.
+- **The CLI and the IPC crate**: `effect` and its option rules, the revision-1 daemon message, the JSON fields and their bounds, the escaping of daemon strings in the human output, and the proxy against a mock server.
+
+### GPU tests with the fake backend (`gpu_` prefix)
+
+These need an NVIDIA GPU and the GStreamer CUDA elements, but no SDK and no camera: a fake `InferenceBackend` (a test double in `crates/gst-obc/tests/support/fake_backend.rs`) marks the pixels it processes, so the tests can tell a processed frame from a raw one by value.
+
+```sh
+cargo test -p gst-obc -p obc-pipeline -- --ignored gpu_ --test-threads=1
+```
+
+They check that `none` passes the input buffer through untouched and touches no CUDA; that going from `none` to an effect shows only black until the effect is ready, and never the raw input; that a switch from one effect to another shows only processed frames; that each failure (backend missing, load, frame, background image) shows black or the input as `on_failure` says; that repeated pushes of one buffer leave it unmodified; that every stop releases the CUDA context exactly once; and, through a whole output (`gpu_an_output_switches_effects_while_streaming`), that a stream switching effects keeps its frame rate and negotiates its caps once.
+
+### Maxine hardware tests
+
+These load the real SDK. They need `MAXINE_VFX_ROOT` and the SDK's library directories on `LD_LIBRARY_PATH` ([setup/maxine.md](setup/maxine.md), steps 6 to 8), and, on a distribution the SDK does not list, the os-release shim (step 7). Set `LD_PRELOAD` through the cargo runner, so that only the test binaries load the shim; `LD_PRELOAD=... cargo test` would be dropped by cargo:
+
+```sh
+make -C tools/os-release-shim
+source tools/maxine-probe/env.sh        # or your env.sh; sets MAXINE_VFX_ROOT and LD_LIBRARY_PATH
+export OMA_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env LD_PRELOAD=$PWD/target/os-release-shim/os-release-shim.so"
+
+cargo test -p obc-gpu -p obc-backend-maxine -p gst-obc -- --ignored --test-threads=1
+OBC_TEST_CAMERA=046d:0944 OBC_TEST_SINK=/dev/video11 \
+  cargo test -p obc-pipeline --test hardware -- --ignored maxine_ --test-threads=1
+```
+
+- `obc-backend-maxine` (2 tests): the backend refuses calls without the CUDA context or a load; blur and replace in a context created like GStreamer's, with per-stage GPU times, load times and GPU memory logged. The SDK works in the pushed context: afterwards the device's primary context is inactive.
+- `gst-obc` (6 tests) and `obc-gpu` (1 test): the element against the real backend, and the driver helpers.
+- `maxine_effects_end_to_end_keep_the_rate_and_release_the_gpu` (`obc-pipeline`): camera, session and output with `blur`, then `replace`, then `none`; each phase keeps the contract rate at the sink, the effect becomes ready, its statistics are sane, and after the output stops the process holds no CUDA context.
+
+The frames in these tests are synthetic, so the mask the model produces for them is not predictable; the tests assert what holds for any mask and log the rest.
+
+### Daemon effects test (ignored)
+
+`crates/oma-broadcastd/tests/hardware.rs::effects_switch_while_streaming_and_release_the_gpu` runs the real daemon like the lifecycle test above, and switches `blur`, `replace`, `none` and `blur` again while a consumer in another process reads the virtual camera. It checks the rate and the single caps negotiation at the consumer, the readiness time of each effect, the daemon's GPU memory in each phase, and that the GPU is released within seconds of the last consumer leaving. The daemon is a child process of the test, so the shim is passed to it explicitly, with `OBC_TEST_PRELOAD`, instead of through the cargo runner:
+
+```sh
+source tools/maxine-probe/env.sh
+OMA_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release \
+OBC_TEST_PRELOAD=$PWD/target/os-release-shim/os-release-shim.so \
+OBC_TEST_SINK=/dev/video11 OBC_TEST_CAMERA=046d:0944 OBC_TEST_CAMERA_2=5986:1193 \
+  cargo test -p oma-broadcastd --test hardware -- --ignored --test-threads=1 --nocapture
+```
+
+Without `OBC_TEST_PRELOAD` the effects test fails with the daemon's `Error` text (`NvVFX_Load(GreenScreen) returned -1209 ...`), which shows that the variable is what makes it pass. With `--nocapture` the test prints, for each phase, the camera's fresh frame rate and whether the output clock was phase locked (the daemon logs this at debug level with `-v`).
+
+### The shim's own test
+
+```sh
+make -C tools/os-release-shim test
+```
+
+builds the library and runs `tools/os-release-shim/test.sh`: every interposed entry point, with and without the shim; that only a read-only open of exactly `/etc/os-release` is redirected; that ordinary programs (`cat`, `grep`, `python3`) and child processes are unaffected; that `LD_PRELOAD` is removed from the process environment; and that the process stays in the user's own namespaces. The test fails against a library that redirects nothing, so it cannot pass vacuously.
+
+### Measured on the reference machine
+
+Daemon on the real deployment path (a systemd transient unit with the drop-in's environment, no namespace), MX Brio NV12 1080p60, fixed frame rate, output NV12 1080p30, an application reading the virtual camera as a separate process.
+
+| Measure | Result |
+|---|---|
+| Consumer detection | the application's open is seen 7 ms after it happens |
+| Effect switching, `none`, `blur`, `replace`, `none`, `blur` | output stays on the configured contract in every phase; one caps negotiation for the whole run, switches included (performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence) |
+| Idle | last application closes: camera and GPU stopped after the 5 s grace and 436 ms; GPU memory back to the pre-start value |
+| Effect failure, daemon without the shim | `State` `error`, `Error` with the SDK's reason, 90 of 90 frames at the application black (luma 16) while the camera delivered a real image |
+| Frames of the two reference cameras, `none`, `blur`, `replace` | 114 captured frames, none dark or blank |
+
+Latency, CPU, GPU utilisation and memory, and model load times with an effect were measured as well. Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence; reproduce locally with `obc-bench`. The rows above were measured by hand on the stated machine; no test asserts them.
+
 ## Manual test
 
 1. Create the loopback device as described in [setup/loopback.md](setup/loopback.md).

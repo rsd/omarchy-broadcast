@@ -21,6 +21,28 @@
 //! `camera.fixed_framerate = true`) has something to pin and restore on
 //! SIGTERM; the test puts the original value back, also when it fails.
 //! A camera without that control writable skips that check, saying so.
+//!
+//! The effects test (`effects_switch_while_streaming_and_release_the_gpu`)
+//! also needs the NVIDIA Maxine Video Effects SDK (`MAXINE_VFX_ROOT`, the
+//! libraries on `LD_LIBRARY_PATH`) and the os-release override of
+//! `docs/setup/maxine.md`: the shim of `tools/os-release-shim`
+//! (`make -C tools/os-release-shim`) and `OMA_BROADCAST_OS_RELEASE`. The
+//! daemon is a child of the test binary, and the shim removes `LD_PRELOAD`
+//! from the environment of the process it is loaded into, so a preload on
+//! the test (or on `cargo`) never reaches the daemon. Name the shim in
+//! `OBC_TEST_PRELOAD` (an absolute path) instead: the test starts the daemon
+//! with `LD_PRELOAD` set to it, and the daemon inherits
+//! `OMA_BROADCAST_OS_RELEASE`. Everything runs in the user's own namespaces:
+//!
+//! ```text
+//! source tools/maxine-probe/env.sh
+//! MAXINE_VFX_ROOT=$P OMA_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release \
+//!     OBC_TEST_PRELOAD=$PWD/target/os-release-shim/os-release-shim.so \
+//!     OBC_TEST_SINK=/dev/video11 OBC_TEST_CAMERA=046d:0944 OBC_TEST_CAMERA_2=5986:1193 \
+//!     cargo test -p oma-broadcastd --test hardware -- --ignored --test-threads=1 --nocapture
+//! ```
+//!
+//! (`$P` and `$LD_LIBRARY_PATH` as `tools/maxine-probe/env.sh` sets them.)
 
 mod common;
 
@@ -351,6 +373,15 @@ impl Client {
     fn reload(&self) -> Result<(), IpcError> {
         self.rt.block_on(self.proxy.reload_config())
     }
+    fn effect(&self) -> String {
+        self.rt.block_on(self.proxy.effect()).unwrap()
+    }
+    fn set_effect(&self, e: &str) -> Result<(), IpcError> {
+        self.rt.block_on(self.proxy.set_effect(e))
+    }
+    fn set_background_image(&self, p: &str) -> Result<(), IpcError> {
+        self.rt.block_on(self.proxy.set_background_image(p))
+    }
 
     fn wait_state(&self, want: State, limit: Duration) -> Option<Duration> {
         let t = Instant::now();
@@ -461,7 +492,8 @@ fn the_daemon_runs_the_lifecycle_on_real_devices() {
     .unwrap();
 
     // ---- idle ----
-    let mut daemon = spawn_daemon(&env);
+    // Logged: the pacing lines (`-v`) say what the latency depends on.
+    let (mut daemon, log) = spawn_daemon_logged(&env);
     let pid = daemon.pid();
     let client = Client::connect(&env);
     let named = client.wait_for_name(Duration::from_secs(15));
@@ -571,6 +603,7 @@ fn the_daemon_runs_the_lifecycle_on_real_devices() {
     for (_, s) in client.stats.lock().unwrap().iter() {
         eprintln!("Stats {s:?}");
     }
+    report_pacing(&log, "active");
     {
         let st = client.stats.lock().unwrap();
         let (_, last) = st.last().unwrap();
@@ -890,4 +923,280 @@ fn the_daemon_runs_the_lifecycle_on_real_devices() {
         0,
         "the loopback is released"
     );
+}
+
+// ---- effects ----
+
+const IGNORE_EFFECTS: &str = "needs OBC_TEST_SINK (a free v4l2loopback device with \
+     exclusive_caps=1), OBC_TEST_CAMERA, an NVIDIA GPU with nvidia-smi, /usr/bin/dbus-daemon, \
+     cargo, gst-launch-1.0, the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT, LD_LIBRARY_PATH) and \
+     the os-release override for the daemon (OBC_TEST_PRELOAD, the absolute path of the \
+     os-release shim, and OMA_BROADCAST_OS_RELEASE; see the module docs)";
+
+/// The GPU memory nvidia-smi lists for `pid`'s compute context, in MiB
+/// (`None`: no context).
+fn gpu_memory_mib(pid: u32) -> Option<u64> {
+    let out = Command::new("nvidia-smi")
+        .args([
+            "--query-compute-apps=pid,used_memory",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .unwrap_or_else(|e| panic!("this test needs nvidia-smi ({e}). {IGNORE_EFFECTS}"));
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
+        let (p, m) = l.split_once(',')?;
+        (p.trim().parse::<u32>().ok()? == pid).then(|| m.trim().parse().ok())?
+    })
+}
+
+/// The daemon with its standard error captured (and echoed): the effect's
+/// state is visible only in its log.
+fn spawn_daemon_logged(env: &DaemonEnv) -> (Guard, Arc<Mutex<Vec<String>>>) {
+    let mut command = env.command();
+    // The os-release shim, for the daemon only (see the module docs).
+    if let Some(shim) = std::env::var_os("OBC_TEST_PRELOAD") {
+        command.env("LD_PRELOAD", shim);
+    }
+    let mut child = command
+        .arg("-v")
+        .env("OBC_TEST_STAMP_FORWARDED", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oma-broadcastd");
+    let err = child.stderr.take().unwrap();
+    let log: Arc<Mutex<Vec<String>>> = Arc::default();
+    let l = Arc::clone(&log);
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(err).lines() {
+            let Ok(line) = line else { break };
+            eprintln!("{line}");
+            l.lock().unwrap().push(line);
+        }
+    });
+    (
+        Guard::new(child, "oma-broadcastd", Duration::from_secs(10)),
+        log,
+    )
+}
+
+/// Prints the camera's fresh rate and the output clock's phase lock, from
+/// the daemon's `pacing:` debug lines (one per Stats window): the last one,
+/// and how many of the windows so far were phase locked. Information for
+/// the latency figures, not a check.
+fn report_pacing(log: &Arc<Mutex<Vec<String>>>, what: &str) {
+    let lines: Vec<String> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.contains("pacing: "))
+        .cloned()
+        .collect();
+    let locked = lines
+        .iter()
+        .filter(|l| l.contains("output clock phase locked"))
+        .count();
+    match lines.last() {
+        Some(last) => eprintln!(
+            "{what}: {} ({locked} of {} stats windows phase locked)",
+            last.split_once("pacing: ")
+                .map_or(last.as_str(), |(_, r)| r),
+            lines.len()
+        ),
+        None => eprintln!("{what}: no pacing line in the daemon's log"),
+    }
+}
+
+fn log_count(log: &Arc<Mutex<Vec<String>>>, needle: &str) -> usize {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.contains(needle))
+        .count()
+}
+
+/// Frames the consumer received per second over `span` from now.
+fn consumer_fps(consumer: &Consumer, span: Duration) -> f64 {
+    let t0 = Instant::now();
+    std::thread::sleep(span);
+    let t1 = Instant::now();
+    let n = consumer
+        .lines()
+        .iter()
+        .filter(|(t, l)| matches!(l, Line::Frame(_)) && *t >= t0 && *t < t1)
+        .count();
+    n as f64 / t1.duration_since(t0).as_secs_f64()
+}
+
+/// Switching effects on a live stream: blur, replace, none and blur again,
+/// with no session restart, the consumer's rate and caps unchanged, and the
+/// GPU released when idle.
+#[test]
+#[ignore = "needs OBC_TEST_SINK (a free v4l2loopback device with exclusive_caps=1), OBC_TEST_CAMERA, an NVIDIA GPU with nvidia-smi, /usr/bin/dbus-daemon, cargo, gst-launch-1.0, the NVIDIA Maxine VFX SDK and OBC_TEST_PRELOAD with OMA_BROADCAST_OS_RELEASE (the os-release override for the daemon)"]
+fn effects_switch_while_streaming_and_release_the_gpu() {
+    let sink = PathBuf::from(
+        std::env::var("OBC_TEST_SINK")
+            .unwrap_or_else(|_| panic!("this test needs OBC_TEST_SINK. {IGNORE_EFFECTS}")),
+    );
+    let sink = std::fs::canonicalize(&sink).unwrap_or(sink);
+    let cam = resolve_camera("OBC_TEST_CAMERA");
+    if let Err(e) = obc_pipeline::effect_backend_available() {
+        panic!("the effect backend is unavailable: {e}. {IGNORE_EFFECTS}");
+    }
+    let consumer_bin = consumer_binary();
+    for node in [&sink, &cam.node] {
+        let n = count_holders(Path::new("/proc"), &NodeId::of(node), std::process::id());
+        assert_eq!(
+            n,
+            0,
+            "{} is held by another process (see `fuser -v {}`): not touching it",
+            node.display(),
+            node.display()
+        );
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    // A background image of another size than the output (scaled and
+    // cropped to fill).
+    let background = dir.path().join("background.png");
+    let st = Command::new("gst-launch-1.0")
+        .args([
+            "-q",
+            "videotestsrc",
+            "num-buffers=1",
+            "pattern=smpte",
+            "!",
+            "video/x-raw,width=1280,height=960",
+            "!",
+            "pngenc",
+            "!",
+            "filesink",
+        ])
+        .arg(format!("location={}", background.display()))
+        .status()
+        .unwrap_or_else(|e| panic!("this test needs gst-launch-1.0 ({e}). {IGNORE_EFFECTS}"));
+    assert!(st.success() && background.exists(), "no background image");
+    let bus = PrivateBus::start(dir.path());
+    let env = DaemonEnv::new(dir.path(), &bus);
+    std::fs::write(
+        env.config_file(),
+        format!(
+            "version = 1\n[camera]\npreference = [{:?}]\n[loopback]\ndevice = {:?}\n\
+             [lifecycle]\nidle_grace_s = 1.0\nstart_debounce_ms = 300\n\
+             [effect]\non_failure = \"black\"\n",
+            cam.selector,
+            sink.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let (daemon, log) = spawn_daemon_logged(&env);
+    let pid = daemon.pid();
+    let client = Client::connect(&env);
+    client.wait_for_daemon(Duration::from_secs(15));
+    assert_eq!(client.state(), State::Idle, "error: {}", client.error());
+    assert_eq!(client.effect(), "none");
+    client
+        .set_background_image(&background.display().to_string())
+        .unwrap();
+
+    let consumer = Consumer::spawn(&consumer_bin, &sink);
+    assert!(
+        client
+            .wait_state(State::Active, Duration::from_secs(20))
+            .is_some(),
+        "not active: {} ({})",
+        client.state(),
+        client.error()
+    );
+    assert!(
+        consumer.wait_more(true, 30, Duration::from_secs(10)),
+        "no frames through the session: {:?}",
+        consumer.runs()
+    );
+    let starts = || log_count(&log, "an application opened the virtual camera: starting");
+    assert_eq!(starts(), 1);
+    let mem_none_before = gpu_memory_mib(pid);
+    eprintln!("GPU memory, no effect: {mem_none_before:?} MiB");
+
+    let mut mem = Vec::new();
+    for (effect, ready) in [
+        ("blur", "effect blur ready"),
+        ("replace", "effect replace ready"),
+        ("none", "effect off"),
+        ("blur", "effect blur ready"),
+    ] {
+        let seen = log_count(&log, ready);
+        let t = Instant::now();
+        client.set_effect(effect).unwrap();
+        assert_eq!(client.effect(), effect);
+        assert!(
+            wait(Duration::from_secs(20), || log_count(&log, ready) > seen
+                || client.state() != State::Active),
+            "{effect}: never ready ({}; {}); is the os-release override in place?",
+            client.state(),
+            client.error()
+        );
+        assert_eq!(
+            client.state(),
+            State::Active,
+            "{effect}: {} (is the os-release override in place?)",
+            client.error()
+        );
+        let took = t.elapsed();
+        // Settle, then measure.
+        std::thread::sleep(Duration::from_millis(500));
+        let fps = consumer_fps(&consumer, Duration::from_secs(5));
+        let mib = gpu_memory_mib(pid);
+        eprintln!("{effect}: ready after {took:?}; consumer {fps:.2} fps; GPU memory {mib:?} MiB");
+        report_pacing(&log, effect);
+        assert!((27.0..=33.0).contains(&fps), "{effect}: {fps:.2} fps");
+        assert_eq!(client.state(), State::Active, "{effect}");
+        assert_eq!(client.error(), "", "{effect}");
+        assert!(holds(pid, &cam.node), "{effect}: the camera is streaming");
+        assert_eq!(starts(), 1, "{effect}: the session was restarted");
+        mem.push((effect, mib));
+    }
+    // `none` unloaded the models while the stream ran.
+    let mib = |i: usize| mem[i].1.expect("a CUDA context while active");
+    assert!(
+        mib(2) + 50 < mib(0),
+        "the models stayed loaded under none: {mem:?}"
+    );
+    let runs = consumer.runs();
+    eprintln!("consumer runs (stamped = via the camera session): {runs:?}");
+    assert_eq!(
+        runs.iter().map(|r| r.0).collect::<Vec<_>>(),
+        [false, true],
+        "the stream never fell back to placeholders: {runs:?}"
+    );
+    assert_eq!(consumer.caps().len(), 1, "caps: {:?}", consumer.caps());
+    assert!(consumer.problems().is_empty(), "{:?}", consumer.problems());
+    {
+        let stats = client.stats.lock().unwrap();
+        let (_, last) = stats.last().expect("Stats while active");
+        eprintln!("last Stats: {last:?}");
+        assert!((25.0..=35.0).contains(&last.fps), "{last:?}");
+    }
+
+    // ---- the consumer leaves: idle, camera closed, GPU released ----
+    consumer.close();
+    assert!(
+        client
+            .wait_state(State::Idle, Duration::from_secs(15))
+            .is_some(),
+        "not idle: {}",
+        client.state()
+    );
+    assert!(!holds(pid, &cam.node), "{:?}", open_nodes(pid));
+    let t = Instant::now();
+    assert!(
+        wait(Duration::from_secs(10), || gpu_memory_mib(pid).is_none()),
+        "GPU memory still allocated while idle: {:?} MiB",
+        gpu_memory_mib(pid)
+    );
+    eprintln!("idle: GPU memory released within {:?}", t.elapsed());
+    assert_eq!(client.effect(), "blur", "the selection stays");
+    drop(client);
+    drop(daemon);
 }

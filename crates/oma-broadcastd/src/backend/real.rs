@@ -6,23 +6,31 @@
 //! camera scan reads sysfs and queries nodes without streaming. NVML (for
 //! `gpu_percent`) is initialised only while a session runs and shut down
 //! with it.
+//!
+//! Every output is built with the effect element (`obceffect`), in
+//! passthrough for `none`, so the effect can change while it streams. Its
+//! models are loaded only while an effect is requested and the session
+//! runs; stopping the session unloads them before the CUDA context goes
+//! (`docs/adr/0012-video-effects-and-maxine-backend.md`, "Lifecycle").
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gst::prelude::*;
-use obc_core::{ModeRequest, OutputContract, SinkSelector};
+use obc_core::config::EffectConfig;
+use obc_core::{EffectMode, EffectOnFailure, ModeRequest, OutputContract, SinkSelector};
 use obc_ipc::Stats;
 use obc_pipeline::gpu::GpuSampler;
 use obc_pipeline::pipeline::names;
 use obc_pipeline::stats::{cpu_usage, online_cpus, self_cpu_ticks, ticks_per_sec};
 use obc_pipeline::{
-    DiscoveryRoute, IngestConfig, LiveStats, LoopbackWriter, Output, OutputConfig, OutputSink,
-    Session, WriterCounts, WriterSink, choose_mode, list_cameras, scan_sysfs, select_sink,
+    DiscoveryRoute, EffectFallback, EffectKind, EffectSettings, IngestConfig, LiveStats,
+    LoopbackWriter, Output, OutputConfig, OutputSink, PipelineError, Session, WriterCounts,
+    WriterSink, choose_mode, effect_backend_available, list_cameras, scan_sysfs, select_sink,
 };
 
-use super::{Failure, MediaBackend, SessionParams};
+use super::{EffectReport, EffectStatus, Failure, MediaBackend, SessionParams};
 use crate::camera::{Camera, stable_id};
 use crate::consumers::{NodeId, count_holders};
 
@@ -107,6 +115,33 @@ impl GstBackend {
             .map_err(|e| format!("{}: {e}", camera.label()))?;
         running.source = Some(timing.source_id);
         Ok(())
+    }
+}
+
+/// The effect element's settings for the daemon's effect settings.
+fn effect_settings(e: &EffectConfig) -> EffectSettings {
+    EffectSettings {
+        kind: match e.mode {
+            EffectMode::None => EffectKind::None,
+            EffectMode::Blur => EffectKind::Blur,
+            EffectMode::Replace => EffectKind::Replace,
+        },
+        // Validated to 0..=1 before it gets here.
+        blur_strength: e.blur_strength as f32,
+        background: e.background_image.clone(),
+        fallback: match e.on_failure {
+            EffectOnFailure::Black => EffectFallback::Black,
+            EffectOnFailure::None => EffectFallback::None,
+        },
+    }
+}
+
+/// The reason of an effect error, without the `effect: ` prefix of
+/// [`PipelineError::Effect`].
+fn effect_error(e: PipelineError) -> String {
+    match e {
+        PipelineError::Effect(m) => m,
+        other => other.to_string(),
     }
 }
 
@@ -217,6 +252,9 @@ impl MediaBackend for GstBackend {
         let mut ocfg = OutputConfig::new(params.contract, OutputSink::Writer(writer.handle()));
         ocfg.gap_threshold = params.input_gap;
         ocfg.hold_timeout = params.hold_timeout;
+        // Always with the element: an output built without it cannot take
+        // an effect later.
+        ocfg.effect = Some(effect_settings(&params.effect));
         let mut output = Output::build(ocfg).map_err(|e| format!("output pipeline: {e}"))?;
         let live = LiveStats::new();
         output.set_observer(Some(live.observer()));
@@ -304,6 +342,21 @@ impl MediaBackend for GstBackend {
         r.counts = counts;
         let window = r.live.take_window();
         let latency = window.latency_p50_ms.unwrap_or(Stats::NOT_MEASURABLE);
+        // What the latency depends on (ADR-0010): the camera's own rate and
+        // whether the output clock is phase-locked to it. Debug only (`-v`).
+        let out = r.session.output().counts();
+        crate::debug!(
+            "pacing: camera {} fresh fps, output clock {} (offset {:.2} ms)",
+            window
+                .fresh_fps()
+                .map_or_else(|| "n/a".to_string(), |f| format!("{f:.2}")),
+            if out.phase_locked {
+                "phase locked"
+            } else {
+                "not phase locked"
+            },
+            out.phase_offset_ns as f64 / 1e6
+        );
         let ticks = self_cpu_ticks();
         let cpu = match (r.cpu_ticks, ticks) {
             (Some(a), Some(b)) if secs > 0.0 => {
@@ -344,6 +397,41 @@ impl MediaBackend for GstBackend {
             cpu_percent: cpu,
             gpu_percent: gpu,
         }
+    }
+
+    fn effect_available(&mut self, effect: &EffectConfig) -> Result<(), String> {
+        if effect.mode == EffectMode::None {
+            return Ok(());
+        }
+        effect_backend_available()?;
+        obc_pipeline::effect::check_settings(&effect_settings(effect)).map_err(effect_error)
+    }
+
+    fn set_effect(&mut self, effect: &EffectConfig) -> Result<(), String> {
+        let Some(r) = self.running.as_ref() else {
+            return Ok(());
+        };
+        r.session
+            .output()
+            .set_effect(&effect_settings(effect))
+            .map_err(effect_error)
+    }
+
+    fn effect_report(&mut self) -> Option<EffectReport> {
+        let output = self.running.as_ref()?.session.output();
+        let status = match output.effect_status() {
+            obc_pipeline::EffectStatus::Off => EffectStatus::Off,
+            obc_pipeline::EffectStatus::Loading => EffectStatus::Loading,
+            obc_pipeline::EffectStatus::Ready => EffectStatus::Ready,
+            obc_pipeline::EffectStatus::Failed(r) => EffectStatus::Failed(r),
+        };
+        let stats = output.effect_stats().unwrap_or_default();
+        Some(EffectReport {
+            status,
+            load_ms: stats.last_load_ms,
+            reused: stats.last_load_reused,
+            gpu_ms_p50: stats.gpu_ms_p50,
+        })
     }
 }
 

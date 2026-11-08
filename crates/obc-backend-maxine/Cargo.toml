@@ -7,5 +7,15 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+obc-backend = { workspace = true }
+obc-gpu = { workspace = true }
+libloading = { workspace = true }
+# dladdr: where the SDK library was found, to locate its model directory.
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true

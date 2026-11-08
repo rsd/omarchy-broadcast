@@ -4,6 +4,7 @@
 //! ```text
 //! appsrc        <canonical caps>,framerate=<contract>  is-live format=time
 //!   [ ! Process stage ]                                 crate::process
+//!   [ ! obceffect ]                                     crate::effect
 //!   [ ! cudaconvert ! capsfilter (CUDAMemory) I420 ]    contract format != NV12
 //!   ! cudadownload
 //!   ! capsfilter  <contract caps>, canonical label      system memory
@@ -59,6 +60,18 @@
 //! reached, so no counter goes back and frames written while the output
 //! was stopped are not counted as superseded.
 //!
+//! **Effect.** With [`OutputConfig::effect`] set, the Process stage holds
+//! the `obceffect` element ([`crate::effect`]) for the output's whole life,
+//! and [`Output::set_effect`] changes its effect while it streams, without
+//! renegotiating caps; [`Output::effect_status`] and
+//! [`Output::effect_stats`] report on it, and every status change is posted
+//! on the output pipeline's bus ([`crate::effect::STATUS_MESSAGE`]). The
+//! element sits after the clock, so a repeated frame is processed again.
+//! It does not combine with [`GpuStage::Roundtrip`] (which stands in for an
+//! effect) and needs frames in CUDA memory. When the output stops, the
+//! element unloads its backend (with the context current) before the
+//! pipeline releases the CUDA context.
+//!
 //! **CUDA context.** The output pipeline's CUDA elements create the
 //! `GstCudaContext` when the pipeline opens; [`Output::cuda_context`] hands
 //! it to every ingest pipeline so canonical frames stay in one context.
@@ -101,6 +114,7 @@ use obc_core::{ColourRange, OutputContract, OutputFormat};
 use serde::Serialize;
 
 use crate::clock::{Latest, Pacer, PacerConfig, PacerCounts, PhaseLockConfig, Step, TickKind};
+use crate::effect::{EffectBackend, EffectSettings, EffectStats, EffectStatus, effect_element};
 use crate::frame::{Canonical, Frame, FrameMemory, FrameWriter};
 use crate::ingest::CUDA_CONTEXT_TYPE;
 use crate::loopback::WriterHandle;
@@ -142,6 +156,16 @@ pub struct OutputConfig {
     pub hold_timeout: Duration,
     /// The output clock's phase lock ([`crate::clock`]).
     pub phase_lock: PhaseLockConfig,
+    /// The effect element of the Process stage ([`crate::effect`]):
+    /// `None` (the default) builds no element, and the output cannot take
+    /// an effect later; `Some` inserts `obceffect` with these settings
+    /// (`EffectSettings::default()`: passthrough until
+    /// [`Output::set_effect`]). Does not combine with
+    /// [`GpuStage::Roundtrip`].
+    pub effect: Option<EffectSettings>,
+    /// The backend the effect element creates its instance with (default:
+    /// Maxine, from `MAXINE_VFX_ROOT`). Unused without [`Self::effect`].
+    pub effect_backend: EffectBackend,
 }
 
 impl OutputConfig {
@@ -155,6 +179,8 @@ impl OutputConfig {
             queue_buffers: Self::DEFAULT_QUEUE_BUFFERS,
             hold_timeout: Self::DEFAULT_HOLD_TIMEOUT,
             phase_lock: PhaseLockConfig::default(),
+            effect: None,
+            effect_backend: EffectBackend::default(),
         }
     }
 
@@ -374,6 +400,7 @@ pub struct Output {
     cuda: Option<gst::Context>,
     clock: Option<ClockThread>,
     memory: FrameMemory,
+    effect: Option<gst_obc::ObcEffect>,
 }
 
 impl std::fmt::Debug for Output {
@@ -382,6 +409,7 @@ impl std::fmt::Debug for Output {
             .field("contract", &self.cfg.contract)
             .field("sink", &self.cfg.sink)
             .field("process", &self.cfg.process)
+            .field("effect", &self.cfg.effect)
             .field("running", &self.clock.is_some())
             .finish_non_exhaustive()
     }
@@ -498,6 +526,19 @@ impl Output {
                 cfg.process
             )));
         }
+        if cfg.effect.is_some() {
+            if memory == FrameMemory::System {
+                return Err(PipelineError::Cuda(
+                    "the effect element needs frames in CUDA memory".into(),
+                ));
+            }
+            if cfg.process != GpuStage::Passthrough {
+                return Err(PipelineError::Effect(format!(
+                    "the effect element does not combine with the {} process stage",
+                    cfg.process
+                )));
+            }
+        }
         let canonical = Canonical::of(&contract);
         let pipeline = gst::Pipeline::with_name("obc-output");
         let queue = cfg.pacer().max_burst;
@@ -512,6 +553,14 @@ impl Output {
 
         let mut chain: Vec<gst::Element> = vec![appsrc.clone().upcast()];
         chain.extend(process_elements(cfg.process, canonical.colorimetry)?);
+        let effect = match &cfg.effect {
+            Some(settings) => {
+                let fx = effect_element(settings, &cfg.effect_backend)?;
+                chain.push(fx.clone().upcast());
+                Some(fx)
+            }
+            None => None,
+        };
         match memory {
             FrameMemory::Cuda => {
                 if contract.format != OutputFormat::Nv12 {
@@ -590,7 +639,42 @@ impl Output {
             cuda: None,
             clock: None,
             memory,
+            effect,
         })
+    }
+
+    /// Changes the effect while the output runs (or before it starts): the
+    /// settings are checked ([`crate::effect::check_settings`]) and applied
+    /// to the effect element at once. Loading happens on the element's
+    /// worker; follow it with [`Self::effect_status`] or the bus messages.
+    /// Applying settings after a failure retries, even unchanged. Fails for
+    /// an output built without [`OutputConfig::effect`].
+    pub fn set_effect(&self, settings: &EffectSettings) -> Result<(), PipelineError> {
+        let fx = self.effect.as_ref().ok_or_else(|| {
+            PipelineError::Effect(
+                "this output was built without the effect element (OutputConfig::effect)".into(),
+            )
+        })?;
+        crate::effect::check_settings(settings)?;
+        fx.apply(settings).map_err(PipelineError::Effect)
+    }
+
+    /// The state of the requested effect; [`EffectStatus::Off`] without an
+    /// effect element.
+    pub fn effect_status(&self) -> EffectStatus {
+        self.effect
+            .as_ref()
+            .map_or(EffectStatus::Off, |fx| fx.status())
+    }
+
+    /// The effect element's counters and timings; `None` without one.
+    pub fn effect_stats(&self) -> Option<EffectStats> {
+        self.effect.as_ref().map(|fx| fx.stats())
+    }
+
+    /// The current effect settings; `None` without an effect element.
+    pub fn effect_settings(&self) -> Option<EffectSettings> {
+        self.effect.as_ref().map(|fx| fx.settings())
     }
 
     /// Sets the per-tick observer. Takes effect at [`Self::start`].
@@ -1517,6 +1601,50 @@ mod tests {
             Output::build_in(cfg, FrameMemory::System),
             Err(PipelineError::Cuda(_))
         ));
+    }
+
+    #[test]
+    fn the_default_config_has_no_effect_element() {
+        let cfg = OutputConfig::new(OutputContract::default(), OutputSink::Fake);
+        assert_eq!(cfg.effect, None);
+        assert_eq!(cfg.effect_backend.factory().name(), "maxine");
+        require_elements(&["appsrc", "videoconvert", "capssetter", "fakesink"]);
+        let o = Output::build_in(cfg, FrameMemory::System).unwrap();
+        assert!(o.pipeline().element(names::EFFECT).is_none());
+        assert_eq!(o.effect_status(), EffectStatus::Off);
+        assert_eq!(o.effect_stats(), None);
+        assert_eq!(o.effect_settings(), None);
+        let e = o
+            .set_effect(&EffectSettings::of(crate::EffectKind::Blur))
+            .unwrap_err();
+        assert!(matches!(e, PipelineError::Effect(_)), "{e}");
+        assert!(e.to_string().contains("without the effect element"), "{e}");
+    }
+
+    /// The effect element needs CUDA frames and does not combine with the
+    /// roundtrip stage; both are refused before any element is made.
+    #[test]
+    fn an_effect_needs_cuda_frames_and_no_roundtrip() {
+        gst::init().unwrap();
+        let mut cfg = OutputConfig::new(OutputContract::default(), OutputSink::Fake);
+        cfg.effect = Some(EffectSettings::default());
+        assert!(matches!(
+            Output::build_in(cfg.clone(), FrameMemory::System),
+            Err(PipelineError::Cuda(_))
+        ));
+        cfg.process = GpuStage::Roundtrip;
+        let e = Output::build(cfg.clone()).unwrap_err();
+        assert!(
+            matches!(&e, PipelineError::Effect(m) if m.contains("roundtrip")),
+            "{e}"
+        );
+        cfg.process = GpuStage::Passthrough;
+        cfg.effect = Some(EffectSettings::of(crate::EffectKind::Replace));
+        let e = Output::build(cfg).unwrap_err();
+        assert!(
+            matches!(&e, PipelineError::Effect(m) if m.contains("background")),
+            "{e}"
+        );
     }
 
     #[test]

@@ -28,6 +28,9 @@ struct Mock {
     cameras: Vec<CameraInfo>,
     active: usize,
     consumers: u32,
+    effect: String,
+    blur_strength: f64,
+    background_image: String,
 }
 
 impl Mock {
@@ -50,6 +53,9 @@ impl Mock {
             ],
             active: 0,
             consumers: 0,
+            effect: "none".into(),
+            blur_strength: 0.5,
+            background_image: String::new(),
         }
     }
 }
@@ -107,6 +113,56 @@ impl Mock {
         Err(IpcError::InvalidConfig(self.error.clone()))
     }
 
+    async fn set_effect(
+        &mut self,
+        effect: &str,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        match effect {
+            "replace" if self.background_image.is_empty() => Err(IpcError::InvalidArgument(
+                "replace needs a background image".into(),
+            )),
+            "none" | "blur" | "replace" => {
+                self.effect = effect.into();
+                self.effect_changed(&emitter).await?;
+                Ok(())
+            }
+            other => Err(IpcError::InvalidArgument(format!(
+                "unknown effect {other:?}"
+            ))),
+        }
+    }
+
+    async fn set_blur_strength(
+        &mut self,
+        strength: f64,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        if !(0.0..=1.0).contains(&strength) {
+            return Err(IpcError::InvalidArgument(format!(
+                "blur strength {strength} is outside 0 to 1"
+            )));
+        }
+        self.blur_strength = strength;
+        self.blur_strength_changed(&emitter).await?;
+        Ok(())
+    }
+
+    async fn set_background_image(
+        &mut self,
+        path: &str,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        if !path.starts_with('/') {
+            return Err(IpcError::InvalidArgument(format!(
+                "{path:?} is not an absolute path"
+            )));
+        }
+        self.background_image = path.into();
+        self.background_image_changed(&emitter).await?;
+        Ok(())
+    }
+
     #[zbus(signal)]
     async fn stats(
         emitter: &SignalEmitter<'_>,
@@ -148,7 +204,17 @@ impl Mock {
 
     #[zbus(property)]
     fn effect(&self) -> String {
-        "none".into()
+        self.effect.clone()
+    }
+
+    #[zbus(property)]
+    fn blur_strength(&self) -> f64 {
+        self.blur_strength
+    }
+
+    #[zbus(property)]
+    fn background_image(&self) -> String {
+        self.background_image.clone()
     }
 
     #[zbus(property)]
@@ -162,14 +228,72 @@ impl Mock {
     }
 }
 
+/// A daemon of revision 1: the properties before the effect controls, and
+/// no effect methods.
+struct Rev1;
+
+#[interface(name = "br.com.dias.OmaBroadcast1")]
+impl Rev1 {
+    #[zbus(property)]
+    fn state(&self) -> State {
+        State::Idle
+    }
+
+    #[zbus(property)]
+    fn error(&self) -> String {
+        String::new()
+    }
+
+    #[zbus(property)]
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    #[zbus(property)]
+    fn cameras(&self) -> Vec<CameraInfo> {
+        Vec::new()
+    }
+
+    #[zbus(property)]
+    fn active_camera(&self) -> String {
+        String::new()
+    }
+
+    #[zbus(property)]
+    fn output_mode(&self) -> String {
+        "NV12 1920x1080@30".into()
+    }
+
+    #[zbus(property)]
+    fn effect(&self) -> String {
+        "none".into()
+    }
+
+    #[zbus(property)]
+    fn consumers(&self) -> u32 {
+        0
+    }
+
+    #[zbus(property)]
+    fn interface_revision(&self) -> u32 {
+        1
+    }
+}
+
 /// A server connection serving [`Mock`] and a client connection, joined by a
 /// socket pair.
 async fn pair() -> (Connection, Connection) {
+    pair_serving(Mock::new()).await
+}
+
+/// A server connection serving `iface` and a client connection, joined by a
+/// socket pair.
+async fn pair_serving(iface: impl zbus::object_server::Interface) -> (Connection, Connection) {
     let (s0, s1) = UnixStream::pair().unwrap();
     let server = connection::Builder::unix_stream(s0)
         .server(Guid::generate())
         .p2p()
-        .serve_at(OBJECT_PATH, Mock::new())
+        .serve_at(OBJECT_PATH, iface)
         .build();
     let client = connection::Builder::unix_stream(s1).p2p().build();
     tokio::try_join!(server, client).unwrap()
@@ -197,11 +321,48 @@ async fn proxy_reads_every_property() {
             active_camera: "usb-1234_abcd".into(),
             output_mode: "NV12 1920x1080@30".into(),
             effect: "none".into(),
+            blur_strength: 0.5,
+            background_image: String::new(),
             consumers: 0,
             interface_revision: INTERFACE_REVISION,
         }
     );
+    assert_eq!(INTERFACE_REVISION, 2);
     assert_eq!(proxy.inner().interface().as_str(), INTERFACE);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revision_1_daemon_reads_with_defaults_for_the_newer_properties() {
+    let (_server, client) = pair_serving(Rev1).await;
+    for proxy in [
+        OmaBroadcastProxy::new(&client).await.unwrap(),
+        OmaBroadcastProxy::builder(&client)
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await
+            .unwrap(),
+    ] {
+        let snap = within("snapshot", Snapshot::fetch(&proxy)).await.unwrap();
+        assert_eq!(snap.interface_revision, 1);
+        assert_eq!(snap.state, State::Idle);
+        assert_eq!(snap.effect, "none");
+        assert_eq!(snap.blur_strength, Snapshot::empty().blur_strength);
+        assert_eq!(snap.background_image, "");
+    }
+    let no_autostart = within("snapshot", Snapshot::fetch_no_autostart(&client))
+        .await
+        .unwrap()
+        .unwrap();
+    let proxy = OmaBroadcastProxy::new(&client).await.unwrap();
+    assert_eq!(
+        no_autostart,
+        within("snapshot", Snapshot::fetch(&proxy)).await.unwrap()
+    );
+    // The effect methods are absent: a D-Bus error, not a daemon reply.
+    match within("SetEffect", proxy.set_effect("blur")).await {
+        Err(IpcError::ZBus(_)) => {}
+        other => panic!("expected a transport-level error, got {other:?}"),
+    }
 }
 
 /// Waits for the next `Properties.GetAll` that `server` receives and returns
@@ -281,14 +442,17 @@ async fn the_no_autostart_read_reports_a_missing_object_as_an_error() {
     // A peer that serves nothing at the object path: an error, not "not
     // running" (only the bus can say a name has no owner).
     let (s0, s1) = UnixStream::pair().unwrap();
+    // The object server answers for the paths it does not serve. It serves
+    // something elsewhere so that `build()` returns only once its dispatch
+    // task is subscribed: started lazily (`object_server()`), a request that
+    // arrived first was never answered and the read timed out.
     let server = connection::Builder::unix_stream(s0)
         .server(Guid::generate())
         .p2p()
+        .serve_at("/unrelated", Rev1)
         .build();
     let client = connection::Builder::unix_stream(s1).p2p().build();
-    let (server, client) = tokio::try_join!(server, client).unwrap();
-    // Starts the object server, which answers for the paths it does not serve.
-    let _ = server.object_server();
+    let (_server, client) = tokio::try_join!(server, client).unwrap();
     let got = within("snapshot", Snapshot::fetch_no_autostart(&client)).await;
     assert!(got.is_err(), "{got:?}");
 }
@@ -354,6 +518,54 @@ async fn proxy_calls_every_method_and_sees_changes() {
         .await
         .unwrap();
     assert_eq!(uncached.active_camera().await.unwrap(), "usb-1234_abcd");
+
+    // The effect controls: options first, then the effect.
+    within("SetBlurStrength", proxy.set_blur_strength(0.8))
+        .await
+        .unwrap();
+    assert_eq!(uncached.blur_strength().await.unwrap(), 0.8);
+    within("SetEffect", proxy.set_effect("blur")).await.unwrap();
+    assert_eq!(uncached.effect().await.unwrap(), "blur");
+    within(
+        "SetBackgroundImage",
+        proxy.set_background_image("/tmp/bg.png"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(uncached.background_image().await.unwrap(), "/tmp/bg.png");
+    within("SetEffect", proxy.set_effect("replace"))
+        .await
+        .unwrap();
+    let snap = within("snapshot", Snapshot::fetch(&uncached))
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            snap.effect.as_str(),
+            snap.blur_strength,
+            snap.background_image.as_str()
+        ),
+        ("replace", 0.8, "/tmp/bg.png")
+    );
+
+    // The changes arrive as PropertiesChanged and apply to a snapshot.
+    let mut seen = Vec::new();
+    let mut applied = Snapshot::empty();
+    while !["BlurStrength", "BackgroundImage", "Effect"]
+        .iter()
+        .all(|k| seen.iter().any(|s| s == k))
+    {
+        let signal = within("PropertiesChanged", changed.next())
+            .await
+            .expect("PropertiesChanged stream ended");
+        let args = signal.args().unwrap();
+        for (k, v) in args.changed_properties() {
+            applied.apply_property(k, v).unwrap();
+            seen.push(k.to_string());
+        }
+    }
+    assert_eq!(applied.blur_strength, 0.8);
+    assert_eq!(applied.background_image, "/tmp/bg.png");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -374,6 +586,36 @@ async fn errors_map_back_by_name() {
             );
         }
         other => panic!("expected InvalidConfig, got {other:?}"),
+    }
+    for (what, reply) in [
+        (
+            "SetEffect",
+            within("SetEffect", proxy.set_effect("sparkle")).await,
+        ),
+        (
+            "SetEffect replace",
+            within("SetEffect", proxy.set_effect("replace")).await,
+        ),
+        (
+            "SetBlurStrength",
+            within("SetBlurStrength", proxy.set_blur_strength(1.5)).await,
+        ),
+        (
+            "SetBackgroundImage",
+            within("SetBackgroundImage", proxy.set_background_image("bg.png")).await,
+        ),
+    ] {
+        match reply {
+            Err(e @ IpcError::InvalidArgument(_)) => {
+                assert!(!e.message().is_empty(), "{what}");
+                assert_eq!(
+                    zbus::DBusError::name(&e).as_str(),
+                    "br.com.dias.OmaBroadcast1.Error.InvalidArgument",
+                    "{what}"
+                );
+            }
+            other => panic!("{what}: expected InvalidArgument, got {other:?}"),
+        }
     }
     // A failed reload reports its reason through Error as well.
     let mut error = proxy.receive_error_changed().await;

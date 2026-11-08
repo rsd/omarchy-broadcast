@@ -1,12 +1,12 @@
 # oma-broadcast
 
-A GPU webcam-effects pipeline for Linux. Frames flow from a camera through GStreamer and CUDA memory into a [v4l2loopback](https://github.com/v4l2loopback/v4l2loopback) virtual camera that any application can select. The planned effects (background blur and replacement) use the NVIDIA Maxine Video Effects SDK behind a replaceable inference-backend interface.
+A GPU webcam-effects pipeline for Linux. Frames flow from a camera through GStreamer and CUDA memory into a [v4l2loopback](https://github.com/v4l2loopback/v4l2loopback) virtual camera that any application can select. The effects (background blur and background replacement) use the NVIDIA Maxine Video Effects SDK behind a replaceable inference-backend interface.
 
 Any UVC webcam works: the pipeline picks a capture mode from what the camera advertises, and adds a CPU decode step for MJPEG cameras and a CPU convert step for YUYV/UYVY.
 
 ## Status
 
-Early development. The camera -> CUDA -> virtual camera passthrough works, with sustained 1080p60 on the reference machine. The `oma-broadcastd` daemon (a systemd user service controlled over D-Bus) and the `oma-broadcast` command-line client run it on demand: the camera and GPU start when an application opens the virtual camera ([docs/setup/daemon.md](docs/setup/daemon.md)). Effects are not implemented yet. Measurements are in [docs/benchmarks/](docs/benchmarks/passthrough.md).
+Early development. The camera -> CUDA -> virtual camera passthrough works, with sustained 1080p60 on the reference machine. The `oma-broadcastd` daemon (a systemd user service controlled over D-Bus) and the `oma-broadcast` command-line client run it on demand: the camera and GPU start when an application opens the virtual camera ([docs/setup/daemon.md](docs/setup/daemon.md)). Background blur and background replacement run on the GPU through the Maxine SDK, which each user installs ([docs/setup/maxine.md](docs/setup/maxine.md)); they are selected with `oma-broadcast effect` and add a small GPU cost per frame. Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence; reproduce locally with `obc-bench` (see [docs/testing.md](docs/testing.md)). Other measurements are in [docs/benchmarks/](docs/benchmarks/passthrough.md).
 
 ## Requirements
 
@@ -40,7 +40,7 @@ Tests, including the manual check with OBS or Chrome, are described in [docs/tes
 
 ## Documentation
 
-See [docs/README.md](docs/README.md) for the architecture, decision records, setup guides and benchmarks. The Omarchy bar widget (status icon, on/off, camera selection) is described in [clients/omarchy-bar/README.md](clients/omarchy-bar/README.md).
+See [docs/README.md](docs/README.md) for the architecture, decision records, setup guides and benchmarks. The Omarchy bar widget (status icon, on/off, camera and effect selection) is described in [clients/omarchy-bar/README.md](clients/omarchy-bar/README.md).
 
 ## Licence
 

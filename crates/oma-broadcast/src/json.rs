@@ -5,7 +5,8 @@
 //! Every line is one JSON object carrying `"v"` ([`VERSION`]) and `"type"`,
 //! and is at most [`MAX_LINE_BYTES`] bytes long: strings are clipped to the
 //! bounds below (measured in bytes of their JSON encoding, so escapes count)
-//! with a trailing [`ELLIPSIS`], and the camera list is cut at
+//! with a trailing [`ELLIPSIS`] (a path, `background_image`, keeps its end,
+//! the file name, behind a leading one), and the camera list is cut at
 //! [`MAX_CAMERAS`] entries.
 
 use std::borrow::Cow;
@@ -35,6 +36,11 @@ pub const MAX_USB_BYTES: usize = 16;
 pub const MAX_MODE_BYTES: usize = 64;
 /// Bound of `effect`.
 pub const MAX_EFFECT_BYTES: usize = 32;
+/// Bound of `background_image`. Kept so that a `snapshot` line with every
+/// string at its bound and [`MAX_CAMERAS`] cameras stays under
+/// [`MAX_LINE_BYTES`]. A longer path is clipped at its start
+/// ([`clip_start`]), so the file name survives.
+pub const MAX_PATH_BYTES: usize = 256;
 /// Appended to a clipped string.
 pub const ELLIPSIS: &str = "\u{2026}";
 
@@ -74,6 +80,37 @@ pub fn clip(s: &str, max: usize) -> Cow<'_, str> {
     Cow::Owned(format!("{}{ELLIPSIS}", &s[..end]))
 }
 
+/// `s`, clipped so that its JSON encoding (without the quotes) is at most
+/// `max` bytes, starting with [`ELLIPSIS`] when it was clipped: the end of
+/// `s` is kept. For paths, whose file name is at the end.
+pub fn clip_start(s: &str, max: usize) -> Cow<'_, str> {
+    if s.chars().map(escaped_len).sum::<usize>() <= max {
+        return Cow::Borrowed(s);
+    }
+    let budget = max.saturating_sub(ELLIPSIS.len());
+    let mut used = 0;
+    let mut start = s.len();
+    for (i, c) in s.char_indices().rev() {
+        let n = escaped_len(c);
+        if used + n > budget {
+            break;
+        }
+        used += n;
+        start = i;
+    }
+    Cow::Owned(format!("{ELLIPSIS}{}", &s[start..]))
+}
+
+/// `blur_strength` as printed: within 0 to 1 (a non-finite value is 0), so
+/// it is always a JSON number.
+fn strength(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 /// A stats value as printed: a finite, non-negative measurement, or `-1`.
 fn measurement(value: f64) -> f64 {
     if value.is_finite() && Stats::is_measured(value) {
@@ -102,6 +139,8 @@ struct StateFields<'a> {
     consumers: u32,
     output_mode: Cow<'a, str>,
     effect: Cow<'a, str>,
+    blur_strength: f64,
+    background_image: Cow<'a, str>,
     interface_revision: u32,
 }
 
@@ -116,6 +155,8 @@ impl<'a> StateFields<'a> {
             consumers: s.consumers,
             output_mode: clip(&s.output_mode, MAX_MODE_BYTES),
             effect: clip(&s.effect, MAX_EFFECT_BYTES),
+            blur_strength: strength(s.blur_strength),
+            background_image: clip_start(&s.background_image, MAX_PATH_BYTES),
             interface_revision: s.interface_revision,
         }
     }
@@ -294,9 +335,11 @@ mod tests {
             ],
             active_camera: "platform-video2".into(),
             output_mode: "NV12 1920x1080@30".into(),
-            effect: "none".into(),
+            effect: "blur".into(),
+            blur_strength: 0.5,
+            background_image: "/home/u/bg.png".into(),
             consumers: 2,
-            interface_revision: 1,
+            interface_revision: 2,
         }
     }
 
@@ -320,8 +363,10 @@ mod tests {
         assert_eq!(v["active_camera_name"], "Second Camera");
         assert_eq!(v["consumers"], 2);
         assert_eq!(v["output_mode"], "NV12 1920x1080@30");
-        assert_eq!(v["effect"], "none");
-        assert_eq!(v["interface_revision"], 1);
+        assert_eq!(v["effect"], "blur");
+        assert_eq!(v["blur_strength"], 0.5);
+        assert_eq!(v["background_image"], "/home/u/bg.png");
+        assert_eq!(v["interface_revision"], 2);
         assert_eq!(v["cameras_truncated"], false);
         let cams = v["cameras"].as_array().unwrap();
         assert_eq!(cams.len(), 2);
@@ -343,7 +388,58 @@ mod tests {
         assert_eq!(v["changed"], serde_json::json!(["state", "consumers"]));
         assert_eq!(v["state"], "active");
         assert_eq!(v["active_camera_name"], "Second Camera");
+        assert_eq!(v["blur_strength"], 0.5);
+        assert_eq!(v["background_image"], "/home/u/bg.png");
         assert!(v.get("cameras").is_none(), "{line}");
+    }
+
+    #[test]
+    fn blur_strength_is_always_a_number_from_0_to_1() {
+        let mut s = sample();
+        for (given, printed) in [
+            (0.0, 0.0),
+            (1.0, 1.0),
+            (0.25, 0.25),
+            (1.5, 1.0),
+            (-0.5, 0.0),
+            (f64::NAN, 0.0),
+            (f64::INFINITY, 0.0),
+        ] {
+            s.blur_strength = given;
+            for line in [snapshot_line(&s), state_line(&s, &["blur_strength"])] {
+                let v = parse(&line);
+                assert!(v["blur_strength"].is_number(), "{given}: {line}");
+                assert_eq!(v["blur_strength"].as_f64(), Some(printed), "{given}");
+            }
+        }
+    }
+
+    #[test]
+    fn background_image_is_clipped_and_stays_valid() {
+        let mut s = sample();
+        // Control characters (6-byte escapes), bidi overrides and other
+        // multi-byte characters, newlines and quotes.
+        let nasty = format!("/home/u/{}", "\u{1}\u{202e}\u{2066}é🎥\n\"\\".repeat(200));
+        s.background_image = nasty.clone();
+        for line in [snapshot_line(&s), state_line(&s, &model::STATE_FIELDS)] {
+            let v = parse(&line);
+            let img = v["background_image"].as_str().unwrap();
+            assert!(img.starts_with(ELLIPSIS), "{img}");
+            assert!(nasty.ends_with(img.trim_start_matches(ELLIPSIS)));
+            let encoded = serde_json::to_string(img).unwrap();
+            assert!(encoded.len() - 2 <= MAX_PATH_BYTES, "{}", encoded.len());
+        }
+        // A long path keeps its file name: the start is what is clipped.
+        s.background_image = format!("/home/u/{}office.jpg", "deep/".repeat(100));
+        let v = parse(&snapshot_line(&s));
+        let img = v["background_image"].as_str().unwrap();
+        assert!(img.starts_with(ELLIPSIS), "{img}");
+        assert!(img.ends_with("/deep/office.jpg"), "{img}");
+        assert_eq!(img.len(), MAX_PATH_BYTES, "{img}");
+        // A short path is printed as it is.
+        s.background_image = "/home/u/\u{202e}gnp.exe".into();
+        let v = parse(&snapshot_line(&s));
+        assert_eq!(v["background_image"], "/home/u/\u{202e}gnp.exe");
     }
 
     #[test]
@@ -423,8 +519,15 @@ mod tests {
                 assert!(encoded.len() - 2 <= max, "{max}: {encoded}");
                 assert!(c.ends_with(ELLIPSIS), "{c}");
                 assert!(s.starts_with(c.trim_end_matches(ELLIPSIS)));
+                let c = clip_start(&s, max);
+                let encoded = serde_json::to_string(c.as_ref()).unwrap();
+                assert!(encoded.len() - 2 <= max, "{max}: {encoded}");
+                assert!(c.starts_with(ELLIPSIS), "{c}");
+                assert!(s.ends_with(c.trim_start_matches(ELLIPSIS)));
             }
         }
+        assert!(matches!(clip_start("exactly10!", 10), Cow::Borrowed(_)));
+        assert_eq!(clip_start("/a/b/name.png", 11), "\u{2026}name.png");
         // The escape lengths agree with serde_json for every ASCII char.
         for b in 0u8..128 {
             let c = b as char;
@@ -441,6 +544,11 @@ mod tests {
         s.error = nasty.clone();
         s.output_mode = nasty.clone();
         s.effect = nasty.clone();
+        s.background_image = nasty.clone();
+        // The longest number serde_json prints for a strength in range.
+        s.blur_strength = 2.225_073_858_507_201_4e-308;
+        s.consumers = u32::MAX;
+        s.interface_revision = u32::MAX;
         s.cameras = (0..100)
             .map(|i| cam(&format!("{i}{nasty}"), &nasty, &nasty))
             .collect();
@@ -460,6 +568,12 @@ mod tests {
         }
         let v = parse(&snapshot_line(&s));
         assert!(v["error"].as_str().unwrap().ends_with(ELLIPSIS));
+        assert!(
+            v["background_image"]
+                .as_str()
+                .unwrap()
+                .starts_with(ELLIPSIS)
+        );
         assert!(
             v["active_camera_name"]
                 .as_str()

@@ -55,8 +55,10 @@ pub const OBJECT_PATH: &str = "/br/com/dias/OmaBroadcast";
 pub const INTERFACE: &str = "br.com.dias.OmaBroadcast1";
 /// Revision of [`INTERFACE`] this crate describes, exposed by the daemon as
 /// the `InterfaceRevision` property. Raised for every backwards-compatible
-/// addition (a new property, method or signal).
-pub const INTERFACE_REVISION: u32 = 1;
+/// addition (a new property, method or signal). Revision 2 added the
+/// effect controls: `BlurStrength`, `BackgroundImage`, `SetEffect`,
+/// `SetBlurStrength`, `SetBackgroundImage` and the `InvalidArgument` error.
+pub const INTERFACE_REVISION: u32 = 2;
 /// Prefix of every D-Bus error name the daemon replies with
 /// (`br.com.dias.OmaBroadcast1.Error.NoSuchCamera`, ...).
 pub const ERROR_PREFIX: &str = "br.com.dias.OmaBroadcast1.Error";
@@ -213,6 +215,11 @@ pub enum IpcError {
     InvalidConfig(String),
     /// The request cannot be served right now (e.g. no camera at all).
     Unavailable(String),
+    /// An argument is out of its domain: an unknown effect, a blur strength
+    /// outside 0 to 1, a background image that is not an absolute path to a
+    /// readable regular file, or `replace` with no background image
+    /// (revision 2).
+    InvalidArgument(String),
     /// Any other failure.
     Failed(String),
     /// A transport or protocol error (not a daemon reply).
@@ -227,6 +234,7 @@ impl IpcError {
             IpcError::NoSuchCamera(m)
             | IpcError::InvalidConfig(m)
             | IpcError::Unavailable(m)
+            | IpcError::InvalidArgument(m)
             | IpcError::Failed(m) => m.clone(),
             IpcError::ZBus(e) => e.to_string(),
         }
@@ -243,6 +251,11 @@ pub struct Snapshot {
     pub active_camera: String,
     pub output_mode: String,
     pub effect: String,
+    /// `BlurStrength` (revision 2); `0.0` when the daemon does not offer it.
+    pub blur_strength: f64,
+    /// `BackgroundImage` (revision 2); empty when the daemon does not offer
+    /// it.
+    pub background_image: String,
     pub consumers: u32,
     pub interface_revision: u32,
 }
@@ -259,6 +272,8 @@ impl Snapshot {
             active_camera: String::new(),
             output_mode: String::new(),
             effect: String::new(),
+            blur_strength: 0.0,
+            background_image: String::new(),
             consumers: 0,
             interface_revision: 0,
         }
@@ -282,6 +297,8 @@ impl Snapshot {
             "ActiveCamera" => self.active_camera = deserialize_for_property(value)?,
             "OutputMode" => self.output_mode = deserialize_for_property(value)?,
             "Effect" => self.effect = deserialize_for_property(value)?,
+            "BlurStrength" => self.blur_strength = deserialize_for_property(value)?,
+            "BackgroundImage" => self.background_image = deserialize_for_property(value)?,
             "Consumers" => self.consumers = deserialize_for_property(value)?,
             "InterfaceRevision" => self.interface_revision = deserialize_for_property(value)?,
             _ => {}
@@ -346,7 +363,14 @@ impl Snapshot {
     /// `NO_AUTO_START`, and the getters of an uncached one send `Get`
     /// without it. Clients that only look use
     /// [`Snapshot::fetch_no_autostart`].
+    ///
+    /// The properties added after revision 1 (`BlurStrength`,
+    /// `BackgroundImage`) keep their [`Snapshot::empty`] value when the
+    /// daemon does not offer them (see [`is_unknown_property_error`]), as
+    /// [`Snapshot::from_properties`] does for a property missing from
+    /// `GetAll`; any other failure to read them is an error.
     pub async fn fetch(proxy: &OmaBroadcastProxy<'_>) -> zbus::Result<Snapshot> {
+        let empty = Snapshot::empty();
         Ok(Snapshot {
             state: proxy.state().await?,
             error: proxy.error().await?,
@@ -355,9 +379,37 @@ impl Snapshot {
             active_camera: proxy.active_camera().await?,
             output_mode: proxy.output_mode().await?,
             effect: proxy.effect().await?,
+            blur_strength: optional(proxy.blur_strength().await, empty.blur_strength)?,
+            background_image: optional(proxy.background_image().await, empty.background_image)?,
             consumers: proxy.consumers().await?,
             interface_revision: proxy.interface_revision().await?,
         })
+    }
+}
+
+/// `value`, or `default` when the read failed because the daemon does not
+/// have the property.
+fn optional<T>(value: zbus::Result<T>, default: T) -> zbus::Result<T> {
+    match value {
+        Err(e) if is_unknown_property_error(&e) => Ok(default),
+        other => other,
+    }
+}
+
+/// Whether `e` is the reply to `Properties.Get` for a property the object
+/// does not have: `org.freedesktop.DBus.Error.UnknownProperty`, or
+/// `org.freedesktop.DBus.Error.InvalidArgs`, which some implementations
+/// send instead. A daemon of an older [`INTERFACE_REVISION`] replies so for
+/// the properties added since.
+pub fn is_unknown_property_error(e: &zbus::Error) -> bool {
+    const NAMES: [&str; 2] = [
+        "org.freedesktop.DBus.Error.UnknownProperty",
+        "org.freedesktop.DBus.Error.InvalidArgs",
+    ];
+    match e {
+        zbus::Error::MethodError(name, _, _) => NAMES.contains(&name.as_str()),
+        zbus::Error::FDO(f) => NAMES.contains(&f.name().as_str()),
+        _ => false,
     }
 }
 
@@ -404,6 +456,12 @@ mod tests {
             zbus::DBusError::name(&e).as_str(),
             format!("{ERROR_PREFIX}.NoSuchCamera")
         );
+        let e = IpcError::InvalidArgument("bad".into());
+        assert_eq!(
+            zbus::DBusError::name(&e).as_str(),
+            format!("{ERROR_PREFIX}.InvalidArgument")
+        );
+        assert_eq!(e.message(), "bad");
     }
 
     #[test]
@@ -451,6 +509,10 @@ mod tests {
         ];
         let snap = Snapshot::from_properties(props).unwrap();
         assert_eq!(snap.state, State::Active);
+        // Properties of a later revision missing from GetAll keep the empty
+        // values.
+        assert_eq!(snap.blur_strength, 0.0);
+        assert_eq!(snap.background_image, "");
         assert!(snap.enabled);
         assert_eq!(snap.consumers, 3);
         assert_eq!(snap.cameras, vec![cam("a", "A")]);
@@ -469,6 +531,47 @@ mod tests {
         assert_eq!(changed.error, "camera lost");
         assert_eq!(changed.state, snap.state);
         assert!(changed.apply_property("Consumers", &state).is_err());
+
+        // The revision-2 properties.
+        let strength = Variant::from(0.75f64);
+        let image = Variant::from("/home/u/bg.png");
+        changed.apply_property("BlurStrength", &strength).unwrap();
+        changed.apply_property("BackgroundImage", &image).unwrap();
+        assert_eq!(changed.blur_strength, 0.75);
+        assert_eq!(changed.background_image, "/home/u/bg.png");
+        assert!(changed.apply_property("BlurStrength", &image).is_err());
+        assert!(
+            changed
+                .apply_property("BackgroundImage", &strength)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unknown_property_replies_are_recognised() {
+        use zbus::fdo;
+        let fdo_error = |e: fdo::Error| zbus::Error::FDO(Box::new(e));
+        assert!(is_unknown_property_error(&fdo_error(
+            fdo::Error::UnknownProperty("BlurStrength".into())
+        )));
+        assert!(is_unknown_property_error(&fdo_error(
+            fdo::Error::InvalidArgs("no such property".into())
+        )));
+        assert!(!is_unknown_property_error(&fdo_error(
+            fdo::Error::AccessDenied("no".into())
+        )));
+        assert!(!is_unknown_property_error(&fdo_error(
+            fdo::Error::NameHasNoOwner("gone".into())
+        )));
+        assert!(!is_unknown_property_error(&zbus::Error::Failure(
+            "x".into()
+        )));
+        assert_eq!(optional(Ok(1), 0).unwrap(), 1);
+        assert_eq!(
+            optional(Err(fdo_error(fdo::Error::UnknownProperty("x".into()))), 7).unwrap(),
+            7
+        );
+        assert!(optional(Err(fdo_error(fdo::Error::AccessDenied("x".into()))), 7).is_err());
     }
 
     #[test]

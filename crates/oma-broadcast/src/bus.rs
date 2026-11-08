@@ -7,8 +7,8 @@
 //! flag), so `status`, `cameras` and `watch` never trigger D-Bus activation.
 //! The generated property getters of [`obc_ipc::OmaBroadcastProxy`] (and its
 //! cache, filled by a `GetAll` without that flag) would. Methods go through
-//! the proxy, without the flag: `on`, `off` and `camera` may start the daemon
-//! when its activation file is installed.
+//! the proxy, without the flag: `on`, `off`, `camera` and `effect <effect>`
+//! may start the daemon when its activation file is installed.
 
 use std::time::Duration;
 
@@ -25,7 +25,7 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Exit status: success.
 pub const EXIT_OK: u8 = 0;
 /// Exit status: the daemon rejected the request (`NoSuchCamera`,
-/// `InvalidConfig`, `Unavailable`, `Failed`).
+/// `InvalidConfig`, `InvalidArgument`, `Unavailable`, `Failed`).
 pub const EXIT_REJECTED: u8 = 1;
 /// Exit status: invalid command line (clap's own status).
 pub const EXIT_USAGE: u8 = 2;
@@ -33,6 +33,10 @@ pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_NOT_RUNNING: u8 = 3;
 /// Exit status: any other D-Bus failure, a timeout, or a failed write.
 pub const EXIT_FAILURE: u8 = 4;
+
+/// The first `InterfaceRevision` with the effect controls (`BlurStrength`,
+/// `BackgroundImage`, `SetEffect` and its siblings).
+pub const EFFECTS_REVISION: u32 = 2;
 
 /// How to start the daemon, quoted in the not-running message.
 pub const START_HINT: &str = "systemctl --user start oma-broadcastd";
@@ -46,6 +50,8 @@ pub enum Failure {
     NoBus(String),
     /// The daemon replied with one of its errors.
     Rejected(IpcError),
+    /// The daemon is too old for the request (its `InterfaceRevision`).
+    Unsupported(String),
     /// Anything else.
     Other(String),
 }
@@ -75,7 +81,7 @@ impl Failure {
     pub fn exit_code(&self) -> u8 {
         match self {
             Failure::NotRunning(_) | Failure::NoBus(_) => EXIT_NOT_RUNNING,
-            Failure::Rejected(_) => EXIT_REJECTED,
+            Failure::Rejected(_) | Failure::Unsupported(_) => EXIT_REJECTED,
             Failure::Other(_) => EXIT_FAILURE,
         }
     }
@@ -92,10 +98,26 @@ impl Failure {
     /// One line for a person.
     pub fn message(&self) -> String {
         match self {
-            Failure::NotRunning(m) | Failure::NoBus(m) | Failure::Other(m) => m.clone(),
+            Failure::NotRunning(m)
+            | Failure::NoBus(m)
+            | Failure::Other(m)
+            | Failure::Unsupported(m) => m.clone(),
             Failure::Rejected(e) => e.message(),
         }
     }
+}
+
+/// Fails unless a daemon of interface revision `revision` has the effect
+/// controls: an older one has no `SetEffect`, and its `Effect` is always
+/// `none`.
+pub fn require_effects(revision: u32) -> Result<(), Failure> {
+    if revision >= EFFECTS_REVISION {
+        return Ok(());
+    }
+    Err(Failure::Unsupported(format!(
+        "the daemon does not support effects (its interface revision is {revision}, \
+         effects need {EFFECTS_REVISION}); update oma-broadcastd"
+    )))
 }
 
 /// The D-Bus error name and description carried by `e`, if it is an error
@@ -179,8 +201,10 @@ pub async fn fetch(conn: &Connection) -> Result<Snapshot, Failure> {
     }
 }
 
-/// The interface proxy for method calls and signals. Uncached: its property
-/// getters are not used, and an uncached proxy makes no call when built.
+/// The interface proxy for method calls and signals. Uncached: an uncached
+/// proxy makes no call when built, and its property getters each make a
+/// fresh `Get` call (as `effect` needs for `InterfaceRevision`) instead of
+/// reading a cache that may be stale.
 pub async fn proxy(conn: &Connection) -> Result<OmaBroadcastProxy<'static>, Failure> {
     OmaBroadcastProxy::builder(conn)
         .cache_properties(CacheProperties::No)
@@ -221,6 +245,22 @@ mod tests {
         );
         assert_eq!(Failure::Other("x".into()).exit_code(), EXIT_FAILURE);
         assert_eq!(Failure::Other("x".into()).json_code(), "dbus-error");
+        assert_eq!(Failure::Unsupported("x".into()).exit_code(), EXIT_REJECTED);
+    }
+
+    #[test]
+    fn effects_need_revision_2() {
+        assert!(require_effects(EFFECTS_REVISION).is_ok());
+        assert!(require_effects(EFFECTS_REVISION + 1).is_ok());
+        let f = require_effects(1).unwrap_err();
+        assert_eq!(f.exit_code(), EXIT_REJECTED);
+        assert!(
+            f.message()
+                .starts_with("the daemon does not support effects")
+                && f.message().ends_with("; update oma-broadcastd"),
+            "{}",
+            f.message()
+        );
     }
 
     #[test]
@@ -253,5 +293,9 @@ mod tests {
         let f = classify_ipc(IpcError::Unavailable("no camera".into()));
         assert_eq!(f.exit_code(), EXIT_REJECTED);
         assert_eq!(f.message(), "no camera");
+
+        let f = classify_ipc(IpcError::InvalidArgument("no background image".into()));
+        assert_eq!(f.exit_code(), EXIT_REJECTED);
+        assert_eq!(f.message(), "no background image");
     }
 }
