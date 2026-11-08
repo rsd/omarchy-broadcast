@@ -1,6 +1,6 @@
 # ADR-0012: Video effects in the Process stage, the inference backend seam and the Maxine backend
 
-- **Status:** Accepted; amended by [ADR-0013](0013-mask-hardening-cuda-kernel.md) (the green-screen mask is hardened by a small CUDA kernel before either effect uses it). Implements [ADR-0003](0003-maxine-first-behind-backend-seam.md) (amends its binding approach) and fills the Process stage of [ADR-0009](0009-ingest-process-output.md). Extends the D-Bus API of [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md) within interface version 1.
+- **Status:** Accepted; amended by [ADR-0013](0013-mask-hardening-cuda-kernel.md) (the green-screen mask is hardened by a small CUDA kernel before either effect uses it), and amended on 2026-11-08 in the Consequences note on the os-release override (the Arch package and the per-user install script now install the shim). Implements [ADR-0003](0003-maxine-first-behind-backend-seam.md) (amends its binding approach) and fills the Process stage of [ADR-0009](0009-ingest-process-output.md). Extends the D-Bus API of [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md) within interface version 1.
 
 ## Context
 - The Process stage sits at the head of the output pipeline and receives canonical frames: NV12 in CUDA memory, at the output size, with the contract's colour label ([ADR-0009](0009-ingest-process-output.md)). Until now it was empty.
@@ -82,7 +82,7 @@
 - A repeated frame is processed again. That costs GPU time while the camera is slower than the contract, and it keeps the element stateless with respect to the clock.
 - The first activation with an effect shows black for the model load and the first run, from a fraction of a second up to a few seconds on a cold cache.
 - The SDK's own libraries stay mapped in the process after an unload; only the models, their GPU memory and the CUDA resources are released. A few MiB of the SDK's runtime state stay allocated in the stream's context after an unload, until that context is destroyed.
-- The os-release override is a per-user, per-process configuration that users apply themselves: they build and install the shim and the drop-in. It is documented, not installed and not shipped as a default.
+- The os-release override is per-user, per-process configuration that each user activates. *Amended 2026-11-08:* the Arch package installs the shim and its replacement os-release under `/usr/lib/oma-broadcast/`, and `scripts/install-user.sh` builds them into `~/.local/lib/oma-broadcast/` when `make` and a C compiler are present; neither enables them. After installing the SDK, the user copies the example drop-in. The shim is a compatibility shim for distributions the SDK does not list, and NVIDIA does not support that configuration. It is expected to move later to a separate, user-built NVIDIA SDK packaging project, so that this repository can ship without it.
 - The shim depends on the SDK reading the file through an interposable libc call. A future SDK version that reads it with a raw system call, or that checks something other than `/etc/os-release`, would make the load fail again with the SDK's reason; the Maxine hardware tests detect it.
 
 ## Alternatives considered
