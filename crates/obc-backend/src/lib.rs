@@ -320,7 +320,8 @@ pub enum BackendError {
     /// Loading an effect failed; `code` is the backend's status code.
     #[error("{message}")]
     Load {
-        /// The backend's status code (for Maxine, an `NvCV_Status`).
+        /// The backend's status code (for Maxine, an `NvCV_Status`; for a
+        /// CUDA driver call, a `CUresult`, and the message names the call).
         code: i32,
         /// What failed and what to do about it.
         message: String,

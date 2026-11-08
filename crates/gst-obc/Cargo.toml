@@ -22,6 +22,9 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The fail-closed hardware test drives the real Maxine backend through the
+# element (tests/hardware.rs, `maxine_*`).
+obc-backend-maxine = { workspace = true }
 
 [lints]
 workspace = true

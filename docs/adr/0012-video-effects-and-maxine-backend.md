@@ -1,6 +1,6 @@
 # ADR-0012: Video effects in the Process stage, the inference backend seam and the Maxine backend
 
-- **Status:** Accepted. Implements [ADR-0003](0003-maxine-first-behind-backend-seam.md) (amends its binding approach) and fills the Process stage of [ADR-0009](0009-ingest-process-output.md). Extends the D-Bus API of [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md) within interface version 1.
+- **Status:** Accepted; amended by [ADR-0013](0013-mask-hardening-cuda-kernel.md) (the green-screen mask is hardened by a small CUDA kernel before either effect uses it). Implements [ADR-0003](0003-maxine-first-behind-backend-seam.md) (amends its binding approach) and fills the Process stage of [ADR-0009](0009-ingest-process-output.md). Extends the D-Bus API of [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md) within interface version 1.
 
 ## Context
 - The Process stage sits at the head of the output pipeline and receives canonical frames: NV12 in CUDA memory, at the output size, with the contract's colour label ([ADR-0009](0009-ingest-process-output.md)). Until now it was empty.
@@ -16,7 +16,7 @@
 
 ### Effects
 - Three effects: `none`, `blur` (background blur, strength 0 to 1, default 0.5) and `replace` (background replacement with an image file, scaled to the output size with a centre crop to fill).
-- Both `blur` and `replace` use the green-screen mask. `blur` passes frame and mask to `BackgroundBlur`; `replace` composites the frame over the background image through the mask with `NvCVImage_Composite`. No custom CUDA kernel is needed.
+- Both `blur` and `replace` use the green-screen mask. `blur` passes frame and mask to `BackgroundBlur`; `replace` composites the frame over the background image through the mask with `NvCVImage_Composite`. Both effects use the mask after the hardening step of [ADR-0013](0013-mask-hardening-cuda-kernel.md), a small CUDA kernel that maps the raw mask through a fixed table; the SDK's own mask is never used directly.
 - The green-screen effect runs in quality mode with its temporal state allocated, which reduces mask flicker between frames.
 
 ### One effect element, always present

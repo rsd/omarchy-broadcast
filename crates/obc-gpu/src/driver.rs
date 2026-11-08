@@ -25,6 +25,10 @@ pub type CuEvent = *mut c_void;
 pub type CuDevice = i32;
 /// `CUdeviceptr`, a device address.
 pub type CuDevicePtr = u64;
+/// `CUmodule`, an opaque driver handle to loaded code.
+pub type CuModule = *mut c_void;
+/// `CUfunction`, an opaque driver handle to a kernel of a [`CuModule`].
+pub type CuFunction = *mut c_void;
 
 pub(crate) const CUDA_SUCCESS: CuResult = 0;
 /// `CUDA_ERROR_NOT_READY`: returned by `cuEventQuery` while work is pending.
@@ -117,6 +121,26 @@ pub struct Driver {
     pub(crate) cuEventQuery: unsafe extern "C" fn(CuEvent) -> CuResult,
     pub(crate) cuEventSynchronize: unsafe extern "C" fn(CuEvent) -> CuResult,
     pub(crate) cuEventElapsedTime: unsafe extern "C" fn(*mut f32, CuEvent, CuEvent) -> CuResult,
+    pub(crate) cuModuleLoadData: unsafe extern "C" fn(*mut CuModule, *const c_void) -> CuResult,
+    pub(crate) cuModuleGetFunction:
+        unsafe extern "C" fn(*mut CuFunction, CuModule, *const c_char) -> CuResult,
+    /// Grid x/y/z, block x/y/z, dynamic shared memory bytes, stream,
+    /// kernel parameters, extra options.
+    #[allow(clippy::type_complexity)]
+    pub(crate) cuLaunchKernel: unsafe extern "C" fn(
+        CuFunction,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        CuStream,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> CuResult,
+    pub(crate) cuModuleUnload: unsafe extern "C" fn(CuModule) -> CuResult,
     cuGetErrorName: unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult,
     cuGetErrorString: unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult,
 }
@@ -194,6 +218,10 @@ impl Driver {
                 cuEventQuery: sym(&lib, "cuEventQuery")?,
                 cuEventSynchronize: sym(&lib, "cuEventSynchronize")?,
                 cuEventElapsedTime: sym(&lib, "cuEventElapsedTime")?,
+                cuModuleLoadData: sym(&lib, "cuModuleLoadData")?,
+                cuModuleGetFunction: sym(&lib, "cuModuleGetFunction")?,
+                cuLaunchKernel: sym(&lib, "cuLaunchKernel")?,
+                cuModuleUnload: sym(&lib, "cuModuleUnload")?,
                 cuGetErrorName: sym(&lib, "cuGetErrorName")?,
                 cuGetErrorString: sym(&lib, "cuGetErrorString")?,
                 _lib: lib,

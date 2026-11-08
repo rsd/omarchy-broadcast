@@ -18,7 +18,7 @@ PREFIX=$(dirname "$MAXINE_VFX_ROOT")                 # holds VideoFX/ and env.sh
 | Item | Requirement | Check |
 |---|---|---|
 | GPU | NVIDIA, compute capability 7.5 or newer (Turing and up). Tested on the reference machine: RTX 5080 Laptop, CC 12.0 (sm_120) | `nvidia-smi --query-gpu=name,compute_cap --format=csv` |
-| Driver | 570.26 or newer. Tested: 615.78.08 | `nvidia-smi --query-gpu=driver_version --format=csv,noheader` |
+| Driver | 570.26 or newer. Tested: 615.78.08. The mask-hardening kernel ([ADR-0013](../adr/0013-mask-hardening-cuda-kernel.md)) does not raise this floor or the GPU floor | `nvidia-smi --query-gpu=driver_version --format=csv,noheader` |
 | System CUDA toolkit | Not needed. The SDK bundles CUDA 12.8, cuDNN 9.7.1 and TensorRT 10.9 and only takes `libcuda.so.1` from the driver (`nvidia-utils`) | |
 | Tools | `curl`, `unzip`, `jq`, `gcc` (also builds the os-release shim in step 7), `make` | `pacman -S --needed curl unzip jq gcc make` |
 | Disk | About 4.5 GB for the final install. Peak about 8 GB while the downloads (2.7 GB) and the extracted tree coexist | `df -h ~` |
@@ -327,6 +327,8 @@ The background image for `replace` must be a PNG or JPEG file. Until an effect i
 | No `models_linux_sm<SM>` for your GPU | GPU architecture not in the 1.3.0.0 matrix | List with step 5; Turing/Ampere/Ada/Hopper/Blackwell (sm75 to sm120) are covered |
 | `NvVFX_Load` succeeds but a program hangs at start | Cold first run (see step 9 observation) | Wait a few seconds; the probe prints the time |
 | The daemon's `Error` property reads `effect blur unavailable: NvVFX_Load(GreenScreen) returned -1209 (...): the SDK rejected this distribution (its model loader reads /etc/os-release). Run the process with the os-release override (docs/setup/maxine.md, section 7)` and the state is `error` | The daemon runs without the shim: the drop-in is not installed, `daemon-reload` and a restart were skipped, or its paths do not match your installation. With the default `on_failure = "black"` the virtual camera stays black | Install the drop-in (step 7a) and check `systemctl --user show oma-broadcastd -p Environment`; a `cannot be preloaded` line in `journalctl --user -u oma-broadcastd` means the library path is wrong |
+| The daemon's `Error` property or the element's status names the mask-hardening kernel and a CUDA error `222` ("the NVIDIA driver is older than this build supports") | The driver rejects the PTX of the mask-hardening kernel: it is older than 570.26 | Update the NVIDIA driver to 570.26 or newer (`nvidia-smi --query-gpu=driver_version --format=csv,noheader`). With the default `on_failure = "black"` the virtual camera stays black until then |
+| The same, with CUDA error `221` | The driver cannot JIT-compile the kernel: `libnvidia-ptxjitcompiler.so.1` is missing from the driver installation | Reinstall the driver's userspace package (`nvidia-utils`) so that it provides `libnvidia-ptxjitcompiler.so.1`; check with `ldconfig -p \| grep ptxjitcompiler` |
 | `ld.so: object '...os-release-shim.so' from LD_PRELOAD cannot be preloaded` | The shim library is not at the path in `LD_PRELOAD`; the program runs without it | Build and install it, or check the paths in the drop-in (step 7) |
 
 ## 11. Licence and support notes
