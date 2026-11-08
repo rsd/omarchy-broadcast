@@ -37,6 +37,8 @@ pub mod session;
 pub mod slot;
 pub mod stamp;
 pub mod stats;
+#[cfg(test)]
+mod test_support;
 
 pub use capability::{Capabilities, IngestPath, ModeChoice, choose_mode};
 pub use clock::{PacerCounts, TickKind};

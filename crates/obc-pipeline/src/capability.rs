@@ -365,7 +365,7 @@ pub fn choose_mode(caps: &Capabilities, req: &ModeRequest) -> Option<ModeChoice>
 
 /// Converts a decimal frame rate as `v4l2-ctl` prints it (`30.000`, `7.500`,
 /// `29.970`) back to the fraction the driver reports.
-fn fraction_from_decimal(fps: f64) -> Option<(u32, u32)> {
+pub(crate) fn fraction_from_decimal(fps: f64) -> Option<(u32, u32)> {
     if !(fps.is_finite() && fps > 0.0) {
         return None;
     }

@@ -61,6 +61,12 @@
 //! `GstCudaContext` when the pipeline opens; [`Output::cuda_context`] hands
 //! it to every ingest pipeline so canonical frames stay in one context.
 //!
+//! **System memory.** Inside the crate the same output can also carry
+//! canonical frames in system memory (`FrameMemory::System`), for the
+//! CPU-only tests: no `cudadownload`, `videoconvert` in place of
+//! `cudaconvert`, a black placeholder made on the CPU, and no CUDA context.
+//! The Process stage must then be empty.
+//!
 //! **Loopback check.** [`Output::start`] compares what the loopback accepts
 //! with the contract once, before streaming
 //! ([`crate::pipeline::MediaPipeline::prepare`]).
@@ -85,7 +91,7 @@ use obc_core::{ColourRange, OutputContract, OutputFormat};
 use serde::Serialize;
 
 use crate::clock::{Latest, Pacer, PacerConfig, PacerCounts, PhaseLockConfig, Step, TickKind};
-use crate::frame::{Canonical, Frame, FrameWriter};
+use crate::frame::{Canonical, Frame, FrameMemory, FrameWriter};
 use crate::ingest::CUDA_CONTEXT_TYPE;
 use crate::pipeline::{
     MediaPipeline, PipelineError, add_linked, capsfilter, cuda_caps, make, names,
@@ -353,6 +359,7 @@ pub struct Output {
     observer: Option<EmitObserver>,
     cuda: Option<gst::Context>,
     clock: Option<ClockThread>,
+    memory: FrameMemory,
 }
 
 impl std::fmt::Debug for Output {
@@ -451,19 +458,31 @@ impl Output {
     /// inspected and probed before [`Self::start`]. A contract the sink
     /// cannot carry is refused here ([`check_sink_range`]).
     pub fn build(cfg: OutputConfig) -> Result<Self, PipelineError> {
+        Self::build_in(cfg, FrameMemory::Cuda)
+    }
+
+    /// [`Self::build`] for canonical frames in `memory` (see the module
+    /// docs).
+    pub(crate) fn build_in(cfg: OutputConfig, memory: FrameMemory) -> Result<Self, PipelineError> {
         use names::*;
         let contract = cfg.contract;
         contract
             .validate()
             .map_err(|e| PipelineError::Caps(e.to_string()))?;
         check_sink_range(&contract, &cfg.sink)?;
+        if memory == FrameMemory::System && cfg.process != GpuStage::Passthrough {
+            return Err(PipelineError::Cuda(format!(
+                "the {} process stage needs frames in CUDA memory",
+                cfg.process
+            )));
+        }
         let canonical = Canonical::of(&contract);
         let pipeline = gst::Pipeline::with_name("obc-output");
         let queue = cfg.pacer().max_burst;
 
         let src_caps = parse_caps(&format!(
             "{},framerate={}/{}",
-            canonical.caps_string(),
+            memory.caps_string(&canonical),
             contract.fps_num,
             contract.fps_den
         ))?;
@@ -471,18 +490,27 @@ impl Output {
 
         let mut chain: Vec<gst::Element> = vec![appsrc.clone().upcast()];
         chain.extend(process_elements(cfg.process, canonical.colorimetry)?);
-        if contract.format != OutputFormat::Nv12 {
-            chain.push(make("cudaconvert", TO_OUT)?);
-            chain.push(capsfilter(
-                OUT_CUDA_CAPS,
-                &format!(
-                    "{},colorimetry={}",
-                    cuda_caps(contract.format.gst_name()),
-                    canonical.colorimetry
-                ),
-            )?);
+        match memory {
+            FrameMemory::Cuda => {
+                if contract.format != OutputFormat::Nv12 {
+                    chain.push(make("cudaconvert", TO_OUT)?);
+                    chain.push(capsfilter(
+                        OUT_CUDA_CAPS,
+                        &format!(
+                            "{},colorimetry={}",
+                            cuda_caps(contract.format.gst_name()),
+                            canonical.colorimetry
+                        ),
+                    )?);
+                }
+                chain.push(make("cudadownload", DOWNLOAD)?);
+            }
+            // Already in system memory: DOWNLOAD_CAPS fixes the format.
+            FrameMemory::System if contract.format != OutputFormat::Nv12 => {
+                chain.push(make("videoconvert", TO_OUT)?);
+            }
+            FrameMemory::System => {}
         }
-        chain.push(make("cudadownload", DOWNLOAD)?);
         // System memory with the canonical label, then the sink's label on
         // the same buffers (see the module docs).
         chain.push(capsfilter(
@@ -534,6 +562,7 @@ impl Output {
             observer: None,
             cuda: None,
             clock: None,
+            memory,
         })
     }
 
@@ -560,9 +589,15 @@ impl Output {
 
     fn start_inner(&mut self) -> Result<(), PipelineError> {
         self.pipeline.prepare()?;
-        let cuda = self.acquire_cuda_context()?;
-        let placeholder = make_placeholder(&self.canonical, &cuda)?;
-        self.cuda = Some(cuda);
+        let (cuda, placeholder) = match self.memory {
+            FrameMemory::Cuda => {
+                let cuda = self.acquire_cuda_context()?;
+                let placeholder = make_placeholder(&self.canonical, &cuda)?;
+                (Some(cuda), placeholder)
+            }
+            FrameMemory::System => (None, black_frame(&self.canonical)),
+        };
+        self.cuda = cuda;
         self.pipeline
             .pipeline()
             .set_state(gst::State::Playing)
@@ -638,6 +673,12 @@ impl Output {
     pub fn frame_writer(&self) -> FrameWriter {
         let id = self.next_source.fetch_add(1, Ordering::Relaxed);
         FrameWriter::new(Arc::clone(&self.slot), self.epoch, id, self.canonical)
+            .in_memory(self.memory)
+    }
+
+    /// Where the canonical frames this output takes live.
+    pub(crate) fn memory(&self) -> FrameMemory {
+        self.memory
     }
 
     /// Holds the last frame while a source switch waits for `source_id`:
@@ -925,8 +966,22 @@ fn nv12_layout(width: u32, height: u32) -> (usize, usize) {
     (luma, luma + stride * (height as usize / 2))
 }
 
+/// One black canonical frame in system memory.
+fn black_frame(canonical: &Canonical) -> gst::Buffer {
+    let (luma, size) = nv12_layout(canonical.width, canonical.height);
+    let (y, uv) = canonical.black();
+    let mut data = vec![uv; size];
+    data[..luma].fill(y);
+    let mut buffer = gst::Buffer::from_mut_slice(data);
+    buffer
+        .get_mut()
+        .expect("a new buffer is writable")
+        .set_pts(gst::ClockTime::ZERO);
+    buffer
+}
+
 /// One black canonical frame in CUDA memory of the context `cuda`, made by
-/// uploading a system-memory frame through a one-shot pipeline:
+/// uploading [`black_frame`] through a one-shot pipeline:
 /// `appsrc ! cudaupload ! capsfilter (canonical) ! appsink`.
 fn make_placeholder(
     canonical: &Canonical,
@@ -955,16 +1010,7 @@ fn make_placeholder(
     let p = MediaPipeline::from_parts(pipeline, None);
     p.play()?;
 
-    let (luma, size) = nv12_layout(canonical.width, canonical.height);
-    let (y, uv) = canonical.black();
-    let mut data = vec![uv; size];
-    data[..luma].fill(y);
-    let mut buffer = gst::Buffer::from_mut_slice(data);
-    buffer
-        .get_mut()
-        .expect("a new buffer is writable")
-        .set_pts(gst::ClockTime::ZERO);
-    let pushed = src.push_buffer(buffer).is_ok() && src.end_of_stream().is_ok();
+    let pushed = src.push_buffer(black_frame(canonical)).is_ok() && src.end_of_stream().is_ok();
     let sample = if pushed {
         sink.try_pull_sample(gst::ClockTime::from_seconds(5))
     } else {
@@ -990,6 +1036,7 @@ fn make_placeholder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::require_elements;
 
     #[test]
     fn nv12_layout_matches_video_info() {
@@ -1045,14 +1092,24 @@ mod tests {
         check_sink_range(&OutputContract::default(), &loopback).unwrap();
         check_sink_range(&full, &OutputSink::Fake).unwrap();
 
-        // Output::build applies it before building anything.
-        if !have(&["cudadownload", "capssetter", "v4l2sink", "fakesink"]) {
-            return;
-        }
+        // Output::build applies it before building anything (no element is
+        // made, so no CUDA element is needed).
+        gst::init().unwrap();
         assert!(matches!(
             Output::build(OutputConfig::new(full, loopback)),
             Err(PipelineError::LoopbackRefused { .. })
         ));
+    }
+
+    /// A full-range contract builds for a sink that carries the range.
+    #[test]
+    #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+    fn gpu_a_fakesink_takes_a_full_range_contract() {
+        require_elements(&["cudadownload", "capssetter", "fakesink"]);
+        let full = OutputContract {
+            range: ColourRange::Full,
+            ..OutputContract::default()
+        };
         Output::build(OutputConfig::new(full, OutputSink::Fake)).unwrap();
     }
 
@@ -1119,8 +1176,9 @@ mod tests {
     /// catch-up burst is the same bound. (Until v0.2.0 both followed the
     /// 1 s resynchronisation threshold: 31 buffers at 30 fps.)
     #[test]
-    fn the_appsrc_queue_is_the_configured_bound_and_the_burst_cap() {
-        gst::init().unwrap();
+    #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+    fn gpu_the_appsrc_queue_is_the_configured_bound_and_the_burst_cap() {
+        require_elements(&["cudadownload", "capssetter", "fakesink"]);
         for (rate, queue) in [
             ("30", None),
             ("60", Some(5)),
@@ -1157,9 +1215,7 @@ mod tests {
     /// loaded machine does not change the outcome.
     #[test]
     fn a_slow_sink_sees_bounded_queue_and_frame_age() {
-        if !have(&["fakesink"]) {
-            return;
-        }
+        require_elements(&["appsrc", "fakesink"]);
         const BOUND: u64 = 3;
         const SERVICE: Duration = Duration::from_millis(100);
         let period = Duration::from_nanos(1_000_000_000 / 30);
@@ -1284,30 +1340,18 @@ mod tests {
         assert!(s.is_set());
     }
 
-    fn have(factories: &[&str]) -> bool {
-        gst::init().unwrap();
-        for f in factories {
-            if gst::ElementFactory::find(f).is_none() {
-                eprintln!("SKIPPED: GStreamer element {f} is not installed");
-                return false;
-            }
-        }
-        true
-    }
-
     /// The pipeline per contract format and process stage, without starting
     /// it (no GPU needed).
     #[test]
-    fn output_elements_per_format_and_stage() {
-        if !have(&[
+    #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+    fn gpu_output_elements_per_format_and_stage() {
+        require_elements(&[
             "cudaconvert",
             "cudadownload",
             "capssetter",
             "v4l2sink",
             "fakesink",
-        ]) {
-            return;
-        }
+        ]);
         for (format, stage) in [
             (OutputFormat::Nv12, GpuStage::Passthrough),
             (OutputFormat::I420, GpuStage::Passthrough),
@@ -1379,6 +1423,44 @@ mod tests {
             fake.frame_writer().source_id(),
             fake.frame_writer().source_id()
         );
+    }
+
+    /// System-memory frames: no download, `videoconvert` in place of
+    /// `cudaconvert` for a contract format other than NV12, and a Process
+    /// stage that needs CUDA refused. CPU only.
+    #[test]
+    fn a_system_memory_output_has_no_cuda_element() {
+        require_elements(&["appsrc", "videoconvert", "capssetter", "fakesink"]);
+        for format in [OutputFormat::Nv12, OutputFormat::I420] {
+            let contract = OutputContract {
+                format,
+                ..OutputContract::default()
+            };
+            let o = Output::build_in(
+                OutputConfig::new(contract, OutputSink::Fake),
+                FrameMemory::System,
+            )
+            .unwrap();
+            let p = o.pipeline();
+            assert!(p.element(names::DOWNLOAD).is_none(), "{format}");
+            assert!(p.element(names::OUT_CUDA_CAPS).is_none(), "{format}");
+            assert_eq!(
+                p.element(names::TO_OUT)
+                    .map(|e| e.factory().unwrap().name().to_string()),
+                (format == OutputFormat::I420).then(|| "videoconvert".to_string()),
+                "{format}"
+            );
+            let src = p.element(names::FRAMES_SRC).unwrap();
+            let caps = src.property::<gst::Caps>("caps").to_string();
+            assert!(!caps.contains("CUDAMemory"), "{caps}");
+            assert_eq!(o.frame_writer().memory(), FrameMemory::System);
+        }
+        let mut cfg = OutputConfig::new(OutputContract::default(), OutputSink::Fake);
+        cfg.process = GpuStage::Roundtrip;
+        assert!(matches!(
+            Output::build_in(cfg, FrameMemory::System),
+            Err(PipelineError::Cuda(_))
+        ));
     }
 
     #[test]

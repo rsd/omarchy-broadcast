@@ -291,67 +291,153 @@ pub fn scan_sysfs() -> Vec<DeviceInfo> {
 
 /// [`scan_sysfs`], with `want` as for [`list_cameras`].
 fn scan_sysfs_for(want: Option<&ModeRequest>) -> Vec<DeviceInfo> {
-    let Ok(entries) = fs::read_dir(SYSFS_V4L) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("video"))
-        .collect();
-    names.sort_by_key(|n| {
-        n.trim_start_matches("video")
-            .parse::<u32>()
-            .unwrap_or(u32::MAX)
-    });
-    names
-        .into_iter()
-        .filter_map(|n| probe_node(&Path::new("/dev").join(n), want))
-        .collect()
+    Discovery::system().scan(want)
 }
 
 /// Builds a [`DeviceInfo`] for one node from sysfs and, for non-loopback
 /// nodes, `VIDIOC_QUERYCAP`. Returns `None` if the node has no sysfs entry.
 /// `want` as for [`list_cameras`].
 pub fn probe_node(path: &Path, want: Option<&ModeRequest>) -> Option<DeviceInfo> {
-    let node = path.file_name()?.to_str()?;
-    let class_dir = Path::new(SYSFS_V4L).join(node);
-    let name = fs::read_to_string(class_dir.join("name")).ok()?;
-    let real = fs::canonicalize(&class_dir).ok();
-    let is_virtual = real
-        .as_ref()
-        .is_some_and(|r| r.components().any(|c| c.as_os_str() == "virtual"));
-    let usb = real.as_deref().and_then(usb_id_from_sysfs);
+    Discovery::system().probe(path, want)
+}
 
-    // Never open a loopback node to identify it: an open counts as an opener
-    // (and, with exclusive_caps, flips what the node advertises).
-    let qc = if is_virtual { None } else { query_cap(path) };
-    let (driver, caps, loopback) = match &qc {
-        Some(q) => (
-            Some(q.driver.clone()),
-            Some(q.caps),
-            DeviceInfo::is_loopback_driver(Some(&q.driver), Some(&q.bus_info)),
-        ),
-        None => (None, None, is_virtual && looks_like_loopback(&class_dir)),
-    };
-    let capture = caps.is_some_and(DeviceInfo::capture_from_caps);
-    let capabilities = match caps {
-        Some(c) if capture && !loopback => enumerate_formats(path, c, want),
-        _ => None,
-    };
-    Some(DeviceInfo {
-        path: path.to_path_buf(),
-        card: qc
+/// Where the sysfs scan reads the video4linux class and finds device nodes,
+/// and what answers the node queries. [`Discovery::system`] is the live
+/// system; tests replay captured cameras through a fake tree and
+/// [`V4l2Queries`].
+pub(crate) struct Discovery<Q> {
+    /// The video4linux class directory (`/sys/class/video4linux`).
+    pub(crate) sysfs_v4l: PathBuf,
+    /// The directory holding the device nodes (`/dev`).
+    pub(crate) dev: PathBuf,
+    pub(crate) nodes: Q,
+}
+
+impl Discovery<SystemNodes> {
+    /// The live system: `/sys/class/video4linux`, `/dev` and real ioctls.
+    pub(crate) fn system() -> Self {
+        Discovery {
+            sysfs_v4l: PathBuf::from(SYSFS_V4L),
+            dev: PathBuf::from("/dev"),
+            nodes: SystemNodes,
+        }
+    }
+}
+
+impl<Q: V4l2Queries> Discovery<Q> {
+    /// Probes every `videoN` entry of the class directory, in node order.
+    pub(crate) fn scan(&self, want: Option<&ModeRequest>) -> Vec<DeviceInfo> {
+        let Ok(entries) = fs::read_dir(&self.sysfs_v4l) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("video"))
+            .collect();
+        names.sort_by_key(|n| {
+            n.trim_start_matches("video")
+                .parse::<u32>()
+                .unwrap_or(u32::MAX)
+        });
+        names
+            .into_iter()
+            .filter_map(|n| self.probe(&self.dev.join(n), want))
+            .collect()
+    }
+
+    /// [`probe_node`] against this tree and these queries.
+    pub(crate) fn probe(&self, path: &Path, want: Option<&ModeRequest>) -> Option<DeviceInfo> {
+        let node = path.file_name()?.to_str()?;
+        let class_dir = self.sysfs_v4l.join(node);
+        let name = fs::read_to_string(class_dir.join("name")).ok()?;
+        let real = fs::canonicalize(&class_dir).ok();
+        let is_virtual = real
             .as_ref()
-            .map_or_else(|| name.trim().to_string(), |q| q.card.clone()),
-        driver: driver.or_else(|| loopback.then(|| crate::device::LOOPBACK_DRIVER.to_string())),
-        usb,
-        caps,
-        capture,
-        loopback,
-        source: DiscoverySource::Sysfs,
-        capabilities,
-    })
+            .is_some_and(|r| r.components().any(|c| c.as_os_str() == "virtual"));
+        let usb = real.as_deref().and_then(usb_id_from_sysfs);
+
+        // Never open a loopback node to identify it: an open counts as an
+        // opener (and, with exclusive_caps, flips what the node advertises).
+        let qc = if is_virtual {
+            None
+        } else {
+            self.nodes.query_cap(path)
+        };
+        let (driver, caps, loopback) = match &qc {
+            Some(q) => (
+                Some(q.driver.clone()),
+                Some(q.caps),
+                DeviceInfo::is_loopback_driver(Some(&q.driver), Some(&q.bus_info)),
+            ),
+            None => (None, None, is_virtual && looks_like_loopback(&class_dir)),
+        };
+        let capture = caps.is_some_and(DeviceInfo::capture_from_caps);
+        let capabilities = match caps {
+            Some(c) if capture && !loopback => enumerate_with(&self.nodes, path, c, want),
+            _ => None,
+        };
+        Some(DeviceInfo {
+            path: path.to_path_buf(),
+            card: qc
+                .as_ref()
+                .map_or_else(|| name.trim().to_string(), |q| q.card.clone()),
+            driver: driver.or_else(|| loopback.then(|| crate::device::LOOPBACK_DRIVER.to_string())),
+            usb,
+            caps,
+            capture,
+            loopback,
+            source: DiscoverySource::Sysfs,
+            capabilities,
+        })
+    }
+}
+
+/// The queries discovery issues on a device node. [`SystemNodes`] issues the
+/// real ioctls; every call leaves the node as it was (nothing is set and
+/// nothing streams).
+pub(crate) trait V4l2Queries {
+    /// A node opened for format enumeration (closed on drop).
+    type Node: V4l2Enum;
+    /// `VIDIOC_QUERYCAP` (open, query, close); `None` if either fails.
+    fn query_cap(&self, path: &Path) -> Option<QueryCap>;
+    /// Opens the node for [`V4l2Enum`]; `None` if it cannot be opened.
+    fn open(&self, path: &Path) -> Option<Self::Node>;
+}
+
+/// The enumeration ioctls on one open node. Each returns `None` once the
+/// driver rejects the index (`EINVAL` ends every enumeration).
+pub(crate) trait V4l2Enum {
+    /// `VIDIOC_ENUM_FMT`: the fourcc code at `index` for buffer type `buf_type`.
+    fn enum_fmt(&self, buf_type: u32, index: u32) -> Option<u32>;
+    /// `VIDIOC_ENUM_FRAMESIZES`: the entry type and its union (discrete:
+    /// `width, height`; stepwise/continuous: `min_w, max_w, step_w, min_h,
+    /// max_h, step_h`).
+    fn enum_frame_sizes(&self, pixel_format: u32, index: u32) -> Option<(u32, [u32; 6])>;
+    /// `VIDIOC_ENUM_FRAMEINTERVALS`: the entry type and its union (discrete:
+    /// the interval `num, den`; stepwise/continuous: `min, max, step` as
+    /// `num, den` pairs).
+    fn enum_frame_intervals(
+        &self,
+        pixel_format: u32,
+        width: u32,
+        height: u32,
+        index: u32,
+    ) -> Option<(u32, [u32; 6])>;
+}
+
+/// The live system's node queries: real V4L2 ioctls.
+pub(crate) struct SystemNodes;
+
+/// A node opened read-only and non-blocking.
+pub(crate) struct OpenNode(fs::File);
+
+fn open_node(path: &Path) -> Option<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .ok()
 }
 
 /// A virtual video4linux node is v4l2loopback when it carries the
@@ -413,32 +499,41 @@ fn cstr(bytes: &[u8]) -> String {
 /// Opens the node read-only and non-blocking, issues `VIDIOC_QUERYCAP` and
 /// closes it. Does not start streaming or change any format.
 pub fn query_cap(path: &Path) -> Option<QueryCap> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-        .ok()?;
-    let mut cap = V4l2Capability {
-        driver: [0; 16],
-        card: [0; 32],
-        bus_info: [0; 32],
-        version: 0,
-        capabilities: 0,
-        device_caps: 0,
-        reserved: [0; 3],
-    };
-    // SAFETY: `cap` is a properly sized and aligned `struct v4l2_capability`
-    // that outlives the call, and the fd is open for the duration.
-    let rc = unsafe { libc::ioctl(file.as_raw_fd(), VIDIOC_QUERYCAP as _, &mut cap) };
-    if rc != 0 {
-        return None;
+    SystemNodes.query_cap(path)
+}
+
+impl V4l2Queries for SystemNodes {
+    type Node = OpenNode;
+
+    fn query_cap(&self, path: &Path) -> Option<QueryCap> {
+        let file = open_node(path)?;
+        let mut cap = V4l2Capability {
+            driver: [0; 16],
+            card: [0; 32],
+            bus_info: [0; 32],
+            version: 0,
+            capabilities: 0,
+            device_caps: 0,
+            reserved: [0; 3],
+        };
+        // SAFETY: `cap` is a properly sized and aligned `struct
+        // v4l2_capability` that outlives the call, and the fd is open for
+        // the duration.
+        let rc = unsafe { libc::ioctl(file.as_raw_fd(), VIDIOC_QUERYCAP as _, &mut cap) };
+        if rc != 0 {
+            return None;
+        }
+        Some(QueryCap {
+            driver: cstr(&cap.driver),
+            card: cstr(&cap.card),
+            bus_info: cstr(&cap.bus_info),
+            caps: DeviceInfo::effective_caps(cap.capabilities, cap.device_caps),
+        })
     }
-    Some(QueryCap {
-        driver: cstr(&cap.driver),
-        card: cstr(&cap.card),
-        bus_info: cstr(&cap.bus_info),
-        caps: DeviceInfo::effective_caps(cap.capabilities, cap.device_caps),
-    })
+
+    fn open(&self, path: &Path) -> Option<OpenNode> {
+        open_node(path).map(OpenNode)
+    }
 }
 
 /// `V4L2_BUF_TYPE_VIDEO_CAPTURE`
@@ -526,6 +621,57 @@ fn fourcc_string(code: u32) -> String {
     code.to_le_bytes().iter().map(|&b| b as char).collect()
 }
 
+impl V4l2Enum for OpenNode {
+    fn enum_fmt(&self, buf_type: u32, index: u32) -> Option<u32> {
+        let mut desc = V4l2FmtDesc {
+            index,
+            type_: buf_type,
+            flags: 0,
+            description: [0; 32],
+            pixelformat: 0,
+            mbus_code: 0,
+            reserved: [0; 3],
+        };
+        // SAFETY: VIDIOC_ENUM_FMT takes a `struct v4l2_fmtdesc`.
+        unsafe { ioctl_rw(self.0.as_raw_fd(), VIDIOC_ENUM_FMT, &mut desc) }
+            .then_some(desc.pixelformat)
+    }
+
+    fn enum_frame_sizes(&self, pixel_format: u32, index: u32) -> Option<(u32, [u32; 6])> {
+        let mut e = V4l2FrmSizeEnum {
+            index,
+            pixel_format,
+            type_: 0,
+            u: [0; 6],
+            reserved: [0; 2],
+        };
+        // SAFETY: VIDIOC_ENUM_FRAMESIZES takes a `struct v4l2_frmsizeenum`.
+        unsafe { ioctl_rw(self.0.as_raw_fd(), VIDIOC_ENUM_FRAMESIZES, &mut e) }
+            .then_some((e.type_, e.u))
+    }
+
+    fn enum_frame_intervals(
+        &self,
+        pixel_format: u32,
+        width: u32,
+        height: u32,
+        index: u32,
+    ) -> Option<(u32, [u32; 6])> {
+        let mut e = V4l2FrmIvalEnum {
+            index,
+            pixel_format,
+            width,
+            height,
+            type_: 0,
+            u: [0; 6],
+            reserved: [0; 2],
+        };
+        // SAFETY: VIDIOC_ENUM_FRAMEINTERVALS takes a `struct v4l2_frmivalenum`.
+        unsafe { ioctl_rw(self.0.as_raw_fd(), VIDIOC_ENUM_FRAMEINTERVALS, &mut e) }
+            .then_some((e.type_, e.u))
+    }
+}
+
 /// Lists the capture modes of the node at `path` (`device_caps` from
 /// `VIDIOC_QUERYCAP`). Opens the node read-only and non-blocking, enumerates
 /// and closes it; no format is set and nothing streams. `want`: a requested
@@ -537,12 +683,17 @@ pub fn enumerate_formats(
     device_caps: u32,
     want: Option<&ModeRequest>,
 ) -> Option<Capabilities> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-        .ok()?;
-    let fd = file.as_raw_fd();
+    enumerate_with(&SystemNodes, path, device_caps, want)
+}
+
+/// [`enumerate_formats`] through `nodes`.
+fn enumerate_with(
+    nodes: &impl V4l2Queries,
+    path: &Path,
+    device_caps: u32,
+    want: Option<&ModeRequest>,
+) -> Option<Capabilities> {
+    let node = nodes.open(path)?;
     let buf_type = if device_caps & crate::device::CAP_VIDEO_CAPTURE != 0 {
         BUF_TYPE_VIDEO_CAPTURE
     } else {
@@ -551,23 +702,11 @@ pub fn enumerate_formats(
     let want_size = want.map(|r| (r.width, r.height));
     let want_rate = want.map(|r| (r.fps_num, r.fps_den));
     collect_capabilities(
-        |index| {
-            let mut desc = V4l2FmtDesc {
-                index,
-                type_: buf_type,
-                flags: 0,
-                description: [0; 32],
-                pixelformat: 0,
-                mbus_code: 0,
-                reserved: [0; 3],
-            };
-            // SAFETY: VIDIOC_ENUM_FMT takes a `struct v4l2_fmtdesc`.
-            unsafe { ioctl_rw(fd, VIDIOC_ENUM_FMT, &mut desc) }.then_some(desc.pixelformat)
-        },
+        |index| node.enum_fmt(buf_type, index),
         |pixel_format| {
             let mut out = Vec::new();
-            for (w, h) in frame_sizes(fd, pixel_format, want_size) {
-                for (num, den) in frame_rates(fd, pixel_format, w, h, want_rate) {
+            for (w, h) in frame_sizes(&node, pixel_format, want_size) {
+                for (num, den) in frame_rates(&node, pixel_format, w, h, want_rate) {
                     out.push((w, h, num, den));
                 }
             }
@@ -676,25 +815,21 @@ fn rates_in_range(type_: u32, u: [u32; 6], want: Option<(u32, u32)>) -> Vec<(u32
 
 /// Discrete sizes as listed; a stepwise/continuous range contributes
 /// [`sizes_in_range`].
-fn frame_sizes(fd: libc::c_int, pixel_format: u32, want: Option<(u32, u32)>) -> Vec<(u32, u32)> {
+fn frame_sizes(
+    node: &impl V4l2Enum,
+    pixel_format: u32,
+    want: Option<(u32, u32)>,
+) -> Vec<(u32, u32)> {
     let mut out = Vec::new();
     for index in 0..MAX_ENUM {
-        let mut e = V4l2FrmSizeEnum {
-            index,
-            pixel_format,
-            type_: 0,
-            u: [0; 6],
-            reserved: [0; 2],
-        };
-        // SAFETY: VIDIOC_ENUM_FRAMESIZES takes a `struct v4l2_frmsizeenum`.
-        if !unsafe { ioctl_rw(fd, VIDIOC_ENUM_FRAMESIZES, &mut e) } {
+        let Some((type_, u)) = node.enum_frame_sizes(pixel_format, index) else {
             break;
-        }
-        if e.type_ == TYPE_DISCRETE {
-            out.push((e.u[0], e.u[1]));
+        };
+        if type_ == TYPE_DISCRETE {
+            out.push((u[0], u[1]));
             continue;
         }
-        out.extend(sizes_in_range(e.u, want));
+        out.extend(sizes_in_range(u, want));
         break; // a range is the only entry
     }
     out
@@ -703,7 +838,7 @@ fn frame_sizes(fd: libc::c_int, pixel_format: u32, want: Option<(u32, u32)>) -> 
 /// Discrete rates as listed (fps = 1 / interval); a stepwise/continuous range
 /// contributes [`rates_in_range`].
 fn frame_rates(
-    fd: libc::c_int,
+    node: &impl V4l2Enum,
     pixel_format: u32,
     width: u32,
     height: u32,
@@ -711,24 +846,14 @@ fn frame_rates(
 ) -> Vec<(u32, u32)> {
     let mut out = Vec::new();
     for index in 0..MAX_ENUM {
-        let mut e = V4l2FrmIvalEnum {
-            index,
-            pixel_format,
-            width,
-            height,
-            type_: 0,
-            u: [0; 6],
-            reserved: [0; 2],
-        };
-        // SAFETY: VIDIOC_ENUM_FRAMEINTERVALS takes a `struct v4l2_frmivalenum`.
-        if !unsafe { ioctl_rw(fd, VIDIOC_ENUM_FRAMEINTERVALS, &mut e) } {
+        let Some((type_, u)) = node.enum_frame_intervals(pixel_format, width, height, index) else {
             break;
-        }
-        if e.type_ == TYPE_DISCRETE {
-            out.push((e.u[1], e.u[0]));
+        };
+        if type_ == TYPE_DISCRETE {
+            out.push((u[1], u[0]));
             continue;
         }
-        out.extend(rates_in_range(e.type_, e.u, want));
+        out.extend(rates_in_range(type_, u, want));
         break;
     }
     out
@@ -1064,6 +1189,579 @@ mod tests {
             };
             assert_eq!(sorted(&a), sorted(&b));
             assert_eq!(a.is_colour(), b.is_colour());
+        }
+    }
+
+    /// Fixture replay of the sysfs scan: a fake video4linux tree under the
+    /// temp dir and fake node queries that answer `VIDIOC_QUERYCAP` from
+    /// `tests/data/v4l2-querycap.txt` and the enumeration ioctls from
+    /// `v4l2-ctl --list-formats-ext` dumps.
+    mod replay {
+        use super::*;
+        use crate::capability::{IngestPath, choose_mode, fraction_from_decimal, parse_v4l2_ctl};
+        use crate::device::{LOOPBACK_DRIVER, select_camera, select_sink};
+        use obc_core::{CameraSelector, PixelFormat, SinkSelector, VideoMode};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        const BRIO: UsbId = UsbId {
+            vendor: 0x046d,
+            product: 0x0944,
+        };
+        const FHD: UsbId = UsbId {
+            vendor: 0x5986,
+            product: 0x1193,
+        };
+        const YUYV_ONLY: UsbId = UsbId {
+            vendor: 0x1209,
+            product: 0x0001,
+        };
+        const BRIO_CTL: &str = "mx-brio-046d-0944.v4l2-ctl.txt";
+        const FHD_CTL: &str = "fhd-camera-5986-1193-colour.v4l2-ctl.txt";
+        const FHD_IR_CTL: &str = "fhd-camera-5986-1193-ir.v4l2-ctl.txt";
+        const YUYV_ONLY_CTL: &str = "synthetic-yuyv-only-1209-0001.v4l2-ctl.txt";
+
+        fn data(name: &str) -> String {
+            let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/data")
+                .join(name);
+            fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+        }
+
+        /// One `Size:` entry of a dump with the `Interval:` entries under it,
+        /// as the ioctls report them (type and union).
+        struct SizeEntry {
+            width: u32,
+            height: u32,
+            intervals: Vec<(u32, [u32; 6])>,
+        }
+
+        /// One `[N]: 'FOURCC'` entry of a dump.
+        struct FormatEntry {
+            code: u32,
+            sizes: Vec<SizeEntry>,
+        }
+
+        fn fourcc_code(s: &str) -> u32 {
+            let mut b = [b' '; 4];
+            for (d, c) in b.iter_mut().zip(s.bytes()) {
+                *d = c;
+            }
+            u32::from_le_bytes(b)
+        }
+
+        /// The enumeration ioctls' answers recorded in a `v4l2-ctl
+        /// --list-formats-ext` dump: every format (ingestible or not), its
+        /// discrete sizes and their discrete intervals. The interval
+        /// fraction is recovered from the printed frame rate. The dumps in
+        /// `tests/data` hold only discrete entries; any other entry fails
+        /// the test rather than replay something the dump does not state.
+        fn ioctl_answers(text: &str) -> Vec<FormatEntry> {
+            let mut formats: Vec<FormatEntry> = Vec::new();
+            for line in text.lines() {
+                let t = line.trim();
+                if t.starts_with('[') {
+                    let fourcc = t.split('\'').nth(1).expect(t);
+                    formats.push(FormatEntry {
+                        code: fourcc_code(fourcc),
+                        sizes: Vec::new(),
+                    });
+                } else if let Some(rest) = t.strip_prefix("Size: Discrete ") {
+                    let (w, h) = rest.split_once('x').expect(t);
+                    formats.last_mut().expect(t).sizes.push(SizeEntry {
+                        width: w.trim().parse().expect(t),
+                        height: h.trim().parse().expect(t),
+                        intervals: Vec::new(),
+                    });
+                } else if let Some(rest) = t.strip_prefix("Interval: Discrete ") {
+                    let fps: f64 = rest
+                        .split_once('(')
+                        .and_then(|(_, r)| r.split_whitespace().next())
+                        .and_then(|v| v.parse().ok())
+                        .expect(t);
+                    let (num, den) = fraction_from_decimal(fps).expect(t);
+                    let size = formats.last_mut().and_then(|f| f.sizes.last_mut());
+                    // The interval is the inverse of the rate.
+                    size.expect(t)
+                        .intervals
+                        .push((TYPE_DISCRETE, [den, num, 0, 0, 0, 0]));
+                } else {
+                    assert!(
+                        !t.starts_with("Size:") && !t.starts_with("Interval:"),
+                        "the replay has no answer for {t:?}"
+                    );
+                }
+            }
+            formats
+        }
+
+        /// A node opened by [`FakeNodes`], answering from its dump.
+        struct FakeNode(Rc<Vec<FormatEntry>>);
+
+        impl FakeNode {
+            fn format(&self, code: u32) -> Option<&FormatEntry> {
+                self.0.iter().find(|f| f.code == code)
+            }
+        }
+
+        impl V4l2Enum for FakeNode {
+            fn enum_fmt(&self, buf_type: u32, index: u32) -> Option<u32> {
+                assert_eq!(buf_type, BUF_TYPE_VIDEO_CAPTURE);
+                self.0.get(index as usize).map(|f| f.code)
+            }
+
+            fn enum_frame_sizes(&self, pixel_format: u32, index: u32) -> Option<(u32, [u32; 6])> {
+                let s = self.format(pixel_format)?.sizes.get(index as usize)?;
+                Some((TYPE_DISCRETE, [s.width, s.height, 0, 0, 0, 0]))
+            }
+
+            fn enum_frame_intervals(
+                &self,
+                pixel_format: u32,
+                width: u32,
+                height: u32,
+                index: u32,
+            ) -> Option<(u32, [u32; 6])> {
+                self.format(pixel_format)?
+                    .sizes
+                    .iter()
+                    .find(|s| (s.width, s.height) == (width, height))?
+                    .intervals
+                    .get(index as usize)
+                    .copied()
+            }
+        }
+
+        /// What one fake `/dev/videoN` answers.
+        struct Reply {
+            qc: QueryCap,
+            /// The enumeration answers; `None` for a node without video capture.
+            formats: Option<Rc<Vec<FormatEntry>>>,
+        }
+
+        /// Node queries answered from fixtures; every query and open is
+        /// recorded, so a test can tell which nodes were touched.
+        #[derive(Default)]
+        struct FakeNodes {
+            replies: HashMap<PathBuf, Reply>,
+            queried: RefCell<Vec<PathBuf>>,
+            opened: RefCell<Vec<PathBuf>>,
+        }
+
+        impl V4l2Queries for FakeNodes {
+            type Node = FakeNode;
+
+            fn query_cap(&self, path: &Path) -> Option<QueryCap> {
+                self.queried.borrow_mut().push(path.to_path_buf());
+                self.replies.get(path).map(|r| r.qc.clone())
+            }
+
+            fn open(&self, path: &Path) -> Option<FakeNode> {
+                self.opened.borrow_mut().push(path.to_path_buf());
+                let formats = self.replies.get(path)?.formats.clone()?;
+                Some(FakeNode(formats))
+            }
+        }
+
+        /// One row of `tests/data/v4l2-querycap.txt`.
+        struct NodeRow {
+            qc: QueryCap,
+            formats: Option<String>,
+        }
+
+        /// The nodes of the USB camera `usb`, in node order.
+        fn querycap_rows(usb: UsbId) -> Vec<NodeRow> {
+            let key = usb.to_string();
+            let rows: Vec<NodeRow> = data("v4l2-querycap.txt")
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .filter_map(|l| {
+                    let f: Vec<&str> = l.split('|').map(str::trim).collect();
+                    assert_eq!(f.len(), 7, "{l}");
+                    (f[0] == key).then(|| {
+                        let hex = |s: &str| u32::from_str_radix(&s[2..], 16).expect(l);
+                        NodeRow {
+                            qc: QueryCap {
+                                driver: f[1].into(),
+                                card: f[2].into(),
+                                bus_info: f[3].into(),
+                                caps: DeviceInfo::effective_caps(hex(f[4]), hex(f[5])),
+                            },
+                            formats: (f[6] != "-").then(|| f[6].to_string()),
+                        }
+                    })
+                })
+                .collect();
+            assert!(!rows.is_empty(), "no QUERYCAP rows for {key}");
+            rows
+        }
+
+        /// A video4linux sysfs tree in a fresh temp dir, laid out as the
+        /// kernel does: `class/video4linux/videoN` links to the node's
+        /// device directory, below its USB interface and USB device (which
+        /// carries `idVendor`/`idProduct`, as does the root hub above it),
+        /// or below `devices/virtual` for v4l2loopback. Removed on drop.
+        struct FakeSysfs {
+            root: PathBuf,
+        }
+
+        const HUB: &str = "devices/pci0000:00/0000:00:14.0/usb3";
+
+        impl FakeSysfs {
+            fn new() -> Self {
+                static NEXT: AtomicU32 = AtomicU32::new(0);
+                let root = std::env::temp_dir().join(format!(
+                    "obc-sysfs-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                let _ = fs::remove_dir_all(&root);
+                let t = FakeSysfs { root };
+                fs::create_dir_all(t.class()).unwrap();
+                fs::create_dir_all(t.dev()).unwrap();
+                t.ids(HUB, 0x1d6b, 0x0003);
+                t
+            }
+
+            fn class(&self) -> PathBuf {
+                self.root.join("sys/class/video4linux")
+            }
+
+            fn dev(&self) -> PathBuf {
+                self.root.join("dev")
+            }
+
+            fn ids(&self, rel: &str, vendor: u16, product: u16) {
+                let d = self.root.join("sys").join(rel);
+                fs::create_dir_all(&d).unwrap();
+                fs::write(d.join("idVendor"), format!("{vendor:04x}\n")).unwrap();
+                fs::write(d.join("idProduct"), format!("{product:04x}\n")).unwrap();
+            }
+
+            /// A class entry `node` for the device dir `sys/<rel>`.
+            fn entry(&self, node: &str, rel: &str, name: &str) -> PathBuf {
+                let real = self.root.join("sys").join(rel);
+                fs::create_dir_all(&real).unwrap();
+                fs::write(real.join("name"), format!("{name}\n")).unwrap();
+                std::os::unix::fs::symlink(format!("../../{rel}"), self.class().join(node))
+                    .unwrap();
+                real
+            }
+
+            /// A node of the USB device on hub port `port`.
+            fn usb_node(&self, n: u32, port: u32, usb: UsbId, name: &str) {
+                let dev = format!("{HUB}/3-{port}");
+                self.ids(&dev, usb.vendor, usb.product);
+                self.entry(
+                    &format!("video{n}"),
+                    &format!("{dev}/3-{port}:1.0/video4linux/video{n}"),
+                    name,
+                );
+            }
+
+            fn loopback_node(&self, n: u32, label: &str) {
+                let real = self.entry(
+                    &format!("video{n}"),
+                    &format!("devices/virtual/video4linux/video{n}"),
+                    label,
+                );
+                fs::write(real.join("max_openers"), "10\n").unwrap();
+                fs::write(real.join("buffers"), "2\n").unwrap();
+            }
+        }
+
+        impl Drop for FakeSysfs {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+
+        /// A USB camera of the QUERYCAP table, on hub port `port`, whose
+        /// nodes start at `/dev/video<first>`.
+        struct Camera {
+            usb: UsbId,
+            port: u32,
+            first: u32,
+        }
+
+        /// Builds the tree and the fake queries for `cameras` and one
+        /// loopback node per `(N, label)`.
+        fn machine(
+            cameras: &[Camera],
+            loopbacks: &[(u32, &str)],
+        ) -> (FakeSysfs, Discovery<FakeNodes>) {
+            let sysfs = FakeSysfs::new();
+            let mut nodes = FakeNodes::default();
+            for cam in cameras {
+                for (i, row) in querycap_rows(cam.usb).into_iter().enumerate() {
+                    let n = cam.first + i as u32;
+                    sysfs.usb_node(n, cam.port, cam.usb, &row.qc.card);
+                    let formats = row.formats.map(|f| Rc::new(ioctl_answers(&data(&f))));
+                    nodes.replies.insert(
+                        sysfs.dev().join(format!("video{n}")),
+                        Reply {
+                            qc: row.qc,
+                            formats,
+                        },
+                    );
+                }
+            }
+            for &(n, label) in loopbacks {
+                sysfs.loopback_node(n, label);
+            }
+            let discovery = Discovery {
+                sysfs_v4l: sysfs.class(),
+                dev: sysfs.dev(),
+                nodes,
+            };
+            (sysfs, discovery)
+        }
+
+        /// The laptop of the captured fixtures: the built-in camera (colour,
+        /// metadata, IR, metadata nodes) at video0..3, the external camera
+        /// (colour, metadata) at video4..5, a loopback at video10, and a
+        /// sub-device entry that is not a video node.
+        fn laptop() -> (FakeSysfs, Discovery<FakeNodes>) {
+            let (sysfs, d) = machine(
+                &[
+                    Camera {
+                        usb: FHD,
+                        port: 6,
+                        first: 0,
+                    },
+                    Camera {
+                        usb: BRIO,
+                        port: 2,
+                        first: 4,
+                    },
+                ],
+                &[(10, "Omarchy Broadcast")],
+            );
+            sysfs.entry(
+                "v4l-subdev0",
+                "devices/platform/sensor/video4linux/v4l-subdev0",
+                "sensor",
+            );
+            (sysfs, d)
+        }
+
+        fn req(s: &str) -> ModeRequest {
+            s.parse().unwrap()
+        }
+
+        fn mode(s: &str) -> VideoMode {
+            s.parse().unwrap()
+        }
+
+        fn sel(s: &str) -> CameraSelector {
+            s.parse().unwrap()
+        }
+
+        /// The sysfs scan over a laptop with a colour+IR built-in camera, an
+        /// external camera and a loopback yields exactly the hand-built
+        /// device lists of the selection tests: QUERYCAP data for real
+        /// nodes, sysfs data for the loopback, which is never queried, and
+        /// capabilities equal to the parsed dumps.
+        #[test]
+        fn sysfs_scan_replays_cameras_and_skips_the_loopback() {
+            let (sysfs, d) = laptop();
+            let devs = d.scan(None);
+            let dev = |n: u32| sysfs.dev().join(format!("video{n}"));
+            let paths: Vec<PathBuf> = devs.iter().map(|x| x.path.clone()).collect();
+            assert_eq!(paths, [0, 1, 2, 3, 4, 5, 10].map(dev));
+
+            let cards: Vec<&str> = devs.iter().map(|x| x.card.as_str()).collect();
+            assert_eq!(
+                cards,
+                [
+                    "FHD Camera: FHD Camera",
+                    "FHD Camera: FHD Camera",
+                    "FHD Camera: FHD IR Camera",
+                    "FHD Camera: FHD IR Camera",
+                    "MX Brio",
+                    "MX Brio",
+                    "Omarchy Broadcast",
+                ]
+            );
+            let usb: Vec<Option<UsbId>> = devs.iter().map(|x| x.usb).collect();
+            let f = Some(FHD);
+            let b = Some(BRIO);
+            assert_eq!(usb, [f, f, f, f, b, b, None]);
+            let capture: Vec<bool> = devs.iter().map(|x| x.capture).collect();
+            assert_eq!(capture, [true, false, true, false, true, false, false]);
+            let loopback: Vec<bool> = devs.iter().map(|x| x.loopback).collect();
+            assert_eq!(loopback, [false, false, false, false, false, false, true]);
+            for x in &devs {
+                assert_eq!(x.source, DiscoverySource::Sysfs);
+                let driver = if x.loopback {
+                    LOOPBACK_DRIVER
+                } else {
+                    "uvcvideo"
+                };
+                assert_eq!(x.driver.as_deref(), Some(driver), "{x}");
+            }
+            assert_eq!(devs[0].caps, Some(0x0420_0001));
+            assert_eq!(devs[1].caps, Some(0x0480_0000));
+            assert_eq!(devs[6].caps, None);
+
+            let parsed = |name: &str| Some(parse_v4l2_ctl(&data(name)));
+            let caps: Vec<Option<Capabilities>> =
+                devs.iter().map(|x| x.capabilities.clone()).collect();
+            assert_eq!(
+                caps,
+                [
+                    parsed(FHD_CTL),
+                    None,
+                    parsed(FHD_IR_CTL),
+                    None,
+                    parsed(BRIO_CTL),
+                    None,
+                    None,
+                ]
+            );
+
+            // QUERYCAP on every real node, never on the loopback (nor on the
+            // sub-device); only video-capture nodes are opened to enumerate.
+            assert_eq!(*d.nodes.queried.borrow(), [0, 1, 2, 3, 4, 5].map(dev));
+            assert_eq!(*d.nodes.opened.borrow(), [0, 2, 4].map(dev));
+
+            // The IR node is a capture node but not a colour camera.
+            assert!(devs[2].capture && !devs[2].is_colour_camera());
+            assert!(devs[0].is_colour_camera() && devs[4].is_colour_camera());
+        }
+
+        /// Selection and mode choice on the replayed list match the tests
+        /// over hand-built lists and parsed dumps.
+        #[test]
+        fn selection_on_replayed_devices_picks_the_colour_nodes() {
+            let (sysfs, d) = laptop();
+            let devs = d.scan(None);
+            let dev = |n: u32| sysfs.dev().join(format!("video{n}"));
+
+            // A vid:pid or a name that also matches the IR node picks the colour node.
+            for s in ["5986:1193", "FHD Camera"] {
+                let got = select_camera(&devs, Some(&sel(s)), &req("1920x1080@60")).unwrap();
+                assert_eq!(got.device.path, dev(0), "{s}");
+                assert_eq!(got.choice.mode, mode("MJPEG:1920x1080@30"));
+                assert!(!got.choice.exact);
+                assert_eq!(got.choice.ingest, IngestPath::CpuDecode);
+                assert_eq!(got.choice.differences, vec!["fps 60 -> 30".to_string()]);
+            }
+            for s in ["046d:0944", "brio"] {
+                let got = select_camera(&devs, Some(&sel(s)), &req("NV12:1920x1080@60")).unwrap();
+                assert_eq!(got.device.path, dev(4), "{s}");
+                assert_eq!(got.choice.mode, mode("NV12:1920x1080@60"));
+                assert!(got.choice.exact);
+                assert_eq!(got.choice.ingest, IngestPath::GpuDirect);
+            }
+            let caps = devs[4].capabilities.as_ref().unwrap();
+            let got = choose_mode(caps, &req("3840x2160@30")).unwrap();
+            assert_eq!(got.mode, mode("MJPEG:3840x2160@30"));
+            assert_eq!(got.ingest, IngestPath::CpuDecode);
+            let caps = devs[0].capabilities.as_ref().unwrap();
+            assert_eq!(
+                choose_mode(caps, &req("640x360@30")).unwrap().mode,
+                mode("YUY2:640x360@30")
+            );
+
+            // Auto pick: the first camera that is exact.
+            let got = select_camera(&devs, None, &req("1920x1080@60")).unwrap();
+            assert_eq!(got.device.path, dev(4));
+            let got = select_camera(&devs, None, &req("1280x720@30")).unwrap();
+            assert_eq!(got.device.path, dev(0));
+
+            // The IR node, named explicitly, is an error, not a fallback.
+            let err = select_camera(&devs, Some(&sel("FHD IR")), &req("640x360@15")).unwrap_err();
+            assert!(err.to_string().contains("GREY"), "{err}");
+
+            // The loopback, read from sysfs alone, is the sink.
+            let sink = select_sink(&devs, &SinkSelector::default()).unwrap();
+            assert_eq!(sink.path, dev(10));
+        }
+
+        /// Probing a node directly (an explicit `/dev/videoN`) follows the
+        /// same rules: a loopback is identified without being opened, and a
+        /// node without a sysfs entry is unknown.
+        #[test]
+        fn direct_probe_identifies_a_loopback_without_opening_it() {
+            let (sysfs, d) = laptop();
+            let lb = d.probe(&sysfs.dev().join("video10"), None).unwrap();
+            assert!(lb.loopback && !lb.capture);
+            assert_eq!(lb.card, "Omarchy Broadcast");
+            assert_eq!(lb.usb, None);
+            assert_eq!(lb.capabilities, None);
+            assert!(d.probe(&sysfs.dev().join("video99"), None).is_none());
+            assert!(d.nodes.queried.borrow().is_empty());
+            assert!(d.nodes.opened.borrow().is_empty());
+
+            // A virtual node without the loopback attributes is not a loopback.
+            sysfs.entry("video11", "devices/virtual/video4linux/video11", "vivid");
+            let other = d.probe(&sysfs.dev().join("video11"), None).unwrap();
+            assert!(!other.loopback && !other.capture);
+            assert_eq!(other.driver, None);
+            assert!(d.nodes.queried.borrow().is_empty());
+        }
+
+        /// A camera whose only format is discrete YUYV (no MJPEG, no NV12):
+        /// discovered like any other, it keeps the requested size and drops
+        /// the rate, and always takes the CPU-convert ingest path.
+        #[test]
+        fn yuyv_only_camera_keeps_the_size_drops_the_rate_and_converts_on_cpu() {
+            let (sysfs, d) = machine(
+                &[Camera {
+                    usb: YUYV_ONLY,
+                    port: 3,
+                    first: 0,
+                }],
+                &[(10, "Omarchy Broadcast")],
+            );
+            let devs = d.scan(None);
+            let dev = |n: u32| sysfs.dev().join(format!("video{n}"));
+            assert_eq!(devs.len(), 3);
+            let cam = &devs[0];
+            assert_eq!(cam.usb, Some(YUYV_ONLY));
+            assert!(cam.is_colour_camera());
+            assert!(!devs[1].capture);
+            let caps = cam.capabilities.as_ref().unwrap();
+            assert_eq!(*caps, parse_v4l2_ctl(&data(YUYV_ONLY_CTL)));
+            assert_eq!(caps.formats(), vec![PixelFormat::Yuy2]);
+            assert!(caps.other_formats.is_empty());
+            assert!(caps.modes.contains(&mode("YUY2:640x480@15/2")));
+            assert_eq!(*d.nodes.opened.borrow(), [dev(0)]);
+
+            // 1080p60: the size is offered (at 5 fps only); size beats rate.
+            let got = select_camera(&devs, None, &req("1920x1080@60")).unwrap();
+            assert_eq!(got.device.path, dev(0));
+            assert_eq!(got.choice.mode, mode("YUY2:1920x1080@5"));
+            assert!(!got.choice.exact);
+            assert_eq!(got.choice.differences, vec!["fps 60 -> 5".to_string()]);
+            assert_eq!(got.choice.ingest, IngestPath::CpuConvert);
+            assert_eq!(
+                got.choice.ingest.upload_format(got.choice.mode.format),
+                "NV12"
+            );
+
+            // A format the camera lacks degrades the format too.
+            let got =
+                select_camera(&devs, Some(&sel("1209:0001")), &req("NV12:1280x720@30")).unwrap();
+            assert_eq!(got.choice.mode, mode("YUY2:1280x720@10"));
+            assert_eq!(
+                got.choice.differences,
+                vec![
+                    "fps 30 -> 10".to_string(),
+                    "format NV12 -> YUY2".to_string()
+                ]
+            );
+
+            // Where the camera reaches the rate, the choice is exact.
+            let got =
+                select_camera(&devs, Some(&sel("Synthetic YUYV")), &req("640x480@30")).unwrap();
+            assert_eq!(got.device.path, dev(0));
+            assert_eq!(got.choice.mode, mode("YUY2:640x480@30"));
+            assert!(got.choice.exact);
+            assert_eq!(got.choice.ingest, IngestPath::CpuConvert);
         }
     }
 }
