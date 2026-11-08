@@ -234,11 +234,46 @@ OBC_TEST_CAMERA=046d:0944 OBC_TEST_SINK=/dev/video11 \
   cargo test -p obc-pipeline --test hardware -- --ignored maxine_ --test-threads=1
 ```
 
-- `obc-backend-maxine` (2 tests): the backend refuses calls without the CUDA context or a load; blur and replace in a context created like GStreamer's, with per-stage GPU times, load times and GPU memory logged. The SDK works in the pushed context: afterwards the device's primary context is inactive.
-- `gst-obc` (6 tests) and `obc-gpu` (1 test): the element against the real backend, and the driver helpers.
+- `obc-backend-maxine` (5 tests in `tests/hardware.rs`): the backend refuses calls without the CUDA context or a load; blur and replace in a context created like GStreamer's, with per-stage GPU times, load times and GPU memory logged. The SDK works in the pushed context: afterwards the device's primary context is inactive. The mask hardening has three more (see [The hardened mask](#the-hardened-mask)).
+- `gst-obc` (7 tests) and `obc-gpu` (3 tests): the element against the real backend, and the driver helpers and the mask kernel. `gst-obc` has `obc-backend-maxine` as a dev-dependency for `maxine_mask_kernel_failures_show_black_with_the_reason`, which needs the Maxine environment above.
 - `maxine_effects_end_to_end_keep_the_rate_and_release_the_gpu` (`obc-pipeline`): camera, session and output with `blur`, then `replace`, then `none`; each phase keeps the contract rate at the sink, the effect becomes ready, its statistics are sane, and after the output stops the process holds no CUDA context.
 
 The frames in these tests are synthetic, so the mask the model produces for them is not predictable; the tests assert what holds for any mask and log the rest.
+
+### The hardened mask
+
+The mask hardening ([ADR-0013](adr/0013-mask-hardening-cuda-kernel.md)) is tested at four levels.
+
+Default suite, no GPU:
+
+- `obc-backend-maxine`, `src/matte.rs`: the table's exact entries (`the_fixed_ramp_has_the_documented_entries`), that it is monotone and equals a floating-point reference for all 256 values, that a ramp that does not rise is refused, and the host reference `apply_lut` on pitched and odd-sized planes (padding untouched).
+- `obc-gpu`, `src/kernel.rs`: `the_embedded_ptx_is_pinned_to_isa_7_0_and_sm_75`, which fails if the PTX is regenerated with a newer nvcc (a newer `.version` would silently raise the driver floor), the single NUL-terminated string, the seven-parameter entry point, the block size, and that the load errors for CUDA codes 222 and 221 say what to fix.
+- `obc-backend-maxine`, `src/lib.rs`: the fault switch is off unless armed from Rust, and a kernel setup failure fails the load.
+
+```sh
+cargo test -p obc-gpu -- --ignored ptxas
+```
+
+`ptxas_assembles_the_committed_ptx_for_sm_75_and_sm_120` (ignored, needs the CUDA toolkit's `ptxas` on the path) assembles the committed PTX for both architectures.
+
+GPU tests (need an NVIDIA GPU and, for the last two rows, the Maxine environment of the previous section; run with `--ignored --test-threads=1`):
+
+| Test | What it shows |
+|---|---|
+| `obc-gpu`: `gpu_lut8_matches_the_host_table_bit_for_bit` | The kernel equals the host table at 1920x1080 and at 513x289 with a pitch larger than the width, for an identity, the hardening and a permutation table; padding bytes keep their sentinel value |
+| `obc-gpu`: `gpu_lut8_failures_are_errors_and_leave_the_context_usable` | Invalid PTX and a bad launch are errors, and the context works afterwards |
+| `obc-backend-maxine`: `maxine_the_effects_read_the_hardened_mask_not_the_raw_one` | The hardened mask is the table applied to the raw mask; where the raw mask is below 128 the output is the background in `replace`, and where the hardened mask is 255 the output is the camera frame; the counts are logged so a mask with no soft band is visible |
+| `obc-backend-maxine`: `maxine_a_mask_kernel_that_does_not_load_fails_the_load`, `maxine_a_mask_kernel_that_does_not_launch_fails_the_frame` | A forced kernel failure is a load error or a frame error, and never produces a frame from the raw mask |
+| `gst-obc`: `maxine_mask_kernel_failures_show_black_with_the_reason` | Through the element, a kernel setup, launch or asynchronous failure shows black with the reason in the status, and no frame carries the raw mask |
+
+The synthetic frames of these tests contain no person, so the model's soft edge is not exercised. `crates/obc-backend-maxine/tests/mask_frames.rs` does it on recorded camera frames:
+
+```sh
+OBC_MASK_FRAMES=/path/to/frames \
+  cargo test -p obc-backend-maxine --test mask_frames -- --ignored --test-threads=1 --nocapture
+```
+
+`the_hardened_mask_hides_the_room_on_recorded_camera_frames` fails if `OBC_MASK_FRAMES` is unset. The directory holds one subdirectory per camera sequence, each with consecutive packed NV12 1920x1080 frames named `*.nv12` (limited-range BT.601, a person in frame, about 40 frames); the module documentation of the test has the layout and a `gst-launch-1.0` recording command. The frames are local and are never committed. Each sequence is replayed through `replace` on a solid background, and on every frame the test checks that the hardened mask is the table applied to the raw one, that no pixel the model rates below 128 shows anything but the background, and that the partly mixed edge band is at most half as wide in pixels as with the raw mask, in the mask and in the output. It also checks that the frames are able to tell the two masks apart (some background-side pixels would have shown the room with the raw mask), and logs the edge flicker for reference.
 
 ### Daemon effects test (ignored)
 

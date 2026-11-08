@@ -17,7 +17,9 @@
 //! * [`mem_get_info`], [`primary_context_active`], [`current_context`]:
 //!   lifecycle checks;
 //! * [`OwnedContext`]: a context created with `cuCtxCreate`, as GStreamer's
-//!   CUDA library creates one, for tests.
+//!   CUDA library creates one, for tests;
+//! * [`Lut8`]: the one custom kernel, a byte lookup table over a pitched
+//!   8-bit plane, shipped as PTX and compiled by the driver at load time.
 //!
 //! Unless stated otherwise every call needs a context current on the calling
 //! thread (the one the memory and streams belong to). Functions that take
@@ -30,11 +32,14 @@ use std::marker::PhantomData;
 use obc_backend::{BackendError, ColourSpec, DeviceNv12};
 
 mod driver;
+mod kernel;
 
 use driver::{CUDA_ERROR_NOT_READY, CUDA_SUCCESS, MEMORYTYPE_DEVICE, MEMORYTYPE_HOST, Memcpy2d};
 pub use driver::{
-    CuContext, CuDevice, CuDevicePtr, CuEvent, CuStream, DRIVER_LIBRARY, Driver, driver,
+    CuContext, CuDevice, CuDevicePtr, CuEvent, CuFunction, CuModule, CuStream, DRIVER_LIBRARY,
+    Driver, driver,
 };
+pub use kernel::{LUT8_BLOCK, LUT8_ENTRY, LUT8_PTX, Lut8};
 
 /// A CUDA failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

@@ -27,7 +27,8 @@ use obc_backend::{
     BackendError, BackendFactory, ColourSpec, EffectKind, FrameParams, GpuContext, HostBgr,
     InferenceBackend, LoadRequest, StageTimings,
 };
-use obc_backend_maxine::{MaxineBackend, MaxineFactory, ROOT_ENV};
+use obc_backend_maxine::matte::{HARDENING_LUT, apply_lut};
+use obc_backend_maxine::{MaskFault, MaskFaultSwitch, MaxineBackend, MaxineFactory, ROOT_ENV};
 use obc_gpu::{
     ContextGuard, DeviceNv12Buffer, OwnedContext, Stream, mem_get_info, primary_context_active,
 };
@@ -175,6 +176,130 @@ fn run_frames(
     all
 }
 
+/// A value the hardened mask is filled with before a checked frame, so a
+/// frame the kernel did not run on cannot pass as hardened.
+const POISON: u8 = 0x5A;
+
+/// Runs one more frame with the hardened mask poisoned first, then checks
+/// that the hardened mask is `table` (the host copy of the table the
+/// backend uploaded) applied to the raw mask: the kernel ran on this
+/// frame's mask, with this table. Logs how much of it is soft, so a frame
+/// without a soft band is visible. Returns the raw and the hardened mask.
+fn check_hardened(
+    label: &str,
+    backend: &mut MaxineBackend,
+    gpu: &GpuContext,
+    params: FrameParams,
+    src: &DeviceNv12Buffer,
+    dst: &DeviceNv12Buffer,
+    table: &[u8; 256],
+) -> (Vec<u8>, Vec<u8>) {
+    backend.fill_hardened_mask(POISON).unwrap();
+    backend
+        .process(gpu, &params, &src.frame(), &dst.frame())
+        .unwrap_or_else(|e| panic!("{label}: process failed: {e}"));
+    let raw = backend.read_mask().unwrap();
+    let hard = backend.read_hardened_mask().unwrap();
+    let w = W as usize;
+    let mut want = vec![0u8; raw.len()];
+    apply_lut(table, &raw, w, &mut want, w, w, H as usize);
+    let wrong = hard.iter().zip(&want).filter(|(a, b)| a != b).count();
+    let count = |v: &[u8], f: fn(u8) -> bool| v.iter().filter(|&&m| f(m)).count();
+    println!(
+        "HARDEN {label}: raw 1..=127 {} px, raw 128 {} px, raw soft band 129..=223 {} px, \
+         raw max {}; hardened 0 {} px, soft {} px, 255 {} px",
+        count(&raw, |m| (1..=127).contains(&m)),
+        count(&raw, |m| m == 128),
+        count(&raw, |m| (129..=223).contains(&m)),
+        raw.iter().max().unwrap(),
+        count(&hard, |m| m == 0),
+        count(&hard, |m| m > 0 && m < 255),
+        count(&hard, |m| m == 255),
+    );
+    assert_eq!(wrong, 0, "{label}: hardened mask != table(raw mask)");
+    if !raw.iter().any(|&m| m >= 128) {
+        println!(
+            "HARDEN {label}: the model found no foreground in this frame; only the \
+             background side of the table was exercised"
+        );
+    }
+    (raw, hard)
+}
+
+/// A luma difference above which a pixel counts as visibly changed.
+const VISIBLE_DY: u8 = 8;
+
+/// Where the hardened mask is opaque the output is the camera frame, up to
+/// the colour round trip NV12 -> BGR -> NV12 around the effect. Luma
+/// survives that round trip up to rounding, except where the first step
+/// clips a colour outside the RGB cube (saturated chroma at sharp edges).
+/// The synthetic frame stays inside it (max 1), but on recorded camera
+/// frames (tests/mask_frames.rs logs it) the opaque pixels differ by a mean
+/// of 0.03 to 0.53 code values, a 99.9th percentile of 3 to 6 and a rare
+/// maximum of 5 to 20. So the mean and the 99.9th percentile are bounded,
+/// never the maximum, with room for other cameras: fewer than 1 in 1000
+/// opaque pixels may change visibly. An effect that ignored the mask is
+/// far outside (replace showing the background: mean above 30; blur
+/// blurring the frame: 99.9th percentile above 50).
+const OPAQUE_MEAN_DY: f64 = 1.0;
+/// See [`OPAQUE_MEAN_DY`].
+const OPAQUE_P999_DY: u8 = VISIBLE_DY;
+
+/// Absolute luma differences between two packed NV12 frames over the
+/// pixels `pick` selects.
+struct LumaDiff {
+    n: usize,
+    mean: f64,
+    p999: u8,
+    max: u8,
+    /// Pixels differing by more than [`VISIBLE_DY`].
+    visible: usize,
+}
+
+impl std::fmt::Display for LumaDiff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "over {} px: mean {:.3}, p99.9 {}, max {}, > {VISIBLE_DY}: {} px",
+            self.n, self.mean, self.p999, self.max, self.visible
+        )
+    }
+}
+
+fn luma_diff(a: &[u8], b: &[u8], pick: impl Fn(usize) -> bool) -> LumaDiff {
+    let mut hist = [0usize; 256];
+    for i in (0..(W * H) as usize).filter(|&i| pick(i)) {
+        hist[a[i].abs_diff(b[i]) as usize] += 1;
+    }
+    let n: usize = hist.iter().sum();
+    let sum: usize = hist.iter().enumerate().map(|(d, &c)| d * c).sum();
+    let target = (n as f64 * 0.999).ceil() as usize;
+    let mut acc = 0;
+    let p999 = hist
+        .iter()
+        .position(|&c| {
+            acc += c;
+            acc >= target
+        })
+        .unwrap_or(0) as u8;
+    LumaDiff {
+        n,
+        mean: sum as f64 / n.max(1) as f64,
+        p999,
+        max: hist.iter().rposition(|&c| c > 0).unwrap_or(0) as u8,
+        visible: hist[VISIBLE_DY as usize + 1..].iter().sum(),
+    }
+}
+
+/// Asserts that `d`, the output against the camera frame where the
+/// hardened mask is opaque, is within the colour round trip.
+fn assert_opaque_is_input(label: &str, d: &LumaDiff) {
+    assert!(
+        d.mean <= OPAQUE_MEAN_DY && d.p999 <= OPAQUE_P999_DY,
+        "{label}: where the hardened mask is 255 the output is not the input ({d})"
+    );
+}
+
 fn free_mib() -> f64 {
     mem_get_info().unwrap().0 as f64 / MIB
 }
@@ -281,6 +406,15 @@ fn maxine_blur_and_replace_in_a_created_context() {
         assert_ne!(out, input, "blur output equals the input");
         let ys = &out[..(W * H) as usize];
         assert!(ys.iter().any(|&y| y > 40), "blur output is black");
+        check_hardened(
+            "blur",
+            &mut backend,
+            &gpu,
+            FrameParams { blur_strength: 0.5 },
+            &src,
+            &dst,
+            &HARDENING_LUT,
+        );
         let mask = backend.read_mask().unwrap();
         let fg = mask.iter().filter(|&&m| m >= 250).count() as f64 / mask.len() as f64;
         let bgc = mask.iter().filter(|&&m| m <= 5).count() as f64 / mask.len() as f64;
@@ -360,37 +494,36 @@ fn maxine_blur_and_replace_in_a_created_context() {
             out[..(W * H) as usize].iter().any(|&y| y > 40),
             "replace output is black"
         );
-        let mask = backend.read_mask().unwrap();
-        let (mut n_bg, mut err_bg, mut n_fg, mut err_fg) = (0usize, 0f64, 0usize, 0f64);
-        for (i, &m) in mask.iter().enumerate() {
-            let y = out[i] as f64;
-            if m == 0 {
-                n_bg += 1;
-                err_bg += (y - bg_nv12[i] as f64).abs();
-            } else if m == 255 {
-                n_fg += 1;
-                err_fg += (y - input[i] as f64).abs();
-            }
-        }
-        let mean = |e: f64, n: usize| if n == 0 { f64::NAN } else { e / n as f64 };
-        println!(
-            "REPLACE: {n_bg} px with mask 0 (mean |Y - bg| {:.2}), {n_fg} px with mask 255 \
-             (mean |Y - input| {:.2})",
-            mean(err_bg, n_bg),
-            mean(err_fg, n_fg)
+        let (raw, hard) = check_hardened(
+            "replace",
+            &mut backend,
+            &gpu,
+            FrameParams::default(),
+            &src,
+            &dst,
+            &HARDENING_LUT,
         );
-        if n_bg > 0 {
-            assert!(
-                mean(err_bg, n_bg) < 3.0,
-                "where the mask is 0 the output is not the background"
+        let out = dst.download_packed().unwrap();
+        // Where the model is below its decision boundary the output is the
+        // background, exactly up to the colour conversion: the raw mask's
+        // low values must not let the room through. Where the hardened mask
+        // is 255 the output is the camera frame.
+        let d_bg = luma_diff(&out, &bg_nv12, |i| raw[i] < 128);
+        let d_fg = luma_diff(&out, &input, |i| hard[i] == 255);
+        println!("REPLACE: raw mask < 128: |Y - bg| {d_bg}; hardened mask 255: |Y - input| {d_fg}");
+        assert!(d_bg.n > 0, "the synthetic frame has no background");
+        assert!(
+            d_bg.max <= 1,
+            "where the raw mask is below 128 the output is not the background"
+        );
+        if d_fg.n == 0 {
+            println!(
+                "REPLACE: no opaque foreground on this synthetic frame; the hardened == 255 \
+                 check tested nothing (maxine_the_effects_read_the_hardened_mask_not_the_raw_one \
+                 covers it)"
             );
         }
-        if n_fg > 0 {
-            assert!(
-                mean(err_fg, n_fg) < 3.0,
-                "where the mask is 255 the output is not the input"
-            );
-        }
+        assert_opaque_is_input("replace", &d_fg);
 
         // A rejected switch leaves the running effect in place.
         let bad = LoadRequest {
@@ -447,4 +580,208 @@ fn maxine_blur_and_replace_in_a_created_context() {
         !active,
         "the SDK activated the device's primary context instead of using the pushed one"
     );
+}
+
+/// A created context with a stream and two frames of the synthetic person,
+/// for the fault tests.
+fn fault_rig(f: impl FnOnce(&GpuContext, &Stream, &DeviceNv12Buffer, &DeviceNv12Buffer)) {
+    let ctx = OwnedContext::create(0).unwrap();
+    {
+        // SAFETY: `ctx` outlives the guard; everything below drops first.
+        let _g = unsafe { ContextGuard::push(ctx.raw()) }.unwrap();
+        let stream = Stream::new(true).unwrap();
+        let gpu = GpuContext {
+            context: ctx.raw(),
+            stream: stream.raw(),
+        };
+        let src = DeviceNv12Buffer::alloc(W, H).unwrap();
+        let dst = DeviceNv12Buffer::alloc(W, H).unwrap();
+        src.upload_packed(&bgr_to_nv12(&synthetic_person(), W as usize, H as usize))
+            .unwrap();
+        f(&gpu, &stream, &src, &dst);
+    }
+}
+
+fn blur_request() -> LoadRequest {
+    LoadRequest {
+        effect: EffectKind::Blur,
+        width: W,
+        height: H,
+        colour: ColourSpec::LIMITED_BT601,
+        background: None,
+    }
+}
+
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]
+fn maxine_a_mask_kernel_that_does_not_load_fails_the_load() {
+    let switch = MaskFaultSwitch::default();
+    let f = factory().with_mask_faults(switch.clone());
+    fault_rig(|gpu, stream, src, dst| {
+        let mut backend = f.create_maxine().unwrap();
+        switch.set(Some(MaskFault::ModuleLoad));
+        let e = backend.load(gpu, &blur_request()).unwrap_err();
+        println!("forced module-load failure: {e}");
+        match &e {
+            BackendError::Load { message, .. } => {
+                assert!(message.contains("cuModuleLoadData"), "{message}");
+                assert!(message.contains("mask-hardening kernel"), "{message}");
+            }
+            other => panic!("expected a load error, got {other:?}"),
+        }
+        assert_eq!(
+            backend.loaded_effect(),
+            None,
+            "a failed load left an effect"
+        );
+        let e = backend
+            .process(gpu, &FrameParams::default(), &src.frame(), &dst.frame())
+            .unwrap_err();
+        assert!(e.to_string().contains("no effect loaded"), "{e}");
+
+        // The failure left the context usable: disarmed, the same backend
+        // loads and runs.
+        switch.set(None);
+        backend.load(gpu, &blur_request()).unwrap();
+        backend
+            .process(gpu, &FrameParams::default(), &src.frame(), &dst.frame())
+            .unwrap();
+        stream.synchronize().unwrap();
+        backend.unload();
+    });
+}
+
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]
+fn maxine_a_mask_kernel_that_does_not_launch_fails_the_frame() {
+    let switch = MaskFaultSwitch::default();
+    let f = factory().with_mask_faults(switch.clone());
+    fault_rig(|gpu, stream, src, dst| {
+        let mut backend = f.create_maxine().unwrap();
+        // Armed before the load: the fault hits frame launches only, so the
+        // load (and its warm-up launch) succeeds.
+        switch.set(Some(MaskFault::Launch));
+        backend
+            .load(gpu, &blur_request())
+            .unwrap_or_else(|e| panic!("the launch fault reached the load: {e}"));
+        for _ in 0..2 {
+            let e = backend
+                .process(gpu, &FrameParams::default(), &src.frame(), &dst.frame())
+                .unwrap_err();
+            println!("forced launch failure: {e}");
+            match &e {
+                BackendError::Run { message, .. } => {
+                    assert!(message.contains("cuLaunchKernel"), "{message}")
+                }
+                other => panic!("expected a run error, got {other:?}"),
+            }
+        }
+        stream
+            .synchronize()
+            .expect("a refused launch leaves the stream usable");
+
+        switch.set(None);
+        check_hardened(
+            "after a refused launch",
+            &mut backend,
+            gpu,
+            FrameParams::default(),
+            src,
+            dst,
+            &HARDENING_LUT,
+        );
+        stream.synchronize().unwrap();
+        backend.unload();
+    });
+}
+
+/// With a constant table the hardened mask is that constant wherever the
+/// model looks, while the raw mask of the synthetic frame is background
+/// nearly everywhere (the model finds no person in it). An effect that read
+/// the raw mask gives itself away: with an all-opaque table replace must
+/// return the camera frame and blur must leave it sharp, where the raw mask
+/// would show the background and blur the whole frame. The all-transparent
+/// table shows that both effects do change the frame where the hardened
+/// mask says background, so "unchanged" above is not a no-op passing.
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]
+fn maxine_the_effects_read_the_hardened_mask_not_the_raw_one() {
+    let switch = MaskFaultSwitch::default();
+    let f = factory().with_mask_faults(switch.clone());
+    fault_rig(|gpu, stream, src, dst| {
+        let input = src.download_packed().unwrap();
+        let bg = background();
+        let bg_nv12 = bgr_to_nv12(&bg.data, W as usize, H as usize);
+        let bg = Arc::new(bg);
+        let params = FrameParams { blur_strength: 1.0 };
+        let mut blur_visible = Vec::new();
+        for value in [0xFFu8, 0x00] {
+            let table = [value; 256];
+            let mut backend = f.create_maxine().unwrap();
+            // The table is uploaded by the cold load and kept by the switch
+            // to replace below.
+            switch.set(Some(MaskFault::ConstantTable(value)));
+            let r = backend.load(gpu, &blur_request());
+            switch.set(None);
+            r.unwrap_or_else(|e| panic!("blur load failed: {e}"));
+            let run = |label: &str, backend: &mut MaxineBackend| {
+                for _ in 0..5 {
+                    backend
+                        .process(gpu, &params, &src.frame(), &dst.frame())
+                        .unwrap_or_else(|e| panic!("{label}: process failed: {e}"));
+                }
+                stream.synchronize().unwrap();
+                let (raw, _) = check_hardened(label, backend, gpu, params, src, dst, &table);
+                let raw_bg = raw.iter().filter(|&&m| m < 128).count();
+                assert!(
+                    raw_bg * 100 >= raw.len() * 99,
+                    "{label}: the raw mask rates only {raw_bg} px background; on the synthetic \
+                     frame it must be background nearly everywhere for this test to tell it \
+                     from the hardened mask"
+                );
+                dst.download_packed().unwrap()
+            };
+
+            let label = format!("blur, table {value:#04x}");
+            let out = run(&label, &mut backend);
+            let d_in = luma_diff(&out, &input, |_| true);
+            println!("CONSTANT {label}: |Y - input| {d_in}");
+            if value == 0xFF {
+                // All foreground: nothing to blur.
+                assert_opaque_is_input(&label, &d_in);
+            }
+            blur_visible.push(d_in.visible);
+
+            let replace = LoadRequest {
+                effect: EffectKind::Replace,
+                background: Some(bg.clone()),
+                ..blur_request()
+            };
+            let r = backend.load(gpu, &replace).unwrap();
+            assert!(r.reused_model, "blur -> replace reloaded the model");
+            let label = format!("replace, table {value:#04x}");
+            let out = run(&label, &mut backend);
+            let d_in = luma_diff(&out, &input, |_| true);
+            let d_bg = luma_diff(&out, &bg_nv12, |_| true);
+            println!("CONSTANT {label}: |Y - input| {d_in}; |Y - bg| {d_bg}");
+            if value == 0xFF {
+                assert_opaque_is_input(&label, &d_in);
+            } else {
+                assert!(
+                    d_bg.max <= 1,
+                    "{label}: with an all-background mask the output is not the background \
+                     everywhere ({d_bg})"
+                );
+            }
+            backend.unload();
+        }
+        // The silhouette's edges blur visibly when the mask says background
+        // everywhere; with an all-foreground mask nothing does.
+        let (opaque, clear) = (blur_visible[0], blur_visible[1]);
+        assert!(
+            clear >= (W * H) as usize / 1000 && clear >= 20 * opaque.max(1),
+            "blur with an all-background mask changed {clear} px visibly, with an \
+             all-foreground mask {opaque} px: the blur does not follow the hardened mask"
+        );
+    });
 }

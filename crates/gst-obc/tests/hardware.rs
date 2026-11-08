@@ -1,10 +1,16 @@
 //! The element on a GPU, with the fake backend of `support/fake_backend.rs`
-//! (no Maxine SDK needed).
+//! (no Maxine SDK needed), and once with the real Maxine backend.
 //!
-//! All tests are `#[ignore]` and named `gpu_*`: they need an NVIDIA GPU with
+//! All tests are `#[ignore]`. The ones named `gpu_*` need an NVIDIA GPU with
 //! GStreamer's CUDA elements (`cudaupload`, `cudadownload`, from the
 //! nvcodec plugin). A test without them fails, naming what is missing. Run
 //! with `cargo test -p gst-obc --test hardware -- --ignored gpu_ --test-threads=1`.
+//!
+//! The ones named `maxine_*` also need the Maxine SDK, set up as for
+//! `crates/obc-backend-maxine/tests/hardware.rs` (`MAXINE_VFX_ROOT`, its
+//! library directories on `LD_LIBRARY_PATH`, the os-release shim preloaded
+//! through the cargo runner); run them with `-- --ignored maxine_
+//! --test-threads=1`.
 //!
 //! The rig is the output pipeline's head in miniature: one canonical frame
 //! (NV12 in CUDA memory, a luma gradient that matches no constant the fake
@@ -25,6 +31,8 @@ use fake_backend::{FAKE_BLUR_Y, FAKE_REPLACE_Y, FakeConfig, FakeFactory, FakeLog
 use gst::prelude::*;
 use gst_obc::{EffectFallback, EffectKind, EffectSettings, EffectStatus, ObcEffect};
 use gst_video::prelude::*;
+use obc_backend::BackendFactory;
+use obc_backend_maxine::{MaskFault, MaskFaultSwitch, MaxineFactory};
 
 const W: u32 = 640;
 const H: u32 = 360;
@@ -154,6 +162,10 @@ struct Rig {
 
 impl Rig {
     fn new(factory: Option<Arc<FakeFactory>>, settings: &EffectSettings) -> Rig {
+        Rig::with_factory(factory.map(|f| f as Arc<dyn BackendFactory>), settings)
+    }
+
+    fn with_factory(factory: Option<Arc<dyn BackendFactory>>, settings: &EffectSettings) -> Rig {
         require_elements(&["cudaupload", "cudadownload", "appsrc", "appsink"]);
         gst_obc::register().unwrap();
         let (input, ctx) = upload();
@@ -674,4 +686,75 @@ fn gpu_each_stop_releases_the_cuda_context_exactly_once() {
         "unload/drop without the context"
     );
     assert_eq!(get(&fake.log.unloads), 3);
+}
+
+/// The Maxine mask-hardening kernel fails closed through the element: a
+/// kernel that does not load fails the effect, and a kernel launch that
+/// fails on a frame blacks that frame, both with the reason in the status.
+/// The faults are real driver errors (garbage PTX, an oversized thread
+/// block), forced through the backend's test-only switch.
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT and its libraries on \
+            LD_LIBRARY_PATH), the os-release override, an NVIDIA GPU and the GStreamer CUDA \
+            elements"]
+fn maxine_mask_kernel_failures_show_black_with_the_reason() {
+    assert!(
+        std::env::var_os(obc_backend_maxine::ROOT_ENV).is_some_and(|v| !v.is_empty()),
+        "this test needs the Maxine SDK: set MAXINE_VFX_ROOT and put its library directories \
+         on LD_LIBRARY_PATH (crates/obc-backend-maxine/tests/hardware.rs has the setup)"
+    );
+    let switch = MaskFaultSwitch::default();
+    let maxine = MaxineFactory::from_env().with_mask_faults(switch.clone());
+    maxine
+        .probe()
+        .unwrap_or_else(|e| panic!("Maxine probe failed: {e}"));
+    let mut rig = Rig::with_factory(Some(Arc::new(maxine)), &EffectSettings::default());
+    assert_eq!(rig.frame(), Seen::Input);
+
+    // The kernel does not load: the load fails, black, status failed.
+    switch.set(Some(MaskFault::ModuleLoad));
+    rig.effect
+        .apply(&EffectSettings::of(EffectKind::Blur))
+        .unwrap();
+    let seen = rig.frames_until(Duration::from_secs(60), failed);
+    assert!(seen.iter().all(|s| *s == Seen::Black), "{seen:?}");
+    let reason = rig.effect.status().reason().unwrap().to_string();
+    println!("forced module-load failure: {reason}");
+    assert!(reason.contains("cuModuleLoadData"), "{reason}");
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::Black, "a failed load stays black");
+    }
+    rig.drain_messages();
+    assert!(
+        rig.messages
+            .iter()
+            .any(|(e, s, r)| e == "blur" && s == "failed" && r.contains("cuModuleLoadData")),
+        "{:?}",
+        rig.messages
+    );
+
+    // A good load runs the effect; then frame launches fail: black.
+    switch.set(None);
+    rig.effect
+        .apply(&EffectSettings::of(EffectKind::Blur))
+        .unwrap();
+    let seen = rig.frames_until(Duration::from_secs(60), status_is(EffectStatus::Ready));
+    assert!(seen.iter().all(|s| *s == Seen::Black), "{seen:?}");
+    let effect_frame = rig.frame();
+    assert!(
+        !matches!(effect_frame, Seen::Input | Seen::Black),
+        "the blur did not run: {effect_frame:?}"
+    );
+    switch.set(Some(MaskFault::Launch));
+    assert_eq!(rig.frame(), Seen::Black, "the failing frame is black");
+    let status = rig.effect.status();
+    println!("effect frame before the launch fault: {effect_frame:?}; after: {status:?}");
+    assert!(
+        matches!(&status, EffectStatus::Failed(r) if r.contains("cuLaunchKernel")),
+        "{status:?}"
+    );
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::Black, "a failed frame path stays black");
+    }
+    rig.stop();
 }
