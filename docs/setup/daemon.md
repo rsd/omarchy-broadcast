@@ -50,6 +50,7 @@ The script builds the release binaries and installs, without root:
 - `oma-broadcastd` and `oma-broadcast` in `${XDG_BIN_HOME:-~/.local/bin}`;
 - the unit in `${XDG_DATA_HOME:-~/.local/share}/systemd/user/`, with `ExecStart=` pointing at the installed daemon;
 - the D-Bus activation file in `${XDG_DATA_HOME:-~/.local/share}/dbus-1/services/`;
+- optionally, the os-release shim for the Maxine backend, `os-release-shim.so` and `fake-os-release`, in `~/.local/lib/oma-broadcast/`: built when `make` and a C compiler are present, skipped with `--no-shim` (see [the os-release override](maxine.md#7-the-os-release-override));
 - a manifest, `install-user.manifest`, in `${XDG_STATE_HOME:-~/.local/state}/oma-broadcast/`, which lists every path written and the sha256 of each binary.
 
 Behaviour:

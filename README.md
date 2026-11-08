@@ -38,11 +38,11 @@ sudo pacman -U oma-broadcast-git-*.pkg.tar.zst
 systemctl --user enable --now oma-broadcastd
 ```
 
-The package installs the daemon and the client in `/usr/bin`, the systemd user unit, the D-Bus activation file, the Omarchy bar plugin and the documentation. It enables nothing: each user runs the last command. The loopback device is still configured as in [docs/setup/loopback.md](docs/setup/loopback.md). The NVIDIA Maxine SDK is never packaged; install it as in [docs/setup/maxine.md](docs/setup/maxine.md).
+The package installs the daemon and the client in `/usr/bin`, the systemd user unit, the D-Bus activation file, the Omarchy bar plugin and the documentation. It enables nothing: each user runs the last command. The loopback device is still configured as in [docs/setup/loopback.md](docs/setup/loopback.md). The package also installs the os-release shim that the Maxine effects need on Arch-based systems, inactive, in `/usr/lib/oma-broadcast/`. The NVIDIA Maxine SDK is never packaged; install it as in [docs/setup/maxine.md](docs/setup/maxine.md), which also covers activating the shim (section 7).
 
 ### Developer install
 
-`scripts/install-user.sh` builds the release binaries and installs them for the current user, without root: the binaries in `~/.local/bin`, the unit and the D-Bus file under `~/.local/share`. It never runs `systemctl`; it prints the next steps. `--dry-run` shows the actions and `--uninstall` removes only what the script installed.
+`scripts/install-user.sh` builds the release binaries and installs them for the current user, without root: the binaries in `~/.local/bin`, the unit and the D-Bus file under `~/.local/share`. When `make` and a C compiler are present it also builds and installs the os-release shim for the Maxine effects (`--no-shim` skips it; activation is described in [docs/setup/maxine.md](docs/setup/maxine.md), section 7). It never runs `systemctl`; it prints the next steps. `--dry-run` shows the actions and `--uninstall` removes only what the script installed.
 
 ```sh
 scripts/install-user.sh

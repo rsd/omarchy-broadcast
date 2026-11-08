@@ -181,13 +181,17 @@ rm -rf ~/Downloads/maxine          # optional, frees 2.7 GB
 
 ### Build and install
 
-From the repository root:
+Three routes put the same two files in place: the shim library and a replacement `os-release`. None of them activates anything; activation is step 7a, after the SDK is installed.
+
+- **Arch package.** Already installed, inactive: `/usr/lib/oma-broadcast/os-release-shim.so` and `/usr/lib/oma-broadcast/fake-os-release`. The package's `check()` runs the shim's test. The SDK itself is never packaged.
+- **`scripts/install-user.sh`.** Builds and installs the shim by default when `make` and a C compiler are present (otherwise it skips the shim with a note), to `~/.local/lib/oma-broadcast/os-release-shim.so` and `~/.local/lib/oma-broadcast/fake-os-release`. `--no-shim` skips it; `--no-build` installs an existing build only. The script never installs or enables the systemd drop-in; it prints the activation steps. If a shim was placed by hand earlier at `~/.local/lib/oma-broadcast`, the script refuses: remove those files first, or pass `--no-shim`.
+- **Manual**, from the repository root:
 
 ```bash
 make -C tools/os-release-shim                     # -> target/os-release-shim/os-release-shim.so
 make -C tools/os-release-shim test                # optional: the shim's own test
-install -Dm644 target/os-release-shim/os-release-shim.so ~/.local/lib/oma-broadcast/os-release-shim.so
-install -Dm644 tools/maxine-probe/fake-os-release ~/.local/share/oma-broadcast/fake-os-release
+install -Dm755 target/os-release-shim/os-release-shim.so ~/.local/lib/oma-broadcast/os-release-shim.so
+install -Dm644 tools/maxine-probe/fake-os-release ~/.local/lib/oma-broadcast/fake-os-release
 ```
 
 The repository ships a working replacement file at [../../tools/maxine-probe/fake-os-release](../../tools/maxine-probe/fake-os-release); its content is:
@@ -203,11 +207,21 @@ PRETTY_NAME="Ubuntu 24.04 LTS"
 
 ### 7a. The daemon (systemd user unit)
 
-The optional drop-in [`dist/systemd/oma-broadcastd.service.d/maxine.conf`](../../dist/systemd/oma-broadcastd.service.d/maxine.conf) sets `LD_PRELOAD`, `OMA_BROADCAST_OS_RELEASE`, `MAXINE_VFX_ROOT` and `LD_LIBRARY_PATH` for the daemon, with the install locations above and the SDK in `~/.local/opt/maxine/VideoFX`. Adjust the paths in the file if you installed elsewhere. Install it, then restart the daemon:
+The optional drop-in sets `LD_PRELOAD`, `OMA_BROADCAST_OS_RELEASE`, `MAXINE_VFX_ROOT` and `LD_LIBRARY_PATH` for the daemon, with the SDK in `~/.local/opt/maxine/VideoFX`. Two versions exist, differing only in where the shim and the replacement file are:
+
+- the package's example, `/usr/share/doc/oma-broadcast/examples/systemd/oma-broadcastd.service.d/maxine.conf`, points at `/usr/lib/oma-broadcast/`;
+- the checkout's [`dist/systemd/oma-broadcastd.service.d/maxine.conf`](../../dist/systemd/oma-broadcastd.service.d/maxine.conf) points at `%h/.local/lib/oma-broadcast/` (the `install-user.sh` and manual locations).
+
+Adjust the paths in the file if you installed elsewhere. After installing the SDK, copy the matching file and restart the daemon:
 
 ```bash
+# package install:
+install -Dm644 /usr/share/doc/oma-broadcast/examples/systemd/oma-broadcastd.service.d/maxine.conf \
+    ~/.config/systemd/user/oma-broadcastd.service.d/maxine.conf
+# checkout (install-user.sh or manual install), from the repository root:
 install -Dm644 dist/systemd/oma-broadcastd.service.d/maxine.conf \
     ~/.config/systemd/user/oma-broadcastd.service.d/maxine.conf
+
 systemctl --user daemon-reload
 systemctl --user restart oma-broadcastd.service
 ```
@@ -220,21 +234,21 @@ Set the two variables on the program that loads the SDK:
 
 ```bash
 env LD_PRELOAD=~/.local/lib/oma-broadcast/os-release-shim.so \
-    OMA_BROADCAST_OS_RELEASE=$HOME/.local/share/oma-broadcast/fake-os-release \
+    OMA_BROADCAST_OS_RELEASE=$HOME/.local/lib/oma-broadcast/fake-os-release \
     <command> [args]
 ```
 
 **Set `LD_PRELOAD` on the final program, never on a wrapper in front of it.** The shim removes `LD_PRELOAD` from the environment of the process that loads it, so that no child inherits it. A wrapper such as `timeout`, `sh -c` or `cargo` that carries `LD_PRELOAD` loads the shim itself, drops the variable, and starts the program without it, which then fails with `-1209`. Write `timeout 60 env LD_PRELOAD=... prog`, not `LD_PRELOAD=... timeout 60 prog`. For `cargo test`, use a runner so that only the test binary is preloaded:
 
 ```bash
-OMA_BROADCAST_OS_RELEASE=$HOME/.local/share/oma-broadcast/fake-os-release \
+OMA_BROADCAST_OS_RELEASE=$HOME/.local/lib/oma-broadcast/fake-os-release \
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env LD_PRELOAD=$HOME/.local/lib/oma-broadcast/os-release-shim.so" \
     cargo test -p obc-backend-maxine --test hardware -- --ignored --test-threads=1
 ```
 
 `OMA_BROADCAST_OS_RELEASE_DEBUG=1` makes the shim log each redirect on stderr, which shows whether it is active.
 
-Licence note on this workaround: see section 11.
+Support note: see section 11.
 
 ## 8. Environment
 
@@ -266,7 +280,7 @@ cd "$(mktemp -d)"
 gcc -O2 -o probe <repo root>/tools/maxine-probe/probe.c \
   -I$P/include -I$P/external/cuda/include -L$P/lib -lVideoFX -lNVCVImage -lcuda
 env LD_PRELOAD=~/.local/lib/oma-broadcast/os-release-shim.so \
-    OMA_BROADCAST_OS_RELEASE=$HOME/.local/share/oma-broadcast/fake-os-release \
+    OMA_BROADCAST_OS_RELEASE=$HOME/.local/lib/oma-broadcast/fake-os-release \
     ./probe $P/lib/models
 ```
 
@@ -313,24 +327,29 @@ The background image for `replace` must be a PNG or JPEG file. Until an effect i
 | No `models_linux_sm<SM>` for your GPU | GPU architecture not in the 1.3.0.0 matrix | List with step 5; Turing/Ampere/Ada/Hopper/Blackwell (sm75 to sm120) are covered |
 | `NvVFX_Load` succeeds but a program hangs at start | Cold first run (see step 9 observation) | Wait a few seconds; the probe prints the time |
 | The daemon's `Error` property reads `effect blur unavailable: NvVFX_Load(GreenScreen) returned -1209 (...): the SDK rejected this distribution (its model loader reads /etc/os-release). Run the process with the os-release override (docs/setup/maxine.md, section 7)` and the state is `error` | The daemon runs without the shim: the drop-in is not installed, `daemon-reload` and a restart were skipped, or its paths do not match your installation. With the default `on_failure = "black"` the virtual camera stays black | Install the drop-in (step 7a) and check `systemctl --user show oma-broadcastd -p Environment`; a `cannot be preloaded` line in `journalctl --user -u oma-broadcastd` means the library path is wrong |
-| `ld.so: object '...os-release-shim.so' from LD_PRELOAD cannot be preloaded` | The shim library is not at the path in `LD_PRELOAD`; the program runs without it | Build and install it (step 7) |
+| `ld.so: object '...os-release-shim.so' from LD_PRELOAD cannot be preloaded` | The shim library is not at the path in `LD_PRELOAD`; the program runs without it | Build and install it, or check the paths in the drop-in (step 7) |
 
-## 11. Licence notes
+## 11. Licence and support notes
 
 Summary of the licence terms as read from the SDK licence documents. This is not legal advice; read the licence you accept.
 
 - The SDK and models are under the NVIDIA Software License Agreement plus the AI Product-Specific Terms. The Developer Program path is "solely for internal evaluation, development or test non-production purposes ... not for use, distribution or deployment in production" (terms 1.2.8). Personal use on your own machine and development are fine; shipping the SDK inside a product needs an NVIDIA enterprise agreement.
 - **No redistribution.** SLA 8.5 forbids copying, distributing or sublicensing any part of the Software, "including in any publicly accessible software repositories". Never commit the SDK, the models (`*.trtpkg`), the NGC key or `~/.ngc/` to this repo, never put them in a package or release artifact (users download from NGC themselves, the daemon only points at the install directory). Keep the install directory outside the working tree.
 - No reverse engineering of the binaries (SLA 8.4); no publishing benchmark results without written permission (SLA 8.9). The timings above are for local verification, not for publication.
-- The os-release override (the shim of step 7) changes only what one process of yours reads on your own machine. It does not decrypt or bypass the model encryption, but SLA 8.7 forbids bypassing "encryption ... or authentication mechanism"; treat this as a grey area. It is per-user configuration that you build and install yourself: oma-broadcast neither installs it nor enables it by default, and it must not be shipped as a feature of a distributed package.
+- The os-release override (the shim of step 7) is a compatibility shim for distributions the SDK does not list. It changes only what the daemon (or another process you start with it) reads as `/etc/os-release`. It does not modify the SDK, the models or their encryption. NVIDIA does not support this configuration.
 - NVIDIA documents the Linux SDK as server-side and does not officially support local, client-side use or Arch. That is a support statement, not a technical block. Expect no vendor support.
 
 ## 12. Uninstall
 
 ```bash
 rm -rf "$PREFIX"                         # SDK, models and env.sh
-rm -rf ~/.local/share/oma-broadcast/fake-os-release
-rm -f ~/.local/lib/oma-broadcast/os-release-shim.so
+# install-user.sh route: scripts/install-user.sh --uninstall removes the whole script install
+#   (binaries, unit, D-Bus file and shim), not only the shim
+# manual route:
+rm -f ~/.local/lib/oma-broadcast/fake-os-release ~/.local/lib/oma-broadcast/os-release-shim.so
+rm -f ~/.local/share/oma-broadcast/fake-os-release   # installs made by earlier instructions
+# package install: sudo pacman -R oma-broadcast-git removes /usr/lib/oma-broadcast/*
+# every route: remove the drop-in, then reload
 rm -f ~/.config/systemd/user/oma-broadcastd.service.d/maxine.conf   # then: systemctl --user daemon-reload
 rm -rf ~/Downloads/maxine                # downloads, if kept
 # NGC CLI (only if nothing else uses it)

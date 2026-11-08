@@ -20,10 +20,16 @@
 # licensed separately by NVIDIA and is never part of this package: each user
 # downloads and installs it as described in docs/setup/maxine.md. Without it
 # the daemon runs normally and a requested effect reports why it failed.
+# The package does install the os-release shim and its replacement os-release
+# under /usr/lib/oma-broadcast, inactive: the SDK does not list every
+# distribution, and the shim lets the daemon (and only the daemon) read the
+# replacement. To activate it, install the SDK, then copy the example drop-in
+# (docs/setup/maxine.md, section 7):
+#   /usr/share/doc/oma-broadcast/examples/systemd/oma-broadcastd.service.d/maxine.conf
 
 pkgname=oma-broadcast-git
 _pkgname=oma-broadcast
-pkgver=0.7.1
+pkgver=0.7.2
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API, a CLI and an Omarchy bar widget'
 arch=('x86_64')
@@ -40,8 +46,11 @@ depends=(
   'nvidia-utils'           # libcuda.so.1 (CUDA driver API) and libnvidia-ml.so.1 (NVML GPU load)
   'V4L2LOOPBACK-MODULE'    # the loopback kernel module, e.g. v4l2loopback-dkms
 )
-makedepends=('cargo' 'git')
-checkdepends=('dbus')      # /usr/bin/dbus-daemon: the process and CLI tests run a private bus
+makedepends=('cargo' 'git')  # the shim also needs make and gcc, both in base-devel
+checkdepends=(
+  'dbus'                   # /usr/bin/dbus-daemon: the process and CLI tests run a private bus
+  'python'                 # the os-release shim test exercises python3's open(); skipped without it
+)
 optdepends=(
   'omarchy: the Omarchy shell (Quickshell) for the bar widget'
   'v4l2loopback-utils: runtime-only loopback setup without modprobe.d'
@@ -71,6 +80,10 @@ build() {
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   cargo build --frozen --release -p oma-broadcastd -p oma-broadcast
+
+  # The os-release shim: target/os-release-shim/os-release-shim.so. The
+  # Makefile takes CFLAGS and LDFLAGS from makepkg's environment.
+  make -C tools/os-release-shim
 }
 
 check() {
@@ -82,6 +95,8 @@ check() {
   # must not leak into it (docs/testing.md).
   env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u OMA_BROADCAST_OS_RELEASE \
     cargo test --frozen --workspace
+  env -u LD_PRELOAD -u OMA_BROADCAST_OS_RELEASE -u OMA_BROADCAST_OS_RELEASE_DEBUG \
+    make -C tools/os-release-shim test
 }
 
 package() {
@@ -112,8 +127,23 @@ package() {
   # SDK. Each file's header says where to copy it.
   install -Dm644 -t "$doc/examples/systemd/wireplumber.service.d" \
     dist/systemd/wireplumber.service.d/oma-broadcast.conf
-  install -Dm644 -t "$doc/examples/systemd/oma-broadcastd.service.d" \
-    dist/systemd/oma-broadcastd.service.d/maxine.conf
+
+  # The os-release shim and its replacement os-release, installed but inactive
+  # (activation is the drop-in above). The example drop-in is generated from
+  # the repository's, which names the per-user locations: only its
+  # Environment= lines are rewritten to the packaged ones.
+  install -Dm755 target/os-release-shim/os-release-shim.so \
+    "$pkgdir/usr/lib/$_pkgname/os-release-shim.so"
+  install -Dm644 tools/maxine-probe/fake-os-release \
+    "$pkgdir/usr/lib/$_pkgname/fake-os-release"
+  local maxine_conf="$doc/examples/systemd/oma-broadcastd.service.d/maxine.conf"
+  install -d "${maxine_conf%/*}"
+  sed '/^Environment=/s|%h/\.local/lib/oma-broadcast/|/usr/lib/oma-broadcast/|' \
+    dist/systemd/oma-broadcastd.service.d/maxine.conf >"$maxine_conf"
+  chmod 644 "$maxine_conf"
+  grep -qx 'Environment=LD_PRELOAD=/usr/lib/oma-broadcast/os-release-shim.so' "$maxine_conf" &&
+    grep -qx 'Environment=OMA_BROADCAST_OS_RELEASE=/usr/lib/oma-broadcast/fake-os-release' "$maxine_conf" ||
+    { echo 'maxine.conf: the /usr/lib/oma-broadcast rewrite did not take' >&2; return 1; }
 
   # Omarchy bar widget, without its development tests.
   local plugin=clients/omarchy-bar/br.com.dias.oma-broadcast
