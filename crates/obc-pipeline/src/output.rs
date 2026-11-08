@@ -21,11 +21,22 @@
 //! shared, never copied. `v4l2sink` runs with `sync=false` because the
 //! pacing is the clock thread's.
 //!
-//! **Queue.** `appsrc` holds up to [`PacerConfig::max_burst`] buffers and
-//! drops the oldest beyond that. The clock never emits more ticks back to
-//! back than that while catching up, so a catch-up burst is queued whole;
-//! a buffer `appsrc` drops anyway (a sink that stopped consuming) is counted
-//! in [`OutputCounts::queue_dropped`].
+//! **Queue.** `appsrc` holds at most [`OutputConfig::queue_buffers`]
+//! buffers (default 3) and drops the oldest beyond that (`leaky-type`
+//! downstream). The clock never emits more ticks back to back than that
+//! while catching up ([`PacerConfig::max_burst`] is the same bound), so a
+//! catch-up burst is queued whole and a longer stall resynchronises the
+//! clock instead. A sink slower than the contract rate therefore never sees
+//! a frame older than about the queue length times its own service time:
+//! the queue cannot build up a backlog of stale frames. A buffer `appsrc`
+//! drops is counted in [`OutputCounts::queue_dropped`], and the highest
+//! queue level seen after a push in [`OutputCounts::queue_level_max`].
+//!
+//! **Phase lock and hold.** The clock emits each tick shortly after a
+//! camera frame is expected ([`crate::clock`]), and during a deliberate
+//! source switch it holds the last frame ([`Output::hold_for`], armed by
+//! [`crate::session::Session`]) instead of sending placeholders after the
+//! gap threshold.
 //!
 //! **Colour label at the sink.** The frames keep the canonical label
 //! ([`OutputContract::colorimetry`]) through every CUDA stage, and are
@@ -64,7 +75,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -73,7 +84,7 @@ use gst::prelude::*;
 use obc_core::{ColourRange, OutputContract, OutputFormat};
 use serde::Serialize;
 
-use crate::clock::{Pacer, PacerConfig, PacerCounts, Step, TickKind};
+use crate::clock::{Latest, Pacer, PacerConfig, PacerCounts, PhaseLockConfig, Step, TickKind};
 use crate::frame::{Canonical, Frame, FrameWriter};
 use crate::ingest::CUDA_CONTEXT_TYPE;
 use crate::pipeline::{
@@ -100,8 +111,17 @@ pub struct OutputConfig {
     pub process: GpuStage,
     /// Input age beyond which placeholders replace repeats.
     pub gap_threshold: Duration,
-    /// How far behind its grid the clock may fall before it resynchronises.
+    /// How far behind its schedule the clock may fall before it
+    /// resynchronises.
     pub resync_after: Duration,
+    /// Buffers `appsrc` holds before dropping the oldest; also the longest
+    /// catch-up burst of the clock.
+    pub queue_buffers: u32,
+    /// How long a source switch holds the last frame while waiting for the
+    /// new source ([`Output::hold_for`]).
+    pub hold_timeout: Duration,
+    /// The output clock's phase lock ([`crate::clock`]).
+    pub phase_lock: PhaseLockConfig,
 }
 
 impl OutputConfig {
@@ -112,19 +132,28 @@ impl OutputConfig {
             process: GpuStage::default(),
             gap_threshold: Duration::from_nanos(PacerConfig::DEFAULT_GAP_THRESHOLD_NS),
             resync_after: Duration::from_nanos(PacerConfig::DEFAULT_RESYNC_AFTER_NS),
+            queue_buffers: Self::DEFAULT_QUEUE_BUFFERS,
+            hold_timeout: Self::DEFAULT_HOLD_TIMEOUT,
+            phase_lock: PhaseLockConfig::default(),
         }
     }
 
-    /// The output clock's parameters, including the catch-up burst cap the
-    /// `appsrc` queue is sized to.
+    /// Default `appsrc` queue bound, in buffers.
+    pub const DEFAULT_QUEUE_BUFFERS: u32 = 3;
+    /// Default hold during a source switch.
+    pub const DEFAULT_HOLD_TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// The output clock's parameters: the catch-up burst is the `appsrc`
+    /// queue bound.
     pub fn pacer(&self) -> PacerConfig {
         let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
-        PacerConfig::with(
-            self.contract.fps_num,
-            self.contract.fps_den,
-            ns(self.gap_threshold),
-            ns(self.resync_after),
-        )
+        PacerConfig {
+            gap_threshold_ns: ns(self.gap_threshold),
+            resync_after_ns: ns(self.resync_after),
+            max_burst: u64::from(self.queue_buffers.max(1)),
+            lock: self.phase_lock,
+            ..PacerConfig::new(self.contract.fps_num, self.contract.fps_den)
+        }
     }
 }
 
@@ -152,8 +181,16 @@ pub struct EmitInfo {
     pub origin: Option<FrameOrigin>,
     /// When the buffer was handed to `appsrc`.
     pub emitted_at: Instant,
+    /// The instant of the tick's timestamp on the clock's grid: the clock's
+    /// start plus `pts_ns`. `emitted_at` minus this is the emission's
+    /// deviation from the grid, the phase offset plus the wake-up delay.
+    pub grid_at: Instant,
+    /// The clock's phase offset when the tick was scheduled.
+    pub phase_offset_ns: i64,
     /// `appsrc` accepted the buffer.
     pub pushed: bool,
+    /// Buffers queued in `appsrc` right after the push.
+    pub queue_level: u64,
 }
 
 /// Called by the clock thread after every tick. It runs on the clock thread:
@@ -182,6 +219,20 @@ pub struct OutputCounts {
     pub queue_dropped: u64,
     /// Buffers `appsrc` refused (pipeline flushing or stopped).
     pub push_failed: u64,
+    /// The highest `appsrc` queue level seen right after a push (whole
+    /// run; at most [`OutputConfig::queue_buffers`]).
+    pub queue_level_max: u64,
+    /// Phase lock jumps and wraps ([`PacerCounts`]).
+    pub lock_acquisitions: u64,
+    pub lock_wraps: u64,
+    /// The current phase offset, and whether the lock is engaged.
+    pub phase_offset_ns: i64,
+    pub phase_locked: bool,
+    /// Holds armed by source switches, ended by the new source's first
+    /// frame, and ended by the timeout.
+    pub holds: u64,
+    pub holds_released: u64,
+    pub holds_expired: u64,
 }
 
 #[derive(Debug, Default)]
@@ -195,6 +246,14 @@ struct Counters {
     emitted: AtomicU64,
     queue_dropped: AtomicU64,
     push_failed: AtomicU64,
+    queue_level_max: AtomicU64,
+    lock_acquisitions: AtomicU64,
+    lock_wraps: AtomicU64,
+    phase_offset_ns: AtomicI64,
+    phase_locked: AtomicBool,
+    holds: AtomicU64,
+    holds_released: AtomicU64,
+    holds_expired: AtomicU64,
     /// Source of the last fresh frame, and when (ns since the epoch) its
     /// first fresh frame was emitted.
     fresh_source: AtomicU64,
@@ -288,6 +347,9 @@ pub struct Output {
     /// Time origin of slot arrival times and of the clock's grid.
     epoch: Instant,
     next_source: AtomicU64,
+    /// A hold requested by [`Self::hold_for`], taken by the clock thread on
+    /// its next tick: the awaited source and the deadline.
+    hold_request: Arc<Mutex<Option<(u64, Instant)>>>,
     observer: Option<EmitObserver>,
     cuda: Option<gst::Context>,
     clock: Option<ClockThread>,
@@ -365,6 +427,25 @@ fn parse_caps(s: &str) -> Result<gst::Caps, PipelineError> {
     s.parse().map_err(|_| PipelineError::Caps(s.to_string()))
 }
 
+/// The output's `appsrc`: live, timestamped by the clock, never blocking,
+/// holding at most `max_buffers` and dropping the oldest beyond that
+/// (`GST_APP_LEAKY_TYPE_DOWNSTREAM`).
+pub(crate) fn frames_src(name: &str, caps: &gst::Caps, max_buffers: u64) -> gst_app::AppSrc {
+    gst_app::AppSrc::builder()
+        .name(name)
+        .caps(caps)
+        .is_live(true)
+        .format(gst::Format::Time)
+        .do_timestamp(false)
+        .stream_type(gst_app::AppStreamType::Stream)
+        .block(false)
+        .max_buffers(max_buffers)
+        .max_bytes(0)
+        .max_time(gst::ClockTime::ZERO)
+        .leaky_type(gst_app::AppLeakyType::Downstream)
+        .build()
+}
+
 impl Output {
     /// Builds (but does not start) the output pipeline. Its elements can be
     /// inspected and probed before [`Self::start`]. A contract the sink
@@ -378,7 +459,7 @@ impl Output {
         check_sink_range(&contract, &cfg.sink)?;
         let canonical = Canonical::of(&contract);
         let pipeline = gst::Pipeline::with_name("obc-output");
-        let max_burst = cfg.pacer().max_burst;
+        let queue = cfg.pacer().max_burst;
 
         let src_caps = parse_caps(&format!(
             "{},framerate={}/{}",
@@ -386,19 +467,7 @@ impl Output {
             contract.fps_num,
             contract.fps_den
         ))?;
-        let appsrc = gst_app::AppSrc::builder()
-            .name(FRAMES_SRC)
-            .caps(&src_caps)
-            .is_live(true)
-            .format(gst::Format::Time)
-            .do_timestamp(false)
-            .stream_type(gst_app::AppStreamType::Stream)
-            .block(false)
-            .max_buffers(max_burst)
-            .max_bytes(0)
-            .max_time(gst::ClockTime::ZERO)
-            .leaky_type(gst_app::AppLeakyType::Downstream)
-            .build();
+        let appsrc = frames_src(FRAMES_SRC, &src_caps, queue);
 
         let mut chain: Vec<gst::Element> = vec![appsrc.clone().upcast()];
         chain.extend(process_elements(cfg.process, canonical.colorimetry)?);
@@ -461,6 +530,7 @@ impl Output {
             counters: Arc::new(Counters::default()),
             epoch: Instant::now(),
             next_source: AtomicU64::new(1),
+            hold_request: Arc::default(),
             observer: None,
             cuda: None,
             clock: None,
@@ -508,7 +578,16 @@ impl Output {
             superseded: prior.superseded,
             late: prior.late,
             skipped: prior.skipped,
+            lock_acquisitions: prior.lock_acquisitions,
+            lock_wraps: prior.lock_wraps,
+            phase_offset_ns: 0,
+            phase_locked: false,
+            holds: prior.holds,
+            holds_released: prior.holds_released,
+            holds_expired: prior.holds_expired,
         };
+        // A hold requested while stopped does not outlive the stop.
+        self.take_hold_request();
         let stop = Arc::new(StopSignal::default());
         let failure: Arc<Mutex<Option<String>>> = Arc::default();
         let ctx = ClockContext {
@@ -516,6 +595,7 @@ impl Output {
             appsrc: self.appsrc.clone(),
             slot: Arc::clone(&self.slot),
             counters: Arc::clone(&self.counters),
+            hold_request: Arc::clone(&self.hold_request),
             observer: self.observer.clone(),
             placeholder,
             epoch: self.epoch,
@@ -560,6 +640,23 @@ impl Output {
         FrameWriter::new(Arc::clone(&self.slot), self.epoch, id, self.canonical)
     }
 
+    /// Holds the last frame while a source switch waits for `source_id`:
+    /// until its first fresh frame or [`OutputConfig::hold_timeout`] from
+    /// now, the clock repeats the last frame instead of sending placeholders
+    /// after the gap threshold ([`crate::clock`], "Hold"). Taken by the
+    /// clock on its next tick; a later request replaces it.
+    pub fn hold_for(&self, source_id: u64) {
+        let deadline = Instant::now() + self.cfg.hold_timeout;
+        *self.hold_request.lock().unwrap_or_else(|e| e.into_inner()) = Some((source_id, deadline));
+    }
+
+    fn take_hold_request(&self) -> Option<(u64, Instant)> {
+        self.hold_request
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
     /// When the first fresh frame of `source_id` was emitted, if it was and
     /// no later source has emitted a fresh frame since.
     pub fn first_fresh(&self, source_id: u64) -> Option<Instant> {
@@ -584,6 +681,14 @@ impl Output {
             emitted: get(&c.emitted),
             queue_dropped: get(&c.queue_dropped),
             push_failed: get(&c.push_failed),
+            queue_level_max: get(&c.queue_level_max),
+            lock_acquisitions: get(&c.lock_acquisitions),
+            lock_wraps: get(&c.lock_wraps),
+            phase_offset_ns: c.phase_offset_ns.load(Ordering::Relaxed),
+            phase_locked: c.phase_locked.load(Ordering::Relaxed),
+            holds: get(&c.holds),
+            holds_released: get(&c.holds_released),
+            holds_expired: get(&c.holds_expired),
         }
     }
 
@@ -669,6 +774,7 @@ struct ClockContext {
     appsrc: gst_app::AppSrc,
     slot: Arc<Slot<Frame>>,
     counters: Arc<Counters>,
+    hold_request: Arc<Mutex<Option<(u64, Instant)>>>,
     observer: Option<EmitObserver>,
     placeholder: gst::Buffer,
     epoch: Instant,
@@ -701,11 +807,22 @@ impl ClockContext {
                 Step::Tick { index, pts_ns } => (index, pts_ns),
             };
             discont |= self.pacer.counts().skipped != skipped_before;
+            let phase_offset_ns = self.pacer.phase_offset_ns();
+            let request = self
+                .hold_request
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some((source_id, deadline)) = request {
+                self.pacer.hold(source_id, ns_since(origin, deadline));
+            }
             let latest = self.slot.latest();
             let kind = self.pacer.decide(
-                latest
-                    .as_ref()
-                    .map(|e| (e.seq, e.arrived_ns.saturating_sub(shift))),
+                latest.as_ref().map(|e| Latest {
+                    seq: e.seq,
+                    arrived_ns: e.arrived_ns.saturating_sub(shift),
+                    source_id: e.frame.source_id,
+                }),
                 now,
             );
             let (source, origin_info) = match (kind, &latest) {
@@ -743,12 +860,14 @@ impl ClockContext {
             let pushed = self.appsrc.push_buffer(buffer).is_ok();
             discont = false;
 
+            let queue_level = self.appsrc.property::<u64>("current-level-buffers");
             let c = &self.counters;
             if pushed {
                 c.emitted.fetch_add(1, Ordering::Relaxed);
             } else {
                 c.push_failed.fetch_add(1, Ordering::Relaxed);
             }
+            c.queue_level_max.fetch_max(queue_level, Ordering::Relaxed);
             // A leaky drop happens inside push_buffer, on this thread.
             let dropped_now = queue_dropped(&self.appsrc);
             if dropped_now != dropped_seen {
@@ -772,6 +891,15 @@ impl ClockContext {
             c.superseded.store(n.superseded, Ordering::Relaxed);
             c.late.store(n.late, Ordering::Relaxed);
             c.skipped.store(n.skipped, Ordering::Relaxed);
+            c.lock_acquisitions
+                .store(n.lock_acquisitions, Ordering::Relaxed);
+            c.lock_wraps.store(n.lock_wraps, Ordering::Relaxed);
+            c.phase_offset_ns
+                .store(n.phase_offset_ns, Ordering::Relaxed);
+            c.phase_locked.store(n.phase_locked, Ordering::Relaxed);
+            c.holds.store(n.holds, Ordering::Relaxed);
+            c.holds_released.store(n.holds_released, Ordering::Relaxed);
+            c.holds_expired.store(n.holds_expired, Ordering::Relaxed);
             if let Some(observer) = &self.observer {
                 observer(&EmitInfo {
                     tick: index,
@@ -779,7 +907,10 @@ impl ClockContext {
                     kind,
                     origin: origin_info,
                     emitted_at,
+                    grid_at: origin + Duration::from_nanos(pts_ns),
+                    phase_offset_ns,
                     pushed,
+                    queue_level,
                 });
             }
         }
@@ -984,22 +1115,159 @@ mod tests {
         assert_eq!(resume_sequence(None, 0), 0);
     }
 
+    /// The queue bound is `queue_buffers` (default 3), and the clock's
+    /// catch-up burst is the same bound. (Until v0.2.0 both followed the
+    /// 1 s resynchronisation threshold: 31 buffers at 30 fps.)
     #[test]
-    fn the_appsrc_queue_holds_a_whole_catch_up_burst() {
+    fn the_appsrc_queue_is_the_configured_bound_and_the_burst_cap() {
         gst::init().unwrap();
-        for rate in ["30", "60", "30000/1001", "240"] {
+        for (rate, queue) in [
+            ("30", None),
+            ("60", Some(5)),
+            ("30000/1001", Some(1)),
+            ("240", None),
+        ] {
             let contract: OutputContract = format!("1280x720@{rate}").parse().unwrap();
-            let cfg = OutputConfig::new(contract, OutputSink::Fake);
+            let mut cfg = OutputConfig::new(contract, OutputSink::Fake);
+            if let Some(q) = queue {
+                cfg.queue_buffers = q;
+            }
+            let want = u64::from(queue.unwrap_or(OutputConfig::DEFAULT_QUEUE_BUFFERS));
             let pacer = cfg.pacer();
-            assert_eq!(pacer.max_burst, pacer.burst_within(pacer.resync_after_ns));
+            assert_eq!(pacer.max_burst, want, "{rate}");
             let o = Output::build(cfg).unwrap();
             let src = o.pipeline().element(names::FRAMES_SRC).unwrap();
+            assert_eq!(src.property::<u64>("max-buffers"), want, "{rate}");
+            let leaky = src.property_value("leaky-type");
             assert_eq!(
-                src.property::<u64>("max-buffers"),
-                pacer.max_burst,
-                "{rate}"
+                leaky.get::<gst_app::AppLeakyType>().unwrap(),
+                gst_app::AppLeakyType::Downstream,
+                "drops the oldest"
             );
         }
+        assert_eq!(OutputConfig::DEFAULT_QUEUE_BUFFERS, 3);
+    }
+
+    /// A sink slower than the push rate (100 ms per buffer against a push
+    /// every 33 ms), behind an `appsrc` built like the output's: the queue
+    /// never holds more than its bound, the excess is dropped oldest first
+    /// (and counted), and a buffer reaching the sink has at most the bound
+    /// of newer buffers queued behind it. System memory only: no GPU
+    /// needed. The assertions count buffers, not wall-clock time, so a
+    /// loaded machine does not change the outcome.
+    #[test]
+    fn a_slow_sink_sees_bounded_queue_and_frame_age() {
+        if !have(&["fakesink"]) {
+            return;
+        }
+        const BOUND: u64 = 3;
+        const SERVICE: Duration = Duration::from_millis(100);
+        let period = Duration::from_nanos(1_000_000_000 / 30);
+        let caps: gst::Caps = "video/x-raw,format=GRAY8,width=16,height=16,framerate=30/1"
+            .parse()
+            .unwrap();
+        let src = frames_src("slow_src", &caps, BOUND);
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .property("signal-handoffs", true)
+            .build()
+            .unwrap();
+        // Per buffer reaching the sink: its index, how many buffers were
+        // queued behind it then, and how long ago it was pushed. A push
+        // and its count happen under the `pushed_at` lock, and buffers
+        // only leave the queue through this callback (or a drop, at a
+        // push), so pushed - dropped - delivered under that lock is the
+        // queue's content at that moment, however late the callback runs.
+        let pushed_at: Arc<Mutex<Vec<Instant>>> = Arc::default();
+        let seen: Arc<Mutex<Vec<(u64, u64, Duration)>>> = Arc::default();
+        let (p, a, s) = (Arc::clone(&pushed_at), Arc::clone(&seen), src.clone());
+        sink.connect("handoff", false, move |args| {
+            let buffer = args[1].get::<gst::Buffer>().unwrap();
+            let index = buffer.offset();
+            let (queued, age) = {
+                let pushed = p.lock().unwrap();
+                let dropped = s.property::<u64>("dropped");
+                let delivered = a.lock().unwrap().len() as u64 + 1;
+                let queued = (pushed.len() as u64).saturating_sub(dropped + delivered);
+                (queued, pushed[index as usize].elapsed())
+            };
+            a.lock().unwrap().push((index, queued, age));
+            std::thread::sleep(SERVICE);
+            None
+        });
+        let pipeline = gst::Pipeline::new();
+        add_linked(&pipeline, &[src.clone().upcast(), sink]).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+
+        let pushes = 60u64;
+        let mut level_max = 0;
+        let start = Instant::now();
+        for i in 0..pushes {
+            let due = start + period * u32::try_from(i).unwrap();
+            if let Some(d) = due.checked_duration_since(Instant::now()) {
+                std::thread::sleep(d);
+            }
+            let mut buffer = gst::Buffer::from_mut_slice(vec![0u8; 16 * 16]);
+            {
+                let b = buffer.get_mut().unwrap();
+                b.set_pts(gst::ClockTime::from_nseconds(i * period.as_nanos() as u64));
+                b.set_offset(i);
+            }
+            let pushed = {
+                let mut pushed_at = pushed_at.lock().unwrap();
+                pushed_at.push(Instant::now());
+                src.push_buffer(buffer)
+            };
+            assert!(pushed.is_ok());
+            let level = src.property::<u64>("current-level-buffers");
+            level_max = level_max.max(level);
+        }
+        // Let the sink drain what is queued: every buffer pushed is either
+        // delivered or dropped (counted).
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let dropped = loop {
+            let dropped = src.property::<u64>("dropped");
+            let delivered = seen.lock().unwrap().len() as u64;
+            if delivered + dropped >= pushes || Instant::now() > deadline {
+                break dropped;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        let seen = seen.lock().unwrap().clone();
+        let delivered = seen.len() as u64;
+        let queued_max = seen.iter().map(|s| s.1).max().unwrap();
+        let oldest = seen.iter().map(|s| s.2).max().unwrap();
+        eprintln!(
+            "slow sink: {pushes} pushed, {delivered} delivered, {dropped} dropped, queue level max \
+             {level_max}, at most {queued_max} buffers queued behind one reaching the sink, oldest \
+             buffer at the sink {oldest:?}"
+        );
+        assert!(level_max <= BOUND, "queue level {level_max}");
+        assert!(dropped > 0, "nothing dropped");
+        assert_eq!(delivered + dropped, pushes);
+        // Delivered in push order.
+        assert!(seen.windows(2).all(|w| w[0].0 < w[1].0));
+        // Dropped oldest first: the newest buffers, last in the queue when
+        // the pushes stopped, all reach the sink (dropping the newest would
+        // have lost the last pushes into a full queue).
+        let tail: Vec<u64> = seen
+            .iter()
+            .rev()
+            .take(BOUND as usize)
+            .map(|s| s.0)
+            .collect();
+        assert_eq!(
+            tail,
+            (pushes - BOUND..pushes).rev().collect::<Vec<_>>(),
+            "the last {BOUND} pushed were delivered"
+        );
+        // No backlog: when a buffer reaches the sink, the queue behind it
+        // holds at most the bound, however long the streaming thread took
+        // from the dequeue to the callback (the pushes meanwhile drop the
+        // oldest). An unbounded queue would hold dozens.
+        assert!(queued_max <= BOUND, "{queued_max} buffers queued");
     }
 
     #[test]

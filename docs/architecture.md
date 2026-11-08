@@ -70,7 +70,7 @@ For example, a camera offering only MJPEG 1080p30 and YUYV up to 960x540@15, ask
 **Ingest, Process, Output.** The stream is split into three stages ([ADR-0009](adr/0009-ingest-process-output.md)):
 - **Ingest** (per source) crops and scales every camera to the **canonical frame**: `video/x-raw(memory:CUDAMemory), format=NV12` at the processing size (the output size for now), with the colour label of the contract's range (`2:4:5:1` limited, `1:4:5:1` full). The default aspect policy is a centre crop to fill the frame; letterbox is an option.
 - **Process** applies the effect chain to canonical frames. Effects do not know which source fed them or which sink they feed. An effect that needs another format gets converters inserted around it in CUDA memory.
-- **Output** (per sink) holds a fixed contract of format (NV12 or I420), size, frame rate and colour range (default NV12 1920x1080@30, limited range) and runs on its own clock: it repeats the latest frame when the source is slower, drops frames when it is faster, and sends a black placeholder after a gap without input (default 500 ms). The source can be switched while the output keeps running; a switch took 0.65 to 1.05 s in measurement ([benchmarks/io-split.md](benchmarks/io-split.md)).
+- **Output** (per sink) holds a fixed contract of format (NV12 or I420), size, frame rate and colour range (default NV12 1920x1080@30, limited range) and runs on its own clock: it repeats the latest frame when the source is slower, drops frames when it is faster, and sends a black placeholder after a gap without input (default 500 ms). The clock's timestamps sit on an exact grid of the contract rate, while the instant each tick is emitted is locked to the camera's frames, a small margin after each expected arrival and never later than the timestamp ([ADR-0010](adr/0010-phase-locked-output-clock.md)), so a frame waits in the slot only that margin plus the camera's arrival jitter. The source can be switched while the output keeps running: the output holds the previous camera's last frame until the new camera's first frame (at most 3 s), so a switch shows no black frame ([benchmarks/io-split.md](benchmarks/io-split.md)). The output's `appsrc` queues at most 3 frames, so a slow consumer gets recent frames, not a backlog.
 - **v4l2loopback constraints.** The device carries no colour description: it reports every stream as BT.601 (`2:4:5:4`) and, while a consumer holds it, refuses any other label. The output therefore relabels frames `2:4:5:4` after download (labels only, no pixel change), and a **full-range contract is refused** for a loopback sink, because consumers would read it as limited. At start the output compares the device's accepted caps with the contract: if the device is held by a consumer in another format, size or rate (its caps are fixed), the error says so (`LoopbackFormatHeld`); a colour label is compared by meaning. Any other mismatch is a generic refusal.
 
 **UVC controls.** `exposure_auto_priority` (`exposure_dynamic_framerate`) is probed and used only if the camera exposes it. `--camera-fixed-framerate` pins it to 0 while a camera streams and restores it when that camera's ingest stops (on a source switch and on exit, including Ctrl-C and SIGTERM, but not SIGKILL). No per-camera quirks are needed.
@@ -92,8 +92,8 @@ flowchart LR
     SLOT[("latest-frame slot<br/>buffer reference + sequence")]
 
     subgraph Output["Output pipeline — fixed contract, lives for the whole stream"]
-        CLK["output clock<br/>one tick per contract period:<br/>fresh / repeat / placeholder"]
-        SRC["appsrc<br/>canonical caps"]
+        CLK["output clock<br/>one tick per contract period,<br/>phase locked to the camera:<br/>fresh / repeat / placeholder;<br/>holds the last frame during a switch"]
+        SRC["appsrc<br/>canonical caps, at most 3 queued<br/>(oldest dropped)"]
         subgraph Process["Process — effect chain (empty in this step)"]
             E1["obcblur / obcreplace<br/>(converters around effects<br/>that need another format)"]
         end
@@ -107,6 +107,25 @@ flowchart LR
     AS --> SLOT --> CLK
     K2["pipewiresink (planned)"]
     DL -.-> K2
+```
+
+A source switch, as the output sees it ([ADR-0010](adr/0010-phase-locked-output-clock.md)):
+
+```mermaid
+sequenceDiagram
+    participant S as Session
+    participant O as Output clock
+    participant A as Old ingest
+    participant B as New ingest
+    S->>O: hold for B (at most 3 s)
+    S->>A: stop (camera closed, controls restored)
+    S->>B: start
+    loop every tick until B's first frame
+        O->>O: repeat the last frame<br/>(no black after 500 ms)
+    end
+    B-->>O: first frame (fresh): hold ends
+    O->>O: phase lock re-acquires on B<br/>within a few frames
+    Note over O: no frame from B within 3 s:<br/>black placeholders, as after any input loss
 ```
 
 These are the extension points, and each is a trait or element boundary:
@@ -134,7 +153,7 @@ stateDiagram-v2
     Streaming --> Draining: last consumer closed
     Draining --> Streaming: consumer reopens
     Draining --> Idle: grace expired → teardown,<br/>release CUDA ctx, close camera
-    Streaming --> Streaming: camera / source change<br/>(rebuild the ingest pipeline only;<br/>output keeps its contract and clock)
+    Streaming --> Streaming: camera / source change<br/>(rebuild the ingest pipeline only;<br/>output keeps its contract and clock<br/>and holds the last frame meanwhile)
     Failed --> Idle: reset / retry
 ```
 

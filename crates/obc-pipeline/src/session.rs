@@ -3,8 +3,15 @@
 //!
 //! A switch stops the current ingest (camera closed, its controls restored)
 //! and only then starts the next one, so the same camera can be reopened in
-//! another mode. The output is never touched: during the gap it repeats the
-//! last frame and then sends placeholders.
+//! another mode. The output pipeline is never touched. Before the current
+//! ingest stops, the output is told to hold the last frame until the next
+//! source's first frame ([`Output::hold_for`], at most
+//! [`crate::output::OutputConfig::hold_timeout`]), so the gap shows the last
+//! frame instead of black placeholders. If the next source does not start,
+//! the hold runs to its timeout and placeholders follow. Stopping the ingest
+//! without a switch ([`Session::stop_ingest`]) or an ingest that fails arms
+//! no hold: the output repeats the last frame and sends placeholders after
+//! the gap threshold.
 
 use std::time::{Duration, Instant};
 
@@ -76,10 +83,14 @@ impl Session {
         Ingest::build(cfg, self.output.frame_writer())
     }
 
-    /// Makes `next` the current source: stops the current ingest, then
-    /// starts `next` with the output's CUDA context. If stopping the
-    /// current ingest fails, `next` is not started (it is dropped); if
-    /// starting `next` fails, the session has no source and the output
+    /// Makes `next` the current source: arms the output's hold for `next`
+    /// (when a source is streaming), stops the current ingest, then starts
+    /// `next` with the output's CUDA context. If stopping the current
+    /// ingest fails, `next` is not started (it is dropped); if starting
+    /// `next` fails, the session has no source. Either way the hold armed
+    /// for `next` runs to its timeout
+    /// ([`OutputConfig::hold_timeout`](crate::output::OutputConfig::hold_timeout),
+    /// 3 s by default): the output repeats the last frame that long, then
     /// sends placeholders.
     pub fn switch_to(&mut self, next: Ingest) -> Result<SwitchTiming, PipelineError> {
         self.switch_at(next, Instant::now())
@@ -122,6 +133,9 @@ impl Session {
         timing: &mut SwitchTiming,
     ) -> Result<(), PipelineError> {
         if let Some(old) = self.ingest.take() {
+            // Before the old camera stops: no tick may see the gap first.
+            self.output.hold_for(next.source_id());
+            // A failed stop drops `next`: the hold runs to its timeout.
             old.stop()?;
             timing.previous_stopped = Some(Instant::now());
         }

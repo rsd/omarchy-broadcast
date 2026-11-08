@@ -1401,10 +1401,23 @@ fn gpu_crop_fills_and_letterbox_pads() {
 /// A test-pattern source for the GPU-only output tests: `videotestsrc`
 /// (live, solid white) at `fps`, 640x480 NV12, stopping after `frames`.
 fn test_pattern_ingest(output: &Output, fps: i32, frames: i32) -> Ingest {
+    pattern_ingest(output, fps, frames, "white", None)
+}
+
+/// A test-pattern source of `pattern`, whose first frame reaches the slot
+/// `delay` after it starts (a `queue` holding back that much), as a camera
+/// that is slow to start.
+fn pattern_ingest(
+    output: &Output,
+    fps: i32,
+    frames: i32,
+    pattern: &str,
+    delay: Option<Duration>,
+) -> Ingest {
     let src = gst::ElementFactory::make("videotestsrc")
         .property("is-live", true)
         .property("num-buffers", frames)
-        .property_from_str("pattern", "white")
+        .property_from_str("pattern", pattern)
         .build()
         .unwrap();
     let caps = gst::ElementFactory::make("capsfilter")
@@ -1419,8 +1432,21 @@ fn test_pattern_ingest(output: &Output, fps: i32, frames: i32) -> Ingest {
         )
         .build()
         .unwrap();
+    let mut head = vec![src, caps];
+    if let Some(d) = delay {
+        let ns = u64::try_from(d.as_nanos()).unwrap();
+        head.push(
+            gst::ElementFactory::make("queue")
+                .property("min-threshold-time", ns)
+                .property("max-size-time", 2 * ns + 1_000_000_000)
+                .property("max-size-buffers", 0u32)
+                .property("max-size-bytes", 0u32)
+                .build()
+                .unwrap(),
+        );
+    }
     Ingest::from_head(
-        vec![src, caps],
+        head,
         "NV12",
         (640, 480),
         AspectPolicy::Crop,
@@ -1959,11 +1985,10 @@ fn gpu_a_failed_switch_is_recorded_with_its_error() {
     ]) {
         return;
     }
-    let output = Output::build(OutputConfig::new(
-        OutputContract::default(),
-        OutputSink::Fake,
-    ))
-    .expect("build output");
+    let mut cfg = OutputConfig::new(OutputContract::default(), OutputSink::Fake);
+    cfg.hold_timeout = Duration::from_secs(1);
+    let mut output = Output::build(cfg).expect("build output");
+    let trace = trace_output(&mut output);
     let mut session = Session::new(output).expect("start output");
     let first = test_pattern_ingest(session.output(), 30, -1);
     let first_id = first.source_id();
@@ -1971,6 +1996,14 @@ fn gpu_a_failed_switch_is_recorded_with_its_error() {
     let ok = session.last_switch().unwrap();
     assert_eq!((ok.source_id, ok.error.as_deref()), (first_id, None));
     assert!(ok.started.is_some());
+    let (mut out_log, mut in_log) = (BusLog::default(), BusLog::default());
+    assert!(run_until(
+        &session,
+        &mut out_log,
+        &mut in_log,
+        Duration::from_secs(10),
+        |s| s.output().counts().fresh > 10
+    ));
 
     // A source that cannot open: a file that does not exist.
     let src = gst::ElementFactory::make("filesrc")
@@ -2000,7 +2033,45 @@ fn gpu_a_failed_switch_is_recorded_with_its_error() {
         .expect_err("a source that cannot open must fail to start");
     let failed = session.last_switch().expect("the attempt is recorded");
     let no_source = session.ingest().is_none();
+    // The hold armed for the broken source runs to its timeout (1 s), then
+    // placeholders follow.
+    std::thread::sleep(Duration::from_millis(2_000));
+    let counts = session.output().counts();
     session.stop().expect("teardown");
+    assert_eq!(
+        (counts.holds, counts.holds_released, counts.holds_expired),
+        (1, 0, 1),
+        "{counts:?}"
+    );
+    let t = trace.lock().unwrap();
+    let last_fresh = t
+        .emitted
+        .iter()
+        .rposition(|e| e.kind == TickKind::Fresh)
+        .expect("frames of the first source");
+    let after: Vec<&EmitInfo> = t.emitted[last_fresh + 1..].iter().collect();
+    let held = after
+        .iter()
+        .take_while(|e| e.kind == TickKind::Repeat)
+        .count();
+    assert!(
+        held > 0,
+        "no repeat after the last fresh frame: {:?}",
+        after.first()
+    );
+    let held_for = after[held - 1].emitted_at - t.emitted[last_fresh].emitted_at;
+    eprintln!("failed switch: {held} repeats over {held_for:?}, then placeholders");
+    // Past the 500 ms gap threshold, up to the 1 s hold.
+    assert!(
+        held_for > Duration::from_millis(700) && held_for < Duration::from_millis(1_100),
+        "{held_for:?}"
+    );
+    assert!(
+        after[held..]
+            .iter()
+            .all(|e| e.kind == TickKind::Placeholder)
+    );
+    assert!(after.len() - held > 15);
 
     assert!(no_source, "the session should be left without a source");
 
@@ -2011,4 +2082,194 @@ fn gpu_a_failed_switch_is_recorded_with_its_error() {
         failed.previous_stopped.is_some(),
         "the first source was stopped"
     );
+}
+
+/// GPU only: a switch to a source that takes 1 s to deliver its first
+/// frame (twice the 500 ms gap threshold) holds the previous source's last
+/// frame throughout: no placeholder, white repeats until the new source's
+/// first frame.
+#[test]
+#[ignore = "needs an NVIDIA GPU"]
+fn gpu_a_switch_holds_the_last_frame_until_the_new_source() {
+    init();
+    if !have(&[
+        "videotestsrc",
+        "queue",
+        "cudaupload",
+        "cudaconvertscale",
+        "videocrop",
+        "cudadownload",
+    ]) {
+        return;
+    }
+    let mut output = Output::build(OutputConfig::new(
+        OutputContract::default(),
+        OutputSink::Fake,
+    ))
+    .expect("build output");
+    let trace = trace_output(&mut output);
+    let mut session = Session::new(output).expect("start output");
+    let first = test_pattern_ingest(session.output(), 30, -1);
+    session.switch_to(first).expect("first source");
+    let (mut out_log, mut in_log) = (BusLog::default(), BusLog::default());
+    assert!(run_until(
+        &session,
+        &mut out_log,
+        &mut in_log,
+        Duration::from_secs(10),
+        |s| s.output().counts().fresh > 30
+    ));
+    let slow = pattern_ingest(
+        session.output(),
+        30,
+        -1,
+        "black",
+        Some(Duration::from_millis(1_000)),
+    );
+    let slow_id = slow.source_id();
+    session.switch_to(slow).expect("switch");
+    assert!(run_until(
+        &session,
+        &mut out_log,
+        &mut in_log,
+        Duration::from_secs(5),
+        |s| s.output().first_fresh(slow_id).is_some()
+    ));
+    run_until(
+        &session,
+        &mut out_log,
+        &mut in_log,
+        Duration::from_millis(500),
+        |_| false,
+    );
+    let timing = session.last_switch().unwrap();
+    let counts = session.output().counts();
+    session.stop().expect("teardown");
+    assert!(
+        out_log.errors.is_empty() && in_log.errors.is_empty(),
+        "{out_log:?} {in_log:?}"
+    );
+
+    let t = trace.lock().unwrap();
+    let first_new = t
+        .emitted
+        .iter()
+        .position(|e| e.origin.is_some_and(|o| o.source_id == slow_id))
+        .unwrap();
+    let last_old = t.emitted[..first_new]
+        .iter()
+        .rposition(|e| e.kind == TickKind::Fresh)
+        .unwrap();
+    let held = t.emitted[first_new].emitted_at - t.emitted[last_old].emitted_at;
+    eprintln!(
+        "{counts:?}; switch gap {:?}, last frame held {held:?} over {} ticks",
+        timing.gap(),
+        first_new - last_old - 1
+    );
+    assert_eq!(
+        (counts.holds, counts.holds_released, counts.holds_expired),
+        (1, 1, 0)
+    );
+    assert!(held > Duration::from_millis(900), "held only {held:?}");
+    let gap = &t.emitted[last_old + 1..first_new];
+    assert!(gap.iter().all(|e| e.kind == TickKind::Repeat), "{gap:?}");
+    assert_eq!(t.emitted[first_new].kind, TickKind::Fresh);
+    // At the sink: the old (white) frame during the hold, never black.
+    let luma_at = |pts: u64| {
+        t.centre_luma
+            .iter()
+            .find(|(p, _)| *p == pts)
+            .map(|(_, v)| *v)
+    };
+    let mut checked = 0;
+    for e in gap {
+        if let Some(v) = luma_at(e.pts_ns) {
+            assert!(v.abs_diff(235) <= 3, "luma {v} during the hold");
+            checked += 1;
+        }
+    }
+    // The sink saw the held frames (not only the clock's decisions).
+    assert!(
+        checked > 0 && checked * 2 >= gap.len(),
+        "luma recorded for {checked} of {} held ticks",
+        gap.len()
+    );
+}
+
+/// GPU only: the real output behind a sink that needs 100 ms per frame (a
+/// third of the contract rate): the `appsrc` queue never exceeds its bound
+/// (3), the frames it drops are counted, the clock neither skips nor falls
+/// behind, and no frame reaches the sink later than about the bound times
+/// the sink's service time after its emission.
+#[test]
+#[ignore = "needs an NVIDIA GPU"]
+fn gpu_a_slow_sink_never_queues_more_than_the_bound() {
+    init();
+    if !have(&[
+        "videotestsrc",
+        "cudaupload",
+        "cudaconvertscale",
+        "videocrop",
+        "cudadownload",
+        "fakesink",
+    ]) {
+        return;
+    }
+    const SERVICE: Duration = Duration::from_millis(100);
+    let cfg = OutputConfig::new(OutputContract::default(), OutputSink::Fake);
+    let bound = u64::from(cfg.queue_buffers);
+    let mut output = Output::build(cfg).expect("build output");
+    let emitted: Arc<Mutex<Vec<(u64, Instant)>>> = Arc::default();
+    let e = Arc::clone(&emitted);
+    output.set_observer(Some(Arc::new(move |i: &EmitInfo| {
+        e.lock().unwrap().push((i.pts_ns, i.emitted_at));
+    })));
+    let ages: Arc<Mutex<Vec<Duration>>> = Arc::default();
+    let sink = output.pipeline().element(names::LOOPBACK).unwrap();
+    sink.set_property("signal-handoffs", true);
+    let (e, a) = (Arc::clone(&emitted), Arc::clone(&ages));
+    sink.connect("handoff", false, move |args| {
+        let buffer = args[1].get::<gst::Buffer>().unwrap();
+        let now = Instant::now();
+        if let Some(pts) = buffer.pts().map(|p| p.nseconds())
+            && let Some((_, at)) = e.lock().unwrap().iter().rev().find(|(p, _)| *p == pts)
+        {
+            a.lock().unwrap().push(now - *at);
+        }
+        std::thread::sleep(SERVICE);
+        None
+    });
+    let mut session = Session::new(output).expect("start output");
+    session
+        .switch_to(test_pattern_ingest(session.output(), 30, -1))
+        .expect("source");
+    let (mut out_log, mut in_log) = (BusLog::default(), BusLog::default());
+    run_until(
+        &session,
+        &mut out_log,
+        &mut in_log,
+        Duration::from_secs(4),
+        |_| false,
+    );
+    let c = session.output().counts();
+    session.stop().expect("teardown");
+    let ages = ages.lock().unwrap().clone();
+    let oldest = ages.iter().max().copied().unwrap_or_default();
+    eprintln!(
+        "slow sink: emitted {} queue dropped {} queue level max {} skipped {} late {}; {} \
+         frames at the sink, oldest {oldest:?} after its emission",
+        c.emitted,
+        c.queue_dropped,
+        c.queue_level_max,
+        c.skipped,
+        c.late,
+        ages.len()
+    );
+    assert!(out_log.errors.is_empty(), "{out_log:?}");
+    assert!(c.queue_level_max <= bound, "{c:?}");
+    assert!(c.queue_dropped > c.emitted / 2, "{c:?}");
+    assert_eq!((c.skipped, c.push_failed), (0, 0), "{c:?}");
+    assert!(ages.len() >= 30, "{} frames reached the sink", ages.len());
+    let limit = SERVICE * u32::try_from(bound).unwrap() + Duration::from_millis(60);
+    assert!(oldest <= limit, "{oldest:?} (limit {limit:?})");
 }

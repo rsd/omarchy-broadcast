@@ -8,7 +8,7 @@
 | [research/maxine-linux.md](research/maxine-linux.md) | Technical notes on Maxine on Linux: distribution, licence, versions, Blackwell support, features, API shape, existing projects |
 | [benchmarks/passthrough.md](benchmarks/passthrough.md) | Passthrough and roundtrip results: pipeline, latency method, output format, camera frame-rate caveat, teardown finding; raw results are the JSON files alongside |
 | [benchmarks/ingest-paths.md](benchmarks/ingest-paths.md) | Camera and ingest-path results: GPU-direct, CPU convert and CPU decode cost on two cameras, with variance under load |
-| [benchmarks/io-split.md](benchmarks/io-split.md) | Ingest / Output split results: output frame rate over 10 minutes, live camera switching with an external consumer, crop versus letterbox, and cost per ingest path against the single pipeline; raw results are the JSON files alongside |
+| [benchmarks/io-split.md](benchmarks/io-split.md) | Ingest / Output split results: output frame rate over 10 minutes, live camera switching with an external consumer, crop versus letterbox, cost per ingest path against the single pipeline, and the phase-locked clock with the held frame at a switch; raw results are the JSON files alongside |
 | [testing.md](testing.md) | Unit tests, hardware tests (environment variables), the `obc-bench` flags and the manual OBS/Chrome test, including camera switching |
 | [benchmarks/dgpu-idle.md](benchmarks/dgpu-idle.md) | dGPU idle check after teardown: findings and the quiet-desktop procedure |
 | `../scripts/dgpu-idle-check.sh` | Reads sysfs and `/proc` only (never NVML) to report whether the dGPU runtime-suspends and who holds it awake |
@@ -28,5 +28,6 @@
 | [0007](adr/0007-headless-daemon-toml-config.md) | Headless daemon with a TOML config file |
 | [0008](adr/0008-cpu-ingest-adapters.md) | CPU ingest adapters for MJPEG and YUYV/UYVY |
 | [0009](adr/0009-ingest-process-output.md) | Ingest, Process and Output stages joined by a latest-frame slot; the output has a fixed contract and its own clock |
+| [0010](adr/0010-phase-locked-output-clock.md) | The output clock locks the phase of its ticks to the camera (timestamps stay on the exact grid), a source switch holds the last frame, and the output queue holds at most 3 frames |
 
 Conventions: diagrams are mermaid. New decisions get the next ADR number; superseded ADRs keep their file and change their status line.

@@ -42,9 +42,20 @@
 //! decodes it and records its arrival on the same clock: camera src pad ->
 //! consumer receipt, for fresh frames.
 //!
+//! **Output timing.** The emit observer also reports each tick's grid
+//! instant (clock start + output PTS), so the sink probe records every
+//! frame's **deviation** from the grid (sink-pad arrival minus grid
+//! instant: the clock's phase offset, its wake-up delay and the push), and
+//! the output PTS of every frame at the sink, so the bench can check the
+//! PTS sequence (every tick once, in order). The same is recorded for the
+//! consumer from its stamp. Fresh emissions also record how long the frame
+//! waited in the slot, and every push the `appsrc` queue level.
+//!
 //! **Switch gaps.** [`Recorder::begin_switch`] opens a switch; the emit
 //! observer counts the repeats and placeholders emitted until the first
-//! fresh frame of the new source closes it ([`SwitchTracker`]). Only
+//! fresh frame of the new source closes it ([`SwitchTracker`]), and how
+//! long the last frame was held: from the last fresh frame before (the
+//! previous camera's) to the new camera's first. Only
 //! emissions `appsrc` accepted count: a refused buffer never reached the
 //! sink, so it neither closes a switch nor adds to its gap. Placeholders
 //! emitted in the window while no switch is open are counted apart
@@ -92,6 +103,28 @@ struct EmitRec {
     src_t: Option<u64>,
     /// When the buffer was handed to `appsrc`.
     t: u64,
+    /// The tick's grid instant (clock start + output PTS).
+    grid_t: Option<u64>,
+}
+
+/// What the recorder takes from one output tick (see [`EmitInfo`]); times
+/// in recorder nanoseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TickRecord {
+    /// Output PTS.
+    pts: u64,
+    kind: TickKind,
+    /// The frame's `(source id, camera PTS)`; `None` for a placeholder.
+    origin: Option<(u64, Option<u64>)>,
+    /// When it was handed to `appsrc`.
+    t: u64,
+    pushed: bool,
+    /// The tick's grid instant.
+    grid_t: Option<u64>,
+    /// `appsrc` queue level after the push.
+    queue_level: u64,
+    /// When the frame entered the slot.
+    arrived_t: Option<u64>,
 }
 
 /// A buffer seen at the sink before its emission was reported.
@@ -117,11 +150,21 @@ pub struct SwitchGap {
     /// Fresh frames of the previous source emitted after the request
     /// (before it was stopped).
     pub previous_fresh: u64,
+    /// When the last fresh frame before the new source's first was
+    /// emitted (the previous source's last), if any.
+    pub held_from_ns: Option<u64>,
 }
 
 impl SwitchGap {
     pub fn gap_ns(&self) -> u64 {
         self.first_fresh_ns.saturating_sub(self.requested_ns)
+    }
+
+    /// How long the output showed no new camera frame: from the previous
+    /// source's last fresh frame to the new source's first.
+    pub fn held_ns(&self) -> Option<u64> {
+        self.held_from_ns
+            .map(|t| self.first_fresh_ns.saturating_sub(t))
     }
 }
 
@@ -140,6 +183,8 @@ struct OpenSwitch {
 #[derive(Debug, Default, Clone)]
 pub struct SwitchTracker {
     open: Option<OpenSwitch>,
+    /// When the last fresh frame was emitted (any source).
+    last_fresh_t: Option<u64>,
 }
 
 impl SwitchTracker {
@@ -175,6 +220,10 @@ impl SwitchTracker {
 
     /// Accounts one emission at `t`; returns the switch it completes.
     pub fn on_emit(&mut self, kind: TickKind, source: Option<u64>, t: u64) -> Option<SwitchGap> {
+        let held_from_ns = self.last_fresh_t;
+        if kind == TickKind::Fresh {
+            self.last_fresh_t = Some(t);
+        }
         let o = self.open.as_mut()?;
         match kind {
             TickKind::Fresh if o.target.is_some() && source == o.target => {
@@ -185,6 +234,7 @@ impl SwitchTracker {
                     repeats: o.repeats,
                     placeholders: o.placeholders,
                     previous_fresh: o.previous_fresh,
+                    held_from_ns,
                 };
                 self.open = None;
                 Some(gap)
@@ -217,13 +267,30 @@ struct Inner {
     src_times: VecDeque<u64>,
     src_source: VecDeque<u64>,
     src_pts: VecDeque<u64>,
-    /// Arrival at the sink pad, every output frame.
+    /// Arrival at the sink pad, every output frame, with its output PTS
+    /// (`UNSET`: none).
     sink_times: VecDeque<u64>,
+    sink_pts: VecDeque<u64>,
+    /// Sink-pad arrival minus grid instant, per frame joined to its
+    /// emission, and its arrival time.
+    sink_dev_t: VecDeque<u64>,
+    sink_dev_ns: VecDeque<i64>,
+    /// Slot wait of each fresh emission (pushed), and its emission time.
+    wait_t: VecDeque<u64>,
+    slot_wait_ns: VecDeque<u64>,
+    /// Of the same frames: camera src pad to slot (`UNSET`: unknown).
+    ingest_ns: VecDeque<u64>,
     /// Sink-ready time of each fresh frame with a latency sample.
     fresh_times: VecDeque<u64>,
     added_latency_ns: VecDeque<u64>,
     added_at_pad_ns: VecDeque<u64>,
     consumer_times: VecDeque<u64>,
+    /// The stamp (output PTS) of each `consumer_times` entry (`UNSET`:
+    /// none).
+    consumer_pts: VecDeque<u64>,
+    /// Consumer receipt minus grid instant, matched frames, and receipt.
+    consumer_dev_t: VecDeque<u64>,
+    consumer_dev_ns: VecDeque<i64>,
     consumer_latency_ns: VecDeque<u64>,
     /// Receipt time of each `consumer_latency_ns` entry (for trimming).
     consumer_latency_t: VecDeque<u64>,
@@ -239,7 +306,7 @@ struct Inner {
 
 /// Pops the front of `times` (and the same number from each paired series)
 /// while it is older than `cutoff`; `true` if anything was dropped.
-fn trim_series(times: &mut VecDeque<u64>, paired: &mut [&mut VecDeque<u64>], cutoff: u64) -> bool {
+fn trim_series<T>(times: &mut VecDeque<u64>, paired: &mut [&mut VecDeque<T>], cutoff: u64) -> bool {
     let mut cut = false;
     while times.front().is_some_and(|&t| t < cutoff) {
         times.pop_front();
@@ -258,7 +325,16 @@ fn index_range(times: &VecDeque<u64>, from: u64, to: u64) -> std::ops::Range<usi
     a..b
 }
 
-fn collect(v: &VecDeque<u64>, r: std::ops::Range<usize>) -> Vec<u64> {
+/// `a - b` as a signed number of nanoseconds.
+fn signed_diff(a: u64, b: u64) -> i64 {
+    if a >= b {
+        i64::try_from(a - b).unwrap_or(i64::MAX)
+    } else {
+        -i64::try_from(b - a).unwrap_or(i64::MAX)
+    }
+}
+
+fn collect<T: Copy>(v: &VecDeque<T>, r: std::ops::Range<usize>) -> Vec<T> {
     v.range(r).copied().collect()
 }
 
@@ -270,13 +346,27 @@ impl Inner {
             &mut [&mut self.src_source, &mut self.src_pts],
             cutoff,
         );
-        let b = trim_series(&mut self.sink_times, &mut [], cutoff);
+        let b = trim_series(&mut self.sink_times, &mut [&mut self.sink_pts], cutoff)
+            | trim_series(&mut self.sink_dev_t, &mut [&mut self.sink_dev_ns], cutoff)
+            | trim_series(
+                &mut self.wait_t,
+                &mut [&mut self.slot_wait_ns, &mut self.ingest_ns],
+                cutoff,
+            );
         let c = trim_series(
             &mut self.fresh_times,
             &mut [&mut self.added_latency_ns, &mut self.added_at_pad_ns],
             cutoff,
         );
-        let d = trim_series(&mut self.consumer_times, &mut [], cutoff);
+        let d = trim_series(
+            &mut self.consumer_times,
+            &mut [&mut self.consumer_pts],
+            cutoff,
+        ) | trim_series(
+            &mut self.consumer_dev_t,
+            &mut [&mut self.consumer_dev_ns],
+            cutoff,
+        );
         let e = trim_series(
             &mut self.consumer_latency_t,
             &mut [&mut self.consumer_latency_ns],
@@ -299,18 +389,29 @@ impl Inner {
     fn samples(&self, from: u64, to: u64) -> Samples {
         let src = index_range(&self.src_times, from, to);
         let fresh = index_range(&self.fresh_times, from, to);
+        let sink = index_range(&self.sink_times, from, to);
+        let consumer = index_range(&self.consumer_times, from, to);
         Samples {
             src_times: collect(&self.src_times, src.clone()),
             src_source: collect(&self.src_source, src.clone()),
             src_pts: collect(&self.src_pts, src),
-            sink_times: collect(&self.sink_times, index_range(&self.sink_times, from, to)),
+            sink_times: collect(&self.sink_times, sink.clone()),
+            sink_pts: collect(&self.sink_pts, sink),
+            sink_deviation_ns: collect(&self.sink_dev_ns, index_range(&self.sink_dev_t, from, to)),
+            slot_wait_ns: collect(&self.slot_wait_ns, index_range(&self.wait_t, from, to)),
+            ingest_ns: collect(&self.ingest_ns, index_range(&self.wait_t, from, to))
+                .into_iter()
+                .filter(|&n| n != UNSET)
+                .collect(),
+            consumer_pts: collect(&self.consumer_pts, consumer.clone()),
+            consumer_deviation_ns: collect(
+                &self.consumer_dev_ns,
+                index_range(&self.consumer_dev_t, from, to),
+            ),
             fresh_times: collect(&self.fresh_times, fresh.clone()),
             added_latency_ns: collect(&self.added_latency_ns, fresh.clone()),
             added_at_pad_ns: collect(&self.added_at_pad_ns, fresh),
-            consumer_times: collect(
-                &self.consumer_times,
-                index_range(&self.consumer_times, from, to),
-            ),
+            consumer_times: collect(&self.consumer_times, consumer),
             consumer_latency_ns: collect(
                 &self.consumer_latency_ns,
                 index_range(&self.consumer_latency_t, from, to),
@@ -336,6 +437,8 @@ pub struct WindowCounts {
     /// Placeholders `appsrc` accepted while no source switch was open: the
     /// output had no frame to send outside a switch gap.
     pub placeholders_outside_switches: u64,
+    /// The highest `appsrc` queue level seen right after a push.
+    pub queue_level_max: u64,
 }
 
 /// Whole-run counters (warm-up included).
@@ -389,6 +492,17 @@ pub struct Samples {
     pub src_pts: Vec<u64>,
     /// Arrival at the output sink pad, every output frame.
     pub sink_times: Vec<u64>,
+    /// The output PTS of each `sink_times` entry (`u64::MAX`: none).
+    pub sink_pts: Vec<u64>,
+    /// Sink-pad arrival minus the frame's grid instant (clock start + PTS),
+    /// per frame: the emission's deviation from the grid as the sink sees
+    /// it.
+    pub sink_deviation_ns: Vec<i64>,
+    /// How long each fresh frame waited in the slot before its tick.
+    pub slot_wait_ns: Vec<u64>,
+    /// Camera src pad to slot, the same frames (where the src-pad record
+    /// was found): the ingest pipeline's own time.
+    pub ingest_ns: Vec<u64>,
     /// Sink-ready times of fresh frames (after the host map).
     pub fresh_times: Vec<u64>,
     /// Camera src pad -> sink-ready, fresh frames (primary).
@@ -397,6 +511,10 @@ pub struct Samples {
     /// map; secondary).
     pub added_at_pad_ns: Vec<u64>,
     pub consumer_times: Vec<u64>,
+    /// The stamp of each `consumer_times` entry (`u64::MAX`: none).
+    pub consumer_pts: Vec<u64>,
+    /// Consumer receipt minus the frame's grid instant, matched frames.
+    pub consumer_deviation_ns: Vec<i64>,
     pub consumer_latency_ns: Vec<u64>,
     pub totals: Totals,
     /// `Some(t)` when the retention dropped older samples: every series above
@@ -612,9 +730,8 @@ impl Recorder {
         }
     }
 
-    /// One output tick: `pts` is the output PTS, `origin` the emitted
-    /// frame's `(source id, camera PTS)` (`None` for a placeholder), `t`
-    /// when it was handed to `appsrc`.
+    /// One output tick without the timing details (tests).
+    #[cfg(test)]
     fn on_emit(
         &self,
         pts: u64,
@@ -623,6 +740,29 @@ impl Recorder {
         t: u64,
         pushed: bool,
     ) {
+        self.on_tick(TickRecord {
+            pts,
+            kind,
+            origin,
+            t,
+            pushed,
+            grid_t: None,
+            queue_level: 0,
+            arrived_t: None,
+        });
+    }
+
+    /// One output tick (see [`TickRecord`]).
+    fn on_tick(&self, k: TickRecord) {
+        let TickRecord {
+            pts,
+            kind,
+            origin,
+            t,
+            pushed,
+            grid_t,
+            ..
+        } = k;
         let mut g = self.lock();
         g.totals.emits += 1;
         if !pushed {
@@ -633,8 +773,11 @@ impl Recorder {
         if let Some(gap) = g.switch.on_emit(kind, origin.map(|o| o.0), t) {
             g.switches_done.push_back(gap);
         }
-        if kind == TickKind::Placeholder && !g.switch.is_open() && self.in_window(t) {
-            g.counts.placeholders_outside_switches += 1;
+        if self.in_window(t) {
+            if kind == TickKind::Placeholder && !g.switch.is_open() {
+                g.counts.placeholders_outside_switches += 1;
+            }
+            g.counts.queue_level_max = g.counts.queue_level_max.max(k.queue_level);
         }
         let src_t = match (kind, origin) {
             (TickKind::Fresh, Some((source, Some(cam_pts)))) => {
@@ -642,10 +785,22 @@ impl Recorder {
             }
             _ => None,
         };
+        if let (TickKind::Fresh, Some(arrived), true) = (kind, k.arrived_t, self.in_window(t)) {
+            g.wait_t.push_back(t);
+            g.slot_wait_ns.push_back(t.saturating_sub(arrived));
+            g.ingest_ns
+                .push_back(src_t.map_or(UNSET, |s| arrived.saturating_sub(s)));
+            self.retain(&mut g, t);
+        }
         if kind == TickKind::Fresh && src_t.is_none() {
             g.totals.fresh_without_src += 1;
         }
-        let rec = EmitRec { kind, src_t, t };
+        let rec = EmitRec {
+            kind,
+            src_t,
+            t,
+            grid_t,
+        };
         match g.sink_wait.remove(&pts) {
             Some(arrival) => {
                 self.join(&mut g, rec, arrival);
@@ -669,6 +824,7 @@ impl Recorder {
         g.totals.sink_buffers += 1;
         if self.in_window(t_pad) {
             g.sink_times.push_back(t_pad);
+            g.sink_pts.push_back(pts.unwrap_or(UNSET));
             g.counts.sink += 1;
             self.retain(&mut g, t_pad);
         }
@@ -692,8 +848,16 @@ impl Recorder {
         }
     }
 
-    /// An emission and its sink arrival: a latency sample for a fresh frame.
+    /// An emission and its sink arrival: the deviation from the grid, and a
+    /// latency sample for a fresh frame.
     fn join(&self, g: &mut Inner, rec: EmitRec, a: SinkArrival) {
+        if let Some(grid_t) = rec.grid_t
+            && self.in_window(a.t_pad)
+        {
+            g.sink_dev_t.push_back(a.t_pad);
+            g.sink_dev_ns.push_back(signed_diff(a.t_pad, grid_t));
+            self.retain(g, a.t_pad);
+        }
         let (TickKind::Fresh, Some(src_t)) = (rec.kind, rec.src_t) else {
             return;
         };
@@ -730,6 +894,7 @@ impl Recorder {
         let in_window = self.in_window(t);
         if in_window {
             g.consumer_times.push_back(t);
+            g.consumer_pts.push_back(stamp.unwrap_or(UNSET));
             g.counts.consumer += 1;
             self.retain(&mut g, t);
         }
@@ -739,6 +904,10 @@ impl Recorder {
         };
         match g.emits.remove(&pts) {
             Some(rec) => {
+                if let (Some(grid_t), true) = (rec.grid_t, in_window) {
+                    g.consumer_dev_t.push_back(t);
+                    g.consumer_dev_ns.push_back(signed_diff(t, grid_t));
+                }
                 if let (TickKind::Fresh, Some(src_t), true) = (rec.kind, rec.src_t, in_window) {
                     g.consumer_latency_ns.push_back(t.saturating_sub(src_t));
                     g.consumer_latency_t.push_back(t);
@@ -789,13 +958,16 @@ impl Recorder {
     pub fn observer(self: &Arc<Self>) -> EmitObserver {
         let rec = Arc::clone(self);
         Arc::new(move |e: &EmitInfo| {
-            rec.on_emit(
-                e.pts_ns,
-                e.kind,
-                e.origin.map(|o| (o.source_id, o.source_pts_ns)),
-                rec.ns_at(e.emitted_at),
-                e.pushed,
-            );
+            rec.on_tick(TickRecord {
+                pts: e.pts_ns,
+                kind: e.kind,
+                origin: e.origin.map(|o| (o.source_id, o.source_pts_ns)),
+                t: rec.ns_at(e.emitted_at),
+                pushed: e.pushed,
+                grid_t: Some(rec.ns_at(e.grid_at)),
+                queue_level: e.queue_level,
+                arrived_t: e.origin.map(|o| rec.ns_at(o.arrived_at)),
+            });
         })
     }
 
@@ -953,6 +1125,7 @@ mod tests {
                 consumer: 0,
                 // No switch open: the placeholder is counted.
                 placeholders_outside_switches: 1,
+                queue_level_max: 0,
             }
         );
         assert_eq!(s.totals.sink_buffers, 4);
@@ -963,6 +1136,43 @@ mod tests {
         let g = r.lock();
         assert!(g.emits.is_empty() && g.sink_wait.is_empty());
         assert_eq!(g.pending_src.len(), 1);
+    }
+
+    /// Output timing: the deviation of each frame from its grid instant at
+    /// the sink and at the consumer, the PTS of every frame, the slot wait
+    /// of fresh frames and the queue level, in the window only.
+    #[test]
+    fn output_timing_is_recorded_per_frame() {
+        let r = Recorder::new(true, true);
+        r.set_window(1_000, 10_000);
+        let tick = |pts: u64, kind, t, grid_t, level, arrived_t| TickRecord {
+            pts,
+            kind,
+            origin: (kind != Placeholder).then_some((SRC, Some(pts))),
+            t,
+            pushed: true,
+            grid_t: Some(grid_t),
+            queue_level: level,
+            arrived_t,
+        };
+        // Before the window: nothing recorded.
+        r.on_tick(tick(0, Fresh, 500, 520, 3, Some(490)));
+        r.on_sink(505, 506, Some(0));
+        // Emitted 20 before the grid instant, at the sink 15 before it.
+        r.on_tick(tick(1, Fresh, 1_100, 1_120, 1, Some(1_090)));
+        r.on_sink(1_105, 1_106, Some(1));
+        r.on_consumer(1_130, Some(1));
+        // The sink sees the next frame before its emission is reported.
+        r.on_sink(1_140, 1_141, Some(2));
+        r.on_tick(tick(2, Repeat, 1_135, 1_153, 2, None));
+        r.on_sink(1_150, 1_151, None);
+        let s = r.samples();
+        assert_eq!(s.sink_pts, vec![1, 2, u64::MAX]);
+        assert_eq!(s.sink_deviation_ns, vec![-15, -13]);
+        assert_eq!(s.consumer_pts, vec![1]);
+        assert_eq!(s.consumer_deviation_ns, vec![10]);
+        assert_eq!(s.slot_wait_ns, vec![10], "fresh frames only");
+        assert_eq!(s.counts.queue_level_max, 2, "in the window");
     }
 
     /// The sink probe may run before the observer reports the emission.
@@ -1085,6 +1295,7 @@ mod tests {
                 fresh_with_latency: 1_000,
                 consumer: 1_000,
                 placeholders_outside_switches: 0,
+                queue_level_max: 0,
             }
         );
         assert_eq!(s.totals.src_buffers, 1_000);
@@ -1157,9 +1368,15 @@ mod tests {
                 repeats: 2,
                 placeholders: 3,
                 previous_fresh: 1,
+                held_from_ns: Some(1_010),
             }
         );
         assert_eq!(gap.gap_ns(), 70);
+        assert_eq!(
+            gap.held_ns(),
+            Some(60),
+            "the old source's last frame to the new one's first"
+        );
         assert!(!s.is_open());
         assert_eq!(s.on_emit(Fresh, Some(2), 1_080), None);
     }
