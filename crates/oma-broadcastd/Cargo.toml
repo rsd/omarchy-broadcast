@@ -7,5 +7,27 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+obc-core = { workspace = true }
+obc-pipeline = { workspace = true }
+obc-ipc = { workspace = true }
+zbus = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+gst = { workspace = true }
+gst-app = { workspace = true }
+gst-video = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+libc = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+# Peer-to-peer D-Bus connections for interface tests without a session bus.
+zbus = { workspace = true, features = ["p2p"] }
+tempfile = { workspace = true }
+
 [lints]
 workspace = true

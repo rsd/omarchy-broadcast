@@ -1,0 +1,8 @@
+# D-Bus activation of oma-broadcastd: a call addressed to
+# br.com.dias.OmaBroadcast starts the systemd user service (never the binary
+# directly). Install to ~/.local/share/dbus-1/services/ (see
+# dist/systemd/oma-broadcastd.service).
+[D-BUS Service]
+Name=br.com.dias.OmaBroadcast
+Exec=/bin/false
+SystemdService=oma-broadcastd.service

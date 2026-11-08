@@ -47,8 +47,14 @@
 //! `exposure_dynamic_framerate` control off while it runs (a camera with it
 //! on may lower its frame rate in dim light) and restores it when stopped or
 //! dropped.
+//!
+//! **Failure.** An ingest that fails while streaming (the camera unplugged,
+//! a streaming error, an end of stream) only stops feeding the slot: the
+//! output carries on. [`Ingest::poll_failure`] tells the owner, without
+//! blocking, so it can switch to another source.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use gst::prelude::*;
 use obc_core::{AspectPolicy, VideoMode};
@@ -228,6 +234,8 @@ pub struct Ingest {
     crop: Crop,
     controls: ControlReport,
     memory: FrameMemory,
+    /// The first failure [`Self::poll_failure`] found (sticky).
+    failure: Mutex<Option<String>>,
 }
 
 impl Ingest {
@@ -282,6 +290,7 @@ impl Ingest {
             crop,
             controls: ControlReport::default(),
             memory,
+            failure: Mutex::new(None),
         })
     }
 
@@ -380,6 +389,38 @@ impl Ingest {
 
     pub fn pipeline(&self) -> &MediaPipeline {
         &self.pipeline
+    }
+
+    /// Why this ingest has failed, if it has: an ERROR or an end of stream
+    /// on its pipeline's bus, or (for a camera) its device node no longer
+    /// existing. Non-blocking, and sticky: once found, the same failure is
+    /// returned by every later call. It reads the pipeline's bus and
+    /// discards the other messages there, so it is not combined with
+    /// another reader of the same bus (the hardware tests' bus logs). An
+    /// ingest that has not started reports only a vanished camera node.
+    pub fn poll_failure(&self) -> Option<String> {
+        let mut failure = self.failure.lock().unwrap_or_else(|e| e.into_inner());
+        if failure.is_none() {
+            *failure = self.find_failure();
+        }
+        failure.clone()
+    }
+
+    fn find_failure(&self) -> Option<String> {
+        let bus = self.pipeline.bus();
+        if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos]) {
+            let from = msg.src().map(|s| s.name().to_string()).unwrap_or_default();
+            return Some(match msg.view() {
+                gst::MessageView::Error(e) => format!(
+                    "{from}: {}{}",
+                    e.error(),
+                    e.debug().map(|d| format!(" ({d})")).unwrap_or_default()
+                ),
+                _ => format!("{from}: end of stream"),
+            });
+        }
+        let camera = self.camera.as_ref()?;
+        (!camera.exists()).then(|| format!("camera {} disappeared", camera.display()))
     }
 
     /// The id of the source in the frames it writes ([`crate::frame::Frame::source_id`]).
@@ -594,6 +635,40 @@ mod tests {
                  pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)2:4:5:1"
             );
         }
+    }
+
+    /// A camera ingest whose device node disappears reports it
+    /// ([`Ingest::poll_failure`]), sticky; a test source (no camera) never
+    /// does on that ground. The node is a plain file here, never opened:
+    /// the ingest is built, not started. CPU only.
+    #[test]
+    fn a_vanished_camera_node_is_reported() {
+        require_elements(&["v4l2src", "videocrop", "videoconvertscale", "appsink"]);
+        let dir = std::env::temp_dir().join(format!("obc-vanish-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = dir.join("video99");
+        std::fs::write(&node, b"").unwrap();
+        let contract = OutputContract::default();
+        let cfg = IngestConfig::new(node.clone(), "NV12:640x480@30".parse().unwrap());
+        let ingest = Ingest::build(&cfg, writer(&contract).in_memory(FrameMemory::System)).unwrap();
+        assert_eq!(ingest.poll_failure(), None, "the node is there");
+        std::fs::remove_file(&node).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        let failure = ingest
+            .poll_failure()
+            .expect("the vanished node is reported");
+        assert_eq!(failure, format!("camera {} disappeared", node.display()));
+        assert_eq!(ingest.poll_failure(), Some(failure));
+
+        let pattern = Ingest::from_head(
+            vec![make("videotestsrc", "src").unwrap()],
+            "NV12",
+            (640, 480),
+            AspectPolicy::Crop,
+            writer(&contract).in_memory(FrameMemory::System),
+        )
+        .unwrap();
+        assert_eq!(pattern.poll_failure(), None);
     }
 
     #[test]

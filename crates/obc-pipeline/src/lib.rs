@@ -17,7 +17,11 @@
 //!   converts to the contract format, downloads and writes to the loopback.
 //!
 //! [`session::Session`] owns an output and its current ingest and switches
-//! sources without touching the output. The measurement modules
+//! sources without touching the output. In the daemon, the output forwards
+//! its frames to the persistent [`loopback::LoopbackWriter`], which owns the
+//! loopback device for the daemon's whole life and sends black placeholders
+//! while no output runs; [`live::LiveStats`] measures a running stream for
+//! the daemon's statistics. The measurement modules
 //! (`instrument`, `stats`, `gpu`, `stamp`) serve `obc-bench`.
 
 pub mod capability;
@@ -30,6 +34,8 @@ pub mod geometry;
 pub mod gpu;
 pub mod ingest;
 pub mod instrument;
+pub mod live;
+pub mod loopback;
 pub mod output;
 pub mod pipeline;
 pub mod process;
@@ -49,6 +55,10 @@ pub use discovery::{DiscoveryRoute, list_cameras, scan_sysfs};
 pub use frame::{Canonical, Frame, FrameWriter};
 pub use geometry::{Crop, crop_for};
 pub use ingest::{ControlReport, Ingest, IngestConfig};
+pub use live::{LiveStats, LiveWindow};
+pub use loopback::{
+    LoopbackWriter, WriterConfig, WriterCounts, WriterHandle, WriterSink, writer_caps_string,
+};
 pub use output::{
     EmitInfo, EmitObserver, FrameOrigin, Output, OutputConfig, OutputCounts, OutputSink,
 };

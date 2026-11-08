@@ -77,6 +77,13 @@ impl Session {
         self.ingest.as_ref()
     }
 
+    /// Why the current ingest has failed, if it has
+    /// ([`Ingest::poll_failure`]); `None` without an ingest. Non-blocking:
+    /// the owner polls it and switches to another source.
+    pub fn ingest_failure(&self) -> Option<String> {
+        self.ingest.as_ref().and_then(Ingest::poll_failure)
+    }
+
     /// Builds (but does not start) an ingest for `cfg` writing into this
     /// session's output, so the caller can inspect or probe it before
     /// [`Self::switch_to`].
@@ -745,6 +752,94 @@ mod tests {
             "placeholder {:?} after the request",
             rest[0].emitted_at - failed.requested
         );
+    }
+
+    /// A test source whose `head` is `videotestsrc` (live, `props`) and
+    /// then the capsfilters `caps`, in order, named `test_caps<i>`.
+    fn source_with(session: &Session, props: &[(&str, i32)], caps: &[&str]) -> Ingest {
+        let src = gst::ElementFactory::make("videotestsrc")
+            .property("is-live", true)
+            .build()
+            .unwrap();
+        for (name, value) in props {
+            src.set_property_from_str(name, &value.to_string());
+        }
+        let mut head = vec![src];
+        for (i, c) in caps.iter().enumerate() {
+            head.push(
+                gst::ElementFactory::make("capsfilter")
+                    .name(format!("test_caps{i}"))
+                    .property("caps", c.parse::<gst::Caps>().unwrap())
+                    .build()
+                    .unwrap(),
+            );
+        }
+        Ingest::from_head(
+            head,
+            "NV12",
+            (160, 120),
+            AspectPolicy::Crop,
+            session.output().frame_writer(),
+        )
+        .expect("test source")
+    }
+
+    /// (g) An ingest that fails while streaming is reported by
+    /// [`Session::ingest_failure`], without blocking and on every later
+    /// call: a streaming error (two capsfilters linked with the same caps,
+    /// then the second one changed to another format, so the source fails
+    /// to negotiate once it runs) and an end of stream (a
+    /// source that stops after three frames). A healthy source that has
+    /// streamed for a while is not reported, and neither is a session
+    /// without a source. The output keeps running throughout.
+    #[test]
+    fn a_failing_ingest_is_reported_and_a_healthy_one_is_not() {
+        let (mut session, _) = cpu_session(OutputConfig::DEFAULT_HOLD_TIMEOUT);
+        assert_eq!(session.ingest_failure(), None, "no source");
+        let healthy = pattern(&session, None);
+        stream(&mut session, healthy);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(session.ingest_failure(), None, "a healthy source");
+
+        let nv12 = "video/x-raw,format=NV12,width=160,height=120,framerate=30/1";
+        let i420 = "video/x-raw,format=I420,width=160,height=120,framerate=30/1";
+        let mismatched = source_with(&session, &[], &[nv12, nv12]);
+        mismatched
+            .pipeline()
+            .element("test_caps1")
+            .unwrap()
+            .set_property("caps", i420.parse::<gst::Caps>().unwrap());
+        let cases = [
+            ("a streaming error", mismatched),
+            (
+                "an end of stream",
+                source_with(&session, &[("num-buffers", 3)], &[nv12]),
+            ),
+        ];
+        for (what, ingest) in cases {
+            session.switch_to(ingest).expect(what);
+            let t0 = Instant::now();
+            let failure = loop {
+                if let Some(f) = session.ingest_failure() {
+                    break f;
+                }
+                assert!(
+                    t0.elapsed() < Duration::from_secs(10),
+                    "{what} was not reported"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            eprintln!("{what}: {failure}");
+            match what {
+                "an end of stream" => assert!(failure.ends_with("end of stream"), "{failure}"),
+                _ => assert!(failure.contains("not-negotiated"), "{failure}"),
+            }
+            assert_eq!(session.ingest_failure().as_deref(), Some(failure.as_str()));
+            assert!(session.output().is_running());
+        }
+        session.stop_ingest().unwrap();
+        assert_eq!(session.ingest_failure(), None);
+        session.stop().expect("teardown");
     }
 
     /// (f) A system-memory output with an I420 contract converts the

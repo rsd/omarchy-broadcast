@@ -6,7 +6,7 @@ Any UVC webcam works: the pipeline picks a capture mode from what the camera adv
 
 ## Status
 
-Early development. The camera -> CUDA -> virtual camera passthrough works, with sustained 1080p60 on the reference machine. Effects are not implemented yet. Measurements are in [docs/benchmarks/](docs/benchmarks/passthrough.md).
+Early development. The camera -> CUDA -> virtual camera passthrough works, with sustained 1080p60 on the reference machine. The `oma-broadcastd` daemon (a systemd user service controlled over D-Bus) and the `oma-broadcast` command-line client run it on demand: the camera and GPU start when an application opens the virtual camera ([docs/setup/daemon.md](docs/setup/daemon.md)). Effects are not implemented yet. Measurements are in [docs/benchmarks/](docs/benchmarks/passthrough.md).
 
 ## Requirements
 

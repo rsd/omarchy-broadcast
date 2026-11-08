@@ -7,5 +7,17 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+zbus = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+# The mock-server test runs the interface over a peer-to-peer connection on a
+# socket pair, so it needs no session bus.
+zbus = { workspace = true, features = ["p2p"] }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

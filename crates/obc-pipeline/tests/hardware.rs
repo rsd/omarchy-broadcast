@@ -2239,3 +2239,531 @@ fn gpu_a_slow_sink_never_queues_more_than_the_bound() {
     let limit = SERVICE * u32::try_from(bound).unwrap() + Duration::from_millis(60);
     assert!(oldest <= limit, "{oldest:?} (limit {limit:?})");
 }
+
+/// One line of the consumer process (`obc-consumer`, see its docs).
+#[derive(Debug, Clone, PartialEq)]
+enum ConsumerLine {
+    Caps(String),
+    /// Luma mean, min and max (`None` for a format without a luma plane),
+    /// and the frame's stamp ([`obc_pipeline::stamp`]), if it has one.
+    Frame(Option<(f64, u8, u8)>, Option<u64>),
+    Error(String),
+    Eos,
+    Other(String),
+}
+
+impl ConsumerLine {
+    fn parse(line: &str) -> Self {
+        let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
+        match word {
+            "caps" => ConsumerLine::Caps(rest.to_string()),
+            "frame" => {
+                let f: Vec<&str> = rest.split(' ').collect();
+                let (luma, stamp) = match f.as_slice() {
+                    [_, mean, min, max, stamp] => (
+                        (|| Some((mean.parse().ok()?, min.parse().ok()?, max.parse().ok()?)))(),
+                        stamp.parse().ok(),
+                    ),
+                    _ => (None, None),
+                };
+                ConsumerLine::Frame(luma, stamp)
+            }
+            "error" => ConsumerLine::Error(rest.to_string()),
+            "eos" => ConsumerLine::Eos,
+            _ => ConsumerLine::Other(line.to_string()),
+        }
+    }
+}
+
+/// A frame the consumer received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Seen {
+    at: Instant,
+    /// Every sampled luma value is 16: black (limited range).
+    black: bool,
+    /// It carries a stamp: the test marked it on its way out of the output
+    /// (a forwarded frame, not a writer placeholder).
+    stamped: bool,
+}
+
+/// A loopback consumer in a separate process: the `obc-consumer` binary of
+/// this crate, `v4l2src device=<loopback> ! appsink`, reporting every caps
+/// negotiation and every frame on stdout, each line stamped here on
+/// arrival. Killed and reaped when dropped, also when the test fails.
+struct ConsumerProcess {
+    child: std::process::Child,
+    lines: Arc<Mutex<Vec<(Instant, ConsumerLine)>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ConsumerProcess {
+    fn spawn(device: &std::path::Path) -> Self {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(env!("CARGO_BIN_EXE_obc-consumer"))
+            .arg(device)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn the obc-consumer process");
+        let stdout = child.stdout.take().unwrap();
+        let lines: Arc<Mutex<Vec<(Instant, ConsumerLine)>>> = Arc::default();
+        let l = Arc::clone(&lines);
+        let reader = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                l.lock()
+                    .unwrap()
+                    .push((Instant::now(), ConsumerLine::parse(&line)));
+            }
+        });
+        ConsumerProcess {
+            child,
+            lines,
+            reader: Some(reader),
+        }
+    }
+
+    /// A consumer that has negotiated caps and received a frame: respawned
+    /// (with `exclusive_caps` the capture side can lag the writer's start)
+    /// until then, for at most `limit`.
+    fn start(device: &std::path::Path, limit: Duration) -> Self {
+        let deadline = Instant::now() + limit;
+        loop {
+            let mut c = Self::spawn(device);
+            let ok = loop {
+                let lines = c.lines();
+                if lines.iter().any(|l| matches!(l.1, ConsumerLine::Frame(..))) {
+                    break true;
+                }
+                let failed = lines.iter().any(|l| matches!(l.1, ConsumerLine::Error(_)))
+                    || c.child.try_wait().ok().flatten().is_some();
+                if failed || Instant::now() > deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            if ok {
+                return c;
+            }
+            let lines = c.lines();
+            drop(c);
+            eprintln!("consumer attempt failed, retrying: {lines:?}");
+            assert!(
+                Instant::now() < deadline,
+                "the consumer process never received a frame from {}: {lines:?}",
+                device.display()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    fn lines(&self) -> Vec<(Instant, ConsumerLine)> {
+        self.lines.lock().unwrap().clone()
+    }
+
+    /// Every frame received.
+    fn frames(&self) -> Vec<Seen> {
+        self.lines()
+            .into_iter()
+            .filter_map(|(at, l)| match l {
+                ConsumerLine::Frame(luma, stamp) => Some(Seen {
+                    at,
+                    black: matches!(luma, Some((_, 16, 16))),
+                    stamped: stamp.is_some(),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn caps(&self) -> Vec<String> {
+        self.lines()
+            .into_iter()
+            .filter_map(|(_, l)| match l {
+                ConsumerLine::Caps(c) => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Lines other than caps and frames (errors, end of stream, other).
+    fn problems(&self) -> Vec<ConsumerLine> {
+        self.lines()
+            .into_iter()
+            .map(|(_, l)| l)
+            .filter(|l| !matches!(l, ConsumerLine::Caps(_) | ConsumerLine::Frame(..)))
+            .collect()
+    }
+
+    /// Waits until `done` holds of the frames received, for at most
+    /// `limit`; returns whether it did.
+    fn wait_frames(&self, limit: Duration, mut done: impl FnMut(&[Seen]) -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            if done(&self.frames()) {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for ConsumerProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(r) = self.reader.take() {
+            let _ = r.join();
+        }
+    }
+}
+
+/// The runs of unstamped (`false`) and stamped (`true`) frames, in order:
+/// `[(false, _), (true, _), (false, _)]` for writer placeholders, then
+/// forwarded frames, then placeholders.
+fn runs(frames: &[Seen]) -> Vec<(bool, usize)> {
+    let mut out: Vec<(bool, usize)> = Vec::new();
+    for s in frames {
+        match out.last_mut() {
+            Some((last, n)) if *last == s.stamped => *n += 1,
+            _ => out.push((s.stamped, 1)),
+        }
+    }
+    out
+}
+
+/// Stamps every buffer reaching `element`'s sink pad in `p` with its PTS
+/// ([`obc_pipeline::stamp`], the first 16 luma bytes), so a consumer can
+/// tell it from a writer placeholder whatever the picture.
+fn stamp_buffers(p: &MediaPipeline, element: &str) {
+    p.element(element)
+        .and_then(|e| e.static_pad("sink"))
+        .expect("sink pad")
+        .add_probe(gst::PadProbeType::BUFFER, |_, info| {
+            if let Some(buffer) = info.buffer_mut() {
+                let pts = buffer.pts().map_or(0, |p| p.nseconds());
+                if let Ok(mut map) = buffer.make_mut().map_writable() {
+                    obc_pipeline::stamp::write_stamp(map.as_mut_slice(), pts);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+}
+
+/// Whether the `nvcodec` GStreamer plugin (the CUDA elements) is loaded in
+/// this process.
+fn nvcodec_loaded() -> bool {
+    gst::Registry::get()
+        .find_plugin("nvcodec")
+        .is_some_and(|p| p.is_loaded())
+}
+
+/// The pids `nvidia-smi` lists with a compute context.
+fn cuda_pids() -> Vec<u32> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-compute-apps=pid", "--format=csv,noheader"])
+        .output()
+        .expect("this test needs nvidia-smi (it comes with the NVIDIA driver)");
+    assert!(out.status.success(), "nvidia-smi failed: {out:?}");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect()
+}
+
+/// Whether this process holds `node` open.
+fn holds_open(node: &std::path::Path) -> bool {
+    let node = std::fs::canonicalize(node).unwrap_or_else(|_| node.to_path_buf());
+    std::fs::read_dir("/proc/self/fd")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|t| t == node))
+}
+
+/// `OBC_TEST_SINK` is required (never the labelled default): these tests
+/// write to the device for a while with no camera to show.
+fn explicit_test_sink() -> DeviceInfo {
+    assert!(
+        std::env::var_os("OBC_TEST_SINK").is_some(),
+        "this test needs OBC_TEST_SINK=/dev/videoN, a free v4l2loopback device created with \
+         exclusive_caps=1 (it never writes to a device found by its label alone)"
+    );
+    test_sink()
+}
+
+/// The loopback writer alone (the daemon idle): while it streams
+/// placeholders, the loopback, which is not a capture device before (with
+/// `exclusive_caps=1`, without a writer), is one, a consumer in another
+/// process negotiates once and receives only black frames of the contract,
+/// and the writer counts placeholders only. After it stops (and the
+/// consumer has closed), the device is no capture device again. CPU only:
+/// no camera, no GPU. If no earlier test in this process loaded the CUDA
+/// plugin, the writer must not have loaded it either.
+#[test]
+#[ignore = "needs OBC_TEST_SINK (a free v4l2loopback device with exclusive_caps=1)"]
+fn the_writer_alone_is_a_capture_device_with_black_frames() {
+    use obc_pipeline::device::CAP_VIDEO_CAPTURE;
+    use obc_pipeline::discovery::query_cap;
+    use obc_pipeline::{LoopbackWriter, WriterSink};
+    init();
+    require_elements(&["appsrc", "v4l2sink", "v4l2src", "appsink"]);
+    let sink = explicit_test_sink();
+    let capture = || {
+        query_cap(&sink.path)
+            .unwrap_or_else(|| panic!("VIDIOC_QUERYCAP failed on {}", sink.path.display()))
+            .caps
+            & CAP_VIDEO_CAPTURE
+            != 0
+    };
+    assert!(
+        !capture(),
+        "{} is already a capture device before the writer streams: it needs exclusive_caps=1 \
+         and no other writer (check `fuser -v {}`)",
+        sink.path.display(),
+        sink.path.display()
+    );
+    let nvcodec_before = nvcodec_loaded();
+    let contract = OutputContract::default();
+    let mut writer = LoopbackWriter::build(contract, WriterSink::Loopback(sink.path.clone()))
+        .expect("build the writer");
+    let sink_caps_events = count_caps_events(writer.pipeline(), names::LOOPBACK);
+    writer.start().expect("start the writer");
+    // The device turns capture once the first frame reaches v4l2sink.
+    let started = Instant::now();
+    let visible_after = loop {
+        if capture() {
+            break Some(started.elapsed());
+        }
+        if started.elapsed() > Duration::from_secs(5) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let consumer = ConsumerProcess::start(&sink.path, Duration::from_secs(10));
+    assert!(
+        consumer.wait_frames(Duration::from_secs(10), |f| f.len() >= 60),
+        "the consumer received {} frames",
+        consumer.frames().len()
+    );
+    writer.health().expect("writer health");
+    let counts = writer.counts();
+    let (frames, caps, problems) = (consumer.frames(), consumer.caps(), consumer.problems());
+    drop(consumer);
+    writer.stop().expect("stop the writer");
+    let hidden = !capture();
+    eprintln!(
+        "writer alone: a capture device {visible_after:?} after the start; {} frames at the \
+         consumer, caps {caps:?}; {counts:?}",
+        frames.len()
+    );
+    assert!(
+        visible_after.is_some(),
+        "not a capture device within 5 s of the writer's start"
+    );
+    assert!(problems.is_empty(), "consumer: {problems:?}");
+    assert_eq!(caps.len(), 1, "consumer caps negotiations: {caps:?}");
+    for want in ["NV12", "1920", "1080", "30/1"] {
+        assert!(caps[0].contains(want), "{caps:?}");
+    }
+    assert_eq!(sink_caps_events.load(Ordering::Relaxed), 1);
+    assert!(
+        frames.iter().all(|f| f.black && !f.stamped),
+        "not every frame was an unstamped black frame: {:?}",
+        frames.iter().find(|f| !f.black || f.stamped)
+    );
+    assert!(counts.placeholder >= 60, "{counts:?}");
+    assert_eq!((counts.forwarded, counts.push_failed), (0, 0), "{counts:?}");
+    assert!(hidden, "still a capture device after the writer stopped");
+    if nvcodec_before {
+        eprintln!(
+            "the CUDA plugin was loaded by an earlier test: its check is not meaningful here"
+        );
+    } else {
+        assert!(!nvcodec_loaded(), "the writer loaded the CUDA plugin");
+    }
+}
+
+/// The core invariant of the daemon (ADR-0011): a consumer in another
+/// process that holds the loopback across Idle -> Active -> Idle sees one
+/// format and an uninterrupted stream: black placeholders from the writer,
+/// then the frames a CUDA session's output forwards from the camera, then
+/// black placeholders again once the session has stopped (its camera
+/// closed, its CUDA context released: this process is no longer listed by
+/// `nvidia-smi`, as it is while the session runs).
+///
+/// The output's frames are stamped on their way into its forwarding
+/// `appsink` ([`obc_pipeline::stamp`], 16 luma bytes), so the consumer
+/// tells them from the writer's placeholders whatever the camera shows (a
+/// camera with its privacy shutter closed, or in the dark, delivers black
+/// too). Asserted: the consumer and the writer's sink each negotiate caps
+/// exactly once; the consumer's frames are one run of placeholders (all
+/// black), one of forwarded frames, one of placeholders (all black);
+/// neither the sink nor the consumer goes longer than three output periods
+/// plus 30 ms without a frame from the consumer's first frame to the end;
+/// while the session runs, the writer pushes no placeholder; the output
+/// emitted fresh camera frames. Whether the forwarded frames show a
+/// picture (not black) is printed, not asserted: a camera with its shutter
+/// closed or in the dark delivers black. No camera control is changed.
+#[test]
+#[ignore = "needs OBC_TEST_CAMERA, OBC_TEST_SINK (a free v4l2loopback device) and an NVIDIA GPU"]
+fn a_consumer_keeps_one_stream_across_idle_active_idle() {
+    use obc_pipeline::{LoopbackWriter, WriterSink};
+    init();
+    let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
+    require_elements(&[
+        "appsrc",
+        "v4l2sink",
+        "v4l2src",
+        "appsink",
+        "cudaupload",
+        "cudaconvertscale",
+        "videocrop",
+        "cudadownload",
+        "capssetter",
+    ]);
+    let sink = explicit_test_sink();
+    let (camera, choice) = select_with(&test_camera(), &test_mode(), DiscoveryRoute::Auto);
+    let contract = OutputContract::default();
+    let period = Duration::from_nanos(contract.frame_duration_ns());
+    let pid = std::process::id();
+
+    let mut writer = LoopbackWriter::build(contract, WriterSink::Loopback(sink.path.clone()))
+        .expect("build the writer");
+    let sink_caps_events = count_caps_events(writer.pipeline(), names::LOOPBACK);
+    let sink_arrivals = record_arrival_times(writer.pipeline(), names::LOOPBACK);
+    writer.start().expect("start the writer");
+    let consumer = ConsumerProcess::start(&sink.path, Duration::from_secs(10));
+    assert!(
+        consumer.wait_frames(Duration::from_secs(10), |f| f.len() >= 30),
+        "idle: the consumer received {} frames",
+        consumer.frames().len()
+    );
+    assert!(
+        !cuda_pids().contains(&pid),
+        "a CUDA context before the session"
+    );
+
+    // Active: a CUDA session whose output forwards to the writer.
+    let output = Output::build(OutputConfig::new(
+        contract,
+        OutputSink::Writer(writer.handle()),
+    ))
+    .expect("build the output");
+    stamp_buffers(output.pipeline(), names::LOOPBACK);
+    let mut session = Session::new(output).expect("start the output");
+    // The default: no camera control is changed.
+    let cfg = IngestConfig::new(camera.path.clone(), choice.mode);
+    session.switch_to_camera(&cfg).expect("start the camera");
+    let source = session.ingest().unwrap().source_id();
+    let forwarded = |f: &[Seen]| f.iter().filter(|x| x.stamped).count();
+    let streaming = consumer.wait_frames(Duration::from_secs(20), |f| {
+        forwarded(f) >= 60 && session.output().first_fresh(source).is_some()
+    });
+    assert!(
+        streaming,
+        "active: the consumer received {} forwarded frames (last lines {:?}); writer {:?}, \
+         output {:?}, ingest failure {:?}",
+        forwarded(&consumer.frames()),
+        consumer.lines().iter().rev().take(3).collect::<Vec<_>>(),
+        writer.counts(),
+        session.output().counts(),
+        session.ingest_failure()
+    );
+    let active = writer.counts();
+    let fresh0 = session.output().counts().fresh;
+    std::thread::sleep(Duration::from_secs(1));
+    let active_after = writer.counts();
+    let fresh1 = session.output().counts().fresh;
+    let cuda_while_active = cuda_pids().contains(&pid);
+    let failure = session.ingest_failure();
+    let stopped_at = Instant::now();
+    session.stop().expect("stop the session");
+    let camera_closed = !holds_open(&camera.path);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let cuda_released = loop {
+        if !cuda_pids().contains(&pid) {
+            break true;
+        }
+        if Instant::now() > deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let black_again = consumer.wait_frames(Duration::from_secs(10), |f| {
+        f.iter().filter(|x| x.at > stopped_at && !x.stamped).count() >= 30
+    });
+    let end = Instant::now();
+    writer.health().expect("writer health");
+    let counts = writer.counts();
+    let (frames, caps, problems) = (consumer.frames(), consumer.caps(), consumer.problems());
+    drop(consumer);
+    writer.stop().expect("stop the writer");
+
+    let limit = 3 * period + Duration::from_millis(30);
+    let from = frames.first().map(|f| f.at).expect("frames");
+    let arrivals: Vec<Instant> = frames.iter().map(|f| f.at).collect();
+    let consumer_silence = longest_silence(&arrivals, from, end);
+    let sink_silence = longest_silence(&sink_arrivals.lock().unwrap(), from, end);
+    let pictures = frames.iter().filter(|f| f.stamped && !f.black).count();
+    eprintln!(
+        "idle -> active -> idle: consumer runs (stamped, count) {:?}, {pictures} forwarded \
+         frames with a picture, caps {caps:?}; longest interval without a frame: consumer \
+         {consumer_silence:?}, writer sink {sink_silence:?} (limit {limit:?}); writer {counts:?}",
+        runs(&frames)
+    );
+    if pictures == 0 {
+        eprintln!(
+            "the camera delivered only black frames (privacy shutter closed, or a dark room): \
+             the forwarded frames were told from the placeholders by their stamp alone"
+        );
+    }
+    assert!(problems.is_empty(), "consumer: {problems:?}");
+    assert_eq!(failure, None, "the camera failed while active");
+    assert!(black_again, "no placeholders after the session stopped");
+    assert!(
+        cuda_while_active,
+        "no CUDA context listed while active (control)"
+    );
+    assert!(
+        camera_closed,
+        "the camera is still open after the session stopped"
+    );
+    assert!(cuda_released, "the CUDA context outlived the session");
+    assert_eq!(caps.len(), 1, "consumer caps negotiations: {caps:?}");
+    assert_eq!(
+        sink_caps_events.load(Ordering::Relaxed),
+        1,
+        "the writer's sink negotiated more than once"
+    );
+    let r = runs(&frames);
+    assert_eq!(
+        r.iter().map(|x| x.0).collect::<Vec<_>>(),
+        vec![false, true, false],
+        "placeholders, forwarded, placeholders: {r:?}"
+    );
+    assert!(
+        frames.iter().filter(|f| !f.stamped).all(|f| f.black),
+        "a placeholder that is not black"
+    );
+    assert!(fresh1 > fresh0, "no fresh camera frame while active");
+    assert_eq!(
+        active_after.placeholder, active.placeholder,
+        "placeholders while the session forwarded"
+    );
+    assert!(
+        active_after.forwarded >= active.forwarded + 25,
+        "{active_after:?}"
+    );
+    assert_eq!(counts.push_failed, 0, "{counts:?}");
+    assert!(
+        consumer_silence <= limit,
+        "consumer silent {consumer_silence:?}"
+    );
+    assert!(sink_silence <= limit, "writer sink silent {sink_silence:?}");
+}

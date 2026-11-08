@@ -1,0 +1,101 @@
+# oma-broadcast configuration
+#
+# Location: $XDG_CONFIG_HOME/oma-broadcast/config.toml
+#           (default ~/.config/oma-broadcast/config.toml)
+#
+# Every key is optional; a missing key takes the default shown here, and a
+# missing file means all defaults. Unknown keys are errors, so a typo is
+# reported instead of silently ignored.
+#
+# The daemon never writes this file. Runtime changes (on/off, the selected
+# camera) are kept in $XDG_STATE_HOME/oma-broadcast/state.toml instead.
+#
+# Reload after editing by sending SIGHUP to the daemon
+# (`systemctl --user kill -s HUP oma-broadcastd`) or with the ReloadConfig()
+# D-Bus method (docs/dbus-api.md). An invalid file
+# is rejected as a whole: the previous configuration stays in force and the
+# reason (file, line, key) is reported in the daemon's Error property.
+#
+# As shipped, this file sets every key to its default: keys whose example
+# value differs from the default are commented out. Remove the leading "# "
+# of a key to use it.
+
+# Schema version. Only 1 is accepted.
+version = 1
+
+[camera]
+# Cameras to use, most preferred first. Each entry is one of:
+#   - a case-insensitive substring of the V4L2 card name, e.g. "Brio";
+#   - a USB vendor:product id, four hex digits each side, e.g. "046d:0944";
+#   - a device path, e.g. "/dev/video4" or a /dev/v4l/by-id/... link.
+# Cameras not listed follow in discovery order. A camera selected at run
+# time (SelectCamera, `oma-broadcast camera ...`) takes precedence while it
+# is present.
+# Default: [] (discovery order only). Example, one entry of each form:
+# preference = ["Brio", "046d:0944", "/dev/v4l/by-id/usb-046d_MX_Brio-video-index0"]
+
+# Mode requested from the camera: "WxH@FPS" (any pixel format) or
+# "FORMAT:WxH@FPS" (FORMAT one of NV12, NV21, I420, YV12, YUY2/YUYV, UYVY,
+# RGB, BGR, MJPEG). FPS may be a fraction, e.g. 30000/1001. The closest mode
+# the camera offers is used when this exact one is not available.
+# Default: "1920x1080@60"
+mode = "1920x1080@60"
+
+# Pin the camera's exposure so it cannot lower the frame rate in low light
+# (disables V4L2 exposure_dynamic_framerate while streaming).
+# Default: false
+fixed_framerate = false
+
+[output]
+# Size and frame rate of the virtual camera: "WxH@FPS". Width and height
+# must be even and at most 8192; the rate is at most 240 fps and may be a
+# fraction. This never follows the camera: frames are scaled and paced to
+# it. Changing it while an application holds the virtual camera takes
+# effect once the last application closes it.
+# Default: "1920x1080@30"
+mode = "1920x1080@30"
+
+# Pixel format of the virtual camera: "nv12" or "i420". The colour range is
+# always limited (16-235).
+# Default: "nv12"
+format = "nv12"
+
+# How a camera whose aspect ratio differs from the output is fitted:
+#   "crop"      centre crop to fill the frame (no borders);
+#   "letterbox" scale the whole picture in and pad with black borders.
+# Default: "crop"
+aspect = "crop"
+
+# Seconds a camera switch holds the last frame while waiting for the next
+# camera's first frame; black frames follow if it has not arrived.
+# Greater than 0, at most 60.
+# Default: 3.0
+hold_timeout_s = 3.0
+
+# Milliseconds without a camera frame after which black frames replace
+# repeats of the last one. 1 to 60000.
+# Default: 500
+input_gap_ms = 500
+
+[loopback]
+# Card label of the v4l2loopback device to write to (exact match), as set
+# with `card_label=` when the module is loaded.
+# Default: "Omarchy Broadcast"
+label = "Omarchy Broadcast"
+
+# Explicit device node, overriding the label. Must be a path under /dev/.
+# Default: unset (find the device by label).
+# device = "/dev/video11"
+
+[lifecycle]
+# Seconds the camera keeps streaming after the last application closes the
+# virtual camera, so a quick reopen finds it running. 0 to 3600; 0 stops at
+# once.
+# Default: 5.0
+idle_grace_s = 5.0
+
+# Milliseconds an application must hold the virtual camera before the camera
+# starts, so that applications that only list devices do not switch it on.
+# 0 to 10000; 0 starts at once.
+# Default: 300
+start_debounce_ms = 300

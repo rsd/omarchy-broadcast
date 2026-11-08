@@ -1,0 +1,54 @@
+# oma-broadcastd as a systemd user service.
+#
+# Install (nothing is installed by the build):
+#   cargo install --path crates/oma-broadcastd      # -> ~/.cargo/bin/oma-broadcastd
+#   install -Dm644 dist/systemd/oma-broadcastd.service \
+#       ~/.config/systemd/user/oma-broadcastd.service
+#   install -Dm644 dist/dbus-1/services/br.com.dias.OmaBroadcast.service \
+#       ~/.local/share/dbus-1/services/br.com.dias.OmaBroadcast.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now oma-broadcastd.service
+#
+# Reload the configuration with `systemctl --user reload oma-broadcastd`
+# (SIGHUP). Logs: `journalctl --user -u oma-broadcastd`.
+#
+# Optional: dist/systemd/wireplumber.service.d/oma-broadcast.conf orders
+# WirePlumber after this unit, so PipeWire lists the virtual camera (see
+# that file).
+
+[Unit]
+Description=oma-broadcast virtual camera daemon
+# No After= or PartOf=graphical-session.target: the daemon needs only the
+# session bus and the V4L2 devices, not a compositor, and it is pulled in by
+# default.target (see [Install]), as WirePlumber is. Ordering it after the
+# graphical session would put it in a later start-up transaction than
+# WirePlumber, so WirePlumber (with the optional drop-in) could not order
+# after it.
+
+[Service]
+# Ready once it owns br.com.dias.OmaBroadcast on the session bus, which it
+# requests only after its first loopback writer attempt: when the unit is
+# ready, the virtual camera is already advertised as a capture device (or
+# the daemon reports why not in State/Error).
+Type=dbus
+BusName=br.com.dias.OmaBroadcast
+ExecStart=%h/.cargo/bin/oma-broadcastd
+ExecReload=/bin/kill -HUP $MAINPID
+# Readiness (the bus name) comes after the first loopback writer attempt,
+# which normally takes well under a second. The first start after a
+# GStreamer upgrade also rebuilds the plugin registry, which can take several
+# seconds; a start that hangs beyond this bound fails instead of holding up
+# the units ordered after this one (WirePlumber, with the drop-in) for
+# systemd's default 90 s.
+TimeoutStartSec=30
+# Also restarts it when the session bus connection is lost (exit status 1).
+Restart=on-failure
+RestartSec=2
+# Exit status 3: another process owns the bus name (the daemon is already
+# running); restarting cannot help.
+RestartPreventExitStatus=3
+
+[Install]
+# default.target: started with the user's service manager, in the same
+# start-up transaction as pipewire.service and wireplumber.service.
+WantedBy=default.target
