@@ -61,6 +61,28 @@ impl Canonical {
     }
 }
 
+/// Where canonical frames live. Production frames are always in CUDA
+/// memory; system memory runs the same ingest, clock and output code on the
+/// CPU (the CPU-only session tests), with CPU stand-ins for the CUDA
+/// elements and no CUDA context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum FrameMemory {
+    #[default]
+    Cuda,
+    #[cfg_attr(not(test), allow(dead_code))]
+    System,
+}
+
+impl FrameMemory {
+    /// The caps of canonical frames in this memory, without a frame rate.
+    pub(crate) fn caps_string(self, canonical: &Canonical) -> String {
+        match self {
+            FrameMemory::Cuda => canonical.caps_string(),
+            FrameMemory::System => canonical.system_caps_string(),
+        }
+    }
+}
+
 /// A canonical frame in the slot, with where it came from.
 #[derive(Debug, Clone)]
 pub struct Frame {
@@ -80,6 +102,7 @@ pub struct FrameWriter {
     epoch: Instant,
     source_id: u64,
     canonical: Canonical,
+    memory: FrameMemory,
 }
 
 impl FrameWriter {
@@ -96,7 +119,18 @@ impl FrameWriter {
             epoch,
             source_id,
             canonical,
+            memory: FrameMemory::Cuda,
         }
+    }
+
+    /// The same writer for frames in `memory`.
+    pub(crate) fn in_memory(self, memory: FrameMemory) -> Self {
+        FrameWriter { memory, ..self }
+    }
+
+    /// Where the frames written must live.
+    pub(crate) fn memory(&self) -> FrameMemory {
+        self.memory
     }
 
     pub fn source_id(&self) -> u64 {

@@ -75,9 +75,10 @@ mod tests {
     use gst::prelude::*;
 
     use super::*;
+    use crate::test_support::require_elements;
 
     #[test]
-    fn gpu_stage_parse() {
+    fn process_stage_parse() {
         assert_eq!(
             "roundtrip".parse::<GpuStage>().unwrap(),
             GpuStage::Roundtrip
@@ -91,17 +92,18 @@ mod tests {
     }
 
     #[test]
-    fn process_stage_elements() {
-        gst::init().unwrap();
+    fn passthrough_has_no_elements() {
         assert!(
             process_elements(GpuStage::Passthrough, "2:4:5:1")
                 .unwrap()
                 .is_empty()
         );
-        if gst::ElementFactory::find("cudaconvert").is_none() {
-            eprintln!("SKIPPED: GStreamer element cudaconvert is not installed");
-            return;
-        }
+    }
+
+    #[test]
+    #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+    fn gpu_roundtrip_stage_elements() {
+        require_elements(&["cudaconvert", "capsfilter"]);
         let e = process_elements(GpuStage::Roundtrip, "2:4:5:1").unwrap();
         let names: Vec<_> = e.iter().map(|e| e.name().to_string()).collect();
         assert_eq!(

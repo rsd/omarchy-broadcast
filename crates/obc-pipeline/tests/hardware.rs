@@ -1,14 +1,19 @@
 //! Hardware integration tests, parametrised by environment variables.
 //!
-//! All are `#[ignore]`. The camera tests need a real camera attached and
-//! free, a v4l2loopback device nobody else is feeding, and an NVIDIA GPU with
-//! GStreamer's `cuda*` elements; the GPU-only tests (`gpu_*`) need only the
-//! GPU. Nothing here assumes a camera model:
+//! All are `#[ignore]`, with the reason naming what they need, and run with
+//! `--ignored`. The camera tests need a real camera attached and free, a
+//! v4l2loopback device nobody else is feeding, and an NVIDIA GPU with
+//! GStreamer's `cuda*` elements; the GPU-only tests (`gpu_*`, selected with
+//! the `gpu_` filter) need only the GPU. A test that runs without its
+//! prerequisite fails, with a message naming what is missing and how to
+//! provide it: no test passes without running. Nothing here assumes a camera
+//! model:
 //!
 //! * `OBC_TEST_CAMERA` (camera tests): the camera, in the same three forms as
 //!   `obc-bench --camera`: a card-name substring, a USB `vid:pid`
-//!   (`hhhh:hhhh`), or a `/dev/videoN` path. Unset, every camera test prints
-//!   `SKIPPED` and returns (passing vacuously; see `--nocapture`).
+//!   (`hhhh:hhhh`), or a `/dev/videoN` path. The camera tests fail when it is
+//!   unset. The control tests need a camera whose
+//!   `exposure_dynamic_framerate` control is writable.
 //! * `OBC_TEST_CAMERA_2` (optional): a second camera for the switching test,
 //!   same forms. Unset, that test switches between two openings of
 //!   `OBC_TEST_CAMERA`.
@@ -20,12 +25,13 @@
 //! * `OBC_TEST_SINK`: the loopback node the pipeline tests write to (it must
 //!   be a v4l2loopback device; anything else fails the test). Unset, a
 //!   v4l2loopback device labelled "Omarchy Broadcast" is used; with neither,
-//!   the pipeline tests skip. A test never feeds "the first loopback found".
-//!   `output_restarts_while_a_consumer_holds_the_loopback` needs no camera,
-//!   so it runs only with `OBC_TEST_SINK` set, never on the labelled default.
+//!   the pipeline tests fail. A test never feeds "the first loopback found".
+//!   `output_restarts_while_a_consumer_holds_the_loopback` needs no camera
+//!   and requires `OBC_TEST_SINK`, never the labelled default.
 //!
-//! Check `fuser -v /dev/video*` first. Example:
-//! `OBC_TEST_CAMERA=1234:abcd OBC_TEST_SINK=/dev/video11 cargo test -p obc-pipeline --test hardware -- --ignored --test-threads=1`.
+//! Check `fuser -v /dev/video*` first. Examples:
+//! `cargo test -p obc-pipeline --test hardware -- --ignored gpu_ --test-threads=1` (GPU only);
+//! `OBC_TEST_CAMERA=1234:abcd OBC_TEST_SINK=/dev/video11 cargo test -p obc-pipeline --test hardware -- --ignored --test-threads=1` (all).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -67,16 +73,14 @@ fn camera_from_env(var: &str) -> Option<CameraSelector> {
     })
 }
 
-/// `OBC_TEST_CAMERA`, or `None` (with a printed reason) when unset.
-fn test_camera() -> Option<CameraSelector> {
-    let sel = camera_from_env("OBC_TEST_CAMERA");
-    if sel.is_none() {
-        eprintln!(
-            "SKIPPED: set OBC_TEST_CAMERA to a card-name substring, a USB vid:pid (hhhh:hhhh) \
-             or a /dev/videoN path to run the hardware tests"
-        );
-    }
-    sel
+/// `OBC_TEST_CAMERA`; the test fails when it is unset.
+fn test_camera() -> CameraSelector {
+    camera_from_env("OBC_TEST_CAMERA").unwrap_or_else(|| {
+        panic!(
+            "this test needs a camera: set OBC_TEST_CAMERA to a card-name substring, a USB \
+             vid:pid (hhhh:hhhh) or a /dev/videoN path"
+        )
+    })
 }
 
 /// `OBC_TEST_MODE`, or the default request.
@@ -87,24 +91,22 @@ fn test_mode() -> ModeRequest {
     }
 }
 
-/// The explicitly named test loopback, or `None` (with a printed reason)
-/// when none is named: never "the first loopback found".
-fn test_sink() -> Option<DeviceInfo> {
+/// The explicitly named test loopback: `OBC_TEST_SINK`, or else the
+/// v4l2loopback device labelled [`DEFAULT_SINK_LABEL`], never "the first
+/// loopback found". The test fails when there is neither.
+fn test_sink() -> DeviceInfo {
     let devs = scan_sysfs();
     if let Some(path) = std::env::var_os("OBC_TEST_SINK") {
         let sel = SinkSelector::Path(path.into());
         let d = select_sink(&devs, &sel).unwrap_or_else(|e| panic!("OBC_TEST_SINK: {e}"));
-        return Some(d.clone());
+        return d.clone();
     }
     match select_sink(&devs, &SinkSelector::Label(DEFAULT_SINK_LABEL.into())) {
-        Ok(d) => Some(d.clone()),
-        Err(e) => {
-            eprintln!(
-                "SKIPPED: no explicit test loopback ({e}); set OBC_TEST_SINK=/dev/videoN \
-                 or create a v4l2loopback device labelled {DEFAULT_SINK_LABEL:?}"
-            );
-            None
-        }
+        Ok(d) => d.clone(),
+        Err(e) => panic!(
+            "this test needs a free v4l2loopback device ({e}): set OBC_TEST_SINK=/dev/videoN \
+             or create a v4l2loopback device labelled {DEFAULT_SINK_LABEL:?}"
+        ),
     }
 }
 
@@ -123,16 +125,41 @@ fn select_with(
     (got.device.clone(), got.choice)
 }
 
-/// Whether every GStreamer element in `factories` is installed (printing
-/// `SKIPPED` otherwise).
-fn have(factories: &[&str]) -> bool {
-    for f in factories {
-        if gst::ElementFactory::find(f).is_none() {
-            eprintln!("SKIPPED: GStreamer element {f} is not installed");
-            return false;
-        }
+/// Fails the test unless every GStreamer element in `factories` is
+/// installed, naming the missing ones and where they come from.
+fn require_elements(factories: &[&str]) {
+    let missing: Vec<&str> = factories
+        .iter()
+        .copied()
+        .filter(|f| gst::ElementFactory::find(f).is_none())
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "GStreamer element(s) not installed: {}. The cuda* elements come from the nvcodec \
+         plugin (gst-plugins-bad) and register only where an NVIDIA GPU and its driver are \
+         present; the others from GStreamer core, gst-plugins-base and gst-plugins-good. \
+         Check with \
+         `gst-inspect-1.0 <element>`.",
+        missing.join(", ")
+    );
+}
+
+/// The value of the camera's `exposure_dynamic_framerate` control; the test
+/// fails when the camera does not have it writable (both reference cameras
+/// do).
+fn writable_exposure_dynamic_framerate(camera: &DeviceInfo) -> i32 {
+    use obc_pipeline::controls::{CID_EXPOSURE_AUTO_PRIORITY, probe_ctrl};
+    match probe_ctrl(&camera.path, CID_EXPOSURE_AUTO_PRIORITY) {
+        Ok((info, v)) if !info.read_only() => v,
+        Ok(_) => panic!(
+            "this test needs a camera whose exposure_dynamic_framerate control is writable; it \
+             is read-only on {camera}: choose another OBC_TEST_CAMERA"
+        ),
+        Err(skip) => panic!(
+            "this test needs a camera with a writable exposure_dynamic_framerate control \
+             ({skip} on {camera}): choose another OBC_TEST_CAMERA"
+        ),
     }
-    true
 }
 
 #[test]
@@ -140,9 +167,7 @@ fn have(factories: &[&str]) -> bool {
 fn selects_test_camera_by_both_routes() {
     init();
     let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(sel) = test_camera() else {
-        return;
-    };
+    let sel = test_camera();
     let req = test_mode();
     let mut picks = Vec::new();
     for route in [DiscoveryRoute::Monitor, DiscoveryRoute::Sysfs] {
@@ -158,29 +183,17 @@ fn selects_test_camera_by_both_routes() {
 }
 
 /// The control guard puts the camera control back on drop, also when the
-/// scope unwinds from a panic. A camera without the control skips.
+/// scope unwinds from a panic. The camera must have the control writable.
 #[test]
 #[ignore = "needs OBC_TEST_CAMERA attached and not streaming"]
 fn control_guard_restores_on_drop_and_unwind() {
-    use obc_pipeline::controls::{CID_EXPOSURE_AUTO_PRIORITY, ControlGuard, get_ctrl, probe_ctrl};
+    use obc_pipeline::controls::{CID_EXPOSURE_AUTO_PRIORITY, ControlGuard, get_ctrl};
     init();
     let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(sel) = test_camera() else {
-        return;
-    };
+    let sel = test_camera();
     let (camera, _) = select_with(&sel, &test_mode(), DiscoveryRoute::Auto);
     let path = camera.path.clone();
-    let original = match probe_ctrl(&path, CID_EXPOSURE_AUTO_PRIORITY) {
-        Ok((info, v)) if !info.read_only() => v,
-        Ok(_) => {
-            eprintln!("SKIPPED: exposure_dynamic_framerate is read-only on {camera}");
-            return;
-        }
-        Err(skip) => {
-            eprintln!("SKIPPED: exposure_dynamic_framerate {skip}");
-            return;
-        }
-    };
+    let original = writable_exposure_dynamic_framerate(&camera);
     let other = i32::from(original == 0);
 
     let guard = ControlGuard::set(&path, CID_EXPOSURE_AUTO_PRIORITY, original, other).unwrap();
@@ -234,27 +247,19 @@ impl Drop for RestoreControl {
 
 /// An ingest that pins `exposure_dynamic_framerate` off restores it when it
 /// is stopped (explicitly, by a switch, or by dropping the session), before
-/// the next ingest of the same camera starts. A camera without a writable
-/// control skips. The camera's original value is put back at the end, also
-/// when the test fails.
+/// the next ingest of the same camera starts. The camera must have the
+/// control writable. The camera's original value is put back at the end,
+/// also when the test fails.
 #[test]
 #[ignore = "needs OBC_TEST_CAMERA, a free v4l2loopback device and an NVIDIA GPU"]
 fn ingest_restores_the_camera_control_on_stop() {
-    use obc_pipeline::controls::{CID_EXPOSURE_AUTO_PRIORITY, get_ctrl, probe_ctrl, set_ctrl};
+    use obc_pipeline::controls::{CID_EXPOSURE_AUTO_PRIORITY, get_ctrl, set_ctrl};
     init();
     let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(sel) = test_camera() else {
-        return;
-    };
+    let sel = test_camera();
     let (camera, choice) = select_with(&sel, &test_mode(), DiscoveryRoute::Auto);
     let path = camera.path.clone();
-    let original = match probe_ctrl(&path, CID_EXPOSURE_AUTO_PRIORITY) {
-        Ok((info, v)) if !info.read_only() => v,
-        Ok(_) | Err(_) => {
-            eprintln!("SKIPPED: exposure_dynamic_framerate not writable on {camera}");
-            return;
-        }
-    };
+    let original = writable_exposure_dynamic_framerate(&camera);
     // Declared before the session, so dropped after it: the session's own
     // restore runs first, then the original value is put back.
     let _restore = RestoreControl {
@@ -616,12 +621,8 @@ fn stream_a_few_frames(
 fn pipeline_test(stage: GpuStage) {
     init();
     let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(sel) = test_camera() else {
-        return;
-    };
-    let Some(sink) = test_sink() else {
-        return;
-    };
+    let sel = test_camera();
+    let sink = test_sink();
     let (camera, choice) = select_with(&sel, &test_mode(), DiscoveryRoute::Auto);
     stream_a_few_frames(&camera, &sink, &choice, stage, OutputFormat::Nv12);
 }
@@ -646,12 +647,8 @@ fn roundtrip_reaches_playing_with_cuda_links() {
 fn every_ingest_path_outputs_requested_format() {
     init();
     let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(sel) = test_camera() else {
-        return;
-    };
-    let Some(sink) = test_sink() else {
-        return;
-    };
+    let sel = test_camera();
+    let sink = test_sink();
     let req = test_mode();
     let (camera, _) = select_with(&sel, &req, DiscoveryRoute::Auto);
     let caps: &Capabilities = camera.capabilities.as_ref().expect("enumerated");
@@ -695,12 +692,8 @@ fn every_ingest_path_outputs_requested_format() {
 fn output_holds_the_contract_frame_rate() {
     init();
     let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(sel) = test_camera() else {
-        return;
-    };
-    let Some(sink) = test_sink() else {
-        return;
-    };
+    let sel = test_camera();
+    let sink = test_sink();
     let (camera, choice) = select_with(&sel, &test_mode(), DiscoveryRoute::Auto);
     let contract = OutputContract::default();
     let output = Output::build(OutputConfig::new(
@@ -912,12 +905,8 @@ fn start_consumer(sink: &DeviceInfo, size: (u32, u32)) -> MediaPipeline {
 fn switching_sources_keeps_the_output_and_its_consumer() {
     init();
     let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(sel_a) = test_camera() else {
-        return;
-    };
-    let Some(sink) = test_sink() else {
-        return;
-    };
+    let sel_a = test_camera();
+    let sink = test_sink();
     let (cam_a, choice_a) = select_with(&sel_a, &test_mode(), DiscoveryRoute::Auto);
     let (cam_b, choice_b) = match camera_from_env("OBC_TEST_CAMERA_2") {
         Some(sel_b) => select_with(&sel_b, &ModeRequest::default(), DiscoveryRoute::Auto),
@@ -1212,17 +1201,15 @@ fn luma(info: &gst_video::VideoInfo, buffer: &gst::Buffer, x: usize, y: usize) -
 /// on the other axis (left and right for the taller source, top and
 /// bottom for the wider one).
 #[test]
-#[ignore = "needs an NVIDIA GPU"]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
 fn gpu_crop_fills_and_letterbox_pads() {
     init();
-    if !have(&[
+    require_elements(&[
         "cudaupload",
         "cudaconvertscale",
         "videocrop",
         "cudadownload",
-    ]) {
-        return;
-    }
+    ]);
     // (source size, output size, band rows): a 4:3 source whose top and
     // bottom bands are exactly what crop-to-fill removes.
     for (src, out, band) in [
@@ -1513,18 +1500,16 @@ fn trace_output(output: &mut Output) -> Arc<Mutex<OutputTrace>> {
 /// (500 ms), then replaced by the black placeholder (luma 16). Repeats
 /// re-push the same CUDA memory.
 #[test]
-#[ignore = "needs an NVIDIA GPU"]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
 fn gpu_stalled_source_repeats_then_sends_the_placeholder() {
     init();
-    if !have(&[
+    require_elements(&[
         "videotestsrc",
         "cudaupload",
         "cudaconvertscale",
         "videocrop",
         "cudadownload",
-    ]) {
-        return;
-    }
+    ]);
     let mut output = Output::build(OutputConfig::new(
         OutputContract::default(),
         OutputSink::Fake,
@@ -1647,18 +1632,16 @@ fn gpu_stalled_source_repeats_then_sends_the_placeholder() {
 /// (d) GPU only: a 15 fps source is padded to the 30 fps contract with
 /// about one repeat per fresh frame, and no placeholder.
 #[test]
-#[ignore = "needs an NVIDIA GPU"]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
 fn gpu_slow_source_is_padded_to_the_contract_rate() {
     init();
-    if !have(&[
+    require_elements(&[
         "videotestsrc",
         "cudaupload",
         "cudaconvertscale",
         "videocrop",
         "cudadownload",
-    ]) {
-        return;
-    }
+    ]);
     let mut output = Output::build(OutputConfig::new(
         OutputContract::default(),
         OutputSink::Fake,
@@ -1730,12 +1713,8 @@ fn gpu_slow_source_is_padded_to_the_contract_rate() {
 fn held_loopback_format_is_reported_before_streaming() {
     init();
     let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(sel) = test_camera() else {
-        return;
-    };
-    let Some(sink) = test_sink() else {
-        return;
-    };
+    let sel = test_camera();
+    let sink = test_sink();
     let (camera, choice) = select_with(&sel, &test_mode(), DiscoveryRoute::Auto);
     let contract = OutputContract::default();
     let held_rate = 15;
@@ -1806,12 +1785,12 @@ fn held_loopback_format_is_reported_before_streaming() {
 /// before it are not counted as superseded after it.
 ///
 /// Writes to the loopback named by `OBC_TEST_SINK` only (no default), and
-/// skips without it.
+/// fails without it.
 #[test]
 #[ignore = "needs OBC_TEST_SINK (a free v4l2loopback device) and an NVIDIA GPU"]
 fn output_restarts_while_a_consumer_holds_the_loopback() {
     init();
-    if !have(&[
+    require_elements(&[
         "videotestsrc",
         "cudaupload",
         "cudaconvertscale",
@@ -1819,18 +1798,13 @@ fn output_restarts_while_a_consumer_holds_the_loopback() {
         "cudadownload",
         "capssetter",
         "v4l2sink",
-    ]) {
-        return;
-    }
-    if std::env::var_os("OBC_TEST_SINK").is_none() {
-        eprintln!(
-            "SKIPPED: set OBC_TEST_SINK=/dev/videoN (a v4l2loopback device) to run this test"
-        );
-        return;
-    }
-    let Some(sink) = test_sink() else {
-        return;
-    };
+    ]);
+    assert!(
+        std::env::var_os("OBC_TEST_SINK").is_some(),
+        "this test needs OBC_TEST_SINK=/dev/videoN, a free v4l2loopback device (it never \
+         writes to a device found by its label alone)"
+    );
+    let sink = test_sink();
 
     // Full range cannot reach a loopback: refused at build, before streaming.
     let full = OutputContract {
@@ -1929,12 +1903,10 @@ fn output_restarts_while_a_consumer_holds_the_loopback() {
 /// stops emitting, so the output reports it: `is_running` turns false,
 /// `health` returns the panic message, and so does `stop`.
 #[test]
-#[ignore = "needs an NVIDIA GPU"]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
 fn gpu_a_dead_output_clock_is_reported() {
     init();
-    if !have(&["cudaupload", "cudadownload", "capssetter", "fakesink"]) {
-        return;
-    }
+    require_elements(&["cudaupload", "cudadownload", "capssetter", "fakesink"]);
     let mut output = Output::build(OutputConfig::new(
         OutputContract::default(),
         OutputSink::Fake,
@@ -1972,19 +1944,17 @@ fn gpu_a_dead_output_clock_is_reported() {
 /// GPU only: a switch whose new source fails to start leaves the session
 /// without a source, and `last_switch` records the attempt with its error.
 #[test]
-#[ignore = "needs an NVIDIA GPU"]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
 fn gpu_a_failed_switch_is_recorded_with_its_error() {
     init();
-    if !have(&[
+    require_elements(&[
         "videotestsrc",
         "filesrc",
         "cudaupload",
         "cudaconvertscale",
         "videocrop",
         "cudadownload",
-    ]) {
-        return;
-    }
+    ]);
     let mut cfg = OutputConfig::new(OutputContract::default(), OutputSink::Fake);
     cfg.hold_timeout = Duration::from_secs(1);
     let mut output = Output::build(cfg).expect("build output");
@@ -2089,19 +2059,17 @@ fn gpu_a_failed_switch_is_recorded_with_its_error() {
 /// frame throughout: no placeholder, white repeats until the new source's
 /// first frame.
 #[test]
-#[ignore = "needs an NVIDIA GPU"]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
 fn gpu_a_switch_holds_the_last_frame_until_the_new_source() {
     init();
-    if !have(&[
+    require_elements(&[
         "videotestsrc",
         "queue",
         "cudaupload",
         "cudaconvertscale",
         "videocrop",
         "cudadownload",
-    ]) {
-        return;
-    }
+    ]);
     let mut output = Output::build(OutputConfig::new(
         OutputContract::default(),
         OutputSink::Fake,
@@ -2202,19 +2170,17 @@ fn gpu_a_switch_holds_the_last_frame_until_the_new_source() {
 /// behind, and no frame reaches the sink later than about the bound times
 /// the sink's service time after its emission.
 #[test]
-#[ignore = "needs an NVIDIA GPU"]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
 fn gpu_a_slow_sink_never_queues_more_than_the_bound() {
     init();
-    if !have(&[
+    require_elements(&[
         "videotestsrc",
         "cudaupload",
         "cudaconvertscale",
         "videocrop",
         "cudadownload",
         "fakesink",
-    ]) {
-        return;
-    }
+    ]);
     const SERVICE: Duration = Duration::from_millis(100);
     let cfg = OutputConfig::new(OutputContract::default(), OutputSink::Fake);
     let bound = u64::from(cfg.queue_buffers);

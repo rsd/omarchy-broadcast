@@ -696,6 +696,7 @@ pub fn all_cuda_between(links: &[LinkCaps], upload: &str, download: &str) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::require_elements;
 
     fn link(from: &str, to: &str, cuda: bool) -> LinkCaps {
         LinkCaps {
@@ -751,10 +752,7 @@ mod tests {
 
     #[test]
     fn io_mode_check() {
-        gst::init().unwrap();
-        if gst::ElementFactory::find("v4l2src").is_none() {
-            return; // plugin not installed; nothing to check against
-        }
+        require_elements(&["v4l2src"]);
         check_io_mode("mmap").unwrap();
         check_io_mode("dmabuf").unwrap();
         assert!(matches!(
@@ -824,13 +822,7 @@ mod tests {
     /// camera's colorimetry label on its NV12 output.
     #[test]
     fn cpu_convert_stage_keeps_camera_colorimetry() {
-        gst::init().unwrap();
-        for f in ["videotestsrc", "videoconvert", "fakesink"] {
-            if gst::ElementFactory::find(f).is_none() {
-                eprintln!("SKIPPED: GStreamer element {f} is not installed");
-                return;
-            }
-        }
+        require_elements(&["videotestsrc", "videoconvert", "fakesink"]);
         let colorimetry = |caps: Option<gst::Caps>| -> Option<String> {
             caps?.structure(0)?.get::<String>("colorimetry").ok()
         };

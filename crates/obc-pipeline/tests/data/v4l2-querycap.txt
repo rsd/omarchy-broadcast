@@ -1,0 +1,17 @@
+# VIDIOC_QUERYCAP replies of every video4linux node of a USB camera, in
+# /dev/videoN order, keyed by USB vendor:product, with the
+# v4l2-ctl --list-formats-ext dump that node enumerates ("-" for a node
+# without video capture, such as a UVC metadata node). The discovery tests
+# replay these through a fake sysfs tree. No serial numbers; bus_info is a
+# host-controller port path.
+#
+# usb id    | driver   | card                      | bus_info           | capabilities | device_caps | formats
+046d:0944 | uvcvideo | MX Brio                   | usb-0000:00:14.0-2 | 0x84a00001 | 0x04200001 | mx-brio-046d-0944.v4l2-ctl.txt
+046d:0944 | uvcvideo | MX Brio                   | usb-0000:00:14.0-2 | 0x84a00001 | 0x04800000 | -
+5986:1193 | uvcvideo | FHD Camera: FHD Camera    | usb-0000:00:14.0-6 | 0x84a00001 | 0x04200001 | fhd-camera-5986-1193-colour.v4l2-ctl.txt
+5986:1193 | uvcvideo | FHD Camera: FHD Camera    | usb-0000:00:14.0-6 | 0x84a00001 | 0x04800000 | -
+5986:1193 | uvcvideo | FHD Camera: FHD IR Camera | usb-0000:00:14.0-6 | 0x84a00001 | 0x04200001 | fhd-camera-5986-1193-ir.v4l2-ctl.txt
+5986:1193 | uvcvideo | FHD Camera: FHD IR Camera | usb-0000:00:14.0-6 | 0x84a00001 | 0x04800000 | -
+# Synthetic camera (see the header of its formats file).
+1209:0001 | uvcvideo | Synthetic YUYV Camera     | usb-0000:00:14.0-3 | 0x84a00001 | 0x04200001 | synthetic-yuyv-only-1209-0001.v4l2-ctl.txt
+1209:0001 | uvcvideo | Synthetic YUYV Camera     | usb-0000:00:14.0-3 | 0x84a00001 | 0x04800000 | -

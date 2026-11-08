@@ -38,6 +38,11 @@
 //! frames reach the output as CUDA memory of the same context, without a
 //! copy.
 //!
+//! **System memory.** Inside the crate the same stage can also produce
+//! canonical frames in system memory (`FrameMemory::System`), for the
+//! CPU-only tests: no `cudaupload`, `videoconvertscale` in place of
+//! `cudaconvertscale`, and no CUDA context.
+//!
 //! **Camera controls.** An ingest optionally pins the UVC
 //! `exposure_dynamic_framerate` control off while it runs (a camera with it
 //! on may lower its frame rate in dim light) and restores it when stopped or
@@ -50,7 +55,7 @@ use obc_core::{AspectPolicy, VideoMode};
 
 use crate::capability::IngestPath;
 use crate::controls::{CID_EXPOSURE_AUTO_PRIORITY, ControlGuard, CtrlSkip, get_ctrl, probe_ctrl};
-use crate::frame::{Canonical, FrameWriter};
+use crate::frame::{Canonical, FrameMemory, FrameWriter};
 use crate::geometry::{Crop, crop_for};
 use crate::pipeline::{
     MediaPipeline, PipelineError, add_linked, camera_head, capsfilter, cuda_caps, make, names,
@@ -112,12 +117,35 @@ pub fn canonical_tail(
     canonical: &Canonical,
     aspect: AspectPolicy,
 ) -> Result<(Vec<gst::Element>, Crop), PipelineError> {
+    tail_in(
+        FrameMemory::Cuda,
+        upload_format,
+        (width, height),
+        canonical,
+        aspect,
+    )
+}
+
+/// [`canonical_tail`] for canonical frames in `memory`. In system memory
+/// there is no upload and `videoconvertscale` stands in for
+/// `cudaconvertscale`: `[videocrop !] videoconvertscale ! capsfilter
+/// (canonical, system memory)`.
+fn tail_in(
+    memory: FrameMemory,
+    upload_format: &str,
+    (width, height): (u32, u32),
+    canonical: &Canonical,
+    aspect: AspectPolicy,
+) -> Result<(Vec<gst::Element>, Crop), PipelineError> {
     use names::*;
     let crop = crop_for(aspect, width, height, canonical.width, canonical.height);
-    let mut tail = vec![
-        make("cudaupload", UPLOAD)?,
-        capsfilter(CUDA_CAPS, &cuda_caps(upload_format))?,
-    ];
+    let mut tail = match memory {
+        FrameMemory::Cuda => vec![
+            make("cudaupload", UPLOAD)?,
+            capsfilter(CUDA_CAPS, &cuda_caps(upload_format))?,
+        ],
+        FrameMemory::System => Vec::new(),
+    };
     if aspect == AspectPolicy::Crop {
         let c = make("videocrop", CROP)?;
         for (side, v) in [
@@ -130,10 +158,14 @@ pub fn canonical_tail(
         }
         tail.push(c);
     }
-    let scale = make("cudaconvertscale", SCALE)?;
+    let scaler = match memory {
+        FrameMemory::Cuda => "cudaconvertscale",
+        FrameMemory::System => "videoconvertscale",
+    };
+    let scale = make(scaler, SCALE)?;
     scale.set_property("add-borders", aspect == AspectPolicy::Letterbox);
     tail.push(scale);
-    tail.push(capsfilter(CANONICAL_CAPS, &canonical.caps_string())?);
+    tail.push(capsfilter(CANONICAL_CAPS, &memory.caps_string(canonical))?);
     Ok((tail, crop))
 }
 
@@ -195,6 +227,7 @@ pub struct Ingest {
     path: Option<IngestPath>,
     crop: Crop,
     controls: ControlReport,
+    memory: FrameMemory,
 }
 
 impl Ingest {
@@ -222,7 +255,8 @@ impl Ingest {
 
     /// Builds an ingest from any system-memory source: `head` (linked in
     /// order) delivers `upload_format` frames of `size`; the canonical tail
-    /// and the slot writer are appended. No camera control is involved.
+    /// (for the writer's frame memory) and the slot writer are appended. No
+    /// camera control is involved.
     pub fn from_head(
         head: Vec<gst::Element>,
         upload_format: &str,
@@ -231,9 +265,9 @@ impl Ingest {
         writer: FrameWriter,
     ) -> Result<Self, PipelineError> {
         let source_id = writer.source_id();
+        let memory = writer.memory();
         let pipeline = gst::Pipeline::with_name(&format!("obc-ingest-{source_id}"));
-        let (tail, crop) =
-            canonical_tail(upload_format, size.0, size.1, &writer.canonical(), aspect)?;
+        let (tail, crop) = tail_in(memory, upload_format, size, &writer.canonical(), aspect)?;
         let mut chain = head;
         chain.extend(tail);
         chain.push(frames_sink(names::FRAMES_SINK, writer));
@@ -247,6 +281,7 @@ impl Ingest {
             path: None,
             crop,
             controls: ControlReport::default(),
+            memory,
         })
     }
 
@@ -257,16 +292,33 @@ impl Ingest {
     /// On error the pipeline is back in NULL and any control already pinned
     /// is restored when the ingest is dropped.
     pub fn start(&mut self, cuda: &gst::Context) -> Result<(), PipelineError> {
-        if cuda.context_type() != CUDA_CONTEXT_TYPE {
-            return Err(PipelineError::Cuda(format!(
-                "an ingest needs a {CUDA_CONTEXT_TYPE} context, not {}",
-                cuda.context_type()
-            )));
+        self.start_with(Some(cuda))
+    }
+
+    /// [`Self::start`] with the output's CUDA context if it has one: an
+    /// ingest of system-memory frames ([`FrameMemory::System`]) starts
+    /// without one, an ingest of CUDA frames refuses to.
+    pub(crate) fn start_with(&mut self, cuda: Option<&gst::Context>) -> Result<(), PipelineError> {
+        match cuda {
+            Some(cuda) if cuda.context_type() != CUDA_CONTEXT_TYPE => {
+                return Err(PipelineError::Cuda(format!(
+                    "an ingest needs a {CUDA_CONTEXT_TYPE} context, not {}",
+                    cuda.context_type()
+                )));
+            }
+            None if self.memory == FrameMemory::Cuda => {
+                return Err(PipelineError::Cuda(format!(
+                    "an ingest of CUDA frames needs the output's {CUDA_CONTEXT_TYPE} context"
+                )));
+            }
+            _ => {}
         }
         self.apply_controls()?;
         // Before NULL -> READY: the CUDA elements take it instead of
         // creating their own.
-        self.pipeline.pipeline().set_context(cuda);
+        if let Some(cuda) = cuda {
+            self.pipeline.pipeline().set_context(cuda);
+        }
         if let Err(e) = self.pipeline.play() {
             let _ = self.pipeline.pipeline().set_state(gst::State::Null);
             return Err(e);
@@ -360,6 +412,7 @@ mod tests {
 
     use super::*;
     use crate::slot::Slot;
+    use crate::test_support::require_elements;
 
     fn writer(contract: &OutputContract) -> FrameWriter {
         FrameWriter::new(
@@ -370,32 +423,20 @@ mod tests {
         )
     }
 
-    fn have(factories: &[&str]) -> bool {
-        gst::init().unwrap();
-        for f in factories {
-            if gst::ElementFactory::find(f).is_none() {
-                eprintln!("SKIPPED: GStreamer element {f} is not installed");
-                return false;
-            }
-        }
-        true
-    }
-
     /// The builder inserts the CPU adapter the camera format needs, uploads
     /// the adapter's output format, and ends in the canonical caps whatever
     /// the camera delivers.
     #[test]
-    fn ingest_adapters_per_format() {
-        if !have(&[
+    #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+    fn gpu_ingest_adapters_per_format() {
+        require_elements(&[
             "v4l2src",
             "cudaupload",
             "cudaconvertscale",
             "videocrop",
             "jpegdec",
             "videoconvert",
-        ]) {
-            return;
-        }
+        ]);
         let caps_of = |p: &Ingest, name: &str| {
             p.pipeline()
                 .element(name)
@@ -471,10 +512,9 @@ mod tests {
     }
 
     #[test]
-    fn letterbox_has_no_crop_and_adds_borders() {
-        if !have(&["videotestsrc", "cudaupload", "cudaconvertscale"]) {
-            return;
-        }
+    #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+    fn gpu_letterbox_has_no_crop_and_adds_borders() {
+        require_elements(&["videotestsrc", "cudaupload", "cudaconvertscale"]);
         let src = make("videotestsrc", "src").unwrap();
         let p = Ingest::from_head(
             vec![src],
@@ -494,15 +534,14 @@ mod tests {
     }
 
     #[test]
-    fn starting_with_a_context_of_another_type_is_refused() {
-        if !have(&[
+    #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+    fn gpu_starting_with_a_context_of_another_type_is_refused() {
+        require_elements(&[
             "videotestsrc",
             "cudaupload",
             "cudaconvertscale",
             "videocrop",
-        ]) {
-            return;
-        }
+        ]);
         let mut p = Ingest::from_head(
             vec![make("videotestsrc", "src").unwrap()],
             "NV12",
@@ -513,20 +552,59 @@ mod tests {
         .unwrap();
         let other = gst::Context::new("not.a.cuda.context", true);
         assert!(matches!(p.start(&other), Err(PipelineError::Cuda(_))));
+        // CUDA frames need the output's context.
+        assert!(matches!(p.start_with(None), Err(PipelineError::Cuda(_))));
         let (_, state, _) = p.pipeline().pipeline().state(gst::ClockTime::ZERO);
         assert_eq!(state, gst::State::Null);
     }
 
+    /// System-memory frames: no upload, `videoconvertscale` in place of
+    /// `cudaconvertscale`, the canonical caps without the CUDA feature, and
+    /// the same crop and letterbox policies. CPU only.
     #[test]
-    fn stopping_an_unstarted_ingest_is_clean() {
-        if !have(&[
+    fn a_system_memory_tail_has_no_cuda_element() {
+        require_elements(&["videotestsrc", "videocrop", "videoconvertscale", "appsink"]);
+        let contract = OutputContract::default();
+        for aspect in [AspectPolicy::Crop, AspectPolicy::Letterbox] {
+            let p = Ingest::from_head(
+                vec![make("videotestsrc", "src").unwrap()],
+                "NV12",
+                (640, 480),
+                aspect,
+                writer(&contract).in_memory(FrameMemory::System),
+            )
+            .unwrap();
+            let pipeline = p.pipeline();
+            assert!(pipeline.element(names::UPLOAD).is_none(), "{aspect:?}");
+            assert!(pipeline.element(names::CUDA_CAPS).is_none(), "{aspect:?}");
+            let scale = pipeline.element(names::SCALE).unwrap();
+            assert_eq!(scale.factory().unwrap().name(), "videoconvertscale");
+            let letterbox = aspect == AspectPolicy::Letterbox;
+            assert_eq!(scale.property::<bool>("add-borders"), letterbox);
+            assert_eq!(pipeline.element(names::CROP).is_none(), letterbox);
+            // 4:3 into 16:9: 60 rows cropped at the top and the bottom.
+            assert_eq!(p.crop().top, if letterbox { 0 } else { 60 });
+            assert_eq!(
+                pipeline
+                    .element(names::CANONICAL_CAPS)
+                    .unwrap()
+                    .property::<gst::Caps>("caps")
+                    .to_string(),
+                "video/x-raw, format=(string)NV12, width=(int)1920, height=(int)1080, \
+                 pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)2:4:5:1"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+    fn gpu_stopping_an_unstarted_ingest_is_clean() {
+        require_elements(&[
             "videotestsrc",
             "cudaupload",
             "cudaconvertscale",
             "videocrop",
-        ]) {
-            return;
-        }
+        ]);
         let p = Ingest::from_head(
             vec![make("videotestsrc", "src").unwrap()],
             "NV12",
