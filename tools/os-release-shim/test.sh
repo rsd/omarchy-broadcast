@@ -2,6 +2,9 @@
 # Tests for os-release-shim. Usage: test.sh <path to os-release-shim.so>
 # (`make test` builds the shim and runs this). Needs a C compiler, and uses
 # cat, grep and python3 when present. Exits non-zero on any failure.
+# The sh -c scripts below are single-quoted on purpose: their arguments
+# arrive as $1, $2 and are expanded by the inner shell, not this one.
+# shellcheck disable=SC2016
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)

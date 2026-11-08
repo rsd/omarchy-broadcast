@@ -4,6 +4,8 @@
 # this file (two directories up). Only committed content is built: makepkg
 # clones the repository, so uncommitted changes are not included. makepkg
 # rewrites pkgver= below on each build; that change need not be committed.
+# The committed pkgver= is the workspace version in Cargo.toml: a version
+# bump changes both files, and CI fails while they differ.
 #
 # Build (from packaging/arch):   makepkg -s
 # Install the result with:       sudo pacman -U oma-broadcast-git-*.pkg.tar.zst
@@ -21,7 +23,7 @@
 
 pkgname=oma-broadcast-git
 _pkgname=oma-broadcast
-pkgver=0.6.1
+pkgver=0.7.1
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API, a CLI and an Omarchy bar widget'
 arch=('x86_64')

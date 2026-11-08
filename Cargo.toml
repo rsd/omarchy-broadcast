@@ -13,7 +13,8 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+# Also the pkgver= of packaging/arch/PKGBUILD: bump both; CI checks they match.
+version = "0.7.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Raul Dias"]
