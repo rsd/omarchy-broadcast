@@ -1,15 +1,19 @@
 //! Shared pure types for oma-broadcast.
 //!
-//! Nothing in this crate touches GStreamer, CUDA or the filesystem: it holds the
-//! value types every other crate agrees on (video modes, mode requests, device
-//! selectors, output formats) and their parsing, so they can be unit-tested in
-//! isolation. Nothing here knows about a particular camera model.
+//! Nothing in this crate touches GStreamer or CUDA: it holds the value types
+//! every other crate agrees on (video modes, mode requests, device selectors,
+//! output formats) and their parsing, so they can be unit-tested in
+//! isolation. The only filesystem access is reading the daemon's config file
+//! and reading and writing its state file ([`config`]). Nothing here knows
+//! about a particular camera model.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde::Serialize;
+
+pub mod config;
 
 /// Card label of the dedicated virtual camera (see
 /// `docs/adr/0004-v4l2loopback-first.md`).

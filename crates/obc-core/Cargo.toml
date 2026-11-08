@@ -10,6 +10,11 @@ rust-version.workspace = true
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
+# Config and state files (src/config.rs).
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

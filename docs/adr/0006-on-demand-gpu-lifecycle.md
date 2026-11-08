@@ -1,6 +1,6 @@
 # ADR-0006: On-demand lifecycle; idle means zero CUDA contexts
 
-- **Status:** Accepted
+- **Status:** Accepted. Amended by [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md): the states are `off`, `idle`, `starting`, `active` and `error` (the grace period is inside `active`, replacing "Draining"), and a CPU-only loopback writer runs while the camera and the CUDA context are released
 
 ## Context
 - The target is a hybrid laptop.

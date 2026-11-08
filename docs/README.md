@@ -2,14 +2,18 @@
 
 | Doc | What it is |
 |---|---|
-| [architecture.md](architecture.md) | Mermaid diagrams: component overview, stage/caps model (ingest, process, output) with capability-driven source selection, on-demand lifecycle, D-Bus toggle sequence |
+| [architecture.md](architecture.md) | Mermaid diagrams: component overview, stage/caps model (ingest, process, output) with capability-driven source selection, persistent loopback writer, daemon lifecycle, threads, D-Bus sequence |
 | [setup/loopback.md](setup/loopback.md) | Creating the "Omarchy Broadcast" v4l2loopback virtual camera: `modprobe` options, reload, and why `exclusive_caps=1` |
+| [setup/daemon.md](setup/daemon.md) | Installing and running `oma-broadcastd` as a systemd user service: `cargo install`, unit and optional D-Bus activation and WirePlumber drop-in files, configuration and state files, reload, logs |
+| [dbus-api.md](dbus-api.md) | Reference for `br.com.dias.OmaBroadcast1`: states, properties, methods, errors, the `Stats` signal, activation without starting the daemon, `busctl` and `gdbus` examples |
+| [cli-json.md](cli-json.md) | The `oma-broadcast` commands, exit codes and the JSON line format (`status`, `cameras`, `watch --json`) for clients that cannot speak D-Bus |
+| [config.example.toml](config.example.toml) | Every `config.toml` key with its default, as a commented example |
 | [setup/maxine.md](setup/maxine.md) | Step-by-step NVIDIA Maxine VFX SDK setup on Arch/Omarchy: NGC access and key, user-prefix install under `$MAXINE_VFX_ROOT`, os-release override, verification with the probe, troubleshooting, licence notes, uninstall |
 | [research/maxine-linux.md](research/maxine-linux.md) | Technical notes on Maxine on Linux: distribution, licence, versions, Blackwell support, features, API shape, existing projects |
 | [benchmarks/passthrough.md](benchmarks/passthrough.md) | Passthrough and roundtrip results: pipeline, latency method, output format, camera frame-rate caveat, teardown finding; raw results are the JSON files alongside |
 | [benchmarks/ingest-paths.md](benchmarks/ingest-paths.md) | Camera and ingest-path results: GPU-direct, CPU convert and CPU decode cost on two cameras, with variance under load |
 | [benchmarks/io-split.md](benchmarks/io-split.md) | Ingest / Output split results: output frame rate over 10 minutes, live camera switching with an external consumer, crop versus letterbox, cost per ingest path against the single pipeline, and the phase-locked clock with the held frame at a switch; raw results are the JSON files alongside |
-| [testing.md](testing.md) | Unit tests, hardware tests (environment variables), the `obc-bench` flags and the manual OBS/Chrome test, including camera switching |
+| [testing.md](testing.md) | Unit tests, hardware tests (environment variables), the daemon, CLI and `obc-ipc` tests, measured daemon figures, discovery by PipeWire, the `obc-bench` flags and the manual OBS/Chrome and daemon tests |
 | [benchmarks/dgpu-idle.md](benchmarks/dgpu-idle.md) | dGPU idle check after teardown: findings and the quiet-desktop procedure |
 | `../scripts/dgpu-idle-check.sh` | Reads sysfs and `/proc` only (never NVML) to report whether the dGPU runtime-suspends and who holds it awake |
 | `../tools/maxine-probe/` | Standalone C probe that checks a Maxine SDK installation; see its README |
@@ -29,5 +33,6 @@
 | [0008](adr/0008-cpu-ingest-adapters.md) | CPU ingest adapters for MJPEG and YUYV/UYVY |
 | [0009](adr/0009-ingest-process-output.md) | Ingest, Process and Output stages joined by a latest-frame slot; the output has a fixed contract and its own clock |
 | [0010](adr/0010-phase-locked-output-clock.md) | The output clock locks the phase of its ticks to the camera (timestamps stay on the exact grid), a source switch holds the last frame, and the output queue holds at most 3 frames |
+| [0011](adr/0011-daemon-lifecycle-and-dbus-api.md) | Daemon lifecycle (`off`/`idle`/`starting`/`active`/`error`), a persistent loopback writer, consumer detection, runtime state file, and the D-Bus v1 API; amends 0006 and 0007 |
 
 Conventions: diagrams are mermaid. New decisions get the next ADR number; superseded ADRs keep their file and change their status line.

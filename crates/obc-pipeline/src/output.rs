@@ -9,7 +9,9 @@
 //!   ! capsfilter  <contract caps>, canonical label      system memory
 //!   ! capssetter  colorimetry=<sink label>              relabel only
 //!   ! capsfilter  <contract caps>
-//!   ! v4l2sink device=<loopback> sync=false             (or fakesink)
+//!   ! v4l2sink device=<loopback> sync=false             (or fakesink, or an
+//!                                                         appsink forwarding to
+//!                                                         a loopback writer)
 //! ```
 //!
 //! The caps are fixed when the pipeline is built and never change, whatever
@@ -67,6 +69,14 @@
 //! `cudaconvert`, a black placeholder made on the CPU, and no CUDA context.
 //! The Process stage must then be empty.
 //!
+//! **Forwarding to a loopback writer.** With [`OutputSink::Writer`] the
+//! chain is the same up to and including the relabel and the contract
+//! capsfilter, and ends in an `appsink` whose callback hands every buffer
+//! to the writer ([`crate::loopback::WriterHandle::push`]) by reference: the
+//! writer, not this output, owns the device, restamps the frames and runs
+//! the loopback check ([`crate::loopback`]). The writer's contract must be
+//! this output's.
+//!
 //! **Loopback check.** [`Output::start`] compares what the loopback accepts
 //! with the contract once, before streaming
 //! ([`crate::pipeline::MediaPipeline::prepare`]).
@@ -93,6 +103,7 @@ use serde::Serialize;
 use crate::clock::{Latest, Pacer, PacerConfig, PacerCounts, PhaseLockConfig, Step, TickKind};
 use crate::frame::{Canonical, Frame, FrameMemory, FrameWriter};
 use crate::ingest::CUDA_CONTEXT_TYPE;
+use crate::loopback::WriterHandle;
 use crate::pipeline::{
     MediaPipeline, PipelineError, add_linked, capsfilter, cuda_caps, make, names,
 };
@@ -107,6 +118,9 @@ pub enum OutputSink {
     /// `fakesink`: frames are downloaded and discarded (tests, measurements
     /// without a loopback).
     Fake,
+    /// An `appsink` forwarding every frame to a persistent loopback writer
+    /// of the same contract (see the module docs).
+    Writer(WriterHandle),
 }
 
 /// Everything needed to build the output pipeline.
@@ -268,23 +282,23 @@ struct Counters {
 
 /// A stop flag the clock thread sleeps on.
 #[derive(Debug, Default)]
-struct StopSignal {
+pub(crate) struct StopSignal {
     stopped: Mutex<bool>,
     cv: Condvar,
 }
 
 impl StopSignal {
-    fn set(&self) {
+    pub(crate) fn set(&self) {
         *self.stopped.lock().unwrap_or_else(|e| e.into_inner()) = true;
         self.cv.notify_all();
     }
 
-    fn is_set(&self) -> bool {
+    pub(crate) fn is_set(&self) -> bool {
         *self.stopped.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Sleeps until `deadline` or until stopped; returns whether stopped.
-    fn wait_until(&self, deadline: Instant) -> bool {
+    pub(crate) fn wait_until(&self, deadline: Instant) -> bool {
         let mut stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if *stopped {
@@ -336,7 +350,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 /// Runs `body`, catching a panic: its message is stored in `failure`.
-fn run_recording_panic(body: impl FnOnce(), failure: &Mutex<Option<String>>) {
+pub(crate) fn run_recording_panic(body: impl FnOnce(), failure: &Mutex<Option<String>>) {
     if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(body)) {
         *failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(panic_message(&*payload));
     }
@@ -470,6 +484,14 @@ impl Output {
             .validate()
             .map_err(|e| PipelineError::Caps(e.to_string()))?;
         check_sink_range(&contract, &cfg.sink)?;
+        if let OutputSink::Writer(writer) = &cfg.sink
+            && writer.contract() != &contract
+        {
+            return Err(PipelineError::Caps(format!(
+                "the loopback writer carries {}, not this output's {contract}",
+                writer.contract()
+            )));
+        }
         if memory == FrameMemory::System && cfg.process != GpuStage::Passthrough {
             return Err(PipelineError::Cuda(format!(
                 "the {} process stage needs frames in CUDA memory",
@@ -544,6 +566,11 @@ impl Output {
                 sink.set_property("sync", false);
                 sink.set_property("enable-last-sample", false);
                 chain.push(sink);
+                None
+            }
+            // The writer checks the loopback; this pipeline has none.
+            OutputSink::Writer(writer) => {
+                chain.push(forward_sink(LOOPBACK, writer.clone()));
                 None
             }
         };
@@ -956,6 +983,35 @@ impl ClockContext {
             }
         }
     }
+}
+
+/// The `appsink` ending an output that forwards to a loopback writer: every
+/// buffer is handed to `writer` by reference (the sample is released first,
+/// so the writer's metadata change copies nothing it does not have to).
+/// Unsynchronised, no last sample kept.
+fn forward_sink(name: &str, writer: WriterHandle) -> gst::Element {
+    let sink = gst_app::AppSink::builder()
+        .name(name)
+        .sync(false)
+        .max_buffers(1)
+        .leaky_type(gst_app::AppLeakyType::Downstream)
+        .wait_on_eos(false)
+        .enable_last_sample(false)
+        .build();
+    sink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Flushing)?;
+                let buffer = sample.buffer_owned();
+                drop(sample);
+                if let Some(buffer) = buffer {
+                    writer.push(buffer);
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+    sink.upcast()
 }
 
 /// NV12 layout as `GstVideoInfo` computes it for even sizes: rows padded to

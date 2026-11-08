@@ -54,9 +54,13 @@ pub mod names {
     /// Output: `capssetter` giving the frames the sink's colour label.
     pub const RELABEL: &str = "relabel";
     pub const OUT_CAPS: &str = "out_caps";
-    /// The output pipeline's sink: `v4l2sink`, or `fakesink` without a
-    /// loopback device.
+    /// The output pipeline's sink: `v4l2sink`, `fakesink` without a
+    /// loopback device, or the `appsink` forwarding to a loopback writer;
+    /// also the loopback writer's sink (`v4l2sink` or `fakesink`).
     pub const LOOPBACK: &str = "loopback";
+    /// Loopback writer: the `appsrc` placeholders and forwarded frames are
+    /// pushed into.
+    pub const WRITER_SRC: &str = "writer_src";
 
     /// Ingest: `videocrop` (crop-to-fill policy only).
     pub const CROP: &str = "crop";
