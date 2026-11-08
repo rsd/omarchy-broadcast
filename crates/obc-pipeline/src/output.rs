@@ -233,6 +233,10 @@ pub struct EmitInfo {
     pub grid_at: Instant,
     /// The clock's phase offset when the tick was scheduled.
     pub phase_offset_ns: i64,
+    /// The phase lock was acquired and engaged ([`OutputCounts::phase_locked`])
+    /// when the tick was emitted: it follows the input from about this tick
+    /// on, where earlier ticks ran on the free-running grid.
+    pub phase_locked: bool,
     /// `appsrc` accepted the buffer.
     pub pushed: bool,
     /// Buffers queued in `appsrc` right after the push.
@@ -1061,6 +1065,7 @@ impl ClockContext {
                     emitted_at,
                     grid_at: origin + Duration::from_nanos(pts_ns),
                     phase_offset_ns,
+                    phase_locked: n.phase_locked,
                     pushed,
                     queue_level,
                 });
