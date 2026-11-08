@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use obc_core::config::EffectConfig;
 use obc_core::{AspectPolicy, ModeRequest, OutputContract, SinkSelector};
 use obc_ipc::Stats;
 
@@ -29,6 +30,37 @@ pub struct SessionParams {
     pub input_gap: Duration,
     /// Pin the camera's exposure so it cannot lower the frame rate.
     pub fixed_framerate: bool,
+    /// The effect the output starts with (the effective settings: the
+    /// state file's over the config's). The output can always change it
+    /// later ([`MediaBackend::set_effect`]).
+    pub effect: EffectConfig,
+}
+
+/// The state of the running session's effect.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EffectStatus {
+    /// No effect is requested: frames pass through.
+    Off,
+    /// The effect's models (or its background image) are loading; the
+    /// output shows black frames, or the previous effect, meanwhile.
+    Loading,
+    /// The effect processes every frame.
+    Ready,
+    /// The effect failed; the output shows what `effect.on_failure` says.
+    Failed(String),
+}
+
+/// What the running session's effect reports when polled.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectReport {
+    pub status: EffectStatus,
+    /// Duration of the last load (models and first run), in milliseconds.
+    pub load_ms: Option<f64>,
+    /// The last load reused the models already loaded (a switch between
+    /// blur and replace).
+    pub reused: bool,
+    /// Median GPU time of one processed frame, in milliseconds.
+    pub gpu_ms_p50: Option<f64>,
 }
 
 /// Why a running session failed.
@@ -93,4 +125,20 @@ pub trait MediaBackend: Send + 'static {
     /// The statistics since the previous call (or since the session
     /// started).
     fn take_stats(&mut self) -> Stats;
+
+    /// Whether `effect` could run now, with the reason if not: the
+    /// inference backend is present (no model is loaded and no CUDA
+    /// context created to find out) and, for `replace`, the background
+    /// image is a readable regular file within the size limit. `none` is
+    /// always available.
+    fn effect_available(&mut self, effect: &EffectConfig) -> Result<(), String>;
+
+    /// Applies `effect` to the running session at once, without restarting
+    /// it (a load continues in the background, reported by
+    /// [`Self::effect_report`]); after a failure it retries even when
+    /// nothing changed. Without a session it does nothing.
+    fn set_effect(&mut self, effect: &EffectConfig) -> Result<(), String>;
+
+    /// The running session's effect (`None`: no session).
+    fn effect_report(&mut self) -> Option<EffectReport>;
 }

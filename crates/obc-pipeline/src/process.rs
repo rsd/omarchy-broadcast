@@ -2,10 +2,12 @@
 //! head of the output pipeline (`docs/adr/0009-ingest-process-output.md`).
 //!
 //! Its input and output are canonical frames (NV12 in CUDA memory, at the
-//! contract size, with the contract's colour label). It is empty by default;
-//! [`GpuStage::Roundtrip`] stands in for an effect that works on BGR: it
-//! converts to BGR and back with `cudaconvert`, in CUDA memory, so its cost
-//! is the conversion cost such an effect pays.
+//! contract size, with the contract's colour label). It is empty by default.
+//! The effects themselves are the `obceffect` element ([`crate::effect`],
+//! inserted when `OutputConfig::effect` is set). [`GpuStage::Roundtrip`]
+//! stands in for an effect that works on BGR: it converts to BGR and back
+//! with `cudaconvert`, in CUDA memory, so its cost is the conversion cost
+//! such an effect pays; it does not combine with the effect element.
 
 use std::fmt;
 use std::str::FromStr;

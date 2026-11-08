@@ -78,7 +78,7 @@ oma-broadcast status                       # shows Error: if the file was reject
 
 `busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast br.com.dias.OmaBroadcast1 ReloadConfig` does the same and returns the reason on failure. An invalid file is rejected as a whole: the previous configuration stays in force and the `Error` property names the file, line and key.
 
-Settings changed while the daemon runs (`oma-broadcast on` / `off` and the camera selection) are kept in a separate state file, `~/.local/state/oma-broadcast/state.toml` (`$XDG_STATE_HOME/oma-broadcast/state.toml`), so that `config.toml` keeps its comments and layout. The state file is written by the daemon. If the state file cannot be read, the daemon starts `off` and says why in `Error`: privacy fails closed.
+Settings changed while the daemon runs (`oma-broadcast on` / `off`, the camera selection and the video effect with its blur strength and background image) are kept in a separate state file, `~/.local/state/oma-broadcast/state.toml` (`$XDG_STATE_HOME/oma-broadcast/state.toml`), so that `config.toml` keeps its comments and layout. The state file is written by the daemon. If the state file cannot be read, the daemon starts `off` and says why in `Error`: privacy fails closed.
 
 The paths can be overridden with `--config PATH` and `--state PATH` in a copy of the unit file.
 

@@ -18,7 +18,7 @@ flowchart LR
         IPC["D-Bus interface<br/>zbus · br.com.dias.OmaBroadcast1"]
         CTL["Controller thread<br/>lifecycle state machine"]
         CFG["Config (read-only)<br/>~/.config/oma-broadcast/config.toml<br/>reload on SIGHUP / ReloadConfig"]
-        ST["Runtime state<br/>~/.local/state/oma-broadcast/state.toml<br/>Enabled, selected camera"]
+        ST["Runtime state<br/>~/.local/state/oma-broadcast/state.toml<br/>Enabled, selected camera,<br/>effect settings"]
         WATCH["Consumer watcher<br/>inotify on the loopback node<br/>+ /proc/PID/fd count"]
         HOT["Hotplug watcher<br/>inotify on /dev"]
         subgraph WR["Loopback writer (lives as long as the daemon, CPU only)"]
@@ -34,7 +34,7 @@ flowchart LR
             end
             SLOT[("latest-frame slot")]
             subgraph OUTP["Output pipeline (fixed contract, own clock)"]
-                FX["Process: obc effects<br/>blur / replace"] --> DOWN["convert → contract format<br/>download + relabel"] --> OSINK["appsink"]
+                FX["Process: obceffect<br/>none / blur / replace"] --> DOWN["convert → contract format<br/>download + relabel"] --> OSINK["appsink"]
             end
             CS --> SLOT --> FX
         end
@@ -78,7 +78,7 @@ The daemon owns one **loopback writer** for its whole life ([ADR-0011](adr/0011-
 
 **Hotplug.** Video nodes appearing in or disappearing from `/dev` trigger a rescan of the camera list. If the streaming camera fails or disappears, the session switches to the next camera in order, with the hold of ADR-0010; if none is left, the state is `error`. A camera that appears while another one streams does not take over.
 
-**Configuration and state.** `config.toml` holds what the user decides and is never written by the daemon; it is re-read on `SIGHUP` or `ReloadConfig()`, and an invalid file is rejected as a whole (the previous one stays in force and `Error` says why). Changes made at run time (`Enabled` and the selected camera) go to a separate `state.toml`, written atomically. A state file that cannot be parsed starts the daemon `off` (privacy fails closed). The keys are in [config.example.toml](config.example.toml).
+**Configuration and state.** `config.toml` holds what the user decides and is never written by the daemon; it is re-read on `SIGHUP` or `ReloadConfig()`, and an invalid file is rejected as a whole (the previous one stays in force and `Error` says why). Changes made at run time (`Enabled`, the selected camera, and the effect with its blur strength and background image) go to a separate `state.toml`, written atomically. A state file that cannot be parsed starts the daemon `off` (privacy fails closed). The keys are in [config.example.toml](config.example.toml).
 
 ## 2. Stage and caps model
 
@@ -103,7 +103,7 @@ For example, a camera offering only MJPEG 1080p30 and YUYV up to 960x540@15, ask
 
 **Ingest, Process, Output.** The stream is split into three stages ([ADR-0009](adr/0009-ingest-process-output.md)):
 - **Ingest** (per source) crops and scales every camera to the **canonical frame**: `video/x-raw(memory:CUDAMemory), format=NV12` at the processing size (the output size for now), with the colour label of the contract's range (`2:4:5:1` limited, `1:4:5:1` full). The default aspect policy is a centre crop to fill the frame; letterbox is an option.
-- **Process** applies the effect chain to canonical frames. Effects do not know which source fed them or which sink they feed. An effect that needs another format gets converters inserted around it in CUDA memory.
+- **Process** holds one element, `obceffect`, which applies the video effect (`none`, `blur` or `replace`) to canonical frames. It is always present in the daemon's output pipeline, with the canonical caps on both pads, so choosing another effect never renegotiates caps or relinks the pipeline. With `none` it is in passthrough: the buffer goes on untouched, with no copy and no CUDA call. It does not know which source fed it or which sink it feeds. The element is described below ([Effects](#effects)) and decided in [ADR-0012](adr/0012-video-effects-and-maxine-backend.md).
 - **Output** (per sink) holds a fixed contract of format (NV12 or I420), size, frame rate and colour range (default NV12 1920x1080@30, limited range) and runs on its own clock: it repeats the latest frame when the source is slower, drops frames when it is faster, and sends a black placeholder after a gap without input (default 500 ms). The clock's timestamps sit on an exact grid of the contract rate, while the instant each tick is emitted is locked to the camera's frames, a small margin after each expected arrival and never later than the timestamp ([ADR-0010](adr/0010-phase-locked-output-clock.md)), so a frame waits in the slot only that margin plus the camera's arrival jitter. The source can be switched while the output keeps running: the output holds the previous camera's last frame until the new camera's first frame (at most 3 s), so a switch shows no black frame ([benchmarks/io-split.md](benchmarks/io-split.md)). The output's `appsrc` queues at most 3 frames, so a slow consumer gets recent frames, not a backlog.
 - **v4l2loopback constraints.** In the daemon the persistent loopback writer ([section 1](#1-component-overview)) owns the device and the output ends in an `appsink` whose caps equal the writer's; the constraints below apply to the writer and to `obc-bench`, which writes to the device directly. The device carries no colour description: it reports every stream as BT.601 (`2:4:5:4`) and, while a consumer holds it, refuses any other label. The output therefore relabels frames `2:4:5:4` after download (labels only, no pixel change), and a **full-range contract is refused** for a loopback sink, because consumers would read it as limited. At start the output compares the device's accepted caps with the contract: if the device is held by a consumer in another format, size or rate (its caps are fixed), the error says so (`LoopbackFormatHeld`); a colour label is compared by meaning. Any other mismatch is a generic refusal.
 
@@ -128,8 +128,8 @@ flowchart LR
     subgraph Output["Output pipeline — fixed contract, lives for the whole stream"]
         CLK["output clock<br/>one tick per contract period,<br/>phase locked to the camera:<br/>fresh / repeat / placeholder;<br/>holds the last frame during a switch"]
         SRC["appsrc<br/>canonical caps, at most 3 queued<br/>(oldest dropped)"]
-        subgraph Process["Process — effect chain (empty in this step)"]
-            E1["obcblur / obcreplace<br/>(converters around effects<br/>that need another format)"]
+        subgraph Process["Process — one element, always present"]
+            E1["obceffect<br/>none: passthrough<br/>blur / replace: new buffer,<br/>own CUDA stream"]
         end
         CONV["cudaconvert<br/>(only if the contract format is not NV12)"]
         DL["cudadownload<br/>(the only GPU→CPU copy)"]
@@ -164,9 +164,28 @@ sequenceDiagram
 
 These are the extension points, and each is a trait or element boundary:
 - **New source:** another camera or a screen capture. It is a new source element, and adapters cover format gaps (for example the MJPEG decode adapter).
-- **New effect:** a new element in the Process stage that accepts canonical CUDAMemory NV12 (or gets converters around it), backed by any `InferenceBackend`.
-- **New backend:** TensorRT, CPU, or another vendor. It is a new `InferenceBackend` impl, and the effect elements are unchanged.
+- **New effect:** a new effect kind in `obceffect`, which accepts and produces canonical CUDAMemory NV12 and talks only to the `InferenceBackend` trait.
+- **New backend:** TensorRT, CPU, or another vendor. It is a new `InferenceBackend` impl, and the `obceffect` element is unchanged. A backend that does not run on CUDA would add a host-memory frame variant to the trait, around which the element downloads and uploads ([ADR-0012](adr/0012-video-effects-and-maxine-backend.md)).
 - **New sink:** PipeWire or recording. It is a new output with its own contract, fed after the Process stage.
+
+### Effects
+
+The Process stage is the `obceffect` element (crate `gst-obc`, registered in-process). The effect, the blur strength and the background image are element properties that can change while the pipeline plays.
+
+```mermaid
+flowchart LR
+    SRC["appsrc<br/>canonical NV12, CUDAMemory"] --> FX["obceffect"]
+    FX --> DL["cudadownload → relabel → appsink"]
+    FX -. "InferenceBackend trait" .-> BE["obc-backend-maxine<br/>NV12 → BGR · mask · blur / composite · BGR → NV12<br/>(dlopen of the SDK, one CUDA stream)"]
+    BG["background image<br/>PNG / JPEG, decoded once"] -.-> FX
+```
+
+- **The seam.** `obceffect` talks to the `InferenceBackend` trait of the crate `obc-backend`, never to Maxine. A backend factory says whether the backend is available without loading anything; a backend instance loads the models for one effect, processes one NV12 device frame into another NV12 device frame, and unloads. `obc-backend-maxine` is the first implementation. It opens the SDK, the CUDA driver library and GStreamer's CUDA library with `dlopen` at run time, so the workspace builds, and its default tests pass, on a machine without the SDK; the backend then reports itself unavailable with the reason.
+- **Frames.** With an effect, the element reads the input and writes a new buffer from a CUDA pool, never modifying the input: the output clock pushes the same slot buffer again when the camera is slower than the contract. All the GPU work (colour conversion to BGR, the green-screen mask, the blur or the composite over the background image, conversion back to NV12) runs on one CUDA stream the element owns, in the CUDA context that GStreamer's CUDA elements share. The element waits for its stream before it pushes, so the input can go back to the ingest pool.
+- **Model lifecycle.** Models are loaded only while an effect other than `none` is requested and the stream is `starting` or `active`; they live in the element, the element in the output pipeline, and that pipeline exists only in those states. Entering `idle`, `off` or `error` stops the pipeline, which unloads the models before the CUDA context is released, so the GPU holds nothing then (section 3). Selecting `none` while streaming unloads them as well. A load runs on a worker thread of the element, so the streaming thread never waits for it; switching between `blur` and `replace` keeps the green-screen model loaded and takes milliseconds.
+- **Warm-up and privacy.** The raw camera image is never shown while an effect is requested. From `none` to an effect, the element outputs black canonical frames until the effect is ready (a fraction of a second, up to a few seconds on a cold cache). From one effect to another, the previous effect keeps running until the new one is ready. From an effect to `none`, the raw image is shown at once. If the effect cannot run, the daemon either stops the stream and shows black (`on_failure = "black"`, the default) or lets the raw image through (`"none"`); see [dbus-api.md](dbus-api.md#video-effects).
+- **The SDK is an external, per-user install.** The Maxine SDK may not be distributed with this project; users install it themselves ([setup/maxine.md](setup/maxine.md)), and on a distribution the SDK does not list, the daemon runs with a small `LD_PRELOAD` library that shows it a replacement `/etc/os-release` (ADR-0012 gives the reasons for this mechanism and for not using a namespace).
+- **Cost.** A small amount of GPU time and added latency per frame; none of the Process stage's cost applies with `none`. Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence; reproduce locally with `obc-bench` (see [testing.md](testing.md)).
 
 ## 3. Lifecycle
 
@@ -200,6 +219,7 @@ stateDiagram-v2
 - **Grace period.** `active` includes the time after the last consumer closes: the stream keeps running for `idle_grace` (default 5 s) with `Consumers` = 0, and a consumer that returns in that time finds it running. This replaces ADR-0006's separate "Draining" state.
 - **Source changes** (`SelectCamera`, `NextCamera`, a camera failure) rebuild only the ingest pipeline; the output keeps its contract and clock and holds the last frame meanwhile (section 2). The state stays `active`.
 - **`off`** is the privacy state: the camera is closed, so its LED is off. The writer keeps feeding black frames to any application that holds the device.
+- **Effects** follow the same lifecycle: the models exist only in `starting` and `active`, and are unloaded before the CUDA context goes. An effect that cannot run puts the daemon in `error` with the reason (or, with `on_failure = "none"`, leaves it `active` with the reason in `Error`).
 - **`error`** has a cause in the `Error` property. The daemon leaves it when the cause can have changed (camera set change, a control method, a reload).
 
 ## 4. D-Bus sequence: an application opens the virtual camera

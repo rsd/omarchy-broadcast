@@ -5,10 +5,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use obc_core::{ModeRequest, OutputContract, SinkSelector};
+use obc_core::config::EffectConfig;
+use obc_core::{EffectMode, ModeRequest, OutputContract, SinkSelector};
 use obc_ipc::Stats;
 
-use super::{Failure, MediaBackend, SessionParams};
+use super::{EffectReport, EffectStatus, Failure, MediaBackend, SessionParams};
 use crate::camera::Camera;
 
 /// The fake media world.
@@ -49,6 +50,22 @@ pub struct World {
     /// Scans give every camera the requested size and rate (as a camera
     /// offering every mode would).
     pub follow_request: bool,
+    /// `effect_available` fails with this for any effect but `none`.
+    pub effect_unavailable: Option<String>,
+    pub effect_probes: u32,
+    /// An effect applied (at start or by `set_effect`) fails with this.
+    pub effect_fail: Option<String>,
+    /// An effect applied stays `Loading` (the test sets the status) rather
+    /// than becoming `Ready` at once.
+    pub effect_slow: bool,
+    /// What `effect_report` reports while a session runs.
+    pub effect_status: EffectStatus,
+    /// The effect the running session applies.
+    pub effect: Option<EffectConfig>,
+    /// Every `set_effect` on a running session, in order.
+    pub effect_sets: Vec<EffectConfig>,
+    /// `set_effect` fails with this (once).
+    pub fail_set_effect: Option<String>,
 }
 
 impl Default for World {
@@ -79,6 +96,14 @@ impl Default for World {
             stats_taken: 0,
             scans: 0,
             follow_request: false,
+            effect_unavailable: None,
+            effect_probes: 0,
+            effect_fail: None,
+            effect_slow: false,
+            effect_status: EffectStatus::Off,
+            effect: None,
+            effect_sets: Vec::new(),
+            fail_set_effect: None,
         }
     }
 }
@@ -87,6 +112,21 @@ impl World {
     /// The camera the session streams from.
     pub fn streaming(&self) -> Option<&str> {
         self.session.as_ref().and_then(|(_, c)| c.as_deref())
+    }
+
+    /// The running session applies `effect`, as the effect element would:
+    /// `none` is off at once, an effect loads (or fails).
+    fn apply_effect(&mut self, effect: &EffectConfig) {
+        self.effect = Some(effect.clone());
+        self.effect_status = if effect.mode == EffectMode::None {
+            EffectStatus::Off
+        } else if let Some(r) = &self.effect_fail {
+            EffectStatus::Failed(r.clone())
+        } else if self.effect_slow {
+            EffectStatus::Loading
+        } else {
+            EffectStatus::Ready
+        };
     }
 }
 
@@ -193,6 +233,7 @@ impl MediaBackend for FakeBackend {
         }
         w.session = Some((params.clone(), None));
         w.session_starts += 1;
+        w.apply_effect(&params.effect);
         Ok(())
     }
 
@@ -205,6 +246,9 @@ impl MediaBackend for FakeBackend {
         let mut w = self.world();
         if w.session.take().is_some() {
             w.session_stops += 1;
+            // The models go with the session.
+            w.effect = None;
+            w.effect_status = EffectStatus::Off;
         }
     }
 
@@ -226,5 +270,38 @@ impl MediaBackend for FakeBackend {
         let mut w = self.world();
         w.stats_taken += 1;
         w.stats
+    }
+
+    fn effect_available(&mut self, effect: &EffectConfig) -> Result<(), String> {
+        let mut w = self.world();
+        w.effect_probes += 1;
+        match &w.effect_unavailable {
+            Some(r) if effect.mode != EffectMode::None => Err(r.clone()),
+            _ => Ok(()),
+        }
+    }
+
+    fn set_effect(&mut self, effect: &EffectConfig) -> Result<(), String> {
+        let mut w = self.world();
+        if w.session.is_none() {
+            return Ok(());
+        }
+        w.effect_sets.push(effect.clone());
+        if let Some(e) = w.fail_set_effect.take() {
+            return Err(e);
+        }
+        w.apply_effect(effect);
+        Ok(())
+    }
+
+    fn effect_report(&mut self) -> Option<EffectReport> {
+        let w = self.world();
+        w.session.as_ref()?;
+        Some(EffectReport {
+            status: w.effect_status.clone(),
+            load_ms: Some(120.0),
+            reused: false,
+            gpu_ms_p50: Some(1.2),
+        })
     }
 }

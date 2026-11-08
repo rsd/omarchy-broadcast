@@ -1,11 +1,27 @@
 [package]
 name = "gst-obc"
-description = "GStreamer plugin with the oma-broadcast effect elements"
+description = "GStreamer effect element of oma-broadcast (obceffect), registered in-process"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+gst = { workspace = true }
+gst-base = { workspace = true }
+gst-video = { workspace = true }
+# Background image decoding (appsink at the end of a decode pipeline).
+gst-app = { workspace = true }
+obc-backend = { workspace = true }
+obc-gpu = { workspace = true }
+# GStreamer's CUDA library is opened at run time, never linked (ADR-0012).
+libloading = { workspace = true }
+# Opening the background image without blocking on a FIFO or a device.
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

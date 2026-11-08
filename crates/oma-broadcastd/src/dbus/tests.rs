@@ -155,6 +155,9 @@ fn render(v: &Variant<'_>) -> String {
     if let Ok(b) = bool::try_from(v) {
         return b.to_string();
     }
+    if let Ok(d) = f64::try_from(v) {
+        return d.to_string();
+    }
     format!("{v:?}")
 }
 
@@ -225,11 +228,13 @@ async fn every_property_reads_through_the_proxy() {
             active_camera: "pci-b".into(),
             output_mode: "NV12 1920x1080@30".into(),
             effect: "none".into(),
+            blur_strength: 0.5,
+            background_image: String::new(),
             consumers: 0,
             interface_revision: INTERFACE_REVISION,
         }
     );
-    // GetAll returns the same nine properties.
+    // GetAll returns the same eleven properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
         .destination(obc_ipc::BUS_NAME)
         .path(OBJECT_PATH)
@@ -248,6 +253,8 @@ async fn every_property_reads_through_the_proxy() {
         keys,
         [
             "ActiveCamera",
+            "BackgroundImage",
+            "BlurStrength",
             "Cameras",
             "Consumers",
             "Effect",
@@ -274,6 +281,12 @@ async fn every_property_reads_through_the_proxy() {
         "<method name=\"SelectCamera\">",
         "<method name=\"NextCamera\">",
         "<method name=\"ReloadConfig\">",
+        "<method name=\"SetEffect\">",
+        "<method name=\"SetBlurStrength\">",
+        "<method name=\"SetBackgroundImage\">",
+        "<property name=\"BlurStrength\" type=\"d\" access=\"read\"",
+        "<property name=\"BackgroundImage\" type=\"s\" access=\"read\"",
+        "<property name=\"Effect\" type=\"s\" access=\"read\"",
         "<signal name=\"Stats\">",
         "<property name=\"Cameras\" type=\"a(sss)\" access=\"read\"",
         "<property name=\"State\" type=\"s\" access=\"read\"",
@@ -543,4 +556,127 @@ async fn set_enabled_false_during_a_slow_start_opens_no_camera() {
         assert!(w.session.is_none());
     }
     assert!(!rig.published.disable_pending(), "the request was handled");
+}
+
+/// The `InvalidArgument` reply of `res`, checked by name; its message.
+fn invalid_argument(res: Result<(), IpcError>) -> String {
+    match res {
+        Err(e @ IpcError::InvalidArgument(_)) => {
+            assert_eq!(
+                zbus::DBusError::name(&e).as_str(),
+                "br.com.dias.OmaBroadcast1.Error.InvalidArgument"
+            );
+            e.message()
+        }
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn effect_methods_properties_and_their_errors() {
+    let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    let seen = rig.record_changes().await;
+    let image = rig._dir.path().join("background.png");
+    fs::write(&image, b"not decoded here").unwrap();
+    let image = image.display().to_string();
+
+    // Each method replies after the property changed.
+    within("SetBlurStrength", proxy.set_blur_strength(0.75))
+        .await
+        .unwrap();
+    assert_eq!(proxy.blur_strength().await.unwrap(), 0.75);
+    within("SetEffect", proxy.set_effect("blur")).await.unwrap();
+    assert_eq!(proxy.effect().await.unwrap(), "blur");
+    within("SetBackgroundImage", proxy.set_background_image(&image))
+        .await
+        .unwrap();
+    assert_eq!(proxy.background_image().await.unwrap(), image);
+    within("SetEffect", proxy.set_effect("replace"))
+        .await
+        .unwrap();
+    assert_eq!(proxy.effect().await.unwrap(), "replace");
+    until("the changes", &seen, |s| {
+        s.iter().any(|e| e == "Effect=replace")
+    })
+    .await;
+    let effect_changes: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            e.starts_with("Effect=")
+                || e.starts_with("BlurStrength=")
+                || e.starts_with("BackgroundImage=")
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        effect_changes,
+        [
+            "BlurStrength=0.75".to_string(),
+            "Effect=blur".to_string(),
+            format!("BackgroundImage={image}"),
+            "Effect=replace".to_string(),
+        ]
+    );
+    // Persisted.
+    let state = fs::read_to_string(&rig.paths.state).unwrap();
+    assert!(state.contains("effect = \"replace\""), "{state}");
+    assert!(state.contains("blur_strength = 0.75"), "{state}");
+
+    // The errors: nothing changes.
+    let msg = invalid_argument(within("SetEffect", proxy.set_effect("sparkle")).await);
+    assert!(msg.contains("unknown effect \"sparkle\""), "{msg}");
+    for bad in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
+        let msg = invalid_argument(within("SetBlurStrength", proxy.set_blur_strength(bad)).await);
+        assert!(msg.contains("outside 0 to 1"), "{bad}: {msg}");
+    }
+    for (bad, why) in [
+        ("relative.png", "not absolute"),
+        ("/nowhere/at/all.png", "unreadable"),
+        ("/", "not a regular file"),
+    ] {
+        let msg =
+            invalid_argument(within("SetBackgroundImage", proxy.set_background_image(bad)).await);
+        assert!(msg.contains(why), "{bad}: {msg}");
+    }
+    // Clearing the image while replace is selected is refused; after
+    // another effect it is accepted, and replace then is refused.
+    let msg = invalid_argument(within("SetBackgroundImage", proxy.set_background_image("")).await);
+    assert!(msg.contains("select another effect"), "{msg}");
+    within("SetEffect", proxy.set_effect("none")).await.unwrap();
+    within("SetBackgroundImage", proxy.set_background_image(""))
+        .await
+        .unwrap();
+    assert_eq!(proxy.background_image().await.unwrap(), "");
+    let msg = invalid_argument(within("SetEffect", proxy.set_effect("replace")).await);
+    assert!(msg.contains("needs a background image"), "{msg}");
+    assert_eq!(proxy.effect().await.unwrap(), "none");
+    assert_eq!(proxy.blur_strength().await.unwrap(), 0.75);
+    assert_eq!(proxy.state().await.unwrap(), State::Idle);
+
+    // While active: an effect failure with on_failure black is the error
+    // state, with the reason in Error; selecting the effect again retries.
+    rig.world().effect_fail = Some("the model did not load".into());
+    rig.consumers(1);
+    wait_state(&proxy, State::Active).await;
+    within("SetEffect", proxy.set_effect("blur")).await.unwrap();
+    wait_state(&proxy, State::Error).await;
+    assert_eq!(
+        proxy.error().await.unwrap(),
+        "effect blur unavailable: the model did not load"
+    );
+    assert!(rig.world().session.is_none(), "the camera is closed");
+    rig.world().effect_fail = None;
+    within("SetEffect", proxy.set_effect("blur")).await.unwrap();
+    wait_state(&proxy, State::Active).await;
+    assert_eq!(proxy.error().await.unwrap(), "");
+    until("the error state and its recovery", &seen, |s| {
+        s.iter()
+            .any(|e| e == "Error=effect blur unavailable: the model did not load")
+            && s.last().is_some_and(|e| e == "State=active")
+    })
+    .await;
 }

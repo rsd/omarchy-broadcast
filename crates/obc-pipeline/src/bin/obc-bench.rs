@@ -35,6 +35,18 @@
 //! output by its PTS sequence, its frame count and the deviation of its
 //! arrivals from the PTS grid (see [`FpsSection`]).
 //!
+//! Effects (`docs/adr/0012-video-effects-and-maxine-backend.md`):
+//! `--effect none|blur|replace` inserts the `obceffect` element in the
+//! Process stage (`none` in passthrough, to measure the element's own cost;
+//! without `--effect` there is no element), with `--blur-strength` and
+//! `--background`. A requested effect is waited for (ready, or the run
+//! fails with the reason) before the warm-up. `--effect-switch-every S`
+//! cycles none -> blur -> replace (replace only with `--background`) inside
+//! the measurement window; the report's `effect` section has the element's
+//! counters, its GPU time per frame, the load time, the caps events at the
+//! sink (one: an effect change never renegotiates) and per switch the time
+//! to ready and the black, processed and passthrough frames.
+//!
 //! `--duration 0` streams until SIGINT/SIGTERM instead, printing a status
 //! line every 5 s and one line per switch. `--consumer` is allowed there for
 //! the consumer frame rate only: the luma stamp the end-to-end latency needs
@@ -63,9 +75,10 @@ use obc_pipeline::output::{check_sink_range, contract_caps_string};
 use obc_pipeline::pipeline::names;
 use obc_pipeline::stats::{self, FpsReport, Summary};
 use obc_pipeline::{
-    ControlReport, DeviceInfo, DiscoveryRoute, GpuStage, IngestConfig, IngestPath, LinkCaps,
-    MediaPipeline, ModeChoice, Output, OutputConfig, OutputCounts, OutputSink, Session,
-    all_cuda_between, list_cameras, scan_sysfs, select_camera, select_sink,
+    ControlReport, DeviceInfo, DiscoveryRoute, EffectFallback, EffectKind, EffectSettings,
+    EffectStats, EffectStatus, GpuStage, IngestConfig, IngestPath, LinkCaps, MediaPipeline,
+    ModeChoice, Output, OutputConfig, OutputCounts, OutputSink, Session, all_cuda_between,
+    list_cameras, scan_sysfs, select_camera, select_sink,
 };
 use serde::Serialize;
 
@@ -142,6 +155,26 @@ struct Args {
     /// memory; the conversion cost of an effect working on BGR).
     #[arg(long, default_value = "passthrough")]
     gpu_stage: GpuStage,
+    /// Effect element in the Process stage: none | blur | replace. `none`
+    /// inserts the element in passthrough (to measure its own cost);
+    /// omitted, there is no element. Does not combine with
+    /// --gpu-stage roundtrip.
+    #[arg(long)]
+    effect: Option<EffectKind>,
+    /// Blur strength, 0 to 1.
+    #[arg(long, default_value_t = EffectSettings::DEFAULT_BLUR_STRENGTH, value_parser = unit_interval)]
+    blur_strength: f32,
+    /// Background image of the replace effect (an absolute path).
+    #[arg(long)]
+    background: Option<PathBuf>,
+    /// Output after an effect failure: black | none (the raw input).
+    #[arg(long, default_value = "black")]
+    effect_on_failure: EffectFallback,
+    /// Cycle the effect none -> blur -> replace (replace only with
+    /// --background) every this many seconds inside the measurement
+    /// window. Needs --effect (the starting point of the cycle).
+    #[arg(long, value_parser = positive_secs)]
+    effect_switch_every: Option<f64>,
     /// Measured seconds (after warm-up). 0 streams until SIGINT/SIGTERM with
     /// a status line every 5 s (--consumer then measures consumer fps only).
     #[arg(long, default_value_t = 30.0, value_parser = non_negative_secs)]
@@ -219,6 +252,46 @@ impl Args {
         }
     }
 
+    /// The effect settings for `kind` from the effect arguments.
+    fn effect_settings(&self, kind: EffectKind) -> EffectSettings {
+        EffectSettings {
+            kind,
+            blur_strength: self.blur_strength,
+            background: self.background.clone(),
+            fallback: self.effect_on_failure,
+        }
+    }
+
+    /// The effects `--effect-switch-every` cycles through.
+    fn effect_cycle(&self) -> Vec<EffectKind> {
+        let mut c = vec![EffectKind::None, EffectKind::Blur];
+        if self.background.is_some() {
+            c.push(EffectKind::Replace);
+        }
+        c
+    }
+
+    /// Checks the effect arguments before any device is touched.
+    fn check_effect(&self) -> Result<()> {
+        let Some(kind) = self.effect else {
+            if self.effect_switch_every.is_some() {
+                bail!("--effect-switch-every needs --effect (the effect the cycle starts with)");
+            }
+            return Ok(());
+        };
+        if self.gpu_stage != GpuStage::Passthrough {
+            bail!(
+                "--effect does not combine with --gpu-stage {}",
+                self.gpu_stage
+            );
+        }
+        obc_pipeline::effect::check_settings(&self.effect_settings(kind))?;
+        if let Some(bg) = &self.background {
+            gst_obc::background::check_file(bg).map_err(|e| anyhow!(e))?;
+        }
+        Ok(())
+    }
+
     fn debug(&self, msg: impl AsRef<str>) {
         if self.verbose {
             eprintln!("debug: {}", msg.as_ref());
@@ -252,6 +325,14 @@ fn non_negative_ms(s: &str) -> Result<f64, String> {
         return Err(format!(
             "{s:?}: expected milliseconds in 0..={MAX_TUNING_MS}"
         ));
+    }
+    Ok(v)
+}
+
+fn unit_interval(s: &str) -> Result<f32, String> {
+    let v: f32 = s.trim().parse().map_err(|e| format!("{s:?}: {e}"))?;
+    if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+        return Err(format!("{s:?}: expected a value in 0..=1"));
     }
     Ok(v)
 }
@@ -972,9 +1053,93 @@ struct Report {
     warnings_suppressed: u64,
     teardown: TeardownSection,
     criteria: Criteria,
+    /// The effect element, with `--effect` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effect: Option<EffectSection>,
     /// `--duration 0` only: what the per-frame figures cover.
     #[serde(skip_serializing_if = "Option::is_none")]
     retention: Option<RetentionSection>,
+}
+
+/// The effect element over the measured window (`--effect`).
+#[derive(Debug, Serialize)]
+struct EffectSection {
+    /// The effect the run started with (`--effect`).
+    kind: String,
+    blur_strength: f32,
+    background: Option<PathBuf>,
+    on_failure: String,
+    /// The effect and its status when the window closed.
+    final_kind: String,
+    status: String,
+    reason: Option<String>,
+    /// The element's last successful load, warm-up included, in ms, and
+    /// whether it reused a loaded model (a switch between effects).
+    load_ms: Option<f64>,
+    load_reused_model: bool,
+    /// Successful loads over the whole run.
+    loads: u64,
+    /// Frames in the window: processed by the backend, black (warm-up or
+    /// failure) and passed through untouched (`none`).
+    frames_processed: u64,
+    frames_black: u64,
+    frames_passthrough: u64,
+    /// GPU time of one processed frame (CUDA events around the backend
+    /// call), median and p95 over the element's last 300 processed frames.
+    gpu_ms_p50: Option<f64>,
+    gpu_ms_p95: Option<f64>,
+    /// Caps events at the sink over the whole run: 1 means no effect change
+    /// renegotiated.
+    sink_caps_events: u64,
+    switch_every_s: Option<f64>,
+    switches: Vec<EffectSwitchReport>,
+    note: &'static str,
+}
+
+/// One `--effect-switch-every` change.
+#[derive(Debug, Clone, Serialize)]
+struct EffectSwitchReport {
+    to: String,
+    /// When, in seconds after the window opened.
+    at_s: f64,
+    /// From the change to the status ready (off for `none`), polled every
+    /// 20 ms; `None` if it never got there before the next change.
+    ready_after_ms: Option<f64>,
+    /// The failure reason, if the change failed.
+    reason: Option<String>,
+    /// Frames from this change to the next (or to the end of the window).
+    frames_processed: u64,
+    frames_black: u64,
+    frames_passthrough: u64,
+}
+
+const EFFECT_NOTE: &str = "frames_* are deltas of the element's counters over the window; gpu_ms_* come from the element's window of its last 300 processed frames when the window closed; load_ms is the backend's load plus its warm-up run, measured by the element";
+
+/// The frame counter deltas between two snapshots.
+fn effect_frames(a: &EffectStats, b: &EffectStats) -> (u64, u64, u64) {
+    (
+        b.frames_processed.saturating_sub(a.frames_processed),
+        b.frames_black.saturating_sub(a.frames_black),
+        b.frames_passthrough.saturating_sub(a.frames_passthrough),
+    )
+}
+
+/// Counts the caps events reaching `element`'s sink pad.
+fn count_caps_events(p: &MediaPipeline, element: &str) -> Result<Arc<AtomicU64>> {
+    let n = Arc::new(AtomicU64::new(0));
+    let c = Arc::clone(&n);
+    p.element(element)
+        .and_then(|e| e.static_pad("sink"))
+        .ok_or_else(|| anyhow!("no sink pad on {element}"))?
+        .add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+            if let Some(gst::PadProbeData::Event(e)) = &info.data
+                && e.type_() == gst::EventType::Caps
+            {
+                c.fetch_add(1, Ordering::Relaxed);
+            }
+            gst::PadProbeReturn::Ok
+        });
+    Ok(n)
 }
 
 /// Streaming (`--duration 0`) memory bound: which span the per-frame figures
@@ -1199,6 +1364,7 @@ fn run(args: &Args) -> Result<()> {
     // Validate every input before any device is touched.
     args.contract().validate()?;
     obc_pipeline::pipeline::check_io_mode(&args.io_mode)?;
+    args.check_effect()?;
     let env = environment();
 
     // ---- device and mode selection (from enumerated capabilities) ----
@@ -1250,6 +1416,21 @@ fn run(args: &Args) -> Result<()> {
         );
     }
     println!("sink:   {sink}");
+    if let Some(k) = args.effect {
+        let s = args.effect_settings(k);
+        println!(
+            "effect: {k} (strength {:.2}{}, on failure {}){}",
+            s.blur_strength,
+            s.background
+                .as_ref()
+                .map(|b| format!(", background {}", b.display()))
+                .unwrap_or_default(),
+            s.fallback,
+            args.effect_switch_every
+                .map(|p| format!(", cycling {:?} every {p} s", args.effect_cycle()))
+                .unwrap_or_default()
+        );
+    }
     println!(
         "output: {} ({}, process {}, input gap {} ms)",
         args.contract(),
@@ -2102,6 +2283,9 @@ struct Measured {
     interrupted: bool,
     counts_start: OutputCounts,
     counts_end: OutputCounts,
+    effect_start: Option<EffectStats>,
+    effect_end: Option<EffectStats>,
+    effect_switches: Vec<EffectSwitchReport>,
 }
 
 fn run_session(
@@ -2145,6 +2329,7 @@ fn run_session(
     // ---- output: build, instrument, start ----
     let mut ocfg = OutputConfig::new(contract, OutputSink::Loopback(sink.path.clone()));
     ocfg.process = args.gpu_stage;
+    ocfg.effect = args.effect.map(|k| args.effect_settings(k));
     ocfg.gap_threshold = Duration::from_millis(args.input_gap_ms);
     ocfg.hold_timeout = Duration::from_secs_f64(args.hold_timeout);
     ocfg.queue_buffers = args.output_queue_buffers;
@@ -2165,6 +2350,7 @@ fn run_session(
     output.set_observer(Some(rec.observer()));
     rec.attach_output(output.pipeline())
         .map_err(|e| anyhow!(e))?;
+    let sink_caps_events = count_caps_events(output.pipeline(), names::LOOPBACK)?;
     if stop_requested() {
         bail!("interrupted by signal before the measurement window");
     }
@@ -2210,6 +2396,19 @@ fn run_session(
                 "no frame of {} reached the output within 15 s",
                 cycle[0].label()
             ),
+        }
+        // A requested effect must be ready (or fail) before the warm-up.
+        if args.effect.is_some_and(|k| k != EffectKind::None) {
+            let settled =
+                |s: &Stream| !matches!(s.session.output().effect_status(), EffectStatus::Loading);
+            match s.wait_until(rec.now_ns() + secs_ns(60.0), settled)? {
+                Wait::Done => {}
+                Wait::Interrupted => return Err(interrupted_before()),
+                Wait::Deadline => bail!("the effect was not ready within 60 s"),
+            }
+            if let EffectStatus::Failed(reason) = s.session.output().effect_status() {
+                bail!("the effect failed: {reason}");
+            }
         }
         let t_first = rec.now_ns();
 
@@ -2282,6 +2481,7 @@ fn run_session(
             println!("note: SIGUSR1 received before the measurement window; ignored");
         }
         let counts_start = s.session.output().counts();
+        let effect_start = s.session.output().effect_stats();
         let ticks_start = stats::self_cpu_ticks().unwrap_or(0);
         let wall_start = rec.now_ns();
 
@@ -2299,11 +2499,28 @@ fn run_session(
         let mut status_counts = counts_start;
         let switch_period = args.switch_every.map(secs_ns);
         let mut next_switch = switch_period.map(|p| wall_start + p);
+        let effect_period = args.effect_switch_every.map(secs_ns);
+        let mut next_effect = effect_period.map(|p| wall_start + p);
+        let effect_cycle = args.effect_cycle();
+        let mut effect_at = args
+            .effect
+            .and_then(|k| effect_cycle.iter().position(|c| *c == k))
+            .unwrap_or(0);
+        let mut effect_switches: Vec<EffectSwitchReport> = Vec::new();
+        // The open switch: its start time and the stats at its start.
+        let mut effect_open: Option<(u64, EffectStats)> = None;
+        let mut effect_pending = false;
         let mut interrupted = false;
         loop {
             let mut deadline = next_sec.min(next_report).min(end);
             if let Some(t) = next_switch {
                 deadline = deadline.min(t);
+            }
+            if let Some(t) = next_effect {
+                deadline = deadline.min(t);
+            }
+            if effect_pending {
+                deadline = deadline.min(rec.now_ns() + 20_000_000);
             }
             if s.wait_until(deadline, |_| next_requested())? == Wait::Interrupted {
                 // Close the window here: the report covers what was measured.
@@ -2321,6 +2538,55 @@ fn run_session(
                 s.switch_next("timer");
                 let now = rec.now_ns();
                 next_switch = Some(if t + p > now { t + p } else { now + p });
+            }
+            if effect_pending && let Some(r) = effect_switches.last_mut() {
+                let status = s.session.output().effect_status();
+                let (at, _) = effect_open.as_ref().expect("an open switch");
+                let done = match &status {
+                    EffectStatus::Ready | EffectStatus::Off => true,
+                    EffectStatus::Failed(reason) => {
+                        r.reason = Some(reason.clone());
+                        true
+                    }
+                    EffectStatus::Loading => false,
+                };
+                if done {
+                    if r.reason.is_none() {
+                        r.ready_after_ms = Some((rec.now_ns() - at) as f64 / 1e6);
+                    }
+                    effect_pending = false;
+                }
+            }
+            if let (Some(t), Some(p)) = (next_effect, effect_period)
+                && !interrupted
+                && timer_switch_due(rec.now_ns(), t, end)
+            {
+                let stats_now = s.session.output().effect_stats().unwrap_or_default();
+                if let (Some((_, before)), Some(r)) = (&effect_open, effect_switches.last_mut()) {
+                    (r.frames_processed, r.frames_black, r.frames_passthrough) =
+                        effect_frames(before, &stats_now);
+                }
+                effect_at = (effect_at + 1) % effect_cycle.len();
+                let to = effect_cycle[effect_at];
+                let now = rec.now_ns();
+                let mut record = EffectSwitchReport {
+                    to: to.to_string(),
+                    at_s: (now - wall_start) as f64 / 1e9,
+                    ready_after_ms: None,
+                    reason: None,
+                    frames_processed: 0,
+                    frames_black: 0,
+                    frames_passthrough: 0,
+                };
+                if let Err(e) = s.session.output().set_effect(&args.effect_settings(to)) {
+                    record.reason = Some(e.to_string());
+                } else {
+                    effect_pending = true;
+                }
+                println!("  effect -> {to} at t+{:.1}s", record.at_s);
+                effect_switches.push(record);
+                effect_open = Some((now, stats_now));
+                next_effect = Some(if t + p > now { t + p } else { now + p });
             }
             let now = rec.now_ns();
             if now >= next_sec || interrupted || now >= end {
@@ -2387,6 +2653,13 @@ fn run_session(
             }
         }
         let counts_end = s.session.output().counts();
+        let effect_end = s.session.output().effect_stats();
+        if let (Some((_, before)), Some(r), Some(after)) =
+            (&effect_open, effect_switches.last_mut(), &effect_end)
+        {
+            (r.frames_processed, r.frames_black, r.frames_passthrough) =
+                effect_frames(before, after);
+        }
         let ticks_end = stats::self_cpu_ticks().unwrap_or(0);
         let wall_end = rec.now_ns();
         // A switch still waiting for its first frame is abandoned, not
@@ -2415,6 +2688,9 @@ fn run_session(
             interrupted,
             counts_start,
             counts_end,
+            effect_start,
+            effect_end,
+            effect_switches,
         })
     })();
 
@@ -2628,6 +2904,7 @@ fn run_session(
                 .sum()
         });
 
+    let effect = effect_section(args, &m, sink_caps_events.load(Ordering::Relaxed));
     let report = Report {
         tool: "obc-bench",
         version: env!("CARGO_PKG_VERSION"),
@@ -2764,6 +3041,7 @@ fn run_session(
             linger_s: args.linger_after_teardown,
         },
         criteria,
+        effect,
         retention,
     };
 
@@ -2796,6 +3074,35 @@ fn run_session(
         );
     }
     Ok(())
+}
+
+/// The report's effect section, with `--effect` only.
+fn effect_section(args: &Args, m: &Measured, sink_caps_events: u64) -> Option<EffectSection> {
+    let kind = args.effect?;
+    let end = m.effect_end.clone().unwrap_or_default();
+    let start = m.effect_start.clone().unwrap_or_default();
+    let (frames_processed, frames_black, frames_passthrough) = effect_frames(&start, &end);
+    Some(EffectSection {
+        kind: kind.to_string(),
+        blur_strength: args.blur_strength,
+        background: args.background.clone(),
+        on_failure: args.effect_on_failure.to_string(),
+        final_kind: end.effect.to_string(),
+        status: end.status.as_str().to_string(),
+        reason: end.status.reason().map(str::to_string),
+        load_ms: end.last_load_ms,
+        load_reused_model: end.last_load_reused,
+        loads: end.loads,
+        frames_processed,
+        frames_black,
+        frames_passthrough,
+        gpu_ms_p50: end.gpu_ms_p50,
+        gpu_ms_p95: end.gpu_ms_p95,
+        sink_caps_events,
+        switch_every_s: args.effect_switch_every,
+        switches: m.effect_switches.clone(),
+        note: EFFECT_NOTE,
+    })
 }
 
 fn write_json(path: &Path, report: &Report) -> Result<()> {
@@ -3063,6 +3370,56 @@ fn print_summary(r: &Report) {
             m(&g.running.proc_mem_mib),
         );
     }
+    if let Some(e) = &r.effect {
+        let ms = |v: Option<f64>| v.map_or("n/a".into(), |v| format!("{v:.3}"));
+        println!(
+            "effect: {} (strength {:.2}{}, on failure {}) -> {} {}{}; load {} ms{}, {} loads",
+            e.kind,
+            e.blur_strength,
+            e.background
+                .as_ref()
+                .map(|b| format!(", background {}", b.display()))
+                .unwrap_or_default(),
+            e.on_failure,
+            e.final_kind,
+            e.status,
+            e.reason
+                .as_deref()
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default(),
+            e.load_ms.map_or("n/a".into(), |v| format!("{v:.1}")),
+            if e.load_reused_model {
+                " (model reused)"
+            } else {
+                ""
+            },
+            e.loads
+        );
+        println!(
+            "  frames processed {} black {} passthrough {}; GPU per frame p50 {} ms p95 {} ms; caps events at the sink {}",
+            e.frames_processed,
+            e.frames_black,
+            e.frames_passthrough,
+            ms(e.gpu_ms_p50),
+            ms(e.gpu_ms_p95),
+            e.sink_caps_events
+        );
+        for w in &e.switches {
+            println!(
+                "  switch at t+{:.1}s -> {}: {}; processed {} black {} passthrough {}",
+                w.at_s,
+                w.to,
+                match (&w.reason, w.ready_after_ms) {
+                    (Some(r), _) => format!("FAILED ({r})"),
+                    (None, Some(ms)) => format!("ready after {ms:.0} ms"),
+                    (None, None) => "not ready before the next change".into(),
+                },
+                w.frames_processed,
+                w.frames_black,
+                w.frames_passthrough
+            );
+        }
+    }
     println!(
         "caps: output CUDAMemory appsrc..download: {}; buffers at v4l2sink: {}",
         r.caps.output_cuda_memory,
@@ -3196,6 +3553,74 @@ mod tests {
         assert_eq!(a.switch_every, None);
         assert_eq!(a.gpu_stage, GpuStage::Passthrough);
         assert!(!a.consumer_stamp());
+        assert_eq!(a.effect, None, "no effect element by default");
+        assert!(a.check_effect().is_ok());
+    }
+
+    #[test]
+    fn effect_arguments() {
+        let a = parse(&["--effect", "blur", "--blur-strength", "0.8"]).unwrap();
+        assert_eq!(a.effect, Some(EffectKind::Blur));
+        let s = a.effect_settings(EffectKind::Blur);
+        assert_eq!((s.blur_strength, s.fallback), (0.8, EffectFallback::Black));
+        assert!(a.check_effect().is_ok());
+        assert_eq!(a.effect_cycle(), [EffectKind::None, EffectKind::Blur]);
+        for (flag, v) in [
+            ("--effect", "sepia"),
+            ("--blur-strength", "1.5"),
+            ("--blur-strength", "-0.1"),
+            ("--effect-on-failure", "raw"),
+            ("--effect-switch-every", "0"),
+        ] {
+            assert!(parse(&[flag, v]).is_err(), "{flag} {v}");
+        }
+        // Replace needs a background; a relative one is refused.
+        let r = parse(&["--effect", "replace"]).unwrap();
+        assert!(
+            r.check_effect()
+                .unwrap_err()
+                .to_string()
+                .contains("background")
+        );
+        let r = parse(&["--effect", "replace", "--background", "bg.png"]).unwrap();
+        assert!(
+            r.check_effect()
+                .unwrap_err()
+                .to_string()
+                .contains("absolute")
+        );
+        // A cycle needs a starting effect; roundtrip does not combine.
+        let c = parse(&["--effect-switch-every", "5"]).unwrap();
+        assert!(
+            c.check_effect()
+                .unwrap_err()
+                .to_string()
+                .contains("--effect")
+        );
+        let rt = parse(&["--effect", "none", "--gpu-stage", "roundtrip"]).unwrap();
+        assert!(
+            rt.check_effect()
+                .unwrap_err()
+                .to_string()
+                .contains("roundtrip")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let bg = dir.path().join("bg.png");
+        std::fs::write(&bg, b"x").unwrap();
+        let ok = parse(&[
+            "--effect",
+            "none",
+            "--background",
+            bg.to_str().unwrap(),
+            "--effect-switch-every",
+            "4",
+        ])
+        .unwrap();
+        assert!(ok.check_effect().is_ok());
+        assert_eq!(
+            ok.effect_cycle(),
+            [EffectKind::None, EffectKind::Blur, EffectKind::Replace]
+        );
     }
 
     #[test]

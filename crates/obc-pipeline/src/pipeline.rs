@@ -76,6 +76,8 @@ pub mod names {
     pub const FROM_BGR: &str = "from_bgr";
     /// Output, roundtrip process stage: the NV12 capsfilter after it.
     pub const PROCESS_CAPS: &str = "process_caps";
+    /// Output, Process stage: the `obceffect` element (ADR-0012).
+    pub const EFFECT: &str = "effect";
 
     pub const CONSUMER_SRC: &str = "consumer_src";
     pub const CONSUMER_CAPS: &str = "consumer_caps";
@@ -121,6 +123,10 @@ pub enum PipelineError {
     },
     #[error("CUDA: {0}")]
     Cuda(String),
+    /// Effect settings that cannot be applied, or an output that has no
+    /// effect element (`docs/adr/0012-video-effects-and-maxine-backend.md`).
+    #[error("effect: {0}")]
+    Effect(String),
     #[error("camera control on {device}: {message}")]
     Control { device: String, message: String },
     #[error("invalid {property} {value:?} for {factory} (valid: {valid})")]

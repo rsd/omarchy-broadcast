@@ -21,7 +21,7 @@ The object also implements the standard `org.freedesktop.DBus.Properties`, `org.
 ## Versioning
 
 - **Breaking changes** (a removed or renamed member, a changed type or meaning, a new lifecycle state) are never made to `br.com.dias.OmaBroadcast1`. They go into a new interface, `br.com.dias.OmaBroadcast2`, on the same object.
-- **Backwards-compatible additions** (a new property, method, signal or error name) are made to `br.com.dias.OmaBroadcast1` and raise the `InterfaceRevision` property. This document describes revision **1**.
+- **Backwards-compatible additions** (a new property, method, signal or error name) are made to `br.com.dias.OmaBroadcast1` and raise the `InterfaceRevision` property. This document describes revision **2**. Revision 1 had no video effects: `Effect` was reserved and always `none`. Revision 2 adds the `BlurStrength` and `BackgroundImage` properties, the `SetEffect`, `SetBlurStrength` and `SetBackgroundImage` methods and the `InvalidArgument` error name, and gives `Effect` its values; it removes and changes nothing else.
 - A client that uses an addition checks `InterfaceRevision` first and treats an older daemon as not offering it. A client must ignore properties, signals and error names it does not know.
 
 ## Lifecycle states
@@ -73,9 +73,11 @@ All properties are read-only. Every change is announced with `org.freedesktop.DB
 | `Cameras` | `a(sss)` | The cameras present, in the order the daemon uses them: first those matching the configured preference, then the others in discovery order. Each entry is `(id, name, usb)`: `id` is an opaque, stable identifier to pass to `SelectCamera`; `name` is the human-readable device name; `usb` is the USB `vid:pid` in lower-case hex (`046d:0944`), or empty for a non-USB camera. | When a camera is plugged in or removed, and on a configuration reload that changes the preference. |
 | `ActiveCamera` | `s` | The `id` of the camera that streams, or that would stream if an application opened the virtual camera now; empty if there is none. | On `SelectCamera`, `NextCamera`, a fallback after a camera failure, and hotplug. |
 | `OutputMode` | `s` | What the virtual camera delivers: pixel format, size and frame rate, e.g. `NV12 1920x1080@30` (a fractional rate is written `30000/1001`). | On a configuration reload that changes it. A change requested while an application holds the virtual camera is applied, and announced, when the last one closes it. |
-| `Effect` | `s` | The video effect in use. Reserved: always `none` in this revision. | Not in this revision. |
+| `Effect` | `s` | The video effect in force: `none`, `blur` or `replace`. This is the effective value (a run-time choice, else the configuration's `[effect] mode`), not whether the effect is ready yet or has failed; see [Video effects](#video-effects). | On `SetEffect`, and on a configuration reload that changes the effective value. |
+| `BlurStrength` | `d` | Strength of the `blur` effect, 0.0 to 1.0. The effective value, shown whatever the effect. | On `SetBlurStrength`, and on a reload that changes the effective value. |
+| `BackgroundImage` | `s` | Absolute path of the image for `replace`; empty if there is none. The effective value (a run-time choice, else the configuration's `[effect] background_image`). | On `SetBackgroundImage`, and on a reload that changes the effective value. |
 | `Consumers` | `u` | Number of processes, other than the daemon, holding the virtual camera open. | When an application opens or closes the virtual camera. |
-| `InterfaceRevision` | `u` | Revision of `br.com.dias.OmaBroadcast1` the daemon implements (see Versioning). This document describes `1`. | Never while the daemon runs. |
+| `InterfaceRevision` | `u` | Revision of `br.com.dias.OmaBroadcast1` the daemon implements (see Versioning). This document describes `2`. | Never while the daemon runs. |
 
 ## Methods
 
@@ -86,6 +88,7 @@ All methods return nothing on success. On failure they return a D-Bus error name
 | `br.com.dias.OmaBroadcast1.Error.NoSuchCamera` | The selector matches no camera that is present. The message ends with `(cameras present: …)`, listing them. |
 | `br.com.dias.OmaBroadcast1.Error.InvalidConfig` | The configuration file cannot be read or is invalid; the message names the file, the line and key, and the reason. The previous configuration stays in force. |
 | `br.com.dias.OmaBroadcast1.Error.Unavailable` | The request cannot be served now, for example `NextCamera` with no camera present. |
+| `br.com.dias.OmaBroadcast1.Error.InvalidArgument` | An argument is well-formed but not acceptable: an unknown effect, a strength outside 0 to 1, a background image that is not usable. The message says which and why. Added in revision 2. |
 | `br.com.dias.OmaBroadcast1.Error.Failed` | Any other failure. |
 
 ### `SetEnabled(b enabled)`
@@ -118,6 +121,41 @@ Errors: `Unavailable` (no camera present), `Failed`.
 Re-reads the configuration file (`$XDG_CONFIG_HOME/oma-broadcast/config.toml`). Equivalent to sending `SIGHUP` to the daemon. An invalid file is rejected as a whole: the previous configuration stays in force, `Error` is set and the call fails with `InvalidConfig`. A valid file clears `Error` unless a cause outside the configuration still holds (see `Error` above). A missing file means the defaults. The configuration keys are described in [config.example.toml](config.example.toml).
 
 Errors: `InvalidConfig`, `Failed`.
+
+### `SetEffect(s effect)`
+
+Selects the video effect: `none` (the camera image as it is), `blur` (blur the background behind the person) or `replace` (replace the background with the background image). It takes effect on a running stream at once, with no restart of the session and no change to what the virtual camera negotiates; see [Video effects](#video-effects) for what the application sees while an effect starts. Selecting the effect already in force does nothing. The choice persists across restarts and takes precedence over the configuration.
+
+Any effect method also retries an effect that failed (see below), and leaves the `error` state when an effect failure put the daemon there.
+
+Errors: `InvalidArgument` (an effect other than `none`, `blur`, `replace`; or `replace` while no background image is set), `Failed`.
+
+### `SetBlurStrength(d strength)`
+
+Sets the strength of the `blur` effect, from 0.0 (lightest) to 1.0 (strongest). It applies from the next frame, without reloading the effect, also while `blur` is not selected. Persists across restarts and takes precedence over the configuration.
+
+Errors: `InvalidArgument` (outside 0 to 1, or not a finite number), `Failed`.
+
+### `SetBackgroundImage(s path)`
+
+Sets the image used by `replace`. `path` must be an absolute path to a readable regular file of at most 32 MiB. The daemon reads the file itself, as the user it runs as, when the effect starts; the file must be a PNG or JPEG image of at most 8192x8192 pixels (only its first image is used). A file that passes the checks of the call but cannot be decoded is an effect failure (see below), not an error of the call. If `replace` is in force the new image is applied at once. Persists across restarts and takes precedence over the configuration.
+
+An empty `path` removes the run-time image: the configuration's `[effect] background_image` applies again. It is refused with `InvalidArgument` only while `replace` is in force and the configuration has no image either; select another effect first.
+
+Errors: `InvalidArgument` (not an absolute path, unreadable, not a regular file, larger than 32 MiB; the message names the path and the reason), `Failed`.
+
+## Video effects
+
+The effect settings (`Effect`, `BlurStrength`, `BackgroundImage`) come from the `[effect]` section of the configuration, and the three setters override them. An override is written to the runtime state file (`state.toml` in `$XDG_STATE_HOME/oma-broadcast/`, with `Enabled` and the selected camera) before the call returns and survives restarts; the configuration is not modified. A value in the state file takes precedence over the configuration, and a reload does not discard it. A state file with an unreadable effect value is a damaged state file (see the `off` rules above); the effect choices saved in it are dropped in favour of the configuration when `SetEnabled` rewrites the file. A setter called with the value already in force changes and writes nothing.
+
+**Privacy while an effect starts.** The raw camera image is never shown while an effect is requested. Going from `none` to `blur` or `replace`, the virtual camera delivers black frames until the effect is ready: a fraction of a second normally, up to a few seconds on the first load after boot or after the files left the cache. Going from one effect to another, the previous effect keeps running until the new one is ready, so every frame is processed. Going to `none` shows the camera image at once. The stream keeps its format and frame rate throughout; applications see no renegotiation.
+
+**When an effect fails.** The effect can fail to start or while running: the Maxine SDK is missing or cannot be loaded, the background image cannot be decoded, a frame fails. The daemon reports the reason in `Error` (for example `effect blur unavailable: NvVFX_Load(GreenScreen) returned -1209 ...`) and acts according to `[effect] on_failure` in the configuration:
+
+- `"black"` (the default): `State` becomes `error`, the camera is closed and the GPU released, and the virtual camera keeps delivering black frames. The raw camera image is not shown, because the user asked to hide the background. If the failure is found before the stream starts (the SDK is missing, `replace` has no usable image) the camera is not opened at all. The daemon leaves `error` like any other: a control method (`SetEffect` and the other setters retry), a configuration reload, a change of the set of cameras, or when the last application closes the virtual camera (then `idle`, and the next one tries again).
+- `"none"`: the stream continues without the effect, so applications see the unprocessed camera image, `State` stays `active`, and `Error` carries the reason, ending `; the camera image is shown without the effect (effect.on_failure = "none")`. `Error` is cleared when the effect becomes ready after a retry, by an effect method, by a reload, or when the session ends.
+
+If a setter finds the failure while it applies the value to a running stream, it also returns `Failed` with the same text.
 
 ## Signals
 
@@ -162,7 +200,7 @@ How to read without starting the daemon:
 - **Rust (`obc-ipc`)**: `Snapshot::fetch_no_autostart(&connection)` sends one `GetAll` with the flag and returns `None` when the daemon is not running; `Snapshot::apply_property` applies the values of a `PropertiesChanged` signal, and `obc_ipc::daemon_is_running` asks `NameHasOwner`. Do not read through the property getters of `OmaBroadcastProxy`: a proxy that caches properties (the zbus default) fills its cache with a `GetAll` that allows activation as soon as it is built, and the getters fall back to a `Get` that allows it too. Build the proxy with `cache_properties(CacheProperties::No)` and use it for method calls and signals only.
 - **Other libraries**: set the `NO_AUTO_START` flag on the message (in GDBus, `G_DBUS_CALL_FLAGS_NO_AUTO_START`; in sd-bus, `sd_bus_message_set_auto_start(m, 0)`), and disable any property cache that a generated proxy fills on construction.
 
-Method calls (`SetEnabled`, `SelectCamera`, `NextCamera`, `ReloadConfig`) are actions; letting them start the daemon is normally what the user wants.
+Method calls (`SetEnabled`, `SelectCamera`, `NextCamera`, `ReloadConfig`, `SetEffect`, `SetBlurStrength`, `SetBackgroundImage`) are actions; letting them start the daemon is normally what the user wants.
 
 A daemon that holds its name but does not answer leaves a call pending; D-Bus libraries differ in their default time limit (zbus sets none). Give every read a time limit of a few seconds, and treat a call that runs out of time as a failure to read, not as "not running".
 
@@ -188,14 +226,19 @@ NAME                        TYPE      SIGNATURE RESULT/VALUE                FLAG
 .NextCamera                 method    -         -                           -
 .ReloadConfig               method    -         -                           -
 .SelectCamera               method    s         -                           -
+.SetBackgroundImage         method    s         -                           -
+.SetBlurStrength            method    d         -                           -
+.SetEffect                  method    s         -                           -
 .SetEnabled                 method    b         -                           -
 .ActiveCamera               property  s         "usb-046d_0944-video-index0" emits-change
+.BackgroundImage            property  s         ""                          emits-change
+.BlurStrength               property  d         0.5                         emits-change
 .Cameras                    property  a(sss)    1 "usb-046d_0944-video-index0" "Logitech MX Brio" "046d:0944" emits-change
 .Consumers                  property  u         0                           emits-change
 .Effect                     property  s         "none"                      emits-change
 .Enabled                    property  b         true                        emits-change
 .Error                      property  s         ""                          emits-change
-.InterfaceRevision          property  u         1                           emits-change
+.InterfaceRevision          property  u         2                           emits-change
 .OutputMode                 property  s         "NV12 1920x1080@30"         emits-change
 .State                      property  s         "idle"                      emits-change
 .Stats                      signal    dddd      -                           -
@@ -240,6 +283,23 @@ busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
     br.com.dias.OmaBroadcast1 NextCamera
 busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
     br.com.dias.OmaBroadcast1 ReloadConfig
+busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
+    br.com.dias.OmaBroadcast1 SetBlurStrength d 0.7
+busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
+    br.com.dias.OmaBroadcast1 SetBackgroundImage s /home/user/Pictures/background.png
+busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
+    br.com.dias.OmaBroadcast1 SetEffect s blur
+```
+
+An argument that is not acceptable is rejected with `InvalidArgument`:
+
+```sh
+busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
+    br.com.dias.OmaBroadcast1 SetBlurStrength d 1.5
+```
+
+```text
+Call failed: blur strength 1.5 is outside 0 to 1
 ```
 
 A failed call prints the error message and exits with a non-zero status. The `NoSuchCamera` message lists the cameras present, as `name (id)`:
@@ -302,6 +362,12 @@ gdbus call --session --dest br.com.dias.OmaBroadcast --object-path /br/com/dias/
     --method br.com.dias.OmaBroadcast1.NextCamera
 gdbus call --session --dest br.com.dias.OmaBroadcast --object-path /br/com/dias/OmaBroadcast \
     --method br.com.dias.OmaBroadcast1.ReloadConfig
+gdbus call --session --dest br.com.dias.OmaBroadcast --object-path /br/com/dias/OmaBroadcast \
+    --method br.com.dias.OmaBroadcast1.SetBackgroundImage /home/user/Pictures/background.png
+gdbus call --session --dest br.com.dias.OmaBroadcast --object-path /br/com/dias/OmaBroadcast \
+    --method br.com.dias.OmaBroadcast1.SetEffect replace
+gdbus call --session --dest br.com.dias.OmaBroadcast --object-path /br/com/dias/OmaBroadcast \
+    --method br.com.dias.OmaBroadcast1.SetBlurStrength 0.7
 ```
 
 A failure is reported with its D-Bus error name, which a script can match on:
@@ -329,5 +395,6 @@ gdbus monitor --session --dest br.com.dias.OmaBroadcast --object-path /br/com/di
 - Read with the `NO_AUTO_START` flag, so that looking at the daemon never starts it, and give each read a time limit (see Service presence and activation).
 - Treat a missing name owner as "daemon not running" (see Service presence and activation).
 - Show `Error` when it is non-empty, whatever the state: a rejected configuration reload sets it while the state stays, for example, `active`.
+- Offer the effect controls only if `InterfaceRevision` is 2 or more; against revision 1 the setters do not exist and `Effect` is always `none`.
 - Treat `-1` in `Stats` as unknown, and expect no `Stats` outside `active`.
 - Match errors by name, not by message text: the messages are for people and may change.

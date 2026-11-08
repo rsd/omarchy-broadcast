@@ -1,0 +1,101 @@
+# ADR-0012: Video effects in the Process stage, the inference backend seam and the Maxine backend
+
+- **Status:** Accepted. Implements [ADR-0003](0003-maxine-first-behind-backend-seam.md) (amends its binding approach) and fills the Process stage of [ADR-0009](0009-ingest-process-output.md). Extends the D-Bus API of [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md) within interface version 1.
+
+## Context
+- The Process stage sits at the head of the output pipeline and receives canonical frames: NV12 in CUDA memory, at the output size, with the contract's colour label ([ADR-0009](0009-ingest-process-output.md)). Until now it was empty.
+- The output clock pushes the same slot buffer more than once (a repeat is a shallow copy of the last fresh frame), so an effect must never modify its input in place.
+- The NVIDIA Maxine Video Effects SDK 1.3 provides AI green screen (`GreenScreen`, a BGR u8 frame in, an 8-bit alpha mask out, a GPU-side cost per frame) and background blur (`BackgroundBlur`, frame and mask in, a much smaller GPU cost). It has no background replacement effect; `NvCVImage_Composite` composites a foreground over a background through a mask on the GPU, and `NvCVImage_TransferFromYUV` / `NvCVImage_TransferToYUV` convert between NV12 and BGR on the GPU.
+- The SDK is licensed under the NVIDIA Software License Agreement. Neither the SDK, its headers that carry a restrictive notice, nor the models may be redistributed or committed ([../setup/maxine.md](../setup/maxine.md), section 11).
+- Loading the green-screen models takes a noticeable time, and the first run after a load takes longer still (TensorRT and cuDNN warm-up). Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence; reproduce locally with `obc-bench` (see [../testing.md](../testing.md)).
+- The SDK's model loader rejects distributions it does not list, by reading `/etc/os-release` ([../setup/maxine.md](../setup/maxine.md), section 7).
+- GStreamer's CUDA library creates its own CUDA context with `cuCtxCreate`, not the device's primary context. Every CUDA element of a stream shares that one context ([ADR-0009](0009-ingest-process-output.md)).
+- The daemon must hold no CUDA context while it is `off`, `idle` or `error` ([ADR-0006](0006-on-demand-gpu-lifecycle.md), [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md)).
+
+## Decision
+
+### Effects
+- Three effects: `none`, `blur` (background blur, strength 0 to 1, default 0.5) and `replace` (background replacement with an image file, scaled to the output size with a centre crop to fill).
+- Both `blur` and `replace` use the green-screen mask. `blur` passes frame and mask to `BackgroundBlur`; `replace` composites the frame over the background image through the mask with `NvCVImage_Composite`. No custom CUDA kernel is needed.
+- The green-screen effect runs in quality mode with its temporal state allocated, which reduces mask flicker between frames.
+
+### One effect element, always present
+- The Process stage holds one element, `obceffect` (crate `gst-obc`, registered in-process, not as a plugin file). Its sink and source caps are both the canonical caps, so changing the effect never renegotiates caps and never relinks the pipeline.
+- With `none` the element is in passthrough: the input buffer goes downstream untouched, with no copy and no CUDA call. The element touches CUDA only once an effect is requested.
+- With an effect, the element writes into a new output buffer from a CUDA buffer pool on the shared context; the input is only read.
+- All of the element's GPU work runs on one CUDA stream it creates in that context, not on the input's stream: the backend binds its stream when it loads, and the input's stream changes with every ingest pipeline (each camera switch) and for the placeholder frame. The element waits for its stream before it pushes a frame, so the input is free again when it is released.
+- The effect, the blur strength and the background image are element properties that may change while the pipeline plays. A strength change applies on the next frame without a reload.
+
+### The backend seam
+- The element talks to the `InferenceBackend` trait (crate `obc-backend`), never to Maxine. A backend factory reports whether the backend is available (libraries present) without loading models; a backend instance loads the models for one effect, processes one frame from an NV12 device frame to an NV12 device frame on a given CUDA stream, and unloads.
+- Frames are described by device pointers, pitches and the colour matrix and range of the canonical label, in the CUDA context the element shares with the stream. A backend that does not run on CUDA (for example an OpenVINO backend on an NPU) would add a host-memory variant of the frame description; the element would then download and upload around it. That variant is not defined until such a backend exists.
+- `obc-backend-maxine` is the first implementation.
+
+### Loading the SDK at run time
+- The SDK is opened with `dlopen` (the `libloading` crate) at run time, from `$MAXINE_VFX_ROOT/lib`, falling back to the library search path. Nothing links against it, so the workspace builds and its tests pass on a machine without the SDK; the backend then reports itself unavailable.
+- The FFI declarations are a minimal subset written by hand from the public API documentation (function signatures, the `NvCVImage` structure layout, the parameter-name strings and the status codes that are used). No SDK header is copied into the repository, and bindgen is not used, so the build never needs the SDK. This replaces the "bindgen over the headers" of [ADR-0003](0003-maxine-first-behind-backend-seam.md).
+- The CUDA driver API (`libcuda.so.1`) and GStreamer's CUDA library (`libgstcuda-1.0.so.0`) are also opened at run time, for the same reason.
+- The SDK runs in GStreamer's CUDA context: the element pushes that context as current on the calling thread before every call into the backend, so the SDK's CUDA runtime binds to it instead of creating the primary context. Destroying the stream's context at teardown therefore leaves no CUDA context behind.
+- The model directory is `$MAXINE_VFX_ROOT/lib/models` (in general, the `models` directory next to the `libVideoFX.so` that was opened). The SDK finds its feature libraries by name, so they must be on `LD_LIBRARY_PATH` when the process starts; the service drop-in below sets it.
+
+### Lifecycle
+- Models exist only while an effect is requested and the daemon is `starting` or `active`: they live in the element, the element lives in the output pipeline, and the output pipeline exists only in those states. Entering `idle`, `off` or `error` tears the pipeline down, and the element unloads the backend before the CUDA context is released. Selecting `none` unloads the backend while the stream keeps running; the element keeps its stream and output buffer pool until the output stops.
+- A load runs on a worker thread of the element, with the context current, so the streaming thread never blocks on it. Switching between `blur` and `replace` keeps the green-screen model loaded: the worker decodes the background image first, and the switch itself takes milliseconds, during which the streaming thread waits for the backend instead of showing anything else.
+- Stopping the element during a cold load waits for the load to finish: a load can take seconds the first time, on a cold cache (model load and TensorRT warm-up), and later loads are shorter. The SDK's load call cannot be interrupted, and the element must unload the backend and release the CUDA context only after the worker has left the SDK; releasing the context under a running load would leave the SDK working in a destroyed context. The worker drops a request that is superseded before the load starts, so only a load already inside the SDK is waited for (and a background decode in progress, which is bounded by a 10 s timeout).
+- If the CUDA context cannot be made current at unload time, the element leaks the backend instead of unloading it: unloading in no context, or in another one, would make the SDK free its objects in the wrong context and could create the primary context. The memory is reclaimed when the context is destroyed. The element's own CUDA objects (stream, timing events, the context reference) are released once, at stop or, if the element is finalised without stopping, when it is dropped.
+
+### Privacy during warm-up and on failure
+- **The raw camera image is never shown while an effect is requested.** From `none` to an effect, the element outputs black canonical frames until the effect is ready. From one effect to another, the previous effect keeps running until the new one is ready, so every frame shown is processed. From an effect to `none`, the raw image is shown at once, because that is what was asked for.
+- If the backend is unavailable, or a load, a frame or the background image fails, the element reports the reason (in its status, and as an element message on the output pipeline's bus) and the outcome depends on `effect.on_failure`:
+  - `"black"` (the default): the daemon reports the reason in `Error` and enters the `error` state, which closes the camera and releases the GPU; the loopback writer keeps sending black frames. It leaves `error` as for any other fault: a control method (for example `SetEffect`), a configuration reload or a camera change.
+  - `"none"`: the stream continues without the effect (the raw image, which the user opted into), and `Error` carries the reason.
+- The default fails closed because the user asked to hide the background; showing it because a library is missing would defeat the purpose.
+
+### Configuration, run-time state and D-Bus
+- A new `[effect]` section in `config.toml`: `mode` (`"none"`, `"blur"` or `"replace"`, default `"none"`), `blur_strength` (0.0 to 1.0, default 0.5), `background_image` (an absolute path, default empty; required when `mode = "replace"`) and `on_failure` (`"black"` or `"none"`, default `"black"`).
+- Changes made at run time go to `state.toml`, as `Enabled` and the selected camera do ([ADR-0011](0011-daemon-lifecycle-and-dbus-api.md)): the effect, the blur strength and the background image. A value in the state file takes precedence over the configuration.
+- D-Bus additions, all within `br.com.dias.OmaBroadcast1` (additive, `InterfaceRevision` 2):
+  - `Effect` (s) now reports the selected effect: `none`, `blur` or `replace`;
+  - new properties `BlurStrength` (d) and `BackgroundImage` (s);
+  - new methods `SetEffect(s)`, `SetBlurStrength(d)` and `SetBackgroundImage(s)`;
+  - a new error name, `br.com.dias.OmaBroadcast1.Error.InvalidArgument`, for an unknown effect, a strength outside 0 to 1, a background path that is not an absolute path to a readable regular file, or `replace` with no background image.
+- `SetBackgroundImage("")` removes the run-time image: the image of `effect.background_image` in the configuration applies again, and the `background_image` key leaves `state.toml`. It is refused with `InvalidArgument` only while `replace` is in force and the configuration has no image either. An empty value in `state.toml` is read as no override. The other two setters likewise persist the value they are given; a call with the value already in force writes nothing and reloads nothing.
+- A state file with an unreadable effect value (an unknown name, a strength outside 0 to 1, a relative path) is a damaged state file under the existing fail-closed rule of ADR-0011: the daemon starts `off` and says so in `Error`, and the effect choices saved there are dropped in favour of the configuration when `SetEnabled` rewrites the file.
+- Strength and image are properties set by methods, rather than arguments of `SetEffect`, so a client can read them back and follow them through `PropertiesChanged`, consistent with the read-only properties of ADR-0011.
+- The background file is read by the daemon, which runs as the same user as every client of the session bus. It is limited to 32 MiB, to PNG and JPEG, and to 8192 x 8192 pixels, and decoded with GStreamer (`pngdec`, `jpegdec`).
+  - The file is opened once without blocking and checked on the open handle (a regular file within the size limit), then read into memory; the decoder reads those bytes. A path that is, or is replaced by, a FIFO or a device is refused at once instead of blocking the worker.
+  - Only the first image of the file is decoded. The length of the first image is found by walking the file's own structure (PNG chunks up to `IEND`; JPEG segments, then the entropy-coded scan up to the end-of-image marker), and the decoder is fed exactly those bytes. Data after the end of the first image is ignored, not refused. The decoders would otherwise decode every concatenated image they find, so a small valid image followed by a second one declaring a huge size would defeat the size check below. Refusing trailing data would close the same hole, but phone photos, a likely source of backgrounds, routinely carry data after the image (the gain map of an Ultra HDR JPEG, the video of a Motion Photo), so they are accepted and only their first image is used. A file whose first image is cut short, or whose structure is invalid, is refused.
+  - The width and height are read from the file's own header (the PNG `IHDR` chunk, the JPEG frame header) before any decoder runs, because a decoder allocates the full image as soon as it knows the size: a small file declaring 60000 x 60000 pixels would otherwise cost about 10 GB. This is why only PNG and JPEG are accepted, with explicit `pngdec` and `jpegdec` decoders rather than format autodetection: for these two the size and the end of the image can be read from the bytes before any decoder runs, whereas GStreamer's other parsers do not all expose a size, and relying on them would put a decoder in front of an unchecked file. Another format can be added together with a header and length reader for it.
+- CLI: `oma-broadcast effect none|blur|replace [--strength X] [--image PATH]`; `--json` output gains `blur_strength` and `background_image` ([../cli-json.md](../cli-json.md)).
+
+### Running the daemon with the os-release override
+- The daemon runs with a small `LD_PRELOAD` library, `tools/os-release-shim` (C, built with `make`, not part of the Rust build). In the process that preloads it, a read-only open of exactly the absolute path `/etc/os-release` (through `open`, `openat`, their `64` and fortified variants, `fopen` or `fopen64`) opens the replacement file named by `OMA_BROADCAST_OS_RELEASE`; every other call passes through unchanged. The SDK reads the file with `fopen`, imported from libc by `libnvVFXGreenScreen.so` through the normal global symbol lookup, so the preloaded definition is the one called. Measured on the reference machine: with the shim `NvVFX_Load` succeeds; without it, it fails with `-1209`.
+- No namespace is involved: the daemon keeps the user's uid and the user's own user and mount namespaces, so the session bus, the devices and `/proc/<pid>/fd` of the user's other processes behave exactly as without the override, and consumer detection ([ADR-0011](0011-daemon-lifecycle-and-dbus-api.md)) works.
+- The shim removes `LD_PRELOAD` from the daemon's environment when it is loaded, so no process the daemon starts inherits it. It redirects nothing if `OMA_BROADCAST_OS_RELEASE` is unset or not an absolute path, and opens the real file if the replacement cannot be opened.
+- A drop-in for the systemd user unit (`dist/systemd/oma-broadcastd.service.d/maxine.conf`) sets `LD_PRELOAD`, `OMA_BROADCAST_OS_RELEASE`, `MAXINE_VFX_ROOT` and `LD_LIBRARY_PATH`. If the shim file is missing, the dynamic loader logs that it cannot be preloaded and the daemon starts normally; an effect then fails with the SDK's reason.
+- A manual run (the daemon, `obc-bench` or the hardware tests) sets the same two variables on the program itself, not on a wrapper in front of it, since a wrapper would load the shim and drop `LD_PRELOAD` before starting the program.
+- The default unit is unchanged: without the drop-in the daemon runs, and an effect fails with the reason.
+
+## Consequences
+- With `none`, the stream pays no conversion and no copy. With an effect, each output frame pays NV12 to BGR, the mask, the blur or composite, and BGR to NV12, all on the GPU with no host copy. Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence; reproduce locally with `obc-bench` (see [../testing.md](../testing.md)).
+- Effects run at the output rate, not the camera rate, because the element sits after the output clock.
+- A repeated frame is processed again. That costs GPU time while the camera is slower than the contract, and it keeps the element stateless with respect to the clock.
+- The first activation with an effect shows black for the model load and the first run, from a fraction of a second up to a few seconds on a cold cache.
+- The SDK's own libraries stay mapped in the process after an unload; only the models, their GPU memory and the CUDA resources are released. A few MiB of the SDK's runtime state stay allocated in the stream's context after an unload, until that context is destroyed.
+- The os-release override is a per-user, per-process configuration that users apply themselves: they build and install the shim and the drop-in. It is documented, not installed and not shipped as a default.
+- The shim depends on the SDK reading the file through an interposable libc call. A future SDK version that reads it with a raw system call, or that checks something other than `/etc/os-release`, would make the load fail again with the SDK's reason; the Maxine hardware tests detect it.
+
+## Alternatives considered
+- **`cudaconvert` to BGR around a BGR-only effect element:** the conversion would run even with `none` (about 3 ms of added latency at 1080p60, [../benchmarks/io-split.md](../benchmarks/io-split.md)), and the SDK's own transfer functions do the same conversion inside the effect.
+- **Adding and removing the element when the effect changes:** relinking a playing pipeline is fragile ([ADR-0002](0002-gstreamer-engine.md)) and could renegotiate caps downstream.
+- **Processing in place on the input buffer:** the clock pushes the same buffer for repeats, so a repeat would be processed twice.
+- **Raw camera frames during warm-up:** smoother, but it shows the background the user asked to hide.
+- **Falling back to `none` by default when the SDK is missing:** the same leak, triggered by a missing library.
+- **bindgen over the SDK headers:** the build would need the SDK, and some feature headers carry a notice that forbids redistribution.
+- **Linking the SDK at build time:** the binaries would not start without it.
+- **`PrivateUsers=yes` with `BindReadOnlyPaths=<replacement>:/etc/os-release` in the unit:** the model loader accepts the replacement and the session bus works, but inside a user namespace the daemon cannot `readlink` `/proc/<pid>/fd/N` of processes outside it (the kernel's ptrace access check fails across the user-namespace boundary; listing the directory still works). Consumer detection ([ADR-0011](0011-daemon-lifecycle-and-dbus-api.md)) therefore never sees an application opening the virtual camera. Measured on the reference machine.
+- **`unshare -Urm` as the launcher:** the same `/proc/<pid>/fd` limitation; in addition it maps the user to uid 0 in the namespace, so the process presents uid 0 to the session bus and `EXTERNAL` authentication fails.
+- **A custom launcher binary that unshares and bind-mounts:** any user namespace has the same `/proc/<pid>/fd` limitation.
+- **Running the effects in a worker process inside a user namespace, with the daemon outside:** avoids the preload, but adds a process boundary, frame transport between the processes and a second CUDA context or context sharing across processes, for a problem one redirected `fopen` solves.
+- **Modifying `/etc/os-release`:** changes the system for every program, needs root, and is undone by package updates.
+- **A `GstCudaContext` wrapping the primary context:** would let the SDK use the primary context, but the primary context outlives the stream unless released explicitly, against [ADR-0006](0006-on-demand-gpu-lifecycle.md).

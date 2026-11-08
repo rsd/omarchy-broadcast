@@ -40,6 +40,10 @@ pub enum CoreError {
     InvalidColourRange(String),
     #[error("unsupported aspect policy {0:?} (supported: crop, letterbox)")]
     InvalidAspectPolicy(String),
+    #[error("unknown effect {0:?} (supported: none, blur, replace)")]
+    InvalidEffect(String),
+    #[error("unsupported effect failure policy {0:?} (supported: black, none)")]
+    InvalidEffectOnFailure(String),
     #[error("invalid USB id {0:?} (expected vid:pid in hex, e.g. 1234:abcd)")]
     InvalidUsbId(String),
     #[error(
@@ -249,6 +253,91 @@ impl FromStr for AspectPolicy {
             "crop" => Ok(AspectPolicy::Crop),
             "letterbox" => Ok(AspectPolicy::Letterbox),
             _ => Err(CoreError::InvalidAspectPolicy(s.to_string())),
+        }
+    }
+}
+
+/// The video effect of the output (see
+/// `docs/adr/0012-video-effects-and-maxine-backend.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectMode {
+    /// No effect: the camera image as it is.
+    #[default]
+    None,
+    /// Background blur.
+    Blur,
+    /// Background replacement with an image.
+    Replace,
+}
+
+impl EffectMode {
+    /// `none`, `blur` or `replace`: the name in the config, the state file
+    /// and on D-Bus.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EffectMode::None => "none",
+            EffectMode::Blur => "blur",
+            EffectMode::Replace => "replace",
+        }
+    }
+}
+
+impl fmt::Display for EffectMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for EffectMode {
+    type Err = CoreError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(EffectMode::None),
+            "blur" => Ok(EffectMode::Blur),
+            "replace" => Ok(EffectMode::Replace),
+            _ => Err(CoreError::InvalidEffect(s.to_string())),
+        }
+    }
+}
+
+/// What the virtual camera shows when a requested effect cannot run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectOnFailure {
+    /// Black frames, the camera closed and the daemon in `error`: the
+    /// background stays hidden (fails closed).
+    #[default]
+    Black,
+    /// The camera image without the effect, with the reason in `Error`.
+    None,
+}
+
+impl EffectOnFailure {
+    /// `black` or `none`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EffectOnFailure::Black => "black",
+            EffectOnFailure::None => "none",
+        }
+    }
+}
+
+impl fmt::Display for EffectOnFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for EffectOnFailure {
+    type Err = CoreError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "black" => Ok(EffectOnFailure::Black),
+            "none" => Ok(EffectOnFailure::None),
+            _ => Err(CoreError::InvalidEffectOnFailure(s.to_string())),
         }
     }
 }
@@ -981,6 +1070,37 @@ mod tests {
         assert!("stretch".parse::<AspectPolicy>().is_err());
         assert_eq!(AspectPolicy::Letterbox.to_string(), "letterbox");
         assert_eq!(AspectPolicy::default(), AspectPolicy::Crop);
+    }
+
+    #[test]
+    fn effect_mode_and_failure_policy_parse() {
+        for (text, mode) in [
+            ("none", EffectMode::None),
+            ("blur", EffectMode::Blur),
+            (" Replace", EffectMode::Replace),
+        ] {
+            assert_eq!(text.parse::<EffectMode>().unwrap(), mode);
+            assert_eq!(mode.to_string().parse::<EffectMode>().unwrap(), mode);
+        }
+        let e = "sparkle".parse::<EffectMode>().unwrap_err().to_string();
+        assert!(
+            e.contains("\"sparkle\"") && e.contains("none, blur, replace"),
+            "{e}"
+        );
+        assert_eq!(EffectMode::default(), EffectMode::None);
+        assert_eq!(EffectMode::Replace.as_str(), "replace");
+
+        assert_eq!(
+            "black".parse::<EffectOnFailure>().unwrap(),
+            EffectOnFailure::Black
+        );
+        assert_eq!(
+            "NONE".parse::<EffectOnFailure>().unwrap(),
+            EffectOnFailure::None
+        );
+        assert!("raw".parse::<EffectOnFailure>().is_err());
+        assert_eq!(EffectOnFailure::default(), EffectOnFailure::Black);
+        assert_eq!(EffectOnFailure::None.to_string(), "none");
     }
 
     #[test]

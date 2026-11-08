@@ -32,6 +32,21 @@ pub trait OmaBroadcast {
     /// Re-reads the configuration file.
     fn reload_config(&self) -> Result<(), IpcError>;
 
+    /// Selects the video effect: `none`, `blur` or `replace`. Persists
+    /// across restarts. Fails with `InvalidArgument` for an unknown effect,
+    /// or `replace` with no background image set. Revision 2.
+    fn set_effect(&self, effect: &str) -> Result<(), IpcError>;
+
+    /// Sets the strength of `blur`, from 0.0 to 1.0. Persists across
+    /// restarts. Fails with `InvalidArgument` outside that range.
+    /// Revision 2.
+    fn set_blur_strength(&self, strength: f64) -> Result<(), IpcError>;
+
+    /// Sets the background image of `replace`: an absolute path to a
+    /// readable regular file, read by the daemon. Persists across restarts.
+    /// Fails with `InvalidArgument` otherwise. Revision 2.
+    fn set_background_image(&self, path: &str) -> Result<(), IpcError>;
+
     /// Roughly once per second while `active`; `-1` marks a value that
     /// cannot be measured.
     #[zbus(signal)]
@@ -67,9 +82,18 @@ pub trait OmaBroadcast {
     #[zbus(property)]
     fn output_mode(&self) -> zbus::Result<String>;
 
-    /// Effect in use; reserved, always `none` in this revision.
+    /// Effect in use: `none`, `blur` or `replace`.
     #[zbus(property)]
     fn effect(&self) -> zbus::Result<String>;
+
+    /// Strength of `blur`, from 0.0 to 1.0. Revision 2.
+    #[zbus(property)]
+    fn blur_strength(&self) -> zbus::Result<f64>;
+
+    /// Absolute path of the background image of `replace`; empty if none.
+    /// Revision 2.
+    #[zbus(property)]
+    fn background_image(&self) -> zbus::Result<String>;
 
     /// Number of processes holding the virtual camera open.
     #[zbus(property)]

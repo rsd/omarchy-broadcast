@@ -76,7 +76,10 @@ impl Printer {
         if self.json {
             out::line(&json::error_line(f.json_code(), &f.message()));
         } else {
-            out::line(&format!("{}; waiting for it", f.message()));
+            out::line(&format!(
+                "{}; waiting for it",
+                human::printable(&f.message())
+            ));
         }
     }
 }
