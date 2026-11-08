@@ -2,30 +2,53 @@
 # install-user.sh — install oma-broadcast from this checkout for the current
 # user, without root.
 #
-# Builds the release binaries and installs:
+# Builds the release binaries and the os-release shim, and installs:
 #   oma-broadcastd, oma-broadcast  -> ${XDG_BIN_HOME:-~/.local/bin}/
+#   os-release shim                -> ~/.local/lib/oma-broadcast/os-release-shim.so
+#   its replacement os-release     -> ~/.local/lib/oma-broadcast/fake-os-release
+#                                     (from tools/maxine-probe/fake-os-release)
 #   systemd user unit              -> ${XDG_DATA_HOME:-~/.local/share}/systemd/user/oma-broadcastd.service
 #                                     (from dist/, ExecStart pointing at the installed daemon)
 #   D-Bus activation file          -> ${XDG_DATA_HOME:-~/.local/share}/dbus-1/services/br.com.dias.OmaBroadcast.service
 #   install manifest               -> ${XDG_STATE_HOME:-~/.local/state}/oma-broadcast/install-user.manifest
 #
+# The shim (tools/os-release-shim, an LD_PRELOAD library that makes only the
+# daemon's reads of /etc/os-release return the replacement file) is what the
+# NVIDIA Maxine SDK needs on a distribution it does not list. The directory
+# is fixed because it must match dist/systemd/oma-broadcastd.service.d/maxine.conf
+# (%h/.local/lib/oma-broadcast/...). By default the shim is built with `make`
+# and ${CC:-cc} whenever both are available, and skipped with a one-line note
+# when either is missing (not an error); a shim build that fails is an error
+# (exit 1, before anything is changed; use --no-shim to go on without it).
+# Installing the shim does not activate it: the Maxine drop-in is a manual
+# step, printed at the end.
+#
 # It runs no systemctl command and enables nothing; it prints the next steps.
-# It does not install the WirePlumber drop-in or the Omarchy bar plugin.
+# It does not install the WirePlumber drop-in, the Maxine drop-in or the
+# Omarchy bar plugin.
 #
 # Usage:
 #   scripts/install-user.sh [options]
 #
 # Options:
 #   --dry-run    Print every action; build nothing, change nothing.
-#   --no-build   Install the binaries already in ${CARGO_TARGET_DIR:-target}/release
-#                instead of running cargo build.
-#   --uninstall  Remove what this script installed, and only that.
+#   --no-build   Build nothing: install the binaries already in
+#                ${CARGO_TARGET_DIR:-target}/release, and the shim already in
+#                ${CARGO_TARGET_DIR:-target}/os-release-shim/os-release-shim.so
+#                if it exists (otherwise skip the shim, with a note).
+#   --no-shim    Neither build nor install the shim. A shim installed by an
+#                earlier run stays in place and in the manifest, so
+#                --uninstall still removes it.
+#   --uninstall  Remove what this script installed, and only that, including
+#                ~/.local/lib/oma-broadcast once it is empty.
 #   -h, --help   Show this help.
 #
 # Ownership: every text file it writes carries a marker comment line, and the
-# manifest lists every path it wrote, with the sha256 of each binary. It
-# overwrites or removes a text file only if it carries the marker, and a
-# binary only if the manifest lists it with the checksum of the file on disk.
+# manifest lists every path it wrote, with the sha256 of each binary, of the
+# shim and of fake-os-release (which carries no marker, so that it stays
+# byte-identical to the source). It overwrites or removes a text file only if
+# it carries the marker, and a binary, the shim or fake-os-release only if the
+# manifest lists it with the checksum of the file on disk.
 # Any other file at a target path stops it before anything is changed.
 # Re-running it over its own install updates that install.
 #
@@ -36,6 +59,8 @@ set -euo pipefail
 
 MARKER='# Installed by oma-broadcast scripts/install-user.sh; remove with scripts/install-user.sh --uninstall'
 BINARIES=(oma-broadcastd oma-broadcast)
+# File names whose ownership is the manifest checksum, not a marker line.
+SUMMED=("${BINARIES[@]}" os-release-shim.so fake-os-release)
 UNIT_NAME=oma-broadcastd.service
 DBUS_NAME=br.com.dias.OmaBroadcast.service
 
@@ -52,11 +77,13 @@ warn() { printf 'install-user: warning: %s\n' "$*" >&2; }
 
 dry_run=0
 build=1
+want_shim=1
 mode=install
 while (($#)); do
   case $1 in
     --dry-run) dry_run=1; shift ;;
     --no-build) build=0; shift ;;
+    --no-shim) want_shim=0; shift ;;
     --uninstall) mode=uninstall; shift ;;
     -h | --help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
@@ -85,13 +112,22 @@ bin_dir=$(xdg_dir XDG_BIN_HOME "$HOME/.local/bin")
 data_dir=$(xdg_dir XDG_DATA_HOME "$HOME/.local/share")
 state_dir=$(xdg_dir XDG_STATE_HOME "$HOME/.local/state")/oma-broadcast
 config_dir=$(xdg_dir XDG_CONFIG_HOME "$HOME/.config")
-target_dir=${CARGO_TARGET_DIR:-$repo/target}
+# Absolute, as cargo resolves a relative CARGO_TARGET_DIR (against the cwd):
+# make runs in tools/os-release-shim, so a relative OUT would land elsewhere.
+target_dir=$(realpath -m -- "${CARGO_TARGET_DIR:-$repo/target}")
+# No XDG variable exists for this; it must match the Maxine drop-in.
+lib_dir=$HOME/.local/lib/oma-broadcast
 
 unit_src=$repo/dist/systemd/$UNIT_NAME
 dbus_src=$repo/dist/dbus-1/services/$DBUS_NAME
 unit_dst=$data_dir/systemd/user/$UNIT_NAME
 dbus_dst=$data_dir/dbus-1/services/$DBUS_NAME
 manifest=$state_dir/install-user.manifest
+shim_out=$target_dir/os-release-shim
+shim_built=$shim_out/os-release-shim.so
+fake_src=$repo/tools/maxine-probe/fake-os-release
+shim_dst=$lib_dir/os-release-shim.so
+fake_dst=$lib_dir/fake-os-release
 
 bin_dsts=()
 for b in "${BINARIES[@]}"; do bin_dsts+=("$bin_dir/$b"); done
@@ -121,12 +157,13 @@ run() {
 
 is_binary_target() {
   local b
-  for b in "${BINARIES[@]}"; do [[ ${1##*/} == "$b" ]] && return 0; done
+  for b in "${SUMMED[@]}"; do [[ ${1##*/} == "$b" ]] && return 0; done
   return 1
 }
 
 # Manifest format, after the marker and comment lines: one path per line for
-# a text file, and "<sha256>  <path>" (sha256sum output) for a binary. A path
+# a text file, and "<sha256>  <path>" (sha256sum output) for a binary, the
+# shim and fake-os-release. A path
 # may appear with more than one checksum while an install is in progress.
 sha_re='^[0-9a-f]{64}  (/.*)$'
 
@@ -161,7 +198,8 @@ file_sum() {
 }
 
 # Ownership of an existing path: 0 if this script installed it. A text file
-# is ours if it carries the marker line, a binary if the manifest lists it
+# is ours if it carries the marker line, a binary (or the shim files) if the
+# manifest lists it
 # with the checksum of the file on disk. Sets WHY to the reason when it is
 # not ours.
 owned() {
@@ -185,7 +223,17 @@ owned() {
     elif manifest_lists "$path"; then
       WHY="it changed since install-user.sh installed it (its sha256 does not match $manifest); check it and remove it by hand if it is not needed"
     else
-      WHY="binary not listed in $manifest"
+      WHY="not listed in $manifest (not installed by install-user.sh)"
+      case $path in
+        "$shim_dst" | "$fake_dst")
+          WHY+="; this looks like a shim installed by hand (following the manual setup docs). Either remove the hand-installed copies in $lib_dir (os-release-shim.so and fake-os-release) and re-run, or re-run with --no-shim to leave them alone"
+          if [[ $path == "$fake_dst" ]] && cmp -s -- "$path" "$fake_src"; then
+            WHY+=". It is identical to tools/maxine-probe/fake-os-release"
+          elif [[ $path == "$shim_dst" && -f $shim_built ]] && cmp -s -- "$path" "$shim_built"; then
+            WHY+=". It is identical to the shim at $shim_built"
+          fi
+          ;;
+      esac
     fi
     return 1
   fi
@@ -243,6 +291,8 @@ if [[ $mode == uninstall ]]; then
       [[ -n $path ]] && targets+=("$path")
     done <"$manifest"
   fi
+  # (The shim files are only ever removed through the manifest: a copy there
+  # that this script did not install is none of its business.)
   mapfile -t targets < <(printf '%s\n' "${targets[@]}" | sort -u)
 
   # Removing the file of an enabled unit leaves a dangling enable link:
@@ -265,11 +315,23 @@ if [[ $mode == uninstall ]]; then
   check_targets "${targets[@]}" "$manifest"
 
   removed=0
+  lib_dirs=()
   for path in "${targets[@]}"; do
     [[ -e $path ]] || continue
     run rm -f -- "$path"
     removed=1
+    case ${path##*/} in
+      os-release-shim.so | fake-os-release) lib_dirs+=("${path%/*}") ;;
+    esac
   done
+  # The library directory goes once it is empty (rmdir only removes an empty one).
+  if ((${#lib_dirs[@]})); then
+    while IFS= read -r path; do
+      if [[ ${path##*/} == oma-broadcast ]]; then
+        run rmdir --ignore-fail-on-non-empty -- "$path"
+      fi
+    done < <(printf '%s\n' "${lib_dirs[@]}" | sort -u)
+  fi
   if [[ -e $manifest ]]; then
     run rm -f -- "$manifest"
     run rmdir --ignore-fail-on-non-empty -- "$state_dir"
@@ -288,6 +350,15 @@ Next steps (not run by this script):
   systemctl --user stop oma-broadcastd    # if it is still running
   systemctl --user daemon-reload
 EOF
+  if ((${#lib_dirs[@]})); then
+    cat <<EOF
+
+The os-release shim is gone. If you activated the Maxine drop-in, remove it
+too, since it now points at removed files:
+  rm $(printf '%q' "$config_dir/systemd/user/oma-broadcastd.service.d/maxine.conf")
+  systemctl --user daemon-reload
+EOF
+  fi
   exit 0
 fi
 
@@ -305,9 +376,36 @@ n=$(grep -c -- "$exec_re" "$unit_src" || true)
   exit 2
 }
 
+# Whether to install the shim: wanted, and either buildable here (make and a
+# C compiler) or, with --no-build, already built.
+note() { printf 'install-user: note: %s\n' "$*"; }
+shim_tools() {
+  local cc
+  read -r cc _ <<<"${CC:-cc}"
+  command -v make >/dev/null 2>&1 && command -v "$cc" >/dev/null 2>&1
+}
+do_shim=0
+if ((want_shim)); then
+  if ((!build)); then
+    if [[ -f $shim_built ]]; then
+      do_shim=1
+    else
+      note "os-release shim skipped: --no-build and no $shim_built (build it with: make -C $(printf '%q' "$repo/tools/os-release-shim") OUT=$(printf '%q' "$shim_out"))"
+    fi
+  elif shim_tools; then
+    do_shim=1
+  else
+    note "os-release shim skipped: needs make and a C compiler (${CC:-cc}); install them (Arch: base-devel) and re-run, or see tools/os-release-shim/README.md"
+  fi
+fi
+if ((do_shim)); then
+  [[ -f $fake_src ]] || die "missing $fake_src"
+fi
+
 # Previously installed paths that still exist stay in the manifest, so
 # --uninstall finds them even if the XDG directories changed since. The
-# current targets are left out here and listed afresh below.
+# current targets are left out here and listed afresh below. The shim files
+# stay listed when this run does not install them (--no-shim, or skipped).
 kept=()
 if [[ -f $manifest ]]; then
   while IFS= read -r line; do
@@ -317,11 +415,14 @@ if [[ -f $manifest ]]; then
       "$unit_dst" | "$dbus_dst") continue ;;
     esac
     for dst in "${bin_dsts[@]}"; do [[ $path == "$dst" ]] && continue 2; done
+    if ((do_shim)) && [[ $path == "$shim_dst" || $path == "$fake_dst" ]]; then continue; fi
     kept+=("$line")
   done <"$manifest"
 fi
 
-check_targets "${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "$manifest"
+shim_dsts=()
+if ((do_shim)); then shim_dsts=("$shim_dst" "$fake_dst"); fi
+check_targets "${bin_dsts[@]}" "${shim_dsts[@]}" "$unit_dst" "$dbus_dst" "$manifest"
 
 if ((build)); then
   run cargo build --manifest-path "$repo/Cargo.toml" --release --locked -p oma-broadcastd -p oma-broadcast || {
@@ -329,10 +430,19 @@ if ((build)); then
     exit 1
   }
 fi
+if ((do_shim && build)); then
+  run make -C "$repo/tools/os-release-shim" OUT="$shim_out" || {
+    printf 'install-user: building the os-release shim failed; nothing was changed (use --no-shim to install without it)\n' >&2
+    exit 1
+  }
+fi
 if ((!dry_run)); then
   for b in "${BINARIES[@]}"; do
     [[ -x $target_dir/release/$b ]] || die "no built binary at $target_dir/release/$b (run without --no-build)"
   done
+  if ((do_shim)); then
+    [[ -f $shim_built ]] || die "no built shim at $shim_built"
+  fi
 fi
 
 # The manifest text: its marker, the kept lines and the given lines.
@@ -342,28 +452,38 @@ manifest_text() {
   printf '%s\n' "${kept[@]}" "$@" "$unit_dst" "$dbus_dst" | sort -u
 }
 
+# What to install with a checksum in the manifest: source, destination, mode.
+srcs=() dsts=() modes=()
+for b in "${BINARIES[@]}"; do
+  srcs+=("$target_dir/release/$b") dsts+=("$bin_dir/$b") modes+=(755)
+done
+if ((do_shim)); then
+  srcs+=("$shim_built" "$fake_src") dsts+=("$shim_dst" "$fake_dst") modes+=(755 644)
+fi
+
 run mkdir -p -- "$bin_dir"
+if ((do_shim)); then run mkdir -p -- "$lib_dir"; fi
 # Install beside the target, then rename: replacing a running binary in place
 # would fail with "Text file busy".
 old_sums=() new_sums=()
-for b in "${BINARIES[@]}"; do
-  tmp=$bin_dir/.$b.install-user
+for i in "${!dsts[@]}"; do
+  tmp=${dsts[i]%/*}/.${dsts[i]##*/}.install-user
   ((dry_run)) || tmp_files+=("$tmp")
-  run install -m755 -T -- "$target_dir/release/$b" "$tmp"
+  run install -m"${modes[i]}" -T -- "${srcs[i]}" "$tmp"
   if ((dry_run)); then
-    new_sums+=("$bin_dir/$b")
+    new_sums+=("${dsts[i]}")
   else
-    new_sums+=("$(file_sum "$tmp")  $bin_dir/$b")
-    # check_targets verified any binary already there against the manifest.
-    [[ ! -e $bin_dir/$b ]] || old_sums+=("$(file_sum "$bin_dir/$b")  $bin_dir/$b")
+    new_sums+=("$(file_sum "$tmp")  ${dsts[i]}")
+    # check_targets verified anything already there against the manifest.
+    [[ ! -e ${dsts[i]} ]] || old_sums+=("$(file_sum "${dsts[i]}")  ${dsts[i]}")
   fi
 done
 
 # The manifest lists both checksums while the binaries are replaced, so an
 # interrupted run leaves either version recognised and a re-run may proceed.
 put_text "$manifest" manifest_text "${old_sums[@]}" "${new_sums[@]}"
-for b in "${BINARIES[@]}"; do
-  run mv -f -T -- "$bin_dir/.$b.install-user" "$bin_dir/$b"
+for i in "${!dsts[@]}"; do
+  run mv -f -T -- "${dsts[i]%/*}/.${dsts[i]##*/}.install-user" "${dsts[i]}"
 done
 put_text "$manifest" manifest_text "${new_sums[@]}"
 
@@ -390,6 +510,7 @@ esac
 
 plugin=$repo/clients/omarchy-bar/br.com.dias.oma-broadcast
 wp_src=$repo/dist/systemd/wireplumber.service.d/oma-broadcast.conf
+maxine_src=$repo/dist/systemd/oma-broadcastd.service.d/maxine.conf
 done_msg="Installed."
 ((!dry_run)) || done_msg="Dry run: nothing was changed."
 cat <<EOF
@@ -409,3 +530,14 @@ Optional, the Omarchy bar plugin:
   mkdir -p ~/.config/omarchy/plugins && ln -s $(printf '%q' "$plugin") ~/.config/omarchy/plugins/br.com.dias.oma-broadcast
   omarchy plugin enable br.com.dias.oma-broadcast
 EOF
+if ((do_shim)); then
+  cat <<EOF
+
+Optional, NVIDIA Maxine video effects (the os-release shim is installed in
+$(printf '%q' "$lib_dir")): install the Maxine SDK as described in
+docs/setup/maxine.md, then activate the shim for the daemon only:
+  install -Dm644 $(printf '%q' "$maxine_src") $(printf '%q' "$config_dir/systemd/user/oma-broadcastd.service.d/maxine.conf")
+  systemctl --user daemon-reload
+  systemctl --user restart oma-broadcastd
+EOF
+fi

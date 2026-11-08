@@ -2,7 +2,7 @@
 
 A small `LD_PRELOAD` library that shows one process a replacement `/etc/os-release`. It exists for one reason: the model loader of the NVIDIA Maxine Video Effects SDK reads `/etc/os-release` and refuses distributions it does not list, so on an unlisted distribution `NvVFX_Load` fails with `-1209` ([docs/setup/maxine.md](../../docs/setup/maxine.md), section 7). The daemon preloads this library through the optional systemd drop-in [`dist/systemd/oma-broadcastd.service.d/maxine.conf`](../../dist/systemd/oma-broadcastd.service.d/maxine.conf); the reasons for this mechanism are in [ADR-0012](../../docs/adr/0012-video-effects-and-maxine-backend.md).
 
-It is not part of the Rust build, and nothing installs it: users who want the Maxine effects build and install it themselves.
+It is not part of the Rust build. The Arch package installs it inactive in `/usr/lib/oma-broadcast/` (with an example drop-in under `/usr/share/doc/oma-broadcast/examples/systemd/`), and `scripts/install-user.sh` builds and installs it to `~/.local/lib/oma-broadcast/` when `make` and a C compiler are present (`--no-shim` skips it). Neither route activates it: the user installs the SDK and then installs the systemd drop-in ([docs/setup/maxine.md](../../docs/setup/maxine.md), section 7a).
 
 ## What it does
 
@@ -27,25 +27,25 @@ make -C tools/os-release-shim test       # builds and runs test.sh
 make -C tools/os-release-shim OUT=/dir   # -> /dir/os-release-shim.so
 ```
 
-The build needs only a C compiler and glibc. Install the library and a replacement `os-release` where the systemd drop-in expects them:
+The build needs only a C compiler and glibc. To install by hand the library and a replacement `os-release` where the checkout's systemd drop-in expects them:
 
 ```sh
-install -Dm644 target/os-release-shim/os-release-shim.so ~/.local/lib/oma-broadcast/os-release-shim.so
-install -Dm644 tools/maxine-probe/fake-os-release ~/.local/share/oma-broadcast/fake-os-release
+install -Dm755 target/os-release-shim/os-release-shim.so ~/.local/lib/oma-broadcast/os-release-shim.so
+install -Dm644 tools/maxine-probe/fake-os-release ~/.local/lib/oma-broadcast/fake-os-release
 ```
 
 ## Running a program with it
 
 ```sh
 env LD_PRELOAD=~/.local/lib/oma-broadcast/os-release-shim.so \
-    OMA_BROADCAST_OS_RELEASE=$HOME/.local/share/oma-broadcast/fake-os-release \
+    OMA_BROADCAST_OS_RELEASE=$HOME/.local/lib/oma-broadcast/fake-os-release \
     <program> [args]
 ```
 
 Put `LD_PRELOAD` on the program that loads the SDK, not on a wrapper in front of it: a wrapper such as `timeout`, `sh -c` or `cargo` would load the shim itself, remove `LD_PRELOAD`, and start the program without it. Write `timeout 60 env LD_PRELOAD=... program`, not `LD_PRELOAD=... timeout 60 program`. For `cargo test`, set it through a runner so that only the test binary is preloaded:
 
 ```sh
-OMA_BROADCAST_OS_RELEASE=$HOME/.local/share/oma-broadcast/fake-os-release \
+OMA_BROADCAST_OS_RELEASE=$HOME/.local/lib/oma-broadcast/fake-os-release \
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env LD_PRELOAD=$HOME/.local/lib/oma-broadcast/os-release-shim.so" \
     cargo test -p obc-backend-maxine --test hardware -- --ignored --test-threads=1
 ```
@@ -61,6 +61,6 @@ If the library file is missing, the dynamic loader prints `ERROR: ld.so: object 
 | `shim-test.c` | Calls every interposed entry point and checks what it reads or creates |
 | `test.sh` | Runs `shim-test` with and without the shim, and checks ordinary programs (`cat`, `grep`, `python3`), child processes and namespaces |
 
-## Licence note
+## Support note
 
-The shim only changes what one process of the user's reads, on the user's own machine. It does not modify `/etc/os-release`, the SDK or the models, and it does not touch the model encryption. It is per-user configuration, not a default: oma-broadcast does not install it, and it must not be shipped as a feature of a distributed package. See [docs/setup/maxine.md](../../docs/setup/maxine.md), section 11, for the licence terms this follows.
+This is a compatibility shim for distributions the SDK does not list. It changes only what the process that preloads it reads as `/etc/os-release`; it does not modify `/etc/os-release` on disk, the SDK, the models or their encryption. NVIDIA does not support this configuration. See [docs/setup/maxine.md](../../docs/setup/maxine.md), section 11, for the licence and support notes.
