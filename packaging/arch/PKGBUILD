@@ -1,0 +1,123 @@
+# Maintainer: Raul Dias
+#
+# Arch package of oma-broadcast, built from the local git checkout that holds
+# this file (two directories up). Only committed content is built: makepkg
+# clones the repository, so uncommitted changes are not included. makepkg
+# rewrites pkgver= below on each build; that change need not be committed.
+#
+# Build (from packaging/arch):   makepkg -s
+# Install the result with:       sudo pacman -U oma-broadcast-git-*.pkg.tar.zst
+#
+# The package installs the daemon, the command-line client, the systemd user
+# unit, the D-Bus activation file, the Omarchy bar widget and the
+# documentation. Nothing is enabled: each user runs
+#   systemctl --user enable --now oma-broadcastd.service
+# The v4l2loopback device must be configured as in docs/setup/loopback.md.
+#
+# The NVIDIA Maxine Video Effects SDK (background blur and replace) is
+# licensed separately by NVIDIA and is never part of this package: each user
+# downloads and installs it as described in docs/setup/maxine.md. Without it
+# the daemon runs normally and a requested effect reports why it failed.
+
+pkgname=oma-broadcast-git
+_pkgname=oma-broadcast
+pkgver=0.6.1
+pkgrel=1
+pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API, a CLI and an Omarchy bar widget'
+arch=('x86_64')
+license=('MIT OR Apache-2.0')
+depends=(
+  'libgcc'                 # libgcc_s.so.1 (split out of gcc-libs on current Arch)
+  'glibc'
+  'glib2'
+  'gstreamer'              # libgstreamer-1.0; capsfilter, queue, filesrc, fakesink
+  'gst-plugins-base-libs'  # libgstapp/libgstvideo; videoconvert(scale), videoscale, appsrc, appsink, videotestsrc
+  'gst-plugins-good'       # v4l2src, v4l2sink, videocrop, jpegdec, pngdec, capssetter
+  'gst-plugins-bad-libs'   # nvcodec plugin and libgstcuda: cudaupload, cudaconvert(scale), cudadownload
+  'cuda'                   # libnvrtc.so, dlopened by libgstcuda for the CUDA converters
+  'nvidia-utils'           # libcuda.so.1 (CUDA driver API) and libnvidia-ml.so.1 (NVML GPU load)
+  'V4L2LOOPBACK-MODULE'    # the loopback kernel module, e.g. v4l2loopback-dkms
+)
+makedepends=('cargo' 'git')
+checkdepends=('dbus')      # /usr/bin/dbus-daemon: the process and CLI tests run a private bus
+optdepends=(
+  'omarchy: the Omarchy shell (Quickshell) for the bar widget'
+  'v4l2loopback-utils: runtime-only loopback setup without modprobe.d'
+)
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+# The checkout that holds this PKGBUILD; resolved at build time, so the
+# package builds from wherever the repository is cloned.
+source=("$_pkgname::git+file://$(realpath -- "$startdir/../..")")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$_pkgname"
+  local version
+  version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+  printf '%s.r%s.g%s' "$version" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p oma-broadcastd -p oma-broadcast
+}
+
+check() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # The default test run needs no GPU, camera or loopback device; the
+  # hardware and SDK tests are ignored. A Maxine environment of the builder
+  # must not leak into it (docs/testing.md).
+  env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u OMA_BROADCAST_OS_RELEASE \
+    cargo test --frozen --workspace
+}
+
+package() {
+  cd "$_pkgname"
+
+  install -Dm755 -t "$pkgdir/usr/bin" \
+    target/release/oma-broadcastd \
+    target/release/oma-broadcast
+
+  install -Dm644 dist/systemd/oma-broadcastd.service \
+    "$pkgdir/usr/lib/systemd/user/oma-broadcastd.service"
+  install -Dm644 dist/dbus-1/services/br.com.dias.OmaBroadcast.service \
+    "$pkgdir/usr/share/dbus-1/services/br.com.dias.OmaBroadcast.service"
+
+  install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE-MIT LICENSE-APACHE
+
+  # Documentation, in the repository's layout so that links between the
+  # shipped files resolve. Links to files that are not shipped (decision
+  # records, benchmarks, tests, tools, sources) refer to the repository.
+  local doc="$pkgdir/usr/share/doc/$_pkgname"
+  install -Dm644 -t "$doc" README.md
+  install -Dm644 -t "$doc/docs" docs/dbus-api.md docs/cli-json.md docs/config.example.toml
+  install -Dm644 -t "$doc/docs/setup" docs/setup/*.md
+  install -Dm644 -t "$doc/clients/omarchy-bar" clients/omarchy-bar/README.md
+
+  # Opt-in drop-ins, shipped as inactive examples: one orders WirePlumber
+  # after the daemon, the other runs the daemon with a user-installed Maxine
+  # SDK. Each file's header says where to copy it.
+  install -Dm644 -t "$doc/examples/systemd/wireplumber.service.d" \
+    dist/systemd/wireplumber.service.d/oma-broadcast.conf
+  install -Dm644 -t "$doc/examples/systemd/oma-broadcastd.service.d" \
+    dist/systemd/oma-broadcastd.service.d/maxine.conf
+
+  # Omarchy bar widget, without its development tests.
+  local plugin=clients/omarchy-bar/br.com.dias.oma-broadcast
+  local dest="$pkgdir/usr/share/$_pkgname/omarchy-bar/br.com.dias.oma-broadcast"
+  local file
+  while IFS= read -r -d '' file; do
+    install -Dm644 "$file" "$dest/${file#"$plugin"/}"
+  done < <(find "$plugin" -path "$plugin/tests" -prune -o -type f -print0)
+}

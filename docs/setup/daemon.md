@@ -1,6 +1,6 @@
 # Running oma-broadcastd as a user service
 
-`oma-broadcastd` is the headless daemon behind the virtual camera. It runs as a systemd user service, owns the D-Bus name `br.com.dias.OmaBroadcast` on the session bus, and starts the camera and the GPU pipeline only while an application is using the virtual camera ([architecture.md](../architecture.md), [ADR-0011](../adr/0011-daemon-lifecycle-and-dbus-api.md)). Nothing is installed by the build; the steps below install the binaries and the unit files for the current user and need no root.
+`oma-broadcastd` is the headless daemon behind the virtual camera. It runs as a systemd user service, owns the D-Bus name `br.com.dias.OmaBroadcast` on the session bus, and starts the camera and the GPU pipeline only while an application is using the virtual camera ([architecture.md](../architecture.md), [ADR-0011](../adr/0011-daemon-lifecycle-and-dbus-api.md)). Nothing is installed by the build. There are three ways to install it: the Arch package, a per-user install with `scripts/install-user.sh`, and a manual install. The last two need no root.
 
 ## Prerequisites
 
@@ -10,18 +10,81 @@
 
 ## Install
 
-1. Install the daemon and the command-line client into `~/.cargo/bin`, from the repository root. The unit starts `%h/.cargo/bin/oma-broadcastd`.
+### Arch package
+
+`packaging/arch/PKGBUILD` builds `oma-broadcast-git` from the committed HEAD of the local checkout (uncommitted changes are not included). Build from `packaging/arch`, then install the result:
+
+```sh
+cd packaging/arch
+makepkg -s
+sudo pacman -U oma-broadcast-git-*.pkg.tar.zst
+```
+
+The package installs:
+
+- `/usr/bin/oma-broadcastd` and `/usr/bin/oma-broadcast`;
+- the unit `/usr/lib/systemd/user/oma-broadcastd.service`;
+- the D-Bus activation file `/usr/share/dbus-1/services/br.com.dias.OmaBroadcast.service`;
+- the Omarchy bar plugin in `/usr/share/oma-broadcast/omarchy-bar/br.com.dias.oma-broadcast/` ([link it](../../clients/omarchy-bar/README.md#install));
+- the licences and this documentation, in `/usr/share/doc/oma-broadcast/`;
+- the optional drop-ins as inactive examples in `/usr/share/doc/oma-broadcast/examples/systemd/` (`wireplumber.service.d/oma-broadcast.conf`, see "Discovery by PipeWire", and `oma-broadcastd.service.d/maxine.conf`, see [maxine.md](maxine.md#7a-the-daemon-systemd-user-unit)).
+
+Nothing is enabled. Each user runs:
+
+```sh
+systemctl --user enable --now oma-broadcastd
+```
+
+The runtime dependencies include the NVIDIA driver userspace (`nvidia-utils`), `cuda` (NVRTC, used by GStreamer's CUDA converters), `gst-plugins-good`, `gst-plugins-bad-libs` and a v4l2loopback kernel module (for example `v4l2loopback-dkms`). The loopback device must still be configured as in [loopback.md](loopback.md). The NVIDIA Maxine VFX SDK is never part of the package; install it as in [maxine.md](maxine.md) (the os-release override described there still needs a source checkout).
+
+### Per-user install from a checkout
+
+From the repository root:
+
+```sh
+scripts/install-user.sh
+```
+
+The script builds the release binaries and installs, without root:
+
+- `oma-broadcastd` and `oma-broadcast` in `${XDG_BIN_HOME:-~/.local/bin}`;
+- the unit in `${XDG_DATA_HOME:-~/.local/share}/systemd/user/`, with `ExecStart=` pointing at the installed daemon;
+- the D-Bus activation file in `${XDG_DATA_HOME:-~/.local/share}/dbus-1/services/`;
+- a manifest, `install-user.manifest`, in `${XDG_STATE_HOME:-~/.local/state}/oma-broadcast/`, which lists every path written and the sha256 of each binary.
+
+Behaviour:
+
+- It refuses to run as root.
+- It marks every text file it writes. It overwrites or removes a file only if it carries that mark (a binary: only if the manifest lists it with the checksum on disk), and stops before changing anything if a target path holds another file. Running it again updates its own install.
+- It runs no `systemctl` command and enables nothing; it prints the next steps.
+- It does not install the WirePlumber drop-in or the bar plugin.
+- It warns when a unit in `~/.config/systemd/user` exists, because that location takes precedence (see below).
+
+Options: `--dry-run` prints every action and changes nothing, `--no-build` installs the binaries already in `${CARGO_TARGET_DIR:-target}/release`, `--uninstall` removes what the script installed, `--help` shows the usage. Exit status: 0 done; 1 refused (a target path holds a file the script did not install, or the unit is still enabled on `--uninstall`) or the build failed; 2 usage error or unusable environment.
+
+Then load and start the service:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now oma-broadcastd
+```
+
+### Manual install
+
+1. Install the daemon and the command-line client into `~/.cargo/bin`, from the repository root.
 
    ```sh
    cargo install --path crates/oma-broadcastd
    cargo install --path crates/oma-broadcast
    ```
 
-2. Install the unit file:
+2. Install the unit file with `ExecStart=` rewritten. The file in `dist/` names `/usr/bin/oma-broadcastd`, the path of the package; copied unchanged after `cargo install`, the service fails to start (status 203/EXEC).
 
    ```sh
-   install -Dm644 dist/systemd/oma-broadcastd.service \
-       ~/.config/systemd/user/oma-broadcastd.service
+   mkdir -p ~/.config/systemd/user
+   sed 's|^ExecStart=/usr/bin/|ExecStart=%h/.cargo/bin/|' \
+       dist/systemd/oma-broadcastd.service \
+       > ~/.config/systemd/user/oma-broadcastd.service
    ```
 
 3. Optional, D-Bus activation: with this file, a command such as `oma-broadcast on` starts the service if it is not running. Reads (`oma-broadcast status`, `watch`) never start it. See [dbus-api.md](../dbus-api.md#service-presence-and-activation).
@@ -31,7 +94,7 @@
        ~/.local/share/dbus-1/services/br.com.dias.OmaBroadcast.service
    ```
 
-4. Optional, discovery through PipeWire: a drop-in that orders WirePlumber after the daemon (see below).
+4. Optional, discovery through PipeWire: a drop-in that orders WirePlumber after the daemon (see below). In a checkout it is `dist/systemd/wireplumber.service.d/oma-broadcast.conf`; the package ships the same file as an example at `/usr/share/doc/oma-broadcast/examples/systemd/wireplumber.service.d/oma-broadcast.conf`.
 
    ```sh
    install -Dm644 dist/systemd/wireplumber.service.d/oma-broadcast.conf \
@@ -47,6 +110,12 @@
 
    If the service was enabled before from an older copy of the unit, run `systemctl --user reenable oma-broadcastd` so that it is wanted by `default.target`.
 
+The same drop-in applies to the other two routes (step 4); the package does not install it.
+
+### Which unit is used
+
+systemd searches the user unit directories in this order and uses the first match: `~/.config/systemd/user`, then `~/.local/share/systemd/user`, then `/usr/lib/systemd/user`. A copy of the unit in a directory earlier in the list shadows the others. In particular, an older manual copy in `~/.config/systemd/user` keeps starting `~/.cargo/bin/oma-broadcastd` after the package is installed; remove it (and run `systemctl --user daemon-reload`) to use the packaged unit. `systemctl --user cat oma-broadcastd` shows which file is in force.
+
 Check it:
 
 ```sh
@@ -60,7 +129,7 @@ The service is ready (`Type=dbus`) once it owns its bus name, which it requests 
 
 WirePlumber probes video devices when it starts. A loopback device that has no writer at that moment is recorded as output-only and not probed again, so applications that list cameras through PipeWire (the camera portal, OBS's PipeWire source, browsers using PipeWire) would not show it. Two remedies:
 
-- The drop-in of step 4 starts WirePlumber after the daemon is ready. Run `systemctl --user daemon-reload` after installing it, and restart WirePlumber once (below) for the current session.
+- The drop-in (manual install, step 4) starts WirePlumber after the daemon is ready. Run `systemctl --user daemon-reload` after installing it, and restart WirePlumber once (below) for the current session.
 - Without the drop-in, or after the daemon was restarted by hand: `systemctl --user restart wireplumber` while the daemon runs.
 
 Applications that open `/dev/video*` directly are not affected. Meanwhile, `gst-device-monitor-1.0 -i Video/Source` lists the camera through the v4l2 provider. Details are in [testing.md](../testing.md#discovery-by-pipewire).
@@ -92,10 +161,23 @@ Add `-v` to `ExecStart` for debug output (consumer counts, teardown times). Exit
 
 ## Stop, disable, uninstall
 
+Stop and disable the service first, on every route:
+
 ```sh
 systemctl --user disable --now oma-broadcastd
-rm ~/.config/systemd/user/oma-broadcastd.service
-rm -f ~/.local/share/dbus-1/services/br.com.dias.OmaBroadcast.service
-rm -f ~/.config/systemd/user/wireplumber.service.d/oma-broadcast.conf
-systemctl --user daemon-reload
 ```
+
+Then, depending on how it was installed:
+
+- Arch package: `sudo pacman -R oma-broadcast-git`. Remove a bar plugin link you made (`rm ~/.config/omarchy/plugins/br.com.dias.oma-broadcast`) and any drop-in you copied from the examples.
+- Per-user install: `scripts/install-user.sh --uninstall` from the checkout. It removes only the files it installed and refuses while the unit is still enabled, hence the command above comes first.
+- Manual install:
+
+  ```sh
+  rm ~/.config/systemd/user/oma-broadcastd.service
+  rm -f ~/.local/share/dbus-1/services/br.com.dias.OmaBroadcast.service
+  rm -f ~/.config/systemd/user/wireplumber.service.d/oma-broadcast.conf
+  cargo uninstall oma-broadcastd oma-broadcast
+  ```
+
+Finish with `systemctl --user daemon-reload`.
