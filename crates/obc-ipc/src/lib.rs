@@ -148,7 +148,8 @@ pub struct CameraInfo {
     /// Stable identifier, accepted by `SelectCamera` and reported by
     /// `ActiveCamera`.
     pub id: String,
-    /// Human-readable name (the V4L2 card name).
+    /// Human-readable name: the V4L2 card name (a repeated `X: X` reduced
+    /// to `X`), unique among the cameras present (` (2)`, ` (3)`, ...).
     pub name: String,
     /// USB `vid:pid` in lower-case hex (`1234:abcd`), empty if not a USB
     /// device.

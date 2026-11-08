@@ -48,7 +48,9 @@
 //! The streaming camera is followed by its device node, not by its id: an
 //! id can change between two scans of the same camera (udev adds the
 //! `/dev/v4l` links after the node), and such a change is a rename, not a
-//! loss.
+//! loss. A node can also be reused by another camera (one unplugged and
+//! another plugged in between two scans): that is a loss, and the
+//! selection stays on the camera that left ([`camera::same_camera`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -697,10 +699,13 @@ impl<B: MediaBackend> Controller<B> {
         self.runtime.effect_over(&self.config.effect)
     }
 
-    /// The camera of the running session, found by its node.
+    /// The camera of the running session, found by its node (and its id,
+    /// which [`Self::follow_renames`] keeps current).
     fn session_camera(&self) -> Option<&Camera> {
         let s = self.session.as_ref()?;
-        self.cameras.iter().find(|c| c.path == s.node)
+        self.cameras
+            .iter()
+            .find(|c| c.path == s.node && c.id == s.camera)
     }
 
     fn state(&self) -> State {
@@ -916,7 +921,10 @@ impl<B: MediaBackend> Controller<B> {
         if self.session_camera().is_none() {
             let id = self.session.as_ref().map(|s| s.camera.clone());
             let msg = format!("camera {} disappeared", id.unwrap_or_default());
-            self.camera_failed(msg, now);
+            warning!("{msg}");
+            // Not marked failed: it is no candidate any more, and its node
+            // may already belong to another camera.
+            self.fail_over(msg, now);
             return;
         }
         if self.poll_effect(now) {
@@ -1053,6 +1061,13 @@ impl<B: MediaBackend> Controller<B> {
         }
         warning!("{reason}");
         self.mark_failed();
+        self.fail_over(reason, now);
+    }
+
+    /// The session's camera stopped (for `reason`): the next camera in
+    /// order that has not failed takes over; with none, the session stops
+    /// and the state is `error`.
+    fn fail_over(&mut self, reason: String, now: Instant) {
         let Some(s) = &self.session else { return };
         let failed_node = s.node.clone();
         let tried: Vec<PathBuf> = s.failed.iter().map(|(n, _)| n.clone()).collect();
@@ -1288,7 +1303,8 @@ impl<B: MediaBackend> Controller<B> {
     /// changed between the two scans (same node) is renamed in the session
     /// and in the runtime selection, not lost.
     fn rescan_cameras(&mut self) -> Vec<Camera> {
-        let found = self.backend.scan_cameras(&self.config.camera_mode());
+        let mut found = self.backend.scan_cameras(&self.config.camera_mode());
+        camera::display_names(&mut found);
         let old = std::mem::replace(
             &mut self.cameras,
             camera::order(found, &self.config.camera_preference()),
@@ -1305,18 +1321,29 @@ impl<B: MediaBackend> Controller<B> {
         old
     }
 
-    /// Follows id changes of cameras still present at the same node.
+    /// Follows id changes of cameras still present at the same node. A
+    /// camera at that node that is not the same device
+    /// ([`camera::same_camera`]) took the node over: no rename.
     fn follow_renames(&mut self, old: &[Camera]) {
-        let renamed = |id: &str| -> Option<String> {
-            let was = old.iter().find(|c| c.id == id)?;
+        let renamed = |id: &str, node: Option<&Path>| -> Option<String> {
+            if self.cameras.iter().any(|c| c.id == id) {
+                return None;
+            }
+            let was = old
+                .iter()
+                .find(|c| c.id == id && node.is_none_or(|n| c.path == n))?;
             let now = self.cameras.iter().find(|c| c.path == was.path)?;
-            (now.id != id).then(|| now.id.clone())
+            camera::same_camera(was, now).then(|| now.id.clone())
         };
-        let session_rename = self.session.as_ref().and_then(|s| {
-            let now = self.cameras.iter().find(|c| c.path == s.node)?;
-            (now.id != s.camera).then(|| now.id.clone())
-        });
-        let selection_rename = self.runtime.camera.as_deref().and_then(renamed);
+        let session_rename = self
+            .session
+            .as_ref()
+            .and_then(|s| renamed(&s.camera, Some(&s.node)));
+        let selection_rename = self
+            .runtime
+            .camera
+            .as_deref()
+            .and_then(|id| renamed(id, None));
         if let Some(new) = session_rename
             && let Some(s) = self.session.as_mut()
         {
@@ -1336,10 +1363,15 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     fn rescan(&mut self, now: Instant) {
-        let before: Vec<PathBuf> = self.cameras.iter().map(|c| c.path.clone()).collect();
-        self.rescan_cameras();
-        let after: Vec<PathBuf> = self.cameras.iter().map(|c| c.path.clone()).collect();
-        if before != after {
+        let old = self.rescan_cameras();
+        let nodes = |c: &[Camera]| c.iter().map(|c| c.path.clone()).collect::<Vec<PathBuf>>();
+        // A node another camera took over changes the set as well.
+        let reused = old.iter().any(|was| {
+            self.cameras
+                .iter()
+                .any(|now| now.path == was.path && !camera::same_camera(was, now))
+        });
+        if nodes(&old) != nodes(&self.cameras) || reused {
             info!(
                 "camera set changed: {}",
                 if self.cameras.is_empty() {
