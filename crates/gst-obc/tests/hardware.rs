@@ -27,7 +27,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fake_backend::{FAKE_BLUR_Y, FAKE_REPLACE_Y, FakeConfig, FakeFactory, FakeLog};
+use fake_backend::{
+    FAKE_BLUR_Y, FAKE_DENOISE_MS, FAKE_DENOISE_UV, FAKE_DENOISE_Y, FAKE_REPLACE_Y, FakeConfig,
+    FakeFactory, FakeLog, Hook,
+};
 use gst::prelude::*;
 use gst_obc::{EffectFallback, EffectKind, EffectSettings, EffectStatus, ObcEffect};
 use gst_video::prelude::*;
@@ -62,6 +65,10 @@ enum Seen {
     Black,
     FakeBlur,
     FakeReplace,
+    /// The fake's denoise stage alone, or under an effect.
+    FakeDenoise,
+    FakeBlurDenoised,
+    FakeReplaceDenoised,
     Other,
 }
 
@@ -87,6 +94,12 @@ fn classify(frame: &[u8], input: &[u8]) -> Seen {
         Seen::FakeBlur
     } else if all(y, FAKE_REPLACE_Y) && all(uv, 128) {
         Seen::FakeReplace
+    } else if all(y, FAKE_DENOISE_Y) && all(uv, FAKE_DENOISE_UV) {
+        Seen::FakeDenoise
+    } else if all(y, FAKE_BLUR_Y) && all(uv, FAKE_DENOISE_UV) {
+        Seen::FakeBlurDenoised
+    } else if all(y, FAKE_REPLACE_Y) && all(uv, FAKE_DENOISE_UV) {
+        Seen::FakeReplaceDenoised
     } else {
         Seen::Other
     }
@@ -158,6 +171,8 @@ struct Rig {
     in_memory: usize,
     pts: u64,
     messages: Vec<(String, String, String)>,
+    /// The `denoise` and `denoise-reason` fields of the same messages.
+    denoise_messages: Vec<(String, String)>,
 }
 
 impl Rig {
@@ -234,17 +249,25 @@ impl Rig {
             in_memory,
             pts: 0,
             messages: Vec::new(),
+            denoise_messages: Vec::new(),
         }
     }
 
     /// Pushes the input once more (a shallow copy, as a clock repeat) and
     /// returns what came out.
     fn frame(&mut self) -> Seen {
+        self.frame_with(gst::BufferFlags::empty())
+    }
+
+    /// [`Self::frame`] with `flags` set on the pushed buffer.
+    fn frame_with(&mut self, flags: gst::BufferFlags) -> Seen {
         let mut b = self.input.copy();
         {
             let b = b.make_mut();
             b.set_pts(gst::ClockTime::from_nseconds(self.pts));
             b.set_duration(gst::ClockTime::from_nseconds(33_333_333));
+            b.unset_flags(gst_obc::NEW_SOURCE_FLAG);
+            b.set_flags(flags);
         }
         self.pts += 33_333_333;
         self.src.push_buffer(b).expect("push");
@@ -282,6 +305,10 @@ impl Rig {
                     s.get::<String>("effect").unwrap(),
                     s.get::<String>("status").unwrap(),
                     s.get::<String>("reason").unwrap(),
+                ));
+                self.denoise_messages.push((
+                    s.get::<String>("denoise").unwrap(),
+                    s.get::<String>("denoise-reason").unwrap(),
                 ));
             }
         }
@@ -346,6 +373,22 @@ fn status_is(want: EffectStatus) -> impl Fn(&Rig) -> bool {
 
 fn failed(r: &Rig) -> bool {
     matches!(r.effect.status(), EffectStatus::Failed(_))
+}
+
+fn denoise_is(want: EffectStatus) -> impl Fn(&Rig) -> bool {
+    move |r| r.effect.denoise_status() == want
+}
+
+fn denoise_failed(r: &Rig) -> bool {
+    matches!(r.effect.denoise_status(), EffectStatus::Failed(_))
+}
+
+/// `kind` with the denoise stage.
+fn denoised(kind: EffectKind) -> EffectSettings {
+    EffectSettings {
+        denoise: true,
+        ..EffectSettings::of(kind)
+    }
 }
 
 fn get(a: &AtomicU64) -> u64 {
@@ -688,6 +731,497 @@ fn gpu_each_stop_releases_the_cuda_context_exactly_once() {
     assert_eq!(get(&fake.log.unloads), 3);
 }
 
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_none_with_denoise_passes_through_until_loaded_then_denoises() {
+    let fake = FakeFactory::new(FakeConfig {
+        load_delay: Duration::from_millis(500),
+        ..FakeConfig::default()
+    });
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &EffectSettings::default());
+    // none without denoise: passthrough, no CUDA at all.
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::Input);
+    }
+    assert!(!rig.effect.stats().cuda_active);
+    assert_eq!(get(&fake.log.creates), 0);
+
+    rig.effect.apply(&denoised(EffectKind::None)).unwrap();
+    assert_eq!(rig.effect.status(), EffectStatus::Off);
+    assert_eq!(rig.effect.denoise_status(), EffectStatus::Loading);
+    let warm = rig.frames_until(Duration::from_secs(10), denoise_is(EffectStatus::Ready));
+    assert!(warm.len() >= 5, "{warm:?}");
+    assert!(
+        warm.iter().all(|s| *s == Seen::Input),
+        "the input while the stage loads, never black: {warm:?}"
+    );
+    for _ in 0..5 {
+        assert_eq!(rig.frame(), Seen::FakeDenoise);
+    }
+    assert_eq!(rig.effect.status(), EffectStatus::Off, "no effect");
+    let s = rig.effect.stats();
+    assert_eq!(s.frames_black, 0);
+    assert!(s.frames_denoised >= 5 && s.frames_denoised == s.frames_processed);
+    assert_eq!(s.denoise_ms_p50, Some(f64::from(FAKE_DENOISE_MS)));
+    assert_eq!(
+        *fake.log.requests.lock().unwrap(),
+        [(EffectKind::None, true)]
+    );
+
+    // Off again: the input at once; the worker unloads.
+    rig.effect.set_property("denoise", false);
+    assert_eq!(rig.frame(), Seen::Input);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while get(&fake.log.unloads) == 0 {
+        assert!(Instant::now() < deadline, "no unload");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(rig.frame(), Seen::Input);
+    assert_eq!(rig.effect.denoise_status(), EffectStatus::Off);
+    rig.drain_messages();
+    let denoise: Vec<&str> = rig.denoise_messages.iter().map(|m| m.0.as_str()).collect();
+    assert_eq!(denoise, ["loading", "ready", "off"], "{:?}", rig.messages);
+    assert!(
+        rig.messages.iter().all(|m| m.1 == "off"),
+        "{:?}",
+        rig.messages
+    );
+    rig.stop();
+    assert!(!rig.effect.stats().cuda_active);
+    assert_eq!(get(&fake.log.wrong_context), 0);
+    assert_eq!(get(&fake.log.wrong_stream), 0);
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_denoise_load_failure_alone_passes_the_input_through_with_the_reason() {
+    let fake = FakeFactory::new(FakeConfig {
+        load_delay: Duration::from_millis(200),
+        fail_denoise_load: Some("fake denoise unavailable".into()),
+        ..FakeConfig::default()
+    });
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &denoised(EffectKind::None));
+    let seen = rig.frames_until(Duration::from_secs(5), denoise_failed);
+    assert!(seen.iter().all(|s| *s == Seen::Input), "{seen:?}");
+    assert_eq!(
+        rig.effect.denoise_status(),
+        EffectStatus::Failed("fake denoise unavailable".into())
+    );
+    assert_eq!(
+        rig.effect.status(),
+        EffectStatus::Off,
+        "the effect never fails"
+    );
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::Input);
+    }
+    assert_eq!(rig.effect.stats().frames_black, 0, "never black");
+    rig.drain_messages();
+    assert!(
+        rig.denoise_messages
+            .contains(&("failed".into(), "fake denoise unavailable".into())),
+        "{:?}",
+        rig.denoise_messages
+    );
+
+    // Off clears the failure; on again retries (and now loads).
+    fake.set(|c| c.fail_denoise_load = None);
+    rig.effect.set_property("denoise", false);
+    assert_eq!(rig.effect.denoise_status(), EffectStatus::Off);
+    rig.effect.set_property("denoise", true);
+    assert_eq!(rig.effect.denoise_status(), EffectStatus::Loading);
+    let seen = rig.frames_until(Duration::from_secs(5), denoise_is(EffectStatus::Ready));
+    assert!(seen.iter().all(|s| *s == Seen::Input), "{seen:?}");
+    assert_eq!(rig.frame(), Seen::FakeDenoise);
+
+    // A retry (apply, unchanged settings) clears a recorded failure too.
+    // (Off, and once unloaded on again, so the stage loads anew: turned on
+    // before the unload it would still be loaded.)
+    fake.set(|c| c.fail_denoise_load = Some("fake denoise unavailable".into()));
+    let unloads = get(&fake.log.unloads);
+    rig.effect.set_property("denoise", false);
+    rig.frames_until(Duration::from_secs(5), |_| get(&fake.log.unloads) > unloads);
+    rig.effect.set_property("denoise", true);
+    rig.frames_until(Duration::from_secs(5), denoise_failed);
+    assert_eq!(rig.frame(), Seen::Input);
+    fake.set(|c| c.fail_denoise_load = None);
+    rig.effect.apply(&denoised(EffectKind::None)).unwrap();
+    assert_eq!(rig.effect.denoise_status(), EffectStatus::Loading);
+    rig.frames_until(Duration::from_secs(5), denoise_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeDenoise);
+    assert_eq!(rig.effect.stats().frames_black, 0, "never black");
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+
+    // Any failure of the stage alone is a denoise failure: here the
+    // backend is unavailable.
+    let missing = FakeFactory::new(FakeConfig {
+        fail_create: Some("fake SDK missing".into()),
+        ..FakeConfig::default()
+    });
+    let mut bare = Rig::new(Some(Arc::clone(&missing)), &denoised(EffectKind::None));
+    let seen = bare.frames_until(Duration::from_secs(5), denoise_failed);
+    assert!(seen.iter().all(|s| *s == Seen::Input), "{seen:?}");
+    assert_eq!(
+        bare.effect.denoise_status(),
+        EffectStatus::Failed("fake SDK missing".into())
+    );
+    assert_eq!(bare.effect.status(), EffectStatus::Off);
+    assert_eq!(bare.frame(), Seen::Input);
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_blur_with_a_failed_denoise_load_runs_the_blur_alone() {
+    let fake = FakeFactory::new(FakeConfig {
+        load_delay: Duration::from_millis(200),
+        fail_denoise_load: Some("fake denoise unavailable".into()),
+        ..FakeConfig::default()
+    });
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &EffectSettings::default());
+    assert_eq!(rig.frame(), Seen::Input);
+    rig.effect.apply(&denoised(EffectKind::Blur)).unwrap();
+    let warm = rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert!(warm.iter().all(|s| *s == Seen::Black), "{warm:?}");
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::FakeBlur, "the blur, without the stage");
+    }
+    assert_eq!(
+        rig.effect.denoise_status(),
+        EffectStatus::Failed("fake denoise unavailable".into())
+    );
+    assert_eq!(rig.effect.status(), EffectStatus::Ready);
+    // The failed attempt with the stage loaded nothing; the blur alone did.
+    assert_eq!(
+        *fake.log.requests.lock().unwrap(),
+        [(EffectKind::Blur, false)]
+    );
+    assert!(rig.effect.stats().frames_processed >= 3);
+    assert_eq!(rig.effect.stats().frames_denoised, 0);
+
+    // The stage becomes available; a retry adds it as a switch: the blur
+    // runs throughout, never black.
+    fake.set(|c| c.fail_denoise_load = None);
+    rig.effect.apply(&denoised(EffectKind::Blur)).unwrap();
+    assert_eq!(
+        rig.effect.status(),
+        EffectStatus::Ready,
+        "the effect is unchanged"
+    );
+    let seen = rig.frames_until(Duration::from_secs(5), denoise_is(EffectStatus::Ready));
+    assert!(
+        seen.iter()
+            .all(|s| matches!(s, Seen::FakeBlur | Seen::FakeBlurDenoised)),
+        "{seen:?}"
+    );
+    assert_eq!(rig.frame(), Seen::FakeBlurDenoised);
+    rig.drain_messages();
+    assert!(
+        rig.messages.iter().all(|m| m.1 != "failed"),
+        "the effect never failed: {:?}",
+        rig.messages
+    );
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_denoise_frame_failure_drops_the_stage_and_keeps_the_effect() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &denoised(EffectKind::Blur));
+    rig.frames_until(Duration::from_secs(5), denoise_is(EffectStatus::Ready));
+    assert_eq!(rig.effect.status(), EffectStatus::Ready);
+    assert_eq!(rig.frame(), Seen::FakeBlurDenoised);
+
+    // For each fallback: the failing frame runs again without the stage,
+    // so it is the effect's (never black, never the input), and so is
+    // every later one.
+    for fallback in [EffectFallback::Black, EffectFallback::None] {
+        let settings = EffectSettings {
+            fallback,
+            ..denoised(EffectKind::Blur)
+        };
+        rig.effect.apply(&settings).unwrap();
+        rig.frames_until(Duration::from_secs(5), denoise_is(EffectStatus::Ready));
+        assert_eq!(rig.frame(), Seen::FakeBlurDenoised, "{fallback:?}");
+        let before = rig.effect.stats();
+        fake.set(|c| c.fail_denoise_process = Some("fake denoise frame failure".into()));
+        assert_eq!(
+            rig.frame(),
+            Seen::FakeBlur,
+            "the failing frame, {fallback:?}"
+        );
+        for _ in 0..3 {
+            assert_eq!(rig.frame(), Seen::FakeBlur, "the chain without the stage");
+        }
+        assert_eq!(
+            rig.effect.status(),
+            EffectStatus::Ready,
+            "the effect never fails"
+        );
+        let reason = rig.effect.denoise_status().reason().unwrap().to_string();
+        assert!(reason.contains("fake denoise frame failure"), "{reason}");
+        let after = rig.effect.stats();
+        assert_eq!(after.frames_processed, before.frames_processed + 4);
+        assert_eq!(after.frames_black, before.frames_black, "{fallback:?}");
+        assert_eq!(
+            after.frames_passthrough, before.frames_passthrough,
+            "never the input, {fallback:?}"
+        );
+        assert_eq!(after.frames_denoised, before.frames_denoised);
+        let processed = get(&fake.log.processes);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(rig.frame(), Seen::FakeBlur);
+        assert_eq!(get(&fake.log.processes), processed + 1);
+        fake.set(|c| c.fail_denoise_process = None);
+    }
+
+    // The stage alone (none): the failing frame is the input, then the
+    // input passes through (the worker unloads).
+    rig.effect.apply(&denoised(EffectKind::Blur)).unwrap();
+    rig.frames_until(Duration::from_secs(5), denoise_is(EffectStatus::Ready));
+    fake.set(|c| c.fail_denoise_process = Some("fake denoise frame failure".into()));
+    rig.effect.apply(&denoised(EffectKind::None)).unwrap();
+    let seen = rig.frames_until(Duration::from_secs(5), denoise_failed);
+    assert!(
+        seen.iter()
+            .all(|s| matches!(s, Seen::FakeBlur | Seen::Input)),
+        "the previous chain, then the input: {seen:?}"
+    );
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::Input);
+    }
+    assert_eq!(rig.effect.status(), EffectStatus::Off);
+    rig.drain_messages();
+    assert!(
+        rig.messages.iter().all(|m| m.1 != "failed"),
+        "the effect never failed: {:?}",
+        rig.messages
+    );
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_an_effect_failing_again_without_the_stage_takes_the_failure_path() {
+    for (fallback, want) in [
+        (EffectFallback::Black, Seen::Black),
+        (EffectFallback::None, Seen::Input),
+    ] {
+        let fake = FakeFactory::new(FakeConfig::default());
+        let settings = EffectSettings {
+            fallback,
+            ..denoised(EffectKind::Blur)
+        };
+        let mut rig = Rig::new(Some(Arc::clone(&fake)), &settings);
+        rig.frames_until(Duration::from_secs(5), denoise_is(EffectStatus::Ready));
+        assert_eq!(rig.frame(), Seen::FakeBlurDenoised);
+        fake.set(|c| {
+            c.fail_denoise_process = Some("fake denoise frame failure".into());
+            c.fail_process = Some("fake frame failure".into());
+        });
+        assert_eq!(rig.frame(), want, "{fallback:?}");
+        let status = rig.effect.status();
+        assert!(
+            matches!(&status, EffectStatus::Failed(r) if r.contains("fake frame failure")),
+            "{status:?}"
+        );
+        let reason = rig.effect.denoise_status().reason().unwrap().to_string();
+        assert!(reason.contains("fake denoise frame failure"), "{reason}");
+        // The failure stays: no request starts behind it.
+        std::thread::sleep(Duration::from_millis(100));
+        for _ in 0..3 {
+            assert_eq!(rig.frame(), want, "{fallback:?}");
+        }
+        assert!(matches!(rig.effect.status(), EffectStatus::Failed(_)));
+        rig.stop();
+        assert_eq!(get(&fake.log.wrong_context), 0);
+    }
+}
+
+/// A frame decided for an earlier request that fails in the denoise stage
+/// still records the failure, while the current request asks for the stage
+/// (as the first frame after turning the stage on: it waited for the switch
+/// under the previous request). Here the request changes while the frame is
+/// in the backend, from the fake's hook.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_denoise_frame_failure_of_an_earlier_request_is_recorded() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &denoised(EffectKind::Blur));
+    rig.frames_until(Duration::from_secs(5), denoise_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeBlurDenoised);
+    let toggle = |fx: &ObcEffect| {
+        let fx = fx.clone();
+        Hook::new(move || {
+            fx.set_property("denoise", false);
+            fx.set_property("denoise", true);
+        })
+    };
+
+    // Blur: the frame is the effect's; the failure is recorded at once.
+    fake.set(|c| {
+        c.fail_denoise_process = Some("fake denoise frame failure".into());
+        c.on_process = Some(toggle(&rig.effect));
+    });
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    let status = rig.effect.denoise_status();
+    assert!(
+        matches!(&status, EffectStatus::Failed(r) if r.contains("fake denoise frame failure")),
+        "{status:?}"
+    );
+    // The worker settles on the effective request (the blur alone); then
+    // the stage would work again, but it is no longer loaded.
+    for _ in 0..10 {
+        assert_eq!(rig.frame(), Seen::FakeBlur);
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    fake.set(|c| c.fail_denoise_process = None);
+    let denoised_frames = rig.effect.stats().frames_denoised;
+    for _ in 0..5 {
+        assert_eq!(rig.frame(), Seen::FakeBlur, "processed, without the stage");
+    }
+    assert_eq!(rig.effect.stats().frames_denoised, denoised_frames);
+    assert_eq!(rig.effect.status(), EffectStatus::Ready);
+    assert_eq!(rig.effect.denoise_status(), status, "still failed");
+
+    // The stage alone: the frame is the input; the failure is recorded at
+    // once, and the worker unloads: the input passes through, untouched.
+    fake.set(|c| c.fail_denoise_process = None);
+    rig.effect.apply(&denoised(EffectKind::None)).unwrap();
+    rig.frames_until(Duration::from_secs(5), denoise_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeDenoise);
+    let unloads = get(&fake.log.unloads);
+    fake.set(|c| {
+        c.fail_denoise_process = Some("fake denoise frame failure".into());
+        c.on_process = Some(toggle(&rig.effect));
+    });
+    assert_eq!(rig.frame(), Seen::Input);
+    assert!(denoise_failed(&rig), "{:?}", rig.effect.denoise_status());
+    rig.frames_until(Duration::from_secs(5), |_| get(&fake.log.unloads) > unloads);
+    std::thread::sleep(Duration::from_millis(100));
+    rig.out_memory.lock().unwrap().clear();
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::Input);
+    }
+    assert!(
+        rig.out_memory
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|m| *m == rig.in_memory),
+        "passed through, not copied with a chain loaded"
+    );
+    assert!(denoise_failed(&rig));
+    assert_eq!(rig.effect.status(), EffectStatus::Off);
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+    assert_eq!(get(&fake.log.wrong_stream), 0);
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_the_green_screen_from_none_with_denoise_loads_black_without_blocking() {
+    let load = Duration::from_millis(800);
+    let fake = FakeFactory::new(FakeConfig {
+        load_delay: load,
+        switch_delay: Duration::from_millis(50),
+        ..FakeConfig::default()
+    });
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &denoised(EffectKind::None));
+    rig.frames_until(Duration::from_secs(10), denoise_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeDenoise);
+
+    // none + denoise -> blur + denoise: the green screen loads cold. Black,
+    // never the (denoised) input, and no frame waits for the load.
+    rig.effect.apply(&denoised(EffectKind::Blur)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    let mut slowest = Duration::ZERO;
+    while rig.effect.status() != EffectStatus::Ready {
+        assert!(Instant::now() < deadline, "timed out: {seen:?}");
+        let t0 = Instant::now();
+        seen.push(rig.frame());
+        slowest = slowest.max(t0.elapsed());
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert!(seen.len() >= 10, "{seen:?}");
+    assert!(seen.iter().all(|s| *s == Seen::Black), "{seen:?}");
+    assert!(
+        slowest < load / 2,
+        "a frame waited {slowest:?} for the {load:?} load"
+    );
+    assert_eq!(rig.frame(), Seen::FakeBlurDenoised);
+
+    // Switches on the loaded chain: never black, never the input.
+    let switches = [
+        (EffectSettings::of(EffectKind::Blur), Seen::FakeBlur),
+        (denoised(EffectKind::Blur), Seen::FakeBlurDenoised),
+        (denoised(EffectKind::None), Seen::FakeDenoise),
+    ];
+    for (settings, want) in switches {
+        let loads = fake.log.requests.lock().unwrap().len();
+        rig.effect.apply(&settings).unwrap();
+        let seen = rig.frames_until(Duration::from_secs(5), |_| {
+            fake.log.requests.lock().unwrap().len() > loads
+        });
+        assert!(
+            seen.iter()
+                .all(|s| !matches!(s, Seen::Black | Seen::Input | Seen::Other)),
+            "{settings:?}: {seen:?}"
+        );
+        assert_eq!(rig.frame(), want, "{settings:?}");
+    }
+    // blur + denoise -> none: the input at once.
+    rig.effect.apply(&denoised(EffectKind::Blur)).unwrap();
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeBlurDenoised);
+    rig.effect.apply(&EffectSettings::default()).unwrap();
+    assert_eq!(rig.frame(), Seen::Input);
+    assert_eq!(rig.caps_events.load(Ordering::SeqCst), 1);
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+    assert_eq!(get(&fake.log.wrong_stream), 0);
+    assert_eq!(get(&fake.log.creates), 1);
+    assert_eq!(get(&fake.log.drops), 1);
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_the_new_source_flag_resets_the_temporal_state_once() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &denoised(EffectKind::Blur));
+    rig.frames_until(Duration::from_secs(5), denoise_is(EffectStatus::Ready));
+    for _ in 0..5 {
+        assert_eq!(rig.frame(), Seen::FakeBlurDenoised);
+    }
+    assert_eq!(get(&fake.log.resets), 0, "no new source yet");
+    assert_eq!(
+        rig.frame_with(gst_obc::NEW_SOURCE_FLAG),
+        Seen::FakeBlurDenoised
+    );
+    assert_eq!(get(&fake.log.resets), 1);
+    for _ in 0..5 {
+        assert_eq!(rig.frame(), Seen::FakeBlurDenoised);
+    }
+    assert_eq!(get(&fake.log.resets), 1, "one reset per new source");
+    // DISCONT (the pacer's skips) is not a new source.
+    rig.frame_with(gst::BufferFlags::DISCONT);
+    assert_eq!(get(&fake.log.resets), 1);
+
+    // The stage alone resets on a new source too.
+    rig.effect.apply(&denoised(EffectKind::None)).unwrap();
+    rig.frames_until(Duration::from_secs(5), denoise_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeDenoise);
+    let before = get(&fake.log.resets);
+    assert_eq!(rig.frame_with(gst_obc::NEW_SOURCE_FLAG), Seen::FakeDenoise);
+    assert_eq!(get(&fake.log.resets), before + 1);
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
 /// The Maxine mask-hardening kernel fails closed through the element: a
 /// kernel that does not load fails the effect, and a kernel launch that
 /// fails on a frame blacks that frame, both with the reason in the status.
@@ -757,4 +1291,104 @@ fn maxine_mask_kernel_failures_show_black_with_the_reason() {
         assert_eq!(rig.frame(), Seen::Black, "a failed frame path stays black");
     }
     rig.stop();
+}
+
+/// The real denoise stage through the element: alone (the input until it
+/// is loaded, then denoised frames), under blur (the green screen loads
+/// black after the stage alone), and turned off and on while playing (a
+/// switch: every frame processed), and the stage's GPU time measured once
+/// frames are denoised. Needs the Maxine denoise feature
+/// (`features/nvvfxdenoising` of the SDK) installed.
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK with its denoising feature (MAXINE_VFX_ROOT and \
+            its library directories on LD_LIBRARY_PATH), the os-release override, an NVIDIA \
+            GPU and the GStreamer CUDA elements"]
+fn maxine_denoise_alone_under_blur_and_toggled_while_playing() {
+    assert!(
+        std::env::var_os(obc_backend_maxine::ROOT_ENV).is_some_and(|v| !v.is_empty()),
+        "this test needs the Maxine SDK: set MAXINE_VFX_ROOT and put its library directories \
+         on LD_LIBRARY_PATH (crates/obc-backend-maxine/tests/hardware.rs has the setup)"
+    );
+    let maxine = MaxineFactory::from_env();
+    maxine
+        .probe()
+        .unwrap_or_else(|e| panic!("Maxine probe failed: {e}"));
+    let mut rig = Rig::with_factory(Some(Arc::new(maxine)), &EffectSettings::default());
+    assert_eq!(rig.frame(), Seen::Input);
+    assert!(!rig.effect.stats().cuda_active);
+
+    // The stage alone: the input while it loads, then denoised frames.
+    rig.effect.apply(&denoised(EffectKind::None)).unwrap();
+    let warm = rig.frames_until(Duration::from_secs(60), |r| {
+        r.effect.denoise_status() != EffectStatus::Loading
+    });
+    assert_eq!(
+        rig.effect.denoise_status(),
+        EffectStatus::Ready,
+        "the denoise stage did not load"
+    );
+    assert!(warm.iter().all(|s| *s == Seen::Input), "{warm:?}");
+    assert_eq!(rig.effect.status(), EffectStatus::Off);
+    let before = rig.effect.stats().frames_denoised;
+    for _ in 0..5 {
+        let s = rig.frame();
+        assert!(!matches!(s, Seen::Black), "{s:?}");
+    }
+    assert_eq!(rig.effect.stats().frames_denoised, before + 5);
+    // Read after each frame's synchronisation: the backend has the times
+    // of a completed frame only.
+    let p50 = rig.effect.stats().denoise_ms_p50;
+    assert!(
+        p50.is_some_and(|ms| ms > 0.0),
+        "no denoise stage time after denoised frames"
+    );
+
+    // Blur on top: the green screen loads cold, black until ready.
+    rig.effect.apply(&denoised(EffectKind::Blur)).unwrap();
+    let warm = rig.frames_until(Duration::from_secs(60), |r| {
+        r.effect.status() != EffectStatus::Loading
+    });
+    assert_eq!(rig.effect.status(), EffectStatus::Ready);
+    assert_eq!(rig.effect.denoise_status(), EffectStatus::Ready);
+    assert!(warm.iter().all(|s| *s == Seen::Black), "{warm:?}");
+    let processed = |s: &Seen| !matches!(s, Seen::Input | Seen::Black);
+    for _ in 0..5 {
+        let s = rig.frame();
+        assert!(processed(&s), "{s:?}");
+    }
+
+    // Off and on while playing: switches, every frame processed.
+    for on in [false, true] {
+        rig.effect.set_property("denoise", on);
+        let want = if on {
+            EffectStatus::Ready
+        } else {
+            EffectStatus::Off
+        };
+        let seen = rig.frames_until(Duration::from_secs(60), denoise_is(want));
+        for _ in 0..5 {
+            let s = rig.frame();
+            assert!(processed(&s), "denoise {on}: {s:?}");
+        }
+        assert!(seen.iter().all(processed), "denoise {on}: {seen:?}");
+        assert_eq!(rig.effect.status(), EffectStatus::Ready);
+    }
+    // A new source resets the temporal state; the frame is processed.
+    let s = rig.frame_with(gst_obc::NEW_SOURCE_FLAG);
+    assert!(processed(&s), "{s:?}");
+
+    // none: the input at once.
+    rig.effect.apply(&EffectSettings::default()).unwrap();
+    assert_eq!(rig.frame(), Seen::Input);
+    assert_eq!(rig.caps_events.load(Ordering::SeqCst), 1);
+    rig.drain_messages();
+    assert!(
+        rig.messages.iter().all(|m| m.1 != "failed")
+            && rig.denoise_messages.iter().all(|m| m.0 != "failed"),
+        "{:?} {:?}",
+        rig.messages,
+        rig.denoise_messages
+    );
+    rig.stop();
+    assert!(!rig.effect.stats().cuda_active);
 }

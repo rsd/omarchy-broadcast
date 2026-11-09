@@ -43,6 +43,12 @@
 //! ```
 //!
 //! (`$P` and `$LD_LIBRARY_PATH` as `tools/maxine-probe/env.sh` sets them.)
+//!
+//! The noise removal test
+//! (`denoise_stacks_with_the_effect_while_streaming_and_the_gpu_parks`)
+//! needs the same, with the SDK's noise removal feature installed and its
+//! library directory (`features/nvvfxdenoising/lib`, which
+//! `tools/maxine-probe/env.sh` adds) on `LD_LIBRARY_PATH`.
 
 mod common;
 
@@ -381,6 +387,12 @@ impl Client {
     }
     fn set_background_image(&self, p: &str) -> Result<(), IpcError> {
         self.rt.block_on(self.proxy.set_background_image(p))
+    }
+    fn denoise(&self) -> bool {
+        self.rt.block_on(self.proxy.denoise()).unwrap()
+    }
+    fn set_denoise(&self, on: bool) -> Result<(), IpcError> {
+        self.rt.block_on(self.proxy.set_denoise(on))
     }
 
     fn wait_state(&self, want: State, limit: Duration) -> Option<Duration> {
@@ -1664,4 +1676,176 @@ fn the_daemon_parks_the_gpu_when_idle() {
     eprintln!("SIGTERM while parked: exit {code:?} after {took:?}");
     assert_eq!(code, Some(0), "the daemon exits 0 on SIGTERM while parked");
     assert!(took < Duration::from_secs(3), "{took:?}");
+}
+
+const IGNORE_DENOISE: &str = "needs OBC_TEST_SINK (a free v4l2loopback device with \
+     exclusive_caps=1), OBC_TEST_CAMERA, an NVIDIA GPU with a driver that has the CUDA \
+     checkpoint API, /usr/bin/dbus-daemon, cargo, the NVIDIA Maxine VFX SDK with its noise \
+     removal feature and OBC_TEST_PRELOAD with OMARCHY_BROADCAST_OS_RELEASE (see the module \
+     docs)";
+
+/// Noise removal on a live stream: alone with `none`, then stacked under
+/// blur selected while streaming, then off and on again, with no session
+/// restart, no error and frames flowing throughout. The consumer then
+/// leaves with noise removal on: the session, its noise removal instance
+/// with it, is torn down and the daemon parks the GPU (no `/dev/nvidia*`
+/// descriptor or mapping left).
+#[test]
+#[ignore = "needs OBC_TEST_SINK (a free v4l2loopback device with exclusive_caps=1), OBC_TEST_CAMERA, an NVIDIA GPU with a driver that has the CUDA checkpoint API, /usr/bin/dbus-daemon, cargo, the NVIDIA Maxine VFX SDK with its noise removal feature and OBC_TEST_PRELOAD with OMARCHY_BROADCAST_OS_RELEASE"]
+fn denoise_stacks_with_the_effect_while_streaming_and_the_gpu_parks() {
+    let sink = PathBuf::from(
+        std::env::var("OBC_TEST_SINK")
+            .unwrap_or_else(|_| panic!("this test needs OBC_TEST_SINK. {IGNORE_DENOISE}")),
+    );
+    let sink = std::fs::canonicalize(&sink).unwrap_or(sink);
+    let cam = resolve_camera("OBC_TEST_CAMERA");
+    if std::env::var_os("OBC_TEST_PRELOAD").is_none() {
+        panic!("this test needs OBC_TEST_PRELOAD. {IGNORE_DENOISE}");
+    }
+    if let Err(e) = obc_pipeline::effect_backend_available() {
+        panic!("the effect backend is unavailable: {e}. {IGNORE_DENOISE}");
+    }
+    for node in [&sink, &cam.node] {
+        let n = count_holders(Path::new("/proc"), &NodeId::of(node), std::process::id());
+        assert_eq!(
+            n,
+            0,
+            "{} is held by another process (see `fuser -v {}`): not touching it",
+            node.display(),
+            node.display()
+        );
+    }
+    let consumer_bin = consumer_binary();
+    let dir = tempfile::tempdir().unwrap();
+    let bus = PrivateBus::start(dir.path());
+    let env = DaemonEnv::new(dir.path(), &bus);
+    std::fs::write(
+        env.config_file(),
+        format!(
+            "version = 1\n[camera]\npreference = [{:?}]\n[loopback]\ndevice = {:?}\n\
+             [lifecycle]\nidle_grace_s = 1.0\nstart_debounce_ms = 300\n\
+             [effect]\non_failure = \"black\"\n",
+            cam.selector,
+            sink.display().to_string()
+        ),
+    )
+    .unwrap();
+    let (mut daemon, log) = spawn_daemon_logged(&env);
+    let pid = daemon.pid();
+    let client = Client::connect(&env);
+    client.wait_for_daemon(Duration::from_secs(15));
+    assert_eq!(client.state(), State::Idle, "error: {}", client.error());
+    assert!(!holds_nvidia(pid), "a GPU device before any session");
+
+    // Switched on while idle: saved, nothing started.
+    assert!(!client.denoise());
+    client.set_denoise(true).unwrap();
+    assert!(client.denoise());
+    assert_eq!(client.effect(), "none");
+    assert!(!holds_nvidia(pid), "SetDenoise while idle touched the GPU");
+
+    // Waits for the `count`-th daemon log line containing `needle`, or for
+    // the session to leave `active` or report an error.
+    let reached = |needle: &str, count: usize, what: &str| {
+        assert!(
+            wait(Duration::from_secs(30), || log_count(&log, needle) >= count
+                || client.state() != State::Active
+                || !client.error().is_empty()),
+            "{what}: no {needle:?} ({}; {})",
+            client.state(),
+            client.error()
+        );
+        assert_eq!(client.state(), State::Active, "{what}: {}", client.error());
+        assert_eq!(
+            client.error(),
+            "",
+            "{what}: is the noise removal feature on LD_LIBRARY_PATH?"
+        );
+    };
+    let starts = || log_count(&log, "an application opened the virtual camera: starting");
+
+    // ---- `none` with noise removal: the stage alone ----
+    let consumer = Consumer::spawn(&consumer_bin, &sink);
+    assert!(
+        client
+            .wait_state(State::Active, Duration::from_secs(20))
+            .is_some(),
+        "not active: {} ({})",
+        client.state(),
+        client.error()
+    );
+    reached("noise removal ready", 1, "none + denoise");
+    assert!(
+        consumer.wait_more(true, 30, Duration::from_secs(10)),
+        "none + denoise: no frames through the session: {:?}",
+        consumer.runs()
+    );
+
+    // ---- blur selected while streaming: stacked on top ----
+    client.set_effect("blur").unwrap();
+    reached("effect blur ready", 1, "blur + denoise");
+    assert!(
+        consumer.wait_more(true, 30, Duration::from_secs(10)),
+        "blur + denoise: no frames"
+    );
+    assert_eq!(log_count(&log, "noise removal unavailable"), 0);
+    assert!(client.denoise());
+
+    // ---- noise removal off, then on again: the effect stays ----
+    client.set_denoise(false).unwrap();
+    reached("noise removal off", 1, "blur alone");
+    assert!(!client.denoise());
+    assert!(
+        consumer.wait_more(true, 30, Duration::from_secs(10)),
+        "blur alone: no frames"
+    );
+    client.set_denoise(true).unwrap();
+    reached("noise removal ready", 2, "blur + denoise again");
+    assert!(
+        consumer.wait_more(true, 30, Duration::from_secs(10)),
+        "blur + denoise again: no frames"
+    );
+    assert_eq!(client.effect(), "blur");
+    assert_eq!(starts(), 1, "the session was restarted");
+    assert!(holds(pid, &cam.node), "the camera is streaming");
+    assert!(consumer.problems().is_empty(), "{:?}", consumer.problems());
+    assert_eq!(consumer.caps().len(), 1, "caps: {:?}", consumer.caps());
+    let runs = consumer.runs();
+    assert_eq!(
+        runs.iter().map(|r| r.0).collect::<Vec<_>>(),
+        [false, true],
+        "the stream fell back to placeholders: {runs:?}"
+    );
+
+    // ---- the consumer leaves with noise removal on: torn down, parked ----
+    let parked_before = log_count(&log, "GPU parked in");
+    consumer.close();
+    assert!(
+        client
+            .wait_state(State::Idle, Duration::from_secs(15))
+            .is_some(),
+        "not idle: {}",
+        client.state()
+    );
+    assert!(!holds(pid, &cam.node), "{:?}", open_nodes(pid));
+    assert!(
+        wait(Duration::from_secs(10), || log_count(&log, "GPU parked in")
+            > parked_before),
+        "not parked; daemon log: {:?}",
+        log.lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .take(10)
+            .collect::<Vec<_>>()
+    );
+    assert_parked_process(pid, "idle after blur + denoise");
+    assert_eq!(log_count(&log, "cannot park"), 0);
+    assert_eq!(log_count(&log, "cannot be parked"), 0);
+    assert_eq!(log_count(&log, "refused while the GPU was parked"), 0);
+    assert_eq!(client.error(), "");
+    assert!(client.denoise(), "the setting stays");
+    let code = daemon.terminate();
+    assert_eq!(code, Some(0), "the daemon exits 0 on SIGTERM while parked");
+    drop(client);
 }

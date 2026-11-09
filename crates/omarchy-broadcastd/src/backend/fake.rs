@@ -83,11 +83,20 @@ pub struct World {
     pub effect_probes: u32,
     /// An effect applied (at start or by `set_effect`) fails with this.
     pub effect_fail: Option<String>,
+    /// `effect_fail` fails the whole chain, as a load of blur or replace
+    /// does in the element: a requested noise removal stage that has not
+    /// failed itself shows the effect's reason too.
+    pub effect_fail_chain: bool,
     /// An effect applied stays `Loading` (the test sets the status) rather
     /// than becoming `Ready` at once.
     pub effect_slow: bool,
     /// What `effect_report` reports while a session runs.
     pub effect_status: EffectStatus,
+    /// Noise removal applied (at start or by `set_effect`) fails with this:
+    /// the effect is unaffected, as in the element.
+    pub denoise_fail: Option<String>,
+    /// What `effect_report` reports for the noise removal stage.
+    pub denoise_status: EffectStatus,
     /// The effect the running session applies.
     pub effect: Option<EffectConfig>,
     /// Every `set_effect` on a running session, in order.
@@ -158,8 +167,11 @@ impl Default for World {
             effect_unavailable: None,
             effect_probes: 0,
             effect_fail: None,
+            effect_fail_chain: false,
             effect_slow: false,
             effect_status: EffectStatus::Off,
+            denoise_fail: None,
+            denoise_status: EffectStatus::Off,
             effect: None,
             effect_sets: Vec::new(),
             fail_set_effect: None,
@@ -243,8 +255,17 @@ impl World {
     }
 
     /// The running session applies `effect`, as the effect element would:
-    /// `none` is off at once, an effect loads (or fails).
+    /// `none` is off at once, an effect loads (or fails); noise removal,
+    /// apart, is off unless requested, else ready (or fails, itself or
+    /// with the whole chain).
     fn apply_effect(&mut self, effect: &EffectConfig) {
+        self.denoise_status = if !effect.denoise {
+            EffectStatus::Off
+        } else if let Some(r) = &self.denoise_fail {
+            EffectStatus::Failed(r.clone())
+        } else {
+            EffectStatus::Ready
+        };
         self.effect = Some(effect.clone());
         self.effect_status = if effect.mode == EffectMode::None {
             EffectStatus::Off
@@ -255,6 +276,12 @@ impl World {
         } else {
             EffectStatus::Ready
         };
+        if let EffectStatus::Failed(r) = &self.effect_status
+            && self.effect_fail_chain
+            && self.denoise_status == EffectStatus::Ready
+        {
+            self.denoise_status = EffectStatus::Failed(r.clone());
+        }
     }
 }
 
@@ -273,6 +300,7 @@ impl StopSession for FakeSession {
         // The models go with the session.
         w.effect = None;
         w.effect_status = EffectStatus::Off;
+        w.denoise_status = EffectStatus::Off;
         let at_null = w.fail_stop_at_null.take();
         match (w.fail_stop.take(), w.session_unclean.take()) {
             (Some(e), _) | (None, Some(e)) => Err(StopFailure::unclean(e)),
@@ -523,6 +551,7 @@ impl MediaBackend for FakeBackend {
         w.session.as_ref()?;
         Some(EffectReport {
             status: w.effect_status.clone(),
+            denoise: w.denoise_status.clone(),
             load_ms: Some(120.0),
             reused: false,
             gpu_ms_p50: Some(1.2),

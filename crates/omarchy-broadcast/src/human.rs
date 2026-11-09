@@ -1,6 +1,6 @@
 //! Human-readable output: `status`, `cameras`, `effect`, the results of
-//! `on`, `off`, `camera` and `effect ...`, and the lines of `watch` without
-//! `--json`.
+//! `on`, `off`, `camera`, `effect ...` and `denoise ...`, and the lines of
+//! `watch` without `--json`.
 //!
 //! Every string that comes from the daemon (camera names and ids, the
 //! error, the output mode, the effect, the background image, the PipeWire
@@ -82,6 +82,16 @@ pub fn effect_label(s: &Snapshot) -> String {
     }
 }
 
+/// Noise removal as printed: `on`, `off`, or `unknown` from a daemon too
+/// old to have it.
+fn on_off(denoise: Option<bool>) -> &'static str {
+    match denoise {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "unknown",
+    }
+}
+
 /// The consumers: the total, split into loopback and PipeWire while the
 /// PipeWire output is involved (`2 (loopback 1, PipeWire 1)`).
 pub fn consumers_label(s: &Snapshot) -> String {
@@ -96,7 +106,8 @@ pub fn consumers_label(s: &Snapshot) -> String {
 }
 
 /// `status`: one field per line; the PipeWire output's state while it is
-/// involved, the strength with `blur`, the image with `replace`.
+/// involved, the strength with `blur`, the image with `replace`, and noise
+/// removal after the effect (unless the daemon is too old to have it).
 pub fn status_text(s: &Snapshot) -> String {
     let mut out = format!(
         "State:      {}\n\
@@ -119,6 +130,9 @@ pub fn status_text(s: &Snapshot) -> String {
         "replace" => out.push_str(&format!("Image:      {}\n", image(&s.background_image))),
         _ => {}
     }
+    if let Some(d) = model::denoise(s) {
+        out.push_str(&format!("Denoise:    {}\n", on_off(Some(d))));
+    }
     if !s.error.is_empty() {
         out.push_str(&format!("Error:      {}\n", printable(&s.error)));
     }
@@ -126,16 +140,26 @@ pub fn status_text(s: &Snapshot) -> String {
 }
 
 /// `effect`, and the result of `effect ...`: the effect, the blur strength
-/// and the background image, whichever effect is selected.
+/// and the background image, whichever effect is selected, and noise
+/// removal as `status` shows it (unless the daemon is too old to have it).
 pub fn effect_text(s: &Snapshot) -> String {
-    format!(
+    let mut out = format!(
         "Effect:     {}\n\
          Strength:   {}\n\
          Image:      {}\n",
         printable(&s.effect),
         strength(s.blur_strength),
         image(&s.background_image),
-    )
+    );
+    if let Some(d) = model::denoise(s) {
+        out.push_str(&format!("Denoise:    {}\n", on_off(Some(d))));
+    }
+    out
+}
+
+/// After `denoise on|off`.
+pub fn denoise_text(s: &Snapshot) -> String {
+    format!("Denoise:    {}\n", on_off(model::denoise(s)))
 }
 
 /// `cameras`: one camera per line in the daemon's order, the active one
@@ -196,6 +220,9 @@ pub fn summary_line(s: &Snapshot) -> String {
         printable(&s.output_mode),
         effect_label(s),
     );
+    if let Some(d) = model::denoise(s) {
+        line.push_str(&format!(" | denoise {}", on_off(Some(d))));
+    }
     if !s.error.is_empty() {
         line.push_str(&format!(" | error: {}", printable(&s.error)));
     }
@@ -228,6 +255,7 @@ pub fn change_lines(s: &Snapshot, changes: &Changes) -> Vec<String> {
             "effect" => format!("effect: {}", printable(&s.effect)),
             "blur_strength" => format!("blur strength: {}", strength(s.blur_strength)),
             "background_image" => format!("background image: {}", image(&s.background_image)),
+            "denoise" => format!("denoise: {}", on_off(model::denoise(s))),
             "interface_revision" => format!("interface revision: {}", s.interface_revision),
             other => format!("{other}: changed"),
         };
@@ -304,6 +332,8 @@ mod tests {
             loopback_consumers: 0,
             pipewire_consumers: 0,
             pipewire_output: "off".into(),
+            // Before noise removal: the outputs without it.
+            denoise: false,
             interface_revision: 3,
         }
     }
@@ -432,6 +462,50 @@ mod tests {
     }
 
     #[test]
+    fn denoise_is_shown_next_to_the_effect_from_revision_4() {
+        let mut s = sample();
+        assert!(!status_text(&s).contains("Denoise"), "{}", status_text(&s));
+        assert!(!summary_line(&s).contains("denoise"));
+        assert_eq!(denoise_text(&s), "Denoise:    unknown\n");
+        s.interface_revision = 4;
+        s.denoise = true;
+        s.effect = "blur".into();
+        s.error = "noise removal unavailable: x".into();
+        assert!(
+            status_text(&s).ends_with(
+                "Effect:     blur\nStrength:   0.50\nDenoise:    on\n\
+                 Error:      noise removal unavailable: x\n"
+            ),
+            "{}",
+            status_text(&s)
+        );
+        assert!(
+            summary_line(&s).ends_with(
+                "| effect blur (strength 0.50) | denoise on | error: noise removal unavailable: x"
+            ),
+            "{}",
+            summary_line(&s)
+        );
+        assert_eq!(denoise_text(&s), "Denoise:    on\n");
+        let mut off = s.clone();
+        off.denoise = false;
+        assert!(status_text(&off).contains("Denoise:    off\n"));
+        assert_eq!(denoise_text(&off), "Denoise:    off\n");
+        assert_eq!(
+            change_lines(&off, &model::diff(&s, &off)),
+            vec!["denoise: off"]
+        );
+        // A daemon of revision 4 replacing an older one: the value appears.
+        let old = sample();
+        let mut new = old.clone();
+        new.interface_revision = 4;
+        assert_eq!(
+            change_lines(&new, &model::diff(&old, &new)),
+            vec!["denoise: off", "interface revision: 4"]
+        );
+    }
+
+    #[test]
     fn effect_lists_effect_strength_and_image() {
         let mut s = sample();
         assert_eq!(
@@ -449,6 +523,13 @@ mod tests {
         s.effect = "blur".into();
         s.blur_strength = 1.0;
         assert_eq!(effect_label(&s), "blur (strength 1.00)");
+        // From revision 4, noise removal follows, as in `status`.
+        s.interface_revision = 4;
+        s.denoise = true;
+        assert_eq!(
+            effect_text(&s),
+            "Effect:     blur\nStrength:   1.00\nImage:      /home/u/bg.png\nDenoise:    on\n"
+        );
     }
 
     #[test]

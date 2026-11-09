@@ -39,13 +39,17 @@
 //! `--effect none|blur|replace` inserts the `obceffect` element in the
 //! Process stage (`none` in passthrough, to measure the element's own cost;
 //! without `--effect` there is no element), with `--blur-strength` and
-//! `--background`. A requested effect is waited for (ready, or the run
-//! fails with the reason) before the warm-up. `--effect-switch-every S`
-//! cycles none -> blur -> replace (replace only with `--background`) inside
-//! the measurement window; the report's `effect` section has the element's
-//! counters, its GPU time per frame, the load time, the caps events at the
-//! sink (one: an effect change never renegotiates) and per switch the time
-//! to ready and the black, processed and passthrough frames.
+//! `--background`. `--denoise` adds the video noise removal stage
+//! (`docs/adr/0018-video-noise-removal.md`) before the effect, or alone with
+//! `--effect none`. A requested effect, and the denoise stage, are waited
+//! for (ready, or the run fails with the reason) before the warm-up.
+//! `--effect-switch-every S` cycles none -> blur -> replace (replace only
+//! with `--background`) inside the measurement window, keeping `--denoise`
+//! throughout; the report's `effect` section has the element's counters,
+//! its GPU time per frame, the denoise request, its status and the frames
+//! and GPU time of the stage, the load time, the caps events at the sink
+//! (one: an effect change never renegotiates) and per switch the time to
+//! ready and the black, processed and passthrough frames.
 //!
 //! `--duration 0` streams until SIGINT/SIGTERM instead, printing a status
 //! line every 5 s and one line per switch. `--consumer` is allowed there for
@@ -170,6 +174,10 @@ struct Args {
     /// Output after an effect failure: black | none (the raw input).
     #[arg(long, default_value = "black")]
     effect_on_failure: EffectFallback,
+    /// Add the video noise removal stage before the effect (alone with
+    /// `--effect none`). Needs --effect.
+    #[arg(long)]
+    denoise: bool,
     /// Cycle the effect none -> blur -> replace (replace only with
     /// --background) every this many seconds inside the measurement
     /// window. Needs --effect (the starting point of the cycle).
@@ -259,6 +267,7 @@ impl Args {
             blur_strength: self.blur_strength,
             background: self.background.clone(),
             fallback: self.effect_on_failure,
+            denoise: self.denoise,
         }
     }
 
@@ -276,6 +285,9 @@ impl Args {
         let Some(kind) = self.effect else {
             if self.effect_switch_every.is_some() {
                 bail!("--effect-switch-every needs --effect (the effect the cycle starts with)");
+            }
+            if self.denoise {
+                bail!("--denoise needs --effect (--effect none for the denoise stage alone)");
             }
             return Ok(());
         };
@@ -1103,6 +1115,19 @@ struct EffectSection {
     /// call), median and p95 over the element's last 300 processed frames.
     gpu_ms_p50: Option<f64>,
     gpu_ms_p95: Option<f64>,
+    /// `--denoise`: the denoise stage was requested.
+    denoise: bool,
+    /// Its status when the window closed (`off` unless requested), and the
+    /// reason if it failed (the stage was dropped; the effect ran on).
+    denoise_status: String,
+    denoise_reason: Option<String>,
+    /// Processed frames in the window the denoise stage ran on.
+    frames_denoised: u64,
+    /// GPU time of the denoise stage alone (the backend's stage timings,
+    /// `denoise_ms`), median and p95 over the element's last 300 denoised
+    /// frames the backend timed.
+    denoise_ms_p50: Option<f64>,
+    denoise_ms_p95: Option<f64>,
     /// Caps events at the sink over the whole run: 1 means no effect change
     /// renegotiated.
     sink_caps_events: u64,
@@ -1122,13 +1147,17 @@ struct EffectSwitchReport {
     ready_after_ms: Option<f64>,
     /// The failure reason, if the change failed.
     reason: Option<String>,
+    /// The denoise stage's failure reason, if it was dropped at this change
+    /// (the effect ran on without it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    denoise_reason: Option<String>,
     /// Frames from this change to the next (or to the end of the window).
     frames_processed: u64,
     frames_black: u64,
     frames_passthrough: u64,
 }
 
-const EFFECT_NOTE: &str = "frames_* are deltas of the element's counters over the window; gpu_ms_* come from the element's window of its last 300 processed frames when the window closed; load_ms is the backend's load plus its warm-up run, measured by the element";
+const EFFECT_NOTE: &str = "frames_* are deltas of the element's counters over the window; gpu_ms_* come from the element's window of its last 300 processed frames when the window closed, denoise_ms_* from its window of the backend's denoise stage times over its last 300 denoised frames; load_ms is the backend's load plus its warm-up run, measured by the element";
 
 /// The frame counter deltas between two snapshots.
 fn effect_frames(a: &EffectStats, b: &EffectStats) -> (u64, u64, u64) {
@@ -1434,7 +1463,8 @@ fn run(args: &Args) -> Result<()> {
     if let Some(k) = args.effect {
         let s = args.effect_settings(k);
         println!(
-            "effect: {k} (strength {:.2}{}, on failure {}){}",
+            "effect: {k}{} (strength {:.2}{}, on failure {}){}",
+            if s.denoise { " + denoise" } else { "" },
             s.blur_strength,
             s.background
                 .as_ref()
@@ -2471,10 +2501,17 @@ fn run_session(
                 cycle[0].label()
             ),
         }
-        // A requested effect must be ready (or fail) before the warm-up.
-        if args.effect.is_some_and(|k| k != EffectKind::None) {
-            let settled =
-                |s: &Stream| !matches!(s.session.output().effect_status(), EffectStatus::Loading);
+        // A requested effect, and the denoise stage, must be ready (or
+        // fail) before the warm-up.
+        if args
+            .effect
+            .is_some_and(|k| k != EffectKind::None || args.denoise)
+        {
+            let settled = |s: &Stream| {
+                let o = s.session.output();
+                !matches!(o.effect_status(), EffectStatus::Loading)
+                    && !matches!(o.denoise_status(), EffectStatus::Loading)
+            };
             match s.wait_until(rec.now_ns() + secs_ns(60.0), settled)? {
                 Wait::Done => {}
                 Wait::Interrupted => return Err(interrupted_before()),
@@ -2482,6 +2519,9 @@ fn run_session(
             }
             if let EffectStatus::Failed(reason) = s.session.output().effect_status() {
                 bail!("the effect failed: {reason}");
+            }
+            if let EffectStatus::Failed(reason) = s.session.output().denoise_status() {
+                bail!("the denoise stage failed: {reason}");
             }
         }
         let t_first = rec.now_ns();
@@ -2615,6 +2655,7 @@ fn run_session(
             }
             if effect_pending && let Some(r) = effect_switches.last_mut() {
                 let status = s.session.output().effect_status();
+                let denoise = s.session.output().denoise_status();
                 let (at, _) = effect_open.as_ref().expect("an open switch");
                 let done = match &status {
                     EffectStatus::Ready | EffectStatus::Off => true,
@@ -2623,6 +2664,13 @@ fn run_session(
                         true
                     }
                     EffectStatus::Loading => false,
+                } && match &denoise {
+                    EffectStatus::Loading => false,
+                    EffectStatus::Failed(reason) => {
+                        r.denoise_reason = Some(reason.clone());
+                        true
+                    }
+                    EffectStatus::Ready | EffectStatus::Off => true,
                 };
                 if done {
                     if r.reason.is_none() {
@@ -2648,6 +2696,7 @@ fn run_session(
                     at_s: (now - wall_start) as f64 / 1e9,
                     ready_after_ms: None,
                     reason: None,
+                    denoise_reason: None,
                     frames_processed: 0,
                     frames_black: 0,
                     frames_passthrough: 0,
@@ -3180,6 +3229,12 @@ fn effect_section(args: &Args, m: &Measured, sink_caps_events: u64) -> Option<Ef
         frames_passthrough,
         gpu_ms_p50: end.gpu_ms_p50,
         gpu_ms_p95: end.gpu_ms_p95,
+        denoise: args.denoise,
+        denoise_status: end.denoise.as_str().to_string(),
+        denoise_reason: end.denoise.reason().map(str::to_string),
+        frames_denoised: end.frames_denoised.saturating_sub(start.frames_denoised),
+        denoise_ms_p50: end.denoise_ms_p50,
+        denoise_ms_p95: end.denoise_ms_p95,
         sink_caps_events,
         switch_every_s: args.effect_switch_every,
         switches: m.effect_switches.clone(),
@@ -3487,9 +3542,22 @@ fn print_summary(r: &Report) {
             ms(e.gpu_ms_p95),
             e.sink_caps_events
         );
+        if e.denoise {
+            println!(
+                "  denoise {}{}; frames denoised {}; stage GPU p50 {} ms p95 {} ms",
+                e.denoise_status,
+                e.denoise_reason
+                    .as_deref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default(),
+                e.frames_denoised,
+                ms(e.denoise_ms_p50),
+                ms(e.denoise_ms_p95)
+            );
+        }
         for w in &e.switches {
             println!(
-                "  switch at t+{:.1}s -> {}: {}; processed {} black {} passthrough {}",
+                "  switch at t+{:.1}s -> {}: {}{}; processed {} black {} passthrough {}",
                 w.at_s,
                 w.to,
                 match (&w.reason, w.ready_after_ms) {
@@ -3497,6 +3565,10 @@ fn print_summary(r: &Report) {
                     (None, Some(ms)) => format!("ready after {ms:.0} ms"),
                     (None, None) => "not ready before the next change".into(),
                 },
+                w.denoise_reason
+                    .as_deref()
+                    .map(|r| format!(", denoise dropped ({r})"))
+                    .unwrap_or_default(),
                 w.frames_processed,
                 w.frames_black,
                 w.frames_passthrough
@@ -3671,6 +3743,23 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("absolute")
+        );
+        // --denoise combines with every effect, none included, and needs one.
+        let d = parse(&["--effect", "none", "--denoise"]).unwrap();
+        assert!(d.check_effect().is_ok());
+        let s = d.effect_settings(EffectKind::None);
+        assert!(s.denoise && s.kind == EffectKind::None);
+        assert!(
+            d.effect_settings(EffectKind::Blur).denoise,
+            "kept by the cycle"
+        );
+        assert!(!a.effect_settings(EffectKind::Blur).denoise);
+        let bare = parse(&["--denoise"]).unwrap();
+        assert!(
+            bare.check_effect()
+                .unwrap_err()
+                .to_string()
+                .contains("--effect none")
         );
         // A cycle needs a starting effect; roundtrip does not combine.
         let c = parse(&["--effect-switch-every", "5"]).unwrap();

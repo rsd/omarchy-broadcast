@@ -47,6 +47,10 @@ pub trait OmarchyBroadcast {
     /// Fails with `InvalidArgument` otherwise. Revision 2.
     fn set_background_image(&self, path: &str) -> Result<(), IpcError>;
 
+    /// Switches video noise removal on (`true`) or off. It runs before the
+    /// effect, or alone with `none`. Persists across restarts. Revision 4.
+    fn set_denoise(&self, denoise: bool) -> Result<(), IpcError>;
+
     /// Roughly once per second while `active`; `-1` marks a value that
     /// cannot be measured.
     #[zbus(signal)]
@@ -94,6 +98,10 @@ pub trait OmarchyBroadcast {
     /// Revision 2.
     #[zbus(property)]
     fn background_image(&self) -> zbus::Result<String>;
+
+    /// Whether video noise removal is requested. Revision 4.
+    #[zbus(property)]
+    fn denoise(&self) -> zbus::Result<bool>;
 
     /// Number of consumers: the processes holding the loopback plus the
     /// links to the PipeWire output (before revision 3, the loopback's

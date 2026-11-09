@@ -56,6 +56,10 @@ pub enum EffectStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectReport {
     pub status: EffectStatus,
+    /// The noise removal stage, apart from the effect: `Off` unless
+    /// requested. Its failure never changes what the effect shows: the
+    /// output streams on without the stage.
+    pub denoise: EffectStatus,
     /// Duration of the last load (models and first run), in milliseconds.
     pub load_ms: Option<f64>,
     /// The last load reused the models already loaded (a switch between

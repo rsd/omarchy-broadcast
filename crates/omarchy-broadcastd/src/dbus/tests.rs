@@ -239,6 +239,7 @@ async fn every_property_reads_through_the_proxy() {
             effect: "none".into(),
             blur_strength: 0.5,
             background_image: String::new(),
+            denoise: false,
             consumers: 0,
             loopback_consumers: 0,
             pipewire_consumers: 0,
@@ -246,8 +247,8 @@ async fn every_property_reads_through_the_proxy() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 3);
-    // GetAll returns the same fourteen properties.
+    assert_eq!(INTERFACE_REVISION, 4);
+    // GetAll returns the same fifteen properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
         .destination(obc_ipc::BUS_NAME)
         .path(OBJECT_PATH)
@@ -270,6 +271,7 @@ async fn every_property_reads_through_the_proxy() {
             "BlurStrength",
             "Cameras",
             "Consumers",
+            "Denoise",
             "Effect",
             "Enabled",
             "Error",
@@ -300,6 +302,8 @@ async fn every_property_reads_through_the_proxy() {
         "<method name=\"SetEffect\">",
         "<method name=\"SetBlurStrength\">",
         "<method name=\"SetBackgroundImage\">",
+        "<method name=\"SetDenoise\">",
+        "<property name=\"Denoise\" type=\"b\" access=\"read\"",
         "<property name=\"BlurStrength\" type=\"d\" access=\"read\"",
         "<property name=\"BackgroundImage\" type=\"s\" access=\"read\"",
         "<property name=\"Effect\" type=\"s\" access=\"read\"",
@@ -702,6 +706,60 @@ async fn effect_methods_properties_and_their_errors() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
+    let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    assert_eq!(proxy.interface_revision().await.unwrap(), 4);
+    assert!(!proxy.denoise().await.unwrap());
+    let seen = rig.record_changes().await;
+
+    // The reply comes after the property changed; it is announced and
+    // persisted. The same value again announces nothing.
+    within("SetDenoise", proxy.set_denoise(true)).await.unwrap();
+    assert!(proxy.denoise().await.unwrap());
+    within("SetDenoise", proxy.set_denoise(true)).await.unwrap();
+    within("SetDenoise", proxy.set_denoise(false))
+        .await
+        .unwrap();
+    assert!(!proxy.denoise().await.unwrap());
+    until("the changes", &seen, |s| {
+        s.iter().filter(|e| e.starts_with("Denoise=")).count() == 2
+    })
+    .await;
+    let denoise: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.starts_with("Denoise="))
+        .cloned()
+        .collect();
+    assert_eq!(denoise, ["Denoise=true", "Denoise=false"]);
+    let state = fs::read_to_string(&rig.paths.state).unwrap();
+    assert!(state.contains("denoise = false"), "{state}");
+
+    // While active: the stage fails; the session streams on, the state
+    // stays active, and Error says why. Switching it off clears it.
+    rig.world().denoise_fail = Some("NvVFX_Load failed (-2)".into());
+    rig.consumers(1);
+    wait_state(&proxy, State::Active).await;
+    within("SetDenoise", proxy.set_denoise(true)).await.unwrap();
+    let want = "noise removal unavailable: NvVFX_Load failed (-2); the camera image is shown \
+                without it";
+    until("the denoise error", &seen, |s| {
+        s.iter().any(|e| *e == format!("Error={want}"))
+    })
+    .await;
+    assert_eq!(proxy.state().await.unwrap(), State::Active);
+    assert!(rig.world().session.is_some());
+    within("SetDenoise", proxy.set_denoise(false))
+        .await
+        .unwrap();
+    assert_eq!(proxy.error().await.unwrap(), "");
+    assert_eq!(proxy.state().await.unwrap(), State::Active);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_pipewire_properties_and_their_changes() {
     let rig = Rig::new(
         "[lifecycle]\nstart_debounce_ms = 0\nidle_grace_s = 0\n[pipewire]\nenabled = true\n",
@@ -710,7 +768,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 3);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 4);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;

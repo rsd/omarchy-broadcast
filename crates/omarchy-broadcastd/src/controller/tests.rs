@@ -939,6 +939,7 @@ fn every_transition_of_the_lifecycle_is_announced_in_order() {
             Change::Effect(e) => format!("effect={e}"),
             Change::BlurStrength(v) => format!("strength={v}"),
             Change::BackgroundImage(p) => format!("image={p}"),
+            Change::Denoise(b) => format!("denoise={b}"),
             Change::LoopbackConsumers(n) => format!("loopback={n}"),
             Change::PipeWireConsumers(n) => format!("pipewire={n}"),
             Change::PipeWireOutput(s) => format!("pipewire_output={s}"),
@@ -984,10 +985,12 @@ fn diff_lists_state_last() {
     b.loopback_consumers = 1;
     b.pipewire_consumers = 1;
     b.pipewire_output = "streaming".into();
+    b.denoise = true;
     assert_eq!(
         diff(&a, &b),
         [
             Change::ActiveCamera("x".into()),
+            Change::Denoise(true),
             Change::Consumers(2),
             Change::LoopbackConsumers(1),
             Change::PipeWireConsumers(1),
@@ -1999,6 +2002,506 @@ fn an_effect_value_the_daemon_does_not_accept_fails_closed() {
     h.consumers(1, 0);
     h.tick(1000);
     assert_eq!(h.world().session_starts, 0, "no raw image instead");
+}
+
+// ---- noise removal (the denoise stage of the effect element) ----
+
+impl H {
+    fn set_denoise(&mut self, on: bool, ms: u64) -> Result<(), IpcError> {
+        self.call(|r| Command::SetDenoise(on, r), ms)
+    }
+
+    /// Whether the running session was given noise removal.
+    fn denoise_applied(&self) -> Option<bool> {
+        self.world().effect.as_ref().map(|e| e.denoise)
+    }
+}
+
+const NO_DENOISE: &str = "NvVFX_Load failed (-2)";
+
+fn denoise_error(reason: &str) -> String {
+    format!("noise removal unavailable: {reason}; the camera image is shown without it")
+}
+
+#[test]
+fn set_denoise_persists_publishes_applies_and_survives_a_restart() {
+    let mut h = H::new("", |_| {});
+    assert!(!h.snap().denoise);
+    h.set_denoise(true, 0).unwrap();
+    assert!(h.snap().denoise);
+    let changes = h.drain().0;
+    assert!(changes.contains(&Change::Denoise(true)), "{changes:?}");
+    assert_eq!(Change::Denoise(true).name(), "Denoise");
+    assert_eq!(h.persisted().denoise, Some(true));
+    assert_eq!(h.persisted().effect, None, "the other keys stay unset");
+    // A restart serves it, before and after the controller runs.
+    assert!(preliminary_snapshot(&h.paths).denoise);
+    h.restart();
+    assert!(h.snap().denoise);
+    // The session starts with it, the effect `none`.
+    h.activate(1000);
+    assert_eq!(h.applied(), Some(EffectMode::None));
+    assert_eq!(h.denoise_applied(), Some(true));
+    h.tick(1500);
+    assert_eq!(h.ctrl.denoise_seen, Some(EffectStatus::Ready));
+    // Off while streaming: applied at once, no restart.
+    h.set_denoise(false, 2000).unwrap();
+    assert_eq!(h.denoise_applied(), Some(false));
+    assert_eq!(h.world().denoise_status, EffectStatus::Off);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().session_starts, 1);
+    assert_eq!(h.persisted().denoise, Some(false));
+    // Stacked with an effect: switching it while streaming keeps it.
+    h.set_denoise(true, 2500).unwrap();
+    h.set_effect("blur", 3000).unwrap();
+    let applied = h.world().effect.clone().unwrap();
+    assert_eq!((applied.mode, applied.denoise), (EffectMode::Blur, true));
+    assert_eq!(h.world().session_starts, 1);
+    assert_eq!(h.snap().error, "");
+}
+
+#[test]
+fn the_state_files_denoise_takes_precedence_over_the_config() {
+    let mut h = H::new("[effect]\ndenoise = true\n", |_| {});
+    assert!(h.snap().denoise);
+    assert_eq!(h.persisted().denoise, None, "nothing written at start");
+    h.set_denoise(false, 0).unwrap();
+    assert!(!h.snap().denoise);
+    h.reload("[effect]\ndenoise = true\n", 100).unwrap();
+    assert!(!h.snap().denoise, "the state file's value still applies");
+    h.restart();
+    assert!(!h.snap().denoise);
+    h.activate(1000);
+    assert_eq!(h.denoise_applied(), Some(false));
+}
+
+#[test]
+fn a_repeated_set_denoise_neither_rewrites_the_state_nor_reloads_the_session() {
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |_| {});
+    h.set_denoise(true, 0).unwrap();
+    h.activate(0);
+    h.tick(500);
+    assert_eq!(h.ctrl.denoise_seen, Some(EffectStatus::Ready));
+    let sets = h.world().effect_sets.len();
+    fs::remove_file(&h.paths.state).unwrap();
+    h.set_denoise(true, 1000).unwrap();
+    h.tick(1500);
+    assert!(!h.paths.state.exists(), "the state file was rewritten");
+    assert_eq!(h.world().effect_sets.len(), sets);
+    assert!(effect_changes(&h.drain().0).is_empty());
+    // A change of the denoise request is followed; the effect's load is
+    // not reported again.
+    h.set_denoise(false, 2000).unwrap();
+    assert_eq!(h.world().effect_sets.len(), sets + 1);
+    assert_eq!(h.ctrl.effect_seen, Some(EffectStatus::Ready));
+    assert_eq!(h.ctrl.denoise_seen, Some(EffectStatus::Off));
+}
+
+#[test]
+fn set_denoise_clears_a_fault_and_the_session_starts_again() {
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |_| {});
+    h.activate(0);
+    h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
+    h.tick(1000);
+    assert_eq!(h.state(), State::Error);
+    assert!(h.world().session.is_none());
+    h.set_denoise(true, 2000).unwrap();
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().session_starts, 2);
+    assert_eq!(h.snap().error, "");
+    assert_eq!(h.denoise_applied(), Some(true));
+}
+
+#[test]
+fn a_denoise_failure_keeps_streaming_whatever_on_failure_says() {
+    for on_failure in ["black", "none"] {
+        // `none` with denoise starts without any capability check, even
+        // with the effect backend missing: the failure arrives by the poll.
+        let config = format!("[effect]\ndenoise = true\non_failure = \"{on_failure}\"\n");
+        let mut h = H::new(&config, |w| {
+            w.effect_unavailable = Some("libVideoFX.so not found".into());
+            w.denoise_fail = Some(NO_DENOISE.into());
+        });
+        h.activate(0);
+        assert_eq!(h.world().effect_probes, 0, "{on_failure}: no pre-check");
+        h.tick(500);
+        assert_eq!(h.state(), State::Active, "{on_failure}");
+        assert!(h.world().session.is_some(), "{on_failure}");
+        assert_eq!(h.snap().error, denoise_error(NO_DENOISE), "{on_failure}");
+        assert!(h.snap().denoise, "the request stays");
+        // Reported once, not on every poll; the state never moved.
+        h.tick(750);
+        h.tick(1000);
+        let (changes, _) = h.drain();
+        let errors = changes
+            .iter()
+            .filter(|c| matches!(c, Change::Error(_)))
+            .count();
+        assert_eq!(errors, 1, "{on_failure}: {changes:?}");
+        let states: Vec<_> = changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::State(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            states,
+            [State::Starting, State::Active],
+            "{on_failure}: the failure moved no state"
+        );
+        // Ready again (the stage recovered): the error is gone.
+        h.world().denoise_status = EffectStatus::Ready;
+        h.tick(1250);
+        assert_eq!(h.snap().error, "", "{on_failure}");
+        assert_eq!(h.ctrl.denoise_failure, None);
+    }
+    // With an effect running, the effect is unaffected: still ready, the
+    // session still streaming, under `black` too.
+    let mut h = H::new("[effect]\nmode = \"blur\"\ndenoise = true\n", |w| {
+        w.denoise_fail = Some(NO_DENOISE.into())
+    });
+    h.activate(0);
+    h.tick(500);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().effect_status, EffectStatus::Ready);
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+}
+
+#[test]
+fn an_effect_method_retries_noise_removal_and_a_new_failure_is_reported_again() {
+    let mut h = H::new("", |w| w.denoise_fail = Some(NO_DENOISE.into()));
+    h.set_denoise(true, 0).unwrap();
+    h.activate(0);
+    h.tick(500);
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    // The value already in force: nothing written, but the failed stage
+    // is retried. It fails the same way and is reported again.
+    let sets = h.world().effect_sets.len();
+    fs::remove_file(&h.paths.state).unwrap();
+    h.set_denoise(true, 1000).unwrap();
+    assert!(!h.paths.state.exists());
+    assert_eq!(h.world().effect_sets.len(), sets + 1, "retried");
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    // Another effect method retries it too; it now loads, and the error is
+    // gone.
+    h.world().denoise_fail = None;
+    h.set_strength(0.3, 2000).unwrap();
+    assert_eq!(h.world().denoise_status, EffectStatus::Ready);
+    assert_eq!(h.snap().error, "");
+    assert_eq!(h.world().session_starts, 1);
+    // Switching it off ends a failure as well.
+    h.world().denoise_fail = Some(NO_DENOISE.into());
+    h.set_denoise(true, 2500).unwrap();
+    h.world().denoise_status = EffectStatus::Failed(NO_DENOISE.into());
+    h.tick(3000);
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    h.set_denoise(false, 3500).unwrap();
+    assert_eq!(h.snap().error, "");
+    assert_eq!(h.state(), State::Active);
+}
+
+#[test]
+fn a_reload_or_the_end_of_the_session_clears_a_denoise_failure() {
+    let config = "[effect]\ndenoise = true\n\
+                  [lifecycle]\nidle_grace_s = 0.0\nstart_debounce_ms = 0\n";
+    let mut h = H::new(config, |w| w.denoise_fail = Some(NO_DENOISE.into()));
+    h.activate(0);
+    h.tick(500);
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    // A reload retries it: now it loads.
+    h.world().denoise_fail = None;
+    let sets = h.world().effect_sets.len();
+    h.reload(config, 1000).unwrap();
+    assert_eq!(h.world().effect_sets.len(), sets + 1);
+    assert_eq!(h.snap().error, "");
+    // It fails again; the consumer leaves: idle, and the error goes with
+    // the session.
+    h.world().denoise_status = EffectStatus::Failed(NO_DENOISE.into());
+    h.tick(1500);
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    h.consumers(0, 2000);
+    h.tick(2100);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.snap().error, "");
+    assert_eq!(h.ctrl.denoise_failure, None);
+    // Off ends it too.
+    h.world().denoise_fail = Some(NO_DENOISE.into());
+    h.activate(3000);
+    h.tick(3500);
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    h.call(|r| Command::SetEnabled(false, r), 4000).unwrap();
+    assert_eq!(h.state(), State::Off);
+    assert_eq!(h.snap().error, "");
+}
+
+#[test]
+fn an_effect_failure_comes_before_a_denoise_failure_in_error() {
+    let config = "[effect]\nmode = \"blur\"\ndenoise = true\non_failure = \"none\"\n";
+    let effect_reason = "the model did not load";
+    // Both fail at once: the effect's text, which matters more (the
+    // background shows).
+    let mut h = H::new(config, |w| {
+        w.effect_fail = Some(effect_reason.into());
+        w.denoise_fail = Some(NO_DENOISE.into());
+    });
+    h.activate(0);
+    h.tick(500);
+    assert_eq!(h.state(), State::Active);
+    let effect_error = h.snap().error;
+    assert!(
+        effect_error.starts_with(&format!("effect blur unavailable: {effect_reason};")),
+        "{effect_error}"
+    );
+    assert!(h.ctrl.denoise_failure.is_some());
+    // The effect recovers: the denoise failure, still standing, shows.
+    h.world().effect_status = EffectStatus::Ready;
+    h.tick(1000);
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    // Noise removal recovers: nothing left.
+    h.world().denoise_status = EffectStatus::Ready;
+    h.tick(1500);
+    assert_eq!(h.snap().error, "");
+    // The other order: noise removal fails first (taken as its own once the
+    // next poll confirms it, the effect still ready), then the effect: the
+    // effect's text replaces it, and gives way to it again.
+    h.world().denoise_status = EffectStatus::Failed(NO_DENOISE.into());
+    h.tick(1750);
+    assert_eq!(h.snap().error, "", "held for one poll");
+    h.tick(2000);
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    h.world().effect_status = EffectStatus::Failed(effect_reason.into());
+    h.tick(2500);
+    assert_eq!(h.snap().error, effect_error);
+    h.world().effect_status = EffectStatus::Ready;
+    h.tick(3000);
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().session_starts, 1);
+}
+
+#[test]
+fn an_effect_fault_ends_a_denoise_failure_with_the_session() {
+    let config = "[effect]\nmode = \"blur\"\ndenoise = true\n";
+    let mut h = H::new(config, |w| w.denoise_fail = Some(NO_DENOISE.into()));
+    h.activate(0);
+    h.tick(500);
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    // The effect fails with `black`: a fault, the session stops, and the
+    // fault's text is the error; the denoise failure ended with the
+    // session.
+    h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
+    h.tick(1000);
+    assert_eq!(h.state(), State::Error);
+    assert_eq!(
+        h.snap().error,
+        "effect blur unavailable: processing a frame failed"
+    );
+    assert_eq!(h.ctrl.denoise_failure, None);
+    // The consumer leaves: the fault is cleared (its text stays, as the
+    // latest error), the denoise failure does not come back.
+    h.consumers(0, 2000);
+    h.tick(2100);
+    assert_eq!(h.state(), State::Idle);
+    assert!(h.snap().error.starts_with("effect blur"));
+    // An unavailable effect with `none` at start, and noise removal
+    // failing too: the effect's text first, then the denoise one once an
+    // effect method selects `none`.
+    let config = "[effect]\nmode = \"blur\"\ndenoise = true\non_failure = \"none\"\n";
+    let mut h = H::new(config, |w| {
+        w.effect_unavailable = Some("libVideoFX.so not found".into());
+        w.denoise_fail = Some(NO_DENOISE.into());
+    });
+    h.activate(0);
+    h.tick(500);
+    assert_eq!(h.applied(), Some(EffectMode::None));
+    assert_eq!(h.denoise_applied(), Some(true), "noise removal still tried");
+    assert!(
+        h.snap().error.starts_with("effect blur unavailable:"),
+        "{}",
+        h.snap().error
+    );
+    h.set_effect("none", 1000).unwrap();
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    assert_eq!(h.state(), State::Active);
+}
+
+const GREEN_SCREEN: &str = "NvVFX_Load of the green screen failed (-2)";
+
+const BLUR_DENOISE_NONE: &str =
+    "[effect]\nmode = \"blur\"\ndenoise = true\non_failure = \"none\"\n";
+
+/// The `Error` texts published since the last drain.
+fn errors_published(h: &mut H) -> Vec<String> {
+    h.drain()
+        .0
+        .into_iter()
+        .filter_map(|c| match c {
+            Change::Error(e) => Some(e),
+            _ => None,
+        })
+        .collect()
+}
+
+/// No `Error` published since the last drain blames noise removal.
+fn assert_no_denoise_text(h: &mut H) {
+    let errors = errors_published(h);
+    assert!(
+        errors.iter().all(|e| !e.contains("noise removal")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn a_failure_of_the_whole_chain_is_the_effects_not_noise_removals() {
+    // The green screen of blur fails to load: the element shows the
+    // failure on the stage too, with the same reason.
+    let mut h = H::new(BLUR_DENOISE_NONE, |w| {
+        w.effect_fail = Some(GREEN_SCREEN.into());
+        w.effect_fail_chain = true;
+    });
+    h.activate(0);
+    h.tick(500);
+    h.tick(750);
+    let failed = EffectStatus::Failed(GREEN_SCREEN.into());
+    assert_eq!(h.world().denoise_status, failed);
+    assert_eq!(h.state(), State::Active);
+    let effect_error = h.snap().error;
+    assert!(
+        effect_error.starts_with(&format!("effect blur unavailable: {GREEN_SCREEN};")),
+        "{effect_error}"
+    );
+    assert_eq!(h.ctrl.denoise_failure, None);
+    assert_no_denoise_text(&mut h);
+    // The effect recovers, seen a poll before the stage does: nothing
+    // stale is left.
+    h.world().effect_status = EffectStatus::Ready;
+    h.tick(1000);
+    assert_eq!(h.snap().error, "");
+    h.world().denoise_status = EffectStatus::Ready;
+    h.tick(1250);
+    assert_eq!(h.snap().error, "");
+    assert_no_denoise_text(&mut h);
+    // An effect method retries the chain, which fails again, then loads.
+    h.set_strength(0.3, 1500).unwrap();
+    assert_eq!(h.world().denoise_status, failed);
+    h.tick(1750);
+    h.tick(2000);
+    assert_eq!(h.snap().error, effect_error);
+    h.world().effect_fail = None;
+    h.set_strength(0.4, 2500).unwrap();
+    h.tick(2750);
+    h.tick(3000);
+    assert_eq!(h.world().denoise_status, EffectStatus::Ready);
+    assert_eq!(h.snap().error, "");
+    assert_eq!(h.ctrl.denoise_failure, None);
+    assert_no_denoise_text(&mut h);
+    assert_eq!(h.world().session_starts, 1);
+}
+
+#[test]
+fn a_failure_of_the_whole_chain_seen_a_poll_apart_is_still_the_effects() {
+    let failed = EffectStatus::Failed(GREEN_SCREEN.into());
+    let effect_text = format!("effect blur unavailable: {GREEN_SCREEN};");
+    for before in [EffectStatus::Ready, EffectStatus::Loading] {
+        // The stage's status shows the failure first: the effect's was
+        // read before it changed.
+        let mut h = H::new(BLUR_DENOISE_NONE, |w| {
+            w.effect_slow = before == EffectStatus::Loading;
+        });
+        h.activate(0);
+        h.tick(500);
+        assert_eq!(h.world().effect_status, before);
+        h.drain();
+        h.world().denoise_status = failed.clone();
+        h.tick(1000);
+        assert_eq!(h.snap().error, "", "{before:?}: not the stage's yet");
+        h.world().effect_status = failed.clone();
+        h.tick(1250);
+        assert!(h.snap().error.starts_with(&effect_text), "{before:?}");
+        h.tick(1500);
+        assert!(h.snap().error.starts_with(&effect_text), "{before:?}");
+        assert_eq!(h.ctrl.denoise_failure, None, "{before:?}");
+        assert_no_denoise_text(&mut h);
+        // Then it recovers: nothing stale.
+        h.world().effect_status = EffectStatus::Ready;
+        h.world().denoise_status = EffectStatus::Ready;
+        h.tick(1750);
+        assert_eq!(h.snap().error, "", "{before:?}");
+
+        // The effect's status shows it first.
+        let mut h = H::new(BLUR_DENOISE_NONE, |w| {
+            w.effect_slow = before == EffectStatus::Loading;
+        });
+        h.activate(0);
+        h.tick(500);
+        h.drain();
+        h.world().effect_status = failed.clone();
+        h.tick(1000);
+        assert!(h.snap().error.starts_with(&effect_text), "{before:?}");
+        h.world().denoise_status = failed.clone();
+        h.tick(1250);
+        h.tick(1500);
+        assert!(h.snap().error.starts_with(&effect_text), "{before:?}");
+        assert_eq!(h.ctrl.denoise_failure, None, "{before:?}");
+        // The effect recovers before the stage does: nothing stale.
+        h.world().effect_status = EffectStatus::Ready;
+        h.tick(1750);
+        assert_eq!(h.snap().error, "", "{before:?}");
+        assert_no_denoise_text(&mut h);
+    }
+}
+
+#[test]
+fn a_noise_removal_failure_under_a_healthy_effect_is_still_reported() {
+    for slow in [false, true] {
+        let mut h = H::new(BLUR_DENOISE_NONE, |w| {
+            w.denoise_fail = Some(NO_DENOISE.into());
+            w.effect_slow = slow;
+        });
+        // The first poll (at the start) holds it; the next confirms it.
+        h.activate(0);
+        assert_eq!(h.snap().error, "", "slow {slow}");
+        h.tick(550);
+        assert_eq!(h.snap().error, denoise_error(NO_DENOISE), "slow {slow}");
+        if slow {
+            h.world().effect_status = EffectStatus::Ready;
+            h.tick(800);
+            assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+        }
+        h.tick(1050);
+        assert_eq!(errors_published(&mut h), [denoise_error(NO_DENOISE)]);
+        assert_eq!(h.state(), State::Active);
+        // An effect failure with another reason does not hide it: it comes
+        // first, and gives way to it again.
+        h.world().effect_status = EffectStatus::Failed(GREEN_SCREEN.into());
+        h.tick(1300);
+        assert!(h.snap().error.starts_with("effect blur unavailable:"));
+        assert!(h.ctrl.denoise_failure.is_some());
+        h.world().effect_status = EffectStatus::Ready;
+        h.tick(1550);
+        assert_eq!(h.snap().error, denoise_error(NO_DENOISE), "slow {slow}");
+    }
+}
+
+#[test]
+fn a_denoise_value_that_is_not_a_boolean_fails_closed() {
+    let mut h = H::new("", |_| {});
+    std::fs::create_dir_all(h.paths.state.parent().unwrap()).unwrap();
+    std::fs::write(&h.paths.state, "enabled = true\ndenoise = \"yes\"\n").unwrap();
+    h.restart();
+    assert_eq!(h.state(), State::Off);
+    let e = h.snap().error;
+    assert!(
+        e.contains(&h.paths.state.display().to_string()) && e.contains("SetEnabled"),
+        "{e}"
+    );
+    h.consumers(1, 0);
+    h.tick(1000);
+    assert_eq!(h.world().session_starts, 0);
+    // SetEnabled rewrites the file without the unreadable value.
+    h.call(|r| Command::SetEnabled(true, r), 2000).unwrap();
+    assert_eq!(h.persisted().denoise, None);
 }
 
 // ---- the PipeWire output ----

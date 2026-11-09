@@ -108,9 +108,10 @@ start_debounce_ms = 300
 # docs/setup/maxine.md. Without it the daemon runs normally, and a requested
 # effect fails as described under on_failure.
 #
-# An effect selected at run time (SetEffect, SetBlurStrength,
-# SetBackgroundImage, `omarchy-broadcast effect ...`) is kept in the state file
-# and takes precedence over the keys of this section.
+# A choice made at run time (SetEffect, SetBlurStrength, SetBackgroundImage,
+# SetDenoise, `omarchy-broadcast effect ...`, `omarchy-broadcast denoise ...`)
+# is kept in the state file and takes precedence over the keys of this
+# section.
 
 # The effect applied to the camera image:
 #   "none"    the camera image as it is;
@@ -132,6 +133,13 @@ blur_strength = 0.5
 # be decoded then is an effect failure (see on_failure).
 # Default: "" (no image). Example:
 # background_image = "/home/user/Pictures/background.png"
+
+# Video noise removal: reduces the grain of a dim or small camera sensor.
+# It runs before the effect, or alone with mode = "none". If it cannot run
+# (the SDK or its noise removal feature is missing), the camera image is
+# shown without it, with the reason in Error, whatever on_failure says.
+# Default: false
+denoise = false
 
 # What the virtual camera shows when the requested effect cannot run (the
 # SDK is missing, a model or the background image fails to load):

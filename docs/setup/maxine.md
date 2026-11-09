@@ -1,6 +1,6 @@
 # Setting up NVIDIA Maxine Video Effects SDK on Arch Linux / Omarchy
 
-Goal: a user-prefix install of the Maxine VFX SDK 1.3.0.0 (Linux) at `$MAXINE_VFX_ROOT`, with the AI green screen (AIGS) and background blur features, ready for `omarchy-broadcast`. The examples use `~/.local/opt/maxine/VideoFX` as the default value. No `sudo` is needed and nothing is written to `/usr`, `/opt` or `/etc`.
+Goal: a user-prefix install of the Maxine VFX SDK 1.3.0.0 (Linux) at `$MAXINE_VFX_ROOT`, with the AI green screen (AIGS), background blur and video noise removal (denoising) features, ready for `omarchy-broadcast`. The examples use `~/.local/opt/maxine/VideoFX` as the default value. No `sudo` is needed and nothing is written to `/usr`, `/opt` or `/etc`.
 
 Background: [../research/maxine-linux.md](../research/maxine-linux.md) (access, licence, API). The SDK is never vendored in this repository, see [ADR-0003](../adr/0003-maxine-first-behind-backend-seam.md).
 
@@ -101,7 +101,7 @@ ls -lh ~/Downloads/maxine/vfx_sdk_core_v1.3.0.0_linux/
 
 ## 5. Download features and the GPU-architecture models
 
-AIGS needs its feature library plus TensorRT model packages built for your GPU's SM architecture. Background blur is pure CUDA compositing on top of an external mask and has no model package.
+AIGS needs its feature library plus TensorRT model packages built for your GPU's SM architecture. Background blur is pure CUDA compositing on top of an external mask and has no model package. Video noise removal (the `nvvfxdenoising` feature, the equivalent of NVIDIA Broadcast's "Video Noise Removal") needs its feature library and its own model packages for your architecture; it is optional, and the effects work without it.
 
 Pick the architecture from your GPU:
 
@@ -109,9 +109,10 @@ Pick the architecture from your GPU:
 SM=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d .)   # 12.0 -> 120
 echo "SM=$SM"
 ngc registry model list "nvidia/maxine/nvvfxgreenscreen:*"
+ngc registry model list "nvidia/maxine/nvvfxdenoising:*"     # only for noise removal
 ```
 
-In that list, a `1.3.0.0_models_linux_sm<SM>` entry must exist for your value. For 1.3.0.0 these exist: `sm75, sm80, sm86, sm89, sm90, sm100, sm120` (Linux). If your `SM` is not listed (for example CC 8.7 or 12.1), pick the closest listed one only if you accept an untested combination; the loader may refuse it. Ignore entries named `windows_*` and `woa_*`.
+In that list, a `1.3.0.0_models_linux_sm<SM>` entry must exist for your value (in each of the two lists you use). For 1.3.0.0 these exist: `sm75, sm80, sm86, sm89, sm90, sm100, sm120` (Linux). If your `SM` is not listed (for example CC 8.7 or 12.1), pick the closest listed one only if you accept an untested combination; the loader may refuse it. Ignore entries named `windows_*` and `woa_*`.
 
 Download into a scratch directory (the NGC CLI creates one subdirectory per version):
 
@@ -120,8 +121,12 @@ DL=$(mktemp -d) && cd "$DL"
 ngc registry model download-version nvidia/maxine/nvvfxgreenscreen:1.3.0.0_lib_linux --dest .
 ngc registry model download-version nvidia/maxine/nvvfxbackgroundblur:1.3.0.0_lib_linux --dest .
 ngc registry model download-version "nvidia/maxine/nvvfxgreenscreen:1.3.0.0_models_linux_sm$SM" --dest .
+# optional, for noise removal:
+ngc registry model download-version nvidia/maxine/nvvfxdenoising:1.3.0.0_lib_linux --dest .
+ngc registry model download-version "nvidia/maxine/nvvfxdenoising:1.3.0.0_models_linux_sm$SM" --dest .
 ls                                             # directory names as created by the CLI, e.g.
 # nvvfxgreenscreen_v1.3.0.0_lib_linux  nvvfxbackgroundblur_v1.3.0.0_lib_linux  nvvfxgreenscreen_v1.3.0.0_models_linux_sm120
+# and, with noise removal: nvvfxdenoising_v1.3.0.0_lib_linux  nvvfxdenoising_v1.3.0.0_models_linux_sm120
 ```
 
 Sizes: greenscreen lib 2.6 MB, blur lib 0.4 MB, sm120 models 113 MB (8 `.engine.trtpkg` files). Keep this shell and `$DL` for step 6.
@@ -139,6 +144,8 @@ tar -xzf ~/Downloads/maxine/vfx_sdk_core_v1.3.0.0_linux/VFXSDK_linux_1.3.0.0.tgz
 cd "$DL"
 for t in */*.tar.gz; do tar -xzf "$t" -C "$PREFIX/VideoFX/features"; done
 cp nvvfxgreenscreen_v1.3.0.0_models_linux_sm$SM/* "$PREFIX/VideoFX/lib/models/"
+# with noise removal:
+cp nvvfxdenoising_v1.3.0.0_models_linux_sm$SM/* "$PREFIX/VideoFX/lib/models/"
 ```
 
 Resulting layout (`$MAXINE_VFX_ROOT`, 4.4 GB):
@@ -148,8 +155,10 @@ VideoFX/
   include/                 nvVideoEffects.h  nvCVImage.h  nvCVStatus.h
   lib/                     libVideoFX.so  libVideoFXLocal.so  libNVCVImage.so  libnvngxruntime.so  libVideoFXTriton.so (unused)
   lib/models/              AIGS_288x512_<SM>_m{0,1,2,3}.engine.trtpkg  and  *_1_4_8.engine.trtpkg   (8 files, 114 MB)
+                           Denoise-agg-<SM>.engine.trtpkg  Denoise-con-<SM>.engine.trtpkg   (noise removal)
   features/nvvfxgreenscreen/lib/libnvVFXGreenScreen.so         (+ include/, license/)
   features/nvvfxbackgroundblur/lib/libnvVFXBackgroundBlur.so   (+ include/, license/)
+  features/nvvfxdenoising/lib/libnvVFXDenoising.so             (noise removal; + include/, license/)
   features/install_feature.sh  compute_capability  README.md   (not used)
   external/cuda/           bundled CUDA 12.8 (3.6 GB: bin, include, lib)
   external/tensorrt/       bundled TensorRT 10.9 (700 MB: include, lib)
@@ -165,7 +174,7 @@ rm -rf ~/Downloads/maxine          # optional, frees 2.7 GB
 
 ## 7. The os-release override
 
-**Why.** The model-package loader inside `libnvVFXGreenScreen.so` reads `/etc/os-release` (with `fopen`, twice per load) and refuses distributions that are not on NVIDIA's list. Omarchy reports `ID=omarchy`, so `NvVFX_Load` fails with `-1209` ("no kernel image is available for execution on the device"). That message is misleading: no CUDA error occurs (verified with compute-sanitizer), the models do contain sm_120 code, and the failure is purely the distro check. Findings on what passes:
+**Why.** The model-package loader inside `libnvVFXGreenScreen.so` (and the one of the noise-removal feature) reads `/etc/os-release` (with `fopen`, twice per load) and refuses distributions that are not on NVIDIA's list. Omarchy reports `ID=omarchy`, so `NvVFX_Load` fails with `-1209` ("no kernel image is available for execution on the device"). That message is misleading: no CUDA error occurs (verified with compute-sanitizer), the models do contain sm_120 code, and the failure is purely the distro check. Findings on what passes:
 
 | os-release | Result |
 |---|---|
@@ -252,7 +261,7 @@ Support note: see section 11.
 
 ## 8. Environment
 
-The SDK bundles CUDA 12.8, cuDNN 9, TensorRT 10 and NPP 12, while Arch ships CUDA 13. None of the `.12` / `.9` / `.10` sonames exist system-wide, so the bundled directories must be on `LD_LIBRARY_PATH`. The feature libraries are found by plain `dlopen("libnvVFXGreenScreen.so")`, so their directories must be on it too (otherwise `NvVFX_CreateEffect` returns `-2`).
+The SDK bundles CUDA 12.8, cuDNN 9, TensorRT 10 and NPP 12, while Arch ships CUDA 13. None of the `.12` / `.9` / `.10` sonames exist system-wide, so the bundled directories must be on `LD_LIBRARY_PATH`. The feature libraries are found by plain `dlopen("libnvVFXGreenScreen.so")`, so their directories must be on it too (otherwise `NvVFX_CreateEffect` returns `-2`). That includes `features/nvvfxdenoising/lib` when noise removal is installed.
 
 Create an env file (kept outside the repo):
 
@@ -260,7 +269,7 @@ Create an env file (kept outside the repo):
 cat > "$PREFIX/env.sh" <<'EOF'
 export MAXINE_VFX_ROOT="${MAXINE_VFX_ROOT:-$HOME/.local/opt/maxine/VideoFX}"
 P="$MAXINE_VFX_ROOT"
-export LD_LIBRARY_PATH="$P/lib:$P/features/nvvfxgreenscreen/lib:$P/features/nvvfxbackgroundblur/lib:$P/external/cuda/lib:$P/external/tensorrt/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$P/lib:$P/features/nvvfxgreenscreen/lib:$P/features/nvvfxbackgroundblur/lib:$P/features/nvvfxdenoising/lib:$P/external/cuda/lib:$P/external/tensorrt/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 unset P
 EOF
 source "$PREFIX/env.sh"
@@ -311,6 +320,14 @@ With the SDK installed and the daemon running with the drop-in (step 7a), the ef
 - In `config.toml`, the `[effect]` section (`mode`, `blur_strength`, `background_image`, `on_failure`); see [../config.example.toml](../config.example.toml).
 - At run time, with `omarchy-broadcast effect none|blur|replace [--strength X] [--image PATH]`, which the daemon remembers across restarts; see [../cli-json.md](../cli-json.md) and [../dbus-api.md](../dbus-api.md).
 
+Video noise removal is a separate switch that combines with any effect: `[effect] denoise = true` in `config.toml`, or `omarchy-broadcast denoise on|off` at run time. It removes the grain a webcam produces, which is mostly visible in dim rooms, and it runs before the blur or replacement, or alone with the effect `none`. It needs the `nvvfxdenoising` feature and its models (steps 5 and 6). Things to know:
+
+- **It fails open.** Noise removal hides nothing, so if it cannot load or run (the feature or SDK is missing, or the frame size is out of range) the stream continues without it, and the daemon's `Error` property says `noise removal unavailable: <reason>`. `[effect] on_failure` does not apply to it and the daemon does not enter `error`. The effects themselves still fail closed, as above.
+- **Frame size.** The feature supports frames from 80x80 up to 1920x1080 (the SDK's range). An output contract above 1080p runs without noise removal and reports the reason.
+- **Strength.** The SDK's strength is binary: 0 favours texture, 1 favours noise removal. The daemon uses 1 and has no setting for it. For comparisons during development, `OBC_MAXINE_DENOISE_STRENGTH=0` or `=1` in the environment of the process overrides it. It is a development knob only and is not a supported configuration.
+- **Cost.** It adds one GPU pass per frame and its model's GPU memory; with it off, nothing is added, no pass, copy or allocation. The models load only while it is on. Measure on your machine with `obc-bench --denoise` ([../testing.md](../testing.md)).
+- The design is in [ADR-0018](../adr/0018-video-noise-removal.md).
+
 The background image for `replace` must be a PNG or JPEG file. Until an effect is ready, the virtual camera shows black rather than the unprocessed camera image; if the SDK cannot be loaded, the daemon enters the `error` state (default) instead of showing the unprocessed image. The design is in [ADR-0012](../adr/0012-video-effects-and-maxine-backend.md). Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence; reproduce locally with `obc-bench` (see [../testing.md](../testing.md)).
 
 ## 10. Troubleshooting
@@ -318,7 +335,10 @@ The background image for `replace` must be a PNG or JPEG file. Until an effect i
 | Symptom | Cause | Fix |
 |---|---|---|
 | `NvVFX_Load` returns `-1209`, "no kernel image is available", log line `Loading TRTModel failed in Aigs` | `/etc/os-release` is not an accepted distro (`ID=omarchy`). Not a real CUDA error | Step 7: the shim is missing or not applied to this process. Check that the library exists at the path in `LD_PRELOAD`, that `OMARCHY_BROADCAST_OS_RELEASE` is an absolute path to a file with both `ID=` and `VERSION_ID=`, that `LD_PRELOAD` is set on the program itself and not on a wrapper (`timeout`, `sh -c`, `cargo`), and run with `OMARCHY_BROADCAST_OS_RELEASE_DEBUG=1` to see the redirect |
-| `NvVFX_CreateEffect` returns `-2` (unimplemented) | `libnvVFXGreenScreen.so` / `libnvVFXBackgroundBlur.so` not found by `dlopen` | Put `features/nvvfxgreenscreen/lib` and `features/nvvfxbackgroundblur/lib` on `LD_LIBRARY_PATH` (step 8); confirm the feature was extracted in step 6 |
+| `NvVFX_CreateEffect` returns `-2` (unimplemented) | `libnvVFXGreenScreen.so` / `libnvVFXBackgroundBlur.so` / `libnvVFXDenoising.so` not found by `dlopen` | Put `features/nvvfxgreenscreen/lib`, `features/nvvfxbackgroundblur/lib` and `features/nvvfxdenoising/lib` on `LD_LIBRARY_PATH` (step 8); confirm the feature was extracted in step 6 |
+| The daemon's `Error` says `noise removal unavailable: ... -2` (NVCV status), and the camera image is shown without noise removal | The feature library `libnvVFXDenoising.so` is not on `LD_LIBRARY_PATH` of the daemon (the drop-in or `env.sh` predates noise removal, or the feature was not extracted) | Add `features/nvvfxdenoising/lib` to `LD_LIBRARY_PATH` (the shipped drop-in has it; re-copy it, `daemon-reload`, restart) and check step 6 |
+| The same, with `-1209` or `-13` | The os-release override is missing for this process (the feature's library needs it too), or the `Denoise-*` models for your SM are not in `lib/models` | Step 7; `ls $MAXINE_VFX_ROOT/lib/models` must show `Denoise-agg-<SM>.engine.trtpkg` and `Denoise-con-<SM>.engine.trtpkg` |
+| The same, with a message that the frame size is out of range | The output contract is smaller than 80x80 or larger than 1920x1080 | Use an output mode within the range (`[output]` in `config.toml`); noise removal does not run outside it |
 | `NvVFX_Load` returns `-13` ("file could not be found") | Model directory wrong or models missing | Pass `$MAXINE_VFX_ROOT/lib/models` (probe argv[1]; the default `./models` does not exist). Check `ls $MAXINE_VFX_ROOT/lib/models` shows 8 `.trtpkg` files for your SM |
 | `error while loading shared libraries: libcudart.so.12` / `libnpp*.so.12` / `libcudnn.so.9` / `libnvinfer.so.10` not found (or linker warnings about `.so.12`) | Bundled `external/cuda/lib` and `external/tensorrt/lib` not on `LD_LIBRARY_PATH` | `source "$PREFIX/env.sh"`, then check `ldd $MAXINE_VFX_ROOT/lib/libVideoFXLocal.so \| grep 'not found'` is empty |
 | `Cannot load libVideoFXTriton.so` in the log | The Triton client library needs `libgrpcclient.so`; unused | Harmless, ignore |

@@ -33,6 +33,7 @@ struct Mock {
     effect: String,
     blur_strength: f64,
     background_image: String,
+    denoise: bool,
 }
 
 impl Mock {
@@ -59,6 +60,7 @@ impl Mock {
             effect: "none".into(),
             blur_strength: 0.5,
             background_image: String::new(),
+            denoise: false,
         }
     }
 }
@@ -166,6 +168,16 @@ impl Mock {
         Ok(())
     }
 
+    async fn set_denoise(
+        &mut self,
+        denoise: bool,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        self.denoise = denoise;
+        self.denoise_changed(&emitter).await?;
+        Ok(())
+    }
+
     #[zbus(signal)]
     async fn stats(
         emitter: &SignalEmitter<'_>,
@@ -218,6 +230,11 @@ impl Mock {
     #[zbus(property)]
     fn background_image(&self) -> String {
         self.background_image.clone()
+    }
+
+    #[zbus(property)]
+    fn denoise(&self) -> bool {
+        self.denoise
     }
 
     #[zbus(property)]
@@ -341,6 +358,7 @@ async fn proxy_reads_every_property() {
             effect: "none".into(),
             blur_strength: 0.5,
             background_image: String::new(),
+            denoise: false,
             consumers: 3,
             loopback_consumers: 1,
             pipewire_consumers: 2,
@@ -348,7 +366,7 @@ async fn proxy_reads_every_property() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 3);
+    assert_eq!(INTERFACE_REVISION, 4);
     assert_eq!(proxy.inner().interface().as_str(), INTERFACE);
 }
 
@@ -369,6 +387,7 @@ async fn a_revision_1_daemon_reads_with_defaults_for_the_newer_properties() {
         assert_eq!(snap.effect, "none");
         assert_eq!(snap.blur_strength, Snapshot::empty().blur_strength);
         assert_eq!(snap.background_image, "");
+        assert!(!snap.denoise);
         // Before revision 3, Consumers counts the loopback only.
         assert_eq!(snap.consumers, 2);
         assert_eq!(snap.loopback_consumers, 2);
@@ -386,6 +405,10 @@ async fn a_revision_1_daemon_reads_with_defaults_for_the_newer_properties() {
     );
     // The effect methods are absent: a D-Bus error, not a daemon reply.
     match within("SetEffect", proxy.set_effect("blur")).await {
+        Err(IpcError::ZBus(_)) => {}
+        other => panic!("expected a transport-level error, got {other:?}"),
+    }
+    match within("SetDenoise", proxy.set_denoise(true)).await {
         Err(IpcError::ZBus(_)) => {}
         other => panic!("expected a transport-level error, got {other:?}"),
     }
@@ -573,11 +596,13 @@ async fn proxy_calls_every_method_and_sees_changes() {
         ),
         ("replace", 0.8, "/tmp/bg.png")
     );
+    within("SetDenoise", proxy.set_denoise(true)).await.unwrap();
+    assert!(uncached.denoise().await.unwrap());
 
     // The changes arrive as PropertiesChanged and apply to a snapshot.
     let mut seen = Vec::new();
     let mut applied = Snapshot::empty();
-    while !["BlurStrength", "BackgroundImage", "Effect"]
+    while !["BlurStrength", "BackgroundImage", "Effect", "Denoise"]
         .iter()
         .all(|k| seen.iter().any(|s| s == k))
     {
@@ -592,6 +617,7 @@ async fn proxy_calls_every_method_and_sees_changes() {
     }
     assert_eq!(applied.blur_strength, 0.8);
     assert_eq!(applied.background_image, "/tmp/bg.png");
+    assert!(applied.denoise);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

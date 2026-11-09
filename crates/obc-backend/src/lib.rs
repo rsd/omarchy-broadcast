@@ -43,7 +43,8 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum EffectKind {
     /// No effect: the element passes frames through and never calls a
-    /// backend.
+    /// backend, unless the denoise stage is on ([`LoadRequest::denoise`]),
+    /// which then runs alone.
     #[default]
     None,
     /// Background blur through the green-screen mask.
@@ -244,9 +245,15 @@ unsafe impl Send for GpuContext {}
 /// What [`InferenceBackend::load`] should prepare.
 #[derive(Debug, Clone)]
 pub struct LoadRequest {
-    /// [`EffectKind::Blur`] or [`EffectKind::Replace`]; `None` is rejected
-    /// (the element does not call a backend for it).
+    /// [`EffectKind::Blur`] or [`EffectKind::Replace`]; `None` is accepted
+    /// only together with `denoise` (the element does not call a backend for
+    /// `none` without it).
     pub effect: EffectKind,
+    /// Run the denoise stage (`docs/adr/0018-video-noise-removal.md`) on
+    /// the frame before the effect, or as the only stage with
+    /// [`EffectKind::None`]. When false, no denoise model is loaded and the
+    /// frame takes no extra pass.
+    pub denoise: bool,
     /// Frame width in pixels; every frame passed to `process` has it.
     pub width: u32,
     /// Frame height in pixels; every frame passed to `process` has it.
@@ -268,8 +275,10 @@ pub struct LoadReport {
     /// (seconds on a cold cache); a backend that warms up in `load` keeps
     /// that off the streaming thread.
     pub warmup_ms: Option<f64>,
-    /// `true` when the mask model of a previous load was kept (same size and
-    /// colour), so the load cost only the effect-specific part.
+    /// `true` when the instance was reused (same size and colour) and no
+    /// model had to be loaded: the models of the previous load that the
+    /// request needs were kept (the mask model, the denoise model), so the
+    /// load cost only the effect-specific part.
     pub reused_model: bool,
 }
 
@@ -293,6 +302,8 @@ impl Default for FrameParams {
 pub struct StageTimings {
     /// NV12 to the backend's input format (BGR for Maxine).
     pub convert_in_ms: f32,
+    /// The denoise stage; 0 when it is not loaded.
+    pub denoise_ms: f32,
     /// The segmentation mask.
     pub mask_ms: f32,
     /// The blur or the composite over the background.
@@ -304,7 +315,7 @@ pub struct StageTimings {
 impl StageTimings {
     /// The sum of all stages.
     pub fn total_ms(&self) -> f32 {
-        self.convert_in_ms + self.mask_ms + self.effect_ms + self.convert_out_ms
+        self.convert_in_ms + self.denoise_ms + self.mask_ms + self.effect_ms + self.convert_out_ms
     }
 }
 
@@ -339,6 +350,19 @@ pub enum BackendError {
     /// missing background, no context current, not loaded).
     #[error("{0}")]
     InvalidInput(String),
+    /// The denoise stage alone failed to load or to run; the rest of the
+    /// request is intact. From `load`: nothing of the request is in force (a
+    /// reused instance keeps its previous chain; a fresh load leaves it
+    /// unloaded), so the caller may load again without denoise. From
+    /// `process`: the backend has dropped the stage, and the next frame runs
+    /// the chain without it; this frame's `dst` is not written.
+    #[error("{message}")]
+    Denoise {
+        /// The backend's status code, as for [`BackendError::Load`].
+        code: i32,
+        /// What failed and what to do about it.
+        message: String,
+    },
 }
 
 /// One instance of an inference backend: the models and buffers for one
@@ -363,9 +387,11 @@ pub trait InferenceBackend: Send {
     /// the mask model stays loaded and the call costs milliseconds, so
     /// switching between blur and replace does not reload it
     /// ([`LoadReport::reused_model`]); such a switch may run on the
-    /// streaming thread. If a switch on a loaded instance fails, the
-    /// previous effect stays loaded; if a full load fails, the instance is
-    /// left unloaded.
+    /// streaming thread. Turning the denoise stage on or off is such a
+    /// switch too, and costs its model load when it is turned on. If a
+    /// switch on a loaded instance fails, the previous effect (and denoise
+    /// stage) stays loaded; if a full load fails, the instance is left
+    /// unloaded.
     fn load(&mut self, gpu: &GpuContext, req: &LoadRequest) -> Result<LoadReport, BackendError>;
 
     /// Enqueues the effect for one frame on `gpu.stream`: reads `src`, writes
@@ -390,6 +416,16 @@ pub trait InferenceBackend: Send {
     /// Per-stage GPU times of the most recent frame whose work has
     /// completed, if the backend measures them.
     fn timings(&self) -> Option<StageTimings>;
+
+    /// Forgets the temporal state of the loaded stages (the denoise state
+    /// and the green screen's), so the next frame is treated as the first
+    /// of a new video: the element calls it when the input switches to
+    /// another source. Enqueued on `gpu.stream`; a no-op when nothing is
+    /// loaded. The default does nothing.
+    fn reset_temporal(&mut self, gpu: &GpuContext) -> Result<(), BackendError> {
+        let _ = gpu;
+        Ok(())
+    }
 }
 
 /// Creates instances of one kind of backend and reports whether it can run.
@@ -512,17 +548,75 @@ mod tests {
             BackendError::Unavailable("no SDK".into()).to_string(),
             "no SDK"
         );
+        let e = BackendError::Denoise {
+            code: -16,
+            message: "the video noise removal does not support 2048x1080 frames".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "the video noise removal does not support 2048x1080 frames"
+        );
+        assert_ne!(
+            e,
+            BackendError::Load {
+                code: -16,
+                message: e.to_string()
+            },
+            "a denoise failure is told apart from a load failure"
+        );
+    }
+
+    #[test]
+    fn reset_temporal_defaults_to_a_no_op() {
+        struct Stateless;
+        impl InferenceBackend for Stateless {
+            fn name(&self) -> &'static str {
+                "stateless"
+            }
+            fn load(
+                &mut self,
+                _: &GpuContext,
+                _: &LoadRequest,
+            ) -> Result<LoadReport, BackendError> {
+                Ok(LoadReport::default())
+            }
+            fn process(
+                &mut self,
+                _: &GpuContext,
+                _: &FrameParams,
+                _: &DeviceNv12,
+                _: &DeviceNv12,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn unload(&mut self) {}
+            fn timings(&self) -> Option<StageTimings> {
+                None
+            }
+        }
+        let gpu = GpuContext {
+            context: std::ptr::null_mut(),
+            stream: std::ptr::null_mut(),
+        };
+        assert_eq!(Stateless.reset_temporal(&gpu), Ok(()));
     }
 
     #[test]
     fn timings_total() {
         let t = StageTimings {
             convert_in_ms: 0.25,
+            denoise_ms: 0.0,
             mask_ms: 1.0,
             effect_ms: 0.5,
             convert_out_ms: 0.25,
         };
         assert_eq!(t.total_ms(), 2.0);
+        let with_denoise = StageTimings {
+            denoise_ms: 1.5,
+            ..t
+        };
+        assert_eq!(with_denoise.total_ms(), 3.5);
+        assert_eq!(StageTimings::default().total_ms(), 0.0);
     }
 
     #[test]

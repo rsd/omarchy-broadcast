@@ -5,7 +5,7 @@ use obc_ipc::{CameraInfo, Snapshot};
 
 /// The JSON names of the scalar fields of a `state` line, in output order
 /// (`docs/cli-json.md`).
-pub const STATE_FIELDS: [&str; 14] = [
+pub const STATE_FIELDS: [&str; 15] = [
     "state",
     "enabled",
     "error",
@@ -19,6 +19,7 @@ pub const STATE_FIELDS: [&str; 14] = [
     "effect",
     "blur_strength",
     "background_image",
+    "denoise",
     "interface_revision",
 ];
 
@@ -26,6 +27,12 @@ pub const STATE_FIELDS: [&str; 14] = [
 /// state is not `off`) or, briefly after it stopped, still counted.
 pub fn pipewire_involved(snap: &Snapshot) -> bool {
     snap.pipewire_output != obc_ipc::PIPEWIRE_OFF || snap.pipewire_consumers > 0
+}
+
+/// Whether noise removal is requested; `None` from a daemon too old to have
+/// it (before [`obc_ipc::DENOISE_REVISION`]), whose `false` means nothing.
+pub fn denoise(snap: &Snapshot) -> Option<bool> {
+    (snap.interface_revision >= obc_ipc::DENOISE_REVISION).then_some(snap.denoise)
 }
 
 /// The entry of `ActiveCamera` in `Cameras`, if it is listed.
@@ -73,6 +80,8 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Changes {
         // Bitwise, so that a NaN does not count as a change every time.
         old.blur_strength.to_bits() != new.blur_strength.to_bits(),
         old.background_image != new.background_image,
+        // As printed: from unknown to a value is a change.
+        denoise(old) != denoise(new),
         old.interface_revision != new.interface_revision,
     ];
     Changes {
@@ -171,5 +180,22 @@ mod tests {
         let mut nan = old.clone();
         nan.blur_strength = f64::NAN;
         assert!(diff(&nan, &nan.clone()).is_empty());
+
+        // Denoise: unknown before revision 4, so an older daemon's `false`
+        // is no value, and a newer daemon's arrival is a change of it.
+        let mut rev3 = old.clone();
+        rev3.interface_revision = 3;
+        assert_eq!(denoise(&rev3), None);
+        let mut rev4 = rev3.clone();
+        rev4.interface_revision = obc_ipc::DENOISE_REVISION;
+        assert_eq!(denoise(&rev4), Some(false));
+        assert_eq!(
+            diff(&rev3, &rev4).fields,
+            vec!["denoise", "interface_revision"]
+        );
+        let mut on = rev4.clone();
+        on.denoise = true;
+        assert_eq!(denoise(&on), Some(true));
+        assert_eq!(diff(&rev4, &on).fields, vec!["denoise"]);
     }
 }

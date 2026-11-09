@@ -60,11 +60,14 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// `SetBlurStrength`, `SetBackgroundImage` and the `InvalidArgument` error.
 /// Revision 3 added the optional PipeWire output: `LoopbackConsumers`,
 /// `PipeWireConsumers` and `PipeWireOutput`, with `Consumers` the total of
-/// both kinds of consumer.
-pub const INTERFACE_REVISION: u32 = 3;
+/// both kinds of consumer. Revision 4 added video noise removal: `Denoise`
+/// and `SetDenoise`.
+pub const INTERFACE_REVISION: u32 = 4;
 /// The first [`INTERFACE_REVISION`] with `LoopbackConsumers`,
 /// `PipeWireConsumers` and `PipeWireOutput`.
 pub const PIPEWIRE_REVISION: u32 = 3;
+/// The first [`INTERFACE_REVISION`] with `Denoise` and `SetDenoise`.
+pub const DENOISE_REVISION: u32 = 4;
 /// `PipeWireOutput` of a daemon whose PipeWire output is not configured, or
 /// that has none (before [`PIPEWIRE_REVISION`]).
 pub const PIPEWIRE_OFF: &str = "off";
@@ -266,6 +269,10 @@ pub struct Snapshot {
     /// `BackgroundImage` (revision 2); empty when the daemon does not offer
     /// it.
     pub background_image: String,
+    /// `Denoise` (revision 4): video noise removal is requested; `false`
+    /// when the daemon does not offer it (tell that case by
+    /// `interface_revision` below [`DENOISE_REVISION`]).
+    pub denoise: bool,
     /// `Consumers`: every consumer, those holding the loopback and those
     /// linked to the PipeWire output.
     pub consumers: u32,
@@ -297,6 +304,7 @@ impl Snapshot {
             effect: String::new(),
             blur_strength: 0.0,
             background_image: String::new(),
+            denoise: false,
             consumers: 0,
             loopback_consumers: 0,
             pipewire_consumers: 0,
@@ -329,6 +337,7 @@ impl Snapshot {
             "Effect" => self.effect = deserialize_for_property(value)?,
             "BlurStrength" => self.blur_strength = deserialize_for_property(value)?,
             "BackgroundImage" => self.background_image = deserialize_for_property(value)?,
+            "Denoise" => self.denoise = deserialize_for_property(value)?,
             "Consumers" => {
                 self.consumers = deserialize_for_property(value)?;
                 if (1..PIPEWIRE_REVISION).contains(&self.interface_revision) {
@@ -409,9 +418,9 @@ impl Snapshot {
     /// [`Snapshot::fetch_no_autostart`].
     ///
     /// The properties added after revision 1 (`BlurStrength`,
-    /// `BackgroundImage`, `PipeWireConsumers`, `PipeWireOutput`) keep their
-    /// [`Snapshot::empty`] value when the daemon does not offer them (see
-    /// [`is_unknown_property_error`]), and `LoopbackConsumers` is then
+    /// `BackgroundImage`, `PipeWireConsumers`, `PipeWireOutput`, `Denoise`)
+    /// keep their [`Snapshot::empty`] value when the daemon does not offer
+    /// them (see [`is_unknown_property_error`]), and `LoopbackConsumers` is then
     /// `Consumers`, as [`Snapshot::from_properties`] does for a property
     /// missing from `GetAll`; any other failure to read them is an error.
     pub async fn fetch(proxy: &OmarchyBroadcastProxy<'_>) -> zbus::Result<Snapshot> {
@@ -427,6 +436,7 @@ impl Snapshot {
             effect: proxy.effect().await?,
             blur_strength: optional(proxy.blur_strength().await, empty.blur_strength)?,
             background_image: optional(proxy.background_image().await, empty.background_image)?,
+            denoise: optional(proxy.denoise().await, empty.denoise)?,
             consumers,
             loopback_consumers: optional(proxy.loopback_consumers().await, consumers)?,
             pipewire_consumers: optional(
@@ -677,6 +687,35 @@ mod tests {
             assert_eq!((changed.consumers, changed.loopback_consumers), (1, 1));
         }
         assert_eq!(Snapshot::empty().pipewire_output, "off");
+    }
+
+    #[test]
+    fn the_revision_4_property_and_an_older_daemon() {
+        let state = Variant::from("idle");
+        let on = Variant::from(true);
+        let rev4 = Variant::from(DENOISE_REVISION);
+        let snap = Snapshot::from_properties([
+            ("State", &state),
+            ("Denoise", &on),
+            ("InterfaceRevision", &rev4),
+        ])
+        .unwrap();
+        assert!(snap.denoise);
+        let mut changed = snap.clone();
+        changed
+            .apply_property("Denoise", &Variant::from(false))
+            .unwrap();
+        assert!(!changed.denoise);
+        assert!(changed.apply_property("Denoise", &state).is_err());
+        // A revision-3 daemon has no Denoise: false, told apart by the
+        // revision.
+        let rev3 = Variant::from(3u32);
+        let old =
+            Snapshot::from_properties([("State", &state), ("InterfaceRevision", &rev3)]).unwrap();
+        assert!(!old.denoise);
+        assert!(old.interface_revision < DENOISE_REVISION);
+        assert!(!Snapshot::empty().denoise);
+        assert_eq!(INTERFACE_REVISION, DENOISE_REVISION);
     }
 
     #[test]

@@ -374,6 +374,7 @@ struct Mock {
     effect: String,
     blur_strength: f64,
     background_image: String,
+    denoise: bool,
     /// The effect calls received, in order, as `Method(argument)`.
     calls: Vec<String>,
 }
@@ -403,6 +404,7 @@ impl Mock {
             effect: "none".into(),
             blur_strength: 0.5,
             background_image: String::new(),
+            denoise: false,
             calls: Vec::new(),
         }
     }
@@ -517,6 +519,19 @@ impl Mock {
         Ok(())
     }
 
+    async fn set_denoise(
+        &mut self,
+        denoise: bool,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        self.calls.push(format!("SetDenoise({denoise})"));
+        if self.denoise != denoise {
+            self.denoise = denoise;
+            self.denoise_changed(&emitter).await?;
+        }
+        Ok(())
+    }
+
     #[zbus(signal)]
     async fn stats(
         emitter: &SignalEmitter<'_>,
@@ -572,6 +587,11 @@ impl Mock {
     #[zbus(property)]
     fn background_image(&self) -> String {
         self.background_image.clone()
+    }
+
+    #[zbus(property)]
+    fn denoise(&self) -> bool {
+        self.denoise
     }
 
     #[zbus(property)]
@@ -824,14 +844,130 @@ impl Rev1 {
     }
 }
 
-/// [`Rev1`] served on the private bus under the daemon's name.
-struct Rev1Daemon {
+/// A daemon of interface revision 3, the one before noise removal: every
+/// member but `Denoise` and `SetDenoise` (a call to it fails with
+/// `UnknownMethod`). The effect methods accept anything.
+struct Rev3;
+
+#[interface(name = "br.com.dias.OmarchyBroadcast1")]
+impl Rev3 {
+    async fn set_enabled(&mut self, _enabled: bool) -> Result<(), IpcError> {
+        Ok(())
+    }
+
+    async fn select_camera(&mut self, _selector: &str) -> Result<(), IpcError> {
+        Ok(())
+    }
+
+    async fn next_camera(&mut self) -> Result<(), IpcError> {
+        Ok(())
+    }
+
+    async fn reload_config(&mut self) -> Result<(), IpcError> {
+        Ok(())
+    }
+
+    async fn set_effect(&mut self, _effect: &str) -> Result<(), IpcError> {
+        Ok(())
+    }
+
+    async fn set_blur_strength(&mut self, _strength: f64) -> Result<(), IpcError> {
+        Ok(())
+    }
+
+    async fn set_background_image(&mut self, _path: &str) -> Result<(), IpcError> {
+        Ok(())
+    }
+
+    #[zbus(signal)]
+    async fn stats(
+        emitter: &SignalEmitter<'_>,
+        fps: f64,
+        latency_ms: f64,
+        cpu_percent: f64,
+        gpu_percent: f64,
+    ) -> zbus::Result<()>;
+
+    #[zbus(property)]
+    fn state(&self) -> State {
+        State::Idle
+    }
+
+    #[zbus(property)]
+    fn error(&self) -> String {
+        String::new()
+    }
+
+    #[zbus(property)]
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    #[zbus(property)]
+    fn cameras(&self) -> Vec<CameraInfo> {
+        Vec::new()
+    }
+
+    #[zbus(property)]
+    fn active_camera(&self) -> String {
+        String::new()
+    }
+
+    #[zbus(property)]
+    fn output_mode(&self) -> String {
+        "NV12 1920x1080@30".into()
+    }
+
+    #[zbus(property)]
+    fn effect(&self) -> String {
+        "blur".into()
+    }
+
+    #[zbus(property)]
+    fn blur_strength(&self) -> f64 {
+        0.5
+    }
+
+    #[zbus(property)]
+    fn background_image(&self) -> String {
+        String::new()
+    }
+
+    #[zbus(property)]
+    fn consumers(&self) -> u32 {
+        0
+    }
+
+    #[zbus(property)]
+    fn loopback_consumers(&self) -> u32 {
+        0
+    }
+
+    #[zbus(property, name = "PipeWireConsumers")]
+    fn pipewire_consumers(&self) -> u32 {
+        0
+    }
+
+    #[zbus(property, name = "PipeWireOutput")]
+    fn pipewire_output(&self) -> String {
+        "off".into()
+    }
+
+    #[zbus(property)]
+    fn interface_revision(&self) -> u32 {
+        3
+    }
+}
+
+/// An older daemon ([`Rev1`], [`Rev3`]) served on the private bus under the
+/// daemon's name.
+struct OldDaemon {
     _rt: tokio::runtime::Runtime,
     _conn: Connection,
 }
 
-impl Rev1Daemon {
-    fn start(bus: &Bus) -> Rev1Daemon {
+impl OldDaemon {
+    fn start(bus: &Bus, iface: impl zbus::object_server::Interface) -> OldDaemon {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -840,12 +976,12 @@ impl Rev1Daemon {
         let conn = rt
             .block_on(
                 connection::Builder::address(bus.address.as_str())
-                    .serve_at(OBJECT_PATH, Rev1)
+                    .serve_at(OBJECT_PATH, iface)
                     .name(BUS_NAME)
                     .build(),
             )
             .unwrap();
-        Rev1Daemon {
+        OldDaemon {
             _rt: rt,
             _conn: conn,
         }
@@ -869,7 +1005,8 @@ fn status_human_and_json() {
          Camera:     First Camera (1234:abcd)\n\
          Consumers:  0\n\
          Output:     NV12 1920x1080@30\n\
-         Effect:     none\n"
+         Effect:     none\n\
+         Denoise:    off\n"
     );
     assert_eq!(out.stderr, "");
 
@@ -891,6 +1028,7 @@ fn status_human_and_json() {
     assert_eq!(v["effect"], "none");
     assert_eq!(v["blur_strength"], 0.5);
     assert_eq!(v["background_image"], "");
+    assert_eq!(v["denoise"], false);
     assert_eq!(v["interface_revision"], INTERFACE_REVISION);
     assert_eq!(v["cameras"].as_array().unwrap().len(), 2);
     assert_eq!(v["cameras_truncated"], false);
@@ -914,7 +1052,8 @@ fn status_and_watch_show_the_pipewire_output() {
          Consumers:  2 (loopback 1, PipeWire 1)\n\
          Output:     NV12 1920x1080@30\n\
          PipeWire:   streaming\n\
-         Effect:     none\n"
+         Effect:     none\n\
+         Denoise:    off\n"
     );
     let out = bus.run(&["status", "--json"]);
     assert!(out.status.success(), "{}", out.stderr);
@@ -952,7 +1091,7 @@ fn status_and_watch_show_the_pipewire_output() {
         watch.next("the summary"),
         "omarchy-broadcastd: state idle | enabled yes | camera First Camera (1234:abcd) \
          | consumers 1 (loopback 1, PipeWire 0) | output NV12 1920x1080@30 \
-         | PipeWire ready | effect none\n"
+         | PipeWire ready | effect none | denoise off\n"
     );
     mock.set_pipewire(1, "streaming");
     assert_eq!(watch.next("the total"), "consumers: 2\n");
@@ -1057,7 +1196,7 @@ fn effect_shows_and_selects_the_effect() {
     assert!(out.status.success(), "{}", out.stderr);
     assert_eq!(
         out.stdout,
-        "Effect:     none\nStrength:   0.50\nImage:      (none)\n"
+        "Effect:     none\nStrength:   0.50\nImage:      (none)\nDenoise:    off\n"
     );
     let out = bus.run(&["effect", "--json"]);
     assert!(out.status.success(), "{}", out.stderr);
@@ -1074,7 +1213,7 @@ fn effect_shows_and_selects_the_effect() {
     assert!(out.status.success(), "{}", out.stderr);
     assert_eq!(
         out.stdout,
-        "Effect:     blur\nStrength:   0.80\nImage:      (none)\n"
+        "Effect:     blur\nStrength:   0.80\nImage:      (none)\nDenoise:    off\n"
     );
     assert_eq!(
         mock.take_calls(),
@@ -1085,7 +1224,8 @@ fn effect_shows_and_selects_the_effect() {
     assert_eq!(mock.take_calls(), vec!["SetEffect(blur)"]);
     let out = bus.run(&["status"]);
     assert!(
-        out.stdout.ends_with("Effect:     blur\nStrength:   0.80\n"),
+        out.stdout
+            .ends_with("Effect:     blur\nStrength:   0.80\nDenoise:    off\n"),
         "{}",
         out.stdout
     );
@@ -1103,7 +1243,7 @@ fn effect_shows_and_selects_the_effect() {
     assert_eq!(
         out.stdout,
         format!(
-            "Effect:     replace\nStrength:   0.80\nImage:      {}\n",
+            "Effect:     replace\nStrength:   0.80\nImage:      {}\nDenoise:    off\n",
             image.display()
         )
     );
@@ -1122,7 +1262,7 @@ fn effect_shows_and_selects_the_effect() {
     let out = bus.run(&["status"]);
     assert!(
         out.stdout.ends_with(&format!(
-            "Effect:     replace\nImage:      {}\n",
+            "Effect:     replace\nImage:      {}\nDenoise:    off\n",
             image.display()
         )),
         "{}",
@@ -1222,7 +1362,7 @@ fn effect_rejected_by_the_daemon_exits_1_with_its_message() {
 #[test]
 fn effect_against_a_revision_1_daemon_says_it_is_unsupported() {
     let bus = Bus::start();
-    let _daemon = Rev1Daemon::start(&bus);
+    let _daemon = OldDaemon::start(&bus, Rev1);
     let expected = "omarchy-broadcast: the daemon does not support effects (its interface \
                     revision is 1, effects need 2); update omarchy-broadcastd\n";
     for args in [
@@ -1248,6 +1388,125 @@ fn effect_against_a_revision_1_daemon_says_it_is_unsupported() {
     assert!(out.stdout.contains("Effect:     none\n"), "{}", out.stdout);
     let out = bus.run(&["on"]);
     assert!(out.status.success(), "{}", out.stderr);
+}
+
+#[test]
+fn denoise_switches_noise_removal_and_status_shows_it() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let out = bus.run(&["denoise", "on"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert_eq!(out.stdout, "Denoise:    on\n");
+    assert_eq!(out.stderr, "");
+    assert_eq!(mock.take_calls(), vec!["SetDenoise(true)"]);
+    let out = bus.run(&["status"]);
+    assert!(
+        out.stdout.ends_with("Effect:     none\nDenoise:    on\n"),
+        "{}",
+        out.stdout
+    );
+    let out = bus.run(&["status", "--json"]);
+    assert_eq!(json_line(&out.stdout)["denoise"], true);
+    let out = bus.run(&["effect", "--json"]);
+    assert_eq!(json_line(&out.stdout)["denoise"], true);
+    let out = bus.run(&["effect"]);
+    assert!(out.stdout.ends_with("Denoise:    on\n"), "{}", out.stdout);
+    let out = bus.run(&["denoise", "off"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert_eq!(out.stdout, "Denoise:    off\n");
+    assert_eq!(mock.take_calls(), vec!["SetDenoise(false)"]);
+    assert_eq!(
+        json_line(&bus.run(&["status", "--json"]).stdout)["denoise"],
+        false
+    );
+    // Usage errors: before any call.
+    for args in [
+        &["denoise"][..],
+        &["denoise", "yes"],
+        &["denoise", "on", "off"],
+        &["denoise", "--json"],
+    ] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", out.stderr);
+        assert_eq!(out.stdout, "", "{args:?}");
+        assert!(
+            out.stderr.starts_with("error: "),
+            "{args:?}: {}",
+            out.stderr
+        );
+    }
+    assert!(mock.take_calls().is_empty());
+    assert!(!bus.activation_attempted());
+}
+
+#[test]
+fn denoise_against_an_older_daemon_says_it_is_unsupported() {
+    let bus = Bus::start();
+    let _daemon = OldDaemon::start(&bus, Rev1);
+    for args in [&["denoise", "on"][..], &["denoise", "off"]] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", out.stderr);
+        assert_eq!(out.stdout, "", "{args:?}");
+        assert_eq!(
+            out.stderr,
+            "omarchy-broadcast: the daemon does not support noise removal (its interface \
+             revision is 1, noise removal needs 4); update omarchy-broadcastd\n",
+            "{args:?}"
+        );
+    }
+    // Its snapshot has no value: `null`, and no line for a person.
+    let v = json_line(&bus.run(&["status", "--json"]).stdout);
+    assert_eq!(v["denoise"], Value::Null);
+    assert!(v.as_object().unwrap().contains_key("denoise"));
+    let out = bus.run(&["status"]);
+    assert!(!out.stdout.contains("Denoise"), "{}", out.stdout);
+}
+
+#[test]
+fn denoise_against_a_revision_3_daemon_says_it_is_unsupported() {
+    // The daemon before noise removal: effects and the PipeWire output,
+    // no `Denoise` and no `SetDenoise`.
+    let bus = Bus::start();
+    let _daemon = OldDaemon::start(&bus, Rev3);
+    for args in [&["denoise", "on"][..], &["denoise", "off"]] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", out.stderr);
+        assert_eq!(out.stdout, "", "{args:?}");
+        assert_eq!(
+            out.stderr,
+            "omarchy-broadcast: the daemon does not support noise removal (its interface \
+             revision is 3, noise removal needs 4); update omarchy-broadcastd\n",
+            "{args:?}"
+        );
+    }
+    // Its snapshot has no value: `null`, and no line for a person, in
+    // `status` and `effect` alike; the rest is shown.
+    let out = bus.run(&["status", "--json"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let v = json_line(&out.stdout);
+    assert_eq!(v["interface_revision"], 3);
+    assert_eq!(v["denoise"], Value::Null);
+    assert!(v.as_object().unwrap().contains_key("denoise"));
+    assert_eq!(v["effect"], "blur");
+    assert_eq!(v["pipewire_output"], "off");
+    let out = bus.run(&["status"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(
+        out.stdout.ends_with("Effect:     blur\nStrength:   0.50\n"),
+        "{}",
+        out.stdout
+    );
+    let out = bus.run(&["effect"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "Effect:     blur\nStrength:   0.50\nImage:      (none)\n"
+    );
+    let out = bus.run(&["effect", "--json"]);
+    assert_eq!(json_line(&out.stdout)["denoise"], Value::Null);
+    // The effect commands still work with it.
+    let out = bus.run(&["effect", "none"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
 }
 
 #[test]
@@ -1398,6 +1657,13 @@ fn watch_json_follows_changes_stats_and_outages() {
     let v = watch.next_json("an effect change");
     assert_eq!(v["changed"], serde_json::json!(["effect"]));
     assert_eq!(v["effect"], "blur");
+    assert_eq!(v["denoise"], false);
+    let out = bus.run(&["denoise", "on"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let v = watch.next_json("a denoise change");
+    assert_eq!(v["changed"], serde_json::json!(["denoise"]));
+    assert_eq!(v["denoise"], true);
+    assert_eq!(v["effect"], "blur");
 
     mock.add_camera("platform-video9", "Third Camera");
     let v = watch.next_json("a camera list change");
@@ -1518,7 +1784,7 @@ fn watch_human_prints_changes_and_stats() {
     assert_eq!(
         watch.next("the summary"),
         "omarchy-broadcastd: state idle | enabled yes | camera First Camera (1234:abcd) \
-         | consumers 0 | output NV12 1920x1080@30 | effect none\n"
+         | consumers 0 | output NV12 1920x1080@30 | effect none | denoise off\n"
     );
     mock.set_consumers(2);
     assert_eq!(watch.next("a consumers change"), "consumers: 2\n");
@@ -1534,6 +1800,9 @@ fn watch_human_prints_changes_and_stats() {
     assert!(out.status.success(), "{}", out.stderr);
     assert_eq!(watch.next("a strength change"), "blur strength: 0.75\n");
     assert_eq!(watch.next("an effect change"), "effect: blur\n");
+    let out = bus.run(&["denoise", "on"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(watch.next("a denoise change"), "denoise: on\n");
     mock.release_name();
     assert!(
         watch

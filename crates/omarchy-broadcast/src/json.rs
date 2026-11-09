@@ -146,6 +146,8 @@ struct StateFields<'a> {
     effect: Cow<'a, str>,
     blur_strength: f64,
     background_image: Cow<'a, str>,
+    /// `null` from a daemon too old to have it.
+    denoise: Option<bool>,
     interface_revision: u32,
 }
 
@@ -165,6 +167,7 @@ impl<'a> StateFields<'a> {
             effect: clip(&s.effect, MAX_EFFECT_BYTES),
             blur_strength: strength(s.blur_strength),
             background_image: clip_start(&s.background_image, MAX_PATH_BYTES),
+            denoise: model::denoise(s),
             interface_revision: s.interface_revision,
         }
     }
@@ -350,7 +353,8 @@ mod tests {
             loopback_consumers: 1,
             pipewire_consumers: 1,
             pipewire_output: "streaming".into(),
-            interface_revision: 3,
+            denoise: true,
+            interface_revision: 4,
         }
     }
 
@@ -380,7 +384,8 @@ mod tests {
         assert_eq!(v["effect"], "blur");
         assert_eq!(v["blur_strength"], 0.5);
         assert_eq!(v["background_image"], "/home/u/bg.png");
-        assert_eq!(v["interface_revision"], 3);
+        assert_eq!(v["denoise"], true);
+        assert_eq!(v["interface_revision"], 4);
         assert_eq!(v["cameras_truncated"], false);
         let cams = v["cameras"].as_array().unwrap();
         assert_eq!(cams.len(), 2);
@@ -432,6 +437,25 @@ mod tests {
                 &serde_json::json!("off")
             )
         );
+    }
+
+    #[test]
+    fn denoise_is_a_boolean_or_null_from_an_older_daemon() {
+        let mut s = sample();
+        for (denoise, revision, printed) in [
+            (true, 4, serde_json::json!(true)),
+            (false, 4, serde_json::json!(false)),
+            (false, 3, Value::Null),
+            (true, 3, Value::Null),
+            (false, 0, Value::Null),
+        ] {
+            s.denoise = denoise;
+            s.interface_revision = revision;
+            for line in [snapshot_line(&s), state_line(&s, &["denoise"])] {
+                let v = parse(&line);
+                assert_eq!(v.get("denoise"), Some(&printed), "{line}");
+            }
+        }
     }
 
     #[test]

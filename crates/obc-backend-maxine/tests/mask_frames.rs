@@ -359,6 +359,7 @@ fn the_hardened_mask_hides_the_room_on_recorded_camera_frames() {
         let dst = DeviceNv12Buffer::alloc(W as u32, H as u32).unwrap();
         let req = LoadRequest {
             effect: EffectKind::Replace,
+            denoise: false,
             width: W as u32,
             height: H as u32,
             colour: ColourSpec::LIMITED_BT601,
