@@ -25,7 +25,10 @@
 //! loopback device for the daemon's whole life and sends black placeholders
 //! while no output runs; [`live::LiveStats`] measures a running stream for
 //! the daemon's statistics. The measurement modules
-//! (`instrument`, `stats`, `gpu`, `stamp`) serve `obc-bench`.
+//! (`instrument`, `stats`, `gpu`, `stamp`) serve `obc-bench`. With the
+//! cargo feature `pipewire` (off by default), the `pipewire` module also
+//! offers the writer's frames as a native PipeWire camera node, fed by the
+//! writer's tap ([`loopback::FrameTap`]).
 
 pub mod capability;
 pub mod clock;
@@ -42,6 +45,8 @@ pub mod live;
 pub mod loopback;
 pub mod output;
 pub mod pipeline;
+#[cfg(feature = "pipewire")]
+pub mod pipewire;
 pub mod process;
 pub mod session;
 pub mod slot;
@@ -65,7 +70,8 @@ pub use geometry::{Crop, crop_for};
 pub use ingest::{ControlReport, Ingest, IngestConfig};
 pub use live::{LiveStats, LiveWindow};
 pub use loopback::{
-    LoopbackWriter, WriterConfig, WriterCounts, WriterHandle, WriterSink, writer_caps_string,
+    FrameTap, LoopbackWriter, WriterConfig, WriterCounts, WriterHandle, WriterSink,
+    writer_caps_string,
 };
 pub use output::{
     EmitInfo, EmitObserver, FrameOrigin, Output, OutputConfig, OutputCounts, OutputSink,

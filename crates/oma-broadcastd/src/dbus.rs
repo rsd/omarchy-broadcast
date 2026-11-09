@@ -151,9 +151,30 @@ impl Server {
         self.snap().background_image
     }
 
+    /// Every consumer: the processes holding the loopback plus the links
+    /// to the PipeWire output.
     #[zbus(property)]
     fn consumers(&self) -> u32 {
         self.snap().consumers
+    }
+
+    /// The processes holding the loopback device open (revision 3).
+    #[zbus(property)]
+    fn loopback_consumers(&self) -> u32 {
+        self.snap().loopback_consumers
+    }
+
+    /// The links to the PipeWire output; 0 when it is off (revision 3).
+    #[zbus(property, name = "PipeWireConsumers")]
+    fn pipewire_consumers(&self) -> u32 {
+        self.snap().pipewire_consumers
+    }
+
+    /// The PipeWire output's state: `off`, `unsupported`, `connecting`,
+    /// `ready`, `streaming` or `failed` (revision 3).
+    #[zbus(property, name = "PipeWireOutput")]
+    fn pipewire_output(&self) -> String {
+        self.snap().pipewire_output
     }
 
     #[zbus(property)]
@@ -190,11 +211,14 @@ async fn emit_change(emitter: &SignalEmitter<'_>, change: &Change) -> zbus::Resu
         | Change::ActiveCamera(v)
         | Change::OutputMode(v)
         | Change::Effect(v)
-        | Change::BackgroundImage(v) => emit_changed(emitter, name, v).await,
+        | Change::BackgroundImage(v)
+        | Change::PipeWireOutput(v) => emit_changed(emitter, name, v).await,
         Change::BlurStrength(v) => emit_changed(emitter, name, v).await,
         Change::Enabled(v) => emit_changed(emitter, name, v).await,
         Change::Cameras(v) => emit_changed(emitter, name, v).await,
-        Change::Consumers(v) => emit_changed(emitter, name, v).await,
+        Change::Consumers(v) | Change::LoopbackConsumers(v) | Change::PipeWireConsumers(v) => {
+            emit_changed(emitter, name, v).await
+        }
     }
 }
 

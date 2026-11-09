@@ -21,7 +21,7 @@ The object also implements the standard `org.freedesktop.DBus.Properties`, `org.
 ## Versioning
 
 - **Breaking changes** (a removed or renamed member, a changed type or meaning, a new lifecycle state) are never made to `br.com.dias.OmaBroadcast1`. They go into a new interface, `br.com.dias.OmaBroadcast2`, on the same object.
-- **Backwards-compatible additions** (a new property, method, signal or error name) are made to `br.com.dias.OmaBroadcast1` and raise the `InterfaceRevision` property. This document describes revision **2**. Revision 1 had no video effects: `Effect` was reserved and always `none`. Revision 2 adds the `BlurStrength` and `BackgroundImage` properties, the `SetEffect`, `SetBlurStrength` and `SetBackgroundImage` methods and the `InvalidArgument` error name, and gives `Effect` its values; it removes and changes nothing else.
+- **Backwards-compatible additions** (a new property, method, signal or error name) are made to `br.com.dias.OmaBroadcast1` and raise the `InterfaceRevision` property. This document describes revision **3**. Revision 1 had no video effects: `Effect` was reserved and always `none`. Revision 2 adds the `BlurStrength` and `BackgroundImage` properties, the `SetEffect`, `SetBlurStrength` and `SetBackgroundImage` methods and the `InvalidArgument` error name, and gives `Effect` its values; it removes and changes nothing else. Revision 3 adds the optional PipeWire output ([ADR-0016](adr/0016-pipewire-output.md)): the properties `LoopbackConsumers`, `PipeWireConsumers` and `PipeWireOutput`. `Consumers` keeps its type and becomes the total of both kinds of consumer; with the PipeWire output off it has the value it had in revision 2. A client that needs only the processes holding the loopback reads `LoopbackConsumers`.
 - A client that uses an addition checks `InterfaceRevision` first and treats an older daemon as not offering it. A client must ignore properties, signals and error names it does not know.
 
 ## Lifecycle states
@@ -76,8 +76,11 @@ All properties are read-only. Every change is announced with `org.freedesktop.DB
 | `Effect` | `s` | The video effect in force: `none`, `blur` or `replace`. This is the effective value (a run-time choice, else the configuration's `[effect] mode`), not whether the effect is ready yet or has failed; see [Video effects](#video-effects). | On `SetEffect`, and on a configuration reload that changes the effective value. |
 | `BlurStrength` | `d` | Strength of the `blur` effect, 0.0 to 1.0. The effective value, shown whatever the effect. | On `SetBlurStrength`, and on a reload that changes the effective value. |
 | `BackgroundImage` | `s` | Absolute path of the image for `replace`; empty if there is none. The effective value (a run-time choice, else the configuration's `[effect] background_image`). | On `SetBackgroundImage`, and on a reload that changes the effective value. |
-| `Consumers` | `u` | Number of processes, other than the daemon, holding the virtual camera open. | When an application opens or closes the virtual camera. |
-| `InterfaceRevision` | `u` | Revision of `br.com.dias.OmaBroadcast1` the daemon implements (see Versioning). This document describes `2`. | Never while the daemon runs. |
+| `Consumers` | `u` | Number of consumers of the virtual camera: `LoopbackConsumers` plus `PipeWireConsumers`. Before revision 3, and with the PipeWire output off, only the processes holding the loopback. | When an application opens or closes the loopback, or links to or leaves the PipeWire node. |
+| `LoopbackConsumers` | `u` | Number of processes, other than the daemon, holding the loopback device open (the former meaning of `Consumers`). Revision 3. | When an application opens or closes the loopback. |
+| `PipeWireConsumers` | `u` | Number of links to the PipeWire output's node; `0` when the output is off. A link in the error state is not counted. Revision 3. | When an application links to or leaves the node. |
+| `PipeWireOutput` | `s` | State of the optional PipeWire output: `off` (not configured), `unsupported` (configured, but the daemon was built without the feature), `connecting`, `ready` (the node is registered, no stream), `streaming` (a consumer is linked and frames flow) or `failed` (no PipeWire daemon, a lost connection or a stream error; retried every 2 s). A failure never changes `State` and never sets `Error`. Revision 3. | On every transition of the output. |
+| `InterfaceRevision` | `u` | Revision of `br.com.dias.OmaBroadcast1` the daemon implements (see Versioning). This document describes `3`. | Never while the daemon runs. |
 
 ## Methods
 
@@ -213,6 +216,12 @@ The daemon starts its loopback writer before it takes its bus name, so the virtu
 - The optional drop-in `dist/systemd/wireplumber.service.d/oma-broadcast.conf`, installed as `~/.config/systemd/user/wireplumber.service.d/oma-broadcast.conf`, orders WirePlumber after `oma-broadcastd.service` (followed by `systemctl --user daemon-reload`).
 - Without it, or after restarting the daemon by hand, `systemctl --user restart wireplumber` once the daemon runs makes WirePlumber probe the device again.
 
+### The native PipeWire node
+
+With the optional PipeWire output ([ADR-0016](adr/0016-pipewire-output.md)) the daemon registers its own PipeWire video source, `oma-broadcast` ("Omarchy Broadcast", `media.class` `Video/Source`, `media.role` `Camera`), and PipeWire-based applications can use it directly, with no WirePlumber probe of the loopback. `PipeWireOutput` and `PipeWireConsumers` report it. Which applications use it depends on the application: Firefox through the camera portal, OBS Studio 30.1 and later, GNOME Snapshot and GStreamer's `pipewiresrc` do; Chromium and Chrome only with their PipeWire camera feature enabled; Zoom and Discord use the loopback. Setup is in [setup/daemon.md](setup/daemon.md#the-pipewire-output).
+
+Once WirePlumber has probed the loopback while the writer streams, PipeWire also lists the loopback as a camera, so an application can show "Omarchy Broadcast" twice. A WirePlumber rule can hide the loopback from PipeWire only; applications that open `/dev/video*` directly are unaffected. The rule is in [setup/daemon.md](setup/daemon.md#hiding-the-duplicate). With it, the ordering drop-in above is not needed for applications that use the native node; it stays useful for those that reach the camera through v4l2 only.
+
 ## Examples with `busctl`
 
 Introspect the object:
@@ -238,8 +247,11 @@ NAME                        TYPE      SIGNATURE RESULT/VALUE                FLAG
 .Effect                     property  s         "none"                      emits-change
 .Enabled                    property  b         true                        emits-change
 .Error                      property  s         ""                          emits-change
-.InterfaceRevision          property  u         2                           emits-change
+.InterfaceRevision          property  u         3                           emits-change
+.LoopbackConsumers          property  u         0                           emits-change
 .OutputMode                 property  s         "NV12 1920x1080@30"         emits-change
+.PipeWireConsumers          property  u         0                           emits-change
+.PipeWireOutput             property  s         "off"                       emits-change
 .State                      property  s         "idle"                      emits-change
 .Stats                      signal    dddd      -                           -
 ```
@@ -396,5 +408,6 @@ gdbus monitor --session --dest br.com.dias.OmaBroadcast --object-path /br/com/di
 - Treat a missing name owner as "daemon not running" (see Service presence and activation).
 - Show `Error` when it is non-empty, whatever the state: a rejected configuration reload sets it while the state stays, for example, `active`.
 - Offer the effect controls only if `InterfaceRevision` is 2 or more; against revision 1 the setters do not exist and `Effect` is always `none`.
+- Read `LoopbackConsumers`, `PipeWireConsumers` and `PipeWireOutput` only if `InterfaceRevision` is 3 or more; against an older daemon `Consumers` counts the loopback alone. To show a split, show it only while `PipeWireOutput` is not `off`.
 - Treat `-1` in `Stats` as unknown, and expect no `Stats` outside `active`.
 - Match errors by name, not by message text: the messages are for people and may change.

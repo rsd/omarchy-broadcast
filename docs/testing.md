@@ -179,6 +179,48 @@ Applications that open `/dev/video*` directly find the virtual camera whenever t
 - Without the drop-in, or after the daemon was restarted by hand, restart WirePlumber once the daemon runs: `systemctl --user restart wireplumber`.
 - Meanwhile `gst-device-monitor-1.0 -i Video/Source` (with `-i`, the hidden providers, including the plain v4l2 one) lists "Omarchy Broadcast" at its `/dev/videoN` path, while the default PipeWire provider does not.
 
+### The PipeWire output
+
+The optional PipeWire node ([ADR-0016](adr/0016-pipewire-output.md)) is compiled only with the cargo feature `pipewire`, so its tests run in a separate suite. The default `cargo test --workspace` does not build them. Building them needs the libpipewire headers and clang; the unit tests create a PipeWire context from its `client.conf` (package `pipewire`) but contact no PipeWire daemon.
+
+```sh
+cargo test -p obc-pipeline -p oma-broadcastd --features oma-broadcastd/pipewire
+```
+
+The continuous integration runs the same command, and clippy with the feature, as a second job; the default job is unchanged.
+
+**Unit tests** (`crates/obc-pipeline/src/pipewire/`, and the controller, D-Bus and CLI tests of the other crates):
+- the format pods and the negotiation: the contract format first, the other two formats after it, the exact size and rate, and the refusal of any other request;
+- the buffer layouts, compared with GStreamer's `GstVideoInfo` default layout, and the CPU conversions into the PipeWire buffer;
+- the link table behind the consumer count: links to the node are counted, links in the error state are not, and links to other nodes are ignored;
+- failure and retry: with no PipeWire daemon the output is `failed` and retried, never puts the daemon in `error`, and events of a replaced output are discarded;
+- the reporting of a panic in a PipeWire callback;
+- in the controller: the lifecycle keyed off the total of loopback and PipeWire consumers, enabling and disabling on reload (immediately, or when the last PipeWire consumer leaves), no loopback rebuild for a PipeWire setting, and the rebuild of both outputs on an output-mode change;
+- in `oma-broadcastd`, `oma-broadcast` and `obc-ipc`: the three revision 3 properties and `Consumers` as their total, an older daemon without them, the `Consumers:  2 (loopback 1, PipeWire 1)` and `PipeWire:` lines, and the three JSON fields with the 32-byte bound on `pipewire_output`.
+
+**Live tests (ignored).** Both change no PipeWire or WirePlumber setting, and their consumers use `node.dont-fallback`, so a missing node never falls back to a real camera. A consumer whose link does not appear within 2 s is stopped and the test fails.
+
+`crates/obc-pipeline/tests/pipewire_live.rs` needs the user PipeWire daemon (with WirePlumber) and `gst-plugin-pipewire` (`pipewiresrc`). It registers a temporary node, `oma-broadcast-test-<pid>`, fed by a loopback writer into a `fakesink` (no device), and checks that NV12 and YUY2 consumers negotiate and receive frames, and that RGBA and 640x480 consumers are refused without disturbing the node, its id or the other consumers.
+
+```sh
+cargo test -p obc-pipeline --features pipewire --test pipewire_live -- --ignored --nocapture --test-threads=1
+```
+
+`crates/oma-broadcastd/tests/pipewire.rs` runs the daemon on a private bus with `[pipewire] enabled = true`, a loopback, a camera and the GPU, with a `pipewiresrc` consumer that drives the lifecycle `starting` to `active` to `idle`, and checks the consumer counts and `PipeWireOutput` along the way. Before it starts the daemon it checks with `pw-dump` that no other node is called `oma-broadcast` (an installed daemon with the node enabled).
+
+| Needs | |
+|---|---|
+| `OBC_TEST_SINK` | A free v4l2loopback device with `exclusive_caps=1`, for example `/dev/video11` |
+| `OBC_TEST_CAMERA` | A colour camera |
+| PipeWire | The user PipeWire daemon, `gst-plugin-pipewire`, `pw-dump` |
+| GPU | An NVIDIA GPU |
+| `/usr/bin/dbus-daemon` | For the private bus |
+
+```sh
+OBC_TEST_SINK=/dev/video11 OBC_TEST_CAMERA=046d:0944 \
+  cargo test -p oma-broadcastd --features pipewire --test pipewire -- --ignored --nocapture
+```
+
 ### Known limitation: one application at a time
 
 While one application streams from the virtual camera, a second one cannot open it: v4l2loopback refuses the second reader's format request (`S_FMT`, "Device or resource busy"). This was seen with a second `gst-launch-1.0 v4l2src` and `obc-consumer`; it is a property of the loopback device, not of the daemon.

@@ -12,6 +12,19 @@
 //! models are loaded only while an effect is requested and the session
 //! runs; stopping the session unloads them before the CUDA context goes
 //! (`docs/adr/0012-video-effects-and-maxine-backend.md`, "Lifecycle").
+//!
+//! The optional PipeWire output (`[pipewire] enabled`) is started and
+//! stopped on its own next to the running writer
+//! ([`MediaBackend::start_pipewire`], [`MediaBackend::stop_pipewire`]),
+//! without touching the writer; stopping the writer stops it too. Every
+//! output started gets a new generation, and its events reach the
+//! [`PipeWireReporter`] given to [`GstBackend::new`] tagged with it. Built
+//! with the cargo feature `pipewire`, it is an
+//! [`obc_pipeline::pipewire::PipeWireOutput`] fed by the writer's frame
+//! tap, with the writer's contract; if it cannot even be started it
+//! reports [`PipeWireState::Failed`] and the loopback runs alone. Built
+//! without the feature (the default), asked for it, the backend reports
+//! [`PipeWireState::Unsupported`] and the loopback runs alone.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,7 +43,10 @@ use obc_pipeline::{
     WriterSink, choose_mode, effect_backend_available, list_cameras, scan_sysfs, select_sink,
 };
 
-use super::{EffectReport, EffectStatus, Failure, MediaBackend, SessionParams};
+use super::{
+    EffectReport, EffectStatus, Failure, MediaBackend, PipeWireEvent, PipeWireGeneration,
+    PipeWireReporter, PipeWireState, SessionParams,
+};
 use crate::camera::{Camera, stable_id, usb_origin};
 use crate::consumers::{NodeId, count_holders};
 
@@ -68,17 +84,88 @@ pub struct GstBackend {
     writer: Option<LoopbackWriter>,
     running: Option<Running>,
     stamp: bool,
+    /// Where the PipeWire output's events go (`None`: nowhere).
+    reporter: Option<PipeWireReporter>,
+    /// The generation of the last PipeWire output started (0: none yet).
+    generation: PipeWireGeneration,
+    /// The PipeWire output fed by the running writer's tap.
+    #[cfg(feature = "pipewire")]
+    output: Option<obc_pipeline::pipewire::PipeWireOutput>,
 }
 
 impl GstBackend {
-    /// Initialises GStreamer (no plugin is loaded by that).
-    pub fn new() -> Result<Self, String> {
+    /// Initialises GStreamer (no plugin is loaded by that). The PipeWire
+    /// output's events go to `reporter`.
+    pub fn new(reporter: Option<PipeWireReporter>) -> Result<Self, String> {
         gst::init().map_err(|e| format!("GStreamer initialisation failed: {e}"))?;
         Ok(GstBackend {
             writer: None,
             running: None,
             stamp: std::env::var_os(STAMP_ENV).is_some_and(|v| !v.is_empty() && v != "0"),
+            reporter,
+            generation: 0,
+            #[cfg(feature = "pipewire")]
+            output: None,
         })
+    }
+
+    fn report(&self, generation: PipeWireGeneration, event: PipeWireEvent) {
+        if let Some(r) = &self.reporter {
+            r(generation, event);
+        }
+    }
+
+    /// Starts the PipeWire output of `generation` next to the running
+    /// writer, with the writer's contract, and installs its tap on the
+    /// writer. Never fails: the outcome is reported (the controller logs
+    /// it), every event tagged with `generation`.
+    #[cfg(feature = "pipewire")]
+    fn start_pipewire_output(&mut self, generation: PipeWireGeneration) {
+        use obc_pipeline::pipewire::{PipeWireOutput, PwEvent, PwOutputConfig};
+
+        let Some(writer) = self.writer.as_ref() else {
+            self.report(
+                generation,
+                PipeWireEvent::State(PipeWireState::Failed(
+                    "no loopback writer is running".into(),
+                )),
+            );
+            self.report(generation, PipeWireEvent::Consumers(0));
+            return;
+        };
+        let reporter = self.reporter.clone();
+        let report = move |event: PwEvent| {
+            if let Some(r) = &reporter {
+                r(generation, pipewire_event(event));
+            }
+        };
+        match PipeWireOutput::start(PwOutputConfig::new(*writer.contract()), report) {
+            Ok(output) => {
+                writer.set_tap(Some(output.tap()));
+                self.output = Some(output);
+            }
+            Err(e) => {
+                self.report(
+                    generation,
+                    PipeWireEvent::State(PipeWireState::Failed(format!(
+                        "cannot start the PipeWire output: {e}"
+                    ))),
+                );
+                self.report(generation, PipeWireEvent::Consumers(0));
+            }
+        }
+    }
+
+    /// Without the feature `pipewire`: reports
+    /// [`PipeWireState::Unsupported`] and no link, and touches nothing.
+    #[cfg(not(feature = "pipewire"))]
+    fn start_pipewire_output(&mut self, generation: PipeWireGeneration) {
+        crate::warning!(
+            "[pipewire] enabled is set, but this build has no PipeWire support: \
+             only the loopback device is offered"
+        );
+        self.report(generation, PipeWireEvent::State(PipeWireState::Unsupported));
+        self.report(generation, PipeWireEvent::Consumers(0));
     }
 
     fn writer_counts(&self) -> WriterCounts {
@@ -230,10 +317,33 @@ impl MediaBackend for GstBackend {
 
     fn stop_writer(&mut self) {
         self.stop_session();
+        self.stop_pipewire();
         if let Some(mut w) = self.writer.take()
             && let Err(e) = w.stop()
         {
             crate::warning!("stopping the loopback writer: {e}");
+        }
+    }
+
+    fn start_pipewire(&mut self) -> PipeWireGeneration {
+        self.stop_pipewire();
+        self.generation += 1;
+        let generation = self.generation;
+        self.start_pipewire_output(generation);
+        generation
+    }
+
+    /// The writer's tap goes first (no frame reaches the output after
+    /// that), then the output (its thread is joined and the node
+    /// disappears). Events it still sends carry its generation, which the
+    /// controller no longer accepts.
+    fn stop_pipewire(&mut self) {
+        #[cfg(feature = "pipewire")]
+        if let Some(output) = self.output.take() {
+            if let Some(w) = &self.writer {
+                w.set_tap(None);
+            }
+            output.stop();
         }
     }
 
@@ -441,6 +551,22 @@ impl MediaBackend for GstBackend {
     }
 }
 
+/// The PipeWire output's event as the controller's.
+#[cfg(feature = "pipewire")]
+fn pipewire_event(event: obc_pipeline::pipewire::PwEvent) -> PipeWireEvent {
+    use obc_pipeline::pipewire::{PwEvent, PwState};
+
+    match event {
+        PwEvent::Consumers(n) => PipeWireEvent::Consumers(n),
+        PwEvent::State(state) => PipeWireEvent::State(match state {
+            PwState::Connecting => PipeWireState::Connecting,
+            PwState::Ready => PipeWireState::Ready,
+            PwState::Streaming => PipeWireState::Streaming,
+            PwState::Failed(reason) => PipeWireState::Failed(reason),
+        }),
+    }
+}
+
 impl Drop for GstBackend {
     fn drop(&mut self) {
         self.stop_writer();
@@ -478,5 +604,34 @@ mod tests {
         // The drop counter read a frame the accepted counters had not yet
         // (two reads, not one snapshot): never below zero.
         assert_eq!(delivered_between(&counts(10, 0, 0), &counts(10, 0, 1)), 0);
+    }
+
+    #[cfg(feature = "pipewire")]
+    #[test]
+    fn the_pipewire_outputs_events_map_one_to_one() {
+        use obc_pipeline::pipewire::{PwEvent, PwState};
+
+        for (from, to) in [
+            (PwEvent::Consumers(0), PipeWireEvent::Consumers(0)),
+            (PwEvent::Consumers(3), PipeWireEvent::Consumers(3)),
+            (
+                PwEvent::State(PwState::Connecting),
+                PipeWireEvent::State(PipeWireState::Connecting),
+            ),
+            (
+                PwEvent::State(PwState::Ready),
+                PipeWireEvent::State(PipeWireState::Ready),
+            ),
+            (
+                PwEvent::State(PwState::Streaming),
+                PipeWireEvent::State(PipeWireState::Streaming),
+            ),
+            (
+                PwEvent::State(PwState::Failed("no daemon".into())),
+                PipeWireEvent::State(PipeWireState::Failed("no daemon".into())),
+            ),
+        ] {
+            assert_eq!(pipewire_event(from), to);
+        }
     }
 }

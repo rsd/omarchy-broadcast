@@ -1,6 +1,6 @@
 # ADR-0004: v4l2loopback is the first output sink
 
-- **Status:** Accepted
+- **Status:** Accepted. Amended by [ADR-0016](0016-pipewire-output.md): the PipeWire video node that "comes later" is an optional second output next to the loopback, which stays the default.
 
 ## Context
 - Applications need to see the processed camera.

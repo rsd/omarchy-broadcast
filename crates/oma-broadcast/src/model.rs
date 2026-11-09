@@ -5,19 +5,28 @@ use obc_ipc::{CameraInfo, Snapshot};
 
 /// The JSON names of the scalar fields of a `state` line, in output order
 /// (`docs/cli-json.md`).
-pub const STATE_FIELDS: [&str; 11] = [
+pub const STATE_FIELDS: [&str; 14] = [
     "state",
     "enabled",
     "error",
     "active_camera",
     "active_camera_name",
     "consumers",
+    "loopback_consumers",
+    "pipewire_consumers",
+    "pipewire_output",
     "output_mode",
     "effect",
     "blur_strength",
     "background_image",
     "interface_revision",
 ];
+
+/// Whether the PipeWire output is part of the picture: configured (its
+/// state is not `off`) or, briefly after it stopped, still counted.
+pub fn pipewire_involved(snap: &Snapshot) -> bool {
+    snap.pipewire_output != obc_ipc::PIPEWIRE_OFF || snap.pipewire_consumers > 0
+}
 
 /// The entry of `ActiveCamera` in `Cameras`, if it is listed.
 pub fn active_camera(snap: &Snapshot) -> Option<&CameraInfo> {
@@ -56,6 +65,9 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Changes {
         old.active_camera != new.active_camera,
         active_camera_name(old) != active_camera_name(new),
         old.consumers != new.consumers,
+        old.loopback_consumers != new.loopback_consumers,
+        old.pipewire_consumers != new.pipewire_consumers,
+        old.pipewire_output != new.pipewire_output,
         old.output_mode != new.output_mode,
         old.effect != new.effect,
         // Bitwise, so that a NaN does not count as a change every time.
@@ -133,6 +145,28 @@ mod tests {
         assert_eq!(active_camera_name(&new), Some("A2"));
         new.active_camera = "gone".into();
         assert_eq!(active_camera_name(&new), None);
+
+        // The PipeWire fields.
+        let mut new = old.clone();
+        new.consumers = 2;
+        new.loopback_consumers = 1;
+        new.pipewire_consumers = 1;
+        new.pipewire_output = "streaming".into();
+        assert_eq!(
+            diff(&old, &new).fields,
+            vec![
+                "consumers",
+                "loopback_consumers",
+                "pipewire_consumers",
+                "pipewire_output"
+            ]
+        );
+        assert!(!pipewire_involved(&old));
+        assert!(pipewire_involved(&new));
+        new.pipewire_output = "off".into();
+        assert!(pipewire_involved(&new), "still counted");
+        new.pipewire_consumers = 0;
+        assert!(!pipewire_involved(&new));
 
         let mut nan = old.clone();
         nan.blur_strength = f64::NAN;

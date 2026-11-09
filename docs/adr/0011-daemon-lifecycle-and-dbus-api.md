@@ -1,6 +1,6 @@
 # ADR-0011: Daemon lifecycle, persistent loopback writer, consumer detection and the D-Bus v1 API
 
-- **Status:** Accepted. Amends [ADR-0006](0006-on-demand-gpu-lifecycle.md) (lifecycle states, what runs while idle) and [ADR-0007](0007-headless-daemon-toml-config.md) (how runtime changes persist, how the config is reloaded). Implements [ADR-0005](0005-dbus-zbus-control-plane.md).
+- **Status:** Accepted. Amends [ADR-0006](0006-on-demand-gpu-lifecycle.md) (lifecycle states, what runs while idle) and [ADR-0007](0007-headless-daemon-toml-config.md) (how runtime changes persist, how the config is reloaded). Implements [ADR-0005](0005-dbus-zbus-control-plane.md). Amended by [ADR-0016](0016-pipewire-output.md): consumers also include PipeWire links, and the property list gains `LoopbackConsumers`, `PipeWireConsumers` and `PipeWireOutput` (revision 3).
 
 ## Context
 - `oma-broadcastd` turns the pipeline of [ADR-0009](0009-ingest-process-output.md) and [ADR-0010](0010-phase-locked-output-clock.md) into a product: a headless user service that the CLI, the Omarchy bar and scripts control over D-Bus.
@@ -63,6 +63,7 @@ stateDiagram-v2
 - A watcher thread holds an inotify watch on the loopback node for `IN_OPEN`, `IN_CLOSE_WRITE` and `IN_CLOSE_NOWRITE`. Each event is only a hint: the watcher then counts the processes other than the daemon that hold the node open, from `/proc/<pid>/fd`. The daemon's own writer holds the device and is excluded by pid.
 - **Debounce:** a consumer must be present for 300 ms before `starting`, so enumeration opens do not open the camera; the grace period covers the other direction.
 - **Fallback:** if the watch cannot be set, the watcher counts every second.
+- With the optional PipeWire output, the links to its node count as consumers too ([ADR-0016](0016-pipewire-output.md)).
 - A process whose `/proc/<pid>/fd` cannot be read (another user's) is not counted. Consumers of a user's virtual camera run as that user.
 
 ### Cameras and hotplug
@@ -78,7 +79,7 @@ stateDiagram-v2
 
 ### D-Bus API v1
 - Session bus, well-known name `br.com.dias.OmaBroadcast`, object `/br/com/dias/OmaBroadcast`, interface `br.com.dias.OmaBroadcast1`. Breaking changes add `br.com.dias.OmaBroadcast2`; additions within v1 raise the `InterfaceRevision` property.
-- **Properties** (read-only, all emit `org.freedesktop.DBus.Properties.PropertiesChanged`): `State` (s), `Error` (s), `Enabled` (b), `Cameras` (a(sss): id, name, `vid:pid`; the name is the V4L2 card name with a repeated `X: X` shown once, and made unique with ` (2)`, ` (3)` suffixes, see [../dbus-api.md](../dbus-api.md)), `ActiveCamera` (s, the id of the camera that streams or would stream; empty if none), `OutputMode` (s, e.g. `NV12 1920x1080@30`), `Effect` (s, reserved, always `none` in this version), `Consumers` (u), `InterfaceRevision` (u).
+- **Properties** (read-only, all emit `org.freedesktop.DBus.Properties.PropertiesChanged`): `State` (s), `Error` (s), `Enabled` (b), `Cameras` (a(sss): id, name, `vid:pid`; the name is the V4L2 card name with a repeated `X: X` shown once, and made unique with ` (2)`, ` (3)` suffixes, see [../dbus-api.md](../dbus-api.md)), `ActiveCamera` (s, the id of the camera that streams or would stream; empty if none), `OutputMode` (s, e.g. `NV12 1920x1080@30`), `Effect` (s, reserved, always `none` in this version), `Consumers` (u; since ADR-0016 the total of loopback holders and PipeWire links), `InterfaceRevision` (u).
 - **Methods:** `SetEnabled(b)`, `SelectCamera(s)` (an id, a card-name substring, a `vid:pid` or a `/dev/videoN`), `NextCamera()`, `ReloadConfig()`. Failures are D-Bus errors under `br.com.dias.OmaBroadcast1.Error`.
 - **Signal** `Stats(d fps, d latency_p50_ms, d cpu_percent, d gpu_percent)`, about once per second while `active`; a value that cannot be measured is `-1`.
 - The interface types, names and a client proxy live in `obc-ipc`, shared by the CLI and the bar client. The reference is [../dbus-api.md](../dbus-api.md).

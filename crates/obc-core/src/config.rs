@@ -102,6 +102,7 @@ pub struct Config {
     pub loopback: LoopbackConfig,
     pub lifecycle: LifecycleConfig,
     pub effect: EffectConfig,
+    pub pipewire: PipeWireConfig,
 }
 
 /// `[camera]`: which camera, and what to ask it for.
@@ -258,6 +259,17 @@ impl Default for EffectConfig {
     }
 }
 
+/// `[pipewire]`: an optional second output, a native PipeWire video
+/// source next to the v4l2loopback device. It carries the same frames as
+/// the loopback, and an application linked to it counts as a consumer like
+/// one holding the loopback.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PipeWireConfig {
+    /// Offer the PipeWire video source. Off by default: the loopback alone.
+    pub enabled: bool,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -267,6 +279,7 @@ impl Default for Config {
             loopback: LoopbackConfig::default(),
             lifecycle: LifecycleConfig::default(),
             effect: EffectConfig::default(),
+            pipewire: PipeWireConfig::default(),
         }
     }
 }
@@ -959,6 +972,7 @@ mod tests {
         assert_eq!(c.sink_selector(), SinkSelector::default());
         assert_eq!(c.idle_grace(), Duration::from_secs(5));
         assert_eq!(c.start_debounce(), Duration::from_millis(300));
+        assert!(!c.pipewire.enabled);
         c.validate().unwrap();
     }
 
@@ -992,6 +1006,9 @@ mode = "replace"
 blur_strength = 1
 background_image = "/home/u/Pictures/office.png"
 on_failure = "none"
+
+[pipewire]
+enabled = true
 "#;
         let c = parse(text).unwrap();
         assert_eq!(
@@ -1030,6 +1047,7 @@ on_failure = "none"
                 on_failure: EffectOnFailure::None,
             }
         );
+        assert_eq!(c.pipewire, PipeWireConfig { enabled: true });
 
         let again = parse(&c.to_toml()).unwrap();
         assert_eq!(again, c);
@@ -1088,6 +1106,7 @@ on_failure = "none"
             "blur_strength",
             "background_image",
             "on_failure",
+            "enabled",
         ] {
             assert!(
                 EXAMPLE.lines().any(|l| l
@@ -1123,6 +1142,12 @@ on_failure = "none"
         );
         assert!(!s.contains('\n'), "one line: {s}");
         assert!(parse_err("[cmaera]\n").contains("unknown field `cmaera`"));
+        let e = parse_err("[pipewire]\nenable = true\n");
+        assert!(
+            e.contains(":2:1: pipewire.enable: ") && e.contains("unknown field `enable`"),
+            "{e}"
+        );
+        assert!(parse_err("[pipe_wire]\n").contains("unknown field `pipe_wire`"));
         assert!(parse_err("colour = 1\n").contains("unknown field `colour`"));
     }
 
@@ -1270,6 +1295,11 @@ on_failure = "none"
                 "[effect]\nbackground_image = \"\"\nmode = \"replace\"",
                 "effect.mode",
                 "needs a background image",
+            ),
+            (
+                "[pipewire]\nenabled = \"yes\"",
+                "pipewire.enabled",
+                "invalid type",
             ),
         ];
         for (text, key, reason) in cases {

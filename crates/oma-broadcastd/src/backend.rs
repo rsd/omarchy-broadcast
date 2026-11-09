@@ -6,6 +6,7 @@
 //! controller's tests use a fake that records the calls.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use obc_core::config::EffectConfig;
@@ -63,6 +64,67 @@ pub struct EffectReport {
     pub gpu_ms_p50: Option<f64>,
 }
 
+/// The state of the optional PipeWire output (`[pipewire] enabled`), the
+/// `PipeWireOutput` property.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipeWireState {
+    /// Not configured, or no writer runs.
+    Off,
+    /// The daemon was built without PipeWire support.
+    Unsupported,
+    /// The node is being created (PipeWire is not reachable yet, or the
+    /// node is not registered yet).
+    Connecting,
+    /// The node is registered; nothing is linked to it.
+    Ready,
+    /// A consumer is linked and frames flow to it.
+    Streaming,
+    /// The output failed, with the reason. The loopback is unaffected.
+    Failed(String),
+}
+
+impl PipeWireState {
+    /// The wire form: `off`, `unsupported`, `connecting`, `ready`,
+    /// `streaming`, `failed`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PipeWireState::Off => "off",
+            PipeWireState::Unsupported => "unsupported",
+            PipeWireState::Connecting => "connecting",
+            PipeWireState::Ready => "ready",
+            PipeWireState::Streaming => "streaming",
+            PipeWireState::Failed(_) => "failed",
+        }
+    }
+}
+
+/// What the PipeWire output reports, from its own thread, through the
+/// [`PipeWireReporter`] the backend was built with, tagged with the
+/// output's [`PipeWireGeneration`]. A newly started output reports
+/// [`PipeWireState::Connecting`] and `Consumers(0)` first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipeWireEvent {
+    /// The number of links to the node.
+    Consumers(u32),
+    /// The output's state changed.
+    State(PipeWireState),
+}
+
+/// Which of the PipeWire outputs a backend started an event comes from:
+/// every [`MediaBackend::start_pipewire`] returns a new one, greater than
+/// every one before it (the first is 1). The events of an output still
+/// queued when it was stopped or replaced carry its generation, so the
+/// controller tells them from the current output's whatever the order in
+/// which they arrive.
+pub type PipeWireGeneration = u64;
+
+/// Receives the PipeWire output's events, each with the generation of the
+/// output that sent it (the daemon forwards them to the controller as
+/// [`crate::controller::Command::PipeWire`]). Shared: the backend keeps it
+/// and hands every PipeWire output it starts a closure that calls it with
+/// that output's generation, from the output's own thread.
+pub type PipeWireReporter = Arc<dyn Fn(PipeWireGeneration, PipeWireEvent) + Send + Sync>;
+
 /// Why a running session failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
@@ -83,16 +145,37 @@ pub trait MediaBackend: Send + 'static {
     fn scan_cameras(&mut self, request: &ModeRequest) -> Vec<Camera>;
 
     /// Finds the loopback `sink` names and starts the persistent writer on
-    /// it with `contract`. Returns the device node. Fails if the device is
-    /// missing or another application holds it in another format.
+    /// it with `contract`, stopping the running one (and its PipeWire
+    /// output) first. Returns the device node. Fails if the device is
+    /// missing or another application holds it in another format. Starts
+    /// no PipeWire output: [`Self::start_pipewire`] does.
     fn start_writer(
         &mut self,
         sink: &SinkSelector,
         contract: &OutputContract,
     ) -> Result<PathBuf, String>;
 
-    /// Stops the writer (the device is closed). Idempotent.
+    /// Stops the writer (the device is closed) and the PipeWire output.
+    /// Idempotent.
     fn stop_writer(&mut self);
+
+    /// Starts the PipeWire output next to the running writer, with the
+    /// writer's contract and the same frames, replacing the one that runs
+    /// (stopped first). The writer is not touched. Returns the new output's
+    /// generation, which tags every event it reports.
+    ///
+    /// Never fails: what happens is reported through its
+    /// [`PipeWireEvent`]s, the first of which are
+    /// [`PipeWireState::Connecting`] and `Consumers(0)`; an output that
+    /// cannot start (no writer runs, PipeWire unusable, or a build without
+    /// PipeWire support: [`PipeWireState::Unsupported`]) reports its state
+    /// and `Consumers(0)` instead.
+    fn start_pipewire(&mut self) -> PipeWireGeneration;
+
+    /// Stops the PipeWire output alone, if one runs: its node disappears;
+    /// the writer and the session keep running. Reports nothing: the caller
+    /// resets its view of the output. Idempotent.
+    fn stop_pipewire(&mut self);
 
     /// Why the running writer has failed, if it has.
     fn writer_failure(&mut self) -> Option<String>;

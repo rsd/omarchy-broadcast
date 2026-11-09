@@ -24,10 +24,18 @@ anyhow = { workspace = true }
 libc = { workspace = true }
 clap = { workspace = true }
 
+[features]
+# The PipeWire camera node; off by default (needs libpipewire headers and clang).
+pipewire = ["obc-pipeline/pipewire"]
+
 [dev-dependencies]
 # Peer-to-peer D-Bus connections for interface tests without a session bus.
 zbus = { workspace = true, features = ["p2p"] }
 tempfile = { workspace = true }
+
+[[test]]
+name = "pipewire"
+required-features = ["pipewire"]
 
 [lints]
 workspace = true

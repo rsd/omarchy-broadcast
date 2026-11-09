@@ -58,7 +58,16 @@ pub const INTERFACE: &str = "br.com.dias.OmaBroadcast1";
 /// addition (a new property, method or signal). Revision 2 added the
 /// effect controls: `BlurStrength`, `BackgroundImage`, `SetEffect`,
 /// `SetBlurStrength`, `SetBackgroundImage` and the `InvalidArgument` error.
-pub const INTERFACE_REVISION: u32 = 2;
+/// Revision 3 added the optional PipeWire output: `LoopbackConsumers`,
+/// `PipeWireConsumers` and `PipeWireOutput`, with `Consumers` the total of
+/// both kinds of consumer.
+pub const INTERFACE_REVISION: u32 = 3;
+/// The first [`INTERFACE_REVISION`] with `LoopbackConsumers`,
+/// `PipeWireConsumers` and `PipeWireOutput`.
+pub const PIPEWIRE_REVISION: u32 = 3;
+/// `PipeWireOutput` of a daemon whose PipeWire output is not configured, or
+/// that has none (before [`PIPEWIRE_REVISION`]).
+pub const PIPEWIRE_OFF: &str = "off";
 /// Prefix of every D-Bus error name the daemon replies with
 /// (`br.com.dias.OmaBroadcast1.Error.NoSuchCamera`, ...).
 pub const ERROR_PREFIX: &str = "br.com.dias.OmaBroadcast1.Error";
@@ -257,7 +266,20 @@ pub struct Snapshot {
     /// `BackgroundImage` (revision 2); empty when the daemon does not offer
     /// it.
     pub background_image: String,
+    /// `Consumers`: every consumer, those holding the loopback and those
+    /// linked to the PipeWire output.
     pub consumers: u32,
+    /// `LoopbackConsumers` (revision 3): the processes holding the
+    /// loopback. From a daemon without it, `Consumers` (which then counts
+    /// only those).
+    pub loopback_consumers: u32,
+    /// `PipeWireConsumers` (revision 3): the links to the PipeWire output;
+    /// `0` when the daemon does not offer it.
+    pub pipewire_consumers: u32,
+    /// `PipeWireOutput` (revision 3): `off`, `unsupported`, `connecting`,
+    /// `ready`, `streaming` or `failed`; `off` when the daemon does not
+    /// offer it.
+    pub pipewire_output: String,
     pub interface_revision: u32,
 }
 
@@ -276,6 +298,9 @@ impl Snapshot {
             blur_strength: 0.0,
             background_image: String::new(),
             consumers: 0,
+            loopback_consumers: 0,
+            pipewire_consumers: 0,
+            pipewire_output: PIPEWIRE_OFF.into(),
             interface_revision: 0,
         }
     }
@@ -284,6 +309,10 @@ impl Snapshot {
     /// `GetAll` reply or a `PropertiesChanged` signal. Properties this crate
     /// does not know (added by a later revision) are ignored; a value of the
     /// wrong type, or a `State` that is not a [`State`] name, is an error.
+    ///
+    /// For a daemon known to predate [`PIPEWIRE_REVISION`]
+    /// (`interface_revision` read and below it), `Consumers` also sets
+    /// `loopback_consumers`: such a daemon counts only the loopback.
     pub fn apply_property(&mut self, name: &str, value: &Variant<'_>) -> zbus::Result<()> {
         match name {
             "State" => {
@@ -300,7 +329,15 @@ impl Snapshot {
             "Effect" => self.effect = deserialize_for_property(value)?,
             "BlurStrength" => self.blur_strength = deserialize_for_property(value)?,
             "BackgroundImage" => self.background_image = deserialize_for_property(value)?,
-            "Consumers" => self.consumers = deserialize_for_property(value)?,
+            "Consumers" => {
+                self.consumers = deserialize_for_property(value)?;
+                if (1..PIPEWIRE_REVISION).contains(&self.interface_revision) {
+                    self.loopback_consumers = self.consumers;
+                }
+            }
+            "LoopbackConsumers" => self.loopback_consumers = deserialize_for_property(value)?,
+            "PipeWireConsumers" => self.pipewire_consumers = deserialize_for_property(value)?,
+            "PipeWireOutput" => self.pipewire_output = deserialize_for_property(value)?,
             "InterfaceRevision" => self.interface_revision = deserialize_for_property(value)?,
             _ => {}
         }
@@ -309,16 +346,22 @@ impl Snapshot {
 
     /// A snapshot from the properties returned by `GetAll`. `State` is
     /// required; any other missing property keeps its [`Snapshot::empty`]
-    /// value.
+    /// value, except `LoopbackConsumers`, which is then `Consumers` (a
+    /// daemon without it counts only the loopback).
     pub fn from_properties<'a, I>(props: I) -> zbus::Result<Snapshot>
     where
         I: IntoIterator<Item = (&'a str, &'a Variant<'a>)>,
     {
         let mut snap = Snapshot::empty();
         let mut has_state = false;
+        let mut has_loopback = false;
         for (name, value) in props {
             has_state |= name == "State";
+            has_loopback |= name == "LoopbackConsumers";
             snap.apply_property(name, value)?;
+        }
+        if !has_loopback {
+            snap.loopback_consumers = snap.consumers;
         }
         if !has_state {
             return Err(zbus::Error::Failure(
@@ -366,12 +409,14 @@ impl Snapshot {
     /// [`Snapshot::fetch_no_autostart`].
     ///
     /// The properties added after revision 1 (`BlurStrength`,
-    /// `BackgroundImage`) keep their [`Snapshot::empty`] value when the
-    /// daemon does not offer them (see [`is_unknown_property_error`]), as
-    /// [`Snapshot::from_properties`] does for a property missing from
-    /// `GetAll`; any other failure to read them is an error.
+    /// `BackgroundImage`, `PipeWireConsumers`, `PipeWireOutput`) keep their
+    /// [`Snapshot::empty`] value when the daemon does not offer them (see
+    /// [`is_unknown_property_error`]), and `LoopbackConsumers` is then
+    /// `Consumers`, as [`Snapshot::from_properties`] does for a property
+    /// missing from `GetAll`; any other failure to read them is an error.
     pub async fn fetch(proxy: &OmaBroadcastProxy<'_>) -> zbus::Result<Snapshot> {
         let empty = Snapshot::empty();
+        let consumers = proxy.consumers().await?;
         Ok(Snapshot {
             state: proxy.state().await?,
             error: proxy.error().await?,
@@ -382,7 +427,13 @@ impl Snapshot {
             effect: proxy.effect().await?,
             blur_strength: optional(proxy.blur_strength().await, empty.blur_strength)?,
             background_image: optional(proxy.background_image().await, empty.background_image)?,
-            consumers: proxy.consumers().await?,
+            consumers,
+            loopback_consumers: optional(proxy.loopback_consumers().await, consumers)?,
+            pipewire_consumers: optional(
+                proxy.pipewire_consumers().await,
+                empty.pipewire_consumers,
+            )?,
+            pipewire_output: optional(proxy.pipewire_output().await, empty.pipewire_output)?,
             interface_revision: proxy.interface_revision().await?,
         })
     }
@@ -546,6 +597,86 @@ mod tests {
                 .apply_property("BackgroundImage", &strength)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn the_revision_3_properties_and_an_older_daemon() {
+        let state = Variant::from("active");
+        let total = Variant::from(3u32);
+        let loopback = Variant::from(1u32);
+        let pipewire = Variant::from(2u32);
+        let output = Variant::from("streaming");
+        let rev3 = Variant::from(3u32);
+        // In GetAll order whatever it is.
+        let snap = Snapshot::from_properties([
+            ("Consumers", &total),
+            ("PipeWireOutput", &output),
+            ("State", &state),
+            ("PipeWireConsumers", &pipewire),
+            ("InterfaceRevision", &rev3),
+            ("LoopbackConsumers", &loopback),
+        ])
+        .unwrap();
+        assert_eq!(
+            (
+                snap.consumers,
+                snap.loopback_consumers,
+                snap.pipewire_consumers,
+                snap.pipewire_output.as_str()
+            ),
+            (3, 1, 2, "streaming")
+        );
+        // A change of the total leaves the split to its own properties.
+        let mut changed = snap.clone();
+        changed
+            .apply_property("Consumers", &Variant::from(2u32))
+            .unwrap();
+        changed
+            .apply_property("PipeWireConsumers", &Variant::from(1u32))
+            .unwrap();
+        changed
+            .apply_property("PipeWireOutput", &Variant::from("ready"))
+            .unwrap();
+        assert_eq!(
+            (
+                changed.consumers,
+                changed.loopback_consumers,
+                changed.pipewire_consumers,
+                changed.pipewire_output.as_str()
+            ),
+            (2, 1, 1, "ready")
+        );
+        assert!(changed.apply_property("PipeWireOutput", &total).is_err());
+        assert!(
+            changed
+                .apply_property("LoopbackConsumers", &output)
+                .is_err()
+        );
+        assert!(
+            changed
+                .apply_property("PipeWireConsumers", &output)
+                .is_err()
+        );
+
+        // A revision-2 daemon: Consumers counts the loopback only, before
+        // and after InterfaceRevision in the reply, and in later changes.
+        let rev2 = Variant::from(2u32);
+        for props in [
+            [("Consumers", &total), ("InterfaceRevision", &rev2)],
+            [("InterfaceRevision", &rev2), ("Consumers", &total)],
+        ] {
+            let snap =
+                Snapshot::from_properties([("State", &state)].into_iter().chain(props)).unwrap();
+            assert_eq!(snap.loopback_consumers, 3);
+            assert_eq!(snap.pipewire_consumers, 0);
+            assert_eq!(snap.pipewire_output, PIPEWIRE_OFF);
+            let mut changed = snap.clone();
+            changed
+                .apply_property("Consumers", &Variant::from(1u32))
+                .unwrap();
+            assert_eq!((changed.consumers, changed.loopback_consumers), (1, 1));
+        }
+        assert_eq!(Snapshot::empty().pipewire_output, "off");
     }
 
     #[test]

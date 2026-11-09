@@ -2,6 +2,8 @@
 
 A GPU webcam-effects pipeline for Linux. Frames flow from a camera through GStreamer and CUDA memory into a [v4l2loopback](https://github.com/v4l2loopback/v4l2loopback) virtual camera that any application can select. The effects (background blur and background replacement) use the NVIDIA Maxine Video Effects SDK behind a replaceable inference-backend interface.
 
+Optionally, the daemon also offers the camera as a native PipeWire video source, "Omarchy Broadcast", next to the loopback device, for applications that use PipeWire for cameras ([docs/setup/daemon.md](docs/setup/daemon.md#the-pipewire-output)).
+
 Any UVC webcam works: the pipeline picks a capture mode from what the camera advertises, and adds a CPU decode step for MJPEG cameras and a CPU convert step for YUYV/UYVY.
 
 ## Status
@@ -15,6 +17,7 @@ Early development. The camera -> CUDA -> virtual camera passthrough works, with 
 - GStreamer 1.x with the `nvcodec` plugin (`cudaupload`, `cudaconvert`, `cudadownload`) and the base/good/bad plugin sets (`videoconvert`, `jpegdec`)
 - v4l2loopback, configured as described in [docs/setup/loopback.md](docs/setup/loopback.md)
 - Rust toolchain (only to build from source; the Arch package is built with it, and installed without it)
+- Optional, for the native PipeWire camera output: a build with the cargo feature `oma-broadcastd/pipewire` (libpipewire headers and clang at build time; the Arch package has it) and `[pipewire] enabled = true` in the configuration
 - Optional, for effects: the NVIDIA Maxine VFX SDK ([docs/setup/maxine.md](docs/setup/maxine.md))
 - Optional, for the noise-removed microphone: `deepfilternet-ladspa` or `noise-suppression-for-voice` ([docs/setup/microphone.md](docs/setup/microphone.md))
 
@@ -23,6 +26,8 @@ Early development. The camera -> CUDA -> virtual camera passthrough works, with 
 ```sh
 cargo build --release
 ```
+
+The PipeWire output is a cargo feature that is off by default: `cargo build --release --features oma-broadcastd/pipewire`.
 
 ## Install
 
@@ -55,7 +60,7 @@ systemctl --user enable --now oma-broadcastd
 
 `cargo install` of the two crates and a copy of the unit file with `ExecStart=` rewritten: see [docs/setup/daemon.md](docs/setup/daemon.md#install).
 
-The continuous integration (`.github/workflows/ci.yml`) runs the format check, clippy, the workspace tests and shellcheck in an Arch Linux container without a GPU.
+The continuous integration (`.github/workflows/ci.yml`) runs the format check, clippy, the workspace tests and shellcheck in an Arch Linux container without a GPU, and a second job that builds, lints and tests `obc-pipeline` and `oma-broadcastd` with the PipeWire feature.
 
 ## Run
 

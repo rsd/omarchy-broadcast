@@ -21,6 +21,7 @@ use zbus::{Connection, Guid, Variant, connection, fdo};
 
 use super::*;
 use crate::backend::fake::{FakeBackend, Hook, World};
+use crate::backend::{PipeWireEvent, PipeWireState};
 use crate::camera::tests::cam;
 use crate::controller::{self, Command, Controller, Paths, Published, preliminary_snapshot};
 
@@ -98,6 +99,14 @@ impl Rig {
 
     fn consumers(&self, n: u32) {
         self.commands.send(Command::Consumers(n)).unwrap();
+    }
+
+    /// An event of the PipeWire output that runs (or ran last).
+    fn pipewire(&self, event: PipeWireEvent) {
+        let generation = self.world().pipewire_generation;
+        self.commands
+            .send(Command::PipeWire(generation, event))
+            .unwrap();
     }
 
     fn world(&self) -> std::sync::MutexGuard<'_, World> {
@@ -231,10 +240,14 @@ async fn every_property_reads_through_the_proxy() {
             blur_strength: 0.5,
             background_image: String::new(),
             consumers: 0,
+            loopback_consumers: 0,
+            pipewire_consumers: 0,
+            pipewire_output: "off".into(),
             interface_revision: INTERFACE_REVISION,
         }
     );
-    // GetAll returns the same eleven properties.
+    assert_eq!(INTERFACE_REVISION, 3);
+    // GetAll returns the same fourteen properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
         .destination(obc_ipc::BUS_NAME)
         .path(OBJECT_PATH)
@@ -261,7 +274,10 @@ async fn every_property_reads_through_the_proxy() {
             "Enabled",
             "Error",
             "InterfaceRevision",
+            "LoopbackConsumers",
             "OutputMode",
+            "PipeWireConsumers",
+            "PipeWireOutput",
             "State"
         ]
     );
@@ -291,6 +307,10 @@ async fn every_property_reads_through_the_proxy() {
         "<property name=\"Cameras\" type=\"a(sss)\" access=\"read\"",
         "<property name=\"State\" type=\"s\" access=\"read\"",
         "<property name=\"Consumers\" type=\"u\" access=\"read\"",
+        "<property name=\"LoopbackConsumers\" type=\"u\" access=\"read\"",
+        "<property name=\"PipeWireConsumers\" type=\"u\" access=\"read\"",
+        "<property name=\"PipeWireOutput\" type=\"s\" access=\"read\"",
+        "<property name=\"InterfaceRevision\" type=\"u\" access=\"read\"",
     ] {
         assert!(xml.contains(m), "{m} missing from {xml}");
     }
@@ -679,4 +699,115 @@ async fn effect_methods_properties_and_their_errors() {
             && s.last().is_some_and(|e| e == "State=active")
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pipewire_properties_and_their_changes() {
+    let rig = Rig::new(
+        "[lifecycle]\nstart_debounce_ms = 0\nidle_grace_s = 0\n[pipewire]\nenabled = true\n",
+        |_| {},
+    )
+    .await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    assert_eq!(proxy.interface_revision().await.unwrap(), 3);
+    // The preliminary snapshot says `off`; the controller's first one has
+    // the writer and its PipeWire output, connecting.
+    let deadline = Instant::now() + TIMEOUT;
+    while proxy.pipewire_output().await.unwrap() != "connecting" {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    {
+        let w = rig.world();
+        assert_eq!((w.writer_starts, w.pipewire_starts), (1, 1));
+        assert_eq!(w.pipewire, Some(1));
+    }
+    let seen = rig.record_changes().await;
+
+    rig.pipewire(PipeWireEvent::State(PipeWireState::Connecting));
+    rig.pipewire(PipeWireEvent::Consumers(0));
+    rig.pipewire(PipeWireEvent::State(PipeWireState::Ready));
+    rig.pipewire(PipeWireEvent::Consumers(1));
+    rig.pipewire(PipeWireEvent::State(PipeWireState::Streaming));
+    until("active", &seen, |s| s.iter().any(|e| e == "State=active")).await;
+    rig.consumers(1);
+    until("both counted", &seen, |s| {
+        s.iter().any(|e| e == "Consumers=2")
+    })
+    .await;
+    assert_eq!(
+        (
+            proxy.consumers().await.unwrap(),
+            proxy.loopback_consumers().await.unwrap(),
+            proxy.pipewire_consumers().await.unwrap(),
+            proxy.pipewire_output().await.unwrap(),
+        ),
+        (2, 1, 1, "streaming".to_string())
+    );
+    let snap = within("snapshot", Snapshot::fetch(&proxy)).await.unwrap();
+    assert_eq!(
+        (
+            snap.consumers,
+            snap.loopback_consumers,
+            snap.pipewire_consumers,
+            snap.pipewire_output.as_str()
+        ),
+        (2, 1, 1, "streaming")
+    );
+
+    // A failure of the PipeWire output: announced, no error state.
+    rig.pipewire(PipeWireEvent::State(PipeWireState::Failed(
+        "the PipeWire daemon went away".into(),
+    )));
+    until("failed", &seen, |s| {
+        s.iter().any(|e| e == "PipeWireOutput=failed")
+    })
+    .await;
+    assert_eq!(proxy.state().await.unwrap(), State::Active);
+    assert_eq!(proxy.error().await.unwrap(), "");
+    rig.consumers(0);
+    until("idle", &seen, |s| {
+        s.last().is_some_and(|e| e == "State=idle")
+    })
+    .await;
+    let pipewire: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            e.starts_with("Consumers=")
+                || e.starts_with("LoopbackConsumers=")
+                || e.starts_with("PipeWire")
+                || e.starts_with("State=")
+        })
+        // The start-up announcement may still have been in flight when the
+        // recording began.
+        .filter(|e| *e != "PipeWireOutput=connecting")
+        .cloned()
+        .collect();
+    assert_eq!(
+        pipewire,
+        [
+            "PipeWireOutput=ready",
+            "Consumers=1",
+            "PipeWireConsumers=1",
+            "State=starting",
+            "State=active",
+            "PipeWireOutput=streaming",
+            "Consumers=2",
+            "LoopbackConsumers=1",
+            "Consumers=1",
+            "PipeWireConsumers=0",
+            "PipeWireOutput=failed",
+            "Consumers=0",
+            "LoopbackConsumers=0",
+            "State=idle",
+        ]
+    );
+    assert!(
+        !seen.lock().unwrap().iter().any(|e| e.starts_with("Error=")),
+        "{:?}",
+        seen.lock().unwrap()
+    );
 }

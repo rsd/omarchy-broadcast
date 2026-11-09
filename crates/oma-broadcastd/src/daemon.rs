@@ -26,6 +26,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::sync::mpsc::{Sender, channel};
 use std::time::Instant;
 
@@ -33,6 +34,7 @@ use obc_ipc::{BUS_NAME, OBJECT_PATH};
 use tokio::signal::unix::{SignalKind, signal};
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 
+use crate::backend::PipeWireReporter;
 use crate::backend::real::GstBackend;
 use crate::consumers::ConsumerWatcher;
 use crate::controller::{self, Command, Controller, Paths, Published, preliminary_snapshot};
@@ -130,6 +132,16 @@ fn consumer_watcher(commands: &Sender<Command>) -> Result<controller::SinkHook, 
     }))
 }
 
+/// The PipeWire output's reporter: its events go to the controller, with
+/// the generation of the output that sent them, on the same command channel
+/// as the consumer watcher's counts.
+fn pipewire_reporter(commands: &Sender<Command>) -> PipeWireReporter {
+    let tx = commands.clone();
+    Arc::new(move |generation, event| {
+        let _ = tx.send(Command::PipeWire(generation, event));
+    })
+}
+
 async fn serve(paths: Paths) -> Result<(), DaemonError> {
     let io = |what: &str| {
         let what = what.to_string();
@@ -158,6 +170,7 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
     }
 
     let hook = consumer_watcher(&commands)?;
+    let reporter = pipewire_reporter(&commands);
     let tx = commands.clone();
     let cameras = CameraWatcher::spawn(PathBuf::from("/dev"), SETTLE, SECOND_SCAN, move || {
         let _ = tx.send(Command::Rescan);
@@ -170,7 +183,7 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
     let thread = std::thread::Builder::new()
         .name("obc-controller".into())
         .spawn(move || {
-            let res = GstBackend::new().map(|backend| {
+            let res = GstBackend::new(Some(reporter)).map(|backend| {
                 // Controller::new makes the first writer attempt.
                 let ctrl = Controller::new(backend, paths, published, Some(hook), Instant::now());
                 let _ = ready_tx.send(());

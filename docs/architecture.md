@@ -20,6 +20,7 @@ flowchart LR
         CFG["Config (read-only)<br/>~/.config/oma-broadcast/config.toml<br/>reload on SIGHUP / ReloadConfig"]
         ST["Runtime state<br/>~/.local/state/oma-broadcast/state.toml<br/>Enabled, selected camera,<br/>effect settings"]
         WATCH["Consumer watcher<br/>inotify on the loopback node<br/>+ /proc/PID/fd count"]
+        PWT["obc-pipewire thread (optional)<br/>PipeWire main loop, output stream,<br/>registry listener: links to the node"]
         HOT["Hotplug watcher<br/>inotify on /dev"]
         subgraph WR["Loopback writer (lives as long as the daemon, CPU only)"]
             PH["black placeholder<br/>at the contract rate"]
@@ -27,6 +28,8 @@ flowchart LR
             WSRC["appsrc"] --> WSINK["v4l2sink"]
             PH --> WSRC
             FWD --> WSRC
+            TAP["frame tap<br/>(every pushed buffer, restamped)"]
+            WSRC --> TAP
         end
         subgraph GST["GStreamer pipelines (exist only while the state is starting or active)"]
             subgraph ING["Ingest pipeline (per source, rebuilt on switch)"]
@@ -43,6 +46,7 @@ flowchart LR
     end
 
     LB[("v4l2loopback<br/>/dev/videoN")]
+    PWN[("PipeWire node<br/>oma-broadcast, Video/Source<br/>(optional)")]
 
     CLI & BAR & SH -- "methods / properties" --> IPC
     IPC -- "PropertiesChanged, Stats" --> BAR & CLI
@@ -50,17 +54,23 @@ flowchart LR
     CFG --> CTL
     CTL <--> ST
     WATCH --> CTL
+    PWT -- "PipeWire consumers, output state" --> CTL
     HOT --> CTL
     CTL --> GST
     CTL --> WR
     OSINK -- "every buffer" --> FWD
     FX --> BE --> MX
     WSINK --> LB
+    TAP --> PWT --> PWN
     LB -. "virtual camera" .-> APPS["Browser / Zoom / OBS"]
+    PWN -. "native camera" .-> APPS
     APPS -. "open / close" .-> WATCH
+    APPS -. "link" .-> PWT
 ```
 
 The daemon owns one **loopback writer** for its whole life ([ADR-0011](adr/0011-daemon-lifecycle-and-dbus-api.md)): a CPU-only `appsrc` → `v4l2sink` pipeline with the output contract's caps (colour label included). It opens the device once and never renegotiates. While no camera is streaming it pushes a black frame at the contract rate, whenever no forwarded frame has arrived for two contract periods. While the state is `active`, the CUDA output pipeline ends in an `appsink` (instead of the `v4l2sink` that `obc-bench` still uses to write to the loopback directly) and forwards each buffer to the writer by reference, without a copy. The writer stamps every buffer on its own monotonic timeline, so an application that holds the virtual camera sees one format and one uninterrupted stream (black, camera frames, black) across the states. The writer is needed because with `exclusive_caps=1` the device is listed as a capture device only while a writer streams into it, so an idle daemon must still have one for any application to find, and open, the camera.
+
+**Optional PipeWire output** ([ADR-0016](adr/0016-pipewire-output.md)). When the daemon is built with the `pipewire` feature and `[pipewire] enabled = true`, a frame tap on the writer also hands every buffer it pushes (placeholder or camera frame, after restamping) to a native PipeWire `Video/Source` node, `oma-broadcast` ("Omarchy Broadcast"). Both outputs therefore carry the same stream: the same contract, pacing, timestamps and Idle behaviour. Nothing is sent while no PipeWire consumer streams. The node offers three formats at the contract's size and rate (the contract format first, then the other two of NV12, YUY2 and I420), and converts on the CPU inside the single copy into the PipeWire buffer, because the format is the consumer's choice at run time and idle placeholders never touch the GPU. A consumer that asks for another format or size fails its own link only. The node exists while the loopback writer runs; its failure is reported as `PipeWireOutput` = `failed`, retried every 2 s, and never puts the daemon in `error`.
 
 ### Threads
 
@@ -69,12 +79,15 @@ The daemon owns one **loopback writer** for its whole life ([ADR-0011](adr/0011-
 | D-Bus (a current-thread async runtime) | The zbus connection and object, the publisher of `PropertiesChanged` and `Stats`, and `SIGHUP` / `SIGTERM` / `SIGINT` |
 | Controller (`obc-controller`) | The only owner of the configuration, the runtime state, the writer and the session. D-Bus methods, watcher events and timers reach it as commands; it replies to a method only after it has published the resulting snapshot. Time is passed into the state machine explicitly, so it is testable with a fake backend and a fake clock |
 | Consumer watcher (`obc-consumers`) | An inotify watch on the loopback node, and the `/proc` count below |
+| PipeWire output (`obc-pipewire`, only with the feature and `[pipewire] enabled`) | Its own PipeWire main loop with the output stream (the node's driver) and a registry listener that counts the links to the node. Frames arrive from the writer's tap; link and state changes reach the controller as commands. Panics in PipeWire callbacks are contained: the output fails and reconnects |
 | Hotplug watcher (`obc-hotplug`) | An inotify watch on `/dev` for `video*` nodes appearing or disappearing |
 | GStreamer threads | The writer's streaming and placeholder threads for the life of the daemon; the ingest and output pipelines' while a session runs |
 
 **Start-up order.** The daemon serves the object (from the files only, with no device touched), requests the bus name with no queueing and no replacement, and only then lets the controller touch devices; if another instance owns the name it exits with status 3 before any device is used. The controller starts the loopback writer, and the bus name is requested after that first writer attempt, so a `Type=dbus` unit is ready only when the virtual camera is already a capture device.
 
 **Consumer detection.** The watcher gets `IN_OPEN` and `IN_CLOSE_*` events for the loopback node, but treats each only as a hint: it then counts the processes other than the daemon holding the node open, from `/proc/<pid>/fd`. A consumer must be present for 300 ms (the start debounce) before the camera starts, so the short opens that browsers and PipeWire make to enumerate devices do nothing. If the watch cannot be set, it counts every second.
+
+With the PipeWire output, the registry listener of the `obc-pipewire` thread counts the `Link` objects whose output node is ours; each is followed, and a link in the error state is not counted. The node's `running` state is not a consumer signal (it means linked, not producing). The lifecycle keys off the total of the loopback holders and the PipeWire links, with the same debounce, grace period and states, so a PipeWire consumer starts the camera exactly as a loopback consumer does. `Consumers` is that total; `LoopbackConsumers` and `PipeWireConsumers` give the split.
 
 **Hotplug.** Video nodes appearing in or disappearing from `/dev` trigger a rescan of the camera list. If the streaming camera fails or disappears, the session switches to the next camera in order, with the hold of ADR-0010; if none is left, the state is `error`. A camera that appears while another one streams does not take over.
 
@@ -139,8 +152,8 @@ flowchart LR
     end
 
     AS --> SLOT --> CLK
-    K2["pipewiresink (planned)"]
-    DL -.-> K2
+    PWK["PipeWire node (optional):<br/>frame tap on the loopback writer,<br/>CPU conversion into the PipeWire buffer"]
+    K1 -.-> PWK
 ```
 
 A source switch, as the output sees it ([ADR-0010](adr/0010-phase-locked-output-clock.md)):
@@ -166,7 +179,7 @@ These are the extension points, and each is a trait or element boundary:
 - **New source:** another camera or a screen capture. It is a new source element, and adapters cover format gaps (for example the MJPEG decode adapter).
 - **New effect:** a new effect kind in `obceffect`, which accepts and produces canonical CUDAMemory NV12 and talks only to the `InferenceBackend` trait.
 - **New backend:** TensorRT, CPU, or another vendor. It is a new `InferenceBackend` impl, and the `obceffect` element is unchanged. A backend that does not run on CUDA would add a host-memory frame variant to the trait, around which the element downloads and uploads ([ADR-0012](adr/0012-video-effects-and-maxine-backend.md)).
-- **New sink:** PipeWire or recording. It is a new output with its own contract, fed after the Process stage.
+- **New sink:** recording, say. It is a new output with its own contract, fed after the Process stage. The PipeWire node of [ADR-0016](adr/0016-pipewire-output.md) is the model for an output that shares the writer's stream: it attaches to the writer's tap and needs no pipeline of its own. An output with an independent contract or timeline would be a separate pipeline.
 
 ### Effects
 
@@ -208,13 +221,15 @@ stateDiagram-v2
     off --> idle: SetEnabled(true)
 ```
 
-| State | Camera | CUDA context | What runs | Loopback carries |
+| State | Camera | CUDA context | What runs | Outputs carry |
 |---|---|---|---|---|
-| `off` | closed | none | D-Bus, watchers, the writer | placeholder |
-| `idle` | closed | none | D-Bus, watchers, the writer | placeholder |
-| `starting` | opening | being created | the above, plus the output pipeline and the ingest being built | placeholder |
-| `active` | streaming | held | the above, plus ingest and output pipelines, 1 Hz `Stats` | camera frames |
-| `error` | closed | none | D-Bus, watchers, the writer (retried every 2 s if the loopback is missing or held) | placeholder |
+| `off` | closed | none | D-Bus, watchers, the writer | placeholder on both outputs |
+| `idle` | closed | none | D-Bus, watchers, the writer | placeholder on both outputs |
+| `starting` | opening | being created | the above, plus the output pipeline and the ingest being built | placeholder on both outputs |
+| `active` | streaming | held | the above, plus ingest and output pipelines, 1 Hz `Stats` | camera frames on both outputs |
+| `error` | closed | none | D-Bus, watchers, the writer (retried every 2 s if the loopback is missing or held) | placeholder on both outputs |
+
+The second output exists only with the PipeWire output enabled; it carries what the loopback carries, and consumers of either kind keep the state `active`.
 
 - **Grace period.** `active` includes the time after the last consumer closes: the stream keeps running for `idle_grace` (default 5 s) with `Consumers` = 0, and a consumer that returns in that time finds it running. This replaces ADR-0006's separate "Draining" state.
 - **Source changes** (`SelectCamera`, `NextCamera`, a camera failure) rebuild only the ingest pipeline; the output keeps its contract and clock and holds the last frame meanwhile (section 2). The state stays `active`.

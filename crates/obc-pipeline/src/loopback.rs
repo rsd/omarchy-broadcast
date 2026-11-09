@@ -36,6 +36,14 @@
 //! between them is invisible downstream. Pushes are serialised by one lock
 //! held across the stamp and the push, so PTS order is push order.
 //!
+//! **Tap.** [`LoopbackWriter::set_tap`] installs a [`FrameTap`]: every
+//! buffer `appsrc` accepted, placeholder and forwarded alike, is handed to
+//! it after the restamp (the writer's PTS, duration and offset, exactly as
+//! the sink sees them), under the push lock, so tap order is push order.
+//! The optional PipeWire output (module `pipewire`, cargo feature
+//! `pipewire`) is fed this way. A tap runs on the pushing thread with the push lock
+//! held: it must never block (take a reference, wake someone, return).
+//!
 //! **Queue.** `appsrc` holds at most [`WriterConfig::queue_buffers`]
 //! (default 3) and drops the oldest beyond that; it never blocks a producer.
 //!
@@ -130,6 +138,27 @@ pub struct WriterCounts {
     pub last_push: Option<Instant>,
 }
 
+/// Receives every buffer the writer's `appsrc` accepted, after the
+/// restamp, in push order (see the module docs, "Tap"). Called on the
+/// pushing thread (the placeholder thread or the output's streaming
+/// thread) with the writer's push lock held: it must never block, and must
+/// not call back into the writer.
+pub type FrameTap = Arc<dyn Fn(&gst::Buffer) + Send + Sync>;
+
+/// The installed tap, behind the push lock.
+#[derive(Default)]
+struct TapSlot(Option<FrameTap>);
+
+impl std::fmt::Debug for TapSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Some(tap)"
+        } else {
+            "None"
+        })
+    }
+}
+
 /// What the push lock protects: the writer's timeline.
 #[derive(Debug, Default)]
 struct PushState {
@@ -141,6 +170,9 @@ struct PushState {
     last_push: Option<Instant>,
     /// When the last forwarded frame was pushed (accepted or not).
     last_forward: Option<Instant>,
+    /// Sees every accepted buffer; behind the push lock, so a call never
+    /// overlaps [`LoopbackWriter::set_tap`].
+    tap: TapSlot,
 }
 
 /// State shared by the writer, its handles and its placeholder thread.
@@ -237,8 +269,13 @@ impl Shared {
                 b.unset_flags(gst::BufferFlags::DISCONT);
             }
         }
+        // A reference for the tap (no copy), kept only when one is set.
+        let tapped = st.tap.0.as_ref().map(|_| buffer.clone());
         let accepted = self.appsrc.push_buffer(buffer).is_ok();
         if accepted {
+            if let (Some(tap), Some(b)) = (&st.tap.0, &tapped) {
+                tap(b);
+            }
             st.last_pts_ns = Some(pts);
             st.pushes += 1;
             st.last_push = Some(now);
@@ -494,6 +531,14 @@ impl LoopbackWriter {
             failure,
         });
         Ok(())
+    }
+
+    /// Installs (`Some`) or removes (`None`) the [`FrameTap`] that sees
+    /// every accepted buffer. Takes the push lock: once it returns, no call
+    /// to the previous tap is in flight and none follows. Kept across
+    /// [`Self::stop`] and [`Self::start`].
+    pub fn set_tap(&self, tap: Option<FrameTap>) {
+        self.shared.lock().tap = TapSlot(tap);
     }
 
     /// A handle for the active output to forward its frames with.
@@ -954,6 +999,103 @@ mod tests {
         assert_eq!(counts.forwarded, 5, "{counts:?}");
         assert!(counts.placeholder >= 1, "{counts:?}");
         assert_eq!(w.counts().push_failed, 2);
+    }
+
+    /// One buffer the tap saw.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Tapped {
+        pts: u64,
+        duration: Option<u64>,
+        offset: u64,
+        data: usize,
+    }
+
+    /// The tap sees every accepted buffer after the restamp, in push order:
+    /// placeholders alone first, then a forwarded buffer sharing the pushed
+    /// memory, with the PTS the sink sees, strictly increasing. Removed, it
+    /// is not called any more.
+    #[test]
+    fn the_tap_sees_every_accepted_buffer_as_the_sink_does() {
+        require_elements(ELEMENTS);
+        let contract = small(OutputFormat::Nv12);
+        let period = contract.frame_duration_ns();
+        // Placeholders pause for 10 s after a forwarded frame: none follows
+        // the forwarded ones below.
+        let mut cfg = WriterConfig::new(contract, WriterSink::Fake);
+        cfg.placeholder_after = Duration::from_secs(10);
+        let mut w = LoopbackWriter::build_with(cfg).unwrap();
+        let seen: Arc<Mutex<Vec<Tapped>>> = Arc::default();
+        let s = Arc::clone(&seen);
+        w.set_tap(Some(Arc::new(move |b: &gst::Buffer| {
+            let data = b.map_readable().unwrap().as_ptr() as usize;
+            s.lock().unwrap().push(Tapped {
+                pts: b.pts().map(|p| p.nseconds()).unwrap_or(u64::MAX),
+                duration: b.duration().map(|d| d.nseconds()),
+                offset: b.offset(),
+                data,
+            });
+        })));
+        let h = w.handle();
+        let frame = || black_contract_frame(&contract).unwrap();
+        assert!(!h.push(frame()), "a writer not started refuses");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a refused push is not tapped"
+        );
+
+        let log = watch_sink(&w);
+        w.start().unwrap();
+        wait_until(Duration::from_secs(10), "placeholders at the tap", || {
+            seen.lock().unwrap().len() >= 3
+        });
+        let placeholder = seen.lock().unwrap()[0].data;
+        let pushed = frame();
+        let address = pushed.map_readable().unwrap().as_ptr() as usize;
+        assert!(h.push(pushed.clone()));
+        wait_until(
+            Duration::from_secs(10),
+            "the forwarded frame at the sink",
+            || {
+                log.lock()
+                    .unwrap()
+                    .buffers
+                    .iter()
+                    .any(|b| b.data == address)
+            },
+        );
+
+        w.set_tap(None);
+        let tapped = seen.lock().unwrap().clone();
+        assert!(h.push(frame()));
+        let counts = w.counts();
+        w.stop().unwrap();
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            tapped.len(),
+            "a removed tap was called"
+        );
+
+        let (last, placeholders) = tapped.split_last().unwrap();
+        assert!(placeholders.len() >= 3);
+        assert!(placeholders.iter().all(|t| t.data == placeholder));
+        assert_eq!(last.data, address, "the forwarded memory was copied");
+        assert!(tapped.windows(2).all(|w| w[0].pts < w[1].pts), "PTS order");
+        for (k, t) in tapped.iter().enumerate() {
+            assert_eq!(t.offset, k as u64, "#{k}: the push index");
+            assert_eq!(t.duration, Some(period), "#{k}");
+        }
+        // The sink saw what the tap saw (the last push came after the tap
+        // was removed), unless the leaky queue dropped some.
+        let at_sink: Vec<u64> = log.lock().unwrap().buffers.iter().map(|b| b.pts).collect();
+        let tap_pts: Vec<u64> = tapped.iter().map(|t| t.pts).collect();
+        if counts.queue_dropped == 0 {
+            assert_eq!(&at_sink[..tap_pts.len()], &tap_pts[..]);
+        } else {
+            let before = at_sink.iter().filter(|&&p| p <= last.pts);
+            assert!(before.into_iter().all(|p| tap_pts.contains(p)));
+        }
+        // The producer's buffer keeps its own (absent) timestamp.
+        assert_eq!(pushed.pts(), None);
     }
 
     /// An output ending in [`OutputSink::Writer`] forwards to the writer:
