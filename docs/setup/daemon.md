@@ -61,7 +61,7 @@ Behaviour:
 - It does not install the WirePlumber drop-in or the bar plugin.
 - It warns when a unit in `~/.config/systemd/user` exists, because that location takes precedence (see below).
 
-Options: `--dry-run` prints every action and changes nothing, `--no-build` installs the binaries already in `${CARGO_TARGET_DIR:-target}/release`, `--uninstall` removes what the script installed, `--help` shows the usage. Exit status: 0 done; 1 refused (a target path holds a file the script did not install, or the unit is still enabled on `--uninstall`) or the build failed; 2 usage error or unusable environment.
+Options: `--mic` also installs the optional noise-removed microphone ([microphone.md](microphone.md)), `--dry-run` prints every action and changes nothing, `--no-build` installs the binaries already in `${CARGO_TARGET_DIR:-target}/release`, `--uninstall` removes what the script installed, `--help` shows the usage. Exit status: 0 done; 1 refused (a target path holds a file the script did not install, or the unit is still enabled on `--uninstall`) or the build failed; 2 usage error or unusable environment.
 
 Then load and start the service:
 

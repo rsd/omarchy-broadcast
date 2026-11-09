@@ -4,26 +4,28 @@
 # oma-broadcastd; neither unit needs the other.
 #
 # Instances and their configuration files (in dist/pipewire/):
-#   oma-broadcast-mic@deepfilter.service  oma-broadcast-mic-deepfilter.conf
 #   oma-broadcast-mic@rnnoise.service     oma-broadcast-mic-rnnoise.conf
-# PipeWire looks the file up in ~/.config/pipewire, /etc/pipewire and
-# /usr/share/pipewire.
+#   oma-broadcast-mic@deepfilter.service  oma-broadcast-mic-deepfilter.conf
+# This file looks the configuration up by name: PipeWire searches
+# ~/.config/pipewire, /etc/pipewire and /usr/share/pipewire. The Arch package
+# and `scripts/install-user.sh --mic` install a copy of this unit whose
+# ExecStart= names the installed configuration by absolute path.
 #
-# Install:
-#   install -Dm644 dist/pipewire/oma-broadcast-mic-deepfilter.conf \
-#       ~/.config/pipewire/oma-broadcast-mic-deepfilter.conf
+# Manual install, from a checkout:
+#   install -Dm644 dist/pipewire/oma-broadcast-mic-rnnoise.conf \
+#       ~/.config/pipewire/oma-broadcast-mic-rnnoise.conf
 #   install -Dm644 dist/systemd/oma-broadcast-mic@.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
-#   systemctl --user enable --now oma-broadcast-mic@deepfilter.service
+#   systemctl --user enable --now oma-broadcast-mic@rnnoise.service
 #
 # Run one instance at a time: both configurations create the same source
 # (node.name oma-broadcast-mic). To switch engines:
-#   systemctl --user disable --now oma-broadcast-mic@deepfilter.service
-#   systemctl --user enable --now oma-broadcast-mic@rnnoise.service
+#   systemctl --user disable --now oma-broadcast-mic@rnnoise.service
+#   systemctl --user enable --now oma-broadcast-mic@deepfilter.service
 #
-# Undo:
-#   systemctl --user disable --now oma-broadcast-mic@deepfilter.service \
-#       oma-broadcast-mic@rnnoise.service
+# Undo (manual install):
+#   systemctl --user disable --now oma-broadcast-mic@rnnoise.service \
+#       oma-broadcast-mic@deepfilter.service
 #   rm ~/.config/systemd/user/oma-broadcast-mic@.service \
 #      ~/.config/pipewire/oma-broadcast-mic-*.conf
 #   systemctl --user daemon-reload
