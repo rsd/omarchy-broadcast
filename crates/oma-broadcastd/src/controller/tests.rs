@@ -13,6 +13,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use super::*;
 use crate::backend::fake::{FakeBackend, Hook, World};
 use crate::camera::tests::cam;
+use crate::log::Level;
 
 fn alpha() -> Camera {
     cam("usb-a", "Alpha Cam", Some("1111:0001"), "/dev/video0")
@@ -2449,4 +2450,170 @@ fn the_pipewire_states_have_their_wire_names() {
         ]
     );
     assert_eq!(obc_ipc::PIPEWIRE_OFF, PipeWireState::Off.as_str());
+}
+
+// ---- the GPU parked between sessions (backend::park) ----
+
+impl H {
+    /// Active from `ms`, then the consumer leaves: idle after the grace.
+    fn activate_then_idle(&mut self, ms: u64) {
+        self.activate(ms);
+        self.consumers(0, ms + 1000);
+        self.tick(ms + 1000 + 5000);
+        assert_eq!(self.state(), State::Idle, "{:?}", self.snap());
+    }
+}
+
+#[test]
+fn idle_after_a_session_parks_the_gpu() {
+    let mut h = H::new("", |_| {});
+    assert!(!h.world().parked, "nothing to park before a session");
+    h.activate_then_idle(0);
+    let w = h.world();
+    assert!(w.parked);
+    assert_eq!((w.parks, w.unparks), (1, 0));
+    assert_eq!(w.gpu_log, ["build", "park"]);
+    assert!(
+        w.writer.is_some(),
+        "the writer keeps the placeholder flowing"
+    );
+    // The backend's parker is the daemon's own state machine.
+    assert!(
+        w.parker_said
+            .iter()
+            .any(|(l, m)| *l == Level::Info && m.starts_with("GPU parked in")),
+        "{:?}",
+        w.parker_said
+    );
+}
+
+#[test]
+fn a_failed_first_start_has_nothing_to_park() {
+    let mut h = H::new("", |w| {
+        w.fail_start = Some("output pipeline: no cudaupload".into())
+    });
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Error, "{:?}", h.snap());
+    let w = h.world();
+    assert!(!w.parked, "CUDA never initialised: nothing parked");
+    assert_eq!((w.parks, w.unparks, w.park_failures), (0, 0, 0));
+    assert!(w.gpu_log.is_empty(), "{:?}", w.gpu_log);
+    assert!(
+        w.parker_said.iter().all(|(l, _)| *l == Level::Debug),
+        "{:?}",
+        w.parker_said
+    );
+}
+
+#[test]
+fn a_start_from_idle_unparks_before_the_session_is_built() {
+    let mut h = H::new("", |_| {});
+    h.activate_then_idle(0);
+    h.activate(10_000);
+    {
+        let w = h.world();
+        assert!(!w.parked);
+        assert_eq!(w.gpu_log, ["build", "park", "unpark", "build"]);
+        assert_eq!(w.session_starts, 2);
+    }
+    // Three cycles: one park and one unpark each.
+    h.consumers(0, 11_000);
+    h.tick(16_000);
+    h.activate_then_idle(20_000);
+    let w = h.world();
+    assert_eq!((w.parks, w.unparks), (3, 2));
+    assert!(w.parked);
+}
+
+#[test]
+fn an_unpark_failure_is_an_error_with_the_writer_kept_and_a_later_start_retries() {
+    let mut h = H::new("", |_| {});
+    h.activate_then_idle(0);
+    h.world().fail_unpark = Some("cuCheckpointProcessRestore failed".into());
+    h.consumers(1, 10_000);
+    h.tick(10_300);
+    assert_eq!(h.state(), State::Error, "{:?}", h.snap());
+    let error = h.snap().error;
+    assert!(
+        error.starts_with("the GPU could not be restored from its parked state")
+            && error.contains("cuCheckpointProcessRestore failed")
+            && error.ends_with("restart the daemon"),
+        "{error}"
+    );
+    {
+        let w = h.world();
+        assert!(w.session.is_none(), "no session");
+        assert_eq!(
+            w.ingests,
+            ["usb-a"],
+            "no camera opened since the first session"
+        );
+        assert!(w.parked, "still parked");
+        assert_eq!(w.gpu_log, ["build", "park"], "nothing built while parked");
+        // Fail closed: the writer keeps sending its black placeholders.
+        assert!(w.writer.is_some());
+        assert_eq!(w.writer_starts, 1);
+    }
+    // No retry by itself.
+    h.tick(20_000);
+    assert_eq!(h.world().session_starts, 1);
+    // Cleared, a control call retries (the consumer is still there).
+    h.world().fail_unpark = None;
+    h.call(|r| Command::SetEnabled(true, r), 21_000).unwrap();
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.snap().error, "");
+    let w = h.world();
+    assert!(!w.parked);
+    assert_eq!(w.gpu_log, ["build", "park", "unpark", "build"]);
+}
+
+#[test]
+fn off_after_a_session_stays_parked() {
+    let mut h = H::new("", |_| {});
+    h.activate(0);
+    h.call(|r| Command::SetEnabled(false, r), 1000).unwrap();
+    assert_eq!(h.state(), State::Off);
+    // Off with the consumer still there, for a while.
+    h.tick(30_000);
+    let w = h.world();
+    assert!(w.parked);
+    assert_eq!((w.parks, w.unparks), (1, 0));
+    assert!(w.writer.is_some());
+}
+
+#[test]
+fn a_park_failure_leaves_the_gpu_awake_and_the_daemon_working() {
+    let mut h = H::new("", |w| w.fail_park = Some("lock timed out".into()));
+    h.activate_then_idle(0);
+    {
+        let w = h.world();
+        assert!(!w.parked);
+        assert_eq!((w.parks, w.park_failures), (0, 1));
+        assert!(
+            w.parker_said.iter().any(|(l, m)| *l == Level::Warning
+                && m.contains("stays awake")
+                && m.contains("lock timed out")),
+            "{:?}",
+            w.parker_said
+        );
+    }
+    assert_eq!(h.snap().error, "", "not an error: the GPU only stays awake");
+    h.activate(10_000);
+    let w = h.world();
+    assert_eq!(w.unparks, 0, "nothing to unpark");
+    assert_eq!(w.session_starts, 2);
+}
+
+#[test]
+fn a_failed_start_parks_the_gpu_again() {
+    let mut h = H::new("", |_| {});
+    h.activate_then_idle(0);
+    h.world().fail_start = Some("output pipeline: no cudaupload".into());
+    h.consumers(1, 10_000);
+    h.tick(10_300);
+    assert_eq!(h.state(), State::Error);
+    let w = h.world();
+    assert!(w.parked, "parked again after the failed start");
+    assert_eq!(w.gpu_log, ["build", "park", "unpark", "park"]);
 }

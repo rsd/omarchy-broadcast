@@ -2,12 +2,22 @@
 //! GPU with its driver; run with
 //! `cargo test -p obc-gpu --test hardware -- --ignored --test-threads=1`.
 //! Without a GPU they fail (no test passes without running).
+//!
+//! The checkpoint tests (`checkpoint_*`) need a process of their own (CUDA's
+//! state, initialised or parked, is the whole process's): each runs its body
+//! in a child process of this test binary ([`in_own_process`]).
+
+use std::io::Read;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use obc_backend::ColourSpec;
 use obc_gpu::{
-    ContextGuard, DeviceBuffer, DeviceNv12Buffer, Event, GpuError, Lut8, OwnedContext, Stream,
-    copy_nv12_async, current_context, download_2d, mem_get_info, memset_2d_async,
-    primary_context_active, stream_synchronize,
+    ContextGuard, DeviceBuffer, DeviceNv12Buffer, Event, GpuError, Lut8, NothingToPark,
+    OwnedContext, ParkOutcome, ProcessState, Stream, UnparkOutcome, copy_nv12_async,
+    current_context, download_2d, mem_get_info, memset_2d_async, park, parked, parked_refusals,
+    primary_context_active, process_state, stream_synchronize, unpark,
 };
 
 const W: u32 = 64;
@@ -270,4 +280,390 @@ fn gpu_lut8_failures_are_errors_and_leave_the_context_usable() {
         let identity: [u8; 256] = std::array::from_fn(|i| i as u8);
         check_lut(&kernel, stream, &identity, w, h);
     });
+}
+
+/// The variable that tells a child process of this binary which test body
+/// to run ([`in_own_process`]).
+const CHILD_VAR: &str = "OBC_GPU_TEST_CHILD";
+
+/// What a child run of a test printed and how long it ran.
+struct ChildRun {
+    stdout: String,
+    /// When the child exited, as wall-clock time.
+    exited: SystemTime,
+}
+
+/// Runs test `name` again in a child process of this test binary, with
+/// [`CHILD_VAR`] naming it, and fails if the child fails or does not exit
+/// within `limit`. Returns `None` in the child itself, which then runs the
+/// body; the parent gets what the child printed.
+fn in_own_process(name: &str, limit: Duration) -> Option<ChildRun> {
+    if std::env::var(CHILD_VAR).as_deref() == Ok(name) {
+        return None;
+    }
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            name,
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_VAR, name)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("re-run this test binary");
+    let mut out = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = out.read_to_string(&mut s);
+        s
+    });
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{name}: the child process did not exit within {limit:?}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let exited = SystemTime::now();
+    let stdout = reader.join().unwrap();
+    print!("{stdout}");
+    assert!(
+        status.success(),
+        "{name}: the child process failed: {status}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "{name}: the child ran no test:\n{stdout}"
+    );
+    Some(ChildRun { stdout, exited })
+}
+
+/// The `/dev/nvidia*` nodes process `pid` holds open.
+fn nvidia_fds(pid: u32) -> Vec<PathBuf> {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+        .filter(|t| t.to_string_lossy().starts_with("/dev/nvidia"))
+        .collect()
+}
+
+/// The lines of `/proc/self/maps` that map a `/dev/nvidia*` node.
+fn nvidia_mappings() -> Vec<String> {
+    std::fs::read_to_string("/proc/self/maps")
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains("/dev/nvidia"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The pids other than `pid` that hold `/dev/nvidia-uvm` open: the GPU
+/// list of `nvidia-uvm` is system-wide, so it only says something about
+/// this process when no other process has registered a GPU.
+fn other_uvm_holders(pid: u32) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&p| p != pid)
+        .filter(|&p| {
+            nvidia_fds(p)
+                .iter()
+                .any(|n| n.as_os_str() == "/dev/nvidia-uvm")
+        })
+        .collect()
+}
+
+/// The entries of `/proc/driver/nvidia-uvm/gpus/` (the GPUs `nvidia-uvm`
+/// has registered); `None` when the driver does not offer the list.
+fn uvm_gpus() -> Option<Vec<String>> {
+    let dir = std::fs::read_dir("/proc/driver/nvidia-uvm/gpus").ok()?;
+    Some(
+        dir.flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect(),
+    )
+}
+
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1e3
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU with a driver that has the CUDA checkpoint API"]
+fn checkpoint_a_process_that_never_initialised_cuda_has_nothing_to_park() {
+    if in_own_process(
+        "checkpoint_a_process_that_never_initialised_cuda_has_nothing_to_park",
+        Duration::from_secs(30),
+    )
+    .is_some()
+    {
+        return;
+    }
+    let pid = std::process::id();
+    assert_eq!(process_state(), Ok(None), "CUDA is not initialised here");
+    assert_eq!(
+        park(),
+        Ok(ParkOutcome::NothingToPark(NothingToPark::NotInitialised))
+    );
+    assert!(!parked());
+    assert_eq!(unpark(), Ok(UnparkOutcome::NotParked));
+    assert!(
+        nvidia_fds(pid).is_empty(),
+        "asking opened a device: {:?}",
+        nvidia_fds(pid)
+    );
+    assert_eq!(process_state(), Ok(None), "asking initialised CUDA");
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU with a driver that has the CUDA checkpoint API"]
+fn checkpoint_parks_a_live_context_three_times_and_keeps_its_data() {
+    if in_own_process(
+        "checkpoint_parks_a_live_context_three_times_and_keeps_its_data",
+        Duration::from_secs(60),
+    )
+    .is_some()
+    {
+        return;
+    }
+    let pid = std::process::id();
+    let ctx = OwnedContext::create(0).expect("cuCtxCreate");
+    let (w, h) = (1920usize, 1080usize);
+    let pattern: Vec<u8> = (0..w * h).map(|i| (i % 253) as u8).collect();
+    let buf = {
+        // SAFETY: `ctx` outlives the guard.
+        let _g = unsafe { ContextGuard::push(ctx.raw()) }.unwrap();
+        let buf = DeviceBuffer::alloc_pitch(w, h).unwrap();
+        buf.upload(&pattern, w).unwrap();
+        buf
+    };
+    assert!(!nvidia_fds(pid).is_empty(), "a live context holds devices");
+    let uvm_others = other_uvm_holders(pid);
+    for cycle in 1..=3 {
+        assert_eq!(process_state(), Ok(Some(ProcessState::Running)));
+        let out = park().expect("park");
+        let ParkOutcome::Parked { lock, checkpoint } = out else {
+            panic!("cycle {cycle}: not parked: {out:?}");
+        };
+        assert!(parked());
+        assert_eq!(process_state(), Ok(Some(ProcessState::Checkpointed)));
+        assert_eq!(
+            park(),
+            Ok(ParkOutcome::NothingToPark(NothingToPark::AlreadyParked))
+        );
+        let fds = nvidia_fds(pid);
+        assert!(fds.is_empty(), "cycle {cycle}: parked with {fds:?}");
+        let maps = nvidia_mappings();
+        assert!(maps.is_empty(), "cycle {cycle}: parked with {maps:?}");
+        match (uvm_others.is_empty(), uvm_gpus()) {
+            (true, Some(gpus)) => {
+                assert!(gpus.is_empty(), "cycle {cycle}: UVM still lists {gpus:?}")
+            }
+            (true, None) => println!("cycle {cycle}: no nvidia-uvm GPU list to check"),
+            (false, _) => println!(
+                "cycle {cycle}: UVM registration not checked: pids {uvm_others:?} hold \
+                 /dev/nvidia-uvm (the list is system-wide)"
+            ),
+        }
+        let out = unpark().expect("unpark");
+        let UnparkOutcome::Unparked { restore, unlock } = out else {
+            panic!("cycle {cycle}: not unparked: {out:?}");
+        };
+        assert!(!parked());
+        println!(
+            "cycle {cycle}: park {:.1} ms (lock {:.1} + checkpoint {:.1}), unpark {:.1} ms \
+             (restore {:.1} + unlock {:.1}), {:.1} MiB on the GPU",
+            ms(lock + checkpoint),
+            ms(lock),
+            ms(checkpoint),
+            ms(restore + unlock),
+            ms(restore),
+            ms(unlock),
+            (w * h) as f64 / f64::from(1u32 << 20)
+        );
+        // SAFETY: `ctx` outlives the guard.
+        let _g = unsafe { ContextGuard::push(ctx.raw()) }.unwrap();
+        let mut back = vec![0u8; w * h];
+        buf.download(&mut back, w).unwrap();
+        assert!(back == pattern, "cycle {cycle}: the data changed");
+    }
+    assert_eq!(unpark(), Ok(UnparkOutcome::NotParked));
+    assert_eq!(parked_refusals(), 0);
+    {
+        // SAFETY: `ctx` outlives the guard.
+        let _g = unsafe { ContextGuard::push(ctx.raw()) }.unwrap();
+        drop(buf);
+    }
+    drop(ctx);
+}
+
+/// `CUcheckpointLockArgs`, for the raw calls of
+/// [`checkpoint_unpark_brings_back_a_process_parked_by_another_tool`].
+#[repr(C)]
+struct RawLockArgs {
+    timeout_ms: u32,
+    reserved0: u32,
+    reserved1: [u64; 7],
+}
+
+/// The checkpoint API called on this process directly, as another tool
+/// (`cuda-checkpoint`) would: `obc_gpu` does not know about it.
+struct OtherTool {
+    lib: libloading::Library,
+}
+
+impl OtherTool {
+    fn open() -> Self {
+        // SAFETY: loading the NVIDIA driver library has no preconditions.
+        let lib = unsafe { libloading::Library::new("libcuda.so.1") }.expect("libcuda.so.1");
+        OtherTool { lib }
+    }
+
+    fn lock(&self) {
+        let mut args = RawLockArgs {
+            timeout_ms: 2000,
+            reserved0: 0,
+            reserved1: [0; 7],
+        };
+        // SAFETY: the documented signature; `args` is a valid, zero-reserved
+        // struct.
+        let rc = unsafe {
+            let f = self
+                .lib
+                .get::<unsafe extern "C" fn(i32, *mut RawLockArgs) -> i32>(
+                    b"cuCheckpointProcessLock\0",
+                )
+                .unwrap();
+            f(std::process::id() as i32, &mut args)
+        };
+        assert_eq!(rc, 0, "cuCheckpointProcessLock");
+    }
+
+    fn checkpoint(&self) {
+        // SAFETY: the documented signature; null args are the defaults.
+        let rc = unsafe {
+            let f = self
+                .lib
+                .get::<unsafe extern "C" fn(i32, *mut std::ffi::c_void) -> i32>(
+                    b"cuCheckpointProcessCheckpoint\0",
+                )
+                .unwrap();
+            f(std::process::id() as i32, std::ptr::null_mut())
+        };
+        assert_eq!(rc, 0, "cuCheckpointProcessCheckpoint");
+    }
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU with a driver that has the CUDA checkpoint API"]
+fn checkpoint_unpark_brings_back_a_process_parked_by_another_tool() {
+    if in_own_process(
+        "checkpoint_unpark_brings_back_a_process_parked_by_another_tool",
+        Duration::from_secs(60),
+    )
+    .is_some()
+    {
+        return;
+    }
+    let ctx = OwnedContext::create(0).expect("cuCtxCreate");
+    let (w, h) = (1024usize, 512usize);
+    let pattern: Vec<u8> = (0..w * h).map(|i| (i % 251) as u8).collect();
+    let buf = {
+        // SAFETY: `ctx` outlives the guard.
+        let _g = unsafe { ContextGuard::push(ctx.raw()) }.unwrap();
+        let buf = DeviceBuffer::alloc_pitch(w, h).unwrap();
+        buf.upload(&pattern, w).unwrap();
+        buf
+    };
+    let tool = OtherTool::open();
+    let check_data = |what: &str| {
+        // SAFETY: `ctx` outlives the guard.
+        let _g = unsafe { ContextGuard::push(ctx.raw()) }.unwrap();
+        let mut back = vec![0u8; w * h];
+        buf.download(&mut back, w).unwrap();
+        assert!(back == pattern, "{what}: the data changed");
+    };
+    // Checkpointed behind obc_gpu's back: restored and unlocked.
+    tool.lock();
+    tool.checkpoint();
+    assert!(!parked(), "obc_gpu did not park it");
+    assert_eq!(process_state(), Ok(Some(ProcessState::Checkpointed)));
+    let out = unpark().expect("unpark a checkpointed process");
+    let UnparkOutcome::Unparked { restore, unlock } = out else {
+        panic!("checkpointed by another tool: not unparked: {out:?}");
+    };
+    assert!(!restore.is_zero(), "restored");
+    println!(
+        "checkpointed by another tool: unparked in {:.1} ms (restore {:.1} + unlock {:.1})",
+        ms(restore + unlock),
+        ms(restore),
+        ms(unlock)
+    );
+    assert_eq!(process_state(), Ok(Some(ProcessState::Running)));
+    check_data("after a restore");
+    // Only locked behind its back: unlocked, nothing to restore.
+    tool.lock();
+    assert_eq!(process_state(), Ok(Some(ProcessState::Locked)));
+    let out = unpark().expect("unpark a locked process");
+    assert!(
+        matches!(out, UnparkOutcome::Unparked { restore, .. } if restore.is_zero()),
+        "locked by another tool: {out:?}"
+    );
+    assert_eq!(process_state(), Ok(Some(ProcessState::Running)));
+    check_data("after an unlock");
+    // Running: nothing to do.
+    assert_eq!(unpark(), Ok(UnparkOutcome::NotParked));
+    assert_eq!(parked_refusals(), 0);
+    {
+        // SAFETY: `ctx` outlives the guard.
+        let _g = unsafe { ContextGuard::push(ctx.raw()) }.unwrap();
+        drop(buf);
+    }
+    drop(ctx);
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU with a driver that has the CUDA checkpoint API"]
+fn checkpoint_a_parked_process_exits_promptly() {
+    const NAME: &str = "checkpoint_a_parked_process_exits_promptly";
+    const MARK: &str = "parked, exiting at ";
+    if let Some(run) = in_own_process(NAME, Duration::from_secs(30)) {
+        let at: u128 = run
+            .stdout
+            .lines()
+            .find_map(|l| l.split_once(MARK).map(|(_, v)| v))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("the child's mark");
+        let exited = run.exited.duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let took = Duration::from_nanos(u64::try_from(exited.saturating_sub(at)).unwrap());
+        println!(
+            "a parked process exited {:.1} ms after its test body",
+            ms(took)
+        );
+        assert!(took < Duration::from_secs(5), "exit took {took:?}");
+        return;
+    }
+    // A live context with memory, left to the exit handlers, parked.
+    let ctx = OwnedContext::create(0).expect("cuCtxCreate");
+    {
+        // SAFETY: `ctx` outlives the guard.
+        let _g = unsafe { ContextGuard::push(ctx.raw()) }.unwrap();
+        std::mem::forget(DeviceBuffer::alloc_pitch(4096, 1024).unwrap());
+    }
+    std::mem::forget(ctx);
+    assert!(matches!(park(), Ok(ParkOutcome::Parked { .. })));
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    println!("{MARK}{}", now.as_nanos());
 }

@@ -4,13 +4,17 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use obc_core::config::EffectConfig;
 use obc_core::{EffectMode, ModeRequest, OutputContract, SinkSelector};
+use obc_gpu::{GpuError, NothingToPark, ParkError, ParkOutcome, UnparkOutcome};
 use obc_ipc::Stats;
 
+use super::park::{ParkOps, Parker};
 use super::{EffectReport, EffectStatus, Failure, MediaBackend, PipeWireGeneration, SessionParams};
 use crate::camera::Camera;
+use crate::log::Level;
 
 /// The fake media world.
 #[derive(Debug)]
@@ -73,6 +77,27 @@ pub struct World {
     pub effect_sets: Vec<EffectConfig>,
     /// `set_effect` fails with this (once).
     pub fail_set_effect: Option<String>,
+    /// The fake GPU driver under the backend's real [`Parker`]
+    /// (`backend::park`): CUDA is initialised once a session is built
+    /// (as GStreamer's `cuInit` does); before that there is nothing to
+    /// park.
+    pub cuda_initialised: bool,
+    /// The GPU is parked: a stopped session parks it, a start unparks it
+    /// before building anything.
+    pub parked: bool,
+    pub parks: u32,
+    pub unparks: u32,
+    /// Parking fails with this (the GPU stays awake), counted in
+    /// `park_failures`.
+    pub fail_park: Option<String>,
+    pub park_failures: u32,
+    /// Unparking fails with this: the start fails, the GPU stays parked.
+    pub fail_unpark: Option<String>,
+    /// What touched the GPU, in order: `park`, `unpark` and `build` (an
+    /// output built).
+    pub gpu_log: Vec<&'static str>,
+    /// What the parker logged.
+    pub parker_said: Vec<(Level, String)>,
 }
 
 impl Default for World {
@@ -115,7 +140,69 @@ impl Default for World {
             effect: None,
             effect_sets: Vec::new(),
             fail_set_effect: None,
+            cuda_initialised: false,
+            parked: false,
+            parks: 0,
+            unparks: 0,
+            fail_park: None,
+            park_failures: 0,
+            fail_unpark: None,
+            gpu_log: Vec::new(),
+            parker_said: Vec::new(),
         }
+    }
+}
+
+fn lock(world: &Mutex<World>) -> MutexGuard<'_, World> {
+    world.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The fake GPU driver (the world's GPU fields), as `obc_gpu::park` and
+/// `obc_gpu::unpark` would answer. Never called with the world locked.
+#[derive(Debug, Clone)]
+pub struct WorldGpu(Arc<Mutex<World>>);
+
+impl ParkOps for WorldGpu {
+    fn park(&mut self) -> Result<ParkOutcome, ParkError> {
+        let mut w = lock(&self.0);
+        if !w.cuda_initialised {
+            return Ok(ParkOutcome::NothingToPark(NothingToPark::NotInitialised));
+        }
+        if w.parked {
+            return Ok(ParkOutcome::NothingToPark(NothingToPark::AlreadyParked));
+        }
+        if let Some(e) = w.fail_park.clone() {
+            w.park_failures += 1;
+            return Err(ParkError::Awake(GpuError::Unavailable(e)));
+        }
+        w.parked = true;
+        w.parks += 1;
+        w.gpu_log.push("park");
+        Ok(ParkOutcome::Parked {
+            lock: Duration::from_millis(1),
+            checkpoint: Duration::from_millis(15),
+        })
+    }
+
+    fn unpark(&mut self) -> Result<UnparkOutcome, GpuError> {
+        let mut w = lock(&self.0);
+        if !w.parked {
+            return Ok(UnparkOutcome::NotParked);
+        }
+        if let Some(e) = w.fail_unpark.clone() {
+            return Err(GpuError::Unavailable(e));
+        }
+        w.parked = false;
+        w.unparks += 1;
+        w.gpu_log.push("unpark");
+        Ok(UnparkOutcome::Unparked {
+            restore: Duration::from_millis(17),
+            unlock: Duration::ZERO,
+        })
+    }
+
+    fn refusals(&self) -> u64 {
+        0
     }
 }
 
@@ -157,13 +244,38 @@ impl std::fmt::Debug for Hook {
     }
 }
 
-/// The backend half; clone the [`Arc`] to keep the test's half.
-#[derive(Debug, Clone, Default)]
-pub struct FakeBackend(pub Arc<Mutex<World>>);
+/// The backend half; clone it to keep the test's half (the clones share
+/// the world and the parker).
+#[derive(Debug, Clone)]
+pub struct FakeBackend {
+    world: Arc<Mutex<World>>,
+    /// The daemon's park state machine, over the world's fake GPU. Locked
+    /// before the world, never while the world is locked.
+    parker: Arc<Mutex<Parker<WorldGpu>>>,
+}
+
+impl Default for FakeBackend {
+    fn default() -> Self {
+        let world: Arc<Mutex<World>> = Arc::default();
+        let said = Arc::clone(&world);
+        let parker = Parker::with(
+            WorldGpu(Arc::clone(&world)),
+            Box::new(move |level, msg| lock(&said).parker_said.push((level, msg.to_string()))),
+        );
+        FakeBackend {
+            world,
+            parker: Arc::new(Mutex::new(parker)),
+        }
+    }
+}
 
 impl FakeBackend {
     pub fn world(&self) -> MutexGuard<'_, World> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.world)
+    }
+
+    fn parker(&self) -> MutexGuard<'_, Parker<WorldGpu>> {
+        self.parker.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn start_ingest(w: &mut World, camera: &Camera) -> Result<(), String> {
@@ -257,20 +369,30 @@ impl MediaBackend for FakeBackend {
             (hook.0)();
             self.world().during_start = Some(hook);
         }
-        let mut w = self.world();
-        assert!(w.writer.is_some(), "a session needs the writer");
-        assert_eq!(
-            Some(params.contract),
-            w.writer.as_ref().map(|(_, c)| *c),
-            "the session contract is the writer's"
-        );
-        if let Some(e) = w.fail_start.clone() {
-            return Err(e);
+        {
+            let w = self.world();
+            assert!(w.writer.is_some(), "a session needs the writer");
+            assert_eq!(
+                Some(params.contract),
+                w.writer.as_ref().map(|(_, c)| *c),
+                "the session contract is the writer's"
+            );
         }
-        w.session = Some((params.clone(), None));
-        w.session_starts += 1;
-        w.apply_effect(&params.effect);
-        Ok(())
+        // The real parker: unparked before anything touches the GPU, parked
+        // again if the start fails.
+        let world = Arc::clone(&self.world);
+        self.parker().starting(|| {
+            let mut w = lock(&world);
+            if let Some(e) = w.fail_start.clone() {
+                return Err(e);
+            }
+            w.cuda_initialised = true;
+            w.gpu_log.push("build");
+            w.session = Some((params.clone(), None));
+            w.session_starts += 1;
+            w.apply_effect(&params.effect);
+            Ok(())
+        })
     }
 
     fn switch_camera(&mut self, _params: &SessionParams, camera: &Camera) -> Result<(), String> {
@@ -279,12 +401,20 @@ impl MediaBackend for FakeBackend {
     }
 
     fn stop_session(&mut self) {
-        let mut w = self.world();
-        if w.session.take().is_some() {
-            w.session_stops += 1;
-            // The models go with the session.
-            w.effect = None;
-            w.effect_status = EffectStatus::Off;
+        let stopped = {
+            let mut w = self.world();
+            let stopped = w.session.take().is_some();
+            if stopped {
+                w.session_stops += 1;
+                // The models go with the session.
+                w.effect = None;
+                w.effect_status = EffectStatus::Off;
+            }
+            stopped
+        };
+        // All of it stopped: the real parker parks.
+        if stopped {
+            self.parker().park();
         }
     }
 

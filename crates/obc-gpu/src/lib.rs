@@ -19,7 +19,11 @@
 //! * [`OwnedContext`]: a context created with `cuCtxCreate`, as GStreamer's
 //!   CUDA library creates one, for tests;
 //! * [`Lut8`]: the one custom kernel, a byte lookup table over a pitched
-//!   8-bit plane, shipped as PTX and compiled by the driver at load time.
+//!   8-bit plane, shipped as PTX and compiled by the driver at load time;
+//! * [`park`], [`unpark`], [`parked`]: the driver's checkpoint API on this
+//!   process, so an idle daemon holds no GPU device (module `checkpoint`).
+//!   While parked, every helper here returns [`GpuError::Parked`] instead
+//!   of blocking in the driver.
 //!
 //! Unless stated otherwise every call needs a context current on the calling
 //! thread (the one the memory and streams belong to). Functions that take
@@ -31,9 +35,14 @@ use std::marker::PhantomData;
 
 use obc_backend::{BackendError, ColourSpec, DeviceNv12};
 
+mod checkpoint;
 mod driver;
 mod kernel;
 
+pub use checkpoint::{
+    NothingToPark, PARK_LOCK_TIMEOUT, ParkError, ParkOutcome, ProcessState, UnparkOutcome, park,
+    parked, parked_refusals, process_state, unpark,
+};
 use driver::{CUDA_ERROR_NOT_READY, CUDA_SUCCESS, MEMORYTYPE_DEVICE, MEMORYTYPE_HOST, Memcpy2d};
 pub use driver::{
     CuContext, CuDevice, CuDevicePtr, CuEvent, CuFunction, CuModule, CuStream, DRIVER_LIBRARY,
@@ -62,6 +71,13 @@ pub enum GpuError {
     /// An argument was rejected before reaching the driver.
     #[error("{0}")]
     InvalidArgument(String),
+    /// The process is parked ([`park`]): a driver call would block until it
+    /// is unparked, so none was made.
+    #[error(
+        "the CUDA driver is parked (the process's GPU state is checkpointed); no CUDA call may \
+         be made until it is unparked"
+    )]
+    Parked,
 }
 
 impl From<GpuError> for BackendError {
@@ -73,6 +89,7 @@ impl From<GpuError> for BackendError {
                 message: e.to_string(),
             },
             GpuError::InvalidArgument(m) => BackendError::InvalidInput(m),
+            GpuError::Parked => BackendError::Unavailable(e.to_string()),
         }
     }
 }

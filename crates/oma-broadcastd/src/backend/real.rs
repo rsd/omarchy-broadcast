@@ -13,6 +13,26 @@
 //! runs; stopping the session unloads them before the CUDA context goes
 //! (`docs/adr/0012-video-effects-and-maxine-backend.md`, "Lifecycle").
 //!
+//! **Parking.** Once a session has run, CUDA stays initialised in the
+//! process and the GPU cannot power down, even with every context gone.
+//! Stopping a session therefore parks the GPU ([`Parker`],
+//! `super::park`) once the whole session is gone: the NVML sampler
+//! stopped, every pipeline at NULL and dropped (the effect element has
+//! joined its worker thread and unloaded its models by then), so nothing
+//! in the process uses CUDA. A session that did not stop cleanly (a
+//! pipeline left short of NULL) may still have CUDA elements alive: the
+//! GPU is then not parked, and stays awake. The frames the writer and the PipeWire tap
+//! may still hold come out of `cudadownload` in system memory, so releasing
+//! them later needs no CUDA. Starting a session unparks first, before the
+//! output or NVML touch the GPU; if the GPU cannot be restored the start
+//! fails (nothing may touch CUDA), and a start that fails after unparking
+//! parks again. While parked, nothing here touches CUDA: the camera scan,
+//! the writer and [`MediaBackend::effect_available`] (the effect backend's
+//! probe opens its libraries and makes no CUDA call) need none. The
+//! process may exit parked (a shutdown stops the session first, which
+//! parks): its exit does not wait on the GPU. Dropping the backend with a
+//! session still running does not park it.
+//!
 //! The optional PipeWire output (`[pipewire] enabled`) is started and
 //! stopped on its own next to the running writer
 //! ([`MediaBackend::start_pipewire`], [`MediaBackend::stop_pipewire`]),
@@ -40,9 +60,11 @@ use obc_pipeline::stats::{cpu_usage, online_cpus, self_cpu_ticks, ticks_per_sec}
 use obc_pipeline::{
     DiscoveryRoute, EffectFallback, EffectKind, EffectSettings, IngestConfig, LiveStats,
     LoopbackWriter, Output, OutputConfig, OutputSink, PipelineError, Session, WriterCounts,
-    WriterSink, choose_mode, effect_backend_available, list_cameras, scan_sysfs, select_sink,
+    WriterHandle, WriterSink, choose_mode, effect_backend_available, list_cameras, scan_sysfs,
+    select_sink,
 };
 
+use super::park::{Parker, StopSession};
 use super::{
     EffectReport, EffectStatus, Failure, MediaBackend, PipeWireEvent, PipeWireGeneration,
     PipeWireReporter, PipeWireState, SessionParams,
@@ -79,6 +101,27 @@ struct Running {
     counts: WriterCounts,
 }
 
+impl StopSession for Running {
+    /// The NVML sampler stopped, then ingest and output to NULL and
+    /// dropped, then the rest: when this returns, nothing of the session is
+    /// left. `Err` when a pipeline did not reach NULL cleanly.
+    fn stop(self) -> Result<(), String> {
+        let Running {
+            session, gpu, live, ..
+        } = self;
+        if let Some(gpu) = gpu {
+            let (_, res) = gpu.stop();
+            if let Err(e) = res {
+                crate::debug!("NVML shutdown: {e}");
+            }
+        }
+        // Ingest, then output: every pipeline at NULL and dropped.
+        let res = session.stop().map_err(|e| e.to_string());
+        drop(live);
+        res
+    }
+}
+
 /// The media backend over GStreamer (see the module docs).
 pub struct GstBackend {
     writer: Option<LoopbackWriter>,
@@ -88,6 +131,8 @@ pub struct GstBackend {
     reporter: Option<PipeWireReporter>,
     /// The generation of the last PipeWire output started (0: none yet).
     generation: PipeWireGeneration,
+    /// Parks the GPU between sessions (see the module docs).
+    parker: Parker,
     /// The PipeWire output fed by the running writer's tap.
     #[cfg(feature = "pipewire")]
     output: Option<obc_pipeline::pipewire::PipeWireOutput>,
@@ -104,9 +149,16 @@ impl GstBackend {
             stamp: std::env::var_os(STAMP_ENV).is_some_and(|v| !v.is_empty() && v != "0"),
             reporter,
             generation: 0,
+            parker: Parker::new(),
             #[cfg(feature = "pipewire")]
             output: None,
         })
+    }
+
+    /// The GPU parker: a measurement hook (turn parking off, read the last
+    /// park and unpark times). The backend parks and unparks by itself.
+    pub fn parker(&mut self) -> &mut Parker {
+        &mut self.parker
     }
 
     fn report(&self, generation: PipeWireGeneration, event: PipeWireEvent) {
@@ -267,6 +319,51 @@ fn stamp_forwarded(output: &Output) {
     });
 }
 
+/// Builds and starts a session's output forwarding to `writer`, and the
+/// NVML sampler: everything of [`MediaBackend::start_session`] that touches
+/// the GPU. The writer's counters are the caller's to set.
+fn build_session(
+    params: &SessionParams,
+    writer: WriterHandle,
+    stamp: bool,
+) -> Result<Running, String> {
+    let mut ocfg = OutputConfig::new(params.contract, OutputSink::Writer(writer));
+    ocfg.gap_threshold = params.input_gap;
+    ocfg.hold_timeout = params.hold_timeout;
+    // Always with the element: an output built without it cannot take an
+    // effect later.
+    ocfg.effect = Some(effect_settings(&params.effect));
+    let mut output = Output::build(ocfg).map_err(|e| format!("output pipeline: {e}"))?;
+    let live = LiveStats::new();
+    output.set_observer(Some(live.observer()));
+    if stamp {
+        stamp_forwarded(&output);
+    }
+    let session = Session::new(output).map_err(|e| format!("output pipeline: {e}"))?;
+    let epoch = Instant::now();
+    let gpu = match GpuSampler::start(
+        GPU_INDEX,
+        GPU_INTERVAL,
+        Arc::new(move || u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)),
+    ) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            crate::debug!("GPU statistics unavailable: {e}");
+            None
+        }
+    };
+    Ok(Running {
+        session,
+        live,
+        source: None,
+        gpu,
+        gpu_seen: 0,
+        window_start: Instant::now(),
+        cpu_ticks: self_cpu_ticks(),
+        counts: WriterCounts::default(),
+    })
+}
+
 impl MediaBackend for GstBackend {
     fn scan_cameras(&mut self, request: &ModeRequest) -> Vec<Camera> {
         // The sysfs route: no DeviceMonitor (it would talk to PipeWire),
@@ -360,47 +457,20 @@ impl MediaBackend for GstBackend {
     }
 
     fn start_session(&mut self, params: &SessionParams) -> Result<(), String> {
-        self.stop_session();
-        let writer = self
-            .writer
-            .as_ref()
-            .ok_or_else(|| "no loopback writer is running".to_string())?;
-        let mut ocfg = OutputConfig::new(params.contract, OutputSink::Writer(writer.handle()));
-        ocfg.gap_threshold = params.input_gap;
-        ocfg.hold_timeout = params.hold_timeout;
-        // Always with the element: an output built without it cannot take
-        // an effect later.
-        ocfg.effect = Some(effect_settings(&params.effect));
-        let mut output = Output::build(ocfg).map_err(|e| format!("output pipeline: {e}"))?;
-        let live = LiveStats::new();
-        output.set_observer(Some(live.observer()));
-        if self.stamp {
-            stamp_forwarded(&output);
+        let Some(writer) = self.writer.as_ref().map(LoopbackWriter::handle) else {
+            self.stop_session();
+            return Err("no loopback writer is running".into());
+        };
+        let stamp = self.stamp;
+        // A running session stopped without parking in between; the GPU
+        // unparked before the output (CUDA) or NVML touch it, and parked
+        // again if the build fails (`Parker::start_session`).
+        self.parker
+            .start_session(&mut self.running, || build_session(params, writer, stamp))?;
+        let counts = self.writer_counts();
+        if let Some(r) = self.running.as_mut() {
+            r.counts = counts;
         }
-        let session = Session::new(output).map_err(|e| format!("output pipeline: {e}"))?;
-        let epoch = Instant::now();
-        let gpu = match GpuSampler::start(
-            GPU_INDEX,
-            GPU_INTERVAL,
-            Arc::new(move || u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)),
-        ) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                crate::debug!("GPU statistics unavailable: {e}");
-                None
-            }
-        };
-        let running = Running {
-            session,
-            live,
-            source: None,
-            gpu,
-            gpu_seen: 0,
-            window_start: Instant::now(),
-            cpu_ticks: self_cpu_ticks(),
-            counts: self.writer_counts(),
-        };
-        self.running = Some(running);
         Ok(())
     }
 
@@ -413,18 +483,9 @@ impl MediaBackend for GstBackend {
     }
 
     fn stop_session(&mut self) {
-        let Some(running) = self.running.take() else {
-            return;
-        };
-        if let Some(gpu) = running.gpu {
-            let (_, res) = gpu.stop();
-            if let Err(e) = res {
-                crate::debug!("NVML shutdown: {e}");
-            }
-        }
-        if let Err(e) = running.session.stop() {
-            crate::warning!("stopping the session: {e}");
-        }
+        // All of the session stopped first; parked only if it stopped
+        // cleanly (`Parker::stop_session`).
+        self.parker.stop_session(&mut self.running);
     }
 
     fn first_frame(&mut self) -> bool {
@@ -519,6 +580,9 @@ impl MediaBackend for GstBackend {
         if effect.mode == EffectMode::None {
             return Ok(());
         }
+        // Called before a session starts, so while the GPU is parked: the
+        // probe only opens the SDK libraries and checks the model directory,
+        // with no CUDA call (a CUDA call would block until unparked).
         effect_backend_available()?;
         obc_pipeline::effect::check_settings(&effect_settings(effect)).map_err(effect_error)
     }
@@ -568,7 +632,10 @@ fn pipewire_event(event: obc_pipeline::pipewire::PwEvent) -> PipeWireEvent {
 }
 
 impl Drop for GstBackend {
+    /// Stops everything without parking a session still running: the
+    /// process is exiting, which releases the GPU anyway.
     fn drop(&mut self) {
+        self.parker.set_enabled(false);
         self.stop_writer();
     }
 }

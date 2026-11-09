@@ -1200,3 +1200,468 @@ fn effects_switch_while_streaming_and_release_the_gpu() {
     drop(client);
     drop(daemon);
 }
+
+// ---- the GPU parked between sessions (backend::park) ----
+
+/// The variable that tells a child process of this test binary which test
+/// body to run ([`in_own_process`]).
+const CHILD_VAR: &str = "OBC_DAEMON_TEST_CHILD";
+
+/// Runs test `name` again in a child process of this test binary, with
+/// [`CHILD_VAR`] naming it and `env` set, and fails if the child fails or
+/// does not exit within `limit`. Returns `false` in the child itself, which
+/// then runs the body. For the tests that use CUDA in this process: its
+/// state (initialised, parked) is the whole process's.
+fn in_own_process(name: &str, env: &[(&str, &str)], limit: Duration) -> bool {
+    if std::env::var(CHILD_VAR).as_deref() == Ok(name) {
+        return false;
+    }
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            name,
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_VAR, name)
+        .envs(env.iter().copied())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("re-run this test binary");
+    let out = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            println!("{line}");
+            s.push_str(&line);
+            s.push('\n');
+        }
+        s
+    });
+    let mut guard = Guard::new(child, "the test's child process", Duration::from_secs(5));
+    let code = guard.wait_exit(limit);
+    drop(guard);
+    let stdout = reader.join().unwrap();
+    assert_eq!(code, Some(0), "{name}: the child process failed or hung");
+    assert!(stdout.contains("1 passed"), "{name}: the child ran no test");
+    true
+}
+
+/// The lines of `/proc/<pid>/maps` that map a `/dev/nvidia*` node.
+fn nvidia_mappings(pid: u32) -> Vec<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/maps"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("/dev/nvidia"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The pids other than `pid` that hold `/dev/nvidia-uvm` open.
+fn other_uvm_holders(pid: u32) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&p| p != pid)
+        .filter(|&p| {
+            open_nodes(p)
+                .iter()
+                .any(|n| n.as_os_str() == "/dev/nvidia-uvm")
+        })
+        .collect()
+}
+
+/// Checks that `pid` holds no GPU: no `/dev/nvidia*` descriptor or mapping
+/// and, when no other process has `nvidia-uvm` open (its GPU list is
+/// system-wide), no GPU registered with `nvidia-uvm`.
+fn assert_parked_process(pid: u32, what: &str) {
+    let fds: Vec<_> = open_nodes(pid)
+        .into_iter()
+        .filter(|n| n.to_string_lossy().starts_with("/dev/nvidia"))
+        .collect();
+    assert!(fds.is_empty(), "{what}: parked with {fds:?}");
+    let maps = nvidia_mappings(pid);
+    assert!(maps.is_empty(), "{what}: parked with {maps:?}");
+    let others = other_uvm_holders(pid);
+    if others.is_empty() {
+        match std::fs::read_dir("/proc/driver/nvidia-uvm/gpus") {
+            Ok(dir) => {
+                let gpus: Vec<_> = dir.flatten().map(|e| e.file_name()).collect();
+                assert!(gpus.is_empty(), "{what}: nvidia-uvm still lists {gpus:?}");
+            }
+            Err(e) => eprintln!("{what}: no nvidia-uvm GPU list to check ({e})"),
+        }
+    } else {
+        eprintln!(
+            "{what}: nvidia-uvm registration not checked: pids {others:?} hold /dev/nvidia-uvm \
+             (the list is system-wide)"
+        );
+    }
+}
+
+/// When the consumer saw its first stamped frame at or after `since`.
+fn first_stamped_since(consumer: &Consumer, since: Instant) -> Option<Instant> {
+    consumer
+        .lines()
+        .into_iter()
+        .find(|(t, l)| *t >= since && *l == Line::Frame(true))
+        .map(|(t, _)| t)
+}
+
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1e3
+}
+
+fn median(v: &mut [f64]) -> f64 {
+    v.sort_by(f64::total_cmp);
+    v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
+}
+
+const IGNORE_PARK_IN_PROCESS: &str = "needs OBC_TEST_SINK (a free v4l2loopback device with \
+     exclusive_caps=1), an NVIDIA GPU with a driver that has the CUDA checkpoint API and cargo \
+     (to build obc-consumer); no camera";
+
+/// The backend in this process, with no camera: each session's output
+/// sends its own (stamped) CUDA placeholders to the writer. A cold start,
+/// then re-starts after a parked idle and after an unparked one in turn
+/// (the parker's switch), timed from the start to the consumer's first
+/// stamped frame. Each park leaves the process with no GPU device; each
+/// unpark brings the frames back.
+#[test]
+#[ignore = "needs OBC_TEST_SINK (a free v4l2loopback device with exclusive_caps=1), an NVIDIA GPU with a driver that has the CUDA checkpoint API and cargo (to build obc-consumer); no camera"]
+fn the_backend_parks_the_gpu_between_sessions_without_a_camera() {
+    use oma_broadcastd::backend::MediaBackend;
+    use oma_broadcastd::backend::SessionParams;
+    use oma_broadcastd::backend::real::GstBackend;
+
+    const NAME: &str = "the_backend_parks_the_gpu_between_sessions_without_a_camera";
+    let sink = PathBuf::from(
+        std::env::var("OBC_TEST_SINK")
+            .unwrap_or_else(|_| panic!("this test needs OBC_TEST_SINK. {IGNORE_PARK_IN_PROCESS}")),
+    );
+    let sink = std::fs::canonicalize(&sink).unwrap_or(sink);
+    if in_own_process(
+        NAME,
+        &[("OBC_TEST_STAMP_FORWARDED", "1")],
+        Duration::from_secs(180),
+    ) {
+        return;
+    }
+    let pid = std::process::id();
+    let n = count_holders(Path::new("/proc"), &NodeId::of(&sink), pid);
+    assert_eq!(
+        n,
+        0,
+        "{} is held by another process: not touching it",
+        sink.display()
+    );
+    let consumer_bin = consumer_binary();
+    let cfg = obc_core::config::Config::default();
+    let params = SessionParams {
+        contract: cfg.output_contract(),
+        aspect: cfg.output.aspect,
+        hold_timeout: cfg.hold_timeout(),
+        input_gap: cfg.input_gap(),
+        fixed_framerate: false,
+        effect: obc_core::config::EffectConfig::default(),
+    };
+    let mut backend = GstBackend::new(None).unwrap();
+    backend
+        .start_writer(
+            &obc_core::SinkSelector::Path(sink.clone()),
+            &params.contract,
+        )
+        .unwrap();
+    let consumer = Consumer::spawn(&consumer_bin, &sink);
+    assert!(
+        consumer.wait_more(false, 10, Duration::from_secs(10)),
+        "no placeholder from the writer: {:?}",
+        consumer.runs()
+    );
+    assert!(!holds_nvidia(pid), "a GPU device before any session");
+    assert_eq!(
+        obc_gpu::process_state(),
+        Ok(None),
+        "CUDA before any session"
+    );
+
+    // Starts a session; (start call, start to the first stamped frame).
+    let start = |backend: &mut GstBackend, what: &str| -> (f64, f64) {
+        let t = Instant::now();
+        backend.start_session(&params).unwrap();
+        let call = t.elapsed();
+        assert!(
+            wait(Duration::from_secs(10), || first_stamped_since(
+                &consumer, t
+            )
+            .is_some()),
+            "{what}: no frame from the session: {:?}",
+            consumer.runs()
+        );
+        let first = first_stamped_since(&consumer, t).unwrap() - t;
+        assert!(
+            consumer.wait_more(true, 15, Duration::from_secs(5)),
+            "{what}: the session's frames stopped"
+        );
+        assert!(holds_nvidia(pid), "{what}: streaming without the GPU?");
+        (ms(call), ms(first))
+    };
+
+    let (call, first) = start(&mut backend, "cold start");
+    eprintln!("cold start (cuInit): start_session {call:.0} ms, first frame after {first:.0} ms");
+    let mut parked_runs: (Vec<f64>, Vec<f64>) = Default::default();
+    let mut awake_runs: (Vec<f64>, Vec<f64>) = Default::default();
+    let mut parks = Vec::new();
+    let mut unparks = Vec::new();
+    // Parked and unparked idles in turn, three of each.
+    for (i, park) in [true, false, true, false, true, false]
+        .into_iter()
+        .enumerate()
+    {
+        let what = format!(
+            "cycle {} ({})",
+            i + 1,
+            if park { "parked" } else { "awake" }
+        );
+        backend.parker().set_enabled(park);
+        backend.stop_session();
+        assert_eq!(obc_gpu::parked(), park, "{what}");
+        if park {
+            parks.push(ms(backend.parker().last_park().unwrap()));
+            assert_parked_process(pid, &what);
+        } else {
+            assert!(holds_nvidia(pid), "{what}: CUDA initialised, unparked");
+        }
+        // The writer's placeholders flow while idle, parked or not.
+        assert!(
+            consumer.wait_more(false, 15, Duration::from_secs(5)),
+            "{what}: no placeholder while idle: {:?}",
+            consumer.runs()
+        );
+        let before = backend.parker().last_unpark();
+        let (call, first) = start(&mut backend, &what);
+        assert!(!obc_gpu::parked());
+        let runs = if park {
+            let u = backend.parker().last_unpark().unwrap();
+            assert_ne!(Some(u), before, "{what}: no unpark");
+            unparks.push(ms(u));
+            &mut parked_runs
+        } else {
+            &mut awake_runs
+        };
+        runs.0.push(call);
+        runs.1.push(first);
+        eprintln!("{what}: start_session {call:.0} ms, first frame after {first:.0} ms");
+    }
+    backend.parker().set_enabled(true);
+    backend.stop_session();
+    assert!(obc_gpu::parked());
+    assert_parked_process(pid, "the last idle");
+    eprintln!(
+        "park {parks:.0?} ms, unpark {unparks:.0?} ms; median re-start after a parked idle: \
+         start_session {:.0} ms, first frame {:.0} ms; after an awake idle: start_session {:.0} \
+         ms, first frame {:.0} ms",
+        median(&mut parked_runs.0),
+        median(&mut parked_runs.1),
+        median(&mut awake_runs.0),
+        median(&mut awake_runs.1)
+    );
+    let (stamped, plain) = consumer.counts();
+    assert!(consumer.problems().is_empty(), "{:?}", consumer.problems());
+    assert_eq!(consumer.caps().len(), 1, "caps: {:?}", consumer.caps());
+    eprintln!("consumer: {stamped} session frames, {plain} placeholders");
+    assert_eq!(obc_gpu::parked_refusals(), 0);
+    consumer.close();
+    backend.stop_writer();
+    drop(backend);
+}
+
+const IGNORE_PARK: &str = "needs OBC_TEST_SINK (a free v4l2loopback device with \
+     exclusive_caps=1), OBC_TEST_CAMERA, an NVIDIA GPU with a driver that has the CUDA \
+     checkpoint API, /usr/bin/dbus-daemon and cargo; with the Maxine SDK and OBC_TEST_PRELOAD \
+     (see the module docs) it adds a blur session";
+
+/// The daemon parks the GPU at every idle: three sessions (four, the
+/// second with blur, when the Maxine SDK is set up), each idle leaving the daemon
+/// with no GPU device, D-Bus answering promptly while parked, the next
+/// session's frames flowing again, and SIGTERM while parked exiting at
+/// once.
+#[test]
+#[ignore = "needs OBC_TEST_SINK (a free v4l2loopback device with exclusive_caps=1), OBC_TEST_CAMERA, an NVIDIA GPU with a driver that has the CUDA checkpoint API, /usr/bin/dbus-daemon and cargo; with the Maxine SDK and OBC_TEST_PRELOAD it adds a blur session"]
+fn the_daemon_parks_the_gpu_when_idle() {
+    let sink = PathBuf::from(
+        std::env::var("OBC_TEST_SINK")
+            .unwrap_or_else(|_| panic!("this test needs OBC_TEST_SINK. {IGNORE_PARK}")),
+    );
+    let sink = std::fs::canonicalize(&sink).unwrap_or(sink);
+    let cam = resolve_camera("OBC_TEST_CAMERA");
+    for node in [&sink, &cam.node] {
+        let n = count_holders(Path::new("/proc"), &NodeId::of(node), std::process::id());
+        assert_eq!(
+            n,
+            0,
+            "{} is held by another process (see `fuser -v {}`): not touching it",
+            node.display(),
+            node.display()
+        );
+    }
+    let maxine = std::env::var_os("OBC_TEST_PRELOAD").is_some()
+        && obc_pipeline::effect_backend_available().is_ok();
+    if !maxine {
+        eprintln!("no Maxine SDK or OBC_TEST_PRELOAD: no blur session");
+    }
+    let consumer_bin = consumer_binary();
+    let dir = tempfile::tempdir().unwrap();
+    let bus = PrivateBus::start(dir.path());
+    let env = DaemonEnv::new(dir.path(), &bus);
+    std::fs::write(
+        env.config_file(),
+        format!(
+            "version = 1\n[camera]\npreference = [{:?}]\n[loopback]\ndevice = {:?}\n\
+             [lifecycle]\nidle_grace_s = 1.0\nstart_debounce_ms = 300\n\
+             [effect]\non_failure = \"black\"\n",
+            cam.selector,
+            sink.display().to_string()
+        ),
+    )
+    .unwrap();
+    let (mut daemon, log) = spawn_daemon_logged(&env);
+    let pid = daemon.pid();
+    let client = Client::connect(&env);
+    client.wait_for_daemon(Duration::from_secs(15));
+    assert_eq!(client.state(), State::Idle, "error: {}", client.error());
+    assert!(!holds_nvidia(pid), "a GPU device before any session");
+
+    // With the SDK, a blur session starts from a parked idle (its probe
+    // runs while parked) and the next one restarts after it.
+    let effects: &[&str] = if maxine {
+        &["none", "blur", "none", "none"]
+    } else {
+        &["none", "none", "none"]
+    };
+    let mut firsts = Vec::new();
+    for (i, effect) in effects.iter().copied().enumerate() {
+        let what = format!("session {} ({effect})", i + 1);
+        let ready_before = log_count(&log, "effect blur ready");
+        // Idle: fresh, then parked. Every query answers at once.
+        for (q, took) in [
+            ("State", {
+                let t = Instant::now();
+                assert_eq!(client.state(), State::Idle);
+                t.elapsed()
+            }),
+            ("Cameras", {
+                let t = Instant::now();
+                assert!(!client.cameras().is_empty());
+                t.elapsed()
+            }),
+            ("SetEffect", {
+                let t = Instant::now();
+                client.set_effect(effect).unwrap();
+                t.elapsed()
+            }),
+            ("Effect", {
+                let t = Instant::now();
+                assert_eq!(client.effect(), effect);
+                t.elapsed()
+            }),
+        ] {
+            assert!(
+                took < Duration::from_millis(500),
+                "{what}: {q} took {took:?} while idle"
+            );
+        }
+        let t = Instant::now();
+        let consumer = Consumer::spawn(&consumer_bin, &sink);
+        assert!(
+            client
+                .wait_state(State::Active, Duration::from_secs(20))
+                .is_some(),
+            "{what}: not active: {} ({})",
+            client.state(),
+            client.error()
+        );
+        assert!(
+            consumer.wait_more(true, 30, Duration::from_secs(10)),
+            "{what}: no frames through the session: {:?}",
+            consumer.runs()
+        );
+        let first = first_stamped_since(&consumer, t).unwrap() - t;
+        firsts.push(ms(first));
+        if effect == "blur" {
+            assert!(
+                wait(Duration::from_secs(30), || log_count(
+                    &log,
+                    "effect blur ready"
+                ) > ready_before
+                    || client.state() != State::Active),
+                "{what}: never ready ({}; {})",
+                client.state(),
+                client.error()
+            );
+            assert_eq!(client.state(), State::Active, "{what}: {}", client.error());
+            assert!(consumer.wait_more(true, 30, Duration::from_secs(10)));
+        }
+        eprintln!(
+            "{what}: consumer open to first session frame {:.0} ms",
+            ms(first)
+        );
+        assert_eq!(
+            log_count(&log, "GPU unparked in"),
+            i,
+            "{what}: one unpark per start from a parked idle"
+        );
+        assert!(holds_nvidia(pid), "{what}: streaming without the GPU?");
+        consumer.close();
+        assert!(
+            client
+                .wait_state(State::Idle, Duration::from_secs(15))
+                .is_some(),
+            "{what}: not idle: {}",
+            client.state()
+        );
+        assert!(
+            wait(Duration::from_secs(10), || log_count(&log, "GPU parked in")
+                > i),
+            "{what}: not parked; daemon log: {:?}",
+            log.lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .take(10)
+                .collect::<Vec<_>>()
+        );
+        assert_parked_process(pid, &what);
+        assert!(!holds(pid, &cam.node), "{what}: the camera stays open");
+    }
+    let times = |needle: &str| -> Vec<u64> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|l| l.split_once(needle))
+            .filter_map(|(_, r)| r.split(' ').next()?.parse().ok())
+            .collect()
+    };
+    eprintln!(
+        "park {:?} ms, unpark {:?} ms, consumer open to first frame {firsts:.0?} ms (the first \
+         includes CUDA's initialisation)",
+        times("GPU parked in "),
+        times("GPU unparked in ")
+    );
+    assert_eq!(log_count(&log, "cannot park"), 0);
+    assert_eq!(log_count(&log, "cannot be parked"), 0);
+    // No CUDA call reached obc_gpu while parked (it would have been refused).
+    assert_eq!(log_count(&log, "refused while the GPU was parked"), 0);
+    // SIGTERM while parked.
+    let t = Instant::now();
+    daemon.signal(libc::SIGTERM);
+    let code = daemon.wait_exit(Duration::from_secs(10));
+    let took = t.elapsed();
+    eprintln!("SIGTERM while parked: exit {code:?} after {took:?}");
+    assert_eq!(code, Some(0), "the daemon exits 0 on SIGTERM while parked");
+    assert!(took < Duration::from_secs(3), "{took:?}");
+}

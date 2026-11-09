@@ -49,8 +49,11 @@
 //!
 //! **No CUDA.** The writer builds no CUDA element and never loads the
 //! `nvcodec` plugin: a daemon with only the writer running holds no CUDA
-//! context (ADR-0006). A forwarded buffer may be backed by CUDA memory
-//! (`cudadownload` output); `v4l2sink` maps it like any other.
+//! context (ADR-0006). A forwarded buffer (`cudadownload` output) is
+//! system memory from a `GstVideoBufferPool` (observed with GStreamer
+//! 1.28.8), not CUDA or pinned host memory: `v4l2sink` maps it like any
+//! other, and releasing it makes no CUDA call, so the writer and its tap
+//! may keep one while the daemon's GPU is parked.
 //!
 //! **Loopback check.** [`LoopbackWriter::start`] runs the same check as the
 //! output ([`MediaPipeline::prepare`]) before going to PLAYING:

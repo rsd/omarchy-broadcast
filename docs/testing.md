@@ -114,6 +114,7 @@ cargo test -p obc-ipc -p oma-broadcastd -p oma-broadcast
 
 **`oma-broadcastd`** (`crates/oma-broadcastd`):
 - The controller state machine runs against a fake media backend with explicit instants, so no test sleeps for a timer. It covers every transition of [ADR-0011](adr/0011-daemon-lifecycle-and-dbus-api.md): the debounce (a 100 ms open never starts the camera), the grace period (a consumer returning inside it keeps the session), `off` keeping the writer, persistence of `Enabled` and the selection across a restart, `SelectCamera` / `NextCamera` while idle and while streaming, the `NoSuchCamera` / `Unavailable` / `Failed` errors, fallback to the next camera, `error` and recovery, no pre-emption of a working stream, an invalid reload, an invalid config at start, deferral of an output-mode change while a consumer holds the device, a missing loopback retried every 2 s, a failing writer, the 10 s start timeout, every camera failing (the session stops rather than cycling), a damaged state file (daemon `off`, file untouched), `SetEnabled(false)` during a start, and `Stats` only while `active`.
+- Parking ([ADR-0017](adr/0017-cuda-checkpoint-parking.md); see [Parking the GPU at Idle](#parking-the-gpu-at-idle)): unit tests of the `Parker` state machine through a test ops seam and of its ordering through a `StopSession` seam, and controller tests through the fake backend, which drives the real `Parker`.
 - Consumer counting uses `sleep` children that hold a temporary file open: the daemon's own descriptor is excluded, counts rise and fall, inotify events trigger recounts, and the polling fallback works. Also covered: the inotify wrapper, hotplug debouncing, camera ids, ordering and selectors.
 - The D-Bus object is served over a peer-to-peer socket pair and driven through `obc_ipc::OmaBroadcastProxy`: every property (including `GetAll` and the introspection data), every method and error name, the `PropertiesChanged` sequence, `Stats` while active and none for 2.5 s while idle.
 - Process tests (`tests/process.rs`) run the binary on a private `dbus-daemon` (`/usr/bin/dbus-daemon` is required; without it the tests fail naming it): a second instance exits with status 3 before touching a device, no session bus gives status 1, `--help` and an unknown option behave.
@@ -278,7 +279,7 @@ OBC_TEST_CAMERA=046d:0944 OBC_TEST_SINK=/dev/video11 \
 ```
 
 - `obc-backend-maxine` (5 tests in `tests/hardware.rs`): the backend refuses calls without the CUDA context or a load; blur and replace in a context created like GStreamer's, with per-stage GPU times, load times and GPU memory logged. The SDK works in the pushed context: afterwards the device's primary context is inactive. The mask hardening has three more (see [The hardened mask](#the-hardened-mask)).
-- `gst-obc` (7 tests) and `obc-gpu` (3 tests): the element against the real backend, and the driver helpers and the mask kernel. `gst-obc` has `obc-backend-maxine` as a dev-dependency for `maxine_mask_kernel_failures_show_black_with_the_reason`, which needs the Maxine environment above.
+- `gst-obc` (7 tests) and `obc-gpu` (3 tests, plus the four `checkpoint_` tests of [Parking the GPU at Idle](#parking-the-gpu-at-idle)): the element against the real backend, and the driver helpers and the mask kernel. `gst-obc` has `obc-backend-maxine` as a dev-dependency for `maxine_mask_kernel_failures_show_black_with_the_reason`, which needs the Maxine environment above.
 - `maxine_effects_end_to_end_keep_the_rate_and_release_the_gpu` (`obc-pipeline`): camera, session and output with `blur`, then `replace`, then `none`; each phase keeps the contract rate at the sink, the effect becomes ready, its statistics are sane, and after the output stops the process holds no CUDA context.
 
 The frames in these tests are synthetic, so the mask the model produces for them is not predictable; the tests assert what holds for any mask and log the rest.
@@ -317,6 +318,33 @@ OBC_MASK_FRAMES=/path/to/frames \
 ```
 
 `the_hardened_mask_hides_the_room_on_recorded_camera_frames` fails if `OBC_MASK_FRAMES` is unset. The directory holds one subdirectory per camera sequence, each with consecutive packed NV12 1920x1080 frames named `*.nv12` (limited-range BT.601, a person in frame, about 40 frames); the module documentation of the test has the layout and a `gst-launch-1.0` recording command. The frames are local and are never committed. Each sequence is replayed through `replace` on a solid background, and on every frame the test checks that the hardened mask is the table applied to the raw one, that no pixel the model rates below 128 shows anything but the background, and that the partly mixed edge band is at most half as wide in pixels as with the raw mask, in the mask and in the output. It also checks that the frames are able to tell the two masks apart (some background-side pixels would have shown the room with the raw mask), and logs the edge flicker for reference.
+
+### Parking the GPU at Idle
+
+[ADR-0017](adr/0017-cuda-checkpoint-parking.md). The default suite needs no GPU.
+
+- **`obc-gpu`** (`src/checkpoint.rs`): a missing library and a driver without the symbols make parking unsupported; the lock arguments' struct layout, the timeout clamp, the mapping of process states, the guard that refuses while parked and counts refusals, and the call sequences against a fake driver (park then unpark in order, a lock timeout leaves the process running, a failed checkpoint unlocks again, a failed unlock stays parked until the next unpark, a failed restore can be retried, an unsupported call fails that park only, unpark follows the driver's state).
+- **`oma-broadcastd`**: `backend/park.rs` tests the `Parker` (logging with durations, a failed park, an unsupported driver said once, a failed unpark, a failed start parks again, the unlock after a blocked park, refusals warned once per park, stop ordering, a session that did not stop cleanly is not parked). The controller tests (`controller/tests.rs`, fake backend with the real `Parker`) cover: Active to Idle parks; a restart unparks before the build; an unpark failure gives `error` with no session and the writer kept; a retry works once the failure clears; `off` after an activation stays parked; a park failure keeps working; a failed first start parks nothing.
+
+Ignored hardware tests, all needing an NVIDIA GPU with a driver that has the CUDA checkpoint API:
+
+```sh
+# obc-gpu: never initialised means nothing to park; a live context's data survives 3 cycles;
+# an externally checkpointed process is restored; a parked process exits promptly
+cargo test -p obc-gpu --test hardware -- --ignored --test-threads=1 checkpoint_
+
+# daemon backend, no camera: videotestsrc, a loopback and 3 cycles
+OBC_TEST_SINK=/dev/video11 \
+  cargo test -p oma-broadcastd --test hardware -- --ignored --test-threads=1 --nocapture \
+  the_backend_parks_the_gpu_between_sessions_without_a_camera
+
+# the daemon: needs a camera and a free loopback
+OBC_TEST_SINK=/dev/video11 OBC_TEST_CAMERA=046d:0944 \
+  cargo test -p oma-broadcastd --test hardware -- --ignored --test-threads=1 --nocapture \
+  the_daemon_parks_the_gpu_when_idle
+```
+
+`the_daemon_parks_the_gpu_when_idle` runs three sessions (four with a blur session when the Maxine environment of the effects test below is set). After each park it checks 0 `/dev/nvidia*` fds and no mappings, D-Bus queries answered promptly while parked, fresh frames after each unpark, and a prompt `SIGTERM` while parked. The `obc-gpu` tests run the checkpoint body in a child process, since CUDA's state is the whole process's. The check that the GPU is missing from `/proc/driver/nvidia-uvm/gpus/` is system-wide, so it is skipped when another process holds `/dev/nvidia-uvm`.
 
 ### Daemon effects test (ignored)
 
