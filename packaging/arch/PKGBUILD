@@ -22,6 +22,12 @@
 # sets [pipewire] enabled = true in config.toml (docs/config.example.toml);
 # without it, or without a running PipeWire, the loopback works alone.
 #
+# The package also ships the optional noise-removed microphone (the PipeWire
+# configurations and a template user unit), not enabled; see
+# docs/setup/microphone.md. After installing a plugin package (optional
+# dependencies), enable it with
+#   systemctl --user enable --now oma-broadcast-mic@rnnoise.service
+#
 # The NVIDIA Maxine Video Effects SDK (background blur and replace) is
 # licensed separately by NVIDIA and is never part of this package: each user
 # downloads and installs it as described in docs/setup/maxine.md. Without it
@@ -35,7 +41,7 @@
 
 pkgname=oma-broadcast-git
 _pkgname=oma-broadcast
-pkgver=0.11.0
+pkgver=0.12.0
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API, a CLI and an Omarchy bar widget'
 arch=('x86_64')
@@ -67,7 +73,9 @@ checkdepends=(
 optdepends=(
   'omarchy: the Omarchy shell (Quickshell) for the bar widget'
   'v4l2loopback-utils: runtime-only loopback setup without modprobe.d'
-  'pipewire: the optional PipeWire camera node ([pipewire] enabled in config.toml)'
+  'pipewire: the optional PipeWire camera node ([pipewire] enabled in config.toml) and the optional noise-removed microphone'
+  'noise-suppression-for-voice: RNNoise engine for the noise-removed microphone (default)'
+  'deepfilternet-ladspa: DeepFilterNet engine for the noise-removed microphone'
 )
 # No LTO: with makepkg's -flto, libspa's build script compiles its C wrapper
 # into GCC LTO bitcode, which rust-lld cannot link (undefined libspa_rs_*).
@@ -167,6 +175,21 @@ package() {
   grep -qx 'Environment=LD_PRELOAD=/usr/lib/oma-broadcast/os-release-shim.so' "$maxine_conf" &&
     grep -qx 'Environment=OMA_BROADCAST_OS_RELEASE=/usr/lib/oma-broadcast/fake-os-release' "$maxine_conf" ||
     { echo 'maxine.conf: the /usr/lib/oma-broadcast rewrite did not take' >&2; return 1; }
+
+  # The optional noise-removed microphone: the filter-chain configurations
+  # and the template unit, inactive (docs/setup/microphone.md). The packaged
+  # configurations are not on PipeWire's config search path, so the packaged
+  # unit names them by absolute path: only its ExecStart= line is rewritten
+  # from the repository's, which looks them up by name.
+  install -Dm644 -t "$pkgdir/usr/share/$_pkgname/pipewire" \
+    dist/pipewire/oma-broadcast-mic-*.conf
+  local mic_unit="$pkgdir/usr/lib/systemd/user/oma-broadcast-mic@.service"
+  install -d "${mic_unit%/*}"
+  sed 's|^ExecStart=/usr/bin/pipewire -c oma-broadcast-mic-%i\.conf$|ExecStart=/usr/bin/pipewire -c /usr/share/oma-broadcast/pipewire/oma-broadcast-mic-%i.conf|' \
+    dist/systemd/oma-broadcast-mic@.service >"$mic_unit"
+  chmod 644 "$mic_unit"
+  grep -qx 'ExecStart=/usr/bin/pipewire -c /usr/share/oma-broadcast/pipewire/oma-broadcast-mic-%i.conf' "$mic_unit" ||
+    { echo 'oma-broadcast-mic@.service: the ExecStart rewrite did not take' >&2; return 1; }
 
   # Omarchy bar widget, without its development tests.
   local plugin=clients/omarchy-bar/br.com.dias.oma-broadcast

@@ -1,6 +1,6 @@
 # ADR-0014: Microphone noise removal through a PipeWire filter-chain; Maxine Audio Effects deferred
 
-- **Status:** Proposed. Becomes Accepted after the live listening and CPU test. Adds no setting, configuration key or D-Bus member, and no Rust code.
+- **Status:** Accepted (2026-11-09). Adds no setting, configuration key or D-Bus member, and no Rust code.
 
 ## Context
 - The project offers camera effects ([ADR-0012](0012-video-effects-and-maxine-backend.md)); users also want a cleaner microphone.
@@ -16,7 +16,14 @@
 - Each runs as a dedicated `pipewire -c oma-broadcast-mic-<engine>.conf` process, started by the template user unit `oma-broadcast-mic@<engine>.service` (`dist/systemd/`).
 - The capture side is passive and follows the default source; it can be pinned with `target.object`. The source is mono at 48 kHz.
 - Independent of `oma-broadcastd`. No Rust code.
+- Packaging: the Arch package ships both configurations and the template unit, and lists each plugin package as an optional dependency. Nothing is enabled; the user enables an instance. `scripts/install-user.sh --mic` installs the same files per user.
 - User documentation: [../setup/microphone.md](../setup/microphone.md).
+
+### Default engine
+- RNNoise is the documented default; DeepFilterNet remains a supported choice.
+- Both engines passed a listening test and were found acceptable.
+- The reason is cost, which matters on a laptop battery: RNNoise about 2.4 % of one core and 14 MB resident, DeepFilterNet about 21.5 % of one core and 155 MB (Intel Core Ultra 9 275HX).
+- The trade-off: RNNoise's voice-activity gate mutes sound it does not classify as voice (ambience, music, keyboard between words) to silence, while DeepFilterNet is a neural model that removes noise from inside speech and lowers the noise floor instead. DeepFilterNet is the choice for higher quality, for noise under speech, or to keep non-speech sound such as an instrument, when the CPU is available.
 
 ### How it runs, and the rejected run modes
 - **A `pipewire.conf.d` drop-in:** rejected. The plugin would run inside the PipeWire server, so a plugin crash or overrun would hit every stream, and enabling, disabling or changing the filter would need a PipeWire restart that drops every stream.
@@ -44,8 +51,8 @@ Revisit only after a local trial shows that AFX loads on the target GPU and is a
 ## Consequences
 - An optional runtime dependency on one plugin package per engine (`deepfilternet-ladspa` or `noise-suppression-for-voice`). Without the plugin the unit fails visibly: the filter module has no `nofail` flag.
 - Each engine adds latency. The upstream figures are 10 ms frames for RNNoise and at least 20 ms of algorithmic latency for DeepFilterNet; the whole chain has not been measured.
-- CPU, measured on an Intel Core Ultra 9 275HX with PipeWire 1.6.9 over 30 s of continuous recording: DeepFilterNet about 20 % of one core (about 155 MB resident once the model has loaded), RNNoise about 2.5 % (about 14 MB). With no recorder connected, both are effectively idle and the hardware microphone stays suspended. Both run under the unit's hardening (including `MemoryDenyWriteExecute=yes`) without errors.
-- No PKGBUILD change yet. Packaging follows the live listening and CPU test. Until then users copy the files from a source checkout; the setup page ships in the package documentation and says so.
+- CPU, measured on an Intel Core Ultra 9 275HX with PipeWire 1.6.9 over 30 s of continuous recording: DeepFilterNet about 21.5 % of one core (about 155 MB resident once the model has loaded), RNNoise about 2.4 % (about 14 MB). With no recorder connected, both are effectively idle and the hardware microphone stays suspended. Both run under the unit's hardening (including `MemoryDenyWriteExecute=yes`) without errors.
+- The Arch package installs the configurations to `/usr/share/oma-broadcast/pipewire/` and the unit to `/usr/lib/systemd/user/`, with `noise-suppression-for-voice` and `deepfilternet-ladspa` as optional dependencies. Those directories are not on PipeWire's configuration search path, so the packaged unit names the configuration by absolute path; the repository's unit looks it up by name. Nothing is enabled by the package.
 - The source can be made the default input safely: filter-chain puts its capture and playback nodes in one `node.link-group` and WirePlumber 0.5 never links nodes of one group, so the capture side does not loop back onto its own output.
 
 ### Later integration with the daemon
@@ -54,5 +61,5 @@ Revisit only after a local trial shows that AFX loads on the target GPU and is a
 - If one is needed later, for example for a GPU engine, the consumer signal is the PipeWire link state of the `oma-broadcast-mic` node, filtering out level-meter monitor streams.
 
 ## What would change this decision
-- The live test showing neither engine is good enough or either costs too much CPU: reconsider the engines, not the run mode.
+- A later finding that an engine is not good enough or costs too much CPU: reconsider the engines, not the run mode.
 - A local AFX trial that loads on the target GPU and is audibly better than DeepFilterNet: reopen the deferral.

@@ -2,31 +2,54 @@
 
 "Omarchy Broadcast Mic" is an optional virtual microphone: the default microphone with background noise removed. It is a PipeWire `filter-chain` that hosts a LADSPA noise-suppression plugin and exposes the result as a new audio source that any application can select. It runs on the CPU only; it needs no GPU and no NVIDIA SDK. It is independent of `oma-broadcastd` and of the virtual camera: neither needs the other. The reasoning is in [ADR-0014](../adr/0014-mic-noise-removal-filter-chain.md).
 
-Two engines are available, each with its own configuration file: DeepFilterNet and RNNoise. Each runs as its own process, started by one instance of the systemd user unit `oma-broadcast-mic@.service`. Both create a source with the same name, so run one at a time.
+Two engines are available, each with its own configuration file: RNNoise (the default, light on CPU) and DeepFilterNet (higher quality, more CPU); see [Choosing the engine](#choosing-the-engine). Each runs as its own process, started by one instance of the systemd user unit `oma-broadcast-mic@.service`. Both create a source with the same name, so run one at a time.
 
-The configuration files and the unit are in the repository's `dist/` directory (`dist/pipewire/` and `dist/systemd/`). The Arch package does not install them yet; copy them from a source checkout, as below. Run the commands from the repository root.
+The configuration files and the unit are in the repository's `dist/` directory (`dist/pipewire/` and `dist/systemd/`). There are three ways to install them; each installs both engines' configurations and the unit, and none enables anything.
 
 ## Requirements
 
 - PipeWire with WirePlumber 0.5 (the default on Omarchy).
 - A systemd user session.
-- At least one LADSPA plugin package:
+- At least one LADSPA plugin package. The Arch package lists both as optional dependencies.
 
 ```sh
+sudo pacman -S noise-suppression-for-voice   # RNNoise engine (default)
 sudo pacman -S deepfilternet-ladspa          # DeepFilterNet engine
-sudo pacman -S noise-suppression-for-voice   # RNNoise engine
 ```
 
-`deepfilternet-ladspa` installs `/usr/lib/ladspa/libdeep_filter_ladspa.so`; `noise-suppression-for-voice` installs `/usr/lib/ladspa/librnnoise_ladspa.so`. The configurations were written against `deepfilternet-ladspa` 0.5.6 and `noise-suppression-for-voice` 1.21.
+`noise-suppression-for-voice` installs `/usr/lib/ladspa/librnnoise_ladspa.so`; `deepfilternet-ladspa` installs `/usr/lib/ladspa/libdeep_filter_ladspa.so`. The configurations were written against `noise-suppression-for-voice` 1.21 and `deepfilternet-ladspa` 0.5.6.
 
 ## Install
 
-Keep the file names: the unit looks the configuration up by name. PipeWire searches `~/.config/pipewire`, `/etc/pipewire` and `/usr/share/pipewire`.
+Choose one of the three routes.
+
+### From the Arch package
+
+The package installs the configurations as `/usr/share/oma-broadcast/pipewire/oma-broadcast-mic-rnnoise.conf` and `oma-broadcast-mic-deepfilter.conf`, and the unit as `/usr/lib/systemd/user/oma-broadcast-mic@.service`. Those directories are not on PipeWire's configuration search path, so the packaged unit names the configuration by absolute path:
+
+```
+ExecStart=/usr/bin/pipewire -c /usr/share/oma-broadcast/pipewire/oma-broadcast-mic-%i.conf
+```
+
+The package enables nothing. Install the plugin package (above), then follow [Enable](#enable).
+
+### With `scripts/install-user.sh --mic`
+
+From the repository root, `scripts/install-user.sh --mic` (see [daemon.md](daemon.md#per-user-install-from-a-checkout)) also installs, without root:
+
+- the configurations in `${XDG_DATA_HOME:-~/.local/share}/oma-broadcast/pipewire/`;
+- the unit as `${XDG_DATA_HOME:-~/.local/share}/systemd/user/oma-broadcast-mic@.service`, with `ExecStart=` pointing at that absolute configuration path.
+
+It enables nothing. `scripts/install-user.sh --uninstall` removes these files; it refuses while an instance is enabled, so disable it first (see [Undo](#undo)).
+
+### Manually, from a checkout
+
+Keep the file names: the unit looks the configuration up by name. PipeWire searches `~/.config/pipewire`, `/etc/pipewire` and `/usr/share/pipewire`. Run the commands from the repository root.
 
 ```sh
 # the engine or engines you want:
-install -Dm644 dist/pipewire/oma-broadcast-mic-deepfilter.conf ~/.config/pipewire/oma-broadcast-mic-deepfilter.conf
 install -Dm644 dist/pipewire/oma-broadcast-mic-rnnoise.conf    ~/.config/pipewire/oma-broadcast-mic-rnnoise.conf
+install -Dm644 dist/pipewire/oma-broadcast-mic-deepfilter.conf ~/.config/pipewire/oma-broadcast-mic-deepfilter.conf
 
 # the unit (once):
 install -Dm644 dist/systemd/oma-broadcast-mic@.service ~/.config/systemd/user/oma-broadcast-mic@.service
@@ -35,13 +58,30 @@ systemctl --user daemon-reload
 
 Installing both configurations side by side is fine; only the running instance matters.
 
+### Which unit wins
+
+systemd uses the first unit it finds: one in `~/.config/systemd/user` shadows one in `~/.local/share/systemd/user`, which shadows one in `/usr/lib/systemd/user`. To tune a packaged configuration, copy it to `~/.config/pipewire` and override `ExecStart` with a drop-in, which makes PipeWire look the file up by name:
+
+```sh
+install -Dm644 /usr/share/oma-broadcast/pipewire/oma-broadcast-mic-rnnoise.conf ~/.config/pipewire/
+systemctl --user edit oma-broadcast-mic@.service
+```
+
+with this content in the editor:
+
+```
+[Service]
+ExecStart=
+ExecStart=/usr/bin/pipewire -c oma-broadcast-mic-%i.conf
+```
+
 ## Enable
 
 ```sh
-systemctl --user enable --now oma-broadcast-mic@deepfilter.service
+systemctl --user enable --now oma-broadcast-mic@rnnoise.service
 ```
 
-Use `oma-broadcast-mic@rnnoise.service` for the RNNoise engine. The unit is bound to `pipewire.service`: it stops with PipeWire and is started again whenever PipeWire starts, so it survives `systemctl --user restart pipewire`.
+Use `oma-broadcast-mic@deepfilter.service` for the DeepFilterNet engine. The unit is bound to `pipewire.service`: it stops with PipeWire and is started again whenever PipeWire starts, so it survives `systemctl --user restart pipewire`.
 
 ## Using it
 
@@ -61,39 +101,37 @@ The source is mono at 48 kHz. A stereo microphone is downmixed.
 
 ## Choosing the engine
 
-| | DeepFilterNet | RNNoise |
-|---|---|---|
-| Strength | Non-stationary noise such as keyboards and voices in the background; less damage to speech | Steady noise such as fans and hiss |
-| Weakness | More CPU | Weaker on keyboards; can clip the onset of words |
-| Latency | Algorithmic latency of at least 20 ms, per the upstream documentation | 10 ms frames |
-| CPU while recording | About 20 % of one core | About 2.5 % of one core |
-| Memory | About 155 MB once a recorder has connected (the model loads then) | About 14 MB |
-| Package | `deepfilternet-ladspa` | `noise-suppression-for-voice` |
+RNNoise is the default: it costs little CPU, which matters on a laptop battery. Its voice-activity gate mutes everything it does not classify as voice (ambience, music, keyboard between words), so a room with no one speaking comes out as silence. Choose DeepFilterNet when you want higher quality, noise removed from under speech, or non-speech sound kept (for example an instrument), and have CPU to spare: it is a neural model that removes noise from inside speech and lowers the noise floor instead of gating. Listening tests found both acceptable.
 
-The CPU and memory figures were measured on an Intel Core Ultra 9 275HX with PipeWire 1.6.9, from the process's own CPU time over 30 s of continuous recording. With nothing recording from the source, both use effectively no CPU. The latency values are from the upstream documentation and were not measured. With the default settings, RNNoise mutes everything it does not classify as voice, so a room with no one speaking comes out as silence; DeepFilterNet lowers the noise floor instead. Try DeepFilterNet first and compare by ear with your own microphone and room.
+| | RNNoise | DeepFilterNet |
+|---|---|---|
+| Strength | Low CPU and memory; steady noise such as fans and hiss | Non-stationary noise such as keyboards and voices in the background; less damage to speech; non-speech sound is kept |
+| Weakness | Mutes non-speech sound (VAD gate); weaker on keyboards; can clip the onset of words | More CPU and memory |
+| Latency | 10 ms frames | Algorithmic latency of at least 20 ms, per the upstream documentation |
+| CPU while recording | About 2.4 % of one core | About 21.5 % of one core |
+| Memory | About 14 MB | About 155 MB once a recorder has connected (the model loads then) |
+| Package | `noise-suppression-for-voice` | `deepfilternet-ladspa` |
+
+The CPU and memory figures were measured on an Intel Core Ultra 9 275HX with PipeWire 1.6.9, from the process's own CPU time over 30 s of continuous recording. With nothing recording from the source, both use effectively no CPU. The latency values are from the upstream documentation and were not measured. Compare by ear with your own microphone and room.
 
 `wpctl status` lists the source under **Filters**, not under Sources, because WirePlumber groups filter-chain nodes there. Applications list it as an ordinary input device named "Omarchy Broadcast Mic".
 
 ## Switching engines
 
 ```sh
-systemctl --user disable --now oma-broadcast-mic@deepfilter.service
-systemctl --user enable --now oma-broadcast-mic@rnnoise.service
+systemctl --user disable --now oma-broadcast-mic@rnnoise.service
+systemctl --user enable --now oma-broadcast-mic@deepfilter.service
 ```
 
 Both engines use the node name `oma-broadcast-mic`, so applications that remember their input by name keep it across the switch.
 
 ## Tuning
 
-Edit the copy in `~/.config/pipewire`, then restart the instance:
+Edit the copy in `~/.config/pipewire` (for a packaged or `--mic` install, see [Which unit wins](#which-unit-wins)), then restart the instance:
 
 ```sh
-systemctl --user restart oma-broadcast-mic@deepfilter.service   # or @rnnoise
+systemctl --user restart oma-broadcast-mic@rnnoise.service   # or @deepfilter
 ```
-
-### DeepFilterNet
-
-`"Attenuation Limit (dB)"` is the maximum noise attenuation, 0 to 100 dB. The shipped value, 100, means no limit (the plugin's default). Lower values leave some of the noise and sound more natural: about 18 to 24 dB for medium reduction, 6 to 12 dB for light reduction. The other plugin controls are listed, commented out, in the file with their ranges and defaults.
 
 ### RNNoise
 
@@ -102,6 +140,10 @@ systemctl --user restart oma-broadcast-mic@deepfilter.service   # or @rnnoise
 - `"Retroactive VAD Grace (ms)"` (0 to 200, shipped 0): opens the output this far back in time so the start of a word gets through, at the cost of that much added latency.
 
 The shipped values are those recommended by the plugin's README.
+
+### DeepFilterNet
+
+`"Attenuation Limit (dB)"` is the maximum noise attenuation, 0 to 100 dB. The shipped value, 100, means no limit (the plugin's default). Lower values leave some of the noise and sound more natural: about 18 to 24 dB for medium reduction, 6 to 12 dB for light reduction. The other plugin controls are listed, commented out, in the file with their ranges and defaults.
 
 ## Pinning one microphone
 
@@ -121,18 +163,31 @@ Restart the instance.
 
 ## Undo
 
+Disable the instances first (both engines):
+
 ```sh
-systemctl --user disable --now oma-broadcast-mic@deepfilter.service oma-broadcast-mic@rnnoise.service
+systemctl --user disable --now oma-broadcast-mic@rnnoise.service oma-broadcast-mic@deepfilter.service
+```
+
+Then remove the files, according to the route:
+
+- Arch package: `sudo pacman -R oma-broadcast-git` removes the daemon too; the microphone files alone are not removable separately. Leaving the instances disabled is enough.
+- `install-user.sh --mic`: `scripts/install-user.sh --uninstall`.
+- Manual install:
+
+```sh
 rm ~/.config/systemd/user/oma-broadcast-mic@.service ~/.config/pipewire/oma-broadcast-mic-*.conf
 systemctl --user daemon-reload
 ```
+
+Remove a drop-in made with `systemctl --user edit` with `systemctl --user revert oma-broadcast-mic@.service`.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | The unit fails to start | Often a missing plugin; see the log | `journalctl --user -u 'oma-broadcast-mic@*'` |
-| The log says a plugin cannot be loaded | The LADSPA package is not installed. The unit fails on purpose: the filter module has no `nofail` flag, so a missing plugin is visible instead of leaving a silent or missing source | Install `deepfilternet-ladspa` or `noise-suppression-for-voice`, then start the unit again |
+| The log says a plugin cannot be loaded | The LADSPA package is not installed. The unit fails on purpose: the filter module has no `nofail` flag, so a missing plugin is visible instead of leaving a silent or missing source | Install `noise-suppression-for-voice` or `deepfilternet-ladspa`, then start the unit again |
 | "Omarchy Broadcast Mic" is not in the application's list | The unit is not running, or the application read its device list before the source existed | `systemctl --user status 'oma-broadcast-mic@*'`; reopen the application's input settings or restart it |
 | The source exists but is silent | No hardware source is available, or the capture side is not linked to one | `wpctl status` to check that a microphone exists and is the default; `pw-link -l` to see whether `oma-broadcast-mic.capture` has an input link. If you pinned `target.object`, check the name |
 | Two "Omarchy Broadcast Mic" entries | Two instances are running (both engines, or a stale process) | Disable one: `systemctl --user disable --now oma-broadcast-mic@<engine>.service` |

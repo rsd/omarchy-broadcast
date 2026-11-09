@@ -11,6 +11,12 @@
 #                                     (from dist/, ExecStart pointing at the installed daemon)
 #   D-Bus activation file          -> ${XDG_DATA_HOME:-~/.local/share}/dbus-1/services/br.com.dias.OmaBroadcast.service
 #   install manifest               -> ${XDG_STATE_HOME:-~/.local/state}/oma-broadcast/install-user.manifest
+# and, with --mic, the noise-removed microphone:
+#   its PipeWire configurations    -> ${XDG_DATA_HOME:-~/.local/share}/oma-broadcast/pipewire/
+#                                     (oma-broadcast-mic-rnnoise.conf and
+#                                     oma-broadcast-mic-deepfilter.conf, from dist/pipewire/)
+#   its systemd user unit template -> ${XDG_DATA_HOME:-~/.local/share}/systemd/user/oma-broadcast-mic@.service
+#                                     (from dist/, ExecStart pointing at the installed configurations)
 #
 # The shim (tools/os-release-shim, an LD_PRELOAD library that makes only the
 # daemon's reads of /etc/os-release return the replacement file) is what the
@@ -24,8 +30,8 @@
 # step, printed at the end.
 #
 # It runs no systemctl command and enables nothing; it prints the next steps.
-# It does not install the WirePlumber drop-in, the Maxine drop-in or the
-# Omarchy bar plugin.
+# It does not install the WirePlumber drop-in, the Maxine drop-in, the
+# Omarchy bar plugin or, without --mic, the microphone.
 #
 # Usage:
 #   scripts/install-user.sh [options]
@@ -39,8 +45,13 @@
 #   --no-shim    Neither build nor install the shim. A shim installed by an
 #                earlier run stays in place and in the manifest, so
 #                --uninstall still removes it.
+#   --mic        Also install the noise-removed microphone (see above). Without
+#                it, microphone files installed by an earlier run stay in
+#                place and in the manifest, so --uninstall still removes them.
 #   --uninstall  Remove what this script installed, and only that, including
-#                ~/.local/lib/oma-broadcast once it is empty.
+#                ~/.local/lib/oma-broadcast and the microphone's
+#                ~/.local/share/oma-broadcast/pipewire and
+#                ~/.local/share/oma-broadcast once they are empty.
 #   -h, --help   Show this help.
 #
 # Ownership: every text file it writes carries a marker comment line, and the
@@ -53,7 +64,7 @@
 # Re-running it over its own install updates that install.
 #
 # Exit status: 0 done; 1 refused (a target path holds a file this script did
-# not install, or the unit is still enabled on --uninstall) or build failed;
+# not install, or a unit is still enabled on --uninstall) or build failed;
 # 2 usage error or unusable environment.
 set -euo pipefail
 
@@ -63,6 +74,8 @@ BINARIES=(oma-broadcastd oma-broadcast)
 SUMMED=("${BINARIES[@]}" os-release-shim.so fake-os-release)
 UNIT_NAME=oma-broadcastd.service
 DBUS_NAME=br.com.dias.OmaBroadcast.service
+MIC_UNIT_NAME=oma-broadcast-mic@.service
+MIC_CONFS=(oma-broadcast-mic-rnnoise.conf oma-broadcast-mic-deepfilter.conf)
 
 usage() {
   sed -n '2,/^set -euo pipefail$/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0"
@@ -78,12 +91,14 @@ warn() { printf 'install-user: warning: %s\n' "$*" >&2; }
 dry_run=0
 build=1
 want_shim=1
+want_mic=0
 mode=install
 while (($#)); do
   case $1 in
     --dry-run) dry_run=1; shift ;;
     --no-build) build=0; shift ;;
     --no-shim) want_shim=0; shift ;;
+    --mic) want_mic=1; shift ;;
     --uninstall) mode=uninstall; shift ;;
     -h | --help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
@@ -128,9 +143,18 @@ shim_built=$shim_out/os-release-shim.so
 fake_src=$repo/tools/maxine-probe/fake-os-release
 shim_dst=$lib_dir/os-release-shim.so
 fake_dst=$lib_dir/fake-os-release
+mic_unit_src=$repo/dist/systemd/$MIC_UNIT_NAME
+mic_unit_dst=$data_dir/systemd/user/$MIC_UNIT_NAME
+mic_conf_dir=$data_dir/oma-broadcast/pipewire
 
 bin_dsts=()
 for b in "${BINARIES[@]}"; do bin_dsts+=("$bin_dir/$b"); done
+# The microphone files this run installs: only with --mic.
+mic_dsts=()
+if ((want_mic)); then
+  mic_dsts=("$mic_unit_dst")
+  for c in "${MIC_CONFS[@]}"; do mic_dsts+=("$mic_conf_dir/$c"); done
+fi
 
 # The bin dir is written into ExecStart, where systemd expands % specifiers,
 # $ variables and quoting; accept only paths that need none of that.
@@ -283,7 +307,11 @@ put_text() {
 # --- uninstall -------------------------------------------------------------
 
 if [[ $mode == uninstall ]]; then
-  targets=("${bin_dsts[@]}" "$unit_dst" "$dbus_dst")
+  # The microphone files are always candidates too, so a lost manifest or a
+  # changed XDG_STATE_HOME does not leave them behind; check_targets still
+  # refuses one without the marker, and a missing one is skipped.
+  targets=("${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "$mic_unit_dst")
+  for c in "${MIC_CONFS[@]}"; do targets+=("$mic_conf_dir/$c"); done
   # Also what an earlier run wrote under other XDG directories.
   if [[ -f $manifest ]]; then
     while IFS= read -r line; do
@@ -297,31 +325,44 @@ if [[ $mode == uninstall ]]; then
 
   # Removing the file of an enabled unit leaves a dangling enable link:
   # disable it first.
-  enabled=0
-  for link in "$config_dir"/systemd/user/*.wants/"$UNIT_NAME"; do
+  # A microphone instance's link (pipewire.service.wants/oma-broadcast-mic@
+  # rnnoise.service) points at the template unit file.
+  enabled=0 mic_links=()
+  for link in "$config_dir"/systemd/user/*.wants/{"$UNIT_NAME",oma-broadcast-mic@*.service}; do
     [[ -L $link ]] || continue
+    unit=$UNIT_NAME
+    [[ ${link##*/} == "$UNIT_NAME" ]] || unit=$MIC_UNIT_NAME
     for path in "${targets[@]}"; do
-      if [[ ${path##*/} == "$UNIT_NAME" && $(readlink -- "$link") == "$path" ]]; then
-        printf 'install-user: %s is still enabled (%s)\n' "$UNIT_NAME" "$link" >&2
-        enabled=1
+      if [[ ${path##*/} == "$unit" && $(readlink -- "$link") == "$path" ]]; then
+        printf 'install-user: %s is still enabled (%s)\n' "${link##*/}" "$link" >&2
+        if [[ $unit == "$UNIT_NAME" ]]; then enabled=1; else mic_links+=("${link##*/}"); fi
       fi
     done
   done
-  if ((enabled)); then
-    printf 'install-user: run this first, then re-run --uninstall:\n  systemctl --user disable --now oma-broadcastd\n' >&2
+  if ((enabled || ${#mic_links[@]})); then
+    printf 'install-user: run this first, then re-run --uninstall:\n' >&2
+    ((!enabled)) || printf '  systemctl --user disable --now oma-broadcastd\n' >&2
+    if ((${#mic_links[@]})); then
+      mapfile -t mic_links < <(printf '%s\n' "${mic_links[@]}" | sort -u)
+      printf '  systemctl --user disable --now' >&2
+      printf ' %q' "${mic_links[@]}" >&2
+      printf '\n' >&2
+    fi
     exit 1
   fi
 
   check_targets "${targets[@]}" "$manifest"
 
-  removed=0
-  lib_dirs=()
+  removed=0 mic_removed=0
+  lib_dirs=() mic_dirs=()
   for path in "${targets[@]}"; do
     [[ -e $path ]] || continue
     run rm -f -- "$path"
     removed=1
     case ${path##*/} in
       os-release-shim.so | fake-os-release) lib_dirs+=("${path%/*}") ;;
+      "$MIC_UNIT_NAME") mic_removed=1 ;;
+      oma-broadcast-mic-*.conf) mic_removed=1 mic_dirs+=("${path%/*}") ;;
     esac
   done
   # The library directory goes once it is empty (rmdir only removes an empty one).
@@ -331,6 +372,14 @@ if [[ $mode == uninstall ]]; then
         run rmdir --ignore-fail-on-non-empty -- "$path"
       fi
     done < <(printf '%s\n' "${lib_dirs[@]}" | sort -u)
+  fi
+  # So do the microphone's oma-broadcast/pipewire and oma-broadcast.
+  if ((${#mic_dirs[@]})); then
+    while IFS= read -r path; do
+      if [[ $path == */oma-broadcast/pipewire ]]; then
+        run rmdir --ignore-fail-on-non-empty -- "$path" "${path%/*}"
+      fi
+    done < <(printf '%s\n' "${mic_dirs[@]}" | sort -u)
   fi
   if [[ -e $manifest ]]; then
     run rm -f -- "$manifest"
@@ -359,6 +408,15 @@ too, since it now points at removed files:
   systemctl --user daemon-reload
 EOF
   fi
+  if ((mic_removed)); then
+    cat <<EOF
+
+The noise-removed microphone is gone; stop any instance still running and
+reload:
+  systemctl --user stop 'oma-broadcast-mic@*.service'
+  systemctl --user daemon-reload
+EOF
+  fi
   exit 0
 fi
 
@@ -375,6 +433,24 @@ n=$(grep -c -- "$exec_re" "$unit_src" || true)
   printf 'install-user: expected exactly one line matching %s in %s, found %s\n' "$exec_re" "$unit_src" "$n" >&2
   exit 2
 }
+
+# The microphone unit's ExecStart names its configuration by file name, which
+# PipeWire does not look up under XDG_DATA_HOME: it is rewritten to the
+# installed path, so the data dir must need no escaping there either.
+mic_exec_re='^ExecStart=/usr/bin/pipewire -c oma-broadcast-mic-%i\.conf$'
+if ((want_mic)); then
+  [[ -f $mic_unit_src ]] || die "missing $mic_unit_src"
+  for c in "${MIC_CONFS[@]}"; do
+    [[ -f $repo/dist/pipewire/$c ]] || die "missing $repo/dist/pipewire/$c"
+  done
+  n=$(grep -c -- "$mic_exec_re" "$mic_unit_src" || true)
+  ((n == 1)) || {
+    printf 'install-user: expected exactly one line matching %s in %s, found %s\n' "$mic_exec_re" "$mic_unit_src" "$n" >&2
+    exit 2
+  }
+  [[ $data_dir =~ ^/[A-Za-z0-9._/@+-]*$ ]] ||
+    die "data dir '$data_dir' contains characters that would need escaping in ExecStart; set XDG_DATA_HOME to a plain path"
+fi
 
 # Whether to install the shim: wanted, and either buildable here (make and a
 # C compiler) or, with --no-build, already built.
@@ -405,7 +481,8 @@ fi
 # Previously installed paths that still exist stay in the manifest, so
 # --uninstall finds them even if the XDG directories changed since. The
 # current targets are left out here and listed afresh below. The shim files
-# stay listed when this run does not install them (--no-shim, or skipped).
+# stay listed when this run does not install them (--no-shim, or skipped),
+# and so do the microphone files (no --mic).
 kept=()
 if [[ -f $manifest ]]; then
   while IFS= read -r line; do
@@ -416,13 +493,14 @@ if [[ -f $manifest ]]; then
     esac
     for dst in "${bin_dsts[@]}"; do [[ $path == "$dst" ]] && continue 2; done
     if ((do_shim)) && [[ $path == "$shim_dst" || $path == "$fake_dst" ]]; then continue; fi
+    for dst in "${mic_dsts[@]}"; do [[ $path == "$dst" ]] && continue 2; done
     kept+=("$line")
   done <"$manifest"
 fi
 
 shim_dsts=()
 if ((do_shim)); then shim_dsts=("$shim_dst" "$fake_dst"); fi
-check_targets "${bin_dsts[@]}" "${shim_dsts[@]}" "$unit_dst" "$dbus_dst" "$manifest"
+check_targets "${bin_dsts[@]}" "${shim_dsts[@]}" "$unit_dst" "$dbus_dst" "${mic_dsts[@]}" "$manifest"
 
 if ((build)); then
   run cargo build --manifest-path "$repo/Cargo.toml" --release --locked -p oma-broadcastd -p oma-broadcast || {
@@ -449,7 +527,7 @@ fi
 manifest_text() {
   echo "$MARKER"
   echo "# Paths written by install-user.sh, one per line; a binary as \"<sha256>  <path>\"."
-  printf '%s\n' "${kept[@]}" "$@" "$unit_dst" "$dbus_dst" | sort -u
+  printf '%s\n' "${kept[@]}" "$@" "$unit_dst" "$dbus_dst" "${mic_dsts[@]}" | sort -u
 }
 
 # What to install with a checksum in the manifest: source, destination, mode.
@@ -500,8 +578,26 @@ dbus_text() {
 }
 put_text "$dbus_dst" dbus_text
 
+if ((want_mic)); then
+  mic_conf_text() {
+    echo "$MARKER"
+    echo "# Generated from dist/pipewire/$1"
+    cat "$repo/dist/pipewire/$1"
+  }
+  for c in "${MIC_CONFS[@]}"; do put_text "$mic_conf_dir/$c" mic_conf_text "$c"; done
+  mic_unit_text() {
+    echo "$MARKER"
+    echo "# Generated from dist/systemd/$MIC_UNIT_NAME; ExecStart points at the installed configuration."
+    sed "s|$mic_exec_re|ExecStart=/usr/bin/pipewire -c $mic_conf_dir/oma-broadcast-mic-%i.conf|" "$mic_unit_src"
+  }
+  put_text "$mic_unit_dst" mic_unit_text
+fi
+
 if [[ -e $config_dir/systemd/user/$UNIT_NAME ]]; then
   warn "$config_dir/systemd/user/$UNIT_NAME exists and takes precedence over $unit_dst, which it shadows; to use the new unit: systemctl --user disable oma-broadcastd, then remove that file"
+fi
+if ((want_mic)) && [[ -e $config_dir/systemd/user/$MIC_UNIT_NAME ]]; then
+  warn "$config_dir/systemd/user/$MIC_UNIT_NAME exists and takes precedence over $mic_unit_dst, which it shadows; to use the new unit: systemctl --user disable oma-broadcast-mic@rnnoise.service oma-broadcast-mic@deepfilter.service, then remove that file"
 fi
 case ":${PATH:-}:" in
   *":$bin_dir:"*) ;;
@@ -539,5 +635,17 @@ docs/setup/maxine.md, then activate the shim for the daemon only:
   install -Dm644 $(printf '%q' "$maxine_src") $(printf '%q' "$config_dir/systemd/user/oma-broadcastd.service.d/maxine.conf")
   systemctl --user daemon-reload
   systemctl --user restart oma-broadcastd
+EOF
+fi
+if ((want_mic)); then
+  cat <<EOF
+
+Optional, the noise-removed microphone (see docs/setup/microphone.md); run
+one instance at a time:
+  systemctl --user daemon-reload
+  systemctl --user enable --now oma-broadcast-mic@rnnoise.service
+    (RNNoise, the default; needs the package noise-suppression-for-voice)
+  or, with DeepFilterNet (needs the package deepfilternet-ladspa):
+  systemctl --user enable --now oma-broadcast-mic@deepfilter.service
 EOF
 fi
