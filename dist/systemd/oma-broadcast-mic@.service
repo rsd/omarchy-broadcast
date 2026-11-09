@@ -1,0 +1,62 @@
+# Omarchy Broadcast Mic as a systemd user service: runs one noise-removal
+# filter-chain as a dedicated PipeWire client process,
+# `pipewire -c oma-broadcast-mic-<instance>.conf`. Independent of
+# oma-broadcastd; neither unit needs the other.
+#
+# Instances and their configuration files (in dist/pipewire/):
+#   oma-broadcast-mic@deepfilter.service  oma-broadcast-mic-deepfilter.conf
+#   oma-broadcast-mic@rnnoise.service     oma-broadcast-mic-rnnoise.conf
+# PipeWire looks the file up in ~/.config/pipewire, /etc/pipewire and
+# /usr/share/pipewire.
+#
+# Install:
+#   install -Dm644 dist/pipewire/oma-broadcast-mic-deepfilter.conf \
+#       ~/.config/pipewire/oma-broadcast-mic-deepfilter.conf
+#   install -Dm644 dist/systemd/oma-broadcast-mic@.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now oma-broadcast-mic@deepfilter.service
+#
+# Run one instance at a time: both configurations create the same source
+# (node.name oma-broadcast-mic). To switch engines:
+#   systemctl --user disable --now oma-broadcast-mic@deepfilter.service
+#   systemctl --user enable --now oma-broadcast-mic@rnnoise.service
+#
+# Undo:
+#   systemctl --user disable --now oma-broadcast-mic@deepfilter.service \
+#       oma-broadcast-mic@rnnoise.service
+#   rm ~/.config/systemd/user/oma-broadcast-mic@.service \
+#      ~/.config/pipewire/oma-broadcast-mic-*.conf
+#   systemctl --user daemon-reload
+#
+# Logs: `journalctl --user -u 'oma-broadcast-mic@*'`.
+# More: docs/setup/microphone.md.
+
+[Unit]
+Description=Omarchy Broadcast Mic noise removal (%i)
+
+After=pipewire.service pipewire-session-manager.service
+# Stopped (and not left running against a dead server) whenever PipeWire
+# stops; see [Install] for how it comes back.
+BindsTo=pipewire.service
+
+[Service]
+# Hardening, type, restart policy and slice as in PipeWire's own
+# filter-chain.service.
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+Type=simple
+ExecStart=/usr/bin/pipewire -c oma-broadcast-mic-%i.conf
+Restart=on-failure
+Slice=session.slice
+
+[Install]
+# WantedBy=pipewire.service, as wireplumber.service: BindsTo= stops this
+# unit with PipeWire, and enabling it here starts it again whenever
+# pipewire.service starts, including on `systemctl --user restart pipewire`.
+# WantedBy=default.target alone would start it only at login, so a PipeWire
+# restart would leave the source gone until it was started by hand.
+WantedBy=pipewire.service
