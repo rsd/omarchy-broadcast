@@ -69,7 +69,7 @@ static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
     gst::DebugCategory::new(
         "obceffect",
         gst::DebugColorFlags::empty(),
-        Some("oma-broadcast effect element"),
+        Some("omarchy-broadcast effect element"),
     )
 });
 
@@ -1102,7 +1102,7 @@ impl ElementImpl for ObcEffect {
     fn metadata() -> Option<&'static gst::subclass::ElementMetadata> {
         static META: LazyLock<gst::subclass::ElementMetadata> = LazyLock::new(|| {
             gst::subclass::ElementMetadata::new(
-                "oma-broadcast effect",
+                "omarchy-broadcast effect",
                 "Filter/Effect/Video/Hardware",
                 "Background blur or replacement on NV12 CUDA frames through an inference \
                  backend; passthrough without an effect",

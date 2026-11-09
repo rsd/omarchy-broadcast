@@ -8,13 +8,13 @@ members = [
     "crates/gst-obc",
     "crates/obc-pipeline",
     "crates/obc-ipc",
-    "crates/oma-broadcastd",
-    "crates/oma-broadcast",
+    "crates/omarchy-broadcastd",
+    "crates/omarchy-broadcast",
 ]
 
 [workspace.package]
 # Also the pkgver= of packaging/arch/PKGBUILD: bump both; CI checks they match.
-version = "0.14.0"
+version = "0.15.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Raul Dias"]

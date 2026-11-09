@@ -1,12 +1,12 @@
 # Setting up the v4l2loopback virtual camera
 
-`oma-broadcast` writes the processed video into a [v4l2loopback](https://github.com/v4l2loopback/v4l2loopback) device. Applications (OBS, Chrome, Zoom, ...) then select that device as their camera. The pipeline finds the device by its **label**, `Omarchy Broadcast`, not by its `/dev/videoN` number (see [ADR-0004](../adr/0004-v4l2loopback-first.md)).
+`omarchy-broadcast` writes the processed video into a [v4l2loopback](https://github.com/v4l2loopback/v4l2loopback) device. Applications (OBS, Chrome, Zoom, ...) then select that device as their camera. The pipeline finds the device by its **label**, `Omarchy Broadcast`, not by its `/dev/videoN` number (see [ADR-0004](../adr/0004-v4l2loopback-first.md)).
 
 Creating the device needs root. This is a one-time setup.
 
 ## Single device
 
-Create `/etc/modprobe.d/oma-broadcast.conf`:
+Create `/etc/modprobe.d/omarchy-broadcast.conf`:
 
 ```text
 options v4l2loopback devices=1 video_nr=10 card_label="Omarchy Broadcast" exclusive_caps=1 max_buffers=4
@@ -39,7 +39,7 @@ options v4l2loopback devices=2 video_nr=10,11 card_label="First Device,Omarchy B
 
 ## Why `exclusive_caps=1`
 
-With `exclusive_caps=1` the device advertises only the CAPTURE capability while a producer is writing to it. It therefore appears as a camera in OBS or a browser only while `oma-broadcast` is streaming, and does not show up as a dead, black camera otherwise. Chrome requires this: it lists only devices that expose capture capability and not output capability. Keep it enabled.
+With `exclusive_caps=1` the device advertises only the CAPTURE capability while a producer is writing to it. It therefore appears as a camera in OBS or a browser only while `omarchy-broadcast` is streaming, and does not show up as a dead, black camera otherwise. Chrome requires this: it lists only devices that expose capture capability and not output capability. Keep it enabled.
 
 ## Notes
 

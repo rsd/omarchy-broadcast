@@ -2,7 +2,7 @@
 //! (feature `pipewire`). `#[ignore]`: it needs the user PipeWire daemon
 //! (with WirePlumber) and GStreamer's `pipewiresrc` (gst-plugin-pipewire).
 //!
-//! It creates exactly one node, named `oma-broadcast-test-<pid>`, fed by a
+//! It creates exactly one node, named `omarchy-broadcast-test-<pid>`, fed by a
 //! loopback writer into a `fakesink` (no device), and consumes it with
 //! in-process `pipewiresrc` pipelines that target it by name with
 //! `node.dont-fallback` and `node.dont-reconnect`, so a consumer can never
@@ -497,7 +497,7 @@ fn refused_native_consumer(rig: &Rig, what: &str, pod: Vec<u8>, node: u32) {
 fn the_node_serves_nv12_and_yuy2_and_survives_refused_consumers() {
     gst::init().unwrap();
     let contract = OutputContract::default();
-    let name = format!("oma-broadcast-test-{}", std::process::id());
+    let name = format!("omarchy-broadcast-test-{}", std::process::id());
     let description = format!("Omarchy Broadcast test {}", std::process::id());
     let mut writer = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
     writer.start().unwrap();
@@ -663,5 +663,8 @@ fn the_node_serves_nv12_and_yuy2_and_survives_refused_consumers() {
     // The node is gone once stopped.
     drop(rig);
     let dump = pw_dump(node);
-    assert!(!dump.contains("oma-broadcast-test-"), "node left: {dump}");
+    assert!(
+        !dump.contains("omarchy-broadcast-test-"),
+        "node left: {dump}"
+    );
 }

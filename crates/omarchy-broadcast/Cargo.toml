@@ -1,0 +1,26 @@
+[package]
+name = "omarchy-broadcast"
+description = "omarchy-broadcast command-line client (D-Bus remote control)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+obc-ipc = { workspace = true }
+zbus = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# Peer-to-peer D-Bus connections for client tests without a session bus.
+zbus = { workspace = true, features = ["p2p"] }
+
+[lints]
+workspace = true

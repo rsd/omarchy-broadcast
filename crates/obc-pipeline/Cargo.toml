@@ -1,6 +1,6 @@
 [package]
 name = "obc-pipeline"
-description = "Device discovery, GStreamer pipeline building and measurement for oma-broadcast"
+description = "Device discovery, GStreamer pipeline building and measurement for omarchy-broadcast"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

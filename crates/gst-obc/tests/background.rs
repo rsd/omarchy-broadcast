@@ -330,7 +330,10 @@ fn a_png_with_an_ancillary_chunk_after_its_data_is_decoded() {
     // Before IEND (the last 12 bytes), after IDAT.
     let iend = png.len() - 12;
     assert_eq!(&png[iend + 4..iend + 8], b"IEND");
-    png.splice(iend..iend, png_chunk(b"tEXt", b"Comment\0oma-broadcast"));
+    png.splice(
+        iend..iend,
+        png_chunk(b"tEXt", b"Comment\0omarchy-broadcast"),
+    );
     let path = tmp(&dir, "text.png");
     std::fs::write(&path, &png).unwrap();
     let img = decode(&path, 32, 32).expect("decodes");

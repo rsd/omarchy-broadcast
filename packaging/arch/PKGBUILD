@@ -1,6 +1,6 @@
 # Maintainer: Raul Dias
 #
-# Arch package of oma-broadcast, built from the local git checkout that holds
+# Arch package of omarchy-broadcast, built from the local git checkout that holds
 # this file (two directories up). Only committed content is built: makepkg
 # clones the repository, so uncommitted changes are not included. makepkg
 # rewrites pkgver= below on each build; that change need not be committed.
@@ -8,16 +8,16 @@
 # bump changes both files, and CI fails while they differ.
 #
 # Build (from packaging/arch):   makepkg -s
-# Install the result with:       sudo pacman -U oma-broadcast-git-*.pkg.tar.zst
+# Install the result with:       sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst
 #
 # The package installs the daemon, the command-line client, the systemd user
 # unit, the D-Bus activation file, the Omarchy bar widget and the
 # documentation. Nothing is enabled: each user runs
-#   systemctl --user enable --now oma-broadcastd.service
+#   systemctl --user enable --now omarchy-broadcastd.service
 # The v4l2loopback device must be configured as in docs/setup/loopback.md.
 #
 # The daemon is built with PipeWire support (cargo feature
-# oma-broadcastd/pipewire): it can also offer the camera as a native
+# omarchy-broadcastd/pipewire): it can also offer the camera as a native
 # PipeWire video source, "Omarchy Broadcast". That node is off until a user
 # sets [pipewire] enabled = true in config.toml (docs/config.example.toml);
 # without it, or without a running PipeWire, the loopback works alone.
@@ -26,22 +26,22 @@
 # configurations and a template user unit), not enabled; see
 # docs/setup/microphone.md. After installing a plugin package (optional
 # dependencies), enable it with
-#   systemctl --user enable --now oma-broadcast-mic@rnnoise.service
+#   systemctl --user enable --now omarchy-broadcast-mic@rnnoise.service
 #
 # The NVIDIA Maxine Video Effects SDK (background blur and replace) is
 # licensed separately by NVIDIA and is never part of this package: each user
 # downloads and installs it as described in docs/setup/maxine.md. Without it
 # the daemon runs normally and a requested effect reports why it failed.
 # The package does install the os-release shim and its replacement os-release
-# under /usr/lib/oma-broadcast, inactive: the SDK does not list every
+# under /usr/lib/omarchy-broadcast, inactive: the SDK does not list every
 # distribution, and the shim lets the daemon (and only the daemon) read the
 # replacement. To activate it, install the SDK, then copy the example drop-in
 # (docs/setup/maxine.md, section 7):
-#   /usr/share/doc/oma-broadcast/examples/systemd/oma-broadcastd.service.d/maxine.conf
+#   /usr/share/doc/omarchy-broadcast/examples/systemd/omarchy-broadcastd.service.d/maxine.conf
 
-pkgname=oma-broadcast-git
-_pkgname=oma-broadcast
-pkgver=0.14.0
+pkgname=omarchy-broadcast-git
+_pkgname=omarchy-broadcast
+pkgver=0.15.0
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API, a CLI and an Omarchy bar widget'
 arch=('x86_64')
@@ -104,8 +104,8 @@ build() {
   cd "$_pkgname"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
-  cargo build --frozen --release --features oma-broadcastd/pipewire \
-    -p oma-broadcastd -p oma-broadcast
+  cargo build --frozen --release --features omarchy-broadcastd/pipewire \
+    -p omarchy-broadcastd -p omarchy-broadcast
 
   # The os-release shim: target/os-release-shim/os-release-shim.so. The
   # Makefile takes CFLAGS and LDFLAGS from makepkg's environment.
@@ -122,11 +122,11 @@ check() {
   # PipeWire node's unit tests (the feature the package is built with);
   # they contact no PipeWire daemon, and the live PipeWire tests are
   # ignored.
-  env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u OMA_BROADCAST_OS_RELEASE \
+  env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u OMARCHY_BROADCAST_OS_RELEASE \
     cargo test --frozen --workspace
-  env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u OMA_BROADCAST_OS_RELEASE \
-    cargo test --frozen -p obc-pipeline -p oma-broadcastd --features oma-broadcastd/pipewire
-  env -u LD_PRELOAD -u OMA_BROADCAST_OS_RELEASE -u OMA_BROADCAST_OS_RELEASE_DEBUG \
+  env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u OMARCHY_BROADCAST_OS_RELEASE \
+    cargo test --frozen -p obc-pipeline -p omarchy-broadcastd --features omarchy-broadcastd/pipewire
+  env -u LD_PRELOAD -u OMARCHY_BROADCAST_OS_RELEASE -u OMARCHY_BROADCAST_OS_RELEASE_DEBUG \
     make -C tools/os-release-shim test
 }
 
@@ -134,13 +134,13 @@ package() {
   cd "$_pkgname"
 
   install -Dm755 -t "$pkgdir/usr/bin" \
-    target/release/oma-broadcastd \
-    target/release/oma-broadcast
+    target/release/omarchy-broadcastd \
+    target/release/omarchy-broadcast
 
-  install -Dm644 dist/systemd/oma-broadcastd.service \
-    "$pkgdir/usr/lib/systemd/user/oma-broadcastd.service"
-  install -Dm644 dist/dbus-1/services/br.com.dias.OmaBroadcast.service \
-    "$pkgdir/usr/share/dbus-1/services/br.com.dias.OmaBroadcast.service"
+  install -Dm644 dist/systemd/omarchy-broadcastd.service \
+    "$pkgdir/usr/lib/systemd/user/omarchy-broadcastd.service"
+  install -Dm644 dist/dbus-1/services/br.com.dias.OmarchyBroadcast.service \
+    "$pkgdir/usr/share/dbus-1/services/br.com.dias.OmarchyBroadcast.service"
 
   install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE-MIT LICENSE-APACHE
 
@@ -157,7 +157,7 @@ package() {
   # after the daemon, the other runs the daemon with a user-installed Maxine
   # SDK. Each file's header says where to copy it.
   install -Dm644 -t "$doc/examples/systemd/wireplumber.service.d" \
-    dist/systemd/wireplumber.service.d/oma-broadcast.conf
+    dist/systemd/wireplumber.service.d/omarchy-broadcast.conf
 
   # The os-release shim and its replacement os-release, installed but inactive
   # (activation is the drop-in above). The example drop-in is generated from
@@ -167,14 +167,14 @@ package() {
     "$pkgdir/usr/lib/$_pkgname/os-release-shim.so"
   install -Dm644 tools/maxine-probe/fake-os-release \
     "$pkgdir/usr/lib/$_pkgname/fake-os-release"
-  local maxine_conf="$doc/examples/systemd/oma-broadcastd.service.d/maxine.conf"
+  local maxine_conf="$doc/examples/systemd/omarchy-broadcastd.service.d/maxine.conf"
   install -d "${maxine_conf%/*}"
-  sed '/^Environment=/s|%h/\.local/lib/oma-broadcast/|/usr/lib/oma-broadcast/|' \
-    dist/systemd/oma-broadcastd.service.d/maxine.conf >"$maxine_conf"
+  sed '/^Environment=/s|%h/\.local/lib/omarchy-broadcast/|/usr/lib/omarchy-broadcast/|' \
+    dist/systemd/omarchy-broadcastd.service.d/maxine.conf >"$maxine_conf"
   chmod 644 "$maxine_conf"
-  grep -qx 'Environment=LD_PRELOAD=/usr/lib/oma-broadcast/os-release-shim.so' "$maxine_conf" &&
-    grep -qx 'Environment=OMA_BROADCAST_OS_RELEASE=/usr/lib/oma-broadcast/fake-os-release' "$maxine_conf" ||
-    { echo 'maxine.conf: the /usr/lib/oma-broadcast rewrite did not take' >&2; return 1; }
+  grep -qx 'Environment=LD_PRELOAD=/usr/lib/omarchy-broadcast/os-release-shim.so' "$maxine_conf" &&
+    grep -qx 'Environment=OMARCHY_BROADCAST_OS_RELEASE=/usr/lib/omarchy-broadcast/fake-os-release' "$maxine_conf" ||
+    { echo 'maxine.conf: the /usr/lib/omarchy-broadcast rewrite did not take' >&2; return 1; }
 
   # The optional noise-removed microphone: the filter-chain configurations
   # and the template unit, inactive (docs/setup/microphone.md). The packaged
@@ -182,18 +182,18 @@ package() {
   # unit names them by absolute path: only its ExecStart= line is rewritten
   # from the repository's, which looks them up by name.
   install -Dm644 -t "$pkgdir/usr/share/$_pkgname/pipewire" \
-    dist/pipewire/oma-broadcast-mic-*.conf
-  local mic_unit="$pkgdir/usr/lib/systemd/user/oma-broadcast-mic@.service"
+    dist/pipewire/omarchy-broadcast-mic-*.conf
+  local mic_unit="$pkgdir/usr/lib/systemd/user/omarchy-broadcast-mic@.service"
   install -d "${mic_unit%/*}"
-  sed 's|^ExecStart=/usr/bin/pipewire -c oma-broadcast-mic-%i\.conf$|ExecStart=/usr/bin/pipewire -c /usr/share/oma-broadcast/pipewire/oma-broadcast-mic-%i.conf|' \
-    dist/systemd/oma-broadcast-mic@.service >"$mic_unit"
+  sed 's|^ExecStart=/usr/bin/pipewire -c omarchy-broadcast-mic-%i\.conf$|ExecStart=/usr/bin/pipewire -c /usr/share/omarchy-broadcast/pipewire/omarchy-broadcast-mic-%i.conf|' \
+    dist/systemd/omarchy-broadcast-mic@.service >"$mic_unit"
   chmod 644 "$mic_unit"
-  grep -qx 'ExecStart=/usr/bin/pipewire -c /usr/share/oma-broadcast/pipewire/oma-broadcast-mic-%i.conf' "$mic_unit" ||
-    { echo 'oma-broadcast-mic@.service: the ExecStart rewrite did not take' >&2; return 1; }
+  grep -qx 'ExecStart=/usr/bin/pipewire -c /usr/share/omarchy-broadcast/pipewire/omarchy-broadcast-mic-%i.conf' "$mic_unit" ||
+    { echo 'omarchy-broadcast-mic@.service: the ExecStart rewrite did not take' >&2; return 1; }
 
   # Omarchy bar widget, without its development tests.
-  local plugin=clients/omarchy-bar/br.com.dias.oma-broadcast
-  local dest="$pkgdir/usr/share/$_pkgname/omarchy-bar/br.com.dias.oma-broadcast"
+  local plugin=clients/omarchy-bar/br.com.dias.omarchy-broadcast
+  local dest="$pkgdir/usr/share/$_pkgname/omarchy-bar/br.com.dias.omarchy-broadcast"
   local file
   while IFS= read -r -d '' file; do
     install -Dm644 "$file" "$dest/${file#"$plugin"/}"

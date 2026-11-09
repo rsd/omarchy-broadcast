@@ -121,7 +121,7 @@ pub struct PwOutputConfig {
 }
 
 impl PwOutputConfig {
-    pub const DEFAULT_NODE_NAME: &str = "oma-broadcast";
+    pub const DEFAULT_NODE_NAME: &str = "omarchy-broadcast";
     pub const DEFAULT_DESCRIPTION: &str = "Omarchy Broadcast";
 
     /// The daemon's defaults for `contract`.
@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn config_defaults_and_validation() {
         let cfg = PwOutputConfig::new(OutputContract::default());
-        assert_eq!(cfg.node_name, "oma-broadcast");
+        assert_eq!(cfg.node_name, "omarchy-broadcast");
         assert_eq!(cfg.description, "Omarchy Broadcast");
         assert!(cfg.offer_nv12);
         cfg.validate().unwrap();

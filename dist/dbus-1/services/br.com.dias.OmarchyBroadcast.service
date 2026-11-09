@@ -1,0 +1,9 @@
+# D-Bus activation of omarchy-broadcastd: a call addressed to
+# br.com.dias.OmarchyBroadcast starts the systemd user service (never the binary
+# directly). Installed to /usr/share/dbus-1/services/ by the package, or to
+# ~/.local/share/dbus-1/services/ for a user install (see
+# dist/systemd/omarchy-broadcastd.service).
+[D-BUS Service]
+Name=br.com.dias.OmarchyBroadcast
+Exec=/bin/false
+SystemdService=omarchy-broadcastd.service

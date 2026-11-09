@@ -1,32 +1,32 @@
-# D-Bus API reference (`br.com.dias.OmaBroadcast1`)
+# D-Bus API reference (`br.com.dias.OmarchyBroadcast1`)
 
-`oma-broadcastd` is controlled over the D-Bus session bus. This document is the reference for clients: status-bar plugins, scripts and other frontends. The design is recorded in [ADR-0005](adr/0005-dbus-zbus-control-plane.md) and [ADR-0011](adr/0011-daemon-lifecycle-and-dbus-api.md).
+`omarchy-broadcastd` is controlled over the D-Bus session bus. This document is the reference for clients: status-bar plugins, scripts and other frontends. The design is recorded in [ADR-0005](adr/0005-dbus-zbus-control-plane.md) and [ADR-0011](adr/0011-daemon-lifecycle-and-dbus-api.md).
 
-Clients that cannot speak D-Bus can use the CLI's JSON output instead (`oma-broadcast status --json`, `oma-broadcast watch --json`), documented in [cli-json.md](cli-json.md).
+Clients that cannot speak D-Bus can use the CLI's JSON output instead (`omarchy-broadcast status --json`, `omarchy-broadcast watch --json`), documented in [cli-json.md](cli-json.md).
 
-Rust clients can use the `obc-ipc` crate, which holds these names, the value types, a typed proxy (`obc_ipc::OmaBroadcastProxy`) for method calls and signals, and `obc_ipc::Snapshot::fetch_no_autostart`, the read that never starts the daemon (see [Service presence and activation](#service-presence-and-activation)).
+Rust clients can use the `obc-ipc` crate, which holds these names, the value types, a typed proxy (`obc_ipc::OmarchyBroadcastProxy`) for method calls and signals, and `obc_ipc::Snapshot::fetch_no_autostart`, the read that never starts the daemon (see [Service presence and activation](#service-presence-and-activation)).
 
 ## Names
 
 | What | Value |
 |---|---|
 | Bus | session bus (`busctl --user`, `gdbus --session`) |
-| Well-known name | `br.com.dias.OmaBroadcast` |
-| Object path | `/br/com/dias/OmaBroadcast` |
-| Interface | `br.com.dias.OmaBroadcast1` |
-| Error names | `br.com.dias.OmaBroadcast1.Error.<Name>` |
+| Well-known name | `br.com.dias.OmarchyBroadcast` |
+| Object path | `/br/com/dias/OmarchyBroadcast` |
+| Interface | `br.com.dias.OmarchyBroadcast1` |
+| Error names | `br.com.dias.OmarchyBroadcast1.Error.<Name>` |
 
 The object also implements the standard `org.freedesktop.DBus.Properties`, `org.freedesktop.DBus.Introspectable` and `org.freedesktop.DBus.Peer` interfaces.
 
 ## Versioning
 
-- **Breaking changes** (a removed or renamed member, a changed type or meaning, a new lifecycle state) are never made to `br.com.dias.OmaBroadcast1`. They go into a new interface, `br.com.dias.OmaBroadcast2`, on the same object.
-- **Backwards-compatible additions** (a new property, method, signal or error name) are made to `br.com.dias.OmaBroadcast1` and raise the `InterfaceRevision` property. This document describes revision **3**. Revision 1 had no video effects: `Effect` was reserved and always `none`. Revision 2 adds the `BlurStrength` and `BackgroundImage` properties, the `SetEffect`, `SetBlurStrength` and `SetBackgroundImage` methods and the `InvalidArgument` error name, and gives `Effect` its values; it removes and changes nothing else. Revision 3 adds the optional PipeWire output ([ADR-0016](adr/0016-pipewire-output.md)): the properties `LoopbackConsumers`, `PipeWireConsumers` and `PipeWireOutput`. `Consumers` keeps its type and becomes the total of both kinds of consumer; with the PipeWire output off it has the value it had in revision 2. A client that needs only the processes holding the loopback reads `LoopbackConsumers`.
+- **Breaking changes** (a removed or renamed member, a changed type or meaning, a new lifecycle state) are never made to `br.com.dias.OmarchyBroadcast1`. They go into a new interface, `br.com.dias.OmarchyBroadcast2`, on the same object.
+- **Backwards-compatible additions** (a new property, method, signal or error name) are made to `br.com.dias.OmarchyBroadcast1` and raise the `InterfaceRevision` property. This document describes revision **3**. Revision 1 had no video effects: `Effect` was reserved and always `none`. Revision 2 adds the `BlurStrength` and `BackgroundImage` properties, the `SetEffect`, `SetBlurStrength` and `SetBackgroundImage` methods and the `InvalidArgument` error name, and gives `Effect` its values; it removes and changes nothing else. Revision 3 adds the optional PipeWire output ([ADR-0016](adr/0016-pipewire-output.md)): the properties `LoopbackConsumers`, `PipeWireConsumers` and `PipeWireOutput`. `Consumers` keeps its type and becomes the total of both kinds of consumer; with the PipeWire output off it has the value it had in revision 2. A client that needs only the processes holding the loopback reads `LoopbackConsumers`.
 - A client that uses an addition checks `InterfaceRevision` first and treats an older daemon as not offering it. A client must ignore properties, signals and error names it does not know.
 
 ## Lifecycle states
 
-The `State` property is one of these lower-case strings. The set is fixed for `br.com.dias.OmaBroadcast1`.
+The `State` property is one of these lower-case strings. The set is fixed for `br.com.dias.OmarchyBroadcast1`.
 
 | State | Camera | GPU (CUDA context) | Virtual camera delivers |
 |---|---|---|---|
@@ -63,12 +63,12 @@ The virtual camera itself never changes format and never stops while the daemon 
 
 ## Properties
 
-All properties are read-only. Every change is announced with `org.freedesktop.DBus.Properties.PropertiesChanged` (interface `br.com.dias.OmaBroadcast1`), with the new value included, so clients never need to poll. Read the initial values with `GetAll` and then follow `PropertiesChanged`.
+All properties are read-only. Every change is announced with `org.freedesktop.DBus.Properties.PropertiesChanged` (interface `br.com.dias.OmarchyBroadcast1`), with the new value included, so clients never need to poll. Read the initial values with `GetAll` and then follow `PropertiesChanged`.
 
 | Property | Type | Meaning | Changes when |
 |---|---|---|---|
 | `State` | `s` | Lifecycle state, one of `off`, `idle`, `starting`, `active`, `error` (see above). | On every state transition. |
-| `Error` | `s` | Text of the latest error, from the lifecycle or from a configuration reload; empty if none. A one-line, human-readable message, e.g. `/home/user/.config/oma-broadcast/config.toml:4:1: camera.mdoe: unknown field ...`. | Set on an error; cleared by the next successful start, or by a valid reload, but only when its own cause is gone: a missing loopback writer or a damaged state file still stands after a reload, and `Error` then keeps that text. An invalid configuration sets `Error` without entering the `error` state, since the previous configuration stays in force. |
+| `Error` | `s` | Text of the latest error, from the lifecycle or from a configuration reload; empty if none. A one-line, human-readable message, e.g. `/home/user/.config/omarchy-broadcast/config.toml:4:1: camera.mdoe: unknown field ...`. | Set on an error; cleared by the next successful start, or by a valid reload, but only when its own cause is gone: a missing loopback writer or a damaged state file still stands after a reload, and `Error` then keeps that text. An invalid configuration sets `Error` without entering the `error` state, since the previous configuration stays in force. |
 | `Enabled` | `b` | `false` is the privacy state `off`. | On `SetEnabled`. Persists across restarts. |
 | `Cameras` | `a(sss)` | The cameras present, in the order the daemon uses them: first those matching the configured preference, then the others in discovery order. Each entry is `(id, name, usb)`: `id` is an opaque, stable identifier to pass to `SelectCamera`; `name` is the human-readable device name: the V4L2 card name, shown once when a driver repeats it on both sides of `: ` (`Laptop Camera: Laptop Camera` is shown as `Laptop Camera`), and made unique when several cameras would share it (the first in id order keeps the plain name, the others get ` (2)`, ` (3)`, ...; a camera still known by its `/dev/videoN` node, before udev creates its `/dev/v4l` links, is ordered last, so a camera already known keeps its name); `usb` is the USB `vid:pid` in lower-case hex (`046d:0944`), or empty for a non-USB camera. | When a camera is plugged in or removed, and on a configuration reload that changes the preference. |
 | `ActiveCamera` | `s` | The `id` of the camera that streams, or that would stream if an application opened the virtual camera now; empty if there is none. | On `SelectCamera`, `NextCamera`, a fallback after a camera failure, and hotplug. |
@@ -80,19 +80,19 @@ All properties are read-only. Every change is announced with `org.freedesktop.DB
 | `LoopbackConsumers` | `u` | Number of processes, other than the daemon, holding the loopback device open (the former meaning of `Consumers`). Revision 3. | When an application opens or closes the loopback. |
 | `PipeWireConsumers` | `u` | Number of links to the PipeWire output's node; `0` when the output is off. A link in the error state is not counted. Revision 3. | When an application links to or leaves the node. |
 | `PipeWireOutput` | `s` | State of the optional PipeWire output: `off` (not configured), `unsupported` (configured, but the daemon was built without the feature), `connecting`, `ready` (the node is registered, no stream), `streaming` (a consumer is linked and frames flow) or `failed` (no PipeWire daemon, a lost connection or a stream error; retried every 2 s). A failure never changes `State` and never sets `Error`. Revision 3. | On every transition of the output. |
-| `InterfaceRevision` | `u` | Revision of `br.com.dias.OmaBroadcast1` the daemon implements (see Versioning). This document describes `3`. | Never while the daemon runs. |
+| `InterfaceRevision` | `u` | Revision of `br.com.dias.OmarchyBroadcast1` the daemon implements (see Versioning). This document describes `3`. | Never while the daemon runs. |
 
 ## Methods
 
-All methods return nothing on success. On failure they return a D-Bus error named under `br.com.dias.OmaBroadcast1.Error`, whose message is a human-readable explanation. Calls with the wrong argument types fail with the standard `org.freedesktop.DBus.Error.InvalidArgs`.
+All methods return nothing on success. On failure they return a D-Bus error named under `br.com.dias.OmarchyBroadcast1.Error`, whose message is a human-readable explanation. Calls with the wrong argument types fail with the standard `org.freedesktop.DBus.Error.InvalidArgs`.
 
 | Error name | Meaning |
 |---|---|
-| `br.com.dias.OmaBroadcast1.Error.NoSuchCamera` | The selector matches no camera that is present. The message ends with `(cameras present: …)`, listing them. |
-| `br.com.dias.OmaBroadcast1.Error.InvalidConfig` | The configuration file cannot be read or is invalid; the message names the file, the line and key, and the reason. The previous configuration stays in force. |
-| `br.com.dias.OmaBroadcast1.Error.Unavailable` | The request cannot be served now, for example `NextCamera` with no camera present. |
-| `br.com.dias.OmaBroadcast1.Error.InvalidArgument` | An argument is well-formed but not acceptable: an unknown effect, a strength outside 0 to 1, a background image that is not usable. The message says which and why. Added in revision 2. |
-| `br.com.dias.OmaBroadcast1.Error.Failed` | Any other failure. |
+| `br.com.dias.OmarchyBroadcast1.Error.NoSuchCamera` | The selector matches no camera that is present. The message ends with `(cameras present: …)`, listing them. |
+| `br.com.dias.OmarchyBroadcast1.Error.InvalidConfig` | The configuration file cannot be read or is invalid; the message names the file, the line and key, and the reason. The previous configuration stays in force. |
+| `br.com.dias.OmarchyBroadcast1.Error.Unavailable` | The request cannot be served now, for example `NextCamera` with no camera present. |
+| `br.com.dias.OmarchyBroadcast1.Error.InvalidArgument` | An argument is well-formed but not acceptable: an unknown effect, a strength outside 0 to 1, a background image that is not usable. The message says which and why. Added in revision 2. |
+| `br.com.dias.OmarchyBroadcast1.Error.Failed` | Any other failure. |
 
 ### `SetEnabled(b enabled)`
 
@@ -121,7 +121,7 @@ Errors: `Unavailable` (no camera present), `Failed`.
 
 ### `ReloadConfig()`
 
-Re-reads the configuration file (`$XDG_CONFIG_HOME/oma-broadcast/config.toml`). Equivalent to sending `SIGHUP` to the daemon. An invalid file is rejected as a whole: the previous configuration stays in force, `Error` is set and the call fails with `InvalidConfig`. A valid file clears `Error` unless a cause outside the configuration still holds (see `Error` above). A missing file means the defaults. The configuration keys are described in [config.example.toml](config.example.toml).
+Re-reads the configuration file (`$XDG_CONFIG_HOME/omarchy-broadcast/config.toml`). Equivalent to sending `SIGHUP` to the daemon. An invalid file is rejected as a whole: the previous configuration stays in force, `Error` is set and the call fails with `InvalidConfig`. A valid file clears `Error` unless a cause outside the configuration still holds (see `Error` above). A missing file means the defaults. The configuration keys are described in [config.example.toml](config.example.toml).
 
 Errors: `InvalidConfig`, `Failed`.
 
@@ -149,7 +149,7 @@ Errors: `InvalidArgument` (not an absolute path, unreadable, not a regular file,
 
 ## Video effects
 
-The effect settings (`Effect`, `BlurStrength`, `BackgroundImage`) come from the `[effect]` section of the configuration, and the three setters override them. An override is written to the runtime state file (`state.toml` in `$XDG_STATE_HOME/oma-broadcast/`, with `Enabled` and the selected camera) before the call returns and survives restarts; the configuration is not modified. A value in the state file takes precedence over the configuration, and a reload does not discard it. A state file with an unreadable effect value is a damaged state file (see the `off` rules above); the effect choices saved in it are dropped in favour of the configuration when `SetEnabled` rewrites the file. A setter called with the value already in force changes and writes nothing.
+The effect settings (`Effect`, `BlurStrength`, `BackgroundImage`) come from the `[effect]` section of the configuration, and the three setters override them. An override is written to the runtime state file (`state.toml` in `$XDG_STATE_HOME/omarchy-broadcast/`, with `Enabled` and the selected camera) before the call returns and survives restarts; the configuration is not modified. A value in the state file takes precedence over the configuration, and a reload does not discard it. A state file with an unreadable effect value is a damaged state file (see the `off` rules above); the effect choices saved in it are dropped in favour of the configuration when `SetEnabled` rewrites the file. A setter called with the value already in force changes and writes nothing.
 
 **Privacy while an effect starts.** The raw camera image is never shown while an effect is requested. Going from `none` to `blur` or `replace`, the virtual camera delivers black frames until the effect is ready: a fraction of a second normally, up to a few seconds on the first load after boot or after the files left the cache. Going from one effect to another, the previous effect keeps running until the new one is ready, so every frame is processed. Going to `none` shows the camera image at once. The stream keeps its format and frame rate throughout; applications see no renegotiation.
 
@@ -175,32 +175,32 @@ The signal has four arguments (signature `dddd`), not one structure (`(dddd)`). 
 | `cpu_percent` | CPU time used by the daemon over the last interval, in percent of one core (can exceed 100). |
 | `gpu_percent` | Utilisation of the GPU the pipeline runs on over the last interval, in percent. |
 
-The property change signal, `org.freedesktop.DBus.Properties.PropertiesChanged(s interface, a{sv} changed, as invalidated)`, is emitted by the same object for every property listed above, with `interface` = `br.com.dias.OmaBroadcast1` and the new values in `changed`.
+The property change signal, `org.freedesktop.DBus.Properties.PropertiesChanged(s interface, a{sv} changed, as invalidated)`, is emitted by the same object for every property listed above, with `interface` = `br.com.dias.OmarchyBroadcast1` and the new values in `changed`.
 
 ## Service presence and activation
 
-The daemon runs as the systemd user service `oma-broadcastd.service`. When the D-Bus activation file `br.com.dias.OmaBroadcast.service` is installed, any message addressed to `br.com.dias.OmaBroadcast` without the `NO_AUTO_START` header flag starts the daemon if it is not running. That includes property reads: `Properties.Get` and `Properties.GetAll` start the daemon as readily as a method call does. Subscribing to signals (an `AddMatch` rule on the bus) never starts it.
+The daemon runs as the systemd user service `omarchy-broadcastd.service`. When the D-Bus activation file `br.com.dias.OmarchyBroadcast.service` is installed, any message addressed to `br.com.dias.OmarchyBroadcast` without the `NO_AUTO_START` header flag starts the daemon if it is not running. That includes property reads: `Properties.Get` and `Properties.GetAll` start the daemon as readily as a method call does. Subscribing to signals (an `AddMatch` rule on the bus) never starts it.
 
-A client that only looks, such as a status-bar plugin, must not start the daemon. It reads with the `NO_AUTO_START` flag set and follows `org.freedesktop.DBus.NameOwnerChanged` for `br.com.dias.OmaBroadcast` to learn when the daemon appears or exits. With the flag set, a read while the daemon is not running fails at once with an error from the bus, normally `org.freedesktop.DBus.Error.NameHasNoOwner`; treat `org.freedesktop.DBus.Error.ServiceUnknown` the same way. When the name has no owner, the daemon is not running: show it as unavailable rather than as `off`.
+A client that only looks, such as a status-bar plugin, must not start the daemon. It reads with the `NO_AUTO_START` flag set and follows `org.freedesktop.DBus.NameOwnerChanged` for `br.com.dias.OmarchyBroadcast` to learn when the daemon appears or exits. With the flag set, a read while the daemon is not running fails at once with an error from the bus, normally `org.freedesktop.DBus.Error.NameHasNoOwner`; treat `org.freedesktop.DBus.Error.ServiceUnknown` the same way. When the name has no owner, the daemon is not running: show it as unavailable rather than as `off`.
 
 How to read without starting the daemon:
 
 - **`busctl`**: pass `--auto-start=no`:
 
   ```sh
-  busctl --user --auto-start=no get-property br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
-      br.com.dias.OmaBroadcast1 State
+  busctl --user --auto-start=no get-property br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+      br.com.dias.OmarchyBroadcast1 State
   ```
 
 - **`gdbus`** has no option to clear auto-start: every `gdbus call` may start the daemon. Ask the bus whether the name has an owner first (there is a small race if the daemon exits in between):
 
   ```sh
   gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
-      --method org.freedesktop.DBus.NameHasOwner br.com.dias.OmaBroadcast
+      --method org.freedesktop.DBus.NameHasOwner br.com.dias.OmarchyBroadcast
   # (true,)
   ```
 
-- **Rust (`obc-ipc`)**: `Snapshot::fetch_no_autostart(&connection)` sends one `GetAll` with the flag and returns `None` when the daemon is not running; `Snapshot::apply_property` applies the values of a `PropertiesChanged` signal, and `obc_ipc::daemon_is_running` asks `NameHasOwner`. Do not read through the property getters of `OmaBroadcastProxy`: a proxy that caches properties (the zbus default) fills its cache with a `GetAll` that allows activation as soon as it is built, and the getters fall back to a `Get` that allows it too. Build the proxy with `cache_properties(CacheProperties::No)` and use it for method calls and signals only.
+- **Rust (`obc-ipc`)**: `Snapshot::fetch_no_autostart(&connection)` sends one `GetAll` with the flag and returns `None` when the daemon is not running; `Snapshot::apply_property` applies the values of a `PropertiesChanged` signal, and `obc_ipc::daemon_is_running` asks `NameHasOwner`. Do not read through the property getters of `OmarchyBroadcastProxy`: a proxy that caches properties (the zbus default) fills its cache with a `GetAll` that allows activation as soon as it is built, and the getters fall back to a `Get` that allows it too. Build the proxy with `cache_properties(CacheProperties::No)` and use it for method calls and signals only.
 - **Other libraries**: set the `NO_AUTO_START` flag on the message (in GDBus, `G_DBUS_CALL_FLAGS_NO_AUTO_START`; in sd-bus, `sd_bus_message_set_auto_start(m, 0)`), and disable any property cache that a generated proxy fills on construction.
 
 Method calls (`SetEnabled`, `SelectCamera`, `NextCamera`, `ReloadConfig`, `SetEffect`, `SetBlurStrength`, `SetBackgroundImage`) are actions; letting them start the daemon is normally what the user wants.
@@ -213,12 +213,12 @@ Applications that open `/dev/video*` directly see the virtual camera whenever th
 
 The daemon starts its loopback writer before it takes its bus name, so the virtual camera is a capture device by the time the service is ready. Two ways to have WirePlumber probe it then:
 
-- The optional drop-in `dist/systemd/wireplumber.service.d/oma-broadcast.conf`, installed as `~/.config/systemd/user/wireplumber.service.d/oma-broadcast.conf`, orders WirePlumber after `oma-broadcastd.service` (followed by `systemctl --user daemon-reload`).
+- The optional drop-in `dist/systemd/wireplumber.service.d/omarchy-broadcast.conf`, installed as `~/.config/systemd/user/wireplumber.service.d/omarchy-broadcast.conf`, orders WirePlumber after `omarchy-broadcastd.service` (followed by `systemctl --user daemon-reload`).
 - Without it, or after restarting the daemon by hand, `systemctl --user restart wireplumber` once the daemon runs makes WirePlumber probe the device again.
 
 ### The native PipeWire node
 
-With the optional PipeWire output ([ADR-0016](adr/0016-pipewire-output.md)) the daemon registers its own PipeWire video source, `oma-broadcast` ("Omarchy Broadcast", `media.class` `Video/Source`, `media.role` `Camera`), and PipeWire-based applications can use it directly, with no WirePlumber probe of the loopback. `PipeWireOutput` and `PipeWireConsumers` report it. Which applications use it depends on the application: Firefox through the camera portal, OBS Studio 30.1 and later, GNOME Snapshot and GStreamer's `pipewiresrc` do; Chromium and Chrome only with their PipeWire camera feature enabled; Zoom and Discord use the loopback. Setup is in [setup/daemon.md](setup/daemon.md#the-pipewire-output).
+With the optional PipeWire output ([ADR-0016](adr/0016-pipewire-output.md)) the daemon registers its own PipeWire video source, `omarchy-broadcast` ("Omarchy Broadcast", `media.class` `Video/Source`, `media.role` `Camera`), and PipeWire-based applications can use it directly, with no WirePlumber probe of the loopback. `PipeWireOutput` and `PipeWireConsumers` report it. Which applications use it depends on the application: Firefox through the camera portal, OBS Studio 30.1 and later, GNOME Snapshot and GStreamer's `pipewiresrc` do; Chromium and Chrome only with their PipeWire camera feature enabled; Zoom and Discord use the loopback. Setup is in [setup/daemon.md](setup/daemon.md#the-pipewire-output).
 
 Once WirePlumber has probed the loopback while the writer streams, PipeWire also lists the loopback as a camera, so an application can show "Omarchy Broadcast" twice. A WirePlumber rule can hide the loopback from PipeWire only; applications that open `/dev/video*` directly are unaffected. The rule is in [setup/daemon.md](setup/daemon.md#hiding-the-duplicate). With it, the ordering drop-in above is not needed for applications that use the native node; it stays useful for those that reach the camera through v4l2 only.
 
@@ -227,7 +227,7 @@ Once WirePlumber has probed the loopback while the writer streams, PipeWire also
 Introspect the object:
 
 ```sh
-busctl --user introspect br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast br.com.dias.OmaBroadcast1
+busctl --user introspect br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast br.com.dias.OmarchyBroadcast1
 ```
 
 ```text
@@ -261,8 +261,8 @@ NAME                        TYPE      SIGNATURE RESULT/VALUE                FLAG
 Read properties (`--auto-start=no`: the read does not start the daemon):
 
 ```sh
-busctl --user --auto-start=no get-property br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
-    br.com.dias.OmaBroadcast1 State Enabled Consumers
+busctl --user --auto-start=no get-property br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 State Enabled Consumers
 ```
 
 ```text
@@ -272,8 +272,8 @@ u 0
 ```
 
 ```sh
-busctl --user --auto-start=no get-property br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
-    br.com.dias.OmaBroadcast1 Cameras
+busctl --user --auto-start=no get-property br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 Cameras
 ```
 
 ```text
@@ -285,29 +285,29 @@ Add `--json=short` for machine-readable output, e.g. `{"type":"s","data":"idle"}
 Call each method:
 
 ```sh
-busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
-    br.com.dias.OmaBroadcast1 SetEnabled b false
-busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
-    br.com.dias.OmaBroadcast1 SetEnabled b true
-busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
-    br.com.dias.OmaBroadcast1 SelectCamera s "046d:0944"
-busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
-    br.com.dias.OmaBroadcast1 NextCamera
-busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
-    br.com.dias.OmaBroadcast1 ReloadConfig
-busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
-    br.com.dias.OmaBroadcast1 SetBlurStrength d 0.7
-busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
-    br.com.dias.OmaBroadcast1 SetBackgroundImage s /home/user/Pictures/background.png
-busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
-    br.com.dias.OmaBroadcast1 SetEffect s blur
+busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 SetEnabled b false
+busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 SetEnabled b true
+busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 SelectCamera s "046d:0944"
+busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 NextCamera
+busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 ReloadConfig
+busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 SetBlurStrength d 0.7
+busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 SetBackgroundImage s /home/user/Pictures/background.png
+busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 SetEffect s blur
 ```
 
 An argument that is not acceptable is rejected with `InvalidArgument`:
 
 ```sh
-busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
-    br.com.dias.OmaBroadcast1 SetBlurStrength d 1.5
+busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 SetBlurStrength d 1.5
 ```
 
 ```text
@@ -317,8 +317,8 @@ Call failed: blur strength 1.5 is outside 0 to 1
 A failed call prints the error message and exits with a non-zero status. The `NoSuchCamera` message lists the cameras present, as `name (id)`:
 
 ```sh
-busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast \
-    br.com.dias.OmaBroadcast1 SelectCamera s "no such camera"
+busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 SelectCamera s "no such camera"
 ```
 
 ```text
@@ -329,16 +329,16 @@ Watch property changes:
 
 ```sh
 busctl --user monitor \
-    --match "type='signal',path='/br/com/dias/OmaBroadcast',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'"
+    --match "type='signal',path='/br/com/dias/OmarchyBroadcast',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'"
 ```
 
-Each change prints a message whose body is the interface name, a dictionary of the changed properties and their new values, and an empty list of invalidated ones, e.g. `STRING "br.com.dias.OmaBroadcast1"; ARRAY "{sv}" { DICT_ENTRY "sv" { STRING "State"; VARIANT "s" { STRING "active"; }; }; ... }; ARRAY "s" { };`.
+Each change prints a message whose body is the interface name, a dictionary of the changed properties and their new values, and an empty list of invalidated ones, e.g. `STRING "br.com.dias.OmarchyBroadcast1"; ARRAY "{sv}" { DICT_ENTRY "sv" { STRING "State"; VARIANT "s" { STRING "active"; }; }; ... }; ARRAY "s" { };`.
 
 Watch the `Stats` signal:
 
 ```sh
 busctl --user monitor \
-    --match "type='signal',path='/br/com/dias/OmaBroadcast',interface='br.com.dias.OmaBroadcast1',member='Stats'"
+    --match "type='signal',path='/br/com/dias/OmarchyBroadcast',interface='br.com.dias.OmarchyBroadcast1',member='Stats'"
 ```
 
 The body of each message is four doubles: `DOUBLE 30; DOUBLE 41.2; DOUBLE 6.5; DOUBLE 18;`.
@@ -348,62 +348,62 @@ The body of each message is four doubles: `DOUBLE 30; DOUBLE 41.2; DOUBLE 6.5; D
 Introspect:
 
 ```sh
-gdbus introspect --session --dest br.com.dias.OmaBroadcast --object-path /br/com/dias/OmaBroadcast
+gdbus introspect --session --dest br.com.dias.OmarchyBroadcast --object-path /br/com/dias/OmarchyBroadcast
 ```
 
 Read one property, or all of them (these calls start the daemon if it is not running; see [Service presence and activation](#service-presence-and-activation)):
 
 ```sh
-gdbus call --session --dest br.com.dias.OmaBroadcast --object-path /br/com/dias/OmaBroadcast \
-    --method org.freedesktop.DBus.Properties.Get br.com.dias.OmaBroadcast1 State
+gdbus call --session --dest br.com.dias.OmarchyBroadcast --object-path /br/com/dias/OmarchyBroadcast \
+    --method org.freedesktop.DBus.Properties.Get br.com.dias.OmarchyBroadcast1 State
 # (<'idle'>,)
 
-gdbus call --session --dest br.com.dias.OmaBroadcast --object-path /br/com/dias/OmaBroadcast \
-    --method org.freedesktop.DBus.Properties.GetAll br.com.dias.OmaBroadcast1
+gdbus call --session --dest br.com.dias.OmarchyBroadcast --object-path /br/com/dias/OmarchyBroadcast \
+    --method org.freedesktop.DBus.Properties.GetAll br.com.dias.OmarchyBroadcast1
 # ({'State': <'idle'>, 'Error': <''>, 'Enabled': <true>, 'Cameras': <[('usb-046d_0944-video-index0', 'Logitech MX Brio', '046d:0944')]>, ...},)
 ```
 
 Call each method:
 
 ```sh
-gdbus call --session --dest br.com.dias.OmaBroadcast --object-path /br/com/dias/OmaBroadcast \
-    --method br.com.dias.OmaBroadcast1.SetEnabled false
-gdbus call --session --dest br.com.dias.OmaBroadcast --object-path /br/com/dias/OmaBroadcast \
-    --method br.com.dias.OmaBroadcast1.SelectCamera "Brio"
-gdbus call --session --dest br.com.dias.OmaBroadcast --object-path /br/com/dias/OmaBroadcast \
-    --method br.com.dias.OmaBroadcast1.NextCamera
-gdbus call --session --dest br.com.dias.OmaBroadcast --object-path /br/com/dias/OmaBroadcast \
-    --method br.com.dias.OmaBroadcast1.ReloadConfig
-gdbus call --session --dest br.com.dias.OmaBroadcast --object-path /br/com/dias/OmaBroadcast \
-    --method br.com.dias.OmaBroadcast1.SetBackgroundImage /home/user/Pictures/background.png
-gdbus call --session --dest br.com.dias.OmaBroadcast --object-path /br/com/dias/OmaBroadcast \
-    --method br.com.dias.OmaBroadcast1.SetEffect replace
-gdbus call --session --dest br.com.dias.OmaBroadcast --object-path /br/com/dias/OmaBroadcast \
-    --method br.com.dias.OmaBroadcast1.SetBlurStrength 0.7
+gdbus call --session --dest br.com.dias.OmarchyBroadcast --object-path /br/com/dias/OmarchyBroadcast \
+    --method br.com.dias.OmarchyBroadcast1.SetEnabled false
+gdbus call --session --dest br.com.dias.OmarchyBroadcast --object-path /br/com/dias/OmarchyBroadcast \
+    --method br.com.dias.OmarchyBroadcast1.SelectCamera "Brio"
+gdbus call --session --dest br.com.dias.OmarchyBroadcast --object-path /br/com/dias/OmarchyBroadcast \
+    --method br.com.dias.OmarchyBroadcast1.NextCamera
+gdbus call --session --dest br.com.dias.OmarchyBroadcast --object-path /br/com/dias/OmarchyBroadcast \
+    --method br.com.dias.OmarchyBroadcast1.ReloadConfig
+gdbus call --session --dest br.com.dias.OmarchyBroadcast --object-path /br/com/dias/OmarchyBroadcast \
+    --method br.com.dias.OmarchyBroadcast1.SetBackgroundImage /home/user/Pictures/background.png
+gdbus call --session --dest br.com.dias.OmarchyBroadcast --object-path /br/com/dias/OmarchyBroadcast \
+    --method br.com.dias.OmarchyBroadcast1.SetEffect replace
+gdbus call --session --dest br.com.dias.OmarchyBroadcast --object-path /br/com/dias/OmarchyBroadcast \
+    --method br.com.dias.OmarchyBroadcast1.SetBlurStrength 0.7
 ```
 
 A failure is reported with its D-Bus error name, which a script can match on:
 
 ```text
-Error: GDBus.Error:br.com.dias.OmaBroadcast1.Error.InvalidConfig: /home/user/.config/oma-broadcast/config.toml:4:1: camera.mdoe: unknown field `mdoe`, expected one of `preference`, `mode`, `fixed_framerate`
+Error: GDBus.Error:br.com.dias.OmarchyBroadcast1.Error.InvalidConfig: /home/user/.config/omarchy-broadcast/config.toml:4:1: camera.mdoe: unknown field `mdoe`, expected one of `preference`, `mode`, `fixed_framerate`
 ```
 
 Watch every signal of the object, `PropertiesChanged` and `Stats` included:
 
 ```sh
-gdbus monitor --session --dest br.com.dias.OmaBroadcast --object-path /br/com/dias/OmaBroadcast
+gdbus monitor --session --dest br.com.dias.OmarchyBroadcast --object-path /br/com/dias/OmarchyBroadcast
 ```
 
 ```text
-/br/com/dias/OmaBroadcast: org.freedesktop.DBus.Properties.PropertiesChanged ('br.com.dias.OmaBroadcast1', {'Consumers': <uint32 1>}, @as [])
-/br/com/dias/OmaBroadcast: org.freedesktop.DBus.Properties.PropertiesChanged ('br.com.dias.OmaBroadcast1', {'State': <'starting'>}, @as [])
-/br/com/dias/OmaBroadcast: org.freedesktop.DBus.Properties.PropertiesChanged ('br.com.dias.OmaBroadcast1', {'State': <'active'>}, @as [])
-/br/com/dias/OmaBroadcast: br.com.dias.OmaBroadcast1.Stats (30.0, 41.2, 6.5, 18.0)
+/br/com/dias/OmarchyBroadcast: org.freedesktop.DBus.Properties.PropertiesChanged ('br.com.dias.OmarchyBroadcast1', {'Consumers': <uint32 1>}, @as [])
+/br/com/dias/OmarchyBroadcast: org.freedesktop.DBus.Properties.PropertiesChanged ('br.com.dias.OmarchyBroadcast1', {'State': <'starting'>}, @as [])
+/br/com/dias/OmarchyBroadcast: org.freedesktop.DBus.Properties.PropertiesChanged ('br.com.dias.OmarchyBroadcast1', {'State': <'active'>}, @as [])
+/br/com/dias/OmarchyBroadcast: br.com.dias.OmarchyBroadcast1.Stats (30.0, 41.2, 6.5, 18.0)
 ```
 
 ## Writing a client
 
-- Read everything once with `GetAll` on `br.com.dias.OmaBroadcast1`, then update from `PropertiesChanged`; subscribe before reading so that no change is missed in between.
+- Read everything once with `GetAll` on `br.com.dias.OmarchyBroadcast1`, then update from `PropertiesChanged`; subscribe before reading so that no change is missed in between.
 - Read with the `NO_AUTO_START` flag, so that looking at the daemon never starts it, and give each read a time limit (see Service presence and activation).
 - Treat a missing name owner as "daemon not running" (see Service presence and activation).
 - Show `Error` when it is non-empty, whatever the state: a rejected configuration reload sets it while the state stays, for example, `active`.

@@ -1,7 +1,7 @@
 # makepkg output and work directories
 /src/
 /pkg/
-/oma-broadcast/
+/omarchy-broadcast/
 *.pkg.tar.*
 .SRCINFO
 *.log

@@ -1,16 +1,16 @@
-# oma-broadcast documentation
+# omarchy-broadcast documentation
 
 | Doc | What it is |
 |---|---|
 | [architecture.md](architecture.md) | Mermaid diagrams: component overview, stage/caps model (ingest, process, output) with capability-driven source selection, persistent loopback writer, daemon lifecycle, threads, D-Bus sequence |
 | [setup/loopback.md](setup/loopback.md) | Creating the "Omarchy Broadcast" v4l2loopback virtual camera: `modprobe` options, reload, and why `exclusive_caps=1` |
-| [setup/daemon.md](setup/daemon.md) | Installing and running `oma-broadcastd` as a systemd user service: `cargo install`, unit and optional D-Bus activation and WirePlumber drop-in files, configuration and state files, reload, logs, and the optional PipeWire camera output (build feature, configuration, checks, application settings, hiding the duplicate camera) |
-| [dbus-api.md](dbus-api.md) | Reference for `br.com.dias.OmaBroadcast1` (revision 3): states, properties, methods, errors, video effects, the `Stats` signal, activation without starting the daemon, `busctl` and `gdbus` examples |
-| [cli-json.md](cli-json.md) | The `oma-broadcast` commands (including `effect`), exit codes and the JSON line format (`status`, `cameras`, `watch --json`) for clients that cannot speak D-Bus |
-| [../clients/omarchy-bar/README.md](../clients/omarchy-bar/README.md) | Omarchy shell bar widget, a client of the daemon through `oma-broadcast watch --json`: icon states, clicks and panel, install by symlink, the `cliPath` setting and CLI resolution order, troubleshooting messages, tests, removal |
+| [setup/daemon.md](setup/daemon.md) | Installing and running `omarchy-broadcastd` as a systemd user service: `cargo install`, unit and optional D-Bus activation and WirePlumber drop-in files, configuration and state files, reload, logs, and the optional PipeWire camera output (build feature, configuration, checks, application settings, hiding the duplicate camera) |
+| [dbus-api.md](dbus-api.md) | Reference for `br.com.dias.OmarchyBroadcast1` (revision 3): states, properties, methods, errors, video effects, the `Stats` signal, activation without starting the daemon, `busctl` and `gdbus` examples |
+| [cli-json.md](cli-json.md) | The `omarchy-broadcast` commands (including `effect`), exit codes and the JSON line format (`status`, `cameras`, `watch --json`) for clients that cannot speak D-Bus |
+| [../clients/omarchy-bar/README.md](../clients/omarchy-bar/README.md) | Omarchy shell bar widget, a client of the daemon through `omarchy-broadcast watch --json`: icon states, clicks and panel, install by symlink, the `cliPath` setting and CLI resolution order, troubleshooting messages, tests, removal |
 | [config.example.toml](config.example.toml) | Every `config.toml` key with its default, as a commented example |
 | [setup/maxine.md](setup/maxine.md) | Step-by-step NVIDIA Maxine VFX SDK setup on Arch/Omarchy: NGC access and key, user-prefix install under `$MAXINE_VFX_ROOT`, the os-release shim and the daemon drop-in, selecting the effects, verification with the probe, troubleshooting, licence notes, uninstall |
-| [setup/microphone.md](setup/microphone.md) | Optional noise-removed virtual microphone "Omarchy Broadcast Mic": a PipeWire filter-chain with an RNNoise (default) or DeepFilterNet LADSPA plugin, run per engine by the `oma-broadcast-mic@.service` user unit; install from the Arch package, `scripts/install-user.sh --mic` or `dist/`, selecting and pinning the microphone, choosing and tuning the engine, troubleshooting, undo |
+| [setup/microphone.md](setup/microphone.md) | Optional noise-removed virtual microphone "Omarchy Broadcast Mic": a PipeWire filter-chain with an RNNoise (default) or DeepFilterNet LADSPA plugin, run per engine by the `omarchy-broadcast-mic@.service` user unit; install from the Arch package, `scripts/install-user.sh --mic` or `dist/`, selecting and pinning the microphone, choosing and tuning the engine, troubleshooting, undo |
 | [research/maxine-linux.md](research/maxine-linux.md) | Technical notes on Maxine on Linux: distribution, licence, versions, Blackwell support, features, API shape, existing projects |
 | [benchmarks/passthrough.md](benchmarks/passthrough.md) | Passthrough and roundtrip results: pipeline, latency method, output format, camera frame-rate caveat, teardown finding; raw results are the JSON files alongside |
 | [benchmarks/ingest-paths.md](benchmarks/ingest-paths.md) | Camera and ingest-path results: GPU-direct, CPU convert and CPU decode cost on two cameras, with variance under load |

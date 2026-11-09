@@ -4,7 +4,7 @@
 // The NVIDIA Maxine Video Effects SDK's model loader reads /etc/os-release
 // and refuses distributions it does not list (docs/setup/maxine.md,
 // section 7). This library redirects read-only opens of exactly
-// "/etc/os-release" to the file named by $OMA_BROADCAST_OS_RELEASE, in the
+// "/etc/os-release" to the file named by $OMARCHY_BROADCAST_OS_RELEASE, in the
 // process that preloads it and nowhere else. Every other call passes
 // through unchanged. See README.md next to this file.
 //
@@ -16,16 +16,16 @@
 //   - Only read-only opens are redirected (O_RDONLY without O_CREAT or
 //     O_TRUNC; fopen modes "r", "rb", "re", ... without '+'). A write goes
 //     to the real path, never to the replacement file.
-//   - $OMA_BROADCAST_OS_RELEASE must be an absolute path. If it is unset,
+//   - $OMARCHY_BROADCAST_OS_RELEASE must be an absolute path. If it is unset,
 //     empty, relative or too long, nothing is redirected (a warning goes to
 //     stderr when it is set but unusable).
 //   - If the replacement file cannot be opened, the real file is opened
 //     instead, so the process behaves as it would without the shim.
 //   - At load time the library removes LD_PRELOAD from the environment, so
 //     child processes do not inherit it (the whole variable: other preloads
-//     listed in it are not passed on either). $OMA_BROADCAST_OS_RELEASE is
+//     listed in it are not passed on either). $OMARCHY_BROADCAST_OS_RELEASE is
 //     kept. The configuration is read once, at that point.
-//   - $OMA_BROADCAST_OS_RELEASE_DEBUG=1 logs each redirect to stderr.
+//   - $OMARCHY_BROADCAST_OS_RELEASE_DEBUG=1 logs each redirect to stderr.
 //
 // Real symbols are resolved with dlsym(RTLD_NEXT, ...) on first use. If a
 // lookup would recurse (dlsym itself opening a file on the same thread) or
@@ -53,8 +53,8 @@
 #define EXPORT __attribute__((visibility("default")))
 
 static const char kTarget[] = "/etc/os-release";
-static const char kEnvPath[] = "OMA_BROADCAST_OS_RELEASE";
-static const char kEnvDebug[] = "OMA_BROADCAST_OS_RELEASE_DEBUG";
+static const char kEnvPath[] = "OMARCHY_BROADCAST_OS_RELEASE";
+static const char kEnvDebug[] = "OMARCHY_BROADCAST_OS_RELEASE_DEBUG";
 
 // ---------------------------------------------------------------------------
 // Configuration, read once.

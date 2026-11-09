@@ -190,7 +190,7 @@ Expected on a quiet desktop: step 1 gives exit 0, and step 3 gives exit 0. Step 
 Same preconditions (no dGPU display, no other GPU client, no `nvidia-smi`). Start the daemon, open the virtual camera once with any application and close it, then wait for the idle grace period and the park (the daemon logs the park and its duration at info):
 
 ```bash
-scripts/dgpu-idle-check.sh --pid "$(pgrep -x oma-broadcastd)" --wait 120; echo "daemon exit=$?"
+scripts/dgpu-idle-check.sh --pid "$(pidof -s omarchy-broadcastd)" --wait 120; echo "daemon exit=$?"
 #    exit 0 -> the dGPU reached "suspended" with the daemon idle after an activation
 #    exit 1 with the daemon as a holder -> the park did not happen; read the daemon log
 #    exit 1 with other holders -> the desktop is not quiet; go back to step 1

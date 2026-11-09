@@ -1,6 +1,6 @@
-# oma-broadcast: architecture
+# omarchy-broadcast: architecture
 
-The rationale behind each design decision is recorded in [adr/](adr/). The D-Bus namespace is `br.com.dias` (bus name `br.com.dias.OmaBroadcast`, interface `br.com.dias.OmaBroadcast1`); see [ADR-0005](adr/0005-dbus-zbus-control-plane.md), the API reference [dbus-api.md](dbus-api.md) and the lifecycle decision [ADR-0011](adr/0011-daemon-lifecycle-and-dbus-api.md). The command-line client and its JSON mode are in [cli-json.md](cli-json.md); installing the service is in [setup/daemon.md](setup/daemon.md).
+The rationale behind each design decision is recorded in [adr/](adr/). The D-Bus namespace is `br.com.dias` (bus name `br.com.dias.OmarchyBroadcast`, interface `br.com.dias.OmarchyBroadcast1`); see [ADR-0005](adr/0005-dbus-zbus-control-plane.md), the API reference [dbus-api.md](dbus-api.md) and the lifecycle decision [ADR-0011](adr/0011-daemon-lifecycle-and-dbus-api.md). The command-line client and its JSON mode are in [cli-json.md](cli-json.md); installing the service is in [setup/daemon.md](setup/daemon.md).
 
 The source is any UVC webcam. The pipeline queries the camera's advertised formats and picks a mode from its capabilities (section 2); nothing in the design is specific to one camera model. Where measured figures are quoted, they come from the reference test cameras (a Logitech MX Brio and a laptop-integrated FHD camera).
 
@@ -9,16 +9,16 @@ The source is any UVC webcam. The pipeline queries the camera's advertised forma
 ```mermaid
 flowchart LR
     subgraph Clients["Clients (optional, replaceable)"]
-        CLI["oma-broadcast CLI<br/>(--json for the QML bar)"]
+        CLI["omarchy-broadcast CLI<br/>(--json for the QML bar)"]
         BAR["Omarchy bar plugin (QML)"]
         SH["scripts via busctl / gdbus"]
     end
 
-    subgraph Daemon["oma-broadcastd (systemd user service)"]
-        IPC["D-Bus interface<br/>zbus · br.com.dias.OmaBroadcast1"]
+    subgraph Daemon["omarchy-broadcastd (systemd user service)"]
+        IPC["D-Bus interface<br/>zbus · br.com.dias.OmarchyBroadcast1"]
         CTL["Controller thread<br/>lifecycle state machine"]
-        CFG["Config (read-only)<br/>~/.config/oma-broadcast/config.toml<br/>reload on SIGHUP / ReloadConfig"]
-        ST["Runtime state<br/>~/.local/state/oma-broadcast/state.toml<br/>Enabled, selected camera,<br/>effect settings"]
+        CFG["Config (read-only)<br/>~/.config/omarchy-broadcast/config.toml<br/>reload on SIGHUP / ReloadConfig"]
+        ST["Runtime state<br/>~/.local/state/omarchy-broadcast/state.toml<br/>Enabled, selected camera,<br/>effect settings"]
         WATCH["Consumer watcher<br/>inotify on the loopback node<br/>+ /proc/PID/fd count"]
         PWT["obc-pipewire thread (optional)<br/>PipeWire main loop, output stream,<br/>registry listener: links to the node"]
         HOT["Hotplug watcher<br/>inotify on /dev"]
@@ -46,7 +46,7 @@ flowchart LR
     end
 
     LB[("v4l2loopback<br/>/dev/videoN")]
-    PWN[("PipeWire node<br/>oma-broadcast, Video/Source<br/>(optional)")]
+    PWN[("PipeWire node<br/>omarchy-broadcast, Video/Source<br/>(optional)")]
 
     CLI & BAR & SH -- "methods / properties" --> IPC
     IPC -- "PropertiesChanged, Stats" --> BAR & CLI
@@ -70,7 +70,7 @@ flowchart LR
 
 The daemon owns one **loopback writer** for its whole life ([ADR-0011](adr/0011-daemon-lifecycle-and-dbus-api.md)): a CPU-only `appsrc` → `v4l2sink` pipeline with the output contract's caps (colour label included). It opens the device once and never renegotiates. While no camera is streaming it pushes a black frame at the contract rate, whenever no forwarded frame has arrived for two contract periods. While the state is `active`, the CUDA output pipeline ends in an `appsink` (instead of the `v4l2sink` that `obc-bench` still uses to write to the loopback directly) and forwards each buffer to the writer by reference, without a copy. The writer stamps every buffer on its own monotonic timeline, so an application that holds the virtual camera sees one format and one uninterrupted stream (black, camera frames, black) across the states. The writer is needed because with `exclusive_caps=1` the device is listed as a capture device only while a writer streams into it, so an idle daemon must still have one for any application to find, and open, the camera.
 
-**Optional PipeWire output** ([ADR-0016](adr/0016-pipewire-output.md)). When the daemon is built with the `pipewire` feature and `[pipewire] enabled = true`, a frame tap on the writer also hands every buffer it pushes (placeholder or camera frame, after restamping) to a native PipeWire `Video/Source` node, `oma-broadcast` ("Omarchy Broadcast"). Both outputs therefore carry the same stream: the same contract, pacing, timestamps and Idle behaviour. Nothing is sent while no PipeWire consumer streams. The node offers three formats at the contract's size and rate (in the order YUY2, NV12, I420; `[pipewire] offer_nv12 = false` drops NV12), and converts on the CPU inside the single copy into the PipeWire buffer, because the format is the consumer's choice at run time and idle placeholders never touch the GPU. A consumer that asks for another format or size fails its own link only. The node exists while the loopback writer runs; its failure is reported as `PipeWireOutput` = `failed`, retried every 2 s, and never puts the daemon in `error`.
+**Optional PipeWire output** ([ADR-0016](adr/0016-pipewire-output.md)). When the daemon is built with the `pipewire` feature and `[pipewire] enabled = true`, a frame tap on the writer also hands every buffer it pushes (placeholder or camera frame, after restamping) to a native PipeWire `Video/Source` node, `omarchy-broadcast` ("Omarchy Broadcast"). Both outputs therefore carry the same stream: the same contract, pacing, timestamps and Idle behaviour. Nothing is sent while no PipeWire consumer streams. The node offers three formats at the contract's size and rate (in the order YUY2, NV12, I420; `[pipewire] offer_nv12 = false` drops NV12), and converts on the CPU inside the single copy into the PipeWire buffer, because the format is the consumer's choice at run time and idle placeholders never touch the GPU. A consumer that asks for another format or size fails its own link only. The node exists while the loopback writer runs; its failure is reported as `PipeWireOutput` = `failed`, retried every 2 s, and never puts the daemon in `error`.
 
 ### Threads
 
@@ -235,7 +235,7 @@ The second output exists only with the PipeWire output enabled; it carries what 
 - **Source changes** (`SelectCamera`, `NextCamera`, a camera failure) rebuild only the ingest pipeline; the output keeps its contract and clock and holds the last frame meanwhile (section 2). The state stays `active`.
 - **`off`** is the privacy state: the camera is closed, so its LED is off. The writer keeps feeding black frames to any application that holds the device.
 - **Effects** follow the same lifecycle: the models exist only in `starting` and `active`, and are unloaded before the CUDA context goes. An effect that cannot run puts the daemon in `error` with the reason (or, with `on_failure = "none"`, leaves it `active` with the reason in `Error`).
-- **Parking** ([ADR-0017](adr/0017-cuda-checkpoint-parking.md)). `cuInit` leaves 7 `/dev/nvidia*` fds and a GPU registration in `nvidia-uvm` that keep the dGPU awake until the process exits. When a session has fully stopped (NVML stopped, CUDA elements at NULL, effect worker joined, Maxine instances destroyed), the daemon checkpoints its own process with the CUDA checkpoint API (`obc-gpu::checkpoint`, driven by the `Parker` in `oma-broadcastd/src/backend/park.rs`). The process then holds no `/dev/nvidia*` fds or mappings and the GPU is unregistered. The next session start restores it before anything touches CUDA. A park failure keeps the GPU awake with a warning. A teardown that leaves a pipeline outside NULL (a session stop, a restart's stop of the previous session, a failed start's cleanup, a camera switch) disables parking until the daemon restarts, with one warning, because a CUDA user still alive would block once parked; a later clean stop does not clear it, and unparking still works. An unpark failure fails the start (`error`, the loopback keeps sending placeholders). While parked, any CUDA call blocks until the unpark, so `obc-gpu`'s `driver()` refuses with an error instead and nothing at Idle may call CUDA. A driver without the API behaves as before. An actual runtime suspend also needs the dGPU to drive no display.
+- **Parking** ([ADR-0017](adr/0017-cuda-checkpoint-parking.md)). `cuInit` leaves 7 `/dev/nvidia*` fds and a GPU registration in `nvidia-uvm` that keep the dGPU awake until the process exits. When a session has fully stopped (NVML stopped, CUDA elements at NULL, effect worker joined, Maxine instances destroyed), the daemon checkpoints its own process with the CUDA checkpoint API (`obc-gpu::checkpoint`, driven by the `Parker` in `omarchy-broadcastd/src/backend/park.rs`). The process then holds no `/dev/nvidia*` fds or mappings and the GPU is unregistered. The next session start restores it before anything touches CUDA. A park failure keeps the GPU awake with a warning. A teardown that leaves a pipeline outside NULL (a session stop, a restart's stop of the previous session, a failed start's cleanup, a camera switch) disables parking until the daemon restarts, with one warning, because a CUDA user still alive would block once parked; a later clean stop does not clear it, and unparking still works. An unpark failure fails the start (`error`, the loopback keeps sending placeholders). While parked, any CUDA call blocks until the unpark, so `obc-gpu`'s `driver()` refuses with an error instead and nothing at Idle may call CUDA. A driver without the API behaves as before. An actual runtime suspend also needs the dGPU to drive no display.
 - **`error`** has a cause in the `Error` property. The daemon leaves it when the cause can have changed (camera set change, a control method, a reload).
 
 ## 4. D-Bus sequence: an application opens the virtual camera

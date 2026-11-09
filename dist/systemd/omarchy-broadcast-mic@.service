@@ -1,0 +1,64 @@
+# Omarchy Broadcast Mic as a systemd user service: runs one noise-removal
+# filter-chain as a dedicated PipeWire client process,
+# `pipewire -c omarchy-broadcast-mic-<instance>.conf`. Independent of
+# omarchy-broadcastd; neither unit needs the other.
+#
+# Instances and their configuration files (in dist/pipewire/):
+#   omarchy-broadcast-mic@rnnoise.service     omarchy-broadcast-mic-rnnoise.conf
+#   omarchy-broadcast-mic@deepfilter.service  omarchy-broadcast-mic-deepfilter.conf
+# This file looks the configuration up by name: PipeWire searches
+# ~/.config/pipewire, /etc/pipewire and /usr/share/pipewire. The Arch package
+# and `scripts/install-user.sh --mic` install a copy of this unit whose
+# ExecStart= names the installed configuration by absolute path.
+#
+# Manual install, from a checkout:
+#   install -Dm644 dist/pipewire/omarchy-broadcast-mic-rnnoise.conf \
+#       ~/.config/pipewire/omarchy-broadcast-mic-rnnoise.conf
+#   install -Dm644 dist/systemd/omarchy-broadcast-mic@.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now omarchy-broadcast-mic@rnnoise.service
+#
+# Run one instance at a time: both configurations create the same source
+# (node.name omarchy-broadcast-mic). To switch engines:
+#   systemctl --user disable --now omarchy-broadcast-mic@rnnoise.service
+#   systemctl --user enable --now omarchy-broadcast-mic@deepfilter.service
+#
+# Undo (manual install):
+#   systemctl --user disable --now omarchy-broadcast-mic@rnnoise.service \
+#       omarchy-broadcast-mic@deepfilter.service
+#   rm ~/.config/systemd/user/omarchy-broadcast-mic@.service \
+#      ~/.config/pipewire/omarchy-broadcast-mic-*.conf
+#   systemctl --user daemon-reload
+#
+# Logs: `journalctl --user -u 'omarchy-broadcast-mic@*'`.
+# More: docs/setup/microphone.md.
+
+[Unit]
+Description=Omarchy Broadcast Mic noise removal (%i)
+
+After=pipewire.service pipewire-session-manager.service
+# Stopped (and not left running against a dead server) whenever PipeWire
+# stops; see [Install] for how it comes back.
+BindsTo=pipewire.service
+
+[Service]
+# Hardening, type, restart policy and slice as in PipeWire's own
+# filter-chain.service.
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+Type=simple
+ExecStart=/usr/bin/pipewire -c omarchy-broadcast-mic-%i.conf
+Restart=on-failure
+Slice=session.slice
+
+[Install]
+# WantedBy=pipewire.service, as wireplumber.service: BindsTo= stops this
+# unit with PipeWire, and enabling it here starts it again whenever
+# pipewire.service starts, including on `systemctl --user restart pipewire`.
+# WantedBy=default.target alone would start it only at login, so a PipeWire
+# restart would leave the source gone until it was started by hand.
+WantedBy=pipewire.service
