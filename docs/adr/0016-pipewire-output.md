@@ -28,7 +28,7 @@
 ### The node
 - A client-owned node created in the daemon process through the `pipewire` crate (pipewire-rs 0.10.1): `node.name` `oma-broadcast`, `node.description` `Omarchy Broadcast`, `media.class` `Video/Source`, `media.role` `Camera`, `media.category` `Capture`.
 - One thread, `obc-pipewire`, with its own PipeWire main loop. It owns the output stream (the driver of the node) and a registry listener.
-- **Formats.** Three `EnumFormat` entries, all at the contract's exact size and frame rate: the contract's format first (NV12, or I420 if configured), then the other two of NV12, YUY2 and I420. A consumer that requests another format or size fails its own link only; the node, its id and the other consumers are unaffected. This was verified live: RGBA and 640x480 requests failed with "no more input formats" on the consumer side only. No colour range or matrix is announced.
+- **Formats.** Three `EnumFormat` entries, all at the contract's exact size and frame rate: in the order YUY2, NV12, I420, whatever the contract's format (see the note on format order below). A consumer that requests another format or size fails its own link only; the node, its id and the other consumers are unaffected. This was verified live: RGBA and 640x480 requests failed with "no more input formats" on the consumer side only. No colour range or matrix is announced.
 
 ### Frames: a tap on the loopback writer
 - Every buffer the writer pushes to the loopback, a placeholder or a camera frame, after it is restamped, is also handed to the PipeWire output. The two outputs therefore carry the same stream: the same contract, the same phase-locked pacing ([ADR-0010](0010-phase-locked-output-clock.md)), the same timestamps (the writer's timeline; `spa_meta_header` `pts` and `seq` are the writer's PTS and offset) and the same Idle behaviour (black placeholders while no camera runs, [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md)).
@@ -61,6 +61,9 @@ Once WirePlumber has probed the loopback while the writer streams, PipeWire also
 - The build gains an optional dependency (libpipewire, clang). The default build and the default CI job are unchanged; a second CI job builds and tests with the feature, and the Arch package is built with it.
 - Tests: [../testing.md](../testing.md#the-pipewire-output).
 - Not supported: a PipeWire-only mode without v4l2loopback; a colour range or matrix announced to consumers.
+
+## Notes
+- **Format order (2026-11-09).** The node offers YUY2 first, then NV12 and I420, whatever the contract's format. OBS Studio 32.2's PipeWire camera source computes NV12 row size as 2 bytes per pixel and reads past the buffer; offering YUY2 first avoids this. A consumer that asks for NV12 or I420 explicitly still negotiates it, and the buffer layout and stride the node announces are unchanged.
 
 ## Alternatives considered
 

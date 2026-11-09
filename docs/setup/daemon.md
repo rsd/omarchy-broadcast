@@ -135,6 +135,8 @@ WirePlumber probes video devices when it starts. A loopback device that has no w
 
 Applications that open `/dev/video*` directly are not affected. Meanwhile, `gst-device-monitor-1.0 -i Video/Source` lists the camera through the v4l2 provider. Details are in [testing.md](../testing.md#discovery-by-pipewire). The daemon can also register its own PipeWire source, which needs none of this: see the next section.
 
+A v4l2loopback device serves one capture stream at a time: a second application that opens the same device gets `EBUSY` at `VIDIOC_S_FMT` or `VIDIOC_REQBUFS`. Applications that need the camera at the same moment should use the PipeWire node, which serves several consumers, or the loopback should have more devices ([loopback.md](loopback.md)).
+
 ## The PipeWire output
 
 Optionally the daemon also registers a native PipeWire video source, "Omarchy Broadcast", next to the loopback device ([ADR-0016](../adr/0016-pipewire-output.md)). The loopback stays as it is and remains the default. Applications that use PipeWire for cameras find the node without WirePlumber having to probe the loopback. It is off in two places: the daemon must be built with the cargo feature, and the configuration must enable it.
@@ -177,7 +179,7 @@ gst-launch-1.0 pipewiresrc target-object=oma-broadcast ! videoconvert ! autovide
 | GNOME Snapshot, GStreamer `pipewiresrc` | work without a setting |
 | Zoom, Discord | do not use the PipeWire camera; select the loopback camera |
 
-The node offers NV12, YUY2 and I420 at the output contract's size and rate. An application that asks for another format or size fails to link, and nothing else is affected.
+The node offers YUY2, NV12 and I420, in that order, at the output contract's size and rate. YUY2 is first because OBS Studio 32.2's PipeWire camera source mis-sizes NV12 rows; an application that asks for NV12 or I420 explicitly still gets it. An application that asks for another format or size fails to link, and nothing else is affected.
 
 ### Hiding the duplicate
 

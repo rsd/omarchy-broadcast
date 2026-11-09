@@ -26,9 +26,9 @@
 //! no consumer is linked and while no frame arrives.
 //!
 //! **Formats.** Three EnumFormat entries, all at the contract's exact size
-//! and frame rate: the contract's format first, then the other two of NV12,
-//! YUY2 and I420 ([`format::offered_formats`]). Nothing is scaled. When a
-//! consumer has chosen, the stream asks for buffers of one data block
+//! and frame rate, in the order YUY2, NV12, I420 ([`format::offered_formats`];
+//! YUY2 first because OBS 32.x overreads NV12 buffers).
+//! Nothing is scaled. When a consumer has chosen, the stream asks for buffers of one data block
 //! holding a whole frame in `GstVideoInfo`'s default layout
 //! ([`format::Layout`], what `pipewiresink` sends and `pipewiresrc` and
 //! browsers accept), in memfd or plain memory, with a `spa_meta_header`.
