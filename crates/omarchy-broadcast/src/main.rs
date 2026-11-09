@@ -20,8 +20,8 @@ use obc_ipc::IpcError;
 
 use crate::bus::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Failure, READ_TIMEOUT};
 
-/// Time allowed for `on`, `off`, `camera` and `effect <effect>`, which may
-/// wait for D-Bus activation of the daemon.
+/// Time allowed for `on`, `off`, `camera`, `effect <effect>` and `denoise`,
+/// which may wait for D-Bus activation of the daemon.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 const AFTER_HELP: &str = "\
@@ -34,8 +34,8 @@ Exit status:
   4  any other D-Bus failure, a timeout, or a failed write to stdout
 
 `status`, `cameras`, `watch` and `effect` without an effect never start the daemon. `on`,
-`off`, `camera` and `effect <effect>` may start it through D-Bus activation when its
-activation file is installed.
+`off`, `camera`, `effect <effect>` and `denoise` may start it through D-Bus activation when
+its activation file is installed.
 
 `--json` output is documented in docs/cli-json.md; the D-Bus interface in docs/dbus-api.md.";
 
@@ -98,6 +98,17 @@ enum Command {
         /// effect.
         #[arg(long, conflicts_with = "effect")]
         json: bool,
+    },
+    /// Switch video noise removal on or off.
+    ///
+    /// It reduces the grain of the camera image and runs before the effect
+    /// (or alone with `none`). If it cannot run, the camera image is shown
+    /// without it and `status` says why. The setting persists across
+    /// restarts of the daemon.
+    Denoise {
+        /// `on` or `off`.
+        #[arg(value_parser = ["on", "off"])]
+        value: String,
     },
     /// Follow state changes and stats until interrupted.
     Watch {
@@ -312,6 +323,30 @@ async fn set_effect(req: &EffectRequest) -> u8 {
     }
 }
 
+/// `denoise on|off`: checks that the daemon has noise removal, sets it, and
+/// prints the result read back after the call.
+async fn set_denoise(on: bool) -> u8 {
+    let result = within(CALL_TIMEOUT, async {
+        let conn = bus::connect().await?;
+        let proxy = bus::proxy(&conn).await?;
+        let revision = proxy
+            .interface_revision()
+            .await
+            .map_err(|e| bus::classify(&e, true))?;
+        bus::require_denoise(revision)?;
+        proxy.set_denoise(on).await.map_err(bus::classify_ipc)?;
+        bus::fetch(&conn).await
+    })
+    .await;
+    match result {
+        Ok(s) => {
+            out::print(&human::denoise_text(&s));
+            EXIT_OK
+        }
+        Err(f) => report(&f, false),
+    }
+}
+
 /// What `main` runs once the command line is checked.
 enum Job {
     Command(Command),
@@ -338,6 +373,7 @@ async fn run(job: Job) -> u8 {
         Job::Command(Command::Cameras { json }) => show(*json, View::Cameras).await,
         Job::Command(Command::Effect { json, .. }) => show(*json, View::Effect).await,
         Job::Command(Command::Watch { json }) => watch::run(*json).await,
+        Job::Command(Command::Denoise { value }) => set_denoise(value == "on").await,
         Job::Command(command @ (Command::On | Command::Off | Command::Camera { .. })) => {
             control(command).await
         }

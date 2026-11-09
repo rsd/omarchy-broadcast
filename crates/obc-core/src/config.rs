@@ -221,6 +221,9 @@ pub struct EffectConfig {
         deserialize_with = "de_background_image"
     )]
     pub background_image: Option<PathBuf>,
+    /// Video noise removal, a stage of its own that runs before the effect
+    /// (or alone, with `mode = "none"`). Off by default.
+    pub denoise: bool,
     /// What the virtual camera shows when the effect cannot run.
     #[serde(serialize_with = "ser_display", deserialize_with = "de_from_str")]
     pub on_failure: EffectOnFailure,
@@ -254,6 +257,7 @@ impl Default for EffectConfig {
             mode: EffectMode::None,
             blur_strength: Self::DEFAULT_BLUR_STRENGTH,
             background_image: None,
+            denoise: false,
             on_failure: EffectOnFailure::Black,
         }
     }
@@ -649,6 +653,10 @@ fn de_state_blur_strength<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>
     de_blur_strength(d).map(Some)
 }
 
+fn de_state_denoise<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    bool::deserialize(d).map(Some)
+}
+
 fn de_hold_timeout<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
     de_secs(d, check_hold_timeout)
 }
@@ -731,10 +739,11 @@ pub fn selector_form(s: &CameraSelector) -> String {
 /// The effect keys override the config's `[effect]` keys of the same name
 /// while set (`None`: the config's value applies). A value that is not
 /// valid (an unknown effect, a strength outside 0 to 1, a relative image
-/// path) makes the whole file unparseable, so the daemon's fail-closed rule
-/// for a damaged state file applies: it starts `off`, with the camera
-/// closed, and never streams the raw image in place of an effect it could
-/// not read. Unknown keys (a newer daemon's) are ignored.
+/// path, a `denoise` that is not a boolean) makes the whole file
+/// unparseable, so the daemon's fail-closed rule for a damaged state file
+/// applies: it starts `off`, with the camera closed, and never streams the
+/// raw image in place of an effect it could not read. Unknown keys (a newer
+/// daemon's) are ignored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RuntimeState {
@@ -764,6 +773,12 @@ pub struct RuntimeState {
         deserialize_with = "de_background_image"
     )]
     pub background_image: Option<PathBuf>,
+    /// Noise removal switched with `SetDenoise`.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_state_denoise"
+    )]
+    pub denoise: Option<bool>,
 }
 
 impl Default for RuntimeState {
@@ -774,6 +789,7 @@ impl Default for RuntimeState {
             effect: None,
             blur_strength: None,
             background_image: None,
+            denoise: None,
         }
     }
 }
@@ -790,6 +806,7 @@ impl RuntimeState {
                 Some(p) if !p.as_os_str().is_empty() => Some(p.clone()),
                 _ => config.background_image.clone(),
             },
+            denoise: self.denoise.unwrap_or(config.denoise),
             on_failure: config.on_failure,
         }
     }
@@ -1022,6 +1039,7 @@ start_debounce_ms = 0
 mode = "replace"
 blur_strength = 1
 background_image = "/home/u/Pictures/office.png"
+denoise = true
 on_failure = "none"
 
 [pipewire]
@@ -1062,6 +1080,7 @@ offer_nv12 = false
                 mode: EffectMode::Replace,
                 blur_strength: 1.0,
                 background_image: Some("/home/u/Pictures/office.png".into()),
+                denoise: true,
                 on_failure: EffectOnFailure::None,
             }
         );
@@ -1129,6 +1148,7 @@ offer_nv12 = false
             "start_debounce_ms",
             "blur_strength",
             "background_image",
+            "denoise",
             "on_failure",
             "enabled",
             "offer_nv12",
@@ -1307,6 +1327,11 @@ offer_nv12 = false
                 "absolute path",
             ),
             (
+                "[effect]\ndenoise = \"yes\"",
+                "effect.denoise",
+                "invalid type",
+            ),
+            (
                 "[effect]\non_failure = \"raw\"",
                 "effect.on_failure",
                 "unsupported effect failure policy",
@@ -1406,6 +1431,7 @@ offer_nv12 = false
         assert_eq!(c.effect.mode, EffectMode::None);
         assert_eq!(c.effect.blur_strength, 0.5);
         assert_eq!(c.effect.background_image, None);
+        assert!(!c.effect.denoise);
         assert_eq!(c.effect.on_failure, EffectOnFailure::Black);
         // An empty image is the default, and is not written back.
         let c = parse("[effect]\nbackground_image = \"\"\n").unwrap();
@@ -1461,6 +1487,7 @@ offer_nv12 = false
             effect: Some(EffectMode::Blur),
             blur_strength: Some(0.25),
             background_image: Some("/home/u/bg.png".into()),
+            denoise: Some(true),
         };
         st.save(&path).unwrap();
         assert_eq!(RuntimeState::load(&path), (st.clone(), None));
@@ -1609,6 +1636,7 @@ offer_nv12 = false
             mode: EffectMode::Blur,
             blur_strength: 0.8,
             background_image: Some("/cfg/bg.png".into()),
+            denoise: true,
             on_failure: EffectOnFailure::None,
         };
         // Nothing set: the config.
@@ -1618,6 +1646,7 @@ offer_nv12 = false
             effect: Some(EffectMode::None),
             blur_strength: Some(0.1),
             background_image: Some("/state/bg.png".into()),
+            denoise: Some(false),
             ..RuntimeState::default()
         }
         .effect_over(&config);
@@ -1627,6 +1656,7 @@ offer_nv12 = false
                 mode: EffectMode::None,
                 blur_strength: 0.1,
                 background_image: Some("/state/bg.png".into()),
+                denoise: false,
                 on_failure: EffectOnFailure::None,
             }
         );
@@ -1651,6 +1681,20 @@ offer_nv12 = false
         // An integer strength is a number too.
         fs::write(&path, "enabled = true\nblur_strength = 1\n").unwrap();
         assert_eq!(RuntimeState::load(&path).0.blur_strength, Some(1.0));
+        // Denoise: written only while set, and an override in either
+        // direction.
+        assert!(!text.contains("denoise"), "{text}");
+        let on = RuntimeState {
+            denoise: Some(true),
+            ..RuntimeState::default()
+        };
+        on.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("denoise = true"), "{text}");
+        assert_eq!(RuntimeState::load(&path), (on.clone(), None));
+        let config_off = EffectConfig::default();
+        assert!(on.effect_over(&config_off).denoise);
+        assert!(RuntimeState::default().effect_over(&config).denoise);
     }
 
     #[test]
@@ -1663,6 +1707,8 @@ offer_nv12 = false
             "enabled = true\nblur_strength = 2.0\n",
             "enabled = true\nblur_strength = nan\n",
             "enabled = true\nbackground_image = \"bg.png\"\n",
+            "enabled = true\ndenoise = \"yes\"\n",
+            "enabled = true\ndenoise = 1\n",
         ] {
             fs::write(&path, text).unwrap();
             let (st, warning) = RuntimeState::load(&path);

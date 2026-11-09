@@ -42,11 +42,16 @@ fn properties_have_their_defaults() {
     assert_eq!(e.property::<f64>("blur-strength"), 0.5);
     assert_eq!(e.property::<String>("background"), "");
     assert_eq!(e.property::<String>("on-failure"), "black");
+    assert!(!e.property::<bool>("denoise"));
     assert_eq!(e.property::<String>("status"), "off");
     assert_eq!(fx.settings(), EffectSettings::default());
     assert_eq!(fx.status(), EffectStatus::Off);
+    assert_eq!(fx.denoise_status(), EffectStatus::Off);
     let s = fx.stats();
     assert_eq!(s.effect, EffectKind::None);
+    assert_eq!(s.denoise, EffectStatus::Off);
+    assert_eq!(s.frames_denoised, 0);
+    assert_eq!((s.denoise_ms_p50, s.denoise_ms_p95), (None, None));
     assert!(!s.cuda_active);
     assert_eq!(
         s.frames_processed + s.frames_black + s.frames_passthrough,
@@ -117,10 +122,66 @@ fn apply_validates_and_sets_everything_at_once() {
         blur_strength: 0.25,
         background: Some("/srv/bg.png".into()),
         fallback: EffectFallback::None,
+        denoise: true,
     };
     fx.apply(&s).unwrap();
     assert_eq!(fx.settings(), s);
     assert_eq!(fx.status(), EffectStatus::Loading);
+    assert_eq!(fx.denoise_status(), EffectStatus::Loading);
+    assert_eq!(fx.stats().denoise, EffectStatus::Loading);
+}
+
+#[test]
+fn denoise_is_a_property_of_its_own_and_has_a_status_of_its_own() {
+    let (e, fx) = element();
+    let pspec = e.find_property("denoise").unwrap();
+    assert!(
+        pspec.flags().contains(gst::PARAM_FLAG_MUTABLE_PLAYING),
+        "changeable while playing"
+    );
+    // none with denoise: the effect stays off; the stage loads.
+    e.set_property("denoise", true);
+    assert!(e.property::<bool>("denoise"));
+    assert!(fx.settings().denoise);
+    assert_eq!(fx.status(), EffectStatus::Off);
+    assert_eq!(e.property::<String>("status"), "off");
+    assert_eq!(fx.denoise_status(), EffectStatus::Loading);
+    // An effect with it: both load.
+    e.set_property("effect", "blur");
+    assert_eq!(fx.status(), EffectStatus::Loading);
+    assert_eq!(fx.denoise_status(), EffectStatus::Loading);
+    // Turning it off is not a change of the effect.
+    e.set_property("denoise", false);
+    assert_eq!(fx.status(), EffectStatus::Loading);
+    assert_eq!(fx.denoise_status(), EffectStatus::Off);
+    assert_eq!(
+        fx.settings(),
+        EffectSettings::of(EffectKind::Blur),
+        "the denoise flag is part of the settings"
+    );
+}
+
+#[test]
+fn the_new_source_flag_is_a_free_video_buffer_flag() {
+    let f = gst_obc::NEW_SOURCE_FLAG;
+    assert_eq!(f.bits().count_ones(), 1);
+    assert!(!f.intersects(gst::BufferFlags::all()), "a core buffer flag");
+    // GST_BUFFER_FLAG_LAST is GST_VIDEO_BUFFER_FLAG_INTERLACED on video
+    // buffers: the flag must be past every video flag.
+    assert!(f.bits() > gst_video::ffi::GST_VIDEO_BUFFER_FLAG_INTERLACED);
+    assert_eq!(f.bits(), gst_video::ffi::GST_VIDEO_BUFFER_FLAG_LAST);
+    // It survives a shallow copy, as the output clock pushes frames, and
+    // is read with the helper (`flags()` drops bits it has no name for).
+    gst::init().unwrap();
+    let mut b = gst::Buffer::new();
+    assert!(!gst_obc::has_new_source_flag(&b));
+    b.get_mut().unwrap().set_flags(f);
+    let mut c = b.copy();
+    assert!(gst_obc::has_new_source_flag(&c));
+    assert!(!c.flags().contains(gst::BufferFlags::DISCONT));
+    c.make_mut().unset_flags(f);
+    assert!(!gst_obc::has_new_source_flag(&c));
+    assert!(gst_obc::has_new_source_flag(&b));
 }
 
 #[test]
@@ -133,22 +194,28 @@ fn status_changes_are_posted_on_the_bus() {
     // Strength alone changes nothing that is loaded: no message.
     e.set_property("blur-strength", 0.9f64);
     e.set_property("effect", "none");
+    // A change of the denoise status alone is posted too.
+    e.set_property("denoise", true);
+    e.set_property("denoise", false);
     let mut seen = Vec::new();
     while let Some(m) = bus.pop_filtered(&[gst::MessageType::Element]) {
         let s = m.structure().unwrap();
         if s.name() == STATUS_MESSAGE {
-            seen.push((
-                s.get::<String>("effect").unwrap(),
-                s.get::<String>("status").unwrap(),
-                s.get::<String>("reason").unwrap(),
-            ));
+            let field = |f: &str| s.get::<String>(f).unwrap();
+            seen.push(
+                ["effect", "status", "reason", "denoise", "denoise-reason"]
+                    .map(field)
+                    .join(" "),
+            );
         }
     }
     assert_eq!(
         seen,
         [
-            ("blur".to_string(), "loading".to_string(), String::new()),
-            ("none".to_string(), "off".to_string(), String::new()),
+            "blur loading  off ",
+            "none off  off ",
+            "none off  loading ",
+            "none off  off ",
         ]
     );
 }

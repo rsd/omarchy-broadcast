@@ -38,6 +38,10 @@ pub const EXIT_FAILURE: u8 = 4;
 /// `BackgroundImage`, `SetEffect` and its siblings).
 pub const EFFECTS_REVISION: u32 = 2;
 
+/// The first `InterfaceRevision` with noise removal (`Denoise`,
+/// `SetDenoise`).
+pub use obc_ipc::DENOISE_REVISION;
+
 /// How to start the daemon, quoted in the not-running message.
 pub const START_HINT: &str = "systemctl --user start omarchy-broadcastd";
 
@@ -117,6 +121,18 @@ pub fn require_effects(revision: u32) -> Result<(), Failure> {
     Err(Failure::Unsupported(format!(
         "the daemon does not support effects (its interface revision is {revision}, \
          effects need {EFFECTS_REVISION}); update omarchy-broadcastd"
+    )))
+}
+
+/// Fails unless a daemon of interface revision `revision` has noise
+/// removal: an older one has no `SetDenoise`.
+pub fn require_denoise(revision: u32) -> Result<(), Failure> {
+    if revision >= DENOISE_REVISION {
+        return Ok(());
+    }
+    Err(Failure::Unsupported(format!(
+        "the daemon does not support noise removal (its interface revision is {revision}, \
+         noise removal needs {DENOISE_REVISION}); update omarchy-broadcastd"
     )))
 }
 
@@ -260,6 +276,19 @@ mod tests {
                 && f.message().ends_with("; update omarchy-broadcastd"),
             "{}",
             f.message()
+        );
+    }
+
+    #[test]
+    fn denoise_needs_revision_4() {
+        assert!(require_denoise(DENOISE_REVISION).is_ok());
+        assert!(require_denoise(DENOISE_REVISION + 1).is_ok());
+        let f = require_denoise(3).unwrap_err();
+        assert_eq!(f.exit_code(), EXIT_REJECTED);
+        assert_eq!(
+            f.message(),
+            "the daemon does not support noise removal (its interface revision is 3, noise \
+             removal needs 4); update omarchy-broadcastd"
         );
     }
 

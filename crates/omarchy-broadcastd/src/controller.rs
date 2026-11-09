@@ -36,14 +36,30 @@
 //!
 //! The effect (`docs/adr/0012-video-effects-and-maxine-backend.md`): the
 //! effective settings are the state file's (set by `SetEffect`,
-//! `SetBlurStrength`, `SetBackgroundImage`) over the config's `[effect]`.
-//! A change applies to the running session without restarting it. When the
-//! effect cannot run, `effect.on_failure` decides: `black` is a fault (the
-//! session stops, so the camera is closed and the GPU released, and the
-//! writer's placeholder keeps the stream black); `none` keeps streaming
-//! without the effect, with the reason in `Error`. An effect that is
-//! unavailable before the session starts is found out before the camera
+//! `SetBlurStrength`, `SetBackgroundImage`, `SetDenoise`) over the config's
+//! `[effect]`. A change applies to the running session without restarting
+//! it. When the effect cannot run, `effect.on_failure` decides: `black` is a
+//! fault (the session stops, so the camera is closed and the GPU released,
+//! and the writer's placeholder keeps the stream black); `none` keeps
+//! streaming without the effect, with the reason in `Error`. An effect that
+//! is unavailable before the session starts is found out before the camera
 //! is opened.
+//!
+//! Noise removal (`denoise`) is a stage of its own, before the effect or
+//! alone with `none`. It hides nothing, so its failure never stops the
+//! session, whatever `effect.on_failure` says: the session streams on
+//! without the stage, the state does not change, and `Error` says why
+//! (after an effect failure's text, which matters more: the background may
+//! show). It is not checked before the session starts; a failure arrives
+//! through the effect report. The failure is cleared when the stage becomes
+//! ready (or is no longer requested), by an effect method, a reload, or the
+//! end of the session. A failure of the whole chain (the effect's load or
+//! frame) shows in the stage's status too, with the effect's reason: that
+//! is the effect's failure, never reported as the stage's. The two statuses
+//! are read one after the other, so a stage failure seen while the effect
+//! is still loading or ready is taken as the stage's only when the next
+//! poll confirms it (the effect's status by then shows a failure of the
+//! chain).
 //!
 //! Consumers are of two kinds: processes holding the loopback (the
 //! consumer watcher's count) and, with `[pipewire] enabled`, links to the
@@ -123,6 +139,8 @@ pub enum Command {
     SetBlurStrength(f64, Reply),
     /// `SetBackgroundImage(s)` (empty: clear it).
     SetBackgroundImage(String, Reply),
+    /// `SetDenoise(b)`.
+    SetDenoise(bool, Reply),
     /// `ReloadConfig()` (with its reply) or SIGHUP (without).
     ReloadConfig(Option<Reply>),
     /// The consumer watcher's count of processes holding the loopback.
@@ -148,6 +166,7 @@ pub enum Change {
     Effect(String),
     BlurStrength(f64),
     BackgroundImage(String),
+    Denoise(bool),
     Consumers(u32),
     LoopbackConsumers(u32),
     PipeWireConsumers(u32),
@@ -167,6 +186,7 @@ impl Change {
             Change::Effect(_) => "Effect",
             Change::BlurStrength(_) => "BlurStrength",
             Change::BackgroundImage(_) => "BackgroundImage",
+            Change::Denoise(_) => "Denoise",
             Change::Consumers(_) => "Consumers",
             Change::LoopbackConsumers(_) => "LoopbackConsumers",
             Change::PipeWireConsumers(_) => "PipeWireConsumers",
@@ -289,6 +309,9 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Vec<Change> {
     if old.background_image != new.background_image {
         out.push(Change::BackgroundImage(new.background_image.clone()));
     }
+    if old.denoise != new.denoise {
+        out.push(Change::Denoise(new.denoise));
+    }
     if old.consumers != new.consumers {
         out.push(Change::Consumers(new.consumers));
     }
@@ -373,6 +396,7 @@ pub fn preliminary_snapshot(paths: &Paths) -> Snapshot {
         effect: effect.mode.as_str().into(),
         blur_strength: effect.blur_strength,
         background_image: image_string(&effect),
+        denoise: effect.denoise,
         consumers: 0,
         loopback_consumers: 0,
         pipewire_consumers: 0,
@@ -443,6 +467,12 @@ fn effect_failure_text(effect: &EffectConfig, reason: &str) -> String {
     }
 }
 
+/// The `Error` text of noise removal that cannot run (the session streams
+/// on without it).
+fn denoise_failure_text(reason: &str) -> String {
+    format!("noise removal unavailable: {reason}; the camera image is shown without it")
+}
+
 /// Told the loopback node whenever it changes (`None`: no writer), so the
 /// consumer watcher watches the right node.
 pub type SinkHook = Box<dyn FnMut(Option<&Path>) + Send>;
@@ -510,9 +540,24 @@ pub struct Controller<B: MediaBackend> {
     effect_seen: Option<EffectStatus>,
     /// The effect has been polled in this session.
     effect_polled: bool,
+    /// Noise removal cannot run: the session streams without it, and this
+    /// is its `Error` text (behind an effect failure's). Cleared when the
+    /// stage becomes ready or is no longer requested, by an effect method,
+    /// a reload, the next session start or the end of the session.
+    denoise_failure: Option<String>,
+    /// The noise removal status last polled in this session, as
+    /// [`Self::effect_seen`] is for the effect.
+    denoise_seen: Option<EffectStatus>,
+    /// Noise removal has been polled in this session.
+    denoise_polled: bool,
+    /// A noise removal failure polled once while the effect was loading or
+    /// ready, held for the next poll: it may be the whole chain's failure,
+    /// read before the effect's status showed it.
+    denoise_held: Option<EffectStatus>,
     /// The effect settings the running session was last given (`None`: no
-    /// session). Only a change of the effect or its image, or a failure,
-    /// starts a new load to follow; a strength change does not.
+    /// session). Only a change of the effect, its image or the noise
+    /// removal request, or a failure of either, starts a new load to
+    /// follow; a strength change does not.
     effect_applied: Option<EffectConfig>,
     /// When the effect's GPU time is logged next.
     effect_log_at: Option<Instant>,
@@ -564,13 +609,15 @@ impl<B: MediaBackend> Controller<B> {
             }
             None => error,
         };
+        let effect = runtime.effect_over(&config.effect);
         info!(
-            "config {}, state {} (enabled: {}, camera: {}, effect: {})",
+            "config {}, state {} (enabled: {}, camera: {}, effect: {}, noise removal: {})",
             paths.config.display(),
             paths.state.display(),
             runtime.enabled,
             runtime.camera.as_deref().unwrap_or("not selected"),
-            runtime.effect_over(&config.effect).mode
+            effect.mode,
+            if effect.denoise { "on" } else { "off" }
         );
         let mut c = Controller {
             backend,
@@ -589,6 +636,10 @@ impl<B: MediaBackend> Controller<B> {
             effect_failure: None,
             effect_seen: None,
             effect_polled: false,
+            denoise_failure: None,
+            denoise_seen: None,
+            denoise_polled: false,
+            denoise_held: None,
             effect_applied: None,
             effect_log_at: None,
             consumers: 0,
@@ -634,6 +685,10 @@ impl<B: MediaBackend> Controller<B> {
             }
             Command::SetBackgroundImage(path, reply) => {
                 let res = self.set_background_image(&path, now);
+                let _ = reply.send(res);
+            }
+            Command::SetDenoise(on, reply) => {
+                let res = self.set_denoise(on, now);
                 let _ = reply.send(res);
             }
             Command::ReloadConfig(reply) => {
@@ -740,8 +795,9 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     /// The `Error` text of the causes that still hold (the writer missing,
-    /// a fault, a damaged state file), or empty: what clearing an error
-    /// whose own cause is gone leaves.
+    /// a fault, an effect failure, a noise removal failure, a damaged state
+    /// file, in that order), or empty: what clearing an error whose own
+    /// cause is gone leaves.
     fn standing_error(&self) -> String {
         if self.writer.is_none()
             && let Some(e) = &self.writer_error
@@ -752,6 +808,9 @@ impl<B: MediaBackend> Controller<B> {
             return f.clone();
         }
         if let Some(e) = &self.effect_failure {
+            return e.clone();
+        }
+        if let Some(e) = &self.denoise_failure {
             return e.clone();
         }
         self.state_damaged.clone().unwrap_or_default()
@@ -852,6 +911,7 @@ impl<B: MediaBackend> Controller<B> {
             effect: effect.mode.as_str().into(),
             blur_strength: effect.blur_strength,
             background_image: image_string(&effect),
+            denoise: effect.denoise,
             consumers: self.consumers,
             loopback_consumers: self.loopback_consumers,
             pipewire_consumers: self.pipewire_consumers,
@@ -1098,21 +1158,34 @@ impl<B: MediaBackend> Controller<B> {
         }
     }
 
-    /// Follows the running session's effect: logs its transitions and acts
-    /// on a failure ([`Self::effect_failed`]). Returns whether the session
-    /// was stopped.
+    /// Follows the running session's effect and noise removal: logs their
+    /// transitions and acts on a failure ([`Self::effect_failed`],
+    /// [`Self::poll_denoise`]). The effect comes first: a failure of the
+    /// whole chain is the effect's, also shown by the stage. Returns whether
+    /// the session was stopped.
     fn poll_effect(&mut self, now: Instant) -> bool {
-        let Some(EffectReport {
+        let Some(report) = self.backend.effect_report() else {
+            return false;
+        };
+        if self.follow_effect(&report, now) {
+            return true;
+        }
+        self.poll_denoise(report.denoise, &report.status);
+        false
+    }
+
+    /// The effect's part of [`Self::poll_effect`].
+    fn follow_effect(&mut self, report: &EffectReport, now: Instant) -> bool {
+        let EffectReport {
             status,
             load_ms,
             reused,
             gpu_ms_p50,
-        }) = self.backend.effect_report()
-        else {
-            return false;
-        };
+            ..
+        } = report;
+        let (load_ms, reused, gpu_ms_p50) = (*load_ms, *reused, *gpu_ms_p50);
         let mode = self.effect().mode;
-        if status == EffectStatus::Ready
+        if *status == EffectStatus::Ready
             && let Some(gpu) = gpu_ms_p50
             && self.effect_log_at.is_none_or(|t| now >= t)
         {
@@ -1121,7 +1194,7 @@ impl<B: MediaBackend> Controller<B> {
             }
             self.effect_log_at = Some(now + EFFECT_LOG_PERIOD);
         }
-        if self.effect_seen.as_ref() == Some(&status) {
+        if self.effect_seen.as_ref() == Some(status) {
             return false;
         }
         self.effect_seen = Some(status.clone());
@@ -1146,9 +1219,80 @@ impl<B: MediaBackend> Controller<B> {
                     self.error = self.standing_error();
                 }
             }
-            EffectStatus::Failed(reason) => return self.effect_failed(&reason),
+            EffectStatus::Failed(reason) => return self.effect_failed(reason),
         }
         false
+    }
+
+    /// Follows the noise removal stage of the running session, `effect`
+    /// being the effect's status of the same report. Its failure never
+    /// stops the session: it streams on without the stage (the element
+    /// drops it), the state is unchanged, and `Error` says why unless an
+    /// effect failure, which matters more, already does.
+    ///
+    /// A failure with the effect's own failure reason is the whole chain's
+    /// (the element shows it on both): the effect's, not recorded as the
+    /// stage's. One seen while the effect is loading or ready waits for the
+    /// next poll: the effect's status is read first, so a failure of the
+    /// chain can show on the stage a poll before it does on the effect.
+    /// With the effect off (`none`), or failed for another reason, the
+    /// stage's failure is its own at once.
+    fn poll_denoise(&mut self, status: EffectStatus, effect: &EffectStatus) {
+        if let EffectStatus::Failed(reason) = &status
+            && self.denoise_seen.as_ref() != Some(&status)
+        {
+            if matches!(effect, EffectStatus::Failed(r) if r == reason) {
+                debug!("noise removal stopped with the effect: {reason}");
+                self.denoise_held = None;
+                self.denoise_seen = Some(status);
+                self.denoise_polled = true;
+                self.clear_denoise_failure();
+                return;
+            }
+            if matches!(effect, EffectStatus::Loading | EffectStatus::Ready)
+                && self.denoise_held.as_ref() != Some(&status)
+            {
+                self.denoise_held = Some(status);
+                return;
+            }
+        }
+        self.denoise_held = None;
+        if self.denoise_seen.as_ref() == Some(&status) {
+            return;
+        }
+        self.denoise_seen = Some(status.clone());
+        let first = !std::mem::replace(&mut self.denoise_polled, true);
+        match status {
+            EffectStatus::Off => {
+                if !first {
+                    info!("noise removal off");
+                }
+                self.clear_denoise_failure();
+            }
+            EffectStatus::Loading => info!("noise removal: loading"),
+            EffectStatus::Ready => {
+                info!("noise removal ready");
+                self.clear_denoise_failure();
+            }
+            EffectStatus::Failed(reason) => {
+                let msg = denoise_failure_text(&reason);
+                warning!("{msg}");
+                if self.effect_failure.is_none() {
+                    self.error = msg.clone();
+                }
+                self.denoise_failure = Some(msg);
+            }
+        }
+    }
+
+    /// Ends a noise removal failure: its `Error` gives way to the causes
+    /// still standing.
+    fn clear_denoise_failure(&mut self) {
+        if let Some(old) = self.denoise_failure.take()
+            && self.error == old
+        {
+            self.error = self.standing_error();
+        }
     }
 
     /// The running session's effect cannot run, for `reason`. With
@@ -1330,6 +1474,7 @@ impl<B: MediaBackend> Controller<B> {
         // camera stays closed.
         let mut params = self.session_params();
         self.effect_failure = None;
+        self.denoise_failure = None;
         if params.effect.mode != EffectMode::None
             && let Err(reason) = self.effect_check(&params.effect)
         {
@@ -1387,8 +1532,8 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     /// Stops the session. An effect failure of that session (with
-    /// `on_failure = "none"`) ends with it: its `Error` gives way to the
-    /// causes still standing.
+    /// `on_failure = "none"`) and a noise removal failure end with it: their
+    /// `Error` gives way to the causes still standing.
     fn drop_session(&mut self) {
         if self.session.take().is_some() {
             self.backend.stop_session();
@@ -1396,11 +1541,14 @@ impl<B: MediaBackend> Controller<B> {
         self.next_stats = None;
         self.effect_seen = None;
         self.effect_polled = false;
+        self.denoise_seen = None;
+        self.denoise_polled = false;
+        self.denoise_held = None;
         self.effect_applied = None;
         self.effect_log_at = None;
-        if let Some(e) = self.effect_failure.take()
-            && self.error == e
-        {
+        let effect = self.effect_failure.take();
+        let denoise = self.denoise_failure.take();
+        if [effect, denoise].iter().flatten().any(|e| *e == self.error) {
             self.error = self.standing_error();
         }
     }
@@ -1731,20 +1879,29 @@ impl<B: MediaBackend> Controller<B> {
         self.effect_changed(changed, now)
     }
 
+    /// `SetDenoise`: noise removal on or off, before the effect (or alone
+    /// with `none`).
+    fn set_denoise(&mut self, on: bool, now: Instant) -> Result<(), IpcError> {
+        info!("noise removal selected: {}", if on { "on" } else { "off" });
+        let changed = self.runtime.denoise.replace(on) != Some(on);
+        self.effect_changed(changed, now)
+    }
+
     /// The effect settings changed by a method: saved (unless `changed` is
     /// false: the state file already holds them), applied to the running
     /// session without restarting it, and published before the reply. A
     /// control call clears a fault (an effect that could not run is tried
-    /// again) and the `Error` of an effect running without its effect.
+    /// again) and the `Error` of a session running without its effect or
+    /// without noise removal.
     fn effect_changed(&mut self, changed: bool, now: Instant) -> Result<(), IpcError> {
         if let Some(f) = self.fault.take()
             && self.error == f
         {
             self.error = self.standing_error();
         }
-        if let Some(e) = self.effect_failure.take()
-            && self.error == e
-        {
+        let effect = self.effect_failure.take();
+        let denoise = self.denoise_failure.take();
+        if [effect, denoise].iter().flatten().any(|e| *e == self.error) {
             self.error = self.standing_error();
         }
         let mut res = if changed { self.save_state() } else { Ok(()) };
@@ -1758,21 +1915,31 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     /// Applies the effect in force to the running session. Settings the
-    /// session already has are not given again, unless the effect failed
-    /// (a retry). A new effect or image, or a retry, is followed from its
-    /// load (its status is reported again); a strength change is not. A
-    /// setting the session cannot take is an effect failure
+    /// session already has are not given again, unless the effect or noise
+    /// removal failed (a retry). A new effect or image, or a retry of the
+    /// effect, is followed from its load (its status is reported again), as
+    /// is a new noise removal request or its retry; a strength change is
+    /// not. A setting the session cannot take is an effect failure
     /// ([`Self::effect_failed`]), and the method's error.
     fn apply_effect(&mut self) -> Result<(), IpcError> {
         let effect = self.effect();
         let failed = matches!(self.effect_seen, Some(EffectStatus::Failed(_)));
-        match &self.effect_applied {
-            Some(prev) if !failed && *prev == effect => return Ok(()),
-            Some(prev)
-                if !failed
-                    && prev.mode == effect.mode
-                    && prev.background_image == effect.background_image => {}
-            _ => self.effect_seen = None,
+        let denoise_failed = matches!(self.denoise_seen, Some(EffectStatus::Failed(_)))
+            || self.denoise_held.is_some();
+        let prev = self.effect_applied.as_ref();
+        if !failed && !denoise_failed && prev == Some(&effect) {
+            return Ok(());
+        }
+        if failed
+            || prev.is_none_or(|p| {
+                p.mode != effect.mode || p.background_image != effect.background_image
+            })
+        {
+            self.effect_seen = None;
+        }
+        if denoise_failed || prev.is_none_or(|p| p.denoise != effect.denoise) {
+            self.denoise_seen = None;
+            self.denoise_held = None;
         }
         self.effect_applied = Some(effect.clone());
         let Err(reason) = self.backend.set_effect(&effect) else {
@@ -1823,6 +1990,7 @@ impl<B: MediaBackend> Controller<B> {
         );
         self.fault = None;
         self.effect_failure = None;
+        self.denoise_failure = None;
         // Only the errors whose cause is gone are cleared: a missing
         // writer or a damaged state file still stands.
         self.error = self.standing_error();

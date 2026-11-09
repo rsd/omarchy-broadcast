@@ -245,12 +245,13 @@ env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u OMARCHY_BROADCAST_OS_
     -p obc-pipeline -p obc-ipc -p omarchy-broadcastd -p omarchy-broadcast
 ```
 
-On the reference machine this gave 424 passed, 0 failed and 41 ignored (the hardware tests), and `ldd` on `omarchy-broadcastd` and `obc-bench` shows no link to the SDK, CUDA or TensorRT libraries. What the default suite covers:
+On the reference machine this passed with every hardware test ignored (the counts change with every release and are not recorded here), and `ldd` on `omarchy-broadcastd` and `obc-bench` shows no link to the SDK, CUDA or TensorRT libraries. What the default suite covers:
 
 - **Backend seam** (`obc-backend`, `obc-gpu`, `obc-backend-maxine`): the trait types, the validation of load requests, the error texts, and a Maxine backend that reports itself unavailable with the reason when the SDK is not found.
 - **The element** (`crates/gst-obc`): registration and caps (CUDA NV12 on both pads), properties and their validation, status messages on the bus, the background image (crop to fill, the size limit, a JPEG, an undecodable or missing file), and the refusal of hostile images in under half a second: a 50-byte PNG declaring 60000x60000 pixels and a JPEG declaring 65000x65000 are refused from their headers before a decoder runs; a file that is a FIFO is refused without blocking. The first-image rule is tested too: a valid image followed by a second one declaring a huge size is decoded as the first image only, data after the image (random bytes, an MP4 box, zero padding) is ignored, and a truncated image is refused.
 - **The pipeline** (`obc-pipeline`): the effect settings and their checks, the effect statistics, that an output built without the element refuses an effect, and that an effect is refused with the roundtrip stage or with a system-memory output.
 - **The daemon** (`omarchy-broadcastd`), against its fake backend: the `[effect]` configuration, the runtime state keys, the setters and their errors, persistence and precedence, the `Error` and `State` outcomes of an effect failure with `on_failure` `"black"` and `"none"`, the clearing of that error when the session ends, and a damaged state file.
+- **Noise removal** ([ADR-0018](adr/0018-video-noise-removal.md)): the element with the fake backend (`crates/gst-obc/tests/element.rs`: `denoise` is a property of its own with a status of its own, and the new-source flag is a free video buffer flag); the output clock (`obc-pipeline`, `the_first_fresh_frame_of_each_source_is_flagged_down_to_the_sink`); the daemon's `[effect] denoise` configuration, the `denoise` state key (a non-boolean value is a damaged state file), `SetDenoise` and its persistence, the fail-open outcome and the `Error` precedence (`controller/tests.rs`, `dbus/tests.rs`); and the CLI's `denoise on|off`, the revision-4 message and the `null` JSON field (`tests/cli.rs`, `json.rs`, `human.rs`).
 - **The CLI and the IPC crate**: `effect` and its option rules, the revision-1 daemon message, the JSON fields and their bounds, the escaping of daemon strings in the human output, and the proxy against a mock server.
 
 ### GPU tests with the fake backend (`gpu_` prefix)
@@ -261,7 +262,7 @@ These need an NVIDIA GPU and the GStreamer CUDA elements, but no SDK and no came
 cargo test -p gst-obc -p obc-pipeline -- --ignored gpu_ --test-threads=1
 ```
 
-They check that `none` passes the input buffer through untouched and touches no CUDA; that going from `none` to an effect shows only black until the effect is ready, and never the raw input; that a switch from one effect to another shows only processed frames; that each failure (backend missing, load, frame, background image) shows black or the input as `on_failure` says; that repeated pushes of one buffer leave it unmodified; that every stop releases the CUDA context exactly once; and, through a whole output (`gpu_an_output_switches_effects_while_streaming`), that a stream switching effects keeps its frame rate and negotiates its caps once.
+They also check the noise-removal stage with the fake backend: `none` with noise removal passes the input through until the stage is ready and then shows only processed frames; a failed load or a failed frame drops the stage and keeps the effect (or the input, with `none`) with the reason reported; an effect that fails again without the stage takes the effect's failure path; the green screen from `none` with noise removal loads black without blocking; and the new-source flag resets the temporal state once. They check that `none` passes the input buffer through untouched and touches no CUDA; that going from `none` to an effect shows only black until the effect is ready, and never the raw input; that a switch from one effect to another shows only processed frames; that each failure (backend missing, load, frame, background image) shows black or the input as `on_failure` says; that repeated pushes of one buffer leave it unmodified; that every stop releases the CUDA context exactly once; and, through a whole output (`gpu_an_output_switches_effects_while_streaming`), that a stream switching effects keeps its frame rate and negotiates its caps once.
 
 ### Maxine hardware tests
 
@@ -278,11 +279,29 @@ OBC_TEST_CAMERA=046d:0944 OBC_TEST_SINK=/dev/video11 \
   cargo test -p obc-pipeline --test hardware -- --ignored maxine_ --test-threads=1
 ```
 
-- `obc-backend-maxine` (5 tests in `tests/hardware.rs`): the backend refuses calls without the CUDA context or a load; blur and replace in a context created like GStreamer's, with per-stage GPU times, load times and GPU memory logged. The SDK works in the pushed context: afterwards the device's primary context is inactive. The mask hardening has three more (see [The hardened mask](#the-hardened-mask)).
-- `gst-obc` (7 tests) and `obc-gpu` (3 tests, plus the four `checkpoint_` tests of [Parking the GPU at Idle](#parking-the-gpu-at-idle)): the element against the real backend, and the driver helpers and the mask kernel. `gst-obc` has `obc-backend-maxine` as a dev-dependency for `maxine_mask_kernel_failures_show_black_with_the_reason`, which needs the Maxine environment above.
+- `obc-backend-maxine` (13 tests in `tests/hardware.rs`; the 8 `maxine_denoise_` tests are described under [Video noise removal](#video-noise-removal)): the backend refuses calls without the CUDA context or a load; blur and replace in a context created like GStreamer's, with per-stage GPU times, load times and GPU memory logged. The SDK works in the pushed context: afterwards the device's primary context is inactive. The mask hardening has three more (see [The hardened mask](#the-hardened-mask)).
+- `gst-obc` (16 tests in `tests/hardware.rs`, including `gpu_` ones and `maxine_denoise_alone_under_blur_and_toggled_while_playing`) and `obc-gpu` (3 tests, plus the four `checkpoint_` tests of [Parking the GPU at Idle](#parking-the-gpu-at-idle)): the element against the real backend, and the driver helpers and the mask kernel. `gst-obc` has `obc-backend-maxine` as a dev-dependency for `maxine_mask_kernel_failures_show_black_with_the_reason`, which needs the Maxine environment above.
 - `maxine_effects_end_to_end_keep_the_rate_and_release_the_gpu` (`obc-pipeline`): camera, session and output with `blur`, then `replace`, then `none`; each phase keeps the contract rate at the sink, the effect becomes ready, its statistics are sane, and after the output stops the process holds no CUDA context.
 
 The frames in these tests are synthetic, so the mask the model produces for them is not predictable; the tests assert what holds for any mask and log the rest.
+
+### Video noise removal
+
+The stage is tested at each level described above; this section lists what needs the SDK and its `nvvfxdenoising` feature and models ([setup/maxine.md](setup/maxine.md), steps 5 and 6; `features/nvvfxdenoising/lib` must be on `LD_LIBRARY_PATH`).
+
+- **Backend** (`crates/obc-backend-maxine/tests/hardware.rs`, run with the command of [Maxine hardware tests](#maxine-hardware-tests)): `maxine_denoise_alone_removes_noise_from_a_flat_frame`, `maxine_denoise_switches_on_and_off_on_a_loaded_chain`, `maxine_denoise_before_blur_and_replace_gives_sane_output`, `maxine_denoise_reset_temporal_starts_a_new_video`, `maxine_denoise_strength_0_and_1_both_load_and_run`, `maxine_denoise_gpu_memory_returns_after_unload`, `maxine_denoise_faults_degrade_to_the_chain_without_it` (fault injection for the load and the run) and `maxine_denoise_loads_again_after_the_gpu_was_parked` (park and unpark, in its own process).
+- **Element** (`crates/gst-obc/tests/hardware.rs`): `maxine_denoise_alone_under_blur_and_toggled_while_playing`.
+- **Daemon** (`crates/omarchy-broadcastd/tests/hardware.rs`): `denoise_stacks_with_the_effect_while_streaming_and_the_gpu_parks` streams `none` with noise removal, adds `blur`, toggles, stops and checks that the GPU parks. It needs `OBC_TEST_SINK`, `OBC_TEST_CAMERA`, `OBC_TEST_PRELOAD` (with `OMARCHY_BROADCAST_OS_RELEASE`) and the Maxine environment, as the daemon effects test below, and a driver with the CUDA checkpoint API.
+- **Recorded frames** (`crates/obc-backend-maxine/tests/denoise_frames.rs`, ignored): runs the stage at both strengths over frames recorded from a real camera and writes the camera frame and each result as PPM images for comparison by eye, with the spatial and temporal noise logged. `OBC_DENOISE_FRAMES` names the directory of recorded sequences and `OBC_DENOISE_OUT` the directory for the images; the test fails without them.
+
+  ```sh
+  OBC_DENOISE_FRAMES=$HOME/frames OBC_DENOISE_OUT=$HOME/denoise-out \
+    cargo test -p obc-backend-maxine --test denoise_frames -- --ignored --nocapture
+  ```
+
+  with the Maxine environment and the shim runner of the section above.
+- **The strength knob.** The daemon runs the stage at strength 1 and has no setting. `OBC_MAXINE_DENOISE_STRENGTH=0` or `=1` in the environment of the process under test (a backend test, `obc-bench`, the daemon) overrides it, to compare the two models. It is for development only.
+- **`obc-bench`.** `--denoise` requests the stage, with `--effect none|blur|replace` (`--effect none` for the stage alone; `--denoise` without `--effect` is refused). The JSON effect section gains `denoise`, `denoise_status`, `denoise_reason`, `frames_denoised` and `denoise_ms_p50` / `denoise_ms_p95`. Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence; reproduce them locally with these.
 
 ### The hardened mask
 

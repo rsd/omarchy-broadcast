@@ -12,9 +12,79 @@
 //! * `Control` (settings, status, the CUDA handles once known) and `Engine`
 //!   (the backend instance and what it has loaded) have one mutex each and
 //!   no code path holds both. The streaming thread locks `Engine` only to
-//!   process a frame, and only when `Control::loaded` says something is
-//!   loaded, so a cold load on the worker never blocks it; a switch between
-//!   two effects blocks it for the switch itself (milliseconds).
+//!   process a frame, and only when `Control::loaded_kind` says a chain
+//!   usable for the request is loaded ([`Control::usable`]), so a cold load
+//!   on the worker never blocks it; a switch on the loaded instance blocks
+//!   it for the switch itself: milliseconds between two effects, the
+//!   denoise stage's load when a switch adds it (see below).
+//!
+//! # The denoise stage
+//!
+//! The denoise stage (`docs/adr/0018-video-noise-removal.md`) lives in the
+//! same backend instance as the effect: one load request carries both
+//! (`LoadRequest::denoise`), and it unloads with the effect, so it adds no
+//! teardown path and nothing of it runs at idle. It hides nothing, so the
+//! privacy rules of the effect are unchanged by it:
+//!
+//! * `none` with denoise passes the input through until the stage is
+//!   loaded, then processes every frame. Without denoise `none` makes no
+//!   CUDA call, as before.
+//! * From `none` (with or without denoise) to blur or replace, the green
+//!   screen loads cold: the denoise stage alone does not count as loaded for
+//!   an effect, so the frames are black until the effect is ready and the
+//!   streaming thread never waits for that load (and under the `Engine` lock
+//!   a frame decided for an effect is black if only the stage is loaded).
+//! * Every other change (turning denoise on or off under an effect, blur
+//!   and replace with denoise, an effect to `none` with denoise) is a switch
+//!   on the loaded instance, done under the `Engine` lock as for blur to
+//!   replace. The streaming thread waits for it there; when the switch adds
+//!   the denoise stage under blur or replace, or goes from an effect to
+//!   `none` with denoise, that wait is the stage's load. No frame is output
+//!   meanwhile, so the last one shown is the previous chain's processed
+//!   frame, never the input; the next is the new chain's.
+//! * **A denoise failure drops the stage, never the effect.** The effective
+//!   request is "denoise requested and no denoise failure recorded"
+//!   (`Control::denoise_failure`). A load that fails with
+//!   `BackendError::Denoise`, or any load failure while the stage is the
+//!   only one (`none`), records the failure; the worker then loads the
+//!   effect alone in the same job (or unloads, for `none`). A frame that
+//!   fails with `BackendError::Denoise` (or any frame of the stage alone)
+//!   records it too, whichever request the frame was decided for, as long
+//!   as the current one still asks for the stage: the streaming thread
+//!   marks the loaded chain as without the stage and starts a new request,
+//!   which the worker finds already loaded (or unloads, for `none`). Under
+//!   blur or replace the backend has dropped the stage, so the frame runs
+//!   once more through the chain without it and is output processed; only
+//!   if that fails too does the effect's failure path apply (black or the
+//!   input, per `on-failure`). With `none` the frame is the input. The
+//!   effect's status never becomes failed for the stage. The failure is
+//!   forgotten when the denoise request changes or on a retry (`apply`
+//!   with `retry`), never otherwise.
+//! * The denoise status (`Control::denoise_status`) is separate from the
+//!   effect's: off (not requested), loading, ready, or failed with the
+//!   reason. A failure of the whole chain (the effect's load or frame) shows
+//!   as failed there too, without being recorded as a denoise failure.
+//!
+//! # Timings
+//!
+//! `gpu_ms` is measured with two CUDA events on the element's stream around
+//! the backend's calls for the frame (both calls when a frame runs again
+//! without the denoise stage), not around a temporal reset. `denoise_ms` is
+//! the backend's `timings` for the frame just processed, read after the
+//! frame's stream synchronisation (a backend reports a frame only once its
+//! work has completed), under a `try_lock` of `Engine` so the streaming
+//! thread never waits for a load for it: while the worker holds the lock,
+//! that frame's figure is skipped.
+//!
+//! # A new source
+//!
+//! The output clock marks the first fresh frame of each new source with
+//! [`NEW_SOURCE_FLAG`](super::NEW_SOURCE_FLAG). The element then asks the
+//! backend to forget its temporal state (`InferenceBackend::reset_temporal`)
+//! right before the next frame it processes, so the denoise stage does not
+//! blend frames of two cameras. A flagged frame that is not processed
+//! (passed through, or black) keeps the reset pending for the next
+//! processed one.
 //!
 //! # CUDA context and stream
 //!
@@ -52,12 +122,12 @@ use gst_base::subclass::base_transform::{InputBuffer, PrepareOutputBufferSuccess
 use gst_base::subclass::prelude::*;
 use gst_video::VideoInfo;
 use obc_backend::{
-    BackendFactory, ColourMatrix, ColourSpec, DeviceNv12, EffectKind, FrameParams, GpuContext,
-    InferenceBackend, LoadReport, LoadRequest,
+    BackendError, BackendFactory, ColourMatrix, ColourSpec, DeviceNv12, EffectKind, FrameParams,
+    GpuContext, InferenceBackend, LoadReport, LoadRequest,
 };
 use obc_gpu::{ContextGuard, CuContext, CuStream, Event};
 
-use super::STATUS_MESSAGE;
+use super::{STATUS_MESSAGE, has_new_source_flag};
 use crate::background;
 use crate::cuda::{self, CudaMemoryHead, MAP_CUDA};
 use crate::settings::{
@@ -150,13 +220,20 @@ struct Engine {
 
 struct Control {
     settings: EffectSettings,
-    /// What the settings need loaded, and the number of the request for it.
+    /// What the settings need loaded (the requested denoise included), and
+    /// the number of the request for it.
     target: Target,
     generation: u64,
     status: EffectStatus,
-    /// `Engine::loaded.is_some()`, as last published by the worker (set to
-    /// false before an unload or a full reload starts).
-    loaded: bool,
+    /// Why the denoise stage was dropped; while set, the stage is not
+    /// loaded although requested (see the module docs).
+    denoise_failure: Option<String>,
+    denoise_status: EffectStatus,
+    /// The effect of `Engine::loaded` (`EffectKind::None`: the denoise
+    /// stage alone), as last published by the worker (cleared before an
+    /// unload, or a reload during which the streaming thread must not wait,
+    /// starts).
+    loaded_kind: Option<EffectKind>,
     /// The CUDA context and the element's stream, once the streaming thread
     /// has created them.
     gpu: Option<GpuContext>,
@@ -175,7 +252,9 @@ impl Default for Control {
             target: Target::default(),
             generation: 0,
             status: EffectStatus::Off,
-            loaded: false,
+            denoise_failure: None,
+            denoise_status: EffectStatus::Off,
+            loaded_kind: None,
             gpu: None,
             format: None,
             factory: None,
@@ -187,6 +266,97 @@ impl Default for Control {
     }
 }
 
+impl Control {
+    /// Whether the denoise stage is requested and has not failed.
+    fn denoise_effective(&self) -> bool {
+        self.target.denoise && self.denoise_failure.is_none()
+    }
+
+    /// What the worker loads for the request: the target with the
+    /// effective denoise request.
+    fn job_target(&self) -> Target {
+        Target {
+            denoise: self.denoise_effective(),
+            ..self.target.clone()
+        }
+    }
+
+    /// Whether the loaded chain can process frames of the request: any
+    /// chain for `none` (with denoise), one with an effect for blur and
+    /// replace (the denoise stage alone hides nothing).
+    fn usable(&self) -> bool {
+        match self.loaded_kind {
+            None => false,
+            Some(EffectKind::None) => self.target.kind == EffectKind::None,
+            Some(_) => true,
+        }
+    }
+
+    /// The effect status of a new request.
+    fn pending_status(&self) -> EffectStatus {
+        match self.target.kind {
+            EffectKind::None => EffectStatus::Off,
+            _ => EffectStatus::Loading,
+        }
+    }
+
+    /// The denoise status of a new request.
+    fn pending_denoise_status(&self) -> EffectStatus {
+        match (&self.denoise_failure, self.target.denoise) {
+            (_, false) => EffectStatus::Off,
+            (Some(r), true) => EffectStatus::Failed(r.clone()),
+            (None, true) => EffectStatus::Loading,
+        }
+    }
+
+    /// Records a denoise failure, unless the request no longer asks for the
+    /// stage, one is already recorded, or (with `generation`) request
+    /// `generation` is superseded. `reconcile` starts a new request so the
+    /// worker brings what is loaded in line with it.
+    fn record_denoise_failure(
+        &mut self,
+        generation: Option<u64>,
+        reason: String,
+        reconcile: bool,
+    ) -> bool {
+        if generation.is_some_and(|g| g != self.generation)
+            || !self.target.denoise
+            || self.denoise_failure.is_some()
+        {
+            return false;
+        }
+        self.denoise_status = EffectStatus::Failed(reason.clone());
+        self.denoise_failure = Some(reason);
+        if reconcile {
+            self.generation += 1;
+        }
+        true
+    }
+
+    fn report(&self) -> Report {
+        Report {
+            kind: self.settings.kind,
+            status: self.status.clone(),
+            denoise: self.denoise_status.clone(),
+        }
+    }
+}
+
+/// What the status message carries.
+#[derive(Debug, Clone, PartialEq)]
+struct Report {
+    kind: EffectKind,
+    status: EffectStatus,
+    denoise: EffectStatus,
+}
+
+impl Report {
+    /// `Some(now)` when `now` differs from `self`: a message to post.
+    fn changed(&self, now: Report) -> Option<Report> {
+        (now.status != self.status || now.denoise != self.denoise).then_some(now)
+    }
+}
+
 #[derive(Default)]
 struct Shared {
     control: Mutex<Control>,
@@ -195,8 +365,19 @@ struct Shared {
     processed: AtomicU64,
     black: AtomicU64,
     passthrough: AtomicU64,
+    denoised: AtomicU64,
     cuda_active: AtomicBool,
     gpu_ms: Mutex<VecDeque<f32>>,
+    denoise_ms: Mutex<VecDeque<f32>>,
+}
+
+/// Appends `v` to a window of at most [`EffectStats::WINDOW`] values.
+fn push_window(w: &Mutex<VecDeque<f32>>, v: f32) {
+    let mut w = lock(w);
+    if w.len() == EffectStats::WINDOW {
+        w.pop_front();
+    }
+    w.push_back(v);
 }
 
 /// The element's CUDA objects, created on the streaming thread when an
@@ -320,8 +501,13 @@ struct StreamState {
     action: FrameAction,
     /// The request the action was decided for, and its per-frame settings.
     generation: u64,
+    kind: EffectKind,
     strength: f32,
     fallback: EffectFallback,
+    /// A frame of a new source arrived
+    /// ([`NEW_SOURCE_FLAG`](super::NEW_SOURCE_FLAG)): reset the backend's
+    /// temporal state before the next processed frame.
+    reset_pending: bool,
     gpu: Option<GpuResources>,
 }
 
@@ -341,11 +527,13 @@ impl ObjectSubclass for ObcEffect {
 
 /// Posts the status message (never with a lock held: a bus sync handler
 /// may call back into the element).
-fn post_status(element: &super::ObcEffect, kind: EffectKind, status: &EffectStatus) {
+fn post_status(element: &super::ObcEffect, r: &Report) {
     let s = gst::Structure::builder(STATUS_MESSAGE)
-        .field("effect", kind.as_str())
-        .field("status", status.as_str())
-        .field("reason", status.reason().unwrap_or(""))
+        .field("effect", r.kind.as_str())
+        .field("status", r.status.as_str())
+        .field("reason", r.status.reason().unwrap_or(""))
+        .field("denoise", r.denoise.as_str())
+        .field("denoise-reason", r.denoise.reason().unwrap_or(""))
         .build();
     let _ = element.post_message(gst::message::Element::builder(s).src(element).build());
 }
@@ -367,27 +555,37 @@ impl ObcEffect {
         lock(&self.shared.control).status.clone()
     }
 
+    pub(super) fn denoise_status(&self) -> EffectStatus {
+        lock(&self.shared.control).denoise_status.clone()
+    }
+
     pub(super) fn stats(&self) -> EffectStats {
-        let (effect, status, last_load_ms, last_load_reused, loads) = {
+        let (effect, status, denoise, last_load_ms, last_load_reused, loads) = {
             let c = lock(&self.shared.control);
             (
                 c.settings.kind,
                 c.status.clone(),
+                c.denoise_status.clone(),
                 c.last_load_ms,
                 c.last_load_reused,
                 c.loads,
             )
         };
         let window: Vec<f32> = lock(&self.shared.gpu_ms).iter().copied().collect();
+        let denoise_window: Vec<f32> = lock(&self.shared.denoise_ms).iter().copied().collect();
         let s = &self.shared;
         EffectStats {
             effect,
             status,
+            denoise,
             frames_processed: s.processed.load(Ordering::Relaxed),
             frames_black: s.black.load(Ordering::Relaxed),
             frames_passthrough: s.passthrough.load(Ordering::Relaxed),
+            frames_denoised: s.denoised.load(Ordering::Relaxed),
             gpu_ms_p50: percentile(&window, 50.0),
             gpu_ms_p95: percentile(&window, 95.0),
+            denoise_ms_p50: percentile(&denoise_window, 50.0),
+            denoise_ms_p95: percentile(&denoise_window, 95.0),
             last_load_ms,
             last_load_reused,
             loads,
@@ -396,47 +594,93 @@ impl ObcEffect {
     }
 
     /// Applies new settings. A change of what has to be loaded (the effect,
-    /// or the image of replace) is a new request for the worker; `retry`
-    /// makes one after a failure even when nothing changed.
+    /// the image of replace, or the denoise request) is a new request for
+    /// the worker; `retry` makes one after a failure (of the effect or of
+    /// the denoise stage) even when nothing changed. A recorded denoise
+    /// failure is forgotten when the denoise request changes or on a retry.
+    /// The effect's status turns loading (off for `none`) when the effect
+    /// changes or had failed; a change of the denoise request alone leaves
+    /// it as it is.
     pub(super) fn apply(&self, new: EffectSettings, retry: bool) {
         let posted = {
             let mut c = lock(&self.shared.control);
+            let before = c.report();
             let target = new.target();
-            let failed = matches!(c.status, EffectStatus::Failed(_));
+            let effect_failed = matches!(c.status, EffectStatus::Failed(_));
+            let denoise_failed = c.denoise_failure.is_some();
+            let effect_changed =
+                (target.kind, &target.background) != (c.target.kind, &c.target.background);
+            let denoise_changed = target.denoise != c.target.denoise;
             c.settings = new;
-            if target != c.target || (retry && failed) {
+            if target != c.target || (retry && (effect_failed || denoise_failed)) {
+                if denoise_changed || retry {
+                    c.denoise_failure = None;
+                }
                 c.target = target;
                 c.generation += 1;
-                c.status = match c.target.kind {
-                    EffectKind::None => EffectStatus::Off,
-                    _ => EffectStatus::Loading,
-                };
+                if effect_changed || effect_failed {
+                    c.status = c.pending_status();
+                }
+                c.denoise_status = c.pending_denoise_status();
                 self.shared.wake.notify_all();
-                Some((c.settings.kind, c.status.clone()))
-            } else {
-                None
             }
+            before.changed(c.report())
         };
-        if let Some((kind, status)) = posted {
-            gst::debug!(CAT, imp = self, "effect {kind}: {status}");
-            post_status(&self.obj(), kind, &status);
+        if let Some(r) = posted {
+            gst::debug!(
+                CAT,
+                imp = self,
+                "effect {}: {}, denoise {}",
+                r.kind,
+                r.status,
+                r.denoise
+            );
+            post_status(&self.obj(), &r);
         }
     }
 
     /// Marks request `generation` as failed (unless superseded), and posts.
+    /// A requested denoise stage that has not failed itself shows the
+    /// failure too: it runs in the failed chain.
     fn fail(&self, generation: u64, reason: String) {
         let posted = {
             let mut c = lock(&self.shared.control);
             if c.generation != generation || matches!(c.status, EffectStatus::Failed(_)) {
                 None
             } else {
+                let before = c.report();
+                if c.target.denoise && c.denoise_failure.is_none() {
+                    c.denoise_status = EffectStatus::Failed(reason.clone());
+                }
                 c.status = EffectStatus::Failed(reason);
-                Some((c.settings.kind, c.status.clone()))
+                before.changed(c.report())
             }
         };
-        if let Some((kind, status)) = posted {
-            gst::warning!(CAT, imp = self, "effect {kind}: {status}");
-            post_status(&self.obj(), kind, &status);
+        if let Some(r) = posted {
+            gst::warning!(CAT, imp = self, "effect {}: {}", r.kind, r.status);
+            post_status(&self.obj(), &r);
+        }
+    }
+
+    /// Records a denoise failure (of request `generation`, unless superseded;
+    /// with `None`, of whatever request still asks for the stage) and
+    /// starts a new request, so the worker drops the stage (it finds the
+    /// effect loaded, or unloads for `none`); posts. The effect's status is
+    /// not touched. A failed effect starts no new request: it processes
+    /// nothing until one comes (a retry or a change), which reconciles.
+    fn fail_denoise(&self, generation: Option<u64>, reason: String) {
+        let posted = {
+            let mut c = lock(&self.shared.control);
+            let before = c.report();
+            let reconcile = !matches!(c.status, EffectStatus::Failed(_));
+            if c.record_denoise_failure(generation, reason, reconcile) && reconcile {
+                self.shared.wake.notify_all();
+            }
+            before.changed(c.report())
+        };
+        if let Some(r) = posted {
+            gst::warning!(CAT, imp = self, "denoise: {}", r.denoise);
+            post_status(&self.obj(), &r);
         }
     }
 
@@ -538,7 +782,7 @@ impl ObcEffect {
         self.shared.cuda_active.store(false, Ordering::Relaxed);
         let mut c = lock(&self.shared.control);
         c.gpu = None;
-        c.loaded = false;
+        c.loaded_kind = None;
         gst::info!(
             CAT,
             imp = self,
@@ -555,6 +799,23 @@ impl ObcEffect {
         if let Some(h) = lock(&self.worker).take() {
             let _ = h.join();
         }
+    }
+
+    /// The denoise stage time of the frame just processed and synchronised
+    /// (see "Timings" in the module docs), if the backend has it. Never
+    /// waits for the `Engine` lock: if the worker holds it (a load, a switch
+    /// or an unload under way), this frame's figure is skipped.
+    fn denoise_time(&self) -> Option<f32> {
+        let e = match self.shared.engine.try_lock() {
+            Ok(e) => e,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        e.instance
+            .as_ref()?
+            .timings()
+            .map(|t| t.denoise_ms)
+            .filter(|ms| *ms > 0.0)
     }
 
     /// Fills `out` for `action` on the element's stream and waits for it.
@@ -586,7 +847,10 @@ impl ObcEffect {
                 .map_err(|e| e.to_string())
         };
         let mut processed = false;
-        // The input copied into the output (a failed frame, on-failure=none).
+        // The denoise stage ran on the processed frame.
+        let mut denoised = false;
+        // The input copied into the output (a failed frame with nothing to
+        // hide, or on-failure=none).
         let mut copied = false;
         // The input stays mapped until the stream has finished reading it.
         let mut input_frame: Option<CudaFrame> = None;
@@ -620,13 +884,55 @@ impl ObcEffect {
                     blur_strength: st.strength,
                 };
                 let ctx = gpu.gpu_context();
+                // The denoise stage alone hides nothing: an effect frame
+                // needs a chain with the effect. A frame of `none` needs a
+                // chain with something in it (the stage, or the previous
+                // effect while switching).
+                let alone = st.kind == EffectKind::None;
+                // The denoise stage failed on this frame (the backend has
+                // dropped it), whatever the frame then got.
+                let mut stage_failure: Option<String> = None;
                 let mut e = lock(&self.shared.engine);
                 let Engine { instance, loaded } = &mut *e;
-                let result = match (instance.as_mut(), loaded.is_some()) {
+                let usable = loaded.as_ref().is_some_and(|k| {
+                    k.target.kind != EffectKind::None || (alone && k.target.denoise)
+                });
+                let result = match (instance.as_mut(), usable) {
                     (Some(instance), true) => {
+                        let with_denoise = loaded.as_ref().is_some_and(|k| k.target.denoise);
+                        // Before the start event: the reset may wait for
+                        // the stream, which is not this frame's GPU time.
+                        let reset = if std::mem::take(&mut st.reset_pending) {
+                            instance.reset_temporal(&ctx)
+                        } else {
+                            Ok(())
+                        };
                         // SAFETY: our own stream.
                         let _ = unsafe { gpu.start.record(stream) };
-                        let r = instance.process(&ctx, &params, &src, &dst);
+                        let mut r =
+                            reset.and_then(|()| instance.process(&ctx, &params, &src, &dst));
+                        match &r {
+                            Ok(()) => denoised = with_denoise,
+                            // The backend has dropped the stage (and any
+                            // failure of the stage alone drops it): the
+                            // chain loaded from now on is without it.
+                            Err(err) if alone || matches!(err, BackendError::Denoise { .. }) => {
+                                if let Some(k) = loaded.as_mut() {
+                                    k.target.denoise = false;
+                                }
+                                stage_failure =
+                                    Some(format!("the denoise stage failed on a frame: {err}"));
+                                // An effect is fine without the stage: run
+                                // this frame again through the chain without
+                                // it, so it is still processed (never the
+                                // input, nor black, for a healthy effect).
+                                // Without an effect there is nothing to run.
+                                if !alone {
+                                    r = instance.process(&ctx, &params, &src, &dst);
+                                }
+                            }
+                            Err(_) => {}
+                        }
                         // SAFETY: our own stream.
                         let _ = unsafe { gpu.end.record(stream) };
                         Some(r)
@@ -634,23 +940,49 @@ impl ObcEffect {
                     _ => None,
                 };
                 drop(e);
+                // The effect failed (alone, or again without the stage):
+                // recorded first, so the denoise failure below does not
+                // supersede it.
+                if !alone && let Some(Err(err)) = &result {
+                    self.fail(st.generation, format!("processing a frame failed: {err}"));
+                }
+                if let Some(reason) = stage_failure {
+                    // Recorded whichever request the frame was decided for:
+                    // the stage is gone from the loaded chain, and a request
+                    // that still asks for it must learn it now (the first
+                    // frame after turning the stage on was decided under the
+                    // previous request, and the worker has already handled
+                    // the new one).
+                    self.fail_denoise(None, reason);
+                }
+                let copy = |src: &DeviceNv12, dst: &DeviceNv12| {
+                    // SAFETY: both are the mapped CUDA frames of this call,
+                    // in our context, same size; the input is only read.
+                    unsafe { obc_gpu::copy_nv12_async(src, dst, stream) }.map_err(|e| e.to_string())
+                };
                 match result {
                     Some(Ok(())) => processed = true,
-                    Some(Err(err)) => {
-                        let reason = format!("processing a frame failed: {err}");
-                        self.fail(st.generation, reason);
-                        match st.fallback {
-                            EffectFallback::Black => fill_black(&dst)?,
-                            // SAFETY: both frames are mapped CUDA frames of
-                            // our context, same size; the input is read.
-                            EffectFallback::None => {
-                                unsafe { obc_gpu::copy_nv12_async(&src, &dst, stream) }
-                                    .map_err(|e| e.to_string())?;
-                                copied = true;
-                            }
-                        }
+                    // The stage alone failed (recorded above): nothing to
+                    // hide, the input.
+                    Some(Err(_)) if alone => {
+                        copy(&src, &dst)?;
+                        copied = true;
                     }
-                    // Unloaded since the decision: black, never the input.
+                    // The effect failed (recorded above).
+                    Some(Err(_)) => match st.fallback {
+                        EffectFallback::Black => fill_black(&dst)?,
+                        EffectFallback::None => {
+                            copy(&src, &dst)?;
+                            copied = true;
+                        }
+                    },
+                    // Unloaded since the decision: the input for `none`
+                    // (nothing to hide), black for an effect, never the
+                    // input.
+                    None if alone => {
+                        copy(&src, &dst)?;
+                        copied = true;
+                    }
                     None => fill_black(&dst)?,
                 }
             }
@@ -663,12 +995,14 @@ impl ObcEffect {
         drop(out);
         if processed {
             self.shared.processed.fetch_add(1, Ordering::Relaxed);
-            if let Ok(ms) = Event::elapsed_ms(&gpu.start, &gpu.end) {
-                let mut w = lock(&self.shared.gpu_ms);
-                if w.len() == EffectStats::WINDOW {
-                    w.pop_front();
+            if denoised {
+                self.shared.denoised.fetch_add(1, Ordering::Relaxed);
+                if let Some(ms) = self.denoise_time() {
+                    push_window(&self.shared.denoise_ms, ms);
                 }
-                w.push_back(ms);
+            }
+            if let Ok(ms) = Event::elapsed_ms(&gpu.start, &gpu.end) {
+                push_window(&self.shared.gpu_ms, ms);
             }
         } else if copied {
             self.shared.passthrough.fetch_add(1, Ordering::Relaxed);
@@ -787,18 +1121,47 @@ impl Drop for CudaFrame {
 /// One unit of work for the worker: the request and what it needs.
 struct Job {
     generation: u64,
+    /// What to load: the request with the effective denoise request
+    /// ([`Control::job_target`]).
     target: Target,
     gpu: GpuContext,
     format: Format,
     factory: Option<Arc<dyn BackendFactory>>,
 }
 
+/// Why a load failed; the backend's error, when it came from the backend,
+/// tells a failure of the denoise stage alone from one of the chain.
+struct Failure {
+    reason: String,
+    error: Option<BackendError>,
+}
+
+impl Failure {
+    fn new(reason: impl Into<String>) -> Failure {
+        Failure {
+            reason: reason.into(),
+            error: None,
+        }
+    }
+
+    fn of_denoise(&self) -> bool {
+        matches!(self.error, Some(BackendError::Denoise { .. }))
+    }
+}
+
 enum Outcome {
     Unloaded,
     Loaded(LoadReport),
     AlreadyLoaded,
-    Failed(String),
+    Failed(Failure),
     Superseded,
+}
+
+/// What a job did, and the denoise failure it ran into, if any (the job
+/// then went on without the stage).
+struct JobResult {
+    outcome: Outcome,
+    denoise_failure: Option<String>,
 }
 
 fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
@@ -815,7 +1178,7 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                 {
                     break Job {
                         generation: c.generation,
-                        target: c.target.clone(),
+                        target: c.job_target(),
                         gpu,
                         format,
                         factory: c.factory.clone(),
@@ -825,38 +1188,65 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
             }
         };
         handled = Some(job.generation);
-        let outcome = run_job(&shared, &job);
-        let loaded = lock(&shared.engine).loaded.is_some();
+        let JobResult {
+            outcome,
+            denoise_failure,
+        } = run_job(&shared, &job);
+        let (loaded_kind, in_force) = {
+            let e = lock(&shared.engine);
+            let k = e.loaded.as_ref();
+            (
+                k.map(|k| k.target.kind),
+                k.is_some_and(|k| k.target.denoise),
+            )
+        };
         let posted = {
             let mut c = lock(&shared.control);
-            c.loaded = loaded;
+            let before = c.report();
+            c.loaded_kind = loaded_kind;
             if let Outcome::Loaded(r) = &outcome {
                 c.loads += 1;
                 c.last_load_ms = Some(r.load_ms + r.warmup_ms.unwrap_or(0.0));
                 c.last_load_reused = r.reused_model;
             }
-            let current = c.generation == job.generation;
-            let status = match &outcome {
-                _ if !current => None,
-                Outcome::Unloaded | Outcome::Superseded => None,
-                Outcome::Loaded(_) | Outcome::AlreadyLoaded => Some(EffectStatus::Ready),
-                Outcome::Failed(r) => Some(EffectStatus::Failed(r.clone())),
-            };
-            match status {
-                Some(s) if s != c.status => {
-                    c.status = s;
-                    Some((c.settings.kind, c.status.clone()))
+            if c.generation == job.generation {
+                if let Some(reason) = &denoise_failure {
+                    c.record_denoise_failure(Some(job.generation), reason.clone(), false);
                 }
-                _ => None,
+                let effect = c.target.kind != EffectKind::None;
+                match &outcome {
+                    Outcome::Unloaded | Outcome::Superseded => {}
+                    Outcome::Loaded(_) | Outcome::AlreadyLoaded => {
+                        if effect {
+                            c.status = EffectStatus::Ready;
+                        }
+                        if c.denoise_effective() && in_force {
+                            c.denoise_status = EffectStatus::Ready;
+                        }
+                    }
+                    Outcome::Failed(f) => {
+                        if effect {
+                            c.status = EffectStatus::Failed(f.reason.clone());
+                        }
+                        if c.denoise_effective() {
+                            c.denoise_status = EffectStatus::Failed(f.reason.clone());
+                        }
+                    }
+                }
+                if !c.target.denoise {
+                    c.denoise_status = EffectStatus::Off;
+                }
             }
+            before.changed(c.report())
         };
         if let Some(el) = element.upgrade() {
             match &outcome {
                 Outcome::Loaded(r) => gst::info!(
                     CAT,
                     obj = el,
-                    "loaded {} in {:.1} ms (+{:.1} ms warm-up, model reused: {})",
+                    "loaded {}{} in {:.1} ms (+{:.1} ms warm-up, model reused: {})",
                     job.target.kind,
+                    if in_force { " with denoise" } else { "" },
                     r.load_ms,
                     r.warmup_ms.unwrap_or(0.0),
                     r.reused_model
@@ -864,8 +1254,11 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                 Outcome::Unloaded => gst::info!(CAT, obj = el, "unloaded"),
                 _ => {}
             }
-            if let Some((kind, status)) = posted {
-                post_status(&el, kind, &status);
+            if let Some(reason) = &denoise_failure {
+                gst::warning!(CAT, obj = el, "the denoise stage failed to load: {reason}");
+            }
+            if let Some(r) = posted {
+                post_status(&el, &r);
             }
         }
     }
@@ -876,37 +1269,77 @@ fn superseded(shared: &Shared, generation: u64) -> bool {
     c.stop || c.generation != generation
 }
 
-fn run_job(shared: &Shared, job: &Job) -> Outcome {
-    let kind = job.target.kind;
-    if kind == EffectKind::None {
-        lock(&shared.control).loaded = false;
-        // SAFETY: the element keeps the context alive until it has joined
-        // this thread.
-        let guard = unsafe { ContextGuard::push(job.gpu.context) };
-        let mut e = lock(&shared.engine);
-        match &guard {
-            Ok(_) => {
-                if let Some(instance) = e.instance.as_mut() {
-                    instance.unload();
-                }
-            }
-            Err(err) => {
-                if let Some(instance) = e.instance.take() {
-                    leak_backend(instance, &err.to_string());
-                }
+/// Brings what is loaded in line with `job`. A failure of the denoise stage
+/// (`BackendError::Denoise`, or any failure while it is the only stage) is
+/// returned as the job's denoise failure, and the job goes on without the
+/// stage: the effect alone, or an unload for `none`.
+fn run_job(shared: &Shared, job: &Job) -> JobResult {
+    let target = &job.target;
+    let done = |outcome| JobResult {
+        outcome,
+        denoise_failure: None,
+    };
+    if target.kind == EffectKind::None && !target.denoise {
+        unload(shared, job);
+        return done(Outcome::Unloaded);
+    }
+    match load(shared, job, target) {
+        Outcome::Failed(f)
+            if target.denoise && (target.kind == EffectKind::None || f.of_denoise()) =>
+        {
+            let denoise_failure = Some(f.reason);
+            let outcome = if target.kind == EffectKind::None {
+                unload(shared, job);
+                Outcome::Unloaded
+            } else {
+                let without = Target {
+                    denoise: false,
+                    ..target.clone()
+                };
+                load(shared, job, &without)
+            };
+            JobResult {
+                outcome,
+                denoise_failure,
             }
         }
-        e.loaded = None;
-        drop(e);
-        drop(guard);
-        return Outcome::Unloaded;
+        outcome => done(outcome),
     }
+}
+
+/// Unloads the backend instance (keeping it for the next load).
+fn unload(shared: &Shared, job: &Job) {
+    lock(&shared.control).loaded_kind = None;
+    // SAFETY: the element keeps the context alive until it has joined
+    // this thread.
+    let guard = unsafe { ContextGuard::push(job.gpu.context) };
+    let mut e = lock(&shared.engine);
+    match &guard {
+        Ok(_) => {
+            if let Some(instance) = e.instance.as_mut() {
+                instance.unload();
+            }
+        }
+        Err(err) => {
+            if let Some(instance) = e.instance.take() {
+                leak_backend(instance, &err.to_string());
+            }
+        }
+    }
+    e.loaded = None;
+    drop(e);
+    drop(guard);
+}
+
+/// Loads `target` (an effect, the denoise stage, or both) for `job`.
+fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
+    let kind = target.kind;
     let colour = match &job.format.colour {
         Ok(c) => *c,
-        Err(reason) => return Outcome::Failed(reason.clone()),
+        Err(reason) => return Outcome::Failed(Failure::new(reason.clone())),
     };
     let key = LoadedKey {
-        target: job.target.clone(),
+        target: target.clone(),
         width: job.format.width,
         height: job.format.height,
         colour,
@@ -915,13 +1348,13 @@ fn run_job(shared: &Shared, job: &Job) -> Outcome {
     if current.as_ref() == Some(&key) {
         return Outcome::AlreadyLoaded;
     }
-    let background = match (kind, &job.target.background) {
+    let background = match (kind, &target.background) {
         (EffectKind::Replace, None) => {
-            return Outcome::Failed("the replace effect needs a background image".into());
+            return Outcome::Failed(Failure::new("the replace effect needs a background image"));
         }
         (EffectKind::Replace, Some(path)) => match decode_background(path, &job.format) {
             Ok(b) => Some(Arc::new(b)),
-            Err(reason) => return Outcome::Failed(reason),
+            Err(reason) => return Outcome::Failed(Failure::new(reason)),
         },
         _ => None,
     };
@@ -929,28 +1362,48 @@ fn run_job(shared: &Shared, job: &Job) -> Outcome {
         return Outcome::Superseded;
     }
     let Some(factory) = job.factory.clone() else {
-        return Outcome::Failed("no inference backend is configured for the effects".into());
+        return Outcome::Failed(Failure::new(
+            "no inference backend is configured for the effects",
+        ));
     };
+    // A full load for the backend: nothing loaded, or another size or
+    // colour (the instance is left unloaded if it fails).
     let full = current
         .as_ref()
         .is_none_or(|k| (k.width, k.height, k.colour) != (key.width, key.height, key.colour));
-    if full && current.is_some() {
-        lock(&shared.control).loaded = false;
+    // The green screen loads cold after the denoise stage alone.
+    let cold_effect = kind != EffectKind::None
+        && current
+            .as_ref()
+            .is_some_and(|k| k.target.kind == EffectKind::None);
+    if (full || cold_effect) && current.is_some() {
+        // The streaming thread must not wait for this load.
+        lock(&shared.control).loaded_kind = None;
     }
     // SAFETY: as for the unload above.
     let _guard = match unsafe { ContextGuard::push(job.gpu.context) } {
         Ok(g) => g,
-        Err(e) => return Outcome::Failed(format!("cannot make the CUDA context current: {e}")),
+        Err(e) => {
+            return Outcome::Failed(Failure::new(format!(
+                "cannot make the CUDA context current: {e}"
+            )));
+        }
     };
     let mut e = lock(&shared.engine);
     if e.instance.is_none() {
         match factory.create() {
             Ok(i) => e.instance = Some(i),
-            Err(err) => return Outcome::Failed(err.to_string()),
+            Err(err) => {
+                return Outcome::Failed(Failure {
+                    reason: err.to_string(),
+                    error: Some(err),
+                });
+            }
         }
     }
     let req = LoadRequest {
         effect: kind,
+        denoise: target.denoise,
         width: key.width,
         height: key.height,
         colour,
@@ -967,10 +1420,14 @@ fn run_job(shared: &Shared, job: &Job) -> Outcome {
             Outcome::Loaded(report)
         }
         Err(err) => {
+            // A switch that fails keeps the previous chain loaded.
             if full {
                 e.loaded = None;
             }
-            Outcome::Failed(err.to_string())
+            Outcome::Failed(Failure {
+                reason: err.to_string(),
+                error: Some(err),
+            })
         }
     }
 }
@@ -1011,6 +1468,17 @@ impl ObjectImpl for ObcEffect {
                     .nick("On failure")
                     .blurb("Output after a failure: black | none (the unprocessed input)")
                     .default_value(Some("black"))
+                    .flags(rw)
+                    .build(),
+                glib::ParamSpecBoolean::builder("denoise")
+                    .nick("Denoise")
+                    .blurb(
+                        "Video noise removal before the effect, or alone with effect none \
+                         (dropped, not failed, if it cannot run). Turned on under blur or \
+                         replace, frames wait for the stage's load, the last processed frame \
+                         staying shown; the input is never shown",
+                    )
+                    .default_value(false)
                     .flags(rw)
                     .build(),
                 glib::ParamSpecString::builder("status")
@@ -1074,6 +1542,10 @@ impl ObjectImpl for ObcEffect {
                     return;
                 }
             },
+            "denoise" => {
+                s.denoise = value.get::<bool>().unwrap_or(false);
+                true
+            }
             other => unreachable!("no property {other}"),
         };
         self.apply(s, retry);
@@ -1090,6 +1562,7 @@ impl ObjectImpl for ObcEffect {
                 .unwrap_or_default()
                 .to_value(),
             "on-failure" => s.fallback.as_str().to_value(),
+            "denoise" => s.denoise.to_value(),
             "status" => self.status().to_string().to_value(),
             other => unreachable!("no property {other}"),
         }
@@ -1104,8 +1577,8 @@ impl ElementImpl for ObcEffect {
             gst::subclass::ElementMetadata::new(
                 "omarchy-broadcast effect",
                 "Filter/Effect/Video/Hardware",
-                "Background blur or replacement on NV12 CUDA frames through an inference \
-                 backend; passthrough without an effect",
+                "Background blur or replacement, and video noise removal, on NV12 CUDA \
+                 frames through an inference backend; passthrough without either",
                 "Raul Dias",
             )
         });
@@ -1170,22 +1643,20 @@ impl BaseTransformImpl for ObcEffect {
         self.release_gpu();
         let posted = {
             let mut c = lock(&self.shared.control);
-            let status = match c.settings.kind {
-                EffectKind::None => EffectStatus::Off,
-                _ => EffectStatus::Loading,
-            };
-            // A restart loads again (and retries a failure).
+            let before = c.report();
+            // A restart loads again (and retries a failure of the effect; a
+            // denoise failure stays recorded until the request changes).
             c.generation += 1;
-            (c.status != status).then(|| {
-                c.status = status;
-                (c.settings.kind, c.status.clone())
-            })
+            c.status = c.pending_status();
+            c.denoise_status = c.pending_denoise_status();
+            before.changed(c.report())
         };
-        if let Some((kind, status)) = posted {
-            post_status(&self.obj(), kind, &status);
+        if let Some(r) = posted {
+            post_status(&self.obj(), &r);
         }
         let mut st = lock(&self.stream);
         st.action = FrameAction::Passthrough;
+        st.reset_pending = false;
         Ok(())
     }
 
@@ -1220,21 +1691,19 @@ impl BaseTransformImpl for ObcEffect {
         }
         let posted = {
             let mut c = lock(&self.shared.control);
-            let mut posted = None;
+            let before = c.report();
             if c.format.as_ref() != Some(&format) {
                 c.format = Some(format);
                 // Loading depends on the size and colour: a new request.
                 c.generation += 1;
-                if c.target.kind != EffectKind::None && c.status != EffectStatus::Loading {
-                    c.status = EffectStatus::Loading;
-                    posted = Some((c.settings.kind, c.status.clone()));
-                }
+                c.status = c.pending_status();
+                c.denoise_status = c.pending_denoise_status();
                 self.shared.wake.notify_all();
             }
-            posted
+            before.changed(c.report())
         };
-        if let Some((kind, status)) = posted {
-            post_status(&self.obj(), kind, &status);
+        if let Some(r) = posted {
+            post_status(&self.obj(), &r);
         }
         Ok(())
     }
@@ -1316,31 +1785,49 @@ impl BaseTransformImpl for ObcEffect {
 
 impl ObcEffect {
     /// Decides what the frame gets and sets BaseTransform's passthrough to
-    /// match, creating the CUDA objects when the frame needs them.
+    /// match, creating the CUDA objects when the frame needs them (or the
+    /// denoise stage alone needs them loaded: it passes frames through
+    /// until then).
     fn prepare_frame(&self, inbuf: &gst::BufferRef) {
-        let (kind, status, fallback, loaded, strength, generation) = {
+        let (kind, status, fallback, loaded, denoise, strength, generation) = {
             let c = lock(&self.shared.control);
             (
                 c.settings.kind,
                 c.status.clone(),
                 c.settings.fallback,
-                c.loaded,
+                c.usable(),
+                c.denoise_effective(),
                 c.settings.blur_strength,
                 c.generation,
             )
         };
-        let mut action = decide(kind, &status, fallback, loaded);
+        let mut action = decide(kind, &status, fallback, loaded, denoise);
+        let needs_gpu = action != FrameAction::Passthrough || (kind == EffectKind::None && denoise);
         let mut st = lock(&self.stream);
-        if action != FrameAction::Passthrough
-            && let Err(reason) = self.ensure_gpu(&mut st, inbuf)
-        {
+        if needs_gpu && let Err(reason) = self.ensure_gpu(&mut st, inbuf) {
             drop(st);
-            self.fail(generation, reason.clone());
+            if kind == EffectKind::None {
+                // Only the denoise stage needed CUDA: drop it, pass through.
+                self.fail_denoise(Some(generation), reason);
+                action = FrameAction::Passthrough;
+            } else {
+                self.fail(generation, reason.clone());
+                action = decide(
+                    kind,
+                    &EffectStatus::Failed(reason),
+                    fallback,
+                    loaded,
+                    denoise,
+                );
+            }
             st = lock(&self.stream);
-            action = decide(kind, &EffectStatus::Failed(reason), fallback, loaded);
+        }
+        if has_new_source_flag(inbuf) {
+            st.reset_pending = true;
         }
         st.action = action;
         st.generation = generation;
+        st.kind = kind;
         st.strength = strength;
         st.fallback = fallback;
         drop(st);

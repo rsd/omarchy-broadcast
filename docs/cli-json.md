@@ -6,14 +6,15 @@
 
 | Command | Does | `--json` |
 |---|---|---|
-| `omarchy-broadcast status` | Prints the state, whether the camera is enabled, the active camera, the number of consumers, the output mode, the effect, and the error text if there is one. While the PipeWire output is configured, the consumers are shown with their split (`Consumers:  2 (loopback 1, PipeWire 1)`) and a `PipeWire:` line gives the output's state. | One `snapshot` object. |
+| `omarchy-broadcast status` | Prints the state, whether the camera is enabled, the active camera, the number of consumers, the output mode, the effect (with noise removal, from interface revision 4), and the error text if there is one. While the PipeWire output is configured, the consumers are shown with their split (`Consumers:  2 (loopback 1, PipeWire 1)`) and a `PipeWire:` line gives the output's state. | One `snapshot` object. |
 | `omarchy-broadcast on` | Enables the camera (`SetEnabled(true)`), then prints the resulting state. | No. |
 | `omarchy-broadcast off` | Disables the camera, entering the privacy state `off` (`SetEnabled(false)`), then prints the resulting state. | No. |
 | `omarchy-broadcast cameras` | Lists the cameras in the daemon's order, the active one marked with `*`: name, USB `vid:pid` (`-` if none) and id. | One `cameras` object. |
 | `omarchy-broadcast camera next` | Selects the next camera (`NextCamera()`), then prints the resulting camera. | No. |
 | `omarchy-broadcast camera <selector>` | Selects a camera (`SelectCamera(selector)`): a camera id, a case-insensitive name substring, a USB `vid:pid` or a `/dev/videoN` path. Prints the resulting camera. | No. |
-| `omarchy-broadcast effect` | Prints the video effect, the blur strength and the background image (`Effect`, `BlurStrength`, `BackgroundImage`). Never starts the daemon. | One `snapshot` object. |
+| `omarchy-broadcast effect` | Prints the video effect, the blur strength, the background image and, from interface revision 4, noise removal (`Effect`, `BlurStrength`, `BackgroundImage`, `Denoise`). Never starts the daemon. | One `snapshot` object. |
 | `omarchy-broadcast effect none\|blur\|replace [--strength X] [--image PATH]` | Selects the video effect (`SetEffect`), then prints the resulting settings. See [Effect](#effect). | No. |
+| `omarchy-broadcast denoise on\|off` | Turns video noise removal on or off (`SetDenoise`), then prints the resulting setting. See [Noise removal](#noise-removal). | No. |
 | `omarchy-broadcast watch` | Follows the daemon: a summary when it connects, then a line for each change and each `Stats` signal (about once per second while `active`), until interrupted. | One object per line (NDJSON). |
 
 The word `next` is always the `NextCamera` command; select a camera whose name contains "next" by its id or `vid:pid`. The selectors and the errors they can raise are those of `SelectCamera` in [dbus-api.md](dbus-api.md#selectcameras-selector).
@@ -34,7 +35,10 @@ omarchy-broadcast effect [none|blur|replace] [--strength X] [--image PATH]
   Effect:     blur
   Strength:   0.50
   Image:      (none)
+  Denoise:    off
   ```
+
+  The `Denoise:` line is printed from interface revision 4; `status` shows it after the effect lines in the same way.
 
 - `none`, `blur` and `replace` select the effect. `--strength X` (0.0 to 1.0) is accepted with `blur` only and `--image PATH` with `replace` only; giving one with another effect is a usage error (status `2`), as is a strength outside 0 to 1 or an image that does not exist or is not a regular file.
 - `PATH` is made absolute against the current directory, so the daemon, which has its own working directory, is always given an absolute path. The daemon requires a PNG or JPEG file; other files are rejected by the daemon (status `1`) or fail when the effect starts (the daemon's `Error` property says why).
@@ -45,10 +49,25 @@ omarchy-broadcast effect [none|blur|replace] [--strength X] [--image PATH]
 - Like `on`, `off` and `camera`, selecting an effect may start the daemon through D-Bus activation and gives up after 30 s; `effect` without an effect, like `status`, never starts it and gives up after 5 s.
 - Strings that come from the daemon (the image path, camera names, `Error`) are printed in the human-readable output with control characters and bidirectional-text marks escaped (`\xNN`, `\u{NNNN}`), so that a hostile file name cannot move the cursor or reorder the line. The JSON output is escaped by JSON itself.
 
+## Noise removal
+
+`omarchy-broadcast denoise on|off` turns video noise removal on or off ([dbus-api.md](dbus-api.md#video-effects), [ADR-0018](adr/0018-video-noise-removal.md)). It is independent of the effect: it combines with `none`, `blur` and `replace`.
+
+```text
+omarchy-broadcast denoise on
+Denoise:    on
+```
+
+- The setting persists across restarts of the daemon and takes precedence over `config.toml`. Setting the value already in force writes nothing.
+- Like the other setters it may start the daemon through D-Bus activation and gives up after 30 s.
+- Against a daemon of interface revision 3 or lower it prints `omarchy-broadcast: the daemon does not support noise removal (its interface revision is N, noise removal needs 4); update omarchy-broadcastd` and exits with status `1`.
+- Noise removal fails open: if the stage cannot run, the stream continues without it and the daemon's `Error` text (shown by `status`) says why. The command itself succeeds, because the setting was applied.
+- In `watch` without `--json`, the summary line gains ` | denoise on` and a change prints a `denoise: on` (or `off`) line, both from revision 4.
+
 ## Starting the daemon
 
 - `status`, `cameras`, `watch` and `effect` without an effect never start the daemon. They read the properties with `org.freedesktop.DBus.Properties.GetAll` carrying the `NO_AUTO_START` flag, so looking at the daemon never launches it. This is the read that the `obc-ipc` crate provides to Rust clients (`Snapshot::fetch_no_autostart`); [dbus-api.md](dbus-api.md#service-presence-and-activation) gives the `busctl` and `gdbus` equivalents.
-- `on`, `off`, `camera` and `effect <effect>` call methods without that flag: when the D-Bus activation file `br.com.dias.OmarchyBroadcast.service` is installed, the call starts the daemon, as `systemctl --user start omarchy-broadcastd` would. `off` on a stopped daemon therefore starts it and records the privacy state, which persists across restarts. Without an activation file, or if the start fails, the command reports that the daemon is not running.
+- `on`, `off`, `camera`, `effect <effect>` and `denoise` call methods without that flag: when the D-Bus activation file `br.com.dias.OmarchyBroadcast.service` is installed, the call starts the daemon, as `systemctl --user start omarchy-broadcastd` would. `off` on a stopped daemon therefore starts it and records the privacy state, which persists across restarts. Without an activation file, or if the start fails, the command reports that the daemon is not running.
 
 When the daemon is not running, the human-readable commands print one line to stderr, for example:
 
@@ -61,12 +80,12 @@ omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.O
 | Status | Meaning |
 |---|---|
 | `0` | Success. Also the status of `watch` when it ends on `SIGTERM`, `SIGINT`, `SIGPIPE` or a closed stdout. |
-| `1` | The daemon rejected the request: one of the `br.com.dias.OmarchyBroadcast1.Error` errors (`NoSuchCamera`, `InvalidConfig`, `Unavailable`, `InvalidArgument`, `Failed`), or the daemon does not support the request (`effect` against interface revision 1). Its message is printed to stderr. |
+| `1` | The daemon rejected the request: one of the `br.com.dias.OmarchyBroadcast1.Error` errors (`NoSuchCamera`, `InvalidConfig`, `Unavailable`, `InvalidArgument`, `Failed`), or the daemon does not support the request (`effect` against interface revision 1, `denoise` against a revision below 4). Its message is printed to stderr. |
 | `2` | Invalid command line. |
 | `3` | The daemon is not running (its name has no owner, or D-Bus could not start it), or there is no D-Bus session bus. |
 | `4` | Any other D-Bus failure (an unexpected reply, a lost connection), a timeout, or a failed write to stdout. |
 
-`status` and `cameras` give up after 5 s, and `on`, `off`, `camera` and `effect <effect>` after 30 s (time for the daemon to be started), with status `4`. `watch` gives each read of the properties 5 s as well (see [Daemon absent or gone](#daemon-absent-or-gone)). `omarchy-broadcast --help` lists the exit statuses.
+`status` and `cameras` give up after 5 s, and `on`, `off`, `camera`, `effect <effect>` and `denoise` after 30 s (time for the daemon to be started), with status `4`. `watch` gives each read of the properties 5 s as well (see [Daemon absent or gone](#daemon-absent-or-gone)). `omarchy-broadcast --help` lists the exit statuses.
 
 ## JSON output
 
@@ -116,6 +135,7 @@ Every property of the daemon at one moment. Printed by `status --json`, and by `
 | `effect` | string | The video effect in force: `"none"`, `"blur"` or `"replace"`. The effective value; it does not say whether the effect is ready or has failed (see `state` and `error`). |
 | `blur_strength` | number | Strength of the blur effect, 0.0 to 1.0, also when `effect` is not `"blur"`. A value outside the range is clamped to it, and a value that is not a finite number is printed as `0`. `0` also when the daemon is too old to have the property (`interface_revision` 1). |
 | `background_image` | string | Absolute path of the image used by `"replace"`; `""` if none. Bounded to 256 bytes and clipped at its start (see above). |
+| `denoise` | boolean or null | Whether video noise removal is on (a stage that combines with any effect). `null`, with the key present, from a daemon below interface revision 4, which has no noise removal; the older fields take a default value instead (see Versioning). |
 | `interface_revision` | number | Revision of `br.com.dias.OmarchyBroadcast1` the daemon implements. |
 | `cameras` | array | The cameras present, in the daemon's order, as camera objects (below). |
 | `cameras_truncated` | boolean | `true` if more cameras were present than listed. |
@@ -136,8 +156,8 @@ Printed by `watch --json` when one or more of the scalar fields change. It carri
 | Field | JSON type | Meaning |
 |---|---|---|
 | `v`, `type` | | `1`, `"state"`. |
-| `changed` | array of strings | The fields whose value changed, from: `state`, `enabled`, `error`, `active_camera`, `active_camera_name`, `consumers`, `loopback_consumers`, `pipewire_consumers`, `pipewire_output`, `output_mode`, `effect`, `blur_strength`, `background_image`, `interface_revision`. Never empty. |
-| `state`, `enabled`, `error`, `active_camera`, `active_camera_name`, `consumers`, `loopback_consumers`, `pipewire_consumers`, `pipewire_output`, `output_mode`, `effect`, `blur_strength`, `background_image`, `interface_revision` | | As in `snapshot`, current values. |
+| `changed` | array of strings | The fields whose value changed, from: `state`, `enabled`, `error`, `active_camera`, `active_camera_name`, `consumers`, `loopback_consumers`, `pipewire_consumers`, `pipewire_output`, `output_mode`, `effect`, `blur_strength`, `background_image`, `denoise`, `interface_revision`. Never empty. |
+| `state`, `enabled`, `error`, `active_camera`, `active_camera_name`, `consumers`, `loopback_consumers`, `pipewire_consumers`, `pipewire_output`, `output_mode`, `effect`, `blur_strength`, `background_image`, `denoise`, `interface_revision` | | As in `snapshot`, current values. |
 
 A `state` line does not carry the camera list. `active_camera_name` can change without `active_camera` (the active camera was renamed, or appeared in or left the list); it is then reported in `changed` on its own.
 
@@ -209,10 +229,11 @@ A client should treat the state after a `daemon-not-running` line as "daemon not
 - `v` is the schema version of every line. It is `1` in this version.
 - **`v` stays 1 for the effect fields.** `blur_strength` and `background_image` are new fields in existing line types, `effect` now takes the values `blur` and `replace` in addition to `none`, and `changed` may name the two new fields. None of this removes or renames a field or changes the type or meaning of one, so it is not breaking under the rule below. The set of `state` strings is unchanged. A client written for the earlier version keeps working: it ignores the new fields and shows an `effect` string it does not know as text.
 - **`v` stays 1 for the PipeWire fields.** `loopback_consumers`, `pipewire_consumers` and `pipewire_output` are new fields in existing line types, and `changed` may name them. `consumers` keeps its type; with the PipeWire output off it has the value it had before. Against a daemon of interface revision 2 or lower the fields are still printed, with the values of a daemon that has no PipeWire output (`loopback_consumers` equal to `consumers`, `pipewire_consumers` 0, `pipewire_output` `"off"`).
+- **`v` stays 1 for `denoise`.** It is a new field in the existing `snapshot` and `state` lines, and `changed` may name it. It differs from the earlier additions in one respect: against a daemon of interface revision 3 or lower the key is still printed, but its value is `null`, not a default, because "off" would claim a setting the daemon does not have. A client that treats a missing or `null` value as "not available" is correct for both. `true` and `false` mean the daemon reports the setting.
 - A **breaking change** raises `v`: a removed or renamed field or line type, a changed JSON type or meaning, a new state string, or a change to the rules above (line cap, outage behaviour).
 - **Not breaking**, made without raising `v`: a new field in an existing line type, a new line type, a new `error` code. Clients ignore what they do not know.
 - The schema is independent of the D-Bus `InterfaceRevision`; a new D-Bus property may appear as a new field.
-- **Capability rules for clients.** A client that shows the split of the consumers does so only while `pipewire_output` is not `"off"`. A client offers the effect controls only if both hold: the CLI is new enough to print `blur_strength` (the field is present as a number in `snapshot`; an older CLI has no `effect` command, and `omarchy-broadcast effect` fails with status `2`), and the daemon's `interface_revision` is 2 or more. Check the CLI first, then the daemon; the two conditions have different remedies (update `omarchy-broadcast`, update `omarchy-broadcastd`). When the field is absent or the revision is lower, show the effect, if at all, as read-only text.
+- **Capability rules for clients.** A client that shows the split of the consumers does so only while `pipewire_output` is not `"off"`. A client offers the effect controls only if both hold: the CLI is new enough to print `blur_strength` (the field is present as a number in `snapshot`; an older CLI has no `effect` command, and `omarchy-broadcast effect` fails with status `2`), and the daemon's `interface_revision` is 2 or more. Offer the noise-removal switch only if `denoise` is a boolean and `interface_revision` is 4 or more. Check the CLI first, then the daemon; the two conditions have different remedies (update `omarchy-broadcast`, update `omarchy-broadcastd`). When the field is absent or the revision is lower, show the effect, if at all, as read-only text.
 
 ## Examples
 
@@ -223,7 +244,7 @@ omarchy-broadcast status --json
 ```
 
 ```json
-{"v":1,"type":"snapshot","state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":0,"loopback_consumers":0,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":3,"cameras":[{"id":"usb-046d_0944-video-index0","name":"Logitech MX Brio","usb":"046d:0944","active":true},{"id":"pci-0000:00:14.0-usb-0:5:1.0-video-index0","name":"FHD Camera","usb":"5986:1193","active":false}],"cameras_truncated":false}
+{"v":1,"type":"snapshot","state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":0,"loopback_consumers":0,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","denoise":false,"interface_revision":4,"cameras":[{"id":"usb-046d_0944-video-index0","name":"Logitech MX Brio","usb":"046d:0944","active":true},{"id":"pci-0000:00:14.0-usb-0:5:1.0-video-index0","name":"FHD Camera","usb":"5986:1193","active":false}],"cameras_truncated":false}
 ```
 
 ```sh
@@ -241,14 +262,14 @@ omarchy-broadcast watch --json
 ```
 
 ```json
-{"v":1,"type":"snapshot","state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":0,"loopback_consumers":0,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":3,"cameras":[{"id":"usb-046d_0944-video-index0","name":"Logitech MX Brio","usb":"046d:0944","active":true}],"cameras_truncated":false}
-{"v":1,"type":"state","changed":["consumers","loopback_consumers"],"state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":1,"loopback_consumers":1,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":3}
-{"v":1,"type":"state","changed":["state"],"state":"starting","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":1,"loopback_consumers":1,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":3}
-{"v":1,"type":"state","changed":["state"],"state":"active","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":1,"loopback_consumers":1,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":3}
+{"v":1,"type":"snapshot","state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":0,"loopback_consumers":0,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","denoise":false,"interface_revision":4,"cameras":[{"id":"usb-046d_0944-video-index0","name":"Logitech MX Brio","usb":"046d:0944","active":true}],"cameras_truncated":false}
+{"v":1,"type":"state","changed":["consumers","loopback_consumers"],"state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":1,"loopback_consumers":1,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","denoise":false,"interface_revision":4}
+{"v":1,"type":"state","changed":["state"],"state":"starting","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":1,"loopback_consumers":1,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","denoise":false,"interface_revision":4}
+{"v":1,"type":"state","changed":["state"],"state":"active","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":1,"loopback_consumers":1,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","denoise":false,"interface_revision":4}
 {"v":1,"type":"stats","fps":30.0,"latency_p50_ms":41.2,"cpu_percent":6.5,"gpu_percent":18.0}
 {"v":1,"type":"stats","fps":30.0,"latency_p50_ms":40.8,"cpu_percent":6.4,"gpu_percent":-1.0}
 {"v":1,"type":"error","code":"daemon-not-running","error":"omarchy-broadcastd is not running (no owner for br.com.dias.OmarchyBroadcast on the session bus); start it with: systemctl --user start omarchy-broadcastd"}
-{"v":1,"type":"snapshot","state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":0,"loopback_consumers":0,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":3,"cameras":[{"id":"usb-046d_0944-video-index0","name":"Logitech MX Brio","usb":"046d:0944","active":true}],"cameras_truncated":false}
+{"v":1,"type":"snapshot","state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":0,"loopback_consumers":0,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","denoise":false,"interface_revision":4,"cameras":[{"id":"usb-046d_0944-video-index0","name":"Logitech MX Brio","usb":"046d:0944","active":true}],"cameras_truncated":false}
 ```
 
 Read the current state once from a shell script:
@@ -264,4 +285,4 @@ state=$(omarchy-broadcast status --json | jq -r 'if .type == "snapshot" then .st
 - Clear the stats display when `state` leaves `active`: no `stats` line arrives in other states.
 - Show `error` whenever it is non-empty, whatever the state.
 - To stop, send `SIGTERM` or close the pipe.
-- Control the daemon by running `omarchy-broadcast on`, `off`, `camera next`, `camera <id>` or `effect <effect>`, and check the exit status; the resulting change arrives on the `watch` stream.
+- Control the daemon by running `omarchy-broadcast on`, `off`, `camera next`, `camera <id>`, `effect <effect>` or `denoise on|off`, and check the exit status; the resulting change arrives on the `watch` stream.

@@ -72,6 +72,14 @@
 //! element unloads its backend (with the context current) before the
 //! pipeline releases the CUDA context.
 //!
+//! **New source.** The clock marks the first fresh frame it emits from each
+//! source (the first after a source switch, and the first of the first
+//! source) with [`gst_obc::NEW_SOURCE_FLAG`], and clears the flag on every
+//! other buffer, so the effect element resets the temporal state of its
+//! backend (the denoise stage's, `docs/adr/0018-video-noise-removal.md`)
+//! instead of blending two cameras. `DISCONT` cannot carry this: the clock
+//! sets it after every skipped tick too.
+//!
 //! **CUDA context.** The output pipeline's CUDA elements create the
 //! `GstCudaContext` when the pipeline opens; [`Output::cuda_context`] hands
 //! it to every ingest pipeline so canonical frames stay in one context.
@@ -672,6 +680,15 @@ impl Output {
             .map_or(EffectStatus::Off, |fx| fx.status())
     }
 
+    /// The state of the effect element's denoise stage
+    /// ([`EffectStatus::Off`] unless requested, and without an effect
+    /// element).
+    pub fn denoise_status(&self) -> EffectStatus {
+        self.effect
+            .as_ref()
+            .map_or(EffectStatus::Off, |fx| fx.denoise_status())
+    }
+
     /// The effect element's counters and timings; `None` without one.
     pub fn effect_stats(&self) -> Option<EffectStats> {
         self.effect.as_ref().map(|fx| fx.stats())
@@ -994,6 +1011,11 @@ impl ClockContext {
                 }),
                 now,
             );
+            // The first fresh frame of a source (see the module docs).
+            let new_source = kind == TickKind::Fresh
+                && latest
+                    .as_ref()
+                    .is_some_and(|e| e.frame.source_id != last_fresh_source);
             let (source, origin_info) = match (kind, &latest) {
                 (TickKind::Fresh | TickKind::Repeat, Some(e)) => (
                     &e.frame.buffer,
@@ -1023,6 +1045,11 @@ impl ClockContext {
                 } else {
                     b.unset_flags(gst::BufferFlags::DISCONT);
                 }
+                if new_source {
+                    b.set_flags(gst_obc::NEW_SOURCE_FLAG);
+                } else {
+                    b.unset_flags(gst_obc::NEW_SOURCE_FLAG);
+                }
             }
             drop(latest);
             let emitted_at = Instant::now();
@@ -1044,10 +1071,7 @@ impl ClockContext {
                     .fetch_add(dropped_now.saturating_sub(dropped_seen), Ordering::Relaxed);
                 dropped_seen = dropped_now;
             }
-            if kind == TickKind::Fresh
-                && let Some(o) = &origin_info
-                && o.source_id != last_fresh_source
-            {
+            if new_source && let Some(o) = &origin_info {
                 last_fresh_source = o.source_id;
                 c.fresh_source_since_ns
                     .store(ns_since(self.epoch, emitted_at), Ordering::Relaxed);
@@ -1619,6 +1643,84 @@ mod tests {
             Output::build_in(cfg, FrameMemory::System),
             Err(PipelineError::Cuda(_))
         ));
+    }
+
+    /// The first fresh frame of each source carries the new-source flag
+    /// out of `appsrc`'s queue and down to the sink; no other buffer does
+    /// (later fresh frames, repeats, placeholders), even when the slot's
+    /// buffer carries it. A source that comes back is new again. CPU only.
+    #[test]
+    fn the_first_fresh_frame_of_each_source_is_flagged_down_to_the_sink() {
+        require_elements(&["appsrc", "capssetter", "fakesink"]);
+        let contract: OutputContract = "320x240@30".parse().unwrap();
+        let mut o = Output::build_in(
+            OutputConfig::new(contract, OutputSink::Fake),
+            FrameMemory::System,
+        )
+        .unwrap();
+        let ticks: Arc<Mutex<Vec<EmitInfo>>> = Arc::default();
+        let t = Arc::clone(&ticks);
+        o.set_observer(Some(Arc::new(move |e: &EmitInfo| {
+            t.lock().unwrap().push(*e);
+        })));
+        // (tick, flagged) of every buffer reaching the sink.
+        let at_sink: Arc<Mutex<Vec<(u64, bool)>>> = Arc::default();
+        let a = Arc::clone(&at_sink);
+        o.pipeline()
+            .element(names::LOOPBACK)
+            .unwrap()
+            .static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
+                    let flagged = gst_obc::has_new_source_flag(b);
+                    a.lock().unwrap().push((b.offset(), flagged));
+                }
+                gst::PadProbeReturn::Ok
+            });
+        o.start().unwrap();
+        let first = o.frame_writer();
+        let second = o.frame_writer();
+        let canonical = first.canonical();
+        let feed = |w: &FrameWriter, n: u64| {
+            for i in 0..n {
+                let mut b = black_frame(&canonical);
+                let r = b.get_mut().unwrap();
+                r.set_pts(gst::ClockTime::from_mseconds(i * 33));
+                // A flag already on the slot's buffer must not leak out.
+                r.set_flags(gst_obc::NEW_SOURCE_FLAG);
+                w.put(b);
+                std::thread::sleep(Duration::from_millis(33));
+            }
+        };
+        feed(&first, 10);
+        feed(&second, 10);
+        feed(&first, 10);
+        // Repeats of the last frame.
+        std::thread::sleep(Duration::from_millis(200));
+        o.stop().unwrap();
+
+        let ticks = ticks.lock().unwrap().clone();
+        let mut last = 0;
+        let mut new_source = Vec::new();
+        for e in &ticks {
+            if e.kind == TickKind::Fresh
+                && let Some(origin) = e.origin
+                && origin.source_id != last
+            {
+                last = origin.source_id;
+                new_source.push(e.tick);
+            }
+        }
+        assert_eq!(new_source.len(), 3, "first, second, first again: {ticks:?}");
+        let at_sink = at_sink.lock().unwrap().clone();
+        assert!(at_sink.len() > 30, "{} buffers at the sink", at_sink.len());
+        let flagged: Vec<u64> = at_sink.iter().filter(|s| s.1).map(|s| s.0).collect();
+        assert_eq!(flagged, new_source, "flagged buffers at the sink");
+        assert!(
+            ticks.iter().any(|e| e.kind == TickKind::Repeat),
+            "the run had repeats"
+        );
     }
 
     #[test]

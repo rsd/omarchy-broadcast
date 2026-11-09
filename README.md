@@ -1,6 +1,6 @@
 # omarchy-broadcast
 
-A GPU webcam-effects pipeline for Linux. Frames flow from a camera through GStreamer and CUDA memory into a [v4l2loopback](https://github.com/v4l2loopback/v4l2loopback) virtual camera that any application can select. The effects (background blur and background replacement) use the NVIDIA Maxine Video Effects SDK behind a replaceable inference-backend interface.
+A GPU webcam-effects pipeline for Linux. Frames flow from a camera through GStreamer and CUDA memory into a [v4l2loopback](https://github.com/v4l2loopback/v4l2loopback) virtual camera that any application can select. The effects (background blur and background replacement) and video noise removal use the NVIDIA Maxine Video Effects SDK behind a replaceable inference-backend interface.
 
 Optionally, the daemon also offers the camera as a native PipeWire video source, "Omarchy Broadcast", next to the loopback device, for applications that use PipeWire for cameras ([docs/setup/daemon.md](docs/setup/daemon.md#the-pipewire-output)).
 
@@ -8,7 +8,7 @@ Any UVC webcam works: the pipeline picks a capture mode from what the camera adv
 
 ## Status
 
-Early development. The camera -> CUDA -> virtual camera passthrough works, with sustained 1080p60 on the reference machine. The `omarchy-broadcastd` daemon (a systemd user service controlled over D-Bus) and the `omarchy-broadcast` command-line client run it on demand: the camera and GPU start when an application opens the virtual camera ([docs/setup/daemon.md](docs/setup/daemon.md)). Background blur and background replacement run on the GPU through the Maxine SDK, which each user installs ([docs/setup/maxine.md](docs/setup/maxine.md)); they are selected with `omarchy-broadcast effect` and add a small GPU cost per frame. Both harden the segmentation mask edge, so the room does not show through around the subject ([docs/adr/0013-mask-hardening-cuda-kernel.md](docs/adr/0013-mask-hardening-cuda-kernel.md)). Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence; reproduce locally with `obc-bench` (see [docs/testing.md](docs/testing.md)). Other measurements are in [docs/benchmarks/](docs/benchmarks/passthrough.md).
+Early development. The camera -> CUDA -> virtual camera passthrough works, with sustained 1080p60 on the reference machine. The `omarchy-broadcastd` daemon (a systemd user service controlled over D-Bus) and the `omarchy-broadcast` command-line client run it on demand: the camera and GPU start when an application opens the virtual camera ([docs/setup/daemon.md](docs/setup/daemon.md)). Background blur and background replacement run on the GPU through the Maxine SDK, which each user installs ([docs/setup/maxine.md](docs/setup/maxine.md)); they are selected with `omarchy-broadcast effect` and add a small GPU cost per frame. Video noise removal, which removes the grain a webcam shows in dim rooms, is a separate switch that combines with either effect or runs alone: `omarchy-broadcast denoise on|off` ([docs/adr/0018-video-noise-removal.md](docs/adr/0018-video-noise-removal.md)). It adds one GPU pass per frame while it is on, and it fails open: if it cannot run, the stream continues without it. Both harden the segmentation mask edge, so the room does not show through around the subject ([docs/adr/0013-mask-hardening-cuda-kernel.md](docs/adr/0013-mask-hardening-cuda-kernel.md)). Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence; reproduce locally with `obc-bench` (see [docs/testing.md](docs/testing.md)). Other measurements are in [docs/benchmarks/](docs/benchmarks/passthrough.md).
 
 ## Requirements
 
@@ -18,7 +18,7 @@ Early development. The camera -> CUDA -> virtual camera passthrough works, with 
 - v4l2loopback, configured as described in [docs/setup/loopback.md](docs/setup/loopback.md)
 - Rust toolchain (only to build from source; the Arch package is built with it, and installed without it)
 - Optional, for the native PipeWire camera output: a build with the cargo feature `omarchy-broadcastd/pipewire` (libpipewire headers and clang at build time; the Arch package has it) and `[pipewire] enabled = true` in the configuration
-- Optional, for effects: the NVIDIA Maxine VFX SDK ([docs/setup/maxine.md](docs/setup/maxine.md))
+- Optional, for effects and noise removal: the NVIDIA Maxine VFX SDK ([docs/setup/maxine.md](docs/setup/maxine.md))
 - Optional, for the noise-removed microphone: `deepfilternet-ladspa` or `noise-suppression-for-voice` ([docs/setup/microphone.md](docs/setup/microphone.md))
 
 ## Build
@@ -79,7 +79,7 @@ Tests, including the manual check with OBS or Chrome, are described in [docs/tes
 
 ## Documentation
 
-See [docs/README.md](docs/README.md) for the architecture, decision records, setup guides and benchmarks. The Omarchy bar widget (status icon, on/off, camera and effect selection) is described in [clients/omarchy-bar/README.md](clients/omarchy-bar/README.md).
+See [docs/README.md](docs/README.md) for the architecture, decision records, setup guides and benchmarks. The Omarchy bar widget (status icon, on/off, camera, effect and noise-removal selection) is described in [clients/omarchy-bar/README.md](clients/omarchy-bar/README.md).
 
 ## Licence
 

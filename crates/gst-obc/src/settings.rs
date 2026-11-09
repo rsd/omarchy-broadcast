@@ -53,7 +53,7 @@ pub fn parse_effect(s: &str) -> Result<EffectKind, String> {
     s.parse::<EffectKind>().map_err(|e| e.to_string())
 }
 
-/// Everything that selects the effect: the element's four properties.
+/// Everything that selects the effect: the element's five properties.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectSettings {
     /// The effect (`effect`).
@@ -64,6 +64,13 @@ pub struct EffectSettings {
     pub background: Option<PathBuf>,
     /// The output after a failure (`on-failure`).
     pub fallback: EffectFallback,
+    /// Run the video noise removal stage (`denoise`) before the effect, or
+    /// alone with [`EffectKind::None`]
+    /// (`docs/adr/0018-video-noise-removal.md`). It hides nothing, so it
+    /// never changes what the privacy rules show: a failure of the stage
+    /// alone drops it and leaves the effect running ([`EffectStatus`] of the
+    /// effect unchanged; the element's denoise status says why).
+    pub denoise: bool,
 }
 
 impl Default for EffectSettings {
@@ -73,6 +80,7 @@ impl Default for EffectSettings {
             blur_strength: Self::DEFAULT_BLUR_STRENGTH,
             background: None,
             fallback: EffectFallback::Black,
+            denoise: false,
         }
     }
 }
@@ -115,8 +123,8 @@ impl EffectSettings {
     }
 
     /// What the backend must have loaded for these settings: the effect,
-    /// and for replace its image. Blur strength and the fallback change
-    /// nothing that is loaded.
+    /// for replace its image, and whether the denoise stage is requested.
+    /// Blur strength and the fallback change nothing that is loaded.
     pub(crate) fn target(&self) -> Target {
         Target {
             kind: self.kind,
@@ -124,18 +132,24 @@ impl EffectSettings {
                 EffectKind::Replace => self.background.clone(),
                 _ => None,
             },
+            denoise: self.denoise,
         }
     }
 }
 
-/// What has to be loaded for a request.
+/// What has to be loaded for a request. `kind` none with `denoise` is the
+/// denoise stage alone; none without it loads nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Target {
     pub kind: EffectKind,
     pub background: Option<PathBuf>,
+    pub denoise: bool,
 }
 
-/// The state of the requested effect.
+/// The state of the requested effect, and (as the element's separate
+/// denoise status) of the requested denoise stage: `Off` when it is not
+/// requested, `Loading` until it runs, `Ready` while it runs on every
+/// processed frame, `Failed` with the reason once it was dropped.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum EffectStatus {
     /// No effect is requested (`none`): frames pass through.
@@ -188,18 +202,31 @@ pub struct EffectStats {
     pub effect: EffectKind,
     /// Its state.
     pub status: EffectStatus,
+    /// The state of the denoise stage ([`EffectStatus::Off`] unless it is
+    /// requested).
+    pub denoise: EffectStatus,
     /// Frames the backend processed.
     pub frames_processed: u64,
     /// Black frames output (warm-up, or a failure with `on-failure=black`).
     pub frames_black: u64,
     /// Frames passed through untouched (`none`, or a failure with
-    /// `on-failure=none`).
+    /// `on-failure=none`), and input frames copied unprocessed into an
+    /// output buffer (a frame whose processing failed, with nothing to hide
+    /// or with `on-failure=none`).
     pub frames_passthrough: u64,
+    /// Of the processed frames, those the denoise stage ran on.
+    pub frames_denoised: u64,
     /// GPU time of the processing of one frame (CUDA events around the
     /// backend call, on the element's stream), median and 95th percentile
     /// over the last [`EffectStats::WINDOW`] processed frames.
     pub gpu_ms_p50: Option<f64>,
     pub gpu_ms_p95: Option<f64>,
+    /// GPU time of the denoise stage alone (the backend's
+    /// [`StageTimings::denoise_ms`](obc_backend::StageTimings::denoise_ms)),
+    /// median and 95th percentile over the last [`EffectStats::WINDOW`]
+    /// denoised frames the backend timed; `None` if it times none.
+    pub denoise_ms_p50: Option<f64>,
+    pub denoise_ms_p95: Option<f64>,
     /// Wall time of the last successful load, warm-up included
     /// (`LoadReport::load_ms + warmup_ms`), and whether it reused a loaded
     /// model.
@@ -235,14 +262,26 @@ pub(crate) enum FrameAction {
 /// for `none`, or after a failure with `on-failure=none`; an effect that is
 /// not loaded yet shows black; a loaded effect (the requested one, or the
 /// previous one while the requested one loads) processes the frame.
+///
+/// `loaded` says a chain usable for the request is loaded: for blur and
+/// replace one with an effect (the denoise stage alone hides nothing), for
+/// `none` any. `denoise` is the effective denoise request (requested, and
+/// not failed). The denoise stage hides nothing, so it changes nothing for
+/// blur and replace; `none` with it is processed once loaded and passed
+/// through until then, and after a denoise failure (ADR-0018).
 pub(crate) fn decide(
     kind: EffectKind,
     status: &EffectStatus,
     fallback: EffectFallback,
     loaded: bool,
+    denoise: bool,
 ) -> FrameAction {
     if kind == EffectKind::None {
-        return FrameAction::Passthrough;
+        return if denoise && loaded {
+            FrameAction::Process
+        } else {
+            FrameAction::Passthrough
+        };
     }
     match (status, fallback) {
         (EffectStatus::Failed(_), EffectFallback::Black) => FrameAction::Black,
@@ -314,6 +353,25 @@ mod tests {
     }
 
     #[test]
+    fn the_target_carries_the_denoise_request() {
+        let blur = EffectSettings::of(EffectKind::Blur);
+        let denoised = EffectSettings {
+            denoise: true,
+            ..blur.clone()
+        };
+        assert!(!blur.target().denoise && denoised.target().denoise);
+        assert_ne!(blur.target(), denoised.target());
+        assert!(!EffectSettings::default().denoise);
+        let alone = EffectSettings {
+            denoise: true,
+            ..EffectSettings::default()
+        };
+        assert_eq!(alone.target().kind, EffectKind::None);
+        assert!(alone.target().denoise);
+        assert!(alone.validate().is_ok());
+    }
+
+    #[test]
     fn the_target_ignores_what_needs_no_reload() {
         let blur = EffectSettings {
             background: Some("/a.png".into()),
@@ -346,9 +404,9 @@ mod tests {
             for fb in [EffectFallback::Black, EffectFallback::None] {
                 for loaded in [false, true] {
                     // none: always the input.
-                    assert_eq!(decide(None, &status, fb, loaded), Passthrough);
+                    assert_eq!(decide(None, &status, fb, loaded, false), Passthrough);
                     for kind in [Blur, Replace] {
-                        let a = decide(kind, &status, fb, loaded);
+                        let a = decide(kind, &status, fb, loaded, false);
                         if a == Passthrough {
                             assert_eq!(
                                 (&status, fb),
@@ -356,20 +414,55 @@ mod tests {
                                 "{kind} {status} {fb} {loaded}"
                             );
                         }
+                        // The denoise stage hides nothing: it changes no
+                        // decision of an effect.
+                        assert_eq!(
+                            decide(kind, &status, fb, loaded, true),
+                            a,
+                            "{kind} {status} {fb} {loaded}"
+                        );
                     }
                 }
             }
         }
         // Warm-up from none: black; a loaded (previous) effect: processed.
         let fb = EffectFallback::Black;
-        assert_eq!(decide(Blur, &EffectStatus::Loading, fb, false), Black);
-        assert_eq!(decide(Blur, &EffectStatus::Loading, fb, true), Process);
-        assert_eq!(decide(Blur, &EffectStatus::Ready, fb, true), Process);
-        assert_eq!(decide(Blur, &failed, fb, true), Black);
         assert_eq!(
-            decide(Blur, &failed, EffectFallback::None, true),
+            decide(Blur, &EffectStatus::Loading, fb, false, false),
+            Black
+        );
+        assert_eq!(
+            decide(Blur, &EffectStatus::Loading, fb, true, false),
+            Process
+        );
+        assert_eq!(decide(Blur, &EffectStatus::Ready, fb, true, false), Process);
+        assert_eq!(decide(Blur, &failed, fb, true, false), Black);
+        assert_eq!(
+            decide(Blur, &failed, EffectFallback::None, true, false),
             Passthrough
         );
+    }
+
+    #[test]
+    fn none_with_denoise_is_processed_once_loaded_and_never_black() {
+        use EffectKind::None;
+        use FrameAction::*;
+        for status in [
+            EffectStatus::Off,
+            EffectStatus::Loading,
+            EffectStatus::Ready,
+            EffectStatus::Failed("x".into()),
+        ] {
+            for fb in [EffectFallback::Black, EffectFallback::None] {
+                // Loading (or reloading): the input, never black.
+                assert_eq!(decide(None, &status, fb, false, true), Passthrough);
+                // Loaded: the denoise stage runs.
+                assert_eq!(decide(None, &status, fb, true, true), Process);
+                // Not requested, or failed (the effective request is off):
+                // the input, with no CUDA.
+                assert_eq!(decide(None, &status, fb, true, false), Passthrough);
+            }
+        }
     }
 
     #[test]

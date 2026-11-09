@@ -95,6 +95,13 @@ impl Server {
         self.call(|r| Command::SetBackgroundImage(path, r)).await
     }
 
+    /// Switches video noise removal on or off: it runs before the effect,
+    /// or alone with `none`. Applies to a running stream at once; persists
+    /// across restarts (revision 4).
+    async fn set_denoise(&self, denoise: bool) -> Result<(), IpcError> {
+        self.call(|r| Command::SetDenoise(denoise, r)).await
+    }
+
     /// About once per second while `active`; `-1` marks a value that cannot
     /// be measured.
     #[zbus(signal)]
@@ -149,6 +156,12 @@ impl Server {
     #[zbus(property)]
     fn background_image(&self) -> String {
         self.snap().background_image
+    }
+
+    /// Whether video noise removal is requested (revision 4).
+    #[zbus(property)]
+    fn denoise(&self) -> bool {
+        self.snap().denoise
     }
 
     /// Every consumer: the processes holding the loopback plus the links
@@ -214,7 +227,7 @@ async fn emit_change(emitter: &SignalEmitter<'_>, change: &Change) -> zbus::Resu
         | Change::BackgroundImage(v)
         | Change::PipeWireOutput(v) => emit_changed(emitter, name, v).await,
         Change::BlurStrength(v) => emit_changed(emitter, name, v).await,
-        Change::Enabled(v) => emit_changed(emitter, name, v).await,
+        Change::Enabled(v) | Change::Denoise(v) => emit_changed(emitter, name, v).await,
         Change::Cameras(v) => emit_changed(emitter, name, v).await,
         Change::Consumers(v) | Change::LoopbackConsumers(v) | Change::PipeWireConsumers(v) => {
             emit_changed(emitter, name, v).await

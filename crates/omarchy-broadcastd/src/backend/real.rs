@@ -9,8 +9,9 @@
 //!
 //! Every output is built with the effect element (`obceffect`), in
 //! passthrough for `none`, so the effect can change while it streams. Its
-//! models are loaded only while an effect is requested and the session
-//! runs; stopping the session unloads them before the CUDA context goes
+//! models (the effect's and the noise removal's) are loaded only while they
+//! are requested and the session runs; stopping the session unloads them
+//! before the CUDA context goes
 //! (`docs/adr/0012-video-effects-and-maxine-backend.md`, "Lifecycle").
 //!
 //! **Parking.** Once a session has run, CUDA stays initialised in the
@@ -332,6 +333,7 @@ fn effect_settings(e: &EffectConfig) -> EffectSettings {
             EffectOnFailure::Black => EffectFallback::Black,
             EffectOnFailure::None => EffectFallback::None,
         },
+        denoise: e.denoise,
     }
 }
 
@@ -680,7 +682,7 @@ impl MediaBackend for GstBackend {
 
     fn effect_report(&mut self) -> Option<EffectReport> {
         let output = self.running.as_ref()?.session.output();
-        let status = match output.effect_status() {
+        let status = |s| match s {
             obc_pipeline::EffectStatus::Off => EffectStatus::Off,
             obc_pipeline::EffectStatus::Loading => EffectStatus::Loading,
             obc_pipeline::EffectStatus::Ready => EffectStatus::Ready,
@@ -688,7 +690,8 @@ impl MediaBackend for GstBackend {
         };
         let stats = output.effect_stats().unwrap_or_default();
         Some(EffectReport {
-            status,
+            status: status(output.effect_status()),
+            denoise: status(output.denoise_status()),
             load_ms: stats.last_load_ms,
             reused: stats.last_load_reused,
             gpu_ms_p50: stats.gpu_ms_p50,

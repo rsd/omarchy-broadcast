@@ -4,23 +4,33 @@
 //!
 //! An output built with [`OutputConfig::effect`](crate::OutputConfig::effect)
 //! set holds one `obceffect` element for its whole life; the effect, the blur
-//! strength, the background and the fallback change on it while it streams
+//! strength, the background, the fallback and the denoise stage
+//! ([`EffectSettings::denoise`], `docs/adr/0018-video-noise-removal.md`)
+//! change on it while it streams
 //! ([`Output::set_effect`](crate::Output::set_effect)), without
-//! renegotiating caps. `EffectSettings::default()` (`none`) inserts the
-//! element in passthrough, which costs no copy and no CUDA call. An output
-//! built without it (`effect: None`, the default) has no element at all and
+//! renegotiating caps. `EffectSettings::default()` (`none`, no denoise)
+//! inserts the element in passthrough, which costs no copy and no CUDA
+//! call; `none` with denoise runs the denoise stage alone. An output built
+//! without it (`effect: None`, the default) has no element at all and
 //! cannot take an effect later.
 //!
-//! The element reports its state as [`EffectStatus`], its counters as
-//! [`EffectStats`], and posts every status change on the output pipeline's
-//! bus as an element message named [`STATUS_MESSAGE`] (fields `effect`,
-//! `status`, `reason`).
+//! The element reports the effect's state as [`EffectStatus`], the denoise
+//! stage's as a second [`EffectStatus`]
+//! ([`Output::denoise_status`](crate::Output::denoise_status),
+//! [`EffectStats::denoise`]), its counters as [`EffectStats`], and posts
+//! every change of either status on the output pipeline's bus as an element
+//! message named [`STATUS_MESSAGE`] (fields `effect`, `status`, `reason`,
+//! `denoise`, `denoise-reason`). A failure of the denoise stage drops the
+//! stage and never fails the effect. The output clock marks the first frame
+//! of each new source with [`NEW_SOURCE_FLAG`], on which the element resets
+//! the backend's temporal state.
 
 use std::fmt;
 use std::sync::Arc;
 
 pub use gst_obc::{
-    EffectFallback, EffectKind, EffectSettings, EffectStats, EffectStatus, STATUS_MESSAGE,
+    EffectFallback, EffectKind, EffectSettings, EffectStats, EffectStatus, NEW_SOURCE_FLAG,
+    STATUS_MESSAGE, has_new_source_flag,
 };
 use obc_backend::BackendFactory;
 use obc_backend_maxine::MaxineFactory;
@@ -188,10 +198,22 @@ mod tests {
     }
 
     #[test]
+    fn denoise_needs_no_file_and_combines_with_every_effect() {
+        for kind in [EffectKind::None, EffectKind::Blur] {
+            let s = EffectSettings {
+                denoise: true,
+                ..EffectSettings::of(kind)
+            };
+            assert!(check_settings(&s).is_ok(), "{kind}");
+        }
+    }
+
+    #[test]
     fn the_element_is_configured_from_the_settings() {
         gst::init().unwrap();
         let s = EffectSettings {
             blur_strength: 0.3,
+            denoise: true,
             ..EffectSettings::of(EffectKind::Blur)
         };
         let fx = effect_element(&s, &EffectBackend::new(Arc::new(Unavailable))).unwrap();

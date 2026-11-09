@@ -22,11 +22,17 @@ pub(crate) type StateHandle = *mut c_void;
 pub(crate) type CuStream = *mut c_void;
 
 pub(crate) const NVCV_SUCCESS: NvCvStatus = 0;
+/// An otherwise unspecified error.
+pub(crate) const NVCV_ERR_GENERAL: NvCvStatus = -1;
 /// The requested feature is not implemented: the SDK did not find the
 /// feature library (`libnvVFXGreenScreen.so`, ...) by name.
 pub(crate) const NVCV_ERR_UNIMPLEMENTED: NvCvStatus = -2;
 /// A file (the models) could not be found.
 pub(crate) const NVCV_ERR_FILE: NvCvStatus = -13;
+/// A parameter value is invalid for the effect.
+pub(crate) const NVCV_ERR_PARAMETER: NvCvStatus = -7;
+/// The image resolution is not supported.
+pub(crate) const NVCV_ERR_RESOLUTION: NvCvStatus = -16;
 /// "No kernel image is available for the device". From `NvVFX_Load` on an
 /// unlisted distribution this is the SDK's `/etc/os-release` check, not a
 /// CUDA problem (`docs/setup/maxine.md`, section 7).
@@ -40,6 +46,9 @@ pub(crate) const NVCV_YUV420: i32 = 10;
 pub(crate) const NVCV_U8: i32 = 1;
 // Layout: interleaved components.
 pub(crate) const NVCV_CHUNKY: u32 = 0;
+/// `NvCVImage_Alloc` alignment 1: rows exactly `width * pixel bytes` apart
+/// (0 lets the SDK pad the pitch for the GPU).
+pub(crate) const NVCV_TIGHT_PITCH: u32 = 1;
 // Memory space: CUDA device memory.
 pub(crate) const NVCV_GPU: u32 = 1;
 // YUV colour-space flags, ORed: matrix, range, chroma siting.
@@ -52,6 +61,7 @@ pub(crate) const NVCV_CHROMA_COSITED: u32 = 0x00;
 // Effect selectors and parameter names.
 pub(crate) const FX_GREEN_SCREEN: &CStr = c"GreenScreen";
 pub(crate) const FX_BACKGROUND_BLUR: &CStr = c"BackgroundBlur";
+pub(crate) const FX_DENOISING: &CStr = c"Denoising";
 pub(crate) const P_INPUT_IMAGE_0: &CStr = c"SrcImage0";
 pub(crate) const P_INPUT_IMAGE_1: &CStr = c"SrcImage1";
 pub(crate) const P_OUTPUT_IMAGE_0: &CStr = c"DstImage0";
@@ -64,6 +74,7 @@ pub(crate) const P_MAX_NUMBER_STREAMS: &CStr = c"MaxNumberStreams";
 pub(crate) const P_STRENGTH: &CStr = c"Strength";
 pub(crate) const P_MODE: &CStr = c"Mode";
 pub(crate) const P_STATE: &CStr = c"State";
+pub(crate) const P_STATE_SIZE: &CStr = c"StateSize";
 
 /// The `NvCVImage` image descriptor: width, height, signed pitch, pixel
 /// format, component type, six byte-sized descriptors (pixel bytes,
@@ -127,6 +138,8 @@ pub(crate) struct Sdk {
     pub NvVFX_DestroyEffect: unsafe extern "C" fn(VfxHandle),
     pub NvVFX_SetU32: unsafe extern "C" fn(VfxHandle, *const c_char, u32) -> NvCvStatus,
     pub NvVFX_SetF32: unsafe extern "C" fn(VfxHandle, *const c_char, f32) -> NvCvStatus,
+    pub NvVFX_GetU32: unsafe extern "C" fn(VfxHandle, *const c_char, *mut u32) -> NvCvStatus,
+    pub NvVFX_SetObject: unsafe extern "C" fn(VfxHandle, *const c_char, *mut c_void) -> NvCvStatus,
     pub NvVFX_SetString:
         unsafe extern "C" fn(VfxHandle, *const c_char, *const c_char) -> NvCvStatus,
     pub NvVFX_SetImage:
@@ -328,6 +341,8 @@ fn load(root: Option<&Path>, names: &LibNames) -> Result<Sdk, String> {
             NvVFX_DestroyEffect: sym(&videofx, vf, "NvVFX_DestroyEffect")?,
             NvVFX_SetU32: sym(&videofx, vf, "NvVFX_SetU32")?,
             NvVFX_SetF32: sym(&videofx, vf, "NvVFX_SetF32")?,
+            NvVFX_GetU32: sym(&videofx, vf, "NvVFX_GetU32")?,
+            NvVFX_SetObject: sym(&videofx, vf, "NvVFX_SetObject")?,
             NvVFX_SetString: sym(&videofx, vf, "NvVFX_SetString")?,
             NvVFX_SetImage: sym(&videofx, vf, "NvVFX_SetImage")?,
             NvVFX_SetCudaStream: sym(&videofx, vf, "NvVFX_SetCudaStream")?,
