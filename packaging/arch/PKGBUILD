@@ -11,8 +11,9 @@
 # Install the result with:       sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst
 #
 # The package installs the daemon, the command-line client, the systemd user
-# unit, the D-Bus activation file, the Omarchy bar widget and the
-# documentation. Nothing is enabled: each user runs
+# unit, the D-Bus activation file and the documentation. The Omarchy bar
+# widget is a separate project (the omarchy-broadcast-plugin repository) and
+# is not part of this package. Nothing is enabled: each user runs
 #   systemctl --user enable --now omarchy-broadcastd.service
 # The v4l2loopback device must be configured as in docs/setup/loopback.md.
 #
@@ -41,9 +42,9 @@
 
 pkgname=omarchy-broadcast-git
 _pkgname=omarchy-broadcast
-pkgver=0.16.0
+pkgver=0.17.0
 pkgrel=1
-pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API, a CLI and an Omarchy bar widget'
+pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API and a CLI'
 arch=('x86_64')
 license=('MIT OR Apache-2.0')
 depends=(
@@ -71,7 +72,7 @@ checkdepends=(
   'pipewire'               # client.conf: the PipeWire node's unit tests create a PipeWire context (no daemon)
 )
 optdepends=(
-  'omarchy: the Omarchy shell (Quickshell) for the bar widget'
+  'omarchy: the Omarchy shell, for the bar widget in the separate omarchy-broadcast-plugin repository'
   'v4l2loopback-utils: runtime-only loopback setup without modprobe.d'
   'pipewire: the optional PipeWire camera node ([pipewire] enabled in config.toml) and the optional noise-removed microphone'
   'noise-suppression-for-voice: RNNoise engine for the noise-removed microphone (default)'
@@ -151,7 +152,6 @@ package() {
   install -Dm644 -t "$doc" README.md
   install -Dm644 -t "$doc/docs" docs/dbus-api.md docs/cli-json.md docs/config.example.toml
   install -Dm644 -t "$doc/docs/setup" docs/setup/*.md
-  install -Dm644 -t "$doc/clients/omarchy-bar" clients/omarchy-bar/README.md
 
   # Opt-in drop-ins, shipped as inactive examples: one orders WirePlumber
   # after the daemon, the other runs the daemon with a user-installed Maxine
@@ -190,12 +190,4 @@ package() {
   chmod 644 "$mic_unit"
   grep -qx 'ExecStart=/usr/bin/pipewire -c /usr/share/omarchy-broadcast/pipewire/omarchy-broadcast-mic-%i.conf' "$mic_unit" ||
     { echo 'omarchy-broadcast-mic@.service: the ExecStart rewrite did not take' >&2; return 1; }
-
-  # Omarchy bar widget, without its development tests.
-  local plugin=clients/omarchy-bar/br.com.dias.omarchy-broadcast
-  local dest="$pkgdir/usr/share/$_pkgname/omarchy-bar/br.com.dias.omarchy-broadcast"
-  local file
-  while IFS= read -r -d '' file; do
-    install -Dm644 "$file" "$dest/${file#"$plugin"/}"
-  done < <(find "$plugin" -path "$plugin/tests" -prune -o -type f -print0)
 }
