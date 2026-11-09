@@ -2339,6 +2339,67 @@ fn disabling_pipewire_on_reload_waits_for_its_last_link_only() {
     assert_eq!(h.counts(), counts(0, 0, 0, "ready"));
 }
 
+const PIPEWIRE_NO_NV12: &str = "[pipewire]\nenabled = true\noffer_nv12 = false\n";
+
+#[test]
+fn the_pipewire_output_starts_with_the_configured_nv12_offer() {
+    let h = H::new(PIPEWIRE, |_| {});
+    assert_eq!(h.world().pipewire_offer_nv12, Some(true), "the default");
+    let h = H::new(PIPEWIRE_NO_NV12, |_| {});
+    assert_eq!(h.world().pipewire_offer_nv12, Some(false));
+    assert_eq!(h.outputs(), (1, 1, Some(1)));
+}
+
+#[test]
+fn changing_the_nv12_offer_on_reload_rebuilds_the_pipewire_output_only() {
+    // No link: rebuilt at once, the writer and the session stay.
+    let mut h = H::new(PIPEWIRE, |_| {});
+    h.pipewire_up(0);
+    h.activate(0);
+    h.drain();
+    h.reload(PIPEWIRE_NO_NV12, 1000).unwrap();
+    assert_eq!(h.outputs(), (1, 2, Some(2)), "a new output, same writer");
+    assert_eq!(h.world().pipewire_offer_nv12, Some(false));
+    assert_eq!(h.counts(), counts(1, 1, 0, "connecting"));
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().session_stops, 0);
+    // The same config again: nothing is rebuilt.
+    h.pipewire_up(1100);
+    h.reload(PIPEWIRE_NO_NV12, 1200).unwrap();
+    assert_eq!(h.outputs(), (1, 2, Some(2)));
+
+    // A linked consumer defers it to the last link, as disabling does.
+    let mut h = H::new(PIPEWIRE, |_| {});
+    h.pipewire_up(0);
+    h.pw_consumers(1, 0);
+    h.reload(PIPEWIRE_NO_NV12, 1000).unwrap();
+    assert_eq!(
+        h.outputs(),
+        (1, 1, Some(1)),
+        "a PipeWire consumer is linked"
+    );
+    assert_eq!(h.world().pipewire_offer_nv12, Some(true));
+    h.pw_consumers(0, 2000);
+    assert_eq!(h.outputs(), (1, 2, Some(2)));
+    assert_eq!(h.world().pipewire_offer_nv12, Some(false));
+    assert_eq!(h.counts(), counts(0, 0, 0, "connecting"));
+
+    // Changed back before the last link went: the output just stays.
+    let mut h = H::new(PIPEWIRE, |_| {});
+    h.pipewire_up(0);
+    h.pw_consumers(1, 0);
+    h.reload(PIPEWIRE_NO_NV12, 100).unwrap();
+    h.reload(PIPEWIRE, 200).unwrap();
+    h.pw_consumers(0, 300);
+    assert_eq!(h.outputs(), (1, 1, Some(1)));
+
+    // With the output disabled, the offer is only remembered for its start.
+    let mut h = H::new("", |_| {});
+    h.reload(PIPEWIRE_NO_NV12, 100).unwrap();
+    assert_eq!(h.world().pipewire_offer_nv12, Some(false));
+    assert_eq!(h.outputs(), (1, 1, Some(1)));
+}
+
 #[test]
 fn an_output_mode_change_rebuilds_the_pipewire_output_too() {
     // Deferred while the PipeWire consumer streams, its grace included.
@@ -2616,4 +2677,169 @@ fn a_failed_start_parks_the_gpu_again() {
     let w = h.world();
     assert!(w.parked, "parked again after the failed start");
     assert_eq!(w.gpu_log, ["build", "park", "unpark", "park"]);
+}
+
+#[test]
+fn a_session_that_did_not_stop_cleanly_turns_parking_off_until_the_daemon_restarts() {
+    let mut h = H::new("", |_| {});
+    // A first clean cycle parks.
+    h.activate_then_idle(0);
+    assert_eq!(h.world().parks, 1);
+    // The next session's stop is unclean: not parked, and said once.
+    h.world().fail_stop = Some("output pipeline: ended in Paused, not Null".into());
+    h.activate(10_000);
+    h.consumers(0, 11_000);
+    h.tick(16_000);
+    assert_eq!(h.state(), State::Idle, "{:?}", h.snap());
+    assert_eq!(h.snap().error, "", "not an error: the GPU only stays awake");
+    {
+        let w = h.world();
+        assert!(!w.parked);
+        assert_eq!(
+            w.gpu_log,
+            ["build", "park", "unpark", "build"],
+            "not parked"
+        );
+        let disabled: Vec<_> = w
+            .parker_said
+            .iter()
+            .filter(|(l, m)| {
+                *l == Level::Warning && m.contains("disabled until the daemon restarts")
+            })
+            .collect();
+        assert_eq!(disabled.len(), 1, "{:?}", w.parker_said);
+        assert!(
+            disabled[0].1.contains("ended in Paused, not Null"),
+            "{}",
+            disabled[0].1
+        );
+    }
+    assert!(h.fake.parking_tainted());
+    // The next sessions still run, and a clean stop parks nothing either.
+    for at in [20_000, 40_000] {
+        h.activate_then_idle(at);
+    }
+    let w = h.world();
+    assert_eq!(w.session_starts, 4);
+    assert_eq!((w.session_stops, w.parks, w.unparks), (4, 1, 1));
+    assert!(!w.parked, "sticky: never parked again");
+    assert_eq!(
+        w.parker_said
+            .iter()
+            .filter(|(l, _)| *l == Level::Warning)
+            .count(),
+        1,
+        "{:?}",
+        w.parker_said
+    );
+}
+
+#[test]
+fn a_failed_start_whose_cleanup_was_unclean_does_not_park_again() {
+    let mut h = H::new("", |_| {});
+    h.activate_then_idle(0);
+    {
+        let mut w = h.world();
+        w.fail_start = Some("output pipeline: state change failed".into());
+        w.fail_start_cleanup = Some("output pipeline: ended in Paused, not Null".into());
+    }
+    h.consumers(1, 10_000);
+    h.tick(10_300);
+    assert_eq!(h.state(), State::Error);
+    assert!(
+        h.snap().error.contains("state change failed"),
+        "the start's error: {}",
+        h.snap().error
+    );
+    {
+        let w = h.world();
+        assert!(!w.parked, "not parked again");
+        assert_eq!(w.gpu_log, ["build", "park", "unpark"]);
+    }
+    assert!(h.fake.parking_tainted());
+    // Cleared, the next start runs; its clean stop parks nothing.
+    {
+        let mut w = h.world();
+        w.fail_start = None;
+        w.fail_start_cleanup = None;
+    }
+    h.call(|r| Command::SetEnabled(true, r), 11_000).unwrap();
+    assert_eq!(h.state(), State::Active);
+    h.consumers(0, 12_000);
+    h.tick(17_000);
+    assert_eq!(h.state(), State::Idle);
+    let w = h.world();
+    assert_eq!(w.gpu_log, ["build", "park", "unpark", "build"]);
+    assert!(!w.parked);
+}
+
+#[test]
+fn a_camera_switch_that_left_a_pipeline_outside_null_turns_parking_off() {
+    let mut h = H::new("", |w| {
+        w.fail_ingest = vec!["usb-b".into()];
+        w.unclean_switch = Some("stopping the previous ingest: ended in Ready, not Null".into());
+    });
+    h.activate(0);
+    assert!(
+        h.call(|r| Command::SelectCamera("usb-b".into(), r), 1000)
+            .is_err()
+    );
+    assert_eq!(h.snap().active_camera, "usb-a", "fell back");
+    assert!(
+        !h.fake.parking_tainted(),
+        "the session runs on: nothing to park yet"
+    );
+    // Its stop is clean, but the switch's was not: not parked.
+    h.consumers(0, 2000);
+    h.tick(7000);
+    assert_eq!(h.state(), State::Idle, "{:?}", h.snap());
+    assert!(h.fake.parking_tainted());
+    {
+        let w = h.world();
+        assert!(!w.parked);
+        assert_eq!(w.parks, 0);
+        let warned: Vec<_> = w
+            .parker_said
+            .iter()
+            .filter(|(l, _)| *l == Level::Warning)
+            .collect();
+        assert_eq!(warned.len(), 1, "{:?}", w.parker_said);
+        assert!(
+            warned[0].1.contains("switching to Beta Cam")
+                && warned[0].1.contains("ended in Ready, not Null")
+                && warned[0].1.contains("disabled until the daemon restarts"),
+            "{}",
+            warned[0].1
+        );
+    }
+    // Sticky: a later session without a switch parks nothing either.
+    h.activate_then_idle(10_000);
+    assert_eq!(h.world().parks, 0);
+}
+
+#[test]
+fn a_session_stop_that_failed_with_every_pipeline_at_null_still_parks() {
+    // A camera unplugged mid-call with fixed_framerate: its control cannot
+    // be restored, but nothing of the session is left.
+    let mut h = H::new("", |_| {});
+    h.world().fail_stop_at_null = Some(
+        "camera control on /dev/video0: restoring exposure_dynamic_framerate: No such device"
+            .into(),
+    );
+    h.activate_then_idle(0);
+    assert!(!h.fake.parking_tainted());
+    let w = h.world();
+    assert!(w.parked);
+    assert_eq!(w.parks, 1);
+    let warned: Vec<_> = w
+        .parker_said
+        .iter()
+        .filter(|(l, _)| *l == Level::Warning)
+        .collect();
+    assert_eq!(warned.len(), 1, "{:?}", w.parker_said);
+    assert!(
+        warned[0].1.contains("No such device") && !warned[0].1.contains("disabled"),
+        "{}",
+        warned[0].1
+    );
 }

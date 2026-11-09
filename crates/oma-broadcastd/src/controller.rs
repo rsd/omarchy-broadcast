@@ -456,6 +456,8 @@ struct WriterOn {
     /// The generation of the PipeWire output running next to it (`None`:
     /// none runs).
     pipewire: Option<PipeWireGeneration>,
+    /// `[pipewire] offer_nv12` as that output was started with it.
+    pipewire_offer_nv12: bool,
 }
 
 /// The running session.
@@ -899,28 +901,46 @@ impl<B: MediaBackend> Controller<B> {
         self.sync_pipewire(now);
     }
 
-    /// Starts or stops the PipeWire output next to the running writer when
-    /// `[pipewire] enabled` asks for it, without touching the writer or
-    /// the session. A stop waits until the output has no link left (the
-    /// loopback's consumers do not matter); it applies at the step that
-    /// counts the last link gone. A stopped output is `off` with no link.
+    /// Starts, stops or rebuilds the PipeWire output next to the running
+    /// writer when `[pipewire]` asks for it (`enabled`, or `offer_nv12`
+    /// differing from the offer the running node was started with), without
+    /// touching the writer or the session. A stop or rebuild waits until the
+    /// output has no link left (the loopback's consumers do not matter); it
+    /// applies at the step that counts the last link gone. A stopped output
+    /// is `off` with no link.
     fn sync_pipewire(&mut self, now: Instant) {
-        let Some(running) = self.writer.as_ref().map(|w| w.pipewire.is_some()) else {
+        let Some((running, offer)) = self
+            .writer
+            .as_ref()
+            .map(|w| (w.pipewire.is_some(), w.pipewire_offer_nv12))
+        else {
             return;
         };
         let wanted = self.config.pipewire.enabled;
+        let offer_wanted = self.config.pipewire.offer_nv12;
         let pipewire = if wanted && !running {
             info!("starting the PipeWire output next to the virtual camera");
-            Some(self.backend.start_pipewire())
+            Some(self.backend.start_pipewire(offer_wanted))
         } else if !wanted && running && self.pipewire_consumers == 0 {
             info!("stopping the PipeWire output; the virtual camera keeps running");
             self.backend.stop_pipewire();
             None
+        } else if wanted && running && offer != offer_wanted && self.pipewire_consumers == 0 {
+            info!(
+                "rebuilding the PipeWire output to {} NV12; the virtual camera keeps running",
+                if offer_wanted {
+                    "offer"
+                } else {
+                    "stop offering"
+                }
+            );
+            Some(self.backend.start_pipewire(offer_wanted))
         } else {
             return;
         };
         if let Some(w) = self.writer.as_mut() {
             w.pipewire = pipewire;
+            w.pipewire_offer_nv12 = offer_wanted;
         }
         self.pipewire_state = if pipewire.is_some() {
             PipeWireState::Connecting
@@ -964,11 +984,12 @@ impl<B: MediaBackend> Controller<B> {
         let contract = self.config.output_contract();
         match self.backend.start_writer(&sink, &contract) {
             Ok(node) => {
+                let offer_nv12 = self.config.pipewire.offer_nv12;
                 let pipewire = self
                     .config
                     .pipewire
                     .enabled
-                    .then(|| self.backend.start_pipewire());
+                    .then(|| self.backend.start_pipewire(offer_nv12));
                 info!(
                     "virtual camera {} ({}) is ready{}",
                     node.display(),
@@ -990,6 +1011,7 @@ impl<B: MediaBackend> Controller<B> {
                     contract,
                     sink,
                     pipewire,
+                    pipewire_offer_nv12: offer_nv12,
                 });
                 self.notify_sink(Some(&node), now);
             }
@@ -1838,6 +1860,13 @@ impl<B: MediaBackend> Controller<B> {
             && self.pipewire_consumers > 0
         {
             info!("the PipeWire output stops once no application is linked to it");
+        } else if self.config.pipewire.enabled
+            && self.writer.as_ref().is_some_and(|w| {
+                w.pipewire.is_some() && w.pipewire_offer_nv12 != self.config.pipewire.offer_nv12
+            })
+            && self.pipewire_consumers > 0
+        {
+            info!("the new PipeWire format offer applies once no application is linked to it");
         }
     }
 }

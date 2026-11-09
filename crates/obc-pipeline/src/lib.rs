@@ -76,6 +76,8 @@ pub use loopback::{
 pub use output::{
     EmitInfo, EmitObserver, FrameOrigin, Output, OutputConfig, OutputCounts, OutputSink,
 };
-pub use pipeline::{LinkCaps, LoopbackMismatch, MediaPipeline, PipelineError, all_cuda_between};
+pub use pipeline::{
+    LinkCaps, LoopbackMismatch, MediaPipeline, PipelineError, StopError, all_cuda_between,
+};
 pub use process::GpuStage;
 pub use session::{Session, SwitchTiming};

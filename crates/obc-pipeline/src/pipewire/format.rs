@@ -66,15 +66,21 @@ impl std::fmt::Display for PwFormat {
     }
 }
 
-/// The EnumFormat order: YUY2, NV12, I420, whatever the contract's format.
+/// The EnumFormat order: YUY2, NV12, I420, whatever the contract's format;
+/// without `offer_nv12`, YUY2 and I420.
 ///
-/// YUY2 is first because OBS Studio 32.x's PipeWire camera source takes the
-/// first entry and mis-sizes NV12 rows (it computes 2 bytes per pixel and
-/// ignores the chunk stride), so it reads past the end of a correctly sized
-/// NV12 buffer and crashes. A consumer that asks for NV12 or I420 explicitly
-/// (`pipewiresrc` with caps) still negotiates it.
-pub fn offered_formats() -> [PwFormat; 3] {
+/// YUY2 is first because OBS Studio 32.x's PipeWire camera source offers
+/// its users the node's formats in order and defaults to the first, and
+/// mis-sizes NV12 rows (it computes 2 bytes per pixel and ignores the chunk
+/// stride), so that a manual choice of NV12 reads past the end of a
+/// correctly sized NV12 buffer and crashes. `offer_nv12 = false` removes that
+/// choice. A consumer that asks for NV12 or I420 explicitly (`pipewiresrc`
+/// with caps) still negotiates it when offered.
+pub fn offered_formats(offer_nv12: bool) -> Vec<PwFormat> {
     [PwFormat::Yuy2, PwFormat::Nv12, PwFormat::I420]
+        .into_iter()
+        .filter(|f| offer_nv12 || *f != PwFormat::Nv12)
+        .collect()
 }
 
 fn round_up_2(v: usize) -> usize {
@@ -190,17 +196,17 @@ pub fn enum_format(contract: &OutputContract, format: PwFormat) -> Object {
 }
 
 /// The serialised EnumFormat pods, in [`offered_formats`] order.
-pub fn enum_format_pods(contract: &OutputContract) -> Vec<Vec<u8>> {
-    offered_formats()
+pub fn enum_format_pods(contract: &OutputContract, offer_nv12: bool) -> Vec<Vec<u8>> {
+    offered_formats(offer_nv12)
         .into_iter()
         .map(|f| serialize(&Value::Object(enum_format(contract, f))))
         .collect()
 }
 
 /// The format a consumer chose (a `Format` param), checked against what
-/// was offered: one of the three formats at the contract's size and frame
-/// rate. Anything else is refused with the reason.
-pub fn negotiate(pod: &Pod, contract: &OutputContract) -> Result<Layout, String> {
+/// was offered: one of the [`offered_formats`] at the contract's size and
+/// frame rate. Anything else is refused with the reason.
+pub fn negotiate(pod: &Pod, contract: &OutputContract, offer_nv12: bool) -> Result<Layout, String> {
     let (media_type, media_subtype) = spa::param::format_utils::parse_format(pod)
         .map_err(|e| format!("not a format param: {e}"))?;
     if media_type != MediaType::Video || media_subtype != MediaSubtype::Raw {
@@ -210,6 +216,7 @@ pub fn negotiate(pod: &Pod, contract: &OutputContract) -> Result<Layout, String>
     info.parse(pod)
         .map_err(|e| format!("unparsable raw video format: {e}"))?;
     let format = PwFormat::from_spa(info.format())
+        .filter(|f| offered_formats(offer_nv12).contains(f))
         .ok_or_else(|| format!("format {:?} not offered", info.format()))?;
     let size = info.size();
     if (size.width, size.height) != (contract.width, contract.height) {
@@ -322,14 +329,14 @@ mod tests {
         // OBS 32.x overreads NV12 buffers, so NV12 must not be the first
         // entry; the order does not depend on the contract.
         assert_eq!(
-            offered_formats(),
+            offered_formats(true),
             [PwFormat::Yuy2, PwFormat::Nv12, PwFormat::I420]
         );
         for c in [
             &OutputContract::default(),
             &contract(OutputFormat::I420, "1920x1080@30"),
         ] {
-            let first = enum_format(c, offered_formats()[0]);
+            let first = enum_format(c, offered_formats(true)[0]);
             assert_eq!(
                 prop(&first, FormatProperties::VideoFormat),
                 &Value::Id(Id(VideoFormat::YUY2.as_raw()))
@@ -339,6 +346,36 @@ mod tests {
             assert_eq!(PwFormat::from_spa(f.spa()), Some(f));
         }
         assert_eq!(PwFormat::from_spa(VideoFormat::RGBA), None);
+    }
+
+    #[test]
+    fn without_nv12_only_yuy2_and_i420_are_offered_in_order() {
+        assert_eq!(offered_formats(false), [PwFormat::Yuy2, PwFormat::I420]);
+        for c in [
+            &OutputContract::default(),
+            &contract(OutputFormat::I420, "1920x1080@30"),
+        ] {
+            let pods = enum_format_pods(c, false);
+            assert_eq!(pods.len(), 2);
+            for (bytes, want) in pods.iter().zip([VideoFormat::YUY2, VideoFormat::I420]) {
+                let (_, value): (_, Value) = PodDeserializer::deserialize_from(bytes).unwrap();
+                let Value::Object(obj) = value else {
+                    panic!("not an object: {value:?}")
+                };
+                assert_eq!(
+                    prop(&obj, FormatProperties::VideoFormat),
+                    &Value::Id(Id(want.as_raw()))
+                );
+            }
+            // A format that was not offered is refused, whatever the contract.
+            let nv12 = format_pod(VideoFormat::NV12, c.width, c.height, c.fps_num, c.fps_den);
+            assert!(
+                negotiate(as_pod(&nv12), c, false)
+                    .unwrap_err()
+                    .contains("not offered")
+            );
+            assert!(negotiate(as_pod(&nv12), c, true).is_ok());
+        }
     }
 
     fn video_info(format: PwFormat, w: u32, h: u32) -> gst_video::VideoInfo {
@@ -396,9 +433,9 @@ mod tests {
     #[test]
     fn enum_format_pods_round_trip() {
         let c = contract(OutputFormat::I420, "1280x720@30000/1001");
-        let pods = enum_format_pods(&c);
+        let pods = enum_format_pods(&c, true);
         assert_eq!(pods.len(), 3);
-        for (bytes, want) in pods.iter().zip(offered_formats()) {
+        for (bytes, want) in pods.iter().zip(offered_formats(true)) {
             let (rest, value): (_, Value) = PodDeserializer::deserialize_from(bytes).unwrap();
             assert!(rest.is_empty());
             let Value::Object(obj) = value else {
@@ -426,7 +463,7 @@ mod tests {
                 })
             );
             // The node's own parse reads the same values back.
-            let layout = negotiate(as_pod(bytes), &c).unwrap();
+            let layout = negotiate(as_pod(bytes), &c, true).unwrap();
             assert_eq!(layout, Layout::of(want, 1280, 720));
         }
     }
@@ -459,14 +496,14 @@ mod tests {
         for f in PwFormat::ALL {
             let pod = format_pod(f.spa(), 1920, 1080, 30, 1);
             assert_eq!(
-                negotiate(as_pod(&pod), &c),
+                negotiate(as_pod(&pod), &c, true),
                 Ok(Layout::of(f, 1920, 1080)),
                 "{f}"
             );
         }
         // 60/2 is the contract's 30/1.
         let pod = format_pod(VideoFormat::NV12, 1920, 1080, 60, 2);
-        assert!(negotiate(as_pod(&pod), &c).is_ok());
+        assert!(negotiate(as_pod(&pod), &c, true).is_ok());
         for (pod, why) in [
             (
                 format_pod(VideoFormat::RGBA, 1920, 1080, 30, 1),
@@ -485,7 +522,7 @@ mod tests {
                 "frame rate 0/1",
             ),
         ] {
-            let err = negotiate(as_pod(&pod), &c).unwrap_err();
+            let err = negotiate(as_pod(&pod), &c, true).unwrap_err();
             assert!(err.contains(why), "{err}");
         }
         let audio = serialize(&Value::Object(object! {
@@ -495,7 +532,7 @@ mod tests {
             property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
         }));
         assert!(
-            negotiate(as_pod(&audio), &c)
+            negotiate(as_pod(&audio), &c, true)
                 .unwrap_err()
                 .contains("not raw video")
         );

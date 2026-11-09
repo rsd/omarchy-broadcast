@@ -578,7 +578,7 @@ fn connect(context: &ContextRc, env: &Rc<Env>) -> Result<Session, String> {
             .register()
             .map_err(|e| format!("PipeWire stream listener: {e}"))?
     };
-    let pods = format::enum_format_pods(&cfg.contract);
+    let pods = format::enum_format_pods(&cfg.contract, cfg.offer_nv12);
     let mut params: Vec<&spa::pod::Pod> = pods.iter().map(|b| as_pod(b)).collect();
     stream
         .connect(
@@ -648,7 +648,7 @@ fn on_param_changed(
         data.layout = None;
         return;
     };
-    match format::negotiate(param, &env.cfg.contract) {
+    match format::negotiate(param, &env.cfg.contract, env.cfg.offer_nv12) {
         Ok(layout) => {
             data.layout = Some(layout);
             let buffers = format::buffers_param(&layout);

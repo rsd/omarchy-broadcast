@@ -27,7 +27,8 @@
 //!
 //! **Formats.** Three EnumFormat entries, all at the contract's exact size
 //! and frame rate, in the order YUY2, NV12, I420 ([`format::offered_formats`];
-//! YUY2 first because OBS 32.x overreads NV12 buffers).
+//! YUY2 first because OBS 32.x overreads NV12 buffers; without
+//! [`PwOutputConfig::offer_nv12`], YUY2 and I420 only).
 //! Nothing is scaled. When a consumer has chosen, the stream asks for buffers of one data block
 //! holding a whole frame in `GstVideoInfo`'s default layout
 //! ([`format::Layout`], what `pipewiresink` sends and `pipewiresrc` and
@@ -115,6 +116,8 @@ pub struct PwOutputConfig {
     pub node_name: String,
     /// `node.description` and `media.name`: what pickers show.
     pub description: String,
+    /// Offer NV12 next to YUY2 and I420 (`[pipewire] offer_nv12`).
+    pub offer_nv12: bool,
 }
 
 impl PwOutputConfig {
@@ -127,6 +130,7 @@ impl PwOutputConfig {
             contract,
             node_name: Self::DEFAULT_NODE_NAME.into(),
             description: Self::DEFAULT_DESCRIPTION.into(),
+            offer_nv12: true,
         }
     }
 
@@ -524,6 +528,7 @@ mod tests {
         let cfg = PwOutputConfig::new(OutputContract::default());
         assert_eq!(cfg.node_name, "oma-broadcast");
         assert_eq!(cfg.description, "Omarchy Broadcast");
+        assert!(cfg.offer_nv12);
         cfg.validate().unwrap();
         let bad = PwOutputConfig {
             node_name: " ".into(),

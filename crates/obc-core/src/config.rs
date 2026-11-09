@@ -263,11 +263,24 @@ impl Default for EffectConfig {
 /// source next to the v4l2loopback device. It carries the same frames as
 /// the loopback, and an application linked to it counts as a consumer like
 /// one holding the loopback.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PipeWireConfig {
     /// Offer the PipeWire video source. Off by default: the loopback alone.
     pub enabled: bool,
+    /// Offer NV12 on the node (next to YUY2 and I420). On by default. OBS
+    /// Studio's PipeWire camera source mis-sizes NV12 rows and crashes when
+    /// NV12 is chosen by hand; off, the node offers YUY2 and I420 only.
+    pub offer_nv12: bool,
+}
+
+impl Default for PipeWireConfig {
+    fn default() -> Self {
+        PipeWireConfig {
+            enabled: false,
+            offer_nv12: true,
+        }
+    }
 }
 
 impl Default for Config {
@@ -973,6 +986,7 @@ mod tests {
         assert_eq!(c.idle_grace(), Duration::from_secs(5));
         assert_eq!(c.start_debounce(), Duration::from_millis(300));
         assert!(!c.pipewire.enabled);
+        assert!(c.pipewire.offer_nv12);
         c.validate().unwrap();
     }
 
@@ -1009,6 +1023,7 @@ on_failure = "none"
 
 [pipewire]
 enabled = true
+offer_nv12 = false
 "#;
         let c = parse(text).unwrap();
         assert_eq!(
@@ -1047,7 +1062,13 @@ enabled = true
                 on_failure: EffectOnFailure::None,
             }
         );
-        assert_eq!(c.pipewire, PipeWireConfig { enabled: true });
+        assert_eq!(
+            c.pipewire,
+            PipeWireConfig {
+                enabled: true,
+                offer_nv12: false
+            }
+        );
 
         let again = parse(&c.to_toml()).unwrap();
         assert_eq!(again, c);
@@ -1107,6 +1128,7 @@ enabled = true
             "background_image",
             "on_failure",
             "enabled",
+            "offer_nv12",
         ] {
             assert!(
                 EXAMPLE.lines().any(|l| l
@@ -1299,6 +1321,11 @@ enabled = true
             (
                 "[pipewire]\nenabled = \"yes\"",
                 "pipewire.enabled",
+                "invalid type",
+            ),
+            (
+                "[pipewire]\noffer_nv12 = 1",
+                "pipewire.offer_nv12",
                 "invalid type",
             ),
         ];

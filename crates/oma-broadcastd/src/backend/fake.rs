@@ -11,7 +11,7 @@ use obc_core::{EffectMode, ModeRequest, OutputContract, SinkSelector};
 use obc_gpu::{GpuError, NothingToPark, ParkError, ParkOutcome, UnparkOutcome};
 use obc_ipc::Stats;
 
-use super::park::{ParkOps, Parker};
+use super::park::{ParkOps, Parker, StartError, StopFailure, StopSession};
 use super::{EffectReport, EffectStatus, Failure, MediaBackend, PipeWireGeneration, SessionParams};
 use crate::camera::Camera;
 use crate::log::Level;
@@ -33,6 +33,8 @@ pub struct World {
     pub pipewire_starts: u32,
     /// Running PipeWire outputs stopped (alone or with the writer).
     pub pipewire_stops: u32,
+    /// `offer_nv12` of the last `start_pipewire`.
+    pub pipewire_offer_nv12: Option<bool>,
     /// Reported (once) by `writer_failure` while a writer runs.
     pub writer_failure: Option<String>,
     /// What `loopback_holders` counts.
@@ -47,6 +49,21 @@ pub struct World {
     pub ingests: Vec<String>,
     /// `start_session` fails with this.
     pub fail_start: Option<String>,
+    /// With `fail_start`: cleaning up the partly built output did not stop
+    /// cleanly, with this (`backend::park::StartError::unclean`).
+    pub fail_start_cleanup: Option<String>,
+    /// The next session stop is unclean, with this (taken by that stop):
+    /// a pipeline left short of NULL.
+    pub fail_stop: Option<String>,
+    /// The next session stop fails with this, every pipeline in NULL all
+    /// the same (taken by that stop): a camera control not restored, say.
+    pub fail_stop_at_null: Option<String>,
+    /// With `fail_ingest`: the failed switch also left a pipeline outside
+    /// NULL, with this (`obc_pipeline::SwitchTiming::unclean_stop`).
+    pub unclean_switch: Option<String>,
+    /// The running session's first unclean switch: its stop is then
+    /// unclean, however it goes (the real backend's `Running::unclean`).
+    pub session_unclean: Option<String>,
     /// Run by `start_session`, as if it happened during the output build.
     pub during_start: Option<Hook>,
     /// Ingests on these camera ids fail to start.
@@ -111,6 +128,7 @@ impl Default for World {
             pipewire_generation: 0,
             pipewire_starts: 0,
             pipewire_stops: 0,
+            pipewire_offer_nv12: None,
             writer_failure: None,
             holders: 0,
             holder_counts: 0,
@@ -119,6 +137,11 @@ impl Default for World {
             session_stops: 0,
             ingests: Vec::new(),
             fail_start: None,
+            fail_start_cleanup: None,
+            fail_stop: None,
+            fail_stop_at_null: None,
+            unclean_switch: None,
+            session_unclean: None,
             during_start: None,
             fail_ingest: Vec::new(),
             frames: true,
@@ -235,6 +258,29 @@ impl World {
     }
 }
 
+/// The running session (the world's `session`), as the parker's
+/// lifecycle sees it: its stop is the world's, unclean with `fail_stop` or
+/// after an unclean switch (`session_unclean`), failed at NULL with
+/// `fail_stop_at_null`.
+struct FakeSession(Arc<Mutex<World>>);
+
+impl StopSession for FakeSession {
+    fn stop(self) -> Result<(), StopFailure> {
+        let mut w = lock(&self.0);
+        if w.session.take().is_some() {
+            w.session_stops += 1;
+        }
+        // The models go with the session.
+        w.effect = None;
+        w.effect_status = EffectStatus::Off;
+        let at_null = w.fail_stop_at_null.take();
+        match (w.fail_stop.take(), w.session_unclean.take()) {
+            (Some(e), _) | (None, Some(e)) => Err(StopFailure::unclean(e)),
+            (None, None) => at_null.map_or(Ok(()), |e| Err(StopFailure::at_null(e))),
+        }
+    }
+}
+
 /// Something that happens while the fake does something slow.
 pub struct Hook(pub Box<dyn FnMut() + Send>);
 
@@ -278,6 +324,17 @@ impl FakeBackend {
         self.parker.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The running session, for the parker's lifecycle.
+    fn running(&self) -> Option<FakeSession> {
+        let running = self.world().session.is_some();
+        running.then(|| FakeSession(Arc::clone(&self.world)))
+    }
+
+    /// Whether the parker is tainted (a session did not stop cleanly).
+    pub fn parking_tainted(&self) -> bool {
+        self.parker().tainted()
+    }
+
     fn start_ingest(w: &mut World, camera: &Camera) -> Result<(), String> {
         let Some((_, current)) = w.session.as_mut() else {
             return Err("no session".into());
@@ -285,6 +342,11 @@ impl FakeBackend {
         *current = None;
         w.ingests.push(camera.id.clone());
         if w.fail_ingest.contains(&camera.id) {
+            if let Some(why) = w.unclean_switch.clone()
+                && w.session_unclean.is_none()
+            {
+                w.session_unclean = Some(format!("switching to {}: {why}", camera.label()));
+            }
             return Err(format!("{}: cannot open", camera.label()));
         }
         if let Some((_, current)) = w.session.as_mut() {
@@ -332,8 +394,9 @@ impl MediaBackend for FakeBackend {
         w.stop_pipewire();
     }
 
-    fn start_pipewire(&mut self) -> PipeWireGeneration {
+    fn start_pipewire(&mut self, offer_nv12: bool) -> PipeWireGeneration {
         let mut w = self.world();
+        w.pipewire_offer_nv12 = Some(offer_nv12);
         assert!(w.writer.is_some(), "the PipeWire output needs the writer");
         w.stop_pipewire();
         w.pipewire_generation += 1;
@@ -378,20 +441,26 @@ impl MediaBackend for FakeBackend {
                 "the session contract is the writer's"
             );
         }
-        // The real parker: unparked before anything touches the GPU, parked
-        // again if the start fails.
+        // The real parker's lifecycle: a running session stopped, the GPU
+        // unparked before anything touches it, parked again if the start
+        // fails cleanly.
         let world = Arc::clone(&self.world);
-        self.parker().starting(|| {
+        let mut running = self.running();
+        self.parker().start_session(&mut running, || {
             let mut w = lock(&world);
             if let Some(e) = w.fail_start.clone() {
-                return Err(e);
+                return Err(match w.fail_start_cleanup.clone() {
+                    Some(why) => StartError::unclean(e, why),
+                    None => StartError::from(e),
+                });
             }
             w.cuda_initialised = true;
+            w.session_unclean = None;
             w.gpu_log.push("build");
             w.session = Some((params.clone(), None));
             w.session_starts += 1;
             w.apply_effect(&params.effect);
-            Ok(())
+            Ok(FakeSession(Arc::clone(&world)))
         })
     }
 
@@ -401,21 +470,10 @@ impl MediaBackend for FakeBackend {
     }
 
     fn stop_session(&mut self) {
-        let stopped = {
-            let mut w = self.world();
-            let stopped = w.session.take().is_some();
-            if stopped {
-                w.session_stops += 1;
-                // The models go with the session.
-                w.effect = None;
-                w.effect_status = EffectStatus::Off;
-            }
-            stopped
-        };
-        // All of it stopped: the real parker parks.
-        if stopped {
-            self.parker().park();
-        }
+        // All of it stopped, then the real parker parks if it stopped
+        // cleanly.
+        let mut running = self.running();
+        self.parker().stop_session(&mut running);
     }
 
     fn first_frame(&mut self) -> bool {

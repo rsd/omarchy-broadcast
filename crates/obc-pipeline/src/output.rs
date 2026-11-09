@@ -119,7 +119,8 @@ use crate::frame::{Canonical, Frame, FrameMemory, FrameWriter};
 use crate::ingest::CUDA_CONTEXT_TYPE;
 use crate::loopback::WriterHandle;
 use crate::pipeline::{
-    MediaPipeline, PipelineError, add_linked, capsfilter, cuda_caps, make, names,
+    MediaPipeline, PipelineError, StopError, add_linked, both_stopped, capsfilter, cuda_caps, make,
+    names, not_null,
 };
 use crate::process::{GpuStage, process_elements};
 use crate::slot::Slot;
@@ -884,6 +885,13 @@ impl Output {
     /// NULL and releases the frames and the CUDA context it holds.
     /// Idempotent.
     pub fn stop(&mut self) -> Result<(), PipelineError> {
+        self.stop_checked().map_err(Into::into)
+    }
+
+    /// [`Self::stop`], its error saying whether the pipeline reached NULL:
+    /// a clock thread that had panicked (or ended) is an error that did,
+    /// as the thread is joined all the same.
+    pub fn stop_checked(&mut self) -> Result<(), StopError> {
         let mut res = Ok(());
         if let Some(clock) = self.clock.take() {
             // An unexpected end is judged before the stop flag is set.
@@ -909,12 +917,17 @@ impl Output {
         let (_, cur, _) = p.state(gst::ClockTime::from_seconds(5));
         self.slot.clear();
         self.cuda = None;
-        res?;
-        state.map_err(|e| PipelineError::State(e.to_string()))?;
-        if cur != gst::State::Null {
-            return Err(PipelineError::State(format!("ended in {cur:?}, not Null")));
-        }
-        Ok(())
+        let clock = res.map_err(|error| StopError {
+            error,
+            reached_null: true,
+        });
+        let null = not_null(state, cur).map_or(Ok(()), |error| {
+            Err(StopError {
+                error,
+                reached_null: false,
+            })
+        });
+        both_stopped(clock, null)
     }
 }
 

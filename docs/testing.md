@@ -191,7 +191,7 @@ cargo test -p obc-pipeline -p oma-broadcastd --features oma-broadcastd/pipewire
 The continuous integration runs the same command, and clippy with the feature, as a second job; the default job is unchanged.
 
 **Unit tests** (`crates/obc-pipeline/src/pipewire/`, and the controller, D-Bus and CLI tests of the other crates):
-- the format pods and the negotiation: the offer order YUY2, NV12, I420 whatever the contract format, the exact size and rate, and the refusal of any other request;
+- the format pods and the negotiation: the offer order YUY2, NV12, I420 whatever the contract format (YUY2, I420 without `offer_nv12`, which also refuses an NV12 request), the exact size and rate, and the refusal of any other request;
 - the buffer layouts, compared with GStreamer's `GstVideoInfo` default layout, and the CPU conversions into the PipeWire buffer;
 - the link table behind the consumer count: links to the node are counted, links in the error state are not, and links to other nodes are ignored;
 - failure and retry: with no PipeWire daemon the output is `failed` and retried, never puts the daemon in `error`, and events of a replaced output are discarded;
@@ -323,14 +323,14 @@ OBC_MASK_FRAMES=/path/to/frames \
 
 [ADR-0017](adr/0017-cuda-checkpoint-parking.md). The default suite needs no GPU.
 
-- **`obc-gpu`** (`src/checkpoint.rs`): a missing library and a driver without the symbols make parking unsupported; the lock arguments' struct layout, the timeout clamp, the mapping of process states, the guard that refuses while parked and counts refusals, and the call sequences against a fake driver (park then unpark in order, a lock timeout leaves the process running, a failed checkpoint unlocks again, a failed unlock stays parked until the next unpark, a failed restore can be retried, an unsupported call fails that park only, unpark follows the driver's state).
-- **`oma-broadcastd`**: `backend/park.rs` tests the `Parker` (logging with durations, a failed park, an unsupported driver said once, a failed unpark, a failed start parks again, the unlock after a blocked park, refusals warned once per park, stop ordering, a session that did not stop cleanly is not parked). The controller tests (`controller/tests.rs`, fake backend with the real `Parker`) cover: Active to Idle parks; a restart unparks before the build; an unpark failure gives `error` with no session and the writer kept; a retry works once the failure clears; `off` after an activation stays parked; a park failure keeps working; a failed first start parks nothing.
+- **`obc-gpu`** (`src/checkpoint.rs`): a missing library and a driver without the symbols make parking unsupported; the lock arguments' struct layout, the timeout clamp, the mapping of process states, the guard that refuses while parked and counts refusals, and the call sequences against a fake driver (park then unpark in order, a lock timeout leaves the process running, a failed checkpoint unlocks again, a failed unlock stays parked until the next unpark, a failed restore can be retried, an unsupported call fails that park only, unpark follows the driver's state, and the flag of a process parked by another tool is set before its restore or unlock runs, so a failed one still refuses CUDA). The process-wide parked flag is tested in a child process.
+- **`oma-broadcastd`**: `backend/park.rs` tests the `Parker` (logging with durations, a failed park, an unsupported driver said once, a failed unpark, a failed start parks again, the unlock after a blocked park, refusals warned once per park, stop ordering, and the taint paths through the seams: an unclean session stop, restart, failed start or camera switch disables parking and a later clean stop does not clear it, a stop that failed with every pipeline in NULL still parks with a warning, a tainted parker still unparks). `backend/real.rs` has pure-function tests of the clean/unclean mapping of stop results, and `obc-pipeline` session tests cover a camera switch whose stop is unclean. The controller tests (`controller/tests.rs`, fake backend with the real `Parker`) cover: Active to Idle parks; a restart unparks before the build; an unpark failure gives `error` with no session and the writer kept; a retry works once the failure clears; `off` after an activation stays parked; a park failure keeps working; a failed first start parks nothing; an unclean stop does not park, and neither does a later clean stop; a failed start whose cleanup was unclean does not park again.
 
 Ignored hardware tests, all needing an NVIDIA GPU with a driver that has the CUDA checkpoint API:
 
 ```sh
 # obc-gpu: never initialised means nothing to park; a live context's data survives 3 cycles;
-# an externally checkpointed process is restored; a parked process exits promptly
+# a process checkpointed by another tool is restored by unpark; a parked process exits promptly
 cargo test -p obc-gpu --test hardware -- --ignored --test-threads=1 checkpoint_
 
 # daemon backend, no camera: videotestsrc, a loopback and 3 cycles

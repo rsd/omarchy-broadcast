@@ -20,13 +20,17 @@
 //! stopped, every pipeline at NULL and dropped (the effect element has
 //! joined its worker thread and unloaded its models by then), so nothing
 //! in the process uses CUDA. A session that did not stop cleanly (a
-//! pipeline left short of NULL) may still have CUDA elements alive: the
-//! GPU is then not parked, and stays awake. The frames the writer and the PipeWire tap
+//! pipeline left short of NULL, by its stop or by one of its camera
+//! switches) may still have CUDA elements alive: the GPU is then not
+//! parked, and parking stays off until the daemon restarts (the parker is
+//! tainted). A stop that failed otherwise (a camera control not restored,
+//! an output clock thread that had panicked) is warned, and parks. The frames the writer and the PipeWire tap
 //! may still hold come out of `cudadownload` in system memory, so releasing
 //! them later needs no CUDA. Starting a session unparks first, before the
 //! output or NVML touch the GPU; if the GPU cannot be restored the start
 //! fails (nothing may touch CUDA), and a start that fails after unparking
-//! parks again. While parked, nothing here touches CUDA: the camera scan,
+//! parks again, unless the output it had started did not stop cleanly
+//! (tainted, as above). While parked, nothing here touches CUDA: the camera scan,
 //! the writer and [`MediaBackend::effect_available`] (the effect backend's
 //! probe opens its libraries and makes no CUDA call) need none. The
 //! process may exit parked (a shutdown stops the session first, which
@@ -59,12 +63,12 @@ use obc_pipeline::pipeline::names;
 use obc_pipeline::stats::{cpu_usage, online_cpus, self_cpu_ticks, ticks_per_sec};
 use obc_pipeline::{
     DiscoveryRoute, EffectFallback, EffectKind, EffectSettings, IngestConfig, LiveStats,
-    LoopbackWriter, Output, OutputConfig, OutputSink, PipelineError, Session, WriterCounts,
-    WriterHandle, WriterSink, choose_mode, effect_backend_available, list_cameras, scan_sysfs,
-    select_sink,
+    LoopbackWriter, Output, OutputConfig, OutputSink, PipelineError, Session, StopError,
+    WriterCounts, WriterHandle, WriterSink, choose_mode, effect_backend_available, list_cameras,
+    scan_sysfs, select_sink,
 };
 
-use super::park::{Parker, StopSession};
+use super::park::{Parker, StartError, StopFailure, StopSession};
 use super::{
     EffectReport, EffectStatus, Failure, MediaBackend, PipeWireEvent, PipeWireGeneration,
     PipeWireReporter, PipeWireState, SessionParams,
@@ -99,15 +103,23 @@ struct Running {
     cpu_ticks: Option<u64>,
     /// The writer's counters at the start of the stats window.
     counts: WriterCounts,
+    /// Why a pipeline a camera switch took down did not reach NULL (the
+    /// first one): the session's stop is then unclean, however it goes.
+    unclean: Option<String>,
 }
 
 impl StopSession for Running {
     /// The NVML sampler stopped, then ingest and output to NULL and
     /// dropped, then the rest: when this returns, nothing of the session is
-    /// left. `Err` when a pipeline did not reach NULL cleanly.
-    fn stop(self) -> Result<(), String> {
+    /// left. Unclean ([`StopFailure::reached_null`] false) when a pipeline
+    /// did not reach NULL, now or in a camera switch ([`session_stopped`]).
+    fn stop(self) -> Result<(), StopFailure> {
         let Running {
-            session, gpu, live, ..
+            session,
+            gpu,
+            live,
+            unclean,
+            ..
         } = self;
         if let Some(gpu) = gpu {
             let (_, res) = gpu.stop();
@@ -116,9 +128,47 @@ impl StopSession for Running {
             }
         }
         // Ingest, then output: every pipeline at NULL and dropped.
-        let res = session.stop().map_err(|e| e.to_string());
+        let res = session.stop_checked();
         drop(live);
-        res
+        session_stopped(res, unclean)
+    }
+}
+
+/// A session stop's outcome for the parker: `res`, the stop of its
+/// pipelines, and `unclean`, why one an earlier camera switch took down did
+/// not reach NULL. Unclean if either left a pipeline outside NULL; an
+/// error with every pipeline in NULL (a camera control not restored, an
+/// output clock thread that had panicked and was joined) is not.
+fn session_stopped(res: Result<(), StopError>, unclean: Option<String>) -> Result<(), StopFailure> {
+    match (res, unclean) {
+        (Ok(()), None) => Ok(()),
+        (Err(e), None) => Err(StopFailure {
+            error: e.to_string(),
+            reached_null: e.reached_null,
+        }),
+        (Ok(()), Some(why)) => Err(StopFailure::unclean(why)),
+        (Err(e), Some(why)) => Err(StopFailure::unclean(format!("{e}; earlier, {why}"))),
+    }
+}
+
+/// Why a camera switch of the session left a pipeline outside NULL
+/// ([`obc_pipeline::SwitchTiming::unclean_stop`]), for [`Running::unclean`].
+fn switch_left(camera: &str, unclean_stop: Option<String>) -> Option<String> {
+    unclean_stop.map(|why| format!("switching to {camera}: {why}"))
+}
+
+/// A failed output start's error (`error`), and how stopping the output
+/// again went (`cleanup`): unclean only if that left it outside NULL. A
+/// cleanup error with the pipeline in NULL is not expected (no clock
+/// thread runs after a failed start); it is logged at debug.
+fn start_failed(error: String, cleanup: Result<(), StopError>) -> StartError {
+    match cleanup {
+        Ok(()) => StartError::from(error),
+        Err(e) if e.reached_null => {
+            crate::debug!("stopping the output pipeline after its failed start: {e}");
+            StartError::from(error)
+        }
+        Err(e) => StartError::unclean(error, format!("output pipeline: {e}")),
     }
 }
 
@@ -172,7 +222,7 @@ impl GstBackend {
     /// writer. Never fails: the outcome is reported (the controller logs
     /// it), every event tagged with `generation`.
     #[cfg(feature = "pipewire")]
-    fn start_pipewire_output(&mut self, generation: PipeWireGeneration) {
+    fn start_pipewire_output(&mut self, generation: PipeWireGeneration, offer_nv12: bool) {
         use obc_pipeline::pipewire::{PipeWireOutput, PwEvent, PwOutputConfig};
 
         let Some(writer) = self.writer.as_ref() else {
@@ -191,7 +241,11 @@ impl GstBackend {
                 r(generation, pipewire_event(event));
             }
         };
-        match PipeWireOutput::start(PwOutputConfig::new(*writer.contract()), report) {
+        let cfg = PwOutputConfig {
+            offer_nv12,
+            ..PwOutputConfig::new(*writer.contract())
+        };
+        match PipeWireOutput::start(cfg, report) {
             Ok(output) => {
                 writer.set_tap(Some(output.tap()));
                 self.output = Some(output);
@@ -211,7 +265,7 @@ impl GstBackend {
     /// Without the feature `pipewire`: reports
     /// [`PipeWireState::Unsupported`] and no link, and touches nothing.
     #[cfg(not(feature = "pipewire"))]
-    fn start_pipewire_output(&mut self, generation: PipeWireGeneration) {
+    fn start_pipewire_output(&mut self, generation: PipeWireGeneration, _offer_nv12: bool) {
         crate::warning!(
             "[pipewire] enabled is set, but this build has no PipeWire support: \
              only the loopback device is offered"
@@ -248,10 +302,16 @@ impl GstBackend {
             .attach(&ingest)
             .map_err(|e| format!("{}: {e}", camera.label()))?;
         running.source = None;
-        let timing = running
-            .session
-            .switch_to(ingest)
-            .map_err(|e| format!("{}: {e}", camera.label()))?;
+        let res = running.session.switch_to(ingest);
+        if res.is_err() && running.unclean.is_none() {
+            // A pipeline it took down left outside NULL: that session's stop
+            // will not park (`Running::unclean`).
+            running.unclean = switch_left(
+                &camera.label(),
+                running.session.last_switch().and_then(|t| t.unclean_stop),
+            );
+        }
+        let timing = res.map_err(|e| format!("{}: {e}", camera.label()))?;
         running.source = Some(timing.source_id);
         Ok(())
     }
@@ -322,11 +382,18 @@ fn stamp_forwarded(output: &Output) {
 /// Builds and starts a session's output forwarding to `writer`, and the
 /// NVML sampler: everything of [`MediaBackend::start_session`] that touches
 /// the GPU. The writer's counters are the caller's to set.
+///
+/// On error, what was built is gone, and the error says whether it went
+/// cleanly ([`StartError::unclean`]: the parker must then not park). An
+/// output that failed to build was never started: its elements were only
+/// made and linked, in NULL, and are dropped with it. One that failed to
+/// start is stopped here, its result seen, rather than by its drop, which
+/// ignores it: unclean only if it did not reach NULL ([`start_failed`]).
 fn build_session(
     params: &SessionParams,
     writer: WriterHandle,
     stamp: bool,
-) -> Result<Running, String> {
+) -> Result<Running, StartError> {
     let mut ocfg = OutputConfig::new(params.contract, OutputSink::Writer(writer));
     ocfg.gap_threshold = params.input_gap;
     ocfg.hold_timeout = params.hold_timeout;
@@ -339,7 +406,20 @@ fn build_session(
     if stamp {
         stamp_forwarded(&output);
     }
-    let session = Session::new(output).map_err(|e| format!("output pipeline: {e}"))?;
+    if let Err(e) = output.start() {
+        return Err(start_failed(
+            format!("output pipeline: {e}"),
+            output.stop_checked(),
+        ));
+    }
+    // Started already: `Session::new` has nothing left to fail on. Should it
+    // fail all the same, the output went with it unchecked.
+    let session = Session::new(output).map_err(|e| {
+        StartError::unclean(
+            format!("output pipeline: {e}"),
+            "the output pipeline was dropped without its stop being checked",
+        )
+    })?;
     let epoch = Instant::now();
     let gpu = match GpuSampler::start(
         GPU_INDEX,
@@ -361,6 +441,7 @@ fn build_session(
         window_start: Instant::now(),
         cpu_ticks: self_cpu_ticks(),
         counts: WriterCounts::default(),
+        unclean: None,
     })
 }
 
@@ -422,11 +503,11 @@ impl MediaBackend for GstBackend {
         }
     }
 
-    fn start_pipewire(&mut self) -> PipeWireGeneration {
+    fn start_pipewire(&mut self, offer_nv12: bool) -> PipeWireGeneration {
         self.stop_pipewire();
         self.generation += 1;
         let generation = self.generation;
-        self.start_pipewire_output(generation);
+        self.start_pipewire_output(generation, offer_nv12);
         generation
     }
 
@@ -651,6 +732,97 @@ mod tests {
             queue_dropped,
             ..WriterCounts::default()
         }
+    }
+
+    fn stop_err(what: &str, reached_null: bool) -> Result<(), StopError> {
+        Err(StopError {
+            error: PipelineError::State(what.into()),
+            reached_null,
+        })
+    }
+
+    #[test]
+    fn only_a_pipeline_outside_null_makes_a_session_stop_unclean() {
+        let not_null = "state change failed: ended in Paused, not Null";
+        assert_eq!(session_stopped(Ok(()), None), Ok(()));
+        // Every pipeline in NULL: a failure, not an unclean one (parks).
+        assert_eq!(
+            session_stopped(
+                Err(StopError {
+                    error: PipelineError::Control {
+                        device: "/dev/video0".into(),
+                        message: "restoring exposure_dynamic_framerate: No such device".into(),
+                    },
+                    reached_null: true,
+                }),
+                None
+            ),
+            Err(StopFailure::at_null(
+                "camera control on /dev/video0: restoring exposure_dynamic_framerate: No such \
+                 device"
+            ))
+        );
+        assert_eq!(
+            session_stopped(
+                stop_err("the output clock thread panicked: boom", true),
+                None
+            ),
+            Err(StopFailure::at_null(
+                "state change failed: the output clock thread panicked: boom"
+            ))
+        );
+        assert_eq!(
+            session_stopped(stop_err("ended in Paused, not Null", false), None),
+            Err(StopFailure::unclean(not_null))
+        );
+        // An earlier switch left a pipeline outside NULL: unclean, however
+        // this stop went.
+        let switch = "switching to Cam (a): stopping the previous ingest: ended in Ready";
+        assert_eq!(
+            session_stopped(Ok(()), Some(switch.into())),
+            Err(StopFailure::unclean(switch))
+        );
+        assert_eq!(
+            session_stopped(stop_err("boom", true), Some(switch.into())),
+            Err(StopFailure::unclean(format!(
+                "state change failed: boom; earlier, {switch}"
+            )))
+        );
+        assert_eq!(
+            session_stopped(
+                stop_err("ended in Paused, not Null", false),
+                Some(switch.into())
+            ),
+            Err(StopFailure::unclean(format!(
+                "{not_null}; earlier, {switch}"
+            )))
+        );
+    }
+
+    #[test]
+    fn a_camera_switch_is_unclean_only_when_it_left_a_pipeline_outside_null() {
+        assert_eq!(switch_left("Cam (a)", None), None);
+        assert_eq!(
+            switch_left("Cam (a)", Some("stopping the previous ingest: x".into())).as_deref(),
+            Some("switching to Cam (a): stopping the previous ingest: x")
+        );
+    }
+
+    #[test]
+    fn a_failed_output_start_is_unclean_only_when_its_stop_left_it_outside_null() {
+        let e = || "output pipeline: state change failed".to_string();
+        assert_eq!(start_failed(e(), Ok(())), StartError::from(e()));
+        assert_eq!(
+            start_failed(e(), stop_err("the output clock thread panicked", true)),
+            StartError::from(e())
+        );
+        assert_eq!(
+            start_failed(e(), stop_err("ended in Paused, not Null", false)),
+            StartError::unclean(
+                e(),
+                "output pipeline: state change failed: ended in Paused, not Null"
+            )
+        );
     }
 
     #[test]
