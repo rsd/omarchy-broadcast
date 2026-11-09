@@ -42,6 +42,10 @@ pub const EFFECTS_REVISION: u32 = 2;
 /// `SetDenoise`).
 pub use obc_ipc::DENOISE_REVISION;
 
+/// The first `InterfaceRevision` with the live preview (`AcquirePreview`,
+/// `ReleasePreview`, `PreviewFrame`).
+pub use obc_ipc::PREVIEW_REVISION;
+
 /// How to start the daemon, quoted in the not-running message.
 pub const START_HINT: &str = "systemctl --user start omarchy-broadcastd";
 
@@ -56,6 +60,9 @@ pub enum Failure {
     Rejected(IpcError),
     /// The daemon is too old for the request (its `InterfaceRevision`).
     Unsupported(String),
+    /// The daemon's preview frame path is too long for a JSON line
+    /// ([`json::MAX_PREVIEW_PATH_BYTES`]).
+    PreviewPathTooLong(String),
     /// Anything else.
     Other(String),
 }
@@ -86,16 +93,17 @@ impl Failure {
         match self {
             Failure::NotRunning(_) | Failure::NoBus(_) => EXIT_NOT_RUNNING,
             Failure::Rejected(_) | Failure::Unsupported(_) => EXIT_REJECTED,
-            Failure::Other(_) => EXIT_FAILURE,
+            Failure::PreviewPathTooLong(_) | Failure::Other(_) => EXIT_FAILURE,
         }
     }
 
     /// The `code` of the JSON error line.
     pub fn json_code(&self) -> &'static str {
-        if self.is_not_running() {
-            json::CODE_NOT_RUNNING
-        } else {
-            json::CODE_DBUS
+        match self {
+            Failure::NotRunning(_) | Failure::NoBus(_) => json::CODE_NOT_RUNNING,
+            Failure::Unsupported(_) => json::CODE_UNSUPPORTED,
+            Failure::PreviewPathTooLong(_) => json::CODE_PREVIEW_PATH_TOO_LONG,
+            Failure::Rejected(_) | Failure::Other(_) => json::CODE_DBUS,
         }
     }
 
@@ -105,7 +113,8 @@ impl Failure {
             Failure::NotRunning(m)
             | Failure::NoBus(m)
             | Failure::Other(m)
-            | Failure::Unsupported(m) => m.clone(),
+            | Failure::Unsupported(m)
+            | Failure::PreviewPathTooLong(m) => m.clone(),
             Failure::Rejected(e) => e.message(),
         }
     }
@@ -134,6 +143,29 @@ pub fn require_denoise(revision: u32) -> Result<(), Failure> {
         "the daemon does not support noise removal (its interface revision is {revision}, \
          noise removal needs {DENOISE_REVISION}); update omarchy-broadcastd"
     )))
+}
+
+/// Fails unless a daemon of interface revision `revision` has the live
+/// preview.
+pub fn require_preview(revision: u32) -> Result<(), Failure> {
+    if revision >= PREVIEW_REVISION {
+        return Ok(());
+    }
+    Err(Failure::Unsupported(format!(
+        "the daemon does not support the live preview (its interface revision is {revision}, \
+         the preview needs {PREVIEW_REVISION}); update omarchy-broadcastd"
+    )))
+}
+
+/// The daemon's preview frame `path` does not fit a JSON line (it is never
+/// clipped: a clipped path names no file).
+pub fn preview_path_too_long(path: &str) -> Failure {
+    Failure::PreviewPathTooLong(format!(
+        "the daemon's preview frame path is too long for a JSON line ({} bytes, at most {} \
+         encoded): set a shorter XDG_RUNTIME_DIR for omarchy-broadcastd",
+        path.len(),
+        json::MAX_PREVIEW_PATH_BYTES
+    ))
 }
 
 /// The D-Bus error name and description carried by `e`, if it is an error
@@ -262,6 +294,26 @@ mod tests {
         assert_eq!(Failure::Other("x".into()).exit_code(), EXIT_FAILURE);
         assert_eq!(Failure::Other("x".into()).json_code(), "dbus-error");
         assert_eq!(Failure::Unsupported("x".into()).exit_code(), EXIT_REJECTED);
+        assert_eq!(
+            Failure::Unsupported("x".into()).json_code(),
+            "unsupported-daemon"
+        );
+        assert_eq!(
+            Failure::Rejected(IpcError::Failed("x".into())).json_code(),
+            "dbus-error"
+        );
+    }
+
+    #[test]
+    fn the_preview_needs_revision_5() {
+        assert!(require_preview(PREVIEW_REVISION).is_ok());
+        let f = require_preview(4).unwrap_err();
+        assert_eq!(f.json_code(), "unsupported-daemon");
+        assert_eq!(
+            f.message(),
+            "the daemon does not support the live preview (its interface revision is 4, the \
+             preview needs 5); update omarchy-broadcastd"
+        );
     }
 
     #[test]

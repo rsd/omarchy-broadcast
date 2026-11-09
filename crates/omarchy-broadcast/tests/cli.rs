@@ -375,8 +375,16 @@ struct Mock {
     blur_strength: f64,
     background_image: String,
     denoise: bool,
-    /// The effect calls received, in order, as `Method(argument)`.
+    /// The effect and preview calls received, in order, as
+    /// `Method(argument)`.
     calls: Vec<String>,
+    /// The preview leases, by the caller's unique name: their rate.
+    leases: std::collections::BTreeMap<String, u32>,
+    /// What `AcquirePreview` returns.
+    preview_path: String,
+    /// The preview calls received without `NO_AUTO_START` (which would
+    /// have started the daemon had it not been running), as in `calls`.
+    auto_start: Vec<String>,
 }
 
 impl Mock {
@@ -406,8 +414,23 @@ impl Mock {
             background_image: String::new(),
             denoise: false,
             calls: Vec::new(),
+            leases: std::collections::BTreeMap::new(),
+            preview_path: PREVIEW_PATH.into(),
+            auto_start: Vec::new(),
         }
     }
+}
+
+/// Where the mock says its preview frames are.
+const PREVIEW_PATH: &str = "/run/user/1000/omarchy-broadcast/preview.jpg";
+
+/// Whether the call `header` belongs to may start the daemon (it lacks
+/// `NO_AUTO_START`).
+fn may_auto_start(header: &zbus::message::Header<'_>) -> bool {
+    !header
+        .primary()
+        .flags()
+        .contains(zbus::message::Flags::NO_AUTO_START)
 }
 
 #[interface(name = "br.com.dias.OmarchyBroadcast1")]
@@ -532,6 +555,41 @@ impl Mock {
         Ok(())
     }
 
+    async fn acquire_preview(
+        &mut self,
+        fps: u32,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<String, IpcError> {
+        self.calls.push(format!("AcquirePreview({fps})"));
+        if may_auto_start(&header) {
+            self.auto_start.push(format!("AcquirePreview({fps})"));
+        }
+        if fps != 15 && fps != 30 {
+            return Err(IpcError::InvalidArgument(format!("bad rate {fps}")));
+        }
+        let sender = header.sender().map(|s| s.to_string()).unwrap_or_default();
+        self.leases.insert(sender, fps);
+        self.preview_consumers_changed(&emitter).await?;
+        Ok(self.preview_path.clone())
+    }
+
+    async fn release_preview(
+        &mut self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        self.calls.push("ReleasePreview".into());
+        if may_auto_start(&header) {
+            self.auto_start.push("ReleasePreview".into());
+        }
+        let sender = header.sender().map(|s| s.to_string()).unwrap_or_default();
+        if self.leases.remove(&sender).is_some() {
+            self.preview_consumers_changed(&emitter).await?;
+        }
+        Ok(())
+    }
+
     #[zbus(signal)]
     async fn stats(
         emitter: &SignalEmitter<'_>,
@@ -540,6 +598,9 @@ impl Mock {
         cpu_percent: f64,
         gpu_percent: f64,
     ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn preview_frame(emitter: &SignalEmitter<'_>, seq: u32) -> zbus::Result<()>;
 
     #[zbus(property)]
     fn state(&self) -> State {
@@ -596,12 +657,17 @@ impl Mock {
 
     #[zbus(property)]
     fn consumers(&self) -> u32 {
-        self.consumers + self.pipewire_consumers
+        self.consumers + self.pipewire_consumers + self.preview_consumers()
     }
 
     #[zbus(property)]
     fn loopback_consumers(&self) -> u32 {
         self.consumers
+    }
+
+    #[zbus(property)]
+    fn preview_consumers(&self) -> u32 {
+        u32::try_from(self.leases.len()).unwrap()
     }
 
     #[zbus(property, name = "PipeWireConsumers")]
@@ -724,6 +790,43 @@ impl MockDaemon {
             });
             let m = iface.get().await;
             m.cameras_changed(iface.signal_emitter()).await.unwrap();
+        });
+    }
+
+    /// The preview leases held: `(holder, fps)`.
+    fn leases(&self) -> Vec<(String, u32)> {
+        let iface = self.iface();
+        self.rt.block_on(async {
+            iface
+                .get()
+                .await
+                .leases
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect()
+        })
+    }
+
+    /// The preview calls received without `NO_AUTO_START`.
+    fn auto_start_calls(&self) -> Vec<String> {
+        let iface = self.iface();
+        self.rt
+            .block_on(async { iface.get().await.auto_start.clone() })
+    }
+
+    /// `AcquirePreview` returns `path` from now on.
+    fn set_preview_path(&self, path: &str) {
+        let iface = self.iface();
+        self.rt
+            .block_on(async { iface.get_mut().await.preview_path = path.into() });
+    }
+
+    fn emit_frame(&self, seq: u32) {
+        let iface = self.iface();
+        self.rt.block_on(async {
+            Mock::preview_frame(iface.signal_emitter(), seq)
+                .await
+                .unwrap();
         });
     }
 
@@ -1814,4 +1917,250 @@ fn watch_human_prints_changes_and_stats() {
     let (status, stderr) = watch.finish("watch after SIGTERM");
     assert_eq!(status.code(), Some(0), "{status:?}");
     assert_eq!(stderr, "");
+}
+
+// ---------------------------------------------------------------------------
+// preview
+
+/// Waits until `done` holds of the mock's leases.
+fn until_leases(mock: &MockDaemon, what: &str, done: impl Fn(&[(String, u32)]) -> bool) {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let leases = mock.leases();
+        if done(&leases) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{what}: leases {leases:?}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn preview_json_holds_a_lease_prints_its_frames_and_releases_it_on_sigterm() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let preview = bus.watch(&["preview", "--json"], None);
+
+    let v = preview.next_json("the lease");
+    assert_eq!(v["type"], "preview", "{v}");
+    assert_eq!(v["active"], true);
+    assert_eq!(v["fps"], 15, "the default rate");
+    assert_eq!(v["path"], PREVIEW_PATH);
+    let leases = mock.leases();
+    assert_eq!(leases.len(), 1, "{leases:?}");
+    assert!(leases[0].0.starts_with(':'), "keyed by its unique name");
+    assert_eq!(leases[0].1, 15);
+
+    for seq in [1, 2, 3] {
+        mock.emit_frame(seq);
+        let v = preview.next_json("a frame");
+        assert_eq!(v["type"], "frame", "{v}");
+        assert_eq!(v["seq"], seq);
+        assert_eq!(v["path"], PREVIEW_PATH);
+    }
+
+    let mut preview = preview;
+    preview.child.signal(libc::SIGTERM);
+    let (status, stderr) = preview.finish("preview after SIGTERM");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert_eq!(stderr, "");
+    assert_eq!(
+        mock.take_calls(),
+        ["AcquirePreview(15)", "ReleasePreview"],
+        "released before it exited"
+    );
+    // Both carried NO_AUTO_START: a daemon gone in between is not started
+    // by them.
+    assert_eq!(mock.auto_start_calls(), Vec::<String>::new());
+    assert!(mock.leases().is_empty());
+    assert!(
+        !bus.activation_attempted(),
+        "preview must not start the daemon"
+    );
+}
+
+#[test]
+fn preview_fps_30_is_asked_for_and_any_other_rate_is_a_usage_error() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    for bad in ["20", "0", "10", "60", "fifteen", "15.0", "4294967295"] {
+        let out = bus.run(&["preview", "--json", "--fps", bad]);
+        assert_eq!(out.status.code(), Some(2), "--fps {bad}: {}", out.stderr);
+        assert_eq!(out.stdout, "", "--fps {bad}");
+        assert!(out.stderr.contains("--fps"), "--fps {bad}: {}", out.stderr);
+    }
+    assert!(mock.take_calls().is_empty(), "no call for a usage error");
+
+    let mut preview = bus.watch(&["preview", "--json", "--fps", "30"], None);
+    let v = preview.next_json("the lease");
+    assert_eq!(
+        (v["type"].as_str(), v["fps"].as_u64()),
+        (Some("preview"), Some(30))
+    );
+    assert_eq!(mock.leases()[0].1, 30);
+    // SIGINT and SIGHUP end it as SIGTERM does.
+    preview.child.signal(libc::SIGHUP);
+    let (status, _) = preview.finish("preview after SIGHUP");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert!(mock.leases().is_empty());
+    let mut preview = bus.watch(&["preview", "--json", "--fps", "15"], None);
+    preview.next_json("the lease");
+    preview.child.signal(libc::SIGINT);
+    let (status, _) = preview.finish("preview after SIGINT");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert!(mock.leases().is_empty());
+}
+
+#[test]
+fn preview_json_follows_the_daemon_through_an_outage() {
+    let bus = Bus::start();
+    let preview = bus.watch(&["preview", "--json"], None);
+    let v = preview.next_json("the not-running line");
+    assert_eq!(v["type"], "error", "{v}");
+    assert_eq!(v["code"], "daemon-not-running");
+    preview.quiet_for(Duration::from_millis(2500), "while nothing runs");
+
+    let mock = MockDaemon::start(&bus);
+    let v = preview.next_json("the lease once the daemon appears");
+    assert_eq!(
+        (v["type"].as_str(), v["active"].as_bool()),
+        (Some("preview"), Some(true))
+    );
+    until_leases(&mock, "the lease", |l| l.len() == 1);
+
+    // The daemon goes away: the lease is lost, then one outage line.
+    mock.release_name();
+    let v = preview.next_json("the lease lost");
+    assert_eq!(
+        v,
+        serde_json::json!({"v": 1, "type": "preview", "active": false})
+    );
+    let v = preview.next_json("the outage");
+    assert_eq!(v["type"], "error", "{v}");
+    assert_eq!(v["code"], "daemon-not-running");
+    preview.quiet_for(Duration::from_millis(2500), "during the outage");
+
+    // Back: the lease is asked for again.
+    mock.request_name();
+    let v = preview.next_json("the lease again");
+    assert_eq!(
+        (v["type"].as_str(), v["active"].as_bool()),
+        (Some("preview"), Some(true))
+    );
+    let acquired = mock
+        .take_calls()
+        .iter()
+        .filter(|c| c.starts_with("AcquirePreview"))
+        .count();
+    assert_eq!(acquired, 2);
+    mock.emit_frame(9);
+    let v = preview.next_json("a frame after the outage");
+    assert_eq!(
+        (v["type"].as_str(), v["seq"].as_u64()),
+        (Some("frame"), Some(9))
+    );
+    assert!(!bus.activation_attempted());
+}
+
+#[test]
+fn preview_against_an_older_daemon_says_it_is_unsupported_and_waits() {
+    let bus = Bus::start();
+    let _old = OldDaemon::start(&bus, Rev3);
+    let preview = bus.watch(&["preview", "--json"], None);
+    let v = preview.next_json("the unsupported line");
+    assert_eq!(v["type"], "error", "{v}");
+    assert_eq!(v["code"], "unsupported-daemon");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("interface revision is 3"),
+        "{v}"
+    );
+    preview.quiet_for(Duration::from_millis(2500), "waiting for another daemon");
+}
+
+#[test]
+fn preview_releases_and_exits_quietly_when_its_reader_goes_away() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    // The reader closes the pipe after the first line.
+    let preview = bus.watch(&["preview", "--json"], Some(1));
+    let v = preview.next_json("the lease");
+    assert_eq!(v["type"], "preview", "{v}");
+    let (status, stderr) = preview.finish("preview without a reader");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert_eq!(stderr, "");
+    assert!(mock.take_calls().contains(&"ReleasePreview".to_string()));
+    assert!(mock.leases().is_empty());
+}
+
+#[test]
+fn preview_json_says_the_lease_is_lost_when_the_bus_goes_away() {
+    let mut bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let preview = bus.watch(&["preview", "--json"], None);
+    let v = preview.next_json("the lease");
+    assert_eq!(
+        (v["type"].as_str(), v["active"].as_bool()),
+        (Some("preview"), Some(true))
+    );
+    until_leases(&mock, "the lease", |l| l.len() == 1);
+
+    // The session bus ends: the connection holding the lease closes, so the
+    // lease is gone; that is said before the outage.
+    bus.daemon.signal(libc::SIGKILL);
+    let v = preview.next_json("the lease lost");
+    assert_eq!(
+        v,
+        serde_json::json!({"v": 1, "type": "preview", "active": false})
+    );
+    let v = preview.next_json("the outage");
+    assert_eq!(v["type"], "error", "{v}");
+    assert_eq!(v["code"], "dbus-error");
+    preview.quiet_for(Duration::from_millis(2500), "during the outage");
+    let mut preview = preview;
+    preview.child.signal(libc::SIGTERM);
+    let (status, stderr) = preview.finish("preview after SIGTERM");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert_eq!(stderr, "");
+}
+
+#[test]
+fn preview_json_refuses_a_frame_path_too_long_for_a_line() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let long = format!("/run/{}/omarchy-broadcast/preview.jpg", "d".repeat(5000));
+    mock.set_preview_path(&long);
+    let preview = bus.watch(&["preview", "--json"], None);
+    let v = preview.next_json("the refusal");
+    assert_eq!(v["type"], "error", "{v}");
+    assert_eq!(v["code"], "preview-path-too-long");
+    assert!(v["error"].as_str().unwrap().contains("too long"), "{v}");
+    // Not held for frames nobody can find: released at once.
+    until_leases(&mock, "the lease released", <[_]>::is_empty);
+    assert_eq!(mock.take_calls(), ["AcquirePreview(15)", "ReleasePreview"]);
+    // No frame line, clipped or not, and the daemon is not asked again.
+    mock.emit_frame(1);
+    preview.quiet_for(
+        Duration::from_millis(2500),
+        "after the refusal, with the same daemon",
+    );
+    assert!(mock.take_calls().is_empty());
+    assert_eq!(mock.auto_start_calls(), Vec::<String>::new());
+
+    // Another daemon (with a short path) is picked up.
+    drop(mock);
+    let mock = MockDaemon::start(&bus);
+    let v = preview.next_json("the lease from the new daemon");
+    assert_eq!(
+        (v["type"].as_str(), v["path"].as_str()),
+        (Some("preview"), Some(PREVIEW_PATH))
+    );
+    mock.emit_frame(2);
+    let v = preview.next_json("a frame");
+    assert_eq!(
+        (v["type"].as_str(), v["seq"].as_u64()),
+        (Some("frame"), Some(2))
+    );
 }

@@ -2,7 +2,9 @@
 //! fake backend, on a peer-to-peer D-Bus connection (a Unix socket pair, no
 //! bus daemon), driven through the client proxy of `obc-ipc`: every
 //! property, every method and each of its errors, `PropertiesChanged` on
-//! each state change, and `Stats` while `active` only.
+//! each state change, and `Stats` while `active` only. The preview leases,
+//! keyed by the caller's unique bus name, need a bus: those tests run the
+//! object on a private `dbus-daemon` instead ([`Rig::on_bus`]).
 
 use std::fs;
 use std::os::unix::net::UnixStream;
@@ -38,15 +40,116 @@ struct Rig {
     paths: Paths,
     controller: Option<std::thread::JoinHandle<()>>,
     _dir: TempDir,
+    /// The private bus of [`Rig::on_bus`] (last: stopped after the rest).
+    bus: Option<PrivateBus>,
+}
+
+/// A private `dbus-daemon` on a socket in a short temporary directory,
+/// killed when dropped.
+struct PrivateBus {
+    address: String,
+    child: std::process::Child,
+    _sockets: TempDir,
+}
+
+impl PrivateBus {
+    fn start(dir: &std::path::Path) -> PrivateBus {
+        use std::io::BufRead;
+        const DBUS_DAEMON: &str = "/usr/bin/dbus-daemon";
+        assert!(
+            std::path::Path::new(DBUS_DAEMON).exists(),
+            "this test needs {DBUS_DAEMON} (the reference D-Bus daemon, package `dbus`) to run a \
+             private bus"
+        );
+        // A unix socket path is limited to 108 bytes: a short directory.
+        let sockets = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .filter(|d| d.is_absolute() && d.as_os_str().len() <= 64)
+            .into_iter()
+            .chain([std::path::PathBuf::from("/tmp")])
+            .find_map(|base| {
+                tempfile::Builder::new()
+                    .prefix("obc-")
+                    .tempdir_in(base)
+                    .ok()
+            })
+            .expect("no writable directory for the test bus socket");
+        let config = dir.join("bus.conf");
+        fs::write(
+            &config,
+            format!(
+                r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:dir={}</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"#,
+                sockets.path().display()
+            ),
+        )
+        .unwrap();
+        let mut child = std::process::Command::new(DBUS_DAEMON)
+            .arg(format!("--config-file={}", config.display()))
+            .args(["--nofork", "--print-address=1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("cannot start {DBUS_DAEMON}: {e}"));
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let address = line.trim().to_string();
+        assert!(address.starts_with("unix:"), "no bus address: {line:?}");
+        PrivateBus {
+            address,
+            child,
+            _sockets: sockets,
+        }
+    }
+
+    async fn connect(&self) -> Connection {
+        connection::Builder::address(self.address.as_str())
+            .build()
+            .await
+            .unwrap()
+    }
+}
+
+impl Drop for PrivateBus {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Rig {
     async fn new(config: &str, setup: impl FnOnce(&mut World)) -> Rig {
+        Self::build(config, setup, false).await
+    }
+
+    /// The object on a private bus, owning the daemon's name there, with
+    /// the subscription to the names leaving the bus; the client is another
+    /// connection to that bus.
+    async fn on_bus(config: &str, setup: impl FnOnce(&mut World)) -> Rig {
+        Self::build(config, setup, true).await
+    }
+
+    async fn build(config: &str, setup: impl FnOnce(&mut World), on_bus: bool) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths {
             config: dir.path().join("config.toml"),
             state: dir.path().join("state.toml"),
+            runtime: Some(dir.path().join("run")),
         };
+        fs::create_dir(dir.path().join("run")).unwrap();
         fs::write(&paths.config, config).unwrap();
         let fake = FakeBackend::default();
         {
@@ -59,17 +162,30 @@ impl Rig {
         }
         let (published, notes) = Published::new(preliminary_snapshot(&paths));
         let (commands, rx) = std::sync::mpsc::channel();
-        let (s0, s1) = UnixStream::pair().unwrap();
-        let server = connection::Builder::unix_stream(s0)
-            .server(Guid::generate())
-            .p2p()
-            .serve_at(
-                OBJECT_PATH,
-                Server::new(published.clone(), commands.clone()),
-            )
-            .build();
-        let client = connection::Builder::unix_stream(s1).p2p().build();
-        let (server, client) = tokio::try_join!(server, client).unwrap();
+        let object = Server::new(published.clone(), commands.clone());
+        let (server, client, bus) = if on_bus {
+            let bus = PrivateBus::start(dir.path());
+            let server = connection::Builder::address(bus.address.as_str())
+                .serve_at(OBJECT_PATH, object)
+                .build()
+                .await
+                .unwrap();
+            let owners = subscribe_owners(&server).await.unwrap();
+            tokio::spawn(run_owner_watch(owners, commands.clone()));
+            server.request_name(obc_ipc::BUS_NAME).await.unwrap();
+            let client = bus.connect().await;
+            (server, client, Some(bus))
+        } else {
+            let (s0, s1) = UnixStream::pair().unwrap();
+            let server = connection::Builder::unix_stream(s0)
+                .server(Guid::generate())
+                .p2p()
+                .serve_at(OBJECT_PATH, object)
+                .build();
+            let client = connection::Builder::unix_stream(s1).p2p().build();
+            let (server, client) = tokio::try_join!(server, client).unwrap();
+            (server, client, None)
+        };
         tokio::spawn(run_publisher(server.clone(), notes));
         let (f, p, pb) = (fake.clone(), paths.clone(), published.clone());
         let controller = std::thread::spawn(move || {
@@ -85,6 +201,7 @@ impl Rig {
             paths,
             controller: Some(controller),
             _dir: dir,
+            bus,
         }
     }
 
@@ -243,12 +360,13 @@ async fn every_property_reads_through_the_proxy() {
             consumers: 0,
             loopback_consumers: 0,
             pipewire_consumers: 0,
+            preview_consumers: 0,
             pipewire_output: "off".into(),
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 4);
-    // GetAll returns the same fifteen properties.
+    assert_eq!(INTERFACE_REVISION, 5);
+    // GetAll returns the same sixteen properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
         .destination(obc_ipc::BUS_NAME)
         .path(OBJECT_PATH)
@@ -280,6 +398,7 @@ async fn every_property_reads_through_the_proxy() {
             "OutputMode",
             "PipeWireConsumers",
             "PipeWireOutput",
+            "PreviewConsumers",
             "State"
         ]
     );
@@ -303,6 +422,10 @@ async fn every_property_reads_through_the_proxy() {
         "<method name=\"SetBlurStrength\">",
         "<method name=\"SetBackgroundImage\">",
         "<method name=\"SetDenoise\">",
+        "<method name=\"AcquirePreview\">",
+        "<method name=\"ReleasePreview\">",
+        "<signal name=\"PreviewFrame\">",
+        "<property name=\"PreviewConsumers\" type=\"u\" access=\"read\"",
         "<property name=\"Denoise\" type=\"b\" access=\"read\"",
         "<property name=\"BlurStrength\" type=\"d\" access=\"read\"",
         "<property name=\"BackgroundImage\" type=\"s\" access=\"read\"",
@@ -710,7 +833,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 4);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 5);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -768,7 +891,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 4);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 5);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -868,4 +991,246 @@ async fn the_pipewire_properties_and_their_changes() {
         "{:?}",
         seen.lock().unwrap()
     );
+}
+
+/// A proxy on `conn` that reads every property from the object.
+async fn proxy_on(conn: &Connection) -> OmarchyBroadcastProxy<'static> {
+    OmarchyBroadcastProxy::builder(conn)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preview_leases_by_bus_name_their_property_and_their_frames() {
+    let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    assert_eq!(proxy.interface_revision().await.unwrap(), 5);
+    assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
+    let seen = rig.record_changes().await;
+    let mut frames = proxy.receive_preview_frame().await.unwrap();
+
+    // The lease: the frame file's path, counted as a consumer.
+    let path = within("AcquirePreview", proxy.acquire_preview(15))
+        .await
+        .unwrap();
+    let want = rig
+        .paths
+        .runtime
+        .as_ref()
+        .unwrap()
+        .join("omarchy-broadcast/preview.jpg");
+    assert_eq!(std::path::PathBuf::from(&path), want);
+    assert_eq!(proxy.preview_consumers().await.unwrap(), 1);
+    assert_eq!(proxy.consumers().await.unwrap(), 1);
+    assert_eq!(rig.world().previewing(), Some(15));
+    until("PreviewConsumers=1", &seen, |s| {
+        s.iter().any(|e| e == "PreviewConsumers=1")
+    })
+    .await;
+    wait_state(&proxy, State::Active).await;
+    // The same caller again: one lease, the new rate, the same path.
+    let again = within("AcquirePreview", proxy.acquire_preview(30))
+        .await
+        .unwrap();
+    assert_eq!(again, path);
+    assert_eq!(proxy.preview_consumers().await.unwrap(), 1);
+    assert_eq!(rig.world().previewing(), Some(30));
+
+    // A bad rate: InvalidArgument, nothing changes.
+    for bad in [0, 10, 16, 60, u32::MAX] {
+        let msg = match within("AcquirePreview", proxy.acquire_preview(bad)).await {
+            Err(e @ IpcError::InvalidArgument(_)) => {
+                assert_eq!(
+                    zbus::DBusError::name(&e).as_str(),
+                    "br.com.dias.OmarchyBroadcast1.Error.InvalidArgument"
+                );
+                e.message()
+            }
+            other => panic!("{bad}: expected InvalidArgument, got {other:?}"),
+        };
+        assert!(msg.contains("15 or 30"), "{msg}");
+    }
+    assert_eq!(proxy.preview_consumers().await.unwrap(), 1);
+
+    // Frames reported by the backend's encoder become PreviewFrame.
+    rig.published.preview_frame(1);
+    rig.published.preview_frame(2);
+    for want in [1, 2] {
+        let signal = within("PreviewFrame", frames.next())
+            .await
+            .expect("PreviewFrame stream");
+        assert_eq!(signal.args().unwrap().seq, want);
+    }
+
+    // A second client takes a lease, then leaves the bus without releasing
+    // it: NameOwnerChanged ends it.
+    let other = rig.bus.as_ref().unwrap().connect().await;
+    let other_proxy = proxy_on(&other).await;
+    within("AcquirePreview", other_proxy.acquire_preview(15))
+        .await
+        .unwrap();
+    assert_eq!(proxy.preview_consumers().await.unwrap(), 2);
+    assert_eq!(proxy.consumers().await.unwrap(), 2);
+    drop(other_proxy);
+    other.close().await.unwrap();
+    until("the vanished client's lease ended", &seen, |s| {
+        s.iter().filter(|e| *e == "PreviewConsumers=1").count() == 2
+    })
+    .await;
+    assert_eq!(proxy.preview_consumers().await.unwrap(), 1);
+    assert_eq!(rig.world().previewing(), Some(30));
+
+    // Released; a release without a lease does nothing.
+    within("ReleasePreview", proxy.release_preview())
+        .await
+        .unwrap();
+    assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
+    assert_eq!(proxy.consumers().await.unwrap(), 0);
+    assert_eq!(rig.world().previewing(), None);
+    within("ReleasePreview", proxy.release_preview())
+        .await
+        .unwrap();
+    until("PreviewConsumers=0", &seen, |s| {
+        s.iter().any(|e| e == "PreviewConsumers=0")
+    })
+    .await;
+    let leases: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.starts_with("PreviewConsumers="))
+        .cloned()
+        .collect();
+    assert_eq!(
+        leases,
+        [
+            "PreviewConsumers=1",
+            "PreviewConsumers=2",
+            "PreviewConsumers=1",
+            "PreviewConsumers=0"
+        ]
+    );
+}
+
+/// The check that a caller is still on the bus once its lease is recorded
+/// (a caller gone before would leak it): a name with no owner is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_caller_gone_before_its_lease_was_recorded_is_seen_as_gone() {
+    let rig = Rig::on_bus("", |_| {}).await;
+    let me = rig.client.unique_name().unwrap().to_string();
+    assert!(still_there(&rig._server, &me).await);
+    let other = rig.bus.as_ref().unwrap().connect().await;
+    let gone = other.unique_name().unwrap().to_string();
+    other.close().await.unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    while still_there(&rig._server, &gone).await {
+        assert!(Instant::now() < deadline, "{gone} still has an owner");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!still_there(&rig._server, ":1.999999").await);
+    assert!(!still_there(&rig._server, "not a name").await);
+}
+
+/// A caller that sends `AcquirePreview` without waiting for the reply and
+/// leaves the bus at once holds no lease, however late the call is
+/// served: here the object is held until the caller's departure has
+/// reached the controller (no lease to end yet), so only the check made
+/// once the lease is recorded can end it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_caller_gone_before_its_lease_was_recorded_leaves_no_lease() {
+    let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    let seen = rig.record_changes().await;
+    // While this guard is held, no call to the object is served.
+    let iface = rig
+        ._server
+        .object_server()
+        .interface::<_, Server>(OBJECT_PATH)
+        .await
+        .unwrap();
+    let held = iface.get_mut().await;
+
+    let other = rig.bus.as_ref().unwrap().connect().await;
+    let gone = other.unique_name().unwrap().to_string();
+    let other_proxy = proxy_on(&other).await;
+    other_proxy
+        .inner()
+        .call_with_flags::<_, _, ()>(
+            "AcquirePreview",
+            zbus::proxy::MethodFlags::NO_REPLY_EXPECTED,
+            &(15u32,),
+        )
+        .await
+        .unwrap();
+    drop(other_proxy);
+    other.close().await.unwrap();
+    // The bus has seen it leave, so the daemon's connection has its
+    // NameOwnerChanged; the owner watch hands it to the controller, which
+    // has handled it once a later command comes back.
+    let deadline = Instant::now() + TIMEOUT;
+    while still_there(&rig._server, &gone).await {
+        assert!(Instant::now() < deadline, "{gone} still has an owner");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    rig.commands
+        .send(Command::ReleasePreview(":0.0".into(), tx))
+        .unwrap();
+    within("the controller", rx).await.unwrap().unwrap();
+
+    // Served now: the lease is recorded, then ended.
+    drop(held);
+    until("the lease recorded, then ended", &seen, |s| {
+        let leases: Vec<&String> = s
+            .iter()
+            .filter(|e| e.starts_with("PreviewConsumers="))
+            .collect();
+        leases == ["PreviewConsumers=1", "PreviewConsumers=0"]
+    })
+    .await;
+    assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
+    assert_eq!(rig.world().preview_sets, [Some(15), None]);
+    assert_eq!(rig.world().previewing(), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_needs_a_sender_and_a_runtime_directory() {
+    // Peer to peer: no bus, so no sender to key a lease by.
+    let rig = Rig::new("", |_| {}).await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    match within("AcquirePreview", proxy.acquire_preview(15)).await {
+        Err(e @ IpcError::Failed(_)) => {
+            assert_eq!(
+                e.message(),
+                "the call has no sender: a preview lease needs a bus connection, which names \
+                 its holder"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
+    assert!(rig.world().preview_sets.is_empty());
+
+    // On a bus, with the runtime directory gone: Failed, no lease.
+    let rig = Rig::on_bus("", |_| {}).await;
+    fs::remove_dir(rig.paths.runtime.as_ref().unwrap()).unwrap();
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    match within("AcquirePreview", proxy.acquire_preview(30)).await {
+        Err(e @ IpcError::Failed(_)) => {
+            assert_eq!(
+                zbus::DBusError::name(&e).as_str(),
+                "br.com.dias.OmarchyBroadcast1.Error.Failed"
+            );
+            assert!(e.message().contains("preview directory"), "{e:?}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
 }

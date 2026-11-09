@@ -40,7 +40,9 @@ impl H {
         let paths = Paths {
             config: dir.path().join("config.toml"),
             state: dir.path().join("state").join("state.toml"),
+            runtime: Some(dir.path().join("run")),
         };
+        fs::create_dir(dir.path().join("run")).unwrap();
         if !config.is_empty() {
             fs::write(&paths.config, config).unwrap();
         }
@@ -138,6 +140,7 @@ impl H {
             match n {
                 Note::Changed(c) => changes.extend(c),
                 Note::Stats(s) => stats.push(s),
+                Note::PreviewFrame(_) => {}
             }
         }
         (changes, stats)
@@ -211,6 +214,7 @@ fn disabled_in_the_state_file_starts_off_with_the_writer_running() {
     let paths = Paths {
         config: dir.path().join("none.toml"),
         state,
+        runtime: None,
     };
     let fake = FakeBackend::default();
     fake.world().cameras = vec![alpha()];
@@ -942,6 +946,7 @@ fn every_transition_of_the_lifecycle_is_announced_in_order() {
             Change::Denoise(b) => format!("denoise={b}"),
             Change::LoopbackConsumers(n) => format!("loopback={n}"),
             Change::PipeWireConsumers(n) => format!("pipewire={n}"),
+            Change::PreviewConsumers(n) => format!("preview={n}"),
             Change::PipeWireOutput(s) => format!("pipewire_output={s}"),
         })
         .collect();
@@ -977,6 +982,7 @@ fn diff_lists_state_last() {
     let a = preliminary_snapshot(&Paths {
         config: "/nonexistent/c.toml".into(),
         state: "/nonexistent/s.toml".into(),
+        runtime: None,
     });
     let mut b = a.clone();
     b.state = State::Active;
@@ -3345,4 +3351,277 @@ fn a_session_stop_that_failed_with_every_pipeline_at_null_still_parks() {
         "{}",
         warned[0].1
     );
+}
+
+// ---- the live preview's leases (interface revision 5) ----
+
+impl H {
+    fn acquire(&mut self, name: &str, fps: u32, ms: u64) -> Result<String, IpcError> {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let now = self.at(ms);
+        assert!(self.ctrl.handle(
+            Command::AcquirePreview {
+                name: name.into(),
+                fps,
+                reply: tx,
+            },
+            now
+        ));
+        rx.try_recv()
+            .expect("the controller replies before returning")
+    }
+
+    fn release(&mut self, name: &str, ms: u64) {
+        let name = name.to_string();
+        self.call(|r| Command::ReleasePreview(name, r), ms).unwrap();
+    }
+
+    fn gone(&mut self, name: &str, ms: u64) {
+        let now = self.at(ms);
+        assert!(
+            self.ctrl
+                .handle(Command::PreviewOwnerGone(name.into()), now)
+        );
+    }
+
+    /// `(PreviewConsumers, Consumers)`.
+    fn leases(&self) -> (u32, u32) {
+        let s = self.snap();
+        (s.preview_consumers, s.consumers)
+    }
+
+    fn preview_dir(&self) -> PathBuf {
+        self.paths
+            .runtime
+            .clone()
+            .unwrap()
+            .join("omarchy-broadcast")
+    }
+}
+
+#[test]
+fn a_preview_lease_alone_starts_the_session_after_the_debounce_and_its_end_parks_after_the_grace() {
+    let mut h = H::new("", |_| {});
+    let path = h.acquire(":1.42", 15, 0).unwrap();
+    assert_eq!(
+        PathBuf::from(&path),
+        h.preview_dir().join("preview.jpg"),
+        "the frame file's absolute path"
+    );
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(h.preview_dir()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o700, "a private directory");
+    }
+    assert_eq!(h.leases(), (1, 1));
+    assert_eq!(h.world().previewing(), Some(15), "encoded from the writer");
+    assert_eq!(h.state(), State::Idle, "the start debounce first");
+    assert_eq!(h.ctrl.next_wakeup(h.at(0)), Duration::from_millis(300));
+    h.tick(299);
+    assert_eq!(h.state(), State::Idle);
+    h.tick(300);
+    assert_eq!(h.state(), State::Active, "a lease is a consumer");
+    let (changes, _) = h.drain();
+    assert!(
+        changes.contains(&Change::PreviewConsumers(1)),
+        "{changes:?}"
+    );
+    assert!(changes.contains(&Change::Consumers(1)), "{changes:?}");
+    assert!(
+        !changes
+            .iter()
+            .any(|c| matches!(c, Change::LoopbackConsumers(_))),
+        "{changes:?}"
+    );
+
+    // Released: no consumer; the grace runs, then idle with the GPU parked.
+    h.release(":1.42", 1000);
+    assert_eq!(h.leases(), (0, 0));
+    assert_eq!(h.world().previewing(), None, "the encoder stopped");
+    assert_eq!(h.world().preview_sets, [Some(15), None]);
+    h.tick(5999);
+    assert_eq!(h.state(), State::Active, "the grace period");
+    h.tick(6000);
+    assert_eq!(h.state(), State::Idle);
+    let w = h.world();
+    assert!(w.session.is_none());
+    assert!(w.parked, "the GPU parked at idle, as for any consumer");
+    assert_eq!((w.parks, w.session_starts, w.session_stops), (1, 1, 1));
+    assert!(w.writer.is_some());
+}
+
+#[test]
+fn one_lease_per_name_at_its_latest_rate_and_the_highest_rate_of_two_holders() {
+    let mut h = H::new("", |_| {});
+    let a = h.acquire(":1.1", 15, 0).unwrap();
+    let again = h.acquire(":1.1", 30, 10).unwrap();
+    assert_eq!(a, again, "the same path");
+    assert_eq!(h.leases(), (1, 1), "one lease");
+    assert_eq!(h.world().previewing(), Some(30), "at the new rate");
+    h.acquire(":1.1", 15, 20).unwrap();
+    assert_eq!(h.world().previewing(), Some(15));
+    h.acquire(":1.2", 30, 30).unwrap();
+    assert_eq!(h.leases(), (2, 2));
+    assert_eq!(h.world().previewing(), Some(30), "the higher rate held");
+    h.release(":1.2", 40);
+    assert_eq!(h.leases(), (1, 1));
+    assert_eq!(h.world().previewing(), Some(15));
+    // The backend is asked again only when the rate or the set changed.
+    assert_eq!(
+        h.world().preview_sets,
+        [Some(15), Some(30), Some(15), Some(30), Some(15)]
+    );
+    h.acquire(":1.1", 15, 50).unwrap();
+    assert_eq!(h.world().preview_sets.len(), 5, "nothing changed");
+    h.release(":1.1", 60);
+    assert_eq!(h.leases(), (0, 0));
+    assert_eq!(h.world().preview_sets.last(), Some(&None));
+}
+
+#[test]
+fn a_bad_rate_is_refused_and_a_release_without_a_lease_does_nothing() {
+    let mut h = H::new("", |_| {});
+    for fps in [0, 10, 16, 60, u32::MAX] {
+        match h.acquire(":1.5", fps, 0) {
+            Err(IpcError::InvalidArgument(m)) => {
+                assert!(m.contains("15 or 30"), "{fps}: {m}");
+            }
+            other => panic!("{fps}: expected InvalidArgument, got {other:?}"),
+        }
+    }
+    assert_eq!(h.leases(), (0, 0));
+    assert!(h.world().preview_sets.is_empty(), "the backend never asked");
+    h.drain();
+    h.release(":1.5", 10);
+    h.gone(":1.5", 20);
+    assert_eq!(h.leases(), (0, 0));
+    assert!(h.drain().0.is_empty(), "nothing announced");
+    assert!(h.world().preview_sets.is_empty());
+    // A lease at 15 or 30 is granted.
+    h.acquire(":1.5", 15, 30).unwrap();
+    h.release(":1.5", 40);
+    h.acquire(":1.5", 30, 50).unwrap();
+    assert_eq!(h.leases(), (1, 1));
+}
+
+#[test]
+fn a_holder_that_left_the_bus_loses_its_lease_and_others_keep_theirs() {
+    let mut h = H::new(
+        "[lifecycle]\nstart_debounce_ms = 0\nidle_grace_s = 0\n",
+        |_| {},
+    );
+    h.acquire(":1.7", 30, 0).unwrap();
+    h.acquire(":1.8", 15, 0).unwrap();
+    assert_eq!(h.state(), State::Active);
+    h.gone(":1.7", 100);
+    assert_eq!(h.leases(), (1, 1));
+    assert_eq!(h.world().previewing(), Some(15));
+    assert_eq!(h.state(), State::Active);
+    // Another name leaving changes nothing.
+    h.drain();
+    h.gone(":1.99", 150);
+    assert!(h.drain().0.is_empty());
+    h.gone(":1.8", 200);
+    assert_eq!(h.leases(), (0, 0));
+    assert_eq!(h.world().previewing(), None);
+    assert_eq!(h.state(), State::Idle, "no grace configured");
+}
+
+#[test]
+fn preview_leases_add_to_the_other_consumers() {
+    let mut h = H::new("", |_| {});
+    h.activate(0);
+    h.acquire(":1.3", 15, 500).unwrap();
+    let s = h.snap();
+    assert_eq!(
+        (s.consumers, s.loopback_consumers, s.preview_consumers),
+        (2, 1, 1)
+    );
+    // The application leaves; the lease keeps the session, past the grace.
+    h.consumers(0, 1000);
+    assert_eq!(h.leases(), (1, 1));
+    h.tick(10_000);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().session_starts, 1);
+    h.release(":1.3", 11_000);
+    h.tick(16_000);
+    assert_eq!(h.state(), State::Idle);
+}
+
+#[test]
+fn a_lease_is_granted_while_off_and_the_placeholder_is_encoded_without_a_camera() {
+    let mut h = H::new("", |_| {});
+    h.call(|r| Command::SetEnabled(false, r), 0).unwrap();
+    h.acquire(":1.4", 15, 10).unwrap();
+    h.tick(1000);
+    assert_eq!(h.state(), State::Off);
+    assert_eq!(h.leases(), (1, 1));
+    assert_eq!(
+        h.world().previewing(),
+        Some(15),
+        "the writer's black frames"
+    );
+    assert_eq!(h.world().session_starts, 0, "the camera stays closed");
+}
+
+#[test]
+fn without_a_runtime_directory_a_lease_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    for runtime in [None, Some(PathBuf::from("relative/run"))] {
+        let paths = Paths {
+            config: dir.path().join("none.toml"),
+            state: dir.path().join("state.toml"),
+            runtime,
+        };
+        let fake = FakeBackend::default();
+        let (published, _notes) = Published::new(preliminary_snapshot(&paths));
+        let mut ctrl = Controller::new(fake.clone(), paths, published, None, Instant::now());
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        ctrl.handle(
+            Command::AcquirePreview {
+                name: ":1.1".into(),
+                fps: 15,
+                reply: tx,
+            },
+            Instant::now(),
+        );
+        match rx.try_recv().unwrap() {
+            Err(IpcError::Failed(m)) => assert!(m.contains("XDG_RUNTIME_DIR"), "{m}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(ctrl.snapshot().preview_consumers, 0);
+        assert!(fake.world().preview_sets.is_empty());
+    }
+}
+
+#[test]
+fn the_writer_rebuild_waits_for_the_leases_and_the_new_writer_is_previewed() {
+    let mut h = H::new(
+        "[lifecycle]\nstart_debounce_ms = 0\nidle_grace_s = 0\n",
+        |_| {},
+    );
+    h.call(|r| Command::SetEnabled(false, r), 0).unwrap();
+    h.acquire(":1.6", 15, 0).unwrap();
+    h.reload("[output]\nmode = \"1280x720@30\"\n", 100).unwrap();
+    h.tick(5000);
+    assert_eq!(h.world().writer_starts, 1, "a lease is a consumer");
+    h.release(":1.6", 6000);
+    assert_eq!(h.world().writer_starts, 2);
+    // A lease taken after the rebuild is encoded from the new writer.
+    h.acquire(":1.6", 15, 7000).unwrap();
+    let w = h.world();
+    assert_eq!(w.writer.as_ref().unwrap().1.width, 1280);
+    assert_eq!(w.previewing(), Some(15));
+}
+
+#[test]
+fn shutdown_ends_every_lease() {
+    let mut h = H::new("", |_| {});
+    h.acquire(":1.1", 15, 0).unwrap();
+    h.acquire(":1.2", 30, 0).unwrap();
+    h.ctrl.shutdown();
+    let w = h.world();
+    assert_eq!(w.preview, None);
+    assert_eq!(w.preview_sets.last(), Some(&None));
+    assert!(w.writer.is_none());
 }

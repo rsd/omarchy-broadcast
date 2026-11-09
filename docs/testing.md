@@ -118,8 +118,9 @@ cargo test -p obc-ipc -p omarchy-broadcastd -p omarchy-broadcast
 - Consumer counting uses `sleep` children that hold a temporary file open: the daemon's own descriptor is excluded, counts rise and fall, inotify events trigger recounts, and the polling fallback works. Also covered: the inotify wrapper, hotplug debouncing, camera ids, ordering and selectors.
 - The D-Bus object is served over a peer-to-peer socket pair and driven through `obc_ipc::OmarchyBroadcastProxy`: every property (including `GetAll` and the introspection data), every method and error name, the `PropertiesChanged` sequence, `Stats` while active and none for 2.5 s while idle.
 - Process tests (`tests/process.rs`) run the binary on a private `dbus-daemon` (`/usr/bin/dbus-daemon` is required; without it the tests fail naming it): a second instance exits with status 3 before touching a device, no session bus gives status 1, `--help` and an unknown option behave.
+- The live preview ([ADR-0019](adr/0019-live-preview.md); see [The live preview](#the-live-preview)): in the controller (fake backend, explicit instants, a temporary runtime directory), `preview.rs` and the D-Bus object, as listed there.
 
-**`omarchy-broadcast`** (`crates/omarchy-broadcast/tests/cli.rs`, plus unit tests of the JSON and human formatting): the CLI runs against a mock daemon on a private `dbus-daemon` with its own configuration and an activation file whose command is `/bin/sh -c 'echo > marker; exit 1'`, so a failed activation is quick and visible. Both `/usr/bin/dbus-daemon` and `/bin/sh` are required. The tests cover `status`, `cameras`, `on`, `off` and `camera` in human and JSON form, exit codes (3 for a daemon that is not running or no session bus, with reads never activating the daemon), `watch --json` following changes, `Stats` and outages, waiting for the daemon to appear, a daemon that holds its name but does not answer, and `watch` exiting quietly when its reader (`| head -1`) goes away.
+**`omarchy-broadcast`** (`crates/omarchy-broadcast/tests/cli.rs`, plus unit tests of the JSON and human formatting): the CLI runs against a mock daemon on a private `dbus-daemon` with its own configuration and an activation file whose command is `/bin/sh -c 'echo > marker; exit 1'`, so a failed activation is quick and visible. Both `/usr/bin/dbus-daemon` and `/bin/sh` are required. The tests cover `status`, `cameras`, `on`, `off` and `camera` in human and JSON form, exit codes (3 for a daemon that is not running or no session bus, with reads never activating the daemon), `watch --json` following changes, `Stats` and outages, waiting for the daemon to appear, a daemon that holds its name but does not answer, and `watch` exiting quietly when its reader (`| head -1`) goes away. The `preview` command is covered in [The live preview](#the-live-preview).
 
 **`obc-ipc`** (`crates/obc-ipc/tests/mock_server.rs`): a mock server over a peer-to-peer connection checks that the proxy reads every property, calls every method, maps errors back by name, receives `Stats`, and that the no-auto-start read sees every property, carries the `NO_AUTO_START` flag at the server and reports a missing object as an error.
 
@@ -221,6 +222,48 @@ cargo test -p obc-pipeline --features pipewire --test pipewire_live -- --ignored
 OBC_TEST_SINK=/dev/video11 OBC_TEST_CAMERA=046d:0944 \
   cargo test -p omarchy-broadcastd --features pipewire --test pipewire -- --ignored --nocapture
 ```
+
+### The live preview
+
+The preview ([ADR-0019](adr/0019-live-preview.md)) has no feature flag: its tests are in the default suite, and need no camera, no GPU and no loopback device (the encoder uses `videoscale`, `videoconvert` and `jpegenc` of gst-plugins-base and gst-plugins-good). The daemon's tests give each daemon a temporary `XDG_RUNTIME_DIR`, so they never touch the user's `$XDG_RUNTIME_DIR/omarchy-broadcast`.
+
+**Encoder** (`crates/obc-pipeline/src/preview.rs`, on the CPU, with frames made in system memory):
+- the size keeps the aspect: 480 wide, the height in proportion and even (480x270 for 1920x1080);
+- the decimator by timestamp: at half the contract rate it keeps every second frame, and the writer's timing jitter does not skip one;
+- the encoder writes decimated JPEGs of the right size, each by a rename (a reader never sees a partial file), reports an increasing sequence number per frame and removes both files when it stops; the decoded JPEG keeps a bright and a dark area of the test frame apart;
+- a file in the way is replaced and a planted link is not followed (a symbolic link, a hard link; the link's target is untouched), and a planted FIFO neither blocks the encoder nor gets the frame.
+
+**Backend** (`crates/omarchy-broadcastd/src/backend/real.rs`): the writer's composed tap feeds whichever of the PipeWire output and the preview runs, in order when both do; each part of the tap outlives the other (stopping one keeps the other's frames), and a new writer gets a new encoder, with sequence numbers that keep increasing.
+
+**Daemon** (`crates/omarchy-broadcastd/src/preview.rs`, the controller tests and the D-Bus tests):
+- the leases: only 15 and 30 are accepted, one lease per bus name at its latest rate, the highest rate of the holders, a release without a lease does nothing;
+- the directory: created mode 0700, a loose mode tightened, stale files removed, a symbolic link or a file in its place refused (and nothing removed through the link), a missing or relative runtime directory refused;
+- the controller: a lease alone starts the session after the debounce and its end parks it after the grace; leases add to the loopback and PipeWire consumers in `Consumers`; a bad rate is refused; a holder that leaves the bus loses its lease while the others keep theirs; a lease is granted while `off` and the placeholder is encoded without a camera; without a runtime directory it fails; a deferred writer rebuild waits for the leases and the new writer is previewed; shutdown ends every lease;
+- the D-Bus object, on a private `dbus-daemon` (the lease needs the caller's unique name): the leases by bus name, `PreviewConsumers` and `PreviewFrame`; a caller that left before its lease was recorded is seen as gone, and one that sends `AcquirePreview` without waiting and leaves holds no lease however late the call is served; a peer-to-peer call, with no sender, and a missing runtime directory fail with `Failed`. In `obc-ipc`: the property in the snapshot, `0` from an older daemon, and the proxy's methods and signal against the mock.
+
+**CLI** (`crates/omarchy-broadcast/tests/cli.rs` and the unit tests of `json.rs`, `human.rs` and `bus.rs`), against a mock daemon that records the leases by caller and the calls that lacked `NO_AUTO_START`:
+- `preview --json` holds a lease, prints the `preview` line and the `frame` lines for the signals it receives, releases on `SIGTERM` and exits 0; the calls never start the daemon;
+- `--fps 30` is asked for, and any other value is a usage error (status 2);
+- through an outage: one `error` line, the lease asked for again when the daemon is back;
+- against an older daemon: one `unsupported-daemon` line, and the command waits;
+- it releases and exits quietly when its reader goes away, and prints `"active":false` before the error when the bus goes away;
+- a frame path too long for a line is refused (`preview-path-too-long`, the lease released);
+- the JSON lines: the exact `preview` and `frame` lines, a path at the bound carried whole and one byte more (or one whose escapes take it over the bound) refused, and `preview_consumers` in `snapshot` and `state`; the human `consumers` label with the preview leases.
+
+**Live test (ignored)**, `crates/omarchy-broadcastd/tests/preview.rs::the_preview_streams_at_the_rate_asked_and_ends_with_its_holder`: the real daemon on a private `dbus-daemon`, a real loopback, and `omarchy-broadcast preview --json` in its own process (the test builds the CLI into the same target directory; `OBC_CLI=<path>` overrides it).
+
+| Needs | |
+|---|---|
+| `OBC_TEST_SINK` | A free v4l2loopback device with `exclusive_caps=1`, for example `/dev/video11`. Required |
+| `OBC_TEST_CAMERA` | Optional. A colour camera. Without it the daemon is switched off first, so the lease opens no camera and the preview carries the writer's black placeholders; with it the lease starts the camera and the preview carries its frames. This case also needs the GPU |
+| `/usr/bin/dbus-daemon`, `cargo` | For the private bus and to build the CLI |
+
+```sh
+OBC_TEST_SINK=/dev/video11 [OBC_TEST_CAMERA=046d:0944] \
+  cargo test -p omarchy-broadcastd --test preview -- --ignored --nocapture
+```
+
+It proves, at 15 and then at 30 frames per second: the lease is announced with the frame file's path and `PreviewConsumers` is 1; the lease starts the camera (`active`), or leaves the daemon `off` without a camera; the frames arrive at the rate asked, within 20 % over at least 5 s, with strictly increasing sequence numbers; the frame file is a 480x270 JPEG of mode 0600 in a directory of mode 0700; after `SIGTERM` the CLI exits 0, `PreviewConsumers` returns to 0 and the file is gone. After that, a `kill -9` of the CLI ends its lease through the bus (`PreviewConsumers` back to 0) and removes the file. The daemon's CPU use without a lease and with each lease, and the encoder's time per frame from the daemon's debug log, are printed, not checked.
 
 ### Known limitation: one application at a time
 

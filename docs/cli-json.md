@@ -15,6 +15,7 @@
 | `omarchy-broadcast effect` | Prints the video effect, the blur strength, the background image and, from interface revision 4, noise removal (`Effect`, `BlurStrength`, `BackgroundImage`, `Denoise`). Never starts the daemon. | One `snapshot` object. |
 | `omarchy-broadcast effect none\|blur\|replace [--strength X] [--image PATH]` | Selects the video effect (`SetEffect`), then prints the resulting settings. See [Effect](#effect). | No. |
 | `omarchy-broadcast denoise on\|off` | Turns video noise removal on or off (`SetDenoise`), then prints the resulting setting. See [Noise removal](#noise-removal). | No. |
+| `omarchy-broadcast preview [--json] [--fps 15\|30]` | Holds a live preview lease on the daemon and prints a line for each frame it writes, until interrupted. See [Preview](#preview). | One object per line (NDJSON). |
 | `omarchy-broadcast watch` | Follows the daemon: a summary when it connects, then a line for each change and each `Stats` signal (about once per second while `active`), until interrupted. | One object per line (NDJSON). |
 
 The word `next` is always the `NextCamera` command; select a camera whose name contains "next" by its id or `vid:pid`. The selectors and the errors they can raise are those of `SelectCamera` in [dbus-api.md](dbus-api.md#selectcameras-selector).
@@ -64,9 +65,28 @@ Denoise:    on
 - Noise removal fails open: if the stage cannot run, the stream continues without it and the daemon's `Error` text (shown by `status`) says why. The command itself succeeds, because the setting was applied.
 - In `watch` without `--json`, the summary line gains ` | denoise on` and a change prints a `denoise: on` (or `off`) line, both from revision 4.
 
+## Preview
+
+`omarchy-broadcast preview` holds a live preview lease ([dbus-api.md](dbus-api.md#live-preview), [ADR-0019](adr/0019-live-preview.md)) and prints one line per frame the daemon writes, until it is interrupted. It is how a client that cannot speak D-Bus, such as the bar plugin, gets a preview of the virtual camera: the frames are JPEG files, and the lines say when to read them.
+
+```text
+omarchy-broadcast preview [--json] [--fps 15|30]
+```
+
+- `--fps` is the frame rate asked for, 15 (the default) or 30. Any other value is a usage error (status `2`). The daemon may write at a higher rate while another client holds a faster lease.
+- The preview counts as an application using the camera: while the command runs, the camera starts if nothing else keeps it running, and it stops after the idle grace once the command ends and no other consumer remains. It works in every state of the daemon (the frames are black while the camera is not streaming).
+- The command never starts the daemon: every call carries `NO_AUTO_START`. It subscribes to the frame signal before it takes the lease, so no frame is missed.
+- Without `--json`, the lines are for people and may change: `preview: <path> at 15 fps` when the lease is held, `frame <seq>` for each frame, `preview: stopped` when the lease is lost, and the outage message followed by `; waiting for it`.
+- Frames and lease are reported as described in [`preview` and `frame`](#preview-and-frame) below. The path is of the daemon's frame file, `$XDG_RUNTIME_DIR/omarchy-broadcast/preview.jpg`. A client opens it when a `frame` line arrives; each frame replaces the file by a rename, so a read never sees a partial frame.
+- **Outages** are handled like `watch` handles them: one `error` line per outage with the usual codes, the daemon's return noticed at once from `NameOwnerChanged` and re-checked every 2 s, and the lease taken again when the daemon is back (a new `preview` line with `"active":true`). A lease that ended because the daemon or the bus went away is announced with `"active":false` first, then the error line.
+- A daemon below interface revision 5 has no preview: one `error` line with the code `unsupported-daemon` is printed, and the command keeps waiting for another daemon instance to take the name.
+- A daemon whose frame path does not fit a JSON line (see [Line length](#general-rules)) is refused: the command releases the lease and prints one `error` line with the code `preview-path-too-long`, then waits for another daemon instance. Shorten the `XDG_RUNTIME_DIR` of the daemon. The path is never clipped, because a clipped path names no file.
+- **Ending.** The command exits with status `0`, after it releases the lease (best effort, within 1 s), on `SIGTERM`, `SIGINT`, `SIGHUP`, `SIGPIPE`, or stdout reporting an error or hang-up. After `kill -9`, or any other end of the process, the lease ends with its bus connection and the daemon releases it. A failed write to stdout other than a closed pipe exits with status `4`.
+- Once started, `preview` keeps waiting through outages: it exits only for the reasons above, never because the daemon is absent.
+
 ## Starting the daemon
 
-- `status`, `cameras`, `watch` and `effect` without an effect never start the daemon. They read the properties with `org.freedesktop.DBus.Properties.GetAll` carrying the `NO_AUTO_START` flag, so looking at the daemon never launches it. This is the read that the `obc-ipc` crate provides to Rust clients (`Snapshot::fetch_no_autostart`); [dbus-api.md](dbus-api.md#service-presence-and-activation) gives the `busctl` and `gdbus` equivalents.
+- `status`, `cameras`, `watch`, `preview` and `effect` without an effect never start the daemon. They read the properties with `org.freedesktop.DBus.Properties.GetAll` carrying the `NO_AUTO_START` flag, so looking at the daemon never launches it. This is the read that the `obc-ipc` crate provides to Rust clients (`Snapshot::fetch_no_autostart`); [dbus-api.md](dbus-api.md#service-presence-and-activation) gives the `busctl` and `gdbus` equivalents.
 - `on`, `off`, `camera`, `effect <effect>` and `denoise` call methods without that flag: when the D-Bus activation file `br.com.dias.OmarchyBroadcast.service` is installed, the call starts the daemon, as `systemctl --user start omarchy-broadcastd` would. `off` on a stopped daemon therefore starts it and records the privacy state, which persists across restarts. Without an activation file, or if the start fails, the command reports that the daemon is not running.
 
 When the daemon is not running, the human-readable commands print one line to stderr, for example:
@@ -79,7 +99,7 @@ omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.O
 
 | Status | Meaning |
 |---|---|
-| `0` | Success. Also the status of `watch` when it ends on `SIGTERM`, `SIGINT`, `SIGPIPE` or a closed stdout. |
+| `0` | Success. Also the status of `watch` when it ends on `SIGTERM`, `SIGINT`, `SIGPIPE` or a closed stdout, and of `preview` when it ends on `SIGTERM`, `SIGINT`, `SIGHUP`, `SIGPIPE` or a closed stdout. |
 | `1` | The daemon rejected the request: one of the `br.com.dias.OmarchyBroadcast1.Error` errors (`NoSuchCamera`, `InvalidConfig`, `Unavailable`, `InvalidArgument`, `Failed`), or the daemon does not support the request (`effect` against interface revision 1, `denoise` against a revision below 4). Its message is printed to stderr. |
 | `2` | Invalid command line. |
 | `3` | The daemon is not running (its name has no owner, or D-Bus could not start it), or there is no D-Bus session bus. |
@@ -92,7 +112,7 @@ omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.O
 ### General rules
 
 - Every object is printed on one line, terminated by `\n`, in UTF-8. `watch --json` flushes stdout after every line.
-- Every object has the field **`v`**, the schema version (an integer, `1` in this version), and the field **`type`**, a string naming the line type: `snapshot`, `state`, `cameras`, `stats` or `error`.
+- Every object has the field **`v`**, the schema version (an integer, `1` in this version), and the field **`type`**, a string naming the line type: `snapshot`, `state`, `cameras`, `stats`, `preview`, `frame` or `error`.
 - The order of the fields within an object is not significant.
 - A client must ignore fields it does not know, and lines whose `type` it does not know.
 - **Line length.** No line is longer than **4096 bytes**, newline excluded. To guarantee it, strings are bounded in bytes of their JSON encoding (escapes included). A longer string is cut at a character boundary and ends with the ellipsis character `…` (U+2026); the result is always valid JSON. The bounds:
@@ -127,9 +147,10 @@ Every property of the daemon at one moment. Printed by `status --json`, and by `
 | `error` | string | Text of the latest error, from the lifecycle or a configuration reload; `""` if none. Can be non-empty in any state: a rejected configuration reload sets it while the state stays as it was. |
 | `active_camera` | string | Id of the camera that streams, or would stream if an application opened the virtual camera now; `""` if none. |
 | `active_camera_name` | string | Name of that camera; `""` if there is none or it is not in the camera list. |
-| `consumers` | number | Number of consumers of the virtual camera: the processes holding the loopback plus the links to the PipeWire node (integer, 0 or more). With the PipeWire output off, only the former. |
+| `consumers` | number | Number of consumers of the virtual camera: the processes holding the loopback plus the links to the PipeWire node plus the preview leases (integer, 0 or more). With the PipeWire output off and no preview lease, only the first. |
 | `loopback_consumers` | number | Number of processes, other than the daemon, holding the loopback device open (integer, 0 or more). From a daemon of interface revision 2 or lower, the value of `consumers`. |
 | `pipewire_consumers` | number | Number of links to the PipeWire output's node (integer, 0 or more); `0` when the output is off or the daemon is older than revision 3. |
+| `preview_consumers` | number | Number of preview leases held (integer, 0 or more); `0` from a daemon older than revision 5. |
 | `pipewire_output` | string | State of the optional PipeWire output: `"off"`, `"unsupported"`, `"connecting"`, `"ready"`, `"streaming"` or `"failed"` (see [dbus-api.md](dbus-api.md#properties)); `"off"` from a daemon older than revision 3. Bounded to 32 bytes and clipped at its end, like the other bounded strings (see above). |
 | `output_mode` | string | What the virtual camera delivers, e.g. `"NV12 1920x1080@30"`. |
 | `effect` | string | The video effect in force: `"none"`, `"blur"` or `"replace"`. The effective value; it does not say whether the effect is ready or has failed (see `state` and `error`). |
@@ -156,8 +177,8 @@ Printed by `watch --json` when one or more of the scalar fields change. It carri
 | Field | JSON type | Meaning |
 |---|---|---|
 | `v`, `type` | | `1`, `"state"`. |
-| `changed` | array of strings | The fields whose value changed, from: `state`, `enabled`, `error`, `active_camera`, `active_camera_name`, `consumers`, `loopback_consumers`, `pipewire_consumers`, `pipewire_output`, `output_mode`, `effect`, `blur_strength`, `background_image`, `denoise`, `interface_revision`. Never empty. |
-| `state`, `enabled`, `error`, `active_camera`, `active_camera_name`, `consumers`, `loopback_consumers`, `pipewire_consumers`, `pipewire_output`, `output_mode`, `effect`, `blur_strength`, `background_image`, `denoise`, `interface_revision` | | As in `snapshot`, current values. |
+| `changed` | array of strings | The fields whose value changed, from: `state`, `enabled`, `error`, `active_camera`, `active_camera_name`, `consumers`, `loopback_consumers`, `pipewire_consumers`, `preview_consumers`, `pipewire_output`, `output_mode`, `effect`, `blur_strength`, `background_image`, `denoise`, `interface_revision`. Never empty. |
+| `state`, `enabled`, `error`, `active_camera`, `active_camera_name`, `consumers`, `loopback_consumers`, `pipewire_consumers`, `preview_consumers`, `pipewire_output`, `output_mode`, `effect`, `blur_strength`, `background_image`, `denoise`, `interface_revision` | | As in `snapshot`, current values. |
 
 A `state` line does not carry the camera list. `active_camera_name` can change without `active_camera` (the active camera was renamed, or appeared in or left the list); it is then reported in `changed` on its own.
 
@@ -188,12 +209,35 @@ One `Stats` signal of the daemon, printed by `watch --json`. The daemon sends it
 
 A value that cannot be measured is **`-1`**: show it as unknown, not as zero. Every number is either `-1` or a finite value of 0 or more; they are JSON numbers with a fractional part, e.g. `30.0`.
 
+### `preview` and `frame`
+
+Printed by `preview --json` only.
+
+A **`preview`** line says whether the lease is held:
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `v`, `type` | | `1`, `"preview"`. |
+| `active` | boolean | `true` once the lease is held; `false` when it is lost (the daemon or the session bus went away). |
+| `fps` | number | The frame rate asked for, 15 or 30. Only with `"active":true`. |
+| `path` | string | Absolute path of the frame file. Only with `"active":true`. |
+
+A **`frame`** line says the file was replaced:
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `v`, `type` | | `1`, `"frame"`. |
+| `seq` | number | The frame's sequence number (integer), strictly increasing within a daemon run, from 1. |
+| `path` | string | Absolute path of the frame file, as in `preview`. |
+
+The `path` of these two lines is never clipped, unlike the other strings (see [General rules](#general-rules)): a client opens that file, and a clipped path names none. Its bound is 3968 bytes of JSON encoding, so that the lines stay within the 4096-byte cap; a daemon that reports a longer path is refused with the code `preview-path-too-long` (see [`error`](#error)). Real paths, under `$XDG_RUNTIME_DIR`, are far shorter.
+
 ### `error`
 
 | Field | JSON type | Meaning |
 |---|---|---|
 | `v`, `type` | | `1`, `"error"`. |
-| `code` | string | `"daemon-not-running"`: the daemon is not running, or there is no D-Bus session bus. `"dbus-error"`: any other failure to talk to the daemon (an unexpected reply, a lost connection, a timeout). New codes may be added; treat an unknown code like `"dbus-error"`. |
+| `code` | string | `"daemon-not-running"`: the daemon is not running, or there is no D-Bus session bus. `"dbus-error"`: any other failure to talk to the daemon (an unexpected reply, a lost connection, a timeout). `"unsupported-daemon"`: the daemon is too old for the request (`preview` needs interface revision 5); printed by `preview --json` only. `"preview-path-too-long"`: the daemon's frame path does not fit a line; printed by `preview --json` only. New codes may be added; treat an unknown code like `"dbus-error"`. |
 | `error` | string | A one-line explanation for people. Match on `code`, never on this text. |
 
 `status --json` and `cameras --json` print an `error` object instead of their usual one when they fail to read the daemon, and exit with the status of the failure (`3` or `4`).
@@ -224,16 +268,28 @@ A client should treat the state after a `daemon-not-running` line as "daemon not
 - `SIGPIPE`, or `EPIPE` on a write to stdout;
 - stdout reporting an error or hang-up: when stdout is a pipe whose reader has gone, `watch` exits at once, even if it has nothing to print. `omarchy-broadcast watch --json | head -1` ends as soon as `head` does.
 
+## `preview --json`
+
+The output is a stream of `preview`, `frame` and `error` lines:
+
+1. Nothing until the lease is held (or the attempt fails). Then a `preview` line with `"active":true`, the rate and the path.
+2. A `frame` line per frame the daemon writes, as the signals arrive.
+3. When the lease is lost, a `preview` line with `"active":false`. When the daemon is back, a new lease and a new `"active":true` line.
+4. An `error` line for each outage, once (see [Preview](#preview)).
+
+A client treats `"active":false`, and any `error` line, as "no frames now", and keeps the last frame only if it wants to. It does not need to reconnect: the command does.
+
 ## Versioning
 
 - `v` is the schema version of every line. It is `1` in this version.
 - **`v` stays 1 for the effect fields.** `blur_strength` and `background_image` are new fields in existing line types, `effect` now takes the values `blur` and `replace` in addition to `none`, and `changed` may name the two new fields. None of this removes or renames a field or changes the type or meaning of one, so it is not breaking under the rule below. The set of `state` strings is unchanged. A client written for the earlier version keeps working: it ignores the new fields and shows an `effect` string it does not know as text.
 - **`v` stays 1 for the PipeWire fields.** `loopback_consumers`, `pipewire_consumers` and `pipewire_output` are new fields in existing line types, and `changed` may name them. `consumers` keeps its type; with the PipeWire output off it has the value it had before. Against a daemon of interface revision 2 or lower the fields are still printed, with the values of a daemon that has no PipeWire output (`loopback_consumers` equal to `consumers`, `pipewire_consumers` 0, `pipewire_output` `"off"`).
 - **`v` stays 1 for `denoise`.** It is a new field in the existing `snapshot` and `state` lines, and `changed` may name it. It differs from the earlier additions in one respect: against a daemon of interface revision 3 or lower the key is still printed, but its value is `null`, not a default, because "off" would claim a setting the daemon does not have. A client that treats a missing or `null` value as "not available" is correct for both. `true` and `false` mean the daemon reports the setting.
+- **`v` stays 1 for the preview.** `preview_consumers` is a new field in the existing `snapshot` and `state` lines, and `changed` may name it; `consumers` keeps its type, and with no preview lease held it has the value it had before. Against a daemon of interface revision 4 or lower the key is still printed, with the value `0`, as for the PipeWire fields. `preview` and `frame` are new line types printed by a new command, and `unsupported-daemon` and `preview-path-too-long` are new `error` codes; a client written for the earlier version never sees them, as it never runs `preview`.
 - A **breaking change** raises `v`: a removed or renamed field or line type, a changed JSON type or meaning, a new state string, or a change to the rules above (line cap, outage behaviour).
 - **Not breaking**, made without raising `v`: a new field in an existing line type, a new line type, a new `error` code. Clients ignore what they do not know.
 - The schema is independent of the D-Bus `InterfaceRevision`; a new D-Bus property may appear as a new field.
-- **Capability rules for clients.** A client that shows the split of the consumers does so only while `pipewire_output` is not `"off"`. A client offers the effect controls only if both hold: the CLI is new enough to print `blur_strength` (the field is present as a number in `snapshot`; an older CLI has no `effect` command, and `omarchy-broadcast effect` fails with status `2`), and the daemon's `interface_revision` is 2 or more. Offer the noise-removal switch only if `denoise` is a boolean and `interface_revision` is 4 or more. Check the CLI first, then the daemon; the two conditions have different remedies (update `omarchy-broadcast`, update `omarchy-broadcastd`). When the field is absent or the revision is lower, show the effect, if at all, as read-only text.
+- **Capability rules for clients.** A client that shows the split of the consumers does so only while `pipewire_output` is not `"off"`. A client offers the effect controls only if both hold: the CLI is new enough to print `blur_strength` (the field is present as a number in `snapshot`; an older CLI has no `effect` command, and `omarchy-broadcast effect` fails with status `2`), and the daemon's `interface_revision` is 2 or more. Offer the noise-removal switch only if `denoise` is a boolean and `interface_revision` is 4 or more. Offer the preview only if the CLI has the `preview` command (an older CLI exits with status `2`) and the daemon's `interface_revision` is 5 or more; `preview --json` reports the second condition itself, with `unsupported-daemon`. Check the CLI first, then the daemon; the two conditions have different remedies (update `omarchy-broadcast`, update `omarchy-broadcastd`). When the field is absent or the revision is lower, show the effect, if at all, as read-only text.
 
 ## Examples
 
@@ -278,6 +334,23 @@ Read the current state once from a shell script:
 state=$(omarchy-broadcast status --json | jq -r 'if .type == "snapshot" then .state else "unavailable" end')
 ```
 
+A `preview --json` session at 15 fps: the lease is taken, three frames follow, the daemon exits (the lease is lost with it), and the next daemon instance is previewed.
+
+```sh
+omarchy-broadcast preview --json
+```
+
+```json
+{"v":1,"type":"preview","active":true,"fps":15,"path":"/run/user/1000/omarchy-broadcast/preview.jpg"}
+{"v":1,"type":"frame","seq":1,"path":"/run/user/1000/omarchy-broadcast/preview.jpg"}
+{"v":1,"type":"frame","seq":2,"path":"/run/user/1000/omarchy-broadcast/preview.jpg"}
+{"v":1,"type":"frame","seq":3,"path":"/run/user/1000/omarchy-broadcast/preview.jpg"}
+{"v":1,"type":"preview","active":false}
+{"v":1,"type":"error","code":"daemon-not-running","error":"omarchy-broadcastd is not running (no owner for br.com.dias.OmarchyBroadcast on the session bus); start it with: systemctl --user start omarchy-broadcastd"}
+{"v":1,"type":"preview","active":true,"fps":15,"path":"/run/user/1000/omarchy-broadcast/preview.jpg"}
+{"v":1,"type":"frame","seq":1,"path":"/run/user/1000/omarchy-broadcast/preview.jpg"}
+```
+
 ## Writing a client
 
 - Run `omarchy-broadcast watch --json` as a long-lived child process and read its stdout line by line. Do not poll `status --json`.
@@ -285,4 +358,5 @@ state=$(omarchy-broadcast status --json | jq -r 'if .type == "snapshot" then .st
 - Clear the stats display when `state` leaves `active`: no `stats` line arrives in other states.
 - Show `error` whenever it is non-empty, whatever the state.
 - To stop, send `SIGTERM` or close the pipe.
+- To show the live preview, run `omarchy-broadcast preview --json` as a second long-lived child process next to `watch`, and only while the user wants the preview: it keeps the camera running. Open the `path` of each `frame` line (or reload the image from it) and keep the lease for as long as the preview is shown; stop the process to end it. The frame file is replaced by a rename, so a reader never sees a partial image.
 - Control the daemon by running `omarchy-broadcast on`, `off`, `camera next`, `camera <id>`, `effect <effect>` or `denoise on|off`, and check the exit status; the resulting change arrives on the `watch` stream.

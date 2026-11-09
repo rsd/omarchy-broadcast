@@ -50,9 +50,20 @@
 //! reports [`PipeWireState::Failed`] and the loopback runs alone. Built
 //! without the feature (the default), asked for it, the backend reports
 //! [`PipeWireState::Unsupported`] and the loopback runs alone.
+//!
+//! The live preview ([`MediaBackend::set_preview`]) is an
+//! [`obc_pipeline::PreviewEncoder`] fed by the same tap: the writer has one
+//! tap slot, so the backend installs one composed tap that hands every
+//! frame to the PipeWire output and to the encoder, whichever of them
+//! runs, and installs it anew whenever one of them starts or stops (the
+//! other keeps its frames). The encoder runs while a preview is asked for
+//! and a writer runs; a new writer (a new contract) gets a new encoder.
+//! Its frames' sequence numbers come from one counter for the backend's
+//! life, so they keep increasing across encoders. It makes no CUDA call.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::{Duration, Instant};
 
 use gst::prelude::*;
@@ -63,16 +74,16 @@ use obc_pipeline::gpu::GpuSampler;
 use obc_pipeline::pipeline::names;
 use obc_pipeline::stats::{cpu_usage, online_cpus, self_cpu_ticks, ticks_per_sec};
 use obc_pipeline::{
-    DiscoveryRoute, EffectFallback, EffectKind, EffectSettings, IngestConfig, LiveStats,
-    LoopbackWriter, Output, OutputConfig, OutputSink, PipelineError, Session, StopError,
-    WriterCounts, WriterHandle, WriterSink, choose_mode, effect_backend_available, list_cameras,
-    scan_sysfs, select_sink,
+    DiscoveryRoute, EffectFallback, EffectKind, EffectSettings, FrameTap, IngestConfig, LiveStats,
+    LoopbackWriter, Output, OutputConfig, OutputSink, PipelineError, PreviewConfig, PreviewEncoder,
+    Session, StopError, WriterCounts, WriterHandle, WriterSink, choose_mode,
+    effect_backend_available, list_cameras, scan_sysfs, select_sink,
 };
 
 use super::park::{Parker, StartError, StopFailure, StopSession};
 use super::{
     EffectReport, EffectStatus, Failure, MediaBackend, PipeWireEvent, PipeWireGeneration,
-    PipeWireReporter, PipeWireState, SessionParams,
+    PipeWireReporter, PipeWireState, PreviewReporter, PreviewRequest, SessionParams,
 };
 use crate::camera::{Camera, stable_id, usb_origin};
 use crate::consumers::{NodeId, count_holders};
@@ -187,12 +198,42 @@ pub struct GstBackend {
     /// The PipeWire output fed by the running writer's tap.
     #[cfg(feature = "pipewire")]
     output: Option<obc_pipeline::pipewire::PipeWireOutput>,
+    /// The PipeWire output's part of the writer's tap.
+    pipewire_tap: Option<FrameTap>,
+    /// The preview asked for (`None`: none).
+    preview: Option<PreviewRequest>,
+    /// The preview encoder fed by the running writer's tap.
+    encoder: Option<PreviewEncoder>,
+    /// Where the preview frames' sequence numbers go.
+    preview_reporter: Option<PreviewReporter>,
+    /// The last preview sequence number used, shared by every encoder.
+    preview_seq: Arc<AtomicU32>,
+}
+
+/// The writer's one tap: the PipeWire output's, the preview encoder's, or
+/// one calling both, in that order (`None`: neither runs).
+fn compose_tap(pipewire: Option<&FrameTap>, preview: Option<&FrameTap>) -> Option<FrameTap> {
+    match (pipewire, preview) {
+        (None, None) => None,
+        (Some(t), None) | (None, Some(t)) => Some(Arc::clone(t)),
+        (Some(a), Some(b)) => {
+            let (a, b) = (Arc::clone(a), Arc::clone(b));
+            Some(Arc::new(move |buffer: &gst::Buffer| {
+                a(buffer);
+                b(buffer);
+            }))
+        }
+    }
 }
 
 impl GstBackend {
     /// Initialises GStreamer (no plugin is loaded by that). The PipeWire
-    /// output's events go to `reporter`.
-    pub fn new(reporter: Option<PipeWireReporter>) -> Result<Self, String> {
+    /// output's events go to `reporter`, the preview frames' sequence
+    /// numbers to `preview_reporter`.
+    pub fn new(
+        reporter: Option<PipeWireReporter>,
+        preview_reporter: Option<PreviewReporter>,
+    ) -> Result<Self, String> {
         gst::init().map_err(|e| format!("GStreamer initialisation failed: {e}"))?;
         Ok(GstBackend {
             writer: None,
@@ -203,7 +244,86 @@ impl GstBackend {
             parker: Parker::new(),
             #[cfg(feature = "pipewire")]
             output: None,
+            pipewire_tap: None,
+            preview: None,
+            encoder: None,
+            preview_reporter,
+            preview_seq: Arc::default(),
         })
+    }
+
+    /// Installs the composed tap of what runs on the writer (see the module
+    /// docs). Once it returns, the previous tap is no longer called.
+    fn install_tap(&self) {
+        if let Some(w) = &self.writer {
+            let preview = self.encoder.as_ref().map(PreviewEncoder::tap);
+            w.set_tap(compose_tap(self.pipewire_tap.as_ref(), preview.as_ref()));
+        }
+    }
+
+    /// Starts the preview encoder on the running writer, with its contract,
+    /// if a preview is asked for and none runs. A failure is logged: no
+    /// frame is written.
+    fn start_encoder(&mut self) {
+        let (Some(req), Some(writer)) = (self.preview.as_ref(), self.writer.as_ref()) else {
+            return;
+        };
+        if self.encoder.is_some() {
+            return;
+        }
+        let cfg = PreviewConfig {
+            seq: Arc::clone(&self.preview_seq),
+            ..PreviewConfig::new(*writer.contract(), req.dir.clone(), req.fps)
+        };
+        let reporter = self.preview_reporter.clone();
+        match PreviewEncoder::start(cfg, move |seq| {
+            if let Some(r) = &reporter {
+                r(seq);
+            }
+        }) {
+            Ok(encoder) => {
+                self.encoder = Some(encoder);
+                self.install_tap();
+            }
+            Err(e) => crate::warning!("the live preview cannot start: {e}"),
+        }
+    }
+
+    /// Stops the preview encoder, if one runs: its tap goes first (no frame
+    /// reaches it after that), then its thread; its frame files are
+    /// removed. The PipeWire output keeps its tap.
+    fn stop_encoder(&mut self) {
+        if let Some(encoder) = self.encoder.take() {
+            self.install_tap();
+            let c = encoder.counts();
+            crate::debug!(
+                "live preview stopped: {} frames written ({} decimated, {} superseded, {} \
+                 failed), {} ms per frame (p50)",
+                c.written,
+                c.decimated,
+                c.superseded,
+                c.failed,
+                encoder
+                    .frame_ms_p50()
+                    .map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.2}"))
+            );
+            encoder.stop();
+        }
+    }
+
+    /// Builds and starts the writer on `sink` (none may run), then the
+    /// preview encoder on its tap if a preview is asked for: a new writer
+    /// gets a new encoder.
+    fn run_writer(
+        &mut self,
+        contract: OutputContract,
+        sink: WriterSink,
+    ) -> Result<(), PipelineError> {
+        let mut writer = LoopbackWriter::build(contract, sink)?;
+        writer.start()?;
+        self.writer = Some(writer);
+        self.start_encoder();
+        Ok(())
     }
 
     /// The GPU parker: a measurement hook (turn parking off, read the last
@@ -248,8 +368,9 @@ impl GstBackend {
         };
         match PipeWireOutput::start(cfg, report) {
             Ok(output) => {
-                writer.set_tap(Some(output.tap()));
+                self.pipewire_tap = Some(output.tap());
                 self.output = Some(output);
+                self.install_tap();
             }
             Err(e) => {
                 self.report(
@@ -486,18 +607,15 @@ impl MediaBackend for GstBackend {
         let devices = scan_sysfs();
         let device = select_sink(&devices, sink).map_err(|e| e.to_string())?;
         let path = device.path.clone();
-        let mut writer = LoopbackWriter::build(*contract, WriterSink::Loopback(path.clone()))
+        self.run_writer(*contract, WriterSink::Loopback(path.clone()))
             .map_err(|e| format!("loopback {}: {e}", path.display()))?;
-        writer
-            .start()
-            .map_err(|e| format!("loopback {}: {e}", path.display()))?;
-        self.writer = Some(writer);
         Ok(path)
     }
 
     fn stop_writer(&mut self) {
         self.stop_session();
         self.stop_pipewire();
+        self.stop_encoder();
         if let Some(mut w) = self.writer.take()
             && let Err(e) = w.stop()
         {
@@ -513,18 +631,37 @@ impl MediaBackend for GstBackend {
         generation
     }
 
-    /// The writer's tap goes first (no frame reaches the output after
-    /// that), then the output (its thread is joined and the node
-    /// disappears). Events it still sends carry its generation, which the
-    /// controller no longer accepts.
+    /// The output's part of the writer's tap goes first (no frame reaches
+    /// the output after that; the preview keeps its part), then the output
+    /// (its thread is joined and the node disappears). Events it still
+    /// sends carry its generation, which the controller no longer accepts.
     fn stop_pipewire(&mut self) {
+        if self.pipewire_tap.take().is_some() {
+            self.install_tap();
+        }
         #[cfg(feature = "pipewire")]
         if let Some(output) = self.output.take() {
-            if let Some(w) = &self.writer {
-                w.set_tap(None);
-            }
             output.stop();
         }
+    }
+
+    fn set_preview(&mut self, preview: Option<PreviewRequest>) {
+        let Some(req) = preview else {
+            self.preview = None;
+            self.stop_encoder();
+            return;
+        };
+        let same_dir = self.preview.as_ref().is_some_and(|p| p.dir == req.dir);
+        if !same_dir {
+            self.stop_encoder();
+        }
+        if let Some(encoder) = self.encoder.as_mut()
+            && encoder.config().fps != req.fps
+        {
+            encoder.set_fps(req.fps);
+        }
+        self.preview = Some(req);
+        self.start_encoder();
     }
 
     fn writer_failure(&mut self) -> Option<String> {
@@ -826,6 +963,107 @@ mod tests {
                 "output pipeline: state change failed: ended in Paused, not Null"
             )
         );
+    }
+
+    /// The writer's one tap feeds whichever of the PipeWire output and the
+    /// preview runs, both in order when both do.
+    #[test]
+    fn the_composed_tap_feeds_what_runs() {
+        use std::sync::Mutex;
+
+        gst::init().unwrap();
+        let seen: Arc<Mutex<Vec<&'static str>>> = Arc::default();
+        let tap = |name: &'static str| -> FrameTap {
+            let seen = Arc::clone(&seen);
+            Arc::new(move |_: &gst::Buffer| seen.lock().unwrap().push(name))
+        };
+        let (pipewire, preview) = (tap("pipewire"), tap("preview"));
+        let buffer = gst::Buffer::new();
+        assert!(compose_tap(None, None).is_none());
+        for (a, b, want) in [
+            (Some(&pipewire), None, vec!["pipewire"]),
+            (None, Some(&preview), vec!["preview"]),
+            (Some(&pipewire), Some(&preview), vec!["pipewire", "preview"]),
+        ] {
+            seen.lock().unwrap().clear();
+            compose_tap(a, b).unwrap()(&buffer);
+            assert_eq!(*seen.lock().unwrap(), want);
+        }
+    }
+
+    /// Waits until `done` holds, for at most 10 s.
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The composition on a running writer (a fake sink: its placeholder
+    /// frames, no device, no camera, no GPU): stopping the PipeWire output
+    /// leaves the preview its frames and the reverse, and a new writer gets
+    /// the preview again. The PipeWire output's part is a counting tap put
+    /// where `start_pipewire_output` puts the output's.
+    #[test]
+    fn each_tap_part_outlives_the_other_and_a_new_writer_is_previewed() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let seqs: Arc<Mutex<Vec<u32>>> = Arc::default();
+        let s = Arc::clone(&seqs);
+        let reporter: PreviewReporter = Arc::new(move |seq| s.lock().unwrap().push(seq));
+        let mut b = GstBackend::new(None, Some(reporter)).unwrap();
+        let pipewire_frames = Arc::new(AtomicU64::new(0));
+        let pipewire_part = || -> FrameTap {
+            let n = Arc::clone(&pipewire_frames);
+            Arc::new(move |_: &gst::Buffer| {
+                n.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let previewed = || seqs.lock().unwrap().len();
+        let piped = || pipewire_frames.load(Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let request = || PreviewRequest {
+            fps: 30,
+            dir: dir.path().to_path_buf(),
+        };
+        let contract = OutputContract::default();
+
+        b.run_writer(contract, WriterSink::Fake).unwrap();
+        b.set_preview(Some(request()));
+        b.pipewire_tap = Some(pipewire_part());
+        b.install_tap();
+        let (p, w) = (previewed(), piped());
+        wait_until("both parts fed", || previewed() > p + 2 && piped() > w + 2);
+
+        // The PipeWire output stops: the preview keeps its frames.
+        b.stop_pipewire();
+        let (p, w) = (previewed(), piped());
+        wait_until("the preview fed alone", || previewed() > p + 3);
+        assert_eq!(piped(), w, "the stopped output's part is gone");
+
+        // The preview stops: the PipeWire output keeps its frames.
+        b.pipewire_tap = Some(pipewire_part());
+        b.install_tap();
+        b.set_preview(None);
+        let (p, w) = (previewed(), piped());
+        wait_until("the output fed alone", || piped() > w + 3);
+        assert_eq!(previewed(), p, "the stopped preview's part is gone");
+        assert!(!dir.path().join(obc_pipeline::preview::FRAME_FILE).exists());
+
+        // A new writer (a rebuild) while a preview is asked for: its tap
+        // feeds a new encoder.
+        b.set_preview(Some(request()));
+        wait_until("the preview again", || previewed() > p + 2);
+        b.stop_writer();
+        b.run_writer(contract, WriterSink::Fake).unwrap();
+        let p = previewed();
+        wait_until("the new writer previewed", || previewed() > p + 3);
+        let all = seqs.lock().unwrap().clone();
+        assert!(all.windows(2).all(|w| w[0] < w[1]), "{all:?}");
+        drop(b);
+        assert!(!dir.path().join(obc_pipeline::preview::FRAME_FILE).exists());
     }
 
     #[test]

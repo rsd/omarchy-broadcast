@@ -18,7 +18,11 @@
 //!   the loopback node, then a `/proc/<pid>/fd` count of the processes
 //!   holding it;
 //! * the **camera watcher** ([`hotplug::CameraWatcher`]): inotify on `/dev`
-//!   for `video*` nodes appearing and disappearing.
+//!   for `video*` nodes appearing and disappearing;
+//! * while a preview lease is held, the **preview encoder**
+//!   (`obc_pipeline::preview`), fed by the writer's tap; its frames reach
+//!   the D-Bus side (`PreviewFrame`) through [`controller::Published`],
+//!   without the controller.
 //!
 //! The lifecycle logic takes the current time as an argument, so its tests
 //! drive it with a fake backend and explicit instants.
@@ -32,3 +36,4 @@ pub mod dbus;
 pub mod hotplug;
 pub mod inotify;
 pub mod log;
+pub mod preview;

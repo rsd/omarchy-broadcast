@@ -93,16 +93,21 @@ fn on_off(denoise: Option<bool>) -> &'static str {
 }
 
 /// The consumers: the total, split into loopback and PipeWire while the
-/// PipeWire output is involved (`2 (loopback 1, PipeWire 1)`).
+/// PipeWire output is involved (`2 (loopback 1, PipeWire 1)`), and with the
+/// preview leases while one is held (`2 (loopback 1, preview 1)`).
 pub fn consumers_label(s: &Snapshot) -> String {
-    if model::pipewire_involved(s) {
-        format!(
-            "{} (loopback {}, PipeWire {})",
-            s.consumers, s.loopback_consumers, s.pipewire_consumers
-        )
-    } else {
-        s.consumers.to_string()
+    let pipewire = model::pipewire_involved(s);
+    if !pipewire && s.preview_consumers == 0 {
+        return s.consumers.to_string();
     }
+    let mut parts = vec![format!("loopback {}", s.loopback_consumers)];
+    if pipewire {
+        parts.push(format!("PipeWire {}", s.pipewire_consumers));
+    }
+    if s.preview_consumers > 0 {
+        parts.push(format!("preview {}", s.preview_consumers));
+    }
+    format!("{} ({})", s.consumers, parts.join(", "))
 }
 
 /// `status`: one field per line; the PipeWire output's state while it is
@@ -250,6 +255,7 @@ pub fn change_lines(s: &Snapshot, changes: &Changes) -> Vec<String> {
             }
             "loopback_consumers" => format!("loopback consumers: {}", s.loopback_consumers),
             "pipewire_consumers" => format!("PipeWire consumers: {}", s.pipewire_consumers),
+            "preview_consumers" => format!("preview consumers: {}", s.preview_consumers),
             "pipewire_output" => format!("PipeWire: {}", printable(&s.pipewire_output)),
             "output_mode" => format!("output: {}", printable(&s.output_mode)),
             "effect" => format!("effect: {}", printable(&s.effect)),
@@ -331,6 +337,7 @@ mod tests {
             consumers: 0,
             loopback_consumers: 0,
             pipewire_consumers: 0,
+            preview_consumers: 0,
             pipewire_output: "off".into(),
             // Before noise removal: the outputs without it.
             denoise: false,
@@ -376,6 +383,28 @@ mod tests {
             "{}",
             status_text(&b)
         );
+    }
+
+    #[test]
+    fn the_consumers_show_the_preview_leases_while_one_is_held() {
+        let mut s = sample();
+        s.consumers = 2;
+        s.loopback_consumers = 1;
+        s.preview_consumers = 1;
+        assert_eq!(consumers_label(&s), "2 (loopback 1, preview 1)");
+        s.pipewire_output = "ready".into();
+        s.consumers = 1;
+        s.loopback_consumers = 0;
+        assert_eq!(consumers_label(&s), "1 (loopback 0, PipeWire 0, preview 1)");
+        s.preview_consumers = 0;
+        s.pipewire_output = "off".into();
+        s.consumers = 0;
+        assert_eq!(consumers_label(&s), "0");
+        let changes = Changes {
+            fields: vec!["preview_consumers"],
+            cameras: false,
+        };
+        assert_eq!(change_lines(&s, &changes), ["preview consumers: 0"]);
     }
 
     #[test]

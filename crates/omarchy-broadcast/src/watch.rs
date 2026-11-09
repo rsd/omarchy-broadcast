@@ -108,7 +108,7 @@ fn stream_ended() -> Ended {
 }
 
 /// The bus itself did not answer within [`READ_TIMEOUT`].
-fn bus_silent() -> Failure {
+pub(crate) fn bus_silent() -> Failure {
     Failure::Other(format!(
         "the D-Bus session bus did not answer within {} s",
         READ_TIMEOUT.as_secs()
@@ -116,7 +116,7 @@ fn bus_silent() -> Failure {
 }
 
 /// [`BUS_NAME`] as a bus name.
-fn daemon_name() -> BusName<'static> {
+pub(crate) fn daemon_name() -> BusName<'static> {
     BusName::from_static_str(BUS_NAME).expect("BUS_NAME is a valid bus name")
 }
 
@@ -246,7 +246,7 @@ async fn follow(conn: &Connection, p: &mut Printer) -> Ended {
 }
 
 /// Waits until the name has an owner. `Err` if the bus is lost.
-async fn wait_for_owner(conn: &Connection) -> Result<(), Failure> {
+pub(crate) async fn wait_for_owner(conn: &Connection) -> Result<(), Failure> {
     let bus_err = |e: zbus::fdo::Error| Failure::Other(format!("lost the D-Bus session bus: {e}"));
     let dbus = DBusProxy::new(conn).await.map_err(|e| bus_err(e.into()))?;
     let mut owners = dbus

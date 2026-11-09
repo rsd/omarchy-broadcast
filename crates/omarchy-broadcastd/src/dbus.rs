@@ -4,20 +4,32 @@
 //! snapshot and forwards each method to the controller, replying with its
 //! result. [`run_publisher`] turns the controller's notes into
 //! `PropertiesChanged` signals (one per changed property, with the value of
-//! that step, so a short-lived state such as `starting` is announced too)
-//! and `Stats` signals.
+//! that step, so a short-lived state such as `starting` is announced too),
+//! `Stats` and `PreviewFrame` signals. [`run_owner_watch`] follows the
+//! unique names leaving the bus, which ends their preview leases.
+//!
+//! A preview lease belongs to the caller's unique bus name (the message
+//! header's sender). A caller that left the bus before its lease was
+//! recorded would leak it (its `NameOwnerChanged` may come before the
+//! lease): so once the lease is recorded, `AcquirePreview` asks the bus
+//! whether the name still has an owner, and ends the lease if not. Over a
+//! peer-to-peer connection (no bus, no sender) `AcquirePreview` fails.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 
+use futures_util::StreamExt;
 use obc_ipc::{CameraInfo, INTERFACE, IpcError, OBJECT_PATH, Snapshot, State};
 use tokio::sync::mpsc::UnboundedReceiver;
-use zbus::names::InterfaceName;
+use zbus::fdo::NameOwnerChangedStream;
+use zbus::message::Header;
+use zbus::names::{BusName, InterfaceName};
 use zbus::object_server::SignalEmitter;
+use zbus::proxy::CacheProperties;
 use zbus::{Connection, interface};
 
-use crate::controller::{Change, Command, Note, Published, Reply};
+use crate::controller::{Change, Command, Note, PathReply, Published, Reply};
 
 /// The D-Bus object (see the module docs).
 pub struct Server {
@@ -38,6 +50,14 @@ impl Server {
     }
 
     async fn call(&self, make: impl FnOnce(Reply) -> Command) -> Result<(), IpcError> {
+        self.ask(make).await
+    }
+
+    /// Sends the command `make` builds and waits for its reply.
+    async fn ask<T>(
+        &self,
+        make: impl FnOnce(tokio::sync::oneshot::Sender<Result<T, IpcError>>) -> Command,
+    ) -> Result<T, IpcError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.commands
             .send(make(tx))
@@ -45,6 +65,35 @@ impl Server {
         rx.await
             .unwrap_or_else(|_| Err(IpcError::Failed("the daemon is shutting down".into())))
     }
+}
+
+/// The caller's unique bus name, which a preview lease is keyed by.
+fn caller(header: &Header<'_>) -> Result<String, IpcError> {
+    header.sender().map(|s| s.to_string()).ok_or_else(|| {
+        IpcError::Failed(
+            "the call has no sender: a preview lease needs a bus connection, which names its \
+             holder"
+                .into(),
+        )
+    })
+}
+
+/// Whether `name` still has an owner on the bus of `conn`; `true` when
+/// the bus cannot tell (the lease then ends with the name's
+/// `NameOwnerChanged`).
+async fn still_there(conn: &Connection, name: &str) -> bool {
+    let Ok(bus_name) = BusName::try_from(name) else {
+        return false;
+    };
+    let dbus = match zbus::fdo::DBusProxy::builder(conn)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+    {
+        Ok(d) => d,
+        Err(_) => return true,
+    };
+    dbus.name_has_owner(bus_name).await.unwrap_or(true)
 }
 
 #[interface(name = "br.com.dias.OmarchyBroadcast1")]
@@ -101,6 +150,43 @@ impl Server {
     async fn set_denoise(&self, denoise: bool) -> Result<(), IpcError> {
         self.call(|r| Command::SetDenoise(denoise, r)).await
     }
+
+    /// Takes (or renews) the caller's preview lease at `fps`, 15 or 30;
+    /// returns the frame file's absolute path. Works in every state
+    /// (revision 5).
+    async fn acquire_preview(
+        &self,
+        fps: u32,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] conn: &Connection,
+    ) -> Result<String, IpcError> {
+        let name = caller(&header)?;
+        let path = self
+            .ask(|reply: PathReply| Command::AcquirePreview {
+                name: name.clone(),
+                fps,
+                reply,
+            })
+            .await?;
+        // The caller may have left before the lease was recorded, its
+        // NameOwnerChanged handled first: the lease must not outlive it.
+        if !still_there(conn, &name).await {
+            let _ = self.commands.send(Command::PreviewOwnerGone(name));
+        }
+        Ok(path)
+    }
+
+    /// Ends the caller's preview lease; without one, does nothing
+    /// (revision 5).
+    async fn release_preview(&self, #[zbus(header)] header: Header<'_>) -> Result<(), IpcError> {
+        let name = caller(&header)?;
+        self.call(|r| Command::ReleasePreview(name, r)).await
+    }
+
+    /// After each replace of the preview frame file while a lease is held;
+    /// `seq` increases strictly within a daemon run, from 1 (revision 5).
+    #[zbus(signal)]
+    pub async fn preview_frame(emitter: &SignalEmitter<'_>, seq: u32) -> zbus::Result<()>;
 
     /// About once per second while `active`; `-1` marks a value that cannot
     /// be measured.
@@ -164,8 +250,8 @@ impl Server {
         self.snap().denoise
     }
 
-    /// Every consumer: the processes holding the loopback plus the links
-    /// to the PipeWire output.
+    /// Every consumer: the processes holding the loopback, the links to the
+    /// PipeWire output and the preview leases.
     #[zbus(property)]
     fn consumers(&self) -> u32 {
         self.snap().consumers
@@ -181,6 +267,12 @@ impl Server {
     #[zbus(property, name = "PipeWireConsumers")]
     fn pipewire_consumers(&self) -> u32 {
         self.snap().pipewire_consumers
+    }
+
+    /// The preview leases held (revision 5).
+    #[zbus(property)]
+    fn preview_consumers(&self) -> u32 {
+        self.snap().preview_consumers
     }
 
     /// The PipeWire output's state: `off`, `unsupported`, `connecting`,
@@ -229,9 +321,10 @@ async fn emit_change(emitter: &SignalEmitter<'_>, change: &Change) -> zbus::Resu
         Change::BlurStrength(v) => emit_changed(emitter, name, v).await,
         Change::Enabled(v) | Change::Denoise(v) => emit_changed(emitter, name, v).await,
         Change::Cameras(v) => emit_changed(emitter, name, v).await,
-        Change::Consumers(v) | Change::LoopbackConsumers(v) | Change::PipeWireConsumers(v) => {
-            emit_changed(emitter, name, v).await
-        }
+        Change::Consumers(v)
+        | Change::LoopbackConsumers(v)
+        | Change::PipeWireConsumers(v)
+        | Change::PreviewConsumers(v) => emit_changed(emitter, name, v).await,
     }
 }
 
@@ -263,9 +356,39 @@ pub async fn run_publisher(conn: Connection, mut notes: UnboundedReceiver<Note>)
                 )
                 .await
             }
+            Note::PreviewFrame(seq) => Server::preview_frame(&emitter, *seq).await,
         };
         if let Err(e) = res {
             crate::debug!("emitting a signal failed: {e}");
+        }
+    }
+}
+
+/// Subscribes to `NameOwnerChanged` on the bus of `conn`, for
+/// [`run_owner_watch`]. Done before `AcquirePreview` is served, so that no
+/// departure after a lease was recorded is missed.
+pub async fn subscribe_owners(conn: &Connection) -> zbus::Result<NameOwnerChangedStream> {
+    let dbus = zbus::fdo::DBusProxy::new(conn).await?;
+    dbus.receive_name_owner_changed().await
+}
+
+/// Tells the controller of every unique name that leaves the bus
+/// (`NameOwnerChanged` with no new owner, from [`subscribe_owners`]), which
+/// ends its preview lease if it holds one, until the connection closes or
+/// the controller is gone.
+pub async fn run_owner_watch(
+    mut owners: NameOwnerChangedStream,
+    commands: std::sync::mpsc::Sender<Command>,
+) {
+    while let Some(signal) = owners.next().await {
+        let Ok(args) = signal.args() else { continue };
+        if args.new_owner().is_none()
+            && let BusName::Unique(name) = args.name()
+            && commands
+                .send(Command::PreviewOwnerGone(name.to_string()))
+                .is_err()
+        {
+            return;
         }
     }
 }

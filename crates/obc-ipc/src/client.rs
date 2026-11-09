@@ -51,6 +51,20 @@ pub trait OmarchyBroadcast {
     /// effect, or alone with `none`. Persists across restarts. Revision 4.
     fn set_denoise(&self, denoise: bool) -> Result<(), IpcError>;
 
+    /// Takes (or renews) the caller's preview lease at `fps` frames per
+    /// second, 15 or 30 (else `InvalidArgument`), and returns the absolute
+    /// path of the frame file, `$XDG_RUNTIME_DIR/omarchy-broadcast/preview.jpg`
+    /// of the daemon. The lease belongs to the caller's unique bus name: it
+    /// ends with [`Self::release_preview`] or when that name leaves the bus.
+    /// Each atomic replace of the file is announced by `PreviewFrame`. A
+    /// lease is a consumer. Fails with `Failed` when the daemon has no
+    /// usable runtime directory. Revision 5.
+    fn acquire_preview(&self, fps: u32) -> Result<String, IpcError>;
+
+    /// Ends the caller's preview lease; without one, does nothing.
+    /// Revision 5.
+    fn release_preview(&self) -> Result<(), IpcError>;
+
     /// Roughly once per second while `active`; `-1` marks a value that
     /// cannot be measured.
     #[zbus(signal)]
@@ -61,6 +75,12 @@ pub trait OmarchyBroadcast {
         cpu_percent: f64,
         gpu_percent: f64,
     ) -> zbus::Result<()>;
+
+    /// Emitted after each atomic replace of the preview frame file while a
+    /// preview lease is held; `seq` increases strictly within a daemon run,
+    /// from 1. Revision 5.
+    #[zbus(signal)]
+    fn preview_frame(&self, seq: u32) -> zbus::Result<()>;
 
     /// Lifecycle state.
     #[zbus(property)]
@@ -103,9 +123,9 @@ pub trait OmarchyBroadcast {
     #[zbus(property)]
     fn denoise(&self) -> zbus::Result<bool>;
 
-    /// Number of consumers: the processes holding the loopback plus the
-    /// links to the PipeWire output (before revision 3, the loopback's
-    /// only).
+    /// Number of consumers: the processes holding the loopback, the links
+    /// to the PipeWire output and the preview leases (before revision 3,
+    /// the loopback's only; before revision 5, without the leases).
     #[zbus(property)]
     fn consumers(&self) -> zbus::Result<u32>;
 
@@ -117,6 +137,10 @@ pub trait OmarchyBroadcast {
     /// Revision 3.
     #[zbus(property, name = "PipeWireConsumers")]
     fn pipewire_consumers(&self) -> zbus::Result<u32>;
+
+    /// Number of preview leases held. Revision 5.
+    #[zbus(property)]
+    fn preview_consumers(&self) -> zbus::Result<u32>;
 
     /// State of the PipeWire output: `off`, `unsupported`, `connecting`,
     /// `ready`, `streaming` or `failed`. Revision 3.

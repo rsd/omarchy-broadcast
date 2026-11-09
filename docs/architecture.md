@@ -21,6 +21,7 @@ flowchart LR
         ST["Runtime state<br/>~/.local/state/omarchy-broadcast/state.toml<br/>Enabled, selected camera,<br/>effect settings"]
         WATCH["Consumer watcher<br/>inotify on the loopback node<br/>+ /proc/PID/fd count"]
         PWT["obc-pipewire thread (optional)<br/>PipeWire main loop, output stream,<br/>registry listener: links to the node"]
+        PRV["obc-preview thread (while a lease is held)<br/>scale to 480 px, RGB, JPEG"]
         HOT["Hotplug watcher<br/>inotify on /dev"]
         subgraph WR["Loopback writer (lives as long as the daemon, CPU only)"]
             PH["black placeholder<br/>at the contract rate"]
@@ -46,15 +47,17 @@ flowchart LR
     end
 
     LB[("v4l2loopback<br/>/dev/videoN")]
+    PJ[("$XDG_RUNTIME_DIR/omarchy-broadcast/<br/>preview.jpg")]
     PWN[("PipeWire node<br/>omarchy-broadcast, Video/Source<br/>(optional)")]
 
     CLI & BAR & SH -- "methods / properties" --> IPC
-    IPC -- "PropertiesChanged, Stats" --> BAR & CLI
+    IPC -- "PropertiesChanged, Stats, PreviewFrame" --> BAR & CLI
     IPC <--> CTL
     CFG --> CTL
     CTL <--> ST
     WATCH --> CTL
     PWT -- "PipeWire consumers, output state" --> CTL
+    IPC -- "preview leases" --> CTL
     HOT --> CTL
     CTL --> GST
     CTL --> WR
@@ -62,6 +65,9 @@ flowchart LR
     FX --> BE --> MX
     WSINK --> LB
     TAP --> PWT --> PWN
+    TAP --> PRV --> PJ
+    PRV -- "frame written" --> IPC
+    PJ -. "read on PreviewFrame" .-> BAR
     LB -. "virtual camera" .-> APPS["Browser / Zoom / OBS"]
     PWN -. "native camera" .-> APPS
     APPS -. "open / close" .-> WATCH
@@ -72,6 +78,12 @@ The daemon owns one **loopback writer** for its whole life ([ADR-0011](adr/0011-
 
 **Optional PipeWire output** ([ADR-0016](adr/0016-pipewire-output.md)). When the daemon is built with the `pipewire` feature and `[pipewire] enabled = true`, a frame tap on the writer also hands every buffer it pushes (placeholder or camera frame, after restamping) to a native PipeWire `Video/Source` node, `omarchy-broadcast` ("Omarchy Broadcast"). Both outputs therefore carry the same stream: the same contract, pacing, timestamps and Idle behaviour. Nothing is sent while no PipeWire consumer streams. The node offers three formats at the contract's size and rate (in the order YUY2, NV12, I420; `[pipewire] offer_nv12 = false` drops NV12), and converts on the CPU inside the single copy into the PipeWire buffer, because the format is the consumer's choice at run time and idle placeholders never touch the GPU. A consumer that asks for another format or size fails its own link only. The node exists while the loopback writer runs; its failure is reported as `PipeWireOutput` = `failed`, retried every 2 s, and never puts the daemon in `error`.
 
+**Live preview** ([ADR-0019](adr/0019-live-preview.md)). While a client holds a preview lease and the loopback writer runs, a second part of the writer's tap hands each buffer to the preview encoder. The writer has one tap slot, so the backend installs one composed tap that calls the PipeWire output's part and the preview's part, whichever run, and installs it anew when one of them starts or stops; each outlives the other, and a new writer (a new output contract) gets a new encoder. The encoder sees what the loopback carries (black placeholders at `off`, `idle` and `error`, black while an effect loads, the processed camera image when `active`), so the preview shows what applications see. It never opens the loopback device, never blocks the writer, and makes no CUDA call. The tap decimates by the writer's timestamps to the highest rate among the leases (15 or 30 fps) and keeps only the latest frame, so a slow encoder drops frames instead of delaying the writer. The encoder thread scales the frame to 480 pixels wide (keeping the aspect, 480x270 for 16:9), converts it to RGB, so that the full-range JPEG gets the levels of the limited-range frame right, and encodes it. Each JPEG goes to `$XDG_RUNTIME_DIR/omarchy-broadcast/preview.jpg.tmp` and is renamed over `preview.jpg`; the encoder then reports the frame's sequence number, which the D-Bus side emits as `PreviewFrame(seq)`, without passing through the controller.
+
+*The frame files.* The directory is created mode 0700 on `AcquirePreview`, or, if present, must be a real directory owned by the daemon's user, whose mode is forced to 0700; otherwise the call fails. The files are created mode 0600 without following links; a symbolic link, hard link, FIFO or other non-regular file in their way is removed and the file is created anew. Both files are removed when the last lease ends, when the writer stops, at shutdown and at start-up (a crashed daemon may have left them).
+
+*The lease is a consumer.* It is the third kind, next to the loopback holders and the PipeWire links, keyed by the caller's unique bus name; it ends on `ReleasePreview`, when the name leaves the bus (the daemon follows `NameOwnerChanged`), and at shutdown. The lifecycle keys off the total: debounce, idle grace, the deferred writer rebuild and the CUDA parking at `idle` are unchanged, so a lease alone starts the camera and its end lets the grace run out. `Consumers` is the total; `PreviewConsumers` counts the leases.
+
 ### Threads
 
 | Thread | Does |
@@ -80,6 +92,7 @@ The daemon owns one **loopback writer** for its whole life ([ADR-0011](adr/0011-
 | Controller (`obc-controller`) | The only owner of the configuration, the runtime state, the writer and the session. D-Bus methods, watcher events and timers reach it as commands; it replies to a method only after it has published the resulting snapshot. Time is passed into the state machine explicitly, so it is testable with a fake backend and a fake clock |
 | Consumer watcher (`obc-consumers`) | An inotify watch on the loopback node, and the `/proc` count below |
 | PipeWire output (`obc-pipewire`, only with the feature and `[pipewire] enabled`) | Its own PipeWire main loop with the output stream (the node's driver) and a registry listener that counts the links to the node. Frames arrive from the writer's tap; link and state changes reach the controller as commands. Panics in PipeWire callbacks are contained: the output fails and reconnects |
+| Preview encoder (`obc-preview`, only while a lease is held and the writer runs) | Scales, converts and JPEG-encodes the latest frame the writer's tap kept, writes the frame file and reports its sequence number. The tap itself runs on the writer's thread and only decimates and swaps a reference |
 | Hotplug watcher (`obc-hotplug`) | An inotify watch on `/dev` for `video*` nodes appearing or disappearing |
 | GStreamer threads | The writer's streaming and placeholder threads for the life of the daemon; the ingest and output pipelines' while a session runs |
 
@@ -87,7 +100,7 @@ The daemon owns one **loopback writer** for its whole life ([ADR-0011](adr/0011-
 
 **Consumer detection.** The watcher gets `IN_OPEN` and `IN_CLOSE_*` events for the loopback node, but treats each only as a hint: it then counts the processes other than the daemon holding the node open, from `/proc/<pid>/fd`. A consumer must be present for 300 ms (the start debounce) before the camera starts, so the short opens that browsers and PipeWire make to enumerate devices do nothing. If the watch cannot be set, it counts every second.
 
-With the PipeWire output, the registry listener of the `obc-pipewire` thread counts the `Link` objects whose output node is ours; each is followed, and a link in the error state is not counted. The node's `running` state is not a consumer signal (it means linked, not producing). The lifecycle keys off the total of the loopback holders and the PipeWire links, with the same debounce, grace period and states, so a PipeWire consumer starts the camera exactly as a loopback consumer does. `Consumers` is that total; `LoopbackConsumers` and `PipeWireConsumers` give the split.
+With the PipeWire output, the registry listener of the `obc-pipewire` thread counts the `Link` objects whose output node is ours; each is followed, and a link in the error state is not counted. The node's `running` state is not a consumer signal (it means linked, not producing). The lifecycle keys off the total of the loopback holders and the PipeWire links, with the same debounce, grace period and states, so a PipeWire consumer starts the camera exactly as a loopback consumer does. `Consumers` is that total, together with the preview leases below; `LoopbackConsumers` and `PipeWireConsumers` give the split.
 
 **Hotplug.** Video nodes appearing in or disappearing from `/dev` trigger a rescan of the camera list. If the streaming camera fails or disappears, the session switches to the next camera in order, with the hold of ADR-0010; if none is left, the state is `error`. A camera that appears while another one streams does not take over.
 
@@ -230,7 +243,7 @@ stateDiagram-v2
 | `active` | streaming | held | the above, plus ingest and output pipelines, 1 Hz `Stats` | camera frames on both outputs |
 | `error` | closed | none | D-Bus, watchers, the writer (retried every 2 s if the loopback is missing or held) | placeholder on both outputs |
 
-The second output exists only with the PipeWire output enabled; it carries what the loopback carries, and consumers of either kind keep the state `active`.
+The second output exists only with the PipeWire output enabled; it carries what the loopback carries, and consumers of either kind keep the state `active`. A preview lease is a consumer too, and is granted in every state; the preview frames carry what the loopback carries.
 
 - **Grace period.** `active` includes the time after the last consumer closes: the stream keeps running for `idle_grace` (default 5 s) with `Consumers` = 0, and a consumer that returns in that time finds it running. This replaces ADR-0006's separate "Draining" state.
 - **Source changes** (`SelectCamera`, `NextCamera`, a camera failure) rebuild only the ingest pipeline; the output keeps its contract and clock and holds the last frame meanwhile (section 2). The state stays `active`.

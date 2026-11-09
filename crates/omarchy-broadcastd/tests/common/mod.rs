@@ -166,11 +166,13 @@ impl PrivateBus {
 }
 
 /// The environment of a daemon under test: a private bus, and config and
-/// state homes in `dir`.
+/// state homes and a runtime directory (`XDG_RUNTIME_DIR`, where the
+/// preview frames go) in `dir`.
 pub struct DaemonEnv {
     pub bus_address: String,
     pub config_home: PathBuf,
     pub state_home: PathBuf,
+    pub runtime_dir: PathBuf,
 }
 
 impl DaemonEnv {
@@ -179,9 +181,17 @@ impl DaemonEnv {
             bus_address: bus.address.clone(),
             config_home: dir.join("config"),
             state_home: dir.join("state"),
+            runtime_dir: dir.join("run"),
         };
         std::fs::create_dir_all(env.config_home.join("omarchy-broadcast")).unwrap();
         std::fs::create_dir_all(&env.state_home).unwrap();
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&env.runtime_dir)
+                .unwrap();
+        }
         env
     }
 
@@ -196,12 +206,14 @@ impl DaemonEnv {
     }
 
     /// The daemon binary with this environment (and nothing else of the
-    /// test's session: no session bus, no user config).
+    /// test's session: no session bus, no user config, not the user's
+    /// runtime directory).
     pub fn command(&self) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_omarchy-broadcastd"));
         c.env("DBUS_SESSION_BUS_ADDRESS", &self.bus_address)
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_STATE_HOME", &self.state_home)
+            .env("XDG_RUNTIME_DIR", &self.runtime_dir)
             .stdin(Stdio::null());
         c
     }
