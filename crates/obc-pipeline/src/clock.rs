@@ -15,7 +15,8 @@
 //! never emitted after its timestamp, nor more than one period before it.
 //! With the phase fixed, the output rate is the contract rate exactly; the
 //! bound means that over any span the emitted count differs from
-//! `rate x span` by at most one frame.
+//! `rate x span` by at most one frame. In cadence mode (below) each tick
+//! has an offset of its own, within the same bound.
 //!
 //! **Phase lock.** A camera frame waits in the slot until the next tick, so
 //! with a fixed phase the added latency depends on where the camera's
@@ -47,7 +48,8 @@
 //!   repeat;
 //! * the lock is engaged only while it can follow the input: the input
 //!   runs at about the output rate, a multiple of it or half of it, within
-//!   the drift the slew can follow.
+//!   the drift the slew can follow, or steadily at 1.1 to 1.9 periods per
+//!   frame (cadence mode, below).
 //!   Two conditions, both over the frames of the same run (same source, no
 //!   placeholder, hold or arrival gap over 2.5 periods in between; over
 //!   2.5 input frame intervals for an input slower than the coarse limit
@@ -56,7 +58,8 @@
 //!     [`PhaseLockConfig::max_input_interval_permille`] of a period, a
 //!     coarse check that reacts within a window to a camera lowering its
 //!     rate in dim light or a 15 fps mode. Over it, the input is
-//!     **sub-rate**, and is followed only at half the rate (see below);
+//!     **sub-rate**, and is followed only at half the rate or in cadence
+//!     mode (see below);
 //!   - the input's frame train drifts against the ticks by at most
 //!     [`PhaseLockConfig::slew_ns`] per tick when it moves earlier (an
 //!     input faster than `k` x the output rate), and at most half of it
@@ -76,21 +79,24 @@
 //!     let go with a full window, the lock engages again only within half
 //!     the limit, so an estimate near the limit cannot switch it on and
 //!     off.
-//!   - a **sub-rate** input is followed only at a frame interval of two
-//!     periods (15 fps against 30 fps, 30 fps against 60 fps), once a full
-//!     window of 64 arrivals measures it, and only while its cadence is
-//!     steady (the median distance of an arrival from the fitted line at
-//!     most an eighth of a period). Every frame then arrives at the same
-//!     phase of the ticks: the lock steers the tick after it to the margin
-//!     like any other, and the repeat goes out on the tick in between. The
-//!     drift is `2 x period - interval` per frame, against the same limits.
-//!     An arrival gap of two frame intervals (a frame the camera dropped;
-//!     a longer gap ends the run) counts as two frames in the fit. The
+//!   - a **sub-rate** input is followed once a full window of 64 arrivals
+//!     measures it, and only while its cadence is steady (the median
+//!     distance of an arrival from the fitted line at most an eighth of a
+//!     period). An arrival gap of two frame intervals (a frame the camera
+//!     dropped; a longer gap ends the run) counts as two frames in the fit.
+//!     At a frame interval of two periods (15 fps against 30 fps, 30 fps
+//!     against 60 fps) every frame arrives at the same phase of the ticks:
+//!     the lock steers the tick after it to the margin like any other, and
+//!     the repeat goes out on the tick in between. The drift is
+//!     `2 x period - interval` per frame, against the same limits. The
 //!     early-edge wrap hysteresis is at least the 4 ms step on which
 //!     cameras deliver their frames, so one step at an edge cannot wrap
-//!     the phase there and back. At other rates (20 or 24 fps against
-//!     30 fps) the frames fall on several phases of the ticks, and the lock
-//!     is not engaged.
+//!     the phase there and back. At 1.1 to 1.9 periods (16 to 27 fps
+//!     against 30 fps: 20 and 24 fps) the frames fall on several phases of
+//!     the ticks, and no phase suits them all: the input is followed in
+//!     **cadence mode**, with no drift limit, while the median distance is
+//!     at most a sixteenth of a period. Other sub-rate inputs are not
+//!     followed.
 //!
 //!   Not engaged, the phase is held: the output pads a slow input with
 //!   repeats, and thins a fast one, exactly as a free-running clock at
@@ -98,6 +104,30 @@
 //!   within reach, the lock tracks again from the held phase (and jumps
 //!   only for an error above the jump threshold), so jitter that briefly
 //!   stretches the measured interval cannot cause a series of jumps.
+//!
+//! **Cadence mode.** Each tick is scheduled on its own from the input's
+//! fitted cadence. A least-squares line of arrival time on frame index over
+//! the run's last 512 fresh frames (fewer early in the run, and the gate's
+//! window of 64 after the input changed its rate within the run) predicts
+//! when each frame arrives; the late side of the arrivals is the
+//! fourth-largest distance above that line over the last 256 frames (the
+//! three largest are skipped, so a frame dequeued far off its cadence now
+//! and then does not delay every tick). A frame is **due** at its predicted
+//! arrival plus that envelope plus the margin. Tick `n` may be emitted
+//! within its window `[D(n) - period, D(n)]`; it is planned for the first
+//! frame not yet tracked whose due instant is not before the window (a
+//! frame that missed the tick planned for it is passed over). If that frame
+//! is due within the window, the tick is emitted when it is due; otherwise
+//! the tick is a repeat, emitted midway between the previous tick's
+//! scheduled instant and the frame's due instant, within the window. At
+//! 20 fps against 30 fps the emission intervals then run about 25, 25 and
+//! 50 ms: the repeat stays well apart from the fresh frame on either side,
+//! so a consumer that limits its own rate to 30 fps drops a repeat rather
+//! than a fresh frame. Each window starts where the previous one ends, so
+//! the ticks stay in order. The phase is held meanwhile, and the phase
+//! schedule resumes from it when the mode ends (the input changes its rate
+//! or its cadence becomes irregular). The first engagement of a run is its
+//! acquisition; there are no wraps.
 //!
 //! **Schedule.** A tick is emitted when its emission instant has passed. A
 //! wake-up later than the next tick's instant is a **late** tick: it is
@@ -113,7 +143,12 @@
 //! stays within one period, so the next instant is never before the
 //! current one, though a move towards the early edge (a jump or a wrap)
 //! can make it due at once: two emissions back to back, in order and
-//! neither after its timestamp.
+//! neither after its timestamp. In cadence mode the instants of successive
+//! ticks are in order for the same reason (each within a period of its own
+//! timestamp). The ticks due at a wake-up are counted by their cadence
+//! instants, each chained from the one before (not by their timestamps,
+//! which would miss a tick due before its timestamp), so a late tick and
+//! the burst cap mean the same as on the phase schedule.
 //!
 //! **Content.** Per tick: a frame newer than the last one emitted is
 //! **fresh** (frames that arrived and were replaced in between are counted as
@@ -320,11 +355,14 @@ pub struct PacerCounts {
     /// Phase wraps at an edge of the band.
     pub lock_wraps: u64,
     /// The current phase offset (`[-period, 0]`): ticks are emitted this
-    /// long before (negative) their timestamps.
+    /// long before (negative) their timestamps. In cadence mode each tick
+    /// has an offset of its own: the offset of the tick last returned by
+    /// [`Pacer::step`].
     pub phase_offset_ns: i64,
     /// The lock is acquired and engaged (the input runs at about the
     /// output rate, a multiple of it or half of it, within the drift the
-    /// slew can follow).
+    /// slew can follow, or steadily at 1.1 to 1.9 periods per frame, in
+    /// cadence mode).
     pub phase_locked: bool,
     /// Holds armed ([`Pacer::hold`]).
     pub holds: u64,
@@ -374,6 +412,64 @@ struct PhaseLock {
     /// The drift gate let go of the run with a full window of arrivals:
     /// it lets the lock engage again only within half its limit.
     let_go: bool,
+    /// `(index, arrived_ns)` of the run's last [`CADENCE_FIT_WINDOW`] fresh
+    /// frames, indexed as in `arrivals`: the cadence fit. A full window of
+    /// arrivals that cadence mode does not follow clears it, so that a fit
+    /// never spans a change of the input's rate within the run.
+    history: VecDeque<(u64, u64)>,
+    /// The input is followed in cadence mode (see the module docs): its
+    /// fitted cadence, from which [`Pacer::step`] schedules every tick. Set
+    /// only while engaged.
+    cadence: Option<Cadence>,
+}
+
+/// A steady sub-rate input's cadence, fitted over the run's last
+/// [`CADENCE_FIT_WINDOW`] fresh frames: the time by which frame `index`
+/// is expected in the slot.
+#[derive(Debug, Clone, Copy)]
+struct Cadence {
+    /// The first fitted frame: the origin of the fit.
+    index0: u64,
+    t0: u64,
+    /// Means of the fitted points (frames and nanoseconds after the origin).
+    mean_x: f64,
+    mean_y: f64,
+    /// The fitted frame interval.
+    interval: f64,
+    /// How late the late side of the arrivals runs against the fitted line:
+    /// the [`CADENCE_ENVELOPE_SKIP`]+1-th largest residual of the last
+    /// [`CADENCE_ENVELOPE_WINDOW`] fitted frames.
+    envelope: f64,
+    /// Index of the last fresh frame tracked.
+    last_index: u64,
+}
+
+impl Cadence {
+    /// When frame `index` is due: its place on the fitted line, plus the
+    /// envelope and `margin_ns`.
+    fn due_ns(&self, index: u64, margin_ns: u64) -> u64 {
+        let x = index as f64 - self.index0 as f64;
+        let offset =
+            self.mean_y + self.interval * (x - self.mean_x) + self.envelope + margin_ns as f64;
+        let offset = offset.round();
+        if offset >= 0.0 {
+            self.t0.saturating_add(offset as u64)
+        } else {
+            self.t0.saturating_sub((-offset) as u64)
+        }
+    }
+
+    /// The first frame from `from` on that is due at or after `t_ns`.
+    fn first_due_from(&self, from: u64, t_ns: u64, margin_ns: u64) -> u64 {
+        // Frames that stopped coming leave the last tracked one far behind:
+        // skip most of the way at once.
+        let behind = t_ns.saturating_sub(self.due_ns(from, margin_ns));
+        let mut index = from.saturating_add((behind as f64 / self.interval) as u64);
+        while self.due_ns(index, margin_ns) < t_ns {
+            index += 1;
+        }
+        index
+    }
 }
 
 impl PhaseLock {
@@ -385,6 +481,62 @@ impl PhaseLock {
         self.samples.clear();
         self.arrivals.clear();
         self.let_go = false;
+        self.history.clear();
+        self.cadence = None;
+    }
+
+    /// The fitted cadence: a least-squares line of arrival time on frame
+    /// index, and the envelope of the late side of the arrivals against
+    /// it. Fitted over the history, or over the drift gate's window of
+    /// arrivals while that holds more frames (the window the gate has just
+    /// found steady, after a change of rate cleared the history).
+    fn fit_cadence(&self) -> Option<Cadence> {
+        let frames: Vec<(u64, u64)> = if self.history.len() >= self.arrivals.len() {
+            self.history.iter().copied().collect()
+        } else {
+            self.arrivals
+                .iter()
+                .map(|&(index, _, t)| (index, t))
+                .collect()
+        };
+        let &(index0, t0) = frames.first()?;
+        let &(last_index, _) = frames.last()?;
+        let pts: Vec<(f64, f64)> = frames
+            .iter()
+            .map(|&(index, t)| ((index - index0) as f64, t as f64 - t0 as f64))
+            .collect();
+        let n = pts.len() as f64;
+        let mean_x = pts.iter().map(|p| p.0).sum::<f64>() / n;
+        let mean_y = pts.iter().map(|p| p.1).sum::<f64>() / n;
+        let sxx: f64 = pts.iter().map(|p| (p.0 - mean_x).powi(2)).sum();
+        if sxx <= 0.0 {
+            return None;
+        }
+        let interval = pts
+            .iter()
+            .map(|p| (p.0 - mean_x) * (p.1 - mean_y))
+            .sum::<f64>()
+            / sxx;
+        if interval <= 0.0 {
+            return None;
+        }
+        let recent = &pts[pts.len().saturating_sub(CADENCE_ENVELOPE_WINDOW)..];
+        let mut residuals: Vec<f64> = recent
+            .iter()
+            .map(|p| p.1 - mean_y - interval * (p.0 - mean_x))
+            .collect();
+        residuals.sort_unstable_by(f64::total_cmp);
+        let envelope =
+            residuals[residuals.len() - 1 - CADENCE_ENVELOPE_SKIP.min(residuals.len() - 1)];
+        Some(Cadence {
+            index0,
+            t0,
+            mean_x,
+            mean_y,
+            interval,
+            envelope,
+            last_index,
+        })
     }
 
     /// Input frame interval over the kept frames of the run.
@@ -413,15 +565,27 @@ impl PhaseLock {
     /// and off with every frame.
     ///
     /// A **sub-rate** input (`sub_rate`: the coarse interval is over its
-    /// limit) is followed only at an interval of [`SUB_RATE_RATIO`] periods
-    /// (15 fps against 30 fps), only once a full window of arrivals
-    /// measures it, and only while its cadence is steady (the median
-    /// distance of an arrival from the fitted line at most a
-    /// [`SUB_RATE_JITTER_DIVISOR`]th of a period). Each frame then has a
-    /// tick of its own, and the frame train moves against the ticks by
-    /// `2 x period - interval` per frame (per fresh tick), against the same
-    /// limits.
-    fn drift_followable(&mut self, period: u64, slew: u64, sub_rate: bool) -> bool {
+    /// limit) is followed only once a full window of arrivals measures it,
+    /// and only while its cadence is steady (the median distance of an
+    /// arrival from the fitted line at most a [`SUB_RATE_JITTER_DIVISOR`]th
+    /// of a period). At an interval of [`CADENCE_MIN_PERIODS`] to
+    /// [`CADENCE_MAX_PERIODS`] periods, with the median distance at most a
+    /// [`CADENCE_JITTER_DIVISOR`]th of a period, it is followed in cadence
+    /// mode, whatever its drift: the fitted cadence is set in `cadence`.
+    /// Once followed in cadence mode (`in_cadence`: up to the frame
+    /// before), it stays so while the median distance is at most a
+    /// [`CADENCE_RELEASE_DIVISOR`]th of a period.
+    /// Otherwise only at an interval of [`SUB_RATE_RATIO`] periods (15 fps
+    /// against 30 fps): each frame then has a tick of its own, and the
+    /// frame train moves against the ticks by `2 x period - interval` per
+    /// frame (per fresh tick), against the same limits.
+    fn drift_followable(
+        &mut self,
+        period: u64,
+        slew: u64,
+        sub_rate: bool,
+        in_cadence: bool,
+    ) -> bool {
         let n = self.arrivals.len();
         if sub_rate && n < RATE_WINDOW {
             return false;
@@ -458,6 +622,22 @@ impl PhaseLock {
             if abs[n / 2] > period / SUB_RATE_JITTER_DIVISOR {
                 return false;
             }
+            let steady = if in_cadence {
+                period / CADENCE_RELEASE_DIVISOR
+            } else {
+                period / CADENCE_JITTER_DIVISOR
+            };
+            if (CADENCE_MIN_PERIODS..=CADENCE_MAX_PERIODS).contains(&(interval / period))
+                && abs[n / 2] <= steady
+            {
+                // Cadence mode: the prediction follows the drift, whatever
+                // it is.
+                if let Some(cadence) = self.fit_cadence() {
+                    self.cadence = Some(cadence);
+                    self.let_go = false;
+                    return true;
+                }
+            }
             (1.0, SUB_RATE_RATIO * period - interval)
         } else {
             let k = (period / interval).round().max(1.0);
@@ -488,15 +668,64 @@ const RATE_WINDOW: usize = 64;
 const DRIFT_STANDARD_ERRORS: f64 = 3.0;
 
 /// The input frame interval, in output periods, at which a sub-rate input
-/// is followed (see [`PhaseLock::drift_followable`]): 15 fps against
-/// 30 fps, 30 fps against 60 fps. Every frame then arrives at the same
-/// phase of the ticks and leaves on the next one; the repeat goes out on
-/// the tick in between. At other ratios the frames fall on several phases
-/// of the ticks (two, half a period apart, at 20 fps against 30 fps), and
-/// arrivals that step by a few milliseconds at once, as on cameras that
-/// deliver on a coarse host-side grid, make the frames of the phase the
-/// lock is steered to miss their ticks; those inputs are not followed.
+/// is followed by the phase (see [`PhaseLock::drift_followable`]): 15 fps
+/// against 30 fps, 30 fps against 60 fps. Every frame then arrives at the
+/// same phase of the ticks and leaves on the next one; the repeat goes out
+/// on the tick in between. At other ratios the frames fall on several
+/// phases of the ticks (two, half a period apart, at 20 fps against
+/// 30 fps), and arrivals that step by a few milliseconds at once, as on
+/// cameras that deliver on a coarse host-side grid, make the frames of the
+/// phase the lock is steered to miss their ticks; those inputs are followed
+/// in cadence mode instead, within [`CADENCE_MIN_PERIODS`] to
+/// [`CADENCE_MAX_PERIODS`].
 const SUB_RATE_RATIO: f64 = 2.0;
+
+/// The band of input frame intervals, in output periods, in which a steady
+/// sub-rate input is followed in **cadence mode** (see the module docs):
+/// 15.8 to 27.3 fps against 30 fps, 20 and 24 fps included. Every frame
+/// then has a tick window of its own (the interval is over a period), and
+/// at most one window between two frames carries a repeat (it is under
+/// two periods). Close above the coarse limit (1.05 periods) an input
+/// flips across that limit with jitter: in simulation a 28 fps input
+/// (1.07 periods) on a 4 ms arrival grid with 2 ms of jitter engaged and
+/// let go in turn. Above 1.9 periods, the phase lock at
+/// [`SUB_RATE_RATIO`] (or nothing) applies.
+const CADENCE_MIN_PERIODS: f64 = 1.1;
+const CADENCE_MAX_PERIODS: f64 = 1.9;
+
+/// Cadence mode follows an input only while the median distance of its
+/// arrivals from the fitted line is at most this fraction of a period
+/// (2.1 ms at 30 fps), half the limit of [`SUB_RATE_JITTER_DIVISOR`]:
+/// without a drift limit, that one alone let an input whose frame
+/// intervals wander at random (40 to 60 ms apart) engage now and then. A
+/// steady camera with 2 ms of jitter on a 4 ms arrival grid stays near
+/// 1.2 ms. In simulation (40 runs of 60 s), an input 40 to 60 ms apart
+/// engaged in 38 runs at an eighth of a period and in none at a
+/// sixteenth; at a 24th the steady cameras with 2 ms of jitter on the
+/// grid no longer engaged for good.
+const CADENCE_JITTER_DIVISOR: f64 = 16.0;
+
+/// Once followed in cadence mode, an input stays so while the median
+/// distance of its arrivals from the fitted line is at most this fraction
+/// of a period: a hysteresis over [`CADENCE_JITTER_DIVISOR`].
+const CADENCE_RELEASE_DIVISOR: f64 = 12.0;
+
+/// Fresh frames over which cadence mode fits its line (25.6 s at 20 fps).
+/// Cameras that deliver on a 4 ms arrival grid make the arrivals of a
+/// 19.99 fps input stand still and then step by the grid, a sweep of 160
+/// frames; a fit over 64 frames sits within one flat stretch, gets the
+/// slope wrong, and misses the frames after each step (1.25 % of them in
+/// simulation). A fit spanning the sweep does not.
+const CADENCE_FIT_WINDOW: usize = 512;
+
+/// Fresh frames whose residuals from the cadence line set its envelope
+/// (12.8 s at 20 fps), and how many of the largest are skipped: the
+/// envelope is the fourth-largest residual. The largest would hold one
+/// frame dequeued 19 ms late (as on a CPU-decode camera) for the whole
+/// window, and every frame would wait those 19 ms; with three skipped only
+/// that frame and a few like it miss their ticks.
+const CADENCE_ENVELOPE_WINDOW: usize = 256;
+const CADENCE_ENVELOPE_SKIP: usize = 3;
 
 /// A sub-rate input is followed only while the median distance of its
 /// arrivals from their fitted line is at most this fraction of a period
@@ -554,6 +783,10 @@ pub struct Pacer {
     counts: PacerCounts,
     lock: PhaseLock,
     hold: Option<Hold>,
+    /// When the last tick returned by [`Pacer::step`] was scheduled, and
+    /// that instant minus its timestamp (cadence mode reports it).
+    last_scheduled_ns: u64,
+    last_offset_ns: i64,
 }
 
 impl Pacer {
@@ -567,7 +800,7 @@ impl Pacer {
 
     pub fn counts(&self) -> PacerCounts {
         PacerCounts {
-            phase_offset_ns: self.lock.phase,
+            phase_offset_ns: self.phase_offset_ns(),
             phase_locked: self.lock.locked && self.lock.engaged,
             ..self.counts
         }
@@ -578,17 +811,89 @@ impl Pacer {
         self.next
     }
 
-    /// The current phase offset (see [`PacerCounts::phase_offset_ns`]).
+    /// The current phase offset; in cadence mode, the offset of the tick
+    /// last returned by [`Pacer::step`] (see
+    /// [`PacerCounts::phase_offset_ns`]).
     pub fn phase_offset_ns(&self) -> i64 {
-        self.lock.phase
+        if self.lock.cadence.is_some() {
+            self.last_offset_ns
+        } else {
+            self.lock.phase
+        }
     }
 
-    /// When tick `index` is emitted at the current phase: its deadline plus
-    /// the (non-positive) phase offset, not before 0.
+    /// When tick `index` is emitted: its deadline plus the (non-positive)
+    /// phase offset, not before 0. In cadence mode, the instant the
+    /// cadence gives it, which depends on the tick before it: exact for the
+    /// next tick ([`Pacer::next_index`]).
     pub fn scheduled_ns(&self, index: u64) -> u64 {
-        self.cfg
-            .deadline_ns(index)
-            .saturating_sub(self.lock.phase.unsigned_abs())
+        match &self.lock.cadence {
+            Some(cadence) => self.cadence_ns(index, cadence),
+            None => self
+                .cfg
+                .deadline_ns(index)
+                .saturating_sub(self.lock.phase.unsigned_abs()),
+        }
+    }
+
+    /// Tick `index`'s emission instant in cadence mode, within its window
+    /// `[deadline - period, deadline]`: the instant the first frame not yet
+    /// tracked and not due before the window is due, if that is within the
+    /// window; otherwise the tick is a repeat, emitted midway between the
+    /// previous tick's scheduled instant and that frame's, within the
+    /// window. The windows of successive ticks follow each other, so the
+    /// ticks stay in order.
+    fn cadence_ns(&self, index: u64, cadence: &Cadence) -> u64 {
+        self.cadence_after_ns(index, cadence, self.last_scheduled_ns)
+    }
+
+    /// [`Pacer::cadence_ns`], with the previous tick scheduled at
+    /// `previous_ns`.
+    fn cadence_after_ns(&self, index: u64, cadence: &Cadence, previous_ns: u64) -> u64 {
+        let margin = self.cfg.lock.margin_ns;
+        let deadline = self.cfg.deadline_ns(index);
+        let start = deadline.saturating_sub(self.cfg.period_ns());
+        let frame = cadence.first_due_from(cadence.last_index + 1, start, margin);
+        let due = cadence.due_ns(frame, margin);
+        if due <= deadline {
+            return due;
+        }
+        let previous = previous_ns.min(due);
+        (previous + (due - previous) / 2).clamp(start, deadline)
+    }
+
+    /// In cadence mode, how many ticks are due at `now_ns`: the next one
+    /// (scheduled at `due_ns`, not after `now_ns`) and those after it whose
+    /// instants, each placed after the one before it, have passed too,
+    /// counting at most `cap`.
+    fn cadence_due_ticks(&self, cadence: &Cadence, due_ns: u64, now_ns: u64, cap: u64) -> u64 {
+        let mut count = 1;
+        let mut previous = due_ns;
+        while count < cap {
+            let at = self.cadence_after_ns(self.next + count, cadence, previous);
+            if at > now_ns {
+                break;
+            }
+            previous = at;
+            count += 1;
+        }
+        count
+    }
+
+    /// In cadence mode, the last tick due at `now_ns`, and its instant: the
+    /// tick a resynchronisation jumps to. Every tick whose timestamp has
+    /// passed is due (an instant is never after its timestamp), and of the
+    /// ticks after it only the next can be (the window of the one after
+    /// starts at that tick's timestamp, after `now_ns`).
+    fn cadence_resync(&self, cadence: &Cadence, now_ns: u64) -> (u64, u64) {
+        let index = self.cfg.index_at(now_ns).max(self.next);
+        let at = self.cadence_ns(index, cadence);
+        let following = self.cadence_after_ns(index + 1, cadence, at);
+        if following <= now_ns {
+            (index + 1, following)
+        } else {
+            (index, at)
+        }
     }
 
     /// Whether a hold is armed.
@@ -613,6 +918,8 @@ impl Pacer {
             },
             lock: PhaseLock::default(),
             hold: None,
+            last_scheduled_ns: 0,
+            last_offset_ns: 0,
         }
     }
 
@@ -625,24 +932,52 @@ impl Pacer {
         if now_ns < due {
             return Step::Wait { until_ns: due };
         }
-        let lead = self.lock.phase.unsigned_abs();
-        let current = self
-            .cfg
-            .index_at(now_ns.saturating_add(lead))
-            .max(self.next);
-        let due_now = current - self.next + 1;
-        if now_ns - due >= self.cfg.resync_after_ns || due_now > self.cfg.max_burst.max(1) {
+        let cap = self.cfg.max_burst.max(1);
+        // In cadence mode each tick has an instant of its own, which
+        // depends on the one before it: walk them from the next one,
+        // counting one over the cap at most.
+        let cadence = self.lock.cadence;
+        let (current, due_now) = match &cadence {
+            Some(cadence) => {
+                let due_now = self.cadence_due_ticks(cadence, due, now_ns, cap + 1);
+                (self.next + due_now - 1, due_now)
+            }
+            None => {
+                let current = self
+                    .cfg
+                    .index_at(now_ns.saturating_add(self.lock.phase.unsigned_abs()))
+                    .max(self.next);
+                (current, current - self.next + 1)
+            }
+        };
+        let resync = now_ns - due >= self.cfg.resync_after_ns || due_now > cap;
+        // The instant this tick was scheduled for (never after its
+        // timestamp), whenever the clock woke: cadence mode places the next
+        // repeat from it and reports its offset.
+        let mut scheduled = due;
+        if resync {
+            let current = match &cadence {
+                Some(cadence) => {
+                    let (current, at) = self.cadence_resync(cadence, now_ns);
+                    scheduled = at;
+                    current
+                }
+                None => {
+                    scheduled = self.scheduled_ns(current);
+                    current
+                }
+            };
             self.counts.skipped += current - self.next;
             self.next = current;
         } else if due_now > 1 {
             self.counts.late += 1;
         }
         let index = self.next;
+        let pts_ns = self.cfg.deadline_ns(index);
+        self.last_scheduled_ns = scheduled;
+        self.last_offset_ns = -i64::try_from(pts_ns.saturating_sub(scheduled)).unwrap_or(i64::MAX);
         self.next += 1;
-        Step::Tick {
-            index,
-            pts_ns: self.cfg.deadline_ns(index),
-        }
+        Step::Tick { index, pts_ns }
     }
 
     /// Arms a hold until `until_ns`, awaiting the first fresh frame of
@@ -753,12 +1088,33 @@ impl Pacer {
         while st.arrivals.len() > RATE_WINDOW {
             st.arrivals.pop_front();
         }
+        st.history.push_back((index, l.arrived_ns));
+        while st.history.len() > CADENCE_FIT_WINDOW {
+            st.history.pop_front();
+        }
         let interval = st.input_interval();
         let sub_rate = is_sub_rate(interval).is_some();
+        let in_cadence = st.cadence.take().is_some();
         let engaged = st.samples.len() >= lc.acquire_after.clamp(2, lc.window.max(2))
             && interval.is_some()
-            && st.drift_followable(self.cfg.period_ns(), lc.slew_ns, sub_rate);
+            && st.drift_followable(self.cfg.period_ns(), lc.slew_ns, sub_rate, in_cadence);
         st.engaged = engaged;
+        if engaged && st.cadence.is_some() {
+            // Cadence mode: `step` schedules each tick from the fit, and
+            // the phase is held for when the mode ends.
+            if !st.locked {
+                st.locked = true;
+                self.counts.lock_acquisitions += 1;
+            }
+            return;
+        }
+        // A full window of arrivals that cadence mode does not follow: the
+        // input runs at another rate, or irregularly. The next engagement
+        // fits anew from the gate's window, so that the fit never spans a
+        // change of rate within the run.
+        if st.arrivals.len() >= RATE_WINDOW {
+            st.history.clear();
+        }
         if !engaged {
             // Held phase: the output pads a slow input as without the lock.
             // The lock stays acquired: when the input is back at the rate
@@ -1333,12 +1689,23 @@ mod tests {
         acquisitions: u64,
         /// The lock is acquired and engaged after this tick.
         locked: bool,
+        /// The tick's phase offset, as scheduled: it was due at `pts +
+        /// offset` (`at` itself is later when the clock woke late).
+        offset: i64,
+    }
+
+    impl Emit {
+        /// When the tick was scheduled.
+        fn scheduled(&self) -> i64 {
+            self.pts as i64 + self.offset
+        }
     }
 
     /// A simulated output clock fed by `arrivals` (`(time, source)`), with
     /// holds armed at given times (`(at, source, until)`), until the ticks
     /// timestamped before `end_ns` are emitted. The clock wakes exactly at
-    /// each emission instant.
+    /// each emission instant ([`Sim::run`]), or later by a delay
+    /// ([`Sim::run_waking`]).
     struct Sim {
         cfg: PacerConfig,
         arrivals: Vec<(u64, u64)>,
@@ -1371,6 +1738,12 @@ mod tests {
         }
 
         fn run(&self) -> (Vec<Emit>, Pacer) {
+            self.run_waking(|_| 0)
+        }
+
+        /// As [`Sim::run`], with the clock waking `wake_delay(index)` after
+        /// the instant of the tick `index` it waits for.
+        fn run_waking(&self, mut wake_delay: impl FnMut(u64) -> u64) -> (Vec<Emit>, Pacer) {
             let mut pacer = Pacer::new(self.cfg);
             let mut holds = self.holds.clone();
             holds.sort_unstable();
@@ -1379,9 +1752,12 @@ mod tests {
             let mut now = 0;
             loop {
                 match pacer.step(now) {
-                    Step::Wait { until_ns } => now = until_ns,
+                    Step::Wait { until_ns } => {
+                        now = until_ns + wake_delay(pacer.next_index());
+                    }
                     Step::Tick { pts_ns, .. } if pts_ns >= self.end_ns => break,
                     Step::Tick { index, pts_ns } => {
+                        let offset = pacer.phase_offset_ns();
                         while let Some(&(_, source, until)) = holds.peek().filter(|h| h.0 <= now) {
                             pacer.hold(source, until);
                             holds.next();
@@ -1401,6 +1777,7 @@ mod tests {
                                 .map(|l| l.source_id),
                             acquisitions: pacer.counts().lock_acquisitions,
                             locked: pacer.counts().phase_locked,
+                            offset,
                         });
                     }
                 }
@@ -1600,11 +1977,14 @@ mod tests {
         assert!(p50(waits) <= M + MS, "{c:?}");
     }
 
-    /// Slower inputs other than a steady 15 fps (against 30 fps): 20 and
-    /// 24 fps, 14.97 fps (its frames drift later by 0.13 ms a frame, more
-    /// than half the slew), an irregular ~20 fps (40 to 60 ms between
-    /// frames) and an irregular ~15 fps (55 to 78 ms). The lock never
-    /// engages, and the output is exactly the free-running clock's.
+    /// Slower inputs that neither the phase (a steady 15 fps against
+    /// 30 fps) nor cadence mode (a steady input at 1.1 to 1.9 periods per
+    /// frame) follows: 14.97 fps (its frames drift later by 0.13 ms a
+    /// frame, more than half the slew), 15.5 fps (1.94 periods) and
+    /// 27.8 fps (1.08 periods), outside the cadence band, an irregular
+    /// ~20 fps (40 to 60 ms between frames) and an irregular ~15 fps (55
+    /// to 78 ms). The lock never engages, and the output is exactly the
+    /// free-running clock's.
     #[test]
     fn phase_lock_is_not_engaged_for_slower_input_off_its_ratio() {
         let irregular = |seed: u64, from: u64, span: u64| {
@@ -1618,10 +1998,9 @@ mod tests {
             out
         };
         for (name, arrivals) in [
-            ("20 fps", train(1, 3 * MS, 20.0, 20_000 * MS, MS, 21)),
-            ("19.98 fps", train(1, 3 * MS, 19.98, 20_000 * MS, MS, 23)),
-            ("24 fps", train(1, 3 * MS, 24.0, 20_000 * MS, MS, 25)),
             ("14.97 fps", train(1, 3 * MS, 14.97, 20_000 * MS, MS, 27)),
+            ("15.5 fps", train(1, 3 * MS, 15.5, 20_000 * MS, MS, 29)),
+            ("27.8 fps", train(1, 3 * MS, 27.8, 20_000 * MS, MS, 31)),
             ("~20 fps", irregular(99, 40 * MS, 20 * MS)),
             ("~15 fps", irregular(97, 55 * MS, 23 * MS)),
         ] {
@@ -1640,7 +2019,8 @@ mod tests {
                 b.iter().map(key).collect::<Vec<_>>(),
                 "{name}"
             );
-            assert!(pa.counts().repeat > 100, "{name}: {:?}", pa.counts());
+            // (27.8 fps falls 44 frames short of 30 fps in 20 s.)
+            assert!(pa.counts().repeat > 40, "{name}: {:?}", pa.counts());
         }
     }
 
@@ -1880,6 +2260,655 @@ mod tests {
         assert!(waits.len() > 200);
         assert!(p50(waits.clone()) <= M + MS, "{:?}", p50(waits.clone()));
         assert!(waits.iter().all(|w| *w < period / 3), "{waits:?}");
+    }
+
+    /// `arrivals` as delivered on a `step_ns` grid of arrival times (0:
+    /// as they are), each at the grid step at or before it, as the
+    /// reference cameras deliver their frames.
+    fn on_grid(mut arrivals: Vec<(u64, u64)>, step_ns: u64) -> Vec<(u64, u64)> {
+        if let Some(step) = std::num::NonZeroU64::new(step_ns) {
+            for a in &mut arrivals {
+                a.0 = a.0 / step * step.get();
+            }
+        }
+        arrivals
+    }
+
+    /// What a run in cadence mode shows from tick `from` on.
+    struct CadenceFigures {
+        /// Fresh frames, and those that waited over half a period: they
+        /// missed the tick planned for them.
+        fresh: usize,
+        missed: usize,
+        p50: u64,
+        p95: u64,
+        /// The shortest interval between two emissions.
+        min_gap: u64,
+        /// The largest deviation of the interval between two fresh
+        /// emissions that did not miss from a whole number of input frame
+        /// intervals.
+        fresh_dev: u64,
+    }
+
+    fn cadence_figures(out: &[Emit], from: usize, period: u64, fps: f64) -> CadenceFigures {
+        let after = &out[from..];
+        let mut waits: Vec<u64> = after.iter().filter_map(|e| e.wait).collect();
+        let missed = waits.iter().filter(|w| **w > period / 2).count();
+        waits.sort_unstable();
+        let interval = 1e9 / fps;
+        let on_time: Vec<u64> = after
+            .iter()
+            .filter(|e| e.wait.is_some_and(|w| w <= period / 2))
+            .map(|e| e.at)
+            .collect();
+        let fresh_dev = on_time
+            .windows(2)
+            .map(|w| {
+                let gap = (w[1] - w[0]) as f64;
+                (gap - (gap / interval).round() * interval).abs() as u64
+            })
+            .max()
+            .unwrap_or(0);
+        CadenceFigures {
+            fresh: waits.len(),
+            missed,
+            p50: waits[waits.len() / 2],
+            p95: waits[waits.len() * 95 / 100],
+            min_gap: after.windows(2).map(|w| w[1].at - w[0].at).min().unwrap(),
+            fresh_dev,
+        }
+    }
+
+    /// A steady camera at about 20 or 24 fps against 30 fps: its frames
+    /// fall on two (or five) phases of the ticks, so no phase suits them
+    /// all. Once a full window of arrivals measures the cadence, the lock
+    /// engages in cadence mode, for good: each tick is emitted when the
+    /// frame planned for it is due (its place on the fitted line, plus the
+    /// late side of the arrivals and the margin), a repeat midway between
+    /// its neighbours. Uniform arrival jitter, or the 4 ms arrival grid of
+    /// the reference cameras with jitter; one run spans the five minutes
+    /// of the acceptance runs. The output contract is unchanged: timestamps
+    /// on the grid, each emission within a period before its timestamp, 30
+    /// +- 1 frames in every wall-clock second, nothing skipped, late or
+    /// superseded. Hardly a frame misses its tick, the median wait is the
+    /// margin plus the arrival jitter (the free-running clock's is half a
+    /// period or more: at 20 fps half the frames wait half a period longer
+    /// than the other half), consecutive fresh frames leave a whole number
+    /// of input frame intervals apart, and no two emissions are closer than
+    /// half a period: a fresh tick follows the one before it by about an
+    /// input frame interval (over 1.1 periods in the cadence band), and a
+    /// repeat goes out midway between the ticks on either side of it, which
+    /// are over a period apart (the frame after it is not due within its
+    /// window); between two fresh ticks that is half the interval, over
+    /// 0.55 periods.
+    #[test]
+    fn phase_lock_follows_a_steady_sub_rate_input_in_cadence_mode() {
+        // (camera fps, arrival jitter, arrival grid step, seconds, seed)
+        for (fps, jitter, grid, t_s, seed) in [
+            (19.95, MS, 0, 60, 401),
+            (19.98, MS, 0, 60, 403),
+            (19.99, MS, 0, 60, 405),
+            (20.0, MS, 0, 60, 407),
+            (20.02, MS, 0, 60, 409),
+            (20.05, MS, 0, 60, 411),
+            (19.99, MS / 2, 4 * MS, 120, 413),
+            (19.99, 2 * MS, 4 * MS, 120, 415),
+            (20.02, MS / 2, 4 * MS, 120, 417),
+            (20.0, 2 * MS, 4 * MS, 60, 419),
+            (24.0, MS, 4 * MS, 60, 421),
+            (19.98, MS, 4 * MS, 300, 423),
+        ] {
+            let end = t_s * 1_000_000_000;
+            let arrivals = on_grid(train(1, 9 * MS, fps, end + 100 * MS, jitter, seed), grid);
+            let sim = Sim::new(arrivals.clone(), end);
+            let (out, p) = sim.run();
+            let c = p.counts();
+            let period = sim.cfg.period_ns();
+            let tag = format!("{fps} fps, jitter {jitter}, grid {grid}: {c:?}");
+            assert_grid(&out, &sim.cfg);
+            assert_eq!((c.skipped, c.late, c.placeholder), (0, 0, 1), "{tag}");
+            assert_eq!(c.superseded, 0, "{tag}");
+            let at: Vec<u64> = out.iter().map(|e| e.at).collect();
+            let (lo, hi) = sliding_1s(&at, 0, end - period);
+            assert!(lo >= 29 && hi <= 31, "{tag}: {lo}..={hi}");
+            let first = out.iter().position(|e| e.locked).expect(&tag);
+            assert!(
+                out[first].at < 5_000 * MS,
+                "{tag}: locked at {}",
+                out[first].at
+            );
+            assert!(out[first..].iter().all(|e| e.locked), "{tag}");
+            assert_eq!((c.lock_acquisitions, c.lock_wraps), (1, 0), "{tag}");
+            // From the first tick the cadence schedules (the one after the
+            // tick that engaged it).
+            let f = cadence_figures(&out, first + 1, period, fps);
+            let mut free = Sim::new(arrivals, end);
+            free.cfg.lock = PhaseLockConfig::disabled();
+            let (fo, _) = free.run();
+            let free_p50 = p50(fo[first + 1..].iter().filter_map(|e| e.wait).collect());
+            eprintln!(
+                "{fps} fps, jitter {:.1} ms, grid {} ms, {t_s} s: locked after {:.2} s, \
+                 acquisitions {} wraps {}, wait p50 {:.2} p95 {:.2} ms, missed {} of {}, \
+                 shortest emission interval {:.2} ms, fresh interval off the cadence by up to \
+                 {:.2} ms; free running p50 {:.2} ms",
+                jitter as f64 / 1e6,
+                grid / MS,
+                out[first].at as f64 / 1e9,
+                c.lock_acquisitions,
+                c.lock_wraps,
+                f.p50 as f64 / 1e6,
+                f.p95 as f64 / 1e6,
+                f.missed,
+                f.fresh,
+                f.min_gap as f64 / 1e6,
+                f.fresh_dev as f64 / 1e6,
+                free_p50 as f64 / 1e6,
+            );
+            assert!(f.missed * 200 <= f.fresh, "{tag}: {} missed", f.missed);
+            assert!(f.p50 <= M + jitter + grid / 2 + MS, "{tag}: p50 {}", f.p50);
+            assert!(
+                f.p50 * 2 < free_p50,
+                "{tag}: p50 {}, free {free_p50}",
+                f.p50
+            );
+            assert!(f.min_gap >= period / 2, "{tag}: {}", f.min_gap);
+            assert!(f.fresh_dev <= MS, "{tag}: {}", f.fresh_dev);
+        }
+    }
+
+    /// A camera that lowers its rate from 30 to 20 fps within one run (as
+    /// in dim light), and one that raises it from 20 to 30 fps. Lowered,
+    /// the lock lets go of the phase within a few frames and engages in
+    /// cadence mode once a full window of arrivals measures the new rate;
+    /// raised, cadence mode ends within a few frames and the lock follows
+    /// the phase again once a full window measures it, tracking from the
+    /// held phase. Throughout, every tick is emitted once, in order, and
+    /// within a period before its timestamp.
+    #[test]
+    fn cadence_mode_follows_a_camera_changing_its_rate_within_a_run() {
+        let end = 40_000 * MS;
+        let change = 15_000 * MS;
+        for (from_fps, to_fps, seed) in [
+            (30.0, 20.0, 431),
+            (20.0, 30.0, 433),
+            (29.97, 19.98, 435),
+            (19.98, 29.97, 437),
+        ] {
+            let mut arrivals = train(1, 7 * MS, from_fps, change, MS, seed);
+            let next = arrivals.last().unwrap().0 + (1e9 / to_fps) as u64;
+            arrivals.extend(train(1, next, to_fps, end + 100 * MS - next, MS, seed + 1));
+            let sim = Sim::new(arrivals, end);
+            let (out, p) = sim.run();
+            let c = p.counts();
+            let period = sim.cfg.period_ns();
+            let tag = format!("{from_fps} -> {to_fps} fps: {c:?}");
+            assert_grid(&out, &sim.cfg);
+            // The instants the ticks were scheduled for are in order across
+            // both changes of mode.
+            assert!(
+                out.windows(2).all(|w| w[0].scheduled() <= w[1].scheduled()),
+                "{tag}"
+            );
+            assert_eq!((c.skipped, c.late, c.placeholder), (0, 0, 1), "{tag}");
+            let first = out.iter().position(|e| e.locked).expect(&tag);
+            assert!(
+                out[first].at < 5_000 * MS,
+                "{tag}: locked at {}",
+                out[first].at
+            );
+            // Locked again after the change, within a window of arrivals
+            // at the new rate, for good.
+            let relocked = out.iter().rposition(|e| !e.locked).unwrap() + 1;
+            assert!(
+                out[relocked].at > change && out[relocked].at < change + 5_000 * MS,
+                "{tag}: locked again at {}",
+                out[relocked].at
+            );
+            // From two seconds on (the phase lock slews towards the margin
+            // after cadence mode, from the phase it held).
+            let settled = out
+                .iter()
+                .position(|e| e.at > out[relocked].at + 2_000 * MS)
+                .unwrap();
+            let f = cadence_figures(&out, settled, period, to_fps);
+            eprintln!(
+                "{from_fps} -> {to_fps} fps: locked after {:.2} s, again {:.2} s after the \
+                 change, acquisitions {} wraps {}, then wait p50 {:.2} p95 {:.2} ms, missed {} \
+                 of {}, superseded {} repeat {}",
+                out[first].at as f64 / 1e9,
+                (out[relocked].at - change) as f64 / 1e9,
+                c.lock_acquisitions,
+                c.lock_wraps,
+                f.p50 as f64 / 1e6,
+                f.p95 as f64 / 1e6,
+                f.missed,
+                f.fresh,
+                c.superseded,
+                c.repeat,
+            );
+            assert!(f.missed * 200 <= f.fresh, "{tag}: {} missed", f.missed);
+            assert!(f.p50 <= M + 2 * MS, "{tag}: p50 {}", f.p50);
+            assert!(c.lock_acquisitions <= 2, "{tag}");
+        }
+    }
+
+    /// A switch between two 20 fps cameras at different phases, through a
+    /// hold: the second camera is a new run, measured anew and acquired in
+    /// cadence mode once its cadence is known; its frames then wait about
+    /// the margin.
+    #[test]
+    fn cadence_mode_reacquires_after_a_switch() {
+        let period = cfg30().period_ns();
+        let mut arrivals = train(1, 11 * MS, 20.0, 10_000 * MS, MS / 2, 5);
+        let start_2 = 10_000 * MS + 600 * MS + 19 * MS;
+        arrivals.extend(train(2, start_2, 19.99, 20_000 * MS, MS / 2, 7));
+        let mut sim = Sim::new(arrivals, 30_000 * MS);
+        sim.holds.push((10_000 * MS, 2, 13_000 * MS));
+        let (out, p) = sim.run();
+        let c = p.counts();
+        assert_grid(&out, &sim.cfg);
+        assert_eq!((c.placeholder, c.skipped, c.late), (1, 0, 0), "{c:?}");
+        assert_eq!((c.holds_released, c.lock_acquisitions), (1, 2), "{c:?}");
+        let first_2 = out.iter().position(|e| e.source == Some(2)).unwrap();
+        let relocked = out[first_2..].iter().position(|e| e.locked).unwrap() + first_2;
+        assert!(
+            out[relocked].at < start_2 + 5_000 * MS,
+            "re-locked at {}",
+            out[relocked].at
+        );
+        assert!(out[relocked..].iter().all(|e| e.locked));
+        let f = cadence_figures(&out, relocked + 1, period, 19.99);
+        eprintln!(
+            "switch between 20 fps cameras: locked again {:.2} s after the second camera \
+             started, wait p50 {:.2} p95 {:.2} ms, missed {} of {}",
+            (out[relocked].at - start_2) as f64 / 1e9,
+            f.p50 as f64 / 1e6,
+            f.p95 as f64 / 1e6,
+            f.missed,
+            f.fresh
+        );
+        assert!(f.fresh > 200);
+        assert!(f.p50 <= M + MS, "{}", f.p50);
+        assert_eq!(f.missed, 0);
+    }
+
+    /// A 20 fps camera on the 4 ms arrival grid whose frames are now and
+    /// then dequeued late (about one in fifty, by up to 19 ms, as on a
+    /// CPU-decode camera), with a frame dropped every 400. The lock stays
+    /// engaged in cadence mode, acquired once. A late frame may miss the
+    /// tick planned for it (it then leaves on the next tick, or is
+    /// superseded by the next frame); the others miss as rarely as without
+    /// late frames. The ticks do not wait for the outliers: with the
+    /// largest residual of the window as the envelope, every tick would
+    /// wait for the latest of them (in simulation a p50 wait of 18.6 ms
+    /// and two thirds of the frames over half a period). The envelope skips
+    /// the three largest; about five late frames fall in its window of 256
+    /// here, so it is now and then a late frame's residual, and the
+    /// 95th-percentile wait rises from 5.6 ms without them to 10 to 13 ms.
+    #[test]
+    fn cadence_mode_rides_out_late_and_dropped_frames() {
+        let end = 120_000 * MS;
+        for (fps, seed) in [(19.99, 451), (20.02, 453)] {
+            let mut rng = Rng(seed + 100);
+            let mut late = Vec::new();
+            let arrivals: Vec<(u64, u64)> = train(1, 9 * MS, fps, end + 100 * MS, MS / 2, seed)
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| i % 400 != 200)
+                .map(|(_, (t, s))| {
+                    let lag = if rng.next().is_multiple_of(50) {
+                        rng.next() % (19 * MS + 1)
+                    } else {
+                        0
+                    };
+                    let t = (t + lag) / (4 * MS) * (4 * MS);
+                    if lag > 0 {
+                        late.push(t);
+                    }
+                    (t, s)
+                })
+                .collect();
+            let sim = Sim::new(arrivals.clone(), end);
+            let (out, p) = sim.run();
+            let c = p.counts();
+            let period = sim.cfg.period_ns();
+            let tag = format!("{fps} fps: {c:?}");
+            assert_grid(&out, &sim.cfg);
+            assert_eq!((c.skipped, c.late, c.placeholder), (0, 0, 1), "{tag}");
+            let first = out.iter().position(|e| e.locked).expect(&tag);
+            assert!(out[first].at < 5_000 * MS, "{tag}");
+            assert!(out[first..].iter().all(|e| e.locked), "{tag}");
+            assert_eq!((c.lock_acquisitions, c.lock_wraps), (1, 0), "{tag}");
+            // Every frame that waited over half a period, and every frame
+            // superseded, is one of the late ones.
+            let from = out[first + 1].at;
+            let emitted: Vec<(u64, u64)> = out[first + 1..]
+                .iter()
+                .filter_map(|e| e.wait.map(|w| (e.at - w, w)))
+                .collect();
+            let missed: Vec<u64> = emitted
+                .iter()
+                .filter(|(_, w)| *w > period / 2)
+                .map(|(a, _)| *a)
+                .collect();
+            let superseded: Vec<u64> = arrivals
+                .iter()
+                .map(|a| a.0)
+                .filter(|a| *a > from && *a < out.last().unwrap().at)
+                .filter(|a| !emitted.iter().any(|(e, _)| e == a))
+                .collect();
+            let not_late = missed
+                .iter()
+                .chain(&superseded)
+                .filter(|a| !late.contains(a))
+                .count();
+            let f = cadence_figures(&out, first + 1, period, fps);
+            let late_after = late.iter().filter(|a| **a > from).count();
+            eprintln!(
+                "{fps} fps with late and dropped frames: wait p50 {:.2} p95 {:.2} ms, {} of {} \
+                 waited over half a period and {} were superseded, {not_late} of them not among \
+                 the {late_after} late frames",
+                f.p50 as f64 / 1e6,
+                f.p95 as f64 / 1e6,
+                missed.len(),
+                f.fresh,
+                superseded.len(),
+            );
+            // The late frames may miss; the others as rarely as without
+            // them.
+            assert!(not_late * 200 <= f.fresh, "{tag}: {not_late} not late");
+            assert!(f.p95 < 14 * MS, "{tag}: p95 {}", f.p95);
+        }
+    }
+
+    /// The most ticks emitted back to back (at the same instant).
+    fn longest_burst(out: &[Emit]) -> usize {
+        out.chunk_by(|a, b| a.at == b.at)
+            .map(<[Emit]>::len)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// A 20 fps camera in cadence mode, with a clock thread that wakes
+    /// 0.1 ms after each instant, and one wake-up in forty up to 45 ms
+    /// after it (under three emission intervals of half a period: at most
+    /// three ticks due at once). Every tick is still emitted, once, in
+    /// order, nothing skipped: a tick whose successor's instant has passed
+    /// is late, and the ticks due follow it back to back, never more than
+    /// the burst cap. The instants the ticks were scheduled for stay
+    /// within a period before their timestamps and in order, each tick
+    /// leaves no later than the delay after its instant, and the lock stays
+    /// engaged in cadence mode, acquired once.
+    #[test]
+    fn cadence_mode_rides_out_late_wakeups() {
+        let end = 60_000 * MS;
+        let arrivals = on_grid(train(1, 9 * MS, 19.99, end + 100 * MS, MS, 461), 4 * MS);
+        let sim = Sim::new(arrivals, end);
+        let period = sim.cfg.period_ns();
+        let longest = 45 * MS;
+        let mut rng = Rng(463);
+        let (out, p) = sim.run_waking(|_| {
+            MS / 10
+                + if rng.next().is_multiple_of(40) {
+                    rng.next() % (longest + 1)
+                } else {
+                    0
+                }
+        });
+        let c = p.counts();
+        let tag = format!("{c:?}");
+        for (i, e) in out.iter().enumerate() {
+            assert_eq!(e.index, i as u64, "{tag}");
+            assert_eq!(e.pts, sim.cfg.deadline_ns(e.index), "{tag}");
+            let scheduled = e.scheduled();
+            assert!(
+                scheduled <= e.pts as i64 && e.pts as i64 - scheduled <= period as i64,
+                "tick {} scheduled at {scheduled} for pts {}",
+                e.index,
+                e.pts
+            );
+            let delay = e.at as i64 - scheduled;
+            assert!(
+                (0..=(longest + MS / 10) as i64).contains(&delay),
+                "tick {}: emitted {delay} ns after its instant",
+                e.index
+            );
+        }
+        assert!(out.windows(2).all(|w| w[0].scheduled() <= w[1].scheduled()));
+        assert_eq!((c.skipped, c.placeholder), (0, 1), "{tag}");
+        let burst = longest_burst(&out);
+        assert!(burst as u64 <= sim.cfg.max_burst, "{tag}: burst {burst}");
+        assert!(c.late > 0, "{tag}");
+        let first = out.iter().position(|e| e.locked).expect(&tag);
+        assert!(out[first].at < 5_000 * MS, "{tag}");
+        assert!(out[first..].iter().all(|e| e.locked), "{tag}");
+        assert_eq!((c.lock_acquisitions, c.lock_wraps), (1, 0), "{tag}");
+        let f = cadence_figures(&out, first + 1, period, 19.99);
+        eprintln!(
+            "20 fps with late wake-ups: late {} longest burst {burst}, wait p50 {:.2} p95 {:.2} \
+             ms, {} of {} waited over half a period, superseded {}",
+            c.late,
+            f.p50 as f64 / 1e6,
+            f.p95 as f64 / 1e6,
+            f.missed,
+            f.fresh,
+            c.superseded,
+        );
+        assert!(f.p50 <= M + 4 * MS, "{tag}: p50 {}", f.p50);
+    }
+
+    /// A clock stall in cadence mode, at a dozen points of the 25, 25 and
+    /// 50 ms emission pattern, of one to five periods. The ticks' instants
+    /// are up to a period before their timestamps, and each depends on the
+    /// one before it: the ticks due are those whose instants, placed one
+    /// after the other, have passed. (Counted by their timestamps, a
+    /// 106 ms stall left four ticks due back to back against a cap of
+    /// three.) Up to the cap, they are caught up back to back, each but the
+    /// last one late; with more due, the clock jumps to the last tick due
+    /// and counts the ones before it skipped, and the tick after it is not
+    /// due at once (no burst follows the jump).
+    #[test]
+    fn cadence_mode_bursts_stay_within_the_cap() {
+        let cfg = cfg30();
+        let end = 22_000 * MS;
+        let sim = Sim::new(train(1, 9 * MS, 19.99, end + 100 * MS, MS, 405), end);
+        let mut base = Pacer::new(cfg);
+        let mut now = 0;
+        let (mut caught_up, mut resyncs, mut longest) = (0, 0, 0);
+        for waited in 600..612 {
+            // On time up to tick `waited`, then woken late for it.
+            let due = loop {
+                match base.step(now) {
+                    Step::Wait { until_ns } if base.next_index() == waited => break until_ns,
+                    Step::Wait { until_ns } => now = until_ns,
+                    Step::Tick { .. } => {
+                        base.decide(sim.latest_at(now), now);
+                    }
+                }
+            };
+            assert!(base.lock.cadence.is_some(), "tick {waited}");
+            for stall in (0..=135).map(|k| cfg.period_ns() + k * MS) {
+                let mut p = base.clone();
+                let before = p.counts();
+                let woke = due + stall;
+                let mut burst = Vec::new();
+                while let Step::Tick { index, .. } = p.step(woke) {
+                    burst.push(index);
+                    p.decide(sim.latest_at(woke), woke);
+                }
+                let c = p.counts();
+                let (skipped, late) = (c.skipped - before.skipped, c.late - before.late);
+                let tag = format!("tick {waited}, stall {stall}: {burst:?}, {c:?}");
+                assert!(burst.len() as u64 <= cfg.max_burst, "{tag}");
+                assert_eq!(burst[0], waited + skipped, "{tag}");
+                assert!(burst.windows(2).all(|w| w[1] == w[0] + 1), "{tag}");
+                if skipped > 0 {
+                    assert_eq!((burst.len(), late), (1, 0), "{tag}");
+                    resyncs += 1;
+                } else {
+                    // The last one too when it took the frame planned for
+                    // the tick after it, which then waits for a later one.
+                    assert!(
+                        (burst.len() - 1..=burst.len()).contains(&(late as usize)),
+                        "{tag}"
+                    );
+                    caught_up += 1;
+                }
+                longest = longest.max(burst.len());
+            }
+            now = due;
+        }
+        eprintln!(
+            "cadence mode stalls of one to five periods: {caught_up} caught up (longest burst \
+             {longest}), {resyncs} resynchronised"
+        );
+        assert_eq!(longest as u64, cfg.max_burst);
+        assert!(resyncs > 0 && caught_up > 0);
+    }
+
+    /// A clock stall of 1.5 s, over the resynchronisation threshold, in
+    /// cadence mode: the clock jumps to the tick due and counts the ones it
+    /// skipped (not late); the frames that arrived meanwhile are superseded.
+    /// The arrival gap between the frames emitted on either side of the
+    /// stall ends the input run: the lock lets go, and engages again in
+    /// cadence mode once a window of arrivals measures the cadence anew.
+    #[test]
+    fn cadence_mode_resynchronises_after_a_long_stall() {
+        let end = 40_000 * MS;
+        let arrivals = on_grid(train(1, 9 * MS, 19.99, end + 100 * MS, MS, 471), 4 * MS);
+        let sim = Sim::new(arrivals, end);
+        let period = sim.cfg.period_ns();
+        let stall = 1_500 * MS;
+        let mut stalled = false;
+        let (out, p) = sim.run_waking(|index| {
+            if index >= 600 && !stalled {
+                stalled = true;
+                stall
+            } else {
+                0
+            }
+        });
+        let c = p.counts();
+        let tag = format!("{c:?}");
+        // One jump in the indices, by the ticks skipped.
+        let jump = out
+            .windows(2)
+            .position(|w| w[1].index != w[0].index + 1)
+            .unwrap();
+        assert_eq!(out[jump].index, 599, "{tag}");
+        assert_eq!(out[jump + 1].index, 600 + c.skipped, "{tag}");
+        assert!(
+            out[jump + 2..]
+                .windows(2)
+                .all(|w| w[1].index == w[0].index + 1)
+        );
+        assert!((44..=46).contains(&c.skipped), "{tag}");
+        assert_eq!((c.late, c.placeholder), (0, 1), "{tag}");
+        // The tick after the resynchronised one is not due at once.
+        assert!(out[jump + 2].at > out[jump + 1].at, "{tag}");
+        assert!((29..=31).contains(&c.superseded), "{tag}");
+        assert!(out.windows(2).all(|w| w[0].scheduled() <= w[1].scheduled()));
+        // Locked before the stall; a new run after it, locked again in
+        // cadence mode within a window of arrivals, for good.
+        assert!(out[jump].locked, "{tag}");
+        assert_eq!(c.lock_acquisitions, 2, "{tag}");
+        let relocked = out.iter().rposition(|e| !e.locked).unwrap() + 1;
+        let resumed = out[jump + 1].at;
+        assert!(
+            out[relocked].at > resumed && out[relocked].at < resumed + 5_000 * MS,
+            "{tag}: locked again at {}",
+            out[relocked].at
+        );
+        assert!(p.lock.cadence.is_some(), "{tag}");
+        let f = cadence_figures(&out, relocked + 1, period, 19.99);
+        eprintln!(
+            "20 fps with a 1.5 s clock stall: skipped {} superseded {}, locked again {:.2} s \
+             after, then wait p50 {:.2} p95 {:.2} ms, missed {} of {}",
+            c.skipped,
+            c.superseded,
+            (out[relocked].at - resumed) as f64 / 1e9,
+            f.p50 as f64 / 1e6,
+            f.p95 as f64 / 1e6,
+            f.missed,
+            f.fresh,
+        );
+        assert_eq!(f.missed, 0, "{tag}");
+        assert!(f.p50 <= M + 3 * MS, "{tag}: p50 {}", f.p50);
+    }
+
+    /// A 20 fps camera in cadence mode that stops for a second, then
+    /// resumes. The last frame is repeated up to the gap threshold, the
+    /// placeholder follows until the camera is back, and the placeholder
+    /// ends the run: the lock lets go, and the resumed camera is a new run,
+    /// acquired anew in cadence mode once a window of arrivals measures it.
+    /// The ticks keep the grid throughout.
+    #[test]
+    fn cadence_mode_reacquires_after_the_input_stalls_to_the_placeholder() {
+        let end = 25_000 * MS;
+        let resume = 11_000 * MS;
+        let mut arrivals = train(1, 9 * MS, 19.99, 10_000 * MS, MS, 481);
+        arrivals.extend(train(1, resume, 19.99, end + 100 * MS - resume, MS, 483));
+        let arrivals = on_grid(arrivals, 4 * MS);
+        // The last frame before the gap, and the first after it.
+        let back = arrivals.partition_point(|a| a.0 < 10_500 * MS);
+        let (last, back) = (arrivals[back - 1].0, arrivals[back].0);
+        let sim = Sim::new(arrivals, end);
+        let period = sim.cfg.period_ns();
+        let (out, p) = sim.run();
+        let c = p.counts();
+        let tag = format!("{c:?}");
+        assert_grid(&out, &sim.cfg);
+        assert!(out.windows(2).all(|w| w[0].scheduled() <= w[1].scheduled()));
+        assert_eq!((c.skipped, c.late, c.superseded), (0, 0, 0), "{tag}");
+        // Repeats while the last frame is under the gap threshold old,
+        // then placeholders until the camera is back.
+        let emitted = |t: u64| {
+            out.iter()
+                .position(|e| e.wait.is_some_and(|w| e.at - w == t))
+                .unwrap()
+        };
+        let gap = &out[emitted(last) + 1..emitted(back)];
+        for e in gap {
+            let want = if e.at - last < sim.cfg.gap_threshold_ns {
+                TickKind::Repeat
+            } else {
+                TickKind::Placeholder
+            };
+            assert_eq!(e.kind, want, "tick {}: {tag}", e.index);
+        }
+        let repeats = gap.iter().filter(|e| e.kind == TickKind::Repeat).count();
+        assert!((14..=16).contains(&repeats), "{repeats}: {tag}");
+        assert!((14..=16).contains(&(c.placeholder - 1)), "{tag}");
+        // Locked in cadence mode until the placeholder, then not until
+        // acquired anew after the camera is back, for good.
+        let first_placeholder = out
+            .iter()
+            .position(|e| e.at > last && e.kind == TickKind::Placeholder)
+            .unwrap();
+        assert!(out[first_placeholder - 1].locked, "{tag}");
+        assert_eq!(c.lock_acquisitions, 2, "{tag}");
+        let relocked = out.iter().rposition(|e| !e.locked).unwrap() + 1;
+        assert!(out[first_placeholder..relocked].iter().all(|e| !e.locked));
+        assert!(
+            out[relocked].at > back && out[relocked].at < back + 5_000 * MS,
+            "{tag}: locked again at {}",
+            out[relocked].at
+        );
+        assert!(p.lock.cadence.is_some(), "{tag}");
+        let f = cadence_figures(&out, relocked + 1, period, 19.99);
+        eprintln!(
+            "20 fps stalled to the placeholder: {repeats} repeats and {} placeholders in the \
+             gap, locked again {:.2} s after the camera resumed, then wait p50 {:.2} p95 {:.2} \
+             ms, missed {} of {}",
+            c.placeholder - 1,
+            (out[relocked].at - back) as f64 / 1e9,
+            f.p50 as f64 / 1e6,
+            f.p95 as f64 / 1e6,
+            f.missed,
+            f.fresh,
+        );
+        assert_eq!(f.missed, 0, "{tag}");
+        assert!(f.p50 <= M + 3 * MS, "{tag}: p50 {}", f.p50);
     }
 
     #[test]
