@@ -61,13 +61,21 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// Revision 3 added the optional PipeWire output: `LoopbackConsumers`,
 /// `PipeWireConsumers` and `PipeWireOutput`, with `Consumers` the total of
 /// both kinds of consumer. Revision 4 added video noise removal: `Denoise`
-/// and `SetDenoise`.
-pub const INTERFACE_REVISION: u32 = 4;
+/// and `SetDenoise`. Revision 5 added the live preview: `AcquirePreview`,
+/// `ReleasePreview`, the `PreviewFrame` signal and `PreviewConsumers`, with
+/// `Consumers` counting the preview leases too.
+pub const INTERFACE_REVISION: u32 = 5;
 /// The first [`INTERFACE_REVISION`] with `LoopbackConsumers`,
 /// `PipeWireConsumers` and `PipeWireOutput`.
 pub const PIPEWIRE_REVISION: u32 = 3;
 /// The first [`INTERFACE_REVISION`] with `Denoise` and `SetDenoise`.
 pub const DENOISE_REVISION: u32 = 4;
+/// The first [`INTERFACE_REVISION`] with the live preview:
+/// `AcquirePreview`, `ReleasePreview`, `PreviewFrame` and
+/// `PreviewConsumers`.
+pub const PREVIEW_REVISION: u32 = 5;
+/// The frame rates `AcquirePreview` accepts.
+pub const PREVIEW_FPS: [u32; 2] = [15, 30];
 /// `PipeWireOutput` of a daemon whose PipeWire output is not configured, or
 /// that has none (before [`PIPEWIRE_REVISION`]).
 pub const PIPEWIRE_OFF: &str = "off";
@@ -231,7 +239,7 @@ pub enum IpcError {
     /// An argument is out of its domain: an unknown effect, a blur strength
     /// outside 0 to 1, a background image that is not an absolute path to a
     /// readable regular file, or `replace` with no background image
-    /// (revision 2).
+    /// (revision 2); a preview frame rate other than 15 or 30 (revision 5).
     InvalidArgument(String),
     /// Any other failure.
     Failed(String),
@@ -273,8 +281,8 @@ pub struct Snapshot {
     /// when the daemon does not offer it (tell that case by
     /// `interface_revision` below [`DENOISE_REVISION`]).
     pub denoise: bool,
-    /// `Consumers`: every consumer, those holding the loopback and those
-    /// linked to the PipeWire output.
+    /// `Consumers`: every consumer, those holding the loopback, those
+    /// linked to the PipeWire output and the preview leases.
     pub consumers: u32,
     /// `LoopbackConsumers` (revision 3): the processes holding the
     /// loopback. From a daemon without it, `Consumers` (which then counts
@@ -283,6 +291,9 @@ pub struct Snapshot {
     /// `PipeWireConsumers` (revision 3): the links to the PipeWire output;
     /// `0` when the daemon does not offer it.
     pub pipewire_consumers: u32,
+    /// `PreviewConsumers` (revision 5): the preview leases held; `0` when
+    /// the daemon does not offer it.
+    pub preview_consumers: u32,
     /// `PipeWireOutput` (revision 3): `off`, `unsupported`, `connecting`,
     /// `ready`, `streaming` or `failed`; `off` when the daemon does not
     /// offer it.
@@ -308,6 +319,7 @@ impl Snapshot {
             consumers: 0,
             loopback_consumers: 0,
             pipewire_consumers: 0,
+            preview_consumers: 0,
             pipewire_output: PIPEWIRE_OFF.into(),
             interface_revision: 0,
         }
@@ -346,6 +358,7 @@ impl Snapshot {
             }
             "LoopbackConsumers" => self.loopback_consumers = deserialize_for_property(value)?,
             "PipeWireConsumers" => self.pipewire_consumers = deserialize_for_property(value)?,
+            "PreviewConsumers" => self.preview_consumers = deserialize_for_property(value)?,
             "PipeWireOutput" => self.pipewire_output = deserialize_for_property(value)?,
             "InterfaceRevision" => self.interface_revision = deserialize_for_property(value)?,
             _ => {}
@@ -418,7 +431,8 @@ impl Snapshot {
     /// [`Snapshot::fetch_no_autostart`].
     ///
     /// The properties added after revision 1 (`BlurStrength`,
-    /// `BackgroundImage`, `PipeWireConsumers`, `PipeWireOutput`, `Denoise`)
+    /// `BackgroundImage`, `PipeWireConsumers`, `PipeWireOutput`, `Denoise`,
+    /// `PreviewConsumers`)
     /// keep their [`Snapshot::empty`] value when the daemon does not offer
     /// them (see [`is_unknown_property_error`]), and `LoopbackConsumers` is then
     /// `Consumers`, as [`Snapshot::from_properties`] does for a property
@@ -443,6 +457,7 @@ impl Snapshot {
                 proxy.pipewire_consumers().await,
                 empty.pipewire_consumers,
             )?,
+            preview_consumers: optional(proxy.preview_consumers().await, empty.preview_consumers)?,
             pipewire_output: optional(proxy.pipewire_output().await, empty.pipewire_output)?,
             interface_revision: proxy.interface_revision().await?,
         })
@@ -715,7 +730,46 @@ mod tests {
         assert!(!old.denoise);
         assert!(old.interface_revision < DENOISE_REVISION);
         assert!(!Snapshot::empty().denoise);
-        assert_eq!(INTERFACE_REVISION, DENOISE_REVISION);
+    }
+
+    #[test]
+    fn the_revision_5_property_and_an_older_daemon() {
+        let state = Variant::from("idle");
+        let total = Variant::from(3u32);
+        let leases = Variant::from(2u32);
+        let rev5 = Variant::from(PREVIEW_REVISION);
+        let snap = Snapshot::from_properties([
+            ("State", &state),
+            ("Consumers", &total),
+            ("PreviewConsumers", &leases),
+            ("LoopbackConsumers", &Variant::from(1u32)),
+            ("InterfaceRevision", &rev5),
+        ])
+        .unwrap();
+        assert_eq!(
+            (
+                snap.consumers,
+                snap.loopback_consumers,
+                snap.pipewire_consumers,
+                snap.preview_consumers
+            ),
+            (3, 1, 0, 2)
+        );
+        let mut changed = snap.clone();
+        changed
+            .apply_property("PreviewConsumers", &Variant::from(0u32))
+            .unwrap();
+        assert_eq!(changed.preview_consumers, 0);
+        assert!(changed.apply_property("PreviewConsumers", &state).is_err());
+        // A revision-4 daemon has none: 0, told apart by the revision.
+        let rev4 = Variant::from(DENOISE_REVISION);
+        let old =
+            Snapshot::from_properties([("State", &state), ("InterfaceRevision", &rev4)]).unwrap();
+        assert_eq!(old.preview_consumers, 0);
+        assert!(old.interface_revision < PREVIEW_REVISION);
+        assert_eq!(Snapshot::empty().preview_consumers, 0);
+        assert_eq!(INTERFACE_REVISION, PREVIEW_REVISION);
+        assert_eq!(PREVIEW_FPS, [15, 30]);
     }
 
     #[test]

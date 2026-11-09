@@ -61,11 +61,12 @@
 //! poll confirms it (the effect's status by then shows a failure of the
 //! chain).
 //!
-//! Consumers are of two kinds: processes holding the loopback (the
-//! consumer watcher's count) and, with `[pipewire] enabled`, links to the
-//! PipeWire output (its [`PipeWireEvent`]s). The lifecycle (debounce, grace,
-//! a deferred writer rebuild) follows their total, `Consumers`; either kind
-//! keeps the session running. The PipeWire output runs next to the writer
+//! Consumers are of three kinds: processes holding the loopback (the
+//! consumer watcher's count), with `[pipewire] enabled` links to the
+//! PipeWire output (its [`PipeWireEvent`]s), and the live preview's leases
+//! ([`crate::preview`]). The lifecycle (debounce, grace, a deferred writer
+//! rebuild, the GPU parked at idle) follows their total, `Consumers`; any
+//! kind keeps the session running. The PipeWire output runs next to the writer
 //! but has its own lifecycle, so `[pipewire] enabled` never disturbs the
 //! loopback device: a reload that enables it starts the output at once; one
 //! that disables it stops the output once it has no link (at once if it
@@ -79,6 +80,15 @@
 //! each of its events: only the current output's events are applied, so
 //! those an output stopped or replaced left in the command queue change
 //! nothing, in whatever order they arrive.
+//!
+//! A preview lease (`AcquirePreview`) is granted in every state, `off` and
+//! `error` included: the backend encodes the writer's frames while a lease
+//! is held and a writer runs (black placeholders while no camera streams).
+//! The leases are keyed by the holder's unique bus name and end with
+//! `ReleasePreview`, when the holder leaves the bus
+//! ([`Command::PreviewOwnerGone`]) and at shutdown. The frames are not the
+//! controller's business: the backend reports them to the D-Bus side
+//! directly.
 //!
 //! The streaming camera is followed by its device node, not by its id: an
 //! id can change between two scans of the same camera (udev adds the
@@ -100,9 +110,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::backend::{
     EffectReport, EffectStatus, Failure, MediaBackend, PipeWireEvent, PipeWireGeneration,
-    PipeWireState, SessionParams,
+    PipeWireState, PreviewRequest, SessionParams,
 };
 use crate::camera::{self, Camera};
+use crate::preview::{Leases, PreviewDir, check_fps};
 use crate::{debug, error, info, warning};
 
 /// How often a missing or held loopback device is retried.
@@ -126,6 +137,8 @@ pub const MAX_BACKGROUND_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The reply channel of a D-Bus method.
 pub type Reply = tokio::sync::oneshot::Sender<Result<(), IpcError>>;
+/// The reply channel of `AcquirePreview`: the frame file's path.
+pub type PathReply = tokio::sync::oneshot::Sender<Result<String, IpcError>>;
 
 /// What the controller is asked to do.
 #[derive(Debug)]
@@ -141,6 +154,17 @@ pub enum Command {
     SetBackgroundImage(String, Reply),
     /// `SetDenoise(b)`.
     SetDenoise(bool, Reply),
+    /// `AcquirePreview(u)` from the unique bus name `name`.
+    AcquirePreview {
+        name: String,
+        fps: u32,
+        reply: PathReply,
+    },
+    /// `ReleasePreview()` from that unique bus name.
+    ReleasePreview(String, Reply),
+    /// That unique bus name left the bus (`NameOwnerChanged` with no new
+    /// owner): its preview lease, if any, ends.
+    PreviewOwnerGone(String),
     /// `ReloadConfig()` (with its reply) or SIGHUP (without).
     ReloadConfig(Option<Reply>),
     /// The consumer watcher's count of processes holding the loopback.
@@ -170,6 +194,7 @@ pub enum Change {
     Consumers(u32),
     LoopbackConsumers(u32),
     PipeWireConsumers(u32),
+    PreviewConsumers(u32),
     PipeWireOutput(String),
 }
 
@@ -190,6 +215,7 @@ impl Change {
             Change::Consumers(_) => "Consumers",
             Change::LoopbackConsumers(_) => "LoopbackConsumers",
             Change::PipeWireConsumers(_) => "PipeWireConsumers",
+            Change::PreviewConsumers(_) => "PreviewConsumers",
             Change::PipeWireOutput(_) => "PipeWireOutput",
         }
     }
@@ -201,6 +227,9 @@ pub enum Note {
     /// Properties that changed in one step, in emission order.
     Changed(Vec<Change>),
     Stats(Stats),
+    /// A preview frame was written, with its sequence number (sent by the
+    /// backend's preview reporter, not by the controller).
+    PreviewFrame(u32),
 }
 
 /// What the controller and the D-Bus side share: the property snapshot the
@@ -253,6 +282,12 @@ impl Published {
 
     fn stats(&self, stats: Stats) {
         let _ = self.notes.send(Note::Stats(stats));
+    }
+
+    /// Announces a preview frame (`PreviewFrame(seq)`): called from the
+    /// preview encoder's thread, through the backend's preview reporter.
+    pub fn preview_frame(&self, seq: u32) {
+        let _ = self.notes.send(Note::PreviewFrame(seq));
     }
 
     /// Announces a `SetEnabled(false)` about to be queued (the D-Bus side
@@ -321,6 +356,9 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Vec<Change> {
     if old.pipewire_consumers != new.pipewire_consumers {
         out.push(Change::PipeWireConsumers(new.pipewire_consumers));
     }
+    if old.preview_consumers != new.preview_consumers {
+        out.push(Change::PreviewConsumers(new.preview_consumers));
+    }
     if old.pipewire_output != new.pipewire_output {
         out.push(Change::PipeWireOutput(new.pipewire_output.clone()));
     }
@@ -343,11 +381,15 @@ pub fn output_mode_string(c: &OutputContract) -> String {
     format!("{} {}x{}@{rate}", c.format.gst_name(), c.width, c.height)
 }
 
-/// The config file and the runtime state file.
+/// The config file, the runtime state file and the runtime directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
     pub config: PathBuf,
     pub state: PathBuf,
+    /// `$XDG_RUNTIME_DIR`, where the preview frames go
+    /// ([`crate::preview::PreviewDir`]); `None` when it is not set, and
+    /// then `AcquirePreview` fails.
+    pub runtime: Option<PathBuf>,
 }
 
 /// The runtime state from `path`. A file that cannot be read or parsed
@@ -400,6 +442,7 @@ pub fn preliminary_snapshot(paths: &Paths) -> Snapshot {
         consumers: 0,
         loopback_consumers: 0,
         pipewire_consumers: 0,
+        preview_consumers: 0,
         pipewire_output: PipeWireState::Off.as_str().into(),
         interface_revision: INTERFACE_REVISION,
     }
@@ -561,8 +604,8 @@ pub struct Controller<B: MediaBackend> {
     effect_applied: Option<EffectConfig>,
     /// When the effect's GPU time is logged next.
     effect_log_at: Option<Instant>,
-    /// Every consumer: `loopback_consumers + pipewire_consumers`, what the
-    /// lifecycle follows.
+    /// Every consumer: `loopback_consumers + pipewire_consumers` plus the
+    /// preview leases, what the lifecycle follows.
     consumers: u32,
     /// The consumer watcher's count of processes holding the loopback.
     loopback_consumers: u32,
@@ -570,6 +613,12 @@ pub struct Controller<B: MediaBackend> {
     pipewire_consumers: u32,
     /// The PipeWire output's state (`Off` without one).
     pipewire_state: PipeWireState,
+    /// The preview leases held (`PreviewConsumers`).
+    leases: Leases,
+    /// What the backend was last asked to preview.
+    preview: Option<PreviewRequest>,
+    /// The preview directory, as last prepared by `AcquirePreview`.
+    preview_dir_in_use: Option<PreviewDir>,
     /// Since when a consumer has been present (debounce).
     present_since: Option<Instant>,
     /// Since when no consumer has been present (grace).
@@ -646,6 +695,9 @@ impl<B: MediaBackend> Controller<B> {
             loopback_consumers: 0,
             pipewire_consumers: 0,
             pipewire_state: PipeWireState::Off,
+            leases: Leases::default(),
+            preview: None,
+            preview_dir_in_use: None,
             present_since: None,
             absent_since: None,
             next_stats: None,
@@ -690,6 +742,17 @@ impl<B: MediaBackend> Controller<B> {
             Command::SetDenoise(on, reply) => {
                 let res = self.set_denoise(on, now);
                 let _ = reply.send(res);
+            }
+            Command::AcquirePreview { name, fps, reply } => {
+                let res = self.acquire_preview(&name, fps, now);
+                let _ = reply.send(res);
+            }
+            Command::ReleasePreview(name, reply) => {
+                self.release_preview(&name, "released", now);
+                let _ = reply.send(Ok(()));
+            }
+            Command::PreviewOwnerGone(name) => {
+                self.release_preview(&name, "ended: its holder left the bus", now);
             }
             Command::ReloadConfig(reply) => {
                 let res = self.reload(now);
@@ -765,9 +828,11 @@ impl<B: MediaBackend> Controller<B> {
         next.saturating_duration_since(now)
     }
 
-    /// Stops the session and the writer.
+    /// Ends the preview leases and stops the session and the writer.
     pub fn shutdown(&mut self) {
         info!("shutting down");
+        self.leases.clear();
+        self.apply_preview();
         self.drop_session();
         self.backend.stop_writer();
         self.writer = None;
@@ -915,6 +980,7 @@ impl<B: MediaBackend> Controller<B> {
             consumers: self.consumers,
             loopback_consumers: self.loopback_consumers,
             pipewire_consumers: self.pipewire_consumers,
+            preview_consumers: self.leases.count(),
             pipewire_output: self.pipewire_state.as_str().into(),
             interface_revision: INTERFACE_REVISION,
         };
@@ -1572,15 +1638,27 @@ impl<B: MediaBackend> Controller<B> {
         }
     }
 
-    /// Sets the two counts; the lifecycle follows their total.
+    /// Sets the loopback and PipeWire counts; the lifecycle follows the
+    /// total with the preview leases ([`Self::count_consumers`]).
     fn set_consumers(&mut self, loopback: u32, pipewire: u32, now: Instant) {
         self.loopback_consumers = loopback;
         self.pipewire_consumers = pipewire;
-        let n = loopback.saturating_add(pipewire);
+        self.count_consumers(now);
+    }
+
+    /// The total of the three kinds of consumer, and the debounce and
+    /// grace instants when it leaves or reaches zero.
+    fn count_consumers(&mut self, now: Instant) {
+        let (loopback, pipewire, preview) = (
+            self.loopback_consumers,
+            self.pipewire_consumers,
+            self.leases.count(),
+        );
+        let n = loopback.saturating_add(pipewire).saturating_add(preview);
         if n == self.consumers {
             return;
         }
-        debug!("consumers: {n} (loopback {loopback}, PipeWire {pipewire})");
+        debug!("consumers: {n} (loopback {loopback}, PipeWire {pipewire}, preview {preview})");
         if n > 0 && self.consumers == 0 {
             self.present_since = Some(now);
             self.absent_since = None;
@@ -1815,6 +1893,70 @@ impl<B: MediaBackend> Controller<B> {
         }
         self.reconcile(now);
         res
+    }
+
+    /// `AcquirePreview(fps)` from `name`: the rate checked, the directory
+    /// made safe, the lease recorded (or renewed at the new rate) and the
+    /// backend asked for the preview. Replies with the frame file's path.
+    fn acquire_preview(&mut self, name: &str, fps: u32, now: Instant) -> Result<String, IpcError> {
+        check_fps(fps).map_err(|e| IpcError::InvalidArgument(e.to_string()))?;
+        let dir = PreviewDir::under(self.paths.runtime.as_deref()).map_err(|e| {
+            warning!("preview refused: {e}");
+            IpcError::Failed(e)
+        })?;
+        dir.prepare().map_err(|e| {
+            warning!("preview refused: {e}");
+            IpcError::Failed(e)
+        })?;
+        let path = dir.frame().into_os_string().into_string().map_err(|p| {
+            IpcError::Failed(format!(
+                "the preview file {} is not valid UTF-8, which D-Bus cannot carry",
+                Path::new(&p).display()
+            ))
+        })?;
+        let renewed = self.leases.holds(name);
+        // Checked above: cannot fail.
+        let _ = self.leases.acquire(name, fps);
+        info!(
+            "preview lease {} by {name} at {fps} fps ({} held)",
+            if renewed { "renewed" } else { "taken" },
+            self.leases.count()
+        );
+        self.preview_dir_in_use = Some(dir);
+        self.apply_preview();
+        self.count_consumers(now);
+        self.reconcile(now);
+        Ok(path)
+    }
+
+    /// Ends the preview lease of `name`, if it holds one (`how` is logged).
+    fn release_preview(&mut self, name: &str, how: &str, now: Instant) {
+        if !self.leases.release(name) {
+            return;
+        }
+        info!(
+            "preview lease of {name} {how} ({} held)",
+            self.leases.count()
+        );
+        self.apply_preview();
+        self.count_consumers(now);
+        self.reconcile(now);
+    }
+
+    /// Tells the backend the preview the leases ask for, if it changed: the
+    /// highest rate held, into the preview directory; none without a lease.
+    fn apply_preview(&mut self) {
+        let want = match (self.leases.fps(), &self.preview_dir_in_use) {
+            (Some(fps), Some(dir)) => Some(PreviewRequest {
+                fps,
+                dir: dir.path().to_path_buf(),
+            }),
+            _ => None,
+        };
+        if want != self.preview {
+            self.backend.set_preview(want.clone());
+            self.preview = want;
+        }
     }
 
     fn set_effect(&mut self, name: &str, now: Instant) -> Result<(), IpcError> {

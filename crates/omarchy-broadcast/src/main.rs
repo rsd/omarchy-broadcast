@@ -7,6 +7,7 @@ mod human;
 mod json;
 mod model;
 mod out;
+mod preview;
 mod watch;
 
 use std::future::Future;
@@ -33,9 +34,9 @@ Exit status:
   3  omarchy-broadcastd is not running, or there is no D-Bus session bus
   4  any other D-Bus failure, a timeout, or a failed write to stdout
 
-`status`, `cameras`, `watch` and `effect` without an effect never start the daemon. `on`,
-`off`, `camera`, `effect <effect>` and `denoise` may start it through D-Bus activation when
-its activation file is installed.
+`status`, `cameras`, `watch`, `preview` and `effect` without an effect never start the
+daemon. `on`, `off`, `camera`, `effect <effect>` and `denoise` may start it through D-Bus
+activation when its activation file is installed.
 
 `--json` output is documented in docs/cli-json.md; the D-Bus interface in docs/dbus-api.md.";
 
@@ -116,6 +117,28 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Hold a live preview of the virtual camera until interrupted: the
+    /// daemon writes small JPEG frames to a file in $XDG_RUNTIME_DIR, and
+    /// one line is printed per frame.
+    ///
+    /// The preview counts as an application using the camera: it starts
+    /// the camera when nothing else does. It ends when this command does.
+    Preview {
+        /// Print one JSON object per line (NDJSON).
+        #[arg(long)]
+        json: bool,
+        /// Frames per second: 15 or 30.
+        #[arg(long, value_name = "15|30", default_value_t = 15, value_parser = parse_fps)]
+        fps: u32,
+    },
+}
+
+/// The value of `--fps`: 15 or 30.
+fn parse_fps(s: &str) -> Result<u32, String> {
+    match s.parse::<u32>() {
+        Ok(v) if obc_ipc::PREVIEW_FPS.contains(&v) => Ok(v),
+        _ => Err("the preview frame rate must be 15 or 30".into()),
+    }
 }
 
 /// The value of `--strength`: a number from 0.0 to 1.0.
@@ -373,6 +396,7 @@ async fn run(job: Job) -> u8 {
         Job::Command(Command::Cameras { json }) => show(*json, View::Cameras).await,
         Job::Command(Command::Effect { json, .. }) => show(*json, View::Effect).await,
         Job::Command(Command::Watch { json }) => watch::run(*json).await,
+        Job::Command(Command::Preview { json, fps }) => preview::run(*json, *fps).await,
         Job::Command(Command::Denoise { value }) => set_denoise(value == "on").await,
         Job::Command(command @ (Command::On | Command::Off | Command::Camera { .. })) => {
             control(command).await

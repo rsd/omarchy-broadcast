@@ -79,7 +79,7 @@ Tests, including the manual check with OBS or Chrome, are described in [docs/tes
 
 ## Documentation
 
-See [docs/README.md](docs/README.md) for the architecture, decision records, setup guides and benchmarks. The Omarchy bar widget (status icon, on/off, camera, effect and noise-removal selection) is a separate project, the omarchy-broadcast-plugin repository; it is a client of the daemon through `omarchy-broadcast watch --json` and is not installed by the package.
+See [docs/README.md](docs/README.md) for the architecture, decision records, setup guides and benchmarks. The Omarchy bar widget (status icon, on/off, camera, effect and noise-removal selection) is a separate project, the omarchy-broadcast-plugin repository; it is a client of the daemon through `omarchy-broadcast watch --json` and is not installed by the package. For a live preview of the virtual camera, the widget runs `omarchy-broadcast preview --json`, which holds a preview lease and prints a line per frame the daemon writes to a small JPEG file under `$XDG_RUNTIME_DIR` ([docs/cli-json.md](docs/cli-json.md#preview)); a preview counts as a user of the camera, so it starts it.
 
 ## Licence
 

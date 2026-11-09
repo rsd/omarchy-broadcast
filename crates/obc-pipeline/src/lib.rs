@@ -28,7 +28,8 @@
 //! (`instrument`, `stats`, `gpu`, `stamp`) serve `obc-bench`. With the
 //! cargo feature `pipewire` (off by default), the `pipewire` module also
 //! offers the writer's frames as a native PipeWire camera node, fed by the
-//! writer's tap ([`loopback::FrameTap`]).
+//! writer's tap ([`loopback::FrameTap`]). The [`preview`] encoder, fed by
+//! the same tap, writes small JPEG snapshots of them for a live preview.
 
 pub mod capability;
 pub mod clock;
@@ -47,6 +48,7 @@ pub mod output;
 pub mod pipeline;
 #[cfg(feature = "pipewire")]
 pub mod pipewire;
+pub mod preview;
 pub mod process;
 pub mod session;
 pub mod slot;
@@ -79,5 +81,6 @@ pub use output::{
 pub use pipeline::{
     LinkCaps, LoopbackMismatch, MediaPipeline, PipelineError, StopError, all_cuda_between,
 };
+pub use preview::{PreviewConfig, PreviewCounts, PreviewEncoder};
 pub use process::GpuStage;
 pub use session::{Session, SwitchTiming};

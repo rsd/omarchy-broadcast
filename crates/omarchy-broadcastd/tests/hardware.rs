@@ -1381,7 +1381,7 @@ fn the_backend_parks_the_gpu_between_sessions_without_a_camera() {
         fixed_framerate: false,
         effect: obc_core::config::EffectConfig::default(),
     };
-    let mut backend = GstBackend::new(None).unwrap();
+    let mut backend = GstBackend::new(None, None).unwrap();
     backend
         .start_writer(
             &obc_core::SinkSelector::Path(sink.clone()),

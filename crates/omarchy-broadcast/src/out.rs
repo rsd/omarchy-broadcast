@@ -28,6 +28,17 @@ pub fn print(text: &str) {
     }
 }
 
+/// Writes one line (a newline is added) and flushes it, returning the
+/// error instead of exiting: for a caller that has something to undo
+/// before it exits (`preview` releases its lease).
+pub fn try_line(text: &str) -> io::Result<()> {
+    let mut s = String::with_capacity(text.len() + 1);
+    s.push_str(text);
+    s.push('\n');
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(s.as_bytes()).and_then(|()| stdout.flush())
+}
+
 /// Writes one line (a newline is added) and flushes it.
 pub fn line(text: &str) {
     let mut s = String::with_capacity(text.len() + 1);

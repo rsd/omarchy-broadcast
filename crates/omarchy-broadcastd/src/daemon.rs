@@ -14,6 +14,12 @@
 //!    another instance between 2 and 4 stops the writer and exits
 //!    [`EXIT_NAME_TAKEN`] as well).
 //!
+//! Between 2 and 3, preview frame files a crashed daemon left in
+//! `$XDG_RUNTIME_DIR/omarchy-broadcast` are removed, and the subscription
+//! to the clients leaving the bus (which ends their preview leases) is
+//! made. At exit the controller ends every lease and the files are removed
+//! again.
+//!
 //! With `Type=dbus`, systemd considers the service ready when the name is
 //! taken, so a unit ordered after `omarchy-broadcastd.service` (WirePlumber,
 //! with the drop-in in `dist/`) finds the loopback already advertised as a
@@ -34,12 +40,13 @@ use obc_ipc::{BUS_NAME, OBJECT_PATH};
 use tokio::signal::unix::{SignalKind, signal};
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 
-use crate::backend::PipeWireReporter;
 use crate::backend::real::GstBackend;
+use crate::backend::{PipeWireReporter, PreviewReporter};
 use crate::consumers::ConsumerWatcher;
 use crate::controller::{self, Command, Controller, Paths, Published, preliminary_snapshot};
-use crate::dbus::{Server, run_publisher};
+use crate::dbus::{Server, run_owner_watch, run_publisher, subscribe_owners};
 use crate::hotplug::{CameraWatcher, SECOND_SCAN, SETTLE};
+use crate::preview::PreviewDir;
 use crate::{error, info, warning};
 
 /// Exit status: a failure (no session bus, a thread could not start, ...).
@@ -82,7 +89,14 @@ fn resolve_paths(opts: &Options) -> Result<Paths, String> {
         .clone()
         .or_else(obc_core::config::state_path)
         .ok_or("neither XDG_STATE_HOME nor HOME is set: pass --state")?;
-    Ok(Paths { config, state })
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    Ok(Paths {
+        config,
+        state,
+        runtime,
+    })
 }
 
 /// Runs the daemon until SIGTERM or SIGINT.
@@ -134,6 +148,21 @@ fn consumer_watcher(commands: &Sender<Command>) -> Result<controller::SinkHook, 
     }))
 }
 
+/// The preview's reporter: every frame written becomes a `PreviewFrame`
+/// signal, through the publisher's channel (the controller is not woken).
+fn preview_reporter(published: &Published) -> PreviewReporter {
+    let published = published.clone();
+    Arc::new(move |seq| published.preview_frame(seq))
+}
+
+/// Removes the preview frame files under `runtime`, if any (a daemon that
+/// crashed may have left them; the controller removes them otherwise).
+fn remove_preview_files(runtime: Option<&Path>) {
+    if let Ok(dir) = PreviewDir::under(runtime) {
+        dir.remove_files();
+    }
+}
+
 /// The PipeWire output's reporter: its events go to the controller, with
 /// the generation of the output that sent them, on the same command channel
 /// as the consumer watcher's counts.
@@ -171,8 +200,15 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
         return Err(DaemonError::NameTaken);
     }
 
+    // No other instance: what is in the preview directory is stale.
+    let runtime = paths.runtime.clone();
+    remove_preview_files(runtime.as_deref());
+    let owners = subscribe_owners(&conn).await?;
+    tokio::spawn(run_owner_watch(owners, commands.clone()));
+
     let hook = consumer_watcher(&commands)?;
     let reporter = pipewire_reporter(&commands);
+    let previews = preview_reporter(&published);
     let tx = commands.clone();
     let cameras = CameraWatcher::spawn(PathBuf::from("/dev"), SETTLE, SECOND_SCAN, move || {
         let _ = tx.send(Command::Rescan);
@@ -185,7 +221,7 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
     let thread = std::thread::Builder::new()
         .name("obc-controller".into())
         .spawn(move || {
-            let res = GstBackend::new(Some(reporter)).map(|backend| {
+            let res = GstBackend::new(Some(reporter), Some(previews)).map(|backend| {
                 // Controller::new makes the first writer attempt.
                 let ctrl = Controller::new(backend, paths, published, Some(hook), Instant::now());
                 let _ = ready_tx.send(());
@@ -262,6 +298,7 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
             .unwrap_or_else(|_| Err("the controller thread panicked".into())),
     };
     let _ = thread.join();
+    remove_preview_files(runtime.as_deref());
     if let Some(c) = cameras {
         c.stop();
     }

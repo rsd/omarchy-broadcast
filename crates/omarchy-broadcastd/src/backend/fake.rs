@@ -12,7 +12,10 @@ use obc_gpu::{GpuError, NothingToPark, ParkError, ParkOutcome, UnparkOutcome};
 use obc_ipc::Stats;
 
 use super::park::{ParkOps, Parker, StartError, StopFailure, StopSession};
-use super::{EffectReport, EffectStatus, Failure, MediaBackend, PipeWireGeneration, SessionParams};
+use super::{
+    EffectReport, EffectStatus, Failure, MediaBackend, PipeWireGeneration, PreviewRequest,
+    SessionParams,
+};
 use crate::camera::Camera;
 use crate::log::Level;
 
@@ -35,6 +38,11 @@ pub struct World {
     pub pipewire_stops: u32,
     /// `offer_nv12` of the last `start_pipewire`.
     pub pipewire_offer_nv12: Option<bool>,
+    /// The preview asked for (`set_preview`); it is encoded while a writer
+    /// runs ([`World::previewing`]).
+    pub preview: Option<PreviewRequest>,
+    /// Every `set_preview`, by its rate (`None`: stopped), in order.
+    pub preview_sets: Vec<Option<u32>>,
     /// Reported (once) by `writer_failure` while a writer runs.
     pub writer_failure: Option<String>,
     /// What `loopback_holders` counts.
@@ -138,6 +146,8 @@ impl Default for World {
             pipewire_starts: 0,
             pipewire_stops: 0,
             pipewire_offer_nv12: None,
+            preview: None,
+            preview_sets: Vec::new(),
             writer_failure: None,
             holders: 0,
             holder_counts: 0,
@@ -247,6 +257,13 @@ impl World {
         if self.pipewire.take().is_some() {
             self.pipewire_stops += 1;
         }
+    }
+
+    /// The rate the preview is encoded at, while one is asked for and a
+    /// writer runs.
+    pub fn previewing(&self) -> Option<u32> {
+        self.writer.as_ref()?;
+        self.preview.as_ref().map(|p| p.fps)
     }
 
     /// The camera the session streams from.
@@ -436,6 +453,12 @@ impl MediaBackend for FakeBackend {
 
     fn stop_pipewire(&mut self) {
         self.world().stop_pipewire();
+    }
+
+    fn set_preview(&mut self, preview: Option<PreviewRequest>) {
+        let mut w = self.world();
+        w.preview_sets.push(preview.as_ref().map(|p| p.fps));
+        w.preview = preview;
     }
 
     fn writer_failure(&mut self) -> Option<String> {

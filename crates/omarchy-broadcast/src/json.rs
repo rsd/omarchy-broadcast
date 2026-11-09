@@ -1,5 +1,5 @@
-//! The JSON lines printed by `status --json`, `cameras --json` and
-//! `watch --json`. The contract is documented in `docs/cli-json.md`; this
+//! The JSON lines printed by `status --json`, `cameras --json`,
+//! `watch --json` and `preview --json`. The contract is documented in `docs/cli-json.md`; this
 //! module is its only producer.
 //!
 //! Every line is one JSON object carrying `"v"` ([`VERSION`]) and `"type"`,
@@ -7,7 +7,10 @@
 //! bounds below (measured in bytes of their JSON encoding, so escapes count)
 //! with a trailing [`ELLIPSIS`] (a path, `background_image`, keeps its end,
 //! the file name, behind a leading one), and the camera list is cut at
-//! [`MAX_CAMERAS`] entries.
+//! [`MAX_CAMERAS`] entries. The `path` of `preview` and `frame` lines is
+//! the one exception: it is never clipped (a client opens that file), and a
+//! path over [`MAX_PREVIEW_PATH_BYTES`] is refused instead
+//! ([`preview_path_fits`], [`CODE_PREVIEW_PATH_TOO_LONG`]).
 
 use std::borrow::Cow;
 
@@ -43,6 +46,10 @@ pub const MAX_PIPEWIRE_OUTPUT_BYTES: usize = 32;
 /// [`MAX_LINE_BYTES`]. A longer path is clipped at its start
 /// ([`clip_start`]), so the file name survives.
 pub const MAX_PATH_BYTES: usize = 256;
+/// Bound of the `path` of `preview` and `frame` lines (bytes of its JSON
+/// encoding): those lines stay under [`MAX_LINE_BYTES`] with it. Such a path
+/// is never clipped; a longer one is refused ([`preview_path_fits`]).
+pub const MAX_PREVIEW_PATH_BYTES: usize = 3968;
 /// Appended to a clipped string.
 pub const ELLIPSIS: &str = "\u{2026}";
 
@@ -52,6 +59,12 @@ pub const CODE_NOT_RUNNING: &str = "daemon-not-running";
 /// `code` of an error line: any other D-Bus failure (an unexpected reply, a
 /// timeout, a lost connection).
 pub const CODE_DBUS: &str = "dbus-error";
+/// `code` of an error line: the daemon is too old for the request (its
+/// interface revision; `preview` needs 5).
+pub const CODE_UNSUPPORTED: &str = "unsupported-daemon";
+/// `code` of an error line: the daemon's preview frame path is longer than
+/// [`MAX_PREVIEW_PATH_BYTES`], so no `frame` line could carry it.
+pub const CODE_PREVIEW_PATH_TOO_LONG: &str = "preview-path-too-long";
 
 /// Bytes `c` takes inside a JSON string as serde_json writes it.
 fn escaped_len(c: char) -> usize {
@@ -62,10 +75,21 @@ fn escaped_len(c: char) -> usize {
     }
 }
 
+/// Bytes of the JSON encoding of `s`, without the quotes.
+fn encoded_len(s: &str) -> usize {
+    s.chars().map(escaped_len).sum()
+}
+
+/// Whether `path` can be the `path` of `preview` and `frame` lines: its
+/// JSON encoding is at most [`MAX_PREVIEW_PATH_BYTES`].
+pub fn preview_path_fits(path: &str) -> bool {
+    encoded_len(path) <= MAX_PREVIEW_PATH_BYTES
+}
+
 /// `s`, clipped so that its JSON encoding (without the quotes) is at most
 /// `max` bytes, ending in [`ELLIPSIS`] when it was clipped.
 pub fn clip(s: &str, max: usize) -> Cow<'_, str> {
-    if s.chars().map(escaped_len).sum::<usize>() <= max {
+    if encoded_len(s) <= max {
         return Cow::Borrowed(s);
     }
     let budget = max.saturating_sub(ELLIPSIS.len());
@@ -86,7 +110,7 @@ pub fn clip(s: &str, max: usize) -> Cow<'_, str> {
 /// `max` bytes, starting with [`ELLIPSIS`] when it was clipped: the end of
 /// `s` is kept. For paths, whose file name is at the end.
 pub fn clip_start(s: &str, max: usize) -> Cow<'_, str> {
-    if s.chars().map(escaped_len).sum::<usize>() <= max {
+    if encoded_len(s) <= max {
         return Cow::Borrowed(s);
     }
     let budget = max.saturating_sub(ELLIPSIS.len());
@@ -141,6 +165,7 @@ struct StateFields<'a> {
     consumers: u32,
     loopback_consumers: u32,
     pipewire_consumers: u32,
+    preview_consumers: u32,
     pipewire_output: Cow<'a, str>,
     output_mode: Cow<'a, str>,
     effect: Cow<'a, str>,
@@ -162,6 +187,7 @@ impl<'a> StateFields<'a> {
             consumers: s.consumers,
             loopback_consumers: s.loopback_consumers,
             pipewire_consumers: s.pipewire_consumers,
+            preview_consumers: s.preview_consumers,
             pipewire_output: clip(&s.pipewire_output, MAX_PIPEWIRE_OUTPUT_BYTES),
             output_mode: clip(&s.output_mode, MAX_MODE_BYTES),
             effect: clip(&s.effect, MAX_EFFECT_BYTES),
@@ -228,6 +254,27 @@ struct StatsLine {
     latency_p50_ms: f64,
     cpu_percent: f64,
     gpu_percent: f64,
+}
+
+#[derive(Serialize)]
+struct PreviewLine<'a> {
+    v: u32,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct FrameLine<'a> {
+    v: u32,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    seq: u32,
+    path: &'a str,
 }
 
 #[derive(Serialize)]
@@ -311,6 +358,32 @@ pub fn stats_line(st: &Stats) -> String {
     })
 }
 
+/// `{"v":1,"type":"preview","active":true,"fps":15,"path":...}` once the
+/// preview lease is held; `{"v":1,"type":"preview","active":false}` when it
+/// is lost. The path is never clipped: the caller checks
+/// [`preview_path_fits`] first.
+pub fn preview_line(held: Option<(u32, &str)>) -> String {
+    to_line(&PreviewLine {
+        v: VERSION,
+        kind: "preview",
+        active: held.is_some(),
+        fps: held.map(|(fps, _)| fps),
+        path: held.map(|(_, path)| path),
+    })
+}
+
+/// `{"v":1,"type":"frame","seq":N,"path":...}`: the frame file was
+/// replaced. The path is never clipped: the caller checks
+/// [`preview_path_fits`] first.
+pub fn frame_line(seq: u32, path: &str) -> String {
+    to_line(&FrameLine {
+        v: VERSION,
+        kind: "frame",
+        seq,
+        path,
+    })
+}
+
 /// `{"v":1,"type":"error","code":...,"error":...}`.
 pub fn error_line(code: &str, message: &str) -> String {
     to_line(&ErrorLine {
@@ -352,6 +425,7 @@ mod tests {
             consumers: 2,
             loopback_consumers: 1,
             pipewire_consumers: 1,
+            preview_consumers: 0,
             pipewire_output: "streaming".into(),
             denoise: true,
             interface_revision: 4,
@@ -379,6 +453,7 @@ mod tests {
         assert_eq!(v["consumers"], 2);
         assert_eq!(v["loopback_consumers"], 1);
         assert_eq!(v["pipewire_consumers"], 1);
+        assert_eq!(v["preview_consumers"], 0);
         assert_eq!(v["pipewire_output"], "streaming");
         assert_eq!(v["output_mode"], "NV12 1920x1080@30");
         assert_eq!(v["effect"], "blur");
@@ -551,6 +626,52 @@ mod tests {
     }
 
     #[test]
+    fn preview_and_frame_lines() {
+        let path = "/run/user/1000/omarchy-broadcast/preview.jpg";
+        let line = preview_line(Some((15, path)));
+        assert_eq!(
+            line,
+            r#"{"v":1,"type":"preview","active":true,"fps":15,"path":"/run/user/1000/omarchy-broadcast/preview.jpg"}"#
+        );
+        parse(&line);
+        let line = preview_line(None);
+        assert_eq!(line, r#"{"v":1,"type":"preview","active":false}"#);
+        parse(&line);
+        let line = frame_line(7, path);
+        assert_eq!(
+            line,
+            r#"{"v":1,"type":"frame","seq":7,"path":"/run/user/1000/omarchy-broadcast/preview.jpg"}"#
+        );
+        // A path is never clipped: at the bound, the lines carry all of it
+        // within the line cap (`parse` checks it); one byte more does not
+        // fit, and neither does a path whose escapes take it over.
+        let long = format!("/{}", "d".repeat(MAX_PREVIEW_PATH_BYTES - 1));
+        assert!(preview_path_fits(&long));
+        let v = parse(&frame_line(u32::MAX, &long));
+        assert_eq!(v["seq"], u32::MAX);
+        assert_eq!(v["path"], long.as_str());
+        let v = parse(&preview_line(Some((30, &long))));
+        assert_eq!(v["path"], long.as_str());
+        assert!(!preview_path_fits(&format!("{long}d")));
+        let escaped = format!("/{}", "\u{1}".repeat(MAX_PREVIEW_PATH_BYTES / 6 + 1));
+        assert!(escaped.len() < MAX_PREVIEW_PATH_BYTES);
+        assert!(!preview_path_fits(&escaped));
+        let v = parse(&error_line(
+            CODE_PREVIEW_PATH_TOO_LONG,
+            &crate::bus::preview_path_too_long(&format!("{long}d")).message(),
+        ));
+        assert_eq!(v["code"], "preview-path-too-long");
+        // The snapshot carries the leases.
+        let mut s = sample();
+        s.preview_consumers = 2;
+        assert_eq!(parse(&snapshot_line(&s))["preview_consumers"], 2);
+        assert_eq!(
+            parse(&state_line(&s, &["preview_consumers"]))["preview_consumers"],
+            2
+        );
+    }
+
+    #[test]
     fn error_line_has_code_and_text() {
         let v = parse(&error_line(
             CODE_NOT_RUNNING,
@@ -613,6 +734,7 @@ mod tests {
         s.pipewire_output = nasty.clone();
         s.loopback_consumers = u32::MAX;
         s.pipewire_consumers = u32::MAX;
+        s.preview_consumers = u32::MAX;
         // The longest number serde_json prints for a strength in range.
         s.blur_strength = 2.225_073_858_507_201_4e-308;
         s.consumers = u32::MAX;

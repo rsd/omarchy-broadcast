@@ -130,6 +130,23 @@ pub type PipeWireGeneration = u64;
 /// that output's generation, from the output's own thread.
 pub type PipeWireReporter = Arc<dyn Fn(PipeWireGeneration, PipeWireEvent) + Send + Sync>;
 
+/// The live preview the backend is asked to encode
+/// ([`MediaBackend::set_preview`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewRequest {
+    /// Frames per second written: the highest rate of the leases held.
+    pub fps: u32,
+    /// The private directory the frame file is written to (prepared by the
+    /// caller, see [`crate::preview::PreviewDir`]).
+    pub dir: PathBuf,
+}
+
+/// Receives the sequence number of every preview frame written, from the
+/// encoder's own thread (the daemon emits `PreviewFrame` with it, without
+/// the controller). The numbers increase strictly over the backend's life,
+/// across encoders, from 1.
+pub type PreviewReporter = Arc<dyn Fn(u32) + Send + Sync>;
+
 /// Why a running session failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
@@ -153,14 +170,18 @@ pub trait MediaBackend: Send + 'static {
     /// it with `contract`, stopping the running one (and its PipeWire
     /// output) first. Returns the device node. Fails if the device is
     /// missing or another application holds it in another format. Starts
-    /// no PipeWire output: [`Self::start_pipewire`] does.
+    /// no PipeWire output: [`Self::start_pipewire`] does. A preview asked
+    /// for ([`Self::set_preview`]) is encoded from the new writer's frames,
+    /// with its contract.
     fn start_writer(
         &mut self,
         sink: &SinkSelector,
         contract: &OutputContract,
     ) -> Result<PathBuf, String>;
 
-    /// Stops the writer (the device is closed) and the PipeWire output.
+    /// Stops the writer (the device is closed), the PipeWire output and the
+    /// preview encoder (which removes its frame files); a preview still
+    /// asked for ([`Self::set_preview`]) resumes with the next writer.
     /// Idempotent.
     fn stop_writer(&mut self);
 
@@ -180,9 +201,21 @@ pub trait MediaBackend: Send + 'static {
     fn start_pipewire(&mut self, offer_nv12: bool) -> PipeWireGeneration;
 
     /// Stops the PipeWire output alone, if one runs: its node disappears;
-    /// the writer and the session keep running. Reports nothing: the caller
-    /// resets its view of the output. Idempotent.
+    /// the writer, the preview and the session keep running. Reports
+    /// nothing: the caller resets its view of the output. Idempotent.
     fn stop_pipewire(&mut self);
+
+    /// Asks for the live preview (`Some`), or for none. While one is asked
+    /// for and a writer runs, the writer's frames (the same buffers the
+    /// loopback and the PipeWire output get: the writer's one tap feeds
+    /// both) are decimated to `fps`, scaled and encoded as JPEG into
+    /// `dir`, each frame reported to the [`PreviewReporter`] the backend
+    /// was built with. A new rate applies to the running encoder; a new
+    /// directory restarts it; `None` stops it and removes its frame files.
+    /// The PipeWire output is not touched, and neither is the writer.
+    /// Never fails and never blocks for long: a preview that cannot be
+    /// encoded writes no frame. Idempotent.
+    fn set_preview(&mut self, preview: Option<PreviewRequest>);
 
     /// Why the running writer has failed, if it has.
     fn writer_failure(&mut self) -> Option<String>;

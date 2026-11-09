@@ -34,6 +34,8 @@ struct Mock {
     blur_strength: f64,
     background_image: String,
     denoise: bool,
+    /// Preview leases (the mock does not key them by caller).
+    previews: u32,
 }
 
 impl Mock {
@@ -61,6 +63,7 @@ impl Mock {
             blur_strength: 0.5,
             background_image: String::new(),
             denoise: false,
+            previews: 0,
         }
     }
 }
@@ -178,6 +181,30 @@ impl Mock {
         Ok(())
     }
 
+    async fn acquire_preview(
+        &mut self,
+        fps: u32,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<String, IpcError> {
+        if !obc_ipc::PREVIEW_FPS.contains(&fps) {
+            return Err(IpcError::InvalidArgument(format!(
+                "preview frame rate {fps} is not 15 or 30"
+            )));
+        }
+        self.previews = 1;
+        self.preview_consumers_changed(&emitter).await?;
+        Ok("/run/user/1000/omarchy-broadcast/preview.jpg".into())
+    }
+
+    async fn release_preview(
+        &mut self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        self.previews = 0;
+        self.preview_consumers_changed(&emitter).await?;
+        Ok(())
+    }
+
     #[zbus(signal)]
     async fn stats(
         emitter: &SignalEmitter<'_>,
@@ -186,6 +213,9 @@ impl Mock {
         cpu_percent: f64,
         gpu_percent: f64,
     ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn preview_frame(emitter: &SignalEmitter<'_>, seq: u32) -> zbus::Result<()>;
 
     #[zbus(property)]
     fn state(&self) -> State {
@@ -239,7 +269,12 @@ impl Mock {
 
     #[zbus(property)]
     fn consumers(&self) -> u32 {
-        self.consumers + self.pipewire_consumers
+        self.consumers + self.pipewire_consumers + self.previews
+    }
+
+    #[zbus(property)]
+    fn preview_consumers(&self) -> u32 {
+        self.previews
     }
 
     #[zbus(property)]
@@ -362,11 +397,12 @@ async fn proxy_reads_every_property() {
             consumers: 3,
             loopback_consumers: 1,
             pipewire_consumers: 2,
+            preview_consumers: 0,
             pipewire_output: "ready".into(),
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 4);
+    assert_eq!(INTERFACE_REVISION, 5);
     assert_eq!(proxy.inner().interface().as_str(), INTERFACE);
 }
 
@@ -393,6 +429,7 @@ async fn a_revision_1_daemon_reads_with_defaults_for_the_newer_properties() {
         assert_eq!(snap.loopback_consumers, 2);
         assert_eq!(snap.pipewire_consumers, 0);
         assert_eq!(snap.pipewire_output, "off");
+        assert_eq!(snap.preview_consumers, 0);
     }
     let no_autostart = within("snapshot", Snapshot::fetch_no_autostart(&client))
         .await
@@ -409,6 +446,10 @@ async fn a_revision_1_daemon_reads_with_defaults_for_the_newer_properties() {
         other => panic!("expected a transport-level error, got {other:?}"),
     }
     match within("SetDenoise", proxy.set_denoise(true)).await {
+        Err(IpcError::ZBus(_)) => {}
+        other => panic!("expected a transport-level error, got {other:?}"),
+    }
+    match within("AcquirePreview", proxy.acquire_preview(15)).await {
         Err(IpcError::ZBus(_)) => {}
         other => panic!("expected a transport-level error, got {other:?}"),
     }
@@ -712,4 +753,51 @@ async fn stats_signal_reaches_the_client() {
         }
     );
     assert!(!Stats::is_measured(got.gpu_percent));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_preview_methods_property_and_signal() {
+    let (server, client) = pair().await;
+    let proxy = OmarchyBroadcastProxy::builder(&client)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .unwrap();
+    let mut frames = proxy.receive_preview_frame().await.unwrap();
+
+    let path = within("AcquirePreview", proxy.acquire_preview(15))
+        .await
+        .unwrap();
+    assert_eq!(path, "/run/user/1000/omarchy-broadcast/preview.jpg");
+    assert_eq!(proxy.preview_consumers().await.unwrap(), 1);
+    assert_eq!(proxy.consumers().await.unwrap(), 4);
+    let snap = within("snapshot", Snapshot::fetch(&proxy)).await.unwrap();
+    assert_eq!(snap.preview_consumers, 1);
+    for bad in [0, 10, 16, 60, u32::MAX] {
+        match within("AcquirePreview", proxy.acquire_preview(bad)).await {
+            Err(e @ IpcError::InvalidArgument(_)) => assert_eq!(
+                zbus::DBusError::name(&e).as_str(),
+                "br.com.dias.OmarchyBroadcast1.Error.InvalidArgument"
+            ),
+            other => panic!("{bad}: expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    let iface: InterfaceRef<Mock> = server.object_server().interface(OBJECT_PATH).await.unwrap();
+    for seq in [1, 2] {
+        Mock::preview_frame(iface.signal_emitter(), seq)
+            .await
+            .unwrap();
+    }
+    for want in [1, 2] {
+        let signal = within("PreviewFrame", frames.next())
+            .await
+            .expect("PreviewFrame stream ended");
+        assert_eq!(signal.args().unwrap().seq, want);
+    }
+
+    within("ReleasePreview", proxy.release_preview())
+        .await
+        .unwrap();
+    assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
 }
