@@ -9,7 +9,7 @@ use obc_core::config::EffectConfig;
 use obc_core::{EffectMode, ModeRequest, OutputContract, SinkSelector};
 use obc_ipc::Stats;
 
-use super::{EffectReport, EffectStatus, Failure, MediaBackend, SessionParams};
+use super::{EffectReport, EffectStatus, Failure, MediaBackend, PipeWireGeneration, SessionParams};
 use crate::camera::Camera;
 
 /// The fake media world.
@@ -22,6 +22,13 @@ pub struct World {
     /// The running writer: node and contract.
     pub writer: Option<(PathBuf, OutputContract)>,
     pub writer_starts: u32,
+    /// The generation of the PipeWire output running next to the writer.
+    pub pipewire: Option<PipeWireGeneration>,
+    /// The generation of the last PipeWire output started (0: none yet).
+    pub pipewire_generation: PipeWireGeneration,
+    pub pipewire_starts: u32,
+    /// Running PipeWire outputs stopped (alone or with the writer).
+    pub pipewire_stops: u32,
     /// Reported (once) by `writer_failure` while a writer runs.
     pub writer_failure: Option<String>,
     /// What `loopback_holders` counts.
@@ -75,6 +82,10 @@ impl Default for World {
             sink: Ok(PathBuf::from("/dev/video11")),
             writer: None,
             writer_starts: 0,
+            pipewire: None,
+            pipewire_generation: 0,
+            pipewire_starts: 0,
+            pipewire_stops: 0,
             writer_failure: None,
             holders: 0,
             holder_counts: 0,
@@ -109,6 +120,13 @@ impl Default for World {
 }
 
 impl World {
+    /// Stops the running PipeWire output, if any.
+    fn stop_pipewire(&mut self) {
+        if self.pipewire.take().is_some() {
+            self.pipewire_stops += 1;
+        }
+    }
+
     /// The camera the session streams from.
     pub fn streaming(&self) -> Option<&str> {
         self.session.as_ref().and_then(|(_, c)| c.as_deref())
@@ -188,6 +206,7 @@ impl MediaBackend for FakeBackend {
         let mut w = self.world();
         w.session = None;
         w.writer = None;
+        w.stop_pipewire();
         let node = w.sink.clone()?;
         w.writer = Some((node.clone(), *contract));
         w.writer_starts += 1;
@@ -196,7 +215,24 @@ impl MediaBackend for FakeBackend {
 
     fn stop_writer(&mut self) {
         self.stop_session();
-        self.world().writer = None;
+        let mut w = self.world();
+        w.writer = None;
+        w.stop_pipewire();
+    }
+
+    fn start_pipewire(&mut self) -> PipeWireGeneration {
+        let mut w = self.world();
+        assert!(w.writer.is_some(), "the PipeWire output needs the writer");
+        w.stop_pipewire();
+        w.pipewire_generation += 1;
+        w.pipewire_starts += 1;
+        let generation = w.pipewire_generation;
+        w.pipewire = Some(generation);
+        generation
+    }
+
+    fn stop_pipewire(&mut self) {
+        self.world().stop_pipewire();
     }
 
     fn writer_failure(&mut self) -> Option<String> {

@@ -27,7 +27,9 @@ struct Mock {
     error: String,
     cameras: Vec<CameraInfo>,
     active: usize,
+    /// Holding the loopback.
     consumers: u32,
+    pipewire_consumers: u32,
     effect: String,
     blur_strength: f64,
     background_image: String,
@@ -52,7 +54,8 @@ impl Mock {
                 },
             ],
             active: 0,
-            consumers: 0,
+            consumers: 1,
+            pipewire_consumers: 2,
             effect: "none".into(),
             blur_strength: 0.5,
             background_image: String::new(),
@@ -219,7 +222,22 @@ impl Mock {
 
     #[zbus(property)]
     fn consumers(&self) -> u32 {
+        self.consumers + self.pipewire_consumers
+    }
+
+    #[zbus(property)]
+    fn loopback_consumers(&self) -> u32 {
         self.consumers
+    }
+
+    #[zbus(property, name = "PipeWireConsumers")]
+    fn pipewire_consumers(&self) -> u32 {
+        self.pipewire_consumers
+    }
+
+    #[zbus(property, name = "PipeWireOutput")]
+    fn pipewire_output(&self) -> String {
+        "ready".into()
     }
 
     #[zbus(property)]
@@ -271,7 +289,7 @@ impl Rev1 {
 
     #[zbus(property)]
     fn consumers(&self) -> u32 {
-        0
+        2
     }
 
     #[zbus(property)]
@@ -323,11 +341,14 @@ async fn proxy_reads_every_property() {
             effect: "none".into(),
             blur_strength: 0.5,
             background_image: String::new(),
-            consumers: 0,
+            consumers: 3,
+            loopback_consumers: 1,
+            pipewire_consumers: 2,
+            pipewire_output: "ready".into(),
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 2);
+    assert_eq!(INTERFACE_REVISION, 3);
     assert_eq!(proxy.inner().interface().as_str(), INTERFACE);
 }
 
@@ -348,6 +369,11 @@ async fn a_revision_1_daemon_reads_with_defaults_for_the_newer_properties() {
         assert_eq!(snap.effect, "none");
         assert_eq!(snap.blur_strength, Snapshot::empty().blur_strength);
         assert_eq!(snap.background_image, "");
+        // Before revision 3, Consumers counts the loopback only.
+        assert_eq!(snap.consumers, 2);
+        assert_eq!(snap.loopback_consumers, 2);
+        assert_eq!(snap.pipewire_consumers, 0);
+        assert_eq!(snap.pipewire_output, "off");
     }
     let no_autostart = within("snapshot", Snapshot::fetch_no_autostart(&client))
         .await

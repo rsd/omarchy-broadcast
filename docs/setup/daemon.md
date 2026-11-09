@@ -133,7 +133,64 @@ WirePlumber probes video devices when it starts. A loopback device that has no w
 - The drop-in (manual install, step 4) starts WirePlumber after the daemon is ready. Run `systemctl --user daemon-reload` after installing it, and restart WirePlumber once (below) for the current session.
 - Without the drop-in, or after the daemon was restarted by hand: `systemctl --user restart wireplumber` while the daemon runs.
 
-Applications that open `/dev/video*` directly are not affected. Meanwhile, `gst-device-monitor-1.0 -i Video/Source` lists the camera through the v4l2 provider. Details are in [testing.md](../testing.md#discovery-by-pipewire).
+Applications that open `/dev/video*` directly are not affected. Meanwhile, `gst-device-monitor-1.0 -i Video/Source` lists the camera through the v4l2 provider. Details are in [testing.md](../testing.md#discovery-by-pipewire). The daemon can also register its own PipeWire source, which needs none of this: see the next section.
+
+## The PipeWire output
+
+Optionally the daemon also registers a native PipeWire video source, "Omarchy Broadcast", next to the loopback device ([ADR-0016](../adr/0016-pipewire-output.md)). The loopback stays as it is and remains the default. Applications that use PipeWire for cameras find the node without WirePlumber having to probe the loopback. It is off in two places: the daemon must be built with the cargo feature, and the configuration must enable it.
+
+**Build.** The Arch package is built with the feature. From source, build or install with it; it needs the libpipewire headers and clang at build time and links `libpipewire-0.3`:
+
+```sh
+cargo build --release --features oma-broadcastd/pipewire
+cargo install --path crates/oma-broadcastd --features pipewire
+```
+
+`scripts/install-user.sh` builds without it.
+
+**Enable.** In `~/.config/oma-broadcast/config.toml`:
+
+```toml
+[pipewire]
+enabled = true
+```
+
+Then reload (`systemctl --user reload oma-broadcastd`). The node appears at once. Setting it back to `false` removes it at once if no application is linked to it, otherwise when the last one leaves. The loopback is not touched either way. The node exists only while the loopback writer runs.
+
+**Check.**
+
+```sh
+oma-broadcast status          # Consumers: 0 (loopback 0, PipeWire 0), PipeWire: ready
+pw-cli ls Node | grep -B2 -A8 oma-broadcast
+gst-launch-1.0 pipewiresrc target-object=oma-broadcast ! videoconvert ! autovideosink
+```
+
+`PipeWire:` in `status` is `ready` when the node is registered, `streaming` while an application is linked, `failed` when PipeWire is not running or the connection was lost (retried every 2 s; the daemon stays usable and the loopback keeps working), and `unsupported` when the configuration enables it in a daemon built without the feature. A PipeWire consumer starts the camera like a loopback consumer does, and `Consumers` is the total of both kinds.
+
+**Applications.**
+
+| Application | Setting |
+|---|---|
+| Firefox | uses the camera portal; the preference `media.webrtc.camera.allow-pipewire` in `about:config` must be `true` (the default in some distributions) |
+| Chromium, Chrome, Electron applications | off by default: enable the "PipeWire Camera support" flag (`chrome://flags`, feature `WebRtcPipeWireCamera`), or start the browser with `--enable-features=WebRtcPipeWireCamera` |
+| OBS Studio 30.1 and later | add a "Video Capture Device (PipeWire)" source |
+| GNOME Snapshot, GStreamer `pipewiresrc` | work without a setting |
+| Zoom, Discord | do not use the PipeWire camera; select the loopback camera |
+
+The node offers NV12, YUY2 and I420 at the output contract's size and rate. An application that asks for another format or size fails to link, and nothing else is affected.
+
+### Hiding the duplicate
+
+Once WirePlumber has probed the loopback while the writer streams, PipeWire lists "Omarchy Broadcast" twice: the native node, and the loopback through v4l2. To hide the loopback from PipeWire only, create `~/.config/wireplumber/wireplumber.conf.d/50-oma-broadcast.conf`:
+
+```
+monitor.v4l2.rules = [
+  { matches = [ { device.product.name = "Omarchy Broadcast" } ]
+    actions = { update-props = { device.disabled = true } } }
+]
+```
+
+and run `systemctl --user restart wireplumber`. Applications that open `/dev/video*` directly are unaffected. The package does not install this file. With it, the WirePlumber ordering drop-in is unnecessary for applications that use the native node; it stays useful for applications that reach the camera through v4l2 only. Remove the file and restart WirePlumber to undo it.
 
 ## Configuration
 

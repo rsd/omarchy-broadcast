@@ -143,3 +143,23 @@ blur_strength = 0.5
 #   "none"  the camera image without the effect, with the reason in Error.
 # Default: "black"
 on_failure = "black"
+
+[pipewire]
+# Also offer the virtual camera as a native PipeWire video source, next to
+# the v4l2loopback device, which is unaffected. The node is called
+# "Omarchy Broadcast" (node name oma-broadcast, class Video/Source, role
+# Camera). Applications that use PipeWire for cameras see it: Firefox and
+# GNOME Snapshot through the camera portal, OBS Studio 30.1 and later,
+# GStreamer's pipewiresrc, and Chromium-based applications that have their
+# PipeWire camera feature enabled. A link to the node counts as an
+# application using the camera, like a process holding the loopback device:
+# the camera starts and stops the same way.
+# Needs a daemon built with the cargo feature oma-broadcastd/pipewire (the
+# Arch package has it). Without it the daemon warns and reports the
+# PipeWire output as "unsupported"; when PipeWire is not running it reports
+# "failed" and retries every 2 s. Neither affects the loopback.
+# Enabling takes effect on reload, at once. Disabling takes effect at once
+# when no application is linked to the node, otherwise when the last one
+# leaves. The loopback is never restarted for this key.
+# Default: false
+enabled = false

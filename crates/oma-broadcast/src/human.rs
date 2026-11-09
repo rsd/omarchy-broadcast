@@ -3,7 +3,8 @@
 //! `--json`.
 //!
 //! Every string that comes from the daemon (camera names and ids, the
-//! error, the output mode, the effect, the background image) goes through
+//! error, the output mode, the effect, the background image, the PipeWire
+//! output's state) goes through
 //! [`printable`] before it reaches the terminal, so a crafted file or camera
 //! name cannot send it control sequences or reorder the text around it.
 
@@ -81,23 +82,38 @@ pub fn effect_label(s: &Snapshot) -> String {
     }
 }
 
-/// `status`: one field per line; the strength with `blur`, the image with
-/// `replace`.
+/// The consumers: the total, split into loopback and PipeWire while the
+/// PipeWire output is involved (`2 (loopback 1, PipeWire 1)`).
+pub fn consumers_label(s: &Snapshot) -> String {
+    if model::pipewire_involved(s) {
+        format!(
+            "{} (loopback {}, PipeWire {})",
+            s.consumers, s.loopback_consumers, s.pipewire_consumers
+        )
+    } else {
+        s.consumers.to_string()
+    }
+}
+
+/// `status`: one field per line; the PipeWire output's state while it is
+/// involved, the strength with `blur`, the image with `replace`.
 pub fn status_text(s: &Snapshot) -> String {
     let mut out = format!(
         "State:      {}\n\
          Enabled:    {}\n\
          Camera:     {}\n\
          Consumers:  {}\n\
-         Output:     {}\n\
-         Effect:     {}\n",
+         Output:     {}\n",
         s.state,
         yes_no(s.enabled),
         camera_label(s),
-        s.consumers,
+        consumers_label(s),
         printable(&s.output_mode),
-        printable(&s.effect),
     );
+    if model::pipewire_involved(s) {
+        out.push_str(&format!("PipeWire:   {}\n", printable(&s.pipewire_output)));
+    }
+    out.push_str(&format!("Effect:     {}\n", printable(&s.effect)));
     match s.effect.as_str() {
         "blur" => out.push_str(&format!("Strength:   {}\n", strength(s.blur_strength))),
         "replace" => out.push_str(&format!("Image:      {}\n", image(&s.background_image))),
@@ -166,12 +182,17 @@ pub fn camera_text(s: &Snapshot) -> String {
 
 /// One-line summary, printed by `watch` when it (re)connects.
 pub fn summary_line(s: &Snapshot) -> String {
+    let pipewire = if model::pipewire_involved(s) {
+        format!(" | PipeWire {}", printable(&s.pipewire_output))
+    } else {
+        String::new()
+    };
     let mut line = format!(
-        "state {} | enabled {} | camera {} | consumers {} | output {} | effect {}",
+        "state {} | enabled {} | camera {} | consumers {} | output {}{pipewire} | effect {}",
         s.state,
         yes_no(s.enabled),
         camera_label(s),
-        s.consumers,
+        consumers_label(s),
         printable(&s.output_mode),
         effect_label(s),
     );
@@ -195,6 +216,14 @@ pub fn change_lines(s: &Snapshot, changes: &Changes) -> Vec<String> {
             "active_camera_name" if changes.fields.contains(&"active_camera") => continue,
             "active_camera_name" => format!("camera: {}", camera_label(s)),
             "consumers" => format!("consumers: {}", s.consumers),
+            // The split is news only while the PipeWire output is involved:
+            // without it the loopback's count is the total.
+            "loopback_consumers" | "pipewire_consumers" if !model::pipewire_involved(s) => {
+                continue;
+            }
+            "loopback_consumers" => format!("loopback consumers: {}", s.loopback_consumers),
+            "pipewire_consumers" => format!("PipeWire consumers: {}", s.pipewire_consumers),
+            "pipewire_output" => format!("PipeWire: {}", printable(&s.pipewire_output)),
             "output_mode" => format!("output: {}", printable(&s.output_mode)),
             "effect" => format!("effect: {}", printable(&s.effect)),
             "blur_strength" => format!("blur strength: {}", strength(s.blur_strength)),
@@ -272,7 +301,10 @@ mod tests {
             blur_strength: 0.5,
             background_image: String::new(),
             consumers: 0,
-            interface_revision: 2,
+            loopback_consumers: 0,
+            pipewire_consumers: 0,
+            pipewire_output: "off".into(),
+            interface_revision: 3,
         }
     }
 
@@ -313,6 +345,89 @@ mod tests {
                 .ends_with("Effect:     replace\nImage:      /home/u/bg.png\nError:      boom\n"),
             "{}",
             status_text(&b)
+        );
+    }
+
+    #[test]
+    fn status_splits_the_consumers_while_pipewire_is_involved() {
+        let mut s = sample();
+        s.consumers = 2;
+        s.loopback_consumers = 1;
+        s.pipewire_consumers = 1;
+        s.pipewire_output = "streaming".into();
+        assert_eq!(
+            status_text(&s),
+            "State:      idle\n\
+             Enabled:    yes\n\
+             Camera:     First Camera (1234:abcd)\n\
+             Consumers:  2 (loopback 1, PipeWire 1)\n\
+             Output:     NV12 1920x1080@30\n\
+             PipeWire:   streaming\n\
+             Effect:     none\n"
+        );
+        assert_eq!(
+            summary_line(&s),
+            "state idle | enabled yes | camera First Camera (1234:abcd) \
+             | consumers 2 (loopback 1, PipeWire 1) | output NV12 1920x1080@30 \
+             | PipeWire streaming | effect none"
+        );
+        // Configured, unavailable: shown, nobody linked.
+        s.consumers = 1;
+        s.pipewire_consumers = 0;
+        s.pipewire_output = "unsupported".into();
+        let text = status_text(&s);
+        assert!(
+            text.contains("Consumers:  1 (loopback 1, PipeWire 0)\nOutput:     NV12 1920x1080@30\nPipeWire:   unsupported\n"),
+            "{text}"
+        );
+        // Not configured (or a daemon without it): no split, no line.
+        s.pipewire_output = "off".into();
+        let text = status_text(&s);
+        assert!(text.contains("Consumers:  1\n"), "{text}");
+        assert!(!text.contains("PipeWire"), "{text}");
+        assert!(!summary_line(&s).contains("PipeWire"));
+    }
+
+    #[test]
+    fn watch_lines_of_the_pipewire_fields() {
+        let mut old = sample();
+        old.pipewire_output = "ready".into();
+        let mut new = old.clone();
+        new.consumers = 1;
+        new.pipewire_consumers = 1;
+        new.pipewire_output = "streaming".into();
+        assert_eq!(
+            change_lines(&new, &model::diff(&old, &new)),
+            vec![
+                "consumers: 1",
+                "PipeWire consumers: 1",
+                "PipeWire: streaming"
+            ]
+        );
+        let mut more = new.clone();
+        more.consumers = 2;
+        more.loopback_consumers = 1;
+        assert_eq!(
+            change_lines(&more, &model::diff(&new, &more)),
+            vec!["consumers: 2", "loopback consumers: 1"]
+        );
+        // Without the PipeWire output the loopback count is the total: its
+        // own change is not repeated.
+        let old = sample();
+        let mut new = old.clone();
+        new.consumers = 1;
+        new.loopback_consumers = 1;
+        assert_eq!(
+            change_lines(&new, &model::diff(&old, &new)),
+            vec!["consumers: 1"]
+        );
+        // The output going off is reported.
+        let mut on = sample();
+        on.pipewire_output = "failed".into();
+        let off = sample();
+        assert_eq!(
+            change_lines(&off, &model::diff(&on, &off)),
+            vec!["PipeWire: off"]
         );
     }
 
@@ -367,6 +482,7 @@ mod tests {
         s.output_mode = format!("mode{evil}");
         s.error = format!("error{evil}");
         s.background_image = format!("/bg{evil}.png");
+        s.pipewire_output = format!("ready{evil}");
         let mut texts = vec![
             status_text(&s),
             cameras_text(&s),
@@ -384,6 +500,7 @@ mod tests {
         let mut new = s.clone();
         new.active_camera = s.cameras[1].id.clone();
         new.effect = format!("blur{evil}");
+        new.pipewire_consumers = 1;
         texts.extend(change_lines(&new, &model::diff(&old, &new)));
         new.active_camera = "unlisted\u{1b}[0m".into();
         texts.push(camera_label(&new));
@@ -398,7 +515,8 @@ mod tests {
             }
         }
         // Each field is still one line.
-        assert_eq!(status_text(&s).lines().count(), 8, "{}", status_text(&s));
+        assert_eq!(status_text(&s).lines().count(), 9, "{}", status_text(&s));
+        assert!(status_text(&s).contains("PipeWire:   ready\\x1b]0;pwned"));
         assert!(status_text(&s).contains("Image:      /bg\\x1b]0;pwned"));
         assert_eq!(cameras_text(&s).lines().count(), 2);
     }

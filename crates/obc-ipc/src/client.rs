@@ -95,9 +95,25 @@ pub trait OmaBroadcast {
     #[zbus(property)]
     fn background_image(&self) -> zbus::Result<String>;
 
-    /// Number of processes holding the virtual camera open.
+    /// Number of consumers: the processes holding the loopback plus the
+    /// links to the PipeWire output (before revision 3, the loopback's
+    /// only).
     #[zbus(property)]
     fn consumers(&self) -> zbus::Result<u32>;
+
+    /// Number of processes holding the loopback device open. Revision 3.
+    #[zbus(property)]
+    fn loopback_consumers(&self) -> zbus::Result<u32>;
+
+    /// Number of links to the PipeWire output; 0 when it is off.
+    /// Revision 3.
+    #[zbus(property, name = "PipeWireConsumers")]
+    fn pipewire_consumers(&self) -> zbus::Result<u32>;
+
+    /// State of the PipeWire output: `off`, `unsupported`, `connecting`,
+    /// `ready`, `streaming` or `failed`. Revision 3.
+    #[zbus(property, name = "PipeWireOutput")]
+    fn pipewire_output(&self) -> zbus::Result<String>;
 
     /// Revision of the interface the daemon implements.
     #[zbus(property)]

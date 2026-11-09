@@ -26,6 +26,11 @@ obc-backend-maxine = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
+# The optional PipeWire camera node (`pipewire` module), off by default.
+pipewire = { workspace = true, optional = true }
+
+[features]
+pipewire = ["dep:pipewire"]
 
 [dev-dependencies]
 # The fake effect backend of the GPU tests writes frames with it.
@@ -35,6 +40,10 @@ tempfile = { workspace = true }
 [[bin]]
 name = "obc-bench"
 path = "src/bin/obc-bench.rs"
+
+[[test]]
+name = "pipewire_live"
+required-features = ["pipewire"]
 
 [lints]
 workspace = true

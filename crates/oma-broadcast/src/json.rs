@@ -36,6 +36,8 @@ pub const MAX_USB_BYTES: usize = 16;
 pub const MAX_MODE_BYTES: usize = 64;
 /// Bound of `effect`.
 pub const MAX_EFFECT_BYTES: usize = 32;
+/// Bound of `pipewire_output`.
+pub const MAX_PIPEWIRE_OUTPUT_BYTES: usize = 32;
 /// Bound of `background_image`. Kept so that a `snapshot` line with every
 /// string at its bound and [`MAX_CAMERAS`] cameras stays under
 /// [`MAX_LINE_BYTES`]. A longer path is clipped at its start
@@ -137,6 +139,9 @@ struct StateFields<'a> {
     active_camera: Cow<'a, str>,
     active_camera_name: Cow<'a, str>,
     consumers: u32,
+    loopback_consumers: u32,
+    pipewire_consumers: u32,
+    pipewire_output: Cow<'a, str>,
     output_mode: Cow<'a, str>,
     effect: Cow<'a, str>,
     blur_strength: f64,
@@ -153,6 +158,9 @@ impl<'a> StateFields<'a> {
             active_camera: clip(&s.active_camera, MAX_ID_BYTES),
             active_camera_name: clip(model::active_camera_name(s).unwrap_or(""), MAX_NAME_BYTES),
             consumers: s.consumers,
+            loopback_consumers: s.loopback_consumers,
+            pipewire_consumers: s.pipewire_consumers,
+            pipewire_output: clip(&s.pipewire_output, MAX_PIPEWIRE_OUTPUT_BYTES),
             output_mode: clip(&s.output_mode, MAX_MODE_BYTES),
             effect: clip(&s.effect, MAX_EFFECT_BYTES),
             blur_strength: strength(s.blur_strength),
@@ -339,7 +347,10 @@ mod tests {
             blur_strength: 0.5,
             background_image: "/home/u/bg.png".into(),
             consumers: 2,
-            interface_revision: 2,
+            loopback_consumers: 1,
+            pipewire_consumers: 1,
+            pipewire_output: "streaming".into(),
+            interface_revision: 3,
         }
     }
 
@@ -362,11 +373,14 @@ mod tests {
         assert_eq!(v["active_camera"], "platform-video2");
         assert_eq!(v["active_camera_name"], "Second Camera");
         assert_eq!(v["consumers"], 2);
+        assert_eq!(v["loopback_consumers"], 1);
+        assert_eq!(v["pipewire_consumers"], 1);
+        assert_eq!(v["pipewire_output"], "streaming");
         assert_eq!(v["output_mode"], "NV12 1920x1080@30");
         assert_eq!(v["effect"], "blur");
         assert_eq!(v["blur_strength"], 0.5);
         assert_eq!(v["background_image"], "/home/u/bg.png");
-        assert_eq!(v["interface_revision"], 2);
+        assert_eq!(v["interface_revision"], 3);
         assert_eq!(v["cameras_truncated"], false);
         let cams = v["cameras"].as_array().unwrap();
         assert_eq!(cams.len(), 2);
@@ -390,7 +404,34 @@ mod tests {
         assert_eq!(v["active_camera_name"], "Second Camera");
         assert_eq!(v["blur_strength"], 0.5);
         assert_eq!(v["background_image"], "/home/u/bg.png");
+        assert_eq!(v["loopback_consumers"], 1);
+        assert_eq!(v["pipewire_consumers"], 1);
+        assert_eq!(v["pipewire_output"], "streaming");
         assert!(v.get("cameras").is_none(), "{line}");
+        // Every scalar of the model is in the line.
+        for field in model::STATE_FIELDS {
+            assert!(v.get(field).is_some(), "{field} missing from {line}");
+        }
+        // A daemon without the PipeWire output: its fields are there,
+        // with the values of one that has none.
+        let mut old = Snapshot::empty();
+        old.consumers = 2;
+        old.loopback_consumers = 2;
+        let v = parse(&snapshot_line(&old));
+        assert_eq!(
+            (
+                &v["consumers"],
+                &v["loopback_consumers"],
+                &v["pipewire_consumers"],
+                &v["pipewire_output"]
+            ),
+            (
+                &serde_json::json!(2),
+                &serde_json::json!(2),
+                &serde_json::json!(0),
+                &serde_json::json!("off")
+            )
+        );
     }
 
     #[test]
@@ -545,6 +586,9 @@ mod tests {
         s.output_mode = nasty.clone();
         s.effect = nasty.clone();
         s.background_image = nasty.clone();
+        s.pipewire_output = nasty.clone();
+        s.loopback_consumers = u32::MAX;
+        s.pipewire_consumers = u32::MAX;
         // The longest number serde_json prints for a strength in range.
         s.blur_strength = 2.225_073_858_507_201_4e-308;
         s.consumers = u32::MAX;
@@ -568,6 +612,7 @@ mod tests {
         }
         let v = parse(&snapshot_line(&s));
         assert!(v["error"].as_str().unwrap().ends_with(ELLIPSIS));
+        assert!(v["pipewire_output"].as_str().unwrap().ends_with(ELLIPSIS));
         assert!(
             v["background_image"]
                 .as_str()

@@ -363,7 +363,11 @@ struct Mock {
     error: String,
     cameras: Vec<CameraInfo>,
     active: usize,
+    /// Holding the loopback.
     consumers: u32,
+    /// Linked to the PipeWire output.
+    pipewire_consumers: u32,
+    pipewire_output: String,
     effect: String,
     blur_strength: f64,
     background_image: String,
@@ -391,6 +395,8 @@ impl Mock {
             ],
             active: 0,
             consumers: 0,
+            pipewire_consumers: 0,
+            pipewire_output: "off".into(),
             effect: "none".into(),
             blur_strength: 0.5,
             background_image: String::new(),
@@ -567,7 +573,22 @@ impl Mock {
 
     #[zbus(property)]
     fn consumers(&self) -> u32 {
+        self.consumers + self.pipewire_consumers
+    }
+
+    #[zbus(property)]
+    fn loopback_consumers(&self) -> u32 {
         self.consumers
+    }
+
+    #[zbus(property, name = "PipeWireConsumers")]
+    fn pipewire_consumers(&self) -> u32 {
+        self.pipewire_consumers
+    }
+
+    #[zbus(property, name = "PipeWireOutput")]
+    fn pipewire_output(&self) -> String {
+        self.pipewire_output.clone()
     }
 
     #[zbus(property)]
@@ -622,12 +643,37 @@ impl MockDaemon {
             .block_on(async { std::mem::take(&mut iface.get_mut().await.calls) })
     }
 
+    /// `n` processes hold the loopback: the total and the loopback count
+    /// change, each announced on its own, as the daemon does.
     fn set_consumers(&self, n: u32) {
         let iface = self.iface();
         self.rt.block_on(async {
             iface.get_mut().await.consumers = n;
             let m = iface.get().await;
             m.consumers_changed(iface.signal_emitter()).await.unwrap();
+            m.loopback_consumers_changed(iface.signal_emitter())
+                .await
+                .unwrap();
+        });
+    }
+
+    /// The PipeWire output is in `output` with `n` links.
+    fn set_pipewire(&self, n: u32, output: &str) {
+        let iface = self.iface();
+        self.rt.block_on(async {
+            {
+                let mut m = iface.get_mut().await;
+                m.pipewire_consumers = n;
+                m.pipewire_output = output.into();
+            }
+            let m = iface.get().await;
+            m.consumers_changed(iface.signal_emitter()).await.unwrap();
+            m.pipe_wire_consumers_changed(iface.signal_emitter())
+                .await
+                .unwrap();
+            m.pipe_wire_output_changed(iface.signal_emitter())
+                .await
+                .unwrap();
         });
     }
 
@@ -835,6 +881,9 @@ fn status_human_and_json() {
     assert_eq!(v["active_camera"], "usb-1234_abcd");
     assert_eq!(v["active_camera_name"], "First Camera");
     assert_eq!(v["consumers"], 0);
+    assert_eq!(v["loopback_consumers"], 0);
+    assert_eq!(v["pipewire_consumers"], 0);
+    assert_eq!(v["pipewire_output"], "off");
     assert_eq!(v["output_mode"], "NV12 1920x1080@30");
     assert_eq!(v["effect"], "none");
     assert_eq!(v["blur_strength"], 0.5);
@@ -843,6 +892,73 @@ fn status_human_and_json() {
     assert_eq!(v["cameras"].as_array().unwrap().len(), 2);
     assert_eq!(v["cameras_truncated"], false);
     assert!(!bus.activation_attempted());
+}
+
+#[test]
+fn status_and_watch_show_the_pipewire_output() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    mock.set_consumers(1);
+    mock.set_pipewire(1, "streaming");
+
+    let out = bus.run(&["status"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "State:      idle\n\
+         Enabled:    yes\n\
+         Camera:     First Camera (1234:abcd)\n\
+         Consumers:  2 (loopback 1, PipeWire 1)\n\
+         Output:     NV12 1920x1080@30\n\
+         PipeWire:   streaming\n\
+         Effect:     none\n"
+    );
+    let out = bus.run(&["status", "--json"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let v = json_line(&out.stdout);
+    assert_eq!(v["consumers"], 2);
+    assert_eq!(v["loopback_consumers"], 1);
+    assert_eq!(v["pipewire_consumers"], 1);
+    assert_eq!(v["pipewire_output"], "streaming");
+
+    // `watch --json`: each property in its own state line.
+    let watch = bus.watch(&["watch", "--json"], None);
+    let v = watch.next_json("the first snapshot");
+    assert_eq!(v["type"], "snapshot", "{v}");
+    assert_eq!(v["pipewire_output"], "streaming");
+    mock.set_pipewire(0, "ready");
+    for (field, value) in [
+        ("consumers", serde_json::json!(1)),
+        ("pipewire_consumers", serde_json::json!(0)),
+        ("pipewire_output", serde_json::json!("ready")),
+    ] {
+        let v = watch.next_json(field);
+        assert_eq!(v["type"], "state", "{v}");
+        assert_eq!(v["changed"], serde_json::json!([field]), "{v}");
+        assert_eq!(v[field], value, "{v}");
+    }
+    let mut watch = watch;
+    watch.child.signal(libc::SIGTERM);
+    let (status, stderr) = watch.finish("watch --json");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert_eq!(stderr, "");
+
+    // `watch`: the same, for a person.
+    let mut watch = bus.watch(&["watch"], None);
+    assert_eq!(
+        watch.next("the summary"),
+        "oma-broadcastd: state idle | enabled yes | camera First Camera (1234:abcd) \
+         | consumers 1 (loopback 1, PipeWire 0) | output NV12 1920x1080@30 \
+         | PipeWire ready | effect none\n"
+    );
+    mock.set_pipewire(1, "streaming");
+    assert_eq!(watch.next("the total"), "consumers: 2\n");
+    assert_eq!(watch.next("the links"), "PipeWire consumers: 1\n");
+    assert_eq!(watch.next("the state"), "PipeWire: streaming\n");
+    watch.child.signal(libc::SIGTERM);
+    let (status, stderr) = watch.finish("watch");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert_eq!(stderr, "");
 }
 
 #[test]
@@ -1233,6 +1349,10 @@ fn watch_json_follows_changes_stats_and_outages() {
     assert_eq!(v["consumers"], 1);
     assert_eq!(v["state"], "idle");
     assert_eq!(v["active_camera_name"], "First Camera");
+    let v = watch.next_json("the loopback count");
+    assert_eq!(v["changed"], serde_json::json!(["loopback_consumers"]));
+    assert_eq!(v["loopback_consumers"], 1);
+    assert_eq!(v["pipewire_consumers"], 0);
 
     mock.set_state(State::Active, "");
     let v = watch.next_json("a state change");
@@ -1295,6 +1415,8 @@ fn watch_json_follows_changes_stats_and_outages() {
     let v = watch.next_json("a change after the outage");
     assert_eq!(v["type"], "state", "{v}");
     assert_eq!(v["consumers"], 0);
+    let v = watch.next_json("the loopback count after the outage");
+    assert_eq!(v["loopback_consumers"], 0);
 
     let mut watch = watch;
     watch.child.signal(libc::SIGTERM);

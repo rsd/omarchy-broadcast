@@ -16,6 +16,12 @@
 #   systemctl --user enable --now oma-broadcastd.service
 # The v4l2loopback device must be configured as in docs/setup/loopback.md.
 #
+# The daemon is built with PipeWire support (cargo feature
+# oma-broadcastd/pipewire): it can also offer the camera as a native
+# PipeWire video source, "Omarchy Broadcast". That node is off until a user
+# sets [pipewire] enabled = true in config.toml (docs/config.example.toml);
+# without it, or without a running PipeWire, the loopback works alone.
+#
 # The NVIDIA Maxine Video Effects SDK (background blur and replace) is
 # licensed separately by NVIDIA and is never part of this package: each user
 # downloads and installs it as described in docs/setup/maxine.md. Without it
@@ -29,7 +35,7 @@
 
 pkgname=oma-broadcast-git
 _pkgname=oma-broadcast
-pkgver=0.10.0
+pkgver=0.11.0
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API, a CLI and an Omarchy bar widget'
 arch=('x86_64')
@@ -45,16 +51,27 @@ depends=(
   'cuda'                   # libnvrtc.so, dlopened by libgstcuda for the CUDA converters
   'nvidia-utils'           # libcuda.so.1 (CUDA driver API) and libnvidia-ml.so.1 (NVML GPU load)
   'V4L2LOOPBACK-MODULE'    # the loopback kernel module, e.g. v4l2loopback-dkms
+  'libpipewire'            # libpipewire-0.3.so.0: the optional PipeWire camera node
 )
-makedepends=('cargo' 'git')  # the shim also needs make and gcc, both in base-devel
+makedepends=(
+  'cargo'
+  'git'
+  'clang'                  # bindgen (libspa-sys, pipewire-sys) for the PipeWire node
+  'libpipewire'            # the libpipewire and SPA headers
+)  # the shim also needs make and gcc, both in base-devel
 checkdepends=(
   'dbus'                   # /usr/bin/dbus-daemon: the process and CLI tests run a private bus
   'python'                 # the os-release shim test exercises python3's open(); skipped without it
+  'pipewire'               # client.conf: the PipeWire node's unit tests create a PipeWire context (no daemon)
 )
 optdepends=(
   'omarchy: the Omarchy shell (Quickshell) for the bar widget'
   'v4l2loopback-utils: runtime-only loopback setup without modprobe.d'
+  'pipewire: the optional PipeWire camera node ([pipewire] enabled in config.toml)'
 )
+# No LTO: with makepkg's -flto, libspa's build script compiles its C wrapper
+# into GCC LTO bitcode, which rust-lld cannot link (undefined libspa_rs_*).
+options=('!lto')
 provides=("$_pkgname")
 conflicts=("$_pkgname")
 # The checkout that holds this PKGBUILD; resolved at build time, so the
@@ -79,7 +96,8 @@ build() {
   cd "$_pkgname"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
-  cargo build --frozen --release -p oma-broadcastd -p oma-broadcast
+  cargo build --frozen --release --features oma-broadcastd/pipewire \
+    -p oma-broadcastd -p oma-broadcast
 
   # The os-release shim: target/os-release-shim/os-release-shim.so. The
   # Makefile takes CFLAGS and LDFLAGS from makepkg's environment.
@@ -92,9 +110,14 @@ check() {
   export CARGO_TARGET_DIR=target
   # The default test run needs no GPU, camera or loopback device; the
   # hardware and SDK tests are ignored. A Maxine environment of the builder
-  # must not leak into it (docs/testing.md).
+  # must not leak into it (docs/testing.md). The second run adds the
+  # PipeWire node's unit tests (the feature the package is built with);
+  # they contact no PipeWire daemon, and the live PipeWire tests are
+  # ignored.
   env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u OMA_BROADCAST_OS_RELEASE \
     cargo test --frozen --workspace
+  env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u OMA_BROADCAST_OS_RELEASE \
+    cargo test --frozen -p obc-pipeline -p oma-broadcastd --features oma-broadcastd/pipewire
   env -u LD_PRELOAD -u OMA_BROADCAST_OS_RELEASE -u OMA_BROADCAST_OS_RELEASE_DEBUG \
     make -C tools/os-release-shim test
 }

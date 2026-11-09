@@ -6,7 +6,7 @@
 
 | Command | Does | `--json` |
 |---|---|---|
-| `oma-broadcast status` | Prints the state, whether the camera is enabled, the active camera, the number of consumers, the output mode, the effect, and the error text if there is one. | One `snapshot` object. |
+| `oma-broadcast status` | Prints the state, whether the camera is enabled, the active camera, the number of consumers, the output mode, the effect, and the error text if there is one. While the PipeWire output is configured, the consumers are shown with their split (`Consumers:  2 (loopback 1, PipeWire 1)`) and a `PipeWire:` line gives the output's state. | One `snapshot` object. |
 | `oma-broadcast on` | Enables the camera (`SetEnabled(true)`), then prints the resulting state. | No. |
 | `oma-broadcast off` | Disables the camera, entering the privacy state `off` (`SetEnabled(false)`), then prints the resulting state. | No. |
 | `oma-broadcast cameras` | Lists the cameras in the daemon's order, the active one marked with `*`: name, USB `vid:pid` (`-` if none) and id. | One `cameras` object. |
@@ -108,7 +108,10 @@ Every property of the daemon at one moment. Printed by `status --json`, and by `
 | `error` | string | Text of the latest error, from the lifecycle or a configuration reload; `""` if none. Can be non-empty in any state: a rejected configuration reload sets it while the state stays as it was. |
 | `active_camera` | string | Id of the camera that streams, or would stream if an application opened the virtual camera now; `""` if none. |
 | `active_camera_name` | string | Name of that camera; `""` if there is none or it is not in the camera list. |
-| `consumers` | number | Number of processes, other than the daemon, holding the virtual camera open (integer, 0 or more). |
+| `consumers` | number | Number of consumers of the virtual camera: the processes holding the loopback plus the links to the PipeWire node (integer, 0 or more). With the PipeWire output off, only the former. |
+| `loopback_consumers` | number | Number of processes, other than the daemon, holding the loopback device open (integer, 0 or more). From a daemon of interface revision 2 or lower, the value of `consumers`. |
+| `pipewire_consumers` | number | Number of links to the PipeWire output's node (integer, 0 or more); `0` when the output is off or the daemon is older than revision 3. |
+| `pipewire_output` | string | State of the optional PipeWire output: `"off"`, `"unsupported"`, `"connecting"`, `"ready"`, `"streaming"` or `"failed"` (see [dbus-api.md](dbus-api.md#properties)); `"off"` from a daemon older than revision 3. Bounded to 32 bytes and clipped at its end, like the other bounded strings (see above). |
 | `output_mode` | string | What the virtual camera delivers, e.g. `"NV12 1920x1080@30"`. |
 | `effect` | string | The video effect in force: `"none"`, `"blur"` or `"replace"`. The effective value; it does not say whether the effect is ready or has failed (see `state` and `error`). |
 | `blur_strength` | number | Strength of the blur effect, 0.0 to 1.0, also when `effect` is not `"blur"`. A value outside the range is clamped to it, and a value that is not a finite number is printed as `0`. `0` also when the daemon is too old to have the property (`interface_revision` 1). |
@@ -133,8 +136,8 @@ Printed by `watch --json` when one or more of the scalar fields change. It carri
 | Field | JSON type | Meaning |
 |---|---|---|
 | `v`, `type` | | `1`, `"state"`. |
-| `changed` | array of strings | The fields whose value changed, from: `state`, `enabled`, `error`, `active_camera`, `active_camera_name`, `consumers`, `output_mode`, `effect`, `blur_strength`, `background_image`, `interface_revision`. Never empty. |
-| `state`, `enabled`, `error`, `active_camera`, `active_camera_name`, `consumers`, `output_mode`, `effect`, `blur_strength`, `background_image`, `interface_revision` | | As in `snapshot`, current values. |
+| `changed` | array of strings | The fields whose value changed, from: `state`, `enabled`, `error`, `active_camera`, `active_camera_name`, `consumers`, `loopback_consumers`, `pipewire_consumers`, `pipewire_output`, `output_mode`, `effect`, `blur_strength`, `background_image`, `interface_revision`. Never empty. |
+| `state`, `enabled`, `error`, `active_camera`, `active_camera_name`, `consumers`, `loopback_consumers`, `pipewire_consumers`, `pipewire_output`, `output_mode`, `effect`, `blur_strength`, `background_image`, `interface_revision` | | As in `snapshot`, current values. |
 
 A `state` line does not carry the camera list. `active_camera_name` can change without `active_camera` (the active camera was renamed, or appeared in or left the list); it is then reported in `changed` on its own.
 
@@ -205,10 +208,11 @@ A client should treat the state after a `daemon-not-running` line as "daemon not
 
 - `v` is the schema version of every line. It is `1` in this version.
 - **`v` stays 1 for the effect fields.** `blur_strength` and `background_image` are new fields in existing line types, `effect` now takes the values `blur` and `replace` in addition to `none`, and `changed` may name the two new fields. None of this removes or renames a field or changes the type or meaning of one, so it is not breaking under the rule below. The set of `state` strings is unchanged. A client written for the earlier version keeps working: it ignores the new fields and shows an `effect` string it does not know as text.
+- **`v` stays 1 for the PipeWire fields.** `loopback_consumers`, `pipewire_consumers` and `pipewire_output` are new fields in existing line types, and `changed` may name them. `consumers` keeps its type; with the PipeWire output off it has the value it had before. Against a daemon of interface revision 2 or lower the fields are still printed, with the values of a daemon that has no PipeWire output (`loopback_consumers` equal to `consumers`, `pipewire_consumers` 0, `pipewire_output` `"off"`).
 - A **breaking change** raises `v`: a removed or renamed field or line type, a changed JSON type or meaning, a new state string, or a change to the rules above (line cap, outage behaviour).
 - **Not breaking**, made without raising `v`: a new field in an existing line type, a new line type, a new `error` code. Clients ignore what they do not know.
 - The schema is independent of the D-Bus `InterfaceRevision`; a new D-Bus property may appear as a new field.
-- **Capability rules for clients.** A client offers the effect controls only if both hold: the CLI is new enough to print `blur_strength` (the field is present as a number in `snapshot`; an older CLI has no `effect` command, and `oma-broadcast effect` fails with status `2`), and the daemon's `interface_revision` is 2 or more. Check the CLI first, then the daemon; the two conditions have different remedies (update `oma-broadcast`, update `oma-broadcastd`). When the field is absent or the revision is lower, show the effect, if at all, as read-only text.
+- **Capability rules for clients.** A client that shows the split of the consumers does so only while `pipewire_output` is not `"off"`. A client offers the effect controls only if both hold: the CLI is new enough to print `blur_strength` (the field is present as a number in `snapshot`; an older CLI has no `effect` command, and `oma-broadcast effect` fails with status `2`), and the daemon's `interface_revision` is 2 or more. Check the CLI first, then the daemon; the two conditions have different remedies (update `oma-broadcast`, update `oma-broadcastd`). When the field is absent or the revision is lower, show the effect, if at all, as read-only text.
 
 ## Examples
 
@@ -219,7 +223,7 @@ oma-broadcast status --json
 ```
 
 ```json
-{"v":1,"type":"snapshot","state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":0,"output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":2,"cameras":[{"id":"usb-046d_0944-video-index0","name":"Logitech MX Brio","usb":"046d:0944","active":true},{"id":"pci-0000:00:14.0-usb-0:5:1.0-video-index0","name":"FHD Camera","usb":"5986:1193","active":false}],"cameras_truncated":false}
+{"v":1,"type":"snapshot","state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":0,"loopback_consumers":0,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":3,"cameras":[{"id":"usb-046d_0944-video-index0","name":"Logitech MX Brio","usb":"046d:0944","active":true},{"id":"pci-0000:00:14.0-usb-0:5:1.0-video-index0","name":"FHD Camera","usb":"5986:1193","active":false}],"cameras_truncated":false}
 ```
 
 ```sh
@@ -237,14 +241,14 @@ oma-broadcast watch --json
 ```
 
 ```json
-{"v":1,"type":"snapshot","state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":0,"output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":2,"cameras":[{"id":"usb-046d_0944-video-index0","name":"Logitech MX Brio","usb":"046d:0944","active":true}],"cameras_truncated":false}
-{"v":1,"type":"state","changed":["consumers"],"state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":1,"output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":2}
-{"v":1,"type":"state","changed":["state"],"state":"starting","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":1,"output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":2}
-{"v":1,"type":"state","changed":["state"],"state":"active","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":1,"output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":2}
+{"v":1,"type":"snapshot","state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":0,"loopback_consumers":0,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":3,"cameras":[{"id":"usb-046d_0944-video-index0","name":"Logitech MX Brio","usb":"046d:0944","active":true}],"cameras_truncated":false}
+{"v":1,"type":"state","changed":["consumers","loopback_consumers"],"state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":1,"loopback_consumers":1,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":3}
+{"v":1,"type":"state","changed":["state"],"state":"starting","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":1,"loopback_consumers":1,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":3}
+{"v":1,"type":"state","changed":["state"],"state":"active","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":1,"loopback_consumers":1,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":3}
 {"v":1,"type":"stats","fps":30.0,"latency_p50_ms":41.2,"cpu_percent":6.5,"gpu_percent":18.0}
 {"v":1,"type":"stats","fps":30.0,"latency_p50_ms":40.8,"cpu_percent":6.4,"gpu_percent":-1.0}
 {"v":1,"type":"error","code":"daemon-not-running","error":"oma-broadcastd is not running (no owner for br.com.dias.OmaBroadcast on the session bus); start it with: systemctl --user start oma-broadcastd"}
-{"v":1,"type":"snapshot","state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":0,"output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":2,"cameras":[{"id":"usb-046d_0944-video-index0","name":"Logitech MX Brio","usb":"046d:0944","active":true}],"cameras_truncated":false}
+{"v":1,"type":"snapshot","state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":0,"loopback_consumers":0,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","interface_revision":3,"cameras":[{"id":"usb-046d_0944-video-index0","name":"Logitech MX Brio","usb":"046d:0944","active":true}],"cameras_truncated":false}
 ```
 
 Read the current state once from a shell script:

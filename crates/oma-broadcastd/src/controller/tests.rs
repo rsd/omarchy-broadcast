@@ -938,15 +938,20 @@ fn every_transition_of_the_lifecycle_is_announced_in_order() {
             Change::Effect(e) => format!("effect={e}"),
             Change::BlurStrength(v) => format!("strength={v}"),
             Change::BackgroundImage(p) => format!("image={p}"),
+            Change::LoopbackConsumers(n) => format!("loopback={n}"),
+            Change::PipeWireConsumers(n) => format!("pipewire={n}"),
+            Change::PipeWireOutput(s) => format!("pipewire_output={s}"),
         })
         .collect();
     assert_eq!(
         seen,
         [
             "consumers=1",
+            "loopback=1",
             "starting",
             "active",
             "consumers=0",
+            "loopback=0",
             "idle",
             "enabled=false",
             "off",
@@ -955,9 +960,11 @@ fn every_transition_of_the_lifecycle_is_announced_in_order() {
             "cameras=0",
             "active=",
             "consumers=1",
+            "loopback=1",
             "error=no camera is available",
             "error",
             "consumers=0",
+            "loopback=0",
             "idle",
         ]
     );
@@ -973,13 +980,27 @@ fn diff_lists_state_last() {
     b.state = State::Active;
     b.consumers = 2;
     b.active_camera = "x".into();
+    b.loopback_consumers = 1;
+    b.pipewire_consumers = 1;
+    b.pipewire_output = "streaming".into();
     assert_eq!(
         diff(&a, &b),
         [
             Change::ActiveCamera("x".into()),
             Change::Consumers(2),
+            Change::LoopbackConsumers(1),
+            Change::PipeWireConsumers(1),
+            Change::PipeWireOutput("streaming".into()),
             Change::State(State::Active)
         ]
+    );
+    assert_eq!(
+        [
+            Change::LoopbackConsumers(0).name(),
+            Change::PipeWireConsumers(0).name(),
+            Change::PipeWireOutput(String::new()).name()
+        ],
+        ["LoopbackConsumers", "PipeWireConsumers", "PipeWireOutput"]
     );
     assert!(diff(&a, &a).is_empty());
 }
@@ -1977,4 +1998,455 @@ fn an_effect_value_the_daemon_does_not_accept_fails_closed() {
     h.consumers(1, 0);
     h.tick(1000);
     assert_eq!(h.world().session_starts, 0, "no raw image instead");
+}
+
+// ---- the PipeWire output ----
+
+const PIPEWIRE: &str = "[pipewire]\nenabled = true\n";
+const PIPEWIRE_720P: &str = "[pipewire]\nenabled = true\n[output]\nmode = \"1280x720@30\"\n";
+
+impl H {
+    /// An event of the PipeWire output of `generation`.
+    fn pipewire_gen(&mut self, generation: PipeWireGeneration, event: PipeWireEvent, ms: u64) {
+        let now = self.at(ms);
+        assert!(self.ctrl.handle(Command::PipeWire(generation, event), now));
+    }
+
+    /// An event of the PipeWire output started last (it may no longer
+    /// run).
+    fn pipewire(&mut self, event: PipeWireEvent, ms: u64) {
+        let generation = self.world().pipewire_generation;
+        self.pipewire_gen(generation, event, ms);
+    }
+
+    fn pw_consumers(&mut self, n: u32, ms: u64) {
+        self.pipewire(PipeWireEvent::Consumers(n), ms);
+    }
+
+    fn pw_state(&mut self, state: PipeWireState, ms: u64) {
+        self.pipewire(PipeWireEvent::State(state), ms);
+    }
+
+    /// (`Consumers`, `LoopbackConsumers`, `PipeWireConsumers`,
+    /// `PipeWireOutput`).
+    fn counts(&self) -> (u32, u32, u32, String) {
+        let s = self.snap();
+        (
+            s.consumers,
+            s.loopback_consumers,
+            s.pipewire_consumers,
+            s.pipewire_output,
+        )
+    }
+
+    /// (writer starts, PipeWire output starts, the running PipeWire
+    /// output's generation).
+    fn outputs(&self) -> (u32, u32, Option<PipeWireGeneration>) {
+        let w = self.world();
+        (w.writer_starts, w.pipewire_starts, w.pipewire)
+    }
+
+    /// What a newly started PipeWire output reports first.
+    fn pipewire_up(&mut self, ms: u64) {
+        self.pw_state(PipeWireState::Connecting, ms);
+        self.pw_consumers(0, ms);
+        self.pw_state(PipeWireState::Ready, ms);
+    }
+}
+
+fn counts(total: u32, loopback: u32, pipewire: u32, output: &str) -> (u32, u32, u32, String) {
+    (total, loopback, pipewire, output.into())
+}
+
+#[test]
+fn the_pipewire_output_starts_with_the_writer_when_configured() {
+    let h = H::new("", |_| {});
+    assert_eq!(h.outputs(), (1, 0, None));
+    assert_eq!(h.counts(), counts(0, 0, 0, "off"));
+
+    let mut h = H::new(PIPEWIRE, |_| {});
+    assert_eq!(h.outputs(), (1, 1, Some(1)));
+    // Until the output reports, it is connecting.
+    assert_eq!(h.counts(), counts(0, 0, 0, "connecting"));
+    h.pipewire_up(0);
+    assert_eq!(h.counts(), counts(0, 0, 0, "ready"));
+    let (changes, _) = h.drain();
+    assert_eq!(changes, [Change::PipeWireOutput("ready".into())]);
+}
+
+#[test]
+fn a_pipewire_consumer_starts_and_stops_the_camera_like_a_loopback_one() {
+    let mut h = H::new(PIPEWIRE, |w| w.frames = false);
+    h.pipewire_up(0);
+    h.drain();
+    h.pw_consumers(1, 1000);
+    assert_eq!(h.counts(), counts(1, 0, 1, "ready"));
+    h.tick(1299);
+    assert_eq!(h.state(), State::Idle, "the debounce");
+    h.tick(1300);
+    assert_eq!(h.state(), State::Starting);
+    assert_eq!(h.world().session_starts, 1);
+    h.world().frames = true;
+    h.pw_state(PipeWireState::Streaming, 1350);
+    h.tick(1350);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.counts(), counts(1, 0, 1, "streaming"));
+    let (changes, _) = h.drain();
+    assert_eq!(
+        changes
+            .iter()
+            .filter(|c| !matches!(c, Change::ActiveCamera(_)))
+            .cloned()
+            .collect::<Vec<_>>(),
+        [
+            Change::Consumers(1),
+            Change::PipeWireConsumers(1),
+            Change::State(State::Starting),
+            Change::PipeWireOutput("streaming".into()),
+            Change::State(State::Active),
+        ]
+    );
+
+    // It leaves: idle after the grace, the camera and CUDA stopped.
+    h.pw_consumers(0, 2000);
+    h.pw_state(PipeWireState::Ready, 2000);
+    h.tick(6999);
+    assert_eq!(h.state(), State::Active, "the grace period");
+    h.tick(7000);
+    assert_eq!(h.state(), State::Idle);
+    {
+        let w = h.world();
+        assert!(w.session.is_none());
+        assert_eq!((w.session_starts, w.session_stops), (1, 1));
+    }
+    assert_eq!(
+        h.outputs(),
+        (1, 1, Some(1)),
+        "the writer and its output stay"
+    );
+    assert_eq!(h.counts(), counts(0, 0, 0, "ready"));
+
+    // A link shorter than the debounce starts nothing.
+    h.pw_consumers(1, 10_000);
+    h.tick(10_200);
+    h.pw_consumers(0, 10_200);
+    h.tick(10_300);
+    h.tick(20_000);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.world().session_starts, 1);
+}
+
+#[test]
+fn either_kind_of_consumer_keeps_the_session() {
+    let mut h = H::new(PIPEWIRE, |_| {});
+    h.pipewire_up(0);
+    h.activate(0);
+    h.pw_consumers(1, 500);
+    assert_eq!(h.counts(), counts(2, 1, 1, "ready"));
+    h.consumers(0, 1000);
+    assert_eq!(h.counts(), counts(1, 0, 1, "ready"));
+    h.tick(30_000);
+    assert_eq!(h.state(), State::Active, "the PipeWire consumer stays");
+    assert_eq!(h.world().session_starts, 1);
+    // Back to the loopback alone, then nobody.
+    h.consumers(2, 31_000);
+    h.pw_consumers(0, 31_000);
+    assert_eq!(h.counts(), counts(2, 2, 0, "ready"));
+    h.tick(60_000);
+    assert_eq!(h.state(), State::Active);
+    h.consumers(0, 60_000);
+    h.tick(65_000);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.world().session_starts, 1);
+}
+
+#[test]
+fn pipewire_events_of_an_output_that_does_not_run_are_ignored() {
+    // A writer without the PipeWire output (no output ever started).
+    let mut h = H::new("", |_| {});
+    h.pw_state(PipeWireState::Streaming, 0);
+    h.pw_consumers(1, 0);
+    h.tick(1000);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.world().session_starts, 0);
+    assert_eq!(h.counts(), counts(0, 0, 0, "off"));
+    assert_eq!(h.drain().0, []);
+
+    // No writer at all (it failed and waits for its retry).
+    let mut h = H::new(PIPEWIRE, |_| {});
+    h.pipewire_up(0);
+    h.pw_consumers(1, 0);
+    {
+        let mut w = h.world();
+        w.writer_failure = Some("loopback writer failed: gone".into());
+        w.sink = Err("no loopback".into());
+    }
+    h.tick(100);
+    assert_eq!(h.state(), State::Error);
+    assert_eq!(h.outputs(), (1, 1, None), "stopped with the writer");
+    assert_eq!(h.counts(), counts(0, 0, 0, "off"), "reset with the writer");
+    h.pw_consumers(1, 200);
+    h.pw_state(PipeWireState::Streaming, 200);
+    assert_eq!(h.counts(), counts(0, 0, 0, "off"));
+    // The writer is back: a new output, connecting, with no link yet.
+    h.world().sink = Ok(PathBuf::from("/dev/video11"));
+    h.tick(2100);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.outputs(), (2, 2, Some(2)));
+    assert_eq!(h.counts(), counts(0, 0, 0, "connecting"));
+
+    // After the output is disabled, its late events change nothing.
+    let mut h = H::new(PIPEWIRE, |_| {});
+    h.pipewire_up(0);
+    h.reload("", 100).unwrap();
+    assert_eq!(h.outputs(), (1, 1, None));
+    assert_eq!(h.counts(), counts(0, 0, 0, "off"));
+    h.pw_consumers(1, 200);
+    h.pw_state(PipeWireState::Failed("late".into()), 200);
+    h.tick(1000);
+    assert_eq!(h.counts(), counts(0, 0, 0, "off"));
+    assert_eq!(h.world().session_starts, 0);
+}
+
+#[test]
+fn events_a_replaced_output_left_queued_are_ignored_whatever_their_order() {
+    // No debounce: a stale link applied would open the camera at once.
+    let config = |extra: &str| format!("[lifecycle]\nstart_debounce_ms = 0\n{extra}");
+    let mut h = H::new(&config(PIPEWIRE), |_| {});
+    h.pipewire_up(0);
+    // Rebuilt for another output mode: a new output, generation 2.
+    h.reload(&config(PIPEWIRE_720P), 100).unwrap();
+    assert_eq!(h.outputs(), (2, 2, Some(2)));
+    assert_eq!(h.counts(), counts(0, 0, 0, "connecting"));
+    // The old output's link and state, still queued, arrive before the new
+    // output has reported anything.
+    h.pipewire_gen(1, PipeWireEvent::Consumers(1), 110);
+    h.pipewire_gen(1, PipeWireEvent::State(PipeWireState::Streaming), 110);
+    h.tick(110);
+    assert_eq!(h.counts(), counts(0, 0, 0, "connecting"));
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.world().session_starts, 0);
+    // The current output's events apply: its link starts the camera.
+    h.pipewire_up(120);
+    assert_eq!(h.counts(), counts(0, 0, 0, "ready"));
+    h.pw_consumers(1, 130);
+    assert_eq!(h.counts(), counts(1, 0, 1, "ready"));
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().session_starts, 1);
+
+    // Disabled and enabled again (the writer untouched): the first
+    // output's late link is no link of the second.
+    let mut h = H::new(&config(PIPEWIRE), |_| {});
+    h.pipewire_up(0);
+    h.reload(&config(""), 100).unwrap();
+    h.reload(&config(PIPEWIRE), 200).unwrap();
+    assert_eq!(h.outputs(), (1, 2, Some(2)));
+    h.pipewire_gen(1, PipeWireEvent::Consumers(1), 210);
+    h.tick(210);
+    assert_eq!(h.counts(), counts(0, 0, 0, "connecting"));
+    assert_eq!(h.world().session_starts, 0);
+    h.pipewire_gen(2, PipeWireEvent::Consumers(1), 220);
+    assert_eq!(h.state(), State::Active);
+}
+
+#[test]
+fn enabling_pipewire_on_reload_starts_it_at_once_and_leaves_the_writer() {
+    // A loopback consumer streams meanwhile: neither it nor the session is
+    // disturbed.
+    let mut h = H::new("", |_| {});
+    h.activate(0);
+    h.drain();
+    h.reload(PIPEWIRE, 1000).unwrap();
+    assert_eq!(h.outputs(), (1, 1, Some(1)), "the writer is not rebuilt");
+    assert_eq!(h.counts(), counts(1, 1, 0, "connecting"));
+    assert_eq!(h.state(), State::Active);
+    {
+        let w = h.world();
+        assert_eq!((w.session_starts, w.session_stops), (1, 0));
+    }
+    assert_eq!(
+        h.drain().0,
+        [Change::PipeWireOutput("connecting".into())],
+        "only the PipeWire output changes"
+    );
+    h.pipewire_up(1100);
+    h.pw_consumers(1, 1200);
+    assert_eq!(h.counts(), counts(2, 1, 1, "ready"));
+
+    // Without any consumer, the same.
+    let mut h = H::new("", |_| {});
+    h.reload(PIPEWIRE, 100).unwrap();
+    assert_eq!(h.outputs(), (1, 1, Some(1)));
+    assert_eq!(h.counts(), counts(0, 0, 0, "connecting"));
+}
+
+#[test]
+fn disabling_pipewire_on_reload_waits_for_its_last_link_only() {
+    // A PipeWire consumer streams: deferred, the output stays.
+    let mut h = H::new(PIPEWIRE, |_| {});
+    h.pipewire_up(0);
+    h.pw_consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Active);
+    h.reload("", 1000).unwrap();
+    assert_eq!(
+        h.outputs(),
+        (1, 1, Some(1)),
+        "a PipeWire consumer is linked"
+    );
+    assert_eq!(h.counts(), counts(1, 0, 1, "ready"));
+    // A loopback consumer arrives meanwhile; the last link goes: the
+    // output stops at once, the writer and the session stay.
+    h.consumers(1, 1500);
+    h.drain();
+    h.pw_consumers(0, 2000);
+    assert_eq!(h.outputs(), (1, 1, None));
+    assert_eq!(h.world().pipewire_stops, 1);
+    assert_eq!(h.counts(), counts(1, 1, 0, "off"));
+    assert_eq!(h.state(), State::Active);
+    {
+        let w = h.world();
+        assert_eq!((w.session_starts, w.session_stops), (1, 0));
+    }
+    assert_eq!(
+        h.drain().0,
+        [
+            Change::Consumers(1),
+            Change::PipeWireConsumers(0),
+            Change::PipeWireOutput("off".into()),
+        ]
+    );
+
+    // Only a loopback consumer: applied at once.
+    let mut h = H::new(PIPEWIRE, |_| {});
+    h.pipewire_up(0);
+    h.activate(0);
+    h.reload("", 1000).unwrap();
+    assert_eq!(h.outputs(), (1, 1, None));
+    assert_eq!(h.counts(), counts(1, 1, 0, "off"));
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().session_stops, 0);
+
+    // Enabled again before the last link went: the output just stays.
+    let mut h = H::new(PIPEWIRE, |_| {});
+    h.pipewire_up(0);
+    h.pw_consumers(1, 0);
+    h.reload("", 100).unwrap();
+    h.reload(PIPEWIRE, 200).unwrap();
+    h.pw_consumers(0, 300);
+    assert_eq!(h.outputs(), (1, 1, Some(1)));
+    assert_eq!(h.counts(), counts(0, 0, 0, "ready"));
+}
+
+#[test]
+fn an_output_mode_change_rebuilds_the_pipewire_output_too() {
+    // Deferred while the PipeWire consumer streams, its grace included.
+    let mut h = H::new(PIPEWIRE, |_| {});
+    let before = h.world().writer.clone().map(|(_, c)| c);
+    h.pipewire_up(0);
+    h.pw_consumers(1, 0);
+    h.tick(300);
+    h.reload(PIPEWIRE_720P, 1000).unwrap();
+    assert_eq!(h.outputs(), (1, 1, Some(1)));
+    h.pw_consumers(0, 2000);
+    h.tick(6999);
+    assert_eq!(h.outputs(), (1, 1, Some(1)), "the grace period");
+    h.tick(7000);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.outputs(), (2, 2, Some(2)), "both rebuilt");
+    assert_ne!(h.world().writer.clone().map(|(_, c)| c), before);
+    assert_eq!(h.counts(), counts(0, 0, 0, "connecting"));
+
+    // Deferred while a loopback consumer is present.
+    let mut h = H::new(PIPEWIRE, |_| {});
+    h.pipewire_up(0);
+    h.consumers(1, 0);
+    h.reload(PIPEWIRE_720P, 100).unwrap();
+    assert_eq!(h.outputs(), (1, 1, Some(1)));
+    h.consumers(0, 200);
+    assert_eq!(h.outputs(), (2, 2, Some(2)));
+    assert_eq!(h.world().session_starts, 0);
+
+    // A mode change and PipeWire disabled with nobody: the writer alone
+    // comes back.
+    let mut h = H::new(PIPEWIRE, |_| {});
+    h.pipewire_up(0);
+    h.reload("[output]\nmode = \"1280x720@30\"\n", 100).unwrap();
+    assert_eq!(h.outputs(), (2, 1, None));
+    assert_eq!(h.counts(), counts(0, 0, 0, "off"));
+}
+
+#[test]
+fn a_failed_or_unsupported_pipewire_output_is_no_fault() {
+    let mut h = H::new(PIPEWIRE, |_| {});
+    h.pipewire_up(0);
+    h.activate(0);
+    h.pw_consumers(1, 400);
+    h.drain();
+    h.pw_state(
+        PipeWireState::Failed("the PipeWire daemon went away".into()),
+        500,
+    );
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.snap().error, "");
+    // A failed output has no links; the loopback consumer stays.
+    assert_eq!(h.counts(), counts(1, 1, 0, "failed"));
+    assert_eq!(
+        h.drain().0,
+        [
+            Change::Consumers(1),
+            Change::PipeWireConsumers(0),
+            Change::PipeWireOutput("failed".into()),
+        ]
+    );
+    // The same failure again changes nothing.
+    h.pw_state(
+        PipeWireState::Failed("the PipeWire daemon went away".into()),
+        600,
+    );
+    assert_eq!(h.drain().0, []);
+    h.consumers(0, 1000);
+    h.tick(6000);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.snap().error, "");
+
+    // A build without PipeWire support: idle, no error, the loopback works.
+    let mut h = H::new(PIPEWIRE, |_| {});
+    h.pw_state(PipeWireState::Unsupported, 0);
+    h.pw_consumers(0, 0);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.snap().error, "");
+    assert_eq!(h.counts(), counts(0, 0, 0, "unsupported"));
+    h.activate(100);
+    assert_eq!(h.snap().error, "");
+    // An error of the loopback side is still reported as before.
+    h.world().failure = Some(Failure::Output("output pipeline failed: boom".into()));
+    h.tick(1000);
+    assert_eq!(h.state(), State::Error);
+    assert_eq!(h.snap().error, "output pipeline failed: boom");
+    assert_eq!(h.snap().pipewire_output, "unsupported");
+}
+
+#[test]
+fn the_pipewire_states_have_their_wire_names() {
+    assert_eq!(
+        [
+            PipeWireState::Off,
+            PipeWireState::Unsupported,
+            PipeWireState::Connecting,
+            PipeWireState::Ready,
+            PipeWireState::Streaming,
+            PipeWireState::Failed("x".into()),
+        ]
+        .map(|s| s.as_str()),
+        [
+            "off",
+            "unsupported",
+            "connecting",
+            "ready",
+            "streaming",
+            "failed"
+        ]
+    );
+    assert_eq!(obc_ipc::PIPEWIRE_OFF, PipeWireState::Off.as_str());
 }

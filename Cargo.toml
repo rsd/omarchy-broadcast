@@ -14,7 +14,7 @@ members = [
 
 [workspace.package]
 # Also the pkgver= of packaging/arch/PKGBUILD: bump both; CI checks they match.
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Raul Dias"]
@@ -49,6 +49,9 @@ tempfile = "3"
 # Run-time loading of the CUDA driver and the Maxine SDK (ADR-0012): nothing
 # links against them, so the workspace builds without either.
 libloading = "0.8"
+# The optional native PipeWire camera node (obc-pipeline feature `pipewire`):
+# a Video/Source stream with our own EnumFormat list; needs libpipewire at build.
+pipewire = { version = "0.10.1", features = ["v0_3_34"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

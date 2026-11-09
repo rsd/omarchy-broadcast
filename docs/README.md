@@ -4,8 +4,8 @@
 |---|---|
 | [architecture.md](architecture.md) | Mermaid diagrams: component overview, stage/caps model (ingest, process, output) with capability-driven source selection, persistent loopback writer, daemon lifecycle, threads, D-Bus sequence |
 | [setup/loopback.md](setup/loopback.md) | Creating the "Omarchy Broadcast" v4l2loopback virtual camera: `modprobe` options, reload, and why `exclusive_caps=1` |
-| [setup/daemon.md](setup/daemon.md) | Installing and running `oma-broadcastd` as a systemd user service: `cargo install`, unit and optional D-Bus activation and WirePlumber drop-in files, configuration and state files, reload, logs |
-| [dbus-api.md](dbus-api.md) | Reference for `br.com.dias.OmaBroadcast1` (revision 2): states, properties, methods, errors, video effects, the `Stats` signal, activation without starting the daemon, `busctl` and `gdbus` examples |
+| [setup/daemon.md](setup/daemon.md) | Installing and running `oma-broadcastd` as a systemd user service: `cargo install`, unit and optional D-Bus activation and WirePlumber drop-in files, configuration and state files, reload, logs, and the optional PipeWire camera output (build feature, configuration, checks, application settings, hiding the duplicate camera) |
+| [dbus-api.md](dbus-api.md) | Reference for `br.com.dias.OmaBroadcast1` (revision 3): states, properties, methods, errors, video effects, the `Stats` signal, activation without starting the daemon, `busctl` and `gdbus` examples |
 | [cli-json.md](cli-json.md) | The `oma-broadcast` commands (including `effect`), exit codes and the JSON line format (`status`, `cameras`, `watch --json`) for clients that cannot speak D-Bus |
 | [../clients/omarchy-bar/README.md](../clients/omarchy-bar/README.md) | Omarchy shell bar widget, a client of the daemon through `oma-broadcast watch --json`: icon states, clicks and panel, install by symlink, the `cliPath` setting and CLI resolution order, troubleshooting messages, tests, removal |
 | [config.example.toml](config.example.toml) | Every `config.toml` key with its default, as a commented example |
@@ -15,7 +15,7 @@
 | [benchmarks/passthrough.md](benchmarks/passthrough.md) | Passthrough and roundtrip results: pipeline, latency method, output format, camera frame-rate caveat, teardown finding; raw results are the JSON files alongside |
 | [benchmarks/ingest-paths.md](benchmarks/ingest-paths.md) | Camera and ingest-path results: GPU-direct, CPU convert and CPU decode cost on two cameras, with variance under load |
 | [benchmarks/io-split.md](benchmarks/io-split.md) | Ingest / Output split results: output frame rate over 10 minutes, live camera switching with an external consumer, crop versus letterbox, cost per ingest path against the single pipeline, and the phase-locked clock with the held frame at a switch; raw results are the JSON files alongside |
-| [testing.md](testing.md) | Unit tests, hardware tests (environment variables), the daemon, CLI and `obc-ipc` tests, measured daemon figures, the video-effects tests (fake backend, Maxine hardware tests with the shim), discovery by PipeWire, the `obc-bench` flags and the manual OBS/Chrome and daemon tests |
+| [testing.md](testing.md) | Unit tests, hardware tests (environment variables), the daemon, CLI and `obc-ipc` tests, measured daemon figures, the video-effects tests (fake backend, Maxine hardware tests with the shim), discovery by PipeWire, the PipeWire output's unit and live tests, the `obc-bench` flags and the manual OBS/Chrome and daemon tests |
 | [benchmarks/dgpu-idle.md](benchmarks/dgpu-idle.md) | dGPU idle check after teardown: findings and the quiet-desktop procedure |
 | `../scripts/dgpu-idle-check.sh` | Reads sysfs and `/proc` only (never NVML) to report whether the dGPU runtime-suspends and who holds it awake |
 | `../tools/maxine-probe/` | Standalone C probe that checks a Maxine SDK installation; see its README |
@@ -39,5 +39,6 @@
 | [0012](adr/0012-video-effects-and-maxine-backend.md) | Video effects (none, blur, replace) in the Process stage as one always-present `obceffect` element, the `InferenceBackend` seam with a dlopen'd Maxine backend, models loaded only while an effect is on, black rather than the raw image while an effect starts or fails, and an `LD_PRELOAD` shim for the SDK's os-release check; extends the D-Bus API to revision 2 |
 | [0014](adr/0014-mic-noise-removal-filter-chain.md) | Proposed: microphone noise removal as a PipeWire filter-chain hosting a CPU LADSPA plugin (DeepFilterNet or RNNoise), one dedicated `pipewire -c` process per engine under a template user unit, independent of the daemon; Maxine Audio Effects deferred |
 | [0015](adr/0015-cadence-emission-for-sub-rate-inputs.md) | A steady camera slower than the contract (1.1 to 1.9 output periods per frame, such as 20 fps into 30) is followed by emitting each tick at the predicted arrival of its frame; amends 0010 |
+| [0016](adr/0016-pipewire-output.md) | An optional native PipeWire `Video/Source` node next to the loopback, fed by a tap on the loopback writer (same stream, pacing and timeline), with three offered formats and CPU conversion; PipeWire links count as consumers; D-Bus revision 3; amends 0004 and 0011 |
 
 Conventions: diagrams are mermaid. New decisions get the next ADR number; superseded ADRs keep their file and change their status line.

@@ -45,6 +45,25 @@
 //! unavailable before the session starts is found out before the camera
 //! is opened.
 //!
+//! Consumers are of two kinds: processes holding the loopback (the
+//! consumer watcher's count) and, with `[pipewire] enabled`, links to the
+//! PipeWire output (its [`PipeWireEvent`]s). The lifecycle (debounce, grace,
+//! a deferred writer rebuild) follows their total, `Consumers`; either kind
+//! keeps the session running. The PipeWire output runs next to the writer
+//! but has its own lifecycle, so `[pipewire] enabled` never disturbs the
+//! loopback device: a reload that enables it starts the output at once; one
+//! that disables it stops the output once it has no link (at once if it
+//! has none; loopback consumers do not matter); neither touches the writer
+//! or the session. A writer rebuild (a new output mode or loopback device,
+//! deferred until no consumer of either kind is left and no session runs)
+//! rebuilds the PipeWire output too, with the new contract. Its failure is
+//! not a lifecycle fault: the loopback keeps working, so it leaves `State`
+//! and `Error` alone (it shows in `PipeWireOutput` and the journal). Every
+//! PipeWire output the backend starts has its own generation, carried by
+//! each of its events: only the current output's events are applied, so
+//! those an output stopped or replaced left in the command queue change
+//! nothing, in whatever order they arrive.
+//!
 //! The streaming camera is followed by its device node, not by its id: an
 //! id can change between two scans of the same camera (udev adds the
 //! `/dev/v4l` links after the node), and such a change is a rename, not a
@@ -63,7 +82,10 @@ use obc_core::{EffectMode, EffectOnFailure, OutputContract};
 use obc_ipc::{CameraInfo, INTERFACE_REVISION, IpcError, Snapshot, State, Stats};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::backend::{EffectReport, EffectStatus, Failure, MediaBackend, SessionParams};
+use crate::backend::{
+    EffectReport, EffectStatus, Failure, MediaBackend, PipeWireEvent, PipeWireGeneration,
+    PipeWireState, SessionParams,
+};
 use crate::camera::{self, Camera};
 use crate::{debug, error, info, warning};
 
@@ -105,6 +127,9 @@ pub enum Command {
     ReloadConfig(Option<Reply>),
     /// The consumer watcher's count of processes holding the loopback.
     Consumers(u32),
+    /// An event of the PipeWire output of that generation (through the
+    /// backend's reporter).
+    PipeWire(PipeWireGeneration, PipeWireEvent),
     /// Video nodes appeared or disappeared: scan the cameras again.
     Rescan,
     /// Stop everything and end the controller loop.
@@ -124,6 +149,9 @@ pub enum Change {
     BlurStrength(f64),
     BackgroundImage(String),
     Consumers(u32),
+    LoopbackConsumers(u32),
+    PipeWireConsumers(u32),
+    PipeWireOutput(String),
 }
 
 impl Change {
@@ -140,6 +168,9 @@ impl Change {
             Change::BlurStrength(_) => "BlurStrength",
             Change::BackgroundImage(_) => "BackgroundImage",
             Change::Consumers(_) => "Consumers",
+            Change::LoopbackConsumers(_) => "LoopbackConsumers",
+            Change::PipeWireConsumers(_) => "PipeWireConsumers",
+            Change::PipeWireOutput(_) => "PipeWireOutput",
         }
     }
 }
@@ -261,6 +292,15 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Vec<Change> {
     if old.consumers != new.consumers {
         out.push(Change::Consumers(new.consumers));
     }
+    if old.loopback_consumers != new.loopback_consumers {
+        out.push(Change::LoopbackConsumers(new.loopback_consumers));
+    }
+    if old.pipewire_consumers != new.pipewire_consumers {
+        out.push(Change::PipeWireConsumers(new.pipewire_consumers));
+    }
+    if old.pipewire_output != new.pipewire_output {
+        out.push(Change::PipeWireOutput(new.pipewire_output.clone()));
+    }
     if old.error != new.error {
         out.push(Change::Error(new.error.clone()));
     }
@@ -334,6 +374,9 @@ pub fn preliminary_snapshot(paths: &Paths) -> Snapshot {
         blur_strength: effect.blur_strength,
         background_image: image_string(&effect),
         consumers: 0,
+        loopback_consumers: 0,
+        pipewire_consumers: 0,
+        pipewire_output: PipeWireState::Off.as_str().into(),
         interface_revision: INTERFACE_REVISION,
     }
 }
@@ -410,6 +453,9 @@ struct WriterOn {
     node: PathBuf,
     contract: OutputContract,
     sink: obc_core::SinkSelector,
+    /// The generation of the PipeWire output running next to it (`None`:
+    /// none runs).
+    pipewire: Option<PipeWireGeneration>,
 }
 
 /// The running session.
@@ -468,7 +514,15 @@ pub struct Controller<B: MediaBackend> {
     effect_applied: Option<EffectConfig>,
     /// When the effect's GPU time is logged next.
     effect_log_at: Option<Instant>,
+    /// Every consumer: `loopback_consumers + pipewire_consumers`, what the
+    /// lifecycle follows.
     consumers: u32,
+    /// The consumer watcher's count of processes holding the loopback.
+    loopback_consumers: u32,
+    /// The links to the PipeWire output (0 without one).
+    pipewire_consumers: u32,
+    /// The PipeWire output's state (`Off` without one).
+    pipewire_state: PipeWireState,
     /// Since when a consumer has been present (debounce).
     present_since: Option<Instant>,
     /// Since when no consumer has been present (grace).
@@ -536,6 +590,9 @@ impl<B: MediaBackend> Controller<B> {
             effect_applied: None,
             effect_log_at: None,
             consumers: 0,
+            loopback_consumers: 0,
+            pipewire_consumers: 0,
+            pipewire_state: PipeWireState::Off,
             present_since: None,
             absent_since: None,
             next_stats: None,
@@ -584,7 +641,11 @@ impl<B: MediaBackend> Controller<B> {
                 }
             }
             Command::Consumers(n) => {
-                self.set_consumers(n, now);
+                self.set_consumers(n, self.pipewire_consumers, now);
+                self.reconcile(now);
+            }
+            Command::PipeWire(generation, event) => {
+                self.pipewire_event(generation, event, now);
                 self.reconcile(now);
             }
             Command::Rescan => self.rescan(now),
@@ -762,8 +823,9 @@ impl<B: MediaBackend> Controller<B> {
         }
     }
 
-    /// The config asks for another output contract or loopback than the
-    /// writer has.
+    /// The config asks for another output contract or loopback device than
+    /// the writer has. The PipeWire setting is not the writer's
+    /// ([`Self::sync_pipewire`]).
     fn writer_outdated(&self) -> bool {
         self.writer.as_ref().is_some_and(|w| {
             w.contract != self.config.output_contract() || w.sink != self.config.sink_selector()
@@ -789,6 +851,9 @@ impl<B: MediaBackend> Controller<B> {
             blur_strength: effect.blur_strength,
             background_image: image_string(&effect),
             consumers: self.consumers,
+            loopback_consumers: self.loopback_consumers,
+            pipewire_consumers: self.pipewire_consumers,
+            pipewire_output: self.pipewire_state.as_str().into(),
             interface_revision: INTERFACE_REVISION,
         };
         self.published.update(snap);
@@ -831,12 +896,45 @@ impl<B: MediaBackend> Controller<B> {
         if self.writer.is_none() && self.writer_retry_at.is_none_or(|t| now >= t) {
             self.start_writer(now);
         }
+        self.sync_pipewire(now);
     }
 
-    /// Restarts the writer with the new output contract or loopback, unless
-    /// a process holds the device after all: the watcher's count lags a
-    /// fresh open (inotify, then a `/proc` scan), and a rebuild under an
-    /// application would change the format it negotiated.
+    /// Starts or stops the PipeWire output next to the running writer when
+    /// `[pipewire] enabled` asks for it, without touching the writer or
+    /// the session. A stop waits until the output has no link left (the
+    /// loopback's consumers do not matter); it applies at the step that
+    /// counts the last link gone. A stopped output is `off` with no link.
+    fn sync_pipewire(&mut self, now: Instant) {
+        let Some(running) = self.writer.as_ref().map(|w| w.pipewire.is_some()) else {
+            return;
+        };
+        let wanted = self.config.pipewire.enabled;
+        let pipewire = if wanted && !running {
+            info!("starting the PipeWire output next to the virtual camera");
+            Some(self.backend.start_pipewire())
+        } else if !wanted && running && self.pipewire_consumers == 0 {
+            info!("stopping the PipeWire output; the virtual camera keeps running");
+            self.backend.stop_pipewire();
+            None
+        } else {
+            return;
+        };
+        if let Some(w) = self.writer.as_mut() {
+            w.pipewire = pipewire;
+        }
+        self.pipewire_state = if pipewire.is_some() {
+            PipeWireState::Connecting
+        } else {
+            PipeWireState::Off
+        };
+        self.set_consumers(self.loopback_consumers, 0, now);
+    }
+
+    /// Restarts the writer (and the PipeWire output, if one is configured)
+    /// with the new output contract or loopback device, unless a process
+    /// holds the device after all: the watcher's count lags a fresh open
+    /// (inotify, then a `/proc` scan), and a rebuild under an application
+    /// would change the format it negotiated.
     fn rebuild_writer(&mut self, now: Instant) {
         let Some(node) = self.writer.as_ref().map(|w| w.node.clone()) else {
             return;
@@ -866,10 +964,20 @@ impl<B: MediaBackend> Controller<B> {
         let contract = self.config.output_contract();
         match self.backend.start_writer(&sink, &contract) {
             Ok(node) => {
+                let pipewire = self
+                    .config
+                    .pipewire
+                    .enabled
+                    .then(|| self.backend.start_pipewire());
                 info!(
-                    "virtual camera {} ({}) is ready",
+                    "virtual camera {} ({}) is ready{}",
                     node.display(),
-                    output_mode_string(&contract)
+                    output_mode_string(&contract),
+                    if pipewire.is_some() {
+                        ", with the PipeWire output"
+                    } else {
+                        ""
+                    }
                 );
                 if let Some(old) = self.writer_error.take()
                     && self.error == old
@@ -881,6 +989,7 @@ impl<B: MediaBackend> Controller<B> {
                     node: node.clone(),
                     contract,
                     sink,
+                    pipewire,
                 });
                 self.notify_sink(Some(&node), now);
             }
@@ -895,8 +1004,17 @@ impl<B: MediaBackend> Controller<B> {
         }
     }
 
+    /// The writer started or stopped: nobody is counted on the new one yet
+    /// (the watcher counts the loopback's holders again, a new PipeWire
+    /// output reports its links), and the PipeWire output is `connecting`
+    /// if the new writer has one, else `off`.
     fn notify_sink(&mut self, node: Option<&Path>, now: Instant) {
-        self.set_consumers(0, now);
+        self.set_consumers(0, 0, now);
+        self.pipewire_state = if self.writer.as_ref().is_some_and(|w| w.pipewire.is_some()) {
+            PipeWireState::Connecting
+        } else {
+            PipeWireState::Off
+        };
         if let Some(hook) = self.sink_hook.as_mut() {
             hook(node);
         }
@@ -1284,11 +1402,15 @@ impl<B: MediaBackend> Controller<B> {
         }
     }
 
-    fn set_consumers(&mut self, n: u32, now: Instant) {
+    /// Sets the two counts; the lifecycle follows their total.
+    fn set_consumers(&mut self, loopback: u32, pipewire: u32, now: Instant) {
+        self.loopback_consumers = loopback;
+        self.pipewire_consumers = pipewire;
+        let n = loopback.saturating_add(pipewire);
         if n == self.consumers {
             return;
         }
-        debug!("consumers: {n}");
+        debug!("consumers: {n} (loopback {loopback}, PipeWire {pipewire})");
         if n > 0 && self.consumers == 0 {
             self.present_since = Some(now);
             self.absent_since = None;
@@ -1297,6 +1419,52 @@ impl<B: MediaBackend> Controller<B> {
             self.absent_since = Some(now);
         }
         self.consumers = n;
+    }
+
+    /// An event of the PipeWire output of `generation`. Ignored unless that
+    /// output is the one running next to the writer (an event of an output
+    /// already stopped or replaced, whenever it arrives). A failure, or a
+    /// build without PipeWire support, is logged and shown in
+    /// `PipeWireOutput` only: the loopback is unaffected, so it is no fault
+    /// and `Error` stays as it is. Such an output has no links.
+    fn pipewire_event(
+        &mut self,
+        generation: PipeWireGeneration,
+        event: PipeWireEvent,
+        now: Instant,
+    ) {
+        if self.writer.as_ref().and_then(|w| w.pipewire) != Some(generation) {
+            debug!(
+                "event of PipeWire output {generation}, which no longer runs, ignored: {event:?}"
+            );
+            return;
+        }
+        match event {
+            PipeWireEvent::Consumers(n) => self.set_consumers(self.loopback_consumers, n, now),
+            PipeWireEvent::State(state) => {
+                if state == self.pipewire_state {
+                    return;
+                }
+                match &state {
+                    PipeWireState::Failed(reason) => warning!(
+                        "PipeWire output failed: {reason}; the loopback device keeps working"
+                    ),
+                    PipeWireState::Unsupported => warning!(
+                        "PipeWire output unavailable: this build has no PipeWire support; the \
+                         loopback device keeps working"
+                    ),
+                    PipeWireState::Ready => info!("PipeWire output ready"),
+                    other => debug!("PipeWire output: {}", other.as_str()),
+                }
+                if matches!(
+                    state,
+                    PipeWireState::Failed(_) | PipeWireState::Unsupported | PipeWireState::Off
+                ) {
+                    self.set_consumers(self.loopback_consumers, 0, now);
+                }
+                self.pipewire_state = state;
+            }
+        }
     }
 
     /// Scans the cameras; returns the previous list. A camera whose id
@@ -1661,8 +1829,15 @@ impl<B: MediaBackend> Controller<B> {
         }
         if self.writer_outdated() && (self.consumers > 0 || self.session.is_some()) {
             info!(
-                "the new output or loopback settings apply once no application holds the virtual camera"
+                "the new output or loopback settings apply once no application uses the \
+                 virtual camera"
             );
+        }
+        if !self.config.pipewire.enabled
+            && self.writer.as_ref().is_some_and(|w| w.pipewire.is_some())
+            && self.pipewire_consumers > 0
+        {
+            info!("the PipeWire output stops once no application is linked to it");
         }
     }
 }
