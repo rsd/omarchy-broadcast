@@ -23,8 +23,8 @@ pub enum PwFormat {
 }
 
 impl PwFormat {
-    /// The formats in their canonical order (the contract's format first is
-    /// [`offered_formats`]'s business).
+    /// The formats in their canonical order ([`offered_formats`] has the order
+    /// the node offers them in).
     pub const ALL: [PwFormat; 3] = [PwFormat::Nv12, PwFormat::Yuy2, PwFormat::I420];
 
     /// The SPA video format.
@@ -66,20 +66,15 @@ impl std::fmt::Display for PwFormat {
     }
 }
 
-/// The EnumFormat order: the contract's format first (no conversion for a
-/// consumer that takes the first entry), then the other two in
-/// [`PwFormat::ALL`] order.
-pub fn offered_formats(contract: &OutputContract) -> [PwFormat; 3] {
-    let first = PwFormat::from(contract.format);
-    let mut out = [first; 3];
-    let mut i = 1;
-    for f in PwFormat::ALL {
-        if f != first {
-            out[i] = f;
-            i += 1;
-        }
-    }
-    out
+/// The EnumFormat order: YUY2, NV12, I420, whatever the contract's format.
+///
+/// YUY2 is first because OBS Studio 32.x's PipeWire camera source takes the
+/// first entry and mis-sizes NV12 rows (it computes 2 bytes per pixel and
+/// ignores the chunk stride), so it reads past the end of a correctly sized
+/// NV12 buffer and crashes. A consumer that asks for NV12 or I420 explicitly
+/// (`pipewiresrc` with caps) still negotiates it.
+pub fn offered_formats() -> [PwFormat; 3] {
+    [PwFormat::Yuy2, PwFormat::Nv12, PwFormat::I420]
 }
 
 fn round_up_2(v: usize) -> usize {
@@ -196,7 +191,7 @@ pub fn enum_format(contract: &OutputContract, format: PwFormat) -> Object {
 
 /// The serialised EnumFormat pods, in [`offered_formats`] order.
 pub fn enum_format_pods(contract: &OutputContract) -> Vec<Vec<u8>> {
-    offered_formats(contract)
+    offered_formats()
         .into_iter()
         .map(|f| serialize(&Value::Object(enum_format(contract, f))))
         .collect()
@@ -323,17 +318,23 @@ mod tests {
     }
 
     #[test]
-    fn the_contract_format_is_offered_first() {
-        let nv12 = OutputContract::default();
+    fn yuy2_is_offered_first_whatever_the_contract_format() {
+        // OBS 32.x overreads NV12 buffers, so NV12 must not be the first
+        // entry; the order does not depend on the contract.
         assert_eq!(
-            offered_formats(&nv12),
-            [PwFormat::Nv12, PwFormat::Yuy2, PwFormat::I420]
+            offered_formats(),
+            [PwFormat::Yuy2, PwFormat::Nv12, PwFormat::I420]
         );
-        let i420 = contract(OutputFormat::I420, "1920x1080@30");
-        assert_eq!(
-            offered_formats(&i420),
-            [PwFormat::I420, PwFormat::Nv12, PwFormat::Yuy2]
-        );
+        for c in [
+            &OutputContract::default(),
+            &contract(OutputFormat::I420, "1920x1080@30"),
+        ] {
+            let first = enum_format(c, offered_formats()[0]);
+            assert_eq!(
+                prop(&first, FormatProperties::VideoFormat),
+                &Value::Id(Id(VideoFormat::YUY2.as_raw()))
+            );
+        }
         for f in PwFormat::ALL {
             assert_eq!(PwFormat::from_spa(f.spa()), Some(f));
         }
@@ -397,7 +398,7 @@ mod tests {
         let c = contract(OutputFormat::I420, "1280x720@30000/1001");
         let pods = enum_format_pods(&c);
         assert_eq!(pods.len(), 3);
-        for (bytes, want) in pods.iter().zip(offered_formats(&c)) {
+        for (bytes, want) in pods.iter().zip(offered_formats()) {
             let (rest, value): (_, Value) = PodDeserializer::deserialize_from(bytes).unwrap();
             assert!(rest.is_empty());
             let Value::Object(obj) = value else {

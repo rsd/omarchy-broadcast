@@ -190,7 +190,7 @@ cargo test -p obc-pipeline -p oma-broadcastd --features oma-broadcastd/pipewire
 The continuous integration runs the same command, and clippy with the feature, as a second job; the default job is unchanged.
 
 **Unit tests** (`crates/obc-pipeline/src/pipewire/`, and the controller, D-Bus and CLI tests of the other crates):
-- the format pods and the negotiation: the contract format first, the other two formats after it, the exact size and rate, and the refusal of any other request;
+- the format pods and the negotiation: the offer order YUY2, NV12, I420 whatever the contract format, the exact size and rate, and the refusal of any other request;
 - the buffer layouts, compared with GStreamer's `GstVideoInfo` default layout, and the CPU conversions into the PipeWire buffer;
 - the link table behind the consumer count: links to the node are counted, links in the error state are not, and links to other nodes are ignored;
 - failure and retry: with no PipeWire daemon the output is `failed` and retried, never puts the daemon in `error`, and events of a replaced output are discarded;
