@@ -25,7 +25,6 @@ The package installs:
 - `/usr/bin/omarchy-broadcastd` and `/usr/bin/omarchy-broadcast`;
 - the unit `/usr/lib/systemd/user/omarchy-broadcastd.service`;
 - the D-Bus activation file `/usr/share/dbus-1/services/br.com.dias.OmarchyBroadcast.service`;
-- the Omarchy bar plugin in `/usr/share/omarchy-broadcast/omarchy-bar/br.com.dias.omarchy-broadcast/` ([link it](../../clients/omarchy-bar/README.md#install));
 - the licences and this documentation, in `/usr/share/doc/omarchy-broadcast/`;
 - the optional drop-ins as inactive examples in `/usr/share/doc/omarchy-broadcast/examples/systemd/` (`wireplumber.service.d/omarchy-broadcast.conf`, see "Discovery by PipeWire", and `omarchy-broadcastd.service.d/maxine.conf`, see [maxine.md](maxine.md#7a-the-daemon-systemd-user-unit)).
 
@@ -58,7 +57,7 @@ Behaviour:
 - It refuses to run as root.
 - It marks every text file it writes. It overwrites or removes a file only if it carries that mark (a binary: only if the manifest lists it with the checksum on disk), and stops before changing anything if a target path holds another file. Running it again updates its own install.
 - It runs no `systemctl` command and enables nothing; it prints the next steps.
-- It does not install the WirePlumber drop-in or the bar plugin.
+- It does not install the WirePlumber drop-in. The Omarchy bar plugin is a separate project (the omarchy-broadcast-plugin repository).
 - It warns when a unit in `~/.config/systemd/user` exists, because that location takes precedence (see below).
 
 Options: `--mic` also installs the optional noise-removed microphone ([microphone.md](microphone.md)), `--dry-run` prints every action and changes nothing, `--no-build` installs the binaries already in `${CARGO_TARGET_DIR:-target}/release`, `--uninstall` removes what the script installed, `--help` shows the usage. Exit status: 0 done; 1 refused (a target path holds a file the script did not install, or the unit is still enabled on `--uninstall`) or the build failed; 2 usage error or unusable environment.
@@ -256,7 +255,7 @@ systemctl --user disable --now omarchy-broadcastd
 
 Then, depending on how it was installed:
 
-- Arch package: `sudo pacman -R omarchy-broadcast-git`. Remove a bar plugin link you made (`rm ~/.config/omarchy/plugins/br.com.dias.omarchy-broadcast`) and any drop-in you copied from the examples.
+- Arch package: `sudo pacman -R omarchy-broadcast-git`. Remove any drop-in you copied from the examples. The bar plugin is not part of the package; see the omarchy-broadcast-plugin repository for removing it.
 - Per-user install: `scripts/install-user.sh --uninstall` from the checkout. It removes only the files it installed and refuses while the unit is still enabled, hence the command above comes first.
 - Manual install:
 

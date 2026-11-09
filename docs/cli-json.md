@@ -1,6 +1,6 @@
 # CLI reference and JSON output (`omarchy-broadcast`)
 
-`omarchy-broadcast` is the command-line remote control of `omarchy-broadcastd`. It talks to the daemon over the D-Bus session bus, through the interface `br.com.dias.OmarchyBroadcast1` described in [dbus-api.md](dbus-api.md). This document is the reference for its commands and, above all, for its JSON output: the interface for clients that cannot speak D-Bus, such as a QML status-bar plugin, which run `omarchy-broadcast watch --json` and read one JSON object per line. The design is recorded in [ADR-0011](adr/0011-daemon-lifecycle-and-dbus-api.md).
+`omarchy-broadcast` is the command-line remote control of `omarchy-broadcastd`. It talks to the daemon over the D-Bus session bus, through the interface `br.com.dias.OmarchyBroadcast1` described in [dbus-api.md](dbus-api.md). This document is the reference for its commands and, above all, for its JSON output: the interface for clients that cannot speak D-Bus, such as a QML status-bar plugin, which run `omarchy-broadcast watch --json` and read one JSON object per line. It is the contract the Omarchy bar widget of the omarchy-broadcast-plugin repository depends on: the widget consumes `watch --json` with schema `v` 1, and changes to the output follow the rules in [Versioning](#versioning). The design is recorded in [ADR-0011](adr/0011-daemon-lifecycle-and-dbus-api.md).
 
 ## Commands
 

@@ -44,7 +44,7 @@ sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst
 systemctl --user enable --now omarchy-broadcastd
 ```
 
-The package installs the daemon and the client in `/usr/bin`, the systemd user unit, the D-Bus activation file, the Omarchy bar plugin and the documentation. It enables nothing: each user runs the last command. The loopback device is still configured as in [docs/setup/loopback.md](docs/setup/loopback.md). The package also installs the os-release shim that the Maxine effects need on Arch-based systems, inactive, in `/usr/lib/omarchy-broadcast/`. The NVIDIA Maxine SDK is never packaged; install it as in [docs/setup/maxine.md](docs/setup/maxine.md), which also covers activating the shim (section 7).
+The package installs the daemon and the client in `/usr/bin`, the systemd user unit, the D-Bus activation file and the documentation. It enables nothing: each user runs the last command. The loopback device is still configured as in [docs/setup/loopback.md](docs/setup/loopback.md). The package also installs the os-release shim that the Maxine effects need on Arch-based systems, inactive, in `/usr/lib/omarchy-broadcast/`. The NVIDIA Maxine SDK is never packaged; install it as in [docs/setup/maxine.md](docs/setup/maxine.md), which also covers activating the shim (section 7).
 
 ### Developer install
 
@@ -79,7 +79,7 @@ Tests, including the manual check with OBS or Chrome, are described in [docs/tes
 
 ## Documentation
 
-See [docs/README.md](docs/README.md) for the architecture, decision records, setup guides and benchmarks. The Omarchy bar widget (status icon, on/off, camera, effect and noise-removal selection) is described in [clients/omarchy-bar/README.md](clients/omarchy-bar/README.md).
+See [docs/README.md](docs/README.md) for the architecture, decision records, setup guides and benchmarks. The Omarchy bar widget (status icon, on/off, camera, effect and noise-removal selection) is a separate project, the omarchy-broadcast-plugin repository; it is a client of the daemon through `omarchy-broadcast watch --json` and is not installed by the package.
 
 ## Licence
 

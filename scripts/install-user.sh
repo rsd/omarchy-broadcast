@@ -30,8 +30,8 @@
 # step, printed at the end.
 #
 # It runs no systemctl command and enables nothing; it prints the next steps.
-# It does not install the WirePlumber drop-in, the Maxine drop-in, the
-# Omarchy bar plugin or, without --mic, the microphone.
+# It does not install the WirePlumber drop-in, the Maxine drop-in or, without
+# --mic, the microphone. The Omarchy bar plugin is a separate project.
 #
 # Usage:
 #   scripts/install-user.sh [options]
@@ -604,7 +604,6 @@ case ":${PATH:-}:" in
   *) warn "$bin_dir is not on PATH; the omarchy-broadcast CLI must be called by its full path" ;;
 esac
 
-plugin=$repo/clients/omarchy-bar/br.com.dias.omarchy-broadcast
 wp_src=$repo/dist/systemd/wireplumber.service.d/omarchy-broadcast.conf
 maxine_src=$repo/dist/systemd/omarchy-broadcastd.service.d/maxine.conf
 done_msg="Installed."
@@ -622,9 +621,8 @@ camera (see $(printf '%q' "$wp_src")):
   install -Dm644 $(printf '%q' "$wp_src") $(printf '%q' "$config_dir/systemd/user/wireplumber.service.d/omarchy-broadcast.conf")
   systemctl --user daemon-reload
 
-Optional, the Omarchy bar plugin:
-  mkdir -p ~/.config/omarchy/plugins && ln -s $(printf '%q' "$plugin") ~/.config/omarchy/plugins/br.com.dias.omarchy-broadcast
-  omarchy plugin enable br.com.dias.omarchy-broadcast
+The Omarchy bar plugin is a separate project: see the omarchy-broadcast-plugin
+repository and its README.
 EOF
 if ((do_shim)); then
   cat <<EOF

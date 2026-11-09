@@ -9,8 +9,8 @@ The source is any UVC webcam. The pipeline queries the camera's advertised forma
 ```mermaid
 flowchart LR
     subgraph Clients["Clients (optional, replaceable)"]
-        CLI["omarchy-broadcast CLI<br/>(--json for the QML bar)"]
-        BAR["Omarchy bar plugin (QML)"]
+        CLI["omarchy-broadcast CLI<br/>(--json for the bar plugin)"]
+        BAR["Omarchy bar plugin<br/>(omarchy-broadcast-plugin repository)"]
         SH["scripts via busctl / gdbus"]
     end
 
