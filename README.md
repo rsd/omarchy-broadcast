@@ -16,6 +16,7 @@ Early development. The camera -> CUDA -> virtual camera passthrough works, with 
 - v4l2loopback, configured as described in [docs/setup/loopback.md](docs/setup/loopback.md)
 - Rust toolchain (only to build from source; the Arch package is built with it, and installed without it)
 - Optional, for effects: the NVIDIA Maxine VFX SDK ([docs/setup/maxine.md](docs/setup/maxine.md))
+- Optional, for the noise-removed microphone: `deepfilternet-ladspa` or `noise-suppression-for-voice` ([docs/setup/microphone.md](docs/setup/microphone.md))
 
 ## Build
 
