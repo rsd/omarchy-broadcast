@@ -1,6 +1,6 @@
 # ADR-0011: Daemon lifecycle, persistent loopback writer, consumer detection and the D-Bus v1 API
 
-- **Status:** Accepted. Amends [ADR-0006](0006-on-demand-gpu-lifecycle.md) (lifecycle states, what runs while idle) and [ADR-0007](0007-headless-daemon-toml-config.md) (how runtime changes persist, how the config is reloaded). Implements [ADR-0005](0005-dbus-zbus-control-plane.md). Amended by [ADR-0016](0016-pipewire-output.md): consumers also include PipeWire links, and the property list gains `LoopbackConsumers`, `PipeWireConsumers` and `PipeWireOutput` (revision 3).
+- **Status:** Accepted. Amends [ADR-0006](0006-on-demand-gpu-lifecycle.md) (lifecycle states, what runs while idle) and [ADR-0007](0007-headless-daemon-toml-config.md) (how runtime changes persist, how the config is reloaded). Implements [ADR-0005](0005-dbus-zbus-control-plane.md). Amended by [ADR-0016](0016-pipewire-output.md): consumers also include PipeWire links, and the property list gains `LoopbackConsumers`, `PipeWireConsumers` and `PipeWireOutput` (revision 3). Amended by [ADR-0017](0017-cuda-checkpoint-parking.md): the worker-process fallback is replaced by parking the daemon's own GPU state at Idle.
 
 ## Context
 - `oma-broadcastd` turns the pipeline of [ADR-0009](0009-ingest-process-output.md) and [ADR-0010](0010-phase-locked-output-clock.md) into a product: a headless user service that the CLI, the Omarchy bar and scripts control over D-Bus.
@@ -16,7 +16,7 @@
 ### Process and service
 - One process, `oma-broadcastd`, run as a systemd user service. The unit file ships in `dist/systemd/oma-broadcastd.service`, and a D-Bus activation file in `dist/dbus-1/services/br.com.dias.OmaBroadcast.service`. Nothing is installed by the build. The unit is `Type=dbus` and `WantedBy=default.target`.
 - **The bus name is requested after the loopback writer has started** (or has failed in a way the `error` state reports). With `Type=dbus`, the service is therefore ready only once the loopback is a capture device, so a WirePlumber ordered after it probes a capture device. An optional drop-in, `dist/systemd/wireplumber.service.d/oma-broadcast.conf`, orders WirePlumber after the daemon; the manual alternative is `systemctl --user restart wireplumber` once the daemon runs. A second instance finds the name owned and exits with status 3 before touching the loopback.
-- GPU work runs in-process and is torn down to release the CUDA context. The handles that survive `cuInit` are accepted for now; if they are shown to block runtime suspend, the GPU work moves to a worker process that exits at teardown ([ADR-0006](0006-on-demand-gpu-lifecycle.md), fallback). Before the first activation the daemon never calls into CUDA and never loads the `nvcodec` plugin.
+- GPU work runs in-process and is torn down to release the CUDA context. The handles that survive `cuInit` are released by parking the process with the CUDA checkpoint API once the session has stopped, and restored at the next start ([ADR-0017](0017-cuda-checkpoint-parking.md)). This replaces the worker process that this ADR first named as the fallback. Before the first activation the daemon never calls into CUDA and never loads the `nvcodec` plugin.
 
 ### A persistent loopback writer
 - The daemon owns one **loopback writer** for its whole life: a CPU-only GStreamer pipeline, `appsrc` → `v4l2sink`, with the output contract's caps (default NV12 1920x1080@30, limited range, labelled as the loopback requires). It opens the device once and never renegotiates.
@@ -92,7 +92,7 @@ stateDiagram-v2
 - Clients that discover cameras through PipeWire depend on WirePlumber probing the device while the daemon's writer streams (start order, the optional drop-in, or a WirePlumber restart).
 - The first open still pays camera start, CUDA initialisation and pipeline build; the consumer sees black until then.
 - Changing the output mode while a consumer holds the device is deferred, not refused.
-- The 7 `cuInit` handles survive the first activation until the daemon exits; the runtime-suspend question of [../benchmarks/dgpu-idle.md](../benchmarks/dgpu-idle.md) still decides whether a worker process is needed.
+- The 7 `cuInit` handles that survive teardown are released by parking the process at Idle ([ADR-0017](0017-cuda-checkpoint-parking.md)); no worker process is needed. A CUDA call made while parked blocks until the next start, so Idle code paths must make none.
 - An unplug cannot be produced on demand without root; it is covered by tests on simulated failures and by the same switch path a manual camera change uses.
 
 ## Alternatives considered

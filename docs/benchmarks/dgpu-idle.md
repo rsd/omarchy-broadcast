@@ -4,7 +4,15 @@ Criterion: after teardown, the dGPU reaches `suspended`. Reframed as what can be
 CUDA context when it is idle**, verified from sysfs (`power/runtime_status`) and `/proc`. Background is in
 [ADR-0006](../adr/0006-on-demand-gpu-lifecycle.md).
 
-## Verdict: partial; the suspend itself could not be observed on the reference machine
+## Update: parked at Idle ([ADR-0017](../adr/0017-cuda-checkpoint-parking.md))
+
+The findings below are those of a daemon that tears down in-process only. The daemon now also parks its process with the CUDA checkpoint API once a session has fully stopped.
+
+- **What kept the GPU awake.** Besides the 7 fds, `cuInit` makes `nvidia-uvm` register the GPU, which takes a keep-awake reference that nothing in the process releases. Opening `/dev/nvidia0` alone does not block suspend under fine-grained RTD3 (`DynamicPowerManagement=3`); the UVM registration does. Destroying the context, resetting the primary context or taking the GStreamer CUDA elements to NULL brings the fds from 21 to 7 but leaves the GPU registered; `dlclose(libcuda)` leaves the fds open.
+- **After a park:** the daemon holds 0 `/dev/nvidia*` fds and no `/dev/nvidia` mappings, and the GPU is missing from `/proc/driver/nvidia-uvm/gpus/` (system-wide: meaningful only when no other process holds `/dev/nvidia-uvm`). Park takes 15 to 18 ms at Idle and unpark 16 to 20 ms (effect off).
+- **Still not observed: an actual runtime suspend.** On the reference machine the dGPU drives the external displays, so it never suspends. The per-process result above is the acceptance proxy. A real suspend needs the dGPU to drive no display and no other process to hold it; the procedure below checks it. The expected unpark from a suspended GPU, about 2.6 s like a cold `cuInit`, is not measured yet.
+
+## Verdict (before parking): partial; the suspend itself could not be observed on the reference machine
 
 - **CUDA context: none after teardown.** The positive control works: while streaming, `nvidia-smi` lists
   `obc-bench` as a compute (`C`) process using 200 MiB. 3 s and 57 s after in-process teardown it lists nothing for our
@@ -126,7 +134,9 @@ other clients):
 | No handles after process exit | **Yes** | Our pid holds nothing; holders are back to baseline |
 | dGPU reaches `suspended` | **Not verifiable here** | Lit dGPU outputs and a running 3D workload; `runtime_suspended_time` = 0 since boot |
 
-## Unresolved question
+## Unresolved question (answered by parking)
+
+The 7 fds and the UVM registration are now released by parking the process ([ADR-0017](../adr/0017-cuda-checkpoint-parking.md)), so the worker-process branch below is not needed. What remains open is observing the suspend itself.
 
 ADR-0006 needs the dGPU to suspend while the daemon idles in a live process. The evidence above leaves one question
 open: **in fine-grained RTD3 mode, do the 7 `cuInit` handles that survive in-process teardown (no context, no
@@ -174,6 +184,19 @@ scripts/dgpu-idle-check.sh --wait 60; echo "after-exit exit=$?"
 ```
 
 Expected on a quiet desktop: step 1 gives exit 0, and step 3 gives exit 0. Step 2's result answers the unresolved question above.
+
+### With the daemon, to observe a real suspend
+
+Same preconditions (no dGPU display, no other GPU client, no `nvidia-smi`). Start the daemon, open the virtual camera once with any application and close it, then wait for the idle grace period and the park (the daemon logs the park and its duration at info):
+
+```bash
+scripts/dgpu-idle-check.sh --pid "$(pgrep -x oma-broadcastd)" --wait 120; echo "daemon exit=$?"
+#    exit 0 -> the dGPU reached "suspended" with the daemon idle after an activation
+#    exit 1 with the daemon as a holder -> the park did not happen; read the daemon log
+#    exit 1 with other holders -> the desktop is not quiet; go back to step 1
+```
+
+The next activation should take about 2.6 s longer to produce its first frame than from a parked, awake GPU (expected, not measured).
 
 ## Not verified
 

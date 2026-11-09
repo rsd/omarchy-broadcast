@@ -17,6 +17,7 @@ use crate::camera::Camera;
 
 #[cfg(test)]
 pub mod fake;
+pub mod park;
 pub mod real;
 
 /// What a session is built with, from the config at the time it starts.
@@ -185,8 +186,9 @@ pub trait MediaBackend: Send + 'static {
     fn loopback_holders(&mut self, node: &Path) -> u32;
 
     /// Builds and starts the output (CUDA) forwarding to the writer, with
-    /// no ingest yet ([`Self::switch_camera`] adds it). On error nothing of
-    /// the session is left.
+    /// no ingest yet ([`Self::switch_camera`] adds it). The GPU is unparked
+    /// first (see [`park`]); an error doing so is this call's error. On
+    /// error nothing of the session is left, and the GPU is parked again.
     fn start_session(&mut self, params: &SessionParams) -> Result<(), String>;
 
     /// Makes `camera` the running session's ingest, replacing the current
@@ -195,7 +197,9 @@ pub trait MediaBackend: Send + 'static {
     fn switch_camera(&mut self, params: &SessionParams, camera: &Camera) -> Result<(), String>;
 
     /// Stops the session: camera closed, its controls restored, CUDA
-    /// context released. Idempotent.
+    /// context released, then the GPU parked if the session stopped cleanly
+    /// (see [`park`]; a session that did not, or a park that fails, leaves
+    /// it awake). Idempotent.
     fn stop_session(&mut self);
 
     /// Whether the current ingest (since the last start or switch) has
@@ -213,7 +217,8 @@ pub trait MediaBackend: Send + 'static {
     /// inference backend is present (no model is loaded and no CUDA
     /// context created to find out) and, for `replace`, the background
     /// image is a readable regular file within the size limit. `none` is
-    /// always available.
+    /// always available. Called before [`Self::start_session`], while the
+    /// GPU may be parked: it must make no CUDA call.
     fn effect_available(&mut self, effect: &EffectConfig) -> Result<(), String>;
 
     /// Applies `effect` to the running session at once, without restarting

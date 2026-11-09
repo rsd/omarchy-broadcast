@@ -40,5 +40,6 @@
 | [0014](adr/0014-mic-noise-removal-filter-chain.md) | Accepted: microphone noise removal as a PipeWire filter-chain hosting a CPU LADSPA plugin (RNNoise by default, DeepFilterNet for higher quality), one dedicated `pipewire -c` process per engine under a template user unit, independent of the daemon; Maxine Audio Effects deferred |
 | [0015](adr/0015-cadence-emission-for-sub-rate-inputs.md) | A steady camera slower than the contract (1.1 to 1.9 output periods per frame, such as 20 fps into 30) is followed by emitting each tick at the predicted arrival of its frame; amends 0010 |
 | [0016](adr/0016-pipewire-output.md) | An optional native PipeWire `Video/Source` node next to the loopback, fed by a tap on the loopback writer (same stream, pacing and timeline), with three offered formats and CPU conversion; PipeWire links count as consumers; D-Bus revision 3; amends 0004 and 0011 |
+| [0017](adr/0017-cuda-checkpoint-parking.md) | The daemon checkpoints its own process with the CUDA checkpoint API when a session has stopped, so Idle after an activation holds no `/dev/nvidia*` fds and no UVM registration; replaces the worker-process fallback; amends 0006 and 0011 |
 
 Conventions: diagrams are mermaid. New decisions get the next ADR number; superseded ADRs keep their file and change their status line.

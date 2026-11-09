@@ -155,7 +155,12 @@ static DRIVER: OnceLock<Result<Driver, GpuError>> = OnceLock::new();
 /// remembered) as [`GpuError::Unavailable`]; it never panics.
 ///
 /// `cuInit` creates no context.
+///
+/// While the process is parked ([`crate::parked`]) it returns
+/// [`GpuError::Parked`] instead: a driver call then would block until the
+/// process is unparked. Every helper of this crate goes through it.
 pub fn driver() -> Result<&'static Driver, GpuError> {
+    crate::checkpoint::guard()?;
     DRIVER
         .get_or_init(|| Driver::open(OsStr::new(DRIVER_LIBRARY)))
         .as_ref()
@@ -166,12 +171,13 @@ pub fn driver() -> Result<&'static Driver, GpuError> {
 ///
 /// # Safety
 /// `T` must be the correct function pointer type for the C symbol `name`.
-unsafe fn sym<T: Copy>(lib: &Library, name: &str) -> Result<T, GpuError> {
+pub(crate) unsafe fn sym<T: Copy>(lib: &Library, name: &str) -> Result<T, GpuError> {
     let mut cname = name.as_bytes().to_vec();
     cname.push(0);
     // SAFETY: the caller guarantees `T` matches the symbol's C signature; the
-    // copied pointer stays valid while `lib` is loaded, and `Driver` keeps
-    // `lib` alive alongside every pointer resolved from it.
+    // copied pointer stays valid while `lib` is loaded, and the tables
+    // (`Driver`, the checkpoint entry points) keep `lib` alive alongside
+    // every pointer resolved from them.
     unsafe { lib.get::<T>(&cname) }
         .map(|s| *s)
         .map_err(|e| GpuError::Unavailable(format!("{DRIVER_LIBRARY} has no {name}: {e}")))
