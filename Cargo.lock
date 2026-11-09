@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "gst-obc"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "gstreamer",
  "gstreamer-app",
@@ -703,14 +703,14 @@ dependencies = [
 
 [[package]]
 name = "obc-backend"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "obc-backend-maxine"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "libc",
  "libloading",
@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "obc-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -731,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "obc-gpu"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "libloading",
  "obc-backend",
@@ -740,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "obc-ipc"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "futures-util",
  "serde",
@@ -751,7 +751,7 @@ dependencies = [
 
 [[package]]
 name = "obc-pipeline"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -773,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "oma-broadcast"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -788,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "oma-broadcastd"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "clap",

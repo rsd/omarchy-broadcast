@@ -38,5 +38,6 @@
 | [0011](adr/0011-daemon-lifecycle-and-dbus-api.md) | Daemon lifecycle (`off`/`idle`/`starting`/`active`/`error`), a persistent loopback writer, consumer detection, runtime state file, and the D-Bus v1 API; amends 0006 and 0007 |
 | [0012](adr/0012-video-effects-and-maxine-backend.md) | Video effects (none, blur, replace) in the Process stage as one always-present `obceffect` element, the `InferenceBackend` seam with a dlopen'd Maxine backend, models loaded only while an effect is on, black rather than the raw image while an effect starts or fails, and an `LD_PRELOAD` shim for the SDK's os-release check; extends the D-Bus API to revision 2 |
 | [0014](adr/0014-mic-noise-removal-filter-chain.md) | Proposed: microphone noise removal as a PipeWire filter-chain hosting a CPU LADSPA plugin (DeepFilterNet or RNNoise), one dedicated `pipewire -c` process per engine under a template user unit, independent of the daemon; Maxine Audio Effects deferred |
+| [0015](adr/0015-cadence-emission-for-sub-rate-inputs.md) | A steady camera slower than the contract (1.1 to 1.9 output periods per frame, such as 20 fps into 30) is followed by emitting each tick at the predicted arrival of its frame; amends 0010 |
 
 Conventions: diagrams are mermaid. New decisions get the next ADR number; superseded ADRs keep their file and change their status line.
