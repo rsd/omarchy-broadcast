@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use crate::frame::FrameMemory;
 use crate::ingest::{Ingest, IngestConfig};
 use crate::output::Output;
-use crate::pipeline::PipelineError;
+use crate::pipeline::{PipelineError, StopError, both_stopped};
 
 /// When a source switch happened, or how it failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +38,12 @@ pub struct SwitchTiming {
     /// Why the switch failed: stopping the previous ingest or starting the
     /// new one (the error [`Session::switch_to`] returned).
     pub error: Option<String>,
+    /// Why a pipeline the failed switch took down did not reach NULL (or
+    /// its state change to NULL failed): the previous ingest's, whose stop
+    /// failed, or the new one's, stopped after it failed to start. Some of
+    /// its elements may still run. `None` when every pipeline it took down
+    /// reached NULL ([`StopError::reached_null`]).
+    pub unclean_stop: Option<String>,
 }
 
 impl SwitchTiming {
@@ -126,6 +132,7 @@ impl Session {
             started: None,
             first_fresh: None,
             error: None,
+            unclean_stop: None,
         };
         let res = self.replace_ingest(next, &mut timing);
         if let Err(e) = &res {
@@ -144,7 +151,12 @@ impl Session {
             // Before the old camera stops: no tick may see the gap first.
             self.output.hold_for(next.source_id());
             // A failed stop drops `next`: the hold runs to its timeout.
-            old.stop()?;
+            if let Err(e) = old.stop_checked() {
+                if !e.reached_null {
+                    timing.unclean_stop = Some(format!("stopping the previous ingest: {e}"));
+                }
+                return Err(e.error);
+            }
             timing.previous_stopped = Some(Instant::now());
         }
         // System-memory frames (CPU-only tests) need no CUDA context.
@@ -156,7 +168,18 @@ impl Session {
             })?),
             FrameMemory::System => None,
         };
-        next.start_with(cuda)?;
+        if let Err(e) = next.start_with(cuda) {
+            // Back to NULL and dropped here, checked, rather than by its
+            // drop, which does not say whether it reached NULL.
+            if let Err(stop) = next.stop_checked()
+                && !stop.reached_null
+            {
+                timing.unclean_stop = Some(format!(
+                    "stopping the new ingest after it failed to start: {stop}"
+                ));
+            }
+            return Err(e);
+        }
         timing.started = Some(Instant::now());
         self.ingest = Some(next);
         Ok(())
@@ -181,11 +204,22 @@ impl Session {
         }
     }
 
-    /// Stops the ingest, then the output, reporting the first failure.
-    pub fn stop(mut self) -> Result<(), PipelineError> {
-        let ingest = self.stop_ingest();
-        let output = self.output.stop();
-        ingest.and(output)
+    /// Stops the ingest, then the output, reporting the first failure (one
+    /// that left a pipeline outside NULL first).
+    pub fn stop(self) -> Result<(), PipelineError> {
+        self.stop_checked().map_err(Into::into)
+    }
+
+    /// [`Self::stop`], its error saying whether both pipelines reached
+    /// NULL. Of this stop only: an earlier switch's is in its
+    /// [`SwitchTiming::unclean_stop`].
+    pub fn stop_checked(mut self) -> Result<(), StopError> {
+        let ingest = match self.ingest.take() {
+            Some(i) => i.stop_checked(),
+            None => Ok(()),
+        };
+        let output = self.output.stop_checked();
+        both_stopped(ingest, output)
     }
 }
 
@@ -196,7 +230,7 @@ impl Session {
 /// can only lengthen.
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     use gst::prelude::*;
@@ -390,15 +424,20 @@ mod tests {
     /// afterwards takes it to NULL. (A pipeline flushes its bus on the way
     /// to NULL unless told not to; the NULL message would not be seen.)
     fn failing_stop(ingest: &Ingest) {
+        failing_stops(ingest, 1);
+    }
+
+    /// [`failing_stop`] for the first `times` times it reaches NULL.
+    fn failing_stops(ingest: &Ingest, times: u32) {
         ingest.pipeline().pipeline().set_auto_flush_bus(false);
         let pipeline = ingest.pipeline().pipeline().downgrade();
-        let raised = AtomicBool::new(false);
+        let raised = AtomicU32::new(0);
         ingest.pipeline().bus().set_sync_handler(move |_, msg| {
             if let gst::MessageView::StateChanged(c) = msg.view()
                 && c.current() == gst::State::Null
                 && let Some(p) = pipeline.upgrade()
                 && msg.src() == Some(p.upcast_ref::<gst::Object>())
-                && !raised.swap(true, Ordering::Relaxed)
+                && raised.fetch_add(1, Ordering::Relaxed) < times
             {
                 let _ = p.set_state(gst::State::Ready);
             }
@@ -531,6 +570,7 @@ mod tests {
         );
         assert!(session.ingest().is_none(), "left without a source");
         assert_eq!(*order.lock().unwrap(), Some(true), "old stopped first");
+        assert_eq!(failed.unclean_stop, None, "both ingests reached NULL");
 
         // The hold armed for the broken source times out; the output keeps
         // emitting.
@@ -702,6 +742,11 @@ mod tests {
         assert_eq!(failed.source_id, next_id);
         assert_eq!(failed.error.as_deref(), Some(err.to_string().as_str()));
         assert_eq!(
+            failed.unclean_stop.as_deref(),
+            Some(format!("stopping the previous ingest: {err}").as_str()),
+            "it ended outside NULL"
+        );
+        assert_eq!(
             (failed.previous_stopped, failed.started, failed.first_fresh),
             (None, None, None),
             "{failed:?}"
@@ -752,6 +797,32 @@ mod tests {
             "placeholder {:?} after the request",
             rest[0].emitted_at - failed.requested
         );
+    }
+
+    /// (e2) A switch whose new source fails to start, and does not reach
+    /// NULL when it is stopped again: the attempt records it as an unclean
+    /// stop (the failed start's own change to NULL is raised back too). A
+    /// session stop afterwards is clean: only its own pipelines count.
+    #[test]
+    fn a_new_source_left_outside_null_after_its_failed_start_is_recorded() {
+        let (mut session, _) = cpu_session(OutputConfig::DEFAULT_HOLD_TIMEOUT);
+        let bad = broken(&session);
+        failing_stops(&bad, 2);
+        let err = session
+            .switch_to(bad)
+            .expect_err("a source that cannot open must fail to start");
+        let failed = session.last_switch().expect("the attempt is recorded");
+        assert_eq!(failed.error.as_deref(), Some(err.to_string().as_str()));
+        let why = failed.unclean_stop.expect("recorded as unclean");
+        assert!(
+            why.starts_with("stopping the new ingest after it failed to start: ")
+                && why.contains("not Null"),
+            "{why}"
+        );
+        assert!(session.ingest().is_none(), "left without a source");
+        session
+            .stop_checked()
+            .expect("the session's own stop is clean");
     }
 
     /// A test source whose `head` is `videotestsrc` (live, `props`) and

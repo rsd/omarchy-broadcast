@@ -24,7 +24,31 @@
 //!   touch CUDA, so no session can run (the caller fails closed);
 //! * a process that never initialised CUDA has nothing to park;
 //! * a CUDA call `obc_gpu` refused while parked (it would have blocked) is
-//!   a caller that ran when it should not have: warned once per park.
+//!   a caller that ran when it should not have: warned once per park;
+//! * a session that did not stop cleanly taints the parker for the rest of
+//!   the process (see "Tainted" below); a stop that failed otherwise, with
+//!   every pipeline in NULL all the same, is warned and parks.
+//!
+//! **Tainted.** Something of a session that did not stop cleanly (a
+//! pipeline left outside NULL) may still be alive and call CUDA, which
+//! would block once parked. So any unclean teardown turns parking off
+//! until the daemon restarts: a session stop that left a pipeline outside
+//! NULL ([`Parker::stop_session`], [`StopFailure::reached_null`]; a camera
+//! switch of the session that did counts), the same of the session a
+//! restart replaces ([`Parker::start_session`]), and a failed start whose
+//! cleanup of what it had built did not stop cleanly ([`StartError`]). The
+//! first one is warned, saying so; the GPU then stays awake while idle, as
+//! before parking existed. A later clean stop does not clear it: it does
+//! not prove the leftovers of the earlier one are gone. Unparking is not
+//! affected: a process parked or locked when it got tainted is restored by
+//! the next start as usual.
+//!
+//! Only a pipeline outside NULL taints. A stop that failed with every
+//! pipeline in NULL (a camera control that could not be restored, after a
+//! camera was unplugged, say, or an output clock thread that had panicked
+//! and was joined) leaves nothing of the session that could call CUDA: its
+//! elements were stopped and dropped, the effect worker joined with them,
+//! and the control is a V4L2 ioctl. It is warned, and the GPU parked.
 //!
 //! [`Parker::stop_session`] and [`Parker::start_session`] are the session
 //! lifecycle around it, over any [`StopSession`]: the GStreamer backend's
@@ -68,10 +92,75 @@ impl ParkOps for GpuOps {
 /// A running session, as the [`Parker`] lifecycle sees it.
 pub trait StopSession {
     /// Stops all of the session and drops it. `Ok` means it stopped
-    /// cleanly: once this returns, nothing of it uses CUDA. `Err` (a
-    /// pipeline that did not reach NULL, say) means something of it may
-    /// still be alive and call CUDA.
-    fn stop(self) -> Result<(), String>;
+    /// cleanly: once this returns, nothing of it uses CUDA. An error says
+    /// whether that holds all the same ([`StopFailure::reached_null`]).
+    fn stop(self) -> Result<(), StopFailure>;
+}
+
+/// How a session stop failed ([`StopSession::stop`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopFailure {
+    /// What failed, as the parker warns it.
+    pub error: String,
+    /// Every pipeline of the session reached NULL all the same, those its
+    /// camera switches took down included: nothing of it is left that could
+    /// call CUDA, and the GPU is parked. `false` (a pipeline left outside
+    /// NULL, or not confirmed in it): something of it may still be alive
+    /// and call CUDA, which taints the parker.
+    pub reached_null: bool,
+}
+
+impl StopFailure {
+    /// A stop that left a pipeline outside NULL, because of `error`.
+    pub fn unclean(error: impl Into<String>) -> Self {
+        StopFailure {
+            error: error.into(),
+            reached_null: false,
+        }
+    }
+
+    /// A stop that failed with `error`, every pipeline in NULL all the
+    /// same.
+    pub fn at_null(error: impl Into<String>) -> Self {
+        StopFailure {
+            error: error.into(),
+            reached_null: true,
+        }
+    }
+}
+
+/// Why a session start failed, as [`Parker::starting`] sees it: the error,
+/// and whether what the start had built was cleaned up cleanly. A `String`
+/// converts into a clean one: a start that failed before it built anything
+/// that could use CUDA, or whose partial build stopped cleanly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartError {
+    /// The start's error, as the caller reports it.
+    pub error: String,
+    /// `Some(why)` when what the start had built did not stop cleanly when
+    /// it was cleaned up (a pipeline left short of NULL, say): something of
+    /// it may still be alive and call CUDA.
+    pub unclean: Option<String>,
+}
+
+impl StartError {
+    /// A start that failed with `error`, and whose partial build did not
+    /// stop cleanly, because of `why`.
+    pub fn unclean(error: impl Into<String>, why: impl Into<String>) -> Self {
+        StartError {
+            error: error.into(),
+            unclean: Some(why.into()),
+        }
+    }
+}
+
+impl From<String> for StartError {
+    fn from(error: String) -> Self {
+        StartError {
+            error,
+            unclean: None,
+        }
+    }
 }
 
 /// Where a [`Parker`] logs: [`crate::log::line`] in the daemon.
@@ -86,6 +175,9 @@ pub struct Parker<O: ParkOps = GpuOps> {
     /// The last park failed and left the process locked: the next unpark
     /// unlocks it.
     blocked: bool,
+    /// A session did not stop cleanly: never parks again in this process
+    /// (see the module docs).
+    tainted: bool,
     /// [`ParkOps::refusals`] when last looked at.
     refusals_seen: u64,
     log: ParkLog,
@@ -100,6 +192,7 @@ impl<O: ParkOps + std::fmt::Debug> std::fmt::Debug for Parker<O> {
             .field("enabled", &self.enabled)
             .field("unsupported", &self.unsupported)
             .field("blocked", &self.blocked)
+            .field("tainted", &self.tainted)
             .field("refusals_seen", &self.refusals_seen)
             .field("last_park", &self.last_park)
             .field("last_unpark", &self.last_unpark)
@@ -129,6 +222,7 @@ impl<O: ParkOps> Parker<O> {
             enabled: true,
             unsupported: false,
             blocked: false,
+            tainted: false,
             refusals_seen,
             log,
             last_park: None,
@@ -144,6 +238,12 @@ impl<O: ParkOps> Parker<O> {
         self.enabled = on;
     }
 
+    /// Whether a session did not stop cleanly, so that parking is off until
+    /// the process exits (see the module docs).
+    pub fn tainted(&self) -> bool {
+        self.tainted
+    }
+
     /// How long the last park that parked took (lock and checkpoint).
     pub fn last_park(&self) -> Option<Duration> {
         self.last_park
@@ -157,9 +257,28 @@ impl<O: ParkOps> Parker<O> {
     /// Parks the GPU, if it can be: call it once nothing in the process
     /// uses CUDA. Never fails: a failure leaves the GPU awake, or, said as
     /// such, locked until the next [`Self::unpark`] (warned either way).
+    /// Does nothing when parking is off, unsupported, or tainted.
+    ///
+    /// **It blocks its caller** (the controller thread, D-Bus included)
+    /// while the driver parks: measured 15 to 20 ms at Idle after a clean
+    /// stop, when only CUDA's initialisation is left to checkpoint. The
+    /// worst case is longer: when another thread is still inside a CUDA
+    /// call, the lock waits up to [`obc_gpu::PARK_LOCK_TIMEOUT`] (2000 ms)
+    /// before the park fails and the GPU stays awake, and a process holding
+    /// GPU memory takes longer to checkpoint (about 120 ms for 2 MiB in a
+    /// live context). A session that did not stop cleanly, the likely
+    /// source of such a thread, taints the parker, so it is not parked at
+    /// all.
     pub fn park(&mut self) {
         self.note_refusals();
         if !self.enabled || self.unsupported {
+            return;
+        }
+        if self.tainted {
+            (self.log)(
+                Level::Debug,
+                "GPU not parked: parking is disabled until the daemon restarts",
+            );
             return;
         }
         match self.ops.park() {
@@ -249,55 +368,121 @@ impl<O: ParkOps> Parker<O> {
 
     /// Runs `start` (a session start, which touches CUDA) with the GPU
     /// unparked first. If unparking fails, `start` does not run and that is
-    /// the error; if `start` fails, the GPU is parked again, so a failed
-    /// start does not keep it awake.
-    pub fn starting<T>(&mut self, start: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    /// the error. If `start` fails, its [`StartError::error`] is the error,
+    /// and the GPU is parked again, so a failed start does not keep it
+    /// awake, unless what it had built did not stop cleanly
+    /// ([`StartError::unclean`]): that taints the parker instead (see the
+    /// module docs).
+    pub fn starting<T, E: Into<StartError>>(
+        &mut self,
+        start: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, String> {
         self.unpark()?;
-        let res = start();
-        if res.is_err() {
-            self.park();
+        match start() {
+            Ok(t) => Ok(t),
+            Err(e) => {
+                let StartError { error, unclean } = e.into();
+                match unclean {
+                    None => self.park(),
+                    Some(why) => self.taint(&format!(
+                        "the session start failed ({error}), and cleaning up what it had built \
+                         did not stop cleanly: {why}"
+                    )),
+                }
+                Err(error)
+            }
         }
-        res
     }
 
     /// Stops the session in `running`, if any, all of it, and parks the
-    /// GPU only then, and only if it stopped cleanly: a session that did
-    /// not may still use CUDA, which would block once parked, so the GPU
-    /// stays awake (warned).
+    /// GPU only then, and only if every pipeline of it reached NULL: a
+    /// session that left one outside NULL may still use CUDA, which would
+    /// block once parked, so it taints the parker instead (see the module
+    /// docs). A stop that failed otherwise is warned, and parks.
     pub fn stop_session<S: StopSession>(&mut self, running: &mut Option<S>) {
         let Some(session) = running.take() else {
             return;
         };
         match session.stop() {
             Ok(()) => self.park(),
-            Err(e) => (self.log)(
-                Level::Warning,
-                &format!(
-                    "stopping the session: {e}; not parking the GPU (something of the session \
-                     may still use it): it stays awake while idle"
-                ),
-            ),
+            Err(StopFailure {
+                error,
+                reached_null: true,
+            }) => {
+                (self.log)(
+                    Level::Warning,
+                    &format!("stopping the session: {error} (every pipeline reached NULL)"),
+                );
+                self.park();
+            }
+            Err(StopFailure {
+                error,
+                reached_null: false,
+            }) => self.taint(&format!("stopping the session: {error}")),
         }
     }
 
     /// Starts a session in `running` with `build`, which touches CUDA: a
     /// session running is stopped first, without parking in between (the
-    /// GPU is in use again at once), then [`Self::starting`] unparks the
-    /// GPU, builds, and parks it again if the build fails. On error
-    /// `running` is empty.
-    pub fn start_session<S: StopSession>(
+    /// GPU is in use again at once; a stop that left a pipeline outside
+    /// NULL taints the parker, one that failed otherwise is warned), then
+    /// [`Self::starting`] unparks the GPU, builds, and parks it again if
+    /// the build fails and the parker is not tainted. On error `running` is
+    /// empty.
+    pub fn start_session<S: StopSession, E: Into<StartError>>(
         &mut self,
         running: &mut Option<S>,
-        build: impl FnOnce() -> Result<S, String>,
+        build: impl FnOnce() -> Result<S, E>,
     ) -> Result<(), String> {
         if let Some(session) = running.take() {
             (self.log)(Level::Debug, "session restarted: not parking in between");
-            if let Err(e) = session.stop() {
-                (self.log)(Level::Warning, &format!("stopping the session: {e}"));
+            match session.stop() {
+                Ok(()) => {}
+                Err(StopFailure {
+                    error,
+                    reached_null: true,
+                }) => (self.log)(
+                    Level::Warning,
+                    &format!(
+                        "stopping the session before a restart: {error} (every pipeline \
+                         reached NULL)"
+                    ),
+                ),
+                Err(StopFailure {
+                    error,
+                    reached_null: false,
+                }) => self.taint(&format!("stopping the session before a restart: {error}")),
             }
         }
         *running = Some(self.starting(build)?);
         Ok(())
+    }
+
+    /// A teardown was unclean (`what` says which, and why): parking is off
+    /// for the rest of the process. Warned: the first one, while parking
+    /// was possible, says that it is now disabled; a later one, or one
+    /// while parking was off or unsupported anyway, says only what failed
+    /// (and, while off, that turning it on again will not park).
+    fn taint(&mut self, what: &str) {
+        let first = !self.tainted;
+        self.tainted = true;
+        let msg = if !first {
+            what.to_string()
+        } else if self.unsupported {
+            format!("{what} (something of the session may still use the GPU)")
+        } else if !self.enabled {
+            format!(
+                "{what} (something of the session may still use the GPU); parking is off, and \
+                 stays off until the daemon restarts even if turned on again"
+            )
+        } else {
+            format!(
+                "{what}; parking the GPU is disabled until the daemon restarts, because a \
+                 session did not stop cleanly (something of it may still use the GPU): it stays \
+                 awake while idle"
+            )
+        };
+        (self.log)(Level::Warning, &msg);
     }
 
     /// Warns about CUDA calls refused since last looked at.
@@ -387,11 +572,11 @@ mod tests {
     /// A recording session: its stop is an event, and fails with `fail`.
     struct Rec {
         ops: ScriptOps,
-        fail: Option<String>,
+        fail: Option<StopFailure>,
     }
 
     impl StopSession for Rec {
-        fn stop(self) -> Result<(), String> {
+        fn stop(self) -> Result<(), StopFailure> {
             self.ops.event("stop");
             self.fail.map_or(Ok(()), Err)
         }
@@ -575,7 +760,7 @@ mod tests {
         assert_eq!(e, "output pipeline: no cudaupload");
         assert_eq!(ops.0.lock().unwrap().parks, 2, "parked again");
         // A start that works stays unparked.
-        assert_eq!(p.starting(|| Ok(7)), Ok(7));
+        assert_eq!(p.starting(|| Ok::<_, String>(7)), Ok(7));
         let s = ops.0.lock().unwrap();
         assert_eq!((s.parks, s.unparks), (2, 2));
     }
@@ -632,7 +817,7 @@ mod tests {
         assert_eq!(
             p.starting(|| {
                 ops.event("build");
-                Ok(())
+                Ok::<_, String>(())
             }),
             Ok(())
         );
@@ -752,26 +937,47 @@ mod tests {
         assert!(ops.events().is_empty());
     }
 
-    #[test]
-    fn a_session_that_did_not_stop_cleanly_leaves_the_gpu_awake() {
-        let (mut p, ops, logged) = parker();
-        let mut running = Some(Rec {
+    /// A session whose stop leaves a pipeline outside NULL, with `why`.
+    fn failing(ops: &ScriptOps, why: &str) -> Rec {
+        Rec {
             ops: ops.clone(),
-            fail: Some("output pipeline ended in Paused, not Null".into()),
-        });
-        p.stop_session(&mut running);
-        assert!(running.is_none());
-        assert_eq!(ops.events(), ["stop"], "not parked");
-        let l = take(&logged);
+            fail: Some(StopFailure::unclean(why)),
+        }
+    }
+
+    /// A session whose stop fails with `why`, every pipeline in NULL.
+    fn failing_at_null(ops: &ScriptOps, why: &str) -> Rec {
+        Rec {
+            ops: ops.clone(),
+            fail: Some(StopFailure::at_null(why)),
+        }
+    }
+
+    /// The one warning that turns parking off, naming `cause`.
+    fn assert_disabled_warning(l: &[(Level, String)], cause: &str) {
         assert_eq!(l.len(), 1, "{l:?}");
         assert_eq!(l[0].0, Level::Warning);
         assert!(
-            l[0].1.contains("ended in Paused, not Null")
-                && l[0].1.contains("not parking the GPU")
+            l[0].1.contains(cause)
+                && l[0]
+                    .1
+                    .contains("parking the GPU is disabled until the daemon restarts")
+                && l[0].1.contains("did not stop cleanly")
                 && l[0].1.contains("stays awake"),
             "{}",
             l[0].1
         );
+    }
+
+    #[test]
+    fn a_session_that_did_not_stop_cleanly_disables_parking_for_good() {
+        let (mut p, ops, logged) = parker();
+        let mut running = Some(failing(&ops, "output pipeline ended in Paused, not Null"));
+        p.stop_session(&mut running);
+        assert!(running.is_none());
+        assert_eq!(ops.events(), ["stop"], "not parked");
+        assert!(p.tainted());
+        assert_disabled_warning(&take(&logged), "ended in Paused, not Null");
         // Not parked: the next start finds it running and builds.
         ops.0
             .lock()
@@ -781,10 +987,242 @@ mod tests {
         let o = ops.clone();
         p.start_session(&mut running, || {
             o.event("build");
-            Ok(rec(&o))
+            Ok::<_, String>(rec(&o))
         })
         .unwrap();
         assert_eq!(ops.events(), ["unpark", "build"]);
+        // A later clean stop does not prove the leftovers gone: still no
+        // park, and nothing more said at warning.
+        p.stop_session(&mut running);
+        assert_eq!(ops.events(), ["stop"], "sticky: not parked");
+        assert!(take(&logged).iter().all(|(lv, _)| *lv == Level::Debug));
+        // A second unclean stop says what failed, not the whole story again.
+        running = Some(failing(&ops, "ingest ended in Ready, not Null"));
+        p.stop_session(&mut running);
+        let l = take(&logged);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert_eq!(l[0].0, Level::Warning);
+        assert!(l[0].1.contains("ended in Ready"), "{}", l[0].1);
+        assert!(!l[0].1.contains("disabled"), "said once: {}", l[0].1);
+        assert_eq!(ops.0.lock().unwrap().parks, 0);
+    }
+
+    #[test]
+    fn a_restart_whose_stop_failed_disables_parking_even_if_the_build_fails() {
+        let (mut p, ops, logged) = parker();
+        ops.0
+            .lock()
+            .unwrap()
+            .unpark
+            .push_back(Ok(UnparkOutcome::NotParked));
+        let mut running = Some(failing(&ops, "output pipeline ended in Paused, not Null"));
+        let o = ops.clone();
+        let e = p
+            .start_session(&mut running, || -> Result<Rec, String> {
+                o.event("build");
+                Err("output pipeline: no cudaupload".into())
+            })
+            .unwrap_err();
+        assert_eq!(e, "output pipeline: no cudaupload");
+        assert!(running.is_none());
+        assert_eq!(ops.events(), ["stop", "unpark", "build"], "not parked");
+        assert!(p.tainted());
+        let l: Vec<_> = take(&logged)
+            .into_iter()
+            .filter(|(lv, _)| *lv != Level::Debug)
+            .collect();
+        assert_disabled_warning(&l, "before a restart: output pipeline ended in Paused");
+    }
+
+    #[test]
+    fn a_failed_start_whose_cleanup_was_unclean_disables_parking() {
+        let (mut p, ops, logged) = parker();
+        {
+            let mut s = ops.0.lock().unwrap();
+            s.unpark.push_back(Ok(UNPARKED));
+            s.unpark.push_back(Ok(UnparkOutcome::NotParked));
+        }
+        let mut running: Option<Rec> = None;
+        let o = ops.clone();
+        let e = p
+            .start_session(&mut running, || -> Result<Rec, StartError> {
+                o.event("build");
+                Err(StartError::unclean(
+                    "output pipeline: state change failed",
+                    "output pipeline: ended in Paused, not Null",
+                ))
+            })
+            .unwrap_err();
+        // The caller reports the start's error, not the cleanup's.
+        assert_eq!(e, "output pipeline: state change failed");
+        assert!(running.is_none());
+        assert_eq!(ops.events(), ["unpark", "build"], "not parked again");
+        assert!(p.tainted());
+        let l: Vec<_> = take(&logged)
+            .into_iter()
+            .filter(|(lv, _)| *lv == Level::Warning)
+            .collect();
+        assert_disabled_warning(&l, "cleaning up what it had built");
+        assert!(l[0].1.contains("ended in Paused, not Null"), "{}", l[0].1);
+        // Sticky: a later clean failed start parks nothing either.
+        let e = p
+            .starting(|| -> Result<(), StartError> { Err("no cudaupload".to_string().into()) })
+            .unwrap_err();
+        assert_eq!(e, "no cudaupload");
+        assert_eq!(ops.0.lock().unwrap().parks, 0);
+    }
+
+    #[test]
+    fn a_failed_start_that_cleaned_up_cleanly_parks_again() {
+        let (mut p, ops, _logged) = parker();
+        {
+            let mut s = ops.0.lock().unwrap();
+            s.unpark.push_back(Ok(UNPARKED));
+            s.park.push_back(Ok(PARKED));
+        }
+        let e = p
+            .starting(|| -> Result<(), StartError> {
+                Err(StartError::from(
+                    "output pipeline: no cudaupload".to_string(),
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(e, "output pipeline: no cudaupload");
+        assert_eq!(ops.events(), ["unpark", "park"]);
+        assert!(!p.tainted());
+    }
+
+    #[test]
+    fn a_tainted_parker_still_unparks_a_parked_process() {
+        let (mut p, ops, _logged) = parker();
+        {
+            let mut s = ops.0.lock().unwrap();
+            s.park.push_back(Ok(PARKED));
+            s.unpark.push_back(Ok(UNPARKED));
+        }
+        p.park();
+        // Tainted while parked (a session the restart replaces failed its
+        // stop): the start restores the GPU as usual.
+        let mut running = Some(failing(&ops, "ended in Paused, not Null"));
+        let o = ops.clone();
+        p.start_session(&mut running, || {
+            o.event("build");
+            Ok::<_, String>(rec(&o))
+        })
+        .unwrap();
+        assert!(p.tainted());
+        assert_eq!(ops.events(), ["park", "stop", "unpark", "build"]);
+        assert_eq!(p.last_unpark(), Some(Duration::from_millis(62)));
+    }
+
+    #[test]
+    fn a_stop_that_failed_with_every_pipeline_at_null_is_warned_and_parks() {
+        // A camera control not restored (the camera was unplugged), or an
+        // output clock that had panicked: nothing of the session is left.
+        let (mut p, ops, logged) = parker();
+        ops.0.lock().unwrap().park.push_back(Ok(PARKED));
+        let mut running = Some(failing_at_null(
+            &ops,
+            "camera control on /dev/video0: restoring exposure_dynamic_framerate: No such device",
+        ));
+        p.stop_session(&mut running);
+        assert!(running.is_none());
+        assert_eq!(ops.events(), ["stop", "park"]);
+        assert!(!p.tainted());
+        let l = take(&logged);
+        assert_eq!(l[0].0, Level::Warning, "{l:?}");
+        assert!(
+            l[0].1.starts_with("stopping the session: camera control")
+                && l[0].1.contains("every pipeline reached NULL"),
+            "{}",
+            l[0].1
+        );
+        assert!(!l[0].1.contains("disabled"), "{}", l[0].1);
+        assert!(l[1].1.starts_with("GPU parked in"), "{l:?}");
+    }
+
+    #[test]
+    fn a_restart_whose_stop_failed_at_null_is_warned_and_parks_again_if_the_build_fails() {
+        let (mut p, ops, logged) = parker();
+        {
+            let mut s = ops.0.lock().unwrap();
+            s.unpark.push_back(Ok(UnparkOutcome::NotParked));
+            s.park.push_back(Ok(PARKED));
+        }
+        let mut running = Some(failing_at_null(
+            &ops,
+            "the output clock thread panicked: boom",
+        ));
+        let o = ops.clone();
+        let e = p
+            .start_session(&mut running, || -> Result<Rec, String> {
+                o.event("build");
+                Err("output pipeline: no cudaupload".into())
+            })
+            .unwrap_err();
+        assert_eq!(e, "output pipeline: no cudaupload");
+        assert_eq!(ops.events(), ["stop", "unpark", "build", "park"]);
+        assert!(!p.tainted());
+        let warned: Vec<_> = take(&logged)
+            .into_iter()
+            .filter(|(lv, _)| *lv == Level::Warning)
+            .collect();
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(
+            warned[0]
+                .1
+                .starts_with("stopping the session before a restart: the output clock")
+                && warned[0].1.contains("every pipeline reached NULL"),
+            "{}",
+            warned[0].1
+        );
+    }
+
+    #[test]
+    fn a_taint_while_parking_is_unsupported_or_off_does_not_say_it_disables_parking() {
+        // Unsupported: parking was never possible here.
+        let (mut p, ops, logged) = parker();
+        ops.0
+            .lock()
+            .unwrap()
+            .unpark
+            .push_back(Ok(UnparkOutcome::Unsupported("no checkpoint API".into())));
+        assert_eq!(p.unpark(), Ok(()));
+        take(&logged);
+        let mut running = Some(failing(&ops, "ended in Paused, not Null"));
+        p.stop_session(&mut running);
+        assert!(p.tainted());
+        let l = take(&logged);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert_eq!(l[0].0, Level::Warning);
+        assert!(l[0].1.contains("ended in Paused, not Null"), "{}", l[0].1);
+        assert!(
+            !l[0].1.contains("disabled") && !l[0].1.contains("parking"),
+            "{}",
+            l[0].1
+        );
+
+        // Off: it stays off, even turned on again.
+        let (mut p, ops, logged) = parker();
+        p.set_enabled(false);
+        let mut running = Some(failing(&ops, "ended in Paused, not Null"));
+        p.stop_session(&mut running);
+        assert!(p.tainted());
+        let l = take(&logged);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert!(
+            !l[0].1.contains("parking the GPU is disabled")
+                && l[0]
+                    .1
+                    .contains("parking is off, and stays off until the daemon restarts"),
+            "{}",
+            l[0].1
+        );
+        p.set_enabled(true);
+        running = Some(rec(&ops));
+        p.stop_session(&mut running);
+        assert_eq!(ops.events(), ["stop", "stop"], "never parked");
+        assert_eq!(ops.0.lock().unwrap().parks, 0);
     }
 
     #[test]
@@ -795,7 +1233,7 @@ mod tests {
         let o = ops.clone();
         p.start_session(&mut running, || {
             o.event("build");
-            Ok(rec(&o))
+            Ok::<_, String>(rec(&o))
         })
         .unwrap();
         assert!(running.is_some());
@@ -814,7 +1252,7 @@ mod tests {
         let o = ops.clone();
         p.start_session(&mut running, || {
             o.event("build");
-            Ok(rec(&o))
+            Ok::<_, String>(rec(&o))
         })
         .unwrap();
         assert_eq!(ops.events(), ["stop", "unpark", "build"]);

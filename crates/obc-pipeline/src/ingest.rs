@@ -64,7 +64,8 @@ use crate::controls::{CID_EXPOSURE_AUTO_PRIORITY, ControlGuard, CtrlSkip, get_ct
 use crate::frame::{Canonical, FrameMemory, FrameWriter};
 use crate::geometry::{Crop, crop_for};
 use crate::pipeline::{
-    MediaPipeline, PipelineError, add_linked, camera_head, capsfilter, cuda_caps, make, names,
+    MediaPipeline, PipelineError, StopError, add_linked, both_stopped, camera_head, capsfilter,
+    cuda_caps, make, names,
 };
 
 /// The GStreamer context type that carries a `GstCudaContext`.
@@ -370,21 +371,30 @@ impl Ingest {
     /// Stops the source: the pipeline goes to NULL (the camera is closed
     /// when this returns), then a pinned control is restored.
     pub fn stop(self) -> Result<(), PipelineError> {
+        self.stop_checked().map_err(Into::into)
+    }
+
+    /// [`Self::stop`], its error saying whether the pipeline reached NULL
+    /// (a control that could not be restored is an error that did).
+    pub fn stop_checked(self) -> Result<(), StopError> {
         let Ingest {
             pipeline,
             guard,
             camera,
             ..
         } = self;
-        let stopped = pipeline.shutdown();
+        let stopped = pipeline.shutdown_checked();
         let restored = match guard {
-            Some(g) => g.restore().map_err(|e| PipelineError::Control {
-                device: camera.map(|c| c.display().to_string()).unwrap_or_default(),
-                message: format!("restoring exposure_dynamic_framerate: {e}"),
+            Some(g) => g.restore().map_err(|e| StopError {
+                error: PipelineError::Control {
+                    device: camera.map(|c| c.display().to_string()).unwrap_or_default(),
+                    message: format!("restoring exposure_dynamic_framerate: {e}"),
+                },
+                reached_null: true,
             }),
             None => Ok(()),
         };
-        stopped.and(restored)
+        both_stopped(stopped, restored)
     }
 
     pub fn pipeline(&self) -> &MediaPipeline {

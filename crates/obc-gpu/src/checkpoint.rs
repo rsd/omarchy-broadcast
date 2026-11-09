@@ -272,10 +272,14 @@ impl Api {
     }
 }
 
-/// Whether the process is parked: set by [`park`] before it locks (or when
-/// it finds the process locked or checkpointed already), cleared by
-/// [`unpark`] once the process runs again (and by a [`park`] that failed
-/// and left it running).
+/// Whether the process is parked (a CUDA call would block): set by [`park`]
+/// before it locks, and by [`park`] or [`unpark`] whenever they find the
+/// process in any state other than running (checkpointed, locked or
+/// failed, by another tool or by an earlier attempt); [`unpark`] sets it
+/// before its restore or unlock, and it stays set when that restore or
+/// unlock fails, or the state allows neither. Cleared by [`unpark`] once
+/// the process runs again (or is found running, or CUDA never
+/// initialised), and by a [`park`] that failed and left it running.
 static PARKED: AtomicBool = AtomicBool::new(false);
 /// How many times a helper refused to call the driver while parked.
 static REFUSALS: AtomicU64 = AtomicU64::new(0);
@@ -363,8 +367,9 @@ pub fn park() -> Result<ParkOutcome, ParkError> {
 /// process checkpointed or locked by another tool (e.g. `cuda-checkpoint`)
 /// is restored or unlocked all the same. Does nothing when it is running
 /// or CUDA was never initialised ([`UnparkOutcome::NotParked`]); the state
-/// query initialises nothing. An error leaves it as it was (if it was
-/// parked, [`parked`] stays true): no CUDA call may be made.
+/// query initialises nothing. An error leaves it as it was, and [`parked`]
+/// true whenever the driver said it is not running (also when another tool
+/// parked it): no CUDA call may be made.
 pub fn unpark() -> Result<UnparkOutcome, GpuError> {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let api = match api() {
@@ -462,12 +467,20 @@ fn unpark_with(api: &Api, pid: i32, flag: &AtomicBool) -> Result<UnparkOutcome, 
         Err(_) if !flag.load(Ordering::SeqCst) => return Ok(UnparkOutcome::NotParked),
         Err(e) => return Err(e),
     };
-    let restore = match state {
+    let state = match state {
         None | Some(ProcessState::Running) => {
             flag.store(false, Ordering::SeqCst);
             return Ok(UnparkOutcome::NotParked);
         }
-        Some(ProcessState::Checkpointed) => {
+        Some(s) => s,
+    };
+    // Not running: CUDA calls would block. Set before anything else (it is
+    // clear when another tool parked the process), so that a restore or an
+    // unlock that fails leaves the helpers refusing rather than blocking;
+    // cleared only once the process runs again.
+    flag.store(true, Ordering::SeqCst);
+    let restore = match state {
+        ProcessState::Checkpointed => {
             let t = Instant::now();
             // SAFETY: the process is checkpointed; null args restore from
             // host memory onto the same GPU.
@@ -477,8 +490,8 @@ fn unpark_with(api: &Api, pid: i32, flag: &AtomicBool) -> Result<UnparkOutcome, 
         }
         // Restored but not unlocked (an earlier unlock failed), or a park
         // whose unlock failed, or locked by another tool.
-        Some(ProcessState::Locked) => Duration::ZERO,
-        Some(other) => {
+        ProcessState::Locked => Duration::ZERO,
+        other => {
             return Err(GpuError::Unavailable(format!(
                 "cannot unpark the GPU: this process's CUDA state is {other:?}"
             )));
@@ -576,11 +589,46 @@ mod tests {
         assert_eq!(refuse_if_parked(&flag, &refusals), Ok(()));
     }
 
+    /// The variable naming the test a child run of this test binary is for
+    /// ([`in_own_process`]).
+    const CHILD_VAR: &str = "OBC_GPU_UNIT_TEST_CHILD";
+
+    /// Whether this is the child run of test `name` (its path in this test
+    /// binary). Otherwise runs this test binary again in a child process,
+    /// with only that test, and fails if the child fails: a test that sets
+    /// the process-wide [`PARKED`] then cannot race another test that goes
+    /// through `driver()`.
+    fn in_own_process(name: &str) -> bool {
+        if std::env::var(CHILD_VAR).as_deref() == Ok(name) {
+            return true;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_VAR, name)
+            .output()
+            .expect("re-run this test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{name}: the child process failed: {}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "{name}: the child ran no test:\n{stdout}"
+        );
+        false
+    }
+
     #[test]
     fn every_helper_refuses_while_the_process_is_parked() {
-        // The only test that sets the process-wide flag; no other unit test
-        // of this crate goes through `driver()`, so none races it. With the
-        // flag set, `driver()` returns before opening the library.
+        // Sets the process-wide flag: in a child process of its own, so no
+        // other test of this binary sees it. With the flag set, `driver()`
+        // returns before opening the library.
+        if !in_own_process("checkpoint::tests::every_helper_refuses_while_the_process_is_parked") {
+            return;
+        }
         let before = parked_refusals();
         PARKED.store(true, Ordering::SeqCst);
         let results = [
@@ -929,6 +977,111 @@ mod tests {
         let e = unpark_with(&api, 1, &flag).unwrap_err();
         assert!(e.to_string().contains("Failed"), "{e}");
         assert_eq!(calls(), ["state"]);
+    }
+
+    #[test]
+    fn an_unpark_of_a_process_another_tool_parked_that_fails_still_refuses_cuda() {
+        // The flag clear (parked by `cuda-checkpoint`, say): it is set
+        // before the restore or the unlock, and stays set when they fail.
+        for (raw, sc, made) in [
+            (
+                2,
+                Script {
+                    restore: 2,
+                    ..Script::default()
+                },
+                &["state", "restore"][..],
+            ),
+            (
+                1,
+                Script {
+                    unlock: 999,
+                    ..Script::default()
+                },
+                &["state", "unlock"][..],
+            ),
+            // Restored, then the unlock failed: still locked.
+            (
+                2,
+                Script {
+                    unlock: 999,
+                    ..Script::default()
+                },
+                &["state", "restore", "unlock"][..],
+            ),
+            // A state that cannot be unparked from: CUDA calls would block
+            // (or fail) all the same.
+            (3, Script::default(), &["state"][..]),
+        ] {
+            let api = fake_api(Script {
+                state: Some(Ok(raw)),
+                ..sc
+            });
+            let flag = AtomicBool::new(false);
+            assert!(unpark_with(&api, 1, &flag).is_err(), "state {raw}");
+            assert_eq!(calls(), made, "state {raw}");
+            assert!(flag.load(Ordering::SeqCst), "state {raw}: helpers refuse");
+        }
+        // A retry that works clears it.
+        let api = fake_api(Script {
+            state: Some(Ok(2)),
+            restore: 2,
+            ..Script::default()
+        });
+        let flag = AtomicBool::new(false);
+        assert!(unpark_with(&api, 1, &flag).is_err());
+        assert!(flag.load(Ordering::SeqCst));
+        script(|s| s.restore = CUDA_SUCCESS);
+        calls();
+        assert!(matches!(
+            unpark_with(&api, 1, &flag),
+            Ok(UnparkOutcome::Unparked { .. })
+        ));
+        assert_eq!(calls(), ["state", "restore", "unlock"]);
+        assert!(!flag.load(Ordering::SeqCst), "running again");
+    }
+
+    #[test]
+    fn the_flag_is_set_before_a_foreign_restore_or_unlock_runs() {
+        // Seen from inside the restore and the unlock: no moment where the
+        // process is not running and the flag is clear.
+        thread_local! {
+            static FLAG: std::cell::Cell<*const AtomicBool> =
+                const { std::cell::Cell::new(std::ptr::null()) };
+            static SEEN: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+        }
+        fn note() {
+            FLAG.with(|f| {
+                // SAFETY: set below to a flag that outlives the call.
+                let set = unsafe { &*f.get() }.load(Ordering::SeqCst);
+                SEEN.with(|s| s.borrow_mut().push(set));
+            });
+        }
+        unsafe extern "C" fn restore(pid: i32, args: *mut c_void) -> CuResult {
+            note();
+            // SAFETY: forwards the caller's arguments.
+            unsafe { fake_restore(pid, args) }
+        }
+        unsafe extern "C" fn unlock(pid: i32, args: *mut c_void) -> CuResult {
+            note();
+            // SAFETY: forwards the caller's arguments.
+            unsafe { fake_unlock(pid, args) }
+        }
+        let mut api = fake_api(Script {
+            state: Some(Ok(2)),
+            ..Script::default()
+        });
+        api.restore = restore;
+        api.unlock = unlock;
+        let flag = AtomicBool::new(false);
+        FLAG.with(|f| f.set(&flag));
+        assert!(matches!(
+            unpark_with(&api, 1, &flag),
+            Ok(UnparkOutcome::Unparked { .. })
+        ));
+        FLAG.with(|f| f.set(std::ptr::null()));
+        assert_eq!(SEEN.with(|s| s.take()), [true, true]);
+        assert!(!flag.load(Ordering::SeqCst));
     }
 
     #[test]

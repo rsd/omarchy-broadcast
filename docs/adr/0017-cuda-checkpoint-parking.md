@@ -1,6 +1,6 @@
 # ADR-0017: Park the daemon's GPU state at Idle with the CUDA checkpoint API
 
-- **Status:** Accepted (2026-11-09). Amends [ADR-0006](0006-on-demand-gpu-lifecycle.md) (what Idle holds after an activation) and [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md) (the worker-process fallback is replaced by this).
+- **Status:** Accepted (2026-11-09; amended 2026-11-09: a session that does not stop cleanly disables parking until the daemon restarts, and `unpark` sets the parked flag before it restores a process checkpointed by another tool). Amends [ADR-0006](0006-on-demand-gpu-lifecycle.md) (what Idle holds after an activation) and [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md) (the worker-process fallback is replaced by this).
 
 ## Context
 - [ADR-0006](0006-on-demand-gpu-lifecycle.md) needs the dGPU to be able to runtime-suspend while the daemon idles. [../benchmarks/dgpu-idle.md](../benchmarks/dgpu-idle.md) showed that tearing the pipeline down releases the CUDA context but leaves 7 `/dev/nvidia*` fds (`nvidia0` x4, `nvidiactl` x1, `nvidia-uvm` x2) until the process exits, and left open whether they block suspend. [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md) named a worker process as the fallback.
@@ -22,7 +22,7 @@
 - A missing library or missing symbols (an older driver) means parking is unsupported. This is logged once and the daemon behaves as before.
 - The lock has a timeout of 2000 ms (at least 1 ms). If it expires the process keeps running.
 - If the checkpoint fails after a successful lock, the process is unlocked again. If that unlock also fails the error is `ParkError::Blocked`, and the next start unlocks first. Any other failure is `ParkError::Awake`: the process keeps running and parking is retried at the next idle.
-- `unpark` reads the driver's process state, so a process checkpointed or locked from outside (for example by the `cuda-checkpoint` tool) is restored or unlocked too.
+- `unpark` reads the driver's process state, so a process checkpointed or locked from outside (for example by the `cuda-checkpoint` tool) is restored or unlocked too. In that case the parked flag is set before the restore or unlock runs, so if it fails, CUDA entry through `obc-gpu` is refused instead of blocking.
 - The public API is `park()`, `unpark()`, `parked()`, the outcome types and `ParkError`.
 
 ### The daemon
@@ -30,7 +30,14 @@
 - A park failure keeps the GPU awake (the previous behaviour) and logs a warning.
 - An unpark failure fails the session start with "the GPU could not be restored from its parked state: <err>; restart the daemon". The controller enters `error` and the loopback keeps sending its black placeholder frames (fail closed).
 - A start that fails after a successful unpark parks again.
-- A session that did not stop cleanly is not parked; a warning is logged.
+- **Taint.** If a teardown leaves a pipeline that did not reach NULL, something of the session may still be alive and call CUDA, which would block once the process is parked. **Taint disables parking until the daemon restarts**: the daemon logs one warning and the GPU stays awake, as before parking existed. It covers:
+  - a session stop that did not reach NULL;
+  - a restart whose stop of the previous session did not reach NULL;
+  - a failed session start whose cleanup of the partly built output did not reach NULL (the backend starts the output itself and checks the result of its stop);
+  - a camera switch whose old ingest, or whose failed new ingest, did not reach NULL.
+
+  A later clean stop does not clear the taint, because it cannot prove that the earlier leftovers are gone. Unparking still works while tainted.
+- **Stop errors are classified** by `obc_pipeline::StopError { error, reached_null }`, returned by the `*_checked` stop methods (the plain `stop()` methods are unchanged). Only a pipeline outside NULL taints. A stop that failed with every pipeline in NULL leaves nothing CUDA-related alive, so it is warned and the process is parked. Two such errors are known: a failed V4L2 control restore (an ioctl) and a panic of the output's clock thread after the pipeline reached NULL.
 - Park and unpark are logged at info with their durations.
 - No D-Bus property or status field was added: it would touch the backend, the controller, the IPC status, D-Bus and the CLI, which was judged too much for what it reports. [../dbus-api.md](../dbus-api.md) is unchanged.
 
@@ -67,9 +74,7 @@ On the reference machine the dGPU drives the external displays, so it never susp
 **An actual runtime suspend needs the dGPU to drive no display and no other process to hold it.** To verify it, follow the quiet-desktop procedure in [../benchmarks/dgpu-idle.md](../benchmarks/dgpu-idle.md#procedure-verify-end-to-end-on-a-quiet-desktop): after the daemon idles, `scripts/dgpu-idle-check.sh --wait` should report `suspended`.
 
 ## Known limitations
-Both are to be fixed in a follow-up.
-1. When a session build fails after a successful unpark, the daemon parks again even if the cleanup of the partly built output did not stop cleanly (the output's drop ignores its stop error). CUDA elements still alive could then block until the next unpark.
-2. A session restart ignores a failed stop of the previous session. If the new build then fails, the daemon parks. The controller never restarts with a session running, so this path is latent today.
+Park runs on the controller thread. It normally takes tens of milliseconds. If a thread is still inside a CUDA call, the lock waits for it, which can block the controller, D-Bus included, for up to the 2000 ms lock timeout plus the checkpoint.
 
 ## Alternatives considered
 

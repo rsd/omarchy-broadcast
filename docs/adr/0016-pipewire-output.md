@@ -64,6 +64,7 @@ Once WirePlumber has probed the loopback while the writer streams, PipeWire also
 
 ## Notes
 - **Format order (2026-11-09).** The node offers YUY2 first, then NV12 and I420, whatever the contract's format. OBS Studio 32.2's PipeWire camera source computes NV12 row size as 2 bytes per pixel and reads past the buffer; offering YUY2 first avoids this. A consumer that asks for NV12 or I420 explicitly still negotiates it, and the buffer layout and stride the node announces are unchanged.
+- **NV12 offer is a setting (2026-11-09).** `[pipewire] offer_nv12` (default `true`) keeps NV12 on the node's offer; `false` offers YUY2 and I420 only, so OBS Studio's NV12 bug cannot be reached by choosing the format by hand. Known issue and upstream links: [setup/daemon.md](../setup/daemon.md#known-issue-obs-studio-and-nv12).
 
 ## Alternatives considered
 

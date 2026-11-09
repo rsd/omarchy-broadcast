@@ -508,6 +508,7 @@ fn the_node_serves_nv12_and_yuy2_and_survives_refused_consumers() {
             contract,
             node_name: name.clone(),
             description: description.clone(),
+            offer_nv12: true,
         },
         move |ev| e.lock().unwrap().push(ev),
     )

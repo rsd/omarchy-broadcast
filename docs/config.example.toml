@@ -163,3 +163,15 @@ on_failure = "black"
 # leaves. The loopback is never restarted for this key.
 # Default: false
 enabled = false
+
+# Offer NV12 on the node, next to YUY2 and I420 (offered in the order YUY2,
+# NV12, I420). OBS Studio's PipeWire camera source (up to at least 32.2.2)
+# mis-sizes NV12 rows and crashes when NV12 is chosen by hand in its
+# properties; its default, YUY2, works. Set this to false to offer YUY2 and
+# I420 only, so that choice does not exist. See "Known issue: OBS Studio and
+# NV12" in docs/setup/daemon.md.
+# Takes effect on reload, once no application is linked to the node (the
+# node is rebuilt, as when enabling or disabling it); the loopback is never
+# restarted for this key.
+# Default: true
+offer_nv12 = true

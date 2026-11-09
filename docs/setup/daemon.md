@@ -179,7 +179,34 @@ gst-launch-1.0 pipewiresrc target-object=oma-broadcast ! videoconvert ! autovide
 | GNOME Snapshot, GStreamer `pipewiresrc` | work without a setting |
 | Zoom, Discord | do not use the PipeWire camera; select the loopback camera |
 
-The node offers YUY2, NV12 and I420, in that order, at the output contract's size and rate. YUY2 is first because OBS Studio 32.2's PipeWire camera source mis-sizes NV12 rows; an application that asks for NV12 or I420 explicitly still gets it. An application that asks for another format or size fails to link, and nothing else is affected.
+The node offers YUY2, NV12 and I420, in that order, at the output contract's size and rate. YUY2 is first because OBS Studio's PipeWire camera source mis-sizes NV12 rows (see the known issue below); an application that asks for NV12 or I420 explicitly still gets it. An application that asks for another format or size fails to link, and nothing else is affected.
+
+**Offered formats.** NV12 is offered by default. `offer_nv12 = false` in `[pipewire]` offers YUY2 and I420 only:
+
+```toml
+[pipewire]
+enabled = true
+offer_nv12 = false
+```
+
+A reload that changes it rebuilds the node, like enabling or disabling it: at once if no application is linked to the node, otherwise when the last one leaves. The loopback is not touched.
+
+### Known issue: OBS Studio and NV12
+
+OBS Studio's PipeWire camera source (`plugins/linux-pipewire`; present in 32.2.2 and on the master branch as of November 2026) computes the row size of an NV12 frame as 2 bytes per pixel, and ignores the stride and the plane offsets the producer announces. For a 1920x1080 frame it reads rows 3840 bytes apart from a buffer that holds 1920 bytes per luma row, so it reads past the end of the buffer and OBS crashes. The chroma plane is not copied either. This is in OBS, not in the node: the node's buffer is a whole NV12 frame in the layout GStreamer's `GstVideoInfo` gives, and other applications read it correctly.
+
+OBS lists the node's formats in the source's properties, in the order the node offers them, and starts with the first one. With the node's order (YUY2 first), OBS uses YUY2, which works. The crash happens only when NV12 is chosen by hand in the source's format selection.
+
+Workarounds, either of them:
+
+- leave the format of the OBS source on YUY2;
+- set `offer_nv12 = false` in `[pipewire]` (above), so that OBS cannot choose NV12.
+
+Upstream:
+
+- issue [obsproject/obs-studio#13823](https://github.com/obsproject/obs-studio/issues/13823), closed without a fix;
+- pull request [obsproject/obs-studio#14002](https://github.com/obsproject/obs-studio/pull/14002), closed unmerged;
+- the lines concerned, at tag 32.2.2: the `bpp` of the NV12 entry in [`formats.c`](https://github.com/obsproject/obs-studio/blob/32.2.2/plugins/linux-pipewire/formats.c#L79), the line size in [`pipewire.c`](https://github.com/obsproject/obs-studio/blob/32.2.2/plugins/linux-pipewire/pipewire.c#L657), and the plane pointers taken from the buffer in [`pipewire.c`](https://github.com/obsproject/obs-studio/blob/32.2.2/plugins/linux-pipewire/pipewire.c#L689-L695).
 
 ### Hiding the duplicate
 

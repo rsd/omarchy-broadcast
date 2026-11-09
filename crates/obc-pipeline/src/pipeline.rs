@@ -138,6 +138,47 @@ pub enum PipelineError {
     },
 }
 
+/// A stop that failed ([`MediaPipeline::shutdown_checked`] and the
+/// `stop_checked` of [`crate::Ingest`], [`crate::Output`] and
+/// [`crate::Session`]): its error, and whether every pipeline it took down
+/// reached NULL all the same.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct StopError {
+    pub error: PipelineError,
+    /// Every pipeline the stop took down was confirmed in NULL: none of its
+    /// elements runs any more (their streaming threads stopped, their
+    /// devices and GPU resources released), and the error is of something
+    /// else (a camera control not restored, an output clock thread that
+    /// had panicked and was joined). `false` when a pipeline ended outside
+    /// NULL, or its state change to NULL failed: some of its elements may
+    /// still run.
+    pub reached_null: bool,
+}
+
+impl From<StopError> for PipelineError {
+    fn from(e: StopError) -> Self {
+        e.error
+    }
+}
+
+/// Two stops' outcomes as one: every pipeline reached NULL if both say so,
+/// and the error is the first one, one that left a pipeline outside NULL
+/// first.
+pub(crate) fn both_stopped(
+    first: Result<(), StopError>,
+    then: Result<(), StopError>,
+) -> Result<(), StopError> {
+    match (first, then) {
+        (Ok(()), r) | (r, Ok(())) => r,
+        (Err(a), Err(b)) if a.reached_null && !b.reached_null => Err(b),
+        (Err(mut a), Err(b)) => {
+            a.reached_null &= b.reached_null;
+            Err(a)
+        }
+    }
+}
+
 pub(crate) fn make(factory: &str, name: &str) -> Result<gst::Element, PipelineError> {
     gst::ElementFactory::make(factory)
         .name(name)
@@ -503,16 +544,39 @@ impl MediaPipeline {
     /// elements, buffer pools and the CUDA context they share. Callers must
     /// not hold element references beyond this point.
     pub fn shutdown(self) -> Result<(), PipelineError> {
+        self.shutdown_checked().map_err(Into::into)
+    }
+
+    /// [`Self::shutdown`], its error saying whether the pipeline reached
+    /// NULL: never, as it fails only when it did not (or the state change
+    /// to NULL failed).
+    pub fn shutdown_checked(self) -> Result<(), StopError> {
         let res = self.pipeline.set_state(gst::State::Null);
         // set_state(Null) completes synchronously; confirm before dropping.
         let (_, cur, _) = self.pipeline.state(gst::ClockTime::from_seconds(5));
         // Drop sets NULL again: a no-op on a pipeline already in NULL.
         drop(self);
-        res.map_err(|e| PipelineError::State(e.to_string()))?;
-        if cur != gst::State::Null {
-            return Err(PipelineError::State(format!("ended in {cur:?}, not Null")));
+        not_null(res, cur).map_or(Ok(()), |error| {
+            Err(StopError {
+                error,
+                reached_null: false,
+            })
+        })
+    }
+}
+
+/// The error of a state change to NULL (`res`) after which the pipeline's
+/// state is `cur`: `None` when it reached NULL.
+pub(crate) fn not_null(
+    res: Result<gst::StateChangeSuccess, gst::StateChangeError>,
+    cur: gst::State,
+) -> Option<PipelineError> {
+    match res {
+        Err(e) => Some(PipelineError::State(e.to_string())),
+        Ok(_) if cur != gst::State::Null => {
+            Some(PipelineError::State(format!("ended in {cur:?}, not Null")))
         }
-        Ok(())
+        Ok(_) => None,
     }
 }
 
@@ -715,6 +779,62 @@ mod tests {
             caps: None,
             cuda_memory: cuda,
         }
+    }
+
+    fn stop_err(what: &str, reached_null: bool) -> Result<(), StopError> {
+        Err(StopError {
+            error: PipelineError::State(what.into()),
+            reached_null,
+        })
+    }
+
+    /// `(error, reached_null)` of a combined stop.
+    fn seen(r: Result<(), StopError>) -> Option<(String, bool)> {
+        r.err().map(|e| (e.to_string(), e.reached_null))
+    }
+
+    #[test]
+    fn two_stops_reach_null_only_if_both_do_and_report_an_unclean_one_first() {
+        let s = |what: &str, null| Some((format!("state change failed: {what}"), null));
+        assert_eq!(seen(both_stopped(Ok(()), Ok(()))), None);
+        assert_eq!(
+            seen(both_stopped(stop_err("a", true), Ok(()))),
+            s("a", true)
+        );
+        assert_eq!(
+            seen(both_stopped(Ok(()), stop_err("b", false))),
+            s("b", false)
+        );
+        // The first error, unless only the second left a pipeline outside
+        // NULL.
+        assert_eq!(
+            seen(both_stopped(stop_err("a", true), stop_err("b", true))),
+            s("a", true)
+        );
+        assert_eq!(
+            seen(both_stopped(stop_err("a", false), stop_err("b", true))),
+            s("a", false)
+        );
+        assert_eq!(
+            seen(both_stopped(stop_err("a", false), stop_err("b", false))),
+            s("a", false)
+        );
+        assert_eq!(
+            seen(both_stopped(stop_err("a", true), stop_err("b", false))),
+            s("b", false)
+        );
+    }
+
+    #[test]
+    fn a_change_to_null_is_clean_only_when_it_worked_and_ended_in_null() {
+        use gst::{State, StateChangeError, StateChangeSuccess};
+        assert!(not_null(Ok(StateChangeSuccess::Success), State::Null).is_none());
+        assert_eq!(
+            not_null(Ok(StateChangeSuccess::Success), State::Ready).map(|e| e.to_string()),
+            Some("state change failed: ended in Ready, not Null".into())
+        );
+        // Failed, whatever the state read afterwards says.
+        assert!(not_null(Err(StateChangeError), State::Null).is_some());
     }
 
     #[test]

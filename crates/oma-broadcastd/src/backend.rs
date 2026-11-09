@@ -162,8 +162,10 @@ pub trait MediaBackend: Send + 'static {
 
     /// Starts the PipeWire output next to the running writer, with the
     /// writer's contract and the same frames, replacing the one that runs
-    /// (stopped first). The writer is not touched. Returns the new output's
-    /// generation, which tags every event it reports.
+    /// (stopped first). The writer is not touched. `offer_nv12` is
+    /// `[pipewire] offer_nv12`: whether the node offers NV12 next to YUY2 and
+    /// I420. Returns the new output's generation, which tags every event it
+    /// reports.
     ///
     /// Never fails: what happens is reported through its
     /// [`PipeWireEvent`]s, the first of which are
@@ -171,7 +173,7 @@ pub trait MediaBackend: Send + 'static {
     /// cannot start (no writer runs, PipeWire unusable, or a build without
     /// PipeWire support: [`PipeWireState::Unsupported`]) reports its state
     /// and `Consumers(0)` instead.
-    fn start_pipewire(&mut self) -> PipeWireGeneration;
+    fn start_pipewire(&mut self, offer_nv12: bool) -> PipeWireGeneration;
 
     /// Stops the PipeWire output alone, if one runs: its node disappears;
     /// the writer and the session keep running. Reports nothing: the caller
