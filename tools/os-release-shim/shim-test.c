@@ -1,7 +1,7 @@
 // Test program for os-release-shim, run by test.sh under LD_PRELOAD.
 //
 //   shim-test redirect <tmpdir>      /etc/os-release must read as the file
-//                                    named by $OMA_BROADCAST_OS_RELEASE
+//                                    named by $OMARCHY_BROADCAST_OS_RELEASE
 //   shim-test passthrough <tmpdir>   /etc/os-release must read as the real file
 //
 // Every interposed entry point is called directly. Reference contents are
@@ -96,9 +96,9 @@ int main(int argc, char **argv) {
     char *real = read_raw(T);
     char *want = real;
     if (redirect) {
-        const char *fake = getenv("OMA_BROADCAST_OS_RELEASE");
+        const char *fake = getenv("OMARCHY_BROADCAST_OS_RELEASE");
         if (fake == NULL) {
-            fprintf(stderr, "redirect mode needs OMA_BROADCAST_OS_RELEASE\n");
+            fprintf(stderr, "redirect mode needs OMARCHY_BROADCAST_OS_RELEASE\n");
             return 2;
         }
         want = read_raw(fake);

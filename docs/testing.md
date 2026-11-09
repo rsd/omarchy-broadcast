@@ -109,23 +109,23 @@ On the reference machine all 19 hardware tests pass with `OBC_TEST_CAMERA=046d:0
 ### Default suite (no camera, no GPU)
 
 ```sh
-cargo test -p obc-ipc -p oma-broadcastd -p oma-broadcast
+cargo test -p obc-ipc -p omarchy-broadcastd -p omarchy-broadcast
 ```
 
-**`oma-broadcastd`** (`crates/oma-broadcastd`):
+**`omarchy-broadcastd`** (`crates/omarchy-broadcastd`):
 - The controller state machine runs against a fake media backend with explicit instants, so no test sleeps for a timer. It covers every transition of [ADR-0011](adr/0011-daemon-lifecycle-and-dbus-api.md): the debounce (a 100 ms open never starts the camera), the grace period (a consumer returning inside it keeps the session), `off` keeping the writer, persistence of `Enabled` and the selection across a restart, `SelectCamera` / `NextCamera` while idle and while streaming, the `NoSuchCamera` / `Unavailable` / `Failed` errors, fallback to the next camera, `error` and recovery, no pre-emption of a working stream, an invalid reload, an invalid config at start, deferral of an output-mode change while a consumer holds the device, a missing loopback retried every 2 s, a failing writer, the 10 s start timeout, every camera failing (the session stops rather than cycling), a damaged state file (daemon `off`, file untouched), `SetEnabled(false)` during a start, and `Stats` only while `active`.
 - Parking ([ADR-0017](adr/0017-cuda-checkpoint-parking.md); see [Parking the GPU at Idle](#parking-the-gpu-at-idle)): unit tests of the `Parker` state machine through a test ops seam and of its ordering through a `StopSession` seam, and controller tests through the fake backend, which drives the real `Parker`.
 - Consumer counting uses `sleep` children that hold a temporary file open: the daemon's own descriptor is excluded, counts rise and fall, inotify events trigger recounts, and the polling fallback works. Also covered: the inotify wrapper, hotplug debouncing, camera ids, ordering and selectors.
-- The D-Bus object is served over a peer-to-peer socket pair and driven through `obc_ipc::OmaBroadcastProxy`: every property (including `GetAll` and the introspection data), every method and error name, the `PropertiesChanged` sequence, `Stats` while active and none for 2.5 s while idle.
+- The D-Bus object is served over a peer-to-peer socket pair and driven through `obc_ipc::OmarchyBroadcastProxy`: every property (including `GetAll` and the introspection data), every method and error name, the `PropertiesChanged` sequence, `Stats` while active and none for 2.5 s while idle.
 - Process tests (`tests/process.rs`) run the binary on a private `dbus-daemon` (`/usr/bin/dbus-daemon` is required; without it the tests fail naming it): a second instance exits with status 3 before touching a device, no session bus gives status 1, `--help` and an unknown option behave.
 
-**`oma-broadcast`** (`crates/oma-broadcast/tests/cli.rs`, plus unit tests of the JSON and human formatting): the CLI runs against a mock daemon on a private `dbus-daemon` with its own configuration and an activation file whose command is `/bin/sh -c 'echo > marker; exit 1'`, so a failed activation is quick and visible. Both `/usr/bin/dbus-daemon` and `/bin/sh` are required. The tests cover `status`, `cameras`, `on`, `off` and `camera` in human and JSON form, exit codes (3 for a daemon that is not running or no session bus, with reads never activating the daemon), `watch --json` following changes, `Stats` and outages, waiting for the daemon to appear, a daemon that holds its name but does not answer, and `watch` exiting quietly when its reader (`| head -1`) goes away.
+**`omarchy-broadcast`** (`crates/omarchy-broadcast/tests/cli.rs`, plus unit tests of the JSON and human formatting): the CLI runs against a mock daemon on a private `dbus-daemon` with its own configuration and an activation file whose command is `/bin/sh -c 'echo > marker; exit 1'`, so a failed activation is quick and visible. Both `/usr/bin/dbus-daemon` and `/bin/sh` are required. The tests cover `status`, `cameras`, `on`, `off` and `camera` in human and JSON form, exit codes (3 for a daemon that is not running or no session bus, with reads never activating the daemon), `watch --json` following changes, `Stats` and outages, waiting for the daemon to appear, a daemon that holds its name but does not answer, and `watch` exiting quietly when its reader (`| head -1`) goes away.
 
 **`obc-ipc`** (`crates/obc-ipc/tests/mock_server.rs`): a mock server over a peer-to-peer connection checks that the proxy reads every property, calls every method, maps errors back by name, receives `Stats`, and that the no-auto-start read sees every property, carries the `NO_AUTO_START` flag at the server and reports a missing object as an error.
 
 ### End-to-end hardware test (ignored)
 
-`crates/oma-broadcastd/tests/hardware.rs::the_daemon_runs_the_lifecycle_on_real_devices` runs the real daemon, a private `dbus-daemon`, temporary `XDG` directories and a grace period of 1 s, with `obc-consumer` as the application.
+`crates/omarchy-broadcastd/tests/hardware.rs::the_daemon_runs_the_lifecycle_on_real_devices` runs the real daemon, a private `dbus-daemon`, temporary `XDG` directories and a grace period of 1 s, with `obc-consumer` as the application.
 
 | Needs | |
 |---|---|
@@ -136,7 +136,7 @@ cargo test -p obc-ipc -p oma-broadcastd -p oma-broadcast
 
 ```sh
 OBC_TEST_SINK=/dev/video11 OBC_TEST_CAMERA=046d:0944 OBC_TEST_CAMERA_2=5986:1193 \
-  cargo test -p oma-broadcastd --test hardware -- --ignored --test-threads=1 --nocapture
+  cargo test -p omarchy-broadcastd --test hardware -- --ignored --test-threads=1 --nocapture
 ```
 
 It asserts, in order:
@@ -176,7 +176,7 @@ These figures were measured by hand on the stated machine; no test asserts them.
 
 Applications that open `/dev/video*` directly find the virtual camera whenever the daemon runs. Applications that discover cameras through PipeWire (the camera portal, OBS's PipeWire source, browsers using PipeWire) depend on WirePlumber:
 - WirePlumber probes video nodes when it starts. A v4l2loopback device into which no writer is streaming at that moment is recorded as output-only (`device.capabilities = ":video_output:"`). The device sends no udev event when a writer starts, so WirePlumber never probes it again and PipeWire lists no camera for it.
-- The daemon requests its bus name only after its loopback writer has started, so a `Type=dbus` unit is ready when the device is already a capture device. The optional drop-in `dist/systemd/wireplumber.service.d/oma-broadcast.conf` orders WirePlumber after the daemon ([setup/daemon.md](setup/daemon.md)).
+- The daemon requests its bus name only after its loopback writer has started, so a `Type=dbus` unit is ready when the device is already a capture device. The optional drop-in `dist/systemd/wireplumber.service.d/omarchy-broadcast.conf` orders WirePlumber after the daemon ([setup/daemon.md](setup/daemon.md)).
 - Without the drop-in, or after the daemon was restarted by hand, restart WirePlumber once the daemon runs: `systemctl --user restart wireplumber`.
 - Meanwhile `gst-device-monitor-1.0 -i Video/Source` (with `-i`, the hidden providers, including the plain v4l2 one) lists "Omarchy Broadcast" at its `/dev/videoN` path, while the default PipeWire provider does not.
 
@@ -185,7 +185,7 @@ Applications that open `/dev/video*` directly find the virtual camera whenever t
 The optional PipeWire node ([ADR-0016](adr/0016-pipewire-output.md)) is compiled only with the cargo feature `pipewire`, so its tests run in a separate suite. The default `cargo test --workspace` does not build them. Building them needs the libpipewire headers and clang; the unit tests create a PipeWire context from its `client.conf` (package `pipewire`) but contact no PipeWire daemon.
 
 ```sh
-cargo test -p obc-pipeline -p oma-broadcastd --features oma-broadcastd/pipewire
+cargo test -p obc-pipeline -p omarchy-broadcastd --features omarchy-broadcastd/pipewire
 ```
 
 The continuous integration runs the same command, and clippy with the feature, as a second job; the default job is unchanged.
@@ -197,17 +197,17 @@ The continuous integration runs the same command, and clippy with the feature, a
 - failure and retry: with no PipeWire daemon the output is `failed` and retried, never puts the daemon in `error`, and events of a replaced output are discarded;
 - the reporting of a panic in a PipeWire callback;
 - in the controller: the lifecycle keyed off the total of loopback and PipeWire consumers, enabling and disabling on reload (immediately, or when the last PipeWire consumer leaves), no loopback rebuild for a PipeWire setting, and the rebuild of both outputs on an output-mode change;
-- in `oma-broadcastd`, `oma-broadcast` and `obc-ipc`: the three revision 3 properties and `Consumers` as their total, an older daemon without them, the `Consumers:  2 (loopback 1, PipeWire 1)` and `PipeWire:` lines, and the three JSON fields with the 32-byte bound on `pipewire_output`.
+- in `omarchy-broadcastd`, `omarchy-broadcast` and `obc-ipc`: the three revision 3 properties and `Consumers` as their total, an older daemon without them, the `Consumers:  2 (loopback 1, PipeWire 1)` and `PipeWire:` lines, and the three JSON fields with the 32-byte bound on `pipewire_output`.
 
 **Live tests (ignored).** Both change no PipeWire or WirePlumber setting, and their consumers use `node.dont-fallback`, so a missing node never falls back to a real camera. A consumer whose link does not appear within 2 s is stopped and the test fails.
 
-`crates/obc-pipeline/tests/pipewire_live.rs` needs the user PipeWire daemon (with WirePlumber) and `gst-plugin-pipewire` (`pipewiresrc`). It registers a temporary node, `oma-broadcast-test-<pid>`, fed by a loopback writer into a `fakesink` (no device), and checks that NV12 and YUY2 consumers negotiate and receive frames, and that RGBA and 640x480 consumers are refused without disturbing the node, its id or the other consumers.
+`crates/obc-pipeline/tests/pipewire_live.rs` needs the user PipeWire daemon (with WirePlumber) and `gst-plugin-pipewire` (`pipewiresrc`). It registers a temporary node, `omarchy-broadcast-test-<pid>`, fed by a loopback writer into a `fakesink` (no device), and checks that NV12 and YUY2 consumers negotiate and receive frames, and that RGBA and 640x480 consumers are refused without disturbing the node, its id or the other consumers.
 
 ```sh
 cargo test -p obc-pipeline --features pipewire --test pipewire_live -- --ignored --nocapture --test-threads=1
 ```
 
-`crates/oma-broadcastd/tests/pipewire.rs` runs the daemon on a private bus with `[pipewire] enabled = true`, a loopback, a camera and the GPU, with a `pipewiresrc` consumer that drives the lifecycle `starting` to `active` to `idle`, and checks the consumer counts and `PipeWireOutput` along the way. Before it starts the daemon it checks with `pw-dump` that no other node is called `oma-broadcast` (an installed daemon with the node enabled).
+`crates/omarchy-broadcastd/tests/pipewire.rs` runs the daemon on a private bus with `[pipewire] enabled = true`, a loopback, a camera and the GPU, with a `pipewiresrc` consumer that drives the lifecycle `starting` to `active` to `idle`, and checks the consumer counts and `PipeWireOutput` along the way. Before it starts the daemon it checks with `pw-dump` that no other node is called `omarchy-broadcast` (an installed daemon with the node enabled).
 
 | Needs | |
 |---|---|
@@ -219,7 +219,7 @@ cargo test -p obc-pipeline --features pipewire --test pipewire_live -- --ignored
 
 ```sh
 OBC_TEST_SINK=/dev/video11 OBC_TEST_CAMERA=046d:0944 \
-  cargo test -p oma-broadcastd --features pipewire --test pipewire -- --ignored --nocapture
+  cargo test -p omarchy-broadcastd --features pipewire --test pipewire -- --ignored --nocapture
 ```
 
 ### Known limitation: one application at a time
@@ -234,23 +234,23 @@ The effects ([ADR-0012](adr/0012-video-effects-and-maxine-backend.md)) are teste
 
 ```sh
 cargo test -p obc-core -p obc-gpu -p obc-backend -p obc-backend-maxine -p gst-obc \
-  -p obc-pipeline -p obc-ipc -p oma-broadcastd -p oma-broadcast
+  -p obc-pipeline -p obc-ipc -p omarchy-broadcastd -p omarchy-broadcast
 ```
 
 To show that nothing in this run depends on the SDK, run it with the SDK variables removed:
 
 ```sh
-env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u OMA_BROADCAST_OS_RELEASE \
+env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u OMARCHY_BROADCAST_OS_RELEASE \
   cargo test -p obc-core -p obc-gpu -p obc-backend -p obc-backend-maxine -p gst-obc \
-    -p obc-pipeline -p obc-ipc -p oma-broadcastd -p oma-broadcast
+    -p obc-pipeline -p obc-ipc -p omarchy-broadcastd -p omarchy-broadcast
 ```
 
-On the reference machine this gave 424 passed, 0 failed and 41 ignored (the hardware tests), and `ldd` on `oma-broadcastd` and `obc-bench` shows no link to the SDK, CUDA or TensorRT libraries. What the default suite covers:
+On the reference machine this gave 424 passed, 0 failed and 41 ignored (the hardware tests), and `ldd` on `omarchy-broadcastd` and `obc-bench` shows no link to the SDK, CUDA or TensorRT libraries. What the default suite covers:
 
 - **Backend seam** (`obc-backend`, `obc-gpu`, `obc-backend-maxine`): the trait types, the validation of load requests, the error texts, and a Maxine backend that reports itself unavailable with the reason when the SDK is not found.
 - **The element** (`crates/gst-obc`): registration and caps (CUDA NV12 on both pads), properties and their validation, status messages on the bus, the background image (crop to fill, the size limit, a JPEG, an undecodable or missing file), and the refusal of hostile images in under half a second: a 50-byte PNG declaring 60000x60000 pixels and a JPEG declaring 65000x65000 are refused from their headers before a decoder runs; a file that is a FIFO is refused without blocking. The first-image rule is tested too: a valid image followed by a second one declaring a huge size is decoded as the first image only, data after the image (random bytes, an MP4 box, zero padding) is ignored, and a truncated image is refused.
 - **The pipeline** (`obc-pipeline`): the effect settings and their checks, the effect statistics, that an output built without the element refuses an effect, and that an effect is refused with the roundtrip stage or with a system-memory output.
-- **The daemon** (`oma-broadcastd`), against its fake backend: the `[effect]` configuration, the runtime state keys, the setters and their errors, persistence and precedence, the `Error` and `State` outcomes of an effect failure with `on_failure` `"black"` and `"none"`, the clearing of that error when the session ends, and a damaged state file.
+- **The daemon** (`omarchy-broadcastd`), against its fake backend: the `[effect]` configuration, the runtime state keys, the setters and their errors, persistence and precedence, the `Error` and `State` outcomes of an effect failure with `on_failure` `"black"` and `"none"`, the clearing of that error when the session ends, and a damaged state file.
 - **The CLI and the IPC crate**: `effect` and its option rules, the revision-1 daemon message, the JSON fields and their bounds, the escaping of daemon strings in the human output, and the proxy against a mock server.
 
 ### GPU tests with the fake backend (`gpu_` prefix)
@@ -270,7 +270,7 @@ These load the real SDK. They need `MAXINE_VFX_ROOT` and the SDK's library direc
 ```sh
 make -C tools/os-release-shim
 source tools/maxine-probe/env.sh        # or your env.sh; sets MAXINE_VFX_ROOT and LD_LIBRARY_PATH
-export OMA_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release
+export OMARCHY_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env LD_PRELOAD=$PWD/target/os-release-shim/os-release-shim.so"
 
 cargo test -p obc-gpu -p obc-backend-maxine -p gst-obc -- --ignored --test-threads=1
@@ -324,7 +324,7 @@ OBC_MASK_FRAMES=/path/to/frames \
 [ADR-0017](adr/0017-cuda-checkpoint-parking.md). The default suite needs no GPU.
 
 - **`obc-gpu`** (`src/checkpoint.rs`): a missing library and a driver without the symbols make parking unsupported; the lock arguments' struct layout, the timeout clamp, the mapping of process states, the guard that refuses while parked and counts refusals, and the call sequences against a fake driver (park then unpark in order, a lock timeout leaves the process running, a failed checkpoint unlocks again, a failed unlock stays parked until the next unpark, a failed restore can be retried, an unsupported call fails that park only, unpark follows the driver's state, and the flag of a process parked by another tool is set before its restore or unlock runs, so a failed one still refuses CUDA). The process-wide parked flag is tested in a child process.
-- **`oma-broadcastd`**: `backend/park.rs` tests the `Parker` (logging with durations, a failed park, an unsupported driver said once, a failed unpark, a failed start parks again, the unlock after a blocked park, refusals warned once per park, stop ordering, and the taint paths through the seams: an unclean session stop, restart, failed start or camera switch disables parking and a later clean stop does not clear it, a stop that failed with every pipeline in NULL still parks with a warning, a tainted parker still unparks). `backend/real.rs` has pure-function tests of the clean/unclean mapping of stop results, and `obc-pipeline` session tests cover a camera switch whose stop is unclean. The controller tests (`controller/tests.rs`, fake backend with the real `Parker`) cover: Active to Idle parks; a restart unparks before the build; an unpark failure gives `error` with no session and the writer kept; a retry works once the failure clears; `off` after an activation stays parked; a park failure keeps working; a failed first start parks nothing; an unclean stop does not park, and neither does a later clean stop; a failed start whose cleanup was unclean does not park again.
+- **`omarchy-broadcastd`**: `backend/park.rs` tests the `Parker` (logging with durations, a failed park, an unsupported driver said once, a failed unpark, a failed start parks again, the unlock after a blocked park, refusals warned once per park, stop ordering, and the taint paths through the seams: an unclean session stop, restart, failed start or camera switch disables parking and a later clean stop does not clear it, a stop that failed with every pipeline in NULL still parks with a warning, a tainted parker still unparks). `backend/real.rs` has pure-function tests of the clean/unclean mapping of stop results, and `obc-pipeline` session tests cover a camera switch whose stop is unclean. The controller tests (`controller/tests.rs`, fake backend with the real `Parker`) cover: Active to Idle parks; a restart unparks before the build; an unpark failure gives `error` with no session and the writer kept; a retry works once the failure clears; `off` after an activation stays parked; a park failure keeps working; a failed first start parks nothing; an unclean stop does not park, and neither does a later clean stop; a failed start whose cleanup was unclean does not park again.
 
 Ignored hardware tests, all needing an NVIDIA GPU with a driver that has the CUDA checkpoint API:
 
@@ -335,12 +335,12 @@ cargo test -p obc-gpu --test hardware -- --ignored --test-threads=1 checkpoint_
 
 # daemon backend, no camera: videotestsrc, a loopback and 3 cycles
 OBC_TEST_SINK=/dev/video11 \
-  cargo test -p oma-broadcastd --test hardware -- --ignored --test-threads=1 --nocapture \
+  cargo test -p omarchy-broadcastd --test hardware -- --ignored --test-threads=1 --nocapture \
   the_backend_parks_the_gpu_between_sessions_without_a_camera
 
 # the daemon: needs a camera and a free loopback
 OBC_TEST_SINK=/dev/video11 OBC_TEST_CAMERA=046d:0944 \
-  cargo test -p oma-broadcastd --test hardware -- --ignored --test-threads=1 --nocapture \
+  cargo test -p omarchy-broadcastd --test hardware -- --ignored --test-threads=1 --nocapture \
   the_daemon_parks_the_gpu_when_idle
 ```
 
@@ -348,14 +348,14 @@ OBC_TEST_SINK=/dev/video11 OBC_TEST_CAMERA=046d:0944 \
 
 ### Daemon effects test (ignored)
 
-`crates/oma-broadcastd/tests/hardware.rs::effects_switch_while_streaming_and_release_the_gpu` runs the real daemon like the lifecycle test above, and switches `blur`, `replace`, `none` and `blur` again while a consumer in another process reads the virtual camera. It checks the rate and the single caps negotiation at the consumer, the readiness time of each effect, the daemon's GPU memory in each phase, and that the GPU is released within seconds of the last consumer leaving. The daemon is a child process of the test, so the shim is passed to it explicitly, with `OBC_TEST_PRELOAD`, instead of through the cargo runner:
+`crates/omarchy-broadcastd/tests/hardware.rs::effects_switch_while_streaming_and_release_the_gpu` runs the real daemon like the lifecycle test above, and switches `blur`, `replace`, `none` and `blur` again while a consumer in another process reads the virtual camera. It checks the rate and the single caps negotiation at the consumer, the readiness time of each effect, the daemon's GPU memory in each phase, and that the GPU is released within seconds of the last consumer leaving. The daemon is a child process of the test, so the shim is passed to it explicitly, with `OBC_TEST_PRELOAD`, instead of through the cargo runner:
 
 ```sh
 source tools/maxine-probe/env.sh
-OMA_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release \
+OMARCHY_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release \
 OBC_TEST_PRELOAD=$PWD/target/os-release-shim/os-release-shim.so \
 OBC_TEST_SINK=/dev/video11 OBC_TEST_CAMERA=046d:0944 OBC_TEST_CAMERA_2=5986:1193 \
-  cargo test -p oma-broadcastd --test hardware -- --ignored --test-threads=1 --nocapture
+  cargo test -p omarchy-broadcastd --test hardware -- --ignored --test-threads=1 --nocapture
 ```
 
 Without `OBC_TEST_PRELOAD` the effects test fails with the daemon's `Error` text (`NvVFX_Load(GreenScreen) returned -1209 ...`), which shows that the variable is what makes it pass. With `--nocapture` the test prints, for each phase, the camera's fresh frame rate and whether the output clock was phase locked (the daemon logs this at debug level with `-v`).
@@ -457,13 +457,13 @@ This checks what the stream promises to a real application: the virtual camera k
 Prerequisites: the loopback of [setup/loopback.md](setup/loopback.md) and the build of the workspace. Run the daemon in the foreground, with its logs on the terminal, from the build directory (or install it as a service, [setup/daemon.md](setup/daemon.md)):
 
 ```sh
-cargo run --release -p oma-broadcastd -- -v
+cargo run --release -p omarchy-broadcastd -- -v
 ```
 
-1. **Idle.** In a second terminal (`oma-broadcast` is the installed CLI, or `cargo run --release -p oma-broadcast --`): `oma-broadcast status` shows `State: idle`; `v4l2-ctl -d /dev/video11 --all` shows a capture device with NV12 1920x1080; `fuser /dev/video0` shows no process holding the camera (the camera LED is off); `nvidia-smi` lists no process of the daemon.
-2. **Follow it.** `oma-broadcast watch` prints the changes; `busctl --user monitor --match "type='signal',path='/br/com/dias/OmaBroadcast'"` shows the raw signals.
+1. **Idle.** In a second terminal (`omarchy-broadcast` is the installed CLI, or `cargo run --release -p omarchy-broadcast --`): `omarchy-broadcast status` shows `State: idle`; `v4l2-ctl -d /dev/video11 --all` shows a capture device with NV12 1920x1080; `fuser /dev/video0` shows no process holding the camera (the camera LED is off); `nvidia-smi` lists no process of the daemon.
+2. **Follow it.** `omarchy-broadcast watch` prints the changes; `busctl --user monitor --match "type='signal',path='/br/com/dias/OmarchyBroadcast'"` shows the raw signals.
 3. **Consumer.** Open the virtual camera in OBS or Chrome, or run `gst-launch-1.0 v4l2src device=/dev/video11 ! fakesink`. `watch` shows `consumers: 1`, `state: starting`, `state: active` (about 2.5 s) and one `stats:` line per second. The application shows the camera.
-4. **Controls.** `oma-broadcast cameras`, `oma-broadcast camera next` and `oma-broadcast camera "Brio"` switch the camera under the open application, which keeps one stream with no black frame; `oma-broadcast off` closes the camera (LED off, application shows black) and `oma-broadcast on` restores it. The same through `busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast br.com.dias.OmaBroadcast1 SetEnabled b false` ([dbus-api.md](dbus-api.md)).
+4. **Controls.** `omarchy-broadcast cameras`, `omarchy-broadcast camera next` and `omarchy-broadcast camera "Brio"` switch the camera under the open application, which keeps one stream with no black frame; `omarchy-broadcast off` closes the camera (LED off, application shows black) and `omarchy-broadcast on` restores it. The same through `busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast br.com.dias.OmarchyBroadcast1 SetEnabled b false` ([dbus-api.md](dbus-api.md)).
 5. **Close the consumer.** After the grace period (5 s) `state: idle` is printed, the camera is released and `nvidia-smi` lists no process.
-6. **Reload.** Change `idle_grace_s` in `~/.config/oma-broadcast/config.toml` and send `kill -HUP $(pidof oma-broadcastd)` (or `busctl ... ReloadConfig`); a typo in a key is rejected with `InvalidConfig` and the old value stays.
-7. **Exit.** Ctrl-C stops the daemon; `oma-broadcast status` then exits with status 3 and says the daemon is not running.
+6. **Reload.** Change `idle_grace_s` in `~/.config/omarchy-broadcast/config.toml` and send `kill -HUP $(pidof omarchy-broadcastd)` (or `busctl ... ReloadConfig`); a typo in a key is rejected with `InvalidConfig` and the old value stays.
+7. **Exit.** Ctrl-C stops the daemon; `omarchy-broadcast status` then exits with status 3 and says the daemon is not running.

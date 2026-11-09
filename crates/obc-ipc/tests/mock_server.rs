@@ -1,5 +1,5 @@
 //! The client proxy against a mock server implementing
-//! `br.com.dias.OmaBroadcast1`, over a peer-to-peer D-Bus connection on a
+//! `br.com.dias.OmarchyBroadcast1`, over a peer-to-peer D-Bus connection on a
 //! Unix socket pair: no session bus needed.
 //!
 //! The mock mirrors the daemon's contract (ADR-0011) closely enough to
@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use obc_ipc::{
-    CameraInfo, INTERFACE, INTERFACE_REVISION, IpcError, OBJECT_PATH, OmaBroadcastProxy, Snapshot,
-    State, Stats,
+    CameraInfo, INTERFACE, INTERFACE_REVISION, IpcError, OBJECT_PATH, OmarchyBroadcastProxy,
+    Snapshot, State, Stats,
 };
 use zbus::message::Flags;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
@@ -63,7 +63,7 @@ impl Mock {
     }
 }
 
-#[interface(name = "br.com.dias.OmaBroadcast1")]
+#[interface(name = "br.com.dias.OmarchyBroadcast1")]
 impl Mock {
     async fn set_enabled(
         &mut self,
@@ -250,7 +250,7 @@ impl Mock {
 /// no effect methods.
 struct Rev1;
 
-#[interface(name = "br.com.dias.OmaBroadcast1")]
+#[interface(name = "br.com.dias.OmarchyBroadcast1")]
 impl Rev1 {
     #[zbus(property)]
     fn state(&self) -> State {
@@ -326,7 +326,7 @@ async fn within<F: std::future::Future>(what: &str, f: F) -> F::Output {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_reads_every_property() {
     let (_server, client) = pair().await;
-    let proxy = OmaBroadcastProxy::new(&client).await.unwrap();
+    let proxy = OmarchyBroadcastProxy::new(&client).await.unwrap();
 
     let snap = within("snapshot", Snapshot::fetch(&proxy)).await.unwrap();
     assert_eq!(
@@ -356,8 +356,8 @@ async fn proxy_reads_every_property() {
 async fn a_revision_1_daemon_reads_with_defaults_for_the_newer_properties() {
     let (_server, client) = pair_serving(Rev1).await;
     for proxy in [
-        OmaBroadcastProxy::new(&client).await.unwrap(),
-        OmaBroadcastProxy::builder(&client)
+        OmarchyBroadcastProxy::new(&client).await.unwrap(),
+        OmarchyBroadcastProxy::builder(&client)
             .cache_properties(CacheProperties::No)
             .build()
             .await
@@ -379,7 +379,7 @@ async fn a_revision_1_daemon_reads_with_defaults_for_the_newer_properties() {
         .await
         .unwrap()
         .unwrap();
-    let proxy = OmaBroadcastProxy::new(&client).await.unwrap();
+    let proxy = OmarchyBroadcastProxy::new(&client).await.unwrap();
     assert_eq!(
         no_autostart,
         within("snapshot", Snapshot::fetch(&proxy)).await.unwrap()
@@ -423,7 +423,7 @@ async fn the_no_autostart_read_sees_every_property_and_carries_the_flag() {
     );
     let via_proxy = within(
         "proxy snapshot",
-        Snapshot::fetch(&OmaBroadcastProxy::new(&client).await.unwrap()),
+        Snapshot::fetch(&OmarchyBroadcastProxy::new(&client).await.unwrap()),
     )
     .await
     .unwrap();
@@ -441,7 +441,7 @@ async fn the_no_autostart_read_sees_every_property_and_carries_the_flag() {
 
     // A change, applied from PropertiesChanged-style values, matches a fresh
     // read.
-    let proxy = OmaBroadcastProxy::builder(&client)
+    let proxy = OmarchyBroadcastProxy::builder(&client)
         .cache_properties(CacheProperties::No)
         .build()
         .await
@@ -489,8 +489,8 @@ async fn proxy_calls_every_method_and_sees_changes() {
     // A caching proxy learns of changes from PropertiesChanged, which may
     // arrive after the method reply; an uncached one reads the server's
     // value at the time of the call.
-    let proxy = OmaBroadcastProxy::new(&client).await.unwrap();
-    let uncached = OmaBroadcastProxy::builder(&client)
+    let proxy = OmarchyBroadcastProxy::new(&client).await.unwrap();
+    let uncached = OmarchyBroadcastProxy::builder(&client)
         .cache_properties(CacheProperties::No)
         .build()
         .await
@@ -597,7 +597,7 @@ async fn proxy_calls_every_method_and_sees_changes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn errors_map_back_by_name() {
     let (_server, client) = pair().await;
-    let proxy = OmaBroadcastProxy::new(&client).await.unwrap();
+    let proxy = OmarchyBroadcastProxy::new(&client).await.unwrap();
 
     match within("SelectCamera", proxy.select_camera("nope")).await {
         Err(IpcError::NoSuchCamera(msg)) => assert!(msg.contains("nope"), "{msg}"),
@@ -608,7 +608,7 @@ async fn errors_map_back_by_name() {
             assert!(e.message().contains("unknown field"), "{e}");
             assert_eq!(
                 zbus::DBusError::name(&e).as_str(),
-                "br.com.dias.OmaBroadcast1.Error.InvalidConfig"
+                "br.com.dias.OmarchyBroadcast1.Error.InvalidConfig"
             );
         }
         other => panic!("expected InvalidConfig, got {other:?}"),
@@ -636,7 +636,7 @@ async fn errors_map_back_by_name() {
                 assert!(!e.message().is_empty(), "{what}");
                 assert_eq!(
                     zbus::DBusError::name(&e).as_str(),
-                    "br.com.dias.OmaBroadcast1.Error.InvalidArgument",
+                    "br.com.dias.OmarchyBroadcast1.Error.InvalidArgument",
                     "{what}"
                 );
             }
@@ -658,7 +658,7 @@ async fn errors_map_back_by_name() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stats_signal_reaches_the_client() {
     let (server, client) = pair().await;
-    let proxy = OmaBroadcastProxy::new(&client).await.unwrap();
+    let proxy = OmarchyBroadcastProxy::new(&client).await.unwrap();
     let mut stats = proxy.receive_stats().await.unwrap();
 
     let iface: InterfaceRef<Mock> = server.object_server().interface(OBJECT_PATH).await.unwrap();

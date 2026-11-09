@@ -1,4 +1,4 @@
-//! Shared pure types for oma-broadcast.
+//! Shared pure types for omarchy-broadcast.
 //!
 //! Nothing in this crate touches GStreamer or CUDA: it holds the value types
 //! every other crate agrees on (video modes, mode requests, device selectors,

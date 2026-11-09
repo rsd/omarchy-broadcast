@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
-# install-user.sh — install oma-broadcast from this checkout for the current
+# install-user.sh — install omarchy-broadcast from this checkout for the current
 # user, without root.
 #
 # Builds the release binaries and the os-release shim, and installs:
-#   oma-broadcastd, oma-broadcast  -> ${XDG_BIN_HOME:-~/.local/bin}/
-#   os-release shim                -> ~/.local/lib/oma-broadcast/os-release-shim.so
-#   its replacement os-release     -> ~/.local/lib/oma-broadcast/fake-os-release
-#                                     (from tools/maxine-probe/fake-os-release)
-#   systemd user unit              -> ${XDG_DATA_HOME:-~/.local/share}/systemd/user/oma-broadcastd.service
-#                                     (from dist/, ExecStart pointing at the installed daemon)
-#   D-Bus activation file          -> ${XDG_DATA_HOME:-~/.local/share}/dbus-1/services/br.com.dias.OmaBroadcast.service
-#   install manifest               -> ${XDG_STATE_HOME:-~/.local/state}/oma-broadcast/install-user.manifest
+#   omarchy-broadcastd, omarchy-broadcast -> ${XDG_BIN_HOME:-~/.local/bin}/
+#   os-release shim                       -> ~/.local/lib/omarchy-broadcast/os-release-shim.so
+#   its replacement os-release            -> ~/.local/lib/omarchy-broadcast/fake-os-release
+#                                            (from tools/maxine-probe/fake-os-release)
+#   systemd user unit                     -> ${XDG_DATA_HOME:-~/.local/share}/systemd/user/omarchy-broadcastd.service
+#                                            (from dist/, ExecStart pointing at the installed daemon)
+#   D-Bus activation file                 -> ${XDG_DATA_HOME:-~/.local/share}/dbus-1/services/br.com.dias.OmarchyBroadcast.service
+#   install manifest                      -> ${XDG_STATE_HOME:-~/.local/state}/omarchy-broadcast/install-user.manifest
 # and, with --mic, the noise-removed microphone:
-#   its PipeWire configurations    -> ${XDG_DATA_HOME:-~/.local/share}/oma-broadcast/pipewire/
-#                                     (oma-broadcast-mic-rnnoise.conf and
-#                                     oma-broadcast-mic-deepfilter.conf, from dist/pipewire/)
-#   its systemd user unit template -> ${XDG_DATA_HOME:-~/.local/share}/systemd/user/oma-broadcast-mic@.service
-#                                     (from dist/, ExecStart pointing at the installed configurations)
+#   its PipeWire configurations           -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/pipewire/
+#                                            (omarchy-broadcast-mic-rnnoise.conf and
+#                                            omarchy-broadcast-mic-deepfilter.conf, from dist/pipewire/)
+#   its systemd user unit template        -> ${XDG_DATA_HOME:-~/.local/share}/systemd/user/omarchy-broadcast-mic@.service
+#                                            (from dist/, ExecStart pointing at the installed configurations)
 #
 # The shim (tools/os-release-shim, an LD_PRELOAD library that makes only the
 # daemon's reads of /etc/os-release return the replacement file) is what the
 # NVIDIA Maxine SDK needs on a distribution it does not list. The directory
-# is fixed because it must match dist/systemd/oma-broadcastd.service.d/maxine.conf
-# (%h/.local/lib/oma-broadcast/...). By default the shim is built with `make`
+# is fixed because it must match dist/systemd/omarchy-broadcastd.service.d/maxine.conf
+# (%h/.local/lib/omarchy-broadcast/...). By default the shim is built with `make`
 # and ${CC:-cc} whenever both are available, and skipped with a one-line note
 # when either is missing (not an error); a shim build that fails is an error
 # (exit 1, before anything is changed; use --no-shim to go on without it).
@@ -49,9 +49,9 @@
 #                it, microphone files installed by an earlier run stay in
 #                place and in the manifest, so --uninstall still removes them.
 #   --uninstall  Remove what this script installed, and only that, including
-#                ~/.local/lib/oma-broadcast and the microphone's
-#                ~/.local/share/oma-broadcast/pipewire and
-#                ~/.local/share/oma-broadcast once they are empty.
+#                ~/.local/lib/omarchy-broadcast and the microphone's
+#                ~/.local/share/omarchy-broadcast/pipewire and
+#                ~/.local/share/omarchy-broadcast once they are empty.
 #   -h, --help   Show this help.
 #
 # Ownership: every text file it writes carries a marker comment line, and the
@@ -68,14 +68,14 @@
 # 2 usage error or unusable environment.
 set -euo pipefail
 
-MARKER='# Installed by oma-broadcast scripts/install-user.sh; remove with scripts/install-user.sh --uninstall'
-BINARIES=(oma-broadcastd oma-broadcast)
+MARKER='# Installed by omarchy-broadcast scripts/install-user.sh; remove with scripts/install-user.sh --uninstall'
+BINARIES=(omarchy-broadcastd omarchy-broadcast)
 # File names whose ownership is the manifest checksum, not a marker line.
 SUMMED=("${BINARIES[@]}" os-release-shim.so fake-os-release)
-UNIT_NAME=oma-broadcastd.service
-DBUS_NAME=br.com.dias.OmaBroadcast.service
-MIC_UNIT_NAME=oma-broadcast-mic@.service
-MIC_CONFS=(oma-broadcast-mic-rnnoise.conf oma-broadcast-mic-deepfilter.conf)
+UNIT_NAME=omarchy-broadcastd.service
+DBUS_NAME=br.com.dias.OmarchyBroadcast.service
+MIC_UNIT_NAME=omarchy-broadcast-mic@.service
+MIC_CONFS=(omarchy-broadcast-mic-rnnoise.conf omarchy-broadcast-mic-deepfilter.conf)
 
 usage() {
   sed -n '2,/^set -euo pipefail$/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0"
@@ -125,13 +125,13 @@ xdg_dir() {
 repo=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd)
 bin_dir=$(xdg_dir XDG_BIN_HOME "$HOME/.local/bin")
 data_dir=$(xdg_dir XDG_DATA_HOME "$HOME/.local/share")
-state_dir=$(xdg_dir XDG_STATE_HOME "$HOME/.local/state")/oma-broadcast
+state_dir=$(xdg_dir XDG_STATE_HOME "$HOME/.local/state")/omarchy-broadcast
 config_dir=$(xdg_dir XDG_CONFIG_HOME "$HOME/.config")
 # Absolute, as cargo resolves a relative CARGO_TARGET_DIR (against the cwd):
 # make runs in tools/os-release-shim, so a relative OUT would land elsewhere.
 target_dir=$(realpath -m -- "${CARGO_TARGET_DIR:-$repo/target}")
 # No XDG variable exists for this; it must match the Maxine drop-in.
-lib_dir=$HOME/.local/lib/oma-broadcast
+lib_dir=$HOME/.local/lib/omarchy-broadcast
 
 unit_src=$repo/dist/systemd/$UNIT_NAME
 dbus_src=$repo/dist/dbus-1/services/$DBUS_NAME
@@ -145,7 +145,7 @@ shim_dst=$lib_dir/os-release-shim.so
 fake_dst=$lib_dir/fake-os-release
 mic_unit_src=$repo/dist/systemd/$MIC_UNIT_NAME
 mic_unit_dst=$data_dir/systemd/user/$MIC_UNIT_NAME
-mic_conf_dir=$data_dir/oma-broadcast/pipewire
+mic_conf_dir=$data_dir/omarchy-broadcast/pipewire
 
 bin_dsts=()
 for b in "${BINARIES[@]}"; do bin_dsts+=("$bin_dir/$b"); done
@@ -325,10 +325,10 @@ if [[ $mode == uninstall ]]; then
 
   # Removing the file of an enabled unit leaves a dangling enable link:
   # disable it first.
-  # A microphone instance's link (pipewire.service.wants/oma-broadcast-mic@
+  # A microphone instance's link (pipewire.service.wants/omarchy-broadcast-mic@
   # rnnoise.service) points at the template unit file.
   enabled=0 mic_links=()
-  for link in "$config_dir"/systemd/user/*.wants/{"$UNIT_NAME",oma-broadcast-mic@*.service}; do
+  for link in "$config_dir"/systemd/user/*.wants/{"$UNIT_NAME",omarchy-broadcast-mic@*.service}; do
     [[ -L $link ]] || continue
     unit=$UNIT_NAME
     [[ ${link##*/} == "$UNIT_NAME" ]] || unit=$MIC_UNIT_NAME
@@ -341,7 +341,7 @@ if [[ $mode == uninstall ]]; then
   done
   if ((enabled || ${#mic_links[@]})); then
     printf 'install-user: run this first, then re-run --uninstall:\n' >&2
-    ((!enabled)) || printf '  systemctl --user disable --now oma-broadcastd\n' >&2
+    ((!enabled)) || printf '  systemctl --user disable --now omarchy-broadcastd\n' >&2
     if ((${#mic_links[@]})); then
       mapfile -t mic_links < <(printf '%s\n' "${mic_links[@]}" | sort -u)
       printf '  systemctl --user disable --now' >&2
@@ -362,21 +362,21 @@ if [[ $mode == uninstall ]]; then
     case ${path##*/} in
       os-release-shim.so | fake-os-release) lib_dirs+=("${path%/*}") ;;
       "$MIC_UNIT_NAME") mic_removed=1 ;;
-      oma-broadcast-mic-*.conf) mic_removed=1 mic_dirs+=("${path%/*}") ;;
+      omarchy-broadcast-mic-*.conf) mic_removed=1 mic_dirs+=("${path%/*}") ;;
     esac
   done
   # The library directory goes once it is empty (rmdir only removes an empty one).
   if ((${#lib_dirs[@]})); then
     while IFS= read -r path; do
-      if [[ ${path##*/} == oma-broadcast ]]; then
+      if [[ ${path##*/} == omarchy-broadcast ]]; then
         run rmdir --ignore-fail-on-non-empty -- "$path"
       fi
     done < <(printf '%s\n' "${lib_dirs[@]}" | sort -u)
   fi
-  # So do the microphone's oma-broadcast/pipewire and oma-broadcast.
+  # So do the microphone's omarchy-broadcast/pipewire and omarchy-broadcast.
   if ((${#mic_dirs[@]})); then
     while IFS= read -r path; do
-      if [[ $path == */oma-broadcast/pipewire ]]; then
+      if [[ $path == */omarchy-broadcast/pipewire ]]; then
         run rmdir --ignore-fail-on-non-empty -- "$path" "${path%/*}"
       fi
     done < <(printf '%s\n' "${mic_dirs[@]}" | sort -u)
@@ -396,7 +396,7 @@ if [[ $mode == uninstall ]]; then
 
 $done_msg
 Next steps (not run by this script):
-  systemctl --user stop oma-broadcastd    # if it is still running
+  systemctl --user stop omarchy-broadcastd    # if it is still running
   systemctl --user daemon-reload
 EOF
   if ((${#lib_dirs[@]})); then
@@ -404,7 +404,7 @@ EOF
 
 The os-release shim is gone. If you activated the Maxine drop-in, remove it
 too, since it now points at removed files:
-  rm $(printf '%q' "$config_dir/systemd/user/oma-broadcastd.service.d/maxine.conf")
+  rm $(printf '%q' "$config_dir/systemd/user/omarchy-broadcastd.service.d/maxine.conf")
   systemctl --user daemon-reload
 EOF
   fi
@@ -413,7 +413,7 @@ EOF
 
 The noise-removed microphone is gone; stop any instance still running and
 reload:
-  systemctl --user stop 'oma-broadcast-mic@*.service'
+  systemctl --user stop 'omarchy-broadcast-mic@*.service'
   systemctl --user daemon-reload
 EOF
   fi
@@ -427,7 +427,7 @@ fi
 
 # The shipped unit must have exactly one ExecStart naming the daemon, whatever
 # its path (/usr/bin for the package, %h/.cargo/bin in older checkouts).
-exec_re='^ExecStart=.*oma-broadcastd$'
+exec_re='^ExecStart=.*omarchy-broadcastd$'
 n=$(grep -c -- "$exec_re" "$unit_src" || true)
 ((n == 1)) || {
   printf 'install-user: expected exactly one line matching %s in %s, found %s\n' "$exec_re" "$unit_src" "$n" >&2
@@ -437,7 +437,7 @@ n=$(grep -c -- "$exec_re" "$unit_src" || true)
 # The microphone unit's ExecStart names its configuration by file name, which
 # PipeWire does not look up under XDG_DATA_HOME: it is rewritten to the
 # installed path, so the data dir must need no escaping there either.
-mic_exec_re='^ExecStart=/usr/bin/pipewire -c oma-broadcast-mic-%i\.conf$'
+mic_exec_re='^ExecStart=/usr/bin/pipewire -c omarchy-broadcast-mic-%i\.conf$'
 if ((want_mic)); then
   [[ -f $mic_unit_src ]] || die "missing $mic_unit_src"
   for c in "${MIC_CONFS[@]}"; do
@@ -503,7 +503,7 @@ if ((do_shim)); then shim_dsts=("$shim_dst" "$fake_dst"); fi
 check_targets "${bin_dsts[@]}" "${shim_dsts[@]}" "$unit_dst" "$dbus_dst" "${mic_dsts[@]}" "$manifest"
 
 if ((build)); then
-  run cargo build --manifest-path "$repo/Cargo.toml" --release --locked -p oma-broadcastd -p oma-broadcast || {
+  run cargo build --manifest-path "$repo/Cargo.toml" --release --locked -p omarchy-broadcastd -p omarchy-broadcast || {
     printf 'install-user: cargo build failed; nothing was changed\n' >&2
     exit 1
   }
@@ -568,7 +568,7 @@ put_text "$manifest" manifest_text "${new_sums[@]}"
 unit_text() {
   echo "$MARKER"
   echo "# Generated from dist/systemd/$UNIT_NAME; ExecStart points at the installed binary."
-  sed "s|$exec_re|ExecStart=$bin_dir/oma-broadcastd|" "$unit_src"
+  sed "s|$exec_re|ExecStart=$bin_dir/omarchy-broadcastd|" "$unit_src"
 }
 put_text "$unit_dst" unit_text
 
@@ -588,25 +588,25 @@ if ((want_mic)); then
   mic_unit_text() {
     echo "$MARKER"
     echo "# Generated from dist/systemd/$MIC_UNIT_NAME; ExecStart points at the installed configuration."
-    sed "s|$mic_exec_re|ExecStart=/usr/bin/pipewire -c $mic_conf_dir/oma-broadcast-mic-%i.conf|" "$mic_unit_src"
+    sed "s|$mic_exec_re|ExecStart=/usr/bin/pipewire -c $mic_conf_dir/omarchy-broadcast-mic-%i.conf|" "$mic_unit_src"
   }
   put_text "$mic_unit_dst" mic_unit_text
 fi
 
 if [[ -e $config_dir/systemd/user/$UNIT_NAME ]]; then
-  warn "$config_dir/systemd/user/$UNIT_NAME exists and takes precedence over $unit_dst, which it shadows; to use the new unit: systemctl --user disable oma-broadcastd, then remove that file"
+  warn "$config_dir/systemd/user/$UNIT_NAME exists and takes precedence over $unit_dst, which it shadows; to use the new unit: systemctl --user disable omarchy-broadcastd, then remove that file"
 fi
 if ((want_mic)) && [[ -e $config_dir/systemd/user/$MIC_UNIT_NAME ]]; then
-  warn "$config_dir/systemd/user/$MIC_UNIT_NAME exists and takes precedence over $mic_unit_dst, which it shadows; to use the new unit: systemctl --user disable oma-broadcast-mic@rnnoise.service oma-broadcast-mic@deepfilter.service, then remove that file"
+  warn "$config_dir/systemd/user/$MIC_UNIT_NAME exists and takes precedence over $mic_unit_dst, which it shadows; to use the new unit: systemctl --user disable omarchy-broadcast-mic@rnnoise.service omarchy-broadcast-mic@deepfilter.service, then remove that file"
 fi
 case ":${PATH:-}:" in
   *":$bin_dir:"*) ;;
-  *) warn "$bin_dir is not on PATH; the oma-broadcast CLI must be called by its full path" ;;
+  *) warn "$bin_dir is not on PATH; the omarchy-broadcast CLI must be called by its full path" ;;
 esac
 
-plugin=$repo/clients/omarchy-bar/br.com.dias.oma-broadcast
-wp_src=$repo/dist/systemd/wireplumber.service.d/oma-broadcast.conf
-maxine_src=$repo/dist/systemd/oma-broadcastd.service.d/maxine.conf
+plugin=$repo/clients/omarchy-bar/br.com.dias.omarchy-broadcast
+wp_src=$repo/dist/systemd/wireplumber.service.d/omarchy-broadcast.conf
+maxine_src=$repo/dist/systemd/omarchy-broadcastd.service.d/maxine.conf
 done_msg="Installed."
 ((!dry_run)) || done_msg="Dry run: nothing was changed."
 cat <<EOF
@@ -614,17 +614,17 @@ cat <<EOF
 $done_msg
 Next steps (not run by this script):
   systemctl --user daemon-reload
-  systemctl --user enable --now oma-broadcastd
-  (already running: systemctl --user restart oma-broadcastd)
+  systemctl --user enable --now omarchy-broadcastd
+  (already running: systemctl --user restart omarchy-broadcastd)
 
 Optional, start WirePlumber after the daemon so PipeWire lists the virtual
 camera (see $(printf '%q' "$wp_src")):
-  install -Dm644 $(printf '%q' "$wp_src") $(printf '%q' "$config_dir/systemd/user/wireplumber.service.d/oma-broadcast.conf")
+  install -Dm644 $(printf '%q' "$wp_src") $(printf '%q' "$config_dir/systemd/user/wireplumber.service.d/omarchy-broadcast.conf")
   systemctl --user daemon-reload
 
 Optional, the Omarchy bar plugin:
-  mkdir -p ~/.config/omarchy/plugins && ln -s $(printf '%q' "$plugin") ~/.config/omarchy/plugins/br.com.dias.oma-broadcast
-  omarchy plugin enable br.com.dias.oma-broadcast
+  mkdir -p ~/.config/omarchy/plugins && ln -s $(printf '%q' "$plugin") ~/.config/omarchy/plugins/br.com.dias.omarchy-broadcast
+  omarchy plugin enable br.com.dias.omarchy-broadcast
 EOF
 if ((do_shim)); then
   cat <<EOF
@@ -632,9 +632,9 @@ if ((do_shim)); then
 Optional, NVIDIA Maxine video effects (the os-release shim is installed in
 $(printf '%q' "$lib_dir")): install the Maxine SDK as described in
 docs/setup/maxine.md, then activate the shim for the daemon only:
-  install -Dm644 $(printf '%q' "$maxine_src") $(printf '%q' "$config_dir/systemd/user/oma-broadcastd.service.d/maxine.conf")
+  install -Dm644 $(printf '%q' "$maxine_src") $(printf '%q' "$config_dir/systemd/user/omarchy-broadcastd.service.d/maxine.conf")
   systemctl --user daemon-reload
-  systemctl --user restart oma-broadcastd
+  systemctl --user restart omarchy-broadcastd
 EOF
 fi
 if ((want_mic)); then
@@ -643,9 +643,9 @@ if ((want_mic)); then
 Optional, the noise-removed microphone (see docs/setup/microphone.md); run
 one instance at a time:
   systemctl --user daemon-reload
-  systemctl --user enable --now oma-broadcast-mic@rnnoise.service
+  systemctl --user enable --now omarchy-broadcast-mic@rnnoise.service
     (RNNoise, the default; needs the package noise-suppression-for-voice)
   or, with DeepFilterNet (needs the package deepfilternet-ladspa):
-  systemctl --user enable --now oma-broadcast-mic@deepfilter.service
+  systemctl --user enable --now omarchy-broadcast-mic@deepfilter.service
 EOF
 fi

@@ -7,8 +7,8 @@
 - Settings must survive reboots without any GUI.
 
 ## Decision
-- `oma-broadcastd` is a systemd user service and is the product. Every frontend is an optional D-Bus client.
-- Settings live in `~/.config/oma-broadcast/config.toml`.
+- `omarchy-broadcastd` is a systemd user service and is the product. Every frontend is an optional D-Bus client.
+- Settings live in `~/.config/omarchy-broadcast/config.toml`.
 - D-Bus changes are written back to the file.
 - Hand edits are hot-reloaded through inotify; the daemon ignores its own writes by content hash.
 

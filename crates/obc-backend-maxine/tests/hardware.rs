@@ -8,7 +8,7 @@
 //! ```text
 //! export MAXINE_VFX_ROOT=~/.local/opt/maxine/VideoFX
 //! source tools/maxine-probe/env.sh
-//! export OMA_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release
+//! export OMARCHY_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release
 //! CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env LD_PRELOAD=$PWD/target/os-release-shim/os-release-shim.so" \
 //!   cargo test -p obc-backend-maxine --test hardware -- --ignored --test-threads=1 --nocapture
 //! ```

@@ -1,6 +1,6 @@
 [package]
 name = "obc-backend-maxine"
-description = "NVIDIA Maxine Video Effects backend (runtime dlopen) for oma-broadcast"
+description = "NVIDIA Maxine Video Effects backend (runtime dlopen) for omarchy-broadcast"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

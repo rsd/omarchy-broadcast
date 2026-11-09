@@ -1,4 +1,4 @@
-//! Device discovery, pipeline building and measurement for oma-broadcast.
+//! Device discovery, pipeline building and measurement for omarchy-broadcast.
 //!
 //! Selects the camera (and its capture mode, from the capabilities it
 //! enumerates) and the v4l2loopback sink, and runs the stream in three

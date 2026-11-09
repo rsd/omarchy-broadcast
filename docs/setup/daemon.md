@@ -1,6 +1,6 @@
-# Running oma-broadcastd as a user service
+# Running omarchy-broadcastd as a user service
 
-`oma-broadcastd` is the headless daemon behind the virtual camera. It runs as a systemd user service, owns the D-Bus name `br.com.dias.OmaBroadcast` on the session bus, and starts the camera and the GPU pipeline only while an application is using the virtual camera ([architecture.md](../architecture.md), [ADR-0011](../adr/0011-daemon-lifecycle-and-dbus-api.md)). Nothing is installed by the build. There are three ways to install it: the Arch package, a per-user install with `scripts/install-user.sh`, and a manual install. The last two need no root.
+`omarchy-broadcastd` is the headless daemon behind the virtual camera. It runs as a systemd user service, owns the D-Bus name `br.com.dias.OmarchyBroadcast` on the session bus, and starts the camera and the GPU pipeline only while an application is using the virtual camera ([architecture.md](../architecture.md), [ADR-0011](../adr/0011-daemon-lifecycle-and-dbus-api.md)). Nothing is installed by the build. There are three ways to install it: the Arch package, a per-user install with `scripts/install-user.sh`, and a manual install. The last two need no root.
 
 ## Prerequisites
 
@@ -12,27 +12,27 @@
 
 ### Arch package
 
-`packaging/arch/PKGBUILD` builds `oma-broadcast-git` from the committed HEAD of the local checkout (uncommitted changes are not included). Build from `packaging/arch`, then install the result:
+`packaging/arch/PKGBUILD` builds `omarchy-broadcast-git` from the committed HEAD of the local checkout (uncommitted changes are not included). Build from `packaging/arch`, then install the result:
 
 ```sh
 cd packaging/arch
 makepkg -s
-sudo pacman -U oma-broadcast-git-*.pkg.tar.zst
+sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst
 ```
 
 The package installs:
 
-- `/usr/bin/oma-broadcastd` and `/usr/bin/oma-broadcast`;
-- the unit `/usr/lib/systemd/user/oma-broadcastd.service`;
-- the D-Bus activation file `/usr/share/dbus-1/services/br.com.dias.OmaBroadcast.service`;
-- the Omarchy bar plugin in `/usr/share/oma-broadcast/omarchy-bar/br.com.dias.oma-broadcast/` ([link it](../../clients/omarchy-bar/README.md#install));
-- the licences and this documentation, in `/usr/share/doc/oma-broadcast/`;
-- the optional drop-ins as inactive examples in `/usr/share/doc/oma-broadcast/examples/systemd/` (`wireplumber.service.d/oma-broadcast.conf`, see "Discovery by PipeWire", and `oma-broadcastd.service.d/maxine.conf`, see [maxine.md](maxine.md#7a-the-daemon-systemd-user-unit)).
+- `/usr/bin/omarchy-broadcastd` and `/usr/bin/omarchy-broadcast`;
+- the unit `/usr/lib/systemd/user/omarchy-broadcastd.service`;
+- the D-Bus activation file `/usr/share/dbus-1/services/br.com.dias.OmarchyBroadcast.service`;
+- the Omarchy bar plugin in `/usr/share/omarchy-broadcast/omarchy-bar/br.com.dias.omarchy-broadcast/` ([link it](../../clients/omarchy-bar/README.md#install));
+- the licences and this documentation, in `/usr/share/doc/omarchy-broadcast/`;
+- the optional drop-ins as inactive examples in `/usr/share/doc/omarchy-broadcast/examples/systemd/` (`wireplumber.service.d/omarchy-broadcast.conf`, see "Discovery by PipeWire", and `omarchy-broadcastd.service.d/maxine.conf`, see [maxine.md](maxine.md#7a-the-daemon-systemd-user-unit)).
 
 Nothing is enabled. Each user runs:
 
 ```sh
-systemctl --user enable --now oma-broadcastd
+systemctl --user enable --now omarchy-broadcastd
 ```
 
 The runtime dependencies include the NVIDIA driver userspace (`nvidia-utils`), `cuda` (NVRTC, used by GStreamer's CUDA converters), `gst-plugins-good`, `gst-plugins-bad-libs` and a v4l2loopback kernel module (for example `v4l2loopback-dkms`). The loopback device must still be configured as in [loopback.md](loopback.md). The NVIDIA Maxine VFX SDK is never part of the package; install it as in [maxine.md](maxine.md) (the os-release override described there still needs a source checkout).
@@ -47,11 +47,11 @@ scripts/install-user.sh
 
 The script builds the release binaries and installs, without root:
 
-- `oma-broadcastd` and `oma-broadcast` in `${XDG_BIN_HOME:-~/.local/bin}`;
+- `omarchy-broadcastd` and `omarchy-broadcast` in `${XDG_BIN_HOME:-~/.local/bin}`;
 - the unit in `${XDG_DATA_HOME:-~/.local/share}/systemd/user/`, with `ExecStart=` pointing at the installed daemon;
 - the D-Bus activation file in `${XDG_DATA_HOME:-~/.local/share}/dbus-1/services/`;
-- optionally, the os-release shim for the Maxine backend, `os-release-shim.so` and `fake-os-release`, in `~/.local/lib/oma-broadcast/`: built when `make` and a C compiler are present, skipped with `--no-shim` (see [the os-release override](maxine.md#7-the-os-release-override));
-- a manifest, `install-user.manifest`, in `${XDG_STATE_HOME:-~/.local/state}/oma-broadcast/`, which lists every path written and the sha256 of each binary.
+- optionally, the os-release shim for the Maxine backend, `os-release-shim.so` and `fake-os-release`, in `~/.local/lib/omarchy-broadcast/`: built when `make` and a C compiler are present, skipped with `--no-shim` (see [the os-release override](maxine.md#7-the-os-release-override));
+- a manifest, `install-user.manifest`, in `${XDG_STATE_HOME:-~/.local/state}/omarchy-broadcast/`, which lists every path written and the sha256 of each binary.
 
 Behaviour:
 
@@ -67,7 +67,7 @@ Then load and start the service:
 
 ```sh
 systemctl --user daemon-reload
-systemctl --user enable --now oma-broadcastd
+systemctl --user enable --now omarchy-broadcastd
 ```
 
 ### Manual install
@@ -75,53 +75,53 @@ systemctl --user enable --now oma-broadcastd
 1. Install the daemon and the command-line client into `~/.cargo/bin`, from the repository root.
 
    ```sh
-   cargo install --path crates/oma-broadcastd
-   cargo install --path crates/oma-broadcast
+   cargo install --path crates/omarchy-broadcastd
+   cargo install --path crates/omarchy-broadcast
    ```
 
-2. Install the unit file with `ExecStart=` rewritten. The file in `dist/` names `/usr/bin/oma-broadcastd`, the path of the package; copied unchanged after `cargo install`, the service fails to start (status 203/EXEC).
+2. Install the unit file with `ExecStart=` rewritten. The file in `dist/` names `/usr/bin/omarchy-broadcastd`, the path of the package; copied unchanged after `cargo install`, the service fails to start (status 203/EXEC).
 
    ```sh
    mkdir -p ~/.config/systemd/user
    sed 's|^ExecStart=/usr/bin/|ExecStart=%h/.cargo/bin/|' \
-       dist/systemd/oma-broadcastd.service \
-       > ~/.config/systemd/user/oma-broadcastd.service
+       dist/systemd/omarchy-broadcastd.service \
+       > ~/.config/systemd/user/omarchy-broadcastd.service
    ```
 
-3. Optional, D-Bus activation: with this file, a command such as `oma-broadcast on` starts the service if it is not running. Reads (`oma-broadcast status`, `watch`) never start it. See [dbus-api.md](../dbus-api.md#service-presence-and-activation).
+3. Optional, D-Bus activation: with this file, a command such as `omarchy-broadcast on` starts the service if it is not running. Reads (`omarchy-broadcast status`, `watch`) never start it. See [dbus-api.md](../dbus-api.md#service-presence-and-activation).
 
    ```sh
-   install -Dm644 dist/dbus-1/services/br.com.dias.OmaBroadcast.service \
-       ~/.local/share/dbus-1/services/br.com.dias.OmaBroadcast.service
+   install -Dm644 dist/dbus-1/services/br.com.dias.OmarchyBroadcast.service \
+       ~/.local/share/dbus-1/services/br.com.dias.OmarchyBroadcast.service
    ```
 
-4. Optional, discovery through PipeWire: a drop-in that orders WirePlumber after the daemon (see below). In a checkout it is `dist/systemd/wireplumber.service.d/oma-broadcast.conf`; the package ships the same file as an example at `/usr/share/doc/oma-broadcast/examples/systemd/wireplumber.service.d/oma-broadcast.conf`.
+4. Optional, discovery through PipeWire: a drop-in that orders WirePlumber after the daemon (see below). In a checkout it is `dist/systemd/wireplumber.service.d/omarchy-broadcast.conf`; the package ships the same file as an example at `/usr/share/doc/omarchy-broadcast/examples/systemd/wireplumber.service.d/omarchy-broadcast.conf`.
 
    ```sh
-   install -Dm644 dist/systemd/wireplumber.service.d/oma-broadcast.conf \
-       ~/.config/systemd/user/wireplumber.service.d/oma-broadcast.conf
+   install -Dm644 dist/systemd/wireplumber.service.d/omarchy-broadcast.conf \
+       ~/.config/systemd/user/wireplumber.service.d/omarchy-broadcast.conf
    ```
 
 5. Load the units and start the service now and at every login:
 
    ```sh
    systemctl --user daemon-reload
-   systemctl --user enable --now oma-broadcastd
+   systemctl --user enable --now omarchy-broadcastd
    ```
 
-   If the service was enabled before from an older copy of the unit, run `systemctl --user reenable oma-broadcastd` so that it is wanted by `default.target`.
+   If the service was enabled before from an older copy of the unit, run `systemctl --user reenable omarchy-broadcastd` so that it is wanted by `default.target`.
 
 The same drop-in applies to the other two routes (step 4); the package does not install it.
 
 ### Which unit is used
 
-systemd searches the user unit directories in this order and uses the first match: `~/.config/systemd/user`, then `~/.local/share/systemd/user`, then `/usr/lib/systemd/user`. A copy of the unit in a directory earlier in the list shadows the others. In particular, an older manual copy in `~/.config/systemd/user` keeps starting `~/.cargo/bin/oma-broadcastd` after the package is installed; remove it (and run `systemctl --user daemon-reload`) to use the packaged unit. `systemctl --user cat oma-broadcastd` shows which file is in force.
+systemd searches the user unit directories in this order and uses the first match: `~/.config/systemd/user`, then `~/.local/share/systemd/user`, then `/usr/lib/systemd/user`. A copy of the unit in a directory earlier in the list shadows the others. In particular, an older manual copy in `~/.config/systemd/user` keeps starting `~/.cargo/bin/omarchy-broadcastd` after the package is installed; remove it (and run `systemctl --user daemon-reload`) to use the packaged unit. `systemctl --user cat omarchy-broadcastd` shows which file is in force.
 
 Check it:
 
 ```sh
-systemctl --user status oma-broadcastd
-oma-broadcast status
+systemctl --user status omarchy-broadcastd
+omarchy-broadcast status
 ```
 
 The service is ready (`Type=dbus`) once it owns its bus name, which it requests after the loopback writer has started: at that point the virtual camera is already listed as a capture device.
@@ -144,27 +144,27 @@ Optionally the daemon also registers a native PipeWire video source, "Omarchy Br
 **Build.** The Arch package is built with the feature. From source, build or install with it; it needs the libpipewire headers and clang at build time and links `libpipewire-0.3`:
 
 ```sh
-cargo build --release --features oma-broadcastd/pipewire
-cargo install --path crates/oma-broadcastd --features pipewire
+cargo build --release --features omarchy-broadcastd/pipewire
+cargo install --path crates/omarchy-broadcastd --features pipewire
 ```
 
 `scripts/install-user.sh` builds without it.
 
-**Enable.** In `~/.config/oma-broadcast/config.toml`:
+**Enable.** In `~/.config/omarchy-broadcast/config.toml`:
 
 ```toml
 [pipewire]
 enabled = true
 ```
 
-Then reload (`systemctl --user reload oma-broadcastd`). The node appears at once. Setting it back to `false` removes it at once if no application is linked to it, otherwise when the last one leaves. The loopback is not touched either way. The node exists only while the loopback writer runs.
+Then reload (`systemctl --user reload omarchy-broadcastd`). The node appears at once. Setting it back to `false` removes it at once if no application is linked to it, otherwise when the last one leaves. The loopback is not touched either way. The node exists only while the loopback writer runs.
 
 **Check.**
 
 ```sh
-oma-broadcast status          # Consumers: 0 (loopback 0, PipeWire 0), PipeWire: ready
-pw-cli ls Node | grep -B2 -A8 oma-broadcast
-gst-launch-1.0 pipewiresrc target-object=oma-broadcast ! videoconvert ! autovideosink
+omarchy-broadcast status          # Consumers: 0 (loopback 0, PipeWire 0), PipeWire: ready
+pw-cli ls Node | grep -B2 -A8 omarchy-broadcast
+gst-launch-1.0 pipewiresrc target-object=omarchy-broadcast ! videoconvert ! autovideosink
 ```
 
 `PipeWire:` in `status` is `ready` when the node is registered, `streaming` while an application is linked, `failed` when PipeWire is not running or the connection was lost (retried every 2 s; the daemon stays usable and the loopback keeps working), and `unsupported` when the configuration enables it in a daemon built without the feature. A PipeWire consumer starts the camera like a loopback consumer does, and `Consumers` is the total of both kinds.
@@ -210,7 +210,7 @@ Upstream:
 
 ### Hiding the duplicate
 
-Once WirePlumber has probed the loopback while the writer streams, PipeWire lists "Omarchy Broadcast" twice: the native node, and the loopback through v4l2. To hide the loopback from PipeWire only, create `~/.config/wireplumber/wireplumber.conf.d/50-oma-broadcast.conf`:
+Once WirePlumber has probed the loopback while the writer streams, PipeWire lists "Omarchy Broadcast" twice: the native node, and the loopback through v4l2. To hide the loopback from PipeWire only, create `~/.config/wireplumber/wireplumber.conf.d/50-omarchy-broadcast.conf`:
 
 ```
 monitor.v4l2.rules = [
@@ -223,25 +223,25 @@ and run `systemctl --user restart wireplumber`. Applications that open `/dev/vid
 
 ## Configuration
 
-The configuration is `~/.config/oma-broadcast/config.toml` (`$XDG_CONFIG_HOME/oma-broadcast/config.toml`). It is optional: a missing file means the defaults. [config.example.toml](../config.example.toml) lists every key with its default and a comment. The daemon never writes this file.
+The configuration is `~/.config/omarchy-broadcast/config.toml` (`$XDG_CONFIG_HOME/omarchy-broadcast/config.toml`). It is optional: a missing file means the defaults. [config.example.toml](../config.example.toml) lists every key with its default and a comment. The daemon never writes this file.
 
 After editing it, reload without restarting:
 
 ```sh
-systemctl --user reload oma-broadcastd     # sends SIGHUP
-oma-broadcast status                       # shows Error: if the file was rejected
+systemctl --user reload omarchy-broadcastd     # sends SIGHUP
+omarchy-broadcast status                       # shows Error: if the file was rejected
 ```
 
-`busctl --user call br.com.dias.OmaBroadcast /br/com/dias/OmaBroadcast br.com.dias.OmaBroadcast1 ReloadConfig` does the same and returns the reason on failure. An invalid file is rejected as a whole: the previous configuration stays in force and the `Error` property names the file, line and key.
+`busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast br.com.dias.OmarchyBroadcast1 ReloadConfig` does the same and returns the reason on failure. An invalid file is rejected as a whole: the previous configuration stays in force and the `Error` property names the file, line and key.
 
-Settings changed while the daemon runs (`oma-broadcast on` / `off`, the camera selection and the video effect with its blur strength and background image) are kept in a separate state file, `~/.local/state/oma-broadcast/state.toml` (`$XDG_STATE_HOME/oma-broadcast/state.toml`), so that `config.toml` keeps its comments and layout. The state file is written by the daemon. If the state file cannot be read, the daemon starts `off` and says why in `Error`: privacy fails closed.
+Settings changed while the daemon runs (`omarchy-broadcast on` / `off`, the camera selection and the video effect with its blur strength and background image) are kept in a separate state file, `~/.local/state/omarchy-broadcast/state.toml` (`$XDG_STATE_HOME/omarchy-broadcast/state.toml`), so that `config.toml` keeps its comments and layout. The state file is written by the daemon. If the state file cannot be read, the daemon starts `off` and says why in `Error`: privacy fails closed.
 
 The paths can be overridden with `--config PATH` and `--state PATH` in a copy of the unit file.
 
 ## Logs
 
 ```sh
-journalctl --user -u oma-broadcastd -f
+journalctl --user -u omarchy-broadcastd -f
 ```
 
 Add `-v` to `ExecStart` for debug output (consumer counts, teardown times). Exit status 3 means another instance already owns the bus name; systemd does not restart the service on that status.
@@ -251,20 +251,20 @@ Add `-v` to `ExecStart` for debug output (consumer counts, teardown times). Exit
 Stop and disable the service first, on every route:
 
 ```sh
-systemctl --user disable --now oma-broadcastd
+systemctl --user disable --now omarchy-broadcastd
 ```
 
 Then, depending on how it was installed:
 
-- Arch package: `sudo pacman -R oma-broadcast-git`. Remove a bar plugin link you made (`rm ~/.config/omarchy/plugins/br.com.dias.oma-broadcast`) and any drop-in you copied from the examples.
+- Arch package: `sudo pacman -R omarchy-broadcast-git`. Remove a bar plugin link you made (`rm ~/.config/omarchy/plugins/br.com.dias.omarchy-broadcast`) and any drop-in you copied from the examples.
 - Per-user install: `scripts/install-user.sh --uninstall` from the checkout. It removes only the files it installed and refuses while the unit is still enabled, hence the command above comes first.
 - Manual install:
 
   ```sh
-  rm ~/.config/systemd/user/oma-broadcastd.service
-  rm -f ~/.local/share/dbus-1/services/br.com.dias.OmaBroadcast.service
-  rm -f ~/.config/systemd/user/wireplumber.service.d/oma-broadcast.conf
-  cargo uninstall oma-broadcastd oma-broadcast
+  rm ~/.config/systemd/user/omarchy-broadcastd.service
+  rm -f ~/.local/share/dbus-1/services/br.com.dias.OmarchyBroadcast.service
+  rm -f ~/.config/systemd/user/wireplumber.service.d/omarchy-broadcast.conf
+  cargo uninstall omarchy-broadcastd omarchy-broadcast
   ```
 
 Finish with `systemctl --user daemon-reload`.

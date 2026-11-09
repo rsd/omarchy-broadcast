@@ -1,4 +1,4 @@
-# oma-broadcast
+# omarchy-broadcast
 
 A GPU webcam-effects pipeline for Linux. Frames flow from a camera through GStreamer and CUDA memory into a [v4l2loopback](https://github.com/v4l2loopback/v4l2loopback) virtual camera that any application can select. The effects (background blur and background replacement) use the NVIDIA Maxine Video Effects SDK behind a replaceable inference-backend interface.
 
@@ -8,7 +8,7 @@ Any UVC webcam works: the pipeline picks a capture mode from what the camera adv
 
 ## Status
 
-Early development. The camera -> CUDA -> virtual camera passthrough works, with sustained 1080p60 on the reference machine. The `oma-broadcastd` daemon (a systemd user service controlled over D-Bus) and the `oma-broadcast` command-line client run it on demand: the camera and GPU start when an application opens the virtual camera ([docs/setup/daemon.md](docs/setup/daemon.md)). Background blur and background replacement run on the GPU through the Maxine SDK, which each user installs ([docs/setup/maxine.md](docs/setup/maxine.md)); they are selected with `oma-broadcast effect` and add a small GPU cost per frame. Both harden the segmentation mask edge, so the room does not show through around the subject ([docs/adr/0013-mask-hardening-cuda-kernel.md](docs/adr/0013-mask-hardening-cuda-kernel.md)). Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence; reproduce locally with `obc-bench` (see [docs/testing.md](docs/testing.md)). Other measurements are in [docs/benchmarks/](docs/benchmarks/passthrough.md).
+Early development. The camera -> CUDA -> virtual camera passthrough works, with sustained 1080p60 on the reference machine. The `omarchy-broadcastd` daemon (a systemd user service controlled over D-Bus) and the `omarchy-broadcast` command-line client run it on demand: the camera and GPU start when an application opens the virtual camera ([docs/setup/daemon.md](docs/setup/daemon.md)). Background blur and background replacement run on the GPU through the Maxine SDK, which each user installs ([docs/setup/maxine.md](docs/setup/maxine.md)); they are selected with `omarchy-broadcast effect` and add a small GPU cost per frame. Both harden the segmentation mask edge, so the room does not show through around the subject ([docs/adr/0013-mask-hardening-cuda-kernel.md](docs/adr/0013-mask-hardening-cuda-kernel.md)). Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence; reproduce locally with `obc-bench` (see [docs/testing.md](docs/testing.md)). Other measurements are in [docs/benchmarks/](docs/benchmarks/passthrough.md).
 
 ## Requirements
 
@@ -17,7 +17,7 @@ Early development. The camera -> CUDA -> virtual camera passthrough works, with 
 - GStreamer 1.x with the `nvcodec` plugin (`cudaupload`, `cudaconvert`, `cudadownload`) and the base/good/bad plugin sets (`videoconvert`, `jpegdec`)
 - v4l2loopback, configured as described in [docs/setup/loopback.md](docs/setup/loopback.md)
 - Rust toolchain (only to build from source; the Arch package is built with it, and installed without it)
-- Optional, for the native PipeWire camera output: a build with the cargo feature `oma-broadcastd/pipewire` (libpipewire headers and clang at build time; the Arch package has it) and `[pipewire] enabled = true` in the configuration
+- Optional, for the native PipeWire camera output: a build with the cargo feature `omarchy-broadcastd/pipewire` (libpipewire headers and clang at build time; the Arch package has it) and `[pipewire] enabled = true` in the configuration
 - Optional, for effects: the NVIDIA Maxine VFX SDK ([docs/setup/maxine.md](docs/setup/maxine.md))
 - Optional, for the noise-removed microphone: `deepfilternet-ladspa` or `noise-suppression-for-voice` ([docs/setup/microphone.md](docs/setup/microphone.md))
 
@@ -27,7 +27,7 @@ Early development. The camera -> CUDA -> virtual camera passthrough works, with 
 cargo build --release
 ```
 
-The PipeWire output is a cargo feature that is off by default: `cargo build --release --features oma-broadcastd/pipewire`.
+The PipeWire output is a cargo feature that is off by default: `cargo build --release --features omarchy-broadcastd/pipewire`.
 
 ## Install
 
@@ -35,16 +35,16 @@ Three routes; the daemon, the unit files and the other steps are described in [d
 
 ### Arch package
 
-`packaging/arch/PKGBUILD` builds `oma-broadcast-git` from the committed HEAD of the local checkout. Build from `packaging/arch`:
+`packaging/arch/PKGBUILD` builds `omarchy-broadcast-git` from the committed HEAD of the local checkout. Build from `packaging/arch`:
 
 ```sh
 cd packaging/arch
 makepkg -s
-sudo pacman -U oma-broadcast-git-*.pkg.tar.zst
-systemctl --user enable --now oma-broadcastd
+sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst
+systemctl --user enable --now omarchy-broadcastd
 ```
 
-The package installs the daemon and the client in `/usr/bin`, the systemd user unit, the D-Bus activation file, the Omarchy bar plugin and the documentation. It enables nothing: each user runs the last command. The loopback device is still configured as in [docs/setup/loopback.md](docs/setup/loopback.md). The package also installs the os-release shim that the Maxine effects need on Arch-based systems, inactive, in `/usr/lib/oma-broadcast/`. The NVIDIA Maxine SDK is never packaged; install it as in [docs/setup/maxine.md](docs/setup/maxine.md), which also covers activating the shim (section 7).
+The package installs the daemon and the client in `/usr/bin`, the systemd user unit, the D-Bus activation file, the Omarchy bar plugin and the documentation. It enables nothing: each user runs the last command. The loopback device is still configured as in [docs/setup/loopback.md](docs/setup/loopback.md). The package also installs the os-release shim that the Maxine effects need on Arch-based systems, inactive, in `/usr/lib/omarchy-broadcast/`. The NVIDIA Maxine SDK is never packaged; install it as in [docs/setup/maxine.md](docs/setup/maxine.md), which also covers activating the shim (section 7).
 
 ### Developer install
 
@@ -53,14 +53,14 @@ The package installs the daemon and the client in `/usr/bin`, the systemd user u
 ```sh
 scripts/install-user.sh
 systemctl --user daemon-reload
-systemctl --user enable --now oma-broadcastd
+systemctl --user enable --now omarchy-broadcastd
 ```
 
 ### Manual install
 
 `cargo install` of the two crates and a copy of the unit file with `ExecStart=` rewritten: see [docs/setup/daemon.md](docs/setup/daemon.md#install).
 
-The continuous integration (`.github/workflows/ci.yml`) runs the format check, clippy, the workspace tests and shellcheck in an Arch Linux container without a GPU, and a second job that builds, lints and tests `obc-pipeline` and `oma-broadcastd` with the PipeWire feature.
+The continuous integration (`.github/workflows/ci.yml`) runs the format check, clippy, the workspace tests and shellcheck in an Arch Linux container without a GPU, and a second job that builds, lints and tests `obc-pipeline` and `omarchy-broadcastd` with the PipeWire feature.
 
 ## Run
 

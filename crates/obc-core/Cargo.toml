@@ -1,6 +1,6 @@
 [package]
 name = "obc-core"
-description = "Shared pure types for oma-broadcast: video modes, device selectors, errors"
+description = "Shared pure types for omarchy-broadcast: video modes, device selectors, errors"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -11,11 +11,11 @@
 - PipeWire ships `libpipewire-module-filter-chain` and an example `source-rnnoise.conf`. DeepFilterNet ships a filter-chain example.
 
 ## Decision
-- A virtual `Audio/Source`, "Omarchy Broadcast Mic" (`node.name` `oma-broadcast-mic`), built by a filter-chain that hosts a CPU LADSPA plugin.
-- Two engines, one configuration file each (`dist/pipewire/oma-broadcast-mic-deepfilter.conf` and `-rnnoise.conf`), with the same `node.name`, so applications that remember their input by name keep it across an engine switch. Only one runs at a time.
-- Each runs as a dedicated `pipewire -c oma-broadcast-mic-<engine>.conf` process, started by the template user unit `oma-broadcast-mic@<engine>.service` (`dist/systemd/`).
+- A virtual `Audio/Source`, "Omarchy Broadcast Mic" (`node.name` `omarchy-broadcast-mic`), built by a filter-chain that hosts a CPU LADSPA plugin.
+- Two engines, one configuration file each (`dist/pipewire/omarchy-broadcast-mic-deepfilter.conf` and `-rnnoise.conf`), with the same `node.name`, so applications that remember their input by name keep it across an engine switch. Only one runs at a time.
+- Each runs as a dedicated `pipewire -c omarchy-broadcast-mic-<engine>.conf` process, started by the template user unit `omarchy-broadcast-mic@<engine>.service` (`dist/systemd/`).
 - The capture side is passive and follows the default source; it can be pinned with `target.object`. The source is mono at 48 kHz.
-- Independent of `oma-broadcastd`. No Rust code.
+- Independent of `omarchy-broadcastd`. No Rust code.
 - Packaging: the Arch package ships both configurations and the template unit, and lists each plugin package as an optional dependency. Nothing is enabled; the user enables an instance. `scripts/install-user.sh --mic` installs the same files per user.
 - User documentation: [../setup/microphone.md](../setup/microphone.md).
 
@@ -33,7 +33,7 @@ A dedicated process confines a plugin fault to that process, and starting, stopp
 
 ## Alternatives considered
 - **Maxine AFX now:** deferred, see below.
-- **A native node inside `oma-broadcastd`** (GStreamer `pipewiresrc` and `pipewiresink`, or `pipewire-rs` streams): new code and a real-time ring buffer for an effect that filter-chain already hosts. It would be needed only for a GPU engine.
+- **A native node inside `omarchy-broadcastd`** (GStreamer `pipewiresrc` and `pipewiresink`, or `pipewire-rs` streams): new code and a real-time ring buffer for an effect that filter-chain already hosts. It would be needed only for a GPU engine.
 - **EasyEffects embedded or required:** a separate, always-on application that owns its own source. Fine to use alongside this; not something to build on.
 - **NoiseTorch:** a separate application that does the same RNNoise virtual source.
 - **A LADSPA wrapper around AFX inside filter-chain:** would load CUDA into a PipeWire process and run GPU calls in the real-time thread.
@@ -52,13 +52,13 @@ Revisit only after a local trial shows that AFX loads on the target GPU and is a
 - An optional runtime dependency on one plugin package per engine (`deepfilternet-ladspa` or `noise-suppression-for-voice`). Without the plugin the unit fails visibly: the filter module has no `nofail` flag.
 - Each engine adds latency. The upstream figures are 10 ms frames for RNNoise and at least 20 ms of algorithmic latency for DeepFilterNet; the whole chain has not been measured.
 - CPU, measured on an Intel Core Ultra 9 275HX with PipeWire 1.6.9 over 30 s of continuous recording: DeepFilterNet about 21.5 % of one core (about 155 MB resident once the model has loaded), RNNoise about 2.4 % (about 14 MB). With no recorder connected, both are effectively idle and the hardware microphone stays suspended. Both run under the unit's hardening (including `MemoryDenyWriteExecute=yes`) without errors.
-- The Arch package installs the configurations to `/usr/share/oma-broadcast/pipewire/` and the unit to `/usr/lib/systemd/user/`, with `noise-suppression-for-voice` and `deepfilternet-ladspa` as optional dependencies. Those directories are not on PipeWire's configuration search path, so the packaged unit names the configuration by absolute path; the repository's unit looks it up by name. Nothing is enabled by the package.
+- The Arch package installs the configurations to `/usr/share/omarchy-broadcast/pipewire/` and the unit to `/usr/lib/systemd/user/`, with `noise-suppression-for-voice` and `deepfilternet-ladspa` as optional dependencies. Those directories are not on PipeWire's configuration search path, so the packaged unit names the configuration by absolute path; the repository's unit looks it up by name. Nothing is enabled by the package.
 - The source can be made the default input safely: filter-chain puts its capture and playback nodes in one `node.link-group` and WirePlumber 0.5 never links nodes of one group, so the capture side does not loop back onto its own output.
 
 ### Later integration with the daemon
 - The daemon could start and stop the unit through systemd's D-Bus API, driven by a configuration key.
 - A consumer-driven lifecycle like the camera's ([ADR-0006](0006-on-demand-gpu-lifecycle.md), [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md)) is not needed for CPU engines: the capture side is passive, so the filter does not open the microphone while nothing records from the source.
-- If one is needed later, for example for a GPU engine, the consumer signal is the PipeWire link state of the `oma-broadcast-mic` node, filtering out level-meter monitor streams.
+- If one is needed later, for example for a GPU engine, the consumer signal is the PipeWire link state of the `omarchy-broadcast-mic` node, filtering out level-meter monitor streams.
 
 ## What would change this decision
 - A later finding that an engine is not good enough or costs too much CPU: reconsider the engines, not the run mode.

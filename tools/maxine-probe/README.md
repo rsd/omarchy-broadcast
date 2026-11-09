@@ -32,7 +32,7 @@ gcc -O2 -o /tmp/probe tools/maxine-probe/probe.c \
 # On a distribution the SDK does not recognise, run with the os-release shim
 # (make -C tools/os-release-shim); set LD_PRELOAD on the probe itself:
 env LD_PRELOAD=$PWD/target/os-release-shim/os-release-shim.so \
-    OMA_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release \
+    OMARCHY_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release \
     /tmp/probe $P/lib/models
 ```
 

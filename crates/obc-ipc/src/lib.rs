@@ -1,4 +1,4 @@
-//! D-Bus interface `br.com.dias.OmaBroadcast1` (zbus), shared by the daemon
+//! D-Bus interface `br.com.dias.OmarchyBroadcast1` (zbus), shared by the daemon
 //! and its clients (see `docs/adr/0005-dbus-zbus-control-plane.md` and
 //! `docs/adr/0011-daemon-lifecycle-and-dbus-api.md`; the reference for
 //! client authors is `docs/dbus-api.md`).
@@ -13,7 +13,7 @@
 //! addressed to [`BUS_NAME`] without the `NO_AUTO_START` flag starts the
 //! daemon if it is not running. The generated proxy sends such messages for
 //! reads too: a proxy that caches properties (the default of
-//! [`OmaBroadcastProxy::new`] and of [`OmaBroadcastProxy::builder`]) fills
+//! [`OmarchyBroadcastProxy::new`] and of [`OmarchyBroadcastProxy::builder`]) fills
 //! its cache with a `GetAll` without the flag, and the property getters
 //! (`state()`, `cameras()`, ...) fall back to a `Get` without it.
 //!
@@ -45,14 +45,14 @@ use zbus::{Connection, DBusError, OwnedVariant, Type, Variant};
 
 pub mod client;
 
-pub use client::OmaBroadcastProxy;
+pub use client::OmarchyBroadcastProxy;
 
 /// Well-known name of the daemon on the session bus.
-pub const BUS_NAME: &str = "br.com.dias.OmaBroadcast";
+pub const BUS_NAME: &str = "br.com.dias.OmarchyBroadcast";
 /// Path of the one object the daemon exports.
-pub const OBJECT_PATH: &str = "/br/com/dias/OmaBroadcast";
-/// Interface name. Breaking changes add `br.com.dias.OmaBroadcast2`.
-pub const INTERFACE: &str = "br.com.dias.OmaBroadcast1";
+pub const OBJECT_PATH: &str = "/br/com/dias/OmarchyBroadcast";
+/// Interface name. Breaking changes add `br.com.dias.OmarchyBroadcast2`.
+pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// Revision of [`INTERFACE`] this crate describes, exposed by the daemon as
 /// the `InterfaceRevision` property. Raised for every backwards-compatible
 /// addition (a new property, method or signal). Revision 2 added the
@@ -69,8 +69,8 @@ pub const PIPEWIRE_REVISION: u32 = 3;
 /// that has none (before [`PIPEWIRE_REVISION`]).
 pub const PIPEWIRE_OFF: &str = "off";
 /// Prefix of every D-Bus error name the daemon replies with
-/// (`br.com.dias.OmaBroadcast1.Error.NoSuchCamera`, ...).
-pub const ERROR_PREFIX: &str = "br.com.dias.OmaBroadcast1.Error";
+/// (`br.com.dias.OmarchyBroadcast1.Error.NoSuchCamera`, ...).
+pub const ERROR_PREFIX: &str = "br.com.dias.OmarchyBroadcast1.Error";
 
 /// Lifecycle state of the daemon, carried as a lower-case string (`s`).
 ///
@@ -212,12 +212,12 @@ impl Default for Stats {
 }
 
 /// The errors the daemon's methods reply with, named
-/// `br.com.dias.OmaBroadcast1.Error.<Variant>`.
+/// `br.com.dias.OmarchyBroadcast1.Error.<Variant>`.
 ///
 /// On the client side a reply carrying one of these names converts back to
 /// its variant; any other failure is [`IpcError::ZBus`].
 #[derive(Debug, DBusError)]
-#[zbus(prefix = "br.com.dias.OmaBroadcast1.Error")]
+#[zbus(prefix = "br.com.dias.OmarchyBroadcast1.Error")]
 pub enum IpcError {
     /// `SelectCamera` named no camera that is present.
     NoSuchCamera(String),
@@ -414,7 +414,7 @@ impl Snapshot {
     /// [`is_unknown_property_error`]), and `LoopbackConsumers` is then
     /// `Consumers`, as [`Snapshot::from_properties`] does for a property
     /// missing from `GetAll`; any other failure to read them is an error.
-    pub async fn fetch(proxy: &OmaBroadcastProxy<'_>) -> zbus::Result<Snapshot> {
+    pub async fn fetch(proxy: &OmarchyBroadcastProxy<'_>) -> zbus::Result<Snapshot> {
         let empty = Snapshot::empty();
         let consumers = proxy.consumers().await?;
         Ok(Snapshot {

@@ -1,6 +1,6 @@
 [package]
 name = "gst-obc"
-description = "GStreamer effect element of oma-broadcast (obceffect), registered in-process"
+description = "GStreamer effect element of omarchy-broadcast (obceffect), registered in-process"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -22,11 +22,11 @@
 **An optional second output, a PipeWire `Video/Source` node, fed from the loopback writer. The loopback is unchanged and remains the default.**
 
 ### Off by default, in two places
-- The cargo feature `pipewire` of `obc-pipeline` (forwarded by `oma-broadcastd/pipewire`) compiles it. It needs the libpipewire headers and clang at build time and links `libpipewire-0.3`. The Arch package is built with it.
+- The cargo feature `pipewire` of `obc-pipeline` (forwarded by `omarchy-broadcastd/pipewire`) compiles it. It needs the libpipewire headers and clang at build time and links `libpipewire-0.3`. The Arch package is built with it.
 - The configuration key `[pipewire] enabled` (default `false`) turns it on. A build without the feature and `enabled = true` logs a warning and reports `PipeWireOutput` = `unsupported`; the loopback is unaffected.
 
 ### The node
-- A client-owned node created in the daemon process through the `pipewire` crate (pipewire-rs 0.10.1): `node.name` `oma-broadcast`, `node.description` `Omarchy Broadcast`, `media.class` `Video/Source`, `media.role` `Camera`, `media.category` `Capture`.
+- A client-owned node created in the daemon process through the `pipewire` crate (pipewire-rs 0.10.1): `node.name` `omarchy-broadcast`, `node.description` `Omarchy Broadcast`, `media.class` `Video/Source`, `media.role` `Camera`, `media.category` `Capture`.
 - One thread, `obc-pipewire`, with its own PipeWire main loop. It owns the output stream (the driver of the node) and a registry listener.
 - **Formats.** Three `EnumFormat` entries, all at the contract's exact size and frame rate: in the order YUY2, NV12, I420, whatever the contract's format (see the note on format order below). A consumer that requests another format or size fails its own link only; the node, its id and the other consumers are unaffected. This was verified live: RGBA and 640x480 requests failed with "no more input formats" on the consumer side only. No colour range or matrix is announced.
 

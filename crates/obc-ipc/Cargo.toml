@@ -1,6 +1,6 @@
 [package]
 name = "obc-ipc"
-description = "D-Bus (zbus) interface definition shared by the oma-broadcast daemon and clients"
+description = "D-Bus (zbus) interface definition shared by the omarchy-broadcast daemon and clients"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

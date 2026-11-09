@@ -1,7 +1,7 @@
-//! Client proxy for `br.com.dias.OmaBroadcast1`.
+//! Client proxy for `br.com.dias.OmarchyBroadcast1`.
 //!
-//! [`OmaBroadcastProxy::new`] targets the daemon's well-known name and
-//! object path on the given connection; use [`OmaBroadcastProxy::builder`] to
+//! [`OmarchyBroadcastProxy::new`] targets the daemon's well-known name and
+//! object path on the given connection; use [`OmarchyBroadcastProxy::builder`] to
 //! point it elsewhere (a peer-to-peer connection, a test server).
 //!
 //! The `Stats` signal yields the message wrapper [`Stats`] (this module's,
@@ -13,11 +13,11 @@ use crate::{CameraInfo, IpcError, State};
 /// The daemon's interface, as seen by a client. Every property is read-only
 /// and emits `org.freedesktop.DBus.Properties.PropertiesChanged`.
 #[zbus::proxy(
-    interface = "br.com.dias.OmaBroadcast1",
-    default_service = "br.com.dias.OmaBroadcast",
-    default_path = "/br/com/dias/OmaBroadcast"
+    interface = "br.com.dias.OmarchyBroadcast1",
+    default_service = "br.com.dias.OmarchyBroadcast",
+    default_path = "/br/com/dias/OmarchyBroadcast"
 )]
-pub trait OmaBroadcast {
+pub trait OmarchyBroadcast {
     /// Enables (`true`) or disables (`false`, the privacy state `off`) the
     /// camera. Persists across restarts.
     fn set_enabled(&self, enabled: bool) -> Result<(), IpcError>;

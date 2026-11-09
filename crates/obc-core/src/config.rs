@@ -2,11 +2,11 @@
 //! `docs/adr/0011-daemon-lifecycle-and-dbus-api.md`, "Configuration and
 //! state").
 //!
-//! - [`Config`]: `$XDG_CONFIG_HOME/oma-broadcast/config.toml`, what the user
+//! - [`Config`]: `$XDG_CONFIG_HOME/omarchy-broadcast/config.toml`, what the user
 //!   decides. Versioned (`version = 1`), every key optional, unknown keys
 //!   refused. The daemon reads it and never writes it. The commented
 //!   reference is `docs/config.example.toml`.
-//! - [`RuntimeState`]: `$XDG_STATE_HOME/oma-broadcast/state.toml`, what
+//! - [`RuntimeState`]: `$XDG_STATE_HOME/omarchy-broadcast/state.toml`, what
 //!   changes at run time (`Enabled`, the selected camera, the effect and its
 //!   settings). Written atomically by the daemon; a damaged file falls back
 //!   to the defaults (the daemon then starts `off`).
@@ -30,7 +30,7 @@ use crate::{
 pub const CONFIG_VERSION: u32 = 1;
 
 /// Directory name under the XDG base directories.
-pub const APP_DIR: &str = "oma-broadcast";
+pub const APP_DIR: &str = "omarchy-broadcast";
 
 /// Bounds of the duration keys, inclusive unless stated otherwise.
 pub mod limits {
@@ -921,14 +921,14 @@ fn remove_stale_temps(dir: &Path, name: &std::ffi::OsStr) {
     }
 }
 
-/// `$XDG_CONFIG_HOME/oma-broadcast/config.toml`, else
-/// `$HOME/.config/oma-broadcast/config.toml`. `None` with neither set.
+/// `$XDG_CONFIG_HOME/omarchy-broadcast/config.toml`, else
+/// `$HOME/.config/omarchy-broadcast/config.toml`. `None` with neither set.
 pub fn config_path() -> Option<PathBuf> {
     config_path_in(|k| std::env::var_os(k))
 }
 
-/// `$XDG_STATE_HOME/oma-broadcast/state.toml`, else
-/// `$HOME/.local/state/oma-broadcast/state.toml`. `None` with neither set.
+/// `$XDG_STATE_HOME/omarchy-broadcast/state.toml`, else
+/// `$HOME/.local/state/omarchy-broadcast/state.toml`. `None` with neither set.
 pub fn state_path() -> Option<PathBuf> {
     state_path_in(|k| std::env::var_os(k))
 }
@@ -963,7 +963,10 @@ mod tests {
     const EXAMPLE: &str = include_str!("../../../docs/config.example.toml");
 
     fn parse(text: &str) -> Result<Config, ConfigError> {
-        Config::parse(text, Path::new("/home/u/.config/oma-broadcast/config.toml"))
+        Config::parse(
+            text,
+            Path::new("/home/u/.config/omarchy-broadcast/config.toml"),
+        )
     }
 
     fn parse_err(text: &str) -> String {
@@ -1159,7 +1162,7 @@ offer_nv12 = false
         }
         let s = e.to_string();
         assert!(
-            s.starts_with("/home/u/.config/oma-broadcast/config.toml:4:1: camera.mdoe: "),
+            s.starts_with("/home/u/.config/omarchy-broadcast/config.toml:4:1: camera.mdoe: "),
             "{s}"
         );
         assert!(!s.contains('\n'), "one line: {s}");
@@ -1341,7 +1344,7 @@ offer_nv12 = false
             }
             assert!(s.contains(reason), "{text}: {s}");
             assert!(
-                s.starts_with("/home/u/.config/oma-broadcast/config.toml:"),
+                s.starts_with("/home/u/.config/omarchy-broadcast/config.toml:"),
                 "{s}"
             );
         }
@@ -1415,7 +1418,7 @@ offer_nv12 = false
         assert_eq!(parse(&c.to_toml()).unwrap(), c);
         let e = parse_err("version = 1\n\n[effect]\nblur_strength = 0.2\nmode = \"replace\"\n");
         assert!(
-            e.starts_with("/home/u/.config/oma-broadcast/config.toml:5: effect.mode: "),
+            e.starts_with("/home/u/.config/omarchy-broadcast/config.toml:5: effect.mode: "),
             "{e}"
         );
         assert!(!parse_err("[effect]\nstrength = 1\n").is_empty());
@@ -1688,21 +1691,23 @@ offer_nv12 = false
         ]);
         assert_eq!(
             config_path_in(xdg),
-            Some(PathBuf::from("/x/cfg/oma-broadcast/config.toml"))
+            Some(PathBuf::from("/x/cfg/omarchy-broadcast/config.toml"))
         );
         assert_eq!(
             state_path_in(xdg),
-            Some(PathBuf::from("/x/state/oma-broadcast/state.toml"))
+            Some(PathBuf::from("/x/state/omarchy-broadcast/state.toml"))
         );
         let home = env(&[("HOME", "/home/u"), ("XDG_CONFIG_HOME", "relative/ignored")]);
         assert_eq!(
             config_path_in(home),
-            Some(PathBuf::from("/home/u/.config/oma-broadcast/config.toml"))
+            Some(PathBuf::from(
+                "/home/u/.config/omarchy-broadcast/config.toml"
+            ))
         );
         assert_eq!(
             state_path_in(home),
             Some(PathBuf::from(
-                "/home/u/.local/state/oma-broadcast/state.toml"
+                "/home/u/.local/state/omarchy-broadcast/state.toml"
             ))
         );
         let none = env(&[]);
