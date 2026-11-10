@@ -21,6 +21,9 @@
 //! `camera.fixed_framerate = true`) has something to pin and restore on
 //! SIGTERM; the test puts the original value back, also when it fails.
 //! A camera without that control writable skips that check, saying so.
+//! `camera_controls_are_stored_and_reapplied_at_each_open` changes the
+//! camera's image controls (sharpness, and saturation if it has one) and
+//! writes every image control's default at the end, also when it fails.
 //!
 //! The effects test (`effects_switch_while_streaming_and_release_the_gpu`)
 //! also needs the NVIDIA Maxine Video Effects SDK (`MAXINE_VFX_ROOT`, the
@@ -393,6 +396,19 @@ impl Client {
     }
     fn set_denoise(&self, on: bool) -> Result<(), IpcError> {
         self.rt.block_on(self.proxy.set_denoise(on))
+    }
+    fn get_controls(&self, camera: &str) -> Result<Vec<obc_ipc::CameraControl>, IpcError> {
+        self.rt.block_on(self.proxy.get_camera_controls(camera))
+    }
+    fn set_control(&self, camera: &str, name: &str, value: i32) -> Result<(), IpcError> {
+        self.rt
+            .block_on(self.proxy.set_camera_control(camera, name, value))
+    }
+    fn reset_controls(&self, camera: &str) -> Result<(), IpcError> {
+        self.rt.block_on(self.proxy.reset_camera_controls(camera))
+    }
+    fn camera_controls(&self) -> obc_ipc::CameraControls {
+        self.rt.block_on(self.proxy.camera_controls()).unwrap()
     }
 
     fn wait_state(&self, want: State, limit: Duration) -> Option<Duration> {
@@ -1848,4 +1864,210 @@ fn denoise_stacks_with_the_effect_while_streaming_and_the_gpu_parks() {
     let code = daemon.terminate();
     assert_eq!(code, Some(0), "the daemon exits 0 on SIGTERM while parked");
     drop(client);
+}
+
+const IGNORE_CONTROLS: &str = "needs OBC_TEST_SINK (a free v4l2loopback device with \
+     exclusive_caps=1), OBC_TEST_CAMERA (a colour camera with a writable sharpness control), an \
+     NVIDIA GPU, /usr/bin/dbus-daemon and cargo (to build obc-consumer)";
+
+/// Writes every image control of the test camera its default when
+/// dropped: also when the test fails partway.
+struct ImageDefaults {
+    node: PathBuf,
+    controls: Vec<obc_pipeline::controls::DeviceControl>,
+}
+
+impl Drop for ImageDefaults {
+    fn drop(&mut self) {
+        for c in &self.controls {
+            if let Err(e) =
+                obc_pipeline::controls::set_image_control(&self.node, &c.name, c.default)
+            {
+                eprintln!(
+                    "could not put {} of {} back to its default {}: {e}",
+                    c.name,
+                    self.node.display(),
+                    c.default
+                );
+            }
+        }
+    }
+}
+
+/// A valid value of `c` other than its default.
+fn not_default(c: &obc_pipeline::controls::DeviceControl) -> i32 {
+    let step = c.step.max(1);
+    let v = if c.default.checked_add(step).is_some_and(|v| v <= c.max) {
+        c.default + step
+    } else {
+        c.default - step
+    };
+    assert_eq!(obc_pipeline::controls::check_value(c, v), Ok(()), "{c:?}");
+    v
+}
+
+/// The camera image controls end to end: read over D-Bus while idle; set
+/// while streaming (written at once); the camera closed and the device put
+/// back to its defaults behind the daemon's back; reopened, the stored
+/// values are on the device again; a reset while streaming writes every
+/// default and stores nothing. The camera's defaults are written at the
+/// end, also when the test fails.
+#[test]
+#[ignore = "needs OBC_TEST_SINK (a free v4l2loopback device with exclusive_caps=1), OBC_TEST_CAMERA (a colour camera with a writable sharpness control), an NVIDIA GPU, /usr/bin/dbus-daemon and cargo"]
+fn camera_controls_are_stored_and_reapplied_at_each_open() {
+    use obc_pipeline::controls::{
+        get_ctrl, image_control_id, query_image_controls, set_image_control,
+    };
+    let sink = PathBuf::from(
+        std::env::var("OBC_TEST_SINK")
+            .unwrap_or_else(|_| panic!("this test needs OBC_TEST_SINK. {IGNORE_CONTROLS}")),
+    );
+    let sink = std::fs::canonicalize(&sink).unwrap_or(sink);
+    let cam = resolve_camera("OBC_TEST_CAMERA");
+    for node in [&sink, &cam.node] {
+        let n = count_holders(Path::new("/proc"), &NodeId::of(node), std::process::id());
+        assert_eq!(
+            n,
+            0,
+            "{} is held by another process (see `fuser -v {}`): not touching it",
+            node.display(),
+            node.display()
+        );
+    }
+    let found = query_image_controls(&cam.node)
+        .unwrap_or_else(|e| panic!("reading the image controls of {}: {e}", cam.node.display()));
+    let _defaults = ImageDefaults {
+        node: cam.node.clone(),
+        controls: found.clone(),
+    };
+    let on_device = |name: &str| get_ctrl(&cam.node, image_control_id(name).unwrap()).unwrap();
+    let sharpness = found
+        .iter()
+        .find(|c| c.name == "sharpness")
+        .unwrap_or_else(|| {
+            panic!(
+                "this test needs a camera with a writable sharpness control; {} exposes {:?}. \
+                 {IGNORE_CONTROLS}",
+                cam.node.display(),
+                found.iter().map(|c| &c.name).collect::<Vec<_>>()
+            )
+        })
+        .clone();
+    let mut chosen = vec![(sharpness.name.clone(), not_default(&sharpness))];
+    if let Some(sat) = found.iter().find(|c| c.name == "saturation") {
+        chosen.push((sat.name.clone(), not_default(sat)));
+    } else {
+        eprintln!("no saturation control: sharpness only");
+    }
+
+    let consumer_bin = consumer_binary();
+    let dir = tempfile::tempdir().unwrap();
+    let bus = PrivateBus::start(dir.path());
+    let env = DaemonEnv::new(dir.path(), &bus);
+    std::fs::write(
+        env.config_file(),
+        format!(
+            "version = 1\n[camera]\npreference = [{:?}]\n[loopback]\ndevice = {:?}\n\
+             [lifecycle]\nidle_grace_s = 0.5\nstart_debounce_ms = 100\n",
+            cam.selector,
+            sink.display().to_string()
+        ),
+    )
+    .unwrap();
+    let mut daemon = spawn_daemon(&env);
+    let client = Client::connect(&env);
+    client.wait_for_daemon(Duration::from_secs(15));
+    assert_eq!(client.state(), State::Idle, "error: {}", client.error());
+    let id = client.active();
+
+    // Read while idle: what the device says, in allowlist order.
+    let got = client.get_controls("").unwrap();
+    assert_eq!(client.get_controls(&id).unwrap(), got);
+    assert_eq!(
+        got.iter()
+            .map(|c| (c.name.clone(), c.min, c.max, c.step, c.default, c.value))
+            .collect::<Vec<_>>(),
+        found
+            .iter()
+            .map(|c| (c.name.clone(), c.min, c.max, c.step, c.default, c.value))
+            .collect::<Vec<_>>()
+    );
+    assert!(got.iter().all(|c| !c.stored));
+    assert_eq!(client.camera_controls().camera, id);
+    eprintln!("controls of {id}: {got:?}");
+
+    // Set while streaming: on the device at once, and stored.
+    let consumer = Consumer::spawn(&consumer_bin, &sink);
+    assert!(
+        client
+            .wait_state(State::Active, Duration::from_secs(20))
+            .is_some(),
+        "not active: {} ({})",
+        client.state(),
+        client.error()
+    );
+    for (name, value) in &chosen {
+        client.set_control("", name, *value).unwrap();
+        assert_eq!(on_device(name), *value, "{name} written while streaming");
+    }
+    let view = client.camera_controls();
+    for (name, value) in &chosen {
+        let c = view.controls.iter().find(|c| c.name == *name).unwrap();
+        assert_eq!((c.value, c.stored), (*value, true), "{c:?}");
+    }
+    let state = std::fs::read_to_string(env.state_file()).unwrap();
+    assert!(state.contains("[camera_controls."), "{state}");
+
+    // Closed: nothing restored. Then the defaults behind the daemon's back.
+    consumer.close();
+    assert!(
+        client
+            .wait_state(State::Idle, Duration::from_secs(15))
+            .is_some(),
+        "not idle: {}",
+        client.state()
+    );
+    for (name, value) in &chosen {
+        assert_eq!(on_device(name), *value, "{name} left applied at the close");
+        let c = found.iter().find(|c| c.name == *name).unwrap();
+        set_image_control(&cam.node, name, c.default).unwrap();
+        assert_eq!(on_device(name), c.default);
+    }
+
+    // Reopened: the stored values are on the device again.
+    let consumer = Consumer::spawn(&consumer_bin, &sink);
+    assert!(
+        client
+            .wait_state(State::Active, Duration::from_secs(20))
+            .is_some(),
+        "not active again: {} ({})",
+        client.state(),
+        client.error()
+    );
+    for (name, value) in &chosen {
+        assert_eq!(on_device(name), *value, "{name} reapplied at the open");
+    }
+    // The property shows what the device has once the camera streams.
+    let view = client.camera_controls();
+    for c in &view.controls {
+        assert_eq!(c.value, on_device(&c.name), "{c:?} in the view");
+    }
+    assert!(consumer.wait_more(true, 10, Duration::from_secs(10)));
+
+    // Reset while streaming: every default on the device, nothing stored.
+    client.reset_controls("").unwrap();
+    for c in &found {
+        assert_eq!(on_device(&c.name), c.default, "{} reset", c.name);
+    }
+    let after = client.get_controls("").unwrap();
+    assert!(
+        after.iter().all(|c| !c.stored && c.value == c.default),
+        "{after:?}"
+    );
+    let state = std::fs::read_to_string(env.state_file()).unwrap();
+    assert!(!state.contains("camera_controls"), "{state}");
+    assert_eq!(client.state(), State::Active, "error: {}", client.error());
+    consumer.close();
+    daemon.signal(libc::SIGTERM);
+    assert_eq!(daemon.wait_exit(Duration::from_secs(10)), Some(0));
 }

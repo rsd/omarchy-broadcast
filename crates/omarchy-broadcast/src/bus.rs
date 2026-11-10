@@ -4,16 +4,19 @@
 //!
 //! Properties are read with [`Snapshot::fetch_no_autostart`] (one
 //! `org.freedesktop.DBus.Properties.GetAll` carrying the `NO_AUTO_START`
-//! flag), so `status`, `cameras` and `watch` never trigger D-Bus activation.
+//! flag), so `status`, `cameras` and `watch` never trigger D-Bus activation;
+//! `controls` reads the image controls with a `GetCameraControls` carrying
+//! the same flag ([`camera_controls`]).
 //! The generated property getters of [`obc_ipc::OmarchyBroadcastProxy`] (and its
 //! cache, filled by a `GetAll` without that flag) would. Methods go through
-//! the proxy, without the flag: `on`, `off`, `camera` and `effect <effect>`
-//! may start the daemon when its activation file is installed.
+//! the proxy, without the flag: `on`, `off`, `camera`, `effect <effect>`,
+//! `denoise`, `controls set` and `controls reset` may start the daemon when
+//! its activation file is installed.
 
 use std::time::Duration;
 
-use obc_ipc::{BUS_NAME, IpcError, OmarchyBroadcastProxy, Snapshot};
-use zbus::proxy::CacheProperties;
+use obc_ipc::{BUS_NAME, CameraControl, IpcError, OmarchyBroadcastProxy, Snapshot};
+use zbus::proxy::{CacheProperties, MethodFlags};
 use zbus::{Connection, DBusError};
 
 use crate::json;
@@ -45,6 +48,11 @@ pub use obc_ipc::DENOISE_REVISION;
 /// The first `InterfaceRevision` with the live preview (`AcquirePreview`,
 /// `ReleasePreview`, `PreviewFrame`).
 pub use obc_ipc::PREVIEW_REVISION;
+
+/// The first `InterfaceRevision` with the camera image controls
+/// (`CameraControls`, `GetCameraControls`, `SetCameraControl`,
+/// `ResetCameraControls`).
+pub use obc_ipc::CONTROLS_REVISION;
 
 /// How to start the daemon, quoted in the not-running message.
 pub const START_HINT: &str = "systemctl --user start omarchy-broadcastd";
@@ -157,6 +165,18 @@ pub fn require_preview(revision: u32) -> Result<(), Failure> {
     )))
 }
 
+/// Fails unless a daemon of interface revision `revision` has the camera
+/// image controls.
+pub fn require_controls(revision: u32) -> Result<(), Failure> {
+    if revision >= CONTROLS_REVISION {
+        return Ok(());
+    }
+    Err(Failure::Unsupported(format!(
+        "the daemon does not support camera controls (its interface revision is {revision}, \
+         camera controls need {CONTROLS_REVISION}); update omarchy-broadcastd"
+    )))
+}
+
 /// The daemon's preview frame `path` does not fit a JSON line (it is never
 /// clipped: a clipped path names no file).
 pub fn preview_path_too_long(path: &str) -> Failure {
@@ -216,6 +236,36 @@ pub fn classify_ipc(e: IpcError) -> Failure {
         IpcError::ZBus(z) => classify(&z, true),
         rejected => Failure::Rejected(rejected),
     }
+}
+
+/// Classifies the reply of a method call made with `NO_AUTO_START`: the
+/// daemon's own error by name, or a transport error.
+pub fn classify_no_autostart(e: zbus::Error) -> Failure {
+    match IpcError::from(e) {
+        IpcError::ZBus(z) => classify(&z, false),
+        rejected => Failure::Rejected(rejected),
+    }
+}
+
+/// `GetCameraControls(camera)` without starting the daemon, within
+/// [`READ_TIMEOUT`]: the image controls of `camera` (an id; `""` is the
+/// active camera), read from the device.
+pub async fn camera_controls(
+    conn: &Connection,
+    camera: &str,
+) -> Result<Vec<CameraControl>, Failure> {
+    let call = async {
+        let proxy = proxy(conn).await?;
+        let reply: Option<Vec<CameraControl>> = proxy
+            .inner()
+            .call_with_flags("GetCameraControls", MethodFlags::NO_AUTO_START, &(camera,))
+            .await
+            .map_err(classify_no_autostart)?;
+        reply.ok_or_else(|| Failure::Other("GetCameraControls returned no reply".into()))
+    };
+    tokio::time::timeout(READ_TIMEOUT, call)
+        .await
+        .unwrap_or_else(|_| Err(timed_out(READ_TIMEOUT)))
 }
 
 /// Connects to the session bus.
@@ -313,6 +363,20 @@ mod tests {
             f.message(),
             "the daemon does not support the live preview (its interface revision is 4, the \
              preview needs 5); update omarchy-broadcastd"
+        );
+    }
+
+    #[test]
+    fn camera_controls_need_revision_6() {
+        assert!(require_controls(CONTROLS_REVISION).is_ok());
+        assert!(require_controls(CONTROLS_REVISION + 1).is_ok());
+        let f = require_controls(5).unwrap_err();
+        assert_eq!(f.exit_code(), EXIT_REJECTED);
+        assert_eq!(f.json_code(), "unsupported-daemon");
+        assert_eq!(
+            f.message(),
+            "the daemon does not support camera controls (its interface revision is 5, camera \
+             controls need 6); update omarchy-broadcastd"
         );
     }
 

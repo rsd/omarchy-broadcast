@@ -20,7 +20,9 @@ use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 
 use futures_util::StreamExt;
-use obc_ipc::{CameraInfo, INTERFACE, IpcError, OBJECT_PATH, Snapshot, State};
+use obc_ipc::{
+    CameraControl, CameraControls, CameraInfo, INTERFACE, IpcError, OBJECT_PATH, Snapshot, State,
+};
 use tokio::sync::mpsc::UnboundedReceiver;
 use zbus::fdo::NameOwnerChangedStream;
 use zbus::message::Header;
@@ -29,7 +31,7 @@ use zbus::object_server::SignalEmitter;
 use zbus::proxy::CacheProperties;
 use zbus::{Connection, interface};
 
-use crate::controller::{Change, Command, Note, PathReply, Published, Reply};
+use crate::controller::{Change, Command, ControlsReply, Note, PathReply, Published, Reply};
 
 /// The D-Bus object (see the module docs).
 pub struct Server {
@@ -183,6 +185,38 @@ impl Server {
         self.call(|r| Command::ReleasePreview(name, r)).await
     }
 
+    /// The image controls `camera` exposes (an id of `Cameras`; empty:
+    /// `ActiveCamera`), read from the device in any state (revision 6).
+    async fn get_camera_controls(&self, camera: String) -> Result<Vec<CameraControl>, IpcError> {
+        self.ask(|reply: ControlsReply| Command::GetCameraControls(camera, reply))
+            .await
+    }
+
+    /// Sets an image control of `camera` and stores it for that camera:
+    /// written at once while it streams, otherwise when it next opens.
+    /// Persists across restarts (revision 6).
+    async fn set_camera_control(
+        &self,
+        camera: String,
+        name: String,
+        value: i32,
+    ) -> Result<(), IpcError> {
+        self.call(|reply| Command::SetCameraControl {
+            camera,
+            name,
+            value,
+            reply,
+        })
+        .await
+    }
+
+    /// Forgets the image controls stored for `camera` and puts each back to
+    /// the camera's default: at once while it streams, otherwise when it
+    /// next opens. Persists across restarts (revision 6).
+    async fn reset_camera_controls(&self, camera: String) -> Result<(), IpcError> {
+        self.call(|r| Command::ResetCameraControls(camera, r)).await
+    }
+
     /// After each replace of the preview frame file while a lease is held;
     /// `seq` increases strictly within a daemon run, from 1 (revision 5).
     #[zbus(signal)]
@@ -282,6 +316,13 @@ impl Server {
         self.snap().pipewire_output
     }
 
+    /// The image controls of `ActiveCamera` (camera `""` and none without
+    /// a camera) (revision 6).
+    #[zbus(property)]
+    fn camera_controls(&self) -> CameraControls {
+        self.snap().camera_controls.unwrap_or_default()
+    }
+
     #[zbus(property)]
     fn interface_revision(&self) -> u32 {
         self.snap().interface_revision
@@ -325,6 +366,7 @@ async fn emit_change(emitter: &SignalEmitter<'_>, change: &Change) -> zbus::Resu
         | Change::LoopbackConsumers(v)
         | Change::PipeWireConsumers(v)
         | Change::PreviewConsumers(v) => emit_changed(emitter, name, v).await,
+        Change::CameraControls(v) => emit_changed(emitter, name, v).await,
     }
 }
 

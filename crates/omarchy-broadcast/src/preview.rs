@@ -27,7 +27,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use obc_ipc::{BUS_NAME, IpcError};
+use obc_ipc::BUS_NAME;
 use tokio::signal::unix::{SignalKind, signal};
 use zbus::Connection;
 use zbus::fdo::DBusProxy;
@@ -153,15 +153,6 @@ fn failed(f: Failure) -> Ended {
     }
 }
 
-/// The failure of a call made with `NO_AUTO_START`: the daemon's own error
-/// by name, or a transport error.
-fn call_failed(e: zbus::Error) -> Failure {
-    match IpcError::from(e) {
-        IpcError::ZBus(z) => bus::classify(&z, false),
-        rejected => Failure::Rejected(rejected),
-    }
-}
-
 /// `AcquirePreview(fps)` without starting the daemon: the frame file's path.
 async fn acquire(conn: &Connection, fps: u32) -> Result<String, Failure> {
     let proxy = bus::proxy(conn).await?;
@@ -169,7 +160,7 @@ async fn acquire(conn: &Connection, fps: u32) -> Result<String, Failure> {
         .inner()
         .call_with_flags("AcquirePreview", MethodFlags::NO_AUTO_START, &(fps,))
         .await
-        .map_err(call_failed)?;
+        .map_err(bus::classify_no_autostart)?;
     reply.ok_or_else(|| Failure::Other("AcquirePreview returned no reply".into()))
 }
 

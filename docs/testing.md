@@ -64,7 +64,7 @@ cargo test --release -p obc-pipeline --lib phase_lock_tuning_sweep -- --ignored 
 
 ## Hardware tests
 
-These run the real pipelines and are ignored by default (19 tests in `crates/obc-pipeline/tests/hardware.rs`), each with the reason naming what it needs. Which hardware a test needs:
+These run the real pipelines and are ignored by default (20 tests in `crates/obc-pipeline/tests/hardware.rs`), each with the reason naming what it needs. Which hardware a test needs:
 
 | Tests | Need |
 |---|---|
@@ -73,6 +73,7 @@ These run the real pipelines and are ignored by default (19 tests in `crates/obc
 | `the_writer_alone_is_a_capture_device_with_black_frames` | A free v4l2loopback device with `exclusive_caps=1` and no other writer, named by `OBC_TEST_SINK`. No camera, no GPU |
 | `a_consumer_keeps_one_stream_across_idle_active_idle` | The camera, the GPU, `nvidia-smi` and a free loopback named by `OBC_TEST_SINK` (required) |
 | `selects_test_camera_by_both_routes`, `control_guard_restores_on_drop_and_unwind` | The camera named by `OBC_TEST_CAMERA`, not streaming. The control test needs its `exposure_dynamic_framerate` control writable |
+| `image_controls_query_write_and_read_back` | The camera named by `OBC_TEST_CAMERA`, not streaming, exposing at least one of the image controls. No GPU, no loopback. It changes the camera's image controls and writes every default back at the end, also when it fails (see [Camera image controls](#camera-image-controls)) |
 | The other camera tests (`ingest_restores_the_camera_control_on_stop`, pipeline `passthrough` / `roundtrip`, `every_ingest_path_outputs_requested_format`, `output_holds_the_contract_frame_rate`, `switching_sources_keeps_the_output_and_its_consumer`, `held_loopback_format_is_reported_before_streaming`) | The camera, the GPU and a **free** v4l2loopback device as the sink (no other process may hold it; see [setup/loopback.md](setup/loopback.md)) |
 
 An ignored test that is run without its prerequisite fails, with a message naming what is missing and how to provide it: a camera test when `OBC_TEST_CAMERA` is unset, a control test (`control_guard_restores_on_drop_and_unwind`, `ingest_restores_the_camera_control_on_stop`) when the camera's `exposure_dynamic_framerate` control is missing or read-only, a test that writes to the loopback when no sink can be found (without `OBC_TEST_SINK` it falls back to the device labelled "Omarchy Broadcast", and fails if there is none), and any test when a GStreamer element it builds is not installed. On a machine with the GPU but no camera or loopback, run the `gpu_` tests only; the full run needs all three.
@@ -102,7 +103,7 @@ The switching test asserts that the output never stalls (the longest interval wi
 
 The consumer is the helper binary `obc-consumer` (`crates/obc-pipeline/src/bin/obc-consumer.rs`), built with the crate. It reads the device as a separate process with `v4l2src io-mode=mmap ! video/x-raw ! appsink` and prints one line per event (`caps`, `frame` with the mean, minimum and maximum luma of a row and the frame's stamp, `error`, `eos`); it exits when its standard input closes.
 
-On the reference machine all 19 hardware tests pass with `OBC_TEST_CAMERA=046d:0944 OBC_TEST_CAMERA_2=5986:1193` (a Logitech MX Brio and a laptop-integrated "FHD Camera"), and the earlier 17 also pass on each camera alone, the Brio also with `OBC_TEST_MODE=NV12:640x480@30`.
+On the reference machine the 19 earlier hardware tests pass with `OBC_TEST_CAMERA=046d:0944 OBC_TEST_CAMERA_2=5986:1193` (a Logitech MX Brio and a laptop-integrated "FHD Camera"), and the earlier 17 also pass on each camera alone, the Brio also with `OBC_TEST_MODE=NV12:640x480@30`. `image_controls_query_write_and_read_back` passes on the Brio alone (`OBC_TEST_CAMERA=046d:0944`).
 
 ## Daemon, CLI and D-Bus crate
 
@@ -119,6 +120,7 @@ cargo test -p obc-ipc -p omarchy-broadcastd -p omarchy-broadcast
 - The D-Bus object is served over a peer-to-peer socket pair and driven through `obc_ipc::OmarchyBroadcastProxy`: every property (including `GetAll` and the introspection data), every method and error name, the `PropertiesChanged` sequence, `Stats` while active and none for 2.5 s while idle.
 - Process tests (`tests/process.rs`) run the binary on a private `dbus-daemon` (`/usr/bin/dbus-daemon` is required; without it the tests fail naming it): a second instance exits with status 3 before touching a device, no session bus gives status 1, `--help` and an unknown option behave.
 - The live preview ([ADR-0019](adr/0019-live-preview.md); see [The live preview](#the-live-preview)): in the controller (fake backend, explicit instants, a temporary runtime directory), `preview.rs` and the D-Bus object, as listed there.
+- The camera image controls ([ADR-0020](adr/0020-camera-image-controls.md); see [Camera image controls](#camera-image-controls)): in `obc-core` (the state file), `obc-pipeline` (the allowlist and the range and step check), the controller (a fake device behind the backend seam), the D-Bus object, `obc-ipc` and the CLI.
 
 **`omarchy-broadcast`** (`crates/omarchy-broadcast/tests/cli.rs`, plus unit tests of the JSON and human formatting): the CLI runs against a mock daemon on a private `dbus-daemon` with its own configuration and an activation file whose command is `/bin/sh -c 'echo > marker; exit 1'`, so a failed activation is quick and visible. Both `/usr/bin/dbus-daemon` and `/bin/sh` are required. The tests cover `status`, `cameras`, `on`, `off` and `camera` in human and JSON form, exit codes (3 for a daemon that is not running or no session bus, with reads never activating the daemon), `watch --json` following changes, `Stats` and outages, waiting for the daemon to appear, a daemon that holds its name but does not answer, and `watch` exiting quietly when its reader (`| head -1`) goes away. The `preview` command is covered in [The live preview](#the-live-preview).
 
@@ -264,6 +266,51 @@ OBC_TEST_SINK=/dev/video11 [OBC_TEST_CAMERA=046d:0944] \
 ```
 
 It proves, at 15 and then at 30 frames per second: the lease is announced with the frame file's path and `PreviewConsumers` is 1; the lease starts the camera (`active`), or leaves the daemon `off` without a camera; the frames arrive at the rate asked, within 20 % over at least 5 s, with strictly increasing sequence numbers; the frame file is a 480x270 JPEG of mode 0600 in a directory of mode 0700; after `SIGTERM` the CLI exits 0, `PreviewConsumers` returns to 0 and the file is gone. After that, a `kill -9` of the CLI ends its lease through the bus (`PreviewConsumers` back to 0) and removes the file. The daemon's CPU use without a lease and with each lease, and the encoder's time per frame from the daemon's debug log, are printed, not checked.
+
+### Camera image controls
+
+The image controls ([ADR-0020](adr/0020-camera-image-controls.md)) have no feature flag: the default suite covers them with no camera, no GPU and no loopback device. The controller tests use a fake device behind the backend seam (`ControlNode` in the fake backend): each fake camera has its own controls with ranges, steps and values, and the fake can refuse a write, fail to open a node, leave a control unreadable, or round a written value, and it counts the nodes opened, the queries and the single reads.
+
+**State file** (`crates/obc-core/src/config.rs`):
+- `[camera_controls."<id>"]` round-trips in its shape (`values` as an inline table, `reset_pending` only when true, no table when there is nothing to keep, entries in the order of the ids), including negative values;
+- camera ids that need escaping (quotes, backslashes, control characters, a newline, both kinds of quote, an empty id, text the `toml` crate would otherwise write as a literal or multi-line string) are written as basic strings and read back, all in one file;
+- bad entries are dropped one by one with a warning that names the file and the part (an unknown control name, a value that is not an integer or does not fit 32 bits, a `values` or `reset_pending` of the wrong type, an entry or the whole section that is not a table), the rest of the file is read as usual, and the file is never reported damaged; a damaged file elsewhere still is.
+
+**Allowlist and check** (`crates/obc-pipeline/src/controls.rs`, no device): the five names and their V4L2 ids, in their order; a control is adjustable only if it is not disabled, read-only or inactive and is an integer or a boolean; `check_value` takes the range and the step counted from the minimum (a step of zero or less counts as 1); a node that cannot be opened is an error; a control that cannot be queried or read is skipped without taking the list with it.
+
+**Controller** (`crates/omarchy-broadcastd/src/controller/tests.rs`, fake backend, explicit instants):
+- reads in any state; a set while `active` writes, stores, saves and announces; while the camera is not open it only stores; in `starting`, a set and a reset write to the open camera;
+- a name that is not allowed, a control the camera lacks, a value outside the range or off the step: `InvalidArgument`, nothing written or stored; a write the device refuses while streaming fails the call and stores nothing; a failed write at an open does not fail the session;
+- the stored values survive a restart and are written at the next open; a reset while streaming writes every default and forgets the values, and while idle it is pending until the next open (defaults first, then any value stored since); a stored value the device no longer takes is skipped and kept;
+- each camera keeps its own values and a switch applies those of the new camera; a fail-over and a mode change that reopen the camera apply them again; a rename of the open camera to an id with stored values applies them;
+- the `CameraControls` view is refreshed on a rescan, once at the camera's first frame, and not otherwise; a set opens the node once and reads back only the control it wrote; a control that cannot be read is left out and warned about once;
+- a bad entry in the state file does not turn the daemon off; the controller's allowlist is the same list as the other crates' (`obc-core`, `obc-pipeline`, `obc-ipc`).
+
+**D-Bus object and `obc-ipc`** (`crates/omarchy-broadcastd/src/dbus/tests.rs`, `crates/obc-ipc`): the three methods, the property and its change notifications, and the error names (`Unavailable`, `NoSuchCamera`, `InvalidArgument`, `Failed`) through the typed proxy; the signatures `(siiiiib)` and `(sa(siiiiib))`; the property in the snapshot and `None` from a daemon below revision 6.
+
+**CLI** (`crates/omarchy-broadcast/tests/cli.rs` and the unit tests of `json.rs`, `human.rs`, `model.rs` and `bus.rs`), against a mock daemon:
+- `controls` in human and JSON form; an empty list, not an error, with no camera; one retry when the active camera changed between the properties and the call; `Applied live.` against the not-in-use note by state;
+- `controls set` and `controls reset` print the controls read back, say so when only the read-back failed, and exit 1 with the daemon's message when it rejects the call; usage errors (an unknown name, a missing or non-integer value, `--json` with a subcommand) exit 2 before any call; negative values are accepted;
+- reads never start the daemon, `set` and `reset` may; a revision 5 daemon gives the unsupported message (and the `unsupported-daemon` code with `--json`);
+- `watch --json` prints a `controls` line on a change of the property and none otherwise; the `snapshot` carries `camera_controls` (`null` below revision 6) and the `state` line does not;
+- the JSON bounds: the exact `controls` line, a name over 32 bytes and a list over 16 controls clipped with `controls_truncated`, and worst-case `snapshot` lines that keep the 4096-byte cap by cutting the controls first and then the cameras.
+
+**Hardware tests (ignored).** Both write the camera's defaults back at the end, also when they fail, and print what the camera exposes.
+
+| Test | Needs |
+|---|---|
+| `crates/obc-pipeline/tests/hardware.rs::image_controls_query_write_and_read_back` | `OBC_TEST_CAMERA`, a camera that exposes at least one of the image controls (it fails, naming them, otherwise). No GPU, no loopback. It queries the controls (order, range, default on the step, value in range), writes another valid value (the default plus one step) to a wide control, sharpness if there is one, and reads it back, then writes every default and reads each back |
+| `crates/omarchy-broadcastd/tests/hardware.rs::camera_controls_are_stored_and_reapplied_at_each_open` | `OBC_TEST_SINK` (a free v4l2loopback device with `exclusive_caps=1`), `OBC_TEST_CAMERA` (a colour camera with a writable `sharpness` control), the GPU, `/usr/bin/dbus-daemon` and `cargo`. The real daemon on a private `dbus-daemon`: it reads the controls over D-Bus while idle, sets while streaming (written at once), closes the camera (the values stay applied), puts the device back to its defaults behind the daemon's back, reopens and finds the stored values on the device again, checks that the property shows the device's values once the camera streams, and that a reset while streaming writes every default and leaves nothing in the state file |
+
+```sh
+OBC_TEST_CAMERA=046d:0944 \
+  cargo test -p obc-pipeline --test hardware -- --ignored --test-threads=1 image_controls_
+OBC_TEST_SINK=/dev/video11 OBC_TEST_CAMERA=046d:0944 \
+  cargo test -p omarchy-broadcastd --test hardware -- --ignored --test-threads=1 --nocapture \
+  camera_controls_are_stored
+```
+
+On the reference machine both pass on the Logitech MX Brio (`046d:0944`), and leave its image controls at their defaults.
 
 ### Known limitation: one application at a time
 

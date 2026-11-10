@@ -63,8 +63,10 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// both kinds of consumer. Revision 4 added video noise removal: `Denoise`
 /// and `SetDenoise`. Revision 5 added the live preview: `AcquirePreview`,
 /// `ReleasePreview`, the `PreviewFrame` signal and `PreviewConsumers`, with
-/// `Consumers` counting the preview leases too.
-pub const INTERFACE_REVISION: u32 = 5;
+/// `Consumers` counting the preview leases too. Revision 6 added the camera
+/// image controls: `CameraControls`, `GetCameraControls`,
+/// `SetCameraControl` and `ResetCameraControls`.
+pub const INTERFACE_REVISION: u32 = 6;
 /// The first [`INTERFACE_REVISION`] with `LoopbackConsumers`,
 /// `PipeWireConsumers` and `PipeWireOutput`.
 pub const PIPEWIRE_REVISION: u32 = 3;
@@ -76,6 +78,20 @@ pub const DENOISE_REVISION: u32 = 4;
 pub const PREVIEW_REVISION: u32 = 5;
 /// The frame rates `AcquirePreview` accepts.
 pub const PREVIEW_FPS: [u32; 2] = [15, 30];
+/// The first [`INTERFACE_REVISION`] with the camera image controls:
+/// `CameraControls`, `GetCameraControls`, `SetCameraControl` and
+/// `ResetCameraControls`.
+pub const CONTROLS_REVISION: u32 = 6;
+/// The image controls the daemon may expose, by their v4l2-ctl names, in
+/// the order it reports them. A camera exposes those it has; the daemon
+/// checks names and values, this list is for clients (labels, layout).
+pub const CAMERA_CONTROL_NAMES: [&str; 5] = [
+    "brightness",
+    "contrast",
+    "saturation",
+    "sharpness",
+    "backlight_compensation",
+];
 /// `PipeWireOutput` of a daemon whose PipeWire output is not configured, or
 /// that has none (before [`PIPEWIRE_REVISION`]).
 pub const PIPEWIRE_OFF: &str = "off";
@@ -176,6 +192,36 @@ pub struct CameraInfo {
     pub usb: String,
 }
 
+/// One image control of a camera: a D-Bus struct `(siiiiib)`, an entry of
+/// `GetCameraControls` and of the `CameraControls` property (revision 6).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
+pub struct CameraControl {
+    /// One of [`CAMERA_CONTROL_NAMES`].
+    pub name: String,
+    pub min: i32,
+    pub max: i32,
+    /// The distance between two valid values, counted from `min`.
+    pub step: i32,
+    /// The camera's own default.
+    pub default: i32,
+    /// For the camera that streams, the value on the device; otherwise the
+    /// value it will be given when it opens: the user's stored value, else
+    /// the default after a pending reset, else the value on the device.
+    pub value: i32,
+    /// The user has a stored value for it, applied whenever the camera
+    /// opens.
+    pub stored: bool,
+}
+
+/// The image controls of one camera: a D-Bus struct `(sa(siiiiib))`, the
+/// `CameraControls` property (revision 6). `camera` is the id of
+/// `ActiveCamera`, empty (with no control) when there is no camera.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
+pub struct CameraControls {
+    pub camera: String,
+    pub controls: Vec<CameraControl>,
+}
+
 /// One sample of the `Stats` signal. A value that cannot be measured is
 /// [`Stats::NOT_MEASURABLE`] (`-1.0`).
 ///
@@ -230,7 +276,8 @@ impl Default for Stats {
 #[derive(Debug, DBusError)]
 #[zbus(prefix = "br.com.dias.OmarchyBroadcast1.Error")]
 pub enum IpcError {
-    /// `SelectCamera` named no camera that is present.
+    /// `SelectCamera` (or, from revision 6, a camera control method) named
+    /// no camera that is present.
     NoSuchCamera(String),
     /// The configuration file is invalid; the previous config stays in force.
     InvalidConfig(String),
@@ -239,7 +286,10 @@ pub enum IpcError {
     /// An argument is out of its domain: an unknown effect, a blur strength
     /// outside 0 to 1, a background image that is not an absolute path to a
     /// readable regular file, or `replace` with no background image
-    /// (revision 2); a preview frame rate other than 15 or 30 (revision 5).
+    /// (revision 2); a preview frame rate other than 15 or 30 (revision 5);
+    /// a camera control name that is not one of [`CAMERA_CONTROL_NAMES`] or
+    /// that the camera does not expose, or a value outside the control's
+    /// range or off its step (revision 6).
     InvalidArgument(String),
     /// Any other failure.
     Failed(String),
@@ -298,6 +348,9 @@ pub struct Snapshot {
     /// `ready`, `streaming` or `failed`; `off` when the daemon does not
     /// offer it.
     pub pipewire_output: String,
+    /// `CameraControls` (revision 6): the image controls of `ActiveCamera`;
+    /// `None` when the daemon does not offer it.
+    pub camera_controls: Option<CameraControls>,
     pub interface_revision: u32,
 }
 
@@ -321,6 +374,7 @@ impl Snapshot {
             pipewire_consumers: 0,
             preview_consumers: 0,
             pipewire_output: PIPEWIRE_OFF.into(),
+            camera_controls: None,
             interface_revision: 0,
         }
     }
@@ -360,6 +414,7 @@ impl Snapshot {
             "PipeWireConsumers" => self.pipewire_consumers = deserialize_for_property(value)?,
             "PreviewConsumers" => self.preview_consumers = deserialize_for_property(value)?,
             "PipeWireOutput" => self.pipewire_output = deserialize_for_property(value)?,
+            "CameraControls" => self.camera_controls = Some(deserialize_for_property(value)?),
             "InterfaceRevision" => self.interface_revision = deserialize_for_property(value)?,
             _ => {}
         }
@@ -432,7 +487,7 @@ impl Snapshot {
     ///
     /// The properties added after revision 1 (`BlurStrength`,
     /// `BackgroundImage`, `PipeWireConsumers`, `PipeWireOutput`, `Denoise`,
-    /// `PreviewConsumers`)
+    /// `PreviewConsumers`, `CameraControls`)
     /// keep their [`Snapshot::empty`] value when the daemon does not offer
     /// them (see [`is_unknown_property_error`]), and `LoopbackConsumers` is then
     /// `Consumers`, as [`Snapshot::from_properties`] does for a property
@@ -459,6 +514,10 @@ impl Snapshot {
             )?,
             preview_consumers: optional(proxy.preview_consumers().await, empty.preview_consumers)?,
             pipewire_output: optional(proxy.pipewire_output().await, empty.pipewire_output)?,
+            camera_controls: optional(
+                proxy.camera_controls().await.map(Some),
+                empty.camera_controls,
+            )?,
             interface_revision: proxy.interface_revision().await?,
         })
     }
@@ -560,6 +619,15 @@ mod tests {
         assert_eq!(<CameraInfo as Type>::SIGNATURE.to_string(), "(sss)");
         assert_eq!(<Vec<CameraInfo> as Type>::SIGNATURE.to_string(), "a(sss)");
         assert_eq!(<Stats as Type>::SIGNATURE.to_string(), "(dddd)");
+        assert_eq!(<CameraControl as Type>::SIGNATURE.to_string(), "(siiiiib)");
+        assert_eq!(
+            <Vec<CameraControl> as Type>::SIGNATURE.to_string(),
+            "a(siiiiib)"
+        );
+        assert_eq!(
+            <CameraControls as Type>::SIGNATURE.to_string(),
+            "(sa(siiiiib))"
+        );
     }
 
     fn cam(id: &str, name: &str) -> CameraInfo {
@@ -768,8 +836,73 @@ mod tests {
         assert_eq!(old.preview_consumers, 0);
         assert!(old.interface_revision < PREVIEW_REVISION);
         assert_eq!(Snapshot::empty().preview_consumers, 0);
-        assert_eq!(INTERFACE_REVISION, PREVIEW_REVISION);
         assert_eq!(PREVIEW_FPS, [15, 30]);
+    }
+
+    fn sharpness(value: i32, stored: bool) -> CameraControl {
+        CameraControl {
+            name: "sharpness".into(),
+            min: 0,
+            max: 255,
+            step: 1,
+            default: 128,
+            value,
+            stored,
+        }
+    }
+
+    #[test]
+    fn the_revision_6_property_and_an_older_daemon() {
+        let state = Variant::from("active");
+        let rev6 = Variant::from(CONTROLS_REVISION);
+        let view = CameraControls {
+            camera: "usb-a".into(),
+            controls: vec![sharpness(200, true)],
+        };
+        let controls = zbus::as_variant::to_owned_variant(&view).unwrap();
+        let snap = Snapshot::from_properties([
+            ("State", &state),
+            ("CameraControls", &controls),
+            ("InterfaceRevision", &rev6),
+        ])
+        .unwrap();
+        assert_eq!(snap.camera_controls, Some(view.clone()));
+        // A change replaces the whole view.
+        let mut changed = snap.clone();
+        let none = zbus::as_variant::to_owned_variant(&CameraControls::default()).unwrap();
+        changed.apply_property("CameraControls", &none).unwrap();
+        assert_eq!(changed.camera_controls, Some(CameraControls::default()));
+        assert!(changed.apply_property("CameraControls", &state).is_err());
+        // A revision-5 daemon has none: None.
+        let rev5 = Variant::from(PREVIEW_REVISION);
+        let old =
+            Snapshot::from_properties([("State", &state), ("InterfaceRevision", &rev5)]).unwrap();
+        assert_eq!(old.camera_controls, None);
+        assert!(old.interface_revision < CONTROLS_REVISION);
+        assert_eq!(Snapshot::empty().camera_controls, None);
+        assert_eq!(INTERFACE_REVISION, CONTROLS_REVISION);
+        assert_eq!(
+            CAMERA_CONTROL_NAMES,
+            [
+                "brightness",
+                "contrast",
+                "saturation",
+                "sharpness",
+                "backlight_compensation"
+            ]
+        );
+        // As clients serialise it.
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "camera": "usb-a",
+                "controls": [{
+                    "name": "sharpness", "min": 0, "max": 255, "step": 1,
+                    "default": 128, "value": 200, "stored": true
+                }]
+            })
+        );
     }
 
     #[test]

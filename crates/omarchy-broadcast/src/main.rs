@@ -15,14 +15,17 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use clap::builder::PossibleValuesParser;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand};
-use obc_ipc::IpcError;
+use obc_ipc::{CameraControls, IpcError, Snapshot};
+use zbus::Connection;
 
 use crate::bus::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Failure, READ_TIMEOUT};
 
-/// Time allowed for `on`, `off`, `camera`, `effect <effect>` and `denoise`,
-/// which may wait for D-Bus activation of the daemon.
+/// Time allowed for `on`, `off`, `camera`, `effect <effect>`, `denoise`,
+/// `controls set` and `controls reset`, which may wait for D-Bus activation
+/// of the daemon.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 const AFTER_HELP: &str = "\
@@ -34,9 +37,10 @@ Exit status:
   3  omarchy-broadcastd is not running, or there is no D-Bus session bus
   4  any other D-Bus failure, a timeout, or a failed write to stdout
 
-`status`, `cameras`, `watch`, `preview` and `effect` without an effect never start the
-daemon. `on`, `off`, `camera`, `effect <effect>` and `denoise` may start it through D-Bus
-activation when its activation file is installed.
+`status`, `cameras`, `watch`, `preview`, `effect` without an effect and `controls` without
+a subcommand never start the daemon. `on`, `off`, `camera`, `effect <effect>`, `denoise`,
+`controls set` and `controls reset` may start it through D-Bus activation when its
+activation file is installed.
 
 `--json` output is documented in docs/cli-json.md; the D-Bus interface in docs/dbus-api.md.";
 
@@ -111,6 +115,28 @@ enum Command {
         #[arg(value_parser = ["on", "off"])]
         value: String,
     },
+    /// Show or change the image controls of the active camera: brightness,
+    /// contrast, saturation, sharpness and backlight compensation, those
+    /// the camera has.
+    ///
+    /// Without a subcommand, prints each control's value, range and
+    /// default; `(stored)` marks a value set here, which the daemon gives
+    /// the camera whenever it opens. A change applies at once while the
+    /// camera is open (state `starting` or `active`); otherwise it is stored and applied
+    /// the next time the camera opens. The values persist across restarts
+    /// of the daemon, for each camera.
+    ///
+    /// Examples: `omarchy-broadcast controls set brightness 10`,
+    /// `omarchy-broadcast controls reset`.
+    #[command(args_conflicts_with_subcommands = true)]
+    Controls {
+        /// Print one JSON object (`"type":"controls"`); only without a
+        /// subcommand.
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<ControlsAction>,
+    },
     /// Follow state changes and stats until interrupted.
     Watch {
         /// Print one JSON object per line (NDJSON).
@@ -131,6 +157,25 @@ enum Command {
         #[arg(long, value_name = "15|30", default_value_t = 15, value_parser = parse_fps)]
         fps: u32,
     },
+}
+
+/// The subcommands of `controls`.
+#[derive(Subcommand)]
+enum ControlsAction {
+    /// Set an image control of the active camera, and store the value for
+    /// that camera; then print the controls.
+    Set {
+        /// The control.
+        #[arg(value_parser = PossibleValuesParser::new(obc_ipc::CAMERA_CONTROL_NAMES))]
+        name: String,
+        /// A whole number within the control's range and on its step (see
+        /// `omarchy-broadcast controls`); the daemon checks it.
+        #[arg(allow_negative_numbers = true)]
+        value: i32,
+    },
+    /// Forget the values stored for the active camera and put every
+    /// control back to the camera's default; then print the controls.
+    Reset,
 }
 
 /// The value of `--fps`: 15 or 30.
@@ -370,6 +415,99 @@ async fn set_denoise(on: bool) -> u8 {
     }
 }
 
+/// The image controls of the active camera, without starting the daemon:
+/// the properties first (for the revision, the state and the camera's
+/// name), then `GetCameraControls` for that camera's id, which the daemon
+/// reads from the device. With no camera present there is nothing to ask
+/// (the daemon would answer `Unavailable`): the controls are empty, as in
+/// the `CameraControls` property.
+async fn read_controls(conn: &Connection) -> Result<(Snapshot, CameraControls), Failure> {
+    let mut snap = bus::fetch(conn).await?;
+    bus::require_controls(snap.interface_revision)?;
+    // The active camera can change (or go away) between the properties and
+    // the call: a `NoSuchCamera` for the id just read is answered by reading
+    // the properties once more and asking again, once.
+    let mut retried = false;
+    loop {
+        if snap.active_camera.is_empty() {
+            return Ok((snap, CameraControls::default()));
+        }
+        match bus::camera_controls(conn, &snap.active_camera).await {
+            Ok(controls) => {
+                let camera = snap.active_camera.clone();
+                return Ok((snap, CameraControls { camera, controls }));
+            }
+            Err(Failure::Rejected(IpcError::NoSuchCamera(_))) if !retried => {
+                retried = true;
+                snap = bus::fetch(conn).await?;
+            }
+            Err(f) => return Err(f),
+        }
+    }
+}
+
+/// `controls`: prints the image controls of the active camera.
+async fn show_controls(json: bool) -> u8 {
+    let result = within(READ_TIMEOUT, async {
+        let conn = bus::connect().await?;
+        read_controls(&conn).await
+    })
+    .await;
+    match result {
+        Ok((s, c)) => {
+            if json {
+                out::line(&json::controls_line(&c));
+            } else {
+                out::print(&human::controls_text(&s, &c));
+            }
+            EXIT_OK
+        }
+        Err(f) => report(&f, json),
+    }
+}
+
+/// `controls set|reset`: checks that the daemon has the image controls,
+/// makes the change on the active camera, and prints the controls read
+/// back after it. The value's range is the daemon's to check.
+async fn change_controls(action: &ControlsAction) -> u8 {
+    // Whether the daemon accepted the change: a failure after that is only
+    // the read-back's, and the message says so.
+    let changed = std::cell::Cell::new(false);
+    let result = within(CALL_TIMEOUT, async {
+        let conn = bus::connect().await?;
+        let proxy = bus::proxy(&conn).await?;
+        let revision = proxy
+            .interface_revision()
+            .await
+            .map_err(|e| bus::classify(&e, true))?;
+        bus::require_controls(revision)?;
+        match action {
+            ControlsAction::Set { name, value } => proxy.set_camera_control("", name, *value).await,
+            ControlsAction::Reset => proxy.reset_camera_controls("").await,
+        }
+        .map_err(bus::classify_ipc)?;
+        changed.set(true);
+        read_controls(&conn).await
+    })
+    .await;
+    match result {
+        Ok((s, c)) => {
+            out::print(&human::controls_text(&s, &c));
+            EXIT_OK
+        }
+        Err(f) if changed.get() => {
+            // Still a failure (the exit status says the result is unknown),
+            // but not a failed change.
+            eprintln!(
+                "omarchy-broadcast: the change was made, but reading the controls back failed: {}",
+                human::printable(&f.message())
+            );
+            f.exit_code()
+        }
+        Err(f) => report(&f, false),
+    }
+}
+
 /// What `main` runs once the command line is checked.
 enum Job {
     Command(Command),
@@ -398,6 +536,11 @@ async fn run(job: Job) -> u8 {
         Job::Command(Command::Watch { json }) => watch::run(*json).await,
         Job::Command(Command::Preview { json, fps }) => preview::run(*json, *fps).await,
         Job::Command(Command::Denoise { value }) => set_denoise(value == "on").await,
+        Job::Command(Command::Controls { json, action: None }) => show_controls(*json).await,
+        Job::Command(Command::Controls {
+            action: Some(action),
+            ..
+        }) => change_controls(action).await,
         Job::Command(command @ (Command::On | Command::Off | Command::Camera { .. })) => {
             control(command).await
         }
