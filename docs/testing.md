@@ -45,11 +45,14 @@ The output clock ([ADR-0010](adr/0010-phase-locked-output-clock.md)) is tested o
 
 The assertions count and order ticks; the only times compared are lower bounds, which a loaded machine can only lengthen.
 
+**The crash cover** (`crates/obc-pipeline/src/loopback_cover.rs`, no device) has unit tests for: the `timeout` formula (at least 250 ms, above the writer's worst gap by the margin, capped at the control's maximum, refused when the maximum is not positive); the black fill (luma, then chroma up to `sizeimage`; a fill that does not fit is refused); finding the loopback's controls by name; a missing node failing the cover; the slot that keeps the outcome of the current start; and taking back a pending `timeout_image_io` mode, also after a failure following the button press. The cover itself, against a real driver, is tested by the hardware tests below.
+
 **The loopback writer** ([ADR-0011](adr/0011-daemon-lifecycle-and-dbus-api.md)) is tested on the CPU in `crates/obc-pipeline/src/loopback.rs`, with a `fakesink` or a system-memory session in place of the loopback and the CUDA elements:
 - `placeholder_timing_rules`: when a placeholder is due (two contract periods after the last forwarded frame) and when it is not.
 - `the_black_frame_fills_the_contract_layout`: NV12 and I420, at 1920x1080 and 642x480: the whole frame is covered, luma 16, chroma 128, with the layout `GstVideoInfo` gives.
 - `the_writer_pipeline_has_the_contract_caps_and_no_cuda_element`: the `appsrc` carries the contract caps, is live, holds at most 3 buffers and does not block; the `v4l2sink` is `sync=false`; no `nvcodec` or CUDA element is in the pipeline; a full-range contract is refused for a loopback and accepted for a `fakesink`.
-- `alone_the_writer_sends_black_frames_at_the_contract_rate`: NV12 and I420 320x240@30 into a `fakesink`: one caps event, 30 black whole frames sharing one memory, the k-th timestamp at least k periods, timestamps strictly increasing.
+- `alone_the_writer_sends_black_frames_at_the_contract_rate`: NV12 and I420 320x240@30 into a `fakesink`: one caps event, 30 black whole frames sharing one memory, the k-th timestamp at least k periods, timestamps strictly increasing and, since [ADR-0022](adr/0022-crash-recovery-for-consumers.md), `CLOCK_MONOTONIC` times of the push (between the clock reads taken before the start and after the stop), and no crash cover on a `fakesink`.
+- `a_new_writer_continues_the_timeline_of_the_previous_one`: two writers one after the other (a new daemon process in effect): the second one's first timestamp is after the first one's last, not back at 0.
 - `a_forwarded_buffer_is_restamped_without_a_copy`: the sink sees the same memory address as the producer's buffer; the producer's buffer keeps its own timestamp; pushes before start and after stop are refused and counted.
 - `a_writer_output_ends_in_an_appsink_with_the_writer_contract`: an output built for the writer ends in an `appsink` named `loopback`; a contract different from the writer's is refused.
 - `the_writer_hands_over_between_placeholder_and_output_without_renegotiating`: placeholders, then a session forwarding a live pattern, then the session stopped. The sink sees placeholder, forwarded, placeholder runs with no placeholder among the forwarded frames, the output's caps equal the writer's, one caps event, strictly increasing timestamps, and placeholders resuming no sooner than two periods after the last forwarded frame. The interleaved count and the resume time (66.7 ms measured) are printed, not asserted, so a loaded machine does not fail the test.
@@ -70,7 +73,7 @@ These run the real pipelines and are ignored by default (20 tests in `crates/obc
 |---|---|
 | `gpu_*` (7: crop and letterbox geometry read back from the GPU, stalled and slow sources, a dead output clock, a failed switch whose hold times out, a switch held across a slow-starting source, a slow sink behind the real output) | An NVIDIA GPU and the GStreamer CUDA elements. No variable, no camera, no loopback |
 | `output_restarts_while_a_consumer_holds_the_loopback` | A free v4l2loopback device named by `OBC_TEST_SINK`, and the GPU. No camera. It fails unless `OBC_TEST_SINK` is set, so it never writes to a device that merely carries the default label |
-| `the_writer_alone_is_a_capture_device_with_black_frames` | A free v4l2loopback device with `exclusive_caps=1` and no other writer, named by `OBC_TEST_SINK`. No camera, no GPU |
+| `the_writer_alone_is_a_capture_device_with_black_frames` | A free v4l2loopback device with `exclusive_caps=1` and no other writer, named by `OBC_TEST_SINK`, with the timeout controls (v4l2loopback 0.15.4 has them). No camera, no GPU. It sets `timeout` on the device and puts it back |
 | `a_consumer_keeps_one_stream_across_idle_active_idle` | The camera, the GPU, `nvidia-smi` and a free loopback named by `OBC_TEST_SINK` (required) |
 | `selects_test_camera_by_both_routes`, `control_guard_restores_on_drop_and_unwind` | The camera named by `OBC_TEST_CAMERA`, not streaming. The control test needs its `exposure_dynamic_framerate` control writable |
 | `image_controls_query_write_and_read_back` | The camera named by `OBC_TEST_CAMERA`, not streaming, exposing at least one of the image controls. No GPU, no loopback. It changes the camera's image controls and writes every default back at the end, also when it fails (see [Camera image controls](#camera-image-controls)) |
@@ -97,7 +100,7 @@ OBC_TEST_CAMERA=046d:0944 OBC_TEST_SINK=/dev/video11 \
 
 The switching test asserts that the output never stalls (the longest interval without a frame, at the loopback sink and at an in-process consumer, stays within two output periods plus 20 ms), that the sink negotiates caps exactly once for the whole test, that the consumer sees no renegotiation, and that the UVC control is restored across a switch. A failed assertion still restores the camera's original `exposure_dynamic_framerate`.
 
-`the_writer_alone_is_a_capture_device_with_black_frames` asserts that the device is not a capture device before the writer starts and is one (`VIDIOC_QUERYCAP`) once it streams; that a consumer in another process receives at least 60 black frames with one caps negotiation (NV12 1920x1080 30/1); that the writer's sink sees one caps event and placeholders only; that the device is no capture device again after the writer stops; and that the `nvcodec` plugin was not loaded by the writer.
+`the_writer_alone_is_a_capture_device_with_black_frames` asserts that the device is not a capture device before the writer starts and is one (`VIDIOC_QUERYCAP`) once it streams; that a consumer in another process receives at least 60 black frames with one caps negotiation (NV12 1920x1080 30/1); that the writer's sink sees one caps event and placeholders only; that the device is no capture device again after the writer stops; and that the `nvcodec` plugin was not loaded by the writer. It also checks the crash cover ([ADR-0022](adr/0022-crash-recovery-for-consumers.md)): the cover is ready with `timeout` 250 ms, the device's `timeout` control reads 250, and no timeout-image mode is left pending (a pending one is taken back, and the test presses the button once to check that the clearing works). The test restores `keep_format`, `sustain_framerate` and `timeout` to their earlier values when it ends, also when it fails.
 
 `a_consumer_keeps_one_stream_across_idle_active_idle` runs the daemon's hand-over without the daemon: writer placeholders, then a CUDA session whose output forwards to the writer, then the session stopped. A consumer in another process must see placeholder, forwarded, placeholder runs with black placeholders; one caps negotiation at the consumer and at the writer's sink; a longest silence of at most three periods plus 30 ms at both; no writer placeholder while frames are forwarded; fresh camera frames; the process listed by `nvidia-smi` while the session runs and not within 5 s of its stop; the camera descriptor closed after the stop; and no failed pushes. It changes no camera control, and prints only the picture content it saw.
 
@@ -153,6 +156,23 @@ It asserts, in order:
 8. **Exit.** `SIGTERM` while active exits with status 0 and releases the loopback; the loss of the bus connection exits with status 1.
 
 The test sets the environment variable `OBC_TEST_STAMP_FORWARDED=1` for the daemon, which stamps the frames the output forwards so that the consumer can tell camera frames from placeholders; it exists for this test only. The test changes one UVC control and restores it.
+
+### Consumer across a daemon crash (ignored)
+
+`crates/omarchy-broadcastd/tests/crash.rs::a_consumer_keeps_receiving_black_frames_across_a_daemon_crash` ([ADR-0022](adr/0022-crash-recovery-for-consumers.md)) runs the real `omarchy-broadcastd` binary on a private `dbus-daemon`, with the loopback named by `OBC_TEST_SINK` and a raw V4L2 reader of that node in the test process. No camera and no GPU: the daemon starts `off` (its state file says so), so it never opens a session, and its writer sends black placeholders. The test kills the daemon with SIGKILL, leaves the loopback without a writer for 1.5 s, and starts a new daemon.
+
+| Needs | |
+|---|---|
+| `OBC_TEST_SINK` | A free v4l2loopback device with `exclusive_caps=1` and the timeout controls (v4l2loopback 0.15.4 has them), for example `/dev/video11`. Required; the test refuses a device another process holds |
+| `/usr/bin/dbus-daemon` | For the private bus |
+
+```sh
+OBC_TEST_SINK=/dev/video11 cargo test -p omarchy-broadcastd --test crash -- --ignored --nocapture --test-threads=1
+```
+
+It asserts that the reader gets no error and never goes without a frame for longer than 600 ms (Chromium restarts its capture after about a second); that the frames are the first daemon's, then black ones from the timeout image (Y=16 and chroma 128, not the driver's zero-filled green), then the second daemon's, in that order, so the driver's timer never fires while a writer runs; that the buffer timestamps never go back across the kill and the restart and the new writer's are `CLOCK_MONOTONIC` times; and that each daemon's `LoopbackConsumers` leaves out the daemon's own descriptors (the writer's and the cover's). With `--nocapture` it prints the outage as the reader saw it.
+
+The test reads the loopback's `keep_format`, `sustain_framerate` and `timeout` controls before it starts and puts them back at the end, also when it fails, because the daemon's cover sets `timeout` and never resets it. `timeout_image_io` is a button with no value to restore, but pressing it leaves a device-wide timeout-image mode pending until a descriptor takes the image, which the cover does at once; if the cover failed and left it pending, the test takes it back. The other daemon hardware tests that start the daemon on a loopback leave `timeout` set on the device (it persists until the module is reloaded); this one and the writer-alone test of [Hardware tests](#hardware-tests) restore it.
 
 ### Measured on the reference machine
 
@@ -356,10 +376,10 @@ They also check the noise-removal stage with the fake backend: `none` with noise
 
 ### Maxine hardware tests
 
-These load the real SDK. They need `MAXINE_VFX_ROOT` and the SDK's library directories on `LD_LIBRARY_PATH` ([setup/maxine.md](setup/maxine.md), sections 2 to 4), and, on a distribution the SDK does not list, the os-release shim. With `maxine-vfx-sdk-local` installed, the package's environment file sets all of that, and the shim is the package's. Set `LD_PRELOAD` through the cargo runner, so that only the test binaries load the shim; `LD_PRELOAD=... cargo test` would be dropped by cargo. With an SDK tree that is not the package, set `MAXINE_VFX_ROOT`, `LD_LIBRARY_PATH` and `MAXINE_OS_RELEASE` as the omarchy-nvidia-sdks documentation (`docs/usage.md`) describes. With the package installed the daemon's `MAXINE_VFX_ROOT` default (`/opt/nvidia/maxine/videofx`) also applies. The default test suite stays hermetic regardless, because none of its tests probes or loads the SDK through the environment: the tests that probe or load construct the factory with an explicit root or none (`MaxineFactory::with_root`), or inject a test factory, and the few that build the default factory only check its name and its fault switches. The `env -u` command above cannot show this on its own, because it does not disable the directory-based default root.
+These load the real SDK. They need the SDK root and, on a distribution the SDK does not list, the os-release shim ([setup/maxine.md](setup/maxine.md), sections 2 to 4). `LD_LIBRARY_PATH` is not needed: the backend loads the SDK's libraries from the root itself ([ADR-0021](adr/0021-nvidia-sdk-handover.md), amendment). The root is `MAXINE_VFX_ROOT` when set, else, with `maxine-vfx-sdk-local` installed, the default `/opt/nvidia/maxine/videofx`; the package's environment file sets the variable and `MAXINE_OS_RELEASE` (the shim's input), and the shim is the package's. Set `LD_PRELOAD` through the cargo runner, so that only the test binaries load the shim; `LD_PRELOAD=... cargo test` would be dropped by cargo. With an SDK tree that is not the package, set `MAXINE_VFX_ROOT` and `MAXINE_OS_RELEASE` as the omarchy-nvidia-sdks documentation (`docs/usage.md`) describes. The default test suite stays hermetic regardless, because none of its tests probes or loads the SDK through the environment: the tests that probe or load construct the factory with an explicit root or none (`MaxineFactory::with_root`), or inject a test factory, and the few that build the default factory only check its name and its fault switches. The `env -u` command above cannot show this on its own, because it does not disable the directory-based default root.
 
 ```sh
-set -a; . /usr/share/maxine-vfx/maxine-vfx.env; set +a    # MAXINE_VFX_ROOT, LD_LIBRARY_PATH, MAXINE_OS_RELEASE
+set -a; . /usr/share/maxine-vfx/maxine-vfx.env; set +a    # MAXINE_VFX_ROOT, MAXINE_OS_RELEASE (and LD_LIBRARY_PATH, not needed)
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env LD_PRELOAD=$MAXINE_VFX_OS_RELEASE_SHIM"
 
 cargo test -p obc-gpu -p obc-backend-maxine -p gst-obc -- --ignored --test-threads=1
@@ -369,13 +389,21 @@ OBC_TEST_CAMERA=046d:0944 OBC_TEST_SINK=/dev/video11 \
 
 - `obc-backend-maxine` (13 tests in `tests/hardware.rs`; the 8 `maxine_denoise_` tests are described under [Video noise removal](#video-noise-removal)): the backend refuses calls without the CUDA context or a load; blur and replace in a context created like GStreamer's, with per-stage GPU times, load times and GPU memory logged. The SDK works in the pushed context: afterwards the device's primary context is inactive. The mask hardening has three more (see [The hardened mask](#the-hardened-mask)).
 - `gst-obc` (16 tests in `tests/hardware.rs`, including `gpu_` ones and `maxine_denoise_alone_under_blur_and_toggled_while_playing`) and `obc-gpu` (3 tests, plus the four `checkpoint_` tests of [Parking the GPU at Idle](#parking-the-gpu-at-idle)): the element against the real backend, and the driver helpers and the mask kernel. `gst-obc` has `obc-backend-maxine` as a dev-dependency for `maxine_mask_kernel_failures_show_black_with_the_reason`, which needs the Maxine environment above.
+- `obc-backend-maxine` `tests/sdk_root.rs` (3 ignored tests): the SDK found from its root alone, with no `LD_LIBRARY_PATH`. Each test re-runs the test binary as a child process, because the loader reads `LD_LIBRARY_PATH` and `LD_PRELOAD` only at process start. The child has `LD_LIBRARY_PATH` removed, the shim preloaded (`OBC_TEST_PRELOAD`, with `MAXINE_OS_RELEASE`) and the root given one way only: as `MAXINE_VFX_ROOT` (`maxine_effects_run_from_the_variable_alone`); as the configured root, the daemon's `[effect] maxine_root`, with the variable removed (`maxine_effects_run_from_the_configured_root_alone`); or not at all, the end user's setup with the package, where the default root must be found (`maxine_effects_run_from_the_default_root_with_nothing_set`). In the child, blur and noise removal each load and run a frame, and `/proc/self/maps` must show the SDK's libraries mapped from that root. The first two use the root this process would use (`MAXINE_VFX_ROOT`, else the default); the third needs the package. The unit tests of the backend cover the root precedence, the pin (a different root after the SDK is loaded is refused), the ELF `DT_NEEDED` reader (including crafted and malformed input) and the load order; those of `obc-core` the validation of `maxine_root`.
+
+```sh
+env -u LD_LIBRARY_PATH -u MAXINE_VFX_ROOT MAXINE_OS_RELEASE=/usr/lib/maxine-vfx/fake-os-release \
+  OBC_TEST_PRELOAD=/usr/lib/maxine-vfx/os-release-shim.so \
+  cargo test -p obc-backend-maxine --test sdk_root -- --ignored --test-threads=1
+```
+
 - `maxine_effects_end_to_end_keep_the_rate_and_release_the_gpu` (`obc-pipeline`): camera, session and output with `blur`, then `replace`, then `none`; each phase keeps the contract rate at the sink, the effect becomes ready, its statistics are sane, and after the output stops the process holds no CUDA context.
 
 The frames in these tests are synthetic, so the mask the model produces for them is not predictable; the tests assert what holds for any mask and log the rest.
 
 ### Video noise removal
 
-The stage is tested at each level described above; this section lists what needs the SDK and its `nvvfxdenoising` feature and models ([setup/maxine.md](setup/maxine.md), sections 1 and 2; `features/nvvfxdenoising/lib` must be on `LD_LIBRARY_PATH`, which the package's environment file does).
+The stage is tested at each level described above; this section lists what needs the SDK and its `nvvfxdenoising` feature and models ([setup/maxine.md](setup/maxine.md), sections 1 and 2; the daemon and the backend find the feature's library under the SDK root themselves, so `LD_LIBRARY_PATH` is not needed).
 
 - **Backend** (`crates/obc-backend-maxine/tests/hardware.rs`, run with the command of [Maxine hardware tests](#maxine-hardware-tests)): `maxine_denoise_alone_removes_noise_from_a_flat_frame`, `maxine_denoise_switches_on_and_off_on_a_loaded_chain`, `maxine_denoise_before_blur_and_replace_gives_sane_output`, `maxine_denoise_reset_temporal_starts_a_new_video`, `maxine_denoise_strength_0_and_1_both_load_and_run`, `maxine_denoise_gpu_memory_returns_after_unload`, `maxine_denoise_faults_degrade_to_the_chain_without_it` (fault injection for the load and the run) and `maxine_denoise_loads_again_after_the_gpu_was_parked` (park and unpark, in its own process).
 - **Element** (`crates/gst-obc/tests/hardware.rs`): `maxine_denoise_alone_under_blur_and_toggled_while_playing`.

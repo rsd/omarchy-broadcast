@@ -125,6 +125,28 @@ omarchy-broadcast status
 
 The service is ready (`Type=dbus`) once it owns its bus name, which it requests after the loopback writer has started: at that point the virtual camera is already listed as a capture device.
 
+### Restarts and crashes
+
+A clean restart (`systemctl --user restart omarchy-broadcastd`, an upgrade) is invisible to applications that hold the virtual camera: the old writer sends placeholders until it closes and the new one starts within about 50 ms.
+
+If the daemon crashes, the unit restarts it after 250 ms (`RestartSec=250ms`). The camera picture returns once the new process has opened the camera and initialised CUDA, which takes seconds; until then applications see black. To keep Chromium-based applications (Chrome, Edge, Teams, Zoom in the browser, Discord, Slack and other Electron applications) from losing the camera in that time, the daemon prepares the loopback at every writer start: it uploads a black image and sets the driver's `timeout`, so the driver keeps serving black frames after the daemon is gone ([loopback.md](loopback.md#what-the-daemon-sets-on-the-device), [ADR-0022](../adr/0022-crash-recovery-for-consumers.md)). The outcome is in the journal:
+
+```text
+crash cover: black timeout image, timeout 250 ms (consumers keep receiving black frames if the daemon stops writing)
+crash cover not in place: <reason>; a consumer may lose the camera if the daemon crashes
+```
+
+The warning is only that: the daemon runs, an older v4l2loopback without the controls included.
+
+A crash loop is stopped: after 5 starts within 60 s (`StartLimitBurst=5`, `StartLimitIntervalSec=60`) systemd stops restarting the unit and it is `failed`. Manual starts and restarts count too. Bring it back with:
+
+```sh
+systemctl --user reset-failed omarchy-broadcastd
+systemctl --user start omarchy-broadcastd
+```
+
+**PipeWire consumers do not reconnect after a crash.** The PipeWire node lives in the daemon process: when it dies, WirePlumber destroys the consumer's stream and the consumer does not come back by itself. An application that has to survive a crash should use the loopback device.
+
 ## Discovery by PipeWire
 
 WirePlumber probes video devices when it starts. A loopback device that has no writer at that moment is recorded as output-only and not probed again, so applications that list cameras through PipeWire (the camera portal, OBS's PipeWire source, browsers using PipeWire) would not show it. Two remedies:
@@ -234,6 +256,8 @@ omarchy-broadcast status                       # shows Error: if the file was re
 `busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast br.com.dias.OmarchyBroadcast1 ReloadConfig` does the same and returns the reason on failure. An invalid file is rejected as a whole: the previous configuration stays in force and the `Error` property names the file, line and key.
 
 Settings changed while the daemon runs (`omarchy-broadcast on` / `off`, the camera selection and the video effect with its blur strength and background image) are kept in a separate state file, `~/.local/state/omarchy-broadcast/state.toml` (`$XDG_STATE_HOME/omarchy-broadcast/state.toml`), so that `config.toml` keeps its comments and layout. The state file is written by the daemon. If the state file cannot be read, the daemon starts `off` and says why in `Error`: privacy fails closed.
+
+The Maxine SDK root can be set in the configuration (`[effect] maxine_root`) or with `MAXINE_VFX_ROOT`; the daemon loads the SDK's libraries from it itself, and `LD_LIBRARY_PATH` is not needed ([maxine.md](maxine.md#4-the-sdk-root-and-the-environment)). The SDK is first loaded by the first effect or noise removal the daemon starts, and a different root then takes a daemon restart; a reload that changes the key says so in the log.
 
 The paths can be overridden with `--config PATH` and `--state PATH` in a copy of the unit file.
 

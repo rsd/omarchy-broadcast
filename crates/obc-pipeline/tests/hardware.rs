@@ -2640,14 +2640,54 @@ fn explicit_test_sink() -> DeviceInfo {
     test_sink()
 }
 
+/// Puts the v4l2loopback controls with a value (`keep_format`,
+/// `sustain_framerate`, `timeout`) back to what they were when made, when
+/// dropped (also when the test fails): the writer's crash cover sets
+/// `timeout` and never resets it.
+struct RestoreLoopbackControls(Vec<(std::path::PathBuf, u32, i32)>);
+
+impl RestoreLoopbackControls {
+    fn save(node: &std::path::Path) -> RestoreLoopbackControls {
+        use obc_pipeline::controls::get_ctrl;
+        use obc_pipeline::loopback_cover::LoopbackControls;
+        let found = LoopbackControls::query(node).expect("query the loopback's controls");
+        RestoreLoopbackControls(
+            [found.keep_format, found.sustain_framerate, found.timeout]
+                .into_iter()
+                .flatten()
+                .map(|c| {
+                    let v = get_ctrl(node, c.id).expect("read a loopback control");
+                    (node.to_path_buf(), c.id, v)
+                })
+                .collect(),
+        )
+    }
+}
+
+impl Drop for RestoreLoopbackControls {
+    fn drop(&mut self) {
+        for (node, id, value) in &self.0 {
+            if let Err(e) = obc_pipeline::controls::set_ctrl(node, *id, *value) {
+                eprintln!(
+                    "failed to restore loopback control {id:#x} of {} to {value}: {e}",
+                    node.display()
+                );
+            }
+        }
+    }
+}
+
 /// The loopback writer alone (the daemon idle): while it streams
 /// placeholders, the loopback, which is not a capture device before (with
 /// `exclusive_caps=1`, without a writer), is one, a consumer in another
 /// process negotiates once and receives only black frames of the contract,
-/// and the writer counts placeholders only. After it stops (and the
-/// consumer has closed), the device is no capture device again. CPU only:
-/// no camera, no GPU. If no earlier test in this process loaded the CUDA
-/// plugin, the writer must not have loaded it either.
+/// and the writer counts placeholders only. Its crash cover goes in: the
+/// driver's `timeout` is 250 ms (restored at the end), and no
+/// timeout-image mode is left pending; one pending (the button pressed
+/// again) is taken back. After it stops (and the consumer has closed), the
+/// device is no capture device again. CPU only: no camera, no GPU. If no
+/// earlier test in this process loaded the CUDA plugin, the writer must not
+/// have loaded it either.
 #[test]
 #[ignore = "needs OBC_TEST_SINK (a free v4l2loopback device with exclusive_caps=1)"]
 fn the_writer_alone_is_a_capture_device_with_black_frames() {
@@ -2672,6 +2712,7 @@ fn the_writer_alone_is_a_capture_device_with_black_frames() {
         sink.path.display()
     );
     let nvcodec_before = nvcodec_loaded();
+    let _restore = RestoreLoopbackControls::save(&sink.path);
     let contract = OutputContract::default();
     let mut writer = LoopbackWriter::build(contract, WriterSink::Loopback(sink.path.clone()))
         .expect("build the writer");
@@ -2695,6 +2736,30 @@ fn the_writer_alone_is_a_capture_device_with_black_frames() {
         consumer.frames().len()
     );
     writer.health().expect("writer health");
+    let cover = writer.wait_consumer_cover(Duration::from_secs(5));
+    let timeout_now = {
+        let found = obc_pipeline::loopback_cover::LoopbackControls::query(&sink.path).unwrap();
+        found
+            .timeout
+            .map(|c| obc_pipeline::controls::get_ctrl(&sink.path, c.id).unwrap())
+    };
+    // A timeout-image mode left pending (the cover failed between its
+    // button and its request) is taken back while the writer streams:
+    // none after the cover (its request took it back); the button pressed,
+    // one, then none again.
+    let pending = {
+        use obc_pipeline::loopback_cover::{LoopbackControls, clear_timeout_image_io};
+        let clear = || clear_timeout_image_io(&sink.path).map_err(|e| e.to_string());
+        let image_io = LoopbackControls::query(&sink.path)
+            .unwrap()
+            .timeout_image_io
+            .expect("a timeout_image_io control")
+            .id;
+        let after_cover = clear();
+        obc_pipeline::controls::set_ctrl(&sink.path, image_io, 1).expect("press timeout_image_io");
+        let after_press = clear();
+        (after_cover, after_press, clear())
+    };
     let counts = writer.counts();
     let (frames, caps, problems) = (consumer.frames(), consumer.caps(), consumer.problems());
     drop(consumer);
@@ -2702,8 +2767,20 @@ fn the_writer_alone_is_a_capture_device_with_black_frames() {
     let hidden = !capture();
     eprintln!(
         "writer alone: a capture device {visible_after:?} after the start; {} frames at the \
-         consumer, caps {caps:?}; {counts:?}",
+         consumer, caps {caps:?}; {counts:?}; crash cover {cover:?}; pending timeout-image \
+         mode (after the cover, after a press, after taking it back): {pending:?}",
         frames.len()
+    );
+    assert_eq!(
+        cover,
+        obc_pipeline::ConsumerCover::Ready { timeout_ms: 250 },
+        "the crash cover"
+    );
+    assert_eq!(timeout_now, Some(250), "the loopback's timeout control");
+    assert_eq!(
+        pending,
+        (Ok(false), Ok(true), Ok(false)),
+        "the pending timeout-image mode"
     );
     assert!(
         visible_after.is_some(),

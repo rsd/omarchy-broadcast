@@ -27,6 +27,17 @@ Description=omarchy-broadcast virtual camera daemon
 # graphical session would put it in a later start-up transaction than
 # WirePlumber, so WirePlumber (with the optional drop-in) could not order
 # after it.
+# The start limit that ends a crash loop: after 5 starts within 60 s
+# systemd stops restarting the unit, which is then `failed`. Manual starts
+# and restarts count towards it too. `systemctl --user reset-failed
+# omarchy-broadcastd` and a start bring it back. systemd's own defaults
+# (DefaultStartLimitIntervalSec=10s, DefaultStartLimitBurst=5) would
+# already stop a daemon that crashes at once; these lines make the limit
+# independent of the manager's defaults and widen its window to 60 s, so
+# that a loop of slow crashes, each run lasting a few seconds, is stopped
+# too.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 # Ready once it owns br.com.dias.OmarchyBroadcast on the session bus, which it
@@ -46,7 +57,14 @@ ExecReload=/bin/kill -HUP $MAINPID
 TimeoutStartSec=30
 # Also restarts it when the session bus connection is lost (exit status 1).
 Restart=on-failure
-RestartSec=2
+# Restart quickly after a crash: until the new process writes again,
+# consumers of the virtual camera get the black frame the daemon left with
+# the loopback (its crash cover), about one every 250 ms (shared between
+# them when several read), and an application may give up on the camera
+# when that lasts. With RestartSec=2
+# the restart delay was about 70% of the time without frames after a
+# kill -9. The start limit in [Unit] ends a crash loop.
+RestartSec=250ms
 # Exit status 3: another process owns the bus name (the daemon is already
 # running); restarting cannot help.
 RestartPreventExitStatus=3

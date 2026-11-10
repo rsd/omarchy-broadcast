@@ -26,6 +26,7 @@
 //! the backend's temporal state.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use gst_obc::{
@@ -38,14 +39,17 @@ use obc_backend_maxine::MaxineFactory;
 use crate::pipeline::{PipelineError, names};
 
 /// The inference backend an output's effect element creates its instance
-/// with. [`EffectBackend::default`] is the Maxine backend, configured from
-/// `MAXINE_VFX_ROOT`, else the package's default root
-/// ([`obc_backend_maxine::DEFAULT_ROOT`]); tests inject another factory.
+/// with. [`EffectBackend::default`] is the Maxine backend with the SDK root
+/// in force when it is made: `MAXINE_VFX_ROOT`, else the configured root
+/// ([`set_maxine_root`]), else the package's default root
+/// ([`obc_backend_maxine::DEFAULT_ROOT`]), else the library search path.
+/// Tests inject another factory.
 #[derive(Clone)]
 pub struct EffectBackend(pub Arc<dyn BackendFactory>);
 
 impl EffectBackend {
-    /// The Maxine backend from the environment.
+    /// The Maxine backend with the SDK root in force now
+    /// ([`obc_backend_maxine::effective_root`]).
     pub fn maxine() -> Self {
         EffectBackend(Arc::new(MaxineFactory::from_env()))
     }
@@ -73,6 +77,32 @@ impl fmt::Debug for EffectBackend {
             .field(&self.0.name())
             .finish()
     }
+}
+
+/// Sets the configured Maxine SDK root of this process (the config file's
+/// `[effect] maxine_root`; `None`: not configured). `MAXINE_VFX_ROOT`, when
+/// set and non-empty, still takes precedence ([`maxine_root_env`]). Outputs
+/// built afterwards use it; an output already built keeps the root it was
+/// built with. The SDK is taken from where its first library is loaded in
+/// the process (the first probe or load of an effect or of the denoise
+/// stage, even one that fails), so after that a root that leads elsewhere
+/// fails the effect until the process restarts ([`maxine_root_conflict`]).
+pub fn set_maxine_root(root: Option<PathBuf>) {
+    obc_backend_maxine::set_configured_root(root);
+}
+
+/// Why the Maxine SDK root in force now cannot be used by this process: the
+/// SDK is already loaded from elsewhere, which takes a restart to change.
+/// `None` when no SDK library is loaded yet or the loaded SDK is the one
+/// this root leads to.
+pub fn maxine_root_conflict() -> Option<String> {
+    obc_backend_maxine::root_conflict(obc_backend_maxine::effective_root().as_deref())
+}
+
+/// The Maxine SDK root `MAXINE_VFX_ROOT` sets for this process, when it is
+/// set and non-empty: it takes precedence over [`set_maxine_root`].
+pub fn maxine_root_env() -> Option<PathBuf> {
+    obc_backend_maxine::env_root()
 }
 
 /// Whether the default effect backend can run here, with the reason if not.
@@ -153,11 +183,25 @@ mod tests {
     #[test]
     fn the_maxine_backend_with_a_root_that_points_nowhere_is_unavailable() {
         let dir = tempfile::tempdir().unwrap();
-        let f = MaxineFactory::with_root(Some(dir.path().join("no-sdk")));
+        let nowhere = dir.path().join("no-sdk");
+        let f = MaxineFactory::with_root(Some(nowhere.clone()));
         let r = effect_backend_available_with(&f);
         if sdk_on_search_path() {
-            // The factory falls back to the search path, where the SDK is.
+            // The factory falls back to the search path, where the SDK is,
+            // and the process is pinned to where it really came from: the
+            // search path, which any root without SDK libraries leads to
+            // as well, not the root that points nowhere.
             assert_eq!(r, Ok(()));
+            assert_eq!(obc_backend_maxine::root_conflict(Some(&nowhere)), None);
+            let another = dir.path().join("another-nowhere");
+            assert_eq!(obc_backend_maxine::root_conflict(Some(&another)), None);
+            assert_eq!(obc_backend_maxine::root_conflict(None), None);
+            let elsewhere = dir.path().join("elsewhere/lib");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::fs::write(elsewhere.join("libVideoFX.so"), b"").unwrap();
+            let why = obc_backend_maxine::root_conflict(Some(&dir.path().join("elsewhere")))
+                .expect("a root with SDK libraries is another SDK");
+            assert!(why.contains("the library search path ("), "{why}");
         } else {
             let e = r.unwrap_err();
             assert!(
@@ -165,6 +209,26 @@ mod tests {
                 "the reason names the root: {e}"
             );
         }
+    }
+
+    #[test]
+    fn the_configured_root_reaches_the_maxine_backend() {
+        let env_set = maxine_root_env().is_some();
+        set_maxine_root(Some("/configured/sdk/for/pipeline".into()));
+        let root = obc_backend_maxine::configured_root();
+        let effective = obc_backend_maxine::effective_root();
+        let conflict = maxine_root_conflict();
+        set_maxine_root(None);
+        assert_eq!(root, Some(PathBuf::from("/configured/sdk/for/pipeline")));
+        if !env_set {
+            assert_eq!(effective, root);
+            // The configured root does not exist, so it leads to the library
+            // search path: the only place these unit tests may load the SDK
+            // from (the "points nowhere" test, when the SDK is on
+            // LD_LIBRARY_PATH), so it never conflicts, in any test order.
+            assert_eq!(conflict, None);
+        }
+        assert_eq!(obc_backend_maxine::configured_root(), None);
     }
 
     #[test]

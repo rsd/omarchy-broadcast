@@ -131,7 +131,7 @@ impl CtrlInfo {
     }
 }
 
-fn open_node(path: &Path, write: bool) -> std::io::Result<fs::File> {
+pub(crate) fn open_node(path: &Path, write: bool) -> std::io::Result<fs::File> {
     fs::OpenOptions::new()
         .read(true)
         .write(write)
@@ -147,6 +147,26 @@ pub fn query_ctrl(path: &Path, id: u32) -> std::io::Result<Option<CtrlInfo>> {
 }
 
 fn query_ctrl_on(file: &fs::File, id: u32) -> std::io::Result<Option<CtrlInfo>> {
+    Ok(query_ctrl_raw(file, id)?.map(|(_, info)| info))
+}
+
+/// `V4L2_CTRL_FLAG_NEXT_CTRL`: asks [`query_next_ctrl_on`] for the first
+/// control after the id it is or'ed with.
+const CTRL_FLAG_NEXT_CTRL: u32 = 0x8000_0000;
+
+/// The control that follows `after` (0: the first one), with its id, by
+/// `VIDIOC_QUERYCTRL` with `V4L2_CTRL_FLAG_NEXT_CTRL`. `Ok(None)` past the
+/// last one.
+pub(crate) fn query_next_ctrl_on(
+    file: &fs::File,
+    after: u32,
+) -> std::io::Result<Option<(u32, CtrlInfo)>> {
+    query_ctrl_raw(file, after | CTRL_FLAG_NEXT_CTRL)
+}
+
+/// `VIDIOC_QUERYCTRL` for `id` (which may carry `V4L2_CTRL_FLAG_NEXT_CTRL`):
+/// the id the driver answered for and its info. `Ok(None)` on `EINVAL`.
+fn query_ctrl_raw(file: &fs::File, id: u32) -> std::io::Result<Option<(u32, CtrlInfo)>> {
     let mut q = V4l2QueryCtrl {
         id,
         type_: 0,
@@ -170,15 +190,18 @@ fn query_ctrl_on(file: &fs::File, id: u32) -> std::io::Result<Option<CtrlInfo>> 
         };
     }
     let end = q.name.iter().position(|&b| b == 0).unwrap_or(q.name.len());
-    Ok(Some(CtrlInfo {
-        name: String::from_utf8_lossy(&q.name[..end]).into_owned(),
-        minimum: q.minimum,
-        maximum: q.maximum,
-        step: q.step,
-        default_value: q.default_value,
-        flags: q.flags,
-        type_: q.type_,
-    }))
+    Ok(Some((
+        q.id,
+        CtrlInfo {
+            name: String::from_utf8_lossy(&q.name[..end]).into_owned(),
+            minimum: q.minimum,
+            maximum: q.maximum,
+            step: q.step,
+            default_value: q.default_value,
+            flags: q.flags,
+            type_: q.type_,
+        },
+    )))
 }
 
 /// Why [`probe_ctrl`] skipped a control.
@@ -221,13 +244,14 @@ pub fn probe_ctrl(path: &Path, id: u32) -> Result<(CtrlInfo, i32), CtrlSkip> {
 /// `_IOWR('V', 27, struct v4l2_control)`
 const VIDIOC_G_CTRL: libc::c_ulong = (3 << 30) | (8 << 16) | ((b'V' as libc::c_ulong) << 8) | 27;
 /// `_IOWR('V', 28, struct v4l2_control)`
-const VIDIOC_S_CTRL: libc::c_ulong = (3 << 30) | (8 << 16) | ((b'V' as libc::c_ulong) << 8) | 28;
+pub(crate) const VIDIOC_S_CTRL: libc::c_ulong =
+    (3 << 30) | (8 << 16) | ((b'V' as libc::c_ulong) << 8) | 28;
 
 fn ioctl_ctrl(path: &Path, request: libc::c_ulong, id: u32, value: i32) -> std::io::Result<i32> {
     ioctl_ctrl_on(&open_node(path, true)?, request, id, value)
 }
 
-fn ioctl_ctrl_on(
+pub(crate) fn ioctl_ctrl_on(
     file: &fs::File,
     request: libc::c_ulong,
     id: u32,

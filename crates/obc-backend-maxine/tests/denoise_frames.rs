@@ -73,8 +73,8 @@ const MAX_LEVEL_SHIFT: f64 = 8.0;
 /// What a test needs before the factory can find the SDK.
 const SDK_HINT: &str = "this test needs the Maxine SDK: install the maxine-vfx-sdk-local package \
      and load its environment (set -a; . /usr/share/maxine-vfx/maxine-vfx.env; set +a), or set \
-     MAXINE_VFX_ROOT, LD_LIBRARY_PATH and MAXINE_OS_RELEASE as omarchy-nvidia-sdks \
-     docs/usage.md describes";
+     MAXINE_VFX_ROOT and MAXINE_OS_RELEASE as omarchy-nvidia-sdks docs/usage.md describes (the \
+     SDK's libraries are loaded from the root: LD_LIBRARY_PATH is not needed)";
 
 fn factory(strength: f32) -> MaxineFactory {
     let f = MaxineFactory::from_env()

@@ -75,10 +75,10 @@ use obc_pipeline::gpu::GpuSampler;
 use obc_pipeline::pipeline::names;
 use obc_pipeline::stats::{cpu_usage, online_cpus, self_cpu_ticks, ticks_per_sec};
 use obc_pipeline::{
-    DiscoveryRoute, EffectFallback, EffectKind, EffectSettings, FrameTap, IngestConfig, LiveStats,
-    LoopbackWriter, Output, OutputConfig, OutputSink, PipelineError, PreviewConfig, PreviewEncoder,
-    Session, StopError, WriterCounts, WriterHandle, WriterSink, choose_mode,
-    effect_backend_available, list_cameras, scan_sysfs, select_sink,
+    ConsumerCover, DiscoveryRoute, EffectFallback, EffectKind, EffectSettings, FrameTap,
+    IngestConfig, LiveStats, LoopbackWriter, Output, OutputConfig, OutputSink, PipelineError,
+    PreviewConfig, PreviewEncoder, Session, StopError, WriterCounts, WriterHandle, WriterSink,
+    choose_mode, effect_backend_available, list_cameras, scan_sysfs, select_sink,
 };
 
 use super::park::{Parker, StartError, StopFailure, StopSession};
@@ -315,13 +315,16 @@ impl GstBackend {
 
     /// Builds and starts the writer on `sink` (none may run), then the
     /// preview encoder on its tap if a preview is asked for: a new writer
-    /// gets a new encoder.
+    /// gets a new encoder. The writer's crash cover is logged once it is in
+    /// place, or why not ([`log_consumer_cover`]), from the cover's own
+    /// thread: the start does not wait for it.
     fn run_writer(
         &mut self,
         contract: OutputContract,
         sink: WriterSink,
     ) -> Result<(), PipelineError> {
         let mut writer = LoopbackWriter::build(contract, sink)?;
+        writer.on_consumer_cover(Some(Arc::new(log_consumer_cover)));
         writer.start()?;
         self.writer = Some(writer);
         self.start_encoder();
@@ -477,6 +480,24 @@ fn delivered_between(from: &WriterCounts, to: &WriterCounts) -> u64 {
         (to.forwarded + to.placeholder).saturating_sub(from.forwarded + from.placeholder);
     let dropped = to.queue_dropped.saturating_sub(from.queue_dropped);
     accepted.saturating_sub(dropped)
+}
+
+/// Logs a writer start's crash cover outcome
+/// (`obc_pipeline::loopback_cover`): a consumer of the loopback keeps
+/// receiving black frames if the daemon dies, or a warning saying why it
+/// would not.
+fn log_consumer_cover(cover: &ConsumerCover) {
+    match cover {
+        ConsumerCover::Ready { timeout_ms } => crate::info!(
+            "crash cover: black timeout image, timeout {timeout_ms} ms (consumers keep \
+             receiving black frames if the daemon stops writing)"
+        ),
+        ConsumerCover::Failed(why) => crate::warning!(
+            "crash cover not in place: {why}; a consumer may lose the camera if the daemon \
+             crashes"
+        ),
+        ConsumerCover::Off | ConsumerCover::Pending => {}
+    }
 }
 
 /// Stamps every buffer reaching the output's forwarding `appsink`
@@ -674,7 +695,8 @@ impl MediaBackend for GstBackend {
     }
 
     fn loopback_holders(&mut self, node: &Path) -> u32 {
-        // The daemon's own descriptors (the writer) are not counted.
+        // The daemon's own descriptors (the writer, the crash cover's
+        // short-lived ones) are not counted.
         count_holders(Path::new("/proc"), &NodeId::of(node), std::process::id())
     }
 

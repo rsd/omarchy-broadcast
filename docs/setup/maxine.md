@@ -49,13 +49,15 @@ Licence: the SDK is under NVIDIA's licence and is for your own machine only. oma
 
 ## 3. Enable the drop-in
 
-The daemon uses the SDK only when its systemd unit has the SDK's environment. That is a user drop-in with two active lines:
+The daemon needs the os-release shim from the moment it starts (see below), and that takes a systemd user drop-in. The shipped drop-in has two active lines:
 
 ```ini
 [Service]
 EnvironmentFile=/usr/share/maxine-vfx/maxine-vfx.env
 Environment=LD_PRELOAD=/usr/lib/maxine-vfx/os-release-shim.so
 ```
+
+With the package installed at its default root, the environment file is optional: the daemon finds `/opt/nvidia/maxine/videofx` itself (section 4) and loads the SDK's libraries from it. The two lines that are strictly needed are `Environment=LD_PRELOAD=/usr/lib/maxine-vfx/os-release-shim.so` and `Environment=MAXINE_OS_RELEASE=/usr/lib/maxine-vfx/fake-os-release`. Keeping `EnvironmentFile=` is fine; it also sets `MAXINE_VFX_ROOT` (to the same tree) and `MAXINE_OS_RELEASE`, and `[effect] maxine_root` is then ignored (section 4).
 
 Copy the example that matches your install of omarchy-broadcast, then reload and restart:
 
@@ -79,46 +81,72 @@ Both files have the same content: [`dist/systemd/omarchy-broadcastd.service.d/ma
 
 The reason the daemon is not run in a namespace with a bind-mounted `os-release` is that the daemon finds consumers of the virtual camera by reading `/proc/<pid>/fd/N` of the user's other processes, which the kernel refuses inside a user namespace; see [ADR-0012](../adr/0012-video-effects-and-maxine-backend.md).
 
-## 4. Environment
+## 4. The SDK root and the environment
 
-What the daemon reads, and where each value comes from with the drop-in of section 3:
+### The SDK root
+
+The SDK root is the directory that contains `lib/`, `features/` and `external/`. The daemon takes it from the first of these that applies:
+
+1. `MAXINE_VFX_ROOT` in the daemon's environment, when it is set and not empty. The package's environment file sets it.
+2. `[effect] maxine_root` in `config.toml`: an absolute path ([../config.example.toml](../config.example.toml)). A relative or empty value is rejected when the file is loaded; whether the directory exists is found out when an effect loads.
+3. `/opt/nvidia/maxine/videofx`, when that is a directory: where `maxine-vfx-sdk-local` installs the SDK.
+4. Otherwise no root: the SDK is looked up on the library search path only, which then has to include its directories (`LD_LIBRARY_PATH` at process start).
+
+When a root is chosen, the daemon loads the SDK's own libraries from it, by absolute path, before it opens `libVideoFX.so`: the SDK libraries, the libraries of every feature under `features/*/lib`, and the bundled CUDA and TensorRT libraries they depend on. **`LD_LIBRARY_PATH` is therefore not needed.** It still works if it is set. A feature added to the tree later is found without any change to the unit. The `models` directory next to the loaded `libVideoFX.so` (`<root>/lib/models`) is passed to the SDK as `NVVFX_MODEL_DIRECTORY`.
+
+Things to know:
+
+- **The environment file overrides the key.** `/usr/share/maxine-vfx/maxine-vfx.env` sets `MAXINE_VFX_ROOT`, so a unit that loads it ignores `[effect] maxine_root`; the daemon logs a warning when both are set. To use the key, leave the environment file out of the drop-in.
+- **The root is fixed once the SDK is loaded.** The SDK is loaded when an effect or noise removal first loads or is first checked, and a loaded library is never unloaded. After that, a different root (a changed `maxine_root` after `systemctl --user reload omarchy-broadcastd`) is refused: the effect fails with a message that asks for a restart (`systemctl --user restart omarchy-broadcastd`). A reload that changes the key logs this. A running output keeps the root it was started with.
+- **A failure keeps the reason.** A missing or incomplete SDK makes the requested effect or noise removal fail as before, with the reason in the `Error` property; libraries that could not be loaded are named in it.
+
+### Environment variables
+
+What the daemon reads, and where each value comes from:
 
 | Variable | Used for | Comes from |
 |---|---|---|
-| `MAXINE_VFX_ROOT` | The SDK root: the directory that contains `lib/`, `features/` and `external/`. The daemon loads `libVideoFX.so` from its `lib/` and passes the `models` directory next to the loaded `libVideoFX.so` (`<root>/lib/models`) to the SDK as `NVVFX_MODEL_DIRECTORY` | The environment file. When unset or empty, the daemon uses `/opt/nvidia/maxine/videofx` if that directory exists, and otherwise searches the library path only |
-| `LD_LIBRARY_PATH` | Lets the dynamic loader find the SDK, the bundled CUDA 12 and TensorRT 10 libraries, and the feature libraries (loaded by a plain `dlopen("libnvVFXGreenScreen.so")`) | The environment file: `lib`, one `features/<feature>/lib` entry for every packaged feature, `external/cuda/lib` and `external/tensorrt/lib` |
-| `LD_PRELOAD` | The os-release shim | The drop-in |
-| `MAXINE_OS_RELEASE` | The replacement `os-release` file the shim opens: an absolute path | The environment file |
+| `MAXINE_VFX_ROOT` | The SDK root (above) | The environment file, if the drop-in loads it. Optional |
+| `LD_PRELOAD` | The os-release shim. It must be set when the process starts | The drop-in (required) |
+| `MAXINE_OS_RELEASE` | The replacement `os-release` file the shim opens: an absolute path | The environment file, or a line in the drop-in (`/usr/lib/maxine-vfx/fake-os-release` with the package) |
 | `MAXINE_OS_RELEASE_DEBUG` | `1` makes the shim log each redirect | Set it by hand, for diagnosis |
+| `LD_LIBRARY_PATH` | Not needed. The environment file still sets it; the daemon's own loading from the root uses the same files | |
 
-Because the environment file is generated for the packaged features, a feature added later, as noise removal was, needs only a rebuild and a reinstall of `maxine-vfx-sdk-local`. The drop-in does not change.
+A feature added to the package later, as noise removal was, needs only a rebuild and a reinstall of `maxine-vfx-sdk-local`. The drop-in does not change.
 
-The bundled CUDA 12 and TensorRT 10 libraries are on the library path of the daemon only. Never set them in a login profile or in `~/.bashrc`: they would shadow Arch's CUDA 13 for every program you start. For the same reason the SDK package installs no `ld.so.conf.d` or `profile.d` entry.
+The bundled CUDA 12 and TensorRT 10 libraries are loaded into the daemon only. Never put them on `LD_LIBRARY_PATH` in a login profile or in `~/.bashrc`: they would shadow Arch's CUDA 13 for every program you start. For the same reason the SDK package installs no `ld.so.conf.d` or `profile.d` entry.
 
 Development knob: `OBC_MAXINE_DENOISE_STRENGTH=0` or `=1` in the environment of the process overrides the noise-removal strength, for comparisons. It is not a supported configuration (see section 6).
 
 ## 5. An SDK tree without the package
 
-An SDK tree that was installed some other way, for example under `~/.local/opt/maxine/VideoFX`, works too. The shipped drop-in has a commented variant for it. Replace the two active lines with the variant, keep the paths that match your tree, and run `daemon-reload` and a restart:
+An SDK tree that was installed some other way, for example under `~/.local/opt/maxine/VideoFX`, works too. Two things are needed:
 
-```ini
-[Service]
-Environment=MAXINE_VFX_ROOT=%h/.local/opt/maxine/VideoFX
-Environment=LD_LIBRARY_PATH=%h/.local/opt/maxine/VideoFX/lib:%h/.local/opt/maxine/VideoFX/features/nvvfxgreenscreen/lib:%h/.local/opt/maxine/VideoFX/features/nvvfxbackgroundblur/lib:%h/.local/opt/maxine/VideoFX/features/nvvfxdenoising/lib:%h/.local/opt/maxine/VideoFX/external/cuda/lib:%h/.local/opt/maxine/VideoFX/external/tensorrt/lib
-Environment=LD_PRELOAD=%h/.local/lib/maxine-vfx/os-release-shim.so
-Environment=MAXINE_OS_RELEASE=%h/.local/lib/maxine-vfx/fake-os-release
-```
+1. The root, either in `config.toml` (then do not load the package's environment file, which would override it):
 
-Notes:
+   ```toml
+   [effect]
+   maxine_root = "/home/user/.local/opt/maxine/VideoFX"
+   ```
 
-- `LD_LIBRARY_PATH` needs one `features/<feature>/lib` entry for every feature that is installed in the tree. systemd does not expand globs in `Environment=`, so a feature added later needs a new entry.
-- The shim library and the replacement `os-release` come from the omarchy-nvidia-sdks repository, which owns both; omarchy-broadcast does not contain them. In a checkout of that repository, `make -C tools/os-release-shim` writes `target/os-release-shim/os-release-shim.so`, and the replacement `os-release` is that repository's `tools/maxine-probe/fake-os-release`. Copy both to `~/.local/lib/maxine-vfx/`, where the two lines above point, or change the paths. The "The compatibility shim" and "Running a program" sections of its `docs/usage.md` describe them and the unpackaged case.
+   or as `Environment=MAXINE_VFX_ROOT=%h/.local/opt/maxine/VideoFX` in the drop-in.
+2. The two shim lines in the drop-in. Replace the active lines of the shipped drop-in with them, adjust the paths, and run `daemon-reload` and a restart:
+
+   ```ini
+   [Service]
+   Environment=LD_PRELOAD=%h/.local/lib/maxine-vfx/os-release-shim.so
+   Environment=MAXINE_OS_RELEASE=%h/.local/lib/maxine-vfx/fake-os-release
+   ```
+
+No `LD_LIBRARY_PATH` line and no list of feature directories are needed. The shipped drop-in has the same variant as a comment.
+
+The shim library and the replacement `os-release` come from the omarchy-nvidia-sdks repository, which owns both; omarchy-broadcast does not contain them. In a checkout of that repository, `make -C tools/os-release-shim` writes `target/os-release-shim/os-release-shim.so`, and the replacement `os-release` is that repository's `tools/maxine-probe/fake-os-release`. Copy both to `~/.local/lib/maxine-vfx/`, where the two lines above point, or change the paths. The "The compatibility shim" and "Running a program" sections of its `docs/usage.md` describe them and the unpackaged case. `%h` is the user's home directory: systemd does not expand `$HOME` or other variables inside `Environment=`.
 
 ## 6. Using the effects
 
 With the SDK installed and the daemon running with the drop-in (section 3), the effects are selected in two ways:
 
-- In `config.toml`, the `[effect]` section (`mode`, `blur_strength`, `background_image`, `on_failure`); see [../config.example.toml](../config.example.toml).
+- In `config.toml`, the `[effect]` section (`mode`, `blur_strength`, `background_image`, `denoise`, `on_failure`, `maxine_root`); see [../config.example.toml](../config.example.toml).
 - At run time, with `omarchy-broadcast effect none|blur|replace [--strength X] [--image PATH]`, which the daemon remembers across restarts; see [../cli-json.md](../cli-json.md) and [../dbus-api.md](../dbus-api.md).
 
 Video noise removal is a separate switch that combines with any effect: `[effect] denoise = true` in `config.toml`, or `omarchy-broadcast denoise on|off` at run time. It removes the grain a webcam produces, which is mostly visible in dim rooms, and it runs before the blur or replacement, or alone with the effect `none`. It needs the `nvvfxdenoising` feature and its models in the package (section 2). Things to know:
@@ -142,8 +170,9 @@ Problems with the SDK itself (download, package, architecture) are in omarchy-nv
 | The daemon's `Error` property reads `effect blur unavailable: NvVFX_Load(GreenScreen) returned -1209 (...)`, naming the os-release override (this page, section 3), and the state is `error` | The daemon runs without the shim: the drop-in is not installed, `daemon-reload` and a restart were skipped, or its paths do not match your installation. With the default `on_failure = "black"` the virtual camera stays black | Install the drop-in (section 3) and check `systemctl --user show omarchy-broadcastd -p Environment`; set `MAXINE_OS_RELEASE_DEBUG=1` to see the redirect. A `cannot be preloaded` line in `journalctl --user -u omarchy-broadcastd` means the library path in `LD_PRELOAD` is wrong or the package is not installed |
 | The unit fails to start after the drop-in was installed, and `journalctl --user -u omarchy-broadcastd` shows `Failed to load environment files: No such file or directory` (systemd does not name the file) | `EnvironmentFile=` has no `-`, so a missing file is an error. `maxine-vfx-sdk-local` is not installed | Check that `/usr/share/maxine-vfx/maxine-vfx.env` exists, which it does when the package is installed. Install the package (section 2), or remove the drop-in (section 8) |
 | The drop-in has no effect: the daemon's environment lacks `LD_PRELOAD` | The file is not at `~/.config/systemd/user/omarchy-broadcastd.service.d/maxine.conf` (the directory name must match the unit), or `daemon-reload` was skipped | Check the path, run `systemctl --user daemon-reload`, restart, and check with `systemctl --user cat omarchy-broadcastd` |
+| An effect fails with a message that the SDK is already loaded from another place and asks for a restart | `[effect] maxine_root` (or `MAXINE_VFX_ROOT`) changed after the SDK was first loaded in the running daemon | `systemctl --user restart omarchy-broadcastd` (section 4) |
 | An effect reports that a feature library is not found (`-2`) or the package lacks a feature | The package was built without that feature | Rebuild `maxine-vfx-sdk-local` with all three features of section 1 (section 2), reinstall it and restart the daemon. The drop-in needs no edit |
-| The daemon's `Error` says `noise removal unavailable: ... -2` (NVCV status), and the camera image is shown without noise removal | The package does not contain the `nvvfxdenoising` feature, or the daemon runs without the environment file | Check that `MAXINE_VFX_FEATURES` in `/usr/share/maxine-vfx/maxine-vfx.env` lists `nvvfxdenoising`; rebuild the package with it if not (section 2); check the drop-in |
+| The daemon's `Error` says `noise removal unavailable: ... -2` (NVCV status), and the camera image is shown without noise removal | The package does not contain the `nvvfxdenoising` feature, or the daemon found no SDK root (section 4) and so looked for it on the library search path only | Check that `MAXINE_VFX_FEATURES` in `/usr/share/maxine-vfx/maxine-vfx.env` lists `nvvfxdenoising`; rebuild the package with it if not (section 2); check the drop-in |
 | The same, with `-1209` or `-13` | The shim is not applied to this process (the feature's library needs it too), or the `Denoise-*` models for your architecture are not in the package | Section 3; `ls /opt/nvidia/maxine/videofx/lib/models` must show `Denoise-agg-<SM>.engine.trtpkg` and `Denoise-con-<SM>.engine.trtpkg`; rebuild the package for your architecture otherwise |
 | The same, with a message that the frame size is out of range | The output contract is smaller than 80x80 or larger than 1920x1080 | Use an output mode within the range (`[output]` in `config.toml`); noise removal does not run outside it |
 | The daemon's `Error` property or the element's status names the mask-hardening kernel and a CUDA error `222` ("the NVIDIA driver is older than this build supports") | The driver rejects the PTX of the mask-hardening kernel: it is older than 570.26 | Update the NVIDIA driver to 570.26 or newer (`nvidia-smi --query-gpu=driver_version --format=csv,noheader`). With the default `on_failure = "black"` the virtual camera stays black until then |

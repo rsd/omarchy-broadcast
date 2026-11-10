@@ -1,9 +1,10 @@
 //! Hardware tests for the Maxine backend. All are `#[ignore]`: they need the
-//! NVIDIA Maxine Video Effects SDK (`MAXINE_VFX_ROOT`, its library
-//! directories on `LD_LIBRARY_PATH`), the os-release override on an unlisted
-//! distribution (the os-release shim preload library and `MAXINE_OS_RELEASE`),
-//! and an NVIDIA GPU. Without them they fail; no test passes without running.
-//! With the `maxine-vfx-sdk-local` package (built from omarchy-nvidia-sdks)
+//! NVIDIA Maxine Video Effects SDK (`MAXINE_VFX_ROOT`; the backend loads the
+//! SDK's libraries from that root, so `LD_LIBRARY_PATH` is not needed), the
+//! os-release override on an unlisted distribution (the os-release shim
+//! preload library and `MAXINE_OS_RELEASE`), and an NVIDIA GPU. Without
+//! them they fail; no test passes without running. With the
+//! `maxine-vfx-sdk-local` package (built from omarchy-nvidia-sdks)
 //! installed, its environment file sets all of it:
 //!
 //! ```text
@@ -14,9 +15,9 @@
 //!
 //! With the package, `MAXINE_VFX_ROOT` may also be left unset: the factory
 //! then uses the package's tree, `/opt/nvidia/maxine/videofx`. For an SDK
-//! tree without the package, set `MAXINE_VFX_ROOT`, `LD_LIBRARY_PATH` and
-//! `MAXINE_OS_RELEASE` as omarchy-nvidia-sdks `docs/usage.md` describes, and
-//! give the runner that shim's path.
+//! tree without the package, set `MAXINE_VFX_ROOT` and `MAXINE_OS_RELEASE` as
+//! omarchy-nvidia-sdks `docs/usage.md` describes, and give the runner that
+//! shim's path. `tests/sdk_root.rs` checks that the root alone is enough.
 //!
 //! The shim is preloaded through the cargo runner so that only the test
 //! binary gets it: `LD_PRELOAD=... cargo test` would be dropped by cargo.
@@ -56,8 +57,8 @@ const MIB: f64 = 1024.0 * 1024.0;
 /// What a test needs before the factory can find the SDK.
 const SDK_HINT: &str = "this test needs the Maxine SDK: install the maxine-vfx-sdk-local package \
      and load its environment (set -a; . /usr/share/maxine-vfx/maxine-vfx.env; set +a), or set \
-     MAXINE_VFX_ROOT, LD_LIBRARY_PATH and MAXINE_OS_RELEASE as omarchy-nvidia-sdks \
-     docs/usage.md describes";
+     MAXINE_VFX_ROOT and MAXINE_OS_RELEASE as omarchy-nvidia-sdks docs/usage.md describes (the \
+     SDK's libraries are loaded from the root: LD_LIBRARY_PATH is not needed)";
 
 fn factory() -> MaxineFactory {
     let f = MaxineFactory::from_env();

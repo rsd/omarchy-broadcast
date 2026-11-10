@@ -240,6 +240,20 @@ pub struct EffectConfig {
     /// What the virtual camera shows when the effect cannot run.
     #[serde(serialize_with = "ser_display", deserialize_with = "de_from_str")]
     pub on_failure: EffectOnFailure,
+    /// The NVIDIA Maxine Video Effects SDK root (the directory with `lib/`,
+    /// `features/` and `external/`): an absolute path. `MAXINE_VFX_ROOT`,
+    /// when set and non-empty, takes precedence (the `maxine-vfx-sdk-local`
+    /// environment file sets it); with neither, the package's default root
+    /// is used. Whether the directory exists is found out when an effect
+    /// loads, not here. The root in force is taken when the SDK is first
+    /// loaded in the process (the first probe or load of an effect or of
+    /// the denoise stage); changing it after that takes a daemon restart,
+    /// and a reload that changes it then says so in the log.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_maxine_root"
+    )]
+    pub maxine_root: Option<PathBuf>,
 }
 
 impl EffectConfig {
@@ -254,6 +268,9 @@ impl EffectConfig {
         check_blur_strength(self.blur_strength).map_err(invalid("effect.blur_strength"))?;
         if let Some(p) = &self.background_image {
             check_background_image(p).map_err(invalid("effect.background_image"))?;
+        }
+        if let Some(p) = &self.maxine_root {
+            check_maxine_root(p).map_err(invalid("effect.maxine_root"))?;
         }
         if self.mode == EffectMode::Replace && self.background_image.is_none() {
             return Err(invalid("effect.mode")(
@@ -272,6 +289,7 @@ impl Default for EffectConfig {
             background_image: None,
             denoise: false,
             on_failure: EffectOnFailure::Black,
+            maxine_root: None,
         }
     }
 }
@@ -590,6 +608,24 @@ fn check_background_image(v: &Path) -> Result<(), String> {
     }
 }
 
+fn check_maxine_root(v: &Path) -> Result<(), String> {
+    if v.as_os_str().is_empty() {
+        Err(
+            "must not be empty: leave the key out to use MAXINE_VFX_ROOT or the default SDK \
+             root"
+                .into(),
+        )
+    } else if v.is_absolute() {
+        Ok(())
+    } else {
+        Err(format!(
+            "must be the absolute path of the Maxine SDK directory (the one with lib/, \
+             features/ and external/), got {:?}",
+            v.display().to_string()
+        ))
+    }
+}
+
 /// A value checked by `check`; the error carries the span of the value.
 fn de_checked<'de, D, T>(d: D, check: fn(T) -> Result<(), String>) -> Result<T, D::Error>
 where
@@ -654,6 +690,14 @@ fn de_background_image<'de, D: Deserializer<'de>>(d: D) -> Result<Option<PathBuf
     }
     let p = PathBuf::from(v);
     check_background_image(&p).map_err(serde::de::Error::custom)?;
+    Ok(Some(p))
+}
+
+/// `effect.maxine_root`: an absolute path (empty is refused: leave the key
+/// out for the default).
+fn de_maxine_root<'de, D: Deserializer<'de>>(d: D) -> Result<Option<PathBuf>, D::Error> {
+    let p = PathBuf::from(String::deserialize(d)?);
+    check_maxine_root(&p).map_err(serde::de::Error::custom)?;
     Ok(Some(p))
 }
 
@@ -995,6 +1039,7 @@ impl RuntimeState {
             },
             denoise: self.denoise.unwrap_or(config.denoise),
             on_failure: config.on_failure,
+            maxine_root: config.maxine_root.clone(),
         }
     }
 
@@ -1250,6 +1295,7 @@ blur_strength = 1
 background_image = "/home/u/Pictures/office.png"
 denoise = true
 on_failure = "none"
+maxine_root = "/home/u/sdk/VideoFX"
 
 [pipewire]
 enabled = true
@@ -1291,6 +1337,7 @@ offer_nv12 = false
                 background_image: Some("/home/u/Pictures/office.png".into()),
                 denoise: true,
                 on_failure: EffectOnFailure::None,
+                maxine_root: Some("/home/u/sdk/VideoFX".into()),
             }
         );
         assert_eq!(
@@ -1340,6 +1387,7 @@ offer_nv12 = false
         ];
         expected.loopback.device = Some("/dev/video11".into());
         expected.effect.background_image = Some("/home/user/Pictures/background.png".into());
+        expected.effect.maxine_root = Some("/home/user/.local/opt/maxine/VideoFX".into());
         assert_eq!(c, expected);
         // Every key of the schema appears in the example.
         for key in [
@@ -1359,6 +1407,7 @@ offer_nv12 = false
             "background_image",
             "denoise",
             "on_failure",
+            "maxine_root",
             "enabled",
             "offer_nv12",
         ] {
@@ -1536,6 +1585,21 @@ offer_nv12 = false
                 "absolute path",
             ),
             (
+                "[effect]\nmaxine_root = \"opt/maxine\"",
+                "effect.maxine_root",
+                "must be the absolute path of the Maxine SDK directory",
+            ),
+            (
+                "[effect]\nmaxine_root = \"\"",
+                "effect.maxine_root",
+                "must not be empty",
+            ),
+            (
+                "[effect]\nmaxine_root = 1",
+                "effect.maxine_root",
+                "invalid type",
+            ),
+            (
                 "[effect]\ndenoise = \"yes\"",
                 "effect.denoise",
                 "invalid type",
@@ -1631,6 +1695,58 @@ offer_nv12 = false
         ));
         c.effect.background_image = Some("/a/b.png".into());
         c.validate().unwrap();
+        for bad in ["", "sdk/VideoFX"] {
+            c.effect.maxine_root = Some(bad.into());
+            assert!(matches!(
+                c.validate(),
+                Err(ConfigError::Invalid {
+                    key: "effect.maxine_root",
+                    ..
+                })
+            ));
+        }
+        c.effect.maxine_root = Some("/opt/sdk".into());
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn the_maxine_root_is_an_absolute_path_or_absent() {
+        // Absent: none, and not written back.
+        let c = parse("[effect]\n").unwrap();
+        assert_eq!(c.effect.maxine_root, None);
+        assert!(!c.to_toml().contains("maxine_root"));
+        // Absolute: kept as written, whether or not it exists (an absent
+        // tree fails when an effect loads), and written back.
+        let c = parse("[effect]\nmaxine_root = \"/nowhere/VideoFX\"\n").unwrap();
+        assert_eq!(
+            c.effect.maxine_root,
+            Some(PathBuf::from("/nowhere/VideoFX"))
+        );
+        let text = c.to_toml();
+        assert!(
+            text.contains("maxine_root = \"/nowhere/VideoFX\""),
+            "{text}"
+        );
+        assert_eq!(parse(&text).unwrap(), c);
+        // The state file has no say in it: the config's root is in force.
+        let over = RuntimeState {
+            effect: Some(EffectMode::Blur),
+            ..RuntimeState::default()
+        }
+        .effect_over(&c.effect);
+        assert_eq!(over.maxine_root, Some(PathBuf::from("/nowhere/VideoFX")));
+        // Relative and empty are refused, naming the key.
+        for (bad, why) in [
+            ("VideoFX", "absolute path"),
+            ("./VideoFX", "absolute path"),
+            ("", "must not be empty"),
+        ] {
+            let e = parse_err(&format!("[effect]\nmaxine_root = {bad:?}\n"));
+            assert!(
+                e.contains("effect.maxine_root: ") && e.contains(why),
+                "{bad:?}: {e}"
+            );
+        }
     }
 
     #[test]
@@ -2057,6 +2173,7 @@ reset_pending = false
             background_image: Some("/cfg/bg.png".into()),
             denoise: true,
             on_failure: EffectOnFailure::None,
+            maxine_root: Some("/cfg/sdk".into()),
         };
         // Nothing set: the config.
         assert_eq!(RuntimeState::default().effect_over(&config), config);
@@ -2077,6 +2194,7 @@ reset_pending = false
                 background_image: Some("/state/bg.png".into()),
                 denoise: false,
                 on_failure: EffectOnFailure::None,
+                maxine_root: Some("/cfg/sdk".into()),
             }
         );
         // No image in the state: the config's image applies.
