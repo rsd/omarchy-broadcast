@@ -24,7 +24,10 @@
 //! its frames to the persistent [`loopback::LoopbackWriter`], which owns the
 //! loopback device for the daemon's whole life and sends black placeholders
 //! while no output runs; [`live::LiveStats`] measures a running stream for
-//! the daemon's statistics. The measurement modules
+//! the daemon's statistics. At each start on a loopback the writer also
+//! puts the crash cover in place ([`loopback_cover`]): a black timeout
+//! image the driver serves while no writer streams, so a consumer survives
+//! the daemon's crash and restart. The measurement modules
 //! (`instrument`, `stats`, `gpu`, `stamp`) serve `obc-bench`. With the
 //! cargo feature `pipewire` (off by default), the `pipewire` module also
 //! offers the writer's frames as a native PipeWire camera node, fed by the
@@ -44,6 +47,7 @@ pub mod ingest;
 pub mod instrument;
 pub mod live;
 pub mod loopback;
+pub mod loopback_cover;
 pub mod output;
 pub mod pipeline;
 #[cfg(feature = "pipewire")]
@@ -75,6 +79,7 @@ pub use loopback::{
     FrameTap, LoopbackWriter, WriterConfig, WriterCounts, WriterHandle, WriterSink,
     writer_caps_string,
 };
+pub use loopback_cover::{ConsumerCover, CoverReport};
 pub use output::{
     EmitInfo, EmitObserver, FrameOrigin, Output, OutputConfig, OutputCounts, OutputSink,
 };

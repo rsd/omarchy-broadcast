@@ -152,6 +152,22 @@ denoise = false
 # Default: "black"
 on_failure = "black"
 
+# Where the Maxine Video Effects SDK is: an absolute path to the SDK
+# directory, the one that contains lib/, features/ and external/. The daemon
+# loads the SDK's libraries from it itself, so LD_LIBRARY_PATH is not needed.
+# The SDK root is, in this order: the MAXINE_VFX_ROOT environment variable
+# when it is set and not empty (the maxine-vfx-sdk-local environment file
+# sets it, so a daemon started with that file ignores this key, and logs
+# so); this key; /opt/nvidia/maxine/videofx when that directory exists
+# (where the maxine-vfx-sdk-local package installs it); else the library
+# search path. A missing directory is found out when an effect starts (see
+# on_failure). The root is taken when the SDK is first loaded, by the first
+# effect or noise removal the daemon starts or checks; the SDK then stays
+# loaded, so a different root takes effect only after the daemon is
+# restarted (a reload that changes it says so in the log).
+# Default: unset. Example:
+# maxine_root = "/home/user/.local/opt/maxine/VideoFX"
+
 [pipewire]
 # Also offer the virtual camera as a native PipeWire video source, next to
 # the v4l2loopback device, which is unaffected. The node is called

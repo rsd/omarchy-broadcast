@@ -705,6 +705,18 @@ impl<B: MediaBackend> Controller<B> {
                 (Config::default(), msg)
             }
         };
+        // Before any output is built: its effect backend takes the root in
+        // force when it is made.
+        obc_pipeline::effect::set_maxine_root(config.effect.maxine_root.clone());
+        if let Some(note) = maxine_root_note(
+            None,
+            config.effect.maxine_root.as_deref(),
+            obc_pipeline::effect::maxine_root_env().as_deref(),
+            None,
+            false,
+        ) {
+            warning!("{note}");
+        }
         let (runtime, state_damaged, notes) = load_runtime_state(&paths.state);
         for note in notes {
             warning!("{note}");
@@ -2658,6 +2670,16 @@ impl<B: MediaBackend> Controller<B> {
 
     fn apply_config(&mut self, new: Config, now: Instant) {
         let old = std::mem::replace(&mut self.config, new);
+        obc_pipeline::effect::set_maxine_root(self.config.effect.maxine_root.clone());
+        if let Some(note) = maxine_root_note(
+            Some(old.effect.maxine_root.as_deref()),
+            self.config.effect.maxine_root.as_deref(),
+            obc_pipeline::effect::maxine_root_env().as_deref(),
+            obc_pipeline::effect::maxine_root_conflict(),
+            self.session.is_some(),
+        ) {
+            warning!("{note}");
+        }
         info!(
             "configuration {} reloaded{}",
             self.paths.config.display(),
@@ -2720,6 +2742,63 @@ impl<B: MediaBackend> Controller<B> {
     }
 }
 
+/// What to log, as a warning, about `[effect] maxine_root` (`new`) at start
+/// (`old`: `None`) or after a reload that had `Some(old)`. `env` is
+/// `MAXINE_VFX_ROOT` when set and non-empty, `conflict` why the root in
+/// force now cannot be used (the SDK is already loaded from elsewhere),
+/// `running` whether an output (and its effect backend, made with the root
+/// in force when it was built) is running.
+///
+/// At start: that the variable overrides the key, when both are set. After
+/// a reload, only when the key changed: that the variable overrides it;
+/// else that the SDK is already loaded from elsewhere and only a restart
+/// changes it; else, with an output running, that its effects keep the
+/// root it was built with.
+fn maxine_root_note(
+    old: Option<Option<&Path>>,
+    new: Option<&Path>,
+    env: Option<&Path>,
+    conflict: Option<String>,
+    running: bool,
+) -> Option<String> {
+    let changed = match old {
+        None => new.is_some(),
+        Some(old) => old != new,
+    };
+    if !changed {
+        return None;
+    }
+    let what = if old.is_none() {
+        "effect.maxine_root"
+    } else {
+        "effect.maxine_root changed"
+    };
+    if let Some(env) = env {
+        let configured = new.map_or_else(|| "unset".to_string(), |p| p.display().to_string());
+        return Some(format!(
+            "{what} ({configured}), but MAXINE_VFX_ROOT={env} is set in the daemon's \
+             environment and takes precedence: the Maxine SDK root is {env}. The \
+             maxine-vfx-sdk-local environment file (/usr/share/maxine-vfx/maxine-vfx.env) \
+             sets it; to use effect.maxine_root, start the daemon without that variable",
+            env = env.display()
+        ));
+    }
+    // At start, nothing else to say: no SDK is loaded yet.
+    old?;
+    if let Some(why) = conflict {
+        return Some(format!("{what}: {why}"));
+    }
+    running.then(|| {
+        format!(
+            "{what} while the virtual camera is running: its effects keep the Maxine SDK root \
+             it was started with, and the SDK stays loaded from wherever it is first loaded. \
+             The new root applies when the virtual camera next starts if no effect has loaded \
+             the SDK before; otherwise restart the daemon (systemctl --user restart \
+             omarchy-broadcastd)"
+        )
+    })
+}
+
 /// Runs `ctrl` until [`Command::Shutdown`] or until every sender is gone,
 /// then shuts it down.
 pub fn run<B: MediaBackend>(mut ctrl: Controller<B>, commands: Receiver<Command>) {
@@ -2740,3 +2819,86 @@ pub fn run<B: MediaBackend>(mut ctrl: Controller<B>, commands: Receiver<Command>
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod maxine_root_tests {
+    use super::*;
+
+    const ENV: &str = "/opt/nvidia/maxine/videofx";
+
+    fn text(n: Option<String>) -> String {
+        n.expect("a warning")
+    }
+
+    #[test]
+    fn at_start_only_an_overridden_key_is_logged() {
+        let key = Some(Path::new("/home/u/VideoFX"));
+        assert_eq!(maxine_root_note(None, None, None, None, false), None);
+        assert_eq!(maxine_root_note(None, key, None, None, true), None);
+        assert_eq!(
+            maxine_root_note(None, None, Some(Path::new(ENV)), None, false),
+            None
+        );
+        let m = text(maxine_root_note(
+            None,
+            key,
+            Some(Path::new(ENV)),
+            None,
+            false,
+        ));
+        assert!(
+            m.starts_with("effect.maxine_root (/home/u/VideoFX), but "),
+            "{m}"
+        );
+        assert!(m.contains(&format!("MAXINE_VFX_ROOT={ENV} is set")), "{m}");
+        assert!(m.contains("takes precedence"), "{m}");
+        assert!(m.contains("maxine-vfx.env"), "{m}");
+    }
+
+    #[test]
+    fn a_reload_logs_only_a_changed_key() {
+        let (a, b) = (Some(Path::new("/sdk/a")), Some(Path::new("/sdk/b")));
+        let why = || Some("already loaded in this process from /sdk/a".to_string());
+        // Unchanged: nothing, whatever else holds.
+        for env in [None, Some(Path::new(ENV))] {
+            assert_eq!(maxine_root_note(Some(a), a, env, why(), true), None);
+            assert_eq!(maxine_root_note(Some(None), None, env, why(), true), None);
+        }
+        // Changed with the variable set: the variable wins, said once per
+        // change, set or cleared.
+        for (old, new) in [(a, b), (None, b), (a, None)] {
+            let m = text(maxine_root_note(
+                Some(old),
+                new,
+                Some(Path::new(ENV)),
+                None,
+                true,
+            ));
+            assert!(m.starts_with("effect.maxine_root changed ("), "{m}");
+            assert!(m.contains("takes precedence"), "{m}");
+        }
+        let m = text(maxine_root_note(
+            Some(a),
+            None,
+            Some(Path::new(ENV)),
+            None,
+            false,
+        ));
+        assert!(m.contains("(unset)"), "{m}");
+        // Changed while the SDK is loaded from elsewhere: the restart,
+        // running or not.
+        for running in [false, true] {
+            let m = text(maxine_root_note(Some(a), b, None, why(), running));
+            assert_eq!(
+                m,
+                "effect.maxine_root changed: already loaded in this process from /sdk/a"
+            );
+        }
+        // Changed with nothing loaded: only a running output keeps the old
+        // root.
+        assert_eq!(maxine_root_note(Some(a), b, None, None, false), None);
+        let m = text(maxine_root_note(Some(a), b, None, None, true));
+        assert!(m.contains("while the virtual camera is running"), "{m}");
+        assert!(m.contains("restart the daemon"), "{m}");
+    }
+}

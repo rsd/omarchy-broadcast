@@ -29,12 +29,30 @@
 //!   copied.
 //!
 //! **Timestamps.** Every buffer pushed, placeholder or forwarded, gets the
-//! writer's own timestamp: PTS = time since the writer was built, strictly
-//! increasing (a push in the same nanosecond as the previous one gets one
-//! nanosecond more), duration one contract period, offset = the push's
-//! index. The producers' own timestamps never reach the sink, so a hand-over
-//! between them is invisible downstream. Pushes are serialised by one lock
-//! held across the stamp and the push, so PTS order is push order.
+//! writer's own timestamp: PTS = the `CLOCK_MONOTONIC` time of the push
+//! (read once when the writer is built, then advanced by `Instant`, which
+//! is the same clock), strictly increasing (a push in the same nanosecond
+//! as the previous one gets one nanosecond more), duration one contract
+//! period, offset = the push's index. The producers' own timestamps never
+//! reach the sink, so a hand-over between them is invisible downstream.
+//! Pushes are serialised by one lock held across the stamp and the push, so
+//! PTS order is push order. `v4l2sink` copies the PTS into the V4L2 buffer
+//! timestamp, so a reader of the loopback sees `CLOCK_MONOTONIC` times, as a
+//! UVC camera stamps them: a writer of a new daemon process (a restart, a
+//! crash) continues forward instead of starting again at 0. The output's
+//! own timeline (ADR 0010, `D(n)`) is restamped away here and unaffected.
+//!
+//! **Crash cover.** At each start on a loopback, once the second buffer
+//! reaches `v4l2sink` (the first has then set the device's format and
+//! allocated its buffers, on the same streaming thread), a helper thread
+//! uploads a black timeout image and sets the driver's `timeout`
+//! ([`crate::loopback_cover`]), so a consumer keeps receiving (black)
+//! frames while no writer streams: after the daemon died, until its restart
+//! writes again. The timeout stays above the writer's worst gap between
+//! two frames ([`WriterConfig::placeholder_after`] plus a period), so it
+//! never fires while the writer runs. The outcome is
+//! [`LoopbackWriter::consumer_cover`]; a failure (an older driver without
+//! the controls) never stops the writer. Nothing is reset at the stop.
 //!
 //! **Tap.** [`LoopbackWriter::set_tap`] installs a [`FrameTap`]: every
 //! buffer `appsrc` accepted, placeholder and forwarded alike, is handed to
@@ -67,7 +85,7 @@
 //! messages nobody reads.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -77,6 +95,7 @@ use obc_core::OutputContract;
 use serde::Serialize;
 
 use crate::frame::Canonical;
+use crate::loopback_cover::{ConsumerCover, CoverPlan, CoverReport, CoverSlot};
 use crate::output::{
     OutputSink, StopSignal, check_sink_range, contract_caps_string, frames_src, run_recording_panic,
 };
@@ -184,8 +203,10 @@ struct Shared {
     appsrc: gst_app::AppSrc,
     contract: OutputContract,
     period_ns: u64,
-    /// Origin of the writer's PTS.
+    /// Origin of the writer's PTS: `epoch_mono_ns` (`CLOCK_MONOTONIC`, read
+    /// at the same instant) at `epoch`.
     epoch: Instant,
+    epoch_mono_ns: u64,
     state: Mutex<PushState>,
     placeholder: AtomicU64,
     forwarded: AtomicU64,
@@ -233,6 +254,21 @@ fn ns_since(epoch: Instant, t: Instant) -> u64 {
     u64::try_from(t.saturating_duration_since(epoch).as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// `CLOCK_MONOTONIC` now, in nanoseconds.
+pub(crate) fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid `struct timespec` that outlives the call.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    assert_eq!(rc, 0, "clock_gettime(CLOCK_MONOTONIC) failed");
+    u64::try_from(ts.tv_sec)
+        .unwrap_or(0)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::try_from(ts.tv_nsec).unwrap_or(0))
+}
+
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, PushState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
@@ -256,7 +292,10 @@ impl Shared {
             }
             return Pushed::Refused;
         }
-        let pts = next_pts(st.last_pts_ns, ns_since(self.epoch, now));
+        let pts = next_pts(
+            st.last_pts_ns,
+            self.epoch_mono_ns.saturating_add(ns_since(self.epoch, now)),
+        );
         {
             // Writable for the metadata only: a shared buffer is copied
             // shallowly (its memory is referenced, not copied).
@@ -359,6 +398,15 @@ struct PlaceholderThread {
     failure: Arc<Mutex<Option<String>>>,
 }
 
+/// The crash cover's trigger: a buffer probe on `v4l2sink`'s sink pad,
+/// removed by itself once it has fired.
+#[derive(Debug)]
+struct CoverProbe {
+    pad: gst::Pad,
+    id: Option<gst::PadProbeId>,
+    fired: Arc<AtomicBool>,
+}
+
 /// The loopback writer. See the module docs.
 pub struct LoopbackWriter {
     pipeline: MediaPipeline,
@@ -366,6 +414,8 @@ pub struct LoopbackWriter {
     shared: Arc<Shared>,
     placeholder: gst::Buffer,
     thread: Option<PlaceholderThread>,
+    cover: Arc<CoverSlot>,
+    cover_probe: Option<CoverProbe>,
 }
 
 impl std::fmt::Debug for LoopbackWriter {
@@ -448,6 +498,7 @@ impl LoopbackWriter {
             contract,
             period_ns: contract.frame_duration_ns(),
             epoch: Instant::now(),
+            epoch_mono_ns: monotonic_ns(),
             state: Mutex::default(),
             placeholder: AtomicU64::new(0),
             forwarded: AtomicU64::new(0),
@@ -480,6 +531,8 @@ impl LoopbackWriter {
             cfg,
             shared,
             thread: None,
+            cover: Arc::default(),
+            cover_probe: None,
         })
     }
 
@@ -495,12 +548,14 @@ impl LoopbackWriter {
         if res.is_err() {
             self.shared.lock().running = false;
             let _ = self.pipeline.pipeline().set_state(gst::State::Null);
+            self.end_cover();
         }
         res
     }
 
     fn start_inner(&mut self) -> Result<(), PipelineError> {
         self.pipeline.prepare()?;
+        self.arm_cover();
         self.pipeline
             .pipeline()
             .set_state(gst::State::Playing)
@@ -534,6 +589,83 @@ impl LoopbackWriter {
             failure,
         });
         Ok(())
+    }
+
+    /// On a loopback, installs the crash cover's trigger (see the module
+    /// docs): a probe on `v4l2sink`'s sink pad that, at the second buffer,
+    /// hands [`crate::loopback_cover::install`] to a helper thread and
+    /// removes itself. Before PLAYING, so it sees the first buffer.
+    fn arm_cover(&mut self) {
+        let WriterSink::Loopback(device) = &self.cfg.sink else {
+            return;
+        };
+        let generation = self.cover.begin();
+        let plan = CoverPlan {
+            device: device.clone(),
+            format: self.cfg.contract.format,
+            black: Canonical::of(&self.cfg.contract).black(),
+            writer_worst_gap: self.cfg.placeholder_after
+                + Duration::from_nanos(self.shared.period_ns),
+        };
+        let Some(pad) = self
+            .pipeline
+            .element(names::LOOPBACK)
+            .and_then(|e| e.static_pad("sink"))
+        else {
+            self.cover.finish(
+                generation,
+                Err("the writer has no sink pad to watch".into()),
+            );
+            return;
+        };
+        let (slot, fired) = (Arc::clone(&self.cover), Arc::new(AtomicBool::new(false)));
+        let seen = AtomicU64::new(0);
+        let flag = Arc::clone(&fired);
+        let plan = Mutex::new(Some(plan));
+        let id = pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            if seen.fetch_add(1, Ordering::Relaxed) == 0 {
+                return gst::PadProbeReturn::Ok;
+            }
+            flag.store(true, Ordering::Release);
+            if let Some(plan) = plan.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                slot.spawn_helper(generation, plan);
+            }
+            gst::PadProbeReturn::Remove
+        });
+        self.cover_probe = Some(CoverProbe { pad, id, fired });
+    }
+
+    /// Ends the crash cover's part of a start, with the pipeline in NULL (no
+    /// buffer flows): the probe removed if it has not fired, the helper
+    /// thread joined, a cover still pending reported off.
+    fn end_cover(&mut self) {
+        if let Some(p) = self.cover_probe.take()
+            && !p.fired.load(Ordering::Acquire)
+            && let Some(id) = p.id
+        {
+            p.pad.remove_probe(id);
+        }
+        self.cover.join_helper();
+        self.cover.cancel();
+    }
+
+    /// The crash cover of the current (or last) start: see
+    /// [`crate::loopback_cover`]. [`ConsumerCover::Off`] for a `fakesink`.
+    pub fn consumer_cover(&self) -> ConsumerCover {
+        self.cover.get()
+    }
+
+    /// [`Self::consumer_cover`] once it is no longer pending, or after
+    /// `limit` (then still [`ConsumerCover::Pending`]).
+    pub fn wait_consumer_cover(&self, limit: Duration) -> ConsumerCover {
+        self.cover.wait(limit)
+    }
+
+    /// Sets (`Some`) or removes (`None`) the [`CoverReport`] called with
+    /// each start's cover outcome once it is known, on the cover's helper
+    /// thread. Setting it calls nothing: set it before [`Self::start`].
+    pub fn on_consumer_cover(&self, report: Option<CoverReport>) {
+        self.cover.set_report(report);
     }
 
     /// Installs (`Some`) or removes (`None`) the [`FrameTap`] that sees
@@ -621,6 +753,7 @@ impl LoopbackWriter {
         let p = self.pipeline.pipeline();
         let state = p.set_state(gst::State::Null);
         let (_, cur, _) = p.state(gst::ClockTime::from_seconds(5));
+        self.end_cover();
         res?;
         state.map_err(|e| PipelineError::State(e.to_string()))?;
         if cur != gst::State::Null {
@@ -801,6 +934,31 @@ mod tests {
         assert_eq!(cfg.queue_buffers, 3);
     }
 
+    /// The PTS base is `CLOCK_MONOTONIC`: a second writer (a new daemon
+    /// process, in effect) starts after the first one's last PTS, not at 0.
+    #[test]
+    fn a_new_writer_continues_the_timeline_of_the_previous_one() {
+        require_elements(ELEMENTS);
+        let contract = small(OutputFormat::Nv12);
+        let mut last = 0;
+        for round in 0..2 {
+            let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+            let log = watch_sink(&w);
+            w.start().unwrap();
+            wait_until(Duration::from_secs(10), "3 placeholders", || {
+                log.lock().unwrap().buffers.len() >= 3
+            });
+            w.stop().unwrap();
+            let log = log.lock().unwrap();
+            let first = log.buffers[0].pts;
+            assert!(first > last, "round {round}: {first} after {last}");
+            last = log.buffers.last().unwrap().pts;
+        }
+        let a = monotonic_ns();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(monotonic_ns() >= a + 2_000_000);
+    }
+
     /// The black frame is a whole frame of the contract format, laid out as
     /// the caps say: Y=16 everywhere, chroma 128 (NV12: one interleaved
     /// plane; I420: two planes), padding rows included.
@@ -894,13 +1052,17 @@ mod tests {
             let contract = small(format);
             let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
             let log = watch_sink(&w);
+            let mono_start = monotonic_ns();
             w.start().unwrap();
             assert!(w.is_running());
             wait_until(Duration::from_secs(10), "30 placeholders", || {
                 log.lock().unwrap().buffers.len() >= 30
             });
             let counts = w.counts();
+            // No crash cover on a fakesink.
+            assert_eq!(w.consumer_cover(), ConsumerCover::Off);
             w.stop().unwrap();
+            let mono_stop = monotonic_ns();
             w.health().unwrap();
             let log = log.lock().unwrap();
             let want: gst::Caps = writer_caps_string(&contract).parse().unwrap();
@@ -918,7 +1080,18 @@ mod tests {
                 assert_eq!(b.duration, Some(period));
                 assert_eq!(b.data, first, "{format} #{k}: the one black frame");
                 // Never faster than the contract rate.
-                assert!(b.pts >= k as u64 * period, "{format} #{k}: pts {}", b.pts);
+                let since_first = b.pts - log.buffers[0].pts;
+                assert!(
+                    since_first >= k as u64 * period,
+                    "{format} #{k}: pts {}",
+                    b.pts
+                );
+                // CLOCK_MONOTONIC at the push.
+                assert!(
+                    (mono_start..=mono_stop).contains(&b.pts),
+                    "{format} #{k}: pts {} outside CLOCK_MONOTONIC {mono_start}..={mono_stop}",
+                    b.pts
+                );
             }
             assert!(log.buffers.windows(2).all(|w| w[0].pts < w[1].pts));
             assert!(
@@ -956,6 +1129,7 @@ mod tests {
         assert_eq!(h.counts().push_failed, 1);
 
         let log = watch_sink(&w);
+        let mono_start = monotonic_ns();
         w.start().unwrap();
         // The first placeholder goes out at start; the forwarded frames
         // follow it.
@@ -981,6 +1155,7 @@ mod tests {
         });
         let counts = w.counts();
         w.stop().unwrap();
+        let mono_stop = monotonic_ns();
         assert!(!h.push(frame()), "a stopped writer refuses");
         let log = log.lock().unwrap();
         let placeholder = log.buffers[0].data;
@@ -995,7 +1170,15 @@ mod tests {
             "forwarded memory was copied"
         );
         assert!(log.buffers.windows(2).all(|w| w[0].pts < w[1].pts));
-        assert!(forwarded.iter().all(|b| b.pts < 100_000_000_000));
+        // The writer's time (CLOCK_MONOTONIC at the push), not the
+        // producer's 1000 s.
+        assert!(
+            forwarded
+                .iter()
+                .all(|b| (mono_start..=mono_stop).contains(&b.pts)),
+            "{:?} outside CLOCK_MONOTONIC {mono_start}..={mono_stop}",
+            forwarded.iter().map(|b| b.pts).collect::<Vec<_>>()
+        );
         for b in &kept {
             assert_eq!(b.pts(), Some(gst::ClockTime::from_seconds(1000)));
         }

@@ -1,6 +1,6 @@
 # ADR-0021: The NVIDIA SDK tooling moves to omarchy-nvidia-sdks; omarchy-broadcast keeps a drop-in and a default root
 
-- **Status:** Accepted (2026-11-09). Amends [ADR-0012](0012-video-effects-and-maxine-backend.md) for the os-release shim: its location, its variable name, the drop-in that activates it and the way it is packaged. [ADR-0003](0003-maxine-first-behind-backend-seam.md) (the SDK is never vendored) is unchanged.
+- **Status:** Accepted (2026-11-09). Amends [ADR-0012](0012-video-effects-and-maxine-backend.md) for the os-release shim: its location, its variable name, the drop-in that activates it and the way it is packaged. [ADR-0003](0003-maxine-first-behind-backend-seam.md) (the SDK is never vendored) is unchanged. Amended on 2026-11-09 (see [Amendment](#amendment-2026-11-09-the-sdk-root-from-the-configuration-and-the-sdks-libraries-loaded-by-the-daemon)): the SDK root can come from the configuration, and the daemon loads the SDK's libraries itself, so `LD_LIBRARY_PATH` is no longer needed.
 
 ## Context
 - [ADR-0012](0012-video-effects-and-maxine-backend.md) put the os-release shim in this repository (`tools/os-release-shim`), with a probe and a replacement `os-release` in `tools/maxine-probe`. The Arch package installed the shim inactive under `/usr/lib/omarchy-broadcast/`, and `scripts/install-user.sh` built it into `~/.local/lib/omarchy-broadcast/`. The note on 2026-11-08 already said it was expected to move to a separate project.
@@ -49,3 +49,37 @@
 - A change in the package layout of `maxine-vfx-sdk-local` (its paths, its environment file or the variable names): the drop-in and the default root follow it.
 - An SDK release that reads the distribution without an interposable libc call, or one that lists Arch: the shim would stop being needed, as noted in [ADR-0012](0012-video-effects-and-maxine-backend.md).
 - A redistribution licence for the SDK: a package that contains it could then be a real dependency.
+
+## Amendment (2026-11-09): the SDK root from the configuration, and the SDK's libraries loaded by the daemon
+
+### Context
+- The decision above left `LD_LIBRARY_PATH` as a requirement: the SDK's own libraries, the bundled CUDA 12 and TensorRT 10 and one directory per feature had to be on it when the process started, and systemd cannot expand a glob in `Environment=`. A tree outside the package needed a hand-written list of feature directories that went stale when a feature was added.
+- The SDK root could be set only through the environment (`MAXINE_VFX_ROOT`), which a user with a tree elsewhere had to put in the unit.
+- glibc reads `LD_LIBRARY_PATH` only at process start, which is why a running daemon cannot set it for itself.
+
+### Decision
+**The daemon loads the SDK's libraries from the SDK root by absolute path, and the root can be set in `config.toml`.**
+
+- **Root precedence.** `MAXINE_VFX_ROOT` (set and non-empty), then `[effect] maxine_root` (an absolute path, validated when the configuration is loaded; whether the directory exists is not checked then), then `/opt/nvidia/maxine/videofx` when it is a directory (where `maxine-vfx-sdk-local` installs the SDK), then none: the library search path only, as before.
+- **Self-loading.** When a root is chosen, before it opens `libNVCVImage` and `libVideoFX`, the daemon opens with `RTLD_GLOBAL`, by absolute path and dependencies first: `lib/libNVCVImage`, `lib/libVideoFXLocal`, `lib/libVideoFX`, every library in `features/*/lib`, and `external/cuda/lib/libnvJitLink.so.12` when it is present (TensorRT opens it by name), together with their `DT_NEEDED` closure, resolved in the SDK's directories (`lib`, `features/*/lib`, `external/cuda/lib`, `external/tensorrt/lib`). The SDK's own later `dlopen` calls by name then find the objects already loaded. The cuDNN and cuBLAS libraries find their sub-libraries through their own `RUNPATH $ORIGIN`. Only the libraries the SDK needs are loaded, not every bundled library.
+- **The root is pinned.** It is taken when the SDK is first loaded in the process (the first probe or load of an effect or of noise removal) and recorded as the canonical path of that directory. A library is never unloaded, so a different root later, after a configuration reload, is refused: the effect fails closed with a message that asks for a daemon restart. A reload that changes the key logs this; an output that is already running keeps its root.
+- **The variable wins over the key.** With `MAXINE_VFX_ROOT` set, `[effect] maxine_root` is ignored, with a warning in the log. The package's environment file (`/usr/share/maxine-vfx/maxine-vfx.env`) sets the variable, so a unit that loads it ignores the key.
+- **`LD_LIBRARY_PATH` still works** when it is set: with no root the search path is used as before, and with a root the absolute-path loads are the same files.
+- **Unchanged:** a missing or broken SDK makes the requested effect or noise removal fail with the reason in the `Error` property, and a preload failure is part of that reason. The os-release shim is still a requirement from process start: `LD_PRELOAD` with the shim and `MAXINE_OS_RELEASE` with the replacement file, which the daemon cannot set for itself either.
+- **The drop-in** needs, with the package at the default root, only the two shim lines (`Environment=LD_PRELOAD=/usr/lib/maxine-vfx/os-release-shim.so` and `Environment=MAXINE_OS_RELEASE=/usr/lib/maxine-vfx/fake-os-release`). Its `EnvironmentFile=` line still works and is kept. For a tree elsewhere, set `[effect] maxine_root` (or `MAXINE_VFX_ROOT`) and keep the two shim lines; no `LD_LIBRARY_PATH` line and no per-feature list.
+
+### Consequences
+- A feature added to a tree needs no edit anywhere: its `features/*/lib` directory is found by the daemon.
+- The "hand-written variables" consequence above shrinks to the two shim variables and, for a tree outside the default root, the root.
+- One SDK per process, for the life of the process. Moving the root takes a daemon restart.
+- The daemon depends on the layout of the SDK tree (`lib`, `features/*/lib`, `external/cuda/lib`, `external/tensorrt/lib`) and on the TensorRT library opening `libnvJitLink.so.12` by name. A layout change in a new SDK release is handled in the daemon, not in the unit.
+
+### Alternatives considered
+
+| Alternative | Why rejected |
+|---|---|
+| Keep requiring `LD_LIBRARY_PATH` | The list is long, systemd cannot glob, and a feature added to the tree silently fails with an unimplemented-status error until the list is edited |
+| Load every bundled library | Much more memory for libraries nothing uses |
+| Re-exec the daemon with `LD_LIBRARY_PATH` set | It works, but it doubles the process start and complicates the unit and D-Bus activation (the process that owns the bus name and the one systemd tracks must stay the same) |
+| An environment variable as the only way to set the root | A user with a tree elsewhere would have to edit the unit; the key keeps the setting with the rest of the configuration. The variable still wins, because the package's environment file sets it |
+

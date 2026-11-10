@@ -41,6 +41,23 @@ options v4l2loopback devices=2 video_nr=10,11 card_label="First Device,Omarchy B
 
 With `exclusive_caps=1` the device advertises only the CAPTURE capability while a producer is writing to it. It therefore appears as a camera in OBS or a browser only while `omarchy-broadcast` is streaming, and does not show up as a dead, black camera otherwise. Chrome requires this: it lists only devices that expose capture capability and not output capability. Keep it enabled.
 
+## What the daemon sets on the device
+
+At every start of its loopback writer the daemon sets two things on the device so that a daemon crash does not make applications lose the camera ([ADR-0022](../adr/0022-crash-recovery-for-consumers.md)). No root is needed:
+
+- a black **timeout image**, uploaded through the driver's `timeout_image_io` control, and
+- the **`timeout`** control, in milliseconds: 250 at the default 30 fps contract. When no frame arrives within that time, the driver serves the timeout image, also after the daemon's process has died. Chromium-based applications restart their capture after about a second without a frame, which v4l2loopback refuses while no writer streams, so without this they lose the camera.
+
+Both are device-wide and persist until the module is reloaded: the daemon does not reset them when it stops, so an application that still holds the node after a clean stop gets black frames at a few frames per second instead of a frozen image. To inspect (no root; the query opens the node, so it counts as a consumer while it runs):
+
+```sh
+v4l2-ctl -d /dev/video10 -C timeout
+```
+
+The daemon logs the outcome at each writer start ([daemon.md](daemon.md#restarts-and-crashes)). The controls need a v4l2loopback that has them (0.15.4 does); without them the daemon only logs a warning.
+
+Do not set `keep_format` or `sustain_framerate` for this daemon. `sustain_framerate=1` repeats the last frame, which would leave the camera image on screen while the daemon is down, and it inserted duplicate frames in steady state; `keep_format=1` refuses a new writer until it is cleared. The daemon never changes them.
+
 ## Notes
 
 - `max_buffers=4` is the value all recorded benchmarks used.

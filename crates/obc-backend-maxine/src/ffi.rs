@@ -8,7 +8,7 @@
 
 use std::ffi::{CStr, c_char, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard};
 
 use libloading::Library;
 
@@ -134,6 +134,16 @@ pub(crate) struct Sdk {
     _nvcvimage: Library,
     /// Where the SDK's models are: `<directory of libVideoFX>/models`.
     pub model_dir: Option<PathBuf>,
+    /// The SDK root the libraries were loaded from by absolute path
+    /// (canonical; `None`: from the library search path, even when a root
+    /// was asked for, because that root had no SDK libraries).
+    pub root: Option<PathBuf>,
+    /// The directory `libVideoFX.so` was loaded from (canonical), as the
+    /// loader reports it.
+    pub lib_dir: Option<PathBuf>,
+    /// The SDK libraries [`crate::preload`] could not load first, as one
+    /// line (`None`: all loaded, or no root).
+    pub preload_failures: Option<String>,
     pub NvVFX_CreateEffect: unsafe extern "C" fn(*const c_char, *mut VfxHandle) -> NvCvStatus,
     pub NvVFX_DestroyEffect: unsafe extern "C" fn(VfxHandle),
     pub NvVFX_SetU32: unsafe extern "C" fn(VfxHandle, *const c_char, u32) -> NvCvStatus,
@@ -230,23 +240,151 @@ pub(crate) const SDK_LIBS: LibNames = LibNames {
     nvcvimage: "libNVCVImage.so",
 };
 
-/// The SDKs opened so far, by (root, names). Never closed: the SDK's
-/// libraries stay mapped for the life of the process
-/// (`docs/adr/0012-video-effects-and-maxine-backend.md`, Consequences).
-#[allow(clippy::type_complexity)]
-static OPENED: OnceLock<Mutex<Vec<((Option<PathBuf>, LibNames), &'static Sdk)>>> = OnceLock::new();
+/// Where this process's SDK libraries came from, or where an open would
+/// take them from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Source {
+    /// By absolute path from this SDK root (canonical: a symbolic link is
+    /// recorded as the directory it pointed at).
+    Root(PathBuf),
+    /// By name from the library search path; the directory the loader found
+    /// the first of them in (canonical), when it reports it.
+    SearchPath(Option<PathBuf>),
+}
 
-/// Opens the SDK (once per root), or explains why it cannot be opened.
-pub(crate) fn open(root: Option<&Path>, names: &LibNames) -> Result<&'static Sdk, String> {
-    let key = (root.map(Path::to_path_buf), names.clone());
-    let opened = OPENED.get_or_init(|| Mutex::new(Vec::new()));
-    let mut opened = opened.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((_, sdk)) = opened.iter().find(|(k, _)| *k == key) {
-        return Ok(sdk);
+impl Source {
+    /// Where an open of `root` takes the SDK from: the root, canonical, when
+    /// it has any of the libraries [`crate::preload::roots`] starts from;
+    /// else (no root, or one without SDK libraries) the search path.
+    fn of(root: Option<&Path>, names: &LibNames) -> Source {
+        root.and_then(|r| r.canonicalize().ok())
+            .filter(|c| !crate::preload::roots(c, names.nvcvimage, names.videofx).is_empty())
+            .map_or(Source::SearchPath(None), Source::Root)
     }
-    let sdk: &'static Sdk = Box::leak(Box::new(load(root, names)?));
-    opened.push((key, sdk));
-    Ok(sdk)
+
+    /// Whether an open that takes the SDK from `wanted` gets the libraries
+    /// already loaded from `self` rather than a second SDK. The search path
+    /// is the same for the life of the process (the loader reads it when the
+    /// process starts). A root matches the search path only when the search
+    /// path served the SDK from that root's `lib`; otherwise what one of them
+    /// would load is not known to be the other's, so they do not match.
+    fn serves(&self, wanted: &Source) -> bool {
+        match (self, wanted) {
+            (Source::Root(a), Source::Root(b)) => a == b,
+            (Source::SearchPath(_), Source::SearchPath(_)) => true,
+            (Source::SearchPath(Some(dir)), Source::Root(b)) => {
+                b.join("lib").canonicalize().is_ok_and(|l| l == *dir)
+            }
+            _ => false,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Source::Root(r) => r.display().to_string(),
+            Source::SearchPath(Some(d)) => format!("the library search path ({})", d.display()),
+            Source::SearchPath(None) => "the library search path".into(),
+        }
+    }
+}
+
+fn describe_root(root: Option<&Path>) -> String {
+    match root {
+        Some(r) => r.display().to_string(),
+        None => "the library search path".into(),
+    }
+}
+
+/// An SDK opened successfully.
+struct Opened {
+    source: Source,
+    names: LibNames,
+    sdk: &'static Sdk,
+}
+
+/// What this process has loaded of the SDK.
+#[derive(Default)]
+struct Registry {
+    /// Where the first SDK library loaded in this process came from. Set as
+    /// soon as one library is loaded, even when the open then fails: what
+    /// was loaded stays loaded (`RTLD_GLOBAL`, never closed) and has the
+    /// same sonames as any other SDK's, so every later open must take the
+    /// SDK from the same place ([`Source::serves`]). A failed open that
+    /// loaded nothing leaves it unset.
+    pin: Option<Source>,
+    /// The SDKs opened, reused by later opens from the same place with the
+    /// same names. Never closed: the SDK's libraries stay mapped for the
+    /// life of the process (`docs/adr/0012-video-effects-and-maxine-backend.md`,
+    /// Consequences).
+    opened: Vec<Opened>,
+}
+
+/// The process's SDK.
+static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
+    pin: None,
+    opened: Vec::new(),
+});
+
+fn registry() -> MutexGuard<'static, Registry> {
+    REGISTRY.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+impl Registry {
+    /// Why an open of `root`, which takes the SDK from `wanted`, is refused:
+    /// the SDK is already loaded from elsewhere.
+    fn conflict(&self, root: Option<&Path>, wanted: &Source) -> Option<String> {
+        let pin = self.pin.as_ref()?;
+        if pin.serves(wanted) {
+            return None;
+        }
+        Some(format!(
+            "the NVIDIA Maxine Video Effects SDK is already loaded in this process from {}, \
+             and a second SDK cannot be loaded beside it: the SDK root is now {}. Restart the \
+             process to use the new root (the daemon: systemctl --user restart \
+             omarchy-broadcastd)",
+            pin.describe(),
+            describe_root(root)
+        ))
+    }
+
+    /// See [`open`].
+    fn open(&mut self, root: Option<&Path>, names: &LibNames) -> Result<&'static Sdk, String> {
+        let wanted = Source::of(root, names);
+        if let Some(why) = self.conflict(root, &wanted) {
+            return Err(why);
+        }
+        if let Some(o) = self
+            .opened
+            .iter()
+            .find(|o| o.names == *names && o.source == wanted)
+        {
+            return Ok(o.sdk);
+        }
+        let sdk = load(root, &wanted, names, &mut self.pin)?;
+        let sdk: &'static Sdk = Box::leak(Box::new(sdk));
+        self.opened.push(Opened {
+            source: wanted,
+            names: names.clone(),
+            sdk,
+        });
+        Ok(sdk)
+    }
+}
+
+/// What [`open`] would refuse `root` with because the SDK is already loaded
+/// from elsewhere; `None` when nothing is loaded yet or the SDK `root`
+/// leads to is the one loaded. Opens nothing.
+pub(crate) fn root_conflict(root: Option<&Path>) -> Option<String> {
+    registry().conflict(root, &Source::of(root, &SDK_LIBS))
+}
+
+/// Opens the SDK, or explains why it cannot be opened. Once a library of
+/// the SDK has been loaded in this process, from a root or from the search
+/// path, the process is pinned to that place, even if that open failed: an
+/// open that would take the SDK from there returns the same SDK (or tries
+/// again), any other is refused (fail-closed, naming the restart it takes).
+pub(crate) fn open(root: Option<&Path>, names: &LibNames) -> Result<&'static Sdk, String> {
+    registry().open(root, names)
 }
 
 /// The candidate file names of `name` in a directory: the unversioned name
@@ -255,44 +393,75 @@ fn candidates(dir: &Path, name: &str) -> Vec<PathBuf> {
     vec![dir.join(name), dir.join(format!("{name}.1"))]
 }
 
-/// Opens one library: from `<root>/lib` when it is there, else by plain
-/// name from the library search path.
-fn open_one(root: Option<&Path>, name: &str) -> Result<Library, String> {
-    if let Some(root) = root {
-        let lib_dir = root.join("lib");
-        if let Some(path) = candidates(&lib_dir, name).into_iter().find(|p| p.exists()) {
-            // SAFETY: loading an SDK library runs its initialisers, which
-            // have no preconditions for the caller.
-            return unsafe { Library::new(&path) }.map_err(|e| {
-                format!(
-                    "{} could not be loaded: {e}. The SDK's bundled CUDA, TensorRT and feature \
-                     libraries must be on LD_LIBRARY_PATH when the process starts \
-                     (docs/setup/maxine.md, section 4)",
-                    path.display()
-                )
-            });
-        }
+/// Opens one library, from `wanted`: from the root's `lib` by absolute path
+/// (never from the search path then, which would mix two SDKs), else by
+/// plain name from the library search path, `symbol` telling the loader's
+/// directory for it. `note` gets where it came from once it is loaded.
+/// `root` is what was asked for, named in the errors.
+fn open_one(
+    root: Option<&Path>,
+    wanted: &Source,
+    name: &str,
+    symbol: &CStr,
+    note: &mut dyn FnMut(Source),
+) -> Result<Library, String> {
+    if let Source::Root(canonical) = wanted {
+        let shown = root.unwrap_or(canonical);
+        let lib_dir = canonical.join("lib");
+        let Some(path) = candidates(&lib_dir, name).into_iter().find(|p| p.is_file()) else {
+            return Err(format!(
+                "{name} is not in {}: the SDK root {} has other SDK libraries but not this one, \
+                 and the library search path is not tried for it, so that two SDKs are not \
+                 mixed. The SDK root must be a complete SDK, the directory that contains lib/, \
+                 features/ and external/ (docs/setup/maxine.md, section 4)",
+                lib_dir.display(),
+                shown.display()
+            ));
+        };
+        // SAFETY: loading an SDK library runs its initialisers, which have
+        // no preconditions for the caller.
+        let lib = unsafe { Library::new(&path) }.map_err(|e| {
+            format!(
+                "{} could not be loaded: {e}. The SDK root {} must be a complete SDK: the \
+                 libraries it needs are loaded from its lib/, features/*/lib, \
+                 external/cuda/lib and external/tensorrt/lib directories \
+                 (docs/setup/maxine.md, section 4)",
+                path.display(),
+                shown.display()
+            )
+        })?;
+        note(wanted.clone());
+        return Ok(lib);
     }
     // SAFETY: as above, for the library found on the search path.
-    unsafe { Library::new(name) }.map_err(|e| match root {
+    let lib = unsafe { Library::new(name) }.map_err(|e| match root {
         Some(root) => format!(
             "the NVIDIA Maxine Video Effects SDK was not found: no {name} in {} and none on \
-             the library search path ({e}). The SDK root {} (MAXINE_VFX_ROOT, or {} when \
-             that is unset) must be the SDK directory that contains lib/, features/ and \
-             external/: reinstall the maxine-vfx-sdk-local package or set MAXINE_VFX_ROOT \
-             to that directory (docs/setup/maxine.md, section 4)",
+             the library search path ({e}). The SDK root {} (MAXINE_VFX_ROOT when set, else \
+             [effect] maxine_root in the configuration, else {}) must be the SDK directory \
+             that contains lib/, features/ and external/: reinstall the maxine-vfx-sdk-local \
+             package, or set [effect] maxine_root or MAXINE_VFX_ROOT to that directory \
+             (docs/setup/maxine.md, section 4)",
             root.join("lib").display(),
             root.display(),
             crate::DEFAULT_ROOT
         ),
         None => format!(
             "the NVIDIA Maxine Video Effects SDK was not found: MAXINE_VFX_ROOT is unset or \
-             empty, {} is not a directory and {name} is not on the library search path ({e}). \
-             Install the maxine-vfx-sdk-local package (built from omarchy-nvidia-sdks) or set \
-             MAXINE_VFX_ROOT to the SDK directory (docs/setup/maxine.md, sections 2 and 5)",
+             empty, no [effect] maxine_root is configured, {} is not a directory and {name} is \
+             not on the library search path ({e}). Install the maxine-vfx-sdk-local package \
+             (built from omarchy-nvidia-sdks), or set [effect] maxine_root in the \
+             configuration (or MAXINE_VFX_ROOT) to the SDK directory (docs/setup/maxine.md, \
+             sections 2 and 5)",
             crate::DEFAULT_ROOT
         ),
-    })
+    })?;
+    // SAFETY: only the symbol's address is read, never called through.
+    let dir = unsafe { lib.get::<*const c_void>(symbol.to_bytes_with_nul()) }
+        .ok()
+        .and_then(|s| object_dir(*s));
+    note(Source::SearchPath(dir));
+    Ok(lib)
 }
 
 /// Resolves `name` from `lib` as a `T` (a function pointer).
@@ -303,7 +472,7 @@ unsafe fn sym<T: Copy>(lib: &Library, lib_name: &str, name: &str) -> Result<T, S
     let mut cname = name.as_bytes().to_vec();
     cname.push(0);
     // SAFETY: the caller guarantees `T`; `Sdk` keeps `lib` loaded for as
-    // long as the pointer is used (forever, see `OPENED`).
+    // long as the pointer is used (forever, see `Registry`).
     unsafe { lib.get::<T>(&cname) }.map(|s| *s).map_err(|e| {
         format!("{lib_name} has no {name} ({e}); is this Maxine VFX SDK 1.3 or later?")
     })
@@ -330,17 +499,55 @@ fn object_dir(addr: *const c_void) -> Option<PathBuf> {
     path.parent().map(Path::to_path_buf)
 }
 
-fn load(root: Option<&Path>, names: &LibNames) -> Result<Sdk, String> {
+/// Opens the SDK from `wanted` ([`Source::of`] of `root`, which is what
+/// was asked for and is named in the errors). From a root, everything the
+/// SDK needs is loaded from it first, by absolute path (`crate::preload`);
+/// from the search path, the loader finds what it can. The first library
+/// loaded sets `pin` when it is unset ([`Registry::pin`]), whether or not
+/// the open then succeeds.
+fn load(
+    root: Option<&Path>,
+    wanted: &Source,
+    names: &LibNames,
+    pin: &mut Option<Source>,
+) -> Result<Sdk, String> {
+    let mut note = |s: Source| {
+        if pin.is_none() {
+            *pin = Some(s);
+        }
+    };
+    let preload_failures = match wanted {
+        Source::Root(canonical) => {
+            let done = crate::preload::preload(canonical, names.nvcvimage, names.videofx);
+            if !done.loaded.is_empty() {
+                note(wanted.clone());
+            }
+            done.failures()
+        }
+        Source::SearchPath(_) => None,
+    };
+    let with_failures = |e: String| match &preload_failures {
+        Some(f) => format!("{e}. SDK libraries that could not be loaded first: {f}"),
+        None => e,
+    };
     // libVideoFX.so needs libNVCVImage.so (by that soname): open it first so
     // the loader reuses it when it is not on the search path.
-    let nvcvimage = open_one(root, names.nvcvimage)?;
-    let videofx = open_one(root, names.videofx)?;
+    let nvcvimage = open_one(root, wanted, names.nvcvimage, c"NvCVImage_Alloc", &mut note)
+        .map_err(with_failures)?;
+    let videofx =
+        open_one(root, wanted, names.videofx, c"NvVFX_Load", &mut note).map_err(with_failures)?;
     let (vf, cv) = (names.videofx, names.nvcvimage);
     // SAFETY (all `sym` calls): each field type is the documented C
     // signature of the entry point it is resolved from.
     let sdk = unsafe {
         Sdk {
             model_dir: None,
+            root: match wanted {
+                Source::Root(canonical) => Some(canonical.clone()),
+                Source::SearchPath(_) => None,
+            },
+            lib_dir: None,
+            preload_failures: preload_failures.clone(),
             NvVFX_CreateEffect: sym(&videofx, vf, "NvVFX_CreateEffect")?,
             NvVFX_DestroyEffect: sym(&videofx, vf, "NvVFX_DestroyEffect")?,
             NvVFX_SetU32: sym(&videofx, vf, "NvVFX_SetU32")?,
@@ -366,8 +573,13 @@ fn load(root: Option<&Path>, names: &LibNames) -> Result<Sdk, String> {
             _nvcvimage: nvcvimage,
         }
     };
-    let model_dir = object_dir(sdk.NvVFX_Load as *const c_void).map(|d| d.join("models"));
-    Ok(Sdk { model_dir, ..sdk })
+    let lib_dir = object_dir(sdk.NvVFX_Load as *const c_void);
+    let model_dir = lib_dir.as_ref().map(|d| d.join("models"));
+    Ok(Sdk {
+        model_dir,
+        lib_dir,
+        ..sdk
+    })
 }
 
 #[cfg(test)]
@@ -383,6 +595,200 @@ mod tests {
         assert_eq!(std::mem::offset_of!(NvCvImage, pixels), 32);
         assert_eq!(std::mem::offset_of!(NvCvImage, delete_proc), 48);
         assert_eq!(std::mem::offset_of!(NvCvImage, buffer_bytes), 56);
+    }
+
+    /// Names that cannot exist, so nothing is found on the search path.
+    const NO_SUCH: LibNames = LibNames {
+        videofx: "libobc-no-such-VideoFX-pin.so",
+        nvcvimage: "libobc-no-such-NVCVImage-pin.so",
+    };
+
+    /// The error of an open that must fail.
+    fn failed(r: Result<&'static Sdk, String>) -> String {
+        match r {
+            Ok(_) => panic!("an impossible SDK opened"),
+            Err(e) => e,
+        }
+    }
+
+    /// A small loadable system library (zlib) to stand in for an SDK one.
+    fn small_library() -> PathBuf {
+        [
+            "/usr/lib/libz.so.1",
+            "/usr/lib64/libz.so.1",
+            "/lib/x86_64-linux-gnu/libz.so.1",
+            "/usr/lib/x86_64-linux-gnu/libz.so.1",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+        .expect("these tests copy zlib (libz.so.1) into a fake SDK root")
+    }
+
+    /// A root that has one loadable library, as a feature library, and none
+    /// of the libraries of [`NO_SUCH`].
+    fn root_with_a_library(dir: &Path) -> PathBuf {
+        let feat = dir.join("features/fx/lib");
+        std::fs::create_dir_all(&feat).unwrap();
+        std::fs::copy(small_library(), feat.join("libnvVFXFx.so")).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn where_an_open_takes_the_sdk_from() {
+        let dir = tempfile::tempdir().unwrap();
+        // No root, a missing one, or one without SDK libraries: the search
+        // path.
+        assert_eq!(Source::of(None, &NO_SUCH), Source::SearchPath(None));
+        let nowhere = dir.path().join("no-sdk");
+        assert_eq!(
+            Source::of(Some(&nowhere), &NO_SUCH),
+            Source::SearchPath(None)
+        );
+        assert_eq!(
+            Source::of(Some(dir.path()), &NO_SUCH),
+            Source::SearchPath(None)
+        );
+        // A root with SDK libraries: that root, canonical, however written.
+        let a = root_with_a_library(&dir.path().join("a"));
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        for written in [
+            dir.path().join("a"),
+            dir.path().join("a/."),
+            dir.path().join("a/../a"),
+            link,
+        ] {
+            assert_eq!(
+                Source::of(Some(&written), &NO_SUCH),
+                Source::Root(a.clone()),
+                "{written:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_serves_only_an_open_from_the_same_place() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("lib")).unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let lib = root.join("lib");
+        let other = PathBuf::from("/elsewhere/sdk");
+        let (r, o) = (Source::Root(root.clone()), Source::Root(other.clone()));
+        let search = Source::SearchPath(None);
+        // A root serves itself only, never the search path.
+        assert!(r.serves(&r));
+        assert!(!r.serves(&o));
+        assert!(!r.serves(&search));
+        // The search path serves the search path, and the root whose lib
+        // it served the SDK from.
+        for s in [
+            Source::SearchPath(None),
+            Source::SearchPath(Some(lib.clone())),
+        ] {
+            assert!(s.serves(&search), "{s:?}");
+            assert!(!s.serves(&o), "{s:?}");
+        }
+        assert!(Source::SearchPath(Some(lib)).serves(&r));
+        assert!(!Source::SearchPath(None).serves(&r));
+        assert!(!Source::SearchPath(Some(root.clone())).serves(&r));
+    }
+
+    #[test]
+    fn failed_opens_that_load_nothing_do_not_pin() {
+        let mut reg = Registry::default();
+        let one = tempfile::tempdir().unwrap();
+        let two = tempfile::tempdir().unwrap();
+        // A root with a library file that does not load, as one of the
+        // SDK's: nothing loaded either.
+        let lib = two.path().join("lib");
+        std::fs::create_dir(&lib).unwrap();
+        std::fs::write(lib.join("libobc-no-such-NVCVImage-pin.so.1"), b"no library").unwrap();
+        for root in [Some(one.path()), Some(two.path()), None, Some(one.path())] {
+            let Err(e) = reg.open(root, &NO_SUCH) else {
+                panic!("an impossible library opened");
+            };
+            assert!(
+                e.contains("was not found") || e.contains("could not be loaded"),
+                "{e}"
+            );
+            assert!(!e.contains("already loaded"), "{e}");
+            assert_eq!(reg.pin, None, "{root:?}");
+        }
+        assert!(reg.opened.is_empty());
+    }
+
+    #[test]
+    fn a_failed_open_that_loaded_a_library_pins_its_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = root_with_a_library(&dir.path().join("a"));
+        let b = root_with_a_library(&dir.path().join("b"));
+        let mut reg = Registry::default();
+        // The feature library loads, the SDK's own are missing: the open
+        // fails without trying the search path, and the root is pinned.
+        let e = failed(reg.open(Some(&a), &NO_SUCH));
+        assert!(e.contains("is not in"), "{e}");
+        assert!(e.contains("not tried"), "{e}");
+        assert_eq!(reg.pin, Some(Source::Root(a.clone())));
+        assert!(reg.opened.is_empty());
+        // The same root may try again; anything else is refused.
+        let e = failed(reg.open(Some(&a), &NO_SUCH));
+        assert!(!e.contains("already loaded"), "{e}");
+        let nowhere = dir.path().join("no-sdk");
+        for other in [Some(b.as_path()), Some(nowhere.as_path()), None] {
+            let e = failed(reg.open(other, &NO_SUCH));
+            assert!(e.contains("already loaded in this process from"), "{e}");
+            assert!(e.contains(&a.display().to_string()), "{e}");
+            assert!(e.contains("Restart the process"), "{e}");
+            assert_eq!(
+                reg.conflict(other, &Source::of(other, &NO_SUCH)).as_deref(),
+                Some(e.as_str())
+            );
+        }
+        let e = failed(reg.open(None, &NO_SUCH));
+        assert!(
+            e.contains("the SDK root is now the library search path"),
+            "{e}"
+        );
+        assert_eq!(reg.pin, Some(Source::Root(a)));
+    }
+
+    #[test]
+    fn a_retargeted_link_is_compared_by_what_was_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = root_with_a_library(&dir.path().join("a"));
+        let b = root_with_a_library(&dir.path().join("b"));
+        let link = dir.path().join("current");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        let mut reg = Registry::default();
+        let _ = reg.open(Some(&link), &NO_SUCH);
+        assert_eq!(reg.pin, Some(Source::Root(a.clone())));
+        // The same link, now to another SDK: refused, naming what is loaded.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&b, &link).unwrap();
+        let e = failed(reg.open(Some(&link), &NO_SUCH));
+        assert!(e.contains(&format!("from {}", a.display())), "{e}");
+        assert!(e.contains(&format!("now {}", link.display())), "{e}");
+        // Back to the loaded one: not refused.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        let e = failed(reg.open(Some(&link), &NO_SUCH));
+        assert!(!e.contains("already loaded"), "{e}");
+    }
+
+    #[test]
+    fn a_search_path_pin_is_described_with_its_directory() {
+        let reg = Registry {
+            pin: Some(Source::SearchPath(Some("/sdk/lib".into()))),
+            opened: Vec::new(),
+        };
+        let want = Source::Root("/other".into());
+        let e = reg.conflict(Some(Path::new("/other")), &want).unwrap();
+        assert!(e.contains("from the library search path (/sdk/lib)"), "{e}");
+        assert!(e.contains("the SDK root is now /other"), "{e}");
+        assert_eq!(reg.conflict(None, &Source::SearchPath(None)), None);
+        // Nothing loaded: nothing conflicts.
+        assert_eq!(Registry::default().conflict(None, &want), None);
     }
 
     #[test]
