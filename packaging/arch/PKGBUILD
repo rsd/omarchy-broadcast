@@ -35,15 +35,21 @@
 # does not list come from the maxine-vfx-sdk-local package (optional
 # dependency), which each user builds from their own download with the
 # omarchy-nvidia-sdks repository. Without it the daemon runs normally and a
-# requested effect reports why it failed. This package installs nothing for
-# Maxine except the example drop-in that runs the daemon with the SDK; to use
-# it, install maxine-vfx-sdk-local, then copy the drop-in
-# (docs/setup/maxine.md, section 3):
+# requested effect reports why it failed. The effects run in the Maxine
+# module, which this package installs (the library in
+# /usr/lib/omarchy-broadcast/modules, its manifest in
+# /usr/lib/omarchy-broadcast/modules.d); the module loads the SDK at run
+# time, so it installs without it. The example drop-in that runs the daemon
+# with the SDK is shipped too; to use it, install maxine-vfx-sdk-local, then
+# copy the drop-in (docs/setup/maxine.md, section 3):
 #   /usr/share/doc/omarchy-broadcast/examples/systemd/omarchy-broadcastd.service.d/maxine.conf
+#
+# The C header of the module interface is installed in
+# /usr/include/omarchy-broadcast, for modules built out of tree.
 
 pkgname=omarchy-broadcast-git
 _pkgname=omarchy-broadcast
-pkgver=0.23.1
+pkgver=0.24.0
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API and a CLI'
 arch=('x86_64')
@@ -108,6 +114,9 @@ build() {
   export CARGO_TARGET_DIR=target
   cargo build --frozen --release --features omarchy-broadcastd/pipewire \
     -p omarchy-broadcastd -p omarchy-broadcast
+  # The Maxine module: a library the daemon loads (no Maxine code is linked
+  # into the daemon).
+  cargo build --frozen --release -p obc-module-maxine
 }
 
 check() {
@@ -137,6 +146,20 @@ package() {
     "$pkgdir/usr/lib/systemd/user/omarchy-broadcastd.service"
   install -Dm644 dist/dbus-1/services/br.com.dias.OmarchyBroadcast.service \
     "$pkgdir/usr/share/dbus-1/services/br.com.dias.OmarchyBroadcast.service"
+
+  # The Maxine module: the library, and its manifest in the system
+  # modules.d directory (it names the library by absolute path).
+  install -Dm755 -t "$pkgdir/usr/lib/$_pkgname/modules" \
+    target/release/libobc_module_maxine.so
+  install -Dm644 -t "$pkgdir/usr/lib/$_pkgname/modules.d" \
+    crates/obc-module-maxine/maxine-vfx.toml
+  grep -qx 'library = "/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so"' \
+    "$pkgdir/usr/lib/$_pkgname/modules.d/maxine-vfx.toml" ||
+    { echo 'maxine-vfx.toml: the library path is not the packaged one' >&2; return 1; }
+
+  # The C header of the module interface, for modules built out of tree.
+  install -Dm644 -t "$pkgdir/usr/include/$_pkgname" \
+    crates/obc-module-abi/include/omarchy_broadcast_module.h
 
   install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE-MIT LICENSE-APACHE
 

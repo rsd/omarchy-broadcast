@@ -78,7 +78,7 @@ use std::sync::Arc;
 
 use obc_backend::{
     BackendFactory, ColourSpec, EffectKind, FrameParams, GpuContext, HostBgr, InferenceBackend,
-    LoadRequest, RelightLight, StageList,
+    LoadRequest, StageList,
 };
 use obc_backend_maxine::MaxineFactory;
 use obc_backend_maxine::matte::{HARDENING_LUT, MATTE_HI, MATTE_LO, apply_lut};
@@ -366,7 +366,7 @@ fn the_hardened_mask_hides_the_room_on_recorded_camera_frames() {
             height: H as u32,
             colour: ColourSpec::LIMITED_BT601,
             background: Some(Arc::new(solid_background())),
-            relight_light: RelightLight::default(),
+            params: Default::default(),
         };
 
         for (name, frames) in &seqs {

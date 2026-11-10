@@ -408,6 +408,12 @@ struct Mock {
     /// The effect and preview calls received, in order, as
     /// `Method(argument)`.
     calls: Vec<String>,
+    /// The modules (revision 9), their serial, the stage order and the
+    /// profile.
+    modules: Vec<obc_ipc::ModuleInfo>,
+    modules_serial: u32,
+    order: Vec<String>,
+    profile: String,
     /// The preview leases, by the caller's unique name: their rate.
     leases: std::collections::BTreeMap<String, u32>,
     /// What `AcquirePreview` returns.
@@ -726,6 +732,10 @@ impl Mock {
             background_image: String::new(),
             denoise: false,
             calls: Vec::new(),
+            modules: Vec::new(),
+            modules_serial: 1,
+            order: Vec::new(),
+            profile: "quality".into(),
             leases: std::collections::BTreeMap::new(),
             preview_path: PREVIEW_PATH.into(),
             auto_start: Vec::new(),
@@ -1431,6 +1441,79 @@ impl Mock {
     }
 
     #[zbus(property)]
+    fn modules_serial(&self) -> u32 {
+        self.modules_serial
+    }
+
+    #[zbus(property)]
+    fn backend_profile(&self) -> String {
+        self.profile.clone()
+    }
+
+    async fn get_modules(&mut self) -> (u32, Vec<VariantDict>) {
+        self.calls.push("GetModules()".into());
+        obc_ipc::ModuleList {
+            serial: self.modules_serial,
+            modules: self.modules.clone(),
+        }
+        .to_wire()
+    }
+
+    async fn set_module_enabled(&mut self, id: String, enabled: bool) -> Result<(), IpcError> {
+        self.calls
+            .push(format!("SetModuleEnabled({id}, {enabled})"));
+        let m = self
+            .modules
+            .iter_mut()
+            .find(|m| m.id == id)
+            .ok_or_else(|| IpcError::InvalidArgument(format!("No module {id} is installed")))?;
+        m.enabled = enabled;
+        m.status = if enabled { "available" } else { "disabled" }.into();
+        m.reason = if enabled { "" } else { "Disabled" }.into();
+        self.modules_serial += 1;
+        Ok(())
+    }
+
+    async fn get_stage_order(&mut self) -> Vec<String> {
+        self.calls.push("GetStageOrder()".into());
+        self.order.clone()
+    }
+
+    async fn set_stage_order(&mut self, order: Vec<String>) -> Result<(), IpcError> {
+        self.calls
+            .push(format!("SetStageOrder({})", order.join(",")));
+        if order.is_empty() {
+            self.order = vec!["denoise".into(), "background".into(), "relight".into()];
+            return Ok(());
+        }
+        if order.first().map(String::as_str) == Some("relight") {
+            return Err(IpcError::InvalidArgument(
+                "relight (post-matte) cannot come before background (matte)".into(),
+            ));
+        }
+        self.order = order;
+        Ok(())
+    }
+
+    async fn set_backend_profile(&mut self, profile: String) -> Result<(), IpcError> {
+        self.calls.push(format!("SetBackendProfile({profile})"));
+        self.profile = profile;
+        Ok(())
+    }
+
+    async fn set_stage_pin(&mut self, stage: String, module: String) -> Result<(), IpcError> {
+        self.calls.push(format!("SetStagePin({stage}, {module})"));
+        for m in &mut self.modules {
+            for s in &mut m.stages {
+                if s.id == stage {
+                    s.selected = module.is_empty() || m.id == module;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[zbus(property)]
     fn interface_revision(&self) -> u32 {
         INTERFACE_REVISION
     }
@@ -1533,6 +1616,15 @@ impl MockDaemon {
             m.pipe_wire_output_changed(iface.signal_emitter())
                 .await
                 .unwrap();
+        });
+    }
+
+    /// Changes the mock's fields directly (no signal).
+    fn with(&self, f: impl FnOnce(&mut Mock)) {
+        let iface = self.iface();
+        self.rt.block_on(async {
+            let mut m = iface.get_mut().await;
+            f(&mut m);
         });
     }
 
@@ -3183,6 +3275,8 @@ const CONTROLS_TEXT: &str = "Camera:     First Camera (1234:abcd)\n  \
                              saturation   50  0..100 step 2  default 50\n  \
                              sharpness   128  0..255         default 128\n";
 const NOT_IN_USE: &str = "The camera is not in use: changes apply the next time it opens.\n";
+/// What `settings` ends with when a revision-9 daemon has no effect module.
+const NO_MODULES: &str = "All cameras: No effect modules installed\n";
 
 #[test]
 fn controls_human_and_json() {
@@ -3762,7 +3856,10 @@ fn settings_human_and_json() {
 
     let out = bus.run(&["settings"]);
     assert!(out.status.success(), "{}", out.stderr);
-    assert_eq!(out.stdout, format!("{SETTINGS_TEXT}{NOT_IN_USE}"));
+    assert_eq!(
+        out.stdout,
+        format!("{SETTINGS_TEXT}{NOT_IN_USE}{NO_MODULES}")
+    );
     assert_eq!(out.stderr, "");
     // The active camera's, read without starting the daemon.
     assert_eq!(mock.take_calls(), ["GetSettings()"]);
@@ -3803,7 +3900,7 @@ fn settings_human_and_json() {
     assert!(out.status.success(), "{}", out.stderr);
     assert_eq!(
         out.stdout,
-        format!("Camera:     Second Camera\nNo camera settings.\n{NOT_IN_USE}")
+        format!("Camera:     Second Camera\nNo camera settings.\n{NOT_IN_USE}{NO_MODULES}")
     );
     assert_eq!(
         mock.take_calls(),
@@ -3816,10 +3913,17 @@ fn settings_human_and_json() {
     // The active camera, by its id, while it streams: live.
     mock.set_state(State::Active, "");
     let out = bus.run(&["settings", "--camera=usb-1234_abcd"]);
-    assert_eq!(out.stdout, format!("{SETTINGS_TEXT}Applied live.\n"));
+    assert_eq!(
+        out.stdout,
+        format!("{SETTINGS_TEXT}Applied live.\n{NO_MODULES}")
+    );
     // Another camera is not open, whatever the state.
     let out = bus.run(&["settings", "--camera=platform-video2"]);
-    assert!(out.stdout.ends_with(NOT_IN_USE), "{}", out.stdout);
+    assert!(
+        out.stdout.ends_with(&format!("{NOT_IN_USE}{NO_MODULES}")),
+        "{}",
+        out.stdout
+    );
 
     // A camera that is not there: the daemon's rejection.
     for json in [false, true] {
@@ -3870,7 +3974,7 @@ fn settings_without_a_camera_are_a_clear_line() {
     assert!(out.status.success(), "{}", out.stderr);
     assert_eq!(
         out.stdout,
-        format!("Camera:     none\nNo camera settings.\n{NOT_IN_USE}")
+        format!("Camera:     none\nNo camera settings.\n{NOT_IN_USE}{NO_MODULES}")
     );
     // Setting something without a camera: rejected before any write.
     let out = bus.run(&["settings", "set", "camera.image.brightness", "10"]);
@@ -4099,13 +4203,14 @@ fn settings_reset_by_camera_group_or_setting() {
             .starts_with("Camera:     First Camera (1234:abcd)\nImage\n")
     );
     assert!(
-        out.stdout.ends_with("90|78|65\nApplied live.\n"),
+        out.stdout
+            .ends_with(&format!("90|78|65\nApplied live.\n{NO_MODULES}")),
         "{}",
         out.stdout
     );
     assert_eq!(
         out.stdout.lines().count(),
-        SETTINGS_TEXT.lines().count() + 1
+        SETTINGS_TEXT.lines().count() + 2
     );
     assert!(!out.stdout.contains("(stored)"), "{}", out.stdout);
     assert_eq!(
@@ -4370,7 +4475,10 @@ fn settings_usage_errors_exit_2_before_any_write() {
     }
     // Nothing was changed.
     let out = bus.run(&["settings"]);
-    assert_eq!(out.stdout, format!("{SETTINGS_TEXT}{NOT_IN_USE}"));
+    assert_eq!(
+        out.stdout,
+        format!("{SETTINGS_TEXT}{NOT_IN_USE}{NO_MODULES}")
+    );
 }
 
 #[test]
@@ -4480,7 +4588,10 @@ fn settings_rejected_by_the_daemon_exit_1_with_its_message() {
     );
     // Nothing was changed.
     let out = bus.run(&["settings"]);
-    assert_eq!(out.stdout, format!("{SETTINGS_TEXT}{NOT_IN_USE}"));
+    assert_eq!(
+        out.stdout,
+        format!("{SETTINGS_TEXT}{NOT_IN_USE}{NO_MODULES}")
+    );
 }
 
 #[test]
@@ -4770,7 +4881,12 @@ fn settings_lines_stay_under_the_cap_with_hostile_strings() {
     // For a person: escaped, one line per setting.
     let out = bus.run(&["settings"]);
     assert!(out.status.success(), "{}", out.stderr);
-    assert_eq!(out.stdout.lines().count(), 1 + 1 + 30 + 1, "{}", out.stdout);
+    assert_eq!(
+        out.stdout.lines().count(),
+        1 + 1 + 30 + 1 + 1,
+        "{}",
+        out.stdout
+    );
     assert!(
         !out.stdout
             .chars()
@@ -5265,4 +5381,130 @@ fn settings_show_the_lighting_group_and_set_a_negative_direction() {
         "{}",
         out.stderr
     );
+}
+
+/// `modules` and `order` against a revision-9 daemon: none installed, then
+/// one; the reads start nothing, the changes are the methods, an invalid
+/// order is the daemon's rejection.
+#[test]
+fn modules_and_order_list_change_and_refuse() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let out = bus.run(&["modules"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert_eq!(out.stdout, "No effect modules installed\n");
+    let out = bus.run(&["modules", "list", "--json"]);
+    assert_eq!(
+        json_lines(&out.stdout),
+        [
+            serde_json::json!({"v": 1, "type": "modules", "serial": 1, "profile": "quality", "count": 0})
+        ]
+    );
+    mock.with(|m| {
+        m.modules = vec![obc_ipc::ModuleInfo {
+            id: "br.com.dias.maxine-vfx".into(),
+            name: "NVIDIA Maxine video effects".into(),
+            version: "0.24.0".into(),
+            enabled: true,
+            status: "available".into(),
+            stages: vec![obc_ipc::StageInfo {
+                id: "background".into(),
+                slot: "matte".into(),
+                rank: 300,
+                device: "nvidia-gpu".into(),
+                available: true,
+                selected: true,
+                ..obc_ipc::StageInfo::default()
+            }],
+            ..obc_ipc::ModuleInfo::default()
+        }];
+        m.order = vec!["denoise".into(), "background".into(), "relight".into()];
+    });
+    mock.take_calls();
+    let out = bus.run(&["modules", "list"]);
+    assert_eq!(
+        out.stdout,
+        "Profile: quality\nbr.com.dias.maxine-vfx  NVIDIA Maxine video effects 0.24.0  available\n\
+         \x20   background (matte, nvidia-gpu, rank 300) selected\n"
+    );
+    let out = bus.run(&["modules", "info", "br.com.dias.maxine-vfx", "--json"]);
+    let v = json_line(&out.stdout);
+    assert_eq!(v["type"], "module");
+    assert_eq!(v["module"]["stages"][0]["id"], "background");
+    let out = bus.run(&["modules", "info", "org.x.none"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        out.stderr.contains("No module org.x.none is installed"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(
+        mock.take_calls(),
+        ["GetModules()", "GetModules()", "GetModules()"]
+    );
+    let out = bus.run(&["modules", "disable", "br.com.dias.maxine-vfx"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert!(
+        out.stdout.contains("Status:      disabled: Disabled\n"),
+        "{}",
+        out.stdout
+    );
+    let out = bus.run(&["modules", "profile", "battery"]);
+    assert_eq!(out.stdout, "Profile: battery\n");
+    let out = bus.run(&["modules", "pin", "background", "--clear"]);
+    assert_eq!(
+        out.stdout,
+        "background: provided by NVIDIA Maxine video effects (br.com.dias.maxine-vfx)\n"
+    );
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "SetModuleEnabled(br.com.dias.maxine-vfx, false)",
+            "GetModules()",
+            "SetBackendProfile(battery)",
+            "GetModules()",
+            "SetStagePin(background, )",
+            "GetModules()"
+        ]
+    );
+    let out = bus.run(&["order"]);
+    assert_eq!(out.stdout, "1. denoise\n2. background\n3. relight\n");
+    let out = bus.run(&["order", "show", "--json"]);
+    assert_eq!(json_line(&out.stdout)["order"][1], "background");
+    let out = bus.run(&["order", "set", "relight,denoise,background"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stderr.contains("cannot come before"), "{}", out.stderr);
+    let out = bus.run(&["order", "set", "background,denoise,relight"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert_eq!(out.stdout, "1. background\n2. denoise\n3. relight\n");
+    let out = bus.run(&["order", "reset"]);
+    assert_eq!(out.stdout, "1. denoise\n2. background\n3. relight\n");
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "GetStageOrder()",
+            "GetStageOrder()",
+            "SetStageOrder(relight,denoise,background)",
+            "SetStageOrder(background,denoise,relight)",
+            "GetStageOrder()",
+            "SetStageOrder()",
+            "GetStageOrder()"
+        ]
+    );
+}
+
+/// `modules` against a daemon before revision 9 says it is unsupported.
+#[test]
+fn modules_against_an_older_daemon_say_they_are_unsupported() {
+    let bus = Bus::start();
+    let _daemon = OldDaemon::start(&bus, Rev1);
+    for args in [&["modules"][..], &["order"], &["modules", "enable", "a.b"]] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", out.stderr);
+        assert!(
+            out.stderr.contains("the daemon does not support modules"),
+            "{args:?}: {}",
+            out.stderr
+        );
+    }
 }

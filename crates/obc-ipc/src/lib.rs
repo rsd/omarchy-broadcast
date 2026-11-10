@@ -44,9 +44,11 @@ use zbus::proxy::{CacheProperties, MethodFlags};
 use zbus::{Connection, DBusError, OwnedVariant, Type, Variant};
 
 pub mod client;
+pub mod modules;
 pub mod settings;
 
 pub use client::OmarchyBroadcastProxy;
+pub use modules::{MODULES_REVISION, ModuleInfo, ModuleList, StageInfo};
 pub use settings::{
     Condition, ConditionOp, ResetScope, Setting, SettingChange, SettingKind, SettingValue,
     SettingsGroup, SettingsTree, valid_setting_id,
@@ -78,8 +80,12 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// (scope [`settings::SCOPE_GLOBAL`]): the video effects as
 /// `effect.background.mode`, `effect.background.blur_strength`,
 /// `effect.video.denoise` and `effect.video.enhance`, after the camera's
-/// groups and also with no camera; the members are unchanged.
-pub const INTERFACE_REVISION: u32 = 8;
+/// groups and also with no camera; the members are unchanged. Revision 9
+/// added the modules ([`modules`]): `GetModules`, `SetModuleEnabled`,
+/// `GetStageOrder`, `SetStageOrder`, `SetBackendProfile`, `SetStagePin`,
+/// the `ModulesSerial` and `BackendProfile` properties; the global settings
+/// are those of the modules installed (none without one).
+pub const INTERFACE_REVISION: u32 = 9;
 /// The first [`INTERFACE_REVISION`] with `LoopbackConsumers`,
 /// `PipeWireConsumers` and `PipeWireOutput`.
 pub const PIPEWIRE_REVISION: u32 = 3;
@@ -399,6 +405,13 @@ pub struct Snapshot {
     /// `SettingsSchemaSerial` (revision 7): bumped on a structural change
     /// of the settings tree; `None` when the daemon does not offer it.
     pub settings_schema_serial: Option<u32>,
+    /// `ModulesSerial` (revision 9): bumped whenever what `GetModules` or
+    /// `GetStageOrder` returns changes; `None` when the daemon does not
+    /// offer it.
+    pub modules_serial: Option<u32>,
+    /// `BackendProfile` (revision 9): `quality` or `battery`; `None` when
+    /// the daemon does not offer it.
+    pub backend_profile: Option<String>,
     pub interface_revision: u32,
 }
 
@@ -425,6 +438,8 @@ impl Snapshot {
             camera_controls: None,
             settings_revision: None,
             settings_schema_serial: None,
+            modules_serial: None,
+            backend_profile: None,
             interface_revision: 0,
         }
     }
@@ -469,6 +484,8 @@ impl Snapshot {
             "SettingsSchemaSerial" => {
                 self.settings_schema_serial = Some(deserialize_for_property(value)?)
             }
+            "ModulesSerial" => self.modules_serial = Some(deserialize_for_property(value)?),
+            "BackendProfile" => self.backend_profile = Some(deserialize_for_property(value)?),
             "InterfaceRevision" => self.interface_revision = deserialize_for_property(value)?,
             _ => {}
         }
@@ -542,7 +559,7 @@ impl Snapshot {
     /// The properties added after revision 1 (`BlurStrength`,
     /// `BackgroundImage`, `PipeWireConsumers`, `PipeWireOutput`, `Denoise`,
     /// `PreviewConsumers`, `CameraControls`, `SettingsRevision`,
-    /// `SettingsSchemaSerial`) keep their [`Snapshot::empty`] value when the daemon does not offer
+    /// `SettingsSchemaSerial`, `ModulesSerial`, `BackendProfile`) keep their [`Snapshot::empty`] value when the daemon does not offer
     /// them (see [`is_unknown_property_error`]), and `LoopbackConsumers` is then
     /// `Consumers`, as [`Snapshot::from_properties`] does for a property
     /// missing from `GetAll`; any other failure to read them is an error.
@@ -579,6 +596,11 @@ impl Snapshot {
             settings_schema_serial: optional(
                 proxy.settings_schema_serial().await.map(Some),
                 empty.settings_schema_serial,
+            )?,
+            modules_serial: optional(proxy.modules_serial().await.map(Some), empty.modules_serial)?,
+            backend_profile: optional(
+                proxy.backend_profile().await.map(Some),
+                empty.backend_profile,
             )?,
             interface_revision: proxy.interface_revision().await?,
         })
@@ -1005,7 +1027,20 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, GLOBAL_SETTINGS_REVISION);
+        assert_eq!(INTERFACE_REVISION, MODULES_REVISION);
+        const { assert!(GLOBAL_SETTINGS_REVISION < MODULES_REVISION) };
+        // Revision 9's properties; a daemon before it has neither.
+        let serial = Variant::from(4u32);
+        let profile = Variant::from("battery");
+        let new = Snapshot::from_properties([
+            ("State", &state),
+            ("ModulesSerial", &serial),
+            ("BackendProfile", &profile),
+        ])
+        .unwrap();
+        assert_eq!(new.modules_serial, Some(4));
+        assert_eq!(new.backend_profile.as_deref(), Some("battery"));
+        assert_eq!((old.modules_serial, old.backend_profile), (None, None));
         assert_eq!(
             (SETTINGS_REVISION, GLOBAL_SETTINGS_REVISION, SETTINGS_SCHEMA),
             (7, 8, 1)

@@ -44,17 +44,19 @@
 //! load after the GPU was parked and unparked, and its GPU time per stage
 //! (logged).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use obc_backend::{
     BackendError, BackendFactory, ColourSpec, EffectKind, FrameParams, GpuContext, HostBgr,
-    InferenceBackend, LoadRequest, RelightLight, Stage, StageList, StageTimings,
+    InferenceBackend, LoadRequest, Params, StageId, StageList, StageTimings, Value,
 };
 use obc_backend_maxine::matte::{HARDENING_LUT, apply_lut};
 use obc_backend_maxine::{
     DenoiseFault, DenoiseFaultSwitch, MaskFault, MaskFaultSwitch, MaxineBackend, MaxineFactory,
-    RelightFault, RelightFaultSwitch, SPLIT_MASK_RAMP, split_mask_value,
+    RELIGHT_DIRECTION, RELIGHT_LIGHT, RelightFault, RelightFaultSwitch, RelightLight,
+    SPLIT_MASK_RAMP, split_mask_value,
 };
 use obc_gpu::{
     ContextGuard, DeviceNv12Buffer, OwnedContext, ParkOutcome, Stream, UnparkOutcome, mem_get_info,
@@ -191,12 +193,12 @@ fn run_frames(
     }
     let col = |f: fn(&StageTimings) -> f32| all.iter().map(f).collect::<Vec<f32>>();
     let mut stages = [
-        ("convert_in", col(|t| t.convert_in_ms)),
-        ("denoise", col(|t| t.denoise_ms)),
-        ("mask", col(|t| t.mask_ms)),
-        ("relight", col(|t| t.relight_ms)),
-        ("effect", col(|t| t.effect_ms)),
-        ("convert_out", col(|t| t.convert_out_ms)),
+        ("convert_in", col(|t| ms(t, StageTimings::CONVERT_IN))),
+        ("denoise", col(|t| ms(t, "denoise"))),
+        ("mask", col(|t| ms(t, StageTimings::MASK))),
+        ("relight", col(|t| ms(t, "relight"))),
+        ("effect", col(|t| ms(t, StageTimings::COMPOSITE))),
+        ("convert_out", col(|t| ms(t, StageTimings::CONVERT_OUT))),
         ("gpu_total", col(|t| t.total_ms())),
         ("wall", wall),
     ];
@@ -353,7 +355,7 @@ fn maxine_rejects_calls_without_the_context_or_a_load() {
         height: H,
         colour: ColourSpec::LIMITED_BT601,
         background: None,
-        relight_light: RelightLight::default(),
+        params: Default::default(),
     };
     // Not pushed: the backend must refuse rather than run in no context.
     let e = backend.load(&gpu, &req).unwrap_err();
@@ -410,7 +412,7 @@ fn maxine_blur_and_replace_in_a_created_context() {
             height: H,
             colour: ColourSpec::LIMITED_BT601,
             background: None,
-            relight_light: RelightLight::default(),
+            params: Default::default(),
         };
         let t = Instant::now();
         let r = backend
@@ -655,7 +657,7 @@ fn blur_request() -> LoadRequest {
         height: H,
         colour: ColourSpec::LIMITED_BT601,
         background: None,
-        relight_light: RelightLight::default(),
+        params: Default::default(),
     }
 }
 
@@ -781,7 +783,8 @@ fn maxine_the_effects_read_the_hardened_mask_not_the_raw_one() {
                         .unwrap_or_else(|e| panic!("{label}: process failed: {e}"));
                 }
                 stream.synchronize().unwrap();
-                let (raw, _) = check_hardened(label, backend, gpu, params, src, dst, &table);
+                let (raw, _) =
+                    check_hardened(label, backend, gpu, params.clone(), src, dst, &table);
                 let raw_bg = raw.iter().filter(|&&m| m < 128).count();
                 assert!(
                     raw_bg * 100 >= raw.len() * 99,
@@ -912,12 +915,12 @@ fn centre_luma(nv12: &[u8]) -> (f64, f64) {
 fn denoise_request(effect: EffectKind) -> LoadRequest {
     LoadRequest {
         effect,
-        stages: Stage::Denoise.into(),
+        stages: StageId::DENOISE.into(),
         width: W,
         height: H,
         colour: ColourSpec::LIMITED_BT601,
         background: None,
-        relight_light: RelightLight::default(),
+        params: Default::default(),
     }
 }
 
@@ -1013,8 +1016,12 @@ fn maxine_denoise_alone_removes_noise_from_a_flat_frame() {
             0..DENOISE_SETTLE + 1,
         );
         assert_denoised("alone", i, o);
-        assert!(t.denoise_ms > 0.0, "{t:?}");
-        assert_eq!((t.mask_ms, t.effect_ms), (0.0, 0.0), "{t:?}");
+        assert!(ms(&t, "denoise") > 0.0, "{t:?}");
+        assert_eq!(
+            (ms(&t, StageTimings::MASK), ms(&t, StageTimings::COMPOSITE)),
+            (0.0, 0.0),
+            "{t:?}"
+        );
         let input = src.download_packed().unwrap();
         assert_eq!(
             input,
@@ -1070,7 +1077,7 @@ fn maxine_denoise_switches_on_and_off_on_a_loaded_chain() {
             let req = LoadRequest {
                 effect,
                 stages: if denoise {
-                    Stage::Denoise.into()
+                    StageId::DENOISE.into()
                 } else {
                     StageList::default()
                 },
@@ -1098,9 +1105,9 @@ fn maxine_denoise_switches_on_and_off_on_a_loaded_chain() {
             stream.synchronize().unwrap();
             let t = backend.timings().unwrap();
             println!("STAGES {label}: {t:?}");
-            assert_eq!(t.denoise_ms > 0.0, denoise, "{label}: {t:?}");
+            assert_eq!(ms(&t, "denoise") > 0.0, denoise, "{label}: {t:?}");
             assert_eq!(
-                t.mask_ms > 0.0,
+                ms(&t, StageTimings::MASK) > 0.0,
                 effect != EffectKind::None,
                 "{label}: {t:?}"
             );
@@ -1154,7 +1161,7 @@ fn maxine_denoise_before_blur_and_replace_gives_sane_output() {
             &mut backend,
             gpu,
             stream,
-            params,
+            params.clone(),
             src,
             dst,
         );
@@ -1317,7 +1324,10 @@ fn maxine_denoise_reset_temporal_starts_a_new_video() {
             dst,
             0..1,
         );
-        assert!(t.denoise_ms > 0.0 && t.mask_ms > 0.0, "{t:?}");
+        assert!(
+            ms(&t, "denoise") > 0.0 && ms(&t, StageTimings::MASK) > 0.0,
+            "{t:?}"
+        );
         assert!(o.0 > 40.0, "the output after a reset is black");
         // The wrong stream is refused.
         let other = Stream::new(true).unwrap();
@@ -1434,10 +1444,10 @@ fn maxine_denoise_faults_degrade_to_the_chain_without_it() {
         };
         let expect_denoise = |label: &str, e: BackendError| match e {
             BackendError::Stage {
-                stage: Stage::Denoise,
+                stage,
                 code,
                 message,
-            } => {
+            } if stage == StageId::DENOISE => {
                 println!("FAULT {label}: code {code}: {message}");
                 message
             }
@@ -1477,7 +1487,10 @@ fn maxine_denoise_faults_degrade_to_the_chain_without_it() {
             assert!(!backend.denoise_loaded(), "{label}");
             frame(&mut backend).unwrap_or_else(|e| panic!("{label}: the chain broke: {e}"));
             let t = backend.timings().unwrap();
-            assert!(t.denoise_ms == 0.0 && t.mask_ms > 0.0, "{label}: {t:?}");
+            assert!(
+                ms(&t, "denoise") == 0.0 && ms(&t, StageTimings::MASK) > 0.0,
+                "{label}: {t:?}"
+            );
         }
 
         // A run failure drops the stage once; the next frame runs without it.
@@ -1495,7 +1508,7 @@ fn maxine_denoise_faults_degrade_to_the_chain_without_it() {
             switch.set(None);
             backend.load(gpu, &req).unwrap();
             frame(&mut backend).unwrap();
-            assert!(backend.timings().unwrap().denoise_ms > 0.0);
+            assert!(ms(&backend.timings().unwrap(), "denoise") > 0.0);
             switch.set(Some(DenoiseFault::Run));
             let m = expect_denoise(&label, frame(&mut backend).unwrap_err());
             assert!(m.contains("next frame runs without it"), "{m}");
@@ -1506,7 +1519,7 @@ fn maxine_denoise_faults_degrade_to_the_chain_without_it() {
             assert_eq!(backend.loaded_effect(), Some(effect), "{label}");
             frame(&mut backend).unwrap_or_else(|e| panic!("{label}: the next frame failed: {e}"));
             let t = backend.timings().unwrap();
-            assert_eq!(t.denoise_ms, 0.0, "{label}: {t:?}");
+            assert_eq!(ms(&t, "denoise"), 0.0, "{label}: {t:?}");
             let out = dst.download_packed().unwrap();
             if effect == EffectKind::None {
                 // The chain without the stage converts the frame there and
@@ -1610,7 +1623,10 @@ fn denoise_session(f: &MaxineFactory, label: &str) {
             t.elapsed().as_secs_f64() * 1000.0
         );
         let (_, o, out, t) = run_noisy(label, &mut backend, gpu, stream, src, dst, 0..3);
-        assert!(t.denoise_ms > 0.0 && t.mask_ms > 0.0, "{label}: {t:?}");
+        assert!(
+            ms(&t, "denoise") > 0.0 && ms(&t, StageTimings::MASK) > 0.0,
+            "{label}: {t:?}"
+        );
         assert!(o.0 > 40.0, "{label}: the output is black");
         assert!(
             out.iter().any(|&v| v != out[0]),
@@ -1656,22 +1672,38 @@ fn maxine_denoise_loads_again_after_the_gpu_was_parked() {
 // ---------------------------------------------------------------------------
 // The relight stage.
 
+/// The time of `step` in `t`, 0 when it did not run.
+fn ms(t: &StageTimings, step: &str) -> f32 {
+    t.step_ms(step).unwrap_or(0.0)
+}
+
+/// The load-time parameters of the relight stage with `light`.
+fn light_params(light: RelightLight) -> BTreeMap<StageId, Params> {
+    BTreeMap::from([(
+        StageId::RELIGHT,
+        Params::from([(RELIGHT_LIGHT.to_string(), Value::from(light.as_str()))]),
+    )])
+}
+
 fn relight_request(effect: EffectKind, light: RelightLight) -> LoadRequest {
     LoadRequest {
         effect,
-        stages: Stage::Relight.into(),
+        stages: StageId::RELIGHT.into(),
         width: W,
         height: H,
         colour: ColourSpec::LIMITED_BT601,
         background: (effect == EffectKind::Replace).then(|| Arc::new(background())),
-        relight_light: light,
+        params: light_params(light),
     }
 }
 
 /// The frame parameters with the light at `pan_deg`.
 fn relight_params(pan_deg: f32) -> FrameParams {
     FrameParams {
-        relight_pan_deg: pan_deg,
+        live: BTreeMap::from([(
+            StageId::RELIGHT,
+            Params::from([(RELIGHT_DIRECTION.to_string(), Value::Float(pan_deg.into()))]),
+        )]),
         ..FrameParams::default()
     }
 }
@@ -1892,7 +1924,10 @@ fn maxine_relight_under_none_blur_and_replace_keeps_the_background() {
             let req = relight_request(effect, RelightLight::Neutral);
             let (out, hard) = settled_frame(&label, &mut backend, gpu, stream, &req, src, dst);
             let t = backend.timings().unwrap();
-            assert!(t.relight_ms > 0.0 && t.mask_ms > 0.0, "{label}: {t:?}");
+            assert!(
+                ms(&t, "relight") > 0.0 && ms(&t, StageTimings::MASK) > 0.0,
+                "{label}: {t:?}"
+            );
             let w = W as usize;
             for (i, &m) in hard.iter().enumerate().step_by(997) {
                 assert_eq!(m, split_mask_value((i % w) as u32, W), "{label}: the split");
@@ -1968,11 +2003,7 @@ fn maxine_relight_faults_degrade_to_the_chain_without_it() {
             r
         };
         let expect_relight = |label: &str, e: BackendError| match e {
-            BackendError::Stage {
-                stage: Stage::Relight,
-                message,
-                ..
-            } => {
+            BackendError::Stage { stage, message, .. } if stage == StageId::RELIGHT => {
                 println!("FAULT {label}: {message}");
                 message
             }
@@ -2008,7 +2039,7 @@ fn maxine_relight_faults_degrade_to_the_chain_without_it() {
                 .load(gpu, &relight_request(effect, RelightLight::Cool))
                 .unwrap();
             frame(&mut backend).unwrap();
-            assert!(backend.timings().unwrap().relight_ms > 0.0, "{label}");
+            assert!(ms(&backend.timings().unwrap(), "relight") > 0.0, "{label}");
             switch.set(Some(RelightFault::Run));
             let m = expect_relight(&label, frame(&mut backend).unwrap_err());
             assert!(m.contains("next frame runs without it"), "{m}");
@@ -2021,7 +2052,7 @@ fn maxine_relight_faults_degrade_to_the_chain_without_it() {
             );
             frame(&mut backend).unwrap_or_else(|e| panic!("{label}: the next frame failed: {e}"));
             let t = backend.timings().unwrap();
-            assert_eq!(t.relight_ms, 0.0, "{label}: {t:?}");
+            assert_eq!(ms(&t, "relight"), 0.0, "{label}: {t:?}");
             if effect == EffectKind::None {
                 let d = luma_diff(
                     &dst.download_packed().unwrap(),
@@ -2057,11 +2088,9 @@ fn maxine_relight_a_failed_new_light_drops_the_stage_alone() {
             r
         };
         let expect_relight = |label: &str, e: BackendError| match e {
-            BackendError::Stage {
-                stage: Stage::Relight,
-                message,
-                ..
-            } => println!("FAULT {label}: {message}"),
+            BackendError::Stage { stage, message, .. } if stage == StageId::RELIGHT => {
+                println!("FAULT {label}: {message}")
+            }
             other => panic!("{label}: expected a relight error, got {other:?}"),
         };
         for (from, to) in [
@@ -2094,9 +2123,13 @@ fn maxine_relight_a_failed_new_light_drops_the_stage_alone() {
             assert!(backend.mask_loaded(), "{label}: the mask stays");
             frame(&mut backend).unwrap_or_else(|e| panic!("{label}: the next frame failed: {e}"));
             let t = backend.timings().unwrap();
-            assert_eq!(t.relight_ms, 0.0, "{label}: {t:?}");
+            assert_eq!(ms(&t, "relight"), 0.0, "{label}: {t:?}");
             if from == EffectKind::None {
-                assert_eq!(t.mask_ms, 0.0, "{label}: the unneeded mask ran: {t:?}");
+                assert_eq!(
+                    ms(&t, StageTimings::MASK),
+                    0.0,
+                    "{label}: the unneeded mask ran: {t:?}"
+                );
                 let d = luma_diff(
                     &dst.download_packed().unwrap(),
                     &src.download_packed().unwrap(),
@@ -2137,7 +2170,7 @@ fn maxine_relight_reset_temporal_drops_the_stage_and_a_new_load_lights_again() {
                 relit_pair(&label, &mut backend, gpu, stream, src, dst),
             );
             let dropped = backend.reset_temporal(gpu).unwrap();
-            assert_eq!(dropped, StageList::from(Stage::Relight), "{label}");
+            assert_eq!(dropped, StageList::from(StageId::RELIGHT), "{label}");
             assert!(
                 !backend.relight_loaded() && backend.mask_loaded(),
                 "{label}"
@@ -2148,7 +2181,11 @@ fn maxine_relight_reset_temporal_drops_the_stage_and_a_new_load_lights_again() {
                 .unwrap_or_else(|e| panic!("{label}: the frame after the reset: {e}"));
             stream.synchronize().unwrap();
             let t = backend.timings().unwrap();
-            assert_eq!(t.relight_ms, 0.0, "{label}: relit after the reset: {t:?}");
+            assert_eq!(
+                ms(&t, "relight"),
+                0.0,
+                "{label}: relit after the reset: {t:?}"
+            );
             if effect == EffectKind::None {
                 let d = luma_diff(&dst.download_packed().unwrap(), &input, |_| true);
                 assert!(d.max <= 1, "{label}: not the input ({d})");
@@ -2249,7 +2286,7 @@ fn maxine_a_stage_change_loads_or_releases_that_stage_alone() {
             let mut backend = f.create_maxine().unwrap();
             let req = |denoise: bool, relight: bool, light: RelightLight| LoadRequest {
                 stages: StageList::new(
-                    [(Stage::Denoise, denoise), (Stage::Relight, relight)]
+                    [(StageId::DENOISE, denoise), (StageId::RELIGHT, relight)]
                         .into_iter()
                         .filter_map(|(s, on)| on.then_some(s)),
                 )
@@ -2270,10 +2307,7 @@ fn maxine_a_stage_change_loads_or_releases_that_stage_alone() {
                 println!("STAGE CHANGE {effect}, {label}: {report:?}, {loads:?}");
                 assert_eq!(
                     (backend.denoise_loaded(), backend.relight_loaded()),
-                    (
-                        r.stages.contains(Stage::Denoise),
-                        r.stages.contains(Stage::Relight)
-                    ),
+                    (r.stages.contains("denoise"), r.stages.contains("relight")),
                     "{effect}, {label}"
                 );
                 (report, loads, backend.mask_loaded())
@@ -2405,9 +2439,9 @@ fn maxine_relight_stage_times() {
             ("replace + relight", EffectKind::Replace, false),
         ] {
             let stages = if denoise {
-                StageList::new([Stage::Denoise, Stage::Relight]).unwrap()
+                StageList::new([StageId::DENOISE, StageId::RELIGHT]).unwrap()
             } else {
-                Stage::Relight.into()
+                StageId::RELIGHT.into()
             };
             let req = LoadRequest {
                 stages,
@@ -2428,8 +2462,12 @@ fn maxine_relight_stage_times() {
                 src,
                 dst,
             );
-            assert!(all.iter().all(|t| t.relight_ms > 0.0), "{label}");
-            assert_eq!(all.iter().all(|t| t.denoise_ms > 0.0), denoise, "{label}");
+            assert!(all.iter().all(|t| ms(t, "relight") > 0.0), "{label}");
+            assert_eq!(
+                all.iter().all(|t| ms(t, "denoise") > 0.0),
+                denoise,
+                "{label}"
+            );
         }
         backend.unload();
     });

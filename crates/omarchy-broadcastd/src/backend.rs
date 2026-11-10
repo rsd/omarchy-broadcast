@@ -9,13 +9,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use obc_core::config::EffectConfig;
-use obc_core::{AspectPolicy, ModeRequest, OutputContract, SinkSelector};
+use obc_core::{
+    AspectPolicy, EffectMode, EffectOnFailure, ModeRequest, OutputContract, SinkSelector,
+};
 use obc_ipc::Stats;
+pub use obc_module_host::{Module, ModuleEntry, SettingsDescription};
 use obc_pipeline::control_node::{CaptureFormat, NodeControl};
 use obc_pipeline::controls::CtrlInfo;
 use obc_pipeline::ctrl_events::CtrlEvent;
-use obc_pipeline::effect::{Availability, Feature};
+use obc_pipeline::effect::{Availability, Params, StageId};
 use obc_pipeline::xu::XuRow;
 
 use crate::camera::Camera;
@@ -113,7 +115,121 @@ pub struct SessionParams {
     /// The effect the output starts with (the effective settings: the
     /// state file's over the config's). The output can always change it
     /// later ([`MediaBackend::set_effect`]).
-    pub effect: EffectConfig,
+    pub effect: EffectRun,
+    /// The modules whose code the session runs, chosen when it starts and
+    /// kept until it stops: a backend never changes mid-session.
+    pub backends: Backends,
+}
+
+/// One stage of a chain the session runs, with its parameters: those read
+/// when the chain loads (`params`) and those of each frame (`live`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StageRun {
+    pub id: StageId,
+    /// Requested; a stage that is not runs no code.
+    pub enabled: bool,
+    pub params: Params,
+    pub live: Params,
+}
+
+/// Where a chain of module stages runs, apart from the effect element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// Before the effect element (stages before the cut-out).
+    BeforeEffect,
+    /// After it.
+    AfterEffect,
+}
+
+/// The stages of one module that run in a chain of their own (a module
+/// stage element), outside the effect element.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChainRun {
+    /// The element's name, unique in the session.
+    pub name: String,
+    /// The module.
+    pub module: String,
+    pub placement: Placement,
+    pub stages: Vec<StageRun>,
+}
+
+/// What a session runs: the core background effect (its mode, strength,
+/// image and fallback), the stages of the effect element (those of the
+/// module that provides the `background` stage, in stage order), the
+/// chains of the other modules, and whether the ingest enhances.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectRun {
+    /// The background effect: `none`, `blur` or `replace`.
+    pub mode: EffectMode,
+    /// The blur strength, 0 to 1.
+    pub blur_strength: f64,
+    /// The image of `replace`.
+    pub background_image: Option<PathBuf>,
+    /// What shows when the background effect cannot run.
+    pub on_failure: EffectOnFailure,
+    /// The other stages of the effect element, in order.
+    pub stages: Vec<StageRun>,
+    /// The chains of the other modules, in order.
+    pub chains: Vec<ChainRun>,
+    /// The ingest is built with the enhance stage (per camera).
+    pub enhance: bool,
+}
+
+impl EffectRun {
+    /// The stage `id` of the effect element or of a chain.
+    pub fn stage(&self, id: &str) -> Option<&StageRun> {
+        self.stages
+            .iter()
+            .chain(self.chains.iter().flat_map(|c| c.stages.iter()))
+            .find(|s| s.id == id)
+    }
+
+    /// Nothing for the effect element to do: no background effect and no
+    /// stage requested.
+    pub fn effect_idle(&self) -> bool {
+        self.mode == EffectMode::None && self.stages.iter().all(|s| !s.enabled)
+    }
+}
+
+/// A module chosen for a session: its id, with the loaded module (`None`
+/// only for modules a test describes without a library).
+#[derive(Clone)]
+pub struct ModuleChoice {
+    pub id: String,
+    pub module: Option<Module>,
+}
+
+impl std::fmt::Debug for ModuleChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.id)
+    }
+}
+
+impl PartialEq for ModuleChoice {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+/// The module code a session runs: the effect element's backend (the
+/// provider of `background`), the ingest's enhancer (the provider of
+/// `enhance`) and each chain's module, by chain name. Absent ones run
+/// nothing: no effect element, no enhance stage, no chain.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Backends {
+    pub effect: Option<ModuleChoice>,
+    pub enhance: Option<ModuleChoice>,
+    pub chains: Vec<(String, ModuleChoice)>,
+}
+
+/// A module opened by [`MediaBackend::open_module`]: the module, what its
+/// probe says of each stage, and its settings.
+#[derive(Debug, Clone)]
+pub struct OpenedModule {
+    /// The module (`None` for a module a test describes without a library).
+    pub module: Option<Module>,
+    pub stages: Vec<(StageId, Availability)>,
+    pub settings: SettingsDescription,
 }
 
 /// The state of the running session's effect.
@@ -134,14 +250,11 @@ pub enum EffectStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectReport {
     pub status: EffectStatus,
-    /// The noise removal stage, apart from the effect: `Off` unless
-    /// requested. Its failure never changes what the effect shows: the
-    /// output streams on without the stage.
-    pub denoise: EffectStatus,
-    /// The relighting stage, apart from the effect, as `denoise` is: `Off`
-    /// unless requested, and its failure never changes what the effect
-    /// shows (the output streams on without the stage).
-    pub relight: EffectStatus,
+    /// Each stage of the effect element and of the chains, apart from the
+    /// effect, in [`EffectRun`] order: `Off` unless requested. A stage's
+    /// failure never changes what the effect shows: the output streams on
+    /// without the stage.
+    pub stages: Vec<(StageId, EffectStatus)>,
     /// The enhance stage of the current ingest: `Off` unless the ingest was
     /// built with it. Its failure never changes what the effect shows: the
     /// stage passes the camera frames through.
@@ -338,36 +451,46 @@ pub trait MediaBackend: Send + 'static {
     /// started).
     fn take_stats(&mut self) -> Stats;
 
-    /// Whether `effect` could run now, with the reason if not: the
-    /// inference backend is present (no model is loaded and no CUDA
-    /// context created to find out) and, for `replace`, the background
-    /// image is a readable regular file within the size limit. `none` is
-    /// always available. Called before [`Self::start_session`], while the
-    /// GPU may be parked: it must make no CUDA call.
-    fn effect_available(&mut self, effect: &EffectConfig) -> Result<(), String>;
+    /// Whether `effect` could run now on the effect backend of `backends`,
+    /// with the reason if not: the backend is present and its probe answers
+    /// (no model is loaded and no CUDA context created to find out) and,
+    /// for `replace`, the background image is a readable regular file
+    /// within the size limit. `none` is always available. Called before
+    /// [`Self::start_session`], while the GPU may be parked: it must make no
+    /// CUDA call.
+    fn effect_available(&mut self, effect: &EffectRun, backends: &Backends) -> Result<(), String>;
 
     /// Applies `effect` to the running session at once, without restarting
     /// it (a load continues in the background, reported by
     /// [`Self::effect_report`]); after a failure it retries even when
     /// nothing changed. Without a session it does nothing.
-    fn set_effect(&mut self, effect: &EffectConfig) -> Result<(), String>;
+    fn set_effect(&mut self, effect: &EffectRun) -> Result<(), String>;
 
     /// The running session's effect (`None`: no session).
     fn effect_report(&mut self) -> Option<EffectReport>;
 
-    /// Which features of the inference backend are installed, from the
-    /// filesystem alone, with the root they were looked for in; `None` when
-    /// no root can be resolved, so that nothing is known. The root is the
-    /// one the process loaded the SDK from once it has (a second SDK cannot
-    /// be loaded beside it), else the one configured.
-    /// `compute_capability` (the GPU's `(major, minor)`, when known) picks
-    /// the models of that GPU; with `None` a model for any GPU counts. Makes
-    /// no CUDA call and loads no library: safe at idle, while the GPU is
-    /// parked or runtime-suspended (`docs/adr/0017-cuda-checkpoint-parking.md`).
-    fn feature_availability(
+    /// The module manifests of `dirs`, in order, a later one overriding an
+    /// earlier one by module id ([`obc_module_host::scan`]). Reads files
+    /// only: safe at idle.
+    fn discover_modules(&mut self, dirs: &[PathBuf]) -> Vec<ModuleEntry>;
+
+    /// Opens the library of module `entry` with its configuration `config`
+    /// (JSON), and probes it: its stages' availability (the filesystem
+    /// only, ADR 0006: no CUDA call) and its settings. `Err` is the reason
+    /// the module is unavailable.
+    fn open_module(
         &mut self,
-        compute_capability: Option<(u32, u32)>,
-    ) -> Option<(PathBuf, Vec<(Feature, Availability)>)>;
+        entry: &ModuleEntry,
+        config: &serde_json::Value,
+    ) -> Result<OpenedModule, String>;
+
+    /// Probes the opened module `id` again (filesystem only, as
+    /// [`Self::open_module`]).
+    fn probe_module(
+        &mut self,
+        id: &str,
+        module: Option<&Module>,
+    ) -> Result<Vec<(StageId, Availability)>, String>;
 
     /// The compute capability `(major, minor)` of the GPU the running
     /// session uses, if the session's GPU side reports it (`None` without a

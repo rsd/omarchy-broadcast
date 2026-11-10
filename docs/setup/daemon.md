@@ -25,6 +25,7 @@ The package installs:
 - `/usr/bin/omarchy-broadcastd` and `/usr/bin/omarchy-broadcast`;
 - the unit `/usr/lib/systemd/user/omarchy-broadcastd.service`;
 - the D-Bus activation file `/usr/share/dbus-1/services/br.com.dias.OmarchyBroadcast.service`;
+- the Maxine module, `/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so`, with its manifest in `/usr/lib/omarchy-broadcast/modules.d/` ([maxine.md](maxine.md#the-maxine-module), [../modules.md](../modules.md)), and the C header of the module interface, `/usr/include/omarchy-broadcast/omarchy_broadcast_module.h`;
 - the licences and this documentation, in `/usr/share/doc/omarchy-broadcast/`;
 - the optional drop-ins as inactive examples in `/usr/share/doc/omarchy-broadcast/examples/systemd/` (`wireplumber.service.d/omarchy-broadcast.conf`, see "Discovery by PipeWire", and `omarchy-broadcastd.service.d/maxine.conf`, see [maxine.md](maxine.md#3-enable-the-drop-in)).
 
@@ -49,7 +50,7 @@ The script builds the release binaries and installs, without root:
 - `omarchy-broadcastd` and `omarchy-broadcast` in `${XDG_BIN_HOME:-~/.local/bin}`;
 - the unit in `${XDG_DATA_HOME:-~/.local/share}/systemd/user/`, with `ExecStart=` pointing at the installed daemon;
 - the D-Bus activation file in `${XDG_DATA_HOME:-~/.local/share}/dbus-1/services/`;
-- nothing for the Maxine backend: the SDK, the os-release shim and the drop-in are described in [maxine.md](maxine.md). An older version of the script installed a shim in `~/.local/lib/omarchy-broadcast/`; `--uninstall` and a reinstall remove it;
+- nothing for the Maxine effects, not even the Maxine module: the module, the SDK, the os-release shim and the drop-in are described in [maxine.md](maxine.md). An older version of the script installed a shim in `~/.local/lib/omarchy-broadcast/`; `--uninstall` and a reinstall remove it;
 - a manifest, `install-user.manifest`, in `${XDG_STATE_HOME:-~/.local/state}/omarchy-broadcast/`, which lists every path written and the sha256 of each binary.
 
 Behaviour:
@@ -255,11 +256,13 @@ omarchy-broadcast status                       # shows Error: if the file was re
 
 `busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast br.com.dias.OmarchyBroadcast1 ReloadConfig` does the same and returns the reason on failure. An invalid file is rejected as a whole: the previous configuration stays in force and the `Error` property names the file, line and key.
 
-Settings changed while the daemon runs (`omarchy-broadcast on` / `off`, the camera selection, the video effect with its blur strength and background image, and the stages noise removal, enhancement and relighting with its light, direction and brightness) are kept in a separate state file, `~/.local/state/omarchy-broadcast/state.toml` (`$XDG_STATE_HOME/omarchy-broadcast/state.toml`), so that `config.toml` keeps its comments and layout. The state file is written by the daemon. If the state file cannot be read, the daemon starts `off` and says why in `Error`: privacy fails closed.
+Settings changed while the daemon runs (`omarchy-broadcast on` / `off`, the camera selection, the video effect with its blur strength and background image, and the stages noise removal, enhancement and relighting with its light, direction and brightness, the settings of any module, and the choices of modules: which are enabled, the stage order, the backend profile and the pins) are kept in a separate state file, `~/.local/state/omarchy-broadcast/state.toml` (`$XDG_STATE_HOME/omarchy-broadcast/state.toml`), so that `config.toml` keeps its comments and layout. The state file is written by the daemon. If the state file cannot be read, the daemon starts `off` and says why in `Error`: privacy fails closed.
 
 What the daemon has learnt about the GPU (its CUDA compute capability, which picks the models made for it, so that it can tell which SDK features are installed without waking the GPU) is kept in `~/.cache/omarchy-broadcast/compute-capability` (`$XDG_CACHE_HOME/omarchy-broadcast/compute-capability`). It is a cache, not a setting: delete it and the daemon learns it again at its next session.
 
-The Maxine SDK root can be set in the configuration (`[effect] maxine_root`) or with `MAXINE_VFX_ROOT`; the daemon loads the SDK's libraries from it itself, and `LD_LIBRARY_PATH` is not needed ([maxine.md](maxine.md#4-the-sdk-root-and-the-environment)). The SDK is first loaded by the first effect or noise removal the daemon starts, and a different root then takes a daemon restart; a reload that changes the key says so in the log.
+The crash ledger of the modules ([../modules.md](../modules.md#the-crash-ledger)) is a small file, `modules-crash.json`, next to the state file. It records which module's code was running when the daemon last went down, and disables a module that did so twice in a row until `omarchy-broadcast modules enable ID`. Deleting it forgives every module.
+
+The Maxine SDK root can be set in the configuration (`sdk_root` in `[module."br.com.dias.maxine-vfx"]`, or its alias `[effect] maxine_root`) or with `MAXINE_VFX_ROOT`; the Maxine module loads the SDK's libraries from it itself, and `LD_LIBRARY_PATH` is not needed ([maxine.md](maxine.md#4-the-sdk-root-and-the-environment)). The SDK is first loaded by the first effect or noise removal the daemon starts, and a different root then takes a daemon restart; a reload that changes the key says so in the log.
 
 The paths can be overridden with `--config PATH` and `--state PATH` in a copy of the unit file.
 

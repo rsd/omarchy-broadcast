@@ -1,0 +1,19 @@
+# The manifest of the example module. Install it with the library: copy
+# this file and libobc_module_hello.so into a modules.d directory, and set
+# `library` to the library's path (absolute, or relative to this file).
+abi = 1
+id = "org.example.hello"
+name = "Hello tint"
+version = "0.1.0"
+licence = "MIT OR Apache-2.0"
+kind = "video-stage"
+library = "target/release/libobc_module_hello.so"
+description = "Example module: tints the picture warm, on the CPU"
+
+[[stage]]
+id = "hello"
+slot = "post-composite"
+rank = 100
+device = "cpu"
+frames = ["host"]
+formats = ["nv12"]

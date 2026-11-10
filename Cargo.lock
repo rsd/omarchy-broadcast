@@ -138,6 +138,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "cbindgen"
+version = "0.29.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ecb53484c9c167ba674026b656d8a27d7657a58e6066aa902bfb1a4aa00ae20"
+dependencies = [
+ "heck",
+ "indexmap",
+ "log",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "syn 2.0.119",
+ "tempfile",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
 name = "cc"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -470,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "gst-obc"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "gstreamer",
  "gstreamer-app",
@@ -741,6 +759,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "log"
+version = "0.4.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -850,14 +874,14 @@ dependencies = [
 
 [[package]]
 name = "obc-backend"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "obc-backend-maxine"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "libc",
  "libloading",
@@ -868,17 +892,17 @@ dependencies = [
 
 [[package]]
 name = "obc-core"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "serde",
  "tempfile",
  "thiserror 2.0.21",
- "toml",
+ "toml 1.2.1+spec-1.1.0",
 ]
 
 [[package]]
 name = "obc-gpu"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "libloading",
  "obc-backend",
@@ -887,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "obc-ipc"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "futures-util",
  "serde",
@@ -897,8 +921,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "obc-module-abi"
+version = "1.0.0"
+dependencies = [
+ "cbindgen",
+]
+
+[[package]]
+name = "obc-module-host"
+version = "0.24.0"
+dependencies = [
+ "libloading",
+ "obc-backend",
+ "obc-module-abi",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 1.2.1+spec-1.1.0",
+]
+
+[[package]]
+name = "obc-module-maxine"
+version = "0.24.0"
+dependencies = [
+ "obc-backend",
+ "obc-backend-maxine",
+ "obc-gpu",
+ "obc-module-host",
+ "obc-module-sdk",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "obc-module-sdk"
+version = "1.0.0"
+dependencies = [
+ "obc-module-abi",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "obc-pipeline"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -912,6 +979,7 @@ dependencies = [
  "obc-backend-maxine",
  "obc-core",
  "obc-gpu",
+ "obc-module-host",
  "pipewire",
  "serde",
  "serde_json",
@@ -921,7 +989,7 @@ dependencies = [
 
 [[package]]
 name = "omarchy-broadcast"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -936,7 +1004,7 @@ dependencies = [
 
 [[package]]
 name = "omarchy-broadcastd"
-version = "0.23.1"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -945,15 +1013,18 @@ dependencies = [
  "gstreamer-app",
  "gstreamer-video",
  "libc",
+ "obc-backend-maxine",
  "obc-core",
  "obc-gpu",
  "obc-ipc",
+ "obc-module-host",
  "obc-pipeline",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "toml",
+ "toml 1.2.1+spec-1.1.0",
  "zbus",
 ]
 
@@ -1259,7 +1330,7 @@ dependencies = [
  "cfg-expr",
  "heck",
  "pkg-config",
- "toml",
+ "toml 1.2.1+spec-1.1.0",
  "version-compare",
 ]
 
@@ -1272,7 +1343,7 @@ dependencies = [
  "cfg-expr",
  "heck",
  "pkg-config",
- "toml",
+ "toml 1.2.1+spec-1.1.0",
  "version-compare",
 ]
 
@@ -1364,6 +1435,21 @@ dependencies = [
 
 [[package]]
 name = "toml"
+version = "0.9.12+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime 0.7.5+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml"
 version = "1.2.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5755c51863cdac711f1956baf8eb9588e060755f7d3c4c979e70ea1e1f32cd7"
@@ -1371,10 +1457,19 @@ dependencies = [
  "indexmap",
  "serde_core",
  "serde_spanned",
- "toml_datetime",
+ "toml_datetime 1.1.3+spec-1.1.0",
  "toml_parser",
  "toml_writer",
- "winnow",
+ "winnow 1.0.5",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "0.7.5+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
+dependencies = [
+ "serde_core",
 ]
 
 [[package]]
@@ -1392,7 +1487,7 @@ version = "1.1.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
 dependencies = [
- "winnow",
+ "winnow 1.0.5",
 ]
 
 [[package]]
@@ -1515,6 +1610,12 @@ dependencies = [
 
 [[package]]
 name = "winnow"
+version = "0.7.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
+
+[[package]]
+name = "winnow"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
@@ -1555,7 +1656,7 @@ dependencies = [
  "uds_windows",
  "uuid",
  "windows-sys",
- "winnow",
+ "winnow 1.0.5",
  "zbus_macros",
  "zbus_utils",
  "zcheapstr",
@@ -1584,7 +1685,7 @@ dependencies = [
  "quote",
  "serde",
  "syn 3.0.9",
- "winnow",
+ "winnow 1.0.5",
 ]
 
 [[package]]

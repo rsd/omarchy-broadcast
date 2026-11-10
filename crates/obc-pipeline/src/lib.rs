@@ -13,7 +13,9 @@
 //!   at the head of the output pipeline: nothing by default, or the
 //!   `obceffect` element when [`OutputConfig::effect`] is set, whose effect
 //!   (`none`, `blur`, `replace`) changes while the output streams
-//!   ([`Output::set_effect`]; `docs/adr/0012-video-effects-and-maxine-backend.md`).
+//!   ([`Output::set_effect`]; `docs/adr/0012-video-effects-and-maxine-backend.md`),
+//!   and around it the stages of loadable modules ([`module`]), one
+//!   `obcmodule` element per [`OutputConfig::module_stages`] entry.
 //! * **Output** ([`output`]), one long-lived pipeline per sink with a fixed
 //!   contract ([`obc_core::OutputContract`]): a clock thread ([`clock`])
 //!   emits one frame per period (fresh, repeated, or a black placeholder),
@@ -57,6 +59,7 @@ pub mod instrument;
 pub mod live;
 pub mod loopback;
 pub mod loopback_cover;
+pub mod module;
 pub mod output;
 pub mod pipeline;
 #[cfg(feature = "pipewire")]
@@ -81,7 +84,7 @@ pub use device::{
 pub use discovery::{DiscoveryRoute, list_cameras, scan_sysfs};
 pub use effect::{
     EffectBackend, EffectFallback, EffectKind, EffectSettings, EffectStats, EffectStatus,
-    effect_backend_available,
+    effect_backend_available_with,
 };
 pub use frame::{Canonical, Frame, FrameWriter};
 pub use geometry::{Crop, crop_for};
@@ -92,6 +95,7 @@ pub use loopback::{
     writer_caps_string,
 };
 pub use loopback_cover::{ConsumerCover, CoverReport};
+pub use module::{ModulePlacement, ModuleStageSpec, ModuleStats};
 pub use output::{
     EmitInfo, EmitObserver, FrameOrigin, Output, OutputConfig, OutputCounts, OutputSink,
 };

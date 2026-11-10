@@ -1,0 +1,33 @@
+[package]
+name = "obc-module-fixture"
+description = "A test module for obc-module-host: its behaviour is chosen by its configuration"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.92"
+publish = false
+
+# Its own workspace: it is built on its own, as a module outside the
+# repository would be.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+# Exports a library of module ABI 2.0 whose entry point aborts the process.
+abi-major-2 = []
+# Exports a library of module ABI 1.99 (newer than the host) whose entry
+# point aborts the process.
+abi-minor-newer = []
+# Exports module ABI 1.0 with an entry point that refuses the host.
+refuse-host = []
+
+[dependencies]
+obc-module-sdk = { path = "../../../../obc-module-sdk" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

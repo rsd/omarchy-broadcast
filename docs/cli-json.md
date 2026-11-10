@@ -21,6 +21,13 @@
 | `omarchy-broadcast settings [--json] [--camera ID]` | Prints every setting of the active camera (or of `--camera`), by group: image, white balance, exposure, focus and zoom, other; those the camera has, each with its value, what it takes, `(stored)` and, for one that cannot be changed now, why; then, from interface revision 8, the video effects, which are the same for every camera, under `All cameras:`. Never starts the daemon. See [Camera settings](#camera-settings). | The full set of `settings_group` lines (the camera's groups, then the global ones), or one `settings_clear` line. |
 | `omarchy-broadcast settings set [--camera ID] ID VALUE` | Sets one setting (`SetSetting`), then prints it as read back. An effect setting (`effect.…`) needs no camera and ignores `--camera`. | No. |
 | `omarchy-broadcast settings reset [--camera ID] [--group GROUP \| --setting ID]` | Forgets the stored values of the camera, of a group or of one setting and puts them back to the camera's defaults (`ResetSettings`), then prints them. | No. |
+| `omarchy-broadcast modules [list] [--json]` | Lists the effect modules the daemon found, with their status and stages and the backend profile (`GetModules`). Never starts the daemon. See [Modules and order](#modules-and-order). | A `modules` line, then one `module` line each. |
+| `omarchy-broadcast modules info ID [--json]` | Shows one module in full. Never starts the daemon. | One `module` object. |
+| `omarchy-broadcast modules enable ID`, `disable ID` | Enables or disables a module (`SetModuleEnabled`), from the next camera start, then prints it. | No. |
+| `omarchy-broadcast modules profile [quality\|battery]` | Prints the backend profile, or sets it (`SetBackendProfile`). | No. |
+| `omarchy-broadcast modules pin STAGE MODULE`, `pin STAGE --clear` | Pins the module that provides a stage, or clears the pin (`SetStagePin`), then prints who provides it. | No. |
+| `omarchy-broadcast order [show] [--json]` | Prints the order the effect stages run in (`GetStageOrder`). Never starts the daemon. | One `order` object. |
+| `omarchy-broadcast order set ID,ID,...`, `order reset` | Sets the stage order or goes back to the default (`SetStageOrder`), then prints it. | No. |
 | `omarchy-broadcast preview [--json] [--fps 15\|30]` | Holds a live preview lease on the daemon and prints a line for each frame it writes, until interrupted. See [Preview](#preview). | One object per line (NDJSON). |
 | `omarchy-broadcast watch` | Follows the daemon: a summary when it connects, then a line for each change and each `Stats` signal (about once per second while `active`), until interrupted. | One object per line (NDJSON). |
 
@@ -145,6 +152,7 @@ Lighting
 - **`reset`** puts back to the camera's defaults, and forgets the stored values of, every setting (no option), the settings of one group (`--group=exposure`) or one setting (`--setting=camera.image.sharpness`); the two options exclude each other. At once while the camera is open, else when it next opens. It prints the settings it reset, read back. A global group (`--group=background`, `video` or `lighting`) or an `effect.…` setting is put back to the configuration's `[effect]` value, at once, and needs no camera; `settings reset` without an option resets the camera and never the effects.
 - `--json` is accepted without a subcommand only; with `set` or `reset` it is a usage error (status `2`), as for `controls`.
 - Reading never starts the daemon and gives up after 5 s, like `status`. `set` and `reset` may start it through D-Bus activation and give up after 30 s.
+- From interface revision 9 the effect settings are those of the modules installed ([Modules and order](#modules-and-order)). With no module installed, `settings` prints `All cameras: No effect modules installed` in place of the `All cameras:` part, and a `settings set` of an `effect.…` setting that is not in the tree is refused.
 - Against a daemon of interface revision 7 the camera settings are printed as before and there are no effects to show or change (`settings set effect.…` is refused as an unknown setting).
 - Against a daemon of interface revision 6 or lower the command prints `omarchy-broadcast: the daemon does not support camera settings (its interface revision is N, camera settings need 7); update omarchy-broadcastd` and exits with status `1`; `settings --json` prints an `error` line with the code `unsupported-daemon` instead.
 - If `set` or `reset` was accepted but reading the settings back failed, the command says so on stderr (`the change was made, but reading the settings back failed: ...`) and exits with the status of that failure.
@@ -152,6 +160,92 @@ Lighting
 - Strings that come from the daemon are escaped in the human-readable output, as for `effect`.
 
 `controls` keeps working, with the five image controls only, and shares the storage of `settings`: a value set by one shows in the other. `controls reset` resets those five only; `settings reset` resets everything.
+
+## Modules and order
+
+The effects come from loadable modules ([ADR-0025](adr/0025-loadable-modules.md), [modules.md](modules.md)). `omarchy-broadcast modules` lists them and manages which are enabled, the backend profile and the pins; `omarchy-broadcast order` shows and sets the order in which their stages run. They wrap the revision-9 members of [dbus-api.md](dbus-api.md#modules) and need a daemon of interface revision 9.
+
+```text
+omarchy-broadcast modules [list] [--json]
+omarchy-broadcast modules info ID [--json]
+omarchy-broadcast modules enable ID
+omarchy-broadcast modules disable ID
+omarchy-broadcast modules profile [quality|battery]
+omarchy-broadcast modules pin STAGE MODULE
+omarchy-broadcast modules pin STAGE --clear
+omarchy-broadcast order [show] [--json]
+omarchy-broadcast order set ID,ID,...
+omarchy-broadcast order reset
+```
+
+- **`modules`** (or `modules list`) prints the backend profile, then each module on a line (id, name, version, status with its reason, `(disabled)` when it is disabled) followed by its stages, one per line with slot, device and rank, and `selected` for the stages this module provides at the next camera start, or `unavailable: <reason>` for a stage that cannot run. With no module it prints `No effect modules installed`.
+
+  ```text
+  Profile: quality
+  br.com.dias.maxine-vfx  NVIDIA Maxine video effects 0.24.0  available
+      enhance (pre-matte, nvidia-gpu, rank 300) selected
+      denoise (pre-matte, nvidia-gpu, rank 300) selected
+      background (matte, nvidia-gpu, rank 300) selected
+      relight (post-matte, nvidia-gpu, rank 300) unavailable: Not installed
+  org.example.hello  Hello tint 0.1.0  disabled: Disabled (disabled)
+      hello (post-composite, cpu, rank 100) unavailable: Disabled
+  ```
+
+- **`modules info ID`** prints one module in full: id, name, version, licence, kind, description, library, manifest, `Enabled:` (`yes` or `no`), `Status:` and its stages. A module that is not installed is exit status 1 (`No module <id> is installed`).
+- **`modules enable ID`** and **`modules disable ID`** call `SetModuleEnabled` and print the module as `info` does, read back. They apply when the camera next starts; the module's settings appear (or go) at once. Enabling a module that the daemon disabled after it crashed the daemon twice in a row forgives it.
+- **`modules profile`** without an argument prints the profile (`Profile: quality`); with `quality` or `battery` it sets it (`SetBackendProfile`) and prints it.
+- **`modules pin STAGE MODULE`** pins the module that provides a stage (`SetStagePin`), and **`--clear`** removes the pin (the argument `MODULE` is then not given). It prints which module provides the stage at the next start, read back: `<stage>: provided by <name> (<id>)`, or `<stage>: no module can provide it now`. A pin that cannot be honoured is not an error: the profile's choice is shown.
+- **`order`** (or `order show`) prints the order the stages run in, numbered, one per line, and `No effect modules installed` when there is none. **`order set ID,ID,...`** (`SetStageOrder`) takes every stage the enabled modules offer, once each, comma-separated, and prints the order read back; the daemon refuses an order that does not fit, with the reason, as exit status 1. **`order reset`** goes back to the default order (by slot, then each stage's position).
+- Reading (`modules`, `modules list`, `modules info`, `modules profile` without an argument, `order`, `order show`) never starts the daemon and gives up after 5 s; the changes may start it through D-Bus activation and give up after 30 s, like the other setters. `--json` is accepted by `modules list`, `modules info` and `order show` only; with another subcommand it is a usage error (status `2`).
+- Against a daemon of interface revision 8 or lower the commands print `omarchy-broadcast: the daemon does not support modules (its interface revision is N, modules need 9); update omarchy-broadcastd` and exit with status `1`; with `--json` they print an `error` line with the code `unsupported-daemon`.
+
+### `modules`, `module` and `order` lines
+
+`modules list --json` prints a `modules` header and then one `module` line per module; `modules info ID --json` prints one `module` line (`index` 0, `count` 1); `order show --json` prints one `order` line. `watch --json` prints none of them.
+
+`modules` line, `{"v":1,"type":"modules","serial":2,"profile":"quality","count":2}`:
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `v`, `type` | | `1`, `"modules"`. |
+| `serial` | number | The daemon's `ModulesSerial` when the list was read. |
+| `profile` | string | The backend profile, `"quality"` or `"battery"` (`""` from a daemon that does not report it). |
+| `count` | number | The number of `module` lines that follow (0 with no module installed). |
+
+`module` line:
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `v`, `type` | | `1`, `"module"`. |
+| `serial` | number | As in `modules`. |
+| `index`, `count` | number | The position of this line in the list, from 0, and the number of modules. |
+| `module` | object | The module, below. |
+
+The `module` object:
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `id` | string | The module id. |
+| `name`, `version`, `licence`, `description` | string | From the manifest; `""` when it could not be read or gives none. |
+| `kind` | string | `"video-stage"`, `"audio-filter"` or `"analyser"`. |
+| `library`, `manifest` | string | The paths of the library and the manifest. Bounded to 256 bytes and clipped at the **start**, like `background_image` (see the general rules). |
+| `enabled` | boolean | `false` when the module is disabled by the user, the configuration or the crash ledger. |
+| `status` | string | `"available"`, `"unavailable"` or `"disabled"`. |
+| `reason` | string | Why the module is not available; `""` when it is. |
+| `stages` | array | Stage objects, in manifest order (below). |
+| `stages_truncated` | boolean | `true` when stages were left out: more than 32, or the line would pass the cap (stages are given up from the end). |
+
+A stage object has `id`, `slot` (`"pre-matte"`, `"matte"`, `"post-matte"` or `"post-composite"`), `rank` (number), `device` (`"nvidia-gpu"`, `"gpu"`, `"npu"` or `"cpu"`), `available` (boolean), `reason` (string, `""` when available) and `selected` (boolean: this module provides the stage at the next camera start).
+
+`order` line, `{"v":1,"type":"order","order":["enhance","denoise","background","relight"],"order_truncated":false}`:
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `v`, `type` | | `1`, `"order"`. |
+| `order` | array of strings | The stage ids in the order they run; empty with no module. At most 32 are listed. |
+| `order_truncated` | boolean | `true` if the daemon reported more than 32. |
+
+The strings are bounded in bytes of their JSON encoding, as in the general rules: a module `id` 64, `name` 64, `version` 96, `licence` 96, `kind` 32, `description` 160, `library` and `manifest` 256, `reason` (of a module and of a stage) 96, `status`, `profile` and a stage's `id`, `slot` and `device` 32, an `order` entry 32.
 
 ## Preview
 
@@ -174,8 +268,8 @@ omarchy-broadcast preview [--json] [--fps 15|30]
 
 ## Starting the daemon
 
-- `status`, `cameras`, `watch`, `preview`, `effect` without an effect, and `controls` and `settings` without a subcommand never start the daemon. They read the properties with `org.freedesktop.DBus.Properties.GetAll` carrying the `NO_AUTO_START` flag, so looking at the daemon never launches it (`controls` also calls `GetCameraControls`, and `settings` calls `GetSettings`, with that flag). This is the read that the `obc-ipc` crate provides to Rust clients (`Snapshot::fetch_no_autostart`); [dbus-api.md](dbus-api.md#service-presence-and-activation) gives the `busctl` and `gdbus` equivalents.
-- `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set` and `settings reset` call methods without that flag: when the D-Bus activation file `br.com.dias.OmarchyBroadcast.service` is installed, the call starts the daemon, as `systemctl --user start omarchy-broadcastd` would. `off` on a stopped daemon therefore starts it and records the privacy state, which persists across restarts. Without an activation file, or if the start fails, the command reports that the daemon is not running.
+- `status`, `cameras`, `watch`, `preview`, `effect` without an effect, and `controls` and `settings` without a subcommand, and `modules` (list, info, `profile` without an argument) and `order` (show), never start the daemon. They read the properties with `org.freedesktop.DBus.Properties.GetAll` carrying the `NO_AUTO_START` flag, so looking at the daemon never launches it (`controls` also calls `GetCameraControls`, and `settings` calls `GetSettings`, with that flag). This is the read that the `obc-ipc` crate provides to Rust clients (`Snapshot::fetch_no_autostart`); [dbus-api.md](dbus-api.md#service-presence-and-activation) gives the `busctl` and `gdbus` equivalents.
+- `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`, `settings reset`, `modules enable`, `modules disable`, `modules profile <profile>`, `modules pin`, `order set` and `order reset` call methods without that flag: when the D-Bus activation file `br.com.dias.OmarchyBroadcast.service` is installed, the call starts the daemon, as `systemctl --user start omarchy-broadcastd` would. `off` on a stopped daemon therefore starts it and records the privacy state, which persists across restarts. Without an activation file, or if the start fails, the command reports that the daemon is not running.
 
 When the daemon is not running, the human-readable commands print one line to stderr, for example:
 
@@ -188,19 +282,19 @@ omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.O
 | Status | Meaning |
 |---|---|
 | `0` | Success. Also the status of `watch` when it ends on `SIGTERM`, `SIGINT`, `SIGPIPE` or a closed stdout, and of `preview` when it ends on `SIGTERM`, `SIGINT`, `SIGHUP`, `SIGPIPE` or a closed stdout. |
-| `1` | The daemon rejected the request: one of the `br.com.dias.OmarchyBroadcast1.Error` errors (`NoSuchCamera`, `InvalidConfig`, `Unavailable`, `InvalidArgument`, `Failed`, and from revision 7 `UnknownSetting`, `Disabled`, `RateLimited`), or the daemon does not support the request (`effect` against interface revision 1, `denoise` against a revision below 4, `controls` against a revision below 6, `settings` against a revision below 7). Its message is printed to stderr. |
+| `1` | The daemon rejected the request: one of the `br.com.dias.OmarchyBroadcast1.Error` errors (`NoSuchCamera`, `InvalidConfig`, `Unavailable`, `InvalidArgument`, `Failed`, and from revision 7 `UnknownSetting`, `Disabled`, `RateLimited`), or the daemon does not support the request (`effect` against interface revision 1, `denoise` against a revision below 4, `controls` against a revision below 6, `settings` against a revision below 7, `modules` and `order` against a revision below 9). Its message is printed to stderr. |
 | `2` | Invalid command line. |
 | `3` | The daemon is not running (its name has no owner, or D-Bus could not start it), or there is no D-Bus session bus. |
 | `4` | Any other D-Bus failure (an unexpected reply, a lost connection), a timeout, or a failed write to stdout. |
 
-`status`, `cameras`, `controls` and `settings` give up after 5 s, and `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set` and `settings reset` after 30 s (time for the daemon to be started), with status `4`. `watch` gives each read of the properties 5 s as well (see [Daemon absent or gone](#daemon-absent-or-gone)). `omarchy-broadcast --help` lists the exit statuses.
+`status`, `cameras`, `controls`, `settings`, `modules` (reads) and `order` (show) give up after 5 s, and `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`, `settings reset` and the changing forms of `modules` and `order` after 30 s (time for the daemon to be started), with status `4`. `watch` gives each read of the properties 5 s as well (see [Daemon absent or gone](#daemon-absent-or-gone)). `omarchy-broadcast --help` lists the exit statuses.
 
 ## JSON output
 
 ### General rules
 
 - Every object is printed on one line, terminated by `\n`, in UTF-8. `watch --json` flushes stdout after every line.
-- Every object has the field **`v`**, the schema version (an integer, `1` in this version), and the field **`type`**, a string naming the line type: `snapshot`, `state`, `cameras`, `controls`, `settings_group`, `settings_delta`, `settings_clear`, `stats`, `preview`, `frame` or `error`.
+- Every object has the field **`v`**, the schema version (an integer, `1` in this version), and the field **`type`**, a string naming the line type: `snapshot`, `state`, `cameras`, `controls`, `settings_group`, `settings_delta`, `settings_clear`, `modules`, `module`, `order`, `stats`, `preview`, `frame` or `error`.
 - The order of the fields within an object is not significant.
 - A client must ignore fields it does not know, and lines whose `type` it does not know.
 - **Line length.** No line is longer than **4096 bytes**, newline excluded. To guarantee it, strings are bounded in bytes of their JSON encoding (escapes included). A longer string is cut at a character boundary and ends with the ellipsis character `…` (U+2026); the result is always valid JSON. The bounds:
@@ -443,7 +537,7 @@ The `path` of these two lines is never clipped, unlike the other strings (see [G
 | Field | JSON type | Meaning |
 |---|---|---|
 | `v`, `type` | | `1`, `"error"`. |
-| `code` | string | `"daemon-not-running"`: the daemon is not running, or there is no D-Bus session bus. `"dbus-error"`: any other failure to talk to the daemon (an unexpected reply, a lost connection, a timeout). `"unsupported-daemon"`: the daemon is too old for the request (`preview` needs interface revision 5, `controls` needs 6, `settings` needs 7); printed by `preview --json`, `controls --json` and `settings --json` only. `"preview-path-too-long"`: the daemon's frame path does not fit a line; printed by `preview --json` only. New codes may be added; treat an unknown code like `"dbus-error"`. |
+| `code` | string | `"daemon-not-running"`: the daemon is not running, or there is no D-Bus session bus. `"dbus-error"`: any other failure to talk to the daemon (an unexpected reply, a lost connection, a timeout). `"unsupported-daemon"`: the daemon is too old for the request (`preview` needs interface revision 5, `controls` needs 6, `settings` needs 7, `modules` and `order` need 9); printed by `preview --json`, `controls --json`, `settings --json`, `modules list --json`, `modules info --json` and `order show --json` only. `"preview-path-too-long"`: the daemon's frame path does not fit a line; printed by `preview --json` only. New codes may be added; treat an unknown code like `"dbus-error"`. |
 | `error` | string | A one-line explanation for people. Match on `code`, never on this text. |
 
 `status --json`, `cameras --json`, `controls --json` and `settings --json` print an `error` object instead of their usual one when they fail to read the daemon, and exit with the status of the failure (`3` or `4`).
@@ -495,6 +589,7 @@ A client treats `"active":false`, and any `error` line, as "no frames now", and 
 - **`v` stays 1 for the preview.** `preview_consumers` is a new field in the existing `snapshot` and `state` lines, and `changed` may name it; `consumers` keeps its type, and with no preview lease held it has the value it had before. Against a daemon of interface revision 4 or lower the key is still printed, with the value `0`, as for the PipeWire fields. `preview` and `frame` are new line types printed by a new command, and `unsupported-daemon` and `preview-path-too-long` are new `error` codes; a client written for the earlier version never sees them, as it never runs `preview`.
 - **`v` stays 1 for the camera controls.** `camera_controls` is a new field in the existing `snapshot` line and `controls` is a new line type, printed by a new command and by `watch --json`; the new `unsupported-daemon` use (`controls` needs revision 6) is an existing code. `state` lines do not carry the controls, so `changed` never names them. Against a daemon of interface revision 5 or lower the `snapshot` still prints the key, with the value `null`, as for `denoise`: "no controls" would claim a camera without them. `watch --json` prints no `controls` line then. A client written for the earlier version ignores both.
 - **`v` stays 1 for the camera settings.** `settings_revision` and `settings_schema` are new fields in the existing `snapshot` line (not in `state`, so `changed` never names them); `settings_group`, `settings_delta` and `settings_clear` are new line types, printed by a new command and by `watch --json`; `unsupported-daemon` for `settings` is an existing code. Against a daemon of interface revision 6 or lower the `snapshot` still prints both keys, with the value `null`, as for `camera_controls`, and `watch --json` prints no settings line. A client written for the earlier version ignores all of it. The meaning of the setting objects has a version of its own, `schema` (see [Settings schema version](#settings-schema-version)).
+- **`v` stays 1 for the modules.** `modules`, `module` and `order` are new line types, printed by new commands only (`watch --json` and the `snapshot` are unchanged); `unsupported-daemon` for them is an existing code. The `snapshot`'s `interface_revision` 9 tells a client that the commands exist. A client written for the earlier version never runs them. The settings tree it reads from `settings --json` is the one of the modules installed ([dbus-api.md](dbus-api.md#modules)): with no module it has no effect group, which the global-settings rule below already allows.
 - **`v` stays 1 for the global settings.** Setting objects gain the key `scope` (`"camera"` or `"global"`), and a set gains groups after the camera's, which are also printed with no camera (`camera` `""`), where a revision-7 daemon printed a `settings_clear`. A client written for the earlier version ignores the key and the groups it does not draw. The settings schema stays 1 ([Settings schema version](#settings-schema-version)); the CLI's `snapshot` is unchanged, and `interface_revision` 8 tells a client that the groups can appear.
 - A **breaking change** raises `v`: a removed or renamed field or line type, a changed JSON type or meaning, a new state string, or a change to the rules above (line cap, outage behaviour).
 - **Not breaking**, made without raising `v`: a new field in an existing line type, a new line type, a new `error` code. Clients ignore what they do not know.

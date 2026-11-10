@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use zbus::Variant;
 use zbus::proxy::MethodFlags;
 
+use crate::modules::{ModuleList, ModulesReply};
 use crate::settings::{
     ResetScope, SettingChange, SettingValue, SettingsReply, SettingsTree, VariantDict,
     camera_options,
@@ -142,6 +143,18 @@ pub trait OmarchyBroadcast {
 
     /// Roughly once per second while `active`; `-1` marks a value that
     /// cannot be measured.
+    fn get_modules(&self) -> Result<ModulesReply, IpcError>;
+
+    fn set_module_enabled(&self, id: &str, enabled: bool) -> Result<(), IpcError>;
+
+    fn get_stage_order(&self) -> Result<Vec<String>, IpcError>;
+
+    fn set_stage_order(&self, order: &[&str]) -> Result<(), IpcError>;
+
+    fn set_backend_profile(&self, profile: &str) -> Result<(), IpcError>;
+
+    fn set_stage_pin(&self, stage: &str, module: &str) -> Result<(), IpcError>;
+
     #[zbus(signal)]
     fn stats(
         &self,
@@ -254,6 +267,12 @@ pub trait OmarchyBroadcast {
 
     /// Revision of the interface the daemon implements.
     #[zbus(property)]
+    fn modules_serial(&self) -> zbus::Result<u32>;
+
+    #[zbus(property)]
+    fn backend_profile(&self) -> zbus::Result<String>;
+
+    #[zbus(property)]
     fn interface_revision(&self) -> zbus::Result<u32>;
 }
 
@@ -319,6 +338,39 @@ impl OmarchyBroadcastProxy<'_> {
     }
 
     /// `ResetSettings(scope)` on `camera` (`""`: `ActiveCamera`).
+    /// `GetModules`, read into the model of [`crate::modules`].
+    pub async fn module_list(&self) -> Result<ModuleList, IpcError> {
+        Ok(ModuleList::from_wire(&self.get_modules().await?))
+    }
+
+    /// `GetModules` with the `NO_AUTO_START` flag: never starts the daemon.
+    pub async fn module_list_no_autostart(&self) -> Result<ModuleList, IpcError> {
+        let reply: Option<ModulesReply> = self
+            .inner()
+            .call_with_flags("GetModules", MethodFlags::NO_AUTO_START, &())
+            .await
+            .map_err(IpcError::from)?;
+        let reply = reply.ok_or_else(|| {
+            IpcError::ZBus(zbus::Error::Failure("GetModules returned no reply".into()))
+        })?;
+        Ok(ModuleList::from_wire(&reply))
+    }
+
+    /// `GetStageOrder` with the `NO_AUTO_START` flag: never starts the
+    /// daemon.
+    pub async fn stage_order_no_autostart(&self) -> Result<Vec<String>, IpcError> {
+        let reply: Option<Vec<String>> = self
+            .inner()
+            .call_with_flags("GetStageOrder", MethodFlags::NO_AUTO_START, &())
+            .await
+            .map_err(IpcError::from)?;
+        reply.ok_or_else(|| {
+            IpcError::ZBus(zbus::Error::Failure(
+                "GetStageOrder returned no reply".into(),
+            ))
+        })
+    }
+
     pub async fn reset_settings_scope(
         &self,
         camera: &str,

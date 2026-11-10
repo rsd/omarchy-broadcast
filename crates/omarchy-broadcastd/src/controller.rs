@@ -240,7 +240,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use obc_core::config::{CAMERA_CONTROL_NAMES, Config, EffectConfig, RuntimeState};
-use obc_core::{EffectMode, EffectOnFailure, OutputContract, RelightLight};
+use obc_core::modules::{BackendProfile, StoredValue, legacy};
+use obc_core::{EffectMode, EffectOnFailure, OutputContract};
 use obc_ipc::settings::ResetScope;
 use obc_ipc::{
     CameraControl, CameraControls, CameraInfo, INTERFACE_REVISION, IpcError, SettingChange,
@@ -255,19 +256,20 @@ use obc_pipeline::controls::{
 use obc_pipeline::ctrl_events::{
     CTRL_CHANGE_FLAGS, CTRL_CHANGE_RANGE, CTRL_CHANGE_VALUE, CtrlEvent,
 };
-use obc_pipeline::effect::{Availability, Feature, Stage};
+use obc_pipeline::effect::StageId;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::backend::{
-    ControlEvent, ControlNode, ControlScan, EffectReport, EffectStatus, Failure, MediaBackend,
-    PipeWireEvent, PipeWireGeneration, PipeWireState, PreviewRequest, SessionParams,
-    WatchGeneration,
+    ControlEvent, ControlNode, ControlScan, EffectReport, EffectRun, EffectStatus, Failure,
+    MediaBackend, PipeWireEvent, PipeWireGeneration, PipeWireState, PreviewRequest, SessionParams,
+    StageRun, WatchGeneration,
 };
 use crate::camera::{self, Camera};
 use crate::gpu_cache;
+use crate::modules::{Modules, Plan};
 use crate::preview::{Leases, PreviewDir, check_fps};
 use crate::settings::catalogue::DYNAMIC_FRAMERATE;
-use crate::settings::effects::{self, GlobalEntry, Key, Write};
+use crate::settings::effects::{self, Binding, GlobalEntry, Write};
 use crate::settings::{self, CameraSettings, Entry, Inputs, Refusal, Target};
 use crate::{debug, error, info, warning};
 
@@ -310,6 +312,10 @@ pub type PathReply = tokio::sync::oneshot::Sender<Result<String, IpcError>>;
 pub type ControlsReply = tokio::sync::oneshot::Sender<Result<Vec<CameraControl>, IpcError>>;
 /// The reply channel of `GetSettings`.
 pub type SettingsReply = tokio::sync::oneshot::Sender<Result<SettingsTree, IpcError>>;
+/// The reply channel of `GetModules`.
+pub type ModulesReply = tokio::sync::oneshot::Sender<Result<obc_ipc::ModuleList, IpcError>>;
+/// The reply channel of `GetStageOrder`.
+pub type OrderReply = tokio::sync::oneshot::Sender<Result<Vec<String>, IpcError>>;
 
 /// What the controller is asked to do.
 #[derive(Debug)]
@@ -367,6 +373,18 @@ pub enum Command {
     /// An event of the control-event watcher of that generation (through
     /// the backend's reporter).
     ControlEvent(WatchGeneration, ControlEvent),
+    /// `GetModules()`.
+    GetModules(ModulesReply),
+    /// `SetModuleEnabled(s, b)`.
+    SetModuleEnabled(String, bool, Reply),
+    /// `GetStageOrder()`.
+    GetStageOrder(OrderReply),
+    /// `SetStageOrder(as)` (empty: the default order).
+    SetStageOrder(Vec<String>, Reply),
+    /// `SetBackendProfile(s)`.
+    SetBackendProfile(String, Reply),
+    /// `SetStagePin(s, s)` (an empty module clears the pin).
+    SetStagePin(String, String, Reply),
     /// `ReloadConfig()` (with its reply) or SIGHUP (without).
     ReloadConfig(Option<Reply>),
     /// The consumer watcher's count of processes holding the loopback.
@@ -401,6 +419,8 @@ pub enum Change {
     CameraControls(CameraControls),
     SettingsRevision(u32),
     SettingsSchemaSerial(u32),
+    ModulesSerial(u32),
+    BackendProfile(String),
 }
 
 impl Change {
@@ -425,6 +445,8 @@ impl Change {
             Change::CameraControls(_) => "CameraControls",
             Change::SettingsRevision(_) => "SettingsRevision",
             Change::SettingsSchemaSerial(_) => "SettingsSchemaSerial",
+            Change::ModulesSerial(_) => "ModulesSerial",
+            Change::BackendProfile(_) => "BackendProfile",
         }
     }
 }
@@ -571,6 +593,16 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Vec<Change> {
             new.settings_revision.unwrap_or_default(),
         ));
     }
+    if old.modules_serial != new.modules_serial {
+        out.push(Change::ModulesSerial(
+            new.modules_serial.unwrap_or_default(),
+        ));
+    }
+    if old.backend_profile != new.backend_profile {
+        out.push(Change::BackendProfile(
+            new.backend_profile.clone().unwrap_or_default(),
+        ));
+    }
     if old.output_mode != new.output_mode {
         out.push(Change::OutputMode(new.output_mode.clone()));
     }
@@ -634,6 +666,9 @@ pub struct Paths {
     /// ([`crate::preview::PreviewDir`]); `None` when it is not set, and
     /// then `AcquirePreview` fails.
     pub runtime: Option<PathBuf>,
+    /// The modules' crash ledger (`modules-crash.json` in the state file's
+    /// directory, [`crate::modules::LEDGER_FILE`]); `None`: none is kept.
+    pub ledger: Option<PathBuf>,
 }
 
 /// The runtime state from `path`. A file that cannot be read or parsed
@@ -668,7 +703,9 @@ pub fn load_runtime_state(path: &Path) -> (RuntimeState, Option<String>, Vec<Str
 /// read: no device is touched).
 pub fn preliminary_snapshot(paths: &Paths) -> Snapshot {
     let config = Config::load(&paths.config).unwrap_or_default();
-    let (runtime, damaged, _) = load_runtime_state(&paths.state);
+    let (mut runtime, damaged, _) = load_runtime_state(&paths.state);
+    // `[settings]` over the typed keys of revision 8, as the controller reads them.
+    runtime.migrate_legacy_settings();
     let effect = runtime.effect_over(&config.effect);
     Snapshot {
         state: if runtime.enabled {
@@ -684,7 +721,7 @@ pub fn preliminary_snapshot(paths: &Paths) -> Snapshot {
         effect: effect.mode.as_str().into(),
         blur_strength: effect.blur_strength,
         background_image: image_string(&effect),
-        denoise: effect.denoise,
+        denoise: denoise_choice(&config, &runtime),
         consumers: 0,
         loopback_consumers: 0,
         pipewire_consumers: 0,
@@ -693,7 +730,24 @@ pub fn preliminary_snapshot(paths: &Paths) -> Snapshot {
         camera_controls: Some(CameraControls::default()),
         settings_revision: Some(1),
         settings_schema_serial: Some(1),
+        modules_serial: Some(1),
+        backend_profile: Some(
+            runtime
+                .modules
+                .profile(&config.modules)
+                .as_str()
+                .to_string(),
+        ),
         interface_revision: INTERFACE_REVISION,
+    }
+}
+
+/// `Denoise`: noise removal chosen (the state file's choice over the
+/// config's), whether or not a module provides it.
+fn denoise_choice(config: &Config, runtime: &RuntimeState) -> bool {
+    match runtime.settings.get(legacy::DENOISE) {
+        Some(StoredValue::Bool(b)) => *b,
+        _ => runtime.denoise.unwrap_or(config.effect.denoise),
     }
 }
 
@@ -748,48 +802,68 @@ pub fn check_background_file(path: &Path) -> Result<(), String> {
 }
 
 /// The `Error` text of an effect that cannot run.
-fn effect_failure_text(effect: &EffectConfig, reason: &str) -> String {
-    match effect.on_failure {
-        EffectOnFailure::Black => format!("effect {} unavailable: {reason}", effect.mode),
+/// The background effect and its fallback, of the settings in force or of
+/// what a session was given.
+trait Fallback {
+    fn mode(&self) -> EffectMode;
+    fn on_failure(&self) -> EffectOnFailure;
+}
+
+impl Fallback for EffectConfig {
+    fn mode(&self) -> EffectMode {
+        self.mode
+    }
+    fn on_failure(&self) -> EffectOnFailure {
+        self.on_failure
+    }
+}
+
+impl Fallback for EffectRun {
+    fn mode(&self) -> EffectMode {
+        self.mode
+    }
+    fn on_failure(&self) -> EffectOnFailure {
+        self.on_failure
+    }
+}
+
+fn effect_failure_text(effect: &impl Fallback, reason: &str) -> String {
+    match effect.on_failure() {
+        EffectOnFailure::Black => format!("effect {} unavailable: {reason}", effect.mode()),
         EffectOnFailure::None => format!(
             "effect {} unavailable: {reason}; the camera image is shown without the effect \
              (effect.on_failure = \"none\")",
-            effect.mode
+            effect.mode()
         ),
     }
 }
 
-/// The `Error` text of noise removal that cannot run (the session streams
-/// on without it).
-fn denoise_failure_text(reason: &str) -> String {
-    format!("noise removal unavailable: {reason}; the camera image is shown without it")
-}
+/// The longest stage failure reason `Error` carries, in bytes.
+const STAGE_REASON_MAX: usize = 400;
 
-/// The longest relighting failure reason `Error` carries, in bytes.
-const RELIGHT_REASON_MAX: usize = 400;
-
-/// The `Error` text of relighting that cannot run (the session streams on
-/// without it): the reason made safe to show and bounded
-/// ([`settings::sanitise`]). Worded to be true under every effect: with
-/// blur or replace the video is the effect without relighting, not the
-/// camera image.
-fn relight_failure_text(reason: &str) -> String {
+/// The `Error` text of stage `id`, labelled `label`, that cannot run (the
+/// session streams on without it): the reason made safe to show and
+/// bounded ([`settings::sanitise`]), worded to be true under every effect
+/// (with blur or replace the video is the effect without the stage, not
+/// the camera image). Noise removal keeps the words of revision 8, whose
+/// reason is the backend's own.
+fn stage_failure_text(id: &StageId, label: &str, reason: &str) -> String {
+    if *id == StageId::DENOISE {
+        return format!("{label} unavailable: {reason}; the camera image is shown without it");
+    }
     format!(
-        "relighting unavailable: {}; the video continues without it",
-        settings::sanitise(reason, RELIGHT_REASON_MAX)
+        "{label} unavailable: {}; the video continues without it",
+        settings::sanitise(reason, STAGE_REASON_MAX)
     )
 }
 
-/// The longest enhancement failure reason `Error` carries, in bytes.
-const ENHANCE_REASON_MAX: usize = 400;
-
 /// The `Error` text of enhancement that cannot run (the session streams on
 /// without it): the reason made safe to show and bounded
-/// ([`settings::sanitise`]), worded as [`relight_failure_text`].
+/// ([`settings::sanitise`]), worded as [`stage_failure_text`].
 fn enhance_failure_text(reason: &str) -> String {
     format!(
         "enhance unavailable: {}; the video continues without it",
-        settings::sanitise(reason, ENHANCE_REASON_MAX)
+        settings::sanitise(reason, STAGE_REASON_MAX)
     )
 }
 
@@ -874,34 +948,15 @@ pub struct Controller<B: MediaBackend> {
     effect_seen: Option<EffectStatus>,
     /// The effect has been polled in this session.
     effect_polled: bool,
-    /// Noise removal cannot run: the session streams without it, and this
-    /// is its `Error` text (behind an effect failure's). Cleared when the
-    /// stage becomes ready or is no longer requested, by an effect method,
-    /// a reload, the next session start or the end of the session.
-    denoise_failure: Option<String>,
-    /// The noise removal status last polled in this session, as
-    /// [`Self::effect_seen`] is for the effect.
-    denoise_seen: Option<EffectStatus>,
-    /// Noise removal has been polled in this session.
-    denoise_polled: bool,
-    /// A noise removal failure polled once while the effect was loading or
-    /// ready, held for the next poll: it may be the whole chain's failure,
-    /// read before the effect's status showed it.
-    denoise_held: Option<EffectStatus>,
-    /// Relighting cannot run: the session streams without it, and this is
-    /// its `Error` text (behind a noise removal failure's). Cleared as
-    /// [`Self::denoise_failure`] is.
-    relight_failure: Option<String>,
-    /// The relighting status last polled in this session, as
-    /// [`Self::denoise_seen`] is for noise removal.
-    relight_seen: Option<EffectStatus>,
-    /// Relighting has been polled in this session.
-    relight_polled: bool,
-    /// A relighting failure held for the next poll, as
-    /// [`Self::denoise_held`] is.
-    relight_held: Option<EffectStatus>,
+    /// Each stage of the session apart from the effect (noise removal,
+    /// relighting, a module's stage), in stage order: whether it cannot run
+    /// (the session streams without it, and its `Error` text, behind an
+    /// effect failure's and those of the stages before it), its last
+    /// polled status and a failure held for the next poll (see
+    /// [`Self::poll_stage`]).
+    stages: Vec<(StageId, StageTrack)>,
     /// Enhancement cannot run: the session streams without it, and this is
-    /// its `Error` text (behind a relighting failure's). Cleared by a
+    /// its `Error` text (behind the stages' failures). Cleared by a
     /// write or reset of the setting, a reload, a camera switch or reopen,
     /// and the end of the session.
     enhance_failure: Option<String>,
@@ -912,7 +967,7 @@ pub struct Controller<B: MediaBackend> {
     /// session). Only a change of the effect, its image or the noise
     /// removal request, or a failure of either, starts a new load to
     /// follow; a strength change does not.
-    effect_applied: Option<EffectConfig>,
+    effect_applied: Option<EffectRun>,
     /// When the effect's GPU time is logged next.
     effect_log_at: Option<Instant>,
     /// Every consumer: `loopback_consumers + pipewire_consumers` plus the
@@ -970,10 +1025,16 @@ pub struct Controller<B: MediaBackend> {
     watch_failed: Option<String>,
     /// A control event asked for a read of the camera at this instant.
     event_refresh_at: Option<Instant>,
-    /// Which features of the effect backend are installed, with the SDK
-    /// root they were looked for in (`None`: no root, nothing known), as
-    /// last read: at start, on a reload and when a session has started.
-    features: Option<(PathBuf, Vec<(Feature, Availability)>)>,
+    /// The modules: what is installed and enabled, and what each offers
+    /// ([`crate::modules`]).
+    modules: Modules,
+    /// The running session's plan: which module runs each stage, fixed
+    /// when it started (`None`: no session).
+    plan: Option<Plan>,
+    /// The modules whose code the running session has run (marked in the
+    /// crash ledger until it stops): those of what it was given, added to
+    /// as the effect or the ingest changes ([`Self::mark_running`]).
+    marked: Vec<String>,
     /// The GPU's compute capability: the one an earlier run learnt
     /// ([`crate::gpu_cache`]) until a session of this process reads it
     /// while it has the GPU up (never at idle: the GPU may be parked); then
@@ -983,6 +1044,25 @@ pub struct Controller<B: MediaBackend> {
     compute_capability_learnt: bool,
     published: Published,
     sink_hook: Option<SinkHook>,
+}
+
+/// What the controller follows of one stage of the session apart from the
+/// effect ([`Controller::poll_stage`]).
+#[derive(Debug, Clone, Default)]
+struct StageTrack {
+    /// The stage cannot run: the `Error` text. Cleared when the stage
+    /// becomes ready or is no longer requested, by an effect method, a
+    /// reload, the next session start or the end of the session.
+    failure: Option<String>,
+    /// The status last polled, as [`Controller::effect_seen`] is for the
+    /// effect.
+    seen: Option<EffectStatus>,
+    /// Polled in this session.
+    polled: bool,
+    /// A failure polled once while the effect was loading or ready, held
+    /// for the next poll: it may be the whole chain's failure, read before
+    /// the effect's status showed it.
+    held: Option<EffectStatus>,
 }
 
 /// A set request: `SetSetting` or the revision-6 `SetCameraControl`.
@@ -1056,13 +1136,53 @@ enum ResetWhat {
 
 impl<B: MediaBackend> Controller<B> {
     /// Loads the config (an invalid file: the defaults, and `Error` set) and
-    /// the runtime state, scans the cameras and starts the writer.
+    /// the runtime state, loads the modules, scans the cameras and starts
+    /// the writer.
     pub fn new(
         backend: B,
         paths: Paths,
         published: Published,
         sink_hook: Option<SinkHook>,
         now: Instant,
+    ) -> Self {
+        Self::new_with(backend, paths, published, sink_hook, now, true)
+    }
+
+    /// [`Self::new`] without the modules: none is discovered, opened or
+    /// counted in the crash ledger until [`Self::load_modules`]. What the
+    /// daemon starts with, so that an instance that does not get the bus
+    /// name leaves the ledger alone.
+    pub fn new_without_modules(
+        backend: B,
+        paths: Paths,
+        published: Published,
+        sink_hook: Option<SinkHook>,
+        now: Instant,
+    ) -> Self {
+        Self::new_with(backend, paths, published, sink_hook, now, false)
+    }
+
+    /// Discovers, opens and probes the modules (counting the crash ledger
+    /// for this start) and publishes what they offer. For a controller made
+    /// with [`Self::new_without_modules`], once, before any command.
+    pub fn load_modules(&mut self, now: Instant) {
+        self.modules = Modules::load(
+            &mut self.backend,
+            &self.config,
+            &self.runtime,
+            self.paths.ledger.as_deref(),
+            self.compute_capability,
+        );
+        self.reconcile(now);
+    }
+
+    fn new_with(
+        backend: B,
+        paths: Paths,
+        published: Published,
+        sink_hook: Option<SinkHook>,
+        now: Instant,
+        load_modules: bool,
     ) -> Self {
         let (config, error) = match Config::load(&paths.config) {
             Ok(c) => (c, String::new()),
@@ -1072,19 +1192,21 @@ impl<B: MediaBackend> Controller<B> {
                 (Config::default(), msg)
             }
         };
-        // Before any output is built: its effect backend takes the root in
-        // force when it is made.
-        obc_pipeline::effect::set_maxine_root(config.effect.maxine_root.clone());
         if let Some(note) = maxine_root_note(
             None,
             config.effect.maxine_root.as_deref(),
-            obc_pipeline::effect::maxine_root_env().as_deref(),
+            maxine_root_env().as_deref(),
             None,
             false,
         ) {
             warning!("{note}");
         }
-        let (runtime, state_damaged, notes) = load_runtime_state(&paths.state);
+        let (mut runtime, state_damaged, notes) = load_runtime_state(&paths.state);
+        // The typed effect keys of an older state file are module settings
+        // now, saved by their setting ids from the next save on.
+        if runtime.migrate_legacy_settings() {
+            debug!("the state file's effect settings are kept by setting id from now on");
+        }
         // Learnt by an earlier run: the models of this GPU are known from
         // the first probe, with no GPU call at idle.
         let compute_capability = paths.cache.as_deref().and_then(gpu_cache::load);
@@ -1110,8 +1232,24 @@ impl<B: MediaBackend> Controller<B> {
             runtime.enabled,
             runtime.camera.as_deref().unwrap_or("not selected"),
             effect.mode,
-            if effect.denoise { "on" } else { "off" }
+            if denoise_choice(&config, &runtime) {
+                "on"
+            } else {
+                "off"
+            }
         );
+        let mut backend = backend;
+        let modules = if load_modules {
+            Modules::load(
+                &mut backend,
+                &config,
+                &runtime,
+                paths.ledger.as_deref(),
+                compute_capability,
+            )
+        } else {
+            Modules::empty()
+        };
         let mut c = Controller {
             backend,
             paths,
@@ -1130,14 +1268,7 @@ impl<B: MediaBackend> Controller<B> {
             effect_failure: None,
             effect_seen: None,
             effect_polled: false,
-            denoise_failure: None,
-            denoise_seen: None,
-            denoise_polled: false,
-            denoise_held: None,
-            relight_failure: None,
-            relight_seen: None,
-            relight_polled: false,
-            relight_held: None,
+            stages: Vec::new(),
             enhance_failure: None,
             enhance_seen: None,
             effect_applied: None,
@@ -1167,13 +1298,14 @@ impl<B: MediaBackend> Controller<B> {
             watch: None,
             watch_failed: None,
             event_refresh_at: None,
-            features: None,
+            modules,
+            plan: None,
+            marked: Vec::new(),
             compute_capability,
             compute_capability_learnt: false,
             published,
             sink_hook,
         };
-        c.refresh_features();
         c.rescan_cameras();
         c.reconcile(now);
         c
@@ -1280,6 +1412,29 @@ impl<B: MediaBackend> Controller<B> {
             Command::ControlEvent(generation, event) => {
                 self.control_event(generation, event, now);
                 self.reconcile(now);
+            }
+            Command::GetModules(reply) => {
+                let _ = reply.send(Ok(self.module_list()));
+            }
+            Command::SetModuleEnabled(id, on, reply) => {
+                let res = self.set_module_enabled(&id, on, now);
+                let _ = reply.send(res);
+            }
+            Command::GetStageOrder(reply) => {
+                let order = self.modules.order().iter().map(|s| s.to_string()).collect();
+                let _ = reply.send(Ok(order));
+            }
+            Command::SetStageOrder(order, reply) => {
+                let res = self.set_stage_order(order, now);
+                let _ = reply.send(res);
+            }
+            Command::SetBackendProfile(profile, reply) => {
+                let res = self.set_backend_profile(&profile, now);
+                let _ = reply.send(res);
+            }
+            Command::SetStagePin(stage, module, reply) => {
+                let res = self.set_stage_pin(&stage, &module, now);
+                let _ = reply.send(res);
             }
             Command::ReloadConfig(reply) => {
                 let res = self.reload(now);
@@ -1396,9 +1551,9 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     /// The `Error` text of the causes that still hold (the writer missing,
-    /// a fault, an effect failure, a noise removal failure, a relighting
-    /// failure, an enhancement failure, a damaged state file, in that
-    /// order), or empty: what clearing an error whose own cause is gone
+    /// a fault, an effect failure, the stages' failures in stage order (a
+    /// noise removal failure, then a relighting failure), an enhancement
+    /// failure, a damaged state file, in that order), or empty: what clearing an error whose own cause is gone
     /// leaves.
     fn standing_error(&self) -> String {
         if self.writer.is_none()
@@ -1412,11 +1567,25 @@ impl<B: MediaBackend> Controller<B> {
         if let Some(e) = &self.effect_failure {
             return e.clone();
         }
-        if let Some(e) = &self.denoise_failure {
-            return e.clone();
-        }
-        if let Some(e) = &self.relight_failure {
-            return e.clone();
+        // In stage order: noise removal's before relighting's.
+        let run = match &self.effect_applied {
+            Some(e) => e.clone(),
+            None => self.effect_run(),
+        };
+        let order: Vec<StageId> = run
+            .stages
+            .iter()
+            .chain(run.chains.iter().flat_map(|c| c.stages.iter()))
+            .map(|s| s.id.clone())
+            .collect();
+        let rank = |id: &StageId| order.iter().position(|o| o == id).unwrap_or(usize::MAX);
+        if let Some((_, t)) = self
+            .stages
+            .iter()
+            .filter(|(_, t)| t.failure.is_some())
+            .min_by_key(|(id, _)| rank(id))
+        {
+            return t.failure.clone().unwrap_or_default();
         }
         if let Some(e) = &self.enhance_failure {
             return e.clone();
@@ -1439,41 +1608,50 @@ impl<B: MediaBackend> Controller<B> {
         self.runtime.effect_over(&self.config.effect)
     }
 
-    /// The effect settings the session is given: those in force, without
-    /// noise removal or relighting while it is known not to be installed.
-    /// A stage that is not installed is never requested, so it raises no
-    /// error; the choice
-    /// stays in force and applies once it is installed. Enhancement is
-    /// off here: it is the ingest's, given per camera
-    /// ([`Self::session_params_for`]).
-    fn effect_run(&self) -> EffectConfig {
-        let mut effect = self.effect();
-        if self.denoise_installed() == Some(false) {
-            effect.denoise = false;
+    /// The session's plan: the running session's, else the one a session
+    /// would start with now.
+    fn current_plan(&self) -> Plan {
+        match &self.plan {
+            Some(p) => p.clone(),
+            None => self.modules.plan(),
         }
-        if self.relight_installed() == Some(false) {
-            effect.relight = false;
-        }
-        effect.enhance = false;
-        effect
     }
 
-    /// Whether relighting is installed (its feature and the green screen
-    /// that makes its matte): `None` when it cannot be known (no SDK root
-    /// resolves).
-    fn relight_installed(&self) -> Option<bool> {
-        let (_, features) = self.features.as_ref()?;
-        Some(Stage::Relight.availability(features).is_installed())
+    /// What the session is given: the background effect in force, the
+    /// stages of the plan with the settings in force (a stage known not to
+    /// run is never requested, so it raises no error; the choice stays in
+    /// force and applies once it can run). Enhancement is off here: it is
+    /// the ingest's, given per camera ([`Self::session_params_for`]).
+    fn effect_run(&self) -> EffectRun {
+        self.effect_run_with(&self.current_plan())
     }
 
-    /// Whether enhancement is installed: `None` when it cannot be known
-    /// (no SDK root resolves).
+    fn effect_run_with(&self, plan: &Plan) -> EffectRun {
+        let effect = self.effect();
+        EffectRun {
+            mode: effect.mode,
+            blur_strength: effect.blur_strength,
+            background_image: effect.background_image,
+            on_failure: effect.on_failure,
+            stages: plan
+                .effect_stages
+                .iter()
+                .map(|s| self.modules.stage_run(plan, &self.config, &self.runtime, s))
+                .collect(),
+            chains: self.modules.chain_runs(plan, &self.config, &self.runtime),
+            enhance: false,
+        }
+    }
+
+    /// Whether enhancement can run: `Some(false)` when no module can run
+    /// it now.
     fn enhance_installed(&self) -> Option<bool> {
-        let (_, features) = self.features.as_ref()?;
-        features
-            .iter()
-            .find(|(f, _)| *f == Feature::VideoSuperResolution)
-            .map(|(_, a)| a.is_installed())
+        Some(
+            self.modules
+                .resolve(StageId::ENHANCE.as_str())
+                .provider
+                .is_some(),
+        )
     }
 
     /// Whether enhancement applies to `camera`'s capture mode (small
@@ -1495,10 +1673,15 @@ impl<B: MediaBackend> Controller<B> {
         }
     }
 
-    /// Whether an ingest on `camera` is built with the enhance stage: it is
-    /// on, not known to be uninstalled, and applies to the camera.
+    /// Whether an ingest on `camera` is built with the enhance stage: a
+    /// module provides it, it is on and can run, and it applies to the
+    /// camera.
     fn enhance_for(&self, camera: &Camera) -> bool {
-        self.effect().enhance
+        let plan = self.current_plan();
+        plan.enhance.is_some()
+            && self
+                .modules
+                .stage_on(&plan, &self.config, &self.runtime, &StageId::ENHANCE)
             && self.enhance_installed() != Some(false)
             && self.enhance_applies(camera) == effects::Applies::Yes
     }
@@ -1512,57 +1695,24 @@ impl<B: MediaBackend> Controller<B> {
         }
     }
 
-    /// Whether noise removal is installed: `None` when it cannot be known
-    /// (no SDK root resolves).
-    fn denoise_installed(&self) -> Option<bool> {
-        let (_, features) = self.features.as_ref()?;
-        features
-            .iter()
-            .find(|(f, _)| *f == Feature::Denoise)
-            .map(|(_, a)| a.is_installed())
-    }
-
-    /// Reads again which features are installed (the filesystem only: no
-    /// CUDA call, safe at idle), with the compute capability known. A
-    /// change of noise removal's is logged and, with a session, applied to
-    /// it ([`Self::follow_denoise`]). While a session runs, the compute
+    /// Probes the modules again (the filesystem only: no CUDA call, safe at
+    /// idle), with the compute capability known; with a session, a stage
+    /// that can now run, or no longer can, is turned on or off in it
+    /// ([`Self::follow_stages`]). While a session runs, the compute
     /// capability is read first if this process has not read it yet (the
-    /// GPU is up then); a value other than the cached one is cached.
+    /// GPU is up then); a value other than the cached one is cached, and
+    /// the modules are opened again with it.
     fn refresh_features(&mut self) {
         if self.session.is_some() && !self.compute_capability_learnt {
             self.learn_compute_capability();
         }
-        let before = self.denoise_installed();
-        let reason_before = self.denoise_reason();
-        let relight_before = self.relight_installed();
-        self.features = self.backend.feature_availability(self.compute_capability);
-        let after = self.denoise_installed();
-        let reason = self.denoise_reason();
-        let relight_after = self.relight_installed();
-        if relight_before != relight_after
-            && let (Some((root, features)), Some(false)) = (&self.features, relight_after)
-        {
-            let why = Stage::Relight.availability(features);
-            info!(
-                "relighting is not installed in {}: {}",
-                root.display(),
-                why.reason().unwrap_or_default()
-            );
-        }
-        if (before, &reason_before) != (after, &reason) {
-            match (&self.features, after) {
-                (None, _) => debug!("no Maxine SDK root: which effects are installed is unknown"),
-                (Some((root, _)), Some(false)) => info!(
-                    "noise removal is not installed in {}: {}",
-                    root.display(),
-                    reason.as_deref().unwrap_or_default()
-                ),
-                (Some((root, _)), _) => {
-                    debug!("noise removal is installed in {}", root.display());
-                }
-            }
-        }
-        if (before != after || relight_before != relight_after) && self.session.is_some() {
+        self.modules.refresh(
+            &mut self.backend,
+            &self.config,
+            &self.runtime,
+            self.compute_capability,
+        );
+        if self.session.is_some() {
             self.follow_stages();
         }
     }
@@ -1590,43 +1740,72 @@ impl<B: MediaBackend> Controller<B> {
         }
     }
 
-    /// What is installed changed while a session runs: noise removal and
-    /// relighting, the stages that follow it, are turned on or off in what
-    /// the session was given, and nothing else is. In particular an effect the session
-    /// started without (rejected by [`Self::effect_check`] with
-    /// `on_failure = "none"`) is not requested again: only a control call
-    /// or a reload retries it.
+    /// What can run changed while a session runs: the stages that follow
+    /// it are turned on or off in what the session was given, and nothing
+    /// else is. In particular an effect the session started without
+    /// (rejected by [`Self::effect_check`] with `on_failure = "none"`) is
+    /// not requested again: only a control call or a reload retries it.
     fn follow_stages(&mut self) {
         let run = self.effect_run();
         let Some(mut effect) = self.effect_applied.clone() else {
             return;
         };
-        if effect.denoise == run.denoise && effect.relight == run.relight {
+        let mut changed = Vec::new();
+        for s in effect
+            .stages
+            .iter_mut()
+            .chain(effect.chains.iter_mut().flat_map(|c| c.stages.iter_mut()))
+        {
+            if let Some(now) = run.stage(s.id.as_str())
+                && now.enabled != s.enabled
+            {
+                s.enabled = now.enabled;
+                changed.push(s.id.clone());
+            }
+        }
+        if changed.is_empty() {
             return;
         }
-        if effect.denoise != run.denoise {
-            effect.denoise = run.denoise;
-            self.denoise_seen = None;
-            self.denoise_held = None;
-        }
-        if effect.relight != run.relight {
-            effect.relight = run.relight;
-            self.relight_seen = None;
-            self.relight_held = None;
+        for id in &changed {
+            let t = self.track(id);
+            t.seen = None;
+            t.held = None;
         }
         self.effect_applied = Some(effect.clone());
+        self.mark_running(&effect);
         if let Err(reason) = self.backend.set_effect(&effect) {
             let _ = self.effect_refused(effect, &reason);
         }
     }
 
-    /// Why noise removal is not installed, if it is known not to be.
-    fn denoise_reason(&self) -> Option<String> {
-        let (_, features) = self.features.as_ref()?;
-        features
-            .iter()
-            .find(|(f, _)| *f == Feature::Denoise)
-            .and_then(|(_, a)| a.reason().map(str::to_string))
+    /// The tracking of stage `id`, made when first needed.
+    fn track(&mut self, id: &StageId) -> &mut StageTrack {
+        let i = match self.stages.iter().position(|(s, _)| s == id) {
+            Some(i) => i,
+            None => {
+                self.stages.push((id.clone(), StageTrack::default()));
+                self.stages.len() - 1
+            }
+        };
+        &mut self.stages[i].1
+    }
+
+    /// Whether stage `id` failed (or holds a failure for the next poll).
+    fn stage_failed(&self, id: &StageId) -> bool {
+        self.stages.iter().any(|(s, t)| {
+            s == id && (matches!(t.seen, Some(EffectStatus::Failed(_))) || t.held.is_some())
+        })
+    }
+
+    /// Ends every stage failure; whether one of them was the `Error` shown.
+    fn take_stage_failures(&mut self) -> bool {
+        let mut shown = false;
+        for (_, t) in &mut self.stages {
+            if let Some(f) = t.failure.take() {
+                shown |= f == self.error;
+            }
+        }
+        shown
     }
 
     /// The global settings (the video effects) as they are now.
@@ -1634,10 +1813,8 @@ impl<B: MediaBackend> Controller<B> {
         effects::build(&effects::Inputs {
             config: &self.config,
             runtime: &self.runtime,
-            denoise_installed: self.denoise_installed(),
-            enhance_installed: self.enhance_installed(),
+            modules: &self.modules,
             enhance_applies: self.settings_camera().map(|c| self.enhance_applies(c)),
-            relight_installed: self.relight_installed(),
         })
     }
 
@@ -1701,6 +1878,7 @@ impl<B: MediaBackend> Controller<B> {
             input_gap: self.config.input_gap(),
             fixed_framerate: self.config.camera.fixed_framerate,
             effect: self.effect_run(),
+            backends: self.current_plan().backends(),
         }
     }
 
@@ -1776,7 +1954,7 @@ impl<B: MediaBackend> Controller<B> {
             effect: effect.mode.as_str().into(),
             blur_strength: effect.blur_strength,
             background_image: image_string(&effect),
-            denoise: effect.denoise,
+            denoise: denoise_choice(&self.config, &self.runtime),
             consumers: self.consumers,
             loopback_consumers: self.loopback_consumers,
             pipewire_consumers: self.pipewire_consumers,
@@ -1785,6 +1963,14 @@ impl<B: MediaBackend> Controller<B> {
             camera_controls: Some(self.controls_view.clone()),
             settings_revision: Some(self.settings_revision),
             settings_schema_serial: Some(self.settings_serial),
+            modules_serial: Some(self.modules.serial()),
+            backend_profile: Some(
+                self.runtime
+                    .modules
+                    .profile(&self.config.modules)
+                    .as_str()
+                    .to_string(),
+            ),
             interface_revision: INTERFACE_REVISION,
         };
         self.published.update(snap);
@@ -2049,8 +2235,9 @@ impl<B: MediaBackend> Controller<B> {
         if self.follow_effect(&report, now) {
             return true;
         }
-        self.poll_denoise(report.denoise, &report.status);
-        self.poll_relight(report.relight, &report.status);
+        for (id, status) in report.stages {
+            self.poll_stage(&id, status, &report.status);
+        }
         self.poll_enhance(report.enhance);
         false
     }
@@ -2146,12 +2333,13 @@ impl<B: MediaBackend> Controller<B> {
         false
     }
 
-    /// Follows the noise removal stage of the running session, `effect`
-    /// being the effect's status of the same report. Its failure never
-    /// stops the session: it streams on without the stage (the element
-    /// drops it), the state is unchanged, and `Error` says why unless a
-    /// higher cause holds ([`Self::standing_error`]): the writer missing, a
-    /// fault, an effect failure.
+    /// Follows stage `id` of the running session (noise removal,
+    /// relighting, a module's stage), `effect` being the effect's status
+    /// of the same report. Its failure never stops the session: it streams
+    /// on without the stage (the element drops it), the state is unchanged,
+    /// and `Error` says why unless a higher cause holds
+    /// ([`Self::standing_error`]): the writer missing, a fault, an effect
+    /// failure, an earlier stage's failure.
     ///
     /// A failure with the effect's own failure reason is the whole chain's
     /// (the element shows it on both): the effect's, not recorded as the
@@ -2160,118 +2348,58 @@ impl<B: MediaBackend> Controller<B> {
     /// chain can show on the stage a poll before it does on the effect.
     /// With the effect off (`none`), or failed for another reason, the
     /// stage's failure is its own at once.
-    fn poll_denoise(&mut self, status: EffectStatus, effect: &EffectStatus) {
+    fn poll_stage(&mut self, id: &StageId, status: EffectStatus, effect: &EffectStatus) {
+        let label = self.modules.stage_label(id.as_str());
+        let t = self.track(id);
         if let EffectStatus::Failed(reason) = &status
-            && self.denoise_seen.as_ref() != Some(&status)
+            && t.seen.as_ref() != Some(&status)
         {
             if matches!(effect, EffectStatus::Failed(r) if r == reason) {
-                debug!("noise removal stopped with the effect: {reason}");
-                self.denoise_held = None;
-                self.denoise_seen = Some(status);
-                self.denoise_polled = true;
-                self.clear_denoise_failure();
+                debug!("{label} stopped with the effect: {reason}");
+                t.held = None;
+                t.seen = Some(status);
+                t.polled = true;
+                self.clear_stage_failure(id);
                 return;
             }
             if matches!(effect, EffectStatus::Loading | EffectStatus::Ready)
-                && self.denoise_held.as_ref() != Some(&status)
+                && t.held.as_ref() != Some(&status)
             {
-                self.denoise_held = Some(status);
+                t.held = Some(status);
                 return;
             }
         }
-        self.denoise_held = None;
-        if self.denoise_seen.as_ref() == Some(&status) {
+        t.held = None;
+        if t.seen.as_ref() == Some(&status) {
             return;
         }
-        self.denoise_seen = Some(status.clone());
-        let first = !std::mem::replace(&mut self.denoise_polled, true);
+        t.seen = Some(status.clone());
+        let first = !std::mem::replace(&mut t.polled, true);
         match status {
             EffectStatus::Off => {
                 if !first {
-                    info!("noise removal off");
+                    info!("{label} off");
                 }
-                self.clear_denoise_failure();
+                self.clear_stage_failure(id);
             }
-            EffectStatus::Loading => info!("noise removal: loading"),
+            EffectStatus::Loading => info!("{label}: loading"),
             EffectStatus::Ready => {
-                info!("noise removal ready");
-                self.clear_denoise_failure();
+                info!("{label} ready");
+                self.clear_stage_failure(id);
             }
             EffectStatus::Failed(reason) => {
-                let msg = denoise_failure_text(&reason);
+                let msg = stage_failure_text(id, &label, &reason);
                 warning!("{msg}");
-                self.denoise_failure = Some(msg);
+                self.track(id).failure = Some(msg);
                 self.show_standing_error();
             }
         }
     }
 
-    /// Ends a noise removal failure: its `Error` gives way to the causes
-    /// still standing.
-    fn clear_denoise_failure(&mut self) {
-        if let Some(old) = self.denoise_failure.take()
-            && self.error == old
-        {
-            self.error = self.standing_error();
-        }
-    }
-
-    /// Follows the relighting stage of the running session, `effect` being
-    /// the effect's status of the same report, exactly as
-    /// [`Self::poll_denoise`] follows noise removal: its failure never stops
-    /// the session, a failure with the effect's own reason is the whole
-    /// chain's, and one seen while the effect is loading or ready waits for
-    /// the next poll.
-    fn poll_relight(&mut self, status: EffectStatus, effect: &EffectStatus) {
-        if let EffectStatus::Failed(reason) = &status
-            && self.relight_seen.as_ref() != Some(&status)
-        {
-            if matches!(effect, EffectStatus::Failed(r) if r == reason) {
-                debug!("relighting stopped with the effect: {reason}");
-                self.relight_held = None;
-                self.relight_seen = Some(status);
-                self.relight_polled = true;
-                self.clear_relight_failure();
-                return;
-            }
-            if matches!(effect, EffectStatus::Loading | EffectStatus::Ready)
-                && self.relight_held.as_ref() != Some(&status)
-            {
-                self.relight_held = Some(status);
-                return;
-            }
-        }
-        self.relight_held = None;
-        if self.relight_seen.as_ref() == Some(&status) {
-            return;
-        }
-        self.relight_seen = Some(status.clone());
-        let first = !std::mem::replace(&mut self.relight_polled, true);
-        match status {
-            EffectStatus::Off => {
-                if !first {
-                    info!("relighting off");
-                }
-                self.clear_relight_failure();
-            }
-            EffectStatus::Loading => info!("relighting: loading"),
-            EffectStatus::Ready => {
-                info!("relighting ready");
-                self.clear_relight_failure();
-            }
-            EffectStatus::Failed(reason) => {
-                let msg = relight_failure_text(&reason);
-                warning!("{msg}");
-                self.relight_failure = Some(msg);
-                self.show_standing_error();
-            }
-        }
-    }
-
-    /// Ends a relighting failure: its `Error` gives way to the causes still
+    /// Ends stage `id`'s failure: its `Error` gives way to the causes still
     /// standing.
-    fn clear_relight_failure(&mut self) {
-        if let Some(old) = self.relight_failure.take()
+    fn clear_stage_failure(&mut self, id: &StageId) {
+        if let Some(old) = self.track(id).failure.take()
             && self.error == old
         {
             self.error = self.standing_error();
@@ -2384,6 +2512,7 @@ impl<B: MediaBackend> Controller<B> {
                 s.pinned = params.fixed_framerate;
                 s.enhance = params.effect.enhance;
             }
+            self.mark_running(&params.effect);
             match self.backend.switch_camera(&params, cam) {
                 Ok(()) => {
                     info!(
@@ -2457,13 +2586,15 @@ impl<B: MediaBackend> Controller<B> {
             self.set_fault("no camera is available".into());
             return;
         };
+        // Which module runs each stage is decided now, for the whole
+        // session.
+        self.plan = Some(self.modules.plan());
         // The effect is checked before the camera is opened: with
         // `on_failure = "black"`, one that cannot run is a fault and the
         // camera stays closed.
         let mut params = self.session_params();
         self.effect_failure = None;
-        self.denoise_failure = None;
-        self.relight_failure = None;
+        self.stages.clear();
         self.enhance_failure = None;
         self.enhance_seen = None;
         if params.effect.mode != EffectMode::None
@@ -2472,6 +2603,7 @@ impl<B: MediaBackend> Controller<B> {
             let msg = effect_failure_text(&params.effect, &reason);
             match params.effect.on_failure {
                 EffectOnFailure::Black => {
+                    self.plan = None;
                     self.set_fault(msg);
                     return;
                 }
@@ -2500,6 +2632,9 @@ impl<B: MediaBackend> Controller<B> {
         // changes (what is installed for this GPU, learnt once it is up)
         // are announced once, at the end of the step.
         self.publish_with(false);
+        // From here the modules' code runs: marked in the crash ledger
+        // until the session stops.
+        self.mark_running(&params.effect);
         if let Err(e) = self.backend.start_session(&params) {
             self.drop_session();
             self.set_fault(e);
@@ -2526,13 +2661,50 @@ impl<B: MediaBackend> Controller<B> {
         }
     }
 
-    /// Whether `effect` can run: `replace` has an image, and the backend
-    /// says the effect is available.
-    fn effect_check(&mut self, effect: &EffectConfig) -> Result<(), String> {
+    /// Before the session runs `effect` (started, given a camera or
+    /// changed): the crash ledger's markers of the modules whose code it
+    /// runs and that are not marked yet are set. A marker stays until the
+    /// session stops: a module that ran may keep its code loaded.
+    fn mark_running(&mut self, effect: &EffectRun) {
+        let Some(plan) = &self.plan else {
+            return;
+        };
+        let new: Vec<String> = plan
+            .running_ids(effect)
+            .into_iter()
+            .filter(|id| !self.marked.contains(id))
+            .collect();
+        self.modules.session_started(&new);
+        self.marked.extend(new);
+    }
+
+    /// Whether `effect` can run: `replace` has an image, a module can run
+    /// the `background` stage, and the backend says the effect is
+    /// available.
+    fn effect_check(&mut self, effect: &EffectRun) -> Result<(), String> {
         if effect.mode == EffectMode::Replace && effect.background_image.is_none() {
             return Err("the replace effect needs a background image".into());
         }
-        self.backend.effect_available(effect)
+        let plan = self.current_plan();
+        let Some(module) = &plan.effect else {
+            return Err(format!(
+                "no effect module provides the background effect ({})",
+                plan.effect_reason
+            ));
+        };
+        if let Some(why) = self
+            .modules
+            .stage_reason(&module.id, StageId::BACKGROUND.as_str())
+            && self.modules.is_enabled(&module.id)
+        {
+            return Err(format!("{}: {why}", self.modules.name_of(&module.id)));
+        }
+        // The backend's check runs the module's probe (which may open its
+        // own libraries): under the crash ledger's marker.
+        self.modules.probe_started(&module.id);
+        let res = self.backend.effect_available(effect, &plan.backends());
+        self.modules.probe_ended(&module.id);
+        res
     }
 
     /// Stops the session. An effect failure of that session (with
@@ -2544,27 +2716,21 @@ impl<B: MediaBackend> Controller<B> {
         if self.session.take().is_some() {
             self.backend.stop_session();
         }
+        // The modules' code stopped (cleanly: the daemon is still here).
+        self.plan = None;
+        let marked = std::mem::take(&mut self.marked);
+        self.modules.session_ended(&marked);
         self.next_stats = None;
         self.effect_seen = None;
         self.effect_polled = false;
-        self.denoise_seen = None;
-        self.denoise_polled = false;
-        self.denoise_held = None;
-        self.relight_seen = None;
-        self.relight_polled = false;
-        self.relight_held = None;
         self.effect_applied = None;
         self.effect_log_at = None;
         self.enhance_seen = None;
+        let stages = self.take_stage_failures();
+        self.stages.clear();
         let effect = self.effect_failure.take();
-        let denoise = self.denoise_failure.take();
-        let relight = self.relight_failure.take();
         let enhance = self.enhance_failure.take();
-        if [effect, denoise, relight, enhance]
-            .iter()
-            .flatten()
-            .any(|e| *e == self.error)
-        {
+        if stages || [effect, enhance].iter().flatten().any(|e| *e == self.error) {
             self.error = self.standing_error();
         }
     }
@@ -2904,6 +3070,7 @@ impl<B: MediaBackend> Controller<B> {
                 s.enhance = params.effect.enhance;
             }
             info!("switching to {}", cam.label());
+            self.mark_running(&params.effect);
             match self.backend.switch_camera(&params, &cam) {
                 Ok(()) => self.camera_opened(&cam),
                 Err(e) => {
@@ -3044,54 +3211,83 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     /// `SetDenoise`: noise removal on or off, before the effect (or alone
-    /// with `none`).
+    /// with `none`): the switch of the `denoise` stage (the setting
+    /// `effect.video.denoise` of revision 8). Kept whether or not a module
+    /// can run it now, as revision 8 kept it.
     fn set_denoise(&mut self, on: bool, now: Instant) -> Result<(), IpcError> {
-        info!("noise removal selected: {}", if on { "on" } else { "off" });
-        let changed = self.runtime.denoise.replace(on) != Some(on);
-        self.effect_changed(changed, now)
+        let entries = self.global_settings();
+        let (id, label) = entries
+            .iter()
+            .find(|e| e.binding == Binding::Enable(StageId::DENOISE))
+            .map_or_else(
+                || (legacy::DENOISE.to_string(), "Noise removal".to_string()),
+                |e| (e.setting.id.clone(), e.setting.label.clone()),
+            );
+        self.set_module_setting(
+            &id,
+            &label,
+            &Binding::Enable(StageId::DENOISE),
+            StoredValue::Bool(on),
+            now,
+        )
     }
 
-    /// A write of `effect.lighting.relight`: relighting on or off, after the
-    /// mask (or alone with `none`), applied as noise removal is.
-    fn set_relight(&mut self, on: bool, now: Instant) -> Result<(), IpcError> {
-        info!("relighting selected: {}", if on { "on" } else { "off" });
-        let changed = self.runtime.relight.replace(on) != Some(on);
-        self.effect_changed(changed, now)
-    }
-
-    /// A write of `effect.lighting.light`: the relighting light (a live
-    /// rebind of the running stage, no reload).
-    fn set_relight_light(&mut self, light: RelightLight, now: Instant) -> Result<(), IpcError> {
-        info!("relighting light: {light}");
-        let changed = self.runtime.relight_light.replace(light) != Some(light);
-        self.effect_changed(changed, now)
-    }
-
-    /// A write of `effect.lighting.direction`: where the relighting light
-    /// comes from, in degrees (a parameter of each frame, no reload).
-    fn set_relight_direction(&mut self, degrees: i32, now: Instant) -> Result<(), IpcError> {
-        // A slider sends many: not worth the journal.
-        debug!("relighting direction: {degrees}°");
-        let changed = self.runtime.relight_direction.replace(degrees) != Some(degrees);
-        self.frame_params_changed(changed, now)
-    }
-
-    /// A write of `effect.lighting.brightness`: how bright the relit person
-    /// is, in percent (a parameter of each frame, no reload).
-    fn set_relight_brightness(&mut self, percent: u32, now: Instant) -> Result<(), IpcError> {
-        debug!("relighting brightness: {percent}%");
-        let changed = self.runtime.relight_brightness.replace(percent) != Some(percent);
-        self.frame_params_changed(changed, now)
-    }
-
-    /// A write of `effect.video.enhance`: enhancement on or off, for the
-    /// ingest (no method of its own). Applied as the other effect settings
-    /// are ([`Self::effect_changed_with`]), an enhancement failure cleared
-    /// and retried.
-    fn set_enhance(&mut self, on: bool, now: Instant) -> Result<(), IpcError> {
-        info!("enhance selected: {}", if on { "on" } else { "off" });
-        let changed = self.runtime.enhance.replace(on) != Some(on);
-        self.effect_changed_with(changed, true, now)
+    /// A write of a module setting `id` (labelled `label`), checked: kept
+    /// in the state file by its id, then applied as its binding says. A
+    /// stage's switch is applied to the running session at once (the
+    /// enhance stage's by reopening the camera, [`Self::follow_enhance`]);
+    /// a `live` parameter is given to each frame (no reload, never a
+    /// retry); a `reload` parameter reloads the stage's chain; a `restart`
+    /// parameter, or a setting bound to no stage, takes effect at the next
+    /// session.
+    fn set_module_setting(
+        &mut self,
+        id: &str,
+        label: &str,
+        binding: &Binding,
+        value: StoredValue,
+        now: Instant,
+    ) -> Result<(), IpcError> {
+        let changed = self.runtime.settings.get(id) != Some(&value);
+        let what = label.to_lowercase();
+        match binding {
+            Binding::Enable(stage) => {
+                let on = if value == StoredValue::Bool(true) {
+                    "on"
+                } else {
+                    "off"
+                };
+                // The enhance stage's own words.
+                let what = if *stage == StageId::ENHANCE {
+                    "enhance"
+                } else {
+                    &what
+                };
+                info!("{what} selected: {on}");
+            }
+            // A slider sends many: not worth the journal.
+            Binding::Param(_, obc_module_host::settings::Apply::Live) => {
+                debug!("{what}: {value}");
+            }
+            _ => info!("{what}: {value}"),
+        }
+        self.runtime.settings.insert(id.to_string(), value);
+        match binding {
+            Binding::Enable(stage) => {
+                self.effect_changed_with(changed, *stage == StageId::ENHANCE, now)
+            }
+            Binding::Param(_, obc_module_host::settings::Apply::Live) => {
+                self.frame_params_changed(changed, now)
+            }
+            Binding::Param(_, obc_module_host::settings::Apply::Reload) => {
+                self.effect_changed(changed, now)
+            }
+            _ => {
+                let res = if changed { self.save_state() } else { Ok(()) };
+                self.reconcile(now);
+                res
+            }
+        }
     }
 
     /// The effect settings changed by a method: saved (unless `changed` is
@@ -3138,16 +3334,22 @@ impl<B: MediaBackend> Controller<B> {
             return self.apply_effect();
         };
         let run = self.effect_run();
-        let effect = EffectConfig {
-            blur_strength: run.blur_strength,
-            relight_direction: run.relight_direction,
-            relight_brightness: run.relight_brightness,
-            ..prev.clone()
-        };
+        let mut effect = prev.clone();
+        effect.blur_strength = run.blur_strength;
+        for s in effect
+            .stages
+            .iter_mut()
+            .chain(effect.chains.iter_mut().flat_map(|c| c.stages.iter_mut()))
+        {
+            if let Some(now) = run.stage(s.id.as_str()) {
+                s.live = now.live.clone();
+            }
+        }
         if effect == prev {
             return Ok(());
         }
         self.effect_applied = Some(effect.clone());
+        self.mark_running(&effect);
         let Err(reason) = self.backend.set_effect(&effect) else {
             return Ok(());
         };
@@ -3169,14 +3371,9 @@ impl<B: MediaBackend> Controller<B> {
         {
             self.error = self.standing_error();
         }
+        let stages = self.take_stage_failures();
         let effect = self.effect_failure.take();
-        let denoise = self.denoise_failure.take();
-        let relight = self.relight_failure.take();
-        if [effect, denoise, relight]
-            .iter()
-            .flatten()
-            .any(|e| *e == self.error)
-        {
+        if stages || effect.is_some_and(|e| e == self.error) {
             self.error = self.standing_error();
         }
         let retry = enhance && self.clear_enhance_failure();
@@ -3208,34 +3405,39 @@ impl<B: MediaBackend> Controller<B> {
     fn apply_effect(&mut self) -> Result<(), IpcError> {
         let effect = self.effect_run();
         let failed = matches!(self.effect_seen, Some(EffectStatus::Failed(_)));
-        let denoise_failed = matches!(self.denoise_seen, Some(EffectStatus::Failed(_)))
-            || self.denoise_held.is_some();
-        let relight_failed = matches!(self.relight_seen, Some(EffectStatus::Failed(_)))
-            || self.relight_held.is_some();
-        let prev = self.effect_applied.as_ref();
-        if !failed && !denoise_failed && !relight_failed && prev == Some(&effect) {
+        let prev = self.effect_applied.clone();
+        let all = |e: &EffectRun| -> Vec<StageRun> {
+            e.stages
+                .iter()
+                .chain(e.chains.iter().flat_map(|c| c.stages.iter()))
+                .cloned()
+                .collect()
+        };
+        let stages = all(&effect);
+        let any_failed = stages.iter().any(|s| self.stage_failed(&s.id));
+        if !failed && !any_failed && prev.as_ref() == Some(&effect) {
             return Ok(());
         }
         if failed
-            || prev.is_none_or(|p| {
+            || prev.as_ref().is_none_or(|p| {
                 p.mode != effect.mode || p.background_image != effect.background_image
             })
         {
             self.effect_seen = None;
         }
-        if denoise_failed || prev.is_none_or(|p| p.denoise != effect.denoise) {
-            self.denoise_seen = None;
-            self.denoise_held = None;
-        }
-        if relight_failed
-            || prev.is_none_or(|p| {
-                p.relight != effect.relight || p.relight_light != effect.relight_light
-            })
-        {
-            self.relight_seen = None;
-            self.relight_held = None;
+        // A stage turned on or off, given new load-time parameters (a new
+        // light), or failed, is followed from its load.
+        for s in &stages {
+            let before = prev.as_ref().and_then(|p| p.stage(s.id.as_str()));
+            let renewed = before.is_none_or(|b| b.enabled != s.enabled || b.params != s.params);
+            if self.stage_failed(&s.id) || renewed {
+                let t = self.track(&s.id);
+                t.seen = None;
+                t.held = None;
+            }
         }
         self.effect_applied = Some(effect.clone());
+        self.mark_running(&effect);
         let Err(reason) = self.backend.set_effect(&effect) else {
             return Ok(());
         };
@@ -3245,11 +3447,11 @@ impl<B: MediaBackend> Controller<B> {
     /// The session refused `effect` for `reason`: an effect failure
     /// ([`Self::effect_failed`]); with `on_failure = "none"` it streams on
     /// without the effect. The error the method answers.
-    fn effect_refused(&mut self, effect: EffectConfig, reason: &str) -> IpcError {
+    fn effect_refused(&mut self, effect: EffectRun, reason: &str) -> IpcError {
         let msg = effect_failure_text(&effect, reason);
         if !self.effect_failed(reason) {
             // Streaming on without the effect, as `none` says.
-            let off = EffectConfig {
+            let off = EffectRun {
                 mode: EffectMode::None,
                 ..effect
             };
@@ -3347,6 +3549,7 @@ impl<B: MediaBackend> Controller<B> {
             s.pinned = params.fixed_framerate;
             s.enhance = params.effect.enhance;
         }
+        self.mark_running(&params.effect);
         match self.backend.switch_camera(&params, cam) {
             Ok(()) => {
                 self.camera_opened(cam);
@@ -4062,10 +4265,9 @@ impl<B: MediaBackend> Controller<B> {
 
     /// `SetSetting` on a global setting (the camera option is ignored):
     /// validated against the tree as it is now (unknown, disabled, invalid),
-    /// then exactly the existing setter (`SetEffect`, `SetBlurStrength` or
-    /// `SetDenoise`, or the relighting and enhancement setters, which have
-    /// no method of their own), with its checks, errors, saving and
-    /// publishing. Not a device write: neither held by the coalescing
+    /// then exactly the existing setter (`SetEffect` or `SetBlurStrength`,
+    /// or the module setting's, [`Self::set_module_setting`]), with its
+    /// checks, errors, saving and publishing. Not a device write: neither held by the coalescing
     /// window nor counted in the cap; the blur strength and the relighting
     /// direction and brightness are parameters the effect reads at each
     /// frame, so a stream of values costs no reload.
@@ -4079,12 +4281,12 @@ impl<B: MediaBackend> Controller<B> {
         match effects::check(&entries, id, value).map_err(refusal_error)? {
             Write::Mode(mode) => self.set_effect(mode.as_str(), now),
             Write::BlurStrength(v) => self.set_blur_strength(v, now),
-            Write::Denoise(on) => self.set_denoise(on, now),
-            Write::Enhance(on) => self.set_enhance(on, now),
-            Write::Relight(on) => self.set_relight(on, now),
-            Write::Light(light) => self.set_relight_light(light, now),
-            Write::Direction(degrees) => self.set_relight_direction(degrees, now),
-            Write::Brightness(percent) => self.set_relight_brightness(percent, now),
+            Write::Setting {
+                id,
+                label,
+                binding,
+                value,
+            } => self.set_module_setting(&id, &label, &binding, value, now),
         }
     }
 
@@ -4094,28 +4296,144 @@ impl<B: MediaBackend> Controller<B> {
     /// session, as an effect method does (saved, a fault or effect failure
     /// cleared). `None` when the scope is not global.
     fn reset_global(&mut self, what: &ResetWhat, now: Instant) -> Option<Result<(), IpcError>> {
-        let keys = match what {
-            ResetWhat::Group(g) if effects::is_global_group(g) => Key::of_group(g),
-            ResetWhat::Setting(id) if effects::is_global(id) => match Key::of(id) {
-                Some(k) => vec![k],
-                None => {
+        let entries = self.global_settings();
+        let ids: Vec<String> = match what {
+            ResetWhat::Group(g) if entries.iter().any(|e| e.group == *g) => entries
+                .iter()
+                .filter(|e| e.group == *g)
+                .map(|e| e.setting.id.clone())
+                .collect(),
+            ResetWhat::Setting(id) if effects::is_global(id) => {
+                if !entries.iter().any(|e| e.setting.id == *id)
+                    && !self.runtime.settings.contains_key(id)
+                {
                     return Some(Err(IpcError::UnknownSetting(format!(
                         "there is no setting {id:?}"
                     ))));
                 }
-            },
+                vec![id.clone()]
+            }
             _ => return None,
         };
         let mut changed = false;
-        for k in &keys {
-            changed |= k.forget(&mut self.runtime);
+        for id in &ids {
+            changed |= effects::forget(&mut self.runtime, id);
         }
-        info!(
-            "{} reset to the configuration's value",
-            keys.iter().map(|k| k.id()).collect::<Vec<_>>().join(", ")
-        );
-        let enhance = keys.contains(&Key::Enhance);
+        info!("{} reset to the configuration's value", ids.join(", "));
+        let enhance = entries
+            .iter()
+            .any(|e| ids.contains(&e.setting.id) && e.binding == Binding::Enable(StageId::ENHANCE));
         Some(self.effect_changed_with(changed, enhance, now))
+    }
+
+    // ---- modules ----
+
+    /// The stage order in force, by id.
+    #[cfg(test)]
+    pub(crate) fn order_ids(&self) -> Vec<String> {
+        self.modules.order().iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `GetModules`.
+    fn module_list(&self) -> obc_ipc::ModuleList {
+        obc_ipc::ModuleList {
+            serial: self.modules.serial(),
+            modules: self.modules.info(),
+        }
+    }
+
+    /// The modules' choices changed: saved, published (the settings tree
+    /// follows the modules enabled), applied at the next session.
+    fn modules_changed(&mut self, changed: bool, now: Instant) -> Result<(), IpcError> {
+        let res = if changed { self.save_state() } else { Ok(()) };
+        if self.session.is_some() && changed {
+            info!("the module change applies when the camera next starts");
+        }
+        self.reconcile(now);
+        res
+    }
+
+    /// `SetModuleEnabled`: kept in the state file, over the config's
+    /// `[modules] disabled`. An enabled module is opened now (its settings
+    /// appear); a running session keeps the modules it started with.
+    fn set_module_enabled(&mut self, id: &str, on: bool, now: Instant) -> Result<(), IpcError> {
+        if !self.modules.installed(id) {
+            return Err(IpcError::InvalidArgument(format!(
+                "No module {id} is installed"
+            )));
+        }
+        // The registry first: the runtime choice changes only once it took.
+        let res = self
+            .modules
+            .set_enabled(&mut self.backend, &self.config, &self.runtime, id, on);
+        if let Err(e) = res {
+            return Err(IpcError::Failed(e));
+        }
+        let before = self.runtime.modules.enabled.insert(id.to_string(), on);
+        info!("module {id} {}", if on { "enabled" } else { "disabled" });
+        self.modules_changed(before != Some(on), now)
+    }
+
+    /// `SetStageOrder`: checked against the stages the enabled modules
+    /// offer (the reason when it is not valid); an empty list is the
+    /// default order.
+    fn set_stage_order(&mut self, order: Vec<String>, now: Instant) -> Result<(), IpcError> {
+        let new = if order.is_empty() {
+            None
+        } else {
+            self.modules
+                .validate_order(&order)
+                .map_err(IpcError::InvalidArgument)?;
+            Some(order)
+        };
+        match &new {
+            Some(o) => info!("stage order: {}", o.join(", ")),
+            None => info!("stage order: the default"),
+        }
+        let changed = self.runtime.modules.order != new;
+        self.runtime.modules.order = new;
+        self.modules.apply_choices(&self.config, &self.runtime);
+        self.modules_changed(changed, now)
+    }
+
+    /// `SetBackendProfile`: `quality` or `battery`.
+    fn set_backend_profile(&mut self, profile: &str, now: Instant) -> Result<(), IpcError> {
+        let p: BackendProfile = profile.parse().map_err(IpcError::InvalidArgument)?;
+        info!("backend profile: {p}");
+        let changed = self.runtime.modules.profile != Some(p);
+        self.runtime.modules.profile = Some(p);
+        self.modules.apply_choices(&self.config, &self.runtime);
+        self.modules_changed(changed, now)
+    }
+
+    /// `SetStagePin`: module `module` provides `stage` while it can (`""`:
+    /// no pin; the profile decides).
+    fn set_stage_pin(&mut self, stage: &str, module: &str, now: Instant) -> Result<(), IpcError> {
+        if !obc_core::modules::valid_stage_id(stage) {
+            return Err(IpcError::InvalidArgument(
+                obc_core::modules::not_a_stage_id(stage),
+            ));
+        }
+        if !module.is_empty() && !self.modules.installed(module) {
+            return Err(IpcError::InvalidArgument(format!(
+                "No module {module} is installed"
+            )));
+        }
+        let before = self.runtime.modules.pins(&self.config.modules);
+        if module.is_empty() {
+            info!("stage {stage}: not pinned");
+            if self.config.modules.pin.contains_key(stage) {
+                self.runtime.modules.pin.insert(stage.into(), String::new());
+            } else {
+                self.runtime.modules.pin.remove(stage);
+            }
+        } else {
+            info!("stage {stage}: pinned to {module}");
+            self.runtime.modules.pin.insert(stage.into(), module.into());
+        }
+        let changed = before != self.runtime.modules.pins(&self.config.modules);
+        self.modules.apply_choices(&self.config, &self.runtime);
+        self.modules_changed(changed, now)
     }
 
     /// The last read of `camera` (the one the published tree is built
@@ -4630,12 +4948,11 @@ impl<B: MediaBackend> Controller<B> {
 
     fn apply_config(&mut self, new: Config, now: Instant) {
         let old = std::mem::replace(&mut self.config, new);
-        obc_pipeline::effect::set_maxine_root(self.config.effect.maxine_root.clone());
         if let Some(note) = maxine_root_note(
             Some(old.effect.maxine_root.as_deref()),
             self.config.effect.maxine_root.as_deref(),
-            obc_pipeline::effect::maxine_root_env().as_deref(),
-            obc_pipeline::effect::maxine_root_conflict(),
+            maxine_root_env().as_deref(),
+            None,
             self.session.is_some(),
         ) {
             warning!("{note}");
@@ -4651,8 +4968,9 @@ impl<B: MediaBackend> Controller<B> {
         );
         self.fault = None;
         self.effect_failure = None;
-        self.denoise_failure = None;
-        self.relight_failure = None;
+        for (_, t) in &mut self.stages {
+            t.failure = None;
+        }
         // A failed enhance stage is tried again (below), as a failed effect
         // is.
         let mut enhance_retry = self.enhance_failure.take().is_some();
@@ -4660,8 +4978,18 @@ impl<B: MediaBackend> Controller<B> {
         // Only the errors whose cause is gone are cleared: a missing
         // writer or a damaged state file still stands.
         self.error = self.standing_error();
-        // The SDK root may have changed, or a feature been installed.
-        self.refresh_features();
+        // The modules (and their configuration, the SDK root among it) may
+        // have changed, or a feature been installed: found and opened again.
+        // A running session keeps the modules it started with.
+        self.modules.reload(
+            &mut self.backend,
+            &self.config,
+            &self.runtime,
+            self.compute_capability,
+        );
+        if self.session.is_some() {
+            self.follow_stages();
+        }
         // The effect in force may have changed (or failed before): applied
         // again, which retries a failed effect.
         if self.session.is_some() {
@@ -4722,6 +5050,14 @@ fn unreadable_names(scan: &ControlScan) -> impl Iterator<Item = String> + '_ {
         .iter()
         .filter(|c| matches!(c.value, CtrlValue::Unreadable { .. }))
         .map(|c| c.name.clone())
+}
+
+/// `MAXINE_VFX_ROOT`, when set and non-empty: it takes precedence over
+/// `[effect] maxine_root` (the Maxine module reads it).
+fn maxine_root_env() -> Option<PathBuf> {
+    std::env::var_os("MAXINE_VFX_ROOT")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 /// What to log, as a warning, about `[effect] maxine_root` (`new`) at start

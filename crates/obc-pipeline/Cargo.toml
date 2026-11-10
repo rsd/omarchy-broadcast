@@ -18,10 +18,11 @@ libc = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 nvml-wrapper = { workspace = true }
-# The Process stage's effect element and its default backend (ADR-0012).
+# The Process stage's effect element and the backend seams (ADR-0012).
 gst-obc = { workspace = true }
 obc-backend = { workspace = true }
-obc-backend-maxine = { workspace = true }
+# obc-bench loads its effect backends as the daemon does: from modules.
+obc-module-host = { workspace = true }
 # Bin-only (obc-bench); kept as plain deps to avoid a separate crate for a dev tool.
 anyhow = { workspace = true }
 clap = { workspace = true }
@@ -33,6 +34,8 @@ pipewire = { workspace = true, optional = true }
 pipewire = ["dep:pipewire"]
 
 [dev-dependencies]
+# The GPU tests run the Maxine backends directly, as its module does.
+obc-backend-maxine = { workspace = true }
 # The fake effect backend of the GPU tests writes frames with it.
 obc-gpu = { workspace = true }
 tempfile = { workspace = true }

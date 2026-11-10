@@ -1,0 +1,50 @@
+# The manifest of the NVIDIA Maxine video effects module. It is installed in
+# /usr/lib/omarchy-broadcast/modules.d with the library; the module needs
+# the NVIDIA Maxine Video Effects SDK at run time (see its documentation).
+abi = 1
+id = "br.com.dias.maxine-vfx"
+name = "NVIDIA Maxine video effects"
+version = "0.24.0"
+licence = "MIT OR Apache-2.0 (module); NVIDIA Maxine SDK under its own licence"
+kind = "video-stage"
+library = "/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so"
+description = "Background blur and replacement, noise removal, relighting and low-resolution enhancement on NVIDIA GPUs"
+
+[requires]
+hardware = ["nvidia-turing+"]
+
+# Upscales a low-resolution camera in the ingest, before anything else.
+[[stage]]
+id = "enhance"
+slot = "pre-matte"
+rank = 300
+device = "nvidia-gpu"
+position = 0
+frames = ["cuda"]
+formats = ["nv12", "i420"]
+
+[[stage]]
+id = "denoise"
+slot = "pre-matte"
+rank = 300
+device = "nvidia-gpu"
+frames = ["cuda"]
+formats = ["nv12"]
+
+# The cut-out, with the blur or replacement of the background.
+[[stage]]
+id = "background"
+slot = "matte"
+rank = 300
+device = "nvidia-gpu"
+frames = ["cuda"]
+formats = ["nv12"]
+
+[[stage]]
+id = "relight"
+slot = "post-matte"
+rank = 300
+device = "nvidia-gpu"
+requires = ["matte"]
+frames = ["cuda"]
+formats = ["nv12"]

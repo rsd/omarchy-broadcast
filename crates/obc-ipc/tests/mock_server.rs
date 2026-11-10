@@ -18,6 +18,7 @@ use obc_ipc::{
     SETTINGS_REVISION, Setting, SettingChange, SettingKind, SettingValue, SettingsGroup,
     SettingsTree, Snapshot, State, Stats,
 };
+use obc_ipc::{ModuleInfo, ModuleList, StageInfo};
 use zbus::message::Flags;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
 use zbus::proxy::CacheProperties;
@@ -48,6 +49,12 @@ struct Mock {
     settings: Vec<SettingsGroup>,
     settings_revision: u32,
     settings_serial: u32,
+    /// The modules (revision 9), with `ModulesSerial`, the stage order and
+    /// the profile.
+    modules: Vec<ModuleInfo>,
+    modules_serial: u32,
+    order: Vec<String>,
+    profile: String,
 }
 
 /// The setting the mock always answers `RateLimited` for.
@@ -213,6 +220,25 @@ impl Mock {
             settings: mock_settings(),
             settings_revision: 1,
             settings_serial: 1,
+            modules: vec![ModuleInfo {
+                id: "org.example.hello".into(),
+                name: "Hello tint".into(),
+                enabled: true,
+                status: "available".into(),
+                stages: vec![StageInfo {
+                    id: "hello".into(),
+                    slot: "post-composite".into(),
+                    rank: 100,
+                    device: "cpu".into(),
+                    available: true,
+                    selected: true,
+                    ..StageInfo::default()
+                }],
+                ..ModuleInfo::default()
+            }],
+            modules_serial: 1,
+            order: vec!["hello".into()],
+            profile: "quality".into(),
         }
     }
 
@@ -404,6 +430,63 @@ impl Mock {
     ) -> Result<(), IpcError> {
         self.denoise = denoise;
         self.denoise_changed(&emitter).await?;
+        Ok(())
+    }
+
+    async fn get_modules(&self) -> (u32, Vec<VariantDict>) {
+        ModuleList {
+            serial: self.modules_serial,
+            modules: self.modules.clone(),
+        }
+        .to_wire()
+    }
+
+    async fn set_module_enabled(
+        &mut self,
+        id: String,
+        enabled: bool,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        let m = self
+            .modules
+            .iter_mut()
+            .find(|m| m.id == id)
+            .ok_or_else(|| IpcError::InvalidArgument(format!("No module {id} is installed")))?;
+        m.enabled = enabled;
+        self.modules_serial += 1;
+        self.modules_serial_changed(&emitter).await?;
+        Ok(())
+    }
+
+    async fn get_stage_order(&self) -> Vec<String> {
+        self.order.clone()
+    }
+
+    async fn set_stage_order(&mut self, order: Vec<String>) -> Result<(), IpcError> {
+        if order != ["hello"] && !order.is_empty() {
+            return Err(IpcError::InvalidArgument(format!(
+                "The order leaves out hello or names another stage: {order:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn set_backend_profile(
+        &mut self,
+        profile: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        if profile != "quality" && profile != "battery" {
+            return Err(IpcError::InvalidArgument(format!(
+                "unknown profile {profile:?}"
+            )));
+        }
+        self.profile = profile;
+        self.backend_profile_changed(&emitter).await?;
+        Ok(())
+    }
+
+    async fn set_stage_pin(&mut self, _stage: String, _module: String) -> Result<(), IpcError> {
         Ok(())
     }
 
@@ -695,6 +778,16 @@ impl Mock {
     }
 
     #[zbus(property)]
+    fn modules_serial(&self) -> u32 {
+        self.modules_serial
+    }
+
+    #[zbus(property)]
+    fn backend_profile(&self) -> String {
+        self.profile.clone()
+    }
+
+    #[zbus(property)]
     fn interface_revision(&self) -> u32 {
         INTERFACE_REVISION
     }
@@ -867,10 +960,12 @@ async fn proxy_reads_every_property() {
             }),
             settings_revision: Some(1),
             settings_schema_serial: Some(1),
+            modules_serial: Some(1),
+            backend_profile: Some("quality".into()),
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 8);
+    assert_eq!(INTERFACE_REVISION, 9);
     assert_eq!(proxy.inner().interface().as_str(), INTERFACE);
 }
 
@@ -1793,4 +1888,49 @@ async fn a_revision_6_daemon_has_no_settings() {
             .await
             .is_ok()
     );
+}
+
+/// The module members of revision 9 through the proxy: the typed list, an
+/// enable with its `ModulesSerial` change, the order and its refusal, the
+/// profile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_module_members_round_trip() {
+    let (_server, client) = pair().await;
+    let proxy = OmarchyBroadcastProxy::new(&client).await.unwrap();
+    let list = within("modules", proxy.module_list()).await.unwrap();
+    assert_eq!(list.serial, 1);
+    assert_eq!(list.provider_of("hello").unwrap().id, "org.example.hello");
+    let list = within("modules", proxy.module_list_no_autostart())
+        .await
+        .unwrap();
+    assert_eq!(list.modules.len(), 1);
+    within(
+        "enable",
+        proxy.set_module_enabled("org.example.hello", false),
+    )
+    .await
+    .unwrap();
+    let list = within("modules", proxy.module_list()).await.unwrap();
+    assert_eq!(list.serial, 2);
+    assert!(!list.modules[0].enabled);
+    let e = within("enable", proxy.set_module_enabled("org.x.none", true))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, IpcError::InvalidArgument(_)), "{e:?}");
+    assert_eq!(
+        within("order", proxy.get_stage_order()).await.unwrap(),
+        ["hello"]
+    );
+    within("order", proxy.set_stage_order(&[])).await.unwrap();
+    let e = within("order", proxy.set_stage_order(&["denoise"]))
+        .await
+        .unwrap_err();
+    assert!(e.message().contains("leaves out"), "{e:?}");
+    within("profile", proxy.set_backend_profile("battery"))
+        .await
+        .unwrap();
+    assert_eq!(proxy.backend_profile().await.unwrap(), "battery");
+    within("pin", proxy.set_stage_pin("hello", ""))
+        .await
+        .unwrap();
 }
