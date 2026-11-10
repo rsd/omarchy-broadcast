@@ -35,7 +35,7 @@ pub(crate) const NVCV_ERR_PARAMETER: NvCvStatus = -7;
 pub(crate) const NVCV_ERR_RESOLUTION: NvCvStatus = -16;
 /// "No kernel image is available for the device". From `NvVFX_Load` on an
 /// unlisted distribution this is the SDK's `/etc/os-release` check, not a
-/// CUDA problem (`docs/setup/maxine.md`, section 7).
+/// CUDA problem (`docs/setup/maxine.md`, section 3).
 pub(crate) const NVCV_ERR_CUDA_KERNEL: NvCvStatus = -1209;
 
 // `NvCVImage_PixelFormat` values.
@@ -267,7 +267,7 @@ fn open_one(root: Option<&Path>, name: &str) -> Result<Library, String> {
                 format!(
                     "{} could not be loaded: {e}. The SDK's bundled CUDA, TensorRT and feature \
                      libraries must be on LD_LIBRARY_PATH when the process starts \
-                     (docs/setup/maxine.md, section 8)",
+                     (docs/setup/maxine.md, section 4)",
                     path.display()
                 )
             });
@@ -276,17 +276,21 @@ fn open_one(root: Option<&Path>, name: &str) -> Result<Library, String> {
     // SAFETY: as above, for the library found on the search path.
     unsafe { Library::new(name) }.map_err(|e| match root {
         Some(root) => format!(
-            "the NVIDIA Maxine Video Effects SDK was not found: no {name} in {} \
-             (MAXINE_VFX_ROOT={} looks wrong) and none on the library search path ({e}). \
-             Set MAXINE_VFX_ROOT to the SDK directory that contains lib/, features/ and \
-             external/ (docs/setup/maxine.md)",
+            "the NVIDIA Maxine Video Effects SDK was not found: no {name} in {} and none on \
+             the library search path ({e}). The SDK root {} (MAXINE_VFX_ROOT, or {} when \
+             that is unset) must be the SDK directory that contains lib/, features/ and \
+             external/: reinstall the maxine-vfx-sdk-local package or set MAXINE_VFX_ROOT \
+             to that directory (docs/setup/maxine.md, section 4)",
             root.join("lib").display(),
-            root.display()
+            root.display(),
+            crate::DEFAULT_ROOT
         ),
         None => format!(
-            "the NVIDIA Maxine Video Effects SDK was not found: MAXINE_VFX_ROOT is not set and \
-             {name} is not on the library search path ({e}). Install the SDK and set \
-             MAXINE_VFX_ROOT to its directory (docs/setup/maxine.md)"
+            "the NVIDIA Maxine Video Effects SDK was not found: MAXINE_VFX_ROOT is unset or \
+             empty, {} is not a directory and {name} is not on the library search path ({e}). \
+             Install the maxine-vfx-sdk-local package (built from omarchy-nvidia-sdks) or set \
+             MAXINE_VFX_ROOT to the SDK directory (docs/setup/maxine.md, sections 2 and 5)",
+            crate::DEFAULT_ROOT
         ),
     })
 }

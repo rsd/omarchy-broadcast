@@ -34,8 +34,8 @@
 //! * The effect tests: `gpu_an_output_switches_effects_while_streaming`
 //!   uses the fake backend of `gst-obc/tests/support/fake_backend.rs` (GPU
 //!   only); `maxine_*` needs `OBC_TEST_CAMERA` and the NVIDIA Maxine SDK
-//!   (`MAXINE_VFX_ROOT`, `source tools/maxine-probe/env.sh`) run under the
-//!   os-release override (`docs/setup/maxine.md`, section 7).
+//!   (the environment file of the `maxine-vfx-sdk-local` package loaded)
+//!   run under the os-release override (`docs/setup/maxine.md`, section 3).
 //!
 //! Check `fuser -v /dev/video*` first. Examples:
 //! `cargo test -p obc-pipeline --test hardware -- --ignored gpu_ --test-threads=1` (GPU only);
@@ -3172,12 +3172,14 @@ fn cuda_apps() -> Vec<(u32, u64)> {
 /// are sane, and after the output stops this process holds no CUDA context
 /// (so its GPU memory is back).
 ///
-/// Run with the SDK set up and the os-release shim (`make -C
-/// tools/os-release-shim`), e.g. `source tools/maxine-probe/env.sh;
-/// OMARCHY_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release
-/// CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env
-/// LD_PRELOAD=$PWD/target/os-release-shim/os-release-shim.so" cargo test -p
-/// obc-pipeline --test hardware -- --ignored maxine_ --test-threads=1`.
+/// Run with the `maxine-vfx-sdk-local` package installed and its os-release
+/// shim preloaded, e.g. `set -a; . /usr/share/maxine-vfx/maxine-vfx.env;
+/// set +a; CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env
+/// LD_PRELOAD=$MAXINE_VFX_OS_RELEASE_SHIM" cargo test -p obc-pipeline --test
+/// hardware -- --ignored maxine_ --test-threads=1`. With the package,
+/// `MAXINE_VFX_ROOT` may be left unset (its tree is the default root); for
+/// an SDK tree without it, set `MAXINE_VFX_ROOT`, `LD_LIBRARY_PATH` and
+/// `MAXINE_OS_RELEASE` as omarchy-nvidia-sdks `docs/usage.md` describes.
 #[test]
 #[ignore = "needs OBC_TEST_CAMERA, an NVIDIA GPU and the NVIDIA Maxine VFX SDK with the os-release override"]
 fn maxine_effects_end_to_end_keep_the_rate_and_release_the_gpu() {
@@ -3185,8 +3187,9 @@ fn maxine_effects_end_to_end_keep_the_rate_and_release_the_gpu() {
     let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
     if let Err(reason) = obc_pipeline::effect_backend_available() {
         panic!(
-            "this test needs the Maxine SDK: {reason} (set MAXINE_VFX_ROOT and source \
-             tools/maxine-probe/env.sh)"
+            "this test needs the Maxine SDK: {reason} (load the environment of the \
+             maxine-vfx-sdk-local package: set -a; . /usr/share/maxine-vfx/maxine-vfx.env; \
+             set +a)"
         );
     }
     let sel = test_camera();

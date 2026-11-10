@@ -1,233 +1,69 @@
-# Setting up NVIDIA Maxine Video Effects SDK on Arch Linux / Omarchy
+# Using the NVIDIA Maxine Video Effects SDK with omarchy-broadcast
 
-Goal: a user-prefix install of the Maxine VFX SDK 1.3.0.0 (Linux) at `$MAXINE_VFX_ROOT`, with the AI green screen (AIGS), background blur and video noise removal (denoising) features, ready for `omarchy-broadcast`. The examples use `~/.local/opt/maxine/VideoFX` as the default value. No `sudo` is needed and nothing is written to `/usr`, `/opt` or `/etc`.
+The video effects `blur` and `replace`, and video noise removal, run on the NVIDIA Maxine Video Effects SDK. omarchy-broadcast does not contain, build or download the SDK. The SDK is a personal download from NVIDIA, and the sibling project omarchy-nvidia-sdks (the omarchy-nvidia-sdks repository) packages it for Arch as `maxine-vfx-sdk-local`. This page covers the omarchy-broadcast side: which parts of the SDK are needed, how to enable the daemon's drop-in, what the daemon reads from its environment and how to fix the failures that are specific to omarchy-broadcast.
 
-Background: [../research/maxine-linux.md](../research/maxine-linux.md) (access, licence, API). The SDK is never vendored in this repository, see [ADR-0003](../adr/0003-maxine-first-behind-backend-seam.md).
+Without the SDK the daemon works as usual: the `none` effect and the passthrough need nothing from it, and an effect or noise removal that cannot load reports the reason in the daemon's `Error` property.
 
-Steps marked **Manual** need your NVIDIA credentials and cannot be scripted. Everything else is copy-paste.
+Background: [../research/maxine-linux.md](../research/maxine-linux.md) (access, licence, API). The SDK is never vendored in this repository, see [ADR-0003](../adr/0003-maxine-first-behind-backend-seam.md). The decision to leave the SDK tooling to omarchy-nvidia-sdks is in [ADR-0021](../adr/0021-nvidia-sdk-handover.md).
 
-Choose the install root once; the later steps use these variables:
-
-```bash
-export MAXINE_VFX_ROOT=~/.local/opt/maxine/VideoFX   # the SDK root (contains lib/, features/, external/)
-PREFIX=$(dirname "$MAXINE_VFX_ROOT")                 # holds VideoFX/ and env.sh
-```
-
-## Prerequisites
+## 1. Requirements
 
 | Item | Requirement | Check |
 |---|---|---|
 | GPU | NVIDIA, compute capability 7.5 or newer (Turing and up). Tested on the reference machine: RTX 5080 Laptop, CC 12.0 (sm_120) | `nvidia-smi --query-gpu=name,compute_cap --format=csv` |
 | Driver | 570.26 or newer. Tested: 615.78.08. The mask-hardening kernel ([ADR-0013](../adr/0013-mask-hardening-cuda-kernel.md)) does not raise this floor or the GPU floor | `nvidia-smi --query-gpu=driver_version --format=csv,noheader` |
-| System CUDA toolkit | Not needed. The SDK bundles CUDA 12.8, cuDNN 9.7.1 and TensorRT 10.9 and only takes `libcuda.so.1` from the driver (`nvidia-utils`) | |
-| Tools | `curl`, `unzip`, `jq`, `gcc` (also builds the os-release shim in step 7), `make` | `pacman -S --needed curl unzip jq gcc make` |
-| Disk | About 4.5 GB for the final install. Peak about 8 GB while the downloads (2.7 GB) and the extracted tree coexist | `df -h ~` |
+| System CUDA toolkit | Not needed for the SDK: it bundles CUDA 12.8, cuDNN 9.7.1 and TensorRT 10.9 and only takes `libcuda.so.1` from the driver (`nvidia-utils`) | |
+| SDK features | One SDK package that contains the features below, with the models for your GPU architecture | `MAXINE_VFX_FEATURES` in `/usr/share/maxine-vfx/maxine-vfx.env` |
 
-## 1. NVIDIA account and access (Manual)
+Which effect needs which feature:
 
-A plain NGC account is not enough. An NVIDIA Developer Program account (free membership) is enough; NVIDIA AI Enterprise is not required.
-
-1. Create or log in to an NVIDIA Developer Program account. Use this one account for NGC, the Developer Program and the API key in step 2.
-2. Open https://catalog.ngc.nvidia.com/orgs/nvidia/maxine/resources/vfx_sdk_core ("NVIDIA Video Effects SDK Core"), log in.
-3. Under "NVIDIA Developer Program" click **Get Access** and accept the terms.
-
-The API key in step 2 must come from the account and org that holds this access, otherwise downloads fail with 403/402 (see troubleshooting).
-
-## 2. Personal API key (Manual)
-
-1. Open https://org.ngc.nvidia.com/setup/personal-keys and click **Generate Personal Key**.
-2. Include the **NGC Catalog** service. Choose an expiry you are comfortable with.
-3. Copy the key (`nvapi-...`) immediately; it is shown once. Keep it out of the repo and out of shell history; you will paste it into `ngc config set` in step 3.
-
-## 3. NGC CLI
-
-Arch has no package for it. Install the official zip from NGC's public API into the user prefix. Pin the version in `NGC_VER` (4.36.6 was used when this was written; the newest is the first entry of the version list).
-
-```bash
-# newest published version (4.36.6 when this was written)
-curl -s https://api.ngc.nvidia.com/v2/resources/nvidia/ngc-apps/ngc_cli/versions | jq -r '.recipeVersions[0].versionId'
-
-NGC_VER=4.36.6
-D=$(mktemp -d) && cd "$D"
-curl -L -o ngccli_linux.zip \
-  "https://api.ngc.nvidia.com/v2/resources/nvidia/ngc-apps/ngc_cli/versions/$NGC_VER/files/ngccli_linux.zip"
-unzip -q ngccli_linux.zip                      # -> ngc-cli/  and  ngc-cli.md5
-
-# integrity check: the two hashes must be identical
-find ngc-cli/ -type f -exec md5sum {} + | LC_ALL=C sort | md5sum
-cat ngc-cli.md5
-
-mkdir -p ~/.local/opt ~/.local/bin
-mv ngc-cli ~/.local/opt/ngc-cli
-ln -sf ~/.local/opt/ngc-cli/ngc ~/.local/bin/ngc
-cd ~ && rm -rf "$D"
-ngc --version                                  # NGC CLI 4.36.6
-```
-
-`~/.local/bin` must be on `PATH` (it is on Omarchy).
-
-### Configure (Manual)
-
-```bash
-ngc config set
-```
-
-Answer the prompts interactively so the key never ends up in a script, a log or shell history:
-
-- API key: paste the `nvapi-...` key from step 2.
-- CLI output format: `ascii`.
-- org: the org of the account that has the Developer Program access (the prompt lists the orgs your key can see).
-- team and ace: press Enter to accept the defaults.
-
-The key is stored in `~/.ngc/config`. Check access (read-only):
-
-```bash
-ngc registry resource list "nvidia/maxine/vfx_sdk_core:*"
-```
-
-You should see a table of versions (`1.3.0.0_linux`, `1.3.0.0_woa`, ...). An authorization error means the key or org is wrong, see troubleshooting.
-
-## 4. Download the core SDK
-
-Tags carry a platform suffix. Use `_linux`. `_woa` is Windows on ARM and is not usable (it was the newest-looking entry on the catalog page). Linux 1.3.0.0 is 2.63 GB and holds `VFXSDK_linux_1.3.0.0.tgz` (the one needed) and a Triton gRPC-client variant (not needed).
-
-```bash
-ngc registry resource list "nvidia/maxine/vfx_sdk_core:*"      # confirm the tag
-mkdir -p ~/Downloads/maxine
-ngc registry resource download-version "nvidia/maxine/vfx_sdk_core:1.3.0.0_linux" --dest ~/Downloads/maxine
-ls -lh ~/Downloads/maxine/vfx_sdk_core_v1.3.0.0_linux/
-# README_VFX_SDK_Triton.md  VFXSDK_linux_1.3.0.0.tgz (2.8 GB)  VFXSDK_triton_1.3.0.0.tgz
-```
-
-## 5. Download features and the GPU-architecture models
-
-AIGS needs its feature library plus TensorRT model packages built for your GPU's SM architecture. Background blur is pure CUDA compositing on top of an external mask and has no model package. Video noise removal (the `nvvfxdenoising` feature, the equivalent of NVIDIA Broadcast's "Video Noise Removal") needs its feature library and its own model packages for your architecture; it is optional, and the effects work without it.
-
-Pick the architecture from your GPU:
-
-```bash
-SM=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d .)   # 12.0 -> 120
-echo "SM=$SM"
-ngc registry model list "nvidia/maxine/nvvfxgreenscreen:*"
-ngc registry model list "nvidia/maxine/nvvfxdenoising:*"     # only for noise removal
-```
-
-In that list, a `1.3.0.0_models_linux_sm<SM>` entry must exist for your value (in each of the two lists you use). For 1.3.0.0 these exist: `sm75, sm80, sm86, sm89, sm90, sm100, sm120` (Linux). If your `SM` is not listed (for example CC 8.7 or 12.1), pick the closest listed one only if you accept an untested combination; the loader may refuse it. Ignore entries named `windows_*` and `woa_*`.
-
-Download into a scratch directory (the NGC CLI creates one subdirectory per version):
-
-```bash
-DL=$(mktemp -d) && cd "$DL"
-ngc registry model download-version nvidia/maxine/nvvfxgreenscreen:1.3.0.0_lib_linux --dest .
-ngc registry model download-version nvidia/maxine/nvvfxbackgroundblur:1.3.0.0_lib_linux --dest .
-ngc registry model download-version "nvidia/maxine/nvvfxgreenscreen:1.3.0.0_models_linux_sm$SM" --dest .
-# optional, for noise removal:
-ngc registry model download-version nvidia/maxine/nvvfxdenoising:1.3.0.0_lib_linux --dest .
-ngc registry model download-version "nvidia/maxine/nvvfxdenoising:1.3.0.0_models_linux_sm$SM" --dest .
-ls                                             # directory names as created by the CLI, e.g.
-# nvvfxgreenscreen_v1.3.0.0_lib_linux  nvvfxbackgroundblur_v1.3.0.0_lib_linux  nvvfxgreenscreen_v1.3.0.0_models_linux_sm120
-# and, with noise removal: nvvfxdenoising_v1.3.0.0_lib_linux  nvvfxdenoising_v1.3.0.0_models_linux_sm120
-```
-
-Sizes: greenscreen lib 2.6 MB, blur lib 0.4 MB, sm120 models 113 MB (8 `.engine.trtpkg` files). Keep this shell and `$DL` for step 6.
-
-The feature version's MAJOR.MINOR must equal the SDK's (1.3). Mixing versions is rejected by `install_feature.sh` and is unsupported here.
-
-## 6. Lay out the prefix
-
-This replicates `features/install_feature.sh` from the SDK. That script hard-codes `VFXSDK_PATH=/usr/local/VideoFX`, has no prefix option and needs root, so it is not used. What it does, and what the commands below reproduce 1:1: extract the core to the prefix, extract each feature `tar.gz` into `<prefix>/VideoFX/features`, and copy the model files into `<prefix>/VideoFX/lib/models`.
-
-```bash
-mkdir -p "$PREFIX"
-tar -xzf ~/Downloads/maxine/vfx_sdk_core_v1.3.0.0_linux/VFXSDK_linux_1.3.0.0.tgz -C "$PREFIX"   # -> $PREFIX/VideoFX (4.4 GB)
-
-cd "$DL"
-for t in */*.tar.gz; do tar -xzf "$t" -C "$PREFIX/VideoFX/features"; done
-cp nvvfxgreenscreen_v1.3.0.0_models_linux_sm$SM/* "$PREFIX/VideoFX/lib/models/"
-# with noise removal:
-cp nvvfxdenoising_v1.3.0.0_models_linux_sm$SM/* "$PREFIX/VideoFX/lib/models/"
-```
-
-Resulting layout (`$MAXINE_VFX_ROOT`, 4.4 GB):
-
-```
-VideoFX/
-  include/                 nvVideoEffects.h  nvCVImage.h  nvCVStatus.h
-  lib/                     libVideoFX.so  libVideoFXLocal.so  libNVCVImage.so  libnvngxruntime.so  libVideoFXTriton.so (unused)
-  lib/models/              AIGS_288x512_<SM>_m{0,1,2,3}.engine.trtpkg  and  *_1_4_8.engine.trtpkg   (8 files, 114 MB)
-                           Denoise-agg-<SM>.engine.trtpkg  Denoise-con-<SM>.engine.trtpkg   (noise removal)
-  features/nvvfxgreenscreen/lib/libnvVFXGreenScreen.so         (+ include/, license/)
-  features/nvvfxbackgroundblur/lib/libnvVFXBackgroundBlur.so   (+ include/, license/)
-  features/nvvfxdenoising/lib/libnvVFXDenoising.so             (noise removal; + include/, license/)
-  features/install_feature.sh  compute_capability  README.md   (not used)
-  external/cuda/           bundled CUDA 12.8 (3.6 GB: bin, include, lib)
-  external/tensorrt/       bundled TensorRT 10.9 (700 MB: include, lib)
-  share/                   docs, licence PDFs, third-party licences
-```
-
-Reclaim space and clean up (the tarball is kept only if you want a quick reinstall):
-
-```bash
-rm -rf "$DL"
-rm -rf ~/Downloads/maxine          # optional, frees 2.7 GB
-```
-
-## 7. The os-release override
-
-**Why.** The model-package loader inside `libnvVFXGreenScreen.so` (and the one of the noise-removal feature) reads `/etc/os-release` (with `fopen`, twice per load) and refuses distributions that are not on NVIDIA's list. Omarchy reports `ID=omarchy`, so `NvVFX_Load` fails with `-1209` ("no kernel image is available for execution on the device"). That message is misleading: no CUDA error occurs (verified with compute-sanitizer), the models do contain sm_120 code, and the failure is purely the distro check. Findings on what passes:
-
-| os-release | Result |
+| In omarchy-broadcast | SDK feature |
 |---|---|
-| `ID=ubuntu` + `VERSION_ID="24.04"` | Load succeeds |
-| `ID=debian` + `VERSION_ID="12"` | Load succeeds |
-| `ID=rocky` + `VERSION_ID="9.4"` | Load succeeds |
-| `ID=arch` (any `VERSION_ID`), or `ID_LIKE=ubuntu` | Fails (-1209). Only the `ID` / `VERSION_ID` pair is read |
-| `ID=ubuntu` without `VERSION_ID` | No output at all in testing, probably a crash. Always give `VERSION_ID` |
+| `blur` and `replace` (the green-screen mask) | `nvvfxgreenscreen` |
+| `blur` (the blur itself) | `nvvfxbackgroundblur` |
+| Video noise removal (`denoise`) | `nvvfxdenoising` |
 
-**How.** A small `LD_PRELOAD` library, [`tools/os-release-shim`](../../tools/os-release-shim/README.md), makes one process see a replacement `/etc/os-release`: inside a process that preloads it, a read-only open of exactly `/etc/os-release` opens the file named by `OMARCHY_BROADCAST_OS_RELEASE` instead, and every other call passes through unchanged. Only that process is affected, the real file is untouched, and no root is needed.
+`replace` needs `nvvfxgreenscreen` only for its mask; the replacement is a composite done by the project. Noise removal is optional and the effects work without it.
 
-**Why not a namespace.** Hiding the file with a bind mount needs a user and mount namespace (`unshare -Urm`, or `PrivateUsers=` and `BindReadOnlyPaths=` in the unit). The daemon finds out that an application has opened the virtual camera by reading `/proc/<pid>/fd/N` of the user's other processes, and inside a user namespace the kernel refuses `readlink` on those entries (listing the directory still works). The daemon would then never see a consumer and would stay idle, sending black. `unshare -Urm` also presents the user as uid 0 to the session bus, so authentication fails. The reasoning is in [ADR-0012](../adr/0012-video-effects-and-maxine-backend.md). The shim needs no namespace: the process keeps its uid, its mounts and `/proc`.
+## 2. Build and install maxine-vfx-sdk-local
 
-### Build and install
+The omarchy-nvidia-sdks repository owns everything about the SDK itself: the NVIDIA account and NGC access, the download, the supported GPU architectures, and the Arch package `maxine-vfx-sdk-local`. Follow its README and its `docs/download.md` for the download and `docs/gpu-support.md` for the architectures. The package installs the SDK under `/opt/nvidia/maxine/videofx` and an environment file, `/usr/share/maxine-vfx/maxine-vfx.env`.
 
-Three routes put the same two files in place: the shim library and a replacement `os-release`. None of them activates anything; activation is step 7a, after the SDK is installed.
-
-- **Arch package.** Already installed, inactive: `/usr/lib/omarchy-broadcast/os-release-shim.so` and `/usr/lib/omarchy-broadcast/fake-os-release`. The package's `check()` runs the shim's test. The SDK itself is never packaged.
-- **`scripts/install-user.sh`.** Builds and installs the shim by default when `make` and a C compiler are present (otherwise it skips the shim with a note), to `~/.local/lib/omarchy-broadcast/os-release-shim.so` and `~/.local/lib/omarchy-broadcast/fake-os-release`. `--no-shim` skips it; `--no-build` installs an existing build only. The script never installs or enables the systemd drop-in; it prints the activation steps. If a shim was placed by hand earlier at `~/.local/lib/omarchy-broadcast`, the script refuses: remove those files first, or pass `--no-shim`.
-- **Manual**, from the repository root:
+Build the package with the three features omarchy-broadcast needs. From a checkout of the omarchy-nvidia-sdks repository, with the download in `~/Downloads/maxine` and `sm_120` standing for your architecture:
 
 ```bash
-make -C tools/os-release-shim                     # -> target/os-release-shim/os-release-shim.so
-make -C tools/os-release-shim test                # optional: the shim's own test
-install -Dm755 target/os-release-shim/os-release-shim.so ~/.local/lib/omarchy-broadcast/os-release-shim.so
-install -Dm644 tools/maxine-probe/fake-os-release ~/.local/lib/omarchy-broadcast/fake-os-release
+maxine-vfx/configure.sh --src ~/Downloads/maxine --archs sm_120 \
+    --features nvvfxgreenscreen,nvvfxbackgroundblur,nvvfxdenoising --write
+(cd maxine-vfx && makepkg -f)
 ```
 
-The repository ships a working replacement file at [../../tools/maxine-probe/fake-os-release](../../tools/maxine-probe/fake-os-release); its content is:
+Then install the package yourself:
 
-```
-NAME="Ubuntu"
-VERSION_ID="24.04"
-ID=ubuntu
-ID_LIKE=debian
-VERSION_CODENAME=noble
-PRETTY_NAME="Ubuntu 24.04 LTS"
+```bash
+cd maxine-vfx && sudo pacman -U maxine-vfx-sdk-local-*.pkg.tar*
 ```
 
-### 7a. The daemon (systemd user unit)
+Nothing in omarchy-broadcast installs the package. The omarchy-broadcast Arch package lists it as an optional dependency (`optdepends`), because the SDK is a personal download and cannot be a hard requirement.
 
-The optional drop-in sets `LD_PRELOAD`, `OMARCHY_BROADCAST_OS_RELEASE`, `MAXINE_VFX_ROOT` and `LD_LIBRARY_PATH` for the daemon, with the SDK in `~/.local/opt/maxine/VideoFX`. Two versions exist, differing only in where the shim and the replacement file are:
+Licence: the SDK is under NVIDIA's licence and is for your own machine only. omarchy-broadcast never distributes it, and you must not put the SDK, the models or the package in a repository, a package or a release artifact. The licence notes are in the "Licence and personal use" section of the omarchy-nvidia-sdks README.
 
-- the package's example, `/usr/share/doc/omarchy-broadcast/examples/systemd/omarchy-broadcastd.service.d/maxine.conf`, points at `/usr/lib/omarchy-broadcast/`;
-- the checkout's [`dist/systemd/omarchy-broadcastd.service.d/maxine.conf`](../../dist/systemd/omarchy-broadcastd.service.d/maxine.conf) points at `%h/.local/lib/omarchy-broadcast/` (the `install-user.sh` and manual locations).
+## 3. Enable the drop-in
 
-Adjust the paths in the file if you installed elsewhere. After installing the SDK, copy the matching file and restart the daemon:
+The daemon uses the SDK only when its systemd unit has the SDK's environment. That is a user drop-in with two active lines:
+
+```ini
+[Service]
+EnvironmentFile=/usr/share/maxine-vfx/maxine-vfx.env
+Environment=LD_PRELOAD=/usr/lib/maxine-vfx/os-release-shim.so
+```
+
+Copy the example that matches your install of omarchy-broadcast, then reload and restart:
 
 ```bash
 # package install:
 install -Dm644 /usr/share/doc/omarchy-broadcast/examples/systemd/omarchy-broadcastd.service.d/maxine.conf \
     ~/.config/systemd/user/omarchy-broadcastd.service.d/maxine.conf
-# checkout (install-user.sh or manual install), from the repository root:
+# checkout (install-user.sh or cargo), from the repository root:
 install -Dm644 dist/systemd/omarchy-broadcastd.service.d/maxine.conf \
     ~/.config/systemd/user/omarchy-broadcastd.service.d/maxine.conf
 
@@ -235,94 +71,59 @@ systemctl --user daemon-reload
 systemctl --user restart omarchy-broadcastd.service
 ```
 
-Remove the file (then `daemon-reload` and restart) to go back to the default unit. If the shim file is missing, the dynamic loader prints `ld.so: object '...' from LD_PRELOAD cannot be preloaded ... ignored` in the journal and the daemon starts normally; the first effect then fails with the reason in the `Error` property (see troubleshooting). Without the drop-in the daemon runs as usual and effects fail the same way.
+Both files have the same content: [`dist/systemd/omarchy-broadcastd.service.d/maxine.conf`](../../dist/systemd/omarchy-broadcastd.service.d/maxine.conf). The `EnvironmentFile=` line has no leading `-`, so the unit fails to start when the package is not installed; that is intended, see section 7.
 
-### 7b. A manual run (probe, `obc-bench`, the daemon, tests)
+**The os-release shim.** The SDK's model loader reads `/etc/os-release` and refuses distributions that are not on NVIDIA's list. Omarchy reports `ID=omarchy`, and the SDK then fails with `-1209` ("no kernel image is available for execution on the device"), which is misleading: no CUDA error occurs. `os-release-shim.so` is an `LD_PRELOAD` library, part of `maxine-vfx-sdk-local`, that shows the preloading process a replacement `os-release` (Ubuntu 24.04) instead of the real file. Only that process is affected and no root is needed. It does not modify the SDK, the models or their encryption, and NVIDIA does not support this configuration. How it works is in the "The compatibility shim" section of `docs/usage.md` in the omarchy-nvidia-sdks repository. Set `MAXINE_OS_RELEASE_DEBUG=1` in the daemon's environment to make the shim log each redirect on stderr, which shows in the journal whether it is active.
 
-Set the two variables on the program that loads the SDK:
+`LD_PRELOAD` is set on the daemon only, and the drop-in does it with `Environment=` on the unit, so the shim loads into `omarchy-broadcastd` itself. The shim removes `LD_PRELOAD` from the environment of the process that loads it, so the programs the daemon starts do not inherit it. The environment file never sets `LD_PRELOAD`, and it must not be set on a wrapper such as `timeout`, `sh -c` or `cargo`: the wrapper would load the shim, drop the variable and start the program without it, which then fails with `-1209`.
 
-```bash
-env LD_PRELOAD=~/.local/lib/omarchy-broadcast/os-release-shim.so \
-    OMARCHY_BROADCAST_OS_RELEASE=$HOME/.local/lib/omarchy-broadcast/fake-os-release \
-    <command> [args]
+The reason the daemon is not run in a namespace with a bind-mounted `os-release` is that the daemon finds consumers of the virtual camera by reading `/proc/<pid>/fd/N` of the user's other processes, which the kernel refuses inside a user namespace; see [ADR-0012](../adr/0012-video-effects-and-maxine-backend.md).
+
+## 4. Environment
+
+What the daemon reads, and where each value comes from with the drop-in of section 3:
+
+| Variable | Used for | Comes from |
+|---|---|---|
+| `MAXINE_VFX_ROOT` | The SDK root: the directory that contains `lib/`, `features/` and `external/`. The daemon loads `libVideoFX.so` from its `lib/` and passes the `models` directory next to the loaded `libVideoFX.so` (`<root>/lib/models`) to the SDK as `NVVFX_MODEL_DIRECTORY` | The environment file. When unset or empty, the daemon uses `/opt/nvidia/maxine/videofx` if that directory exists, and otherwise searches the library path only |
+| `LD_LIBRARY_PATH` | Lets the dynamic loader find the SDK, the bundled CUDA 12 and TensorRT 10 libraries, and the feature libraries (loaded by a plain `dlopen("libnvVFXGreenScreen.so")`) | The environment file: `lib`, one `features/<feature>/lib` entry for every packaged feature, `external/cuda/lib` and `external/tensorrt/lib` |
+| `LD_PRELOAD` | The os-release shim | The drop-in |
+| `MAXINE_OS_RELEASE` | The replacement `os-release` file the shim opens: an absolute path | The environment file |
+| `MAXINE_OS_RELEASE_DEBUG` | `1` makes the shim log each redirect | Set it by hand, for diagnosis |
+
+Because the environment file is generated for the packaged features, a feature added later, as noise removal was, needs only a rebuild and a reinstall of `maxine-vfx-sdk-local`. The drop-in does not change.
+
+The bundled CUDA 12 and TensorRT 10 libraries are on the library path of the daemon only. Never set them in a login profile or in `~/.bashrc`: they would shadow Arch's CUDA 13 for every program you start. For the same reason the SDK package installs no `ld.so.conf.d` or `profile.d` entry.
+
+Development knob: `OBC_MAXINE_DENOISE_STRENGTH=0` or `=1` in the environment of the process overrides the noise-removal strength, for comparisons. It is not a supported configuration (see section 6).
+
+## 5. An SDK tree without the package
+
+An SDK tree that was installed some other way, for example under `~/.local/opt/maxine/VideoFX`, works too. The shipped drop-in has a commented variant for it. Replace the two active lines with the variant, keep the paths that match your tree, and run `daemon-reload` and a restart:
+
+```ini
+[Service]
+Environment=MAXINE_VFX_ROOT=%h/.local/opt/maxine/VideoFX
+Environment=LD_LIBRARY_PATH=%h/.local/opt/maxine/VideoFX/lib:%h/.local/opt/maxine/VideoFX/features/nvvfxgreenscreen/lib:%h/.local/opt/maxine/VideoFX/features/nvvfxbackgroundblur/lib:%h/.local/opt/maxine/VideoFX/features/nvvfxdenoising/lib:%h/.local/opt/maxine/VideoFX/external/cuda/lib:%h/.local/opt/maxine/VideoFX/external/tensorrt/lib
+Environment=LD_PRELOAD=%h/.local/lib/maxine-vfx/os-release-shim.so
+Environment=MAXINE_OS_RELEASE=%h/.local/lib/maxine-vfx/fake-os-release
 ```
 
-**Set `LD_PRELOAD` on the final program, never on a wrapper in front of it.** The shim removes `LD_PRELOAD` from the environment of the process that loads it, so that no child inherits it. A wrapper such as `timeout`, `sh -c` or `cargo` that carries `LD_PRELOAD` loads the shim itself, drops the variable, and starts the program without it, which then fails with `-1209`. Write `timeout 60 env LD_PRELOAD=... prog`, not `LD_PRELOAD=... timeout 60 prog`. For `cargo test`, use a runner so that only the test binary is preloaded:
+Notes:
 
-```bash
-OMARCHY_BROADCAST_OS_RELEASE=$HOME/.local/lib/omarchy-broadcast/fake-os-release \
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env LD_PRELOAD=$HOME/.local/lib/omarchy-broadcast/os-release-shim.so" \
-    cargo test -p obc-backend-maxine --test hardware -- --ignored --test-threads=1
-```
+- `LD_LIBRARY_PATH` needs one `features/<feature>/lib` entry for every feature that is installed in the tree. systemd does not expand globs in `Environment=`, so a feature added later needs a new entry.
+- The shim library and the replacement `os-release` come from the omarchy-nvidia-sdks repository, which owns both; omarchy-broadcast does not contain them. In a checkout of that repository, `make -C tools/os-release-shim` writes `target/os-release-shim/os-release-shim.so`, and the replacement `os-release` is that repository's `tools/maxine-probe/fake-os-release`. Copy both to `~/.local/lib/maxine-vfx/`, where the two lines above point, or change the paths. The "The compatibility shim" and "Running a program" sections of its `docs/usage.md` describe them and the unpackaged case.
 
-`OMARCHY_BROADCAST_OS_RELEASE_DEBUG=1` makes the shim log each redirect on stderr, which shows whether it is active.
+## 6. Using the effects
 
-Support note: see section 11.
-
-## 8. Environment
-
-The SDK bundles CUDA 12.8, cuDNN 9, TensorRT 10 and NPP 12, while Arch ships CUDA 13. None of the `.12` / `.9` / `.10` sonames exist system-wide, so the bundled directories must be on `LD_LIBRARY_PATH`. The feature libraries are found by plain `dlopen("libnvVFXGreenScreen.so")`, so their directories must be on it too (otherwise `NvVFX_CreateEffect` returns `-2`). That includes `features/nvvfxdenoising/lib` when noise removal is installed.
-
-Create an env file (kept outside the repo):
-
-```bash
-cat > "$PREFIX/env.sh" <<'EOF'
-export MAXINE_VFX_ROOT="${MAXINE_VFX_ROOT:-$HOME/.local/opt/maxine/VideoFX}"
-P="$MAXINE_VFX_ROOT"
-export LD_LIBRARY_PATH="$P/lib:$P/features/nvvfxgreenscreen/lib:$P/features/nvvfxbackgroundblur/lib:$P/features/nvvfxdenoising/lib:$P/external/cuda/lib:$P/external/tensorrt/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-unset P
-EOF
-source "$PREFIX/env.sh"
-```
-
-- `MAXINE_VFX_ROOT` is the one variable the project reads: the SDK root (the directory containing `lib/`, `features/`, `external/`). The daemon derives the model directory (`$MAXINE_VFX_ROOT/lib/models`, passed to the SDK as `NVVFX_MODEL_DIRECTORY`) and the library paths from it, and the systemd drop-in of step 7 sets the same variables in `Environment=`.
-- Do not `source` this from `~/.bashrc` or `~/.profile`. The bundled CUDA 12 libraries would shadow system libraries for every program you start. Source it per shell, or set it per process/unit.
-
-## 9. Verify with the probe
-
-The probe ([`tools/maxine-probe/probe.c`](../../tools/maxine-probe/), see its README) loads AIGS, runs 200 frames at 1080p, then runs background blur. The CUDA headers it needs are bundled; no system toolkit is required. The model directory is argv[1]; if omitted it defaults to `./models`, which does not exist and gives `-13` ("file could not be found").
-
-```bash
-source "$PREFIX/env.sh"                # first, so the linker finds the bundled .12 libs
-P=$MAXINE_VFX_ROOT
-cd "$(mktemp -d)"
-gcc -O2 -o probe <repo root>/tools/maxine-probe/probe.c \
-  -I$P/include -I$P/external/cuda/include -L$P/lib -lVideoFX -lNVCVImage -lcuda
-env LD_PRELOAD=~/.local/lib/omarchy-broadcast/os-release-shim.so \
-    OMARCHY_BROADCAST_OS_RELEASE=$HOME/.local/lib/omarchy-broadcast/fake-os-release \
-    ./probe $P/lib/models
-```
-
-Expected output on the reference machine (RTX 5080 Laptop, driver 615.78; timings are shown as `<t>`; they vary by GPU and are not published here, per the NVIDIA Maxine SDK licence):
-
-```
-NvVFX_GetVersion = 0x01030000  (major 1 minor 3 build 0)
-CUDA device: NVIDIA GeForce RTX 5080 Laptop GPU
-NvVFX_Load -> 0 (No error)  took <t> ms
-first NvVFX_Run(sync) -> 0 (No error)  took <t> ms
-AIGS mode 0 1920x1080 BGR u8 GPU -> A u8 GPU: avg <t> ms/frame over 200 (sync Run)
-...
-Blur NvVFX_Load -> 0 (No error) took <t> ms
-BackgroundBlur 1920x1080: avg <t> ms/frame
-DONE
-```
-
-Pass criteria: version `0x01030000`, `NvVFX_Load -> 0`, `DONE`, no `FAIL` line. Set `VFX_LOG=1` for the SDK's own log on stderr.
-
-Observation, cause unconfirmed: on the very first probe run the first `NvVFX_Run` took much longer than later ones (plausibly a one-time warm-up of the TensorRT context, cuDNN and CUDA graph capture); later runs were faster, plausibly because of a CUDA JIT or file cache. Budget for a cold first run of a few seconds: the daemon is meant to show a black or "starting..." frame while an effect loads.
-
-Without the shim the same probe stops at `NvVFX_Load -> -1209`, which confirms the distro gate.
-
-### Using the effects
-
-With the SDK installed and the daemon running with the drop-in (step 7a), the effects are selected in two ways:
+With the SDK installed and the daemon running with the drop-in (section 3), the effects are selected in two ways:
 
 - In `config.toml`, the `[effect]` section (`mode`, `blur_strength`, `background_image`, `on_failure`); see [../config.example.toml](../config.example.toml).
 - At run time, with `omarchy-broadcast effect none|blur|replace [--strength X] [--image PATH]`, which the daemon remembers across restarts; see [../cli-json.md](../cli-json.md) and [../dbus-api.md](../dbus-api.md).
 
-Video noise removal is a separate switch that combines with any effect: `[effect] denoise = true` in `config.toml`, or `omarchy-broadcast denoise on|off` at run time. It removes the grain a webcam produces, which is mostly visible in dim rooms, and it runs before the blur or replacement, or alone with the effect `none`. It needs the `nvvfxdenoising` feature and its models (steps 5 and 6). Things to know:
+Video noise removal is a separate switch that combines with any effect: `[effect] denoise = true` in `config.toml`, or `omarchy-broadcast denoise on|off` at run time. It removes the grain a webcam produces, which is mostly visible in dim rooms, and it runs before the blur or replacement, or alone with the effect `none`. It needs the `nvvfxdenoising` feature and its models in the package (section 2). Things to know:
 
-- **It fails open.** Noise removal hides nothing, so if it cannot load or run (the feature or SDK is missing, or the frame size is out of range) the stream continues without it, and the daemon's `Error` property says `noise removal unavailable: <reason>`. `[effect] on_failure` does not apply to it and the daemon does not enter `error`. The effects themselves still fail closed, as above.
+- **It fails open.** Noise removal hides nothing, so if it cannot load or run (the feature or SDK is missing, or the frame size is out of range) the stream continues without it, and the daemon's `Error` property says `noise removal unavailable: <reason>`. `[effect] on_failure` does not apply to it and the daemon does not enter `error`. The effects themselves still fail closed, as below.
 - **Frame size.** The feature supports frames from 80x80 up to 1920x1080 (the SDK's range). An output contract above 1080p runs without noise removal and reports the reason.
 - **Strength.** The SDK's strength is binary: 0 favours texture, 1 favours noise removal. The daemon uses 1 and has no setting for it. For comparisons during development, `OBC_MAXINE_DENOISE_STRENGTH=0` or `=1` in the environment of the process overrides it. It is a development knob only and is not a supported configuration.
 - **Cost.** It adds one GPU pass per frame and its model's GPU memory; with it off, nothing is added, no pass, copy or allocation. The models load only while it is on. Measure on your machine with `obc-bench --denoise` ([../testing.md](../testing.md)).
@@ -330,53 +131,48 @@ Video noise removal is a separate switch that combines with any effect: `[effect
 
 The background image for `replace` must be a PNG or JPEG file. Until an effect is ready, the virtual camera shows black rather than the unprocessed camera image; if the SDK cannot be loaded, the daemon enters the `error` state (default) instead of showing the unprocessed image. The design is in [ADR-0012](../adr/0012-video-effects-and-maxine-backend.md). Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence; reproduce locally with `obc-bench` (see [../testing.md](../testing.md)).
 
-## 10. Troubleshooting
+To check the SDK installation itself, use the check commands in the "Check the installation" section of `docs/usage.md` in the omarchy-nvidia-sdks repository, and its own tests. omarchy-broadcast has no probe of its own.
+
+## 7. Troubleshooting
+
+Problems with the SDK itself (download, package, architecture) are in omarchy-nvidia-sdks. The SDK status codes `-1209` ("no kernel image is available"), `-2` (unimplemented, a feature library not found) and `-13` ("file could not be found", the model directory) are explained in the Troubleshooting section of its `docs/usage.md`. The rows below are the ones that are specific to omarchy-broadcast.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `NvVFX_Load` returns `-1209`, "no kernel image is available", log line `Loading TRTModel failed in Aigs` | `/etc/os-release` is not an accepted distro (`ID=omarchy`). Not a real CUDA error | Step 7: the shim is missing or not applied to this process. Check that the library exists at the path in `LD_PRELOAD`, that `OMARCHY_BROADCAST_OS_RELEASE` is an absolute path to a file with both `ID=` and `VERSION_ID=`, that `LD_PRELOAD` is set on the program itself and not on a wrapper (`timeout`, `sh -c`, `cargo`), and run with `OMARCHY_BROADCAST_OS_RELEASE_DEBUG=1` to see the redirect |
-| `NvVFX_CreateEffect` returns `-2` (unimplemented) | `libnvVFXGreenScreen.so` / `libnvVFXBackgroundBlur.so` / `libnvVFXDenoising.so` not found by `dlopen` | Put `features/nvvfxgreenscreen/lib`, `features/nvvfxbackgroundblur/lib` and `features/nvvfxdenoising/lib` on `LD_LIBRARY_PATH` (step 8); confirm the feature was extracted in step 6 |
-| The daemon's `Error` says `noise removal unavailable: ... -2` (NVCV status), and the camera image is shown without noise removal | The feature library `libnvVFXDenoising.so` is not on `LD_LIBRARY_PATH` of the daemon (the drop-in or `env.sh` predates noise removal, or the feature was not extracted) | Add `features/nvvfxdenoising/lib` to `LD_LIBRARY_PATH` (the shipped drop-in has it; re-copy it, `daemon-reload`, restart) and check step 6 |
-| The same, with `-1209` or `-13` | The os-release override is missing for this process (the feature's library needs it too), or the `Denoise-*` models for your SM are not in `lib/models` | Step 7; `ls $MAXINE_VFX_ROOT/lib/models` must show `Denoise-agg-<SM>.engine.trtpkg` and `Denoise-con-<SM>.engine.trtpkg` |
+| The daemon's `Error` property reads `effect blur unavailable: NvVFX_Load(GreenScreen) returned -1209 (...)`, naming the os-release override (this page, section 3), and the state is `error` | The daemon runs without the shim: the drop-in is not installed, `daemon-reload` and a restart were skipped, or its paths do not match your installation. With the default `on_failure = "black"` the virtual camera stays black | Install the drop-in (section 3) and check `systemctl --user show omarchy-broadcastd -p Environment`; set `MAXINE_OS_RELEASE_DEBUG=1` to see the redirect. A `cannot be preloaded` line in `journalctl --user -u omarchy-broadcastd` means the library path in `LD_PRELOAD` is wrong or the package is not installed |
+| The unit fails to start after the drop-in was installed, and `journalctl --user -u omarchy-broadcastd` shows `Failed to load environment files: No such file or directory` (systemd does not name the file) | `EnvironmentFile=` has no `-`, so a missing file is an error. `maxine-vfx-sdk-local` is not installed | Check that `/usr/share/maxine-vfx/maxine-vfx.env` exists, which it does when the package is installed. Install the package (section 2), or remove the drop-in (section 8) |
+| The drop-in has no effect: the daemon's environment lacks `LD_PRELOAD` | The file is not at `~/.config/systemd/user/omarchy-broadcastd.service.d/maxine.conf` (the directory name must match the unit), or `daemon-reload` was skipped | Check the path, run `systemctl --user daemon-reload`, restart, and check with `systemctl --user cat omarchy-broadcastd` |
+| An effect reports that a feature library is not found (`-2`) or the package lacks a feature | The package was built without that feature | Rebuild `maxine-vfx-sdk-local` with all three features of section 1 (section 2), reinstall it and restart the daemon. The drop-in needs no edit |
+| The daemon's `Error` says `noise removal unavailable: ... -2` (NVCV status), and the camera image is shown without noise removal | The package does not contain the `nvvfxdenoising` feature, or the daemon runs without the environment file | Check that `MAXINE_VFX_FEATURES` in `/usr/share/maxine-vfx/maxine-vfx.env` lists `nvvfxdenoising`; rebuild the package with it if not (section 2); check the drop-in |
+| The same, with `-1209` or `-13` | The shim is not applied to this process (the feature's library needs it too), or the `Denoise-*` models for your architecture are not in the package | Section 3; `ls /opt/nvidia/maxine/videofx/lib/models` must show `Denoise-agg-<SM>.engine.trtpkg` and `Denoise-con-<SM>.engine.trtpkg`; rebuild the package for your architecture otherwise |
 | The same, with a message that the frame size is out of range | The output contract is smaller than 80x80 or larger than 1920x1080 | Use an output mode within the range (`[output]` in `config.toml`); noise removal does not run outside it |
-| `NvVFX_Load` returns `-13` ("file could not be found") | Model directory wrong or models missing | Pass `$MAXINE_VFX_ROOT/lib/models` (probe argv[1]; the default `./models` does not exist). Check `ls $MAXINE_VFX_ROOT/lib/models` shows 8 `.trtpkg` files for your SM |
-| `error while loading shared libraries: libcudart.so.12` / `libnpp*.so.12` / `libcudnn.so.9` / `libnvinfer.so.10` not found (or linker warnings about `.so.12`) | Bundled `external/cuda/lib` and `external/tensorrt/lib` not on `LD_LIBRARY_PATH` | `source "$PREFIX/env.sh"`, then check `ldd $MAXINE_VFX_ROOT/lib/libVideoFXLocal.so \| grep 'not found'` is empty |
-| `Cannot load libVideoFXTriton.so` in the log | The Triton client library needs `libgrpcclient.so`; unused | Harmless, ignore |
-| Model list shows only `_woa` / `windows` entries, or the downloaded SDK has no Linux libs | Wrong tag: `_woa` is Windows on ARM | Use `1.3.0.0_linux` (step 4) |
-| `ngc registry ...` returns 401/402/403 or an empty list, "not authorized" | API key from another account or org than the Developer Program access, or "NGC Catalog" service not included, or access not yet granted | Redo step 1 with the same account that owns the key; regenerate the key with the NGC Catalog service (step 2); run `ngc config set` again with the right org; `ngc config current` shows what is active |
-| No `models_linux_sm<SM>` for your GPU | GPU architecture not in the 1.3.0.0 matrix | List with step 5; Turing/Ampere/Ada/Hopper/Blackwell (sm75 to sm120) are covered |
-| `NvVFX_Load` succeeds but a program hangs at start | Cold first run (see step 9 observation) | Wait a few seconds; the probe prints the time |
-| The daemon's `Error` property reads `effect blur unavailable: NvVFX_Load(GreenScreen) returned -1209 (...): the SDK rejected this distribution (its model loader reads /etc/os-release). Run the process with the os-release override (docs/setup/maxine.md, section 7)` and the state is `error` | The daemon runs without the shim: the drop-in is not installed, `daemon-reload` and a restart were skipped, or its paths do not match your installation. With the default `on_failure = "black"` the virtual camera stays black | Install the drop-in (step 7a) and check `systemctl --user show omarchy-broadcastd -p Environment`; a `cannot be preloaded` line in `journalctl --user -u omarchy-broadcastd` means the library path is wrong |
 | The daemon's `Error` property or the element's status names the mask-hardening kernel and a CUDA error `222` ("the NVIDIA driver is older than this build supports") | The driver rejects the PTX of the mask-hardening kernel: it is older than 570.26 | Update the NVIDIA driver to 570.26 or newer (`nvidia-smi --query-gpu=driver_version --format=csv,noheader`). With the default `on_failure = "black"` the virtual camera stays black until then |
 | The same, with CUDA error `221` | The driver cannot JIT-compile the kernel: `libnvidia-ptxjitcompiler.so.1` is missing from the driver installation | Reinstall the driver's userspace package (`nvidia-utils`) so that it provides `libnvidia-ptxjitcompiler.so.1`; check with `ldconfig -p \| grep ptxjitcompiler` |
-| `ld.so: object '...os-release-shim.so' from LD_PRELOAD cannot be preloaded` | The shim library is not at the path in `LD_PRELOAD`; the program runs without it | Build and install it, or check the paths in the drop-in (step 7) |
 
-## 11. Licence and support notes
-
-Summary of the licence terms as read from the SDK licence documents. This is not legal advice; read the licence you accept.
-
-- The SDK and models are under the NVIDIA Software License Agreement plus the AI Product-Specific Terms. The Developer Program path is "solely for internal evaluation, development or test non-production purposes ... not for use, distribution or deployment in production" (terms 1.2.8). Personal use on your own machine and development are fine; shipping the SDK inside a product needs an NVIDIA enterprise agreement.
-- **No redistribution.** SLA 8.5 forbids copying, distributing or sublicensing any part of the Software, "including in any publicly accessible software repositories". Never commit the SDK, the models (`*.trtpkg`), the NGC key or `~/.ngc/` to this repo, never put them in a package or release artifact (users download from NGC themselves, the daemon only points at the install directory). Keep the install directory outside the working tree.
-- No reverse engineering of the binaries (SLA 8.4); no publishing benchmark results without written permission (SLA 8.9). The timings above are for local verification, not for publication.
-- The os-release override (the shim of step 7) is a compatibility shim for distributions the SDK does not list. It changes only what the daemon (or another process you start with it) reads as `/etc/os-release`. It does not modify the SDK, the models or their encryption. NVIDIA does not support this configuration.
-- NVIDIA documents the Linux SDK as server-side and does not officially support local, client-side use or Arch. That is a support statement, not a technical block. Expect no vendor support.
-
-## 12. Uninstall
+## 8. Uninstall
 
 ```bash
-rm -rf "$PREFIX"                         # SDK, models and env.sh
-# install-user.sh route: scripts/install-user.sh --uninstall removes the whole script install
-#   (binaries, unit, D-Bus file and shim), not only the shim
-# manual route:
-rm -f ~/.local/lib/omarchy-broadcast/fake-os-release ~/.local/lib/omarchy-broadcast/os-release-shim.so
-rm -f ~/.local/share/omarchy-broadcast/fake-os-release   # installs made by earlier instructions
-# package install: sudo pacman -R omarchy-broadcast-git removes /usr/lib/omarchy-broadcast/*
-# every route: remove the drop-in, then reload
-rm -f ~/.config/systemd/user/omarchy-broadcastd.service.d/maxine.conf   # then: systemctl --user daemon-reload
-rm -rf ~/Downloads/maxine                # downloads, if kept
-# NGC CLI (only if nothing else uses it)
-rm -rf ~/.local/opt/ngc-cli ~/.local/bin/ngc
-rm -rf ~/.ngc                            # contains your API key; also revoke it at https://org.ngc.nvidia.com/setup/personal-keys
+# remove the drop-in, then reload and restart
+rm -f ~/.config/systemd/user/omarchy-broadcastd.service.d/maxine.conf
+systemctl --user daemon-reload
+systemctl --user restart omarchy-broadcastd.service
+# the SDK package, only if nothing else uses it
+sudo pacman -R maxine-vfx-sdk-local
 ```
 
-Nothing outside your home directory was written, so nothing else needs reverting.
+Without the drop-in the daemon runs as usual and the effects are unavailable.
+
+An os-release shim installed by `scripts/install-user.sh` of an older omarchy-broadcast release, under `~/.local/lib/omarchy-broadcast/`, is removed by `scripts/install-user.sh --uninstall` of the current script, and by reinstalling with it. To remove it by hand: `rm -f ~/.local/lib/omarchy-broadcast/os-release-shim.so ~/.local/lib/omarchy-broadcast/fake-os-release`.
+
+The NGC CLI, the NGC key and the downloads belong to omarchy-nvidia-sdks; its documentation covers removing them.
+
+## 9. Licence and support
+
+This is a summary, not legal advice. Read the licence you accept.
+
+- The SDK and its models are NVIDIA's, under NVIDIA's licence. You download them with your own NVIDIA account and accept that licence yourself.
+- Neither omarchy-broadcast nor omarchy-nvidia-sdks redistributes NVIDIA files. Do not commit the SDK, the models, an NGC key or `~/.ngc/` to a repository, and do not put them in a package or release artifact.
+- Benchmark results for the SDK are not published (SLA 8.9).
+- Running the SDK on a distribution it does not list, through the compatibility shim, is not supported by NVIDIA.
+
+The README of omarchy-nvidia-sdks has that repository's own licence notes.

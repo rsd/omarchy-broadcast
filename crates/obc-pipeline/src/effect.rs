@@ -39,7 +39,8 @@ use crate::pipeline::{PipelineError, names};
 
 /// The inference backend an output's effect element creates its instance
 /// with. [`EffectBackend::default`] is the Maxine backend, configured from
-/// the environment (`MAXINE_VFX_ROOT`); tests inject another factory.
+/// `MAXINE_VFX_ROOT`, else the package's default root
+/// ([`obc_backend_maxine::DEFAULT_ROOT`]); tests inject another factory.
 #[derive(Clone)]
 pub struct EffectBackend(pub Arc<dyn BackendFactory>);
 

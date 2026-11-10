@@ -20,7 +20,7 @@ Some cameras keep image settings from other software far from their defaults (ov
 - v4l2loopback, configured as described in [docs/setup/loopback.md](docs/setup/loopback.md)
 - Rust toolchain (only to build from source; the Arch package is built with it, and installed without it)
 - Optional, for the native PipeWire camera output: a build with the cargo feature `omarchy-broadcastd/pipewire` (libpipewire headers and clang at build time; the Arch package has it) and `[pipewire] enabled = true` in the configuration
-- Optional, for effects and noise removal: the NVIDIA Maxine VFX SDK ([docs/setup/maxine.md](docs/setup/maxine.md))
+- Optional, for effects and noise removal: the NVIDIA Maxine VFX SDK, as the package `maxine-vfx-sdk-local` that you build yourself from the omarchy-nvidia-sdks repository ([docs/setup/maxine.md](docs/setup/maxine.md))
 - Optional, for the noise-removed microphone: `deepfilternet-ladspa` or `noise-suppression-for-voice` ([docs/setup/microphone.md](docs/setup/microphone.md))
 
 ## Build
@@ -46,11 +46,11 @@ sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst
 systemctl --user enable --now omarchy-broadcastd
 ```
 
-The package installs the daemon and the client in `/usr/bin`, the systemd user unit, the D-Bus activation file and the documentation. It enables nothing: each user runs the last command. The loopback device is still configured as in [docs/setup/loopback.md](docs/setup/loopback.md). The package also installs the os-release shim that the Maxine effects need on Arch-based systems, inactive, in `/usr/lib/omarchy-broadcast/`. The NVIDIA Maxine SDK is never packaged; install it as in [docs/setup/maxine.md](docs/setup/maxine.md), which also covers activating the shim (section 7).
+The package installs the daemon and the client in `/usr/bin`, the systemd user unit, the D-Bus activation file and the documentation. It enables nothing: each user runs the last command. The loopback device is still configured as in [docs/setup/loopback.md](docs/setup/loopback.md). The NVIDIA Maxine SDK is never packaged here; the package lists `maxine-vfx-sdk-local` (built by the user from the omarchy-nvidia-sdks repository) as an optional dependency, and [docs/setup/maxine.md](docs/setup/maxine.md) covers installing it and enabling the drop-in (section 3).
 
 ### Developer install
 
-`scripts/install-user.sh` builds the release binaries and installs them for the current user, without root: the binaries in `~/.local/bin`, the unit and the D-Bus file under `~/.local/share`. When `make` and a C compiler are present it also builds and installs the os-release shim for the Maxine effects (`--no-shim` skips it; activation is described in [docs/setup/maxine.md](docs/setup/maxine.md), section 7). It never runs `systemctl`; it prints the next steps. `--dry-run` shows the actions and `--uninstall` removes only what the script installed.
+`scripts/install-user.sh` builds the release binaries and installs them for the current user, without root: the binaries in `~/.local/bin`, the unit and the D-Bus file under `~/.local/share`. It installs nothing for the Maxine effects; see [docs/setup/maxine.md](docs/setup/maxine.md). It never runs `systemctl`; it prints the next steps. `--dry-run` shows the actions and `--uninstall` removes only what the script installed.
 
 ```sh
 scripts/install-user.sh

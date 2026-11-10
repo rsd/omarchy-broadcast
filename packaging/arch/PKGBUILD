@@ -29,20 +29,21 @@
 # dependencies), enable it with
 #   systemctl --user enable --now omarchy-broadcast-mic@rnnoise.service
 #
-# The NVIDIA Maxine Video Effects SDK (background blur and replace) is
-# licensed separately by NVIDIA and is never part of this package: each user
-# downloads and installs it as described in docs/setup/maxine.md. Without it
-# the daemon runs normally and a requested effect reports why it failed.
-# The package does install the os-release shim and its replacement os-release
-# under /usr/lib/omarchy-broadcast, inactive: the SDK does not list every
-# distribution, and the shim lets the daemon (and only the daemon) read the
-# replacement. To activate it, install the SDK, then copy the example drop-in
-# (docs/setup/maxine.md, section 7):
+# The NVIDIA Maxine Video Effects SDK (background blur and replace, video
+# noise removal) is licensed separately by NVIDIA and is never part of this
+# package. The SDK and the os-release shim it needs on distributions NVIDIA
+# does not list come from the maxine-vfx-sdk-local package (optional
+# dependency), which each user builds from their own download with the
+# omarchy-nvidia-sdks repository. Without it the daemon runs normally and a
+# requested effect reports why it failed. This package installs nothing for
+# Maxine except the example drop-in that runs the daemon with the SDK; to use
+# it, install maxine-vfx-sdk-local, then copy the drop-in
+# (docs/setup/maxine.md, section 3):
 #   /usr/share/doc/omarchy-broadcast/examples/systemd/omarchy-broadcastd.service.d/maxine.conf
 
 pkgname=omarchy-broadcast-git
 _pkgname=omarchy-broadcast
-pkgver=0.19.0
+pkgver=0.20.0
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API and a CLI'
 arch=('x86_64')
@@ -65,10 +66,9 @@ makedepends=(
   'git'
   'clang'                  # bindgen (libspa-sys, pipewire-sys) for the PipeWire node
   'libpipewire'            # the libpipewire and SPA headers
-)  # the shim also needs make and gcc, both in base-devel
+)
 checkdepends=(
   'dbus'                   # /usr/bin/dbus-daemon: the process and CLI tests run a private bus
-  'python'                 # the os-release shim test exercises python3's open(); skipped without it
   'pipewire'               # client.conf: the PipeWire node's unit tests create a PipeWire context (no daemon)
 )
 optdepends=(
@@ -77,6 +77,7 @@ optdepends=(
   'pipewire: the optional PipeWire camera node ([pipewire] enabled in config.toml) and the optional noise-removed microphone'
   'noise-suppression-for-voice: RNNoise engine for the noise-removed microphone (default)'
   'deepfilternet-ladspa: DeepFilterNet engine for the noise-removed microphone'
+  'maxine-vfx-sdk-local: NVIDIA Maxine video effects (build it from omarchy-nvidia-sdks)'
 )
 # No LTO: with makepkg's -flto, libspa's build script compiles its C wrapper
 # into GCC LTO bitcode, which rust-lld cannot link (undefined libspa_rs_*).
@@ -107,10 +108,6 @@ build() {
   export CARGO_TARGET_DIR=target
   cargo build --frozen --release --features omarchy-broadcastd/pipewire \
     -p omarchy-broadcastd -p omarchy-broadcast
-
-  # The os-release shim: target/os-release-shim/os-release-shim.so. The
-  # Makefile takes CFLAGS and LDFLAGS from makepkg's environment.
-  make -C tools/os-release-shim
 }
 
 check() {
@@ -123,12 +120,10 @@ check() {
   # PipeWire node's unit tests (the feature the package is built with);
   # they contact no PipeWire daemon, and the live PipeWire tests are
   # ignored.
-  env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u OMARCHY_BROADCAST_OS_RELEASE \
+  env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u MAXINE_OS_RELEASE \
     cargo test --frozen --workspace
-  env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u OMARCHY_BROADCAST_OS_RELEASE \
+  env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u MAXINE_OS_RELEASE \
     cargo test --frozen -p obc-pipeline -p omarchy-broadcastd --features omarchy-broadcastd/pipewire
-  env -u LD_PRELOAD -u OMARCHY_BROADCAST_OS_RELEASE -u OMARCHY_BROADCAST_OS_RELEASE_DEBUG \
-    make -C tools/os-release-shim test
 }
 
 package() {
@@ -147,34 +142,20 @@ package() {
 
   # Documentation, in the repository's layout so that links between the
   # shipped files resolve. Links to files that are not shipped (decision
-  # records, benchmarks, tests, tools, sources) refer to the repository.
+  # records, benchmarks, tests, sources) refer to the repository.
   local doc="$pkgdir/usr/share/doc/$_pkgname"
   install -Dm644 -t "$doc" README.md
   install -Dm644 -t "$doc/docs" docs/dbus-api.md docs/cli-json.md docs/config.example.toml
   install -Dm644 -t "$doc/docs/setup" docs/setup/*.md
 
-  # Opt-in drop-ins, shipped as inactive examples: one orders WirePlumber
-  # after the daemon, the other runs the daemon with a user-installed Maxine
-  # SDK. Each file's header says where to copy it.
+  # Opt-in drop-ins, shipped verbatim as inactive examples: one orders
+  # WirePlumber after the daemon, the other runs the daemon with the Maxine
+  # SDK of the maxine-vfx-sdk-local package. Each file's header says where to
+  # copy it.
   install -Dm644 -t "$doc/examples/systemd/wireplumber.service.d" \
     dist/systemd/wireplumber.service.d/omarchy-broadcast.conf
-
-  # The os-release shim and its replacement os-release, installed but inactive
-  # (activation is the drop-in above). The example drop-in is generated from
-  # the repository's, which names the per-user locations: only its
-  # Environment= lines are rewritten to the packaged ones.
-  install -Dm755 target/os-release-shim/os-release-shim.so \
-    "$pkgdir/usr/lib/$_pkgname/os-release-shim.so"
-  install -Dm644 tools/maxine-probe/fake-os-release \
-    "$pkgdir/usr/lib/$_pkgname/fake-os-release"
-  local maxine_conf="$doc/examples/systemd/omarchy-broadcastd.service.d/maxine.conf"
-  install -d "${maxine_conf%/*}"
-  sed '/^Environment=/s|%h/\.local/lib/omarchy-broadcast/|/usr/lib/omarchy-broadcast/|' \
-    dist/systemd/omarchy-broadcastd.service.d/maxine.conf >"$maxine_conf"
-  chmod 644 "$maxine_conf"
-  grep -qx 'Environment=LD_PRELOAD=/usr/lib/omarchy-broadcast/os-release-shim.so' "$maxine_conf" &&
-    grep -qx 'Environment=OMARCHY_BROADCAST_OS_RELEASE=/usr/lib/omarchy-broadcast/fake-os-release' "$maxine_conf" ||
-    { echo 'maxine.conf: the /usr/lib/omarchy-broadcast rewrite did not take' >&2; return 1; }
+  install -Dm644 dist/systemd/omarchy-broadcastd.service.d/maxine.conf \
+    "$doc/examples/systemd/omarchy-broadcastd.service.d/maxine.conf"
 
   # The optional noise-removed microphone: the filter-chain configurations
   # and the template unit, inactive (docs/setup/microphone.md). The packaged

@@ -2,8 +2,10 @@
 //! (`docs/adr/0012-video-effects-and-maxine-backend.md`).
 //!
 //! The user-installed SDK is opened at run time with `dlopen`, never linked
-//! and never vendored. [`MaxineFactory`] finds it (`$MAXINE_VFX_ROOT/lib`,
-//! else the library search path) and reports what to do when it cannot;
+//! and never vendored. [`MaxineFactory`] finds it (`$MAXINE_VFX_ROOT/lib`;
+//! with the variable unset, [`DEFAULT_ROOT`]`/lib` when that directory
+//! exists; else the library search path) and reports what to do when it
+//! cannot;
 //! [`MaxineBackend`] implements [`InferenceBackend`] for `blur` and
 //! `replace`, each with or without the denoise stage, and for the denoise
 //! stage alone (`none` with [`LoadRequest::denoise`]).
@@ -39,7 +41,7 @@
 //!
 //! The process needs the SDK's library directories on `LD_LIBRARY_PATH` and,
 //! on a distribution the SDK does not list, the os-release override
-//! (`docs/setup/maxine.md`, sections 7 and 8).
+//! (`docs/setup/maxine.md`, sections 3 and 4).
 
 use std::cell::Cell;
 use std::ffi::{CString, c_void};
@@ -62,6 +64,11 @@ use ffi::{NvCvImage, NvCvStatus, Sdk, StateHandle, VfxHandle};
 /// The environment variable that names the SDK root (the directory with
 /// `lib/`, `features/` and `external/`).
 pub const ROOT_ENV: &str = "MAXINE_VFX_ROOT";
+
+/// The SDK root used when [`ROOT_ENV`] is unset or empty and this directory
+/// exists: where the `maxine-vfx-sdk-local` package (built from
+/// omarchy-nvidia-sdks) installs the SDK tree.
+pub const DEFAULT_ROOT: &str = "/opt/nvidia/maxine/videofx";
 
 /// The smallest frame the green-screen effect accepts.
 pub const MIN_WIDTH: u32 = 512;
@@ -223,17 +230,29 @@ fn parse_denoise_strength(value: Option<&std::ffi::OsStr>) -> Result<f32, String
     }
 }
 
+/// The SDK root from the [`ROOT_ENV`] value: set and non-empty is that
+/// root; unset or empty is `default` when it is a directory, else `None`
+/// (the library search path only).
+fn resolve_root(value: Option<&std::ffi::OsStr>, default: &Path) -> Option<PathBuf> {
+    match value.filter(|v| !v.is_empty()) {
+        Some(v) => Some(PathBuf::from(v)),
+        None => default.is_dir().then(|| default.to_path_buf()),
+    }
+}
+
 impl MaxineFactory {
-    /// Uses `$MAXINE_VFX_ROOT` (unset or empty: the library search path only).
+    /// Uses `$MAXINE_VFX_ROOT`; unset or empty, [`DEFAULT_ROOT`] when that
+    /// directory exists, else the library search path only.
     ///
     /// For development, [`DENOISE_STRENGTH_ENV`] (`0` or `1`) overrides
     /// [`DEFAULT_DENOISE_STRENGTH`]. Any other value makes every load that
     /// asks for the denoise stage fail with [`BackendError::Denoise`] naming
     /// the variable; loads without it are unaffected.
     pub fn from_env() -> MaxineFactory {
-        let root = std::env::var_os(ROOT_ENV)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from);
+        let root = resolve_root(
+            std::env::var_os(ROOT_ENV).as_deref(),
+            Path::new(DEFAULT_ROOT),
+        );
         let mut f = MaxineFactory::with_root(root);
         f.denoise_strength =
             parse_denoise_strength(std::env::var_os(DENOISE_STRENGTH_ENV).as_deref());
@@ -334,14 +353,14 @@ fn model_dir(sdk: &Sdk) -> Result<PathBuf, BackendError> {
     let dir = sdk.model_dir.clone().ok_or_else(|| {
         BackendError::Unavailable(
             "the Maxine model directory could not be located (the loader did not report where \
-             libVideoFX.so is); set MAXINE_VFX_ROOT (docs/setup/maxine.md)"
+             libVideoFX.so is); set MAXINE_VFX_ROOT (docs/setup/maxine.md, section 4)"
                 .into(),
         )
     })?;
     if !dir.is_dir() {
         return Err(BackendError::Unavailable(format!(
             "the Maxine model directory {} does not exist; install the models for this GPU \
-             into $MAXINE_VFX_ROOT/lib/models (docs/setup/maxine.md)",
+             into the SDK root's lib/models (docs/setup/maxine.md, section 7)",
             dir.display()
         )));
     }
@@ -386,17 +405,17 @@ fn explain(sdk: &Sdk, call: &str, code: NvCvStatus, model_dir: &Path) -> String 
         ffi::NVCV_ERR_UNIMPLEMENTED if call.starts_with("NvVFX_CreateEffect") => format!(
             "{base}: the SDK could not open the effect's feature library \
              ({}). Put the SDK's features/*/lib directories on LD_LIBRARY_PATH before the \
-             process starts (docs/setup/maxine.md, section 8)",
+             process starts (docs/setup/maxine.md, section 4)",
             feature_library(call)
         ),
         ffi::NVCV_ERR_CUDA_KERNEL if call.starts_with("NvVFX_Load") => format!(
             "{base}: the SDK rejected this distribution (its model loader reads \
              /etc/os-release). Run the process with the os-release override \
-             (docs/setup/maxine.md, section 7)"
+             (docs/setup/maxine.md, section 3)"
         ),
         ffi::NVCV_ERR_FILE => format!(
             "{base}: the models were not found in {}; install the models for this GPU \
-             (docs/setup/maxine.md, section 10)",
+             (docs/setup/maxine.md, section 7)",
             model_dir.display()
         ),
         _ => base,
@@ -1749,8 +1768,10 @@ mod tests {
             panic!("expected Unavailable, got {e:?}");
         };
         assert!(m.contains("SDK was not found"), "{m}");
-        assert!(m.contains("MAXINE_VFX_ROOT="), "{m}");
+        assert!(m.contains("The SDK root"), "{m}");
+        assert!(m.contains("MAXINE_VFX_ROOT"), "{m}");
         assert!(m.contains(&dir.path().display().to_string()), "{m}");
+        assert!(!m.contains("is not set,"), "a root is in use: {m}");
         assert!(m.contains("docs/setup/maxine.md"), "{m}");
         assert!(f.create().is_err());
     }
@@ -1760,7 +1781,9 @@ mod tests {
         let e = failing(None).probe().unwrap_err();
         let m = e.to_string();
         assert!(matches!(e, BackendError::Unavailable(_)));
-        assert!(m.contains("MAXINE_VFX_ROOT is not set"), "{m}");
+        assert!(m.contains("MAXINE_VFX_ROOT is unset or empty"), "{m}");
+        assert!(m.contains(DEFAULT_ROOT), "{m}");
+        assert!(m.contains("maxine-vfx-sdk-local"), "{m}");
     }
 
     #[test]
@@ -1984,6 +2007,31 @@ mod tests {
             assert!(matches!(e, BackendError::InvalidInput(_)), "{e:?}");
             assert!(e.to_string().contains("0 (weak) or 1 (strong)"), "{e}");
         }
+    }
+
+    #[test]
+    fn the_root_is_the_variable_else_the_default_directory_else_none() {
+        use std::ffi::OsStr;
+        let default = tempfile::tempdir().unwrap();
+        let present = default.path();
+        let absent = present.join("no-sdk");
+        // Set and non-empty: that root, whether or not the default exists.
+        for d in [present, absent.as_path()] {
+            assert_eq!(
+                resolve_root(Some(OsStr::new("/some/sdk")), d),
+                Some(PathBuf::from("/some/sdk"))
+            );
+        }
+        // Unset or empty: the default when it is a directory.
+        for v in [None, Some(OsStr::new(""))] {
+            assert_eq!(resolve_root(v, present), Some(present.to_path_buf()));
+            assert_eq!(resolve_root(v, &absent), None);
+        }
+        // A file at the default path is not an SDK root.
+        let file = present.join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(resolve_root(None, &file), None);
+        assert_eq!(DEFAULT_ROOT, "/opt/nvidia/maxine/videofx");
     }
 
     #[test]

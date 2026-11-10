@@ -28,30 +28,35 @@
 //! The effects test (`effects_switch_while_streaming_and_release_the_gpu`)
 //! also needs the NVIDIA Maxine Video Effects SDK (`MAXINE_VFX_ROOT`, the
 //! libraries on `LD_LIBRARY_PATH`) and the os-release override of
-//! `docs/setup/maxine.md`: the shim of `tools/os-release-shim`
-//! (`make -C tools/os-release-shim`) and `OMARCHY_BROADCAST_OS_RELEASE`. The
-//! daemon is a child of the test binary, and the shim removes `LD_PRELOAD`
-//! from the environment of the process it is loaded into, so a preload on
-//! the test (or on `cargo`) never reaches the daemon. Name the shim in
+//! `docs/setup/maxine.md`: the os-release shim and `MAXINE_OS_RELEASE`, all
+//! of which the `maxine-vfx-sdk-local` package (built from
+//! omarchy-nvidia-sdks) provides, with its environment file. The daemon is a
+//! child of the test binary, and the shim removes `LD_PRELOAD` from the
+//! environment of the process it is loaded into, so a preload on the test
+//! (or on `cargo`) never reaches the daemon. Name the shim in
 //! `OBC_TEST_PRELOAD` (an absolute path) instead: the test starts the daemon
-//! with `LD_PRELOAD` set to it, and the daemon inherits
-//! `OMARCHY_BROADCAST_OS_RELEASE`. Everything runs in the user's own namespaces:
+//! with `LD_PRELOAD` set to it, and the daemon inherits `MAXINE_VFX_ROOT`,
+//! `LD_LIBRARY_PATH` and `MAXINE_OS_RELEASE`. Everything runs in the user's
+//! own namespaces:
 //!
 //! ```text
-//! source tools/maxine-probe/env.sh
-//! MAXINE_VFX_ROOT=$P OMARCHY_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release \
-//!     OBC_TEST_PRELOAD=$PWD/target/os-release-shim/os-release-shim.so \
+//! set -a; . /usr/share/maxine-vfx/maxine-vfx.env; set +a
+//! OBC_TEST_PRELOAD=$MAXINE_VFX_OS_RELEASE_SHIM \
 //!     OBC_TEST_SINK=/dev/video11 OBC_TEST_CAMERA=046d:0944 OBC_TEST_CAMERA_2=5986:1193 \
 //!     cargo test -p omarchy-broadcastd --test hardware -- --ignored --test-threads=1 --nocapture
 //! ```
 //!
-//! (`$P` and `$LD_LIBRARY_PATH` as `tools/maxine-probe/env.sh` sets them.)
+//! With the package, `MAXINE_VFX_ROOT` may be left unset: the daemon then
+//! uses the package's tree, `/opt/nvidia/maxine/videofx`. For an SDK tree
+//! without the package, set `MAXINE_VFX_ROOT`, `LD_LIBRARY_PATH` and
+//! `MAXINE_OS_RELEASE` as omarchy-nvidia-sdks `docs/usage.md` describes.
 //!
 //! The noise removal test
 //! (`denoise_stacks_with_the_effect_while_streaming_and_the_gpu_parks`)
 //! needs the same, with the SDK's noise removal feature installed and its
-//! library directory (`features/nvvfxdenoising/lib`, which
-//! `tools/maxine-probe/env.sh` adds) on `LD_LIBRARY_PATH`.
+//! library directory (`features/nvvfxdenoising/lib`, which the package's
+//! environment file lists when the package was built with that feature) on
+//! `LD_LIBRARY_PATH`.
 
 mod common;
 
@@ -959,7 +964,7 @@ const IGNORE_EFFECTS: &str = "needs OBC_TEST_SINK (a free v4l2loopback device wi
      exclusive_caps=1), OBC_TEST_CAMERA, an NVIDIA GPU with nvidia-smi, /usr/bin/dbus-daemon, \
      cargo, gst-launch-1.0, the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT, LD_LIBRARY_PATH) and \
      the os-release override for the daemon (OBC_TEST_PRELOAD, the absolute path of the \
-     os-release shim, and OMARCHY_BROADCAST_OS_RELEASE; see the module docs)";
+     os-release shim, and MAXINE_OS_RELEASE; see the module docs)";
 
 /// The GPU memory nvidia-smi lists for `pid`'s compute context, in MiB
 /// (`None`: no context).
@@ -1060,7 +1065,7 @@ fn consumer_fps(consumer: &Consumer, span: Duration) -> f64 {
 /// with no session restart, the consumer's rate and caps unchanged, and the
 /// GPU released when idle.
 #[test]
-#[ignore = "needs OBC_TEST_SINK (a free v4l2loopback device with exclusive_caps=1), OBC_TEST_CAMERA, an NVIDIA GPU with nvidia-smi, /usr/bin/dbus-daemon, cargo, gst-launch-1.0, the NVIDIA Maxine VFX SDK and OBC_TEST_PRELOAD with OMARCHY_BROADCAST_OS_RELEASE (the os-release override for the daemon)"]
+#[ignore = "needs OBC_TEST_SINK (a free v4l2loopback device with exclusive_caps=1), OBC_TEST_CAMERA, an NVIDIA GPU with nvidia-smi, /usr/bin/dbus-daemon, cargo, gst-launch-1.0, the NVIDIA Maxine VFX SDK and OBC_TEST_PRELOAD with MAXINE_OS_RELEASE (the os-release override for the daemon)"]
 fn effects_switch_while_streaming_and_release_the_gpu() {
     let sink = PathBuf::from(
         std::env::var("OBC_TEST_SINK")
@@ -1697,7 +1702,7 @@ fn the_daemon_parks_the_gpu_when_idle() {
 const IGNORE_DENOISE: &str = "needs OBC_TEST_SINK (a free v4l2loopback device with \
      exclusive_caps=1), OBC_TEST_CAMERA, an NVIDIA GPU with a driver that has the CUDA \
      checkpoint API, /usr/bin/dbus-daemon, cargo, the NVIDIA Maxine VFX SDK with its noise \
-     removal feature and OBC_TEST_PRELOAD with OMARCHY_BROADCAST_OS_RELEASE (see the module \
+     removal feature and OBC_TEST_PRELOAD with MAXINE_OS_RELEASE (see the module \
      docs)";
 
 /// Noise removal on a live stream: alone with `none`, then stacked under
@@ -1707,7 +1712,7 @@ const IGNORE_DENOISE: &str = "needs OBC_TEST_SINK (a free v4l2loopback device wi
 /// with it, is torn down and the daemon parks the GPU (no `/dev/nvidia*`
 /// descriptor or mapping left).
 #[test]
-#[ignore = "needs OBC_TEST_SINK (a free v4l2loopback device with exclusive_caps=1), OBC_TEST_CAMERA, an NVIDIA GPU with a driver that has the CUDA checkpoint API, /usr/bin/dbus-daemon, cargo, the NVIDIA Maxine VFX SDK with its noise removal feature and OBC_TEST_PRELOAD with OMARCHY_BROADCAST_OS_RELEASE"]
+#[ignore = "needs OBC_TEST_SINK (a free v4l2loopback device with exclusive_caps=1), OBC_TEST_CAMERA, an NVIDIA GPU with a driver that has the CUDA checkpoint API, /usr/bin/dbus-daemon, cargo, the NVIDIA Maxine VFX SDK with its noise removal feature and OBC_TEST_PRELOAD with MAXINE_OS_RELEASE"]
 fn denoise_stacks_with_the_effect_while_streaming_and_the_gpu_parks() {
     let sink = PathBuf::from(
         std::env::var("OBC_TEST_SINK")

@@ -7,8 +7,8 @@
 //! with `cargo test -p gst-obc --test hardware -- --ignored gpu_ --test-threads=1`.
 //!
 //! The ones named `maxine_*` also need the Maxine SDK, set up as for
-//! `crates/obc-backend-maxine/tests/hardware.rs` (`MAXINE_VFX_ROOT`, its
-//! library directories on `LD_LIBRARY_PATH`, the os-release shim preloaded
+//! `crates/obc-backend-maxine/tests/hardware.rs` (the environment file of
+//! the `maxine-vfx-sdk-local` package loaded, the os-release shim preloaded
 //! through the cargo runner); run them with `-- --ignored maxine_
 //! --test-threads=1`.
 //!
@@ -1222,6 +1222,12 @@ fn gpu_the_new_source_flag_resets_the_temporal_state_once() {
     assert_eq!(get(&fake.log.wrong_context), 0);
 }
 
+/// What the `maxine_*` tests need before the factory can find the SDK.
+const MAXINE_SETUP: &str = "this test needs the Maxine SDK: install the maxine-vfx-sdk-local \
+     package and load its environment (set -a; . /usr/share/maxine-vfx/maxine-vfx.env; set +a), \
+     or set MAXINE_VFX_ROOT, LD_LIBRARY_PATH and MAXINE_OS_RELEASE as omarchy-nvidia-sdks \
+     docs/usage.md describes (crates/obc-backend-maxine/tests/hardware.rs has the setup)";
+
 /// The Maxine mask-hardening kernel fails closed through the element: a
 /// kernel that does not load fails the effect, and a kernel launch that
 /// fails on a frame blacks that frame, both with the reason in the status.
@@ -1232,13 +1238,9 @@ fn gpu_the_new_source_flag_resets_the_temporal_state_once() {
             LD_LIBRARY_PATH), the os-release override, an NVIDIA GPU and the GStreamer CUDA \
             elements"]
 fn maxine_mask_kernel_failures_show_black_with_the_reason() {
-    assert!(
-        std::env::var_os(obc_backend_maxine::ROOT_ENV).is_some_and(|v| !v.is_empty()),
-        "this test needs the Maxine SDK: set MAXINE_VFX_ROOT and put its library directories \
-         on LD_LIBRARY_PATH (crates/obc-backend-maxine/tests/hardware.rs has the setup)"
-    );
     let switch = MaskFaultSwitch::default();
     let maxine = MaxineFactory::from_env().with_mask_faults(switch.clone());
+    assert!(maxine.root().is_some(), "{MAXINE_SETUP}");
     maxine
         .probe()
         .unwrap_or_else(|e| panic!("Maxine probe failed: {e}"));
@@ -1304,12 +1306,8 @@ fn maxine_mask_kernel_failures_show_black_with_the_reason() {
             its library directories on LD_LIBRARY_PATH), the os-release override, an NVIDIA \
             GPU and the GStreamer CUDA elements"]
 fn maxine_denoise_alone_under_blur_and_toggled_while_playing() {
-    assert!(
-        std::env::var_os(obc_backend_maxine::ROOT_ENV).is_some_and(|v| !v.is_empty()),
-        "this test needs the Maxine SDK: set MAXINE_VFX_ROOT and put its library directories \
-         on LD_LIBRARY_PATH (crates/obc-backend-maxine/tests/hardware.rs has the setup)"
-    );
     let maxine = MaxineFactory::from_env();
+    assert!(maxine.root().is_some(), "{MAXINE_SETUP}");
     maxine
         .probe()
         .unwrap_or_else(|e| panic!("Maxine probe failed: {e}"));
