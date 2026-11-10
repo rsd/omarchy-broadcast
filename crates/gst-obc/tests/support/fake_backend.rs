@@ -1,9 +1,15 @@
 //! A fake inference backend for the effect tests: no models, a
 //! configurable load delay and failures, and an output that is easy to
 //! recognise: `blur` writes Y = [`FAKE_BLUR_Y`], `replace` Y =
-//! [`FAKE_REPLACE_Y`], the denoise stage alone Y = [`FAKE_DENOISE_Y`], all
-//! with neutral chroma unless the denoise stage ran, which writes chroma
-//! [`FAKE_DENOISE_UV`] instead, through `obc-gpu` on the stream it is given.
+//! [`FAKE_REPLACE_Y`], the denoise stage alone Y = [`FAKE_DENOISE_Y`], the
+//! relight stage alone (with or without denoise) Y = [`FAKE_RELIGHT_Y`],
+//! and the relight stage under an effect adds [`FAKE_RELIGHT_DY`] to the
+//! effect's Y; all with neutral chroma unless the denoise stage ran, which
+//! writes chroma [`FAKE_DENOISE_UV`] instead, through `obc-gpu` on the
+//! stream it is given.
+//! Like Maxine, its `reset_temporal` drops a loaded relight stage and returns
+//! it (unless `FakeConfig::relight_resets_in_place`); each build of the
+//! stage is numbered, so a test can tell which one relit a frame.
 //! It records every call and whether the caller kept the context and stream
 //! rules of `obc_backend::InferenceBackend`. Like a real backend, it reports
 //! a frame's stage timings (`timings`) only once that frame's work has
@@ -23,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use obc_backend::{
     BackendError, BackendFactory, DeviceNv12, EffectKind, FrameParams, GpuContext,
-    InferenceBackend, LoadReport, LoadRequest, StageTimings,
+    InferenceBackend, LoadReport, LoadRequest, RelightLight, Stage, StageList, StageTimings,
 };
 use obc_gpu::Event;
 
@@ -38,6 +44,12 @@ pub const FAKE_DENOISE_UV: u8 = 90;
 /// The denoise stage time the fake reports (`timings`), in ms, for a
 /// completed frame the stage ran on.
 pub const FAKE_DENOISE_MS: f32 = 0.25;
+/// The luma the fake relight stage writes when it runs without an effect.
+pub const FAKE_RELIGHT_Y: u8 = 150;
+/// What the fake relight stage adds to an effect's luma.
+pub const FAKE_RELIGHT_DY: u8 = 10;
+/// The relight stage time the fake reports, as [`FAKE_DENOISE_MS`].
+pub const FAKE_RELIGHT_MS: f32 = 0.5;
 
 /// A test's action, run by the fake on the streaming thread (see
 /// [`FakeConfig::on_process`]).
@@ -72,12 +84,33 @@ pub struct FakeConfig {
     /// `process` fails with this reason (after `fail_denoise_process`, so
     /// with both set a frame fails in the stage, then again without it).
     pub fail_process: Option<String>,
-    /// A `load` with `denoise` fails with `BackendError::Denoise` and this
+    /// A `load` with the denoise stage fails with `BackendError::Stage` and this
     /// reason (nothing of the request in force, as the seam says).
     pub fail_denoise_load: Option<String>,
     /// A `process` with the denoise stage loaded fails with
-    /// `BackendError::Denoise` and this reason, and drops the stage.
+    /// `BackendError::Stage` and this reason, and drops the stage.
     pub fail_denoise_process: Option<String>,
+    /// A `load` with the relight stage fails with `BackendError::Stage`
+    /// for it and this reason (after `fail_denoise_load`).
+    pub fail_relight_load: Option<String>,
+    /// A `load` on a loaded instance that gives the loaded relight stage a
+    /// new light fails with `BackendError::Stage` for it and this reason,
+    /// and, as the seam says of that switch, drops the stage: the previous
+    /// chain stays, without it.
+    pub fail_relight_rebind: Option<String>,
+    /// Run once (then cleared) when `fail_relight_rebind` fails a load,
+    /// before the error is returned, on the caller's (worker) thread: a
+    /// test's action between a failed switch and what the element does
+    /// next.
+    pub on_rebind_failure: Option<Hook>,
+    /// `reset_temporal` keeps a loaded relight stage instead of dropping
+    /// and returning it (by default the fake drops it, as Maxine does,
+    /// whose relighting state cannot be reset).
+    pub relight_resets_in_place: bool,
+    /// A `process` with the relight stage loaded fails with
+    /// `BackendError::Stage` for it and this reason, and drops the stage
+    /// (after `fail_denoise_process`, before `fail_process`).
+    pub fail_relight_process: Option<String>,
     /// Run once at the start of the next `process` (then cleared), before
     /// the failures above are checked: a test's action while a frame is in
     /// the backend (the element's streaming thread holds its engine lock).
@@ -108,6 +141,27 @@ pub struct FakeLog {
     pub resets: AtomicU64,
     /// `process` calls that ran the denoise stage.
     pub denoised: AtomicU64,
+    /// `process` calls that ran the relight stage.
+    pub relit: AtomicU64,
+    /// Successful loads as (effect, stages, relight light), in order.
+    pub stage_requests: Mutex<Vec<(EffectKind, Vec<Stage>, RelightLight)>>,
+    /// The relight direction and gain of the last frame that ran the
+    /// relight stage, in thousandths.
+    pub last_relight_milli: Mutex<Option<(i64, i64)>>,
+    /// Relight stages built (a load that adds the stage; a new light on a
+    /// loaded one builds none). The first is 1.
+    pub relight_builds: AtomicU64,
+    /// For each `process` call that ran the relight stage, the build
+    /// ([`Self::relight_builds`]) that relit it, in order.
+    pub relit_by: Mutex<Vec<u64>>,
+    /// `reset_temporal` calls that dropped the relight stage.
+    pub relight_resets_dropped: AtomicU64,
+    /// Denoise stages built (a successful load that adds the stage; one
+    /// that keeps a loaded stage builds none): the denoise model loads.
+    pub denoise_builds: AtomicU64,
+    /// Successful loads that gave the loaded relight stage a new light (a
+    /// live rebind, no model load).
+    pub relight_rebinds: AtomicU64,
 }
 
 impl FakeLog {
@@ -159,10 +213,13 @@ impl BackendFactory for FakeFactory {
             log: Arc::clone(&self.log),
             loaded: None,
             denoise: false,
+            relight: false,
+            light: RelightLight::default(),
+            relight_build: 0,
             stream: 0,
             context: 0,
             done: None,
-            timed: false,
+            timed: (false, false),
         }))
     }
 }
@@ -173,14 +230,20 @@ pub struct FakeBackend {
     loaded: Option<EffectKind>,
     /// The denoise stage is loaded (with `loaded`).
     denoise: bool,
+    /// The relight stage is loaded (with `loaded`).
+    relight: bool,
+    /// Its light, and which build of it is loaded
+    /// ([`FakeLog::relight_builds`]).
+    light: RelightLight,
+    relight_build: u64,
     /// The stream and context of the last load (as addresses: Send).
     stream: usize,
     context: usize,
     /// Recorded on the stream after each frame's work (created with the
     /// first frame, in the loaded context; dropped on unload).
     done: Option<Event>,
-    /// The denoise stage ran on the last frame.
-    timed: bool,
+    /// The stages that ran on the last frame (denoise, relight).
+    timed: (bool, bool),
 }
 
 impl FakeBackend {
@@ -199,6 +262,8 @@ impl InferenceBackend for FakeBackend {
 
     fn load(&mut self, gpu: &GpuContext, req: &LoadRequest) -> Result<LoadReport, BackendError> {
         self.check_context(gpu.context);
+        let denoise = req.stages.contains(Stage::Denoise);
+        let relight = req.stages.contains(Stage::Relight);
         let cfg = self.config.lock().unwrap().clone();
         let t0 = Instant::now();
         let reused = self.loaded.is_some();
@@ -213,28 +278,58 @@ impl InferenceBackend for FakeBackend {
             if !reused {
                 self.loaded = None;
                 self.denoise = false;
+                self.relight = false;
             }
             return Err(BackendError::Load {
                 code: -1,
                 message: r,
             });
         }
-        if req.denoise
-            && let Some(r) = cfg.fail_denoise_load
-        {
-            if !reused {
-                self.loaded = None;
-                self.denoise = false;
+        for (stage, wanted, fail) in [
+            (Stage::Denoise, denoise, cfg.fail_denoise_load),
+            (Stage::Relight, relight, cfg.fail_relight_load),
+        ] {
+            if wanted && let Some(r) = fail {
+                if !reused {
+                    self.loaded = None;
+                    self.denoise = false;
+                    self.relight = false;
+                } else {
+                    // The previous chain stays, less the stage (the seam:
+                    // without it if it was not in it, the same).
+                    match stage {
+                        Stage::Denoise => self.denoise = false,
+                        Stage::Relight => self.relight = false,
+                    }
+                }
+                return Err(BackendError::Stage {
+                    stage,
+                    code: -3,
+                    message: r,
+                });
             }
-            return Err(BackendError::Denoise {
-                code: -3,
+        }
+        if reused
+            && relight
+            && self.relight
+            && self.light != req.relight_light
+            && let Some(r) = cfg.fail_relight_rebind
+        {
+            self.relight = false;
+            let hook = self.config.lock().unwrap().on_rebind_failure.take();
+            if let Some(hook) = hook {
+                (hook.0)();
+            }
+            return Err(BackendError::Stage {
+                stage: Stage::Relight,
+                code: -6,
                 message: r,
             });
         }
         match (req.effect, &req.background) {
-            (EffectKind::None, _) if !req.denoise => {
+            (EffectKind::None, _) if req.stages.is_empty() => {
                 return Err(BackendError::InvalidInput(
-                    "load(None) without denoise".into(),
+                    "load(None) without a stage".into(),
                 ));
             }
             (EffectKind::Replace, None) => {
@@ -258,8 +353,18 @@ impl InferenceBackend for FakeBackend {
             }
             _ => {}
         }
+        if relight && !(reused && self.relight) {
+            self.relight_build = self.log.relight_builds.fetch_add(1, Ordering::SeqCst) + 1;
+        } else if relight && self.light != req.relight_light {
+            self.log.relight_rebinds.fetch_add(1, Ordering::SeqCst);
+        }
+        if denoise && !(reused && self.denoise) {
+            self.log.denoise_builds.fetch_add(1, Ordering::SeqCst);
+        }
         self.loaded = Some(req.effect);
-        self.denoise = req.denoise;
+        self.denoise = denoise;
+        self.relight = relight;
+        self.light = req.relight_light;
         self.stream = gpu.stream as usize;
         self.context = gpu.context as usize;
         self.log.loads.fetch_add(1, Ordering::SeqCst);
@@ -268,7 +373,12 @@ impl InferenceBackend for FakeBackend {
             .requests
             .lock()
             .unwrap()
-            .push((req.effect, req.denoise));
+            .push((req.effect, denoise));
+        self.log.stage_requests.lock().unwrap().push((
+            req.effect,
+            req.stages.as_slice().to_vec(),
+            req.relight_light,
+        ));
         let ms = t0.elapsed().as_secs_f64() * 1e3;
         Ok(LoadReport {
             load_ms: ms,
@@ -299,8 +409,20 @@ impl InferenceBackend for FakeBackend {
         {
             // The stage is dropped; the next call runs without it.
             self.denoise = false;
-            return Err(BackendError::Denoise {
+            return Err(BackendError::Stage {
+                stage: Stage::Denoise,
                 code: -4,
+                message: r,
+            });
+        }
+        if self.relight
+            && self.loaded.is_some()
+            && let Some(r) = cfg.fail_relight_process
+        {
+            self.relight = false;
+            return Err(BackendError::Stage {
+                stage: Stage::Relight,
+                code: -5,
                 message: r,
             });
         }
@@ -313,8 +435,14 @@ impl InferenceBackend for FakeBackend {
         let y = match self.loaded {
             Some(EffectKind::Blur) => FAKE_BLUR_Y,
             Some(EffectKind::Replace) => FAKE_REPLACE_Y,
+            Some(EffectKind::None) if self.relight => FAKE_RELIGHT_Y,
             Some(EffectKind::None) if self.denoise => FAKE_DENOISE_Y,
             _ => return Err(BackendError::InvalidInput("not loaded".into())),
+        };
+        let y = if self.relight && self.loaded != Some(EffectKind::None) {
+            y + FAKE_RELIGHT_DY
+        } else {
+            y
         };
         let uv = if self.denoise { FAKE_DENOISE_UV } else { 128 };
         src.validate()?;
@@ -322,6 +450,15 @@ impl InferenceBackend for FakeBackend {
         self.log.processes.fetch_add(1, Ordering::SeqCst);
         if self.denoise {
             self.log.denoised.fetch_add(1, Ordering::SeqCst);
+        }
+        if self.relight {
+            self.log.relit.fetch_add(1, Ordering::SeqCst);
+            self.log.relit_by.lock().unwrap().push(self.relight_build);
+            let (pan, gain) = params.relight();
+            *self.log.last_relight_milli.lock().unwrap() = Some((
+                (pan * 1000.0).round() as i64,
+                (gain * 1000.0).round() as i64,
+            ));
         }
         self.log.last_strength_milli.store(
             (params.blur_strength * 1000.0).round() as u64,
@@ -345,13 +482,14 @@ impl InferenceBackend for FakeBackend {
                 .expect("created above")
                 .record(gpu.stream)?
         };
-        self.timed = self.denoise;
+        self.timed = (self.denoise, self.relight);
         Ok(())
     }
 
     fn unload(&mut self) {
         self.denoise = false;
-        self.timed = false;
+        self.relight = false;
+        self.timed = (false, false);
         // Destroyed with the context current (the caller's rule for unload).
         self.done = None;
         if self.loaded.take().is_some() {
@@ -360,8 +498,8 @@ impl InferenceBackend for FakeBackend {
         }
     }
 
-    /// Only the denoise stage is "timed" (a constant), so the element's
-    /// denoise window can be checked; and only once the last frame's work
+    /// Only the stages are "timed" (constants), so the element's stage
+    /// windows can be checked; and only once the last frame's work
     /// has completed, as the trait says (a real backend reads its CUDA
     /// events): before the caller synchronises the stream, the frame is
     /// most likely still queued and there is nothing to report.
@@ -370,16 +508,26 @@ impl InferenceBackend for FakeBackend {
             .done
             .as_ref()
             .is_some_and(|e| e.is_complete().unwrap_or(false));
-        (self.loaded.is_some() && self.timed && complete).then(|| StageTimings {
-            denoise_ms: FAKE_DENOISE_MS,
+        let (denoise, relight) = self.timed;
+        (self.loaded.is_some() && (denoise || relight) && complete).then(|| StageTimings {
+            denoise_ms: if denoise { FAKE_DENOISE_MS } else { 0.0 },
+            relight_ms: if relight { FAKE_RELIGHT_MS } else { 0.0 },
             ..StageTimings::default()
         })
     }
 
-    fn reset_temporal(&mut self, gpu: &GpuContext) -> Result<(), BackendError> {
+    fn reset_temporal(&mut self, gpu: &GpuContext) -> Result<StageList, BackendError> {
         self.check_context(gpu.context);
         self.log.resets.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        let in_place = self.config.lock().unwrap().relight_resets_in_place;
+        if self.relight && self.loaded.is_some() && !in_place {
+            self.relight = false;
+            self.log
+                .relight_resets_dropped
+                .fetch_add(1, Ordering::SeqCst);
+            return Ok(Stage::Relight.into());
+        }
+        Ok(StageList::default())
     }
 }
 

@@ -1,4 +1,4 @@
-//! The camera settings channel (revision 7): the typed model of the tree
+//! The settings channel (revision 7, global settings from revision 8): the typed model of the tree
 //! `GetSettings` returns and the deltas `SettingsChanged` carries, and its
 //! codec to and from the D-Bus shapes.
 //!
@@ -48,13 +48,29 @@ pub type WireChange = (String, VariantDict);
 /// The longest setting id, in bytes.
 pub const SETTING_ID_MAX: usize = 48;
 
-/// The only `scope` of revision 7: a setting stored per camera.
+/// The `scope` of a setting kept per camera id (revision 7).
 pub const SCOPE_CAMERA: &str = "camera";
+
+/// The `scope` of a setting kept for the daemon, the same whatever the
+/// camera: the video effects (revision 8, ids `effect.<group>.<name>`).
+/// Its groups follow the camera's in the tree and are there with no camera
+/// too.
+pub const SCOPE_GLOBAL: &str = "global";
+
+/// How every global setting id starts (revision 8): `effect.`.
+pub const GLOBAL_ID_PREFIX: &str = "effect.";
+
+/// Whether `id` names a global setting ([`GLOBAL_ID_PREFIX`]): one the
+/// daemon answers whatever the camera, so its camera option is ignored.
+pub fn is_global_id(id: &str) -> bool {
+    id.starts_with(GLOBAL_ID_PREFIX)
+}
 
 /// Whether `id` is a valid setting id: `^[a-z0-9]+(\.[a-z0-9_]+){1,3}$`, at
 /// most [`SETTING_ID_MAX`] bytes. That is two to four segments joined by
 /// `.`, each non-empty, the first of `a-z` and `0-9`, the others of `a-z`,
-/// `0-9` and `_`. Revision-7 ids are `camera.<group>.<name>`.
+/// `0-9` and `_`. Revision-7 ids are `camera.<group>.<name>`; revision 8
+/// adds `effect.<group>.<name>`.
 pub fn valid_setting_id(id: &str) -> bool {
     if id.is_empty() || id.len() > SETTING_ID_MAX {
         return false;
@@ -247,7 +263,9 @@ pub struct Setting {
     pub id: String,
     pub label: String,
     pub kind: SettingKind,
-    /// Where it is stored: [`SCOPE_CAMERA`] in revision 7.
+    /// Where it is kept: [`SCOPE_CAMERA`] (per camera, revision 7) or
+    /// [`SCOPE_GLOBAL`] (for the daemon, revision 8). Every setting of a
+    /// group has the same scope.
     pub scope: String,
     /// The user has a stored value for it.
     pub stored: bool,
@@ -397,13 +415,22 @@ impl Setting {
 /// A group of settings, a group dictionary on the bus.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsGroup {
-    /// `image`, `white_balance`, `exposure`, `focus` or `other` in revision 7.
+    /// `image`, `white_balance`, `exposure`, `focus` or `other` in revision
+    /// 7; revision 8 adds the global `background` and `video`.
     pub id: String,
     pub label: String,
     pub settings: Vec<Setting>,
 }
 
 impl SettingsGroup {
+    /// Whether the group holds global settings ([`SCOPE_GLOBAL`]): its
+    /// first setting's scope, which every setting of a group shares.
+    pub fn is_global(&self) -> bool {
+        self.settings
+            .first()
+            .is_some_and(|s| s.scope == SCOPE_GLOBAL)
+    }
+
     /// The group dictionary: `id`, `label`, `settings` (aa{sv}).
     pub fn to_dict(&self) -> VariantDict {
         let mut d = VariantDict::new();
@@ -438,8 +465,10 @@ pub struct SettingsTree {
     pub revision: u32,
     /// `SettingsSchemaSerial` when the tree was read.
     pub serial: u32,
-    /// The camera's id; empty, with no group, when there is no camera.
+    /// The camera's id; empty when there is no camera, and then only the
+    /// global groups are there (none before revision 8).
     pub camera: String,
+    /// The camera's groups, then the global ones ([`SCOPE_GLOBAL`]).
     pub groups: Vec<SettingsGroup>,
 }
 
@@ -918,6 +947,50 @@ mod tests {
             })
         );
         assert!(tree.find("camera.image.nope").is_none());
+    }
+
+    #[test]
+    fn a_global_tree_without_a_camera_round_trips() {
+        let mut mode = base(
+            "effect.background.mode",
+            SettingKind::Enum {
+                options: vec![
+                    ("none".into(), "Off".into()),
+                    ("blur".into(), "Blur".into()),
+                ],
+                default: "none".into(),
+                value: "blur".into(),
+            },
+        );
+        mode.scope = SCOPE_GLOBAL.into();
+        assert!(valid_setting_id(&mode.id));
+        assert!(valid_setting_id("effect.background.blur_strength"));
+        let tree = SettingsTree {
+            revision: 3,
+            serial: 2,
+            camera: String::new(),
+            groups: vec![SettingsGroup {
+                id: "background".into(),
+                label: "Background effect".into(),
+                settings: vec![mode],
+            }],
+        };
+        let back = SettingsTree::from_wire(&over_the_wire(&tree.to_wire()));
+        assert_eq!(back, tree);
+        assert!(back.groups[0].is_global());
+        assert!(is_global_id("effect.background.mode"));
+        assert!(!is_global_id("camera.image.sharpness"));
+        assert!(!is_global_id("effects.x.y"));
+        let empty = SettingsGroup {
+            settings: Vec::new(),
+            ..tree.groups[0].clone()
+        };
+        assert!(!empty.is_global());
+        assert_eq!(
+            back.find("effect.background.mode")
+                .map(|s| s.scope.as_str()),
+            Some(SCOPE_GLOBAL)
+        );
     }
 
     #[test]

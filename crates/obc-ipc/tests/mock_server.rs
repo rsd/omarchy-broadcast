@@ -870,7 +870,7 @@ async fn proxy_reads_every_property() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 7);
+    assert_eq!(INTERFACE_REVISION, 8);
     assert_eq!(proxy.inner().interface().as_str(), INTERFACE);
 }
 

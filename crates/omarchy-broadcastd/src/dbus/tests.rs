@@ -147,6 +147,7 @@ impl Rig {
         let paths = Paths {
             config: dir.path().join("config.toml"),
             state: dir.path().join("state.toml"),
+            cache: Some(dir.path().join("cache")),
             runtime: Some(dir.path().join("run")),
         };
         fs::create_dir(dir.path().join("run")).unwrap();
@@ -388,7 +389,7 @@ async fn every_property_reads_through_the_proxy() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 7);
+    assert_eq!(INTERFACE_REVISION, 8);
     // GetAll returns the same nineteen properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
         .destination(obc_ipc::BUS_NAME)
@@ -869,7 +870,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 7);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 8);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -927,7 +928,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 7);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 8);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -1043,7 +1044,7 @@ async fn preview_leases_by_bus_name_their_property_and_their_frames() {
     let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 7);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 8);
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
     let seen = rig.record_changes().await;
     let mut frames = proxy.receive_preview_frame().await.unwrap();
@@ -1569,7 +1570,36 @@ async fn settings_methods_their_signal_their_properties_and_their_errors() {
             .iter()
             .map(|g| g.id.as_str())
             .collect::<Vec<_>>(),
-        ["image", "white_balance", "exposure", "focus"]
+        [
+            "image",
+            "white_balance",
+            "exposure",
+            "focus",
+            "background",
+            "video",
+            "lighting"
+        ]
+    );
+    // The global settings (revision 8) after the camera's, scope `global`.
+    let globals: Vec<(&str, &str)> = tree
+        .groups
+        .iter()
+        .filter(|g| g.is_global())
+        .flat_map(|g| g.settings.iter())
+        .map(|s| (s.id.as_str(), s.scope.as_str()))
+        .collect();
+    assert_eq!(
+        globals,
+        [
+            ("effect.background.mode", "global"),
+            ("effect.background.blur_strength", "global"),
+            ("effect.video.denoise", "global"),
+            ("effect.video.enhance", "global"),
+            ("effect.lighting.relight", "global"),
+            ("effect.lighting.light", "global"),
+            ("effect.lighting.direction", "global"),
+            ("effect.lighting.brightness", "global")
+        ]
     );
     let snap = within("snapshot", Snapshot::fetch(&proxy)).await.unwrap();
     assert_eq!(snap.settings_revision, Some(tree.revision));
@@ -1578,7 +1608,9 @@ async fn settings_methods_their_signal_their_properties_and_their_errors() {
     let other = within("GetSettings", proxy.settings_tree("pci-b"))
         .await
         .unwrap();
-    assert_eq!((other.camera.as_str(), other.groups.len()), ("pci-b", 0));
+    // Its controls: none; the global groups are there for every camera.
+    assert_eq!((other.camera.as_str(), other.groups.len()), ("pci-b", 3));
+    assert!(other.groups.iter().all(|g| g.is_global()));
     let mut options = camera_options("");
     options.insert("future", Variant::from(5u32));
     let reply = within("GetSettings", proxy.get_settings(options))
@@ -1737,6 +1769,43 @@ async fn settings_methods_their_signal_their_properties_and_their_errors() {
         .await
         .unwrap();
     assert!(!tree.find(EXPOSURE).unwrap().stored);
+    // A global setting (revision 8): the existing method's effect and
+    // property, one signal, the camera option ignored; a reset of its
+    // group.
+    drop(signals);
+    let mut signals = proxy.receive_settings_changed().await.unwrap();
+    let before = proxy.settings_revision().await.unwrap();
+    within(
+        "SetSetting",
+        proxy.set_setting(
+            "effect.video.denoise",
+            Variant::from(true),
+            camera_options("pci-b"),
+        ),
+    )
+    .await
+    .unwrap();
+    let denoise = |on: bool| SettingChange {
+        id: "effect.video.denoise".into(),
+        value: Some(SettingValue::Bool(on)),
+        stored: on,
+        enabled: true,
+        disabled_reason: String::new(),
+    };
+    let sig = within("SettingsChanged", signals.next()).await.unwrap();
+    let args = sig.args().unwrap();
+    assert_eq!(args.revision, before + 1);
+    assert_eq!(args.to_changes(), [denoise(true)]);
+    assert!(proxy.denoise().await.unwrap());
+    within(
+        "ResetSettings",
+        proxy.reset_settings_scope("", &ResetScope::Group("video".into())),
+    )
+    .await
+    .unwrap();
+    let sig = within("SettingsChanged", signals.next()).await.unwrap();
+    assert_eq!(sig.args().unwrap().to_changes(), [denoise(false)]);
+    assert!(!proxy.denoise().await.unwrap());
     // Over the cap: RateLimited. (A signal stream left unread would fill
     // the client connection's queue and stall its replies.)
     drop(signals);

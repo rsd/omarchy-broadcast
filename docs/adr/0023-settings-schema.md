@@ -1,6 +1,6 @@
 # ADR-0023: Camera settings: a tree the daemon describes, computes and publishes
 
-- **Status:** Accepted (2026-11-10). Extends [ADR-0020](0020-camera-image-controls.md) (per-camera storage, written whenever the camera opens, never to a closed camera) and [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md) (the D-Bus API as revision 7, additive, and the runtime state file). Uses the control plane of [ADR-0005](0005-dbus-zbus-control-plane.md) and the camera's place in the ingest stage of [ADR-0009](0009-ingest-process-output.md).
+- **Status:** Accepted (2026-11-10). *Phase 2 is recorded in [ADR-0024](0024-stackable-stages-and-effects-in-the-settings-schema.md): the video effects join the tree as global settings, D-Bus revision 8; the limitation below that leaves them out no longer holds.* Extends [ADR-0020](0020-camera-image-controls.md) (per-camera storage, written whenever the camera opens, never to a closed camera) and [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md) (the D-Bus API as revision 7, additive, and the runtime state file). Uses the control plane of [ADR-0005](0005-dbus-zbus-control-plane.md) and the camera's place in the ingest stage of [ADR-0009](0009-ingest-process-output.md).
 
 ## Context
 - Revision 6 offers five image controls from a fixed allowlist ([ADR-0020](0020-camera-image-controls.md)). Users also want exposure, white balance, focus, zoom and anti-flicker, and a camera has more: the bar widget grew four hand-written sliders and a reset for the five, and every new control would mean a new member, a new type and new widget code in each client.
@@ -82,7 +82,7 @@
   - A driver may round a written value; the value read back is what the tree shows.
   - A held write's reply takes up to 50 ms, and the caller of a superseded write cannot tell that its value was replaced (it is answered `Ok`). The 100-writes-a-second cap is global to the daemon, not per client.
   - A camera with more than 64 controls, or a menu with more than 16 items, loses the rest, logged once.
-  - Only camera settings are in the tree. The video effects, noise removal and the preview stay separate properties and methods; the `scope` key leaves room for settings that are not per camera. The tree is of `ActiveCamera`; another camera's tree is read with `GetSettings` and has no signal.
+  - Only camera settings are in the tree. The video effects, noise removal and the preview stay separate properties and methods; the `scope` key leaves room for settings that are not per camera. The tree is of `ActiveCamera`; another camera's tree is read with `GetSettings` and has no signal. *(Revision 8, [ADR-0024](0024-stackable-stages-and-effects-in-the-settings-schema.md), puts the video effects and noise removal in the tree as `scope` `global` settings; the preview stays separate.)*
   - The state file keeps an entry for a camera that is no longer plugged in, as in ADR-0020, and a stored value for a control a different firmware lacks is skipped and kept.
   - `enabled_when` is a hint: a client that does not understand a condition has `enabled` anyway.
   - The settings revision is a 32-bit counter; a client that sees it wrap treats it as a gap and reads the tree again.
@@ -112,7 +112,7 @@
 ## What would change this decision
 - A client that wants per-setting objects (`busctl tree`, other tools): a read-only facade on the same model, not a second model.
 - Slider traffic where a fork per write shows in practice: the bidirectional session command, additive to the tree and the lines.
-- Settings that are not per camera (the effect choice, noise removal): new `scope` values and settings in the same tree, with the existing properties kept; additive unless the meaning of a key changes.
+- Settings that are not per camera (the effect choice, noise removal): new `scope` values and settings in the same tree, with the existing properties kept; additive unless the meaning of a key changes. *(Done in [ADR-0024](0024-stackable-stages-and-effects-in-the-settings-schema.md): scope `global`, revision 8, settings schema still 1.)*
 - A change in meaning of a key or an `enabled_when` operator: the settings schema becomes 2, and clients that do not know it say so.
 - A verified way to change HDR, RightLight or another vendor setting: a data row in the same table, with its own evidence.
 - Control events proving unreliable on a camera that matters: a refresh on a timer while open, as an option, not the default.

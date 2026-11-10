@@ -95,6 +95,7 @@ fn resolve_paths(opts: &Options) -> Result<Paths, String> {
     Ok(Paths {
         config,
         state,
+        cache: obc_core::config::cache_dir(),
         runtime,
     })
 }

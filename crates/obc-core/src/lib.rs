@@ -44,6 +44,8 @@ pub enum CoreError {
     InvalidEffect(String),
     #[error("unsupported effect failure policy {0:?} (supported: black, none)")]
     InvalidEffectOnFailure(String),
+    #[error("unknown relighting light {0:?} (supported: warm, neutral, cool)")]
+    InvalidRelightLight(String),
     #[error("invalid USB id {0:?} (expected vid:pid in hex, e.g. 1234:abcd)")]
     InvalidUsbId(String),
     #[error(
@@ -338,6 +340,58 @@ impl FromStr for EffectOnFailure {
             "black" => Ok(EffectOnFailure::Black),
             "none" => Ok(EffectOnFailure::None),
             _ => Err(CoreError::InvalidEffectOnFailure(s.to_string())),
+        }
+    }
+}
+
+/// The key light of the relighting stage (`effect.relight_light`): its
+/// colour temperature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelightLight {
+    /// A warm light (tungsten).
+    Warm,
+    /// A neutral light.
+    #[default]
+    Neutral,
+    /// A cool light (daylight).
+    Cool,
+}
+
+impl RelightLight {
+    /// Every light, in display order.
+    pub const ALL: [RelightLight; 3] = [
+        RelightLight::Warm,
+        RelightLight::Neutral,
+        RelightLight::Cool,
+    ];
+
+    /// `warm`, `neutral` or `cool`: the name in the config, the state file
+    /// and the settings tree.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RelightLight::Warm => "warm",
+            RelightLight::Neutral => "neutral",
+            RelightLight::Cool => "cool",
+        }
+    }
+}
+
+impl fmt::Display for RelightLight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for RelightLight {
+    type Err = CoreError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "warm" => Ok(RelightLight::Warm),
+            "neutral" => Ok(RelightLight::Neutral),
+            "cool" => Ok(RelightLight::Cool),
+            _ => Err(CoreError::InvalidRelightLight(s.to_string())),
         }
     }
 }
@@ -1101,6 +1155,20 @@ mod tests {
         assert!("raw".parse::<EffectOnFailure>().is_err());
         assert_eq!(EffectOnFailure::default(), EffectOnFailure::Black);
         assert_eq!(EffectOnFailure::None.to_string(), "none");
+    }
+
+    #[test]
+    fn relight_light_parses() {
+        for light in RelightLight::ALL {
+            assert_eq!(light.as_str().parse::<RelightLight>().unwrap(), light);
+        }
+        assert_eq!(" Warm".parse::<RelightLight>().unwrap(), RelightLight::Warm);
+        let e = "pink".parse::<RelightLight>().unwrap_err().to_string();
+        assert!(
+            e.contains("\"pink\"") && e.contains("warm, neutral, cool"),
+            "{e}"
+        );
+        assert_eq!(RelightLight::default(), RelightLight::Neutral);
     }
 
     #[test]

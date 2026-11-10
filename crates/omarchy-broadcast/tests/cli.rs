@@ -426,6 +426,9 @@ struct Mock {
     fail_gets: bool,
     /// The camera settings of the first camera (the others have none).
     settings: Vec<SettingsGroup>,
+    /// The global settings (revision 8), in every tree after the camera's,
+    /// with no camera too; none unless a test sets them.
+    global: Vec<SettingsGroup>,
     settings_revision: u32,
     settings_serial: u32,
     /// The next valid `SetSetting` fails with this error instead (`"RateLimited"`
@@ -467,6 +470,7 @@ fn reason_of(id: &str) -> &'static str {
         "camera.white_balance.white_balance_temperature" => WB_REASON,
         "camera.exposure.exposure_time_absolute" => EXPOSURE_REASON,
         "camera.focus.focus_absolute" => AF_REASON,
+        "effect.background.blur_strength" => BLUR_REASON,
         _ => "The camera does not allow changing this now",
     }
 }
@@ -729,6 +733,7 @@ impl Mock {
             rename_on_get: None,
             fail_gets: false,
             settings: mock_settings(),
+            global: Vec::new(),
             settings_revision: 1,
             settings_serial: 1,
             fail_next_set: None,
@@ -754,17 +759,24 @@ impl Mock {
                 self.settings.clone()
             } else {
                 Vec::new()
-            },
+            }
+            .into_iter()
+            .chain(self.global.iter().cloned())
+            .collect(),
         }
     }
 
     fn all_settings(&self) -> impl Iterator<Item = &Setting> {
-        self.settings.iter().flat_map(|g| g.settings.iter())
+        self.settings
+            .iter()
+            .chain(&self.global)
+            .flat_map(|g| g.settings.iter())
     }
 
     fn setting_mut(&mut self, id: &str) -> Option<&mut Setting> {
         self.settings
             .iter_mut()
+            .chain(self.global.iter_mut())
             .flat_map(|g| g.settings.iter_mut())
             .find(|s| s.id == id)
     }
@@ -777,7 +789,12 @@ impl Mock {
             .filter_map(|s| s.kind.value().map(|v| (s.id.clone(), v)))
             .collect();
         let mut flipped = Vec::new();
-        for s in self.settings.iter_mut().flat_map(|g| g.settings.iter_mut()) {
+        for s in self
+            .settings
+            .iter_mut()
+            .chain(self.global.iter_mut())
+            .flat_map(|g| g.settings.iter_mut())
+        {
             if s.enabled_when.is_empty() {
                 continue;
             }
@@ -1150,7 +1167,16 @@ impl Mock {
         let shown = value.as_ref().map_or("?".into(), |v| format!("{v:?}"));
         self.calls
             .push(format!("SetSetting({camera},{id},{shown})"));
-        let at = self.settings_camera(&options)?;
+        // A global setting does not look at the camera.
+        let global = self
+            .global
+            .iter()
+            .any(|g| g.settings.iter().any(|s| s.id == id));
+        let at = if global {
+            Some(0)
+        } else {
+            self.settings_camera(&options)?
+        };
         let unknown = || IpcError::UnknownSetting(format!("the camera has no setting {id:?}"));
         if at != Some(0) {
             return Err(unknown());
@@ -1214,11 +1240,27 @@ impl Mock {
     ) -> Result<(), IpcError> {
         let camera = camera_option(&options)?;
         self.calls.push(format!("ResetSettings({scope},{camera})"));
-        let at = self.settings_camera(&options)?;
         let Some(parsed) = ResetScope::parse(&scope) else {
             return Err(IpcError::InvalidArgument(format!("no scope {scope:?}")));
         };
-        let groups = if at == Some(0) {
+        // A global group or setting does not look at the camera; the camera
+        // scope never touches them.
+        let global = match &parsed {
+            ResetScope::Camera => false,
+            ResetScope::Group(id) => self.global.iter().any(|g| g.id == *id),
+            ResetScope::Setting(id) => self
+                .global
+                .iter()
+                .any(|g| g.settings.iter().any(|s| s.id == *id)),
+        };
+        let at = if global {
+            None
+        } else {
+            self.settings_camera(&options)?
+        };
+        let groups = if global {
+            self.global.as_slice()
+        } else if at == Some(0) {
             self.settings.as_slice()
         } else {
             &[]
@@ -1237,8 +1279,13 @@ impl Mock {
             _ => {}
         }
         let mut ids = Vec::new();
-        if at == Some(0) {
-            for g in &mut self.settings {
+        if at == Some(0) || global {
+            let groups = if global {
+                &mut self.global
+            } else {
+                &mut self.settings
+            };
+            for g in groups {
                 for s in &mut g.settings {
                     let hit = match &parsed {
                         ResetScope::Camera => true,
@@ -1650,6 +1697,13 @@ impl MockDaemon {
                 .await
                 .unwrap();
         });
+    }
+
+    /// The global settings become `groups` (not announced).
+    fn set_global(&self, groups: Vec<SettingsGroup>) {
+        let iface = self.iface();
+        self.rt
+            .block_on(async { iface.get_mut().await.global = groups });
     }
 
     /// The first camera's settings become `groups` (not announced).
@@ -3644,25 +3698,25 @@ fn exposure_group_line(rev: u32, serial: u32) -> Value {
         "v": 1, "type": "settings_group", "schema": 1, "rev": rev, "serial": serial,
         "camera": "usb-1234_abcd", "index": 2, "count": 4, "part": 1, "parts": 1,
         "group": {"id": "exposure", "label": "Exposure", "settings": [
-            {"id": "camera.exposure.auto_exposure", "label": "Exposure mode", "type": "enum",
+            {"id": "camera.exposure.auto_exposure", "scope": "camera", "label": "Exposure mode", "type": "enum",
              "value": "aperture_priority", "default": "aperture_priority", "stored": false,
              "enabled": true, "disabled_reason": "", "enabled_when": [],
              "options": [{"value": "manual", "label": "Manual"},
                          {"value": "aperture_priority", "label": "Auto"}],
              "hint": "segmented"},
-            {"id": "camera.exposure.exposure_time_absolute", "label": "Exposure time",
+            {"id": "camera.exposure.exposure_time_absolute", "scope": "camera", "label": "Exposure time",
              "type": "int", "value": 1250, "default": 156, "stored": false, "enabled": false,
              "disabled_reason": "Set exposure to manual to change this",
              "enabled_when": [{"id": "camera.exposure.auto_exposure", "op": "in",
                                "value": ["manual", "shutter_priority"]}],
              "min": 3, "max": 2047, "step": 1, "unit": "\u{d7}100 \u{b5}s", "hint": "slider"},
-            {"id": "camera.exposure.gain", "label": "Gain", "type": "int", "value": 0,
+            {"id": "camera.exposure.gain", "scope": "camera", "label": "Gain", "type": "int", "value": 0,
              "default": 0, "stored": false, "enabled": true, "disabled_reason": "",
              "enabled_when": [], "min": 0, "max": 255, "step": 1, "hint": "slider"},
-            {"id": "camera.exposure.keep_framerate", "label": "Keep 30 fps in low light",
+            {"id": "camera.exposure.keep_framerate", "scope": "camera", "label": "Keep 30 fps in low light",
              "type": "bool", "value": false, "default": true, "stored": false, "enabled": true,
              "disabled_reason": "", "enabled_when": [], "hint": "switch"},
-            {"id": "camera.exposure.power_line_frequency", "label": "Anti-flicker",
+            {"id": "camera.exposure.power_line_frequency", "scope": "camera", "label": "Anti-flicker",
              "type": "enum", "value": "60hz", "default": "60hz", "stored": false,
              "enabled": true, "disabled_reason": "", "enabled_when": [],
              "options": [{"value": "disabled", "label": "Off"}, {"value": "50hz", "label": "50 Hz"},
@@ -3726,7 +3780,7 @@ fn settings_human_and_json() {
     assert_eq!(lines[3]["group"]["label"], "Focus & zoom");
     assert_eq!(
         find_setting(&lines, "camera.focus.pan_reset"),
-        &serde_json::json!({"id": "camera.focus.pan_reset", "label": "Recentre pan",
+        &serde_json::json!({"id": "camera.focus.pan_reset", "scope": "camera", "label": "Recentre pan",
                             "type": "action", "stored": false, "enabled": true,
                             "disabled_reason": "", "enabled_when": []})
     );
@@ -4723,5 +4777,492 @@ fn settings_lines_stay_under_the_cap_with_hostile_strings() {
             .any(|c| (c.is_control() && c != '\n') || c == '\u{202e}'),
         "{:?}",
         out.stdout
+    );
+}
+
+// ---- the global settings (revision 8): the video effects ----
+
+const BLUR_REASON: &str = "Choose Blur to change this";
+
+/// The global groups a revision-8 daemon publishes after the camera's.
+fn mock_global() -> Vec<SettingsGroup> {
+    let global = |mut s: Setting| {
+        s.scope = "global".into();
+        s
+    };
+    vec![
+        SettingsGroup {
+            id: "background".into(),
+            label: "Background effect".into(),
+            settings: vec![
+                global(choice(
+                    "effect.background.mode",
+                    "Effect",
+                    &[("none", "Off"), ("blur", "Blur"), ("replace", "Replace")],
+                    "none",
+                    "none",
+                )),
+                global(with_unit(
+                    depends(
+                        int(
+                            "effect.background.blur_strength",
+                            "Blur strength",
+                            (0, 100, 1),
+                            50,
+                            50,
+                        ),
+                        "effect.background.mode",
+                        ConditionOp::Eq,
+                        SettingValue::Str("blur".into()),
+                    ),
+                    "%",
+                )),
+            ],
+        },
+        SettingsGroup {
+            id: "video".into(),
+            label: "Video".into(),
+            settings: vec![global(switch(
+                "effect.video.denoise",
+                "Noise removal",
+                false,
+                false,
+            ))],
+        },
+    ]
+}
+
+const GLOBAL_TEXT: &str = "All cameras:\n\
+    Background effect\n  \
+    Effect         Off   effect.background.mode           none|blur|replace\n  \
+    Blur strength  50 %  effect.background.blur_strength  0..100             (Choose Blur to change this)\n\
+    Video\n  \
+    Noise removal  off   effect.video.denoise             on|off\n";
+
+#[test]
+fn settings_show_the_global_settings_after_the_cameras_and_without_one() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    mock.set_global(mock_global());
+    let out = bus.run(&["settings"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        format!("{SETTINGS_TEXT}{NOT_IN_USE}{GLOBAL_TEXT}")
+    );
+    let out = bus.run(&["settings", "--json"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let lines = json_lines(&out.stdout);
+    let groups: Vec<&str> = lines
+        .iter()
+        .map(|v| v["group"]["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        groups,
+        [
+            "image",
+            "white_balance",
+            "exposure",
+            "focus",
+            "background",
+            "video"
+        ]
+    );
+    assert_eq!(
+        find_setting(&lines, "effect.background.blur_strength"),
+        &serde_json::json!({"id": "effect.background.blur_strength", "scope": "global", "label": "Blur strength",
+            "type": "int", "value": 50, "default": 50, "stored": false, "enabled": false,
+            "disabled_reason": BLUR_REASON,
+            "enabled_when": [{"id": "effect.background.mode", "op": "eq", "value": "blur"}],
+            "min": 0, "max": 100, "step": 1, "unit": "%", "hint": "slider"})
+    );
+
+    // No camera: the global settings alone; no clear line.
+    mock.remove_cameras();
+    let out = bus.run(&["settings", "--json"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let lines = json_lines(&out.stdout);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .all(|v| v["type"] == "settings_group" && v["camera"] == ""),
+        "{lines:?}"
+    );
+    let out = bus.run(&["settings"]);
+    assert_eq!(
+        out.stdout,
+        format!("Camera:     none\nNo camera settings.\n{NOT_IN_USE}{GLOBAL_TEXT}")
+    );
+}
+
+#[test]
+fn settings_set_and_reset_take_global_ids() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    mock.set_global(mock_global());
+    let out = bus.run(&["settings", "set", "--", "effect.video.denoise", "on"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "All cameras:\nVideo\n  \
+         Noise removal  on  effect.video.denoise  on|off  (stored)\n"
+    );
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "GetSettings()",
+            "SetSetting(,effect.video.denoise,Bool(true))",
+            "GetSettings()"
+        ]
+    );
+    // Typed from the tree: a choice, then the number it enables.
+    let out = bus.run(&["settings", "set", "effect.background.mode", "blur"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let out = bus.run(&["settings", "set", "effect.background.blur_strength", "70"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(
+        out.stdout
+            .contains("Blur strength  70 %  effect.background.blur_strength"),
+        "{}",
+        out.stdout
+    );
+    let out = bus.run(&["settings", "set", "effect.background.mode", "sepia"]);
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("one of none, blur, replace"),
+        "{}",
+        out.stderr
+    );
+    mock.take_calls();
+    // A reset of one global setting and of a global group.
+    let out = bus.run(&[
+        "settings",
+        "reset",
+        "--setting=effect.background.blur_strength",
+    ]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(
+        out.stdout
+            .starts_with("All cameras:\nBackground effect\n  Blur strength  50 %"),
+        "{}",
+        out.stdout
+    );
+    let out = bus.run(&["settings", "reset", "--group=video"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "All cameras:\nVideo\n  \
+         Noise removal  off  effect.video.denoise  on|off\n"
+    );
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "ResetSettings(setting:effect.background.blur_strength,)",
+            "GetSettings()",
+            "ResetSettings(group:video,)",
+            "GetSettings()"
+        ]
+    );
+}
+
+#[test]
+fn watch_json_carries_the_global_groups_in_the_set_and_their_deltas() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    mock.set_global(mock_global());
+    let watch = bus.watch(&["watch", "--json"], None);
+    assert_eq!(watch.next_json("the snapshot")["type"], "snapshot");
+    let set = watch.settings_set("the settings after the snapshot");
+    assert_eq!(
+        set_groups(&set),
+        [
+            "image",
+            "white_balance",
+            "exposure",
+            "focus",
+            "background",
+            "video"
+        ]
+    );
+    let out = bus.run(&["settings", "set", "effect.background.mode", "blur"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let v = watch.next_json("the delta");
+    assert_eq!(v["type"], "settings_delta", "{v}");
+    let ids: Vec<&str> = v["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        ["effect.background.mode", "effect.background.blur_strength"]
+    );
+}
+
+#[test]
+fn global_ids_ignore_the_camera_option_and_need_no_camera() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    mock.set_global(mock_global());
+    // A camera that is not there: typed and read back from the global
+    // groups, the camera passed on (the daemon ignores it).
+    let out = bus.run(&[
+        "settings",
+        "set",
+        "--camera=usb-gone",
+        "effect.video.denoise",
+        "on",
+    ]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "All cameras:\nVideo\n  \
+         Noise removal  on  effect.video.denoise  on|off  (stored)\n"
+    );
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "GetSettings()",
+            "SetSetting(usb-gone,effect.video.denoise,Bool(true))",
+            "GetSettings()"
+        ]
+    );
+    let out = bus.run(&[
+        "settings",
+        "reset",
+        "--camera=usb-gone",
+        "--setting=effect.video.denoise",
+    ]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(out.stdout.contains("Noise removal  off"), "{}", out.stdout);
+    mock.take_calls();
+    // No camera at all: an unknown global id is unknown, not "no camera".
+    mock.remove_cameras();
+    let out = bus.run(&["settings", "set", "effect.video.nope", "on"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert_eq!(
+        out.stderr,
+        "omarchy-broadcast: there is no setting \"effect.video.nope\"\n"
+    );
+    assert_eq!(mock.take_calls(), ["GetSettings()"], "nothing written");
+    // ... and a known one works.
+    let out = bus.run(&["settings", "set", "effect.background.mode", "blur"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    // A camera id is still a camera's: with no camera, no camera is there.
+    let out = bus.run(&["settings", "set", "camera.image.brightness", "10"]);
+    assert_eq!(out.stderr, "omarchy-broadcast: no camera is present\n");
+}
+
+/// [`mock_global`] with the enhance switch after noise removal, greyed or
+/// not as `reason` says.
+fn mock_global_with_enhance(reason: &str) -> Vec<SettingsGroup> {
+    let mut groups = mock_global();
+    let mut enhance = switch(
+        "effect.video.enhance",
+        "Enhance low-resolution camera",
+        false,
+        false,
+    );
+    enhance.scope = "global".into();
+    enhance.enabled = reason.is_empty();
+    enhance.disabled_reason = reason.into();
+    groups[1].settings.push(enhance);
+    groups
+}
+
+#[test]
+fn settings_show_and_set_the_enhance_switch() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    mock.set_global(mock_global_with_enhance(""));
+    let out = bus.run(&["settings", "--json"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let lines = json_lines(&out.stdout);
+    assert_eq!(
+        find_setting(&lines, "effect.video.enhance"),
+        &serde_json::json!({"id": "effect.video.enhance", "scope": "global",
+            "label": "Enhance low-resolution camera", "type": "bool", "value": false,
+            "default": false, "stored": false, "enabled": true, "disabled_reason": "",
+            "enabled_when": [], "hint": "switch"})
+    );
+    let out = bus.run(&["settings", "set", "--", "effect.video.enhance", "on"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "All cameras:\nVideo\n  \
+         Enhance low-resolution camera  on  effect.video.enhance  on|off  (stored)\n"
+    );
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "GetSettings()",
+            "GetSettings()",
+            "SetSetting(,effect.video.enhance,Bool(true))",
+            "GetSettings()"
+        ]
+    );
+    // Greyed for a camera that needs none: the reason shows.
+    mock.set_global(mock_global_with_enhance(
+        "The camera already captures at full resolution",
+    ));
+    let out = bus.run(&["settings"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(
+        out.stdout
+            .contains("(The camera already captures at full resolution)"),
+        "{}",
+        out.stdout
+    );
+}
+
+/// [`mock_global`] with the lighting group after the video one, its light
+/// settings enabled only while relighting is `on`.
+fn mock_global_with_lighting(on: bool) -> Vec<SettingsGroup> {
+    let mut groups = mock_global();
+    let global = |mut s: Setting| {
+        s.scope = "global".into();
+        if s.id != "effect.lighting.relight" {
+            s = depends(
+                s,
+                "effect.lighting.relight",
+                ConditionOp::Eq,
+                SettingValue::Bool(true),
+            );
+            s.enabled = on;
+            s.disabled_reason = if on {
+                String::new()
+            } else {
+                LIGHT_REASON.into()
+            };
+        }
+        s
+    };
+    groups.push(SettingsGroup {
+        id: "lighting".into(),
+        label: "Lighting".into(),
+        settings: vec![
+            global(switch("effect.lighting.relight", "Relighting", false, on)),
+            global(choice(
+                "effect.lighting.light",
+                "Light",
+                &[("warm", "Warm"), ("neutral", "Neutral"), ("cool", "Cool")],
+                "neutral",
+                "neutral",
+            )),
+            global(with_unit(
+                int(
+                    "effect.lighting.direction",
+                    "Light direction",
+                    (-90, 90, 5),
+                    0,
+                    0,
+                ),
+                "°",
+            )),
+            global(with_unit(
+                int(
+                    "effect.lighting.brightness",
+                    "Brightness",
+                    (50, 200, 5),
+                    100,
+                    100,
+                ),
+                "%",
+            )),
+        ],
+    });
+    groups
+}
+
+const LIGHT_REASON: &str = "Turn on relighting to change this";
+
+#[test]
+fn settings_show_the_lighting_group_and_set_a_negative_direction() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    mock.set_global(mock_global_with_lighting(false));
+    let out = bus.run(&["settings"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(
+        out.stdout.ends_with(
+            "Lighting\n  \
+             Relighting       off      effect.lighting.relight          on|off\n  \
+             Light            Neutral  effect.lighting.light            warm|neutral|cool  \
+             (Turn on relighting to change this)\n  \
+             Light direction  0 °      effect.lighting.direction        -90..90 step 5     \
+             (Turn on relighting to change this)\n  \
+             Brightness       100 %    effect.lighting.brightness       50..200 step 5     \
+             (Turn on relighting to change this)\n"
+        ),
+        "{}",
+        out.stdout
+    );
+    let out = bus.run(&["settings", "--json"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let lines = json_lines(&out.stdout);
+    let groups: Vec<&str> = lines
+        .iter()
+        .map(|v| v["group"]["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        groups,
+        [
+            "image",
+            "white_balance",
+            "exposure",
+            "focus",
+            "background",
+            "video",
+            "lighting"
+        ]
+    );
+    assert_eq!(
+        find_setting(&lines, "effect.lighting.direction"),
+        &serde_json::json!({"id": "effect.lighting.direction", "scope": "global",
+            "label": "Light direction", "type": "int", "value": 0, "default": 0,
+            "stored": false, "enabled": false, "disabled_reason": LIGHT_REASON,
+            "enabled_when": [{"id": "effect.lighting.relight", "op": "eq", "value": true}],
+            "min": -90, "max": 90, "step": 5, "unit": "°", "hint": "slider"})
+    );
+    for id in [
+        "effect.lighting.relight",
+        "effect.lighting.light",
+        "effect.lighting.brightness",
+    ] {
+        assert_eq!(find_setting(&lines, id)["scope"], "global", "{id}");
+    }
+    // On: a negative direction after `--`, typed from the tree.
+    mock.set_global(mock_global_with_lighting(true));
+    mock.take_calls();
+    let out = bus.run(&["settings", "set", "--", "effect.lighting.direction", "-30"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "All cameras:\nLighting\n  \
+         Light direction  -30 °  effect.lighting.direction  -90..90 step 5  (stored)\n"
+    );
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "GetSettings()",
+            "SetSetting(,effect.lighting.direction,Int(-30))",
+            "GetSettings()"
+        ]
+    );
+    // The light by its option id, the brightness, and a light that is none.
+    let out = bus.run(&["settings", "set", "effect.lighting.light", "warm"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(out.stdout.contains("Light  Warm"), "{}", out.stdout);
+    let out = bus.run(&["settings", "set", "effect.lighting.brightness", "150"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(out.stdout.contains("150 %"), "{}", out.stdout);
+    let out = bus.run(&["settings", "set", "effect.lighting.light", "pink"]);
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("one of warm, neutral, cool"),
+        "{}",
+        out.stderr
     );
 }

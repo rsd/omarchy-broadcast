@@ -37,6 +37,7 @@ pub mod consumers;
 pub mod controller;
 pub mod daemon;
 pub mod dbus;
+pub mod gpu_cache;
 pub mod hotplug;
 pub mod inotify;
 pub mod log;

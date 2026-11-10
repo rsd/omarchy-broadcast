@@ -40,15 +40,20 @@ pub(crate) const NVCV_ERR_CUDA_KERNEL: NvCvStatus = -1209;
 
 // `NvCVImage_PixelFormat` values.
 pub(crate) const NVCV_A: i32 = 2;
+pub(crate) const NVCV_RGB: i32 = 4;
 pub(crate) const NVCV_BGR: i32 = 5;
 pub(crate) const NVCV_YUV420: i32 = 10;
 // `NvCVImage_ComponentType`: unsigned 8-bit.
 pub(crate) const NVCV_U8: i32 = 1;
+// `NvCVImage_ComponentType`: 32-bit float.
+pub(crate) const NVCV_F32: i32 = 7;
 // Layout: interleaved components.
 pub(crate) const NVCV_CHUNKY: u32 = 0;
 /// `NvCVImage_Alloc` alignment 1: rows exactly `width * pixel bytes` apart
 /// (0 lets the SDK pad the pitch for the GPU).
 pub(crate) const NVCV_TIGHT_PITCH: u32 = 1;
+// Memory space: pageable host memory.
+pub(crate) const NVCV_CPU: u32 = 0;
 // Memory space: CUDA device memory.
 pub(crate) const NVCV_GPU: u32 = 1;
 // YUV colour-space flags, ORed: matrix, range, chroma siting.
@@ -57,13 +62,19 @@ pub(crate) const NVCV_709: u32 = 0x01;
 pub(crate) const NVCV_VIDEO_RANGE: u32 = 0x00;
 pub(crate) const NVCV_FULL_RANGE: u32 = 0x04;
 pub(crate) const NVCV_CHROMA_COSITED: u32 = 0x00;
+pub(crate) const NVCV_CHROMA_INTSTITIAL: u32 = 0x08;
+pub(crate) const NVCV_CHROMA_TOPLEFT: u32 = 0x10;
 
 // Effect selectors and parameter names.
 pub(crate) const FX_GREEN_SCREEN: &CStr = c"GreenScreen";
 pub(crate) const FX_BACKGROUND_BLUR: &CStr = c"BackgroundBlur";
 pub(crate) const FX_DENOISING: &CStr = c"Denoising";
+pub(crate) const FX_RELIGHTING: &CStr = c"Relighting";
 pub(crate) const P_INPUT_IMAGE_0: &CStr = c"SrcImage0";
 pub(crate) const P_INPUT_IMAGE_1: &CStr = c"SrcImage1";
+/// The relighting effect's lighting environment (its
+/// `NVVFX_INPUT_HDR_RELIGHTING_IMAGE`).
+pub(crate) const P_INPUT_IMAGE_2: &CStr = c"SrcImage2";
 pub(crate) const P_OUTPUT_IMAGE_0: &CStr = c"DstImage0";
 pub(crate) const P_MODEL_DIRECTORY: &CStr = c"ModelDir";
 pub(crate) const P_CUDA_STREAM: &CStr = c"CudaStream";
@@ -75,6 +86,10 @@ pub(crate) const P_STRENGTH: &CStr = c"Strength";
 pub(crate) const P_MODE: &CStr = c"Mode";
 pub(crate) const P_STATE: &CStr = c"State";
 pub(crate) const P_STATE_SIZE: &CStr = c"StateSize";
+/// The relighting effect's rotation of its environment, in radians.
+pub(crate) const P_ANGLE_PAN: &CStr = c"AnglePan";
+/// The relighting effect's brightness of the relit foreground.
+pub(crate) const P_FG_GAIN: &CStr = c"FgGain";
 
 /// The `NvCVImage` image descriptor: width, height, signed pitch, pixel
 /// format, component type, six byte-sized descriptors (pixel bytes,
@@ -330,6 +345,20 @@ fn registry() -> MutexGuard<'static, Registry> {
 }
 
 impl Registry {
+    /// The SDK root the process's SDK was loaded from: the pinned root, or
+    /// the directory above the `lib` the search path served the SDK from.
+    /// `None` when nothing is loaded yet, or the search path served it from
+    /// a directory that is not a root's `lib` (or did not say which).
+    fn loaded_root(&self) -> Option<PathBuf> {
+        match self.pin.as_ref()? {
+            Source::Root(r) => Some(r.clone()),
+            Source::SearchPath(Some(dir)) if dir.file_name().is_some_and(|n| n == "lib") => {
+                dir.parent().map(Path::to_path_buf)
+            }
+            Source::SearchPath(_) => None,
+        }
+    }
+
     /// Why an open of `root`, which takes the SDK from `wanted`, is refused:
     /// the SDK is already loaded from elsewhere.
     fn conflict(&self, root: Option<&Path>, wanted: &Source) -> Option<String> {
@@ -376,6 +405,13 @@ impl Registry {
 /// leads to is the one loaded. Opens nothing.
 pub(crate) fn root_conflict(root: Option<&Path>) -> Option<String> {
     registry().conflict(root, &Source::of(root, &SDK_LIBS))
+}
+
+/// The SDK root this process loaded its SDK from ([`Registry::loaded_root`]);
+/// `None` when nothing is loaded yet or the place is not a root. Opens
+/// nothing.
+pub(crate) fn loaded_root() -> Option<PathBuf> {
+    registry().loaded_root()
 }
 
 /// Opens the SDK, or explains why it cannot be opened. Once a library of
@@ -789,6 +825,29 @@ mod tests {
         assert_eq!(reg.conflict(None, &Source::SearchPath(None)), None);
         // Nothing loaded: nothing conflicts.
         assert_eq!(Registry::default().conflict(None, &want), None);
+    }
+
+    #[test]
+    fn the_loaded_root_is_the_pin() {
+        assert_eq!(Registry::default().loaded_root(), None, "nothing loaded");
+        let pinned = |pin: Source| Registry {
+            pin: Some(pin),
+            opened: Vec::new(),
+        };
+        assert_eq!(
+            pinned(Source::Root("/sdk/a".into())).loaded_root(),
+            Some(PathBuf::from("/sdk/a"))
+        );
+        assert_eq!(
+            pinned(Source::SearchPath(Some("/sdk/b/lib".into()))).loaded_root(),
+            Some(PathBuf::from("/sdk/b"))
+        );
+        assert_eq!(
+            pinned(Source::SearchPath(Some("/usr/lib64/maxine".into()))).loaded_root(),
+            None,
+            "not a root's lib"
+        );
+        assert_eq!(pinned(Source::SearchPath(None)).loaded_root(), None);
     }
 
     #[test]

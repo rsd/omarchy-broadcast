@@ -72,6 +72,7 @@ use obc_core::{EffectMode, EffectOnFailure, ModeRequest, OutputContract, SinkSel
 use obc_ipc::Stats;
 use obc_pipeline::control_node::CaptureFormat;
 use obc_pipeline::controls::CtrlInfo;
+use obc_pipeline::effect::{Availability, Feature, RelightLight, RelightParams};
 use obc_pipeline::gpu::GpuSampler;
 use obc_pipeline::pipeline::names;
 use obc_pipeline::stats::{cpu_usage, online_cpus, self_cpu_ticks, ticks_per_sec};
@@ -431,6 +432,8 @@ impl GstBackend {
         let mut cfg = IngestConfig::new(camera.path.clone(), camera.mode);
         cfg.aspect = params.aspect;
         cfg.fixed_framerate = params.fixed_framerate;
+        // Requested only where it applies (the controller's choice).
+        cfg.enhance = params.effect.enhance;
         cfg
     }
 
@@ -480,6 +483,23 @@ fn effect_settings(e: &EffectConfig) -> EffectSettings {
             EffectOnFailure::None => EffectFallback::None,
         },
         denoise: e.denoise,
+        relight: e.relight,
+        relight_params: relight_params(e),
+    }
+}
+
+/// The relighting stage's parameters for the daemon's effect settings: the
+/// direction in degrees, the brightness as a gain (100 % is 1.0).
+fn relight_params(e: &EffectConfig) -> RelightParams {
+    RelightParams {
+        light: match e.relight_light {
+            obc_core::RelightLight::Warm => RelightLight::Warm,
+            obc_core::RelightLight::Neutral => RelightLight::Neutral,
+            obc_core::RelightLight::Cool => RelightLight::Cool,
+        },
+        // Validated to -90..=90 and 50..=200 before they get here.
+        pan_deg: e.relight_direction as f32,
+        gain: e.relight_brightness as f32 / 100.0,
     }
 }
 
@@ -862,7 +882,8 @@ impl MediaBackend for GstBackend {
     }
 
     fn effect_report(&mut self) -> Option<EffectReport> {
-        let output = self.running.as_ref()?.session.output();
+        let session = &self.running.as_ref()?.session;
+        let output = session.output();
         let status = |s| match s {
             obc_pipeline::EffectStatus::Off => EffectStatus::Off,
             obc_pipeline::EffectStatus::Loading => EffectStatus::Loading,
@@ -873,10 +894,35 @@ impl MediaBackend for GstBackend {
         Some(EffectReport {
             status: status(output.effect_status()),
             denoise: status(output.denoise_status()),
+            relight: status(output.relight_status()),
+            // Read from the element, not the bus (the ingest's failure poll
+            // would hide it).
+            enhance: session
+                .ingest()
+                .and_then(obc_pipeline::Ingest::enhance_status)
+                .map_or(EffectStatus::Off, status),
             load_ms: stats.last_load_ms,
             reused: stats.last_load_reused,
             gpu_ms_p50: stats.gpu_ms_p50,
         })
+    }
+
+    fn feature_availability(
+        &mut self,
+        compute_capability: Option<(u32, u32)>,
+    ) -> Option<(PathBuf, Vec<(Feature, Availability)>)> {
+        obc_pipeline::effect::maxine_feature_availability(compute_capability)
+    }
+
+    fn compute_capability(&mut self) -> Option<(u32, u32)> {
+        // NVML runs next to the session already (the GPU statistics): its
+        // answer costs no CUDA call.
+        self.running
+            .as_ref()?
+            .gpu
+            .as_ref()?
+            .info()
+            .compute_capability
     }
 
     fn open_camera_controls(
@@ -1304,6 +1350,48 @@ mod tests {
             ),
         ] {
             assert_eq!(pipewire_event(from), to);
+        }
+    }
+
+    #[test]
+    fn the_relighting_settings_map_to_the_elements_degrees_and_gain() {
+        let e = EffectConfig {
+            relight: true,
+            relight_light: obc_core::RelightLight::Warm,
+            relight_direction: -30,
+            relight_brightness: 150,
+            ..EffectConfig::default()
+        };
+        let s = effect_settings(&e);
+        assert!(s.relight);
+        assert_eq!(
+            s.relight_params,
+            RelightParams {
+                light: RelightLight::Warm,
+                pan_deg: -30.0,
+                gain: 1.5,
+            }
+        );
+        let d = effect_settings(&EffectConfig::default());
+        assert!(!d.relight);
+        assert_eq!(d.relight_params, RelightParams::default());
+        for light in obc_core::RelightLight::ALL {
+            let e = EffectConfig {
+                relight_light: light,
+                ..EffectConfig::default()
+            };
+            assert_eq!(relight_params(&e).light.as_str(), light.as_str());
+        }
+        // The configured bounds are within what the element takes.
+        for (direction, brightness) in [(-90, 50), (90, 200)] {
+            let e = EffectConfig {
+                relight: true,
+                relight_direction: direction,
+                relight_brightness: brightness,
+                ..EffectConfig::default()
+            };
+            assert!(relight_params(&e).validate().is_ok());
+            assert!(obc_pipeline::effect::check_settings(&effect_settings(&e)).is_ok());
         }
     }
 }

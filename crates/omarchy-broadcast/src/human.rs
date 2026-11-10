@@ -320,27 +320,55 @@ fn setting_accepts(s: &Setting) -> String {
     }
 }
 
+/// One setting as [`settings_text`] prints it.
+struct SettingRow<'a> {
+    label: Cow<'a, str>,
+    value: String,
+    id: Cow<'a, str>,
+    accepts: String,
+    marks: String,
+}
+
+/// The groups of one part of [`settings_text`], each under its label, the
+/// columns aligned over the part.
+fn settings_rows_text(out: &mut String, groups: &[(Cow<'_, str>, Vec<SettingRow<'_>>)]) {
+    let all = || groups.iter().flat_map(|(_, rows)| rows.iter());
+    let width = |f: fn(&SettingRow<'_>) -> usize| all().map(f).max().unwrap_or(0);
+    let label_w = width(|r| r.label.chars().count());
+    let value_w = width(|r| r.value.chars().count());
+    let id_w = width(|r| r.id.chars().count());
+    let accepts_w = width(|r| r.accepts.chars().count());
+    for (label, rows) in groups {
+        out.push_str(label);
+        out.push('\n');
+        for r in rows {
+            let line = format!(
+                "  {:<label_w$}  {:<value_w$}  {:<id_w$}  {:<accepts_w$}{}",
+                r.label, r.value, r.id, r.accepts, r.marks
+            );
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+    }
+}
+
 /// `settings`, and the result of `settings set|reset`: the camera, then the
 /// settings of `tree` (those `only` names) under their group's label, one
 /// line each: label, value (with its unit), id, what `settings set` takes,
 /// then `(stored)` for a value the user set and, for one that cannot be
-/// changed now, the daemon's reason in parentheses; last, whether a change
-/// applies now. Settings of a type this client does not know are left out.
+/// changed now, the daemon's reason in parentheses; then whether a change
+/// applies now. The global settings (revision 8: the video effects, the
+/// same for every camera) follow under `All cameras:`; when `only` names
+/// global settings alone, the camera part is left out. Settings of a type
+/// this client does not know are left out.
 pub fn settings_text(s: &Snapshot, tree: &SettingsTree, only: Only<'_>) -> String {
-    let mut out = format!("Camera:     {}\n", camera_label_of(s, &tree.camera));
-    struct Row<'a> {
-        label: Cow<'a, str>,
-        value: String,
-        id: Cow<'a, str>,
-        accepts: String,
-        marks: String,
-    }
-    let mut groups: Vec<(Cow<'_, str>, Vec<Row<'_>>)> = Vec::new();
+    let mut camera_groups = Vec::new();
+    let mut global_groups = Vec::new();
     for g in &tree.groups {
         if matches!(only, Only::Group(id) if id != g.id) {
             continue;
         }
-        let rows: Vec<Row<'_>> = g
+        let rows: Vec<SettingRow<'_>> = g
             .settings
             .iter()
             .filter(|st| !matches!(st.kind, SettingKind::Unknown(_)))
@@ -358,7 +386,7 @@ pub fn settings_text(s: &Snapshot, tree: &SettingsTree, only: Only<'_>) -> Strin
                     };
                     marks.push_str(&format!("  ({reason})"));
                 }
-                Row {
+                SettingRow {
                     label: printable(&st.label),
                     value: setting_value(st),
                     id: printable(&st.id),
@@ -367,40 +395,41 @@ pub fn settings_text(s: &Snapshot, tree: &SettingsTree, only: Only<'_>) -> Strin
                 }
             })
             .collect();
-        if !rows.is_empty() {
-            groups.push((printable(&g.label), rows));
+        if rows.is_empty() {
+            continue;
         }
-    }
-    if groups.is_empty() {
-        out.push_str(if tree.camera.is_empty() || matches!(only, Only::All) {
-            "No camera settings.\n"
+        if g.is_global() {
+            global_groups.push((printable(&g.label), rows));
         } else {
-            "No such camera setting.\n"
-        });
-    }
-    let all = || groups.iter().flat_map(|(_, rows)| rows.iter());
-    let width = |f: fn(&Row<'_>) -> usize| all().map(f).max().unwrap_or(0);
-    let label_w = width(|r| r.label.chars().count());
-    let value_w = width(|r| r.value.chars().count());
-    let id_w = width(|r| r.id.chars().count());
-    let accepts_w = width(|r| r.accepts.chars().count());
-    for (label, rows) in &groups {
-        out.push_str(label);
-        out.push('\n');
-        for r in rows {
-            let line = format!(
-                "  {:<label_w$}  {:<value_w$}  {:<id_w$}  {:<accepts_w$}{}",
-                r.label, r.value, r.id, r.accepts, r.marks
-            );
-            out.push_str(line.trim_end());
-            out.push('\n');
+            camera_groups.push((printable(&g.label), rows));
         }
     }
-    // Only the active camera is ever open.
-    let live = !tree.camera.is_empty()
-        && tree.camera == s.active_camera
-        && matches!(s.state, State::Active | State::Starting);
-    out.push_str(applies_text(live));
+    let mut out = String::new();
+    let camera_part =
+        matches!(only, Only::All) || !camera_groups.is_empty() || global_groups.is_empty();
+    if camera_part {
+        out.push_str(&format!(
+            "Camera:     {}\n",
+            camera_label_of(s, &tree.camera)
+        ));
+        if camera_groups.is_empty() {
+            out.push_str(if tree.camera.is_empty() || matches!(only, Only::All) {
+                "No camera settings.\n"
+            } else {
+                "No such camera setting.\n"
+            });
+        }
+        settings_rows_text(&mut out, &camera_groups);
+        // Only the active camera is ever open.
+        let live = !tree.camera.is_empty()
+            && tree.camera == s.active_camera
+            && matches!(s.state, State::Active | State::Starting);
+        out.push_str(applies_text(live));
+    }
+    if !global_groups.is_empty() {
+        out.push_str("All cameras:\n");
+        settings_rows_text(&mut out, &global_groups);
+    }
     out
 }
 
@@ -1168,6 +1197,120 @@ mod tests {
             settings_text(&s, &none, Only::All),
             "Camera:     none\nNo camera settings.\n\
              The camera is not in use: changes apply the next time it opens.\n"
+        );
+    }
+
+    /// The global groups of a revision-8 daemon.
+    fn global_groups() -> Vec<obc_ipc::SettingsGroup> {
+        let setting = |id: &str, label: &str, kind| Setting {
+            id: id.into(),
+            label: label.into(),
+            kind,
+            scope: "global".into(),
+            stored: false,
+            enabled: true,
+            disabled_reason: String::new(),
+            enabled_when: Vec::new(),
+            hint: None,
+        };
+        let mode = setting(
+            "effect.background.mode",
+            "Effect",
+            SettingKind::Enum {
+                options: vec![
+                    ("none".into(), "Off".into()),
+                    ("blur".into(), "Blur".into()),
+                    ("replace".into(), "Replace".into()),
+                ],
+                default: "none".into(),
+                value: "none".into(),
+            },
+        );
+        let mut blur = setting(
+            "effect.background.blur_strength",
+            "Blur strength",
+            SettingKind::Int {
+                min: 0,
+                max: 100,
+                step: 1,
+                default: 50,
+                value: 50,
+                unit: Some("%".into()),
+            },
+        );
+        blur.enabled = false;
+        blur.disabled_reason = "Choose Blur to change this".into();
+        let mut denoise = setting(
+            "effect.video.denoise",
+            "Noise removal",
+            SettingKind::Bool {
+                default: false,
+                value: false,
+            },
+        );
+        denoise.stored = true;
+        denoise.enabled = false;
+        denoise.disabled_reason = "Not installed".into();
+        vec![
+            obc_ipc::SettingsGroup {
+                id: "background".into(),
+                label: "Background effect".into(),
+                settings: vec![mode, blur],
+            },
+            obc_ipc::SettingsGroup {
+                id: "video".into(),
+                label: "Video".into(),
+                settings: vec![denoise],
+            },
+        ]
+    }
+
+    const GLOBAL_TEXT: &str = "All cameras:\n\
+         Background effect\n  \
+         Effect         Off   effect.background.mode           none|blur|replace\n  \
+         Blur strength  50 %  effect.background.blur_strength  0..100             (Choose Blur to change this)\n\
+         Video\n  \
+         Noise removal  off   effect.video.denoise             on|off             (stored)  (Not installed)\n";
+
+    #[test]
+    fn global_settings_follow_the_cameras_under_their_own_heading() {
+        let mut s = sample();
+        s.state = State::Active;
+        let mut tree = settings_tree();
+        tree.groups.truncate(1);
+        tree.groups.extend(global_groups());
+        assert_eq!(
+            settings_text(&s, &tree, Only::All),
+            format!(
+                "Camera:     First Camera (1234:abcd)\n\
+                 Image\n  \
+                 Sharpness  128  camera.image.sharpness  0..255\n\
+                 Applied live.\n{GLOBAL_TEXT}"
+            )
+        );
+        // A global setting or group alone: no camera part.
+        assert_eq!(
+            settings_text(&s, &tree, Only::Setting("effect.video.denoise")),
+            "All cameras:\nVideo\n  \
+             Noise removal  off  effect.video.denoise  on|off  (stored)  (Not installed)\n"
+        );
+        assert!(
+            settings_text(&s, &tree, Only::Group("background"))
+                .starts_with("All cameras:\nBackground effect\n")
+        );
+        // A camera setting alone: no global part.
+        assert!(!settings_text(&s, &tree, Only::Group("image")).contains("All cameras"));
+        // No camera: the global settings all the same.
+        let none = SettingsTree {
+            groups: global_groups(),
+            ..SettingsTree::default()
+        };
+        assert_eq!(
+            settings_text(&s, &none, Only::All),
+            format!(
+                "Camera:     none\nNo camera settings.\n\
+                 The camera is not in use: changes apply the next time it opens.\n{GLOBAL_TEXT}"
+            )
         );
     }
 }

@@ -22,7 +22,7 @@
 //!
 //! The denoise stage (`docs/adr/0018-video-noise-removal.md`) lives in the
 //! same backend instance as the effect: one load request carries both
-//! (`LoadRequest::denoise`), and it unloads with the effect, so it adds no
+//! (`Stage::Denoise` in `LoadRequest::stages`), and it unloads with the effect, so it adds no
 //! teardown path and nothing of it runs at idle. It hides nothing, so the
 //! privacy rules of the effect are unchanged by it:
 //!
@@ -44,11 +44,13 @@
 //!   frame, never the input; the next is the new chain's.
 //! * **A denoise failure drops the stage, never the effect.** The effective
 //!   request is "denoise requested and no denoise failure recorded"
-//!   (`Control::denoise_failure`). A load that fails with
-//!   `BackendError::Denoise`, or any load failure while the stage is the
+//!   (`StageCtl::failure` of `Control::stages`). A load that fails with
+//!   `BackendError::Stage` for `Stage::Denoise`, or any load failure while
+//!   the stage is the
 //!   only one (`none`), records the failure; the worker then loads the
 //!   effect alone in the same job (or unloads, for `none`). A frame that
-//!   fails with `BackendError::Denoise` (or any frame of the stage alone)
+//!   fails with `BackendError::Stage` for the stage (or any frame of the
+//!   stage alone)
 //!   records it too, whichever request the frame was decided for, as long
 //!   as the current one still asks for the stage: the streaming thread
 //!   marks the loaded chain as without the stage and starts a new request,
@@ -60,21 +62,40 @@
 //!   effect's status never becomes failed for the stage. The failure is
 //!   forgotten when the denoise request changes or on a retry (`apply`
 //!   with `retry`), never otherwise.
-//! * The denoise status (`Control::denoise_status`) is separate from the
+//! * The denoise status (`StageCtl::status`) is separate from the
 //!   effect's: off (not requested), loading, ready, or failed with the
 //!   reason. A failure of the whole chain (the effect's load or frame) shows
 //!   as failed there too, without being recorded as a denoise failure.
 //!
+//! # The relight stage
+//!
+//! The relight stage (`Stage::Relight`, after denoise and the mask) follows
+//! every rule above, with its own failure, status, request and counters
+//! (`Control::stages` holds one `StageCtl` per stage). Its request is "on,
+//! with this light": a new light is a new request and, on the loaded chain,
+//! a switch that loads no model, so the streaming thread waits only for
+//! the switch itself; its direction and gain travel with each frame
+//! (`FrameParams`) and change nothing that is loaded. Where the stages
+//! differ from one stage alone:
+//!
+//! * a load failure of one stage drops that stage and the job loads the
+//!   rest; any other load failure with `none` drops every requested stage;
+//! * a frame failure of one stage under blur or replace drops it and runs
+//!   the frame again without it, as often as stages fail; under `none` the
+//!   frame is the input (any failure there that names no stage drops every
+//!   stage), and a stage left loaded runs from the next frame.
+//!
 //! # Timings
 //!
 //! `gpu_ms` is measured with two CUDA events on the element's stream around
-//! the backend's calls for the frame (both calls when a frame runs again
-//! without the denoise stage), not around a temporal reset. `denoise_ms` is
-//! the backend's `timings` for the frame just processed, read after the
+//! the backend's calls for the frame (every call when a frame runs again
+//! without a stage), not around a temporal reset. `denoise_ms` and
+//! `relight_ms` are the backend's `timings` for the frame just processed,
+//! read after the
 //! frame's stream synchronisation (a backend reports a frame only once its
 //! work has completed), under a `try_lock` of `Engine` so the streaming
 //! thread never waits for a load for it: while the worker holds the lock,
-//! that frame's figure is skipped.
+//! that frame's figures are skipped.
 //!
 //! # A new source
 //!
@@ -82,9 +103,15 @@
 //! [`NEW_SOURCE_FLAG`](super::NEW_SOURCE_FLAG). The element then asks the
 //! backend to forget its temporal state (`InferenceBackend::reset_temporal`)
 //! right before the next frame it processes, so the denoise stage does not
-//! blend frames of two cameras. A flagged frame that is not processed
-//! (passed through, or black) keeps the reset pending for the next
-//! processed one.
+//! blend frames of two cameras. A stage whose state cannot be reset in place
+//! (Maxine's relighting) is dropped by the backend instead and loaded again
+//! fresh by the worker (a new request, the stage loading meanwhile): the
+//! frames until it is ready run without it, the effect alone under blur or
+//! replace (never the input), the input with the stages alone gone, and no
+//! frame is relit by the instance that saw the previous source, so camera
+//! A's person never shows in camera B's frames. A flagged frame that is not
+//! processed (passed through, or black) keeps the reset pending for the
+//! next processed one.
 //!
 //! # CUDA context and stream
 //!
@@ -123,7 +150,7 @@ use gst_base::subclass::prelude::*;
 use gst_video::VideoInfo;
 use obc_backend::{
     BackendError, BackendFactory, ColourMatrix, ColourSpec, DeviceNv12, EffectKind, FrameParams,
-    GpuContext, InferenceBackend, LoadReport, LoadRequest,
+    GpuContext, InferenceBackend, LoadReport, LoadRequest, RelightParams, Stage, StageTimings,
 };
 use obc_gpu::{ContextGuard, CuContext, CuStream, Event};
 
@@ -131,8 +158,8 @@ use super::{STATUS_MESSAGE, has_new_source_flag};
 use crate::background;
 use crate::cuda::{self, CudaMemoryHead, MAP_CUDA};
 use crate::settings::{
-    EffectFallback, EffectSettings, EffectStats, EffectStatus, FrameAction, Target, decide,
-    parse_effect, percentile,
+    EffectFallback, EffectSettings, EffectStats, EffectStatus, FrameAction, RelightLight, Target,
+    decide, parse_effect, percentile,
 };
 
 static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
@@ -225,12 +252,11 @@ struct Control {
     target: Target,
     generation: u64,
     status: EffectStatus,
-    /// Why the denoise stage was dropped; while set, the stage is not
-    /// loaded although requested (see the module docs).
-    denoise_failure: Option<String>,
-    denoise_status: EffectStatus,
-    /// The effect of `Engine::loaded` (`EffectKind::None`: the denoise
-    /// stage alone), as last published by the worker (cleared before an
+    /// Each stage's failure and status, in [`Stage::ALL`] order
+    /// ([`stage_index`]).
+    stages: [StageCtl; Stage::ALL.len()],
+    /// The effect of `Engine::loaded` (`EffectKind::None`: the stages
+    /// alone), as last published by the worker (cleared before an
     /// unload, or a reload during which the streaming thread must not wait,
     /// starts).
     loaded_kind: Option<EffectKind>,
@@ -252,8 +278,7 @@ impl Default for Control {
             target: Target::default(),
             generation: 0,
             status: EffectStatus::Off,
-            denoise_failure: None,
-            denoise_status: EffectStatus::Off,
+            stages: Default::default(),
             loaded_kind: None,
             gpu: None,
             format: None,
@@ -266,24 +291,58 @@ impl Default for Control {
     }
 }
 
+/// What the element knows of one stage.
+#[derive(Debug, Clone, Default)]
+struct StageCtl {
+    /// Why the stage was dropped; while set, the stage is not loaded
+    /// although requested (see the module docs).
+    failure: Option<String>,
+    status: EffectStatus,
+}
+
+/// The position of `stage` in [`Stage::ALL`] (and in `Control::stages`).
+fn stage_index(stage: Stage) -> usize {
+    Stage::ALL
+        .iter()
+        .position(|&s| s == stage)
+        .expect("every stage is in Stage::ALL")
+}
+
 impl Control {
-    /// Whether the denoise stage is requested and has not failed.
-    fn denoise_effective(&self) -> bool {
-        self.target.denoise && self.denoise_failure.is_none()
+    fn stage(&self, stage: Stage) -> &StageCtl {
+        &self.stages[stage_index(stage)]
     }
 
-    /// What the worker loads for the request: the target with the
-    /// effective denoise request.
+    fn stage_mut(&mut self, stage: Stage) -> &mut StageCtl {
+        &mut self.stages[stage_index(stage)]
+    }
+
+    /// Whether `stage` is requested and has not failed.
+    fn effective(&self, stage: Stage) -> bool {
+        self.target.wants(stage) && self.stage(stage).failure.is_none()
+    }
+
+    /// Whether any stage is requested and has not failed.
+    fn any_effective(&self) -> bool {
+        Stage::ALL.iter().any(|&s| self.effective(s))
+    }
+
+    /// Whether a requested stage has a failure recorded.
+    fn any_stage_failed(&self) -> bool {
+        self.stages.iter().any(|s| s.failure.is_some())
+    }
+
+    /// What the worker loads for the request: the target without the
+    /// stages that failed.
     fn job_target(&self) -> Target {
-        Target {
-            denoise: self.denoise_effective(),
-            ..self.target.clone()
-        }
+        Stage::ALL.iter().fold(self.target.clone(), |t, &s| {
+            if self.effective(s) { t } else { t.without(s) }
+        })
     }
 
     /// Whether the loaded chain can process frames of the request: any
-    /// chain for `none` (with denoise), one with an effect for blur and
-    /// replace (the denoise stage alone hides nothing).
+    /// chain for `none` (with a stage), one with an effect for blur and
+    /// replace (the stages alone hide nothing).
     fn usable(&self) -> bool {
         match self.loaded_kind {
             None => false,
@@ -300,33 +359,52 @@ impl Control {
         }
     }
 
-    /// The denoise status of a new request.
-    fn pending_denoise_status(&self) -> EffectStatus {
-        match (&self.denoise_failure, self.target.denoise) {
-            (_, false) => EffectStatus::Off,
-            (Some(r), true) => EffectStatus::Failed(r.clone()),
-            (None, true) => EffectStatus::Loading,
+    /// Sets every stage's status for a new request: off when not
+    /// requested, failed while its failure is recorded, else loading.
+    fn set_pending_stage_statuses(&mut self) {
+        self.set_switch_stage_statuses(None);
+    }
+
+    /// [`Self::set_pending_stage_statuses`] for a new request that replaces
+    /// `prev` on the loaded chain (`None`: a reload of everything), except
+    /// that a ready stage whose request is the same in both stays ready: the
+    /// switch keeps it loaded as it is (only the stage that changed loads,
+    /// rebinds or goes), and showing it loading again would read as a reload
+    /// of its model.
+    fn set_switch_stage_statuses(&mut self, prev: Option<&Target>) {
+        for s in Stage::ALL {
+            let kept = prev.is_some_and(|p| p.stage_request(s) == self.target.stage_request(s))
+                && self.stage(s).status == EffectStatus::Ready;
+            let status = match (&self.stage(s).failure, self.target.wants(s)) {
+                (_, false) => EffectStatus::Off,
+                (Some(r), true) => EffectStatus::Failed(r.clone()),
+                (None, true) if kept => EffectStatus::Ready,
+                (None, true) => EffectStatus::Loading,
+            };
+            self.stage_mut(s).status = status;
         }
     }
 
-    /// Records a denoise failure, unless the request no longer asks for the
-    /// stage, one is already recorded, or (with `generation`) request
+    /// Records a failure of `stage`, unless the request no longer asks for
+    /// the stage, one is already recorded, or (with `generation`) request
     /// `generation` is superseded. `reconcile` starts a new request so the
     /// worker brings what is loaded in line with it.
-    fn record_denoise_failure(
+    fn record_stage_failure(
         &mut self,
+        stage: Stage,
         generation: Option<u64>,
         reason: String,
         reconcile: bool,
     ) -> bool {
         if generation.is_some_and(|g| g != self.generation)
-            || !self.target.denoise
-            || self.denoise_failure.is_some()
+            || !self.target.wants(stage)
+            || self.stage(stage).failure.is_some()
         {
             return false;
         }
-        self.denoise_status = EffectStatus::Failed(reason.clone());
-        self.denoise_failure = Some(reason);
+        let st = self.stage_mut(stage);
+        st.status = EffectStatus::Failed(reason.clone());
+        st.failure = Some(reason);
         if reconcile {
             self.generation += 1;
         }
@@ -337,7 +415,7 @@ impl Control {
         Report {
             kind: self.settings.kind,
             status: self.status.clone(),
-            denoise: self.denoise_status.clone(),
+            stages: self.stages.iter().map(|s| s.status.clone()).collect(),
         }
     }
 }
@@ -347,13 +425,18 @@ impl Control {
 struct Report {
     kind: EffectKind,
     status: EffectStatus,
-    denoise: EffectStatus,
+    /// Each stage's status, in [`Stage::ALL`] order.
+    stages: Vec<EffectStatus>,
 }
 
 impl Report {
     /// `Some(now)` when `now` differs from `self`: a message to post.
     fn changed(&self, now: Report) -> Option<Report> {
-        (now.status != self.status || now.denoise != self.denoise).then_some(now)
+        (now != *self).then_some(now)
+    }
+
+    fn stage(&self, stage: Stage) -> &EffectStatus {
+        &self.stages[stage_index(stage)]
     }
 }
 
@@ -366,9 +449,11 @@ struct Shared {
     black: AtomicU64,
     passthrough: AtomicU64,
     denoised: AtomicU64,
+    relit: AtomicU64,
     cuda_active: AtomicBool,
     gpu_ms: Mutex<VecDeque<f32>>,
     denoise_ms: Mutex<VecDeque<f32>>,
+    relight_ms: Mutex<VecDeque<f32>>,
 }
 
 /// Appends `v` to a window of at most [`EffectStats::WINDOW`] values.
@@ -503,6 +588,7 @@ struct StreamState {
     generation: u64,
     kind: EffectKind,
     strength: f32,
+    relight: RelightParams,
     fallback: EffectFallback,
     /// A frame of a new source arrived
     /// ([`NEW_SOURCE_FLAG`](super::NEW_SOURCE_FLAG)): reset the backend's
@@ -532,8 +618,16 @@ fn post_status(element: &super::ObcEffect, r: &Report) {
         .field("effect", r.kind.as_str())
         .field("status", r.status.as_str())
         .field("reason", r.status.reason().unwrap_or(""))
-        .field("denoise", r.denoise.as_str())
-        .field("denoise-reason", r.denoise.reason().unwrap_or(""))
+        .field("denoise", r.stage(Stage::Denoise).as_str())
+        .field(
+            "denoise-reason",
+            r.stage(Stage::Denoise).reason().unwrap_or(""),
+        )
+        .field("relight", r.stage(Stage::Relight).as_str())
+        .field(
+            "relight-reason",
+            r.stage(Stage::Relight).reason().unwrap_or(""),
+        )
         .build();
     let _ = element.post_message(gst::message::Element::builder(s).src(element).build());
 }
@@ -555,37 +649,44 @@ impl ObcEffect {
         lock(&self.shared.control).status.clone()
     }
 
-    pub(super) fn denoise_status(&self) -> EffectStatus {
-        lock(&self.shared.control).denoise_status.clone()
+    pub(super) fn stage_status(&self, stage: Stage) -> EffectStatus {
+        lock(&self.shared.control).stage(stage).status.clone()
     }
 
     pub(super) fn stats(&self) -> EffectStats {
-        let (effect, status, denoise, last_load_ms, last_load_reused, loads) = {
+        let (effect, status, denoise, relight, last_load_ms, last_load_reused, loads) = {
             let c = lock(&self.shared.control);
             (
                 c.settings.kind,
                 c.status.clone(),
-                c.denoise_status.clone(),
+                c.stage(Stage::Denoise).status.clone(),
+                c.stage(Stage::Relight).status.clone(),
                 c.last_load_ms,
                 c.last_load_reused,
                 c.loads,
             )
         };
-        let window: Vec<f32> = lock(&self.shared.gpu_ms).iter().copied().collect();
-        let denoise_window: Vec<f32> = lock(&self.shared.denoise_ms).iter().copied().collect();
+        let window = |w: &Mutex<VecDeque<f32>>| -> Vec<f32> { lock(w).iter().copied().collect() };
+        let gpu_window = window(&self.shared.gpu_ms);
+        let denoise_window = window(&self.shared.denoise_ms);
+        let relight_window = window(&self.shared.relight_ms);
         let s = &self.shared;
         EffectStats {
             effect,
             status,
             denoise,
+            relight,
             frames_processed: s.processed.load(Ordering::Relaxed),
             frames_black: s.black.load(Ordering::Relaxed),
             frames_passthrough: s.passthrough.load(Ordering::Relaxed),
             frames_denoised: s.denoised.load(Ordering::Relaxed),
-            gpu_ms_p50: percentile(&window, 50.0),
-            gpu_ms_p95: percentile(&window, 95.0),
+            frames_relit: s.relit.load(Ordering::Relaxed),
+            gpu_ms_p50: percentile(&gpu_window, 50.0),
+            gpu_ms_p95: percentile(&gpu_window, 95.0),
             denoise_ms_p50: percentile(&denoise_window, 50.0),
             denoise_ms_p95: percentile(&denoise_window, 95.0),
+            relight_ms_p50: percentile(&relight_window, 50.0),
+            relight_ms_p95: percentile(&relight_window, 95.0),
             last_load_ms,
             last_load_reused,
             loads,
@@ -594,34 +695,42 @@ impl ObcEffect {
     }
 
     /// Applies new settings. A change of what has to be loaded (the effect,
-    /// the image of replace, or the denoise request) is a new request for
-    /// the worker; `retry` makes one after a failure (of the effect or of
-    /// the denoise stage) even when nothing changed. A recorded denoise
-    /// failure is forgotten when the denoise request changes or on a retry.
-    /// The effect's status turns loading (off for `none`) when the effect
-    /// changes or had failed; a change of the denoise request alone leaves
-    /// it as it is.
+    /// the image of replace, a stage request, or the relighting light) is a
+    /// new request for the worker; `retry` makes one after a failure (of
+    /// the effect or of a stage) even when nothing changed. A stage's
+    /// recorded failure is forgotten when its request (for relight: on or
+    /// off, or its light) changes or on a retry. The effect's status turns
+    /// loading (off for `none`) when the effect changes or had failed; a
+    /// change of a stage request alone leaves it as it is. Likewise a ready
+    /// stage whose own request is unchanged stays ready: the switch keeps
+    /// it loaded, and only the stage that changed shows loading (its model
+    /// load, or the rebind of a new light). A change of the
+    /// per-frame parameters alone (blur strength, relighting direction and
+    /// gain) is never a retry: they load nothing, and a slider moved after
+    /// a failure would otherwise reload what failed on every step.
     pub(super) fn apply(&self, new: EffectSettings, retry: bool) {
         let posted = {
             let mut c = lock(&self.shared.control);
+            let retry = retry && !c.settings.changes_frame_params_only(&new);
             let before = c.report();
             let target = new.target();
             let effect_failed = matches!(c.status, EffectStatus::Failed(_));
-            let denoise_failed = c.denoise_failure.is_some();
+            let stage_failed = c.any_stage_failed();
             let effect_changed =
                 (target.kind, &target.background) != (c.target.kind, &c.target.background);
-            let denoise_changed = target.denoise != c.target.denoise;
             c.settings = new;
-            if target != c.target || (retry && (effect_failed || denoise_failed)) {
-                if denoise_changed || retry {
-                    c.denoise_failure = None;
+            if target != c.target || (retry && (effect_failed || stage_failed)) {
+                for s in Stage::ALL {
+                    if retry || target.stage_request(s) != c.target.stage_request(s) {
+                        c.stage_mut(s).failure = None;
+                    }
                 }
-                c.target = target;
+                let prev = std::mem::replace(&mut c.target, target);
                 c.generation += 1;
                 if effect_changed || effect_failed {
                     c.status = c.pending_status();
                 }
-                c.denoise_status = c.pending_denoise_status();
+                c.set_switch_stage_statuses(Some(&prev));
                 self.shared.wake.notify_all();
             }
             before.changed(c.report())
@@ -630,18 +739,19 @@ impl ObcEffect {
             gst::debug!(
                 CAT,
                 imp = self,
-                "effect {}: {}, denoise {}",
+                "effect {}: {}, denoise {}, relight {}",
                 r.kind,
                 r.status,
-                r.denoise
+                r.stage(Stage::Denoise),
+                r.stage(Stage::Relight)
             );
             post_status(&self.obj(), &r);
         }
     }
 
     /// Marks request `generation` as failed (unless superseded), and posts.
-    /// A requested denoise stage that has not failed itself shows the
-    /// failure too: it runs in the failed chain.
+    /// A requested stage that has not failed itself shows the failure too:
+    /// it runs in the failed chain.
     fn fail(&self, generation: u64, reason: String) {
         let posted = {
             let mut c = lock(&self.shared.control);
@@ -649,8 +759,10 @@ impl ObcEffect {
                 None
             } else {
                 let before = c.report();
-                if c.target.denoise && c.denoise_failure.is_none() {
-                    c.denoise_status = EffectStatus::Failed(reason.clone());
+                for s in Stage::ALL {
+                    if c.effective(s) {
+                        c.stage_mut(s).status = EffectStatus::Failed(reason.clone());
+                    }
                 }
                 c.status = EffectStatus::Failed(reason);
                 before.changed(c.report())
@@ -662,24 +774,57 @@ impl ObcEffect {
         }
     }
 
-    /// Records a denoise failure (of request `generation`, unless superseded;
-    /// with `None`, of whatever request still asks for the stage) and
-    /// starts a new request, so the worker drops the stage (it finds the
-    /// effect loaded, or unloads for `none`); posts. The effect's status is
-    /// not touched. A failed effect starts no new request: it processes
-    /// nothing until one comes (a retry or a change), which reconciles.
-    fn fail_denoise(&self, generation: Option<u64>, reason: String) {
+    /// Records a failure of `stage` (of request `generation`, unless
+    /// superseded; with `None`, of whatever request still asks for the
+    /// stage) and starts a new request, so the worker drops the stage (it
+    /// finds the rest loaded, or unloads for `none` without another stage);
+    /// posts. The effect's status is not touched. A failed effect starts no
+    /// new request: it processes nothing until one comes (a retry or a
+    /// change), which reconciles.
+    fn fail_stage(&self, stage: Stage, generation: Option<u64>, reason: String) {
         let posted = {
             let mut c = lock(&self.shared.control);
             let before = c.report();
             let reconcile = !matches!(c.status, EffectStatus::Failed(_));
-            if c.record_denoise_failure(generation, reason, reconcile) && reconcile {
+            if c.record_stage_failure(stage, generation, reason, reconcile) && reconcile {
                 self.shared.wake.notify_all();
             }
             before.changed(c.report())
         };
         if let Some(r) = posted {
-            gst::warning!(CAT, imp = self, "denoise: {}", r.denoise);
+            gst::warning!(CAT, imp = self, "{stage}: {}", r.stage(stage));
+            post_status(&self.obj(), &r);
+        }
+    }
+
+    /// Starts a new request so the worker loads `stages` again: the
+    /// backend dropped them on a temporal reset (not a failure), so the
+    /// chain loaded is without them. Each one still requested and not
+    /// failed shows loading until the worker has it ready again; posts.
+    fn rebuild_stages(&self, stages: &[Stage]) {
+        let posted = {
+            let mut c = lock(&self.shared.control);
+            let before = c.report();
+            let mut wanted = false;
+            for &s in stages {
+                if c.effective(s) {
+                    c.stage_mut(s).status = EffectStatus::Loading;
+                    wanted = true;
+                }
+            }
+            if wanted {
+                c.generation += 1;
+                self.shared.wake.notify_all();
+            }
+            before.changed(c.report())
+        };
+        if let Some(r) = posted {
+            gst::debug!(
+                CAT,
+                imp = self,
+                "a new source: loading again {stages:?}, relight {}",
+                r.stage(Stage::Relight)
+            );
             post_status(&self.obj(), &r);
         }
     }
@@ -801,21 +946,17 @@ impl ObcEffect {
         }
     }
 
-    /// The denoise stage time of the frame just processed and synchronised
-    /// (see "Timings" in the module docs), if the backend has it. Never
-    /// waits for the `Engine` lock: if the worker holds it (a load, a switch
-    /// or an unload under way), this frame's figure is skipped.
-    fn denoise_time(&self) -> Option<f32> {
+    /// The stage times of the frame just processed and synchronised (see
+    /// "Timings" in the module docs), if the backend has them. Never waits
+    /// for the `Engine` lock: if the worker holds it (a load, a switch or an
+    /// unload under way), this frame's figures are skipped.
+    fn stage_times(&self) -> Option<StageTimings> {
         let e = match self.shared.engine.try_lock() {
             Ok(e) => e,
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return None,
         };
-        e.instance
-            .as_ref()?
-            .timings()
-            .map(|t| t.denoise_ms)
-            .filter(|ms| *ms > 0.0)
+        e.instance.as_ref()?.timings()
     }
 
     /// Fills `out` for `action` on the element's stream and waits for it.
@@ -847,8 +988,8 @@ impl ObcEffect {
                 .map_err(|e| e.to_string())
         };
         let mut processed = false;
-        // The denoise stage ran on the processed frame.
-        let mut denoised = false;
+        // The stages that ran on the processed frame.
+        let mut ran = (false, false);
         // The input copied into the output (a failed frame with nothing to
         // hide, or on-failure=none).
         let mut copied = false;
@@ -880,58 +1021,101 @@ impl ObcEffect {
                 let src = input.nv12();
                 // Owned by the outer scope, so it outlives `sync_on_exit`.
                 input_frame = Some(input);
-                let params = FrameParams {
+                let params = st.relight.frame_params(FrameParams {
                     blur_strength: st.strength,
-                };
+                    ..FrameParams::default()
+                });
                 let ctx = gpu.gpu_context();
-                // The denoise stage alone hides nothing: an effect frame
-                // needs a chain with the effect. A frame of `none` needs a
-                // chain with something in it (the stage, or the previous
-                // effect while switching).
+                // The stages alone hide nothing: an effect frame needs a
+                // chain with the effect. A frame of `none` needs a chain
+                // with something in it (a stage, or the previous effect
+                // while switching).
                 let alone = st.kind == EffectKind::None;
-                // The denoise stage failed on this frame (the backend has
-                // dropped it), whatever the frame then got.
-                let mut stage_failure: Option<String> = None;
+                // The stages that failed on this frame (the backend has
+                // dropped them), whatever the frame then got.
+                let mut stage_failures: Vec<(Stage, String)> = Vec::new();
+                // The stages the temporal reset dropped, to load again.
+                let mut rebuild: Vec<Stage> = Vec::new();
                 let mut e = lock(&self.shared.engine);
                 let Engine { instance, loaded } = &mut *e;
                 let usable = loaded.as_ref().is_some_and(|k| {
-                    k.target.kind != EffectKind::None || (alone && k.target.denoise)
+                    k.target.kind != EffectKind::None || (alone && k.target.has_stages())
                 });
                 let result = match (instance.as_mut(), usable) {
-                    (Some(instance), true) => {
-                        let with_denoise = loaded.as_ref().is_some_and(|k| k.target.denoise);
+                    (Some(instance), true) => 'frame: {
                         // Before the start event: the reset may wait for
                         // the stream, which is not this frame's GPU time.
                         let reset = if std::mem::take(&mut st.reset_pending) {
                             instance.reset_temporal(&ctx)
                         } else {
-                            Ok(())
+                            Ok(Default::default())
                         };
+                        // A stage whose state the backend cannot forget
+                        // (Maxine's relighting) is dropped by the reset
+                        // rather than carry the previous source's person
+                        // into this one. The chain in force is without it
+                        // from this frame, and a new request below has the
+                        // worker load it again, fresh: until it is ready
+                        // the frames run without it (under blur or replace
+                        // the effect alone, never the input), and no frame
+                        // is relit by the instance that saw the previous
+                        // source.
+                        let reset = reset.map(|dropped| {
+                            if let Some(k) = loaded.as_mut() {
+                                for &s in dropped.as_slice() {
+                                    if k.target.wants(s) {
+                                        k.target = k.target.without(s);
+                                        rebuild.push(s);
+                                    }
+                                }
+                            }
+                        });
+                        // The stages alone may have gone with it: nothing
+                        // left to run (the input, below).
+                        if reset.is_ok()
+                            && alone
+                            && !loaded.as_ref().is_some_and(|k| k.target.has_stages())
+                        {
+                            break 'frame None;
+                        }
                         // SAFETY: our own stream.
                         let _ = unsafe { gpu.start.record(stream) };
                         let mut r =
                             reset.and_then(|()| instance.process(&ctx, &params, &src, &dst));
-                        match &r {
-                            Ok(()) => denoised = with_denoise,
-                            // The backend has dropped the stage (and any
-                            // failure of the stage alone drops it): the
-                            // chain loaded from now on is without it.
-                            Err(err) if alone || matches!(err, BackendError::Denoise { .. }) => {
-                                if let Some(k) = loaded.as_mut() {
-                                    k.target.denoise = false;
-                                }
-                                stage_failure =
-                                    Some(format!("the denoise stage failed on a frame: {err}"));
-                                // An effect is fine without the stage: run
-                                // this frame again through the chain without
-                                // it, so it is still processed (never the
-                                // input, nor black, for a healthy effect).
-                                // Without an effect there is nothing to run.
-                                if !alone {
-                                    r = instance.process(&ctx, &params, &src, &dst);
-                                }
+                        // A stage failure: the backend has dropped the stage
+                        // (and any failure of the stages alone drops them
+                        // all), so the chain loaded from now on is without
+                        // it. An effect is fine without it: the frame runs
+                        // again through the chain without it, so it is still
+                        // processed (never the input, nor black, for a
+                        // healthy effect), as often as stages fail. Without
+                        // an effect the frame is the input.
+                        while let Err(err) = &r {
+                            let failed: Vec<Stage> = match stage_of(err) {
+                                Some(s) => vec![s],
+                                None if alone => Stage::ALL.to_vec(),
+                                None => break,
+                            };
+                            let Some(k) = loaded.as_mut() else { break };
+                            let failed: Vec<Stage> =
+                                failed.into_iter().filter(|&s| k.target.wants(s)).collect();
+                            if failed.is_empty() {
+                                break;
                             }
-                            Err(_) => {}
+                            for &s in &failed {
+                                k.target = k.target.without(s);
+                                stage_failures
+                                    .push((s, format!("the {s} stage failed on a frame: {err}")));
+                            }
+                            if alone {
+                                break;
+                            }
+                            r = instance.process(&ctx, &params, &src, &dst);
+                        }
+                        if r.is_ok()
+                            && let Some(k) = loaded.as_ref()
+                        {
+                            ran = (k.target.denoise, k.target.relight);
                         }
                         // SAFETY: our own stream.
                         let _ = unsafe { gpu.end.record(stream) };
@@ -940,20 +1124,23 @@ impl ObcEffect {
                     _ => None,
                 };
                 drop(e);
-                // The effect failed (alone, or again without the stage):
-                // recorded first, so the denoise failure below does not
+                if !rebuild.is_empty() {
+                    self.rebuild_stages(&rebuild);
+                }
+                // The effect failed (alone, or again without the stages):
+                // recorded first, so the stage failures below do not
                 // supersede it.
                 if !alone && let Some(Err(err)) = &result {
                     self.fail(st.generation, format!("processing a frame failed: {err}"));
                 }
-                if let Some(reason) = stage_failure {
+                for (stage, reason) in stage_failures {
                     // Recorded whichever request the frame was decided for:
                     // the stage is gone from the loaded chain, and a request
                     // that still asks for it must learn it now (the first
                     // frame after turning the stage on was decided under the
                     // previous request, and the worker has already handled
                     // the new one).
-                    self.fail_denoise(None, reason);
+                    self.fail_stage(stage, None, reason);
                 }
                 let copy = |src: &DeviceNv12, dst: &DeviceNv12| {
                     // SAFETY: both are the mapped CUDA frames of this call,
@@ -962,7 +1149,7 @@ impl ObcEffect {
                 };
                 match result {
                     Some(Ok(())) => processed = true,
-                    // The stage alone failed (recorded above): nothing to
+                    // The stages alone failed (recorded above): nothing to
                     // hide, the input.
                     Some(Err(_)) if alone => {
                         copy(&src, &dst)?;
@@ -995,10 +1182,21 @@ impl ObcEffect {
         drop(out);
         if processed {
             self.shared.processed.fetch_add(1, Ordering::Relaxed);
+            let (denoised, relit) = ran;
             if denoised {
                 self.shared.denoised.fetch_add(1, Ordering::Relaxed);
-                if let Some(ms) = self.denoise_time() {
-                    push_window(&self.shared.denoise_ms, ms);
+            }
+            if relit {
+                self.shared.relit.fetch_add(1, Ordering::Relaxed);
+            }
+            if (denoised || relit)
+                && let Some(t) = self.stage_times()
+            {
+                if denoised && t.denoise_ms > 0.0 {
+                    push_window(&self.shared.denoise_ms, t.denoise_ms);
+                }
+                if relit && t.relight_ms > 0.0 {
+                    push_window(&self.shared.relight_ms, t.relight_ms);
                 }
             }
             if let Ok(ms) = Event::elapsed_ms(&gpu.start, &gpu.end) {
@@ -1121,7 +1319,7 @@ impl Drop for CudaFrame {
 /// One unit of work for the worker: the request and what it needs.
 struct Job {
     generation: u64,
-    /// What to load: the request with the effective denoise request
+    /// What to load: the request without the stages that failed
     /// ([`Control::job_target`]).
     target: Target,
     gpu: GpuContext,
@@ -1130,7 +1328,7 @@ struct Job {
 }
 
 /// Why a load failed; the backend's error, when it came from the backend,
-/// tells a failure of the denoise stage alone from one of the chain.
+/// tells a failure of one stage alone from one of the chain.
 struct Failure {
     reason: String,
     error: Option<BackendError>,
@@ -1144,8 +1342,16 @@ impl Failure {
         }
     }
 
-    fn of_denoise(&self) -> bool {
-        matches!(self.error, Some(BackendError::Denoise { .. }))
+    fn stage(&self) -> Option<Stage> {
+        self.error.as_ref().and_then(stage_of)
+    }
+}
+
+/// The stage `err` is the failure of alone, the rest of the chain intact.
+fn stage_of(err: &BackendError) -> Option<Stage> {
+    match err {
+        BackendError::Stage { stage, .. } => Some(*stage),
+        _ => None,
     }
 }
 
@@ -1157,11 +1363,11 @@ enum Outcome {
     Superseded,
 }
 
-/// What a job did, and the denoise failure it ran into, if any (the job
-/// then went on without the stage).
+/// What a job did, and the stage failures it ran into (the job then went
+/// on without those stages).
 struct JobResult {
     outcome: Outcome,
-    denoise_failure: Option<String>,
+    stage_failures: Vec<(Stage, String)>,
 }
 
 fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
@@ -1190,16 +1396,18 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
         handled = Some(job.generation);
         let JobResult {
             outcome,
-            denoise_failure,
+            stage_failures,
         } = run_job(&shared, &job);
         let (loaded_kind, in_force) = {
             let e = lock(&shared.engine);
             let k = e.loaded.as_ref();
-            (
-                k.map(|k| k.target.kind),
-                k.is_some_and(|k| k.target.denoise),
-            )
+            (k.map(|k| k.target.kind), k.map(|k| k.target.clone()))
         };
+        let in_force_list = in_force
+            .as_ref()
+            .map(|t| t.stage_list().to_string())
+            .unwrap_or_default();
+        let in_force = |s: Stage| in_force.as_ref().is_some_and(|t| t.wants(s));
         let posted = {
             let mut c = lock(&shared.control);
             let before = c.report();
@@ -1210,8 +1418,8 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                 c.last_load_reused = r.reused_model;
             }
             if c.generation == job.generation {
-                if let Some(reason) = &denoise_failure {
-                    c.record_denoise_failure(Some(job.generation), reason.clone(), false);
+                for (stage, reason) in &stage_failures {
+                    c.record_stage_failure(*stage, Some(job.generation), reason.clone(), false);
                 }
                 let effect = c.target.kind != EffectKind::None;
                 match &outcome {
@@ -1220,21 +1428,27 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                         if effect {
                             c.status = EffectStatus::Ready;
                         }
-                        if c.denoise_effective() && in_force {
-                            c.denoise_status = EffectStatus::Ready;
+                        for s in Stage::ALL {
+                            if c.effective(s) && in_force(s) {
+                                c.stage_mut(s).status = EffectStatus::Ready;
+                            }
                         }
                     }
                     Outcome::Failed(f) => {
                         if effect {
                             c.status = EffectStatus::Failed(f.reason.clone());
                         }
-                        if c.denoise_effective() {
-                            c.denoise_status = EffectStatus::Failed(f.reason.clone());
+                        for s in Stage::ALL {
+                            if c.effective(s) {
+                                c.stage_mut(s).status = EffectStatus::Failed(f.reason.clone());
+                            }
                         }
                     }
                 }
-                if !c.target.denoise {
-                    c.denoise_status = EffectStatus::Off;
+                for s in Stage::ALL {
+                    if !c.target.wants(s) {
+                        c.stage_mut(s).status = EffectStatus::Off;
+                    }
                 }
             }
             before.changed(c.report())
@@ -1244,9 +1458,9 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                 Outcome::Loaded(r) => gst::info!(
                     CAT,
                     obj = el,
-                    "loaded {}{} in {:.1} ms (+{:.1} ms warm-up, model reused: {})",
+                    "loaded {} with stages {} in {:.1} ms (+{:.1} ms warm-up, model reused: {})",
                     job.target.kind,
-                    if in_force { " with denoise" } else { "" },
+                    in_force_list,
                     r.load_ms,
                     r.warmup_ms.unwrap_or(0.0),
                     r.reused_model
@@ -1254,8 +1468,8 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                 Outcome::Unloaded => gst::info!(CAT, obj = el, "unloaded"),
                 _ => {}
             }
-            if let Some(reason) = &denoise_failure {
-                gst::warning!(CAT, obj = el, "the denoise stage failed to load: {reason}");
+            for (stage, reason) in &stage_failures {
+                gst::warning!(CAT, obj = el, "the {stage} stage failed to load: {reason}");
             }
             if let Some(r) = posted {
                 post_status(&el, &r);
@@ -1269,41 +1483,47 @@ fn superseded(shared: &Shared, generation: u64) -> bool {
     c.stop || c.generation != generation
 }
 
-/// Brings what is loaded in line with `job`. A failure of the denoise stage
-/// (`BackendError::Denoise`, or any failure while it is the only stage) is
-/// returned as the job's denoise failure, and the job goes on without the
-/// stage: the effect alone, or an unload for `none`.
+/// Brings what is loaded in line with `job`. A failure of one stage
+/// (`BackendError::Stage` for it), or any failure while the stages are
+/// alone (`none`: then of every one of them), is returned as the job's
+/// stage failure, and the job goes on without the stage: the rest of the
+/// chain, or an unload for `none` without another stage.
 fn run_job(shared: &Shared, job: &Job) -> JobResult {
-    let target = &job.target;
-    let done = |outcome| JobResult {
-        outcome,
-        denoise_failure: None,
-    };
-    if target.kind == EffectKind::None && !target.denoise {
-        unload(shared, job);
-        return done(Outcome::Unloaded);
-    }
-    match load(shared, job, target) {
-        Outcome::Failed(f)
-            if target.denoise && (target.kind == EffectKind::None || f.of_denoise()) =>
-        {
-            let denoise_failure = Some(f.reason);
-            let outcome = if target.kind == EffectKind::None {
-                unload(shared, job);
-                Outcome::Unloaded
-            } else {
-                let without = Target {
-                    denoise: false,
-                    ..target.clone()
-                };
-                load(shared, job, &without)
+    let mut target = job.target.clone();
+    let mut stage_failures = Vec::new();
+    loop {
+        if target.kind == EffectKind::None && !target.has_stages() {
+            unload(shared, job);
+            return JobResult {
+                outcome: Outcome::Unloaded,
+                stage_failures,
             };
-            JobResult {
-                outcome,
-                denoise_failure,
+        }
+        match load(shared, job, &target) {
+            Outcome::Failed(f)
+                if target.has_stages()
+                    && (target.kind == EffectKind::None
+                        || f.stage().is_some_and(|s| target.wants(s))) =>
+            {
+                let failed: Vec<Stage> = match f.stage() {
+                    Some(s) if target.wants(s) => vec![s],
+                    _ => Stage::ALL
+                        .into_iter()
+                        .filter(|&s| target.wants(s))
+                        .collect(),
+                };
+                for s in failed {
+                    stage_failures.push((s, f.reason.clone()));
+                    target = target.without(s);
+                }
+            }
+            outcome => {
+                return JobResult {
+                    outcome,
+                    stage_failures,
+                };
             }
         }
-        outcome => done(outcome),
     }
 }
 
@@ -1331,7 +1551,7 @@ fn unload(shared: &Shared, job: &Job) {
     drop(guard);
 }
 
-/// Loads `target` (an effect, the denoise stage, or both) for `job`.
+/// Loads `target` (an effect, its stages, or the stages alone) for `job`.
 fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
     let kind = target.kind;
     let colour = match &job.format.colour {
@@ -1371,7 +1591,7 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
     let full = current
         .as_ref()
         .is_none_or(|k| (k.width, k.height, k.colour) != (key.width, key.height, key.colour));
-    // The green screen loads cold after the denoise stage alone.
+    // The effect loads cold after the stages alone.
     let cold_effect = kind != EffectKind::None
         && current
             .as_ref()
@@ -1403,11 +1623,12 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
     }
     let req = LoadRequest {
         effect: kind,
-        denoise: target.denoise,
+        stages: target.stage_list(),
         width: key.width,
         height: key.height,
         colour,
         background,
+        relight_light: target.relight_light,
     };
     let result = e
         .instance
@@ -1420,9 +1641,14 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
             Outcome::Loaded(report)
         }
         Err(err) => {
-            // A switch that fails keeps the previous chain loaded.
+            // A switch that fails keeps the previous chain loaded, less the
+            // stage of a stage error (a new light the loaded relight stage
+            // could not take drops it: the seam's rule), so that the status
+            // never says ready for a stage that is not running.
             if full {
                 e.loaded = None;
+            } else if let (Some(stage), Some(k)) = (stage_of(&err), e.loaded.as_mut()) {
+                k.target = k.target.without(stage);
             }
             Outcome::Failed(Failure {
                 reason: err.to_string(),
@@ -1479,6 +1705,44 @@ impl ObjectImpl for ObcEffect {
                          staying shown; the input is never shown",
                     )
                     .default_value(false)
+                    .flags(rw)
+                    .build(),
+                glib::ParamSpecBoolean::builder("relight")
+                    .nick("Relight")
+                    .blurb(
+                        "Relighting of the person, after denoise, under the effect or alone \
+                         with effect none (dropped, not failed, if it cannot run). Switched \
+                         like denoise",
+                    )
+                    .default_value(false)
+                    .flags(rw)
+                    .build(),
+                glib::ParamSpecString::builder("relight-light")
+                    .nick("Relight light")
+                    .blurb("The relighting light: warm | neutral | cool")
+                    .default_value(Some(RelightLight::default().as_str()))
+                    .flags(rw)
+                    .build(),
+                glib::ParamSpecDouble::builder("relight-pan")
+                    .nick("Relight direction")
+                    .blurb(
+                        "The relighting light's direction around the person, in degrees \
+                         (applies on the next frame)",
+                    )
+                    .minimum(f64::from(RelightParams::MIN_PAN_DEG))
+                    .maximum(f64::from(RelightParams::MAX_PAN_DEG))
+                    .default_value(0.0)
+                    .flags(rw)
+                    .build(),
+                glib::ParamSpecDouble::builder("relight-gain")
+                    .nick("Relight gain")
+                    .blurb(
+                        "The relit person's brightness, 1 unchanged (applies on the next \
+                         frame)",
+                    )
+                    .minimum(f64::from(RelightParams::MIN_GAIN))
+                    .maximum(f64::from(RelightParams::MAX_GAIN))
+                    .default_value(f64::from(RelightParams::DEFAULT_GAIN))
                     .flags(rw)
                     .build(),
                 glib::ParamSpecString::builder("status")
@@ -1546,6 +1810,28 @@ impl ObjectImpl for ObcEffect {
                 s.denoise = value.get::<bool>().unwrap_or(false);
                 true
             }
+            "relight" => {
+                s.relight = value.get::<bool>().unwrap_or(false);
+                true
+            }
+            "relight-light" => match text().parse::<RelightLight>() {
+                Ok(l) => {
+                    s.relight_params.light = l;
+                    true
+                }
+                Err(e) => {
+                    gst::warning!(CAT, imp = self, "ignoring relight-light: {e}");
+                    return;
+                }
+            },
+            "relight-pan" => {
+                s.relight_params.pan_deg = value.get::<f64>().unwrap_or(0.0) as f32;
+                false
+            }
+            "relight-gain" => {
+                s.relight_params.gain = value.get::<f64>().unwrap_or(1.0) as f32;
+                false
+            }
             other => unreachable!("no property {other}"),
         };
         self.apply(s, retry);
@@ -1563,6 +1849,10 @@ impl ObjectImpl for ObcEffect {
                 .to_value(),
             "on-failure" => s.fallback.as_str().to_value(),
             "denoise" => s.denoise.to_value(),
+            "relight" => s.relight.to_value(),
+            "relight-light" => s.relight_params.light.as_str().to_value(),
+            "relight-pan" => f64::from(s.relight_params.pan_deg).to_value(),
+            "relight-gain" => f64::from(s.relight_params.gain).to_value(),
             "status" => self.status().to_string().to_value(),
             other => unreachable!("no property {other}"),
         }
@@ -1645,10 +1935,10 @@ impl BaseTransformImpl for ObcEffect {
             let mut c = lock(&self.shared.control);
             let before = c.report();
             // A restart loads again (and retries a failure of the effect; a
-            // denoise failure stays recorded until the request changes).
+            // stage failure stays recorded until the request changes).
             c.generation += 1;
             c.status = c.pending_status();
-            c.denoise_status = c.pending_denoise_status();
+            c.set_pending_stage_statuses();
             before.changed(c.report())
         };
         if let Some(r) = posted {
@@ -1697,7 +1987,7 @@ impl BaseTransformImpl for ObcEffect {
                 // Loading depends on the size and colour: a new request.
                 c.generation += 1;
                 c.status = c.pending_status();
-                c.denoise_status = c.pending_denoise_status();
+                c.set_pending_stage_statuses();
                 self.shared.wake.notify_all();
             }
             before.changed(c.report())
@@ -1786,29 +2076,31 @@ impl BaseTransformImpl for ObcEffect {
 impl ObcEffect {
     /// Decides what the frame gets and sets BaseTransform's passthrough to
     /// match, creating the CUDA objects when the frame needs them (or the
-    /// denoise stage alone needs them loaded: it passes frames through
-    /// until then).
+    /// stages alone need them loaded: they pass frames through until then).
     fn prepare_frame(&self, inbuf: &gst::BufferRef) {
-        let (kind, status, fallback, loaded, denoise, strength, generation) = {
+        let (kind, status, fallback, loaded, stages, strength, relight, generation) = {
             let c = lock(&self.shared.control);
             (
                 c.settings.kind,
                 c.status.clone(),
                 c.settings.fallback,
                 c.usable(),
-                c.denoise_effective(),
+                c.any_effective(),
                 c.settings.blur_strength,
+                c.settings.relight_params,
                 c.generation,
             )
         };
-        let mut action = decide(kind, &status, fallback, loaded, denoise);
-        let needs_gpu = action != FrameAction::Passthrough || (kind == EffectKind::None && denoise);
+        let mut action = decide(kind, &status, fallback, loaded, stages);
+        let needs_gpu = action != FrameAction::Passthrough || (kind == EffectKind::None && stages);
         let mut st = lock(&self.stream);
         if needs_gpu && let Err(reason) = self.ensure_gpu(&mut st, inbuf) {
             drop(st);
             if kind == EffectKind::None {
-                // Only the denoise stage needed CUDA: drop it, pass through.
-                self.fail_denoise(Some(generation), reason);
+                // Only the stages needed CUDA: drop them, pass through.
+                for s in Stage::ALL {
+                    self.fail_stage(s, Some(generation), reason.clone());
+                }
                 action = FrameAction::Passthrough;
             } else {
                 self.fail(generation, reason.clone());
@@ -1817,7 +2109,7 @@ impl ObcEffect {
                     &EffectStatus::Failed(reason),
                     fallback,
                     loaded,
-                    denoise,
+                    stages,
                 );
             }
             st = lock(&self.stream);
@@ -1829,6 +2121,7 @@ impl ObcEffect {
         st.generation = generation;
         st.kind = kind;
         st.strength = strength;
+        st.relight = relight;
         st.fallback = fallback;
         drop(st);
         let passthrough = action == FrameAction::Passthrough;

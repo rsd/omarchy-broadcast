@@ -5,7 +5,8 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-pub use obc_backend::EffectKind;
+pub use obc_backend::{EffectKind, RelightLight, RelightParams};
+use obc_backend::{Stage, StageList};
 
 /// What the element outputs while an effect is requested but failed
 /// (property `on-failure`, configuration `effect.on_failure`).
@@ -53,7 +54,8 @@ pub fn parse_effect(s: &str) -> Result<EffectKind, String> {
     s.parse::<EffectKind>().map_err(|e| e.to_string())
 }
 
-/// Everything that selects the effect: the element's five properties.
+/// Everything that selects the effect and its stages: the element's
+/// writable properties.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectSettings {
     /// The effect (`effect`).
@@ -71,6 +73,17 @@ pub struct EffectSettings {
     /// alone drops it and leaves the effect running ([`EffectStatus`] of the
     /// effect unchanged; the element's denoise status says why).
     pub denoise: bool,
+    /// Run the relighting stage (`relight`) on the person, after the
+    /// denoise stage, under the effect or alone with [`EffectKind::None`].
+    /// Like denoise it hides nothing: a failure of the stage alone drops it
+    /// and leaves the effect running (the element's relight status says
+    /// why).
+    pub relight: bool,
+    /// The relighting stage's light (`relight-light`, a new light is a
+    /// switch on the loaded chain), direction (`relight-pan`, degrees) and
+    /// foreground gain (`relight-gain`); the last two apply on the next
+    /// frame. Kept while the stage is off.
+    pub relight_params: RelightParams,
 }
 
 impl Default for EffectSettings {
@@ -81,6 +94,8 @@ impl Default for EffectSettings {
             background: None,
             fallback: EffectFallback::Black,
             denoise: false,
+            relight: false,
+            relight_params: RelightParams::default(),
         }
     }
 }
@@ -98,7 +113,9 @@ impl EffectSettings {
     }
 
     /// Checks the settings without touching the file system: a strength in
-    /// 0..=1, an absolute background path, and a background for replace.
+    /// 0..=1, an absolute background path, a background for replace, and
+    /// the relighting direction and gain within their ranges (checked
+    /// whether or not the stage is on).
     /// Whether the file is there and decodable is checked when the effect
     /// loads ([`crate::background::check_file`] checks it up front).
     pub fn validate(&self) -> Result<(), String> {
@@ -119,12 +136,30 @@ impl EffectSettings {
         if self.kind == EffectKind::Replace && self.background.is_none() {
             return Err("the replace effect needs a background image".into());
         }
-        Ok(())
+        self.relight_params.validate()
     }
 
     /// What the backend must have loaded for these settings: the effect,
-    /// for replace its image, and whether the denoise stage is requested.
-    /// Blur strength and the fallback change nothing that is loaded.
+    /// for replace its image, which stages are requested, and the
+    /// relighting light when that stage is. Blur strength, the fallback and
+    /// the relighting direction and gain change nothing that is loaded.
+    /// Whether `new` differs from these settings in the parameters of each
+    /// frame alone (the blur strength, the relighting direction and gain):
+    /// such a change loads nothing and is never a retry, so a slider moved
+    /// after a failure does not reload what failed on every step.
+    pub fn changes_frame_params_only(&self, new: &EffectSettings) -> bool {
+        let fixed = |s: &EffectSettings| EffectSettings {
+            blur_strength: 0.0,
+            relight_params: RelightParams {
+                pan_deg: 0.0,
+                gain: 0.0,
+                ..s.relight_params
+            },
+            ..s.clone()
+        };
+        self != new && fixed(self) == fixed(new)
+    }
+
     pub(crate) fn target(&self) -> Target {
         Target {
             kind: self.kind,
@@ -133,17 +168,70 @@ impl EffectSettings {
                 _ => None,
             },
             denoise: self.denoise,
+            relight: self.relight,
+            relight_light: if self.relight {
+                self.relight_params.light
+            } else {
+                RelightLight::default()
+            },
         }
     }
 }
 
-/// What has to be loaded for a request. `kind` none with `denoise` is the
-/// denoise stage alone; none without it loads nothing.
+/// What has to be loaded for a request. `kind` none with a stage is the
+/// stages alone; none without one loads nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Target {
     pub kind: EffectKind,
     pub background: Option<PathBuf>,
     pub denoise: bool,
+    pub relight: bool,
+    /// The relighting light; the default unless `relight`.
+    pub relight_light: RelightLight,
+}
+
+impl Target {
+    /// Whether `stage` is requested.
+    pub fn wants(&self, stage: Stage) -> bool {
+        match stage {
+            Stage::Denoise => self.denoise,
+            Stage::Relight => self.relight,
+        }
+    }
+
+    /// Whether any stage is requested.
+    pub fn has_stages(&self) -> bool {
+        Stage::ALL.iter().any(|&s| self.wants(s))
+    }
+
+    /// The same request without `stage`.
+    pub fn without(&self, stage: Stage) -> Target {
+        let mut t = self.clone();
+        match stage {
+            Stage::Denoise => t.denoise = false,
+            Stage::Relight => {
+                t.relight = false;
+                t.relight_light = RelightLight::default();
+            }
+        }
+        t
+    }
+
+    /// What `stage` asks to load: nothing when it is not requested, else its
+    /// light (relight) or nothing more (denoise). Changes of it forget the
+    /// stage's recorded failure.
+    pub fn stage_request(&self, stage: Stage) -> Option<Option<RelightLight>> {
+        self.wants(stage).then_some(match stage {
+            Stage::Denoise => None,
+            Stage::Relight => Some(self.relight_light),
+        })
+    }
+
+    /// The requested stages, in canonical order.
+    pub fn stage_list(&self) -> StageList {
+        StageList::new(Stage::ALL.into_iter().filter(|&s| self.wants(s)))
+            .expect("Stage::ALL is in canonical order, each once")
+    }
 }
 
 /// The state of the requested effect, and (as the element's separate
@@ -205,6 +293,8 @@ pub struct EffectStats {
     /// The state of the denoise stage ([`EffectStatus::Off`] unless it is
     /// requested).
     pub denoise: EffectStatus,
+    /// The state of the relighting stage, as `denoise`.
+    pub relight: EffectStatus,
     /// Frames the backend processed.
     pub frames_processed: u64,
     /// Black frames output (warm-up, or a failure with `on-failure=black`).
@@ -216,6 +306,8 @@ pub struct EffectStats {
     pub frames_passthrough: u64,
     /// Of the processed frames, those the denoise stage ran on.
     pub frames_denoised: u64,
+    /// Of the processed frames, those the relighting stage ran on.
+    pub frames_relit: u64,
     /// GPU time of the processing of one frame (CUDA events around the
     /// backend call, on the element's stream), median and 95th percentile
     /// over the last [`EffectStats::WINDOW`] processed frames.
@@ -227,6 +319,12 @@ pub struct EffectStats {
     /// denoised frames the backend timed; `None` if it times none.
     pub denoise_ms_p50: Option<f64>,
     pub denoise_ms_p95: Option<f64>,
+    /// GPU time of the relighting stage alone, as the denoise figures (the
+    /// backend's
+    /// [`StageTimings::relight_ms`](obc_backend::StageTimings::relight_ms)),
+    /// over the last [`EffectStats::WINDOW`] relit frames it timed.
+    pub relight_ms_p50: Option<f64>,
+    pub relight_ms_p95: Option<f64>,
     /// Wall time of the last successful load, warm-up included
     /// (`LoadReport::load_ms + warmup_ms`), and whether it reused a loaded
     /// model.
@@ -264,20 +362,20 @@ pub(crate) enum FrameAction {
 /// previous one while the requested one loads) processes the frame.
 ///
 /// `loaded` says a chain usable for the request is loaded: for blur and
-/// replace one with an effect (the denoise stage alone hides nothing), for
-/// `none` any. `denoise` is the effective denoise request (requested, and
-/// not failed). The denoise stage hides nothing, so it changes nothing for
-/// blur and replace; `none` with it is processed once loaded and passed
-/// through until then, and after a denoise failure (ADR-0018).
+/// replace one with an effect (the stages alone hide nothing), for `none`
+/// any. `stages` says a stage is effectively requested (requested, and not
+/// failed). The stages hide nothing, so they change nothing for blur and
+/// replace; `none` with one is processed once loaded and passed through
+/// until then, and after the stages failed (ADR-0018).
 pub(crate) fn decide(
     kind: EffectKind,
     status: &EffectStatus,
     fallback: EffectFallback,
     loaded: bool,
-    denoise: bool,
+    stages: bool,
 ) -> FrameAction {
     if kind == EffectKind::None {
-        return if denoise && loaded {
+        return if stages && loaded {
             FrameAction::Process
         } else {
             FrameAction::Passthrough
@@ -305,6 +403,48 @@ pub(crate) fn percentile(values: &[f32], p: f64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_change_of_the_frame_parameters_alone_is_told_apart() {
+        let base = EffectSettings {
+            relight: true,
+            ..EffectSettings::of(EffectKind::Blur)
+        };
+        let with = |f: fn(&mut EffectSettings)| {
+            let mut s = base.clone();
+            f(&mut s);
+            s
+        };
+        for frame_only in [
+            with(|s| s.blur_strength = 0.9),
+            with(|s| s.relight_params.pan_deg = 45.0),
+            with(|s| s.relight_params.gain = 1.5),
+            with(|s| {
+                s.relight_params.pan_deg = -30.0;
+                s.relight_params.gain = 0.75;
+                s.blur_strength = 0.1;
+            }),
+        ] {
+            assert!(
+                base.changes_frame_params_only(&frame_only),
+                "{frame_only:?}"
+            );
+        }
+        // The same settings again are a retry, not a frame change.
+        assert!(!base.changes_frame_params_only(&base.clone()));
+        for load in [
+            with(|s| s.relight = false),
+            with(|s| s.relight_params.light = RelightLight::Warm),
+            with(|s| s.denoise = true),
+            with(|s| s.kind = EffectKind::None),
+            with(|s| {
+                s.relight_params.pan_deg = 10.0;
+                s.fallback = EffectFallback::None;
+            }),
+        ] {
+            assert!(!base.changes_frame_params_only(&load), "{load:?}");
+        }
+    }
 
     #[test]
     fn fallback_parses_and_displays() {
@@ -369,6 +509,108 @@ mod tests {
         assert_eq!(alone.target().kind, EffectKind::None);
         assert!(alone.target().denoise);
         assert!(alone.validate().is_ok());
+    }
+
+    #[test]
+    fn the_target_carries_the_relight_request_and_its_light_only_when_on() {
+        let off = EffectSettings {
+            relight_params: RelightParams {
+                light: RelightLight::Warm,
+                ..RelightParams::default()
+            },
+            ..EffectSettings::of(EffectKind::Blur)
+        };
+        // The light of a stage that is off loads nothing.
+        assert_eq!(off.target(), EffectSettings::of(EffectKind::Blur).target());
+        let on = EffectSettings {
+            relight: true,
+            ..off.clone()
+        };
+        let t = on.target();
+        assert!(t.relight && t.wants(Stage::Relight) && !t.wants(Stage::Denoise));
+        assert_eq!(t.relight_light, RelightLight::Warm);
+        assert_eq!(
+            t.stage_request(Stage::Relight),
+            Some(Some(RelightLight::Warm))
+        );
+        assert_eq!(t.stage_request(Stage::Denoise), None);
+        assert_eq!(t.stage_list().as_slice(), &[Stage::Relight]);
+        // Direction and gain are per frame: no new target.
+        let turned = EffectSettings {
+            relight_params: RelightParams {
+                pan_deg: 90.0,
+                gain: 1.5,
+                ..on.relight_params
+            },
+            ..on.clone()
+        };
+        assert_eq!(turned.target(), t);
+        let cool = EffectSettings {
+            relight_params: RelightParams {
+                light: RelightLight::Cool,
+                ..on.relight_params
+            },
+            ..on.clone()
+        };
+        assert_ne!(cool.target(), t);
+        let both = EffectSettings {
+            denoise: true,
+            ..on.clone()
+        };
+        let b = both.target();
+        assert_eq!(b.stage_list().as_slice(), &[Stage::Denoise, Stage::Relight]);
+        assert!(b.has_stages());
+        assert_eq!(b.without(Stage::Denoise), t);
+        assert!(
+            !b.without(Stage::Denoise)
+                .without(Stage::Relight)
+                .has_stages()
+        );
+        assert_eq!(
+            t.without(Stage::Relight),
+            EffectSettings::of(EffectKind::Blur).target()
+        );
+        let alone = EffectSettings {
+            kind: EffectKind::None,
+            ..on
+        };
+        assert!(alone.validate().is_ok());
+        assert_eq!(alone.target().kind, EffectKind::None);
+    }
+
+    #[test]
+    fn relight_direction_and_gain_are_validated() {
+        for (pan_deg, gain) in [
+            (181.0, 1.0),
+            (-180.5, 1.0),
+            (0.0, 0.4),
+            (0.0, 2.1),
+            (f32::NAN, 1.0),
+        ] {
+            let s = EffectSettings {
+                relight_params: RelightParams {
+                    pan_deg,
+                    gain,
+                    ..RelightParams::default()
+                },
+                ..EffectSettings::default()
+            };
+            assert!(
+                s.validate().unwrap_err().contains("relight"),
+                "{pan_deg} {gain}"
+            );
+        }
+        let edge = EffectSettings {
+            relight: true,
+            relight_params: RelightParams {
+                pan_deg: -180.0,
+                gain: 2.0,
+                ..RelightParams::default()
+            },
+            ..EffectSettings::default()
+        };
+        assert!(edge.validate().is_ok());
+        assert!(!EffectSettings::default().relight);
     }
 
     #[test]

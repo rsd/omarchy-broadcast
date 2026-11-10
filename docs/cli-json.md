@@ -18,8 +18,8 @@
 | `omarchy-broadcast controls [--json]` | Prints the image controls of the active camera (brightness, contrast, saturation, sharpness, backlight compensation, those the camera has) with each value, range and default. Never starts the daemon. See [Camera image controls](#camera-image-controls). | One `controls` object. |
 | `omarchy-broadcast controls set NAME VALUE` | Sets an image control of the active camera (`SetCameraControl`), then prints the controls read back. | No. |
 | `omarchy-broadcast controls reset` | Forgets the values stored for the active camera and puts every control back to the camera's default (`ResetCameraControls`), then prints the controls. | No. |
-| `omarchy-broadcast settings [--json] [--camera ID]` | Prints every setting of the active camera (or of `--camera`), by group: image, white balance, exposure, focus and zoom, other; those the camera has, each with its value, what it takes, `(stored)` and, for one that cannot be changed now, why. Never starts the daemon. See [Camera settings](#camera-settings). | The full set of `settings_group` lines, or one `settings_clear` line. |
-| `omarchy-broadcast settings set [--camera ID] ID VALUE` | Sets one setting (`SetSetting`), then prints it as read back. | No. |
+| `omarchy-broadcast settings [--json] [--camera ID]` | Prints every setting of the active camera (or of `--camera`), by group: image, white balance, exposure, focus and zoom, other; those the camera has, each with its value, what it takes, `(stored)` and, for one that cannot be changed now, why; then, from interface revision 8, the video effects, which are the same for every camera, under `All cameras:`. Never starts the daemon. See [Camera settings](#camera-settings). | The full set of `settings_group` lines (the camera's groups, then the global ones), or one `settings_clear` line. |
+| `omarchy-broadcast settings set [--camera ID] ID VALUE` | Sets one setting (`SetSetting`), then prints it as read back. An effect setting (`effect.…`) needs no camera and ignores `--camera`. | No. |
 | `omarchy-broadcast settings reset [--camera ID] [--group GROUP \| --setting ID]` | Forgets the stored values of the camera, of a group or of one setting and puts them back to the camera's defaults (`ResetSettings`), then prints them. | No. |
 | `omarchy-broadcast preview [--json] [--fps 15\|30]` | Holds a live preview lease on the daemon and prints a line for each frame it writes, until interrupted. See [Preview](#preview). | One object per line (NDJSON). |
 | `omarchy-broadcast watch` | Follows the daemon: a summary when it connects, then a line for each change and each `Stats` signal (about once per second while `active`), until interrupted. | One object per line (NDJSON). |
@@ -104,7 +104,7 @@ Applied live.
 
 ## Camera settings
 
-`omarchy-broadcast settings` shows and changes every setting the active camera offers: the five image controls of [`controls`](#camera-image-controls) and the rest of the standard controls (white balance, exposure, focus and zoom, anything else the camera has), and, on cameras that have it, the Logitech field of view ([dbus-api.md](dbus-api.md#camera-settings), [ADR-0023](adr/0023-settings-schema.md)). The daemon stores what the user sets, for each camera, and gives it to the camera whenever it opens.
+`omarchy-broadcast settings` shows and changes every setting the active camera offers: the five image controls of [`controls`](#camera-image-controls) and the rest of the standard controls (white balance, exposure, focus and zoom, anything else the camera has), and, on cameras that have it, the Logitech field of view ([dbus-api.md](dbus-api.md#camera-settings), [ADR-0023](adr/0023-settings-schema.md)). The daemon stores what the user sets, for each camera, and gives it to the camera whenever it opens. From interface revision 8 the same command also shows and changes the video effects, which belong to no camera: the effect, the blur strength, noise removal, enhancement of a low-resolution camera and relighting ([dbus-api.md](dbus-api.md#global-settings-the-video-effects), [ADR-0024](adr/0024-stackable-stages-and-effects-in-the-settings-schema.md)).
 
 ```text
 omarchy-broadcast settings [--json] [--camera=ID]
@@ -123,14 +123,29 @@ Exposure
   Exposure time             156 ×100 µs  camera.exposure.exposure_time_absolute  3..2047                   (Set exposure to manual to change this)
   Keep 30 fps in low light  on           camera.exposure.keep_framerate          on|off
 Applied live.
+All cameras:
+Background effect
+  Effect                         Blur     effect.background.mode           none|blur|replace
+  Blur strength                  50 %     effect.background.blur_strength  0..100
+Video
+  Noise removal                  off      effect.video.denoise             on|off
+  Enhance low-resolution camera  off      effect.video.enhance             on|off             (The camera already captures at full resolution)
+Lighting
+  Relighting                     off      effect.lighting.relight          on|off
+  Light                          Neutral  effect.lighting.light            warm|neutral|cool  (Turn on relighting to change this)
+  Light direction                0 °      effect.lighting.direction        -90..90 step 5     (Turn on relighting to change this)
+  Brightness                     100 %    effect.lighting.brightness       50..200 step 5     (Turn on relighting to change this)
 ```
 
-- **Where a change applies.** The last line says it, as for `controls`: `Applied live.` while the daemon's state is `starting` or `active` and the camera is the one in use; otherwise `The camera is not in use: changes apply the next time it opens.`
-- **`--camera=ID`** names a camera by its id, as `cameras` lists it; the active camera when omitted. It goes before or after `set` and `reset`. With no camera, or a camera that exposes none of the settings the CLI can show, the output is `No camera settings.`
-- **`set ID VALUE`** reads the tree to type the value, then sends `SetSetting`. `VALUE` is `on`, `off`, `true` or `false` for a switch; a whole number for a number, negative ones included (put `--` before the id, or write the value right after it: `settings set -- camera.focus.pan_absolute -3600`); an option's value id, as the listing shows them after the id (`manual`, `60hz`), for a choice; nothing, or `true`, for an action (`settings set camera.white_balance.do_white_balance`). A value that does not fit the setting's type is a usage error (status `2`) and nothing is sent. The daemon then checks the range, the step and whether the setting can be changed now; its rejection (`Disabled`, with its reason, `InvalidArgument`, `RateLimited`, `Failed`) exits with status `1` and the daemon's message on stderr. An id that is not in the camera's tree is refused the same way (`UnknownSetting`, status `1`) before anything is sent. On success the command prints the setting as read back, so a value the driver rounded shows as it is.
-- **`reset`** puts back to the camera's defaults, and forgets the stored values of, every setting (no option), the settings of one group (`--group=exposure`) or one setting (`--setting=camera.image.sharpness`); the two options exclude each other. At once while the camera is open, else when it next opens. It prints the settings it reset, read back.
+(The columns of each part are aligned over that part; the example is shortened. A line shows `(stored)` before the reason for a value the user set.)
+
+- **Where a change applies.** The last line of the camera part says it, as for `controls`: `Applied live.` while the daemon's state is `starting` or `active` and the camera is the one in use; otherwise `The camera is not in use: changes apply the next time it opens.` It is about the camera's settings; the effects under `All cameras:` apply at once to a running stream whatever the camera, and are only stored with none.
+- **`--camera=ID`** names a camera by its id, as `cameras` lists it; the active camera when omitted. It goes before or after `set` and `reset`. With no camera, or a camera that exposes none of the settings the CLI can show, the camera part is `No camera settings.` (the effects are still printed under `All cameras:` against a revision-8 daemon).
+- **`set ID VALUE`** reads the tree to type the value, then sends `SetSetting`. `VALUE` is `on`, `off`, `true` or `false` for a switch; a whole number for a number, negative ones included (put `--` before the id, or write the value right after it: `settings set -- camera.focus.pan_absolute -3600`); an option's value id, as the listing shows them after the id (`manual`, `60hz`), for a choice; nothing, or `true`, for an action (`settings set camera.white_balance.do_white_balance`). A value that does not fit the setting's type is a usage error (status `2`) and nothing is sent. The daemon then checks the range, the step and whether the setting can be changed now; its rejection (`Disabled`, with its reason, `InvalidArgument`, `RateLimited`, `Failed`) exits with status `1` and the daemon's message on stderr. An id that is not in the camera's tree is refused the same way (`UnknownSetting`, status `1`) before anything is sent; an `effect.…` id is looked up among the effects instead, whatever `--camera` says, and an unknown one is `UnknownSetting` too. A blur strength is a whole percentage (`settings set effect.background.blur_strength 70`), a light is `warm`, `neutral` or `cool`, a negative direction needs the `--` or the value right after the id (`settings set effect.lighting.direction -30`). On success the command prints the setting as read back, so a value the driver rounded shows as it is.
+- **`reset`** puts back to the camera's defaults, and forgets the stored values of, every setting (no option), the settings of one group (`--group=exposure`) or one setting (`--setting=camera.image.sharpness`); the two options exclude each other. At once while the camera is open, else when it next opens. It prints the settings it reset, read back. A global group (`--group=background`, `video` or `lighting`) or an `effect.…` setting is put back to the configuration's `[effect]` value, at once, and needs no camera; `settings reset` without an option resets the camera and never the effects.
 - `--json` is accepted without a subcommand only; with `set` or `reset` it is a usage error (status `2`), as for `controls`.
 - Reading never starts the daemon and gives up after 5 s, like `status`. `set` and `reset` may start it through D-Bus activation and give up after 30 s.
+- Against a daemon of interface revision 7 the camera settings are printed as before and there are no effects to show or change (`settings set effect.…` is refused as an unknown setting).
 - Against a daemon of interface revision 6 or lower the command prints `omarchy-broadcast: the daemon does not support camera settings (its interface revision is N, camera settings need 7); update omarchy-broadcastd` and exits with status `1`; `settings --json` prints an `error` line with the code `unsupported-daemon` instead.
 - If `set` or `reset` was accepted but reading the settings back failed, the command says so on stderr (`the change was made, but reading the settings back failed: ...`) and exits with the status of that failure.
 - `watch` without `--json` prints nothing about the settings.
@@ -310,7 +325,7 @@ A **control object**:
 
 ### `settings_group`
 
-The settings of one camera, one group at a time. Printed by `settings --json` (the full set) and by `watch --json` (after the `snapshot`, and again whenever the structure changes). The tree is a **set** of lines, because the settings of a camera do not fit one line of 4096 bytes.
+The settings of one camera, one group at a time, followed from interface revision 8 by the global groups (the video effects). Printed by `settings --json` (the full set) and by `watch --json` (after the `snapshot`, and again whenever the structure changes). The tree is a **set** of lines, because the settings of a camera do not fit one line of 4096 bytes.
 
 | Field | JSON type | Meaning |
 |---|---|---|
@@ -318,7 +333,7 @@ The settings of one camera, one group at a time. Printed by `settings --json` (t
 | `schema` | number | The settings schema version, `1`. |
 | `rev` | number | The daemon's `SettingsRevision` when the set was read. |
 | `serial` | number | The daemon's `SettingsSchemaSerial` when the set was read. |
-| `camera` | string | Id of the camera the settings belong to: the active camera (or `--camera`). Bounded like a camera `id`. |
+| `camera` | string | Id of the camera the settings belong to: the active camera (or `--camera`). Bounded like a camera `id`. `""` when there is no camera, which a revision-8 daemon answers with the global groups alone. |
 | `index` | number | Position of this line in the set, from 0. |
 | `count` | number | The number of lines in the set (at least 1). |
 | `part`, `parts` | number | A group that does not fit one line is cut over several, repeating `group.id` and `group.label`: this line is part `part` of `parts`, from 1. `1` and `1` when the group is whole. Always present. |
@@ -330,8 +345,9 @@ A **setting object** has the keys of its type only:
 
 | Field | JSON type | Present for | Meaning |
 |---|---|---|---|
-| `id` | string | all | The setting's id, `camera.<group>.<name>`. |
+| `id` | string | all | The setting's id, `camera.<group>.<name>` or, for a global setting, `effect.<group>.<name>`. |
 | `label` | string | all | The name to show. |
+| `scope` | string | all | Where the value is kept: `"camera"` (per camera) or `"global"` (the same for every camera: the video effects). A client routes by it: a global setting is drawn apart from the camera's and written with no camera. Bounded to 16 bytes. A client that meets a scope it does not know leaves the setting out. |
 | `type` | string | all | `"bool"`, `"int"`, `"enum"` or `"action"`. |
 | `value` | boolean, number or string | `bool`, `int`, `enum` | The current value: for an `enum`, an option's `value`. For a camera that is not open, the value it will have when it opens. |
 | `default` | as `value` | `bool`, `int`, `enum` | The camera's own default. |
@@ -344,7 +360,7 @@ A **setting object** has the keys of its type only:
 | `options` | array | `enum` | Objects `{"value", "label"}`, in display order. |
 | `hint` | string | optional | A widget suggestion: `"slider"`, `"switch"`, `"segmented"`. |
 
-An `action` has no `value` or `default`. A setting whose `type` the CLI does not know is left out of the line, and a group with nothing left prints no line; a camera for which nothing is left gives a `settings_clear` line.
+An `action` has no `value` or `default`. A setting whose `type` the CLI does not know is left out of the line, and a group with nothing left prints no line; a tree for which nothing is left gives a `settings_clear` line. The groups of one scope share it. The global groups are `background` ("Background effect": `effect.background.mode`, `effect.background.blur_strength`), `video` ("Video": `effect.video.denoise`, `effect.video.enhance`) and `lighting` ("Lighting": `effect.lighting.relight`, `.light`, `.direction`, `.brightness`), after the camera's groups; their settings and reasons are in [dbus-api.md](dbus-api.md#global-settings-the-video-effects). They are present with no camera, and a client assembles them with the rest of the set.
 
 A client keeps the order, ignores keys it does not know, skips a setting whose `type` it does not know, and trusts `enabled` and `disabled_reason` without evaluating `enabled_when`.
 
@@ -364,7 +380,7 @@ At most 16 changes go into a line, and they are packed by length like the settin
 
 ### `settings_clear`
 
-`{"v":1,"type":"settings_clear","rev":R,"serial":S}`: there is nothing to show, because there is no camera, or no setting the CLI can show. A client drops its settings.
+`{"v":1,"type":"settings_clear","rev":R,"serial":S}`: there is nothing to show, because there is no camera and no global setting (a daemon below revision 8), or no setting the CLI can show. A client drops its settings. From revision 8 a missing camera is not a `settings_clear`: the set holds the global groups, with `camera` `""`.
 
 ### Client assembly rules
 
@@ -373,8 +389,9 @@ At most 16 changes go into a line, and they are packed by length like the settin
 - **Applying a delta.** A `settings_delta` applies to the committed set when its `serial` is the committed one and its `rev` is the committed `rev` (a further line of the same change) or the next. Deltas carry absolute values, so applying one twice is harmless. A delta of another `serial` is ignored: a new set follows it. A delta whose `rev` is older than the committed one is stale and ignored. A delta that skips a revision cannot occur from `watch --json` (it reads the tree again and prints a full set first); a client that sees one waits for the next set.
 - **`settings_clear`** means nothing to show: drop the set and show no settings. It is a state, like a set: a later set replaces it.
 - **Nothing below revision 7.** A daemon below interface revision 7 prints no settings lines, and `settings_schema` is `null`.
+- **Global groups.** A set from a revision-8 daemon ends with the global groups. A set with `camera` `""` holds only those, and `camera` is `""` on every line of it (a client accepts the empty string for that and no other empty or non-string value). A change of the active camera moves the `serial`, so the set is replaced as a whole, global groups included; a client that keeps the user's pending edit of a global setting across that replacement is right to, because the setting is the same.
 
-`watch --json` prints the set after the `snapshot` when the daemon has settings, then a `settings_delta` for each change. When the active camera changes the `serial` moves and a new set is printed. When a signal was missed, or the revision wrapped past its largest value, the CLI reads the tree again and prints a new set. After an outage, the new `snapshot` is followed by a new set.
+`watch --json` prints the set after the `snapshot` when the daemon has settings (against a revision-8 daemon also when it has no camera: the global groups alone), then a `settings_delta` for each change. When the active camera changes the `serial` moves and a new set is printed. When a signal was missed, or the revision wrapped past its largest value, the CLI reads the tree again and prints a new set. After an outage, the new `snapshot` is followed by a new set.
 
 ### Settings schema version
 
@@ -478,10 +495,11 @@ A client treats `"active":false`, and any `error` line, as "no frames now", and 
 - **`v` stays 1 for the preview.** `preview_consumers` is a new field in the existing `snapshot` and `state` lines, and `changed` may name it; `consumers` keeps its type, and with no preview lease held it has the value it had before. Against a daemon of interface revision 4 or lower the key is still printed, with the value `0`, as for the PipeWire fields. `preview` and `frame` are new line types printed by a new command, and `unsupported-daemon` and `preview-path-too-long` are new `error` codes; a client written for the earlier version never sees them, as it never runs `preview`.
 - **`v` stays 1 for the camera controls.** `camera_controls` is a new field in the existing `snapshot` line and `controls` is a new line type, printed by a new command and by `watch --json`; the new `unsupported-daemon` use (`controls` needs revision 6) is an existing code. `state` lines do not carry the controls, so `changed` never names them. Against a daemon of interface revision 5 or lower the `snapshot` still prints the key, with the value `null`, as for `denoise`: "no controls" would claim a camera without them. `watch --json` prints no `controls` line then. A client written for the earlier version ignores both.
 - **`v` stays 1 for the camera settings.** `settings_revision` and `settings_schema` are new fields in the existing `snapshot` line (not in `state`, so `changed` never names them); `settings_group`, `settings_delta` and `settings_clear` are new line types, printed by a new command and by `watch --json`; `unsupported-daemon` for `settings` is an existing code. Against a daemon of interface revision 6 or lower the `snapshot` still prints both keys, with the value `null`, as for `camera_controls`, and `watch --json` prints no settings line. A client written for the earlier version ignores all of it. The meaning of the setting objects has a version of its own, `schema` (see [Settings schema version](#settings-schema-version)).
+- **`v` stays 1 for the global settings.** Setting objects gain the key `scope` (`"camera"` or `"global"`), and a set gains groups after the camera's, which are also printed with no camera (`camera` `""`), where a revision-7 daemon printed a `settings_clear`. A client written for the earlier version ignores the key and the groups it does not draw. The settings schema stays 1 ([Settings schema version](#settings-schema-version)); the CLI's `snapshot` is unchanged, and `interface_revision` 8 tells a client that the groups can appear.
 - A **breaking change** raises `v`: a removed or renamed field or line type, a changed JSON type or meaning, a new state string, or a change to the rules above (line cap, outage behaviour).
 - **Not breaking**, made without raising `v`: a new field in an existing line type, a new line type, a new `error` code. Clients ignore what they do not know.
 - The schema is independent of the D-Bus `InterfaceRevision`; a new D-Bus property may appear as a new field.
-- **Capability rules for clients.** A client that shows the split of the consumers does so only while `pipewire_output` is not `"off"`. A client offers the effect controls only if both hold: the CLI is new enough to print `blur_strength` (the field is present as a number in `snapshot`; an older CLI has no `effect` command, and `omarchy-broadcast effect` fails with status `2`), and the daemon's `interface_revision` is 2 or more. Offer the noise-removal switch only if `denoise` is a boolean and `interface_revision` is 4 or more. Offer the preview only if the CLI has the `preview` command (an older CLI exits with status `2`) and the daemon's `interface_revision` is 5 or more; `preview --json` reports the second condition itself, with `unsupported-daemon`. Check the CLI first, then the daemon; the two conditions have different remedies (update `omarchy-broadcast`, update `omarchy-broadcastd`). Offer the camera controls only if `camera_controls` is an object and `interface_revision` is 6 or more; with `camera_controls` an empty list, offer none. Edits apply live while `state` is `starting` or `active`, and otherwise are stored for the next time the camera opens, so a client may tell its user which. To change a control run `omarchy-broadcast controls set NAME VALUE` (an older CLI exits with status `2`) and read the result from the `controls` line of `watch`. Offer the generic camera settings only if `interface_revision` is 7 or more and `settings_schema` is a number the client knows (1 in this version); with `settings_schema` `null` the daemon is too old (update `omarchy-broadcastd`), with the key missing the CLI is too old (update `omarchy-broadcast`), and with a number above the client's own the client is too old (update it); in all three, show the camera and no settings, with that hint. To change a setting run `omarchy-broadcast settings set --camera=ID -- SETTING VALUE` and `omarchy-broadcast settings reset --camera=ID` (an older CLI exits with status `2`), naming the camera the settings were drawn for so that a click after a change of camera fails instead of writing to another camera, and read the result from the `settings_delta` lines of `watch`. When the field is absent or the revision is lower, show the effect, if at all, as read-only text.
+- **Capability rules for clients.** A client that shows the split of the consumers does so only while `pipewire_output` is not `"off"`. A client offers the effect controls only if both hold: the CLI is new enough to print `blur_strength` (the field is present as a number in `snapshot`; an older CLI has no `effect` command, and `omarchy-broadcast effect` fails with status `2`), and the daemon's `interface_revision` is 2 or more. Offer the noise-removal switch only if `denoise` is a boolean and `interface_revision` is 4 or more. Offer the preview only if the CLI has the `preview` command (an older CLI exits with status `2`) and the daemon's `interface_revision` is 5 or more; `preview --json` reports the second condition itself, with `unsupported-daemon`. Check the CLI first, then the daemon; the two conditions have different remedies (update `omarchy-broadcast`, update `omarchy-broadcastd`). Offer the camera controls only if `camera_controls` is an object and `interface_revision` is 6 or more; with `camera_controls` an empty list, offer none. Edits apply live while `state` is `starting` or `active`, and otherwise are stored for the next time the camera opens, so a client may tell its user which. To change a control run `omarchy-broadcast controls set NAME VALUE` (an older CLI exits with status `2`) and read the result from the `controls` line of `watch`. Offer the video effects as settings only if `interface_revision` is 8 or more and the set holds groups of `scope` `"global"`; they are there for every camera and with none, they are written with `omarchy-broadcast settings set -- ID VALUE` and no `--camera`, and the camera's `settings reset` never touches them. Offer the generic camera settings only if `interface_revision` is 7 or more and `settings_schema` is a number the client knows (1 in this version); with `settings_schema` `null` the daemon is too old (update `omarchy-broadcastd`), with the key missing the CLI is too old (update `omarchy-broadcast`), and with a number above the client's own the client is too old (update it); in all three, show the camera and no settings, with that hint. To change a setting run `omarchy-broadcast settings set --camera=ID -- SETTING VALUE` and `omarchy-broadcast settings reset --camera=ID` (an older CLI exits with status `2`), naming the camera the settings were drawn for so that a click after a change of camera fails instead of writing to another camera, and read the result from the `settings_delta` lines of `watch`. When the field is absent or the revision is lower, show the effect, if at all, as read-only text.
 
 ## Examples
 
@@ -549,15 +567,32 @@ omarchy-broadcast settings set camera.exposure.auto_exposure manual
 ```
 
 ```json
-{"v":1,"type":"settings_group","schema":1,"rev":4,"serial":2,"camera":"usb-046d_0944-video-index0","index":0,"count":2,"part":1,"parts":1,"group":{"id":"image","label":"Image","settings":[{"id":"camera.image.sharpness","label":"Sharpness","type":"int","value":255,"default":128,"stored":false,"enabled":true,"disabled_reason":"","enabled_when":[],"min":0,"max":255,"step":1,"hint":"slider"}]}}
-{"v":1,"type":"settings_group","schema":1,"rev":4,"serial":2,"camera":"usb-046d_0944-video-index0","index":1,"count":2,"part":1,"parts":1,"group":{"id":"exposure","label":"Exposure","settings":[{"id":"camera.exposure.auto_exposure","label":"Exposure mode","type":"enum","value":"aperture_priority","default":"aperture_priority","stored":false,"enabled":true,"disabled_reason":"","enabled_when":[],"options":[{"value":"manual","label":"Manual"},{"value":"aperture_priority","label":"Auto"}],"hint":"segmented"},{"id":"camera.exposure.exposure_time_absolute","label":"Exposure time","type":"int","value":156,"default":156,"stored":false,"enabled":false,"disabled_reason":"Set exposure to manual to change this","enabled_when":[{"id":"camera.exposure.auto_exposure","op":"in","value":["manual","shutter_priority"]}],"min":3,"max":2047,"step":1,"unit":"×100 µs","hint":"slider"}]}}
+{"v":1,"type":"settings_group","schema":1,"rev":4,"serial":2,"camera":"usb-046d_0944-video-index0","index":0,"count":2,"part":1,"parts":1,"group":{"id":"image","label":"Image","settings":[{"id":"camera.image.sharpness","label":"Sharpness","scope":"camera","type":"int","value":255,"default":128,"stored":false,"enabled":true,"disabled_reason":"","enabled_when":[],"min":0,"max":255,"step":1,"hint":"slider"}]}}
+{"v":1,"type":"settings_group","schema":1,"rev":4,"serial":2,"camera":"usb-046d_0944-video-index0","index":1,"count":2,"part":1,"parts":1,"group":{"id":"exposure","label":"Exposure","settings":[{"id":"camera.exposure.auto_exposure","label":"Exposure mode","scope":"camera","type":"enum","value":"aperture_priority","default":"aperture_priority","stored":false,"enabled":true,"disabled_reason":"","enabled_when":[],"options":[{"value":"manual","label":"Manual"},{"value":"aperture_priority","label":"Auto"}],"hint":"segmented"},{"id":"camera.exposure.exposure_time_absolute","label":"Exposure time","scope":"camera","type":"int","value":156,"default":156,"stored":false,"enabled":false,"disabled_reason":"Set exposure to manual to change this","enabled_when":[{"id":"camera.exposure.auto_exposure","op":"in","value":["manual","shutter_priority"]}],"min":3,"max":2047,"step":1,"unit":"×100 µs","hint":"slider"}]}}
 ```
 
 ```json
 {"v":1,"type":"settings_delta","schema":1,"rev":5,"serial":2,"camera":"usb-046d_0944-video-index0","changes":[{"id":"camera.exposure.auto_exposure","value":"manual","stored":true,"enabled":true,"disabled_reason":""},{"id":"camera.exposure.exposure_time_absolute","value":1250,"stored":false,"enabled":true,"disabled_reason":""}]}
 ```
 
-With no camera the output is one line:
+The video effects are in the same set, after the camera's groups, from a revision-8 daemon (one group shown, shortened):
+
+```json
+{"v":1,"type":"settings_group","schema":1,"rev":6,"serial":2,"camera":"usb-046d_0944-video-index0","index":2,"count":4,"part":1,"parts":1,"group":{"id":"video","label":"Video","settings":[{"id":"effect.video.denoise","label":"Noise removal","scope":"global","type":"bool","value":false,"default":false,"stored":false,"enabled":false,"disabled_reason":"Not installed","enabled_when":[],"hint":"switch"}]}}
+```
+
+```sh
+omarchy-broadcast settings set effect.background.mode blur
+omarchy-broadcast settings set effect.lighting.direction -30
+```
+
+With no camera, a revision-8 daemon prints the global groups alone, with `"camera":""`:
+
+```json
+{"v":1,"type":"settings_group","schema":1,"rev":6,"serial":2,"camera":"","index":0,"count":3,"part":1,"parts":1,"group":{"id":"background","label":"Background effect","settings":[{"id":"effect.background.mode","label":"Effect","scope":"global","type":"enum","value":"none","default":"none","stored":false,"enabled":true,"disabled_reason":"","enabled_when":[],"options":[{"value":"none","label":"Off"},{"value":"blur","label":"Blur"},{"value":"replace","label":"Replace"}],"hint":"segmented"}]}}
+```
+
+With no camera and no global setting (a daemon below revision 8) the output is one line:
 
 ```json
 {"v":1,"type":"settings_clear","rev":1,"serial":1}
@@ -596,4 +631,4 @@ omarchy-broadcast preview --json
 - Show `error` whenever it is non-empty, whatever the state.
 - To stop, send `SIGTERM` or close the pipe.
 - To show the live preview, run `omarchy-broadcast preview --json` as a second long-lived child process next to `watch`, and only while the user wants the preview: it keeps the camera running. Open the `path` of each `frame` line (or reload the image from it) and keep the lease for as long as the preview is shown; stop the process to end it. The frame file is replaced by a rename, so a reader never sees a partial image.
-- Control the daemon by running `omarchy-broadcast on`, `off`, `camera next`, `camera <id>`, `effect <effect>` `denoise on|off`, `controls set NAME VALUE`, `controls reset`, `settings set --camera=ID -- ID VALUE` or `settings reset --camera=ID`, and check the exit status; the resulting change arrives on the `watch` stream.
+- Control the daemon by running `omarchy-broadcast on`, `off`, `camera next`, `camera <id>`, `effect <effect>` `denoise on|off`, `controls set NAME VALUE`, `controls reset`, `settings set --camera=ID -- ID VALUE` (no `--camera` for an `effect.…` id) or `settings reset --camera=ID`, and check the exit status; the resulting change arrives on the `watch` stream.

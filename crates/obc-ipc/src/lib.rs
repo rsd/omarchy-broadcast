@@ -74,8 +74,12 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// camera settings channel ([`settings`]): `SettingsRevision`,
 /// `SettingsSchemaSerial`, `GetSettings`, `SetSetting`, `ResetSettings`,
 /// the `SettingsChanged` signal and the `UnknownSetting`, `Disabled` and
-/// `RateLimited` errors.
-pub const INTERFACE_REVISION: u32 = 7;
+/// `RateLimited` errors. Revision 8 added global settings to the tree
+/// (scope [`settings::SCOPE_GLOBAL`]): the video effects as
+/// `effect.background.mode`, `effect.background.blur_strength`,
+/// `effect.video.denoise` and `effect.video.enhance`, after the camera's
+/// groups and also with no camera; the members are unchanged.
+pub const INTERFACE_REVISION: u32 = 8;
 /// The first [`INTERFACE_REVISION`] with `LoopbackConsumers`,
 /// `PipeWireConsumers` and `PipeWireOutput`.
 pub const PIPEWIRE_REVISION: u32 = 3;
@@ -95,6 +99,9 @@ pub const CONTROLS_REVISION: u32 = 6;
 /// ([`settings`]): `SettingsRevision`, `SettingsSchemaSerial`,
 /// `GetSettings`, `SetSetting`, `ResetSettings` and `SettingsChanged`.
 pub const SETTINGS_REVISION: u32 = 7;
+/// The first [`INTERFACE_REVISION`] with global settings in the tree
+/// ([`settings::SCOPE_GLOBAL`]): the video effects.
+pub const GLOBAL_SETTINGS_REVISION: u32 = 8;
 /// The settings schema version this crate describes: the meaning of the
 /// setting dictionaries ([`settings`]), separate from
 /// [`INTERFACE_REVISION`]. Additions (a key, a setting type, a hint) keep
@@ -998,8 +1005,11 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, SETTINGS_REVISION);
-        assert_eq!((SETTINGS_REVISION, SETTINGS_SCHEMA), (7, 1));
+        assert_eq!(INTERFACE_REVISION, GLOBAL_SETTINGS_REVISION);
+        assert_eq!(
+            (SETTINGS_REVISION, GLOBAL_SETTINGS_REVISION, SETTINGS_SCHEMA),
+            (7, 8, 1)
+        );
 
         for (e, name) in [
             (IpcError::UnknownSetting("u".into()), "UnknownSetting"),

@@ -79,3 +79,6 @@ The stage lives in the same backend instance as the effect. Its model handle and
 - Evidence that the strength matters to users: expose it as a setting.
 - A user report of the reset being skipped often enough to be visible: carry the new-source mark outside the buffer queue.
 - A denoising model for frames above 1080p.
+
+## Amendment (2026-11-10)
+[ADR-0024](0024-stackable-stages-and-effects-in-the-settings-schema.md) carries out the first item of "What would change this decision": a second stage (relighting, after the mask) arrived, and the boolean became an ordered list of stackable stages in the backend seam (`LoadRequest.stages`; `BackendError::Denoise` is now `BackendError::Stage`). Noise removal is still the pre-mask stage, still fails open, and its text, its temporal reset and its CUDA parking are as above. The `Error` precedence is now, first applicable: writer missing, fault, effect failure, noise-removal failure, relighting failure, enhance failure, damaged state file. Noise removal is also published as the global setting `effect.video.denoise` of D-Bus revision 8 (greyed "Not installed" while its feature is missing; the `Denoise` property keeps the request), which `SetSetting` writes as `SetDenoise` does.

@@ -1,6 +1,6 @@
 # Using the NVIDIA Maxine Video Effects SDK with omarchy-broadcast
 
-The video effects `blur` and `replace`, and video noise removal, run on the NVIDIA Maxine Video Effects SDK. omarchy-broadcast does not contain, build or download the SDK. The SDK is a personal download from NVIDIA, and the sibling project omarchy-nvidia-sdks (the omarchy-nvidia-sdks repository) packages it for Arch as `maxine-vfx-sdk-local`. This page covers the omarchy-broadcast side: which parts of the SDK are needed, how to enable the daemon's drop-in, what the daemon reads from its environment and how to fix the failures that are specific to omarchy-broadcast.
+The video effects `blur` and `replace`, video noise removal, relighting and the enhancement of a low-resolution camera run on the NVIDIA Maxine Video Effects SDK. omarchy-broadcast does not contain, build or download the SDK. The SDK is a personal download from NVIDIA, and the sibling project omarchy-nvidia-sdks (the omarchy-nvidia-sdks repository) packages it for Arch as `maxine-vfx-sdk-local`. This page covers the omarchy-broadcast side: which parts of the SDK are needed, how to enable the daemon's drop-in, what the daemon reads from its environment and how to fix the failures that are specific to omarchy-broadcast.
 
 Without the SDK the daemon works as usual: the `none` effect and the passthrough need nothing from it, and an effect or noise removal that cannot load reports the reason in the daemon's `Error` property.
 
@@ -22,18 +22,20 @@ Which effect needs which feature:
 | `blur` and `replace` (the green-screen mask) | `nvvfxgreenscreen` |
 | `blur` (the blur itself) | `nvvfxbackgroundblur` |
 | Video noise removal (`denoise`) | `nvvfxdenoising` |
+| Relighting (`relight`) | `nvvfxrelighting`, and `nvvfxgreenscreen` for the person's mask |
+| Enhancement of a low-resolution camera (`enhance`) | `nvvfxvideosuperres` |
 
-`replace` needs `nvvfxgreenscreen` only for its mask; the replacement is a composite done by the project. Noise removal is optional and the effects work without it.
+`replace` needs `nvvfxgreenscreen` only for its mask; the replacement is a composite done by the project. Noise removal, relighting and enhancement are optional and the effects work without them. The names are those of the SDK's feature directories under `features/`, which is where the daemon looks. Relighting also needs its models for your GPU architecture in `lib/models` (`relight_0thframe_*` and `relight_nthframe_*`), and noise removal its `Denoise-*` models; video super resolution has no model files. The daemon checks what is installed from these files, without waking the GPU: a stage whose feature is missing is shown as "Not installed" by the clients and is never requested.
 
 ## 2. Build and install maxine-vfx-sdk-local
 
 The omarchy-nvidia-sdks repository owns everything about the SDK itself: the NVIDIA account and NGC access, the download, the supported GPU architectures, and the Arch package `maxine-vfx-sdk-local`. Follow its README and its `docs/download.md` for the download and `docs/gpu-support.md` for the architectures. The package installs the SDK under `/opt/nvidia/maxine/videofx` and an environment file, `/usr/share/maxine-vfx/maxine-vfx.env`.
 
-Build the package with the three features omarchy-broadcast needs. From a checkout of the omarchy-nvidia-sdks repository, with the download in `~/Downloads/maxine` and `sm_120` standing for your architecture:
+Build the package with the features omarchy-broadcast uses (the last two are only for relighting and enhancement; leave them out if you do not want those). From a checkout of the omarchy-nvidia-sdks repository, with the download in `~/Downloads/maxine` and `sm_120` standing for your architecture:
 
 ```bash
 maxine-vfx/configure.sh --src ~/Downloads/maxine --archs sm_120 \
-    --features nvvfxgreenscreen,nvvfxbackgroundblur,nvvfxdenoising --write
+    --features nvvfxgreenscreen,nvvfxbackgroundblur,nvvfxdenoising,nvvfxrelighting,nvvfxvideosuperres --write
 (cd maxine-vfx && makepkg -f)
 ```
 
@@ -146,8 +148,8 @@ The shim library and the replacement `os-release` come from the omarchy-nvidia-s
 
 With the SDK installed and the daemon running with the drop-in (section 3), the effects are selected in two ways:
 
-- In `config.toml`, the `[effect]` section (`mode`, `blur_strength`, `background_image`, `denoise`, `on_failure`, `maxine_root`); see [../config.example.toml](../config.example.toml).
-- At run time, with `omarchy-broadcast effect none|blur|replace [--strength X] [--image PATH]`, which the daemon remembers across restarts; see [../cli-json.md](../cli-json.md) and [../dbus-api.md](../dbus-api.md).
+- In `config.toml`, the `[effect]` section (`mode`, `blur_strength`, `background_image`, `denoise`, `enhance`, `relight`, `relight_light`, `relight_direction`, `relight_brightness`, `on_failure`, `maxine_root`); see [../config.example.toml](../config.example.toml).
+- At run time, with `omarchy-broadcast effect none|blur|replace [--strength X] [--image PATH]`, which the daemon remembers across restarts, and, for every effect and stage, `omarchy-broadcast settings` (`effect.*`, for example `settings set effect.lighting.relight on`); see [../cli-json.md](../cli-json.md) and [../dbus-api.md](../dbus-api.md).
 
 Video noise removal is a separate switch that combines with any effect: `[effect] denoise = true` in `config.toml`, or `omarchy-broadcast denoise on|off` at run time. It removes the grain a webcam produces, which is mostly visible in dim rooms, and it runs before the blur or replacement, or alone with the effect `none`. It needs the `nvvfxdenoising` feature and its models in the package (section 2). Things to know:
 
@@ -156,6 +158,12 @@ Video noise removal is a separate switch that combines with any effect: `[effect
 - **Strength.** The SDK's strength is binary: 0 favours texture, 1 favours noise removal. The daemon uses 1 and has no setting for it. For comparisons during development, `OBC_MAXINE_DENOISE_STRENGTH=0` or `=1` in the environment of the process overrides it. It is a development knob only and is not a supported configuration.
 - **Cost.** It adds one GPU pass per frame and its model's GPU memory; with it off, nothing is added, no pass, copy or allocation. The models load only while it is on. Measure on your machine with `obc-bench --denoise` ([../testing.md](../testing.md)).
 - The design is in [ADR-0018](../adr/0018-video-noise-removal.md).
+
+Relighting and enhancement are stages that stack the same way ([ADR-0024](../adr/0024-stackable-stages-and-effects-in-the-settings-schema.md)), and fail open too: if one cannot run, the video continues without it and `Error` says why (`relighting unavailable: <reason>; the video continues without it`, `enhance unavailable: ...`).
+
+- **Relighting** (`[effect] relight = true`, or `omarchy-broadcast settings set effect.lighting.relight on`) lights the person with a warm, neutral or cool key light (`relight_light`), from a direction of -90 to 90 degrees (`relight_direction`) and at a brightness of 50 to 200 percent (`relight_brightness`); the direction and the brightness change while it runs with no reload. It runs after the green-screen mask, so it needs `nvvfxgreenscreen` as well, and it lights only the person: the camera image (`none`), the blurred image or the replacement behind them is not relit. The lighting environments are made by the daemon; the SDK ships none. When the camera is switched, the stage is built again from scratch, so the first frames of the new camera run without it.
+- **Enhancement** (`[effect] enhance = true`, or `settings set effect.video.enhance on`) upscales a camera that captures well below the output size, before the picture is fitted to the output, with video super resolution. It applies only where it helps: the part of the camera frame the output shows must have at most half the pixels of the area it fills (a 960x540 or 640x360 mode into a 1080p output does; a 1080p camera does not), and the camera's frames must be NV12 or I420. Otherwise the setting is greyed with the reason ("The camera already captures at full resolution", "The camera's format cannot be enhanced"). Turning it on or off while the camera is open reopens the camera, like a camera switch: the virtual camera holds the last frame and keeps its format.
+- **Cost.** Each stage adds a GPU pass per frame and its models' GPU memory while it is on, and nothing while it is off. Measure on your machine with `obc-bench --effect blur --denoise --relight` ([../testing.md](../testing.md)); the figures are not published.
 
 The background image for `replace` must be a PNG or JPEG file. Until an effect is ready, the virtual camera shows black rather than the unprocessed camera image; if the SDK cannot be loaded, the daemon enters the `error` state (default) instead of showing the unprocessed image. The design is in [ADR-0012](../adr/0012-video-effects-and-maxine-backend.md). Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence; reproduce locally with `obc-bench` (see [../testing.md](../testing.md)).
 
@@ -171,7 +179,9 @@ Problems with the SDK itself (download, package, architecture) are in omarchy-nv
 | The unit fails to start after the drop-in was installed, and `journalctl --user -u omarchy-broadcastd` shows `Failed to load environment files: No such file or directory` (systemd does not name the file) | `EnvironmentFile=` has no `-`, so a missing file is an error. `maxine-vfx-sdk-local` is not installed | Check that `/usr/share/maxine-vfx/maxine-vfx.env` exists, which it does when the package is installed. Install the package (section 2), or remove the drop-in (section 8) |
 | The drop-in has no effect: the daemon's environment lacks `LD_PRELOAD` | The file is not at `~/.config/systemd/user/omarchy-broadcastd.service.d/maxine.conf` (the directory name must match the unit), or `daemon-reload` was skipped | Check the path, run `systemctl --user daemon-reload`, restart, and check with `systemctl --user cat omarchy-broadcastd` |
 | An effect fails with a message that the SDK is already loaded from another place and asks for a restart | `[effect] maxine_root` (or `MAXINE_VFX_ROOT`) changed after the SDK was first loaded in the running daemon | `systemctl --user restart omarchy-broadcastd` (section 4) |
-| An effect reports that a feature library is not found (`-2`) or the package lacks a feature | The package was built without that feature | Rebuild `maxine-vfx-sdk-local` with all three features of section 1 (section 2), reinstall it and restart the daemon. The drop-in needs no edit |
+| An effect reports that a feature library is not found (`-2`) or the package lacks a feature | The package was built without that feature | Rebuild `maxine-vfx-sdk-local` with the features of section 1 that you use (section 2), reinstall it and restart the daemon. The drop-in needs no edit |
+| A setting such as `effect.lighting.relight` or `effect.video.denoise` is greyed "Not installed" | The package has no library, or no models for this GPU's architecture, for that feature (relighting also needs `nvvfxgreenscreen`) | `ls /opt/nvidia/maxine/videofx/features` and `ls /opt/nvidia/maxine/videofx/lib/models`; rebuild the package with the feature and your architecture (section 2). The daemon looks again at its next start, reload and session |
+| The daemon's `Error` says `relighting unavailable: ...` or `enhance unavailable: ...`, and the video is shown without it | The feature failed to load or run (the reason says which) | The reason names the SDK's status; check section 3 (the shim applies to every feature's library) and the models. The video is not affected otherwise |
 | The daemon's `Error` says `noise removal unavailable: ... -2` (NVCV status), and the camera image is shown without noise removal | The package does not contain the `nvvfxdenoising` feature, or the daemon found no SDK root (section 4) and so looked for it on the library search path only | Check that `MAXINE_VFX_FEATURES` in `/usr/share/maxine-vfx/maxine-vfx.env` lists `nvvfxdenoising`; rebuild the package with it if not (section 2); check the drop-in |
 | The same, with `-1209` or `-13` | The shim is not applied to this process (the feature's library needs it too), or the `Denoise-*` models for your architecture are not in the package | Section 3; `ls /opt/nvidia/maxine/videofx/lib/models` must show `Denoise-agg-<SM>.engine.trtpkg` and `Denoise-con-<SM>.engine.trtpkg`; rebuild the package for your architecture otherwise |
 | The same, with a message that the frame size is out of range | The output contract is smaller than 80x80 or larger than 1920x1080 | Use an output mode within the range (`[output]` in `config.toml`); noise removal does not run outside it |

@@ -6,6 +6,7 @@ use gst::prelude::*;
 use gst_obc::{
     EffectFallback, EffectKind, EffectSettings, EffectStatus, ObcEffect, STATUS_MESSAGE,
 };
+use obc_backend::{RelightLight, RelightParams};
 
 fn element() -> (gst::Element, ObcEffect) {
     gst_obc::register().expect("register obceffect");
@@ -123,12 +124,87 @@ fn apply_validates_and_sets_everything_at_once() {
         background: Some("/srv/bg.png".into()),
         fallback: EffectFallback::None,
         denoise: true,
+        relight: true,
+        relight_params: RelightParams {
+            light: RelightLight::Cool,
+            pan_deg: -45.0,
+            gain: 1.25,
+        },
     };
     fx.apply(&s).unwrap();
     assert_eq!(fx.settings(), s);
     assert_eq!(fx.status(), EffectStatus::Loading);
     assert_eq!(fx.denoise_status(), EffectStatus::Loading);
     assert_eq!(fx.stats().denoise, EffectStatus::Loading);
+    assert_eq!(fx.relight_status(), EffectStatus::Loading);
+    assert_eq!(fx.stats().relight, EffectStatus::Loading);
+    let bad = EffectSettings {
+        relight_params: RelightParams {
+            gain: 3.0,
+            ..RelightParams::default()
+        },
+        ..s.clone()
+    };
+    assert!(fx.apply(&bad).unwrap_err().contains("relight gain"));
+    assert_eq!(fx.settings(), s, "nothing applied");
+}
+
+#[test]
+fn relight_has_properties_and_a_status_of_its_own() {
+    let (e, fx) = element();
+    assert!(!e.property::<bool>("relight"));
+    assert_eq!(e.property::<String>("relight-light"), "neutral");
+    assert_eq!(e.property::<f64>("relight-pan"), 0.0);
+    assert_eq!(e.property::<f64>("relight-gain"), 1.0);
+    assert_eq!(fx.relight_status(), EffectStatus::Off);
+    let st = fx.stats();
+    assert_eq!(st.relight, EffectStatus::Off);
+    assert_eq!(st.frames_relit, 0);
+    assert_eq!((st.relight_ms_p50, st.relight_ms_p95), (None, None));
+    for (name, min, max) in [("relight-pan", -180.0, 180.0), ("relight-gain", 0.5, 2.0)] {
+        let pspec = e.find_property(name).unwrap();
+        let p = pspec.downcast_ref::<glib::ParamSpecDouble>().unwrap();
+        assert_eq!((p.minimum(), p.maximum()), (min, max), "{name}");
+    }
+    for name in ["relight", "relight-light", "relight-pan", "relight-gain"] {
+        let pspec = e.find_property(name).unwrap();
+        assert!(
+            pspec.flags().contains(gst::PARAM_FLAG_MUTABLE_PLAYING),
+            "{name} is changeable while playing"
+        );
+    }
+    // none with relight: the effect stays off; the stage loads.
+    e.set_property("relight", true);
+    assert!(fx.settings().relight);
+    assert_eq!(fx.status(), EffectStatus::Off);
+    assert_eq!(fx.relight_status(), EffectStatus::Loading);
+    assert_eq!(fx.denoise_status(), EffectStatus::Off);
+    e.set_property("relight-light", "WARM");
+    assert_eq!(e.property::<String>("relight-light"), "warm");
+    e.set_property("relight-light", "pink");
+    assert_eq!(
+        e.property::<String>("relight-light"),
+        "warm",
+        "an unknown light is ignored"
+    );
+    e.set_property("relight-pan", 90.0f64);
+    e.set_property("relight-gain", 1.5f64);
+    assert_eq!(
+        fx.settings().relight_params,
+        RelightParams {
+            light: RelightLight::Warm,
+            pan_deg: 90.0,
+            gain: 1.5,
+        }
+    );
+    assert_eq!(e.property::<f64>("relight-pan"), 90.0);
+    e.set_property("relight", false);
+    assert_eq!(fx.relight_status(), EffectStatus::Off);
+    assert_eq!(
+        fx.settings().relight_params.light,
+        RelightLight::Warm,
+        "kept while the stage is off"
+    );
 }
 
 #[test]
@@ -197,25 +273,42 @@ fn status_changes_are_posted_on_the_bus() {
     // A change of the denoise status alone is posted too.
     e.set_property("denoise", true);
     e.set_property("denoise", false);
+    // So is one of the relight status; direction and gain post nothing, a
+    // light that is off neither.
+    e.set_property("relight-light", "cool");
+    e.set_property("relight", true);
+    e.set_property("relight-pan", 30.0f64);
+    e.set_property("relight-gain", 0.75f64);
+    e.set_property("relight", false);
     let mut seen = Vec::new();
     while let Some(m) = bus.pop_filtered(&[gst::MessageType::Element]) {
         let s = m.structure().unwrap();
         if s.name() == STATUS_MESSAGE {
             let field = |f: &str| s.get::<String>(f).unwrap();
             seen.push(
-                ["effect", "status", "reason", "denoise", "denoise-reason"]
-                    .map(field)
-                    .join(" "),
+                [
+                    "effect",
+                    "status",
+                    "reason",
+                    "denoise",
+                    "denoise-reason",
+                    "relight",
+                    "relight-reason",
+                ]
+                .map(field)
+                .join(" "),
             );
         }
     }
     assert_eq!(
         seen,
         [
-            "blur loading  off ",
-            "none off  off ",
-            "none off  loading ",
-            "none off  off ",
+            "blur loading  off  off ",
+            "none off  off  off ",
+            "none off  loading  off ",
+            "none off  off  off ",
+            "none off  off  loading ",
+            "none off  off  off ",
         ]
     );
 }

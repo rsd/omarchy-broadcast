@@ -23,8 +23,12 @@
 //! options and [`MAX_CONDITIONS`] conditions, and a setting of a type this
 //! client does not know is left out. A change is a `settings_delta` line
 //! ([`settings_delta_lines`], at most [`MAX_CHANGES_PER_LINE`] changes,
-//! packed the same way), and nothing to show (no camera, or no setting this
-//! CLI can show) a `settings_clear` line.
+//! packed the same way), and nothing to show (no camera and no global
+//! setting, or no setting this CLI can show) a `settings_clear` line. The
+//! global settings of a revision-8 daemon (the video effects) are groups
+//! like the others, after the camera's, and are shown with no camera too;
+//! every setting object carries its `scope` (`camera` or `global`, clipped
+//! to [`MAX_SCOPE_BYTES`]), which a client routes by.
 
 use std::borrow::Cow;
 
@@ -106,6 +110,9 @@ pub const MAX_CONDITION_VALUES: usize = 8;
 pub const MAX_OP_BYTES: usize = 8;
 /// Bound of a setting's `hint`.
 pub const MAX_HINT_BYTES: usize = 16;
+/// Bound of a setting's `scope` (`camera` or `global`, or one a newer
+/// daemon adds).
+pub const MAX_SCOPE_BYTES: usize = 16;
 /// Appended to a clipped string.
 pub const ELLIPSIS: &str = "\u{2026}";
 
@@ -602,6 +609,9 @@ struct OptionJson<'a> {
 struct SettingJson<'a> {
     id: Cow<'a, str>,
     label: Cow<'a, str>,
+    /// Where it is kept: `camera` (per camera) or `global` (the same for
+    /// every camera, revision 8), which a client routes by.
+    scope: Cow<'a, str>,
     #[serde(rename = "type")]
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -632,6 +642,7 @@ impl<'a> SettingJson<'a> {
         let mut j = SettingJson {
             id: clip(&s.id, MAX_SETTING_ID_BYTES),
             label: clip(&s.label, MAX_LABEL_BYTES),
+            scope: clip(&s.scope, MAX_SCOPE_BYTES),
             kind: "",
             value: None,
             default: None,
@@ -809,8 +820,10 @@ fn encoded_settings(g: &SettingsGroup) -> Vec<(SettingJson<'_>, usize)> {
 /// `{"v":1,"type":"settings_group","schema":1,"rev":R,"serial":S,"camera":"<id>",
 /// "index":I,"count":N,"part":P,"parts":Q,"group":{"id":...,"label":...,"settings":[...]}}`
 ///
-/// A tree with nothing to show (no camera, or no setting this CLI can show)
-/// is one [`settings_clear_line`] instead.
+/// The camera's groups come first, then the global ones (revision 8: the
+/// video effects), which are there with no camera too (`camera` is then
+/// `""`). A tree with nothing to show (no camera and no global setting, or
+/// no setting this CLI can show) is one [`settings_clear_line`] instead.
 pub fn settings_lines(tree: &SettingsTree) -> Vec<String> {
     let camera = clip(&tree.camera, MAX_ID_BYTES);
     let line = |group: &SettingsGroup,
@@ -838,13 +851,16 @@ pub fn settings_lines(tree: &SettingsTree) -> Vec<String> {
     // longest they can be.
     let widest = u32::MAX as usize;
     let mut runs: Vec<(&SettingsGroup, Vec<Vec<SettingJson<'_>>>)> = Vec::new();
-    if !tree.camera.is_empty() {
-        for g in &tree.groups {
-            let overhead = line(g, &[], (widest, widest, widest, widest)).len();
-            let parts = pack(encoded_settings(g), overhead, MAX_SETTINGS_PER_LINE);
-            if !parts.is_empty() {
-                runs.push((g, parts));
-            }
+    // A camera's groups need the camera; the global ones (revision 8) are
+    // there without one.
+    for g in &tree.groups {
+        if tree.camera.is_empty() && !g.is_global() {
+            continue;
+        }
+        let overhead = line(g, &[], (widest, widest, widest, widest)).len();
+        let parts = pack(encoded_settings(g), overhead, MAX_SETTINGS_PER_LINE);
+        if !parts.is_empty() {
+            runs.push((g, parts));
         }
     }
     let count: usize = runs.iter().map(|(_, parts)| parts.len()).sum();
@@ -908,7 +924,8 @@ pub fn settings_delta_lines(
 }
 
 /// `{"v":1,"type":"settings_clear","rev":R,"serial":S}`: there is nothing
-/// to show (no camera, or no setting this CLI can show).
+/// to show (no camera and no global setting, or no setting this CLI can
+/// show).
 pub fn settings_clear_line(rev: u32, serial: u32) -> String {
     to_line(&SettingsClearLine {
         v: VERSION,
@@ -1564,11 +1581,11 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert_eq!(
             lines[0],
-            r#"{"v":1,"type":"settings_group","schema":1,"rev":12,"serial":3,"camera":"usb-046d_0944","index":0,"count":2,"part":1,"parts":1,"group":{"id":"exposure","label":"Exposure","settings":[{"id":"camera.exposure.auto_exposure","label":"Exposure mode","type":"enum","value":"aperture_priority","default":"aperture_priority","stored":false,"enabled":true,"disabled_reason":"","enabled_when":[],"options":[{"value":"manual","label":"Manual"},{"value":"aperture_priority","label":"Auto"}],"hint":"segmented"},{"id":"camera.exposure.exposure_time_absolute","label":"Exposure time","type":"int","value":1250,"default":156,"stored":false,"enabled":false,"disabled_reason":"Set exposure to manual to change this","enabled_when":[{"id":"camera.exposure.auto_exposure","op":"in","value":["manual","shutter_priority"]}],"min":3,"max":2047,"step":1,"unit":"×100 µs"},{"id":"camera.exposure.keep_framerate","label":"Keep 30 fps in low light","type":"bool","value":false,"default":true,"stored":true,"enabled":true,"disabled_reason":"","enabled_when":[],"hint":"switch"}]}}"#
+            r#"{"v":1,"type":"settings_group","schema":1,"rev":12,"serial":3,"camera":"usb-046d_0944","index":0,"count":2,"part":1,"parts":1,"group":{"id":"exposure","label":"Exposure","settings":[{"id":"camera.exposure.auto_exposure","label":"Exposure mode","scope":"camera","type":"enum","value":"aperture_priority","default":"aperture_priority","stored":false,"enabled":true,"disabled_reason":"","enabled_when":[],"options":[{"value":"manual","label":"Manual"},{"value":"aperture_priority","label":"Auto"}],"hint":"segmented"},{"id":"camera.exposure.exposure_time_absolute","label":"Exposure time","scope":"camera","type":"int","value":1250,"default":156,"stored":false,"enabled":false,"disabled_reason":"Set exposure to manual to change this","enabled_when":[{"id":"camera.exposure.auto_exposure","op":"in","value":["manual","shutter_priority"]}],"min":3,"max":2047,"step":1,"unit":"×100 µs"},{"id":"camera.exposure.keep_framerate","label":"Keep 30 fps in low light","scope":"camera","type":"bool","value":false,"default":true,"stored":true,"enabled":true,"disabled_reason":"","enabled_when":[],"hint":"switch"}]}}"#
         );
         assert_eq!(
             lines[1],
-            r#"{"v":1,"type":"settings_group","schema":1,"rev":12,"serial":3,"camera":"usb-046d_0944","index":1,"count":2,"part":1,"parts":1,"group":{"id":"white_balance","label":"White balance","settings":[{"id":"camera.white_balance.do_white_balance","label":"Balance once","type":"action","stored":false,"enabled":true,"disabled_reason":"","enabled_when":[]}]}}"#
+            r#"{"v":1,"type":"settings_group","schema":1,"rev":12,"serial":3,"camera":"usb-046d_0944","index":1,"count":2,"part":1,"parts":1,"group":{"id":"white_balance","label":"White balance","settings":[{"id":"camera.white_balance.do_white_balance","label":"Balance once","scope":"camera","type":"action","stored":false,"enabled":true,"disabled_reason":"","enabled_when":[]}]}}"#
         );
         for line in &lines {
             parse(line);
@@ -1596,6 +1613,56 @@ mod tests {
         unknown.serial = 2;
         assert_eq!(settings_lines(&unknown), [clear]);
         parse(clear);
+    }
+
+    #[test]
+    fn global_groups_follow_the_cameras_and_show_without_a_camera() {
+        let global = SettingsGroup {
+            id: "video".into(),
+            label: "Video".into(),
+            settings: vec![Setting {
+                id: "effect.video.denoise".into(),
+                label: "Noise removal".into(),
+                kind: SettingKind::Bool {
+                    default: false,
+                    value: false,
+                },
+                scope: obc_ipc::settings::SCOPE_GLOBAL.into(),
+                stored: true,
+                enabled: false,
+                disabled_reason: "Not installed".into(),
+                enabled_when: Vec::new(),
+                hint: Some("switch".into()),
+            }],
+        };
+        let mut tree = exposure_tree();
+        tree.groups.push(global.clone());
+        let lines = settings_lines(&tree);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[2].ends_with(
+                r#""index":2,"count":3,"part":1,"parts":1,"group":{"id":"video","label":"Video","settings":[{"id":"effect.video.denoise","label":"Noise removal","scope":"global","type":"bool","value":false,"default":false,"stored":true,"enabled":false,"disabled_reason":"Not installed","enabled_when":[],"hint":"switch"}]}}"#
+            ),
+            "{}",
+            lines[2]
+        );
+        // No camera: the global groups alone, with an empty camera.
+        let none = SettingsTree {
+            revision: 5,
+            serial: 2,
+            camera: String::new(),
+            groups: vec![global],
+        };
+        let lines = settings_lines(&none);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with(
+                r#"{"v":1,"type":"settings_group","schema":1,"rev":5,"serial":2,"camera":"","index":0,"count":1,"#
+            ),
+            "{}",
+            lines[0]
+        );
+        parse(&lines[0]);
     }
 
     #[test]
@@ -1799,6 +1866,13 @@ mod tests {
             let s = &v["group"]["settings"][0];
             assert!(s["label"].as_str().unwrap().ends_with(ELLIPSIS));
             assert!(s["disabled_reason"].as_str().unwrap().len() <= MAX_REASON_BYTES);
+            // The scope too: clipped to its bound, never left out.
+            let scope = s["scope"].as_str().unwrap();
+            assert!(scope.ends_with(ELLIPSIS), "{scope:?}");
+            assert!(
+                serde_json::to_string(scope).unwrap().len() - 2 <= MAX_SCOPE_BYTES,
+                "{scope:?}"
+            );
             let when = s["enabled_when"].as_array().unwrap();
             assert_eq!(when.len(), MAX_CONDITIONS);
             let operands = when[0]["value"].as_array().unwrap();

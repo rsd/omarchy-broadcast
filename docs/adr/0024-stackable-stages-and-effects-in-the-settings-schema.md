@@ -1,0 +1,148 @@
+# ADR-0024: Stackable stages, and the video effects in the settings schema
+
+- **Status:** Accepted (2026-11-10). Amends [ADR-0018](0018-video-noise-removal.md): the noise-removal boolean becomes an ordered list of stackable stages, and the `Error` precedence gains two entries. Extends [ADR-0023](0023-settings-schema.md) (phase 2: global settings, D-Bus revision 8), [ADR-0012](0012-video-effects-and-maxine-backend.md) (a stage that composites over the effect's background) and [ADR-0009](0009-ingest-process-output.md) (a stage in the ingest tail).
+
+## Context
+- ADR-0018 added noise removal as a boolean on the backend request and said that a second stage that stacks the same way would turn the boolean into a list. Two more features of the Maxine Video Effects SDK fit the chain: **relighting** of the person (`nvvfxrelighting`) and **video super resolution** (`nvvfxvideosuperres`), which upscales a low-resolution camera.
+- Relighting reads the green-screen matte and returns a relit foreground whose background pixels are not valid, so it has to run after the mask and be composited. It lights the person from an environment map (an equirectangular image of linear RGB floats). The SDK ships none.
+- Video super resolution changes the frame size. The Process stage runs on canonical frames at the output size, so a camera that captures below the output has already been scaled up by the ingest's scaler when the effects see it.
+- The effect choice, the blur strength and noise removal reach clients as properties and methods. A client that carries one widget per stage needs a change for each new stage. ADR-0023 describes camera settings as data the daemon computes, left room for settings that are not per camera (`scope`) and named "the effect choice, noise removal" as the next candidates.
+- The bar plugin has no generic D-Bus access and reads the CLI's JSON lines ([ADR-0023](0023-settings-schema.md)).
+- Which SDK features a user has installed varies: the package is built by the user, with a choice of features and of GPU architecture. A client needs to grey out what cannot run. The daemon must not wake the GPU to find out ([ADR-0006](0006-on-demand-gpu-lifecycle.md), [ADR-0017](0017-cuda-checkpoint-parking.md)).
+- The output clock sends a fresh frame on the next tick ([ADR-0010](0010-phase-locked-output-clock.md), [ADR-0015](0015-cadence-emission-for-sub-rate-inputs.md)), and the output contract is 8-bit NV12 SDR into v4l2loopback and PipeWire ([ADR-0016](0016-pipewire-output.md)).
+- The relighting effect keeps a temporal state that the SDK offers no call to clear. A stream that switches camera ([ADR-0010](0010-phase-locked-output-clock.md)) must not carry the look of the previous camera into the next one: with `blur` or `replace` the previous background is hidden, and a relit person is lit by what it saw.
+- Performance figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence; reproduce locally with `obc-bench` (see [../testing.md](../testing.md)).
+
+## Decision
+**The primary effect stays `none`, `blur` or `replace`. Around it the backend runs an ordered list of stackable stages: noise removal before the mask, relighting after it. Low-resolution enhancement is a stage of the ingest, before the scale. Every stage fails open. The effects and the stages are published as global settings in the ADR-0023 tree (D-Bus revision 8), with no new method or property, and the daemon says from the filesystem which stages are installed.**
+
+### Stages in the backend seam
+- `LoadRequest.denoise` (a boolean) becomes `LoadRequest.stages`, a `StageList`: the stages in canonical order, each at most once. `StageList::new` refuses any other order, so a backend never receives an invalid list. The empty list adds no pass, copy or allocation.
+- A stage says whether it needs the mask (`Stage::needs_mask`), and that decides its place. One frame runs: colour conversion, the **pre-mask stages** (noise removal), the **mask** (computed when the effect or a stage needs it), the **post-mask stages** (relighting), the effect's **composite**, conversion back to NV12. The mask-hardening kernel of [ADR-0013](0013-mask-hardening-cuda-kernel.md) is unchanged: every consumer of the mask reads the hardened one.
+- A post-mask stage's output is valid only where the mask says foreground, so it is composited over the effect's background: the camera frame with `none`, the blurred frame with `blur`, the image with `replace`. With `none` and no post-mask stage there is no mask and nothing to composite, as in ADR-0018.
+- Values that change on every frame (the relighting direction and brightness) travel in the per-frame parameters, so changing them reloads nothing. A new light is a request change that loads no model (below). Adding or removing a stage on a loaded instance is a switch of the kind ADR-0018 describes: only that stage's model is loaded or released, and the streaming thread waits for the switch.
+- `BackendError::Denoise` becomes `BackendError::Stage { stage, .. }`: one stage failed to load or to run, the rest of the request is intact, and the caller goes on without that stage. A switch that fails leaves the previous chain loaded, less the failed stage; a frame that fails drops the stage and runs again without it (the frame is processed again under `blur` or `replace`, so no raw frame appears).
+- `reset_temporal` returns the stages it could not reset in place, dropped. The element loads them again from a fresh state (below).
+- **Availability.** `Feature` (the SDK's features), `Availability` (installed, or not installed with a reason) and `Stage::features` say what a stage needs: noise removal its feature; relighting its own feature and the green screen. A feature is installed when its library and, for those that have model files, the models for this GPU's compute capability are present under the SDK root.
+
+### Which features are installed: the filesystem only
+- The probe reads directories and nothing else: no CUDA call, no `dlopen`, so it never wakes a runtime-suspended GPU ([ADR-0017](0017-cuda-checkpoint-parking.md)). The SDK puts the models of every feature together, one file per model and architecture, named with the compute capability; the probe matches them by name. A tree copied from another machine can have the libraries and no model for this GPU, and then the feature is not installed.
+- The compute capability is learnt from the GPU while a session has it up, never at Idle, and cached in `$XDG_CACHE_HOME/omarchy-broadcast/compute-capability` (one line, `major.minor`), so a restarted daemon picks this GPU's models before its first session. The file is a cache, not a setting and not the state file: a missing or unreadable file means "unknown", never an error. While it is unknown, models for any architecture count as installed.
+- The daemon probes at start, on a reload, and after a session has started (when the compute capability may have become known). It probes the root the process loaded the SDK from once it has loaded it, because the SDK stays loaded and a different configured root only applies after a restart ([ADR-0021](0021-nvidia-sdk-handover.md)). A change of what is installed during a session turns the affected stage on or off in what the session was given and touches nothing else.
+- A stage known not to be installed is shown greyed and off, is never requested from the session, and so raises no error. The user's choice is kept and applies once the feature is installed. When nothing is known (no SDK root resolves) the stage is requested as before, and its failure arrives while streaming.
+
+### Effects in the settings tree: D-Bus revision 8
+- **Scope `global`.** A setting has `scope` `camera` (kept per camera, ADR-0023) or `global` (kept for the daemon, the same whatever the camera). Global settings have ids `effect.<group>.<name>`, are in groups that come **after** the camera's, and are published when there is **no camera** too (`GetSettings` then replies `camera` `""` with the global groups alone). A group has one scope.
+- **Groups and settings** (every one is a view of an existing effect setting):
+
+  | Group (label) | Id | Type, range | Meaning |
+  |---|---|---|---|
+  | `background` ("Background effect") | `effect.background.mode` | `enum` `none`, `blur`, `replace`; segmented | The effect (`SetEffect`) |
+  | | `effect.background.blur_strength` | `int` 0 to 100, unit `%`; slider | The blur strength (`SetBlurStrength`, 0.0 to 1.0), enabled only while the mode is `blur` |
+  | `video` ("Video") | `effect.video.denoise` | `bool`; switch | Noise removal (`SetDenoise`) |
+  | | `effect.video.enhance` | `bool`; switch | Enhancement of a low-resolution camera |
+  | `lighting` ("Lighting") | `effect.lighting.relight` | `bool`; switch | Relighting |
+  | | `effect.lighting.light` | `enum` `warm`, `neutral`, `cool`; segmented | The colour of the key light |
+  | | `effect.lighting.direction` | `int` -90 to 90 step 5, unit `°`; slider | Where the key light comes from |
+  | | `effect.lighting.brightness` | `int` 50 to 200 step 5, unit `%`; slider | The brightness of the relit person (100 is unchanged) |
+
+  The background image has no setting: a path is not a type of the schema, and `SetBackgroundImage` stays the way to set it.
+- **Greyed, with a reason.** The blur strength is greyed "Choose Blur to change this" unless the mode is `blur`. The three settings of the light are greyed "Turn on relighting to change this" while relighting is off. A stage whose feature is not installed is greyed "Not installed" (the settings of the light too), and published off, which is what runs; the stored choice is kept. Enhancement is also greyed "The camera already captures at full resolution" when the camera needs none, and "The camera's format cannot be enhanced" when its frames come in a format the stage cannot read. With no camera it is enabled. The conditions are shipped as `enabled_when` for display, as for camera settings.
+- **Writes are the old setters.** `SetSetting` on a global id is validated against the tree in the order of ADR-0023 (unknown, disabled, invalid) and then is exactly the setter it stands for, with its checks, persistence in the state file at once, live application, announcement, and clearing of a standing fault or effect failure. It is not a device write: the coalescing window and the 100-writes-a-second cap do not apply, because the setters are cheap and the blur strength, the direction and the brightness are read per frame. `options.camera` is ignored for a global id. Enhancement and relighting have no method of their own; they are reachable only through the tree.
+- **Resets.** `ResetSettings` with a global `group:` or `setting:` scope forgets the state file's override, so the configuration's value applies again, at once. Scope `camera` never touches a global setting, and a camera reset does not forget the effect choices.
+- **The old members stay.** `Effect`, `BlurStrength`, `BackgroundImage`, `Denoise`, `SetEffect`, `SetBlurStrength`, `SetBackgroundImage` and `SetDenoise` keep their types and meanings. `Denoise` is the request: it stays `true` while noise removal is not installed (the tree shows what runs, the property what was asked for), and the request never raises an error.
+- **Versioning.** `InterfaceRevision` is 8. The settings schema stays 1 and the CLI's `v` stays 1: a setting scope, new setting ids and new groups are additive ([ADR-0023](0023-settings-schema.md)). The CLI's JSON setting objects gain a `scope` key (`camera` or `global`), which a client routes writes by; the D-Bus setting dictionaries already had it.
+- **Plugin.** The bar plugin's Effect tab keeps a dedicated row for the effect choice, which also carries the loading and privacy status the schema cannot express, and draws every other global setting with the same renderer as the camera's settings. A stage added later needs no plugin change.
+
+### Relighting
+- **Placement.** After the mask, before the composite (see the seam above). It needs the green-screen feature as well as its own, and its failure is the stage's alone.
+- **Lighting environments are made in code.** The SDK ships no environment map. The backend builds one per light, deterministically: a dim ambient, a large soft key light above and to one side of the camera at the light's colour temperature (about 3200 K, 5000 K and 6500 K for `warm`, `neutral` and `cool`), and a weaker neutral fill on the other side. They are 512 by 256 floats, built on the CPU at load.
+- **Per frame and live.** The direction is the effect's pan angle and the brightness its foreground gain, set when a frame asks for others. A new light binds a new environment to the loaded effect: a **live rebind**, with no model load. A stage toggle loads or releases only that stage's model.
+- **A blocking CUDA stream.** The SDK processes the environment inside the call that binds it, and at load while one is bound, in work that is not ordered with a non-blocking stream such as the element's frame stream. On such a stream the effect reads the environment before it is in place and lights the person with nothing: a dark result that ignores the direction, for as long as that binding lasts. This was found by testing, and the stage follows it as an SDK requirement: it owns a blocking stream, bound from before the environment is set until the load or the rebind has finished and that stream is synchronised; every frame runs on the element's stream as before. A regression test loads ten times and rebinds twelve times and checks that each result is lit, and fails with a non-blocking stream.
+- **A new source rebuilds the stage.** The temporal state cannot be cleared, so on the new-source flag of ADR-0018 the backend drops the stage and the element loads it again from a fresh state. Frames before it is ready run without it: the effect alone under `blur` or `replace`, the camera frame under `none`, and never a raw frame under an effect. No frame is relit by an instance that saw the previous source.
+- **Fail open.** Relighting hides nothing. A load or frame failure, or a new light that cannot be taken, drops the stage and the video continues without it. A failed new light drops only the stage and keeps the mask, so the effect under it keeps its privacy rule. `Error` reads `relighting unavailable: <reason>; the video continues without it`, worded to be true under every effect.
+- **Configuration.** `[effect] relight`, `relight_light`, `relight_direction` and `relight_brightness`, overridden by the state file's keys of the same names. The direction and the brightness are validated to their range and step, so the tree and the file agree.
+
+### Enhancing a low-resolution camera
+- **Placement: the ingest tail, before the scale.** The stage upscales a frame at the camera's capture size, so it sits where the camera frame still has that size: after `videocrop` and before `cudaconvertscale`. After the scale there would be nothing left to restore. An element `obcenhance` reads the crop region `videocrop` attaches and enhances only what the output shows. It reads NV12 or I420 (what a camera, or `jpegdec`, gives after the upload), writes NV12, and keeps the chroma siting and the colour label of its input. It runs on the same CUDA context as the rest, on a stream of its own.
+- **The factor is an integer.** The smallest integer from 2 to 4 whose result covers the output in the dimension that fills it (both, with crop-to-fill). A larger need is enhanced by 4 and the scaler does the rest. The scaler then fits the frame to the contract as for any camera.
+- **It applies only where it pays.** The region the output shows has even dimensions and at most half the pixels of the area it fills in the output (with letterbox, each dimension at most 1/sqrt(2) of the output's), and the enhanced frame stays within 3840x2160. A camera that captures at or near the output size has the setting greyed.
+- **Toggling is a reopen of the camera.** The stage changes the caps between its neighbours, so the ingest is built with it or without it. A change of the setting, or of what is requested, while a camera is open reopens the camera through the camera-switch path of ADR-0010, and the output holds the last frame while it does. Without a camera the setting applies at the next open. The setting reaches only the ingest, never the effect element.
+- **Fail open.** A load or frame failure releases the enhancer, drops that frame and renegotiates the element's source pad to its input's caps: from the next frame the camera frames pass through at their own size and the scaler sizes them as without the stage. No frame of the wrong size leaves the element. `Error` reads `enhance unavailable: <reason>; the video continues without it`. The failure is cleared by a write or reset of the setting and a reload (both retry the stage), a camera switch or reopen, and the end of the session.
+- **GPU lifecycle.** The enhancer loads with the first frame and is released when the element stops, before the context ([ADR-0017](0017-cuda-checkpoint-parking.md)); a test checks that no CUDA context remains.
+- **Configuration.** `[effect] enhance`, overridden by the state key `enhance`.
+
+### Errors and precedence
+- A stage's failure never changes `State` and never enters `error`. `Error` shows the first applicable of: a missing writer, a fault, an effect failure, a noise-removal failure, a **relighting failure**, an **enhance failure**, a damaged state file. A stage's failure never overwrites a higher cause, also when it is polled later.
+- A relighting or enhance failure reason is made safe to show (control and bidirectional characters removed) and bounded to 400 bytes. The noise-removal text of ADR-0018 is unchanged.
+
+### Not implemented, and why
+- **Video frame generation** (`nvvfxvideoframegeneration`). It interpolates between the previous and the next camera frame, so a generated frame needs a frame that has not arrived. It would delay every fresh frame by at least one output tick plus its compute, against the phase-locked clock's rule that a fresh frame goes out on the next tick ([ADR-0010](0010-phase-locked-output-clock.md), [ADR-0015](0015-cadence-emission-for-sub-rate-inputs.md)), and it adds more than one frame of latency, which a video call feels.
+- **TrueHDR.** The output contract is 8-bit NV12 SDR into v4l2loopback and PipeWire, and no call application consumes HDR10. There is nowhere for HDR to go.
+- **Upscale** (`nvvfxupscale`). Lower quality than video super resolution at these factors; video super resolution is used.
+- **Super resolution's same-size modes** (denoise and deblur at the camera's own size). Deblur sharpens noise instead of removing it. Its denoise modes are not adopted over the existing temporal webcam denoiser without an A/B on a real camera in real low light.
+
+## Consequences
+- A stage costs one GPU pass per frame and its model's GPU memory while it is on, and nothing while it is off. The stacks run live at 1080p30 on the reference machine, relighting and noise removal under `blur` and `replace` included, held the output rate with no skipped ticks. Enhancement costs one pass on the capture-size frame. The figures are not published; see Context.
+- Revision 8 is additive. A client built for revision 7 that draws every group it receives shows the global groups after the camera's; the daemon ignores the camera of a write to a global id, so those writes work. A revision-6 client keeps working through the old members. A revision-8 client against an older daemon sees no global setting and keeps its own effect rows.
+- A new stage needs a seam entry, a catalogue row in `settings::effects` and nothing in the clients. The plugin's Effect tab follows the daemon's groups.
+- The effect choice is a setting of the tree and a property, written two ways to the same storage. The tree is the reference for clients that draw the settings; the old members stay for scripts.
+- A stage that is not installed is greyed with a reason, not missing, so a user can see what the SDK package lacks.
+- Relighting rebuilds on each new source, so after a camera switch the first frames run without it, and the rebuild loads the stage's model again.
+- Toggling enhancement reopens the camera: the output holds the last frame, as in a camera switch, and an application of the virtual camera sees no renegotiation.
+- Known limitations:
+  - **Compute capability unknown.** Before the first session of a machine, and with no cache file, the probe counts models of any architecture as installed. A model for another architecture then fails at load and the stage fails open.
+  - **A feature that installs but does not load.** The probe says what is on disk, not what loads on this GPU; the stage fails open with the SDK's reason.
+  - **`Denoise` and the tree disagree on purpose** while noise removal is not installed (see above).
+  - **Reason texts.** The noise-removal reason of ADR-0018 is shown as the SDK reports it; the two new reasons are sanitised and bounded.
+  - **Enhance factors.** The SDK accepts some non-integer factors; the stage uses integers only.
+  - **First relit frames after a switch** run without relighting, as said.
+  - **The CLI's `settings reset --group=<global group> --camera=<absent camera>`** reads back the tree of that camera; the CLI cannot tell a global group by its name alone.
+
+## Alternatives considered
+
+| Alternative | Why rejected |
+|---|---|
+| Another boolean per stage on the request | Every stage would need its own field, its own order rule and its own branch in the element. An ordered list with one validation gives the order once and lets a stage be added by one entry |
+| New properties and methods for each stage (`SetRelight`, `SetEnhance`, ...) | Each would be a new public name to support and a new widget in every client. Global settings in the tree reach every client with no new member, and the old members stay for scripts |
+| Relighting as a fourth effect | It would exclude combining with `blur` and `replace`, which is the main use, for the reason ADR-0018 gave for noise removal |
+| Relighting before the mask | The stage consumes the matte and its output is valid only on the foreground; it cannot run before the mask exists |
+| The SDK's sample lighting environments | The SDK does not ship them. Environments made in code are deterministic, need no file and have no licence question |
+| Probing each relighting load and rebuilding until the result is lit | Treats the symptom: it did not reliably recover, and each retry is a model load. The cause is the stream rule above |
+| Relighting in a helper process restarted for each load | Would need frame transfer out of the shared CUDA context of ADR-0012 to avoid a rule that a blocking stream satisfies in-process |
+| Deferring relighting | The reliable sequence was found, with a regression test |
+| Resetting the relighting state in place | The SDK has no call that does it; rebuilding on a new source is the only way to keep one camera's look from the next |
+| Fail-closed relighting or enhancement (black on failure) | Neither hides anything. Under `blur` or `replace` the stage is dropped and the effect keeps its own rule, so the privacy rule is intact |
+| Enhancement after the scale, in the Process stage | The frame has been scaled to the output size by then; there is nothing left to restore. It would also run on every output frame instead of every camera frame |
+| Enhancement always on | At a camera size near the output the stage costs a pass and gains nothing. The pays-off rule greys it |
+| Hiding a stage that is not installed | The user could not tell that the package lacks a feature. Greyed with "Not installed" follows ADR-0023's rule for a control that cannot be changed |
+| Asking the GPU which features load | It wakes a parked dGPU ([ADR-0006](0006-on-demand-gpu-lifecycle.md), [ADR-0017](0017-cuda-checkpoint-parking.md)). The filesystem says what is installed; a feature that does not load fails open |
+| Coalescing and rate-limiting global writes | The setters are cheap and the per-frame values are read per frame; the window and the cap exist for device writes |
+| Video frame generation, TrueHDR, Upscale, super resolution's same-size modes | See "Not implemented" |
+
+## Extensibility
+Effects and filters are meant to become layered modules that are loaded as needed, and hardware backends are modules too: NVIDIA Maxine today; later Intel NPU and integrated GPU through OpenVINO, a CPU fallback, and AMD backends from contributors. Most users will not have an NVIDIA RTX GPU, so the effects cannot stay tied to one vendor. This is a direction, not part of this decision, and no module loader exists yet.
+
+This release already respects it in three ways:
+- **Names describe the effect, never the vendor.** Stage ids are `denoise`, `relight` and `enhance`; setting ids are `effect.video.denoise`, `effect.lighting.*` and `effect.video.enhance`.
+- **Availability comes from the backend that provides the stage.** "Not installed" is worded without reference to a vendor, and the setting is greyed whichever backend is missing.
+- **The bar plugin carries no effect list.** It renders the global settings generically. It names only the background-effect choice, which it draws itself, and two legacy fallback rows for daemons below revision 8.
+
+### What would block a second backend today
+- **`Feature` lists the Maxine SDK's features, not capabilities.** `obc_backend::Feature` (green screen, background blur, video super resolution, upscale, frame generation, ...) mirrors the SDK. Availability is answered by a filesystem probe of the Maxine tree (`obc-backend-maxine`, `features.rs`) that the daemon reaches through `obc_pipeline::effect::maxine_feature_availability`, and the controller matches on `Feature` variants to decide what is installed. The daemon does not ask each loaded backend which stages it offers.
+- **A Maxine-specific root outside a backend section.** `[effect] maxine_root`, `set_maxine_root`, the root-conflict note, and the compute-capability cache are in the shared configuration, the pipeline crate and the controller. The `LD_PRELOAD` compatibility shim for the SDK is a unit drop-in of the same kind.
+- **One backend per process.** The effect element's factory defaults to the Maxine factory, and the enhance stage builds the Maxine super-resolution factory. A factory can be injected, but nothing selects a backend per stage.
+- **Stage parameters follow what the Maxine SDK accepts.** The relighting light environments and the colour temperatures of `RelightLight`, the enhance stage's integer scale factor of 2 to 4, and its NV12 and I420 input restriction are shaped by the SDK. Another backend may need its own mapping behind the seam.
+- **GPU memory types are in the seam.** `DeviceNv12` holds `CUdeviceptr` planes and `GpuContext` holds a `CUcontext` and a `CUstream`. A CPU or OpenVINO backend could not take part without a host-memory path.
+
+The next step would be a capability query on the backend seam that lists the stages a backend offers, each with its parameter schema, so that the daemon builds the settings tree from it. This is not decided.
+
+## What would change this decision
+- A stage that needs both a pre-mask and a post-mask part, or one that changes the frame size inside the Process stage: the seam would need a third place in the order.
+- An output contract above 1080p, or a denoising model for frames above 1080p: the size limits of noise removal and the 4K bound of enhancement would be revisited.
+- A relighting temporal reset in a later SDK: the rebuild on a new source would become a reset.
+- A later SDK that orders the environment's processing on any stream: the blocking stream would go.
+- A real-camera A/B showing the super-resolution denoise mode beats the temporal denoiser in low light: it becomes an option of noise removal.
+- A way to interpolate frames without waiting for the next one, or an application that consumes HDR: the two features would be reconsidered.
+- Evidence that non-integer factors matter for common cameras: the factor rule would allow the SDK's non-integer factors.
+- A client that needs the effects as a read-only facade without the tree: properties for the stages, additive.

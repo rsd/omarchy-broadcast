@@ -149,6 +149,64 @@
 //! delayed save that fails is logged and shown in `Error` when nothing
 //! else is, until a save succeeds.
 //!
+//! The video effects are in the tree too, as global settings (revision 8,
+//! [`crate::settings::effects`]): their groups follow the camera's and are
+//! published with no camera as well. They are views of the effect settings:
+//! a `SetSetting` on one is validated against the tree (unknown, disabled,
+//! invalid) and then is exactly `SetEffect`, `SetBlurStrength` or
+//! `SetDenoise` (saved at once, applied live, a fault cleared), never held
+//! by the coalescing window nor counted in the write cap; a reset of a
+//! global group or setting forgets the state file's overrides, so the
+//! configuration's values apply again. Every effect method, a reload and a
+//! change of what is installed announce them like any other setting. Which
+//! features are installed is read from the filesystem (no CUDA call) at
+//! start, on a reload and when a session has started; the GPU's compute
+//! capability, which picks the models of this GPU, is learnt once from the
+//! first session (the GPU is up then) and kept, never asked at idle; it is
+//! cached across restarts ([`crate::gpu_cache`]), so the probes before the
+//! first session already pick this GPU's models. The root probed is the
+//! one the process loaded the SDK from once it has, whatever the
+//! configuration names since. A change of what is installed during a
+//! session turns noise removal on or off in what the session was given,
+//! and touches nothing else. Noise
+//! removal known not to be installed is shown greyed and off, and is not
+//! requested from the session at all, so it raises no error; the choice is
+//! kept and applies once it is installed. When no SDK root resolves,
+//! nothing is known and it is requested as before.
+//!
+//! Relighting of the person (`relight`, the global settings of the
+//! `lighting` group: `effect.lighting.relight`, `.light`, `.direction` and
+//! `.brightness`) is a stage of the output after the mask, as noise removal
+//! is one before it: it follows noise removal's rules. Its settings are
+//! saved at once and applied live to the running session (the switch and
+//! the light through the effect element, the direction and the brightness
+//! as parameters it reads at each frame, so a stream of values costs no
+//! reload), and announced in one `SettingsChanged`; with no session they
+//! are only stored. It needs the relighting and the green-screen features:
+//! known not to be installed, it is greyed and off, never requested and
+//! never an error. Its failure never stops the session (it streams on
+//! without the stage) and only shows in `Error`, after a noise removal
+//! failure's text and before an enhancement failure's; it is cleared as
+//! noise removal's is (the stage ready or no longer requested, an effect
+//! setting written or reset, a reload, the end of the session).
+//!
+//! Enhancement of a low-resolution camera (`enhance`, the global setting
+//! `effect.video.enhance`) is a stage of the ingest, not of the output: an
+//! upscale of the camera image before it is fitted to the output. It is
+//! requested only for a camera whose capture mode is small enough for it to
+//! pay and uploaded in a format it reads
+//! ([`obc_pipeline::ingest::enhance_plan`]), and while it is not
+//! known to be uninstalled; otherwise the ingest is built without it, and
+//! the setting is greyed. The ingest is built with it or without it, so a
+//! change of what is requested while a camera is open (the setting, a
+//! reload) reopens the camera through the camera-switch path, the output
+//! holding the last frame; with the camera closed it applies at the next
+//! open. It hides nothing: its failure never stops the session (the stage
+//! passes the camera frames through) and only shows in `Error`, after a
+//! noise removal failure's text. The failure is cleared by a write or a
+//! reset of the setting and by a reload (both retry the stage, reopening
+//! the camera), a camera switch or reopen, and the end of the session.
+//!
 //! The revision-6 members are views of the same storage: `CameraControls`
 //! and `GetCameraControls` show the five image controls of
 //! [`obc_pipeline::controls::IMAGE_CONTROLS`] (adjustable ones only),
@@ -182,12 +240,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use obc_core::config::{CAMERA_CONTROL_NAMES, Config, EffectConfig, RuntimeState};
-use obc_core::{EffectMode, EffectOnFailure, OutputContract};
+use obc_core::{EffectMode, EffectOnFailure, OutputContract, RelightLight};
 use obc_ipc::settings::ResetScope;
 use obc_ipc::{
     CameraControl, CameraControls, CameraInfo, INTERFACE_REVISION, IpcError, SettingChange,
     SettingValue, SettingsTree, Snapshot, State, Stats,
 };
+use obc_pipeline::capability::IngestPath;
 use obc_pipeline::control_node::CtrlValue;
 use obc_pipeline::controls::{
     CTRL_FLAG_DISABLED, CTRL_FLAG_READ_ONLY, CTRL_FLAG_UPDATE, DeviceControl, IMAGE_CONTROLS,
@@ -196,6 +255,7 @@ use obc_pipeline::controls::{
 use obc_pipeline::ctrl_events::{
     CTRL_CHANGE_FLAGS, CTRL_CHANGE_RANGE, CTRL_CHANGE_VALUE, CtrlEvent,
 };
+use obc_pipeline::effect::{Availability, Feature, Stage};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::backend::{
@@ -204,8 +264,10 @@ use crate::backend::{
     WatchGeneration,
 };
 use crate::camera::{self, Camera};
+use crate::gpu_cache;
 use crate::preview::{Leases, PreviewDir, check_fps};
 use crate::settings::catalogue::DYNAMIC_FRAMERATE;
+use crate::settings::effects::{self, GlobalEntry, Key, Write};
 use crate::settings::{self, CameraSettings, Entry, Inputs, Refusal, Target};
 use crate::{debug, error, info, warning};
 
@@ -558,11 +620,16 @@ pub fn output_mode_string(c: &OutputContract) -> String {
     format!("{} {}x{}@{rate}", c.format.gst_name(), c.width, c.height)
 }
 
-/// The config file, the runtime state file and the runtime directory.
+/// The config file, the runtime state file, the runtime directory and the
+/// cache directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
     pub config: PathBuf,
     pub state: PathBuf,
+    /// `$XDG_CACHE_HOME/omarchy-broadcast`, where what was learnt about the
+    /// GPU is kept ([`crate::gpu_cache`]); `None` when it cannot be found,
+    /// and then nothing is kept.
+    pub cache: Option<PathBuf>,
     /// `$XDG_RUNTIME_DIR`, where the preview frames go
     /// ([`crate::preview::PreviewDir`]); `None` when it is not set, and
     /// then `AcquirePreview` fails.
@@ -698,6 +765,34 @@ fn denoise_failure_text(reason: &str) -> String {
     format!("noise removal unavailable: {reason}; the camera image is shown without it")
 }
 
+/// The longest relighting failure reason `Error` carries, in bytes.
+const RELIGHT_REASON_MAX: usize = 400;
+
+/// The `Error` text of relighting that cannot run (the session streams on
+/// without it): the reason made safe to show and bounded
+/// ([`settings::sanitise`]). Worded to be true under every effect: with
+/// blur or replace the video is the effect without relighting, not the
+/// camera image.
+fn relight_failure_text(reason: &str) -> String {
+    format!(
+        "relighting unavailable: {}; the video continues without it",
+        settings::sanitise(reason, RELIGHT_REASON_MAX)
+    )
+}
+
+/// The longest enhancement failure reason `Error` carries, in bytes.
+const ENHANCE_REASON_MAX: usize = 400;
+
+/// The `Error` text of enhancement that cannot run (the session streams on
+/// without it): the reason made safe to show and bounded
+/// ([`settings::sanitise`]), worded as [`relight_failure_text`].
+fn enhance_failure_text(reason: &str) -> String {
+    format!(
+        "enhance unavailable: {}; the video continues without it",
+        settings::sanitise(reason, ENHANCE_REASON_MAX)
+    )
+}
+
 /// Told the loopback node whenever it changes (`None`: no writer), so the
 /// consumer watcher watches the right node.
 pub type SinkHook = Box<dyn FnMut(Option<&Path>) + Send>;
@@ -728,7 +823,9 @@ struct Streaming {
     failed: Vec<(PathBuf, String)>,
     /// A camera frame has reached the output: `active`.
     live: bool,
-    /// When the current camera's ingest started, until its first frame.
+    /// When the current camera's ingest started, until its first frame (a
+    /// reopen of the same camera before then keeps it: the start timeout
+    /// runs from the first open).
     awaiting: Option<Instant>,
     /// The ingest's switch to `camera` succeeded: the session has it open
     /// (`starting` or `active`), so the image control methods write to it.
@@ -736,6 +833,8 @@ struct Streaming {
     /// That ingest was built with `fixed_framerate`: it pins
     /// `exposure_dynamic_framerate` and puts its value back at the close.
     pinned: bool,
+    /// That ingest was built with the enhance stage.
+    enhance: bool,
 }
 
 /// The lifecycle state machine (see the module docs).
@@ -789,6 +888,26 @@ pub struct Controller<B: MediaBackend> {
     /// ready, held for the next poll: it may be the whole chain's failure,
     /// read before the effect's status showed it.
     denoise_held: Option<EffectStatus>,
+    /// Relighting cannot run: the session streams without it, and this is
+    /// its `Error` text (behind a noise removal failure's). Cleared as
+    /// [`Self::denoise_failure`] is.
+    relight_failure: Option<String>,
+    /// The relighting status last polled in this session, as
+    /// [`Self::denoise_seen`] is for noise removal.
+    relight_seen: Option<EffectStatus>,
+    /// Relighting has been polled in this session.
+    relight_polled: bool,
+    /// A relighting failure held for the next poll, as
+    /// [`Self::denoise_held`] is.
+    relight_held: Option<EffectStatus>,
+    /// Enhancement cannot run: the session streams without it, and this is
+    /// its `Error` text (behind a relighting failure's). Cleared by a
+    /// write or reset of the setting, a reload, a camera switch or reopen,
+    /// and the end of the session.
+    enhance_failure: Option<String>,
+    /// The enhancement status last polled for the current ingest (`None`:
+    /// not polled since it was built).
+    enhance_seen: Option<EffectStatus>,
     /// The effect settings the running session was last given (`None`: no
     /// session). Only a change of the effect, its image or the noise
     /// removal request, or a failure of either, starts a new load to
@@ -851,6 +970,17 @@ pub struct Controller<B: MediaBackend> {
     watch_failed: Option<String>,
     /// A control event asked for a read of the camera at this instant.
     event_refresh_at: Option<Instant>,
+    /// Which features of the effect backend are installed, with the SDK
+    /// root they were looked for in (`None`: no root, nothing known), as
+    /// last read: at start, on a reload and when a session has started.
+    features: Option<(PathBuf, Vec<(Feature, Availability)>)>,
+    /// The GPU's compute capability: the one an earlier run learnt
+    /// ([`crate::gpu_cache`]) until a session of this process reads it
+    /// while it has the GPU up (never at idle: the GPU may be parked); then
+    /// kept for the process, and in the cache when it differs.
+    compute_capability: Option<(u32, u32)>,
+    /// A session of this process has read [`Self::compute_capability`].
+    compute_capability_learnt: bool,
     published: Published,
     sink_hook: Option<SinkHook>,
 }
@@ -955,6 +1085,9 @@ impl<B: MediaBackend> Controller<B> {
             warning!("{note}");
         }
         let (runtime, state_damaged, notes) = load_runtime_state(&paths.state);
+        // Learnt by an earlier run: the models of this GPU are known from
+        // the first probe, with no GPU call at idle.
+        let compute_capability = paths.cache.as_deref().and_then(gpu_cache::load);
         for note in notes {
             warning!("{note}");
         }
@@ -1001,6 +1134,12 @@ impl<B: MediaBackend> Controller<B> {
             denoise_seen: None,
             denoise_polled: false,
             denoise_held: None,
+            relight_failure: None,
+            relight_seen: None,
+            relight_polled: false,
+            relight_held: None,
+            enhance_failure: None,
+            enhance_seen: None,
             effect_applied: None,
             effect_log_at: None,
             consumers: 0,
@@ -1028,9 +1167,13 @@ impl<B: MediaBackend> Controller<B> {
             watch: None,
             watch_failed: None,
             event_refresh_at: None,
+            features: None,
+            compute_capability,
+            compute_capability_learnt: false,
             published,
             sink_hook,
         };
+        c.refresh_features();
         c.rescan_cameras();
         c.reconcile(now);
         c
@@ -1117,9 +1260,19 @@ impl<B: MediaBackend> Controller<B> {
                         "{scope:?} is not a reset scope (camera, group:<id> or setting:<id>)"
                     ))),
                     Some(ResetScope::Camera) => self.reset(&camera, ResetWhat::Camera, now),
-                    Some(ResetScope::Group(g)) => self.reset(&camera, ResetWhat::Group(g), now),
+                    Some(ResetScope::Group(g)) => {
+                        let what = ResetWhat::Group(g);
+                        match self.reset_global(&what, now) {
+                            Some(res) => res,
+                            None => self.reset(&camera, what, now),
+                        }
+                    }
                     Some(ResetScope::Setting(id)) => {
-                        self.reset(&camera, ResetWhat::Setting(id), now)
+                        let what = ResetWhat::Setting(id);
+                        match self.reset_global(&what, now) {
+                            Some(res) => res,
+                            None => self.reset(&camera, what, now),
+                        }
                     }
                 };
                 let _ = reply.send(res);
@@ -1243,9 +1396,10 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     /// The `Error` text of the causes that still hold (the writer missing,
-    /// a fault, an effect failure, a noise removal failure, a damaged state
-    /// file, in that order), or empty: what clearing an error whose own
-    /// cause is gone leaves.
+    /// a fault, an effect failure, a noise removal failure, a relighting
+    /// failure, an enhancement failure, a damaged state file, in that
+    /// order), or empty: what clearing an error whose own cause is gone
+    /// leaves.
     fn standing_error(&self) -> String {
         if self.writer.is_none()
             && let Some(e) = &self.writer_error
@@ -1261,12 +1415,230 @@ impl<B: MediaBackend> Controller<B> {
         if let Some(e) = &self.denoise_failure {
             return e.clone();
         }
+        if let Some(e) = &self.relight_failure {
+            return e.clone();
+        }
+        if let Some(e) = &self.enhance_failure {
+            return e.clone();
+        }
         self.state_damaged.clone().unwrap_or_default()
+    }
+
+    /// Shows the highest cause still standing ([`Self::standing_error`])
+    /// in `Error` when there is one: a cause just raised shows unless a
+    /// higher one holds, and never overwrites it.
+    fn show_standing_error(&mut self) {
+        let standing = self.standing_error();
+        if !standing.is_empty() {
+            self.error = standing;
+        }
     }
 
     /// The effect settings in force: the state file's over the config's.
     pub fn effect(&self) -> EffectConfig {
         self.runtime.effect_over(&self.config.effect)
+    }
+
+    /// The effect settings the session is given: those in force, without
+    /// noise removal or relighting while it is known not to be installed.
+    /// A stage that is not installed is never requested, so it raises no
+    /// error; the choice
+    /// stays in force and applies once it is installed. Enhancement is
+    /// off here: it is the ingest's, given per camera
+    /// ([`Self::session_params_for`]).
+    fn effect_run(&self) -> EffectConfig {
+        let mut effect = self.effect();
+        if self.denoise_installed() == Some(false) {
+            effect.denoise = false;
+        }
+        if self.relight_installed() == Some(false) {
+            effect.relight = false;
+        }
+        effect.enhance = false;
+        effect
+    }
+
+    /// Whether relighting is installed (its feature and the green screen
+    /// that makes its matte): `None` when it cannot be known (no SDK root
+    /// resolves).
+    fn relight_installed(&self) -> Option<bool> {
+        let (_, features) = self.features.as_ref()?;
+        Some(Stage::Relight.availability(features).is_installed())
+    }
+
+    /// Whether enhancement is installed: `None` when it cannot be known
+    /// (no SDK root resolves).
+    fn enhance_installed(&self) -> Option<bool> {
+        let (_, features) = self.features.as_ref()?;
+        features
+            .iter()
+            .find(|(f, _)| *f == Feature::VideoSuperResolution)
+            .map(|(_, a)| a.is_installed())
+    }
+
+    /// Whether enhancement applies to `camera`'s capture mode (small
+    /// enough for it to pay, in a format it reads once uploaded), with the
+    /// output's contract and aspect policy, and why not.
+    fn enhance_applies(&self, camera: &Camera) -> effects::Applies {
+        use obc_pipeline::ingest::{EnhanceRefusal, enhance_plan};
+        let out = self.output_contract();
+        let format = camera.mode.format;
+        match enhance_plan(
+            self.config.output.aspect,
+            IngestPath::of(format).upload_format(format),
+            (camera.mode.width, camera.mode.height),
+            (out.width, out.height),
+        ) {
+            Ok(_) => effects::Applies::Yes,
+            Err(EnhanceRefusal::Resolution) => effects::Applies::FullResolution,
+            Err(EnhanceRefusal::Format) => effects::Applies::Format,
+        }
+    }
+
+    /// Whether an ingest on `camera` is built with the enhance stage: it is
+    /// on, not known to be uninstalled, and applies to the camera.
+    fn enhance_for(&self, camera: &Camera) -> bool {
+        self.effect().enhance
+            && self.enhance_installed() != Some(false)
+            && self.enhance_applies(camera) == effects::Applies::Yes
+    }
+
+    /// The camera the settings tree describes: the session's, else the one
+    /// a session would start on.
+    fn settings_camera(&self) -> Option<&Camera> {
+        match &self.session {
+            Some(_) => self.session_camera(),
+            None => self.chosen_camera(),
+        }
+    }
+
+    /// Whether noise removal is installed: `None` when it cannot be known
+    /// (no SDK root resolves).
+    fn denoise_installed(&self) -> Option<bool> {
+        let (_, features) = self.features.as_ref()?;
+        features
+            .iter()
+            .find(|(f, _)| *f == Feature::Denoise)
+            .map(|(_, a)| a.is_installed())
+    }
+
+    /// Reads again which features are installed (the filesystem only: no
+    /// CUDA call, safe at idle), with the compute capability known. A
+    /// change of noise removal's is logged and, with a session, applied to
+    /// it ([`Self::follow_denoise`]). While a session runs, the compute
+    /// capability is read first if this process has not read it yet (the
+    /// GPU is up then); a value other than the cached one is cached.
+    fn refresh_features(&mut self) {
+        if self.session.is_some() && !self.compute_capability_learnt {
+            self.learn_compute_capability();
+        }
+        let before = self.denoise_installed();
+        let reason_before = self.denoise_reason();
+        let relight_before = self.relight_installed();
+        self.features = self.backend.feature_availability(self.compute_capability);
+        let after = self.denoise_installed();
+        let reason = self.denoise_reason();
+        let relight_after = self.relight_installed();
+        if relight_before != relight_after
+            && let (Some((root, features)), Some(false)) = (&self.features, relight_after)
+        {
+            let why = Stage::Relight.availability(features);
+            info!(
+                "relighting is not installed in {}: {}",
+                root.display(),
+                why.reason().unwrap_or_default()
+            );
+        }
+        if (before, &reason_before) != (after, &reason) {
+            match (&self.features, after) {
+                (None, _) => debug!("no Maxine SDK root: which effects are installed is unknown"),
+                (Some((root, _)), Some(false)) => info!(
+                    "noise removal is not installed in {}: {}",
+                    root.display(),
+                    reason.as_deref().unwrap_or_default()
+                ),
+                (Some((root, _)), _) => {
+                    debug!("noise removal is installed in {}", root.display());
+                }
+            }
+        }
+        if (before != after || relight_before != relight_after) && self.session.is_some() {
+            self.follow_stages();
+        }
+    }
+
+    /// Reads the compute capability from the running session's GPU side,
+    /// once per process, and caches it when it differs from what was known.
+    fn learn_compute_capability(&mut self) {
+        let Some(cc) = self.backend.compute_capability() else {
+            return;
+        };
+        self.compute_capability_learnt = true;
+        let (major, minor) = cc;
+        debug!("GPU compute capability {major}.{minor}");
+        if self.compute_capability == Some(cc) {
+            return;
+        }
+        self.compute_capability = Some(cc);
+        if let Some(dir) = &self.paths.cache
+            && let Err(e) = gpu_cache::save(dir, cc)
+        {
+            debug!(
+                "cannot keep the GPU compute capability in {}: {e}",
+                gpu_cache::path(dir).display()
+            );
+        }
+    }
+
+    /// What is installed changed while a session runs: noise removal and
+    /// relighting, the stages that follow it, are turned on or off in what
+    /// the session was given, and nothing else is. In particular an effect the session
+    /// started without (rejected by [`Self::effect_check`] with
+    /// `on_failure = "none"`) is not requested again: only a control call
+    /// or a reload retries it.
+    fn follow_stages(&mut self) {
+        let run = self.effect_run();
+        let Some(mut effect) = self.effect_applied.clone() else {
+            return;
+        };
+        if effect.denoise == run.denoise && effect.relight == run.relight {
+            return;
+        }
+        if effect.denoise != run.denoise {
+            effect.denoise = run.denoise;
+            self.denoise_seen = None;
+            self.denoise_held = None;
+        }
+        if effect.relight != run.relight {
+            effect.relight = run.relight;
+            self.relight_seen = None;
+            self.relight_held = None;
+        }
+        self.effect_applied = Some(effect.clone());
+        if let Err(reason) = self.backend.set_effect(&effect) {
+            let _ = self.effect_refused(effect, &reason);
+        }
+    }
+
+    /// Why noise removal is not installed, if it is known not to be.
+    fn denoise_reason(&self) -> Option<String> {
+        let (_, features) = self.features.as_ref()?;
+        features
+            .iter()
+            .find(|(f, _)| *f == Feature::Denoise)
+            .and_then(|(_, a)| a.reason().map(str::to_string))
+    }
+
+    /// The global settings (the video effects) as they are now.
+    fn global_settings(&self) -> Vec<GlobalEntry> {
+        effects::build(&effects::Inputs {
+            config: &self.config,
+            runtime: &self.runtime,
+            denoise_installed: self.denoise_installed(),
+            enhance_installed: self.enhance_installed(),
+            enhance_applies: self.settings_camera().map(|c| self.enhance_applies(c)),
+            relight_installed: self.relight_installed(),
+        })
     }
 
     /// The camera of the running session, found by its node (and its id,
@@ -1328,18 +1700,21 @@ impl<B: MediaBackend> Controller<B> {
             hold_timeout: self.config.hold_timeout(),
             input_gap: self.config.input_gap(),
             fixed_framerate: self.config.camera.fixed_framerate,
-            effect: self.effect(),
+            effect: self.effect_run(),
         }
     }
 
     /// The session params for an ingest on `camera`: `fixed_framerate`
     /// only when its next open pins the frame rate
-    /// ([`Self::fixed_framerate_for`]).
+    /// ([`Self::fixed_framerate_for`]), the enhance stage only when it is
+    /// requested for that camera ([`Self::enhance_for`]).
     fn session_params_for(&self, camera: &Camera) -> SessionParams {
-        SessionParams {
+        let mut params = SessionParams {
             fixed_framerate: self.fixed_framerate_for(&camera.id),
             ..self.session_params()
-        }
+        };
+        params.effect.enhance = self.enhance_for(camera);
+        params
     }
 
     /// The config asks for another output contract or loopback device than
@@ -1358,24 +1733,38 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     fn publish(&mut self) {
+        self.publish_with(true);
+    }
+
+    /// Publishes the properties, and the settings tree when `settings`.
+    /// Without it the tree is left for a later [`Self::publish`] of the same
+    /// operation, so that an operation sends one `SettingsChanged` at most
+    /// (`docs/adr/0023-settings-schema.md`); the properties then carry the
+    /// revision published so far.
+    fn publish_with(&mut self, settings: bool) {
         if self.controls_view.camera != self.active_camera() {
             self.refresh_controls();
         }
-        let tree = self.current_settings();
-        // The first tree is revision 1.
-        let delta = self
-            .settings_published
-            .as_ref()
-            .and_then(|old| settings::diff(old, &tree));
-        if let Some(d) = &delta {
-            self.settings_revision = self.settings_revision.wrapping_add(1).max(1);
-            if d.structural {
-                self.settings_serial = self.settings_serial.wrapping_add(1).max(1);
+        let delta = if settings {
+            let tree = self.current_settings();
+            // The first tree is revision 1.
+            let delta = self
+                .settings_published
+                .as_ref()
+                .and_then(|old| settings::diff(old, &tree));
+            if let Some(d) = &delta {
+                self.settings_revision = self.settings_revision.wrapping_add(1).max(1);
+                if d.structural {
+                    self.settings_serial = self.settings_serial.wrapping_add(1).max(1);
+                }
             }
-        }
-        if delta.is_some() || self.settings_published.is_none() {
-            self.settings_published = Some(tree);
-        }
+            if delta.is_some() || self.settings_published.is_none() {
+                self.settings_published = Some(tree);
+            }
+            delta
+        } else {
+            None
+        };
         let effect = self.effect();
         let snap = Snapshot {
             state: self.state(),
@@ -1661,7 +2050,50 @@ impl<B: MediaBackend> Controller<B> {
             return true;
         }
         self.poll_denoise(report.denoise, &report.status);
+        self.poll_relight(report.relight, &report.status);
+        self.poll_enhance(report.enhance);
         false
+    }
+
+    /// Follows the enhance stage of the current ingest. Its failure never
+    /// stops the session: the stage passes the camera frames through, the
+    /// state is unchanged, and `Error` says why unless a higher cause holds
+    /// ([`Self::standing_error`]).
+    fn poll_enhance(&mut self, status: EffectStatus) {
+        if self.enhance_seen.as_ref() == Some(&status) {
+            return;
+        }
+        let first = self.enhance_seen.is_none();
+        self.enhance_seen = Some(status.clone());
+        match status {
+            EffectStatus::Off => {
+                if !first {
+                    info!("enhance off");
+                }
+            }
+            EffectStatus::Loading => info!("enhance: loading"),
+            EffectStatus::Ready => info!("enhance ready"),
+            EffectStatus::Failed(reason) => {
+                let msg = enhance_failure_text(&reason);
+                warning!("{msg}");
+                self.enhance_failure = Some(msg);
+                self.show_standing_error();
+            }
+        }
+    }
+
+    /// Ends an enhancement failure and forgets the stage's status (a new
+    /// ingest reports its own): its `Error` gives way to the causes still
+    /// standing. Whether there was one.
+    fn clear_enhance_failure(&mut self) -> bool {
+        self.enhance_seen = None;
+        let Some(old) = self.enhance_failure.take() else {
+            return false;
+        };
+        if self.error == old {
+            self.error = self.standing_error();
+        }
+        true
     }
 
     /// The effect's part of [`Self::poll_effect`].
@@ -1717,8 +2149,9 @@ impl<B: MediaBackend> Controller<B> {
     /// Follows the noise removal stage of the running session, `effect`
     /// being the effect's status of the same report. Its failure never
     /// stops the session: it streams on without the stage (the element
-    /// drops it), the state is unchanged, and `Error` says why unless an
-    /// effect failure, which matters more, already does.
+    /// drops it), the state is unchanged, and `Error` says why unless a
+    /// higher cause holds ([`Self::standing_error`]): the writer missing, a
+    /// fault, an effect failure.
     ///
     /// A failure with the effect's own failure reason is the whole chain's
     /// (the element shows it on both): the effect's, not recorded as the
@@ -1767,10 +2200,8 @@ impl<B: MediaBackend> Controller<B> {
             EffectStatus::Failed(reason) => {
                 let msg = denoise_failure_text(&reason);
                 warning!("{msg}");
-                if self.effect_failure.is_none() {
-                    self.error = msg.clone();
-                }
                 self.denoise_failure = Some(msg);
+                self.show_standing_error();
             }
         }
     }
@@ -1779,6 +2210,68 @@ impl<B: MediaBackend> Controller<B> {
     /// still standing.
     fn clear_denoise_failure(&mut self) {
         if let Some(old) = self.denoise_failure.take()
+            && self.error == old
+        {
+            self.error = self.standing_error();
+        }
+    }
+
+    /// Follows the relighting stage of the running session, `effect` being
+    /// the effect's status of the same report, exactly as
+    /// [`Self::poll_denoise`] follows noise removal: its failure never stops
+    /// the session, a failure with the effect's own reason is the whole
+    /// chain's, and one seen while the effect is loading or ready waits for
+    /// the next poll.
+    fn poll_relight(&mut self, status: EffectStatus, effect: &EffectStatus) {
+        if let EffectStatus::Failed(reason) = &status
+            && self.relight_seen.as_ref() != Some(&status)
+        {
+            if matches!(effect, EffectStatus::Failed(r) if r == reason) {
+                debug!("relighting stopped with the effect: {reason}");
+                self.relight_held = None;
+                self.relight_seen = Some(status);
+                self.relight_polled = true;
+                self.clear_relight_failure();
+                return;
+            }
+            if matches!(effect, EffectStatus::Loading | EffectStatus::Ready)
+                && self.relight_held.as_ref() != Some(&status)
+            {
+                self.relight_held = Some(status);
+                return;
+            }
+        }
+        self.relight_held = None;
+        if self.relight_seen.as_ref() == Some(&status) {
+            return;
+        }
+        self.relight_seen = Some(status.clone());
+        let first = !std::mem::replace(&mut self.relight_polled, true);
+        match status {
+            EffectStatus::Off => {
+                if !first {
+                    info!("relighting off");
+                }
+                self.clear_relight_failure();
+            }
+            EffectStatus::Loading => info!("relighting: loading"),
+            EffectStatus::Ready => {
+                info!("relighting ready");
+                self.clear_relight_failure();
+            }
+            EffectStatus::Failed(reason) => {
+                let msg = relight_failure_text(&reason);
+                warning!("{msg}");
+                self.relight_failure = Some(msg);
+                self.show_standing_error();
+            }
+        }
+    }
+
+    /// Ends a relighting failure: its `Error` gives way to the causes still
+    /// standing.
+    fn clear_relight_failure(&mut self) {
+        if let Some(old) = self.relight_failure.take()
             && self.error == old
         {
             self.error = self.standing_error();
@@ -1889,6 +2382,7 @@ impl<B: MediaBackend> Controller<B> {
                 s.awaiting = Some(now);
                 s.open = false;
                 s.pinned = params.fixed_framerate;
+                s.enhance = params.effect.enhance;
             }
             match self.backend.switch_camera(&params, cam) {
                 Ok(()) => {
@@ -1969,6 +2463,9 @@ impl<B: MediaBackend> Controller<B> {
         let mut params = self.session_params();
         self.effect_failure = None;
         self.denoise_failure = None;
+        self.relight_failure = None;
+        self.enhance_failure = None;
+        self.enhance_seen = None;
         if params.effect.mode != EffectMode::None
             && let Err(reason) = self.effect_check(&params.effect)
         {
@@ -1997,12 +2494,23 @@ impl<B: MediaBackend> Controller<B> {
             awaiting: Some(now),
             open: false,
             pinned: false,
+            enhance: false,
         });
-        // `starting` is announced before the (slow) start.
-        self.publish();
+        // `starting` is announced before the (slow) start; the settings it
+        // changes (what is installed for this GPU, learnt once it is up)
+        // are announced once, at the end of the step.
+        self.publish_with(false);
         if let Err(e) = self.backend.start_session(&params) {
             self.drop_session();
             self.set_fault(e);
+            return;
+        }
+        // The GPU is up: the compute capability can be learnt, and what is
+        // installed for this GPU read again (applied to the session if it
+        // changed what runs; an effect that then fails with
+        // `on_failure = "black"` stops the session).
+        self.refresh_features();
+        if self.session.is_none() {
             return;
         }
         // Turned off during the (slow) output build: no camera is opened;
@@ -2028,7 +2536,8 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     /// Stops the session. An effect failure of that session (with
-    /// `on_failure = "none"`) and a noise removal failure end with it: their
+    /// `on_failure = "none"`), a noise removal failure, a relighting failure
+    /// and an enhancement failure end with it: their
     /// `Error` gives way to the causes still standing.
     fn drop_session(&mut self) {
         self.stop_watch();
@@ -2041,11 +2550,21 @@ impl<B: MediaBackend> Controller<B> {
         self.denoise_seen = None;
         self.denoise_polled = false;
         self.denoise_held = None;
+        self.relight_seen = None;
+        self.relight_polled = false;
+        self.relight_held = None;
         self.effect_applied = None;
         self.effect_log_at = None;
+        self.enhance_seen = None;
         let effect = self.effect_failure.take();
         let denoise = self.denoise_failure.take();
-        if [effect, denoise].iter().flatten().any(|e| *e == self.error) {
+        let relight = self.relight_failure.take();
+        let enhance = self.enhance_failure.take();
+        if [effect, denoise, relight, enhance]
+            .iter()
+            .flatten()
+            .any(|e| *e == self.error)
+        {
             self.error = self.standing_error();
         }
     }
@@ -2382,6 +2901,7 @@ impl<B: MediaBackend> Controller<B> {
                 s.awaiting = Some(now);
                 s.open = false;
                 s.pinned = params.fixed_framerate;
+                s.enhance = params.effect.enhance;
             }
             info!("switching to {}", cam.label());
             match self.backend.switch_camera(&params, &cam) {
@@ -2486,7 +3006,7 @@ impl<B: MediaBackend> Controller<B> {
         // A slider sends many: not worth the journal.
         debug!("blur strength: {strength}");
         let changed = self.runtime.blur_strength.replace(strength) != Some(strength);
-        self.effect_changed(changed, now)
+        self.frame_params_changed(changed, now)
     }
 
     /// `SetBackgroundImage`: a path sets the run-time image; `""` removes
@@ -2531,13 +3051,119 @@ impl<B: MediaBackend> Controller<B> {
         self.effect_changed(changed, now)
     }
 
+    /// A write of `effect.lighting.relight`: relighting on or off, after the
+    /// mask (or alone with `none`), applied as noise removal is.
+    fn set_relight(&mut self, on: bool, now: Instant) -> Result<(), IpcError> {
+        info!("relighting selected: {}", if on { "on" } else { "off" });
+        let changed = self.runtime.relight.replace(on) != Some(on);
+        self.effect_changed(changed, now)
+    }
+
+    /// A write of `effect.lighting.light`: the relighting light (a live
+    /// rebind of the running stage, no reload).
+    fn set_relight_light(&mut self, light: RelightLight, now: Instant) -> Result<(), IpcError> {
+        info!("relighting light: {light}");
+        let changed = self.runtime.relight_light.replace(light) != Some(light);
+        self.effect_changed(changed, now)
+    }
+
+    /// A write of `effect.lighting.direction`: where the relighting light
+    /// comes from, in degrees (a parameter of each frame, no reload).
+    fn set_relight_direction(&mut self, degrees: i32, now: Instant) -> Result<(), IpcError> {
+        // A slider sends many: not worth the journal.
+        debug!("relighting direction: {degrees}°");
+        let changed = self.runtime.relight_direction.replace(degrees) != Some(degrees);
+        self.frame_params_changed(changed, now)
+    }
+
+    /// A write of `effect.lighting.brightness`: how bright the relit person
+    /// is, in percent (a parameter of each frame, no reload).
+    fn set_relight_brightness(&mut self, percent: u32, now: Instant) -> Result<(), IpcError> {
+        debug!("relighting brightness: {percent}%");
+        let changed = self.runtime.relight_brightness.replace(percent) != Some(percent);
+        self.frame_params_changed(changed, now)
+    }
+
+    /// A write of `effect.video.enhance`: enhancement on or off, for the
+    /// ingest (no method of its own). Applied as the other effect settings
+    /// are ([`Self::effect_changed_with`]), an enhancement failure cleared
+    /// and retried.
+    fn set_enhance(&mut self, on: bool, now: Instant) -> Result<(), IpcError> {
+        info!("enhance selected: {}", if on { "on" } else { "off" });
+        let changed = self.runtime.enhance.replace(on) != Some(on);
+        self.effect_changed_with(changed, true, now)
+    }
+
     /// The effect settings changed by a method: saved (unless `changed` is
     /// false: the state file already holds them), applied to the running
     /// session without restarting it, and published before the reply. A
     /// control call clears a fault (an effect that could not run is tried
-    /// again) and the `Error` of a session running without its effect or
-    /// without noise removal.
+    /// again) and the `Error` of a session running without its effect,
+    /// without noise removal or without relighting.
     fn effect_changed(&mut self, changed: bool, now: Instant) -> Result<(), IpcError> {
+        self.effect_changed_with(changed, false, now)
+    }
+
+    /// A parameter of each frame changed by a method (the blur strength,
+    /// the relighting direction or brightness): saved (unless `changed` is
+    /// false) and given to the running session as it is, never as a retry.
+    /// A slider sends many, and a retry reloads what failed (a model load
+    /// per tick), so a failure, its `Error` and a fault stay as they are:
+    /// only a toggle, a new light or image, a reset or a reload retries.
+    /// A fault is the exception: with the session stopped in error there is
+    /// nothing to give the value to, and any control call clears a fault
+    /// ([`Self::effect_changed`]), once (the session it starts is not in
+    /// error).
+    fn frame_params_changed(&mut self, changed: bool, now: Instant) -> Result<(), IpcError> {
+        if self.fault.is_some() {
+            return self.effect_changed(changed, now);
+        }
+        let mut res = if changed { self.save_state() } else { Ok(()) };
+        if self.session.is_some()
+            && let Err(e) = self.apply_frame_params()
+        {
+            res = Err(e);
+        }
+        self.reconcile(now);
+        res
+    }
+
+    /// Gives the running session the per-frame parameters in force on top
+    /// of what it was last given ([`Self::apply_effect`] when it was given
+    /// nothing yet), so that nothing it loads changes and nothing failed is
+    /// retried: the effect element takes a change of these alone as one
+    /// without a retry.
+    fn apply_frame_params(&mut self) -> Result<(), IpcError> {
+        let Some(prev) = self.effect_applied.clone() else {
+            return self.apply_effect();
+        };
+        let run = self.effect_run();
+        let effect = EffectConfig {
+            blur_strength: run.blur_strength,
+            relight_direction: run.relight_direction,
+            relight_brightness: run.relight_brightness,
+            ..prev.clone()
+        };
+        if effect == prev {
+            return Ok(());
+        }
+        self.effect_applied = Some(effect.clone());
+        let Err(reason) = self.backend.set_effect(&effect) else {
+            return Ok(());
+        };
+        Err(self.effect_refused(effect, &reason))
+    }
+
+    /// [`Self::effect_changed`], and the open camera reopened when what its
+    /// ingest should have of enhancement changed ([`Self::follow_enhance`]);
+    /// with `enhance`, the setting itself was written: its failure is
+    /// cleared and, still requested, tried again.
+    fn effect_changed_with(
+        &mut self,
+        changed: bool,
+        enhance: bool,
+        now: Instant,
+    ) -> Result<(), IpcError> {
         if let Some(f) = self.fault.take()
             && self.error == f
         {
@@ -2545,12 +3171,23 @@ impl<B: MediaBackend> Controller<B> {
         }
         let effect = self.effect_failure.take();
         let denoise = self.denoise_failure.take();
-        if [effect, denoise].iter().flatten().any(|e| *e == self.error) {
+        let relight = self.relight_failure.take();
+        if [effect, denoise, relight]
+            .iter()
+            .flatten()
+            .any(|e| *e == self.error)
+        {
             self.error = self.standing_error();
         }
+        let retry = enhance && self.clear_enhance_failure();
         let mut res = if changed { self.save_state() } else { Ok(()) };
         if self.session.is_some()
             && let Err(e) = self.apply_effect()
+        {
+            res = Err(e);
+        }
+        if let Err(e) = self.follow_enhance(retry, now)
+            && res.is_ok()
         {
             res = Err(e);
         }
@@ -2559,19 +3196,24 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     /// Applies the effect in force to the running session. Settings the
-    /// session already has are not given again, unless the effect or noise
-    /// removal failed (a retry). A new effect or image, or a retry of the
-    /// effect, is followed from its load (its status is reported again), as
-    /// is a new noise removal request or its retry; a strength change is
-    /// not. A setting the session cannot take is an effect failure
+    /// session already has are not given again, unless the effect, noise
+    /// removal or relighting failed (a retry). A new effect or image, or a
+    /// retry of the effect, is followed from its load (its status is
+    /// reported again), as is a new noise removal or relighting request (a
+    /// new light included) or its retry; a strength, direction or
+    /// brightness change is not (those go through
+    /// [`Self::apply_frame_params`], never a retry). A setting the session
+    /// cannot take is an effect failure
     /// ([`Self::effect_failed`]), and the method's error.
     fn apply_effect(&mut self) -> Result<(), IpcError> {
-        let effect = self.effect();
+        let effect = self.effect_run();
         let failed = matches!(self.effect_seen, Some(EffectStatus::Failed(_)));
         let denoise_failed = matches!(self.denoise_seen, Some(EffectStatus::Failed(_)))
             || self.denoise_held.is_some();
+        let relight_failed = matches!(self.relight_seen, Some(EffectStatus::Failed(_)))
+            || self.relight_held.is_some();
         let prev = self.effect_applied.as_ref();
-        if !failed && !denoise_failed && prev == Some(&effect) {
+        if !failed && !denoise_failed && !relight_failed && prev == Some(&effect) {
             return Ok(());
         }
         if failed
@@ -2585,12 +3227,27 @@ impl<B: MediaBackend> Controller<B> {
             self.denoise_seen = None;
             self.denoise_held = None;
         }
+        if relight_failed
+            || prev.is_none_or(|p| {
+                p.relight != effect.relight || p.relight_light != effect.relight_light
+            })
+        {
+            self.relight_seen = None;
+            self.relight_held = None;
+        }
         self.effect_applied = Some(effect.clone());
         let Err(reason) = self.backend.set_effect(&effect) else {
             return Ok(());
         };
-        let msg = effect_failure_text(&effect, &reason);
-        if !self.effect_failed(&reason) {
+        Err(self.effect_refused(effect, &reason))
+    }
+
+    /// The session refused `effect` for `reason`: an effect failure
+    /// ([`Self::effect_failed`]); with `on_failure = "none"` it streams on
+    /// without the effect. The error the method answers.
+    fn effect_refused(&mut self, effect: EffectConfig, reason: &str) -> IpcError {
+        let msg = effect_failure_text(&effect, reason);
+        if !self.effect_failed(reason) {
             // Streaming on without the effect, as `none` says.
             let off = EffectConfig {
                 mode: EffectMode::None,
@@ -2601,7 +3258,7 @@ impl<B: MediaBackend> Controller<B> {
             }
             self.effect_applied = Some(off);
         }
-        Err(IpcError::Failed(msg))
+        IpcError::Failed(msg)
     }
 
     // ---- camera settings and image controls ----
@@ -2665,11 +3322,70 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     /// The session is about to leave the camera it has open (a switch, a
-    /// reopen, a fail-over): its watcher stops, and a settings change not
-    /// saved yet is saved first.
+    /// reopen, a fail-over): its watcher stops, a settings change not
+    /// saved yet is saved first, and an enhancement failure of that ingest
+    /// ends with it.
     fn leaving_camera(&mut self) {
         self.stop_watch();
         self.flush_settings();
+        self.clear_enhance_failure();
+    }
+
+    /// Reopens the session's `camera` (a new ingest on the same camera,
+    /// through the switch path: the output holds the last frame), with the
+    /// params it takes now. A failure is the camera's
+    /// ([`Self::camera_failed`]), and the error returned.
+    fn reopen_camera(&mut self, cam: &Camera, now: Instant) -> Result<(), IpcError> {
+        self.leaving_camera();
+        let params = self.session_params_for(cam);
+        if let Some(s) = self.session.as_mut() {
+            // A camera that has not delivered yet keeps its deadline: reopens
+            // (enhancement toggled before the first frame) never postpone
+            // the start timeout.
+            s.awaiting = Some(s.awaiting.unwrap_or(now));
+            s.open = false;
+            s.pinned = params.fixed_framerate;
+            s.enhance = params.effect.enhance;
+        }
+        match self.backend.switch_camera(&params, cam) {
+            Ok(()) => {
+                self.camera_opened(cam);
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("reopening {}: {e}", cam.label());
+                self.camera_failed(msg.clone(), now);
+                Err(IpcError::Failed(msg))
+            }
+        }
+    }
+
+    /// Reopens the session's open camera when whether its ingest should
+    /// have the enhance stage ([`Self::enhance_for`]) differs from what it
+    /// was built with, or, with `retry`, when it should have it (a failed
+    /// stage tried again). Nothing without a session or an open camera:
+    /// it applies at the next open.
+    fn follow_enhance(&mut self, retry: bool, now: Instant) -> Result<(), IpcError> {
+        let Some(s) = &self.session else {
+            return Ok(());
+        };
+        if !s.open {
+            return Ok(());
+        }
+        let has = s.enhance;
+        let Some(cam) = self.session_camera().cloned() else {
+            return Ok(());
+        };
+        let want = self.enhance_for(&cam);
+        if want == has && !(retry && want) {
+            return Ok(());
+        }
+        info!(
+            "enhance {}: reopening {}",
+            if want { "on" } else { "off" },
+            cam.label()
+        );
+        self.reopen_camera(&cam, now)
     }
 
     /// Starts the control-event watcher on `camera` for the controls
@@ -2832,6 +3548,8 @@ impl<B: MediaBackend> Controller<B> {
             open: self.is_open(camera),
             fixed_framerate: self.fixed_framerate_for(&camera.id),
         });
+        let mut built = built;
+        built.global = self.global_settings();
         for note in &built.notes {
             if self
                 .settings_noted
@@ -2946,6 +3664,7 @@ impl<B: MediaBackend> Controller<B> {
                 self.settings_scan = other;
                 CameraSettings {
                     camera: active,
+                    global: self.global_settings(),
                     ..CameraSettings::none()
                 }
             }
@@ -3256,7 +3975,11 @@ impl<B: MediaBackend> Controller<B> {
         let (rev, serial) = (self.settings_revision, self.settings_serial);
         if camera.is_empty() || camera == self.active_camera() {
             if camera.is_empty() && self.cameras.is_empty() {
-                return Ok(CameraSettings::none().tree(rev, serial));
+                let none = CameraSettings {
+                    global: self.global_settings(),
+                    ..CameraSettings::none()
+                };
+                return Ok(none.tree(rev, serial));
             }
             if let Some(published) = &self.settings_published
                 && published.camera == self.active_camera()
@@ -3299,6 +4022,13 @@ impl<B: MediaBackend> Controller<B> {
     /// now, or held for the coalescing window (a held request of the same
     /// setting is replaced, and answered `Ok`).
     fn set_request(&mut self, camera: &str, req: SetRequest, reply: Reply, now: Instant) {
+        if let SetRequest::Setting { id, value } = &req
+            && effects::is_global(id)
+        {
+            let res = self.set_global(id, value.as_ref(), now);
+            let _ = reply.send(res);
+            return;
+        }
         match self.try_set(camera, &req, now, false, true) {
             SetOutcome::Done(res) => {
                 let _ = reply.send(res);
@@ -3328,6 +4058,64 @@ impl<B: MediaBackend> Controller<B> {
                 });
             }
         }
+    }
+
+    /// `SetSetting` on a global setting (the camera option is ignored):
+    /// validated against the tree as it is now (unknown, disabled, invalid),
+    /// then exactly the existing setter (`SetEffect`, `SetBlurStrength` or
+    /// `SetDenoise`, or the relighting and enhancement setters, which have
+    /// no method of their own), with its checks, errors, saving and
+    /// publishing. Not a device write: neither held by the coalescing
+    /// window nor counted in the cap; the blur strength and the relighting
+    /// direction and brightness are parameters the effect reads at each
+    /// frame, so a stream of values costs no reload.
+    fn set_global(
+        &mut self,
+        id: &str,
+        value: Option<&SettingValue>,
+        now: Instant,
+    ) -> Result<(), IpcError> {
+        let entries = self.global_settings();
+        match effects::check(&entries, id, value).map_err(refusal_error)? {
+            Write::Mode(mode) => self.set_effect(mode.as_str(), now),
+            Write::BlurStrength(v) => self.set_blur_strength(v, now),
+            Write::Denoise(on) => self.set_denoise(on, now),
+            Write::Enhance(on) => self.set_enhance(on, now),
+            Write::Relight(on) => self.set_relight(on, now),
+            Write::Light(light) => self.set_relight_light(light, now),
+            Write::Direction(degrees) => self.set_relight_direction(degrees, now),
+            Write::Brightness(percent) => self.set_relight_brightness(percent, now),
+        }
+    }
+
+    /// `ResetSettings` of a global group or setting (the camera option is
+    /// ignored): the state file's overrides in scope are forgotten, so the
+    /// configuration's values apply again, at once and to the running
+    /// session, as an effect method does (saved, a fault or effect failure
+    /// cleared). `None` when the scope is not global.
+    fn reset_global(&mut self, what: &ResetWhat, now: Instant) -> Option<Result<(), IpcError>> {
+        let keys = match what {
+            ResetWhat::Group(g) if effects::is_global_group(g) => Key::of_group(g),
+            ResetWhat::Setting(id) if effects::is_global(id) => match Key::of(id) {
+                Some(k) => vec![k],
+                None => {
+                    return Some(Err(IpcError::UnknownSetting(format!(
+                        "there is no setting {id:?}"
+                    ))));
+                }
+            },
+            _ => return None,
+        };
+        let mut changed = false;
+        for k in &keys {
+            changed |= k.forget(&mut self.runtime);
+        }
+        info!(
+            "{} reset to the configuration's value",
+            keys.iter().map(|k| k.id()).collect::<Vec<_>>().join(", ")
+        );
+        let enhance = keys.contains(&Key::Enhance);
+        Some(self.effect_changed_with(changed, enhance, now))
     }
 
     /// The last read of `camera` (the one the published tree is built
@@ -3370,11 +4158,7 @@ impl<B: MediaBackend> Controller<B> {
         let model = self.build_settings(&cam, &scan);
         let (index, raw) = match req {
             SetRequest::Setting { id, value } => {
-                model.check(id, value.as_ref()).map_err(|r| match r {
-                    Refusal::Unknown(m) => IpcError::UnknownSetting(m),
-                    Refusal::Disabled(m) => IpcError::Disabled(m),
-                    Refusal::Invalid(m) => IpcError::InvalidArgument(m),
-                })?
+                model.check(id, value.as_ref()).map_err(refusal_error)?
             }
             SetRequest::Control { name, value } => {
                 let not_exposed =
@@ -3868,9 +4652,16 @@ impl<B: MediaBackend> Controller<B> {
         self.fault = None;
         self.effect_failure = None;
         self.denoise_failure = None;
+        self.relight_failure = None;
+        // A failed enhance stage is tried again (below), as a failed effect
+        // is.
+        let mut enhance_retry = self.enhance_failure.take().is_some();
+        self.enhance_seen = None;
         // Only the errors whose cause is gone are cleared: a missing
         // writer or a damaged state file still stands.
         self.error = self.standing_error();
+        // The SDK root may have changed, or a feature been installed.
+        self.refresh_features();
         // The effect in force may have changed (or failed before): applied
         // again, which retries a failed effect.
         if self.session.is_some() {
@@ -3885,19 +4676,15 @@ impl<B: MediaBackend> Controller<B> {
                 && let Some(cam) = self.session_camera().cloned()
             {
                 info!("camera mode changed: reopening {}", cam.label());
-                self.leaving_camera();
-                let params = self.session_params_for(&cam);
-                if let Some(s) = self.session.as_mut() {
-                    s.awaiting = Some(now);
-                    s.open = false;
-                    s.pinned = params.fixed_framerate;
-                }
-                match self.backend.switch_camera(&params, &cam) {
-                    Ok(()) => self.camera_opened(&cam),
-                    Err(e) => self.camera_failed(format!("reopening {}: {e}", cam.label()), now),
-                }
+                let _ = self.reopen_camera(&cam, now);
+                // A new ingest: the stage already tried again.
+                enhance_retry = false;
             }
         }
+        // Enhancement requested otherwise (the setting's default, the
+        // aspect, what is installed), or failed: the camera is reopened with
+        // it or without it.
+        let _ = self.follow_enhance(enhance_retry, now);
         if self.writer_outdated() && (self.consumers > 0 || self.session.is_some()) {
             info!(
                 "the new output or loopback settings apply once no application uses the \
@@ -3917,6 +4704,15 @@ impl<B: MediaBackend> Controller<B> {
         {
             info!("the new PipeWire format offer applies once no application is linked to it");
         }
+    }
+}
+
+/// The error a refused `SetSetting` answers.
+fn refusal_error(r: Refusal) -> IpcError {
+    match r {
+        Refusal::Unknown(m) => IpcError::UnknownSetting(m),
+        Refusal::Disabled(m) => IpcError::Disabled(m),
+        Refusal::Invalid(m) => IpcError::InvalidArgument(m),
     }
 }
 

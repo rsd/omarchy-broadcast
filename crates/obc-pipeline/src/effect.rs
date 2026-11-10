@@ -4,24 +4,27 @@
 //!
 //! An output built with [`OutputConfig::effect`](crate::OutputConfig::effect)
 //! set holds one `obceffect` element for its whole life; the effect, the blur
-//! strength, the background, the fallback and the denoise stage
+//! strength, the background, the fallback, the denoise stage
 //! ([`EffectSettings::denoise`], `docs/adr/0018-video-noise-removal.md`)
-//! change on it while it streams
+//! and the relighting stage ([`EffectSettings::relight`] with its
+//! [`RelightParams`]) change on it while it streams
 //! ([`Output::set_effect`](crate::Output::set_effect)), without
 //! renegotiating caps. `EffectSettings::default()` (`none`, no denoise)
 //! inserts the element in passthrough, which costs no copy and no CUDA
-//! call; `none` with denoise runs the denoise stage alone. An output built
+//! call; `none` with a stage runs the stages alone. An output built
 //! without it (`effect: None`, the default) has no element at all and
 //! cannot take an effect later.
 //!
-//! The element reports the effect's state as [`EffectStatus`], the denoise
-//! stage's as a second [`EffectStatus`]
+//! The element reports the effect's state as [`EffectStatus`], each
+//! stage's as an [`EffectStatus`] of its own
 //! ([`Output::denoise_status`](crate::Output::denoise_status),
-//! [`EffectStats::denoise`]), its counters as [`EffectStats`], and posts
-//! every change of either status on the output pipeline's bus as an element
-//! message named [`STATUS_MESSAGE`] (fields `effect`, `status`, `reason`,
-//! `denoise`, `denoise-reason`). A failure of the denoise stage drops the
-//! stage and never fails the effect. The output clock marks the first frame
+//! [`Output::relight_status`](crate::Output::relight_status),
+//! [`EffectStats::denoise`], [`EffectStats::relight`]), its counters as
+//! [`EffectStats`], and posts every change of any status on the output
+//! pipeline's bus as an element message named [`STATUS_MESSAGE`] (fields
+//! `effect`, `status`, `reason`, `denoise`, `denoise-reason`, `relight`,
+//! `relight-reason`). A failure of a stage drops the stage and never fails
+//! the effect. The output clock marks the first frame
 //! of each new source with [`NEW_SOURCE_FLAG`], on which the element resets
 //! the backend's temporal state.
 
@@ -34,6 +37,7 @@ pub use gst_obc::{
     STATUS_MESSAGE, has_new_source_flag,
 };
 use obc_backend::BackendFactory;
+pub use obc_backend::{Availability, Feature, RelightLight, RelightParams, Stage};
 use obc_backend_maxine::MaxineFactory;
 
 use crate::pipeline::{PipelineError, names};
@@ -103,6 +107,24 @@ pub fn maxine_root_conflict() -> Option<String> {
 /// set and non-empty: it takes precedence over [`set_maxine_root`].
 pub fn maxine_root_env() -> Option<PathBuf> {
     obc_backend_maxine::env_root()
+}
+
+/// Which features of the Maxine SDK are installed under the root this
+/// process can use ([`obc_backend_maxine::usable_root`]: the one it loaded
+/// the SDK from once it has, since a second SDK cannot be loaded beside
+/// it; else the root in force now), with that root, in
+/// [`Feature::ALL`] order; `None` when no root can be resolved (the
+/// library search path only: nothing can be checked). Reads directories
+/// only, with no CUDA call and no `dlopen`, so it never wakes a
+/// runtime-suspended GPU (`obc_backend_maxine::feature_availability`).
+/// `compute_capability` is the GPU's `(major, minor)` when known; with
+/// `None` a model for any architecture counts.
+pub fn maxine_feature_availability(
+    compute_capability: Option<(u32, u32)>,
+) -> Option<(PathBuf, Vec<(Feature, Availability)>)> {
+    let root = obc_backend_maxine::usable_root()?;
+    let features = obc_backend_maxine::feature_availability(&root, compute_capability);
+    Some((root, features))
 }
 
 /// Whether the default effect backend can run here, with the reason if not.
@@ -274,11 +296,44 @@ mod tests {
     }
 
     #[test]
+    fn relight_needs_no_file_combines_with_every_effect_and_is_validated() {
+        for kind in [EffectKind::None, EffectKind::Blur] {
+            let s = EffectSettings {
+                relight: true,
+                denoise: kind == EffectKind::Blur,
+                relight_params: RelightParams {
+                    light: RelightLight::Warm,
+                    pan_deg: 120.0,
+                    gain: 0.75,
+                },
+                ..EffectSettings::of(kind)
+            };
+            assert!(check_settings(&s).is_ok(), "{kind}");
+        }
+        let bad = EffectSettings {
+            relight: true,
+            relight_params: RelightParams {
+                pan_deg: 200.0,
+                ..RelightParams::default()
+            },
+            ..EffectSettings::default()
+        };
+        let e = check_settings(&bad).unwrap_err().to_string();
+        assert!(e.contains("relight direction"), "{e}");
+    }
+
+    #[test]
     fn the_element_is_configured_from_the_settings() {
         gst::init().unwrap();
         let s = EffectSettings {
             blur_strength: 0.3,
             denoise: true,
+            relight: true,
+            relight_params: RelightParams {
+                light: RelightLight::Cool,
+                pan_deg: -30.0,
+                gain: 1.2,
+            },
             ..EffectSettings::of(EffectKind::Blur)
         };
         let fx = effect_element(&s, &EffectBackend::new(Arc::new(Unavailable))).unwrap();
