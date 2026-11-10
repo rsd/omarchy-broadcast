@@ -70,6 +70,7 @@ use gst::prelude::*;
 use obc_core::config::EffectConfig;
 use obc_core::{EffectMode, EffectOnFailure, ModeRequest, OutputContract, SinkSelector};
 use obc_ipc::Stats;
+use obc_pipeline::controls::ImageControls;
 use obc_pipeline::gpu::GpuSampler;
 use obc_pipeline::pipeline::names;
 use obc_pipeline::stats::{cpu_usage, online_cpus, self_cpu_ticks, ticks_per_sec};
@@ -82,8 +83,9 @@ use obc_pipeline::{
 
 use super::park::{Parker, StartError, StopFailure, StopSession};
 use super::{
-    EffectReport, EffectStatus, Failure, MediaBackend, PipeWireEvent, PipeWireGeneration,
-    PipeWireReporter, PipeWireState, PreviewReporter, PreviewRequest, SessionParams,
+    ControlNode, ControlQuery, EffectReport, EffectStatus, Failure, MediaBackend, PipeWireEvent,
+    PipeWireGeneration, PipeWireReporter, PipeWireState, PreviewReporter, PreviewRequest,
+    SessionParams,
 };
 use crate::camera::{Camera, stable_id, usb_origin};
 use crate::consumers::{NodeId, count_holders};
@@ -833,6 +835,50 @@ impl MediaBackend for GstBackend {
             reused: stats.last_load_reused,
             gpu_ms_p50: stats.gpu_ms_p50,
         })
+    }
+
+    fn open_camera_controls(
+        &mut self,
+        camera: &Camera,
+        write: bool,
+    ) -> Result<Box<dyn ControlNode>, String> {
+        let what = format!("{} ({})", camera.label(), camera.path.display());
+        let node = ImageControls::open(&camera.path, write)
+            .map_err(|e| format!("opening {what} for its image controls: {e}"))?;
+        Ok(Box::new(RealControlNode { node, what }))
+    }
+}
+
+/// A camera node opened for its image controls.
+struct RealControlNode {
+    node: ImageControls,
+    /// The camera's label and node, for the errors.
+    what: String,
+}
+
+impl ControlNode for RealControlNode {
+    fn query(&mut self) -> ControlQuery {
+        let found = self.node.query();
+        ControlQuery {
+            controls: found.controls,
+            skipped: found
+                .skipped
+                .into_iter()
+                .map(|s| (s.name.to_string(), s.error.to_string()))
+                .collect(),
+        }
+    }
+
+    fn set(&mut self, name: &str, value: i32) -> Result<(), String> {
+        self.node
+            .set(name, value)
+            .map_err(|e| format!("setting {name} to {value} on {}: {e}", self.what))
+    }
+
+    fn get(&mut self, name: &str) -> Result<i32, String> {
+        self.node
+            .get(name)
+            .map_err(|e| format!("reading {name} of {}: {e}", self.what))
     }
 }
 

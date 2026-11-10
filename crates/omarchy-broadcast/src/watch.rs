@@ -52,6 +52,9 @@ impl Printer {
             if changes.cameras {
                 out::line(&json::cameras_line(s));
             }
+            if let (true, Some(c)) = (changes.controls, &s.camera_controls) {
+                out::line(&json::controls_line(c));
+            }
         } else {
             for line in human::change_lines(s, changes) {
                 out::line(&line);

@@ -38,10 +38,15 @@ pub fn denoise(snap: &Snapshot) -> Option<bool> {
 
 /// The entry of `ActiveCamera` in `Cameras`, if it is listed.
 pub fn active_camera(snap: &Snapshot) -> Option<&CameraInfo> {
-    if snap.active_camera.is_empty() {
+    camera(snap, &snap.active_camera)
+}
+
+/// The entry of the camera `id` in `Cameras`, if it is listed.
+pub fn camera<'a>(snap: &'a Snapshot, id: &str) -> Option<&'a CameraInfo> {
+    if id.is_empty() {
         return None;
     }
-    snap.cameras.iter().find(|c| c.id == snap.active_camera)
+    snap.cameras.iter().find(|c| c.id == id)
 }
 
 /// The name of the active camera, if it is listed.
@@ -56,11 +61,14 @@ pub struct Changes {
     pub fields: Vec<&'static str>,
     /// Whether the camera list changed.
     pub cameras: bool,
+    /// Whether `CameraControls` changed (revision 6): its camera, or a
+    /// control's range, default, value or stored mark.
+    pub controls: bool,
 }
 
 impl Changes {
     pub fn is_empty(&self) -> bool {
-        self.fields.is_empty() && !self.cameras
+        self.fields.is_empty() && !self.cameras && !self.controls
     }
 }
 
@@ -94,6 +102,7 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Changes {
             .map(|(name, _)| *name)
             .collect(),
         cameras: old.cameras != new.cameras,
+        controls: old.camera_controls != new.camera_controls,
     }
 }
 
@@ -124,7 +133,8 @@ mod tests {
             diff(&old, &new),
             Changes {
                 fields: vec!["state", "consumers"],
-                cameras: false
+                cameras: false,
+                controls: false
             }
         );
 
@@ -150,7 +160,8 @@ mod tests {
                     "blur_strength",
                     "background_image"
                 ],
-                cameras: true
+                cameras: true,
+                controls: false
             }
         );
         assert_eq!(active_camera_name(&new), Some("A2"));
@@ -199,5 +210,41 @@ mod tests {
         on.denoise = true;
         assert_eq!(denoise(&on), Some(true));
         assert_eq!(diff(&rev4, &on).fields, vec!["denoise"]);
+    }
+
+    #[test]
+    fn diff_tells_a_change_of_the_camera_controls() {
+        use obc_ipc::{CameraControl, CameraControls};
+        let mut old = Snapshot::empty();
+        old.camera_controls = Some(CameraControls {
+            camera: "a".into(),
+            controls: vec![CameraControl {
+                name: "sharpness".into(),
+                min: 0,
+                max: 255,
+                step: 1,
+                default: 128,
+                value: 128,
+                stored: false,
+            }],
+        });
+        assert!(diff(&old, &old.clone()).is_empty());
+        let mut new = old.clone();
+        new.camera_controls.as_mut().unwrap().controls[0].stored = true;
+        let changes = diff(&old, &new);
+        assert_eq!(
+            changes,
+            Changes {
+                fields: Vec::new(),
+                cameras: false,
+                controls: true
+            }
+        );
+        assert!(!changes.is_empty());
+        let mut other = old.clone();
+        other.camera_controls.as_mut().unwrap().camera = "b".into();
+        assert!(diff(&old, &other).controls);
+        // From an older daemon (no property) to a newer one: a change.
+        assert!(diff(&Snapshot::empty(), &old).controls);
     }
 }

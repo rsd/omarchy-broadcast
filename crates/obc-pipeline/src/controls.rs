@@ -6,6 +6,14 @@
 //! its frame rate in dim light (a 60 fps mode can drop to 15 fps), which no
 //! pipeline can compensate for.
 //!
+//! The image controls the user may adjust ([`IMAGE_CONTROLS`]: brightness,
+//! contrast, saturation, sharpness, backlight compensation) are an
+//! allowlist, the same for every camera: [`ImageControls`] opens a node
+//! once and reports those it exposes as writable integer or boolean
+//! controls (skipping one it cannot read), writes one by name and reads one
+//! back; [`check_value`] checks a value against a control's range and
+//! step. No camera is special-cased.
+//!
 //! Every control is optional: cameras differ in what they expose. Callers
 //! probe with [`probe_ctrl`] first; an absent or disabled control is skipped,
 //! never an error.
@@ -17,6 +25,35 @@ use std::path::{Path, PathBuf};
 
 /// `V4L2_CID_EXPOSURE_AUTO_PRIORITY` (`exposure_dynamic_framerate` in v4l2-ctl).
 pub const CID_EXPOSURE_AUTO_PRIORITY: u32 = 0x009a_0903;
+/// `V4L2_CID_BRIGHTNESS`
+pub const CID_BRIGHTNESS: u32 = 0x0098_0900;
+/// `V4L2_CID_CONTRAST`
+pub const CID_CONTRAST: u32 = 0x0098_0901;
+/// `V4L2_CID_SATURATION`
+pub const CID_SATURATION: u32 = 0x0098_0902;
+/// `V4L2_CID_SHARPNESS`
+pub const CID_SHARPNESS: u32 = 0x0098_091b;
+/// `V4L2_CID_BACKLIGHT_COMPENSATION`
+pub const CID_BACKLIGHT_COMPENSATION: u32 = 0x0098_091c;
+
+/// The image controls a user may adjust, by their v4l2-ctl name, in the
+/// order they are reported: the same list for every camera. A camera
+/// exposes the subset it has ([`query_image_controls`]).
+pub const IMAGE_CONTROLS: [(&str, u32); 5] = [
+    ("brightness", CID_BRIGHTNESS),
+    ("contrast", CID_CONTRAST),
+    ("saturation", CID_SATURATION),
+    ("sharpness", CID_SHARPNESS),
+    ("backlight_compensation", CID_BACKLIGHT_COMPENSATION),
+];
+
+/// The control id of the image control `name` ([`IMAGE_CONTROLS`]).
+pub fn image_control_id(name: &str) -> Option<u32> {
+    IMAGE_CONTROLS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, id)| *id)
+}
 
 #[repr(C)]
 struct V4l2Control {
@@ -28,6 +65,14 @@ struct V4l2Control {
 pub const CTRL_FLAG_DISABLED: u32 = 0x0001;
 /// `V4L2_CTRL_FLAG_READ_ONLY`
 pub const CTRL_FLAG_READ_ONLY: u32 = 0x0004;
+/// `V4L2_CTRL_FLAG_INACTIVE`: the control's value does not apply now (a
+/// manual setting while its automatic mode is on, say).
+pub const CTRL_FLAG_INACTIVE: u32 = 0x0010;
+
+/// `V4L2_CTRL_TYPE_INTEGER`
+pub const CTRL_TYPE_INTEGER: u32 = 1;
+/// `V4L2_CTRL_TYPE_BOOLEAN`
+pub const CTRL_TYPE_BOOLEAN: u32 = 2;
 
 #[repr(C)]
 struct V4l2QueryCtrl {
@@ -54,8 +99,13 @@ pub struct CtrlInfo {
     pub name: String,
     pub minimum: i32,
     pub maximum: i32,
+    /// The distance between two valid values, from `minimum`.
+    pub step: i32,
     pub default_value: i32,
     pub flags: u32,
+    /// `V4L2_CTRL_TYPE_*` ([`CTRL_TYPE_INTEGER`], [`CTRL_TYPE_BOOLEAN`],
+    /// ...).
+    pub type_: u32,
 }
 
 impl CtrlInfo {
@@ -66,16 +116,37 @@ impl CtrlInfo {
     pub fn read_only(&self) -> bool {
         self.flags & CTRL_FLAG_READ_ONLY != 0
     }
+
+    pub fn inactive(&self) -> bool {
+        self.flags & CTRL_FLAG_INACTIVE != 0
+    }
+
+    /// Whether a user may adjust it as an image control: neither disabled,
+    /// read-only nor inactive, and an integer or a boolean.
+    pub fn adjustable(&self) -> bool {
+        !self.disabled()
+            && !self.read_only()
+            && !self.inactive()
+            && matches!(self.type_, CTRL_TYPE_INTEGER | CTRL_TYPE_BOOLEAN)
+    }
+}
+
+fn open_node(path: &Path, write: bool) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(write)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
 }
 
 /// Queries control `id`. `Ok(None)` when the device does not have it
 /// (`EINVAL`); `Err` when the node cannot be opened or the query fails
 /// otherwise.
 pub fn query_ctrl(path: &Path, id: u32) -> std::io::Result<Option<CtrlInfo>> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
+    query_ctrl_on(&open_node(path, false)?, id)
+}
+
+fn query_ctrl_on(file: &fs::File, id: u32) -> std::io::Result<Option<CtrlInfo>> {
     let mut q = V4l2QueryCtrl {
         id,
         type_: 0,
@@ -103,8 +174,10 @@ pub fn query_ctrl(path: &Path, id: u32) -> std::io::Result<Option<CtrlInfo>> {
         name: String::from_utf8_lossy(&q.name[..end]).into_owned(),
         minimum: q.minimum,
         maximum: q.maximum,
+        step: q.step,
         default_value: q.default_value,
         flags: q.flags,
+        type_: q.type_,
     }))
 }
 
@@ -151,11 +224,15 @@ const VIDIOC_G_CTRL: libc::c_ulong = (3 << 30) | (8 << 16) | ((b'V' as libc::c_u
 const VIDIOC_S_CTRL: libc::c_ulong = (3 << 30) | (8 << 16) | ((b'V' as libc::c_ulong) << 8) | 28;
 
 fn ioctl_ctrl(path: &Path, request: libc::c_ulong, id: u32, value: i32) -> std::io::Result<i32> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
+    ioctl_ctrl_on(&open_node(path, true)?, request, id, value)
+}
+
+fn ioctl_ctrl_on(
+    file: &fs::File,
+    request: libc::c_ulong,
+    id: u32,
+    value: i32,
+) -> std::io::Result<i32> {
     let mut ctrl = V4l2Control { id, value };
     // SAFETY: `ctrl` is a valid `struct v4l2_control` that outlives the call;
     // the fd is open for the duration.
@@ -174,6 +251,165 @@ pub fn get_ctrl(path: &Path, id: u32) -> std::io::Result<i32> {
 /// Sets a control. Does not start streaming or change formats.
 pub fn set_ctrl(path: &Path, id: u32, value: i32) -> std::io::Result<()> {
     ioctl_ctrl(path, VIDIOC_S_CTRL, id, value).map(|_| ())
+}
+
+/// One image control a device exposes ([`ImageControls::query`]): its
+/// range, step, default and current value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceControl {
+    /// The [`IMAGE_CONTROLS`] name (`sharpness`, ...).
+    pub name: String,
+    pub min: i32,
+    pub max: i32,
+    pub step: i32,
+    pub default: i32,
+    /// The value on the device when it was queried.
+    pub value: i32,
+}
+
+/// An image control left out of a query because its `VIDIOC_QUERYCTRL` or
+/// its `VIDIOC_G_CTRL` failed (`EIO` and `EPIPE` are common on UVC).
+#[derive(Debug)]
+pub struct SkippedControl {
+    /// The [`IMAGE_CONTROLS`] name.
+    pub name: &'static str,
+    pub error: std::io::Error,
+}
+
+/// What [`ImageControls::query`] found: the controls, and those it left
+/// out because they could not be read.
+#[derive(Debug, Default)]
+pub struct QueriedControls {
+    pub controls: Vec<DeviceControl>,
+    pub skipped: Vec<SkippedControl>,
+}
+
+/// The control id of `name`, or `InvalidInput` for a name outside the
+/// allowlist.
+fn image_control_id_or_err(name: &str) -> std::io::Result<u32> {
+    image_control_id(name).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{name:?} is not an image control"),
+        )
+    })
+}
+
+/// The image controls of one device node, opened once for any number of
+/// queries, writes and reads. Opening, querying and reading start no
+/// stream, so they may run while any application uses the camera.
+#[derive(Debug)]
+pub struct ImageControls {
+    file: fs::File,
+}
+
+impl ImageControls {
+    /// Opens the node at `path`, for writing as well when `write`.
+    pub fn open(path: &Path, write: bool) -> std::io::Result<ImageControls> {
+        Ok(ImageControls {
+            file: open_node(path, write)?,
+        })
+    }
+
+    /// The [`IMAGE_CONTROLS`] the device exposes as adjustable
+    /// ([`CtrlInfo::adjustable`]), in that order, each with its current
+    /// value. One the device does not have, or that is not adjustable, is
+    /// left out; one whose query or read fails is left out and listed in
+    /// [`QueriedControls::skipped`]. Only queries and reads: nothing is
+    /// written.
+    pub fn query(&self) -> QueriedControls {
+        collect_image_controls(
+            |id| query_ctrl_on(&self.file, id),
+            |id| ioctl_ctrl_on(&self.file, VIDIOC_G_CTRL, id, 0),
+        )
+    }
+
+    /// Writes the image control `name` ([`IMAGE_CONTROLS`]). The value is
+    /// the caller's to check ([`check_value`]); the driver may refuse it. A
+    /// name outside the allowlist is `InvalidInput`.
+    pub fn set(&self, name: &str, value: i32) -> std::io::Result<()> {
+        let id = image_control_id_or_err(name)?;
+        ioctl_ctrl_on(&self.file, VIDIOC_S_CTRL, id, value).map(|_| ())
+    }
+
+    /// Reads the image control `name` ([`IMAGE_CONTROLS`]): one
+    /// `VIDIOC_G_CTRL`.
+    pub fn get(&self, name: &str) -> std::io::Result<i32> {
+        let id = image_control_id_or_err(name)?;
+        ioctl_ctrl_on(&self.file, VIDIOC_G_CTRL, id, 0)
+    }
+}
+
+/// [`ImageControls::query`] over its two ioctls: `query` is
+/// `VIDIOC_QUERYCTRL`, `read` is `VIDIOC_G_CTRL`, each by control id. A
+/// control whose query or read fails is skipped, never the whole list.
+fn collect_image_controls(
+    mut query: impl FnMut(u32) -> std::io::Result<Option<CtrlInfo>>,
+    mut read: impl FnMut(u32) -> std::io::Result<i32>,
+) -> QueriedControls {
+    let mut out = QueriedControls::default();
+    for (name, id) in IMAGE_CONTROLS {
+        let info = match query(id) {
+            Ok(Some(info)) if info.adjustable() => info,
+            Ok(_) => continue,
+            Err(error) => {
+                out.skipped.push(SkippedControl { name, error });
+                continue;
+            }
+        };
+        match read(id) {
+            Ok(value) => out.controls.push(DeviceControl {
+                name: name.to_string(),
+                min: info.minimum,
+                max: info.maximum,
+                step: info.step,
+                default: info.default_value,
+                value,
+            }),
+            Err(error) => out.skipped.push(SkippedControl { name, error }),
+        }
+    }
+    out
+}
+
+/// The image controls of the device at `path` ([`ImageControls::query`]),
+/// without those it could not read. `Err` only when the node cannot be
+/// opened.
+pub fn query_image_controls(path: &Path) -> std::io::Result<Vec<DeviceControl>> {
+    Ok(ImageControls::open(path, false)?.query().controls)
+}
+
+/// Writes the image control `name` on the device at `path`
+/// ([`ImageControls::set`]). A name outside the allowlist is
+/// `InvalidInput`, before the node is opened.
+pub fn set_image_control(path: &Path, name: &str, value: i32) -> std::io::Result<()> {
+    image_control_id_or_err(name)?;
+    ImageControls::open(path, true)?.set(name, value)
+}
+
+/// Whether `value` is valid for `control`: within `min..=max` and a whole
+/// number of steps from `min` (a step of zero or less counts as 1). The
+/// error names the control, the value and the range.
+pub fn check_value(control: &DeviceControl, value: i32) -> Result<(), String> {
+    let (min, max, v) = (
+        i64::from(control.min),
+        i64::from(control.max),
+        i64::from(value),
+    );
+    let step = i64::from(control.step).max(1);
+    if v < min || v > max {
+        return Err(format!(
+            "{} {value} is outside its range {}..={}",
+            control.name, control.min, control.max
+        ));
+    }
+    if (v - min) % step != 0 {
+        return Err(format!(
+            "{} {value} is not a whole number of steps of {step} from {} (range {}..={})",
+            control.name, control.min, control.min, control.max
+        ));
+    }
+    Ok(())
 }
 
 /// Holds a control at a temporary value and puts the original back.
@@ -254,11 +490,190 @@ mod tests {
             name: "x".into(),
             minimum: 0,
             maximum: 1,
+            step: 1,
             default_value: 0,
             flags: CTRL_FLAG_DISABLED | CTRL_FLAG_READ_ONLY,
+            type_: CTRL_TYPE_BOOLEAN,
         };
         assert!(info.disabled() && info.read_only());
+        assert!(!info.inactive() && !info.adjustable());
         assert_eq!(CtrlSkip::Absent.to_string(), "not exposed by the device");
+    }
+
+    fn control(min: i32, max: i32, step: i32) -> DeviceControl {
+        DeviceControl {
+            name: "sharpness".into(),
+            min,
+            max,
+            step,
+            default: min,
+            value: min,
+        }
+    }
+
+    #[test]
+    fn check_value_takes_the_range_and_the_step() {
+        let c = control(0, 255, 1);
+        for v in [0, 1, 128, 254, 255] {
+            assert_eq!(check_value(&c, v), Ok(()), "{v}");
+        }
+        for v in [-1, 256, i32::MIN, i32::MAX] {
+            let e = check_value(&c, v).unwrap_err();
+            assert!(e.contains("sharpness"), "{e}");
+            assert!(e.contains(&v.to_string()), "{e}");
+            assert!(e.contains("0..=255"), "{e}");
+        }
+        // Off the step, counted from the minimum.
+        let c = control(-10, 10, 5);
+        for v in [-10, -5, 0, 5, 10] {
+            assert_eq!(check_value(&c, v), Ok(()), "{v}");
+        }
+        for v in [-9, -1, 1, 4, 9] {
+            let e = check_value(&c, v).unwrap_err();
+            assert!(e.contains("steps of 5") && e.contains("-10..=10"), "{e}");
+        }
+        let c = control(1, 9, 4);
+        assert_eq!(check_value(&c, 5), Ok(()));
+        assert!(check_value(&c, 4).is_err());
+        // A step of zero or less counts as 1.
+        for step in [0, -3, i32::MIN] {
+            let c = control(0, 3, step);
+            for v in 0..=3 {
+                assert_eq!(check_value(&c, v), Ok(()), "step {step}, {v}");
+            }
+            assert!(check_value(&c, 4).is_err());
+        }
+        // The whole i32 range, without overflow.
+        let c = control(i32::MIN, i32::MAX, i32::MAX);
+        for v in [i32::MIN, -1, i32::MAX - 1] {
+            assert_eq!(check_value(&c, v), Ok(()), "{v}");
+        }
+        assert!(check_value(&c, i32::MAX).is_err());
+        assert!(check_value(&c, 0).is_err());
+        let c = control(i32::MIN, i32::MAX, 1);
+        assert_eq!(check_value(&c, i32::MIN), Ok(()));
+        assert_eq!(check_value(&c, i32::MAX), Ok(()));
+        // An empty range (min above max) takes nothing.
+        assert!(check_value(&control(5, 4, 1), 5).is_err());
+    }
+
+    #[test]
+    fn the_image_control_allowlist() {
+        assert_eq!(
+            IMAGE_CONTROLS,
+            [
+                ("brightness", 0x0098_0900),
+                ("contrast", 0x0098_0901),
+                ("saturation", 0x0098_0902),
+                ("sharpness", 0x0098_091b),
+                ("backlight_compensation", 0x0098_091c),
+            ]
+        );
+        // The state file checks the same names.
+        let names: Vec<&str> = IMAGE_CONTROLS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, obc_core::config::CAMERA_CONTROL_NAMES);
+        assert_eq!(image_control_id("sharpness"), Some(CID_SHARPNESS));
+        assert_eq!(image_control_id("exposure_dynamic_framerate"), None);
+        assert_eq!(image_control_id("Sharpness"), None);
+        assert_eq!(std::mem::size_of::<V4l2QueryCtrl>(), 68);
+    }
+
+    #[test]
+    fn adjustable_controls_are_writable_integers_or_booleans() {
+        let info = |type_, flags| CtrlInfo {
+            name: "x".into(),
+            minimum: 0,
+            maximum: 255,
+            step: 1,
+            default_value: 128,
+            flags,
+            type_,
+        };
+        assert!(info(CTRL_TYPE_INTEGER, 0).adjustable());
+        assert!(info(CTRL_TYPE_BOOLEAN, 0).adjustable());
+        // V4L2_CTRL_FLAG_SLIDER (0x20) does not matter.
+        assert!(info(CTRL_TYPE_INTEGER, 0x20).adjustable());
+        for flags in [CTRL_FLAG_DISABLED, CTRL_FLAG_READ_ONLY, CTRL_FLAG_INACTIVE] {
+            assert!(!info(CTRL_TYPE_INTEGER, flags).adjustable(), "{flags:#x}");
+        }
+        // Menu (3), button (4), integer64 (5).
+        for type_ in [3, 4, 5] {
+            assert!(!info(type_, 0).adjustable(), "type {type_}");
+        }
+    }
+
+    #[test]
+    fn image_controls_of_a_missing_node_are_an_error() {
+        let missing = Path::new("/nonexistent/obc-no-such-video-node");
+        assert!(query_image_controls(missing).is_err());
+        assert!(set_image_control(missing, "sharpness", 128).is_err());
+        let e = set_image_control(missing, "zoom_absolute", 1).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(ImageControls::open(missing, false).is_err());
+    }
+
+    #[test]
+    fn a_control_that_cannot_be_queried_or_read_is_skipped_not_the_list() {
+        let errno = |n| std::io::Error::from_raw_os_error(n);
+        let adjustable = |flags| CtrlInfo {
+            name: "x".into(),
+            minimum: 0,
+            maximum: 255,
+            step: 1,
+            default_value: 128,
+            flags,
+            type_: CTRL_TYPE_INTEGER,
+        };
+        let mut queried = Vec::new();
+        let mut read = Vec::new();
+        let got = collect_image_controls(
+            |id| {
+                queried.push(id);
+                match id {
+                    CID_BRIGHTNESS => Err(errno(libc::EIO)),
+                    CID_CONTRAST => Ok(None),
+                    CID_BACKLIGHT_COMPENSATION => Ok(Some(adjustable(CTRL_FLAG_READ_ONLY))),
+                    _ => Ok(Some(adjustable(0))),
+                }
+            },
+            |id| {
+                read.push(id);
+                match id {
+                    CID_SATURATION => Err(errno(libc::EPIPE)),
+                    _ => Ok(7),
+                }
+            },
+        );
+        // Every control is tried; only the adjustable ones are read.
+        assert_eq!(queried, IMAGE_CONTROLS.map(|(_, id)| id));
+        assert_eq!(read, [CID_SATURATION, CID_SHARPNESS]);
+        assert_eq!(
+            got.controls,
+            [DeviceControl {
+                name: "sharpness".into(),
+                min: 0,
+                max: 255,
+                step: 1,
+                default: 128,
+                value: 7,
+            }]
+        );
+        let skipped: Vec<(&str, Option<i32>)> = got
+            .skipped
+            .iter()
+            .map(|s| (s.name, s.error.raw_os_error()))
+            .collect();
+        assert_eq!(
+            skipped,
+            [
+                ("brightness", Some(libc::EIO)),
+                ("saturation", Some(libc::EPIPE))
+            ]
+        );
+        // Nothing failing: everything, nothing skipped.
+        let all = collect_image_controls(|_| Ok(Some(adjustable(0))), |_| Ok(1));
+        assert_eq!(all.controls.len(), 5);
+        assert!(all.skipped.is_empty());
     }
 
     #[test]

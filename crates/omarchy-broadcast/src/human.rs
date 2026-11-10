@@ -1,17 +1,17 @@
-//! Human-readable output: `status`, `cameras`, `effect`, the results of
-//! `on`, `off`, `camera`, `effect ...` and `denoise ...`, and the lines of
-//! `watch` without `--json`.
+//! Human-readable output: `status`, `cameras`, `effect`, `controls`, the
+//! results of `on`, `off`, `camera`, `effect ...`, `denoise ...` and
+//! `controls set|reset`, and the lines of `watch` without `--json`.
 //!
 //! Every string that comes from the daemon (camera names and ids, the
 //! error, the output mode, the effect, the background image, the PipeWire
-//! output's state) goes through
+//! output's state, the names of image controls) goes through
 //! [`printable`] before it reaches the terminal, so a crafted file or camera
 //! name cannot send it control sequences or reorder the text around it.
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
-use obc_ipc::{Snapshot, Stats};
+use obc_ipc::{CameraControl, CameraControls, Snapshot, State, Stats};
 
 use crate::model::{self, Changes};
 
@@ -50,11 +50,16 @@ fn yes_no(b: bool) -> &'static str {
 /// The active camera as a label: its name and `vid:pid`, its id if it is not
 /// listed, or `none`.
 pub fn camera_label(s: &Snapshot) -> String {
-    match model::active_camera(s) {
+    camera_label_of(s, &s.active_camera)
+}
+
+/// The camera `id` as a label, as [`camera_label`] gives the active one.
+fn camera_label_of(s: &Snapshot, id: &str) -> String {
+    match model::camera(s, id) {
         Some(c) if c.usb.is_empty() => printable(&c.name).into_owned(),
         Some(c) => format!("{} ({})", printable(&c.name), printable(&c.usb)),
-        None if s.active_camera.is_empty() => "none".into(),
-        None => printable(&s.active_camera).into_owned(),
+        None if id.is_empty() => "none".into(),
+        None => printable(id).into_owned(),
     }
 }
 
@@ -195,6 +200,80 @@ pub fn cameras_text(s: &Snapshot) -> String {
     out
 }
 
+/// An image control's range: `min..max`, with the step when it is not 1.
+fn control_range(c: &CameraControl) -> String {
+    if c.step > 1 {
+        format!("{}..{} step {}", c.min, c.max, c.step)
+    } else {
+        format!("{}..{}", c.min, c.max)
+    }
+}
+
+/// `controls`, and the result of `controls set|reset`: the camera, one line
+/// per image control of `c` (name, value, range, default, and `(stored)`
+/// for a value the user set), then whether a change applies now: only
+/// while the camera is open (`starting` or `active`).
+pub fn controls_text(s: &Snapshot, c: &CameraControls) -> String {
+    let mut out = format!("Camera:     {}\n", camera_label_of(s, &c.camera));
+    if c.controls.is_empty() {
+        out.push_str("No image controls.\n");
+    }
+    struct Row<'a> {
+        name: Cow<'a, str>,
+        value: String,
+        range: String,
+        default: String,
+        stored: bool,
+    }
+    let rows: Vec<Row<'_>> = c
+        .controls
+        .iter()
+        .map(|c| Row {
+            name: printable(&c.name),
+            value: c.value.to_string(),
+            range: control_range(c),
+            default: c.default.to_string(),
+            stored: c.stored,
+        })
+        .collect();
+    let width = |f: fn(&Row<'_>) -> usize| rows.iter().map(f).max().unwrap_or(0);
+    let name_w = width(|r| r.name.chars().count());
+    let value_w = width(|r| r.value.len());
+    let range_w = width(|r| r.range.len());
+    let default_w = width(|r| r.default.len());
+    for r in &rows {
+        let mark = if r.stored { "  (stored)" } else { "" };
+        let line = format!(
+            "  {:<name_w$}  {:>value_w$}  {:<range_w$}  default {:<default_w$}{mark}",
+            r.name, r.value, r.range, r.default
+        );
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out.push_str(if matches!(s.state, State::Active | State::Starting) {
+        "Applied live.\n"
+    } else {
+        "The camera is not in use: changes apply the next time it opens.\n"
+    });
+    out
+}
+
+/// `watch`: the image controls of the active camera, after a change.
+pub fn controls_change_line(c: &CameraControls) -> String {
+    if c.controls.is_empty() {
+        return "camera controls: none".into();
+    }
+    let list: Vec<String> = c
+        .controls
+        .iter()
+        .map(|c| {
+            let mark = if c.stored { " (stored)" } else { "" };
+            format!("{} {}{mark}", printable(&c.name), c.value)
+        })
+        .collect();
+    format!("camera controls: {}", list.join(", "))
+}
+
 /// After `on` / `off`.
 pub fn enabled_text(s: &Snapshot) -> String {
     format!(
@@ -285,6 +364,9 @@ pub fn change_lines(s: &Snapshot, changes: &Changes) -> Vec<String> {
             format!("cameras: {}", names.join(", "))
         });
     }
+    if let (true, Some(c)) = (changes.controls, &s.camera_controls) {
+        lines.push(controls_change_line(c));
+    }
     lines
 }
 
@@ -341,6 +423,7 @@ mod tests {
             pipewire_output: "off".into(),
             // Before noise removal: the outputs without it.
             denoise: false,
+            camera_controls: None,
             interface_revision: 3,
         }
     }
@@ -403,6 +486,7 @@ mod tests {
         let changes = Changes {
             fields: vec!["preview_consumers"],
             cameras: false,
+            controls: false,
         };
         assert_eq!(change_lines(&s, &changes), ["preview consumers: 0"]);
     }
@@ -561,6 +645,72 @@ mod tests {
         );
     }
 
+    fn controls() -> CameraControls {
+        let control = |name: &str, min, max, step, default, value, stored| CameraControl {
+            name: String::from(name),
+            min,
+            max,
+            step,
+            default,
+            value,
+            stored,
+        };
+        CameraControls {
+            camera: "usb-1234_abcd".into(),
+            controls: vec![
+                control("brightness", -64, 64, 1, 0, -10, true),
+                control("saturation", 0, 100, 2, 50, 50, false),
+                control("sharpness", 0, 255, 1, 128, 200, true),
+            ],
+        }
+    }
+
+    #[test]
+    fn controls_list_values_ranges_defaults_and_where_a_change_applies() {
+        let mut s = sample();
+        let c = controls();
+        assert_eq!(
+            controls_text(&s, &c),
+            "Camera:     First Camera (1234:abcd)\n  \
+             brightness  -10  -64..64        default 0    (stored)\n  \
+             saturation   50  0..100 step 2  default 50\n  \
+             sharpness   200  0..255         default 128  (stored)\n\
+             The camera is not in use: changes apply the next time it opens.\n"
+        );
+        // The camera is open from `starting` on: a change reaches it then.
+        for state in [State::Starting, State::Active] {
+            s.state = state;
+            assert!(
+                controls_text(&s, &c).ends_with("(stored)\nApplied live.\n"),
+                "{}",
+                controls_text(&s, &c)
+            );
+        }
+        // An unlisted camera by its id; no control at all.
+        let none = CameraControls {
+            camera: "platform-video9".into(),
+            controls: Vec::new(),
+        };
+        assert_eq!(
+            controls_text(&s, &none),
+            "Camera:     platform-video9\nNo image controls.\nApplied live.\n"
+        );
+        // `watch`: one line for a change.
+        assert_eq!(
+            controls_change_line(&c),
+            "camera controls: brightness -10 (stored), saturation 50, sharpness 200 (stored)"
+        );
+        assert_eq!(controls_change_line(&none), "camera controls: none");
+        let old = s.clone();
+        let mut new = s.clone();
+        new.camera_controls = Some(c.clone());
+        assert_eq!(
+            change_lines(&new, &model::diff(&old, &new)),
+            vec![controls_change_line(&c)]
+        );
+        assert!(change_lines(&new, &model::diff(&new, &new)).is_empty());
+    }
+
     #[test]
     fn printable_escapes_control_and_bidi_characters() {
         assert!(matches!(printable("/home/u/bg é 🎥.png"), Cow::Borrowed(_)));
@@ -614,6 +764,13 @@ mod tests {
         texts.extend(change_lines(&new, &model::diff(&old, &new)));
         new.active_camera = "unlisted\u{1b}[0m".into();
         texts.push(camera_label(&new));
+        let mut c = controls();
+        c.controls[0].name = format!("bright{evil}");
+        c.camera = format!("cam{evil}");
+        texts.push(controls_text(&s, &c));
+        texts.push(controls_change_line(&c));
+        new.camera_controls = Some(c);
+        texts.extend(change_lines(&new, &model::diff(&old, &new)));
         for text in &texts {
             // Only the line ends this module writes itself.
             let body = text.trim_end_matches('\n');

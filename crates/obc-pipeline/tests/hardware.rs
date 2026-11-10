@@ -13,7 +13,9 @@
 //!   `obc-bench --camera`: a card-name substring, a USB `vid:pid`
 //!   (`hhhh:hhhh`), or a `/dev/videoN` path. The camera tests fail when it is
 //!   unset. The control tests need a camera whose
-//!   `exposure_dynamic_framerate` control is writable.
+//!   `exposure_dynamic_framerate` control is writable;
+//!   `image_controls_query_write_and_read_back` one that exposes at least
+//!   one image control, and it leaves every image control at its default.
 //! * `OBC_TEST_CAMERA_2` (optional): a second camera for the switching test,
 //!   same forms. Unset, that test switches between two openings of
 //!   `OBC_TEST_CAMERA`.
@@ -233,6 +235,112 @@ fn control_guard_restores_on_drop_and_unwind() {
         get_ctrl(&path, CID_EXPOSURE_AUTO_PRIORITY).unwrap(),
         original
     );
+}
+
+/// Writes every image control of a camera its default when dropped: also
+/// when an assertion fails partway through the test.
+struct ImageDefaults {
+    path: std::path::PathBuf,
+    controls: Vec<obc_pipeline::controls::DeviceControl>,
+}
+
+impl Drop for ImageDefaults {
+    fn drop(&mut self) {
+        for c in &self.controls {
+            if let Err(e) =
+                obc_pipeline::controls::set_image_control(&self.path, &c.name, c.default)
+            {
+                eprintln!(
+                    "could not put {} of {} back to its default {}: {e}",
+                    c.name,
+                    self.path.display(),
+                    c.default
+                );
+            }
+        }
+    }
+}
+
+/// The image controls of the allowlist: queried (each within its range,
+/// in allowlist order), one written to another valid value and read back,
+/// then every control written its default and read back. Needs no stream.
+/// The defaults are written at the end, also when the test fails.
+#[test]
+#[ignore = "needs OBC_TEST_CAMERA attached"]
+fn image_controls_query_write_and_read_back() {
+    use obc_pipeline::controls::{
+        IMAGE_CONTROLS, check_value, image_control_id, query_image_controls, set_image_control,
+    };
+    init();
+    let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
+    let sel = test_camera();
+    let (camera, _) = select_with(&sel, &test_mode(), DiscoveryRoute::Auto);
+    let path = camera.path.clone();
+    let found = query_image_controls(&path)
+        .unwrap_or_else(|e| panic!("querying the image controls of {camera}: {e}"));
+    eprintln!("{camera}: {found:?}");
+    assert!(
+        !found.is_empty(),
+        "this test needs a camera exposing at least one of the image controls {:?}; {camera} \
+         exposes none: choose another OBC_TEST_CAMERA",
+        IMAGE_CONTROLS.map(|(n, _)| n)
+    );
+    let order: Vec<usize> = found
+        .iter()
+        .map(|c| {
+            IMAGE_CONTROLS
+                .iter()
+                .position(|(n, _)| *n == c.name)
+                .unwrap()
+        })
+        .collect();
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+    for c in &found {
+        assert!(c.min <= c.max, "{c:?}");
+        assert_eq!(check_value(c, c.default), Ok(()), "{c:?}");
+        assert!((c.min..=c.max).contains(&c.value), "{c:?}");
+    }
+    let _defaults = ImageDefaults {
+        path: path.clone(),
+        controls: found.clone(),
+    };
+    let read = |name: &str| {
+        obc_pipeline::controls::get_ctrl(&path, image_control_id(name).unwrap()).unwrap()
+    };
+
+    // A wide control (sharpness if the camera has it): another valid
+    // value, read back.
+    let c = found
+        .iter()
+        .find(|c| c.name == "sharpness")
+        .or_else(|| {
+            found
+                .iter()
+                .max_by_key(|c| i64::from(c.max) - i64::from(c.min))
+        })
+        .unwrap();
+    let step = c.step.max(1);
+    let other = if c.default.checked_add(step).is_some_and(|v| v <= c.max) {
+        c.default + step
+    } else {
+        c.default - step
+    };
+    assert_eq!(check_value(c, other), Ok(()), "{c:?} {other}");
+    set_image_control(&path, &c.name, other).unwrap();
+    assert_eq!(read(&c.name), other, "{} read back", c.name);
+    let now = query_image_controls(&path).unwrap();
+    assert_eq!(
+        now.iter().find(|n| n.name == c.name).map(|n| n.value),
+        Some(other)
+    );
+
+    // Every default, read back.
+    for c in &found {
+        set_image_control(&path, &c.name, c.default).unwrap();
+    }
+    for c in &found {
+        assert_eq!(read(&c.name), c.default, "{} default", c.name);
+    }
 }
 
 /// Puts a camera control back to the value it had when the test found it,

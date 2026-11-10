@@ -15,6 +15,9 @@
 | `omarchy-broadcast effect` | Prints the video effect, the blur strength, the background image and, from interface revision 4, noise removal (`Effect`, `BlurStrength`, `BackgroundImage`, `Denoise`). Never starts the daemon. | One `snapshot` object. |
 | `omarchy-broadcast effect none\|blur\|replace [--strength X] [--image PATH]` | Selects the video effect (`SetEffect`), then prints the resulting settings. See [Effect](#effect). | No. |
 | `omarchy-broadcast denoise on\|off` | Turns video noise removal on or off (`SetDenoise`), then prints the resulting setting. See [Noise removal](#noise-removal). | No. |
+| `omarchy-broadcast controls [--json]` | Prints the image controls of the active camera (brightness, contrast, saturation, sharpness, backlight compensation, those the camera has) with each value, range and default. Never starts the daemon. See [Camera image controls](#camera-image-controls). | One `controls` object. |
+| `omarchy-broadcast controls set NAME VALUE` | Sets an image control of the active camera (`SetCameraControl`), then prints the controls read back. | No. |
+| `omarchy-broadcast controls reset` | Forgets the values stored for the active camera and puts every control back to the camera's default (`ResetCameraControls`), then prints the controls. | No. |
 | `omarchy-broadcast preview [--json] [--fps 15\|30]` | Holds a live preview lease on the daemon and prints a line for each frame it writes, until interrupted. See [Preview](#preview). | One object per line (NDJSON). |
 | `omarchy-broadcast watch` | Follows the daemon: a summary when it connects, then a line for each change and each `Stats` signal (about once per second while `active`), until interrupted. | One object per line (NDJSON). |
 
@@ -65,6 +68,37 @@ Denoise:    on
 - Noise removal fails open: if the stage cannot run, the stream continues without it and the daemon's `Error` text (shown by `status`) says why. The command itself succeeds, because the setting was applied.
 - In `watch` without `--json`, the summary line gains ` | denoise on` and a change prints a `denoise: on` (or `off`) line, both from revision 4.
 
+## Camera image controls
+
+`omarchy-broadcast controls` shows and changes the image controls of the active camera ([dbus-api.md](dbus-api.md#camera-image-controls), [ADR-0020](adr/0020-camera-image-controls.md)): `brightness`, `contrast`, `saturation`, `sharpness` and `backlight_compensation`, those the camera has. Some cameras keep controls set by other software far from their defaults (an oversharpened, oversaturated picture); this is how a user adjusts them or puts them back, per camera. The daemon stores what the user sets and gives it to the camera whenever the camera opens.
+
+```text
+omarchy-broadcast controls [--json]
+omarchy-broadcast controls set NAME VALUE
+omarchy-broadcast controls reset
+```
+
+Without a subcommand it prints one line per control, with its value, range and default, `(stored)` marking a value the user set:
+
+```text
+Camera:     Logitech MX Brio (046d:0944)
+  brightness  128  0..255  default 128
+  contrast     77  0..255  default 128  (stored)
+  sharpness   255  0..255  default 128
+Applied live.
+```
+
+- **Where a change applies.** The last line says it: `Applied live.` while the daemon's state is `starting` or `active`, when the daemon has the camera open and writes the value to it at once; otherwise `The camera is not in use: changes apply the next time it opens.`, because the daemon leaves a closed camera untouched and only stores the value. A step other than 1 is shown (`0..100 step 2`). With no camera, or a camera that exposes none of the controls, the output is `No image controls.`
+- `set NAME VALUE` takes one of the five names (any other is a usage error, status `2`) and a whole number, negative ones included (`controls set brightness -10`). The daemon checks the value against the range and the step the camera reports; one outside them is rejected with status `1` and the daemon's message on stderr, as is a control the camera does not have. On success the command prints the controls as read back, so a value the driver rounded shows as it is.
+- `reset` forgets the stored values of the camera and writes every control its default: at once while the camera is open, else when it next opens.
+- `--json` is accepted without a subcommand only; with `set` or `reset` it is a usage error (status `2`).
+- The values persist across restarts of the daemon, for each camera; they are kept in the daemon's state file.
+- Reading never starts the daemon and gives up after 5 s, like `status`. `set` and `reset` may start it through D-Bus activation, like the other setters, and give up after 30 s.
+- Against a daemon of interface revision 5 or lower the command prints `omarchy-broadcast: the daemon does not support camera controls (its interface revision is N, camera controls need 6); update omarchy-broadcastd` and exits with status `1`; `controls --json` prints an `error` line with the code `unsupported-daemon` instead.
+- If `set` or `reset` was accepted but reading the controls back failed, the command says so on stderr (`the change was made, but reading the controls back failed: ...`) and exits with the status of that failure.
+- In `watch` without `--json`, a change of the controls prints a `camera controls: brightness 128, contrast 77 (stored)` line.
+- Strings that come from the daemon are escaped in the human-readable output, as for `effect`.
+
 ## Preview
 
 `omarchy-broadcast preview` holds a live preview lease ([dbus-api.md](dbus-api.md#live-preview), [ADR-0019](adr/0019-live-preview.md)) and prints one line per frame the daemon writes, until it is interrupted. It is how a client that cannot speak D-Bus, such as the bar plugin, gets a preview of the virtual camera: the frames are JPEG files, and the lines say when to read them.
@@ -86,8 +120,8 @@ omarchy-broadcast preview [--json] [--fps 15|30]
 
 ## Starting the daemon
 
-- `status`, `cameras`, `watch`, `preview` and `effect` without an effect never start the daemon. They read the properties with `org.freedesktop.DBus.Properties.GetAll` carrying the `NO_AUTO_START` flag, so looking at the daemon never launches it. This is the read that the `obc-ipc` crate provides to Rust clients (`Snapshot::fetch_no_autostart`); [dbus-api.md](dbus-api.md#service-presence-and-activation) gives the `busctl` and `gdbus` equivalents.
-- `on`, `off`, `camera`, `effect <effect>` and `denoise` call methods without that flag: when the D-Bus activation file `br.com.dias.OmarchyBroadcast.service` is installed, the call starts the daemon, as `systemctl --user start omarchy-broadcastd` would. `off` on a stopped daemon therefore starts it and records the privacy state, which persists across restarts. Without an activation file, or if the start fails, the command reports that the daemon is not running.
+- `status`, `cameras`, `watch`, `preview`, `effect` without an effect and `controls` without a subcommand never start the daemon. They read the properties with `org.freedesktop.DBus.Properties.GetAll` carrying the `NO_AUTO_START` flag, so looking at the daemon never launches it (`controls` also calls `GetCameraControls` with that flag). This is the read that the `obc-ipc` crate provides to Rust clients (`Snapshot::fetch_no_autostart`); [dbus-api.md](dbus-api.md#service-presence-and-activation) gives the `busctl` and `gdbus` equivalents.
+- `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set` and `controls reset` call methods without that flag: when the D-Bus activation file `br.com.dias.OmarchyBroadcast.service` is installed, the call starts the daemon, as `systemctl --user start omarchy-broadcastd` would. `off` on a stopped daemon therefore starts it and records the privacy state, which persists across restarts. Without an activation file, or if the start fails, the command reports that the daemon is not running.
 
 When the daemon is not running, the human-readable commands print one line to stderr, for example:
 
@@ -100,19 +134,19 @@ omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.O
 | Status | Meaning |
 |---|---|
 | `0` | Success. Also the status of `watch` when it ends on `SIGTERM`, `SIGINT`, `SIGPIPE` or a closed stdout, and of `preview` when it ends on `SIGTERM`, `SIGINT`, `SIGHUP`, `SIGPIPE` or a closed stdout. |
-| `1` | The daemon rejected the request: one of the `br.com.dias.OmarchyBroadcast1.Error` errors (`NoSuchCamera`, `InvalidConfig`, `Unavailable`, `InvalidArgument`, `Failed`), or the daemon does not support the request (`effect` against interface revision 1, `denoise` against a revision below 4). Its message is printed to stderr. |
+| `1` | The daemon rejected the request: one of the `br.com.dias.OmarchyBroadcast1.Error` errors (`NoSuchCamera`, `InvalidConfig`, `Unavailable`, `InvalidArgument`, `Failed`), or the daemon does not support the request (`effect` against interface revision 1, `denoise` against a revision below 4, `controls` against a revision below 6). Its message is printed to stderr. |
 | `2` | Invalid command line. |
 | `3` | The daemon is not running (its name has no owner, or D-Bus could not start it), or there is no D-Bus session bus. |
 | `4` | Any other D-Bus failure (an unexpected reply, a lost connection), a timeout, or a failed write to stdout. |
 
-`status` and `cameras` give up after 5 s, and `on`, `off`, `camera`, `effect <effect>` and `denoise` after 30 s (time for the daemon to be started), with status `4`. `watch` gives each read of the properties 5 s as well (see [Daemon absent or gone](#daemon-absent-or-gone)). `omarchy-broadcast --help` lists the exit statuses.
+`status`, `cameras` and `controls` give up after 5 s, and `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set` and `controls reset` after 30 s (time for the daemon to be started), with status `4`. `watch` gives each read of the properties 5 s as well (see [Daemon absent or gone](#daemon-absent-or-gone)). `omarchy-broadcast --help` lists the exit statuses.
 
 ## JSON output
 
 ### General rules
 
 - Every object is printed on one line, terminated by `\n`, in UTF-8. `watch --json` flushes stdout after every line.
-- Every object has the field **`v`**, the schema version (an integer, `1` in this version), and the field **`type`**, a string naming the line type: `snapshot`, `state`, `cameras`, `stats`, `preview`, `frame` or `error`.
+- Every object has the field **`v`**, the schema version (an integer, `1` in this version), and the field **`type`**, a string naming the line type: `snapshot`, `state`, `cameras`, `controls`, `stats`, `preview`, `frame` or `error`.
 - The order of the fields within an object is not significant.
 - A client must ignore fields it does not know, and lines whose `type` it does not know.
 - **Line length.** No line is longer than **4096 bytes**, newline excluded. To guarantee it, strings are bounded in bytes of their JSON encoding (escapes included). A longer string is cut at a character boundary and ends with the ellipsis character `…` (U+2026); the result is always valid JSON. The bounds:
@@ -126,9 +160,12 @@ omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.O
   | `output_mode` | 64 |
   | `effect` | 32 |
   | `background_image` | 256 |
+| image control `name` | 32 |
 
-- **Clipping of a path.** `error` and the other strings keep their beginning and lose their end. `background_image` is the exception: the end of a path, the file name, is what identifies it, so a path over the bound is clipped at the **start** and begins with `…` (for example `…/Pictures/office/background-2026.jpg`). The bound is 256 bytes, not 512 as for `error`, because a line that carries twelve cameras and a long path must stay within the 4096-byte cap. Do not use a clipped path as an argument: read it back from the daemon.
+- **Clipping of a path.** `error` and the other strings keep their beginning and lose their end. `background_image` is the exception: the end of a path, the file name, is what identifies it, so a path over the bound is clipped at the **start** and begins with `…` (for example `…/Pictures/office/background-2026.jpg`). The bound is 256 bytes, not 512 as for `error`, because a line that carries many cameras and a long path must stay within the 4096-byte cap. Do not use a clipped path as an argument: read it back from the daemon.
 - **Camera list.** At most **12** cameras are listed; `cameras_truncated` is `true` when the daemon reported more. The list keeps the daemon's order, so the first 12 are listed. A clipped camera id can no longer be passed to `omarchy-broadcast camera`; real ids are far shorter than the bound.
+- **Control list.** At most **16** image controls are listed; `controls_truncated` is `true` when the daemon reported more (a daemon reports at most five). The names are bounded as in the table above.
+- **A `snapshot` over the cap.** Twelve cameras with every string at its bound, and image controls with theirs, do not fit 4096 bytes together. Strings at those bounds do not occur in practice, but the guarantee holds: an over-cap `snapshot` gives up its controls first, one at a time (`controls` ends empty and `controls_truncated` is `true`), and only then its cameras (`cameras_truncated` is `true`). With realistic ids and names, twelve cameras and the controls fit.
 
 ### State strings
 
@@ -160,6 +197,7 @@ Every property of the daemon at one moment. Printed by `status --json`, and by `
 | `interface_revision` | number | Revision of `br.com.dias.OmarchyBroadcast1` the daemon implements. |
 | `cameras` | array | The cameras present, in the daemon's order, as camera objects (below). |
 | `cameras_truncated` | boolean | `true` if more cameras were present than listed. |
+| `camera_controls` | object or null | The image controls of the active camera, as in the [`controls`](#controls) line without its `v` and `type`: `camera`, `controls` and `controls_truncated`. `null`, with the key present, from a daemon below interface revision 6. |
 
 A **camera object**:
 
@@ -180,7 +218,7 @@ Printed by `watch --json` when one or more of the scalar fields change. It carri
 | `changed` | array of strings | The fields whose value changed, from: `state`, `enabled`, `error`, `active_camera`, `active_camera_name`, `consumers`, `loopback_consumers`, `pipewire_consumers`, `preview_consumers`, `pipewire_output`, `output_mode`, `effect`, `blur_strength`, `background_image`, `denoise`, `interface_revision`. Never empty. |
 | `state`, `enabled`, `error`, `active_camera`, `active_camera_name`, `consumers`, `loopback_consumers`, `pipewire_consumers`, `preview_consumers`, `pipewire_output`, `output_mode`, `effect`, `blur_strength`, `background_image`, `denoise`, `interface_revision` | | As in `snapshot`, current values. |
 
-A `state` line does not carry the camera list. `active_camera_name` can change without `active_camera` (the active camera was renamed, or appeared in or left the list); it is then reported in `changed` on its own.
+A `state` line does not carry the camera list or `camera_controls`. `active_camera_name` can change without `active_camera` (the active camera was renamed, or appeared in or left the list); it is then reported in `changed` on its own.
 
 ### `cameras`
 
@@ -193,7 +231,31 @@ The camera list. Printed by `cameras --json`, and by `watch --json` when the lis
 | `cameras` | array | Camera objects, as in `snapshot`. |
 | `cameras_truncated` | boolean | As in `snapshot`. |
 
-When the daemon announces changes to scalar fields and to the camera list in one notification (for example when the active camera is unplugged), `watch --json` prints the `state` line first, then the `cameras` line.
+When the daemon announces changes to scalar fields and to the camera list in one notification (for example when the active camera is unplugged), `watch --json` prints the `state` line first, then the `cameras` line, then the `controls` line if the controls changed too.
+
+### `controls`
+
+The image controls of one camera. Printed by `controls --json`, and by `watch --json` when the controls of the active camera change.
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `v`, `type` | | `1`, `"controls"`. |
+| `camera` | string | Id of the camera the controls belong to: the active camera. `""` when there is none. Bounded like a camera `id`. |
+| `controls` | array | The controls the camera has, in the order brightness, contrast, saturation, sharpness, backlight_compensation, as control objects (below). Empty with no camera, or when the camera exposes none. |
+| `controls_truncated` | boolean | `true` if more controls were present than listed. |
+
+A **control object**:
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `name` | string | The control's name as `v4l2-ctl` calls it: `brightness`, `contrast`, `saturation`, `sharpness` or `backlight_compensation`. |
+| `min`, `max` | number | The range the camera reports (integers, negative values possible). |
+| `step` | number | The distance between two valid values, counted from `min`. A value must be on it to be accepted. |
+| `default` | number | The camera's own default. |
+| `value` | number | For the camera that is open (state `starting` or `active`), the value on the device. Otherwise the value it will be given when it opens: the user's stored value, else the default if a reset is pending, else the value on the device. |
+| `stored` | boolean | `true` if the user set a value for this control; the daemon gives it to the camera whenever it opens. |
+
+`watch --json` prints a `controls` line when the property that carries them changes: the camera, or a control's range, default, value or `stored`. The daemon refreshes the controls when the active camera changes, when the cameras are rescanned, when the camera opens, once at its first frame, and after a set or reset; it does not poll the device, so a value changed by other software shows at the next of those moments.
 
 ### `stats`
 
@@ -237,17 +299,17 @@ The `path` of these two lines is never clipped, unlike the other strings (see [G
 | Field | JSON type | Meaning |
 |---|---|---|
 | `v`, `type` | | `1`, `"error"`. |
-| `code` | string | `"daemon-not-running"`: the daemon is not running, or there is no D-Bus session bus. `"dbus-error"`: any other failure to talk to the daemon (an unexpected reply, a lost connection, a timeout). `"unsupported-daemon"`: the daemon is too old for the request (`preview` needs interface revision 5); printed by `preview --json` only. `"preview-path-too-long"`: the daemon's frame path does not fit a line; printed by `preview --json` only. New codes may be added; treat an unknown code like `"dbus-error"`. |
+| `code` | string | `"daemon-not-running"`: the daemon is not running, or there is no D-Bus session bus. `"dbus-error"`: any other failure to talk to the daemon (an unexpected reply, a lost connection, a timeout). `"unsupported-daemon"`: the daemon is too old for the request (`preview` needs interface revision 5, `controls` needs 6); printed by `preview --json` and `controls --json` only. `"preview-path-too-long"`: the daemon's frame path does not fit a line; printed by `preview --json` only. New codes may be added; treat an unknown code like `"dbus-error"`. |
 | `error` | string | A one-line explanation for people. Match on `code`, never on this text. |
 
-`status --json` and `cameras --json` print an `error` object instead of their usual one when they fail to read the daemon, and exit with the status of the failure (`3` or `4`).
+`status --json`, `cameras --json` and `controls --json` print an `error` object instead of their usual one when they fail to read the daemon, and exit with the status of the failure (`3` or `4`).
 
 ## `watch --json`
 
 The output is a stream of the line types above:
 
 1. A `snapshot` line, once the daemon has been read. The subscriptions to its signals are made before the read, so no change is lost in between.
-2. Then, as events arrive (no polling): a `state` line per change of the scalar fields, a `cameras` line per change of the camera list, and a `stats` line per `Stats` signal. A change notification that changes no value prints nothing.
+2. Then, as events arrive (no polling): a `state` line per change of the scalar fields, a `cameras` line per change of the camera list, a `controls` line per change of the image controls of the active camera (from a daemon of interface revision 6), and a `stats` line per `Stats` signal. A change notification that changes no value prints nothing.
 
 ### Daemon absent or gone
 
@@ -286,10 +348,11 @@ A client treats `"active":false`, and any `error` line, as "no frames now", and 
 - **`v` stays 1 for the PipeWire fields.** `loopback_consumers`, `pipewire_consumers` and `pipewire_output` are new fields in existing line types, and `changed` may name them. `consumers` keeps its type; with the PipeWire output off it has the value it had before. Against a daemon of interface revision 2 or lower the fields are still printed, with the values of a daemon that has no PipeWire output (`loopback_consumers` equal to `consumers`, `pipewire_consumers` 0, `pipewire_output` `"off"`).
 - **`v` stays 1 for `denoise`.** It is a new field in the existing `snapshot` and `state` lines, and `changed` may name it. It differs from the earlier additions in one respect: against a daemon of interface revision 3 or lower the key is still printed, but its value is `null`, not a default, because "off" would claim a setting the daemon does not have. A client that treats a missing or `null` value as "not available" is correct for both. `true` and `false` mean the daemon reports the setting.
 - **`v` stays 1 for the preview.** `preview_consumers` is a new field in the existing `snapshot` and `state` lines, and `changed` may name it; `consumers` keeps its type, and with no preview lease held it has the value it had before. Against a daemon of interface revision 4 or lower the key is still printed, with the value `0`, as for the PipeWire fields. `preview` and `frame` are new line types printed by a new command, and `unsupported-daemon` and `preview-path-too-long` are new `error` codes; a client written for the earlier version never sees them, as it never runs `preview`.
+- **`v` stays 1 for the camera controls.** `camera_controls` is a new field in the existing `snapshot` line and `controls` is a new line type, printed by a new command and by `watch --json`; the new `unsupported-daemon` use (`controls` needs revision 6) is an existing code. `state` lines do not carry the controls, so `changed` never names them. Against a daemon of interface revision 5 or lower the `snapshot` still prints the key, with the value `null`, as for `denoise`: "no controls" would claim a camera without them. `watch --json` prints no `controls` line then. A client written for the earlier version ignores both.
 - A **breaking change** raises `v`: a removed or renamed field or line type, a changed JSON type or meaning, a new state string, or a change to the rules above (line cap, outage behaviour).
 - **Not breaking**, made without raising `v`: a new field in an existing line type, a new line type, a new `error` code. Clients ignore what they do not know.
 - The schema is independent of the D-Bus `InterfaceRevision`; a new D-Bus property may appear as a new field.
-- **Capability rules for clients.** A client that shows the split of the consumers does so only while `pipewire_output` is not `"off"`. A client offers the effect controls only if both hold: the CLI is new enough to print `blur_strength` (the field is present as a number in `snapshot`; an older CLI has no `effect` command, and `omarchy-broadcast effect` fails with status `2`), and the daemon's `interface_revision` is 2 or more. Offer the noise-removal switch only if `denoise` is a boolean and `interface_revision` is 4 or more. Offer the preview only if the CLI has the `preview` command (an older CLI exits with status `2`) and the daemon's `interface_revision` is 5 or more; `preview --json` reports the second condition itself, with `unsupported-daemon`. Check the CLI first, then the daemon; the two conditions have different remedies (update `omarchy-broadcast`, update `omarchy-broadcastd`). When the field is absent or the revision is lower, show the effect, if at all, as read-only text.
+- **Capability rules for clients.** A client that shows the split of the consumers does so only while `pipewire_output` is not `"off"`. A client offers the effect controls only if both hold: the CLI is new enough to print `blur_strength` (the field is present as a number in `snapshot`; an older CLI has no `effect` command, and `omarchy-broadcast effect` fails with status `2`), and the daemon's `interface_revision` is 2 or more. Offer the noise-removal switch only if `denoise` is a boolean and `interface_revision` is 4 or more. Offer the preview only if the CLI has the `preview` command (an older CLI exits with status `2`) and the daemon's `interface_revision` is 5 or more; `preview --json` reports the second condition itself, with `unsupported-daemon`. Check the CLI first, then the daemon; the two conditions have different remedies (update `omarchy-broadcast`, update `omarchy-broadcastd`). Offer the camera controls only if `camera_controls` is an object and `interface_revision` is 6 or more; with `camera_controls` an empty list, offer none. Edits apply live while `state` is `starting` or `active`, and otherwise are stored for the next time the camera opens, so a client may tell its user which. To change a control run `omarchy-broadcast controls set NAME VALUE` (an older CLI exits with status `2`) and read the result from the `controls` line of `watch`. When the field is absent or the revision is lower, show the effect, if at all, as read-only text.
 
 ## Examples
 
@@ -328,6 +391,27 @@ omarchy-broadcast watch --json
 {"v":1,"type":"snapshot","state":"idle","enabled":true,"error":"","active_camera":"usb-046d_0944-video-index0","active_camera_name":"Logitech MX Brio","consumers":0,"loopback_consumers":0,"pipewire_consumers":0,"pipewire_output":"off","output_mode":"NV12 1920x1080@30","effect":"none","blur_strength":0.5,"background_image":"","denoise":false,"interface_revision":4,"cameras":[{"id":"usb-046d_0944-video-index0","name":"Logitech MX Brio","usb":"046d:0944","active":true}],"cameras_truncated":false}
 ```
 
+The image controls of the active camera, as the daemon reads them from the device, then one set (the daemon is `active`, so the change applies at once):
+
+```sh
+omarchy-broadcast controls --json
+omarchy-broadcast controls set sharpness 128
+```
+
+```json
+{"v":1,"type":"controls","camera":"usb-046d_0944-video-index0","controls":[{"name":"brightness","min":0,"max":255,"step":1,"default":128,"value":128,"stored":false},{"name":"contrast","min":0,"max":255,"step":1,"default":128,"value":77,"stored":false},{"name":"saturation","min":0,"max":255,"step":1,"default":128,"value":179,"stored":false},{"name":"sharpness","min":0,"max":255,"step":1,"default":128,"value":255,"stored":false},{"name":"backlight_compensation","min":0,"max":1,"step":1,"default":1,"value":0,"stored":false}],"controls_truncated":false}
+```
+
+```text
+Camera:     Logitech MX Brio (046d:0944)
+  brightness              128  0..255  default 128
+  contrast                 77  0..255  default 128
+  saturation              179  0..255  default 128
+  sharpness               128  0..255  default 128  (stored)
+  backlight_compensation    0  0..1    default 1
+Applied live.
+```
+
 Read the current state once from a shell script:
 
 ```sh
@@ -356,7 +440,8 @@ omarchy-broadcast preview --json
 - Run `omarchy-broadcast watch --json` as a long-lived child process and read its stdout line by line. Do not poll `status --json`.
 - Keep one record of the daemon. On `snapshot`, replace it. On `state`, replace its scalar fields. On `cameras`, replace its camera list and active camera. On `stats`, update the figures; on an `error` with `daemon-not-running`, mark the daemon unavailable until the next `snapshot`.
 - Clear the stats display when `state` leaves `active`: no `stats` line arrives in other states.
+- On `controls`, replace the record's image controls (they are also in `snapshot`, as `camera_controls`).
 - Show `error` whenever it is non-empty, whatever the state.
 - To stop, send `SIGTERM` or close the pipe.
 - To show the live preview, run `omarchy-broadcast preview --json` as a second long-lived child process next to `watch`, and only while the user wants the preview: it keeps the camera running. Open the `path` of each `frame` line (or reload the image from it) and keep the lease for as long as the preview is shown; stop the process to end it. The frame file is replaced by a rename, so a reader never sees a partial image.
-- Control the daemon by running `omarchy-broadcast on`, `off`, `camera next`, `camera <id>`, `effect <effect>` or `denoise on|off`, and check the exit status; the resulting change arrives on the `watch` stream.
+- Control the daemon by running `omarchy-broadcast on`, `off`, `camera next`, `camera <id>`, `effect <effect>` `denoise on|off`, `controls set NAME VALUE` or `controls reset`, and check the exit status; the resulting change arrives on the `watch` stream.

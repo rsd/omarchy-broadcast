@@ -18,7 +18,7 @@ flowchart LR
         IPC["D-Bus interface<br/>zbus · br.com.dias.OmarchyBroadcast1"]
         CTL["Controller thread<br/>lifecycle state machine"]
         CFG["Config (read-only)<br/>~/.config/omarchy-broadcast/config.toml<br/>reload on SIGHUP / ReloadConfig"]
-        ST["Runtime state<br/>~/.local/state/omarchy-broadcast/state.toml<br/>Enabled, selected camera,<br/>effect settings"]
+        ST["Runtime state<br/>~/.local/state/omarchy-broadcast/state.toml<br/>Enabled, selected camera,<br/>effect settings,<br/>per-camera image controls"]
         WATCH["Consumer watcher<br/>inotify on the loopback node<br/>+ /proc/PID/fd count"]
         PWT["obc-pipewire thread (optional)<br/>PipeWire main loop, output stream,<br/>registry listener: links to the node"]
         PRV["obc-preview thread (while a lease is held)<br/>scale to 480 px, RGB, JPEG"]
@@ -83,6 +83,13 @@ The daemon owns one **loopback writer** for its whole life ([ADR-0011](adr/0011-
 *The frame files.* The directory is created mode 0700 on `AcquirePreview`, or, if present, must be a real directory owned by the daemon's user, whose mode is forced to 0700; otherwise the call fails. The files are created mode 0600 without following links; a symbolic link, hard link, FIFO or other non-regular file in their way is removed and the file is created anew. Both files are removed when the last lease ends, when the writer stops, at shutdown and at start-up (a crashed daemon may have left them).
 
 *The lease is a consumer.* It is the third kind, next to the loopback holders and the PipeWire links, keyed by the caller's unique bus name; it ends on `ReleasePreview`, when the name leaves the bus (the daemon follows `NameOwnerChanged`), and at shutdown. The lifecycle keys off the total: debounce, idle grace, the deferred writer rebuild and the CUDA parking at `idle` are unchanged, so a lease alone starts the camera and its end lets the grace run out. `Consumers` is the total; `PreviewConsumers` counts the leases.
+
+**Camera image controls** ([ADR-0020](adr/0020-camera-image-controls.md)). Each camera has its own brightness, contrast, saturation, sharpness and backlight compensation, which the user can set and reset over D-Bus (`SetCameraControl`, `ResetCameraControls`) and which the daemon writes to the camera whenever it opens. Three places hold the design:
+- `obc-pipeline::controls` is the V4L2 side. `IMAGE_CONTROLS` is the allowlist, as data and the same for every camera. `ImageControls` opens a camera node once and queries the controls it has (range, step, default and value, from `VIDIOC_QUERYCTRL` and `VIDIOC_G_CTRL`), skipping one that cannot be read; a control is exposed only when it is not disabled, read-only or inactive and is an integer or a boolean. `check_value` validates a value against range and step.
+- The backend seam has a `ControlNode` (`MediaBackend::open_camera_controls`): the controller never touches a device node itself, and the fake backend replaces it in tests with an in-memory device whose controls can be made to fail.
+- The controller owns the policy. The values live in the runtime state, by camera id (`[camera_controls."<id>"]` in `state.toml`: `values`, and `reset_pending`), and nothing else is stored. A session records that the ingest's switch to its camera succeeded; only then, in `starting` or `active`, do the methods write to the device. At every successful switch to a camera (and when the open camera is renamed to an id with stored values) the controller opens the node once, writes the defaults if a reset is pending, then each stored value, and rebuilds the `CameraControls` view from what the device reports. A failing control never fails the session. Reads are allowed in any state and start no stream.
+
+The `CameraControls` property is the view of `ActiveCamera` and is queried again only on events, never polled: when `ActiveCamera` changes, on a rescan, at a camera's open, once at its first frame (a camera may change controls as it starts streaming) and after a set or reset. Closing a camera restores nothing. The user's values stay on the device, because restoring what was there would bring back what other software had left; the exposure pin of section 2 (`UVC controls`), which the daemon does restore, is not one of these controls.
 
 ### Threads
 
@@ -246,6 +253,7 @@ stateDiagram-v2
 The second output exists only with the PipeWire output enabled; it carries what the loopback carries, and consumers of either kind keep the state `active`. A preview lease is a consumer too, and is granted in every state; the preview frames carry what the loopback carries.
 
 - **Grace period.** `active` includes the time after the last consumer closes: the stream keeps running for `idle_grace` (default 5 s) with `Consumers` = 0, and a consumer that returns in that time finds it running. This replaces ADR-0006's separate "Draining" state.
+- **Camera image controls** are written at the points where the camera opens, so they follow the lifecycle: a camera that is closed (`off`, `idle`, `error`) is never written, a `SetCameraControl` or `ResetCameraControls` then only changes what is stored (or marks a reset pending), and the next switch to the camera applies it. They take no part in the consumers, the grace period or the parking.
 - **Source changes** (`SelectCamera`, `NextCamera`, a camera failure) rebuild only the ingest pipeline; the output keeps its contract and clock and holds the last frame meanwhile (section 2). The state stays `active`.
 - **`off`** is the privacy state: the camera is closed, so its LED is off. The writer keeps feeding black frames to any application that holds the device.
 - **Effects** follow the same lifecycle: the models exist only in `starting` and `active`, and are unloaded before the CUDA context goes. An effect that cannot run puts the daemon in `error` with the reason (or, with `on_failure = "none"`, leaves it `active` with the reason in `Error`). The noise-removal stage lives in the same backend instance: its model handle and state buffer are released at unload, before the context, so the park at Idle covers it. A noise-removal failure never enters `error`.

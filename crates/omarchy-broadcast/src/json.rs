@@ -1,20 +1,22 @@
 //! The JSON lines printed by `status --json`, `cameras --json`,
-//! `watch --json` and `preview --json`. The contract is documented in `docs/cli-json.md`; this
+//! `controls --json`, `watch --json` and `preview --json`. The contract is documented in `docs/cli-json.md`; this
 //! module is its only producer.
 //!
 //! Every line is one JSON object carrying `"v"` ([`VERSION`]) and `"type"`,
 //! and is at most [`MAX_LINE_BYTES`] bytes long: strings are clipped to the
 //! bounds below (measured in bytes of their JSON encoding, so escapes count)
 //! with a trailing [`ELLIPSIS`] (a path, `background_image`, keeps its end,
-//! the file name, behind a leading one), and the camera list is cut at
-//! [`MAX_CAMERAS`] entries. The `path` of `preview` and `frame` lines is
+//! the file name, behind a leading one), the camera list is cut at
+//! [`MAX_CAMERAS`] entries and a list of image controls at [`MAX_CONTROLS`]
+//! (a `snapshot` line cuts its controls further, then its cameras, should
+//! the line still exceed the cap). The `path` of `preview` and `frame` lines is
 //! the one exception: it is never clipped (a client opens that file), and a
 //! path over [`MAX_PREVIEW_PATH_BYTES`] is refused instead
 //! ([`preview_path_fits`], [`CODE_PREVIEW_PATH_TOO_LONG`]).
 
 use std::borrow::Cow;
 
-use obc_ipc::{CameraInfo, Snapshot, Stats};
+use obc_ipc::{CameraControl, CameraControls, CameraInfo, Snapshot, Stats};
 use serde::Serialize;
 
 use crate::model;
@@ -50,6 +52,11 @@ pub const MAX_PATH_BYTES: usize = 256;
 /// encoding): those lines stay under [`MAX_LINE_BYTES`] with it. Such a path
 /// is never clipped; a longer one is refused ([`preview_path_fits`]).
 pub const MAX_PREVIEW_PATH_BYTES: usize = 3968;
+/// At most this many image controls are listed; `controls_truncated` says
+/// whether more were present (a daemon reports at most five).
+pub const MAX_CONTROLS: usize = 16;
+/// Bound of an image control's `name`.
+pub const MAX_CONTROL_NAME_BYTES: usize = 32;
 /// Appended to a clipped string.
 pub const ELLIPSIS: &str = "\u{2026}";
 
@@ -214,6 +221,51 @@ fn cameras_of<'a>(s: &'a Snapshot, limit: usize) -> (Vec<Camera<'a>>, bool) {
     (list, s.cameras.len() > limit)
 }
 
+/// One image control.
+#[derive(Serialize)]
+struct Control<'a> {
+    name: Cow<'a, str>,
+    min: i32,
+    max: i32,
+    step: i32,
+    default: i32,
+    value: i32,
+    stored: bool,
+}
+
+/// The image controls of one camera: the `camera_controls` of a `snapshot`
+/// line, and the body of a `controls` line.
+#[derive(Serialize)]
+struct Controls<'a> {
+    camera: Cow<'a, str>,
+    controls: Vec<Control<'a>>,
+    controls_truncated: bool,
+}
+
+impl<'a> Controls<'a> {
+    /// `c`, with at most `limit` controls.
+    fn of(c: &'a CameraControls, limit: usize) -> Self {
+        Controls {
+            camera: clip(&c.camera, MAX_ID_BYTES),
+            controls: c
+                .controls
+                .iter()
+                .take(limit)
+                .map(|c: &CameraControl| Control {
+                    name: clip(&c.name, MAX_CONTROL_NAME_BYTES),
+                    min: c.min,
+                    max: c.max,
+                    step: c.step,
+                    default: c.default,
+                    value: c.value,
+                    stored: c.stored,
+                })
+                .collect(),
+            controls_truncated: c.controls.len() > limit,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct SnapshotLine<'a> {
     v: u32,
@@ -223,6 +275,17 @@ struct SnapshotLine<'a> {
     fields: StateFields<'a>,
     cameras: Vec<Camera<'a>>,
     cameras_truncated: bool,
+    /// `null` from a daemon too old to have it.
+    camera_controls: Option<Controls<'a>>,
+}
+
+#[derive(Serialize)]
+struct ControlsLine<'a> {
+    v: u32,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(flatten)]
+    controls: Controls<'a>,
 }
 
 #[derive(Serialize)]
@@ -309,17 +372,40 @@ fn bounded_cameras_line<'a>(
     }
 }
 
-/// `{"v":1,"type":"snapshot",...}`: every property.
+/// `{"v":1,"type":"snapshot",...}`: every property. Should the line exceed
+/// [`MAX_LINE_BYTES`] (which only strings and lists at their bounds can
+/// make it do), its image controls are cut first, then its cameras.
 pub fn snapshot_line(s: &Snapshot) -> String {
-    bounded_cameras_line(s, |cameras, cameras_truncated| {
+    let build = |camera_limit: usize, control_limit: usize| {
+        let (cameras, cameras_truncated) = cameras_of(s, camera_limit);
         to_line(&SnapshotLine {
             v: VERSION,
             kind: "snapshot",
             fields: StateFields::of(s),
             cameras,
             cameras_truncated,
+            camera_controls: s
+                .camera_controls
+                .as_ref()
+                .map(|c| Controls::of(c, control_limit)),
         })
-    })
+    };
+    let mut cameras = MAX_CAMERAS;
+    let mut controls = s
+        .camera_controls
+        .as_ref()
+        .map_or(0, |c| c.controls.len().min(MAX_CONTROLS));
+    loop {
+        let line = build(cameras, controls);
+        if line.len() <= MAX_LINE_BYTES || (cameras == 0 && controls == 0) {
+            return line;
+        }
+        if controls > 0 {
+            controls -= 1;
+        } else {
+            cameras -= 1;
+        }
+    }
 }
 
 /// `{"v":1,"type":"state",...}`: every scalar field, after a change of the
@@ -343,6 +429,16 @@ pub fn cameras_line(s: &Snapshot) -> String {
             cameras,
             cameras_truncated,
         })
+    })
+}
+
+/// `{"v":1,"type":"controls","camera":...,"controls":[...],
+/// "controls_truncated":false}`: the image controls of one camera.
+pub fn controls_line(c: &CameraControls) -> String {
+    to_line(&ControlsLine {
+        v: VERSION,
+        kind: "controls",
+        controls: Controls::of(c, MAX_CONTROLS),
     })
 }
 
@@ -428,6 +524,7 @@ mod tests {
             preview_consumers: 0,
             pipewire_output: "streaming".into(),
             denoise: true,
+            camera_controls: None,
             interface_revision: 4,
         }
     }
@@ -722,6 +819,112 @@ mod tests {
         }
     }
 
+    fn control(name: &str, min: i32, max: i32, step: i32, value: i32) -> CameraControl {
+        CameraControl {
+            name: name.into(),
+            min,
+            max,
+            step,
+            default: min,
+            value,
+            stored: value != min,
+        }
+    }
+
+    fn controls() -> CameraControls {
+        CameraControls {
+            camera: "platform-video2".into(),
+            controls: vec![
+                control("brightness", -64, 64, 1, 10),
+                control("saturation", 0, 100, 2, 0),
+            ],
+        }
+    }
+
+    #[test]
+    fn controls_line_lists_the_controls_of_one_camera() {
+        let line = controls_line(&controls());
+        assert_eq!(
+            line,
+            r#"{"v":1,"type":"controls","camera":"platform-video2","controls":[{"name":"brightness","min":-64,"max":64,"step":1,"default":-64,"value":10,"stored":true},{"name":"saturation","min":0,"max":100,"step":2,"default":0,"value":0,"stored":false}],"controls_truncated":false}"#
+        );
+        parse(&line);
+        // No camera: an empty id and no control.
+        let v = parse(&controls_line(&CameraControls::default()));
+        assert_eq!(v["camera"], "");
+        assert_eq!(v["controls"], serde_json::json!([]));
+        assert_eq!(v["controls_truncated"], false);
+    }
+
+    #[test]
+    fn the_snapshot_carries_the_controls_or_null_from_an_older_daemon() {
+        let mut s = sample();
+        let v = parse(&snapshot_line(&s));
+        assert_eq!(v.get("camera_controls"), Some(&Value::Null));
+        s.camera_controls = Some(controls());
+        s.interface_revision = 6;
+        let v = parse(&snapshot_line(&s));
+        let c = &v["camera_controls"];
+        assert_eq!(c["camera"], "platform-video2");
+        assert_eq!(c["controls_truncated"], false);
+        assert_eq!(
+            c["controls"][0],
+            serde_json::json!({
+                "name": "brightness", "min": -64, "max": 64, "step": 1,
+                "default": -64, "value": 10, "stored": true
+            })
+        );
+        assert_eq!(c["controls"].as_array().unwrap().len(), 2);
+        // A `state` line does not carry them.
+        assert!(
+            parse(&state_line(&s, &["state"]))
+                .get("camera_controls")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn controls_are_bounded() {
+        let nasty = "\u{1}".repeat(500);
+        let many = CameraControls {
+            camera: format!("id{nasty}"),
+            controls: (0..40)
+                .map(|i| {
+                    control(
+                        &format!("{i}{nasty}"),
+                        i32::MIN,
+                        i32::MAX,
+                        i32::MIN,
+                        i32::MIN,
+                    )
+                })
+                .collect(),
+        };
+        let v = parse(&controls_line(&many));
+        assert_eq!(v["controls"].as_array().unwrap().len(), MAX_CONTROLS);
+        assert_eq!(v["controls_truncated"], true);
+        let camera = v["camera"].as_str().unwrap();
+        assert!(camera.ends_with(ELLIPSIS), "{camera}");
+        assert!(serde_json::to_string(camera).unwrap().len() - 2 <= MAX_ID_BYTES);
+        for c in v["controls"].as_array().unwrap() {
+            let name = c["name"].as_str().unwrap();
+            assert!(name.ends_with(ELLIPSIS), "{name}");
+            assert!(serde_json::to_string(name).unwrap().len() - 2 <= MAX_CONTROL_NAME_BYTES);
+            assert_eq!(c["min"], i32::MIN);
+            assert_eq!(c["max"], i32::MAX);
+        }
+        // Exactly the bound: listed whole.
+        let mut sixteen = many.clone();
+        sixteen.controls.truncate(MAX_CONTROLS);
+        assert_eq!(parse(&controls_line(&sixteen))["controls_truncated"], false);
+        // A real name is printed as it is.
+        let v = parse(&controls_line(&CameraControls {
+            camera: "c".into(),
+            controls: vec![control("backlight_compensation", 0, 2, 1, 1)],
+        }));
+        assert_eq!(v["controls"][0]["name"], "backlight_compensation");
+    }
+
     #[test]
     fn worst_case_lines_stay_under_the_cap_and_valid() {
         // Every string at its worst: long and made of 6-byte escapes.
@@ -757,6 +960,52 @@ mod tests {
             assert!(v["active_camera"].as_str().unwrap().ends_with(ELLIPSIS));
         }
         let v = parse(&snapshot_line(&s));
+        // From a daemon with image controls, at their worst too: the line
+        // keeps its cap. The controls are cut first, then the cameras.
+        let worst_controls = CameraControls {
+            camera: s.active_camera.clone(),
+            controls: (0..40)
+                .map(|i| {
+                    control(
+                        &format!("{i}{nasty}"),
+                        i32::MIN,
+                        i32::MAX,
+                        i32::MIN,
+                        i32::MIN,
+                    )
+                })
+                .collect(),
+        };
+        let mut with = s.clone();
+        with.camera_controls = Some(worst_controls.clone());
+        let w = parse(&snapshot_line(&with));
+        let c = &w["camera_controls"];
+        assert_eq!(c["controls_truncated"], true, "{w}");
+        assert_eq!(c["controls"], serde_json::json!([]), "{w}");
+        assert!(c["camera"].as_str().unwrap().ends_with(ELLIPSIS));
+        assert_eq!(w["cameras_truncated"], true);
+        // The cameras are cut after the controls: with the controls gone
+        // the line still has to give up some cameras.
+        let kept = w["cameras"].as_array().unwrap().len();
+        assert!(kept > 0 && kept < MAX_CAMERAS, "{kept} cameras kept");
+        let v2 = parse(&controls_line(&worst_controls));
+        assert_eq!(v2["controls"].as_array().unwrap().len(), MAX_CONTROLS);
+        // With fewer cameras, the controls a daemon reports fit whole.
+        with.cameras.truncate(4);
+        with.camera_controls = Some(CameraControls {
+            camera: with.active_camera.clone(),
+            controls: obc_ipc::CAMERA_CONTROL_NAMES
+                .iter()
+                .map(|n| control(n, i32::MIN, i32::MAX, i32::MIN, i32::MAX))
+                .collect(),
+        });
+        let w = parse(&snapshot_line(&with));
+        assert_eq!(
+            w["camera_controls"]["controls"].as_array().unwrap().len(),
+            5
+        );
+        assert_eq!(w["camera_controls"]["controls_truncated"], false);
+        assert_eq!(w["cameras"].as_array().unwrap().len(), 4);
         assert!(v["error"].as_str().unwrap().ends_with(ELLIPSIS));
         assert!(v["pipewire_output"].as_str().unwrap().ends_with(ELLIPSIS));
         assert!(

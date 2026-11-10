@@ -8,7 +8,7 @@
 //! not [`crate::Stats`]); [`StatsArgs::to_stats`] turns its arguments into
 //! the value type.
 
-use crate::{CameraInfo, IpcError, State};
+use crate::{CameraControl, CameraControls, CameraInfo, IpcError, State};
 
 /// The daemon's interface, as seen by a client. Every property is read-only
 /// and emits `org.freedesktop.DBus.Properties.PropertiesChanged`.
@@ -64,6 +64,30 @@ pub trait OmarchyBroadcast {
     /// Ends the caller's preview lease; without one, does nothing.
     /// Revision 5.
     fn release_preview(&self) -> Result<(), IpcError>;
+
+    /// The image controls `camera` exposes (an id of `Cameras`; empty:
+    /// `ActiveCamera`), in [`crate::CAMERA_CONTROL_NAMES`] order, read from
+    /// the device in any state. Fails with `Unavailable` for `""` with no
+    /// camera, `NoSuchCamera` for an id not present, `Failed` when the
+    /// device cannot be read. Revision 6.
+    fn get_camera_controls(&self, camera: &str) -> Result<Vec<CameraControl>, IpcError>;
+
+    /// Sets the image control `name` of `camera` (as for
+    /// [`Self::get_camera_controls`]) to `value` and stores it for that
+    /// camera, applied whenever it opens. Written to the device at once
+    /// while the camera streams; otherwise only stored. Persists across
+    /// restarts. Fails with `InvalidArgument` for a name that is not one of
+    /// [`crate::CAMERA_CONTROL_NAMES`] or that the camera does not expose,
+    /// or a value outside the control's range or off its step; `Failed`
+    /// when the device or the state file cannot be written. Revision 6.
+    fn set_camera_control(&self, camera: &str, name: &str, value: i32) -> Result<(), IpcError>;
+
+    /// Forgets the image controls stored for `camera` and puts every
+    /// control back to the camera's default: at once while it streams,
+    /// otherwise when it next opens. Persists across restarts. Fails with
+    /// `Failed`, naming the controls, when the device refuses a default
+    /// (the stored values are forgotten all the same). Revision 6.
+    fn reset_camera_controls(&self, camera: &str) -> Result<(), IpcError>;
 
     /// Roughly once per second while `active`; `-1` marks a value that
     /// cannot be measured.
@@ -146,6 +170,12 @@ pub trait OmarchyBroadcast {
     /// `ready`, `streaming` or `failed`. Revision 3.
     #[zbus(property, name = "PipeWireOutput")]
     fn pipewire_output(&self) -> zbus::Result<String>;
+
+    /// The image controls of `ActiveCamera` (camera `""` and no control
+    /// when there is none), as [`Self::get_camera_controls`] reports them.
+    /// Revision 6.
+    #[zbus(property)]
+    fn camera_controls(&self) -> zbus::Result<CameraControls>;
 
     /// Revision of the interface the daemon implements.
     #[zbus(property)]

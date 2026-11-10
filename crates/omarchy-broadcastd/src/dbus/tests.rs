@@ -362,11 +362,15 @@ async fn every_property_reads_through_the_proxy() {
             pipewire_consumers: 0,
             preview_consumers: 0,
             pipewire_output: "off".into(),
+            camera_controls: Some(obc_ipc::CameraControls {
+                camera: "pci-b".into(),
+                controls: Vec::new(),
+            }),
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 5);
-    // GetAll returns the same sixteen properties.
+    assert_eq!(INTERFACE_REVISION, 6);
+    // GetAll returns the same seventeen properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
         .destination(obc_ipc::BUS_NAME)
         .path(OBJECT_PATH)
@@ -387,6 +391,7 @@ async fn every_property_reads_through_the_proxy() {
             "ActiveCamera",
             "BackgroundImage",
             "BlurStrength",
+            "CameraControls",
             "Cameras",
             "Consumers",
             "Denoise",
@@ -424,6 +429,10 @@ async fn every_property_reads_through_the_proxy() {
         "<method name=\"SetDenoise\">",
         "<method name=\"AcquirePreview\">",
         "<method name=\"ReleasePreview\">",
+        "<method name=\"GetCameraControls\">",
+        "<method name=\"SetCameraControl\">",
+        "<method name=\"ResetCameraControls\">",
+        "<property name=\"CameraControls\" type=\"(sa(siiiiib))\" access=\"read\"",
         "<signal name=\"PreviewFrame\">",
         "<property name=\"PreviewConsumers\" type=\"u\" access=\"read\"",
         "<property name=\"Denoise\" type=\"b\" access=\"read\"",
@@ -833,7 +842,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 5);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 6);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -891,7 +900,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 5);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 6);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -1007,7 +1016,7 @@ async fn preview_leases_by_bus_name_their_property_and_their_frames() {
     let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 5);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 6);
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
     let seen = rig.record_changes().await;
     let mut frames = proxy.receive_preview_frame().await.unwrap();
@@ -1233,4 +1242,210 @@ async fn a_lease_needs_a_sender_and_a_runtime_directory() {
         other => panic!("expected Failed, got {other:?}"),
     }
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
+}
+
+fn image_control(
+    name: &str,
+    max: i32,
+    default: i32,
+    value: i32,
+) -> obc_pipeline::controls::DeviceControl {
+    obc_pipeline::controls::DeviceControl {
+        name: name.into(),
+        min: 0,
+        max,
+        step: 1,
+        default,
+        value,
+    }
+}
+
+/// The error name of `res`, which must be an error.
+fn error_name<T: std::fmt::Debug>(res: Result<T, IpcError>) -> String {
+    match res {
+        Err(e @ IpcError::ZBus(_)) => panic!("expected a daemon reply, got {e:?}"),
+        Err(e) => zbus::DBusError::name(&e).to_string(),
+        Ok(v) => panic!("expected an error, got {v:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn camera_control_methods_their_property_and_their_errors() {
+    let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |w| {
+        w.controls.insert(
+            "usb-a".into(),
+            vec![
+                image_control("saturation", 255, 128, 179),
+                image_control("sharpness", 255, 128, 255),
+            ],
+        );
+    })
+    .await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    let deadline = Instant::now() + TIMEOUT;
+    while proxy.active_camera().await.unwrap().is_empty() {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let seen = rig.record_changes().await;
+
+    // Read in idle: the device's values, by "" or by id.
+    let got = within("GetCameraControls", proxy.get_camera_controls(""))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.iter()
+            .map(|c| (c.name.as_str(), c.value, c.stored))
+            .collect::<Vec<_>>(),
+        [("saturation", 179, false), ("sharpness", 255, false)]
+    );
+    assert_eq!(
+        within("GetCameraControls", proxy.get_camera_controls("usb-a"))
+            .await
+            .unwrap(),
+        got
+    );
+    assert!(
+        within("GetCameraControls", proxy.get_camera_controls("pci-b"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let view = proxy.camera_controls().await.unwrap();
+    assert_eq!(
+        (view.camera.as_str(), view.controls.clone()),
+        ("usb-a", got)
+    );
+
+    // Set while idle: stored, not written; the property and its change
+    // say so before the reply.
+    within(
+        "SetCameraControl",
+        proxy.set_camera_control("", "sharpness", 128),
+    )
+    .await
+    .unwrap();
+    let view = proxy.camera_controls().await.unwrap();
+    assert_eq!(
+        (view.controls[1].value, view.controls[1].stored),
+        (128, true)
+    );
+    assert!(rig.world().control_writes.is_empty());
+    until("CameraControls changed", &seen, |s| {
+        s.iter().any(|e| e.starts_with("CameraControls="))
+    })
+    .await;
+    let state = fs::read_to_string(&rig.paths.state).unwrap();
+    assert!(state.contains("values = { sharpness = 128 }"), "{state}");
+
+    // Active: the open applies it; a set writes at once.
+    rig.consumers(1);
+    wait_state(&proxy, State::Active).await;
+    within(
+        "SetCameraControl",
+        proxy.set_camera_control("usb-a", "saturation", 128),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rig.world().control_writes,
+        [
+            ("usb-a".to_string(), "sharpness".to_string(), 128),
+            ("usb-a".to_string(), "saturation".to_string(), 128),
+        ]
+    );
+    // Reset while active: the defaults written, nothing stored.
+    within("ResetCameraControls", proxy.reset_camera_controls(""))
+        .await
+        .unwrap();
+    let view = proxy.camera_controls().await.unwrap();
+    assert!(view.controls.iter().all(|c| !c.stored && c.value == 128));
+    let state = fs::read_to_string(&rig.paths.state).unwrap();
+    assert!(!state.contains("camera_controls"), "{state}");
+
+    // Each error by its name.
+    let invalid = "br.com.dias.OmarchyBroadcast1.Error.InvalidArgument";
+    for (name, value) in [
+        ("zoom_absolute", 1),
+        ("contrast", 1),
+        ("sharpness", 256),
+        ("sharpness", -1),
+    ] {
+        assert_eq!(
+            error_name(
+                within(
+                    "SetCameraControl",
+                    proxy.set_camera_control("", name, value)
+                )
+                .await
+            ),
+            invalid,
+            "{name} {value}"
+        );
+    }
+    let no_such = "br.com.dias.OmarchyBroadcast1.Error.NoSuchCamera";
+    assert_eq!(
+        error_name(within("GetCameraControls", proxy.get_camera_controls("Alpha")).await),
+        no_such
+    );
+    assert_eq!(
+        error_name(
+            within(
+                "SetCameraControl",
+                proxy.set_camera_control("nope", "sharpness", 1)
+            )
+            .await
+        ),
+        no_such
+    );
+    assert_eq!(
+        error_name(within("ResetCameraControls", proxy.reset_camera_controls("nope")).await),
+        no_such
+    );
+    rig.world().fail_control_writes = vec!["sharpness".into()];
+    assert_eq!(
+        error_name(
+            within(
+                "SetCameraControl",
+                proxy.set_camera_control("", "sharpness", 1)
+            )
+            .await
+        ),
+        "br.com.dias.OmarchyBroadcast1.Error.Failed"
+    );
+    rig.world().fail_control_query = vec!["pci-b".into()];
+    assert_eq!(
+        error_name(within("GetCameraControls", proxy.get_camera_controls("pci-b")).await),
+        "br.com.dias.OmarchyBroadcast1.Error.Failed"
+    );
+    rig.world().cameras.clear();
+    rig.commands.send(Command::Rescan).unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    while !proxy.cameras().await.unwrap().is_empty() {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let unavailable = "br.com.dias.OmarchyBroadcast1.Error.Unavailable";
+    assert_eq!(
+        error_name(within("GetCameraControls", proxy.get_camera_controls("")).await),
+        unavailable
+    );
+    assert_eq!(
+        error_name(
+            within(
+                "SetCameraControl",
+                proxy.set_camera_control("", "sharpness", 1)
+            )
+            .await
+        ),
+        unavailable
+    );
+    assert_eq!(
+        error_name(within("ResetCameraControls", proxy.reset_camera_controls("")).await),
+        unavailable
+    );
+    // No camera: camera "" and no control.
+    let view = proxy.camera_controls().await.unwrap();
+    assert_eq!(view, obc_ipc::CameraControls::default());
 }

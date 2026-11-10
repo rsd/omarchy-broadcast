@@ -8,9 +8,11 @@
 //!   reference is `docs/config.example.toml`.
 //! - [`RuntimeState`]: `$XDG_STATE_HOME/omarchy-broadcast/state.toml`, what
 //!   changes at run time (`Enabled`, the selected camera, the effect and its
-//!   settings). Written atomically by the daemon; a damaged file falls back
-//!   to the defaults (the daemon then starts `off`).
+//!   settings, each camera's image controls). Written atomically by the
+//!   daemon; a damaged file falls back to the defaults (the daemon then
+//!   starts `off`).
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
@@ -31,6 +33,17 @@ pub const CONFIG_VERSION: u32 = 1;
 
 /// Directory name under the XDG base directories.
 pub const APP_DIR: &str = "omarchy-broadcast";
+
+/// The camera image controls a user may set (their v4l2-ctl names), the
+/// only names [`RuntimeState::camera_controls`] keeps: the allowlist of
+/// `obc_pipeline::controls::IMAGE_CONTROLS`, in its order.
+pub const CAMERA_CONTROL_NAMES: [&str; 5] = [
+    "brightness",
+    "contrast",
+    "saturation",
+    "sharpness",
+    "backlight_compensation",
+];
 
 /// Bounds of the duration keys, inclusive unless stated otherwise.
 pub mod limits {
@@ -734,6 +747,27 @@ pub fn selector_form(s: &CameraSelector) -> String {
     }
 }
 
+/// The image controls the user set on one camera
+/// ([`RuntimeState::camera_controls`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CameraControlState {
+    /// The values the user set, by control name ([`CAMERA_CONTROL_NAMES`]),
+    /// written to the camera whenever it opens. A value equal to the
+    /// control's default is kept all the same: the user set it.
+    pub values: BTreeMap<String, i32>,
+    /// A reset was asked while the camera did not stream: every control is
+    /// written its default the next time the camera opens (before
+    /// `values`, which a reset leaves empty and a later set may fill).
+    pub reset_pending: bool,
+}
+
+impl CameraControlState {
+    /// Nothing to keep: no value and no pending reset.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty() && !self.reset_pending
+    }
+}
+
 /// What the daemon changes at run time and keeps across restarts.
 ///
 /// The effect keys override the config's `[effect]` keys of the same name
@@ -744,6 +778,10 @@ pub fn selector_form(s: &CameraSelector) -> String {
 /// applies: it starts `off`, with the camera closed, and never streams the
 /// raw image in place of an effect it could not read. Unknown keys (a newer
 /// daemon's) are ignored.
+///
+/// The camera image controls are the exception: they hide nothing, so a bad
+/// entry of `[camera_controls]` is dropped on its own, with a warning
+/// ([`RuntimeState::load_noting`]), and never damages the file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RuntimeState {
@@ -779,6 +817,21 @@ pub struct RuntimeState {
         deserialize_with = "de_state_denoise"
     )]
     pub denoise: Option<bool>,
+    /// The image controls set with `SetCameraControl` (or reset with
+    /// `ResetCameraControls`), by camera id. Never holds an empty entry
+    /// ([`CameraControlState::is_empty`]). In the file, one table per
+    /// camera, after the other keys (written by [`RuntimeState::save`]):
+    ///
+    /// ```toml
+    /// [camera_controls."usb-046d_0944-video-index0"]
+    /// values = { saturation = 128, sharpness = 128 }
+    /// reset_pending = true
+    /// ```
+    ///
+    /// `values` is left out when empty, `reset_pending` when false, and the
+    /// whole table when there is no entry.
+    #[serde(skip_serializing, deserialize_with = "de_camera_controls")]
+    pub camera_controls: BTreeMap<String, CameraControlState>,
 }
 
 impl Default for RuntimeState {
@@ -790,8 +843,142 @@ impl Default for RuntimeState {
             blur_strength: None,
             background_image: None,
             denoise: None,
+            camera_controls: BTreeMap::new(),
         }
     }
+}
+
+/// `[camera_controls]`, leniently: what is valid is kept, the rest dropped
+/// ([`camera_controls_from`]); never an error.
+fn de_camera_controls<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<String, CameraControlState>, D::Error> {
+    let value = toml::Value::deserialize(d)?;
+    Ok(camera_controls_from(&value).0)
+}
+
+/// The camera control entries of the `[camera_controls]` value, and a
+/// warning for each part dropped: an entry that is not a table, a control
+/// name outside [`CAMERA_CONTROL_NAMES`], a value that is not an integer or
+/// does not fit 32 bits, a `values` that is not a table, a `reset_pending`
+/// that is not a boolean. An entry left with nothing to keep is dropped
+/// (silently when nothing in it was bad). Unknown keys of an entry (a newer
+/// daemon's) are ignored.
+fn camera_controls_from(
+    value: &toml::Value,
+) -> (BTreeMap<String, CameraControlState>, Vec<String>) {
+    let mut out = BTreeMap::new();
+    let mut warnings = Vec::new();
+    let Some(table) = value.as_table() else {
+        warnings.push(format!(
+            "camera_controls must be a table (found {}): ignored",
+            value.type_str()
+        ));
+        return (out, warnings);
+    };
+    for (camera, entry) in table {
+        let Some(entry) = entry.as_table() else {
+            warnings.push(format!(
+                "camera_controls.{camera:?} must be a table (found {}): ignored",
+                entry.type_str()
+            ));
+            continue;
+        };
+        let mut state = CameraControlState::default();
+        match entry.get("values") {
+            None => {}
+            Some(toml::Value::Table(values)) => {
+                for (name, v) in values {
+                    if !CAMERA_CONTROL_NAMES.contains(&name.as_str()) {
+                        warnings.push(format!(
+                            "camera_controls.{camera:?}: {name:?} is not a camera control \
+                             (expected one of {}): ignored",
+                            CAMERA_CONTROL_NAMES.join(", ")
+                        ));
+                        continue;
+                    }
+                    match v.as_integer().map(i32::try_from) {
+                        Some(Ok(v)) => {
+                            state.values.insert(name.clone(), v);
+                        }
+                        Some(Err(_)) => warnings.push(format!(
+                            "camera_controls.{camera:?}: {name} = {v} does not fit 32 bits: \
+                             ignored"
+                        )),
+                        None => warnings.push(format!(
+                            "camera_controls.{camera:?}: {name} must be an integer (found {}): ignored",
+                            v.type_str()
+                        )),
+                    }
+                }
+            }
+            Some(other) => warnings.push(format!(
+                "camera_controls.{camera:?}: values must be a table (found {}): ignored",
+                other.type_str()
+            )),
+        }
+        match entry.get("reset_pending") {
+            None => {}
+            Some(toml::Value::Boolean(b)) => state.reset_pending = *b,
+            Some(other) => warnings.push(format!(
+                "camera_controls.{camera:?}: reset_pending must be a boolean (found {}): ignored",
+                other.type_str()
+            )),
+        }
+        if !state.is_empty() {
+            out.insert(camera.clone(), state);
+        }
+    }
+    (out, warnings)
+}
+
+/// `s` as a TOML basic string (`"..."`), valid as a quoted key: `"` and
+/// `\` escaped, and every control character (U+0000 to U+001F, U+007F to
+/// U+009F) written as its short escape or `\uXXXX`. (The `toml` crate may
+/// write a literal or a multi-line string instead, and a multi-line string
+/// is no valid key.)
+fn toml_basic_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The `[camera_controls."<id>"]` tables of [`RuntimeState::save`], each
+/// with `values` as an inline table; empty entries are left out.
+fn camera_controls_toml(controls: &BTreeMap<String, CameraControlState>) -> String {
+    let mut text = String::new();
+    for (camera, state) in controls.iter().filter(|(_, s)| !s.is_empty()) {
+        text.push_str(&format!(
+            "\n[camera_controls.{}]\n",
+            toml_basic_string(camera)
+        ));
+        if !state.values.is_empty() {
+            let values: toml::Table = state
+                .values
+                .iter()
+                .map(|(k, v)| (k.clone(), toml::Value::Integer(i64::from(*v))))
+                .collect();
+            text.push_str(&format!("values = {}\n", toml::Value::Table(values)));
+        }
+        if state.reset_pending {
+            text.push_str("reset_pending = true\n");
+        }
+    }
+    text
 }
 
 impl RuntimeState {
@@ -813,27 +1000,48 @@ impl RuntimeState {
 
     /// Reads `path`. Never fails: a missing file is the defaults, and a file
     /// that cannot be read or parsed is the defaults plus a warning saying
-    /// why.
+    /// why. What [`Self::load_noting`] reads, without its notes.
     pub fn load(path: &Path) -> (RuntimeState, Option<String>) {
+        let (state, damaged, _) = Self::load_noting(path);
+        (state, damaged)
+    }
+
+    /// [`Self::load`], and the parts of `[camera_controls]` it dropped, one
+    /// line each naming the file (they never make the file damaged).
+    pub fn load_noting(path: &Path) -> (RuntimeState, Option<String>, Vec<String>) {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return (RuntimeState::default(), None);
+                return (RuntimeState::default(), None, Vec::new());
             }
             Err(e) => {
                 return (
                     RuntimeState::default(),
                     Some(format!("{}: {e}; using the default state", path.display())),
+                    Vec::new(),
                 );
             }
         };
         match toml::from_str::<RuntimeState>(&text) {
-            Ok(state) => (state, None),
+            Ok(state) => {
+                // The second read of a small file, for what the first one
+                // dropped.
+                let notes = toml::from_str::<toml::Table>(&text)
+                    .ok()
+                    .and_then(|t| t.get("camera_controls").map(camera_controls_from))
+                    .map(|(_, w)| w)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|w| format!("{}: {w}", path.display()))
+                    .collect();
+                (state, None, notes)
+            }
             Err(e) => {
                 let err = parse_error(&e, &text, path);
                 (
                     RuntimeState::default(),
                     Some(format!("{err}; using the default state")),
+                    Vec::new(),
                 )
             }
         }
@@ -857,7 +1065,8 @@ impl RuntimeState {
         let name = path.file_name().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "state path has no file name")
         })?;
-        let text = toml::to_string(self).map_err(io::Error::other)?;
+        let mut text = toml::to_string(self).map_err(io::Error::other)?;
+        text.push_str(&camera_controls_toml(&self.camera_controls));
         let (tmp, f) = create_temp(dir, name)?;
         let write = |mut f: fs::File| -> io::Result<()> {
             f.write_all(text.as_bytes())?;
@@ -1488,6 +1697,7 @@ offer_nv12 = false
             blur_strength: Some(0.25),
             background_image: Some("/home/u/bg.png".into()),
             denoise: Some(true),
+            camera_controls: BTreeMap::new(),
         };
         st.save(&path).unwrap();
         assert_eq!(RuntimeState::load(&path), (st.clone(), None));
@@ -1502,6 +1712,215 @@ offer_nv12 = false
         RuntimeState::default().save(&path).unwrap();
         assert_eq!(RuntimeState::load(&path), (RuntimeState::default(), None));
         assert_eq!(fs::read_to_string(&path).unwrap().trim(), "enabled = true");
+    }
+
+    fn controls(values: &[(&str, i32)], reset_pending: bool) -> CameraControlState {
+        CameraControlState {
+            values: values.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            reset_pending,
+        }
+    }
+
+    #[test]
+    fn camera_controls_round_trip_in_their_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let mut st = RuntimeState {
+            camera: Some("usb-046d_0944-video-index0".into()),
+            ..RuntimeState::default()
+        };
+        st.camera_controls.insert(
+            "usb-046d_0944-video-index0".into(),
+            controls(&[("sharpness", 128), ("saturation", 128)], false),
+        );
+        st.camera_controls.insert(
+            "pci-0000:00:14.0-usb-0:2:1.0-video-index0".into(),
+            controls(&[], true),
+        );
+        st.camera_controls.insert(
+            "platform-x".into(),
+            controls(&[("brightness", -64), ("backlight_compensation", 0)], true),
+        );
+        st.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            "enabled = true\n\
+             camera = \"usb-046d_0944-video-index0\"\n\
+             \n\
+             [camera_controls.\"pci-0000:00:14.0-usb-0:2:1.0-video-index0\"]\n\
+             reset_pending = true\n\
+             \n\
+             [camera_controls.\"platform-x\"]\n\
+             values = { backlight_compensation = 0, brightness = -64 }\n\
+             reset_pending = true\n\
+             \n\
+             [camera_controls.\"usb-046d_0944-video-index0\"]\n\
+             values = { saturation = 128, sharpness = 128 }\n"
+        );
+        assert_eq!(RuntimeState::load_noting(&path), (st.clone(), None, vec![]));
+
+        // An id that needs escaping still round-trips.
+        let mut odd = RuntimeState::default();
+        odd.camera_controls.insert(
+            "a \"quoted\" id\\ \u{e9}".into(),
+            controls(&[("contrast", 3)], false),
+        );
+        odd.save(&path).unwrap();
+        assert_eq!(RuntimeState::load_noting(&path), (odd, None, vec![]));
+        // Every id the toml crate would quote otherwise (a literal string,
+        // or a multi-line one, which is no valid key), all in one file.
+        let mut odd = RuntimeState::default();
+        let ids = [
+            "usb-plain",
+            "it's",
+            "say \"hi\"",
+            "both ' and \"",
+            "both ' and \" and\na newline",
+            "line\nbreak",
+            "tab\there",
+            "back\\slash \\\" mixed",
+            "c\u{1}ontrol \u{7f} \u{85} \r \u{8} \u{c}",
+            "caf\u{e9} \u{1f4f7} \u{202e}",
+            "'''triple''' \"\"\"quotes\"\"\"",
+            "",
+        ];
+        for (i, id) in ids.iter().enumerate() {
+            odd.camera_controls.insert(
+                id.to_string(),
+                controls(&[("contrast", i as i32)], i % 2 == 0),
+            );
+        }
+        odd.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(toml::from_str::<toml::Table>(&text).is_ok(), "{text}");
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.starts_with("[camera_controls."))
+                .count(),
+            ids.len(),
+            "one header line each: {text}"
+        );
+        assert!(text.contains("[camera_controls.\"usb-plain\"]\n"), "{text}");
+        assert_eq!(RuntimeState::load_noting(&path), (odd, None, vec![]));
+
+        // No entry: no table at all; an empty entry is not written.
+        let mut empty = RuntimeState::default();
+        empty
+            .camera_controls
+            .insert("usb-x".into(), CameraControlState::default());
+        empty.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.trim(), "enabled = true");
+        assert_eq!(RuntimeState::load(&path), (RuntimeState::default(), None));
+        RuntimeState::default().save(&path).unwrap();
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("camera_controls")
+        );
+
+        // The header form serde would write reads the same.
+        fs::write(
+            &path,
+            "enabled = true\n[camera_controls.usb-x]\nreset_pending = false\n\
+             [camera_controls.usb-x.values]\nsharpness = 0\n",
+        )
+        .unwrap();
+        let (got, damaged, notes) = RuntimeState::load_noting(&path);
+        assert_eq!((damaged, notes), (None, vec![]));
+        assert_eq!(
+            got.camera_controls["usb-x"],
+            controls(&[("sharpness", 0)], false)
+        );
+    }
+
+    #[test]
+    fn bad_camera_control_entries_are_dropped_and_never_damage_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        fs::write(
+            &path,
+            r#"enabled = false
+effect = "blur"
+
+[camera_controls."usb-good"]
+values = { sharpness = 128, zoom_absolute = 3, contrast = "high", saturation = 4294967296, brightness = -2147483648 }
+reset_pending = "yes"
+future_key = 1
+
+[camera_controls."usb-only-bad"]
+values = { exposure_dynamic_framerate = 0 }
+
+[camera_controls."usb-pending"]
+values = 5
+reset_pending = true
+
+[camera_controls."usb-nothing"]
+reset_pending = false
+"#,
+        )
+        .unwrap();
+        let (st, damaged, notes) = RuntimeState::load_noting(&path);
+        assert_eq!(damaged, None, "never damaged");
+        // The rest of the file is read as usual.
+        assert!(!st.enabled);
+        assert_eq!(st.effect, Some(EffectMode::Blur));
+        let mut want = BTreeMap::new();
+        want.insert(
+            "usb-good".to_string(),
+            controls(&[("sharpness", 128), ("brightness", i32::MIN)], false),
+        );
+        want.insert("usb-pending".to_string(), controls(&[], true));
+        assert_eq!(st.camera_controls, want);
+        let all = notes.join("\n");
+        for part in [
+            "\"zoom_absolute\" is not a camera control",
+            "contrast must be an integer (found string)",
+            "saturation = 4294967296 does not fit 32 bits",
+            "reset_pending must be a boolean (found string)",
+            "\"exposure_dynamic_framerate\" is not a camera control",
+            "values must be a table (found integer)",
+        ] {
+            assert!(all.contains(part), "{part:?} not in {all}");
+        }
+        assert_eq!(notes.len(), 6, "{all}");
+        assert!(!all.contains("  "), "no run of spaces: {all}");
+        assert!(
+            notes
+                .iter()
+                .all(|n| n.starts_with(&path.display().to_string()))
+        );
+        // `load` reads the same, without the notes.
+        assert_eq!(RuntimeState::load(&path), (st.clone(), None));
+
+        // A camera_controls that is not a table, or an entry that is not one.
+        fs::write(&path, "camera_controls = 3\n").unwrap();
+        let (st, damaged, notes) = RuntimeState::load_noting(&path);
+        assert_eq!((st, damaged), (RuntimeState::default(), None));
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("camera_controls must be a table (found integer)"),
+            "{notes:?}"
+        );
+        fs::write(&path, "[camera_controls]\nusb-a = \"x\"\n").unwrap();
+        let (st, damaged, notes) = RuntimeState::load_noting(&path);
+        assert_eq!((st, damaged), (RuntimeState::default(), None));
+        assert!(
+            notes[0].contains("must be a table (found string)"),
+            "{notes:?}"
+        );
+
+        // A damaged file elsewhere is still damaged.
+        fs::write(
+            &path,
+            "enabled = maybe\n[camera_controls.a]\nreset_pending = true\n",
+        )
+        .unwrap();
+        let (st, damaged, notes) = RuntimeState::load_noting(&path);
+        assert_eq!(st, RuntimeState::default());
+        assert!(damaged.is_some());
+        assert!(notes.is_empty());
     }
 
     #[test]

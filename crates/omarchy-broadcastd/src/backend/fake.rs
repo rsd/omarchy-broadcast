@@ -10,11 +10,12 @@ use obc_core::config::EffectConfig;
 use obc_core::{EffectMode, ModeRequest, OutputContract, SinkSelector};
 use obc_gpu::{GpuError, NothingToPark, ParkError, ParkOutcome, UnparkOutcome};
 use obc_ipc::Stats;
+use obc_pipeline::controls::DeviceControl;
 
 use super::park::{ParkOps, Parker, StartError, StopFailure, StopSession};
 use super::{
-    EffectReport, EffectStatus, Failure, MediaBackend, PipeWireGeneration, PreviewRequest,
-    SessionParams,
+    ControlNode, ControlQuery, EffectReport, EffectStatus, Failure, MediaBackend,
+    PipeWireGeneration, PreviewRequest, SessionParams,
 };
 use crate::camera::Camera;
 use crate::log::Level;
@@ -132,6 +133,29 @@ pub struct World {
     pub gpu_log: Vec<&'static str>,
     /// What the parker logged.
     pub parker_said: Vec<(Level, String)>,
+    /// The fake devices' image controls, by camera id, each with its
+    /// current value (what `camera_controls` reports, what
+    /// `set_camera_control` changes). A camera without an entry exposes
+    /// none; a control left out is one it lacks.
+    pub controls: std::collections::HashMap<String, Vec<DeviceControl>>,
+    /// Every image control write that reached a fake device, in order:
+    /// (camera id, control, value).
+    pub control_writes: Vec<(String, String, i32)>,
+    /// Writes of these controls fail (on any camera); nothing is changed.
+    pub fail_control_writes: Vec<String>,
+    /// Opening the node of these camera ids for its image controls fails.
+    pub fail_control_query: Vec<String>,
+    /// The number of image control queries ([`ControlNode::query`]).
+    pub control_queries: u32,
+    /// The number of nodes opened for their image controls.
+    pub control_opens: u32,
+    /// The number of single image control reads ([`ControlNode::get`]).
+    pub control_reads: u32,
+    /// A query skips these controls (on any camera), as unreadable.
+    pub fail_control_reads: Vec<String>,
+    /// A write of this control leaves this value on the device instead (a
+    /// driver that rounds or clamps), by control name.
+    pub control_write_quirks: std::collections::HashMap<String, i32>,
 }
 
 impl Default for World {
@@ -194,6 +218,15 @@ impl Default for World {
             fail_unpark: None,
             gpu_log: Vec::new(),
             parker_said: Vec::new(),
+            controls: std::collections::HashMap::new(),
+            control_writes: Vec::new(),
+            fail_control_writes: Vec::new(),
+            fail_control_query: Vec::new(),
+            control_queries: 0,
+            control_opens: 0,
+            control_reads: 0,
+            fail_control_reads: Vec::new(),
+            control_write_quirks: std::collections::HashMap::new(),
         }
     }
 }
@@ -579,5 +612,94 @@ impl MediaBackend for FakeBackend {
             reused: false,
             gpu_ms_p50: Some(1.2),
         })
+    }
+
+    fn open_camera_controls(
+        &mut self,
+        camera: &Camera,
+        write: bool,
+    ) -> Result<Box<dyn ControlNode>, String> {
+        let mut w = self.world();
+        w.control_opens += 1;
+        if w.fail_control_query.contains(&camera.id) {
+            return Err(format!(
+                "opening {} for its image controls: Input/output error",
+                camera.path.display()
+            ));
+        }
+        Ok(Box::new(FakeControlNode {
+            world: Arc::clone(&self.world),
+            camera: camera.clone(),
+            write,
+        }))
+    }
+}
+
+/// A fake device node opened for its image controls.
+struct FakeControlNode {
+    world: Arc<Mutex<World>>,
+    camera: Camera,
+    /// Opened for writing: a write through a node that was not fails.
+    write: bool,
+}
+
+impl ControlNode for FakeControlNode {
+    fn query(&mut self) -> ControlQuery {
+        let mut w = lock(&self.world);
+        w.control_queries += 1;
+        let (controls, skipped) = w
+            .controls
+            .get(&self.camera.id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .partition(|c| !w.fail_control_reads.contains(&c.name));
+        ControlQuery {
+            controls,
+            skipped: skipped
+                .into_iter()
+                .map(|c: DeviceControl| (c.name, "Broken pipe".to_string()))
+                .collect(),
+        }
+    }
+
+    fn set(&mut self, name: &str, value: i32) -> Result<(), String> {
+        let mut w = lock(&self.world);
+        let path = self.camera.path.display();
+        if !self.write {
+            return Err(format!(
+                "{path}: setting {name}: opened read-only (a controller bug)"
+            ));
+        }
+        if w.fail_control_writes.iter().any(|n| n == name) {
+            return Err(format!("{path}: setting {name}: Input/output error"));
+        }
+        let stored = w.control_write_quirks.get(name).copied().unwrap_or(value);
+        let Some(c) = w
+            .controls
+            .get_mut(&self.camera.id)
+            .and_then(|cs| cs.iter_mut().find(|c| c.name == name))
+        else {
+            return Err(format!("{path}: setting {name}: Invalid argument"));
+        };
+        c.value = stored;
+        w.control_writes
+            .push((self.camera.id.clone(), name.to_string(), value));
+        Ok(())
+    }
+
+    fn get(&mut self, name: &str) -> Result<i32, String> {
+        let mut w = lock(&self.world);
+        w.control_reads += 1;
+        w.controls
+            .get(&self.camera.id)
+            .and_then(|cs| cs.iter().find(|c| c.name == name))
+            .map(|c| c.value)
+            .ok_or_else(|| {
+                format!(
+                    "{}: reading {name}: Invalid argument",
+                    self.camera.path.display()
+                )
+            })
     }
 }

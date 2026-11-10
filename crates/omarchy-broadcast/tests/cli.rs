@@ -21,7 +21,10 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use obc_ipc::{BUS_NAME, CameraInfo, INTERFACE_REVISION, IpcError, OBJECT_PATH, State};
+use obc_ipc::{
+    BUS_NAME, CameraControl, CameraControls, CameraInfo, INTERFACE_REVISION, IpcError, OBJECT_PATH,
+    State,
+};
 use serde_json::Value;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
 use zbus::{Connection, connection, interface};
@@ -382,9 +385,39 @@ struct Mock {
     leases: std::collections::BTreeMap<String, u32>,
     /// What `AcquirePreview` returns.
     preview_path: String,
-    /// The preview calls received without `NO_AUTO_START` (which would
-    /// have started the daemon had it not been running), as in `calls`.
+    /// The preview calls and `GetCameraControls` calls received without
+    /// `NO_AUTO_START` (which would have started the daemon had it not been
+    /// running), as in `calls`.
     auto_start: Vec<String>,
+    /// The image controls of the first camera (the others have none).
+    controls: Vec<CameraControl>,
+    /// The next `GetCameraControls` for a named camera first renames the
+    /// first camera to this id (the active camera changing under the CLI),
+    /// so the call itself finds no such camera.
+    rename_on_get: Option<String>,
+    /// `GetCameraControls` fails (a device that cannot be read).
+    fail_gets: bool,
+}
+
+fn control(name: &str, min: i32, max: i32, step: i32, default: i32) -> CameraControl {
+    CameraControl {
+        name: name.into(),
+        min,
+        max,
+        step,
+        default,
+        value: default,
+        stored: false,
+    }
+}
+
+/// The image controls the mock's first camera starts with.
+fn mock_controls() -> Vec<CameraControl> {
+    vec![
+        control("brightness", -64, 64, 1, 0),
+        control("saturation", 0, 100, 2, 50),
+        control("sharpness", 0, 255, 1, 128),
+    ]
 }
 
 impl Mock {
@@ -417,6 +450,33 @@ impl Mock {
             leases: std::collections::BTreeMap::new(),
             preview_path: PREVIEW_PATH.into(),
             auto_start: Vec::new(),
+            controls: mock_controls(),
+            rename_on_get: None,
+            fail_gets: false,
+        }
+    }
+
+    /// The camera a control method names (`""`: the active one), as the
+    /// daemon resolves it.
+    fn controls_of(&self, camera: &str) -> Result<usize, IpcError> {
+        if camera.is_empty() {
+            if self.cameras.is_empty() {
+                return Err(IpcError::Unavailable("no camera present".into()));
+            }
+            return Ok(self.active);
+        }
+        self.cameras
+            .iter()
+            .position(|c| c.id == camera)
+            .ok_or_else(|| IpcError::NoSuchCamera(format!("no camera {camera:?} is present")))
+    }
+
+    /// The controls of camera `at`.
+    fn controls_at(&self, at: usize) -> Vec<CameraControl> {
+        if at == 0 {
+            self.controls.clone()
+        } else {
+            Vec::new()
         }
     }
 }
@@ -590,6 +650,76 @@ impl Mock {
         Ok(())
     }
 
+    async fn get_camera_controls(
+        &mut self,
+        camera: &str,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<Vec<CameraControl>, IpcError> {
+        self.calls.push(format!("GetCameraControls({camera})"));
+        if may_auto_start(&header) {
+            self.auto_start.push(format!("GetCameraControls({camera})"));
+        }
+        if !camera.is_empty()
+            && let Some(id) = self.rename_on_get.take()
+        {
+            self.cameras[0].id = id;
+        }
+        if self.fail_gets {
+            return Err(IpcError::Failed("the device cannot be read".into()));
+        }
+        let at = self.controls_of(camera)?;
+        Ok(self.controls_at(at))
+    }
+
+    /// Checks the name, the range and the step, as the daemon does.
+    async fn set_camera_control(
+        &mut self,
+        camera: &str,
+        name: &str,
+        value: i32,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        self.calls
+            .push(format!("SetCameraControl({camera},{name},{value})"));
+        let at = self.controls_of(camera)?;
+        let Some(c) = self.controls.iter_mut().find(|c| c.name == name && at == 0) else {
+            return Err(IpcError::InvalidArgument(format!(
+                "the camera has no control {name:?}"
+            )));
+        };
+        if !(c.min..=c.max).contains(&value) {
+            return Err(IpcError::InvalidArgument(format!(
+                "{name} {value} is outside its range {}..={}",
+                c.min, c.max
+            )));
+        }
+        if (value - c.min) % c.step != 0 {
+            return Err(IpcError::InvalidArgument(format!(
+                "{name} {value} is not on its step of {} from {}",
+                c.step, c.min
+            )));
+        }
+        c.value = value;
+        c.stored = true;
+        self.camera_controls_changed(&emitter).await?;
+        Ok(())
+    }
+
+    async fn reset_camera_controls(
+        &mut self,
+        camera: &str,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        self.calls.push(format!("ResetCameraControls({camera})"));
+        self.controls_of(camera)?;
+        for c in &mut self.controls {
+            c.value = c.default;
+            c.stored = false;
+        }
+        self.camera_controls_changed(&emitter).await?;
+        Ok(())
+    }
+
     #[zbus(signal)]
     async fn stats(
         emitter: &SignalEmitter<'_>,
@@ -678,6 +808,17 @@ impl Mock {
     #[zbus(property, name = "PipeWireOutput")]
     fn pipewire_output(&self) -> String {
         self.pipewire_output.clone()
+    }
+
+    #[zbus(property)]
+    fn camera_controls(&self) -> CameraControls {
+        match self.cameras.get(self.active) {
+            Some(c) => CameraControls {
+                camera: c.id.clone(),
+                controls: self.controls_at(self.active),
+            },
+            None => CameraControls::default(),
+        }
     }
 
     #[zbus(property)]
@@ -837,6 +978,58 @@ impl MockDaemon {
                 .await
                 .unwrap();
         });
+    }
+
+    /// The first camera's controls become `controls`, announced.
+    fn set_controls(&self, controls: Vec<CameraControl>) {
+        let iface = self.iface();
+        self.rt.block_on(async {
+            iface.get_mut().await.controls = controls;
+            let m = iface.get().await;
+            m.camera_controls_changed(iface.signal_emitter())
+                .await
+                .unwrap();
+        });
+    }
+
+    /// Announces `CameraControls` without changing it.
+    fn announce_controls(&self) {
+        let iface = self.iface();
+        self.rt.block_on(async {
+            let m = iface.get().await;
+            m.camera_controls_changed(iface.signal_emitter())
+                .await
+                .unwrap();
+        });
+    }
+
+    /// No camera is present any more (not announced).
+    fn remove_cameras(&self) {
+        let iface = self.iface();
+        self.rt
+            .block_on(async { iface.get_mut().await.cameras.clear() });
+    }
+
+    /// The next `GetCameraControls` for a named camera finds the first
+    /// camera under the id `id` instead.
+    fn rename_first_camera_on_next_get(&self, id: &str) {
+        let iface = self.iface();
+        self.rt
+            .block_on(async { iface.get_mut().await.rename_on_get = Some(id.into()) });
+    }
+
+    /// `GetCameraControls` fails, or works again.
+    fn fail_get_camera_controls(&self, fail: bool) {
+        let iface = self.iface();
+        self.rt
+            .block_on(async { iface.get_mut().await.fail_gets = fail });
+    }
+
+    /// The first camera's id becomes `id` (not announced).
+    fn set_first_camera_id(&self, id: &str) {
+        let iface = self.iface();
+        self.rt
+            .block_on(async { iface.get_mut().await.cameras[0].id = id.into() });
     }
 
     fn release_name(&self) {
@@ -1062,7 +1255,70 @@ impl Rev3 {
     }
 }
 
-/// An older daemon ([`Rev1`], [`Rev3`]) served on the private bus under the
+/// A daemon of interface revision 5, the one before the camera image
+/// controls: no `CameraControls`, and a call to `GetCameraControls`,
+/// `SetCameraControl` or `ResetCameraControls` fails with `UnknownMethod`.
+/// (The members of revisions 2 to 5 that the CLI reads have their default
+/// value when absent, so they are left out.)
+struct Rev5;
+
+#[interface(name = "br.com.dias.OmarchyBroadcast1")]
+impl Rev5 {
+    async fn set_enabled(&mut self, _enabled: bool) -> Result<(), IpcError> {
+        Ok(())
+    }
+
+    #[zbus(property)]
+    fn state(&self) -> State {
+        State::Idle
+    }
+
+    #[zbus(property)]
+    fn error(&self) -> String {
+        String::new()
+    }
+
+    #[zbus(property)]
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    #[zbus(property)]
+    fn cameras(&self) -> Vec<CameraInfo> {
+        vec![CameraInfo {
+            id: "usb-1234_abcd".into(),
+            name: "First Camera".into(),
+            usb: "1234:abcd".into(),
+        }]
+    }
+
+    #[zbus(property)]
+    fn active_camera(&self) -> String {
+        "usb-1234_abcd".into()
+    }
+
+    #[zbus(property)]
+    fn output_mode(&self) -> String {
+        "NV12 1920x1080@30".into()
+    }
+
+    #[zbus(property)]
+    fn effect(&self) -> String {
+        "none".into()
+    }
+
+    #[zbus(property)]
+    fn consumers(&self) -> u32 {
+        0
+    }
+
+    #[zbus(property)]
+    fn interface_revision(&self) -> u32 {
+        5
+    }
+}
+
+/// An older daemon ([`Rev1`], [`Rev3`], [`Rev5`]) served on the private bus under the
 /// daemon's name.
 struct OldDaemon {
     _rt: tokio::runtime::Runtime,
@@ -2162,5 +2418,490 @@ fn preview_json_refuses_a_frame_path_too_long_for_a_line() {
     assert_eq!(
         (v["type"].as_str(), v["seq"].as_u64()),
         (Some("frame"), Some(2))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// controls
+
+/// `controls` of the mock's first camera, untouched, for a person.
+const CONTROLS_TEXT: &str = "Camera:     First Camera (1234:abcd)\n  \
+                             brightness    0  -64..64        default 0\n  \
+                             saturation   50  0..100 step 2  default 50\n  \
+                             sharpness   128  0..255         default 128\n";
+const NOT_IN_USE: &str = "The camera is not in use: changes apply the next time it opens.\n";
+
+#[test]
+fn controls_human_and_json() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+
+    let out = bus.run(&["controls"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(out.stdout, format!("{CONTROLS_TEXT}{NOT_IN_USE}"));
+    assert_eq!(out.stderr, "");
+    // Read from the device, for the active camera's id, never starting the
+    // daemon.
+    assert_eq!(mock.take_calls(), ["GetCameraControls(usb-1234_abcd)"]);
+
+    let out = bus.run(&["controls", "--json"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(out.stdout.lines().count(), 1, "{}", out.stdout);
+    let v = json_line(&out.stdout);
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "v": 1, "type": "controls", "camera": "usb-1234_abcd",
+            "controls": [
+                {"name": "brightness", "min": -64, "max": 64, "step": 1,
+                 "default": 0, "value": 0, "stored": false},
+                {"name": "saturation", "min": 0, "max": 100, "step": 2,
+                 "default": 50, "value": 50, "stored": false},
+                {"name": "sharpness", "min": 0, "max": 255, "step": 1,
+                 "default": 128, "value": 128, "stored": false},
+            ],
+            "controls_truncated": false,
+        })
+    );
+    assert_eq!(mock.take_calls(), ["GetCameraControls(usb-1234_abcd)"]);
+
+    // While the camera streams, a change applies at once.
+    mock.set_state(State::Active, "");
+    let out = bus.run(&["controls"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(out.stdout, format!("{CONTROLS_TEXT}Applied live.\n"));
+
+    // A camera without image controls.
+    let out = bus.run(&["camera", "platform-video2"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let out = bus.run(&["controls"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "Camera:     Second Camera\nNo image controls.\nApplied live.\n"
+    );
+    let v = json_line(&bus.run(&["controls", "--json"]).stdout);
+    assert_eq!(v["camera"], "platform-video2");
+    assert_eq!(v["controls"], serde_json::json!([]));
+
+    // `status --json` carries the property.
+    let v = json_line(&bus.run(&["status", "--json"]).stdout);
+    assert_eq!(v["camera_controls"]["camera"], "platform-video2");
+    assert_eq!(v["camera_controls"]["controls"], serde_json::json!([]));
+    assert_eq!(v["camera_controls"]["controls_truncated"], false);
+
+    assert!(
+        mock.auto_start_calls().is_empty(),
+        "{:?}",
+        mock.auto_start_calls()
+    );
+    assert!(!bus.activation_attempted());
+}
+
+/// No camera present: nothing to read, so no call, and the empty controls
+/// of the `CameraControls` property, exit 0.
+#[test]
+fn controls_without_a_camera_are_empty_not_an_error() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    mock.remove_cameras();
+
+    let out = bus.run(&["controls"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        format!("Camera:     none\nNo image controls.\n{NOT_IN_USE}")
+    );
+    assert_eq!(out.stderr, "");
+
+    let out = bus.run(&["controls", "--json"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        json_line(&out.stdout),
+        serde_json::json!({
+            "v": 1, "type": "controls", "camera": "", "controls": [],
+            "controls_truncated": false,
+        })
+    );
+    assert_eq!(mock.take_calls(), Vec::<String>::new());
+
+    // The same as the property says.
+    let v = json_line(&bus.run(&["status", "--json"]).stdout);
+    assert_eq!(v["camera_controls"]["camera"], "");
+    assert_eq!(v["camera_controls"]["controls"], serde_json::json!([]));
+}
+
+/// The active camera changes between the properties and the call: one
+/// retry with the new id.
+#[test]
+fn controls_retry_once_when_the_active_camera_changed() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    mock.rename_first_camera_on_next_get("usb-new_id");
+
+    let out = bus.run(&["controls"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(out.stdout, format!("{CONTROLS_TEXT}{NOT_IN_USE}"));
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "GetCameraControls(usb-1234_abcd)",
+            "GetCameraControls(usb-new_id)"
+        ]
+    );
+}
+
+/// A change the daemon accepted, whose read-back failed: still a failure
+/// status, but the message says the change was made.
+#[test]
+fn controls_set_says_so_when_only_the_read_back_failed() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    mock.fail_get_camera_controls(true);
+
+    let out = bus.run(&["controls", "set", "brightness", "-10"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert_eq!(out.stdout, "");
+    assert!(
+        out.stderr.contains("the change was made")
+            && out.stderr.contains("the device cannot be read"),
+        "{}",
+        out.stderr
+    );
+    mock.fail_get_camera_controls(false);
+    let v = json_line(&bus.run(&["controls", "--json"]).stdout);
+    assert_eq!(v["controls"][0]["value"], -10);
+    assert_eq!(v["controls"][0]["stored"], true);
+
+    // A change that fails keeps the plain message.
+    let out = bus.run(&["controls", "set", "brightness", "1000"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert!(
+        !out.stderr.contains("the change was made"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn controls_set_and_reset_print_the_result() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+
+    let out = bus.run(&["controls", "set", "brightness", "-10"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        format!(
+            "Camera:     First Camera (1234:abcd)\n  \
+             brightness  -10  -64..64        default 0    (stored)\n  \
+             saturation   50  0..100 step 2  default 50\n  \
+             sharpness   128  0..255         default 128\n{NOT_IN_USE}"
+        )
+    );
+    assert_eq!(out.stderr, "");
+    // On the active camera (`""`), then read back from the device.
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "SetCameraControl(,brightness,-10)",
+            "GetCameraControls(usb-1234_abcd)"
+        ]
+    );
+    let out = bus.run(&["controls", "set", "saturation", "+52"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(mock.take_calls()[0], "SetCameraControl(,saturation,52)");
+    let v = json_line(&bus.run(&["controls", "--json"]).stdout);
+    assert_eq!(v["controls"][0]["value"], -10);
+    assert_eq!(v["controls"][0]["stored"], true);
+    assert_eq!(v["controls"][1]["value"], 52);
+    mock.take_calls();
+
+    mock.set_state(State::Active, "");
+    let out = bus.run(&["controls", "reset"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(out.stdout, format!("{CONTROLS_TEXT}Applied live.\n"));
+    assert_eq!(
+        mock.take_calls(),
+        ["ResetCameraControls()", "GetCameraControls(usb-1234_abcd)"]
+    );
+}
+
+#[test]
+fn controls_usage_errors_exit_2_before_any_call() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    for args in [
+        &["controls", "set", "hue", "1"][..],
+        &["controls", "set", "Brightness", "1"],
+        &["controls", "set", "", "1"],
+        &["controls", "set", "brightness", "1.5"],
+        &["controls", "set", "brightness", "ten"],
+        &["controls", "set", "brightness", "0x10"],
+        &["controls", "set", "brightness", ""],
+        &["controls", "set", "brightness", "2147483648"],
+        &["controls", "set", "brightness", "-2147483649"],
+        &["controls", "set", "brightness", "99999999999999999999"],
+        &["controls", "set", "brightness"],
+        &["controls", "set", "brightness", "1", "2"],
+        &["controls", "set"],
+        &["controls", "--json", "set", "brightness", "1"],
+        &["controls", "set", "brightness", "1", "--json"],
+        &["controls", "reset", "--json"],
+        &["controls", "reset", "brightness"],
+        &["controls", "sharpen"],
+    ] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", out.stderr);
+        assert_eq!(out.stdout, "", "{args:?}");
+        assert!(
+            out.stderr.starts_with("error: "),
+            "{args:?}: {}",
+            out.stderr
+        );
+    }
+    let out = bus.run(&["controls", "set", "hue", "1"]);
+    assert!(
+        out.stderr.contains("backlight_compensation"),
+        "{}",
+        out.stderr
+    );
+    assert!(mock.take_calls().is_empty());
+    assert!(!bus.activation_attempted());
+}
+
+#[test]
+fn controls_rejected_by_the_daemon_exit_1_with_its_message() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    for (args, message) in [
+        (
+            &["controls", "set", "brightness", "65"][..],
+            "brightness 65 is outside its range -64..=64",
+        ),
+        (
+            &["controls", "set", "saturation", "51"],
+            "saturation 51 is not on its step of 2 from 0",
+        ),
+        (
+            &["controls", "set", "contrast", "5"],
+            "the camera has no control \"contrast\"",
+        ),
+    ] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", out.stderr);
+        assert_eq!(out.stdout, "", "{args:?}");
+        assert_eq!(out.stderr, format!("omarchy-broadcast: {message}\n"));
+        assert_eq!(mock.take_calls().len(), 1, "{args:?}: nothing read back");
+    }
+    // Nothing was changed.
+    let out = bus.run(&["controls"]);
+    assert_eq!(out.stdout, format!("{CONTROLS_TEXT}{NOT_IN_USE}"));
+}
+
+#[test]
+fn controls_never_start_the_daemon_but_set_and_reset_may() {
+    let bus = Bus::start();
+    let out = bus.run(&["controls"]);
+    assert_eq!(out.status.code(), Some(3), "{}", out.stderr);
+    assert!(out.stderr.contains("is not running"), "{}", out.stderr);
+    let out = bus.run(&["controls", "--json"]);
+    assert_eq!(out.status.code(), Some(3), "{}", out.stderr);
+    let v = json_line(&out.stdout);
+    assert_eq!(v["type"], "error");
+    assert_eq!(v["code"], "daemon-not-running");
+    assert!(!bus.activation_attempted(), "`controls` must not start it");
+
+    for args in [
+        &["controls", "set", "sharpness", "1"][..],
+        &["controls", "reset"],
+    ] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(3), "{args:?}: {}", out.stderr);
+        assert!(
+            out.stderr.contains("D-Bus could not start it"),
+            "{}",
+            out.stderr
+        );
+    }
+    assert!(bus.activation_attempted(), "`controls set` may start it");
+}
+
+#[test]
+fn controls_against_a_revision_5_daemon_say_they_are_unsupported() {
+    let bus = Bus::start();
+    let _daemon = OldDaemon::start(&bus, Rev5);
+    let expected = "omarchy-broadcast: the daemon does not support camera controls (its \
+                    interface revision is 5, camera controls need 6); update omarchy-broadcastd\n";
+    for args in [
+        &["controls"][..],
+        &["controls", "set", "brightness", "1"],
+        &["controls", "reset"],
+    ] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", out.stderr);
+        assert_eq!(out.stdout, "", "{args:?}");
+        assert_eq!(out.stderr, expected, "{args:?}");
+    }
+    let out = bus.run(&["controls", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert_eq!(out.stderr, "");
+    assert_eq!(out.stdout.lines().count(), 1, "{}", out.stdout);
+    let v = json_line(&out.stdout);
+    assert_eq!(v["type"], "error");
+    assert_eq!(v["code"], "unsupported-daemon");
+    assert_eq!(
+        v["error"],
+        expected
+            .trim_start_matches("omarchy-broadcast: ")
+            .trim_end_matches('\n')
+    );
+
+    // Its snapshot has none: `null`, with the key present.
+    let v = json_line(&bus.run(&["status", "--json"]).stdout);
+    assert_eq!(v["interface_revision"], 5);
+    assert!(v.as_object().unwrap().contains_key("camera_controls"));
+    assert_eq!(v["camera_controls"], Value::Null);
+    let mut watch = bus.watch(&["watch", "--json"], None);
+    let v = watch.next_json("the snapshot of a revision-5 daemon");
+    assert_eq!(v["type"], "snapshot", "{v}");
+    assert!(v.as_object().unwrap().contains_key("camera_controls"));
+    assert_eq!(v["camera_controls"], Value::Null);
+    watch.child.signal(libc::SIGTERM);
+    let (status, _) = watch.finish("watch --json");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+#[test]
+fn watch_prints_the_controls_when_they_change() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+
+    let watch = bus.watch(&["watch", "--json"], None);
+    let v = watch.next_json("the first snapshot");
+    assert_eq!(v["type"], "snapshot", "{v}");
+    assert_eq!(v["camera_controls"]["camera"], "usb-1234_abcd");
+    assert_eq!(
+        v["camera_controls"]["controls"][2],
+        serde_json::json!({"name": "sharpness", "min": 0, "max": 255, "step": 1,
+                           "default": 128, "value": 128, "stored": false})
+    );
+    assert_eq!(v["camera_controls"]["controls_truncated"], false);
+
+    let out = bus.run(&["controls", "set", "sharpness", "200"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let v = watch.next_json("a controls change");
+    assert_eq!(v["type"], "controls", "{v}");
+    assert_eq!(v["camera"], "usb-1234_abcd");
+    assert_eq!(v["controls"].as_array().unwrap().len(), 3);
+    assert_eq!(v["controls"][2]["value"], 200);
+    assert_eq!(v["controls"][2]["stored"], true);
+    assert_eq!(v["controls_truncated"], false);
+
+    // An announcement that changes nothing prints nothing.
+    mock.announce_controls();
+    watch.quiet_for(Duration::from_millis(500), "an unchanged CameraControls");
+    let out = bus.run(&["controls", "reset"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let v = watch.next_json("the reset");
+    assert_eq!(v["type"], "controls", "{v}");
+    assert_eq!(v["controls"][2]["value"], 128);
+    assert_eq!(v["controls"][2]["stored"], false);
+    let mut watch = watch;
+    watch.child.signal(libc::SIGTERM);
+    let (status, stderr) = watch.finish("watch --json");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert_eq!(stderr, "");
+
+    // For a person.
+    let mut watch = bus.watch(&["watch"], None);
+    assert!(
+        watch
+            .next("the summary")
+            .starts_with("omarchy-broadcastd: state idle")
+    );
+    let out = bus.run(&["controls", "set", "brightness", "-64"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        watch.next("a controls change"),
+        "camera controls: brightness -64 (stored), saturation 50, sharpness 128\n"
+    );
+    mock.announce_controls();
+    watch.quiet_for(Duration::from_millis(500), "an unchanged CameraControls");
+    mock.set_controls(Vec::new());
+    assert_eq!(watch.next("no controls"), "camera controls: none\n");
+    watch.child.signal(libc::SIGTERM);
+    let (status, stderr) = watch.finish("watch");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert_eq!(stderr, "");
+    assert!(!bus.activation_attempted());
+}
+
+#[test]
+fn controls_lines_stay_under_the_cap_with_a_long_camera_id() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    // A hostile daemon: a long id full of escapes, and too many controls
+    // with long names that carry escapes too.
+    let evil = "\u{1b}]0;x\u{7}\u{202e}\"\\";
+    let id = format!("usb-{}", evil.repeat(60));
+    mock.set_first_camera_id(&id);
+    let many: Vec<CameraControl> = (0..20)
+        .map(|i| {
+            control(
+                &format!("{i}{evil}{}", "n".repeat(100)),
+                i32::MIN,
+                i32::MAX,
+                1,
+                i32::MIN,
+            )
+        })
+        .collect();
+    mock.set_controls(many);
+
+    let out = bus.run(&["controls", "--json"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let v = json_line(&out.stdout);
+    let camera = v["camera"].as_str().unwrap();
+    assert!(
+        camera.starts_with("usb-") && camera.ends_with('\u{2026}'),
+        "{camera}"
+    );
+    assert!(
+        serde_json::to_string(camera).unwrap().len() - 2 <= 96,
+        "{camera}"
+    );
+    assert_eq!(v["controls"].as_array().unwrap().len(), 16);
+    assert_eq!(v["controls_truncated"], true);
+    for c in v["controls"].as_array().unwrap() {
+        let name = c["name"].as_str().unwrap();
+        assert!(name.ends_with('\u{2026}') && name.len() <= 32, "{name}");
+    }
+
+    let v = json_line(&bus.run(&["status", "--json"]).stdout);
+    assert_eq!(v["camera_controls"]["camera"].as_str().unwrap(), camera);
+    assert_eq!(v["camera_controls"]["controls_truncated"], true);
+    let watch = bus.watch(&["watch", "--json"], Some(1));
+    let v = watch.next_json("the snapshot");
+    assert_eq!(v["camera_controls"]["controls_truncated"], true);
+    let _ = watch.finish("watch --json | head -1");
+
+    // For a person, the id is escaped and each control is one line.
+    let out = bus.run(&["controls"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(out.stdout.lines().count(), 1 + 20 + 1, "{}", out.stdout);
+    assert!(
+        !out.stdout
+            .chars()
+            .any(|c| (c.is_control() && c != '\n') || c == '\u{202e}'),
+        "{:?}",
+        out.stdout
+    );
+    // The camera is listed: its name, not its id.
+    assert!(
+        out.stdout
+            .starts_with("Camera:     First Camera (1234:abcd)\n  0\\x1b]0;x\\x07\\u{202e}\"\\"),
+        "{}",
+        out.stdout
     );
 }

@@ -12,8 +12,37 @@ use std::time::Duration;
 use obc_core::config::EffectConfig;
 use obc_core::{AspectPolicy, ModeRequest, OutputContract, SinkSelector};
 use obc_ipc::Stats;
+use obc_pipeline::controls::DeviceControl;
 
 use crate::camera::Camera;
+
+/// What [`ControlNode::query`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ControlQuery {
+    /// The [`obc_pipeline::controls::IMAGE_CONTROLS`] the device exposes
+    /// as adjustable, in that order, each with its value.
+    pub controls: Vec<DeviceControl>,
+    /// Each control left out because its query or its read failed: (name,
+    /// why).
+    pub skipped: Vec<(String, String)>,
+}
+
+/// One camera node opened for its image controls
+/// ([`MediaBackend::open_camera_controls`]); closed when dropped. Each
+/// call is one or a few ioctls.
+pub trait ControlNode {
+    /// The image controls the device exposes, each with its current value
+    /// ([`obc_pipeline::controls::ImageControls::query`]): a control that
+    /// cannot be read is skipped, never the whole list.
+    fn query(&mut self) -> ControlQuery;
+
+    /// Writes the image control `name` (its value checked by the caller).
+    fn set(&mut self, name: &str, value: i32) -> Result<(), String>;
+
+    /// Reads the image control `name` back (the driver may have rounded a
+    /// value written).
+    fn get(&mut self, name: &str) -> Result<i32, String>;
+}
 
 #[cfg(test)]
 pub mod fake;
@@ -268,4 +297,22 @@ pub trait MediaBackend: Send + 'static {
 
     /// The running session's effect (`None`: no session).
     fn effect_report(&mut self) -> Option<EffectReport>;
+
+    /// Opens `camera`'s node for its image controls (for writing as well
+    /// when `write`): one open for the whole operation, its queries, writes
+    /// and reads ([`ControlNode`]). Opening starts no stream, so it may be
+    /// done in any state, whoever uses the camera. `Err` when the node
+    /// cannot be opened. The caller writes only to the camera the session
+    /// has open.
+    fn open_camera_controls(
+        &mut self,
+        camera: &Camera,
+        write: bool,
+    ) -> Result<Box<dyn ControlNode>, String>;
+
+    /// The image controls `camera` exposes, each with its value on the
+    /// device: [`Self::open_camera_controls`], then one query.
+    fn camera_controls(&mut self, camera: &Camera) -> Result<ControlQuery, String> {
+        Ok(self.open_camera_controls(camera, false)?.query())
+    }
 }

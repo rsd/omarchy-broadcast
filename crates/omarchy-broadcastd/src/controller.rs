@@ -90,6 +90,25 @@
 //! controller's business: the backend reports them to the D-Bus side
 //! directly.
 //!
+//! Each camera keeps its own image controls (brightness, contrast,
+//! saturation, sharpness, backlight compensation: the allowlist of
+//! [`obc_pipeline::controls::IMAGE_CONTROLS`], the same for every camera),
+//! stored by camera id in the state file. The device is written only while
+//! the session has that camera open (its ingest switched to it: `starting`
+//! or `active`); otherwise a `SetCameraControl` is only stored and a
+//! `ResetCameraControls` leaves a reset pending. Whenever a camera opens
+//! (every successful switch of the ingest to it, and a rename of the
+//! session's camera to an id with stored controls), a pending reset writes
+//! every default, then each stored value is written; a value the device
+//! does not take is logged and never stops the session. Closing the camera
+//! restores nothing: what the user set stays on the device. Reading the
+//! controls (queries and reads, no stream) is allowed in any state; a
+//! control that cannot be read is left out, not the list. The
+//! `CameraControls` property is the view of `ActiveCamera`'s controls, as
+//! the device has them after a write: queried again when `ActiveCamera`
+//! changes, on a rescan, at an open, at the camera's first frame and at a
+//! control method, never polled.
+//!
 //! The streaming camera is followed by its device node, not by its id: an
 //! id can change between two scans of the same camera (udev adds the
 //! `/dev/v4l` links after the node), and such a change is a rename, not a
@@ -97,20 +116,24 @@
 //! another plugged in between two scans): that is a loss, and the
 //! selection stays on the camera that left ([`camera::same_camera`]).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use obc_core::config::{Config, EffectConfig, RuntimeState};
+use obc_core::config::{CameraControlState, Config, EffectConfig, RuntimeState};
 use obc_core::{EffectMode, EffectOnFailure, OutputContract};
-use obc_ipc::{CameraInfo, INTERFACE_REVISION, IpcError, Snapshot, State, Stats};
+use obc_ipc::{
+    CameraControl, CameraControls, CameraInfo, INTERFACE_REVISION, IpcError, Snapshot, State, Stats,
+};
+use obc_pipeline::controls::{DeviceControl, IMAGE_CONTROLS, check_value, image_control_id};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::backend::{
-    EffectReport, EffectStatus, Failure, MediaBackend, PipeWireEvent, PipeWireGeneration,
-    PipeWireState, PreviewRequest, SessionParams,
+    ControlNode, EffectReport, EffectStatus, Failure, MediaBackend, PipeWireEvent,
+    PipeWireGeneration, PipeWireState, PreviewRequest, SessionParams,
 };
 use crate::camera::{self, Camera};
 use crate::preview::{Leases, PreviewDir, check_fps};
@@ -139,6 +162,8 @@ pub const MAX_BACKGROUND_BYTES: u64 = 32 * 1024 * 1024;
 pub type Reply = tokio::sync::oneshot::Sender<Result<(), IpcError>>;
 /// The reply channel of `AcquirePreview`: the frame file's path.
 pub type PathReply = tokio::sync::oneshot::Sender<Result<String, IpcError>>;
+/// The reply channel of `GetCameraControls`.
+pub type ControlsReply = tokio::sync::oneshot::Sender<Result<Vec<CameraControl>, IpcError>>;
 
 /// What the controller is asked to do.
 #[derive(Debug)]
@@ -165,6 +190,17 @@ pub enum Command {
     /// That unique bus name left the bus (`NameOwnerChanged` with no new
     /// owner): its preview lease, if any, ends.
     PreviewOwnerGone(String),
+    /// `GetCameraControls(s)` (empty: `ActiveCamera`).
+    GetCameraControls(String, ControlsReply),
+    /// `SetCameraControl(s, s, i)`.
+    SetCameraControl {
+        camera: String,
+        name: String,
+        value: i32,
+        reply: Reply,
+    },
+    /// `ResetCameraControls(s)`.
+    ResetCameraControls(String, Reply),
     /// `ReloadConfig()` (with its reply) or SIGHUP (without).
     ReloadConfig(Option<Reply>),
     /// The consumer watcher's count of processes holding the loopback.
@@ -196,6 +232,7 @@ pub enum Change {
     PipeWireConsumers(u32),
     PreviewConsumers(u32),
     PipeWireOutput(String),
+    CameraControls(CameraControls),
 }
 
 impl Change {
@@ -217,6 +254,7 @@ impl Change {
             Change::PipeWireConsumers(_) => "PipeWireConsumers",
             Change::PreviewConsumers(_) => "PreviewConsumers",
             Change::PipeWireOutput(_) => "PipeWireOutput",
+            Change::CameraControls(_) => "CameraControls",
         }
     }
 }
@@ -332,6 +370,11 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Vec<Change> {
     if old.active_camera != new.active_camera {
         out.push(Change::ActiveCamera(new.active_camera.clone()));
     }
+    if old.camera_controls != new.camera_controls {
+        out.push(Change::CameraControls(
+            new.camera_controls.clone().unwrap_or_default(),
+        ));
+    }
     if old.output_mode != new.output_mode {
         out.push(Change::OutputMode(new.output_mode.clone()));
     }
@@ -397,11 +440,12 @@ pub struct Paths {
 /// not enabled, no selection, no effect override (the config's effect is
 /// the one in force, and `SetEnabled` rewrites the file without the saved
 /// effect choice), and the second value is the `Error` text naming the file
-/// and saying so (`None`: the file is fine or absent).
-pub fn load_runtime_state(path: &Path) -> (RuntimeState, Option<String>) {
-    match RuntimeState::load(path) {
-        (state, None) => (state, None),
-        (_, Some(warn)) => {
+/// and saying so (`None`: the file is fine or absent). The third is what
+/// was dropped from the camera image controls (never a damage).
+pub fn load_runtime_state(path: &Path) -> (RuntimeState, Option<String>, Vec<String>) {
+    match RuntimeState::load_noting(path) {
+        (state, None, notes) => (state, None, notes),
+        (_, Some(warn), _) => {
             let why = warn.trim_end_matches("; using the default state");
             (
                 RuntimeState {
@@ -413,6 +457,7 @@ pub fn load_runtime_state(path: &Path) -> (RuntimeState, Option<String>) {
                      rewrites the state file; any effect choice saved there is dropped in favour \
                      of the configuration's effect"
                 )),
+                Vec::new(),
             )
         }
     }
@@ -422,7 +467,7 @@ pub fn load_runtime_state(path: &Path) -> (RuntimeState, Option<String>) {
 /// read: no device is touched).
 pub fn preliminary_snapshot(paths: &Paths) -> Snapshot {
     let config = Config::load(&paths.config).unwrap_or_default();
-    let (runtime, damaged) = load_runtime_state(&paths.state);
+    let (runtime, damaged, _) = load_runtime_state(&paths.state);
     let effect = runtime.effect_over(&config.effect);
     Snapshot {
         state: if runtime.enabled {
@@ -444,6 +489,7 @@ pub fn preliminary_snapshot(paths: &Paths) -> Snapshot {
         pipewire_consumers: 0,
         preview_consumers: 0,
         pipewire_output: PipeWireState::Off.as_str().into(),
+        camera_controls: Some(CameraControls::default()),
         interface_revision: INTERFACE_REVISION,
     }
 }
@@ -548,6 +594,9 @@ struct Streaming {
     live: bool,
     /// When the current camera's ingest started, until its first frame.
     awaiting: Option<Instant>,
+    /// The ingest's switch to `camera` succeeded: the session has it open
+    /// (`starting` or `active`), so the image control methods write to it.
+    open: bool,
 }
 
 /// The lifecycle state machine (see the module docs).
@@ -624,6 +673,16 @@ pub struct Controller<B: MediaBackend> {
     /// Since when no consumer has been present (grace).
     absent_since: Option<Instant>,
     next_stats: Option<Instant>,
+    /// The `CameraControls` property: the controls of the camera it names
+    /// (`ActiveCamera` when it was queried), refreshed only at the moments
+    /// the module docs list.
+    controls_view: CameraControls,
+    /// The camera whose controls could not be read, already logged (so a
+    /// failing query is logged once, not at every refresh).
+    controls_unreadable: Option<String>,
+    /// The (camera id, control) pairs a query skipped as unreadable,
+    /// already warned about (later skips are logged at debug).
+    controls_skipped: HashSet<(String, String)>,
     published: Published,
     sink_hook: Option<SinkHook>,
 }
@@ -646,7 +705,10 @@ impl<B: MediaBackend> Controller<B> {
                 (Config::default(), msg)
             }
         };
-        let (runtime, state_damaged) = load_runtime_state(&paths.state);
+        let (runtime, state_damaged, notes) = load_runtime_state(&paths.state);
+        for note in notes {
+            warning!("{note}");
+        }
         let error = match &state_damaged {
             Some(d) => {
                 error!("{d}");
@@ -701,6 +763,9 @@ impl<B: MediaBackend> Controller<B> {
             present_since: None,
             absent_since: None,
             next_stats: None,
+            controls_view: CameraControls::default(),
+            controls_unreadable: None,
+            controls_skipped: HashSet::new(),
             published,
             sink_hook,
         };
@@ -753,6 +818,23 @@ impl<B: MediaBackend> Controller<B> {
             }
             Command::PreviewOwnerGone(name) => {
                 self.release_preview(&name, "ended: its holder left the bus", now);
+            }
+            Command::GetCameraControls(camera, reply) => {
+                let res = self.get_camera_controls(&camera);
+                let _ = reply.send(res);
+            }
+            Command::SetCameraControl {
+                camera,
+                name,
+                value,
+                reply,
+            } => {
+                let res = self.set_camera_control(&camera, &name, value, now);
+                let _ = reply.send(res);
+            }
+            Command::ResetCameraControls(camera, reply) => {
+                let res = self.reset_camera_controls(&camera, now);
+                let _ = reply.send(res);
             }
             Command::ReloadConfig(reply) => {
                 let res = self.reload(now);
@@ -965,6 +1047,9 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     fn publish(&mut self) {
+        if self.controls_view.camera != self.active_camera() {
+            self.refresh_controls();
+        }
         let effect = self.effect();
         let snap = Snapshot {
             state: self.state(),
@@ -982,6 +1067,7 @@ impl<B: MediaBackend> Controller<B> {
             pipewire_consumers: self.pipewire_consumers,
             preview_consumers: self.leases.count(),
             pipewire_output: self.pipewire_state.as_str().into(),
+            camera_controls: Some(self.controls_view.clone()),
             interface_revision: INTERFACE_REVISION,
         };
         self.published.update(snap);
@@ -1213,6 +1299,9 @@ impl<B: MediaBackend> Controller<B> {
                     let _ = self.backend.take_stats();
                     self.next_stats = Some(now + STATS_PERIOD);
                 }
+                // The camera's first frame: its controls are read once
+                // more (a camera may change them as it starts streaming).
+                self.refresh_controls();
             } else if now.saturating_duration_since(since) >= START_TIMEOUT {
                 let msg = format!(
                     "{} delivered no frame within {} s",
@@ -1462,6 +1551,7 @@ impl<B: MediaBackend> Controller<B> {
                 s.camera = cam.id.clone();
                 s.node = cam.path.clone();
                 s.awaiting = Some(now);
+                s.open = false;
             }
             match self.backend.switch_camera(&params, cam) {
                 Ok(()) => {
@@ -1473,6 +1563,7 @@ impl<B: MediaBackend> Controller<B> {
                         cam.mode.height,
                         cam.mode.fps()
                     );
+                    self.camera_opened(cam);
                     return Ok(());
                 }
                 Err(e) => {
@@ -1567,6 +1658,7 @@ impl<B: MediaBackend> Controller<B> {
             failed: Vec::new(),
             live: false,
             awaiting: Some(now),
+            open: false,
         });
         // `starting` is announced before the (slow) start.
         self.publish();
@@ -1725,7 +1817,7 @@ impl<B: MediaBackend> Controller<B> {
             &mut self.cameras,
             camera::order(found, &self.config.camera_preference()),
         );
-        self.follow_renames(&old);
+        let renamed = self.follow_renames(&old);
         debug!(
             "cameras: {}",
             self.cameras
@@ -1734,13 +1826,20 @@ impl<B: MediaBackend> Controller<B> {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        // The session's camera under a new id: what is stored under that
+        // id applies now (and the view follows); otherwise ActiveCamera,
+        // kept or changed, has its controls read again.
+        if !renamed.is_some_and(|id| self.apply_after_rename(&id)) {
+            self.refresh_controls();
+        }
         old
     }
 
     /// Follows id changes of cameras still present at the same node. A
     /// camera at that node that is not the same device
-    /// ([`camera::same_camera`]) took the node over: no rename.
-    fn follow_renames(&mut self, old: &[Camera]) {
+    /// ([`camera::same_camera`]) took the node over: no rename. Returns the
+    /// session camera's new id when it was renamed.
+    fn follow_renames(&mut self, old: &[Camera]) -> Option<String> {
         let renamed = |id: &str, node: Option<&Path>| -> Option<String> {
             if self.cameras.iter().any(|c| c.id == id) {
                 return None;
@@ -1760,6 +1859,7 @@ impl<B: MediaBackend> Controller<B> {
             .camera
             .as_deref()
             .and_then(|id| renamed(id, None));
+        let mut session_renamed = None;
         if let Some(new) = session_rename
             && let Some(s) = self.session.as_mut()
         {
@@ -1767,6 +1867,7 @@ impl<B: MediaBackend> Controller<B> {
                 "camera {} is now known as {new}",
                 std::mem::replace(&mut s.camera, new.clone())
             );
+            session_renamed = Some(new);
         }
         if let Some(new) = selection_rename {
             info!(
@@ -1776,6 +1877,7 @@ impl<B: MediaBackend> Controller<B> {
             self.runtime.camera = Some(new);
             let _ = self.save_state();
         }
+        session_renamed
     }
 
     fn rescan(&mut self, now: Instant) {
@@ -1883,12 +1985,16 @@ impl<B: MediaBackend> Controller<B> {
                 s.camera = cam.id.clone();
                 s.node = cam.path.clone();
                 s.awaiting = Some(now);
+                s.open = false;
             }
             info!("switching to {}", cam.label());
-            if let Err(e) = self.backend.switch_camera(&params, &cam) {
-                let msg = format!("switching to {}: {e}", cam.label());
-                self.camera_failed(msg.clone(), now);
-                res = Err(IpcError::Failed(msg));
+            match self.backend.switch_camera(&params, &cam) {
+                Ok(()) => self.camera_opened(&cam),
+                Err(e) => {
+                    let msg = format!("switching to {}: {e}", cam.label());
+                    self.camera_failed(msg.clone(), now);
+                    res = Err(IpcError::Failed(msg));
+                }
             }
         }
         self.reconcile(now);
@@ -2102,6 +2208,437 @@ impl<B: MediaBackend> Controller<B> {
         Err(IpcError::Failed(msg))
     }
 
+    // ---- camera image controls ----
+
+    /// The camera a control method names: an exact id of a camera present,
+    /// or `""` for `ActiveCamera`.
+    fn control_camera(&self, camera: &str) -> Result<Camera, IpcError> {
+        if camera.is_empty() {
+            let id = self.active_camera();
+            return self
+                .cameras
+                .iter()
+                .find(|c| c.id == id)
+                .cloned()
+                .ok_or_else(|| IpcError::Unavailable("no camera is present".into()));
+        }
+        self.cameras
+            .iter()
+            .find(|c| c.id == camera)
+            .cloned()
+            .ok_or_else(|| {
+                IpcError::NoSuchCamera(format!(
+                    "no camera with the id {camera:?} is present (the ids are in Cameras)"
+                ))
+            })
+    }
+
+    /// Whether the session has `camera` open: it is the session's camera
+    /// and the ingest's switch to it succeeded, while `starting` (before
+    /// its first frame) or `active`. Only then is its device written by a
+    /// method.
+    fn is_open(&self, camera: &Camera) -> bool {
+        matches!(self.state(), State::Starting | State::Active)
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.open && s.camera == camera.id && s.node == camera.path)
+    }
+
+    /// The ingest's switch to `camera` succeeded: the session has it open,
+    /// and its stored image controls apply.
+    fn camera_opened(&mut self, camera: &Camera) {
+        if let Some(s) = self.session.as_mut() {
+            s.open = true;
+        }
+        self.apply_camera_controls(camera);
+    }
+
+    /// The controls `device` reports for `camera`, as the methods and the
+    /// property give them: for the camera the session has open, the
+    /// device's values; otherwise what it will be given when it opens (the
+    /// stored value, else the default after a pending reset, else the
+    /// device's).
+    fn control_entries(&self, camera: &Camera, device: Vec<DeviceControl>) -> Vec<CameraControl> {
+        let open = self.is_open(camera);
+        let state = self.runtime.camera_controls.get(&camera.id);
+        let reset_pending = state.is_some_and(|s| s.reset_pending);
+        device
+            .into_iter()
+            .map(|d| {
+                let user = state.and_then(|s| s.values.get(&d.name)).copied();
+                let value = match user {
+                    _ if open => d.value,
+                    Some(v) => v,
+                    None if reset_pending => d.default,
+                    None => d.value,
+                };
+                CameraControl {
+                    name: d.name,
+                    min: d.min,
+                    max: d.max,
+                    step: d.step,
+                    default: d.default,
+                    value,
+                    stored: user.is_some(),
+                }
+            })
+            .collect()
+    }
+
+    /// Opens `camera`'s node (for writing as well when `write`) and queries
+    /// its controls: the node, kept open for the rest of the operation, and
+    /// what it exposes. A control the query skipped is logged, as a warning
+    /// the first time for that camera.
+    fn query_controls(
+        &mut self,
+        camera: &Camera,
+        write: bool,
+    ) -> Result<(Box<dyn ControlNode>, Vec<DeviceControl>), String> {
+        let mut node = self.backend.open_camera_controls(camera, write)?;
+        let found = node.query();
+        for (name, why) in found.skipped {
+            let what = format!(
+                "{}: {name} could not be read ({why}): it is left out of its image controls",
+                camera.label()
+            );
+            if self.controls_skipped.insert((camera.id.clone(), name)) {
+                warning!("{what}");
+            } else {
+                debug!("{what}");
+            }
+        }
+        Ok((node, found.controls))
+    }
+
+    /// Shows `device` (what is on it now) as the `CameraControls` property
+    /// when `camera` is `ActiveCamera`.
+    fn show_controls(&mut self, camera: &Camera, device: Vec<DeviceControl>) {
+        if self.active_camera() == camera.id {
+            self.controls_view = CameraControls {
+                camera: camera.id.clone(),
+                controls: self.control_entries(camera, device),
+            };
+        }
+    }
+
+    /// `camera`'s controls cannot be read (`e`): it shows none, logged once
+    /// for that camera.
+    fn controls_unreadable(&mut self, camera: &Camera, e: &str) {
+        if self.controls_unreadable.as_deref() != Some(camera.id.as_str()) {
+            warning!("{e}; no image control is shown for it");
+            self.controls_unreadable = Some(camera.id.clone());
+        }
+        self.show_controls(camera, Vec::new());
+    }
+
+    /// Queries `ActiveCamera`'s controls again for the `CameraControls`
+    /// property. A camera whose controls cannot be read shows none (logged
+    /// once for that camera).
+    fn refresh_controls(&mut self) {
+        let id = self.active_camera();
+        let Some(cam) = self.cameras.iter().find(|c| c.id == id).cloned() else {
+            self.controls_view = CameraControls {
+                camera: id,
+                controls: Vec::new(),
+            };
+            return;
+        };
+        match self.query_controls(&cam, false) {
+            Ok((_, device)) => {
+                self.controls_unreadable = None;
+                self.show_controls(&cam, device);
+            }
+            Err(e) => self.controls_unreadable(&cam, &e),
+        }
+    }
+
+    /// Writes `value` to the control `name` through `node`, then reads it
+    /// back into `device` (the driver may round it); a read that fails
+    /// keeps the value written.
+    fn write_control(
+        node: &mut dyn ControlNode,
+        device: &mut [DeviceControl],
+        name: &str,
+        value: i32,
+    ) -> Result<(), String> {
+        node.set(name, value)?;
+        let now = node.get(name).unwrap_or_else(|e| {
+            debug!("{e}");
+            value
+        });
+        if let Some(d) = device.iter_mut().find(|d| d.name == name) {
+            d.value = now;
+        }
+        Ok(())
+    }
+
+    /// Writes every control of `device` its default through `node`
+    /// ([`Self::write_control`]); returns those that failed, each with its
+    /// error (logged).
+    fn write_defaults(node: &mut dyn ControlNode, device: &mut [DeviceControl]) -> Vec<String> {
+        let mut failed = Vec::new();
+        for i in 0..device.len() {
+            let (name, default) = (device[i].name.clone(), device[i].default);
+            if let Err(e) = Self::write_control(node, device, &name, default) {
+                warning!("{e}");
+                failed.push(format!("{name} ({e})"));
+            }
+        }
+        failed
+    }
+
+    /// `camera` was just opened (its ingest switched to it): a pending
+    /// reset writes every default, then each stored value is written, all
+    /// through one open of its node. A stored value the device does not
+    /// take now (no such control, out of its range) is skipped and kept; a
+    /// write that fails is logged. None of it fails or stops the session.
+    /// The view is built from what is on the device afterwards.
+    fn apply_camera_controls(&mut self, camera: &Camera) {
+        let (mut node, mut device) = match self.query_controls(camera, true) {
+            Ok(found) => found,
+            Err(e) => {
+                warning!("{e}; its stored image controls are not applied");
+                // Logged: a refresh that fails the same is not logged again.
+                self.controls_unreadable = Some(camera.id.clone());
+                self.show_controls(camera, Vec::new());
+                return;
+            }
+        };
+        self.controls_unreadable = None;
+        if self
+            .runtime
+            .camera_controls
+            .get(&camera.id)
+            .is_some_and(|s| s.reset_pending)
+        {
+            let failed = Self::write_defaults(&mut *node, &mut device);
+            info!(
+                "image controls of {} reset to the camera's defaults{}",
+                camera.label(),
+                if failed.is_empty() {
+                    String::new()
+                } else {
+                    format!(", except {}", failed.join(", "))
+                }
+            );
+            if let Some(s) = self.runtime.camera_controls.get_mut(&camera.id) {
+                s.reset_pending = false;
+                if s.is_empty() {
+                    self.runtime.camera_controls.remove(&camera.id);
+                }
+            }
+            let _ = self.save_state();
+        }
+        let stored = self
+            .runtime
+            .camera_controls
+            .get(&camera.id)
+            .map(|s| s.values.clone())
+            .unwrap_or_default();
+        let mut applied = Vec::new();
+        for i in 0..device.len() {
+            let Some(&value) = stored.get(&device[i].name) else {
+                continue;
+            };
+            if let Err(e) = check_value(&device[i], value) {
+                warning!(
+                    "{}: the stored {e}: not applied (kept for the camera)",
+                    camera.label()
+                );
+                continue;
+            }
+            let name = device[i].name.clone();
+            match Self::write_control(&mut *node, &mut device, &name, value) {
+                Ok(()) => applied.push(format!("{name} {value}")),
+                Err(e) => warning!("{e}"),
+            }
+        }
+        drop(node);
+        for name in stored.keys() {
+            if !device.iter().any(|d| d.name == *name) {
+                warning!(
+                    "{} does not expose {name}: its stored value is not applied (kept for the \
+                     camera)",
+                    camera.label()
+                );
+            }
+        }
+        if !applied.is_empty() {
+            info!(
+                "image controls of {} applied: {}",
+                camera.label(),
+                applied.join(", ")
+            );
+        }
+        self.show_controls(camera, device);
+    }
+
+    /// The session's camera was renamed to `id` by a rescan: what is
+    /// stored under that id applies now, if the session has it open.
+    /// Returns whether it did (the view is then up to date).
+    fn apply_after_rename(&mut self, id: &str) -> bool {
+        if !self.runtime.camera_controls.contains_key(id) {
+            return false;
+        }
+        let Some(cam) = self.session_camera().cloned() else {
+            return false;
+        };
+        if cam.id != id || !self.is_open(&cam) {
+            return false;
+        }
+        info!(
+            "applying the image controls stored for {}, its new id",
+            cam.label()
+        );
+        self.apply_camera_controls(&cam);
+        true
+    }
+
+    /// `GetCameraControls`: the controls `camera` exposes, read now.
+    fn get_camera_controls(&mut self, camera: &str) -> Result<Vec<CameraControl>, IpcError> {
+        let cam = self.control_camera(camera)?;
+        let (_, device) = self.query_controls(&cam, false).map_err(IpcError::Failed)?;
+        Ok(self.control_entries(&cam, device))
+    }
+
+    /// `SetCameraControl`: checked against the allowlist and the device's
+    /// range, written while the session has the camera open (a failure
+    /// stores nothing), stored and saved. One open of the node: the query
+    /// that checks the value is the view's, with the control written read
+    /// back.
+    fn set_camera_control(
+        &mut self,
+        camera: &str,
+        name: &str,
+        value: i32,
+        now: Instant,
+    ) -> Result<(), IpcError> {
+        let cam = self.control_camera(camera)?;
+        if image_control_id(name).is_none() {
+            return Err(IpcError::InvalidArgument(format!(
+                "{name:?} is not a camera control (expected one of {})",
+                IMAGE_CONTROLS.map(|(n, _)| n).join(", ")
+            )));
+        }
+        let open = self.is_open(&cam);
+        let (mut node, mut device) = self.query_controls(&cam, open).map_err(IpcError::Failed)?;
+        let Some(control) = device.iter().find(|d| d.name == name) else {
+            return Err(IpcError::InvalidArgument(format!(
+                "{} does not expose {name}",
+                cam.label()
+            )));
+        };
+        check_value(control, value)
+            .map_err(|e| IpcError::InvalidArgument(format!("{}: {e}", cam.label())))?;
+        if open {
+            Self::write_control(&mut *node, &mut device, name, value).map_err(|e| {
+                warning!("{e}");
+                IpcError::Failed(e)
+            })?;
+        }
+        drop(node);
+        // A slider sends many: not worth the journal.
+        debug!(
+            "{} {name} = {value}{}",
+            cam.label(),
+            if open {
+                ""
+            } else {
+                " (stored: applied when it opens)"
+            }
+        );
+        let changed = self
+            .runtime
+            .camera_controls
+            .entry(cam.id.clone())
+            .or_default()
+            .values
+            .insert(name.to_string(), value)
+            != Some(value);
+        let res = if changed { self.save_state() } else { Ok(()) };
+        self.show_controls(&cam, device);
+        self.reconcile(now);
+        res
+    }
+
+    /// `ResetCameraControls`: the stored values forgotten; every control
+    /// written its default while the session has the camera open, else a
+    /// reset left pending for its next open. A default the device refuses
+    /// fails the call, naming the controls; the values are forgotten all
+    /// the same.
+    fn reset_camera_controls(&mut self, camera: &str, now: Instant) -> Result<(), IpcError> {
+        let cam = self.control_camera(camera)?;
+        let open = self.is_open(&cam);
+        let shown = self.active_camera() == cam.id;
+        let mut res = Ok(());
+        let mut pending = !open;
+        // The device: written when open, read for the view when shown.
+        let mut device = None;
+        let mut unread = None;
+        if open || shown {
+            match self.query_controls(&cam, open) {
+                Ok((mut node, mut found)) => {
+                    if open {
+                        let failed = Self::write_defaults(&mut *node, &mut found);
+                        if !failed.is_empty() {
+                            res = Err(IpcError::Failed(format!(
+                                "{}: not put back to the default: {}",
+                                cam.label(),
+                                failed.join(", ")
+                            )));
+                        }
+                    }
+                    device = Some(found);
+                }
+                Err(e) => {
+                    if open {
+                        warning!("{e}");
+                        // Logged: not again for the view.
+                        self.controls_unreadable = Some(cam.id.clone());
+                        res = Err(IpcError::Failed(format!(
+                            "{e}; the defaults are written when the camera next opens"
+                        )));
+                        pending = true;
+                    }
+                    unread = Some(e);
+                }
+            }
+        }
+        info!(
+            "image controls of {} reset{}",
+            cam.label(),
+            if pending {
+                ": the camera's defaults apply when it next opens"
+            } else {
+                " to the camera's defaults"
+            }
+        );
+        let before = self.runtime.camera_controls.remove(&cam.id);
+        if pending {
+            self.runtime.camera_controls.insert(
+                cam.id.clone(),
+                CameraControlState {
+                    values: Default::default(),
+                    reset_pending: true,
+                },
+            );
+        }
+        if before.as_ref() != self.runtime.camera_controls.get(&cam.id) {
+            let saved = self.save_state();
+            if res.is_ok() {
+                res = saved;
+            }
+        }
+        match (device, unread) {
+            (Some(device), _) => self.show_controls(&cam, device),
+            (None, Some(e)) => self.controls_unreadable(&cam, &e),
+            (None, None) => {}
+        }
+        self.reconcile(now);
+        res
+    }
+
     fn reload(&mut self, now: Instant) -> Result<(), IpcError> {
         let res = match Config::load(&self.paths.config) {
             Ok(new) => {
@@ -2153,9 +2690,11 @@ impl<B: MediaBackend> Controller<B> {
                 let params = self.session_params();
                 if let Some(s) = self.session.as_mut() {
                     s.awaiting = Some(now);
+                    s.open = false;
                 }
-                if let Err(e) = self.backend.switch_camera(&params, &cam) {
-                    self.camera_failed(format!("reopening {}: {e}", cam.label()), now);
+                match self.backend.switch_camera(&params, &cam) {
+                    Ok(()) => self.camera_opened(&cam),
+                    Err(e) => self.camera_failed(format!("reopening {}: {e}", cam.label()), now),
                 }
             }
         }

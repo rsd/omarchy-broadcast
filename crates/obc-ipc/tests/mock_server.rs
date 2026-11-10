@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use obc_ipc::{
-    CameraInfo, INTERFACE, INTERFACE_REVISION, IpcError, OBJECT_PATH, OmarchyBroadcastProxy,
-    Snapshot, State, Stats,
+    CameraControl, CameraControls, CameraInfo, INTERFACE, INTERFACE_REVISION, IpcError,
+    OBJECT_PATH, OmarchyBroadcastProxy, Snapshot, State, Stats,
 };
 use zbus::message::Flags;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
@@ -36,6 +36,21 @@ struct Mock {
     denoise: bool,
     /// Preview leases (the mock does not key them by caller).
     previews: u32,
+    /// The image controls of the first camera (the mock has none for the
+    /// other).
+    controls: Vec<CameraControl>,
+}
+
+fn sharpness(value: i32, stored: bool) -> CameraControl {
+    CameraControl {
+        name: "sharpness".into(),
+        min: 0,
+        max: 255,
+        step: 1,
+        default: 128,
+        value,
+        stored,
+    }
 }
 
 impl Mock {
@@ -64,6 +79,30 @@ impl Mock {
             background_image: String::new(),
             denoise: false,
             previews: 0,
+            controls: vec![sharpness(128, false)],
+        }
+    }
+
+    /// The camera a control method names (`""`: the active one), as the
+    /// daemon resolves it.
+    fn controls_of(&self, camera: &str) -> Result<usize, IpcError> {
+        if camera.is_empty() {
+            return Ok(self.active);
+        }
+        self.cameras
+            .iter()
+            .position(|c| c.id == camera)
+            .ok_or_else(|| IpcError::NoSuchCamera(format!("no camera {camera:?} is present")))
+    }
+
+    fn view(&self) -> CameraControls {
+        CameraControls {
+            camera: self.cameras[self.active].id.clone(),
+            controls: if self.active == 0 {
+                self.controls.clone()
+            } else {
+                Vec::new()
+            },
         }
     }
 }
@@ -205,6 +244,53 @@ impl Mock {
         Ok(())
     }
 
+    async fn get_camera_controls(&self, camera: String) -> Result<Vec<CameraControl>, IpcError> {
+        Ok(if self.controls_of(&camera)? == 0 {
+            self.controls.clone()
+        } else {
+            Vec::new()
+        })
+    }
+
+    async fn set_camera_control(
+        &mut self,
+        camera: String,
+        name: String,
+        value: i32,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        let at = self.controls_of(&camera)?;
+        let Some(c) = self.controls.iter_mut().find(|c| c.name == name && at == 0) else {
+            return Err(IpcError::InvalidArgument(format!(
+                "the camera does not expose {name:?}"
+            )));
+        };
+        if !(c.min..=c.max).contains(&value) {
+            return Err(IpcError::InvalidArgument(format!(
+                "{name} {value} is outside its range {}..={}",
+                c.min, c.max
+            )));
+        }
+        c.value = value;
+        c.stored = true;
+        self.camera_controls_changed(&emitter).await?;
+        Ok(())
+    }
+
+    async fn reset_camera_controls(
+        &mut self,
+        camera: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        self.controls_of(&camera)?;
+        for c in &mut self.controls {
+            c.value = c.default;
+            c.stored = false;
+        }
+        self.camera_controls_changed(&emitter).await?;
+        Ok(())
+    }
+
     #[zbus(signal)]
     async fn stats(
         emitter: &SignalEmitter<'_>,
@@ -290,6 +376,11 @@ impl Mock {
     #[zbus(property, name = "PipeWireOutput")]
     fn pipewire_output(&self) -> String {
         "ready".into()
+    }
+
+    #[zbus(property)]
+    fn camera_controls(&self) -> CameraControls {
+        self.view()
     }
 
     #[zbus(property)]
@@ -399,10 +490,14 @@ async fn proxy_reads_every_property() {
             pipewire_consumers: 2,
             preview_consumers: 0,
             pipewire_output: "ready".into(),
+            camera_controls: Some(CameraControls {
+                camera: "usb-1234_abcd".into(),
+                controls: vec![sharpness(128, false)],
+            }),
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 5);
+    assert_eq!(INTERFACE_REVISION, 6);
     assert_eq!(proxy.inner().interface().as_str(), INTERFACE);
 }
 
@@ -430,6 +525,7 @@ async fn a_revision_1_daemon_reads_with_defaults_for_the_newer_properties() {
         assert_eq!(snap.pipewire_consumers, 0);
         assert_eq!(snap.pipewire_output, "off");
         assert_eq!(snap.preview_consumers, 0);
+        assert_eq!(snap.camera_controls, None);
     }
     let no_autostart = within("snapshot", Snapshot::fetch_no_autostart(&client))
         .await
@@ -450,6 +546,23 @@ async fn a_revision_1_daemon_reads_with_defaults_for_the_newer_properties() {
         other => panic!("expected a transport-level error, got {other:?}"),
     }
     match within("AcquirePreview", proxy.acquire_preview(15)).await {
+        Err(IpcError::ZBus(_)) => {}
+        other => panic!("expected a transport-level error, got {other:?}"),
+    }
+    match within("GetCameraControls", proxy.get_camera_controls("")).await {
+        Err(IpcError::ZBus(_)) => {}
+        other => panic!("expected a transport-level error, got {other:?}"),
+    }
+    match within(
+        "SetCameraControl",
+        proxy.set_camera_control("", "sharpness", 1),
+    )
+    .await
+    {
+        Err(IpcError::ZBus(_)) => {}
+        other => panic!("expected a transport-level error, got {other:?}"),
+    }
+    match within("ResetCameraControls", proxy.reset_camera_controls("")).await {
         Err(IpcError::ZBus(_)) => {}
         other => panic!("expected a transport-level error, got {other:?}"),
     }
@@ -800,4 +913,91 @@ async fn the_preview_methods_property_and_signal() {
         .await
         .unwrap();
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_camera_control_methods_and_property() {
+    let (_server, client) = pair().await;
+    let proxy = OmarchyBroadcastProxy::builder(&client)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .unwrap();
+    let cached = OmarchyBroadcastProxy::new(&client).await.unwrap();
+    let mut changes = cached.receive_camera_controls_changed().await;
+
+    let got = within("GetCameraControls", proxy.get_camera_controls(""))
+        .await
+        .unwrap();
+    assert_eq!(got, [sharpness(128, false)]);
+    let by_id = within(
+        "GetCameraControls",
+        proxy.get_camera_controls("usb-1234_abcd"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(by_id, got);
+    assert!(
+        within(
+            "GetCameraControls",
+            proxy.get_camera_controls("platform-video2")
+        )
+        .await
+        .unwrap()
+        .is_empty()
+    );
+
+    within(
+        "SetCameraControl",
+        proxy.set_camera_control("", "sharpness", 200),
+    )
+    .await
+    .unwrap();
+    let view = proxy.camera_controls().await.unwrap();
+    assert_eq!(
+        view,
+        CameraControls {
+            camera: "usb-1234_abcd".into(),
+            controls: vec![sharpness(200, true)],
+        }
+    );
+    // The change is announced, and a cached proxy follows it.
+    let changed = within("CameraControls changed", changes.next())
+        .await
+        .expect("change stream");
+    assert_eq!(changed.get().await.unwrap(), view);
+    let snap = within("snapshot", Snapshot::fetch(&proxy)).await.unwrap();
+    assert_eq!(snap.camera_controls, Some(view));
+
+    // The error replies map back to their variants.
+    match within(
+        "SetCameraControl",
+        proxy.set_camera_control("", "sharpness", 256),
+    )
+    .await
+    {
+        Err(e @ IpcError::InvalidArgument(_)) => {
+            assert_eq!(
+                zbus::DBusError::name(&e).as_str(),
+                "br.com.dias.OmarchyBroadcast1.Error.InvalidArgument"
+            );
+            assert!(e.message().contains("0..=255"), "{e:?}");
+        }
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+    match within("ResetCameraControls", proxy.reset_camera_controls("nope")).await {
+        Err(e @ IpcError::NoSuchCamera(_)) => assert_eq!(
+            zbus::DBusError::name(&e).as_str(),
+            "br.com.dias.OmarchyBroadcast1.Error.NoSuchCamera"
+        ),
+        other => panic!("expected NoSuchCamera, got {other:?}"),
+    }
+
+    within("ResetCameraControls", proxy.reset_camera_controls(""))
+        .await
+        .unwrap();
+    assert_eq!(
+        proxy.camera_controls().await.unwrap().controls,
+        [sharpness(128, false)]
+    );
 }
