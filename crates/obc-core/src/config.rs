@@ -12,7 +12,7 @@
 //!   daemon; a damaged file falls back to the defaults (the daemon then
 //!   starts `off`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
@@ -34,9 +34,10 @@ pub const CONFIG_VERSION: u32 = 1;
 /// Directory name under the XDG base directories.
 pub const APP_DIR: &str = "omarchy-broadcast";
 
-/// The camera image controls a user may set (their v4l2-ctl names), the
-/// only names [`RuntimeState::camera_controls`] keeps: the allowlist of
-/// `obc_pipeline::controls::IMAGE_CONTROLS`, in its order.
+/// The five camera image controls of the revision-6 D-Bus methods (their
+/// v4l2-ctl names): the allowlist of `obc_pipeline::controls::IMAGE_CONTROLS`,
+/// in its order. [`RuntimeState::camera_controls`] keeps any
+/// [`valid_control_name`], not only these.
 pub const CAMERA_CONTROL_NAMES: [&str; 5] = [
     "brightness",
     "contrast",
@@ -44,6 +45,20 @@ pub const CAMERA_CONTROL_NAMES: [&str; 5] = [
     "sharpness",
     "backlight_compensation",
 ];
+
+/// The longest control name [`valid_control_name`] accepts, in bytes.
+pub const CONTROL_NAME_MAX: usize = 32;
+
+/// Whether `name` can be a key of [`CameraControlState`]:
+/// `^[a-z][a-z0-9_]{0,31}$`, the form of a v4l2-ctl control name (the
+/// kernel's name lowercased, every run of other characters made one `_`)
+/// that starts with a letter, at most [`CONTROL_NAME_MAX`] bytes.
+pub fn valid_control_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    name.len() <= CONTROL_NAME_MAX
+        && bytes.next().is_some_and(|b| b.is_ascii_lowercase())
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
 
 /// Bounds of the duration keys, inclusive unless stated otherwise.
 pub mod limits {
@@ -791,24 +806,40 @@ pub fn selector_form(s: &CameraSelector) -> String {
     }
 }
 
-/// The image controls the user set on one camera
+/// The controls the user set on one camera
 /// ([`RuntimeState::camera_controls`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CameraControlState {
-    /// The values the user set, by control name ([`CAMERA_CONTROL_NAMES`]),
-    /// written to the camera whenever it opens. A value equal to the
-    /// control's default is kept all the same: the user set it.
+    /// The values the user set, by control name (a [`valid_control_name`]),
+    /// as raw device values, written to the camera whenever it opens. A
+    /// value equal to the control's default is kept all the same: the user
+    /// set it.
     pub values: BTreeMap<String, i32>,
-    /// A reset was asked while the camera did not stream: every control is
-    /// written its default the next time the camera opens (before
-    /// `values`, which a reset leaves empty and a later set may fill).
-    pub reset_pending: bool,
+    /// A reset of the whole camera was asked while it was closed: every
+    /// control is written its default the next time the camera opens
+    /// (before `values`, which a reset leaves empty and a later set may
+    /// fill). The file key `reset_all`.
+    ///
+    /// Revision 6 (0.21) wrote `reset_pending = true` for a closed
+    /// `ResetCameraControls`, which meant the five image controls only: that
+    /// key is read as [`LEGACY_RESET_NAMES`] added to `reset_names`, never as
+    /// this flag, and is never written back.
+    pub reset_all: bool,
+    /// A reset of some controls was asked while the camera was closed:
+    /// these are written their defaults the next time it opens (before
+    /// `values`), after which the list is cleared. Each a
+    /// [`valid_control_name`].
+    pub reset_names: BTreeSet<String>,
 }
 
+/// What a `reset_pending = true` of a state file written by revision 6
+/// (0.21) reset: the five image controls ([`CAMERA_CONTROL_NAMES`]).
+pub const LEGACY_RESET_NAMES: [&str; 5] = CAMERA_CONTROL_NAMES;
+
 impl CameraControlState {
-    /// Nothing to keep: no value and no pending reset.
+    /// Nothing to keep: no value and no pending reset, whole or partial.
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty() && !self.reset_pending
+        self.values.is_empty() && !self.reset_all && self.reset_names.is_empty()
     }
 }
 
@@ -861,19 +892,23 @@ pub struct RuntimeState {
         deserialize_with = "de_state_denoise"
     )]
     pub denoise: Option<bool>,
-    /// The image controls set with `SetCameraControl` (or reset with
-    /// `ResetCameraControls`), by camera id. Never holds an empty entry
-    /// ([`CameraControlState::is_empty`]). In the file, one table per
-    /// camera, after the other keys (written by [`RuntimeState::save`]):
+    /// The camera controls set (with `SetCameraControl` or `SetSetting`) or
+    /// reset while the camera was closed, by camera id. Never holds an
+    /// empty entry ([`CameraControlState::is_empty`]). In the file, one
+    /// table per camera, after the other keys (written by
+    /// [`RuntimeState::save`]):
     ///
     /// ```toml
     /// [camera_controls."usb-046d_0944-video-index0"]
     /// values = { saturation = 128, sharpness = 128 }
-    /// reset_pending = true
+    /// reset_all = true
+    /// reset_names = ["contrast", "gain"]
     /// ```
     ///
-    /// `values` is left out when empty, `reset_pending` when false, and the
-    /// whole table when there is no entry.
+    /// `values` and `reset_names` are left out when empty, `reset_all` when
+    /// false, and the whole table when there is no entry. A revision-6
+    /// `reset_pending = true` is read as its five names in `reset_names`
+    /// ([`CameraControlState::reset_all`]).
     #[serde(skip_serializing, deserialize_with = "de_camera_controls")]
     pub camera_controls: BTreeMap<String, CameraControlState>,
 }
@@ -903,9 +938,13 @@ fn de_camera_controls<'de, D: Deserializer<'de>>(
 
 /// The camera control entries of the `[camera_controls]` value, and a
 /// warning for each part dropped: an entry that is not a table, a control
-/// name outside [`CAMERA_CONTROL_NAMES`], a value that is not an integer or
-/// does not fit 32 bits, a `values` that is not a table, a `reset_pending`
-/// that is not a boolean. An entry left with nothing to keep is dropped
+/// name that is not a [`valid_control_name`] (in `values` or
+/// `reset_names`), a value that is not an integer or does not fit 32 bits,
+/// a `values` that is not a table, a `reset_all` or `reset_pending` that is
+/// not a boolean, a `reset_names` that is not an array or an element of it
+/// that is not a string. A revision-6 `reset_pending = true` adds
+/// [`LEGACY_RESET_NAMES`] to `reset_names` (it never sets `reset_all`).
+/// An entry left with nothing to keep is dropped
 /// (silently when nothing in it was bad). Unknown keys of an entry (a newer
 /// daemon's) are ignored.
 fn camera_controls_from(
@@ -933,12 +972,8 @@ fn camera_controls_from(
             None => {}
             Some(toml::Value::Table(values)) => {
                 for (name, v) in values {
-                    if !CAMERA_CONTROL_NAMES.contains(&name.as_str()) {
-                        warnings.push(format!(
-                            "camera_controls.{camera:?}: {name:?} is not a camera control \
-                             (expected one of {}): ignored",
-                            CAMERA_CONTROL_NAMES.join(", ")
-                        ));
+                    if !valid_control_name(name) {
+                        warnings.push(not_a_control_name(camera, name));
                         continue;
                     }
                     match v.as_integer().map(i32::try_from) {
@@ -961,11 +996,44 @@ fn camera_controls_from(
                 other.type_str()
             )),
         }
-        match entry.get("reset_pending") {
+        match entry.get("reset_all") {
             None => {}
-            Some(toml::Value::Boolean(b)) => state.reset_pending = *b,
+            Some(toml::Value::Boolean(b)) => state.reset_all = *b,
+            Some(other) => warnings.push(format!(
+                "camera_controls.{camera:?}: reset_all must be a boolean (found {}): ignored",
+                other.type_str()
+            )),
+        }
+        // Revision 6's pending reset of the five image controls.
+        match entry.get("reset_pending") {
+            None | Some(toml::Value::Boolean(false)) => {}
+            Some(toml::Value::Boolean(true)) => state
+                .reset_names
+                .extend(LEGACY_RESET_NAMES.iter().map(|n| n.to_string())),
             Some(other) => warnings.push(format!(
                 "camera_controls.{camera:?}: reset_pending must be a boolean (found {}): ignored",
+                other.type_str()
+            )),
+        }
+        match entry.get("reset_names") {
+            None => {}
+            Some(toml::Value::Array(names)) => {
+                for name in names {
+                    match name.as_str() {
+                        Some(name) if valid_control_name(name) => {
+                            state.reset_names.insert(name.to_string());
+                        }
+                        Some(name) => warnings.push(not_a_control_name(camera, name)),
+                        None => warnings.push(format!(
+                            "camera_controls.{camera:?}: reset_names must hold strings \
+                             (found {}): ignored",
+                            name.type_str()
+                        )),
+                    }
+                }
+            }
+            Some(other) => warnings.push(format!(
+                "camera_controls.{camera:?}: reset_names must be an array (found {}): ignored",
                 other.type_str()
             )),
         }
@@ -974,6 +1042,15 @@ fn camera_controls_from(
         }
     }
     (out, warnings)
+}
+
+/// The warning for a control name that is not a [`valid_control_name`].
+fn not_a_control_name(camera: &str, name: &str) -> String {
+    format!(
+        "camera_controls.{camera:?}: {name:?} is not a control name (expected \
+         a lower-case letter, then up to {} of a-z, 0-9 and _): ignored",
+        CONTROL_NAME_MAX - 1
+    )
 }
 
 /// `s` as a TOML basic string (`"..."`), valid as a quoted key: `"` and
@@ -1018,8 +1095,16 @@ fn camera_controls_toml(controls: &BTreeMap<String, CameraControlState>) -> Stri
                 .collect();
             text.push_str(&format!("values = {}\n", toml::Value::Table(values)));
         }
-        if state.reset_pending {
-            text.push_str("reset_pending = true\n");
+        if state.reset_all {
+            text.push_str("reset_all = true\n");
+        }
+        if !state.reset_names.is_empty() {
+            let names: Vec<toml::Value> = state
+                .reset_names
+                .iter()
+                .map(|n| toml::Value::String(n.clone()))
+                .collect();
+            text.push_str(&format!("reset_names = {}\n", toml::Value::Array(names)));
         }
     }
     text
@@ -1830,11 +1915,175 @@ offer_nv12 = false
         assert_eq!(fs::read_to_string(&path).unwrap().trim(), "enabled = true");
     }
 
-    fn controls(values: &[(&str, i32)], reset_pending: bool) -> CameraControlState {
+    fn controls(values: &[(&str, i32)], reset_all: bool) -> CameraControlState {
         CameraControlState {
             values: values.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
-            reset_pending,
+            reset_all,
+            reset_names: BTreeSet::new(),
         }
+    }
+
+    fn with_reset_names(mut state: CameraControlState, names: &[&str]) -> CameraControlState {
+        state.reset_names = names.iter().map(|n| n.to_string()).collect();
+        state
+    }
+
+    #[test]
+    fn control_names_follow_the_grammar() {
+        for good in [
+            "brightness",
+            "exposure_dynamic_framerate",
+            "field_of_view",
+            "white_balance_temperature",
+            "a",
+            "a0",
+            "pan_",
+            "x__y",
+            "abcdefghijklmnopqrstuvwxyz012345",
+        ] {
+            assert!(valid_control_name(good), "{good:?}");
+        }
+        assert_eq!("abcdefghijklmnopqrstuvwxyz012345".len(), CONTROL_NAME_MAX);
+        for bad in [
+            "",
+            "abcdefghijklmnopqrstuvwxyz0123456",
+            "_brightness",
+            "0gain",
+            "Brightness",
+            "bright-ness",
+            "bright ness",
+            "camera.image.brightness",
+            "caf\u{e9}",
+            "gain\n",
+        ] {
+            assert!(!valid_control_name(bad), "{bad:?}");
+        }
+        for name in CAMERA_CONTROL_NAMES {
+            assert!(valid_control_name(name));
+        }
+    }
+
+    #[test]
+    fn reset_names_and_any_control_name_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let mut st = RuntimeState::default();
+        st.camera_controls.insert(
+            "usb-046d_0944-video-index0".into(),
+            with_reset_names(
+                controls(
+                    &[
+                        ("exposure_dynamic_framerate", 1),
+                        ("field_of_view", 2),
+                        ("white_balance_temperature", 4000),
+                    ],
+                    false,
+                ),
+                &["sharpness", "gain", "focus_absolute"],
+            ),
+        );
+        // A partial reset alone keeps the entry.
+        st.camera_controls.insert(
+            "usb-only-names".into(),
+            with_reset_names(controls(&[], false), &["contrast"]),
+        );
+        st.camera_controls.insert(
+            "usb-everything".into(),
+            with_reset_names(controls(&[("zoom_absolute", 100)], true), &["pan_absolute"]),
+        );
+        st.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            "enabled = true\n\
+             \n\
+             [camera_controls.\"usb-046d_0944-video-index0\"]\n\
+             values = { exposure_dynamic_framerate = 1, field_of_view = 2, \
+             white_balance_temperature = 4000 }\n\
+             reset_names = [\"focus_absolute\", \"gain\", \"sharpness\"]\n\
+             \n\
+             [camera_controls.\"usb-everything\"]\n\
+             values = { zoom_absolute = 100 }\n\
+             reset_all = true\n\
+             reset_names = [\"pan_absolute\"]\n\
+             \n\
+             [camera_controls.\"usb-only-names\"]\n\
+             reset_names = [\"contrast\"]\n"
+        );
+        assert_eq!(RuntimeState::load_noting(&path), (st.clone(), None, vec![]));
+        assert!(!st.camera_controls["usb-only-names"].is_empty());
+        assert!(with_reset_names(controls(&[], false), &[]).is_empty());
+
+        // The header and multi-line forms read the same, duplicates once.
+        fs::write(
+            &path,
+            "[camera_controls.usb-x]\nreset_names = [\n  \"gain\",\n  \"gain\",\n  \"hue\",\n]\n",
+        )
+        .unwrap();
+        let (got, damaged, notes) = RuntimeState::load_noting(&path);
+        assert_eq!((damaged, notes), (None, vec![]));
+        assert_eq!(
+            got.camera_controls["usb-x"],
+            with_reset_names(controls(&[], false), &["gain", "hue"])
+        );
+    }
+
+    #[test]
+    fn a_revision_6_pending_reset_becomes_the_five_image_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        // As 0.21 wrote it after a closed ResetCameraControls, then a set.
+        fs::write(
+            &path,
+            "enabled = true\n\
+             \n\
+             [camera_controls.\"usb-046d_0944-video-index0\"]\n\
+             values = { sharpness = 10 }\n\
+             reset_pending = true\n\
+             \n\
+             [camera_controls.\"usb-merged\"]\n\
+             reset_pending = true\n\
+             reset_names = [\"gain\", \"contrast\"]\n",
+        )
+        .unwrap();
+        let (st, damaged, notes) = RuntimeState::load_noting(&path);
+        assert_eq!((damaged, notes), (None, vec![]));
+        let five = &LEGACY_RESET_NAMES;
+        assert_eq!(
+            five,
+            &[
+                "brightness",
+                "contrast",
+                "saturation",
+                "sharpness",
+                "backlight_compensation"
+            ]
+        );
+        assert_eq!(
+            st.camera_controls["usb-046d_0944-video-index0"],
+            with_reset_names(controls(&[("sharpness", 10)], false), five)
+        );
+        let mut merged: Vec<&str> = five.to_vec();
+        merged.push("gain");
+        assert_eq!(
+            st.camera_controls["usb-merged"],
+            with_reset_names(controls(&[], false), &merged)
+        );
+        assert!(st.camera_controls.values().all(|c| !c.reset_all));
+        // Written back as names, never as reset_pending.
+        st.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("reset_pending"), "{text}");
+        assert!(!text.contains("reset_all"), "{text}");
+        assert!(
+            text.contains(
+                "values = { sharpness = 10 }\n\
+                 reset_names = [\"backlight_compensation\", \"brightness\", \"contrast\", \
+                 \"saturation\", \"sharpness\"]\n"
+            ),
+            "{text}"
+        );
+        assert_eq!(RuntimeState::load_noting(&path), (st, None, vec![]));
     }
 
     #[test]
@@ -1865,11 +2114,11 @@ offer_nv12 = false
              camera = \"usb-046d_0944-video-index0\"\n\
              \n\
              [camera_controls.\"pci-0000:00:14.0-usb-0:2:1.0-video-index0\"]\n\
-             reset_pending = true\n\
+             reset_all = true\n\
              \n\
              [camera_controls.\"platform-x\"]\n\
              values = { backlight_compensation = 0, brightness = -64 }\n\
-             reset_pending = true\n\
+             reset_all = true\n\
              \n\
              [camera_controls.\"usb-046d_0944-video-index0\"]\n\
              values = { saturation = 128, sharpness = 128 }\n"
@@ -1963,17 +2212,27 @@ effect = "blur"
 [camera_controls."usb-good"]
 values = { sharpness = 128, zoom_absolute = 3, contrast = "high", saturation = 4294967296, brightness = -2147483648 }
 reset_pending = "yes"
+reset_all = 1
 future_key = 1
 
 [camera_controls."usb-only-bad"]
+values = { "Exposure Time" = 0, "0gain" = 1 }
+reset_names = "sharpness"
+
+[camera_controls."usb-names"]
 values = { exposure_dynamic_framerate = 0 }
+reset_names = ["gain", 3, "_x", "field_of_view", "an_overlong_name_of_thirty_three_b"]
 
 [camera_controls."usb-pending"]
 values = 5
 reset_pending = true
 
+[camera_controls."usb-all"]
+reset_all = true
+
 [camera_controls."usb-nothing"]
 reset_pending = false
+reset_all = false
 "#,
         )
         .unwrap();
@@ -1983,24 +2242,49 @@ reset_pending = false
         assert!(!st.enabled);
         assert_eq!(st.effect, Some(EffectMode::Blur));
         let mut want = BTreeMap::new();
+        // Any name of the grammar is kept, not only the five image controls.
         want.insert(
             "usb-good".to_string(),
-            controls(&[("sharpness", 128), ("brightness", i32::MIN)], false),
+            controls(
+                &[
+                    ("sharpness", 128),
+                    ("zoom_absolute", 3),
+                    ("brightness", i32::MIN),
+                ],
+                false,
+            ),
         );
-        want.insert("usb-pending".to_string(), controls(&[], true));
+        want.insert(
+            "usb-names".to_string(),
+            with_reset_names(
+                controls(&[("exposure_dynamic_framerate", 0)], false),
+                &["gain", "field_of_view"],
+            ),
+        );
+        // Revision 6's pending reset: its five image controls, not all.
+        want.insert(
+            "usb-pending".to_string(),
+            with_reset_names(controls(&[], false), &LEGACY_RESET_NAMES),
+        );
+        want.insert("usb-all".to_string(), controls(&[], true));
         assert_eq!(st.camera_controls, want);
         let all = notes.join("\n");
         for part in [
-            "\"zoom_absolute\" is not a camera control",
             "contrast must be an integer (found string)",
             "saturation = 4294967296 does not fit 32 bits",
             "reset_pending must be a boolean (found string)",
-            "\"exposure_dynamic_framerate\" is not a camera control",
+            "reset_all must be a boolean (found integer)",
+            "\"Exposure Time\" is not a control name",
+            "\"0gain\" is not a control name",
+            "reset_names must be an array (found string)",
+            "reset_names must hold strings (found integer)",
+            "\"_x\" is not a control name",
+            "\"an_overlong_name_of_thirty_three_b\" is not a control name",
             "values must be a table (found integer)",
         ] {
             assert!(all.contains(part), "{part:?} not in {all}");
         }
-        assert_eq!(notes.len(), 6, "{all}");
+        assert_eq!(notes.len(), 11, "{all}");
         assert!(!all.contains("  "), "no run of spaces: {all}");
         assert!(
             notes

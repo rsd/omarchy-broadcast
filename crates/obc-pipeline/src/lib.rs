@@ -33,10 +33,19 @@
 //! offers the writer's frames as a native PipeWire camera node, fed by the
 //! writer's tap ([`loopback::FrameTap`]). The [`preview`] encoder, fed by
 //! the same tap, writes small JPEG snapshots of them for a live preview.
+//!
+//! Camera settings: [`control_node`] enumerates, reads and writes every
+//! user and camera control of an opened node and reads its capture format
+//! back; [`ctrl_events`] watches their changes (`V4L2_EVENT_CTRL`) on a
+//! thread; [`xu`] reaches the vendor settings of UVC Extension Units listed
+//! as data rows (the Logitech field of view). [`controls`] keeps the fixed
+//! image-control allowlist and the frame-rate guard.
 
 pub mod capability;
 pub mod clock;
+pub mod control_node;
 pub mod controls;
+pub mod ctrl_events;
 pub mod device;
 pub mod discovery;
 pub mod effect;
@@ -60,9 +69,12 @@ pub mod stamp;
 pub mod stats;
 #[cfg(test)]
 mod test_support;
+pub mod xu;
 
 pub use capability::{Capabilities, IngestPath, ModeChoice, choose_mode};
 pub use clock::{PacerCounts, TickKind};
+pub use control_node::{CaptureFormat, ControlNode, CtrlValue, Enumeration, NodeControl};
+pub use ctrl_events::{CtrlEvent, CtrlNotice, CtrlWatcher};
 pub use device::{
     CameraChoice, DeviceInfo, DiscoverySource, SelectError, select_camera, select_sink,
 };
@@ -89,3 +101,4 @@ pub use pipeline::{
 pub use preview::{PreviewConfig, PreviewCounts, PreviewEncoder};
 pub use process::GpuStage;
 pub use session::{Session, SwitchTiming};
+pub use xu::{XuControl, XuRow, XuState};

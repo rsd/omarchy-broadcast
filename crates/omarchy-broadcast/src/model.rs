@@ -36,6 +36,17 @@ pub fn denoise(snap: &Snapshot) -> Option<bool> {
     (snap.interface_revision >= obc_ipc::DENOISE_REVISION).then_some(snap.denoise)
 }
 
+/// Whether the daemon has the camera settings (revision
+/// [`obc_ipc::SETTINGS_REVISION`] or later).
+pub fn has_settings(snap: &Snapshot) -> bool {
+    snap.interface_revision >= obc_ipc::SETTINGS_REVISION
+}
+
+/// `SettingsRevision`; `None` from a daemon too old to have it.
+pub fn settings_revision(snap: &Snapshot) -> Option<u32> {
+    snap.settings_revision.filter(|_| has_settings(snap))
+}
+
 /// The entry of `ActiveCamera` in `Cameras`, if it is listed.
 pub fn active_camera(snap: &Snapshot) -> Option<&CameraInfo> {
     camera(snap, &snap.active_camera)

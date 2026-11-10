@@ -12,37 +12,85 @@ use std::time::Duration;
 use obc_core::config::EffectConfig;
 use obc_core::{AspectPolicy, ModeRequest, OutputContract, SinkSelector};
 use obc_ipc::Stats;
-use obc_pipeline::controls::DeviceControl;
+use obc_pipeline::control_node::{CaptureFormat, NodeControl};
+use obc_pipeline::controls::CtrlInfo;
+use obc_pipeline::ctrl_events::CtrlEvent;
+use obc_pipeline::xu::XuRow;
 
 use crate::camera::Camera;
+use crate::settings::XuReading;
 
-/// What [`ControlNode::query`] found.
+/// What [`ControlNode::enumerate`] found on a camera's node.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ControlQuery {
-    /// The [`obc_pipeline::controls::IMAGE_CONTROLS`] the device exposes
-    /// as adjustable, in that order, each with its value.
-    pub controls: Vec<DeviceControl>,
-    /// Each control left out because its query or its read failed: (name,
-    /// why).
-    pub skipped: Vec<(String, String)>,
+pub struct ControlScan {
+    /// Every user- and camera-class control of a reported type, in the
+    /// order the device reports them, each with its value (or why it could
+    /// not be read) and its menu items
+    /// ([`obc_pipeline::ControlNode::enumerate`]).
+    pub controls: Vec<NodeControl>,
+    /// The Extension Unit data rows the camera has and agrees to
+    /// ([`obc_pipeline::xu`]), each read now.
+    pub xu: Vec<XuReading>,
+    /// What could not be read, each as (what, why): the walk stopped before
+    /// the end, an Extension Unit row could not be probed. The rest is
+    /// kept.
+    pub problems: Vec<(String, String)>,
 }
 
-/// One camera node opened for its image controls
-/// ([`MediaBackend::open_camera_controls`]); closed when dropped. Each
-/// call is one or a few ioctls.
+/// One camera node opened for its controls
+/// ([`MediaBackend::open_camera_controls`]); closed when dropped. Each call
+/// is one or a few ioctls.
 pub trait ControlNode {
-    /// The image controls the device exposes, each with its current value
-    /// ([`obc_pipeline::controls::ImageControls::query`]): a control that
-    /// cannot be read is skipped, never the whole list.
-    fn query(&mut self) -> ControlQuery;
+    /// Every control and Extension Unit row the camera exposes, each with
+    /// its current value and flags: a control that cannot be read is
+    /// reported unreadable, never the whole list.
+    fn enumerate(&mut self) -> ControlScan;
 
-    /// Writes the image control `name` (its value checked by the caller).
-    fn set(&mut self, name: &str, value: i32) -> Result<(), String>;
+    /// Writes control `id`, named `name` (for the error), its value
+    /// checked by the caller.
+    fn set(&mut self, id: u32, name: &str, value: i32) -> Result<(), String>;
 
-    /// Reads the image control `name` back (the driver may have rounded a
-    /// value written).
-    fn get(&mut self, name: &str) -> Result<i32, String>;
+    /// Reads control `id`, named `name` (for the error), back (the driver
+    /// may have rounded a value written).
+    fn get(&mut self, id: u32, name: &str) -> Result<i32, String>;
+
+    /// Queries control `id`, named `name` (for the error): its range,
+    /// default and flags now (`VIDIOC_QUERYCTRL`), without its value. What
+    /// a write reads again of the controls that depend on the one written.
+    fn query(&mut self, id: u32, name: &str) -> Result<CtrlInfo, String>;
+
+    /// The capture format now (`VIDIOC_G_FMT`): what an Extension Unit
+    /// write is checked against.
+    fn capture_format(&mut self) -> Result<CaptureFormat, String>;
+
+    /// Writes the option `option` of the Extension Unit row `row`.
+    fn xu_set(&mut self, row: &'static XuRow, option: &str) -> Result<(), String>;
+
+    /// Reads the current byte of the Extension Unit row `row`.
+    fn xu_current(&mut self, row: &'static XuRow) -> Result<u8, String>;
 }
+
+/// Which control-event watcher an event comes from: every
+/// [`MediaBackend::watch_controls`] returns a new one, greater than every
+/// one before it (the first is 1), so the events of a watcher stopped or
+/// replaced are told from the current one's whatever their order.
+pub type WatchGeneration = u64;
+
+/// What a control-event watcher reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlEvent {
+    /// A watched control changed (its value, flags or range), through
+    /// another file descriptor or by the device itself: the event, with
+    /// what changed and the control's value, flags and range now.
+    Changed(CtrlEvent),
+    /// The watcher ended by itself, for this reason (the node went away).
+    Ended(String),
+}
+
+/// Receives the control events, with the generation of the watcher that
+/// sent them, from the watcher's thread (the daemon forwards them to the
+/// controller as [`crate::controller::Command::ControlEvent`]).
+pub type ControlEventReporter = Arc<dyn Fn(WatchGeneration, ControlEvent) + Send + Sync>;
 
 #[cfg(test)]
 pub mod fake;
@@ -298,21 +346,27 @@ pub trait MediaBackend: Send + 'static {
     /// The running session's effect (`None`: no session).
     fn effect_report(&mut self) -> Option<EffectReport>;
 
-    /// Opens `camera`'s node for its image controls (for writing as well
-    /// when `write`): one open for the whole operation, its queries, writes
-    /// and reads ([`ControlNode`]). Opening starts no stream, so it may be
-    /// done in any state, whoever uses the camera. `Err` when the node
-    /// cannot be opened. The caller writes only to the camera the session
-    /// has open.
+    /// Opens `camera`'s node for its controls (for writing as well when
+    /// `write`): one open for the whole operation, its enumerations,
+    /// writes and reads ([`ControlNode`]). Opening starts no stream, so it
+    /// may be done in any state, whoever uses the camera. `Err` when the
+    /// node cannot be opened. The caller writes only to the camera the
+    /// session has open.
     fn open_camera_controls(
         &mut self,
         camera: &Camera,
         write: bool,
     ) -> Result<Box<dyn ControlNode>, String>;
 
-    /// The image controls `camera` exposes, each with its value on the
-    /// device: [`Self::open_camera_controls`], then one query.
-    fn camera_controls(&mut self, camera: &Camera) -> Result<ControlQuery, String> {
-        Ok(self.open_camera_controls(camera, false)?.query())
-    }
+    /// Starts watching the controls `ids` of `camera` for changes
+    /// (`V4L2_EVENT_CTRL`) on a read-only descriptor of its own, replacing
+    /// the watcher that runs (stopped first). Each event goes to the
+    /// backend's [`ControlEventReporter`] with the returned generation.
+    /// Called only while the session has the camera open: an open
+    /// descriptor keeps a UVC camera out of autosuspend.
+    fn watch_controls(&mut self, camera: &Camera, ids: &[u32]) -> Result<WatchGeneration, String>;
+
+    /// Stops the control-event watcher, if one runs; no event of it is
+    /// reported afterwards. Idempotent.
+    fn unwatch_controls(&mut self);
 }

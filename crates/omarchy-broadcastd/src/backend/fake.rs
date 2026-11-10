@@ -10,15 +10,103 @@ use obc_core::config::EffectConfig;
 use obc_core::{EffectMode, ModeRequest, OutputContract, SinkSelector};
 use obc_gpu::{GpuError, NothingToPark, ParkError, ParkOutcome, UnparkOutcome};
 use obc_ipc::Stats;
-use obc_pipeline::controls::DeviceControl;
+use obc_pipeline::control_node::{CaptureFormat, CtrlValue, MenuItem, MenuItemValue, NodeControl};
+use obc_pipeline::controls::{
+    CTRL_FLAG_INACTIVE, CTRL_TYPE_BOOLEAN, CTRL_TYPE_BUTTON, CTRL_TYPE_INTEGER, CTRL_TYPE_MENU,
+    CtrlInfo, DeviceControl, image_control_id,
+};
+use obc_pipeline::xu::{FIELD_OF_VIEW, XuRow, XuState};
 
 use super::park::{ParkOps, Parker, StartError, StopFailure, StopSession};
 use super::{
-    ControlNode, ControlQuery, EffectReport, EffectStatus, Failure, MediaBackend,
-    PipeWireGeneration, PreviewRequest, SessionParams,
+    ControlNode, ControlScan, EffectReport, EffectStatus, Failure, MediaBackend,
+    PipeWireGeneration, PreviewRequest, SessionParams, WatchGeneration,
 };
 use crate::camera::Camera;
 use crate::log::Level;
+use crate::settings::XuReading;
+
+/// A fake camera with any controls ([`World::devices`]): types, menus and
+/// flags as the test builds them, dependencies that flip a control's
+/// inactive flag when its master is written, a field of view whose writes
+/// can change the capture format.
+#[derive(Debug, Clone)]
+pub struct FakeDevice {
+    /// Its controls, in enumeration order, with their values and flags.
+    pub controls: Vec<NodeControl>,
+    /// `(dependent, master, values)`: writing the master clears the
+    /// dependent's inactive flag when the master's new value is one of
+    /// `values`, and sets it otherwise.
+    pub links: Vec<(u32, u32, Vec<i32>)>,
+    /// Its field of view (the Logitech row), if it has one.
+    pub fov: Option<FakeFov>,
+    /// The capture format `capture_format` reads.
+    pub format: CaptureFormat,
+    /// Writes to these control ids fail (the device refuses them).
+    pub refuse: Vec<u32>,
+}
+
+impl Default for FakeDevice {
+    fn default() -> Self {
+        FakeDevice {
+            controls: Vec::new(),
+            links: Vec::new(),
+            fov: None,
+            format: CaptureFormat {
+                width: 1920,
+                height: 1080,
+                pixelformat: u32::from_le_bytes(*b"NV12"),
+            },
+            refuse: Vec::new(),
+        }
+    }
+}
+
+impl FakeDevice {
+    /// The control `id`.
+    pub fn control(&self, id: u32) -> &NodeControl {
+        self.controls
+            .iter()
+            .find(|c| c.id == id)
+            .unwrap_or_else(|| panic!("no control {id:#010x}"))
+    }
+
+    /// The value of control `id`.
+    pub fn value(&self, id: u32) -> i32 {
+        self.control(id).value.value().expect("a value")
+    }
+
+    /// Sets control `id` as the device would by itself (or another
+    /// program): its value and the flags of what depends on it.
+    pub fn change(&mut self, id: u32, value: i32) {
+        if let Some(c) = self.controls.iter_mut().find(|c| c.id == id) {
+            c.value = CtrlValue::Value(value);
+        }
+        for (dependent, master, values) in self.links.clone() {
+            if master != id {
+                continue;
+            }
+            if let Some(d) = self.controls.iter_mut().find(|c| c.id == dependent) {
+                if values.contains(&value) {
+                    d.info.flags &= !CTRL_FLAG_INACTIVE;
+                } else {
+                    d.info.flags |= CTRL_FLAG_INACTIVE;
+                }
+            }
+        }
+    }
+}
+
+/// A fake field of view (the [`FIELD_OF_VIEW`] row).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeFov {
+    /// The current byte.
+    pub current: u8,
+    /// The default byte (`GET_DEF`).
+    pub default: u8,
+    /// Writing this byte changes the capture format to this one.
+    pub changes_format: Option<(u8, CaptureFormat)>,
+}
 
 /// The fake media world.
 #[derive(Debug)]
@@ -56,6 +144,9 @@ pub struct World {
     pub session_stops: u32,
     /// Every camera an ingest was started on, in order.
     pub ingests: Vec<String>,
+    /// The `fixed_framerate` each ingest was started with, in the same
+    /// order as `ingests`.
+    pub ingest_fixed_framerate: Vec<bool>,
     /// `start_session` fails with this.
     pub fail_start: Option<String>,
     /// With `fail_start`: cleaning up the partly built output did not stop
@@ -153,9 +244,34 @@ pub struct World {
     pub control_reads: u32,
     /// A query skips these controls (on any camera), as unreadable.
     pub fail_control_reads: Vec<String>,
+    /// The next queries' [`World::fail_control_reads`], one per query in
+    /// turn (a control whose read fails, then works, or the other way
+    /// round); once empty, `fail_control_reads` stays as the last one left
+    /// it.
+    pub next_read_failures: std::collections::VecDeque<Vec<String>>,
+    /// The number of single control queries without a value
+    /// ([`ControlNode::query`]).
+    pub control_info_reads: u32,
     /// A write of this control leaves this value on the device instead (a
     /// driver that rounds or clamps), by control name.
     pub control_write_quirks: std::collections::HashMap<String, i32>,
+    /// Fake devices with any controls, by camera id: a camera with an entry
+    /// here is this device, and its `controls` entry is not used.
+    pub devices: std::collections::HashMap<String, FakeDevice>,
+    /// Every field of view write that reached a fake device, in order:
+    /// (camera id, option id).
+    pub xu_writes: Vec<(String, String)>,
+    /// The number of capture format reads.
+    pub format_reads: u32,
+    /// The control-event watcher that runs: (camera id, control ids).
+    pub watch: Option<(String, Vec<u32>)>,
+    /// The generation of the last watcher started (0: none yet).
+    pub watch_generation: WatchGeneration,
+    pub watch_starts: u32,
+    /// Running watchers stopped (alone or replaced).
+    pub watch_stops: u32,
+    /// Starting a watcher fails with this.
+    pub fail_watch: Option<String>,
 }
 
 impl Default for World {
@@ -179,6 +295,7 @@ impl Default for World {
             session_starts: 0,
             session_stops: 0,
             ingests: Vec::new(),
+            ingest_fixed_framerate: Vec::new(),
             fail_start: None,
             fail_start_cleanup: None,
             fail_stop: None,
@@ -226,7 +343,17 @@ impl Default for World {
             control_opens: 0,
             control_reads: 0,
             fail_control_reads: Vec::new(),
+            next_read_failures: std::collections::VecDeque::new(),
+            control_info_reads: 0,
             control_write_quirks: std::collections::HashMap::new(),
+            devices: std::collections::HashMap::new(),
+            xu_writes: Vec::new(),
+            format_reads: 0,
+            watch: None,
+            watch_generation: 0,
+            watch_starts: 0,
+            watch_stops: 0,
+            fail_watch: None,
         }
     }
 }
@@ -548,8 +675,9 @@ impl MediaBackend for FakeBackend {
         })
     }
 
-    fn switch_camera(&mut self, _params: &SessionParams, camera: &Camera) -> Result<(), String> {
+    fn switch_camera(&mut self, params: &SessionParams, camera: &Camera) -> Result<(), String> {
         let mut w = self.world();
+        w.ingest_fixed_framerate.push(params.fixed_framerate);
         Self::start_ingest(&mut w, camera)
     }
 
@@ -623,7 +751,7 @@ impl MediaBackend for FakeBackend {
         w.control_opens += 1;
         if w.fail_control_query.contains(&camera.id) {
             return Err(format!(
-                "opening {} for its image controls: Input/output error",
+                "opening {} for its controls: Input/output error",
                 camera.path.display()
             ));
         }
@@ -633,9 +761,59 @@ impl MediaBackend for FakeBackend {
             write,
         }))
     }
+
+    fn watch_controls(&mut self, camera: &Camera, ids: &[u32]) -> Result<WatchGeneration, String> {
+        self.unwatch_controls();
+        let mut w = self.world();
+        if let Some(e) = w.fail_watch.clone() {
+            return Err(e);
+        }
+        w.watch_generation += 1;
+        w.watch_starts += 1;
+        w.watch = Some((camera.id.clone(), ids.to_vec()));
+        Ok(w.watch_generation)
+    }
+
+    fn unwatch_controls(&mut self) {
+        let mut w = self.world();
+        if w.watch.take().is_some() {
+            w.watch_stops += 1;
+        }
+    }
 }
 
-/// A fake device node opened for its image controls.
+/// The synthetic id of a simple control ([`World::controls`]) that is not
+/// one of the five image controls.
+const SIMPLE_ID_BASE: u32 = 0x0098_0f00;
+
+/// A simple control of [`World::controls`] as the device would report it:
+/// an integer of the user class (the image control's id), no flag.
+fn simple_control(i: usize, c: &DeviceControl, unreadable: bool) -> NodeControl {
+    NodeControl {
+        id: image_control_id(&c.name).unwrap_or(SIMPLE_ID_BASE + i as u32),
+        name: c.name.clone(),
+        info: CtrlInfo {
+            name: c.name.clone(),
+            minimum: c.min,
+            maximum: c.max,
+            step: c.step,
+            default_value: c.default,
+            flags: 0,
+            type_: CTRL_TYPE_INTEGER,
+        },
+        value: if unreadable {
+            CtrlValue::Unreadable {
+                errno: Some(libc::EPIPE),
+                message: "Broken pipe".into(),
+            }
+        } else {
+            CtrlValue::Value(c.value)
+        },
+        menu: Vec::new(),
+    }
+}
+
+/// A fake device node opened for its controls.
 struct FakeControlNode {
     world: Arc<Mutex<World>>,
     camera: Camera,
@@ -643,63 +821,320 @@ struct FakeControlNode {
     write: bool,
 }
 
+impl FakeControlNode {
+    /// The name of control `id` on the camera, if it has it.
+    fn name_of(w: &World, camera: &str, id: u32) -> Option<String> {
+        if let Some(d) = w.devices.get(camera) {
+            return d
+                .controls
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.name.clone());
+        }
+        w.controls.get(camera).and_then(|cs| {
+            cs.iter()
+                .enumerate()
+                .find(|(i, c)| simple_control(*i, c, false).id == id)
+                .map(|(_, c)| c.name.clone())
+        })
+    }
+
+    fn fov_of<'a>(&self, w: &'a mut World, row: &'static XuRow) -> Result<&'a mut FakeFov, String> {
+        let path = self.camera.path.display().to_string();
+        w.devices
+            .get_mut(&self.camera.id)
+            .and_then(|d| d.fov.as_mut())
+            .filter(|_| row.name == FIELD_OF_VIEW.name)
+            .ok_or_else(|| format!("{path}: no {}", row.name))
+    }
+}
+
 impl ControlNode for FakeControlNode {
-    fn query(&mut self) -> ControlQuery {
+    fn enumerate(&mut self) -> ControlScan {
         let mut w = lock(&self.world);
         w.control_queries += 1;
-        let (controls, skipped) = w
+        if let Some(next) = w.next_read_failures.pop_front() {
+            w.fail_control_reads = next;
+        }
+        let unreadable = w.fail_control_reads.clone();
+        if let Some(d) = w.devices.get(&self.camera.id) {
+            let controls = d
+                .controls
+                .iter()
+                .cloned()
+                .map(|mut c| {
+                    if unreadable.contains(&c.name) {
+                        c.value = CtrlValue::Unreadable {
+                            errno: Some(libc::EPIPE),
+                            message: "Broken pipe".into(),
+                        };
+                    }
+                    c
+                })
+                .collect();
+            let xu = d
+                .fov
+                .iter()
+                .map(|f| XuReading {
+                    row: &FIELD_OF_VIEW,
+                    state: XuState {
+                        info: 0x03,
+                        current: f.current,
+                        current_option: FIELD_OF_VIEW.option_for_value(f.current),
+                        default_raw: Some(f.default),
+                        default: FIELD_OF_VIEW
+                            .option_for_value(f.default)
+                            .unwrap_or(&FIELD_OF_VIEW.options[0]),
+                    },
+                })
+                .collect();
+            return ControlScan {
+                controls,
+                xu,
+                problems: Vec::new(),
+            };
+        }
+        let controls = w
             .controls
             .get(&self.camera.id)
             .cloned()
             .unwrap_or_default()
-            .into_iter()
-            .partition(|c| !w.fail_control_reads.contains(&c.name));
-        ControlQuery {
+            .iter()
+            .enumerate()
+            .map(|(i, c)| simple_control(i, c, unreadable.contains(&c.name)))
+            .collect();
+        ControlScan {
             controls,
-            skipped: skipped
-                .into_iter()
-                .map(|c: DeviceControl| (c.name, "Broken pipe".to_string()))
-                .collect(),
+            xu: Vec::new(),
+            problems: Vec::new(),
         }
     }
 
-    fn set(&mut self, name: &str, value: i32) -> Result<(), String> {
+    fn set(&mut self, id: u32, _name: &str, value: i32) -> Result<(), String> {
         let mut w = lock(&self.world);
-        let path = self.camera.path.display();
+        let path = self.camera.path.display().to_string();
+        let Some(name) = Self::name_of(&w, &self.camera.id, id) else {
+            return Err(format!("{path}: setting {id:#010x}: Invalid argument"));
+        };
         if !self.write {
             return Err(format!(
                 "{path}: setting {name}: opened read-only (a controller bug)"
             ));
         }
-        if w.fail_control_writes.iter().any(|n| n == name) {
+        if w.fail_control_writes.contains(&name) {
             return Err(format!("{path}: setting {name}: Input/output error"));
         }
-        let stored = w.control_write_quirks.get(name).copied().unwrap_or(value);
-        let Some(c) = w
+        let stored = w.control_write_quirks.get(&name).copied().unwrap_or(value);
+        if let Some(d) = w.devices.get_mut(&self.camera.id) {
+            let inactive = d.control(id).info.flags & CTRL_FLAG_INACTIVE != 0;
+            if d.refuse.contains(&id) || inactive {
+                return Err(format!("{path}: setting {name}: Permission denied"));
+            }
+            d.change(id, stored);
+        } else if let Some(c) = w
             .controls
             .get_mut(&self.camera.id)
             .and_then(|cs| cs.iter_mut().find(|c| c.name == name))
-        else {
-            return Err(format!("{path}: setting {name}: Invalid argument"));
-        };
-        c.value = stored;
-        w.control_writes
-            .push((self.camera.id.clone(), name.to_string(), value));
+        {
+            c.value = stored;
+        }
+        w.control_writes.push((self.camera.id.clone(), name, value));
         Ok(())
     }
 
-    fn get(&mut self, name: &str) -> Result<i32, String> {
+    fn get(&mut self, id: u32, _name: &str) -> Result<i32, String> {
         let mut w = lock(&self.world);
         w.control_reads += 1;
+        let path = self.camera.path.display();
+        if let Some(d) = w.devices.get(&self.camera.id) {
+            return d
+                .controls
+                .iter()
+                .find(|c| c.id == id)
+                .and_then(|c| c.value.value())
+                .ok_or_else(|| format!("{path}: reading {id:#010x}: Invalid argument"));
+        }
+        let name = Self::name_of(&w, &self.camera.id, id);
         w.controls
             .get(&self.camera.id)
-            .and_then(|cs| cs.iter().find(|c| c.name == name))
+            .and_then(|cs| cs.iter().find(|c| Some(&c.name) == name.as_ref()))
             .map(|c| c.value)
-            .ok_or_else(|| {
-                format!(
-                    "{}: reading {name}: Invalid argument",
-                    self.camera.path.display()
-                )
+            .ok_or_else(|| format!("{path}: reading {id:#010x}: Invalid argument"))
+    }
+
+    fn query(&mut self, id: u32, _name: &str) -> Result<CtrlInfo, String> {
+        let mut w = lock(&self.world);
+        w.control_info_reads += 1;
+        let path = self.camera.path.display();
+        if let Some(d) = w.devices.get(&self.camera.id) {
+            return d
+                .controls
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.info.clone())
+                .ok_or_else(|| format!("{path}: querying {id:#010x}: Invalid argument"));
+        }
+        w.controls
+            .get(&self.camera.id)
+            .and_then(|cs| {
+                cs.iter()
+                    .enumerate()
+                    .map(|(i, c)| simple_control(i, c, false))
+                    .find(|c| c.id == id)
             })
+            .map(|c| c.info)
+            .ok_or_else(|| format!("{path}: querying {id:#010x}: Invalid argument"))
+    }
+
+    fn capture_format(&mut self) -> Result<CaptureFormat, String> {
+        let mut w = lock(&self.world);
+        w.format_reads += 1;
+        Ok(w.devices
+            .get(&self.camera.id)
+            .map(|d| d.format)
+            .unwrap_or_else(|| FakeDevice::default().format))
+    }
+
+    fn xu_set(&mut self, row: &'static XuRow, option: &str) -> Result<(), String> {
+        let mut w = lock(&self.world);
+        if !self.write {
+            return Err("opened read-only (a controller bug)".into());
+        }
+        let byte = row
+            .option(option)
+            .ok_or_else(|| format!("{option:?} is not an option of {}", row.name))?
+            .value;
+        let fov = self.fov_of(&mut w, row)?;
+        fov.current = byte;
+        let change = fov.changes_format.filter(|(b, _)| *b == byte);
+        if let (Some((_, format)), Some(d)) = (change, w.devices.get_mut(&self.camera.id)) {
+            d.format = format;
+        }
+        w.xu_writes
+            .push((self.camera.id.clone(), option.to_string()));
+        Ok(())
+    }
+
+    fn xu_current(&mut self, row: &'static XuRow) -> Result<u8, String> {
+        let mut w = lock(&self.world);
+        Ok(self.fov_of(&mut w, row)?.current)
+    }
+}
+
+/// The control ids of [`brio_device`].
+pub mod cid {
+    pub const SHARPNESS: u32 = 0x0098_091b;
+    pub const GAIN: u32 = 0x0098_0913;
+    pub const WB_AUTO: u32 = 0x0098_090c;
+    pub const WB_TEMP: u32 = 0x0098_091a;
+    pub const AUTO_EXPOSURE: u32 = 0x009a_0901;
+    pub const EXPOSURE: u32 = 0x009a_0902;
+    pub const DYNAMIC_FPS: u32 = 0x009a_0903;
+    pub const PAN_RESET: u32 = 0x009a_0906;
+}
+
+use cid::{AUTO_EXPOSURE, DYNAMIC_FPS, EXPOSURE, GAIN, PAN_RESET, SHARPNESS, WB_AUTO, WB_TEMP};
+
+/// A control as a device would report it.
+pub fn node_control(
+    id: u32,
+    name: &str,
+    type_: u32,
+    range: (i32, i32, i32),
+    default: i32,
+    value: i32,
+    flags: u32,
+) -> NodeControl {
+    NodeControl {
+        id,
+        name: obc_pipeline::control_node::normalise_control_name(name),
+        info: CtrlInfo {
+            name: name.into(),
+            minimum: range.0,
+            maximum: range.1,
+            step: range.2,
+            default_value: default,
+            flags,
+            type_,
+        },
+        value: if type_ == CTRL_TYPE_BUTTON {
+            CtrlValue::None
+        } else {
+            CtrlValue::Value(value)
+        },
+        menu: Vec::new(),
+    }
+}
+
+/// A fake MX Brio: its controls with the values a real one reports
+/// (exposure, temperature and focus inactive under their automatic modes),
+/// the dependencies the driver has, its field of view at 65°.
+pub fn brio_device() -> FakeDevice {
+    let int = |id, name, r, d, v, f| node_control(id, name, CTRL_TYPE_INTEGER, r, d, v, f);
+    let boolean = |id, name, d, v| node_control(id, name, CTRL_TYPE_BOOLEAN, (0, 1, 1), d, v, 0);
+    let mut mode = node_control(
+        AUTO_EXPOSURE,
+        "Auto Exposure",
+        CTRL_TYPE_MENU,
+        (0, 3, 1),
+        3,
+        3,
+        0,
+    );
+    mode.menu = vec![
+        MenuItem {
+            index: 1,
+            value: MenuItemValue::Name("Manual Mode".into()),
+        },
+        MenuItem {
+            index: 3,
+            value: MenuItemValue::Name("Aperture Priority Mode".into()),
+        },
+    ];
+    FakeDevice {
+        controls: vec![
+            int(0x0098_0900, "Brightness", (0, 255, 1), 128, 128, 0),
+            int(0x0098_0901, "Contrast", (0, 255, 1), 128, 128, 0),
+            boolean(WB_AUTO, "White Balance, Automatic", 1, 1),
+            int(GAIN, "Gain", (0, 255, 1), 0, 0, 0),
+            int(
+                WB_TEMP,
+                "White Balance Temperature",
+                (2000, 7500, 1),
+                5000,
+                2975,
+                CTRL_FLAG_INACTIVE,
+            ),
+            int(SHARPNESS, "Sharpness", (0, 255, 1), 128, 128, 0),
+            mode,
+            int(
+                EXPOSURE,
+                "Exposure Time, Absolute",
+                (3, 2047, 1),
+                156,
+                1250,
+                CTRL_FLAG_INACTIVE,
+            ),
+            boolean(DYNAMIC_FPS, "Exposure, Dynamic Framerate", 0, 1),
+            node_control(
+                PAN_RESET,
+                "Pan, Reset",
+                CTRL_TYPE_BUTTON,
+                (0, 0, 0),
+                0,
+                0,
+                0,
+            ),
+        ],
+        links: vec![
+            (WB_TEMP, WB_AUTO, vec![0]),
+            (EXPOSURE, AUTO_EXPOSURE, vec![1]),
+        ],
+        fov: Some(FakeFov {
+            current: 2,
+            default: 0,
+            changes_format: None,
+        }),
+        ..FakeDevice::default()
     }
 }

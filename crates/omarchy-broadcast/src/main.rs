@@ -18,29 +18,34 @@ use std::time::Duration;
 use clap::builder::PossibleValuesParser;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand};
-use obc_ipc::{CameraControls, IpcError, Snapshot};
+use obc_ipc::{
+    CameraControls, IpcError, ResetScope, Setting, SettingKind, SettingValue, SettingsTree,
+    Snapshot,
+};
 use zbus::Connection;
 
 use crate::bus::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Failure, READ_TIMEOUT};
 
 /// Time allowed for `on`, `off`, `camera`, `effect <effect>`, `denoise`,
-/// `controls set` and `controls reset`, which may wait for D-Bus activation
-/// of the daemon.
+/// `controls set`, `controls reset`, `settings set` and `settings reset`,
+/// which may wait for D-Bus activation of the daemon.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 const AFTER_HELP: &str = "\
 Exit status:
   0  success
   1  the daemon rejected the request (no such camera, invalid config, invalid argument,
-     unavailable, failed)
+     unavailable, failed, unknown setting, setting disabled, rate limited), or is too old
+     for it
   2  invalid command line
   3  omarchy-broadcastd is not running, or there is no D-Bus session bus
   4  any other D-Bus failure, a timeout, or a failed write to stdout
 
-`status`, `cameras`, `watch`, `preview`, `effect` without an effect and `controls` without
-a subcommand never start the daemon. `on`, `off`, `camera`, `effect <effect>`, `denoise`,
-`controls set` and `controls reset` may start it through D-Bus activation when its
-activation file is installed.
+`status`, `cameras`, `watch`, `preview`, `effect` without an effect, and `controls` and
+`settings` without a subcommand never start the daemon. `on`, `off`, `camera`,
+`effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set` and
+`settings reset` may start it through D-Bus activation when its activation file is
+installed.
 
 `--json` output is documented in docs/cli-json.md; the D-Bus interface in docs/dbus-api.md.";
 
@@ -137,6 +142,37 @@ enum Command {
         #[command(subcommand)]
         action: Option<ControlsAction>,
     },
+    /// Show or change the settings of a camera: image, white balance,
+    /// exposure, focus and zoom, those the camera has.
+    ///
+    /// Without a subcommand, prints the settings of the active camera (or
+    /// of `--camera`) by group: each one's label, value, id, the values it
+    /// takes, `(stored)` for a value set here, and why it cannot be changed
+    /// now when it cannot. A change applies at once while the camera is
+    /// open (state `starting` or `active`); otherwise it is stored and
+    /// applied the next time the camera opens. The values persist across
+    /// restarts of the daemon, for each camera.
+    ///
+    /// Examples: `omarchy-broadcast settings set camera.exposure.auto_exposure manual`,
+    /// `omarchy-broadcast settings set -- camera.focus.pan_absolute -3600`,
+    /// `omarchy-broadcast settings reset --group=exposure`.
+    // Not `args_conflicts_with_subcommands`: `--camera` goes before or after
+    // `set`/`reset`; `--json` with a subcommand is refused in `job`.
+    Settings {
+        /// Print the settings as JSON lines (`"type":"settings_group"`, or
+        /// `"type":"settings_clear"` when there is nothing to show: no
+        /// camera, or no setting this version can show); only without a
+        /// subcommand.
+        #[arg(long)]
+        json: bool,
+        /// The camera, by its id (as `omarchy-broadcast cameras` lists it);
+        /// the active camera when omitted. Before or after `set` and
+        /// `reset`.
+        #[arg(long, value_name = "ID", global = true)]
+        camera: Option<String>,
+        #[command(subcommand)]
+        action: Option<SettingsAction>,
+    },
     /// Follow state changes and stats until interrupted.
     Watch {
         /// Print one JSON object per line (NDJSON).
@@ -176,6 +212,70 @@ enum ControlsAction {
     /// Forget the values stored for the active camera and put every
     /// control back to the camera's default; then print the controls.
     Reset,
+}
+
+/// The subcommands of `settings`.
+#[derive(Subcommand)]
+enum SettingsAction {
+    /// Set a setting of the active camera (or of `--camera`), and store the
+    /// value for that camera; then print the setting.
+    ///
+    /// The value is read by the setting's type: `on`, `off`, `true` or
+    /// `false` for a switch; a whole number for a number (a negative one
+    /// after `--`, or written right after the id); one of the option ids
+    /// `omarchy-broadcast settings` lists for a choice; nothing (or `true`)
+    /// to run an action. The daemon checks the range and whether the
+    /// setting can be changed now.
+    Set {
+        /// The setting's id, e.g. `camera.image.brightness`.
+        #[arg(value_name = "ID", value_parser = parse_setting_id)]
+        id: String,
+        /// The value; omitted only for an action.
+        #[arg(value_name = "VALUE", allow_negative_numbers = true)]
+        value: Option<String>,
+    },
+    /// Forget the values stored for the active camera (or `--camera`), all
+    /// of them, a group's or one setting's, and put those settings back to
+    /// the camera's default; then print them.
+    Reset {
+        /// Reset only the settings of this group, e.g. `exposure`.
+        #[arg(long, value_name = "GROUP", value_parser = parse_group_id, conflicts_with = "setting")]
+        group: Option<String>,
+        /// Reset only this setting, e.g. `camera.image.brightness`.
+        #[arg(long, value_name = "ID", value_parser = parse_setting_id)]
+        setting: Option<String>,
+    },
+}
+
+/// A setting id ([`obc_ipc::valid_setting_id`]).
+fn parse_setting_id(s: &str) -> Result<String, String> {
+    if obc_ipc::valid_setting_id(s) {
+        Ok(s.to_string())
+    } else {
+        Err(format!(
+            "not a setting id (dot-separated lowercase words such as \
+             camera.image.brightness, at most {} bytes)",
+            obc_ipc::settings::SETTING_ID_MAX
+        ))
+    }
+}
+
+/// A group id: lowercase letters, digits and `_`, at most
+/// [`json::MAX_GROUP_ID_BYTES`] bytes.
+fn parse_group_id(s: &str) -> Result<String, String> {
+    let ok = !s.is_empty()
+        && s.len() <= json::MAX_GROUP_ID_BYTES
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if ok {
+        Ok(s.to_string())
+    } else {
+        Err(format!(
+            "not a group id (lowercase letters, digits and `_`, such as white_balance, at most \
+             {} bytes)",
+            json::MAX_GROUP_ID_BYTES
+        ))
+    }
 }
 
 /// The value of `--fps`: 15 or 30.
@@ -508,6 +608,214 @@ async fn change_controls(action: &ControlsAction) -> u8 {
     }
 }
 
+/// The settings of `camera` (`""`: the active camera), without starting
+/// the daemon: the properties first (for the revision, the state and the
+/// camera's name), then `GetSettings`.
+async fn read_settings(
+    conn: &Connection,
+    camera: &str,
+) -> Result<(Snapshot, SettingsTree), Failure> {
+    let snap = bus::fetch(conn).await?;
+    bus::require_settings(snap.interface_revision)?;
+    let tree = bus::settings_tree(conn, camera).await?;
+    Ok((snap, tree))
+}
+
+/// `settings`: prints the settings of a camera, as JSON lines (the full
+/// set, or `settings_clear` with nothing to show) or for a person.
+async fn show_settings(json: bool, camera: &str) -> u8 {
+    let result = within(READ_TIMEOUT, async {
+        let conn = bus::connect().await?;
+        read_settings(&conn, camera).await
+    })
+    .await;
+    match result {
+        Ok((s, tree)) => {
+            if json {
+                for line in json::settings_lines(&tree) {
+                    out::line(&line);
+                }
+            } else {
+                out::print(&human::settings_text(&s, &tree, human::Only::All));
+            }
+            EXIT_OK
+        }
+        Err(f) => report(&f, json),
+    }
+}
+
+/// The value `text` names for `setting`, typed by the setting's type: `on`,
+/// `off`, `true` or `false` for a bool; a decimal integer for an int (its
+/// range is the daemon's to check); an option value id for an enum; nothing
+/// or `true` for an action. `Err` is the usage message.
+fn typed_value(setting: &Setting, text: Option<&str>) -> Result<SettingValue, String> {
+    let id = human::printable(&setting.id);
+    let missing = || format!("{id} needs a value");
+    match &setting.kind {
+        SettingKind::Bool { .. } => match text {
+            Some("on" | "true") => Ok(SettingValue::Bool(true)),
+            Some("off" | "false") => Ok(SettingValue::Bool(false)),
+            Some(other) => Err(format!(
+                "invalid value '{}' for {id}: it is a switch (on, off, true or false)",
+                human::printable(other)
+            )),
+            None => Err(format!("{}: on, off, true or false", missing())),
+        },
+        SettingKind::Int { min, max, .. } => {
+            let range = format!("a whole number from {min} to {max}");
+            match text {
+                // Decimal digits only: `i64::from_str` takes a sign, and
+                // nothing else that is not a digit.
+                Some(t) => t.parse::<i64>().map(SettingValue::Int).map_err(|_| {
+                    format!("invalid value '{}' for {id}: {range}", human::printable(t))
+                }),
+                None => Err(format!("{}: {range}", missing())),
+            }
+        }
+        SettingKind::Enum { options, .. } => {
+            let ids = options
+                .iter()
+                .map(|(v, _)| human::printable(v).into_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            match text {
+                Some(t) if options.iter().any(|(v, _)| v == t) => {
+                    Ok(SettingValue::Str(t.to_string()))
+                }
+                Some(t) => Err(format!(
+                    "invalid value '{}' for {id}: one of {ids}",
+                    human::printable(t)
+                )),
+                None => Err(format!("{}: one of {ids}", missing())),
+            }
+        }
+        SettingKind::Action => match text {
+            None | Some("true") => Ok(SettingValue::Bool(true)),
+            Some(other) => Err(format!(
+                "invalid value '{}' for {id}: it is an action (give no value, or true)",
+                human::printable(other)
+            )),
+        },
+        SettingKind::Unknown(t) => Err(format!(
+            "{id} is a setting of type '{}', which this version of omarchy-broadcast cannot set",
+            human::printable(t)
+        )),
+    }
+}
+
+/// A usage error of `settings <action>`, found after the command line was
+/// read (a value the setting's type does not take).
+fn settings_usage(action: &str, msg: String) -> clap::Error {
+    let mut cmd = Cli::command();
+    cmd.build();
+    match cmd
+        .find_subcommand_mut("settings")
+        .and_then(|s| s.find_subcommand_mut(action))
+    {
+        Some(sub) => sub.error(ErrorKind::ValueValidation, msg),
+        None => cmd.error(ErrorKind::ValueValidation, msg),
+    }
+}
+
+/// What a `settings set|reset` run came to.
+enum SettingsOutcome {
+    /// Made, and read back: print these.
+    Done(Box<(Snapshot, SettingsTree)>),
+    /// The value does not fit the setting's type: a usage error, nothing
+    /// sent.
+    Usage(String),
+}
+
+/// `settings set|reset`: checks that the daemon has the settings, makes
+/// the change (for `set`, after reading the tree to type the value), and
+/// prints the settings changed, read back after it.
+async fn change_settings(action: &SettingsAction, camera: &str) -> u8 {
+    let name = match action {
+        SettingsAction::Set { .. } => "set",
+        SettingsAction::Reset { .. } => "reset",
+    };
+    // Whether the daemon accepted the change: a failure after that is only
+    // the read-back's, and the message says so.
+    let changed = std::cell::Cell::new(false);
+    let result = within(CALL_TIMEOUT, async {
+        let conn = bus::connect().await?;
+        let proxy = bus::proxy(&conn).await?;
+        let revision = proxy
+            .interface_revision()
+            .await
+            .map_err(|e| bus::classify(&e, true))?;
+        bus::require_settings(revision)?;
+        match action {
+            SettingsAction::Set { id, value, .. } => {
+                let tree = proxy
+                    .settings_tree(camera)
+                    .await
+                    .map_err(bus::classify_ipc)?;
+                let Some(setting) = tree.find(id) else {
+                    return Err(Failure::Rejected(if tree.camera.is_empty() {
+                        IpcError::Unavailable("no camera is present".into())
+                    } else {
+                        IpcError::UnknownSetting(format!(
+                            "the camera {:?} has no setting {id:?}",
+                            tree.camera
+                        ))
+                    }));
+                };
+                let value = match typed_value(setting, value.as_deref()) {
+                    Ok(v) => v,
+                    Err(msg) => return Ok(SettingsOutcome::Usage(msg)),
+                };
+                proxy
+                    .set_setting_value(camera, id, &value)
+                    .await
+                    .map_err(bus::classify_ipc)?;
+            }
+            SettingsAction::Reset { group, setting, .. } => {
+                let scope = match (group, setting) {
+                    (Some(g), _) => ResetScope::Group(g.clone()),
+                    (None, Some(id)) => ResetScope::Setting(id.clone()),
+                    (None, None) => ResetScope::Camera,
+                };
+                proxy
+                    .reset_settings_scope(camera, &scope)
+                    .await
+                    .map_err(bus::classify_ipc)?;
+            }
+        }
+        changed.set(true);
+        let (snap, tree) = read_settings(&conn, camera).await?;
+        Ok(SettingsOutcome::Done(Box::new((snap, tree))))
+    })
+    .await;
+    match result {
+        Ok(SettingsOutcome::Done(done)) => {
+            let (s, tree) = *done;
+            let only = match action {
+                SettingsAction::Set { id, .. } => human::Only::Setting(id),
+                SettingsAction::Reset { group: Some(g), .. } => human::Only::Group(g),
+                SettingsAction::Reset {
+                    setting: Some(id), ..
+                } => human::Only::Setting(id),
+                SettingsAction::Reset { .. } => human::Only::All,
+            };
+            out::print(&human::settings_text(&s, &tree, only));
+            EXIT_OK
+        }
+        Ok(SettingsOutcome::Usage(msg)) => {
+            let _ = settings_usage(name, msg).print();
+            EXIT_USAGE
+        }
+        Err(f) if changed.get() => {
+            eprintln!(
+                "omarchy-broadcast: the change was made, but reading the settings back failed: {}",
+                human::printable(&f.message())
+            );
+            f.exit_code()
+        }
+        Err(f) => report(&f, false),
+    }
+}
+
 /// What `main` runs once the command line is checked.
 enum Job {
     Command(Command),
@@ -523,6 +831,19 @@ fn job(cli: Cli) -> Result<Job, clap::Error> {
             image,
             ..
         } => effect_request(&effect, strength, image.as_deref()).map(Job::SetEffect),
+        Command::Settings {
+            json: true,
+            action: Some(_),
+            ..
+        } => {
+            let mut cmd = Cli::command();
+            cmd.build();
+            let msg = "the argument '--json' cannot be used with a subcommand";
+            Err(match cmd.find_subcommand_mut("settings") {
+                Some(sub) => sub.error(ErrorKind::ArgumentConflict, msg),
+                None => cmd.error(ErrorKind::ArgumentConflict, msg),
+            })
+        }
         command => Ok(Job::Command(command)),
     }
 }
@@ -541,6 +862,16 @@ async fn run(job: Job) -> u8 {
             action: Some(action),
             ..
         }) => change_controls(action).await,
+        Job::Command(Command::Settings {
+            json,
+            camera,
+            action: None,
+        }) => show_settings(*json, camera.as_deref().unwrap_or("")).await,
+        Job::Command(Command::Settings {
+            camera,
+            action: Some(action),
+            ..
+        }) => change_settings(action, camera.as_deref().unwrap_or("")).await,
         Job::Command(command @ (Command::On | Command::Off | Command::Camera { .. })) => {
             control(command).await
         }

@@ -3400,3 +3400,709 @@ fn maxine_effects_end_to_end_keep_the_rate_and_release_the_gpu() {
         "a CUDA context outlived the output: {after:?}"
     );
 }
+
+// ---- Camera settings (control enumeration, events, Extension Unit) ----
+//
+// The `settings_hw_` tests need `OBC_TEST_CAMERA` attached and free. Each
+// puts every control it touches back to the value it read at its start,
+// also when it fails (a guard), and never resets the whole camera. The
+// checks of specific controls run only on an MX Brio (046d:0944), the
+// reference camera; on another camera only the generic checks run.
+
+/// The MX Brio's USB id: the camera whose known controls the settings
+/// tests check by name.
+const MX_BRIO: obc_core::UsbId = obc_core::UsbId {
+    vendor: 0x046d,
+    product: 0x0944,
+};
+
+/// The test camera's node path and its USB id (when it has one).
+fn settings_camera() -> (std::path::PathBuf, Option<obc_core::UsbId>) {
+    let sel = test_camera();
+    let (camera, _) = select_with(&sel, &test_mode(), DiscoveryRoute::Auto);
+    let usb = obc_pipeline::xu::usb_device_of_node(
+        std::path::Path::new(obc_pipeline::xu::SYSFS_ROOT),
+        &camera.path,
+    )
+    .ok()
+    .map(|u| u.id);
+    eprintln!("settings camera: {camera} (usb {usb:?})");
+    (camera.path, usb)
+}
+
+/// Puts controls back to the values the test read at its start when
+/// dropped, the last saved first: also when an assertion fails.
+struct RestoreControls {
+    path: std::path::PathBuf,
+    saved: Vec<(&'static str, u32, i32)>,
+}
+
+impl RestoreControls {
+    fn new(path: &std::path::Path) -> Self {
+        RestoreControls {
+            path: path.to_path_buf(),
+            saved: Vec::new(),
+        }
+    }
+
+    /// Reads control `id` and remembers its value for the restore.
+    fn save(&mut self, name: &'static str, id: u32) -> i32 {
+        let v = obc_pipeline::controls::get_ctrl(&self.path, id)
+            .unwrap_or_else(|e| panic!("reading {name}: {e}"));
+        self.saved.push((name, id, v));
+        v
+    }
+}
+
+impl Drop for RestoreControls {
+    fn drop(&mut self) {
+        for (name, id, value) in self.saved.iter().rev() {
+            match obc_pipeline::controls::set_ctrl(&self.path, *id, *value) {
+                Ok(()) => eprintln!("restored {name} = {value}"),
+                Err(e) => eprintln!(
+                    "could not restore {name} ({id:#x}) of {} to {value}: {e}",
+                    self.path.display()
+                ),
+            }
+        }
+    }
+}
+
+/// The control named `name` in an enumeration.
+fn control<'a>(found: &'a obc_pipeline::Enumeration, name: &str) -> &'a obc_pipeline::NodeControl {
+    found
+        .controls
+        .iter()
+        .find(|c| c.name == name)
+        .unwrap_or_else(|| panic!("{name} not enumerated"))
+}
+
+/// Every control the camera reports, printed; each one's range and value
+/// are consistent. On an MX Brio, its known controls are all there with
+/// their ids, types, ranges and menus, and the field-of-view unit resolves.
+#[test]
+#[ignore = "needs OBC_TEST_CAMERA attached"]
+fn settings_hw_enumerates_every_control() {
+    use obc_pipeline::controls::{CTRL_TYPE_BOOLEAN, CTRL_TYPE_INTEGER, CTRL_TYPE_MENU};
+    use obc_pipeline::{ControlNode, CtrlValue};
+    init();
+    let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
+    let (path, usb) = settings_camera();
+    let node = ControlNode::open(&path, false).unwrap();
+    let found = node.enumerate();
+    for c in &found.controls {
+        eprintln!(
+            "{:#010x} {:<28} {:?} type {} min {} max {} step {} def {} flags {:#x} value {:?} menu {:?}",
+            c.id,
+            c.name,
+            c.info.name,
+            c.info.type_,
+            c.info.minimum,
+            c.info.maximum,
+            c.info.step,
+            c.info.default_value,
+            c.info.flags,
+            c.value,
+            c.menu
+        );
+    }
+    assert!(found.incomplete.is_none(), "{:?}", found.incomplete);
+    assert!(!found.controls.is_empty(), "the camera reports no control");
+    let ids: Vec<u32> = found.controls.iter().map(|c| c.id).collect();
+    assert!(ids.windows(2).all(|w| w[0] < w[1]), "ascending: {ids:x?}");
+    for c in &found.controls {
+        assert!(obc_pipeline::control_node::in_exposed_class(c.id), "{c:?}");
+        assert!(!c.name.is_empty(), "{c:?}");
+        if c.info.type_ == CTRL_TYPE_INTEGER {
+            assert!(c.info.minimum <= c.info.maximum, "{c:?}");
+            assert!(
+                (c.info.minimum..=c.info.maximum).contains(&c.info.default_value),
+                "{c:?}"
+            );
+            if let CtrlValue::Value(v) = c.value {
+                assert!((c.info.minimum..=c.info.maximum).contains(&v), "{c:?}");
+            }
+        }
+    }
+    let format = node.capture_format().unwrap();
+    eprintln!("capture format: {format}");
+    assert!(format.width > 0 && format.height > 0, "{format}");
+
+    if usb != Some(MX_BRIO) {
+        eprintln!("not an MX Brio: only the generic checks ran");
+        return;
+    }
+    // (name, id, type, min, max, step, default) as the MX Brio reports them.
+    let known: [(&str, u32, u32, i32, i32, i32, i32); 17] = [
+        ("brightness", 0x0098_0900, CTRL_TYPE_INTEGER, 0, 255, 1, 128),
+        ("contrast", 0x0098_0901, CTRL_TYPE_INTEGER, 0, 255, 1, 128),
+        ("saturation", 0x0098_0902, CTRL_TYPE_INTEGER, 0, 255, 1, 128),
+        (
+            "white_balance_automatic",
+            0x0098_090c,
+            CTRL_TYPE_BOOLEAN,
+            0,
+            1,
+            1,
+            1,
+        ),
+        ("gain", 0x0098_0913, CTRL_TYPE_INTEGER, 0, 255, 1, 0),
+        (
+            "power_line_frequency",
+            0x0098_0918,
+            CTRL_TYPE_MENU,
+            0,
+            2,
+            1,
+            2,
+        ),
+        (
+            "white_balance_temperature",
+            0x0098_091a,
+            CTRL_TYPE_INTEGER,
+            2800,
+            7500,
+            1,
+            5000,
+        ),
+        ("sharpness", 0x0098_091b, CTRL_TYPE_INTEGER, 0, 255, 1, 128),
+        (
+            "backlight_compensation",
+            0x0098_091c,
+            CTRL_TYPE_INTEGER,
+            0,
+            1,
+            1,
+            1,
+        ),
+        ("auto_exposure", 0x009a_0901, CTRL_TYPE_MENU, 0, 3, 1, 3),
+        (
+            "exposure_time_absolute",
+            0x009a_0902,
+            CTRL_TYPE_INTEGER,
+            3,
+            2047,
+            1,
+            156,
+        ),
+        (
+            "exposure_dynamic_framerate",
+            0x009a_0903,
+            CTRL_TYPE_BOOLEAN,
+            0,
+            1,
+            1,
+            0,
+        ),
+        (
+            "pan_absolute",
+            0x009a_0908,
+            CTRL_TYPE_INTEGER,
+            -72000,
+            72000,
+            3600,
+            0,
+        ),
+        (
+            "tilt_absolute",
+            0x009a_0909,
+            CTRL_TYPE_INTEGER,
+            -72000,
+            72000,
+            3600,
+            0,
+        ),
+        (
+            "focus_absolute",
+            0x009a_090a,
+            CTRL_TYPE_INTEGER,
+            0,
+            255,
+            1,
+            0,
+        ),
+        (
+            "focus_automatic_continuous",
+            0x009a_090c,
+            CTRL_TYPE_BOOLEAN,
+            0,
+            1,
+            1,
+            1,
+        ),
+        (
+            "zoom_absolute",
+            0x009a_090d,
+            CTRL_TYPE_INTEGER,
+            100,
+            400,
+            1,
+            100,
+        ),
+    ];
+    for (name, id, type_, min, max, step, def) in known {
+        let c = control(&found, name);
+        assert_eq!(
+            (
+                c.id,
+                c.info.type_,
+                c.info.minimum,
+                c.info.maximum,
+                c.info.default_value
+            ),
+            (id, type_, min, max, def),
+            "{name}"
+        );
+        if type_ == CTRL_TYPE_INTEGER {
+            assert_eq!(c.info.step, step, "{name}");
+        }
+        assert!(c.value.value().is_some(), "{name}: {:?}", c.value);
+        assert!(!c.info.disabled() && !c.info.read_only(), "{name}");
+    }
+    let menu =
+        |name: &str| -> Vec<u32> { control(&found, name).menu.iter().map(|m| m.index).collect() };
+    assert_eq!(menu("power_line_frequency"), [0, 1, 2]);
+    // Only Manual and Aperture Priority: the device refuses items 0 and 2.
+    assert_eq!(menu("auto_exposure"), [1, 3]);
+    // The field-of-view row resolves on the camera's descriptors: unit 10.
+    let xu = obc_pipeline::xu::find_xu_controls(
+        std::path::Path::new(obc_pipeline::xu::SYSFS_ROOT),
+        &path,
+    )
+    .unwrap();
+    let units: Vec<(&str, u8)> = xu.iter().map(|x| (x.row().name, x.unit())).collect();
+    assert_eq!(units, [("field_of_view", 10)]);
+}
+
+/// Exposure: with auto exposure set to manual the exposure time's
+/// INACTIVE flag clears; back at the starting (automatic) mode it is set
+/// again. The camera's auto exposure must start in an automatic mode.
+#[test]
+#[ignore = "needs OBC_TEST_CAMERA attached"]
+fn settings_hw_auto_exposure_flips_the_exposure_time_inactive_flag() {
+    use obc_pipeline::ControlNode;
+    const AUTO_EXPOSURE: u32 = 0x009a_0901;
+    const EXPOSURE_TIME: u32 = 0x009a_0902;
+    const MANUAL: i32 = 1;
+    init();
+    let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
+    let (path, _) = settings_camera();
+    let node = ControlNode::open(&path, true).unwrap();
+    let mut restore = RestoreControls::new(&path);
+    let start = restore.save("auto_exposure", AUTO_EXPOSURE);
+    assert_ne!(
+        start, MANUAL,
+        "this test needs auto exposure in an automatic mode at its start"
+    );
+    let inactive = || {
+        node.query(EXPOSURE_TIME)
+            .unwrap()
+            .expect("exposure_time_absolute")
+            .inactive()
+    };
+    eprintln!(
+        "auto_exposure starts at {start}; exposure time inactive: {}",
+        inactive()
+    );
+    assert!(
+        inactive(),
+        "exposure time is inactive under automatic exposure"
+    );
+
+    node.set(AUTO_EXPOSURE, MANUAL).unwrap();
+    assert_eq!(node.get(AUTO_EXPOSURE).unwrap(), MANUAL);
+    assert!(!inactive(), "manual exposure activates the exposure time");
+
+    node.set(AUTO_EXPOSURE, start).unwrap();
+    assert_eq!(node.get(AUTO_EXPOSURE).unwrap(), start);
+    assert!(
+        inactive(),
+        "back in automatic mode the exposure time is inactive"
+    );
+}
+
+/// A slider control (sharpness, else gain): default + step read back, the
+/// default read back, then the starting value restored.
+#[test]
+#[ignore = "needs OBC_TEST_CAMERA attached"]
+fn settings_hw_a_slider_writes_and_reads_back() {
+    use obc_pipeline::ControlNode;
+    init();
+    let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
+    let (path, _) = settings_camera();
+    let node = ControlNode::open(&path, true).unwrap();
+    let found = node.enumerate();
+    let c = ["sharpness", "gain"]
+        .iter()
+        .find_map(|n| found.controls.iter().find(|c| c.name == *n))
+        .expect("this test needs a camera with sharpness or gain");
+    let name: &'static str = if c.name == "sharpness" {
+        "sharpness"
+    } else {
+        "gain"
+    };
+    let mut restore = RestoreControls::new(&path);
+    let start = restore.save(name, c.id);
+    let step = c.info.step.max(1);
+    let def = c.info.default_value;
+    let range = c.info.minimum..=c.info.maximum;
+    // One step up, else one step down: never outside the control's range.
+    let other = [def.checked_add(step), def.checked_sub(step)]
+        .into_iter()
+        .flatten()
+        .find(|v| range.contains(v))
+        .unwrap_or_else(|| panic!("{name}: no value one step from {def} within {range:?}"));
+    assert!(
+        range.contains(&other) && other != def,
+        "{other} in {range:?}"
+    );
+    eprintln!("{name}: start {start}, default {def}, range {range:?}, writing {other}");
+    node.set(c.id, other).unwrap();
+    assert_eq!(node.get(c.id).unwrap(), other);
+    node.set(c.id, def).unwrap();
+    assert_eq!(node.get(c.id).unwrap(), def);
+    node.set(c.id, start).unwrap();
+    assert_eq!(node.get(c.id).unwrap(), start);
+}
+
+/// Puts the field of view back to the option the test found when dropped.
+struct RestoreFov<'a> {
+    xu: obc_pipeline::XuControl,
+    node: &'a obc_pipeline::ControlNode,
+    option: &'static str,
+}
+
+impl Drop for RestoreFov<'_> {
+    fn drop(&mut self) {
+        match self.xu.set(self.node, self.option) {
+            Ok(()) => eprintln!("restored field_of_view = {}", self.option),
+            Err(e) => eprintln!("could not restore field_of_view to {}: {e}", self.option),
+        }
+    }
+}
+
+/// `VIDIOC_G_FMT` / `VIDIOC_S_FMT`: `struct v4l2_format`, 208 bytes on
+/// 64-bit (its union holds pointers, so it is 8-aligned at offset 8).
+#[repr(C, align(8))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RawFormat([u8; 208]);
+/// `VIDIOC_G_PARM` / `VIDIOC_S_PARM`: `struct v4l2_streamparm`, 204 bytes.
+#[repr(C, align(4))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RawParm([u8; 204]);
+
+const fn vidioc_rw(nr: libc::c_ulong, size: usize) -> libc::c_ulong {
+    (3 << 30) | ((size as libc::c_ulong) << 16) | ((b'V' as libc::c_ulong) << 8) | nr
+}
+const VIDIOC_G_FMT: libc::c_ulong = vidioc_rw(4, std::mem::size_of::<RawFormat>());
+const VIDIOC_S_FMT: libc::c_ulong = vidioc_rw(5, std::mem::size_of::<RawFormat>());
+const VIDIOC_G_PARM: libc::c_ulong = vidioc_rw(21, std::mem::size_of::<RawParm>());
+const VIDIOC_S_PARM: libc::c_ulong = vidioc_rw(22, std::mem::size_of::<RawParm>());
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(VIDIOC_G_FMT == 0xc0d0_5604 && VIDIOC_G_PARM == 0xc0cc_5615);
+
+/// One `VIDIOC_*` on a struct whose first word is the buffer type, set to
+/// `V4L2_BUF_TYPE_VIDEO_CAPTURE`.
+fn capture_ioctl<T>(
+    file: &std::fs::File,
+    request: libc::c_ulong,
+    arg: &mut T,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `arg` is a whole `#[repr(C)]` struct of the size the request
+    // encodes, live across the call.
+    let rc = unsafe { libc::ioctl(file.as_raw_fd(), request as _, arg as *mut T) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn with_capture_type<const N: usize>(mut raw: [u8; N]) -> [u8; N] {
+    raw[..4].copy_from_slice(&1u32.to_ne_bytes());
+    raw
+}
+
+/// The node's whole capture format and stream parameters (frame interval).
+fn capture_mode(file: &std::fs::File) -> std::io::Result<(RawFormat, RawParm)> {
+    let mut fmt = RawFormat(with_capture_type([0; 208]));
+    capture_ioctl(file, VIDIOC_G_FMT, &mut fmt)?;
+    let mut parm = RawParm(with_capture_type([0; 204]));
+    capture_ioctl(file, VIDIOC_G_PARM, &mut parm)?;
+    Ok((fmt, parm))
+}
+
+/// The capture frame interval of stream parameters, as a framerate
+/// (`timeperframe` inverted): `None` when the driver reports none.
+fn parm_framerate(parm: &RawParm) -> Option<(u32, u32)> {
+    let word = |at: usize| u32::from_ne_bytes(parm.0[at..at + 4].try_into().unwrap());
+    // type, then struct v4l2_captureparm: capability, capturemode,
+    // timeperframe { numerator, denominator }.
+    let (num, den) = (word(12), word(16));
+    (num != 0 && den != 0).then_some((den, num))
+}
+
+/// Puts the capture format and the frame interval a test found back when
+/// dropped, also when an assertion fails: `VIDIOC_S_FMT` then
+/// `VIDIOC_S_PARM`, each only when it now differs. Must be dropped after
+/// the stream stopped (a streaming node refuses `S_FMT` with `EBUSY`).
+struct RestoreCaptureMode {
+    file: std::fs::File,
+    fmt: RawFormat,
+    parm: RawParm,
+}
+
+/// The node opened for reading and writing, non-blocking.
+fn open_capture(path: &std::path::Path) -> std::fs::File {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .unwrap_or_else(|e| panic!("opening {}: {e}", path.display()))
+}
+
+impl RestoreCaptureMode {
+    fn new(path: &std::path::Path) -> Self {
+        let file = open_capture(path);
+        let (fmt, parm) = capture_mode(&file).expect("reading the capture format and interval");
+        RestoreCaptureMode { file, fmt, parm }
+    }
+
+    /// Whether the node's format and interval are the ones saved.
+    fn unchanged(&self) -> bool {
+        capture_mode(&self.file).is_ok_and(|(f, p)| f == self.fmt && p == self.parm)
+    }
+}
+
+impl Drop for RestoreCaptureMode {
+    fn drop(&mut self) {
+        let Ok((fmt, parm)) = capture_mode(&self.file) else {
+            eprintln!("could not read the capture mode back to restore it");
+            return;
+        };
+        if fmt != self.fmt {
+            let mut want = self.fmt;
+            match capture_ioctl(&self.file, VIDIOC_S_FMT, &mut want) {
+                Ok(()) => eprintln!("restored the capture format"),
+                Err(e) => eprintln!("could not restore the capture format: {e}"),
+            }
+        }
+        // S_FMT may reset the interval: compare again.
+        let parm = capture_mode(&self.file).map(|(_, p)| p).unwrap_or(parm);
+        if parm != self.parm {
+            let mut want = self.parm;
+            match capture_ioctl(&self.file, VIDIOC_S_PARM, &mut want) {
+                Ok(()) => eprintln!("restored the frame interval"),
+                Err(e) => eprintln!("could not restore the frame interval: {e}"),
+            }
+        }
+    }
+}
+
+/// Field of view, while the camera streams: the current byte is read and
+/// printed first, 78° is written and read back, the capture format is
+/// unchanged and frames keep coming, then the starting option is written
+/// back and read back. Needs a camera with the field-of-view row.
+#[test]
+#[ignore = "needs OBC_TEST_CAMERA attached (a camera with an Extension Unit row)"]
+fn settings_hw_field_of_view_while_streaming() {
+    use obc_pipeline::ControlNode;
+    use obc_pipeline::xu::{SYSFS_ROOT, find_xu_controls};
+    init();
+    require_elements(&["v4l2src", "fakesink"]);
+    let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
+    let (path, usb) = settings_camera();
+    let xu = find_xu_controls(std::path::Path::new(SYSFS_ROOT), &path)
+        .unwrap()
+        .into_iter()
+        .find(|x| x.row().name == "field_of_view")
+        .unwrap_or_else(|| {
+            panic!("this test needs a camera with the field-of-view row (usb {usb:?})")
+        });
+    let node = ControlNode::open(&path, true).unwrap();
+    let state = xu
+        .probe(&node)
+        .unwrap()
+        .expect("the device agrees with the row");
+    eprintln!(
+        "field_of_view: unit {} GET_INFO {:#04x} GET_CUR {:#04x} ({:?}) GET_DEF {:?} (default {})",
+        xu.unit(),
+        state.info,
+        state.current,
+        state.current_option.map(|o| o.label),
+        state.default_raw,
+        state.default.label
+    );
+    let start = state.current_option.unwrap_or_else(|| {
+        panic!(
+            "unknown starting byte {:#04x}: not touching it",
+            state.current
+        )
+    });
+    let target = if start.id == "78" { "90" } else { "78" };
+    let target_value = xu.row().option(target).unwrap().value;
+
+    // Stream in the format and at the frame interval the camera is set to,
+    // and put both back (whole) once the stream stopped, also on a panic:
+    // the guard is created before the stream's, so it drops after it.
+    let mode = RestoreCaptureMode::new(&path);
+    let initial = node.capture_format().unwrap();
+    let caps = match &initial.pixelformat.to_le_bytes() {
+        b"NV12" => "video/x-raw,format=NV12".to_string(),
+        b"YUYV" => "video/x-raw,format=YUY2".to_string(),
+        b"MJPG" => "image/jpeg".to_string(),
+        _ => panic!("no capture caps for the camera's format {initial}"),
+    };
+    let framerate = parm_framerate(&mode.parm)
+        .map(|(n, d)| format!(",framerate={n}/{d}"))
+        .unwrap_or_default();
+    eprintln!("capture mode at the start: {initial}{framerate}");
+    let pipeline = gst::parse::launch(&format!(
+        "v4l2src device={} ! {caps},width={},height={}{framerate} ! fakesink name=sink sync=false",
+        path.display(),
+        initial.width,
+        initial.height
+    ))
+    .expect("capture pipeline");
+    let bin = pipeline.clone().downcast::<gst::Bin>().unwrap();
+    let frames = Arc::new(AtomicU64::new(0));
+    let f = Arc::clone(&frames);
+    bin.by_name("sink")
+        .unwrap()
+        .static_pad("sink")
+        .unwrap()
+        .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            f.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+    struct Stop(gst::Element);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            let _ = self.0.set_state(gst::State::Null);
+        }
+    }
+    let stop = Stop(pipeline.clone());
+    pipeline.set_state(gst::State::Playing).expect("PLAYING");
+    let wait_frames = |more_than: u64| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while frames.load(Ordering::Relaxed) <= more_than {
+            assert!(Instant::now() < deadline, "no frames past {more_than}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_frames(5);
+
+    let restore = RestoreFov {
+        xu,
+        node: &node,
+        option: start.id,
+    };
+    let before = node.capture_format().unwrap();
+    eprintln!("streaming {before}; writing field_of_view {target}");
+    xu.set(&node, target).unwrap();
+    assert_eq!(xu.current(&node).unwrap(), target_value);
+    let after = node.capture_format().unwrap();
+    assert_eq!(after, before, "the field of view changed the format");
+    let seen = frames.load(Ordering::Relaxed);
+    wait_frames(seen + 10);
+    eprintln!(
+        "frames still flowing after the write ({} so far)",
+        frames.load(Ordering::Relaxed)
+    );
+
+    drop(restore);
+    assert_eq!(xu.current(&node).unwrap(), start.value);
+    assert_eq!(node.capture_format().unwrap(), before);
+    drop(stop);
+    assert_eq!(
+        node.capture_format().unwrap(),
+        initial,
+        "the stream left another format"
+    );
+    // The stream committed the mode it streamed in: the starting one, or
+    // the guard puts it back. Either way the whole format and the interval
+    // are the starting ones afterwards.
+    let (saved_fmt, saved_parm) = (mode.fmt, mode.parm);
+    eprintln!(
+        "the stream left the capture mode unchanged: {}",
+        mode.unchanged()
+    );
+    drop(mode);
+    let (fmt, parm) = capture_mode(&open_capture(&path)).unwrap();
+    assert!(fmt == saved_fmt, "the capture format was not restored");
+    assert!(parm == saved_parm, "the frame interval was not restored");
+    eprintln!(
+        "capture mode at the end: {} at {:?} fps",
+        node.capture_format().unwrap(),
+        parm_framerate(&parm)
+    );
+}
+
+/// Control events: a watcher on exposure_dynamic_framerate (else gain)
+/// receives the change made through another descriptor within a bounded
+/// wait, and the restore.
+#[test]
+#[ignore = "needs OBC_TEST_CAMERA attached"]
+fn settings_hw_a_control_change_raises_an_event() {
+    use obc_pipeline::ctrl_events::CTRL_CHANGE_VALUE;
+    use obc_pipeline::{ControlNode, CtrlNotice, CtrlWatcher};
+    init();
+    let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
+    let (path, _) = settings_camera();
+    let found = ControlNode::open(&path, false).unwrap().enumerate();
+    let c = ["exposure_dynamic_framerate", "gain"]
+        .iter()
+        .find_map(|n| found.controls.iter().find(|c| c.name == *n))
+        .expect("this test needs exposure_dynamic_framerate or gain");
+    let name: &'static str = if c.name == "gain" {
+        "gain"
+    } else {
+        "exposure_dynamic_framerate"
+    };
+    let id = c.id;
+    let mut restore = RestoreControls::new(&path);
+    let start = restore.save(name, id);
+    let other = if start + c.info.step.max(1) <= c.info.maximum {
+        start + c.info.step.max(1)
+    } else {
+        start - c.info.step.max(1)
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let watcher = CtrlWatcher::start(&path, &[id], move |n| {
+        let _ = tx.send(n);
+    })
+    .unwrap();
+    assert_eq!(watcher.subscribed(), [id], "{:?}", watcher.refused());
+    let expect = |value: i32| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(CtrlNotice::Changed(ev)) => {
+                    eprintln!("event {ev:?}");
+                    if ev.id == id && ev.changes & CTRL_CHANGE_VALUE != 0 && ev.value == value {
+                        return;
+                    }
+                }
+                Ok(CtrlNotice::Ended(e)) => panic!("the watcher ended: {e}"),
+                Err(e) => panic!("no event for {name} = {value} within 3 s: {e}"),
+            }
+        }
+    };
+    let t = Instant::now();
+    obc_pipeline::controls::set_ctrl(&path, id, other).unwrap();
+    expect(other);
+    eprintln!("{name} = {other}: event after {:?}", t.elapsed());
+    obc_pipeline::controls::set_ctrl(&path, id, start).unwrap();
+    expect(start);
+    let t = Instant::now();
+    watcher.stop();
+    assert!(
+        t.elapsed() < Duration::from_secs(1),
+        "stop took {:?}",
+        t.elapsed()
+    );
+}

@@ -21,13 +21,15 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use obc_ipc::settings::{VariantDict, WireChange, camera_option};
 use obc_ipc::{
-    BUS_NAME, CameraControl, CameraControls, CameraInfo, INTERFACE_REVISION, IpcError, OBJECT_PATH,
-    State,
+    BUS_NAME, CameraControl, CameraControls, CameraInfo, Condition, ConditionOp,
+    INTERFACE_REVISION, IpcError, OBJECT_PATH, ResetScope, Setting, SettingChange, SettingKind,
+    SettingValue, SettingsGroup, SettingsTree, State,
 };
 use serde_json::Value;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
-use zbus::{Connection, connection, interface};
+use zbus::{Connection, OwnedVariant, connection, interface};
 
 const CLI: &str = env!("CARGO_BIN_EXE_omarchy-broadcast");
 const DBUS_DAEMON: &str = "dbus-daemon";
@@ -330,6 +332,31 @@ impl Watch {
         json_line(&self.next(what))
     }
 
+    /// The full set of camera settings that follows a snapshot or a
+    /// structural change: `count` `settings_group` lines, `index` 0 to
+    /// `count - 1`, or one `settings_clear` line.
+    fn settings_set(&self, what: &str) -> Vec<Value> {
+        let first = self.next_json(what);
+        if first["type"] == "settings_clear" {
+            return vec![first];
+        }
+        assert_eq!(first["type"], "settings_group", "{what}: {first}");
+        assert_eq!(first["index"], 0, "{what}: {first}");
+        let count = first["count"].as_u64().unwrap();
+        let mut lines = vec![first];
+        for i in 1..count {
+            let v = self.next_json(what);
+            assert_eq!(v["type"], "settings_group", "{what}: {v}");
+            assert_eq!(
+                (&v["index"], &v["count"]),
+                (&i.into(), &count.into()),
+                "{v}"
+            );
+            lines.push(v);
+        }
+        lines
+    }
+
     /// Asserts that no line arrives within `d`.
     fn quiet_for(&self, d: Duration, what: &str) {
         match self.lines.recv_timeout(d) {
@@ -397,6 +424,13 @@ struct Mock {
     rename_on_get: Option<String>,
     /// `GetCameraControls` fails (a device that cannot be read).
     fail_gets: bool,
+    /// The camera settings of the first camera (the others have none).
+    settings: Vec<SettingsGroup>,
+    settings_revision: u32,
+    settings_serial: u32,
+    /// The next valid `SetSetting` fails with this error instead (`"RateLimited"`
+    /// or `"UnknownSetting"`).
+    fail_next_set: Option<&'static str>,
 }
 
 fn control(name: &str, min: i32, max: i32, step: i32, default: i32) -> CameraControl {
@@ -417,6 +451,247 @@ fn mock_controls() -> Vec<CameraControl> {
         control("brightness", -64, 64, 1, 0),
         control("saturation", 0, 100, 2, 50),
         control("sharpness", 0, 255, 1, 128),
+    ]
+}
+
+const WB_AUTO: &str = "camera.white_balance.white_balance_automatic";
+const WB_REASON: &str = "Turn off automatic white balance to change this";
+const EXPOSURE_MODE: &str = "camera.exposure.auto_exposure";
+const EXPOSURE_REASON: &str = "Set exposure to manual to change this";
+const AF: &str = "camera.focus.focus_automatic_continuous";
+const AF_REASON: &str = "Turn off continuous autofocus to change this";
+
+/// The catalogue's reason for a dependent setting that is off.
+fn reason_of(id: &str) -> &'static str {
+    match id {
+        "camera.white_balance.white_balance_temperature" => WB_REASON,
+        "camera.exposure.exposure_time_absolute" => EXPOSURE_REASON,
+        "camera.focus.focus_absolute" => AF_REASON,
+        _ => "The camera does not allow changing this now",
+    }
+}
+
+fn setting(id: &str, label: &str, kind: SettingKind, hint: Option<&str>) -> Setting {
+    Setting {
+        id: id.into(),
+        label: label.into(),
+        kind,
+        scope: "camera".into(),
+        stored: false,
+        enabled: true,
+        disabled_reason: String::new(),
+        enabled_when: Vec::new(),
+        hint: hint.map(String::from),
+    }
+}
+
+fn int(
+    id: &str,
+    label: &str,
+    (min, max, step): (i64, i64, i64),
+    default: i64,
+    value: i64,
+) -> Setting {
+    let kind = SettingKind::Int {
+        min,
+        max,
+        step,
+        default,
+        value,
+        unit: None,
+    };
+    setting(id, label, kind, Some("slider"))
+}
+
+fn switch(id: &str, label: &str, default: bool, value: bool) -> Setting {
+    let kind = SettingKind::Bool { default, value };
+    setting(id, label, kind, Some("switch"))
+}
+
+fn choice(id: &str, label: &str, options: &[(&str, &str)], default: &str, value: &str) -> Setting {
+    let kind = SettingKind::Enum {
+        options: options
+            .iter()
+            .map(|(v, l)| (v.to_string(), l.to_string()))
+            .collect(),
+        default: default.into(),
+        value: value.into(),
+    };
+    setting(id, label, kind, Some("segmented"))
+}
+
+/// `s`, greyed while `master` does not compare to `value` by `op`.
+fn depends(mut s: Setting, master: &str, op: ConditionOp, value: SettingValue) -> Setting {
+    s.enabled_when = vec![Condition {
+        id: master.into(),
+        op,
+        value,
+    }];
+    s.enabled = false;
+    s.disabled_reason = reason_of(&s.id).into();
+    s
+}
+
+fn with_unit(mut s: Setting, u: &str) -> Setting {
+    if let SettingKind::Int { unit, .. } = &mut s.kind {
+        *unit = Some(u.into());
+    }
+    s
+}
+
+/// The settings of an MX Brio as the daemon publishes them (its values at
+/// rest: automatic white balance, exposure and focus, so their manual
+/// values are greyed), with an action added.
+fn mock_settings() -> Vec<SettingsGroup> {
+    let group = |id: &str, label: &str, settings| SettingsGroup {
+        id: id.into(),
+        label: label.into(),
+        settings,
+    };
+    vec![
+        group(
+            "image",
+            "Image",
+            vec![
+                int(
+                    "camera.image.brightness",
+                    "Brightness",
+                    (0, 255, 1),
+                    128,
+                    128,
+                ),
+                int("camera.image.contrast", "Contrast", (0, 255, 1), 128, 128),
+                int(
+                    "camera.image.saturation",
+                    "Saturation",
+                    (0, 255, 1),
+                    128,
+                    128,
+                ),
+                int("camera.image.sharpness", "Sharpness", (0, 255, 1), 128, 128),
+                int(
+                    "camera.image.backlight_compensation",
+                    "Backlight compensation",
+                    (0, 1, 1),
+                    1,
+                    1,
+                ),
+            ],
+        ),
+        group(
+            "white_balance",
+            "White balance",
+            vec![
+                switch(WB_AUTO, "Automatic white balance", true, true),
+                depends(
+                    with_unit(
+                        int(
+                            "camera.white_balance.white_balance_temperature",
+                            "Temperature",
+                            (2000, 7500, 1),
+                            5000,
+                            2975,
+                        ),
+                        "K",
+                    ),
+                    WB_AUTO,
+                    ConditionOp::Eq,
+                    SettingValue::Bool(false),
+                ),
+            ],
+        ),
+        group(
+            "exposure",
+            "Exposure",
+            vec![
+                choice(
+                    EXPOSURE_MODE,
+                    "Exposure mode",
+                    &[("manual", "Manual"), ("aperture_priority", "Auto")],
+                    "aperture_priority",
+                    "aperture_priority",
+                ),
+                depends(
+                    with_unit(
+                        int(
+                            "camera.exposure.exposure_time_absolute",
+                            "Exposure time",
+                            (3, 2047, 1),
+                            156,
+                            1250,
+                        ),
+                        "\u{d7}100 \u{b5}s",
+                    ),
+                    EXPOSURE_MODE,
+                    ConditionOp::In,
+                    SettingValue::List(vec![
+                        SettingValue::Str("manual".into()),
+                        SettingValue::Str("shutter_priority".into()),
+                    ]),
+                ),
+                int("camera.exposure.gain", "Gain", (0, 255, 1), 0, 0),
+                switch(
+                    "camera.exposure.keep_framerate",
+                    "Keep 30 fps in low light",
+                    true,
+                    false,
+                ),
+                choice(
+                    "camera.exposure.power_line_frequency",
+                    "Anti-flicker",
+                    &[("disabled", "Off"), ("50hz", "50 Hz"), ("60hz", "60 Hz")],
+                    "60hz",
+                    "60hz",
+                ),
+            ],
+        ),
+        group(
+            "focus",
+            "Focus & zoom",
+            vec![
+                switch(AF, "Continuous autofocus", true, true),
+                depends(
+                    int("camera.focus.focus_absolute", "Focus", (0, 255, 5), 0, 40),
+                    AF,
+                    ConditionOp::Eq,
+                    SettingValue::Bool(false),
+                ),
+                int(
+                    "camera.focus.zoom_absolute",
+                    "Zoom",
+                    (100, 500, 1),
+                    100,
+                    100,
+                ),
+                int(
+                    "camera.focus.pan_absolute",
+                    "Pan",
+                    (-36000, 36000, 3600),
+                    0,
+                    14400,
+                ),
+                int(
+                    "camera.focus.tilt_absolute",
+                    "Tilt",
+                    (-36000, 36000, 3600),
+                    0,
+                    -14400,
+                ),
+                setting(
+                    "camera.focus.pan_reset",
+                    "Recentre pan",
+                    SettingKind::Action,
+                    None,
+                ),
+                choice(
+                    "camera.focus.field_of_view",
+                    "Field of view",
+                    &[("90", "90\u{b0}"), ("78", "78\u{b0}"), ("65", "65\u{b0}")],
+                    "90",
+                    "65",
+                ),
+            ],
+        ),
     ]
 }
 
@@ -453,7 +728,125 @@ impl Mock {
             controls: mock_controls(),
             rename_on_get: None,
             fail_gets: false,
+            settings: mock_settings(),
+            settings_revision: 1,
+            settings_serial: 1,
+            fail_next_set: None,
         }
+    }
+
+    /// The camera a settings method's `options` name (`""`: the active
+    /// one): `None` for no camera at all.
+    fn settings_camera(&self, options: &VariantDict) -> Result<Option<usize>, IpcError> {
+        let camera = camera_option(options)?;
+        if camera.is_empty() && self.cameras.is_empty() {
+            return Ok(None);
+        }
+        self.controls_of(&camera).map(Some)
+    }
+
+    fn settings_tree(&self, at: Option<usize>) -> SettingsTree {
+        SettingsTree {
+            revision: self.settings_revision,
+            serial: self.settings_serial,
+            camera: at.map(|i| self.cameras[i].id.clone()).unwrap_or_default(),
+            groups: if at == Some(0) {
+                self.settings.clone()
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn all_settings(&self) -> impl Iterator<Item = &Setting> {
+        self.settings.iter().flat_map(|g| g.settings.iter())
+    }
+
+    fn setting_mut(&mut self, id: &str) -> Option<&mut Setting> {
+        self.settings
+            .iter_mut()
+            .flat_map(|g| g.settings.iter_mut())
+            .find(|s| s.id == id)
+    }
+
+    /// Recomputes `enabled` from the `enabled_when` conditions over the
+    /// current values, as the daemon does; returns the ids that flipped.
+    fn apply_dependencies(&mut self) -> Vec<String> {
+        let values: std::collections::HashMap<String, SettingValue> = self
+            .all_settings()
+            .filter_map(|s| s.kind.value().map(|v| (s.id.clone(), v)))
+            .collect();
+        let mut flipped = Vec::new();
+        for s in self.settings.iter_mut().flat_map(|g| g.settings.iter_mut()) {
+            if s.enabled_when.is_empty() {
+                continue;
+            }
+            let on = s.enabled_when.iter().all(|c| {
+                let Some(v) = values.get(&c.id) else {
+                    return true;
+                };
+                match (&c.op, &c.value) {
+                    (ConditionOp::Eq, want) => v == want,
+                    (ConditionOp::Ne, want) => v != want,
+                    (ConditionOp::In, SettingValue::List(any)) => any.contains(v),
+                    _ => true,
+                }
+            });
+            if on != s.enabled {
+                s.enabled = on;
+                s.disabled_reason = if on {
+                    String::new()
+                } else {
+                    reason_of(&s.id).into()
+                };
+                flipped.push(s.id.clone());
+            }
+        }
+        flipped
+    }
+
+    /// Bumps the revision and announces the changes of `ids` in one
+    /// signal.
+    async fn publish(&mut self, ids: &[String], emitter: &SignalEmitter<'_>) -> zbus::Result<()> {
+        self.settings_revision += 1;
+        let changes: Vec<WireChange> = ids
+            .iter()
+            .filter_map(|id| self.all_settings().find(|s| s.id == *id))
+            .map(|s| {
+                SettingChange {
+                    id: s.id.clone(),
+                    value: s.kind.value(),
+                    stored: s.stored,
+                    enabled: s.enabled,
+                    disabled_reason: s.disabled_reason.clone(),
+                }
+                .to_wire()
+            })
+            .collect();
+        Mock::settings_changed(
+            emitter,
+            self.settings_revision,
+            self.settings_serial,
+            changes,
+        )
+        .await?;
+        self.settings_revision_changed(emitter).await
+    }
+
+    /// A structural change (another camera): the serial and the revision
+    /// move, and the signal carries no change.
+    async fn restructure(&mut self, emitter: &SignalEmitter<'_>) -> zbus::Result<()> {
+        self.settings_serial += 1;
+        self.settings_revision += 1;
+        Mock::settings_changed(
+            emitter,
+            self.settings_revision,
+            self.settings_serial,
+            Vec::new(),
+        )
+        .await?;
+        self.settings_revision_changed(emitter).await?;
+        self.settings_schema_serial_changed(emitter).await
     }
 
     /// The camera a control method names (`""`: the active one), as the
@@ -518,8 +911,12 @@ impl Mock {
         });
         match found {
             Some(i) => {
+                let other = i != self.active;
                 self.active = i;
                 self.active_camera_changed(&emitter).await?;
+                if other {
+                    self.restructure(&emitter).await?;
+                }
                 Ok(())
             }
             None => Err(IpcError::NoSuchCamera(format!(
@@ -537,6 +934,7 @@ impl Mock {
         }
         self.active = (self.active + 1) % self.cameras.len();
         self.active_camera_changed(&emitter).await?;
+        self.restructure(&emitter).await?;
         Ok(())
     }
 
@@ -720,6 +1118,160 @@ impl Mock {
         Ok(())
     }
 
+    // The daemon's four named out args, so introspection matches it: the
+    // tuple is spelled out (the macro does not see through the
+    // `SettingsReply` alias, and would advertise one struct).
+    #[zbus(out_args("revision", "serial", "camera", "groups"))]
+    async fn get_settings(
+        &mut self,
+        options: VariantDict,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<(u32, u32, String, Vec<VariantDict>), IpcError> {
+        let camera = camera_option(&options)?;
+        self.calls.push(format!("GetSettings({camera})"));
+        if may_auto_start(&header) {
+            self.auto_start.push(format!("GetSettings({camera})"));
+        }
+        let at = self.settings_camera(&options)?;
+        Ok(self.settings_tree(at).to_wire())
+    }
+
+    /// Checks as the daemon does, in its order: the id, whether the setting
+    /// is enabled, the value's type, range, step or option.
+    async fn set_setting(
+        &mut self,
+        id: String,
+        value: OwnedVariant,
+        options: VariantDict,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        let camera = camera_option(&options)?;
+        let value = SettingValue::from_variant(&value);
+        let shown = value.as_ref().map_or("?".into(), |v| format!("{v:?}"));
+        self.calls
+            .push(format!("SetSetting({camera},{id},{shown})"));
+        let at = self.settings_camera(&options)?;
+        let unknown = || IpcError::UnknownSetting(format!("the camera has no setting {id:?}"));
+        if at != Some(0) {
+            return Err(unknown());
+        }
+        let Some(s) = self.setting_mut(&id) else {
+            return Err(unknown());
+        };
+        if !s.enabled {
+            return Err(IpcError::Disabled(s.disabled_reason.clone()));
+        }
+        let invalid = |why: String| Err(IpcError::InvalidArgument(format!("{id}: {why}")));
+        match (&s.kind, &value) {
+            (SettingKind::Int { min, max, step, .. }, Some(SettingValue::Int(v))) => {
+                if !(*min..=*max).contains(v) {
+                    return invalid(format!("{v} is outside {min}..={max}"));
+                }
+                if (v - min) % step != 0 {
+                    return invalid(format!("{v} is not on its step of {step} from {min}"));
+                }
+            }
+            (SettingKind::Bool { .. }, Some(SettingValue::Bool(_))) => {}
+            (SettingKind::Enum { options, .. }, Some(SettingValue::Str(v))) => {
+                if !options.iter().any(|(o, _)| o == v) {
+                    return invalid(format!("{v:?} is not one of its options"));
+                }
+            }
+            (SettingKind::Action, Some(SettingValue::Bool(true))) => {}
+            _ => return invalid("a value of the wrong type".into()),
+        }
+        match self.fail_next_set.take() {
+            Some("RateLimited") => {
+                return Err(IpcError::RateLimited(
+                    "too many changes to the camera: try again in a moment".into(),
+                ));
+            }
+            Some(_) => return Err(unknown()),
+            None => {}
+        }
+        let s = self.setting_mut(&id).unwrap();
+        match (&mut s.kind, value) {
+            (SettingKind::Int { value, .. }, Some(SettingValue::Int(v))) => *value = v,
+            (SettingKind::Bool { value, .. }, Some(SettingValue::Bool(v))) => *value = v,
+            (SettingKind::Enum { value, .. }, Some(SettingValue::Str(v))) => *value = v,
+            _ => {}
+        }
+        if !matches!(s.kind, SettingKind::Action) {
+            s.stored = true;
+        }
+        // A dependency flip travels in the same signal as its cause.
+        let mut ids = vec![id.clone()];
+        ids.extend(self.apply_dependencies());
+        self.publish(&ids, &emitter).await?;
+        Ok(())
+    }
+
+    async fn reset_settings(
+        &mut self,
+        scope: String,
+        options: VariantDict,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        let camera = camera_option(&options)?;
+        self.calls.push(format!("ResetSettings({scope},{camera})"));
+        let at = self.settings_camera(&options)?;
+        let Some(parsed) = ResetScope::parse(&scope) else {
+            return Err(IpcError::InvalidArgument(format!("no scope {scope:?}")));
+        };
+        let groups = if at == Some(0) {
+            self.settings.as_slice()
+        } else {
+            &[]
+        };
+        match &parsed {
+            ResetScope::Group(g) if !groups.iter().any(|x| x.id == *g) => {
+                return Err(IpcError::InvalidArgument(format!("no group {g:?}")));
+            }
+            ResetScope::Setting(id)
+                if !groups.iter().flat_map(|g| &g.settings).any(|s| s.id == *id) =>
+            {
+                return Err(IpcError::UnknownSetting(format!(
+                    "the camera has no setting {id:?}"
+                )));
+            }
+            _ => {}
+        }
+        let mut ids = Vec::new();
+        if at == Some(0) {
+            for g in &mut self.settings {
+                for s in &mut g.settings {
+                    let hit = match &parsed {
+                        ResetScope::Camera => true,
+                        ResetScope::Group(id) => g.id == *id,
+                        ResetScope::Setting(id) => s.id == *id,
+                    };
+                    if !hit {
+                        continue;
+                    }
+                    match &mut s.kind {
+                        SettingKind::Int { default, value, .. } => *value = *default,
+                        SettingKind::Bool { default, value } => *value = *default,
+                        SettingKind::Enum { default, value, .. } => *value = default.clone(),
+                        SettingKind::Action | SettingKind::Unknown(_) => {}
+                    }
+                    s.stored = false;
+                    ids.push(s.id.clone());
+                }
+            }
+        }
+        ids.extend(self.apply_dependencies());
+        self.publish(&ids, &emitter).await?;
+        Ok(())
+    }
+
+    #[zbus(signal)]
+    async fn settings_changed(
+        emitter: &SignalEmitter<'_>,
+        revision: u32,
+        serial: u32,
+        changes: Vec<WireChange>,
+    ) -> zbus::Result<()>;
+
     #[zbus(signal)]
     async fn stats(
         emitter: &SignalEmitter<'_>,
@@ -822,6 +1374,16 @@ impl Mock {
     }
 
     #[zbus(property)]
+    fn settings_revision(&self) -> u32 {
+        self.settings_revision
+    }
+
+    #[zbus(property)]
+    fn settings_schema_serial(&self) -> u32 {
+        self.settings_serial
+    }
+
+    #[zbus(property)]
     fn interface_revision(&self) -> u32 {
         INTERFACE_REVISION
     }
@@ -850,6 +1412,26 @@ impl MockDaemon {
             )
             .unwrap();
         MockDaemon { rt, conn }
+    }
+
+    /// The mock's introspection data, read over the bus by another
+    /// connection.
+    fn introspect(&self, bus: &Bus) -> String {
+        self.rt.block_on(async {
+            let client = connection::Builder::address(bus.address.as_str())
+                .build()
+                .await
+                .unwrap();
+            zbus::fdo::IntrospectableProxy::builder(&client)
+                .destination(BUS_NAME)
+                .path(OBJECT_PATH)
+                .build()
+                .await
+                .unwrap()
+                .introspect()
+                .await
+                .unwrap()
+        })
     }
 
     fn iface(&self) -> InterfaceRef<Mock> {
@@ -1030,6 +1612,60 @@ impl MockDaemon {
         let iface = self.iface();
         self.rt
             .block_on(async { iface.get_mut().await.cameras[0].id = id.into() });
+    }
+
+    /// The next valid `SetSetting` fails with `error` (`"RateLimited"`, or
+    /// any other text for `UnknownSetting`).
+    fn fail_next_set(&self, error: &'static str) {
+        let iface = self.iface();
+        self.rt
+            .block_on(async { iface.get_mut().await.fail_next_set = Some(error) });
+    }
+
+    /// The settings structure changed (the serial moves), announced.
+    fn restructure_settings(&self) {
+        let iface = self.iface();
+        self.rt.block_on(async {
+            let mut m = iface.get_mut().await;
+            m.restructure(iface.signal_emitter()).await.unwrap();
+        });
+    }
+
+    /// The setting `id` (an int) becomes `value` and stored, announced as
+    /// the daemon would; with `missed`, a revision is spent first without
+    /// a signal (one the client missed).
+    fn change_setting(&self, id: &str, v: i64, missed: bool) {
+        let iface = self.iface();
+        self.rt.block_on(async {
+            let mut m = iface.get_mut().await;
+            if missed {
+                m.settings_revision += 1;
+            }
+            let s = m.setting_mut(id).unwrap();
+            if let SettingKind::Int { value, .. } = &mut s.kind {
+                *value = v;
+            }
+            s.stored = true;
+            m.publish(&[id.to_string()], iface.signal_emitter())
+                .await
+                .unwrap();
+        });
+    }
+
+    /// The first camera's settings become `groups` (not announced).
+    fn set_settings(&self, groups: Vec<SettingsGroup>) {
+        let iface = self.iface();
+        self.rt
+            .block_on(async { iface.get_mut().await.settings = groups });
+    }
+
+    /// `(SettingsRevision, SettingsSchemaSerial)`.
+    fn settings_marks(&self) -> (u32, u32) {
+        let iface = self.iface();
+        self.rt.block_on(async {
+            let m = iface.get().await;
+            (m.settings_revision, m.settings_serial)
+        })
     }
 
     fn release_name(&self) {
@@ -1318,7 +1954,65 @@ impl Rev5 {
     }
 }
 
-/// An older daemon ([`Rev1`], [`Rev3`], [`Rev5`]) served on the private bus under the
+/// A daemon of interface revision 6: the image controls but no camera
+/// settings (`GetSettings`, `SetSetting`, `ResetSettings` and their
+/// properties fail with `UnknownMethod` / `UnknownProperty`). As for
+/// [`Rev5`], the members the CLI reads with a default are left out.
+struct Rev6;
+
+#[interface(name = "br.com.dias.OmarchyBroadcast1")]
+impl Rev6 {
+    #[zbus(property)]
+    fn state(&self) -> State {
+        State::Idle
+    }
+
+    #[zbus(property)]
+    fn error(&self) -> String {
+        String::new()
+    }
+
+    #[zbus(property)]
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    #[zbus(property)]
+    fn cameras(&self) -> Vec<CameraInfo> {
+        vec![CameraInfo {
+            id: "usb-1234_abcd".into(),
+            name: "First Camera".into(),
+            usb: "1234:abcd".into(),
+        }]
+    }
+
+    #[zbus(property)]
+    fn active_camera(&self) -> String {
+        "usb-1234_abcd".into()
+    }
+
+    #[zbus(property)]
+    fn output_mode(&self) -> String {
+        "NV12 1920x1080@30".into()
+    }
+
+    #[zbus(property)]
+    fn effect(&self) -> String {
+        "none".into()
+    }
+
+    #[zbus(property)]
+    fn consumers(&self) -> u32 {
+        0
+    }
+
+    #[zbus(property)]
+    fn interface_revision(&self) -> u32 {
+        6
+    }
+}
+
+/// An older daemon ([`Rev1`], [`Rev3`], [`Rev5`], [`Rev6`]) served on the private bus under the
 /// daemon's name.
 struct OldDaemon {
     _rt: tokio::runtime::Runtime,
@@ -1427,6 +2121,7 @@ fn status_and_watch_show_the_pipewire_output() {
     let v = watch.next_json("the first snapshot");
     assert_eq!(v["type"], "snapshot", "{v}");
     assert_eq!(v["pipewire_output"], "streaming");
+    watch.settings_set("the settings after the snapshot");
     mock.set_pipewire(0, "ready");
     for (field, value) in [
         ("consumers", serde_json::json!(1)),
@@ -1968,6 +2663,7 @@ fn watch_json_follows_changes_stats_and_outages() {
     assert_eq!(v["state"], "idle");
     assert_eq!(v["consumers"], 0);
     assert_eq!(v["cameras"].as_array().unwrap().len(), 2);
+    assert_eq!(watch.settings_set("the settings").len(), 4);
 
     mock.set_consumers(1);
     let v = watch.next_json("a consumers change");
@@ -2044,6 +2740,7 @@ fn watch_json_follows_changes_stats_and_outages() {
     assert_eq!(v["type"], "snapshot", "{v}");
     assert_eq!(v["state"], "active");
     assert_eq!(v["cameras"].as_array().unwrap().len(), 3);
+    assert_eq!(watch.settings_set("the settings after the outage").len(), 4);
 
     mock.set_consumers(0);
     let v = watch.next_json("a change after the outage");
@@ -2077,6 +2774,7 @@ fn watch_json_waits_for_the_daemon_to_appear() {
     let v = watch.next_json("the snapshot once the daemon appears");
     assert_eq!(v["type"], "snapshot", "{v}");
     assert_eq!(v["state"], "idle");
+    watch.settings_set("the settings once the daemon appears");
 
     watch.child.signal(libc::SIGINT);
     let (status, stderr) = watch.finish("watch after SIGINT");
@@ -2108,6 +2806,7 @@ fn watch_json_reports_a_daemon_that_does_not_answer() {
     let v = watch.next_json("the snapshot once the daemon answers");
     assert_eq!(v["type"], "snapshot", "{v}");
     assert_eq!(v["state"], "idle");
+    watch.settings_set("the settings once the daemon answers");
 
     let mut watch = watch;
     watch.child.signal(libc::SIGTERM);
@@ -2787,6 +3486,7 @@ fn watch_prints_the_controls_when_they_change() {
                            "default": 128, "value": 128, "stored": false})
     );
     assert_eq!(v["camera_controls"]["controls_truncated"], false);
+    watch.settings_set("the settings");
 
     let out = bus.run(&["controls", "set", "sharpness", "200"]);
     assert!(out.status.success(), "{}", out.stderr);
@@ -2902,6 +3602,1126 @@ fn controls_lines_stay_under_the_cap_with_a_long_camera_id() {
         out.stdout
             .starts_with("Camera:     First Camera (1234:abcd)\n  0\\x1b]0;x\\x07\\u{202e}\"\\"),
         "{}",
+        out.stdout
+    );
+}
+
+// ---------------------------------------------------------------------------
+// settings
+
+/// `settings` of the mock's first camera, untouched, for a person (without
+/// the closing line on where a change applies).
+const SETTINGS_TEXT: &str = "\
+Camera:     First Camera (1234:abcd)
+Image
+  Brightness                128           camera.image.brightness                         0..255
+  Contrast                  128           camera.image.contrast                           0..255
+  Saturation                128           camera.image.saturation                         0..255
+  Sharpness                 128           camera.image.sharpness                          0..255
+  Backlight compensation    1             camera.image.backlight_compensation             0..1
+White balance
+  Automatic white balance   on            camera.white_balance.white_balance_automatic    on|off
+  Temperature               2975 K        camera.white_balance.white_balance_temperature  2000..7500                (Turn off automatic white balance to change this)
+Exposure
+  Exposure mode             Auto          camera.exposure.auto_exposure                   manual|aperture_priority
+  Exposure time             1250 \u{d7}100 \u{b5}s  camera.exposure.exposure_time_absolute          3..2047                   (Set exposure to manual to change this)
+  Gain                      0             camera.exposure.gain                            0..255
+  Keep 30 fps in low light  off           camera.exposure.keep_framerate                  on|off
+  Anti-flicker              60 Hz         camera.exposure.power_line_frequency            disabled|50hz|60hz
+Focus & zoom
+  Continuous autofocus      on            camera.focus.focus_automatic_continuous         on|off
+  Focus                     40            camera.focus.focus_absolute                     0..255 step 5             (Turn off continuous autofocus to change this)
+  Zoom                      100           camera.focus.zoom_absolute                      100..500
+  Pan                       14400         camera.focus.pan_absolute                       -36000..36000 step 3600
+  Tilt                      -14400        camera.focus.tilt_absolute                      -36000..36000 step 3600
+  Recentre pan              action        camera.focus.pan_reset
+  Field of view             65\u{b0}           camera.focus.field_of_view                      90|78|65
+";
+
+/// The `settings_group` line of the mock's exposure group, untouched.
+fn exposure_group_line(rev: u32, serial: u32) -> Value {
+    serde_json::json!({
+        "v": 1, "type": "settings_group", "schema": 1, "rev": rev, "serial": serial,
+        "camera": "usb-1234_abcd", "index": 2, "count": 4, "part": 1, "parts": 1,
+        "group": {"id": "exposure", "label": "Exposure", "settings": [
+            {"id": "camera.exposure.auto_exposure", "label": "Exposure mode", "type": "enum",
+             "value": "aperture_priority", "default": "aperture_priority", "stored": false,
+             "enabled": true, "disabled_reason": "", "enabled_when": [],
+             "options": [{"value": "manual", "label": "Manual"},
+                         {"value": "aperture_priority", "label": "Auto"}],
+             "hint": "segmented"},
+            {"id": "camera.exposure.exposure_time_absolute", "label": "Exposure time",
+             "type": "int", "value": 1250, "default": 156, "stored": false, "enabled": false,
+             "disabled_reason": "Set exposure to manual to change this",
+             "enabled_when": [{"id": "camera.exposure.auto_exposure", "op": "in",
+                               "value": ["manual", "shutter_priority"]}],
+             "min": 3, "max": 2047, "step": 1, "unit": "\u{d7}100 \u{b5}s", "hint": "slider"},
+            {"id": "camera.exposure.gain", "label": "Gain", "type": "int", "value": 0,
+             "default": 0, "stored": false, "enabled": true, "disabled_reason": "",
+             "enabled_when": [], "min": 0, "max": 255, "step": 1, "hint": "slider"},
+            {"id": "camera.exposure.keep_framerate", "label": "Keep 30 fps in low light",
+             "type": "bool", "value": false, "default": true, "stored": false, "enabled": true,
+             "disabled_reason": "", "enabled_when": [], "hint": "switch"},
+            {"id": "camera.exposure.power_line_frequency", "label": "Anti-flicker",
+             "type": "enum", "value": "60hz", "default": "60hz", "stored": false,
+             "enabled": true, "disabled_reason": "", "enabled_when": [],
+             "options": [{"value": "disabled", "label": "Off"}, {"value": "50hz", "label": "50 Hz"},
+                         {"value": "60hz", "label": "60 Hz"}],
+             "hint": "segmented"},
+        ]},
+    })
+}
+
+/// The lines of `settings --json` (or of a set in `watch --json`): their
+/// groups' ids, checking `index`, `count` and that each group is whole.
+fn set_groups(lines: &[Value]) -> Vec<String> {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            assert_eq!(v["type"], "settings_group", "{v}");
+            assert_eq!(v["index"], i, "{v}");
+            assert_eq!(v["count"], lines.len(), "{v}");
+            assert_eq!((&v["part"], &v["parts"]), (&1.into(), &1.into()), "{v}");
+            v["group"]["id"].as_str().unwrap().to_string()
+        })
+        .collect()
+}
+
+fn json_lines(stdout: &str) -> Vec<Value> {
+    stdout.split_inclusive('\n').map(json_line).collect()
+}
+
+/// The setting `id` in a set of lines.
+fn find_setting<'a>(lines: &'a [Value], id: &str) -> &'a Value {
+    lines
+        .iter()
+        .flat_map(|v| v["group"]["settings"].as_array().unwrap())
+        .find(|s| s["id"] == id)
+        .unwrap_or_else(|| panic!("no setting {id}"))
+}
+
+#[test]
+fn settings_human_and_json() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+
+    let out = bus.run(&["settings"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(out.stdout, format!("{SETTINGS_TEXT}{NOT_IN_USE}"));
+    assert_eq!(out.stderr, "");
+    // The active camera's, read without starting the daemon.
+    assert_eq!(mock.take_calls(), ["GetSettings()"]);
+
+    let out = bus.run(&["settings", "--json"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(out.stderr, "");
+    let lines = json_lines(&out.stdout);
+    assert_eq!(
+        set_groups(&lines),
+        ["image", "white_balance", "exposure", "focus"]
+    );
+    assert_eq!(lines[2], exposure_group_line(1, 1));
+    assert_eq!(lines[0]["group"]["label"], "Image");
+    assert_eq!(lines[3]["group"]["label"], "Focus & zoom");
+    assert_eq!(
+        find_setting(&lines, "camera.focus.pan_reset"),
+        &serde_json::json!({"id": "camera.focus.pan_reset", "label": "Recentre pan",
+                            "type": "action", "stored": false, "enabled": true,
+                            "disabled_reason": "", "enabled_when": []})
+    );
+    assert_eq!(
+        find_setting(&lines, "camera.focus.field_of_view")["options"],
+        serde_json::json!([{"value": "90", "label": "90\u{b0}"},
+                           {"value": "78", "label": "78\u{b0}"},
+                           {"value": "65", "label": "65\u{b0}"}])
+    );
+    assert_eq!(mock.take_calls(), ["GetSettings()"]);
+
+    // Another camera, by its id: it has none.
+    let out = bus.run(&["settings", "--json", "--camera=platform-video2"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        json_lines(&out.stdout),
+        [serde_json::json!({"v": 1, "type": "settings_clear", "rev": 1, "serial": 1})]
+    );
+    let out = bus.run(&["settings", "--camera", "platform-video2"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        format!("Camera:     Second Camera\nNo camera settings.\n{NOT_IN_USE}")
+    );
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "GetSettings(platform-video2)",
+            "GetSettings(platform-video2)"
+        ]
+    );
+
+    // The active camera, by its id, while it streams: live.
+    mock.set_state(State::Active, "");
+    let out = bus.run(&["settings", "--camera=usb-1234_abcd"]);
+    assert_eq!(out.stdout, format!("{SETTINGS_TEXT}Applied live.\n"));
+    // Another camera is not open, whatever the state.
+    let out = bus.run(&["settings", "--camera=platform-video2"]);
+    assert!(out.stdout.ends_with(NOT_IN_USE), "{}", out.stdout);
+
+    // A camera that is not there: the daemon's rejection.
+    for json in [false, true] {
+        let mut args = vec!["settings", "--camera=nope"];
+        if json {
+            args.push("--json");
+        }
+        let out = bus.run(&args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", out.stderr);
+        if json {
+            let v = json_line(&out.stdout);
+            assert_eq!(v["type"], "error");
+            assert_eq!(v["code"], "dbus-error");
+            assert_eq!(v["error"], "no camera \"nope\" is present");
+        } else {
+            assert_eq!(
+                out.stderr,
+                "omarchy-broadcast: no camera \"nope\" is present\n"
+            );
+        }
+    }
+
+    // The snapshot carries the revision and the schema; a state line does not.
+    let v = json_line(&bus.run(&["status", "--json"]).stdout);
+    assert_eq!(v["settings_revision"], 1);
+    assert_eq!(v["settings_schema"], 1);
+
+    assert!(
+        mock.auto_start_calls().is_empty(),
+        "{:?}",
+        mock.auto_start_calls()
+    );
+    assert!(!bus.activation_attempted());
+}
+
+#[test]
+fn settings_without_a_camera_are_a_clear_line() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    mock.remove_cameras();
+    let out = bus.run(&["settings", "--json"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        json_lines(&out.stdout),
+        [serde_json::json!({"v": 1, "type": "settings_clear", "rev": 1, "serial": 1})]
+    );
+    let out = bus.run(&["settings"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        format!("Camera:     none\nNo camera settings.\n{NOT_IN_USE}")
+    );
+    // Setting something without a camera: rejected before any write.
+    let out = bus.run(&["settings", "set", "camera.image.brightness", "10"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert_eq!(out.stderr, "omarchy-broadcast: no camera is present\n");
+    assert_eq!(
+        mock.take_calls(),
+        ["GetSettings()", "GetSettings()", "GetSettings()"]
+    );
+}
+
+#[test]
+fn settings_set_types_the_value_and_prints_the_setting() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+
+    let out = bus.run(&["settings", "set", "camera.exposure.auto_exposure", "manual"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        format!(
+            "Camera:     First Camera (1234:abcd)\n\
+             Exposure\n  \
+             Exposure mode  Manual  camera.exposure.auto_exposure  manual|aperture_priority  \
+             (stored)\n{NOT_IN_USE}"
+        )
+    );
+    assert_eq!(out.stderr, "");
+    // The tree first, to type the value; then the write; then read back.
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "GetSettings()",
+            "SetSetting(,camera.exposure.auto_exposure,Str(\"manual\"))",
+            "GetSettings()"
+        ]
+    );
+    // Its dependent can be changed now.
+    let out = bus.run(&["settings"]);
+    assert!(
+        out.stdout.contains(
+            "\n  Exposure time             1250 \u{d7}100 \u{b5}s  \
+             camera.exposure.exposure_time_absolute          3..2047\n"
+        ),
+        "{}",
+        out.stdout
+    );
+    mock.take_calls();
+
+    // Each type, each spelling.
+    for (args, sent) in [
+        (
+            &[
+                "settings",
+                "set",
+                "--",
+                "camera.focus.pan_absolute",
+                "-3600",
+            ][..],
+            "SetSetting(,camera.focus.pan_absolute,Int(-3600))",
+        ),
+        (
+            &["settings", "set", "camera.focus.tilt_absolute", "-7200"],
+            "SetSetting(,camera.focus.tilt_absolute,Int(-7200))",
+        ),
+        (
+            &["settings", "set", "camera.image.brightness", "+40"],
+            "SetSetting(,camera.image.brightness,Int(40))",
+        ),
+        (
+            &["settings", "set", "camera.exposure.keep_framerate", "on"],
+            "SetSetting(,camera.exposure.keep_framerate,Bool(true))",
+        ),
+        (
+            &["settings", "set", "camera.exposure.keep_framerate", "false"],
+            "SetSetting(,camera.exposure.keep_framerate,Bool(false))",
+        ),
+        (
+            &["settings", "set", "camera.exposure.keep_framerate", "true"],
+            "SetSetting(,camera.exposure.keep_framerate,Bool(true))",
+        ),
+        (
+            &[
+                "settings",
+                "set",
+                "camera.focus.focus_automatic_continuous",
+                "off",
+            ],
+            "SetSetting(,camera.focus.focus_automatic_continuous,Bool(false))",
+        ),
+        (
+            &["settings", "set", "camera.focus.pan_reset"],
+            "SetSetting(,camera.focus.pan_reset,Bool(true))",
+        ),
+        (
+            &["settings", "set", "camera.focus.pan_reset", "true"],
+            "SetSetting(,camera.focus.pan_reset,Bool(true))",
+        ),
+        (
+            &["settings", "set", "camera.focus.field_of_view", "90"],
+            "SetSetting(,camera.focus.field_of_view,Str(\"90\"))",
+        ),
+        (
+            &[
+                "settings",
+                "set",
+                "--camera=usb-1234_abcd",
+                "camera.exposure.power_line_frequency",
+                "50hz",
+            ],
+            "SetSetting(usb-1234_abcd,camera.exposure.power_line_frequency,Str(\"50hz\"))",
+        ),
+    ] {
+        let out = bus.run(args);
+        assert!(out.status.success(), "{args:?}: {}", out.stderr);
+        let calls = mock.take_calls();
+        assert_eq!(calls.len(), 3, "{args:?}: {calls:?}");
+        assert_eq!(calls[1], sent, "{args:?}");
+    }
+    let lines = json_lines(&bus.run(&["settings", "--json"]).stdout);
+    for (id, value) in [
+        ("camera.focus.pan_absolute", serde_json::json!(-3600)),
+        ("camera.focus.tilt_absolute", serde_json::json!(-7200)),
+        ("camera.image.brightness", serde_json::json!(40)),
+        ("camera.exposure.keep_framerate", serde_json::json!(true)),
+        ("camera.focus.field_of_view", serde_json::json!("90")),
+        (
+            "camera.exposure.power_line_frequency",
+            serde_json::json!("50hz"),
+        ),
+    ] {
+        let s = find_setting(&lines, id);
+        assert_eq!((&s["value"], &s["stored"]), (&value, &true.into()), "{s}");
+    }
+    // Continuous autofocus off: the focus can be set.
+    assert_eq!(
+        find_setting(&lines, "camera.focus.focus_absolute")["enabled"],
+        true
+    );
+
+    // The keep-30-fps switch as on/off; the action applied live while open.
+    mock.set_state(State::Active, "");
+    let out = bus.run(&["settings", "set", "camera.exposure.keep_framerate", "off"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "Camera:     First Camera (1234:abcd)\n\
+         Exposure\n  \
+         Keep 30 fps in low light  off  camera.exposure.keep_framerate  on|off  (stored)\n\
+         Applied live.\n"
+    );
+    let out = bus.run(&["settings", "set", "camera.focus.pan_reset"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "Camera:     First Camera (1234:abcd)\n\
+         Focus & zoom\n  \
+         Recentre pan  action  camera.focus.pan_reset\n\
+         Applied live.\n"
+    );
+    assert!(!bus.activation_attempted());
+}
+
+#[test]
+fn settings_reset_by_camera_group_or_setting() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    for (id, value) in [
+        ("camera.exposure.auto_exposure", "manual"),
+        ("camera.exposure.gain", "30"),
+        ("camera.image.sharpness", "200"),
+        ("camera.image.contrast", "100"),
+    ] {
+        assert!(bus.run(&["settings", "set", id, value]).status.success());
+    }
+    mock.take_calls();
+
+    let out = bus.run(&["settings", "reset", "--setting=camera.image.contrast"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        format!(
+            "Camera:     First Camera (1234:abcd)\nImage\n  \
+             Contrast  128  camera.image.contrast  0..255\n{NOT_IN_USE}"
+        )
+    );
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "ResetSettings(setting:camera.image.contrast,)",
+            "GetSettings()"
+        ]
+    );
+
+    let out = bus.run(&["settings", "reset", "--group", "exposure"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        format!(
+            "Camera:     First Camera (1234:abcd)\nExposure\n  \
+             Exposure mode             Auto         camera.exposure.auto_exposure           \
+             manual|aperture_priority\n  \
+             Exposure time             156 \u{d7}100 \u{b5}s  camera.exposure.exposure_time_absolute  \
+             3..2047                   (Set exposure to manual to change this)\n  \
+             Gain                      0            camera.exposure.gain                    0..255\n  \
+             Keep 30 fps in low light  on           camera.exposure.keep_framerate          on|off\n  \
+             Anti-flicker              60 Hz        camera.exposure.power_line_frequency    \
+             disabled|50hz|60hz\n{NOT_IN_USE}"
+        )
+    );
+    assert_eq!(
+        mock.take_calls(),
+        ["ResetSettings(group:exposure,)", "GetSettings()"]
+    );
+    // The image group keeps its stored sharpness until the camera reset.
+    let lines = json_lines(&bus.run(&["settings", "--json"]).stdout);
+    assert_eq!(find_setting(&lines, "camera.image.sharpness")["value"], 200);
+    mock.take_calls();
+
+    mock.set_state(State::Active, "");
+    let out = bus.run(&["settings", "reset", "--camera=usb-1234_abcd"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    // Every setting is listed, back at its default; live, as it streams.
+    assert!(
+        out.stdout
+            .starts_with("Camera:     First Camera (1234:abcd)\nImage\n")
+    );
+    assert!(
+        out.stdout.ends_with("90|78|65\nApplied live.\n"),
+        "{}",
+        out.stdout
+    );
+    assert_eq!(
+        out.stdout.lines().count(),
+        SETTINGS_TEXT.lines().count() + 1
+    );
+    assert!(!out.stdout.contains("(stored)"), "{}", out.stdout);
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "ResetSettings(camera,usb-1234_abcd)",
+            "GetSettings(usb-1234_abcd)"
+        ]
+    );
+    let lines = json_lines(&bus.run(&["settings", "--json"]).stdout);
+    for s in lines
+        .iter()
+        .flat_map(|v| v["group"]["settings"].as_array().unwrap())
+    {
+        assert_eq!(s["stored"], false, "{s}");
+        assert_eq!(s.get("value"), s.get("default"), "{s}");
+    }
+    mock.take_calls();
+    let out = bus.run(&["settings", "reset"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(mock.take_calls()[0], "ResetSettings(camera,)");
+}
+
+#[test]
+fn the_mock_introspects_get_settings_like_the_daemon() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let xml = mock.introspect(&bus);
+    let start = xml
+        .find("<method name=\"GetSettings\">")
+        .unwrap_or_else(|| panic!("no GetSettings in {xml}"));
+    let get = &xml[start..start + xml[start..].find("</method>").unwrap()];
+    let outs: Vec<&str> = get
+        .split("<arg ")
+        .filter(|a| a.contains("direction=\"out\""))
+        .collect();
+    assert_eq!(outs.len(), 4, "{get}");
+    for (arg, (name, ty)) in outs.iter().zip([
+        ("revision", "u"),
+        ("serial", "u"),
+        ("camera", "s"),
+        ("groups", "aa{sv}"),
+    ]) {
+        assert!(
+            arg.contains(&format!("name=\"{name}\"")) && arg.contains(&format!("type=\"{ty}\"")),
+            "{name} {ty} not in {arg}"
+        );
+    }
+}
+
+#[test]
+fn settings_camera_goes_before_or_after_the_subcommand() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let cam = "--camera=usb-1234_abcd";
+    let id = "camera.focus.pan_absolute";
+    for args in [
+        &["settings", cam, "set", "--", id, "-3600"][..],
+        &["settings", "set", cam, "--", id, "-3600"],
+        &[
+            "settings",
+            "--camera",
+            "usb-1234_abcd",
+            "set",
+            "--",
+            id,
+            "-3600",
+        ],
+        &["settings", "set", id, cam, "-3600"],
+        &["settings", "set", id, "-3600", cam],
+    ] {
+        let out = bus.run(args);
+        assert!(out.status.success(), "{args:?}: {}", out.stderr);
+        assert_eq!(
+            mock.take_calls(),
+            [
+                "GetSettings(usb-1234_abcd)",
+                "SetSetting(usb-1234_abcd,camera.focus.pan_absolute,Int(-3600))",
+                "GetSettings(usb-1234_abcd)"
+            ],
+            "{args:?}"
+        );
+    }
+    for (args, sent) in [
+        (
+            &["settings", cam, "reset"][..],
+            "ResetSettings(camera,usb-1234_abcd)",
+        ),
+        (
+            &["settings", "reset", cam],
+            "ResetSettings(camera,usb-1234_abcd)",
+        ),
+        (
+            &["settings", cam, "reset", "--group=exposure"],
+            "ResetSettings(group:exposure,usb-1234_abcd)",
+        ),
+        (
+            &["settings", "reset", "--group=exposure", cam],
+            "ResetSettings(group:exposure,usb-1234_abcd)",
+        ),
+    ] {
+        let out = bus.run(args);
+        assert!(out.status.success(), "{args:?}: {}", out.stderr);
+        assert_eq!(
+            mock.take_calls(),
+            [sent, "GetSettings(usb-1234_abcd)"],
+            "{args:?}"
+        );
+    }
+    // `--` still ends the options: what follows is the id and the value,
+    // however much it looks like `--camera`.
+    let out = bus.run(&["settings", "set", "--", cam, "camera.image.brightness"]);
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr);
+    assert!(out.stderr.contains("not a setting id"), "{}", out.stderr);
+    assert!(mock.take_calls().is_empty());
+    let out = bus.run(&[
+        "settings",
+        cam,
+        "set",
+        "--",
+        "camera.image.brightness",
+        "--camera=x",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr);
+    assert_eq!(mock.take_calls(), ["GetSettings(usb-1234_abcd)"]);
+    // `--json` with a subcommand stays refused, wherever `--camera` is.
+    for args in [
+        &[
+            "settings",
+            "--json",
+            cam,
+            "set",
+            "camera.image.brightness",
+            "1",
+        ][..],
+        &["settings", cam, "--json", "reset"],
+        &["settings", "--json", "reset", cam],
+    ] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", out.stderr);
+        assert!(
+            out.stderr
+                .starts_with("error: the argument '--json' cannot be used with a subcommand"),
+            "{args:?}: {}",
+            out.stderr
+        );
+        assert_eq!(out.stdout, "");
+    }
+    assert!(mock.take_calls().is_empty());
+}
+
+#[test]
+fn settings_usage_errors_exit_2_before_any_write() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    // The command line alone is wrong: no call at all.
+    for args in [
+        &["settings", "set", "Camera.image.brightness", "1"][..],
+        &["settings", "set", "camera", "1"],
+        &["settings", "set", "camera.image.bright-ness", "1"],
+        &["settings", "set", "", "1"],
+        &["settings", "set", "camera.a.b.c.d", "1"],
+        &["settings", "set"],
+        &["settings", "set", "camera.image.brightness", "1", "2"],
+        &["settings", "--json", "set", "camera.image.brightness", "1"],
+        &["settings", "set", "--json", "camera.image.brightness", "1"],
+        &["settings", "set", "camera.image.brightness", "1", "--json"],
+        &["settings", "reset", "--json"],
+        &["settings", "--json", "reset"],
+        &["settings", "reset", "camera.image.brightness"],
+        &["settings", "reset", "--group=Exposure"],
+        &["settings", "reset", "--group="],
+        &["settings", "reset", "--setting=exposure"],
+        &[
+            "settings",
+            "reset",
+            "--group=exposure",
+            "--setting=camera.image.brightness",
+        ],
+        &["settings", "frob"],
+    ] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", out.stderr);
+        assert_eq!(out.stdout, "", "{args:?}");
+        assert!(
+            out.stderr.starts_with("error: "),
+            "{args:?}: {}",
+            out.stderr
+        );
+    }
+    assert!(mock.take_calls().is_empty());
+    assert!(!bus.activation_attempted());
+
+    // The value does not fit the setting's type: the tree is read, nothing
+    // is written.
+    for (args, message) in [
+        (
+            &[
+                "settings",
+                "set",
+                "camera.exposure.auto_exposure",
+                "shutter_priority",
+            ][..],
+            "error: invalid value 'shutter_priority' for camera.exposure.auto_exposure: one of \
+             manual, aperture_priority\n",
+        ),
+        (
+            &["settings", "set", "camera.exposure.auto_exposure"],
+            "error: camera.exposure.auto_exposure needs a value: one of manual, \
+             aperture_priority\n",
+        ),
+        (
+            &["settings", "set", "camera.image.brightness", "1.5"],
+            "error: invalid value '1.5' for camera.image.brightness: a whole number from 0 to \
+             255\n",
+        ),
+        (
+            &["settings", "set", "camera.image.brightness", "0x10"],
+            "error: invalid value '0x10' for camera.image.brightness",
+        ),
+        (
+            &["settings", "set", "camera.image.brightness", "ten"],
+            "error: invalid value 'ten' for camera.image.brightness",
+        ),
+        (
+            &["settings", "set", "camera.image.brightness", ""],
+            "error: invalid value '' for camera.image.brightness",
+        ),
+        (
+            &[
+                "settings",
+                "set",
+                "camera.image.brightness",
+                "99999999999999999999",
+            ],
+            "error: invalid value '99999999999999999999' for camera.image.brightness",
+        ),
+        (
+            &["settings", "set", "camera.image.brightness"],
+            "error: camera.image.brightness needs a value: a whole number from 0 to 255\n",
+        ),
+        (
+            &["settings", "set", "camera.exposure.keep_framerate", "yes"],
+            "error: invalid value 'yes' for camera.exposure.keep_framerate: it is a switch (on, \
+             off, true or false)\n",
+        ),
+        (
+            &["settings", "set", "camera.exposure.keep_framerate"],
+            "error: camera.exposure.keep_framerate needs a value: on, off, true or false\n",
+        ),
+        (
+            &["settings", "set", "camera.focus.pan_reset", "false"],
+            "error: invalid value 'false' for camera.focus.pan_reset: it is an action (give no \
+             value, or true)\n",
+        ),
+    ] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", out.stderr);
+        assert_eq!(out.stdout, "", "{args:?}");
+        assert!(out.stderr.starts_with(message), "{args:?}: {}", out.stderr);
+        assert_eq!(mock.take_calls(), ["GetSettings()"], "{args:?}: no write");
+    }
+    // Nothing was changed.
+    let out = bus.run(&["settings"]);
+    assert_eq!(out.stdout, format!("{SETTINGS_TEXT}{NOT_IN_USE}"));
+}
+
+#[test]
+fn settings_rejected_by_the_daemon_exit_1_with_its_message() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let set = |id: &str, v: &str| {
+        vec![
+            "GetSettings()".to_string(),
+            format!("SetSetting(,{id},{v})"),
+        ]
+    };
+    for (args, message, calls) in [
+        (
+            &[
+                "settings",
+                "set",
+                "camera.white_balance.white_balance_temperature",
+                "4000",
+            ][..],
+            "Turn off automatic white balance to change this",
+            set(
+                "camera.white_balance.white_balance_temperature",
+                "Int(4000)",
+            ),
+        ),
+        (
+            &["settings", "set", "camera.image.brightness", "300"],
+            "camera.image.brightness: 300 is outside 0..=255",
+            set("camera.image.brightness", "Int(300)"),
+        ),
+        (
+            &[
+                "settings",
+                "set",
+                "--",
+                "camera.focus.pan_absolute",
+                "-1000",
+            ],
+            "camera.focus.pan_absolute: -1000 is not on its step of 3600 from -36000",
+            set("camera.focus.pan_absolute", "Int(-1000)"),
+        ),
+        (
+            &[
+                "settings",
+                "set",
+                "--camera=nope",
+                "camera.image.brightness",
+                "1",
+            ],
+            "no camera \"nope\" is present",
+            vec!["GetSettings(nope)".to_string()],
+        ),
+        (
+            &["settings", "reset", "--setting=camera.image.hue"],
+            "the camera has no setting \"camera.image.hue\"",
+            vec!["ResetSettings(setting:camera.image.hue,)".to_string()],
+        ),
+        (
+            &["settings", "reset", "--group=other"],
+            "no group \"other\"",
+            vec!["ResetSettings(group:other,)".to_string()],
+        ),
+    ] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", out.stderr);
+        assert_eq!(out.stdout, "", "{args:?}");
+        assert_eq!(
+            out.stderr,
+            format!("omarchy-broadcast: {message}\n"),
+            "{args:?}"
+        );
+        // Nothing read back.
+        assert_eq!(mock.take_calls(), calls, "{args:?}");
+    }
+    // A setting the camera does not have: found before any write.
+    let out = bus.run(&["settings", "set", "camera.image.hue", "1"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert_eq!(
+        out.stderr,
+        "omarchy-broadcast: the camera \"usb-1234_abcd\" has no setting \"camera.image.hue\"\n"
+    );
+    assert_eq!(mock.take_calls(), ["GetSettings()"]);
+    // The daemon's own refusals of a valid value.
+    mock.fail_next_set("RateLimited");
+    let out = bus.run(&["settings", "set", "camera.image.brightness", "10"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert_eq!(
+        out.stderr,
+        "omarchy-broadcast: too many changes to the camera: try again in a moment\n"
+    );
+    mock.fail_next_set("UnknownSetting");
+    let out = bus.run(&["settings", "set", "camera.image.brightness", "10"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert_eq!(
+        out.stderr,
+        "omarchy-broadcast: the camera has no setting \"camera.image.brightness\"\n"
+    );
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "GetSettings()",
+            "SetSetting(,camera.image.brightness,Int(10))",
+            "GetSettings()",
+            "SetSetting(,camera.image.brightness,Int(10))"
+        ]
+    );
+    // Nothing was changed.
+    let out = bus.run(&["settings"]);
+    assert_eq!(out.stdout, format!("{SETTINGS_TEXT}{NOT_IN_USE}"));
+}
+
+#[test]
+fn settings_never_start_the_daemon_but_set_and_reset_may() {
+    let bus = Bus::start();
+    let out = bus.run(&["settings"]);
+    assert_eq!(out.status.code(), Some(3), "{}", out.stderr);
+    assert!(out.stderr.contains("is not running"), "{}", out.stderr);
+    let out = bus.run(&["settings", "--json", "--camera=x"]);
+    assert_eq!(out.status.code(), Some(3), "{}", out.stderr);
+    let v = json_line(&out.stdout);
+    assert_eq!(v["type"], "error");
+    assert_eq!(v["code"], "daemon-not-running");
+    assert!(!bus.activation_attempted(), "`settings` must not start it");
+
+    for args in [
+        &["settings", "set", "camera.image.brightness", "1"][..],
+        &["settings", "reset"],
+    ] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(3), "{args:?}: {}", out.stderr);
+        assert!(
+            out.stderr.contains("D-Bus could not start it"),
+            "{}",
+            out.stderr
+        );
+    }
+    assert!(bus.activation_attempted(), "`settings set` may start it");
+}
+
+#[test]
+fn settings_against_a_revision_6_daemon_say_they_are_unsupported() {
+    let bus = Bus::start();
+    let _daemon = OldDaemon::start(&bus, Rev6);
+    let expected = "omarchy-broadcast: the daemon does not support camera settings (its \
+                    interface revision is 6, camera settings need 7); update omarchy-broadcastd\n";
+    for args in [
+        &["settings"][..],
+        &["settings", "set", "camera.image.brightness", "1"],
+        &["settings", "reset", "--group=image"],
+    ] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", out.stderr);
+        assert_eq!(out.stdout, "", "{args:?}");
+        assert_eq!(out.stderr, expected, "{args:?}");
+    }
+    let out = bus.run(&["settings", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert_eq!(out.stderr, "");
+    let v = json_line(&out.stdout);
+    assert_eq!(v["type"], "error");
+    assert_eq!(v["code"], "unsupported-daemon");
+    assert_eq!(
+        v["error"],
+        expected
+            .trim_start_matches("omarchy-broadcast: ")
+            .trim_end_matches('\n')
+    );
+
+    // Its snapshot has neither: `null`, with the keys present; `watch`
+    // prints nothing of the settings.
+    let v = json_line(&bus.run(&["status", "--json"]).stdout);
+    assert_eq!(v["interface_revision"], 6);
+    for key in ["settings_revision", "settings_schema"] {
+        assert_eq!(v.get(key), Some(&Value::Null), "{key}: {v}");
+    }
+    let mut watch = bus.watch(&["watch", "--json"], None);
+    let v = watch.next_json("the snapshot of a revision-6 daemon");
+    assert_eq!(v["type"], "snapshot", "{v}");
+    assert_eq!(v["settings_schema"], Value::Null);
+    watch.quiet_for(Duration::from_millis(500), "no settings from revision 6");
+    watch.child.signal(libc::SIGTERM);
+    let (status, stderr) = watch.finish("watch --json");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert_eq!(stderr, "");
+}
+
+/// The next `n` lines of `watch`, sorted by their type (lines from
+/// different signals may come in either order).
+fn next_lines_by_type(watch: &Watch, n: usize, what: &str) -> Vec<Value> {
+    let mut lines: Vec<Value> = (0..n).map(|_| watch.next_json(what)).collect();
+    lines.sort_by_key(|v| v["type"].as_str().unwrap().to_string());
+    lines
+}
+
+#[test]
+fn watch_json_follows_the_settings() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let watch = bus.watch(&["watch", "--json"], None);
+
+    let v = watch.next_json("the snapshot");
+    assert_eq!(v["type"], "snapshot", "{v}");
+    assert_eq!(
+        (&v["settings_revision"], &v["settings_schema"]),
+        (&1.into(), &1.into())
+    );
+    let set = watch.settings_set("the settings after the snapshot");
+    assert_eq!(
+        set_groups(&set),
+        ["image", "white_balance", "exposure", "focus"]
+    );
+    assert_eq!(set[2], exposure_group_line(1, 1));
+
+    // A change, and the dependency it flips, in one delta.
+    let out = bus.run(&["settings", "set", "camera.exposure.auto_exposure", "manual"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let v = watch.next_json("the delta");
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "v": 1, "type": "settings_delta", "schema": 1, "rev": 2, "serial": 1,
+            "camera": "usb-1234_abcd",
+            "changes": [
+                {"id": "camera.exposure.auto_exposure", "value": "manual", "stored": true,
+                 "enabled": true, "disabled_reason": ""},
+                {"id": "camera.exposure.exposure_time_absolute", "value": 1250,
+                 "stored": false, "enabled": true, "disabled_reason": ""},
+            ],
+        })
+    );
+    // An action has no value.
+    assert!(
+        bus.run(&["settings", "set", "camera.focus.pan_reset"])
+            .status
+            .success()
+    );
+    let v = watch.next_json("the action's delta");
+    assert_eq!(
+        v["changes"],
+        serde_json::json!([{"id": "camera.focus.pan_reset", "stored": false,
+                            "enabled": true, "disabled_reason": ""}])
+    );
+    assert_eq!(v["rev"], 3);
+
+    // A structural change: the set again, in full.
+    mock.restructure_settings();
+    let set = watch.settings_set("the set after a serial change");
+    assert_eq!(set.len(), 4);
+    assert!(
+        set.iter().all(|v| v["rev"] == 4 && v["serial"] == 2),
+        "{set:?}"
+    );
+    assert_eq!(
+        find_setting(&set, "camera.exposure.auto_exposure")["value"],
+        "manual"
+    );
+
+    // A missed signal: the next revision is not the one after the last.
+    mock.change_setting("camera.exposure.gain", 30, true);
+    let set = watch.settings_set("the set after a revision gap");
+    assert!(
+        set.iter().all(|v| v["rev"] == 6 && v["serial"] == 2),
+        "{set:?}"
+    );
+    assert_eq!(find_setting(&set, "camera.exposure.gain")["value"], 30);
+    // And the next one in order is a delta again.
+    mock.change_setting("camera.exposure.gain", 40, false);
+    let v = watch.next_json("a delta after the gap");
+    assert_eq!(v["type"], "settings_delta", "{v}");
+    assert_eq!((&v["rev"], &v["serial"]), (&7.into(), &2.into()));
+    assert_eq!(v["changes"][0]["value"], 40);
+    assert_eq!(mock.settings_marks(), (7, 2));
+
+    // Another camera (the daemon bumps the serial): its set, here none.
+    assert!(bus.run(&["camera", "platform-video2"]).status.success());
+    let lines = next_lines_by_type(&watch, 2, "the camera switch");
+    assert_eq!(lines[0]["type"], "settings_clear", "{lines:?}");
+    assert_eq!(
+        (&lines[0]["rev"], &lines[0]["serial"]),
+        (&8.into(), &3.into())
+    );
+    assert_eq!(lines[1]["type"], "state", "{lines:?}");
+    assert!(lines[1].get("settings_revision").is_none(), "{lines:?}");
+
+    // Through an outage: a fresh snapshot, then the set.
+    mock.release_name();
+    assert_eq!(watch.next_json("the outage")["type"], "error");
+    mock.request_name();
+    assert_eq!(watch.next_json("the snapshot after it")["type"], "snapshot");
+    assert_eq!(
+        watch.settings_set("the set after the outage"),
+        [serde_json::json!({"v": 1, "type": "settings_clear", "rev": 8, "serial": 3})]
+    );
+    assert!(bus.run(&["camera", "next"]).status.success());
+    // The state line and the set (four lines) of the first camera.
+    let mut seen = Vec::new();
+    for _ in 0..5 {
+        seen.push(watch.next_json("the switch back"));
+    }
+    let set: Vec<Value> = seen
+        .iter()
+        .filter(|v| v["type"] == "settings_group")
+        .cloned()
+        .collect();
+    assert_eq!(
+        set_groups(&set),
+        ["image", "white_balance", "exposure", "focus"]
+    );
+    assert!(set.iter().all(|v| v["serial"] == 4));
+    assert_eq!(seen.iter().filter(|v| v["type"] == "state").count(), 1);
+
+    // No camera: a clear line.
+    let mut watch = watch;
+    watch.child.signal(libc::SIGTERM);
+    let (status, stderr) = watch.finish("watch --json");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert_eq!(stderr, "");
+    mock.remove_cameras();
+    let watch = bus.watch(&["watch", "--json"], None);
+    assert_eq!(watch.next_json("the snapshot")["type"], "snapshot");
+    assert_eq!(watch.settings_set("no camera")[0]["type"], "settings_clear");
+    let mut watch = watch;
+    watch.child.signal(libc::SIGTERM);
+    let _ = watch.finish("watch --json");
+    assert!(
+        !bus.activation_attempted(),
+        "watch must not start the daemon"
+    );
+}
+
+#[test]
+fn watch_for_a_person_prints_nothing_of_the_settings() {
+    let bus = Bus::start();
+    let _mock = MockDaemon::start(&bus);
+    let mut watch = bus.watch(&["watch"], None);
+    assert!(
+        watch
+            .next("the summary")
+            .starts_with("omarchy-broadcastd: state idle")
+    );
+    assert!(
+        bus.run(&["settings", "set", "camera.image.brightness", "1"])
+            .status
+            .success()
+    );
+    watch.quiet_for(Duration::from_millis(500), "a settings change");
+    watch.child.signal(libc::SIGTERM);
+    let (status, stderr) = watch.finish("watch");
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert_eq!(stderr, "");
+}
+
+#[test]
+fn settings_lines_stay_under_the_cap_with_hostile_strings() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let evil = "\u{1b}]0;x\u{7}\u{202e}\"\\".repeat(60);
+    let hostile = |i: usize| {
+        let mut s = choice(&format!("camera.other.s{i}"), &evil, &[], &evil, &evil);
+        if let SettingKind::Enum { options, .. } = &mut s.kind {
+            *options = (0..30)
+                .map(|j| (format!("{j}{evil}"), evil.clone()))
+                .collect();
+        }
+        s.enabled = false;
+        s.disabled_reason = evil.clone();
+        s.enabled_when = (0..9)
+            .map(|_| Condition {
+                id: evil.clone(),
+                op: ConditionOp::In,
+                value: SettingValue::List(
+                    (0..30).map(|_| SettingValue::Str(evil.clone())).collect(),
+                ),
+            })
+            .collect();
+        s
+    };
+    mock.set_settings(vec![SettingsGroup {
+        id: "other".into(),
+        label: evil.clone(),
+        settings: (0..30).map(hostile).collect(),
+    }]);
+    let out = bus.run(&["settings", "--json"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    // `json_line` checks every line is one valid object of at most 4096 bytes.
+    let lines = json_lines(&out.stdout);
+    let mut n = 0;
+    for (i, v) in lines.iter().enumerate() {
+        assert_eq!(v["index"], i);
+        assert_eq!(v["count"], lines.len());
+        assert_eq!(v["parts"], lines.len());
+        assert_eq!(v["part"], i + 1);
+        n += v["group"]["settings"].as_array().unwrap().len();
+    }
+    assert_eq!(n, 30);
+    // For a person: escaped, one line per setting.
+    let out = bus.run(&["settings"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(out.stdout.lines().count(), 1 + 1 + 30 + 1, "{}", out.stdout);
+    assert!(
+        !out.stdout
+            .chars()
+            .any(|c| (c.is_control() && c != '\n') || c == '\u{202e}'),
+        "{:?}",
         out.stdout
     );
 }

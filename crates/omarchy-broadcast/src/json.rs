@@ -1,6 +1,7 @@
 //! The JSON lines printed by `status --json`, `cameras --json`,
-//! `controls --json`, `watch --json` and `preview --json`. The contract is documented in `docs/cli-json.md`; this
-//! module is its only producer.
+//! `controls --json`, `settings --json`, `watch --json` and `preview --json`.
+//! The contract is documented in `docs/cli-json.md`; this module is its only
+//! producer.
 //!
 //! Every line is one JSON object carrying `"v"` ([`VERSION`]) and `"type"`,
 //! and is at most [`MAX_LINE_BYTES`] bytes long: strings are clipped to the
@@ -13,10 +14,24 @@
 //! the one exception: it is never clipped (a client opens that file), and a
 //! path over [`MAX_PREVIEW_PATH_BYTES`] is refused instead
 //! ([`preview_path_fits`], [`CODE_PREVIEW_PATH_TOO_LONG`]).
+//!
+//! The camera settings (revision 7) are a *set* of `settings_group` lines
+//! ([`settings_lines`]): each carries one group, or a part of one, with at
+//! most [`MAX_SETTINGS_PER_LINE`] settings, packed greedily by encoded
+//! length so that a line stays under the cap; every string of a setting is
+//! clipped to its bound below, a setting lists at most [`MAX_OPTIONS`]
+//! options and [`MAX_CONDITIONS`] conditions, and a setting of a type this
+//! client does not know is left out. A change is a `settings_delta` line
+//! ([`settings_delta_lines`], at most [`MAX_CHANGES_PER_LINE`] changes,
+//! packed the same way), and nothing to show (no camera, or no setting this
+//! CLI can show) a `settings_clear` line.
 
 use std::borrow::Cow;
 
-use obc_ipc::{CameraControl, CameraControls, CameraInfo, Snapshot, Stats};
+use obc_ipc::{
+    CameraControl, CameraControls, CameraInfo, Condition, SETTINGS_SCHEMA, Setting, SettingChange,
+    SettingKind, SettingValue, SettingsGroup, SettingsTree, Snapshot, Stats,
+};
 use serde::Serialize;
 
 use crate::model;
@@ -43,10 +58,13 @@ pub const MAX_MODE_BYTES: usize = 64;
 pub const MAX_EFFECT_BYTES: usize = 32;
 /// Bound of `pipewire_output`.
 pub const MAX_PIPEWIRE_OUTPUT_BYTES: usize = 32;
-/// Bound of `background_image`. Kept so that a `snapshot` line with every
-/// string at its bound and [`MAX_CAMERAS`] cameras stays under
-/// [`MAX_LINE_BYTES`]. A longer path is clipped at its start
-/// ([`clip_start`]), so the file name survives.
+/// Bound of `background_image`. A longer path is clipped at its start
+/// ([`clip_start`]), so the file name survives. With every string and
+/// number at its worst and no image controls, a `snapshot` line holds
+/// [`MAX_CAMERAS`] − 1 cameras under [`MAX_LINE_BYTES`] (its settings
+/// fields take the room of the last one), a `cameras` line all
+/// [`MAX_CAMERAS`]; image controls at their worst take more, and
+/// [`snapshot_line`] cuts the controls, then the cameras, to keep the cap.
 pub const MAX_PATH_BYTES: usize = 256;
 /// Bound of the `path` of `preview` and `frame` lines (bytes of its JSON
 /// encoding): those lines stay under [`MAX_LINE_BYTES`] with it. Such a path
@@ -57,6 +75,37 @@ pub const MAX_PREVIEW_PATH_BYTES: usize = 3968;
 pub const MAX_CONTROLS: usize = 16;
 /// Bound of an image control's `name`.
 pub const MAX_CONTROL_NAME_BYTES: usize = 32;
+/// At most this many settings are in one `settings_group` line.
+pub const MAX_SETTINGS_PER_LINE: usize = 8;
+/// At most this many changes are in one `settings_delta` line.
+pub const MAX_CHANGES_PER_LINE: usize = 16;
+/// Bound of a setting id (`id`, and the `id` of a condition). A valid id is
+/// at most this long already ([`obc_ipc::valid_setting_id`]).
+pub const MAX_SETTING_ID_BYTES: usize = obc_ipc::settings::SETTING_ID_MAX;
+/// Bound of a group id.
+pub const MAX_GROUP_ID_BYTES: usize = 32;
+/// Bound of a setting's or a group's `label`.
+pub const MAX_LABEL_BYTES: usize = 48;
+/// Bound of `disabled_reason`.
+pub const MAX_REASON_BYTES: usize = 96;
+/// Bound of an int setting's `unit`.
+pub const MAX_UNIT_BYTES: usize = 16;
+/// Bound of an option's `value`, and so of an enum setting's `value` and
+/// `default` and of a string operand of a condition.
+pub const MAX_OPTION_VALUE_BYTES: usize = 32;
+/// Bound of an option's `label`.
+pub const MAX_OPTION_LABEL_BYTES: usize = 32;
+/// At most this many options of an enum setting are listed.
+pub const MAX_OPTIONS: usize = 16;
+/// At most this many `enabled_when` conditions of a setting are listed.
+pub const MAX_CONDITIONS: usize = 4;
+/// At most this many operands of an `in` condition (a list) are listed.
+pub const MAX_CONDITION_VALUES: usize = 8;
+/// Bound of a condition's `op` (`eq`, `ne`, `in`, or one a newer daemon
+/// adds).
+pub const MAX_OP_BYTES: usize = 8;
+/// Bound of a setting's `hint`.
+pub const MAX_HINT_BYTES: usize = 16;
 /// Appended to a clipped string.
 pub const ELLIPSIS: &str = "\u{2026}";
 
@@ -277,6 +326,11 @@ struct SnapshotLine<'a> {
     cameras_truncated: bool,
     /// `null` from a daemon too old to have it.
     camera_controls: Option<Controls<'a>>,
+    /// `SettingsRevision`; `null` before revision 7.
+    settings_revision: Option<u32>,
+    /// The settings schema version the daemon's settings follow
+    /// ([`SETTINGS_SCHEMA`]); `null` before revision 7.
+    settings_schema: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -388,6 +442,8 @@ pub fn snapshot_line(s: &Snapshot) -> String {
                 .camera_controls
                 .as_ref()
                 .map(|c| Controls::of(c, control_limit)),
+            settings_revision: model::settings_revision(s),
+            settings_schema: model::has_settings(s).then_some(SETTINGS_SCHEMA),
         })
     };
     let mut cameras = MAX_CAMERAS;
@@ -490,6 +546,378 @@ pub fn error_line(code: &str, message: &str) -> String {
     })
 }
 
+/// A value of the settings channel as printed: a boolean, a number, a
+/// string, or a list of those (the operands of an `in` condition).
+#[derive(Serialize)]
+#[serde(untagged)]
+enum JsonValue<'a> {
+    Bool(bool),
+    Int(i64),
+    Str(Cow<'a, str>),
+    List(Vec<JsonValue<'a>>),
+}
+
+impl<'a> JsonValue<'a> {
+    /// `v` as printed: a string clipped to [`MAX_OPTION_VALUE_BYTES`], a
+    /// list cut at [`MAX_CONDITION_VALUES`] items, a list within a list
+    /// printed empty.
+    fn of(v: &'a SettingValue) -> Self {
+        Self::at_depth(v, 0)
+    }
+
+    fn at_depth(v: &'a SettingValue, depth: usize) -> Self {
+        match v {
+            SettingValue::Bool(b) => JsonValue::Bool(*b),
+            SettingValue::Int(i) => JsonValue::Int(*i),
+            SettingValue::Str(s) => JsonValue::Str(clip(s, MAX_OPTION_VALUE_BYTES)),
+            SettingValue::List(_) if depth > 0 => JsonValue::List(Vec::new()),
+            SettingValue::List(items) => JsonValue::List(
+                items
+                    .iter()
+                    .take(MAX_CONDITION_VALUES)
+                    .map(|i| Self::at_depth(i, depth + 1))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// One `enabled_when` condition.
+#[derive(Serialize)]
+struct ConditionJson<'a> {
+    id: Cow<'a, str>,
+    op: Cow<'a, str>,
+    value: JsonValue<'a>,
+}
+
+/// One option of an enum setting.
+#[derive(Serialize)]
+struct OptionJson<'a> {
+    value: Cow<'a, str>,
+    label: Cow<'a, str>,
+}
+
+/// One setting of a `settings_group` line, with the keys of its type only.
+#[derive(Serialize)]
+struct SettingJson<'a> {
+    id: Cow<'a, str>,
+    label: Cow<'a, str>,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<JsonValue<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default: Option<JsonValue<'a>>,
+    stored: bool,
+    enabled: bool,
+    disabled_reason: Cow<'a, str>,
+    enabled_when: Vec<ConditionJson<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unit: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<Vec<OptionJson<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<Cow<'a, str>>,
+}
+
+impl<'a> SettingJson<'a> {
+    /// `s` as printed, or `None` for a type this client does not know.
+    fn of(s: &'a Setting) -> Option<Self> {
+        let mut j = SettingJson {
+            id: clip(&s.id, MAX_SETTING_ID_BYTES),
+            label: clip(&s.label, MAX_LABEL_BYTES),
+            kind: "",
+            value: None,
+            default: None,
+            stored: s.stored,
+            enabled: s.enabled,
+            disabled_reason: clip(&s.disabled_reason, MAX_REASON_BYTES),
+            enabled_when: s
+                .enabled_when
+                .iter()
+                .take(MAX_CONDITIONS)
+                .map(|c: &Condition| ConditionJson {
+                    id: clip(&c.id, MAX_SETTING_ID_BYTES),
+                    op: clip(c.op.as_str(), MAX_OP_BYTES),
+                    value: JsonValue::of(&c.value),
+                })
+                .collect(),
+            min: None,
+            max: None,
+            step: None,
+            unit: None,
+            options: None,
+            hint: s.hint.as_deref().map(|h| clip(h, MAX_HINT_BYTES)),
+        };
+        match &s.kind {
+            SettingKind::Bool { default, value } => {
+                j.kind = "bool";
+                j.value = Some(JsonValue::Bool(*value));
+                j.default = Some(JsonValue::Bool(*default));
+            }
+            SettingKind::Int {
+                min,
+                max,
+                step,
+                default,
+                value,
+                unit,
+            } => {
+                j.kind = "int";
+                j.value = Some(JsonValue::Int(*value));
+                j.default = Some(JsonValue::Int(*default));
+                j.min = Some(*min);
+                j.max = Some(*max);
+                j.step = Some(*step);
+                j.unit = unit.as_deref().map(|u| clip(u, MAX_UNIT_BYTES));
+            }
+            SettingKind::Enum {
+                options,
+                default,
+                value,
+            } => {
+                j.kind = "enum";
+                j.value = Some(JsonValue::Str(clip(value, MAX_OPTION_VALUE_BYTES)));
+                j.default = Some(JsonValue::Str(clip(default, MAX_OPTION_VALUE_BYTES)));
+                j.options = Some(
+                    options
+                        .iter()
+                        .take(MAX_OPTIONS)
+                        .map(|(v, l)| OptionJson {
+                            value: clip(v, MAX_OPTION_VALUE_BYTES),
+                            label: clip(l, MAX_OPTION_LABEL_BYTES),
+                        })
+                        .collect(),
+                );
+            }
+            SettingKind::Action => j.kind = "action",
+            SettingKind::Unknown(_) => return None,
+        }
+        Some(j)
+    }
+}
+
+/// The `group` of a `settings_group` line.
+#[derive(Serialize)]
+struct GroupJson<'a, 'b> {
+    id: Cow<'a, str>,
+    label: Cow<'a, str>,
+    settings: &'b [SettingJson<'a>],
+}
+
+#[derive(Serialize)]
+struct SettingsGroupLine<'a, 'b> {
+    v: u32,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    schema: u32,
+    rev: u32,
+    serial: u32,
+    camera: Cow<'a, str>,
+    index: usize,
+    count: usize,
+    part: usize,
+    parts: usize,
+    group: GroupJson<'a, 'b>,
+}
+
+/// One change of a `settings_delta` line.
+#[derive(Serialize)]
+struct ChangeJson<'a> {
+    id: Cow<'a, str>,
+    /// Absent for an action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<JsonValue<'a>>,
+    stored: bool,
+    enabled: bool,
+    disabled_reason: Cow<'a, str>,
+}
+
+#[derive(Serialize)]
+struct SettingsDeltaLine<'a, 'b> {
+    v: u32,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    schema: u32,
+    rev: u32,
+    serial: u32,
+    camera: Cow<'a, str>,
+    changes: &'b [ChangeJson<'a>],
+}
+
+#[derive(Serialize)]
+struct SettingsClearLine {
+    v: u32,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    rev: u32,
+    serial: u32,
+}
+
+/// Splits `items` (each with the length of its JSON encoding) into runs of
+/// at most `max_items` whose JSON array, in a line of `overhead` bytes
+/// with an empty array, keeps the line within [`MAX_LINE_BYTES`]: filled
+/// greedily, in order. An item too long to fit a line on its own (which the
+/// bounds prevent) is left out, so that the cap stays a guarantee.
+fn pack<T>(items: Vec<(T, usize)>, overhead: usize, max_items: usize) -> Vec<Vec<T>> {
+    let mut runs = Vec::new();
+    let mut run: Vec<T> = Vec::new();
+    // Bytes of the run's items and the commas between them.
+    let mut used = 0;
+    for (item, len) in items {
+        if overhead + len > MAX_LINE_BYTES {
+            continue;
+        }
+        let comma = usize::from(!run.is_empty());
+        if run.len() == max_items || overhead + used + comma + len > MAX_LINE_BYTES {
+            runs.push(std::mem::take(&mut run));
+            used = 0;
+        }
+        used += usize::from(!run.is_empty()) + len;
+        run.push(item);
+    }
+    if !run.is_empty() {
+        runs.push(run);
+    }
+    runs
+}
+
+/// The settings of `g` as printed, with their encoded lengths; settings of
+/// an unknown type left out.
+fn encoded_settings(g: &SettingsGroup) -> Vec<(SettingJson<'_>, usize)> {
+    g.settings
+        .iter()
+        .filter_map(SettingJson::of)
+        .map(|j| {
+            let len = to_line(&j).len();
+            (j, len)
+        })
+        .collect()
+}
+
+/// The full set of settings of `tree`: one `settings_group` line per group,
+/// or per part of a group that does not fit one line (`part` 1 to `parts`;
+/// `1` of `1` when whole), each with at most [`MAX_SETTINGS_PER_LINE`]
+/// settings, `index` 0 to `count - 1` over the whole set:
+///
+/// `{"v":1,"type":"settings_group","schema":1,"rev":R,"serial":S,"camera":"<id>",
+/// "index":I,"count":N,"part":P,"parts":Q,"group":{"id":...,"label":...,"settings":[...]}}`
+///
+/// A tree with nothing to show (no camera, or no setting this CLI can show)
+/// is one [`settings_clear_line`] instead.
+pub fn settings_lines(tree: &SettingsTree) -> Vec<String> {
+    let camera = clip(&tree.camera, MAX_ID_BYTES);
+    let line = |group: &SettingsGroup,
+                settings: &[SettingJson<'_>],
+                (index, count, part, parts): (usize, usize, usize, usize)| {
+        to_line(&SettingsGroupLine {
+            v: VERSION,
+            kind: "settings_group",
+            schema: SETTINGS_SCHEMA,
+            rev: tree.revision,
+            serial: tree.serial,
+            camera: camera.clone(),
+            index,
+            count,
+            part,
+            parts,
+            group: GroupJson {
+                id: clip(&group.id, MAX_GROUP_ID_BYTES),
+                label: clip(&group.label, MAX_LABEL_BYTES),
+                settings,
+            },
+        })
+    };
+    // The lines' numbers are not known before the packing: measure with the
+    // longest they can be.
+    let widest = u32::MAX as usize;
+    let mut runs: Vec<(&SettingsGroup, Vec<Vec<SettingJson<'_>>>)> = Vec::new();
+    if !tree.camera.is_empty() {
+        for g in &tree.groups {
+            let overhead = line(g, &[], (widest, widest, widest, widest)).len();
+            let parts = pack(encoded_settings(g), overhead, MAX_SETTINGS_PER_LINE);
+            if !parts.is_empty() {
+                runs.push((g, parts));
+            }
+        }
+    }
+    let count: usize = runs.iter().map(|(_, parts)| parts.len()).sum();
+    if count == 0 {
+        return vec![settings_clear_line(tree.revision, tree.serial)];
+    }
+    let mut lines = Vec::with_capacity(count);
+    for (g, parts) in &runs {
+        for (i, settings) in parts.iter().enumerate() {
+            lines.push(line(g, settings, (lines.len(), count, i + 1, parts.len())));
+        }
+    }
+    lines
+}
+
+/// The `settings_delta` lines of one `SettingsChanged` signal on `camera`:
+///
+/// `{"v":1,"type":"settings_delta","schema":1,"rev":R,"serial":S,"camera":"<id>",
+/// "changes":[{"id":...,"value":...,"stored":...,"enabled":...,"disabled_reason":...}]}`
+///
+/// with at most [`MAX_CHANGES_PER_LINE`] changes per line (more make
+/// several lines with the same `rev`), no `value` for an action. No change,
+/// no line.
+pub fn settings_delta_lines(
+    rev: u32,
+    serial: u32,
+    camera: &str,
+    changes: &[SettingChange],
+) -> Vec<String> {
+    let camera = clip(camera, MAX_ID_BYTES);
+    let line = |changes: &[ChangeJson<'_>]| {
+        to_line(&SettingsDeltaLine {
+            v: VERSION,
+            kind: "settings_delta",
+            schema: SETTINGS_SCHEMA,
+            rev,
+            serial,
+            camera: camera.clone(),
+            changes,
+        })
+    };
+    let encoded: Vec<(ChangeJson<'_>, usize)> = changes
+        .iter()
+        .map(|c| {
+            let j = ChangeJson {
+                id: clip(&c.id, MAX_SETTING_ID_BYTES),
+                value: c.value.as_ref().map(JsonValue::of),
+                stored: c.stored,
+                enabled: c.enabled,
+                disabled_reason: clip(&c.disabled_reason, MAX_REASON_BYTES),
+            };
+            let len = to_line(&j).len();
+            (j, len)
+        })
+        .collect();
+    let overhead = line(&[]).len();
+    pack(encoded, overhead, MAX_CHANGES_PER_LINE)
+        .iter()
+        .map(|run| line(run))
+        .collect()
+}
+
+/// `{"v":1,"type":"settings_clear","rev":R,"serial":S}`: there is nothing
+/// to show (no camera, or no setting this CLI can show).
+pub fn settings_clear_line(rev: u32, serial: u32) -> String {
+    to_line(&SettingsClearLine {
+        v: VERSION,
+        kind: "settings_clear",
+        rev,
+        serial,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,6 +953,8 @@ mod tests {
             pipewire_output: "streaming".into(),
             denoise: true,
             camera_controls: None,
+            settings_revision: None,
+            settings_schema_serial: None,
             interface_revision: 4,
         }
     }
@@ -942,18 +1372,22 @@ mod tests {
         s.blur_strength = 2.225_073_858_507_201_4e-308;
         s.consumers = u32::MAX;
         s.interface_revision = u32::MAX;
+        s.settings_revision = Some(u32::MAX);
+        s.settings_schema_serial = Some(u32::MAX);
         s.cameras = (0..100)
             .map(|i| cam(&format!("{i}{nasty}"), &nasty, &nasty))
             .collect();
         s.active_camera = s.cameras[3].id.clone();
-        for line in [
-            snapshot_line(&s),
-            cameras_line(&s),
-            state_line(&s, &model::STATE_FIELDS),
+        for (line, cameras) in [
+            // The settings fields (revision 7, as `interface_revision` is
+            // here) leave no room for the last camera: the snapshot cuts it.
+            (snapshot_line(&s), MAX_CAMERAS - 1),
+            (cameras_line(&s), MAX_CAMERAS),
+            (state_line(&s, &model::STATE_FIELDS), 0),
         ] {
             let v = parse(&line);
             if let Some(cams) = v.get("cameras") {
-                assert_eq!(cams.as_array().unwrap().len(), MAX_CAMERAS, "{line}");
+                assert_eq!(cams.as_array().unwrap().len(), cameras, "{line}");
                 assert_eq!(v["cameras_truncated"], true);
                 assert_eq!(cams[3]["active"], true);
             }
@@ -1020,5 +1454,432 @@ mod tests {
                 .unwrap()
                 .ends_with(ELLIPSIS)
         );
+    }
+
+    fn setting(id: &str, label: &str, kind: SettingKind) -> Setting {
+        Setting {
+            id: id.into(),
+            label: label.into(),
+            kind,
+            scope: "camera".into(),
+            stored: false,
+            enabled: true,
+            disabled_reason: String::new(),
+            enabled_when: Vec::new(),
+            hint: None,
+        }
+    }
+
+    fn exposure_tree() -> SettingsTree {
+        let mut time = setting(
+            "camera.exposure.exposure_time_absolute",
+            "Exposure time",
+            SettingKind::Int {
+                min: 3,
+                max: 2047,
+                step: 1,
+                default: 156,
+                value: 1250,
+                unit: Some("\u{d7}100 \u{b5}s".into()),
+            },
+        );
+        time.enabled = false;
+        time.disabled_reason = "Set exposure to manual to change this".into();
+        time.enabled_when = vec![Condition {
+            id: "camera.exposure.auto_exposure".into(),
+            op: obc_ipc::ConditionOp::In,
+            value: SettingValue::List(vec![
+                SettingValue::Str("manual".into()),
+                SettingValue::Str("shutter_priority".into()),
+            ]),
+        }];
+        let mut mode = setting(
+            "camera.exposure.auto_exposure",
+            "Exposure mode",
+            SettingKind::Enum {
+                options: vec![
+                    ("manual".into(), "Manual".into()),
+                    ("aperture_priority".into(), "Auto".into()),
+                ],
+                default: "aperture_priority".into(),
+                value: "aperture_priority".into(),
+            },
+        );
+        mode.hint = Some("segmented".into());
+        let mut keep = setting(
+            "camera.exposure.keep_framerate",
+            "Keep 30 fps in low light",
+            SettingKind::Bool {
+                default: true,
+                value: false,
+            },
+        );
+        keep.stored = true;
+        keep.hint = Some("switch".into());
+        SettingsTree {
+            revision: 12,
+            serial: 3,
+            camera: "usb-046d_0944".into(),
+            groups: vec![
+                SettingsGroup {
+                    id: "exposure".into(),
+                    label: "Exposure".into(),
+                    settings: vec![
+                        mode,
+                        time,
+                        keep,
+                        setting(
+                            "camera.exposure.future",
+                            "From the future",
+                            SettingKind::Unknown("colour".into()),
+                        ),
+                    ],
+                },
+                SettingsGroup {
+                    id: "white_balance".into(),
+                    label: "White balance".into(),
+                    settings: vec![setting(
+                        "camera.white_balance.do_white_balance",
+                        "Balance once",
+                        SettingKind::Action,
+                    )],
+                },
+                // Nothing this client can show: no line.
+                SettingsGroup {
+                    id: "other".into(),
+                    label: "Other".into(),
+                    settings: vec![setting(
+                        "camera.other.x",
+                        "X",
+                        SettingKind::Unknown("colour".into()),
+                    )],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn settings_lines_carry_each_group_with_the_keys_of_each_type() {
+        let lines = settings_lines(&exposure_tree());
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            r#"{"v":1,"type":"settings_group","schema":1,"rev":12,"serial":3,"camera":"usb-046d_0944","index":0,"count":2,"part":1,"parts":1,"group":{"id":"exposure","label":"Exposure","settings":[{"id":"camera.exposure.auto_exposure","label":"Exposure mode","type":"enum","value":"aperture_priority","default":"aperture_priority","stored":false,"enabled":true,"disabled_reason":"","enabled_when":[],"options":[{"value":"manual","label":"Manual"},{"value":"aperture_priority","label":"Auto"}],"hint":"segmented"},{"id":"camera.exposure.exposure_time_absolute","label":"Exposure time","type":"int","value":1250,"default":156,"stored":false,"enabled":false,"disabled_reason":"Set exposure to manual to change this","enabled_when":[{"id":"camera.exposure.auto_exposure","op":"in","value":["manual","shutter_priority"]}],"min":3,"max":2047,"step":1,"unit":"×100 µs"},{"id":"camera.exposure.keep_framerate","label":"Keep 30 fps in low light","type":"bool","value":false,"default":true,"stored":true,"enabled":true,"disabled_reason":"","enabled_when":[],"hint":"switch"}]}}"#
+        );
+        assert_eq!(
+            lines[1],
+            r#"{"v":1,"type":"settings_group","schema":1,"rev":12,"serial":3,"camera":"usb-046d_0944","index":1,"count":2,"part":1,"parts":1,"group":{"id":"white_balance","label":"White balance","settings":[{"id":"camera.white_balance.do_white_balance","label":"Balance once","type":"action","stored":false,"enabled":true,"disabled_reason":"","enabled_when":[]}]}}"#
+        );
+        for line in &lines {
+            parse(line);
+        }
+    }
+
+    #[test]
+    fn no_camera_or_nothing_to_show_is_a_clear_line() {
+        let clear = r#"{"v":1,"type":"settings_clear","rev":5,"serial":2}"#;
+        assert_eq!(settings_clear_line(5, 2), clear);
+        let none = SettingsTree {
+            revision: 5,
+            serial: 2,
+            camera: String::new(),
+            groups: Vec::new(),
+        };
+        assert_eq!(settings_lines(&none), [clear]);
+        // A camera without a setting, or with none of a known type.
+        let mut empty = none.clone();
+        empty.camera = "platform-video2".into();
+        assert_eq!(settings_lines(&empty), [clear]);
+        let mut unknown = exposure_tree();
+        unknown.groups.drain(..2);
+        unknown.revision = 5;
+        unknown.serial = 2;
+        assert_eq!(settings_lines(&unknown), [clear]);
+        parse(clear);
+    }
+
+    #[test]
+    fn settings_delta_lines_carry_the_changes() {
+        let changes = [
+            SettingChange {
+                id: "camera.exposure.auto_exposure".into(),
+                value: Some(SettingValue::Str("manual".into())),
+                stored: true,
+                enabled: true,
+                disabled_reason: String::new(),
+            },
+            SettingChange {
+                id: "camera.exposure.exposure_time_absolute".into(),
+                value: Some(SettingValue::Int(1250)),
+                stored: false,
+                enabled: true,
+                disabled_reason: String::new(),
+            },
+            SettingChange {
+                id: "camera.white_balance.do_white_balance".into(),
+                value: None,
+                stored: false,
+                enabled: false,
+                disabled_reason: "Not now".into(),
+            },
+        ];
+        let lines = settings_delta_lines(13, 3, "usb-046d_0944", &changes);
+        assert_eq!(
+            lines,
+            [
+                r#"{"v":1,"type":"settings_delta","schema":1,"rev":13,"serial":3,"camera":"usb-046d_0944","changes":[{"id":"camera.exposure.auto_exposure","value":"manual","stored":true,"enabled":true,"disabled_reason":""},{"id":"camera.exposure.exposure_time_absolute","value":1250,"stored":false,"enabled":true,"disabled_reason":""},{"id":"camera.white_balance.do_white_balance","stored":false,"enabled":false,"disabled_reason":"Not now"}]}"#
+            ]
+        );
+        parse(&lines[0]);
+        assert!(settings_delta_lines(13, 3, "c", &[]).is_empty());
+        // More than a line takes: several, with the same revision, in order.
+        let many: Vec<SettingChange> = (0..40)
+            .map(|i| SettingChange {
+                id: format!("camera.image.s{i}"),
+                value: Some(SettingValue::Bool(i % 2 == 0)),
+                stored: false,
+                enabled: true,
+                disabled_reason: String::new(),
+            })
+            .collect();
+        let lines = settings_delta_lines(14, 3, "c", &many);
+        assert_eq!(lines.len(), 3);
+        let mut ids = Vec::new();
+        for line in &lines {
+            let v = parse(line);
+            assert_eq!(v["rev"], 14);
+            let changes = v["changes"].as_array().unwrap();
+            assert!(changes.len() <= MAX_CHANGES_PER_LINE);
+            ids.extend(
+                changes
+                    .iter()
+                    .map(|c| c["id"].as_str().unwrap().to_string()),
+            );
+        }
+        let want: Vec<String> = many.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(ids, want);
+    }
+
+    #[test]
+    fn a_big_group_is_cut_into_parts_of_at_most_eight() {
+        let settings: Vec<Setting> = (0..19)
+            .map(|i| {
+                setting(
+                    &format!("camera.image.s{i}"),
+                    "S",
+                    SettingKind::Bool {
+                        default: false,
+                        value: true,
+                    },
+                )
+            })
+            .collect();
+        let tree = SettingsTree {
+            revision: 1,
+            serial: 1,
+            camera: "c".into(),
+            groups: vec![
+                SettingsGroup {
+                    id: "image".into(),
+                    label: "Image".into(),
+                    settings,
+                },
+                SettingsGroup {
+                    id: "focus".into(),
+                    label: "Focus & zoom".into(),
+                    settings: vec![setting("camera.focus.pan_reset", "P", SettingKind::Action)],
+                },
+            ],
+        };
+        let lines = settings_lines(&tree);
+        let got: Vec<(u64, u64, u64, u64, String, usize)> = lines
+            .iter()
+            .map(|l| {
+                let v = parse(l);
+                (
+                    v["index"].as_u64().unwrap(),
+                    v["count"].as_u64().unwrap(),
+                    v["part"].as_u64().unwrap(),
+                    v["parts"].as_u64().unwrap(),
+                    v["group"]["id"].as_str().unwrap().to_string(),
+                    v["group"]["settings"].as_array().unwrap().len(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (0, 4, 1, 3, "image".into(), 8),
+                (1, 4, 2, 3, "image".into(), 8),
+                (2, 4, 3, 3, "image".into(), 3),
+                (3, 4, 1, 1, "focus".into(), 1),
+            ]
+        );
+        // The group's id and label are on every part.
+        assert!(lines[..3].iter().all(|l| l.contains(r#""label":"Image""#)));
+    }
+
+    /// A setting with every string at its worst (long and made of 6-byte
+    /// escapes), the most options and conditions, the longest numbers.
+    fn worst_setting(i: usize, kind: SettingKind) -> Setting {
+        let nasty = "\u{1}".repeat(500);
+        // A valid id at its longest.
+        let id = format!("camera.{}.s{i:0>35}", "g".repeat(4));
+        assert!(obc_ipc::valid_setting_id(&id), "{id}");
+        assert_eq!(id.len(), MAX_SETTING_ID_BYTES);
+        let list = SettingValue::List(
+            (0..40)
+                .map(|_| SettingValue::Str(nasty.clone()))
+                .chain([SettingValue::List(vec![SettingValue::Int(i64::MIN)])])
+                .collect(),
+        );
+        Setting {
+            id: id.clone(),
+            label: nasty.clone(),
+            kind,
+            scope: nasty.clone(),
+            stored: false,
+            enabled: false,
+            disabled_reason: nasty.clone(),
+            enabled_when: (0..10)
+                .map(|_| Condition {
+                    id: nasty.clone(),
+                    op: obc_ipc::ConditionOp::Unknown(nasty.clone()),
+                    value: list.clone(),
+                })
+                .collect(),
+            hint: Some(nasty.clone()),
+        }
+    }
+
+    fn worst_kinds() -> Vec<SettingKind> {
+        let nasty = "\u{1}".repeat(500);
+        vec![
+            SettingKind::Enum {
+                options: (0..40).map(|_| (nasty.clone(), nasty.clone())).collect(),
+                default: nasty.clone(),
+                value: nasty.clone(),
+            },
+            SettingKind::Int {
+                min: i64::MIN,
+                max: i64::MIN,
+                step: i64::MIN,
+                default: i64::MIN,
+                value: i64::MIN,
+                unit: Some(nasty.clone()),
+            },
+            SettingKind::Bool {
+                default: false,
+                value: false,
+            },
+            SettingKind::Action,
+        ]
+    }
+
+    #[test]
+    fn worst_case_settings_lines_stay_under_the_cap_and_valid() {
+        let nasty = "\u{1}".repeat(500);
+        for kind in worst_kinds() {
+            // A single worst-case setting fits a line alone, with the rest
+            // of the line at its worst too.
+            let tree = SettingsTree {
+                revision: u32::MAX,
+                serial: u32::MAX,
+                camera: nasty.clone(),
+                groups: vec![SettingsGroup {
+                    id: nasty.clone(),
+                    label: nasty.clone(),
+                    settings: vec![worst_setting(0, kind.clone())],
+                }],
+            };
+            let lines = settings_lines(&tree);
+            assert_eq!(lines.len(), 1, "{kind:?}");
+            let v = parse(&lines[0]);
+            assert_eq!(v["type"], "settings_group");
+            let s = &v["group"]["settings"][0];
+            assert!(s["label"].as_str().unwrap().ends_with(ELLIPSIS));
+            assert!(s["disabled_reason"].as_str().unwrap().len() <= MAX_REASON_BYTES);
+            let when = s["enabled_when"].as_array().unwrap();
+            assert_eq!(when.len(), MAX_CONDITIONS);
+            let operands = when[0]["value"].as_array().unwrap();
+            assert_eq!(operands.len(), MAX_CONDITION_VALUES);
+            if let Some(options) = s.get("options") {
+                assert_eq!(options.as_array().unwrap().len(), MAX_OPTIONS);
+            }
+        }
+        // Many of them: every line valid and under the cap, no setting lost.
+        let groups: Vec<SettingsGroup> = (0..5)
+            .map(|g| SettingsGroup {
+                id: nasty.clone(),
+                label: nasty.clone(),
+                settings: (0..64)
+                    .map(|i| worst_setting(g * 64 + i, worst_kinds()[i % 4].clone()))
+                    .collect(),
+            })
+            .collect();
+        let tree = SettingsTree {
+            revision: u32::MAX,
+            serial: u32::MAX,
+            camera: nasty.clone(),
+            groups,
+        };
+        let lines = settings_lines(&tree);
+        let mut seen = 0;
+        for (i, line) in lines.iter().enumerate() {
+            let v = parse(line);
+            assert_eq!(v["index"], i);
+            assert_eq!(v["count"], lines.len());
+            let n = v["group"]["settings"].as_array().unwrap().len();
+            assert!((1..=MAX_SETTINGS_PER_LINE).contains(&n), "{n}");
+            seen += n;
+        }
+        assert_eq!(seen, 5 * 64);
+        // The deltas likewise.
+        let changes: Vec<SettingChange> = (0..100)
+            .map(|i| SettingChange {
+                id: worst_setting(i, SettingKind::Action).id,
+                value: Some(match i % 3 {
+                    0 => SettingValue::Str(nasty.clone()),
+                    1 => SettingValue::Int(i64::MIN),
+                    _ => SettingValue::List(
+                        (0..40).map(|_| SettingValue::Str(nasty.clone())).collect(),
+                    ),
+                }),
+                stored: false,
+                enabled: false,
+                disabled_reason: nasty.clone(),
+            })
+            .collect();
+        let lines = settings_delta_lines(u32::MAX, u32::MAX, &nasty, &changes);
+        let mut seen = 0;
+        for line in &lines {
+            let v = parse(line);
+            let n = v["changes"].as_array().unwrap().len();
+            assert!((1..=MAX_CHANGES_PER_LINE).contains(&n), "{n}");
+            seen += n;
+        }
+        assert_eq!(seen, 100);
+        parse(&settings_clear_line(u32::MAX, u32::MAX));
+    }
+
+    #[test]
+    fn the_snapshot_carries_the_settings_revision_and_schema_or_null() {
+        let mut s = sample();
+        s.settings_revision = Some(9);
+        s.settings_schema_serial = Some(2);
+        // From a daemon too old for them: null, with the keys present.
+        s.interface_revision = 6;
+        let v = parse(&snapshot_line(&s));
+        assert_eq!(v.get("settings_revision"), Some(&Value::Null));
+        assert_eq!(v.get("settings_schema"), Some(&Value::Null));
+        s.interface_revision = obc_ipc::SETTINGS_REVISION;
+        let v = parse(&snapshot_line(&s));
+        assert_eq!(v["settings_revision"], 9);
+        assert_eq!(v["settings_schema"], SETTINGS_SCHEMA);
+        assert_eq!(v["settings_schema"], 1);
+        // Not in a `state` line.
+        let v = parse(&state_line(&s, &["state"]));
+        assert!(v.get("settings_revision").is_none());
+        assert!(v.get("settings_schema").is_none());
     }
 }
