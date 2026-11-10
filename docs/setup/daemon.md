@@ -26,7 +26,7 @@ The package installs:
 - the unit `/usr/lib/systemd/user/omarchy-broadcastd.service`;
 - the D-Bus activation file `/usr/share/dbus-1/services/br.com.dias.OmarchyBroadcast.service`;
 - the licences and this documentation, in `/usr/share/doc/omarchy-broadcast/`;
-- the optional drop-ins as inactive examples in `/usr/share/doc/omarchy-broadcast/examples/systemd/` (`wireplumber.service.d/omarchy-broadcast.conf`, see "Discovery by PipeWire", and `omarchy-broadcastd.service.d/maxine.conf`, see [maxine.md](maxine.md#7a-the-daemon-systemd-user-unit)).
+- the optional drop-ins as inactive examples in `/usr/share/doc/omarchy-broadcast/examples/systemd/` (`wireplumber.service.d/omarchy-broadcast.conf`, see "Discovery by PipeWire", and `omarchy-broadcastd.service.d/maxine.conf`, see [maxine.md](maxine.md#3-enable-the-drop-in)).
 
 Nothing is enabled. Each user runs:
 
@@ -34,7 +34,7 @@ Nothing is enabled. Each user runs:
 systemctl --user enable --now omarchy-broadcastd
 ```
 
-The runtime dependencies include the NVIDIA driver userspace (`nvidia-utils`), `cuda` (NVRTC, used by GStreamer's CUDA converters), `gst-plugins-good`, `gst-plugins-bad-libs` and a v4l2loopback kernel module (for example `v4l2loopback-dkms`). The loopback device must still be configured as in [loopback.md](loopback.md). The NVIDIA Maxine VFX SDK is never part of the package; install it as in [maxine.md](maxine.md) (the os-release override described there still needs a source checkout).
+The runtime dependencies include the NVIDIA driver userspace (`nvidia-utils`), `cuda` (NVRTC, used by GStreamer's CUDA converters), `gst-plugins-good`, `gst-plugins-bad-libs` and a v4l2loopback kernel module (for example `v4l2loopback-dkms`). The loopback device must still be configured as in [loopback.md](loopback.md). The NVIDIA Maxine VFX SDK is never part of the package; it is an optional dependency (`optdepends`) on `maxine-vfx-sdk-local`, which you build yourself from the omarchy-nvidia-sdks repository and install as in [maxine.md](maxine.md).
 
 ### Per-user install from a checkout
 
@@ -49,7 +49,7 @@ The script builds the release binaries and installs, without root:
 - `omarchy-broadcastd` and `omarchy-broadcast` in `${XDG_BIN_HOME:-~/.local/bin}`;
 - the unit in `${XDG_DATA_HOME:-~/.local/share}/systemd/user/`, with `ExecStart=` pointing at the installed daemon;
 - the D-Bus activation file in `${XDG_DATA_HOME:-~/.local/share}/dbus-1/services/`;
-- optionally, the os-release shim for the Maxine backend, `os-release-shim.so` and `fake-os-release`, in `~/.local/lib/omarchy-broadcast/`: built when `make` and a C compiler are present, skipped with `--no-shim` (see [the os-release override](maxine.md#7-the-os-release-override));
+- nothing for the Maxine backend: the SDK, the os-release shim and the drop-in are described in [maxine.md](maxine.md). An older version of the script installed a shim in `~/.local/lib/omarchy-broadcast/`; `--uninstall` and a reinstall remove it;
 - a manifest, `install-user.manifest`, in `${XDG_STATE_HOME:-~/.local/state}/omarchy-broadcast/`, which lists every path written and the sha256 of each binary.
 
 Behaviour:

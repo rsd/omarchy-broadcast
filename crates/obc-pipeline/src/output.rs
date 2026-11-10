@@ -173,7 +173,9 @@ pub struct OutputConfig {
     /// [`GpuStage::Roundtrip`].
     pub effect: Option<EffectSettings>,
     /// The backend the effect element creates its instance with (default:
-    /// Maxine, from `MAXINE_VFX_ROOT`). Unused without [`Self::effect`].
+    /// Maxine, from `MAXINE_VFX_ROOT`, else the package's default root
+    /// ([`obc_backend_maxine::DEFAULT_ROOT`])). Unused without
+    /// [`Self::effect`].
     pub effect_backend: EffectBackend,
 }
 

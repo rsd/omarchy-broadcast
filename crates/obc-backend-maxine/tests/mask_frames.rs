@@ -68,7 +68,7 @@
 //!
 //! ```text
 //! OBC_MASK_FRAMES=/path/to/frames \
-//! CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env LD_PRELOAD=$PWD/target/os-release-shim/os-release-shim.so" \
+//! CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env LD_PRELOAD=$MAXINE_VFX_OS_RELEASE_SHIM" \
 //!   cargo test -p obc-backend-maxine --test mask_frames -- --ignored --nocapture
 //! ```
 
@@ -80,8 +80,8 @@ use obc_backend::{
     BackendFactory, ColourSpec, EffectKind, FrameParams, GpuContext, HostBgr, InferenceBackend,
     LoadRequest,
 };
+use obc_backend_maxine::MaxineFactory;
 use obc_backend_maxine::matte::{HARDENING_LUT, MATTE_HI, MATTE_LO, apply_lut};
-use obc_backend_maxine::{MaxineFactory, ROOT_ENV};
 use obc_gpu::{ContextGuard, DeviceNv12Buffer, OwnedContext, Stream};
 
 const W: usize = 1920;
@@ -119,13 +119,15 @@ const TOLERANCE: i32 = 1;
 /// above `MATTE_LO`, below `MATTE_HI`.
 const SOFT_BAND: RangeInclusive<u8> = MATTE_LO + 1..=MATTE_HI - 1;
 
+/// What a test needs before the factory can find the SDK.
+const SDK_HINT: &str = "this test needs the Maxine SDK: install the maxine-vfx-sdk-local package \
+     and load its environment (set -a; . /usr/share/maxine-vfx/maxine-vfx.env; set +a), or set \
+     MAXINE_VFX_ROOT, LD_LIBRARY_PATH and MAXINE_OS_RELEASE as omarchy-nvidia-sdks \
+     docs/usage.md describes";
+
 fn factory() -> MaxineFactory {
-    assert!(
-        std::env::var_os(ROOT_ENV).is_some_and(|v| !v.is_empty()),
-        "this test needs the Maxine SDK: set {ROOT_ENV} to its directory and put its library \
-         directories on LD_LIBRARY_PATH (source tools/maxine-probe/env.sh)"
-    );
     let f = MaxineFactory::from_env();
+    assert!(f.root().is_some(), "{SDK_HINT}");
     f.probe()
         .unwrap_or_else(|e| panic!("Maxine probe failed: {e}"));
     f

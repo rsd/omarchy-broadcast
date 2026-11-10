@@ -43,7 +43,7 @@ A dedicated process confines a plugin fault to that process, and starting, stopp
 - Its supported GPU list names datacenter and RTX PRO parts, no GeForce.
 - The download is gated through NGC (NVIDIA AI Enterprise or the NVIDIA Developer Program).
 - Using the discrete GPU for audio would wake it for every call, even with camera effects off ([ADR-0006](0006-on-demand-gpu-lifecycle.md)), for work a CPU core does.
-- The SDK bundles its own CUDA and TensorRT runtimes. They would need a separate worker process to avoid clashing with the video SDK's ([../setup/maxine.md](../setup/maxine.md), section 8).
+- The SDK bundles its own CUDA and TensorRT runtimes. They would need a separate worker process to avoid clashing with the video SDK's ([../setup/maxine.md](../setup/maxine.md), section 4).
 - Its licence terms forbid publishing benchmark results, which limits what this project could document.
 
 Revisit only after a local trial shows that AFX loads on the target GPU and is audibly better than DeepFilterNet. No AFX performance or latency figures are given here.

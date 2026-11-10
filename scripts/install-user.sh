@@ -2,11 +2,8 @@
 # install-user.sh — install omarchy-broadcast from this checkout for the current
 # user, without root.
 #
-# Builds the release binaries and the os-release shim, and installs:
+# Builds the release binaries and installs:
 #   omarchy-broadcastd, omarchy-broadcast -> ${XDG_BIN_HOME:-~/.local/bin}/
-#   os-release shim                       -> ~/.local/lib/omarchy-broadcast/os-release-shim.so
-#   its replacement os-release            -> ~/.local/lib/omarchy-broadcast/fake-os-release
-#                                            (from tools/maxine-probe/fake-os-release)
 #   systemd user unit                     -> ${XDG_DATA_HOME:-~/.local/share}/systemd/user/omarchy-broadcastd.service
 #                                            (from dist/, ExecStart pointing at the installed daemon)
 #   D-Bus activation file                 -> ${XDG_DATA_HOME:-~/.local/share}/dbus-1/services/br.com.dias.OmarchyBroadcast.service
@@ -18,16 +15,12 @@
 #   its systemd user unit template        -> ${XDG_DATA_HOME:-~/.local/share}/systemd/user/omarchy-broadcast-mic@.service
 #                                            (from dist/, ExecStart pointing at the installed configurations)
 #
-# The shim (tools/os-release-shim, an LD_PRELOAD library that makes only the
-# daemon's reads of /etc/os-release return the replacement file) is what the
-# NVIDIA Maxine SDK needs on a distribution it does not list. The directory
-# is fixed because it must match dist/systemd/omarchy-broadcastd.service.d/maxine.conf
-# (%h/.local/lib/omarchy-broadcast/...). By default the shim is built with `make`
-# and ${CC:-cc} whenever both are available, and skipped with a one-line note
-# when either is missing (not an error); a shim build that fails is an error
-# (exit 1, before anything is changed; use --no-shim to go on without it).
-# Installing the shim does not activate it: the Maxine drop-in is a manual
-# step, printed at the end.
+# Nothing for NVIDIA Maxine: the SDK and the os-release shim it needs come
+# from the maxine-vfx-sdk-local package (built from the omarchy-nvidia-sdks
+# repository), and the Maxine drop-in that uses them is a manual step,
+# printed at the end (docs/setup/maxine.md, section 3). An earlier version of
+# this script installed its own copy of the shim in
+# ~/.local/lib/omarchy-broadcast; a re-run removes that copy (see Ownership).
 #
 # It runs no systemctl command and enables nothing; it prints the next steps.
 # It does not install the WirePlumber drop-in, the Maxine drop-in or, without
@@ -39,29 +32,28 @@
 # Options:
 #   --dry-run    Print every action; build nothing, change nothing.
 #   --no-build   Build nothing: install the binaries already in
-#                ${CARGO_TARGET_DIR:-target}/release, and the shim already in
-#                ${CARGO_TARGET_DIR:-target}/os-release-shim/os-release-shim.so
-#                if it exists (otherwise skip the shim, with a note).
-#   --no-shim    Neither build nor install the shim. A shim installed by an
-#                earlier run stays in place and in the manifest, so
-#                --uninstall still removes it.
+#                ${CARGO_TARGET_DIR:-target}/release.
 #   --mic        Also install the noise-removed microphone (see above). Without
 #                it, microphone files installed by an earlier run stay in
 #                place and in the manifest, so --uninstall still removes them.
 #   --uninstall  Remove what this script installed, and only that, including
-#                ~/.local/lib/omarchy-broadcast and the microphone's
-#                ~/.local/share/omarchy-broadcast/pipewire and
-#                ~/.local/share/omarchy-broadcast once they are empty.
+#                the microphone's ~/.local/share/omarchy-broadcast/pipewire and
+#                ~/.local/share/omarchy-broadcast once they are empty, and the
+#                shim an earlier version installed (with
+#                ~/.local/lib/omarchy-broadcast once it is empty).
 #   -h, --help   Show this help.
 #
 # Ownership: every text file it writes carries a marker comment line, and the
-# manifest lists every path it wrote, with the sha256 of each binary, of the
-# shim and of fake-os-release (which carries no marker, so that it stays
-# byte-identical to the source). It overwrites or removes a text file only if
-# it carries the marker, and a binary, the shim or fake-os-release only if the
-# manifest lists it with the checksum of the file on disk.
+# manifest lists every path it wrote, with the sha256 of each binary. It
+# overwrites or removes a text file only if it carries the marker, and a
+# binary only if the manifest lists it with the checksum of the file on disk.
 # Any other file at a target path stops it before anything is changed.
-# Re-running it over its own install updates that install.
+# Re-running it over its own install updates that install. The shim files of
+# an earlier version (os-release-shim.so and fake-os-release, listed in its
+# manifest with their sha256) follow the binaries' rule: a re-run or
+# --uninstall removes them when the checksum matches. One that changed since
+# is left in place and listed: a re-run warns about it, and --uninstall
+# refuses it like a changed binary.
 #
 # Exit status: 0 done; 1 refused (a target path holds a file this script did
 # not install, or a unit is still enabled on --uninstall) or build failed;
@@ -70,8 +62,12 @@ set -euo pipefail
 
 MARKER='# Installed by omarchy-broadcast scripts/install-user.sh; remove with scripts/install-user.sh --uninstall'
 BINARIES=(omarchy-broadcastd omarchy-broadcast)
+# The os-release shim files an earlier version of this script installed in
+# ~/.local/lib/omarchy-broadcast. It installs them no more; they are only
+# removed, through the manifest of that version.
+LEGACY_SHIM=(os-release-shim.so fake-os-release)
 # File names whose ownership is the manifest checksum, not a marker line.
-SUMMED=("${BINARIES[@]}" os-release-shim.so fake-os-release)
+SUMMED=("${BINARIES[@]}" "${LEGACY_SHIM[@]}")
 UNIT_NAME=omarchy-broadcastd.service
 DBUS_NAME=br.com.dias.OmarchyBroadcast.service
 MIC_UNIT_NAME=omarchy-broadcast-mic@.service
@@ -90,14 +86,12 @@ warn() { printf 'install-user: warning: %s\n' "$*" >&2; }
 
 dry_run=0
 build=1
-want_shim=1
 want_mic=0
 mode=install
 while (($#)); do
   case $1 in
     --dry-run) dry_run=1; shift ;;
     --no-build) build=0; shift ;;
-    --no-shim) want_shim=0; shift ;;
     --mic) want_mic=1; shift ;;
     --uninstall) mode=uninstall; shift ;;
     -h | --help) usage; exit 0 ;;
@@ -127,25 +121,20 @@ bin_dir=$(xdg_dir XDG_BIN_HOME "$HOME/.local/bin")
 data_dir=$(xdg_dir XDG_DATA_HOME "$HOME/.local/share")
 state_dir=$(xdg_dir XDG_STATE_HOME "$HOME/.local/state")/omarchy-broadcast
 config_dir=$(xdg_dir XDG_CONFIG_HOME "$HOME/.config")
-# Absolute, as cargo resolves a relative CARGO_TARGET_DIR (against the cwd):
-# make runs in tools/os-release-shim, so a relative OUT would land elsewhere.
+# Absolute, as cargo resolves a relative CARGO_TARGET_DIR (against the cwd).
 target_dir=$(realpath -m -- "${CARGO_TARGET_DIR:-$repo/target}")
-# No XDG variable exists for this; it must match the Maxine drop-in.
-lib_dir=$HOME/.local/lib/omarchy-broadcast
 
 unit_src=$repo/dist/systemd/$UNIT_NAME
 dbus_src=$repo/dist/dbus-1/services/$DBUS_NAME
 unit_dst=$data_dir/systemd/user/$UNIT_NAME
 dbus_dst=$data_dir/dbus-1/services/$DBUS_NAME
 manifest=$state_dir/install-user.manifest
-shim_out=$target_dir/os-release-shim
-shim_built=$shim_out/os-release-shim.so
-fake_src=$repo/tools/maxine-probe/fake-os-release
-shim_dst=$lib_dir/os-release-shim.so
-fake_dst=$lib_dir/fake-os-release
 mic_unit_src=$repo/dist/systemd/$MIC_UNIT_NAME
 mic_unit_dst=$data_dir/systemd/user/$MIC_UNIT_NAME
 mic_conf_dir=$data_dir/omarchy-broadcast/pipewire
+maxine_src=$repo/dist/systemd/omarchy-broadcastd.service.d/maxine.conf
+# The user's Maxine drop-in, if any: only read, never written.
+maxine_dropin=$config_dir/systemd/user/omarchy-broadcastd.service.d/maxine.conf
 
 bin_dsts=()
 for b in "${BINARIES[@]}"; do bin_dsts+=("$bin_dir/$b"); done
@@ -185,10 +174,51 @@ is_binary_target() {
   return 1
 }
 
+# 0 if $1 is a shim file of an earlier version (by file name, as the
+# manifest lists it).
+is_legacy_shim() {
+  local b
+  for b in "${LEGACY_SHIM[@]}"; do [[ ${1##*/} == "$b" ]] && return 0; done
+  return 1
+}
+
+# Print the note for the shim of an earlier version, after "$1" (the
+# sentence that says it was, or with --dry-run would be, removed). A Maxine
+# drop-in that preloads it from ~/.local/lib/omarchy-broadcast gets a note
+# naming it; the drop-in itself is only read, never changed.
+legacy_shim_note() {
+  local intro=$1
+  if [[ -f $maxine_dropin ]] && grep -qF -- .local/lib/omarchy-broadcast "$maxine_dropin" 2>/dev/null; then
+    cat <<EOF
+
+$intro
+$(printf '%q' "$maxine_dropin")
+preloads that shim from ~/.local/lib/omarchy-broadcast, so it no longer
+works. Replace it with the current
+dist/systemd/omarchy-broadcastd.service.d/maxine.conf after installing the
+maxine-vfx-sdk-local package (docs/setup/maxine.md, section 3):
+  install -Dm644 $(printf '%q' "$maxine_src") $(printf '%q' "$maxine_dropin")
+or remove it:
+  rm $(printf '%q' "$maxine_dropin")
+then reload:
+  systemctl --user daemon-reload
+EOF
+  else
+    cat <<EOF
+
+$intro
+A Maxine drop-in that still points at it is out of date: replace it with the
+current dist/systemd/omarchy-broadcastd.service.d/maxine.conf, which uses the
+maxine-vfx-sdk-local package (docs/setup/maxine.md, section 3), or remove it.
+EOF
+  fi
+}
+
 # Manifest format, after the marker and comment lines: one path per line for
-# a text file, and "<sha256>  <path>" (sha256sum output) for a binary, the
-# shim and fake-os-release. A path
-# may appear with more than one checksum while an install is in progress.
+# a text file, and "<sha256>  <path>" (sha256sum output) for a binary (and,
+# in the manifest of an earlier version, the shim and fake-os-release). A
+# path may appear with more than one checksum while an install is in
+# progress.
 sha_re='^[0-9a-f]{64}  (/.*)$'
 
 # Print the path of a manifest line, or nothing for a comment line.
@@ -222,10 +252,9 @@ file_sum() {
 }
 
 # Ownership of an existing path: 0 if this script installed it. A text file
-# is ours if it carries the marker line, a binary (or the shim files) if the
-# manifest lists it
-# with the checksum of the file on disk. Sets WHY to the reason when it is
-# not ours.
+# is ours if it carries the marker line, a binary (or a legacy shim file) if
+# the manifest lists it with the checksum of the file on disk. Sets WHY to
+# the reason when it is not ours.
 owned() {
   local path=$1 sum
   WHY=""
@@ -248,16 +277,6 @@ owned() {
       WHY="it changed since install-user.sh installed it (its sha256 does not match $manifest); check it and remove it by hand if it is not needed"
     else
       WHY="not listed in $manifest (not installed by install-user.sh)"
-      case $path in
-        "$shim_dst" | "$fake_dst")
-          WHY+="; this looks like a shim installed by hand (following the manual setup docs). Either remove the hand-installed copies in $lib_dir (os-release-shim.so and fake-os-release) and re-run, or re-run with --no-shim to leave them alone"
-          if [[ $path == "$fake_dst" ]] && cmp -s -- "$path" "$fake_src"; then
-            WHY+=". It is identical to tools/maxine-probe/fake-os-release"
-          elif [[ $path == "$shim_dst" && -f $shim_built ]] && cmp -s -- "$path" "$shim_built"; then
-            WHY+=". It is identical to the shim at $shim_built"
-          fi
-          ;;
-      esac
     fi
     return 1
   fi
@@ -319,8 +338,9 @@ if [[ $mode == uninstall ]]; then
       [[ -n $path ]] && targets+=("$path")
     done <"$manifest"
   fi
-  # (The shim files are only ever removed through the manifest: a copy there
-  # that this script did not install is none of its business.)
+  # (The shim files of an earlier version are only ever removed through its
+  # manifest: a copy there that this script did not install is none of its
+  # business.)
   mapfile -t targets < <(printf '%s\n' "${targets[@]}" | sort -u)
 
   # Removing the file of an enabled unit leaves a dangling enable link:
@@ -359,13 +379,14 @@ if [[ $mode == uninstall ]]; then
     [[ -e $path ]] || continue
     run rm -f -- "$path"
     removed=1
+    if is_legacy_shim "$path"; then lib_dirs+=("${path%/*}"); fi
     case ${path##*/} in
-      os-release-shim.so | fake-os-release) lib_dirs+=("${path%/*}") ;;
       "$MIC_UNIT_NAME") mic_removed=1 ;;
       omarchy-broadcast-mic-*.conf) mic_removed=1 mic_dirs+=("${path%/*}") ;;
     esac
   done
-  # The library directory goes once it is empty (rmdir only removes an empty one).
+  # The legacy shim's library directory goes once it is empty (rmdir only
+  # removes an empty one).
   if ((${#lib_dirs[@]})); then
     while IFS= read -r path; do
       if [[ ${path##*/} == omarchy-broadcast ]]; then
@@ -400,13 +421,11 @@ Next steps (not run by this script):
   systemctl --user daemon-reload
 EOF
   if ((${#lib_dirs[@]})); then
-    cat <<EOF
-
-The os-release shim is gone. If you activated the Maxine drop-in, remove it
-too, since it now points at removed files:
-  rm $(printf '%q' "$config_dir/systemd/user/omarchy-broadcastd.service.d/maxine.conf")
-  systemctl --user daemon-reload
-EOF
+    if ((dry_run)); then
+      legacy_shim_note "The os-release shim of an earlier install-user.sh would be removed."
+    else
+      legacy_shim_note "The os-release shim of an earlier install-user.sh is gone."
+    fi
   fi
   if ((mic_removed)); then
     cat <<EOF
@@ -452,38 +471,14 @@ if ((want_mic)); then
     die "data dir '$data_dir' contains characters that would need escaping in ExecStart; set XDG_DATA_HOME to a plain path"
 fi
 
-# Whether to install the shim: wanted, and either buildable here (make and a
-# C compiler) or, with --no-build, already built.
-note() { printf 'install-user: note: %s\n' "$*"; }
-shim_tools() {
-  local cc
-  read -r cc _ <<<"${CC:-cc}"
-  command -v make >/dev/null 2>&1 && command -v "$cc" >/dev/null 2>&1
-}
-do_shim=0
-if ((want_shim)); then
-  if ((!build)); then
-    if [[ -f $shim_built ]]; then
-      do_shim=1
-    else
-      note "os-release shim skipped: --no-build and no $shim_built (build it with: make -C $(printf '%q' "$repo/tools/os-release-shim") OUT=$(printf '%q' "$shim_out"))"
-    fi
-  elif shim_tools; then
-    do_shim=1
-  else
-    note "os-release shim skipped: needs make and a C compiler (${CC:-cc}); install them (Arch: base-devel) and re-run, or see tools/os-release-shim/README.md"
-  fi
-fi
-if ((do_shim)); then
-  [[ -f $fake_src ]] || die "missing $fake_src"
-fi
-
 # Previously installed paths that still exist stay in the manifest, so
 # --uninstall finds them even if the XDG directories changed since. The
-# current targets are left out here and listed afresh below. The shim files
-# stay listed when this run does not install them (--no-shim, or skipped),
-# and so do the microphone files (no --mic).
-kept=()
+# current targets are left out here and listed afresh below. The microphone
+# files stay listed when this run does not install them (no --mic). The shim
+# files of an earlier version are removed below when they are still the
+# files it installed (owned), and left out of the manifest; one that changed
+# since stays in place and listed, so --uninstall still reports it.
+kept=() legacy_rm=()
 if [[ -f $manifest ]]; then
   while IFS= read -r line; do
     path=$(manifest_path "$line")
@@ -492,15 +487,21 @@ if [[ -f $manifest ]]; then
       "$unit_dst" | "$dbus_dst") continue ;;
     esac
     for dst in "${bin_dsts[@]}"; do [[ $path == "$dst" ]] && continue 2; done
-    if ((do_shim)) && [[ $path == "$shim_dst" || $path == "$fake_dst" ]]; then continue; fi
     for dst in "${mic_dsts[@]}"; do [[ $path == "$dst" ]] && continue 2; done
+    if is_legacy_shim "$path"; then
+      if owned "$path"; then
+        # Listed once per checksum while an install was in progress: once here.
+        for dst in "${legacy_rm[@]}"; do [[ $path == "$dst" ]] && continue 2; done
+        legacy_rm+=("$path")
+        continue
+      fi
+      warn "leaving $path in place: $WHY"
+    fi
     kept+=("$line")
   done <"$manifest"
 fi
 
-shim_dsts=()
-if ((do_shim)); then shim_dsts=("$shim_dst" "$fake_dst"); fi
-check_targets "${bin_dsts[@]}" "${shim_dsts[@]}" "$unit_dst" "$dbus_dst" "${mic_dsts[@]}" "$manifest"
+check_targets "${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "${mic_dsts[@]}" "$manifest"
 
 if ((build)); then
   run cargo build --manifest-path "$repo/Cargo.toml" --release --locked -p omarchy-broadcastd -p omarchy-broadcast || {
@@ -508,19 +509,22 @@ if ((build)); then
     exit 1
   }
 fi
-if ((do_shim && build)); then
-  run make -C "$repo/tools/os-release-shim" OUT="$shim_out" || {
-    printf 'install-user: building the os-release shim failed; nothing was changed (use --no-shim to install without it)\n' >&2
-    exit 1
-  }
-fi
 if ((!dry_run)); then
   for b in "${BINARIES[@]}"; do
     [[ -x $target_dir/release/$b ]] || die "no built binary at $target_dir/release/$b (run without --no-build)"
   done
-  if ((do_shim)); then
-    [[ -f $shim_built ]] || die "no built shim at $shim_built"
-  fi
+fi
+
+# The shim files of an earlier version go before the manifest is rewritten
+# without them, so an interrupted run leaves each one either removed or
+# still listed. Their directory goes once it is empty.
+if ((${#legacy_rm[@]})); then
+  run rm -f -- "${legacy_rm[@]}"
+  while IFS= read -r path; do
+    if [[ ${path##*/} == omarchy-broadcast ]]; then
+      run rmdir --ignore-fail-on-non-empty -- "$path"
+    fi
+  done < <(printf '%s\n' "${legacy_rm[@]%/*}" | sort -u)
 fi
 
 # The manifest text: its marker, the kept lines and the given lines.
@@ -535,12 +539,8 @@ srcs=() dsts=() modes=()
 for b in "${BINARIES[@]}"; do
   srcs+=("$target_dir/release/$b") dsts+=("$bin_dir/$b") modes+=(755)
 done
-if ((do_shim)); then
-  srcs+=("$shim_built" "$fake_src") dsts+=("$shim_dst" "$fake_dst") modes+=(755 644)
-fi
 
 run mkdir -p -- "$bin_dir"
-if ((do_shim)); then run mkdir -p -- "$lib_dir"; fi
 # Install beside the target, then rename: replacing a running binary in place
 # would fail with "Text file busy".
 old_sums=() new_sums=()
@@ -605,7 +605,6 @@ case ":${PATH:-}:" in
 esac
 
 wp_src=$repo/dist/systemd/wireplumber.service.d/omarchy-broadcast.conf
-maxine_src=$repo/dist/systemd/omarchy-broadcastd.service.d/maxine.conf
 done_msg="Installed."
 ((!dry_run)) || done_msg="Dry run: nothing was changed."
 cat <<EOF
@@ -624,16 +623,23 @@ camera (see $(printf '%q' "$wp_src")):
 The Omarchy bar plugin is a separate project: see the omarchy-broadcast-plugin
 repository and its README.
 EOF
-if ((do_shim)); then
-  cat <<EOF
+cat <<EOF
 
-Optional, NVIDIA Maxine video effects (the os-release shim is installed in
-$(printf '%q' "$lib_dir")): install the Maxine SDK as described in
-docs/setup/maxine.md, then activate the shim for the daemon only:
-  install -Dm644 $(printf '%q' "$maxine_src") $(printf '%q' "$config_dir/systemd/user/omarchy-broadcastd.service.d/maxine.conf")
+Optional, NVIDIA Maxine video effects (docs/setup/maxine.md, section 3):
+install the maxine-vfx-sdk-local package (built from the omarchy-nvidia-sdks
+repository), then run the daemon with it:
+  install -Dm644 $(printf '%q' "$maxine_src") $(printf '%q' "$maxine_dropin")
   systemctl --user daemon-reload
   systemctl --user restart omarchy-broadcastd
 EOF
+if ((${#legacy_rm[@]})); then
+  if ((dry_run)); then
+    legacy_shim_note "The os-release shim of an earlier install-user.sh would be removed: the
+maxine-vfx-sdk-local package provides it now."
+  else
+    legacy_shim_note "The os-release shim of an earlier install-user.sh was removed: the
+maxine-vfx-sdk-local package provides it now."
+  fi
 fi
 if ((want_mic)); then
   cat <<EOF

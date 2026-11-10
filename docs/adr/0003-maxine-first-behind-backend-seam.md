@@ -20,7 +20,7 @@
 ## Consequences
 - A TensorRT/ONNX backend can be added later without changing the pipeline or the elements.
 - Users must install Maxine themselves, which makes packaging harder. That is acceptable while no release is planned.
-- On an unsupported distribution the SDK's distribution check must be worked around per process ([../setup/maxine.md](../setup/maxine.md), step 7). The fallback is an Ubuntu container.
+- On an unsupported distribution the SDK's distribution check must be worked around per process ([../setup/maxine.md](../setup/maxine.md), section 3). The fallback is an Ubuntu container.
 
 ## Alternatives considered
 - TensorRT with open models (RVM, BiRefNet and similar): no vendor licence constraint, but more integration work and no vendor-tuned models. Kept as the second backend behind the same seam.

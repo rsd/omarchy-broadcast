@@ -1,17 +1,22 @@
 //! Hardware tests for the Maxine backend. All are `#[ignore]`: they need the
 //! NVIDIA Maxine Video Effects SDK (`MAXINE_VFX_ROOT`, its library
 //! directories on `LD_LIBRARY_PATH`), the os-release override on an unlisted
-//! distribution (the `tools/os-release-shim` preload library), and an NVIDIA
-//! GPU. Without them they fail; no test passes without running. From the
-//! repository root, after `make -C tools/os-release-shim`:
+//! distribution (the os-release shim preload library and `MAXINE_OS_RELEASE`),
+//! and an NVIDIA GPU. Without them they fail; no test passes without running.
+//! With the `maxine-vfx-sdk-local` package (built from omarchy-nvidia-sdks)
+//! installed, its environment file sets all of it:
 //!
 //! ```text
-//! export MAXINE_VFX_ROOT=~/.local/opt/maxine/VideoFX
-//! source tools/maxine-probe/env.sh
-//! export OMARCHY_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release
-//! CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env LD_PRELOAD=$PWD/target/os-release-shim/os-release-shim.so" \
+//! set -a; . /usr/share/maxine-vfx/maxine-vfx.env; set +a
+//! CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env LD_PRELOAD=$MAXINE_VFX_OS_RELEASE_SHIM" \
 //!   cargo test -p obc-backend-maxine --test hardware -- --ignored --test-threads=1 --nocapture
 //! ```
+//!
+//! With the package, `MAXINE_VFX_ROOT` may also be left unset: the factory
+//! then uses the package's tree, `/opt/nvidia/maxine/videofx`. For an SDK
+//! tree without the package, set `MAXINE_VFX_ROOT`, `LD_LIBRARY_PATH` and
+//! `MAXINE_OS_RELEASE` as omarchy-nvidia-sdks `docs/usage.md` describes, and
+//! give the runner that shim's path.
 //!
 //! The shim is preloaded through the cargo runner so that only the test
 //! binary gets it: `LD_PRELOAD=... cargo test` would be dropped by cargo.
@@ -37,7 +42,6 @@ use obc_backend::{
 use obc_backend_maxine::matte::{HARDENING_LUT, apply_lut};
 use obc_backend_maxine::{
     DenoiseFault, DenoiseFaultSwitch, MaskFault, MaskFaultSwitch, MaxineBackend, MaxineFactory,
-    ROOT_ENV,
 };
 use obc_gpu::{
     ContextGuard, DeviceNv12Buffer, OwnedContext, ParkOutcome, Stream, UnparkOutcome, mem_get_info,
@@ -49,13 +53,15 @@ const H: u32 = 1080;
 const FRAMES: usize = 100;
 const MIB: f64 = 1024.0 * 1024.0;
 
+/// What a test needs before the factory can find the SDK.
+const SDK_HINT: &str = "this test needs the Maxine SDK: install the maxine-vfx-sdk-local package \
+     and load its environment (set -a; . /usr/share/maxine-vfx/maxine-vfx.env; set +a), or set \
+     MAXINE_VFX_ROOT, LD_LIBRARY_PATH and MAXINE_OS_RELEASE as omarchy-nvidia-sdks \
+     docs/usage.md describes";
+
 fn factory() -> MaxineFactory {
-    assert!(
-        std::env::var_os(ROOT_ENV).is_some_and(|v| !v.is_empty()),
-        "this test needs the Maxine SDK: set {ROOT_ENV} to its directory and put its library \
-         directories on LD_LIBRARY_PATH (source tools/maxine-probe/env.sh)"
-    );
     let f = MaxineFactory::from_env();
+    assert!(f.root().is_some(), "{SDK_HINT}");
     f.probe()
         .unwrap_or_else(|e| panic!("Maxine probe failed: {e}"));
     f

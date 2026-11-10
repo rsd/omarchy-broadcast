@@ -330,7 +330,7 @@ cargo test -p obc-core -p obc-gpu -p obc-backend -p obc-backend-maxine -p gst-ob
 To show that nothing in this run depends on the SDK, run it with the SDK variables removed:
 
 ```sh
-env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u OMARCHY_BROADCAST_OS_RELEASE \
+env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u MAXINE_OS_RELEASE \
   cargo test -p obc-core -p obc-gpu -p obc-backend -p obc-backend-maxine -p gst-obc \
     -p obc-pipeline -p obc-ipc -p omarchy-broadcastd -p omarchy-broadcast
 ```
@@ -356,13 +356,11 @@ They also check the noise-removal stage with the fake backend: `none` with noise
 
 ### Maxine hardware tests
 
-These load the real SDK. They need `MAXINE_VFX_ROOT` and the SDK's library directories on `LD_LIBRARY_PATH` ([setup/maxine.md](setup/maxine.md), steps 6 to 8), and, on a distribution the SDK does not list, the os-release shim (step 7). Set `LD_PRELOAD` through the cargo runner, so that only the test binaries load the shim; `LD_PRELOAD=... cargo test` would be dropped by cargo:
+These load the real SDK. They need `MAXINE_VFX_ROOT` and the SDK's library directories on `LD_LIBRARY_PATH` ([setup/maxine.md](setup/maxine.md), sections 2 to 4), and, on a distribution the SDK does not list, the os-release shim. With `maxine-vfx-sdk-local` installed, the package's environment file sets all of that, and the shim is the package's. Set `LD_PRELOAD` through the cargo runner, so that only the test binaries load the shim; `LD_PRELOAD=... cargo test` would be dropped by cargo. With an SDK tree that is not the package, set `MAXINE_VFX_ROOT`, `LD_LIBRARY_PATH` and `MAXINE_OS_RELEASE` as the omarchy-nvidia-sdks documentation (`docs/usage.md`) describes. With the package installed the daemon's `MAXINE_VFX_ROOT` default (`/opt/nvidia/maxine/videofx`) also applies. The default test suite stays hermetic regardless, because none of its tests probes or loads the SDK through the environment: the tests that probe or load construct the factory with an explicit root or none (`MaxineFactory::with_root`), or inject a test factory, and the few that build the default factory only check its name and its fault switches. The `env -u` command above cannot show this on its own, because it does not disable the directory-based default root.
 
 ```sh
-make -C tools/os-release-shim
-source tools/maxine-probe/env.sh        # or your env.sh; sets MAXINE_VFX_ROOT and LD_LIBRARY_PATH
-export OMARCHY_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release
-export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env LD_PRELOAD=$PWD/target/os-release-shim/os-release-shim.so"
+set -a; . /usr/share/maxine-vfx/maxine-vfx.env; set +a    # MAXINE_VFX_ROOT, LD_LIBRARY_PATH, MAXINE_OS_RELEASE
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env LD_PRELOAD=$MAXINE_VFX_OS_RELEASE_SHIM"
 
 cargo test -p obc-gpu -p obc-backend-maxine -p gst-obc -- --ignored --test-threads=1
 OBC_TEST_CAMERA=046d:0944 OBC_TEST_SINK=/dev/video11 \
@@ -377,11 +375,11 @@ The frames in these tests are synthetic, so the mask the model produces for them
 
 ### Video noise removal
 
-The stage is tested at each level described above; this section lists what needs the SDK and its `nvvfxdenoising` feature and models ([setup/maxine.md](setup/maxine.md), steps 5 and 6; `features/nvvfxdenoising/lib` must be on `LD_LIBRARY_PATH`).
+The stage is tested at each level described above; this section lists what needs the SDK and its `nvvfxdenoising` feature and models ([setup/maxine.md](setup/maxine.md), sections 1 and 2; `features/nvvfxdenoising/lib` must be on `LD_LIBRARY_PATH`, which the package's environment file does).
 
 - **Backend** (`crates/obc-backend-maxine/tests/hardware.rs`, run with the command of [Maxine hardware tests](#maxine-hardware-tests)): `maxine_denoise_alone_removes_noise_from_a_flat_frame`, `maxine_denoise_switches_on_and_off_on_a_loaded_chain`, `maxine_denoise_before_blur_and_replace_gives_sane_output`, `maxine_denoise_reset_temporal_starts_a_new_video`, `maxine_denoise_strength_0_and_1_both_load_and_run`, `maxine_denoise_gpu_memory_returns_after_unload`, `maxine_denoise_faults_degrade_to_the_chain_without_it` (fault injection for the load and the run) and `maxine_denoise_loads_again_after_the_gpu_was_parked` (park and unpark, in its own process).
 - **Element** (`crates/gst-obc/tests/hardware.rs`): `maxine_denoise_alone_under_blur_and_toggled_while_playing`.
-- **Daemon** (`crates/omarchy-broadcastd/tests/hardware.rs`): `denoise_stacks_with_the_effect_while_streaming_and_the_gpu_parks` streams `none` with noise removal, adds `blur`, toggles, stops and checks that the GPU parks. It needs `OBC_TEST_SINK`, `OBC_TEST_CAMERA`, `OBC_TEST_PRELOAD` (with `OMARCHY_BROADCAST_OS_RELEASE`) and the Maxine environment, as the daemon effects test below, and a driver with the CUDA checkpoint API.
+- **Daemon** (`crates/omarchy-broadcastd/tests/hardware.rs`): `denoise_stacks_with_the_effect_while_streaming_and_the_gpu_parks` streams `none` with noise removal, adds `blur`, toggles, stops and checks that the GPU parks. It needs `OBC_TEST_SINK`, `OBC_TEST_CAMERA`, `OBC_TEST_PRELOAD` (with `MAXINE_OS_RELEASE`) and the Maxine environment, as the daemon effects test below, and a driver with the CUDA checkpoint API.
 - **Recorded frames** (`crates/obc-backend-maxine/tests/denoise_frames.rs`, ignored): runs the stage at both strengths over frames recorded from a real camera and writes the camera frame and each result as PPM images for comparison by eye, with the spatial and temporal noise logged. `OBC_DENOISE_FRAMES` names the directory of recorded sequences and `OBC_DENOISE_OUT` the directory for the images; the test fails without them.
 
   ```sh
@@ -460,22 +458,13 @@ OBC_TEST_SINK=/dev/video11 OBC_TEST_CAMERA=046d:0944 \
 `crates/omarchy-broadcastd/tests/hardware.rs::effects_switch_while_streaming_and_release_the_gpu` runs the real daemon like the lifecycle test above, and switches `blur`, `replace`, `none` and `blur` again while a consumer in another process reads the virtual camera. It checks the rate and the single caps negotiation at the consumer, the readiness time of each effect, the daemon's GPU memory in each phase, and that the GPU is released within seconds of the last consumer leaving. The daemon is a child process of the test, so the shim is passed to it explicitly, with `OBC_TEST_PRELOAD`, instead of through the cargo runner:
 
 ```sh
-source tools/maxine-probe/env.sh
-OMARCHY_BROADCAST_OS_RELEASE=$PWD/tools/maxine-probe/fake-os-release \
-OBC_TEST_PRELOAD=$PWD/target/os-release-shim/os-release-shim.so \
+set -a; . /usr/share/maxine-vfx/maxine-vfx.env; set +a
+OBC_TEST_PRELOAD=$MAXINE_VFX_OS_RELEASE_SHIM \
 OBC_TEST_SINK=/dev/video11 OBC_TEST_CAMERA=046d:0944 OBC_TEST_CAMERA_2=5986:1193 \
   cargo test -p omarchy-broadcastd --test hardware -- --ignored --test-threads=1 --nocapture
 ```
 
 Without `OBC_TEST_PRELOAD` the effects test fails with the daemon's `Error` text (`NvVFX_Load(GreenScreen) returned -1209 ...`), which shows that the variable is what makes it pass. With `--nocapture` the test prints, for each phase, the camera's fresh frame rate and whether the output clock was phase locked (the daemon logs this at debug level with `-v`).
-
-### The shim's own test
-
-```sh
-make -C tools/os-release-shim test
-```
-
-builds the library and runs `tools/os-release-shim/test.sh`: every interposed entry point, with and without the shim; that only a read-only open of exactly `/etc/os-release` is redirected; that ordinary programs (`cat`, `grep`, `python3`) and child processes are unaffected; that `LD_PRELOAD` is removed from the process environment; and that the process stays in the user's own namespaces. The test fails against a library that redirects nothing, so it cannot pass vacuously.
 
 ### Measured on the reference machine
 
