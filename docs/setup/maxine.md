@@ -21,7 +21,11 @@ It provides four stages ([../modules.md](../modules.md#the-manifest) explains th
 
 Check it with the CLI: `omarchy-broadcast modules` lists the module with its status and stages (a stage whose feature is not installed says `unavailable: Not installed`), and `omarchy-broadcast modules info br.com.dias.maxine-vfx` shows its manifest and library paths. Its settings are the `effect.*` settings of `omarchy-broadcast settings`.
 
-**From a checkout** (the developer install does not build or install the module): build it and put a manifest for it in your own `modules.d` directory, with `library` pointing at the library:
+**From a checkout**: `scripts/install-user.sh` builds the module and installs it for the current user, without root: the library in `~/.local/share/omarchy-broadcast/modules/` and a manifest in `~/.local/share/omarchy-broadcast/modules.d/`, whose `library` names that library. The module is installed whether or not the SDK is present; without the SDK it is listed greyed out, with the reason. Run the script again after a change to the module.
+
+A manifest in `~/.local/share/omarchy-broadcast/modules.d` replaces the packaged one of the same id. A module library that is rebuilt later takes a daemon restart to load (libraries are never unloaded); a changed manifest only needs a reload.
+
+A checkout that was not installed with the script (the cargo route of [daemon.md](daemon.md#manual-install)) can take the module by hand, with the recipe below. The script refuses to replace a manifest written this way, so remove it first when the script is used later (section 8):
 
 ```bash
 cargo build --release -p obc-module-maxine
@@ -32,8 +36,6 @@ sed "s|^library = .*|library = \"$lib\"|" crates/obc-module-maxine/maxine-vfx.to
     > ~/.local/share/omarchy-broadcast/modules.d/maxine-vfx.toml
 systemctl --user restart omarchy-broadcastd
 ```
-
-A manifest in `~/.local/share/omarchy-broadcast/modules.d` replaces the packaged one of the same id. A module library that is rebuilt later takes a daemon restart to load (libraries are never unloaded); a changed manifest only needs a reload.
 
 **Configuration.** The module takes one key, the SDK root, in its own table of `config.toml`:
 
@@ -220,7 +222,7 @@ Problems with the SDK itself (download, package, architecture) are in omarchy-nv
 | The drop-in has no effect: the daemon's environment lacks `LD_PRELOAD` | The file is not at `~/.config/systemd/user/omarchy-broadcastd.service.d/maxine.conf` (the directory name must match the unit), or `daemon-reload` was skipped | Check the path, run `systemctl --user daemon-reload`, restart, and check with `systemctl --user cat omarchy-broadcastd` |
 | An effect fails with a message that the SDK is already loaded from another place and asks for a restart | `sdk_root`, `[effect] maxine_root` (or `MAXINE_VFX_ROOT`) changed after the SDK was first loaded in the running daemon | `systemctl --user restart omarchy-broadcastd` (section 4) |
 | An effect reports that a feature library is not found (`-2`) or the package lacks a feature | The package was built without that feature | Rebuild `maxine-vfx-sdk-local` with the features of section 1 that you use (section 2), reinstall it and restart the daemon. The drop-in needs no edit |
-| `omarchy-broadcast modules` says `No effect modules installed`, or the settings have no effect group | The Maxine module's manifest is not in a `modules.d` directory: the package is not installed, or the checkout's module was never built and installed | Install the package, or follow "From a checkout" under [The Maxine module](#the-maxine-module); then `systemctl --user restart omarchy-broadcastd` |
+| `omarchy-broadcast modules` says `No effect modules installed`, or the settings have no effect group | The Maxine module's manifest is not in a `modules.d` directory: the package is not installed, or the checkout was not installed with `scripts/install-user.sh` (or the module was not built and installed by hand) | Install the package, or run `scripts/install-user.sh` in the checkout (see "From a checkout" under [The Maxine module](#the-maxine-module)); then `systemctl --user restart omarchy-broadcastd` |
 | The module is listed `unavailable`, with a reason such as `The library /... is not installed` or `Built for module ABI N; this daemon supports module ABI 1` | The library named by the manifest's `library` is missing, or was built for another version of the module interface than this daemon's | Check the paths with `omarchy-broadcast modules info br.com.dias.maxine-vfx`; rebuild and reinstall the module from the same checkout as the daemon |
 | The module is `disabled` with `Disabled after crashing the daemon twice in a row` | The module's code was running when the daemon went down twice in a row (see the journal for the crash) | Fix the cause (the SDK installation and the shim of section 3 are the usual ones), then `omarchy-broadcast modules enable br.com.dias.maxine-vfx` |
 | A setting such as `effect.lighting.relight` or `effect.video.denoise` is greyed "Not installed" | The package has no library, or no models for this GPU's architecture, for that feature (relighting also needs `nvvfxgreenscreen`) | `ls /opt/nvidia/maxine/videofx/features` and `ls /opt/nvidia/maxine/videofx/lib/models`; rebuild the package with the feature and your architecture (section 2). The daemon looks again at its next start, reload and session |
@@ -242,7 +244,13 @@ systemctl --user restart omarchy-broadcastd.service
 sudo pacman -R maxine-vfx-sdk-local
 ```
 
-Without the drop-in the daemon runs as usual and the effects are unavailable. To remove the Maxine module of a checkout install, delete its manifest and library (`~/.local/share/omarchy-broadcast/modules.d/maxine-vfx.toml` and `~/.local/lib/omarchy-broadcast/modules/libobc_module_maxine.so`) and restart the daemon; the packaged module goes with the omarchy-broadcast package, and `omarchy-broadcast modules disable br.com.dias.maxine-vfx` turns it off without removing it.
+Without the drop-in the daemon runs as usual and the effects are unavailable. To remove the Maxine module of a checkout installed with `scripts/install-user.sh`, run `scripts/install-user.sh --uninstall`: it removes the module's library and manifest, and the directories among them once they are empty. A module installed by hand (the recipe under "From a checkout") has a manifest without the script's mark, and the script refuses to remove it. Delete that manifest and the library it names first, then run the uninstall again:
+
+```bash
+rm -f ~/.local/share/omarchy-broadcast/modules.d/maxine-vfx.toml ~/.local/lib/omarchy-broadcast/modules/libobc_module_maxine.so
+```
+
+Restart the daemon after either. The packaged module goes with the omarchy-broadcast package, and `omarchy-broadcast modules disable br.com.dias.maxine-vfx` turns it off without removing it.
 
 An os-release shim installed by `scripts/install-user.sh` of an older omarchy-broadcast release, under `~/.local/lib/omarchy-broadcast/`, is removed by `scripts/install-user.sh --uninstall` of the current script, and by reinstalling with it. To remove it by hand: `rm -f ~/.local/lib/omarchy-broadcast/os-release-shim.so ~/.local/lib/omarchy-broadcast/fake-os-release`.
 

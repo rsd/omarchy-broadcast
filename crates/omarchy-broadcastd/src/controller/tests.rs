@@ -323,6 +323,35 @@ fn disabled_in_the_state_file_starts_off_with_the_writer_running() {
 }
 
 #[test]
+fn loading_the_modules_moves_the_serial_the_empty_list_had() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths {
+        config: dir.path().join("none.toml"),
+        state: dir.path().join("state").join("state.toml"),
+        cache: None,
+        runtime: None,
+        ledger: None,
+    };
+    let fake = FakeBackend::default();
+    fake.world().cameras = vec![alpha()];
+    let (published, mut notes) = Published::new(preliminary_snapshot(&paths));
+    let mut ctrl =
+        Controller::new_without_modules(fake.clone(), paths, published, None, Instant::now());
+    let empty = ctrl.snapshot().modules_serial.unwrap();
+    while notes.try_recv().is_ok() {}
+    ctrl.load_modules(Instant::now());
+    let loaded = ctrl.snapshot().modules_serial.unwrap();
+    assert_ne!(loaded, empty, "the list that arrives is a change");
+    let mut announced = false;
+    while let Ok(n) = notes.try_recv() {
+        if let Note::Changed(c) = n {
+            announced |= c.contains(&Change::ModulesSerial(loaded));
+        }
+    }
+    assert!(announced, "the change is announced");
+}
+
+#[test]
 fn a_short_open_never_starts_the_camera() {
     let mut h = H::new("", |_| {});
     h.consumers(1, 0);

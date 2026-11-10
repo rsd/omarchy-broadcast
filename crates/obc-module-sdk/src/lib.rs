@@ -71,6 +71,14 @@
 //! same time from different threads. Hence `Module: Send + Sync` and
 //! `Instance: Send`. State shared between the module and its instances
 //! belongs in an `Arc` (with its own locking) handed to each instance.
+//!
+//! # Stability
+//!
+//! The ABI this crate wraps (ABI 1.x, [`abi`]) is not yet declared stable.
+//! Until it is, it may change in breaking ways, even without a change of the
+//! major version. A module built with this crate may therefore need
+//! rebuilding, against the matching release of this crate, after an update
+//! of omarchy-broadcast.
 
 pub use obc_module_abi as abi;
 /// Re-exported so a module needs no direct dependency to read its

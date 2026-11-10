@@ -2,7 +2,7 @@
 
 The effects of omarchy-broadcast are provided by **modules**: a TOML manifest and a shared library that exports a versioned C ABI. The daemon finds the manifests, loads the libraries of the modules that are enabled, and shows the settings each module describes in its clients, with no change to them. This page is the reference for module authors and for people who install modules. The design and the reasons for it are in [ADR-0025](adr/0025-loadable-modules.md); the daemon's side is in [architecture.md](architecture.md#modules), the D-Bus members in [dbus-api.md](dbus-api.md#modules) and the CLI in [cli-json.md](cli-json.md#modules-and-order).
 
-The module interface is **ABI 1.0, and it is not frozen**: no module outside this repository exists yet, so a promise of stability (when a major version changes, and what a minor version may add) has not been made. The version rules the host enforces are in [The ABI](#the-abi-and-the-sdk).
+The module interface is **ABI 1.x (1.0 at present), and it is not yet declared stable**: until it is, it may change in breaking ways, so a module built outside this repository may need rebuilding against the matching SDK or header after an update of omarchy-broadcast. No module outside this repository exists yet, so a promise of stability (when a major version changes, and what a minor version may add) has not been made. The version rules the host enforces are in [The ABI](#the-abi-and-the-sdk), and they are unchanged by this.
 
 Where to look:
 
@@ -108,7 +108,7 @@ The daemon reads manifests from these directories, in order; a later directory o
 
 Discovery reads manifests and nothing else: no library is opened, so a broken library cannot stop the daemon from starting. The daemon looks again at its start and on `SIGHUP` or `ReloadConfig`. A library is opened for a module that is **enabled** (all are, except the ones the configuration's `[modules] disabled`, the user, or the crash ledger disabled): `omarchy-broadcast modules enable|disable ID`.
 
-The Arch package installs the Maxine module as `/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so` with its manifest, `maxine-vfx.toml`, in `/usr/lib/omarchy-broadcast/modules.d` (the manifest names the library by absolute path). A module you build yourself goes in your own `modules.d`, with `library` relative to the manifest or absolute.
+The Arch package installs the Maxine module as `/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so` with its manifest, `maxine-vfx.toml`, in `/usr/lib/omarchy-broadcast/modules.d` (the manifest names the library by absolute path). `scripts/install-user.sh` in a checkout builds the Maxine module and installs it for the current user, in `~/.local/share/omarchy-broadcast/modules/` with a manifest in `~/.local/share/omarchy-broadcast/modules.d/`, which replaces the packaged manifest of the same id. A module you build yourself goes in your own `modules.d`, with `library` relative to the manifest or absolute.
 
 **A rebuilt library needs a daemon restart.** Libraries are opened with `RTLD_NODELETE` and are never unloaded: a module may hold process-wide state that must outlive a reload, and code it started must never run unmapped. A library rebuilt at the same path is therefore not loaded again while the daemon runs; the code first loaded stays. A new or changed manifest, or a library at another path, is picked up on a reload; for a rebuilt library, run `systemctl --user restart omarchy-broadcastd`.
 
@@ -135,6 +135,8 @@ A module library exports two C symbols:
 | `const obc_module_vtable *obc_module_entry(const obc_host *host)` | Takes the host's description (its ABI version and a log callback) and returns the module's vtable, or null to refuse the host |
 
 **Version rules.** The host refuses a library whose major version is not its own, and one built for a **newer minor** version than its own, each with a reason naming both versions; the entry point is not called then. A library built for an older minor version of the same major version loads. A structure that can grow starts with `struct_size`, and a reader reads a field only when it fits in `struct_size`; vtable entries and fields are only ever appended; a vtable at least as large as that of ABI 1.0 is accepted, and an entry past its `struct_size` counts as not set. A boolean crossing the boundary is a `uint8_t`.
+
+**Stability.** The version numbers are the host's check, not yet a promise. ABI 1.x may still change in breaking ways, even without a change of the major version, until it is declared stable and its stability promise is stated (see [ADR-0025](adr/0025-loadable-modules.md)). A module built for one release of omarchy-broadcast may therefore need rebuilding, against the `obc-module-sdk` or the header of the matching release, after an update. The checks above are unchanged: a library of another major version, or of a newer minor version, is still refused with its reason.
 
 **The vtable** (every entry is a nullable function pointer; the header says which are required):
 

@@ -45,6 +45,15 @@ pub struct CrashLedger {
     load_error: Option<String>,
 }
 
+/// The directory that holds `path`: for a bare file name, whose parent is
+/// empty, the current directory.
+fn directory_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
 impl CrashLedger {
     /// The ledger in `path` (which need not exist yet). A file that cannot
     /// be read or parsed counts as empty, and says why
@@ -89,7 +98,7 @@ impl CrashLedger {
     }
 
     fn save(&self) -> std::io::Result<()> {
-        let dir = self.path.parent().unwrap_or(Path::new("."));
+        let dir = directory_of(&self.path);
         std::fs::create_dir_all(dir)?;
         let name = self
             .path
@@ -197,6 +206,13 @@ impl CrashLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bare_file_name_lives_in_the_current_directory() {
+        assert_eq!(directory_of(Path::new("crash-ledger")), Path::new("."));
+        assert_eq!(directory_of(Path::new("a/crash-ledger")), Path::new("a"));
+        assert_eq!(directory_of(Path::new("/crash-ledger")), Path::new("/"));
+    }
 
     const M: &str = "org.x.crashy";
 
