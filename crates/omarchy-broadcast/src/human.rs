@@ -609,6 +609,7 @@ mod tests {
             settings_schema_serial: None,
             modules_serial: None,
             backend_profile: None,
+            config_serial: None,
             interface_revision: 3,
         }
     }

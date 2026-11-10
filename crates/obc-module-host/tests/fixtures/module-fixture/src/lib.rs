@@ -23,7 +23,8 @@
 //!   `background`;
 //! * a temporal reset drops `beta`;
 //! * every load and frame is logged at info level (`fixture-load ...`,
-//!   `fixture-process ...`), so a test can read what crossed the ABI.
+//!   `fixture-process ...`), and every settings description
+//!   (`fixture-settings`), so a test can read what crossed the ABI.
 //!
 //! With a feature, the library exports another ABI version (or refuses the
 //! host) by hand, and its entry point aborts the process if it is called.
@@ -134,6 +135,7 @@ mod module {
         }
 
         fn settings(&self) -> SettingsDescription {
+            log::info!("fixture-settings");
             let mut g = Group::new("fixture", "Fixture")
                 .setting(
                     Setting::bool("effect.fixture.alpha", "Alpha", false)

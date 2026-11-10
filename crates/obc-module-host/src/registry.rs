@@ -367,7 +367,10 @@ impl Registry {
     /// Opens and probes module `id`, with `config` (its configuration
     /// table, `{}` when none) and its log lines to `log`, unless it is
     /// disabled, cannot be loaded, or is open already. A failure becomes
-    /// its status.
+    /// its status. A probed module is asked for its settings description
+    /// once, which [`Module::cached_settings`] then holds (the backend
+    /// factory checks parameters against it); a description that fails is
+    /// logged, the module kept.
     pub fn open(
         &mut self,
         id: &str,
@@ -388,6 +391,9 @@ impl Registry {
             }
             Ok(module) => match module.probe() {
                 Ok(stages) => {
+                    if let Err(e) = module.settings() {
+                        log(id, LogLevel::Warn, &format!("no settings description: {e}"));
+                    }
                     r.opened = Opened::Probed(stages);
                     r.module = Some(module);
                 }

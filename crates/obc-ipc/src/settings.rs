@@ -646,21 +646,21 @@ pub(crate) fn entries_of<'v, 'a>(v: &'v Variant<'a>) -> Option<Entries<'v, 'a>> 
     }
 }
 
-fn peel<'v, 'a>(mut v: &'v Variant<'a>) -> &'v Variant<'a> {
+pub(crate) fn peel<'v, 'a>(mut v: &'v Variant<'a>) -> &'v Variant<'a> {
     while let Variant::Variant(inner) = v {
         v = inner;
     }
     v
 }
 
-fn bool_of(v: &Variant<'_>) -> Option<bool> {
+pub(crate) fn bool_of(v: &Variant<'_>) -> Option<bool> {
     match peel(v) {
         Variant::Bool(b) => Some(*b),
         _ => None,
     }
 }
 
-fn int_of(v: &Variant<'_>) -> Option<i64> {
+pub(crate) fn int_of(v: &Variant<'_>) -> Option<i64> {
     match peel(v) {
         Variant::U8(x) => Some(i64::from(*x)),
         Variant::I16(x) => Some(i64::from(*x)),
@@ -673,7 +673,7 @@ fn int_of(v: &Variant<'_>) -> Option<i64> {
     }
 }
 
-fn str_of<'v>(v: &'v Variant<'_>) -> Option<&'v str> {
+pub(crate) fn str_of<'v>(v: &'v Variant<'_>) -> Option<&'v str> {
     match peel(v) {
         Variant::Str(s) => Some(s.as_str()),
         _ => None,
@@ -687,7 +687,7 @@ pub(crate) fn list_of<'v, 'a>(v: &'v Variant<'a>) -> Option<&'v [Variant<'a>]> {
     }
 }
 
-fn fields_of<'v, 'a>(v: &'v Variant<'a>) -> Option<&'v [Variant<'a>]> {
+pub(crate) fn fields_of<'v, 'a>(v: &'v Variant<'a>) -> Option<&'v [Variant<'a>]> {
     match peel(v) {
         Variant::Structure(s) => Some(s.fields()),
         _ => None,

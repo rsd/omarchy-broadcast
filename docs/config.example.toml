@@ -12,11 +12,39 @@
 # $XDG_STATE_HOME/omarchy-broadcast/state.toml instead, and take precedence
 # over the values here.
 #
+# The configuration is this file followed by the drop-in files in the
+# config.d directory next to it (~/.config/omarchy-broadcast/config.d/):
+# every regular file whose name ends in .toml and does not start with a dot,
+# read in order of the file name. A later file overrides an earlier one key
+# by key: a table merges, and any other value (a number, a string, a list) is
+# replaced whole. A drop-in holds the same keys as this file, each optional.
+# Put your own overrides in a file that sorts late, such as
+# config.d/90-local.toml.
+#
+# One drop-in is managed by the daemon: config.d/50-panel.toml, which the
+# bar's setup dialog and `omarchy-broadcast config set` write (through the
+# SetConfig D-Bus method), together with the module choices (the enabled
+# modules, the stage order, the backend profile and the pins, from
+# `omarchy-broadcast modules ...` and `order ...`). Do not edit it by hand:
+# the daemon writes it whole, from the choices made through it. It never
+# writes this file or any other. A key that a file after 50-panel.toml sets,
+# such as 90-local.toml, wins over it, and the daemon refuses to change that
+# key ("Overridden by config.d/90-local.toml"); remove it from that file to
+# change it again. The keys the dialog and `omarchy-broadcast config set`
+# can change are: [camera] fixed_framerate; [output] format, aspect,
+# hold_timeout_s and input_gap_ms; [lifecycle] idle_grace_s and
+# start_debounce_ms; [effect] on_failure; [pipewire] enabled and offer_nv12;
+# and in [modules] profile, enabled.<id> and pin.<stage>. Everything else,
+# including the [effect] defaults (which a choice made in the panel overrides),
+# is set here. `omarchy-broadcast config show` lists every key with the file
+# that sets it, and `omarchy-broadcast config files` the files.
+#
 # Reload after editing by sending SIGHUP to the daemon
 # (`systemctl --user kill -s HUP omarchy-broadcastd`) or with the ReloadConfig()
-# D-Bus method (docs/dbus-api.md). An invalid file
-# is rejected as a whole: the previous configuration stays in force and the
-# reason (file, line, key) is reported in the daemon's Error property.
+# D-Bus method (docs/dbus-api.md); a change to a file is not seen before. An
+# invalid file is rejected as a whole: the previous configuration stays in
+# force and the reason (file, line, key) is reported in the daemon's Error
+# property.
 #
 # As shipped, this file sets every key to its default: keys whose example
 # value differs from the default are commented out. Remove the leading "# "
@@ -269,31 +297,44 @@ offer_nv12 = true
 # Default: none. Example:
 # dirs = ["/home/user/omarchy-modules"]
 
-# Modules not to load, by module id. `omarchy-broadcast modules enable|disable`
-# overrides this at run time (kept in the state file). A module that took the
-# daemon down twice in a row is disabled until it is enabled again.
+# Modules not to load, by module id. A module that took the daemon down twice
+# in a row is disabled until it is enabled again.
 # Default: none. Example:
 # disabled = ["org.example.hello"]
+
+# Modules to load or not, one entry per module id: true or false. This is what
+# `omarchy-broadcast modules enable|disable ID` and the setup dialog write (to
+# config.d/50-panel.toml); you can set it by hand too. For a module it names,
+# it beats the `disabled` list, in whichever file the list is, so a module
+# switched on in the dialog stays on though `disabled` lists it: reset it
+# (`omarchy-broadcast config reset modules.enabled.ID`) or set it false.
+# Default: none. Example (a table; indented so as not to read as a key):
+#   [modules.enabled]
+#   "org.example.hello" = true
 
 # The order of the effect stages, by stage id: every stage the enabled modules
 # offer, once each, within the limits each declares (a stage that needs the
 # cut-out after it, for example). Unset: by slot (before the cut-out, the
 # cut-out, after it, after the composite), then each stage's preferred
 # position. An order that does not fit the modules found is replaced by the
-# default one, with a warning. `omarchy-broadcast order set` overrides it.
+# default one, with a warning. `omarchy-broadcast order set` and the setup
+# dialog's order section write it to config.d/50-panel.toml.
 # Default: unset. Example:
 # order = ["enhance", "denoise", "background", "relight"]
 
 # Which module provides a stage that several offer: "quality" (the highest
 # rank) or "battery" (an NPU first, then the CPU, then a GPU). The choice is
 # made when the camera starts and never changes while it runs.
-# `omarchy-broadcast modules profile` overrides it.
+# `omarchy-broadcast modules profile` and the setup dialog write it to
+# config.d/50-panel.toml.
 # Default: "quality"
 # profile = "quality"
 
 # The module that provides a stage, by stage id, whatever the profile says,
 # while it can (otherwise the profile decides, and the module list says why).
-# `omarchy-broadcast modules pin` overrides it.
+# `omarchy-broadcast modules pin` and the setup dialog write it to
+# config.d/50-panel.toml; an empty module (pin = { background = "" }) means
+# automatic, and in a later file clears the pin of an earlier one.
 # Default: none. Example:
 # pin = { background = "br.com.dias.maxine-vfx" }
 

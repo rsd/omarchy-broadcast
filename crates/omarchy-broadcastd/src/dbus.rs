@@ -7,7 +7,8 @@
 //! that step, so a short-lived state such as `starting` is announced too),
 //! `Stats`, `PreviewFrame` and `SettingsChanged` signals (the last after
 //! the `SettingsRevision` change of the same step, so a client reading the
-//! property on the signal sees its revision). [`run_owner_watch`] follows the
+//! property on the signal sees its revision) and `ConfigChanged` (after the
+//! `ConfigSerial` change). [`run_owner_watch`] follows the
 //! unique names leaving the bus, which ends their preview leases.
 //!
 //! A preview lease belongs to the caller's unique bus name (the message
@@ -36,7 +37,8 @@ use zbus::proxy::CacheProperties;
 use zbus::{Connection, OwnedVariant, interface};
 
 use crate::controller::{
-    Change, Command, ControlsReply, Note, PathReply, Published, Reply, SettingsReply,
+    Change, Command, ConfigFilesReply, ConfigSchemaReply, ControlsReply, MovesReply, Note,
+    PathReply, Published, Reply, SettingsReply,
 };
 
 /// The D-Bus object (see the module docs).
@@ -128,7 +130,8 @@ impl Server {
         self.call(Command::NextCamera).await
     }
 
-    /// Re-reads the configuration file (same as SIGHUP).
+    /// Re-reads the configuration files, `config.toml` then `config.d/`
+    /// (same as SIGHUP).
     async fn reload_config(&self) -> Result<(), IpcError> {
         self.call(|r| Command::ReloadConfig(Some(r))).await
     }
@@ -327,6 +330,70 @@ impl Server {
             .await
     }
 
+    /// The stage order in force with the moves the daemon accepts
+    /// (revision 10): each stage as `(id, slot, up, down)`, `up` / `down`
+    /// whether `SetStageOrder` would accept the order with the stage
+    /// swapped with the one before / after it.
+    async fn get_stage_order_moves(&self) -> Result<Vec<(String, String, bool, bool)>, IpcError> {
+        let moves = self
+            .ask(|reply: MovesReply| Command::GetStageOrderMoves(reply))
+            .await?;
+        Ok(moves
+            .into_iter()
+            .map(|m| (m.id, m.slot, m.up, m.down))
+            .collect())
+    }
+
+    /// The config schema (revision 10): `(serial, groups)`, `serial` being
+    /// `ConfigSerial` when it was made, each group a dictionary
+    /// (`obc_ipc::config`).
+    #[zbus(out_args("serial", "groups"))]
+    async fn get_config_schema(&self) -> Result<(u32, Vec<VariantDict>), IpcError> {
+        let schema = self
+            .ask(|reply: ConfigSchemaReply| Command::GetConfigSchema(reply))
+            .await?;
+        Ok(schema.to_wire())
+    }
+
+    /// Sets the configuration key `key` (revision 10): checked as a load
+    /// would check the result, written to `config.d/50-panel.toml`, then
+    /// applied as a reload would apply it. Refused with `UnknownSetting`
+    /// (no such key), `Disabled` (read only, or "Overridden by
+    /// config.d/<file>"), `InvalidArgument` (the value), `InvalidConfig`
+    /// (another file does not load) or `Failed` (the managed file cannot
+    /// be read or written).
+    async fn set_config(&self, key: String, value: OwnedVariant) -> Result<(), IpcError> {
+        let value = obc_ipc::ConfigValue::from_variant(&value);
+        self.call(|reply| Command::SetConfig(key, value, reply))
+            .await
+    }
+
+    /// Removes the key `key` from `config.d/50-panel.toml` (revision 10),
+    /// so that an earlier file's value (or the default) is in force; the
+    /// refusals of `SetConfig`.
+    async fn reset_config(&self, key: String) -> Result<(), IpcError> {
+        self.call(|reply| Command::ResetConfig(key, reply)).await
+    }
+
+    /// The configuration files in load order as they are now (revision
+    /// 10): `(serial, dir, files)`, each file `(path, status, managed,
+    /// reason)`, `path` relative to `dir`, status `loaded`, `absent` or
+    /// `error`.
+    #[zbus(out_args("serial", "dir", "files"))]
+    async fn get_config_files(
+        &self,
+    ) -> Result<(u32, String, Vec<(String, String, bool, String)>), IpcError> {
+        let files = self
+            .ask(|reply: ConfigFilesReply| Command::GetConfigFiles(reply))
+            .await?;
+        Ok(files.to_wire())
+    }
+
+    /// The configuration in force, its files or the config schema changed;
+    /// `serial` is the new `ConfigSerial` (revision 10).
+    #[zbus(signal)]
+    pub async fn config_changed(emitter: &SignalEmitter<'_>, serial: u32) -> zbus::Result<()>;
+
     /// The settings tree changed: one signal per operation, each setting
     /// whose value, `stored`, `enabled` or reason changed; empty when
     /// `serial` moved (the client calls `GetSettings`) (revision 7).
@@ -473,6 +540,14 @@ impl Server {
             .unwrap_or_else(|| "quality".into())
     }
 
+    /// Bumped whenever what `GetConfigSchema` or `GetConfigFiles` returns
+    /// changes through the daemon (a write, a reload, the modules found);
+    /// from 1 (revision 10).
+    #[zbus(property)]
+    fn config_serial(&self) -> u32 {
+        self.snap().config_serial.unwrap_or(1)
+    }
+
     #[zbus(property)]
     fn interface_revision(&self) -> u32 {
         self.snap().interface_revision
@@ -519,7 +594,8 @@ async fn emit_change(emitter: &SignalEmitter<'_>, change: &Change) -> zbus::Resu
         | Change::PreviewConsumers(v)
         | Change::SettingsRevision(v)
         | Change::SettingsSchemaSerial(v)
-        | Change::ModulesSerial(v) => emit_changed(emitter, name, v).await,
+        | Change::ModulesSerial(v)
+        | Change::ConfigSerial(v) => emit_changed(emitter, name, v).await,
         Change::CameraControls(v) => emit_changed(emitter, name, v).await,
     }
 }
@@ -561,6 +637,7 @@ pub async fn run_publisher(conn: Connection, mut notes: UnboundedReceiver<Note>)
                 let changes: Vec<WireChange> = changes.iter().map(|c| c.to_wire()).collect();
                 Server::settings_changed(&emitter, *revision, *serial, changes).await
             }
+            Note::ConfigChanged(serial) => Server::config_changed(&emitter, *serial).await,
         };
         if let Err(e) = res {
             crate::debug!("emitting a signal failed: {e}");

@@ -249,16 +249,18 @@ and run `systemctl --user restart wireplumber`. Applications that open `/dev/vid
 
 The configuration is `~/.config/omarchy-broadcast/config.toml` (`$XDG_CONFIG_HOME/omarchy-broadcast/config.toml`). It is optional: a missing file means the defaults. [config.example.toml](../config.example.toml) lists every key with its default and a comment. The daemon never writes this file.
 
+After it the daemon reads the files of `~/.config/omarchy-broadcast/config.d/` (every file ending in `.toml`, in order of the file name), each overriding the earlier ones key by key. Put your own overrides in a file that sorts late, such as `config.d/90-local.toml`. One file there is the daemon's: `config.d/50-panel.toml`, which it writes when a setting is changed through it (the bar's setup dialog, `omarchy-broadcast config set`, `modules enable|disable|profile|pin`, `order set`) and which starts with a comment that says so. Do not edit it by hand. A key that a file after it sets, such as `90-local.toml`, wins, and the daemon refuses to change that key until it is removed from that file. `omarchy-broadcast config show` lists every key with the file that sets it, and `omarchy-broadcast config files` the files in load order. See [config.example.toml](../config.example.toml) and [ADR-0026](../adr/0026-config-d-and-managed-config.md).
+
 After editing it, reload without restarting:
 
 ```sh
 systemctl --user reload omarchy-broadcastd     # sends SIGHUP
-omarchy-broadcast status                       # shows Error: if the file was rejected
+omarchy-broadcast status                       # shows Error: if a file was rejected
 ```
 
-`busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast br.com.dias.OmarchyBroadcast1 ReloadConfig` does the same and returns the reason on failure. An invalid file is rejected as a whole: the previous configuration stays in force and the `Error` property names the file, line and key.
+`busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast br.com.dias.OmarchyBroadcast1 ReloadConfig` does the same and returns the reason on failure. An invalid file, in `config.toml` or in `config.d/`, is rejected as a whole: the previous configuration stays in force and the `Error` property names the file, line and key. The files are read at start and on a reload, not when they change.
 
-Settings changed while the daemon runs (`omarchy-broadcast on` / `off`, the camera selection, the video effect with its blur strength and background image, and the stages noise removal, enhancement and relighting with its light, direction and brightness, the settings of any module, and the choices of modules: which are enabled, the stage order, the backend profile and the pins) are kept in a separate state file, `~/.local/state/omarchy-broadcast/state.toml` (`$XDG_STATE_HOME/omarchy-broadcast/state.toml`), so that `config.toml` keeps its comments and layout. The state file is written by the daemon. If the state file cannot be read, the daemon starts `off` and says why in `Error`: privacy fails closed.
+Settings changed while the daemon runs (`omarchy-broadcast on` / `off`, the camera selection, the video effect with its blur strength and background image, and the stages noise removal, enhancement and relighting with its light, direction and brightness, and the settings of any module) are kept in a separate state file, `~/.local/state/omarchy-broadcast/state.toml` (`$XDG_STATE_HOME/omarchy-broadcast/state.toml`), so that `config.toml` keeps its comments and layout. The state file is written by the daemon. The choices of modules (which are enabled, the stage order, the backend profile and the pins) are configuration and are kept in `config.d/50-panel.toml`; a state file written by the 0.24 daemon, which kept them in its `[modules]` table, is moved there when the daemon first loads. A daemon of 0.24 ignores `config.d`, so after a downgrade it sees only what `config.toml` says of the modules. If the state file cannot be read, the daemon starts `off` and says why in `Error`: privacy fails closed.
 
 What the daemon has learnt about the GPU (its CUDA compute capability, which picks the models made for it, so that it can tell which SDK features are installed without waking the GPU) is kept in `~/.cache/omarchy-broadcast/compute-capability` (`$XDG_CACHE_HOME/omarchy-broadcast/compute-capability`). It is a cache, not a setting: delete it and the daemon learns it again at its next session.
 
@@ -266,7 +268,7 @@ The crash ledger of the modules ([../modules.md](../modules.md#the-crash-ledger)
 
 The Maxine SDK root can be set in the configuration (`sdk_root` in `[module."br.com.dias.maxine-vfx"]`, or its alias `[effect] maxine_root`) or with `MAXINE_VFX_ROOT`; the Maxine module loads the SDK's libraries from it itself, and `LD_LIBRARY_PATH` is not needed ([maxine.md](maxine.md#4-the-sdk-root-and-the-environment)). The SDK is first loaded by the first effect or noise removal the daemon starts, and a different root then takes a daemon restart; a reload that changes the key says so in the log.
 
-The paths can be overridden with `--config PATH` and `--state PATH` in a copy of the unit file.
+The paths can be overridden with `--config PATH` and `--state PATH` in a copy of the unit file; `config.d` is then the directory next to `PATH`.
 
 ## Logs
 

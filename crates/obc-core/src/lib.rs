@@ -3,8 +3,10 @@
 //! Nothing in this crate touches GStreamer or CUDA: it holds the value types
 //! every other crate agrees on (video modes, mode requests, device selectors,
 //! output formats) and their parsing, so they can be unit-tested in
-//! isolation. The only filesystem access is reading the daemon's config file
-//! and reading and writing its state file ([`config`]). Nothing here knows
+//! isolation. The only filesystem access is reading the daemon's config files
+//! and reading and writing its state file ([`config`]), and writing the one
+//! managed drop-in of the config set, `config.d/50-panel.toml`
+//! ([`config_d`]). Nothing here knows
 //! about a particular camera model.
 
 use std::fmt;
@@ -14,6 +16,8 @@ use std::str::FromStr;
 use serde::Serialize;
 
 pub mod config;
+pub mod config_d;
+pub mod config_schema;
 pub mod modules;
 
 /// Card label of the dedicated virtual camera (see

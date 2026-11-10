@@ -569,7 +569,7 @@ impl Config {
 
 /// A TOML error as a [`ConfigError::Parse`], with a 1-based position and
 /// the dotted key it is on.
-fn parse_error(e: &toml::de::Error, text: &str, path: &Path) -> ConfigError {
+pub(crate) fn parse_error(e: &toml::de::Error, text: &str, path: &Path) -> ConfigError {
     let (line, column, key) = match e.span() {
         Some(span) => {
             let start = span.start.min(text.len());
@@ -615,7 +615,7 @@ fn key_at(text: &str, line: usize) -> Option<String> {
 
 /// The 1-based line of the dotted `key` (`table.key`, or a top-level key)
 /// in `text`, best effort: the line of `key = ...` inside `[table]`.
-fn line_of_key(text: &str, key: &str) -> Option<usize> {
+pub(crate) fn line_of_key(text: &str, key: &str) -> Option<usize> {
     let (table, bare) = key.rsplit_once('.').unwrap_or(("", key));
     let mut current = "";
     for (i, line) in text.lines().enumerate() {
@@ -1546,7 +1546,7 @@ fn temp_prefix(name: &std::ffi::OsStr) -> OsString {
 /// Creates a temporary file next to the file `name` in `dir`, with a name no
 /// other save uses: the process id, a per-process sequence number and the
 /// time, opened with `create_new` (and a fresh name on a collision).
-fn create_temp(dir: &Path, name: &std::ffi::OsStr) -> io::Result<(PathBuf, fs::File)> {
+pub(crate) fn create_temp(dir: &Path, name: &std::ffi::OsStr) -> io::Result<(PathBuf, fs::File)> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let mut attempts = 0;
@@ -1577,7 +1577,7 @@ fn create_temp(dir: &Path, name: &std::ffi::OsStr) -> io::Result<(PathBuf, fs::F
 /// processes that no longer run (they died during a save). The temporary
 /// files of running processes, this one included, are left alone: their
 /// saves may be in progress.
-fn remove_stale_temps(dir: &Path, name: &std::ffi::OsStr) {
+pub(crate) fn remove_stale_temps(dir: &Path, name: &std::ffi::OsStr) {
     let prefix = temp_prefix(name);
     let prefix = prefix.to_string_lossy();
     let Ok(entries) = fs::read_dir(dir) else {
@@ -1827,6 +1827,7 @@ offer_nv12 = false
                 "br.com.dias.maxine-vfx".to_string(),
             )]
             .into(),
+            ..ModulesConfig::default()
         };
         assert_eq!(c, expected);
         // Every key of the schema appears in the example.

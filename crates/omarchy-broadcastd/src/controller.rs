@@ -240,6 +240,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use obc_core::config::{CAMERA_CONTROL_NAMES, Config, EffectConfig, RuntimeState};
+use obc_core::config_d::{self, ConfigSet, ManagedEdit, OverridePolicy, WriteError};
+use obc_core::config_schema::{self, ModuleFact, RegistryFacts, StageFact};
 use obc_core::modules::{BackendProfile, StoredValue, legacy};
 use obc_core::{EffectMode, EffectOnFailure, OutputContract};
 use obc_ipc::settings::ResetScope;
@@ -316,6 +318,23 @@ pub type SettingsReply = tokio::sync::oneshot::Sender<Result<SettingsTree, IpcEr
 pub type ModulesReply = tokio::sync::oneshot::Sender<Result<obc_ipc::ModuleList, IpcError>>;
 /// The reply channel of `GetStageOrder`.
 pub type OrderReply = tokio::sync::oneshot::Sender<Result<Vec<String>, IpcError>>;
+/// The reply channel of `GetStageOrderMoves`.
+pub type MovesReply = tokio::sync::oneshot::Sender<Result<Vec<StageMove>, IpcError>>;
+/// The reply channel of `GetConfigSchema`.
+pub type ConfigSchemaReply = tokio::sync::oneshot::Sender<Result<obc_ipc::ConfigSchema, IpcError>>;
+/// The reply channel of `GetConfigFiles`.
+pub type ConfigFilesReply = tokio::sync::oneshot::Sender<Result<obc_ipc::ConfigFiles, IpcError>>;
+
+/// One stage of `GetStageOrderMoves`: the stage, its slot, and whether the
+/// daemon would accept the order with it swapped with the stage before it
+/// (`up`) or after it (`down`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageMove {
+    pub id: String,
+    pub slot: String,
+    pub up: bool,
+    pub down: bool,
+}
 
 /// What the controller is asked to do.
 #[derive(Debug)]
@@ -385,6 +404,17 @@ pub enum Command {
     SetBackendProfile(String, Reply),
     /// `SetStagePin(s, s)` (an empty module clears the pin).
     SetStagePin(String, String, Reply),
+    /// `GetStageOrderMoves()`.
+    GetStageOrderMoves(MovesReply),
+    /// `GetConfigSchema()`.
+    GetConfigSchema(ConfigSchemaReply),
+    /// `SetConfig(s, v)`: the value as decoded (`None`: a D-Bus type no
+    /// key takes).
+    SetConfig(String, Option<obc_ipc::ConfigValue>, Reply),
+    /// `ResetConfig(s)`.
+    ResetConfig(String, Reply),
+    /// `GetConfigFiles()`.
+    GetConfigFiles(ConfigFilesReply),
     /// `ReloadConfig()` (with its reply) or SIGHUP (without).
     ReloadConfig(Option<Reply>),
     /// The consumer watcher's count of processes holding the loopback.
@@ -421,6 +451,7 @@ pub enum Change {
     SettingsSchemaSerial(u32),
     ModulesSerial(u32),
     BackendProfile(String),
+    ConfigSerial(u32),
 }
 
 impl Change {
@@ -447,6 +478,7 @@ impl Change {
             Change::SettingsSchemaSerial(_) => "SettingsSchemaSerial",
             Change::ModulesSerial(_) => "ModulesSerial",
             Change::BackendProfile(_) => "BackendProfile",
+            Change::ConfigSerial(_) => "ConfigSerial",
         }
     }
 }
@@ -468,6 +500,10 @@ pub enum Note {
         serial: u32,
         changes: Vec<SettingChange>,
     },
+    /// The configuration in force or the config schema changed
+    /// (`ConfigChanged`): sent after the snapshot with the new
+    /// `ConfigSerial`.
+    ConfigChanged(u32),
 }
 
 /// What the controller and the D-Bus side share: the property snapshot the
@@ -528,6 +564,10 @@ impl Published {
             serial,
             changes,
         });
+    }
+
+    fn config_changed(&self, serial: u32) {
+        let _ = self.notes.send(Note::ConfigChanged(serial));
     }
 
     /// Announces a preview frame (`PreviewFrame(seq)`): called from the
@@ -602,6 +642,9 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Vec<Change> {
         out.push(Change::BackendProfile(
             new.backend_profile.clone().unwrap_or_default(),
         ));
+    }
+    if old.config_serial != new.config_serial {
+        out.push(Change::ConfigSerial(new.config_serial.unwrap_or_default()));
     }
     if old.output_mode != new.output_mode {
         out.push(Change::OutputMode(new.output_mode.clone()));
@@ -702,7 +745,9 @@ pub fn load_runtime_state(path: &Path) -> (RuntimeState, Option<String>, Vec<Str
 /// The snapshot served before the controller has run (only the files are
 /// read: no device is touched).
 pub fn preliminary_snapshot(paths: &Paths) -> Snapshot {
-    let config = Config::load(&paths.config).unwrap_or_default();
+    let config = ConfigSet::load(&paths.config)
+        .map(|s| s.config)
+        .unwrap_or_default();
     let (mut runtime, damaged, _) = load_runtime_state(&paths.state);
     // `[settings]` over the typed keys of revision 8, as the controller reads them.
     runtime.migrate_legacy_settings();
@@ -731,6 +776,8 @@ pub fn preliminary_snapshot(paths: &Paths) -> Snapshot {
         settings_revision: Some(1),
         settings_schema_serial: Some(1),
         modules_serial: Some(1),
+        // The state file's choice until it moves into the configuration
+        // (the controller's first snapshot follows the configuration).
         backend_profile: Some(
             runtime
                 .modules
@@ -738,6 +785,7 @@ pub fn preliminary_snapshot(paths: &Paths) -> Snapshot {
                 .as_str()
                 .to_string(),
         ),
+        config_serial: Some(1),
         interface_revision: INTERFACE_REVISION,
     }
 }
@@ -915,7 +963,22 @@ struct Streaming {
 pub struct Controller<B: MediaBackend> {
     backend: B,
     paths: Paths,
+    /// The configuration in force: [`Self::config_set`]'s.
     config: Config,
+    /// The files it was loaded from (`config.toml`, then `config.d/`), with
+    /// where each key comes from; the built-in defaults when the set did
+    /// not load at start.
+    config_set: ConfigSet,
+    /// `ConfigSerial`: from 1, bumped at every change of the configuration
+    /// in force or of its files (a write, a reload, also a refused one, the
+    /// move of the state file's module choices) and of the module rows of
+    /// the config schema (the modules found).
+    config_serial: u32,
+    /// The `ConfigSerial` last announced with `ConfigChanged`.
+    config_announced: u32,
+    /// The module registry's facts the config schema was last made from,
+    /// and the `ModulesSerial` they were read at.
+    config_facts: (u32, RegistryFacts),
     runtime: RuntimeState,
     cameras: Vec<Camera>,
     writer: Option<WriterOn>,
@@ -1169,7 +1232,6 @@ impl<B: MediaBackend> Controller<B> {
         let mut loaded = Modules::load(
             &mut self.backend,
             &self.config,
-            &self.runtime,
             self.paths.ledger.as_deref(),
             self.compute_capability,
         );
@@ -1187,17 +1249,17 @@ impl<B: MediaBackend> Controller<B> {
         now: Instant,
         load_modules: bool,
     ) -> Self {
-        let (config, error) = match Config::load(&paths.config) {
-            Ok(c) => (c, String::new()),
+        let (config_set, error) = match ConfigSet::load(&paths.config) {
+            Ok(set) => (set, String::new()),
             Err(e) => {
                 let msg = format!("{e}; running on the default configuration");
                 error!("{msg}");
-                (Config::default(), msg)
+                (ConfigSet::defaults(&paths.config), msg)
             }
         };
         if let Some(note) = maxine_root_note(
             None,
-            config.effect.maxine_root.as_deref(),
+            config_set.config.effect.maxine_root.as_deref(),
             maxine_root_env().as_deref(),
             None,
             false,
@@ -1210,6 +1272,16 @@ impl<B: MediaBackend> Controller<B> {
         if runtime.migrate_legacy_settings() {
             debug!("the state file's effect settings are kept by setting id from now on");
         }
+        // The module choices of an older state file move into the
+        // configuration (a damaged state file has none to move). A set that
+        // did not load has nothing to write them into: they stay, to move
+        // at a reload that succeeds.
+        let config_set = if state_damaged.is_none() && error.is_empty() {
+            migrate_choices(&paths, config_set, &mut runtime).0
+        } else {
+            config_set
+        };
+        let config = in_force(&config_set.config, &runtime);
         // Learnt by an earlier run: the models of this GPU are known from
         // the first probe, with no GPU call at idle.
         let compute_capability = paths.cache.as_deref().and_then(gpu_cache::load);
@@ -1246,17 +1318,21 @@ impl<B: MediaBackend> Controller<B> {
             Modules::load(
                 &mut backend,
                 &config,
-                &runtime,
                 paths.ledger.as_deref(),
                 compute_capability,
             )
         } else {
             Modules::empty()
         };
+        let config_facts = (modules.serial(), registry_facts(&modules));
         let mut c = Controller {
             backend,
             paths,
             config,
+            config_set,
+            config_serial: 1,
+            config_announced: 1,
+            config_facts,
             runtime,
             cameras: Vec::new(),
             writer: None,
@@ -1424,8 +1500,7 @@ impl<B: MediaBackend> Controller<B> {
                 let _ = reply.send(res);
             }
             Command::GetStageOrder(reply) => {
-                let order = self.modules.order().iter().map(|s| s.to_string()).collect();
-                let _ = reply.send(Ok(order));
+                let _ = reply.send(Ok(self.order_strings()));
             }
             Command::SetStageOrder(order, reply) => {
                 let res = self.set_stage_order(order, now);
@@ -1438,6 +1513,23 @@ impl<B: MediaBackend> Controller<B> {
             Command::SetStagePin(stage, module, reply) => {
                 let res = self.set_stage_pin(&stage, &module, now);
                 let _ = reply.send(res);
+            }
+            Command::GetStageOrderMoves(reply) => {
+                let _ = reply.send(Ok(self.stage_moves()));
+            }
+            Command::GetConfigSchema(reply) => {
+                let _ = reply.send(Ok(self.config_schema()));
+            }
+            Command::SetConfig(key, value, reply) => {
+                let res = self.set_config(&key, value, now);
+                let _ = reply.send(res);
+            }
+            Command::ResetConfig(key, reply) => {
+                let res = self.reset_config(&key, now);
+                let _ = reply.send(res);
+            }
+            Command::GetConfigFiles(reply) => {
+                let _ = reply.send(Ok(self.config_files()));
             }
             Command::ReloadConfig(reply) => {
                 let res = self.reload(now);
@@ -1709,12 +1801,8 @@ impl<B: MediaBackend> Controller<B> {
         if self.session.is_some() && !self.compute_capability_learnt {
             self.learn_compute_capability();
         }
-        self.modules.refresh(
-            &mut self.backend,
-            &self.config,
-            &self.runtime,
-            self.compute_capability,
-        );
+        self.modules
+            .refresh(&mut self.backend, &self.config, self.compute_capability);
         if self.session.is_some() {
             self.follow_stages();
         }
@@ -1946,6 +2034,14 @@ impl<B: MediaBackend> Controller<B> {
         } else {
             None
         };
+        // The modules found make the module rows of the config schema.
+        if self.config_facts.0 != self.modules.serial() {
+            let facts = registry_facts(&self.modules);
+            if facts != self.config_facts.1 {
+                self.bump_config();
+            }
+            self.config_facts = (self.modules.serial(), facts);
+        }
         let effect = self.effect();
         let snap = Snapshot {
             state: self.state(),
@@ -1968,15 +2064,20 @@ impl<B: MediaBackend> Controller<B> {
             settings_schema_serial: Some(self.settings_serial),
             modules_serial: Some(self.modules.serial()),
             backend_profile: Some(
-                self.runtime
+                self.config
                     .modules
-                    .profile(&self.config.modules)
+                    .profile_or_default()
                     .as_str()
                     .to_string(),
             ),
+            config_serial: Some(self.config_serial),
             interface_revision: INTERFACE_REVISION,
         };
         self.published.update(snap);
+        if self.config_announced != self.config_serial {
+            self.config_announced = self.config_serial;
+            self.published.config_changed(self.config_serial);
+        }
         if let Some(d) = delta {
             self.published.settings_changed(
                 self.settings_revision,
@@ -4345,72 +4446,285 @@ impl<B: MediaBackend> Controller<B> {
         }
     }
 
-    /// The modules' choices changed: saved, published (the settings tree
-    /// follows the modules enabled), applied at the next session.
-    fn modules_changed(&mut self, changed: bool, now: Instant) -> Result<(), IpcError> {
-        let res = if changed { self.save_state() } else { Ok(()) };
-        if self.session.is_some() && changed {
-            info!("the module change applies when the camera next starts");
-        }
-        self.reconcile(now);
-        res
+    /// The stages in force, each with its slot and whether the order with
+    /// it swapped with its neighbour before (`up`) or after (`down`) is one
+    /// `SetStageOrder` accepts (the same check). No move is when a file
+    /// after the managed one sets the order (`SetStageOrder` refuses).
+    fn stage_moves(&self) -> Vec<StageMove> {
+        let order: Vec<String> = self.order_strings();
+        let movable = self.config_set.overridden_by("modules.order").is_empty();
+        let info = self.modules.info();
+        let slot_of = |stage: &str| {
+            let stages = || {
+                info.iter()
+                    .flat_map(|m| m.stages.iter())
+                    .filter(|s| s.id == stage)
+            };
+            stages()
+                .find(|s| s.selected)
+                .or_else(|| stages().next())
+                .map(|s| s.slot.clone())
+                .unwrap_or_default()
+        };
+        let swapped_ok = |i: usize| {
+            let mut o = order.clone();
+            o.swap(i, i + 1);
+            movable && self.modules.validate_order(&o).is_ok()
+        };
+        (0..order.len())
+            .map(|i| StageMove {
+                id: order[i].clone(),
+                slot: slot_of(&order[i]),
+                up: i > 0 && swapped_ok(i - 1),
+                down: i + 1 < order.len() && swapped_ok(i),
+            })
+            .collect()
     }
 
-    /// `SetModuleEnabled`: kept in the state file, over the config's
-    /// `[modules] disabled`. An enabled module is opened now (its settings
-    /// appear); a running session keeps the modules it started with.
+    /// The stage order in force, by id.
+    fn order_strings(&self) -> Vec<String> {
+        self.modules.order().iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `GetConfigSchema`.
+    fn config_schema(&self) -> obc_ipc::ConfigSchema {
+        let facts = registry_facts(&self.modules);
+        obc_ipc::ConfigSchema {
+            serial: self.config_serial,
+            groups: config_schema::config_schema(&self.config_set, &facts)
+                .into_iter()
+                .map(ipc_group)
+                .collect(),
+        }
+    }
+
+    /// `GetConfigFiles`: the files as they are now (a file added or broken
+    /// since the last load shows, before a reload takes it).
+    fn config_files(&self) -> obc_ipc::ConfigFiles {
+        let (dir, files) = config_d::config_files(&self.paths.config);
+        obc_ipc::ConfigFiles {
+            serial: self.config_serial,
+            dir: dir.display().to_string(),
+            files: files
+                .into_iter()
+                .map(|f| obc_ipc::ConfigFileEntry {
+                    path: f.path,
+                    status: f.status.as_str().to_string(),
+                    managed: f.managed,
+                    reason: f.reason,
+                })
+                .collect(),
+        }
+    }
+
+    /// `SetConfig`: checked, written to the managed file, applied.
+    fn set_config(
+        &mut self,
+        key: &str,
+        value: Option<obc_ipc::ConfigValue>,
+        now: Instant,
+    ) -> Result<(), IpcError> {
+        let value = value.map(core_value).ok_or_else(|| {
+            IpcError::InvalidArgument(format!(
+                "{key}: the value is of a D-Bus type no configuration key takes"
+            ))
+        })?;
+        self.settle_pending_move(now);
+        let facts = registry_facts(&self.modules);
+        let res = config_d::set_config(&self.paths.config, &facts, key, &value);
+        // Enabling a module is the same as `SetModuleEnabled`: one the
+        // crash ledger disabled is forgiven.
+        let forgive = match (key.strip_prefix(config_schema::ENABLED_PREFIX), &value) {
+            (Some(id), config_schema::ConfigValue::Bool(true)) => Some(id.to_string()),
+            _ => None,
+        };
+        self.config_written(&format!("{key} set"), res, forgive.as_deref(), now)
+    }
+
+    /// `ResetConfig`: the key removed from the managed file, applied.
+    fn reset_config(&mut self, key: &str, now: Instant) -> Result<(), IpcError> {
+        self.settle_pending_move(now);
+        let facts = registry_facts(&self.modules);
+        let res = config_d::reset_config(&self.paths.config, &facts, key);
+        self.config_written(&format!("{key} reset"), res, None, now)
+    }
+
+    /// Writes `edits` to the managed file for a module method (refused for
+    /// a key a later file sets) and applies the result.
+    fn write_choice(
+        &mut self,
+        what: &str,
+        edits: &[ManagedEdit],
+        forgive: Option<&str>,
+        now: Instant,
+    ) -> Result<(), IpcError> {
+        self.settle_pending_move(now);
+        let res = config_d::persist_managed(&self.paths.config, edits, OverridePolicy::Refuse);
+        self.config_written(what, res, forgive, now)
+    }
+
+    /// The edit that clears `key` of the managed file: its removal, or
+    /// (when an earlier file sets it, so that the removal would bring that
+    /// value back) its empty value `empty`, which `still_set` tells.
+    fn clear_edit(
+        &self,
+        key: &str,
+        empty: toml::Value,
+        still_set: impl Fn(&Config) -> bool,
+    ) -> ManagedEdit {
+        let removed = config_d::apply_edits(
+            &self.config_set.managed,
+            &[ManagedEdit::Remove(key.to_string())],
+        );
+        match self.config_set.with_managed(&removed) {
+            Ok(c) if still_set(&c) => ManagedEdit::Set(key.to_string(), empty),
+            _ => ManagedEdit::Remove(key.to_string()),
+        }
+    }
+
+    /// A write of the managed file was made (or refused, `res`): the new set
+    /// is applied. A change of the module choices alone (enabled modules,
+    /// profile, pins, order) goes to the module registry, from the next
+    /// session, as the module methods always did (a module enabled is
+    /// opened now; `forgive` names one to re-enable even when the
+    /// configuration already had it on, which forgives a crash); any other
+    /// change is applied as a reload would, restarting only what it needs.
+    fn config_written(
+        &mut self,
+        what: &str,
+        res: Result<ConfigSet, WriteError>,
+        forgive: Option<&str>,
+        now: Instant,
+    ) -> Result<(), IpcError> {
+        let set = match res {
+            Ok(set) => set,
+            Err(e) => {
+                let err = write_error(e);
+                info!("configuration write refused: {}", err.message());
+                return Err(err);
+            }
+        };
+        info!("configuration: {what}");
+        let config = in_force(&set.config, &self.runtime);
+        // The registry's refusal for the module the request named (as
+        // `SetModuleEnabled` answered before; a module that fails to open
+        // is no refusal: its status says why).
+        let mut refused = None;
+        if choices_only(&self.config, &config) {
+            let old = std::mem::replace(&mut self.config, config);
+            self.adopt_set(set);
+            let mut changed = old.modules != self.config.modules;
+            for m in self.modules.info() {
+                let on = self.config.modules.is_enabled(&m.id);
+                let named = forgive == Some(m.id.as_str());
+                if on != old.modules.is_enabled(&m.id) || named {
+                    let res = self
+                        .modules
+                        .set_enabled(&mut self.backend, &self.config, &m.id, on);
+                    match res {
+                        Ok(c) => changed |= c,
+                        Err(e) if named => refused = Some(e),
+                        Err(e) => debug!("{e}"),
+                    }
+                }
+            }
+            self.modules.apply_choices(&self.config);
+            if self.session.is_some() && changed {
+                info!("the module change applies when the camera next starts");
+            }
+        } else {
+            self.apply_set(set, now);
+            if let Some(id) = forgive
+                && let Err(e) = self
+                    .modules
+                    .set_enabled(&mut self.backend, &self.config, id, true)
+            {
+                refused = Some(e);
+            }
+        }
+        self.reconcile(now);
+        match refused {
+            Some(e) => Err(IpcError::Failed(e)),
+            None => Ok(()),
+        }
+    }
+
+    /// Moves the state file's module choices into the managed file when a
+    /// start or reload could not (they are in force from the state until
+    /// then), before a write of the managed file: the write then goes over
+    /// them. Nothing when the set does not load or the move fails again
+    /// (the write that follows meets the same cause and says it).
+    fn settle_pending_move(&mut self, now: Instant) {
+        if self.runtime.modules.is_empty() || self.state_damaged.is_some() {
+            return;
+        }
+        let Ok(set) = ConfigSet::load(&self.paths.config) else {
+            return;
+        };
+        let (set, _) = migrate_choices(&self.paths, set, &mut self.runtime);
+        if self.runtime.modules.is_empty() {
+            let _ =
+                self.config_written("the state file's module choices moved", Ok(set), None, now);
+        }
+    }
+
+    /// `SetModuleEnabled`: `modules.enabled.<id>` in the managed file. An
+    /// enabled module is opened now (its settings appear); a running
+    /// session keeps the modules it started with.
     fn set_module_enabled(&mut self, id: &str, on: bool, now: Instant) -> Result<(), IpcError> {
         if !self.modules.installed(id) {
             return Err(IpcError::InvalidArgument(format!(
                 "No module {id} is installed"
             )));
         }
-        // The registry first: the runtime choice changes only once it took.
-        let res = self
-            .modules
-            .set_enabled(&mut self.backend, &self.config, &self.runtime, id, on);
-        if let Err(e) = res {
-            return Err(IpcError::Failed(e));
-        }
-        let before = self.runtime.modules.enabled.insert(id.to_string(), on);
-        info!("module {id} {}", if on { "enabled" } else { "disabled" });
-        self.modules_changed(before != Some(on), now)
+        let key = format!("{}{id}", config_schema::ENABLED_PREFIX);
+        let what = format!("module {id} {}", if on { "enabled" } else { "disabled" });
+        self.write_choice(
+            &what,
+            &[ManagedEdit::Set(key, toml::Value::Boolean(on))],
+            on.then_some(id),
+            now,
+        )
     }
 
     /// `SetStageOrder`: checked against the stages the enabled modules
-    /// offer (the reason when it is not valid); an empty list is the
-    /// default order.
+    /// offer (the reason when it is not valid), kept as `modules.order`;
+    /// an empty list is the default order.
     fn set_stage_order(&mut self, order: Vec<String>, now: Instant) -> Result<(), IpcError> {
-        let new = if order.is_empty() {
-            None
+        const KEY: &str = "modules.order";
+        let (edit, what) = if order.is_empty() {
+            let edit = self.clear_edit(KEY, toml::Value::Array(Vec::new()), |c| {
+                !c.modules.order.is_empty()
+            });
+            (edit, "stage order: the default".to_string())
         } else {
             self.modules
                 .validate_order(&order)
                 .map_err(IpcError::InvalidArgument)?;
-            Some(order)
+            let what = format!("stage order: {}", order.join(", "));
+            let value = toml::Value::Array(order.into_iter().map(toml::Value::String).collect());
+            (ManagedEdit::Set(KEY.into(), value), what)
         };
-        match &new {
-            Some(o) => info!("stage order: {}", o.join(", ")),
-            None => info!("stage order: the default"),
-        }
-        let changed = self.runtime.modules.order != new;
-        self.runtime.modules.order = new;
-        self.modules.apply_choices(&self.config, &self.runtime);
-        self.modules_changed(changed, now)
+        self.write_choice(&what, &[edit], None, now)
     }
 
-    /// `SetBackendProfile`: `quality` or `battery`.
+    /// `SetBackendProfile`: `quality` or `battery`, kept as
+    /// `modules.profile`.
     fn set_backend_profile(&mut self, profile: &str, now: Instant) -> Result<(), IpcError> {
         let p: BackendProfile = profile.parse().map_err(IpcError::InvalidArgument)?;
-        info!("backend profile: {p}");
-        let changed = self.runtime.modules.profile != Some(p);
-        self.runtime.modules.profile = Some(p);
-        self.modules.apply_choices(&self.config, &self.runtime);
-        self.modules_changed(changed, now)
+        self.write_choice(
+            &format!("backend profile: {p}"),
+            &[ManagedEdit::Set(
+                "modules.profile".into(),
+                toml::Value::String(p.as_str().into()),
+            )],
+            None,
+            now,
+        )
     }
 
     /// `SetStagePin`: module `module` provides `stage` while it can (`""`:
-    /// no pin; the profile decides).
+    /// no pin; the profile decides), kept as `modules.pin.<stage>`.
     fn set_stage_pin(&mut self, stage: &str, module: &str, now: Instant) -> Result<(), IpcError> {
         if !obc_core::modules::valid_stage_id(stage) {
             return Err(IpcError::InvalidArgument(
@@ -4422,21 +4736,19 @@ impl<B: MediaBackend> Controller<B> {
                 "No module {module} is installed"
             )));
         }
-        let before = self.runtime.modules.pins(&self.config.modules);
-        if module.is_empty() {
-            info!("stage {stage}: not pinned");
-            if self.config.modules.pin.contains_key(stage) {
-                self.runtime.modules.pin.insert(stage.into(), String::new());
-            } else {
-                self.runtime.modules.pin.remove(stage);
-            }
+        let key = format!("{}{stage}", config_schema::PIN_PREFIX);
+        let (edit, what) = if module.is_empty() {
+            let edit = self.clear_edit(&key, toml::Value::String(String::new()), |c| {
+                c.modules.pins().contains_key(stage)
+            });
+            (edit, format!("stage {stage}: not pinned"))
         } else {
-            info!("stage {stage}: pinned to {module}");
-            self.runtime.modules.pin.insert(stage.into(), module.into());
-        }
-        let changed = before != self.runtime.modules.pins(&self.config.modules);
-        self.modules.apply_choices(&self.config, &self.runtime);
-        self.modules_changed(changed, now)
+            (
+                ManagedEdit::Set(key, toml::Value::String(module.into())),
+                format!("stage {stage}: pinned to {module}"),
+            )
+        };
+        self.write_choice(&what, &[edit], None, now)
     }
 
     /// The last read of `camera` (the one the published tree is built
@@ -4933,20 +5245,54 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     fn reload(&mut self, now: Instant) -> Result<(), IpcError> {
-        let res = match Config::load(&self.paths.config) {
-            Ok(new) => {
-                self.apply_config(new, now);
+        let res = match ConfigSet::load(&self.paths.config) {
+            Ok(set) => {
+                // Choices a start or an earlier reload could not move
+                // move now.
+                let set = if self.state_damaged.is_none() {
+                    migrate_choices(&self.paths, set, &mut self.runtime).0
+                } else {
+                    set
+                };
+                self.apply_set(set, now);
                 Ok(())
             }
             Err(e) => {
                 let msg = e.to_string();
                 warning!("configuration rejected, the previous one stays in force: {msg}");
                 self.error = msg.clone();
+                // What `GetConfigFiles` shows changed (the file in error).
+                self.bump_config();
                 Err(IpcError::InvalidConfig(msg))
             }
         };
         self.reconcile(now);
         res
+    }
+
+    /// Bumps `ConfigSerial` (announced with the next publish).
+    fn bump_config(&mut self) {
+        self.config_serial = self.config_serial.wrapping_add(1).max(1);
+    }
+
+    /// Takes `set` as the set in force, its configuration not applied yet:
+    /// `ConfigSerial` moves when the configuration, where its keys come
+    /// from or its files changed.
+    fn adopt_set(&mut self, set: ConfigSet) {
+        let changed = set.config != self.config_set.config
+            || set.provenance != self.config_set.provenance
+            || set.files != self.config_set.files;
+        self.config_set = set;
+        if changed {
+            self.bump_config();
+        }
+    }
+
+    /// Takes `set` as the set in force and applies it as a reload does.
+    fn apply_set(&mut self, set: ConfigSet, now: Instant) {
+        let config = in_force(&set.config, &self.runtime);
+        self.adopt_set(set);
+        self.apply_config(config, now);
     }
 
     fn apply_config(&mut self, new: Config, now: Instant) {
@@ -4984,12 +5330,8 @@ impl<B: MediaBackend> Controller<B> {
         // The modules (and their configuration, the SDK root among it) may
         // have changed, or a feature been installed: found and opened again.
         // A running session keeps the modules it started with.
-        self.modules.reload(
-            &mut self.backend,
-            &self.config,
-            &self.runtime,
-            self.compute_capability,
-        );
+        self.modules
+            .reload(&mut self.backend, &self.config, self.compute_capability);
         if self.session.is_some() {
             self.follow_stages();
         }
@@ -5035,6 +5377,211 @@ impl<B: MediaBackend> Controller<B> {
         {
             info!("the new PipeWire format offer applies once no application is linked to it");
         }
+    }
+}
+
+/// The configuration in force for the loaded `config`: the state file's
+/// module choices laid over it while they wait to move into the managed
+/// file ([`migrate_choices`] could not write it, or the set did not load),
+/// as they were in force before the move; `config` itself otherwise.
+fn in_force(config: &Config, runtime: &RuntimeState) -> Config {
+    let mut c = config.clone();
+    if !runtime.modules.is_empty() {
+        c.modules = runtime.modules.over(&config.modules);
+    }
+    c
+}
+
+/// Moves the module choices of `runtime` (the state file's enabled
+/// modules, stage order, profile and pins) into the managed file of `set`
+/// ([`config_d::migrate_modules_state`]): the managed file is written first
+/// (for the keys it does not set already), then, only once that worked,
+/// the state file is saved without them. A crash between the two loses
+/// nothing (the configuration holds them; the state's copy is dropped at
+/// the next load). A write that fails leaves the state as it is, to be
+/// tried at the next load. Returns the set in force afterwards and whether
+/// the managed file was written.
+fn migrate_choices(paths: &Paths, set: ConfigSet, runtime: &mut RuntimeState) -> (ConfigSet, bool) {
+    let m = config_d::migrate_modules_state(runtime, &set.managed);
+    if !m.is_needed() {
+        return (set, false);
+    }
+    for note in &m.notes {
+        warning!("the state file's module choices: {note}");
+    }
+    let written = if m.edits.is_empty() {
+        Ok(None)
+    } else {
+        config_d::persist_managed(&paths.config, &m.edits, OverridePolicy::Ignore).map(Some)
+    };
+    let managed = config_d::managed_path(&paths.config);
+    match written {
+        Ok(new) => {
+            runtime.modules = m.state.modules;
+            match runtime.save(&paths.state) {
+                Ok(()) => info!(
+                    "the module choices of {} moved to {}",
+                    paths.state.display(),
+                    managed.display()
+                ),
+                Err(e) => warning!(
+                    "the module choices are in {} now, but {} cannot be saved without them \
+                     ({e}): its copy is dropped at its next save",
+                    managed.display(),
+                    paths.state.display()
+                ),
+            }
+            match new {
+                Some(new) => (new, true),
+                None => (set, false),
+            }
+        }
+        Err(e) => {
+            error!(
+                "the module choices of {} cannot be moved to {}: {e}; they stay in the state \
+                 file, in force from it, and are moved at the next start, reload or write",
+                paths.state.display(),
+                managed.display()
+            );
+            (set, false)
+        }
+    }
+}
+
+/// What the module registry found, for the module rows of the config
+/// schema: the installed modules (by name) and, for each stage they offer,
+/// the modules offering it.
+fn registry_facts(modules: &Modules) -> RegistryFacts {
+    let info = modules.info();
+    let mut stages: Vec<StageFact> = Vec::new();
+    for m in &info {
+        for st in &m.stages {
+            match stages.iter_mut().find(|f| f.id == st.id) {
+                Some(f) if !f.modules.contains(&m.id) => f.modules.push(m.id.clone()),
+                Some(_) => {}
+                None => stages.push(StageFact {
+                    id: st.id.clone(),
+                    modules: vec![m.id.clone()],
+                }),
+            }
+        }
+    }
+    RegistryFacts {
+        modules: info
+            .iter()
+            .map(|m| ModuleFact {
+                id: m.id.clone(),
+                name: if m.name.is_empty() {
+                    m.id.clone()
+                } else {
+                    m.name.clone()
+                },
+            })
+            .collect(),
+        stages,
+    }
+}
+
+/// Whether `new` differs from `old` in the module choices alone (enabled
+/// and disabled modules, profile, pins, order), or not at all.
+fn choices_only(old: &Config, new: &Config) -> bool {
+    let mut n = new.clone();
+    n.modules.enabled = old.modules.enabled.clone();
+    n.modules.disabled = old.modules.disabled.clone();
+    n.modules.profile = old.modules.profile;
+    n.modules.pin = old.modules.pin.clone();
+    n.modules.order = old.modules.order.clone();
+    n == *old
+}
+
+/// A value of the bus as the config schema's.
+fn core_value(v: obc_ipc::ConfigValue) -> config_schema::ConfigValue {
+    use config_schema::ConfigValue as C;
+    match v {
+        obc_ipc::ConfigValue::Bool(b) => C::Bool(b),
+        obc_ipc::ConfigValue::Int(i) => C::Int(i),
+        obc_ipc::ConfigValue::Float(f) => C::Float(f),
+        obc_ipc::ConfigValue::Str(s) => C::Str(s),
+        obc_ipc::ConfigValue::List(l) => C::List(l),
+    }
+}
+
+/// A value of the config schema as the bus's.
+fn ipc_value(v: config_schema::ConfigValue) -> obc_ipc::ConfigValue {
+    use config_schema::ConfigValue as C;
+    match v {
+        C::Bool(b) => obc_ipc::ConfigValue::Bool(b),
+        C::Int(i) => obc_ipc::ConfigValue::Int(i),
+        C::Float(f) => obc_ipc::ConfigValue::Float(f),
+        C::Str(s) => obc_ipc::ConfigValue::Str(s),
+        C::List(l) => obc_ipc::ConfigValue::List(l),
+    }
+}
+
+/// A group of the config schema as `GetConfigSchema` sends it.
+fn ipc_group(g: config_schema::ConfigGroup) -> obc_ipc::ConfigGroup {
+    use config_schema::RowKind as K;
+    obc_ipc::ConfigGroup {
+        id: g.id,
+        label: g.label,
+        rows: g
+            .rows
+            .into_iter()
+            .map(|r| obc_ipc::ConfigRow {
+                id: r.id,
+                label: r.label,
+                description: r.description,
+                kind: match r.kind {
+                    K::Bool => obc_ipc::ConfigKind::Bool,
+                    K::Int {
+                        min,
+                        max,
+                        step,
+                        unit,
+                    } => obc_ipc::ConfigKind::Int {
+                        min,
+                        max,
+                        step,
+                        unit,
+                    },
+                    K::Float {
+                        min,
+                        max,
+                        step,
+                        unit,
+                    } => obc_ipc::ConfigKind::Float {
+                        min,
+                        max,
+                        step,
+                        unit,
+                    },
+                    K::Enum { options } => obc_ipc::ConfigKind::Enum { options },
+                    K::String => obc_ipc::ConfigKind::String,
+                    K::Path => obc_ipc::ConfigKind::Path,
+                    K::List => obc_ipc::ConfigKind::List,
+                },
+                value: ipc_value(r.value),
+                default: r.default.map(ipc_value),
+                editable: r.editable,
+                source: r.source,
+                overridden_by: r.overridden_by,
+                apply: r.apply.as_str().to_string(),
+                enabled: r.enabled,
+                disabled_reason: r.disabled_reason,
+            })
+            .collect(),
+    }
+}
+
+/// The error a refused write of the managed file answers.
+fn write_error(e: WriteError) -> IpcError {
+    let msg = e.to_string();
+    match e {
+        WriteError::UnknownKey(_) => IpcError::UnknownSetting(msg),
+        WriteError::NotEditable(_) | WriteError::Overridden { .. } => IpcError::Disabled(msg),
+        WriteError::Invalid(_) => IpcError::InvalidArgument(msg),
+        WriteError::Config(_) => IpcError::InvalidConfig(msg),
+        WriteError::ManagedUnreadable { .. } | WriteError::Io { .. } => IpcError::Failed(msg),
     }
 }
 

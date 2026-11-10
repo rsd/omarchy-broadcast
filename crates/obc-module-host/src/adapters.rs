@@ -295,11 +295,14 @@ pub struct ModuleBackendFactory {
 }
 
 impl ModuleBackendFactory {
-    /// The factory of `module`. Reads its settings description once, to
-    /// check parameters ([`BackendFactory::check_params`]); without one
-    /// every parameter is accepted.
+    /// The factory of `module`. Checks parameters
+    /// ([`BackendFactory::check_params`]) against the settings description
+    /// read when the module was opened ([`Module::cached_settings`]): the
+    /// factory never calls the module for it, so no module code runs
+    /// outside the crash ledger's marker. Without one every parameter is
+    /// accepted.
     pub fn new(module: Module) -> ModuleBackendFactory {
-        let settings = module.settings().ok();
+        let settings = module.cached_settings();
         ModuleBackendFactory {
             name: intern(module.id()),
             module,

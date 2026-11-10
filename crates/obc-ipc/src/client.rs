@@ -14,13 +14,17 @@
 //! [`OmarchyBroadcastProxy::set_setting_value`] and
 //! [`OmarchyBroadcastProxy::reset_settings_scope`] take and return the
 //! model of [`crate::settings`], and [`SettingsChangedArgs::to_changes`]
-//! decodes the signal.
+//! decodes the signal. The configuration methods (revision 10) have
+//! [`OmarchyBroadcastProxy::config_schema`],
+//! [`OmarchyBroadcastProxy::set_config_value`] and
+//! [`OmarchyBroadcastProxy::config_files`] (and the `_no_autostart` reads).
 
 use std::collections::HashMap;
 
 use zbus::Variant;
 use zbus::proxy::MethodFlags;
 
+use crate::config::{ConfigFiles, ConfigFilesReply, ConfigSchema, ConfigSchemaReply, ConfigValue};
 use crate::modules::{ModuleList, ModulesReply};
 use crate::settings::{
     ResetScope, SettingChange, SettingValue, SettingsReply, SettingsTree, VariantDict,
@@ -141,8 +145,8 @@ pub trait OmarchyBroadcast {
         options: HashMap<&str, Variant<'_>>,
     ) -> Result<(), IpcError>;
 
-    /// Roughly once per second while `active`; `-1` marks a value that
-    /// cannot be measured.
+    /// The modules (revision 9): `(serial, modules)`, read with
+    /// [`OmarchyBroadcastProxy::module_list`].
     fn get_modules(&self) -> Result<ModulesReply, IpcError>;
 
     fn set_module_enabled(&self, id: &str, enabled: bool) -> Result<(), IpcError>;
@@ -154,6 +158,33 @@ pub trait OmarchyBroadcast {
     fn set_backend_profile(&self, profile: &str) -> Result<(), IpcError>;
 
     fn set_stage_pin(&self, stage: &str, module: &str) -> Result<(), IpcError>;
+
+    /// The stage order in force with the moves the daemon accepts
+    /// (revision 10): each stage as `(id, slot, up, down)`, `up` / `down`
+    /// whether `SetStageOrder` would accept the order with the stage
+    /// swapped with the one before / after it.
+    fn get_stage_order_moves(&self) -> Result<Vec<(String, String, bool, bool)>, IpcError>;
+
+    /// The config schema (revision 10): `(serial, groups)`, read with
+    /// [`OmarchyBroadcastProxy::config_schema`].
+    fn get_config_schema(&self) -> Result<ConfigSchemaReply, IpcError>;
+
+    /// Sets the configuration key `key` in `config.d/50-panel.toml`, checked
+    /// and applied (revision 10); send the value with
+    /// [`OmarchyBroadcastProxy::set_config_value`]. Refused with
+    /// `UnknownSetting`, `Disabled` (read-only, or overridden by a later
+    /// file), `InvalidArgument` or `InvalidConfig`.
+    fn set_config(&self, key: &str, value: Variant<'_>) -> Result<(), IpcError>;
+
+    /// Removes the key `key` from `config.d/50-panel.toml` (revision 10).
+    fn reset_config(&self, key: &str) -> Result<(), IpcError>;
+
+    /// The configuration files in load order (revision 10): `(serial, dir,
+    /// files)`, read with [`OmarchyBroadcastProxy::config_files`].
+    fn get_config_files(&self) -> Result<ConfigFilesReply, IpcError>;
+
+    /// Roughly once per second while `active`; `-1` marks a value that
+    /// cannot be measured.
 
     #[zbus(signal)]
     fn stats(
@@ -169,6 +200,11 @@ pub trait OmarchyBroadcast {
     /// from 1. Revision 5.
     #[zbus(signal)]
     fn preview_frame(&self, seq: u32) -> zbus::Result<()>;
+
+    /// The configuration in force or the config schema changed;
+    /// `serial` is the new `ConfigSerial`. Revision 10.
+    #[zbus(signal)]
+    fn config_changed(&self, serial: u32) -> zbus::Result<()>;
 
     /// The settings tree changed: one signal per operation, every setting
     /// whose value, `stored`, `enabled` or reason changed, as `(id, {value,
@@ -265,13 +301,19 @@ pub trait OmarchyBroadcast {
     #[zbus(property)]
     fn settings_schema_serial(&self) -> zbus::Result<u32>;
 
-    /// Revision of the interface the daemon implements.
+    /// Bumped whenever what `GetModules` returns changes. Revision 9.
     #[zbus(property)]
     fn modules_serial(&self) -> zbus::Result<u32>;
+
+    /// Bumped whenever the configuration in force or the config schema
+    /// changes (a write, a reload, the modules found). Revision 10.
+    #[zbus(property)]
+    fn config_serial(&self) -> zbus::Result<u32>;
 
     #[zbus(property)]
     fn backend_profile(&self) -> zbus::Result<String>;
 
+    /// Revision of the interface the daemon implements.
     #[zbus(property)]
     fn interface_revision(&self) -> zbus::Result<u32>;
 }
@@ -337,7 +379,53 @@ impl OmarchyBroadcastProxy<'_> {
             .await
     }
 
-    /// `ResetSettings(scope)` on `camera` (`""`: `ActiveCamera`).
+    /// `GetConfigSchema`, read into the model of [`crate::config`].
+    pub async fn config_schema(&self) -> Result<ConfigSchema, IpcError> {
+        Ok(ConfigSchema::from_wire(&self.get_config_schema().await?))
+    }
+
+    /// `GetConfigSchema` with the `NO_AUTO_START` flag: never starts the
+    /// daemon.
+    pub async fn config_schema_no_autostart(&self) -> Result<ConfigSchema, IpcError> {
+        let reply: ConfigSchemaReply = self.call_no_autostart("GetConfigSchema").await?;
+        Ok(ConfigSchema::from_wire(&reply))
+    }
+
+    /// `SetConfig(key, value)`, the value sent as its
+    /// [`ConfigValue::to_variant`].
+    pub async fn set_config_value(&self, key: &str, value: &ConfigValue) -> Result<(), IpcError> {
+        let value = value.to_variant();
+        self.set_config(key, Variant::from(value)).await
+    }
+
+    /// `GetConfigFiles`, read into [`ConfigFiles`].
+    pub async fn config_files(&self) -> Result<ConfigFiles, IpcError> {
+        Ok(ConfigFiles::from_wire(&self.get_config_files().await?))
+    }
+
+    /// `GetConfigFiles` with the `NO_AUTO_START` flag: never starts the
+    /// daemon.
+    pub async fn config_files_no_autostart(&self) -> Result<ConfigFiles, IpcError> {
+        let reply: ConfigFilesReply = self.call_no_autostart("GetConfigFiles").await?;
+        Ok(ConfigFiles::from_wire(&reply))
+    }
+
+    /// The method `member`, without arguments, with the `NO_AUTO_START`
+    /// flag.
+    async fn call_no_autostart<R>(&self, member: &str) -> Result<R, IpcError>
+    where
+        R: serde::de::DeserializeOwned + zbus::zvariant::Type,
+    {
+        let reply: Option<R> = self
+            .inner()
+            .call_with_flags(member, MethodFlags::NO_AUTO_START, &())
+            .await
+            .map_err(IpcError::from)?;
+        reply.ok_or_else(|| {
+            IpcError::ZBus(zbus::Error::Failure(format!("{member} returned no reply")))
+        })
+    }
+
     /// `GetModules`, read into the model of [`crate::modules`].
     pub async fn module_list(&self) -> Result<ModuleList, IpcError> {
         Ok(ModuleList::from_wire(&self.get_modules().await?))
@@ -371,6 +459,15 @@ impl OmarchyBroadcastProxy<'_> {
         })
     }
 
+    /// `GetStageOrderMoves` with the `NO_AUTO_START` flag: never starts
+    /// the daemon. Each stage `(id, slot, up, down)`.
+    pub async fn stage_order_moves_no_autostart(
+        &self,
+    ) -> Result<Vec<(String, String, bool, bool)>, IpcError> {
+        self.call_no_autostart("GetStageOrderMoves").await
+    }
+
+    /// `ResetSettings(scope)` on `camera` (`""`: `ActiveCamera`).
     pub async fn reset_settings_scope(
         &self,
         camera: &str,

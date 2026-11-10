@@ -389,11 +389,12 @@ async fn every_property_reads_through_the_proxy() {
             settings_schema_serial: Some(1),
             modules_serial: Some(1),
             backend_profile: Some("quality".into()),
+            config_serial: Some(1),
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 9);
-    // GetAll returns the same twenty-one properties.
+    assert_eq!(INTERFACE_REVISION, 10);
+    // GetAll returns the same twenty-two properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
         .destination(obc_ipc::BUS_NAME)
         .path(OBJECT_PATH)
@@ -417,6 +418,7 @@ async fn every_property_reads_through_the_proxy() {
             "BlurStrength",
             "CameraControls",
             "Cameras",
+            "ConfigSerial",
             "Consumers",
             "Denoise",
             "Effect",
@@ -875,7 +877,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 9);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 10);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -936,7 +938,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 9);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 10);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -1052,7 +1054,7 @@ async fn preview_leases_by_bus_name_their_property_and_their_frames() {
     let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 9);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 10);
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
     let seen = rig.record_changes().await;
     let mut frames = proxy.receive_preview_frame().await.unwrap();
@@ -1901,4 +1903,109 @@ async fn the_module_members_over_the_bus() {
         s.iter().any(|e| e.starts_with("ModulesSerial="))
     })
     .await;
+}
+
+/// The members of revision 10 over the bus: the config schema, a write and
+/// a reset (landing in the managed file only, `ConfigSerial` and
+/// `ConfigChanged` following), a refusal for a key a later file sets, the
+/// file list and the order moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_config_members_over_the_bus() {
+    use obc_ipc::ConfigValue as V;
+    let config = "[lifecycle]\nstart_debounce_ms = 0\n";
+    let rig = Rig::new(config, |_| {}).await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    let schema = within("GetConfigSchema", proxy.config_schema())
+        .await
+        .unwrap();
+    assert_eq!(schema.serial, proxy.config_serial().await.unwrap());
+    let row = schema.find("lifecycle.start_debounce_ms").unwrap();
+    assert_eq!(
+        (row.value.clone(), row.source.as_str(), row.editable),
+        (V::Int(0), "config.toml", true)
+    );
+    assert!(
+        schema
+            .find(&format!(
+                "modules.enabled.{}",
+                crate::modules::MAXINE_MODULE
+            ))
+            .is_some()
+    );
+    let mut changed = proxy.receive_config_changed().await.unwrap();
+    let before = proxy.config_serial().await.unwrap();
+    within(
+        "SetConfig",
+        proxy.set_config_value("lifecycle.idle_grace_s", &V::Int(11)),
+    )
+    .await
+    .unwrap();
+    let signal = within("ConfigChanged", changed.next()).await.unwrap();
+    let serial = signal.args().unwrap().serial;
+    assert_ne!(serial, before);
+    assert_eq!(proxy.config_serial().await.unwrap(), serial);
+    let schema = proxy.config_schema().await.unwrap();
+    let row = schema.find("lifecycle.idle_grace_s").unwrap();
+    assert_eq!(
+        (row.value.clone(), row.source.as_str()),
+        (V::Float(11.0), "config.d/50-panel.toml")
+    );
+    assert_eq!(fs::read_to_string(&rig.paths.config).unwrap(), config);
+    // Refusals carry the daemon's reason.
+    let e = proxy
+        .set_config_value("output.mode", &V::Str("x".into()))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, IpcError::Disabled(_)), "{e:?}");
+    let e = proxy
+        .set_config_value("no.such", &V::Int(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, IpcError::UnknownSetting(_)), "{e:?}");
+    let dir = rig.paths.config.with_file_name("config.d");
+    fs::write(dir.join("90-x.toml"), "[lifecycle]\nidle_grace_s = 2\n").unwrap();
+    within("ReloadConfig", proxy.reload_config()).await.unwrap();
+    let e = proxy
+        .reset_config("lifecycle.idle_grace_s")
+        .await
+        .unwrap_err();
+    match e {
+        IpcError::Disabled(m) => assert_eq!(m, "Overridden by config.d/90-x.toml"),
+        other => panic!("{other:?}"),
+    }
+    fs::remove_file(dir.join("90-x.toml")).unwrap();
+    within("ReloadConfig", proxy.reload_config()).await.unwrap();
+    within("ResetConfig", proxy.reset_config("lifecycle.idle_grace_s"))
+        .await
+        .unwrap();
+    let files = within("GetConfigFiles", proxy.config_files())
+        .await
+        .unwrap();
+    assert_eq!(files.serial, proxy.config_serial().await.unwrap());
+    assert_eq!(
+        files.dir,
+        rig.paths.config.parent().unwrap().display().to_string()
+    );
+    let listed: Vec<(&str, &str, bool)> = files
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f.status.as_str(), f.managed))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("config.toml", "loaded", false),
+            ("config.d/50-panel.toml", "loaded", true)
+        ]
+    );
+    let moves = within("GetStageOrderMoves", proxy.get_stage_order_moves())
+        .await
+        .unwrap();
+    assert_eq!(moves.len(), 4);
+    assert_eq!(
+        (moves[0].0.as_str(), moves[0].2, moves[0].3),
+        ("enhance", false, true)
+    );
+    assert!(!moves[3].3);
 }

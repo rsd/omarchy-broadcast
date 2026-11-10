@@ -17,8 +17,8 @@ flowchart LR
     subgraph Daemon["omarchy-broadcastd (systemd user service)"]
         IPC["D-Bus interface<br/>zbus · br.com.dias.OmarchyBroadcast1"]
         CTL["Controller thread<br/>lifecycle state machine"]
-        CFG["Config (read-only)<br/>~/.config/omarchy-broadcast/config.toml<br/>reload on SIGHUP / ReloadConfig"]
-        ST["Runtime state<br/>~/.local/state/omarchy-broadcast/state.toml<br/>Enabled, selected camera,<br/>effect and module settings,<br/>enabled modules, order, profile, pins,<br/>per-camera camera settings"]
+        CFG["Config files<br/>~/.config/omarchy-broadcast/config.toml<br/>+ config.d/*.toml, in name order<br/>reload on SIGHUP / ReloadConfig<br/>written only: config.d/50-panel.toml"]
+        ST["Runtime state<br/>~/.local/state/omarchy-broadcast/state.toml<br/>Enabled, selected camera,<br/>effect and module settings,<br/>per-camera camera settings"]
         WATCH["Consumer watcher<br/>inotify on the loopback node<br/>+ /proc/PID/fd count"]
         CEV["Control-event watcher<br/>(only while a camera is open)<br/>V4L2_EVENT_CTRL on its own fd"]
         PWT["obc-pipewire thread (optional)<br/>PipeWire main loop, output stream,<br/>registry listener: links to the node"]
@@ -52,9 +52,10 @@ flowchart LR
     PWN[("PipeWire node<br/>omarchy-broadcast, Video/Source<br/>(optional)")]
 
     CLI & BAR & SH -- "methods / properties" --> IPC
-    IPC -- "PropertiesChanged, Stats, PreviewFrame, SettingsChanged" --> BAR & CLI
+    IPC -- "PropertiesChanged, Stats, PreviewFrame, SettingsChanged, ConfigChanged" --> BAR & CLI
     IPC <--> CTL
     CFG --> CTL
+    CTL -- "50-panel.toml only" --> CFG
     CTL <--> ST
     WATCH --> CTL
     CEV -- "control changes" --> CTL
@@ -130,7 +131,7 @@ With the PipeWire output, the registry listener of the `obc-pipewire` thread cou
 
 **Hotplug.** Video nodes appearing in or disappearing from `/dev` trigger a rescan of the camera list. If the streaming camera fails or disappears, the session switches to the next camera in order, with the hold of ADR-0010; if none is left, the state is `error`. A camera that appears while another one streams does not take over.
 
-**Configuration and state.** `config.toml` holds what the user decides and is never written by the daemon; it is re-read on `SIGHUP` or `ReloadConfig()`, and an invalid file is rejected as a whole (the previous one stays in force and `Error` says why). Changes made at run time (`Enabled`, the selected camera, and the effect with its blur strength and background image) go to a separate `state.toml`, written atomically. A state file that cannot be parsed starts the daemon `off` (privacy fails closed). The keys are in [config.example.toml](config.example.toml).
+**Configuration and state.** The configuration is `config.toml` followed by the files of `config.d/` in name order, merged key by key ([ADR-0026](adr/0026-config-d-and-managed-config.md)); it holds what the user decides. The daemon never writes `config.toml`. It writes one drop-in, `config.d/50-panel.toml`, atomically, for the changes asked through D-Bus (`SetConfig` and the module setters: the enabled modules, the stage order, the backend profile and the pins), and refuses to change a key that a file after it sets. The files are re-read on `SIGHUP` or `ReloadConfig()`, and an invalid file is rejected as a whole (the previous set stays in force and `Error` says why). The daemon describes the keys to clients as a config schema (value, source file, editable, when a change applies). Changes made at run time (`Enabled`, the selected camera, the effect with its blur strength and background image, a module's settings) go to a separate `state.toml`, written atomically. A state file that cannot be parsed starts the daemon `off` (privacy fails closed). The keys are in [config.example.toml](config.example.toml).
 
 ## 2. Stage and caps model
 
@@ -261,6 +262,7 @@ flowchart LR
 | `gst-obc` (`module/`) | The `obcmodule` element: one chain of one module's stages, run in place on the frames between two other elements |
 | `obc-pipeline` (`module.rs`) | Where `obcmodule` elements sit in the output, and their status |
 | `omarchy-broadcastd` (`modules.rs`) | The daemon's modules: discovery at start and on reload, the crash ledger, the session plan, the settings of the enabled modules, and the D-Bus members of revision 9 |
+| `obc-core` (`config_d.rs`, `config_schema.rs`) | The configuration as a set of files: the loader (merge, provenance), the managed-file writer for `config.d/50-panel.toml`, the migration of the module choices out of the state file, and the config schema built from the core keys and what the registry found ([ADR-0026](adr/0026-config-d-and-managed-config.md)) |
 
 **Data flow.**
 
@@ -281,7 +283,7 @@ flowchart LR
 
 1. At start (and on `SIGHUP` or `ReloadConfig`) the daemon scans the manifest directories. No library is opened. A manifest that cannot be read, a kind that is not supported yet and an ABI major version that does not match each become an entry with a reason.
 2. Each enabled module is opened: `dlopen` with `RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE`, the ABI version checked before anything else of the library runs, `init` with the module's `[module."<id>"]` table, `probe` (filesystem only, so the GPU is never woken), and `describe_settings`. The crash ledger counts the starts that find a module's code running. A reload keeps a module open when its manifest, library file and configuration are unchanged.
-3. When a camera session starts, the controller makes the **plan**: for each stage, the provider by pin and profile, and where it runs. The plan is fixed for the session. A change of modules, order, profile or pin applies at the next start.
+3. When a camera session starts, the controller makes the **plan**: for each stage, the provider by pin and profile, and where it runs. The plan is fixed for the session. A change of modules, order, profile or pin (written to `config.d/50-panel.toml`) applies at the next start.
 4. **Placement.** The provider of `background` runs the whole cut-out family inside `obceffect`: its stages in `pre-matte`, `matte` and `post-matte` (denoise, the cut-out with the blur or replacement, relighting for Maxine), on one CUDA stream, as before the module system. The provider of `enhance` runs it in the ingest tail (`obcenhance`). The stages of any other module run in `obcmodule` elements, one chain per module and side, in the stage order: those in `pre-matte` before `obceffect`, the others (`post-matte`, `post-composite`) after it. A stage that needs the cut-out but is provided by another module than the `background` provider is unavailable, with a reason (the cut-out of one module cannot yet feed another's stage).
 5. **Memory kinds.** A module declares the frame kinds its stage takes: `cuda` (a device pointer in GStreamer's shared CUDA context, on a stream the element owns) or `host`. The element converts only at the module boundary: a chain that takes host frames and is offered CUDA frames runs through a page-locked host copy (download, process, upload back into the same frame); a chain that takes CUDA frames only fails on system memory, with the reason. A chain that lives inside one module stays in the memory it was loaded for. `dmabuf` is reserved in the ABI and offered by no host yet.
 6. **Passthrough and failure.** With no stage running an `obcmodule` element is in passthrough, with no copy, no chain call and no CUDA call. Module stages other than the cut-out fail open: a stage that fails alone is dropped and the others run (a frame it failed on runs again without it, from the input restored beforehand), and a failure of the whole chain passes the input through. The cut-out never fails open: a failure of the `background` stage or of any stage of the `matte` slot is the effect's failure, and follows `[effect] on_failure` ([ADR-0012](adr/0012-video-effects-and-maxine-backend.md)). A failed switch that keeps the frame geometry leaves the previous chain running; any other failed load unloads the instance.
@@ -390,6 +392,6 @@ Raw 4K tops out at 15 fps; 4K at 30 fps is only available as MJPEG, which is wha
 
 ## Known limitations / future work
 
-- **Modules, phase 1** ([ADR-0025](adr/0025-loadable-modules.md)). A stage cannot use the cut-out of a module other than the `background` provider; the `conflicts` field of a manifest is read but not enforced; a rebuilt module library is not loaded again until the daemon restarts; only `video-stage` modules load; the module interface is not yet frozen. Enabled modules, order, profile and pins are kept in the state file and apply at the next camera start.
+- **Modules, phase 1** ([ADR-0025](adr/0025-loadable-modules.md)). A stage cannot use the cut-out of a module other than the `background` provider; the `conflicts` field of a manifest is read but not enforced; a rebuilt module library is not loaded again until the daemon restarts; only `video-stage` modules load; the module interface is not yet frozen. Enabled modules, order, profile and pins are kept in `config.d/50-panel.toml` (phase 2, [ADR-0026](adr/0026-config-d-and-managed-config.md)) and apply at the next camera start.
 - **MJPEG is decoded on the CPU.** GStreamer's `nvjpegdec` (NVDEC) is not used: on the reference machine it rejects the 4:2:2 MJPEG that typical UVC webcams send (`unhandled chroma format 2`). The cost is CPU time that scales with resolution and frame rate (see [benchmarks/ingest-paths.md](benchmarks/ingest-paths.md)). GPU JPEG decode, for example through an element built on the nvJPEG library, is future work. See [ADR-0008](adr/0008-cpu-ingest-adapters.md).
 - **YUYV/UYVY are converted on the CPU.** A custom CUDA kernel for these formats is deferred.
