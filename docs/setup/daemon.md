@@ -50,18 +50,20 @@ The script builds the release binaries and installs, without root:
 - `omarchy-broadcastd` and `omarchy-broadcast` in `${XDG_BIN_HOME:-~/.local/bin}`;
 - the unit in `${XDG_DATA_HOME:-~/.local/share}/systemd/user/`, with `ExecStart=` pointing at the installed daemon;
 - the D-Bus activation file in `${XDG_DATA_HOME:-~/.local/share}/dbus-1/services/`;
-- nothing for the Maxine effects, not even the Maxine module: the module, the SDK, the os-release shim and the drop-in are described in [maxine.md](maxine.md). An older version of the script installed a shim in `~/.local/lib/omarchy-broadcast/`; `--uninstall` and a reinstall remove it;
-- a manifest, `install-user.manifest`, in `${XDG_STATE_HOME:-~/.local/state}/omarchy-broadcast/`, which lists every path written and the sha256 of each binary.
+- the NVIDIA Maxine module: the library `${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules/libobc_module_maxine.so` and its manifest `${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules.d/maxine-vfx.toml`, whose `library` line names the installed library. The module is built and installed whether or not the Maxine SDK is present; without the SDK the daemon lists it greyed out, with the reason. The SDK, the os-release shim and the drop-in are not installed by the script; they are described in [maxine.md](maxine.md). An older version of the script installed a shim in `~/.local/lib/omarchy-broadcast/`; `--uninstall` and a reinstall remove it;
+- a manifest, `install-user.manifest`, in `${XDG_STATE_HOME:-~/.local/state}/omarchy-broadcast/`, which lists every path written (the module's library and manifest included) and the sha256 of each binary and of the module library.
 
 Behaviour:
 
 - It refuses to run as root.
-- It marks every text file it writes. It overwrites or removes a file only if it carries that mark (a binary: only if the manifest lists it with the checksum on disk), and stops before changing anything if a target path holds another file. Running it again updates its own install.
-- It runs no `systemctl` command and enables nothing; it prints the next steps.
+- It marks every text file it writes. It overwrites or removes a file only if it carries that mark (a binary, the module's library included: only if the manifest lists it with the checksum on disk), and stops before changing anything if a target path holds another file. Running it again updates its own install.
+- A Maxine manifest at `${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules.d/maxine-vfx.toml` that it did not write, such as the hand-made copy of the manual recipe in [maxine.md](maxine.md), has no mark, so the script refuses it. Remove that file and the library its `library` line names, then run the script again. This applies to `--uninstall` as well.
+- The data directory must be an absolute path made only of letters, digits and `._/@+-` for an install: its path is written into the Maxine manifest, and with `--mic` into the microphone's unit. Otherwise the script exits with status 2.
+- It runs no `systemctl` command and enables nothing; it prints the next steps. A running daemon never reloads a module library: after a run that rebuilt the module, restart the daemon (`systemctl --user restart omarchy-broadcastd`).
 - It does not install the WirePlumber drop-in. The Omarchy bar plugin is a separate project (the omarchy-broadcast-plugin repository).
 - It warns when a unit in `~/.config/systemd/user` exists, because that location takes precedence (see below).
 
-Options: `--mic` also installs the optional noise-removed microphone ([microphone.md](microphone.md)), `--dry-run` prints every action and changes nothing, `--no-build` installs the binaries already in `${CARGO_TARGET_DIR:-target}/release`, `--uninstall` removes what the script installed, `--help` shows the usage. Exit status: 0 done; 1 refused (a target path holds a file the script did not install, or the unit is still enabled on `--uninstall`) or the build failed; 2 usage error or unusable environment.
+Options: `--mic` also installs the optional noise-removed microphone ([microphone.md](microphone.md)), `--dry-run` prints every action and changes nothing, `--no-build` installs the binaries and the module library already in `${CARGO_TARGET_DIR:-target}/release`, `--uninstall` removes what the script installed (the Maxine module's library and manifest included), `--help` shows the usage. Exit status: 0 done; 1 refused (a target path holds a file the script did not install, or the unit is still enabled on `--uninstall`) or the build failed; 2 usage error or unusable environment.
 
 Then load and start the service:
 
@@ -285,7 +287,7 @@ systemctl --user disable --now omarchy-broadcastd
 Then, depending on how it was installed:
 
 - Arch package: `sudo pacman -R omarchy-broadcast-git`. Remove any drop-in you copied from the examples. The bar plugin is not part of the package; see the omarchy-broadcast-plugin repository for removing it.
-- Per-user install: `scripts/install-user.sh --uninstall` from the checkout. It removes only the files it installed and refuses while the unit is still enabled, hence the command above comes first.
+- Per-user install: `scripts/install-user.sh --uninstall` from the checkout. It removes only the files it installed, the Maxine module's library and manifest among them, and refuses while the unit is still enabled, hence the command above comes first. A hand-made Maxine manifest stops it too; remove the files named in [maxine.md](maxine.md#8-uninstall) first.
 - Manual install:
 
   ```sh

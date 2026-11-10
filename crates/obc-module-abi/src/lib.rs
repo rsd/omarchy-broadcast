@@ -1,4 +1,4 @@
-//! The stable C ABI between omarchy-broadcast and its modules.
+//! The versioned C ABI between omarchy-broadcast and its modules.
 //!
 //! A module is a manifest (a TOML file in a `modules.d` directory) plus a
 //! shared library that exports two symbols:
@@ -18,6 +18,15 @@
 //! generated from this file by cbindgen and committed (a test regenerates
 //! it and fails when the two differ). Module authors writing Rust use the
 //! safe `obc-module-sdk` crate instead of these types.
+//!
+//! # Stability
+//!
+//! ABI 1.x is not yet declared stable. Until it is, it may change in
+//! breaking ways, even without a change of the major version: the version
+//! numbers are the host's check, not yet a promise that a module built
+//! against one release works with the next. A module built outside this
+//! repository may need rebuilding, against the matching `obc-module-sdk` or
+//! header, after an update of omarchy-broadcast.
 //!
 //! # Conventions
 //!

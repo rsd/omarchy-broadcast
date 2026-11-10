@@ -723,6 +723,42 @@ fn gpu_failures_show_black_or_the_input_as_configured() {
 
 #[test]
 #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_backend_that_lost_its_chain_is_loaded_again_on_a_retry() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let blur = EffectSettings::of(EffectKind::Blur);
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &blur);
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    let loads = get(&fake.log.loads);
+
+    // The backend loses its chain on its own (a module instance unloaded
+    // after a panic): the frame fails, the effect is failed.
+    fake.set(|c| c.lose_chain_on_process = Some("the module panicked".into()));
+    assert_eq!(rig.frame(), Seen::Black);
+    assert_eq!(get(&fake.log.lost_chains), 1);
+    assert!(matches!(rig.effect.status(), EffectStatus::Failed(_)));
+    // Nothing runs on the lost chain: black, the backend not asked.
+    let processes = get(&fake.log.processes);
+    assert_eq!(rig.frame(), Seen::Black);
+    assert_eq!(get(&fake.log.processes), processes);
+
+    // A retry of the same effect loads it again, rather than taking what
+    // was loaded last as still loaded and saying ready.
+    rig.effect.apply(&blur).unwrap();
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert_eq!(get(&fake.log.loads), loads + 1, "loaded again");
+    assert_eq!(get(&fake.log.lost_chains), 1, "no further chain was lost");
+    assert_eq!(
+        fake.log.loaded.lock().unwrap().as_slice(),
+        [EffectKind::Blur, EffectKind::Blur],
+        "the chain was loaded, lost and loaded again"
+    );
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    rig.stop();
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
 fn gpu_an_unavailable_backend_or_image_is_a_failure_with_its_reason() {
     let fake = FakeFactory::new(FakeConfig {
         fail_create: Some("fake SDK missing".into()),

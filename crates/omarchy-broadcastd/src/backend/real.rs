@@ -954,8 +954,9 @@ impl MediaBackend for GstBackend {
             return Err("no effect module is loaded".into());
         };
         // Called before a session starts, so while the GPU is parked: the
-        // module's probe reads the filesystem only, with no CUDA call (a
-        // CUDA call would block until unparked).
+        // module's probe reads the filesystem and its deeper check may open
+        // the module's own libraries, but neither makes a CUDA call (a CUDA
+        // call would block until unparked).
         effect_backend_available_with(backend.factory().as_ref())?;
         obc_pipeline::effect::check_settings_with(
             &effect_settings(effect),

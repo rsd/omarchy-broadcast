@@ -2,10 +2,14 @@
 # install-user.sh — install omarchy-broadcast from this checkout for the current
 # user, without root.
 #
-# Builds the release binaries and installs:
+# Builds the release binaries and the NVIDIA Maxine module, and installs:
 #   omarchy-broadcastd, omarchy-broadcast -> ${XDG_BIN_HOME:-~/.local/bin}/
 #   systemd user unit                     -> ${XDG_DATA_HOME:-~/.local/share}/systemd/user/omarchy-broadcastd.service
 #                                            (from dist/, ExecStart pointing at the installed daemon)
+#   NVIDIA Maxine module library          -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules/libobc_module_maxine.so
+#   its module manifest                   -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules.d/maxine-vfx.toml
+#                                            (from crates/obc-module-maxine/maxine-vfx.toml, library pointing at the
+#                                            installed module library)
 #   D-Bus activation file                 -> ${XDG_DATA_HOME:-~/.local/share}/dbus-1/services/br.com.dias.OmarchyBroadcast.service
 #   install manifest                      -> ${XDG_STATE_HOME:-~/.local/state}/omarchy-broadcast/install-user.manifest
 # and, with --mic, the noise-removed microphone:
@@ -15,12 +19,16 @@
 #   its systemd user unit template        -> ${XDG_DATA_HOME:-~/.local/share}/systemd/user/omarchy-broadcast-mic@.service
 #                                            (from dist/, ExecStart pointing at the installed configurations)
 #
-# Nothing for NVIDIA Maxine: the SDK and the os-release shim it needs come
-# from the maxine-vfx-sdk-local package (built from the omarchy-nvidia-sdks
-# repository), and the Maxine drop-in that uses them is a manual step,
-# printed at the end (docs/setup/maxine.md, section 3). An earlier version of
-# this script installed its own copy of the shim in
-# ~/.local/lib/omarchy-broadcast; a re-run removes that copy (see Ownership).
+# The Maxine module is always built and installed (the library builds without
+# the Maxine SDK). Without the SDK the daemon lists the module greyed out, with
+# the reason, so there is no flag for it. The SDK and the os-release shim it
+# needs still come from the maxine-vfx-sdk-local package (built from the
+# omarchy-nvidia-sdks repository), and the Maxine drop-in that uses them is a
+# manual step, printed at the end (docs/setup/maxine.md, section 3). The
+# daemon loads a module library once and never reloads it: restart a running
+# daemon to pick up a rebuilt module. An earlier version of this script
+# installed its own copy of the shim in ~/.local/lib/omarchy-broadcast; a
+# re-run removes that copy (see Ownership).
 #
 # It runs no systemctl command and enables nothing; it prints the next steps.
 # It does not install the WirePlumber drop-in, the Maxine drop-in or, without
@@ -31,22 +39,26 @@
 #
 # Options:
 #   --dry-run    Print every action; build nothing, change nothing.
-#   --no-build   Build nothing: install the binaries already in
-#                ${CARGO_TARGET_DIR:-target}/release.
+#   --no-build   Build nothing: install the binaries and the module library
+#                already in ${CARGO_TARGET_DIR:-target}/release.
 #   --mic        Also install the noise-removed microphone (see above). Without
 #                it, microphone files installed by an earlier run stay in
 #                place and in the manifest, so --uninstall still removes them.
 #   --uninstall  Remove what this script installed, and only that, including
-#                the microphone's ~/.local/share/omarchy-broadcast/pipewire and
-#                ~/.local/share/omarchy-broadcast once they are empty, and the
-#                shim an earlier version installed (with
-#                ~/.local/lib/omarchy-broadcast once it is empty).
+#                the Maxine module and its manifest, the microphone's files,
+#                and the directories ~/.local/share/omarchy-broadcast/modules,
+#                modules.d and pipewire and ~/.local/share/omarchy-broadcast
+#                once they are empty (modules and modules.d even when no file
+#                of theirs was installed), and the shim an earlier version
+#                installed (with ~/.local/lib/omarchy-broadcast once it is
+#                empty).
 #   -h, --help   Show this help.
 #
 # Ownership: every text file it writes carries a marker comment line, and the
 # manifest lists every path it wrote, with the sha256 of each binary. It
 # overwrites or removes a text file only if it carries the marker, and a
-# binary only if the manifest lists it with the checksum of the file on disk.
+# binary (the daemon, the CLI and the module library) only if the manifest
+# lists it with the checksum of the file on disk.
 # Any other file at a target path stops it before anything is changed.
 # Re-running it over its own install updates that install. The shim files of
 # an earlier version (os-release-shim.so and fake-os-release, listed in its
@@ -66,8 +78,13 @@ BINARIES=(omarchy-broadcastd omarchy-broadcast)
 # ~/.local/lib/omarchy-broadcast. It installs them no more; they are only
 # removed, through the manifest of that version.
 LEGACY_SHIM=(os-release-shim.so fake-os-release)
+# The Maxine module: a cdylib built from crate obc-module-maxine, and its
+# manifest (a text file, generated from the one in that crate).
+MODULE_CRATE=obc-module-maxine
+MODULE_LIB=libobc_module_maxine.so
+MODULE_MANIFEST=maxine-vfx.toml
 # File names whose ownership is the manifest checksum, not a marker line.
-SUMMED=("${BINARIES[@]}" "${LEGACY_SHIM[@]}")
+SUMMED=("${BINARIES[@]}" "$MODULE_LIB" "${LEGACY_SHIM[@]}")
 UNIT_NAME=omarchy-broadcastd.service
 DBUS_NAME=br.com.dias.OmarchyBroadcast.service
 MIC_UNIT_NAME=omarchy-broadcast-mic@.service
@@ -132,6 +149,10 @@ manifest=$state_dir/install-user.manifest
 mic_unit_src=$repo/dist/systemd/$MIC_UNIT_NAME
 mic_unit_dst=$data_dir/systemd/user/$MIC_UNIT_NAME
 mic_conf_dir=$data_dir/omarchy-broadcast/pipewire
+module_manifest_src=$repo/crates/$MODULE_CRATE/$MODULE_MANIFEST
+module_dir=$data_dir/omarchy-broadcast/modules
+module_lib_dst=$module_dir/$MODULE_LIB
+module_manifest_dst=$data_dir/omarchy-broadcast/modules.d/$MODULE_MANIFEST
 maxine_src=$repo/dist/systemd/omarchy-broadcastd.service.d/maxine.conf
 # The user's Maxine drop-in, if any: only read, never written.
 maxine_dropin=$config_dir/systemd/user/omarchy-broadcastd.service.d/maxine.conf
@@ -285,6 +306,9 @@ owned() {
   if [[ $path == "$dbus_dst" ]] && cmp -s -- "$path" "$dbus_src"; then
     WHY+="; it is identical to dist/dbus-1/services/$DBUS_NAME (a manual install): remove it and re-run"
   fi
+  if [[ $path == "$module_manifest_dst" ]]; then
+    WHY+="; it looks like a manual install of the Maxine module manifest: remove it (and the library its library line names, if that was installed by hand too, e.g. ~/.local/lib/omarchy-broadcast/modules/$MODULE_LIB) and re-run"
+  fi
   return 1
 }
 
@@ -329,7 +353,8 @@ if [[ $mode == uninstall ]]; then
   # The microphone files are always candidates too, so a lost manifest or a
   # changed XDG_STATE_HOME does not leave them behind; check_targets still
   # refuses one without the marker, and a missing one is skipped.
-  targets=("${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "$mic_unit_dst")
+  # So are the module's two files, for the same reason.
+  targets=("${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "$module_lib_dst" "$module_manifest_dst" "$mic_unit_dst")
   for c in "${MIC_CONFS[@]}"; do targets+=("$mic_conf_dir/$c"); done
   # Also what an earlier run wrote under other XDG directories.
   if [[ -f $manifest ]]; then
@@ -374,7 +399,7 @@ if [[ $mode == uninstall ]]; then
   check_targets "${targets[@]}" "$manifest"
 
   removed=0 mic_removed=0
-  lib_dirs=() mic_dirs=()
+  lib_dirs=() leaf_dirs=()
   for path in "${targets[@]}"; do
     [[ -e $path ]] || continue
     run rm -f -- "$path"
@@ -382,7 +407,8 @@ if [[ $mode == uninstall ]]; then
     if is_legacy_shim "$path"; then lib_dirs+=("${path%/*}"); fi
     case ${path##*/} in
       "$MIC_UNIT_NAME") mic_removed=1 ;;
-      omarchy-broadcast-mic-*.conf) mic_removed=1 mic_dirs+=("${path%/*}") ;;
+      omarchy-broadcast-mic-*.conf) mic_removed=1 leaf_dirs+=("${path%/*}") ;;
+      "$MODULE_LIB" | "$MODULE_MANIFEST") leaf_dirs+=("${path%/*}") ;;
     esac
   done
   # The legacy shim's library directory goes once it is empty (rmdir only
@@ -394,14 +420,25 @@ if [[ $mode == uninstall ]]; then
       fi
     done < <(printf '%s\n' "${lib_dirs[@]}" | sort -u)
   fi
-  # So do the microphone's omarchy-broadcast/pipewire and omarchy-broadcast.
-  if ((${#mic_dirs[@]})); then
-    while IFS= read -r path; do
-      if [[ $path == */omarchy-broadcast/pipewire ]]; then
-        run rmdir --ignore-fail-on-non-empty -- "$path" "${path%/*}"
-      fi
-    done < <(printf '%s\n' "${mic_dirs[@]}" | sort -u)
-  fi
+  # So do the omarchy-broadcast/{pipewire,modules,modules.d} directories of
+  # the microphone and the module, and then omarchy-broadcast itself, once
+  # the files are gone. Each is removed only while it exists and only if it
+  # is empty.
+  # The module's two directories are always tried, so an empty one left by an
+  # interrupted first install goes too.
+  leaf_dirs+=("$module_dir" "${module_manifest_dst%/*}")
+  parent_dirs=()
+  while IFS= read -r path; do
+    case $path in
+      */omarchy-broadcast/pipewire | */omarchy-broadcast/modules | */omarchy-broadcast/modules.d)
+        if [[ -d $path ]]; then run rmdir --ignore-fail-on-non-empty -- "$path"; fi
+        parent_dirs+=("${path%/*}")
+        ;;
+    esac
+  done < <(printf '%s\n' "${leaf_dirs[@]}" | sort -u)
+  while IFS= read -r path; do
+    if [[ -d $path ]]; then run rmdir --ignore-fail-on-non-empty -- "$path"; fi
+  done < <(printf '%s\n' "${parent_dirs[@]}" | sort -u)
   if [[ -e $manifest ]]; then
     run rm -f -- "$manifest"
     run rmdir --ignore-fail-on-non-empty -- "$state_dir"
@@ -443,6 +480,7 @@ fi
 
 [[ -f $unit_src ]] || die "missing $unit_src"
 [[ -f $dbus_src ]] || die "missing $dbus_src"
+[[ -f $module_manifest_src ]] || die "missing $module_manifest_src"
 
 # The shipped unit must have exactly one ExecStart naming the daemon, whatever
 # its path (/usr/bin for the package, %h/.cargo/bin in older checkouts).
@@ -453,9 +491,23 @@ n=$(grep -c -- "$exec_re" "$unit_src" || true)
   exit 2
 }
 
+# The module manifest names the library by absolute path, in a TOML basic
+# string: the shipped one must have exactly one such line, which is rewritten
+# to the installed library.
+lib_re='^library = .*$'
+n=$(grep -c -- "$lib_re" "$module_manifest_src" || true)
+((n == 1)) || {
+  printf 'install-user: expected exactly one line matching %s in %s, found %s\n' "$lib_re" "$module_manifest_src" "$n" >&2
+  exit 2
+}
+# That path goes into a TOML string, and (with --mic) into ExecStart: the data
+# dir must need no escaping in either.
+[[ $data_dir =~ ^/[A-Za-z0-9._/@+-]*$ ]] ||
+  die "data dir '$data_dir' contains characters that would need escaping in the module manifest and in ExecStart; set XDG_DATA_HOME to a plain path"
+
 # The microphone unit's ExecStart names its configuration by file name, which
 # PipeWire does not look up under XDG_DATA_HOME: it is rewritten to the
-# installed path, so the data dir must need no escaping there either.
+# installed path (the data dir is checked above).
 mic_exec_re='^ExecStart=/usr/bin/pipewire -c omarchy-broadcast-mic-%i\.conf$'
 if ((want_mic)); then
   [[ -f $mic_unit_src ]] || die "missing $mic_unit_src"
@@ -467,8 +519,6 @@ if ((want_mic)); then
     printf 'install-user: expected exactly one line matching %s in %s, found %s\n' "$mic_exec_re" "$mic_unit_src" "$n" >&2
     exit 2
   }
-  [[ $data_dir =~ ^/[A-Za-z0-9._/@+-]*$ ]] ||
-    die "data dir '$data_dir' contains characters that would need escaping in ExecStart; set XDG_DATA_HOME to a plain path"
 fi
 
 # Previously installed paths that still exist stay in the manifest, so
@@ -484,7 +534,7 @@ if [[ -f $manifest ]]; then
     path=$(manifest_path "$line")
     [[ -n $path && -e $path ]] || continue
     case $path in
-      "$unit_dst" | "$dbus_dst") continue ;;
+      "$unit_dst" | "$dbus_dst" | "$module_lib_dst" | "$module_manifest_dst") continue ;;
     esac
     for dst in "${bin_dsts[@]}"; do [[ $path == "$dst" ]] && continue 2; done
     for dst in "${mic_dsts[@]}"; do [[ $path == "$dst" ]] && continue 2; done
@@ -501,10 +551,16 @@ if [[ -f $manifest ]]; then
   done <"$manifest"
 fi
 
-check_targets "${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "${mic_dsts[@]}" "$manifest"
+check_targets "${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "$module_lib_dst" "$module_manifest_dst" "${mic_dsts[@]}" "$manifest"
 
 if ((build)); then
   run cargo build --manifest-path "$repo/Cargo.toml" --release --locked -p omarchy-broadcastd -p omarchy-broadcast || {
+    printf 'install-user: cargo build failed; nothing was changed\n' >&2
+    exit 1
+  }
+  # Separate from the daemon's build: one invocation unifies the features of
+  # its packages, which could change the daemon.
+  run cargo build --manifest-path "$repo/Cargo.toml" --release --locked -p "$MODULE_CRATE" || {
     printf 'install-user: cargo build failed; nothing was changed\n' >&2
     exit 1
   }
@@ -513,6 +569,7 @@ if ((!dry_run)); then
   for b in "${BINARIES[@]}"; do
     [[ -x $target_dir/release/$b ]] || die "no built binary at $target_dir/release/$b (run without --no-build)"
   done
+  [[ -f $target_dir/release/$MODULE_LIB ]] || die "no built module at $target_dir/release/$MODULE_LIB (run without --no-build)"
 fi
 
 # The shim files of an earlier version go before the manifest is rewritten
@@ -531,7 +588,7 @@ fi
 manifest_text() {
   echo "$MARKER"
   echo "# Paths written by install-user.sh, one per line; a binary as \"<sha256>  <path>\"."
-  printf '%s\n' "${kept[@]}" "$@" "$unit_dst" "$dbus_dst" "${mic_dsts[@]}" | sort -u
+  printf '%s\n' "${kept[@]}" "$@" "$unit_dst" "$dbus_dst" "$module_manifest_dst" "${mic_dsts[@]}" | sort -u
 }
 
 # What to install with a checksum in the manifest: source, destination, mode.
@@ -539,8 +596,9 @@ srcs=() dsts=() modes=()
 for b in "${BINARIES[@]}"; do
   srcs+=("$target_dir/release/$b") dsts+=("$bin_dir/$b") modes+=(755)
 done
+srcs+=("$target_dir/release/$MODULE_LIB") dsts+=("$module_lib_dst") modes+=(644)
 
-run mkdir -p -- "$bin_dir"
+run mkdir -p -- "$bin_dir" "$module_dir"
 # Install beside the target, then rename: replacing a running binary in place
 # would fail with "Text file busy".
 old_sums=() new_sums=()
@@ -577,6 +635,15 @@ dbus_text() {
   cat "$dbus_src"
 }
 put_text "$dbus_dst" dbus_text
+
+module_manifest_text() {
+  echo "$MARKER"
+  echo "# Generated from crates/$MODULE_CRATE/$MODULE_MANIFEST; library points at the installed module."
+  # The source's leading comment block describes the packaged install: left out.
+  awk 'started || !/^#/ { started = 1; print }' "$module_manifest_src" |
+    sed "s|$lib_re|library = \"$module_lib_dst\"|"
+}
+put_text "$module_manifest_dst" module_manifest_text
 
 if ((want_mic)); then
   mic_conf_text() {
@@ -623,14 +690,19 @@ camera (see $(printf '%q' "$wp_src")):
 The Omarchy bar plugin is a separate project: see the omarchy-broadcast-plugin
 repository and its README.
 EOF
+module_state="is installed"
+((!dry_run)) || module_state="would be installed"
 cat <<EOF
 
-Optional, NVIDIA Maxine video effects (docs/setup/maxine.md, section 3):
-install the maxine-vfx-sdk-local package (built from the omarchy-nvidia-sdks
-repository), then run the daemon with it:
+The NVIDIA Maxine video effects module $module_state ($(printf '%q' "$module_lib_dst")).
+Without the Maxine SDK the daemon lists it greyed out, with the reason. To use
+it (docs/setup/maxine.md, section 3), install the maxine-vfx-sdk-local package
+(built from the omarchy-nvidia-sdks repository), then run the daemon with it:
   install -Dm644 $(printf '%q' "$maxine_src") $(printf '%q' "$maxine_dropin")
   systemctl --user daemon-reload
   systemctl --user restart omarchy-broadcastd
+A running daemon never reloads a module library: restart it to pick up a
+rebuilt module.
 EOF
 if ((${#legacy_rm[@]})); then
   if ((dry_run)); then

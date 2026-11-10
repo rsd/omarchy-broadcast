@@ -76,7 +76,7 @@ The package installs the daemon and the client in `/usr/bin`, the Maxine module 
 
 ### Developer install
 
-`scripts/install-user.sh` builds the release binaries and installs them for the current user, without root: the binaries in `~/.local/bin`, the unit and the D-Bus file under `~/.local/share`. It installs nothing for the Maxine effects, and not the Maxine module either; see [docs/setup/maxine.md](docs/setup/maxine.md) ("The Maxine module", for building and installing the module from a checkout). It never runs `systemctl`; it prints the next steps. `--dry-run` shows the actions and `--uninstall` removes only what the script installed.
+`scripts/install-user.sh` builds the release binaries and the NVIDIA Maxine module, and installs them for the current user, without root: the binaries in `~/.local/bin`, the unit and the D-Bus file under `~/.local/share`, and the Maxine module's library and manifest under `~/.local/share/omarchy-broadcast`. It does not install the Maxine SDK or the systemd drop-in that enables the effects; see [docs/setup/maxine.md](docs/setup/maxine.md) ("The Maxine module", and section 3). It never runs `systemctl`; it prints the next steps. `--dry-run` shows the actions and `--uninstall` removes only what the script installed.
 
 ```sh
 scripts/install-user.sh

@@ -700,6 +700,16 @@ impl Modules {
         }
     }
 
+    /// Carries on the serial of `previous`, the modules this one replaces: a
+    /// list that differs from what `previous` listed moves the serial, so a
+    /// client that saw the earlier list (the empty one, before the modules
+    /// load) is told of the change.
+    pub fn follow(&mut self, previous: &Modules) {
+        self.serial = previous.serial;
+        self.listed = previous.listed.clone();
+        self.bump();
+    }
+
     /// `ModulesSerial`.
     pub fn serial(&self) -> u32 {
         self.serial

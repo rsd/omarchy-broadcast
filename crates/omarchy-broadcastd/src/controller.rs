@@ -1166,13 +1166,16 @@ impl<B: MediaBackend> Controller<B> {
     /// for this start) and publishes what they offer. For a controller made
     /// with [`Self::new_without_modules`], once, before any command.
     pub fn load_modules(&mut self, now: Instant) {
-        self.modules = Modules::load(
+        let mut loaded = Modules::load(
             &mut self.backend,
             &self.config,
             &self.runtime,
             self.paths.ledger.as_deref(),
             self.compute_capability,
         );
+        // The empty list was published before: the loaded one is a change.
+        loaded.follow(&self.modules);
+        self.modules = loaded;
         self.reconcile(now);
     }
 

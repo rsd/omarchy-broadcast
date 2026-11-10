@@ -157,8 +157,24 @@ pub fn check_abi_version(version: u32) -> Result<(), String> {
 }
 
 /// The size of the vtable of ABI 1.0, the smallest a host of this major
-/// version accepts: what a module built for 1.0 sets in `struct_size`.
-pub const VTABLE_SIZE_1_0: usize = size_of::<obc_module_vtable>();
+/// version accepts: what a module built for 1.0 sets in `struct_size`. It is
+/// fixed: later minors append entries and must not move it.
+pub const VTABLE_SIZE_1_0: usize = 136;
+
+// `check` is the last entry of ABI 1.0, so the 1.0 vtable ends right after it.
+const _: () = assert!(
+    std::mem::offset_of!(obc_module_vtable, check)
+        + size_of::<
+            Option<
+                unsafe extern "C" fn(
+                    *mut obc_module_abi::obc_module,
+                    *const *const c_char,
+                    usize,
+                ) -> obc_module_abi::obc_status,
+            >,
+        >()
+        == VTABLE_SIZE_1_0
+);
 
 /// A loaded, checked module library.
 pub struct Library {
