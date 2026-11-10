@@ -11,6 +11,9 @@
 //! * [`fill_black_nv12`], [`copy_nv12_async`], [`memset_2d_async`],
 //!   [`copy_2d_async`]: stream-ordered fills and device-to-device copies;
 //! * [`upload_2d`], [`download_2d`]: synchronous host transfers;
+//! * [`upload_2d_async`], [`download_2d_async`], [`upload_nv12_async`],
+//!   [`download_nv12_async`]: stream-ordered host transfers, asynchronous
+//!   with page-locked memory ([`PinnedHostBuffer`]);
 //! * [`DeviceBuffer`] / [`DeviceNv12Buffer`]: owned pitched allocations
 //!   with host upload and download, for intermediates and tests;
 //! * [`Stream`], [`Event`]: owned streams and timing events;
@@ -33,7 +36,7 @@
 use std::ffi::c_void;
 use std::marker::PhantomData;
 
-use obc_backend::{BackendError, ColourSpec, DeviceNv12};
+use obc_backend::{BackendError, ColourSpec, DeviceNv12, HostNv12};
 
 mod checkpoint;
 mod driver;
@@ -562,6 +565,242 @@ pub unsafe fn download_2d(
     // (checked above) and exclusively borrowed for the synchronous copy; the
     // caller guarantees the source.
     d.check("cuMemcpy2D_v2", unsafe { (d.cuMemcpy2D_v2)(&p) })
+}
+
+/// Copies `height` rows of `width_bytes` bytes from device memory at `src`
+/// (rows `src_pitch` apart) to host memory at `host` (rows `host_pitch`
+/// apart), ordered on `stream` (`cuMemcpy2DAsync_v2`). The copy is
+/// asynchronous only for page-locked host memory ([`PinnedHostBuffer`]);
+/// either way the host bytes are complete only once `stream` has been
+/// synchronised.
+///
+/// # Safety
+/// The source rectangle must lie inside a live device allocation of the
+/// current context, and `host .. host + host_pitch * (height - 1) +
+/// width_bytes` must be valid for writes and not accessed otherwise until
+/// the stream is synchronised.
+pub unsafe fn download_2d_async(
+    src: CuDevicePtr,
+    src_pitch: usize,
+    host: *mut u8,
+    host_pitch: usize,
+    width_bytes: usize,
+    height: usize,
+    stream: CuStream,
+) -> Result<(), GpuError> {
+    if host.is_null() || host_pitch < width_bytes {
+        return Err(GpuError::InvalidArgument(format!(
+            "host rows of {host_pitch} bytes cannot take {width_bytes} bytes (or a null pointer)"
+        )));
+    }
+    let d = driver()?;
+    let p = Memcpy2d {
+        src_memory_type: MEMORYTYPE_DEVICE,
+        src_device: src,
+        src_pitch,
+        dst_memory_type: MEMORYTYPE_HOST,
+        dst_host: host.cast::<c_void>(),
+        dst_pitch: host_pitch,
+        width_in_bytes: width_bytes,
+        height,
+        ..Memcpy2d::zeroed()
+    };
+    // SAFETY: `p` outlives the call (the driver copies it); the caller
+    // guarantees both rectangles until the stream is synchronised.
+    d.check("cuMemcpy2DAsync_v2", unsafe {
+        (d.cuMemcpy2DAsync_v2)(&p, stream)
+    })
+}
+
+/// Copies `height` rows of `width_bytes` bytes from host memory at `host`
+/// (rows `host_pitch` apart) to device memory at `dst` (rows `dst_pitch`
+/// apart), ordered on `stream`; see [`download_2d_async`].
+///
+/// # Safety
+/// The destination rectangle must lie inside a live device allocation of
+/// the current context, and the host rectangle must be valid for reads and
+/// not written until the stream is synchronised.
+pub unsafe fn upload_2d_async(
+    host: *const u8,
+    host_pitch: usize,
+    dst: CuDevicePtr,
+    dst_pitch: usize,
+    width_bytes: usize,
+    height: usize,
+    stream: CuStream,
+) -> Result<(), GpuError> {
+    if host.is_null() || host_pitch < width_bytes {
+        return Err(GpuError::InvalidArgument(format!(
+            "host rows of {host_pitch} bytes cannot give {width_bytes} bytes (or a null pointer)"
+        )));
+    }
+    let d = driver()?;
+    let p = Memcpy2d {
+        src_memory_type: MEMORYTYPE_HOST,
+        src_host: host.cast::<c_void>(),
+        src_pitch: host_pitch,
+        dst_memory_type: MEMORYTYPE_DEVICE,
+        dst_device: dst,
+        dst_pitch,
+        width_in_bytes: width_bytes,
+        height,
+        ..Memcpy2d::zeroed()
+    };
+    // SAFETY: as in `download_2d_async`.
+    d.check("cuMemcpy2DAsync_v2", unsafe {
+        (d.cuMemcpy2DAsync_v2)(&p, stream)
+    })
+}
+
+/// Checks that a device and a host NV12 frame have the same size and are
+/// self-consistent.
+fn check_nv12_pair(device: &DeviceNv12, host: &HostNv12) -> Result<(), GpuError> {
+    device
+        .validate()
+        .map_err(|e| GpuError::InvalidArgument(e.to_string()))?;
+    host.validate()
+        .map_err(|e| GpuError::InvalidArgument(e.to_string()))?;
+    if (device.width, device.height) != (host.width, host.height) {
+        return Err(GpuError::InvalidArgument(format!(
+            "NV12 transfer between {}x{} and {}x{}",
+            device.width, device.height, host.width, host.height
+        )));
+    }
+    Ok(())
+}
+
+/// Copies both planes of the NV12 frame `src` (device) into `dst` (host,
+/// same size) on `stream`; see [`download_2d_async`].
+///
+/// # Safety
+/// As [`download_2d_async`], for both planes of both frames.
+pub unsafe fn download_nv12_async(
+    src: &DeviceNv12,
+    dst: &HostNv12,
+    stream: CuStream,
+) -> Result<(), GpuError> {
+    check_nv12_pair(src, dst)?;
+    let (w, h) = (src.width as usize, src.height as usize);
+    // SAFETY: the caller guarantees both frames; the rectangles are theirs.
+    unsafe {
+        download_2d_async(src.y, src.y_pitch, dst.y, dst.y_pitch, w, h, stream)?;
+        download_2d_async(src.uv, src.uv_pitch, dst.uv, dst.uv_pitch, w, h / 2, stream)
+    }
+}
+
+/// Copies both planes of the NV12 frame `src` (host) into `dst` (device,
+/// same size) on `stream`; see [`upload_2d_async`].
+///
+/// # Safety
+/// As [`upload_2d_async`], for both planes of both frames.
+pub unsafe fn upload_nv12_async(
+    src: &HostNv12,
+    dst: &DeviceNv12,
+    stream: CuStream,
+) -> Result<(), GpuError> {
+    check_nv12_pair(dst, src)?;
+    let (w, h) = (src.width as usize, src.height as usize);
+    // SAFETY: the caller guarantees both frames; the rectangles are theirs.
+    unsafe {
+        upload_2d_async(src.y, src.y_pitch, dst.y, dst.y_pitch, w, h, stream)?;
+        upload_2d_async(src.uv, src.uv_pitch, dst.uv, dst.uv_pitch, w, h / 2, stream)
+    }
+}
+
+/// Page-locked host memory (`cuMemAllocHost_v2`), which the GPU reads and
+/// writes directly, so stream-ordered transfers with it are truly
+/// asynchronous. Allocated in, and freed (on drop) with, the context that
+/// is current: drop it with that context current.
+pub struct PinnedHostBuffer {
+    ptr: *mut u8,
+    len: usize,
+}
+
+// SAFETY: page-locked memory is plain host memory, not bound to a thread;
+// the buffer owns it exclusively.
+unsafe impl Send for PinnedHostBuffer {}
+
+impl PinnedHostBuffer {
+    /// Allocates `len` bytes (non-zero) in the current context. The content
+    /// is undefined until written.
+    pub fn alloc(len: usize) -> Result<PinnedHostBuffer, GpuError> {
+        if len == 0 {
+            return Err(GpuError::InvalidArgument(
+                "empty page-locked host allocation".into(),
+            ));
+        }
+        let d = driver()?;
+        let mut p: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `p` is a valid out-pointer.
+        d.check("cuMemAllocHost_v2", unsafe {
+            (d.cuMemAllocHost_v2)(&mut p, len)
+        })?;
+        Ok(PinnedHostBuffer { ptr: p.cast(), len })
+    }
+
+    /// The address of the first byte.
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr
+    }
+
+    /// The size in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Always false: an allocation is never empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The bytes. Read them only while no transfer into the buffer is
+    /// pending on a stream.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr` is our live allocation of `len` bytes.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    /// The bytes, writable. Write them only while no transfer from or into
+    /// the buffer is pending on a stream.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `ptr` is our live allocation of `len` bytes, exclusively
+        // borrowed.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    /// A `width x height` NV12 frame over the buffer, the Y rows then the
+    /// UV rows, `pitch` bytes apart. Fails if the buffer is too small.
+    pub fn nv12(&mut self, width: u32, height: u32, pitch: usize) -> Result<HostNv12, GpuError> {
+        let rows = height as usize + height as usize / 2;
+        if pitch < width as usize || pitch * rows > self.len {
+            return Err(GpuError::InvalidArgument(format!(
+                "a page-locked buffer of {} bytes cannot hold a {width}x{height} NV12 frame \
+                 with rows of {pitch} bytes",
+                self.len
+            )));
+        }
+        let f = HostNv12 {
+            y: self.ptr,
+            y_pitch: pitch,
+            // SAFETY: inside the allocation (checked above).
+            uv: unsafe { self.ptr.add(pitch * height as usize) },
+            uv_pitch: pitch,
+            width,
+            height,
+        };
+        f.validate()
+            .map_err(|e| GpuError::InvalidArgument(e.to_string()))?;
+        Ok(f)
+    }
+}
+
+impl Drop for PinnedHostBuffer {
+    fn drop(&mut self) {
+        if let Ok(d) = driver() {
+            // SAFETY: allocated by us with cuMemAllocHost and freed once.
+            unsafe { (d.cuMemFreeHost)(self.ptr.cast()) };
+        }
+    }
 }
 
 fn check_host_rect(

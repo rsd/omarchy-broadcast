@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::modules::{ModulesConfig, ModulesState, StoredValue, legacy, valid_module_id};
 use crate::{
     AspectPolicy, CameraSelector, ColourRange, DEFAULT_SINK_LABEL, EffectMode, EffectOnFailure,
     ModeRequest, OutputContract, OutputFormat, RelightLight, SinkSelector, fmt_size_rate,
@@ -147,6 +148,21 @@ pub struct Config {
     pub lifecycle: LifecycleConfig,
     pub effect: EffectConfig,
     pub pipewire: PipeWireConfig,
+    /// `[modules]`: which modules load, the stage order, the backend profile
+    /// and the pins ([`ModulesConfig`]).
+    #[serde(skip_serializing_if = "is_default_modules")]
+    pub modules: ModulesConfig,
+    /// `[module."<id>"]`: each module's own configuration, by module id, a
+    /// free table handed to the module as it is (as JSON) when it is
+    /// loaded. The daemon checks the id's form only; the module checks its
+    /// keys, and a module that refuses its table is unavailable with the
+    /// reason.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub module: BTreeMap<String, toml::Table>,
+}
+
+fn is_default_modules(m: &ModulesConfig) -> bool {
+    *m == ModulesConfig::default()
 }
 
 /// `[camera]`: which camera, and what to ask it for.
@@ -339,6 +355,35 @@ impl EffectConfig {
     }
 }
 
+impl EffectConfig {
+    /// The values of the module settings that revision 8 configured here,
+    /// by setting id ([`legacy`]): the noise removal, enhancement and
+    /// relighting keys. They are the defaults the daemon shows for those
+    /// settings, over each module's own.
+    pub fn legacy_settings(&self) -> BTreeMap<String, StoredValue> {
+        [
+            (legacy::DENOISE, StoredValue::Bool(self.denoise)),
+            (legacy::ENHANCE, StoredValue::Bool(self.enhance)),
+            (legacy::RELIGHT, StoredValue::Bool(self.relight)),
+            (
+                legacy::LIGHT,
+                StoredValue::Str(self.relight_light.as_str().into()),
+            ),
+            (
+                legacy::DIRECTION,
+                StoredValue::Int(self.relight_direction.into()),
+            ),
+            (
+                legacy::BRIGHTNESS,
+                StoredValue::Int(self.relight_brightness.into()),
+            ),
+        ]
+        .into_iter()
+        .map(|(id, v)| (id.to_string(), v))
+        .collect()
+    }
+}
+
 impl Default for EffectConfig {
     fn default() -> Self {
         EffectConfig {
@@ -391,6 +436,8 @@ impl Default for Config {
             lifecycle: LifecycleConfig::default(),
             effect: EffectConfig::default(),
             pipewire: PipeWireConfig::default(),
+            modules: ModulesConfig::default(),
+            module: BTreeMap::new(),
         }
     }
 }
@@ -461,7 +508,14 @@ impl Config {
         check_idle_grace(self.lifecycle.idle_grace_s).map_err(invalid("lifecycle.idle_grace_s"))?;
         check_start_debounce(self.lifecycle.start_debounce_ms)
             .map_err(invalid("lifecycle.start_debounce_ms"))?;
-        self.effect.validate()
+        self.effect.validate()?;
+        self.modules
+            .validate()
+            .map_err(|(key, reason)| ConfigError::Invalid { key, reason })?;
+        if let Some(id) = self.module.keys().find(|id| !valid_module_id(id)) {
+            return Err(invalid("module")(crate::modules::not_a_module_id(id)));
+        }
+        Ok(())
     }
 
     /// The output contract: `output.mode`'s size and rate, `output.format`,
@@ -1055,6 +1109,25 @@ pub struct RuntimeState {
     /// ([`CameraControlState::reset_all`]).
     #[serde(skip_serializing, deserialize_with = "de_camera_controls")]
     pub camera_controls: BTreeMap<String, CameraControlState>,
+    /// The module choices made with `SetModuleEnabled`, `SetStageOrder`,
+    /// `SetBackendProfile` and `SetStagePin` ([`ModulesState`]), each over
+    /// the config's `[modules]`. The `[modules]` table, left out when
+    /// nothing is set.
+    #[serde(skip_serializing_if = "ModulesState::is_empty")]
+    pub modules: ModulesState,
+    /// The values of module settings set with `SetSetting`, by setting id:
+    /// the `[settings]` table, left out when empty. Read leniently: a value
+    /// that is not a boolean, an integer or a string is dropped with a
+    /// warning ([`RuntimeState::load_noting`]) and never damages the file.
+    /// The typed keys revision 8 wrote for some of them (`denoise`,
+    /// `enhance`, `relight`, `relight_light`, `relight_direction`,
+    /// `relight_brightness`) are read as before and moved here by
+    /// [`RuntimeState::migrate_legacy_settings`].
+    #[serde(
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "crate::modules::de_settings"
+    )]
+    pub settings: BTreeMap<String, StoredValue>,
 }
 
 impl Default for RuntimeState {
@@ -1072,6 +1145,8 @@ impl Default for RuntimeState {
             relight_direction: None,
             relight_brightness: None,
             camera_controls: BTreeMap::new(),
+            modules: ModulesState::default(),
+            settings: BTreeMap::new(),
         }
     }
 }
@@ -1260,6 +1335,85 @@ fn camera_controls_toml(controls: &BTreeMap<String, CameraControlState>) -> Stri
 }
 
 impl RuntimeState {
+    /// Moves the values of the typed keys of revision 8 (`denoise`,
+    /// `enhance`, `relight`, `relight_light`, `relight_direction`,
+    /// `relight_brightness`) into [`Self::settings`] under their setting
+    /// ids ([`legacy`]), unless a value of that id is there already, and
+    /// clears them, so that they are saved there from now on. Whether
+    /// anything moved.
+    pub fn migrate_legacy_settings(&mut self) -> bool {
+        let moved = [
+            (legacy::DENOISE, self.denoise.take().map(StoredValue::Bool)),
+            (legacy::ENHANCE, self.enhance.take().map(StoredValue::Bool)),
+            (legacy::RELIGHT, self.relight.take().map(StoredValue::Bool)),
+            (
+                legacy::LIGHT,
+                self.relight_light
+                    .take()
+                    .map(|l| StoredValue::Str(l.as_str().into())),
+            ),
+            (
+                legacy::DIRECTION,
+                self.relight_direction
+                    .take()
+                    .map(|d| StoredValue::Int(d.into())),
+            ),
+            (
+                legacy::BRIGHTNESS,
+                self.relight_brightness
+                    .take()
+                    .map(|b| StoredValue::Int(b.into())),
+            ),
+        ];
+        let mut any = false;
+        for (id, value) in moved {
+            if let Some(v) = value {
+                any = true;
+                self.settings.entry(id.to_string()).or_insert(v);
+            }
+        }
+        any
+    }
+
+    /// This state with the typed keys of revision 8 written back from
+    /// [`Self::settings`] (where one is not set already), each only when
+    /// it is a value revision 8 accepts: what [`Self::save`] writes, so
+    /// that a daemon of revision 8 reading the file keeps these choices.
+    /// [`Self::migrate_legacy_settings`] keeps the `[settings]` values over
+    /// them when the file is read again.
+    fn with_legacy_keys(&self) -> RuntimeState {
+        let mut st = self.clone();
+        let get = |id: &str| self.settings.get(id);
+        let bool_of = |id: &str| match get(id) {
+            Some(StoredValue::Bool(b)) => Some(*b),
+            _ => None,
+        };
+        st.denoise = st.denoise.or_else(|| bool_of(legacy::DENOISE));
+        st.enhance = st.enhance.or_else(|| bool_of(legacy::ENHANCE));
+        st.relight = st.relight.or_else(|| bool_of(legacy::RELIGHT));
+        st.relight_light = st.relight_light.or_else(|| match get(legacy::LIGHT) {
+            Some(StoredValue::Str(s)) => s.parse().ok(),
+            _ => None,
+        });
+        st.relight_direction = st
+            .relight_direction
+            .or_else(|| match get(legacy::DIRECTION) {
+                Some(StoredValue::Int(i)) => i32::try_from(*i)
+                    .ok()
+                    .filter(|d| check_relight_direction(*d).is_ok()),
+                _ => None,
+            });
+        st.relight_brightness = st
+            .relight_brightness
+            .or_else(|| match get(legacy::BRIGHTNESS) {
+                Some(StoredValue::Int(i)) => u32::try_from(*i)
+                    .ok()
+                    .filter(|b| check_relight_brightness(*b).is_ok()),
+                _ => None,
+            });
+        st
+    }
+
     /// The effect settings in force: each key of `config` overridden by
     /// this state's value when it has one (`on_failure` is config only).
     pub fn effect_over(&self, config: &EffectConfig) -> EffectConfig {
@@ -1310,12 +1464,20 @@ impl RuntimeState {
             Ok(state) => {
                 // The second read of a small file, for what the first one
                 // dropped.
-                let notes = toml::from_str::<toml::Table>(&text)
-                    .ok()
+                let table = toml::from_str::<toml::Table>(&text).ok();
+                let controls = table
+                    .as_ref()
                     .and_then(|t| t.get("camera_controls").map(camera_controls_from))
                     .map(|(_, w)| w)
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                let settings = table
+                    .as_ref()
+                    .and_then(|t| t.get("settings").map(crate::modules::settings_from))
+                    .map(|(_, w)| w)
+                    .unwrap_or_default();
+                let notes = controls
                     .into_iter()
+                    .chain(settings)
                     .map(|w| format!("{}: {w}", path.display()))
                     .collect();
                 (state, None, notes)
@@ -1334,7 +1496,9 @@ impl RuntimeState {
     /// Writes `path` atomically: a temporary file with a name of its own in
     /// the same directory, flushed to disk, renamed over `path`, then the
     /// directory flushed so the rename is durable. Creates the parent
-    /// directories.
+    /// directories. The values of [`Self::settings`] that revision 8 kept
+    /// in typed keys are written in those keys as well
+    /// ([`Self::with_legacy_keys`]).
     ///
     /// Saves may run concurrently, from threads or processes: each writes its
     /// own temporary file, and the last rename wins whole. A temporary file
@@ -1349,7 +1513,9 @@ impl RuntimeState {
         let name = path.file_name().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "state path has no file name")
         })?;
-        let mut text = toml::to_string(self).map_err(io::Error::other)?;
+        // The typed effect keys of revision 8 are written next to
+        // `[settings]`, for a daemon of that revision reading the file.
+        let mut text = toml::to_string(&self.with_legacy_keys()).map_err(io::Error::other)?;
         text.push_str(&camera_controls_toml(&self.camera_controls));
         let (tmp, f) = create_temp(dir, name)?;
         let write = |mut f: fs::File| -> io::Result<()> {
@@ -1649,6 +1815,19 @@ offer_nv12 = false
         expected.loopback.device = Some("/dev/video11".into());
         expected.effect.background_image = Some("/home/user/Pictures/background.png".into());
         expected.effect.maxine_root = Some("/home/user/.local/opt/maxine/VideoFX".into());
+        expected.modules = ModulesConfig {
+            dirs: vec!["/home/user/omarchy-modules".into()],
+            disabled: vec!["org.example.hello".into()],
+            order: ["enhance", "denoise", "background", "relight"]
+                .map(String::from)
+                .to_vec(),
+            profile: Some(crate::modules::BackendProfile::Quality),
+            pin: [(
+                "background".to_string(),
+                "br.com.dias.maxine-vfx".to_string(),
+            )]
+            .into(),
+        };
         assert_eq!(c, expected);
         // Every key of the schema appears in the example.
         for key in [
@@ -2142,6 +2321,7 @@ offer_nv12 = false
             relight_direction: Some(45),
             relight_brightness: Some(60),
             camera_controls: BTreeMap::new(),
+            ..RuntimeState::default()
         };
         st.save(&path).unwrap();
         assert_eq!(RuntimeState::load(&path), (st.clone(), None));
@@ -2912,5 +3092,196 @@ reset_all = false
             let sel: CameraSelector = s.parse().unwrap();
             assert_eq!(selector_form(&sel), s);
         }
+    }
+
+    /// A daemon of revision 8 (0.23) reading a saved state keeps the
+    /// effect choices: the typed keys are written next to `[settings]`
+    /// (values revision 8 would refuse are left out), and reading the file
+    /// again prefers `[settings]`.
+    #[test]
+    fn a_save_writes_the_revision_8_effect_keys_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let mut st = RuntimeState::default();
+        for (id, v) in [
+            (legacy::DENOISE, StoredValue::Bool(true)),
+            (legacy::ENHANCE, StoredValue::Bool(false)),
+            (legacy::RELIGHT, StoredValue::Bool(true)),
+            (legacy::LIGHT, StoredValue::Str("cool".into())),
+            (legacy::DIRECTION, StoredValue::Int(-30)),
+            // Not a value revision 8 accepts: not written as a typed key.
+            (legacy::BRIGHTNESS, StoredValue::Int(52)),
+            ("org.example.x.gain", StoredValue::Int(3)),
+        ] {
+            st.settings.insert(id.into(), v);
+        }
+        st.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        let table: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(table["denoise"].as_bool(), Some(true), "{text}");
+        assert_eq!(table["enhance"].as_bool(), Some(false), "{text}");
+        assert_eq!(table["relight"].as_bool(), Some(true), "{text}");
+        assert_eq!(table["relight_light"].as_str(), Some("cool"), "{text}");
+        assert_eq!(table["relight_direction"].as_integer(), Some(-30), "{text}");
+        assert!(!table.contains_key("relight_brightness"), "{text}");
+        assert!(table.contains_key("settings"), "{text}");
+        // What revision 8 reads: the typed keys alone.
+        let (old, damaged) = RuntimeState::load(&path);
+        assert_eq!(damaged, None);
+        assert_eq!(old.denoise, Some(true));
+        assert_eq!(old.relight_light, Some(RelightLight::Cool));
+        assert_eq!(old.relight_direction, Some(-30));
+        // Read again, `[settings]` wins over a typed key that differs.
+        let edited = text.replace("denoise = true", "denoise = false");
+        fs::write(&path, edited).unwrap();
+        let (mut again, damaged) = RuntimeState::load(&path);
+        assert_eq!(damaged, None);
+        assert!(again.migrate_legacy_settings());
+        assert_eq!(again, st);
+    }
+
+    /// A state file of revision 8 (0.23) keeps working: its typed effect
+    /// keys are read and checked as before, and move into `[settings]` by
+    /// their setting ids, which is where they are saved from then on.
+    #[test]
+    fn a_revision_8_state_file_moves_its_effect_keys_into_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        fs::write(
+            &path,
+            "enabled = true\neffect = \"blur\"\nblur_strength = 0.3\ndenoise = true\n\
+             enhance = false\nrelight = true\nrelight_light = \"warm\"\n\
+             relight_direction = -45\nrelight_brightness = 150\n\n\
+             [camera_controls.\"usb-1\"]\nvalues = { saturation = 128 }\n",
+        )
+        .unwrap();
+        let (mut st, damaged) = RuntimeState::load(&path);
+        assert_eq!(damaged, None);
+        assert_eq!(st.denoise, Some(true));
+        assert!(st.migrate_legacy_settings());
+        assert_eq!(st.denoise, None);
+        assert_eq!(st.relight_light, None);
+        let v = |id: &str| st.settings.get(id).cloned();
+        assert_eq!(v(legacy::DENOISE), Some(StoredValue::Bool(true)));
+        assert_eq!(v(legacy::ENHANCE), Some(StoredValue::Bool(false)));
+        assert_eq!(v(legacy::RELIGHT), Some(StoredValue::Bool(true)));
+        assert_eq!(v(legacy::LIGHT), Some(StoredValue::Str("warm".into())));
+        assert_eq!(v(legacy::DIRECTION), Some(StoredValue::Int(-45)));
+        assert_eq!(v(legacy::BRIGHTNESS), Some(StoredValue::Int(150)));
+        // The core keys stay typed.
+        assert_eq!(st.effect, Some(EffectMode::Blur));
+        assert_eq!(st.blur_strength, Some(0.3));
+        assert!(!st.migrate_legacy_settings(), "nothing left to move");
+        st.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[settings]"), "{text}");
+        let (mut again, damaged) = RuntimeState::load(&path);
+        assert_eq!(damaged, None);
+        assert!(
+            again.migrate_legacy_settings(),
+            "the typed keys are written too"
+        );
+        assert_eq!(again, st);
+        // A bad typed key still damages the file, as in revision 8.
+        fs::write(&path, "relight_direction = 7.5\n").unwrap();
+        assert!(RuntimeState::load(&path).1.is_some());
+    }
+
+    /// The module choices and the setting values round-trip; a setting
+    /// value of a type no setting takes is dropped with a note, never
+    /// damaging the file.
+    #[test]
+    fn module_choices_and_setting_values_round_trip() {
+        use crate::modules::BackendProfile;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let mut st = RuntimeState::default();
+        st.modules.enabled.insert("org.example.hello".into(), true);
+        st.modules.order = Some(vec!["denoise".into(), "background".into()]);
+        st.modules.profile = Some(BackendProfile::Battery);
+        st.modules
+            .pin
+            .insert("background".into(), "br.com.dias.maxine-vfx".into());
+        st.settings
+            .insert("effect.hello.strength".into(), StoredValue::Int(40));
+        st.camera_controls.insert(
+            "usb-1".into(),
+            CameraControlState {
+                values: [("contrast".to_string(), 3)].into(),
+                ..CameraControlState::default()
+            },
+        );
+        st.save(&path).unwrap();
+        assert_eq!(RuntimeState::load(&path), (st.clone(), None));
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("[modules.pin]\n\n")
+        );
+        fs::write(
+            &path,
+            "[settings]\n\"effect.hello.strength\" = 1.5\n\"effect.hello.enabled\" = true\n",
+        )
+        .unwrap();
+        let (st, damaged, notes) = RuntimeState::load_noting(&path);
+        assert_eq!(damaged, None);
+        assert_eq!(st.settings.len(), 1);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        // A default state writes neither table.
+        RuntimeState::default().save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("modules") && !text.contains("settings"),
+            "{text}"
+        );
+    }
+
+    /// `[modules]` and the module tables parse and are checked; the
+    /// revision-8 config keys are the defaults of their settings.
+    #[test]
+    fn the_modules_keys_parse_and_are_checked() {
+        let c = parse(
+            "[effect]\ndenoise = true\nrelight_brightness = 120\n\
+             maxine_root = \"/opt/maxine\"\n\n\
+             [modules]\ndirs = [\"/srv/modules\"]\ndisabled = [\"org.example.hello\"]\n\
+             order = [\"denoise\", \"background\"]\nprofile = \"battery\"\n\
+             pin = { background = \"br.com.dias.maxine-vfx\" }\n\n\
+             [module.\"br.com.dias.maxine-vfx\"]\nsdk_root = \"/opt/other\"\n\
+             [module.\"org.example.hello\"]\nanything = { goes = [1, 2] }\n",
+        )
+        .unwrap();
+        assert_eq!(c.modules.dirs, [PathBuf::from("/srv/modules")]);
+        assert_eq!(
+            c.modules.profile,
+            Some(crate::modules::BackendProfile::Battery)
+        );
+        assert_eq!(c.module.len(), 2);
+        assert_eq!(
+            c.module["br.com.dias.maxine-vfx"]["sdk_root"].as_str(),
+            Some("/opt/other")
+        );
+        let legacy = c.effect.legacy_settings();
+        assert_eq!(legacy[legacy::DENOISE], StoredValue::Bool(true));
+        assert_eq!(legacy[legacy::BRIGHTNESS], StoredValue::Int(120));
+        assert_eq!(parse(&c.to_toml()).unwrap(), c);
+        // Core keys still refuse unknown fields, the module tables do not.
+        let e = parse("[modules]\nprofiles = \"battery\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("profiles"), "{e}");
+        let e = parse("[modules]\nprofile = \"fast\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("fast"), "{e}");
+        let e = parse("[modules]\ndirs = [\"rel\"]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("absolute"), "{e}");
+        let e = parse("[module.maxine]\nx = 1\n").unwrap_err().to_string();
+        assert!(e.contains("module id"), "{e}");
+        // A revision-8 config has neither table and writes neither back.
+        let c = parse("[effect]\nmode = \"blur\"\n").unwrap();
+        assert_eq!(c.modules, ModulesConfig::default());
+        assert!(!c.to_toml().contains("modules"));
     }
 }

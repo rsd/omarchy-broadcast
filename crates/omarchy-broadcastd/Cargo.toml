@@ -12,6 +12,9 @@ obc-core = { workspace = true }
 obc-pipeline = { workspace = true }
 obc-gpu = { workspace = true }
 obc-ipc = { workspace = true }
+# The modules: discovery, loading, the registry and the crash ledger.
+obc-module-host = { workspace = true }
+serde_json = { workspace = true }
 zbus = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
@@ -30,6 +33,9 @@ clap = { workspace = true }
 pipewire = ["obc-pipeline/pipewire"]
 
 [dev-dependencies]
+# The hardware tests check that the NVIDIA Maxine SDK loads before they
+# build the Maxine module for the daemon they spawn.
+obc-backend-maxine = { workspace = true }
 # Peer-to-peer D-Bus connections for interface tests without a session bus.
 zbus = { workspace = true, features = ["p2p"] }
 tempfile = { workspace = true }

@@ -14,6 +14,7 @@ use std::str::FromStr;
 use serde::Serialize;
 
 pub mod config;
+pub mod modules;
 
 /// Card label of the dedicated virtual camera (see
 /// `docs/adr/0004-v4l2loopback-first.md`).

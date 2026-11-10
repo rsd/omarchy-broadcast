@@ -8,6 +8,60 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// The `modules.d` directory with the Maxine module these tests built, once
+/// [`maxine_available`] has found the SDK: every daemon spawned afterwards
+/// finds the module there (`OBC_MODULE_PATH`).
+static MAXINE_MODULES: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Whether the NVIDIA Maxine SDK can be loaded here (its libraries open,
+/// no model loaded, no CUDA context), with the reason if not; when it can,
+/// the Maxine module is built (in the profile of this test binary) and
+/// offered to the daemons spawned from then on.
+pub fn maxine_available() -> Result<(), String> {
+    obc_pipeline::effect_backend_available_with(&obc_backend_maxine::MaxineFactory::from_env())?;
+    MAXINE_MODULES.get_or_init(|| {
+        let exe = std::env::current_exe().unwrap();
+        let profile_dir = exe
+            .parent()
+            .and_then(Path::parent)
+            .expect("test binary under target/<profile>/deps")
+            .to_path_buf();
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+        let mut build = Command::new(env!("CARGO"));
+        build
+            .args(["build", "-q", "-p", "obc-module-maxine", "--manifest-path"])
+            .arg(&manifest);
+        if profile_dir.file_name().is_some_and(|n| n == "release") {
+            build.arg("--release");
+        }
+        let st = build
+            .status()
+            .expect("run cargo to build the Maxine module");
+        assert!(st.success(), "building the Maxine module failed: {st}");
+        let lib = profile_dir.join("libobc_module_maxine.so");
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("maxine-modules.d");
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../obc-module-maxine/maxine-vfx.toml"),
+        )
+        .unwrap();
+        let text: String = text
+            .lines()
+            .map(|l| {
+                if l.starts_with("library = ") {
+                    format!("library = {:?}", lib.display().to_string())
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("maxine-vfx.toml"), text).unwrap();
+        dir
+    });
+    Ok(())
+}
+
 /// The D-Bus daemon these tests run their own bus with.
 pub const DBUS_DAEMON: &str = "/usr/bin/dbus-daemon";
 
@@ -215,6 +269,9 @@ impl DaemonEnv {
             .env("XDG_STATE_HOME", &self.state_home)
             .env("XDG_RUNTIME_DIR", &self.runtime_dir)
             .stdin(Stdio::null());
+        if let Some(dir) = MAXINE_MODULES.get() {
+            c.env("OBC_MODULE_PATH", dir);
+        }
         c
     }
 

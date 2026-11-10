@@ -1113,7 +1113,7 @@ fn effects_switch_while_streaming_and_release_the_gpu() {
     );
     let sink = std::fs::canonicalize(&sink).unwrap_or(sink);
     let cam = resolve_camera("OBC_TEST_CAMERA");
-    if let Err(e) = obc_pipeline::effect_backend_available() {
+    if let Err(e) = common::maxine_available() {
         panic!("the effect backend is unavailable: {e}. {IGNORE_EFFECTS}");
     }
     let consumer_bin = consumer_binary();
@@ -1440,7 +1440,16 @@ fn the_backend_parks_the_gpu_between_sessions_without_a_camera() {
         hold_timeout: cfg.hold_timeout(),
         input_gap: cfg.input_gap(),
         fixed_framerate: false,
-        effect: obc_core::config::EffectConfig::default(),
+        effect: omarchy_broadcastd::backend::EffectRun {
+            mode: obc_core::EffectMode::None,
+            blur_strength: 0.5,
+            background_image: None,
+            on_failure: obc_core::EffectOnFailure::Black,
+            stages: Vec::new(),
+            chains: Vec::new(),
+            enhance: false,
+        },
+        backends: Default::default(),
     };
     let mut backend = GstBackend::new(None, None).unwrap();
     backend
@@ -1582,8 +1591,8 @@ fn the_daemon_parks_the_gpu_when_idle() {
             node.display()
         );
     }
-    let maxine = std::env::var_os("OBC_TEST_PRELOAD").is_some()
-        && obc_pipeline::effect_backend_available().is_ok();
+    let maxine =
+        std::env::var_os("OBC_TEST_PRELOAD").is_some() && common::maxine_available().is_ok();
     if !maxine {
         eprintln!("no Maxine SDK or OBC_TEST_PRELOAD: no blur session");
     }
@@ -1763,7 +1772,7 @@ fn denoise_stacks_with_the_effect_while_streaming_and_the_gpu_parks() {
     if std::env::var_os("OBC_TEST_PRELOAD").is_none() {
         panic!("this test needs OBC_TEST_PRELOAD. {IGNORE_DENOISE}");
     }
-    if let Err(e) = obc_pipeline::effect_backend_available() {
+    if let Err(e) = common::maxine_available() {
         panic!("the effect backend is unavailable: {e}. {IGNORE_DENOISE}");
     }
     for node in [&sink, &cam.node] {

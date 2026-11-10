@@ -17,9 +17,64 @@
 //! (`docs/adr/0017-cuda-checkpoint-parking.md`).
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::path::Path;
 
-use obc_backend::{Availability, Feature};
+use obc_backend::Availability;
+
+/// A feature of the SDK that is installed separately: a feature directory
+/// with its library and its models. Not every feature is used by the chain
+/// yet; the list says what the backend could offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Feature {
+    /// The green-screen segmentation: the mask of `blur` and `replace`.
+    GreenScreen,
+    /// The background blur of `blur`.
+    BackgroundBlur,
+    /// Video noise removal (the `denoise` stage).
+    Denoise,
+    /// Relighting of the foreground through the green-screen matte.
+    Relighting,
+    /// Video super resolution (upscaling, and same-size denoise and
+    /// deblur modes).
+    VideoSuperResolution,
+    /// A lightweight upscaler.
+    Upscale,
+    /// Video frame generation (frames interpolated between two inputs).
+    VideoFrameGeneration,
+}
+
+impl Feature {
+    /// Every feature, in declaration order.
+    pub const ALL: [Feature; 7] = [
+        Feature::GreenScreen,
+        Feature::BackgroundBlur,
+        Feature::Denoise,
+        Feature::Relighting,
+        Feature::VideoSuperResolution,
+        Feature::Upscale,
+        Feature::VideoFrameGeneration,
+    ];
+
+    /// A stable lower-case name for logs and interfaces.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Feature::GreenScreen => "green-screen",
+            Feature::BackgroundBlur => "background-blur",
+            Feature::Denoise => "denoise",
+            Feature::Relighting => "relighting",
+            Feature::VideoSuperResolution => "video-super-resolution",
+            Feature::Upscale => "upscale",
+            Feature::VideoFrameGeneration => "video-frame-generation",
+        }
+    }
+}
+
+impl fmt::Display for Feature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// A family of model files: those whose stem (the name without
 /// [`MODEL_SUFFIX`]) starts with `prefix` and whose remaining fields,
@@ -242,6 +297,26 @@ mod tests {
             std::fs::write(m.join(name), b"").unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn features_have_stable_names() {
+        let names: Vec<&str> = Feature::ALL.iter().map(|f| f.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "green-screen",
+                "background-blur",
+                "denoise",
+                "relighting",
+                "video-super-resolution",
+                "upscale",
+                "video-frame-generation"
+            ]
+        );
+        assert_eq!(Feature::Relighting.to_string(), "relighting");
+        fn _send_clone<T: Send + Sync + Clone>() {}
+        _send_clone::<Feature>();
     }
 
     fn of(all: &[(Feature, Availability)], f: Feature) -> &Availability {

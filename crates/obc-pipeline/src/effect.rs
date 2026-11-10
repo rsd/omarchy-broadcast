@@ -4,12 +4,12 @@
 //!
 //! An output built with [`OutputConfig::effect`](crate::OutputConfig::effect)
 //! set holds one `obceffect` element for its whole life; the effect, the blur
-//! strength, the background, the fallback, the denoise stage
-//! ([`EffectSettings::denoise`], `docs/adr/0018-video-noise-removal.md`)
-//! and the relighting stage ([`EffectSettings::relight`] with its
-//! [`RelightParams`]) change on it while it streams
+//! strength, the background, the fallback and the stackable stages
+//! ([`EffectSettings::stages`]: each a [`StageId`] with its parameters, for
+//! example noise removal, `docs/adr/0018-video-noise-removal.md`, and
+//! relighting) change on it while it streams
 //! ([`Output::set_effect`](crate::Output::set_effect)), without
-//! renegotiating caps. `EffectSettings::default()` (`none`, no denoise)
+//! renegotiating caps. `EffectSettings::default()` (`none`, no stage)
 //! inserts the element in passthrough, which costs no copy and no CUDA
 //! call; `none` with a stage runs the stages alone. An output built
 //! without it (`effect: None`, the default) has no element at all and
@@ -17,47 +17,36 @@
 //!
 //! The element reports the effect's state as [`EffectStatus`], each
 //! stage's as an [`EffectStatus`] of its own
-//! ([`Output::denoise_status`](crate::Output::denoise_status),
-//! [`Output::relight_status`](crate::Output::relight_status),
-//! [`EffectStats::denoise`], [`EffectStats::relight`]), its counters as
-//! [`EffectStats`], and posts every change of any status on the output
-//! pipeline's bus as an element message named [`STATUS_MESSAGE`] (fields
-//! `effect`, `status`, `reason`, `denoise`, `denoise-reason`, `relight`,
-//! `relight-reason`). A failure of a stage drops the stage and never fails
-//! the effect. The output clock marks the first frame
+//! ([`Output::stage_status`](crate::Output::stage_status),
+//! [`EffectStats::stage`]), its counters as [`EffectStats`], and posts
+//! every change of any status on the output pipeline's bus as an element
+//! message named [`STATUS_MESSAGE`] (fields `effect`, `status`, `reason`,
+//! and `<id>` and `<id>-reason` for every stage the settings list, such as
+//! `denoise` and `denoise-reason`). A failure of a stage drops the stage and
+//! never fails the effect. The output clock marks the first frame
 //! of each new source with [`NEW_SOURCE_FLAG`], on which the element resets
 //! the backend's temporal state.
 
 use std::fmt;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use gst_obc::{
     EffectFallback, EffectKind, EffectSettings, EffectStats, EffectStatus, NEW_SOURCE_FLAG,
-    STATUS_MESSAGE, has_new_source_flag,
+    STATUS_MESSAGE, StageRequest, StageStats, has_new_source_flag,
 };
 use obc_backend::BackendFactory;
-pub use obc_backend::{Availability, Feature, RelightLight, RelightParams, Stage};
-use obc_backend_maxine::MaxineFactory;
+pub use obc_backend::{Availability, Params, StageId, Value};
 
 use crate::pipeline::{PipelineError, names};
 
 /// The inference backend an output's effect element creates its instance
-/// with. [`EffectBackend::default`] is the Maxine backend with the SDK root
-/// in force when it is made: `MAXINE_VFX_ROOT`, else the configured root
-/// ([`set_maxine_root`]), else the package's default root
-/// ([`obc_backend_maxine::DEFAULT_ROOT`]), else the library search path.
-/// Tests inject another factory.
+/// with: a factory the caller provides (the daemon's comes from the module
+/// that provides the `background` stage). There is no default: an output
+/// without one has no effect element ([`crate::OutputConfig::effect_backend`]).
 #[derive(Clone)]
 pub struct EffectBackend(pub Arc<dyn BackendFactory>);
 
 impl EffectBackend {
-    /// The Maxine backend with the SDK root in force now
-    /// ([`obc_backend_maxine::effective_root`]).
-    pub fn maxine() -> Self {
-        EffectBackend(Arc::new(MaxineFactory::from_env()))
-    }
-
     /// Any factory.
     pub fn new(factory: Arc<dyn BackendFactory>) -> Self {
         EffectBackend(factory)
@@ -69,12 +58,6 @@ impl EffectBackend {
     }
 }
 
-impl Default for EffectBackend {
-    fn default() -> Self {
-        EffectBackend::maxine()
-    }
-}
-
 impl fmt::Debug for EffectBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("EffectBackend")
@@ -83,67 +66,18 @@ impl fmt::Debug for EffectBackend {
     }
 }
 
-/// Sets the configured Maxine SDK root of this process (the config file's
-/// `[effect] maxine_root`; `None`: not configured). `MAXINE_VFX_ROOT`, when
-/// set and non-empty, still takes precedence ([`maxine_root_env`]). Outputs
-/// built afterwards use it; an output already built keeps the root it was
-/// built with. The SDK is taken from where its first library is loaded in
-/// the process (the first probe or load of an effect or of the denoise
-/// stage, even one that fails), so after that a root that leads elsewhere
-/// fails the effect until the process restarts ([`maxine_root_conflict`]).
-pub fn set_maxine_root(root: Option<PathBuf>) {
-    obc_backend_maxine::set_configured_root(root);
-}
-
-/// Why the Maxine SDK root in force now cannot be used by this process: the
-/// SDK is already loaded from elsewhere, which takes a restart to change.
-/// `None` when no SDK library is loaded yet or the loaded SDK is the one
-/// this root leads to.
-pub fn maxine_root_conflict() -> Option<String> {
-    obc_backend_maxine::root_conflict(obc_backend_maxine::effective_root().as_deref())
-}
-
-/// The Maxine SDK root `MAXINE_VFX_ROOT` sets for this process, when it is
-/// set and non-empty: it takes precedence over [`set_maxine_root`].
-pub fn maxine_root_env() -> Option<PathBuf> {
-    obc_backend_maxine::env_root()
-}
-
-/// Which features of the Maxine SDK are installed under the root this
-/// process can use ([`obc_backend_maxine::usable_root`]: the one it loaded
-/// the SDK from once it has, since a second SDK cannot be loaded beside
-/// it; else the root in force now), with that root, in
-/// [`Feature::ALL`] order; `None` when no root can be resolved (the
-/// library search path only: nothing can be checked). Reads directories
-/// only, with no CUDA call and no `dlopen`, so it never wakes a
-/// runtime-suspended GPU (`obc_backend_maxine::feature_availability`).
-/// `compute_capability` is the GPU's `(major, minor)` when known; with
-/// `None` a model for any architecture counts.
-pub fn maxine_feature_availability(
-    compute_capability: Option<(u32, u32)>,
-) -> Option<(PathBuf, Vec<(Feature, Availability)>)> {
-    let root = obc_backend_maxine::usable_root()?;
-    let features = obc_backend_maxine::feature_availability(&root, compute_capability);
-    Some((root, features))
-}
-
-/// Whether the default effect backend can run here, with the reason if not.
-/// Cheap: it opens the libraries and checks the model directory, but loads
-/// no model and creates no CUDA context (`BackendFactory::probe`).
-pub fn effect_backend_available() -> Result<(), String> {
-    effect_backend_available_with(EffectBackend::default().factory().as_ref())
-}
-
-/// [`effect_backend_available`] for a given factory.
+/// Whether the effect backend of `factory` can run here, with the reason if
+/// not. Cheap: what `BackendFactory::probe` does (no model is loaded and no
+/// CUDA context created).
 pub fn effect_backend_available_with(factory: &dyn BackendFactory) -> Result<(), String> {
     factory.probe().map_err(|e| e.to_string())
 }
 
-/// Checks `settings` as the output applies them: the rules of
-/// [`EffectSettings::validate`], and for `replace` that the background is an
-/// absolute path to a readable regular file within the size limit
-/// ([`gst_obc::background::check_file`]). Whether the image decodes is
-/// found out when the effect loads.
+/// Checks `settings` as the output applies them, before any backend is
+/// asked: the rules of [`EffectSettings::validate`], and for `replace` that
+/// the background is an absolute path to a readable regular file within
+/// the size limit ([`gst_obc::background::check_file`]). Whether the image
+/// decodes is found out when the effect loads.
 pub fn check_settings(settings: &EffectSettings) -> Result<(), PipelineError> {
     settings.validate().map_err(PipelineError::Effect)?;
     if settings.kind == EffectKind::Replace
@@ -154,17 +88,35 @@ pub fn check_settings(settings: &EffectSettings) -> Result<(), PipelineError> {
     Ok(())
 }
 
+/// [`check_settings`], and the stages' parameters as `factory` checks them
+/// (`BackendFactory::check_params`).
+pub fn check_settings_with(
+    settings: &EffectSettings,
+    factory: &dyn BackendFactory,
+) -> Result<(), PipelineError> {
+    check_settings(settings)?;
+    for s in &settings.stages {
+        factory
+            .check_params(&s.id, &s.params, &s.live)
+            .map_err(PipelineError::Effect)?;
+    }
+    Ok(())
+}
+
 /// The effect element for an output, configured and named
 /// [`names::EFFECT`].
 pub(crate) fn effect_element(
     settings: &EffectSettings,
-    backend: &EffectBackend,
+    backend: Option<&EffectBackend>,
 ) -> Result<gst_obc::ObcEffect, PipelineError> {
-    check_settings(settings)?;
+    match backend {
+        Some(b) => check_settings_with(settings, b.factory().as_ref())?,
+        None => check_settings(settings)?,
+    }
     gst_obc::register()
         .map_err(|e| PipelineError::Effect(format!("cannot register obceffect: {e}")))?;
     let fx = gst_obc::ObcEffect::new(Some(names::EFFECT));
-    fx.set_backend_factory(Some(Arc::clone(backend.factory())));
+    fx.set_backend_factory(backend.map(|b| Arc::clone(b.factory())));
     fx.apply(settings).map_err(PipelineError::Effect)?;
     Ok(fx)
 }
@@ -195,71 +147,32 @@ mod tests {
         );
     }
 
-    /// Whether `libVideoFX.so` can be found on the library search path,
-    /// which the Maxine factory falls back to.
-    fn sdk_on_search_path() -> bool {
-        std::env::var_os("LD_LIBRARY_PATH")
-            .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("libVideoFX.so").exists()))
-    }
-
-    #[test]
-    fn the_maxine_backend_with_a_root_that_points_nowhere_is_unavailable() {
-        let dir = tempfile::tempdir().unwrap();
-        let nowhere = dir.path().join("no-sdk");
-        let f = MaxineFactory::with_root(Some(nowhere.clone()));
-        let r = effect_backend_available_with(&f);
-        if sdk_on_search_path() {
-            // The factory falls back to the search path, where the SDK is,
-            // and the process is pinned to where it really came from: the
-            // search path, which any root without SDK libraries leads to
-            // as well, not the root that points nowhere.
-            assert_eq!(r, Ok(()));
-            assert_eq!(obc_backend_maxine::root_conflict(Some(&nowhere)), None);
-            let another = dir.path().join("another-nowhere");
-            assert_eq!(obc_backend_maxine::root_conflict(Some(&another)), None);
-            assert_eq!(obc_backend_maxine::root_conflict(None), None);
-            let elsewhere = dir.path().join("elsewhere/lib");
-            std::fs::create_dir_all(&elsewhere).unwrap();
-            std::fs::write(elsewhere.join("libVideoFX.so"), b"").unwrap();
-            let why = obc_backend_maxine::root_conflict(Some(&dir.path().join("elsewhere")))
-                .expect("a root with SDK libraries is another SDK");
-            assert!(why.contains("the library search path ("), "{why}");
-        } else {
-            let e = r.unwrap_err();
-            assert!(
-                e.contains("not found") && e.contains("no-sdk"),
-                "the reason names the root: {e}"
-            );
+    /// A backend whose parameter check refuses a relighting direction
+    /// beyond 90 degrees, as a real backend checks its own ranges.
+    struct Strict;
+    impl BackendFactory for Strict {
+        fn name(&self) -> &'static str {
+            "strict"
         }
-    }
-
-    #[test]
-    fn the_configured_root_reaches_the_maxine_backend() {
-        let env_set = maxine_root_env().is_some();
-        set_maxine_root(Some("/configured/sdk/for/pipeline".into()));
-        let root = obc_backend_maxine::configured_root();
-        let effective = obc_backend_maxine::effective_root();
-        let conflict = maxine_root_conflict();
-        set_maxine_root(None);
-        assert_eq!(root, Some(PathBuf::from("/configured/sdk/for/pipeline")));
-        if !env_set {
-            assert_eq!(effective, root);
-            // The configured root does not exist, so it leads to the library
-            // search path: the only place these unit tests may load the SDK
-            // from (the "points nowhere" test, when the SDK is on
-            // LD_LIBRARY_PATH), so it never conflicts, in any test order.
-            assert_eq!(conflict, None);
+        fn probe(&self) -> Result<(), BackendError> {
+            Ok(())
         }
-        assert_eq!(obc_backend_maxine::configured_root(), None);
-    }
-
-    #[test]
-    fn the_default_backend_is_maxine() {
-        assert_eq!(EffectBackend::default().factory().name(), "maxine");
-        assert_eq!(
-            format!("{:?}", EffectBackend::default()),
-            "EffectBackend(\"maxine\")"
-        );
+        fn create(&self) -> Result<Box<dyn InferenceBackend>, BackendError> {
+            Err(BackendError::Unavailable("not for frames".into()))
+        }
+        fn check_params(
+            &self,
+            stage: &StageId,
+            params: &Params,
+            live: &Params,
+        ) -> Result<(), String> {
+            match live.get("direction").or_else(|| params.get("direction")) {
+                Some(Value::Int(d)) if d.abs() > 90 => Err(format!(
+                    "the {stage} relight direction {d} is outside -90 to 90"
+                )),
+                _ => Ok(()),
+            }
+        }
     }
 
     #[test]
@@ -287,39 +200,37 @@ mod tests {
     #[test]
     fn denoise_needs_no_file_and_combines_with_every_effect() {
         for kind in [EffectKind::None, EffectKind::Blur] {
-            let s = EffectSettings {
-                denoise: true,
-                ..EffectSettings::of(kind)
-            };
+            let s = EffectSettings::of(kind).with_stage(StageRequest::on(StageId::DENOISE));
             assert!(check_settings(&s).is_ok(), "{kind}");
         }
+    }
+
+    fn relight(light: &str, direction: i64, brightness: i64) -> StageRequest {
+        StageRequest::on(StageId::RELIGHT)
+            .with_param("light", light)
+            .with_live("direction", direction)
+            .with_live("brightness", brightness)
     }
 
     #[test]
     fn relight_needs_no_file_combines_with_every_effect_and_is_validated() {
         for kind in [EffectKind::None, EffectKind::Blur] {
-            let s = EffectSettings {
-                relight: true,
-                denoise: kind == EffectKind::Blur,
-                relight_params: RelightParams {
-                    light: RelightLight::Warm,
-                    pan_deg: 120.0,
-                    gain: 0.75,
-                },
-                ..EffectSettings::of(kind)
-            };
+            let mut s = EffectSettings::of(kind).with_stage(relight("warm", 120, 75));
+            if kind == EffectKind::Blur {
+                s.stages.insert(0, StageRequest::on(StageId::DENOISE));
+            }
             assert!(check_settings(&s).is_ok(), "{kind}");
         }
-        let bad = EffectSettings {
-            relight: true,
-            relight_params: RelightParams {
-                pan_deg: 200.0,
-                ..RelightParams::default()
-            },
-            ..EffectSettings::default()
-        };
-        let e = check_settings(&bad).unwrap_err().to_string();
+        let bad = EffectSettings::default().with_stage(relight("neutral", 200, 100));
+        let e = check_settings_with(&bad, &Strict).unwrap_err().to_string();
         assert!(e.contains("relight direction"), "{e}");
+        // The backend's check applies whether or not the stage is on.
+        let mut off = bad.clone();
+        off.stages[0].enabled = false;
+        assert!(check_settings_with(&off, &Strict).is_err());
+        // Without a backend, and with another backend, its rules do not apply.
+        assert!(check_settings(&bad).is_ok());
+        assert!(check_settings_with(&bad, &Unavailable).is_ok());
     }
 
     #[test]
@@ -327,16 +238,11 @@ mod tests {
         gst::init().unwrap();
         let s = EffectSettings {
             blur_strength: 0.3,
-            denoise: true,
-            relight: true,
-            relight_params: RelightParams {
-                light: RelightLight::Cool,
-                pan_deg: -30.0,
-                gain: 1.2,
-            },
             ..EffectSettings::of(EffectKind::Blur)
-        };
-        let fx = effect_element(&s, &EffectBackend::new(Arc::new(Unavailable))).unwrap();
+        }
+        .with_stage(StageRequest::on(StageId::DENOISE))
+        .with_stage(relight("cool", -30, 120));
+        let fx = effect_element(&s, Some(&EffectBackend::new(Arc::new(Unavailable)))).unwrap();
         use gst::prelude::*;
         assert_eq!(fx.name(), names::EFFECT);
         assert_eq!(fx.settings(), s);

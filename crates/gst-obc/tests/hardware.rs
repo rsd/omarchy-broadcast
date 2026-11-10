@@ -32,10 +32,13 @@ use fake_backend::{
     FAKE_RELIGHT_MS, FAKE_RELIGHT_Y, FAKE_REPLACE_Y, FakeConfig, FakeFactory, FakeLog, Hook,
 };
 use gst::prelude::*;
-use gst_obc::{EffectFallback, EffectKind, EffectSettings, EffectStatus, ObcEffect};
+use gst_obc::{
+    EffectFallback, EffectKind, EffectSettings, EffectStatus, ObcEffect, StageId, StageRequest,
+    Value,
+};
 use gst_video::prelude::*;
-use obc_backend::{BackendFactory, RelightLight, RelightParams, Stage};
-use obc_backend_maxine::{MaskFault, MaskFaultSwitch, MaxineFactory};
+use obc_backend::BackendFactory;
+use obc_backend_maxine::{MaskFault, MaskFaultSwitch, MaxineFactory, RelightLight};
 
 const W: u32 = 640;
 const H: u32 = 360;
@@ -326,14 +329,16 @@ impl Rig {
                     s.get::<String>("status").unwrap(),
                     s.get::<String>("reason").unwrap(),
                 ));
-                self.denoise_messages.push((
-                    s.get::<String>("denoise").unwrap(),
-                    s.get::<String>("denoise-reason").unwrap(),
-                ));
-                self.relight_messages.push((
-                    s.get::<String>("relight").unwrap(),
-                    s.get::<String>("relight-reason").unwrap(),
-                ));
+                // A stage the element was never given has no field: off.
+                let stage = |id: &str| {
+                    (
+                        s.get::<String>(id).unwrap_or_else(|_| "off".into()),
+                        s.get::<String>(format!("{id}-reason").as_str())
+                            .unwrap_or_default(),
+                    )
+                };
+                self.denoise_messages.push(stage("denoise"));
+                self.relight_messages.push(stage("relight"));
             }
         }
     }
@@ -400,39 +405,70 @@ fn failed(r: &Rig) -> bool {
 }
 
 fn denoise_is(want: EffectStatus) -> impl Fn(&Rig) -> bool {
-    move |r| r.effect.denoise_status() == want
+    move |r| r.effect.stage_status("denoise") == want
 }
 
 fn denoise_failed(r: &Rig) -> bool {
-    matches!(r.effect.denoise_status(), EffectStatus::Failed(_))
+    matches!(r.effect.stage_status("denoise"), EffectStatus::Failed(_))
 }
 
 /// `kind` with the denoise stage.
 fn denoised(kind: EffectKind) -> EffectSettings {
-    EffectSettings {
-        denoise: true,
-        ..EffectSettings::of(kind)
+    with_denoise(EffectSettings::of(kind))
+}
+
+/// `s` with the denoise stage on, first in the list (before relight, as the
+/// daemon lists them).
+fn with_denoise(mut s: EffectSettings) -> EffectSettings {
+    if s.stage("denoise").is_none() {
+        s.stages.insert(0, StageRequest::new(StageId::DENOISE));
     }
+    s.stage_mut(&StageId::DENOISE).enabled = true;
+    s
+}
+
+/// Applies the element's settings with stage `id` on or off (denoise listed
+/// first if it was not listed), as a client does.
+fn set_stage(fx: &ObcEffect, id: &StageId, on: bool) {
+    let mut s = fx.settings();
+    if *id == StageId::DENOISE && s.stage("denoise").is_none() {
+        s.stages.insert(0, StageRequest::new(StageId::DENOISE));
+    }
+    s.stage_mut(id).enabled = on;
+    fx.apply(&s).unwrap();
+}
+
+/// Applies the element's settings with the relight stage's light `light`.
+fn set_light(fx: &ObcEffect, light: &str) {
+    let mut s = fx.settings();
+    s.stage_mut(&StageId::RELIGHT)
+        .params
+        .insert("light".into(), light.into());
+    fx.apply(&s).unwrap();
+}
+
+/// Applies the element's settings with the relight stage's live parameter
+/// `key` at `value`.
+fn set_live(fx: &ObcEffect, key: &str, value: Value) {
+    let mut s = fx.settings();
+    s.stage_mut(&StageId::RELIGHT)
+        .live
+        .insert(key.into(), value);
+    fx.apply(&s).unwrap();
 }
 
 fn relight_is(want: EffectStatus) -> impl Fn(&Rig) -> bool {
-    move |r| r.effect.relight_status() == want
+    move |r| r.effect.stage_status("relight") == want
 }
 
 fn relight_failed(r: &Rig) -> bool {
-    matches!(r.effect.relight_status(), EffectStatus::Failed(_))
+    matches!(r.effect.stage_status("relight"), EffectStatus::Failed(_))
 }
 
 /// `kind` with the relight stage, with `light`.
 fn relit(kind: EffectKind, light: RelightLight) -> EffectSettings {
-    EffectSettings {
-        relight: true,
-        relight_params: RelightParams {
-            light,
-            ..RelightParams::default()
-        },
-        ..EffectSettings::of(kind)
-    }
+    EffectSettings::of(kind)
+        .with_stage(StageRequest::on(StageId::RELIGHT).with_param("light", light.as_str()))
 }
 
 fn get(a: &AtomicU64) -> u64 {
@@ -509,7 +545,13 @@ fn gpu_switches_never_show_the_input_while_an_effect_is_requested() {
     let warm = rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
     let warm_ms = t0.elapsed().as_millis();
     assert!(warm.len() >= 10, "{warm:?}");
-    assert!(warm.iter().all(|s| *s == Seen::Black), "{warm:?}");
+    // The frame decided just after the status turned ready may already be
+    // processed: the status is read before the frame is taken.
+    let black = warm.iter().take_while(|s| **s == Seen::Black).count();
+    assert!(
+        black + 1 >= warm.len() && warm[black..].iter().all(|s| *s == Seen::FakeBlur),
+        "{warm:?}"
+    );
     assert!(warm_ms >= 750, "the load took {warm_ms} ms");
     for _ in 0..5 {
         assert_eq!(rig.frame(), Seen::FakeBlur);
@@ -561,7 +603,13 @@ fn gpu_switches_never_show_the_input_while_an_effect_is_requested() {
     // none -> blur again: the model was unloaded, so black first.
     rig.effect.apply(&blur).unwrap();
     let again = rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
-    assert!(again.iter().all(|s| *s == Seen::Black), "{again:?}");
+    // The frame decided just after the status turned ready may already be
+    // processed: the status is read before the frame is taken.
+    let black = again.iter().take_while(|s| **s == Seen::Black).count();
+    assert!(
+        black + 1 >= again.len() && again[black..].iter().all(|s| *s == Seen::FakeBlur),
+        "{again:?}"
+    );
     assert_eq!(rig.frame(), Seen::FakeBlur);
 
     assert_eq!(
@@ -794,7 +842,7 @@ fn gpu_none_with_denoise_passes_through_until_loaded_then_denoises() {
 
     rig.effect.apply(&denoised(EffectKind::None)).unwrap();
     assert_eq!(rig.effect.status(), EffectStatus::Off);
-    assert_eq!(rig.effect.denoise_status(), EffectStatus::Loading);
+    assert_eq!(rig.effect.stage_status("denoise"), EffectStatus::Loading);
     let warm = rig.frames_until(Duration::from_secs(10), denoise_is(EffectStatus::Ready));
     assert!(warm.len() >= 5, "{warm:?}");
     assert!(
@@ -807,15 +855,21 @@ fn gpu_none_with_denoise_passes_through_until_loaded_then_denoises() {
     assert_eq!(rig.effect.status(), EffectStatus::Off, "no effect");
     let s = rig.effect.stats();
     assert_eq!(s.frames_black, 0);
-    assert!(s.frames_denoised >= 5 && s.frames_denoised == s.frames_processed);
-    assert_eq!(s.denoise_ms_p50, Some(f64::from(FAKE_DENOISE_MS)));
+    assert!(
+        s.stage(&StageId::DENOISE).frames >= 5
+            && s.stage(&StageId::DENOISE).frames == s.frames_processed
+    );
+    assert_eq!(
+        s.stage(&StageId::DENOISE).ms_p50,
+        Some(f64::from(FAKE_DENOISE_MS))
+    );
     assert_eq!(
         *fake.log.requests.lock().unwrap(),
         [(EffectKind::None, true)]
     );
 
     // Off again: the input at once; the worker unloads.
-    rig.effect.set_property("denoise", false);
+    set_stage(&rig.effect, &StageId::DENOISE, false);
     assert_eq!(rig.frame(), Seen::Input);
     let deadline = Instant::now() + Duration::from_secs(5);
     while get(&fake.log.unloads) == 0 {
@@ -823,7 +877,7 @@ fn gpu_none_with_denoise_passes_through_until_loaded_then_denoises() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(rig.frame(), Seen::Input);
-    assert_eq!(rig.effect.denoise_status(), EffectStatus::Off);
+    assert_eq!(rig.effect.stage_status("denoise"), EffectStatus::Off);
     rig.drain_messages();
     let denoise: Vec<&str> = rig.denoise_messages.iter().map(|m| m.0.as_str()).collect();
     assert_eq!(denoise, ["loading", "ready", "off"], "{:?}", rig.messages);
@@ -850,7 +904,7 @@ fn gpu_a_denoise_load_failure_alone_passes_the_input_through_with_the_reason() {
     let seen = rig.frames_until(Duration::from_secs(5), denoise_failed);
     assert!(seen.iter().all(|s| *s == Seen::Input), "{seen:?}");
     assert_eq!(
-        rig.effect.denoise_status(),
+        rig.effect.stage_status("denoise"),
         EffectStatus::Failed("fake denoise unavailable".into())
     );
     assert_eq!(
@@ -872,10 +926,10 @@ fn gpu_a_denoise_load_failure_alone_passes_the_input_through_with_the_reason() {
 
     // Off clears the failure; on again retries (and now loads).
     fake.set(|c| c.fail_denoise_load = None);
-    rig.effect.set_property("denoise", false);
-    assert_eq!(rig.effect.denoise_status(), EffectStatus::Off);
-    rig.effect.set_property("denoise", true);
-    assert_eq!(rig.effect.denoise_status(), EffectStatus::Loading);
+    set_stage(&rig.effect, &StageId::DENOISE, false);
+    assert_eq!(rig.effect.stage_status("denoise"), EffectStatus::Off);
+    set_stage(&rig.effect, &StageId::DENOISE, true);
+    assert_eq!(rig.effect.stage_status("denoise"), EffectStatus::Loading);
     let seen = rig.frames_until(Duration::from_secs(5), denoise_is(EffectStatus::Ready));
     assert!(seen.iter().all(|s| *s == Seen::Input), "{seen:?}");
     assert_eq!(rig.frame(), Seen::FakeDenoise);
@@ -885,14 +939,14 @@ fn gpu_a_denoise_load_failure_alone_passes_the_input_through_with_the_reason() {
     // before the unload it would still be loaded.)
     fake.set(|c| c.fail_denoise_load = Some("fake denoise unavailable".into()));
     let unloads = get(&fake.log.unloads);
-    rig.effect.set_property("denoise", false);
+    set_stage(&rig.effect, &StageId::DENOISE, false);
     rig.frames_until(Duration::from_secs(5), |_| get(&fake.log.unloads) > unloads);
-    rig.effect.set_property("denoise", true);
+    set_stage(&rig.effect, &StageId::DENOISE, true);
     rig.frames_until(Duration::from_secs(5), denoise_failed);
     assert_eq!(rig.frame(), Seen::Input);
     fake.set(|c| c.fail_denoise_load = None);
     rig.effect.apply(&denoised(EffectKind::None)).unwrap();
-    assert_eq!(rig.effect.denoise_status(), EffectStatus::Loading);
+    assert_eq!(rig.effect.stage_status("denoise"), EffectStatus::Loading);
     rig.frames_until(Duration::from_secs(5), denoise_is(EffectStatus::Ready));
     assert_eq!(rig.frame(), Seen::FakeDenoise);
     assert_eq!(rig.effect.stats().frames_black, 0, "never black");
@@ -909,7 +963,7 @@ fn gpu_a_denoise_load_failure_alone_passes_the_input_through_with_the_reason() {
     let seen = bare.frames_until(Duration::from_secs(5), denoise_failed);
     assert!(seen.iter().all(|s| *s == Seen::Input), "{seen:?}");
     assert_eq!(
-        bare.effect.denoise_status(),
+        bare.effect.stage_status("denoise"),
         EffectStatus::Failed("fake SDK missing".into())
     );
     assert_eq!(bare.effect.status(), EffectStatus::Off);
@@ -933,7 +987,7 @@ fn gpu_blur_with_a_failed_denoise_load_runs_the_blur_alone() {
         assert_eq!(rig.frame(), Seen::FakeBlur, "the blur, without the stage");
     }
     assert_eq!(
-        rig.effect.denoise_status(),
+        rig.effect.stage_status("denoise"),
         EffectStatus::Failed("fake denoise unavailable".into())
     );
     assert_eq!(rig.effect.status(), EffectStatus::Ready);
@@ -943,7 +997,7 @@ fn gpu_blur_with_a_failed_denoise_load_runs_the_blur_alone() {
         [(EffectKind::Blur, false)]
     );
     assert!(rig.effect.stats().frames_processed >= 3);
-    assert_eq!(rig.effect.stats().frames_denoised, 0);
+    assert_eq!(rig.effect.stats().stage(&StageId::DENOISE).frames, 0);
 
     // The stage becomes available; a retry adds it as a switch: the blur
     // runs throughout, never black.
@@ -1006,7 +1060,12 @@ fn gpu_a_denoise_frame_failure_drops_the_stage_and_keeps_the_effect() {
             EffectStatus::Ready,
             "the effect never fails"
         );
-        let reason = rig.effect.denoise_status().reason().unwrap().to_string();
+        let reason = rig
+            .effect
+            .stage_status("denoise")
+            .reason()
+            .unwrap()
+            .to_string();
         assert!(reason.contains("fake denoise frame failure"), "{reason}");
         let after = rig.effect.stats();
         assert_eq!(after.frames_processed, before.frames_processed + 4);
@@ -1015,7 +1074,10 @@ fn gpu_a_denoise_frame_failure_drops_the_stage_and_keeps_the_effect() {
             after.frames_passthrough, before.frames_passthrough,
             "never the input, {fallback:?}"
         );
-        assert_eq!(after.frames_denoised, before.frames_denoised);
+        assert_eq!(
+            after.stage(&StageId::DENOISE).frames,
+            before.stage(&StageId::DENOISE).frames
+        );
         let processed = get(&fake.log.processes);
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(rig.frame(), Seen::FakeBlur);
@@ -1074,7 +1136,12 @@ fn gpu_an_effect_failing_again_without_the_stage_takes_the_failure_path() {
             matches!(&status, EffectStatus::Failed(r) if r.contains("fake frame failure")),
             "{status:?}"
         );
-        let reason = rig.effect.denoise_status().reason().unwrap().to_string();
+        let reason = rig
+            .effect
+            .stage_status("denoise")
+            .reason()
+            .unwrap()
+            .to_string();
         assert!(reason.contains("fake denoise frame failure"), "{reason}");
         // The failure stays: no request starts behind it.
         std::thread::sleep(Duration::from_millis(100));
@@ -1102,8 +1169,8 @@ fn gpu_a_denoise_frame_failure_of_an_earlier_request_is_recorded() {
     let toggle = |fx: &ObcEffect| {
         let fx = fx.clone();
         Hook::new(move || {
-            fx.set_property("denoise", false);
-            fx.set_property("denoise", true);
+            set_stage(&fx, &StageId::DENOISE, false);
+            set_stage(&fx, &StageId::DENOISE, true);
         })
     };
 
@@ -1113,7 +1180,7 @@ fn gpu_a_denoise_frame_failure_of_an_earlier_request_is_recorded() {
         c.on_process = Some(toggle(&rig.effect));
     });
     assert_eq!(rig.frame(), Seen::FakeBlur);
-    let status = rig.effect.denoise_status();
+    let status = rig.effect.stage_status("denoise");
     assert!(
         matches!(&status, EffectStatus::Failed(r) if r.contains("fake denoise frame failure")),
         "{status:?}"
@@ -1125,13 +1192,16 @@ fn gpu_a_denoise_frame_failure_of_an_earlier_request_is_recorded() {
         std::thread::sleep(Duration::from_millis(30));
     }
     fake.set(|c| c.fail_denoise_process = None);
-    let denoised_frames = rig.effect.stats().frames_denoised;
+    let denoised_frames = rig.effect.stats().stage(&StageId::DENOISE).frames;
     for _ in 0..5 {
         assert_eq!(rig.frame(), Seen::FakeBlur, "processed, without the stage");
     }
-    assert_eq!(rig.effect.stats().frames_denoised, denoised_frames);
+    assert_eq!(
+        rig.effect.stats().stage(&StageId::DENOISE).frames,
+        denoised_frames
+    );
     assert_eq!(rig.effect.status(), EffectStatus::Ready);
-    assert_eq!(rig.effect.denoise_status(), status, "still failed");
+    assert_eq!(rig.effect.stage_status("denoise"), status, "still failed");
 
     // The stage alone: the frame is the input; the failure is recorded at
     // once, and the worker unloads: the input passes through, untouched.
@@ -1145,7 +1215,11 @@ fn gpu_a_denoise_frame_failure_of_an_earlier_request_is_recorded() {
         c.on_process = Some(toggle(&rig.effect));
     });
     assert_eq!(rig.frame(), Seen::Input);
-    assert!(denoise_failed(&rig), "{:?}", rig.effect.denoise_status());
+    assert!(
+        denoise_failed(&rig),
+        "{:?}",
+        rig.effect.stage_status("denoise")
+    );
     rig.frames_until(Duration::from_secs(5), |_| get(&fake.log.unloads) > unloads);
     std::thread::sleep(Duration::from_millis(100));
     rig.out_memory.lock().unwrap().clear();
@@ -1262,7 +1336,7 @@ fn gpu_the_new_source_flag_resets_the_temporal_state_once() {
     // the switch's end: the backend's record of the request does.
     let loads = fake.log.requests.lock().unwrap().len();
     rig.effect.apply(&denoised(EffectKind::None)).unwrap();
-    assert_eq!(rig.effect.denoise_status(), EffectStatus::Ready);
+    assert_eq!(rig.effect.stage_status("denoise"), EffectStatus::Ready);
     let seen = rig.frames_until(Duration::from_secs(5), |_| {
         fake.log.requests.lock().unwrap().len() > loads
     });
@@ -1271,7 +1345,7 @@ fn gpu_the_new_source_flag_resets_the_temporal_state_once() {
             .all(|s| matches!(s, Seen::FakeBlurDenoised | Seen::FakeDenoise)),
         "{seen:?}"
     );
-    assert_eq!(rig.effect.denoise_status(), EffectStatus::Ready);
+    assert_eq!(rig.effect.stage_status("denoise"), EffectStatus::Ready);
     assert_eq!(rig.frame(), Seen::FakeDenoise);
     let before = get(&fake.log.resets);
     assert_eq!(rig.frame_with(gst_obc::NEW_SOURCE_FLAG), Seen::FakeDenoise);
@@ -1293,7 +1367,7 @@ fn gpu_none_with_relight_passes_through_until_loaded_then_relights() {
         .apply(&relit(EffectKind::None, RelightLight::Warm))
         .unwrap();
     assert_eq!(rig.effect.status(), EffectStatus::Off);
-    assert_eq!(rig.effect.relight_status(), EffectStatus::Loading);
+    assert_eq!(rig.effect.stage_status("relight"), EffectStatus::Loading);
     let warm = rig.frames_until(Duration::from_secs(10), relight_is(EffectStatus::Ready));
     assert!(
         warm.iter().all(|s| *s == Seen::Input),
@@ -1305,32 +1379,35 @@ fn gpu_none_with_relight_passes_through_until_loaded_then_relights() {
     // Direction and gain reach the backend on the next frame, without a
     // load.
     let loads = get(&fake.log.loads);
-    rig.effect.set_property("relight-pan", -120.0f64);
-    rig.effect.set_property("relight-gain", 1.75f64);
+    set_live(&rig.effect, "direction", Value::Float(-120.0));
+    set_live(&rig.effect, "brightness", Value::Float(175.0));
     assert_eq!(rig.frame(), Seen::FakeRelight);
     assert_eq!(
         *fake.log.last_relight_milli.lock().unwrap(),
         Some((-120_000, 1_750))
     );
     assert_eq!(get(&fake.log.loads), loads, "no load for direction or gain");
-    assert_eq!(rig.effect.relight_status(), EffectStatus::Ready);
+    assert_eq!(rig.effect.stage_status("relight"), EffectStatus::Ready);
     let s = rig.effect.stats();
     assert_eq!(s.frames_black, 0);
-    assert!(s.frames_relit >= 4 && s.frames_relit == s.frames_processed);
-    assert_eq!(s.frames_denoised, 0);
-    assert_eq!(s.relight_ms_p50, Some(f64::from(FAKE_RELIGHT_MS)));
-    assert_eq!(s.denoise_ms_p50, None);
+    assert!(
+        s.stage(&StageId::RELIGHT).frames >= 4
+            && s.stage(&StageId::RELIGHT).frames == s.frames_processed
+    );
+    assert_eq!(s.stage(&StageId::DENOISE).frames, 0);
+    assert_eq!(
+        s.stage(&StageId::RELIGHT).ms_p50,
+        Some(f64::from(FAKE_RELIGHT_MS))
+    );
+    assert_eq!(s.stage(&StageId::DENOISE).ms_p50, None);
     assert_eq!(
         *fake.log.stage_requests.lock().unwrap(),
-        [(EffectKind::None, vec![Stage::Relight], RelightLight::Warm)]
+        [(EffectKind::None, vec![StageId::RELIGHT], RelightLight::Warm)]
     );
 
     // With denoise too: both stages, in order, in one switch.
     rig.effect
-        .apply(&EffectSettings {
-            denoise: true,
-            ..relit(EffectKind::None, RelightLight::Warm)
-        })
+        .apply(&with_denoise(relit(EffectKind::None, RelightLight::Warm)))
         .unwrap();
     let seen = rig.frames_until(Duration::from_secs(5), denoise_is(EffectStatus::Ready));
     assert!(
@@ -1343,7 +1420,7 @@ fn gpu_none_with_relight_passes_through_until_loaded_then_relights() {
         fake.log.stage_requests.lock().unwrap().last().unwrap(),
         &(
             EffectKind::None,
-            vec![Stage::Denoise, Stage::Relight],
+            vec![StageId::DENOISE, StageId::RELIGHT],
             RelightLight::Warm
         )
     );
@@ -1351,7 +1428,7 @@ fn gpu_none_with_relight_passes_through_until_loaded_then_relights() {
     // Off again: the input at once; the worker unloads.
     rig.effect.apply(&EffectSettings::default()).unwrap();
     assert_eq!(rig.frame(), Seen::Input);
-    assert_eq!(rig.effect.relight_status(), EffectStatus::Off);
+    assert_eq!(rig.effect.stage_status("relight"), EffectStatus::Off);
     let deadline = Instant::now() + Duration::from_secs(5);
     while get(&fake.log.unloads) == 0 {
         assert!(Instant::now() < deadline, "no unload");
@@ -1406,18 +1483,18 @@ fn gpu_relight_toggles_and_new_lights_are_switches_on_the_loaded_chain() {
         assert_eq!(rig.frame(), Seen::FakeBlurRelit, "{light}");
         assert_eq!(
             fake.log.stage_requests.lock().unwrap().last().unwrap(),
-            &(EffectKind::Blur, vec![Stage::Relight], light)
+            &(EffectKind::Blur, vec![StageId::RELIGHT], light)
         );
     }
     // The property does the same.
-    rig.effect.set_property("relight-light", "warm");
+    set_light(&rig.effect, "warm");
     rig.frames_until(Duration::from_secs(5), relight_is(EffectStatus::Ready));
     assert_eq!(
         fake.log.stage_requests.lock().unwrap().last().unwrap().2,
         RelightLight::Warm
     );
-    rig.effect.set_property("relight", false);
-    assert_eq!(rig.effect.relight_status(), EffectStatus::Off);
+    set_stage(&rig.effect, &StageId::RELIGHT, false);
+    assert_eq!(rig.effect.stage_status("relight"), EffectStatus::Off);
     let blur_alone = |_: &Rig| {
         fake.log.stage_requests.lock().unwrap().last().unwrap()
             == &(EffectKind::Blur, vec![], RelightLight::Neutral)
@@ -1460,12 +1537,16 @@ fn gpu_relight_toggles_and_new_lights_are_switches_on_the_loaded_chain() {
 /// `kind` with the stages `denoise` and `relight` (with `light`).
 fn staged(kind: EffectKind, denoise: bool, relight: bool, light: RelightLight) -> EffectSettings {
     EffectSettings {
-        denoise,
-        relight,
-        relight_params: RelightParams {
-            light,
-            ..RelightParams::default()
-        },
+        stages: vec![
+            StageRequest {
+                enabled: denoise,
+                ..StageRequest::new(StageId::DENOISE)
+            },
+            StageRequest {
+                enabled: relight,
+                ..StageRequest::new(StageId::RELIGHT).with_param("light", light.as_str())
+            },
+        ],
         ..EffectSettings::of(kind)
     }
 }
@@ -1489,8 +1570,8 @@ fn gpu_a_stage_change_loads_or_releases_that_stage_alone() {
             &staged(kind, true, true, RelightLight::Neutral),
         );
         let ready = |r: &Rig| {
-            r.effect.denoise_status() == EffectStatus::Ready
-                && r.effect.relight_status() == EffectStatus::Ready
+            r.effect.stage_status("denoise") == EffectStatus::Ready
+                && r.effect.stage_status("relight") == EffectStatus::Ready
         };
         rig.frames_until(Duration::from_secs(5), ready);
         let start = rig.effect.stats();
@@ -1520,7 +1601,7 @@ fn gpu_a_stage_change_loads_or_releases_that_stage_alone() {
         ] {
             rig.effect.apply(&staged(kind, true, true, light)).unwrap();
             assert_eq!(
-                rig.effect.denoise_status(),
+                rig.effect.stage_status("denoise"),
                 EffectStatus::Ready,
                 "{kind}, {light}: denoise is untouched"
             );
@@ -1531,33 +1612,35 @@ fn gpu_a_stage_change_loads_or_releases_that_stage_alone() {
         // Denoise off, then on: relight keeps its model and its status;
         // relight off, then on: denoise does.
         let steps = [
-            (Stage::Denoise, false, (1, 1)),
-            (Stage::Denoise, true, (2, 1)),
-            (Stage::Relight, false, (2, 1)),
-            (Stage::Relight, true, (2, 2)),
+            (StageId::DENOISE, false, (1, 1)),
+            (StageId::DENOISE, true, (2, 1)),
+            (StageId::RELIGHT, false, (2, 1)),
+            (StageId::RELIGHT, true, (2, 2)),
         ];
         for (toggled, on, (d, r)) in steps {
             let label = format!("{kind}, {toggled} {}", if on { "on" } else { "off" });
-            let (denoise, relight) = match toggled {
-                Stage::Denoise => (on, true),
-                Stage::Relight => (true, on),
+            let (denoise, relight) = if toggled == StageId::DENOISE {
+                (on, true)
+            } else {
+                (true, on)
             };
             rig.effect
                 .apply(&staged(kind, denoise, relight, RelightLight::Neutral))
                 .unwrap();
-            let other = match toggled {
-                Stage::Denoise => rig.effect.relight_status(),
-                Stage::Relight => rig.effect.denoise_status(),
+            let other = if toggled == StageId::DENOISE {
+                rig.effect.stage_status("relight")
+            } else {
+                rig.effect.stage_status("denoise")
             };
             assert_eq!(other, EffectStatus::Ready, "{label}: the other stage");
-            let stages: Vec<Stage> = Stage::ALL
+            let stages: Vec<StageId> = [StageId::DENOISE, StageId::RELIGHT]
                 .into_iter()
-                .filter(|&s| s != toggled || on)
+                .filter(|s| *s != toggled || on)
                 .collect();
             rig.frames_until(Duration::from_secs(5), |rg| {
                 last().1 == stages
-                    && (!denoise || rg.effect.denoise_status() == EffectStatus::Ready)
-                    && (!relight || rg.effect.relight_status() == EffectStatus::Ready)
+                    && (!denoise || rg.effect.stage_status("denoise") == EffectStatus::Ready)
+                    && (!relight || rg.effect.stage_status("relight") == EffectStatus::Ready)
             });
             assert_eq!(counts(), (d, r, rebinds), "{label}");
         }
@@ -1604,7 +1687,7 @@ fn gpu_a_relight_load_failure_runs_the_chain_without_it() {
             assert_eq!(rig.frame(), want, "{kind}: the effect, without the stage");
         }
         assert_eq!(
-            rig.effect.relight_status(),
+            rig.effect.stage_status("relight"),
             EffectStatus::Failed("fake relight unavailable".into())
         );
         assert_eq!(rig.effect.status(), EffectStatus::Ready, "{kind}");
@@ -1633,8 +1716,8 @@ fn gpu_a_relight_load_failure_runs_the_chain_without_it() {
     assert_eq!(rig.effect.status(), EffectStatus::Off);
     // A new light retries; the stage is available now.
     fake.set(|c| c.fail_relight_load = None);
-    rig.effect.set_property("relight-light", "warm");
-    assert_eq!(rig.effect.relight_status(), EffectStatus::Loading);
+    set_light(&rig.effect, "warm");
+    assert_eq!(rig.effect.stage_status("relight"), EffectStatus::Loading);
     let seen = rig.frames_until(Duration::from_secs(5), relight_is(EffectStatus::Ready));
     assert!(seen.iter().all(|s| *s == Seen::Input), "{seen:?}");
     assert_eq!(rig.frame(), Seen::FakeRelight);
@@ -1684,7 +1767,7 @@ fn gpu_a_relight_frame_failure_drops_the_stage_and_keeps_the_rest() {
             };
             rig.effect.apply(&settings).unwrap();
             rig.frames_until(Duration::from_secs(5), |r| {
-                r.effect.relight_status() == EffectStatus::Ready
+                r.effect.stage_status("relight") == EffectStatus::Ready
                     && r.effect.status() == EffectStatus::Ready
             });
             assert_eq!(rig.frame(), relit_frame, "{label}");
@@ -1696,7 +1779,12 @@ fn gpu_a_relight_frame_failure_drops_the_stage_and_keeps_the_rest() {
             }
             fake.set(|c| c.fail_relight_process = None);
             assert_eq!(rig.effect.status(), EffectStatus::Ready, "{label}");
-            let reason = rig.effect.relight_status().reason().unwrap().to_string();
+            let reason = rig
+                .effect
+                .stage_status("relight")
+                .reason()
+                .unwrap()
+                .to_string();
             assert!(reason.contains("fake relight frame failure"), "{reason}");
             let after = rig.effect.stats();
             assert_eq!(
@@ -1709,7 +1797,11 @@ fn gpu_a_relight_frame_failure_drops_the_stage_and_keeps_the_rest() {
                 after.frames_passthrough, before.frames_passthrough,
                 "{label}"
             );
-            assert_eq!(after.frames_relit, before.frames_relit, "{label}");
+            assert_eq!(
+                after.stage(&StageId::RELIGHT).frames,
+                before.stage(&StageId::RELIGHT).frames,
+                "{label}"
+            );
         }
     }
     // Alone under none: the failing frame and the later ones are the input.
@@ -1728,21 +1820,18 @@ fn gpu_a_relight_frame_failure_drops_the_stage_and_keeps_the_rest() {
     // With denoise under none: the failing frame is the input, then the
     // denoise stage goes on alone.
     rig.effect
-        .apply(&EffectSettings {
-            denoise: true,
-            ..relit(EffectKind::None, RelightLight::Warm)
-        })
+        .apply(&with_denoise(relit(EffectKind::None, RelightLight::Warm)))
         .unwrap();
     rig.frames_until(Duration::from_secs(5), |r| {
-        r.effect.relight_status() == EffectStatus::Ready
-            && r.effect.denoise_status() == EffectStatus::Ready
+        r.effect.stage_status("relight") == EffectStatus::Ready
+            && r.effect.stage_status("denoise") == EffectStatus::Ready
     });
     assert_eq!(rig.frame(), Seen::FakeRelightDenoised);
     fake.set(|c| c.fail_relight_process = Some("fake relight frame failure".into()));
     assert_eq!(rig.frame(), Seen::Input, "the failing frame");
     fake.set(|c| c.fail_relight_process = None);
     let seen = rig.frames_until(Duration::from_secs(5), |r| {
-        r.effect.denoise_status() == EffectStatus::Ready && relight_failed(r)
+        r.effect.stage_status("denoise") == EffectStatus::Ready && relight_failed(r)
     });
     assert!(
         seen.iter()
@@ -1775,7 +1864,8 @@ fn gpu_a_failed_new_light_drops_the_stage_and_the_status_says_so() {
         &relit(EffectKind::Blur, RelightLight::Warm),
     );
     rig.frames_until(Duration::from_secs(5), |r| {
-        r.effect.relight_status() == EffectStatus::Ready && r.effect.status() == EffectStatus::Ready
+        r.effect.stage_status("relight") == EffectStatus::Ready
+            && r.effect.status() == EffectStatus::Ready
     });
     assert_eq!(rig.frame(), Seen::FakeBlurRelit);
     fake.set(|c| c.fail_relight_rebind = Some("fake rebind failure".into()));
@@ -1792,7 +1882,7 @@ fn gpu_a_failed_new_light_drops_the_stage_and_the_status_says_so() {
         assert_eq!(rig.frame(), Seen::FakeBlur, "the effect without the stage");
     }
     assert_eq!(
-        rig.effect.relight_status(),
+        rig.effect.stage_status("relight"),
         EffectStatus::Failed("fake rebind failure".into())
     );
     assert_eq!(rig.effect.status(), EffectStatus::Ready);
@@ -1809,14 +1899,15 @@ fn gpu_a_failed_new_light_drops_the_stage_and_the_status_says_so() {
     let effect = rig.effect.clone();
     fake.set(|c| {
         c.on_rebind_failure = Some(Hook::new(move || {
-            effect.set_property("relight-light", "warm");
+            set_light(&effect, "warm");
         }))
     });
     rig.effect
         .apply(&relit(EffectKind::Blur, RelightLight::Cool))
         .unwrap();
     rig.frames_until(Duration::from_secs(5), |r| {
-        get(&fake.log.relight_builds) > builds && r.effect.relight_status() == EffectStatus::Ready
+        get(&fake.log.relight_builds) > builds
+            && r.effect.stage_status("relight") == EffectStatus::Ready
     });
     for _ in 0..3 {
         assert_eq!(
@@ -1827,7 +1918,7 @@ fn gpu_a_failed_new_light_drops_the_stage_and_the_status_says_so() {
     }
     assert_eq!(
         fake.log.stage_requests.lock().unwrap().last().unwrap(),
-        &(EffectKind::Blur, vec![Stage::Relight], RelightLight::Warm)
+        &(EffectKind::Blur, vec![StageId::RELIGHT], RelightLight::Warm)
     );
 
     // The stage alone: the input after the failure, then an unload. Blur
@@ -1837,7 +1928,7 @@ fn gpu_a_failed_new_light_drops_the_stage_and_the_status_says_so() {
     rig.effect
         .apply(&relit(EffectKind::None, RelightLight::Warm))
         .unwrap();
-    assert_eq!(rig.effect.relight_status(), EffectStatus::Ready);
+    assert_eq!(rig.effect.stage_status("relight"), EffectStatus::Ready);
     assert_eq!(rig.effect.status(), EffectStatus::Off);
     let seen = rig.frames_until(Duration::from_secs(5), |_| {
         fake.log.requests.lock().unwrap().len() > loads
@@ -1847,7 +1938,7 @@ fn gpu_a_failed_new_light_drops_the_stage_and_the_status_says_so() {
             .all(|s| matches!(s, Seen::FakeBlurRelit | Seen::FakeRelight)),
         "{seen:?}"
     );
-    assert_eq!(rig.effect.relight_status(), EffectStatus::Ready);
+    assert_eq!(rig.effect.stage_status("relight"), EffectStatus::Ready);
     assert_eq!(rig.frame(), Seen::FakeRelight);
     let unloads = get(&fake.log.unloads);
     let black = rig.effect.stats().frames_black;
@@ -1902,7 +1993,7 @@ fn gpu_a_new_source_rebuilds_the_relight_stage_before_it_relights_again() {
         rig.effect.apply(&settings).unwrap();
         rig.frames_until(Duration::from_secs(5), |r| {
             fake.log.requests.lock().unwrap().len() > loads
-                && r.effect.relight_status() == EffectStatus::Ready
+                && r.effect.stage_status("relight") == EffectStatus::Ready
                 && (kind == EffectKind::None || r.effect.status() == EffectStatus::Ready)
         });
         assert_eq!(rig.frame(), relit_frame, "{kind}");
@@ -1920,7 +2011,7 @@ fn gpu_a_new_source_rebuilds_the_relight_stage_before_it_relights_again() {
         });
         let seen = rig.frames_until(Duration::from_secs(5), |r| {
             get(&fake.log.relight_builds) > builds
-                && r.effect.relight_status() == EffectStatus::Ready
+                && r.effect.stage_status("relight") == EffectStatus::Ready
         });
         assert!(
             seen.iter().all(|s| *s == plain || *s == relit_frame),
@@ -1977,15 +2068,14 @@ fn gpu_frame_parameters_after_a_failure_load_nothing() {
     let attempts = |f: &FakeFactory| f.log.stage_requests.lock().unwrap().len();
     let tries = attempts(&fake);
     for (i, pan) in [-90.0f32, -45.0, 0.0, 45.0, 90.0].into_iter().enumerate() {
-        let s = EffectSettings {
+        let mut s = EffectSettings {
             blur_strength: 0.1 * i as f32,
-            relight_params: RelightParams {
-                pan_deg: pan,
-                gain: 1.0 + 0.1 * i as f32,
-                ..settings.relight_params
-            },
             ..settings.clone()
         };
+        let r = s.stage_mut(&StageId::RELIGHT);
+        r.live.insert("direction".into(), Value::Float(pan.into()));
+        r.live
+            .insert("brightness".into(), Value::Float(100.0 + 10.0 * i as f64));
         rig.effect.apply(&s).unwrap();
         assert_eq!(rig.frame(), Seen::FakeBlur);
     }
@@ -2109,24 +2199,27 @@ fn maxine_denoise_alone_under_blur_and_toggled_while_playing() {
     // The stage alone: the input while it loads, then denoised frames.
     rig.effect.apply(&denoised(EffectKind::None)).unwrap();
     let warm = rig.frames_until(Duration::from_secs(60), |r| {
-        r.effect.denoise_status() != EffectStatus::Loading
+        r.effect.stage_status("denoise") != EffectStatus::Loading
     });
     assert_eq!(
-        rig.effect.denoise_status(),
+        rig.effect.stage_status("denoise"),
         EffectStatus::Ready,
         "the denoise stage did not load"
     );
     assert!(warm.iter().all(|s| *s == Seen::Input), "{warm:?}");
     assert_eq!(rig.effect.status(), EffectStatus::Off);
-    let before = rig.effect.stats().frames_denoised;
+    let before = rig.effect.stats().stage(&StageId::DENOISE).frames;
     for _ in 0..5 {
         let s = rig.frame();
         assert!(!matches!(s, Seen::Black), "{s:?}");
     }
-    assert_eq!(rig.effect.stats().frames_denoised, before + 5);
+    assert_eq!(
+        rig.effect.stats().stage(&StageId::DENOISE).frames,
+        before + 5
+    );
     // Read after each frame's synchronisation: the backend has the times
     // of a completed frame only.
-    let p50 = rig.effect.stats().denoise_ms_p50;
+    let p50 = rig.effect.stats().stage(&StageId::DENOISE).ms_p50;
     assert!(
         p50.is_some_and(|ms| ms > 0.0),
         "no denoise stage time after denoised frames"
@@ -2138,7 +2231,7 @@ fn maxine_denoise_alone_under_blur_and_toggled_while_playing() {
         r.effect.status() != EffectStatus::Loading
     });
     assert_eq!(rig.effect.status(), EffectStatus::Ready);
-    assert_eq!(rig.effect.denoise_status(), EffectStatus::Ready);
+    assert_eq!(rig.effect.stage_status("denoise"), EffectStatus::Ready);
     assert!(warm.iter().all(|s| *s == Seen::Black), "{warm:?}");
     let processed = |s: &Seen| !matches!(s, Seen::Input | Seen::Black);
     for _ in 0..5 {
@@ -2148,7 +2241,7 @@ fn maxine_denoise_alone_under_blur_and_toggled_while_playing() {
 
     // Off and on while playing: switches, every frame processed.
     for on in [false, true] {
-        rig.effect.set_property("denoise", on);
+        set_stage(&rig.effect, &StageId::DENOISE, on);
         let want = if on {
             EffectStatus::Ready
         } else {
@@ -2202,10 +2295,10 @@ fn maxine_a_new_source_rebuilds_the_relighting_before_it_relights() {
     );
     rig.frames_until(Duration::from_secs(60), |r| {
         r.effect.status() != EffectStatus::Loading
-            && r.effect.relight_status() != EffectStatus::Loading
+            && r.effect.stage_status("relight") != EffectStatus::Loading
     });
     assert_eq!(rig.effect.status(), EffectStatus::Ready);
-    assert_eq!(rig.effect.relight_status(), EffectStatus::Ready);
+    assert_eq!(rig.effect.stage_status("relight"), EffectStatus::Ready);
     let processed = |s: &Seen| !matches!(s, Seen::Input | Seen::Black);
     for _ in 0..3 {
         let s = rig.frame();
@@ -2216,7 +2309,8 @@ fn maxine_a_new_source_rebuilds_the_relighting_before_it_relights() {
     assert!(processed(&s), "the flagged frame: {s:?}");
     let after = rig.effect.stats();
     assert_eq!(
-        after.frames_relit, before.frames_relit,
+        after.stage(&StageId::RELIGHT).frames,
+        before.stage(&StageId::RELIGHT).frames,
         "relit by the old stage"
     );
     assert_eq!(after.frames_processed, before.frames_processed + 1);
@@ -2228,7 +2322,11 @@ fn maxine_a_new_source_rebuilds_the_relighting_before_it_relights() {
         assert!(processed(&s), "{s:?}");
     }
     let end = rig.effect.stats();
-    assert_eq!(end.frames_relit, ready.frames_relit + 3, "relit again");
+    assert_eq!(
+        end.stage(&StageId::RELIGHT).frames,
+        ready.stage(&StageId::RELIGHT).frames + 3,
+        "relit again"
+    );
     assert_eq!(end.loads, after.loads + 1, "one load rebuilt the stage");
     assert_eq!(end.frames_black, before.frames_black);
     assert_eq!(end.frames_passthrough, before.frames_passthrough);

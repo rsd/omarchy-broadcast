@@ -632,14 +632,14 @@ pub fn camera_option(options: &VariantDict) -> Result<String, IpcError> {
 }
 
 /// A dictionary seen as its keys and values, nested variants looked through.
-type Entries<'v, 'a> = HashMap<&'v str, &'v Variant<'a>>;
+pub(crate) type Entries<'v, 'a> = HashMap<&'v str, &'v Variant<'a>>;
 
-fn entries_of_dict(dict: &VariantDict) -> Entries<'_, 'static> {
+pub(crate) fn entries_of_dict(dict: &VariantDict) -> Entries<'_, 'static> {
     dict.iter().map(|(k, v)| (k.as_str(), peel(v))).collect()
 }
 
 /// The entries of a dictionary variant with string keys (`a{s*}`).
-fn entries_of<'v, 'a>(v: &'v Variant<'a>) -> Option<Entries<'v, 'a>> {
+pub(crate) fn entries_of<'v, 'a>(v: &'v Variant<'a>) -> Option<Entries<'v, 'a>> {
     match peel(v) {
         Variant::Dict(d) => d.iter().map(|(k, v)| Some((str_of(k)?, peel(v)))).collect(),
         _ => None,
@@ -680,7 +680,7 @@ fn str_of<'v>(v: &'v Variant<'_>) -> Option<&'v str> {
     }
 }
 
-fn list_of<'v, 'a>(v: &'v Variant<'a>) -> Option<&'v [Variant<'a>]> {
+pub(crate) fn list_of<'v, 'a>(v: &'v Variant<'a>) -> Option<&'v [Variant<'a>]> {
     match peel(v) {
         Variant::Array(a) => Some(a.inner()),
         _ => None,
@@ -694,32 +694,32 @@ fn fields_of<'v, 'a>(v: &'v Variant<'a>) -> Option<&'v [Variant<'a>]> {
     }
 }
 
-fn get_str<'v>(e: &Entries<'v, '_>, key: &str) -> Option<&'v str> {
+pub(crate) fn get_str<'v>(e: &Entries<'v, '_>, key: &str) -> Option<&'v str> {
     str_of(e.get(key)?)
 }
 
-fn get_bool(e: &Entries<'_, '_>, key: &str) -> Option<bool> {
+pub(crate) fn get_bool(e: &Entries<'_, '_>, key: &str) -> Option<bool> {
     bool_of(e.get(key)?)
 }
 
-fn get_int(e: &Entries<'_, '_>, key: &str) -> Option<i64> {
+pub(crate) fn get_int(e: &Entries<'_, '_>, key: &str) -> Option<i64> {
     int_of(e.get(key)?)
 }
 
 /// `v` owned. Only a file descriptor can fail to convert, and the settings
 /// channel carries none.
-fn owned(v: Variant<'_>) -> OwnedVariant {
+pub(crate) fn owned(v: Variant<'_>) -> OwnedVariant {
     OwnedVariant::try_from(v).expect("a variant without file descriptors converts")
 }
 
 /// `value` as a variant of its own D-Bus type (arrays keep their element
 /// signature when empty).
-fn to_owned<T: serde::Serialize + zbus::Type>(value: &T) -> OwnedVariant {
+pub(crate) fn to_owned<T: serde::Serialize + zbus::Type>(value: &T) -> OwnedVariant {
     zbus::as_variant::to_owned_variant(value)
         .expect("a value without file descriptors converts to a variant")
 }
 
-fn put(d: &mut VariantDict, key: &str, v: Variant<'_>) {
+pub(crate) fn put(d: &mut VariantDict, key: &str, v: Variant<'_>) {
     d.insert(key.to_string(), owned(v));
 }
 

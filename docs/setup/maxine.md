@@ -1,10 +1,48 @@
 # Using the NVIDIA Maxine Video Effects SDK with omarchy-broadcast
 
-The video effects `blur` and `replace`, video noise removal, relighting and the enhancement of a low-resolution camera run on the NVIDIA Maxine Video Effects SDK. omarchy-broadcast does not contain, build or download the SDK. The SDK is a personal download from NVIDIA, and the sibling project omarchy-nvidia-sdks (the omarchy-nvidia-sdks repository) packages it for Arch as `maxine-vfx-sdk-local`. This page covers the omarchy-broadcast side: which parts of the SDK are needed, how to enable the daemon's drop-in, what the daemon reads from its environment and how to fix the failures that are specific to omarchy-broadcast.
+The video effects `blur` and `replace`, video noise removal, relighting and the enhancement of a low-resolution camera run on the NVIDIA Maxine Video Effects SDK, through the **Maxine module**: a loadable module of omarchy-broadcast ([../modules.md](../modules.md), [ADR-0025](../adr/0025-loadable-modules.md)) that the daemon loads and that opens the SDK at run time. omarchy-broadcast does not contain, build or download the SDK. The SDK is a personal download from NVIDIA, and the sibling project omarchy-nvidia-sdks (the omarchy-nvidia-sdks repository) packages it for Arch as `maxine-vfx-sdk-local`. This page covers the omarchy-broadcast side: which parts of the SDK are needed, how to enable the daemon's drop-in, what the daemon reads from its environment and how to fix the failures that are specific to omarchy-broadcast.
 
-Without the SDK the daemon works as usual: the `none` effect and the passthrough need nothing from it, and an effect or noise removal that cannot load reports the reason in the daemon's `Error` property.
+Without the SDK the daemon works as usual: the `none` effect and the passthrough need nothing from it, and an effect or noise removal that cannot load reports the reason in the daemon's `Error` property. Without the module (no manifest for it in a `modules.d` directory) the daemon offers no effect at all: the camera image passes through and `omarchy-broadcast modules` says `No effect modules installed`.
 
 Background: [../research/maxine-linux.md](../research/maxine-linux.md) (access, licence, API). The SDK is never vendored in this repository, see [ADR-0003](../adr/0003-maxine-first-behind-backend-seam.md). The decision to leave the SDK tooling to omarchy-nvidia-sdks is in [ADR-0021](../adr/0021-nvidia-sdk-handover.md).
+
+## The Maxine module
+
+The module is the library `libobc_module_maxine.so` and a manifest, `maxine-vfx.toml`, which gives it the id `br.com.dias.maxine-vfx`. The Arch package installs the library as `/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so` and the manifest in `/usr/lib/omarchy-broadcast/modules.d/`, where the daemon looks for manifests; the manifest names the library by absolute path. The module contains no NVIDIA code: it opens the SDK when an effect loads, so it installs and loads on a machine without the SDK or an NVIDIA GPU. An effect that cannot load then fails with the reason (in the daemon's `Error` property), and where an SDK tree is found but lacks a feature, the stage that needs it is unavailable ("Not installed").
+
+It provides four stages ([../modules.md](../modules.md#the-manifest) explains the fields):
+
+| Stage | Slot | What it does | SDK feature (section 1) |
+|---|---|---|---|
+| `enhance` | `pre-matte`, position 0 | Upscales a low-resolution camera in the ingest | `nvvfxvideosuperres` |
+| `denoise` | `pre-matte` | Video noise removal | `nvvfxdenoising` |
+| `background` | `matte` | The cut-out of the person, with the blur or the replacement | `nvvfxgreenscreen`, and `nvvfxbackgroundblur` for `blur` |
+| `relight` | `post-matte`, needs the cut-out | Relighting of the person | `nvvfxrelighting`, and `nvvfxgreenscreen` |
+
+Check it with the CLI: `omarchy-broadcast modules` lists the module with its status and stages (a stage whose feature is not installed says `unavailable: Not installed`), and `omarchy-broadcast modules info br.com.dias.maxine-vfx` shows its manifest and library paths. Its settings are the `effect.*` settings of `omarchy-broadcast settings`.
+
+**From a checkout** (the developer install does not build or install the module): build it and put a manifest for it in your own `modules.d` directory, with `library` pointing at the library:
+
+```bash
+cargo build --release -p obc-module-maxine
+lib=~/.local/lib/omarchy-broadcast/modules/libobc_module_maxine.so
+install -Dm755 target/release/libobc_module_maxine.so "$lib"
+mkdir -p ~/.local/share/omarchy-broadcast/modules.d
+sed "s|^library = .*|library = \"$lib\"|" crates/obc-module-maxine/maxine-vfx.toml \
+    > ~/.local/share/omarchy-broadcast/modules.d/maxine-vfx.toml
+systemctl --user restart omarchy-broadcastd
+```
+
+A manifest in `~/.local/share/omarchy-broadcast/modules.d` replaces the packaged one of the same id. A module library that is rebuilt later takes a daemon restart to load (libraries are never unloaded); a changed manifest only needs a reload.
+
+**Configuration.** The module takes one key, the SDK root, in its own table of `config.toml`:
+
+```toml
+[module."br.com.dias.maxine-vfx"]
+sdk_root = "/home/user/.local/opt/maxine/VideoFX"
+```
+
+`[effect] maxine_root` is still honoured: the daemon passes it to the module as `sdk_root` when this table sets none, and `MAXINE_VFX_ROOT` in the daemon's environment still wins over both (section 4). Use an absolute path.
 
 ## 1. Requirements
 
@@ -87,19 +125,19 @@ The reason the daemon is not run in a namespace with a bind-mounted `os-release`
 
 ### The SDK root
 
-The SDK root is the directory that contains `lib/`, `features/` and `external/`. The daemon takes it from the first of these that applies:
+The SDK root is the directory that contains `lib/`, `features/` and `external/`. The Maxine module takes it from the first of these that applies:
 
 1. `MAXINE_VFX_ROOT` in the daemon's environment, when it is set and not empty. The package's environment file sets it.
-2. `[effect] maxine_root` in `config.toml`: an absolute path ([../config.example.toml](../config.example.toml)). A relative or empty value is rejected when the file is loaded; whether the directory exists is found out when an effect loads.
+2. `sdk_root` in the module's table of `config.toml`, `[module."br.com.dias.maxine-vfx"]`, or, when that table sets none, `[effect] maxine_root` (an alias, kept for existing configurations): an absolute path ([../config.example.toml](../config.example.toml)). A relative or empty `maxine_root` is rejected when the file is loaded; whether the directory exists is found out when an effect loads.
 3. `/opt/nvidia/maxine/videofx`, when that is a directory: where `maxine-vfx-sdk-local` installs the SDK.
 4. Otherwise no root: the SDK is looked up on the library search path only, which then has to include its directories (`LD_LIBRARY_PATH` at process start).
 
-When a root is chosen, the daemon loads the SDK's own libraries from it, by absolute path, before it opens `libVideoFX.so`: the SDK libraries, the libraries of every feature under `features/*/lib`, and the bundled CUDA and TensorRT libraries they depend on. **`LD_LIBRARY_PATH` is therefore not needed.** It still works if it is set. A feature added to the tree later is found without any change to the unit. The `models` directory next to the loaded `libVideoFX.so` (`<root>/lib/models`) is passed to the SDK as `NVVFX_MODEL_DIRECTORY`.
+When a root is chosen, the module loads the SDK's own libraries from it, by absolute path, before it opens `libVideoFX.so`: the SDK libraries, the libraries of every feature under `features/*/lib`, and the bundled CUDA and TensorRT libraries they depend on. **`LD_LIBRARY_PATH` is therefore not needed.** It still works if it is set. A feature added to the tree later is found without any change to the unit. The `models` directory next to the loaded `libVideoFX.so` (`<root>/lib/models`) is passed to the SDK as `NVVFX_MODEL_DIRECTORY`.
 
 Things to know:
 
-- **The environment file overrides the key.** `/usr/share/maxine-vfx/maxine-vfx.env` sets `MAXINE_VFX_ROOT`, so a unit that loads it ignores `[effect] maxine_root`; the daemon logs a warning when both are set. To use the key, leave the environment file out of the drop-in.
-- **The root is fixed once the SDK is loaded.** The SDK is loaded when an effect or noise removal first loads or is first checked, and a loaded library is never unloaded. After that, a different root (a changed `maxine_root` after `systemctl --user reload omarchy-broadcastd`) is refused: the effect fails with a message that asks for a restart (`systemctl --user restart omarchy-broadcastd`). A reload that changes the key logs this. A running output keeps the root it was started with.
+- **The environment file overrides the key.** `/usr/share/maxine-vfx/maxine-vfx.env` sets `MAXINE_VFX_ROOT`, so a unit that loads it ignores `sdk_root` and `[effect] maxine_root`; the daemon logs a warning when both are set. To use the key, leave the environment file out of the drop-in.
+- **The root is fixed once the SDK is loaded.** The SDK is loaded when an effect or noise removal first loads or is first checked, and a loaded library is never unloaded. After that, a different root (a changed `sdk_root` or `maxine_root` after `systemctl --user reload omarchy-broadcastd`) is refused: the effect fails with a message that asks for a restart (`systemctl --user restart omarchy-broadcastd`). A reload that changes the key logs this. A running output keeps the root it was started with.
 - **A failure keeps the reason.** A missing or incomplete SDK makes the requested effect or noise removal fail as before, with the reason in the `Error` property; libraries that could not be loaded are named in it.
 
 ### Environment variables
@@ -127,9 +165,11 @@ An SDK tree that was installed some other way, for example under `~/.local/opt/m
 1. The root, either in `config.toml` (then do not load the package's environment file, which would override it):
 
    ```toml
-   [effect]
-   maxine_root = "/home/user/.local/opt/maxine/VideoFX"
+   [module."br.com.dias.maxine-vfx"]
+   sdk_root = "/home/user/.local/opt/maxine/VideoFX"
    ```
+
+   (`[effect] maxine_root = "..."` does the same, as an alias)
 
    or as `Environment=MAXINE_VFX_ROOT=%h/.local/opt/maxine/VideoFX` in the drop-in.
 2. The two shim lines in the drop-in. Replace the active lines of the shipped drop-in with them, adjust the paths, and run `daemon-reload` and a restart:
@@ -148,7 +188,7 @@ The shim library and the replacement `os-release` come from the omarchy-nvidia-s
 
 With the SDK installed and the daemon running with the drop-in (section 3), the effects are selected in two ways:
 
-- In `config.toml`, the `[effect]` section (`mode`, `blur_strength`, `background_image`, `denoise`, `enhance`, `relight`, `relight_light`, `relight_direction`, `relight_brightness`, `on_failure`, `maxine_root`); see [../config.example.toml](../config.example.toml).
+- In `config.toml`, the `[effect]` section (`mode`, `blur_strength`, `background_image`, `denoise`, `enhance`, `relight`, `relight_light`, `relight_direction`, `relight_brightness`, `on_failure`, `maxine_root`) and the module's own `[module."br.com.dias.maxine-vfx"]` table (`sdk_root`); see [../config.example.toml](../config.example.toml).
 - At run time, with `omarchy-broadcast effect none|blur|replace [--strength X] [--image PATH]`, which the daemon remembers across restarts, and, for every effect and stage, `omarchy-broadcast settings` (`effect.*`, for example `settings set effect.lighting.relight on`); see [../cli-json.md](../cli-json.md) and [../dbus-api.md](../dbus-api.md).
 
 Video noise removal is a separate switch that combines with any effect: `[effect] denoise = true` in `config.toml`, or `omarchy-broadcast denoise on|off` at run time. It removes the grain a webcam produces, which is mostly visible in dim rooms, and it runs before the blur or replacement, or alone with the effect `none`. It needs the `nvvfxdenoising` feature and its models in the package (section 2). Things to know:
@@ -178,8 +218,11 @@ Problems with the SDK itself (download, package, architecture) are in omarchy-nv
 | The daemon's `Error` property reads `effect blur unavailable: NvVFX_Load(GreenScreen) returned -1209 (...)`, naming the os-release override (this page, section 3), and the state is `error` | The daemon runs without the shim: the drop-in is not installed, `daemon-reload` and a restart were skipped, or its paths do not match your installation. With the default `on_failure = "black"` the virtual camera stays black | Install the drop-in (section 3) and check `systemctl --user show omarchy-broadcastd -p Environment`; set `MAXINE_OS_RELEASE_DEBUG=1` to see the redirect. A `cannot be preloaded` line in `journalctl --user -u omarchy-broadcastd` means the library path in `LD_PRELOAD` is wrong or the package is not installed |
 | The unit fails to start after the drop-in was installed, and `journalctl --user -u omarchy-broadcastd` shows `Failed to load environment files: No such file or directory` (systemd does not name the file) | `EnvironmentFile=` has no `-`, so a missing file is an error. `maxine-vfx-sdk-local` is not installed | Check that `/usr/share/maxine-vfx/maxine-vfx.env` exists, which it does when the package is installed. Install the package (section 2), or remove the drop-in (section 8) |
 | The drop-in has no effect: the daemon's environment lacks `LD_PRELOAD` | The file is not at `~/.config/systemd/user/omarchy-broadcastd.service.d/maxine.conf` (the directory name must match the unit), or `daemon-reload` was skipped | Check the path, run `systemctl --user daemon-reload`, restart, and check with `systemctl --user cat omarchy-broadcastd` |
-| An effect fails with a message that the SDK is already loaded from another place and asks for a restart | `[effect] maxine_root` (or `MAXINE_VFX_ROOT`) changed after the SDK was first loaded in the running daemon | `systemctl --user restart omarchy-broadcastd` (section 4) |
+| An effect fails with a message that the SDK is already loaded from another place and asks for a restart | `sdk_root`, `[effect] maxine_root` (or `MAXINE_VFX_ROOT`) changed after the SDK was first loaded in the running daemon | `systemctl --user restart omarchy-broadcastd` (section 4) |
 | An effect reports that a feature library is not found (`-2`) or the package lacks a feature | The package was built without that feature | Rebuild `maxine-vfx-sdk-local` with the features of section 1 that you use (section 2), reinstall it and restart the daemon. The drop-in needs no edit |
+| `omarchy-broadcast modules` says `No effect modules installed`, or the settings have no effect group | The Maxine module's manifest is not in a `modules.d` directory: the package is not installed, or the checkout's module was never built and installed | Install the package, or follow "From a checkout" under [The Maxine module](#the-maxine-module); then `systemctl --user restart omarchy-broadcastd` |
+| The module is listed `unavailable`, with a reason such as `The library /... is not installed` or `Built for module ABI N; this daemon supports module ABI 1` | The library named by the manifest's `library` is missing, or was built for another version of the module interface than this daemon's | Check the paths with `omarchy-broadcast modules info br.com.dias.maxine-vfx`; rebuild and reinstall the module from the same checkout as the daemon |
+| The module is `disabled` with `Disabled after crashing the daemon twice in a row` | The module's code was running when the daemon went down twice in a row (see the journal for the crash) | Fix the cause (the SDK installation and the shim of section 3 are the usual ones), then `omarchy-broadcast modules enable br.com.dias.maxine-vfx` |
 | A setting such as `effect.lighting.relight` or `effect.video.denoise` is greyed "Not installed" | The package has no library, or no models for this GPU's architecture, for that feature (relighting also needs `nvvfxgreenscreen`) | `ls /opt/nvidia/maxine/videofx/features` and `ls /opt/nvidia/maxine/videofx/lib/models`; rebuild the package with the feature and your architecture (section 2). The daemon looks again at its next start, reload and session |
 | The daemon's `Error` says `relighting unavailable: ...` or `enhance unavailable: ...`, and the video is shown without it | The feature failed to load or run (the reason says which) | The reason names the SDK's status; check section 3 (the shim applies to every feature's library) and the models. The video is not affected otherwise |
 | The daemon's `Error` says `noise removal unavailable: ... -2` (NVCV status), and the camera image is shown without noise removal | The package does not contain the `nvvfxdenoising` feature, or the daemon found no SDK root (section 4) and so looked for it on the library search path only | Check that `MAXINE_VFX_FEATURES` in `/usr/share/maxine-vfx/maxine-vfx.env` lists `nvvfxdenoising`; rebuild the package with it if not (section 2); check the drop-in |
@@ -199,7 +242,7 @@ systemctl --user restart omarchy-broadcastd.service
 sudo pacman -R maxine-vfx-sdk-local
 ```
 
-Without the drop-in the daemon runs as usual and the effects are unavailable.
+Without the drop-in the daemon runs as usual and the effects are unavailable. To remove the Maxine module of a checkout install, delete its manifest and library (`~/.local/share/omarchy-broadcast/modules.d/maxine-vfx.toml` and `~/.local/lib/omarchy-broadcast/modules/libobc_module_maxine.so`) and restart the daemon; the packaged module goes with the omarchy-broadcast package, and `omarchy-broadcast modules disable br.com.dias.maxine-vfx` turns it off without removing it.
 
 An os-release shim installed by `scripts/install-user.sh` of an older omarchy-broadcast release, under `~/.local/lib/omarchy-broadcast/`, is removed by `scripts/install-user.sh --uninstall` of the current script, and by reinstalling with it. To remove it by hand: `rm -f ~/.local/lib/omarchy-broadcast/os-release-shim.so ~/.local/lib/omarchy-broadcast/fake-os-release`.
 

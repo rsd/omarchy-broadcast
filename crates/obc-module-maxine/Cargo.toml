@@ -1,0 +1,27 @@
+[package]
+name = "obc-module-maxine"
+description = "NVIDIA Maxine video effects as an omarchy-broadcast module (the SDK is loaded at run time)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+# The module library the daemon loads: libobc_module_maxine.so.
+crate-type = ["cdylib"]
+
+[dependencies]
+obc-module-sdk = { workspace = true }
+obc-backend = { workspace = true }
+obc-backend-maxine = { workspace = true }
+obc-gpu = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+obc-module-host = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

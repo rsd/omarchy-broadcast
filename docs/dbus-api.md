@@ -4,7 +4,7 @@
 
 Clients that cannot speak D-Bus can use the CLI's JSON output instead (`omarchy-broadcast status --json`, `omarchy-broadcast watch --json`), documented in [cli-json.md](cli-json.md).
 
-Rust clients can use the `obc-ipc` crate, which holds these names, the value types, a typed proxy (`obc_ipc::OmarchyBroadcastProxy`) for method calls and signals, and `obc_ipc::Snapshot::fetch_no_autostart`, the read that never starts the daemon (see [Service presence and activation](#service-presence-and-activation)). For the camera settings it also holds the typed model of the tree and its changes (`obc_ipc::SettingsTree`, `obc_ipc::SettingChange`), with the encoding to and from the dictionaries described in [Camera settings](#camera-settings).
+Rust clients can use the `obc-ipc` crate, which holds these names, the value types, a typed proxy (`obc_ipc::OmarchyBroadcastProxy`) for method calls and signals, and `obc_ipc::Snapshot::fetch_no_autostart`, the read that never starts the daemon (see [Service presence and activation](#service-presence-and-activation)). For the camera settings it also holds the typed model of the tree and its changes (`obc_ipc::SettingsTree`, `obc_ipc::SettingChange`), with the encoding to and from the dictionaries described in [Camera settings](#camera-settings). From revision 9 it also holds the typed model of the modules (`obc_ipc::ModuleList`, `ModuleInfo`, `StageInfo`), with the encoding to and from the dictionaries of `GetModules`.
 
 ## Names
 
@@ -21,7 +21,7 @@ The object also implements the standard `org.freedesktop.DBus.Properties`, `org.
 ## Versioning
 
 - **Breaking changes** (a removed or renamed member, a changed type or meaning, a new lifecycle state) are never made to `br.com.dias.OmarchyBroadcast1`. They go into a new interface, `br.com.dias.OmarchyBroadcast2`, on the same object.
-- **Backwards-compatible additions** (a new property, method, signal or error name) are made to `br.com.dias.OmarchyBroadcast1` and raise the `InterfaceRevision` property. This document describes revision **8**. Revision 1 had no video effects: `Effect` was reserved and always `none`. Revision 2 adds the `BlurStrength` and `BackgroundImage` properties, the `SetEffect`, `SetBlurStrength` and `SetBackgroundImage` methods and the `InvalidArgument` error name, and gives `Effect` its values; it removes and changes nothing else. Revision 3 adds the optional PipeWire output ([ADR-0016](adr/0016-pipewire-output.md)): the properties `LoopbackConsumers`, `PipeWireConsumers` and `PipeWireOutput`. `Consumers` keeps its type and becomes the total of both kinds of consumer; with the PipeWire output off it has the value it had in revision 2. A client that needs only the processes holding the loopback reads `LoopbackConsumers`. Revision 4 adds video noise removal ([ADR-0018](adr/0018-video-noise-removal.md)): the `Denoise` property and the `SetDenoise` method; it changes nothing else. Revision 5 adds the live preview ([ADR-0019](adr/0019-live-preview.md)): the `AcquirePreview` and `ReleasePreview` methods, the `PreviewFrame` signal and the `PreviewConsumers` property. `Consumers` keeps its type and becomes the total of the three kinds of consumer; with no preview lease held it has the value it had in revision 4. A client that needs only the processes holding the loopback reads `LoopbackConsumers`. Revision 6 adds the camera image controls ([ADR-0020](adr/0020-camera-image-controls.md)): the `CameraControls` property and the `GetCameraControls`, `SetCameraControl` and `ResetCameraControls` methods; it changes nothing else. Revision 7 adds the camera settings channel ([ADR-0023](adr/0023-settings-schema.md)): the `SettingsRevision` and `SettingsSchemaSerial` properties, the `GetSettings`, `SetSetting` and `ResetSettings` methods, the `SettingsChanged` signal and the `UnknownSetting`, `Disabled` and `RateLimited` error names. The revision-6 members stay, with their types and meanings, as views of the same model (see [Camera settings](#camera-settings)); nothing is removed or retyped. A revision-6 client keeps working against a revision-7 daemon. Revision 8 adds **global settings** to the settings tree ([ADR-0024](adr/0024-stackable-stages-and-effects-in-the-settings-schema.md)): the video effects, noise removal, the enhancement of a low-resolution camera and relighting, as settings of `scope` `global` with ids `effect.<group>.<name>`, in groups after the camera's and present with no camera (see [Global settings](#global-settings-the-video-effects)). It adds no property, method, signal or error name; the revision-7 members and every effect member keep their types and meanings, and the settings schema stays at 1. A revision-7 client keeps working against a revision-8 daemon.
+- **Backwards-compatible additions** (a new property, method, signal or error name) are made to `br.com.dias.OmarchyBroadcast1` and raise the `InterfaceRevision` property. This document describes revision **9**. Revision 1 had no video effects: `Effect` was reserved and always `none`. Revision 2 adds the `BlurStrength` and `BackgroundImage` properties, the `SetEffect`, `SetBlurStrength` and `SetBackgroundImage` methods and the `InvalidArgument` error name, and gives `Effect` its values; it removes and changes nothing else. Revision 3 adds the optional PipeWire output ([ADR-0016](adr/0016-pipewire-output.md)): the properties `LoopbackConsumers`, `PipeWireConsumers` and `PipeWireOutput`. `Consumers` keeps its type and becomes the total of both kinds of consumer; with the PipeWire output off it has the value it had in revision 2. A client that needs only the processes holding the loopback reads `LoopbackConsumers`. Revision 4 adds video noise removal ([ADR-0018](adr/0018-video-noise-removal.md)): the `Denoise` property and the `SetDenoise` method; it changes nothing else. Revision 5 adds the live preview ([ADR-0019](adr/0019-live-preview.md)): the `AcquirePreview` and `ReleasePreview` methods, the `PreviewFrame` signal and the `PreviewConsumers` property. `Consumers` keeps its type and becomes the total of the three kinds of consumer; with no preview lease held it has the value it had in revision 4. A client that needs only the processes holding the loopback reads `LoopbackConsumers`. Revision 6 adds the camera image controls ([ADR-0020](adr/0020-camera-image-controls.md)): the `CameraControls` property and the `GetCameraControls`, `SetCameraControl` and `ResetCameraControls` methods; it changes nothing else. Revision 7 adds the camera settings channel ([ADR-0023](adr/0023-settings-schema.md)): the `SettingsRevision` and `SettingsSchemaSerial` properties, the `GetSettings`, `SetSetting` and `ResetSettings` methods, the `SettingsChanged` signal and the `UnknownSetting`, `Disabled` and `RateLimited` error names. The revision-6 members stay, with their types and meanings, as views of the same model (see [Camera settings](#camera-settings)); nothing is removed or retyped. A revision-6 client keeps working against a revision-7 daemon. Revision 8 adds **global settings** to the settings tree ([ADR-0024](adr/0024-stackable-stages-and-effects-in-the-settings-schema.md)): the video effects, noise removal, the enhancement of a low-resolution camera and relighting, as settings of `scope` `global` with ids `effect.<group>.<name>`, in groups after the camera's and present with no camera (see [Global settings](#global-settings-the-video-effects)). It adds no property, method, signal or error name; the revision-7 members and every effect member keep their types and meanings, and the settings schema stays at 1. A revision-7 client keeps working against a revision-8 daemon. Revision 9 adds **modules** ([ADR-0025](adr/0025-loadable-modules.md)): the effects are provided by loadable modules, and the interface gains the `GetModules`, `SetModuleEnabled`, `GetStageOrder`, `SetStageOrder`, `SetBackendProfile` and `SetStagePin` methods and the `ModulesSerial` and `BackendProfile` properties (see [Modules](#modules)). It adds no signal and no error name. Every revision-8 member, property and signal keeps its type and meaning, and the effect members (`SetEffect`, `SetBlurStrength`, `SetDenoise`, `SetBackgroundImage`, `Effect`, `BlurStrength`, `Denoise`, `BackgroundImage`) are kept as aliases of the `effect.background.*` and `effect.video.denoise` settings. What changes is which global settings the tree holds: they are those of the modules installed, so a daemon with no module has none. A revision-8 client keeps working against a revision-9 daemon, and sees no effect group when no module is installed.
 - A client that uses an addition checks `InterfaceRevision` first and treats an older daemon as not offering it. A client must ignore properties, signals and error names it does not know.
 
 ## Lifecycle states
@@ -85,22 +85,24 @@ All properties are read-only. Every change is announced with `org.freedesktop.DB
 | `CameraControls` | `(sa(siiiiib))` | The image controls of `ActiveCamera`, as `GetCameraControls` reports them (see [Camera image controls](#camera-image-controls)): the camera's id, then one `(name, min, max, step, default, value, stored)` per control the camera exposes. The id is empty, with no control, when there is no camera. Revision 6. | When `ActiveCamera` changes, on a rescan of the cameras, when the camera opens, once at its first frame, and after `SetCameraControl` and `ResetCameraControls`, and, while the camera is open, when the camera reports a control change (see [Camera settings](#camera-settings)). Not polled. From revision 7 it is a view of the settings model, with the five image controls only. |
 | `SettingsRevision` | `u` | Counter of the settings tree (the camera settings of `ActiveCamera` and, from revision 8, the global ones; see [Camera settings](#camera-settings)): it starts at 1 when the daemon starts and goes up by one at every change of the published tree, a value or a structure. `0` is never published. A client that sees a gap between the revision it holds and the one of a signal has missed a change and reads the tree again. Revision 7. | At every change of the settings tree, with the new value included. Emitted before the `SettingsChanged` signal of the same step. |
 | `SettingsSchemaSerial` | `u` | Counter of the *structure* of the settings tree: it starts at 1 and goes up only when the structure changes, that is when the camera changes (`ActiveCamera` changed, a camera appeared or left) or a setting appears, goes, or changes its type, range, step, default, unit, options, conditions, hint or label. A change of a value, of `stored`, `enabled` or a reason leaves it. A client keeps the structure it read while the serial stays. Revision 7. | At every structural change of the settings tree. |
-| `InterfaceRevision` | `u` | Revision of `br.com.dias.OmarchyBroadcast1` the daemon implements (see Versioning). This document describes `8`. | Never while the daemon runs. |
+| `ModulesSerial` | `u` | Counter of what `GetModules` and `GetStageOrder` return: it starts at 1 and goes up by one (wrapping past 2^32 - 1 to 1) whenever either result would be different, that is whenever a module's status, reason, `enabled` flag or stages change, a module appears or goes, a stage is provided by another module, or the order changes. See [Modules](#modules). Revision 9. | At a reload that changes the modules, after a session has started and the modules were probed again, and on `SetModuleEnabled`, `SetStageOrder`, `SetBackendProfile` and `SetStagePin` when they change the result. |
+| `BackendProfile` | `s` | Which module provides a stage that several offer: `quality` (the default) or `battery`. The effective value (a run-time choice, else the configuration's `[modules] profile`). Revision 9. | On `SetBackendProfile` when it changes the value, and on a reload that changes the effective value. |
+| `InterfaceRevision` | `u` | Revision of `br.com.dias.OmarchyBroadcast1` the daemon implements (see Versioning). This document describes `9`. | Never while the daemon runs. |
 
 ## Methods
 
-Every method returns nothing on success, except `AcquirePreview`, which returns the path of the preview frame file, `GetCameraControls`, which returns the camera's controls, and `GetSettings`, which returns the settings tree. On failure they return a D-Bus error named under `br.com.dias.OmarchyBroadcast1.Error`, whose message is a human-readable explanation. Calls with the wrong argument types fail with the standard `org.freedesktop.DBus.Error.InvalidArgs`.
+Every method returns nothing on success, except `AcquirePreview`, which returns the path of the preview frame file, `GetCameraControls`, which returns the camera's controls, `GetSettings`, which returns the settings tree, and (revision 9) `GetModules` and `GetStageOrder`, which return the modules and the stage order. On failure they return a D-Bus error named under `br.com.dias.OmarchyBroadcast1.Error`, whose message is a human-readable explanation. Calls with the wrong argument types fail with the standard `org.freedesktop.DBus.Error.InvalidArgs`.
 
 | Error name | Meaning |
 |---|---|
 | `br.com.dias.OmarchyBroadcast1.Error.NoSuchCamera` | The selector, or the camera id of a camera controls method or the `camera` option of a settings method, matches no camera that is present (the `camera` option is ignored for a global setting). The message ends with `(cameras present: …)`, listing them. |
 | `br.com.dias.OmarchyBroadcast1.Error.InvalidConfig` | The configuration file cannot be read or is invalid; the message names the file, the line and key, and the reason. The previous configuration stays in force. |
 | `br.com.dias.OmarchyBroadcast1.Error.Unavailable` | The request cannot be served now, for example `NextCamera` with no camera present, or a camera controls or settings method for `ActiveCamera` (camera `""`) when there is none (`GetSettings` is the exception, it replies with the global groups alone; a write or reset of a global setting never needs a camera), or an action fired while the camera is not open. |
-| `br.com.dias.OmarchyBroadcast1.Error.InvalidArgument` | An argument is well-formed but not acceptable: an unknown effect, a strength outside 0 to 1, a background image that is not usable, a preview frame rate other than 15 or 30, a camera control that is not offered or a value it does not accept; from revision 7 also a settings value of the wrong type, outside the range or off the step, an enum value that is not an option, an action fired with anything but `true`, a `camera` option that is not a string, a reset scope that is not one, and a reset of an action. The message says which and why. Added in revision 2. |
+| `br.com.dias.OmarchyBroadcast1.Error.InvalidArgument` | An argument is well-formed but not acceptable: an unknown effect, a strength outside 0 to 1, a background image that is not usable, a preview frame rate other than 15 or 30, a camera control that is not offered or a value it does not accept; from revision 7 also a settings value of the wrong type, outside the range or off the step, an enum value that is not an option, an action fired with anything but `true`, a `camera` option that is not a string, a reset scope that is not one, and a reset of an action. The message says which and why. Added in revision 2. From revision 9 also a module or stage id that is not installed or not well formed, a profile that is not `quality` or `battery`, and a stage order that is not valid (the message is the reason; see [Modules](#modules)). |
 | `br.com.dias.OmarchyBroadcast1.Error.UnknownSetting` | The setting id (or, for a reset, the group) is not in the tree of the camera the call is for. Revision 7. |
 | `br.com.dias.OmarchyBroadcast1.Error.Disabled` | The setting exists but is not enabled now; the message is its `disabled_reason`. Revision 7. |
 | `br.com.dias.OmarchyBroadcast1.Error.RateLimited` | `SetSetting` or `SetCameraControl` came over the daemon's cap on device writes (see [Coalescing and the rate limit](#coalescing-and-the-rate-limit)); nothing was stored. Revision 7. |
-| `br.com.dias.OmarchyBroadcast1.Error.Failed` | Any other failure. |
+| `br.com.dias.OmarchyBroadcast1.Error.Failed` | Any other failure; from revision 9 also a module choice (enabled flag, order, profile, pin) that could not be saved to the state file. |
 
 ### `SetEnabled(b enabled)`
 
@@ -243,6 +245,79 @@ From revision 8 the group ids also include the global groups (`background`, `vid
 
 Errors: `Unavailable`, `NoSuchCamera`, `UnknownSetting`, `InvalidArgument`, `Failed` (none of the first two for a global group or setting).
 
+### `GetModules()` -> `(u serial, aa{sv} modules)`
+
+Returns the modules the daemon found (revision 9; see [Modules](#modules)). `serial` is the value `ModulesSerial` had when the list was made. `modules` has one dictionary per module, ordered by module id, with these keys:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `id` | `s` | The module id (reverse-DNS, at most 64 bytes). For a manifest that could not be read, its `id` key when that is a valid id, else the file name without `.toml` |
+| `name`, `version`, `licence`, `description` | `s` | From the manifest. `""` when the manifest could not be read; `description` is `""` when the manifest has none |
+| `kind` | `s` | `video-stage` (the only kind that loads), or `audio-filter` or `analyser` (listed, unavailable) |
+| `library` | `s` | The library's absolute path (a relative `library` is resolved against the manifest's directory) |
+| `manifest` | `s` | The manifest file's path |
+| `enabled` | `b` | `false` when the module is disabled, by the user (`SetModuleEnabled`, the configuration's `[modules] disabled`) or by the crash ledger |
+| `status` | `s` | `available` (loaded, probed, and at least one stage can run), `unavailable` (see `reason`) or `disabled` |
+| `reason` | `s` | Why the module is not `available`: the manifest's parse error, the ABI version that does not match (`Built for module ABI 2; this daemon supports module ABI 1`), a kind that is not supported yet, a library that is not installed or cannot be opened, a failing `init` or probe, `Disabled`, or `Disabled after crashing the daemon twice in a row`. `""` when `available` |
+| `stages` | `aa{sv}` | The module's stages, in manifest order; empty for a manifest that could not be read |
+
+A stage dictionary has `id` (`s`), `slot` (`s`: `pre-matte`, `matte`, `post-matte` or `post-composite`), `rank` (`u`), `device` (`s`: `nvidia-gpu`, `gpu`, `npu` or `cpu`), `available` (`b`: the probe says it can run here), `reason` (`s`: why not, `""` when it can) and `selected` (`b`: this module provides the stage at the next pipeline start, by pin and profile; at most one module has `selected` for a stage). The stages of a module that is disabled or unavailable are `available` `false` with the module's reason, and never `selected`.
+
+A client ignores keys it does not know and reads a missing key as its default. The call never starts a camera or a GPU: it reads what the daemon already knows.
+
+Errors: none besides the standard ones.
+
+### `SetModuleEnabled(s id, b enabled)`
+
+Enables (`true`) or disables (`false`) module `id` (revision 9). The choice is saved in the state file, over the configuration's `[modules] disabled`, and survives restarts. An enabled module is opened and probed at once, so that its settings appear in the tree and its status is known; a running pipeline keeps the modules it started with, and the change applies when the camera next starts. Enabling a module the daemon disabled after it crashed the daemon twice in a row forgives it (its strikes are cleared). A module that cannot be opened is not an error of the call: it is enabled, `unavailable`, with the reason. Setting the current value again is not an error.
+
+Errors: `InvalidArgument` (`No module <id> is installed`), `Failed` (the state file cannot be written; the change is in force).
+
+### `GetStageOrder()` -> `as`
+
+Returns the stage order in force (revision 9): every stage that the enabled modules offer, available or not, each once, in the order the pipeline runs them. With no module enabled the list is empty. A stored order that does not fit the modules found (a module went away, or a new one added a stage) is replaced by the default order, with a warning in the log, and this call returns the default.
+
+### `SetStageOrder(as order)`
+
+Sets the stage order (revision 9). `order` must name every stage the enabled modules offer, once each, and keep the limits the manifests declare: the slots never go back (`pre-matte`, `matte`, `post-matte`, `post-composite`), and a stage that requires a stage, or any stage of a slot, has one before it. An empty list sets the default order (by slot, then each stage's `position`, then the stage id). The order is saved in the state file and applies when the camera next starts. An order that is not valid is refused with `InvalidArgument`, and the message is the reason, one of:
+
+| Message | When |
+|---|---|
+| `The order names <stage> twice` | A stage is listed twice |
+| `No enabled module offers the stage <stage>` | A stage no enabled module declares |
+| `The order leaves out <a>, <b>` | Stages that are offered and not listed |
+| `<stage> (<slot>) cannot come after <other> (<slot>)` | A stage in an earlier slot after one in a later slot |
+| `<stage> needs <stage or "a <slot> stage"> before it` | A `requires` entry not met by an earlier stage |
+| a stage-id message | A string that is not a stage id (a lower-case letter, then up to 31 of `a-z`, `0-9` and `-`; not `status`, `effect`, `reason`, `module` or a name ending in `-reason`) |
+
+Errors: `InvalidArgument`, `Failed` (the state file cannot be written).
+
+### `SetBackendProfile(s profile)`
+
+Sets the backend profile (revision 9): `quality` or `battery`. It decides which module provides a stage that several enabled, available modules offer: `quality` takes the highest `rank`; `battery` prefers the device (an NPU, then the CPU, then a GPU, then an NVIDIA GPU) and then the highest `rank`; a tie goes to the lower module id. The choice is saved in the state file, over the configuration's `[modules] profile`, and applies when the camera next starts, never to a running pipeline. The `BackendProfile` property follows it.
+
+Errors: `InvalidArgument` (a profile that is neither), `Failed` (the state file cannot be written).
+
+### `SetStagePin(s stage, s module)`
+
+Pins the module that provides `stage`, whatever the profile says, while it can (revision 9); an empty `module` clears the pin, so the profile decides again, also over a pin of the configuration's `[modules] pin`. A pin that cannot be honoured when a pipeline starts (the module is disabled, unavailable, does not provide the stage, or cannot run it) does not fail anything: the stage falls back to the profile's choice, and its `reason` in `GetModules` says `Pinned module <id> is unavailable: <why>`. A stage that needs the cut-out (it `requires` the `matte` slot or the `background` stage) is only provided by the module that provides `background`, so a pin to another module for it falls back the same way ([Modules](#modules)). The pin is saved in the state file and applies when the camera next starts. The stage id is only checked for its form: pinning a stage that no module offers is accepted and has no effect.
+
+Errors: `InvalidArgument` (a `stage` that is not a stage id, or a `module` that is not installed), `Failed` (the state file cannot be written).
+
+## Modules
+
+Revision 9 puts the effects in loadable modules ([ADR-0025](adr/0025-loadable-modules.md); the author guide is [modules.md](modules.md)). A module is a manifest and a shared library. The daemon finds manifests in the system, user, configured and `OBC_MODULE_PATH` directories without opening any library, opens the library of each enabled module, probes it (the filesystem only; never the GPU) and builds the settings tree from what the modules describe.
+
+- **Stages.** A module provides stages. A stage has an id (`background`, `denoise`, `relight`, ...), a `slot` that says where it sits relative to the person's cut-out (`pre-matte`, `matte`, `post-matte`, `post-composite`), a `rank` and a `device`. `background` (the cut-out, and the core's blur and replacement) and `enhance` (the ingest's upscaler) have a meaning to the daemon; every other id is opaque to it.
+- **Who provides a stage.** One enabled, available module provides each stage, chosen by the pin of `SetStagePin`, else by the profile of `SetBackendProfile`. The choice is made when the camera starts and never changes while it runs; `GetModules` reports it as `selected`. The module that provides `background` runs the whole cut-out family inside the effect element, and a stage that needs the cut-out is provided only by it; a stage that needs the cut-out and is offered by another module only is `available` `false` with the reason `Needs the cut-out of the module that provides it`.
+- **The order.** The stages of the enabled modules have one order, `GetStageOrder` and `SetStageOrder`, within the slots and requirements the manifests declare.
+- **When changes apply.** `SetModuleEnabled`, `SetStageOrder`, `SetBackendProfile` and `SetStagePin` are stored at once and apply when the camera next starts. A module's settings (the global groups of the tree) follow the enabled modules at once. A reload (`ReloadConfig`, `SIGHUP`) finds the modules again; a library rebuilt in place is not loaded again until the daemon restarts.
+- **`ModulesSerial`.** A client reads `GetModules` (and `GetStageOrder`) once, remembers the `serial`, and reads again when the property `ModulesSerial` differs from it. The counter moves whenever either result changes, including `selected`, the status of a module and a stage's `available` and `reason`, and not otherwise: a call that changes nothing (the same profile, the pin already set) does not move it. It starts at 1 when the daemon has made its first list and is not announced for that list, so a client reads `GetModules` when it connects. Subscribe to `PropertiesChanged` before reading.
+- **Zero modules.** With no module installed, or none enabled, `GetModules` returns the empty list (or only unavailable and disabled modules), `GetStageOrder` an empty list, and the tree no effect group; the daemon passes the camera image through. `BackendProfile` is still `quality` or `battery`.
+- **The effect members.** `SetEffect`, `SetBlurStrength`, `SetDenoise`, `SetBackgroundImage` and the properties of the same names keep working as in revision 8. A request for `blur` or `replace` while no enabled module provides `background` is kept, and the effect fails like any effect that cannot load (`Error` reads `effect blur unavailable: no effect module provides the background ...`, and `[effect] on_failure` applies); the setting `effect.background.mode` refuses it with `No installed module provides the background effect`.
+- **Crashes.** A module whose code was running when the daemon went down twice in a row is disabled at the next start: `status` is `disabled`, `enabled` is `false` and `reason` is `Disabled after crashing the daemon twice in a row`, until `SetModuleEnabled(id, true)`.
+- **Module settings.** A module's settings are global settings of the tree (`effect.<group>.<name>`, [Global settings](#global-settings-the-video-effects)): written with `SetSetting`, reset with `ResetSettings`, announced by `SettingsChanged`. A module that is enabled adds its groups and a module that is disabled or gone removes them, which is a structural change (the `SettingsSchemaSerial` moves).
+
 ## Camera image controls
 
 Revision 6 lets a client adjust the image controls of each camera and put them back to the camera's defaults. The design is recorded in [ADR-0020](adr/0020-camera-image-controls.md); the CLI's `controls` command wraps this API (see [cli-json.md](cli-json.md#camera-image-controls)). It exists because some cameras keep controls set by other software far from their defaults (an oversharpened or oversaturated picture) and a user wants them back, or wants them different, and kept so.
@@ -377,6 +452,8 @@ The descriptor is held *only while the camera is open*, and released when it clo
 ### Global settings: the video effects
 
 Revision 8 puts the video effects in the same tree, as settings of `scope` `global` ([ADR-0024](adr/0024-stackable-stages-and-effects-in-the-settings-schema.md)). They are not a camera's: they follow the camera groups, are published when there is no camera (`camera` `""` in `GetSettings` and in the CLI's lines), and a write to one ignores `options.camera`. Each is a view of an effect setting that already exists, and a write is that setting's setter. The groups and settings, in order:
+
+**From revision 9 these settings come from the modules installed** ([Modules](#modules), [ADR-0025](adr/0025-loadable-modules.md)). The table below is what the Maxine module describes, with the ids, labels, ranges, defaults and reasons of revision 8; the `background` group is the daemon's own (the compositor's mode and blur strength) and is published only while an enabled module provides the `background` stage, or a mode other than `none` is in force, in which case it holds the mode alone so that it can be turned off (a write of `blur` or `replace` is then refused with `No installed module provides the background effect`). Another module adds its own groups, whose ids and settings it chooses within the same grammar (`effect.<group>.<name>`), after the Maxine module's by module id; a group of a module cannot be named `background`. With no module the tree has no effect group. A module's settings are written, reset and announced like any other, and their values are kept in the state file by setting id.
 
 | Group | Setting id | `type`, range, hint | Meaning |
 |---|---|---|---|
@@ -676,6 +753,35 @@ busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
     br.com.dias.OmarchyBroadcast1 ResetSettings sa{sv} group:lighting 0
 ```
 
+Revision 9 adds the modules. Read the order the stages run in, the profile, and the list (the list is a `(u, aa{sv})`, which `busctl` prints in full; the CLI's `modules` command shows it as text or JSON):
+
+```sh
+busctl --user --auto-start=no call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 GetStageOrder
+busctl --user --auto-start=no get-property br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 BackendProfile
+busctl --user --auto-start=no call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 GetModules
+busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 SetModuleEnabled sb org.example.hello true
+busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 SetStageOrder as 4 enhance denoise background relight
+busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 SetBackendProfile s battery
+busctl --user call br.com.dias.OmarchyBroadcast /br/com/dias/OmarchyBroadcast \
+    br.com.dias.OmarchyBroadcast1 SetStagePin ss background br.com.dias.maxine-vfx
+```
+
+```text
+as 4 "enhance" "denoise" "background" "relight"
+```
+
+An order that is not valid is refused with the reason (`InvalidArgument`):
+
+```text
+Call failed: The order leaves out relight
+```
+
 A setting that is not enabled now is refused with its reason, and the message names what to do:
 
 ```text
@@ -813,5 +919,6 @@ gdbus monitor --session --dest br.com.dias.OmarchyBroadcast --object-path /br/co
 - Offer the camera controls only if `InterfaceRevision` is 6 or more; against an older daemon `CameraControls` and the three methods do not exist. Show `CameraControls` for the active camera and tell the user whether a change applies now (state `starting` or `active`) or when the camera next opens. A control's `value` is the device's value only while the camera is open. Do not poll: `CameraControls` is refreshed by the daemon on the events listed for it.
 - Offer the camera settings only if `InterfaceRevision` is 7 or more; against an older daemon the two properties, the three methods and the signal do not exist (the revision-6 members remain). Subscribe to `SettingsChanged` before calling `GetSettings`, keep the tree while `SettingsSchemaSerial` stays, apply a delta only when its revision is the next one of the same serial, and read the tree again otherwise (see [Revision and serial](#revision-and-serial)). Draw `enabled` and `disabled_reason` as the daemon gives them, never compute them, and show a setting of a type you do not know as nothing. Send `camera` in the options of a write, so that a switch of camera between drawing and writing fails instead of changing another camera. Match errors by name: `Disabled` (the setting is greyed, with its reason), `RateLimited` (wait, then send the last value), `UnknownSetting`. Send a stream of slider values as they come and rely on the daemon's coalescing, or at most one call in flight per setting.
 - Offer the effects as settings only if `InterfaceRevision` is 8 or more and the tree has groups of `scope` `global`. They are there with no camera and for every camera; send no `camera` option for them (it is ignored), draw `enabled` and the reason as for any setting (a feature that is not installed is greyed "Not installed"), and do not reset them with the scope `camera`. A client that keeps a dedicated row for the effect choice can draw every other global setting generically, so that a stage added later needs no change in it. Against an older daemon the effect members above are the way.
+- Offer the modules only if `InterfaceRevision` is 9 or more. Subscribe to `PropertiesChanged` before reading `GetModules` and `GetStageOrder`, keep the `serial` of the list, and read both again when `ModulesSerial` differs. Draw the effect groups from the settings tree, never from a list of effects of your own: with no module the tree has none, and a module can add groups. Say when a choice applies (the next camera start), show `reason` for a module or a stage that is not available, and show which module provides each stage by `selected`.
 - Treat `-1` in `Stats` as unknown, and expect no `Stats` outside `active`.
 - Match errors by name, not by message text: the messages are for people and may change.

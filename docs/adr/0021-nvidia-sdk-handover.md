@@ -72,6 +72,7 @@
 - A feature added to a tree needs no edit anywhere: its `features/*/lib` directory is found by the daemon.
 - The "hand-written variables" consequence above shrinks to the two shim variables and, for a tree outside the default root, the root.
 - One SDK per process, for the life of the process. Moving the root takes a daemon restart.
+  *Amendment ([ADR-0025](0025-loadable-modules.md)): the root and its pin belong to the Maxine module (`obc-module-maxine`), which the daemon loads and never unloads; the rule is unchanged. The configuration key is `sdk_root` in `[module."br.com.dias.maxine-vfx"]`, `[effect] maxine_root` is its alias, and `MAXINE_VFX_ROOT` still comes first.*
 - The daemon depends on the layout of the SDK tree (`lib`, `features/*/lib`, `external/cuda/lib`, `external/tensorrt/lib`) and on the TensorRT library opening `libnvJitLink.so.12` by name. A layout change in a new SDK release is handled in the daemon, not in the unit.
 
 ### Alternatives considered

@@ -68,13 +68,17 @@ use std::sync::atomic::AtomicU32;
 use std::time::{Duration, Instant};
 
 use gst::prelude::*;
-use obc_core::config::EffectConfig;
 use obc_core::{EffectMode, EffectOnFailure, ModeRequest, OutputContract, SinkSelector};
 use obc_ipc::Stats;
+use obc_module_host::{
+    LogLevel, LogSink, ModuleBackendFactory, ModuleChainFactory, ModuleEnhancerFactory,
+};
 use obc_pipeline::control_node::CaptureFormat;
 use obc_pipeline::controls::CtrlInfo;
-use obc_pipeline::effect::{Availability, Feature, RelightLight, RelightParams};
+use obc_pipeline::effect::{Availability, StageId, StageRequest};
 use obc_pipeline::gpu::GpuSampler;
+use obc_pipeline::ingest::EnhanceBackend;
+use obc_pipeline::module::{ModulePlacement, ModuleStageSpec};
 use obc_pipeline::pipeline::names;
 use obc_pipeline::stats::{cpu_usage, online_cpus, self_cpu_ticks, ticks_per_sec};
 use obc_pipeline::xu::{SYSFS_ROOT, XuControl, XuRow, find_xu_controls};
@@ -82,15 +86,16 @@ use obc_pipeline::{
     ConsumerCover, CtrlNotice, CtrlWatcher, DiscoveryRoute, EffectFallback, EffectKind,
     EffectSettings, FrameTap, IngestConfig, LiveStats, LoopbackWriter, Output, OutputConfig,
     OutputSink, PipelineError, PreviewConfig, PreviewEncoder, Session, StopError, WriterCounts,
-    WriterHandle, WriterSink, choose_mode, effect_backend_available, list_cameras, scan_sysfs,
+    WriterHandle, WriterSink, choose_mode, effect_backend_available_with, list_cameras, scan_sysfs,
     select_sink,
 };
 
 use super::park::{Parker, StartError, StopFailure, StopSession};
 use super::{
-    ControlEvent, ControlEventReporter, ControlNode, ControlScan, EffectReport, EffectStatus,
-    Failure, MediaBackend, PipeWireEvent, PipeWireGeneration, PipeWireReporter, PipeWireState,
-    PreviewReporter, PreviewRequest, SessionParams, WatchGeneration,
+    Backends, ControlEvent, ControlEventReporter, ControlNode, ControlScan, EffectReport,
+    EffectRun, EffectStatus, Failure, MediaBackend, Module, ModuleEntry, OpenedModule,
+    PipeWireEvent, PipeWireGeneration, PipeWireReporter, PipeWireState, Placement, PreviewReporter,
+    PreviewRequest, SessionParams, StageRun, WatchGeneration,
 };
 use crate::camera::{Camera, stable_id, usb_origin};
 use crate::consumers::{NodeId, count_holders};
@@ -126,6 +131,13 @@ struct Running {
     /// Why a pipeline a camera switch took down did not reach NULL (the
     /// first one): the session's stop is then unclean, however it goes.
     unclean: Option<String>,
+    /// The ingests' enhancer, chosen when the session started (`None`: no
+    /// enhance stage).
+    enhance: Option<EnhanceBackend>,
+    /// The output has the effect element.
+    effect: bool,
+    /// The chains of the output, by element name.
+    chains: Vec<String>,
 }
 
 impl StopSession for Running {
@@ -431,12 +443,18 @@ impl GstBackend {
             .map_or_else(WriterCounts::default, LoopbackWriter::counts)
     }
 
-    fn ingest_config(params: &SessionParams, camera: &Camera) -> IngestConfig {
+    fn ingest_config(
+        params: &SessionParams,
+        camera: &Camera,
+        enhance: Option<&EnhanceBackend>,
+    ) -> IngestConfig {
         let mut cfg = IngestConfig::new(camera.path.clone(), camera.mode);
         cfg.aspect = params.aspect;
         cfg.fixed_framerate = params.fixed_framerate;
-        // Requested only where it applies (the controller's choice).
-        cfg.enhance = params.effect.enhance;
+        // Requested only where it applies (the controller's choice), with
+        // the enhancer the session started with.
+        cfg.enhance = params.effect.enhance && enhance.is_some();
+        cfg.enhance_backend = enhance.cloned();
         cfg
     }
 
@@ -445,7 +463,7 @@ impl GstBackend {
         params: &SessionParams,
         camera: &Camera,
     ) -> Result<(), String> {
-        let cfg = Self::ingest_config(params, camera);
+        let cfg = Self::ingest_config(params, camera, running.enhance.as_ref());
         let ingest = running
             .session
             .build_ingest(&cfg)
@@ -472,8 +490,20 @@ impl GstBackend {
     }
 }
 
-/// The effect element's settings for the daemon's effect settings.
-fn effect_settings(e: &EffectConfig) -> EffectSettings {
+/// A stage's request for the elements.
+fn stage_request(s: &StageRun) -> StageRequest {
+    StageRequest {
+        enabled: s.enabled,
+        params: s.params.clone(),
+        live: s.live.clone(),
+        ..StageRequest::new(s.id.clone())
+    }
+}
+
+/// The effect element's settings for what the session runs: the
+/// background effect, then its stages in stage order, each listed whether
+/// on or off, with its parameters (the module's keys and units).
+fn effect_settings(e: &EffectRun) -> EffectSettings {
     EffectSettings {
         kind: match e.mode {
             EffectMode::None => EffectKind::None,
@@ -487,25 +517,63 @@ fn effect_settings(e: &EffectConfig) -> EffectSettings {
             EffectOnFailure::Black => EffectFallback::Black,
             EffectOnFailure::None => EffectFallback::None,
         },
-        denoise: e.denoise,
-        relight: e.relight,
-        relight_params: relight_params(e),
+        stages: e.stages.iter().map(stage_request).collect(),
     }
 }
 
-/// The relighting stage's parameters for the daemon's effect settings: the
-/// direction in degrees, the brightness as a gain (100 % is 1.0).
-fn relight_params(e: &EffectConfig) -> RelightParams {
-    RelightParams {
-        light: match e.relight_light {
-            obc_core::RelightLight::Warm => RelightLight::Warm,
-            obc_core::RelightLight::Neutral => RelightLight::Neutral,
-            obc_core::RelightLight::Cool => RelightLight::Cool,
-        },
-        // Validated to -90..=90 and 50..=200 before they get here.
-        pan_deg: e.relight_direction as f32,
-        gain: e.relight_brightness as f32 / 100.0,
-    }
+/// The module stage elements of a session: one per chain of `e` whose
+/// module `backends` has loaded.
+fn module_stages(e: &EffectRun, backends: &Backends) -> Vec<ModuleStageSpec> {
+    e.chains
+        .iter()
+        .filter_map(|c| {
+            let (_, choice) = backends.chains.iter().find(|(n, _)| *n == c.name)?;
+            let module = choice.module.clone()?;
+            let ids: Vec<StageId> = c.stages.iter().map(|s| s.id.clone()).collect();
+            let factory = match ModuleChainFactory::new(module, &ids) {
+                Ok(f) => f,
+                Err(e) => {
+                    crate::warning!("module {}: {e}", c.module);
+                    return None;
+                }
+            };
+            Some(ModuleStageSpec {
+                name: c.name.clone(),
+                factory: Arc::new(factory),
+                stages: c.stages.iter().map(stage_request).collect(),
+                placement: match c.placement {
+                    Placement::BeforeEffect => ModulePlacement::BeforeEffect,
+                    Placement::AfterEffect => ModulePlacement::AfterEffect,
+                },
+            })
+        })
+        .collect()
+}
+
+/// The effect backend of `backends`, if its module is loaded.
+fn effect_backend(backends: &Backends) -> Option<obc_pipeline::EffectBackend> {
+    let module = backends.effect.as_ref()?.module.clone()?;
+    Some(obc_pipeline::EffectBackend::new(Arc::new(
+        ModuleBackendFactory::new(module),
+    )))
+}
+
+/// The enhancer of `backends`, if its module is loaded.
+fn enhance_backend(backends: &Backends) -> Option<EnhanceBackend> {
+    let module = backends.enhance.as_ref()?.module.clone()?;
+    Some(EnhanceBackend::new(Arc::new(ModuleEnhancerFactory::new(
+        module,
+    ))))
+}
+
+/// Where a module's log lines go: the daemon's log, with the module id.
+fn module_log() -> LogSink {
+    Arc::new(|id, level, msg| match level {
+        LogLevel::Error => crate::error!("module {id}: {msg}"),
+        LogLevel::Warn => crate::warning!("module {id}: {msg}"),
+        LogLevel::Info => crate::info!("module {id}: {msg}"),
+        LogLevel::Debug | LogLevel::Trace => crate::debug!("module {id}: {msg}"),
+    })
 }
 
 /// The reason of an effect error, without the `effect: ` prefix of
@@ -588,9 +656,17 @@ fn build_session(
     let mut ocfg = OutputConfig::new(params.contract, OutputSink::Writer(writer));
     ocfg.gap_threshold = params.input_gap;
     ocfg.hold_timeout = params.hold_timeout;
-    // Always with the element: an output built without it cannot take an
-    // effect later.
-    ocfg.effect = Some(effect_settings(&params.effect));
+    // With the element whenever a module provides the effect: an output
+    // built without it cannot take an effect later. Without one, no
+    // element (the frames pass through).
+    let backend = effect_backend(&params.backends);
+    let has_effect = backend.is_some();
+    if has_effect {
+        ocfg.effect = Some(effect_settings(&params.effect));
+        ocfg.effect_backend = backend;
+    }
+    ocfg.module_stages = module_stages(&params.effect, &params.backends);
+    let chains: Vec<String> = ocfg.module_stages.iter().map(|m| m.name.clone()).collect();
     let mut output = Output::build(ocfg).map_err(|e| format!("output pipeline: {e}"))?;
     let live = LiveStats::new();
     output.set_observer(Some(live.observer()));
@@ -635,6 +711,9 @@ fn build_session(
         cpu_ticks: self_cpu_ticks(),
         counts: WriterCounts::default(),
         unclean: None,
+        enhance: enhance_backend(&params.backends),
+        effect: has_effect,
+        chains,
     })
 }
 
@@ -867,29 +946,48 @@ impl MediaBackend for GstBackend {
         }
     }
 
-    fn effect_available(&mut self, effect: &EffectConfig) -> Result<(), String> {
+    fn effect_available(&mut self, effect: &EffectRun, backends: &Backends) -> Result<(), String> {
         if effect.mode == EffectMode::None {
             return Ok(());
         }
+        let Some(backend) = effect_backend(backends) else {
+            return Err("no effect module is loaded".into());
+        };
         // Called before a session starts, so while the GPU is parked: the
-        // probe only opens the SDK libraries and checks the model directory,
-        // with no CUDA call (a CUDA call would block until unparked).
-        effect_backend_available()?;
-        obc_pipeline::effect::check_settings(&effect_settings(effect)).map_err(effect_error)
+        // module's probe reads the filesystem only, with no CUDA call (a
+        // CUDA call would block until unparked).
+        effect_backend_available_with(backend.factory().as_ref())?;
+        obc_pipeline::effect::check_settings_with(
+            &effect_settings(effect),
+            backend.factory().as_ref(),
+        )
+        .map_err(effect_error)
     }
 
-    fn set_effect(&mut self, effect: &EffectConfig) -> Result<(), String> {
+    fn set_effect(&mut self, effect: &EffectRun) -> Result<(), String> {
         let Some(r) = self.running.as_ref() else {
             return Ok(());
         };
-        r.session
-            .output()
-            .set_effect(&effect_settings(effect))
-            .map_err(effect_error)
+        let output = r.session.output();
+        if r.effect {
+            output
+                .set_effect(&effect_settings(effect))
+                .map_err(effect_error)?;
+        } else if !effect.effect_idle() {
+            return Err("no effect module provides the effect".into());
+        }
+        for c in effect.chains.iter().filter(|c| r.chains.contains(&c.name)) {
+            let stages: Vec<StageRequest> = c.stages.iter().map(stage_request).collect();
+            output
+                .set_module_stages(&c.name, &stages)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     fn effect_report(&mut self) -> Option<EffectReport> {
-        let session = &self.running.as_ref()?.session;
+        let running = self.running.as_ref()?;
+        let session = &running.session;
         let output = session.output();
         let status = |s| match s {
             obc_pipeline::EffectStatus::Off => EffectStatus::Off,
@@ -898,10 +996,25 @@ impl MediaBackend for GstBackend {
             obc_pipeline::EffectStatus::Failed(r) => EffectStatus::Failed(r),
         };
         let stats = output.effect_stats().unwrap_or_default();
+        let mut stages: Vec<(StageId, EffectStatus)> = output
+            .effect_settings()
+            .map(|s| s.stages)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| {
+                let st = status(output.stage_status(s.id.as_str()));
+                (s.id, st)
+            })
+            .collect();
+        for name in &running.chains {
+            for s in output.module_stages(name).unwrap_or_default() {
+                let st = status(output.module_stage_status(name, s.id.as_str()));
+                stages.push((s.id, st));
+            }
+        }
         Some(EffectReport {
             status: status(output.effect_status()),
-            denoise: status(output.denoise_status()),
-            relight: status(output.relight_status()),
+            stages,
             // Read from the element, not the bus (the ingest's failure poll
             // would hide it).
             enhance: session
@@ -914,11 +1027,39 @@ impl MediaBackend for GstBackend {
         })
     }
 
-    fn feature_availability(
+    fn discover_modules(&mut self, dirs: &[PathBuf]) -> Vec<ModuleEntry> {
+        let found = obc_module_host::scan(dirs);
+        for (id, path) in &found.overridden {
+            crate::debug!("module {id}: the manifest {} is overridden", path.display());
+        }
+        found.entries
+    }
+
+    fn open_module(
         &mut self,
-        compute_capability: Option<(u32, u32)>,
-    ) -> Option<(PathBuf, Vec<(Feature, Availability)>)> {
-        obc_pipeline::effect::maxine_feature_availability(compute_capability)
+        entry: &ModuleEntry,
+        config: &serde_json::Value,
+    ) -> Result<OpenedModule, String> {
+        let manifest = entry.manifest.as_ref().map_err(Clone::clone)?;
+        let module = Module::open(manifest, config, module_log())?;
+        let stages = module.probe().map_err(|e| e.message)?;
+        let settings = module.settings().map_err(|e| e.message)?;
+        Ok(OpenedModule {
+            module: Some(module),
+            stages,
+            settings,
+        })
+    }
+
+    fn probe_module(
+        &mut self,
+        _id: &str,
+        module: Option<&Module>,
+    ) -> Result<Vec<(StageId, Availability)>, String> {
+        match module {
+            Some(m) => m.probe().map_err(|e| e.message),
+            None => Err("the module is not loaded".into()),
+        }
     }
 
     fn compute_capability(&mut self) -> Option<(u32, u32)> {
@@ -1360,45 +1501,88 @@ mod tests {
         }
     }
 
+    /// What the session is given with the Maxine module (its settings as it
+    /// describes them) and `runtime`'s settings.
+    fn maxine_run(runtime: &obc_core::config::RuntimeState) -> EffectRun {
+        let modules = crate::modules::testing::maxine(&[]);
+        let config = obc_core::config::Config::default();
+        let plan = modules.plan();
+        EffectRun {
+            mode: EffectMode::None,
+            blur_strength: 0.5,
+            background_image: None,
+            on_failure: EffectOnFailure::Black,
+            stages: plan
+                .effect_stages
+                .iter()
+                .map(|s| modules.stage_run(&plan, &config, runtime, s))
+                .collect(),
+            chains: modules.chain_runs(&plan, &config, runtime),
+            enhance: false,
+        }
+    }
+
     #[test]
     fn the_relighting_settings_map_to_the_elements_degrees_and_gain() {
-        let e = EffectConfig {
-            relight: true,
-            relight_light: obc_core::RelightLight::Warm,
-            relight_direction: -30,
-            relight_brightness: 150,
-            ..EffectConfig::default()
+        use obc_pipeline::effect::Value;
+        let mut runtime = obc_core::config::RuntimeState {
+            relight: Some(true),
+            relight_light: Some(obc_core::RelightLight::Warm),
+            relight_direction: Some(-30),
+            relight_brightness: Some(150),
+            ..Default::default()
         };
-        let s = effect_settings(&e);
-        assert!(s.relight);
+        runtime.migrate_legacy_settings();
+        let s = effect_settings(&maxine_run(&runtime));
+        assert!(s.is_enabled("relight"));
+        let r = s.stage("relight").unwrap();
+        assert_eq!(r.params.get("light"), Some(&Value::from("warm")));
+        assert_eq!(r.live.get("direction"), Some(&Value::Int(-30)));
+        assert_eq!(r.live.get("brightness"), Some(&Value::Int(150)));
+        // Whole degrees and whole percent: the module takes the pan as the
+        // degrees and the gain as the percent over 100, as before.
+        let d = effect_settings(&maxine_run(&Default::default()));
+        assert!(!d.is_enabled("relight") && !d.is_enabled("denoise"));
         assert_eq!(
-            s.relight_params,
-            RelightParams {
-                light: RelightLight::Warm,
-                pan_deg: -30.0,
-                gain: 1.5,
-            }
+            d.stages.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["denoise", "relight"],
+            "both listed, noise removal first"
         );
-        let d = effect_settings(&EffectConfig::default());
-        assert!(!d.relight);
-        assert_eq!(d.relight_params, RelightParams::default());
+        let dr = d.stage("relight").unwrap();
+        assert_eq!(dr.params.get("light"), Some(&Value::from("neutral")));
+        assert_eq!(
+            (dr.live.get("direction"), dr.live.get("brightness")),
+            (Some(&Value::Int(0)), Some(&Value::Int(100)))
+        );
         for light in obc_core::RelightLight::ALL {
-            let e = EffectConfig {
-                relight_light: light,
-                ..EffectConfig::default()
+            let mut runtime = obc_core::config::RuntimeState {
+                relight_light: Some(light),
+                ..Default::default()
             };
-            assert_eq!(relight_params(&e).light.as_str(), light.as_str());
+            runtime.migrate_legacy_settings();
+            let run = maxine_run(&runtime);
+            assert_eq!(
+                run.stage("relight").unwrap().params.get("light"),
+                Some(&Value::from(light.as_str()))
+            );
         }
         // The configured bounds are within what the element takes.
         for (direction, brightness) in [(-90, 50), (90, 200)] {
-            let e = EffectConfig {
-                relight: true,
-                relight_direction: direction,
-                relight_brightness: brightness,
-                ..EffectConfig::default()
+            let mut runtime = obc_core::config::RuntimeState {
+                relight: Some(true),
+                relight_direction: Some(direction),
+                relight_brightness: Some(brightness),
+                ..Default::default()
             };
-            assert!(relight_params(&e).validate().is_ok());
-            assert!(obc_pipeline::effect::check_settings(&effect_settings(&e)).is_ok());
+            runtime.migrate_legacy_settings();
+            assert!(
+                obc_pipeline::effect::check_settings(&effect_settings(&maxine_run(&runtime)))
+                    .is_ok()
+            );
         }
+        // No module: no effect element, no chain.
+        let none = crate::modules::Modules::empty().plan();
+        assert!(none.effect.is_none() && none.chains.is_empty());
+        assert!(effect_backend(&none.backends()).is_none());
     }
 }

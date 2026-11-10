@@ -881,8 +881,8 @@ impl CameraSettings {
     }
 
     /// The published groups, in [`catalogue::GROUPS`] order, then the
-    /// global ones in [`effects::GROUPS`] order, those with no setting left
-    /// out.
+    /// global ones in the order [`effects::build`] gives them, those with no
+    /// setting left out.
     pub fn groups(&self) -> Vec<SettingsGroup> {
         let group = |g: &catalogue::Group, settings: Vec<Setting>| {
             (!settings.is_empty()).then(|| SettingsGroup {
@@ -901,16 +901,17 @@ impl CameraSettings {
                     .collect(),
             )
         });
-        let global = effects::GROUPS.iter().filter_map(|g| {
-            group(
-                g,
-                self.global
-                    .iter()
-                    .filter(|e| e.group() == g.id)
-                    .map(|e| e.setting.clone())
-                    .collect(),
-            )
-        });
+        let mut global: Vec<SettingsGroup> = Vec::new();
+        for e in &self.global {
+            match global.iter_mut().find(|g| g.id == e.group) {
+                Some(g) => g.settings.push(e.setting.clone()),
+                None => global.push(SettingsGroup {
+                    id: e.group.clone(),
+                    label: e.group_label.clone(),
+                    settings: vec![e.setting.clone()],
+                }),
+            }
+        }
         camera.chain(global).collect()
     }
 
@@ -972,11 +973,11 @@ pub fn diff(old: &CameraSettings, new: &CameraSettings) -> Option<Delta> {
             .iter()
             .zip(&new.entries)
             .any(|(a, b)| a.group != b.group || shape(&a.setting) != shape(&b.setting))
-        || old
-            .global
-            .iter()
-            .zip(&new.global)
-            .any(|(a, b)| a.key != b.key || shape(&a.setting) != shape(&b.setting));
+        || old.global.iter().zip(&new.global).any(|(a, b)| {
+            a.group != b.group
+                || a.group_label != b.group_label
+                || shape(&a.setting) != shape(&b.setting)
+        });
     if structural {
         return Some(Delta {
             structural: true,

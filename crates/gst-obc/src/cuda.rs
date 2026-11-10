@@ -24,6 +24,9 @@ pub const LIBRARY: &str = "libgstcuda-1.0.so.0";
 /// `GstCudaMemory` instead of a host staging copy.
 pub const MAP_CUDA: u32 = gst::ffi::GST_MAP_FLAG_LAST << 1;
 
+/// The caps feature of frames in CUDA memory.
+pub const MEMORY_FEATURE: &str = "memory:CUDAMemory";
+
 /// The structure name of the CUDA context in a `GstContext`.
 pub const CONTEXT_TYPE: &str = "gst.cuda.context";
 

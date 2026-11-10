@@ -1,7 +1,8 @@
 //! The `obceffect` element: the effect of the Process stage
 //! (`docs/adr/0012-video-effects-and-maxine-backend.md`), and its optional
-//! stages: video noise removal (`docs/adr/0018-video-noise-removal.md`)
-//! and relighting of the person.
+//! stackable stages (`docs/adr/0018-video-noise-removal.md`,
+//! `docs/adr/0024-stackable-stages-and-effects-in-the-settings-schema.md`),
+//! such as video noise removal and relighting of the person.
 //!
 //! ```text
 //! sink, src: video/x-raw(memory:CUDAMemory), format=NV12   (same caps both sides)
@@ -10,33 +11,28 @@
 //! * **Properties**, all changeable while playing: `effect` (`none`, `blur`,
 //!   `replace`), `blur-strength` (0 to 1, default 0.5; applies on the next
 //!   frame), `background` (an absolute path, or empty), `on-failure`
-//!   (`black`, `none`), `denoise` (boolean, default false), `relight`
-//!   (boolean, default false), `relight-light` (`warm`, `neutral`,
-//!   `cool`; default `neutral`), `relight-pan` (degrees, -180 to 180,
-//!   default 0) and `relight-gain` (0.5 to 2, default 1; both apply on the
-//!   next frame); read-only `status`. [`ObcEffect::apply`] sets them
-//!   together, validated.
-//! * **`none`** without denoise is BaseTransform passthrough: the input
+//!   (`black`, `none`); read-only `status`. The stackable stages have no
+//!   property: [`ObcEffect::apply`] sets them with the rest
+//!   ([`EffectSettings::stages`], each a [`StageId`](obc_backend::StageId)
+//!   with its parameters), validated.
+//! * **`none`** without a stage is BaseTransform passthrough: the input
 //!   buffer goes downstream untouched and the element makes no CUDA call;
 //!   it does not even open GStreamer's CUDA library.
-//! * **Denoise** runs before the effect in the same backend instance, or
-//!   alone with `none`. It hides nothing: `none` with denoise passes the
-//!   input through until the stage is loaded, and blur and replace follow
-//!   their privacy rules below whether or not it is on. If the stage cannot
-//!   load or fails on a frame, the element drops it and goes on without it
-//!   (the effect keeps running; its status does not turn failed), and
-//!   reports why in the separate denoise status
-//!   ([`ObcEffect::denoise_status`]). The failure is retried when the
-//!   `denoise` value changes or on [`ObcEffect::apply`].
-//! * **Relight** runs after denoise and the green-screen matte, on the
-//!   person only, in the same backend instance, under an effect or alone
-//!   with `none`. It follows the rules of denoise: it hides nothing, it is
-//!   switched on the loaded chain, and a failure of it alone drops it (a
-//!   frame under blur or replace is processed again without it, under
-//!   `none` the frame is the input), reported in the separate relight
-//!   status ([`ObcEffect::relight_status`]) and retried when `relight` or
-//!   `relight-light` changes or on [`ObcEffect::apply`]. A new light is a
-//!   switch that loads no model.
+//! * **Stages** run in the same backend instance as the effect, in the
+//!   order of the settings (the backend runs a stage that consumes the
+//!   matte after it, for example relighting of the person), under the
+//!   effect or alone with `none`. A stage hides nothing: `none` with stages
+//!   passes the input through until they are loaded, and blur and replace
+//!   follow their privacy rules below whether or not one is on. A stage is
+//!   switched on the loaded chain (a new load-time parameter is a switch
+//!   too; its live parameters apply on the next frame and load nothing). If
+//!   a stage cannot load or fails on a frame, the element drops it and goes
+//!   on without it (the effect keeps running; its status does not turn
+//!   failed; a frame under blur or replace is processed again without it,
+//!   under `none` the frame is the input), and reports why in the stage's
+//!   own status ([`ObcEffect::stage_status`]). The failure is retried when
+//!   the stage's request (on or off, or its load-time parameters) changes or
+//!   on [`ObcEffect::apply`].
 //! * **An effect** writes a new output buffer from a CUDA buffer pool on the
 //!   input's `GstCudaContext` (the stream's shared context, taken from the
 //!   first input memory); the input is only read, so the clock's repeats of
@@ -46,20 +42,22 @@
 //!   not used).
 //! * **Loading** runs on a worker thread of the element, with the context
 //!   pushed. Until the requested effect is ready the element outputs black
-//!   frames (from `none`, with or without denoise) or keeps the previous
-//!   effect (from another effect, or when only the denoise request
-//!   changes); `none` passes the input through at once and unloads on the
-//!   worker (or switches to the denoise stage alone).
+//!   frames (from `none`, with or without stages) or keeps the previous
+//!   effect (from another effect, or when only a stage request changes);
+//!   `none` passes the input through at once and unloads on the worker (or
+//!   switches to the stages alone).
 //! * **Failures** (no backend, a failed load, a frame or a background
 //!   image) set [`EffectStatus::Failed`]; the element then outputs black
 //!   (`on-failure=black`) or the input (`on-failure=none`). Every change of
-//!   the effect's or the denoise status is also posted on the bus as an
+//!   the effect's or a stage's status is also posted on the bus as an
 //!   element message named [`STATUS_MESSAGE`], with the fields `effect`
 //!   (string), `status` (`off`, `loading`, `ready`, `failed`), `reason`
-//!   (string, empty unless failed), `denoise` (the denoise status, same
-//!   values), `denoise-reason` (string, empty unless the denoise status
-//!   is failed), `relight` and `relight-reason` (the same for the
-//!   relighting stage).
+//!   (string, empty unless failed), and for every stage the element has
+//!   been given (listed in its settings, on or off), `<id>` (the stage's
+//!   status, same values) and `<id>-reason` (string, empty unless the
+//!   stage's status is failed): `denoise` and `denoise-reason`, for
+//!   example. A stage the element was never given has no field: it is
+//!   off.
 //! * **A new source**: a buffer carrying [`NEW_SOURCE_FLAG`] (the output
 //!   clock sets it on the first fresh frame of each source) makes the
 //!   element reset the backend's temporal state before the next frame it
@@ -74,7 +72,7 @@ use std::sync::Arc;
 use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
-use obc_backend::{BackendFactory, Stage};
+use obc_backend::BackendFactory;
 
 use crate::settings::{EffectSettings, EffectStats, EffectStatus};
 
@@ -138,13 +136,20 @@ impl ObcEffect {
         self.imp().backend_factory()
     }
 
-    /// Validates `settings` ([`EffectSettings::validate`]) and applies them
-    /// at once, as one change: one reload at most, and after a failure a
-    /// new attempt even when nothing changed. A change of the per-frame
-    /// parameters alone ([`EffectSettings::changes_frame_params_only`])
-    /// makes no new attempt.
+    /// Validates `settings` ([`EffectSettings::validate`], and each listed
+    /// stage's parameters with the backend factory's
+    /// `BackendFactory::check_params` when the element has a factory) and
+    /// applies them at once, as one change: one reload at most, and after a
+    /// failure a new attempt even when nothing changed. A change of the
+    /// per-frame parameters alone
+    /// ([`EffectSettings::changes_frame_params_only`]) makes no new attempt.
     pub fn apply(&self, settings: &EffectSettings) -> Result<(), String> {
         settings.validate()?;
+        if let Some(factory) = self.backend_factory() {
+            for s in &settings.stages {
+                factory.check_params(&s.id, &s.params, &s.live)?;
+            }
+        }
         self.imp().apply(settings.clone(), true);
         Ok(())
     }
@@ -155,21 +160,16 @@ impl ObcEffect {
     }
 
     /// The state of the requested effect ([`EffectStatus::Off`] for
-    /// `none`, with or without denoise).
+    /// `none`, with or without stages).
     pub fn status(&self) -> EffectStatus {
         self.imp().status()
     }
 
-    /// The state of the denoise stage: [`EffectStatus::Off`] unless
-    /// requested, then loading, ready, or failed with the reason (the stage
-    /// was dropped, or the chain it runs in failed).
-    pub fn denoise_status(&self) -> EffectStatus {
-        self.imp().stage_status(Stage::Denoise)
-    }
-
-    /// The state of the relighting stage, as [`ObcEffect::denoise_status`].
-    pub fn relight_status(&self) -> EffectStatus {
-        self.imp().stage_status(Stage::Relight)
+    /// The state of the stage `id`: [`EffectStatus::Off`] unless requested,
+    /// then loading, ready, or failed with the reason (the stage was
+    /// dropped, or the chain it runs in failed).
+    pub fn stage_status(&self, id: &str) -> EffectStatus {
+        self.imp().stage_status(id)
     }
 
     /// Counters and timings.

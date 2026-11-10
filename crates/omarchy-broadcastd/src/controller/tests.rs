@@ -15,6 +15,40 @@ use crate::backend::fake::{FakeBackend, Hook, World};
 use crate::camera::tests::cam;
 use crate::log::Level;
 
+/// The tracking of the stages of revision 8, as the tests read it.
+impl<B: MediaBackend> Controller<B> {
+    fn track_of(&self, id: &str) -> StageTrack {
+        self.stages
+            .iter()
+            .find(|(s, _)| s == id)
+            .map(|(_, t)| t.clone())
+            .unwrap_or_default()
+    }
+    fn denoise_failure(&self) -> Option<String> {
+        self.track_of("denoise").failure
+    }
+    fn relight_failure(&self) -> Option<String> {
+        self.track_of("relight").failure
+    }
+    fn denoise_seen(&self) -> Option<EffectStatus> {
+        self.track_of("denoise").seen
+    }
+    fn poll_denoise(&mut self, status: EffectStatus, effect: &EffectStatus) {
+        self.poll_stage(&StageId::DENOISE, status, effect);
+    }
+    fn poll_relight(&mut self, status: EffectStatus, effect: &EffectStatus) {
+        self.poll_stage(&StageId::RELIGHT, status, effect);
+    }
+}
+
+fn denoise_failure_text(reason: &str) -> String {
+    stage_failure_text(&StageId::DENOISE, "noise removal", reason)
+}
+
+fn relight_failure_text(reason: &str) -> String {
+    stage_failure_text(&StageId::RELIGHT, "relighting", reason)
+}
+
 fn alpha() -> Camera {
     cam("usb-a", "Alpha Cam", Some("1111:0001"), "/dev/video0")
 }
@@ -44,6 +78,7 @@ impl H {
             state: dir.path().join("state").join("state.toml"),
             cache: Some(dir.path().join("cache")),
             runtime: Some(dir.path().join("run")),
+            ledger: None,
         };
         fs::create_dir(dir.path().join("run")).unwrap();
         if !config.is_empty() {
@@ -186,8 +221,38 @@ impl H {
         self.ctrl.flush_settings();
         let (s, warn) = RuntimeState::load(&self.paths.state);
         assert_eq!(warn, None);
-        s
+        legacy_view(s)
     }
+}
+
+/// A state file's module settings as the typed keys of revision 8 read
+/// them, for the assertions written against those.
+fn legacy_view(mut s: RuntimeState) -> RuntimeState {
+    use obc_core::modules::StoredValue as V;
+    use obc_core::modules::legacy as l;
+    let get = |id: &str| s.settings.get(id).cloned();
+    let b = |v: Option<V>| match v {
+        Some(V::Bool(b)) => Some(b),
+        _ => None,
+    };
+    let i = |v: Option<V>| match v {
+        Some(V::Int(i)) => Some(i),
+        _ => None,
+    };
+    s.denoise = s.denoise.or(b(get(l::DENOISE)));
+    s.enhance = s.enhance.or(b(get(l::ENHANCE)));
+    s.relight = s.relight.or(b(get(l::RELIGHT)));
+    s.relight_light = s.relight_light.or(match get(l::LIGHT) {
+        Some(V::Str(x)) => x.parse().ok(),
+        _ => None,
+    });
+    s.relight_direction = s
+        .relight_direction
+        .or(i(get(l::DIRECTION)).map(|v| v as i32));
+    s.relight_brightness = s
+        .relight_brightness
+        .or(i(get(l::BRIGHTNESS)).map(|v| v as u32));
+    s
 }
 
 fn ids(s: &Snapshot) -> Vec<&str> {
@@ -234,6 +299,7 @@ fn disabled_in_the_state_file_starts_off_with_the_writer_running() {
         state,
         cache: None,
         runtime: None,
+        ledger: None,
     };
     let fake = FakeBackend::default();
     fake.world().cameras = vec![alpha()];
@@ -970,6 +1036,8 @@ fn every_transition_of_the_lifecycle_is_announced_in_order() {
             Change::CameraControls(v) => format!("controls={}:{}", v.camera, v.controls.len()),
             Change::SettingsRevision(n) => format!("settings_revision={n}"),
             Change::SettingsSchemaSerial(n) => format!("settings_serial={n}"),
+            Change::ModulesSerial(n) => format!("modules_serial={n}"),
+            Change::BackendProfile(p) => format!("profile={p}"),
         })
         .collect();
     assert_eq!(
@@ -1009,6 +1077,7 @@ fn diff_lists_state_last() {
         state: "/nonexistent/s.toml".into(),
         cache: None,
         runtime: None,
+        ledger: None,
     });
     let mut b = a.clone();
     b.state = State::Active;
@@ -2045,7 +2114,7 @@ impl H {
 
     /// Whether the running session was given noise removal.
     fn denoise_applied(&self) -> Option<bool> {
-        self.world().effect.as_ref().map(|e| e.denoise)
+        self.world().effect.as_ref().map(|e| e.denoise())
     }
 }
 
@@ -2075,7 +2144,7 @@ fn set_denoise_persists_publishes_applies_and_survives_a_restart() {
     assert_eq!(h.applied(), Some(EffectMode::None));
     assert_eq!(h.denoise_applied(), Some(true));
     h.tick(1500);
-    assert_eq!(h.ctrl.denoise_seen, Some(EffectStatus::Ready));
+    assert_eq!(h.ctrl.denoise_seen(), Some(EffectStatus::Ready));
     // Off while streaming: applied at once, no restart.
     h.set_denoise(false, 2000).unwrap();
     assert_eq!(h.denoise_applied(), Some(false));
@@ -2087,7 +2156,7 @@ fn set_denoise_persists_publishes_applies_and_survives_a_restart() {
     h.set_denoise(true, 2500).unwrap();
     h.set_effect("blur", 3000).unwrap();
     let applied = h.world().effect.clone().unwrap();
-    assert_eq!((applied.mode, applied.denoise), (EffectMode::Blur, true));
+    assert_eq!((applied.mode, applied.denoise()), (EffectMode::Blur, true));
     assert_eq!(h.world().session_starts, 1);
     assert_eq!(h.snap().error, "");
 }
@@ -2113,7 +2182,7 @@ fn a_repeated_set_denoise_neither_rewrites_the_state_nor_reloads_the_session() {
     h.set_denoise(true, 0).unwrap();
     h.activate(0);
     h.tick(500);
-    assert_eq!(h.ctrl.denoise_seen, Some(EffectStatus::Ready));
+    assert_eq!(h.ctrl.denoise_seen(), Some(EffectStatus::Ready));
     let sets = h.world().effect_sets.len();
     fs::remove_file(&h.paths.state).unwrap();
     h.set_denoise(true, 1000).unwrap();
@@ -2126,7 +2195,7 @@ fn a_repeated_set_denoise_neither_rewrites_the_state_nor_reloads_the_session() {
     h.set_denoise(false, 2000).unwrap();
     assert_eq!(h.world().effect_sets.len(), sets + 1);
     assert_eq!(h.ctrl.effect_seen, Some(EffectStatus::Ready));
-    assert_eq!(h.ctrl.denoise_seen, Some(EffectStatus::Off));
+    assert_eq!(h.ctrl.denoise_seen(), Some(EffectStatus::Off));
 }
 
 #[test]
@@ -2186,7 +2255,7 @@ fn a_denoise_failure_keeps_streaming_whatever_on_failure_says() {
         h.world().denoise_status = EffectStatus::Ready;
         h.tick(1250);
         assert_eq!(h.snap().error, "", "{on_failure}");
-        assert_eq!(h.ctrl.denoise_failure, None);
+        assert_eq!(h.ctrl.denoise_failure(), None);
     }
     // With an effect running, the effect is unaffected: still ready, the
     // session still streaming, under `black` too.
@@ -2256,7 +2325,7 @@ fn a_reload_or_the_end_of_the_session_clears_a_denoise_failure() {
     h.tick(2100);
     assert_eq!(h.state(), State::Idle);
     assert_eq!(h.snap().error, "");
-    assert_eq!(h.ctrl.denoise_failure, None);
+    assert_eq!(h.ctrl.denoise_failure(), None);
     // Off ends it too.
     h.world().denoise_fail = Some(NO_DENOISE.into());
     h.activate(3000);
@@ -2285,7 +2354,7 @@ fn an_effect_failure_comes_before_a_denoise_failure_in_error() {
         effect_error.starts_with(&format!("effect blur unavailable: {effect_reason};")),
         "{effect_error}"
     );
-    assert!(h.ctrl.denoise_failure.is_some());
+    assert!(h.ctrl.denoise_failure().is_some());
     // The effect recovers: the denoise failure, still standing, shows.
     h.world().effect_status = EffectStatus::Ready;
     h.tick(1000);
@@ -2329,7 +2398,7 @@ fn an_effect_fault_ends_a_denoise_failure_with_the_session() {
         h.snap().error,
         "effect blur unavailable: processing a frame failed"
     );
-    assert_eq!(h.ctrl.denoise_failure, None);
+    assert_eq!(h.ctrl.denoise_failure(), None);
     // The consumer leaves: the fault is cleared (its text stays, as the
     // latest error), the denoise failure does not come back.
     h.consumers(0, 2000);
@@ -2403,7 +2472,7 @@ fn a_failure_of_the_whole_chain_is_the_effects_not_noise_removals() {
         effect_error.starts_with(&format!("effect blur unavailable: {GREEN_SCREEN};")),
         "{effect_error}"
     );
-    assert_eq!(h.ctrl.denoise_failure, None);
+    assert_eq!(h.ctrl.denoise_failure(), None);
     assert_no_denoise_text(&mut h);
     // The effect recovers, seen a poll before the stage does: nothing
     // stale is left.
@@ -2426,7 +2495,7 @@ fn a_failure_of_the_whole_chain_is_the_effects_not_noise_removals() {
     h.tick(3000);
     assert_eq!(h.world().denoise_status, EffectStatus::Ready);
     assert_eq!(h.snap().error, "");
-    assert_eq!(h.ctrl.denoise_failure, None);
+    assert_eq!(h.ctrl.denoise_failure(), None);
     assert_no_denoise_text(&mut h);
     assert_eq!(h.world().session_starts, 1);
 }
@@ -2453,7 +2522,7 @@ fn a_failure_of_the_whole_chain_seen_a_poll_apart_is_still_the_effects() {
         assert!(h.snap().error.starts_with(&effect_text), "{before:?}");
         h.tick(1500);
         assert!(h.snap().error.starts_with(&effect_text), "{before:?}");
-        assert_eq!(h.ctrl.denoise_failure, None, "{before:?}");
+        assert_eq!(h.ctrl.denoise_failure(), None, "{before:?}");
         assert_no_denoise_text(&mut h);
         // Then it recovers: nothing stale.
         h.world().effect_status = EffectStatus::Ready;
@@ -2475,7 +2544,7 @@ fn a_failure_of_the_whole_chain_seen_a_poll_apart_is_still_the_effects() {
         h.tick(1250);
         h.tick(1500);
         assert!(h.snap().error.starts_with(&effect_text), "{before:?}");
-        assert_eq!(h.ctrl.denoise_failure, None, "{before:?}");
+        assert_eq!(h.ctrl.denoise_failure(), None, "{before:?}");
         // The effect recovers before the stage does: nothing stale.
         h.world().effect_status = EffectStatus::Ready;
         h.tick(1750);
@@ -2509,7 +2578,7 @@ fn a_noise_removal_failure_under_a_healthy_effect_is_still_reported() {
         h.world().effect_status = EffectStatus::Failed(GREEN_SCREEN.into());
         h.tick(1300);
         assert!(h.snap().error.starts_with("effect blur unavailable:"));
-        assert!(h.ctrl.denoise_failure.is_some());
+        assert!(h.ctrl.denoise_failure().is_some());
         h.world().effect_status = EffectStatus::Ready;
         h.tick(1550);
         assert_eq!(h.snap().error, denoise_error(NO_DENOISE), "slow {slow}");
@@ -3599,6 +3668,7 @@ fn without_a_runtime_directory_a_lease_fails() {
             state: dir.path().join("state.toml"),
             cache: None,
             runtime,
+            ledger: None,
         };
         let fake = FakeBackend::default();
         let (published, _notes) = Published::new(preliminary_snapshot(&paths));
@@ -6036,31 +6106,45 @@ fn a_held_write_follows_a_rename_of_the_open_camera() {
 
 // ---- the global settings: the video effects (revision 8) ----
 
-use crate::settings::effects::{
-    BLUR_STRENGTH as BLUR_ID, DENOISE as DENOISE_ID, MODE as EFFECT_ID, REASON_CHOOSE_BLUR,
-    REASON_NOT_INSTALLED,
-};
-use obc_pipeline::effect::{Availability, Feature};
+use crate::settings::effects::{BLUR_STRENGTH as BLUR_ID, MODE as EFFECT_ID, REASON_CHOOSE_BLUR};
+use obc_core::modules::legacy::DENOISE as DENOISE_ID;
 
-/// Every feature installed but noise removal, missing for `why`.
-fn denoise_missing(why: &str) -> Vec<(Feature, Availability)> {
-    Feature::ALL
+/// The Maxine module's reason of a stage whose SDK features are missing.
+const REASON_NOT_INSTALLED: &str = "Not installed";
+use obc_pipeline::effect::{Availability, StageId};
+
+/// The stages the Maxine backend reports.
+const STAGES: [StageId; 4] = [
+    StageId::BACKGROUND,
+    StageId::DENOISE,
+    StageId::RELIGHT,
+    StageId::ENHANCE,
+];
+
+/// Every stage installed but `missing`, missing for `why`.
+fn stage_missing(missing: &StageId, why: &str) -> Vec<(StageId, Availability)> {
+    STAGES
         .into_iter()
-        .map(|f| {
-            let a = if f == Feature::Denoise {
+        .map(|s| {
+            let a = if s == *missing {
                 Availability::NotInstalled(why.into())
             } else {
                 Availability::Installed
             };
-            (f, a)
+            (s, a)
         })
         .collect()
 }
 
-fn all_installed() -> Vec<(Feature, Availability)> {
-    Feature::ALL
+/// Every stage installed but noise removal, missing for `why`.
+fn denoise_missing(why: &str) -> Vec<(StageId, Availability)> {
+    stage_missing(&StageId::DENOISE, why)
+}
+
+fn all_installed() -> Vec<(StageId, Availability)> {
+    STAGES
         .into_iter()
-        .map(|f| (f, Availability::Installed))
+        .map(|s| (s, Availability::Installed))
         .collect()
 }
 
@@ -6076,7 +6160,7 @@ fn signal_ids(signals: &[(u32, u32, Vec<SettingChange>)]) -> Vec<Vec<String>> {
 fn saved_now(h: &H) -> RuntimeState {
     let (s, warn) = RuntimeState::load(&h.paths.state);
     assert_eq!(warn, None);
-    s
+    legacy_view(s)
 }
 
 #[test]
@@ -6341,7 +6425,7 @@ fn noise_removal_not_installed_is_never_requested_and_raises_no_error() {
     h.set_denoise(false, 900).unwrap();
     h.set_denoise(true, 950).unwrap();
     assert_eq!(saved_now(&h).denoise, Some(true));
-    assert!(h.world().effect_sets.iter().all(|e| !e.denoise));
+    assert!(h.world().effect_sets.iter().all(|e| !e.denoise()));
     assert_eq!(h.snap().error, "");
     // Installed (found on a reload): it turns on by itself, and a real
     // failure is reported as before.
@@ -6576,7 +6660,8 @@ fn a_global_write_the_state_file_cannot_take_fails_as_the_setter_does() {
 
 // ---- enhancement of a low-resolution camera (the ingest's enhance stage) ----
 
-use crate::settings::effects::{ENHANCE as ENHANCE_ID, REASON_FULL_RESOLUTION};
+use crate::settings::effects::REASON_FULL_RESOLUTION;
+use obc_core::modules::legacy::ENHANCE as ENHANCE_ID;
 use obc_ipc::SettingKind;
 
 /// `c` capturing at 640x360: below the default 1920x1080 output.
@@ -6591,19 +6676,10 @@ fn enhance_error(reason: &str) -> String {
     format!("enhance unavailable: {reason}; the video continues without it")
 }
 
-/// Every feature installed but video super resolution, missing for `why`.
-fn vsr_missing(why: &str) -> Vec<(Feature, Availability)> {
-    Feature::ALL
-        .into_iter()
-        .map(|f| {
-            let a = if f == Feature::VideoSuperResolution {
-                Availability::NotInstalled(why.into())
-            } else {
-                Availability::Installed
-            };
-            (f, a)
-        })
-        .collect()
+/// Every stage installed but enhancement (video super resolution), missing
+/// for `why`.
+fn vsr_missing(why: &str) -> Vec<(StageId, Availability)> {
+    stage_missing(&StageId::ENHANCE, why)
 }
 
 impl H {
@@ -6835,7 +6911,7 @@ fn an_enhance_failure_keeps_streaming_and_shows_in_error_after_noise_removal() {
     let ugly = format!("bad\u{1b}[31m\n{}", "x".repeat(2000));
     let text = enhance_failure_text(&ugly);
     assert!(!text.chars().any(char::is_control), "{text:?}");
-    assert!(text.len() <= ENHANCE_REASON_MAX + 80, "{}", text.len());
+    assert!(text.len() <= STAGE_REASON_MAX + 80, "{}", text.len());
 }
 
 #[test]
@@ -6999,7 +7075,7 @@ fn stage_failures_never_overwrite_a_higher_cause_in_error() {
         assert_eq!(h.ctrl.error, top, "noise removal under {what}");
         h.ctrl.poll_enhance(failed("no vsr"));
         assert_eq!(h.ctrl.error, top, "enhance under {what}");
-        assert!(h.ctrl.denoise_failure.is_some() && h.ctrl.enhance_failure.is_some());
+        assert!(h.ctrl.denoise_failure().is_some() && h.ctrl.enhance_failure.is_some());
     }
     // Noise removal over enhancement, either order.
     let mut h = fresh();
@@ -7056,10 +7132,15 @@ fn reopens_before_the_first_frame_keep_the_start_deadline() {
 
 // ---- relighting (the `lighting` group) ----
 
-use crate::settings::effects::{
+use obc_core::RelightLight;
+use obc_core::modules::legacy::{
     BRIGHTNESS as BRIGHTNESS_ID, DIRECTION as DIRECTION_ID, LIGHT as LIGHT_ID,
-    REASON_TURN_ON_RELIGHT, RELIGHT as RELIGHT_ID,
+    RELIGHT as RELIGHT_ID,
 };
+
+/// The Maxine module's reason of a relighting setting while relighting is
+/// off.
+const REASON_TURN_ON_RELIGHT: &str = "Turn on relighting to change this";
 
 const NO_RELIGHT: &str = "NvVFX_Load of relighting failed (-2)";
 
@@ -7067,19 +7148,16 @@ fn relight_error(reason: &str) -> String {
     format!("relighting unavailable: {reason}; the video continues without it")
 }
 
-/// Every feature installed but `missing`, missing for `why`.
-fn feature_missing(missing: Feature, why: &str) -> Vec<(Feature, Availability)> {
-    Feature::ALL
-        .into_iter()
-        .map(|f| {
-            let a = if f == missing {
-                Availability::NotInstalled(why.into())
-            } else {
-                Availability::Installed
-            };
-            (f, a)
-        })
-        .collect()
+/// Every stage installed but relighting, whose feature `missing` (its own,
+/// or the green screen that makes its matte) is missing for `why`, as the
+/// Maxine backend reports it (`<feature>: <why>`); the green screen takes
+/// the background stage with it.
+fn feature_missing(missing: &str, why: &str) -> Vec<(StageId, Availability)> {
+    let mut stages = stage_missing(&StageId::RELIGHT, &format!("{missing}: {why}"));
+    if missing == "green-screen" {
+        stages[0].1 = Availability::NotInstalled(format!("{missing}: {why}"));
+    }
+    stages
 }
 
 impl H {
@@ -7088,10 +7166,10 @@ impl H {
     fn relight_applied(&self) -> Option<(bool, RelightLight, i32, u32)> {
         self.world().effect.as_ref().map(|e| {
             (
-                e.relight,
-                e.relight_light,
-                e.relight_direction,
-                e.relight_brightness,
+                e.relight(),
+                e.relight_light(),
+                e.relight_direction(),
+                e.relight_brightness(),
             )
         })
     }
@@ -7226,20 +7304,28 @@ fn a_new_light_or_a_stage_toggle_is_one_change_on_the_running_session() {
     assert_eq!(h.world().relight_status, EffectStatus::Ready);
     let ingests = h.world().ingests.clone();
     let mut t = 200;
-    type Change = fn(&mut EffectConfig);
+    type Change = fn(&mut EffectRun);
     let steps: [(&str, SettingValue, Change); 7] = [
         (LIGHT_ID, s("warm"), |e| {
-            e.relight_light = RelightLight::Warm
+            e.set_param("relight", "light", "warm")
         }),
         (LIGHT_ID, s("cool"), |e| {
-            e.relight_light = RelightLight::Cool
+            e.set_param("relight", "light", "cool")
         }),
-        (DENOISE_ID, SettingValue::Bool(false), |e| e.denoise = false),
-        (DENOISE_ID, SettingValue::Bool(true), |e| e.denoise = true),
-        (RELIGHT_ID, SettingValue::Bool(false), |e| e.relight = false),
-        (RELIGHT_ID, SettingValue::Bool(true), |e| e.relight = true),
+        (DENOISE_ID, SettingValue::Bool(false), |e| {
+            e.set_enabled("denoise", false)
+        }),
+        (DENOISE_ID, SettingValue::Bool(true), |e| {
+            e.set_enabled("denoise", true)
+        }),
+        (RELIGHT_ID, SettingValue::Bool(false), |e| {
+            e.set_enabled("relight", false)
+        }),
+        (RELIGHT_ID, SettingValue::Bool(true), |e| {
+            e.set_enabled("relight", true)
+        }),
         (LIGHT_ID, s("neutral"), |e| {
-            e.relight_light = RelightLight::Neutral
+            e.set_param("relight", "light", "neutral")
         }),
     ];
     for (id, value, change) in steps {
@@ -7310,7 +7396,7 @@ fn relighting_settings_at_idle_are_only_stored() {
 
 #[test]
 fn relighting_not_installed_is_never_requested_and_raises_no_error() {
-    for missing in [Feature::Relighting, Feature::GreenScreen] {
+    for missing in ["relighting", "green-screen"] {
         let mut h = H::new("[effect]\nrelight = true\n", |w| {
             w.features = Some(feature_missing(missing, "no model for this GPU"));
             // Were it requested, it would fail and show in Error.
@@ -7367,7 +7453,7 @@ fn a_relighting_failure_keeps_streaming_and_is_cleared_like_noise_removals() {
         h.world().relight_status = EffectStatus::Ready;
         h.tick(1000);
         assert_eq!(h.snap().error, "");
-        assert_eq!(h.ctrl.relight_failure, None);
+        assert_eq!(h.ctrl.relight_failure(), None);
     }
     // A write of a relighting setting retries it (the value in force too).
     let mut h = H::new(config, |w| w.relight_fail = Some(NO_RELIGHT.into()));
@@ -7394,12 +7480,12 @@ fn a_relighting_failure_keeps_streaming_and_is_cleared_like_noise_removals() {
     assert_eq!(
         given
             .iter()
-            .map(|e| (e.relight_direction, e.relight_brightness))
+            .map(|e| (e.relight_direction(), e.relight_brightness()))
             .collect::<Vec<_>>(),
         [(10, 100), (10, 150), (15, 150)]
     );
     assert_eq!(h.snap().error, relight_error(NO_RELIGHT), "not retried");
-    assert!(h.ctrl.relight_failure.is_some());
+    assert!(h.ctrl.relight_failure().is_some());
     // A toggle write retries.
     h.world().relight_fail = None;
     h.set_setting(RELIGHT_ID, SettingValue::Bool(true), 700)
@@ -7430,7 +7516,7 @@ fn a_relighting_failure_keeps_streaming_and_is_cleared_like_noise_removals() {
     h.tick(1400);
     assert_eq!(h.state(), State::Idle);
     assert_eq!(h.snap().error, "");
-    assert_eq!(h.ctrl.relight_failure, None);
+    assert_eq!(h.ctrl.relight_failure(), None);
 }
 
 #[test]
@@ -7443,7 +7529,7 @@ fn a_relighting_failure_text_is_sanitised_and_bounded() {
     );
     assert!(text.ends_with("; the video continues without it"));
     assert!(!text.chars().any(char::is_control), "{text}");
-    assert!(text.len() <= RELIGHT_REASON_MAX + 80, "{}", text.len());
+    assert!(text.len() <= STAGE_REASON_MAX + 80, "{}", text.len());
 }
 
 #[test]
@@ -7462,7 +7548,7 @@ fn a_whole_chain_failure_is_the_effects_not_relightings() {
         EffectStatus::Failed(reason.into())
     );
     assert!(h.snap().error.starts_with("effect blur unavailable"));
-    assert_eq!(h.ctrl.relight_failure, None);
+    assert_eq!(h.ctrl.relight_failure(), None);
 }
 
 /// Relighting comes after noise removal and before enhancement in
@@ -7481,7 +7567,7 @@ fn a_relighting_failure_sits_between_noise_removal_and_enhancement() {
     h.ctrl
         .poll_relight(failed("no relight"), &EffectStatus::Off);
     assert_eq!(h.ctrl.error, "effect unavailable: x");
-    assert!(h.ctrl.relight_failure.is_some());
+    assert!(h.ctrl.relight_failure().is_some());
     // Noise removal over relighting.
     let mut h = fresh();
     h.ctrl
@@ -7530,5 +7616,654 @@ fn a_damaged_relighting_value_in_the_state_file_fails_closed() {
     assert!(
         error.contains("state.toml") && error.contains("relight_direction"),
         "{error}"
+    );
+}
+
+// ---- the modules (revision 9) ----
+
+use crate::backend::{Backends, Placement};
+use crate::modules::{LEDGER_FILE, MAXINE_MODULE};
+use obc_module_host::{CrashLedger, REASON_CRASHED};
+
+impl H {
+    fn modules(&mut self) -> obc_ipc::ModuleList {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let now = self.at(0);
+        assert!(self.ctrl.handle(Command::GetModules(tx), now));
+        rx.try_recv().unwrap().unwrap()
+    }
+
+    fn global_groups(&mut self) -> Vec<String> {
+        self.get_settings("", 0)
+            .unwrap()
+            .groups
+            .iter()
+            .filter(|g| g.is_global())
+            .map(|g| g.id.clone())
+            .collect()
+    }
+}
+
+/// The example module, built (once per test binary) out of tree as a
+/// third party builds it, with a manifest naming it in a `modules.d`
+/// directory of its own; the directory is returned (kept by the caller).
+fn hello_modules_dir() -> TempDir {
+    static BUILT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let lib = BUILT.get_or_init(|| {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let target = repo.join("target/daemon-module-tests");
+        let status = std::process::Command::new(env!("CARGO"))
+            .args(["build", "--quiet", "--locked", "--manifest-path"])
+            .arg(repo.join("examples/module-hello/Cargo.toml"))
+            .arg("--target-dir")
+            .arg(&target)
+            .status()
+            .expect("run cargo");
+        assert!(status.success(), "building the example module failed");
+        target.join("debug/libobc_module_hello.so")
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/module-hello/hello.toml"),
+    )
+    .unwrap()
+    .replace(
+        "library = \"target/release/libobc_module_hello.so\"",
+        &format!("library = \"{}\"", lib.display()),
+    );
+    fs::write(dir.path().join("hello.toml"), manifest).unwrap();
+    dir
+}
+
+fn modules_config(dir: &std::path::Path) -> String {
+    format!(
+        "[modules]\ndirs = [\"{}\"]\n[lifecycle]\nstart_debounce_ms = 0\n",
+        dir.display()
+    )
+}
+
+#[test]
+fn with_no_module_the_camera_passes_through_and_no_effect_group_is_shown() {
+    let mut h = H::new("", |w| w.maxine = false);
+    assert!(h.modules().modules.is_empty());
+    assert!(h.global_groups().is_empty());
+    assert!(matches!(
+        h.set_setting(EFFECT_ID, s("blur"), 0),
+        Err(IpcError::UnknownSetting(_))
+    ));
+    h.activate(100);
+    {
+        let w = h.world();
+        let (params, _) = w.session.as_ref().unwrap();
+        assert_eq!(params.backends, Backends::default(), "no module code runs");
+        assert!(params.effect.stages.is_empty() && params.effect.chains.is_empty());
+        assert!(!params.effect.enhance);
+    }
+    assert_eq!(h.snap().error, "");
+    assert!(h.ctrl.order_ids().is_empty());
+}
+
+#[test]
+fn a_background_effect_with_no_module_to_run_it_fails_closed() {
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| w.maxine = false);
+    // The method of revision 8 still takes the choice.
+    h.call(|r| Command::SetEffect("blur".into(), r), 0).unwrap();
+    h.consumers(1, 100);
+    h.tick(400);
+    assert_eq!(h.state(), State::Error);
+    let error = h.snap().error;
+    assert!(
+        error.starts_with("effect blur unavailable: no effect module provides the background"),
+        "{error}"
+    );
+    assert!(h.world().session.is_none(), "the camera stays closed");
+}
+
+#[test]
+fn the_maxine_module_offers_the_groups_and_stages_of_revision_8() {
+    let mut h = H::new("", |_| {});
+    assert_eq!(h.global_groups(), ["background", "video", "lighting"]);
+    let list = h.modules();
+    assert_eq!(list.serial, 1);
+    let m = list.find(MAXINE_MODULE).unwrap();
+    assert_eq!((m.enabled, m.status.as_str()), (true, "available"));
+    let stages: Vec<(&str, &str, bool)> = m
+        .stages
+        .iter()
+        .map(|s| (s.id.as_str(), s.slot.as_str(), s.selected))
+        .collect();
+    assert_eq!(
+        stages,
+        [
+            ("enhance", "pre-matte", true),
+            ("denoise", "pre-matte", true),
+            ("background", "matte", true),
+            ("relight", "post-matte", true)
+        ]
+    );
+    // It is the effect element's backend and the ingest's enhancer.
+    h.activate(0);
+    let w = h.world();
+    let (params, _) = w.session.as_ref().unwrap();
+    assert_eq!(
+        params.backends.effect.as_ref().map(|c| c.id.as_str()),
+        Some(MAXINE_MODULE)
+    );
+    assert_eq!(
+        params.backends.enhance.as_ref().map(|c| c.id.as_str()),
+        Some(MAXINE_MODULE)
+    );
+    let ids: Vec<&str> = params.effect.stages.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, ["denoise", "relight"]);
+    assert!(params.effect.chains.is_empty());
+    // Its configuration: the module's table, the revision-8 SDK root
+    // alias, and the GPU's compute capability when known.
+    let (_, config) = w
+        .module_opens
+        .iter()
+        .find(|(id, _)| id == MAXINE_MODULE)
+        .unwrap();
+    assert_eq!(
+        config["_host"]["compute_capability"],
+        serde_json::Value::Null
+    );
+}
+
+/// A reload keeps a module open while its manifest, library and
+/// configuration are unchanged (probed again), and opens anew only the
+/// modules whose configuration (or manifest) changed.
+#[test]
+fn a_reload_reopens_only_the_modules_that_changed() {
+    const NPU: &str = "org.example.npu";
+    let manifest = |version: &str| {
+        crate::modules::testing::entry(
+            &format!(
+                "abi = 1\nid = \"{NPU}\"\nname = \"NPU cut-out\"\nversion = \"{version}\"\n\
+                 licence = \"MIT\"\nkind = \"video-stage\"\nlibrary = \"/m/libnpu.so\"\n\
+                 [[stage]]\nid = \"background\"\nslot = \"matte\"\nrank = 100\n\
+                 device = \"npu\"\nframes = [\"host\"]\nformats = [\"nv12\"]\n"
+            ),
+            "/m/npu.toml",
+        )
+    };
+    let opened = Ok(crate::backend::OpenedModule {
+        module: None,
+        stages: vec![(
+            StageId::BACKGROUND,
+            obc_pipeline::effect::Availability::Installed,
+        )],
+        settings: Default::default(),
+    });
+    let first = (manifest("1"), opened.clone());
+    let mut h = H::new("", move |w| w.modules = vec![first]);
+    let opens = |h: &H, id: &str| {
+        h.world()
+            .module_opens
+            .iter()
+            .filter(|(m, _)| m == id)
+            .count()
+    };
+    assert_eq!((opens(&h, MAXINE_MODULE), opens(&h, NPU)), (1, 1));
+    h.reload("", 0).unwrap();
+    assert_eq!(
+        (opens(&h, MAXINE_MODULE), opens(&h, NPU)),
+        (1, 1),
+        "nothing changed: both kept"
+    );
+    assert_eq!(h.modules().find(NPU).unwrap().status, "available");
+    h.reload(&format!("[module.\"{NPU}\"]\nthreads = 2\n"), 0)
+        .unwrap();
+    assert_eq!(
+        (opens(&h, MAXINE_MODULE), opens(&h, NPU)),
+        (1, 2),
+        "its table changed: the NPU module alone is opened again"
+    );
+    h.reload(
+        &format!("[effect]\nmaxine_root = \"/opt/m\"\n[module.\"{NPU}\"]\nthreads = 2\n"),
+        0,
+    )
+    .unwrap();
+    assert_eq!((opens(&h, MAXINE_MODULE), opens(&h, NPU)), (2, 2));
+    h.world().modules = vec![(manifest("2"), opened)];
+    h.reload(
+        &format!("[effect]\nmaxine_root = \"/opt/m\"\n[module.\"{NPU}\"]\nthreads = 2\n"),
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        (opens(&h, MAXINE_MODULE), opens(&h, NPU)),
+        (2, 3),
+        "its manifest changed"
+    );
+}
+
+#[test]
+fn the_sdk_root_alias_and_the_module_table_reach_the_module() {
+    let h = H::new(
+        "[effect]\nmaxine_root = \"/opt/maxine\"\n[module.\"org.example.other\"]\nx = 1\n",
+        |_| {},
+    );
+    let opens = h.world().module_opens.clone();
+    assert_eq!(opens[0].1["sdk_root"], "/opt/maxine");
+    drop(h);
+    let h = H::new(
+        "[effect]\nmaxine_root = \"/opt/maxine\"\n\
+         [module.\"br.com.dias.maxine-vfx\"]\nsdk_root = \"/opt/other\"\n",
+        |_| {},
+    );
+    let opens = h.world().module_opens.clone();
+    assert_eq!(
+        opens[0].1["sdk_root"], "/opt/other",
+        "the module's own wins"
+    );
+}
+
+#[test]
+fn a_module_from_a_modules_dir_shows_its_group_and_a_write_reaches_its_stage() {
+    let dir = hello_modules_dir();
+    let mut h = H::new(&modules_config(dir.path()), |w| w.real_modules = true);
+    let list = h.modules();
+    let hello = list.find("org.example.hello").expect("discovered");
+    assert_eq!(
+        (hello.status.as_str(), hello.reason.as_str()),
+        ("available", "")
+    );
+    assert_eq!(hello.stages[0].id, "hello");
+    assert!(hello.stages[0].selected);
+    assert_eq!(
+        h.global_groups(),
+        ["background", "video", "lighting", "hello"]
+    );
+    let on = h.setting("effect.hello.enabled");
+    assert_eq!(on.kind.value(), Some(SettingValue::Bool(false)));
+    h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
+        .unwrap();
+    h.activate(100);
+    {
+        let w = h.world();
+        let (params, _) = w.session.as_ref().unwrap();
+        assert_eq!(params.backends.chains.len(), 1);
+        assert_eq!(params.backends.chains[0].1.id, "org.example.hello");
+        assert!(params.backends.chains[0].1.module.is_some(), "loaded");
+        let chain = &params.effect.chains[0];
+        assert_eq!(chain.placement, Placement::AfterEffect);
+        assert_eq!(chain.stages[0].id.as_str(), "hello");
+        assert!(chain.stages[0].enabled);
+    }
+    // A live parameter reaches the running stage, without a reload.
+    let default = match h.setting("effect.hello.strength").kind {
+        SettingKind::Int { default, .. } => default,
+        other => panic!("{other:?}"),
+    };
+    let new = if default == 30 { 40 } else { 30 };
+    h.set_setting("effect.hello.strength", SettingValue::Int(new), 500)
+        .unwrap();
+    let w = h.world();
+    let last = w.effect_sets.last().expect("given to the session");
+    let stage = last.stage("hello").unwrap();
+    assert_eq!(
+        stage.live.get("strength"),
+        Some(&obc_pipeline::effect::Value::Int(new))
+    );
+    assert!(w.stage_status.is_empty() || w.stage_status.contains_key("hello"));
+}
+
+#[test]
+fn broken_missing_and_mismatched_modules_are_listed_with_their_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = |id: &str, abi: u32, library: &str, extra: &str| {
+        format!(
+            "abi = {abi}\nid = \"{id}\"\nname = \"N\"\nversion = \"1\"\nlicence = \"MIT\"\n\
+             kind = \"video-stage\"\nlibrary = \"{library}\"\n{extra}\
+             [[stage]]\nid = \"tint\"\nslot = \"post-composite\"\nrank = 1\ndevice = \"cpu\"\n\
+             frames = [\"host\"]\nformats = [\"nv12\"]\n"
+        )
+    };
+    fs::write(
+        dir.path().join("missing.toml"),
+        manifest("org.x.missing", 1, "/nonexistent/libx.so", ""),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("abi.toml"),
+        manifest("org.x.future", 2, "/nonexistent/liby.so", ""),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("typo.toml"),
+        manifest(
+            "org.x.typo",
+            1,
+            "/nonexistent/libz.so",
+            "colour = \"red\"\n",
+        ),
+    )
+    .unwrap();
+    let mut h = H::new(&modules_config(dir.path()), |w| w.real_modules = true);
+    let list = h.modules();
+    let reason = |id: &str| {
+        let m = list.find(id).unwrap_or_else(|| panic!("{id} listed"));
+        assert_eq!(m.status, "unavailable", "{id}");
+        assert!(m.enabled, "{id}");
+        m.reason.clone()
+    };
+    assert!(reason("org.x.missing").contains("/nonexistent/libx.so"));
+    assert!(
+        reason("org.x.future").contains("ABI"),
+        "{}",
+        reason("org.x.future")
+    );
+    assert!(reason("org.x.typo").contains("colour"));
+    // The daemon is up, the other module unaffected.
+    assert_eq!(h.global_groups(), ["background", "video", "lighting"]);
+    h.activate(100);
+}
+
+/// The crash ledger marks only the modules whose code the session runs: a
+/// plain video session (no effect, no stage on) marks none; turning the
+/// effect on marks its module before it runs, until the session stops.
+#[test]
+fn a_plain_video_session_marks_no_module_in_the_crash_ledger() {
+    let mut h = H::new("", |_| {});
+    let ledger = h.paths.state.with_file_name(LEDGER_FILE);
+    fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+    h.paths.ledger = Some(ledger.clone());
+    h.restart();
+    let running = || CrashLedger::open(&ledger).is_running(MAXINE_MODULE);
+    h.activate(0);
+    assert!(!running(), "plain video runs no module code");
+    h.call(|r| Command::SetEffect("blur".into(), r), 1000)
+        .unwrap();
+    assert!(running(), "the effect runs the module's code");
+    h.call(|r| Command::SetEffect("none".into(), r), 1100)
+        .unwrap();
+    assert!(running(), "kept while the session runs");
+    h.consumers(0, 2000);
+    h.tick(8000);
+    assert_eq!(h.state(), State::Idle);
+    assert!(!running(), "cleared when the session stops");
+    // A session that starts with a stage on marks it from the start.
+    h.set_setting("effect.video.denoise", SettingValue::Bool(true), 9000)
+        .unwrap();
+    h.activate(10_000);
+    assert!(running());
+}
+
+#[test]
+fn a_module_that_crashed_the_daemon_twice_in_a_row_is_disabled_until_enabled() {
+    let mut h = H::new("", |_| {});
+    let ledger = h.paths.state.with_file_name(LEDGER_FILE);
+    fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+    h.paths.ledger = Some(ledger.clone());
+    for start in 1..=2 {
+        // The daemon dies while the module's pipeline code runs.
+        let mut l = CrashLedger::open(&ledger);
+        l.begin(MAXINE_MODULE).unwrap();
+        drop(l);
+        h.restart();
+        let m = h.modules().find(MAXINE_MODULE).cloned().unwrap();
+        if start == 1 {
+            assert!(m.enabled, "one crash is not enough");
+            assert_eq!(h.global_groups(), ["background", "video", "lighting"]);
+        } else {
+            assert!(!m.enabled);
+            assert_eq!(
+                (m.status.as_str(), m.reason.as_str()),
+                ("disabled", REASON_CRASHED)
+            );
+            assert!(h.global_groups().is_empty(), "its settings are gone");
+        }
+    }
+    // A clean session clears the marker; re-enabling forgives it.
+    h.call(
+        |r| Command::SetModuleEnabled(MAXINE_MODULE.into(), true, r),
+        0,
+    )
+    .unwrap();
+    let m = h.modules().find(MAXINE_MODULE).cloned().unwrap();
+    assert!(m.enabled && m.status == "available");
+    assert_eq!(h.global_groups(), ["background", "video", "lighting"]);
+    assert_eq!(CrashLedger::open(&ledger).disabled(MAXINE_MODULE), None);
+    h.restart();
+    assert!(h.modules().find(MAXINE_MODULE).unwrap().enabled, "kept");
+}
+
+#[test]
+fn disabling_a_module_applies_at_the_next_start_and_is_kept() {
+    let mut h = H::new("", |_| {});
+    h.activate(0);
+    let serial = h.modules().serial;
+    h.call(
+        |r| Command::SetModuleEnabled(MAXINE_MODULE.into(), false, r),
+        500,
+    )
+    .unwrap();
+    let list = h.modules();
+    assert!(list.serial > serial);
+    assert!(!list.find(MAXINE_MODULE).unwrap().enabled);
+    assert!(h.global_groups().is_empty());
+    // The running session keeps its modules.
+    {
+        let w = h.world();
+        let (params, _) = w.session.as_ref().unwrap();
+        assert!(params.backends.effect.is_some());
+    }
+    assert_eq!(
+        h.persisted().modules.enabled.get(MAXINE_MODULE),
+        Some(&false)
+    );
+    h.restart();
+    assert!(!h.modules().find(MAXINE_MODULE).unwrap().enabled);
+    assert!(matches!(
+        h.call(
+            |r| Command::SetModuleEnabled("org.x.none".into(), true, r),
+            0
+        ),
+        Err(IpcError::InvalidArgument(_))
+    ));
+}
+
+#[test]
+fn the_stage_order_is_validated_kept_and_reset() {
+    let mut h = H::new("", |_| {});
+    assert_eq!(
+        h.ctrl.order_ids(),
+        ["enhance", "denoise", "background", "relight"]
+    );
+    let order = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let e = h
+        .call(
+            |r| Command::SetStageOrder(order(&["enhance", "relight", "denoise", "background"]), r),
+            0,
+        )
+        .unwrap_err();
+    match e {
+        IpcError::InvalidArgument(m) => assert!(m.contains("relight"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    let e = h
+        .call(|r| Command::SetStageOrder(order(&["denoise"]), r), 0)
+        .unwrap_err();
+    assert!(e.message().contains("leaves out"), "{e:?}");
+    h.call(
+        |r| Command::SetStageOrder(order(&["denoise", "enhance", "background", "relight"]), r),
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        h.ctrl.order_ids(),
+        ["denoise", "enhance", "background", "relight"]
+    );
+    assert!(h.persisted().modules.order.is_some());
+    h.restart();
+    assert_eq!(
+        h.ctrl.order_ids(),
+        ["denoise", "enhance", "background", "relight"]
+    );
+    h.call(|r| Command::SetStageOrder(Vec::new(), r), 0)
+        .unwrap();
+    assert_eq!(
+        h.ctrl.order_ids(),
+        ["enhance", "denoise", "background", "relight"]
+    );
+    assert_eq!(h.persisted().modules.order, None);
+}
+
+#[test]
+fn a_stored_order_that_no_longer_fits_falls_back_to_the_default() {
+    let mut h = H::new("", |_| {});
+    let mut st = RuntimeState::default();
+    st.modules.order = Some(vec!["relight".into(), "background".into()]);
+    st.save(&h.paths.state).unwrap();
+    h.restart();
+    assert_eq!(
+        h.ctrl.order_ids(),
+        ["enhance", "denoise", "background", "relight"]
+    );
+}
+
+#[test]
+fn the_profile_and_pins_are_reported_in_the_module_list() {
+    let mut h = H::new("", |w| {
+        w.modules = vec![(
+            crate::modules::testing::entry(
+                "abi = 1\nid = \"org.example.npu\"\nname = \"NPU cut-out\"\nversion = \"1\"\n\
+                 licence = \"MIT\"\nkind = \"video-stage\"\nlibrary = \"/m/libnpu.so\"\n\
+                 [[stage]]\nid = \"background\"\nslot = \"matte\"\nrank = 100\n\
+                 device = \"npu\"\nframes = [\"host\"]\nformats = [\"nv12\"]\n",
+                "/m/npu.toml",
+            ),
+            Ok(crate::backend::OpenedModule {
+                module: None,
+                stages: vec![(
+                    StageId::BACKGROUND,
+                    obc_pipeline::effect::Availability::Installed,
+                )],
+                settings: Default::default(),
+            }),
+        )];
+    });
+    let selected = |h: &mut H| {
+        h.modules()
+            .provider_of("background")
+            .map(|m| m.id.clone())
+            .unwrap()
+    };
+    assert_eq!(selected(&mut h), MAXINE_MODULE, "quality: the highest rank");
+    // Every change of what `GetModules` (or `GetStageOrder`) returns moves
+    // `ModulesSerial`, announced, and the list carries it.
+    let mut serial = h.snap().modules_serial.unwrap();
+    let mut moved = |h: &mut H, what: &str| {
+        let now = h.snap().modules_serial.unwrap();
+        assert_ne!(now, serial, "{what}: the serial moves");
+        assert_eq!(h.modules().serial, now, "{what}");
+        assert!(
+            h.drain().0.contains(&Change::ModulesSerial(now)),
+            "{what}: announced"
+        );
+        serial = now;
+    };
+    h.drain();
+    h.call(|r| Command::SetBackendProfile("battery".into(), r), 0)
+        .unwrap();
+    assert_eq!(
+        selected(&mut h),
+        "org.example.npu",
+        "battery: the NPU first"
+    );
+    moved(&mut h, "profile");
+    assert_eq!(h.snap().backend_profile.as_deref(), Some("battery"));
+    h.call(
+        |r| Command::SetStagePin("background".into(), MAXINE_MODULE.into(), r),
+        0,
+    )
+    .unwrap();
+    assert_eq!(selected(&mut h), MAXINE_MODULE, "pinned");
+    moved(&mut h, "pin");
+    h.call(
+        |r| Command::SetStagePin("background".into(), String::new(), r),
+        0,
+    )
+    .unwrap();
+    assert_eq!(selected(&mut h), "org.example.npu");
+    moved(&mut h, "unpinned");
+    let order = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    h.call(
+        |r| Command::SetStageOrder(order(&["denoise", "enhance", "background", "relight"]), r),
+        0,
+    )
+    .unwrap();
+    moved(&mut h, "order");
+    h.call(|r| Command::SetStageOrder(Vec::new(), r), 0)
+        .unwrap();
+    moved(&mut h, "default order");
+    assert!(matches!(
+        h.call(|r| Command::SetBackendProfile("fast".into(), r), 0),
+        Err(IpcError::InvalidArgument(_))
+    ));
+    let st = h.persisted();
+    assert_eq!(
+        st.modules.profile,
+        Some(obc_core::modules::BackendProfile::Battery)
+    );
+    assert!(st.modules.pin.is_empty());
+}
+
+#[test]
+fn the_revision_8_methods_are_aliases_of_the_registry_settings() {
+    let mut h = H::new("", |_| {});
+    h.call(|r| Command::SetDenoise(true, r), 0).unwrap();
+    assert_eq!(
+        h.setting(DENOISE_ID).kind.value(),
+        Some(SettingValue::Bool(true))
+    );
+    assert!(h.snap().denoise);
+    h.call(|r| Command::SetEffect("blur".into(), r), 0).unwrap();
+    h.call(|r| Command::SetBlurStrength(0.25, r), 0).unwrap();
+    assert_eq!(h.setting(EFFECT_ID).kind.value(), Some(s("blur")));
+    assert_eq!(h.setting(BLUR_ID).kind.value(), Some(SettingValue::Int(25)));
+    let st = h.persisted();
+    assert_eq!(st.denoise, Some(true), "kept by its setting id");
+    assert_eq!(st.effect, Some(EffectMode::Blur));
+    // And through the setting, the property.
+    h.set_setting(DENOISE_ID, SettingValue::Bool(false), 100)
+        .unwrap();
+    assert!(!h.snap().denoise);
+}
+
+#[test]
+fn a_revision_8_state_file_and_config_keep_their_meaning() {
+    let mut h = H::new(
+        "[effect]\nrelight = true\nrelight_brightness = 120\n",
+        |_| {},
+    );
+    fs::create_dir_all(h.paths.state.parent().unwrap()).unwrap();
+    fs::write(
+        &h.paths.state,
+        "enabled = true\neffect = \"blur\"\ndenoise = true\nrelight_light = \"warm\"\n\
+         relight_direction = -45\n",
+    )
+    .unwrap();
+    h.restart();
+    let value = |h: &mut H, id: &str| h.setting(id).kind.value();
+    assert_eq!(value(&mut h, EFFECT_ID), Some(s("blur")));
+    assert_eq!(value(&mut h, DENOISE_ID), Some(SettingValue::Bool(true)));
+    assert_eq!(value(&mut h, RELIGHT_ID), Some(SettingValue::Bool(true)));
+    assert_eq!(value(&mut h, LIGHT_ID), Some(s("warm")));
+    assert_eq!(value(&mut h, DIRECTION_ID), Some(SettingValue::Int(-45)));
+    assert_eq!(value(&mut h, BRIGHTNESS_ID), Some(SettingValue::Int(120)));
+    assert!(h.setting(DENOISE_ID).stored && !h.setting(RELIGHT_ID).stored);
+    assert!(h.snap().denoise);
+    h.activate(0);
+    let applied = h.world().effect.clone().unwrap();
+    assert!(applied.denoise() && applied.relight());
+    assert_eq!(
+        (
+            applied.relight_light(),
+            applied.relight_direction(),
+            applied.relight_brightness()
+        ),
+        (RelightLight::Warm, -45, 120)
     );
 }

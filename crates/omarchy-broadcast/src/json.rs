@@ -972,6 +972,8 @@ mod tests {
             camera_controls: None,
             settings_revision: None,
             settings_schema_serial: None,
+            modules_serial: None,
+            backend_profile: None,
             interface_revision: 4,
         }
     }

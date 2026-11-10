@@ -10,15 +10,18 @@
 //! when it cannot;
 //! [`MaxineBackend`] implements [`InferenceBackend`] for `none`, `blur`
 //! and `replace`, each with any of the stages of [`LoadRequest::stages`]
-//! (the denoise stage, [`Stage::Denoise`], and the relight stage,
-//! [`Stage::Relight`]); `none` needs at least one.
+//! (the `denoise` stage and the `relight` stage, [`stages`]); `none` needs
+//! at least one.
 //! [`feature_availability`] says which SDK features are installed, from the
-//! filesystem alone, and [`stage_availability`] whether a stage can be
-//! offered.
+//! filesystem alone, and [`stage_availability`] (or, from the features,
+//! [`stages_availability`]) whether a stage can be offered.
 //!
 //! Per frame, all on the GPU and on the caller's stream, with no host copy,
 //! in the stage order of the seam (`obc_backend`, "Effects, stages and
 //! their order"):
+//!
+//! A pre-mask stage runs before the mask and a post-mask one after it
+//! ([`needs_mask`]), whatever their order in the request.
 //!
 //! 1. NV12 to BGR (`NvCVImage_TransferFromYUV`, matrix and range from the
 //!    request's [`ColourSpec`]): into the frame image, or, with a pre-mask
@@ -93,7 +96,7 @@
 //! os-release override from the moment it starts (`docs/setup/maxine.md`,
 //! sections 3 and 4).
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::ffi::{CString, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU16, Ordering};
@@ -102,8 +105,8 @@ use std::time::Instant;
 
 use obc_backend::{
     Availability, BackendError, BackendFactory, ColourMatrix, ColourSpec, DeviceNv12, EffectKind,
-    FrameParams, GpuContext, HostBgr, InferenceBackend, LoadReport, LoadRequest, RelightLight,
-    Stage, StageList, StageTimings,
+    FrameParams, GpuContext, HostBgr, InferenceBackend, LoadReport, LoadRequest, Params, StageId,
+    StageList, StageTimings,
 };
 use obc_gpu::{CuStream, DeviceBuffer, Event, GpuError, LUT8_BLOCK, Lut8};
 
@@ -112,20 +115,27 @@ mod ffi;
 pub mod hdri;
 pub mod matte;
 mod preload;
+pub mod stages;
 pub mod vsr;
 
-pub use features::{feature_availability, feature_dir};
+pub use features::{Feature, feature_availability, feature_dir};
+pub use stages::{
+    RELIGHT_BRIGHTNESS, RELIGHT_DIRECTION, RELIGHT_LIGHT, RelightLight, RelightParams, STAGES,
+    check_stage_params, needs_mask, relight_frame, stage_availability_of, stage_features,
+    stages_availability,
+};
 
 /// Whether `stage` can be offered from the SDK tree at `root`: every
-/// feature it needs ([`Stage::features`]: for the relight stage, the
+/// feature it needs ([`stage_features`]: for the relight stage, the
 /// relighting and the green screen that makes its matte) is installed, as
-/// [`feature_availability`] reports it. Reads directories only.
+/// [`feature_availability`] reports it ([`stage_availability_of`]). Reads
+/// directories only.
 pub fn stage_availability(
     root: &Path,
     compute_capability: Option<(u32, u32)>,
-    stage: Stage,
+    stage: &str,
 ) -> Availability {
-    stage.availability(&feature_availability(root, compute_capability))
+    stage_availability_of(&feature_availability(root, compute_capability), stage)
 }
 
 use ffi::{NvCvImage, NvCvStatus, Sdk, StateHandle, VfxHandle};
@@ -566,7 +576,7 @@ impl MaxineFactory {
             relight_faults: self.relight_faults.clone(),
             denoise_strength: self.denoise_strength.clone(),
             loaded: None,
-            last_timings: Cell::new(None),
+            last_timings: RefCell::new(None),
             model_loads: ModelLoads::default(),
         })
     }
@@ -580,7 +590,7 @@ impl MaxineFactory {
 /// override is unusable.
 fn strength_err(message: String) -> BackendError {
     BackendError::Stage {
-        stage: Stage::Denoise,
+        stage: StageId::DENOISE,
         code: ffi::NVCV_ERR_PARAMETER,
         message,
     }
@@ -618,6 +628,12 @@ impl BackendFactory for MaxineFactory {
 
     fn create(&self) -> Result<Box<dyn InferenceBackend>, BackendError> {
         Ok(Box::new(self.create_maxine()?))
+    }
+
+    /// The relight stage's light, direction and brightness
+    /// ([`check_stage_params`]).
+    fn check_params(&self, stage: &StageId, params: &Params, live: &Params) -> Result<(), String> {
+        check_stage_params(stage.as_str(), params, live)
     }
 }
 
@@ -1130,7 +1146,7 @@ impl Relight {
     /// Gives the effect the direction and the gain of `params` (clamped),
     /// setting only what changed. The call that failed and its status.
     fn apply(&mut self, params: &FrameParams) -> Result<(), (&'static str, NvCvStatus)> {
-        let (pan_deg, gain) = params.relight();
+        let (pan_deg, gain) = relight_frame(params);
         if pan_deg != self.pan_deg {
             let rc = self.effect.set_f32(ffi::P_ANGLE_PAN, pan_deg.to_radians());
             if rc != ffi::NVCV_SUCCESS {
@@ -1162,7 +1178,8 @@ struct Stages {
 /// The stage boundaries of a frame, as indices into [`Loaded::events`]:
 /// before the conversion, after it, after the denoise run, after the mask,
 /// after the relight run, after the effect, after the conversion back. A
-/// stage that is not loaded records no event, and measures 0.
+/// stage that is not loaded records no event, and has no step in the
+/// timings.
 const EV_START: usize = 0;
 const EV_IN: usize = 1;
 const EV_DENOISE: usize = 2;
@@ -1177,34 +1194,25 @@ fn stage_timings(
     stages: Stages,
     span: impl Fn(usize, usize) -> Option<f32>,
 ) -> Option<StageTimings> {
-    let convert_in_ms = span(EV_START, EV_IN)?;
+    let mut t = StageTimings::new().with(StageTimings::CONVERT_IN, span(EV_START, EV_IN)?);
     let mut last = EV_IN;
-    let denoise_ms = if stages.denoise {
+    if stages.denoise {
+        t.push(StageId::DENOISE.as_str(), span(EV_IN, EV_DENOISE)?);
         last = EV_DENOISE;
-        span(EV_IN, EV_DENOISE)?
-    } else {
-        0.0
-    };
-    let (mask_ms, relight_ms, effect_ms) = if stages.mask {
-        let m = span(last, EV_MASK)?;
-        let (r, before_effect) = if stages.relight {
-            (span(EV_MASK, EV_RELIGHT)?, EV_RELIGHT)
+    }
+    if stages.mask {
+        t.push(StageTimings::MASK, span(last, EV_MASK)?);
+        let before_effect = if stages.relight {
+            t.push(StageId::RELIGHT.as_str(), span(EV_MASK, EV_RELIGHT)?);
+            EV_RELIGHT
         } else {
-            (0.0, EV_MASK)
+            EV_MASK
         };
+        t.push(StageTimings::COMPOSITE, span(before_effect, EV_EFFECT)?);
         last = EV_EFFECT;
-        (m, r, span(before_effect, EV_EFFECT)?)
-    } else {
-        (0.0, 0.0, 0.0)
-    };
-    Some(StageTimings {
-        convert_in_ms,
-        denoise_ms,
-        mask_ms,
-        relight_ms,
-        effect_ms,
-        convert_out_ms: span(last, EV_OUT)?,
-    })
+    }
+    t.push(StageTimings::CONVERT_OUT, span(last, EV_OUT)?);
+    Some(t)
 }
 
 /// Everything loaded for one request. Field order is drop order: the blur
@@ -1325,7 +1333,7 @@ pub struct MaxineBackend {
     relight_faults: RelightFaultSwitch,
     denoise_strength: Result<f32, String>,
     loaded: Option<Loaded>,
-    last_timings: Cell<Option<StageTimings>>,
+    last_timings: RefCell<Option<StageTimings>>,
     model_loads: ModelLoads,
 }
 
@@ -1379,17 +1387,18 @@ const WARMUP_SYNC_FAILED: &str =
     "the warm-up run (the green screen, then the mask-hardening kernel) failed on the GPU";
 
 /// What messages call `stage`.
-fn stage_name(stage: Stage) -> &'static str {
-    match stage {
-        Stage::Denoise => "the video noise removal",
-        Stage::Relight => "the relighting",
+fn stage_name(stage: &StageId) -> String {
+    match stage.as_str() {
+        "denoise" => "the video noise removal".into(),
+        "relight" => "the relighting".into(),
+        other => format!("the {other} stage"),
     }
 }
 
 /// Turns any failure while loading `stage` into [`BackendError::Stage`], so
 /// the caller can tell that the rest of its request would load. The driver
 /// missing (or parked) stays `Unavailable`: nothing else would load either.
-fn stage_load_err(stage: Stage, e: BackendError) -> BackendError {
+fn stage_load_err(stage: StageId, e: BackendError) -> BackendError {
     let (code, message) = match e {
         BackendError::Load { code, message }
         | BackendError::Run { code, message }
@@ -1398,16 +1407,10 @@ fn stage_load_err(stage: Stage, e: BackendError) -> BackendError {
         other @ BackendError::Unavailable(_) => return other,
     };
     BackendError::Stage {
+        message: format!("{} could not be loaded: {message}", stage_name(&stage)),
         stage,
         code,
-        message: format!("{} could not be loaded: {message}", stage_name(stage)),
     }
-}
-
-/// Whether `req` makes the chain compute the mask: its effect composites
-/// through it, or one of its stages consumes it.
-fn needs_mask(req: &LoadRequest) -> bool {
-    req.effect != EffectKind::None || req.stages.needs_mask()
 }
 
 impl MaxineBackend {
@@ -1527,7 +1530,7 @@ impl MaxineBackend {
                 req.width, req.height
             )));
         }
-        if needs_mask(req) && (req.width < MIN_WIDTH || req.height < MIN_HEIGHT) {
+        if stages::request_needs_mask(req) && (req.width < MIN_WIDTH || req.height < MIN_HEIGHT) {
             return Err(BackendError::InvalidInput(format!(
                 "frame size {}x{} is not supported: the green screen needs at least \
                  {MIN_WIDTH}x{MIN_HEIGHT}, even dimensions",
@@ -1546,14 +1549,14 @@ impl MaxineBackend {
                 )));
             }
         }
-        for &stage in req.stages.as_slice() {
-            match stage {
-                Stage::Denoise => {
+        for stage in req.stages.as_slice() {
+            match stage.as_str() {
+                "denoise" => {
                     if !((DENOISE_MIN_WIDTH..=DENOISE_MAX_WIDTH).contains(&req.width)
                         && (DENOISE_MIN_HEIGHT..=DENOISE_MAX_HEIGHT).contains(&req.height))
                     {
                         return Err(BackendError::Stage {
-                            stage,
+                            stage: stage.clone(),
                             code: ffi::NVCV_ERR_RESOLUTION,
                             message: format!(
                                 "the video noise removal does not support {}x{} frames: it \
@@ -1566,7 +1569,18 @@ impl MaxineBackend {
                 }
                 // The green screen's limits, checked above, are the
                 // stage's.
-                Stage::Relight => {}
+                "relight" => {}
+                // Not a stage of this backend: it fails open, like a stage
+                // that cannot load.
+                _ => {
+                    return Err(BackendError::Stage {
+                        stage: stage.clone(),
+                        code: ffi::NVCV_ERR_UNIMPLEMENTED,
+                        message: format!(
+                            "the Maxine backend has no stage {stage} (it has denoise and relight)"
+                        ),
+                    });
+                }
             }
         }
         Ok(())
@@ -1584,7 +1598,7 @@ impl MaxineBackend {
         strength: f32,
     ) -> Result<(Denoise, f64), BackendError> {
         self.build_denoise(frames, (w, h), stream, strength)
-            .map_err(|e| stage_load_err(Stage::Denoise, e))
+            .map_err(|e| stage_load_err(StageId::DENOISE, e))
     }
 
     fn build_denoise(
@@ -1781,7 +1795,7 @@ impl MaxineBackend {
         light: RelightLight,
     ) -> Result<(Relight, f64), BackendError> {
         self.build_relight(frames, mask, (w, h), stream, light)
-            .map_err(|e| stage_load_err(Stage::Relight, e))
+            .map_err(|e| stage_load_err(StageId::RELIGHT, e))
     }
 
     fn build_relight(
@@ -1835,7 +1849,7 @@ impl MaxineBackend {
             .synchronize()
             .map_err(|e| cuda_load_err(e, "its load failed on the GPU"))?;
         effect.set_stream(stream, dir)?;
-        let (pan_deg, gain) = FrameParams::default().relight();
+        let (pan_deg, gain) = relight_frame(&FrameParams::default());
         let rc = effect.set_f32(ffi::P_FG_GAIN, gain);
         effect.check("NvVFX_SetF32 FgGain", rc, dir)?;
         let rc = effect.set_f32(ffi::P_ANGLE_PAN, pan_deg.to_radians());
@@ -1876,7 +1890,7 @@ impl MaxineBackend {
         let dir = self.model_dir.as_path();
         if self.relight_faults.get() == Some(RelightFault::Rebind) {
             return Err(BackendError::Stage {
-                stage: Stage::Relight,
+                stage: StageId::RELIGHT,
                 code: ffi::NVCV_ERR_GENERAL,
                 message: "the relighting could not take its new light: a forced fault failed \
                           the rebind"
@@ -1902,7 +1916,7 @@ impl MaxineBackend {
             }
             bound.and(synced).and(restored)
         };
-        rebind(r).map_err(|e| stage_load_err(Stage::Relight, e))
+        rebind(r).map_err(|e| stage_load_err(StageId::RELIGHT, e))
     }
 
     /// Creates and loads the blur effect on the frame images and the
@@ -1981,6 +1995,7 @@ impl MaxineBackend {
         l: &mut Loaded,
         req: &LoadRequest,
         strength: Option<f32>,
+        light: RelightLight,
     ) -> Result<Configured, BackendError> {
         let (size, stream) = ((l.width, l.height), l.stream);
         let mut warmup_ms: Option<f64> = None;
@@ -1992,14 +2007,14 @@ impl MaxineBackend {
             }
             _ => None,
         };
-        let needs_mask = needs_mask(req);
-        let relight = req.stages.contains(Stage::Relight);
+        let needs_mask = stages::request_needs_mask(req);
+        let relight = req.stages.contains(StageId::RELIGHT.as_str());
         let mut new_mask = if needs_mask && l.mask.is_none() {
             let (m, ms) =
                 self.load_mask(&mut l.frames, size, stream)
                     .map_err(|e| match req.effect {
                         // Only the relight stage needs the mask: it fails open.
-                        EffectKind::None => stage_load_err(Stage::Relight, e),
+                        EffectKind::None => stage_load_err(StageId::RELIGHT, e),
                         _ => e,
                     })?;
             *warmup_ms.get_or_insert(0.0) += ms;
@@ -2013,8 +2028,7 @@ impl MaxineBackend {
                 .as_mut()
                 .or(l.mask.as_mut())
                 .expect("relight has a mask: loaded above or kept");
-            let (r, ms) =
-                self.load_relight(&mut l.frames, mask, size, stream, req.relight_light)?;
+            let (r, ms) = self.load_relight(&mut l.frames, mask, size, stream, light)?;
             *warmup_ms.get_or_insert(0.0) += ms;
             Some(r)
         } else {
@@ -2049,9 +2063,9 @@ impl MaxineBackend {
         let mut rebound = false;
         if relight
             && let Some(r) = l.relight.as_mut()
-            && r.light != req.relight_light
+            && r.light != light
         {
-            if let Err(e) = self.rebind_relight(r, stream, req.relight_light) {
+            if let Err(e) = self.rebind_relight(r, stream, light) {
                 drop(new_blur);
                 drop(new_relight);
                 drop(new_mask);
@@ -2225,7 +2239,7 @@ impl MaxineBackend {
                     ));
                 }
                 return Err(BackendError::Stage {
-                    stage: Stage::Denoise,
+                    stage: StageId::DENOISE,
                     code: rc,
                     message,
                 });
@@ -2406,7 +2420,7 @@ impl MaxineBackend {
                     ));
                 }
                 return Err(BackendError::Stage {
-                    stage: Stage::Relight,
+                    stage: StageId::RELIGHT,
                     code,
                     message,
                 });
@@ -2482,10 +2496,15 @@ impl InferenceBackend for MaxineBackend {
     fn load(&mut self, gpu: &GpuContext, req: &LoadRequest) -> Result<LoadReport, BackendError> {
         Self::check_context(gpu)?;
         Self::validate(req)?;
-        let strength = if req.stages.contains(Stage::Denoise) {
+        let strength = if req.stages.contains(StageId::DENOISE.as_str()) {
             Some(self.denoise_strength.clone().map_err(strength_err)?)
         } else {
             None
+        };
+        let light = if req.stages.contains(StageId::RELIGHT.as_str()) {
+            stages::relight_light(req)?
+        } else {
+            RelightLight::default()
         };
         let t0 = Instant::now();
         let reuse = self.loaded.as_ref().is_some_and(|l| {
@@ -2505,7 +2524,7 @@ impl InferenceBackend for MaxineBackend {
             self.unload();
             Loaded::new(self.sdk, req, gpu.stream)?
         };
-        match self.configure(&mut loaded, req, strength) {
+        match self.configure(&mut loaded, req, strength, light) {
             Ok(c) => {
                 self.loaded = Some(loaded);
                 self.model_loads.add(c.counted);
@@ -2523,7 +2542,7 @@ impl InferenceBackend for MaxineBackend {
                     self.loaded = Some(loaded);
                 } else {
                     drop(loaded);
-                    self.last_timings.set(None);
+                    *self.last_timings.borrow_mut() = None;
                 }
                 Err(e)
             }
@@ -2548,7 +2567,7 @@ impl InferenceBackend for MaxineBackend {
             let _ = sync(l.stream);
             drop(l);
         }
-        self.last_timings.set(None);
+        *self.last_timings.borrow_mut() = None;
     }
 
     fn timings(&self) -> Option<StageTimings> {
@@ -2558,10 +2577,10 @@ impl InferenceBackend for MaxineBackend {
             let e = &l.events;
             let span = |a: usize, b: usize| Event::elapsed_ms(&e[a], &e[b]).ok();
             if let Some(t) = stage_timings(stages, span) {
-                self.last_timings.set(Some(t));
+                *self.last_timings.borrow_mut() = Some(t);
             }
         }
-        self.last_timings.get()
+        self.last_timings.borrow().clone()
     }
 
     /// Zeroes the denoise state (on the stream) and resets the green
@@ -2615,7 +2634,7 @@ impl InferenceBackend for MaxineBackend {
             // Queued frames may still run it.
             sync(l.stream)?;
             l.relight = None;
-            return Ok(Stage::Relight.into());
+            return Ok(StageId::RELIGHT.into());
         }
         Ok(StageList::default())
     }
@@ -2811,7 +2830,7 @@ mod tests {
             height,
             colour: ColourSpec::LIMITED_BT601,
             background,
-            relight_light: RelightLight::default(),
+            params: Default::default(),
         };
         assert!(MaxineBackend::validate(&req(EffectKind::Blur, 1920, 1080, None)).is_ok());
         assert!(MaxineBackend::validate(&req(EffectKind::None, 1920, 1080, None)).is_err());
@@ -2827,12 +2846,12 @@ mod tests {
     fn denoise_req(effect: EffectKind, width: u32, height: u32) -> LoadRequest {
         LoadRequest {
             effect,
-            stages: Stage::Denoise.into(),
+            stages: StageId::DENOISE.into(),
             width,
             height,
             colour: ColourSpec::LIMITED_BT601,
             background: None,
-            relight_light: RelightLight::default(),
+            params: Default::default(),
         }
     }
 
@@ -2870,13 +2889,14 @@ mod tests {
         ] {
             let e = MaxineBackend::validate(&denoise_req(EffectKind::None, w, h)).unwrap_err();
             let BackendError::Stage {
-                stage: Stage::Denoise,
+                stage,
                 code,
                 message,
             } = &e
             else {
                 panic!("{w}x{h}: expected a denoise stage error, got {e:?}");
             };
+            assert_eq!(*stage, StageId::DENOISE);
             assert_eq!(*code, ffi::NVCV_ERR_RESOLUTION);
             assert!(message.contains(&format!("{w}x{h}")), "{message}");
             assert!(message.contains("80x80 up to 1920x1080"), "{message}");
@@ -2887,10 +2907,7 @@ mod tests {
         assert!(
             matches!(
                 e,
-                BackendError::Stage {
-                    stage: Stage::Denoise,
-                    ..
-                }
+                BackendError::Stage { ref stage, .. } if *stage == StageId::DENOISE
             ),
             "{e:?}"
         );
@@ -3033,10 +3050,7 @@ mod tests {
         assert!(
             matches!(
                 e,
-                BackendError::Stage {
-                    stage: Stage::Denoise,
-                    ..
-                }
+                BackendError::Stage { ref stage, .. } if *stage == StageId::DENOISE
             ),
             "{e:?}"
         );
@@ -3061,7 +3075,7 @@ mod tests {
     #[test]
     fn stage_load_failures_become_stage_errors_except_a_missing_driver() {
         let e = stage_load_err(
-            Stage::Denoise,
+            StageId::DENOISE,
             BackendError::Load {
                 code: -10,
                 message: "NvVFX_Load(Denoising) returned -10".into(),
@@ -3069,10 +3083,11 @@ mod tests {
         );
         match e {
             BackendError::Stage {
-                stage: Stage::Denoise,
+                stage,
                 code,
                 message,
             } => {
+                assert_eq!(stage, StageId::DENOISE);
                 assert_eq!(code, -10);
                 assert!(message.contains("video noise removal"), "{message}");
                 assert!(message.contains("NvVFX_Load(Denoising)"), "{message}");
@@ -3080,28 +3095,21 @@ mod tests {
             other => panic!("expected Denoise, got {other:?}"),
         }
         assert!(matches!(
-            stage_load_err(Stage::Denoise, BackendError::InvalidInput("x".into())),
-            BackendError::Stage {
-                stage: Stage::Denoise,
-                ..
-            }
+            stage_load_err(StageId::DENOISE, BackendError::InvalidInput("x".into())),
+            BackendError::Stage { stage, .. } if stage == StageId::DENOISE
         ));
         assert!(matches!(
             stage_load_err(
-                Stage::Denoise,
+                StageId::DENOISE,
                 BackendError::Run {
                     code: 2,
                     message: "oom".into()
                 }
             ),
-            BackendError::Stage {
-                stage: Stage::Denoise,
-                code: 2,
-                ..
-            }
+            BackendError::Stage { stage, code: 2, .. } if stage == StageId::DENOISE
         ));
         assert!(matches!(
-            stage_load_err(Stage::Denoise, BackendError::Unavailable("parked".into())),
+            stage_load_err(StageId::DENOISE, BackendError::Unavailable("parked".into())),
             BackendError::Unavailable(_)
         ));
     }
@@ -3124,7 +3132,7 @@ mod tests {
     }
 
     #[test]
-    fn stages_that_did_not_run_measure_zero() {
+    fn stages_that_did_not_run_have_no_step() {
         // A fake span: one unit per event index it covers, so each figure shows
         // which events it was measured between.
         let span = |a: usize, b: usize| Some((b - a) as f32);
@@ -3136,39 +3144,56 @@ mod tests {
         let all = stage_timings(st(true, true, true), span).unwrap();
         assert_eq!(
             all,
-            StageTimings {
-                convert_in_ms: 1.0,
-                denoise_ms: 1.0,
-                mask_ms: 1.0,
-                relight_ms: 1.0,
-                effect_ms: 1.0,
-                convert_out_ms: 1.0,
-            }
+            StageTimings::new()
+                .with(StageTimings::CONVERT_IN, 1.0)
+                .with("denoise", 1.0)
+                .with(StageTimings::MASK, 1.0)
+                .with("relight", 1.0)
+                .with(StageTimings::COMPOSITE, 1.0)
+                .with(StageTimings::CONVERT_OUT, 1.0)
         );
         let no_relight = stage_timings(st(true, true, false), span).unwrap();
-        assert_eq!(no_relight.relight_ms, 0.0);
-        assert_eq!(no_relight.effect_ms, 2.0, "the effect follows the mask");
+        assert_eq!(no_relight.step_ms("relight"), None);
+        assert_eq!(
+            no_relight.step_ms(StageTimings::COMPOSITE),
+            Some(2.0),
+            "the effect follows the mask"
+        );
         assert_eq!(no_relight.total_ms(), 6.0);
         let effect_only = stage_timings(st(false, true, false), span).unwrap();
-        assert_eq!(effect_only.denoise_ms, 0.0);
-        assert_eq!(effect_only.mask_ms, 2.0, "the mask follows the conversion");
+        assert_eq!(effect_only.step_ms("denoise"), None);
+        assert_eq!(
+            effect_only.step_ms(StageTimings::MASK),
+            Some(2.0),
+            "the mask follows the conversion"
+        );
         assert_eq!(effect_only.total_ms(), 6.0);
         let relight_only = stage_timings(st(false, true, true), span).unwrap();
-        assert_eq!((relight_only.mask_ms, relight_only.relight_ms), (2.0, 1.0));
+        assert_eq!(
+            (
+                relight_only.step_ms(StageTimings::MASK),
+                relight_only.step_ms("relight")
+            ),
+            (Some(2.0), Some(1.0))
+        );
         assert_eq!(relight_only.total_ms(), 6.0);
         let denoise_only = stage_timings(st(true, false, false), span).unwrap();
         assert_eq!(
             (
-                denoise_only.mask_ms,
-                denoise_only.relight_ms,
-                denoise_only.effect_ms
+                denoise_only.step_ms(StageTimings::MASK),
+                denoise_only.step_ms("relight"),
+                denoise_only.step_ms(StageTimings::COMPOSITE)
             ),
-            (0.0, 0.0, 0.0)
+            (None, None, None)
         );
-        assert_eq!(denoise_only.convert_out_ms, 4.0, "out follows the denoise");
+        assert_eq!(
+            denoise_only.step_ms(StageTimings::CONVERT_OUT),
+            Some(4.0),
+            "out follows the denoise"
+        );
         assert_eq!(denoise_only.total_ms(), 6.0);
         let none = stage_timings(st(false, false, false), span).unwrap();
-        assert_eq!(none.convert_out_ms, 5.0);
+        assert_eq!(none.step_ms(StageTimings::CONVERT_OUT), Some(5.0));
         // A span that cannot be read gives no timings at all.
         assert_eq!(
             stage_timings(st(true, true, true), |a, b| (a != EV_IN)
@@ -3183,8 +3208,31 @@ mod tests {
     }
 
     #[test]
+    fn a_stage_of_another_backend_fails_alone_and_any_order_is_accepted() {
+        let req = |stages: &[&str]| LoadRequest {
+            stages: StageList::new(stages.iter().map(|s| StageId::new(*s).unwrap())).unwrap(),
+            ..denoise_req(EffectKind::Blur, 1280, 720)
+        };
+        let e = MaxineBackend::validate(&req(&["denoise", "hello"])).unwrap_err();
+        match &e {
+            BackendError::Stage { stage, message, .. } => {
+                assert_eq!(stage, "hello");
+                assert!(message.contains("no stage hello"), "{message}");
+            }
+            other => panic!("expected a stage error, got {other:?}"),
+        }
+        // The pre-mask stage runs before the mask whatever the order.
+        assert!(MaxineBackend::validate(&req(&["relight", "denoise"])).is_ok());
+        assert!(MaxineBackend::validate(&req(&["denoise", "relight"])).is_ok());
+        assert_eq!(
+            stage_name(&StageId::new("hello").unwrap()),
+            "the hello stage"
+        );
+    }
+
+    #[test]
     fn relight_is_named_in_messages() {
-        assert_eq!(stage_name(Stage::Relight), "the relighting");
+        assert_eq!(stage_name(&StageId::RELIGHT), "the relighting");
         assert_eq!(
             feature_library("NvVFX_CreateEffect(Relighting)"),
             "libnvVFXRelighting.so"
@@ -3244,17 +3292,17 @@ mod tests {
         for m in ["relight_0thframe_perf_120", "relight_nthframe_perf_120"] {
             std::fs::write(models.join(format!("{m}.engine.trtpkg")), b"").unwrap();
         }
-        let a = stage_availability(root, Some((12, 0)), Stage::Relight);
+        let a = stage_availability(root, Some((12, 0)), "relight");
         let why = a.reason().expect("no green screen").to_owned();
         assert!(why.starts_with("green-screen: "), "{why}");
         lib("nvvfxgreenscreen", "libnvVFXGreenScreen.so");
         std::fs::write(models.join("AIGS_1080_120_m0.engine.trtpkg"), b"").unwrap();
         assert_eq!(
-            stage_availability(root, Some((12, 0)), Stage::Relight),
+            stage_availability(root, Some((12, 0)), "relight"),
             Availability::Installed
         );
         assert!(
-            !stage_availability(root, Some((12, 0)), Stage::Denoise).is_installed(),
+            !stage_availability(root, Some((12, 0)), "denoise").is_installed(),
             "the denoising feature is not installed"
         );
     }

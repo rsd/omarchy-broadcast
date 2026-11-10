@@ -12,27 +12,45 @@
 //!   its stages ([`InferenceBackend::load`]), processes one canonical frame
 //!   at a time ([`InferenceBackend::process`]) and releases everything again
 //!   ([`InferenceBackend::unload`]);
-//! * [`Feature`] and [`Availability`] say which of a backend's features are
-//!   installed, from the filesystem alone, so that a client can grey out
-//!   what it cannot offer without waking the GPU.
+//! * [`Availability`] says whether something a backend offers (a stage, a
+//!   feature) is installed, from the filesystem alone, so that a client can
+//!   grey out what it cannot offer without waking the GPU;
+//! * a [`StageChainFactory`] and its [`StageChain`]s are the generic seam of
+//!   a chain of stages that is not the effect itself (see [`chain`]).
+//!
+//! # Stages and their parameters
+//!
+//! A stage is named by a [`StageId`], a short vendor-neutral string
+//! (`denoise`, `relight`, ...). This crate gives a meaning to none of them:
+//! which stages exist, what they need and where in a frame they run is the
+//! backend's business. The well-known ids ([`StageId::BACKGROUND`],
+//! [`StageId::ENHANCE`], [`StageId::DENOISE`], [`StageId::RELIGHT`]) are
+//! names only.
+//!
+//! A stage's settings are generic [`Params`]: string keys with typed
+//! [`Value`]s. Those that need a reload (for example the light of a
+//! relighting stage) travel in the [`LoadRequest`] ([`LoadRequest::params`]);
+//! those that may change on every frame (its direction and brightness)
+//! travel in each frame's [`FrameParams`] ([`FrameParams::live`]), so
+//! changing them never reloads anything. A backend documents the keys of
+//! each of its stages, and ignores keys it does not know.
 //!
 //! # Effects, stages and their order
 //!
 //! A request has one [`EffectKind`] (mutually exclusive: `none`, `blur`,
-//! `replace`) and an ordered list of stackable [`Stage`]s
-//! ([`StageList`], [`LoadRequest::stages`]). A backend runs one frame in
-//! this order:
+//! `replace`) and an ordered list of stackable stages ([`StageList`],
+//! [`LoadRequest::stages`]), in the order the caller gives. A backend that
+//! composites through a matte typically runs one frame in this order:
 //!
 //! 1. the conversion of the NV12 frame to the backend's working format;
-//! 2. the **pre-mask stages**, those whose [`Stage::needs_mask`] is false
-//!    ([`Stage::Denoise`]), in list order: each reads the previous one's
-//!    output, so every later step sees the processed camera frame;
-//! 3. the **mask** (the green-screen matte), computed only when the effect
-//!    needs it (`blur`, `replace`) or a stage does;
-//! 4. the **post-mask stages**, those whose [`Stage::needs_mask`] is true
-//!    ([`Stage::Relight`]), in list order. Such a stage consumes the matte,
-//!    and its output is only valid where the matte says foreground (a relit
-//!    foreground, for example), so it must be composited;
+//! 2. the **pre-mask stages**, those that do not consume the matte, in list
+//!    order: each reads the previous one's output, so every later step sees
+//!    the processed camera frame;
+//! 3. the **mask** (the matte), computed only when the effect needs it
+//!    (`blur`, `replace`) or a stage does;
+//! 4. the **post-mask stages**, those that consume the matte, in list order.
+//!    Such a stage's output is only valid where the matte says foreground (a
+//!    relit foreground, for example), so it must be composited;
 //! 5. the effect's **composite** through the mask: `none` over the original
 //!    frame, `blur` over the blurred frame, `replace` over the background
 //!    image. The foreground composited is the last post-mask stage's output,
@@ -40,13 +58,10 @@
 //!    there is no mask and nothing to composite;
 //! 6. the conversion back to NV12 into the destination.
 //!
-//! An empty list adds nothing: no pass, copy or allocation
+//! Which stages are pre-mask and which post-mask is the backend's to know;
+//! a pre-mask stage always runs before the mask, whatever its place in the
+//! list. An empty list adds nothing: no pass, copy or allocation
 //! (`docs/adr/0018-video-noise-removal.md`, "off costs nothing").
-//!
-//! The values of a stage that can change on every frame (the direction and
-//! the gain of [`Stage::Relight`]) travel in [`FrameParams`], so changing
-//! them never reloads anything; those that need a switch (its light) are
-//! in the [`LoadRequest`].
 //!
 //! # Frames and the CUDA context
 //!
@@ -63,18 +78,22 @@
 //!
 //! # A backend that does not run on CUDA
 //!
-//! A backend on another device (for example an OpenVINO backend on an NPU)
-//! would add a host-memory variant of the frame description next to
-//! [`DeviceNv12`]; the element would then download each frame, call the
-//! backend and upload the result. That variant is deliberately not defined
-//! until such a backend exists.
+//! A chain of stages on another device (for example on an NPU, or the CPU)
+//! takes host frames ([`HostNv12`]) through the generic chain seam
+//! ([`StageChain`], [`FrameKind::Host`]); the element then downloads each
+//! frame, calls the chain and uploads the result.
 
+use std::borrow::{Borrow, Cow};
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
+pub mod chain;
 pub mod enhance;
+
+pub use chain::{ChainFrame, ChainRequest, FrameKind, HostNv12, StageChain, StageChainFactory};
 
 /// The effect the Process stage applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -122,106 +141,160 @@ impl FromStr for EffectKind {
     }
 }
 
-/// A stackable stage of the chain, which runs together with any
-/// [`EffectKind`] (`docs/adr/0018-video-noise-removal.md`). The declaration
-/// order is the canonical order a [`StageList`] keeps: the pre-mask stages
-/// first, then the post-mask ones (see the crate documentation).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Stage {
-    /// Video noise removal, on the camera frame before the mask and the
-    /// effect. A pre-mask stage.
-    Denoise,
-    /// Relighting of the foreground (the person) through the green-screen
-    /// matte, with the light of [`LoadRequest::relight_light`] from the
-    /// direction and at the gain of [`FrameParams`]. A post-mask stage: its
-    /// output is composited over the effect's background, so the background
-    /// itself is never relit.
-    Relight,
+/// The name of a stage: a vendor-neutral string of 1 to 32 characters, a
+/// lower-case ASCII letter followed by lower-case letters, digits and `-`
+/// (`^[a-z][a-z0-9-]{0,31}$`), other than the names the elements' status
+/// messages use for their own fields ([`StageId::RESERVED`], and any name
+/// ending in `-reason`). Only [`StageId::new`] (and the constants) make
+/// one, so every id is valid.
+///
+/// The constants are the well-known ids. [`StageId::BACKGROUND`] (the matte
+/// and the core compositor modes of [`EffectKind`]) and
+/// [`StageId::ENHANCE`] (the ingest upscaler) have a meaning to the core;
+/// every other id is opaque to it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StageId(Cow<'static, str>);
+
+impl StageId {
+    /// The matte and the compositor of [`EffectKind`] (`blur`, `replace`).
+    pub const BACKGROUND: StageId = StageId(Cow::Borrowed("background"));
+    /// The upscaler of low-resolution camera modes, in the ingest.
+    pub const ENHANCE: StageId = StageId(Cow::Borrowed("enhance"));
+    /// Video noise removal.
+    pub const DENOISE: StageId = StageId(Cow::Borrowed("denoise"));
+    /// Relighting of the person.
+    pub const RELIGHT: StageId = StageId(Cow::Borrowed("relight"));
+
+    /// The longest id, in bytes.
+    pub const MAX_LEN: usize = 32;
+
+    /// The names a stage id cannot take: the fixed fields of the elements'
+    /// status messages, which carry one field per stage (`<stage>` and
+    /// `<stage>-reason`). A name ending in [`StageId::RESERVED_SUFFIX`] is
+    /// reserved too.
+    pub const RESERVED: [&'static str; 4] = ["status", "effect", "reason", "module"];
+
+    /// The suffix of the status messages' per-stage reason fields; no stage
+    /// id ends with it.
+    pub const RESERVED_SUFFIX: &'static str = "-reason";
+
+    /// The id `id`, or [`BackendError::InvalidInput`] with the rule it
+    /// breaks.
+    pub fn new(id: impl Into<String>) -> Result<StageId, BackendError> {
+        let id = id.into();
+        if !Self::is_well_formed(&id) {
+            return Err(BackendError::InvalidInput(format!(
+                "invalid stage id {id:?}: a stage id is a lower-case letter followed by up to \
+                 {} lower-case letters, digits or '-'",
+                Self::MAX_LEN - 1
+            )));
+        }
+        if Self::is_reserved(&id) {
+            return Err(BackendError::InvalidInput(format!(
+                "invalid stage id {id:?}: {} and names ending in {:?} are reserved for the \
+                 status messages",
+                Self::RESERVED.join(", "),
+                Self::RESERVED_SUFFIX
+            )));
+        }
+        Ok(StageId(Cow::Owned(id)))
+    }
+
+    /// Whether `id` is a valid stage id: well formed and not reserved.
+    pub fn is_valid(id: &str) -> bool {
+        Self::is_well_formed(id) && !Self::is_reserved(id)
+    }
+
+    fn is_well_formed(id: &str) -> bool {
+        let b = id.as_bytes();
+        !b.is_empty()
+            && b.len() <= Self::MAX_LEN
+            && b[0].is_ascii_lowercase()
+            && b[1..]
+                .iter()
+                .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+    }
+
+    fn is_reserved(id: &str) -> bool {
+        Self::RESERVED.contains(&id) || id.ends_with(Self::RESERVED_SUFFIX)
+    }
+
+    /// The id as a string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
-impl Stage {
-    /// Every stage, in canonical order.
-    pub const ALL: [Stage; 2] = [Stage::Denoise, Stage::Relight];
-
-    /// The lower-case name used in logs.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Stage::Denoise => "denoise",
-            Stage::Relight => "relight",
-        }
-    }
-
-    /// Whether the stage consumes the green-screen matte. Such a stage runs
-    /// after the mask (a post-mask stage), and its request makes the
-    /// backend compute the mask even under [`EffectKind::None`]; a stage
-    /// that does not runs before the mask (a pre-mask stage).
-    pub fn needs_mask(self) -> bool {
-        match self {
-            Stage::Denoise => false,
-            Stage::Relight => true,
-        }
-    }
-
-    /// The backend features the stage needs installed: its own, and for a
-    /// post-mask stage the green screen that makes its matte.
-    pub fn features(self) -> &'static [Feature] {
-        match self {
-            Stage::Denoise => &[Feature::Denoise],
-            Stage::Relight => &[Feature::GreenScreen, Feature::Relighting],
-        }
-    }
-
-    /// Whether the stage can be offered, from the availability of each
-    /// feature (as a backend reports it, for example
-    /// `obc_backend_maxine::feature_availability`): installed when every
-    /// feature of [`Stage::features`] is, else not installed with the
-    /// reasons of those that are not (a feature missing from `features`
-    /// counts as not installed).
-    pub fn availability(self, features: &[(Feature, Availability)]) -> Availability {
-        let missing: Vec<String> = self
-            .features()
-            .iter()
-            .filter_map(|f| match features.iter().find(|(g, _)| g == f) {
-                Some((_, Availability::Installed)) => None,
-                Some((_, Availability::NotInstalled(r))) => Some(format!("{f}: {r}")),
-                None => Some(format!("{f}: not reported")),
-            })
-            .collect();
-        if missing.is_empty() {
-            Availability::Installed
-        } else {
-            Availability::NotInstalled(missing.join("; "))
-        }
-    }
-}
-
-impl fmt::Display for Stage {
+impl fmt::Display for StageId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-/// The stages of a request, in canonical order ([`Stage`]'s declaration
-/// order: pre-mask stages first) and each at most once. Only
-/// [`StageList::new`] builds a list from several stages, and it refuses
-/// any other order, so a list a backend receives is always valid. The empty
-/// list ([`StageList::default`]) allocates nothing.
+impl FromStr for StageId {
+    type Err = BackendError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        StageId::new(s)
+    }
+}
+
+impl AsRef<str> for StageId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// Maps keyed by [`StageId`] can be looked up with a `&str`: an id orders,
+/// hashes and compares as its string.
+impl Borrow<str> for StageId {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<str> for StageId {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for StageId {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<StageId> for str {
+    fn eq(&self, other: &StageId) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl PartialEq<StageId> for &str {
+    fn eq(&self, other: &StageId) -> bool {
+        *self == other.as_str()
+    }
+}
+
+/// The stages of a request, in the order the caller gives and each at most
+/// once. Only [`StageList::new`] builds a list from several stages, and it
+/// refuses a stage listed twice, so a list a backend receives never repeats
+/// one. The empty list ([`StageList::default`]) allocates nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-pub struct StageList(Vec<Stage>);
+pub struct StageList(Vec<StageId>);
 
 impl StageList {
-    /// The list of `stages`, which must be in canonical order with no
-    /// stage twice; [`BackendError::InvalidInput`] otherwise.
-    pub fn new(stages: impl IntoIterator<Item = Stage>) -> Result<StageList, BackendError> {
-        let stages: Vec<Stage> = stages.into_iter().collect();
-        if let Some(w) = stages.windows(2).find(|w| w[0] >= w[1]) {
-            let what = if w[0] == w[1] {
-                format!("the stage {} is listed twice", w[0])
-            } else {
-                format!("the stage {} must come before {}", w[1], w[0])
-            };
+    /// The list of `stages`, in the order given, with no stage twice;
+    /// [`BackendError::InvalidInput`] otherwise.
+    pub fn new(stages: impl IntoIterator<Item = StageId>) -> Result<StageList, BackendError> {
+        let stages: Vec<StageId> = stages.into_iter().collect();
+        if let Some(s) = stages
+            .iter()
+            .enumerate()
+            .find_map(|(i, s)| stages[..i].contains(s).then_some(s))
+        {
             return Err(BackendError::InvalidInput(format!(
-                "invalid stage list {}: {what}",
+                "invalid stage list {}: the stage {s} is listed twice",
                 StageList(stages.clone())
             )));
         }
@@ -229,8 +302,8 @@ impl StageList {
     }
 
     /// Whether `stage` is in the list.
-    pub fn contains(&self, stage: Stage) -> bool {
-        self.0.contains(&stage)
+    pub fn contains(&self, stage: &str) -> bool {
+        self.0.iter().any(|s| s == stage)
     }
 
     /// Whether the list is empty.
@@ -238,21 +311,39 @@ impl StageList {
         self.0.is_empty()
     }
 
+    /// The number of stages.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
     /// The stages, in order.
-    pub fn as_slice(&self) -> &[Stage] {
+    pub fn as_slice(&self) -> &[StageId] {
         &self.0
     }
 
-    /// Whether any stage consumes the mask ([`Stage::needs_mask`]).
-    pub fn needs_mask(&self) -> bool {
-        self.0.iter().any(|s| s.needs_mask())
+    /// The stages, in order.
+    pub fn iter(&self) -> std::slice::Iter<'_, StageId> {
+        self.0.iter()
+    }
+
+    /// The same list without `stage` (the same list if it is not in it).
+    pub fn without(&self, stage: &str) -> StageList {
+        StageList(self.0.iter().filter(|s| *s != stage).cloned().collect())
     }
 }
 
-impl From<Stage> for StageList {
+impl From<StageId> for StageList {
     /// The list of the one stage.
-    fn from(stage: Stage) -> StageList {
+    fn from(stage: StageId) -> StageList {
         StageList(vec![stage])
+    }
+}
+
+impl<'a> IntoIterator for &'a StageList {
+    type Item = &'a StageId;
+    type IntoIter = std::slice::Iter<'a, StageId>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
     }
 }
 
@@ -270,66 +361,127 @@ impl fmt::Display for StageList {
     }
 }
 
-/// A feature of a backend that is installed separately (for Maxine, a
-/// feature directory of the SDK with its library and its models). Not every
-/// feature is used by the chain yet; the list says what a client can offer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Feature {
-    /// The green-screen segmentation: the mask of `blur` and `replace`.
-    GreenScreen,
-    /// The background blur of `blur`.
-    BackgroundBlur,
-    /// Video noise removal ([`Stage::Denoise`]).
-    Denoise,
-    /// Relighting of the foreground through the green-screen matte.
-    Relighting,
-    /// Video super resolution (upscaling, and same-size denoise and
-    /// deblur modes).
-    VideoSuperResolution,
-    /// A lightweight upscaler.
-    Upscale,
-    /// Video frame generation (frames interpolated between two inputs).
-    VideoFrameGeneration,
+/// The value of one stage parameter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    /// A switch.
+    Bool(bool),
+    /// A whole number (degrees, percent, a count).
+    Int(i64),
+    /// A real number.
+    Float(f64),
+    /// A string (for example a choice among names).
+    Str(String),
 }
 
-impl Feature {
-    /// Every feature, in declaration order.
-    pub const ALL: [Feature; 7] = [
-        Feature::GreenScreen,
-        Feature::BackgroundBlur,
-        Feature::Denoise,
-        Feature::Relighting,
-        Feature::VideoSuperResolution,
-        Feature::Upscale,
-        Feature::VideoFrameGeneration,
-    ];
-
-    /// A stable lower-case name for logs and interfaces.
-    pub fn as_str(self) -> &'static str {
+impl Value {
+    /// The switch, if this is a [`Value::Bool`].
+    pub fn as_bool(&self) -> Option<bool> {
         match self {
-            Feature::GreenScreen => "green-screen",
-            Feature::BackgroundBlur => "background-blur",
-            Feature::Denoise => "denoise",
-            Feature::Relighting => "relighting",
-            Feature::VideoSuperResolution => "video-super-resolution",
-            Feature::Upscale => "upscale",
-            Feature::VideoFrameGeneration => "video-frame-generation",
+            Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// The number, if this is a [`Value::Int`].
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// The number, if this is a [`Value::Float`] or a [`Value::Int`].
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::Float(f) => Some(*f),
+            Value::Int(i) => Some(*i as f64),
+            _ => None,
+        }
+    }
+
+    /// The string, if this is a [`Value::Str`].
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The kind of value, for messages: `bool`, `int`, `float` or `string`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Value::Bool(_) => "bool",
+            Value::Int(_) => "int",
+            Value::Float(_) => "float",
+            Value::Str(_) => "string",
         }
     }
 }
 
-impl fmt::Display for Feature {
+impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        match self {
+            Value::Bool(b) => write!(f, "{b}"),
+            Value::Int(i) => write!(f, "{i}"),
+            Value::Float(x) => write!(f, "{x}"),
+            Value::Str(s) => f.write_str(s),
+        }
     }
 }
 
-/// Whether a [`Feature`] is installed, as far as the filesystem shows. It
-/// says nothing about whether the feature loads on this GPU: that is known
-/// only when it is loaded.
+impl From<bool> for Value {
+    fn from(b: bool) -> Value {
+        Value::Bool(b)
+    }
+}
+
+impl From<i64> for Value {
+    fn from(i: i64) -> Value {
+        Value::Int(i)
+    }
+}
+
+impl From<i32> for Value {
+    fn from(i: i32) -> Value {
+        Value::Int(i.into())
+    }
+}
+
+impl From<u32> for Value {
+    fn from(i: u32) -> Value {
+        Value::Int(i.into())
+    }
+}
+
+impl From<f64> for Value {
+    fn from(f: f64) -> Value {
+        Value::Float(f)
+    }
+}
+
+impl From<&str> for Value {
+    fn from(s: &str) -> Value {
+        Value::Str(s.to_owned())
+    }
+}
+
+impl From<String> for Value {
+    fn from(s: String) -> Value {
+        Value::Str(s)
+    }
+}
+
+/// The parameters of one stage, by key. The keys and their meaning are the
+/// backend's (see the crate documentation).
+pub type Params = BTreeMap<String, Value>;
+
+/// Whether something a backend offers (a stage, or a feature it is made of)
+/// is installed, as far as the filesystem shows. It says nothing about
+/// whether it loads on this GPU: that is known only when it is loaded.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Availability {
-    /// The feature's library and the models it needs are present.
+    /// Its library and the models it needs are present.
     Installed,
     /// Something is missing; the reason says what, for logs (the library,
     /// or the models for this GPU).
@@ -337,12 +489,12 @@ pub enum Availability {
 }
 
 impl Availability {
-    /// Whether the feature is installed.
+    /// Whether it is installed.
     pub fn is_installed(&self) -> bool {
         matches!(self, Availability::Installed)
     }
 
-    /// Why the feature is not installed, if it is not.
+    /// Why it is not installed, if it is not.
     pub fn reason(&self) -> Option<&str> {
         match self {
             Availability::Installed => None,
@@ -516,9 +668,10 @@ pub struct LoadRequest {
     /// backend for `none` without one).
     pub effect: EffectKind,
     /// The stackable stages to run with the effect, or alone with
-    /// [`EffectKind::None`], in the order of the crate documentation. A
-    /// stage that is not listed loads no model and adds no pass; the empty
-    /// list is the effect alone.
+    /// [`EffectKind::None`], in the caller's order (see the crate
+    /// documentation for how a backend runs them). A stage that is not
+    /// listed loads no model and adds no pass; the empty list is the effect
+    /// alone.
     pub stages: StageList,
     /// Frame width in pixels; every frame passed to `process` has it.
     pub width: u32,
@@ -529,10 +682,19 @@ pub struct LoadRequest {
     /// The background image, already scaled and cropped to `width x height`.
     /// Required for [`EffectKind::Replace`], ignored otherwise.
     pub background: Option<Arc<HostBgr>>,
-    /// The light of [`Stage::Relight`]; ignored without the stage. A new
-    /// light on a loaded stage is a switch that loads no model (Maxine binds
-    /// a new lighting environment to the loaded effect).
-    pub relight_light: RelightLight,
+    /// The load-time parameters of the stages (for example the light of a
+    /// relighting stage), by stage; a stage without an entry has its
+    /// defaults, and an entry for a stage that is not listed is ignored. A
+    /// new value on a loaded stage is a switch; the backend documents what
+    /// it costs.
+    pub params: BTreeMap<StageId, Params>,
+}
+
+impl LoadRequest {
+    /// The load-time parameters of `stage`, if the request has any.
+    pub fn stage_params(&self, stage: &str) -> Option<&Params> {
+        self.params.get(stage)
+    }
 }
 
 /// The outcome of a successful [`InferenceBackend::load`].
@@ -552,180 +714,23 @@ pub struct LoadReport {
     pub reused_model: bool,
 }
 
-/// The light of [`Stage::Relight`]: the colour temperature of its key
-/// light.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum RelightLight {
-    /// A warm key light, about 3200 K (tungsten).
-    Warm,
-    /// A neutral key light, about 5000 K.
-    #[default]
-    Neutral,
-    /// A cool key light, about 6500 K (daylight).
-    Cool,
-}
-
-impl RelightLight {
-    /// Every light, in declaration order.
-    pub const ALL: [RelightLight; 3] = [
-        RelightLight::Warm,
-        RelightLight::Neutral,
-        RelightLight::Cool,
-    ];
-
-    /// The lower-case name used in configuration, D-Bus and the CLI.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RelightLight::Warm => "warm",
-            RelightLight::Neutral => "neutral",
-            RelightLight::Cool => "cool",
-        }
-    }
-
-    /// The colour temperature of the key light, in kelvin.
-    pub fn kelvin(self) -> f32 {
-        match self {
-            RelightLight::Warm => 3200.0,
-            RelightLight::Neutral => 5000.0,
-            RelightLight::Cool => 6500.0,
-        }
-    }
-}
-
-impl fmt::Display for RelightLight {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for RelightLight {
-    type Err = BackendError;
-    /// Parses `warm`, `neutral` or `cool`, ignoring ASCII case.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "warm" => Ok(RelightLight::Warm),
-            "neutral" => Ok(RelightLight::Neutral),
-            "cool" => Ok(RelightLight::Cool),
-            _ => Err(BackendError::InvalidInput(format!(
-                "unknown relight light {s:?} (warm|neutral|cool)"
-            ))),
-        }
-    }
-}
-
-/// What [`Stage::Relight`] does to a frame: the light, where it comes from
-/// and how bright the relit foreground is, as a client sets them. The light
-/// goes into the load request ([`LoadRequest::relight_light`]: a new light
-/// is a switch that loads no model), the direction and the gain into
-/// each frame's [`FrameParams`] ([`RelightParams::frame_params`]).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RelightParams {
-    /// The key light's colour.
-    pub light: RelightLight,
-    /// The direction of the light, in degrees around the vertical axis:
-    /// 0 is the default position, positive values turn it one way and
-    /// negative values the other ([`RelightParams::MIN_PAN_DEG`] to
-    /// [`RelightParams::MAX_PAN_DEG`]).
-    pub pan_deg: f32,
-    /// The brightness of the relit foreground, 1.0 unchanged
-    /// ([`RelightParams::MIN_GAIN`] to [`RelightParams::MAX_GAIN`]).
-    pub gain: f32,
-}
-
-impl RelightParams {
-    /// The smallest light direction, in degrees.
-    pub const MIN_PAN_DEG: f32 = -180.0;
-    /// The largest light direction, in degrees.
-    pub const MAX_PAN_DEG: f32 = 180.0;
-    /// The smallest foreground gain.
-    pub const MIN_GAIN: f32 = 0.5;
-    /// The largest foreground gain.
-    pub const MAX_GAIN: f32 = 2.0;
-    /// The default foreground gain.
-    pub const DEFAULT_GAIN: f32 = 1.0;
-
-    /// The parameters with the direction and the gain within their ranges;
-    /// a value that is not finite becomes its default.
-    pub fn clamped(self) -> RelightParams {
-        let finite_or = |v: f32, d: f32| if v.is_finite() { v } else { d };
-        RelightParams {
-            light: self.light,
-            pan_deg: finite_or(self.pan_deg, 0.0).clamp(Self::MIN_PAN_DEG, Self::MAX_PAN_DEG),
-            gain: finite_or(self.gain, Self::DEFAULT_GAIN).clamp(Self::MIN_GAIN, Self::MAX_GAIN),
-        }
-    }
-
-    /// `params` with this direction and gain (clamped).
-    pub fn frame_params(&self, params: FrameParams) -> FrameParams {
-        let c = self.clamped();
-        FrameParams {
-            relight_pan_deg: c.pan_deg,
-            relight_gain: c.gain,
-            ..params
-        }
-    }
-
-    /// Checks the parameters are finite and within their ranges, with the
-    /// reason if not (what a client is told; a backend clamps instead).
-    pub fn validate(&self) -> Result<(), String> {
-        if !self.pan_deg.is_finite()
-            || !(Self::MIN_PAN_DEG..=Self::MAX_PAN_DEG).contains(&self.pan_deg)
-        {
-            return Err(format!(
-                "relight direction {} is outside {} to {} degrees",
-                self.pan_deg,
-                Self::MIN_PAN_DEG,
-                Self::MAX_PAN_DEG
-            ));
-        }
-        if !self.gain.is_finite() || !(Self::MIN_GAIN..=Self::MAX_GAIN).contains(&self.gain) {
-            return Err(format!(
-                "relight gain {} is outside {} to {}",
-                self.gain,
-                Self::MIN_GAIN,
-                Self::MAX_GAIN
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl Default for RelightParams {
-    fn default() -> Self {
-        RelightParams {
-            light: RelightLight::default(),
-            pan_deg: 0.0,
-            gain: Self::DEFAULT_GAIN,
-        }
-    }
-}
-
 /// Per-frame parameters that change without a reload.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FrameParams {
     /// Blur strength, 0.0 to 1.0 (values outside are clamped). Used by
     /// [`EffectKind::Blur`] only.
     pub blur_strength: f32,
-    /// The direction of the light of [`Stage::Relight`], in degrees
-    /// ([`RelightParams::pan_deg`]; clamped to its range). Ignored without
-    /// the stage.
-    pub relight_pan_deg: f32,
-    /// The brightness of the relit foreground of [`Stage::Relight`]
-    /// ([`RelightParams::gain`]; clamped to its range). Ignored without the
-    /// stage.
-    pub relight_gain: f32,
+    /// The live parameters of the stages (for example the direction and
+    /// brightness of a relighting stage), by stage; a stage without an
+    /// entry has its defaults, and a backend clamps values outside their
+    /// range. An entry for a stage that is not loaded is ignored.
+    pub live: BTreeMap<StageId, Params>,
 }
 
 impl FrameParams {
-    /// The relight direction and gain, clamped as a backend applies them.
-    pub fn relight(&self) -> (f32, f32) {
-        let c = RelightParams {
-            light: RelightLight::default(),
-            pan_deg: self.relight_pan_deg,
-            gain: self.relight_gain,
-        }
-        .clamped();
-        (c.pan_deg, c.gain)
+    /// The live parameters of `stage`, if the frame has any.
+    pub fn stage_params(&self, stage: &str) -> Option<&Params> {
+        self.live.get(stage)
     }
 }
 
@@ -733,50 +738,64 @@ impl Default for FrameParams {
     fn default() -> Self {
         FrameParams {
             blur_strength: 0.5,
-            relight_pan_deg: 0.0,
-            relight_gain: RelightParams::DEFAULT_GAIN,
+            live: BTreeMap::new(),
         }
     }
 }
 
-/// GPU time of each step of one processed frame, in milliseconds, measured
-/// with CUDA events on the backend's stream. Each [`Stage`] has a field of
-/// its own (0 when the stage is not loaded), so that tools can report the
-/// stages by name.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+/// GPU time of each step of one processed frame, in milliseconds, in the
+/// order the steps ran, measured by the backend (with CUDA events on its
+/// stream, for a CUDA backend). A step is a stage, by its id, or one of the
+/// steps of [`StageTimings`]'s constants; a stage that did not run on the
+/// frame has no entry.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct StageTimings {
-    /// NV12 to the backend's input format (BGR for Maxine).
-    pub convert_in_ms: f32,
-    /// The denoise stage; 0 when it is not loaded.
-    pub denoise_ms: f32,
-    /// The segmentation mask.
-    pub mask_ms: f32,
-    /// The relight stage; 0 when it is not loaded.
-    pub relight_ms: f32,
-    /// The blur or the composite over the background.
-    pub effect_ms: f32,
-    /// Back to NV12 into the destination frame.
-    pub convert_out_ms: f32,
+    steps: Vec<(String, f32)>,
 }
 
 impl StageTimings {
-    /// The sum of all stages.
-    pub fn total_ms(&self) -> f32 {
-        self.convert_in_ms
-            + self.denoise_ms
-            + self.mask_ms
-            + self.relight_ms
-            + self.effect_ms
-            + self.convert_out_ms
+    /// The conversion of NV12 to the backend's working format.
+    pub const CONVERT_IN: &'static str = "convert-in";
+    /// The matte (segmentation mask).
+    pub const MASK: &'static str = "mask";
+    /// The effect's blur or composite over the background, through the
+    /// matte.
+    pub const COMPOSITE: &'static str = "composite";
+    /// The conversion back to NV12 into the destination frame.
+    pub const CONVERT_OUT: &'static str = "convert-out";
+
+    /// Timings with no step.
+    pub fn new() -> StageTimings {
+        StageTimings::default()
     }
 
-    /// The time of `stage` ([`StageTimings::denoise_ms`],
-    /// [`StageTimings::relight_ms`]).
-    pub fn stage_ms(&self, stage: Stage) -> f32 {
-        match stage {
-            Stage::Denoise => self.denoise_ms,
-            Stage::Relight => self.relight_ms,
-        }
+    /// Appends the time of `step`.
+    pub fn push(&mut self, step: impl Into<String>, ms: f32) {
+        self.steps.push((step.into(), ms));
+    }
+
+    /// `self` with the time of `step` appended.
+    pub fn with(mut self, step: impl Into<String>, ms: f32) -> StageTimings {
+        self.push(step, ms);
+        self
+    }
+
+    /// The steps and their times, in the order they ran.
+    pub fn steps(&self) -> &[(String, f32)] {
+        &self.steps
+    }
+
+    /// The sum of all steps.
+    pub fn total_ms(&self) -> f32 {
+        self.steps.iter().map(|(_, ms)| ms).sum()
+    }
+
+    /// The time of `step` (a stage id or a step constant), if it ran.
+    pub fn step_ms(&self, step: &str) -> Option<f32> {
+        self.steps
+            .iter()
+            .find(|(s, _)| s == step)
+            .map(|(_, ms)| *ms)
     }
 }
 
@@ -816,17 +835,18 @@ pub enum BackendError {
     /// without it. From `load`: nothing of the request is in force (a
     /// reused instance keeps its previous chain; a fresh load leaves it
     /// unloaded), so the caller may load again without `stage`. One switch
-    /// cannot keep the previous chain whole: a new light the loaded relight
-    /// stage fails to take leaves the stage in an unknown state, so the
-    /// reused instance keeps its previous chain **without** `stage`; the
-    /// caller then knows the previous chain without `stage` is in force
-    /// (without it if it was not in it, the same). From
+    /// cannot keep the previous chain whole: a new load-time parameter that
+    /// a loaded stage fails to take (a new light of a relighting stage, for
+    /// example) can leave the stage in an unknown state, so the reused
+    /// instance keeps its previous chain **without** `stage`; the caller
+    /// then knows the previous chain without `stage` is in force (without
+    /// it if it was not in it, the same). From
     /// `process`: the backend has dropped `stage`, and the next frame runs
     /// the chain without it; this frame's `dst` is not written.
     #[error("{message}")]
     Stage {
         /// The stage that failed.
-        stage: Stage,
+        stage: StageId,
         /// The backend's status code, as for [`BackendError::Load`].
         code: i32,
         /// What failed and what to do about it.
@@ -856,11 +876,11 @@ pub trait InferenceBackend: Send {
     /// the mask model stays loaded and the call costs milliseconds, so
     /// switching between blur and replace does not reload it
     /// ([`LoadReport::reused_model`]); such a switch may run on the
-    /// streaming thread. Adding or removing a stage, or changing the light
-    /// of the relight stage, is such a switch too, and costs the stage's
-    /// model load when it is added (a new light loads no model). If a
-    /// switch on a
-    /// loaded instance fails, the previous effect (and its stages) stays
+    /// streaming thread. Adding or removing a stage, or changing a stage's
+    /// load-time parameters ([`LoadRequest::params`]), is such a switch
+    /// too, and costs the stage's model load when it is added (the backend
+    /// documents what a new parameter costs). If a switch on a loaded
+    /// instance fails, the previous effect (and its stages) stays
     /// loaded, less the stage of a [`BackendError::Stage`] (see there); if
     /// a full load fails, the instance is left unloaded.
     fn load(&mut self, gpu: &GpuContext, req: &LoadRequest) -> Result<LoadReport, BackendError>;
@@ -884,12 +904,23 @@ pub trait InferenceBackend: Send {
     /// callers should unload explicitly before releasing the context).
     fn unload(&mut self);
 
+    /// Whether a chain is loaded and can process frames; asked after a
+    /// successful load. A backend that can lose its chain on its own (a
+    /// backend over a module, unloaded after the module panicked) says so
+    /// here, so that a caller does not take what it loaded last as still
+    /// loaded. The default is `true`: a built-in backend loses its chain
+    /// only through [`unload`] or a failed full load, which the caller sees.
+    ///
+    /// [`unload`]: InferenceBackend::unload
+    fn is_loaded(&self) -> bool {
+        true
+    }
+
     /// Per-stage GPU times of the most recent frame whose work has
     /// completed, if the backend measures them.
     fn timings(&self) -> Option<StageTimings>;
 
-    /// Forgets the temporal state of the loaded stages and of the mask (the
-    /// denoise state, the green screen's, and any a relight stage keeps), so
+    /// Forgets the temporal state of the loaded stages and of the mask, so
     /// the next frame is treated as the first
     /// of a new video: the element calls it when the input switches to
     /// another source. Enqueued on `gpu.stream`; a no-op when nothing is
@@ -920,6 +951,16 @@ pub trait BackendFactory: Send + Sync {
 
     /// Creates an unloaded instance. Does what `probe` does, and no more.
     fn create(&self) -> Result<Box<dyn InferenceBackend>, BackendError>;
+
+    /// Checks the parameters a client sets for `stage` (`params` at load
+    /// time, `live` per frame) without loading anything, with the reason if
+    /// they are malformed or out of range: what a client is told before it
+    /// applies them (a backend clamps a live value instead). Keys the
+    /// backend does not know are accepted. The default accepts everything.
+    fn check_params(&self, stage: &StageId, params: &Params, live: &Params) -> Result<(), String> {
+        let _ = (stage, params, live);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1030,7 +1071,7 @@ mod tests {
             "no SDK"
         );
         let e = BackendError::Stage {
-            stage: Stage::Denoise,
+            stage: StageId::DENOISE,
             code: -16,
             message: "the video noise removal does not support 2048x1080 frames".into(),
         };
@@ -1049,172 +1090,164 @@ mod tests {
     }
 
     #[test]
-    fn stage_lists_keep_the_canonical_order_once() {
+    fn stage_ids_are_validated() {
+        for ok in ["denoise", "relight", "a", "eye-contact", "x2", "a-b-c-1"] {
+            let id = StageId::new(ok).unwrap();
+            assert_eq!(id.as_str(), ok);
+            assert_eq!(id.to_string(), ok);
+            assert_eq!(ok.parse::<StageId>().unwrap(), id);
+        }
+        let longest = format!("a{}", "b".repeat(31));
+        assert!(StageId::new(longest.clone()).is_ok());
+        for bad in [
+            "",
+            "Denoise",
+            "1denoise",
+            "-x",
+            "de_noise",
+            "de noise",
+            "dé",
+            &format!("{longest}c"),
+        ] {
+            let e = StageId::new(bad).unwrap_err();
+            assert!(matches!(e, BackendError::InvalidInput(_)), "{bad:?}");
+            assert!(e.to_string().contains("invalid stage id"), "{e}");
+            assert!(!StageId::is_valid(bad), "{bad:?}");
+        }
+        // The status messages' own field names.
+        for reserved in [
+            "status",
+            "effect",
+            "reason",
+            "module",
+            "relight-reason",
+            "x-reason",
+        ] {
+            let e = StageId::new(reserved).unwrap_err();
+            assert!(
+                matches!(&e, BackendError::InvalidInput(m) if m.contains("reserved")),
+                "{reserved}: {e:?}"
+            );
+            assert!(!StageId::is_valid(reserved), "{reserved:?}");
+        }
+        for ok in ["statuses", "reasons", "reason-x", "modules"] {
+            assert!(StageId::new(ok).is_ok(), "{ok}");
+        }
+        for (c, s) in [
+            (StageId::BACKGROUND, "background"),
+            (StageId::ENHANCE, "enhance"),
+            (StageId::DENOISE, "denoise"),
+            (StageId::RELIGHT, "relight"),
+        ] {
+            assert!(StageId::is_valid(c.as_str()));
+            assert_eq!(
+                c,
+                StageId::new(s).unwrap(),
+                "a constant equals the parsed id"
+            );
+            assert_eq!(c, s);
+        }
+        // A map keyed by id is looked up with a string.
+        let mut m = BTreeMap::new();
+        m.insert(StageId::RELIGHT, 1);
+        assert_eq!(m.get("relight"), Some(&1));
+    }
+
+    #[test]
+    fn stage_lists_keep_the_callers_order_once() {
         let empty = StageList::default();
-        assert!(empty.is_empty() && !empty.needs_mask());
-        assert_eq!(empty.as_slice(), &[] as &[Stage]);
+        assert!(empty.is_empty());
+        assert_eq!(empty.as_slice(), &[] as &[StageId]);
         assert_eq!(empty.to_string(), "[]");
         assert_eq!(StageList::new([]).unwrap(), empty);
 
-        let one = StageList::new([Stage::Denoise]).unwrap();
-        assert_eq!(one, StageList::from(Stage::Denoise));
-        assert!(one.contains(Stage::Denoise) && !one.is_empty());
+        let one = StageList::new([StageId::DENOISE]).unwrap();
+        assert_eq!(one, StageList::from(StageId::DENOISE));
+        assert!(one.contains("denoise") && !one.is_empty());
         assert_eq!(one.to_string(), "[denoise]");
-        assert!(!empty.contains(Stage::Denoise));
+        assert!(!empty.contains("denoise"));
 
-        let e = StageList::new([Stage::Denoise, Stage::Denoise]).unwrap_err();
+        let e = StageList::new([StageId::DENOISE, StageId::DENOISE]).unwrap_err();
         assert!(matches!(e, BackendError::InvalidInput(_)), "{e:?}");
         assert!(e.to_string().contains("denoise is listed twice"), "{e}");
-    }
 
-    #[test]
-    fn denoise_is_a_pre_mask_stage() {
-        assert!(!Stage::Denoise.needs_mask());
-        assert!(!StageList::from(Stage::Denoise).needs_mask());
-        assert_eq!(Stage::Denoise.to_string(), "denoise");
-    }
-
-    #[test]
-    fn relight_is_a_post_mask_stage_after_denoise() {
-        assert!(Stage::Relight.needs_mask());
-        assert!(StageList::from(Stage::Relight).needs_mask());
-        assert_eq!(Stage::Relight.to_string(), "relight");
-        assert_eq!(Stage::ALL, [Stage::Denoise, Stage::Relight]);
-
-        let both = StageList::new([Stage::Denoise, Stage::Relight]).unwrap();
-        assert!(both.needs_mask());
-        assert!(both.contains(Stage::Denoise) && both.contains(Stage::Relight));
+        let both = StageList::new([StageId::DENOISE, StageId::RELIGHT]).unwrap();
+        assert!(both.contains("denoise") && both.contains("relight"));
         assert_eq!(both.to_string(), "[denoise, relight]");
-        assert_eq!(both.as_slice(), &[Stage::Denoise, Stage::Relight]);
-
-        let e = StageList::new([Stage::Relight, Stage::Denoise]).unwrap_err();
-        assert!(matches!(e, BackendError::InvalidInput(_)), "{e:?}");
-        assert!(
-            e.to_string().contains("denoise must come before relight"),
-            "{e}"
-        );
-        let e = StageList::new([Stage::Denoise, Stage::Relight, Stage::Relight]).unwrap_err();
+        assert_eq!(both.as_slice(), &[StageId::DENOISE, StageId::RELIGHT]);
+        assert_eq!(both.len(), 2);
+        assert_eq!(both.without("denoise"), StageList::from(StageId::RELIGHT));
+        assert_eq!(both.without("hello"), both);
+        // The caller's order is kept, whatever it is.
+        let reversed = StageList::new([StageId::RELIGHT, StageId::DENOISE]).unwrap();
+        assert_eq!(reversed.to_string(), "[relight, denoise]");
+        assert_ne!(reversed, both);
+        let e = StageList::new([StageId::DENOISE, StageId::RELIGHT, StageId::RELIGHT]).unwrap_err();
         assert!(e.to_string().contains("relight is listed twice"), "{e}");
     }
 
     #[test]
-    fn a_stage_is_available_when_all_its_features_are() {
-        use Availability::*;
-        let all_installed: Vec<(Feature, Availability)> =
-            Feature::ALL.iter().map(|f| (*f, Installed)).collect();
-        for stage in Stage::ALL {
-            assert_eq!(stage.availability(&all_installed), Installed, "{stage}");
-        }
-        assert_eq!(Stage::Denoise.features(), &[Feature::Denoise]);
+    fn values_read_as_their_kind() {
+        assert_eq!(Value::from(true).as_bool(), Some(true));
+        assert_eq!(Value::from(-30).as_int(), Some(-30));
+        assert_eq!(Value::from(150u32).as_f64(), Some(150.0));
+        assert_eq!(Value::from(1.5).as_f64(), Some(1.5));
+        assert_eq!(Value::from(1.5).as_int(), None);
+        assert_eq!(Value::from("warm").as_str(), Some("warm"));
+        assert_eq!(Value::from("warm").as_int(), None);
+        assert_eq!(Value::Int(3).as_bool(), None);
         assert_eq!(
-            Stage::Relight.features(),
-            &[Feature::GreenScreen, Feature::Relighting]
-        );
-        let without_green_screen: Vec<(Feature, Availability)> = all_installed
-            .iter()
-            .map(|(f, a)| match f {
-                Feature::GreenScreen => (*f, NotInstalled("no models".into())),
-                _ => (*f, a.clone()),
-            })
-            .collect();
-        assert_eq!(
-            Stage::Relight.availability(&without_green_screen),
-            NotInstalled("green-screen: no models".into())
-        );
-        assert_eq!(
-            Stage::Denoise.availability(&without_green_screen),
-            Installed
-        );
-        let a = Stage::Relight.availability(&[(Feature::GreenScreen, Installed)]);
-        assert_eq!(a, NotInstalled("relighting: not reported".into()));
-        let a = Stage::Relight.availability(&[]);
-        assert_eq!(
-            a.reason(),
-            Some("green-screen: not reported; relighting: not reported")
-        );
-    }
-
-    #[test]
-    fn relight_lights_parse_and_display_lower_case() {
-        for (s, l, k) in [
-            ("warm", RelightLight::Warm, 3200.0),
-            ("neutral", RelightLight::Neutral, 5000.0),
-            ("cool", RelightLight::Cool, 6500.0),
-        ] {
-            assert_eq!(s.parse::<RelightLight>().unwrap(), l);
-            assert_eq!(l.to_string(), s);
-            assert_eq!(l.kelvin(), k);
-        }
-        assert_eq!("COOL".parse::<RelightLight>().unwrap(), RelightLight::Cool);
-        let e = "pink".parse::<RelightLight>().unwrap_err();
-        assert!(e.to_string().contains("warm|neutral|cool"), "{e}");
-        assert_eq!(RelightLight::default(), RelightLight::Neutral);
-        assert_eq!(RelightLight::ALL.len(), 3);
-    }
-
-    #[test]
-    fn relight_params_clamp_and_validate() {
-        let d = RelightParams::default();
-        assert_eq!(
-            (d.light, d.pan_deg, d.gain),
-            (RelightLight::Neutral, 0.0, 1.0)
-        );
-        assert_eq!(d.clamped(), d);
-        assert!(d.validate().is_ok());
-        let p = |pan_deg, gain| RelightParams {
-            light: RelightLight::Warm,
-            pan_deg,
-            gain,
-        };
-        assert_eq!(p(270.0, 3.0).clamped(), p(180.0, 2.0));
-        assert_eq!(p(-400.0, 0.1).clamped(), p(-180.0, 0.5));
-        assert_eq!(p(f32::NAN, f32::INFINITY).clamped(), p(0.0, 1.0));
-        assert_eq!(p(-45.0, 1.25).clamped(), p(-45.0, 1.25));
-        for (pan, gain) in [(180.0, 2.0), (-180.0, 0.5), (12.5, 1.5)] {
-            assert!(p(pan, gain).validate().is_ok(), "{pan} {gain}");
-        }
-        for pan in [180.5, -181.0, f32::NAN] {
-            let e = p(pan, 1.0).validate().unwrap_err();
-            assert!(e.contains("-180 to 180 degrees"), "{e}");
-        }
-        for gain in [0.49, 2.01, f32::INFINITY] {
-            let e = p(0.0, gain).validate().unwrap_err();
-            assert!(e.contains("0.5 to 2"), "{e}");
-        }
-        let f = FrameParams::default();
-        assert_eq!(f.relight(), (0.0, 1.0));
-        let f = p(-400.0, 3.0).frame_params(FrameParams {
-            blur_strength: 0.25,
-            ..FrameParams::default()
-        });
-        assert_eq!(
-            (f.blur_strength, f.relight_pan_deg, f.relight_gain),
-            (0.25, -180.0, 2.0)
-        );
-        let raw = FrameParams {
-            relight_pan_deg: 999.0,
-            relight_gain: f32::NAN,
-            ..FrameParams::default()
-        };
-        assert_eq!(raw.relight(), (180.0, 1.0), "a backend clamps");
-    }
-
-    #[test]
-    fn features_have_stable_names_and_availability_its_reason() {
-        let names: Vec<&str> = Feature::ALL.iter().map(|f| f.as_str()).collect();
-        assert_eq!(
-            names,
             [
-                "green-screen",
-                "background-blur",
-                "denoise",
-                "relighting",
-                "video-super-resolution",
-                "upscale",
-                "video-frame-generation"
-            ]
+                Value::Bool(false).kind(),
+                Value::Int(0).kind(),
+                Value::Float(0.0).kind(),
+                Value::Str(String::new()).kind()
+            ],
+            ["bool", "int", "float", "string"]
         );
-        assert_eq!(Feature::Relighting.to_string(), "relighting");
+        assert_eq!(Value::from("cool").to_string(), "cool");
+        assert_eq!(Value::from(-5).to_string(), "-5");
+    }
+
+    #[test]
+    fn requests_and_frames_carry_params_by_stage() {
+        let mut live = BTreeMap::new();
+        live.insert(
+            StageId::RELIGHT,
+            Params::from([("direction".to_string(), Value::Int(45))]),
+        );
+        let f = FrameParams {
+            blur_strength: 0.25,
+            live,
+        };
+        assert_eq!(
+            f.stage_params("relight").and_then(|p| p.get("direction")),
+            Some(&Value::Int(45))
+        );
+        assert_eq!(f.stage_params("denoise"), None);
+        let d = FrameParams::default();
+        assert_eq!((d.blur_strength, d.live.len()), (0.5, 0));
+        let req = LoadRequest {
+            effect: EffectKind::None,
+            stages: StageId::RELIGHT.into(),
+            width: 1280,
+            height: 720,
+            colour: ColourSpec::default(),
+            background: None,
+            params: BTreeMap::from([(
+                StageId::RELIGHT,
+                Params::from([("light".to_string(), Value::from("warm"))]),
+            )]),
+        };
+        assert_eq!(
+            req.stage_params("relight").and_then(|p| p.get("light")),
+            Some(&Value::from("warm"))
+        );
+        assert_eq!(req.stage_params("denoise"), None);
+    }
+
+    #[test]
+    fn availability_has_its_reason() {
         assert!(Availability::Installed.is_installed());
         assert_eq!(Availability::Installed.reason(), None);
         let missing = Availability::NotInstalled("no library".into());
@@ -1222,8 +1255,27 @@ mod tests {
         assert_eq!(missing.reason(), Some("no library"));
         fn _send_clone<T: Send + Sync + Clone>() {}
         _send_clone::<Availability>();
-        _send_clone::<Feature>();
+        _send_clone::<StageId>();
         _send_clone::<StageList>();
+        _send_clone::<Params>();
+    }
+
+    #[test]
+    fn the_default_factory_accepts_any_params() {
+        struct Factory;
+        impl BackendFactory for Factory {
+            fn name(&self) -> &'static str {
+                "any"
+            }
+            fn probe(&self) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn create(&self) -> Result<Box<dyn InferenceBackend>, BackendError> {
+                Err(BackendError::Unavailable("none".into()))
+            }
+        }
+        let p = Params::from([("x".to_string(), Value::Int(1))]);
+        assert_eq!(Factory.check_params(&StageId::DENOISE, &p, &p), Ok(()));
     }
 
     #[test]
@@ -1263,27 +1315,28 @@ mod tests {
 
     #[test]
     fn timings_total() {
-        let t = StageTimings {
-            convert_in_ms: 0.25,
-            denoise_ms: 0.0,
-            mask_ms: 1.0,
-            relight_ms: 0.0,
-            effect_ms: 0.5,
-            convert_out_ms: 0.25,
-        };
+        let t = StageTimings::new()
+            .with(StageTimings::CONVERT_IN, 0.25)
+            .with(StageTimings::MASK, 1.0)
+            .with(StageTimings::COMPOSITE, 0.5)
+            .with(StageTimings::CONVERT_OUT, 0.25);
         assert_eq!(t.total_ms(), 2.0);
-        let with_denoise = StageTimings {
-            denoise_ms: 1.5,
-            ..t
-        };
+        assert_eq!(t.step_ms("denoise"), None, "a stage that did not run");
+        let with_denoise = StageTimings::new()
+            .with(StageTimings::CONVERT_IN, 0.25)
+            .with("denoise", 1.5)
+            .with(StageTimings::MASK, 1.0)
+            .with(StageTimings::COMPOSITE, 0.5)
+            .with(StageTimings::CONVERT_OUT, 0.25);
         assert_eq!(with_denoise.total_ms(), 3.5);
-        let with_both = StageTimings {
-            relight_ms: 4.0,
-            ..with_denoise
-        };
+        let mut with_both = with_denoise.clone();
+        with_both.push("relight", 4.0);
         assert_eq!(with_both.total_ms(), 7.5);
-        assert_eq!(with_both.stage_ms(Stage::Denoise), 1.5);
-        assert_eq!(with_both.stage_ms(Stage::Relight), 4.0);
+        assert_eq!(with_both.step_ms("denoise"), Some(1.5));
+        assert_eq!(with_both.step_ms("relight"), Some(4.0));
+        assert_eq!(with_both.step_ms(StageTimings::MASK), Some(1.0));
+        assert_eq!(with_both.steps().len(), 6);
+        assert_eq!(with_both.steps()[1], ("denoise".to_string(), 1.5));
         assert_eq!(StageTimings::default().total_ms(), 0.0);
     }
 

@@ -6,6 +6,7 @@ mod bus;
 mod human;
 mod json;
 mod model;
+mod modules;
 mod out;
 mod preview;
 mod watch;
@@ -41,11 +42,12 @@ Exit status:
   3  omarchy-broadcastd is not running, or there is no D-Bus session bus
   4  any other D-Bus failure, a timeout, or a failed write to stdout
 
-`status`, `cameras`, `watch`, `preview`, `effect` without an effect, and `controls` and
-`settings` without a subcommand never start the daemon. `on`, `off`, `camera`,
-`effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set` and
-`settings reset` may start it through D-Bus activation when its activation file is
-installed.
+`status`, `cameras`, `watch`, `preview`, `effect` without an effect, `controls` and
+`settings` without a subcommand, `modules list`, `modules info`, `modules profile` without
+a profile and `order show` never start the daemon. `on`, `off`, `camera`,
+`effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`,
+`settings reset`, `modules enable|disable|profile <profile>|pin` and `order set|reset` may
+start it through D-Bus activation when its activation file is installed.
 
 `--json` output is documented in docs/cli-json.md; the D-Bus interface in docs/dbus-api.md.";
 
@@ -176,6 +178,28 @@ enum Command {
         camera: Option<String>,
         #[command(subcommand)]
         action: Option<SettingsAction>,
+    },
+    /// Show or manage the effect modules: list them with their status and
+    /// stages, show one, enable or disable one, set the backend profile,
+    /// pin the module that provides a stage. Changes take effect when the
+    /// camera next starts.
+    ///
+    /// Without a subcommand, lists the modules. Examples:
+    /// `omarchy-broadcast modules info br.com.dias.maxine-vfx`,
+    /// `omarchy-broadcast modules profile battery`,
+    /// `omarchy-broadcast modules pin background br.com.dias.maxine-vfx`.
+    Modules {
+        #[command(subcommand)]
+        action: Option<modules::ModulesAction>,
+    },
+    /// Show or set the order of the effect stages (within the limits each
+    /// stage declares). Changes take effect when the camera next starts.
+    ///
+    /// Without a subcommand, prints the order. Example:
+    /// `omarchy-broadcast order set enhance,denoise,background,relight`.
+    Order {
+        #[command(subcommand)]
+        action: Option<modules::OrderAction>,
     },
     /// Follow state changes and stats until interrupted.
     Watch {
@@ -881,6 +905,14 @@ async fn run(job: Job) -> u8 {
         Job::Command(Command::Watch { json }) => watch::run(*json).await,
         Job::Command(Command::Preview { json, fps }) => preview::run(*json, *fps).await,
         Job::Command(Command::Denoise { value }) => set_denoise(value == "on").await,
+        Job::Command(Command::Modules { action }) => {
+            let list = modules::ModulesAction::List { json: false };
+            modules::run_modules(action.as_ref().unwrap_or(&list)).await
+        }
+        Job::Command(Command::Order { action }) => {
+            let show = modules::OrderAction::Show { json: false };
+            modules::run_order(action.as_ref().unwrap_or(&show)).await
+        }
         Job::Command(Command::Controls { json, action: None }) => show_controls(*json).await,
         Job::Command(Command::Controls {
             action: Some(action),

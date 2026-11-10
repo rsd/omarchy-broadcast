@@ -1,0 +1,2 @@
+# Build output of the fixture (built by the tests of obc-module-host).
+/target/

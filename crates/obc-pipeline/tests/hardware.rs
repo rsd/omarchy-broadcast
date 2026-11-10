@@ -32,7 +32,8 @@
 //!   and requires `OBC_TEST_SINK`, never the labelled default.
 //!
 //! * The effect tests: `gpu_an_output_switches_effects_while_streaming`
-//!   uses the fake backend of `gst-obc/tests/support/fake_backend.rs` (GPU
+//!   and `gpu_module_stages_run_around_the_effect_on_cuda_frames` use the
+//!   fake backend and the fake module chain of `gst-obc/tests/support/fake_backend.rs` (GPU
 //!   only); `maxine_*` needs `OBC_TEST_CAMERA` and the NVIDIA Maxine SDK
 //!   (the environment file of the `maxine-vfx-sdk-local` package loaded)
 //!   run under the os-release override (`docs/setup/maxine.md`, section 3).
@@ -66,6 +67,10 @@ use obc_pipeline::{
 /// The fake effect backend shared with gst-obc's GPU tests.
 #[path = "../../gst-obc/tests/support/fake_backend.rs"]
 mod fake_backend;
+
+/// The fake module chain shared with gst-obc's `obcmodule` tests.
+#[path = "../../gst-obc/tests/support/fake_chain.rs"]
+mod fake_chain;
 
 /// The camera can only be opened by one test at a time.
 static CAMERA: Mutex<()> = Mutex::new(());
@@ -3064,7 +3069,7 @@ fn gpu_an_output_switches_effects_while_streaming() {
     });
     let mut cfg = OutputConfig::new(OutputContract::default(), OutputSink::Fake);
     cfg.effect = Some(EffectSettings::default());
-    cfg.effect_backend = EffectBackend::new(fake.clone());
+    cfg.effect_backend = Some(EffectBackend::new(fake.clone()));
     let mut output = Output::build(cfg).expect("build output");
     assert!(output.pipeline().element(names::EFFECT).is_some());
     let trace = trace_output(&mut output);
@@ -3224,6 +3229,152 @@ fn gpu_an_output_switches_effects_while_streaming() {
     );
 }
 
+/// GPU only, fake module chains around the effect element (`none`, with
+/// the fake effect backend): a chain on host frames placed before the
+/// effect (through the host copy) and one on CUDA frames after it, while a
+/// white source streams. The sink sees the source (luma 235) until the
+/// first chain is loaded, then the earlier lift (120), then the later one
+/// (130) once both are; the later one turned off shows the earlier one
+/// again; one caps event in all.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_module_stages_run_around_the_effect_on_cuda_frames() {
+    use fake_chain::{FakeChainConfig, FakeChainFactory, FakeChainLog};
+    use obc_pipeline::effect::{StageId, StageRequest};
+    use obc_pipeline::module::{ModulePlacement, ModuleStageSpec, element_name};
+    init();
+    require_elements(&[
+        "videotestsrc",
+        "cudaupload",
+        "cudaconvertscale",
+        "videocrop",
+        "cudadownload",
+    ]);
+    let lift = |y: i64| StageRequest::on(StageId::new("lift").unwrap()).with_param("y", y);
+    let host = FakeChainFactory::host(FakeChainConfig::default());
+    let cuda = FakeChainFactory::cuda(FakeChainConfig {
+        load_delay: std::time::Duration::from_millis(300),
+        ..FakeChainConfig::default()
+    });
+    let mut cfg = OutputConfig::new(OutputContract::default(), OutputSink::Fake);
+    cfg.effect = Some(EffectSettings::default());
+    cfg.effect_backend = Some(EffectBackend::new(fake_backend::FakeFactory::new(
+        fake_backend::FakeConfig::default(),
+    )));
+    cfg.module_stages = vec![
+        ModuleStageSpec {
+            name: "pre".into(),
+            factory: host.clone(),
+            stages: vec![lift(120)],
+            placement: ModulePlacement::BeforeEffect,
+        },
+        ModuleStageSpec {
+            name: "post".into(),
+            factory: cuda.clone(),
+            stages: vec![lift(130)],
+            placement: ModulePlacement::AfterEffect,
+        },
+    ];
+    let mut output = Output::build(cfg).expect("build output");
+    let into = |element: &str| -> String {
+        output
+            .pipeline()
+            .element(element)
+            .and_then(|e| e.static_pad("sink"))
+            .and_then(|p| p.peer())
+            .and_then(|p| p.parent_element())
+            .map(|e| e.name().to_string())
+            .unwrap_or_default()
+    };
+    assert_eq!(into(names::EFFECT), element_name("pre"));
+    assert_eq!(into(&element_name("post")), names::EFFECT);
+    let trace = trace_output(&mut output);
+    let caps_events = count_caps_events(output.pipeline(), names::LOOPBACK);
+    let mut session = Session::new(output).expect("start output");
+    session
+        .switch_to(test_pattern_ingest(session.output(), 30, 30 * 30))
+        .expect("start source");
+    let (mut out_log, mut in_log) = (BusLog::default(), BusLog::default());
+    let ready = |s: &Session, name: &str| {
+        s.output().module_stage_status(name, "lift") == EffectStatus::Ready
+    };
+    assert!(
+        run_until(
+            &session,
+            &mut out_log,
+            &mut in_log,
+            Duration::from_secs(10),
+            |s| ready(s, "pre") && ready(s, "post")
+        ),
+        "{:?} {:?}; {out_log:?} {in_log:?}",
+        session.output().module_stats("pre"),
+        session.output().module_stats("post")
+    );
+    let len = || trace.lock().unwrap().centre_luma.len();
+    let last = |n: usize| -> Vec<u8> {
+        let t = trace.lock().unwrap();
+        t.centre_luma[t.centre_luma.len() - n..]
+            .iter()
+            .map(|(_, v)| *v)
+            .collect()
+    };
+    let wait_frames = |session: &Session, out_log: &mut BusLog, in_log: &mut BusLog, n: usize| {
+        let from = len();
+        assert!(run_until(
+            session,
+            out_log,
+            in_log,
+            Duration::from_secs(10),
+            |_| len() >= from + n
+        ));
+    };
+    wait_frames(&session, &mut out_log, &mut in_log, 10);
+    assert!(last(5).iter().all(|v| *v == 130), "{:?}", last(10));
+    let all: Vec<u8> = trace
+        .lock()
+        .unwrap()
+        .centre_luma
+        .iter()
+        .map(|(_, v)| *v)
+        .collect();
+    assert!(
+        all.iter().all(|v| [235, 120, 130].contains(v)),
+        "only the source and the lifts: {all:?}"
+    );
+    assert!(
+        all.contains(&120),
+        "the earlier lift alone while the later loads"
+    );
+
+    let post_on = session.output().module_stats("post").unwrap();
+    assert_eq!(post_on.kind, Some(obc_pipeline::module::FrameKind::Cuda));
+    assert!(post_on.frames_processed > 5 && post_on.frames_converted == 0);
+    // The later element off: the earlier one shows at once.
+    session
+        .output()
+        .set_module_stages("post", &[StageRequest::new(StageId::new("lift").unwrap())])
+        .unwrap();
+    wait_frames(&session, &mut out_log, &mut in_log, 10);
+    assert!(last(5).iter().all(|v| *v == 120), "{:?}", last(10));
+
+    let pre = session.output().module_stats("pre").unwrap();
+    let post = session.output().module_stats("post").unwrap();
+    session.stop().expect("teardown");
+    assert!(
+        out_log.errors.is_empty() && in_log.errors.is_empty(),
+        "{out_log:?} {in_log:?}"
+    );
+    eprintln!("{pre:?}\n{post:?}");
+    assert_eq!(pre.kind, Some(obc_pipeline::module::FrameKind::Host));
+    assert!(pre.frames_converted > 10 && pre.cuda_active);
+    assert_eq!(post.kind, None, "unloaded once off");
+    assert!(post.frames_passthrough >= 10);
+    assert_eq!(caps_events.load(Ordering::Relaxed), 1, "one negotiation");
+    assert_eq!(FakeChainLog::get(&host.log.unloads), 1);
+    assert_eq!(FakeChainLog::get(&cuda.log.unloads), 1);
+    assert_eq!(FakeChainLog::get(&cuda.log.misuse), 0);
+}
+
 /// `nvidia-smi`'s compute processes with their used memory in MiB.
 fn cuda_apps() -> Vec<(u32, u64)> {
     let out = std::process::Command::new("nvidia-smi")
@@ -3262,7 +3413,10 @@ fn cuda_apps() -> Vec<(u32, u64)> {
 fn maxine_effects_end_to_end_keep_the_rate_and_release_the_gpu() {
     init();
     let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
-    if let Err(reason) = obc_pipeline::effect_backend_available() {
+    let maxine = EffectBackend::new(std::sync::Arc::new(
+        obc_backend_maxine::MaxineFactory::from_env(),
+    ));
+    if let Err(reason) = obc_pipeline::effect_backend_available_with(maxine.factory().as_ref()) {
         panic!(
             "this test needs the Maxine SDK: {reason} (load the environment of the \
              maxine-vfx-sdk-local package: set -a; . /usr/share/maxine-vfx/maxine-vfx.env; \
@@ -3281,6 +3435,7 @@ fn maxine_effects_end_to_end_keep_the_rate_and_release_the_gpu() {
     let contract = OutputContract::default();
     let mut cfg = OutputConfig::new(contract, OutputSink::Fake);
     cfg.effect = Some(EffectSettings::of(EffectKind::Blur));
+    cfg.effect_backend = Some(maxine);
     let output = Output::build(cfg).expect("build output");
     let arrivals = record_arrival_times(output.pipeline(), names::LOOPBACK);
     let caps_events = count_caps_events(output.pipeline(), names::LOOPBACK);

@@ -149,6 +149,7 @@ impl Rig {
             state: dir.path().join("state.toml"),
             cache: Some(dir.path().join("cache")),
             runtime: Some(dir.path().join("run")),
+            ledger: None,
         };
         fs::create_dir(dir.path().join("run")).unwrap();
         fs::write(&paths.config, config).unwrap();
@@ -386,11 +387,13 @@ async fn every_property_reads_through_the_proxy() {
             }),
             settings_revision: Some(1),
             settings_schema_serial: Some(1),
+            modules_serial: Some(1),
+            backend_profile: Some("quality".into()),
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 8);
-    // GetAll returns the same nineteen properties.
+    assert_eq!(INTERFACE_REVISION, 9);
+    // GetAll returns the same twenty-one properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
         .destination(obc_ipc::BUS_NAME)
         .path(OBJECT_PATH)
@@ -409,6 +412,7 @@ async fn every_property_reads_through_the_proxy() {
         keys,
         [
             "ActiveCamera",
+            "BackendProfile",
             "BackgroundImage",
             "BlurStrength",
             "CameraControls",
@@ -420,6 +424,7 @@ async fn every_property_reads_through_the_proxy() {
             "Error",
             "InterfaceRevision",
             "LoopbackConsumers",
+            "ModulesSerial",
             "OutputMode",
             "PipeWireConsumers",
             "PipeWireOutput",
@@ -870,7 +875,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 8);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 9);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -896,7 +901,10 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
         .collect();
     assert_eq!(denoise, ["Denoise=true", "Denoise=false"]);
     let state = fs::read_to_string(&rig.paths.state).unwrap();
-    assert!(state.contains("denoise = false"), "{state}");
+    assert!(
+        state.contains("\"effect.video.denoise\" = false"),
+        "{state}"
+    );
 
     // While active: the stage fails; the session streams on, the state
     // stays active, and Error says why. Switching it off clears it.
@@ -928,7 +936,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 8);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 9);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -1044,7 +1052,7 @@ async fn preview_leases_by_bus_name_their_property_and_their_frames() {
     let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 8);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 9);
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
     let seen = rig.record_changes().await;
     let mut frames = proxy.receive_preview_frame().await.unwrap();
@@ -1834,4 +1842,63 @@ async fn settings_methods_their_signal_their_properties_and_their_errors() {
     }
     let e = limited.expect("rate limited within 400 calls");
     assert_eq!(zbus::DBusError::name(&e).to_string(), name("RateLimited"));
+}
+
+/// The members of revision 9 over the bus: the module list, an invalid
+/// order refused with its reason, the profile property and its change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_module_members_over_the_bus() {
+    let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    let list = within("GetModules", proxy.module_list()).await.unwrap();
+    assert_eq!(list.serial, proxy.modules_serial().await.unwrap());
+    assert_eq!(list.modules[0].id, crate::modules::MAXINE_MODULE);
+    assert_eq!(
+        within("GetStageOrder", proxy.get_stage_order())
+            .await
+            .unwrap(),
+        ["enhance", "denoise", "background", "relight"]
+    );
+    let e = within(
+        "SetStageOrder",
+        proxy.set_stage_order(&["relight", "enhance", "denoise", "background"]),
+    )
+    .await
+    .unwrap_err();
+    match e {
+        IpcError::InvalidArgument(m) => {
+            assert!(m.contains("relight needs a matte stage before it"), "{m}")
+        }
+        other => panic!("{other:?}"),
+    }
+    within("SetStageOrder", proxy.set_stage_order(&[]))
+        .await
+        .unwrap();
+    let seen = rig.record_changes().await;
+    within("SetBackendProfile", proxy.set_backend_profile("battery"))
+        .await
+        .unwrap();
+    assert_eq!(proxy.backend_profile().await.unwrap(), "battery");
+    until("BackendProfile changed", &seen, |s| {
+        s.iter().any(|e| e == "BackendProfile=battery")
+    })
+    .await;
+    let e = within(
+        "SetStagePin",
+        proxy.set_stage_pin("background", "org.x.none"),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(e, IpcError::InvalidArgument(_)), "{e:?}");
+    within(
+        "SetModuleEnabled",
+        proxy.set_module_enabled(crate::modules::MAXINE_MODULE, false),
+    )
+    .await
+    .unwrap();
+    until("ModulesSerial changed", &seen, |s| {
+        s.iter().any(|e| e.starts_with("ModulesSerial="))
+    })
+    .await;
 }

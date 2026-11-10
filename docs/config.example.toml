@@ -213,6 +213,8 @@ on_failure = "black"
 # the SDK are installed (noise removal, relighting, enhance) is read from the
 # files under this root and, for the models, the GPU's compute capability,
 # which the daemon keeps in $XDG_CACHE_HOME/omarchy-broadcast/.
+# The key is handed to the Maxine module as its sdk_root, unless the
+# module's own table ([module."br.com.dias.maxine-vfx"], below) sets one.
 # Default: unset. Example:
 # maxine_root = "/home/user/.local/opt/maxine/VideoFX"
 
@@ -247,3 +249,58 @@ enabled = false
 # restarted for this key.
 # Default: true
 offer_nv12 = true
+
+[modules]
+# The effects come from modules: a manifest (<name>.toml) in a modules.d
+# directory, naming a library the daemon loads. The directories are read in
+# this order, a later one overriding an earlier one by module id:
+# /usr/lib/omarchy-broadcast/modules.d (packaged modules),
+# $XDG_DATA_HOME/omarchy-broadcast/modules.d (default
+# ~/.local/share/omarchy-broadcast/modules.d, your own), the directories
+# below, then those of the OBC_MODULE_PATH environment variable
+# (colon-separated). With no module the camera image passes through and no
+# effect setting is offered. A module that cannot load (a missing library,
+# another module interface version, a broken manifest) is listed by
+# `omarchy-broadcast modules` with the reason and offers nothing; the daemon
+# runs on. Module changes take effect on reload (the modules are found and
+# opened again) and apply to the camera the next time it starts.
+
+# More manifest directories: absolute paths.
+# Default: none. Example:
+# dirs = ["/home/user/omarchy-modules"]
+
+# Modules not to load, by module id. `omarchy-broadcast modules enable|disable`
+# overrides this at run time (kept in the state file). A module that took the
+# daemon down twice in a row is disabled until it is enabled again.
+# Default: none. Example:
+# disabled = ["org.example.hello"]
+
+# The order of the effect stages, by stage id: every stage the enabled modules
+# offer, once each, within the limits each declares (a stage that needs the
+# cut-out after it, for example). Unset: by slot (before the cut-out, the
+# cut-out, after it, after the composite), then each stage's preferred
+# position. An order that does not fit the modules found is replaced by the
+# default one, with a warning. `omarchy-broadcast order set` overrides it.
+# Default: unset. Example:
+# order = ["enhance", "denoise", "background", "relight"]
+
+# Which module provides a stage that several offer: "quality" (the highest
+# rank) or "battery" (an NPU first, then the CPU, then a GPU). The choice is
+# made when the camera starts and never changes while it runs.
+# `omarchy-broadcast modules profile` overrides it.
+# Default: "quality"
+# profile = "quality"
+
+# The module that provides a stage, by stage id, whatever the profile says,
+# while it can (otherwise the profile decides, and the module list says why).
+# `omarchy-broadcast modules pin` overrides it.
+# Default: none. Example:
+# pin = { background = "br.com.dias.maxine-vfx" }
+
+# Each module's own configuration: a table named after its module id, handed
+# to the module as it is when it loads (the daemon checks only the id). A
+# module that refuses its table is unavailable, with the reason. The Maxine
+# module takes sdk_root, the SDK directory (see [effect] maxine_root).
+# Example:
+#   [module."br.com.dias.maxine-vfx"]
+#   sdk_root = "/home/user/.local/opt/maxine/VideoFX"

@@ -25,7 +25,7 @@
 //! right of the picture. (These were measured on the effect, which does not
 //! document its conventions.)
 
-use obc_backend::RelightLight;
+use crate::RelightLight;
 
 /// The width of every environment map, in pixels.
 pub const WIDTH: u32 = 512;

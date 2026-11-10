@@ -30,7 +30,7 @@
 //! enough for it to pay, uploaded as NV12 or I420 ([`enhance_plan`]),
 //! `obcenhance` (`gst_obc::enhance`)
 //! upscales the kept region by the integer factor `k` with an enhancer
-//! (Maxine video super resolution by default, [`EnhanceBackend`]) before
+//! (the one [`IngestConfig::enhance_backend`] gives, [`EnhanceBackend`]) before
 //! `cudaconvertscale` fits it to the output as it fits any frame. The
 //! element sits after `videocrop`, so it reads the crop region and enhances
 //! only what is shown; and since the stage changes the caps between the
@@ -74,7 +74,6 @@ use std::sync::{Arc, Mutex};
 use gst::prelude::*;
 use gst_obc::{EffectStatus, EnhanceStats, ObcEnhance};
 use obc_backend::enhance::{EnhancerFactory, MAX_SCALE, MIN_SCALE};
-use obc_backend_maxine::vsr::MaxineVsrFactory;
 use obc_core::{AspectPolicy, OutputContract, VideoMode};
 
 use crate::capability::IngestPath;
@@ -96,19 +95,14 @@ pub fn cuda_context_object(ctx: &gst::Context) -> Option<gst::Object> {
     ctx.structure().get::<gst::Object>(CUDA_CONTEXT_TYPE).ok()
 }
 
-/// The enhancer an ingest's enhance stage creates its instance with.
-/// [`EnhanceBackend::default`] is Maxine video super resolution with the
-/// SDK root in force when it is made, as for the effects
-/// ([`crate::effect::EffectBackend`]). Tests inject another factory.
+/// The enhancer an ingest's enhance stage creates its instance with: a
+/// factory the caller provides (the daemon's comes from the module that
+/// provides the `enhance` stage). There is no default: an ingest without
+/// one has no enhance stage.
 #[derive(Clone)]
 pub struct EnhanceBackend(pub Arc<dyn EnhancerFactory>);
 
 impl EnhanceBackend {
-    /// Maxine video super resolution with the SDK root in force now.
-    pub fn maxine() -> Self {
-        EnhanceBackend(Arc::new(MaxineVsrFactory::from_env()))
-    }
-
     /// Any factory.
     pub fn new(factory: Arc<dyn EnhancerFactory>) -> Self {
         EnhanceBackend(factory)
@@ -117,12 +111,6 @@ impl EnhanceBackend {
     /// The factory.
     pub fn factory(&self) -> &Arc<dyn EnhancerFactory> {
         &self.0
-    }
-}
-
-impl Default for EnhanceBackend {
-    fn default() -> Self {
-        EnhanceBackend::maxine()
     }
 }
 
@@ -240,7 +228,8 @@ pub struct IngestConfig {
     /// Enhance a mode smaller than the output (see the module docs); no
     /// effect when [`Self::enhance_scale`] is `None`.
     pub enhance: bool,
-    /// The enhancer of the enhance stage; `None`: [`EnhanceBackend::default`].
+    /// The enhancer of the enhance stage; `None`: no enhance stage, whatever
+    /// [`Self::enhance`] says.
     pub enhance_backend: Option<EnhanceBackend>,
 }
 
@@ -482,9 +471,7 @@ impl Ingest {
             &cfg.camera_io_mode,
             cfg.queue_buffers,
         )?;
-        let enhance = cfg
-            .enhance
-            .then(|| cfg.enhance_backend.clone().unwrap_or_default());
+        let enhance = cfg.enhance.then(|| cfg.enhance_backend.clone()).flatten();
         let mut ingest = Self::from_head_enhanced(
             head,
             path.upload_format(cfg.mode.format),
@@ -758,6 +745,13 @@ mod tests {
     use super::*;
     use crate::slot::Slot;
     use crate::test_support::require_elements;
+
+    /// The Maxine upscaler, which the tests run as a module would.
+    fn maxine_vsr() -> EnhanceBackend {
+        EnhanceBackend::new(Arc::new(
+            obc_backend_maxine::vsr::MaxineVsrFactory::from_env(),
+        ))
+    }
 
     fn writer(contract: &OutputContract) -> FrameWriter {
         FrameWriter::new(
@@ -1128,7 +1122,7 @@ mod tests {
                 "NV12",
                 size,
                 AspectPolicy::Crop,
-                Some(EnhanceBackend::maxine()),
+                Some(maxine_vsr()),
                 writer(&contract).in_memory(FrameMemory::System),
             )
         };
@@ -1138,7 +1132,7 @@ mod tests {
         assert_eq!(p.enhance_scale(), None);
         assert_eq!(p.enhance_status(), None);
         assert_eq!(
-            format!("{:?}", EnhanceBackend::maxine()),
+            format!("{:?}", maxine_vsr()),
             "EnhanceBackend(\"maxine-vsr\")"
         );
     }
@@ -1192,7 +1186,7 @@ mod tests {
 
         fn maxine(faults: &EnhanceFaultSwitch) -> EnhanceBackend {
             EnhanceBackend::new(Arc::new(
-                MaxineVsrFactory::from_env().with_faults(faults.clone()),
+                obc_backend_maxine::vsr::MaxineVsrFactory::from_env().with_faults(faults.clone()),
             ))
         }
 

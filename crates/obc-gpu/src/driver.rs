@@ -108,6 +108,8 @@ pub struct Driver {
     pub(crate) cuMemAllocPitch_v2:
         unsafe extern "C" fn(*mut CuDevicePtr, *mut usize, usize, usize, u32) -> CuResult,
     pub(crate) cuMemFree_v2: unsafe extern "C" fn(CuDevicePtr) -> CuResult,
+    pub(crate) cuMemAllocHost_v2: unsafe extern "C" fn(*mut *mut c_void, usize) -> CuResult,
+    pub(crate) cuMemFreeHost: unsafe extern "C" fn(*mut c_void) -> CuResult,
     pub(crate) cuMemsetD2D8Async:
         unsafe extern "C" fn(CuDevicePtr, usize, u8, usize, usize, CuStream) -> CuResult,
     pub(crate) cuMemcpy2D_v2: unsafe extern "C" fn(*const Memcpy2d) -> CuResult,
@@ -212,6 +214,8 @@ impl Driver {
                 cuMemGetInfo_v2: sym(&lib, "cuMemGetInfo_v2")?,
                 cuMemAllocPitch_v2: sym(&lib, "cuMemAllocPitch_v2")?,
                 cuMemFree_v2: sym(&lib, "cuMemFree_v2")?,
+                cuMemAllocHost_v2: sym(&lib, "cuMemAllocHost_v2")?,
+                cuMemFreeHost: sym(&lib, "cuMemFreeHost")?,
                 cuMemsetD2D8Async: sym(&lib, "cuMemsetD2D8Async")?,
                 cuMemcpy2D_v2: sym(&lib, "cuMemcpy2D_v2")?,
                 cuMemcpy2DAsync_v2: sym(&lib, "cuMemcpy2DAsync_v2")?,

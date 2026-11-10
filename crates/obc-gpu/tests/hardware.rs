@@ -15,9 +15,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use obc_backend::ColourSpec;
 use obc_gpu::{
     ContextGuard, DeviceBuffer, DeviceNv12Buffer, Event, GpuError, Lut8, NothingToPark,
-    OwnedContext, ParkOutcome, ProcessState, Stream, UnparkOutcome, copy_nv12_async,
-    current_context, download_2d, mem_get_info, memset_2d_async, park, parked, parked_refusals,
-    primary_context_active, process_state, stream_synchronize, unpark,
+    OwnedContext, ParkOutcome, PinnedHostBuffer, ProcessState, Stream, UnparkOutcome,
+    copy_nv12_async, current_context, download_2d, download_nv12_async, mem_get_info,
+    memset_2d_async, park, parked, parked_refusals, primary_context_active, process_state,
+    stream_synchronize, unpark, upload_nv12_async,
 };
 
 const W: u32 = 64;
@@ -190,6 +191,62 @@ fn in_created_context(f: impl FnOnce(&Stream)) {
     }
     drop(ctx);
     assert!(!primary_context_active(0).unwrap());
+}
+
+/// A frame downloaded into page-locked memory, changed on the host and
+/// uploaded back, all ordered on one stream, comes back as written; a
+/// page-locked buffer too small for a frame is refused.
+#[test]
+#[ignore = "needs an NVIDIA GPU"]
+fn gpu_pinned_host_copies_round_trip_on_a_stream() {
+    in_created_context(|stream| {
+        let dev = DeviceNv12Buffer::alloc(W, H).unwrap();
+        let mut packed = vec![0u8; (W * H * 3 / 2) as usize];
+        for (i, b) in packed.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        dev.upload_packed(&packed).unwrap();
+        let pitch = W as usize + 32;
+        let mut pinned = PinnedHostBuffer::alloc(pitch * (H as usize * 3 / 2)).unwrap();
+        assert!(
+            pinned.nv12(W, H, pitch - 64).is_err(),
+            "pitch below the width"
+        );
+        assert!(pinned.nv12(W, H * 2, pitch).is_err(), "too small");
+        let host = pinned.nv12(W, H, pitch).unwrap();
+        // SAFETY: our own frames of this context, synchronised below.
+        unsafe {
+            download_nv12_async(&dev.frame(), &host, stream.raw()).unwrap();
+            stream_synchronize(stream.raw()).unwrap();
+        }
+        let bytes = pinned.as_slice().to_vec();
+        let (w, h) = (W as usize, H as usize);
+        for r in 0..h {
+            assert_eq!(
+                &bytes[r * pitch..r * pitch + w],
+                &packed[r * w..(r + 1) * w]
+            );
+        }
+        for r in 0..h / 2 {
+            let at = (h + r) * pitch;
+            assert_eq!(&bytes[at..at + w], &packed[(h + r) * w..(h + r + 1) * w]);
+        }
+        let buf = pinned.as_mut_slice();
+        for r in 0..h + h / 2 {
+            buf[r * pitch..r * pitch + w].fill(7);
+        }
+        let host = pinned.nv12(W, H, pitch).unwrap();
+        // SAFETY: as above.
+        unsafe {
+            upload_nv12_async(&host, &dev.frame(), stream.raw()).unwrap();
+            stream_synchronize(stream.raw()).unwrap();
+        }
+        assert!(dev.download_packed().unwrap().iter().all(|b| *b == 7));
+        let small = DeviceNv12Buffer::alloc(W / 2, H).unwrap();
+        // SAFETY: refused before any copy.
+        let e = unsafe { download_nv12_async(&small.frame(), &host, stream.raw()) }.unwrap_err();
+        assert!(matches!(e, GpuError::InvalidArgument(_)), "{e}");
+    });
 }
 
 #[test]

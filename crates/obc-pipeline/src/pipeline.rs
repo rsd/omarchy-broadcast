@@ -129,6 +129,10 @@ pub enum PipelineError {
     /// effect element (`docs/adr/0012-video-effects-and-maxine-backend.md`).
     #[error("effect: {0}")]
     Effect(String),
+    /// Module stages that cannot be built or applied, or an output that
+    /// has no element for them (`crate::module`).
+    #[error("module stage: {0}")]
+    Module(String),
     #[error("camera control on {device}: {message}")]
     Control { device: String, message: String },
     #[error("invalid {property} {value:?} for {factory} (valid: {valid})")]

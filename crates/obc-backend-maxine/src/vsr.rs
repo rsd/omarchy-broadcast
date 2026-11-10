@@ -13,7 +13,7 @@
 //!
 //! The effect ships no model files and takes no model directory: the
 //! feature library is the whole feature
-//! ([`Feature::VideoSuperResolution`](obc_backend::Feature)). The SDK is
+//! ([`Feature::VideoSuperResolution`](crate::Feature)). The SDK is
 //! found and opened exactly as for the effects ([`MaxineFactory`]): one SDK
 //! per process, loaded from the same root.
 

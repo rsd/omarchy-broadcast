@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use obc_core::config::EffectConfig;
 use obc_core::{EffectMode, ModeRequest, OutputContract, SinkSelector};
 use obc_gpu::{GpuError, NothingToPark, ParkError, ParkOutcome, UnparkOutcome};
 use obc_ipc::Stats;
@@ -15,13 +14,14 @@ use obc_pipeline::controls::{
     CTRL_FLAG_INACTIVE, CTRL_TYPE_BOOLEAN, CTRL_TYPE_BUTTON, CTRL_TYPE_INTEGER, CTRL_TYPE_MENU,
     CtrlInfo, DeviceControl, image_control_id,
 };
-use obc_pipeline::effect::{Availability, Feature};
+use obc_pipeline::effect::{Availability, StageId};
 use obc_pipeline::xu::{FIELD_OF_VIEW, XuRow, XuState};
 
 use super::park::{ParkOps, Parker, StartError, StopFailure, StopSession};
 use super::{
-    ControlNode, ControlScan, EffectReport, EffectStatus, Failure, MediaBackend,
-    PipeWireGeneration, PreviewRequest, SessionParams, WatchGeneration,
+    Backends, ControlNode, ControlScan, EffectReport, EffectRun, EffectStatus, Failure,
+    MediaBackend, Module, ModuleEntry, OpenedModule, PipeWireGeneration, PreviewRequest,
+    SessionParams, WatchGeneration,
 };
 use crate::camera::Camera;
 use crate::log::Level;
@@ -213,19 +213,32 @@ pub struct World {
     /// What `effect_report` reports for the relighting stage.
     pub relight_status: EffectStatus,
     /// The effect the running session applies.
-    pub effect: Option<EffectConfig>,
+    pub effect: Option<EffectRun>,
     /// Every `set_effect` on a running session, in order.
-    pub effect_sets: Vec<EffectConfig>,
+    pub effect_sets: Vec<EffectRun>,
+    /// What `effect_report` reports for the other stages (a module's), by
+    /// id; a stage applied on is `Ready` unless set here.
+    pub stage_status: std::collections::BTreeMap<String, EffectStatus>,
+    /// The fake Maxine module is installed (the default): its manifest and
+    /// settings are the real module's, its probe [`World::features`].
+    pub maxine: bool,
+    /// More modules, each with what opening it gives.
+    pub modules: Vec<(ModuleEntry, Result<OpenedModule, String>)>,
+    /// The modules of the directories are discovered and opened for real
+    /// (`obc-module-host`), after the fake ones.
+    pub real_modules: bool,
+    /// Every module opened, with its configuration, in order.
+    pub module_opens: Vec<(String, serde_json::Value)>,
     /// `set_effect` fails with this (once).
     pub fail_set_effect: Option<String>,
-    /// What `feature_availability` reports without a compute capability
-    /// (`None`: no root, nothing known, as before revision 8).
-    pub features: Option<Vec<(Feature, Availability)>>,
+    /// What the fake Maxine module's probe reports without a compute
+    /// capability (`None`: no root, nothing known: every stage offered).
+    pub features: Option<Vec<(StageId, Availability)>>,
     /// What it reports with one, when set (else [`World::features`]): the
     /// models of another GPU.
-    pub features_with_cc: Option<Vec<(Feature, Availability)>>,
-    /// The compute capability of every `feature_availability` call, in
-    /// order.
+    pub features_with_cc: Option<Vec<(StageId, Availability)>>,
+    /// The compute capability of every probe of the fake Maxine module (at
+    /// its opening and after), in order.
     pub feature_probes: Vec<Option<(u32, u32)>>,
     /// What `compute_capability` reports while a session runs.
     pub compute_capability: Option<(u32, u32)>,
@@ -360,6 +373,11 @@ impl Default for World {
             relight_status: EffectStatus::Off,
             effect: None,
             effect_sets: Vec::new(),
+            stage_status: std::collections::BTreeMap::new(),
+            maxine: true,
+            modules: Vec::new(),
+            real_modules: false,
+            module_opens: Vec::new(),
             fail_set_effect: None,
             features: None,
             features_with_cc: None,
@@ -453,6 +471,38 @@ impl ParkOps for WorldGpu {
 }
 
 impl World {
+    /// The fake Maxine module's probe with compute capability `cc`: what
+    /// [`World::features`] (or [`World::features_with_cc`]) says, every
+    /// other stage available.
+    fn maxine_probe(&mut self, cc: Option<(u32, u32)>) -> Vec<(StageId, Availability)> {
+        self.feature_probes.push(cc);
+        let found = match (&self.features_with_cc, cc) {
+            (Some(f), Some(_)) => Some(f.clone()),
+            _ => self.features.clone(),
+        };
+        [
+            StageId::ENHANCE,
+            StageId::DENOISE,
+            StageId::BACKGROUND,
+            StageId::RELIGHT,
+        ]
+        .into_iter()
+        .map(|s| {
+            // As the module reports it: the detail goes to its log.
+            let a = match found
+                .as_ref()
+                .and_then(|f| f.iter().find(|(id, _)| *id == s).map(|(_, a)| a.clone()))
+            {
+                Some(Availability::NotInstalled(_)) => {
+                    Availability::NotInstalled("Not installed".into())
+                }
+                _ => Availability::Installed,
+            };
+            (s, a)
+        })
+        .collect()
+    }
+
     /// Stops the running PipeWire output, if any.
     fn stop_pipewire(&mut self) {
         if self.pipewire.take().is_some() {
@@ -476,7 +526,7 @@ impl World {
     /// `none` is off at once, an effect loads (or fails); noise removal
     /// and relighting, apart, are each off unless requested, else ready
     /// (or fail, themselves or with the whole chain).
-    fn apply_effect(&mut self, effect: &EffectConfig) {
+    fn apply_effect(&mut self, effect: &EffectRun) {
         let stage = |on: bool, fail: &Option<String>| {
             if !on {
                 EffectStatus::Off
@@ -486,8 +536,8 @@ impl World {
                 EffectStatus::Ready
             }
         };
-        self.denoise_status = stage(effect.denoise, &self.denoise_fail);
-        self.relight_status = stage(effect.relight, &self.relight_fail);
+        self.denoise_status = stage(effect.denoise(), &self.denoise_fail);
+        self.relight_status = stage(effect.relight(), &self.relight_fail);
         self.effect = Some(effect.clone());
         self.effect_status = if effect.mode == EffectMode::None {
             EffectStatus::Off
@@ -765,7 +815,7 @@ impl MediaBackend for FakeBackend {
         w.stats
     }
 
-    fn effect_available(&mut self, effect: &EffectConfig) -> Result<(), String> {
+    fn effect_available(&mut self, effect: &EffectRun, _: &Backends) -> Result<(), String> {
         let mut w = self.world();
         w.effect_probes += 1;
         match &w.effect_unavailable {
@@ -774,7 +824,7 @@ impl MediaBackend for FakeBackend {
         }
     }
 
-    fn set_effect(&mut self, effect: &EffectConfig) -> Result<(), String> {
+    fn set_effect(&mut self, effect: &EffectRun) -> Result<(), String> {
         let mut w = self.world();
         if w.session.is_none() {
             return Ok(());
@@ -790,10 +840,30 @@ impl MediaBackend for FakeBackend {
     fn effect_report(&mut self) -> Option<EffectReport> {
         let w = self.world();
         w.session.as_ref()?;
+        let stages = w
+            .effect
+            .iter()
+            .flat_map(|e| {
+                e.stages
+                    .iter()
+                    .chain(e.chains.iter().flat_map(|c| c.stages.iter()))
+            })
+            .map(|s| {
+                let status = match s.id.as_str() {
+                    "denoise" => w.denoise_status.clone(),
+                    "relight" => w.relight_status.clone(),
+                    other => match (s.enabled, w.stage_status.get(other)) {
+                        (false, _) => EffectStatus::Off,
+                        (true, Some(st)) => st.clone(),
+                        (true, None) => EffectStatus::Ready,
+                    },
+                };
+                (s.id.clone(), status)
+            })
+            .collect();
         Some(EffectReport {
             status: w.effect_status.clone(),
-            denoise: w.denoise_status.clone(),
-            relight: w.relight_status.clone(),
+            stages,
             enhance: w.enhance_status.clone(),
             load_ms: Some(120.0),
             reused: false,
@@ -801,17 +871,74 @@ impl MediaBackend for FakeBackend {
         })
     }
 
-    fn feature_availability(
+    fn discover_modules(&mut self, dirs: &[PathBuf]) -> Vec<ModuleEntry> {
+        let w = self.world();
+        let mut entries: Vec<ModuleEntry> = Vec::new();
+        if w.maxine {
+            entries.push(crate::modules::testing::maxine_entry());
+        }
+        entries.extend(w.modules.iter().map(|(e, _)| e.clone()));
+        if w.real_modules {
+            entries.extend(obc_module_host::scan(dirs).entries);
+        }
+        entries
+    }
+
+    fn open_module(
         &mut self,
-        compute_capability: Option<(u32, u32)>,
-    ) -> Option<(PathBuf, Vec<(Feature, Availability)>)> {
+        entry: &ModuleEntry,
+        config: &serde_json::Value,
+    ) -> Result<OpenedModule, String> {
         let mut w = self.world();
-        w.feature_probes.push(compute_capability);
-        let found = match (&w.features_with_cc, compute_capability) {
-            (Some(f), Some(_)) => Some(f.clone()),
-            _ => w.features.clone(),
-        };
-        found.map(|f| (PathBuf::from("/opt/fake/maxine"), f))
+        w.module_opens.push((entry.id.clone(), config.clone()));
+        if w.maxine && entry.id == crate::modules::MAXINE_MODULE {
+            let cc = config["_host"]["compute_capability"]
+                .as_array()
+                .and_then(|a| Some((a.first()?.as_u64()? as u32, a.get(1)?.as_u64()? as u32)));
+            return Ok(OpenedModule {
+                module: None,
+                stages: w.maxine_probe(cc),
+                settings: crate::modules::testing::maxine_settings(),
+            });
+        }
+        if let Some((_, opened)) = w.modules.iter().find(|(e, _)| e.id == entry.id) {
+            return opened.clone();
+        }
+        drop(w);
+        let manifest = entry.manifest.as_ref().map_err(Clone::clone)?;
+        let module = Module::open(manifest, config, obc_module_host::stderr_log())?;
+        let stages = module.probe().map_err(|e| e.message)?;
+        let settings = module.settings().map_err(|e| e.message)?;
+        Ok(OpenedModule {
+            module: Some(module),
+            stages,
+            settings,
+        })
+    }
+
+    fn probe_module(
+        &mut self,
+        id: &str,
+        module: Option<&Module>,
+    ) -> Result<Vec<(StageId, Availability)>, String> {
+        let mut w = self.world();
+        if w.maxine && id == crate::modules::MAXINE_MODULE {
+            let cc = w
+                .module_opens
+                .iter()
+                .rev()
+                .find(|(m, _)| m == id)
+                .and_then(|(_, c)| c["_host"]["compute_capability"].as_array().cloned())
+                .and_then(|a| Some((a.first()?.as_u64()? as u32, a.get(1)?.as_u64()? as u32)));
+            return Ok(w.maxine_probe(cc));
+        }
+        if let Some((_, opened)) = w.modules.iter().find(|(e, _)| e.id == id) {
+            return opened.clone().map(|o| o.stages);
+        }
+        match module {
+            Some(m) => m.probe().map_err(|e| e.message),
+            None => Err("the module is not loaded".into()),
+        }
     }
 
     fn compute_capability(&mut self) -> Option<(u32, u32)> {
@@ -1218,5 +1345,68 @@ pub fn brio_device() -> FakeDevice {
             changes_format: None,
         }),
         ..FakeDevice::default()
+    }
+}
+
+/// The stages of the fake Maxine module as a test reads them (what the
+/// settings of revision 8 were): switches and parameters by stage id.
+impl EffectRun {
+    fn stage_param(&self, stage: &str, key: &str) -> Option<obc_pipeline::effect::Value> {
+        let s = self.stage(stage)?;
+        s.params.get(key).or_else(|| s.live.get(key)).cloned()
+    }
+
+    fn stage_mut(&mut self, id: &str) -> &mut super::StageRun {
+        self.stages
+            .iter_mut()
+            .chain(self.chains.iter_mut().flat_map(|c| c.stages.iter_mut()))
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("no stage {id}"))
+    }
+
+    /// Turns stage `id` on or off, as a test expects it.
+    pub fn set_enabled(&mut self, id: &str, on: bool) {
+        self.stage_mut(id).enabled = on;
+    }
+
+    /// Sets the load-time parameter `key` of `stage`, as a test expects it.
+    pub fn set_param(&mut self, stage: &str, key: &str, value: &str) {
+        self.stage_mut(stage)
+            .params
+            .insert(key.into(), obc_pipeline::effect::Value::from(value));
+    }
+
+    /// Noise removal requested.
+    pub fn denoise(&self) -> bool {
+        self.stage("denoise").is_some_and(|s| s.enabled)
+    }
+
+    /// Relighting requested.
+    pub fn relight(&self) -> bool {
+        self.stage("relight").is_some_and(|s| s.enabled)
+    }
+
+    /// The relighting light.
+    pub fn relight_light(&self) -> obc_core::RelightLight {
+        match self.stage_param("relight", "light") {
+            Some(obc_pipeline::effect::Value::Str(s)) => s.parse().unwrap(),
+            other => panic!("no relighting light: {other:?}"),
+        }
+    }
+
+    /// The relighting direction, in degrees.
+    pub fn relight_direction(&self) -> i32 {
+        match self.stage_param("relight", "direction") {
+            Some(obc_pipeline::effect::Value::Int(i)) => i as i32,
+            other => panic!("no relighting direction: {other:?}"),
+        }
+    }
+
+    /// The relighting brightness, in percent.
+    pub fn relight_brightness(&self) -> u32 {
+        match self.stage_param("relight", "brightness") {
+            Some(obc_pipeline::effect::Value::Int(i)) => i as u32,
+            other => panic!("no relighting brightness: {other:?}"),
+        }
     }
 }

@@ -307,6 +307,54 @@ pub async fn settings_tree(conn: &Connection, camera: &str) -> Result<SettingsTr
         .unwrap_or_else(|_| Err(timed_out(READ_TIMEOUT)))
 }
 
+/// Fails unless a daemon of interface revision `revision` has the modules.
+pub fn require_modules(revision: u32) -> Result<(), Failure> {
+    if revision >= obc_ipc::MODULES_REVISION {
+        return Ok(());
+    }
+    Err(Failure::Unsupported(format!(
+        "the daemon does not support modules (its interface revision is {revision}, \
+         modules need {}); update omarchy-broadcastd",
+        obc_ipc::MODULES_REVISION
+    )))
+}
+
+/// Maps an error of a call made without starting the daemon.
+fn no_autostart_error(e: IpcError) -> Failure {
+    match e {
+        IpcError::ZBus(z) => classify(&z, false),
+        rejected => Failure::Rejected(rejected),
+    }
+}
+
+/// `GetModules` without starting the daemon, within [`READ_TIMEOUT`].
+pub async fn modules(conn: &Connection) -> Result<obc_ipc::ModuleList, Failure> {
+    let call = async {
+        let proxy = proxy(conn).await?;
+        proxy
+            .module_list_no_autostart()
+            .await
+            .map_err(no_autostart_error)
+    };
+    tokio::time::timeout(READ_TIMEOUT, call)
+        .await
+        .unwrap_or_else(|_| Err(timed_out(READ_TIMEOUT)))
+}
+
+/// `GetStageOrder` without starting the daemon, within [`READ_TIMEOUT`].
+pub async fn stage_order(conn: &Connection) -> Result<Vec<String>, Failure> {
+    let call = async {
+        let proxy = proxy(conn).await?;
+        proxy
+            .stage_order_no_autostart()
+            .await
+            .map_err(no_autostart_error)
+    };
+    tokio::time::timeout(READ_TIMEOUT, call)
+        .await
+        .unwrap_or_else(|_| Err(timed_out(READ_TIMEOUT)))
+}
+
 /// Connects to the session bus.
 pub async fn connect() -> Result<Connection, Failure> {
     Connection::session().await.map_err(|e| {

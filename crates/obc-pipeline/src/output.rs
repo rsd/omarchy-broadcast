@@ -4,7 +4,9 @@
 //! ```text
 //! appsrc        <canonical caps>,framerate=<contract>  is-live format=time
 //!   [ ! Process stage ]                                 crate::process
+//!   [ ! obcmodule ... ]  placed before the effect      crate::module
 //!   [ ! obceffect ]                                     crate::effect
+//!   [ ! obcmodule ... ]  placed after the effect        crate::module
 //!   [ ! cudaconvert ! capsfilter (CUDAMemory) I420 ]    contract format != NV12
 //!   ! cudadownload
 //!   ! capsfilter  <contract caps>, canonical label      system memory
@@ -72,6 +74,17 @@
 //! element unloads its backend (with the context current) before the
 //! pipeline releases the CUDA context.
 //!
+//! **Module stages.** Each entry of [`OutputConfig::module_stages`] adds
+//! one `obcmodule` element ([`crate::module`]) for the output's whole life,
+//! before or after the effect element as the entry says (where the effect
+//! element would be, without one), and [`Output::set_module_stages`]
+//! changes its stages while it streams, without renegotiating caps;
+//! [`Output::module_stage_status`] and [`Output::module_stats`] report on
+//! it, and its status changes are posted on the output pipeline's bus
+//! ([`crate::module::STATUS_MESSAGE`]). Unlike the effect element, these
+//! run on system memory too (a chain that takes host frames), and need no
+//! empty Process stage. None by default: no element, no cost.
+//!
 //! **New source.** The clock marks the first fresh frame it emits from each
 //! source (the first after a source switch, and the first of the first
 //! source) with [`gst_obc::NEW_SOURCE_FLAG`], and clears the flag on every
@@ -126,6 +139,7 @@ use crate::effect::{EffectBackend, EffectSettings, EffectStats, EffectStatus, ef
 use crate::frame::{Canonical, Frame, FrameMemory, FrameWriter};
 use crate::ingest::CUDA_CONTEXT_TYPE;
 use crate::loopback::WriterHandle;
+use crate::module::{ModulePlacement, ModuleStageSpec, ModuleStats, check_specs, module_element};
 use crate::pipeline::{
     MediaPipeline, PipelineError, StopError, add_linked, both_stopped, capsfilter, cuda_caps, make,
     names, not_null,
@@ -172,10 +186,17 @@ pub struct OutputConfig {
     /// [`Output::set_effect`]). Does not combine with
     /// [`GpuStage::Roundtrip`].
     pub effect: Option<EffectSettings>,
-    /// The backend the effect element creates its instance with (default:
-    /// Maxine, with the SDK root in force when the config is made, as
-    /// [`EffectBackend`] describes). Unused without [`Self::effect`].
-    pub effect_backend: EffectBackend,
+    /// The backend the effect element creates its instance with: none by
+    /// default, and there is no built-in one (the daemon's comes from the
+    /// module that provides the `background` stage). Without one the
+    /// element passes frames through and fails any other request with the
+    /// reason. Unused without [`Self::effect`].
+    pub effect_backend: Option<EffectBackend>,
+    /// The module stage elements ([`crate::module`]), one per entry, in
+    /// order within their placement: none by default. Their names must be
+    /// unique; on system-memory frames every factory must take host
+    /// frames.
+    pub module_stages: Vec<ModuleStageSpec>,
 }
 
 impl OutputConfig {
@@ -190,7 +211,8 @@ impl OutputConfig {
             hold_timeout: Self::DEFAULT_HOLD_TIMEOUT,
             phase_lock: PhaseLockConfig::default(),
             effect: None,
-            effect_backend: EffectBackend::default(),
+            effect_backend: None,
+            module_stages: Vec::new(),
         }
     }
 
@@ -415,6 +437,8 @@ pub struct Output {
     clock: Option<ClockThread>,
     memory: FrameMemory,
     effect: Option<gst_obc::ObcEffect>,
+    /// The module stage elements, by spec name, in pipeline order.
+    modules: Vec<(String, gst_obc::ObcModule)>,
 }
 
 impl std::fmt::Debug for Output {
@@ -424,6 +448,7 @@ impl std::fmt::Debug for Output {
             .field("sink", &self.cfg.sink)
             .field("process", &self.cfg.process)
             .field("effect", &self.cfg.effect)
+            .field("module_stages", &self.cfg.module_stages)
             .field("running", &self.clock.is_some())
             .finish_non_exhaustive()
     }
@@ -553,6 +578,7 @@ impl Output {
                 )));
             }
         }
+        check_specs(&cfg.module_stages, memory == FrameMemory::Cuda)?;
         let canonical = Canonical::of(&contract);
         let pipeline = gst::Pipeline::with_name("obc-output");
         let queue = cfg.pacer().max_burst;
@@ -567,14 +593,25 @@ impl Output {
 
         let mut chain: Vec<gst::Element> = vec![appsrc.clone().upcast()];
         chain.extend(process_elements(cfg.process, canonical.colorimetry)?);
+        let mut modules = Vec::new();
+        let mut place = |chain: &mut Vec<gst::Element>, at: ModulePlacement| {
+            for spec in cfg.module_stages.iter().filter(|s| s.placement == at) {
+                let m = module_element(spec)?;
+                chain.push(m.clone().upcast());
+                modules.push((spec.name.clone(), m));
+            }
+            Ok::<(), PipelineError>(())
+        };
+        place(&mut chain, ModulePlacement::BeforeEffect)?;
         let effect = match &cfg.effect {
             Some(settings) => {
-                let fx = effect_element(settings, &cfg.effect_backend)?;
+                let fx = effect_element(settings, cfg.effect_backend.as_ref())?;
                 chain.push(fx.clone().upcast());
                 Some(fx)
             }
             None => None,
         };
+        place(&mut chain, ModulePlacement::AfterEffect)?;
         match memory {
             FrameMemory::Cuda => {
                 if contract.format != OutputFormat::Nv12 {
@@ -654,7 +691,57 @@ impl Output {
             clock: None,
             memory,
             effect,
+            modules,
         })
+    }
+
+    fn module(&self, name: &str) -> Option<&gst_obc::ObcModule> {
+        self.modules.iter().find(|(n, _)| n == name).map(|(_, m)| m)
+    }
+
+    /// Changes the stages of the module stage element `name` while the
+    /// output runs (or before it starts): they are checked (each listed
+    /// once) and applied at once ([`gst_obc::ObcModule::apply`]); loading
+    /// happens on the element's worker, follow it with
+    /// [`Self::module_stage_status`] or the bus messages. Applying stages
+    /// after a failure retries, even unchanged. Fails for a name the output
+    /// was not built with ([`OutputConfig::module_stages`]).
+    pub fn set_module_stages(
+        &self,
+        name: &str,
+        stages: &[crate::module::StageRequest],
+    ) -> Result<(), PipelineError> {
+        let m = self.module(name).ok_or_else(|| {
+            PipelineError::Module(format!(
+                "this output was built without the module stage {name:?} \
+                 (OutputConfig::module_stages)"
+            ))
+        })?;
+        crate::module::check_stages(stages)?;
+        m.apply(stages).map_err(PipelineError::Module)
+    }
+
+    /// The names of the module stage elements, in pipeline order.
+    pub fn module_names(&self) -> Vec<String> {
+        self.modules.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// The stages of the module stage element `name` as last applied;
+    /// `None` without one.
+    pub fn module_stages(&self, name: &str) -> Option<Vec<crate::module::StageRequest>> {
+        self.module(name).map(|m| m.stages())
+    }
+
+    /// The state of stage `id` of the module stage element `name`
+    /// ([`EffectStatus::Off`] unless requested, and without that element).
+    pub fn module_stage_status(&self, name: &str, id: &str) -> EffectStatus {
+        self.module(name)
+            .map_or(EffectStatus::Off, |m| m.stage_status(id))
+    }
+
+    /// The counters of the module stage element `name`; `None` without one.
+    pub fn module_stats(&self, name: &str) -> Option<ModuleStats> {
+        self.module(name).map(|m| m.stats())
     }
 
     /// Changes the effect while the output runs (or before it starts): the
@@ -681,21 +768,12 @@ impl Output {
             .map_or(EffectStatus::Off, |fx| fx.status())
     }
 
-    /// The state of the effect element's denoise stage
-    /// ([`EffectStatus::Off`] unless requested, and without an effect
-    /// element).
-    pub fn denoise_status(&self) -> EffectStatus {
+    /// The state of the effect element's stage `id` ([`EffectStatus::Off`]
+    /// unless requested, and without an effect element).
+    pub fn stage_status(&self, id: &str) -> EffectStatus {
         self.effect
             .as_ref()
-            .map_or(EffectStatus::Off, |fx| fx.denoise_status())
-    }
-
-    /// The state of the effect element's relighting stage, as
-    /// [`Output::denoise_status`].
-    pub fn relight_status(&self) -> EffectStatus {
-        self.effect
-            .as_ref()
-            .map_or(EffectStatus::Off, |fx| fx.relight_status())
+            .map_or(EffectStatus::Off, |fx| fx.stage_status(id))
     }
 
     /// The effect element's counters and timings; `None` without one.
@@ -1227,6 +1305,7 @@ fn make_placeholder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::fake_chain::FakeChainLog as FakeLog;
     use crate::test_support::require_elements;
 
     #[test]
@@ -1797,7 +1876,7 @@ mod tests {
     fn the_default_config_has_no_effect_element() {
         let cfg = OutputConfig::new(OutputContract::default(), OutputSink::Fake);
         assert_eq!(cfg.effect, None);
-        assert_eq!(cfg.effect_backend.factory().name(), "maxine");
+        assert!(cfg.effect_backend.is_none(), "no built-in backend");
         require_elements(&["appsrc", "videoconvert", "capssetter", "fakesink"]);
         let o = Output::build_in(cfg, FrameMemory::System).unwrap();
         assert!(o.pipeline().element(names::EFFECT).is_none());
@@ -1835,6 +1914,182 @@ mod tests {
             matches!(&e, PipelineError::Effect(m) if m.contains("background")),
             "{e}"
         );
+    }
+
+    /// A system-memory output with two module stage elements, one before
+    /// the place of the effect and one after it, with the fake host chain
+    /// of gst-obc's tests: both are in the pipeline in that order, the
+    /// later one's chroma reaches the sink, a live change applies, an
+    /// element with its stage off passes frames through, and statuses
+    /// reach the getters and the bus. CPU only.
+    #[test]
+    fn module_stages_run_around_the_effect_on_system_memory() {
+        use crate::module::{ModulePlacement, ModuleStageSpec, STATUS_MESSAGE, element_name};
+        use crate::test_support::fake_chain::{FakeChainConfig, FakeChainFactory};
+        use gst_obc::{StageId, StageRequest};
+        use gst_video::prelude::*;
+        require_elements(&["appsrc", "capssetter", "fakesink"]);
+        let tint = |u: i64| StageRequest::on(StageId::new("tint").unwrap()).with_live("u", u);
+        let fake = FakeChainFactory::host(FakeChainConfig::default());
+        let contract: OutputContract = "320x240@30".parse().unwrap();
+        let mut cfg = OutputConfig::new(contract, OutputSink::Fake);
+        // Listed after-first: the placement, not the list, orders them.
+        cfg.module_stages = vec![
+            ModuleStageSpec {
+                name: "post".into(),
+                factory: fake.clone(),
+                stages: vec![tint(70)],
+                placement: ModulePlacement::AfterEffect,
+            },
+            ModuleStageSpec {
+                name: "pre".into(),
+                factory: fake.clone(),
+                stages: vec![tint(60)],
+                placement: ModulePlacement::BeforeEffect,
+            },
+        ];
+        let mut o = Output::build_in(cfg.clone(), FrameMemory::System).unwrap();
+        assert_eq!(o.module_names(), ["pre", "post"]);
+        let order: Vec<String> = {
+            let mut v = Vec::new();
+            let mut e = o.pipeline().element(names::FRAMES_SRC);
+            while let Some(el) = e {
+                v.push(el.name().to_string());
+                e = el
+                    .static_pad("src")
+                    .and_then(|p| p.peer())
+                    .and_then(|p| p.parent_element());
+            }
+            v
+        };
+        let pre = order
+            .iter()
+            .position(|n| *n == element_name("pre"))
+            .unwrap();
+        let post = order
+            .iter()
+            .position(|n| *n == element_name("post"))
+            .unwrap();
+        assert_eq!((pre, post), (1, 2), "{order:?}");
+        // The chroma of the frame centre at the sink.
+        let uv: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let u = Arc::clone(&uv);
+        let info = gst_video::VideoInfo::builder(gst_video::VideoFormat::Nv12, 320, 240)
+            .build()
+            .unwrap();
+        o.pipeline()
+            .element(names::LOOPBACK)
+            .unwrap()
+            .static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, probe| {
+                if let Some(b) = probe.buffer()
+                    && let Ok(f) = gst_video::VideoFrameRef::from_buffer_ref_readable(b, &info)
+                {
+                    let stride = f.plane_stride()[1] as usize;
+                    u.lock()
+                        .unwrap()
+                        .push(f.plane_data(1).unwrap()[60 * stride + 160]);
+                }
+                gst::PadProbeReturn::Ok
+            });
+        o.start().unwrap();
+        let writer = o.frame_writer();
+        let canonical = writer.canonical();
+        let feed_until = |done: &dyn Fn(&Output) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done(&o) {
+                assert!(Instant::now() < deadline, "{:?}", o.module_stats("post"));
+                writer.put(black_frame(&canonical));
+                std::thread::sleep(Duration::from_millis(33));
+            }
+        };
+        let ready = |name: &'static str| {
+            move |o: &Output| o.module_stage_status(name, "tint") == EffectStatus::Ready
+        };
+        feed_until(&|o| ready("pre")(o) && ready("post")(o));
+        let at = || uv.lock().unwrap().len();
+        let n = at();
+        feed_until(&|_| at() >= n + 5);
+        assert_eq!(
+            *uv.lock().unwrap().last().unwrap(),
+            70,
+            "the later stage wins"
+        );
+        // A live change, then the later element off: the earlier one shows.
+        o.set_module_stages("post", &[tint(80)]).unwrap();
+        feed_until(&|_| uv.lock().unwrap().last() == Some(&80));
+        o.set_module_stages("post", &[StageRequest::new(StageId::new("tint").unwrap())])
+            .unwrap();
+        feed_until(&|_| uv.lock().unwrap().last() == Some(&60));
+        assert_eq!(o.module_stage_status("post", "tint"), EffectStatus::Off);
+        assert_eq!(FakeLog::get(&fake.log.loads), 2, "one load per element");
+        let stats = o.module_stats("pre").unwrap();
+        assert!(
+            stats.frames_processed > 5 && stats.module == "fake",
+            "{stats:?}"
+        );
+        assert!(!o.module_stages("post").unwrap()[0].enabled);
+        assert_eq!(o.module_stats("nope"), None);
+        assert_eq!(o.module_stage_status("nope", "tint"), EffectStatus::Off);
+        let e = o.set_module_stages("nope", &[]).unwrap_err();
+        assert!(matches!(e, PipelineError::Module(_)), "{e}");
+        let e = o.set_module_stages("pre", &[tint(1), tint(2)]).unwrap_err();
+        assert!(e.to_string().contains("listed twice"), "{e}");
+        // The status messages, from each element.
+        let mut seen = Vec::new();
+        while let Some(m) = o
+            .pipeline()
+            .bus()
+            .pop_filtered(&[gst::MessageType::Element])
+        {
+            if let Some(s) = m.structure()
+                && s.name() == STATUS_MESSAGE
+            {
+                let src = m.src().map(|s| s.name().to_string()).unwrap_or_default();
+                seen.push((src, s.get::<String>("tint").unwrap()));
+            }
+        }
+        for name in ["pre", "post"] {
+            assert!(
+                seen.contains(&(element_name(name), "ready".to_string())),
+                "{name}: {seen:?}"
+            );
+        }
+        o.stop().unwrap();
+        assert_eq!(FakeLog::get(&fake.log.unloads), 2);
+
+        // A chain that takes CUDA frames only is refused on system memory,
+        // before anything is built; so is a name used twice.
+        let mut cuda_only = cfg.clone();
+        cuda_only.module_stages[0].factory = FakeChainFactory::cuda(FakeChainConfig::default());
+        let e = Output::build_in(cuda_only, FrameMemory::System).unwrap_err();
+        assert!(e.to_string().contains("cuda frames only"), "{e}");
+        let mut twice = cfg;
+        twice.module_stages[1].name = "post".into();
+        let e = Output::build_in(twice, FrameMemory::System).unwrap_err();
+        assert!(e.to_string().contains("used twice"), "{e}");
+    }
+
+    #[test]
+    fn the_default_config_has_no_module_stage_element() {
+        require_elements(&["appsrc", "capssetter", "fakesink"]);
+        let cfg = OutputConfig::new("320x240@30".parse().unwrap(), OutputSink::Fake);
+        assert!(cfg.module_stages.is_empty());
+        let o = Output::build_in(cfg, FrameMemory::System).unwrap();
+        assert!(o.module_names().is_empty());
+        let mut e = o.pipeline().element(names::FRAMES_SRC);
+        while let Some(el) = e {
+            assert!(
+                el.downcast_ref::<gst_obc::ObcModule>().is_none(),
+                "no module element: {}",
+                el.name()
+            );
+            e = el
+                .static_pad("src")
+                .and_then(|p| p.peer())
+                .and_then(|p| p.parent_element());
+        }
     }
 
     #[test]

@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use obc_backend::{
     BackendFactory, ColourSpec, EffectKind, FrameParams, GpuContext, InferenceBackend, LoadRequest,
-    RelightLight, Stage, StageList,
+    StageId, StageList,
 };
 use obc_backend_maxine::{DEFAULT_ROOT, MaxineFactory, ROOT_ENV, set_configured_root};
 use obc_gpu::{ContextGuard, DeviceNv12Buffer, OwnedContext, Stream};
@@ -206,7 +206,7 @@ fn one_frame(f: &MaxineFactory, effect: EffectKind, denoise: bool) {
     let req = LoadRequest {
         effect,
         stages: if denoise {
-            Stage::Denoise.into()
+            StageId::DENOISE.into()
         } else {
             StageList::default()
         },
@@ -214,7 +214,7 @@ fn one_frame(f: &MaxineFactory, effect: EffectKind, denoise: bool) {
         height: H,
         colour: ColourSpec::LIMITED_BT601,
         background: None,
-        relight_light: RelightLight::default(),
+        params: Default::default(),
     };
     backend
         .load(&gpu, &req)

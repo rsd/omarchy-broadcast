@@ -429,6 +429,12 @@ pub fn settings_text(s: &Snapshot, tree: &SettingsTree, only: Only<'_>) -> Strin
     if !global_groups.is_empty() {
         out.push_str("All cameras:\n");
         settings_rows_text(&mut out, &global_groups);
+    } else if matches!(only, Only::All)
+        && s.interface_revision >= obc_ipc::MODULES_REVISION
+        && !tree.groups.iter().any(|g| g.is_global())
+    {
+        // From revision 9 the effects are the modules': none, none shown.
+        out.push_str(&format!("All cameras: {}\n", crate::modules::NO_MODULES));
     }
     out
 }
@@ -601,6 +607,8 @@ mod tests {
             camera_controls: None,
             settings_revision: None,
             settings_schema_serial: None,
+            modules_serial: None,
+            backend_profile: None,
             interface_revision: 3,
         }
     }

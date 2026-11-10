@@ -278,6 +278,55 @@ impl Server {
         .await
     }
 
+    /// The modules installed (revision 9): `(serial, modules)`, `serial`
+    /// being `ModulesSerial` when the list was made, each module a
+    /// dictionary (`obc_ipc::modules`).
+    #[zbus(out_args("serial", "modules"))]
+    async fn get_modules(&self) -> Result<(u32, Vec<VariantDict>), IpcError> {
+        let list = self.ask(Command::GetModules).await?;
+        Ok(list.to_wire())
+    }
+
+    /// Enables or disables module `id` (revision 9): kept across restarts;
+    /// it takes effect when the camera next starts (an enabled module's
+    /// settings appear at once). Re-enabling a module the daemon disabled
+    /// after it crashed it forgives it.
+    async fn set_module_enabled(&self, id: String, enabled: bool) -> Result<(), IpcError> {
+        self.call(|reply| Command::SetModuleEnabled(id, enabled, reply))
+            .await
+    }
+
+    /// The stage order in force: every stage the enabled modules offer
+    /// (revision 9).
+    async fn get_stage_order(&self) -> Result<Vec<String>, IpcError> {
+        self.ask(Command::GetStageOrder).await
+    }
+
+    /// Sets the stage order (revision 9): every stage the enabled modules
+    /// offer, once each, within their slots and requirements; an empty list
+    /// is the default order. An order that is not valid is refused with
+    /// `InvalidArgument` and the reason. It takes effect when the camera
+    /// next starts.
+    async fn set_stage_order(&self, order: Vec<String>) -> Result<(), IpcError> {
+        self.call(|reply| Command::SetStageOrder(order, reply))
+            .await
+    }
+
+    /// Sets the backend profile, `quality` or `battery` (revision 9): which
+    /// module provides a stage several offer, from the next camera start.
+    async fn set_backend_profile(&self, profile: String) -> Result<(), IpcError> {
+        self.call(|reply| Command::SetBackendProfile(profile, reply))
+            .await
+    }
+
+    /// Pins the module that provides `stage` (`""` clears the pin),
+    /// whatever the profile says, while it can run it (revision 9), from
+    /// the next camera start.
+    async fn set_stage_pin(&self, stage: String, module: String) -> Result<(), IpcError> {
+        self.call(|reply| Command::SetStagePin(stage, module, reply))
+            .await
+    }
+
     /// The settings tree changed: one signal per operation, each setting
     /// whose value, `stored`, `enabled` or reason changed; empty when
     /// `serial` moved (the client calls `GetSettings`) (revision 7).
@@ -409,6 +458,21 @@ impl Server {
         self.snap().settings_schema_serial.unwrap_or(1)
     }
 
+    /// Bumped whenever what `GetModules` returns changes; from 1
+    /// (revision 9).
+    #[zbus(property)]
+    fn modules_serial(&self) -> u32 {
+        self.snap().modules_serial.unwrap_or(1)
+    }
+
+    /// The backend profile in force, `quality` or `battery` (revision 9).
+    #[zbus(property)]
+    fn backend_profile(&self) -> String {
+        self.snap()
+            .backend_profile
+            .unwrap_or_else(|| "quality".into())
+    }
+
     #[zbus(property)]
     fn interface_revision(&self) -> u32 {
         self.snap().interface_revision
@@ -444,7 +508,8 @@ async fn emit_change(emitter: &SignalEmitter<'_>, change: &Change) -> zbus::Resu
         | Change::OutputMode(v)
         | Change::Effect(v)
         | Change::BackgroundImage(v)
-        | Change::PipeWireOutput(v) => emit_changed(emitter, name, v).await,
+        | Change::PipeWireOutput(v)
+        | Change::BackendProfile(v) => emit_changed(emitter, name, v).await,
         Change::BlurStrength(v) => emit_changed(emitter, name, v).await,
         Change::Enabled(v) | Change::Denoise(v) => emit_changed(emitter, name, v).await,
         Change::Cameras(v) => emit_changed(emitter, name, v).await,
@@ -453,7 +518,8 @@ async fn emit_change(emitter: &SignalEmitter<'_>, change: &Change) -> zbus::Resu
         | Change::PipeWireConsumers(v)
         | Change::PreviewConsumers(v)
         | Change::SettingsRevision(v)
-        | Change::SettingsSchemaSerial(v) => emit_changed(emitter, name, v).await,
+        | Change::SettingsSchemaSerial(v)
+        | Change::ModulesSerial(v) => emit_changed(emitter, name, v).await,
         Change::CameraControls(v) => emit_changed(emitter, name, v).await,
     }
 }

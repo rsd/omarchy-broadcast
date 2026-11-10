@@ -12,7 +12,10 @@
 //!    (the writer streams, or the failure is in `State`/`Error`);
 //! 4. only then is the name requested (`DO_NOT_QUEUE`; losing a race to
 //!    another instance between 2 and 4 stops the writer and exits
-//!    [`EXIT_NAME_TAKEN`] as well).
+//!    [`EXIT_NAME_TAKEN`] as well);
+//! 5. with the name taken, the controller loads the modules (counting the
+//!    crash ledger for this start) before it handles any command: an
+//!    instance that loses the name never touches the ledger.
 //!
 //! Between 2 and 3, preview frame files a crashed daemon left in
 //! `$XDG_RUNTIME_DIR/omarchy-broadcast` are removed, and the subscription
@@ -92,11 +95,13 @@ fn resolve_paths(opts: &Options) -> Result<Paths, String> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
+    let ledger = state.parent().map(|d| d.join(crate::modules::LEDGER_FILE));
     Ok(Paths {
         config,
         state,
         cache: obc_core::config::cache_dir(),
         runtime,
+        ledger,
     })
 }
 
@@ -229,15 +234,31 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
     .ok();
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    // The modules are loaded (and the crash ledger counted) once the name
+    // is ours: an instance that loses it never touches the ledger.
+    let (name_tx, name_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut name_tx = Some(name_tx);
     let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
     let thread = std::thread::Builder::new()
         .name("obc-controller".into())
         .spawn(move || {
             let res = GstBackend::new(Some(reporter), Some(previews)).map(|backend| {
                 let backend = backend.with_control_reporter(controls);
-                // Controller::new makes the first writer attempt.
-                let ctrl = Controller::new(backend, paths, published, Some(hook), Instant::now());
+                // Controller::new_without_modules makes the first writer
+                // attempt.
+                let mut ctrl = Controller::new_without_modules(
+                    backend,
+                    paths,
+                    published,
+                    Some(hook),
+                    Instant::now(),
+                );
                 let _ = ready_tx.send(());
+                // Commands wait in the channel meanwhile; without the name
+                // the daemon stops (the sender is dropped).
+                if name_rx.blocking_recv().is_ok() {
+                    ctrl.load_modules(Instant::now());
+                }
                 controller::run(ctrl, command_rx);
             });
             let _ = done_tx.send(res);
@@ -270,6 +291,9 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
                     env!("CARGO_PKG_VERSION")
                 );
                 tokio::spawn(run_publisher(conn.clone(), notes));
+                if let Some(tx) = name_tx.take() {
+                    let _ = tx.send(());
+                }
             }
             Ok(RequestNameReply::Exists | RequestNameReply::InQueue)
             | Err(zbus::Error::NameTaken) => {
@@ -303,6 +327,9 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
             }
         }
     }
+    // A controller still waiting for the name goes straight to the
+    // shutdown, without the modules.
+    drop(name_tx.take());
     let _ = commands.send(Command::Shutdown);
     let res = match ended {
         Some(r) => r,
