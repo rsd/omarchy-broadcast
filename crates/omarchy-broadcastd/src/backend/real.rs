@@ -25,18 +25,19 @@
 //! switches) may still have CUDA elements alive: the GPU is then not
 //! parked, and parking stays off until the daemon restarts (the parker is
 //! tainted). A stop that failed otherwise (a camera control not restored,
-//! an output clock thread that had panicked) is warned, and parks. The frames the writer and the PipeWire tap
-//! may still hold come out of `cudadownload` in system memory, so releasing
-//! them later needs no CUDA. Starting a session unparks first, before the
-//! output or NVML touch the GPU; if the GPU cannot be restored the start
-//! fails (nothing may touch CUDA), and a start that fails after unparking
-//! parks again, unless the output it had started did not stop cleanly
-//! (tainted, as above). While parked, nothing here touches CUDA: the camera scan,
-//! the writer and [`MediaBackend::effect_available`] (the effect backend's
-//! probe opens its libraries and makes no CUDA call) need none. The
-//! process may exit parked (a shutdown stops the session first, which
-//! parks): its exit does not wait on the GPU. Dropping the backend with a
-//! session still running does not park it.
+//! an output clock thread that had panicked) is warned, and parks. The
+//! frames the writer and the PipeWire tap may still hold come out of
+//! `cudadownload` in system memory, so releasing them later needs no CUDA.
+//! Starting a session unparks first, before the output or NVML touch the
+//! GPU; if the GPU cannot be restored the start fails (nothing may touch
+//! CUDA), and a start that fails after unparking parks again, unless the
+//! output it had started did not stop cleanly (tainted, as above). While
+//! parked, nothing here touches CUDA: the camera scan, the writer and
+//! [`MediaBackend::effect_available`] (the effect backend's probe opens its
+//! libraries and makes no CUDA call) need none. The process may exit parked
+//! (a shutdown stops the session first, which parks): its exit does not
+//! wait on the GPU. Dropping the backend with a session still running does
+//! not park it.
 //!
 //! The optional PipeWire output (`[pipewire] enabled`) is started and
 //! stopped on its own next to the running writer
@@ -146,7 +147,9 @@ impl StopSession for Running {
                 crate::debug!("NVML shutdown: {e}");
             }
         }
-        // Ingest, then output: every pipeline at NULL and dropped.
+        // Ingest, then output: every pipeline at NULL and dropped. The
+        // mapping to a clean or unclean stop is unit-tested
+        // (`session_stopped`); this wiring only on hardware.
         let res = session.stop_checked();
         drop(live);
         session_stopped(res, unclean)
@@ -453,6 +456,8 @@ impl GstBackend {
             .map_err(|e| format!("{}: {e}", camera.label()))?;
         running.source = None;
         let res = running.session.switch_to(ingest);
+        // The mapping (`switch_left`) is unit-tested; this wiring only by
+        // the hardware tests.
         if res.is_err() && running.unclean.is_none() {
             // A pipeline it took down left outside NULL: that session's stop
             // will not park (`Running::unclean`).
@@ -592,6 +597,8 @@ fn build_session(
     if stamp {
         stamp_forwarded(&output);
     }
+    // The mapping (`start_failed`) is unit-tested; this wiring only by the
+    // hardware tests.
     if let Err(e) = output.start() {
         return Err(start_failed(
             format!("output pipeline: {e}"),

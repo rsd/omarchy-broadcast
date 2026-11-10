@@ -203,7 +203,7 @@ Errors: `NoSuchCamera` (`camera` is not an id of `Cameras`), `InvalidArgument` (
 
 ### `SetSetting(s id, v value, a{sv} options)`
 
-Sets the setting `id` of a camera and stores the value for that camera (revision 7). `options` is as for `GetSettings`, and its `camera` also guards against a stale target: a client that rendered the tree of one camera passes that camera's id, and a switch of the active camera in the meantime makes the call fail with `NoSuchCamera` or `UnknownSetting` instead of writing to another camera. The value is written to the device at once while the daemon has the camera open (state `starting` or `active`, the camera being the one in use); otherwise it is only stored, and written when the camera next opens.
+Sets the setting `id` of a camera and stores the value for that camera (revision 7). `options` is as for `GetSettings`, and its `camera` also guards against a stale target: a client that rendered the tree of one camera passes that camera's id, and a switch of the active camera in the meantime makes the call fail with `NoSuchCamera` or `UnknownSetting` instead of writing to another camera. The value is written to the device at once while the daemon has the camera open (state `starting` or `active`, the camera being the one in use); otherwise it is only stored, and written when the camera next opens. A write of the value already in force and already stored (or, for a global setting, already in the state file) succeeds and changes nothing: no `SettingsChanged` is emitted and `SettingsRevision` does not move. A client that waits for its write to show therefore settles when the call returns successfully, not on a signal.
 
 The type of `value` follows the setting's `type`:
 
@@ -480,6 +480,8 @@ Emitted when the settings tree changes (revision 7: the camera settings of `Acti
 A change dictionary has always `stored` `b`, `enabled` `b` and `disabled_reason` `s`, and `value` (`b`, `x` or `s`, the type of the setting's `value`) unless the setting is an action, which has none. Nothing else of the setting is in it: the structure is in the tree.
 
 When the structure changed (`serial` is not the one the client holds) the `changes` list is **empty** and the client calls `GetSettings`: the camera changed, or a setting appeared, went, or changed its range, options or label. A delta never carries a structural change.
+
+A write of the value already in force and already stored changes nothing, so it emits no signal (see `SetSetting`).
 
 The property change signal, `org.freedesktop.DBus.Properties.PropertiesChanged(s interface, a{sv} changed, as invalidated)`, is emitted by the same object for every property listed above, with `interface` = `br.com.dias.OmarchyBroadcast1` and the new values in `changed`.
 

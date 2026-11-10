@@ -321,7 +321,7 @@ A **control object**:
 | `value` | number | For the camera that is open (state `starting` or `active`), the value on the device. Otherwise the value it will be given when it opens: the user's stored value, else the default if a reset is pending, else the value on the device. |
 | `stored` | boolean | `true` if the user set a value for this control; the daemon gives it to the camera whenever it opens. |
 
-`watch --json` prints a `controls` line when the property that carries them changes: the camera, or a control's range, default, value or `stored`. The daemon refreshes the controls when the active camera changes, when the cameras are rescanned, when the camera opens, once at its first frame, and after a set or reset; it does not poll the device, so a value changed by other software shows at the next of those moments.
+`watch --json` prints a `controls` line when the property that carries them changes: the camera, or a control's range, default, value or `stored`. The daemon refreshes the controls when the active camera changes, when the cameras are rescanned, when the camera opens, once at its first frame, and after a set or reset; it does not poll the device, so a value changed by other software shows at the next of those moments. A `controls set` of the value already stored changes nothing and prints no line; the command exits with status `0`, and that is when a client settles its write.
 
 ### `settings_group`
 
@@ -366,7 +366,7 @@ A client keeps the order, ignores keys it does not know, skips a setting whose `
 
 ### `settings_delta`
 
-Changes to a set already assembled. Printed by `watch --json` for each `SettingsChanged` signal.
+Changes to a set already assembled. Printed by `watch --json` for each `SettingsChanged` signal. A write of the value already in force and already stored raises no signal, so it prints no line: a client that waits for its write to show settles when `settings set` exits with status `0`, not on a line.
 
 | Field | JSON type | Meaning |
 |---|---|---|

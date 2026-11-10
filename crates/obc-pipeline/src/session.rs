@@ -100,7 +100,9 @@ impl Session {
     /// Makes `next` the current source: arms the output's hold for `next`
     /// (when a source is streaming), stops the current ingest, then starts
     /// `next` with the output's CUDA context. If stopping the current
-    /// ingest fails, `next` is not started (it is dropped); if starting
+    /// ingest fails, `next` is not started (it is dropped), unless the old
+    /// pipeline reached NULL and only a pinned control could not be put
+    /// back: that is logged and the switch goes on; if starting
     /// `next` fails, the session has no source. Either way the hold armed
     /// for `next` runs to its timeout
     /// ([`OutputConfig::hold_timeout`](crate::output::OutputConfig::hold_timeout),
@@ -154,8 +156,13 @@ impl Session {
             if let Err(e) = old.stop_checked() {
                 if !e.reached_null {
                     timing.unclean_stop = Some(format!("stopping the previous ingest: {e}"));
+                    return Err(e.error);
                 }
-                return Err(e.error);
+                // The camera is closed and the pipeline is in NULL; only a
+                // control could not be put back (an unplugged camera, say).
+                // That is no reason to keep the switch from a camera that
+                // still works, and nothing is left running: not unclean.
+                eprintln!("the previous ingest stopped, but not cleanly: {e}");
             }
             timing.previous_stopped = Some(Instant::now());
         }
@@ -171,12 +178,17 @@ impl Session {
         if let Err(e) = next.start_with(cuda) {
             // Back to NULL and dropped here, checked, rather than by its
             // drop, which does not say whether it reached NULL.
-            if let Err(stop) = next.stop_checked()
-                && !stop.reached_null
-            {
-                timing.unclean_stop = Some(format!(
-                    "stopping the new ingest after it failed to start: {stop}"
-                ));
+            if let Err(stop) = next.stop_checked() {
+                if stop.reached_null {
+                    // Nothing is left running: logged, not unclean.
+                    eprintln!(
+                        "the new ingest stopped, but not cleanly, after it failed to start: {stop}"
+                    );
+                } else {
+                    timing.unclean_stop = Some(format!(
+                        "stopping the new ingest after it failed to start: {stop}"
+                    ));
+                }
             }
             return Err(e);
         }

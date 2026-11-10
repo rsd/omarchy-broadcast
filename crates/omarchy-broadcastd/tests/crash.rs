@@ -546,9 +546,10 @@ fn loopback_consumers(env: &DaemonEnv) -> u32 {
 /// increasing, and a frame the driver serves on a timeout repeats the last
 /// written frame's timestamp. A repeat is not always a timeout frame: the
 /// reader was measured to dequeue a new writer's first frame twice in a
-/// row, with its one timestamp (written twice by `v4l2sink`, its preroll),
-/// so a repeat is the timeout image only when it repeats the first daemon's
-/// last frame.
+/// row, with its one timestamp (written twice by `v4l2sink`, its preroll).
+/// So a repeat is the timeout image when it repeats the first daemon's last
+/// frame, and the one legitimate second-daemon repeat is that first frame,
+/// once; any other repeat is stray.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
     /// Written by the first daemon: stamped before the kill.
@@ -556,7 +557,8 @@ enum Kind {
     /// The driver's timeout image while no writer ran: the first daemon's
     /// last timestamp again.
     Covered,
-    /// Written by the second daemon: stamped after its spawn.
+    /// Written by the second daemon: stamped after its spawn. Includes the
+    /// one repeat of its first frame (the preroll's second write).
     Second,
     /// None of these (stamped while no daemon ran, or going back).
     Stray,
@@ -566,14 +568,26 @@ enum Kind {
 /// the second daemon's spawn at `restart_mono` (`CLOCK_MONOTONIC`, ns).
 fn classify(frames: &[Seen], kill_mono: u64, restart_mono: u64) -> Vec<Kind> {
     let mut prev: Option<u64> = None;
+    let mut second_first: Option<u64> = None;
+    let mut preroll_repeated = false;
     frames
         .iter()
         .map(|s| {
-            let kind = if prev == Some(s.ts_ns) && s.ts_ns < kill_mono {
+            let repeat = prev == Some(s.ts_ns);
+            let kind = if repeat && s.ts_ns < kill_mono {
                 Kind::Covered
+            } else if repeat && s.ts_ns > restart_mono {
+                // Only the second daemon's first frame repeats, and once.
+                if second_first == Some(s.ts_ns) && !preroll_repeated {
+                    preroll_repeated = true;
+                    Kind::Second
+                } else {
+                    Kind::Stray
+                }
             } else if prev.is_some_and(|p| s.ts_ns < p) {
                 Kind::Stray
             } else if s.ts_ns > restart_mono {
+                second_first.get_or_insert(s.ts_ns);
                 Kind::Second
             } else if s.ts_ns < kill_mono {
                 Kind::First
@@ -644,7 +658,8 @@ fn ms(d: Duration) -> f64 {
 /// Frames are told apart by their timestamps, whenever they were dequeued:
 /// a frame written just before the kill but dequeued after it is still the
 /// first daemon's, a timeout frame repeats its last one, and a repeat of
-/// the second daemon's frame is the second daemon's.
+/// the second daemon's first frame is the second daemon's, once; any other
+/// repeat of a second-daemon frame is stray.
 #[test]
 fn frames_are_classified_by_their_timestamps() {
     let seen = |ts_ns: u64| Seen {
@@ -657,17 +672,29 @@ fn frames_are_classified_by_their_timestamps() {
         chroma: 128,
     };
     // Kill at 1000, second daemon spawned at 2000.
-    let frames: Vec<Seen> = [900, 990, 990, 990, 2100, 2133, 2133, 2166, 1500, 2200, 1200]
-        .into_iter()
-        .map(seen)
-        .collect();
+    let frames: Vec<Seen> = [
+        900, 990, 990, 990, 2100, 2100, 2133, 2133, 2166, 1500, 2200, 1200,
+    ]
+    .into_iter()
+    .map(seen)
+    .collect();
     use Kind::*;
     assert_eq!(
         classify(&frames, 1000, 2000),
         [
-            First, First, Covered, Covered, Second, Second, Second, Second, Stray, Second, Stray
+            First, First, Covered, Covered, Second, Second, Second, Stray, Second, Stray, Second,
+            Stray
         ]
     );
+    let kinds = |ts: &[u64]| {
+        let f: Vec<Seen> = ts.iter().copied().map(seen).collect();
+        classify(&f, 1000, 2000)
+    };
+    // The first second-daemon frame repeats once; a further repeat is stray.
+    assert_eq!(kinds(&[2100, 2100]), [Second, Second]);
+    assert_eq!(kinds(&[2100, 2100, 2100]), [Second, Second, Stray]);
+    // A later second-daemon frame never repeats.
+    assert_eq!(kinds(&[2100, 2133, 2133]), [Second, Second, Stray]);
     // Stamped between the kill and the spawn: no daemon ran.
     assert_eq!(classify(&[seen(1500)], 1000, 2000), [Stray]);
 }
