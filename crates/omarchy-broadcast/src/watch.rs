@@ -9,11 +9,23 @@
 //! printed when it is back. A daemon that holds its name but does not
 //! answer a read within [`READ_TIMEOUT`] is an outage too (a `dbus-error`
 //! line), retried every [`RETRY`]. Nothing here starts the daemon.
+//!
+//! With `--json`, from a daemon with the camera settings (revision 7), the
+//! snapshot is followed by the full set of settings of the active camera
+//! (or a `settings_clear` line), then each `SettingsChanged` signal by its
+//! `settings_delta` lines. The signal is subscribed to before the settings
+//! are read, and a signal the set already reflects (its revision is not
+//! newer) is skipped. A signal whose schema serial differs from the set's,
+//! or whose revision is not the next one (a signal was missed, or the
+//! revision wrapped past `u32::MAX`), has the settings read again and
+//! printed as a new full set ([`settings_step`]); the daemon bumps the
+//! serial when the active camera changes, so another camera is a new set
+//! too. After an outage, the set follows the fresh snapshot.
 
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use obc_ipc::{BUS_NAME, INTERFACE, OBJECT_PATH, Snapshot, Stats};
+use obc_ipc::{BUS_NAME, INTERFACE, OBJECT_PATH, SettingsTree, Snapshot, Stats};
 use tokio::signal::unix::{SignalKind, signal};
 use zbus::Connection;
 use zbus::fdo::{DBusProxy, PropertiesProxy};
@@ -57,6 +69,30 @@ impl Printer {
             }
         } else {
             for line in human::change_lines(s, changes) {
+                out::line(&line);
+            }
+        }
+    }
+
+    /// The full set of settings (JSON only).
+    fn settings(&self, tree: &SettingsTree) {
+        if self.json {
+            for line in json::settings_lines(tree) {
+                out::line(&line);
+            }
+        }
+    }
+
+    /// The lines of one `SettingsChanged` signal (JSON only).
+    fn settings_delta(
+        &self,
+        rev: u32,
+        serial: u32,
+        camera: &str,
+        changes: &[obc_ipc::SettingChange],
+    ) {
+        if self.json {
+            for line in json::settings_delta_lines(rev, serial, camera, changes) {
                 out::line(&line);
             }
         }
@@ -138,11 +174,14 @@ struct Subscriptions {
     owners: zbus::fdo::NameOwnerChangedStream,
     changed: zbus::fdo::PropertiesChangedStream,
     stats: obc_ipc::client::StatsStream,
+    /// `SettingsChanged`, for `--json` only.
+    settings: Option<obc_ipc::client::SettingsChangedStream>,
 }
 
-/// Subscribes to the name's owner changes, `PropertiesChanged` and `Stats`,
-/// then asks for the current owner.
-async fn subscribe(conn: &Connection) -> Result<Subscriptions, Ended> {
+/// Subscribes to the name's owner changes, `PropertiesChanged`, `Stats`
+/// and (with `settings`) `SettingsChanged`, then asks for the current
+/// owner.
+async fn subscribe(conn: &Connection, settings: bool) -> Result<Subscriptions, Ended> {
     let dbus = DBusProxy::new(conn).await.map_err(lost)?;
     let owners = dbus
         .receive_name_owner_changed_with_args(&[(0, BUS_NAME)])
@@ -158,6 +197,11 @@ async fn subscribe(conn: &Connection) -> Result<Subscriptions, Ended> {
     let changed = props.receive_properties_changed().await.map_err(lost)?;
     let proxy = bus::proxy(conn).await.map_err(Ended::BusLost)?;
     let stats = proxy.receive_stats().await.map_err(lost)?;
+    let settings = if settings {
+        Some(proxy.receive_settings_changed().await.map_err(lost)?)
+    } else {
+        None
+    };
     let owner = match dbus.get_name_owner(daemon_name()).await {
         Ok(o) => o,
         Err(zbus::fdo::Error::NameHasNoOwner(_)) => {
@@ -170,6 +214,35 @@ async fn subscribe(conn: &Connection) -> Result<Subscriptions, Ended> {
         owners,
         changed,
         stats,
+        settings,
+    })
+}
+
+/// The next `SettingsChanged` signal; never, without the subscription.
+async fn next_settings(
+    s: &mut Option<obc_ipc::client::SettingsChangedStream>,
+) -> Option<obc_ipc::client::SettingsChanged> {
+    match s {
+        Some(s) => s.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The revision, serial and camera of the settings last printed in full.
+struct SettingsSeen {
+    revision: u32,
+    serial: u32,
+    camera: String,
+}
+
+/// Reads the settings of the active camera and prints them in full.
+async fn print_settings(conn: &Connection, p: &Printer) -> Result<SettingsSeen, Ended> {
+    let tree = bus::settings_tree(conn, "").await.map_err(fetch_failed)?;
+    p.settings(&tree);
+    Ok(SettingsSeen {
+        revision: tree.revision,
+        serial: tree.serial,
+        camera: tree.camera,
     })
 }
 
@@ -177,7 +250,7 @@ async fn subscribe(conn: &Connection) -> Result<Subscriptions, Ended> {
 async fn follow(conn: &Connection, p: &mut Printer) -> Ended {
     // Every call here goes to the bus itself; a bus that does not answer in
     // time counts as lost.
-    let subscribed = match tokio::time::timeout(READ_TIMEOUT, subscribe(conn)).await {
+    let subscribed = match tokio::time::timeout(READ_TIMEOUT, subscribe(conn, p.json)).await {
         Ok(Ok(s)) => s,
         Ok(Err(ended)) => return ended,
         Err(_) => return Ended::BusLost(bus_silent()),
@@ -187,6 +260,7 @@ async fn follow(conn: &Connection, p: &mut Printer) -> Ended {
         mut owners,
         mut changed,
         mut stats,
+        mut settings,
     } = subscribed;
     // Bounded by READ_TIMEOUT: a daemon that holds the name but does not
     // answer is an outage like any other.
@@ -195,6 +269,14 @@ async fn follow(conn: &Connection, p: &mut Printer) -> Ended {
         Err(f) => return fetch_failed(f),
     };
     p.snapshot(&snap);
+    // Nothing of the settings from a daemon without them.
+    let mut seen = None;
+    if settings.is_some() && model::has_settings(&snap) {
+        match print_settings(conn, p).await {
+            Ok(s) => seen = Some(s),
+            Err(ended) => return ended,
+        }
+    }
 
     loop {
         tokio::select! {
@@ -239,12 +321,58 @@ async fn follow(conn: &Connection, p: &mut Printer) -> Ended {
                 }
                 snap = new;
             }
+            s = next_settings(&mut settings) => {
+                let Some(signal) = s else { return stream_ended() };
+                let Some(last) = &mut seen else { continue };
+                let Ok(args) = signal.args() else { continue };
+                let (rev, serial) = (args.revision, args.serial);
+                match settings_step(last.revision, last.serial, rev, serial) {
+                    SettingsStep::Stale => {}
+                    SettingsStep::FullSet => match print_settings(conn, p).await {
+                        Ok(s) => *last = s,
+                        Err(ended) => return ended,
+                    },
+                    SettingsStep::Delta => {
+                        p.settings_delta(rev, serial, &last.camera, &args.to_changes());
+                        last.revision = rev;
+                    }
+                }
+            }
             s = stats.next() => {
                 let Some(signal) = s else { return stream_ended() };
                 let Ok(args) = signal.args() else { continue };
                 p.stats(&args.to_stats());
             }
         }
+    }
+}
+
+/// What a `SettingsChanged` signal is to the set last printed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsStep {
+    /// Already in the set (sent before it was read): skipped.
+    Stale,
+    /// The next revision of the same structure: printed as a delta.
+    Delta,
+    /// Another structure, a missed signal, or a revision that wrapped: the
+    /// settings are read and printed again as a full set.
+    FullSet,
+}
+
+/// The step of a signal of revision `rev` and serial `serial` after the set
+/// at `last_rev` / `last_serial`. Revisions compare in serial-number
+/// arithmetic (wrapping), so none overflows: a revision up to half the
+/// `u32` range behind is stale, the one after is a delta (unless it wrapped
+/// past `u32::MAX`, which counts as a gap), any other is a full set; a
+/// stale one is skipped whatever its serial.
+fn settings_step(last_rev: u32, last_serial: u32, rev: u32, serial: u32) -> SettingsStep {
+    let ahead = rev.wrapping_sub(last_rev);
+    if ahead == 0 || ahead > u32::MAX / 2 {
+        SettingsStep::Stale
+    } else if ahead == 1 && rev > last_rev && serial == last_serial {
+        SettingsStep::Delta
+    } else {
+        SettingsStep::FullSet
     }
 }
 
@@ -340,4 +468,44 @@ pub async fn run(json: bool) -> u8 {
         () = watch_loop(json) => {}
     }
     EXIT_OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_signal_is_stale_a_delta_or_a_full_set() {
+        use SettingsStep::{Delta, FullSet, Stale};
+        for (last, rev, serial, step) in [
+            (5, 6, 2, Delta),
+            (5, 5, 2, Stale),
+            (5, 4, 2, Stale),
+            (5, 1, 2, Stale),
+            // Stale whatever the serial.
+            (5, 5, 3, Stale),
+            (5, 4, 3, Stale),
+            // A missed signal, or another structure.
+            (5, 7, 2, FullSet),
+            (5, 6, 3, FullSet),
+            (5, 1000, 2, FullSet),
+            // At the top of the range: no overflow, and the wrap is a gap.
+            (u32::MAX - 1, u32::MAX, 2, Delta),
+            (u32::MAX, u32::MAX, 2, Stale),
+            (u32::MAX, u32::MAX - 1, 2, Stale),
+            (u32::MAX, 0, 2, FullSet),
+            (u32::MAX, 1, 2, FullSet),
+            (u32::MAX, 7, 3, FullSet),
+            (u32::MAX - 3, 2, 2, FullSet),
+            // From 0, the first revisions.
+            (0, 1, 2, Delta),
+            (0, u32::MAX, 2, Stale),
+        ] {
+            assert_eq!(
+                settings_step(last, 2, rev, serial),
+                step,
+                "{last} -> {rev} ({serial})"
+            );
+        }
+    }
 }

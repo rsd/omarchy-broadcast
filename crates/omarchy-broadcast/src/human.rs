@@ -1,17 +1,21 @@
-//! Human-readable output: `status`, `cameras`, `effect`, `controls`, the
-//! results of `on`, `off`, `camera`, `effect ...`, `denoise ...` and
-//! `controls set|reset`, and the lines of `watch` without `--json`.
+//! Human-readable output: `status`, `cameras`, `effect`, `controls`,
+//! `settings`, the results of `on`, `off`, `camera`, `effect ...`,
+//! `denoise ...`, `controls set|reset` and `settings set|reset`, and the
+//! lines of `watch` without `--json`.
 //!
 //! Every string that comes from the daemon (camera names and ids, the
 //! error, the output mode, the effect, the background image, the PipeWire
-//! output's state, the names of image controls) goes through
+//! output's state, the names of image controls, the ids, labels, units,
+//! option labels and reasons of camera settings) goes through
 //! [`printable`] before it reaches the terminal, so a crafted file or camera
 //! name cannot send it control sequences or reorder the text around it.
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
-use obc_ipc::{CameraControl, CameraControls, Snapshot, State, Stats};
+use obc_ipc::{
+    CameraControl, CameraControls, Setting, SettingKind, SettingsTree, Snapshot, State, Stats,
+};
 
 use crate::model::{self, Changes};
 
@@ -250,11 +254,153 @@ pub fn controls_text(s: &Snapshot, c: &CameraControls) -> String {
         out.push_str(line.trim_end());
         out.push('\n');
     }
-    out.push_str(if matches!(s.state, State::Active | State::Starting) {
+    out.push_str(applies_text(matches!(
+        s.state,
+        State::Active | State::Starting
+    )));
+    out
+}
+
+/// Whether a change applies now (`live`) or the next time the camera opens.
+fn applies_text(live: bool) -> &'static str {
+    if live {
         "Applied live.\n"
     } else {
         "The camera is not in use: changes apply the next time it opens.\n"
-    });
+    }
+}
+
+/// Which settings [`settings_text`] lists.
+#[derive(Debug, Clone, Copy)]
+pub enum Only<'a> {
+    /// Every setting.
+    All,
+    /// The settings of one group.
+    Group(&'a str),
+    /// One setting.
+    Setting(&'a str),
+}
+
+/// A setting's value as printed: an int with its unit, a bool as `on` or
+/// `off`, an enum as its option's label (its value id when no option has
+/// it), `action` for an action.
+fn setting_value(s: &Setting) -> String {
+    match &s.kind {
+        SettingKind::Bool { value, .. } => on_off(Some(*value)).into(),
+        SettingKind::Int { value, unit, .. } => match unit {
+            Some(u) if !u.is_empty() => format!("{value} {}", printable(u)),
+            _ => value.to_string(),
+        },
+        SettingKind::Enum { options, value, .. } => {
+            let label = options
+                .iter()
+                .find(|(v, _)| v == value)
+                .map_or(value.as_str(), |(_, l)| l.as_str());
+            printable(label).into_owned()
+        }
+        SettingKind::Action | SettingKind::Unknown(_) => "action".into(),
+    }
+}
+
+/// What `settings set` takes for a setting: `on|off`, `MIN..MAX` (with the
+/// step when it is not 1), the option value ids, or nothing for an action.
+fn setting_accepts(s: &Setting) -> String {
+    match &s.kind {
+        SettingKind::Bool { .. } => "on|off".into(),
+        SettingKind::Int { min, max, step, .. } if *step > 1 => {
+            format!("{min}..{max} step {step}")
+        }
+        SettingKind::Int { min, max, .. } => format!("{min}..{max}"),
+        SettingKind::Enum { options, .. } => options
+            .iter()
+            .map(|(v, _)| printable(v).into_owned())
+            .collect::<Vec<_>>()
+            .join("|"),
+        SettingKind::Action | SettingKind::Unknown(_) => String::new(),
+    }
+}
+
+/// `settings`, and the result of `settings set|reset`: the camera, then the
+/// settings of `tree` (those `only` names) under their group's label, one
+/// line each: label, value (with its unit), id, what `settings set` takes,
+/// then `(stored)` for a value the user set and, for one that cannot be
+/// changed now, the daemon's reason in parentheses; last, whether a change
+/// applies now. Settings of a type this client does not know are left out.
+pub fn settings_text(s: &Snapshot, tree: &SettingsTree, only: Only<'_>) -> String {
+    let mut out = format!("Camera:     {}\n", camera_label_of(s, &tree.camera));
+    struct Row<'a> {
+        label: Cow<'a, str>,
+        value: String,
+        id: Cow<'a, str>,
+        accepts: String,
+        marks: String,
+    }
+    let mut groups: Vec<(Cow<'_, str>, Vec<Row<'_>>)> = Vec::new();
+    for g in &tree.groups {
+        if matches!(only, Only::Group(id) if id != g.id) {
+            continue;
+        }
+        let rows: Vec<Row<'_>> = g
+            .settings
+            .iter()
+            .filter(|st| !matches!(st.kind, SettingKind::Unknown(_)))
+            .filter(|st| !matches!(only, Only::Setting(id) if id != st.id))
+            .map(|st| {
+                let mut marks = String::new();
+                if st.stored {
+                    marks.push_str("  (stored)");
+                }
+                if !st.enabled {
+                    let reason = if st.disabled_reason.is_empty() {
+                        Cow::Borrowed("cannot be changed now")
+                    } else {
+                        printable(&st.disabled_reason)
+                    };
+                    marks.push_str(&format!("  ({reason})"));
+                }
+                Row {
+                    label: printable(&st.label),
+                    value: setting_value(st),
+                    id: printable(&st.id),
+                    accepts: setting_accepts(st),
+                    marks,
+                }
+            })
+            .collect();
+        if !rows.is_empty() {
+            groups.push((printable(&g.label), rows));
+        }
+    }
+    if groups.is_empty() {
+        out.push_str(if tree.camera.is_empty() || matches!(only, Only::All) {
+            "No camera settings.\n"
+        } else {
+            "No such camera setting.\n"
+        });
+    }
+    let all = || groups.iter().flat_map(|(_, rows)| rows.iter());
+    let width = |f: fn(&Row<'_>) -> usize| all().map(f).max().unwrap_or(0);
+    let label_w = width(|r| r.label.chars().count());
+    let value_w = width(|r| r.value.chars().count());
+    let id_w = width(|r| r.id.chars().count());
+    let accepts_w = width(|r| r.accepts.chars().count());
+    for (label, rows) in &groups {
+        out.push_str(label);
+        out.push('\n');
+        for r in rows {
+            let line = format!(
+                "  {:<label_w$}  {:<value_w$}  {:<id_w$}  {:<accepts_w$}{}",
+                r.label, r.value, r.id, r.accepts, r.marks
+            );
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+    }
+    // Only the active camera is ever open.
+    let live = !tree.camera.is_empty()
+        && tree.camera == s.active_camera
+        && matches!(s.state, State::Active | State::Starting);
+    out.push_str(applies_text(live));
     out
 }
 
@@ -424,6 +570,8 @@ mod tests {
             // Before noise removal: the outputs without it.
             denoise: false,
             camera_controls: None,
+            settings_revision: None,
+            settings_schema_serial: None,
             interface_revision: 3,
         }
     }
@@ -868,6 +1016,158 @@ mod tests {
                 gpu_percent: -1.0,
             }),
             "stats: 30.0 fps | latency 12.5 ms | cpu 3.0% | gpu n/a"
+        );
+    }
+
+    fn settings_tree() -> SettingsTree {
+        use obc_ipc::{Condition, ConditionOp, SettingValue, SettingsGroup};
+        let setting = |id: &str, label: &str, kind| Setting {
+            id: id.into(),
+            label: label.into(),
+            kind,
+            scope: "camera".into(),
+            stored: false,
+            enabled: true,
+            disabled_reason: String::new(),
+            enabled_when: Vec::new(),
+            hint: None,
+        };
+        let mut time = setting(
+            "camera.exposure.exposure_time_absolute",
+            "Exposure time",
+            SettingKind::Int {
+                min: 3,
+                max: 2047,
+                step: 1,
+                default: 156,
+                value: 1250,
+                unit: Some("\u{d7}100 \u{b5}s".into()),
+            },
+        );
+        time.enabled = false;
+        time.disabled_reason = "Set exposure to manual to change this".into();
+        time.enabled_when = vec![Condition {
+            id: "camera.exposure.auto_exposure".into(),
+            op: ConditionOp::In,
+            value: SettingValue::List(vec![SettingValue::Str("manual".into())]),
+        }];
+        let mut keep = setting(
+            "camera.exposure.keep_framerate",
+            "Keep 30 fps in low light",
+            SettingKind::Bool {
+                default: true,
+                value: false,
+            },
+        );
+        keep.stored = true;
+        SettingsTree {
+            revision: 4,
+            serial: 1,
+            camera: "usb-1234_abcd".into(),
+            groups: vec![
+                SettingsGroup {
+                    id: "image".into(),
+                    label: "Image".into(),
+                    settings: vec![setting(
+                        "camera.image.sharpness",
+                        "Sharpness",
+                        SettingKind::Int {
+                            min: 0,
+                            max: 255,
+                            step: 1,
+                            default: 128,
+                            value: 128,
+                            unit: None,
+                        },
+                    )],
+                },
+                SettingsGroup {
+                    id: "exposure".into(),
+                    label: "Exposure".into(),
+                    settings: vec![
+                        setting(
+                            "camera.exposure.auto_exposure",
+                            "Exposure mode",
+                            SettingKind::Enum {
+                                options: vec![
+                                    ("manual".into(), "Manual".into()),
+                                    ("aperture_priority".into(), "Auto".into()),
+                                ],
+                                default: "aperture_priority".into(),
+                                value: "aperture_priority".into(),
+                            },
+                        ),
+                        time,
+                        keep,
+                        setting(
+                            "camera.exposure.future",
+                            "Unknown \u{1b}[2J",
+                            SettingKind::Unknown("colour".into()),
+                        ),
+                    ],
+                },
+                SettingsGroup {
+                    id: "focus".into(),
+                    label: "Focus & \u{202e}zoom".into(),
+                    settings: vec![setting(
+                        "camera.focus.pan_reset",
+                        "Recentre pan",
+                        SettingKind::Action,
+                    )],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn settings_list_by_group_with_values_ids_and_reasons() {
+        let mut s = sample();
+        let tree = settings_tree();
+        assert_eq!(
+            settings_text(&s, &tree, Only::All),
+            "Camera:     First Camera (1234:abcd)\n\
+             Image\n  \
+             Sharpness                 128           camera.image.sharpness                  0..255\n\
+             Exposure\n  \
+             Exposure mode             Auto          camera.exposure.auto_exposure           manual|aperture_priority\n  \
+             Exposure time             1250 \u{d7}100 \u{b5}s  camera.exposure.exposure_time_absolute  3..2047                   (Set exposure to manual to change this)\n  \
+             Keep 30 fps in low light  off           camera.exposure.keep_framerate          on|off                    (stored)\n\
+             Focus & \\u{202e}zoom\n  \
+             Recentre pan              action        camera.focus.pan_reset\n\
+             The camera is not in use: changes apply the next time it opens.\n"
+        );
+        // One setting, one group; open: live.
+        s.state = State::Active;
+        assert_eq!(
+            settings_text(&s, &tree, Only::Setting("camera.exposure.keep_framerate")),
+            "Camera:     First Camera (1234:abcd)\n\
+             Exposure\n  \
+             Keep 30 fps in low light  off  camera.exposure.keep_framerate  on|off  (stored)\n\
+             Applied live.\n"
+        );
+        assert_eq!(
+            settings_text(&s, &tree, Only::Group("image")),
+            "Camera:     First Camera (1234:abcd)\n\
+             Image\n  \
+             Sharpness  128  camera.image.sharpness  0..255\n\
+             Applied live.\n"
+        );
+        // Another camera than the active one is not open.
+        let mut other = tree.clone();
+        other.camera = "platform-video2".into();
+        assert!(
+            settings_text(&s, &other, Only::Group("image")).starts_with("Camera:     Second\n")
+        );
+        assert!(
+            settings_text(&s, &other, Only::All)
+                .ends_with("The camera is not in use: changes apply the next time it opens.\n")
+        );
+        // No camera.
+        let none = SettingsTree::default();
+        assert_eq!(
+            settings_text(&s, &none, Only::All),
+            "Camera:     none\nNo camera settings.\n\
+             The camera is not in use: changes apply the next time it opens.\n"
         );
     }
 }

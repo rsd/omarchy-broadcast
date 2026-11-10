@@ -24,6 +24,12 @@
 //! `camera_controls_are_stored_and_reapplied_at_each_open` changes the
 //! camera's image controls (sharpness, and saturation if it has one) and
 //! writes every image control's default at the end, also when it fails.
+//! `settings_follow_the_camera_over_dbus` (revision 7) changes the exposure
+//! mode, sharpness, the field of view (on a camera with the Logitech row)
+//! and gain; it records every control's value and the field of view at its
+//! start and writes back each one that differs at the end, also when it
+//! fails, and never resets the whole camera. `settings_tree_of_the_real_camera`
+//! only reads the camera.
 //!
 //! The effects test (`effects_switch_while_streaming_and_release_the_gpu`)
 //! also needs the NVIDIA Maxine Video Effects SDK (`MAXINE_VFX_ROOT`, the
@@ -286,6 +292,9 @@ fn cuda_pids() -> Vec<u32> {
 }
 
 /// A synchronous client of the daemon on the private bus.
+/// The `SettingsChanged` signals recorded: (revision, serial, changes).
+type SettingsSeen = Arc<Mutex<Vec<(u32, u32, Vec<obc_ipc::SettingChange>)>>>;
+
 struct Client {
     rt: tokio::runtime::Runtime,
     conn: zbus::Connection,
@@ -414,6 +423,37 @@ impl Client {
     }
     fn camera_controls(&self) -> obc_ipc::CameraControls {
         self.rt.block_on(self.proxy.camera_controls()).unwrap()
+    }
+    fn settings(&self, camera: &str) -> Result<obc_ipc::SettingsTree, IpcError> {
+        self.rt.block_on(self.proxy.settings_tree(camera))
+    }
+    fn set_setting(&self, id: &str, value: obc_ipc::SettingValue) -> Result<(), IpcError> {
+        self.rt
+            .block_on(self.proxy.set_setting_value("", id, &value))
+    }
+    fn reset_settings(&self, scope: obc_ipc::ResetScope) -> Result<(), IpcError> {
+        self.rt
+            .block_on(self.proxy.reset_settings_scope("", &scope))
+    }
+    /// Records every `SettingsChanged` from now on: (revision, serial,
+    /// changes).
+    fn record_settings(&self) -> SettingsSeen {
+        let seen: SettingsSeen = Arc::default();
+        let s = Arc::clone(&seen);
+        let mut stream = self
+            .rt
+            .block_on(self.proxy.receive_settings_changed())
+            .unwrap();
+        self.rt.spawn(async move {
+            while let Some(sig) = stream.next().await {
+                if let Ok(a) = sig.args() {
+                    s.lock()
+                        .unwrap()
+                        .push((a.revision, a.serial, a.to_changes()));
+                }
+            }
+        });
+        seen
     }
 
     fn wait_state(&self, want: State, limit: Duration) -> Option<Duration> {
@@ -1875,30 +1915,6 @@ const IGNORE_CONTROLS: &str = "needs OBC_TEST_SINK (a free v4l2loopback device w
      exclusive_caps=1), OBC_TEST_CAMERA (a colour camera with a writable sharpness control), an \
      NVIDIA GPU, /usr/bin/dbus-daemon and cargo (to build obc-consumer)";
 
-/// Writes every image control of the test camera its default when
-/// dropped: also when the test fails partway.
-struct ImageDefaults {
-    node: PathBuf,
-    controls: Vec<obc_pipeline::controls::DeviceControl>,
-}
-
-impl Drop for ImageDefaults {
-    fn drop(&mut self) {
-        for c in &self.controls {
-            if let Err(e) =
-                obc_pipeline::controls::set_image_control(&self.node, &c.name, c.default)
-            {
-                eprintln!(
-                    "could not put {} of {} back to its default {}: {e}",
-                    c.name,
-                    self.node.display(),
-                    c.default
-                );
-            }
-        }
-    }
-}
-
 /// A valid value of `c` other than its default.
 fn not_default(c: &obc_pipeline::controls::DeviceControl) -> i32 {
     let step = c.step.max(1);
@@ -1915,8 +1931,9 @@ fn not_default(c: &obc_pipeline::controls::DeviceControl) -> i32 {
 /// while streaming (written at once); the camera closed and the device put
 /// back to its defaults behind the daemon's back; reopened, the stored
 /// values are on the device again; a reset while streaming writes every
-/// default and stores nothing. The camera's defaults are written at the
-/// end, also when the test fails.
+/// default and stores nothing. Every control is put back to the value it
+/// had at the test's start when it ends, also when it fails
+/// ([`RestoreAll`]).
 #[test]
 #[ignore = "needs OBC_TEST_SINK (a free v4l2loopback device with exclusive_caps=1), OBC_TEST_CAMERA (a colour camera with a writable sharpness control), an NVIDIA GPU, /usr/bin/dbus-daemon and cargo"]
 fn camera_controls_are_stored_and_reapplied_at_each_open() {
@@ -1941,10 +1958,8 @@ fn camera_controls_are_stored_and_reapplied_at_each_open() {
     }
     let found = query_image_controls(&cam.node)
         .unwrap_or_else(|e| panic!("reading the image controls of {}: {e}", cam.node.display()));
-    let _defaults = ImageDefaults {
-        node: cam.node.clone(),
-        controls: found.clone(),
-    };
+    // Before the daemon: dropped after it.
+    let _restore = RestoreAll::read(&cam.node);
     let on_device = |name: &str| get_ctrl(&cam.node, image_control_id(name).unwrap()).unwrap();
     let sharpness = found
         .iter()
@@ -2020,8 +2035,14 @@ fn camera_controls_are_stored_and_reapplied_at_each_open() {
         let c = view.controls.iter().find(|c| c.name == *name).unwrap();
         assert_eq!((c.value, c.stored), (*value, true), "{c:?}");
     }
-    let state = std::fs::read_to_string(env.state_file()).unwrap();
-    assert!(state.contains("[camera_controls."), "{state}");
+    // Saved after the settings write-behind delay.
+    let saved = || std::fs::read_to_string(env.state_file()).unwrap_or_default();
+    assert!(
+        wait(Duration::from_secs(3), || saved()
+            .contains("[camera_controls.")),
+        "{}",
+        saved()
+    );
 
     // Closed: nothing restored. Then the defaults behind the daemon's back.
     consumer.close();
@@ -2069,10 +2090,478 @@ fn camera_controls_are_stored_and_reapplied_at_each_open() {
         after.iter().all(|c| !c.stored && c.value == c.default),
         "{after:?}"
     );
-    let state = std::fs::read_to_string(env.state_file()).unwrap();
-    assert!(!state.contains("camera_controls"), "{state}");
+    assert!(
+        wait(Duration::from_secs(3), || !saved()
+            .contains("camera_controls")),
+        "{}",
+        saved()
+    );
     assert_eq!(client.state(), State::Active, "error: {}", client.error());
     consumer.close();
     daemon.signal(libc::SIGTERM);
     assert_eq!(daemon.wait_exit(Duration::from_secs(10)), Some(0));
+}
+
+const IGNORE_SETTINGS: &str = "needs OBC_TEST_SINK (a free v4l2loopback device with \
+     exclusive_caps=1), OBC_TEST_CAMERA (a colour camera with an auto_exposure menu, sharpness \
+     and gain; the field of view is checked on a Logitech camera with its row), an NVIDIA GPU, \
+     /usr/bin/dbus-daemon and cargo (to build obc-consumer)";
+
+/// Every control of a camera as it was at the test's start, and its
+/// Extension Unit rows: each one that differs is written back when this is
+/// dropped (dependent controls first, while their masters still have the
+/// test's values; one the camera flags inactive is left alone, a control
+/// the camera refuses now is reported, not fatal). Never a reset: only the
+/// values read at the start.
+struct RestoreAll {
+    node: PathBuf,
+    controls: Vec<(u32, String, i32)>,
+    xu: Vec<(obc_pipeline::XuControl, u8)>,
+}
+
+impl RestoreAll {
+    fn read(node: &Path) -> RestoreAll {
+        let n = obc_pipeline::ControlNode::open(node, false)
+            .unwrap_or_else(|e| panic!("opening {}: {e}", node.display()));
+        let controls = n
+            .enumerate()
+            .controls
+            .into_iter()
+            .filter(|c| {
+                !obc_pipeline::control_node::is_never_exposed(c.id, &c.name)
+                    && c.info.flags & obc_pipeline::controls::CTRL_FLAG_READ_ONLY == 0
+            })
+            .filter_map(|c| c.value.value().map(|v| (c.id, c.name, v)))
+            .collect();
+        let xu = obc_pipeline::xu::find_xu_controls(Path::new(obc_pipeline::xu::SYSFS_ROOT), node)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|x| x.current(&n).ok().map(|b| (x, b)))
+            .collect();
+        RestoreAll {
+            node: node.to_path_buf(),
+            controls,
+            xu,
+        }
+    }
+
+    fn value(&self, name: &str) -> Option<i32> {
+        self.controls
+            .iter()
+            .find(|(_, n, _)| n == name)
+            .map(|(_, _, v)| *v)
+    }
+}
+
+impl Drop for RestoreAll {
+    fn drop(&mut self) {
+        let n = match obc_pipeline::ControlNode::open(&self.node, true) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("RESTORE: cannot open {}: {e}", self.node.display());
+                return;
+            }
+        };
+        let masters = [
+            "auto_exposure",
+            "white_balance_automatic",
+            "focus_automatic_continuous",
+            "hue_automatic",
+        ];
+        let (first, last): (Vec<_>, Vec<_>) = self
+            .controls
+            .iter()
+            .partition(|(_, name, _)| !masters.contains(&name.as_str()));
+        for (id, name, want) in first.into_iter().chain(last) {
+            let inactive = n
+                .query(*id)
+                .ok()
+                .flatten()
+                .is_some_and(|info| info.inactive());
+            match n.get(*id) {
+                Ok(now) if now == *want => {}
+                // Under its automatic mode it follows the camera (and
+                // cannot be written); the test never writes it.
+                Ok(now) if inactive => {
+                    eprintln!("RESTORE: {name} {now} (was {want}) is inactive: left to the camera")
+                }
+                Ok(now) => match n.set(*id, *want) {
+                    Ok(()) => eprintln!("RESTORE: {name} {now} -> {want}"),
+                    Err(e) => eprintln!("RESTORE: {name} {now} -> {want} failed: {e}"),
+                },
+                Err(e) => eprintln!("RESTORE: reading {name}: {e}"),
+            }
+        }
+        for (x, want) in &self.xu {
+            let now = x.current(&n).ok();
+            if now == Some(*want) {
+                continue;
+            }
+            let Some(option) = x.row().option_for_value(*want) else {
+                eprintln!("RESTORE: {} {want:#04x} is not an option", x.row().name);
+                continue;
+            };
+            match x.set(&n, option.id) {
+                Ok(()) => eprintln!("RESTORE: {} {now:?} -> {want:#04x}", x.row().name),
+                Err(e) => eprintln!("RESTORE: {} -> {want:#04x} failed: {e}", x.row().name),
+            }
+        }
+    }
+}
+
+/// Waits until a recorded `SettingsChanged` holds a change of `id` that
+/// `ok` accepts; returns it.
+fn wait_change(
+    seen: &SettingsSeen,
+    from: usize,
+    id: &str,
+    limit: Duration,
+    ok: impl Fn(&obc_ipc::SettingChange) -> bool,
+) -> Option<obc_ipc::SettingChange> {
+    let mut found = None;
+    wait(limit, || {
+        found = seen.lock().unwrap()[from..]
+            .iter()
+            .flat_map(|(_, _, c)| c.iter())
+            .find(|c| c.id == id && ok(c))
+            .cloned();
+        found.is_some()
+    });
+    found
+}
+
+/// The camera settings channel end to end on the MX Brio (revision 7):
+/// the tree while idle (its groups, the field of view, the exposure time
+/// greyed under the automatic mode); while streaming, the manual mode and
+/// the exposure time it enables in one signal and back; a slider written,
+/// read back on the device, reset to its default and forgotten; the field
+/// of view changed and back without the consumer's format moving; a
+/// change behind the daemon's back announced by the control-event watcher.
+/// Every control the test touches is put back to its start value.
+#[test]
+#[ignore = "needs OBC_TEST_SINK (a free v4l2loopback device with exclusive_caps=1), OBC_TEST_CAMERA (a colour camera with an auto_exposure menu, sharpness and gain), an NVIDIA GPU, /usr/bin/dbus-daemon and cargo"]
+fn settings_follow_the_camera_over_dbus() {
+    use obc_ipc::{ResetScope, SettingKind, SettingValue};
+    const MODE: &str = "camera.exposure.auto_exposure";
+    const EXPOSURE: &str = "camera.exposure.exposure_time_absolute";
+    const SHARP: &str = "camera.image.sharpness";
+    const GAIN: &str = "camera.exposure.gain";
+    const FOV: &str = "camera.focus.field_of_view";
+    let sink = PathBuf::from(
+        std::env::var("OBC_TEST_SINK")
+            .unwrap_or_else(|_| panic!("this test needs OBC_TEST_SINK. {IGNORE_SETTINGS}")),
+    );
+    let sink = std::fs::canonicalize(&sink).unwrap_or(sink);
+    let cam = resolve_camera("OBC_TEST_CAMERA");
+    for node in [&sink, &cam.node] {
+        let n = count_holders(Path::new("/proc"), &NodeId::of(node), std::process::id());
+        assert_eq!(
+            n,
+            0,
+            "{} is held by another process (see `fuser -v {}`): not touching it",
+            node.display(),
+            node.display()
+        );
+    }
+    let start = RestoreAll::read(&cam.node);
+    eprintln!(
+        "start: {:?}; field of view bytes {:?}",
+        start.controls,
+        start
+            .xu
+            .iter()
+            .map(|(x, b)| (x.row().name, *b))
+            .collect::<Vec<_>>()
+    );
+    let start_mode = start
+        .value("auto_exposure")
+        .expect("an auto_exposure control");
+    let node_value = |id: u32| -> i32 {
+        obc_pipeline::ControlNode::open(&cam.node, false)
+            .unwrap()
+            .get(id)
+            .unwrap()
+    };
+    let format_now = || {
+        obc_pipeline::ControlNode::open(&cam.node, false)
+            .unwrap()
+            .capture_format()
+            .unwrap()
+    };
+
+    let consumer_bin = consumer_binary();
+    let dir = tempfile::tempdir().unwrap();
+    let bus = PrivateBus::start(dir.path());
+    let env = DaemonEnv::new(dir.path(), &bus);
+    std::fs::write(
+        env.config_file(),
+        format!(
+            "version = 1\n[camera]\npreference = [{:?}]\n[loopback]\ndevice = {:?}\n\
+             [lifecycle]\nidle_grace_s = 0.5\nstart_debounce_ms = 100\n",
+            cam.selector,
+            sink.display().to_string()
+        ),
+    )
+    .unwrap();
+    let mut daemon = spawn_daemon(&env);
+    let client = Client::connect(&env);
+    client.wait_for_daemon(Duration::from_secs(15));
+    assert_eq!(client.state(), State::Idle, "error: {}", client.error());
+
+    // Idle: the tree of the camera.
+    let tree = client.settings("").unwrap();
+    let groups: Vec<&str> = tree.groups.iter().map(|g| g.label.as_str()).collect();
+    eprintln!("groups {groups:?}");
+    for g in &tree.groups {
+        for st in &g.settings {
+            eprintln!(
+                "  {} {:?} enabled={} {:?} {:?}",
+                st.id,
+                st.kind.value(),
+                st.enabled,
+                st.disabled_reason,
+                st.enabled_when
+            );
+        }
+    }
+    for want in ["Image", "White balance", "Exposure", "Focus & zoom"] {
+        assert!(groups.contains(&want), "{want} missing: {groups:?}");
+    }
+    assert_eq!(tree.camera, client.active());
+    let exposure = tree.find(EXPOSURE).expect("an exposure time");
+    let manual_now = start_mode == 1;
+    assert_eq!(exposure.enabled, manual_now, "{exposure:?}");
+    if !manual_now {
+        assert_eq!(
+            exposure.disabled_reason,
+            "Set exposure to manual to change this"
+        );
+    }
+    let fov_start = start
+        .xu
+        .iter()
+        .find(|(x, _)| x.row().name == "field_of_view")
+        .map(|(x, b)| x.row().option_for_value(*b).map(|o| o.id));
+    match (tree.find(FOV), fov_start) {
+        (Some(f), Some(Some(start_id))) => {
+            eprintln!(
+                "field of view read: {:?} (start byte maps to {start_id})",
+                f.kind
+            );
+            assert_eq!(f.kind.value(), Some(SettingValue::Str(start_id.into())));
+            assert!(f.enabled);
+        }
+        (f, s) => eprintln!("no field of view row checked (tree {f:?}, start {s:?})"),
+    }
+
+    // Streaming.
+    let seen = client.record_settings();
+    let consumer = Consumer::spawn(&consumer_bin, &sink);
+    assert!(
+        client
+            .wait_state(State::Active, Duration::from_secs(20))
+            .is_some(),
+        "not active: {} ({})",
+        client.state(),
+        client.error()
+    );
+    assert!(consumer.wait_more(true, 10, Duration::from_secs(10)));
+    let format_streaming = format_now();
+    let caps_streaming = consumer.caps();
+    eprintln!("streaming {format_streaming}, consumer caps {caps_streaming:?}");
+
+    // The manual mode, and the exposure time it enables, in one signal.
+    let start_mode_id = match &tree.find(MODE).expect("an exposure mode").kind {
+        SettingKind::Enum { value, .. } => value.clone(),
+        other => panic!("{other:?}"),
+    };
+    if !manual_now {
+        let from = seen.lock().unwrap().len();
+        client
+            .set_setting(MODE, SettingValue::Str("manual".into()))
+            .unwrap();
+        assert_eq!(node_value(0x009a_0901), 1, "manual on the device");
+        let c = wait_change(&seen, from, EXPOSURE, Duration::from_secs(3), |c| c.enabled)
+            .expect("the exposure time enabled");
+        eprintln!("manual: {c:?}");
+        let sig = seen.lock().unwrap()[from..]
+            .iter()
+            .find(|(_, _, ch)| ch.iter().any(|c| c.id == EXPOSURE && c.enabled))
+            .cloned()
+            .unwrap();
+        assert!(
+            sig.2.iter().any(|c| c.id == MODE),
+            "the mode and the dependency in one signal: {sig:?}"
+        );
+        let from = seen.lock().unwrap().len();
+        client
+            .set_setting(MODE, SettingValue::Str(start_mode_id.clone()))
+            .unwrap();
+        assert_eq!(node_value(0x009a_0901), start_mode, "mode back");
+        let c = wait_change(&seen, from, EXPOSURE, Duration::from_secs(3), |c| {
+            !c.enabled
+        })
+        .expect("the exposure time greyed again");
+        assert_eq!(c.disabled_reason, "Set exposure to manual to change this");
+    }
+
+    // A slider: written, read back, reset to its default and forgotten.
+    let (sharp_default, sharp_max) = match &tree.find(SHARP).expect("sharpness").kind {
+        SettingKind::Int { default, max, .. } => (*default, *max),
+        other => panic!("{other:?}"),
+    };
+    let value = if sharp_default < sharp_max {
+        sharp_default + 1
+    } else {
+        sharp_default - 1
+    };
+    client.set_setting(SHARP, SettingValue::Int(value)).unwrap();
+    assert_eq!(
+        i64::from(node_value(0x0098_091b)),
+        value,
+        "sharpness on the device"
+    );
+    assert!(
+        wait(Duration::from_secs(3), || std::fs::read_to_string(
+            env.state_file()
+        )
+        .unwrap_or_default()
+        .contains("sharpness")),
+        "stored after the write-behind delay"
+    );
+    client
+        .reset_settings(ResetScope::Setting(SHARP.into()))
+        .unwrap();
+    assert_eq!(
+        i64::from(node_value(0x0098_091b)),
+        sharp_default,
+        "sharpness back to its default"
+    );
+    assert!(!client.settings("").unwrap().find(SHARP).unwrap().stored);
+    assert!(
+        wait(Duration::from_secs(3), || !std::fs::read_to_string(
+            env.state_file()
+        )
+        .unwrap_or_default()
+        .contains("sharpness")),
+        "forgotten in the state file"
+    );
+
+    // The field of view while streaming: the format stays.
+    if let Some(Some(start_id)) = fov_start {
+        let other = if start_id == "78" { "65" } else { "78" };
+        client
+            .set_setting(FOV, SettingValue::Str(other.into()))
+            .unwrap_or_else(|e| panic!("field of view {other}: {e}"));
+        assert_eq!(
+            format_now(),
+            format_streaming,
+            "the capture format after {other}"
+        );
+        assert!(consumer.wait_more(true, 30, Duration::from_secs(10)));
+        assert_eq!(consumer.caps(), caps_streaming, "the consumer's caps");
+        eprintln!(
+            "field of view {other}: {:?}",
+            client
+                .settings("")
+                .unwrap()
+                .find(FOV)
+                .map(|f| f.kind.value())
+        );
+        client
+            .set_setting(FOV, SettingValue::Str(start_id.into()))
+            .unwrap();
+        assert_eq!(format_now(), format_streaming);
+        assert!(consumer.wait_more(true, 10, Duration::from_secs(10)));
+    }
+
+    // Behind the daemon's back: the watcher's event, a delta.
+    let gain_id = 0x0098_0913;
+    let gain_start = node_value(gain_id);
+    let other_gain = if gain_start > 0 {
+        gain_start - 1
+    } else {
+        gain_start + 1
+    };
+    let from = seen.lock().unwrap().len();
+    obc_pipeline::ControlNode::open(&cam.node, true)
+        .unwrap()
+        .set(gain_id, other_gain)
+        .unwrap();
+    let c = wait_change(&seen, from, GAIN, Duration::from_secs(3), |c| {
+        c.value == Some(SettingValue::Int(other_gain.into()))
+    })
+    .expect("a SettingsChanged for the gain changed behind the daemon's back");
+    eprintln!("event: {c:?}");
+    assert!(!c.stored, "not the user's: not stored");
+    obc_pipeline::ControlNode::open(&cam.node, true)
+        .unwrap()
+        .set(gain_id, gain_start)
+        .unwrap();
+    assert!(
+        wait_change(&seen, from, GAIN, Duration::from_secs(3), |c| {
+            c.value == Some(SettingValue::Int(gain_start.into()))
+        })
+        .is_some()
+    );
+
+    assert_eq!(client.state(), State::Active, "error: {}", client.error());
+    consumer.close();
+    daemon.signal(libc::SIGTERM);
+    assert_eq!(daemon.wait_exit(Duration::from_secs(10)), Some(0));
+    drop(start);
+}
+
+/// The settings tree the model builds from the real camera, read only (no
+/// daemon, no stream): what a client would be shown while the camera is
+/// closed and nothing is stored.
+#[test]
+#[ignore = "needs OBC_TEST_CAMERA (a colour camera)"]
+fn settings_tree_of_the_real_camera() {
+    let cam = resolve_camera("OBC_TEST_CAMERA");
+    let node = obc_pipeline::ControlNode::open(&cam.node, false).unwrap();
+    let found = node.enumerate();
+    let xu: Vec<omarchy_broadcastd::settings::XuReading> =
+        obc_pipeline::xu::find_xu_controls(Path::new(obc_pipeline::xu::SYSFS_ROOT), &cam.node)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|x| {
+                x.probe(&node)
+                    .ok()
+                    .flatten()
+                    .map(|state| omarchy_broadcastd::settings::XuReading {
+                        row: x.row(),
+                        state,
+                    })
+            })
+            .collect();
+    let built = omarchy_broadcastd::settings::build(&omarchy_broadcastd::settings::Inputs {
+        camera: "test",
+        controls: &found.controls,
+        xu: &xu,
+        stored: None,
+        open: false,
+        fixed_framerate: false,
+    });
+    for g in built.groups() {
+        eprintln!("{} ({})", g.label, g.id);
+        for s in g.settings {
+            eprintln!(
+                "  {} {:?} {:?} enabled={} {:?}",
+                s.id, s.label, s.kind, s.enabled, s.disabled_reason
+            );
+        }
+    }
+    eprintln!("notes: {:?}", built.notes);
+    assert!(!built.entries.is_empty(), "no setting at all");
+    assert!(built.entries.len() <= omarchy_broadcastd::settings::MAX_SETTINGS);
+    for e in &built.entries {
+        assert!(obc_ipc::valid_setting_id(&e.setting.id), "{}", e.setting.id);
+        assert!(e.setting.enabled || !e.setting.disabled_reason.is_empty());
+    }
+    if cam.usb.eq_ignore_ascii_case("046d:0944") {
+        assert!(built.get("camera.focus.field_of_view").is_some());
+        assert!(built.get("camera.exposure.keep_framerate").is_some());
+        assert!(built.get("camera.image.sharpness").is_some());
+    }
 }

@@ -45,6 +45,8 @@ mode = "1920x1080@60"
 
 # Pin the camera's exposure so it cannot lower the frame rate in low light
 # (disables V4L2 exposure_dynamic_framerate while streaming).
+# A camera for which you set "Keep 30 fps in low light" (omarchy-broadcast
+# settings) is not pinned: your stored choice wins.
 # Default: false
 fixed_framerate = false
 

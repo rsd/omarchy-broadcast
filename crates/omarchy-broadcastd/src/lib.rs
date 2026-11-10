@@ -24,6 +24,10 @@
 //!   the D-Bus side (`PreviewFrame`) through [`controller::Published`],
 //!   without the controller.
 //!
+//! The camera settings channel (revision 7) is modelled, without any
+//! device, in [`settings`]; the controller feeds it what the camera's node
+//! reports and publishes its tree.
+//!
 //! The lifecycle logic takes the current time as an argument, so its tests
 //! drive it with a fake backend and explicit instants.
 
@@ -37,3 +41,4 @@ pub mod hotplug;
 pub mod inotify;
 pub mod log;
 pub mod preview;
+pub mod settings;

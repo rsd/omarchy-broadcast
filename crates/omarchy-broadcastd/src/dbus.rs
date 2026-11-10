@@ -5,7 +5,9 @@
 //! result. [`run_publisher`] turns the controller's notes into
 //! `PropertiesChanged` signals (one per changed property, with the value of
 //! that step, so a short-lived state such as `starting` is announced too),
-//! `Stats` and `PreviewFrame` signals. [`run_owner_watch`] follows the
+//! `Stats`, `PreviewFrame` and `SettingsChanged` signals (the last after
+//! the `SettingsRevision` change of the same step, so a client reading the
+//! property on the signal sees its revision). [`run_owner_watch`] follows the
 //! unique names leaving the bus, which ends their preview leases.
 //!
 //! A preview lease belongs to the caller's unique bus name (the message
@@ -20,8 +22,10 @@ use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 
 use futures_util::StreamExt;
+use obc_ipc::settings::{VariantDict, WireChange, camera_option};
 use obc_ipc::{
-    CameraControl, CameraControls, CameraInfo, INTERFACE, IpcError, OBJECT_PATH, Snapshot, State,
+    CameraControl, CameraControls, CameraInfo, INTERFACE, IpcError, OBJECT_PATH, SettingValue,
+    Snapshot, State,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 use zbus::fdo::NameOwnerChangedStream;
@@ -29,9 +33,11 @@ use zbus::message::Header;
 use zbus::names::{BusName, InterfaceName};
 use zbus::object_server::SignalEmitter;
 use zbus::proxy::CacheProperties;
-use zbus::{Connection, interface};
+use zbus::{Connection, OwnedVariant, interface};
 
-use crate::controller::{Change, Command, ControlsReply, Note, PathReply, Published, Reply};
+use crate::controller::{
+    Change, Command, ControlsReply, Note, PathReply, Published, Reply, SettingsReply,
+};
 
 /// The D-Bus object (see the module docs).
 pub struct Server {
@@ -217,6 +223,66 @@ impl Server {
         self.call(|r| Command::ResetCameraControls(camera, r)).await
     }
 
+    /// The settings tree of a camera: `(revision, serial, camera, groups)`.
+    /// `options`: `camera` s, an id of `Cameras` (absent or empty:
+    /// `ActiveCamera`); other keys are ignored. With no camera present the
+    /// reply is `(revision, serial, "", [])` (revision 7).
+    #[zbus(out_args("revision", "serial", "camera", "groups"))]
+    async fn get_settings(
+        &self,
+        options: VariantDict,
+    ) -> Result<(u32, u32, String, Vec<VariantDict>), IpcError> {
+        let camera = camera_option(&options)?;
+        let tree = self
+            .ask(|reply: SettingsReply| Command::GetSettings(camera, reply))
+            .await?;
+        Ok(tree.to_wire())
+    }
+
+    /// Sets a camera setting (`options` as for `GetSettings`): written at
+    /// once while the camera streams, otherwise stored and applied when it
+    /// next opens. Persists across restarts (revision 7).
+    async fn set_setting(
+        &self,
+        id: String,
+        value: OwnedVariant,
+        options: VariantDict,
+    ) -> Result<(), IpcError> {
+        let camera = camera_option(&options)?;
+        let value = SettingValue::from_variant(&value);
+        self.call(|reply| Command::SetSetting {
+            camera,
+            id,
+            value,
+            reply,
+        })
+        .await
+    }
+
+    /// Forgets the stored settings in `scope` (`camera`, `group:<id>` or
+    /// `setting:<id>`) and puts them back to the camera's defaults: at once
+    /// while it streams, otherwise when it next opens (revision 7).
+    async fn reset_settings(&self, scope: String, options: VariantDict) -> Result<(), IpcError> {
+        let camera = camera_option(&options)?;
+        self.call(|reply| Command::ResetSettings {
+            camera,
+            scope,
+            reply,
+        })
+        .await
+    }
+
+    /// The settings tree changed: one signal per operation, each setting
+    /// whose value, `stored`, `enabled` or reason changed; empty when
+    /// `serial` moved (the client calls `GetSettings`) (revision 7).
+    #[zbus(signal)]
+    pub async fn settings_changed(
+        emitter: &SignalEmitter<'_>,
+        revision: u32,
+        serial: u32,
+        changes: Vec<WireChange>,
+    ) -> zbus::Result<()>;
+
     /// After each replace of the preview frame file while a lease is held;
     /// `seq` increases strictly within a daemon run, from 1 (revision 5).
     #[zbus(signal)]
@@ -323,6 +389,20 @@ impl Server {
         self.snap().camera_controls.unwrap_or_default()
     }
 
+    /// Bumped at every change of the published settings tree; from 1
+    /// (revision 7).
+    #[zbus(property)]
+    fn settings_revision(&self) -> u32 {
+        self.snap().settings_revision.unwrap_or(1)
+    }
+
+    /// Bumped at a structural change of the settings tree only; from 1
+    /// (revision 7).
+    #[zbus(property)]
+    fn settings_schema_serial(&self) -> u32 {
+        self.snap().settings_schema_serial.unwrap_or(1)
+    }
+
     #[zbus(property)]
     fn interface_revision(&self) -> u32 {
         self.snap().interface_revision
@@ -365,7 +445,9 @@ async fn emit_change(emitter: &SignalEmitter<'_>, change: &Change) -> zbus::Resu
         Change::Consumers(v)
         | Change::LoopbackConsumers(v)
         | Change::PipeWireConsumers(v)
-        | Change::PreviewConsumers(v) => emit_changed(emitter, name, v).await,
+        | Change::PreviewConsumers(v)
+        | Change::SettingsRevision(v)
+        | Change::SettingsSchemaSerial(v) => emit_changed(emitter, name, v).await,
         Change::CameraControls(v) => emit_changed(emitter, name, v).await,
     }
 }
@@ -399,6 +481,14 @@ pub async fn run_publisher(conn: Connection, mut notes: UnboundedReceiver<Note>)
                 .await
             }
             Note::PreviewFrame(seq) => Server::preview_frame(&emitter, *seq).await,
+            Note::SettingsChanged {
+                revision,
+                serial,
+                changes,
+            } => {
+                let changes: Vec<WireChange> = changes.iter().map(|c| c.to_wire()).collect();
+                Server::settings_changed(&emitter, *revision, *serial, changes).await
+            }
         };
         if let Err(e) = res {
             crate::debug!("emitting a signal failed: {e}");

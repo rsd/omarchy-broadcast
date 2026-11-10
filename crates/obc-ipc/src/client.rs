@@ -7,7 +7,24 @@
 //! The `Stats` signal yields the message wrapper [`Stats`] (this module's,
 //! not [`crate::Stats`]); [`StatsArgs::to_stats`] turns its arguments into
 //! the value type.
+//!
+//! The settings methods (revision 7) carry dictionaries; the typed wrappers
+//! [`OmarchyBroadcastProxy::settings_tree`],
+//! [`OmarchyBroadcastProxy::settings_tree_no_autostart`],
+//! [`OmarchyBroadcastProxy::set_setting_value`] and
+//! [`OmarchyBroadcastProxy::reset_settings_scope`] take and return the
+//! model of [`crate::settings`], and [`SettingsChangedArgs::to_changes`]
+//! decodes the signal.
 
+use std::collections::HashMap;
+
+use zbus::Variant;
+use zbus::proxy::MethodFlags;
+
+use crate::settings::{
+    ResetScope, SettingChange, SettingValue, SettingsReply, SettingsTree, VariantDict,
+    camera_options,
+};
 use crate::{CameraControl, CameraControls, CameraInfo, IpcError, State};
 
 /// The daemon's interface, as seen by a client. Every property is read-only
@@ -89,6 +106,40 @@ pub trait OmarchyBroadcast {
     /// (the stored values are forgotten all the same). Revision 6.
     fn reset_camera_controls(&self, camera: &str) -> Result<(), IpcError>;
 
+    /// The settings tree of a camera: `(revision, serial, camera, groups)`
+    /// (see [`crate::settings`]). `options`: `camera` s, an id of `Cameras`
+    /// (absent or `""`: `ActiveCamera`); unknown keys are ignored. With no
+    /// camera present the reply is `(revision, serial, "", [])`, not an
+    /// error. Fails with `NoSuchCamera` for an id not present. Revision 7.
+    fn get_settings(&self, options: HashMap<&str, Variant<'_>>) -> Result<SettingsReply, IpcError>;
+
+    /// Sets the setting `id` of a camera (`options` as for
+    /// [`Self::get_settings`]) to `value`: `b` for a bool, any integer type
+    /// for an int, `s` (an option value id) for an enum, `b` `true` to fire
+    /// an action. Written to the device while the camera is open, otherwise
+    /// stored and applied when it opens. Fails, in this order, with
+    /// `UnknownSetting`, `Disabled` (the message is the reason),
+    /// `InvalidArgument` (wrong type, out of range, off the step, not an
+    /// option) and `RateLimited`; `Failed` when the device refuses it.
+    /// Revision 7.
+    fn set_setting(
+        &self,
+        id: &str,
+        value: Variant<'_>,
+        options: HashMap<&str, Variant<'_>>,
+    ) -> Result<(), IpcError>;
+
+    /// Forgets the stored values in `scope` (`camera`, `group:<id>` or
+    /// `setting:<id>`, see [`ResetScope`]) and puts those settings back to
+    /// their defaults: at once while the camera is open, otherwise when it
+    /// next opens. `options` as for [`Self::get_settings`]. Fails with
+    /// `InvalidArgument` for any other scope. Revision 7.
+    fn reset_settings(
+        &self,
+        scope: &str,
+        options: HashMap<&str, Variant<'_>>,
+    ) -> Result<(), IpcError>;
+
     /// Roughly once per second while `active`; `-1` marks a value that
     /// cannot be measured.
     #[zbus(signal)]
@@ -105,6 +156,19 @@ pub trait OmarchyBroadcast {
     /// from 1. Revision 5.
     #[zbus(signal)]
     fn preview_frame(&self, seq: u32) -> zbus::Result<()>;
+
+    /// The settings tree changed: one signal per operation, every setting
+    /// whose value, `stored`, `enabled` or reason changed, as `(id, {value,
+    /// stored, enabled, disabled_reason})` ([`SettingsChangedArgs::to_changes`]).
+    /// When `serial` moved the list is empty and the client calls
+    /// [`Self::get_settings`]. Revision 7.
+    #[zbus(signal)]
+    fn settings_changed(
+        &self,
+        revision: u32,
+        serial: u32,
+        changes: Vec<(String, VariantDict)>,
+    ) -> zbus::Result<()>;
 
     /// Lifecycle state.
     #[zbus(property)]
@@ -177,6 +241,17 @@ pub trait OmarchyBroadcast {
     #[zbus(property)]
     fn camera_controls(&self) -> zbus::Result<CameraControls>;
 
+    /// Bumped on every change of the published settings tree (a value or
+    /// the structure); from 1. Revision 7.
+    #[zbus(property)]
+    fn settings_revision(&self) -> zbus::Result<u32>;
+
+    /// Bumped on a structural change of the settings tree only (another
+    /// camera, a setting added or gone, a type, range, step, default,
+    /// option or label changed); from 1. Revision 7.
+    #[zbus(property)]
+    fn settings_schema_serial(&self) -> zbus::Result<u32>;
+
     /// Revision of the interface the daemon implements.
     #[zbus(property)]
     fn interface_revision(&self) -> zbus::Result<u32>;
@@ -191,5 +266,65 @@ impl StatsArgs<'_> {
             cpu_percent: self.cpu_percent,
             gpu_percent: self.gpu_percent,
         }
+    }
+}
+
+impl SettingsChangedArgs<'_> {
+    /// The signal's changes in the typed model; a malformed change is
+    /// dropped alone ([`SettingChange::list_from_wire`]).
+    pub fn to_changes(&self) -> Vec<SettingChange> {
+        SettingChange::list_from_wire(&self.changes)
+    }
+}
+
+impl OmarchyBroadcastProxy<'_> {
+    /// `GetSettings` for `camera` (an id of `Cameras`; `""`:
+    /// `ActiveCamera`), decoded ([`SettingsTree::from_wire`]). Like every
+    /// method call through the proxy, it may start the daemon.
+    pub async fn settings_tree(&self, camera: &str) -> Result<SettingsTree, IpcError> {
+        let reply = self.get_settings(camera_options(camera)).await?;
+        Ok(SettingsTree::from_wire(&reply))
+    }
+
+    /// [`Self::settings_tree`] with the `NO_AUTO_START` flag: never starts
+    /// the daemon. A daemon that is not running is a [`IpcError::ZBus`] that
+    /// [`crate::is_not_running_error`] recognises.
+    pub async fn settings_tree_no_autostart(&self, camera: &str) -> Result<SettingsTree, IpcError> {
+        let reply: Option<SettingsReply> = self
+            .inner()
+            .call_with_flags(
+                "GetSettings",
+                MethodFlags::NO_AUTO_START,
+                &(camera_options(camera),),
+            )
+            .await
+            .map_err(IpcError::from)?;
+        let reply = reply.ok_or_else(|| {
+            IpcError::ZBus(zbus::Error::Failure("GetSettings returned no reply".into()))
+        })?;
+        Ok(SettingsTree::from_wire(&reply))
+    }
+
+    /// `SetSetting(id, value)` on `camera` (`""`: `ActiveCamera`), the
+    /// value sent as its [`SettingValue::to_variant`].
+    pub async fn set_setting_value(
+        &self,
+        camera: &str,
+        id: &str,
+        value: &SettingValue,
+    ) -> Result<(), IpcError> {
+        let value = value.to_variant();
+        self.set_setting(id, Variant::from(value), camera_options(camera))
+            .await
+    }
+
+    /// `ResetSettings(scope)` on `camera` (`""`: `ActiveCamera`).
+    pub async fn reset_settings_scope(
+        &self,
+        camera: &str,
+        scope: &ResetScope,
+    ) -> Result<(), IpcError> {
+        self.reset_settings(&scope.to_wire(), camera_options(camera))
+            .await
     }
 }

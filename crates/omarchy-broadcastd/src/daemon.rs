@@ -41,7 +41,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 
 use crate::backend::real::GstBackend;
-use crate::backend::{PipeWireReporter, PreviewReporter};
+use crate::backend::{ControlEventReporter, PipeWireReporter, PreviewReporter};
 use crate::consumers::ConsumerWatcher;
 use crate::controller::{self, Command, Controller, Paths, Published, preliminary_snapshot};
 use crate::dbus::{Server, run_owner_watch, run_publisher, subscribe_owners};
@@ -173,6 +173,16 @@ fn pipewire_reporter(commands: &Sender<Command>) -> PipeWireReporter {
     })
 }
 
+/// The control-event watcher's reporter: the open camera's control
+/// changes go to the controller, with the generation of the watcher that
+/// saw them, on the same command channel.
+fn control_reporter(commands: &Sender<Command>) -> ControlEventReporter {
+    let tx = commands.clone();
+    Arc::new(move |generation, event| {
+        let _ = tx.send(Command::ControlEvent(generation, event));
+    })
+}
+
 async fn serve(paths: Paths) -> Result<(), DaemonError> {
     let io = |what: &str| {
         let what = what.to_string();
@@ -209,6 +219,7 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
     let hook = consumer_watcher(&commands)?;
     let reporter = pipewire_reporter(&commands);
     let previews = preview_reporter(&published);
+    let controls = control_reporter(&commands);
     let tx = commands.clone();
     let cameras = CameraWatcher::spawn(PathBuf::from("/dev"), SETTLE, SECOND_SCAN, move || {
         let _ = tx.send(Command::Rescan);
@@ -222,6 +233,7 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
         .name("obc-controller".into())
         .spawn(move || {
             let res = GstBackend::new(Some(reporter), Some(previews)).map(|backend| {
+                let backend = backend.with_control_reporter(controls);
                 // Controller::new makes the first writer attempt.
                 let ctrl = Controller::new(backend, paths, published, Some(hook), Instant::now());
                 let _ = ready_tx.send(());

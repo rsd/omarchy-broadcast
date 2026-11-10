@@ -14,6 +14,19 @@ If the daemon crashes, applications that hold the virtual camera keep it: the da
 
 Some cameras keep image settings from other software far from their defaults (oversharpened, oversaturated). `omarchy-broadcast controls` shows a camera's brightness, contrast, saturation, sharpness and backlight compensation, `omarchy-broadcast controls set NAME VALUE` changes one and `omarchy-broadcast controls reset` puts them back to the camera's defaults. The daemon keeps the values per camera and writes them whenever that camera opens ([docs/adr/0020-camera-image-controls.md](docs/adr/0020-camera-image-controls.md)).
 
+Beyond those five, `omarchy-broadcast settings` lists every standard setting the camera offers, by group (image, white balance, exposure, focus and zoom, anything else), with its value, what it takes and, for one that cannot be changed now, why: exposure time is greyed with "Set exposure to manual to change this" while exposure is automatic. The daemon works the rules out from the camera's own flags, so no client carries a list of controls. On a Logitech Brio or MX Brio the field of view (90, 78 or 65 degrees) is among them. The values are stored per camera and written whenever the camera opens, as above.
+
+```sh
+omarchy-broadcast settings                                        # show them all
+omarchy-broadcast settings set camera.exposure.auto_exposure manual
+omarchy-broadcast settings set camera.exposure.exposure_time_absolute 400
+omarchy-broadcast settings set camera.exposure.keep_framerate on  # keep 30 fps in low light
+omarchy-broadcast settings set -- camera.focus.pan_absolute -3600
+omarchy-broadcast settings reset --group=exposure                 # or --setting=ID, or nothing for the whole camera
+```
+
+A change applies at once while the camera is in use, and otherwise at the next time it opens. While the daemon has the camera open it also follows changes other software makes to it, with no polling. The tree, the D-Bus revision 7 members and the `watch --json` lines that carry it are described in [docs/adr/0023-settings-schema.md](docs/adr/0023-settings-schema.md), [docs/dbus-api.md](docs/dbus-api.md#camera-settings) and [docs/cli-json.md](docs/cli-json.md#camera-settings).
+
 ## Requirements
 
 - NVIDIA GPU with the proprietary driver
@@ -83,7 +96,7 @@ Tests, including the manual check with OBS or Chrome, are described in [docs/tes
 
 ## Documentation
 
-See [docs/README.md](docs/README.md) for the architecture, decision records, setup guides and benchmarks. The Omarchy bar widget (status icon, on/off, camera, effect and noise-removal selection) is a separate project, the omarchy-broadcast-plugin repository; it is a client of the daemon through `omarchy-broadcast watch --json` and is not installed by the package. For a live preview of the virtual camera, the widget runs `omarchy-broadcast preview --json`, which holds a preview lease and prints a line per frame the daemon writes to a small JPEG file under `$XDG_RUNTIME_DIR` ([docs/cli-json.md](docs/cli-json.md#preview)); a preview counts as a user of the camera, so it starts it.
+See [docs/README.md](docs/README.md) for the architecture, decision records, setup guides and benchmarks. The Omarchy bar widget (status icon, on/off, camera, effect and noise-removal selection) is a separate project, the omarchy-broadcast-plugin repository; it is a client of the daemon through `omarchy-broadcast watch --json` and is not installed by the package. Its camera settings panel (plugin 0.19.0) needs omarchy-broadcast 0.22.0 or newer, the first release with the settings channel ([docs/adr/0023-settings-schema.md](docs/adr/0023-settings-schema.md)); against an older daemon the plugin shows the cameras and asks for an update. For a live preview of the virtual camera, the widget runs `omarchy-broadcast preview --json`, which holds a preview lease and prints a line per frame the daemon writes to a small JPEG file under `$XDG_RUNTIME_DIR` ([docs/cli-json.md](docs/cli-json.md#preview)); a preview counts as a user of the camera, so it starts it.
 
 ## Licence
 

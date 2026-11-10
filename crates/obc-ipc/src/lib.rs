@@ -44,8 +44,13 @@ use zbus::proxy::{CacheProperties, MethodFlags};
 use zbus::{Connection, DBusError, OwnedVariant, Type, Variant};
 
 pub mod client;
+pub mod settings;
 
 pub use client::OmarchyBroadcastProxy;
+pub use settings::{
+    Condition, ConditionOp, ResetScope, Setting, SettingChange, SettingKind, SettingValue,
+    SettingsGroup, SettingsTree, valid_setting_id,
+};
 
 /// Well-known name of the daemon on the session bus.
 pub const BUS_NAME: &str = "br.com.dias.OmarchyBroadcast";
@@ -65,8 +70,12 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// `ReleasePreview`, the `PreviewFrame` signal and `PreviewConsumers`, with
 /// `Consumers` counting the preview leases too. Revision 6 added the camera
 /// image controls: `CameraControls`, `GetCameraControls`,
-/// `SetCameraControl` and `ResetCameraControls`.
-pub const INTERFACE_REVISION: u32 = 6;
+/// `SetCameraControl` and `ResetCameraControls`. Revision 7 added the
+/// camera settings channel ([`settings`]): `SettingsRevision`,
+/// `SettingsSchemaSerial`, `GetSettings`, `SetSetting`, `ResetSettings`,
+/// the `SettingsChanged` signal and the `UnknownSetting`, `Disabled` and
+/// `RateLimited` errors.
+pub const INTERFACE_REVISION: u32 = 7;
 /// The first [`INTERFACE_REVISION`] with `LoopbackConsumers`,
 /// `PipeWireConsumers` and `PipeWireOutput`.
 pub const PIPEWIRE_REVISION: u32 = 3;
@@ -82,6 +91,16 @@ pub const PREVIEW_FPS: [u32; 2] = [15, 30];
 /// `CameraControls`, `GetCameraControls`, `SetCameraControl` and
 /// `ResetCameraControls`.
 pub const CONTROLS_REVISION: u32 = 6;
+/// The first [`INTERFACE_REVISION`] with the camera settings channel
+/// ([`settings`]): `SettingsRevision`, `SettingsSchemaSerial`,
+/// `GetSettings`, `SetSetting`, `ResetSettings` and `SettingsChanged`.
+pub const SETTINGS_REVISION: u32 = 7;
+/// The settings schema version this crate describes: the meaning of the
+/// setting dictionaries ([`settings`]), separate from
+/// [`INTERFACE_REVISION`]. Additions (a key, a setting type, a hint) keep
+/// it; a changed meaning raises it, and a client that meets a higher one
+/// does not render the settings.
+pub const SETTINGS_SCHEMA: u32 = 1;
 /// The image controls the daemon may expose, by their v4l2-ctl names, in
 /// the order it reports them. A camera exposes those it has; the daemon
 /// checks names and values, this list is for clients (labels, layout).
@@ -276,8 +295,9 @@ impl Default for Stats {
 #[derive(Debug, DBusError)]
 #[zbus(prefix = "br.com.dias.OmarchyBroadcast1.Error")]
 pub enum IpcError {
-    /// `SelectCamera` (or, from revision 6, a camera control method) named
-    /// no camera that is present.
+    /// `SelectCamera` (or, from revision 6, a camera control method; from
+    /// revision 7, the `camera` option of a settings method) named no
+    /// camera that is present.
     NoSuchCamera(String),
     /// The configuration file is invalid; the previous config stays in force.
     InvalidConfig(String),
@@ -289,10 +309,22 @@ pub enum IpcError {
     /// (revision 2); a preview frame rate other than 15 or 30 (revision 5);
     /// a camera control name that is not one of [`CAMERA_CONTROL_NAMES`] or
     /// that the camera does not expose, or a value outside the control's
-    /// range or off its step (revision 6).
+    /// range or off its step (revision 6); a `SetSetting` value of the
+    /// wrong D-Bus type, outside the setting's range or off its step, an
+    /// enum value that is not an option, an action fired with anything but
+    /// `true`, a `ResetSettings` scope that is not one (revision 7).
     InvalidArgument(String),
     /// Any other failure.
     Failed(String),
+    /// `SetSetting` or `ResetSettings` named a setting id that is not in
+    /// the target camera's tree (revision 7).
+    UnknownSetting(String),
+    /// `SetSetting` named a setting that is not enabled now; the message is
+    /// its `disabled_reason` (revision 7).
+    Disabled(String),
+    /// `SetSetting` came over the daemon's cap on device writes; nothing
+    /// was stored (revision 7).
+    RateLimited(String),
     /// A transport or protocol error (not a daemon reply).
     #[zbus(error)]
     ZBus(zbus::Error),
@@ -306,7 +338,10 @@ impl IpcError {
             | IpcError::InvalidConfig(m)
             | IpcError::Unavailable(m)
             | IpcError::InvalidArgument(m)
-            | IpcError::Failed(m) => m.clone(),
+            | IpcError::Failed(m)
+            | IpcError::UnknownSetting(m)
+            | IpcError::Disabled(m)
+            | IpcError::RateLimited(m) => m.clone(),
             IpcError::ZBus(e) => e.to_string(),
         }
     }
@@ -351,6 +386,12 @@ pub struct Snapshot {
     /// `CameraControls` (revision 6): the image controls of `ActiveCamera`;
     /// `None` when the daemon does not offer it.
     pub camera_controls: Option<CameraControls>,
+    /// `SettingsRevision` (revision 7): bumped on every change of the
+    /// published settings tree; `None` when the daemon does not offer it.
+    pub settings_revision: Option<u32>,
+    /// `SettingsSchemaSerial` (revision 7): bumped on a structural change
+    /// of the settings tree; `None` when the daemon does not offer it.
+    pub settings_schema_serial: Option<u32>,
     pub interface_revision: u32,
 }
 
@@ -375,6 +416,8 @@ impl Snapshot {
             preview_consumers: 0,
             pipewire_output: PIPEWIRE_OFF.into(),
             camera_controls: None,
+            settings_revision: None,
+            settings_schema_serial: None,
             interface_revision: 0,
         }
     }
@@ -415,6 +458,10 @@ impl Snapshot {
             "PreviewConsumers" => self.preview_consumers = deserialize_for_property(value)?,
             "PipeWireOutput" => self.pipewire_output = deserialize_for_property(value)?,
             "CameraControls" => self.camera_controls = Some(deserialize_for_property(value)?),
+            "SettingsRevision" => self.settings_revision = Some(deserialize_for_property(value)?),
+            "SettingsSchemaSerial" => {
+                self.settings_schema_serial = Some(deserialize_for_property(value)?)
+            }
             "InterfaceRevision" => self.interface_revision = deserialize_for_property(value)?,
             _ => {}
         }
@@ -487,8 +534,8 @@ impl Snapshot {
     ///
     /// The properties added after revision 1 (`BlurStrength`,
     /// `BackgroundImage`, `PipeWireConsumers`, `PipeWireOutput`, `Denoise`,
-    /// `PreviewConsumers`, `CameraControls`)
-    /// keep their [`Snapshot::empty`] value when the daemon does not offer
+    /// `PreviewConsumers`, `CameraControls`, `SettingsRevision`,
+    /// `SettingsSchemaSerial`) keep their [`Snapshot::empty`] value when the daemon does not offer
     /// them (see [`is_unknown_property_error`]), and `LoopbackConsumers` is then
     /// `Consumers`, as [`Snapshot::from_properties`] does for a property
     /// missing from `GetAll`; any other failure to read them is an error.
@@ -517,6 +564,14 @@ impl Snapshot {
             camera_controls: optional(
                 proxy.camera_controls().await.map(Some),
                 empty.camera_controls,
+            )?,
+            settings_revision: optional(
+                proxy.settings_revision().await.map(Some),
+                empty.settings_revision,
+            )?,
+            settings_schema_serial: optional(
+                proxy.settings_schema_serial().await.map(Some),
+                empty.settings_schema_serial,
             )?,
             interface_revision: proxy.interface_revision().await?,
         })
@@ -880,7 +935,7 @@ mod tests {
         assert_eq!(old.camera_controls, None);
         assert!(old.interface_revision < CONTROLS_REVISION);
         assert_eq!(Snapshot::empty().camera_controls, None);
-        assert_eq!(INTERFACE_REVISION, CONTROLS_REVISION);
+        const { assert!(INTERFACE_REVISION >= CONTROLS_REVISION) };
         assert_eq!(
             CAMERA_CONTROL_NAMES,
             [
@@ -903,6 +958,60 @@ mod tests {
                 }]
             })
         );
+    }
+
+    #[test]
+    fn the_revision_7_properties_errors_and_an_older_daemon() {
+        let state = Variant::from("idle");
+        let rev7 = Variant::from(SETTINGS_REVISION);
+        let rev = Variant::from(12u32);
+        let serial = Variant::from(3u32);
+        let snap = Snapshot::from_properties([
+            ("State", &state),
+            ("SettingsRevision", &rev),
+            ("SettingsSchemaSerial", &serial),
+            ("InterfaceRevision", &rev7),
+        ])
+        .unwrap();
+        assert_eq!(
+            (snap.settings_revision, snap.settings_schema_serial),
+            (Some(12), Some(3))
+        );
+        let mut changed = snap.clone();
+        changed
+            .apply_property("SettingsRevision", &Variant::from(13u32))
+            .unwrap();
+        assert_eq!(changed.settings_revision, Some(13));
+        assert_eq!(changed.settings_schema_serial, Some(3));
+        assert!(changed.apply_property("SettingsRevision", &state).is_err());
+        assert!(
+            changed
+                .apply_property("SettingsSchemaSerial", &state)
+                .is_err()
+        );
+        // A revision-6 daemon has neither: None.
+        let rev6 = Variant::from(CONTROLS_REVISION);
+        let old =
+            Snapshot::from_properties([("State", &state), ("InterfaceRevision", &rev6)]).unwrap();
+        assert_eq!(
+            (old.settings_revision, old.settings_schema_serial),
+            (None, None)
+        );
+        assert!(old.interface_revision < SETTINGS_REVISION);
+        assert_eq!(INTERFACE_REVISION, SETTINGS_REVISION);
+        assert_eq!((SETTINGS_REVISION, SETTINGS_SCHEMA), (7, 1));
+
+        for (e, name) in [
+            (IpcError::UnknownSetting("u".into()), "UnknownSetting"),
+            (IpcError::Disabled("d".into()), "Disabled"),
+            (IpcError::RateLimited("r".into()), "RateLimited"),
+        ] {
+            assert_eq!(
+                zbus::DBusError::name(&e).as_str(),
+                format!("{ERROR_PREFIX}.{name}")
+            );
+            assert_eq!(e.message().len(), 1);
+        }
     }
 
     #[test]

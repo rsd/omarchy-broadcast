@@ -69,10 +69,30 @@ pub const CTRL_FLAG_READ_ONLY: u32 = 0x0004;
 /// manual setting while its automatic mode is on, say).
 pub const CTRL_FLAG_INACTIVE: u32 = 0x0010;
 
+/// `V4L2_CTRL_FLAG_GRABBED`: the control cannot be changed now (the device
+/// streams, typically).
+pub const CTRL_FLAG_GRABBED: u32 = 0x0002;
+/// `V4L2_CTRL_FLAG_UPDATE`: changing it may change other controls.
+pub const CTRL_FLAG_UPDATE: u32 = 0x0008;
+/// `V4L2_CTRL_FLAG_SLIDER`: a hint that a slider suits it.
+pub const CTRL_FLAG_SLIDER: u32 = 0x0020;
+/// `V4L2_CTRL_FLAG_WRITE_ONLY`: it has no readable value.
+pub const CTRL_FLAG_WRITE_ONLY: u32 = 0x0040;
+/// `V4L2_CTRL_FLAG_VOLATILE`: the device changes its value by itself.
+pub const CTRL_FLAG_VOLATILE: u32 = 0x0080;
+
 /// `V4L2_CTRL_TYPE_INTEGER`
 pub const CTRL_TYPE_INTEGER: u32 = 1;
 /// `V4L2_CTRL_TYPE_BOOLEAN`
 pub const CTRL_TYPE_BOOLEAN: u32 = 2;
+/// `V4L2_CTRL_TYPE_MENU`: a value is the index of a named item.
+pub const CTRL_TYPE_MENU: u32 = 3;
+/// `V4L2_CTRL_TYPE_BUTTON`: an action, without a value.
+pub const CTRL_TYPE_BUTTON: u32 = 4;
+/// `V4L2_CTRL_TYPE_CTRL_CLASS`: a class header, not a control.
+pub const CTRL_TYPE_CTRL_CLASS: u32 = 6;
+/// `V4L2_CTRL_TYPE_INTEGER_MENU`: a value is the index of an integer item.
+pub const CTRL_TYPE_INTEGER_MENU: u32 = 9;
 
 #[repr(C)]
 struct V4l2QueryCtrl {
@@ -121,6 +141,11 @@ impl CtrlInfo {
         self.flags & CTRL_FLAG_INACTIVE != 0
     }
 
+    /// Whether the device refuses changes now ([`CTRL_FLAG_GRABBED`]).
+    pub fn grabbed(&self) -> bool {
+        self.flags & CTRL_FLAG_GRABBED != 0
+    }
+
     /// Whether a user may adjust it as an image control: neither disabled,
     /// read-only nor inactive, and an integer or a boolean.
     pub fn adjustable(&self) -> bool {
@@ -146,7 +171,7 @@ pub fn query_ctrl(path: &Path, id: u32) -> std::io::Result<Option<CtrlInfo>> {
     query_ctrl_on(&open_node(path, false)?, id)
 }
 
-fn query_ctrl_on(file: &fs::File, id: u32) -> std::io::Result<Option<CtrlInfo>> {
+pub(crate) fn query_ctrl_on(file: &fs::File, id: u32) -> std::io::Result<Option<CtrlInfo>> {
     Ok(query_ctrl_raw(file, id)?.map(|(_, info)| info))
 }
 
@@ -242,7 +267,8 @@ pub fn probe_ctrl(path: &Path, id: u32) -> Result<(CtrlInfo, i32), CtrlSkip> {
 }
 
 /// `_IOWR('V', 27, struct v4l2_control)`
-const VIDIOC_G_CTRL: libc::c_ulong = (3 << 30) | (8 << 16) | ((b'V' as libc::c_ulong) << 8) | 27;
+pub(crate) const VIDIOC_G_CTRL: libc::c_ulong =
+    (3 << 30) | (8 << 16) | ((b'V' as libc::c_ulong) << 8) | 27;
 /// `_IOWR('V', 28, struct v4l2_control)`
 pub(crate) const VIDIOC_S_CTRL: libc::c_ulong =
     (3 << 30) | (8 << 16) | ((b'V' as libc::c_ulong) << 8) | 28;

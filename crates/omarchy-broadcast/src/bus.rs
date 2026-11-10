@@ -6,16 +6,18 @@
 //! `org.freedesktop.DBus.Properties.GetAll` carrying the `NO_AUTO_START`
 //! flag), so `status`, `cameras` and `watch` never trigger D-Bus activation;
 //! `controls` reads the image controls with a `GetCameraControls` carrying
-//! the same flag ([`camera_controls`]).
+//! the same flag ([`camera_controls`]), and `settings` and `watch` read the
+//! camera settings with a `GetSettings` carrying it ([`settings_tree`]).
 //! The generated property getters of [`obc_ipc::OmarchyBroadcastProxy`] (and its
 //! cache, filled by a `GetAll` without that flag) would. Methods go through
 //! the proxy, without the flag: `on`, `off`, `camera`, `effect <effect>`,
-//! `denoise`, `controls set` and `controls reset` may start the daemon when
-//! its activation file is installed.
+//! `denoise`, `controls set`, `controls reset`, `settings set` and
+//! `settings reset` may start the daemon when its activation file is
+//! installed.
 
 use std::time::Duration;
 
-use obc_ipc::{BUS_NAME, CameraControl, IpcError, OmarchyBroadcastProxy, Snapshot};
+use obc_ipc::{BUS_NAME, CameraControl, IpcError, OmarchyBroadcastProxy, SettingsTree, Snapshot};
 use zbus::proxy::{CacheProperties, MethodFlags};
 use zbus::{Connection, DBusError};
 
@@ -28,7 +30,8 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Exit status: success.
 pub const EXIT_OK: u8 = 0;
 /// Exit status: the daemon rejected the request (`NoSuchCamera`,
-/// `InvalidConfig`, `InvalidArgument`, `Unavailable`, `Failed`).
+/// `InvalidConfig`, `InvalidArgument`, `Unavailable`, `Failed`,
+/// `UnknownSetting`, `Disabled`, `RateLimited`), or is too old for it.
 pub const EXIT_REJECTED: u8 = 1;
 /// Exit status: invalid command line (clap's own status).
 pub const EXIT_USAGE: u8 = 2;
@@ -53,6 +56,11 @@ pub use obc_ipc::PREVIEW_REVISION;
 /// (`CameraControls`, `GetCameraControls`, `SetCameraControl`,
 /// `ResetCameraControls`).
 pub use obc_ipc::CONTROLS_REVISION;
+
+/// The first `InterfaceRevision` with the camera settings (`GetSettings`,
+/// `SetSetting`, `ResetSettings`, `SettingsChanged`, `SettingsRevision`,
+/// `SettingsSchemaSerial`).
+pub use obc_ipc::SETTINGS_REVISION;
 
 /// How to start the daemon, quoted in the not-running message.
 pub const START_HINT: &str = "systemctl --user start omarchy-broadcastd";
@@ -177,6 +185,18 @@ pub fn require_controls(revision: u32) -> Result<(), Failure> {
     )))
 }
 
+/// Fails unless a daemon of interface revision `revision` has the camera
+/// settings.
+pub fn require_settings(revision: u32) -> Result<(), Failure> {
+    if revision >= SETTINGS_REVISION {
+        return Ok(());
+    }
+    Err(Failure::Unsupported(format!(
+        "the daemon does not support camera settings (its interface revision is {revision}, \
+         camera settings need {SETTINGS_REVISION}); update omarchy-broadcastd"
+    )))
+}
+
 /// The daemon's preview frame `path` does not fit a JSON line (it is never
 /// clipped: a clipped path names no file).
 pub fn preview_path_too_long(path: &str) -> Failure {
@@ -262,6 +282,25 @@ pub async fn camera_controls(
             .await
             .map_err(classify_no_autostart)?;
         reply.ok_or_else(|| Failure::Other("GetCameraControls returned no reply".into()))
+    };
+    tokio::time::timeout(READ_TIMEOUT, call)
+        .await
+        .unwrap_or_else(|_| Err(timed_out(READ_TIMEOUT)))
+}
+
+/// `GetSettings` for `camera` (an id; `""` is the active camera) without
+/// starting the daemon, within [`READ_TIMEOUT`]. With no camera present the
+/// tree has camera `""` and no group.
+pub async fn settings_tree(conn: &Connection, camera: &str) -> Result<SettingsTree, Failure> {
+    let call = async {
+        let proxy = proxy(conn).await?;
+        proxy
+            .settings_tree_no_autostart(camera)
+            .await
+            .map_err(|e| match e {
+                IpcError::ZBus(z) => classify(&z, false),
+                rejected => Failure::Rejected(rejected),
+            })
     };
     tokio::time::timeout(READ_TIMEOUT, call)
         .await
@@ -378,6 +417,29 @@ mod tests {
             "the daemon does not support camera controls (its interface revision is 5, camera \
              controls need 6); update omarchy-broadcastd"
         );
+    }
+
+    #[test]
+    fn camera_settings_need_revision_7() {
+        assert!(require_settings(SETTINGS_REVISION).is_ok());
+        assert!(require_settings(SETTINGS_REVISION + 1).is_ok());
+        let f = require_settings(6).unwrap_err();
+        assert_eq!(f.exit_code(), EXIT_REJECTED);
+        assert_eq!(f.json_code(), "unsupported-daemon");
+        assert_eq!(
+            f.message(),
+            "the daemon does not support camera settings (its interface revision is 6, camera \
+             settings need 7); update omarchy-broadcastd"
+        );
+        for e in [
+            IpcError::UnknownSetting("u".into()),
+            IpcError::Disabled("d".into()),
+            IpcError::RateLimited("r".into()),
+        ] {
+            let f = classify_ipc(e);
+            assert_eq!(f.exit_code(), EXIT_REJECTED);
+            assert_eq!(f.message().len(), 1);
+        }
     }
 
     #[test]

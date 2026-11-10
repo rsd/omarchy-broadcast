@@ -309,6 +309,23 @@ async fn until(what: &str, seen: &Arc<Mutex<Vec<String>>>, done: impl Fn(&[Strin
     }
 }
 
+/// The state file once `done` holds of its text (a settings change is
+/// saved after a delay).
+async fn state_file_until(rig: &Rig, done: impl Fn(&str) -> bool) -> String {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let text = fs::read_to_string(&rig.paths.state).unwrap_or_default();
+        if done(&text) {
+            return text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out; the state file is {text:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn wait_state(proxy: &OmarchyBroadcastProxy<'_>, want: State) {
     let deadline = Instant::now() + TIMEOUT;
     loop {
@@ -366,11 +383,13 @@ async fn every_property_reads_through_the_proxy() {
                 camera: "pci-b".into(),
                 controls: Vec::new(),
             }),
+            settings_revision: Some(1),
+            settings_schema_serial: Some(1),
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 6);
-    // GetAll returns the same seventeen properties.
+    assert_eq!(INTERFACE_REVISION, 7);
+    // GetAll returns the same nineteen properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
         .destination(obc_ipc::BUS_NAME)
         .path(OBJECT_PATH)
@@ -404,6 +423,8 @@ async fn every_property_reads_through_the_proxy() {
             "PipeWireConsumers",
             "PipeWireOutput",
             "PreviewConsumers",
+            "SettingsRevision",
+            "SettingsSchemaSerial",
             "State"
         ]
     );
@@ -432,6 +453,12 @@ async fn every_property_reads_through_the_proxy() {
         "<method name=\"GetCameraControls\">",
         "<method name=\"SetCameraControl\">",
         "<method name=\"ResetCameraControls\">",
+        "<method name=\"GetSettings\">",
+        "<method name=\"SetSetting\">",
+        "<method name=\"ResetSettings\">",
+        "<signal name=\"SettingsChanged\">",
+        "<property name=\"SettingsRevision\" type=\"u\" access=\"read\"",
+        "<property name=\"SettingsSchemaSerial\" type=\"u\" access=\"read\"",
         "<property name=\"CameraControls\" type=\"(sa(siiiiib))\" access=\"read\"",
         "<signal name=\"PreviewFrame\">",
         "<property name=\"PreviewConsumers\" type=\"u\" access=\"read\"",
@@ -842,7 +869,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 6);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 7);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -900,7 +927,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 6);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 7);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -1016,7 +1043,7 @@ async fn preview_leases_by_bus_name_their_property_and_their_frames() {
     let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 6);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 7);
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
     let seen = rig.record_changes().await;
     let mut frames = proxy.receive_preview_frame().await.unwrap();
@@ -1336,7 +1363,8 @@ async fn camera_control_methods_their_property_and_their_errors() {
         s.iter().any(|e| e.starts_with("CameraControls="))
     })
     .await;
-    let state = fs::read_to_string(&rig.paths.state).unwrap();
+    // Saved after the settings write-behind delay.
+    let state = state_file_until(&rig, |t| t.contains("values = { sharpness = 128 }")).await;
     assert!(state.contains("values = { sharpness = 128 }"), "{state}");
 
     // Active: the open applies it; a set writes at once.
@@ -1361,7 +1389,7 @@ async fn camera_control_methods_their_property_and_their_errors() {
         .unwrap();
     let view = proxy.camera_controls().await.unwrap();
     assert!(view.controls.iter().all(|c| !c.stored && c.value == 128));
-    let state = fs::read_to_string(&rig.paths.state).unwrap();
+    let state = state_file_until(&rig, |t| !t.contains("camera_controls")).await;
     assert!(!state.contains("camera_controls"), "{state}");
 
     // Each error by its name.
@@ -1448,4 +1476,293 @@ async fn camera_control_methods_their_property_and_their_errors() {
     // No camera: camera "" and no control.
     let view = proxy.camera_controls().await.unwrap();
     assert_eq!(view, obc_ipc::CameraControls::default());
+}
+
+/// The `<method>`, `<signal>` or `<property>` element named `name` in
+/// introspection data, its arguments included.
+fn element<'a>(xml: &'a str, kind: &str, name: &str) -> &'a str {
+    let start = xml
+        .find(&format!("<{kind} name=\"{name}\""))
+        .unwrap_or_else(|| panic!("no {kind} {name} in {xml}"));
+    let rest = &xml[start..];
+    let end = rest
+        .find(&format!("</{kind}>"))
+        .map_or_else(|| rest.find("/>").unwrap() + 2, |e| e + kind.len() + 3);
+    &rest[..end]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_methods_their_signal_their_properties_and_their_errors() {
+    use crate::backend::fake::brio_device;
+    use obc_ipc::settings::{ResetScope, camera_options};
+    use obc_ipc::{SettingChange, SettingValue};
+
+    const MODE: &str = "camera.exposure.auto_exposure";
+    const EXPOSURE: &str = "camera.exposure.exposure_time_absolute";
+    const SHARP: &str = "camera.image.sharpness";
+    let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |w| {
+        w.devices.insert("usb-a".into(), brio_device());
+    })
+    .await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    let deadline = Instant::now() + TIMEOUT;
+    while proxy.active_camera().await.unwrap().is_empty() {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let seen = rig.record_changes().await;
+
+    // The signatures.
+    let xml = fdo::IntrospectableProxy::builder(&rig.client)
+        .destination(obc_ipc::BUS_NAME)
+        .path(OBJECT_PATH)
+        .build()
+        .await
+        .unwrap()
+        .introspect()
+        .await
+        .unwrap();
+    let get = element(&xml, "method", "GetSettings");
+    for arg in [
+        "name=\"options\" type=\"a{sv}\" direction=\"in\"",
+        "name=\"revision\" type=\"u\" direction=\"out\"",
+        "name=\"serial\" type=\"u\" direction=\"out\"",
+        "name=\"camera\" type=\"s\" direction=\"out\"",
+        "name=\"groups\" type=\"aa{sv}\" direction=\"out\"",
+    ] {
+        assert!(get.contains(arg), "{arg} not in {get}");
+    }
+    assert_eq!(get.matches("direction=\"out\"").count(), 4, "{get}");
+    let set = element(&xml, "method", "SetSetting");
+    for arg in ["type=\"s\"", "type=\"v\"", "type=\"a{sv}\""] {
+        assert!(set.contains(arg), "{arg} not in {set}");
+    }
+    assert!(!set.contains("direction=\"out\""), "{set}");
+    let reset = element(&xml, "method", "ResetSettings");
+    assert!(
+        reset.contains("type=\"s\"") && reset.contains("type=\"a{sv}\""),
+        "{reset}"
+    );
+    let signal = element(&xml, "signal", "SettingsChanged");
+    assert!(signal.contains("type=\"a(sa{sv})\""), "{signal}");
+    assert_eq!(signal.matches("type=\"u\"").count(), 2, "{signal}");
+
+    // The tree, the revision and serial properties, the snapshot.
+    let tree = within("GetSettings", proxy.settings_tree(""))
+        .await
+        .unwrap();
+    assert_eq!(tree.camera, "usb-a");
+    assert_eq!(
+        (tree.revision, tree.serial),
+        (
+            proxy.settings_revision().await.unwrap(),
+            proxy.settings_schema_serial().await.unwrap()
+        )
+    );
+    assert!(tree.revision >= 1 && tree.serial >= 1);
+    let exp = tree.find(EXPOSURE).unwrap();
+    assert!(!exp.enabled);
+    assert_eq!(exp.disabled_reason, "Set exposure to manual to change this");
+    assert_eq!(
+        tree.groups
+            .iter()
+            .map(|g| g.id.as_str())
+            .collect::<Vec<_>>(),
+        ["image", "white_balance", "exposure", "focus"]
+    );
+    let snap = within("snapshot", Snapshot::fetch(&proxy)).await.unwrap();
+    assert_eq!(snap.settings_revision, Some(tree.revision));
+    assert_eq!(snap.settings_schema_serial, Some(tree.serial));
+    // Another camera by id; unknown option keys are ignored.
+    let other = within("GetSettings", proxy.settings_tree("pci-b"))
+        .await
+        .unwrap();
+    assert_eq!((other.camera.as_str(), other.groups.len()), ("pci-b", 0));
+    let mut options = camera_options("");
+    options.insert("future", Variant::from(5u32));
+    let reply = within("GetSettings", proxy.get_settings(options))
+        .await
+        .unwrap();
+    assert_eq!(reply.2, "usb-a");
+
+    // Each error by its name.
+    let name = |e| format!("br.com.dias.OmarchyBroadcast1.Error.{e}");
+    let mut bad_camera = camera_options("");
+    bad_camera.insert("camera", Variant::from(5u32));
+    assert_eq!(
+        error_name(within("GetSettings", proxy.get_settings(bad_camera)).await),
+        name("InvalidArgument")
+    );
+    assert_eq!(
+        error_name(within("GetSettings", proxy.settings_tree("nope")).await),
+        name("NoSuchCamera")
+    );
+    let set = |camera: &'static str, id: &'static str, v: SettingValue| {
+        let proxy = proxy.clone();
+        async move { proxy.set_setting_value(camera, id, &v).await }
+    };
+    assert_eq!(
+        error_name(within("SetSetting", set("nope", SHARP, SettingValue::Int(1))).await),
+        name("NoSuchCamera")
+    );
+    assert_eq!(
+        error_name(
+            within(
+                "SetSetting",
+                set("", "camera.image.nope", SettingValue::Int(1))
+            )
+            .await
+        ),
+        name("UnknownSetting")
+    );
+    assert_eq!(
+        error_name(within("SetSetting", set("", EXPOSURE, SettingValue::Int(500))).await),
+        name("Disabled")
+    );
+    match within("SetSetting", set("", EXPOSURE, SettingValue::Int(500))).await {
+        Err(IpcError::Disabled(m)) => assert_eq!(m, "Set exposure to manual to change this"),
+        other => panic!("expected Disabled, got {other:?}"),
+    }
+    for v in [
+        SettingValue::Int(256),
+        SettingValue::Bool(true),
+        SettingValue::Str("x".into()),
+    ] {
+        assert_eq!(
+            error_name(within("SetSetting", set("", SHARP, v.clone())).await),
+            name("InvalidArgument"),
+            "{v:?}"
+        );
+    }
+    // A D-Bus type no setting takes.
+    assert_eq!(
+        error_name(
+            within(
+                "SetSetting",
+                proxy.set_setting(SHARP, Variant::from(1.5f64), camera_options(""))
+            )
+            .await
+        ),
+        name("InvalidArgument")
+    );
+    let reset = |scope: &'static str| {
+        let proxy = proxy.clone();
+        async move { proxy.reset_settings(scope, camera_options("")).await }
+    };
+    assert_eq!(
+        error_name(within("ResetSettings", reset("all")).await),
+        name("InvalidArgument")
+    );
+    assert_eq!(
+        error_name(within("ResetSettings", reset("group:nope")).await),
+        name("UnknownSetting")
+    );
+    assert_eq!(
+        error_name(
+            within(
+                "ResetSettings",
+                proxy.reset_settings_scope("nope", &ResetScope::Camera)
+            )
+            .await
+        ),
+        name("NoSuchCamera")
+    );
+    assert!(rig.world().control_writes.is_empty());
+
+    // Streaming: the mode and the exposure time it enables, in one signal.
+    rig.consumers(1);
+    wait_state(&proxy, State::Active).await;
+    let mut signals = proxy.receive_settings_changed().await.unwrap();
+    let before = proxy.settings_revision().await.unwrap();
+    let serial = proxy.settings_schema_serial().await.unwrap();
+    within(
+        "SetSetting",
+        set("", MODE, SettingValue::Str("manual".into())),
+    )
+    .await
+    .unwrap();
+    let sig = within("SettingsChanged", signals.next()).await.unwrap();
+    let args = sig.args().unwrap();
+    assert_eq!((args.revision, args.serial), (before + 1, serial));
+    assert_eq!(
+        args.to_changes(),
+        [
+            SettingChange {
+                id: MODE.into(),
+                value: Some(SettingValue::Str("manual".into())),
+                stored: true,
+                enabled: true,
+                disabled_reason: String::new(),
+            },
+            SettingChange {
+                id: EXPOSURE.into(),
+                value: Some(SettingValue::Int(1250)),
+                stored: false,
+                enabled: true,
+                disabled_reason: String::new(),
+            },
+        ]
+    );
+    // The property is up to date when the signal arrives.
+    assert_eq!(proxy.settings_revision().await.unwrap(), before + 1);
+    until("SettingsRevision changed", &seen, |s| {
+        s.iter()
+            .any(|e| *e == format!("SettingsRevision={}", before + 1))
+    })
+    .await;
+    // Any integer type for an int.
+    within(
+        "SetSetting",
+        proxy.set_setting(EXPOSURE, Variant::from(500u16), camera_options("usb-a")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rig.world().devices["usb-a"].value(crate::backend::fake::cid::EXPOSURE),
+        500
+    );
+    // A reset of one setting while streaming: its default written.
+    within(
+        "ResetSettings",
+        proxy.reset_settings_scope("", &ResetScope::Setting(EXPOSURE.into())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rig.world().devices["usb-a"].value(crate::backend::fake::cid::EXPOSURE),
+        156
+    );
+    let tree = within("GetSettings", proxy.settings_tree(""))
+        .await
+        .unwrap();
+    assert!(!tree.find(EXPOSURE).unwrap().stored);
+    // Over the cap: RateLimited. (A signal stream left unread would fill
+    // the client connection's queue and stall its replies.)
+    drop(signals);
+    let mut limited = None;
+    // Six settings in turn: each written at most every 50 ms, so over
+    // 100 writes a second in all.
+    let ids = [
+        "camera.image.brightness",
+        "camera.image.contrast",
+        SHARP,
+        "camera.exposure.gain",
+        "camera.white_balance.white_balance_automatic",
+        "camera.exposure.keep_framerate",
+    ];
+    for k in 0..400usize {
+        let id = ids[k % ids.len()];
+        let v = if k % ids.len() < 4 {
+            SettingValue::Int((k % 2) as i64)
+        } else {
+            SettingValue::Bool(k % 2 == 0)
+        };
+        if let Err(e @ IpcError::RateLimited(_)) = within("SetSetting", set("", id, v)).await {
+            limited = Some(e);
+            break;
+        }
+    }
+    let e = limited.expect("rate limited within 400 calls");
+    assert_eq!(zbus::DBusError::name(&e).to_string(), name("RateLimited"));
 }

@@ -29,6 +29,8 @@ struct H {
     ctrl: Controller<FakeBackend>,
     fake: FakeBackend,
     notes: UnboundedReceiver<Note>,
+    /// The `SettingsChanged` notes drained: (revision, serial, changes).
+    settings_notes: Vec<(u32, u32, Vec<SettingChange>)>,
     paths: Paths,
     t0: Instant,
     _dir: TempDir,
@@ -58,6 +60,7 @@ impl H {
             ctrl,
             fake,
             notes,
+            settings_notes: Vec::new(),
             paths,
             t0,
             _dir: dir,
@@ -147,6 +150,11 @@ impl H {
                 Note::Changed(c) => changes.extend(c),
                 Note::Stats(s) => stats.push(s),
                 Note::PreviewFrame(_) => {}
+                Note::SettingsChanged {
+                    revision,
+                    serial,
+                    changes,
+                } => self.settings_notes.push((revision, serial, changes)),
             }
         }
         (changes, stats)
@@ -171,7 +179,10 @@ impl H {
         assert_eq!(self.state(), State::Active, "{:?}", self.snap());
     }
 
-    fn persisted(&self) -> RuntimeState {
+    /// The state file, once a settings change waiting for its delayed
+    /// save is saved.
+    fn persisted(&mut self) -> RuntimeState {
+        self.ctrl.flush_settings();
         let (s, warn) = RuntimeState::load(&self.paths.state);
         assert_eq!(warn, None);
         s
@@ -955,6 +966,8 @@ fn every_transition_of_the_lifecycle_is_announced_in_order() {
             Change::PreviewConsumers(n) => format!("preview={n}"),
             Change::PipeWireOutput(s) => format!("pipewire_output={s}"),
             Change::CameraControls(v) => format!("controls={}:{}", v.camera, v.controls.len()),
+            Change::SettingsRevision(n) => format!("settings_revision={n}"),
+            Change::SettingsSchemaSerial(n) => format!("settings_serial={n}"),
         })
         .collect();
     assert_eq!(
@@ -974,6 +987,8 @@ fn every_transition_of_the_lifecycle_is_announced_in_order() {
             "cameras=0",
             "active=",
             "controls=:0",
+            "settings_serial=2",
+            "settings_revision=2",
             "consumers=1",
             "loopback=1",
             "error=no camera is available",
@@ -3636,6 +3651,7 @@ fn shutdown_ends_every_lease() {
 
 // ---- camera image controls ----
 
+use obc_core::config::CameraControlState;
 use obc_ipc::CameraControl;
 use obc_pipeline::controls::DeviceControl;
 
@@ -3742,7 +3758,7 @@ impl H {
             .collect()
     }
 
-    fn stored(&self, camera: &str) -> Option<CameraControlState> {
+    fn stored(&mut self, camera: &str) -> Option<CameraControlState> {
         self.persisted().camera_controls.get(camera).cloned()
     }
 }
@@ -3755,10 +3771,24 @@ fn entry(name: &str, value: i32, stored: bool) -> (String, i32, bool) {
     (name.into(), value, stored)
 }
 
-fn stored(values: &[(&str, i32)], reset_pending: bool) -> CameraControlState {
+/// What a `ResetCameraControls` of a closed camera leaves (revision 7:
+/// the five image controls' names in `reset_names`, not `reset_all`),
+/// with `values` stored after it.
+fn image_reset(values: &[(&str, i32)]) -> CameraControlState {
+    CameraControlState {
+        reset_names: obc_core::config::CAMERA_CONTROL_NAMES
+            .iter()
+            .map(|n| n.to_string())
+            .collect(),
+        ..stored(values, false)
+    }
+}
+
+fn stored(values: &[(&str, i32)], reset_all: bool) -> CameraControlState {
     CameraControlState {
         values: values.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
-        reset_pending,
+        reset_all,
+        reset_names: Default::default(),
     }
 }
 
@@ -3877,7 +3907,7 @@ fn set_while_the_camera_is_not_open_only_stores() {
         h.stored("usb-a"),
         Some(stored(&[("brightness", 1), ("sharpness", 100)], false))
     );
-    assert_eq!(h.stored("usb-b"), Some(stored(&[], true)));
+    assert_eq!(h.stored("usb-b"), Some(image_reset(&[])));
 
     // Error (no camera opens): stored only.
     let mut h = H::new("", |w| {
@@ -3891,7 +3921,7 @@ fn set_while_the_camera_is_not_open_only_stores() {
     h.reset_controls("usb-b", 400).unwrap();
     assert!(h.writes().is_empty());
     assert_eq!(h.stored("usb-a"), Some(stored(&[("contrast", 120)], false)));
-    assert_eq!(h.stored("usb-b"), Some(stored(&[], true)));
+    assert_eq!(h.stored("usb-b"), Some(image_reset(&[])));
 
     // A camera that is not the session's, while it starts and while it
     // streams: stored only.
@@ -3909,7 +3939,7 @@ fn set_while_the_camera_is_not_open_only_stores() {
     h.reset_controls("usb-b", 500).unwrap();
     assert!(h.writes().is_empty());
     assert_eq!(h.device("usb-b", "sharpness"), 5);
-    assert_eq!(h.stored("usb-b"), Some(stored(&[], true)));
+    assert_eq!(h.stored("usb-b"), Some(image_reset(&[])));
 }
 
 #[test]
@@ -3983,7 +4013,7 @@ fn a_rename_of_the_session_camera_applies_what_is_stored_under_the_new_id() {
     fs::write(
         &h.paths.state,
         "enabled = true\n[camera_controls.\"usb-b\"]\nvalues = { sharpness = 1 }\n\
-         reset_pending = true\n",
+         reset_all = true\n",
     )
     .unwrap();
     h.restart();
@@ -4122,6 +4152,8 @@ fn stored_values_survive_a_restart_and_apply_at_the_next_open() {
     h.set_control("", "sharpness", 128, 0).unwrap();
     h.set_control("", "saturation", 128, 0).unwrap();
     h.set_control("", "backlight_compensation", 1, 0).unwrap();
+    // Saved after the settings write-behind delay.
+    h.ctrl.flush_settings();
     let text = fs::read_to_string(&h.paths.state).unwrap();
     assert!(
         text.contains(
@@ -4198,10 +4230,12 @@ fn reset_while_idle_is_pending_until_the_next_open() {
     h.set_control("", "sharpness", 10, 0).unwrap();
     h.reset_controls("", 100).unwrap();
     assert!(h.writes().is_empty(), "nothing written while idle");
-    assert_eq!(h.stored("usb-a"), Some(stored(&[], true)));
+    assert_eq!(h.stored("usb-a"), Some(image_reset(&[])));
     let text = fs::read_to_string(&h.paths.state).unwrap();
     assert!(
-        text.contains("[camera_controls.\"usb-a\"]\nreset_pending = true\n"),
+        text.contains(
+            "[camera_controls.\"usb-a\"]\nreset_names = [\"backlight_compensation\", \"brightness\", \"contrast\", \"saturation\", \"sharpness\"]\n"
+        ),
         "{text}"
     );
     // Reported as they will be: the defaults, none stored.
@@ -4210,10 +4244,7 @@ fn reset_while_idle_is_pending_until_the_next_open() {
     assert_eq!(view[4], entry("backlight_compensation", 1, false));
     // A value set after the reset is stored with the reset still pending.
     h.set_control("", "saturation", 100, 200).unwrap();
-    assert_eq!(
-        h.stored("usb-a"),
-        Some(stored(&[("saturation", 100)], true))
-    );
+    assert_eq!(h.stored("usb-a"), Some(image_reset(&[("saturation", 100)])));
     assert_eq!(h.view().1[2], entry("saturation", 100, true));
     // Survives a restart; the open writes the defaults, then the value.
     h.restart();
@@ -4375,7 +4406,7 @@ fn each_camera_keeps_its_own_values_and_a_switch_applies_the_new_ones() {
     // does alone.
     h.reset_controls("usb-a", 3000).unwrap();
     assert!(h.writes().is_empty());
-    assert_eq!(h.stored("usb-a"), Some(stored(&[], true)));
+    assert_eq!(h.stored("usb-a"), Some(image_reset(&[])));
     assert_eq!(h.stored("usb-b"), Some(stored(&[("sharpness", 1)], false)));
     // Selecting while idle changes ActiveCamera: the view follows,
     // announced, nothing written.
@@ -4522,7 +4553,8 @@ fn a_set_opens_the_node_once_and_reads_back_only_the_control_written() {
     let (opens, queries, reads) = counts(&h);
     h.set_control("", "sharpness", 129, 1000).unwrap();
     assert_eq!(h.writes(), [w("usb-a", "sharpness", 129)]);
-    assert_eq!(counts(&h), (opens + 1, queries + 1, reads + 1));
+    // Validated against the last read: no query, only the read-back.
+    assert_eq!(counts(&h), (opens + 1, queries, reads + 1));
     // The view shows the value read back; the user's value is stored.
     assert_eq!(h.view().1[3], entry("sharpness", 130, true));
     assert_eq!(
@@ -4597,4 +4629,1391 @@ fn a_control_that_cannot_be_read_is_left_out_and_warned_about_once() {
     h.activate(300);
     h.set_control("", "sharpness", 1, 1000).unwrap();
     assert_eq!(h.writes(), [w("usb-a", "sharpness", 1)]);
+}
+
+// ---- camera settings (revision 7) ----
+
+use obc_ipc::Setting;
+use obc_pipeline::control_node::NodeControl;
+use obc_pipeline::controls::{CTRL_FLAG_INACTIVE, CTRL_TYPE_INTEGER};
+
+use crate::backend::fake::FakeDevice;
+
+use crate::backend::fake::cid::{AUTO_EXPOSURE, EXPOSURE, GAIN, PAN_RESET, SHARPNESS};
+use crate::backend::fake::{brio_device, node_control};
+
+const EXPOSURE_ID: &str = "camera.exposure.exposure_time_absolute";
+const MODE_ID: &str = "camera.exposure.auto_exposure";
+const SHARP_ID: &str = "camera.image.sharpness";
+const FOV_ID: &str = "camera.focus.field_of_view";
+const KEEP_ID: &str = "camera.exposure.keep_framerate";
+
+/// The fake world with `usb-a` a fake MX Brio and `usb-b` with simple
+/// image controls.
+fn with_brio(w: &mut World) {
+    w.devices.insert("usb-a".into(), brio_device());
+    w.controls
+        .insert("usb-b".into(), vec![control("sharpness", 7, 3, 5)]);
+}
+
+type SetReply = tokio::sync::oneshot::Receiver<Result<(), IpcError>>;
+
+impl H {
+    fn get_settings(&mut self, camera: &str, ms: u64) -> Result<SettingsTree, IpcError> {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let now = self.at(ms);
+        assert!(
+            self.ctrl
+                .handle(Command::GetSettings(camera.into(), tx), now)
+        );
+        rx.try_recv()
+            .expect("the controller replies before returning")
+    }
+
+    /// A setting of `ActiveCamera`'s published tree.
+    fn setting(&mut self, id: &str) -> Setting {
+        let tree = self.get_settings("", self.ms_now()).unwrap();
+        tree.find(id)
+            .unwrap_or_else(|| panic!("no {id} in {tree:?}"))
+            .clone()
+    }
+
+    /// A time that changes nothing (`GetSettings` does not look at it).
+    fn ms_now(&self) -> u64 {
+        0
+    }
+
+    /// Sends `SetSetting` and returns its reply channel (empty while held).
+    fn send_set(
+        &mut self,
+        camera: &str,
+        id: &str,
+        value: Option<SettingValue>,
+        ms: u64,
+    ) -> SetReply {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let now = self.at(ms);
+        assert!(self.ctrl.handle(
+            Command::SetSetting {
+                camera: camera.into(),
+                id: id.into(),
+                value,
+                reply: tx,
+            },
+            now,
+        ));
+        rx
+    }
+
+    fn set_setting(&mut self, id: &str, value: SettingValue, ms: u64) -> Result<(), IpcError> {
+        self.send_set("", id, Some(value), ms)
+            .try_recv()
+            .expect("answered at once")
+    }
+
+    fn reset_settings(&mut self, scope: &str, ms: u64) -> Result<(), IpcError> {
+        self.call(
+            |reply| Command::ResetSettings {
+                camera: String::new(),
+                scope: scope.into(),
+                reply,
+            },
+            ms,
+        )
+    }
+
+    /// The fake MX Brio, as it is now.
+    fn brio(&self) -> FakeDevice {
+        self.world().devices["usb-a"].clone()
+    }
+
+    /// Changes the fake MX Brio.
+    fn brio_mut(&self, f: impl FnOnce(&mut FakeDevice)) {
+        f(self.world().devices.get_mut("usb-a").unwrap());
+    }
+
+    /// The `SettingsChanged` notes since the last call.
+    fn signals(&mut self) -> Vec<(u32, u32, Vec<SettingChange>)> {
+        self.drain();
+        std::mem::take(&mut self.settings_notes)
+    }
+}
+
+/// The control event a driver sends for control `id` of `d` as it is now,
+/// for the changes `changes`.
+fn ctrl_event(d: &FakeDevice, id: u32, changes: u32) -> ControlEvent {
+    let c = d.control(id);
+    ControlEvent::Changed(CtrlEvent {
+        id,
+        changes,
+        type_: c.info.type_,
+        value: c.value.value().unwrap_or(0),
+        flags: c.info.flags,
+        minimum: c.info.minimum,
+        maximum: c.info.maximum,
+        step: c.info.step,
+        default_value: c.info.default_value,
+    })
+}
+
+fn s(v: &str) -> SettingValue {
+    SettingValue::Str(v.into())
+}
+
+fn change(id: &str, value: Option<SettingValue>, stored: bool, reason: &str) -> SettingChange {
+    SettingChange {
+        id: id.into(),
+        value,
+        stored,
+        enabled: reason.is_empty(),
+        disabled_reason: reason.into(),
+    }
+}
+
+const MANUAL_REASON: &str = "Set exposure to manual to change this";
+
+#[test]
+fn get_settings_gives_the_tree_from_revision_one_and_no_camera_is_no_error() {
+    let mut h = H::new("", with_brio);
+    let snap = h.snap();
+    assert_eq!(
+        (snap.settings_revision, snap.settings_schema_serial),
+        (Some(1), Some(1))
+    );
+    let tree = h.get_settings("", 0).unwrap();
+    assert_eq!((tree.revision, tree.serial), (1, 1));
+    assert_eq!(tree.camera, "usb-a");
+    let groups: Vec<&str> = tree.groups.iter().map(|g| g.label.as_str()).collect();
+    assert_eq!(
+        groups,
+        ["Image", "White balance", "Exposure", "Focus & zoom"]
+    );
+    let exp = tree.find(EXPOSURE_ID).unwrap();
+    assert!(!exp.enabled);
+    assert_eq!(exp.disabled_reason, MANUAL_REASON);
+    assert_eq!(tree.find(FOV_ID).unwrap().kind.value(), Some(s("65")));
+    // By id: the same; another camera's read now, at the current revision.
+    assert_eq!(h.get_settings("usb-a", 0).unwrap(), tree);
+    let b = h.get_settings("usb-b", 0).unwrap();
+    assert_eq!((b.camera.as_str(), b.revision, b.serial), ("usb-b", 1, 1));
+    assert_eq!(
+        b.find(SHARP_ID).unwrap().kind.value(),
+        Some(SettingValue::Int(5))
+    );
+    assert!(matches!(
+        h.get_settings("usb-z", 0),
+        Err(IpcError::NoSuchCamera(_))
+    ));
+    // The published tree is served without reading the device.
+    let queries = h.world().control_queries;
+    h.get_settings("", 0).unwrap();
+    assert_eq!(h.world().control_queries, queries);
+    // No camera: an empty tree, a structural change.
+    h.world().cameras.clear();
+    h.rescan(100);
+    let none = h.get_settings("", 100).unwrap();
+    assert_eq!((none.revision, none.serial), (2, 2));
+    assert_eq!((none.camera.as_str(), none.groups.len()), ("", 0));
+    assert_eq!(h.signals(), [(2, 2, Vec::new())]);
+}
+
+#[test]
+fn a_mode_change_and_the_exposure_it_enables_come_in_one_signal() {
+    let mut h = H::new("", with_brio);
+    h.activate(0);
+    h.signals();
+    let rev = h.snap().settings_revision.unwrap();
+    let serial = h.snap().settings_schema_serial.unwrap();
+    h.set_setting(MODE_ID, s("manual"), 1000).unwrap();
+    // Written, the dependent's flag flipped by the device, read again.
+    assert_eq!(h.writes(), [w("usb-a", "auto_exposure", 1)]);
+    assert_eq!(
+        h.brio().control(EXPOSURE).info.flags & CTRL_FLAG_INACTIVE,
+        0
+    );
+    assert_eq!(
+        h.signals(),
+        [(
+            rev + 1,
+            serial,
+            vec![
+                change(MODE_ID, Some(s("manual")), true, ""),
+                change(EXPOSURE_ID, Some(SettingValue::Int(1250)), false, ""),
+            ]
+        )]
+    );
+    assert_eq!(h.snap().settings_revision, Some(rev + 1));
+    // Now the exposure time can be set; back to automatic greys it again.
+    h.set_setting(EXPOSURE_ID, SettingValue::Int(500), 1100)
+        .unwrap();
+    assert_eq!(h.brio().value(EXPOSURE), 500);
+    h.set_setting(MODE_ID, s("aperture_priority"), 1200)
+        .unwrap();
+    let sigs = h.signals();
+    assert_eq!(sigs.len(), 2, "{sigs:?}");
+    assert_eq!(
+        sigs[1].2,
+        [
+            change(MODE_ID, Some(s("aperture_priority")), true, ""),
+            change(
+                EXPOSURE_ID,
+                Some(SettingValue::Int(500)),
+                true,
+                MANUAL_REASON
+            ),
+        ]
+    );
+    // Stored by name, raw.
+    let st = h.stored("usb-a").unwrap();
+    assert_eq!(
+        st.values.into_iter().collect::<Vec<_>>(),
+        [
+            ("auto_exposure".to_string(), 3),
+            ("exposure_time_absolute".to_string(), 500)
+        ]
+    );
+    // Greyed: Disabled with its reason, nothing written or stored.
+    h.writes();
+    match h.set_setting(EXPOSURE_ID, SettingValue::Int(600), 1300) {
+        Err(IpcError::Disabled(m)) => assert_eq!(m, MANUAL_REASON),
+        other => panic!("expected Disabled, got {other:?}"),
+    }
+    assert!(h.writes().is_empty());
+    assert_eq!(
+        h.stored("usb-a").unwrap().values["exposure_time_absolute"],
+        500
+    );
+}
+
+#[test]
+fn a_set_while_closed_is_stored_and_the_open_writes_masters_first() {
+    let mut h = H::new("", with_brio);
+    h.set_setting(MODE_ID, s("manual"), 0).unwrap();
+    // Closed: the stored mode enables the exposure time at once.
+    assert!(h.setting(EXPOSURE_ID).enabled);
+    h.set_setting(EXPOSURE_ID, SettingValue::Int(400), 0)
+        .unwrap();
+    h.set_setting(SHARP_ID, SettingValue::Int(100), 0).unwrap();
+    assert!(h.writes().is_empty(), "nothing written while closed");
+    assert_eq!(h.brio().value(AUTO_EXPOSURE), 3);
+    let exp = h.setting(EXPOSURE_ID);
+    assert_eq!(exp.kind.value(), Some(SettingValue::Int(400)));
+    assert!(exp.stored);
+    // The open: masters (sharpness, the mode) first, then the exposure
+    // time, which the fake refuses while inactive.
+    h.activate(1000);
+    assert_eq!(
+        h.writes(),
+        [
+            w("usb-a", "sharpness", 100),
+            w("usb-a", "auto_exposure", 1),
+            w("usb-a", "exposure_time_absolute", 400),
+        ]
+    );
+    assert_eq!(h.brio().value(EXPOSURE), 400);
+    assert!(h.setting(EXPOSURE_ID).enabled);
+    // A stored dependent whose master leaves it inactive is not written.
+    h.consumers(0, 2000);
+    h.tick(10_000);
+    h.set_setting(MODE_ID, s("aperture_priority"), 10_000)
+        .unwrap();
+    h.activate(11_000);
+    assert_eq!(
+        h.writes(),
+        [w("usb-a", "sharpness", 100), w("usb-a", "auto_exposure", 3)]
+    );
+    assert_eq!(h.state(), State::Active);
+}
+
+#[test]
+fn set_setting_refuses_in_the_contract_order() {
+    let mut h = H::new("", with_brio);
+    h.activate(0);
+    h.writes();
+    let err = |h: &mut H, id: &str, v: Option<SettingValue>| {
+        h.send_set("", id, v, 1000).try_recv().expect("answered")
+    };
+    assert!(matches!(
+        err(&mut h, "camera.image.nope", Some(SettingValue::Int(1))),
+        Err(IpcError::UnknownSetting(_))
+    ));
+    // Disabled before the value is looked at.
+    assert!(matches!(
+        err(&mut h, EXPOSURE_ID, None),
+        Err(IpcError::Disabled(_))
+    ));
+    for (id, v) in [
+        (SHARP_ID, None),
+        (SHARP_ID, Some(SettingValue::Int(256))),
+        (SHARP_ID, Some(SettingValue::Bool(true))),
+        (MODE_ID, Some(s("auto"))),
+        (MODE_ID, Some(SettingValue::Int(1))),
+        (KEEP_ID, Some(SettingValue::Int(1))),
+        ("camera.focus.pan_reset", Some(SettingValue::Bool(false))),
+        (FOV_ID, Some(s("120"))),
+    ] {
+        assert!(
+            matches!(
+                err(&mut h, id, v.clone()),
+                Err(IpcError::InvalidArgument(_))
+            ),
+            "{id} {v:?}"
+        );
+    }
+    assert!(h.writes().is_empty());
+    assert!(!h.paths.state.exists() || h.persisted().camera_controls.is_empty());
+    assert!(matches!(
+        h.send_set("usb-z", SHARP_ID, Some(SettingValue::Int(1)), 1000)
+            .try_recv()
+            .unwrap(),
+        Err(IpcError::NoSuchCamera(_))
+    ));
+    // A device write failure is Failed and stores nothing.
+    h.brio_mut(|d| d.refuse.push(GAIN));
+    assert!(matches!(
+        h.set_setting("camera.exposure.gain", SettingValue::Int(10), 1000),
+        Err(IpcError::Failed(_))
+    ));
+    assert!(!h.paths.state.exists() || h.persisted().camera_controls.is_empty());
+    // An action fires while open, stores nothing; closed it is refused.
+    h.set_setting("camera.focus.pan_reset", SettingValue::Bool(true), 1100)
+        .unwrap();
+    assert_eq!(h.writes(), [w("usb-a", "pan_reset", 1)]);
+    assert!(!h.paths.state.exists() || h.persisted().camera_controls.is_empty());
+    h.consumers(0, 2000);
+    h.tick(10_000);
+    assert!(matches!(
+        h.set_setting("camera.focus.pan_reset", SettingValue::Bool(true), 10_000),
+        Err(IpcError::Unavailable(_))
+    ));
+    assert!(h.writes().is_empty());
+    // No camera at all: Unavailable, as for the revision-6 methods.
+    h.world().cameras.clear();
+    h.rescan(11_000);
+    assert!(matches!(
+        h.set_setting(SHARP_ID, SettingValue::Int(1), 11_000),
+        Err(IpcError::Unavailable(_))
+    ));
+}
+
+#[test]
+fn a_set_within_the_window_is_held_replaced_and_answered_when_written() {
+    let mut h = H::new("", with_brio);
+    h.activate(0);
+    h.writes();
+    h.set_setting(SHARP_ID, SettingValue::Int(10), 1000)
+        .unwrap();
+    // Within 50 ms: validated, then held with its reply.
+    let mut first = h.send_set("", SHARP_ID, Some(SettingValue::Int(20)), 1010);
+    assert!(first.try_recv().is_err(), "held");
+    // An invalid one is refused at once, and does not replace it.
+    assert!(matches!(
+        h.send_set("", SHARP_ID, Some(SettingValue::Int(999)), 1015)
+            .try_recv()
+            .unwrap(),
+        Err(IpcError::InvalidArgument(_))
+    ));
+    assert!(first.try_recv().is_err(), "still held");
+    let mut second = h.send_set("", SHARP_ID, Some(SettingValue::Int(30)), 1020);
+    assert!(
+        matches!(first.try_recv().unwrap(), Ok(())),
+        "superseded: Ok"
+    );
+    assert!(second.try_recv().is_err());
+    // Another setting is not held by sharpness's window.
+    h.set_setting("camera.exposure.gain", SettingValue::Int(5), 1030)
+        .unwrap();
+    assert_eq!(
+        h.writes(),
+        [w("usb-a", "sharpness", 10), w("usb-a", "gain", 5)]
+    );
+    // The controller wakes when the window opens.
+    assert_eq!(h.ctrl.next_wakeup(h.at(1030)), Duration::from_millis(20));
+    h.tick(1049);
+    assert!(second.try_recv().is_err());
+    h.tick(1050);
+    assert!(matches!(second.try_recv().unwrap(), Ok(())));
+    assert_eq!(h.writes(), [w("usb-a", "sharpness", 30)]);
+    assert_eq!(h.brio().value(SHARPNESS), 30);
+    assert_eq!(h.stored("usb-a").unwrap().values["sharpness"], 30);
+    // A held write that fails is answered Failed, nothing stored.
+    let mut held = h.send_set("", SHARP_ID, Some(SettingValue::Int(40)), 1060);
+    h.brio_mut(|d| d.refuse.push(SHARPNESS));
+    h.tick(1100);
+    assert!(matches!(held.try_recv().unwrap(), Err(IpcError::Failed(_))));
+    assert_eq!(h.stored("usb-a").unwrap().values["sharpness"], 30);
+    // Any command runs what is due first (a slider never starves it).
+    h.brio_mut(|d| d.refuse.clear());
+    h.set_setting(SHARP_ID, SettingValue::Int(45), 1105)
+        .unwrap();
+    let mut held = h.send_set("", SHARP_ID, Some(SettingValue::Int(50)), 1110);
+    assert!(held.try_recv().is_err(), "held");
+    h.writes();
+    h.consumers(1, 1200);
+    assert!(matches!(held.try_recv().unwrap(), Ok(())));
+    assert_eq!(h.writes(), [w("usb-a", "sharpness", 50)]);
+    // Closed: nothing written, nothing held.
+    h.consumers(0, 2000);
+    h.tick(10_000);
+    h.set_setting(SHARP_ID, SettingValue::Int(60), 10_000)
+        .unwrap();
+    h.set_setting(SHARP_ID, SettingValue::Int(61), 10_001)
+        .unwrap();
+    assert!(h.writes().is_empty());
+}
+
+#[test]
+fn over_a_hundred_writes_a_second_are_rate_limited() {
+    let extra: Vec<NodeControl> = (0..30)
+        .map(|i| {
+            node_control(
+                0x0098_0a00 + i,
+                &format!("Extra {i}"),
+                CTRL_TYPE_INTEGER,
+                (0, 1000, 1),
+                0,
+                0,
+                0,
+            )
+        })
+        .collect();
+    let mut h = H::new("", |w| {
+        w.devices.insert(
+            "usb-a".into(),
+            FakeDevice {
+                controls: extra,
+                ..FakeDevice::default()
+            },
+        );
+    });
+    h.activate(0);
+    for k in 0..100u64 {
+        let id = format!("camera.other.extra_{}", k % 30);
+        h.set_setting(&id, SettingValue::Int(k as i64 + 1), 1000 + k * 5)
+            .unwrap();
+    }
+    match h.set_setting("camera.other.extra_10", SettingValue::Int(999), 1500) {
+        Err(IpcError::RateLimited(m)) => assert!(m.contains("100"), "{m}"),
+        other => panic!("expected RateLimited, got {other:?}"),
+    }
+    assert_ne!(h.stored("usb-a").unwrap().values["extra_10"], 999);
+    // A second after the first write, one is free again.
+    h.set_setting("camera.other.extra_10", SettingValue::Int(999), 2000)
+        .unwrap();
+    assert_eq!(h.stored("usb-a").unwrap().values["extra_10"], 999);
+}
+
+#[test]
+fn reset_settings_by_scope_open_and_closed() {
+    let mut h = H::new("", with_brio);
+    for (id, v) in [
+        (SHARP_ID, SettingValue::Int(10)),
+        ("camera.exposure.gain", SettingValue::Int(7)),
+        (MODE_ID, s("manual")),
+        (EXPOSURE_ID, SettingValue::Int(300)),
+    ] {
+        h.set_setting(id, v, 0).unwrap();
+    }
+    // Closed, one setting: forgotten, its name left for the next open.
+    h.reset_settings(&format!("setting:{SHARP_ID}"), 100)
+        .unwrap();
+    let st = h.stored("usb-a").unwrap();
+    assert!(!st.values.contains_key("sharpness"));
+    assert_eq!(st.reset_names.iter().collect::<Vec<_>>(), ["sharpness"]);
+    assert!(!st.reset_all);
+    assert_eq!(
+        h.setting(SHARP_ID).kind.value(),
+        Some(SettingValue::Int(128))
+    );
+    // A group.
+    h.reset_settings("group:exposure", 100).unwrap();
+    let st = h.stored("usb-a").unwrap();
+    assert!(st.values.is_empty(), "{st:?}");
+    assert!(st.reset_names.contains("gain") && st.reset_names.contains("auto_exposure"));
+    assert!(h.writes().is_empty());
+    // The whole camera: reset_all, the names subsumed.
+    h.set_setting(SHARP_ID, SettingValue::Int(10), 200).unwrap();
+    h.reset_settings("camera", 200).unwrap();
+    let st = h.stored("usb-a").unwrap();
+    assert!(st.reset_all && st.values.is_empty() && st.reset_names.is_empty());
+    // Bad scopes.
+    for scope in ["", "everything", "group:", "setting:"] {
+        assert!(
+            matches!(
+                h.reset_settings(scope, 300),
+                Err(IpcError::InvalidArgument(_))
+            ),
+            "{scope:?}"
+        );
+    }
+    assert!(matches!(
+        h.reset_settings("group:nope", 300),
+        Err(IpcError::UnknownSetting(_))
+    ));
+    assert!(matches!(
+        h.reset_settings("setting:camera.image.nope", 300),
+        Err(IpcError::UnknownSetting(_))
+    ));
+    // The open writes every default, dependents first (the exposure time
+    // is inactive: not written), then nothing stored.
+    h.activate(1000);
+    let writes = h.writes();
+    let names: Vec<&str> = writes.iter().map(|(_, n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "brightness",
+            "contrast",
+            "sharpness",
+            "white_balance_automatic",
+            "auto_exposure",
+            "gain",
+            "exposure_dynamic_framerate",
+        ],
+        "{writes:?}"
+    );
+    assert_eq!(h.world().xu_writes, [("usb-a".into(), "90".into())]);
+    assert_eq!(h.stored("usb-a"), None);
+    // Open: a scope writes its defaults now, dependents first.
+    h.set_setting(MODE_ID, s("manual"), 2000).unwrap();
+    h.set_setting(EXPOSURE_ID, SettingValue::Int(300), 2100)
+        .unwrap();
+    h.writes();
+    h.reset_settings("group:exposure", 2200).unwrap();
+    let writes = h.writes();
+    assert_eq!(
+        writes,
+        [
+            w("usb-a", "exposure_time_absolute", 156),
+            w("usb-a", "auto_exposure", 3),
+            w("usb-a", "gain", 0),
+            w("usb-a", "exposure_dynamic_framerate", 0),
+        ]
+    );
+    assert_eq!(h.stored("usb-a"), None);
+    assert!(!h.setting(EXPOSURE_ID).enabled);
+    // A refused default fails the call, naming it; forgotten all the same.
+    h.set_setting("camera.exposure.gain", SettingValue::Int(9), 2300)
+        .unwrap();
+    h.brio_mut(|d| d.refuse.push(GAIN));
+    match h.reset_settings("setting:camera.exposure.gain", 2400) {
+        Err(IpcError::Failed(m)) => assert!(m.contains("gain ("), "{m}"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert_eq!(h.stored("usb-a"), None);
+}
+
+#[test]
+fn the_revision_six_methods_reach_only_the_five_image_controls() {
+    let mut h = H::new("", with_brio);
+    h.set_setting("camera.exposure.gain", SettingValue::Int(7), 0)
+        .unwrap();
+    h.set_control("", "sharpness", 50, 0).unwrap();
+    assert!(matches!(
+        h.set_control("", "gain", 1, 0),
+        Err(IpcError::InvalidArgument(_))
+    ));
+    // The property: the image controls the device exposes, as before.
+    assert_eq!(
+        h.view().1,
+        [
+            entry("brightness", 128, false),
+            entry("contrast", 128, false),
+            entry("sharpness", 50, true),
+        ]
+    );
+    // The same storage: the tree shows the value set through revision 6.
+    assert!(h.setting(SHARP_ID).stored);
+    // A closed reset forgets only the five, by name.
+    h.reset_controls("", 100).unwrap();
+    let st = h.stored("usb-a").unwrap();
+    assert_eq!(
+        st.values.into_iter().collect::<Vec<_>>(),
+        [("gain".to_string(), 7)]
+    );
+    assert_eq!(st.reset_names.len(), 5);
+    assert!(!st.reset_all);
+    // The open resets the five it exposes, then applies the gain.
+    h.activate(1000);
+    assert_eq!(
+        h.writes(),
+        [
+            w("usb-a", "brightness", 128),
+            w("usb-a", "contrast", 128),
+            w("usb-a", "sharpness", 128),
+            w("usb-a", "gain", 7),
+        ]
+    );
+    // They share the coalescing window.
+    h.set_setting(SHARP_ID, SettingValue::Int(1), 2000).unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let now = h.at(2010);
+    h.ctrl.handle(
+        Command::SetCameraControl {
+            camera: String::new(),
+            name: "sharpness".into(),
+            value: 2,
+            reply: tx,
+        },
+        now,
+    );
+    assert!(rx.try_recv().is_err(), "held");
+    h.tick(2050);
+    assert!(matches!(rx.try_recv().unwrap(), Ok(())));
+    assert_eq!(h.brio().value(SHARPNESS), 2);
+}
+
+#[test]
+fn settings_are_saved_after_a_quiet_delay_and_flushed_by_any_other_save() {
+    let mut h = H::new("", with_brio);
+    let saved = |h: &H| {
+        fs::read_to_string(&h.paths.state)
+            .unwrap_or_default()
+            .contains("sharpness")
+    };
+    h.set_setting(SHARP_ID, SettingValue::Int(10), 1000)
+        .unwrap();
+    assert!(!saved(&h));
+    assert_eq!(h.ctrl.next_wakeup(h.at(1000)), Duration::from_millis(300));
+    h.tick(1200);
+    // Another change restarts the delay.
+    h.set_setting(SHARP_ID, SettingValue::Int(11), 1200)
+        .unwrap();
+    h.tick(1499);
+    assert!(!saved(&h));
+    h.tick(1500);
+    assert!(saved(&h));
+    // Another state change saves at once, the settings with it.
+    h.set_setting("camera.exposure.gain", SettingValue::Int(3), 2000)
+        .unwrap();
+    h.call(|r| Command::SetEffect("blur".into(), r), 2010)
+        .unwrap();
+    assert!(
+        fs::read_to_string(&h.paths.state)
+            .unwrap()
+            .contains("gain = 3")
+    );
+    // Before a camera switch.
+    h.activate(3000);
+    h.set_setting("camera.exposure.gain", SettingValue::Int(4), 4000)
+        .unwrap();
+    h.call(|r| Command::SelectCamera("usb-b".into(), r), 4010)
+        .unwrap();
+    assert!(
+        fs::read_to_string(&h.paths.state)
+            .unwrap()
+            .contains("gain = 4")
+    );
+    // At shutdown.
+    h.set_setting(SHARP_ID, SettingValue::Int(2), 5000)
+        .unwrap_or(());
+    h.call(|r| Command::SelectCamera("usb-a".into(), r), 5100)
+        .unwrap();
+    h.set_setting("camera.exposure.gain", SettingValue::Int(5), 5200)
+        .unwrap();
+    h.ctrl.shutdown();
+    assert!(
+        fs::read_to_string(&h.paths.state)
+            .unwrap()
+            .contains("gain = 5")
+    );
+}
+
+#[test]
+fn the_watcher_runs_while_the_camera_is_open_and_an_event_publishes_the_delta() {
+    let mut h = H::new("", with_brio);
+    assert_eq!(h.world().watch, None, "never on a closed camera");
+    h.activate(0);
+    let (camera, ids) = h.world().watch.clone().expect("watching");
+    assert_eq!(camera, "usb-a");
+    assert!(ids.contains(&SHARPNESS) && ids.contains(&EXPOSURE) && ids.contains(&PAN_RESET));
+    let generation = h.world().watch_generation;
+    h.signals();
+    // Another program sets manual exposure: the event, a read after the
+    // settle delay, the delta.
+    h.brio_mut(|d| d.change(AUTO_EXPOSURE, 1));
+    let queries = h.world().control_queries;
+    let now = h.at(1000);
+    let b = h.brio();
+    h.ctrl.handle(
+        Command::ControlEvent(generation, ctrl_event(&b, AUTO_EXPOSURE, CTRL_CHANGE_VALUE)),
+        now,
+    );
+    h.ctrl.handle(
+        Command::ControlEvent(generation, ctrl_event(&b, EXPOSURE, CTRL_CHANGE_FLAGS)),
+        now,
+    );
+    assert_eq!(h.world().control_queries, queries, "not read yet");
+    h.tick(1049);
+    assert!(h.signals().is_empty());
+    h.tick(1050);
+    assert_eq!(
+        h.world().control_queries,
+        queries + 1,
+        "one read for the burst"
+    );
+    let sigs = h.signals();
+    assert_eq!(sigs.len(), 1);
+    assert_eq!(
+        sigs[0].2,
+        [
+            change(MODE_ID, Some(s("manual")), false, ""),
+            change(EXPOSURE_ID, Some(SettingValue::Int(1250)), false, ""),
+        ]
+    );
+    // An event of an old watcher changes nothing.
+    h.ctrl.handle(
+        Command::ControlEvent(generation - 1, ctrl_event(&b, GAIN, CTRL_CHANGE_VALUE)),
+        h.at(1100),
+    );
+    h.tick(1200);
+    assert_eq!(h.world().control_queries, queries + 1);
+    // A switch replaces it; the close stops it.
+    h.call(|r| Command::SelectCamera("usb-b".into(), r), 2000)
+        .unwrap();
+    assert_eq!(
+        h.world().watch.as_ref().map(|(c, _)| c.as_str()),
+        Some("usb-b")
+    );
+    assert!(h.world().watch_generation > generation);
+    h.consumers(0, 3000);
+    h.tick(10_000);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.world().watch, None);
+    // A watcher that ended by itself is dropped.
+    h.activate(20_000);
+    let generation = h.world().watch_generation;
+    h.ctrl.handle(
+        Command::ControlEvent(generation, ControlEvent::Ended("No such device".into())),
+        h.at(21_000),
+    );
+    assert_eq!(h.world().watch, None);
+    // One that cannot start leaves the session streaming.
+    h.consumers(0, 22_000);
+    h.tick(30_000);
+    h.world().fail_watch = Some("no events".into());
+    h.activate(40_000);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().watch, None);
+}
+
+#[test]
+fn a_rename_of_the_open_camera_restarts_its_watcher() {
+    let early = cam("/dev/video0", "Alpha Cam", Some("1111:0001"), "/dev/video0");
+    let mut h = H::new("", |w| {
+        w.cameras = vec![early.clone()];
+        w.devices.insert("/dev/video0".into(), brio_device());
+    });
+    h.activate(0);
+    let generation = h.world().watch_generation;
+    assert_eq!(
+        h.world().watch.as_ref().map(|(c, _)| c.as_str()),
+        Some("/dev/video0")
+    );
+    {
+        let mut w = h.world();
+        w.cameras = vec![alpha()];
+        let d = w.devices.remove("/dev/video0").unwrap();
+        w.devices.insert("usb-a".into(), d);
+    }
+    h.rescan(1000);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(
+        h.world().watch.as_ref().map(|(c, _)| c.as_str()),
+        Some("usb-a")
+    );
+    assert!(h.world().watch_generation > generation);
+}
+
+#[test]
+fn a_stored_keep_framerate_wins_over_the_configured_pin() {
+    let config = "[camera]\nfixed_framerate = true\n";
+    let mut h = H::new(config, with_brio);
+    // Nothing stored: the config's pin, shown as what the open makes it.
+    assert_eq!(
+        h.setting(KEEP_ID).kind.value(),
+        Some(SettingValue::Bool(true))
+    );
+    h.activate(0);
+    assert_eq!(h.world().ingest_fixed_framerate, [true]);
+    // Set while open and pinned: written and stored (the pin's guard puts
+    // its value back at the close, which the fake does not model).
+    h.writes();
+    h.set_setting(KEEP_ID, SettingValue::Bool(false), 1000)
+        .unwrap();
+    assert_eq!(h.writes(), [w("usb-a", "exposure_dynamic_framerate", 1)]);
+    assert_eq!(
+        h.stored("usb-a").unwrap().values["exposure_dynamic_framerate"],
+        1
+    );
+    // The next open is built without the pin, and applies the stored raw
+    // value like any other.
+    h.consumers(0, 2000);
+    h.tick(10_000);
+    h.activate(11_000);
+    assert_eq!(h.world().ingest_fixed_framerate, [true, false]);
+    assert_eq!(h.writes(), [w("usb-a", "exposure_dynamic_framerate", 1)]);
+    // Forgotten again: the pin is back.
+    h.reset_settings(&format!("setting:{KEEP_ID}"), 12_000)
+        .unwrap();
+    h.consumers(0, 13_000);
+    h.tick(20_000);
+    h.activate(21_000);
+    assert_eq!(h.world().ingest_fixed_framerate, [true, false, true]);
+    // A camera with nothing stored is pinned per the config, the other not.
+    h.set_setting(KEEP_ID, SettingValue::Bool(true), 22_000)
+        .unwrap();
+    h.call(|r| Command::SelectCamera("usb-b".into(), r), 23_000)
+        .unwrap();
+    assert_eq!(h.world().ingest_fixed_framerate.last(), Some(&true));
+    h.call(|r| Command::SelectCamera("usb-a".into(), r), 24_000)
+        .unwrap();
+    assert_eq!(h.world().ingest_fixed_framerate.last(), Some(&false));
+}
+
+#[test]
+fn the_field_of_view_is_written_only_while_open_and_a_format_change_is_undone() {
+    let mut h = H::new("", with_brio);
+    h.set_setting(FOV_ID, s("78"), 0).unwrap();
+    assert!(h.world().xu_writes.is_empty());
+    assert_eq!(h.brio().fov.as_ref().unwrap().current, 2);
+    assert_eq!(h.setting(FOV_ID).kind.value(), Some(s("78")));
+    assert_eq!(h.stored("usb-a").unwrap().values["field_of_view"], 1);
+    // The open applies it, the format checked before and after.
+    let reads = h.world().format_reads;
+    h.activate(1000);
+    assert_eq!(h.world().xu_writes, [("usb-a".into(), "78".into())]);
+    assert_eq!(h.brio().fov.as_ref().unwrap().current, 1);
+    assert_eq!(h.world().format_reads, reads + 2);
+    // A write that changes the format is put back and fails.
+    let wide = obc_pipeline::CaptureFormat {
+        width: 1280,
+        height: 720,
+        pixelformat: u32::from_le_bytes(*b"YUYV"),
+    };
+    h.brio_mut(|d| d.fov.as_mut().unwrap().changes_format = Some((0, wide)));
+    match h.set_setting(FOV_ID, s("90"), 2000) {
+        Err(IpcError::Failed(m)) => {
+            assert!(
+                m.starts_with("changing the field of view changed the camera's format"),
+                "{m}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert_eq!(
+        h.world().xu_writes[1..],
+        [
+            ("usb-a".to_string(), "90".to_string()),
+            ("usb-a".to_string(), "78".to_string())
+        ]
+    );
+    assert_eq!(h.brio().fov.as_ref().unwrap().current, 1);
+    assert_eq!(h.stored("usb-a").unwrap().values["field_of_view"], 1);
+    // An unknown byte greys it.
+    h.brio_mut(|d| d.fov.as_mut().unwrap().current = 9);
+    h.rescan(3000);
+    let f = h.setting(FOV_ID);
+    assert!(!f.enabled);
+    assert!(f.disabled_reason.contains("field of view"));
+}
+
+#[test]
+fn the_serial_moves_with_the_structure_and_the_revision_with_every_change() {
+    let mut h = H::new("", with_brio);
+    let ids = |h: &H| (h.snap().settings_revision, h.snap().settings_schema_serial);
+    assert_eq!(ids(&h), (Some(1), Some(1)));
+    // A value: the revision only, its change announced.
+    h.set_setting("camera.exposure.gain", SettingValue::Int(3), 0)
+        .unwrap();
+    assert_eq!(ids(&h), (Some(2), Some(1)));
+    let (changes, _) = h.drain();
+    assert_eq!(h.signals().len(), 1);
+    assert!(changes.contains(&Change::SettingsRevision(2)));
+    assert!(
+        !changes
+            .iter()
+            .any(|c| matches!(c, Change::SettingsSchemaSerial(_)))
+    );
+    // Nothing changed: nothing announced.
+    h.rescan(100);
+    assert_eq!(ids(&h), (Some(2), Some(1)));
+    assert!(h.signals().is_empty());
+    // ActiveCamera changes: structural, an empty change list.
+    h.call(|r| Command::SelectCamera("usb-b".into(), r), 200)
+        .unwrap();
+    assert_eq!(ids(&h), (Some(3), Some(2)));
+    assert_eq!(h.signals(), [(3, 2, Vec::new())]);
+    assert_eq!(h.get_settings("", 200).unwrap().camera, "usb-b");
+    // A range the device changed: structural.
+    h.world().controls.get_mut("usb-b").unwrap()[0].max = 9;
+    h.rescan(300);
+    assert_eq!(ids(&h), (Some(4), Some(3)));
+}
+
+// ---- the review fixes of the settings channel ----
+
+const FOCUS_AUTO: u32 = 0x009a_090c;
+const FOCUS_ABS: u32 = 0x009a_090a;
+const FOCUS_AUTO_ID: &str = "camera.focus.focus_automatic_continuous";
+const FOCUS_ID: &str = "camera.focus.focus_absolute";
+
+/// The fake MX Brio with continuous autofocus and the focus it greys
+/// (after the exposure controls in the tree).
+fn with_focus_brio(w: &mut World) {
+    with_brio(w);
+    let d = w.devices.get_mut("usb-a").unwrap();
+    d.controls.push(node_control(
+        FOCUS_AUTO,
+        "Focus, Automatic Continuous",
+        obc_pipeline::controls::CTRL_TYPE_BOOLEAN,
+        (0, 1, 1),
+        1,
+        1,
+        0,
+    ));
+    d.controls.push(node_control(
+        FOCUS_ABS,
+        "Focus, Absolute",
+        CTRL_TYPE_INTEGER,
+        (0, 255, 1),
+        0,
+        40,
+        CTRL_FLAG_INACTIVE,
+    ));
+    d.links.push((FOCUS_ABS, FOCUS_AUTO, vec![0]));
+}
+
+/// Stores manual exposure, an exposure time, manual focus and a focus
+/// while the camera is closed (nothing written).
+fn store_manual_exposure_and_focus(h: &mut H) {
+    for (id, v) in [
+        (MODE_ID, s("manual")),
+        (EXPOSURE_ID, SettingValue::Int(400)),
+        (FOCUS_AUTO_ID, SettingValue::Bool(false)),
+        (FOCUS_ID, SettingValue::Int(90)),
+    ] {
+        h.set_setting(id, v, 0).unwrap();
+    }
+    assert!(h.writes().is_empty());
+}
+
+#[test]
+fn a_stored_dependent_a_read_left_out_before_the_masters_is_applied_after_them() {
+    let mut h = H::new("", with_focus_brio);
+    store_manual_exposure_and_focus(&mut h);
+    // The first read at the open cannot read the exposure time (under
+    // automatic exposure); after the masters' writes it can. The read
+    // after them has one entry more, before the focus.
+    let queries = h.world().control_queries;
+    h.world().next_read_failures =
+        vec![vec!["exposure_time_absolute".to_string()], Vec::new()].into();
+    h.activate(1000);
+    assert_eq!(
+        h.writes(),
+        [
+            w("usb-a", "auto_exposure", 1),
+            w("usb-a", "focus_automatic_continuous", 0),
+            w("usb-a", "exposure_time_absolute", 400),
+            w("usb-a", "focus_absolute", 90),
+        ]
+    );
+    assert_eq!(h.brio().value(EXPOSURE), 400);
+    assert_eq!(h.brio().value(FOCUS_ABS), 90);
+    // The open's read, the read after the masters, the first frame's.
+    assert_eq!(h.world().control_queries, queries + 3);
+    assert_eq!(h.state(), State::Active);
+}
+
+#[test]
+fn a_stored_dependent_unreadable_after_the_masters_is_kept_and_nothing_else_is_written() {
+    let mut h = H::new("", with_focus_brio);
+    store_manual_exposure_and_focus(&mut h);
+    // Readable at the open; the read after the masters' writes cannot read
+    // the exposure time: one entry fewer, before the focus.
+    h.world().next_read_failures = vec![
+        Vec::new(),
+        vec!["exposure_time_absolute".to_string()],
+        Vec::new(),
+    ]
+    .into();
+    h.activate(1000);
+    assert_eq!(
+        h.writes(),
+        [
+            w("usb-a", "auto_exposure", 1),
+            w("usb-a", "focus_automatic_continuous", 0),
+            w("usb-a", "focus_absolute", 90),
+        ]
+    );
+    assert_eq!(h.brio().value(EXPOSURE), 1250, "not written");
+    assert_eq!(h.state(), State::Active);
+    // Kept for the camera, and logged as unreadable (not silently).
+    assert_eq!(
+        h.stored("usb-a").unwrap().values["exposure_time_absolute"],
+        400
+    );
+    assert!(
+        h.ctrl
+            .controls_skipped
+            .contains(&("usb-a".to_string(), "exposure_time_absolute".to_string()))
+    );
+}
+
+#[test]
+fn a_reset_supersedes_the_held_writes_in_its_scope() {
+    let mut h = H::new("", with_brio);
+    h.activate(0);
+    let gain = "camera.exposure.gain";
+    h.set_setting(SHARP_ID, SettingValue::Int(10), 1000)
+        .unwrap();
+    h.set_setting(gain, SettingValue::Int(1), 1000).unwrap();
+    let mut sharp = h.send_set("", SHARP_ID, Some(SettingValue::Int(20)), 1010);
+    let mut held_gain = h.send_set("", gain, Some(SettingValue::Int(2)), 1010);
+    assert!(sharp.try_recv().is_err() && held_gain.try_recv().is_err());
+    h.writes();
+    // One setting: its held write is answered and dropped, the other stays.
+    h.reset_settings(&format!("setting:{SHARP_ID}"), 1020)
+        .unwrap();
+    assert!(matches!(sharp.try_recv().unwrap(), Ok(())));
+    assert!(held_gain.try_recv().is_err(), "another setting stays held");
+    assert_eq!(h.writes(), [w("usb-a", "sharpness", 128)]);
+    h.tick(1050);
+    assert!(matches!(held_gain.try_recv().unwrap(), Ok(())));
+    assert_eq!(h.writes(), [w("usb-a", "gain", 2)]);
+    assert_eq!(h.brio().value(SHARPNESS), 128);
+    let st = h.stored("usb-a").unwrap();
+    assert_eq!(
+        st.values.into_iter().collect::<Vec<_>>(),
+        [("gain".to_string(), 2)]
+    );
+    // The whole camera, then the revision-6 reset of the five: after the
+    // window nothing is written or stored again.
+    for (k, whole) in [(0u64, true), (1, false)] {
+        let t = 2000 + k * 1000;
+        h.set_setting(SHARP_ID, SettingValue::Int(30), t).unwrap();
+        let mut held = h.send_set("", SHARP_ID, Some(SettingValue::Int(31)), t + 10);
+        assert!(held.try_recv().is_err());
+        if whole {
+            h.reset_settings("camera", t + 20).unwrap();
+        } else {
+            h.reset_controls("", t + 20).unwrap();
+        }
+        assert!(matches!(held.try_recv().unwrap(), Ok(())));
+        h.writes();
+        h.tick(t + 100);
+        assert!(h.writes().is_empty(), "nothing written after the reset");
+        assert_eq!(h.brio().value(SHARPNESS), 128);
+        assert!(
+            h.stored("usb-a")
+                .is_none_or(|st| !st.values.contains_key("sharpness")),
+            "nothing stored again"
+        );
+    }
+}
+
+#[test]
+fn a_held_write_whose_camera_closes_or_switches_is_stored_and_never_written() {
+    let mut h = H::new("[lifecycle]\nidle_grace_s = 0.0\n", with_brio);
+    h.activate(0);
+    h.writes();
+    // The camera closes inside the window.
+    h.set_setting(SHARP_ID, SettingValue::Int(10), 1000)
+        .unwrap();
+    let mut held = h.send_set("", SHARP_ID, Some(SettingValue::Int(20)), 1010);
+    assert!(held.try_recv().is_err());
+    h.consumers(0, 1020);
+    assert_eq!(h.state(), State::Idle);
+    h.tick(1050);
+    assert!(matches!(held.try_recv().unwrap(), Ok(())));
+    assert_eq!(h.writes(), [w("usb-a", "sharpness", 10)]);
+    assert_eq!(h.brio().value(SHARPNESS), 10, "never written closed");
+    assert_eq!(h.stored("usb-a").unwrap().values["sharpness"], 20);
+    // The session switches to another camera inside the window.
+    h.activate(2000);
+    assert_eq!(h.writes(), [w("usb-a", "sharpness", 20)]);
+    h.set_setting(SHARP_ID, SettingValue::Int(30), 3000)
+        .unwrap();
+    let mut held = h.send_set("", SHARP_ID, Some(SettingValue::Int(40)), 3010);
+    assert!(held.try_recv().is_err());
+    h.call(|r| Command::SelectCamera("usb-b".into(), r), 3020)
+        .unwrap();
+    h.writes();
+    h.tick(3050);
+    assert!(matches!(held.try_recv().unwrap(), Ok(())));
+    assert!(h.writes().is_empty(), "not on the other camera either");
+    assert_eq!(h.device("usb-b", "sharpness"), 5);
+    assert_eq!(h.brio().value(SHARPNESS), 30);
+    assert_eq!(h.stored("usb-a").unwrap().values["sharpness"], 40);
+    assert_eq!(h.stored("usb-b"), None);
+}
+
+#[test]
+fn every_held_reply_is_answered_at_shutdown_without_a_step_each() {
+    let mut h = H::new("", with_brio);
+    h.activate(0);
+    let gain = "camera.exposure.gain";
+    h.set_setting(SHARP_ID, SettingValue::Int(10), 1000)
+        .unwrap();
+    h.set_setting(gain, SettingValue::Int(1), 1000).unwrap();
+    let mut a = h.send_set("", SHARP_ID, Some(SettingValue::Int(20)), 1010);
+    let mut b = h.send_set("", gain, Some(SettingValue::Int(2)), 1010);
+    assert!(a.try_recv().is_err() && b.try_recv().is_err());
+    h.writes();
+    h.signals();
+    h.ctrl.shutdown();
+    assert!(matches!(a.try_recv().unwrap(), Ok(())));
+    assert!(matches!(b.try_recv().unwrap(), Ok(())));
+    // Written while the camera was still open, and saved.
+    assert_eq!(
+        h.writes(),
+        [w("usb-a", "sharpness", 20), w("usb-a", "gain", 2)]
+    );
+    let st = h.stored("usb-a").unwrap();
+    assert_eq!((st.values["sharpness"], st.values["gain"]), (20, 2));
+    // No lifecycle step (and so no publish) per held request.
+    assert!(h.signals().is_empty());
+}
+
+#[test]
+fn a_settings_change_the_state_file_cannot_take_fails_at_once() {
+    // A damaged state file is never overwritten: the change is in force
+    // (stored, shown), the call says it is not saved.
+    let mut h = H::new("", with_brio);
+    let damaged = "enabled = \"false\"\n";
+    fs::create_dir_all(h.paths.state.parent().unwrap()).unwrap();
+    fs::write(&h.paths.state, damaged).unwrap();
+    h.restart();
+    h.world().devices.insert("usb-a".into(), brio_device());
+    let not_saved = |r: Result<(), IpcError>| match r {
+        Err(IpcError::Failed(m)) => {
+            assert!(m.contains("in force") && m.contains("SetEnabled"), "{m}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    };
+    not_saved(h.set_setting(SHARP_ID, SettingValue::Int(10), 0));
+    assert!(h.setting(SHARP_ID).stored);
+    not_saved(h.set_control("", "contrast", 3, 0));
+    not_saved(h.reset_settings(&format!("setting:{SHARP_ID}"), 0));
+    // Nothing changed: nothing to save, no failure.
+    h.set_setting("camera.exposure.gain", SettingValue::Int(0), 0)
+        .unwrap_err();
+    assert_eq!(fs::read_to_string(&h.paths.state).unwrap(), damaged);
+
+    // A state file that cannot be written: the first change is saved
+    // behind (it fails: logged, shown in Error); the next ones are saved at
+    // once while it fails, and Failed; once it works again, Ok and the
+    // error is gone.
+    let mut h = H::new("", with_brio);
+    let parent = h.paths.state.parent().unwrap().to_path_buf();
+    fs::write(&parent, b"not a dir").unwrap();
+    h.set_setting(SHARP_ID, SettingValue::Int(10), 1000)
+        .unwrap();
+    assert_eq!(h.snap().error, "");
+    h.tick(1300);
+    let e = h.snap().error;
+    assert!(e.contains("will not survive a restart"), "{e}");
+    match h.set_setting(SHARP_ID, SettingValue::Int(11), 1400) {
+        Err(IpcError::Failed(m)) => assert!(m.contains("will not survive a restart"), "{m}"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    fs::remove_file(&parent).unwrap();
+    h.set_setting(SHARP_ID, SettingValue::Int(12), 1500)
+        .unwrap();
+    assert_eq!(h.snap().error, "");
+    assert!(
+        fs::read_to_string(&h.paths.state)
+            .unwrap()
+            .contains("sharpness = 12")
+    );
+    // Back to the delayed save.
+    h.set_setting(SHARP_ID, SettingValue::Int(13), 1600)
+        .unwrap();
+    assert!(
+        fs::read_to_string(&h.paths.state)
+            .unwrap()
+            .contains("sharpness = 12")
+    );
+}
+
+#[test]
+fn a_reset_keeps_the_frame_rate_pin() {
+    let config = "[camera]\nfixed_framerate = true\n";
+    // A camera whose default is the dynamic frame rate, pinned to 0 by
+    // the ingest (the fake leaves the value as the pin made it).
+    let mut h = H::new(config, |w| {
+        with_brio(w);
+        let d = w.devices.get_mut("usb-a").unwrap();
+        let c = d
+            .controls
+            .iter_mut()
+            .find(|c| c.id == crate::backend::fake::cid::DYNAMIC_FPS)
+            .unwrap();
+        c.info.default_value = 1;
+        c.value = CtrlValue::Value(0);
+    });
+    let dynamic = |h: &H| h.brio().value(crate::backend::fake::cid::DYNAMIC_FPS);
+    let wrote_it = |writes: &[(String, String, i32)]| {
+        writes
+            .iter()
+            .any(|(_, n, _)| n == "exposure_dynamic_framerate")
+    };
+    h.activate(0);
+    assert_eq!(h.world().ingest_fixed_framerate, [true]);
+    h.writes();
+    // Open: a whole reset leaves the pin.
+    h.reset_settings("camera", 1000).unwrap();
+    let writes = h.writes();
+    assert!(!wrote_it(&writes), "{writes:?}");
+    assert_eq!(dynamic(&h), 0);
+    // Changed over the pin, then reset: back to the pin's 0, forgotten.
+    h.set_setting(KEEP_ID, SettingValue::Bool(false), 2000)
+        .unwrap();
+    assert_eq!(dynamic(&h), 1);
+    h.writes();
+    h.reset_settings(&format!("setting:{KEEP_ID}"), 2100)
+        .unwrap();
+    assert_eq!(h.writes(), [w("usb-a", "exposure_dynamic_framerate", 0)]);
+    assert_eq!(h.stored("usb-a"), None);
+    // A whole reset left for the open: shown as the pin makes it, and the
+    // open does not write the default over the pin.
+    h.consumers(0, 3000);
+    h.tick(10_000);
+    assert_eq!(h.state(), State::Idle);
+    h.reset_settings("camera", 10_000).unwrap();
+    assert!(h.stored("usb-a").unwrap().reset_all);
+    assert_eq!(
+        h.setting(KEEP_ID).kind.value(),
+        Some(SettingValue::Bool(true))
+    );
+    h.activate(11_000);
+    assert_eq!(h.world().ingest_fixed_framerate.last(), Some(&true));
+    let writes = h.writes();
+    assert!(!writes.is_empty(), "the other defaults");
+    assert!(!wrote_it(&writes), "{writes:?}");
+    assert_eq!(dynamic(&h), 0);
+    assert_eq!(h.stored("usb-a"), None);
+}
+
+#[test]
+fn a_set_on_the_open_camera_reads_back_only_what_depends_on_it() {
+    let mut h = H::new("", with_brio);
+    h.activate(0);
+    h.writes();
+    h.signals();
+    let counts = |h: &H| {
+        let w = h.world();
+        (
+            w.control_opens,
+            w.control_queries,
+            w.control_reads,
+            w.control_info_reads,
+        )
+    };
+    // A plain control: one open, the write read back, no full read.
+    let (o, q, r, i) = counts(&h);
+    h.set_setting(SHARP_ID, SettingValue::Int(10), 1000)
+        .unwrap();
+    assert_eq!(counts(&h), (o + 1, q, r + 1, i));
+    // A master: the dependent's flags and value as well, still no full
+    // read; the flip comes in the same signal.
+    let (o, q, r, i) = counts(&h);
+    h.set_setting(MODE_ID, s("manual"), 1100).unwrap();
+    assert_eq!(counts(&h), (o + 1, q, r + 2, i + 1));
+    let sigs = h.signals();
+    assert_eq!(sigs.len(), 2, "{sigs:?}");
+    assert_eq!(
+        sigs[1].2,
+        [
+            change(MODE_ID, Some(s("manual")), true, ""),
+            change(EXPOSURE_ID, Some(SettingValue::Int(1250)), false, ""),
+        ]
+    );
+    // A refused value is refused against the published tree, without
+    // touching the device.
+    let before = counts(&h);
+    assert!(matches!(
+        h.set_setting(SHARP_ID, SettingValue::Int(999), 1200),
+        Err(IpcError::InvalidArgument(_))
+    ));
+    assert_eq!(counts(&h), before);
+    // An action reads every control again (it may change any).
+    let (_, q, _, _) = counts(&h);
+    h.set_setting("camera.focus.pan_reset", SettingValue::Bool(true), 1300)
+        .unwrap();
+    assert_eq!(counts(&h).1, q + 1);
+    // So does a control the device says changes others when the daemon
+    // knows none of them.
+    h.brio_mut(|d| {
+        d.controls
+            .iter_mut()
+            .find(|c| c.id == GAIN)
+            .unwrap()
+            .info
+            .flags |= CTRL_FLAG_UPDATE;
+    });
+    h.rescan(1400);
+    let (_, q, _, _) = counts(&h);
+    h.set_setting("camera.exposure.gain", SettingValue::Int(3), 1500)
+        .unwrap();
+    assert_eq!(counts(&h).1, q + 1);
+
+    // The watcher's events of the daemon's own writes report what was read
+    // back: no read again. Another program's change is read.
+    let generation = h.world().watch_generation;
+    let b = h.brio();
+    let (_, q, _, _) = counts(&h);
+    for (id, changes) in [
+        (SHARPNESS, CTRL_CHANGE_VALUE),
+        (AUTO_EXPOSURE, CTRL_CHANGE_VALUE),
+        (EXPOSURE, CTRL_CHANGE_FLAGS),
+    ] {
+        h.ctrl.handle(
+            Command::ControlEvent(generation, ctrl_event(&b, id, changes)),
+            h.at(1600),
+        );
+    }
+    h.tick(1700);
+    assert_eq!(counts(&h).1, q, "nothing new: no read");
+    h.brio_mut(|d| d.change(SHARPNESS, 77));
+    let b = h.brio();
+    h.ctrl.handle(
+        Command::ControlEvent(generation, ctrl_event(&b, SHARPNESS, CTRL_CHANGE_VALUE)),
+        h.at(1800),
+    );
+    h.tick(1850);
+    assert_eq!(counts(&h).1, q + 1);
+    assert_eq!(
+        h.setting(SHARP_ID).kind.value(),
+        Some(SettingValue::Int(77))
+    );
+}
+
+#[test]
+fn a_held_write_follows_a_rename_of_the_open_camera() {
+    let early = cam("/dev/video0", "Alpha Cam", Some("1111:0001"), "/dev/video0");
+    let mut h = H::new("", |w| {
+        w.cameras = vec![early.clone()];
+        w.devices.insert("/dev/video0".into(), brio_device());
+    });
+    h.activate(0);
+    h.set_setting(SHARP_ID, SettingValue::Int(10), 1000)
+        .unwrap();
+    let mut held = h.send_set("", SHARP_ID, Some(SettingValue::Int(20)), 1010);
+    assert!(held.try_recv().is_err());
+    assert_eq!(h.writes(), [w("/dev/video0", "sharpness", 10)]);
+    {
+        let mut w = h.world();
+        w.cameras = vec![alpha()];
+        let d = w.devices.remove("/dev/video0").unwrap();
+        w.devices.insert("usb-a".into(), d);
+    }
+    h.rescan(1020);
+    assert_eq!(h.snap().active_camera, "usb-a");
+    assert!(held.try_recv().is_err(), "still held");
+    h.tick(1050);
+    assert!(matches!(held.try_recv().unwrap(), Ok(())));
+    assert_eq!(h.writes(), [w("usb-a", "sharpness", 20)]);
+    assert_eq!(h.brio().value(SHARPNESS), 20);
+    assert_eq!(h.stored("usb-a").unwrap().values["sharpness"], 20);
 }

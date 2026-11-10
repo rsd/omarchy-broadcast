@@ -70,25 +70,29 @@ use gst::prelude::*;
 use obc_core::config::EffectConfig;
 use obc_core::{EffectMode, EffectOnFailure, ModeRequest, OutputContract, SinkSelector};
 use obc_ipc::Stats;
-use obc_pipeline::controls::ImageControls;
+use obc_pipeline::control_node::CaptureFormat;
+use obc_pipeline::controls::CtrlInfo;
 use obc_pipeline::gpu::GpuSampler;
 use obc_pipeline::pipeline::names;
 use obc_pipeline::stats::{cpu_usage, online_cpus, self_cpu_ticks, ticks_per_sec};
+use obc_pipeline::xu::{SYSFS_ROOT, XuControl, XuRow, find_xu_controls};
 use obc_pipeline::{
-    ConsumerCover, DiscoveryRoute, EffectFallback, EffectKind, EffectSettings, FrameTap,
-    IngestConfig, LiveStats, LoopbackWriter, Output, OutputConfig, OutputSink, PipelineError,
-    PreviewConfig, PreviewEncoder, Session, StopError, WriterCounts, WriterHandle, WriterSink,
-    choose_mode, effect_backend_available, list_cameras, scan_sysfs, select_sink,
+    ConsumerCover, CtrlNotice, CtrlWatcher, DiscoveryRoute, EffectFallback, EffectKind,
+    EffectSettings, FrameTap, IngestConfig, LiveStats, LoopbackWriter, Output, OutputConfig,
+    OutputSink, PipelineError, PreviewConfig, PreviewEncoder, Session, StopError, WriterCounts,
+    WriterHandle, WriterSink, choose_mode, effect_backend_available, list_cameras, scan_sysfs,
+    select_sink,
 };
 
 use super::park::{Parker, StartError, StopFailure, StopSession};
 use super::{
-    ControlNode, ControlQuery, EffectReport, EffectStatus, Failure, MediaBackend, PipeWireEvent,
-    PipeWireGeneration, PipeWireReporter, PipeWireState, PreviewReporter, PreviewRequest,
-    SessionParams,
+    ControlEvent, ControlEventReporter, ControlNode, ControlScan, EffectReport, EffectStatus,
+    Failure, MediaBackend, PipeWireEvent, PipeWireGeneration, PipeWireReporter, PipeWireState,
+    PreviewReporter, PreviewRequest, SessionParams, WatchGeneration,
 };
 use crate::camera::{Camera, stable_id, usb_origin};
 use crate::consumers::{NodeId, count_holders};
+use crate::settings::XuReading;
 
 /// Environment variable that makes the daemon stamp every frame it
 /// forwards to the writer with `obc_pipeline::stamp` (the frame's PTS in
@@ -210,6 +214,12 @@ pub struct GstBackend {
     preview_reporter: Option<PreviewReporter>,
     /// The last preview sequence number used, shared by every encoder.
     preview_seq: Arc<AtomicU32>,
+    /// Where the control events go (`None`: no watcher can start).
+    control_reporter: Option<ControlEventReporter>,
+    /// The control-event watcher of the open camera.
+    watcher: Option<CtrlWatcher>,
+    /// The generation of the last watcher started (0: none yet).
+    watch_generation: WatchGeneration,
 }
 
 /// The writer's one tap: the PipeWire output's, the preview encoder's, or
@@ -251,7 +261,17 @@ impl GstBackend {
             encoder: None,
             preview_reporter,
             preview_seq: Arc::default(),
+            control_reporter: None,
+            watcher: None,
+            watch_generation: 0,
         })
+    }
+
+    /// The backend with the control events of its watchers
+    /// ([`MediaBackend::watch_controls`]) going to `reporter`.
+    pub fn with_control_reporter(mut self, reporter: ControlEventReporter) -> Self {
+        self.control_reporter = Some(reporter);
+        self
     }
 
     /// Installs the composed tap of what runs on the writer (see the module
@@ -865,42 +885,146 @@ impl MediaBackend for GstBackend {
         write: bool,
     ) -> Result<Box<dyn ControlNode>, String> {
         let what = format!("{} ({})", camera.label(), camera.path.display());
-        let node = ImageControls::open(&camera.path, write)
-            .map_err(|e| format!("opening {what} for its image controls: {e}"))?;
-        Ok(Box::new(RealControlNode { node, what }))
+        let node = obc_pipeline::ControlNode::open(&camera.path, write)
+            .map_err(|e| format!("opening {what} for its controls: {e}"))?;
+        // The Extension Unit rows of its USB device (none for another
+        // camera, or one that is not on USB).
+        let (xu, xu_problem) = match find_xu_controls(Path::new(SYSFS_ROOT), &camera.path) {
+            Ok(found) => (found, None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
+            Err(e) => (Vec::new(), Some(e.to_string())),
+        };
+        Ok(Box::new(RealControlNode {
+            node,
+            xu,
+            xu_problem,
+            what,
+        }))
+    }
+
+    fn watch_controls(&mut self, camera: &Camera, ids: &[u32]) -> Result<WatchGeneration, String> {
+        self.unwatch_controls();
+        let Some(reporter) = self.control_reporter.clone() else {
+            return Err("control events are not reported by this backend".into());
+        };
+        self.watch_generation += 1;
+        let generation = self.watch_generation;
+        let watcher = CtrlWatcher::start(&camera.path, ids, move |notice| {
+            reporter(
+                generation,
+                match notice {
+                    CtrlNotice::Changed(ev) => ControlEvent::Changed(ev),
+                    CtrlNotice::Ended(e) => ControlEvent::Ended(e.to_string()),
+                },
+            );
+        })
+        .map_err(|e| {
+            format!(
+                "watching the controls of {} ({}): {e}",
+                camera.label(),
+                camera.path.display()
+            )
+        })?;
+        if !watcher.refused().is_empty() {
+            crate::debug!(
+                "{}: no change events for {} of its controls",
+                camera.label(),
+                watcher.refused().len()
+            );
+        }
+        self.watcher = Some(watcher);
+        Ok(generation)
+    }
+
+    fn unwatch_controls(&mut self) {
+        // Dropping it wakes the thread and joins it.
+        self.watcher = None;
     }
 }
 
-/// A camera node opened for its image controls.
+/// A camera node opened for its controls, with its Extension Unit rows.
 struct RealControlNode {
-    node: ImageControls,
+    node: obc_pipeline::ControlNode,
+    xu: Vec<XuControl>,
+    /// Why its Extension Unit rows could not be looked up, if so.
+    xu_problem: Option<String>,
     /// The camera's label and node, for the errors.
     what: String,
 }
 
+impl RealControlNode {
+    fn xu_of(&self, row: &'static XuRow) -> Result<&XuControl, String> {
+        self.xu
+            .iter()
+            .find(|x| std::ptr::eq(x.row(), row) || x.row().name == row.name)
+            .ok_or_else(|| format!("{} has no {}", self.what, row.name))
+    }
+}
+
 impl ControlNode for RealControlNode {
-    fn query(&mut self) -> ControlQuery {
-        let found = self.node.query();
-        ControlQuery {
+    fn enumerate(&mut self) -> ControlScan {
+        let found = self.node.enumerate();
+        let mut problems = Vec::new();
+        if let Some(e) = found.incomplete {
+            problems.push(("the list of its controls".to_string(), e.to_string()));
+        }
+        if let Some(e) = &self.xu_problem {
+            problems.push(("its USB descriptors".to_string(), e.clone()));
+        }
+        let mut xu = Vec::new();
+        for x in &self.xu {
+            match x.probe(&self.node) {
+                Ok(Some(state)) => xu.push(XuReading {
+                    row: x.row(),
+                    state,
+                }),
+                Ok(None) => {}
+                Err(e) => problems.push((x.row().name.to_string(), e.to_string())),
+            }
+        }
+        ControlScan {
             controls: found.controls,
-            skipped: found
-                .skipped
-                .into_iter()
-                .map(|s| (s.name.to_string(), s.error.to_string()))
-                .collect(),
+            xu,
+            problems,
         }
     }
 
-    fn set(&mut self, name: &str, value: i32) -> Result<(), String> {
+    fn set(&mut self, id: u32, name: &str, value: i32) -> Result<(), String> {
         self.node
-            .set(name, value)
+            .set(id, value)
             .map_err(|e| format!("setting {name} to {value} on {}: {e}", self.what))
     }
 
-    fn get(&mut self, name: &str) -> Result<i32, String> {
+    fn get(&mut self, id: u32, name: &str) -> Result<i32, String> {
         self.node
-            .get(name)
+            .get(id)
             .map_err(|e| format!("reading {name} of {}: {e}", self.what))
+    }
+
+    fn query(&mut self, id: u32, name: &str) -> Result<CtrlInfo, String> {
+        match self.node.query(id) {
+            Ok(Some(info)) => Ok(info),
+            Ok(None) => Err(format!("{} no longer has {name}", self.what)),
+            Err(e) => Err(format!("querying {name} of {}: {e}", self.what)),
+        }
+    }
+
+    fn capture_format(&mut self) -> Result<CaptureFormat, String> {
+        self.node
+            .capture_format()
+            .map_err(|e| format!("reading the capture format of {}: {e}", self.what))
+    }
+
+    fn xu_set(&mut self, row: &'static XuRow, option: &str) -> Result<(), String> {
+        let x = *self.xu_of(row)?;
+        x.set(&self.node, option)
+            .map_err(|e| format!("setting {} to {option} on {}: {e}", row.name, self.what))
+    }
+
+    fn xu_current(&mut self, row: &'static XuRow) -> Result<u8, String> {
+        let x = *self.xu_of(row)?;
+        x.current(&self.node)
+            .map_err(|e| format!("reading {} of {}: {e}", row.name, self.what))
     }
 }
 
