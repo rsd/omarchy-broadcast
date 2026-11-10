@@ -15,6 +15,7 @@ use obc_pipeline::controls::{
     CTRL_FLAG_INACTIVE, CTRL_TYPE_BOOLEAN, CTRL_TYPE_BUTTON, CTRL_TYPE_INTEGER, CTRL_TYPE_MENU,
     CtrlInfo, DeviceControl, image_control_id,
 };
+use obc_pipeline::effect::{Availability, Feature};
 use obc_pipeline::xu::{FIELD_OF_VIEW, XuRow, XuState};
 
 use super::park::{ParkOps, Parker, StartError, StopFailure, StopSession};
@@ -147,6 +148,15 @@ pub struct World {
     /// The `fixed_framerate` each ingest was started with, in the same
     /// order as `ingests`.
     pub ingest_fixed_framerate: Vec<bool>,
+    /// Whether each ingest was built with the enhance stage, in the same
+    /// order as `ingests`.
+    pub ingest_enhance: Vec<bool>,
+    /// An ingest built with the enhance stage reports it failed with this
+    /// (the stage passing the frames through, as the element does).
+    pub enhance_fail: Option<String>,
+    /// What `effect_report` reports for the current ingest's enhance
+    /// stage.
+    pub enhance_status: EffectStatus,
     /// `start_session` fails with this.
     pub fail_start: Option<String>,
     /// With `fail_start`: cleaning up the partly built output did not stop
@@ -197,12 +207,32 @@ pub struct World {
     pub denoise_fail: Option<String>,
     /// What `effect_report` reports for the noise removal stage.
     pub denoise_status: EffectStatus,
+    /// Relighting applied (at start or by `set_effect`) fails with this,
+    /// as `denoise_fail` does for noise removal.
+    pub relight_fail: Option<String>,
+    /// What `effect_report` reports for the relighting stage.
+    pub relight_status: EffectStatus,
     /// The effect the running session applies.
     pub effect: Option<EffectConfig>,
     /// Every `set_effect` on a running session, in order.
     pub effect_sets: Vec<EffectConfig>,
     /// `set_effect` fails with this (once).
     pub fail_set_effect: Option<String>,
+    /// What `feature_availability` reports without a compute capability
+    /// (`None`: no root, nothing known, as before revision 8).
+    pub features: Option<Vec<(Feature, Availability)>>,
+    /// What it reports with one, when set (else [`World::features`]): the
+    /// models of another GPU.
+    pub features_with_cc: Option<Vec<(Feature, Availability)>>,
+    /// The compute capability of every `feature_availability` call, in
+    /// order.
+    pub feature_probes: Vec<Option<(u32, u32)>>,
+    /// What `compute_capability` reports while a session runs.
+    pub compute_capability: Option<(u32, u32)>,
+    /// `compute_capability` calls, and those made with no session (the GPU
+    /// may be parked then: never allowed).
+    pub cc_reads: u32,
+    pub cc_reads_idle: u32,
     /// The fake GPU driver under the backend's real [`Parker`]
     /// (`backend::park`): CUDA is initialised once a session is built
     /// (as GStreamer's `cuInit` does); before that there is nothing to
@@ -296,6 +326,9 @@ impl Default for World {
             session_stops: 0,
             ingests: Vec::new(),
             ingest_fixed_framerate: Vec::new(),
+            ingest_enhance: Vec::new(),
+            enhance_fail: None,
+            enhance_status: EffectStatus::Off,
             fail_start: None,
             fail_start_cleanup: None,
             fail_stop: None,
@@ -323,9 +356,17 @@ impl Default for World {
             effect_status: EffectStatus::Off,
             denoise_fail: None,
             denoise_status: EffectStatus::Off,
+            relight_fail: None,
+            relight_status: EffectStatus::Off,
             effect: None,
             effect_sets: Vec::new(),
             fail_set_effect: None,
+            features: None,
+            features_with_cc: None,
+            feature_probes: Vec::new(),
+            compute_capability: None,
+            cc_reads: 0,
+            cc_reads_idle: 0,
             cuda_initialised: false,
             parked: false,
             parks: 0,
@@ -432,17 +473,21 @@ impl World {
     }
 
     /// The running session applies `effect`, as the effect element would:
-    /// `none` is off at once, an effect loads (or fails); noise removal,
-    /// apart, is off unless requested, else ready (or fails, itself or
-    /// with the whole chain).
+    /// `none` is off at once, an effect loads (or fails); noise removal
+    /// and relighting, apart, are each off unless requested, else ready
+    /// (or fail, themselves or with the whole chain).
     fn apply_effect(&mut self, effect: &EffectConfig) {
-        self.denoise_status = if !effect.denoise {
-            EffectStatus::Off
-        } else if let Some(r) = &self.denoise_fail {
-            EffectStatus::Failed(r.clone())
-        } else {
-            EffectStatus::Ready
+        let stage = |on: bool, fail: &Option<String>| {
+            if !on {
+                EffectStatus::Off
+            } else if let Some(r) = fail {
+                EffectStatus::Failed(r.clone())
+            } else {
+                EffectStatus::Ready
+            }
         };
+        self.denoise_status = stage(effect.denoise, &self.denoise_fail);
+        self.relight_status = stage(effect.relight, &self.relight_fail);
         self.effect = Some(effect.clone());
         self.effect_status = if effect.mode == EffectMode::None {
             EffectStatus::Off
@@ -455,9 +500,12 @@ impl World {
         };
         if let EffectStatus::Failed(r) = &self.effect_status
             && self.effect_fail_chain
-            && self.denoise_status == EffectStatus::Ready
         {
-            self.denoise_status = EffectStatus::Failed(r.clone());
+            for s in [&mut self.denoise_status, &mut self.relight_status] {
+                if *s == EffectStatus::Ready {
+                    *s = EffectStatus::Failed(r.clone());
+                }
+            }
         }
     }
 }
@@ -476,8 +524,10 @@ impl StopSession for FakeSession {
         }
         // The models go with the session.
         w.effect = None;
+        w.enhance_status = EffectStatus::Off;
         w.effect_status = EffectStatus::Off;
         w.denoise_status = EffectStatus::Off;
+        w.relight_status = EffectStatus::Off;
         let at_null = w.fail_stop_at_null.take();
         match (w.fail_stop.take(), w.session_unclean.take()) {
             (Some(e), _) | (None, Some(e)) => Err(StopFailure::unclean(e)),
@@ -678,7 +728,14 @@ impl MediaBackend for FakeBackend {
     fn switch_camera(&mut self, params: &SessionParams, camera: &Camera) -> Result<(), String> {
         let mut w = self.world();
         w.ingest_fixed_framerate.push(params.fixed_framerate);
-        Self::start_ingest(&mut w, camera)
+        w.ingest_enhance.push(params.effect.enhance);
+        let res = Self::start_ingest(&mut w, camera);
+        w.enhance_status = match (&res, params.effect.enhance, &w.enhance_fail) {
+            (Ok(()), true, Some(r)) => EffectStatus::Failed(r.clone()),
+            (Ok(()), true, None) => EffectStatus::Ready,
+            _ => EffectStatus::Off,
+        };
+        res
     }
 
     fn stop_session(&mut self) {
@@ -736,10 +793,35 @@ impl MediaBackend for FakeBackend {
         Some(EffectReport {
             status: w.effect_status.clone(),
             denoise: w.denoise_status.clone(),
+            relight: w.relight_status.clone(),
+            enhance: w.enhance_status.clone(),
             load_ms: Some(120.0),
             reused: false,
             gpu_ms_p50: Some(1.2),
         })
+    }
+
+    fn feature_availability(
+        &mut self,
+        compute_capability: Option<(u32, u32)>,
+    ) -> Option<(PathBuf, Vec<(Feature, Availability)>)> {
+        let mut w = self.world();
+        w.feature_probes.push(compute_capability);
+        let found = match (&w.features_with_cc, compute_capability) {
+            (Some(f), Some(_)) => Some(f.clone()),
+            _ => w.features.clone(),
+        };
+        found.map(|f| (PathBuf::from("/opt/fake/maxine"), f))
+    }
+
+    fn compute_capability(&mut self) -> Option<(u32, u32)> {
+        let mut w = self.world();
+        w.cc_reads += 1;
+        if w.session.is_none() {
+            w.cc_reads_idle += 1;
+            return None;
+        }
+        w.compute_capability
     }
 
     fn open_camera_controls(

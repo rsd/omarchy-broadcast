@@ -25,7 +25,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     AspectPolicy, CameraSelector, ColourRange, DEFAULT_SINK_LABEL, EffectMode, EffectOnFailure,
-    ModeRequest, OutputContract, OutputFormat, SinkSelector, fmt_size_rate,
+    ModeRequest, OutputContract, OutputFormat, RelightLight, SinkSelector, fmt_size_rate,
 };
 
 /// Config schema version this build reads.
@@ -74,6 +74,22 @@ pub mod limits {
     pub const MIN_BLUR_STRENGTH: f64 = 0.0;
     /// `effect.blur_strength`: [`MIN_BLUR_STRENGTH`] to this.
     pub const MAX_BLUR_STRENGTH: f64 = 1.0;
+    /// `effect.relight_direction`: this to [`MAX_RELIGHT_DIRECTION`]
+    /// degrees.
+    pub const MIN_RELIGHT_DIRECTION: i32 = -90;
+    /// `effect.relight_direction`: [`MIN_RELIGHT_DIRECTION`] to this
+    /// degrees.
+    pub const MAX_RELIGHT_DIRECTION: i32 = 90;
+    /// `effect.relight_brightness`: this to [`MAX_RELIGHT_BRIGHTNESS`]
+    /// percent.
+    pub const MIN_RELIGHT_BRIGHTNESS: u32 = 50;
+    /// `effect.relight_brightness`: [`MIN_RELIGHT_BRIGHTNESS`] to this
+    /// percent.
+    pub const MAX_RELIGHT_BRIGHTNESS: u32 = 200;
+    /// `effect.relight_direction` and `effect.relight_brightness`: whole
+    /// steps of this (degrees, percent) from their minimum, the step the
+    /// settings schema publishes.
+    pub const RELIGHT_STEP: u32 = 5;
 }
 
 /// A config file that cannot be used. The previous config stays in force.
@@ -252,6 +268,27 @@ pub struct EffectConfig {
     /// Video noise removal, a stage of its own that runs before the effect
     /// (or alone, with `mode = "none"`). Off by default.
     pub denoise: bool,
+    /// Enhance a low-resolution camera: upscale the camera image to the
+    /// output size (Maxine Video Super Resolution) before the other
+    /// stages, when the camera captures below the output in both
+    /// dimensions. Off by default; with a camera that already captures at
+    /// the output size or above, it does nothing.
+    pub enhance: bool,
+    /// Relighting of the person (Maxine Video Relighting), a stage of its
+    /// own after the mask: the background is never relit. Off by default.
+    pub relight: bool,
+    /// The colour of the relighting key light: `warm`, `neutral` or
+    /// `cool`.
+    #[serde(serialize_with = "ser_display", deserialize_with = "de_from_str")]
+    pub relight_light: RelightLight,
+    /// Where the relighting key light comes from, in degrees around the
+    /// vertical axis, -90 to 90 in steps of 5 (0: the default position).
+    #[serde(deserialize_with = "de_relight_direction")]
+    pub relight_direction: i32,
+    /// How bright the relit person is, in percent, 50 to 200 in steps of 5
+    /// (100: unchanged).
+    #[serde(deserialize_with = "de_relight_brightness")]
+    pub relight_brightness: u32,
     /// What the virtual camera shows when the effect cannot run.
     #[serde(serialize_with = "ser_display", deserialize_with = "de_from_str")]
     pub on_failure: EffectOnFailure,
@@ -274,6 +311,8 @@ pub struct EffectConfig {
 impl EffectConfig {
     /// The default blur strength.
     pub const DEFAULT_BLUR_STRENGTH: f64 = 0.5;
+    /// The default relighting brightness, in percent.
+    pub const DEFAULT_RELIGHT_BRIGHTNESS: u32 = 100;
 
     /// Checks the values and that `replace` has an image. The key named in
     /// the error is the dotted config key.
@@ -281,6 +320,10 @@ impl EffectConfig {
         let invalid =
             |key: &'static str| move |reason: String| ConfigError::Invalid { key, reason };
         check_blur_strength(self.blur_strength).map_err(invalid("effect.blur_strength"))?;
+        check_relight_direction(self.relight_direction)
+            .map_err(invalid("effect.relight_direction"))?;
+        check_relight_brightness(self.relight_brightness)
+            .map_err(invalid("effect.relight_brightness"))?;
         if let Some(p) = &self.background_image {
             check_background_image(p).map_err(invalid("effect.background_image"))?;
         }
@@ -303,6 +346,11 @@ impl Default for EffectConfig {
             blur_strength: Self::DEFAULT_BLUR_STRENGTH,
             background_image: None,
             denoise: false,
+            enhance: false,
+            relight: false,
+            relight_light: RelightLight::Neutral,
+            relight_direction: 0,
+            relight_brightness: Self::DEFAULT_RELIGHT_BRIGHTNESS,
             on_failure: EffectOnFailure::Black,
             maxine_root: None,
         }
@@ -612,6 +660,42 @@ fn check_blur_strength(v: f64) -> Result<(), String> {
     }
 }
 
+fn check_relight_direction(v: i32) -> Result<(), String> {
+    if !(limits::MIN_RELIGHT_DIRECTION..=limits::MAX_RELIGHT_DIRECTION).contains(&v) {
+        Err(format!(
+            "must be between {} and {} degrees, got {v}",
+            limits::MIN_RELIGHT_DIRECTION,
+            limits::MAX_RELIGHT_DIRECTION
+        ))
+    } else if (v - limits::MIN_RELIGHT_DIRECTION) % limits::RELIGHT_STEP as i32 != 0 {
+        Err(format!(
+            "must be a whole number of steps of {} degrees from {}, got {v}",
+            limits::RELIGHT_STEP,
+            limits::MIN_RELIGHT_DIRECTION
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_relight_brightness(v: u32) -> Result<(), String> {
+    if !(limits::MIN_RELIGHT_BRIGHTNESS..=limits::MAX_RELIGHT_BRIGHTNESS).contains(&v) {
+        Err(format!(
+            "must be between {} and {} percent, got {v}",
+            limits::MIN_RELIGHT_BRIGHTNESS,
+            limits::MAX_RELIGHT_BRIGHTNESS
+        ))
+    } else if !(v - limits::MIN_RELIGHT_BRIGHTNESS).is_multiple_of(limits::RELIGHT_STEP) {
+        Err(format!(
+            "must be a whole number of steps of {} percent from {}, got {v}",
+            limits::RELIGHT_STEP,
+            limits::MIN_RELIGHT_BRIGHTNESS
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn check_background_image(v: &Path) -> Result<(), String> {
     if v.is_absolute() {
         Ok(())
@@ -725,8 +809,32 @@ fn de_state_blur_strength<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>
     de_blur_strength(d).map(Some)
 }
 
-fn de_state_denoise<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+fn de_state_bool<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
     bool::deserialize(d).map(Some)
+}
+
+/// `effect.relight_direction`: whole degrees, checked.
+fn de_relight_direction<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
+    de_checked(d, check_relight_direction)
+}
+
+/// `effect.relight_brightness`: whole percent, checked.
+fn de_relight_brightness<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    de_checked(d, check_relight_brightness)
+}
+
+fn de_state_relight_light<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<RelightLight>, D::Error> {
+    de_from_str(d).map(Some)
+}
+
+fn de_state_relight_direction<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i32>, D::Error> {
+    de_relight_direction(d).map(Some)
+}
+
+fn de_state_relight_brightness<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    de_relight_brightness(d).map(Some)
 }
 
 fn de_hold_timeout<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
@@ -848,7 +956,9 @@ impl CameraControlState {
 /// The effect keys override the config's `[effect]` keys of the same name
 /// while set (`None`: the config's value applies). A value that is not
 /// valid (an unknown effect, a strength outside 0 to 1, a relative image
-/// path, a `denoise` that is not a boolean) makes the whole file
+/// path, a `denoise`, `enhance` or `relight` that is not a boolean, an
+/// unknown relighting light, a relighting direction or brightness that is
+/// not a whole number within its range) makes the whole file
 /// unparseable, so the daemon's fail-closed rule for a damaged state file
 /// applies: it starts `off`, with the camera closed, and never streams the
 /// raw image in place of an effect it could not read. Unknown keys (a newer
@@ -889,9 +999,43 @@ pub struct RuntimeState {
     /// Noise removal switched with `SetDenoise`.
     #[serde(
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "de_state_denoise"
+        deserialize_with = "de_state_bool"
     )]
     pub denoise: Option<bool>,
+    /// Low-resolution enhancement switched with `SetSetting`
+    /// (`effect.video.enhance`).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_state_bool"
+    )]
+    pub enhance: Option<bool>,
+    /// Relighting switched with `SetSetting` (`effect.lighting.relight`).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_state_bool"
+    )]
+    pub relight: Option<bool>,
+    /// The relighting light set with `SetSetting`
+    /// (`effect.lighting.light`).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_state_relight_light"
+    )]
+    pub relight_light: Option<RelightLight>,
+    /// The relighting direction set with `SetSetting`
+    /// (`effect.lighting.direction`), -90 to 90 degrees.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_state_relight_direction"
+    )]
+    pub relight_direction: Option<i32>,
+    /// The relighting brightness set with `SetSetting`
+    /// (`effect.lighting.brightness`), 50 to 200 percent.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_state_relight_brightness"
+    )]
+    pub relight_brightness: Option<u32>,
     /// The camera controls set (with `SetCameraControl` or `SetSetting`) or
     /// reset while the camera was closed, by camera id. Never holds an
     /// empty entry ([`CameraControlState::is_empty`]). In the file, one
@@ -922,6 +1066,11 @@ impl Default for RuntimeState {
             blur_strength: None,
             background_image: None,
             denoise: None,
+            enhance: None,
+            relight: None,
+            relight_light: None,
+            relight_direction: None,
+            relight_brightness: None,
             camera_controls: BTreeMap::new(),
         }
     }
@@ -1123,6 +1272,11 @@ impl RuntimeState {
                 _ => config.background_image.clone(),
             },
             denoise: self.denoise.unwrap_or(config.denoise),
+            enhance: self.enhance.unwrap_or(config.enhance),
+            relight: self.relight.unwrap_or(config.relight),
+            relight_light: self.relight_light.unwrap_or(config.relight_light),
+            relight_direction: self.relight_direction.unwrap_or(config.relight_direction),
+            relight_brightness: self.relight_brightness.unwrap_or(config.relight_brightness),
             on_failure: config.on_failure,
             maxine_root: config.maxine_root.clone(),
         }
@@ -1289,6 +1443,18 @@ pub fn state_path() -> Option<PathBuf> {
     state_path_in(|k| std::env::var_os(k))
 }
 
+/// `$XDG_CACHE_HOME/omarchy-broadcast`, else
+/// `$HOME/.cache/omarchy-broadcast`: what the daemon learnt and may forget
+/// (never a setting). `None` with neither set.
+pub fn cache_dir() -> Option<PathBuf> {
+    cache_dir_in(|k| std::env::var_os(k))
+}
+
+/// [`cache_dir`] with the environment looked up through `env`.
+pub fn cache_dir_in(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    xdg_dir(&env, "XDG_CACHE_HOME", ".cache").map(|d| d.join(APP_DIR))
+}
+
 /// [`config_path`] with the environment looked up through `env`.
 pub fn config_path_in(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     xdg_dir(&env, "XDG_CONFIG_HOME", ".config").map(|d| d.join(APP_DIR).join("config.toml"))
@@ -1379,6 +1545,11 @@ mode = "replace"
 blur_strength = 1
 background_image = "/home/u/Pictures/office.png"
 denoise = true
+enhance = true
+relight = true
+relight_light = "warm"
+relight_direction = -45
+relight_brightness = 150
 on_failure = "none"
 maxine_root = "/home/u/sdk/VideoFX"
 
@@ -1421,6 +1592,11 @@ offer_nv12 = false
                 blur_strength: 1.0,
                 background_image: Some("/home/u/Pictures/office.png".into()),
                 denoise: true,
+                enhance: true,
+                relight: true,
+                relight_light: RelightLight::Warm,
+                relight_direction: -45,
+                relight_brightness: 150,
                 on_failure: EffectOnFailure::None,
                 maxine_root: Some("/home/u/sdk/VideoFX".into()),
             }
@@ -1491,6 +1667,11 @@ offer_nv12 = false
             "blur_strength",
             "background_image",
             "denoise",
+            "enhance",
+            "relight",
+            "relight_light",
+            "relight_direction",
+            "relight_brightness",
             "on_failure",
             "maxine_root",
             "enabled",
@@ -1689,6 +1870,58 @@ offer_nv12 = false
                 "effect.denoise",
                 "invalid type",
             ),
+            ("[effect]\nenhance = 1", "effect.enhance", "invalid type"),
+            ("[effect]\nrelight = 1", "effect.relight", "invalid type"),
+            (
+                "[effect]\nrelight_light = \"pink\"",
+                "effect.relight_light",
+                "unknown relighting light",
+            ),
+            (
+                "[effect]\nrelight_direction = 91",
+                "effect.relight_direction",
+                "between -90 and 90 degrees",
+            ),
+            (
+                "[effect]\nrelight_direction = -91",
+                "effect.relight_direction",
+                "between -90 and 90 degrees",
+            ),
+            (
+                "[effect]\nrelight_direction = 1.5",
+                "effect.relight_direction",
+                "invalid type",
+            ),
+            (
+                "[effect]\nrelight_brightness = 49",
+                "effect.relight_brightness",
+                "between 50 and 200 percent",
+            ),
+            (
+                "[effect]\nrelight_brightness = 201",
+                "effect.relight_brightness",
+                "between 50 and 200 percent",
+            ),
+            (
+                "[effect]\nrelight_direction = 47",
+                "effect.relight_direction",
+                "steps of 5 degrees from -90",
+            ),
+            (
+                "[effect]\nrelight_direction = -1",
+                "effect.relight_direction",
+                "steps of 5 degrees from -90",
+            ),
+            (
+                "[effect]\nrelight_brightness = 101",
+                "effect.relight_brightness",
+                "steps of 5 percent from 50",
+            ),
+            (
+                "[effect]\nrelight_brightness = -5",
+                "effect.relight_brightness",
+                "invalid value",
+            ),
             (
                 "[effect]\non_failure = \"raw\"",
                 "effect.on_failure",
@@ -1842,6 +2075,11 @@ offer_nv12 = false
         assert_eq!(c.effect.blur_strength, 0.5);
         assert_eq!(c.effect.background_image, None);
         assert!(!c.effect.denoise);
+        assert!(!c.effect.enhance);
+        assert!(!c.effect.relight);
+        assert_eq!(c.effect.relight_light, RelightLight::Neutral);
+        assert_eq!(c.effect.relight_direction, 0);
+        assert_eq!(c.effect.relight_brightness, 100);
         assert_eq!(c.effect.on_failure, EffectOnFailure::Black);
         // An empty image is the default, and is not written back.
         let c = parse("[effect]\nbackground_image = \"\"\n").unwrap();
@@ -1898,6 +2136,11 @@ offer_nv12 = false
             blur_strength: Some(0.25),
             background_image: Some("/home/u/bg.png".into()),
             denoise: Some(true),
+            enhance: Some(true),
+            relight: Some(true),
+            relight_light: Some(RelightLight::Cool),
+            relight_direction: Some(45),
+            relight_brightness: Some(60),
             camera_controls: BTreeMap::new(),
         };
         st.save(&path).unwrap();
@@ -2456,6 +2699,11 @@ reset_all = false
             blur_strength: 0.8,
             background_image: Some("/cfg/bg.png".into()),
             denoise: true,
+            enhance: true,
+            relight: true,
+            relight_light: RelightLight::Cool,
+            relight_direction: 30,
+            relight_brightness: 80,
             on_failure: EffectOnFailure::None,
             maxine_root: Some("/cfg/sdk".into()),
         };
@@ -2467,6 +2715,11 @@ reset_all = false
             blur_strength: Some(0.1),
             background_image: Some("/state/bg.png".into()),
             denoise: Some(false),
+            enhance: Some(false),
+            relight: Some(false),
+            relight_light: Some(RelightLight::Warm),
+            relight_direction: Some(-90),
+            relight_brightness: Some(200),
             ..RuntimeState::default()
         }
         .effect_over(&config);
@@ -2477,6 +2730,11 @@ reset_all = false
                 blur_strength: 0.1,
                 background_image: Some("/state/bg.png".into()),
                 denoise: false,
+                enhance: false,
+                relight: false,
+                relight_light: RelightLight::Warm,
+                relight_direction: -90,
+                relight_brightness: 200,
                 on_failure: EffectOnFailure::None,
                 maxine_root: Some("/cfg/sdk".into()),
             }
@@ -2516,6 +2774,51 @@ reset_all = false
         let config_off = EffectConfig::default();
         assert!(on.effect_over(&config_off).denoise);
         assert!(RuntimeState::default().effect_over(&config).denoise);
+        // Enhance: the same, written only while set.
+        assert!(!text.contains("enhance"), "{text}");
+        let on = RuntimeState {
+            enhance: Some(true),
+            ..RuntimeState::default()
+        };
+        on.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("enhance = true"), "{text}");
+        assert_eq!(RuntimeState::load(&path), (on.clone(), None));
+        assert!(on.effect_over(&config_off).enhance);
+        assert!(!RuntimeState::default().effect_over(&config_off).enhance);
+        assert!(RuntimeState::default().effect_over(&config).enhance);
+        // The relighting keys: the same, written only while set.
+        assert!(!text.contains("relight"), "{text}");
+        let lit = RuntimeState {
+            relight: Some(true),
+            relight_light: Some(RelightLight::Warm),
+            relight_direction: Some(-30),
+            relight_brightness: Some(125),
+            ..RuntimeState::default()
+        };
+        lit.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        for line in [
+            "relight = true",
+            "relight_light = \"warm\"",
+            "relight_direction = -30",
+            "relight_brightness = 125",
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
+        assert_eq!(RuntimeState::load(&path), (lit.clone(), None));
+        let e = lit.effect_over(&config_off);
+        assert!(e.relight);
+        assert_eq!(
+            (e.relight_light, e.relight_direction, e.relight_brightness),
+            (RelightLight::Warm, -30, 125)
+        );
+        let d = RuntimeState::default().effect_over(&config_off);
+        assert!(!d.relight);
+        assert_eq!(
+            (d.relight_light, d.relight_direction, d.relight_brightness),
+            (RelightLight::Neutral, 0, 100)
+        );
     }
 
     #[test]
@@ -2530,6 +2833,17 @@ reset_all = false
             "enabled = true\nbackground_image = \"bg.png\"\n",
             "enabled = true\ndenoise = \"yes\"\n",
             "enabled = true\ndenoise = 1\n",
+            "enabled = true\nenhance = \"on\"\n",
+            "enabled = true\nenhance = 1\n",
+            "enabled = true\nrelight = \"on\"\n",
+            "enabled = true\nrelight_light = \"pink\"\n",
+            "enabled = true\nrelight_light = 1\n",
+            "enabled = true\nrelight_direction = 95\n",
+            "enabled = true\nrelight_direction = 2.5\n",
+            "enabled = true\nrelight_direction = 7\n",
+            "enabled = true\nrelight_brightness = 102\n",
+            "enabled = true\nrelight_brightness = 20\n",
+            "enabled = true\nrelight_brightness = \"100\"\n",
         ] {
             fs::write(&path, text).unwrap();
             let (st, warning) = RuntimeState::load(&path);
@@ -2554,8 +2868,13 @@ reset_all = false
         let xdg = env(&[
             ("XDG_CONFIG_HOME", "/x/cfg"),
             ("XDG_STATE_HOME", "/x/state"),
+            ("XDG_CACHE_HOME", "/x/cache"),
             ("HOME", "/home/u"),
         ]);
+        assert_eq!(
+            cache_dir_in(xdg),
+            Some(PathBuf::from("/x/cache/omarchy-broadcast"))
+        );
         assert_eq!(
             config_path_in(xdg),
             Some(PathBuf::from("/x/cfg/omarchy-broadcast/config.toml"))
@@ -2577,7 +2896,12 @@ reset_all = false
                 "/home/u/.local/state/omarchy-broadcast/state.toml"
             ))
         );
+        assert_eq!(
+            cache_dir_in(home),
+            Some(PathBuf::from("/home/u/.cache/omarchy-broadcast"))
+        );
         let none = env(&[]);
+        assert_eq!(cache_dir_in(none), None);
         assert_eq!(config_path_in(none), None);
         assert_eq!(state_path_in(none), None);
     }

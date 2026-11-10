@@ -24,6 +24,10 @@ pub struct GpuInfo {
     pub pci_bus_id: String,
     pub driver_version: String,
     pub memory_total_bytes: u64,
+    /// The CUDA compute capability `(major, minor)`, when NVML reports it.
+    /// Not serialised: the measurement reports keep their shape.
+    #[serde(skip)]
+    pub compute_capability: Option<(u32, u32)>,
 }
 
 /// One NVML sample.
@@ -151,6 +155,10 @@ fn sample_loop(
         pci_bus_id: device.pci_info().map(|p| p.bus_id).unwrap_or_default(),
         driver_version: nvml.sys_driver_version().unwrap_or_default(),
         memory_total_bytes: device.memory_info().map(|m| m.total).unwrap_or(0),
+        compute_capability: device
+            .cuda_compute_capability()
+            .ok()
+            .and_then(|c| Some((u32::try_from(c.major).ok()?, u32::try_from(c.minor).ok()?))),
     };
     let _ = info_tx.send(Ok(info));
     let pid = std::process::id();

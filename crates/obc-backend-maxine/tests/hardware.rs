@@ -32,17 +32,29 @@
 //! replace, its temporal reset, both strengths, its GPU memory, its forced
 //! load and run failures, and a load after the GPU was parked and unparked
 //! (ADR 0017), which runs in a child process of this binary.
+//!
+//! The `maxine_relight_` tests cover the relight stage: that it lights on
+//! every load in a process and after every live change of its light (the
+//! SDK can bring the effect up without its lighting environment, dark and
+//! blind to the light's direction, and the test would catch it coming
+//! back), that under each effect it changes the foreground only (on a fixed
+//! split mask with a soft ramp), its forced load, run and light-change
+//! failures, that a temporal reset drops it and a new load lights again,
+//! switching it on and off with its GPU memory, a
+//! load after the GPU was parked and unparked, and its GPU time per stage
+//! (logged).
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use obc_backend::{
     BackendError, BackendFactory, ColourSpec, EffectKind, FrameParams, GpuContext, HostBgr,
-    InferenceBackend, LoadRequest, StageTimings,
+    InferenceBackend, LoadRequest, RelightLight, Stage, StageList, StageTimings,
 };
 use obc_backend_maxine::matte::{HARDENING_LUT, apply_lut};
 use obc_backend_maxine::{
     DenoiseFault, DenoiseFaultSwitch, MaskFault, MaskFaultSwitch, MaxineBackend, MaxineFactory,
+    RelightFault, RelightFaultSwitch, SPLIT_MASK_RAMP, split_mask_value,
 };
 use obc_gpu::{
     ContextGuard, DeviceNv12Buffer, OwnedContext, ParkOutcome, Stream, UnparkOutcome, mem_get_info,
@@ -182,6 +194,7 @@ fn run_frames(
         ("convert_in", col(|t| t.convert_in_ms)),
         ("denoise", col(|t| t.denoise_ms)),
         ("mask", col(|t| t.mask_ms)),
+        ("relight", col(|t| t.relight_ms)),
         ("effect", col(|t| t.effect_ms)),
         ("convert_out", col(|t| t.convert_out_ms)),
         ("gpu_total", col(|t| t.total_ms())),
@@ -335,11 +348,12 @@ fn maxine_rejects_calls_without_the_context_or_a_load() {
     };
     let req = LoadRequest {
         effect: EffectKind::Blur,
-        denoise: false,
+        stages: StageList::default(),
         width: W,
         height: H,
         colour: ColourSpec::LIMITED_BT601,
         background: None,
+        relight_light: RelightLight::default(),
     };
     // Not pushed: the backend must refuse rather than run in no context.
     let e = backend.load(&gpu, &req).unwrap_err();
@@ -391,11 +405,12 @@ fn maxine_blur_and_replace_in_a_created_context() {
         // Blur: a cold load (models + warm-up run).
         let blur_req = LoadRequest {
             effect: EffectKind::Blur,
-            denoise: false,
+            stages: StageList::default(),
             width: W,
             height: H,
             colour: ColourSpec::LIMITED_BT601,
             background: None,
+            relight_light: RelightLight::default(),
         };
         let t = Instant::now();
         let r = backend
@@ -417,7 +432,10 @@ fn maxine_blur_and_replace_in_a_created_context() {
             &mut backend,
             &gpu,
             &stream,
-            FrameParams { blur_strength: 0.5 },
+            FrameParams {
+                blur_strength: 0.5,
+                ..FrameParams::default()
+            },
             &src,
             &dst,
         );
@@ -431,7 +449,10 @@ fn maxine_blur_and_replace_in_a_created_context() {
             "blur",
             &mut backend,
             &gpu,
-            FrameParams { blur_strength: 0.5 },
+            FrameParams {
+                blur_strength: 0.5,
+                ..FrameParams::default()
+            },
             &src,
             &dst,
             &HARDENING_LUT,
@@ -452,7 +473,10 @@ fn maxine_blur_and_replace_in_a_created_context() {
                 backend
                     .process(
                         &gpu,
-                        &FrameParams { blur_strength: s },
+                        &FrameParams {
+                            blur_strength: s,
+                            ..FrameParams::default()
+                        },
                         &src.frame(),
                         &dst.frame(),
                     )
@@ -626,11 +650,12 @@ fn fault_rig(f: impl FnOnce(&GpuContext, &Stream, &DeviceNv12Buffer, &DeviceNv12
 fn blur_request() -> LoadRequest {
     LoadRequest {
         effect: EffectKind::Blur,
-        denoise: false,
+        stages: StageList::default(),
         width: W,
         height: H,
         colour: ColourSpec::LIMITED_BT601,
         background: None,
+        relight_light: RelightLight::default(),
     }
 }
 
@@ -735,7 +760,10 @@ fn maxine_the_effects_read_the_hardened_mask_not_the_raw_one() {
         let bg = background();
         let bg_nv12 = bgr_to_nv12(&bg.data, W as usize, H as usize);
         let bg = Arc::new(bg);
-        let params = FrameParams { blur_strength: 1.0 };
+        let params = FrameParams {
+            blur_strength: 1.0,
+            ..FrameParams::default()
+        };
         let mut blur_visible = Vec::new();
         for value in [0xFFu8, 0x00] {
             let table = [value; 256];
@@ -884,11 +912,12 @@ fn centre_luma(nv12: &[u8]) -> (f64, f64) {
 fn denoise_request(effect: EffectKind) -> LoadRequest {
     LoadRequest {
         effect,
-        denoise: true,
+        stages: Stage::Denoise.into(),
         width: W,
         height: H,
         colour: ColourSpec::LIMITED_BT601,
         background: None,
+        relight_light: RelightLight::default(),
     }
 }
 
@@ -1040,7 +1069,11 @@ fn maxine_denoise_switches_on_and_off_on_a_loaded_chain() {
             );
             let req = LoadRequest {
                 effect,
-                denoise,
+                stages: if denoise {
+                    Stage::Denoise.into()
+                } else {
+                    StageList::default()
+                },
                 background: (effect == EffectKind::Replace).then(|| bg.clone()),
                 ..denoise_request(effect)
             };
@@ -1112,7 +1145,10 @@ fn maxine_denoise_before_blur_and_replace_gives_sane_output() {
             r.warmup_ms,
             t.elapsed().as_secs_f64() * 1000.0
         );
-        let params = FrameParams { blur_strength: 0.5 };
+        let params = FrameParams {
+            blur_strength: 0.5,
+            ..FrameParams::default()
+        };
         run_frames(
             "blur + denoise",
             &mut backend,
@@ -1397,7 +1433,11 @@ fn maxine_denoise_faults_degrade_to_the_chain_without_it() {
             r
         };
         let expect_denoise = |label: &str, e: BackendError| match e {
-            BackendError::Denoise { code, message } => {
+            BackendError::Stage {
+                stage: Stage::Denoise,
+                code,
+                message,
+            } => {
                 println!("FAULT {label}: code {code}: {message}");
                 message
             }
@@ -1611,4 +1651,786 @@ fn maxine_denoise_loads_again_after_the_gpu_was_parked() {
     }
     assert!(!obc_gpu::parked());
     denoise_session(&f, "after unparking");
+}
+
+// ---------------------------------------------------------------------------
+// The relight stage.
+
+fn relight_request(effect: EffectKind, light: RelightLight) -> LoadRequest {
+    LoadRequest {
+        effect,
+        stages: Stage::Relight.into(),
+        width: W,
+        height: H,
+        colour: ColourSpec::LIMITED_BT601,
+        background: (effect == EffectKind::Replace).then(|| Arc::new(background())),
+        relight_light: light,
+    }
+}
+
+/// The frame parameters with the light at `pan_deg`.
+fn relight_params(pan_deg: f32) -> FrameParams {
+    FrameParams {
+        relight_pan_deg: pan_deg,
+        ..FrameParams::default()
+    }
+}
+
+/// Frames the relighting effect gets at one light direction before the
+/// output is measured (its temporal state follows a change over a few).
+const RELIGHT_SETTLE: usize = 8;
+
+/// The luma of the synthetic person's head in a packed NV12 frame: its
+/// mean, and the mean of its left half minus that of its right half.
+fn head_luma(nv12: &[u8]) -> (f64, f64) {
+    let (w, h) = (W as usize, H as usize);
+    let (cx, cy, r) = (w as f64 / 2.0, h as f64 * 0.38, h as f64 * 0.17);
+    // The inner part of the head ellipse, clear of its edge.
+    let (rx, ry) = (r * 0.8 * 0.85, r * 0.85);
+    let (mut sum, mut n) = ([0f64; 2], [0f64; 2]);
+    for y in (cy - ry) as usize..=(cy + ry) as usize {
+        for x in (cx - rx) as usize..=(cx + rx) as usize {
+            let (dx, dy) = (x as f64 - cx, y as f64 - cy);
+            if (dx / rx).powi(2) + (dy / ry).powi(2) > 1.0 {
+                continue;
+            }
+            let side = usize::from(dx >= 0.0);
+            sum[side] += nv12[y * w + x] as f64;
+            n[side] += 1.0;
+        }
+    }
+    let (l, r) = (sum[0] / n[0], sum[1] / n[1]);
+    ((sum[0] + sum[1]) / (n[0] + n[1]), l - r)
+}
+
+/// The head of one relit output: [`head_luma`].
+#[derive(Debug, Clone, Copy)]
+struct Lit {
+    mean: f64,
+    asym: f64,
+}
+
+/// Runs [`RELIGHT_SETTLE`] frames with the light at -90 degrees, measures
+/// the head, then the same at +90 degrees.
+fn relit_pair(
+    label: &str,
+    backend: &mut MaxineBackend,
+    gpu: &GpuContext,
+    stream: &Stream,
+    src: &DeviceNv12Buffer,
+    dst: &DeviceNv12Buffer,
+) -> (Lit, Lit) {
+    let mut at = |pan: f32| {
+        for _ in 0..RELIGHT_SETTLE {
+            backend
+                .process(gpu, &relight_params(pan), &src.frame(), &dst.frame())
+                .unwrap_or_else(|e| panic!("{label}: process failed: {e}"));
+        }
+        stream.synchronize().unwrap();
+        let (mean, asym) = head_luma(&dst.download_packed().unwrap());
+        Lit { mean, asym }
+    };
+    let pair = (at(-90.0), at(90.0));
+    println!(
+        "RELIGHT {label}: pan -90 mean {:.1} asym {:+.1}; pan +90 mean {:.1} asym {:+.1}",
+        pair.0.mean, pair.0.asym, pair.1.mean, pair.1.asym
+    );
+    pair
+}
+
+/// The smallest head luma of a lit output, against the input's. Lit, the
+/// synthetic head keeps about 0.8 of its luma with the light behind one
+/// side and more with it behind the other; without its light the effect
+/// darkens it to about 0.5 whatever the direction.
+const RELIGHT_MIN_MEAN_RATIO: f64 = 0.7;
+/// The smallest change of the head's left-right asymmetry (luma code
+/// values) between the light at -90 and at +90 degrees. Lit, it changes by
+/// about 6; without its light by less than 0.5.
+const RELIGHT_MIN_FLIP: f64 = 3.0;
+
+/// Asserts that the relit head is lit, by the light it was given: bright
+/// enough, and brighter on the side the light comes from.
+fn assert_lit(label: &str, input_mean: f64, (minus, plus): (Lit, Lit)) {
+    for l in [minus, plus] {
+        assert!(
+            l.mean >= input_mean * RELIGHT_MIN_MEAN_RATIO,
+            "{label}: the relit head is dark (luma {:.1}, input {input_mean:.1})",
+            l.mean
+        );
+    }
+    let flip = plus.asym - minus.asym;
+    assert!(
+        flip.abs() >= RELIGHT_MIN_FLIP,
+        "{label}: the light direction changed nothing (asymmetry {:+.1} at -90, {:+.1} at +90)",
+        minus.asym,
+        plus.asym
+    );
+}
+
+/// The regression test of the relighting effect coming up without its
+/// light (dark, the direction ignored) on every load but the first and on
+/// every new light: many loads in one process, and many live light
+/// changes on one, each checked. The hardened mask is all foreground, so
+/// the measurement does not depend on what the model finds in the
+/// synthetic frame.
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]
+fn maxine_relight_lights_on_every_load_and_every_new_light() {
+    const LOADS: usize = 10;
+    const REBINDS: usize = 12;
+    let switch = MaskFaultSwitch::default();
+    switch.set(Some(MaskFault::ConstantTable(255)));
+    let f = factory().with_mask_faults(switch);
+    fault_rig(|gpu, stream, src, dst| {
+        let (input_mean, _) = head_luma(&src.download_packed().unwrap());
+        println!("RELIGHT input head luma {input_mean:.1}");
+        let mut backend = f.create_maxine().unwrap();
+        for i in 0..LOADS {
+            let label = format!("load {i}");
+            let light = RelightLight::ALL[i % 3];
+            let t = Instant::now();
+            backend
+                .load(gpu, &relight_request(EffectKind::None, light))
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            println!(
+                "RELIGHT {label} ({light}) in {:.0} ms",
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+            let pair = relit_pair(&label, &mut backend, gpu, stream, src, dst);
+            assert_lit(&label, input_mean, pair);
+            backend.unload();
+        }
+        backend
+            .load(
+                gpu,
+                &relight_request(EffectKind::None, RelightLight::Neutral),
+            )
+            .unwrap();
+        for i in 0..REBINDS {
+            let light = RelightLight::ALL[(i + 2) % 3];
+            let label = format!("rebind {i} ({light})");
+            let t = Instant::now();
+            let report = backend
+                .load(gpu, &relight_request(EffectKind::None, light))
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            println!(
+                "RELIGHT {label} in {:.1} ms, reused {}",
+                t.elapsed().as_secs_f64() * 1000.0,
+                report.reused_model
+            );
+            assert!(report.reused_model, "{label}: a new light loaded a model");
+            assert!(report.warmup_ms.is_none(), "{label}: {report:?}");
+            let pair = relit_pair(&label, &mut backend, gpu, stream, src, dst);
+            assert_lit(&label, input_mean, pair);
+        }
+        backend.unload();
+    });
+}
+
+/// One frame of the synthetic person through a fresh load of `req` on
+/// `backend`, after a few frames for the mask's temporal state: the output
+/// and the hardened mask.
+fn settled_frame(
+    label: &str,
+    backend: &mut MaxineBackend,
+    gpu: &GpuContext,
+    stream: &Stream,
+    req: &LoadRequest,
+    src: &DeviceNv12Buffer,
+    dst: &DeviceNv12Buffer,
+) -> (Vec<u8>, Vec<u8>) {
+    backend
+        .load(gpu, req)
+        .unwrap_or_else(|e| panic!("{label}: load failed: {e}"));
+    for _ in 0..RELIGHT_SETTLE {
+        backend
+            .process(gpu, &relight_params(90.0), &src.frame(), &dst.frame())
+            .unwrap_or_else(|e| panic!("{label}: process failed: {e}"));
+    }
+    stream.synchronize().unwrap();
+    (
+        dst.download_packed().unwrap(),
+        backend.read_hardened_mask().unwrap(),
+    )
+}
+
+/// Under each effect, the relight stage changes the foreground only: where
+/// the hardened mask is 0 the output is what the effect alone gives (the
+/// camera frame, the blurred frame, the background), so no pixel of the
+/// relit image outside the person (which is not valid) reaches the output;
+/// where it is 255 the stage relit the frame, and on the soft ramp between
+/// the two the relit foreground is blended in. The model may find no
+/// person in the synthetic frame, so the backend's split-mask fault gives
+/// every frame a fixed mask: background on the left, a soft ramp in the
+/// middle, foreground on the right. A second pass makes the hardened mask
+/// all foreground: then all three effects output the same relit frame.
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]
+fn maxine_relight_under_none_blur_and_replace_keeps_the_background() {
+    let switch = MaskFaultSwitch::default();
+    let f = factory().with_mask_faults(switch.clone());
+    fault_rig(|gpu, stream, src, dst| {
+        let input = src.download_packed().unwrap();
+        let bg = background();
+        let bg_nv12 = bgr_to_nv12(&bg.data, W as usize, H as usize);
+        let mut backend = f.create_maxine().unwrap();
+        switch.set(Some(MaskFault::SplitMask));
+        let px = (W * H) as usize;
+        for effect in [EffectKind::None, EffectKind::Blur, EffectKind::Replace] {
+            let label = format!("{effect} + relight");
+            let reference = match effect {
+                EffectKind::None => input.clone(),
+                EffectKind::Replace => bg_nv12.clone(),
+                EffectKind::Blur => {
+                    let req = LoadRequest {
+                        stages: StageList::default(),
+                        ..relight_request(effect, RelightLight::Neutral)
+                    };
+                    settled_frame("blur alone", &mut backend, gpu, stream, &req, src, dst).0
+                }
+            };
+            let req = relight_request(effect, RelightLight::Neutral);
+            let (out, hard) = settled_frame(&label, &mut backend, gpu, stream, &req, src, dst);
+            let t = backend.timings().unwrap();
+            assert!(t.relight_ms > 0.0 && t.mask_ms > 0.0, "{label}: {t:?}");
+            let w = W as usize;
+            for (i, &m) in hard.iter().enumerate().step_by(997) {
+                assert_eq!(m, split_mask_value((i % w) as u32, W), "{label}: the split");
+            }
+            let bgd = luma_diff(&out, &reference, |i| i < px && hard[i] == 0);
+            let fg = luma_diff(&out, &input, |i| i < px && hard[i] == 255);
+            println!("RELIGHT {label}: background {bgd}; foreground against the input {fg}");
+            assert!(bgd.n > px / 3 && fg.n > px / 3, "{label}: not split");
+            assert_opaque_is_input(&format!("{label} (background)"), &bgd);
+            assert!(
+                fg.mean > 1.0,
+                "{label}: the foreground was not relit ({fg})"
+            );
+            // The ramp blends the relit foreground in: the more opaque, the
+            // further from what the effect alone gives.
+            let low = luma_diff(&out, &reference, |i| i < px && hard[i] > 0 && hard[i] < 64);
+            let high = luma_diff(&out, &reference, |i| {
+                i < px && hard[i] >= 192 && hard[i] < 255
+            });
+            println!("RELIGHT {label}: ramp below 64 {low}; ramp from 192 {high}");
+            assert!(
+                low.n == (SPLIT_MASK_RAMP as usize / 4) * H as usize && high.n > 0,
+                "{label}: the ramp ({} and {} px)",
+                low.n,
+                high.n
+            );
+            assert!(
+                low.mean < high.mean,
+                "{label}: the ramp does not blend the relit foreground in ({low} vs {high})"
+            );
+        }
+        backend.unload();
+
+        // All foreground (the table is uploaded by a cold load).
+        switch.set(Some(MaskFault::ConstantTable(255)));
+        let mut relit_none: Option<Vec<u8>> = None;
+        for effect in [EffectKind::None, EffectKind::Blur, EffectKind::Replace] {
+            let label = format!("{effect} + relight, all foreground");
+            let req = relight_request(effect, RelightLight::Neutral);
+            let (out, _) = settled_frame(&label, &mut backend, gpu, stream, &req, src, dst);
+            match &relit_none {
+                None => {
+                    let d = luma_diff(&out, &input, |_| true);
+                    println!("RELIGHT {label}: against the input {d}");
+                    assert!(d.mean > 1.0, "{label}: the frame was not relit ({d})");
+                    relit_none = Some(out);
+                }
+                Some(want) => {
+                    let d = luma_diff(&out, want, |_| true);
+                    println!("RELIGHT {label}: against none + relight {d}");
+                    assert_opaque_is_input(&label, &d);
+                }
+            }
+            backend.unload();
+        }
+        switch.set(None);
+    });
+}
+
+/// A forced load failure is the stage's and leaves the previous chain; a
+/// forced run failure drops the stage (and, under `none`, the mask only it
+/// needed), and the next frame runs without it.
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]
+fn maxine_relight_faults_degrade_to_the_chain_without_it() {
+    let switch = RelightFaultSwitch::default();
+    let f = factory().with_relight_faults(switch.clone());
+    fault_rig(|gpu, stream, src, dst| {
+        let mut backend = f.create_maxine().unwrap();
+        let frame = |backend: &mut MaxineBackend| {
+            let r = backend.process(gpu, &FrameParams::default(), &src.frame(), &dst.frame());
+            stream.synchronize().unwrap();
+            r
+        };
+        let expect_relight = |label: &str, e: BackendError| match e {
+            BackendError::Stage {
+                stage: Stage::Relight,
+                message,
+                ..
+            } => {
+                println!("FAULT {label}: {message}");
+                message
+            }
+            other => panic!("{label}: expected a relight error, got {other:?}"),
+        };
+        switch.set(Some(RelightFault::Load));
+        let m = expect_relight(
+            "fresh none + relight, load fault",
+            backend
+                .load(gpu, &relight_request(EffectKind::None, RelightLight::Warm))
+                .unwrap_err(),
+        );
+        assert!(m.contains("NvVFX_CreateEffect"), "{m}");
+        assert_eq!(backend.loaded_effect(), None);
+        switch.set(None);
+        backend.load(gpu, &blur_request()).unwrap();
+        switch.set(Some(RelightFault::Load));
+        expect_relight(
+            "blur -> blur + relight, load fault",
+            backend
+                .load(gpu, &relight_request(EffectKind::Blur, RelightLight::Warm))
+                .unwrap_err(),
+        );
+        assert_eq!(backend.loaded_effect(), Some(EffectKind::Blur));
+        assert!(!backend.relight_loaded());
+        frame(&mut backend).unwrap();
+
+        switch.set(None);
+        for effect in [EffectKind::Blur, EffectKind::Replace, EffectKind::None] {
+            let label = format!("{effect} + relight, run fault");
+            switch.set(None);
+            backend
+                .load(gpu, &relight_request(effect, RelightLight::Cool))
+                .unwrap();
+            frame(&mut backend).unwrap();
+            assert!(backend.timings().unwrap().relight_ms > 0.0, "{label}");
+            switch.set(Some(RelightFault::Run));
+            let m = expect_relight(&label, frame(&mut backend).unwrap_err());
+            assert!(m.contains("next frame runs without it"), "{m}");
+            assert!(!backend.relight_loaded(), "{label}: still loaded");
+            assert_eq!(backend.loaded_effect(), Some(effect), "{label}");
+            assert_eq!(
+                backend.mask_loaded(),
+                effect != EffectKind::None,
+                "{label}: the mask"
+            );
+            frame(&mut backend).unwrap_or_else(|e| panic!("{label}: the next frame failed: {e}"));
+            let t = backend.timings().unwrap();
+            assert_eq!(t.relight_ms, 0.0, "{label}: {t:?}");
+            if effect == EffectKind::None {
+                let d = luma_diff(
+                    &dst.download_packed().unwrap(),
+                    &src.download_packed().unwrap(),
+                    |_| true,
+                );
+                assert!(
+                    d.max <= 1,
+                    "{label}: the chain without it is not the input ({d})"
+                );
+            }
+        }
+        switch.set(None);
+        backend.unload();
+    });
+}
+
+/// A new light the loaded stage fails to take drops the stage alone, with
+/// the stage's error: the previous chain stays, without it. Under `none`
+/// the mask only the stage needed stays loaded, unrun, until the next load
+/// decides (a blur loaded next reuses it); and a switch that had loaded a
+/// blur on that mask before the light failed lets it go first.
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]
+fn maxine_relight_a_failed_new_light_drops_the_stage_alone() {
+    let switch = RelightFaultSwitch::default();
+    let f = factory().with_relight_faults(switch.clone());
+    fault_rig(|gpu, stream, src, dst| {
+        let mut backend = f.create_maxine().unwrap();
+        let frame = |backend: &mut MaxineBackend| {
+            let r = backend.process(gpu, &FrameParams::default(), &src.frame(), &dst.frame());
+            stream.synchronize().unwrap();
+            r
+        };
+        let expect_relight = |label: &str, e: BackendError| match e {
+            BackendError::Stage {
+                stage: Stage::Relight,
+                message,
+                ..
+            } => println!("FAULT {label}: {message}"),
+            other => panic!("{label}: expected a relight error, got {other:?}"),
+        };
+        for (from, to) in [
+            (EffectKind::Blur, EffectKind::Blur),
+            (EffectKind::Blur, EffectKind::Replace),
+            (EffectKind::Replace, EffectKind::Blur),
+            (EffectKind::None, EffectKind::None),
+            (EffectKind::None, EffectKind::Blur),
+        ] {
+            let label = format!("{from} + relight warm -> {to} + relight cool");
+            switch.set(None);
+            backend
+                .load(gpu, &relight_request(from, RelightLight::Warm))
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            frame(&mut backend).unwrap();
+            switch.set(Some(RelightFault::Rebind));
+            expect_relight(
+                &label,
+                backend
+                    .load(gpu, &relight_request(to, RelightLight::Cool))
+                    .unwrap_err(),
+            );
+            switch.set(None);
+            assert!(!backend.relight_loaded(), "{label}: the stage stayed");
+            assert_eq!(
+                backend.loaded_effect(),
+                Some(from),
+                "{label}: the previous chain"
+            );
+            assert!(backend.mask_loaded(), "{label}: the mask stays");
+            frame(&mut backend).unwrap_or_else(|e| panic!("{label}: the next frame failed: {e}"));
+            let t = backend.timings().unwrap();
+            assert_eq!(t.relight_ms, 0.0, "{label}: {t:?}");
+            if from == EffectKind::None {
+                assert_eq!(t.mask_ms, 0.0, "{label}: the unneeded mask ran: {t:?}");
+                let d = luma_diff(
+                    &dst.download_packed().unwrap(),
+                    &src.download_packed().unwrap(),
+                    |_| true,
+                );
+                assert!(d.max <= 1, "{label}: not the input ({d})");
+                // The next load decides: the mask is reused by a blur.
+                let r = backend.load(gpu, &blur_request()).unwrap();
+                assert!(r.reused_model, "{label}: the kept mask was not reused");
+                frame(&mut backend).unwrap();
+            }
+            backend.unload();
+        }
+    });
+}
+
+/// A temporal reset cannot reset the relighting state, so it drops the
+/// stage and returns it: the next frames run without it (the effect alone,
+/// the input for the stage alone), and a load builds a fresh stage that
+/// lights properly (the blocking-stream sequence of every build).
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]
+fn maxine_relight_reset_temporal_drops_the_stage_and_a_new_load_lights_again() {
+    let switch = MaskFaultSwitch::default();
+    switch.set(Some(MaskFault::ConstantTable(255)));
+    let f = factory().with_mask_faults(switch);
+    fault_rig(|gpu, stream, src, dst| {
+        let input = src.download_packed().unwrap();
+        let (input_mean, _) = head_luma(&input);
+        let mut backend = f.create_maxine().unwrap();
+        for effect in [EffectKind::None, EffectKind::Blur] {
+            let label = format!("{effect} + relight");
+            let req = relight_request(effect, RelightLight::Warm);
+            backend.load(gpu, &req).unwrap();
+            assert_lit(
+                &label,
+                input_mean,
+                relit_pair(&label, &mut backend, gpu, stream, src, dst),
+            );
+            let dropped = backend.reset_temporal(gpu).unwrap();
+            assert_eq!(dropped, StageList::from(Stage::Relight), "{label}");
+            assert!(
+                !backend.relight_loaded() && backend.mask_loaded(),
+                "{label}"
+            );
+            assert_eq!(backend.loaded_effect(), Some(effect), "{label}");
+            backend
+                .process(gpu, &relight_params(90.0), &src.frame(), &dst.frame())
+                .unwrap_or_else(|e| panic!("{label}: the frame after the reset: {e}"));
+            stream.synchronize().unwrap();
+            let t = backend.timings().unwrap();
+            assert_eq!(t.relight_ms, 0.0, "{label}: relit after the reset: {t:?}");
+            if effect == EffectKind::None {
+                let d = luma_diff(&dst.download_packed().unwrap(), &input, |_| true);
+                assert!(d.max <= 1, "{label}: not the input ({d})");
+            }
+            // Nothing left to drop.
+            assert_eq!(backend.reset_temporal(gpu).unwrap(), StageList::default());
+            let t0 = Instant::now();
+            let r = backend.load(gpu, &req).unwrap();
+            println!(
+                "RELIGHT {label}: rebuilt in {:.0} ms ({r:?})",
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+            assert!(!r.reused_model && r.warmup_ms.is_some(), "{label}: {r:?}");
+            assert!(backend.relight_loaded(), "{label}");
+            assert_lit(
+                &format!("{label}, rebuilt"),
+                input_mean,
+                relit_pair(&label, &mut backend, gpu, stream, src, dst),
+            );
+            backend.unload();
+        }
+    });
+}
+
+/// Switching the stage on and off on a loaded chain, and its GPU memory:
+/// turning it off (and unloading) returns what it took, its own stream
+/// included.
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]
+fn maxine_relight_switches_on_and_off_and_returns_its_memory() {
+    let f = factory();
+    fault_rig(|gpu, stream, src, dst| {
+        let mut backend = f.create_maxine().unwrap();
+        // Prime the SDK's per-context state, which stays until the context
+        // goes.
+        backend
+            .load(
+                gpu,
+                &relight_request(EffectKind::None, RelightLight::Neutral),
+            )
+            .unwrap();
+        backend.unload();
+        let before = free_mib();
+        backend.load(gpu, &blur_request()).unwrap();
+        let blur_only = free_mib();
+        let on = backend
+            .load(
+                gpu,
+                &relight_request(EffectKind::Blur, RelightLight::Neutral),
+            )
+            .unwrap();
+        assert!(!on.reused_model, "adding the stage loads its model");
+        assert!(backend.relight_loaded() && backend.mask_loaded());
+        backend
+            .process(gpu, &relight_params(45.0), &src.frame(), &dst.frame())
+            .unwrap();
+        stream.synchronize().unwrap();
+        let with_relight = free_mib();
+        let off = backend.load(gpu, &blur_request()).unwrap();
+        assert!(off.reused_model, "turning the stage off loads nothing");
+        assert!(!backend.relight_loaded() && backend.mask_loaded());
+        let dropped = free_mib();
+        backend.unload();
+        let unloaded = free_mib();
+        println!(
+            "MEMORY relight: free before {before:.0} MiB, blur {blur_only:.0}, blur + relight \
+             {with_relight:.0} ({:.0} MiB for the stage), blur again {dropped:.0}, unloaded \
+             {unloaded:.0}",
+            blur_only - with_relight
+        );
+        assert!(
+            blur_only - with_relight > 1.0,
+            "the stage used no GPU memory?"
+        );
+        assert!(
+            blur_only - dropped < (blur_only - with_relight) / 4.0 + 16.0,
+            "turning relight off returned too little GPU memory"
+        );
+        assert!(
+            before - unloaded < (before - with_relight) / 4.0 + 16.0,
+            "unload returned too little GPU memory"
+        );
+    });
+}
+
+/// A change of one stage on a loaded chain loads or releases that stage
+/// alone, under `none` and under blur: a new light is a live rebind (no
+/// model, `reused_model`), turning denoise or relighting on loads that
+/// stage's model only (and, under `none`, the green screen relighting
+/// reads), turning one off loads nothing, and the other stage's model is
+/// kept throughout.
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]
+fn maxine_a_stage_change_loads_or_releases_that_stage_alone() {
+    let f = factory();
+    fault_rig(|gpu, stream, src, dst| {
+        for effect in [EffectKind::None, EffectKind::Blur] {
+            let mut backend = f.create_maxine().unwrap();
+            let req = |denoise: bool, relight: bool, light: RelightLight| LoadRequest {
+                stages: StageList::new(
+                    [(Stage::Denoise, denoise), (Stage::Relight, relight)]
+                        .into_iter()
+                        .filter_map(|(s, on)| on.then_some(s)),
+                )
+                .unwrap(),
+                ..relight_request(effect, light)
+            };
+            let mut step = |label: &str, r: &LoadRequest| {
+                let report = backend
+                    .load(gpu, r)
+                    .unwrap_or_else(|e| panic!("{effect}, {label}: {e}"));
+                for _ in 0..4 {
+                    backend
+                        .process(gpu, &relight_params(30.0), &src.frame(), &dst.frame())
+                        .unwrap_or_else(|e| panic!("{effect}, {label}: process failed: {e}"));
+                }
+                stream.synchronize().unwrap();
+                let loads = backend.model_loads();
+                println!("STAGE CHANGE {effect}, {label}: {report:?}, {loads:?}");
+                assert_eq!(
+                    (backend.denoise_loaded(), backend.relight_loaded()),
+                    (
+                        r.stages.contains(Stage::Denoise),
+                        r.stages.contains(Stage::Relight)
+                    ),
+                    "{effect}, {label}"
+                );
+                (report, loads, backend.mask_loaded())
+            };
+            let (_, first, _) = step("denoise + relight", &req(true, true, RelightLight::Neutral));
+            assert_eq!(
+                first,
+                obc_backend_maxine::ModelLoads {
+                    denoise: 1,
+                    green_screen: 1,
+                    relight: 1,
+                    relight_rebinds: 0,
+                },
+                "{effect}: the first load"
+            );
+            let mut want = first;
+            for light in [
+                RelightLight::Warm,
+                RelightLight::Cool,
+                RelightLight::Neutral,
+            ] {
+                let label = format!("light {light}");
+                let (report, loads, _) = step(&label, &req(true, true, light));
+                assert!(report.reused_model, "{effect}, {label}: {report:?}");
+                assert!(report.warmup_ms.is_none(), "{effect}, {label}: {report:?}");
+                want.relight_rebinds += 1;
+                assert_eq!(loads, want, "{effect}, {label}: a rebind, no model");
+            }
+            // Denoise off and on: the relighting (and the mask) stay.
+            let (report, loads, _) = step("denoise off", &req(false, true, RelightLight::Neutral));
+            assert!(report.reused_model, "{effect}, denoise off: {report:?}");
+            assert_eq!(loads, want, "{effect}, denoise off");
+            let (report, loads, _) = step("denoise on", &req(true, true, RelightLight::Neutral));
+            assert!(!report.reused_model, "{effect}, denoise on: {report:?}");
+            want.denoise += 1;
+            assert_eq!(loads, want, "{effect}, denoise on: its model only");
+            // Relighting off and on: denoise stays; under `none` the mask
+            // goes with the relighting (nothing else reads it) and comes
+            // back with it.
+            let (report, loads, mask) =
+                step("relight off", &req(true, false, RelightLight::Neutral));
+            assert!(report.reused_model, "{effect}, relight off: {report:?}");
+            assert_eq!(loads, want, "{effect}, relight off");
+            assert_eq!(mask, effect != EffectKind::None, "{effect}, relight off");
+            let (report, loads, _) = step("relight on", &req(true, true, RelightLight::Neutral));
+            assert!(!report.reused_model, "{effect}, relight on: {report:?}");
+            want.relight += 1;
+            want.green_screen += u64::from(effect == EffectKind::None);
+            assert_eq!(loads, want, "{effect}, relight on: its model only");
+            backend.unload();
+        }
+    });
+}
+
+/// Loads `none` + relight in a new context, checks that it lights, and
+/// tears everything down again, context included.
+fn relight_session(f: &MaxineFactory, label: &str) {
+    fault_rig(|gpu, stream, src, dst| {
+        let (input_mean, _) = head_luma(&src.download_packed().unwrap());
+        let mut backend = f.create_maxine().unwrap();
+        backend
+            .load(gpu, &relight_request(EffectKind::None, RelightLight::Warm))
+            .unwrap_or_else(|e| panic!("{label}: load failed: {e}"));
+        let pair = relit_pair(label, &mut backend, gpu, stream, src, dst);
+        assert_lit(label, input_mean, pair);
+        backend
+            .load(gpu, &relight_request(EffectKind::None, RelightLight::Cool))
+            .unwrap_or_else(|e| panic!("{label}: new light failed: {e}"));
+        let pair = relit_pair(
+            &format!("{label}, new light"),
+            &mut backend,
+            gpu,
+            stream,
+            src,
+            dst,
+        );
+        assert_lit(label, input_mean, pair);
+        backend.unload();
+    });
+}
+
+/// The relight stage releases everything with its session (its stream
+/// included), so the GPU parks (ADR 0017), and it loads and lights again
+/// after unparking. Runs in a child process of this binary.
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]
+fn maxine_relight_loads_and_lights_again_after_the_gpu_was_parked() {
+    const NAME: &str = "maxine_relight_loads_and_lights_again_after_the_gpu_was_parked";
+    if in_own_process(NAME, std::time::Duration::from_secs(180)) {
+        return;
+    }
+    let switch = MaskFaultSwitch::default();
+    switch.set(Some(MaskFault::ConstantTable(255)));
+    let f = factory().with_mask_faults(switch);
+    relight_session(&f, "before parking");
+    match obc_gpu::park() {
+        Ok(ParkOutcome::Parked { lock, checkpoint }) => {
+            println!("PARK parked: lock {lock:?}, checkpoint {checkpoint:?}")
+        }
+        Ok(ParkOutcome::Unsupported(why)) => {
+            println!("PARK unsupported on this driver, nothing to test: {why}");
+            return;
+        }
+        Ok(other) => panic!("not parked: {other:?}"),
+        Err(e) => panic!("park failed: {e}"),
+    }
+    assert!(obc_gpu::parked());
+    match obc_gpu::unpark() {
+        Ok(UnparkOutcome::Unparked { restore, unlock }) => {
+            println!("PARK unparked: restore {restore:?}, unlock {unlock:?}")
+        }
+        other => panic!("not unparked: {other:?}"),
+    }
+    assert!(!obc_gpu::parked());
+    relight_session(&f, "after unparking");
+}
+
+/// The relight stage's GPU time per frame at 1080p, logged per stage for
+/// `none`, `blur` with denoise, and `replace`.
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]
+fn maxine_relight_stage_times() {
+    let f = factory();
+    fault_rig(|gpu, stream, src, dst| {
+        let mut backend = f.create_maxine().unwrap();
+        for (label, effect, denoise) in [
+            ("none + relight", EffectKind::None, false),
+            ("blur + denoise + relight", EffectKind::Blur, true),
+            ("replace + relight", EffectKind::Replace, false),
+        ] {
+            let stages = if denoise {
+                StageList::new([Stage::Denoise, Stage::Relight]).unwrap()
+            } else {
+                Stage::Relight.into()
+            };
+            let req = LoadRequest {
+                stages,
+                ..relight_request(effect, RelightLight::Neutral)
+            };
+            let t = Instant::now();
+            let report = backend.load(gpu, &req).unwrap();
+            println!(
+                "LOAD {label}: {:.0} ms ({report:?})",
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+            let all = run_frames(
+                label,
+                &mut backend,
+                gpu,
+                stream,
+                relight_params(30.0),
+                src,
+                dst,
+            );
+            assert!(all.iter().all(|t| t.relight_ms > 0.0), "{label}");
+            assert_eq!(all.iter().all(|t| t.denoise_ms > 0.0), denoise, "{label}");
+        }
+        backend.unload();
+    });
 }

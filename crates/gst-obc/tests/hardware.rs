@@ -28,13 +28,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fake_backend::{
-    FAKE_BLUR_Y, FAKE_DENOISE_MS, FAKE_DENOISE_UV, FAKE_DENOISE_Y, FAKE_REPLACE_Y, FakeConfig,
-    FakeFactory, FakeLog, Hook,
+    FAKE_BLUR_Y, FAKE_DENOISE_MS, FAKE_DENOISE_UV, FAKE_DENOISE_Y, FAKE_RELIGHT_DY,
+    FAKE_RELIGHT_MS, FAKE_RELIGHT_Y, FAKE_REPLACE_Y, FakeConfig, FakeFactory, FakeLog, Hook,
 };
 use gst::prelude::*;
 use gst_obc::{EffectFallback, EffectKind, EffectSettings, EffectStatus, ObcEffect};
 use gst_video::prelude::*;
-use obc_backend::BackendFactory;
+use obc_backend::{BackendFactory, RelightLight, RelightParams, Stage};
 use obc_backend_maxine::{MaskFault, MaskFaultSwitch, MaxineFactory};
 
 const W: u32 = 640;
@@ -69,6 +69,13 @@ enum Seen {
     FakeDenoise,
     FakeBlurDenoised,
     FakeReplaceDenoised,
+    /// The fake's relight stage without an effect (with or without
+    /// denoise), and under an effect.
+    FakeRelight,
+    FakeRelightDenoised,
+    FakeBlurRelit,
+    FakeReplaceRelit,
+    FakeBlurRelitDenoised,
     Other,
 }
 
@@ -100,6 +107,16 @@ fn classify(frame: &[u8], input: &[u8]) -> Seen {
         Seen::FakeBlurDenoised
     } else if all(y, FAKE_REPLACE_Y) && all(uv, FAKE_DENOISE_UV) {
         Seen::FakeReplaceDenoised
+    } else if all(y, FAKE_RELIGHT_Y) && all(uv, 128) {
+        Seen::FakeRelight
+    } else if all(y, FAKE_RELIGHT_Y) && all(uv, FAKE_DENOISE_UV) {
+        Seen::FakeRelightDenoised
+    } else if all(y, FAKE_BLUR_Y + FAKE_RELIGHT_DY) && all(uv, 128) {
+        Seen::FakeBlurRelit
+    } else if all(y, FAKE_REPLACE_Y + FAKE_RELIGHT_DY) && all(uv, 128) {
+        Seen::FakeReplaceRelit
+    } else if all(y, FAKE_BLUR_Y + FAKE_RELIGHT_DY) && all(uv, FAKE_DENOISE_UV) {
+        Seen::FakeBlurRelitDenoised
     } else {
         Seen::Other
     }
@@ -173,6 +190,8 @@ struct Rig {
     messages: Vec<(String, String, String)>,
     /// The `denoise` and `denoise-reason` fields of the same messages.
     denoise_messages: Vec<(String, String)>,
+    /// The `relight` and `relight-reason` fields of the same messages.
+    relight_messages: Vec<(String, String)>,
 }
 
 impl Rig {
@@ -250,6 +269,7 @@ impl Rig {
             pts: 0,
             messages: Vec::new(),
             denoise_messages: Vec::new(),
+            relight_messages: Vec::new(),
         }
     }
 
@@ -309,6 +329,10 @@ impl Rig {
                 self.denoise_messages.push((
                     s.get::<String>("denoise").unwrap(),
                     s.get::<String>("denoise-reason").unwrap(),
+                ));
+                self.relight_messages.push((
+                    s.get::<String>("relight").unwrap(),
+                    s.get::<String>("relight-reason").unwrap(),
                 ));
             }
         }
@@ -391,12 +415,34 @@ fn denoised(kind: EffectKind) -> EffectSettings {
     }
 }
 
+fn relight_is(want: EffectStatus) -> impl Fn(&Rig) -> bool {
+    move |r| r.effect.relight_status() == want
+}
+
+fn relight_failed(r: &Rig) -> bool {
+    matches!(r.effect.relight_status(), EffectStatus::Failed(_))
+}
+
+/// `kind` with the relight stage, with `light`.
+fn relit(kind: EffectKind, light: RelightLight) -> EffectSettings {
+    EffectSettings {
+        relight: true,
+        relight_params: RelightParams {
+            light,
+            ..RelightParams::default()
+        },
+        ..EffectSettings::of(kind)
+    }
+}
+
 fn get(a: &AtomicU64) -> u64 {
     FakeLog::get(a)
 }
 
 /// A background PNG for replace.
 fn background(dir: &Path) -> std::path::PathBuf {
+    // Tests call this before the rig exists, which is what inits otherwise.
+    gst::init().unwrap();
     let path = dir.join("bg.png");
     let p = gst::parse::launch(&format!(
         "videotestsrc num-buffers=1 ! video/x-raw,width=800,height=600 ! pngenc snapshot=true ! \
@@ -1211,13 +1257,758 @@ fn gpu_the_new_source_flag_resets_the_temporal_state_once() {
     rig.frame_with(gst::BufferFlags::DISCONT);
     assert_eq!(get(&fake.log.resets), 1);
 
-    // The stage alone resets on a new source too.
+    // The stage alone resets on a new source too. Blur to none is a
+    // switch that keeps the ready stage ready, so its status does not mark
+    // the switch's end: the backend's record of the request does.
+    let loads = fake.log.requests.lock().unwrap().len();
     rig.effect.apply(&denoised(EffectKind::None)).unwrap();
-    rig.frames_until(Duration::from_secs(5), denoise_is(EffectStatus::Ready));
+    assert_eq!(rig.effect.denoise_status(), EffectStatus::Ready);
+    let seen = rig.frames_until(Duration::from_secs(5), |_| {
+        fake.log.requests.lock().unwrap().len() > loads
+    });
+    assert!(
+        seen.iter()
+            .all(|s| matches!(s, Seen::FakeBlurDenoised | Seen::FakeDenoise)),
+        "{seen:?}"
+    );
+    assert_eq!(rig.effect.denoise_status(), EffectStatus::Ready);
     assert_eq!(rig.frame(), Seen::FakeDenoise);
     let before = get(&fake.log.resets);
     assert_eq!(rig.frame_with(gst_obc::NEW_SOURCE_FLAG), Seen::FakeDenoise);
     assert_eq!(get(&fake.log.resets), before + 1);
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_none_with_relight_passes_through_until_loaded_then_relights() {
+    let fake = FakeFactory::new(FakeConfig {
+        load_delay: Duration::from_millis(500),
+        ..FakeConfig::default()
+    });
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &EffectSettings::default());
+    assert_eq!(rig.frame(), Seen::Input);
+    rig.effect
+        .apply(&relit(EffectKind::None, RelightLight::Warm))
+        .unwrap();
+    assert_eq!(rig.effect.status(), EffectStatus::Off);
+    assert_eq!(rig.effect.relight_status(), EffectStatus::Loading);
+    let warm = rig.frames_until(Duration::from_secs(10), relight_is(EffectStatus::Ready));
+    assert!(
+        warm.iter().all(|s| *s == Seen::Input),
+        "the input while the stage loads, never black: {warm:?}"
+    );
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::FakeRelight);
+    }
+    // Direction and gain reach the backend on the next frame, without a
+    // load.
+    let loads = get(&fake.log.loads);
+    rig.effect.set_property("relight-pan", -120.0f64);
+    rig.effect.set_property("relight-gain", 1.75f64);
+    assert_eq!(rig.frame(), Seen::FakeRelight);
+    assert_eq!(
+        *fake.log.last_relight_milli.lock().unwrap(),
+        Some((-120_000, 1_750))
+    );
+    assert_eq!(get(&fake.log.loads), loads, "no load for direction or gain");
+    assert_eq!(rig.effect.relight_status(), EffectStatus::Ready);
+    let s = rig.effect.stats();
+    assert_eq!(s.frames_black, 0);
+    assert!(s.frames_relit >= 4 && s.frames_relit == s.frames_processed);
+    assert_eq!(s.frames_denoised, 0);
+    assert_eq!(s.relight_ms_p50, Some(f64::from(FAKE_RELIGHT_MS)));
+    assert_eq!(s.denoise_ms_p50, None);
+    assert_eq!(
+        *fake.log.stage_requests.lock().unwrap(),
+        [(EffectKind::None, vec![Stage::Relight], RelightLight::Warm)]
+    );
+
+    // With denoise too: both stages, in order, in one switch.
+    rig.effect
+        .apply(&EffectSettings {
+            denoise: true,
+            ..relit(EffectKind::None, RelightLight::Warm)
+        })
+        .unwrap();
+    let seen = rig.frames_until(Duration::from_secs(5), denoise_is(EffectStatus::Ready));
+    assert!(
+        seen.iter()
+            .all(|s| matches!(s, Seen::FakeRelight | Seen::FakeRelightDenoised)),
+        "{seen:?}"
+    );
+    assert_eq!(rig.frame(), Seen::FakeRelightDenoised);
+    assert_eq!(
+        fake.log.stage_requests.lock().unwrap().last().unwrap(),
+        &(
+            EffectKind::None,
+            vec![Stage::Denoise, Stage::Relight],
+            RelightLight::Warm
+        )
+    );
+
+    // Off again: the input at once; the worker unloads.
+    rig.effect.apply(&EffectSettings::default()).unwrap();
+    assert_eq!(rig.frame(), Seen::Input);
+    assert_eq!(rig.effect.relight_status(), EffectStatus::Off);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while get(&fake.log.unloads) == 0 {
+        assert!(Instant::now() < deadline, "no unload");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    rig.drain_messages();
+    let relight: Vec<&str> = rig.relight_messages.iter().map(|m| m.0.as_str()).collect();
+    assert_eq!(relight.first(), Some(&"loading"), "{relight:?}");
+    assert_eq!(relight.last(), Some(&"off"), "{relight:?}");
+    assert!(!relight.contains(&"failed"), "{relight:?}");
+    assert!(
+        rig.messages.iter().all(|m| m.1 == "off"),
+        "{:?}",
+        rig.messages
+    );
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+    assert_eq!(get(&fake.log.wrong_stream), 0);
+}
+
+/// Turning the stage on and off, and changing its light, under an effect
+/// are switches on the loaded chain: the effect runs throughout, never
+/// black and never the input, and no switch unloads anything.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_relight_toggles_and_new_lights_are_switches_on_the_loaded_chain() {
+    let fake = FakeFactory::new(FakeConfig {
+        switch_delay: Duration::from_millis(50),
+        ..FakeConfig::default()
+    });
+    let mut rig = Rig::new(
+        Some(Arc::clone(&fake)),
+        &EffectSettings::of(EffectKind::Blur),
+    );
+    rig.frames_until(Duration::from_secs(5), status_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    let start = rig.effect.stats();
+    let effect_ok = |s: &Seen| matches!(s, Seen::FakeBlur | Seen::FakeBlurRelit);
+    for light in [
+        RelightLight::Warm,
+        RelightLight::Cool,
+        RelightLight::Neutral,
+    ] {
+        rig.effect.apply(&relit(EffectKind::Blur, light)).unwrap();
+        assert_eq!(
+            rig.effect.status(),
+            EffectStatus::Ready,
+            "the effect is unchanged"
+        );
+        let seen = rig.frames_until(Duration::from_secs(5), relight_is(EffectStatus::Ready));
+        assert!(seen.iter().all(effect_ok), "{light}: {seen:?}");
+        assert_eq!(rig.frame(), Seen::FakeBlurRelit, "{light}");
+        assert_eq!(
+            fake.log.stage_requests.lock().unwrap().last().unwrap(),
+            &(EffectKind::Blur, vec![Stage::Relight], light)
+        );
+    }
+    // The property does the same.
+    rig.effect.set_property("relight-light", "warm");
+    rig.frames_until(Duration::from_secs(5), relight_is(EffectStatus::Ready));
+    assert_eq!(
+        fake.log.stage_requests.lock().unwrap().last().unwrap().2,
+        RelightLight::Warm
+    );
+    rig.effect.set_property("relight", false);
+    assert_eq!(rig.effect.relight_status(), EffectStatus::Off);
+    let blur_alone = |_: &Rig| {
+        fake.log.stage_requests.lock().unwrap().last().unwrap()
+            == &(EffectKind::Blur, vec![], RelightLight::Neutral)
+    };
+    let seen = rig.frames_until(Duration::from_secs(5), blur_alone);
+    assert!(seen.iter().all(effect_ok), "{seen:?}");
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    // Blur to replace with the stage keeps it.
+    let dir = tempfile::tempdir().unwrap();
+    let replace = EffectSettings {
+        background: Some(background(dir.path())),
+        ..relit(EffectKind::Replace, RelightLight::Neutral)
+    };
+    rig.effect.apply(&replace).unwrap();
+    let seen = rig.frames_until(Duration::from_secs(5), status_is(EffectStatus::Ready));
+    assert!(
+        seen.iter()
+            .all(|s| matches!(s, Seen::FakeBlur | Seen::FakeReplaceRelit)),
+        "{seen:?}"
+    );
+    rig.frames_until(Duration::from_secs(5), relight_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeReplaceRelit);
+    assert_eq!(get(&fake.log.unloads), 0, "no switch unloaded anything");
+    let s = rig.effect.stats();
+    assert_eq!(s.frames_black, start.frames_black, "never black");
+    assert_eq!(
+        s.frames_passthrough, start.frames_passthrough,
+        "never the input"
+    );
+    rig.drain_messages();
+    assert!(
+        rig.messages.iter().all(|m| m.1 != "failed"),
+        "{:?}",
+        rig.messages
+    );
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
+/// `kind` with the stages `denoise` and `relight` (with `light`).
+fn staged(kind: EffectKind, denoise: bool, relight: bool, light: RelightLight) -> EffectSettings {
+    EffectSettings {
+        denoise,
+        relight,
+        relight_params: RelightParams {
+            light,
+            ..RelightParams::default()
+        },
+        ..EffectSettings::of(kind)
+    }
+}
+
+/// A change of one stage (its light, or the stage on or off) loads or
+/// releases that stage alone, under `none` and under blur: a new light is a
+/// rebind of the loaded stage (no model load), turning a stage on builds
+/// that stage only, turning one off builds nothing, and the other stage
+/// keeps its model and its ready status throughout (the daemon follows the
+/// statuses: a stage shown loading again reads as a reload).
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_stage_change_loads_or_releases_that_stage_alone() {
+    for kind in [EffectKind::None, EffectKind::Blur] {
+        let fake = FakeFactory::new(FakeConfig {
+            switch_delay: Duration::from_millis(20),
+            ..FakeConfig::default()
+        });
+        let mut rig = Rig::new(
+            Some(Arc::clone(&fake)),
+            &staged(kind, true, true, RelightLight::Neutral),
+        );
+        let ready = |r: &Rig| {
+            r.effect.denoise_status() == EffectStatus::Ready
+                && r.effect.relight_status() == EffectStatus::Ready
+        };
+        rig.frames_until(Duration::from_secs(5), ready);
+        let start = rig.effect.stats();
+        let counts = || {
+            (
+                get(&fake.log.denoise_builds),
+                get(&fake.log.relight_builds),
+                get(&fake.log.relight_rebinds),
+            )
+        };
+        assert_eq!(counts(), (1, 1, 0), "{kind}: the first load");
+        let last = || {
+            fake.log
+                .stage_requests
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap()
+        };
+        // Each new light: one rebind, no model.
+        let mut rebinds = 0;
+        for light in [
+            RelightLight::Warm,
+            RelightLight::Cool,
+            RelightLight::Neutral,
+        ] {
+            rig.effect.apply(&staged(kind, true, true, light)).unwrap();
+            assert_eq!(
+                rig.effect.denoise_status(),
+                EffectStatus::Ready,
+                "{kind}, {light}: denoise is untouched"
+            );
+            rig.frames_until(Duration::from_secs(5), |r| last().2 == light && ready(r));
+            rebinds += 1;
+            assert_eq!(counts(), (1, 1, rebinds), "{kind}, {light}");
+        }
+        // Denoise off, then on: relight keeps its model and its status;
+        // relight off, then on: denoise does.
+        let steps = [
+            (Stage::Denoise, false, (1, 1)),
+            (Stage::Denoise, true, (2, 1)),
+            (Stage::Relight, false, (2, 1)),
+            (Stage::Relight, true, (2, 2)),
+        ];
+        for (toggled, on, (d, r)) in steps {
+            let label = format!("{kind}, {toggled} {}", if on { "on" } else { "off" });
+            let (denoise, relight) = match toggled {
+                Stage::Denoise => (on, true),
+                Stage::Relight => (true, on),
+            };
+            rig.effect
+                .apply(&staged(kind, denoise, relight, RelightLight::Neutral))
+                .unwrap();
+            let other = match toggled {
+                Stage::Denoise => rig.effect.relight_status(),
+                Stage::Relight => rig.effect.denoise_status(),
+            };
+            assert_eq!(other, EffectStatus::Ready, "{label}: the other stage");
+            let stages: Vec<Stage> = Stage::ALL
+                .into_iter()
+                .filter(|&s| s != toggled || on)
+                .collect();
+            rig.frames_until(Duration::from_secs(5), |rg| {
+                last().1 == stages
+                    && (!denoise || rg.effect.denoise_status() == EffectStatus::Ready)
+                    && (!relight || rg.effect.relight_status() == EffectStatus::Ready)
+            });
+            assert_eq!(counts(), (d, r, rebinds), "{label}");
+        }
+        assert_eq!(
+            get(&fake.log.unloads),
+            0,
+            "{kind}: no switch unloaded anything"
+        );
+        let s = rig.effect.stats();
+        assert_eq!(s.frames_black, start.frames_black, "{kind}: never black");
+        rig.stop();
+        assert_eq!(get(&fake.log.wrong_context), 0);
+    }
+}
+
+/// A relight load failure drops the stage, never the effect: blur and
+/// replace run without it, `none` passes the input through, each with the
+/// reason in the relight status; changing the light retries.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_relight_load_failure_runs_the_chain_without_it() {
+    let fake = FakeFactory::new(FakeConfig {
+        load_delay: Duration::from_millis(100),
+        fail_relight_load: Some("fake relight unavailable".into()),
+        ..FakeConfig::default()
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let bg = background(dir.path());
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &EffectSettings::default());
+    assert_eq!(rig.frame(), Seen::Input);
+    for (kind, want) in [
+        (EffectKind::Blur, Seen::FakeBlur),
+        (EffectKind::Replace, Seen::FakeReplace),
+    ] {
+        let settings = EffectSettings {
+            background: Some(bg.clone()),
+            ..relit(kind, RelightLight::Cool)
+        };
+        rig.effect.apply(&settings).unwrap();
+        rig.frames_until(Duration::from_secs(10), |r| {
+            relight_failed(r) && r.effect.status() == EffectStatus::Ready
+        });
+        for _ in 0..3 {
+            assert_eq!(rig.frame(), want, "{kind}: the effect, without the stage");
+        }
+        assert_eq!(
+            rig.effect.relight_status(),
+            EffectStatus::Failed("fake relight unavailable".into())
+        );
+        assert_eq!(rig.effect.status(), EffectStatus::Ready, "{kind}");
+    }
+    assert_eq!(
+        rig.effect.stats().frames_passthrough,
+        1,
+        "only the first frame"
+    );
+    // The stage alone: the input, with the reason; the effect never fails.
+    let black = rig.effect.stats().frames_black;
+    rig.effect
+        .apply(&relit(EffectKind::None, RelightLight::Cool))
+        .unwrap();
+    let seen = rig.frames_until(Duration::from_secs(5), |r| {
+        relight_failed(r) && get(&fake.log.unloads) > 0
+    });
+    assert!(
+        seen.iter()
+            .all(|s| matches!(s, Seen::FakeReplace | Seen::Input)),
+        "{seen:?}"
+    );
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::Input);
+    }
+    assert_eq!(rig.effect.status(), EffectStatus::Off);
+    // A new light retries; the stage is available now.
+    fake.set(|c| c.fail_relight_load = None);
+    rig.effect.set_property("relight-light", "warm");
+    assert_eq!(rig.effect.relight_status(), EffectStatus::Loading);
+    let seen = rig.frames_until(Duration::from_secs(5), relight_is(EffectStatus::Ready));
+    assert!(seen.iter().all(|s| *s == Seen::Input), "{seen:?}");
+    assert_eq!(rig.frame(), Seen::FakeRelight);
+    assert_eq!(rig.effect.stats().frames_black, black, "never black");
+    rig.drain_messages();
+    assert!(
+        rig.relight_messages
+            .contains(&("failed".into(), "fake relight unavailable".into())),
+        "{:?}",
+        rig.relight_messages
+    );
+    assert!(
+        rig.messages.iter().all(|m| m.1 != "failed"),
+        "{:?}",
+        rig.messages
+    );
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
+/// A relight frame failure drops the stage: under blur and replace the
+/// failing frame runs again without it (never black, never the input);
+/// under `none` it is the input, and so is every later frame unless
+/// another stage is left; a denoise stage keeps running.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_relight_frame_failure_drops_the_stage_and_keeps_the_rest() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let dir = tempfile::tempdir().unwrap();
+    let bg = background(dir.path());
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &EffectSettings::default());
+    assert_eq!(rig.frame(), Seen::Input);
+    for (kind, relit_frame, plain) in [
+        (EffectKind::Blur, Seen::FakeBlurRelit, Seen::FakeBlur),
+        (
+            EffectKind::Replace,
+            Seen::FakeReplaceRelit,
+            Seen::FakeReplace,
+        ),
+    ] {
+        for fallback in [EffectFallback::Black, EffectFallback::None] {
+            let label = format!("{kind} {fallback:?}");
+            let settings = EffectSettings {
+                fallback,
+                background: Some(bg.clone()),
+                ..relit(kind, RelightLight::Neutral)
+            };
+            rig.effect.apply(&settings).unwrap();
+            rig.frames_until(Duration::from_secs(5), |r| {
+                r.effect.relight_status() == EffectStatus::Ready
+                    && r.effect.status() == EffectStatus::Ready
+            });
+            assert_eq!(rig.frame(), relit_frame, "{label}");
+            let before = rig.effect.stats();
+            fake.set(|c| c.fail_relight_process = Some("fake relight frame failure".into()));
+            assert_eq!(rig.frame(), plain, "the failing frame, {label}");
+            for _ in 0..3 {
+                assert_eq!(rig.frame(), plain, "the chain without the stage, {label}");
+            }
+            fake.set(|c| c.fail_relight_process = None);
+            assert_eq!(rig.effect.status(), EffectStatus::Ready, "{label}");
+            let reason = rig.effect.relight_status().reason().unwrap().to_string();
+            assert!(reason.contains("fake relight frame failure"), "{reason}");
+            let after = rig.effect.stats();
+            assert_eq!(
+                after.frames_processed,
+                before.frames_processed + 4,
+                "{label}"
+            );
+            assert_eq!(after.frames_black, before.frames_black, "{label}");
+            assert_eq!(
+                after.frames_passthrough, before.frames_passthrough,
+                "{label}"
+            );
+            assert_eq!(after.frames_relit, before.frames_relit, "{label}");
+        }
+    }
+    // Alone under none: the failing frame and the later ones are the input.
+    rig.effect
+        .apply(&relit(EffectKind::None, RelightLight::Neutral))
+        .unwrap();
+    rig.frames_until(Duration::from_secs(5), relight_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeRelight);
+    fake.set(|c| c.fail_relight_process = Some("fake relight frame failure".into()));
+    assert_eq!(rig.frame(), Seen::Input, "the failing frame");
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::Input);
+    }
+    assert!(relight_failed(&rig));
+    fake.set(|c| c.fail_relight_process = None);
+    // With denoise under none: the failing frame is the input, then the
+    // denoise stage goes on alone.
+    rig.effect
+        .apply(&EffectSettings {
+            denoise: true,
+            ..relit(EffectKind::None, RelightLight::Warm)
+        })
+        .unwrap();
+    rig.frames_until(Duration::from_secs(5), |r| {
+        r.effect.relight_status() == EffectStatus::Ready
+            && r.effect.denoise_status() == EffectStatus::Ready
+    });
+    assert_eq!(rig.frame(), Seen::FakeRelightDenoised);
+    fake.set(|c| c.fail_relight_process = Some("fake relight frame failure".into()));
+    assert_eq!(rig.frame(), Seen::Input, "the failing frame");
+    fake.set(|c| c.fail_relight_process = None);
+    let seen = rig.frames_until(Duration::from_secs(5), |r| {
+        r.effect.denoise_status() == EffectStatus::Ready && relight_failed(r)
+    });
+    assert!(
+        seen.iter()
+            .all(|s| matches!(s, Seen::FakeDenoise | Seen::Input)),
+        "{seen:?}"
+    );
+    assert_eq!(rig.frame(), Seen::FakeDenoise);
+    assert_eq!(rig.effect.status(), EffectStatus::Off);
+    rig.drain_messages();
+    assert!(
+        rig.messages.iter().all(|m| m.1 != "failed"),
+        "{:?}",
+        rig.messages
+    );
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
+/// A new light the loaded stage fails to take drops the stage (the seam's
+/// rule for that switch), and the element knows: the relight status says
+/// failed, the effect runs on without it, and a request that comes back to
+/// the old light while the failed switch is handled loads the stage again
+/// instead of finding it "already loaded".
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_failed_new_light_drops_the_stage_and_the_status_says_so() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let mut rig = Rig::new(
+        Some(Arc::clone(&fake)),
+        &relit(EffectKind::Blur, RelightLight::Warm),
+    );
+    rig.frames_until(Duration::from_secs(5), |r| {
+        r.effect.relight_status() == EffectStatus::Ready && r.effect.status() == EffectStatus::Ready
+    });
+    assert_eq!(rig.frame(), Seen::FakeBlurRelit);
+    fake.set(|c| c.fail_relight_rebind = Some("fake rebind failure".into()));
+    rig.effect
+        .apply(&relit(EffectKind::Blur, RelightLight::Cool))
+        .unwrap();
+    let seen = rig.frames_until(Duration::from_secs(5), relight_failed);
+    assert!(
+        seen.iter()
+            .all(|s| matches!(s, Seen::FakeBlur | Seen::FakeBlurRelit)),
+        "{seen:?}"
+    );
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::FakeBlur, "the effect without the stage");
+    }
+    assert_eq!(
+        rig.effect.relight_status(),
+        EffectStatus::Failed("fake rebind failure".into())
+    );
+    assert_eq!(rig.effect.status(), EffectStatus::Ready);
+
+    // Back to warm while the failed switch is being handled: the chain in
+    // force is blur alone, so warm loads the stage again (a fresh build,
+    // no rebind) and it runs; never ready without running.
+    rig.effect
+        .apply(&relit(EffectKind::Blur, RelightLight::Warm))
+        .unwrap();
+    rig.frames_until(Duration::from_secs(5), relight_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeBlurRelit);
+    let builds = get(&fake.log.relight_builds);
+    let effect = rig.effect.clone();
+    fake.set(|c| {
+        c.on_rebind_failure = Some(Hook::new(move || {
+            effect.set_property("relight-light", "warm");
+        }))
+    });
+    rig.effect
+        .apply(&relit(EffectKind::Blur, RelightLight::Cool))
+        .unwrap();
+    rig.frames_until(Duration::from_secs(5), |r| {
+        get(&fake.log.relight_builds) > builds && r.effect.relight_status() == EffectStatus::Ready
+    });
+    for _ in 0..3 {
+        assert_eq!(
+            rig.frame(),
+            Seen::FakeBlurRelit,
+            "relight ready means relight running"
+        );
+    }
+    assert_eq!(
+        fake.log.stage_requests.lock().unwrap().last().unwrap(),
+        &(EffectKind::Blur, vec![Stage::Relight], RelightLight::Warm)
+    );
+
+    // The stage alone: the input after the failure, then an unload. Blur
+    // to none keeps the ready stage ready, so its status does not mark the
+    // switch's end: the backend's record of the request does.
+    let loads = fake.log.requests.lock().unwrap().len();
+    rig.effect
+        .apply(&relit(EffectKind::None, RelightLight::Warm))
+        .unwrap();
+    assert_eq!(rig.effect.relight_status(), EffectStatus::Ready);
+    assert_eq!(rig.effect.status(), EffectStatus::Off);
+    let seen = rig.frames_until(Duration::from_secs(5), |_| {
+        fake.log.requests.lock().unwrap().len() > loads
+    });
+    assert!(
+        seen.iter()
+            .all(|s| matches!(s, Seen::FakeBlurRelit | Seen::FakeRelight)),
+        "{seen:?}"
+    );
+    assert_eq!(rig.effect.relight_status(), EffectStatus::Ready);
+    assert_eq!(rig.frame(), Seen::FakeRelight);
+    let unloads = get(&fake.log.unloads);
+    let black = rig.effect.stats().frames_black;
+    rig.effect
+        .apply(&relit(EffectKind::None, RelightLight::Cool))
+        .unwrap();
+    let seen = rig.frames_until(Duration::from_secs(5), |r| {
+        relight_failed(r) && get(&fake.log.unloads) > unloads
+    });
+    assert!(
+        seen.iter()
+            .all(|s| matches!(s, Seen::FakeRelight | Seen::Input)),
+        "{seen:?}"
+    );
+    assert_eq!(rig.frame(), Seen::Input);
+    assert_eq!(rig.effect.stats().frames_black, black, "never black");
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
+/// A new source rebuilds the relight stage, whose state the backend cannot
+/// reset: from the flagged frame on no frame is relit by the stage that saw
+/// the previous source; until the new one is ready the effect runs alone
+/// (never the input, never black), and the stage alone passes the input.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_new_source_rebuilds_the_relight_stage_before_it_relights_again() {
+    let fake = FakeFactory::new(FakeConfig {
+        switch_delay: Duration::from_millis(50),
+        ..FakeConfig::default()
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let bg = background(dir.path());
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &EffectSettings::default());
+    assert_eq!(rig.frame(), Seen::Input);
+    for (kind, relit_frame, plain) in [
+        (EffectKind::Blur, Seen::FakeBlurRelit, Seen::FakeBlur),
+        (
+            EffectKind::Replace,
+            Seen::FakeReplaceRelit,
+            Seen::FakeReplace,
+        ),
+        (EffectKind::None, Seen::FakeRelight, Seen::Input),
+    ] {
+        let settings = EffectSettings {
+            background: Some(bg.clone()),
+            ..relit(kind, RelightLight::Neutral)
+        };
+        // Replace to none keeps the ready stage ready, so the statuses do
+        // not mark the switch's end: the backend's record of it does.
+        let loads = fake.log.requests.lock().unwrap().len();
+        rig.effect.apply(&settings).unwrap();
+        rig.frames_until(Duration::from_secs(5), |r| {
+            fake.log.requests.lock().unwrap().len() > loads
+                && r.effect.relight_status() == EffectStatus::Ready
+                && (kind == EffectKind::None || r.effect.status() == EffectStatus::Ready)
+        });
+        assert_eq!(rig.frame(), relit_frame, "{kind}");
+        let builds = get(&fake.log.relight_builds);
+        let relit_before = fake.log.relit_by.lock().unwrap().len();
+        let black = rig.effect.stats().frames_black;
+        assert_eq!(
+            rig.frame_with(gst_obc::NEW_SOURCE_FLAG),
+            plain,
+            "{kind}: the flagged frame runs without the stage"
+        );
+        assert_eq!(get(&fake.log.relight_resets_dropped) as usize, {
+            let k = [EffectKind::Blur, EffectKind::Replace, EffectKind::None];
+            k.iter().position(|&x| x == kind).unwrap() + 1
+        });
+        let seen = rig.frames_until(Duration::from_secs(5), |r| {
+            get(&fake.log.relight_builds) > builds
+                && r.effect.relight_status() == EffectStatus::Ready
+        });
+        assert!(
+            seen.iter().all(|s| *s == plain || *s == relit_frame),
+            "{kind}: {seen:?}"
+        );
+        assert_eq!(rig.frame(), relit_frame, "{kind}: relit again");
+        assert_eq!(get(&fake.log.relight_builds), builds + 1, "{kind}");
+        let by = fake.log.relit_by.lock().unwrap()[relit_before..].to_vec();
+        assert!(
+            !by.is_empty() && by.iter().all(|&b| b == builds + 1),
+            "{kind}: relit after the new source by builds {by:?}, the old one was {builds}"
+        );
+        assert_eq!(
+            rig.effect.stats().frames_black,
+            black,
+            "{kind}: never black"
+        );
+    }
+    rig.drain_messages();
+    assert!(
+        rig.relight_messages.iter().all(|m| m.0 != "failed"),
+        "a rebuild is no failure: {:?}",
+        rig.relight_messages
+    );
+    // A backend that can reset the stage in place keeps it: no rebuild.
+    fake.set(|c| c.relight_resets_in_place = true);
+    let builds = get(&fake.log.relight_builds);
+    assert_eq!(rig.frame_with(gst_obc::NEW_SOURCE_FLAG), Seen::FakeRelight);
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::FakeRelight);
+    }
+    assert_eq!(get(&fake.log.relight_builds), builds);
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+    assert_eq!(get(&fake.log.wrong_stream), 0);
+}
+
+/// The per-frame parameters never retry what failed: after a relight load
+/// failure, direction and gain changes reach the frames and load nothing;
+/// the same settings again (a retry) or a new light do.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_frame_parameters_after_a_failure_load_nothing() {
+    let fake = FakeFactory::new(FakeConfig {
+        fail_relight_load: Some("fake relight unavailable".into()),
+        ..FakeConfig::default()
+    });
+    let settings = relit(EffectKind::Blur, RelightLight::Cool);
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &settings);
+    rig.frames_until(Duration::from_secs(5), |r| {
+        relight_failed(r) && r.effect.status() == EffectStatus::Ready
+    });
+    let loads = get(&fake.log.loads);
+    let attempts = |f: &FakeFactory| f.log.stage_requests.lock().unwrap().len();
+    let tries = attempts(&fake);
+    for (i, pan) in [-90.0f32, -45.0, 0.0, 45.0, 90.0].into_iter().enumerate() {
+        let s = EffectSettings {
+            blur_strength: 0.1 * i as f32,
+            relight_params: RelightParams {
+                pan_deg: pan,
+                gain: 1.0 + 0.1 * i as f32,
+                ..settings.relight_params
+            },
+            ..settings.clone()
+        };
+        rig.effect.apply(&s).unwrap();
+        assert_eq!(rig.frame(), Seen::FakeBlur);
+    }
+    assert_eq!(
+        get(&fake.log.last_strength_milli),
+        400,
+        "the strength arrived"
+    );
+    // A load the fake would now accept: a retry would show it.
+    fake.set(|c| c.fail_relight_load = None);
+    std::thread::sleep(Duration::from_millis(200));
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::FakeBlur);
+    }
+    assert_eq!(get(&fake.log.loads), loads, "no load for a frame parameter");
+    assert_eq!(attempts(&fake), tries);
+    assert!(relight_failed(&rig), "the failure stands");
+    // The same settings again are a retry.
+    let current = rig.effect.settings();
+    rig.effect.apply(&current).unwrap();
+    rig.frames_until(Duration::from_secs(5), relight_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeBlurRelit);
+    assert!(get(&fake.log.loads) > loads);
     rig.stop();
     assert_eq!(get(&fake.log.wrong_context), 0);
 }
@@ -1389,4 +2180,68 @@ fn maxine_denoise_alone_under_blur_and_toggled_while_playing() {
     );
     rig.stop();
     assert!(!rig.effect.stats().cuda_active);
+}
+
+/// A new source through the element with Maxine's relighting, whose state
+/// cannot be reset: the flagged frame and the frames until the stage is
+/// built again are the blur alone (processed, never the input or black),
+/// the stage shows loading, never failed, and then relights again with a
+/// fresh build. Needs the relighting and green-screen features installed.
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK with its relighting feature (MAXINE_VFX_ROOT), the \
+            os-release override, an NVIDIA GPU and the GStreamer CUDA elements"]
+fn maxine_a_new_source_rebuilds_the_relighting_before_it_relights() {
+    let maxine = MaxineFactory::from_env();
+    assert!(maxine.root().is_some(), "{MAXINE_SETUP}");
+    maxine
+        .probe()
+        .unwrap_or_else(|e| panic!("Maxine probe failed: {e}"));
+    let mut rig = Rig::with_factory(
+        Some(Arc::new(maxine)),
+        &relit(EffectKind::Blur, RelightLight::Warm),
+    );
+    rig.frames_until(Duration::from_secs(60), |r| {
+        r.effect.status() != EffectStatus::Loading
+            && r.effect.relight_status() != EffectStatus::Loading
+    });
+    assert_eq!(rig.effect.status(), EffectStatus::Ready);
+    assert_eq!(rig.effect.relight_status(), EffectStatus::Ready);
+    let processed = |s: &Seen| !matches!(s, Seen::Input | Seen::Black);
+    for _ in 0..3 {
+        let s = rig.frame();
+        assert!(processed(&s), "{s:?}");
+    }
+    let before = rig.effect.stats();
+    let s = rig.frame_with(gst_obc::NEW_SOURCE_FLAG);
+    assert!(processed(&s), "the flagged frame: {s:?}");
+    let after = rig.effect.stats();
+    assert_eq!(
+        after.frames_relit, before.frames_relit,
+        "relit by the old stage"
+    );
+    assert_eq!(after.frames_processed, before.frames_processed + 1);
+    let seen = rig.frames_until(Duration::from_secs(60), relight_is(EffectStatus::Ready));
+    assert!(seen.iter().all(processed), "{seen:?}");
+    let ready = rig.effect.stats();
+    for _ in 0..3 {
+        let s = rig.frame();
+        assert!(processed(&s), "{s:?}");
+    }
+    let end = rig.effect.stats();
+    assert_eq!(end.frames_relit, ready.frames_relit + 3, "relit again");
+    assert_eq!(end.loads, after.loads + 1, "one load rebuilt the stage");
+    assert_eq!(end.frames_black, before.frames_black);
+    assert_eq!(end.frames_passthrough, before.frames_passthrough);
+    rig.drain_messages();
+    assert!(
+        rig.relight_messages.iter().all(|m| m.0 != "failed"),
+        "{:?}",
+        rig.relight_messages
+    );
+    assert!(
+        rig.relight_messages.iter().any(|m| m.0 == "loading"),
+        "{:?}",
+        rig.relight_messages
+    );
+    rig.stop();
 }

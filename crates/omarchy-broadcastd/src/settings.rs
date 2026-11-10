@@ -51,6 +51,10 @@
 //!   (another camera, a setting added or gone, or its label, type, range,
 //!   step, default, unit, options, conditions or hint changed) or the
 //!   settings whose value, `stored`, `enabled` or reason changed.
+//! - **Global settings** (revision 8, [`effects`]): the video effects, kept
+//!   for the daemon rather than per camera. The controller attaches them to
+//!   every tree ([`CameraSettings::global`]); their groups follow the
+//!   camera's, and are there with no camera too. [`diff`] covers them.
 
 use obc_core::config::{CameraControlState, valid_control_name};
 use obc_ipc::settings::SCOPE_CAMERA;
@@ -67,6 +71,7 @@ use obc_pipeline::controls::{
 use obc_pipeline::xu::{XuRow, XuState};
 
 pub mod catalogue;
+pub mod effects;
 
 use catalogue::{
     AUTO_EXPOSURE_ALONE, CATALOGUE, DYNAMIC_FRAMERATE, Known, OTHER, Operand, Rule, XU,
@@ -283,6 +288,9 @@ pub struct CameraSettings {
     pub camera: String,
     /// The published settings, in publishing order.
     pub entries: Vec<Entry>,
+    /// The global settings published with them, after them
+    /// ([`effects::build`]; empty until the controller attaches them).
+    pub global: Vec<effects::GlobalEntry>,
     /// What was left out or cut, for the caller to log (once per camera
     /// and text).
     pub notes: Vec<String>,
@@ -403,6 +411,7 @@ pub fn build(inp: &Inputs<'_>) -> CameraSettings {
     CameraSettings {
         camera: inp.camera.to_string(),
         entries,
+        global: Vec::new(),
         notes,
     }
 }
@@ -871,25 +880,38 @@ impl CameraSettings {
         out
     }
 
-    /// The published groups, in [`catalogue::GROUPS`] order, those with no
-    /// setting left out.
+    /// The published groups, in [`catalogue::GROUPS`] order, then the
+    /// global ones in [`effects::GROUPS`] order, those with no setting left
+    /// out.
     pub fn groups(&self) -> Vec<SettingsGroup> {
-        catalogue::GROUPS
-            .iter()
-            .filter_map(|g| {
-                let settings: Vec<Setting> = self
-                    .entries
+        let group = |g: &catalogue::Group, settings: Vec<Setting>| {
+            (!settings.is_empty()).then(|| SettingsGroup {
+                id: g.id.into(),
+                label: g.label.into(),
+                settings,
+            })
+        };
+        let camera = catalogue::GROUPS.iter().filter_map(|g| {
+            group(
+                g,
+                self.entries
                     .iter()
                     .filter(|e| e.group == g.id)
                     .map(|e| e.setting.clone())
-                    .collect();
-                (!settings.is_empty()).then(|| SettingsGroup {
-                    id: g.id.into(),
-                    label: g.label.into(),
-                    settings,
-                })
-            })
-            .collect()
+                    .collect(),
+            )
+        });
+        let global = effects::GROUPS.iter().filter_map(|g| {
+            group(
+                g,
+                self.global
+                    .iter()
+                    .filter(|e| e.group() == g.id)
+                    .map(|e| e.setting.clone())
+                    .collect(),
+            )
+        });
+        camera.chain(global).collect()
     }
 
     /// The `GetSettings` reply of these settings at `revision` and
@@ -944,23 +966,37 @@ pub fn change_of(s: &Setting) -> SettingChange {
 pub fn diff(old: &CameraSettings, new: &CameraSettings) -> Option<Delta> {
     let structural = old.camera != new.camera
         || old.entries.len() != new.entries.len()
+        || old.global.len() != new.global.len()
         || old
             .entries
             .iter()
             .zip(&new.entries)
-            .any(|(a, b)| a.group != b.group || shape(&a.setting) != shape(&b.setting));
+            .any(|(a, b)| a.group != b.group || shape(&a.setting) != shape(&b.setting))
+        || old
+            .global
+            .iter()
+            .zip(&new.global)
+            .any(|(a, b)| a.key != b.key || shape(&a.setting) != shape(&b.setting));
     if structural {
         return Some(Delta {
             structural: true,
             changes: Vec::new(),
         });
     }
-    let changes: Vec<SettingChange> = old
+    let camera = old
         .entries
         .iter()
         .zip(&new.entries)
-        .filter(|(a, b)| a.setting != b.setting)
-        .map(|(_, b)| change_of(&b.setting))
+        .map(|(a, b)| (&a.setting, &b.setting));
+    let global = old
+        .global
+        .iter()
+        .zip(&new.global)
+        .map(|(a, b)| (&a.setting, &b.setting));
+    let changes: Vec<SettingChange> = camera
+        .chain(global)
+        .filter(|(a, b)| a != b)
+        .map(|(_, b)| change_of(b))
         .collect();
     (!changes.is_empty()).then_some(Delta {
         structural: false,

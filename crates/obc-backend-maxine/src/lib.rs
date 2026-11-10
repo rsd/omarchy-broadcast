@@ -8,38 +8,74 @@
 //! daemon's `[effect] maxine_root`); else [`DEFAULT_ROOT`] when that
 //! directory exists; else the library search path) and reports what to do
 //! when it cannot;
-//! [`MaxineBackend`] implements [`InferenceBackend`] for `blur` and
-//! `replace`, each with or without the denoise stage, and for the denoise
-//! stage alone (`none` with [`LoadRequest::denoise`]).
+//! [`MaxineBackend`] implements [`InferenceBackend`] for `none`, `blur`
+//! and `replace`, each with any of the stages of [`LoadRequest::stages`]
+//! (the denoise stage, [`Stage::Denoise`], and the relight stage,
+//! [`Stage::Relight`]); `none` needs at least one.
+//! [`feature_availability`] says which SDK features are installed, from the
+//! filesystem alone, and [`stage_availability`] whether a stage can be
+//! offered.
 //!
-//! Per frame, all on the GPU and on the caller's stream, with no host copy:
+//! Per frame, all on the GPU and on the caller's stream, with no host copy,
+//! in the stage order of the seam (`obc_backend`, "Effects, stages and
+//! their order"):
 //!
 //! 1. NV12 to BGR (`NvCVImage_TransferFromYUV`, matrix and range from the
-//!    request's [`ColourSpec`]): into the frame image, or, with the denoise
-//!    stage, into the stage's own input image;
-//! 2. with the denoise stage: the `Denoising` effect (temporal state, the
-//!    strength fixed when the factory is made) from that image into the
-//!    frame image, so every later stage reads the denoised frame;
+//!    request's [`ColourSpec`]): into the frame image, or, with a pre-mask
+//!    stage, into the first such stage's own input image;
+//! 2. the pre-mask stages. The denoise stage: the `Denoising` effect
+//!    (temporal state, the strength fixed when the factory is made) from
+//!    that image into the frame image, so every later step reads the
+//!    denoised frame;
 //! 3. the `GreenScreen` effect (quality mode, temporal state, CUDA graph)
-//!    makes an 8-bit alpha mask;
+//!    makes an 8-bit alpha mask, when the effect or a stage needs it;
 //! 4. a CUDA kernel ([`obc_gpu::Lut8`]) hardens the mask through a fixed
 //!    table into a second mask ([`matte`]): the raw mask lets a faint copy
 //!    of the room through, so nothing but the hardened mask is ever used;
-//! 5. `blur`: the `BackgroundBlur` effect on frame and hardened mask;
+//! 5. the post-mask stages. The relight stage: the `Relighting` effect on
+//!    the frame image and the hardened mask, lit by a lighting environment
+//!    made in code ([`hdri`]), into an image of its own whose background
+//!    pixels are not valid. Its direction (`AnglePan`) and foreground gain
+//!    (`FgGain`) are set on the loaded effect when a frame asks for others,
+//!    and a new light binds a new lighting environment to it, live, with no
+//!    new load. The effect processes the environment inside
+//!    `NvVFX_SetImage` (and at `NvVFX_Load` while one is bound), in work
+//!    that is not ordered with a non-blocking stream such as the frame
+//!    stream: on one it reads the environment before it is in place and
+//!    lights with nothing (a dark foreground that ignores the direction,
+//!    for the binding's life). So the stage owns a blocking stream
+//!    (`Relight::blocking`), bound from before the environment is set until
+//!    the load (or the new binding) has finished and that stream is
+//!    synchronised; the frame stream is bound for every run;
+//! 6. `blur`: the `BackgroundBlur` effect on frame and hardened mask;
 //!    `replace`: `NvCVImage_Composite` of the frame over the background
-//!    through the hardened mask;
-//! 6. BGR to NV12 into the destination (`NvCVImage_TransferToYUV`).
+//!    through the hardened mask. With the relight stage the foreground is
+//!    the relit image instead of the frame: `replace` composites it over the
+//!    background, `none` over the frame image (the denoised camera frame),
+//!    and `blur` over the blur's output, into the frame image (which nothing
+//!    reads any more by then), so no invalid pixel ever reaches the output
+//!    and no extra image is needed;
+//! 7. BGR to NV12 into the destination (`NvCVImage_TransferToYUV`).
+//!
+//! Each stage has a slot of its own in the loaded chain, a branch in the
+//! validation, in `configure` and in the frame, and is released with the
+//! chain.
 //!
 //! Without the denoise stage step 2 does not exist: the conversion writes
-//! the frame image directly, as before the stage was added. With `none`
-//! steps 3 to 5 do not exist: the denoised frame goes straight back to
-//! NV12, and no green-screen model is loaded.
+//! the frame image directly, as before the stage was added. Without the
+//! relight stage step 5 does not exist and the composite is the effect's
+//! alone. With `none` and no relight stage steps 3 to 6 do not exist: the
+//! denoised frame goes straight back to NV12, and no green-screen model is
+//! loaded. With `none` and the relight stage the mask exists for the stage
+//! alone, so any failure of the mask, the stage or its composite is the
+//! stage's ([`BackendError::Stage`]), and fails open.
 //!
 //! Failing to set the kernel up fails the load ([`BackendError::Load`]);
 //! failing to launch it fails the frame ([`BackendError::Run`]). Either way
 //! the caller shows its failure output; no path falls back to the raw mask.
-//! The denoise stage alone failing is [`BackendError::Denoise`]: a load
-//! leaves nothing of the request in force, a frame drops the stage.
+//! A stage alone failing is [`BackendError::Stage`]: a load leaves nothing
+//! of the request in force, a frame drops the stage (and, under `none`, the
+//! mask that only the relight stage needed).
 //!
 //! With a root, the backend loads the SDK's bundled libraries from it itself,
 //! by absolute path and dependencies first, before it opens the SDK
@@ -65,14 +101,32 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use obc_backend::{
-    BackendError, BackendFactory, ColourMatrix, ColourSpec, DeviceNv12, EffectKind, FrameParams,
-    GpuContext, HostBgr, InferenceBackend, LoadReport, LoadRequest, StageTimings,
+    Availability, BackendError, BackendFactory, ColourMatrix, ColourSpec, DeviceNv12, EffectKind,
+    FrameParams, GpuContext, HostBgr, InferenceBackend, LoadReport, LoadRequest, RelightLight,
+    Stage, StageList, StageTimings,
 };
 use obc_gpu::{CuStream, DeviceBuffer, Event, GpuError, LUT8_BLOCK, Lut8};
 
+mod features;
 mod ffi;
+pub mod hdri;
 pub mod matte;
 mod preload;
+pub mod vsr;
+
+pub use features::{feature_availability, feature_dir};
+
+/// Whether `stage` can be offered from the SDK tree at `root`: every
+/// feature it needs ([`Stage::features`]: for the relight stage, the
+/// relighting and the green screen that makes its matte) is installed, as
+/// [`feature_availability`] reports it. Reads directories only.
+pub fn stage_availability(
+    root: &Path,
+    compute_capability: Option<(u32, u32)>,
+    stage: Stage,
+) -> Availability {
+    stage.availability(&feature_availability(root, compute_capability))
+}
 
 use ffi::{NvCvImage, NvCvStatus, Sdk, StateHandle, VfxHandle};
 
@@ -128,6 +182,29 @@ pub fn effective_root() -> Option<PathBuf> {
     )
 }
 
+/// The SDK root this process has loaded its SDK from, when it has loaded
+/// one from a root (or from a root's `lib` on the library search path);
+/// `None` before the first SDK library is loaded. Once loaded, that SDK is
+/// the process's until it restarts ([`root_conflict`]), whatever root is
+/// configured afterwards. Cheap: opens nothing.
+pub fn loaded_root() -> Option<PathBuf> {
+    ffi::loaded_root()
+}
+
+/// The SDK root whose features this process can use: the one it loaded
+/// ([`loaded_root`]) once it has loaded the SDK, else the one in force
+/// ([`effective_root`]). Opens nothing.
+pub fn usable_root() -> Option<PathBuf> {
+    pick_usable_root(loaded_root(), effective_root)
+}
+
+fn pick_usable_root(
+    loaded: Option<PathBuf>,
+    effective: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    loaded.or_else(effective)
+}
+
 /// Why the SDK cannot be opened from `root` in this process: it is already
 /// loaded from elsewhere, which only a restart can change. `None` when no
 /// SDK library is loaded yet, or the SDK `root` leads to is the one loaded
@@ -181,6 +258,30 @@ pub enum MaskFault {
     /// constant whatever the model sees: a test can then tell whether an
     /// effect reads the hardened mask or the raw one.
     ConstantTable(u8),
+    /// Frames (not the warm-up run inside `load`) overwrite the hardened
+    /// mask, after the kernel and before anything reads it, with a fixed
+    /// split ([`split_mask_value`]): background (0) left of a soft ramp of
+    /// [`SPLIT_MASK_RAMP`] columns centred on the frame, foreground (255)
+    /// right of it. A test can then check what an effect does on each side
+    /// and on the ramp whatever the model sees.
+    SplitMask,
+}
+
+/// The width in columns of the soft ramp of [`MaskFault::SplitMask`].
+#[doc(hidden)]
+pub const SPLIT_MASK_RAMP: u32 = 64;
+
+/// The hardened mask value [`MaskFault::SplitMask`] gives column `x` of a
+/// frame `width` columns wide: 0 left of the ramp, 255 right of it, and on
+/// it a rise strictly between the two.
+#[doc(hidden)]
+pub fn split_mask_value(x: u32, width: u32) -> u8 {
+    let start = (width / 2).saturating_sub(SPLIT_MASK_RAMP / 2);
+    match x.checked_sub(start) {
+        None => 0,
+        Some(i) if i < SPLIT_MASK_RAMP => ((i + 1) * 255 / (SPLIT_MASK_RAMP + 1)) as u8,
+        Some(_) => 255,
+    }
 }
 
 /// The fault every backend of a factory reads: shared, so a test can arm
@@ -201,6 +302,7 @@ impl MaskFaultSwitch {
             Some(MaskFault::ModuleLoad) => 1,
             Some(MaskFault::Launch) => 2,
             Some(MaskFault::ConstantTable(b)) => CONSTANT_TABLE_TAG | u16::from(b),
+            Some(MaskFault::SplitMask) => 3,
         };
         self.0.store(v, Ordering::SeqCst);
     }
@@ -211,6 +313,7 @@ impl MaskFaultSwitch {
         match self.0.load(Ordering::Relaxed) {
             1 => Some(MaskFault::ModuleLoad),
             2 => Some(MaskFault::Launch),
+            3 => Some(MaskFault::SplitMask),
             v if v & CONSTANT_TABLE_TAG != 0 => Some(MaskFault::ConstantTable(v as u8)),
             _ => None,
         }
@@ -268,6 +371,54 @@ impl DenoiseFaultSwitch {
 /// What [`DenoiseFault::Load`] creates instead of the denoise effect.
 const FAULT_SELECTOR: &std::ffi::CStr = c"ForcedFaultNoSuchEffect";
 
+/// A failure a test can force on the relight stage, as [`DenoiseFault`]
+/// does on the denoise stage: only Rust code can set one
+/// ([`RelightFaultSwitch`]).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelightFault {
+    /// Loads of the stage create the effect with a selector the SDK does
+    /// not know, so `NvVFX_CreateEffect` fails and so does `load`.
+    Load,
+    /// Frames (not the warm-up run inside `load`) report a failed relight
+    /// run instead of calling the SDK, so `process` fails and drops the
+    /// stage.
+    Run,
+    /// A new light on the loaded stage (a live rebind in `load`) fails
+    /// before anything is bound, so `load` fails with the stage's error and
+    /// drops the stage.
+    Rebind,
+}
+
+/// The relight fault every backend of a factory reads, shared like
+/// [`MaskFaultSwitch`]. Disarmed by default.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct RelightFaultSwitch(Arc<AtomicU8>);
+
+impl RelightFaultSwitch {
+    /// Arms `fault` (`None`: disarms).
+    pub fn set(&self, fault: Option<RelightFault>) {
+        let v = match fault {
+            None => 0,
+            Some(RelightFault::Load) => 1,
+            Some(RelightFault::Run) => 2,
+            Some(RelightFault::Rebind) => 3,
+        };
+        self.0.store(v, Ordering::SeqCst);
+    }
+
+    /// The armed fault (relaxed, as [`MaskFaultSwitch::get`]).
+    pub fn get(&self) -> Option<RelightFault> {
+        match self.0.load(Ordering::Relaxed) {
+            1 => Some(RelightFault::Load),
+            2 => Some(RelightFault::Run),
+            3 => Some(RelightFault::Rebind),
+            _ => None,
+        }
+    }
+}
+
 /// Finds the Maxine SDK and creates [`MaxineBackend`] instances.
 #[derive(Debug, Clone)]
 pub struct MaxineFactory {
@@ -275,6 +426,7 @@ pub struct MaxineFactory {
     names: ffi::LibNames,
     faults: MaskFaultSwitch,
     denoise_faults: DenoiseFaultSwitch,
+    relight_faults: RelightFaultSwitch,
     /// The denoise strength, or why the development override is unusable
     /// (reported by a load that asks for the stage).
     denoise_strength: Result<f32, String>,
@@ -322,7 +474,7 @@ impl MaxineFactory {
     ///
     /// For development, [`DENOISE_STRENGTH_ENV`] (`0` or `1`) overrides
     /// [`DEFAULT_DENOISE_STRENGTH`]. Any other value makes every load that
-    /// asks for the denoise stage fail with [`BackendError::Denoise`] naming
+    /// asks for the denoise stage fail with [`BackendError::Stage`] naming
     /// the variable; loads without it are unaffected.
     pub fn from_env() -> MaxineFactory {
         let mut f = MaxineFactory::with_root(effective_root());
@@ -339,6 +491,7 @@ impl MaxineFactory {
             names: ffi::SDK_LIBS,
             faults: MaskFaultSwitch::default(),
             denoise_faults: DenoiseFaultSwitch::default(),
+            relight_faults: RelightFaultSwitch::default(),
             denoise_strength: Ok(DEFAULT_DENOISE_STRENGTH),
         }
     }
@@ -361,7 +514,7 @@ impl MaxineFactory {
     }
 
     /// The denoise strength backends of this factory load the stage with,
-    /// or the [`BackendError::Denoise`] such a load would fail with.
+    /// or the [`BackendError::Stage`] such a load would fail with.
     pub fn denoise_strength(&self) -> Result<f32, BackendError> {
         self.denoise_strength.clone().map_err(strength_err)
     }
@@ -378,6 +531,14 @@ impl MaxineFactory {
     #[doc(hidden)]
     pub fn with_denoise_faults(mut self, switch: DenoiseFaultSwitch) -> MaxineFactory {
         self.denoise_faults = switch;
+        self
+    }
+
+    /// Makes every backend this factory creates read `switch` for its relight
+    /// stage (tests only).
+    #[doc(hidden)]
+    pub fn with_relight_faults(mut self, switch: RelightFaultSwitch) -> MaxineFactory {
+        self.relight_faults = switch;
         self
     }
 
@@ -402,9 +563,11 @@ impl MaxineFactory {
             model_dir,
             faults: self.faults.clone(),
             denoise_faults: self.denoise_faults.clone(),
+            relight_faults: self.relight_faults.clone(),
             denoise_strength: self.denoise_strength.clone(),
             loaded: None,
             last_timings: Cell::new(None),
+            model_loads: ModelLoads::default(),
         })
     }
 
@@ -416,7 +579,8 @@ impl MaxineFactory {
 /// The error of a load that asks for the denoise stage when the strength
 /// override is unusable.
 fn strength_err(message: String) -> BackendError {
-    BackendError::Denoise {
+    BackendError::Stage {
+        stage: Stage::Denoise,
         code: ffi::NVCV_ERR_PARAMETER,
         message,
     }
@@ -526,8 +690,11 @@ fn feature_library(call: &str) -> &'static str {
         "libnvVFXBackgroundBlur.so"
     } else if call.contains("(Denoising)") {
         "libnvVFXDenoising.so"
+    } else if call.contains("(Relighting)") {
+        "libnvVFXRelighting.so"
     } else {
-        "libnvVFXGreenScreen.so / libnvVFXBackgroundBlur.so / libnvVFXDenoising.so"
+        "libnvVFXGreenScreen.so / libnvVFXBackgroundBlur.so / libnvVFXDenoising.so / \
+         libnvVFXRelighting.so"
     }
 }
 
@@ -638,8 +805,9 @@ impl Drop for Effect {
     }
 }
 
-/// A GPU image allocated by the SDK (`NvCVImage_Alloc`), boxed so its
-/// address is stable for `NvVFX_SetImage`, and freed on drop.
+/// An image allocated by the SDK (`NvCVImage_Alloc`), boxed so its
+/// address is stable for `NvVFX_SetImage`, and freed on drop. In GPU
+/// memory, except the lighting environments of [`GpuImage::host_hdri`].
 struct GpuImage {
     sdk: &'static Sdk,
     image: Box<NvCvImage>,
@@ -699,6 +867,62 @@ impl GpuImage {
                     sdk.error_string(rc)
                 ),
             });
+        }
+        Ok(img)
+    }
+
+    /// A lighting environment in host memory, where the relighting effect
+    /// prefers it (it processes it when it is bound): RGB floats, tightly
+    /// pitched, filled from `map`.
+    fn host_hdri(sdk: &'static Sdk, map: &hdri::Hdri) -> Result<GpuImage, BackendError> {
+        let mut image = Box::new(NvCvImage::empty());
+        // SAFETY: `image` is an empty descriptor; host memory, tight rows.
+        let rc = unsafe {
+            (sdk.NvCVImage_Alloc)(
+                &mut *image,
+                map.width,
+                map.height,
+                ffi::NVCV_RGB,
+                ffi::NVCV_F32,
+                ffi::NVCV_CHUNKY,
+                ffi::NVCV_CPU,
+                ffi::NVCV_TIGHT_PITCH,
+            )
+        };
+        let img = GpuImage { sdk, image };
+        if rc != ffi::NVCV_SUCCESS {
+            return Err(BackendError::Load {
+                code: rc,
+                message: format!(
+                    "NvCVImage_Alloc of a {}x{} lighting environment returned {rc} ({})",
+                    map.width,
+                    map.height,
+                    sdk.error_string(rc)
+                ),
+            });
+        }
+        let row = map.width as usize * 3;
+        let pitch = img.pitch();
+        if img.image.pixels.is_null() || pitch < row * 4 {
+            return Err(BackendError::Load {
+                code: ffi::NVCV_ERR_GENERAL,
+                message: format!(
+                    "NvCVImage_Alloc of a {}x{} lighting environment gave no usable buffer",
+                    map.width, map.height
+                ),
+            });
+        }
+        for (y, src) in map.data.chunks_exact(row).enumerate() {
+            // SAFETY: the buffer holds `height` rows of `pitch >= 4 * row`
+            // bytes of host memory, suitably aligned for f32 (the SDK's
+            // allocation); `y < height`.
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(
+                    img.image.pixels.cast::<u8>().add(y * pitch).cast::<f32>(),
+                    row,
+                )
+            };
+            dst.copy_from_slice(src);
         }
         Ok(img)
     }
@@ -812,6 +1036,37 @@ impl Mask {
     }
 }
 
+impl Mask {
+    /// Enqueues overwriting the hardened mask with the split of
+    /// [`MaskFault::SplitMask`] on `stream`. Tests only.
+    ///
+    /// # Safety
+    /// As [`Mask::harden`].
+    unsafe fn split(&self, width: u32, height: u32, stream: CuStream) -> Result<(), GpuError> {
+        let (h, ptr, pitch) = (height as usize, self.hard.ptr(), self.hard.pitch());
+        let start = (width / 2).saturating_sub(SPLIT_MASK_RAMP / 2);
+        let end = (start + SPLIT_MASK_RAMP).min(width);
+        // SAFETY: every rectangle lies within the live `width x height`
+        // hardened mask (`pitch >= width`) of the current context; the
+        // caller guarantees the stream.
+        unsafe {
+            obc_gpu::memset_2d_async(ptr, pitch, 0, start as usize, h, stream)?;
+            for x in start..end {
+                let v = split_mask_value(x, width);
+                obc_gpu::memset_2d_async(ptr + u64::from(x), pitch, v, 1, h, stream)?;
+            }
+            obc_gpu::memset_2d_async(
+                ptr + u64::from(end),
+                pitch,
+                255,
+                (width - end) as usize,
+                h,
+                stream,
+            )
+        }
+    }
+}
+
 /// The denoise effect with its temporal state and its input image. Writes
 /// [`Frames::frame_bgr`].
 struct Denoise {
@@ -843,25 +1098,78 @@ impl Denoise {
     }
 }
 
+/// The relighting effect, its lighting environment and its output. Reads
+/// [`Frames::frame_bgr`] and the hardened mask; its output is valid only
+/// where the mask is opaque, so only the composite reads it.
+struct Relight {
+    // Field order is drop order: the effect, which holds every image, goes
+    // first.
+    effect: Effect,
+    /// The lighting environment of `light`, in host memory (where the
+    /// effect prefers it). The effect processes it when it is bound and
+    /// keeps its address, so it lives until the effect is destroyed or
+    /// another environment is bound.
+    hdri: GpuImage,
+    /// The relit foreground.
+    out: GpuImage,
+    /// The stage's own blocking stream (one that synchronises with the
+    /// legacy default stream), in the frame stream's context, bound only
+    /// while a lighting environment is bound and the effect loads; every
+    /// run uses the frame stream. Destroyed with the stage, after the
+    /// effect and before the context is released.
+    blocking: obc_gpu::Stream,
+    /// The light whose environment is bound.
+    light: RelightLight,
+    /// The direction (degrees) and gain the effect was last given
+    /// (clamped).
+    pan_deg: f32,
+    gain: f32,
+}
+
+impl Relight {
+    /// Gives the effect the direction and the gain of `params` (clamped),
+    /// setting only what changed. The call that failed and its status.
+    fn apply(&mut self, params: &FrameParams) -> Result<(), (&'static str, NvCvStatus)> {
+        let (pan_deg, gain) = params.relight();
+        if pan_deg != self.pan_deg {
+            let rc = self.effect.set_f32(ffi::P_ANGLE_PAN, pan_deg.to_radians());
+            if rc != ffi::NVCV_SUCCESS {
+                return Err(("NvVFX_SetF32(Relighting, AnglePan)", rc));
+            }
+            self.pan_deg = pan_deg;
+        }
+        if gain != self.gain {
+            let rc = self.effect.set_f32(ffi::P_FG_GAIN, gain);
+            if rc != ffi::NVCV_SUCCESS {
+                return Err(("NvVFX_SetF32(Relighting, FgGain)", rc));
+            }
+            self.gain = gain;
+        }
+        Ok(())
+    }
+}
+
 /// The stages the last frame whose work was fully enqueued ran, so that
 /// [`InferenceBackend::timings`] knows which of its events it recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Stages {
     denoise: bool,
-    /// The green screen and the effect (they are loaded together).
+    /// The green screen and the composite (they are loaded together).
     mask: bool,
+    relight: bool,
 }
 
 /// The stage boundaries of a frame, as indices into [`Loaded::events`]:
 /// before the conversion, after it, after the denoise run, after the mask,
-/// after the effect, after the conversion back. A stage that is not loaded
-/// records no event, and measures 0.
+/// after the relight run, after the effect, after the conversion back. A
+/// stage that is not loaded records no event, and measures 0.
 const EV_START: usize = 0;
 const EV_IN: usize = 1;
 const EV_DENOISE: usize = 2;
 const EV_MASK: usize = 3;
-const EV_EFFECT: usize = 4;
-const EV_OUT: usize = 5;
+const EV_RELIGHT: usize = 4;
+const EV_EFFECT: usize = 5;
+const EV_OUT: usize = 6;
 
 /// The stage times of a frame that ran `stages`, from `span(a, b)`, the
 /// time between events `a` and `b`; `None` if a span is unavailable.
@@ -877,25 +1185,32 @@ fn stage_timings(
     } else {
         0.0
     };
-    let (mask_ms, effect_ms) = if stages.mask {
+    let (mask_ms, relight_ms, effect_ms) = if stages.mask {
         let m = span(last, EV_MASK)?;
+        let (r, before_effect) = if stages.relight {
+            (span(EV_MASK, EV_RELIGHT)?, EV_RELIGHT)
+        } else {
+            (0.0, EV_MASK)
+        };
         last = EV_EFFECT;
-        (m, span(EV_MASK, EV_EFFECT)?)
+        (m, r, span(before_effect, EV_EFFECT)?)
     } else {
-        (0.0, 0.0)
+        (0.0, 0.0, 0.0)
     };
     Some(StageTimings {
         convert_in_ms,
         denoise_ms,
         mask_ms,
+        relight_ms,
         effect_ms,
         convert_out_ms: span(last, EV_OUT)?,
     })
 }
 
 /// Everything loaded for one request. Field order is drop order: the blur
-/// effect uses the mask's hardened mask and the frame images, the denoise
-/// and green-screen effects the frame image, so the frame images go last.
+/// effect uses the mask's hardened mask and the frame images, the relight,
+/// denoise and green-screen effects the frame image, so the frame images go
+/// last.
 struct Loaded {
     width: u32,
     height: u32,
@@ -904,20 +1219,32 @@ struct Loaded {
     effect: EffectKind,
     blur: Option<(Effect, f32)>,
     background: Option<GpuImage>,
-    /// `Some` iff the request asked for the denoise stage (and it has not
-    /// failed since).
+    /// The stages, one slot each, in reverse chain order (drop order): a
+    /// post-mask stage reads the hardened mask, so its slot goes before
+    /// `mask`. Each is `Some` iff the request asked for the stage (and it
+    /// has not failed since).
+    relight: Option<Relight>,
     denoise: Option<Denoise>,
-    /// `Some` iff `effect` is blur or replace.
+    /// `Some` iff the effect is blur or replace, or a stage needs the mask
+    /// (`needs_mask`).
     mask: Option<Mask>,
     frames: Frames,
     /// Stage boundaries of the last recorded frame (`EV_*`).
-    events: [Event; 6],
+    events: [Event; 7],
     /// The stages of the last frame whose events were all recorded; `None`
     /// before the first, and while a frame is being enqueued.
     recorded: Option<Stages>,
 }
 
 impl Loaded {
+    /// Whether frames run the mask: it is loaded and the effect or the
+    /// relight stage reads it. A mask under `none` without the stage (kept
+    /// after a failed light change, or after `reset_temporal` dropped the
+    /// stage, until the next load decides) is not run.
+    fn runs_mask(&self) -> bool {
+        self.mask.is_some() && (self.effect != EffectKind::None || self.relight.is_some())
+    }
+
     /// The frame images and events for `req`, with no stage yet.
     fn new(sdk: &'static Sdk, req: &LoadRequest, stream: CuStream) -> Result<Loaded, BackendError> {
         Ok(Loaded {
@@ -928,10 +1255,12 @@ impl Loaded {
             effect: EffectKind::None,
             blur: None,
             background: None,
+            relight: None,
             denoise: None,
             mask: None,
             frames: Frames::alloc(sdk, req.width, req.height)?,
             events: [
+                Event::new()?,
                 Event::new()?,
                 Event::new()?,
                 Event::new()?,
@@ -948,8 +1277,38 @@ impl Loaded {
 struct Configured {
     /// The wall time of the warm-up runs of the models it loaded, if any.
     warmup_ms: Option<f64>,
-    /// Whether it loaded a model (the denoise or the green-screen one).
+    /// Whether it loaded a model (the denoise, green-screen or relighting
+    /// one).
     loaded_model: bool,
+    /// The models it loaded and the light it rebound, one count each.
+    counted: ModelLoads,
+}
+
+/// What a [`MaxineBackend`] has loaded since it was created, per model,
+/// and how many live light changes its relighting stage took
+/// ([`MaxineBackend::model_loads`]). Only loads that succeeded count. A
+/// switch that keeps a stage loads nothing for it, so these tell which
+/// stages a change of the request really loaded: a diagnostic for tests and
+/// tools.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelLoads {
+    /// Denoise models loaded.
+    pub denoise: u64,
+    /// Green-screen models loaded (with the mask they write).
+    pub green_screen: u64,
+    /// Relighting models loaded.
+    pub relight: u64,
+    /// New lights given to a loaded relighting stage (no model load).
+    pub relight_rebinds: u64,
+}
+
+impl ModelLoads {
+    fn add(&mut self, o: ModelLoads) {
+        self.denoise += o.denoise;
+        self.green_screen += o.green_screen;
+        self.relight += o.relight;
+        self.relight_rebinds += o.relight_rebinds;
+    }
 }
 
 /// The Maxine implementation of [`InferenceBackend`].
@@ -963,9 +1322,11 @@ pub struct MaxineBackend {
     model_dir: PathBuf,
     faults: MaskFaultSwitch,
     denoise_faults: DenoiseFaultSwitch,
+    relight_faults: RelightFaultSwitch,
     denoise_strength: Result<f32, String>,
     loaded: Option<Loaded>,
     last_timings: Cell<Option<StageTimings>>,
+    model_loads: ModelLoads,
 }
 
 // SAFETY: the backend holds SDK handles, SDK-allocated GPU images, device
@@ -1017,22 +1378,36 @@ fn kernel_setup_err(what: &'static str) -> impl Fn(GpuError) -> BackendError {
 const WARMUP_SYNC_FAILED: &str =
     "the warm-up run (the green screen, then the mask-hardening kernel) failed on the GPU";
 
-/// Turns any failure while loading the denoise stage into
-/// [`BackendError::Denoise`], so the caller can tell that the rest of its
-/// request would load. The driver missing (or parked) stays `Unavailable`:
-/// nothing else would load either.
-fn denoise_load_err(e: BackendError) -> BackendError {
+/// What messages call `stage`.
+fn stage_name(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Denoise => "the video noise removal",
+        Stage::Relight => "the relighting",
+    }
+}
+
+/// Turns any failure while loading `stage` into [`BackendError::Stage`], so
+/// the caller can tell that the rest of its request would load. The driver
+/// missing (or parked) stays `Unavailable`: nothing else would load either.
+fn stage_load_err(stage: Stage, e: BackendError) -> BackendError {
     let (code, message) = match e {
         BackendError::Load { code, message }
         | BackendError::Run { code, message }
-        | BackendError::Denoise { code, message } => (code, message),
+        | BackendError::Stage { code, message, .. } => (code, message),
         BackendError::InvalidInput(message) => (ffi::NVCV_ERR_GENERAL, message),
         other @ BackendError::Unavailable(_) => return other,
     };
-    BackendError::Denoise {
+    BackendError::Stage {
+        stage,
         code,
-        message: format!("the video noise removal could not be loaded: {message}"),
+        message: format!("{} could not be loaded: {message}", stage_name(stage)),
     }
+}
+
+/// Whether `req` makes the chain compute the mask: its effect composites
+/// through it, or one of its stages consumes it.
+fn needs_mask(req: &LoadRequest) -> bool {
+    req.effect != EffectKind::None || req.stages.needs_mask()
 }
 
 impl MaxineBackend {
@@ -1051,6 +1426,24 @@ impl MaxineBackend {
     /// denoise run fails).
     pub fn denoise_loaded(&self) -> bool {
         self.loaded.as_ref().is_some_and(|l| l.denoise.is_some())
+    }
+
+    /// Whether the relight stage is loaded (it is dropped when a frame's
+    /// relight run fails).
+    pub fn relight_loaded(&self) -> bool {
+        self.loaded.as_ref().is_some_and(|l| l.relight.is_some())
+    }
+
+    /// Whether the green-screen mask is loaded (for an effect, or for the
+    /// relight stage under `none`).
+    pub fn mask_loaded(&self) -> bool {
+        self.loaded.as_ref().is_some_and(|l| l.mask.is_some())
+    }
+
+    /// The models loaded and the light changes taken since this backend
+    /// was created ([`ModelLoads`]).
+    pub fn model_loads(&self) -> ModelLoads {
+        self.model_loads
     }
 
     /// Copies the raw mask of the last processed frame, as the green-screen
@@ -1114,12 +1507,14 @@ impl MaxineBackend {
         Ok(())
     }
 
-    /// Checks `req` before any GPU call. Everything but the denoise stage
-    /// first, so that [`BackendError::Denoise`] means the rest would load.
+    /// Checks `req` before any GPU call. Everything but the stages first,
+    /// so that [`BackendError::Stage`] means the rest would load.
     fn validate(req: &LoadRequest) -> Result<(), BackendError> {
-        if req.effect == EffectKind::None && !req.denoise {
+        if req.effect == EffectKind::None && req.stages.is_empty() {
             return Err(BackendError::InvalidInput(
-                "the Maxine backend has nothing to load for effect none without denoise".into(),
+                "the Maxine backend has nothing to load for effect none without a stage \
+                 (denoise, relight)"
+                    .into(),
             ));
         }
         if req.width == 0
@@ -1132,7 +1527,7 @@ impl MaxineBackend {
                 req.width, req.height
             )));
         }
-        if req.effect != EffectKind::None && (req.width < MIN_WIDTH || req.height < MIN_HEIGHT) {
+        if needs_mask(req) && (req.width < MIN_WIDTH || req.height < MIN_HEIGHT) {
             return Err(BackendError::InvalidInput(format!(
                 "frame size {}x{} is not supported: the green screen needs at least \
                  {MIN_WIDTH}x{MIN_HEIGHT}, even dimensions",
@@ -1151,19 +1546,28 @@ impl MaxineBackend {
                 )));
             }
         }
-        if req.denoise
-            && !((DENOISE_MIN_WIDTH..=DENOISE_MAX_WIDTH).contains(&req.width)
-                && (DENOISE_MIN_HEIGHT..=DENOISE_MAX_HEIGHT).contains(&req.height))
-        {
-            return Err(BackendError::Denoise {
-                code: ffi::NVCV_ERR_RESOLUTION,
-                message: format!(
-                    "the video noise removal does not support {}x{} frames: it takes \
-                     {DENOISE_MIN_WIDTH}x{DENOISE_MIN_HEIGHT} up to \
-                     {DENOISE_MAX_WIDTH}x{DENOISE_MAX_HEIGHT}",
-                    req.width, req.height
-                ),
-            });
+        for &stage in req.stages.as_slice() {
+            match stage {
+                Stage::Denoise => {
+                    if !((DENOISE_MIN_WIDTH..=DENOISE_MAX_WIDTH).contains(&req.width)
+                        && (DENOISE_MIN_HEIGHT..=DENOISE_MAX_HEIGHT).contains(&req.height))
+                    {
+                        return Err(BackendError::Stage {
+                            stage,
+                            code: ffi::NVCV_ERR_RESOLUTION,
+                            message: format!(
+                                "the video noise removal does not support {}x{} frames: it \
+                                 takes {DENOISE_MIN_WIDTH}x{DENOISE_MIN_HEIGHT} up to \
+                                 {DENOISE_MAX_WIDTH}x{DENOISE_MAX_HEIGHT}",
+                                req.width, req.height
+                            ),
+                        });
+                    }
+                }
+                // The green screen's limits, checked above, are the
+                // stage's.
+                Stage::Relight => {}
+            }
         }
         Ok(())
     }
@@ -1171,7 +1575,7 @@ impl MaxineBackend {
     /// Creates and loads the denoise effect from a new input image into the
     /// frame image, with its temporal state, then runs it once to absorb the
     /// first-run warm-up and zeroes the state again. Every failure is
-    /// [`BackendError::Denoise`] (or `Unavailable`).
+    /// [`BackendError::Stage`] (or `Unavailable`).
     fn load_denoise(
         &self,
         frames: &mut Frames,
@@ -1180,7 +1584,7 @@ impl MaxineBackend {
         strength: f32,
     ) -> Result<(Denoise, f64), BackendError> {
         self.build_denoise(frames, (w, h), stream, strength)
-            .map_err(denoise_load_err)
+            .map_err(|e| stage_load_err(Stage::Denoise, e))
     }
 
     fn build_denoise(
@@ -1361,6 +1765,146 @@ impl MaxineBackend {
         Ok((mask, kernel_ms + ms_since(t1)))
     }
 
+    /// Creates and loads the relighting effect on the frame image and the
+    /// hardened mask, with the lighting environment of `light` ([`hdri`])
+    /// and its output image, then runs it once to absorb the first-run
+    /// warm-up. The lighting environment is bound and the effect loaded on
+    /// the stage's own blocking stream ([`Relight::blocking`]); every run
+    /// after that is on `stream`. Every failure is [`BackendError::Stage`]
+    /// (or `Unavailable`).
+    fn load_relight(
+        &self,
+        frames: &mut Frames,
+        mask: &mut Mask,
+        (w, h): (u32, u32),
+        stream: CuStream,
+        light: RelightLight,
+    ) -> Result<(Relight, f64), BackendError> {
+        self.build_relight(frames, mask, (w, h), stream, light)
+            .map_err(|e| stage_load_err(Stage::Relight, e))
+    }
+
+    fn build_relight(
+        &self,
+        frames: &mut Frames,
+        mask: &mut Mask,
+        (w, h): (u32, u32),
+        stream: CuStream,
+        light: RelightLight,
+    ) -> Result<(Relight, f64), BackendError> {
+        let sdk = self.sdk;
+        let dir = self.model_dir.as_path();
+        let mut out = GpuImage::alloc(sdk, w, h, ffi::NVCV_BGR)?;
+        // Cleared once, so no earlier allocation's bytes can ever be read
+        // from it (the effect writes it only where it relights).
+        // SAFETY: a live allocation of `h` rows of `pitch >= 3w` bytes in
+        // the current context; the caller has synchronised `stream`, and
+        // the wait below finishes the fill before the effect is created.
+        unsafe {
+            obc_gpu::memset_2d_async(
+                out.ptr(),
+                out.pitch(),
+                0,
+                w as usize * 3,
+                h as usize,
+                stream,
+            )
+            .and_then(|()| obc_gpu::stream_synchronize(stream))
+        }
+        .map_err(|e| cuda_load_err(e, "clearing its output failed"))?;
+        let mut hdri = GpuImage::host_hdri(sdk, &hdri::studio(light))?;
+        let blocking = obc_gpu::Stream::new(false)
+            .map_err(|e| cuda_load_err(e, "creating its stream failed"))?;
+        let selector = match self.relight_faults.get() {
+            Some(RelightFault::Load) => FAULT_SELECTOR,
+            _ => ffi::FX_RELIGHTING,
+        };
+        let effect = Effect::create(sdk, selector, dir)?;
+        effect.set_model_dir(dir)?;
+        // The blocking stream from before the lighting environment is bound
+        // until the load has finished: see the module documentation (step
+        // 5).
+        effect.set_stream(blocking.raw(), dir)?;
+        effect.set_image(ffi::P_INPUT_IMAGE_0, &mut frames.frame_bgr.image, dir)?;
+        // The hardened mask, never the raw one.
+        effect.set_image(ffi::P_INPUT_IMAGE_1, &mut mask.hard.image, dir)?;
+        effect.set_image(ffi::P_INPUT_IMAGE_2, &mut hdri.image, dir)?;
+        effect.set_image(ffi::P_OUTPUT_IMAGE_0, &mut out.image, dir)?;
+        effect.load(dir)?;
+        blocking
+            .synchronize()
+            .map_err(|e| cuda_load_err(e, "its load failed on the GPU"))?;
+        effect.set_stream(stream, dir)?;
+        let (pan_deg, gain) = FrameParams::default().relight();
+        let rc = effect.set_f32(ffi::P_FG_GAIN, gain);
+        effect.check("NvVFX_SetF32 FgGain", rc, dir)?;
+        let rc = effect.set_f32(ffi::P_ANGLE_PAN, pan_deg.to_radians());
+        effect.check("NvVFX_SetF32 AnglePan", rc, dir)?;
+        let r = Relight {
+            effect,
+            hdri,
+            out,
+            blocking,
+            light,
+            pan_deg,
+            gain,
+        };
+        // Warm-up: one synchronous run on whatever the frame image and the
+        // mask hold (the caller has synchronised the stream, and only the
+        // stage's own output is written).
+        let t1 = Instant::now();
+        let rc = r.effect.run(false);
+        r.effect.check("NvVFX_Run (warm-up)", rc, dir)?;
+        // SAFETY: as in `sync`.
+        unsafe { obc_gpu::stream_synchronize(stream) }
+            .map_err(|e| cuda_load_err(e, "its warm-up run failed on the GPU"))?;
+        Ok((r, ms_since(t1)))
+    }
+
+    /// Gives the loaded relighting effect `r` the lighting environment of
+    /// `light`, live, without a new load: a new environment (a bound one
+    /// cannot be overwritten) bound on the stage's blocking stream, which is
+    /// then synchronised, and `stream` (idle: the caller synchronised it)
+    /// bound again for the runs. On failure the stage's state is unknown and
+    /// the caller drops it; every failure is [`BackendError::Stage`].
+    fn rebind_relight(
+        &self,
+        r: &mut Relight,
+        stream: CuStream,
+        light: RelightLight,
+    ) -> Result<(), BackendError> {
+        let dir = self.model_dir.as_path();
+        if self.relight_faults.get() == Some(RelightFault::Rebind) {
+            return Err(BackendError::Stage {
+                stage: Stage::Relight,
+                code: ffi::NVCV_ERR_GENERAL,
+                message: "the relighting could not take its new light: a forced fault failed \
+                          the rebind"
+                    .into(),
+            });
+        }
+        let rebind = |r: &mut Relight| -> Result<(), BackendError> {
+            let mut hdri = GpuImage::host_hdri(self.sdk, &hdri::studio(light))?;
+            r.effect.set_stream(r.blocking.raw(), dir)?;
+            let bound = r
+                .effect
+                .set_image(ffi::P_INPUT_IMAGE_2, &mut hdri.image, dir);
+            let synced = r
+                .blocking
+                .synchronize()
+                .map_err(|e| cuda_load_err(e, "binding its new light failed on the GPU"));
+            let restored = r.effect.set_stream(stream, dir);
+            if bound.is_ok() {
+                // The effect holds the new environment's address now; the
+                // old one is no longer read.
+                r.hdri = hdri;
+                r.light = light;
+            }
+            bound.and(synced).and(restored)
+        };
+        rebind(r).map_err(|e| stage_load_err(Stage::Relight, e))
+    }
+
     /// Creates and loads the blur effect on the frame images and the
     /// hardened mask.
     fn load_blur(
@@ -1424,9 +1968,13 @@ impl MaxineBackend {
 
     /// Makes `l`, whose stream is idle, run `req` (already validated; the
     /// denoise stage at `strength` iff `Some`). The new parts are built
-    /// first, before anything of `l` changes: the denoise stage (it fails
-    /// with [`BackendError::Denoise`]), then the green screen, then the blur
-    /// or the background. On failure `l` is as it was. Only then are the
+    /// first, before anything of `l` changes, in chain order: the pre-mask
+    /// stages (each fails with [`BackendError::Stage`]), then the green
+    /// screen (a failure of which is the relight stage's under `none`, where
+    /// only that stage needs it), then the post-mask stages, then the blur
+    /// or the background, then a new light on a loaded relight stage. On
+    /// failure `l` is as it was, except that a failed new light drops the
+    /// relight stage ([`BackendError::Stage`] for it). Only then are the
     /// parts the request no longer needs dropped.
     fn configure(
         &self,
@@ -1444,11 +1992,31 @@ impl MaxineBackend {
             }
             _ => None,
         };
-        let needs_mask = req.effect != EffectKind::None;
+        let needs_mask = needs_mask(req);
+        let relight = req.stages.contains(Stage::Relight);
         let mut new_mask = if needs_mask && l.mask.is_none() {
-            let (m, ms) = self.load_mask(&mut l.frames, size, stream)?;
+            let (m, ms) =
+                self.load_mask(&mut l.frames, size, stream)
+                    .map_err(|e| match req.effect {
+                        // Only the relight stage needs the mask: it fails open.
+                        EffectKind::None => stage_load_err(Stage::Relight, e),
+                        _ => e,
+                    })?;
             *warmup_ms.get_or_insert(0.0) += ms;
             Some(m)
+        } else {
+            None
+        };
+        // A new light on a loaded stage is a live rebind, done last (below).
+        let new_relight = if relight && l.relight.is_none() {
+            let mask = new_mask
+                .as_mut()
+                .or(l.mask.as_mut())
+                .expect("relight has a mask: loaded above or kept");
+            let (r, ms) =
+                self.load_relight(&mut l.frames, mask, size, stream, req.relight_light)?;
+            *warmup_ms.get_or_insert(0.0) += ms;
+            Some(r)
         } else {
             None
         };
@@ -1469,13 +2037,49 @@ impl MaxineBackend {
             let bg = req.background.as_ref().expect("validated");
             self.upload_background(bg, &mut l.background)?;
         }
+        // The last step that can fail: a new light on the loaded stage. A
+        // failed rebind leaves the stage in an unknown state, so it goes,
+        // and only it: the rest of `l` is the previous chain, which the
+        // error (the stage's) tells the caller. The mask stays even where
+        // only the stage needed it (`none`): it is not run without the
+        // stage (`Loaded::runs_mask`), and whether it is kept is the next
+        // commit's decision, as for every part. The parts built for this
+        // request go first, the blur (which reads the hardened mask of
+        // `new_mask` or of `l`) before the mask.
+        let mut rebound = false;
+        if relight
+            && let Some(r) = l.relight.as_mut()
+            && r.light != req.relight_light
+        {
+            if let Err(e) = self.rebind_relight(r, stream, req.relight_light) {
+                drop(new_blur);
+                drop(new_relight);
+                drop(new_mask);
+                drop(new_denoise);
+                l.relight = None;
+                return Err(e);
+            }
+            rebound = true;
+        }
         // Commit; nothing below fails. The parts dropped here have no queued
         // work: the caller synchronised the stream.
-        let loaded_model = new_denoise.is_some() || new_mask.is_some();
+        let loaded_model = new_denoise.is_some() || new_mask.is_some() || new_relight.is_some();
+        let counted = ModelLoads {
+            denoise: new_denoise.is_some().into(),
+            green_screen: new_mask.is_some().into(),
+            relight: new_relight.is_some().into(),
+            relight_rebinds: rebound.into(),
+        };
         if new_denoise.is_some() {
             l.denoise = new_denoise;
         } else if strength.is_none() {
             l.denoise = None;
+        }
+        // Before the mask, whose hardened mask it reads.
+        if new_relight.is_some() {
+            l.relight = new_relight;
+        } else if !relight {
+            l.relight = None;
         }
         match req.effect {
             EffectKind::Blur => {
@@ -1490,7 +2094,8 @@ impl MaxineBackend {
                 l.background = None;
             }
         }
-        // After the blur effect, which reads the hardened mask.
+        // After the blur and relighting effects, which read the hardened
+        // mask.
         if new_mask.is_some() {
             l.mask = new_mask;
         } else if !needs_mask {
@@ -1500,6 +2105,7 @@ impl MaxineBackend {
         Ok(Configured {
             warmup_ms,
             loaded_model,
+            counted,
         })
     }
 
@@ -1511,11 +2117,14 @@ impl MaxineBackend {
         dst: &DeviceNv12,
     ) -> Result<(), BackendError> {
         let sdk = self.sdk;
-        let block = match self.faults.get() {
+        let mask_fault = self.faults.get();
+        let block = match mask_fault {
             Some(MaskFault::Launch) => FAULT_BLOCK,
             _ => LUT8_BLOCK,
         };
+        let split_mask = mask_fault == Some(MaskFault::SplitMask);
         let denoise_fault = self.denoise_faults.get() == Some(DenoiseFault::Run);
+        let relight_fault = self.relight_faults.get() == Some(RelightFault::Run);
         let l = self.loaded.as_mut().ok_or_else(not_loaded)?;
         if gpu.stream != l.stream {
             return Err(BackendError::InvalidInput(
@@ -1537,9 +2146,11 @@ impl MaxineBackend {
             code: rc,
             message: format!("{call} returned {rc} ({})", sdk.error_string(rc)),
         };
+        let runs_mask = l.runs_mask();
         let stages = Stages {
             denoise: l.denoise.is_some(),
-            mask: l.mask.is_some(),
+            mask: runs_mask,
+            relight: l.relight.is_some(),
         };
         l.recorded = None;
         let Frames {
@@ -1583,6 +2194,8 @@ impl MaxineBackend {
             return Err(run_err("NvCVImage_TransferFromYUV", rc));
         }
         record(&l.events[EV_IN], stream)?;
+        // The pre-mask stages, in canonical order; each writes the frame
+        // image.
         if let Some(d) = l.denoise.as_ref() {
             let rc = if denoise_fault {
                 ffi::NVCV_ERR_GENERAL
@@ -1611,60 +2224,192 @@ impl MaxineBackend {
                         " (waiting for the stream before that failed: {e})"
                     ));
                 }
-                return Err(BackendError::Denoise { code: rc, message });
+                return Err(BackendError::Stage {
+                    stage: Stage::Denoise,
+                    code: rc,
+                    message,
+                });
             }
             record(&l.events[EV_DENOISE], stream)?;
         }
-        let out: &NvCvImage = match l.mask.as_ref() {
-            None => &frame_bgr.image,
-            Some(m) => {
-                let rc = m.effect.run(true);
-                if rc != ffi::NVCV_SUCCESS {
-                    return Err(run_err("NvVFX_Run(GreenScreen)", rc));
-                }
-                // SAFETY: the masks, the table and the kernel are ours, in the
-                // current context; the effect's run is queued on `stream`
-                // before the kernel, which therefore reads the finished mask.
-                unsafe { m.harden(l.width, l.height, stream, block) }?;
-                record(&l.events[EV_MASK], stream)?;
-                match l.effect {
-                    EffectKind::Blur => {
-                        let (blur, current) = l.blur.as_mut().ok_or_else(not_loaded)?;
-                        let strength = params.blur_strength.clamp(0.0, 1.0);
-                        if strength != *current {
-                            let rc = blur.set_f32(ffi::P_STRENGTH, strength);
-                            if rc != ffi::NVCV_SUCCESS {
-                                return Err(run_err("NvVFX_SetF32(Strength)", rc));
-                            }
-                            *current = strength;
-                        }
-                        let rc = blur.run(true);
-                        if rc != ffi::NVCV_SUCCESS {
-                            return Err(run_err("NvVFX_Run(BackgroundBlur)", rc));
-                        }
+        // The mask, iff the effect or a stage needs it (`needs_mask`), then
+        // the post-mask stages, then the effect's composite. Under `none` the
+        // mask (and the composite) exist for the relight stage alone, so
+        // their failures are the stage's.
+        let stage_only = l.effect == EffectKind::None;
+        let fail = |e: BackendError| {
+            if stage_only {
+                PostMaskError::Relight(e)
+            } else {
+                PostMaskError::Effect(e)
+            }
+        };
+        let post: Result<PostMaskOutput, PostMaskError> = 'post: {
+            let Some(m) = l.mask.as_ref().filter(|_| runs_mask) else {
+                break 'post Ok(PostMaskOutput::Frame);
+            };
+            let rc = m.effect.run(true);
+            if rc != ffi::NVCV_SUCCESS {
+                break 'post Err(fail(run_err("NvVFX_Run(GreenScreen)", rc)));
+            }
+            // SAFETY: the masks, the table and the kernel are ours, in the
+            // current context; the effect's run is queued on `stream`
+            // before the kernel, which therefore reads the finished mask.
+            if let Err(e) = unsafe { m.harden(l.width, l.height, stream, block) } {
+                break 'post Err(fail(e.into()));
+            }
+            // SAFETY: as above.
+            if split_mask && let Err(e) = unsafe { m.split(l.width, l.height, stream) } {
+                break 'post Err(fail(e.into()));
+            }
+            if let Err(e) = record(&l.events[EV_MASK], stream) {
+                break 'post Err(fail(e));
+            }
+            // The post-mask stages, in canonical order: the relit
+            // foreground, valid only where the hardened mask is opaque.
+            let relit: Option<&NvCvImage> = match l.relight.as_mut() {
+                None => None,
+                Some(r) => {
+                    if let Err((call, rc)) = r.apply(params) {
+                        break 'post Err(PostMaskError::Relight(run_err(call, rc)));
                     }
-                    EffectKind::Replace => {
-                        let bg = l.background.as_ref().ok_or_else(not_loaded)?;
-                        // SAFETY: all four images are live GPU allocations of
-                        // the same size in the current context.
-                        let rc = unsafe {
-                            (sdk.NvCVImage_Composite)(
-                                &*frame_bgr.image,
-                                &*bg.image,
-                                // The hardened mask, never the raw one.
-                                &*m.hard.image,
-                                &mut *out_bgr.image,
-                                stream,
+                    let rc = if relight_fault {
+                        ffi::NVCV_ERR_GENERAL
+                    } else {
+                        r.effect.run(true)
+                    };
+                    if rc != ffi::NVCV_SUCCESS {
+                        let message = if relight_fault {
+                            "a forced fault failed NvVFX_Run(Relighting)".to_owned()
+                        } else {
+                            format!(
+                                "NvVFX_Run(Relighting) returned {rc} ({})",
+                                sdk.error_string(rc)
                             )
                         };
-                        if rc != ffi::NVCV_SUCCESS {
-                            return Err(run_err("NvCVImage_Composite", rc));
-                        }
+                        break 'post Err(PostMaskError::Relight(BackendError::Run {
+                            code: rc,
+                            message,
+                        }));
                     }
-                    EffectKind::None => return Err(not_loaded()),
+                    if let Err(e) = record(&l.events[EV_RELIGHT], stream) {
+                        break 'post Err(fail(e));
+                    }
+                    Some(&*r.out.image)
                 }
-                record(&l.events[EV_EFFECT], stream)?;
-                &out_bgr.image
+            };
+            // A composite through the hardened mask, never the raw one.
+            let composite = |fg: &NvCvImage, bg: &NvCvImage, dst: &mut NvCvImage| {
+                // SAFETY: all four images are live GPU allocations of the
+                // same size in the current context; `dst` is neither input.
+                unsafe { (sdk.NvCVImage_Composite)(fg, bg, &*m.hard.image, dst, stream) }
+            };
+            // A failed composite of the relit foreground is the stage's:
+            // the frame can run again without it.
+            let composite_err = |rc: NvCvStatus| match relit {
+                Some(_) => PostMaskError::Relight(run_err("NvCVImage_Composite", rc)),
+                None => fail(run_err("NvCVImage_Composite", rc)),
+            };
+            let output = match l.effect {
+                EffectKind::Blur => {
+                    let Some((blur, current)) = l.blur.as_mut() else {
+                        break 'post Err(PostMaskError::Effect(not_loaded()));
+                    };
+                    let strength = params.blur_strength.clamp(0.0, 1.0);
+                    if strength != *current {
+                        let rc = blur.set_f32(ffi::P_STRENGTH, strength);
+                        if rc != ffi::NVCV_SUCCESS {
+                            break 'post Err(PostMaskError::Effect(run_err(
+                                "NvVFX_SetF32(Strength)",
+                                rc,
+                            )));
+                        }
+                        *current = strength;
+                    }
+                    let rc = blur.run(true);
+                    if rc != ffi::NVCV_SUCCESS {
+                        break 'post Err(PostMaskError::Effect(run_err(
+                            "NvVFX_Run(BackgroundBlur)",
+                            rc,
+                        )));
+                    }
+                    match relit {
+                        // The relit foreground over the blurred frame, into
+                        // the frame image: the relighting and the blur have
+                        // read it already (stream order).
+                        Some(fg) => {
+                            let rc = composite(fg, &out_bgr.image, &mut frame_bgr.image);
+                            if rc != ffi::NVCV_SUCCESS {
+                                break 'post Err(composite_err(rc));
+                            }
+                            PostMaskOutput::Frame
+                        }
+                        None => PostMaskOutput::Out,
+                    }
+                }
+                EffectKind::Replace => {
+                    let Some(bg) = l.background.as_ref() else {
+                        break 'post Err(PostMaskError::Effect(not_loaded()));
+                    };
+                    let fg = relit.unwrap_or(&frame_bgr.image);
+                    let rc = composite(fg, &bg.image, &mut out_bgr.image);
+                    if rc != ffi::NVCV_SUCCESS {
+                        break 'post Err(composite_err(rc));
+                    }
+                    PostMaskOutput::Out
+                }
+                // A mask under `none` exists only for the relight stage:
+                // its foreground over the (denoised) camera frame.
+                EffectKind::None => {
+                    let Some(fg) = relit else {
+                        break 'post Err(PostMaskError::Effect(not_loaded()));
+                    };
+                    let rc = composite(fg, &frame_bgr.image, &mut out_bgr.image);
+                    if rc != ffi::NVCV_SUCCESS {
+                        break 'post Err(composite_err(rc));
+                    }
+                    PostMaskOutput::Out
+                }
+            };
+            if let Err(e) = record(&l.events[EV_EFFECT], stream) {
+                break 'post Err(fail(e));
+            }
+            Ok(output)
+        };
+        let out: &NvCvImage = match post {
+            Ok(PostMaskOutput::Frame) => &frame_bgr.image,
+            Ok(PostMaskOutput::Out) => &out_bgr.image,
+            Err(PostMaskError::Effect(e)) => return Err(e),
+            Err(PostMaskError::Relight(e)) => {
+                // What was queued must finish before the stage (and, under
+                // `none`, the mask it alone needed) goes.
+                let synced = sync(stream);
+                l.relight = None;
+                if l.effect == EffectKind::None {
+                    l.mask = None;
+                }
+                let (code, what) = match e {
+                    BackendError::Load { code, message }
+                    | BackendError::Run { code, message }
+                    | BackendError::Stage { code, message, .. } => (code, message),
+                    BackendError::InvalidInput(m) | BackendError::Unavailable(m) => {
+                        (ffi::NVCV_ERR_GENERAL, m)
+                    }
+                };
+                let mut message = format!(
+                    "the relighting failed and was turned off; the next frame runs without it: \
+                     {what}"
+                );
+                if let Err(e) = synced {
+                    message.push_str(&format!(
+                        " (waiting for the stream before that failed: {e})"
+                    ));
+                }
+                return Err(BackendError::Stage {
+                    stage: Stage::Relight,
+                    code,
+                    message,
+                });
             }
         };
         // SAFETY: `dst` describes live, writable NV12 device memory of the
@@ -1699,13 +2444,33 @@ impl MaxineBackend {
     }
 }
 
+/// Which image a frame's post-mask part left the output in.
+enum PostMaskOutput {
+    /// [`Frames::frame_bgr`]: no mask, or the relit foreground composited
+    /// over the blur.
+    Frame,
+    /// [`Frames::out_bgr`].
+    Out,
+}
+
+/// Whose failure a frame's post-mask part ran into.
+enum PostMaskError {
+    /// The effect's: the frame fails.
+    Effect(BackendError),
+    /// The relight stage's (or, under `none`, the mask's, which only the
+    /// stage needs): the stage is dropped and fails open.
+    Relight(BackendError),
+}
+
 fn not_loaded() -> BackendError {
     BackendError::InvalidInput("the Maxine backend has no effect loaded".into())
 }
 
 fn no_mask() -> BackendError {
     BackendError::InvalidInput(
-        "the Maxine backend has no mask loaded (effect none runs the denoise stage only)".into(),
+        "the Maxine backend has no mask loaded (effect none without the relight stage runs no \
+         mask)"
+            .into(),
     )
 }
 
@@ -1717,7 +2482,7 @@ impl InferenceBackend for MaxineBackend {
     fn load(&mut self, gpu: &GpuContext, req: &LoadRequest) -> Result<LoadReport, BackendError> {
         Self::check_context(gpu)?;
         Self::validate(req)?;
-        let strength = if req.denoise {
+        let strength = if req.stages.contains(Stage::Denoise) {
             Some(self.denoise_strength.clone().map_err(strength_err)?)
         } else {
             None
@@ -1743,6 +2508,7 @@ impl InferenceBackend for MaxineBackend {
         match self.configure(&mut loaded, req, strength) {
             Ok(c) => {
                 self.loaded = Some(loaded);
+                self.model_loads.add(c.counted);
                 Ok(LoadReport {
                     load_ms: ms_since(t0) - c.warmup_ms.unwrap_or(0.0),
                     warmup_ms: c.warmup_ms,
@@ -1751,7 +2517,9 @@ impl InferenceBackend for MaxineBackend {
             }
             Err(e) => {
                 if reuse {
-                    // `configure` changed nothing: the previous chain stays.
+                    // The previous chain stays: `configure` changed nothing,
+                    // or, when a new light failed, dropped the relight stage
+                    // alone (the error is the stage's).
                     self.loaded = Some(loaded);
                 } else {
                     drop(loaded);
@@ -1799,10 +2567,25 @@ impl InferenceBackend for MaxineBackend {
     /// Zeroes the denoise state (on the stream) and resets the green
     /// screen's (after waiting for the stream: the SDK does not say which
     /// stream `NvVFX_ResetState` works on, and queued frames use the state).
-    fn reset_temporal(&mut self, gpu: &GpuContext) -> Result<(), BackendError> {
+    ///
+    /// The relighting effect's temporal state cannot be reset: it lists no
+    /// `State` parameter, and handing it a state allocated with
+    /// `NvVFX_AllocateState` (or resetting one) makes every later run fail
+    /// with "an image buffer has not been specified". Its model blends the
+    /// previous frames' albedo and normals into each new one, so after a
+    /// switch of source the first frames of camera B would carry camera
+    /// A's person, background included where blur or replace had hidden
+    /// it. So the stage is dropped here (after the stream has finished
+    /// with it) and returned: frames run without it from now, and the
+    /// caller loads it again, which builds a new effect with a fresh state
+    /// (the full sequence of `build_relight`, the blocking stream included)
+    /// before any frame is relit again. The mask stays (not run under
+    /// `none` without the stage: `Loaded::runs_mask`), so the new stage
+    /// costs its own load only.
+    fn reset_temporal(&mut self, gpu: &GpuContext) -> Result<StageList, BackendError> {
         Self::check_context(gpu)?;
-        let Some(l) = self.loaded.as_ref() else {
-            return Ok(());
+        let Some(l) = self.loaded.as_mut() else {
+            return Ok(StageList::default());
         };
         if gpu.stream != l.stream {
             return Err(BackendError::InvalidInput(
@@ -1828,7 +2611,13 @@ impl InferenceBackend for MaxineBackend {
                 });
             }
         }
-        Ok(())
+        if l.relight.is_some() {
+            // Queued frames may still run it.
+            sync(l.stream)?;
+            l.relight = None;
+            return Ok(Stage::Relight.into());
+        }
+        Ok(StageList::default())
     }
 }
 
@@ -1841,6 +2630,7 @@ impl Drop for MaxineBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use obc_backend::StageList;
     use std::sync::Arc;
 
     fn failing(root: Option<PathBuf>) -> MaxineFactory {
@@ -1929,6 +2719,7 @@ mod tests {
             Some(MaskFault::ConstantTable(0x00)),
             Some(MaskFault::ConstantTable(0xFF)),
             Some(MaskFault::ConstantTable(0x5A)),
+            Some(MaskFault::SplitMask),
             None,
         ] {
             switch.set(fault);
@@ -2015,11 +2806,12 @@ mod tests {
         });
         let req = |effect, width, height, background| LoadRequest {
             effect,
-            denoise: false,
+            stages: StageList::default(),
             width,
             height,
             colour: ColourSpec::LIMITED_BT601,
             background,
+            relight_light: RelightLight::default(),
         };
         assert!(MaxineBackend::validate(&req(EffectKind::Blur, 1920, 1080, None)).is_ok());
         assert!(MaxineBackend::validate(&req(EffectKind::None, 1920, 1080, None)).is_err());
@@ -2035,23 +2827,24 @@ mod tests {
     fn denoise_req(effect: EffectKind, width: u32, height: u32) -> LoadRequest {
         LoadRequest {
             effect,
-            denoise: true,
+            stages: Stage::Denoise.into(),
             width,
             height,
             colour: ColourSpec::LIMITED_BT601,
             background: None,
+            relight_light: RelightLight::default(),
         }
     }
 
     #[test]
     fn none_needs_the_denoise_stage_and_skips_the_green_screen_minimum() {
         let off = LoadRequest {
-            denoise: false,
+            stages: StageList::default(),
             ..denoise_req(EffectKind::None, 1920, 1080)
         };
         let e = MaxineBackend::validate(&off).unwrap_err();
         assert!(matches!(e, BackendError::InvalidInput(_)), "{e:?}");
-        assert!(e.to_string().contains("without denoise"), "{e}");
+        assert!(e.to_string().contains("without a stage"), "{e}");
         // Below the green screen's 512x288: fine for denoise alone, not for
         // an effect, with or without denoise.
         assert!(MaxineBackend::validate(&denoise_req(EffectKind::None, 320, 180)).is_ok());
@@ -2076,8 +2869,13 @@ mod tests {
             (80, 78),
         ] {
             let e = MaxineBackend::validate(&denoise_req(EffectKind::None, w, h)).unwrap_err();
-            let BackendError::Denoise { code, message } = &e else {
-                panic!("{w}x{h}: expected Denoise, got {e:?}");
+            let BackendError::Stage {
+                stage: Stage::Denoise,
+                code,
+                message,
+            } = &e
+            else {
+                panic!("{w}x{h}: expected a denoise stage error, got {e:?}");
             };
             assert_eq!(*code, ffi::NVCV_ERR_RESOLUTION);
             assert!(message.contains(&format!("{w}x{h}")), "{message}");
@@ -2086,9 +2884,18 @@ mod tests {
         // The same size with an effect: the effect part is fine, so the
         // error is the denoise stage's, and without denoise it loads.
         let e = MaxineBackend::validate(&denoise_req(EffectKind::Blur, 2048, 1152)).unwrap_err();
-        assert!(matches!(e, BackendError::Denoise { .. }), "{e:?}");
+        assert!(
+            matches!(
+                e,
+                BackendError::Stage {
+                    stage: Stage::Denoise,
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
         let off = LoadRequest {
-            denoise: false,
+            stages: StageList::default(),
             ..denoise_req(EffectKind::Blur, 2048, 1152)
         };
         assert!(MaxineBackend::validate(&off).is_ok());
@@ -2182,6 +2989,25 @@ mod tests {
     }
 
     #[test]
+    fn the_usable_root_is_the_loaded_one_once_the_sdk_is_loaded() {
+        let configured = || Some(PathBuf::from("/configured/new"));
+        // Loaded from a root: that one, whatever is configured now.
+        assert_eq!(
+            pick_usable_root(Some("/loaded/old".into()), configured),
+            Some(PathBuf::from("/loaded/old"))
+        );
+        // Nothing loaded: the root in force.
+        assert_eq!(
+            pick_usable_root(None, configured),
+            Some(PathBuf::from("/configured/new"))
+        );
+        assert_eq!(pick_usable_root(None, || None), None);
+        // Nothing is loaded in this test process.
+        assert_eq!(loaded_root(), None);
+        assert_eq!(usable_root(), effective_root());
+    }
+
+    #[test]
     fn the_strength_override_takes_0_or_1_and_names_itself_otherwise() {
         use std::ffi::OsStr;
         assert_eq!(parse_denoise_strength(None), Ok(DEFAULT_DENOISE_STRENGTH));
@@ -2204,7 +3030,16 @@ mod tests {
             ..MaxineFactory::with_root(None)
         };
         let e = f.denoise_strength().unwrap_err();
-        assert!(matches!(e, BackendError::Denoise { .. }), "{e:?}");
+        assert!(
+            matches!(
+                e,
+                BackendError::Stage {
+                    stage: Stage::Denoise,
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
     }
 
     #[test]
@@ -2224,13 +3059,20 @@ mod tests {
     }
 
     #[test]
-    fn denoise_load_failures_become_denoise_errors_except_a_missing_driver() {
-        let e = denoise_load_err(BackendError::Load {
-            code: -10,
-            message: "NvVFX_Load(Denoising) returned -10".into(),
-        });
+    fn stage_load_failures_become_stage_errors_except_a_missing_driver() {
+        let e = stage_load_err(
+            Stage::Denoise,
+            BackendError::Load {
+                code: -10,
+                message: "NvVFX_Load(Denoising) returned -10".into(),
+            },
+        );
         match e {
-            BackendError::Denoise { code, message } => {
+            BackendError::Stage {
+                stage: Stage::Denoise,
+                code,
+                message,
+            } => {
                 assert_eq!(code, -10);
                 assert!(message.contains("video noise removal"), "{message}");
                 assert!(message.contains("NvVFX_Load(Denoising)"), "{message}");
@@ -2238,18 +3080,28 @@ mod tests {
             other => panic!("expected Denoise, got {other:?}"),
         }
         assert!(matches!(
-            denoise_load_err(BackendError::InvalidInput("x".into())),
-            BackendError::Denoise { .. }
+            stage_load_err(Stage::Denoise, BackendError::InvalidInput("x".into())),
+            BackendError::Stage {
+                stage: Stage::Denoise,
+                ..
+            }
         ));
         assert!(matches!(
-            denoise_load_err(BackendError::Run {
+            stage_load_err(
+                Stage::Denoise,
+                BackendError::Run {
+                    code: 2,
+                    message: "oom".into()
+                }
+            ),
+            BackendError::Stage {
+                stage: Stage::Denoise,
                 code: 2,
-                message: "oom".into()
-            }),
-            BackendError::Denoise { code: 2, .. }
+                ..
+            }
         ));
         assert!(matches!(
-            denoise_load_err(BackendError::Unavailable("parked".into())),
+            stage_load_err(Stage::Denoise, BackendError::Unavailable("parked".into())),
             BackendError::Unavailable(_)
         ));
     }
@@ -2276,65 +3128,134 @@ mod tests {
         // A fake span: one unit per event index it covers, so each figure shows
         // which events it was measured between.
         let span = |a: usize, b: usize| Some((b - a) as f32);
-        let all = stage_timings(
-            Stages {
-                denoise: true,
-                mask: true,
-            },
-            span,
-        )
-        .unwrap();
+        let st = |denoise, mask, relight| Stages {
+            denoise,
+            mask,
+            relight,
+        };
+        let all = stage_timings(st(true, true, true), span).unwrap();
         assert_eq!(
             all,
             StageTimings {
                 convert_in_ms: 1.0,
                 denoise_ms: 1.0,
                 mask_ms: 1.0,
+                relight_ms: 1.0,
                 effect_ms: 1.0,
                 convert_out_ms: 1.0,
             }
         );
-        let effect_only = stage_timings(
-            Stages {
-                denoise: false,
-                mask: true,
-            },
-            span,
-        )
-        .unwrap();
+        let no_relight = stage_timings(st(true, true, false), span).unwrap();
+        assert_eq!(no_relight.relight_ms, 0.0);
+        assert_eq!(no_relight.effect_ms, 2.0, "the effect follows the mask");
+        assert_eq!(no_relight.total_ms(), 6.0);
+        let effect_only = stage_timings(st(false, true, false), span).unwrap();
         assert_eq!(effect_only.denoise_ms, 0.0);
         assert_eq!(effect_only.mask_ms, 2.0, "the mask follows the conversion");
-        assert_eq!(effect_only.total_ms(), 5.0);
-        let denoise_only = stage_timings(
-            Stages {
-                denoise: true,
-                mask: false,
-            },
-            span,
-        )
-        .unwrap();
-        assert_eq!((denoise_only.mask_ms, denoise_only.effect_ms), (0.0, 0.0));
-        assert_eq!(denoise_only.convert_out_ms, 3.0, "out follows the denoise");
-        assert_eq!(denoise_only.total_ms(), 5.0);
-        let none = stage_timings(
-            Stages {
-                denoise: false,
-                mask: false,
-            },
-            span,
-        )
-        .unwrap();
-        assert_eq!(none.convert_out_ms, 4.0);
+        assert_eq!(effect_only.total_ms(), 6.0);
+        let relight_only = stage_timings(st(false, true, true), span).unwrap();
+        assert_eq!((relight_only.mask_ms, relight_only.relight_ms), (2.0, 1.0));
+        assert_eq!(relight_only.total_ms(), 6.0);
+        let denoise_only = stage_timings(st(true, false, false), span).unwrap();
+        assert_eq!(
+            (
+                denoise_only.mask_ms,
+                denoise_only.relight_ms,
+                denoise_only.effect_ms
+            ),
+            (0.0, 0.0, 0.0)
+        );
+        assert_eq!(denoise_only.convert_out_ms, 4.0, "out follows the denoise");
+        assert_eq!(denoise_only.total_ms(), 6.0);
+        let none = stage_timings(st(false, false, false), span).unwrap();
+        assert_eq!(none.convert_out_ms, 5.0);
         // A span that cannot be read gives no timings at all.
         assert_eq!(
-            stage_timings(
-                Stages {
-                    denoise: true,
-                    mask: true
-                },
-                |a, b| (a != EV_IN).then_some((b - a) as f32)
-            ),
+            stage_timings(st(true, true, true), |a, b| (a != EV_IN)
+                .then_some((b - a) as f32)),
             None
+        );
+        assert_eq!(
+            stage_timings(st(false, true, true), |a, b| (b != EV_RELIGHT)
+                .then_some((b - a) as f32)),
+            None
+        );
+    }
+
+    #[test]
+    fn relight_is_named_in_messages() {
+        assert_eq!(stage_name(Stage::Relight), "the relighting");
+        assert_eq!(
+            feature_library("NvVFX_CreateEffect(Relighting)"),
+            "libnvVFXRelighting.so"
+        );
+    }
+
+    #[test]
+    fn relight_faults_are_off_unless_armed_and_shared_by_clones() {
+        let f = MaxineFactory::with_root(None);
+        assert_eq!(f.relight_faults.get(), None);
+        assert_eq!(MaxineFactory::from_env().relight_faults.get(), None);
+        let switch = RelightFaultSwitch::default();
+        let f = f.with_relight_faults(switch.clone());
+        let copy = f.clone();
+        for fault in [
+            Some(RelightFault::Load),
+            Some(RelightFault::Run),
+            Some(RelightFault::Rebind),
+            None,
+        ] {
+            switch.set(fault);
+            assert_eq!(f.relight_faults.get(), fault);
+            assert_eq!(copy.relight_faults.get(), fault);
+        }
+    }
+
+    #[test]
+    fn the_split_mask_is_background_then_a_soft_ramp_then_foreground() {
+        for width in [1920u32, 640, 101] {
+            let start = width / 2 - SPLIT_MASK_RAMP / 2;
+            let v: Vec<u8> = (0..width).map(|x| split_mask_value(x, width)).collect();
+            assert!(v[..start as usize].iter().all(|&m| m == 0), "{width}");
+            let ramp = &v[start as usize..(start + SPLIT_MASK_RAMP) as usize];
+            assert!(ramp.iter().all(|&m| m > 0 && m < 255), "{width}: {ramp:?}");
+            assert!(ramp.windows(2).all(|p| p[0] < p[1]), "{width}: rising");
+            assert!(
+                v[(start + SPLIT_MASK_RAMP) as usize..]
+                    .iter()
+                    .all(|&m| m == 255),
+                "{width}"
+            );
+        }
+    }
+
+    #[test]
+    fn relight_stage_availability_needs_the_green_screen_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let lib = |d: &str, l: &str| {
+            let p = root.join("features").join(d).join("lib");
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join(l), b"").unwrap();
+        };
+        let models = root.join("lib").join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        lib("nvvfxrelighting", "libnvVFXRelighting.so");
+        for m in ["relight_0thframe_perf_120", "relight_nthframe_perf_120"] {
+            std::fs::write(models.join(format!("{m}.engine.trtpkg")), b"").unwrap();
+        }
+        let a = stage_availability(root, Some((12, 0)), Stage::Relight);
+        let why = a.reason().expect("no green screen").to_owned();
+        assert!(why.starts_with("green-screen: "), "{why}");
+        lib("nvvfxgreenscreen", "libnvVFXGreenScreen.so");
+        std::fs::write(models.join("AIGS_1080_120_m0.engine.trtpkg"), b"").unwrap();
+        assert_eq!(
+            stage_availability(root, Some((12, 0)), Stage::Relight),
+            Availability::Installed
+        );
+        assert!(
+            !stage_availability(root, Some((12, 0)), Stage::Denoise).is_installed(),
+            "the denoising feature is not installed"
         );
     }
 }

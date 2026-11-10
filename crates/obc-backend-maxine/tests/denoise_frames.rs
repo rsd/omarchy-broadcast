@@ -53,6 +53,7 @@ use std::path::{Path, PathBuf};
 
 use obc_backend::{
     BackendFactory, ColourSpec, EffectKind, FrameParams, GpuContext, InferenceBackend, LoadRequest,
+    RelightLight, Stage,
 };
 use obc_backend_maxine::MaxineFactory;
 use obc_gpu::{ContextGuard, DeviceNv12Buffer, OwnedContext, Stream};
@@ -230,11 +231,12 @@ fn the_denoise_stage_on_recorded_camera_frames_at_both_strengths() {
         let dst = DeviceNv12Buffer::alloc(W as u32, H as u32).unwrap();
         let req = LoadRequest {
             effect: EffectKind::None,
-            denoise: true,
+            stages: Stage::Denoise.into(),
             width: W as u32,
             height: H as u32,
             colour: ColourSpec::LIMITED_BT601,
             background: None,
+            relight_light: RelightLight::default(),
         };
 
         for (name, frames) in &seqs {

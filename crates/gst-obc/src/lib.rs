@@ -17,12 +17,14 @@
 pub mod background;
 pub mod cuda;
 pub mod effect;
+pub mod enhance;
 mod settings;
 
 pub use effect::{
     ELEMENT_NAME, NEW_SOURCE_FLAG, ObcEffect, STATUS_MESSAGE, from_element, has_new_source_flag,
     register,
 };
+pub use enhance::{EnhanceStats, ObcEnhance};
 pub use settings::{
     EffectFallback, EffectKind, EffectSettings, EffectStats, EffectStatus, parse_effect,
 };

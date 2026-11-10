@@ -111,9 +111,16 @@ start_debounce_ms = 300
 # effect fails as described under on_failure.
 #
 # A choice made at run time (SetEffect, SetBlurStrength, SetBackgroundImage,
-# SetDenoise, `omarchy-broadcast effect ...`, `omarchy-broadcast denoise ...`)
-# is kept in the state file and takes precedence over the keys of this
-# section.
+# SetDenoise, `omarchy-broadcast effect ...`, `omarchy-broadcast denoise ...`,
+# or a setting written with SetSetting / `omarchy-broadcast settings set
+# effect....`) is kept in the state file and takes precedence over the keys of
+# this section. A reset of a setting (`omarchy-broadcast settings reset`)
+# forgets the choice, so the value here applies again.
+#
+# Noise removal, enhance and relighting are stages that stack with any effect
+# and fail open: if one cannot run (its SDK feature is missing, for example),
+# the video continues without it and the reason is in Error. A stage whose
+# feature is not installed is shown greyed ("Not installed") by the clients.
 
 # The effect applied to the camera image:
 #   "none"    the camera image as it is;
@@ -143,6 +150,42 @@ blur_strength = 0.5
 # Default: false
 denoise = false
 
+# Enhance a low-resolution camera: upscale the camera image to the output
+# size with the SDK's video super resolution, before the other stages, so a
+# camera that captures well below the output (for example 960x540 or 640x360
+# into 1920x1080) is sharper than scaling alone makes it. It applies only
+# where it pays: the part of the camera frame the output shows must have at
+# most half the pixels of the area it fills in the output, and the camera's
+# frames must be NV12 or I420 (a camera in NV12, YUYV, UYVY or MJPEG is). A
+# camera that already captures at or near the output size is left as it is.
+# Turning it on or off while the camera is open reopens the camera (the
+# output holds the last frame meanwhile). If it cannot run, the camera
+# frames pass through at their own size, with the reason in Error.
+# Default: false
+enhance = false
+
+# Relighting: light the person with a key light, after the background
+# effect's mask, so the background is never relit. It needs the SDK's
+# relighting and green-screen features. The light is made by the daemon;
+# changing it, the direction or the brightness while it runs reloads nothing.
+# If it cannot run, the video continues without it, with the reason in Error.
+# Default: false
+relight = false
+
+# The colour of the key light: "warm", "neutral" or "cool".
+# Default: "neutral"
+relight_light = "neutral"
+
+# Where the key light comes from, in degrees: -90 to 90 in steps of 5.
+# 0 is the default position.
+# Default: 0
+relight_direction = 0
+
+# How bright the relit person is, in percent: 50 to 200 in steps of 5.
+# 100 leaves the brightness unchanged.
+# Default: 100
+relight_brightness = 100
+
 # What the virtual camera shows when the requested effect cannot run (the
 # SDK is missing, a model or the background image fails to load):
 #   "black" black frames: the camera is closed, the daemon reports the
@@ -166,7 +209,10 @@ on_failure = "black"
 # on_failure). The root is taken when the SDK is first loaded, by the first
 # effect or noise removal the daemon starts or checks; the SDK then stays
 # loaded, so a different root takes effect only after the daemon is
-# restarted (a reload that changes it says so in the log).
+# restarted (a reload that changes it says so in the log). Which features of
+# the SDK are installed (noise removal, relighting, enhance) is read from the
+# files under this root and, for the models, the GPU's compute capability,
+# which the daemon keeps in $XDG_CACHE_HOME/omarchy-broadcast/.
 # Default: unset. Example:
 # maxine_root = "/home/user/.local/opt/maxine/VideoFX"
 

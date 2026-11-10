@@ -143,7 +143,8 @@ enum Command {
         action: Option<ControlsAction>,
     },
     /// Show or change the settings of a camera: image, white balance,
-    /// exposure, focus and zoom, those the camera has.
+    /// exposure, focus and zoom, those the camera has; and the video
+    /// effects, the same for every camera.
     ///
     /// Without a subcommand, prints the settings of the active camera (or
     /// of `--camera`) by group: each one's label, value, id, the values it
@@ -151,18 +152,21 @@ enum Command {
     /// now when it cannot. A change applies at once while the camera is
     /// open (state `starting` or `active`); otherwise it is stored and
     /// applied the next time the camera opens. The values persist across
-    /// restarts of the daemon, for each camera.
+    /// restarts of the daemon, for each camera. The effects (`effect.*`,
+    /// under "All cameras") apply at once whatever the camera, and a reset
+    /// puts back the configuration's value.
     ///
     /// Examples: `omarchy-broadcast settings set camera.exposure.auto_exposure manual`,
     /// `omarchy-broadcast settings set -- camera.focus.pan_absolute -3600`,
+    /// `omarchy-broadcast settings set effect.video.denoise on`,
     /// `omarchy-broadcast settings reset --group=exposure`.
     // Not `args_conflicts_with_subcommands`: `--camera` goes before or after
     // `set`/`reset`; `--json` with a subcommand is refused in `job`.
     Settings {
         /// Print the settings as JSON lines (`"type":"settings_group"`, or
         /// `"type":"settings_clear"` when there is nothing to show: no
-        /// camera, or no setting this version can show); only without a
-        /// subcommand.
+        /// camera and no effect setting, or no setting this version can
+        /// show); only without a subcommand.
         #[arg(long)]
         json: bool,
         /// The camera, by its id (as `omarchy-broadcast cameras` lists it);
@@ -745,14 +749,34 @@ async fn change_settings(action: &SettingsAction, camera: &str) -> u8 {
             .await
             .map_err(|e| bus::classify(&e, true))?;
         bus::require_settings(revision)?;
+        // A global setting (the video effects) is the same whatever the
+        // camera, and the daemon ignores the camera for it: it is typed and
+        // read back from the global groups, which every tree has (that of
+        // the active camera, or of none), so an absent --camera is no error.
+        let global = match action {
+            SettingsAction::Set { id, .. }
+            | SettingsAction::Reset {
+                setting: Some(id), ..
+            } => obc_ipc::settings::is_global_id(id),
+            SettingsAction::Reset { .. } => false,
+        };
+        let read_camera = if global { "" } else { camera };
         match action {
             SettingsAction::Set { id, value, .. } => {
                 let tree = proxy
-                    .settings_tree(camera)
+                    .settings_tree(read_camera)
                     .await
                     .map_err(bus::classify_ipc)?;
-                let Some(setting) = tree.find(id) else {
-                    return Err(Failure::Rejected(if tree.camera.is_empty() {
+                let found = tree
+                    .groups
+                    .iter()
+                    .filter(|g| !global || g.is_global())
+                    .flat_map(|g| &g.settings)
+                    .find(|s| s.id == *id);
+                let Some(setting) = found else {
+                    return Err(Failure::Rejected(if global {
+                        IpcError::UnknownSetting(format!("there is no setting {id:?}"))
+                    } else if tree.camera.is_empty() {
                         IpcError::Unavailable("no camera is present".into())
                     } else {
                         IpcError::UnknownSetting(format!(
@@ -783,7 +807,7 @@ async fn change_settings(action: &SettingsAction, camera: &str) -> u8 {
             }
         }
         changed.set(true);
-        let (snap, tree) = read_settings(&conn, camera).await?;
+        let (snap, tree) = read_settings(&conn, read_camera).await?;
         Ok(SettingsOutcome::Done(Box::new((snap, tree))))
     })
     .await;

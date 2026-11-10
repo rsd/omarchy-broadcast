@@ -15,6 +15,7 @@ use obc_ipc::Stats;
 use obc_pipeline::control_node::{CaptureFormat, NodeControl};
 use obc_pipeline::controls::CtrlInfo;
 use obc_pipeline::ctrl_events::CtrlEvent;
+use obc_pipeline::effect::{Availability, Feature};
 use obc_pipeline::xu::XuRow;
 
 use crate::camera::Camera;
@@ -137,6 +138,14 @@ pub struct EffectReport {
     /// requested. Its failure never changes what the effect shows: the
     /// output streams on without the stage.
     pub denoise: EffectStatus,
+    /// The relighting stage, apart from the effect, as `denoise` is: `Off`
+    /// unless requested, and its failure never changes what the effect
+    /// shows (the output streams on without the stage).
+    pub relight: EffectStatus,
+    /// The enhance stage of the current ingest: `Off` unless the ingest was
+    /// built with it. Its failure never changes what the effect shows: the
+    /// stage passes the camera frames through.
+    pub enhance: EffectStatus,
     /// Duration of the last load (models and first run), in milliseconds.
     pub load_ms: Option<f64>,
     /// The last load reused the models already loaded (a switch between
@@ -345,6 +354,26 @@ pub trait MediaBackend: Send + 'static {
 
     /// The running session's effect (`None`: no session).
     fn effect_report(&mut self) -> Option<EffectReport>;
+
+    /// Which features of the inference backend are installed, from the
+    /// filesystem alone, with the root they were looked for in; `None` when
+    /// no root can be resolved, so that nothing is known. The root is the
+    /// one the process loaded the SDK from once it has (a second SDK cannot
+    /// be loaded beside it), else the one configured.
+    /// `compute_capability` (the GPU's `(major, minor)`, when known) picks
+    /// the models of that GPU; with `None` a model for any GPU counts. Makes
+    /// no CUDA call and loads no library: safe at idle, while the GPU is
+    /// parked or runtime-suspended (`docs/adr/0017-cuda-checkpoint-parking.md`).
+    fn feature_availability(
+        &mut self,
+        compute_capability: Option<(u32, u32)>,
+    ) -> Option<(PathBuf, Vec<(Feature, Availability)>)>;
+
+    /// The compute capability `(major, minor)` of the GPU the running
+    /// session uses, if the session's GPU side reports it (`None` without a
+    /// session). Called only while a session runs, when the GPU is awake
+    /// anyway: it may ask the driver.
+    fn compute_capability(&mut self) -> Option<(u32, u32)>;
 
     /// Opens `camera`'s node for its controls (for writing as well when
     /// `write`): one open for the whole operation, its enumerations,

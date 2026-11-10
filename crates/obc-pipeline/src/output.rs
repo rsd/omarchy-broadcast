@@ -690,6 +690,14 @@ impl Output {
             .map_or(EffectStatus::Off, |fx| fx.denoise_status())
     }
 
+    /// The state of the effect element's relighting stage, as
+    /// [`Output::denoise_status`].
+    pub fn relight_status(&self) -> EffectStatus {
+        self.effect
+            .as_ref()
+            .map_or(EffectStatus::Off, |fx| fx.relight_status())
+    }
+
     /// The effect element's counters and timings; `None` without one.
     pub fn effect_stats(&self) -> Option<EffectStats> {
         self.effect.as_ref().map(|fx| fx.stats())

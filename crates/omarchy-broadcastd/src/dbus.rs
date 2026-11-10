@@ -225,8 +225,10 @@ impl Server {
 
     /// The settings tree of a camera: `(revision, serial, camera, groups)`.
     /// `options`: `camera` s, an id of `Cameras` (absent or empty:
-    /// `ActiveCamera`); other keys are ignored. With no camera present the
-    /// reply is `(revision, serial, "", [])` (revision 7).
+    /// `ActiveCamera`); other keys are ignored. The camera's groups come
+    /// first, then the global ones (the video effects, revision 8). With no
+    /// camera present the reply is `(revision, serial, "", <the global
+    /// groups>)` (no group at all before revision 8).
     #[zbus(out_args("revision", "serial", "camera", "groups"))]
     async fn get_settings(
         &self,
@@ -241,7 +243,9 @@ impl Server {
 
     /// Sets a camera setting (`options` as for `GetSettings`): written at
     /// once while the camera streams, otherwise stored and applied when it
-    /// next opens. Persists across restarts (revision 7).
+    /// next opens. Persists across restarts (revision 7). A global setting
+    /// (revision 8) is the effect method it stands for (`SetEffect`,
+    /// `SetBlurStrength`, `SetDenoise`), the `camera` option ignored.
     async fn set_setting(
         &self,
         id: String,
@@ -261,7 +265,9 @@ impl Server {
 
     /// Forgets the stored settings in `scope` (`camera`, `group:<id>` or
     /// `setting:<id>`) and puts them back to the camera's defaults: at once
-    /// while it streams, otherwise when it next opens (revision 7).
+    /// while it streams, otherwise when it next opens (revision 7). A
+    /// global group or setting (revision 8) goes back to the
+    /// configuration's value, at once; `camera` never touches those.
     async fn reset_settings(&self, scope: String, options: VariantDict) -> Result<(), IpcError> {
         let camera = camera_option(&options)?;
         self.call(|reply| Command::ResetSettings {

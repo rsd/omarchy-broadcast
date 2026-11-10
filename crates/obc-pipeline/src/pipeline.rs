@@ -64,6 +64,8 @@ pub mod names {
 
     /// Ingest: `videocrop` (crop-to-fill policy only).
     pub const CROP: &str = "crop";
+    /// Ingest: `obcenhance`, the enhance stage (enhance only).
+    pub const ENHANCE: &str = "enhance";
     /// Ingest: `cudaconvertscale` to the canonical frame.
     pub const SCALE: &str = "scale";
     /// Ingest: capsfilter with the canonical caps.

@@ -41,13 +41,16 @@
 //! without `--effect` there is no element), with `--blur-strength` and
 //! `--background`. `--denoise` adds the video noise removal stage
 //! (`docs/adr/0018-video-noise-removal.md`) before the effect, or alone with
-//! `--effect none`. A requested effect, and the denoise stage, are waited
-//! for (ready, or the run fails with the reason) before the warm-up.
+//! `--effect none`. `--relight[=warm|neutral|cool]` adds the relighting
+//! stage after it (light `neutral` without a value), with `--relight-pan`
+//! (degrees) and `--relight-gain`, under the effect or alone with
+//! `--effect none`. A requested effect, and each requested stage, are
+//! waited for (ready, or the run fails with the reason) before the warm-up.
 //! `--effect-switch-every S` cycles none -> blur -> replace (replace only
 //! with `--background`) inside the measurement window, keeping `--denoise`
-//! throughout; the report's `effect` section has the element's counters,
-//! its GPU time per frame, the denoise request, its status and the frames
-//! and GPU time of the stage, the load time, the caps events at the sink
+//! (and `--relight`) throughout; the report's `effect` section has the
+//! element's counters, its GPU time per frame, each stage's request, its
+//! status and the frames and GPU time of the stage, the load time, the caps events at the sink
 //! (one: an effect change never renegotiates) and per switch the time to
 //! ready and the black, processed and passthrough frames.
 //!
@@ -73,6 +76,7 @@ use obc_pipeline::capability::choose_mode;
 use obc_pipeline::clock::{PacerConfig, PhaseLockConfig};
 use obc_pipeline::controls::{CID_EXPOSURE_AUTO_PRIORITY, get_ctrl};
 use obc_pipeline::discovery::{CameraList, resolve_node_path};
+use obc_pipeline::effect::{RelightLight, RelightParams};
 use obc_pipeline::gpu::{GpuInfo, GpuSample, GpuSampler};
 use obc_pipeline::instrument::{Recorder, Samples, SwitchGap, Totals};
 use obc_pipeline::output::{check_sink_range, contract_caps_string};
@@ -178,6 +182,18 @@ struct Args {
     /// `--effect none`). Needs --effect.
     #[arg(long)]
     denoise: bool,
+    /// Add the relighting stage after the denoise stage (alone with
+    /// `--effect none`), with this light: warm | neutral | cool (neutral
+    /// without a value). Needs --effect.
+    #[arg(long, value_name = "LIGHT", num_args = 0..=1, require_equals = true,
+          default_missing_value = "neutral")]
+    relight: Option<RelightLight>,
+    /// The relighting light's direction, in degrees (-180 to 180).
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    relight_pan: f32,
+    /// The relit person's brightness (0.5 to 2, 1 unchanged).
+    #[arg(long, default_value_t = RelightParams::DEFAULT_GAIN)]
+    relight_gain: f32,
     /// Cycle the effect none -> blur -> replace (replace only with
     /// --background) every this many seconds inside the measurement
     /// window. Needs --effect (the starting point of the cycle).
@@ -268,6 +284,12 @@ impl Args {
             background: self.background.clone(),
             fallback: self.effect_on_failure,
             denoise: self.denoise,
+            relight: self.relight.is_some(),
+            relight_params: RelightParams {
+                light: self.relight.unwrap_or_default(),
+                pan_deg: self.relight_pan,
+                gain: self.relight_gain,
+            },
         }
     }
 
@@ -288,6 +310,9 @@ impl Args {
             }
             if self.denoise {
                 bail!("--denoise needs --effect (--effect none for the denoise stage alone)");
+            }
+            if self.relight.is_some() {
+                bail!("--relight needs --effect (--effect none for the relighting stage alone)");
             }
             return Ok(());
         };
@@ -1128,6 +1153,18 @@ struct EffectSection {
     /// frames the backend timed.
     denoise_ms_p50: Option<f64>,
     denoise_ms_p95: Option<f64>,
+    /// `--relight`: the relighting light requested (`None` without the
+    /// stage), its direction and gain.
+    relight: Option<String>,
+    relight_pan_deg: f32,
+    relight_gain: f32,
+    /// Its status and failure reason, its frames and its GPU time, as the
+    /// denoise figures.
+    relight_status: String,
+    relight_reason: Option<String>,
+    frames_relit: u64,
+    relight_ms_p50: Option<f64>,
+    relight_ms_p95: Option<f64>,
     /// Caps events at the sink over the whole run: 1 means no effect change
     /// renegotiated.
     sink_caps_events: u64,
@@ -1151,13 +1188,16 @@ struct EffectSwitchReport {
     /// (the effect ran on without it).
     #[serde(skip_serializing_if = "Option::is_none")]
     denoise_reason: Option<String>,
+    /// The relighting stage's failure reason, as `denoise_reason`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relight_reason: Option<String>,
     /// Frames from this change to the next (or to the end of the window).
     frames_processed: u64,
     frames_black: u64,
     frames_passthrough: u64,
 }
 
-const EFFECT_NOTE: &str = "frames_* are deltas of the element's counters over the window; gpu_ms_* come from the element's window of its last 300 processed frames when the window closed, denoise_ms_* from its window of the backend's denoise stage times over its last 300 denoised frames; load_ms is the backend's load plus its warm-up run, measured by the element";
+const EFFECT_NOTE: &str = "frames_* are deltas of the element's counters over the window; gpu_ms_* come from the element's window of its last 300 processed frames when the window closed, denoise_ms_* and relight_ms_* from its windows of the backend's stage times over its last 300 frames each stage ran on; load_ms is the backend's load plus its warm-up run, measured by the element";
 
 /// The frame counter deltas between two snapshots.
 fn effect_frames(a: &EffectStats, b: &EffectStats) -> (u64, u64, u64) {
@@ -1463,8 +1503,16 @@ fn run(args: &Args) -> Result<()> {
     if let Some(k) = args.effect {
         let s = args.effect_settings(k);
         println!(
-            "effect: {k}{} (strength {:.2}{}, on failure {}){}",
+            "effect: {k}{}{} (strength {:.2}{}, on failure {}){}",
             if s.denoise { " + denoise" } else { "" },
+            if s.relight {
+                format!(
+                    " + relight {} (pan {:.0} deg, gain {:.2})",
+                    s.relight_params.light, s.relight_params.pan_deg, s.relight_params.gain
+                )
+            } else {
+                String::new()
+            },
             s.blur_strength,
             s.background
                 .as_ref()
@@ -2501,16 +2549,17 @@ fn run_session(
                 cycle[0].label()
             ),
         }
-        // A requested effect, and the denoise stage, must be ready (or
+        // A requested effect, and each requested stage, must be ready (or
         // fail) before the warm-up.
         if args
             .effect
-            .is_some_and(|k| k != EffectKind::None || args.denoise)
+            .is_some_and(|k| k != EffectKind::None || args.denoise || args.relight.is_some())
         {
             let settled = |s: &Stream| {
                 let o = s.session.output();
                 !matches!(o.effect_status(), EffectStatus::Loading)
                     && !matches!(o.denoise_status(), EffectStatus::Loading)
+                    && !matches!(o.relight_status(), EffectStatus::Loading)
             };
             match s.wait_until(rec.now_ns() + secs_ns(60.0), settled)? {
                 Wait::Done => {}
@@ -2522,6 +2571,9 @@ fn run_session(
             }
             if let EffectStatus::Failed(reason) = s.session.output().denoise_status() {
                 bail!("the denoise stage failed: {reason}");
+            }
+            if let EffectStatus::Failed(reason) = s.session.output().relight_status() {
+                bail!("the relighting stage failed: {reason}");
             }
         }
         let t_first = rec.now_ns();
@@ -2656,6 +2708,7 @@ fn run_session(
             if effect_pending && let Some(r) = effect_switches.last_mut() {
                 let status = s.session.output().effect_status();
                 let denoise = s.session.output().denoise_status();
+                let relight = s.session.output().relight_status();
                 let (at, _) = effect_open.as_ref().expect("an open switch");
                 let done = match &status {
                     EffectStatus::Ready | EffectStatus::Off => true,
@@ -2668,6 +2721,13 @@ fn run_session(
                     EffectStatus::Loading => false,
                     EffectStatus::Failed(reason) => {
                         r.denoise_reason = Some(reason.clone());
+                        true
+                    }
+                    EffectStatus::Ready | EffectStatus::Off => true,
+                } && match &relight {
+                    EffectStatus::Loading => false,
+                    EffectStatus::Failed(reason) => {
+                        r.relight_reason = Some(reason.clone());
                         true
                     }
                     EffectStatus::Ready | EffectStatus::Off => true,
@@ -2697,6 +2757,7 @@ fn run_session(
                     ready_after_ms: None,
                     reason: None,
                     denoise_reason: None,
+                    relight_reason: None,
                     frames_processed: 0,
                     frames_black: 0,
                     frames_passthrough: 0,
@@ -3235,6 +3296,14 @@ fn effect_section(args: &Args, m: &Measured, sink_caps_events: u64) -> Option<Ef
         frames_denoised: end.frames_denoised.saturating_sub(start.frames_denoised),
         denoise_ms_p50: end.denoise_ms_p50,
         denoise_ms_p95: end.denoise_ms_p95,
+        relight: args.relight.map(|l| l.to_string()),
+        relight_pan_deg: args.relight_pan,
+        relight_gain: args.relight_gain,
+        relight_status: end.relight.as_str().to_string(),
+        relight_reason: end.relight.reason().map(str::to_string),
+        frames_relit: end.frames_relit.saturating_sub(start.frames_relit),
+        relight_ms_p50: end.relight_ms_p50,
+        relight_ms_p95: end.relight_ms_p95,
         sink_caps_events,
         switch_every_s: args.effect_switch_every,
         switches: m.effect_switches.clone(),
@@ -3555,9 +3624,24 @@ fn print_summary(r: &Report) {
                 ms(e.denoise_ms_p95)
             );
         }
+        if let Some(light) = &e.relight {
+            println!(
+                "  relight {light} (pan {:.0} deg, gain {:.2}) {}{}; frames relit {}; stage GPU p50 {} ms p95 {} ms",
+                e.relight_pan_deg,
+                e.relight_gain,
+                e.relight_status,
+                e.relight_reason
+                    .as_deref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default(),
+                e.frames_relit,
+                ms(e.relight_ms_p50),
+                ms(e.relight_ms_p95)
+            );
+        }
         for w in &e.switches {
             println!(
-                "  switch at t+{:.1}s -> {}: {}{}; processed {} black {} passthrough {}",
+                "  switch at t+{:.1}s -> {}: {}{}{}; processed {} black {} passthrough {}",
                 w.at_s,
                 w.to,
                 match (&w.reason, w.ready_after_ms) {
@@ -3568,6 +3652,10 @@ fn print_summary(r: &Report) {
                 w.denoise_reason
                     .as_deref()
                     .map(|r| format!(", denoise dropped ({r})"))
+                    .unwrap_or_default(),
+                w.relight_reason
+                    .as_deref()
+                    .map(|r| format!(", relight dropped ({r})"))
                     .unwrap_or_default(),
                 w.frames_processed,
                 w.frames_black,
@@ -3755,6 +3843,54 @@ mod tests {
         );
         assert!(!a.effect_settings(EffectKind::Blur).denoise);
         let bare = parse(&["--denoise"]).unwrap();
+        assert!(
+            bare.check_effect()
+                .unwrap_err()
+                .to_string()
+                .contains("--effect none")
+        );
+        // --relight takes an optional light, combines with every effect and
+        // denoise, needs one, and its direction and gain are checked.
+        let r = parse(&["--effect", "none", "--relight"]).unwrap();
+        assert!(r.check_effect().is_ok());
+        let s = r.effect_settings(EffectKind::None);
+        assert!(s.relight && !s.denoise);
+        assert_eq!(s.relight_params.light, RelightLight::Neutral);
+        let r = parse(&[
+            "--effect",
+            "blur",
+            "--denoise",
+            "--relight=warm",
+            "--relight-pan",
+            "-90",
+            "--relight-gain",
+            "1.5",
+        ])
+        .unwrap();
+        assert!(r.check_effect().is_ok());
+        let s = r.effect_settings(EffectKind::Replace);
+        assert!(s.relight && s.denoise, "kept by the cycle");
+        assert_eq!(
+            s.relight_params,
+            RelightParams {
+                light: RelightLight::Warm,
+                pan_deg: -90.0,
+                gain: 1.5
+            }
+        );
+        assert!(!a.effect_settings(EffectKind::Blur).relight);
+        assert!(parse(&["--effect", "blur", "--relight=pink"]).is_err());
+        for (flag, v) in [("--relight-pan", "190"), ("--relight-gain", "3")] {
+            let bad = parse(&["--effect", "blur", "--relight", flag, v]).unwrap();
+            assert!(
+                bad.check_effect()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("relight"),
+                "{flag} {v}"
+            );
+        }
+        let bare = parse(&["--relight=cool"]).unwrap();
         assert!(
             bare.check_effect()
                 .unwrap_err()

@@ -42,6 +42,7 @@ impl H {
         let paths = Paths {
             config: dir.path().join("config.toml"),
             state: dir.path().join("state").join("state.toml"),
+            cache: Some(dir.path().join("cache")),
             runtime: Some(dir.path().join("run")),
         };
         fs::create_dir(dir.path().join("run")).unwrap();
@@ -231,6 +232,7 @@ fn disabled_in_the_state_file_starts_off_with_the_writer_running() {
     let paths = Paths {
         config: dir.path().join("none.toml"),
         state,
+        cache: None,
         runtime: None,
     };
     let fake = FakeBackend::default();
@@ -1005,6 +1007,7 @@ fn diff_lists_state_last() {
     let a = preliminary_snapshot(&Paths {
         config: "/nonexistent/c.toml".into(),
         state: "/nonexistent/s.toml".into(),
+        cache: None,
         runtime: None,
     });
     let mut b = a.clone();
@@ -3594,6 +3597,7 @@ fn without_a_runtime_directory_a_lease_fails() {
         let paths = Paths {
             config: dir.path().join("none.toml"),
             state: dir.path().join("state.toml"),
+            cache: None,
             runtime,
         };
         let fake = FakeBackend::default();
@@ -4786,7 +4790,15 @@ fn get_settings_gives_the_tree_from_revision_one_and_no_camera_is_no_error() {
     let groups: Vec<&str> = tree.groups.iter().map(|g| g.label.as_str()).collect();
     assert_eq!(
         groups,
-        ["Image", "White balance", "Exposure", "Focus & zoom"]
+        [
+            "Image",
+            "White balance",
+            "Exposure",
+            "Focus & zoom",
+            "Background effect",
+            "Video",
+            "Lighting"
+        ]
     );
     let exp = tree.find(EXPOSURE_ID).unwrap();
     assert!(!exp.enabled);
@@ -4808,12 +4820,16 @@ fn get_settings_gives_the_tree_from_revision_one_and_no_camera_is_no_error() {
     let queries = h.world().control_queries;
     h.get_settings("", 0).unwrap();
     assert_eq!(h.world().control_queries, queries);
-    // No camera: an empty tree, a structural change.
+    // No camera: only the global groups, a structural change.
     h.world().cameras.clear();
     h.rescan(100);
     let none = h.get_settings("", 100).unwrap();
     assert_eq!((none.revision, none.serial), (2, 2));
-    assert_eq!((none.camera.as_str(), none.groups.len()), ("", 0));
+    let ids: Vec<&str> = none.groups.iter().map(|g| g.id.as_str()).collect();
+    assert_eq!(
+        (none.camera.as_str(), ids),
+        ("", vec!["background", "video", "lighting"])
+    );
     assert_eq!(h.signals(), [(2, 2, Vec::new())]);
 }
 
@@ -6016,4 +6032,1503 @@ fn a_held_write_follows_a_rename_of_the_open_camera() {
     assert_eq!(h.writes(), [w("usb-a", "sharpness", 20)]);
     assert_eq!(h.brio().value(SHARPNESS), 20);
     assert_eq!(h.stored("usb-a").unwrap().values["sharpness"], 20);
+}
+
+// ---- the global settings: the video effects (revision 8) ----
+
+use crate::settings::effects::{
+    BLUR_STRENGTH as BLUR_ID, DENOISE as DENOISE_ID, MODE as EFFECT_ID, REASON_CHOOSE_BLUR,
+    REASON_NOT_INSTALLED,
+};
+use obc_pipeline::effect::{Availability, Feature};
+
+/// Every feature installed but noise removal, missing for `why`.
+fn denoise_missing(why: &str) -> Vec<(Feature, Availability)> {
+    Feature::ALL
+        .into_iter()
+        .map(|f| {
+            let a = if f == Feature::Denoise {
+                Availability::NotInstalled(why.into())
+            } else {
+                Availability::Installed
+            };
+            (f, a)
+        })
+        .collect()
+}
+
+fn all_installed() -> Vec<(Feature, Availability)> {
+    Feature::ALL
+        .into_iter()
+        .map(|f| (f, Availability::Installed))
+        .collect()
+}
+
+/// The ids of the settings each signal carries.
+fn signal_ids(signals: &[(u32, u32, Vec<SettingChange>)]) -> Vec<Vec<String>> {
+    signals
+        .iter()
+        .map(|(_, _, c)| c.iter().map(|c| c.id.clone()).collect())
+        .collect()
+}
+
+/// The state file as saved now (no delayed save flushed).
+fn saved_now(h: &H) -> RuntimeState {
+    let (s, warn) = RuntimeState::load(&h.paths.state);
+    assert_eq!(warn, None);
+    s
+}
+
+#[test]
+fn set_setting_on_a_global_id_is_the_effect_method_it_stands_for() {
+    let mut h = H::new("", |_| {});
+    h.activate(0);
+    h.signals();
+    h.set_setting(EFFECT_ID, s("blur"), 1000).unwrap();
+    assert_eq!(h.snap().effect, "blur");
+    assert_eq!(h.applied(), Some(EffectMode::Blur), "applied live");
+    // Saved at once, as SetEffect saves.
+    assert_eq!(saved_now(&h).effect, Some(EffectMode::Blur));
+    assert_eq!(effect_changes(&h.drain().0), ["effect=blur"]);
+    // One signal: the mode and the strength it enables.
+    let sig = h.signals();
+    assert_eq!(signal_ids(&sig), [vec![EFFECT_ID, BLUR_ID]]);
+    assert_eq!(
+        sig[0].2,
+        [
+            change(EFFECT_ID, Some(s("blur")), true, ""),
+            change(BLUR_ID, Some(SettingValue::Int(50)), false, "")
+        ]
+    );
+    h.set_setting(BLUR_ID, SettingValue::Int(30), 1100).unwrap();
+    assert_eq!(h.snap().blur_strength, 0.3);
+    assert_eq!(saved_now(&h).blur_strength, Some(0.3));
+    assert_eq!(effect_changes(&h.drain().0), ["strength=0.3"]);
+    assert_eq!(
+        h.signals()[0].2,
+        [change(BLUR_ID, Some(SettingValue::Int(30)), true, "")]
+    );
+    assert_eq!(h.world().effect.as_ref().unwrap().blur_strength, 0.3);
+    // Not a device write: no coalescing, every value answered at once.
+    for (i, v) in [31, 32, 33].into_iter().enumerate() {
+        h.set_setting(BLUR_ID, SettingValue::Int(v), 1101 + i as u64)
+            .unwrap();
+    }
+    assert_eq!(h.snap().blur_strength, 0.33);
+    h.set_setting(DENOISE_ID, SettingValue::Bool(true), 1200)
+        .unwrap();
+    assert!(h.snap().denoise);
+    assert_eq!(h.denoise_applied(), Some(true));
+    assert_eq!(saved_now(&h).denoise, Some(true));
+    // The camera option is ignored for a global id.
+    let mut r = h.send_set(
+        "usb-nope",
+        DENOISE_ID,
+        Some(SettingValue::Bool(false)),
+        1300,
+    );
+    assert!(matches!(r.try_recv().unwrap(), Ok(())));
+    assert!(!h.snap().denoise);
+    assert_eq!(h.state(), State::Active, "never restarted");
+    assert_eq!(h.world().session_starts, 1);
+}
+
+#[test]
+fn global_writes_refuse_as_the_methods_do_in_the_order_of_the_checks() {
+    let mut h = H::new("", |_| {});
+    // Replace without an image: the SetEffect error, word for word.
+    let old = h.set_effect("replace", 0).unwrap_err();
+    let new = h.set_setting(EFFECT_ID, s("replace"), 0).unwrap_err();
+    assert!(matches!(new, IpcError::InvalidArgument(_)), "{new:?}");
+    assert_eq!(format!("{new:?}"), format!("{old:?}"));
+    assert_eq!(h.snap().effect, "none");
+    assert!(matches!(
+        h.set_setting("effect.background.nope", s("x"), 0),
+        Err(IpcError::UnknownSetting(_))
+    ));
+    // The strength is disabled until Blur is chosen, whatever the value.
+    for v in [SettingValue::Int(40), SettingValue::Int(500), s("x")] {
+        assert!(matches!(
+            h.set_setting(BLUR_ID, v, 0),
+            Err(IpcError::Disabled(m)) if m == REASON_CHOOSE_BLUR
+        ));
+    }
+    assert!(matches!(
+        h.set_setting(EFFECT_ID, s("Blur"), 0),
+        Err(IpcError::InvalidArgument(_))
+    ));
+    h.set_effect("blur", 0).unwrap();
+    for v in [SettingValue::Int(101), SettingValue::Bool(true)] {
+        assert!(matches!(
+            h.set_setting(BLUR_ID, v, 0),
+            Err(IpcError::InvalidArgument(_))
+        ));
+    }
+    let mut r = h.send_set("", BLUR_ID, None, 0);
+    assert!(matches!(
+        r.try_recv().unwrap(),
+        Err(IpcError::InvalidArgument(_))
+    ));
+    assert_eq!(h.snap().blur_strength, 0.5, "nothing refused changed");
+}
+
+#[test]
+fn a_global_write_clears_a_fault_as_the_methods_do() {
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |_| {});
+    h.activate(0);
+    h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
+    h.tick(1000);
+    assert_eq!(h.state(), State::Error);
+    h.set_setting(DENOISE_ID, SettingValue::Bool(true), 2000)
+        .unwrap();
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().session_starts, 2);
+    assert_eq!(h.snap().error, "");
+}
+
+#[test]
+fn the_effect_methods_and_a_reload_announce_the_global_settings() {
+    let mut h = H::new("", |_| {});
+    h.signals();
+    h.set_effect("blur", 0).unwrap();
+    h.set_strength(0.7, 10).unwrap();
+    h.set_denoise(true, 20).unwrap();
+    let sig = h.signals();
+    assert_eq!(
+        signal_ids(&sig),
+        [vec![EFFECT_ID, BLUR_ID], vec![BLUR_ID], vec![DENOISE_ID]]
+    );
+    assert_eq!(
+        sig[1].2,
+        [change(BLUR_ID, Some(SettingValue::Int(70)), true, "")]
+    );
+    // Consecutive revisions, one per operation, no structural change.
+    let revs: Vec<u32> = sig.iter().map(|(r, _, _)| *r).collect();
+    assert_eq!(revs, [revs[0], revs[0] + 1, revs[0] + 2]);
+    assert!(sig.iter().all(|(_, serial, _)| *serial == sig[0].1));
+    assert_eq!(h.snap().settings_revision, Some(revs[2]));
+    // The same value again: nothing.
+    h.set_denoise(true, 30).unwrap();
+    assert!(h.signals().is_empty());
+    // The background image is outside the tree: no signal.
+    let image = h.image();
+    h.set_image(&image, 40).unwrap();
+    assert!(h.signals().is_empty());
+    // A reload that changes a default is structural.
+    let serial = h.snap().settings_schema_serial.unwrap();
+    h.reload("[effect]\nblur_strength = 0.2\n", 50).unwrap();
+    let sig = h.signals();
+    assert_eq!(sig.len(), 1);
+    assert_eq!(sig[0].1, serial + 1);
+    assert!(sig[0].2.is_empty(), "structural: {sig:?}");
+    assert_eq!(
+        h.setting(BLUR_ID).kind.default_value(),
+        Some(SettingValue::Int(20))
+    );
+}
+
+#[test]
+fn a_global_reset_puts_the_configurations_value_back_and_camera_reset_leaves_it() {
+    let mut h = H::new("[effect]\nblur_strength = 0.4\n", with_brio);
+    h.activate(0);
+    h.set_effect("blur", 0).unwrap();
+    h.set_strength(0.9, 0).unwrap();
+    h.set_denoise(true, 0).unwrap();
+    h.signals();
+    // The camera scope never touches them.
+    h.reset_settings("camera", 1000).unwrap();
+    let st = saved_now(&h);
+    assert_eq!(
+        (st.effect, st.blur_strength, st.denoise),
+        (Some(EffectMode::Blur), Some(0.9), Some(true))
+    );
+    assert!(h.setting(BLUR_ID).stored);
+    h.signals();
+    // One setting.
+    h.reset_settings(&format!("setting:{BLUR_ID}"), 1100)
+        .unwrap();
+    assert_eq!(h.snap().blur_strength, 0.4);
+    assert_eq!(saved_now(&h).blur_strength, None);
+    assert_eq!(
+        h.world().effect.as_ref().unwrap().blur_strength,
+        0.4,
+        "live"
+    );
+    assert_eq!(
+        h.signals()[0].2,
+        [change(BLUR_ID, Some(SettingValue::Int(40)), false, "")]
+    );
+    // A group, with the camera option ignored.
+    let res = h.call(
+        |reply| Command::ResetSettings {
+            camera: "usb-nope".into(),
+            scope: "group:background".into(),
+            reply,
+        },
+        1200,
+    );
+    assert!(res.is_ok(), "{res:?}");
+    assert_eq!(h.snap().effect, "none");
+    assert_eq!(h.applied(), Some(EffectMode::None));
+    assert_eq!(saved_now(&h).effect, None);
+    assert!(h.snap().denoise, "another group");
+    assert_eq!(
+        signal_ids(&h.signals()),
+        [vec![EFFECT_ID, BLUR_ID]],
+        "one signal for the reset"
+    );
+    h.reset_settings("group:video", 1300).unwrap();
+    assert!(!h.snap().denoise);
+    assert_eq!(saved_now(&h).denoise, None);
+    assert_eq!(signal_ids(&h.signals()), [vec![DENOISE_ID]]);
+    // Nothing stored: still fine, nothing announced.
+    h.reset_settings("group:video", 1400).unwrap();
+    assert!(h.signals().is_empty());
+    assert!(matches!(
+        h.reset_settings("setting:effect.video.nope", 1500),
+        Err(IpcError::UnknownSetting(_))
+    ));
+    assert_eq!(h.state(), State::Active);
+}
+
+#[test]
+fn global_settings_are_there_without_a_camera_and_work() {
+    let mut h = H::new("", |w| w.cameras.clear());
+    let tree = h.get_settings("", 0).unwrap();
+    assert_eq!(tree.camera, "");
+    let ids: Vec<&str> = tree.groups.iter().map(|g| g.id.as_str()).collect();
+    assert_eq!(ids, ["background", "video", "lighting"]);
+    h.set_setting(EFFECT_ID, s("blur"), 0).unwrap();
+    assert_eq!(h.snap().effect, "blur");
+    assert_eq!(
+        h.setting(EFFECT_ID).kind.value(),
+        Some(s("blur")),
+        "the tree follows"
+    );
+    h.reset_settings("group:background", 10).unwrap();
+    assert_eq!(h.snap().effect, "none");
+    // A camera setting still needs a camera.
+    assert!(matches!(
+        h.set_setting(SHARP_ID, SettingValue::Int(1), 20),
+        Err(IpcError::NoSuchCamera(_) | IpcError::Unavailable(_))
+    ));
+}
+
+#[test]
+fn noise_removal_not_installed_is_never_requested_and_raises_no_error() {
+    let why = "no Denoise model for this GPU (sm_120) in /opt/fake/maxine/lib/models";
+    let mut h = H::new("[effect]\ndenoise = true\n", |w| {
+        w.features = Some(denoise_missing(why));
+        // Were it requested, it would fail and show in Error.
+        w.denoise_fail = Some(NO_DENOISE.into());
+    });
+    let d = h.setting(DENOISE_ID);
+    assert!(!d.enabled);
+    assert_eq!(d.disabled_reason, REASON_NOT_INSTALLED);
+    assert_eq!(d.kind.value(), Some(SettingValue::Bool(false)), "what runs");
+    assert!(h.snap().denoise, "the request stays");
+    h.activate(0);
+    h.tick(500);
+    h.tick(750);
+    assert_eq!(h.denoise_applied(), Some(false));
+    assert_eq!(h.snap().error, "");
+    assert_no_denoise_text(&mut h);
+    assert!(matches!(
+        h.set_setting(DENOISE_ID, SettingValue::Bool(true), 800),
+        Err(IpcError::Disabled(m)) if m == REASON_NOT_INSTALLED
+    ));
+    // The method still stores the choice; it is not requested either.
+    h.set_denoise(false, 900).unwrap();
+    h.set_denoise(true, 950).unwrap();
+    assert_eq!(saved_now(&h).denoise, Some(true));
+    assert!(h.world().effect_sets.iter().all(|e| !e.denoise));
+    assert_eq!(h.snap().error, "");
+    // Installed (found on a reload): it turns on by itself, and a real
+    // failure is reported as before.
+    h.world().features = Some(all_installed());
+    h.signals();
+    h.reload("[effect]\ndenoise = true\n", 1000).unwrap();
+    let d = h.setting(DENOISE_ID);
+    assert!(d.enabled && d.kind.value() == Some(SettingValue::Bool(true)));
+    assert_eq!(
+        h.signals()[0].2,
+        [change(DENOISE_ID, Some(SettingValue::Bool(true)), true, "")]
+    );
+    assert_eq!(h.denoise_applied(), Some(true));
+    h.tick(1250);
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+}
+
+#[test]
+fn unknown_availability_requests_noise_removal_as_before() {
+    let mut h = H::new("[effect]\ndenoise = true\n", |w| {
+        w.denoise_fail = Some(NO_DENOISE.into())
+    });
+    assert!(h.world().features.is_none());
+    let d = h.setting(DENOISE_ID);
+    assert!(d.enabled && d.kind.value() == Some(SettingValue::Bool(true)));
+    h.activate(0);
+    h.tick(500);
+    assert_eq!(h.denoise_applied(), Some(true));
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+}
+
+#[test]
+fn the_compute_capability_is_read_once_with_a_session_never_at_idle() {
+    let mut h = H::new(
+        "[effect]\ndenoise = true\n[lifecycle]\nidle_grace_s = 0.0\n",
+        |w| {
+            w.features = Some(all_installed());
+            // This GPU's models are missing.
+            w.features_with_cc = Some(denoise_missing("no Denoise model for this GPU (sm_86)"));
+            w.compute_capability = Some((8, 6));
+        },
+    );
+    // At start: the filesystem only, with no compute capability.
+    assert_eq!(h.world().feature_probes, [None]);
+    assert!(h.setting(DENOISE_ID).enabled);
+    h.reload(
+        "[effect]\ndenoise = true\n[lifecycle]\nidle_grace_s = 0.0\n",
+        10,
+    )
+    .unwrap();
+    assert_eq!(h.world().feature_probes, [None, None]);
+    assert_eq!(h.world().cc_reads, 0, "no GPU call at idle");
+    // A session: read once, the features read again for this GPU, and the
+    // stage taken off the running session.
+    h.signals();
+    h.activate(100);
+    assert_eq!(h.world().cc_reads, 1);
+    assert_eq!(h.world().feature_probes.last(), Some(&Some((8, 6))));
+    let d = h.setting(DENOISE_ID);
+    assert_eq!(d.disabled_reason, REASON_NOT_INSTALLED);
+    assert_eq!(h.denoise_applied(), Some(false));
+    h.tick(600);
+    assert_eq!(h.snap().error, "");
+    // Idle again, a reload: the cached value, no GPU call.
+    h.consumers(0, 1000);
+    h.tick(1010);
+    assert_eq!(h.state(), State::Idle);
+    h.reload("[effect]\ndenoise = true\n", 1100).unwrap();
+    assert_eq!(h.world().feature_probes.last(), Some(&Some((8, 6))));
+    // The next session does not ask again.
+    h.activate(2000);
+    let w = h.world();
+    assert_eq!((w.cc_reads, w.cc_reads_idle), (1, 0));
+}
+
+#[test]
+fn a_change_of_what_is_installed_never_requests_an_effect_the_session_started_without() {
+    let mut h = H::new(
+        "[effect]\nmode = \"blur\"\non_failure = \"none\"\ndenoise = true\n",
+        |w| {
+            w.effect_unavailable = Some("libVideoFX.so not found".into());
+            w.features = Some(all_installed());
+            // Learnt once the session is up: this GPU's denoising models
+            // are missing.
+            w.features_with_cc = Some(denoise_missing("no Denoise model for this GPU (sm_86)"));
+            w.compute_capability = Some((8, 6));
+        },
+    );
+    h.activate(0);
+    assert_eq!(h.world().feature_probes.last(), Some(&Some((8, 6))));
+    assert_eq!(h.applied(), Some(EffectMode::None), "still without it");
+    assert_eq!(
+        h.denoise_applied(),
+        Some(false),
+        "only noise removal followed"
+    );
+    assert!(
+        h.world()
+            .effect_sets
+            .iter()
+            .all(|e| e.mode == EffectMode::None),
+        "the rejected effect is never requested: {:?}",
+        h.world().effect_sets
+    );
+    let e = h.snap().error;
+    assert!(
+        e.starts_with("effect blur unavailable: libVideoFX.so not found;"),
+        "{e}"
+    );
+    assert_eq!(h.snap().effect, "blur", "the selection is kept");
+    h.tick(1000);
+    assert_eq!(h.applied(), Some(EffectMode::None));
+    assert_eq!(h.state(), State::Active);
+}
+
+#[test]
+fn a_session_start_that_learns_what_is_installed_sends_one_settings_changed() {
+    let mut h = H::new("[effect]\nmode = \"blur\"\ndenoise = true\n", |w| {
+        w.features = Some(all_installed());
+        w.features_with_cc = Some(denoise_missing("no Denoise model for this GPU (sm_86)"));
+    });
+    h.activate(0);
+    // The effect fails: the camera stops, a fault.
+    h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
+    h.tick(1000);
+    assert_eq!(h.state(), State::Error);
+    // The next session learns the GPU, and with it that noise removal is
+    // not installed for it.
+    h.world().compute_capability = Some((8, 6));
+    h.signals();
+    // One operation: the write, the session it restarts and what that
+    // session learns.
+    h.set_setting(BLUR_ID, SettingValue::Int(30), 2000).unwrap();
+    assert_eq!(h.world().session_starts, 2);
+    assert_eq!(h.setting(DENOISE_ID).disabled_reason, REASON_NOT_INSTALLED);
+    let sig = h.signals();
+    assert_eq!(sig.len(), 1, "one SettingsChanged per operation: {sig:?}");
+    let ids = &signal_ids(&sig)[0];
+    assert!(
+        ids.iter().any(|i| i == BLUR_ID) && ids.iter().any(|i| i == DENOISE_ID),
+        "{ids:?}"
+    );
+    assert_eq!(h.snap().settings_revision, Some(sig[0].0));
+}
+
+#[test]
+fn the_compute_capability_is_cached_across_restarts_and_refreshed_by_a_session() {
+    let mut h = H::new("[effect]\ndenoise = true\n", |w| {
+        w.features = Some(all_installed());
+        w.compute_capability = Some((8, 6));
+    });
+    let cache = h.paths.cache.clone().unwrap();
+    assert_eq!(h.world().feature_probes, [None], "nothing cached yet");
+    h.activate(0);
+    assert_eq!(
+        fs::read_to_string(crate::gpu_cache::path(&cache)).unwrap(),
+        "8.6\n",
+        "learnt and kept"
+    );
+    // A restart probes this GPU's models from the start, with no GPU call.
+    h.restart();
+    {
+        let w = h.world();
+        assert_eq!(w.feature_probes, [Some((8, 6))]);
+        assert_eq!(w.cc_reads, 0);
+    }
+    // A garbled or missing file is unknown, never an error.
+    for content in [Some("not a version\n"), None] {
+        let file = crate::gpu_cache::path(&cache);
+        match content {
+            Some(c) => fs::write(&file, c).unwrap(),
+            None => fs::remove_file(&file).unwrap(),
+        }
+        h.restart();
+        assert_eq!(h.world().feature_probes, [None], "{content:?}");
+        assert_eq!(h.snap().error, "");
+    }
+    // Another GPU since: the session learns it, the cache follows, and the
+    // features are read again for it.
+    fs::write(crate::gpu_cache::path(&cache), "12.0\n").unwrap();
+    h.restart();
+    assert_eq!(h.world().feature_probes, [Some((12, 0))]);
+    {
+        let mut w = h.world();
+        w.features = Some(all_installed());
+        w.features_with_cc = Some(denoise_missing("no Denoise model for this GPU (sm_86)"));
+        w.compute_capability = Some((8, 6));
+    }
+    h.activate(10_000);
+    assert_eq!(h.world().cc_reads, 1);
+    assert_eq!(h.world().feature_probes.last(), Some(&Some((8, 6))));
+    assert_eq!(
+        fs::read_to_string(crate::gpu_cache::path(&cache)).unwrap(),
+        "8.6\n"
+    );
+    assert_eq!(h.setting(DENOISE_ID).disabled_reason, REASON_NOT_INSTALLED);
+    // A cache that cannot be written is only logged.
+    fs::remove_file(crate::gpu_cache::path(&cache)).unwrap();
+    fs::remove_dir(&cache).unwrap();
+    fs::write(&cache, b"not a dir").unwrap();
+    h.restart();
+    h.world().compute_capability = Some((8, 6));
+    h.world().features = Some(all_installed());
+    h.activate(20_000);
+    assert_eq!(h.snap().error, "");
+}
+
+#[test]
+fn a_global_write_the_state_file_cannot_take_fails_as_the_setter_does() {
+    let mut h = H::new("", |_| {});
+    let parent = h.paths.state.parent().unwrap().to_path_buf();
+    fs::write(&parent, b"not a dir").unwrap();
+    let old = h.set_effect("blur", 0).unwrap_err();
+    assert!(matches!(&old, IpcError::Failed(m) if m.contains("will not survive a restart")));
+    let new = h.set_setting(EFFECT_ID, s("none"), 10).unwrap_err();
+    assert_eq!(format!("{new:?}"), format!("{old:?}"));
+    assert_eq!(h.snap().effect, "none", "in force all the same");
+    h.set_effect("blur", 20).unwrap_err();
+    let old = h.set_strength(0.2, 30).unwrap_err();
+    let new = h
+        .set_setting(BLUR_ID, SettingValue::Int(30), 40)
+        .unwrap_err();
+    assert_eq!(format!("{new:?}"), format!("{old:?}"));
+    assert_eq!(h.snap().blur_strength, 0.3);
+    let old = h.set_denoise(true, 50).unwrap_err();
+    let new = h
+        .set_setting(DENOISE_ID, SettingValue::Bool(false), 60)
+        .unwrap_err();
+    assert_eq!(format!("{new:?}"), format!("{old:?}"));
+    assert!(!h.snap().denoise);
+}
+
+// ---- enhancement of a low-resolution camera (the ingest's enhance stage) ----
+
+use crate::settings::effects::{ENHANCE as ENHANCE_ID, REASON_FULL_RESOLUTION};
+use obc_ipc::SettingKind;
+
+/// `c` capturing at 640x360: below the default 1920x1080 output.
+fn small(mut c: Camera) -> Camera {
+    c.mode = "NV12:640x360@30".parse().unwrap();
+    c
+}
+
+const NO_VSR: &str = "NvVFX_Load of video super resolution failed (-2)";
+
+fn enhance_error(reason: &str) -> String {
+    format!("enhance unavailable: {reason}; the video continues without it")
+}
+
+/// Every feature installed but video super resolution, missing for `why`.
+fn vsr_missing(why: &str) -> Vec<(Feature, Availability)> {
+    Feature::ALL
+        .into_iter()
+        .map(|f| {
+            let a = if f == Feature::VideoSuperResolution {
+                Availability::NotInstalled(why.into())
+            } else {
+                Availability::Installed
+            };
+            (f, a)
+        })
+        .collect()
+}
+
+impl H {
+    /// Whether each ingest was built with the enhance stage, in order.
+    fn enhance_requests(&self) -> Vec<bool> {
+        self.world().ingest_enhance.clone()
+    }
+}
+
+/// The states published since the last drain, and the drained changes.
+fn states_in(changes: &[Change]) -> Vec<State> {
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::State(s) => Some(*s),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn enhance_toggled_while_streaming_reopens_the_camera_once_and_keeps_active() {
+    let mut h = H::new("", |w| w.cameras = vec![small(alpha()), beta()]);
+    h.activate(0);
+    assert_eq!(h.enhance_requests(), [false]);
+    h.signals();
+    h.set_setting(ENHANCE_ID, SettingValue::Bool(true), 1000)
+        .unwrap();
+    // One reopen of the same camera, through the switch (the output holds
+    // the last frame): no new session, no state change.
+    assert_eq!(h.world().ingests, ["usb-a", "usb-a"]);
+    assert_eq!(h.enhance_requests(), [false, true]);
+    assert_eq!(h.world().session_starts, 1);
+    assert_eq!(saved_now(&h).enhance, Some(true));
+    let (changes, _) = h.drain();
+    assert_eq!(states_in(&changes), [], "{changes:?}");
+    let sig = std::mem::take(&mut h.settings_notes);
+    assert_eq!(sig.len(), 1, "one SettingsChanged per operation: {sig:?}");
+    assert_eq!(
+        sig[0].2,
+        [change(ENHANCE_ID, Some(SettingValue::Bool(true)), true, "")]
+    );
+    h.tick(1100);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.snap().error, "");
+    // The same value again: nothing reopened.
+    h.set_setting(ENHANCE_ID, SettingValue::Bool(true), 1200)
+        .unwrap();
+    assert_eq!(h.enhance_requests(), [false, true]);
+    // Off: reopened once more, without it.
+    h.set_setting(ENHANCE_ID, SettingValue::Bool(false), 1300)
+        .unwrap();
+    assert_eq!(h.enhance_requests(), [false, true, false]);
+    assert_eq!(h.state(), State::Active);
+    // An effect method that does not touch it reopens nothing.
+    h.set_strength(0.3, 1400).unwrap();
+    assert_eq!(h.enhance_requests(), [false, true, false]);
+    // A reset of the video group puts the configuration's value back
+    // (off): nothing to reopen.
+    h.reset_settings("group:video", 1500).unwrap();
+    assert_eq!(saved_now(&h).enhance, None);
+    assert_eq!(h.enhance_requests(), [false, true, false]);
+}
+
+#[test]
+fn enhance_set_while_the_camera_is_closed_applies_at_the_next_open() {
+    let mut h = H::new("", |w| w.cameras = vec![small(alpha())]);
+    h.set_setting(ENHANCE_ID, SettingValue::Bool(true), 0)
+        .unwrap();
+    {
+        let w = h.world();
+        assert!(w.ingests.is_empty());
+        assert_eq!(w.session_starts, 0);
+        // Nothing of the GPU at idle.
+        assert!(w.gpu_log.is_empty(), "{:?}", w.gpu_log);
+        assert_eq!((w.cc_reads, w.cc_reads_idle), (0, 0));
+    }
+    assert_eq!(h.persisted().enhance, Some(true));
+    h.activate(100);
+    assert_eq!(h.enhance_requests(), [true]);
+    // The configuration's key turns it on as well, and survives a restart
+    // with the state file's choice over it.
+    let mut h = H::new("[effect]\nenhance = true\n", |w| {
+        w.cameras = vec![small(alpha())]
+    });
+    assert_eq!(
+        h.setting(ENHANCE_ID).kind,
+        SettingKind::Bool {
+            default: true,
+            value: true
+        }
+    );
+    h.set_setting(ENHANCE_ID, SettingValue::Bool(false), 0)
+        .unwrap();
+    h.restart();
+    h.world().cameras = vec![small(alpha())];
+    h.rescan(10);
+    h.activate(100);
+    assert_eq!(h.enhance_requests(), [false]);
+}
+
+#[test]
+fn enhance_not_installed_is_never_requested_and_raises_no_error() {
+    let why = "no VideoSuperRes model for this GPU in /opt/fake/maxine/lib/models";
+    let mut h = H::new("[effect]\nenhance = true\n", |w| {
+        w.cameras = vec![small(alpha())];
+        w.features = Some(vsr_missing(why));
+        // Were it requested, it would fail and show in Error.
+        w.enhance_fail = Some(NO_VSR.into());
+    });
+    let e = h.setting(ENHANCE_ID);
+    assert!(!e.enabled);
+    assert_eq!(e.disabled_reason, REASON_NOT_INSTALLED);
+    assert_eq!(e.kind.value(), Some(SettingValue::Bool(false)), "what runs");
+    h.activate(0);
+    h.tick(500);
+    assert_eq!(h.enhance_requests(), [false]);
+    assert_eq!(h.snap().error, "");
+    assert!(matches!(
+        h.set_setting(ENHANCE_ID, SettingValue::Bool(true), 600),
+        Err(IpcError::Disabled(m)) if m == REASON_NOT_INSTALLED
+    ));
+    // Installed (found on a reload): the camera is reopened with it, and a
+    // real failure is reported.
+    h.world().features = Some(all_installed());
+    h.signals();
+    h.reload("[effect]\nenhance = true\n", 1000).unwrap();
+    assert_eq!(h.enhance_requests(), [false, true]);
+    assert_eq!(
+        h.signals()[0].2,
+        [change(
+            ENHANCE_ID,
+            Some(SettingValue::Bool(true)),
+            false,
+            ""
+        )]
+    );
+    h.tick(1250);
+    assert_eq!(h.snap().error, enhance_error(NO_VSR));
+    assert_eq!(h.state(), State::Active);
+}
+
+#[test]
+fn enhance_is_not_requested_for_a_camera_at_full_resolution_and_follows_a_switch() {
+    // Alpha captures at the output's size, beta below it.
+    let mut h = H::new("[effect]\nenhance = true\n", |w| {
+        w.cameras = vec![alpha(), small(beta())]
+    });
+    let e = h.setting(ENHANCE_ID);
+    assert!(!e.enabled);
+    assert_eq!(e.disabled_reason, REASON_FULL_RESOLUTION);
+    assert_eq!(e.kind.value(), Some(SettingValue::Bool(false)));
+    assert!(matches!(
+        h.set_setting(ENHANCE_ID, SettingValue::Bool(false), 0),
+        Err(IpcError::Disabled(m)) if m == REASON_FULL_RESOLUTION
+    ));
+    h.activate(0);
+    assert_eq!(h.enhance_requests(), [false]);
+    // A switch to the small camera: requested, and the setting enabled
+    // (in the switch's one signal, structural: another camera).
+    h.signals();
+    h.call(|r| Command::SelectCamera("usb-b".into(), r), 1000)
+        .unwrap();
+    assert_eq!(h.enhance_requests(), [false, true]);
+    assert_eq!(h.signals().len(), 1);
+    let e = h.setting(ENHANCE_ID);
+    assert!(e.enabled && e.disabled_reason.is_empty());
+    assert_eq!(e.kind.value(), Some(SettingValue::Bool(true)));
+    assert_eq!(h.state(), State::Active);
+    // Closed, the selection back on alpha: greyed again.
+    h.consumers(0, 2000);
+    h.tick(10_000);
+    assert_eq!(h.state(), State::Idle);
+    h.signals();
+    h.call(|r| Command::SelectCamera("usb-a".into(), r), 10_100)
+        .unwrap();
+    assert_eq!(h.signals().len(), 1);
+    let e = h.setting(ENHANCE_ID);
+    assert!(!e.enabled);
+    assert_eq!(e.disabled_reason, REASON_FULL_RESOLUTION);
+    assert_eq!(e.kind.value(), Some(SettingValue::Bool(false)));
+    // No camera: enabled, it applies when one is used.
+    h.world().cameras.clear();
+    h.rescan(10_200);
+    let e = h.setting(ENHANCE_ID);
+    assert!(e.enabled && e.disabled_reason.is_empty());
+    assert_eq!(e.kind.value(), Some(SettingValue::Bool(true)));
+}
+
+#[test]
+fn an_enhance_failure_keeps_streaming_and_shows_in_error_after_noise_removal() {
+    let config = "[effect]\nenhance = true\ndenoise = true\non_failure = \"black\"\n";
+    let mut h = H::new(config, |w| {
+        w.cameras = vec![small(alpha())];
+        w.enhance_fail = Some(NO_VSR.into());
+        w.denoise_fail = Some(NO_DENOISE.into());
+    });
+    h.activate(0);
+    h.tick(500);
+    assert_eq!(h.state(), State::Active, "never a fault");
+    assert!(h.world().session.is_some());
+    // Noise removal's failure comes first.
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    // Noise removal recovers: the enhance failure shows.
+    h.world().denoise_status = EffectStatus::Ready;
+    h.drain();
+    h.tick(750);
+    assert_eq!(h.snap().error, enhance_error(NO_VSR));
+    // Reported once, not at every poll; no state moved.
+    h.tick(1000);
+    h.tick(1250);
+    let (changes, _) = h.drain();
+    let errors: Vec<_> = changes
+        .iter()
+        .filter(|c| matches!(c, Change::Error(_)))
+        .collect();
+    assert_eq!(errors.len(), 1, "{changes:?}");
+    assert_eq!(states_in(&changes), []);
+    // A new noise removal failure takes over, and gives the place back.
+    h.world().denoise_status = EffectStatus::Failed(NO_DENOISE.into());
+    h.tick(1500);
+    h.tick(1750);
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    h.world().denoise_status = EffectStatus::Ready;
+    h.tick(2000);
+    assert_eq!(h.snap().error, enhance_error(NO_VSR));
+    // A reason with control characters and of any length is made safe and
+    // bounded.
+    let ugly = format!("bad\u{1b}[31m\n{}", "x".repeat(2000));
+    let text = enhance_failure_text(&ugly);
+    assert!(!text.chars().any(char::is_control), "{text:?}");
+    assert!(text.len() <= ENHANCE_REASON_MAX + 80, "{}", text.len());
+}
+
+#[test]
+fn an_enhance_failure_is_cleared_by_the_setting_a_reload_a_switch_and_the_end() {
+    let config = "[effect]\nenhance = true\n\
+                  [lifecycle]\nidle_grace_s = 0.0\nstart_debounce_ms = 0\n";
+    let mut h = H::new(config, |w| {
+        w.cameras = vec![small(alpha()), small(beta())];
+        w.enhance_fail = Some(NO_VSR.into());
+    });
+    h.activate(0);
+    h.tick(500);
+    assert_eq!(h.snap().error, enhance_error(NO_VSR));
+    // A write of the setting retries it (a reopen); fixed meanwhile, the
+    // error is gone.
+    h.world().enhance_fail = None;
+    h.set_setting(ENHANCE_ID, SettingValue::Bool(true), 1000)
+        .unwrap();
+    assert_eq!(h.enhance_requests(), [true, true]);
+    h.tick(1250);
+    assert_eq!(h.snap().error, "");
+    // Switched off: reopened without it.
+    h.set_setting(ENHANCE_ID, SettingValue::Bool(false), 1500)
+        .unwrap();
+    assert_eq!(h.enhance_requests(), [true, true, false]);
+    // Failing again, then switched off: cleared.
+    h.world().enhance_fail = Some(NO_VSR.into());
+    h.set_setting(ENHANCE_ID, SettingValue::Bool(true), 1600)
+        .unwrap();
+    h.tick(1750);
+    assert_eq!(h.snap().error, enhance_error(NO_VSR));
+    h.set_setting(ENHANCE_ID, SettingValue::Bool(false), 2000)
+        .unwrap();
+    assert_eq!(h.enhance_requests().last(), Some(&false));
+    assert_eq!(h.snap().error, "");
+    h.tick(2250);
+    assert_eq!(h.snap().error, "");
+    // A reload retries it.
+    h.set_setting(ENHANCE_ID, SettingValue::Bool(true), 2500)
+        .unwrap();
+    h.tick(2750);
+    assert_eq!(h.snap().error, enhance_error(NO_VSR));
+    let n = h.enhance_requests().len();
+    h.world().enhance_fail = None;
+    h.reload(config, 3000).unwrap();
+    assert_eq!(h.enhance_requests().len(), n + 1, "retried");
+    h.tick(3250);
+    assert_eq!(h.snap().error, "");
+    // A camera switch: a new ingest, its own status.
+    h.world().enhance_fail = Some(NO_VSR.into());
+    h.set_setting(ENHANCE_ID, SettingValue::Bool(false), 3400)
+        .unwrap();
+    h.set_setting(ENHANCE_ID, SettingValue::Bool(true), 3500)
+        .unwrap();
+    h.tick(3750);
+    assert_eq!(h.snap().error, enhance_error(NO_VSR));
+    h.world().enhance_fail = None;
+    h.call(|r| Command::SelectCamera("usb-b".into(), r), 4000)
+        .unwrap();
+    h.tick(4250);
+    assert_eq!(h.snap().error, "");
+    // The end of the session.
+    h.world().enhance_fail = Some(NO_VSR.into());
+    h.call(|r| Command::SelectCamera("usb-a".into(), r), 4500)
+        .unwrap();
+    h.tick(4750);
+    assert_eq!(h.snap().error, enhance_error(NO_VSR));
+    h.consumers(0, 5000);
+    h.tick(5100);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.snap().error, "");
+    assert_eq!(h.ctrl.enhance_failure, None);
+}
+
+/// A camera whose frames the stage cannot read once uploaded (NV21 goes to
+/// the GPU as it comes, and `obcenhance` reads NV12 and I420): greyed with
+/// its own reason, and its ingest built without the stage.
+#[test]
+fn enhance_is_not_requested_for_a_camera_in_a_format_it_cannot_read() {
+    use crate::settings::effects::REASON_FORMAT;
+    let mut nv21 = alpha();
+    nv21.mode = "NV21:640x360@30".parse().unwrap();
+    let mut h = H::new("[effect]\nenhance = true\n", |w| {
+        w.cameras = vec![nv21, small(beta())]
+    });
+    let e = h.setting(ENHANCE_ID);
+    assert!(!e.enabled);
+    assert_eq!(e.disabled_reason, REASON_FORMAT);
+    assert!(REASON_FORMAT.len() <= 96);
+    assert_eq!(e.kind.value(), Some(SettingValue::Bool(false)));
+    assert!(matches!(
+        h.set_setting(ENHANCE_ID, SettingValue::Bool(true), 0),
+        Err(IpcError::Disabled(m)) if m == REASON_FORMAT
+    ));
+    h.activate(0);
+    assert_eq!(h.enhance_requests(), [false]);
+    assert_eq!(h.state(), State::Active);
+    // The NV12 camera: requested.
+    h.call(|r| Command::SelectCamera("usb-b".into(), r), 1000)
+        .unwrap();
+    assert_eq!(h.enhance_requests(), [false, true]);
+    // An MJPEG camera is decoded to I420 on the CPU: it applies.
+    let mut h = H::new("[effect]\nenhance = true\n", |w| {
+        let mut c = alpha();
+        c.mode = "MJPEG:640x360@30".parse().unwrap();
+        w.cameras = vec![c]
+    });
+    assert!(h.setting(ENHANCE_ID).enabled);
+    h.activate(0);
+    assert_eq!(h.enhance_requests(), [true]);
+}
+
+/// 1280x720 into the 1920x1080 output still pays (under half the pixels);
+/// 1600x900 does not.
+#[test]
+fn enhance_applies_only_where_it_pays() {
+    for (mode, applies) in [("NV12:1280x720@30", true), ("NV12:1600x900@30", false)] {
+        let mut h = H::new("[effect]\nenhance = true\n", |w| {
+            let mut c = alpha();
+            c.mode = mode.parse().unwrap();
+            w.cameras = vec![c]
+        });
+        let e = h.setting(ENHANCE_ID);
+        assert_eq!(e.enabled, applies, "{mode}");
+        if !applies {
+            assert_eq!(e.disabled_reason, REASON_FULL_RESOLUTION, "{mode}");
+        }
+    }
+}
+
+/// A noise removal or enhancement failure shows in `Error` only when no
+/// higher cause holds (the writer missing, a fault, an effect failure,
+/// noise removal over enhancement), and over a damaged state file.
+#[test]
+fn stage_failures_never_overwrite_a_higher_cause_in_error() {
+    let failed = |r: &str| EffectStatus::Failed(r.into());
+    let fresh = || {
+        let mut h = H::new("", |w| w.cameras = vec![small(alpha())]);
+        h.ctrl.error.clear();
+        h
+    };
+    type Raise = fn(&mut Controller<FakeBackend>);
+    let higher: [(&str, Raise); 3] = [
+        ("writer", |c| {
+            c.writer = None;
+            c.writer_error = Some("no loopback device".into());
+        }),
+        ("fault", |c| c.fault = Some("the output failed".into())),
+        ("effect", |c| {
+            c.effect_failure = Some("effect unavailable: x".into())
+        }),
+    ];
+    for (what, raise) in higher {
+        let mut h = fresh();
+        raise(&mut h.ctrl);
+        let top = h.ctrl.standing_error();
+        assert!(!top.is_empty(), "{what}");
+        h.ctrl.error = top.clone();
+        h.ctrl
+            .poll_denoise(failed("no denoiser"), &EffectStatus::Off);
+        assert_eq!(h.ctrl.error, top, "noise removal under {what}");
+        h.ctrl.poll_enhance(failed("no vsr"));
+        assert_eq!(h.ctrl.error, top, "enhance under {what}");
+        assert!(h.ctrl.denoise_failure.is_some() && h.ctrl.enhance_failure.is_some());
+    }
+    // Noise removal over enhancement, either order.
+    let mut h = fresh();
+    h.ctrl
+        .poll_denoise(failed("no denoiser"), &EffectStatus::Off);
+    h.ctrl.poll_enhance(failed("no vsr"));
+    assert_eq!(h.ctrl.error, denoise_failure_text("no denoiser"));
+    let mut h = fresh();
+    h.ctrl.poll_enhance(failed("no vsr"));
+    assert_eq!(h.ctrl.error, enhance_error("no vsr"));
+    h.ctrl
+        .poll_denoise(failed("no denoiser"), &EffectStatus::Off);
+    assert_eq!(h.ctrl.error, denoise_failure_text("no denoiser"));
+    // Over a damaged state file, which is lower.
+    let mut h = fresh();
+    h.ctrl.state_damaged = Some("state.toml is damaged".into());
+    h.ctrl.error = "state.toml is damaged".into();
+    h.ctrl.poll_enhance(failed("no vsr"));
+    assert_eq!(h.ctrl.error, enhance_error("no vsr"));
+}
+
+/// Toggling enhancement before the camera delivers reopens it each time,
+/// but the start timeout runs from the first open: the camera still fails
+/// over at 10 s.
+#[test]
+fn reopens_before_the_first_frame_keep_the_start_deadline() {
+    let mut h = H::new("", |w| {
+        w.frames = false;
+        w.cameras = vec![small(alpha()), small(beta())];
+    });
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Starting);
+    assert_eq!(h.world().ingests, ["usb-a"]);
+    // A toggle every 3 s, each a reopen of alpha.
+    let mut on = true;
+    for t in [3_000, 6_000, 9_000] {
+        h.set_setting(ENHANCE_ID, SettingValue::Bool(on), t)
+            .unwrap();
+        on = !on;
+        h.tick(t + 100);
+    }
+    assert_eq!(h.world().ingests, ["usb-a"; 4], "three reopens");
+    assert_eq!(h.enhance_requests(), [false, true, false, true]);
+    h.tick(10_299);
+    assert_eq!(h.world().ingests.len(), 4, "not yet");
+    h.tick(10_300);
+    assert_eq!(
+        h.world().ingests.last().map(String::as_str),
+        Some("usb-b"),
+        "alpha failed over at its first deadline"
+    );
+}
+
+// ---- relighting (the `lighting` group) ----
+
+use crate::settings::effects::{
+    BRIGHTNESS as BRIGHTNESS_ID, DIRECTION as DIRECTION_ID, LIGHT as LIGHT_ID,
+    REASON_TURN_ON_RELIGHT, RELIGHT as RELIGHT_ID,
+};
+
+const NO_RELIGHT: &str = "NvVFX_Load of relighting failed (-2)";
+
+fn relight_error(reason: &str) -> String {
+    format!("relighting unavailable: {reason}; the video continues without it")
+}
+
+/// Every feature installed but `missing`, missing for `why`.
+fn feature_missing(missing: Feature, why: &str) -> Vec<(Feature, Availability)> {
+    Feature::ALL
+        .into_iter()
+        .map(|f| {
+            let a = if f == missing {
+                Availability::NotInstalled(why.into())
+            } else {
+                Availability::Installed
+            };
+            (f, a)
+        })
+        .collect()
+}
+
+impl H {
+    /// What the running session was given of relighting: on, the light,
+    /// the direction and the brightness.
+    fn relight_applied(&self) -> Option<(bool, RelightLight, i32, u32)> {
+        self.world().effect.as_ref().map(|e| {
+            (
+                e.relight,
+                e.relight_light,
+                e.relight_direction,
+                e.relight_brightness,
+            )
+        })
+    }
+}
+
+#[test]
+fn each_relighting_setting_is_saved_applied_live_and_announced_once() {
+    let mut h = H::new("", |w| w.features = Some(all_installed()));
+    h.activate(0);
+    h.signals();
+    assert_eq!(
+        h.relight_applied(),
+        Some((false, RelightLight::Neutral, 0, 100))
+    );
+    // The dependents are greyed until relighting is on.
+    let d = h.setting(DIRECTION_ID);
+    assert!(!d.enabled);
+    assert_eq!(d.disabled_reason, REASON_TURN_ON_RELIGHT);
+    assert!(matches!(
+        h.set_setting(DIRECTION_ID, SettingValue::Int(-30), 500),
+        Err(IpcError::Disabled(m)) if m == REASON_TURN_ON_RELIGHT
+    ));
+    let sets = h.world().effect_sets.len();
+    // On: saved, applied, and one signal with the three it enables.
+    h.set_setting(RELIGHT_ID, SettingValue::Bool(true), 1000)
+        .unwrap();
+    assert_eq!(saved_now(&h).relight, Some(true));
+    assert_eq!(
+        h.relight_applied(),
+        Some((true, RelightLight::Neutral, 0, 100))
+    );
+    let sig = h.signals();
+    assert_eq!(
+        sig[0].2,
+        [
+            change(RELIGHT_ID, Some(SettingValue::Bool(true)), true, ""),
+            change(LIGHT_ID, Some(s("neutral")), false, ""),
+            change(DIRECTION_ID, Some(SettingValue::Int(0)), false, ""),
+            change(BRIGHTNESS_ID, Some(SettingValue::Int(100)), false, ""),
+        ]
+    );
+    assert_eq!(sig.len(), 1);
+    h.tick(1100);
+    assert_eq!(h.world().relight_status, EffectStatus::Ready);
+    // The light, the direction (negative) and the brightness: each one
+    // set_effect, one signal, saved at once.
+    h.set_setting(LIGHT_ID, s("warm"), 1200).unwrap();
+    assert_eq!(saved_now(&h).relight_light, Some(RelightLight::Warm));
+    assert_eq!(signal_ids(&h.signals()), [vec![LIGHT_ID]]);
+    h.set_setting(DIRECTION_ID, SettingValue::Int(-30), 1300)
+        .unwrap();
+    assert_eq!(saved_now(&h).relight_direction, Some(-30));
+    assert_eq!(signal_ids(&h.signals()), [vec![DIRECTION_ID]]);
+    h.set_setting(BRIGHTNESS_ID, SettingValue::Int(150), 1400)
+        .unwrap();
+    assert_eq!(saved_now(&h).relight_brightness, Some(150));
+    assert_eq!(
+        h.signals()[0].2,
+        [change(
+            BRIGHTNESS_ID,
+            Some(SettingValue::Int(150)),
+            true,
+            ""
+        )]
+    );
+    assert_eq!(
+        h.relight_applied(),
+        Some((true, RelightLight::Warm, -30, 150))
+    );
+    assert_eq!(h.world().effect_sets.len(), sets + 4);
+    // A slider's stream: every value answered at once, no coalescing.
+    for (i, v) in [-25, -20, -15].into_iter().enumerate() {
+        h.set_setting(DIRECTION_ID, SettingValue::Int(v), 1500 + i as u64)
+            .unwrap();
+    }
+    assert_eq!(h.relight_applied().unwrap().2, -15);
+    assert_eq!(h.world().effect_sets.len(), sets + 7);
+    assert_eq!(h.signals().len(), 3, "one per value");
+    // A refused value changes nothing.
+    assert!(matches!(
+        h.set_setting(DIRECTION_ID, SettingValue::Int(-32), 1600),
+        Err(IpcError::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        h.set_setting(BRIGHTNESS_ID, SettingValue::Int(250), 1600),
+        Err(IpcError::InvalidArgument(_))
+    ));
+    assert_eq!(h.relight_applied().unwrap().2, -15);
+    assert_eq!(h.state(), State::Active, "never restarted");
+    assert_eq!(h.world().session_starts, 1);
+    assert_eq!(h.snap().error, "");
+    // Off: the three greyed again, in one signal.
+    h.set_setting(RELIGHT_ID, SettingValue::Bool(false), 1700)
+        .unwrap();
+    assert!(!h.relight_applied().unwrap().0);
+    assert_eq!(
+        signal_ids(&h.signals()),
+        [vec![RELIGHT_ID, LIGHT_ID, DIRECTION_ID, BRIGHTNESS_ID]]
+    );
+    // Survives a restart.
+    h.restart();
+    assert_eq!(
+        h.setting(DIRECTION_ID).kind.value(),
+        Some(SettingValue::Int(-15))
+    );
+    let st = saved_now(&h);
+    assert_eq!(
+        (
+            st.relight,
+            st.relight_light,
+            st.relight_direction,
+            st.relight_brightness
+        ),
+        (Some(false), Some(RelightLight::Warm), Some(-15), Some(150))
+    );
+}
+
+/// A new light and a stage toggled on or off are each one change of the
+/// running session's effect, on the session as it runs: one `set_effect`
+/// that differs from the previous one in that setting alone (so the element
+/// switches that stage alone: `gst-obc`'s
+/// `gpu_a_stage_change_loads_or_releases_that_stage_alone`), no restart, no
+/// camera reopen, and the other stage left as it is.
+#[test]
+fn a_new_light_or_a_stage_toggle_is_one_change_on_the_running_session() {
+    let mut h = H::new("[effect]\ndenoise = true\nrelight = true\n", |w| {
+        w.features = Some(all_installed())
+    });
+    h.activate(0);
+    h.tick(100);
+    assert_eq!(h.world().denoise_status, EffectStatus::Ready);
+    assert_eq!(h.world().relight_status, EffectStatus::Ready);
+    let ingests = h.world().ingests.clone();
+    let mut t = 200;
+    type Change = fn(&mut EffectConfig);
+    let steps: [(&str, SettingValue, Change); 7] = [
+        (LIGHT_ID, s("warm"), |e| {
+            e.relight_light = RelightLight::Warm
+        }),
+        (LIGHT_ID, s("cool"), |e| {
+            e.relight_light = RelightLight::Cool
+        }),
+        (DENOISE_ID, SettingValue::Bool(false), |e| e.denoise = false),
+        (DENOISE_ID, SettingValue::Bool(true), |e| e.denoise = true),
+        (RELIGHT_ID, SettingValue::Bool(false), |e| e.relight = false),
+        (RELIGHT_ID, SettingValue::Bool(true), |e| e.relight = true),
+        (LIGHT_ID, s("neutral"), |e| {
+            e.relight_light = RelightLight::Neutral
+        }),
+    ];
+    for (id, value, change) in steps {
+        let label = format!("{id} = {value:?}");
+        let sets = h.world().effect_sets.len();
+        let mut want = h.world().effect.clone().unwrap();
+        change(&mut want);
+        h.set_setting(id, value, t).unwrap();
+        {
+            let w = h.world();
+            assert_eq!(w.effect_sets.len(), sets + 1, "{label}: one change");
+            assert_eq!(
+                w.effect_sets.last(),
+                Some(&want),
+                "{label}: that setting alone"
+            );
+        }
+        h.tick(t + 50);
+        let w = h.world();
+        assert_eq!(w.session_starts, 1, "{label}: never restarted");
+        assert_eq!(w.ingests, ingests, "{label}: the camera not reopened");
+        assert_eq!(
+            w.effect_sets.len(),
+            sets + 1,
+            "{label}: nothing given again"
+        );
+        drop(w);
+        assert_eq!(h.state(), State::Active, "{label}");
+        t += 100;
+    }
+    assert_eq!(h.snap().error, "");
+}
+
+#[test]
+fn relighting_settings_at_idle_are_only_stored() {
+    let mut h = H::new("", |w| w.features = Some(all_installed()));
+    h.signals();
+    h.set_setting(RELIGHT_ID, SettingValue::Bool(true), 0)
+        .unwrap();
+    h.set_setting(LIGHT_ID, s("cool"), 10).unwrap();
+    h.set_setting(DIRECTION_ID, SettingValue::Int(45), 20)
+        .unwrap();
+    h.set_setting(BRIGHTNESS_ID, SettingValue::Int(75), 30)
+        .unwrap();
+    assert_eq!(h.signals().len(), 4, "one per operation");
+    {
+        let w = h.world();
+        assert!(w.session.is_none() && w.effect_sets.is_empty());
+        assert_eq!((w.session_starts, w.cc_reads), (0, 0), "nothing at idle");
+    }
+    let st = saved_now(&h);
+    assert_eq!(
+        (
+            st.relight,
+            st.relight_light,
+            st.relight_direction,
+            st.relight_brightness
+        ),
+        (Some(true), Some(RelightLight::Cool), Some(45), Some(75))
+    );
+    // The next session starts with them.
+    h.activate(100);
+    assert_eq!(
+        h.relight_applied(),
+        Some((true, RelightLight::Cool, 45, 75))
+    );
+}
+
+#[test]
+fn relighting_not_installed_is_never_requested_and_raises_no_error() {
+    for missing in [Feature::Relighting, Feature::GreenScreen] {
+        let mut h = H::new("[effect]\nrelight = true\n", |w| {
+            w.features = Some(feature_missing(missing, "no model for this GPU"));
+            // Were it requested, it would fail and show in Error.
+            w.relight_fail = Some(NO_RELIGHT.into());
+        });
+        let r = h.setting(RELIGHT_ID);
+        assert!(!r.enabled, "{missing}");
+        assert_eq!(r.disabled_reason, REASON_NOT_INSTALLED);
+        assert_eq!(r.kind.value(), Some(SettingValue::Bool(false)), "what runs");
+        for id in [LIGHT_ID, DIRECTION_ID, BRIGHTNESS_ID] {
+            assert_eq!(h.setting(id).disabled_reason, REASON_NOT_INSTALLED, "{id}");
+        }
+        h.activate(0);
+        h.tick(500);
+        h.tick(750);
+        assert_eq!(h.relight_applied().map(|r| r.0), Some(false), "{missing}");
+        assert_eq!(h.world().relight_status, EffectStatus::Off);
+        assert_eq!(h.snap().error, "", "{missing}");
+        assert!(matches!(
+            h.set_setting(RELIGHT_ID, SettingValue::Bool(true), 800),
+            Err(IpcError::Disabled(m)) if m == REASON_NOT_INSTALLED
+        ));
+        // Installed (found on a reload): it turns on by itself, and a real
+        // failure is reported.
+        h.world().features = Some(all_installed());
+        h.signals();
+        h.reload("[effect]\nrelight = true\n", 1000).unwrap();
+        assert_eq!(
+            signal_ids(&h.signals()),
+            [vec![RELIGHT_ID, LIGHT_ID, DIRECTION_ID, BRIGHTNESS_ID]]
+        );
+        assert_eq!(h.relight_applied().map(|r| r.0), Some(true));
+        h.tick(1250);
+        assert_eq!(h.snap().error, relight_error(NO_RELIGHT));
+        assert_eq!(h.state(), State::Active);
+    }
+}
+
+#[test]
+fn a_relighting_failure_keeps_streaming_and_is_cleared_like_noise_removals() {
+    let config = "[effect]\nrelight = true\n\
+                  [lifecycle]\nidle_grace_s = 0.0\nstart_debounce_ms = 0\n";
+    for on_failure in ["black", "none"] {
+        let config = config.replace(
+            "relight = true\n",
+            &format!("relight = true\non_failure = \"{on_failure}\"\n"),
+        );
+        let mut h = H::new(&config, |w| w.relight_fail = Some(NO_RELIGHT.into()));
+        h.activate(0);
+        h.tick(500);
+        assert_eq!(h.state(), State::Active, "{on_failure}");
+        assert_eq!(h.snap().error, relight_error(NO_RELIGHT), "{on_failure}");
+        // Ready again: gone.
+        h.world().relight_status = EffectStatus::Ready;
+        h.tick(1000);
+        assert_eq!(h.snap().error, "");
+        assert_eq!(h.ctrl.relight_failure, None);
+    }
+    // A write of a relighting setting retries it (the value in force too).
+    let mut h = H::new(config, |w| w.relight_fail = Some(NO_RELIGHT.into()));
+    h.activate(0);
+    h.tick(500);
+    assert_eq!(h.snap().error, relight_error(NO_RELIGHT));
+    let sets = h.world().effect_sets.len();
+    h.set_setting(RELIGHT_ID, SettingValue::Bool(true), 600)
+        .unwrap();
+    assert_eq!(h.world().effect_sets.len(), sets + 1, "retried");
+    assert_eq!(h.snap().error, relight_error(NO_RELIGHT), "again");
+    // A per-frame parameter is given to the session, never as a retry: the
+    // failure and its Error stay (a slider would reload the model per tick).
+    let sets = h.world().effect_sets.len();
+    for (i, (id, v)) in [(DIRECTION_ID, 10), (BRIGHTNESS_ID, 150), (DIRECTION_ID, 15)]
+        .into_iter()
+        .enumerate()
+    {
+        h.set_setting(id, SettingValue::Int(v), 650 + i as u64)
+            .unwrap();
+    }
+    let given = h.world().effect_sets[sets..].to_vec();
+    assert_eq!(given.len(), 3, "each value reaches the session");
+    assert_eq!(
+        given
+            .iter()
+            .map(|e| (e.relight_direction, e.relight_brightness))
+            .collect::<Vec<_>>(),
+        [(10, 100), (10, 150), (15, 150)]
+    );
+    assert_eq!(h.snap().error, relight_error(NO_RELIGHT), "not retried");
+    assert!(h.ctrl.relight_failure.is_some());
+    // A toggle write retries.
+    h.world().relight_fail = None;
+    h.set_setting(RELIGHT_ID, SettingValue::Bool(true), 700)
+        .unwrap();
+    assert_eq!(h.world().relight_status, EffectStatus::Ready);
+    assert_eq!(h.snap().error, "");
+    // A reset of the group clears it as well.
+    h.world().relight_status = EffectStatus::Failed(NO_RELIGHT.into());
+    h.tick(800);
+    assert_eq!(h.snap().error, relight_error(NO_RELIGHT));
+    h.reset_settings("group:lighting", 900).unwrap();
+    assert_eq!(h.snap().error, "");
+    assert_eq!(saved_now(&h).relight_direction, None);
+    assert_eq!(h.relight_applied().unwrap().2, 0, "the configuration's");
+    // A reload retries it.
+    h.world().relight_status = EffectStatus::Failed(NO_RELIGHT.into());
+    h.tick(1000);
+    assert_eq!(h.snap().error, relight_error(NO_RELIGHT));
+    let sets = h.world().effect_sets.len();
+    h.reload(config, 1100).unwrap();
+    assert_eq!(h.world().effect_sets.len(), sets + 1);
+    assert_eq!(h.snap().error, "");
+    // The end of the session ends it.
+    h.world().relight_status = EffectStatus::Failed(NO_RELIGHT.into());
+    h.tick(1200);
+    assert_eq!(h.snap().error, relight_error(NO_RELIGHT));
+    h.consumers(0, 1300);
+    h.tick(1400);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.snap().error, "");
+    assert_eq!(h.ctrl.relight_failure, None);
+}
+
+#[test]
+fn a_relighting_failure_text_is_sanitised_and_bounded() {
+    let long = format!("bad\nline\t{}", "x".repeat(2000));
+    let text = relight_failure_text(&long);
+    assert!(
+        text.starts_with("relighting unavailable: bad line "),
+        "{text}"
+    );
+    assert!(text.ends_with("; the video continues without it"));
+    assert!(!text.chars().any(char::is_control), "{text}");
+    assert!(text.len() <= RELIGHT_REASON_MAX + 80, "{}", text.len());
+}
+
+#[test]
+fn a_whole_chain_failure_is_the_effects_not_relightings() {
+    let config = "[effect]\nmode = \"blur\"\nrelight = true\non_failure = \"none\"\n";
+    let reason = "the green screen did not load";
+    let mut h = H::new(config, |w| {
+        w.effect_fail = Some(reason.into());
+        w.effect_fail_chain = true;
+    });
+    h.activate(0);
+    h.tick(500);
+    h.tick(750);
+    assert_eq!(
+        h.world().relight_status,
+        EffectStatus::Failed(reason.into())
+    );
+    assert!(h.snap().error.starts_with("effect blur unavailable"));
+    assert_eq!(h.ctrl.relight_failure, None);
+}
+
+/// Relighting comes after noise removal and before enhancement in
+/// `Error`, either order, and under the higher causes.
+#[test]
+fn a_relighting_failure_sits_between_noise_removal_and_enhancement() {
+    let failed = |r: &str| EffectStatus::Failed(r.into());
+    let fresh = || {
+        let mut h = H::new("", |w| w.cameras = vec![small(alpha())]);
+        h.ctrl.error.clear();
+        h
+    };
+    let mut h = fresh();
+    h.ctrl.effect_failure = Some("effect unavailable: x".into());
+    h.ctrl.error = "effect unavailable: x".into();
+    h.ctrl
+        .poll_relight(failed("no relight"), &EffectStatus::Off);
+    assert_eq!(h.ctrl.error, "effect unavailable: x");
+    assert!(h.ctrl.relight_failure.is_some());
+    // Noise removal over relighting.
+    let mut h = fresh();
+    h.ctrl
+        .poll_relight(failed("no relight"), &EffectStatus::Off);
+    assert_eq!(h.ctrl.error, relight_error("no relight"));
+    h.ctrl
+        .poll_denoise(failed("no denoiser"), &EffectStatus::Off);
+    assert_eq!(h.ctrl.error, denoise_error("no denoiser"));
+    let mut h = fresh();
+    h.ctrl
+        .poll_denoise(failed("no denoiser"), &EffectStatus::Off);
+    h.ctrl
+        .poll_relight(failed("no relight"), &EffectStatus::Off);
+    assert_eq!(h.ctrl.error, denoise_error("no denoiser"));
+    // Relighting over enhancement.
+    let mut h = fresh();
+    h.ctrl.poll_enhance(failed("no vsr"));
+    h.ctrl
+        .poll_relight(failed("no relight"), &EffectStatus::Off);
+    assert_eq!(h.ctrl.error, relight_error("no relight"));
+    let mut h = fresh();
+    h.ctrl
+        .poll_relight(failed("no relight"), &EffectStatus::Off);
+    h.ctrl.poll_enhance(failed("no vsr"));
+    assert_eq!(h.ctrl.error, relight_error("no relight"));
+    // It ends: the enhancement failure, still standing, shows.
+    h.ctrl.poll_relight(EffectStatus::Ready, &EffectStatus::Off);
+    assert_eq!(h.ctrl.error, enhance_error("no vsr"));
+    // Over a damaged state file.
+    let mut h = fresh();
+    h.ctrl.state_damaged = Some("state.toml is damaged".into());
+    h.ctrl.error = "state.toml is damaged".into();
+    h.ctrl
+        .poll_relight(failed("no relight"), &EffectStatus::Off);
+    assert_eq!(h.ctrl.error, relight_error("no relight"));
+}
+
+#[test]
+fn a_damaged_relighting_value_in_the_state_file_fails_closed() {
+    let mut h = H::new("", |_| {});
+    fs::create_dir_all(h.paths.state.parent().unwrap()).unwrap();
+    fs::write(&h.paths.state, "enabled = true\nrelight_direction = 120\n").unwrap();
+    h.restart();
+    assert_eq!(h.state(), State::Off);
+    let error = h.snap().error;
+    assert!(
+        error.contains("state.toml") && error.contains("relight_direction"),
+        "{error}"
+    );
 }
