@@ -647,9 +647,54 @@ fn stage_failures_cross_as_stage_errors_and_keep_the_rest_of_the_chain() {
 // The effect and enhance seams
 // ---------------------------------------------------------------------------
 
+/// The factory reads the settings description kept when the module was
+/// opened: it never calls the module for it (that would run module code
+/// outside the crash ledger's marker).
+#[test]
+fn the_backend_factory_never_asks_the_module_for_its_settings() {
+    let count = |lines: &Lines| {
+        lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, m)| m == "fixture-settings")
+            .count()
+    };
+    let p = |v: i64| -> Params { [("step".to_string(), Value::Int(v))].into_iter().collect() };
+    // Never described: no call, and every parameter is accepted.
+    let (_dir, module, lines) = fixture(serde_json::json!({}));
+    assert!(module.cached_settings().is_none());
+    let factory = ModuleBackendFactory::new(module.clone());
+    assert_eq!(count(&lines), 0);
+    assert!(
+        factory
+            .check_params(&s("alpha"), &p(90), &Params::new())
+            .is_ok()
+    );
+    // Described once (at open): the factory checks against that copy.
+    let described = module.settings().unwrap();
+    assert_eq!(count(&lines), 1);
+    assert_eq!(module.cached_settings(), Some(described));
+    let factory = ModuleBackendFactory::new(module.clone());
+    assert_eq!(count(&lines), 1, "the factory made no module call");
+    assert!(
+        factory
+            .check_params(&s("alpha"), &p(90), &Params::new())
+            .is_err()
+    );
+    assert!(
+        factory
+            .check_params(&s("alpha"), &p(20), &Params::new())
+            .is_ok()
+    );
+}
+
 #[test]
 fn the_backend_factory_carries_the_effect_through_the_abi() {
     let (_dir, module, lines) = fixture(serde_json::json!({}));
+    // As the daemon opens a module: the description read under the crash
+    // ledger's marker, kept for the factory.
+    module.settings().unwrap();
     let factory = ModuleBackendFactory::new(module);
     assert_eq!(factory.name(), "org.test.fixture");
     factory.probe().unwrap();
@@ -1025,4 +1070,34 @@ fn a_library_opened_again_keeps_its_state() {
     chain
         .load(&host_request(&["alpha"], BTreeMap::new()))
         .unwrap();
+}
+
+#[test]
+fn a_registry_open_fills_the_settings_cache_the_factory_checks_against() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = own_copy(&fixture_lib(""), dir.path(), "registry");
+    std::fs::write(
+        dir.path().join("fixture.toml"),
+        fixture_manifest("org.test.fixture", &lib, 1),
+    )
+    .unwrap();
+    let mut registry = Registry::new(scan(&[dir.path().to_path_buf()]));
+    let (sink, lines) = capture();
+    registry.open_all(|_| serde_json::json!({}), &sink);
+    let module = registry.module("org.test.fixture").unwrap().clone();
+    assert!(module.cached_settings().is_some());
+    let described = lines
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, _, m)| m == "fixture-settings")
+        .count();
+    assert_eq!(described, 1);
+    let p = |v: i64| -> Params { [("step".to_string(), Value::Int(v))].into_iter().collect() };
+    let factory = ModuleBackendFactory::new(module);
+    assert!(
+        factory
+            .check_params(&s("alpha"), &p(90), &Params::new())
+            .is_err()
+    );
 }

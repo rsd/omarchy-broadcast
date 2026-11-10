@@ -319,6 +319,62 @@ pub fn require_modules(revision: u32) -> Result<(), Failure> {
     )))
 }
 
+/// Fails unless a daemon of interface revision `revision` has the
+/// configuration methods.
+pub fn require_config(revision: u32) -> Result<(), Failure> {
+    if revision >= obc_ipc::CONFIG_REVISION {
+        return Ok(());
+    }
+    Err(Failure::Unsupported(format!(
+        "the daemon does not support the configuration methods (its interface revision is \
+         {revision}, they need {}); update omarchy-broadcastd",
+        obc_ipc::CONFIG_REVISION
+    )))
+}
+
+/// `GetConfigSchema` without starting the daemon, within [`READ_TIMEOUT`].
+pub async fn config_schema(conn: &Connection) -> Result<obc_ipc::ConfigSchema, Failure> {
+    let call = async {
+        let proxy = proxy(conn).await?;
+        proxy
+            .config_schema_no_autostart()
+            .await
+            .map_err(no_autostart_error)
+    };
+    tokio::time::timeout(READ_TIMEOUT, call)
+        .await
+        .unwrap_or_else(|_| Err(timed_out(READ_TIMEOUT)))
+}
+
+/// `GetConfigFiles` without starting the daemon, within [`READ_TIMEOUT`].
+pub async fn config_files(conn: &Connection) -> Result<obc_ipc::ConfigFiles, Failure> {
+    let call = async {
+        let proxy = proxy(conn).await?;
+        proxy
+            .config_files_no_autostart()
+            .await
+            .map_err(no_autostart_error)
+    };
+    tokio::time::timeout(READ_TIMEOUT, call)
+        .await
+        .unwrap_or_else(|_| Err(timed_out(READ_TIMEOUT)))
+}
+
+/// `GetStageOrderMoves` without starting the daemon, within
+/// [`READ_TIMEOUT`]: each stage `(id, slot, up, down)`.
+pub async fn stage_moves(conn: &Connection) -> Result<Vec<(String, String, bool, bool)>, Failure> {
+    let call = async {
+        let proxy = proxy(conn).await?;
+        proxy
+            .stage_order_moves_no_autostart()
+            .await
+            .map_err(no_autostart_error)
+    };
+    tokio::time::timeout(READ_TIMEOUT, call)
+        .await
+        .unwrap_or_else(|_| Err(timed_out(READ_TIMEOUT)))
+}
+
 /// Maps an error of a call made without starting the daemon.
 fn no_autostart_error(e: IpcError) -> Failure {
     match e {

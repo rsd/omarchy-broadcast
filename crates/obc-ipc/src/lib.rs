@@ -44,10 +44,15 @@ use zbus::proxy::{CacheProperties, MethodFlags};
 use zbus::{Connection, DBusError, OwnedVariant, Type, Variant};
 
 pub mod client;
+pub mod config;
 pub mod modules;
 pub mod settings;
 
 pub use client::OmarchyBroadcastProxy;
+pub use config::{
+    CONFIG_REVISION, ConfigFileEntry, ConfigFiles, ConfigGroup, ConfigKind, ConfigRow,
+    ConfigSchema, ConfigValue,
+};
 pub use modules::{MODULES_REVISION, ModuleInfo, ModuleList, StageInfo};
 pub use settings::{
     Condition, ConditionOp, ResetScope, Setting, SettingChange, SettingKind, SettingValue,
@@ -84,8 +89,12 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// added the modules ([`modules`]): `GetModules`, `SetModuleEnabled`,
 /// `GetStageOrder`, `SetStageOrder`, `SetBackendProfile`, `SetStagePin`,
 /// the `ModulesSerial` and `BackendProfile` properties; the global settings
-/// are those of the modules installed (none without one).
-pub const INTERFACE_REVISION: u32 = 9;
+/// are those of the modules installed (none without one). Revision 10
+/// added the configuration ([`config`]): `GetConfigSchema`, `SetConfig`,
+/// `ResetConfig`, `GetConfigFiles`, the `ConfigChanged` signal and the
+/// `ConfigSerial` property; the daemon reads `config.d/` after
+/// `config.toml` and writes `config.d/50-panel.toml`.
+pub const INTERFACE_REVISION: u32 = 10;
 /// The first [`INTERFACE_REVISION`] with `LoopbackConsumers`,
 /// `PipeWireConsumers` and `PipeWireOutput`.
 pub const PIPEWIRE_REVISION: u32 = 3;
@@ -412,6 +421,10 @@ pub struct Snapshot {
     /// `BackendProfile` (revision 9): `quality` or `battery`; `None` when
     /// the daemon does not offer it.
     pub backend_profile: Option<String>,
+    /// `ConfigSerial` (revision 10): bumped whenever the configuration in
+    /// force or the config schema changes; `None` when the daemon does not
+    /// offer it.
+    pub config_serial: Option<u32>,
     pub interface_revision: u32,
 }
 
@@ -440,6 +453,7 @@ impl Snapshot {
             settings_schema_serial: None,
             modules_serial: None,
             backend_profile: None,
+            config_serial: None,
             interface_revision: 0,
         }
     }
@@ -486,6 +500,7 @@ impl Snapshot {
             }
             "ModulesSerial" => self.modules_serial = Some(deserialize_for_property(value)?),
             "BackendProfile" => self.backend_profile = Some(deserialize_for_property(value)?),
+            "ConfigSerial" => self.config_serial = Some(deserialize_for_property(value)?),
             "InterfaceRevision" => self.interface_revision = deserialize_for_property(value)?,
             _ => {}
         }
@@ -559,7 +574,8 @@ impl Snapshot {
     /// The properties added after revision 1 (`BlurStrength`,
     /// `BackgroundImage`, `PipeWireConsumers`, `PipeWireOutput`, `Denoise`,
     /// `PreviewConsumers`, `CameraControls`, `SettingsRevision`,
-    /// `SettingsSchemaSerial`, `ModulesSerial`, `BackendProfile`) keep their [`Snapshot::empty`] value when the daemon does not offer
+    /// `SettingsSchemaSerial`, `ModulesSerial`, `BackendProfile`, `ConfigSerial`) keep their
+    /// [`Snapshot::empty`] value when the daemon does not offer
     /// them (see [`is_unknown_property_error`]), and `LoopbackConsumers` is then
     /// `Consumers`, as [`Snapshot::from_properties`] does for a property
     /// missing from `GetAll`; any other failure to read them is an error.
@@ -602,6 +618,7 @@ impl Snapshot {
                 proxy.backend_profile().await.map(Some),
                 empty.backend_profile,
             )?,
+            config_serial: optional(proxy.config_serial().await.map(Some), empty.config_serial)?,
             interface_revision: proxy.interface_revision().await?,
         })
     }
@@ -1027,7 +1044,8 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, MODULES_REVISION);
+        assert_eq!(INTERFACE_REVISION, CONFIG_REVISION);
+        const { assert!(MODULES_REVISION < CONFIG_REVISION) };
         const { assert!(GLOBAL_SETTINGS_REVISION < MODULES_REVISION) };
         // Revision 9's properties; a daemon before it has neither.
         let serial = Variant::from(4u32);
@@ -1041,6 +1059,12 @@ mod tests {
         assert_eq!(new.modules_serial, Some(4));
         assert_eq!(new.backend_profile.as_deref(), Some("battery"));
         assert_eq!((old.modules_serial, old.backend_profile), (None, None));
+        // Revision 10's property.
+        let config_serial = Variant::from(7u32);
+        let rev10 =
+            Snapshot::from_properties([("State", &state), ("ConfigSerial", &config_serial)])
+                .unwrap();
+        assert_eq!((rev10.config_serial, old.config_serial), (Some(7), None));
         assert_eq!(
             (SETTINGS_REVISION, GLOBAL_SETTINGS_REVISION, SETTINGS_SCHEMA),
             (7, 8, 1)

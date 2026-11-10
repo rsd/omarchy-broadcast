@@ -119,6 +119,11 @@ pub struct ModulesConfig {
     /// Module ids that are not loaded.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub disabled: Vec<String>,
+    /// Modules enabled (`true`) or disabled (`false`), by module id, each
+    /// over [`Self::disabled`]: the table the daemon writes for
+    /// `SetModuleEnabled` and the setup dialog (`config.d/50-panel.toml`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub enabled: BTreeMap<String, bool>,
     /// The stage order, by stage id; empty: the default order (by slot,
     /// then each stage's preferred position). An order that is not valid
     /// for the modules found is replaced by the default, with a warning.
@@ -128,7 +133,8 @@ pub struct ModulesConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<BackendProfile>,
     /// The module that provides a stage, by stage id, whatever the profile
-    /// says, while it can.
+    /// says, while it can. An empty module is no pin (automatic): in a later
+    /// file it clears the pin of an earlier one.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub pin: BTreeMap<String, String>,
 }
@@ -149,6 +155,9 @@ impl ModulesConfig {
         if let Some(id) = self.disabled.iter().find(|id| !valid_module_id(id)) {
             return Err(("modules.disabled", not_a_module_id(id)));
         }
+        if let Some(id) = self.enabled.keys().find(|id| !valid_module_id(id)) {
+            return Err(("modules.enabled", not_a_module_id(id)));
+        }
         for (i, s) in self.order.iter().enumerate() {
             if !valid_stage_id(s) {
                 return Err(("modules.order", not_a_stage_id(s)));
@@ -161,11 +170,35 @@ impl ModulesConfig {
             if !valid_stage_id(stage) {
                 return Err(("modules.pin", not_a_stage_id(stage)));
             }
-            if !valid_module_id(module) {
+            if !module.is_empty() && !valid_module_id(module) {
                 return Err(("modules.pin", not_a_module_id(module)));
             }
         }
         Ok(())
+    }
+
+    /// Whether module `id` is enabled by the configuration alone:
+    /// [`Self::enabled`]'s entry, else not in [`Self::disabled`].
+    pub fn is_enabled(&self, id: &str) -> bool {
+        self.enabled
+            .get(id)
+            .copied()
+            .unwrap_or_else(|| !self.disabled.iter().any(|d| d == id))
+    }
+
+    /// The profile of the configuration alone (`quality` when unset).
+    pub fn profile_or_default(&self) -> BackendProfile {
+        self.profile.unwrap_or_default()
+    }
+
+    /// The pins of the configuration alone, by stage id: [`Self::pin`]
+    /// without its empty (automatic) entries.
+    pub fn pins(&self) -> BTreeMap<String, String> {
+        self.pin
+            .iter()
+            .filter(|(_, m)| !m.is_empty())
+            .map(|(s, m)| (s.clone(), m.clone()))
+            .collect()
     }
 }
 
@@ -209,13 +242,13 @@ impl ModulesState {
         *self == ModulesState::default()
     }
 
-    /// Whether module `id` is enabled: this state's choice, else not in
-    /// `config`'s `disabled` list.
+    /// Whether module `id` is enabled: this state's choice, else the
+    /// config's ([`ModulesConfig::is_enabled`]).
     pub fn enabled(&self, config: &ModulesConfig, id: &str) -> bool {
         self.enabled
             .get(id)
             .copied()
-            .unwrap_or_else(|| !config.disabled.iter().any(|d| d == id))
+            .unwrap_or_else(|| config.is_enabled(id))
     }
 
     /// The stage order in force: this state's, else the config's (empty:
@@ -232,7 +265,7 @@ impl ModulesState {
     /// The pins in force: the config's, then this state's over them (an
     /// empty module clears the stage's pin).
     pub fn pins(&self, config: &ModulesConfig) -> BTreeMap<String, String> {
-        let mut pins = config.pin.clone();
+        let mut pins = config.pins();
         for (stage, module) in &self.pin {
             if module.is_empty() {
                 pins.remove(stage);
@@ -241,6 +274,24 @@ impl ModulesState {
             }
         }
         pins
+    }
+
+    /// `config` with this state's choices laid over it: what is in force
+    /// while the state's choices could not be moved into the configuration
+    /// yet (as they were in force before the move).
+    pub fn over(&self, config: &ModulesConfig) -> ModulesConfig {
+        let mut out = config.clone();
+        out.enabled
+            .extend(self.enabled.iter().map(|(id, on)| (id.clone(), *on)));
+        if let Some(order) = &self.order {
+            out.order = order.clone();
+        }
+        if self.profile.is_some() {
+            out.profile = self.profile;
+        }
+        out.pin
+            .extend(self.pin.iter().map(|(s, m)| (s.clone(), m.clone())));
+        out
     }
 }
 
@@ -413,6 +464,43 @@ mod tests {
     }
 
     #[test]
+    fn the_state_laid_over_the_config_is_what_its_helpers_read() {
+        let config = ModulesConfig {
+            disabled: vec!["org.x.off".into()],
+            enabled: [("org.x.a".to_string(), false)].into(),
+            order: vec!["denoise".into()],
+            pin: [
+                ("background".to_string(), "org.x.a".to_string()),
+                ("relight".to_string(), "org.x.b".to_string()),
+            ]
+            .into(),
+            ..ModulesConfig::default()
+        };
+        assert_eq!(ModulesState::default().over(&config), config);
+        let state = ModulesState {
+            enabled: [
+                ("org.x.off".to_string(), true),
+                ("org.x.on".to_string(), false),
+            ]
+            .into(),
+            order: Some(vec!["enhance".into(), "denoise".into()]),
+            profile: Some(BackendProfile::Battery),
+            pin: [
+                ("background".to_string(), "org.x.c".to_string()),
+                ("relight".to_string(), String::new()),
+            ]
+            .into(),
+        };
+        let over = state.over(&config);
+        for id in ["org.x.off", "org.x.on", "org.x.a", "org.x.d"] {
+            assert_eq!(over.is_enabled(id), state.enabled(&config, id), "{id}");
+        }
+        assert_eq!(over.order, state.order(&config));
+        assert_eq!(over.profile_or_default(), state.profile(&config));
+        assert_eq!(over.pins(), state.pins(&config));
+    }
+
+    #[test]
     fn the_config_table_is_checked() {
         let ok = ModulesConfig {
             dirs: vec!["/srv/modules".into()],
@@ -434,6 +522,42 @@ mod tests {
             ..ModulesConfig::default()
         };
         assert_eq!(bad.validate().unwrap_err().0, "modules.pin");
+    }
+
+    #[test]
+    fn the_enabled_table_overrides_the_disabled_list() {
+        let config = ModulesConfig {
+            disabled: vec!["org.x.a".into(), "org.x.b".into()],
+            enabled: [
+                ("org.x.a".to_string(), true),
+                ("org.x.c".to_string(), false),
+            ]
+            .into(),
+            pin: [
+                ("background".to_string(), String::new()),
+                ("relight".to_string(), "org.x.a".to_string()),
+            ]
+            .into(),
+            ..ModulesConfig::default()
+        };
+        assert!(config.validate().is_ok());
+        assert!(config.is_enabled("org.x.a"));
+        assert!(!config.is_enabled("org.x.b"));
+        assert!(!config.is_enabled("org.x.c"));
+        assert!(config.is_enabled("org.x.d"));
+        // An empty pin is automatic: no pin.
+        assert_eq!(
+            config.pins(),
+            [("relight".to_string(), "org.x.a".to_string())].into()
+        );
+        assert_eq!(ModulesState::default().pins(&config), config.pins());
+        assert!(ModulesState::default().enabled(&config, "org.x.a"));
+        assert_eq!(config.profile_or_default(), BackendProfile::Quality);
+        let bad = ModulesConfig {
+            enabled: [("hello".to_string(), true)].into(),
+            ..ModulesConfig::default()
+        };
+        assert_eq!(bad.validate().unwrap_err().0, "modules.enabled");
     }
 
     #[test]

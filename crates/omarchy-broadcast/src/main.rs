@@ -3,6 +3,7 @@
 //! ADR-0011). `--json` output is the contract of `docs/cli-json.md`.
 
 mod bus;
+mod config;
 mod human;
 mod json;
 mod model;
@@ -44,10 +45,11 @@ Exit status:
 
 `status`, `cameras`, `watch`, `preview`, `effect` without an effect, `controls` and
 `settings` without a subcommand, `modules list`, `modules info`, `modules profile` without
-a profile and `order show` never start the daemon. `on`, `off`, `camera`,
-`effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`,
-`settings reset`, `modules enable|disable|profile <profile>|pin` and `order set|reset` may
-start it through D-Bus activation when its activation file is installed.
+a profile, `order show` and `config show|get|files` never start the daemon. `on`, `off`,
+`camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`,
+`settings reset`, `modules enable|disable|profile <profile>|pin`, `order set|reset` and
+`config set|reset` may start it through D-Bus activation when its activation file is
+installed.
 
 `--json` output is documented in docs/cli-json.md; the D-Bus interface in docs/dbus-api.md.";
 
@@ -200,6 +202,26 @@ enum Command {
     Order {
         #[command(subcommand)]
         action: Option<modules::OrderAction>,
+    },
+    /// Show or change the daemon's configuration: every key with its
+    /// value and the file that sets it, one key, the configuration files.
+    ///
+    /// The daemon reads config.toml, then the files of config.d/ in name
+    /// order, a later file winning key by key. A change made here is
+    /// written by the daemon to config.d/50-panel.toml (never to
+    /// config.toml) and applied; a key that a later file sets (such as
+    /// config.d/90-local.toml) is refused. Without a subcommand, shows
+    /// every key. Examples: `omarchy-broadcast config get output.format`,
+    /// `omarchy-broadcast config set -- lifecycle.idle_grace_s 10`,
+    /// `omarchy-broadcast config reset -- lifecycle.idle_grace_s`.
+    #[command(args_conflicts_with_subcommands = true)]
+    Config {
+        /// Print JSON lines (`"type":"config_group"`); only without a
+        /// subcommand (as `config show --json`).
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<config::ConfigAction>,
     },
     /// Follow state changes and stats until interrupted.
     Watch {
@@ -912,6 +934,10 @@ async fn run(job: Job) -> u8 {
         Job::Command(Command::Order { action }) => {
             let show = modules::OrderAction::Show { json: false };
             modules::run_order(action.as_ref().unwrap_or(&show)).await
+        }
+        Job::Command(Command::Config { json, action }) => {
+            let show = config::ConfigAction::Show { json: *json };
+            config::run(action.as_ref().unwrap_or(&show)).await
         }
         Job::Command(Command::Controls { json, action: None }) => show_controls(*json).await,
         Job::Command(Command::Controls {

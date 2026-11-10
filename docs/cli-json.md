@@ -28,6 +28,10 @@
 | `omarchy-broadcast modules pin STAGE MODULE`, `pin STAGE --clear` | Pins the module that provides a stage, or clears the pin (`SetStagePin`), then prints who provides it. | No. |
 | `omarchy-broadcast order [show] [--json]` | Prints the order the effect stages run in (`GetStageOrder`). Never starts the daemon. | One `order` object. |
 | `omarchy-broadcast order set ID,ID,...`, `order reset` | Sets the stage order or goes back to the default (`SetStageOrder`), then prints it. | No. |
+| `omarchy-broadcast config [show] [--json]` | Prints every configuration key of the daemon by group, with its value, the file that sets it, whether it can be changed here and when a change applies (`GetConfigSchema`). Never starts the daemon. See [Config](#config). | The full set of `config_group` lines. |
+| `omarchy-broadcast config get KEY` | Prints the value of one key. Never starts the daemon. | No. |
+| `omarchy-broadcast config set [--] KEY VALUE`, `config reset [--] KEY` | Sets a key, or removes it from the daemon's managed file `config.d/50-panel.toml` so that the earlier files' value (or the default) applies again (`SetConfig`, `ResetConfig`), then prints the key as read back. | No. |
+| `omarchy-broadcast config files [--json]` | Lists the configuration files in load order, with their status (`GetConfigFiles`). Never starts the daemon. | One `config_files` line. |
 | `omarchy-broadcast preview [--json] [--fps 15\|30]` | Holds a live preview lease on the daemon and prints a line for each frame it writes, until interrupted. See [Preview](#preview). | One object per line (NDJSON). |
 | `omarchy-broadcast watch` | Follows the daemon: a summary when it connects, then a line for each change and each `Stats` signal (about once per second while `active`), until interrupted. | One object per line (NDJSON). |
 
@@ -163,7 +167,7 @@ Lighting
 
 ## Modules and order
 
-The effects come from loadable modules ([ADR-0025](adr/0025-loadable-modules.md), [modules.md](modules.md)). `omarchy-broadcast modules` lists them and manages which are enabled, the backend profile and the pins; `omarchy-broadcast order` shows and sets the order in which their stages run. They wrap the revision-9 members of [dbus-api.md](dbus-api.md#modules) and need a daemon of interface revision 9.
+The effects come from loadable modules ([ADR-0025](adr/0025-loadable-modules.md), [modules.md](modules.md)). `omarchy-broadcast modules` lists them and manages which are enabled, the backend profile and the pins; `omarchy-broadcast order` shows and sets the order in which their stages run. They wrap the revision-9 members of [dbus-api.md](dbus-api.md#modules) and need a daemon of interface revision 9. Against a daemon of revision 10 or later they also show which choices a configuration file after the daemon's own sets (and so cannot be changed here), and where the stages can move.
 
 ```text
 omarchy-broadcast modules [list] [--json]
@@ -197,6 +201,7 @@ omarchy-broadcast order reset
 - **`modules pin STAGE MODULE`** pins the module that provides a stage (`SetStagePin`), and **`--clear`** removes the pin (the argument `MODULE` is then not given). It prints which module provides the stage at the next start, read back: `<stage>: provided by <name> (<id>)`, or `<stage>: no module can provide it now`. A pin that cannot be honoured is not an error: the profile's choice is shown.
 - **`order`** (or `order show`) prints the order the stages run in, numbered, one per line, and `No effect modules installed` when there is none. **`order set ID,ID,...`** (`SetStageOrder`) takes every stage the enabled modules offer, once each, comma-separated, and prints the order read back; the daemon refuses an order that does not fit, with the reason, as exit status 1. **`order reset`** goes back to the default order (by slot, then each stage's position).
 - Reading (`modules`, `modules list`, `modules info`, `modules profile` without an argument, `order`, `order show`) never starts the daemon and gives up after 5 s; the changes may start it through D-Bus activation and give up after 30 s, like the other setters. `--json` is accepted by `modules list`, `modules info` and `order show` only; with another subcommand it is a usage error (status `2`).
+- **Overridden choices (revision 10).** The daemon keeps these choices in `config.d/50-panel.toml`, and refuses to change one that a file after it (for example `config.d/90-local.toml`) sets. The text output says so: `modules` and `modules profile` add `(set by config.d/90-local.toml)` to the profile and to a module line, `modules info` has a `Set by:` line, and `order` ends with `The order is set by config.d/90-local.toml: change it there.` A change the daemon refuses is exit status 1 with its reason, `Overridden by config.d/90-local.toml`. A pin that a later file sets is refused the same way, but is not shown in these listings; `config show` has it.
 - Against a daemon of interface revision 8 or lower the commands print `omarchy-broadcast: the daemon does not support modules (its interface revision is N, modules need 9); update omarchy-broadcastd` and exit with status `1`; with `--json` they print an `error` line with the code `unsupported-daemon`.
 
 ### `modules`, `module` and `order` lines
@@ -211,6 +216,7 @@ omarchy-broadcast order reset
 | `serial` | number | The daemon's `ModulesSerial` when the list was read. |
 | `profile` | string | The backend profile, `"quality"` or `"battery"` (`""` from a daemon that does not report it). |
 | `count` | number | The number of `module` lines that follow (0 with no module installed). |
+| `profile_overridden_by` | string | The file after `config.d/50-panel.toml` that sets `modules.profile`, relative to the configuration directory (`"config.d/90-local.toml"`); `""` when none does, and from a daemon below revision 10. Bounded to 256 bytes and clipped at the start. |
 
 `module` line:
 
@@ -234,18 +240,103 @@ The `module` object:
 | `reason` | string | Why the module is not available; `""` when it is. |
 | `stages` | array | Stage objects, in manifest order (below). |
 | `stages_truncated` | boolean | `true` when stages were left out: more than 32, or the line would pass the cap (stages are given up from the end). |
+| `overridden_by` | string | The file after `config.d/50-panel.toml` that sets `modules.enabled.<id>` for this module, so that `enable` and `disable` are refused; `""` when none does, and from a daemon below revision 10. Bounded as `profile_overridden_by`. |
 
 A stage object has `id`, `slot` (`"pre-matte"`, `"matte"`, `"post-matte"` or `"post-composite"`), `rank` (number), `device` (`"nvidia-gpu"`, `"gpu"`, `"npu"` or `"cpu"`), `available` (boolean), `reason` (string, `""` when available) and `selected` (boolean: this module provides the stage at the next camera start).
 
-`order` line, `{"v":1,"type":"order","order":["enhance","denoise","background","relight"],"order_truncated":false}`:
+`order` line, `{"v":1,"type":"order","order":["enhance","denoise","background","relight"],"order_truncated":false,"stages":[{"id":"enhance","slot":"pre-matte","up":false,"down":true},...],"overridden_by":""}`:
 
 | Field | JSON type | Meaning |
 |---|---|---|
 | `v`, `type` | | `1`, `"order"`. |
 | `order` | array of strings | The stage ids in the order they run; empty with no module. At most 32 are listed. |
 | `order_truncated` | boolean | `true` if the daemon reported more than 32. |
+| `stages` | array | One object per stage of `order` (the same stages, in the same order, at most 32): `id` and `slot` (strings), and `up` and `down` (booleans): whether the daemon would accept the order with the stage swapped with the one before it (`up`) or after it (`down`). The daemon works them out with the check `order set` uses, so a client that offers move buttons holds no rule of its own. From a daemon of revision 9, `slot` is read from the module list and `up` and `down` are `false`. |
+| `overridden_by` | string | The file after `config.d/50-panel.toml` that sets `modules.order`; `""` when none does. While it is set, `order set` and `order reset` are refused and every `up` and `down` is `false`. Bounded as above. |
 
-The strings are bounded in bytes of their JSON encoding, as in the general rules: a module `id` 64, `name` 64, `version` 96, `licence` 96, `kind` 32, `description` 160, `library` and `manifest` 256, `reason` (of a module and of a stage) 96, `status`, `profile` and a stage's `id`, `slot` and `device` 32, an `order` entry 32.
+The strings are bounded in bytes of their JSON encoding, as in the general rules: a module `id` 64, `name` 64, `version` 96, `licence` 96, `kind` 32, `description` 160, `library` and `manifest` 256, `reason` (of a module and of a stage) 96, `status`, `profile` and a stage's `id`, `slot` and `device` 32, an `order` entry 32, an `order` `stages` entry's `id` and `slot` 32, `profile_overridden_by` and `overridden_by` 256 (clipped at the start).
+
+## Config
+
+`omarchy-broadcast config` shows and changes the daemon's configuration through the revision-10 members of [dbus-api.md](dbus-api.md#configuration-revision-10) ([ADR-0026](adr/0026-config-d-and-managed-config.md)). The daemon reads `config.toml` and then the files of `config.d/`, a later file winning key by key. A change made here is written by the daemon to `config.d/50-panel.toml` and never to `config.toml`; a key that a file after it sets (such as `config.d/90-local.toml`) is refused.
+
+```text
+omarchy-broadcast config [show] [--json]
+omarchy-broadcast config get KEY
+omarchy-broadcast config set [--] KEY VALUE
+omarchy-broadcast config reset [--] KEY
+omarchy-broadcast config files [--json]
+```
+
+- **`config`** (or `config show`) prints every key by group, one row per key, with its value, the label, where the value comes from (`default` or `from config.toml`), `read only` when the daemon does not change it (or `overridden by FILE`), and, for a key that can be changed, when a change applies (`applies at once`, `applies at the next camera start`, `applies at the next daemon start`):
+
+  ```text
+  Output
+    output.format = nv12  (Pixel format; default; applies at the next camera start)
+    output.hold_timeout_s = 3 s  (Hold on camera switch; from config.d/50-panel.toml; applies at the next camera start)
+    output.mode = 1920x1080@30  (Output size and rate; from config.toml; read only)
+  ```
+
+  A list is shown comma-separated, an empty string as `""`. `config --json` is `config show --json`; the options of the other subcommands are not accepted with it.
+- **`config get KEY`** prints the value alone. An unknown key is exit status 1 (`No configuration key KEY`).
+- **`config set KEY VALUE`** takes the value by the type of the key: `true` or `false` (also `on` and `off`) for a switch, a number, one of the options of an enum, a text for a string or a path, a comma-separated list for a list (items trimmed, empty ones dropped; `""` is the empty list). The keys that can be changed are `camera.fixed_framerate`, `output.format`, `output.aspect`, `output.hold_timeout_s`, `output.input_gap_ms`, `lifecycle.idle_grace_s`, `lifecycle.start_debounce_ms`, `effect.on_failure`, `pipewire.enabled`, `pipewire.offer_nv12`, `modules.profile`, `modules.enabled.<module id>` and `modules.pin.<stage>`; the others are shown read only and are set in `config.toml`. Put `--` before the key when the value is negative. A value of the wrong form is a usage error (status `2`); a value the daemon refuses, a key it does not change, a key that a later file sets, or a `config.d/50-panel.toml` that cannot be written is exit status 1 with the daemon's reason on standard error. On success the key is printed as read back. It may start the daemon through D-Bus activation.
+- **`config reset KEY`** removes the key from `config.d/50-panel.toml`, so that the value of `config.toml` or an earlier drop-in, or the default, applies again, and prints it. The refusals are those of `set`.
+- **`config files`** prints `Directory: <dir>`, then one line per file in load order: the path relative to the directory, its status (`loaded`, `absent` or `error`), the reason after a colon for an error, and `(written by the daemon)` for `config.d/50-panel.toml`.
+- Reading (`config`, `config show`, `config get`, `config files`) never starts the daemon and gives up after 5 s; `set` and `reset` may start it and give up after 30 s, like the other setters. `--json` is accepted by `config`, `config show` and `config files` only.
+- Against a daemon of interface revision 9 or lower the commands print `omarchy-broadcast: the daemon does not support the configuration methods (its interface revision is N, they need 10); update omarchy-broadcastd` and exit with status `1`; with `--json` they print an `error` line with the code `unsupported-daemon`.
+
+### `config_group` lines
+
+`config show --json` prints the configuration as a **set** of `config_group` lines, packed and assembled exactly like the `settings_group` lines ([`settings_group`](#settings_group), [Client assembly rules](#client-assembly-rules)): one line per group, or per part of a group that does not fit a line, with at most 8 rows and 4096 bytes, `index` and `count` over the set, `part` and `parts` for a cut group. A group without rows has no line. `watch --json` prints none: it prints [`config_changed`](#config_changed-and-modules_changed) and the client runs `config show --json` again.
+
+`{"v":1,"type":"config_group","schema":1,"serial":3,"index":0,"count":7,"part":1,"parts":1,"group":{"id":"output","label":"Output","settings":[ROW,...]}}`
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `v`, `type` | | `1`, `"config_group"`. |
+| `schema` | number | The version of the row model, `1` (that of the settings rows: additive changes keep it). |
+| `serial` | number | The daemon's `ConfigSerial` when the schema was read. |
+| `index`, `count`, `part`, `parts` | number | As in `settings_group`. |
+| `group` | object | `id` (`camera`, `output`, `loopback`, `lifecycle`, `effect`, `pipewire`, `modules`), `label` and `settings`, an array of rows (below). |
+
+The `modules` group holds `modules.profile`, a `modules.pin.<stage>` row for each stage a module offers (an `enum` whose option `""` is `Automatic`, then each module offering the stage, labelled with its name), a `modules.enabled.<id>` row (`bool`, labelled with the module's name) for each installed module, then the read-only `modules.order`, `modules.dirs` and `modules.disabled` (`list`).
+
+A **row** has the keys of its type only:
+
+| Field | JSON type | Present for | Meaning |
+|---|---|---|---|
+| `id` | string | all | The dotted configuration key, the argument of `config set`. |
+| `label` | string | all | The name to show. |
+| `description` | string | all | Help text, at most 160 bytes. |
+| `type` | string | all | `"bool"`, `"int"`, `"float"`, `"enum"`, `"string"`, `"path"` or `"list"`. A client skips a type it does not know. |
+| `value` | boolean, number, string or array of strings | all | The value in force; a `list` is an array of strings, cut to 8 items. |
+| `value_truncated` | boolean | `list`, only when `true` | Present, and `true`, when the list had more than 8 items and `value` was cut. |
+| `default` | as `value` | optional | The built-in default; absent when there is none (a path that is not set). |
+| `min`, `max`, `step` | number | `int`, `float` | The range and the step. |
+| `unit` | string | `int`, `float`, optional | Shown after the value (`"s"`, `"ms"`). |
+| `options` | array | `enum` | Objects `{"value", "label"}`, in display order; at most 16. |
+| `editable` | boolean | all | The daemon accepts `config set` for the key. |
+| `source` | string | all | The file that sets the value in force, relative to the configuration directory (`"config.toml"`, `"config.d/50-panel.toml"`, `"config.d/90-local.toml"`); `""` when no file does (the default). |
+| `overridden_by` | string | all | The file after `config.d/50-panel.toml` that sets the value in force; `""` when none does. A write to the key is refused while it is set. |
+| `apply` | string | all | When a change takes effect: `"live"`, `"reload"` (at the next camera start or reopening of the device) or `"restart"` (at the next daemon start). |
+| `enabled` | boolean | all | `false` when the row is overridden; draw it greyed. A read-only row is not `enabled: false` for that: use `editable`. |
+| `disabled_reason` | string | all | Why not, when `enabled` is `false` (`"Overridden by config.d/90-local.toml"`); `""` otherwise. |
+
+The strings are bounded in bytes of their JSON encoding: a key (`id`) 128, a group `id` and `apply` 32, a `label` and a group or option `label` 48, `description` and `disabled_reason` 160, `unit` 16, a string `value`, a `default` and a list item 160 (one that is too long keeps its end, with `…` at the start, like a path), an option `value` 160, `source` and `overridden_by` 256 (clipped at the start). A client keeps the order, ignores keys it does not know, and trusts `editable`, `enabled` and `apply`.
+
+### `config_files` line
+
+`config files --json` prints one line:
+
+`{"v":1,"type":"config_files","serial":3,"dir":"/home/u/.config/omarchy-broadcast","files":[{"path":"config.toml","status":"loaded","managed":false,"reason":""},{"path":"config.d/50-panel.toml","status":"absent","managed":true,"reason":""}],"files_truncated":false}`
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `v`, `type` | | `1`, `"config_files"`. |
+| `serial` | number | The daemon's `ConfigSerial`. |
+| `dir` | string | The configuration directory. Bounded to 256 bytes and clipped at the start. |
+| `files` | array | The files in load order: `path` (relative to `dir`), `status` (`"loaded"`, `"absent"` or `"error"`), `managed` (boolean: the daemon writes it; `config.d/50-panel.toml`) and `reason` (the error, at most 160 bytes; `""` otherwise). At most 16 are listed. The list is read from disk when the command runs. |
+| `files_truncated` | boolean | `true` when files were left out (more than 16, or the line would pass the cap; files are given up from the end). |
 
 ## Preview
 
@@ -294,7 +385,7 @@ omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.O
 ### General rules
 
 - Every object is printed on one line, terminated by `\n`, in UTF-8. `watch --json` flushes stdout after every line.
-- Every object has the field **`v`**, the schema version (an integer, `1` in this version), and the field **`type`**, a string naming the line type: `snapshot`, `state`, `cameras`, `controls`, `settings_group`, `settings_delta`, `settings_clear`, `modules`, `module`, `order`, `stats`, `preview`, `frame` or `error`.
+- Every object has the field **`v`**, the schema version (an integer, `1` in this version), and the field **`type`**, a string naming the line type: `snapshot`, `state`, `cameras`, `controls`, `settings_group`, `settings_delta`, `settings_clear`, `modules`, `module`, `order`, `config_group`, `config_files`, `config_changed`, `modules_changed`, `stats`, `preview`, `frame` or `error`.
 - The order of the fields within an object is not significant.
 - A client must ignore fields it does not know, and lines whose `type` it does not know.
 - **Line length.** No line is longer than **4096 bytes**, newline excluded. To guarantee it, strings are bounded in bytes of their JSON encoding (escapes included). A longer string is cut at a character boundary and ends with the ellipsis character `…` (U+2026); the result is always valid JSON. The bounds:
@@ -358,6 +449,8 @@ Every property of the daemon at one moment. Printed by `status --json`, and by `
 | `camera_controls` | object or null | The image controls of the active camera, as in the [`controls`](#controls) line without its `v` and `type`: `camera`, `controls` and `controls_truncated`. `null`, with the key present, from a daemon below interface revision 6. |
 | `settings_revision` | number or null | The daemon's `SettingsRevision`, the counter of its camera settings tree (integer, from 1). `null`, with the key present, from a daemon below interface revision 7. |
 | `settings_schema` | number or null | The settings schema version the settings lines follow (`1` in this version; see [Settings schema version](#settings-schema-version)). `null`, with the key present, from a daemon below interface revision 7, which has no settings. A client treats a missing key as `null`: an older CLI does not print it. |
+| `modules_serial` | number | The daemon's `ModulesSerial`, the counter of the module list and the stage order (from 1); `0` from a daemon below interface revision 9. A client reads `modules list --json` and `order show --json` again when it changes. Printed by every command that prints a `snapshot`. |
+| `config_serial` | number | The daemon's `ConfigSerial`, the counter of the configuration schema and the file list (from 1); `0` from a daemon below interface revision 10. A client reads `config show --json` again when it changes. |
 
 A **camera object**:
 
@@ -537,7 +630,7 @@ The `path` of these two lines is never clipped, unlike the other strings (see [G
 | Field | JSON type | Meaning |
 |---|---|---|
 | `v`, `type` | | `1`, `"error"`. |
-| `code` | string | `"daemon-not-running"`: the daemon is not running, or there is no D-Bus session bus. `"dbus-error"`: any other failure to talk to the daemon (an unexpected reply, a lost connection, a timeout). `"unsupported-daemon"`: the daemon is too old for the request (`preview` needs interface revision 5, `controls` needs 6, `settings` needs 7, `modules` and `order` need 9); printed by `preview --json`, `controls --json`, `settings --json`, `modules list --json`, `modules info --json` and `order show --json` only. `"preview-path-too-long"`: the daemon's frame path does not fit a line; printed by `preview --json` only. New codes may be added; treat an unknown code like `"dbus-error"`. |
+| `code` | string | `"daemon-not-running"`: the daemon is not running, or there is no D-Bus session bus. `"dbus-error"`: any other failure to talk to the daemon (an unexpected reply, a lost connection, a timeout). `"unsupported-daemon"`: the daemon is too old for the request (`preview` needs interface revision 5, `controls` needs 6, `settings` needs 7, `modules` and `order` need 9, `config` needs 10); printed by `preview --json`, `controls --json`, `settings --json`, `modules list --json`, `modules info --json`, `order show --json`, `config show --json` and `config files --json` only. `"preview-path-too-long"`: the daemon's frame path does not fit a line; printed by `preview --json` only. New codes may be added; treat an unknown code like `"dbus-error"`. |
 | `error` | string | A one-line explanation for people. Match on `code`, never on this text. |
 
 `status --json`, `cameras --json`, `controls --json` and `settings --json` print an `error` object instead of their usual one when they fail to read the daemon, and exit with the status of the failure (`3` or `4`).
@@ -548,7 +641,18 @@ The output is a stream of the line types above:
 
 1. A `snapshot` line, once the daemon has been read. The subscriptions to its signals are made before the read, so no change is lost in between.
    From a daemon of interface revision 7, the snapshot is followed by the full set of settings of the active camera (the `settings_group` lines, or one `settings_clear`; see [Client assembly rules](#client-assembly-rules)).
-2. Then, as events arrive (no polling): a `state` line per change of the scalar fields, a `cameras` line per change of the camera list, a `controls` line per change of the image controls of the active camera (from a daemon of interface revision 6), a `settings_delta` line per change of a camera setting (from revision 7), a new set of `settings_group` lines (or a `settings_clear`) when the structure of the settings changes, and a `stats` line per `Stats` signal. A change notification that changes no value prints nothing.
+2. Then, as events arrive (no polling): a `state` line per change of the scalar fields, a `cameras` line per change of the camera list, a `controls` line per change of the image controls of the active camera (from a daemon of interface revision 6), a `settings_delta` line per change of a camera setting (from revision 7), a new set of `settings_group` lines (or a `settings_clear`) when the structure of the settings changes, a `modules_changed` line when `ModulesSerial` moves (from revision 9), a `config_changed` line per `ConfigChanged` signal (from revision 10), and a `stats` line per `Stats` signal. A change notification that changes no value prints nothing.
+
+### `config_changed` and `modules_changed`
+
+`{"v":1,"type":"config_changed","serial":N}` and `{"v":1,"type":"modules_changed","serial":N}`. Printed by `watch --json` only, and without a payload: they say that something a client has read is out of date, and the client reads it again.
+
+| Line | Printed when | The client reads |
+|---|---|---|
+| `config_changed` | The daemon emits `ConfigChanged`: a write or reset through the daemon, a reload that changed the configuration, where a value comes from or the file list, a refused reload, a migration, or a change of the modules found. `serial` is the new `ConfigSerial`. | `config show --json` and `config files --json`. |
+| `modules_changed` | `ModulesSerial` moved: a module's status or stages changed, a module appeared or went, a stage is provided by another module, or the order changed. `serial` is the new `ModulesSerial`. | `modules list --json` and `order show --json`. |
+
+A change made by the client's own `config set` or `modules enable` shows as one of these lines as well. The `snapshot` carries both serials (`config_serial`, `modules_serial`), so a client that has just connected knows whether what it holds is current. Neither line is printed against a daemon below the revision that has it.
 
 ### Daemon absent or gone
 
@@ -590,11 +694,12 @@ A client treats `"active":false`, and any `error` line, as "no frames now", and 
 - **`v` stays 1 for the camera controls.** `camera_controls` is a new field in the existing `snapshot` line and `controls` is a new line type, printed by a new command and by `watch --json`; the new `unsupported-daemon` use (`controls` needs revision 6) is an existing code. `state` lines do not carry the controls, so `changed` never names them. Against a daemon of interface revision 5 or lower the `snapshot` still prints the key, with the value `null`, as for `denoise`: "no controls" would claim a camera without them. `watch --json` prints no `controls` line then. A client written for the earlier version ignores both.
 - **`v` stays 1 for the camera settings.** `settings_revision` and `settings_schema` are new fields in the existing `snapshot` line (not in `state`, so `changed` never names them); `settings_group`, `settings_delta` and `settings_clear` are new line types, printed by a new command and by `watch --json`; `unsupported-daemon` for `settings` is an existing code. Against a daemon of interface revision 6 or lower the `snapshot` still prints both keys, with the value `null`, as for `camera_controls`, and `watch --json` prints no settings line. A client written for the earlier version ignores all of it. The meaning of the setting objects has a version of its own, `schema` (see [Settings schema version](#settings-schema-version)).
 - **`v` stays 1 for the modules.** `modules`, `module` and `order` are new line types, printed by new commands only (`watch --json` and the `snapshot` are unchanged); `unsupported-daemon` for them is an existing code. The `snapshot`'s `interface_revision` 9 tells a client that the commands exist. A client written for the earlier version never runs them. The settings tree it reads from `settings --json` is the one of the modules installed ([dbus-api.md](dbus-api.md#modules)): with no module it has no effect group, which the global-settings rule below already allows.
+- **`v` stays 1 for the configuration.** `config_group`, `config_files`, `config_changed` and `modules_changed` are new line types, printed by a new command and by `watch --json`; the `snapshot` gains the fields `modules_serial` and `config_serial`; the `modules`, `module` and `order` lines gain `profile_overridden_by`, `overridden_by` and `stages`; `unsupported-daemon` for `config` is an existing code. A client written for the earlier version ignores all of it. Against a daemon below the revision that has them, the two serials are `0` and the added fields are `""`, `false` or empty. The row model of the `config_group` lines is versioned by its own `schema` field, `1`, with the same rule as the settings schema (a new key or a new `type` keeps it).
 - **`v` stays 1 for the global settings.** Setting objects gain the key `scope` (`"camera"` or `"global"`), and a set gains groups after the camera's, which are also printed with no camera (`camera` `""`), where a revision-7 daemon printed a `settings_clear`. A client written for the earlier version ignores the key and the groups it does not draw. The settings schema stays 1 ([Settings schema version](#settings-schema-version)); the CLI's `snapshot` is unchanged, and `interface_revision` 8 tells a client that the groups can appear.
 - A **breaking change** raises `v`: a removed or renamed field or line type, a changed JSON type or meaning, a new state string, or a change to the rules above (line cap, outage behaviour).
 - **Not breaking**, made without raising `v`: a new field in an existing line type, a new line type, a new `error` code. Clients ignore what they do not know.
 - The schema is independent of the D-Bus `InterfaceRevision`; a new D-Bus property may appear as a new field.
-- **Capability rules for clients.** A client that shows the split of the consumers does so only while `pipewire_output` is not `"off"`. A client offers the effect controls only if both hold: the CLI is new enough to print `blur_strength` (the field is present as a number in `snapshot`; an older CLI has no `effect` command, and `omarchy-broadcast effect` fails with status `2`), and the daemon's `interface_revision` is 2 or more. Offer the noise-removal switch only if `denoise` is a boolean and `interface_revision` is 4 or more. Offer the preview only if the CLI has the `preview` command (an older CLI exits with status `2`) and the daemon's `interface_revision` is 5 or more; `preview --json` reports the second condition itself, with `unsupported-daemon`. Check the CLI first, then the daemon; the two conditions have different remedies (update `omarchy-broadcast`, update `omarchy-broadcastd`). Offer the camera controls only if `camera_controls` is an object and `interface_revision` is 6 or more; with `camera_controls` an empty list, offer none. Edits apply live while `state` is `starting` or `active`, and otherwise are stored for the next time the camera opens, so a client may tell its user which. To change a control run `omarchy-broadcast controls set NAME VALUE` (an older CLI exits with status `2`) and read the result from the `controls` line of `watch`. Offer the video effects as settings only if `interface_revision` is 8 or more and the set holds groups of `scope` `"global"`; they are there for every camera and with none, they are written with `omarchy-broadcast settings set -- ID VALUE` and no `--camera`, and the camera's `settings reset` never touches them. Offer the generic camera settings only if `interface_revision` is 7 or more and `settings_schema` is a number the client knows (1 in this version); with `settings_schema` `null` the daemon is too old (update `omarchy-broadcastd`), with the key missing the CLI is too old (update `omarchy-broadcast`), and with a number above the client's own the client is too old (update it); in all three, show the camera and no settings, with that hint. To change a setting run `omarchy-broadcast settings set --camera=ID -- SETTING VALUE` and `omarchy-broadcast settings reset --camera=ID` (an older CLI exits with status `2`), naming the camera the settings were drawn for so that a click after a change of camera fails instead of writing to another camera, and read the result from the `settings_delta` lines of `watch`. When the field is absent or the revision is lower, show the effect, if at all, as read-only text.
+- **Capability rules for clients.** A client that shows the split of the consumers does so only while `pipewire_output` is not `"off"`. A client offers the effect controls only if both hold: the CLI is new enough to print `blur_strength` (the field is present as a number in `snapshot`; an older CLI has no `effect` command, and `omarchy-broadcast effect` fails with status `2`), and the daemon's `interface_revision` is 2 or more. Offer the noise-removal switch only if `denoise` is a boolean and `interface_revision` is 4 or more. Offer the preview only if the CLI has the `preview` command (an older CLI exits with status `2`) and the daemon's `interface_revision` is 5 or more; `preview --json` reports the second condition itself, with `unsupported-daemon`. Check the CLI first, then the daemon; the two conditions have different remedies (update `omarchy-broadcast`, update `omarchy-broadcastd`). Offer the camera controls only if `camera_controls` is an object and `interface_revision` is 6 or more; with `camera_controls` an empty list, offer none. Edits apply live while `state` is `starting` or `active`, and otherwise are stored for the next time the camera opens, so a client may tell its user which. To change a control run `omarchy-broadcast controls set NAME VALUE` (an older CLI exits with status `2`) and read the result from the `controls` line of `watch`. Offer the video effects as settings only if `interface_revision` is 8 or more and the set holds groups of `scope` `"global"`; they are there for every camera and with none, they are written with `omarchy-broadcast settings set -- ID VALUE` and no `--camera`, and the camera's `settings reset` never touches them. Offer the generic camera settings only if `interface_revision` is 7 or more and `settings_schema` is a number the client knows (1 in this version); with `settings_schema` `null` the daemon is too old (update `omarchy-broadcastd`), with the key missing the CLI is too old (update `omarchy-broadcast`), and with a number above the client's own the client is too old (update it); in all three, show the camera and no settings, with that hint. To change a setting run `omarchy-broadcast settings set --camera=ID -- SETTING VALUE` and `omarchy-broadcast settings reset --camera=ID` (an older CLI exits with status `2`), naming the camera the settings were drawn for so that a click after a change of camera fails instead of writing to another camera, and read the result from the `settings_delta` lines of `watch`. When the field is absent or the revision is lower, show the effect, if at all, as read-only text. Offer the module list and the stage order only if `interface_revision` is 9 or more, and the configuration only if it is 10 or more and the CLI has the `config` command (an older CLI exits with status `2`): draw `config show --json` as given, write with `omarchy-broadcast config set -- KEY VALUE`, and read again on `config_changed` and `modules_changed` rather than on a timer. Take the move buttons of the stage order from the `stages` of the `order` line, and a greyed row, with its file, from `overridden_by`.
 
 ## Examples
 

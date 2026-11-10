@@ -21,6 +21,11 @@
 //! printed as a new full set ([`settings_step`]); the daemon bumps the
 //! serial when the active camera changes, so another camera is a new set
 //! too. After an outage, the set follows the fresh snapshot.
+//!
+//! Also with `--json`: a `modules_changed` line when `ModulesSerial` moves
+//! (revision 9), and a `config_changed` line for each `ConfigChanged`
+//! signal (revision 10), so a client reads the module list or the
+//! configuration again.
 
 use std::time::Duration;
 
@@ -176,6 +181,8 @@ struct Subscriptions {
     stats: obc_ipc::client::StatsStream,
     /// `SettingsChanged`, for `--json` only.
     settings: Option<obc_ipc::client::SettingsChangedStream>,
+    /// `ConfigChanged`, for `--json` only.
+    config: Option<obc_ipc::client::ConfigChangedStream>,
 }
 
 /// Subscribes to the name's owner changes, `PropertiesChanged`, `Stats`
@@ -197,10 +204,13 @@ async fn subscribe(conn: &Connection, settings: bool) -> Result<Subscriptions, E
     let changed = props.receive_properties_changed().await.map_err(lost)?;
     let proxy = bus::proxy(conn).await.map_err(Ended::BusLost)?;
     let stats = proxy.receive_stats().await.map_err(lost)?;
-    let settings = if settings {
-        Some(proxy.receive_settings_changed().await.map_err(lost)?)
+    let (settings, config) = if settings {
+        (
+            Some(proxy.receive_settings_changed().await.map_err(lost)?),
+            Some(proxy.receive_config_changed().await.map_err(lost)?),
+        )
     } else {
-        None
+        (None, None)
     };
     let owner = match dbus.get_name_owner(daemon_name()).await {
         Ok(o) => o,
@@ -215,7 +225,18 @@ async fn subscribe(conn: &Connection, settings: bool) -> Result<Subscriptions, E
         changed,
         stats,
         settings,
+        config,
     })
+}
+
+/// The next `ConfigChanged` signal; never, without the subscription.
+async fn next_config(
+    s: &mut Option<obc_ipc::client::ConfigChangedStream>,
+) -> Option<obc_ipc::client::ConfigChanged> {
+    match s {
+        Some(s) => s.next().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// The next `SettingsChanged` signal; never, without the subscription.
@@ -261,6 +282,7 @@ async fn follow(conn: &Connection, p: &mut Printer) -> Ended {
         mut changed,
         mut stats,
         mut settings,
+        mut config,
     } = subscribed;
     // Bounded by READ_TIMEOUT: a daemon that holds the name but does not
     // answer is an outage like any other.
@@ -319,6 +341,12 @@ async fn follow(conn: &Connection, p: &mut Printer) -> Ended {
                 if !changes.is_empty() {
                     p.changes(&new, &changes);
                 }
+                if let (true, Some(serial)) = (
+                    p.json && new.modules_serial != snap.modules_serial,
+                    new.modules_serial,
+                ) {
+                    out::line(&json::modules_changed_line(serial));
+                }
                 snap = new;
             }
             s = next_settings(&mut settings) => {
@@ -337,6 +365,11 @@ async fn follow(conn: &Connection, p: &mut Printer) -> Ended {
                         last.revision = rev;
                     }
                 }
+            }
+            c = next_config(&mut config) => {
+                let Some(signal) = c else { return stream_ended() };
+                let Ok(args) = signal.args() else { continue };
+                out::line(&json::config_changed_line(args.serial));
             }
             s = stats.next() => {
                 let Some(signal) = s else { return stream_ended() };

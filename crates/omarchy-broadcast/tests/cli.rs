@@ -440,6 +440,10 @@ struct Mock {
     /// The next valid `SetSetting` fails with this error instead (`"RateLimited"`
     /// or `"UnknownSetting"`).
     fail_next_set: Option<&'static str>,
+    /// The config schema (revision 10), its serial and the files.
+    config: Vec<obc_ipc::ConfigGroup>,
+    config_serial: u32,
+    config_files: Vec<obc_ipc::ConfigFileEntry>,
 }
 
 fn control(name: &str, min: i32, max: i32, step: i32, default: i32) -> CameraControl {
@@ -747,6 +751,22 @@ impl Mock {
             settings_revision: 1,
             settings_serial: 1,
             fail_next_set: None,
+            config: mock_config(),
+            config_serial: 1,
+            config_files: vec![
+                obc_ipc::ConfigFileEntry {
+                    path: "config.toml".into(),
+                    status: "loaded".into(),
+                    managed: false,
+                    reason: String::new(),
+                },
+                obc_ipc::ConfigFileEntry {
+                    path: "config.d/50-panel.toml".into(),
+                    status: "absent".into(),
+                    managed: true,
+                    reason: String::new(),
+                },
+            ],
         }
     }
 
@@ -1513,10 +1533,239 @@ impl Mock {
         Ok(())
     }
 
+    async fn get_stage_order_moves(&mut self) -> Vec<(String, String, bool, bool)> {
+        self.calls.push("GetStageOrderMoves()".into());
+        // The mock's one rule: relight never goes before background.
+        let ok = |a: &str, b: &str| !(a == "background" && b == "relight");
+        let n = self.order.len();
+        (0..n)
+            .map(|i| {
+                let id = self.order[i].clone();
+                let slot = match id.as_str() {
+                    "background" => "matte",
+                    "relight" => "post-matte",
+                    _ => "pre-matte",
+                };
+                let up = i > 0 && ok(&self.order[i - 1], &id);
+                let down = i + 1 < n && ok(&id, &self.order[i + 1]);
+                (id, slot.to_string(), up, down)
+            })
+            .collect()
+    }
+
+    #[zbus(out_args("serial", "groups"))]
+    async fn get_config_schema(&mut self) -> (u32, Vec<VariantDict>) {
+        self.calls.push("GetConfigSchema()".into());
+        obc_ipc::ConfigSchema {
+            serial: self.config_serial,
+            groups: self.config.clone(),
+        }
+        .to_wire()
+    }
+
+    async fn set_config(
+        &mut self,
+        key: String,
+        value: OwnedVariant,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        let value = obc_ipc::ConfigValue::from_variant(&value);
+        self.calls.push(format!("SetConfig({key}, {value:?})"));
+        let row = self.config_row(&key)?;
+        let value = value.ok_or_else(|| IpcError::InvalidArgument("bad type".into()))?;
+        let fits = matches!(
+            (&row.kind, &value),
+            (obc_ipc::ConfigKind::Bool, obc_ipc::ConfigValue::Bool(_))
+                | (
+                    obc_ipc::ConfigKind::Int { .. },
+                    obc_ipc::ConfigValue::Int(_)
+                )
+                | (
+                    obc_ipc::ConfigKind::Float { .. },
+                    obc_ipc::ConfigValue::Float(_)
+                )
+                | (
+                    obc_ipc::ConfigKind::Enum { .. },
+                    obc_ipc::ConfigValue::Str(_)
+                )
+                | (obc_ipc::ConfigKind::List, obc_ipc::ConfigValue::List(_))
+        );
+        if !fits {
+            return Err(IpcError::InvalidArgument(format!("{key}: wrong type")));
+        }
+        if let (obc_ipc::ConfigKind::Enum { options }, obc_ipc::ConfigValue::Str(v)) =
+            (&row.kind, &value)
+            && !options.iter().any(|(o, _)| o == v)
+        {
+            return Err(IpcError::InvalidArgument(format!(
+                "{key}: {v:?} is not one of its options"
+            )));
+        }
+        row.value = value;
+        row.source = "config.d/50-panel.toml".into();
+        self.config_changed_now(&emitter).await;
+        Ok(())
+    }
+
+    async fn reset_config(
+        &mut self,
+        key: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        self.calls.push(format!("ResetConfig({key})"));
+        let row = self.config_row(&key)?;
+        if let Some(d) = row.default.clone() {
+            row.value = d;
+        }
+        row.source = String::new();
+        self.config_changed_now(&emitter).await;
+        Ok(())
+    }
+
+    #[zbus(out_args("serial", "dir", "files"))]
+    async fn get_config_files(&mut self) -> (u32, String, Vec<(String, String, bool, String)>) {
+        self.calls.push("GetConfigFiles()".into());
+        obc_ipc::ConfigFiles {
+            serial: self.config_serial,
+            dir: "/home/u/.config/omarchy-broadcast".into(),
+            files: self.config_files.clone(),
+        }
+        .to_wire()
+    }
+
+    #[zbus(signal)]
+    async fn config_changed(emitter: &SignalEmitter<'_>, serial: u32) -> zbus::Result<()>;
+
+    #[zbus(property)]
+    fn config_serial(&self) -> u32 {
+        self.config_serial
+    }
+
     #[zbus(property)]
     fn interface_revision(&self) -> u32 {
         INTERFACE_REVISION
     }
+}
+
+impl Mock {
+    /// The row `key`, writable, or the daemon's refusal.
+    fn config_row(&mut self, key: &str) -> Result<&mut obc_ipc::ConfigRow, IpcError> {
+        let row = self
+            .config
+            .iter_mut()
+            .flat_map(|g| g.rows.iter_mut())
+            .find(|r| r.id == key)
+            .ok_or_else(|| IpcError::UnknownSetting(format!("No configuration key {key}")))?;
+        if !row.overridden_by.is_empty() {
+            return Err(IpcError::Disabled(format!(
+                "Overridden by {}",
+                row.overridden_by
+            )));
+        }
+        if !row.editable {
+            return Err(IpcError::Disabled(format!(
+                "{key} cannot be changed here: set it in config.toml"
+            )));
+        }
+        Ok(row)
+    }
+
+    /// `ConfigSerial` moves: the property, then `ConfigChanged`.
+    async fn config_changed_now(&mut self, emitter: &SignalEmitter<'_>) {
+        self.config_serial += 1;
+        self.config_serial_changed(emitter).await.unwrap();
+        Mock::config_changed(emitter, self.config_serial)
+            .await
+            .unwrap();
+    }
+}
+
+fn config_row(
+    id: &str,
+    label: &str,
+    kind: obc_ipc::ConfigKind,
+    value: obc_ipc::ConfigValue,
+) -> obc_ipc::ConfigRow {
+    obc_ipc::ConfigRow {
+        id: id.into(),
+        label: label.into(),
+        description: format!("Help for {id}"),
+        kind,
+        default: Some(value.clone()),
+        value,
+        editable: true,
+        source: String::new(),
+        overridden_by: String::new(),
+        apply: "reload".into(),
+        enabled: true,
+        disabled_reason: String::new(),
+    }
+}
+
+/// The mock's config schema: a few rows of each kind.
+fn mock_config() -> Vec<obc_ipc::ConfigGroup> {
+    use obc_ipc::{ConfigKind as K, ConfigValue as V};
+    let mut mode = config_row(
+        "output.mode",
+        "Output mode",
+        K::String,
+        V::Str("1920x1080@30".into()),
+    );
+    mode.editable = false;
+    mode.apply = "restart".into();
+    let mut grace = config_row(
+        "lifecycle.idle_grace_s",
+        "Idle grace",
+        K::Int {
+            min: 0,
+            max: 3600,
+            step: 1,
+            unit: Some("s".into()),
+        },
+        V::Int(5),
+    );
+    grace.source = "config.toml".into();
+    grace.apply = "live".into();
+    let hold = config_row(
+        "output.hold_timeout_s",
+        "Hold timeout",
+        K::Float {
+            min: 0.0,
+            max: 60.0,
+            step: 0.5,
+            unit: Some("s".into()),
+        },
+        V::Float(2.0),
+    );
+    let profile = config_row(
+        "modules.profile",
+        "Backend profile",
+        K::Enum {
+            options: vec![
+                ("quality".into(), "Quality".into()),
+                ("battery".into(), "Battery".into()),
+            ],
+        },
+        V::Str("quality".into()),
+    );
+    let enabled = config_row(
+        "modules.enabled.br.com.dias.maxine-vfx",
+        "NVIDIA Maxine video effects",
+        K::Bool,
+        V::Bool(true),
+    );
+    let mut order = config_row("modules.order", "Stage order", K::List, V::List(Vec::new()));
+    order.editable = false;
+    let group = |id: &str, label: &str, rows| obc_ipc::ConfigGroup {
+        id: id.into(),
+        label: label.into(),
+        rows,
+    };
+    vec![
+        group("output", "Output", vec![mode, hold]),
+        group("lifecycle", "Lifecycle", vec![grace]),
+        group("modules", "Modules", vec![profile, enabled, order]),
+    ]
 }
 
 /// [`Mock`] served on the private bus under the daemon's name, on its own
@@ -5397,7 +5646,7 @@ fn modules_and_order_list_change_and_refuse() {
     assert_eq!(
         json_lines(&out.stdout),
         [
-            serde_json::json!({"v": 1, "type": "modules", "serial": 1, "profile": "quality", "count": 0})
+            serde_json::json!({"v": 1, "type": "modules", "serial": 1, "profile": "quality", "count": 0, "profile_overridden_by": ""})
         ]
     );
     mock.with(|m| {
@@ -5438,9 +5687,18 @@ fn modules_and_order_list_change_and_refuse() {
         "{}",
         out.stderr
     );
+    // A daemon of revision 10: the config schema says what a later file
+    // sets.
     assert_eq!(
         mock.take_calls(),
-        ["GetModules()", "GetModules()", "GetModules()"]
+        [
+            "GetModules()",
+            "GetConfigSchema()",
+            "GetModules()",
+            "GetConfigSchema()",
+            "GetModules()",
+            "GetConfigSchema()"
+        ]
     );
     let out = bus.run(&["modules", "disable", "br.com.dias.maxine-vfx"]);
     assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
@@ -5461,10 +5719,13 @@ fn modules_and_order_list_change_and_refuse() {
         [
             "SetModuleEnabled(br.com.dias.maxine-vfx, false)",
             "GetModules()",
+            "GetConfigSchema()",
             "SetBackendProfile(battery)",
             "GetModules()",
+            "GetConfigSchema()",
             "SetStagePin(background, )",
-            "GetModules()"
+            "GetModules()",
+            "GetConfigSchema()"
         ]
     );
     let out = bus.run(&["order"]);
@@ -5482,13 +5743,17 @@ fn modules_and_order_list_change_and_refuse() {
     assert_eq!(
         mock.take_calls(),
         [
-            "GetStageOrder()",
-            "GetStageOrder()",
+            "GetStageOrderMoves()",
+            "GetConfigSchema()",
+            "GetStageOrderMoves()",
+            "GetConfigSchema()",
             "SetStageOrder(relight,denoise,background)",
             "SetStageOrder(background,denoise,relight)",
-            "GetStageOrder()",
+            "GetStageOrderMoves()",
+            "GetConfigSchema()",
             "SetStageOrder()",
-            "GetStageOrder()"
+            "GetStageOrderMoves()",
+            "GetConfigSchema()"
         ]
     );
 }
@@ -5507,4 +5772,311 @@ fn modules_against_an_older_daemon_say_they_are_unsupported() {
             out.stderr
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The configuration (revision 10)
+
+/// Sets `overridden_by` (and what follows from it) on the mock's row `id`.
+fn override_row(mock: &MockDaemon, id: &str, file: &str) {
+    mock.with(|m| {
+        let row = m
+            .config
+            .iter_mut()
+            .flat_map(|g| g.rows.iter_mut())
+            .find(|r| r.id == id)
+            .unwrap();
+        row.overridden_by = file.into();
+        row.source = file.into();
+        row.enabled = false;
+        row.disabled_reason = format!("Overridden by {file}");
+    });
+}
+
+#[test]
+fn config_shows_gets_sets_resets_and_lists_the_files() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let out = bus.run(&["config"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert!(
+        out.stdout.starts_with(
+            "Output\n  output.mode = 1920x1080@30  (Output mode; default; read only)\n  \
+             output.hold_timeout_s = 2 s  (Hold timeout; default; applies at the next camera \
+             start)\n\nLifecycle\n  lifecycle.idle_grace_s = 5 s  (Idle grace; from \
+             config.toml; applies at once)\n"
+        ),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout
+            .contains("  modules.order = \"\"  (Stage order; default; read only)\n")
+    );
+    for args in [&["config", "--json"][..], &["config", "show", "--json"]] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+        let lines = json_lines(&out.stdout);
+        let groups: Vec<&str> = lines
+            .iter()
+            .map(|v| v["group"]["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(groups, ["output", "lifecycle", "modules"], "{args:?}");
+        for (i, v) in lines.iter().enumerate() {
+            assert_eq!(v["type"], "config_group");
+            assert_eq!(
+                (&v["schema"], &v["serial"], &v["index"], &v["count"]),
+                (&1.into(), &1.into(), &i.into(), &3.into())
+            );
+            assert_eq!((&v["part"], &v["parts"]), (&1.into(), &1.into()));
+        }
+        let grace = &lines[1]["group"]["settings"][0];
+        assert_eq!(
+            *grace,
+            serde_json::json!({
+                "id": "lifecycle.idle_grace_s", "label": "Idle grace",
+                "description": "Help for lifecycle.idle_grace_s", "type": "int",
+                "value": 5, "default": 5, "min": 0, "max": 3600, "step": 1, "unit": "s",
+                "editable": true, "source": "config.toml", "overridden_by": "",
+                "apply": "live", "enabled": true, "disabled_reason": ""
+            })
+        );
+        let modules = &lines[2]["group"]["settings"];
+        assert_eq!(
+            modules[0]["options"][1],
+            serde_json::json!({"value": "battery", "label": "Battery"})
+        );
+        assert_eq!(modules[2]["value"], serde_json::json!([]));
+        assert_eq!(lines[0]["group"]["settings"][1]["value"], 2.0);
+    }
+    mock.take_calls();
+
+    let out = bus.run(&["config", "get", "lifecycle.idle_grace_s"]);
+    assert_eq!((out.status.code(), out.stdout.as_str()), (Some(0), "5\n"));
+    let out = bus.run(&["config", "get", "no.such"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        out.stderr.contains("No configuration key no.such"),
+        "{}",
+        out.stderr
+    );
+
+    let out = bus.run(&["config", "set", "--", "lifecycle.idle_grace_s", "10"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "  lifecycle.idle_grace_s = 10 s  (Idle grace; from config.d/50-panel.toml; applies at \
+         once)\n"
+    );
+    let out = bus.run(&["config", "set", "--", "output.hold_timeout_s", "2.5"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert!(out.stdout.contains("= 2.5 s"), "{}", out.stdout);
+    // The value's type is checked before any write.
+    let out = bus.run(&["config", "set", "--", "lifecycle.idle_grace_s", "soon"]);
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr);
+    assert!(out.stderr.contains("a whole number"), "{}", out.stderr);
+    // The daemon's refusals: exit 1 with its reason.
+    let out = bus.run(&["config", "set", "--", "output.mode", "1280x720@30"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        out.stderr.contains("cannot be changed here"),
+        "{}",
+        out.stderr
+    );
+    override_row(&mock, "modules.profile", "config.d/90-x.toml");
+    let out = bus.run(&["config", "set", "--", "modules.profile", "battery"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        out.stderr.contains("Overridden by config.d/90-x.toml"),
+        "{}",
+        out.stderr
+    );
+    let out = bus.run(&["config", "reset", "--", "lifecycle.idle_grace_s"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "  lifecycle.idle_grace_s = 5 s  (Idle grace; default; applies at once)\n"
+    );
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "GetConfigSchema()",
+            "GetConfigSchema()",
+            "GetConfigSchema()",
+            "SetConfig(lifecycle.idle_grace_s, Some(Int(10)))",
+            "GetConfigSchema()",
+            "GetConfigSchema()",
+            "SetConfig(output.hold_timeout_s, Some(Float(2.5)))",
+            "GetConfigSchema()",
+            "GetConfigSchema()",
+            "GetConfigSchema()",
+            "SetConfig(output.mode, Some(Str(\"1280x720@30\")))",
+            "GetConfigSchema()",
+            "SetConfig(modules.profile, Some(Str(\"battery\")))",
+            "ResetConfig(lifecycle.idle_grace_s)",
+            "GetConfigSchema()"
+        ]
+    );
+
+    let out = bus.run(&["config", "files"]);
+    assert_eq!(
+        out.stdout,
+        "Directory: /home/u/.config/omarchy-broadcast\n  config.toml             loaded\n  \
+         config.d/50-panel.toml  absent (written by the daemon)\n"
+    );
+    let out = bus.run(&["config", "files", "--json"]);
+    assert_eq!(
+        json_line(&out.stdout),
+        serde_json::json!({
+            "v": 1, "type": "config_files", "serial": 4,
+            "dir": "/home/u/.config/omarchy-broadcast",
+            "files": [
+                {"path": "config.toml", "status": "loaded", "managed": false, "reason": ""},
+                {"path": "config.d/50-panel.toml", "status": "absent", "managed": true, "reason": ""}
+            ],
+            "files_truncated": false
+        })
+    );
+    // `--json` goes with `config` or `show` only.
+    let out = bus.run(&["config", "--json", "get", "a.b"]);
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr);
+}
+
+#[test]
+fn config_against_an_older_daemon_says_it_is_unsupported() {
+    let bus = Bus::start();
+    let _daemon = OldDaemon::start(&bus, Rev1);
+    for args in [
+        &["config"][..],
+        &["config", "get", "a.b"],
+        &["config", "files"],
+        &["config", "set", "--", "a.b", "1"],
+        &["config", "reset", "--", "a.b"],
+    ] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", out.stderr);
+        assert!(
+            out.stderr
+                .contains("the daemon does not support the configuration methods"),
+            "{args:?}: {}",
+            out.stderr
+        );
+    }
+    for args in [&["config", "--json"][..], &["config", "files", "--json"]] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(1));
+        let v = json_line(&out.stdout);
+        assert_eq!(
+            (&v["type"], &v["code"]),
+            (&"error".into(), &"unsupported-daemon".into())
+        );
+    }
+}
+
+#[test]
+fn watch_json_carries_the_serials_and_the_config_and_modules_lines() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let watch = bus.watch(&["watch", "--json"], None);
+    let v = watch.next_json("the first snapshot");
+    assert_eq!(v["type"], "snapshot", "{v}");
+    assert_eq!(
+        (&v["config_serial"], &v["modules_serial"]),
+        (&1.into(), &1.into())
+    );
+    watch.settings_set("the settings");
+    let out = bus.run(&["config", "set", "--", "lifecycle.idle_grace_s", "10"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert_eq!(
+        watch.next_json("ConfigChanged"),
+        serde_json::json!({"v": 1, "type": "config_changed", "serial": 2})
+    );
+    let iface = mock.iface();
+    mock.rt.block_on(async {
+        iface.get_mut().await.modules_serial = 5;
+        let m = iface.get().await;
+        m.modules_serial_changed(iface.signal_emitter())
+            .await
+            .unwrap();
+    });
+    assert_eq!(
+        watch.next_json("ModulesSerial"),
+        serde_json::json!({"v": 1, "type": "modules_changed", "serial": 5})
+    );
+    watch.quiet_for(Duration::from_millis(200), "nothing else");
+    // A daemon before revision 10 (or 9): the serials are 0.
+    let old = Bus::start();
+    let _daemon = OldDaemon::start(&old, Rev1);
+    let out = old.run(&["status", "--json"]);
+    let v = json_line(&out.stdout);
+    assert_eq!(
+        (&v["config_serial"], &v["modules_serial"]),
+        (&0.into(), &0.into())
+    );
+}
+
+#[test]
+fn order_and_modules_json_carry_the_moves_and_the_overrides() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    mock.with(|m| {
+        m.modules = vec![obc_ipc::ModuleInfo {
+            id: "br.com.dias.maxine-vfx".into(),
+            name: "NVIDIA Maxine video effects".into(),
+            enabled: true,
+            status: "available".into(),
+            ..obc_ipc::ModuleInfo::default()
+        }];
+        m.order = vec!["denoise".into(), "background".into(), "relight".into()];
+    });
+    let out = bus.run(&["order", "show", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert_eq!(
+        json_line(&out.stdout),
+        serde_json::json!({
+            "v": 1, "type": "order", "order": ["denoise", "background", "relight"],
+            "order_truncated": false,
+            "stages": [
+                {"id": "denoise", "slot": "pre-matte", "up": false, "down": true},
+                {"id": "background", "slot": "matte", "up": true, "down": false},
+                {"id": "relight", "slot": "post-matte", "up": false, "down": false}
+            ],
+            "overridden_by": ""
+        })
+    );
+    override_row(&mock, "modules.order", "config.d/90-x.toml");
+    override_row(&mock, "modules.profile", "config.d/90-x.toml");
+    override_row(
+        &mock,
+        "modules.enabled.br.com.dias.maxine-vfx",
+        "config.d/91-y.toml",
+    );
+    let out = bus.run(&["order", "show", "--json"]);
+    assert_eq!(
+        json_line(&out.stdout)["overridden_by"],
+        "config.d/90-x.toml"
+    );
+    let out = bus.run(&["order"]);
+    assert_eq!(
+        out.stdout,
+        "1. denoise\n2. background\n3. relight\nThe order is set by config.d/90-x.toml: change \
+         it there.\n"
+    );
+    let out = bus.run(&["modules", "list", "--json"]);
+    let lines = json_lines(&out.stdout);
+    assert_eq!(lines[0]["profile_overridden_by"], "config.d/90-x.toml");
+    assert_eq!(lines[1]["module"]["overridden_by"], "config.d/91-y.toml");
+    let out = bus.run(&["modules"]);
+    assert!(
+        out.stdout
+            .starts_with("Profile: quality (set by config.d/90-x.toml)\n"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout
+            .contains("available (set by config.d/91-y.toml)\n"),
+        "{}",
+        out.stdout
+    );
 }

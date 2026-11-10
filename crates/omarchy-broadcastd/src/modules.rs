@@ -15,9 +15,10 @@
 //! probes it again) when its manifest, its library file and its
 //! configuration are unchanged.
 //!
-//! The runtime choices (enabled modules, stage order, backend profile,
-//! pins) come from the state file over the config's `[modules]`
-//! ([`obc_core::modules`]). They apply to the next session: a running one
+//! The module choices (enabled modules, stage order, backend profile,
+//! pins) come from the configuration's `[modules]` alone (written to
+//! `config.d/50-panel.toml` by the methods that change them,
+//! [`obc_core::config_d`]). They apply to the next session: a running one
 //! keeps the [`Plan`] it started with.
 //!
 //! The opening of libraries goes through the media backend
@@ -361,7 +362,6 @@ impl Modules {
     pub fn load<B: MediaBackend>(
         backend: &mut B,
         config: &Config,
-        runtime: &RuntimeState,
         ledger: Option<&Path>,
         cc: Option<(u32, u32)>,
     ) -> Modules {
@@ -381,7 +381,7 @@ impl Modules {
             }
             l
         });
-        m.reload(backend, config, runtime, cc);
+        m.reload(backend, config, cc);
         // The first list is serial 1.
         m.serial = 1;
         m.listed = m.listing();
@@ -396,7 +396,6 @@ impl Modules {
         &mut self,
         backend: &mut B,
         config: &Config,
-        runtime: &RuntimeState,
         cc: Option<(u32, u32)>,
     ) {
         let dirs = module_dirs(config);
@@ -409,7 +408,7 @@ impl Modules {
         self.registry = Registry::from_entries(entries);
         let mut before = std::mem::take(&mut self.opened);
         self.compute_capability = cc;
-        self.apply_enabled(config, runtime);
+        self.apply_enabled(config);
         for id in self.registry.ids() {
             match before.remove(&id) {
                 Some(o) if self.unchanged(config, &id, &o) => self.keep(backend, &id, o),
@@ -419,7 +418,7 @@ impl Modules {
         // What is not kept is closed here (a session that runs it holds
         // its own reference).
         drop(before);
-        self.apply_choices(config, runtime);
+        self.apply_choices(config);
         let ids = self.registry.ids();
         if ids.is_empty() {
             info!("no effect modules installed");
@@ -430,8 +429,8 @@ impl Modules {
     }
 
     /// Sets each module enabled or disabled: by the crash ledger, then the
-    /// state file's choice over the config's `[modules] disabled`.
-    fn apply_enabled(&mut self, config: &Config, runtime: &RuntimeState) {
+    /// configuration (`[modules] enabled` over `disabled`).
+    fn apply_enabled(&mut self, config: &Config) {
         for id in self.registry.ids() {
             let crashed = self
                 .ledger
@@ -440,7 +439,7 @@ impl Modules {
                 .map(str::to_string);
             let res = match crashed {
                 Some(why) => self.registry.disable(&id, why),
-                None if !runtime.modules.enabled(&config.modules, &id) => {
+                None if !config.modules.is_enabled(&id) => {
                     self.registry.disable(&id, REASON_DISABLED)
                 }
                 None => self.registry.set_enabled(&id, true),
@@ -540,19 +539,19 @@ impl Modules {
     /// that is not valid for the modules found is replaced by the default
     /// one, with a warning. The serial moves when what `GetModules` lists
     /// (the stages `selected`, among them) or the order changed.
-    pub fn apply_choices(&mut self, config: &Config, runtime: &RuntimeState) {
+    pub fn apply_choices(&mut self, config: &Config) {
         self.registry
-            .set_profile(profile_of(runtime.modules.profile(&config.modules)));
+            .set_profile(profile_of(config.modules.profile_or_default()));
         for stage in self.registry.pins().keys().cloned().collect::<Vec<_>>() {
             self.registry.set_pin(stage, None);
         }
-        for (stage, module) in runtime.modules.pins(&config.modules) {
+        for (stage, module) in config.modules.pins() {
             if let Ok(s) = StageId::new(stage) {
                 self.registry.set_pin(s, Some(module));
             }
         }
         self.registry.reset_order();
-        let stored = runtime.modules.order(&config.modules);
+        let stored = &config.modules.order;
         if !stored.is_empty() {
             let order: Result<Vec<StageId>, String> = stored
                 .iter()
@@ -572,7 +571,6 @@ impl Modules {
         &mut self,
         backend: &mut B,
         config: &Config,
-        runtime: &RuntimeState,
         cc: Option<(u32, u32)>,
     ) {
         if cc != self.compute_capability {
@@ -597,7 +595,7 @@ impl Modules {
                 let _ = self.registry.record_probe(&id, res);
             }
         }
-        self.apply_choices(config, runtime);
+        self.apply_choices(config);
         self.bump();
     }
 
@@ -608,7 +606,6 @@ impl Modules {
         &mut self,
         backend: &mut B,
         config: &Config,
-        runtime: &RuntimeState,
         id: &str,
         on: bool,
     ) -> Result<bool, String> {
@@ -629,7 +626,7 @@ impl Modules {
             self.opened.remove(id);
             was
         };
-        self.apply_choices(config, runtime);
+        self.apply_choices(config);
         self.bump();
         Ok(changed)
     }

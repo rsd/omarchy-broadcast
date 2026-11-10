@@ -65,6 +65,8 @@ struct H {
     notes: UnboundedReceiver<Note>,
     /// The `SettingsChanged` notes drained: (revision, serial, changes).
     settings_notes: Vec<(u32, u32, Vec<SettingChange>)>,
+    /// The `ConfigChanged` notes drained: their serials.
+    config_notes: Vec<u32>,
     paths: Paths,
     t0: Instant,
     _dir: TempDir,
@@ -97,6 +99,7 @@ impl H {
             fake,
             notes,
             settings_notes: Vec::new(),
+            config_notes: Vec::new(),
             paths,
             t0,
             _dir: dir,
@@ -191,6 +194,7 @@ impl H {
                     serial,
                     changes,
                 } => self.settings_notes.push((revision, serial, changes)),
+                Note::ConfigChanged(serial) => self.config_notes.push(serial),
             }
         }
         (changes, stats)
@@ -213,6 +217,19 @@ impl H {
         self.consumers(1, ms);
         self.tick(ms + 300);
         assert_eq!(self.state(), State::Active, "{:?}", self.snap());
+    }
+
+    /// The managed file `config.d/50-panel.toml` (empty when absent).
+    fn managed(&self) -> toml::Table {
+        match fs::read_to_string(obc_core::config_d::managed_path(&self.paths.config)) {
+            Ok(text) => text.parse().unwrap(),
+            Err(_) => toml::Table::new(),
+        }
+    }
+
+    /// The value of the dotted `key` in the managed file.
+    fn managed_key(&self, key: &str) -> Option<toml::Value> {
+        obc_core::config_d::table_get(&self.managed(), key).cloned()
     }
 
     /// The state file, once a settings change waiting for its delayed
@@ -810,7 +827,11 @@ fn an_invalid_reload_keeps_the_old_config_and_sets_error() {
     );
     assert_eq!(ids(&s), ["usb-b", "usb-a"], "the old preference stays");
     assert_eq!(h.ctrl.config().camera_preference().len(), 1);
-    assert_eq!(h.drain().0, [Change::Error(msg.clone())]);
+    // What `GetConfigFiles` shows changed: `ConfigSerial` moves.
+    assert_eq!(
+        h.drain().0,
+        [Change::ConfigSerial(2), Change::Error(msg.clone())]
+    );
 
     // SIGHUP (no reply) with an unreadable value: the same.
     fs::write(&h.paths.config, "[lifecycle]\nidle_grace_s = -1\n").unwrap();
@@ -1067,6 +1088,7 @@ fn every_transition_of_the_lifecycle_is_announced_in_order() {
             Change::SettingsSchemaSerial(n) => format!("settings_serial={n}"),
             Change::ModulesSerial(n) => format!("modules_serial={n}"),
             Change::BackendProfile(p) => format!("profile={p}"),
+            Change::ConfigSerial(n) => format!("config_serial={n}"),
         })
         .collect();
     assert_eq!(
@@ -2900,8 +2922,11 @@ fn enabling_pipewire_on_reload_starts_it_at_once_and_leaves_the_writer() {
     }
     assert_eq!(
         h.drain().0,
-        [Change::PipeWireOutput("connecting".into())],
-        "only the PipeWire output changes"
+        [
+            Change::ConfigSerial(2),
+            Change::PipeWireOutput("connecting".into())
+        ],
+        "only the PipeWire output (and the configuration's serial) changes"
     );
     h.pipewire_up(1100);
     h.pw_consumers(1, 1200);
@@ -8079,9 +8104,10 @@ fn disabling_a_module_applies_at_the_next_start_and_is_kept() {
         assert!(params.backends.effect.is_some());
     }
     assert_eq!(
-        h.persisted().modules.enabled.get(MAXINE_MODULE),
-        Some(&false)
+        h.managed_key(&format!("modules.enabled.{MAXINE_MODULE}")),
+        Some(toml::Value::Boolean(false))
     );
+    assert!(h.persisted().modules.is_empty(), "not in the state file");
     h.restart();
     assert!(!h.modules().find(MAXINE_MODULE).unwrap().enabled);
     assert!(matches!(
@@ -8124,7 +8150,8 @@ fn the_stage_order_is_validated_kept_and_reset() {
         h.ctrl.order_ids(),
         ["denoise", "enhance", "background", "relight"]
     );
-    assert!(h.persisted().modules.order.is_some());
+    assert!(h.managed_key("modules.order").is_some());
+    assert!(h.persisted().modules.is_empty(), "not in the state file");
     h.restart();
     assert_eq!(
         h.ctrl.order_ids(),
@@ -8136,7 +8163,7 @@ fn the_stage_order_is_validated_kept_and_reset() {
         h.ctrl.order_ids(),
         ["enhance", "denoise", "background", "relight"]
     );
-    assert_eq!(h.persisted().modules.order, None);
+    assert_eq!(h.managed_key("modules.order"), None);
 }
 
 #[test]
@@ -8231,12 +8258,12 @@ fn the_profile_and_pins_are_reported_in_the_module_list() {
         h.call(|r| Command::SetBackendProfile("fast".into(), r), 0),
         Err(IpcError::InvalidArgument(_))
     ));
-    let st = h.persisted();
     assert_eq!(
-        st.modules.profile,
-        Some(obc_core::modules::BackendProfile::Battery)
+        h.managed_key("modules.profile"),
+        Some(toml::Value::String("battery".into()))
     );
-    assert!(st.modules.pin.is_empty());
+    assert_eq!(h.managed_key("modules.pin"), None, "the pin is removed");
+    assert!(h.persisted().modules.is_empty(), "not in the state file");
 }
 
 #[test]
@@ -8295,4 +8322,553 @@ fn a_revision_8_state_file_and_config_keep_their_meaning() {
         ),
         (RelightLight::Warm, -45, 120)
     );
+}
+
+// ---- the configuration set (config.d) and its writes (revision 10) ----
+
+use obc_core::config_d::MANAGED_HEADER;
+
+impl H {
+    fn ask<T>(
+        &mut self,
+        make: impl FnOnce(tokio::sync::oneshot::Sender<Result<T, IpcError>>) -> Command,
+    ) -> Result<T, IpcError> {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let now = self.at(0);
+        assert!(self.ctrl.handle(make(tx), now));
+        rx.try_recv()
+            .expect("the controller replies before returning")
+    }
+
+    fn schema(&mut self) -> obc_ipc::ConfigSchema {
+        self.ask(Command::GetConfigSchema).unwrap()
+    }
+
+    fn row(&mut self, id: &str) -> obc_ipc::ConfigRow {
+        self.schema()
+            .find(id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no row {id}"))
+    }
+
+    fn set_config(&mut self, key: &str, value: obc_ipc::ConfigValue) -> Result<(), IpcError> {
+        let key = key.to_string();
+        self.call(|r| Command::SetConfig(key, Some(value), r), 0)
+    }
+
+    fn config_d(&self, name: &str) -> std::path::PathBuf {
+        self.paths.config.with_file_name("config.d").join(name)
+    }
+
+    fn write_drop_in(&self, name: &str, text: &str) {
+        let path = self.config_d(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    fn write_state(&self, text: &str) {
+        fs::create_dir_all(self.paths.state.parent().unwrap()).unwrap();
+        fs::write(&self.paths.state, text).unwrap();
+    }
+
+    /// The state file's text.
+    fn state_text(&self) -> String {
+        fs::read_to_string(&self.paths.state).unwrap()
+    }
+}
+
+/// A state file of 0.24 with the module choices (and a revision-8 typed
+/// effect key).
+const STATE_0_24: &str = "enabled = true\ndenoise = true\n\n[modules]\norder = \
+     [\"denoise\", \"enhance\", \"background\", \"relight\"]\nprofile = \"battery\"\n\n\
+     [modules.enabled]\n\"br.com.dias.maxine-vfx\" = false\n\n[modules.pin]\n\
+     background = \"br.com.dias.maxine-vfx\"\n";
+
+#[test]
+fn the_state_files_module_choices_move_into_the_managed_file_losing_nothing() {
+    let config = "[lifecycle]\nidle_grace_s = 7\n";
+    let mut h = H::new(config, |_| {});
+    h.write_state(STATE_0_24);
+    h.restart();
+    // Every choice is in the managed file, in force, and out of the state.
+    assert_eq!(
+        h.managed_key(&format!("modules.enabled.{MAXINE_MODULE}")),
+        Some(toml::Value::Boolean(false))
+    );
+    assert_eq!(
+        h.managed_key("modules.profile"),
+        Some(toml::Value::String("battery".into()))
+    );
+    assert_eq!(
+        h.managed_key("modules.pin.background"),
+        Some(toml::Value::String(MAXINE_MODULE.into()))
+    );
+    assert!(h.managed_key("modules.order").is_some());
+    let text = fs::read_to_string(h.config_d("50-panel.toml")).unwrap();
+    assert!(text.starts_with(MANAGED_HEADER), "{text}");
+    assert!(!h.modules().find(MAXINE_MODULE).unwrap().enabled);
+    assert_eq!(h.snap().backend_profile.as_deref(), Some("battery"));
+    let state = h.state_text();
+    assert!(!state.contains("[modules"), "{state}");
+    // The rest of the state is kept, the revision-8 typed key written too.
+    assert!(h.persisted().enabled);
+    assert!(state.contains("denoise = true"), "{state}");
+    assert_eq!(fs::read_to_string(&h.paths.config).unwrap(), config);
+    // A second start moves nothing more.
+    let before = fs::read(h.config_d("50-panel.toml")).unwrap();
+    h.restart();
+    assert_eq!(fs::read(h.config_d("50-panel.toml")).unwrap(), before);
+    assert!(!h.modules().find(MAXINE_MODULE).unwrap().enabled);
+}
+
+#[test]
+fn a_crash_between_the_two_writes_of_the_move_loses_nothing() {
+    let mut h = H::new("", |_| {});
+    // The managed file was written, the daemon died before saving the
+    // state: both hold the choices (the managed file's profile differs,
+    // as a write after the move would leave it).
+    h.write_drop_in(
+        "50-panel.toml",
+        &format!(
+            "{MANAGED_HEADER}\n[modules]\nprofile = \"quality\"\norder = [\"denoise\", \
+             \"enhance\", \"background\", \"relight\"]\n\n[modules.enabled]\n\
+             \"{MAXINE_MODULE}\" = false\n\n[modules.pin]\nbackground = \"{MAXINE_MODULE}\"\n"
+        ),
+    );
+    let managed = fs::read(h.config_d("50-panel.toml")).unwrap();
+    h.write_state(STATE_0_24);
+    h.restart();
+    assert_eq!(
+        fs::read(h.config_d("50-panel.toml")).unwrap(),
+        managed,
+        "the managed file wins: nothing to write"
+    );
+    assert!(
+        !h.state_text().contains("[modules"),
+        "the state's copy is dropped"
+    );
+    assert_eq!(h.snap().backend_profile.as_deref(), Some("quality"));
+    // Disabled by the managed file: no stage is offered.
+    assert!(!h.modules().find(MAXINE_MODULE).unwrap().enabled);
+    assert!(h.ctrl.order_ids().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_move_that_cannot_be_written_keeps_the_state_and_is_tried_again() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut h = H::new("", |_| {});
+    let dir = h.paths.config.with_file_name("config.d");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    h.write_state(STATE_0_24);
+    h.restart();
+    let writable = fs::write(dir.join("probe"), "").is_ok();
+    if !writable {
+        assert_eq!(h.state_text(), STATE_0_24, "the state is left as it was");
+        assert!(!dir.join("50-panel.toml").exists());
+        // The state's choices stay in force meanwhile, as before the move.
+        assert_eq!(h.snap().backend_profile.as_deref(), Some("battery"));
+        assert!(!h.modules().find(MAXINE_MODULE).unwrap().enabled);
+        // A module method cannot write: refused with the reason, nothing
+        // changed.
+        let e = h
+            .call(|r| Command::SetBackendProfile("quality".into(), r), 0)
+            .unwrap_err();
+        assert!(matches!(e, IpcError::Failed(_)), "{e:?}");
+        assert!(e.message().contains("50-panel.toml"), "{e:?}");
+        assert_eq!(h.snap().backend_profile.as_deref(), Some("battery"));
+        // A save of the state keeps the choices it holds.
+        h.call(|r| Command::SetEnabled(true, r), 0).unwrap();
+        assert!(h.state_text().contains("[modules"));
+        // A reload that cannot move them either keeps them in force.
+        h.call(|r| Command::ReloadConfig(Some(r)), 0).unwrap();
+        assert_eq!(h.snap().backend_profile.as_deref(), Some("battery"));
+        assert!(!h.modules().find(MAXINE_MODULE).unwrap().enabled);
+    }
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    h.call(|r| Command::ReloadConfig(Some(r)), 0).unwrap();
+    assert!(!h.state_text().contains("[modules"));
+    assert_eq!(
+        h.managed_key("modules.profile"),
+        Some(toml::Value::String("battery".into()))
+    );
+    assert_eq!(h.snap().backend_profile.as_deref(), Some("battery"));
+}
+
+#[test]
+fn writes_land_in_the_managed_file_only_and_announce_the_config_serial() {
+    let config = "# mine\n[output]\nhold_timeout_s = 3.0\n";
+    let mut h = H::new(config, |_| {});
+    let serial = h.snap().config_serial.unwrap();
+    h.drain();
+    h.set_config("output.hold_timeout_s", obc_ipc::ConfigValue::Int(9))
+        .unwrap();
+    let row = h.row("output.hold_timeout_s");
+    // A whole number is taken for a float key.
+    assert_eq!(row.value, obc_ipc::ConfigValue::Float(9.0));
+    assert_eq!(row.source, "config.d/50-panel.toml");
+    assert_eq!(row.overridden_by, "");
+    assert_eq!(h.ctrl.config().output.hold_timeout_s, 9.0);
+    let now = h.snap().config_serial.unwrap();
+    assert_ne!(now, serial);
+    assert!(h.drain().0.contains(&Change::ConfigSerial(now)));
+    assert_eq!(h.config_notes.last(), Some(&now), "ConfigChanged follows");
+    // The module methods write the same file.
+    h.call(
+        |r| Command::SetModuleEnabled(MAXINE_MODULE.into(), false, r),
+        0,
+    )
+    .unwrap();
+    h.call(|r| Command::SetBackendProfile("battery".into(), r), 0)
+        .unwrap();
+    h.call(
+        |r| Command::SetStagePin("background".into(), MAXINE_MODULE.into(), r),
+        0,
+    )
+    .unwrap();
+    let text = fs::read_to_string(h.config_d("50-panel.toml")).unwrap();
+    assert!(text.starts_with(MANAGED_HEADER), "{text}");
+    assert_eq!(
+        h.managed_key("output.hold_timeout_s"),
+        Some(toml::Value::Float(9.0))
+    );
+    assert!(h.managed_key("modules.pin.background").is_some());
+    assert_eq!(fs::read_to_string(&h.paths.config).unwrap(), config);
+    assert!(
+        !h.paths.state.exists() || !h.state_text().contains("[modules"),
+        "no module choice in the state file"
+    );
+    let entries: Vec<String> = fs::read_dir(h.config_d(""))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(entries, ["50-panel.toml"], "no other file");
+    // A reset removes the key: config.toml's value is back.
+    let key = "output.hold_timeout_s".to_string();
+    h.call(|r| Command::ResetConfig(key, r), 0).unwrap();
+    assert_eq!(h.ctrl.config().output.hold_timeout_s, 3.0);
+    assert_eq!(h.row("output.hold_timeout_s").source, "config.toml");
+    // A write that changes nothing moves nothing.
+    let serial = h.snap().config_serial.unwrap();
+    h.call(|r| Command::SetBackendProfile("battery".into(), r), 0)
+        .unwrap();
+    assert_eq!(h.snap().config_serial.unwrap(), serial);
+}
+
+#[test]
+fn a_key_a_later_file_sets_is_refused_with_the_file() {
+    let mut h = H::new("", |_| {});
+    h.write_drop_in(
+        "90-local.toml",
+        &format!(
+            "[output]\nhold_timeout_s = 4.0\n[modules]\nprofile = \"quality\"\norder = \
+             [\"enhance\", \"denoise\", \"background\", \"relight\"]\n[modules.enabled]\n\
+             \"{MAXINE_MODULE}\" = true\n[modules.pin]\nbackground = \"\"\n"
+        ),
+    );
+    h.call(|r| Command::ReloadConfig(Some(r)), 0).unwrap();
+    let overridden = |e: Result<(), IpcError>| match e {
+        Err(IpcError::Disabled(m)) => assert_eq!(m, "Overridden by config.d/90-local.toml"),
+        other => panic!("{other:?}"),
+    };
+    overridden(h.set_config("output.hold_timeout_s", obc_ipc::ConfigValue::Int(9)));
+    overridden(h.call(
+        |r| Command::ResetConfig("output.hold_timeout_s".into(), r),
+        0,
+    ));
+    overridden(h.call(|r| Command::SetBackendProfile("battery".into(), r), 0));
+    overridden(h.call(
+        |r| Command::SetModuleEnabled(MAXINE_MODULE.into(), false, r),
+        0,
+    ));
+    overridden(h.call(
+        |r| Command::SetStagePin("background".into(), MAXINE_MODULE.into(), r),
+        0,
+    ));
+    overridden(h.call(|r| Command::SetStageOrder(Vec::new(), r), 0));
+    assert!(!h.config_d("50-panel.toml").exists(), "nothing written");
+    let row = h.row("output.hold_timeout_s");
+    assert_eq!(
+        (row.overridden_by.as_str(), row.enabled, row.source.as_str()),
+        ("config.d/90-local.toml", false, "config.d/90-local.toml")
+    );
+    assert_eq!(row.disabled_reason, "Overridden by config.d/90-local.toml");
+}
+
+#[test]
+fn a_reload_takes_a_hand_written_drop_in_and_names_a_bad_one() {
+    let mut h = H::new("[lifecycle]\nidle_grace_s = 7\n", |_| {});
+    let serial = h.snap().config_serial.unwrap();
+    h.write_drop_in("90-mine.toml", "[lifecycle]\nidle_grace_s = 9\n");
+    h.call(|r| Command::ReloadConfig(Some(r)), 0).unwrap();
+    assert_eq!(h.ctrl.config().idle_grace(), Duration::from_secs(9));
+    assert_eq!(
+        h.row("lifecycle.idle_grace_s").source,
+        "config.d/90-mine.toml"
+    );
+    assert_ne!(h.snap().config_serial.unwrap(), serial);
+    // A bad drop-in: refused, named with its line; the set stays.
+    h.write_drop_in("95-bad.toml", "\n[lifecycle]\nidle_grace = 1\n");
+    let e = h.call(|r| Command::ReloadConfig(Some(r)), 0).unwrap_err();
+    let msg = e.message().to_string();
+    assert!(matches!(e, IpcError::InvalidConfig(_)), "{e:?}");
+    assert!(
+        msg.contains("config.d/95-bad.toml") && msg.contains(":3"),
+        "{msg}"
+    );
+    assert_eq!(h.snap().error, msg);
+    assert_eq!(h.ctrl.config().idle_grace(), Duration::from_secs(9));
+    let files = h.ask(Command::GetConfigFiles).unwrap();
+    let bad = files
+        .files
+        .iter()
+        .find(|f| f.path == "config.d/95-bad.toml")
+        .unwrap();
+    assert_eq!(bad.status, "error");
+    assert!(!bad.reason.is_empty());
+    let managed = files.files.iter().find(|f| f.managed).unwrap();
+    assert_eq!(
+        (managed.path.as_str(), managed.status.as_str()),
+        ("config.d/50-panel.toml", "absent")
+    );
+    assert_eq!(files.files[0].path, "config.toml");
+    assert_eq!(files.serial, h.snap().config_serial.unwrap());
+    // A write while a file is bad is refused, naming it.
+    let e = h
+        .set_config("lifecycle.idle_grace_s", obc_ipc::ConfigValue::Int(2))
+        .unwrap_err();
+    assert!(matches!(e, IpcError::InvalidConfig(_)), "{e:?}");
+}
+
+#[test]
+fn set_config_refuses_unknown_read_only_and_invalid_values() {
+    let mut h = H::new("", |_| {});
+    use obc_ipc::ConfigValue as V;
+    assert!(matches!(
+        h.set_config("output.nope", V::Int(1)),
+        Err(IpcError::UnknownSetting(_))
+    ));
+    assert!(matches!(
+        h.set_config("modules.enabled.org.x.none", V::Bool(true)),
+        Err(IpcError::UnknownSetting(_))
+    ));
+    assert!(matches!(
+        h.set_config("output.mode", V::Str("1280x720@30".into())),
+        Err(IpcError::Disabled(_))
+    ));
+    assert!(matches!(
+        h.set_config("output.hold_timeout_s", V::Str("x".into())),
+        Err(IpcError::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        h.call(
+            |r| Command::SetConfig("output.hold_timeout_s".into(), None, r),
+            0
+        ),
+        Err(IpcError::InvalidArgument(_))
+    ));
+    assert!(!h.config_d("50-panel.toml").exists());
+    // A module row through SetConfig is the module method.
+    h.set_config(&format!("modules.enabled.{MAXINE_MODULE}"), V::Bool(false))
+        .unwrap();
+    assert!(!h.modules().find(MAXINE_MODULE).unwrap().enabled);
+    assert!(h.global_groups().is_empty());
+    h.set_config("modules.profile", V::Str("battery".into()))
+        .unwrap();
+    assert_eq!(h.snap().backend_profile.as_deref(), Some("battery"));
+}
+
+#[test]
+fn the_schema_has_the_module_rows_and_follows_the_modules_found() {
+    let mut h = H::new("", |_| {});
+    let schema = h.schema();
+    let ids: Vec<&str> = schema.groups.iter().map(|g| g.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "camera",
+            "output",
+            "loopback",
+            "lifecycle",
+            "effect",
+            "pipewire",
+            "modules"
+        ]
+    );
+    let row = h.row(&format!("modules.enabled.{MAXINE_MODULE}"));
+    assert_eq!(row.value, obc_ipc::ConfigValue::Bool(true));
+    let pin = h.row("modules.pin.background");
+    match &pin.kind {
+        obc_ipc::ConfigKind::Enum { options } => {
+            assert_eq!(options[0].0, "");
+            assert!(options.iter().any(|(v, _)| v == MAXINE_MODULE));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(schema.serial, h.snap().config_serial.unwrap());
+}
+
+#[test]
+fn the_order_moves_are_those_the_order_check_accepts() {
+    let mut h = H::new("", |_| {});
+    let moves = h.ask(Command::GetStageOrderMoves).unwrap();
+    let ids: Vec<&str> = moves.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["enhance", "denoise", "background", "relight"]);
+    assert!(!moves[0].up && !moves[3].down, "no neighbour");
+    // enhance and denoise may swap (an order the method accepts).
+    assert!(moves[0].down && moves[1].up);
+    assert_eq!(moves[2].slot, "matte");
+    let order = h.ctrl.order_ids();
+    for i in 0..moves.len() - 1 {
+        let mut o = order.clone();
+        o.swap(i, i + 1);
+        let accepted = h.call(|r| Command::SetStageOrder(o, r), 0).is_ok();
+        assert_eq!(accepted, moves[i].down, "{i} down");
+        assert_eq!(accepted, moves[i + 1].up, "{} up", i + 1);
+        h.call(|r| Command::SetStageOrder(Vec::new(), r), 0)
+            .unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_write_once_the_directory_is_writable_moves_the_waiting_choices_first() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut h = H::new("", |_| {});
+    let dir = h.paths.config.with_file_name("config.d");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    h.write_state(STATE_0_24);
+    h.restart();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    // No reload: the write moves the state's choices, then goes over them.
+    h.call(|r| Command::SetBackendProfile("quality".into(), r), 0)
+        .unwrap();
+    assert_eq!(
+        h.managed_key("modules.profile"),
+        Some(toml::Value::String("quality".into()))
+    );
+    assert_eq!(
+        h.managed_key(&format!("modules.enabled.{MAXINE_MODULE}")),
+        Some(toml::Value::Boolean(false))
+    );
+    assert!(h.managed_key("modules.pin.background").is_some());
+    assert!(!h.state_text().contains("[modules"));
+    assert_eq!(h.snap().backend_profile.as_deref(), Some("quality"));
+    assert!(!h.modules().find(MAXINE_MODULE).unwrap().enabled);
+}
+
+#[test]
+fn a_set_that_does_not_load_at_start_keeps_the_states_choices_in_force() {
+    let mut h = H::new("", |_| {});
+    fs::write(&h.paths.config, "[output]\nnope = 1\n").unwrap();
+    h.write_state(STATE_0_24);
+    h.restart();
+    assert!(!h.snap().error.is_empty());
+    // Not moved (nothing to write them into), in force from the state.
+    assert!(!h.config_d("50-panel.toml").exists());
+    assert_eq!(h.state_text(), STATE_0_24);
+    assert_eq!(h.snap().backend_profile.as_deref(), Some("battery"));
+    assert!(!h.modules().find(MAXINE_MODULE).unwrap().enabled);
+    // A write names the file that does not load.
+    let e = h
+        .call(|r| Command::SetBackendProfile("quality".into(), r), 0)
+        .unwrap_err();
+    assert!(matches!(e, IpcError::InvalidConfig(_)), "{e:?}");
+    assert_eq!(h.snap().backend_profile.as_deref(), Some("battery"));
+    // The first reload that succeeds moves them.
+    h.reload("", 0).unwrap();
+    assert!(!h.state_text().contains("[modules"));
+    assert_eq!(
+        h.managed_key("modules.profile"),
+        Some(toml::Value::String("battery".into()))
+    );
+    assert_eq!(h.snap().backend_profile.as_deref(), Some("battery"));
+    assert!(!h.modules().find(MAXINE_MODULE).unwrap().enabled);
+}
+
+#[test]
+fn no_order_move_is_offered_when_a_later_file_sets_the_order() {
+    let mut h = H::new("", |_| {});
+    let moves = h.ask(Command::GetStageOrderMoves).unwrap();
+    assert!(moves.iter().any(|m| m.up || m.down));
+    h.write_drop_in(
+        "90-local.toml",
+        "[modules]\norder = [\"enhance\", \"denoise\", \"background\", \"relight\"]\n",
+    );
+    h.call(|r| Command::ReloadConfig(Some(r)), 0).unwrap();
+    let moves = h.ask(Command::GetStageOrderMoves).unwrap();
+    assert_eq!(moves.len(), 4);
+    assert!(moves.iter().all(|m| !m.up && !m.down), "{moves:?}");
+    // As SetStageOrder refuses every order.
+    let mut o = h.ctrl.order_ids();
+    o.swap(0, 1);
+    assert!(matches!(
+        h.call(|r| Command::SetStageOrder(o, r), 0),
+        Err(IpcError::Disabled(_))
+    ));
+    // The managed file's own order leaves the moves.
+    fs::remove_file(h.config_d("90-local.toml")).unwrap();
+    h.write_drop_in(
+        "50-panel.toml",
+        "[modules]\norder = [\"enhance\", \"denoise\", \"background\", \"relight\"]\n",
+    );
+    h.call(|r| Command::ReloadConfig(Some(r)), 0).unwrap();
+    let moves = h.ask(Command::GetStageOrderMoves).unwrap();
+    assert!(moves[0].down && moves[1].up);
+}
+
+#[test]
+fn a_stale_managed_entry_for_a_module_no_longer_installed_is_reset() {
+    let mut h = H::new("", |_| {});
+    h.write_drop_in(
+        "50-panel.toml",
+        "[modules.enabled]\n\"org.gone.module\" = false\n[modules.pin]\nhaze = \"org.gone.module\"\n",
+    );
+    h.call(|r| Command::ReloadConfig(Some(r)), 0).unwrap();
+    for key in ["modules.enabled.org.gone.module", "modules.pin.haze"] {
+        let k = key.to_string();
+        h.call(|r| Command::ResetConfig(k, r), 0)
+            .unwrap_or_else(|e| panic!("{key}: {e:?}"));
+        assert_eq!(h.managed_key(key), None, "{key}");
+    }
+    assert!(matches!(
+        h.call(|r| Command::ResetConfig("modules.pin.haze".into(), r), 0),
+        Err(IpcError::UnknownSetting(_))
+    ));
+}
+
+#[test]
+fn enabling_a_module_that_fails_to_open_is_kept_and_says_why_in_its_status() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("missing.toml"),
+        "abi = 1\nid = \"org.x.missing\"\nname = \"N\"\nversion = \"1\"\nlicence = \"MIT\"\n\
+         kind = \"video-stage\"\nlibrary = \"/nonexistent/libx.so\"\n\
+         [[stage]]\nid = \"tint\"\nslot = \"post-composite\"\nrank = 1\ndevice = \"cpu\"\n\
+         frames = [\"host\"]\nformats = [\"nv12\"]\n",
+    )
+    .unwrap();
+    let mut h = H::new(&modules_config(dir.path()), |w| w.real_modules = true);
+    h.call(
+        |r| Command::SetModuleEnabled("org.x.missing".into(), false, r),
+        0,
+    )
+    .unwrap();
+    // As in 0.24: an open that fails is no refusal; the status says why.
+    h.call(
+        |r| Command::SetModuleEnabled("org.x.missing".into(), true, r),
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        h.managed_key("modules.enabled.org.x.missing"),
+        Some(toml::Value::Boolean(true))
+    );
+    let list = h.modules();
+    let m = list.find("org.x.missing").unwrap();
+    assert!(m.enabled);
+    assert_eq!(m.status, "unavailable");
+    assert!(m.reason.contains("/nonexistent/libx.so"), "{}", m.reason);
 }

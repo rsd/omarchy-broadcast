@@ -11,7 +11,12 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use obc_ipc::config::{APPLY_LIVE, APPLY_RELOAD, FILE_ABSENT, FILE_LOADED};
 use obc_ipc::settings::{VariantDict, WireChange, camera_option};
+use obc_ipc::{
+    CONFIG_REVISION, ConfigFileEntry, ConfigFiles, ConfigGroup, ConfigKind, ConfigRow,
+    ConfigSchema, ConfigValue,
+};
 use obc_ipc::{
     CameraControl, CameraControls, CameraInfo, Condition, ConditionOp, INTERFACE,
     INTERFACE_REVISION, IpcError, OBJECT_PATH, OmarchyBroadcastProxy, ResetScope,
@@ -55,6 +60,88 @@ struct Mock {
     modules_serial: u32,
     order: Vec<String>,
     profile: String,
+    /// The config schema (revision 10), with `ConfigSerial`.
+    config: Vec<ConfigGroup>,
+    config_serial: u32,
+}
+
+const OVERRIDDEN: &str = "output.aspect";
+const LOCAL: &str = "config.d/90-local.toml";
+
+fn config_row(id: &str, kind: ConfigKind, value: ConfigValue, default: ConfigValue) -> ConfigRow {
+    ConfigRow {
+        id: id.into(),
+        label: id.into(),
+        description: format!("Help for {id}."),
+        kind,
+        value,
+        default: Some(default),
+        editable: true,
+        source: String::new(),
+        overridden_by: String::new(),
+        apply: APPLY_RELOAD.into(),
+        enabled: true,
+        disabled_reason: String::new(),
+    }
+}
+
+fn mock_config() -> Vec<ConfigGroup> {
+    let mut aspect = config_row(
+        OVERRIDDEN,
+        ConfigKind::Enum {
+            options: vec![
+                ("crop".into(), "Crop to fill".into()),
+                ("letterbox".into(), "Letterbox".into()),
+            ],
+        },
+        ConfigValue::Str("letterbox".into()),
+        ConfigValue::Str("crop".into()),
+    );
+    aspect.source = LOCAL.into();
+    aspect.overridden_by = LOCAL.into();
+    aspect.enabled = false;
+    aspect.disabled_reason = format!("Overridden by {LOCAL}");
+    let mut grace = config_row(
+        "lifecycle.idle_grace_s",
+        ConfigKind::Float {
+            min: 0.0,
+            max: 3600.0,
+            step: 0.5,
+            unit: Some("s".into()),
+        },
+        ConfigValue::Float(5.0),
+        ConfigValue::Float(5.0),
+    );
+    grace.apply = APPLY_LIVE.into();
+    let mut mode = config_row(
+        "output.mode",
+        ConfigKind::String,
+        ConfigValue::Str("1920x1080@30".into()),
+        ConfigValue::Str("1920x1080@30".into()),
+    );
+    mode.editable = false;
+    vec![
+        ConfigGroup {
+            id: "output".into(),
+            label: "Output".into(),
+            rows: vec![mode, aspect],
+        },
+        ConfigGroup {
+            id: "lifecycle".into(),
+            label: "Start and stop".into(),
+            rows: vec![grace],
+        },
+        ConfigGroup {
+            id: "modules".into(),
+            label: "Modules".into(),
+            rows: vec![config_row(
+                "modules.enabled.org.example.hello",
+                ConfigKind::Bool,
+                ConfigValue::Bool(true),
+                ConfigValue::Bool(true),
+            )],
+        },
+    ]
 }
 
 /// The setting the mock always answers `RateLimited` for.
@@ -239,7 +326,35 @@ impl Mock {
             modules_serial: 1,
             order: vec!["hello".into()],
             profile: "quality".into(),
+            config: mock_config(),
+            config_serial: 1,
         }
+    }
+
+    /// The editable, enabled config row `key`, or the daemon's refusal.
+    fn config_row_mut(&mut self, key: &str) -> Result<&mut ConfigRow, IpcError> {
+        let row = self
+            .config
+            .iter_mut()
+            .flat_map(|g| g.rows.iter_mut())
+            .find(|r| r.id == key)
+            .ok_or_else(|| IpcError::UnknownSetting(format!("No configuration key {key}")))?;
+        if !row.editable {
+            return Err(IpcError::Disabled(format!(
+                "{key} cannot be changed here: set it in config.toml"
+            )));
+        }
+        if !row.enabled {
+            return Err(IpcError::Disabled(row.disabled_reason.clone()));
+        }
+        Ok(row)
+    }
+
+    async fn config_changed_now(&mut self, emitter: &SignalEmitter<'_>) -> Result<(), IpcError> {
+        self.config_serial += 1;
+        self.config_serial_changed(emitter).await?;
+        Mock::config_changed(emitter, self.config_serial).await?;
+        Ok(())
     }
 
     fn settings_tree(&self, at: usize) -> SettingsTree {
@@ -488,6 +603,92 @@ impl Mock {
 
     async fn set_stage_pin(&mut self, _stage: String, _module: String) -> Result<(), IpcError> {
         Ok(())
+    }
+
+    #[zbus(out_args("serial", "groups"))]
+    async fn get_config_schema(&self) -> (u32, Vec<VariantDict>) {
+        ConfigSchema {
+            serial: self.config_serial,
+            groups: self.config.clone(),
+        }
+        .to_wire()
+    }
+
+    async fn set_config(
+        &mut self,
+        key: String,
+        value: OwnedVariant,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        let value = ConfigValue::from_variant(&value);
+        let row = self.config_row_mut(&key)?;
+        let value = match (&row.kind, value) {
+            (ConfigKind::Bool, Some(v @ ConfigValue::Bool(_))) => v,
+            (ConfigKind::Float { min, max, .. }, Some(ConfigValue::Float(f)))
+                if (*min..=*max).contains(&f) =>
+            {
+                ConfigValue::Float(f)
+            }
+            (ConfigKind::Float { min, max, .. }, Some(ConfigValue::Int(i)))
+                if (*min..=*max).contains(&(i as f64)) =>
+            {
+                ConfigValue::Float(i as f64)
+            }
+            _ => return Err(IpcError::InvalidArgument(format!("{key}: invalid value"))),
+        };
+        row.value = value;
+        row.source = "config.d/50-panel.toml".into();
+        self.config_changed_now(&emitter).await
+    }
+
+    async fn reset_config(
+        &mut self,
+        key: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        let row = self.config_row_mut(&key)?;
+        if let Some(d) = row.default.clone() {
+            row.value = d;
+        }
+        row.source = String::new();
+        self.config_changed_now(&emitter).await
+    }
+
+    #[zbus(out_args("serial", "dir", "files"))]
+    async fn get_config_files(&self) -> (u32, String, Vec<(String, String, bool, String)>) {
+        ConfigFiles {
+            serial: self.config_serial,
+            dir: "/home/u/.config/omarchy-broadcast".into(),
+            files: vec![
+                ConfigFileEntry {
+                    path: "config.toml".into(),
+                    status: FILE_LOADED.into(),
+                    managed: false,
+                    reason: String::new(),
+                },
+                ConfigFileEntry {
+                    path: "config.d/50-panel.toml".into(),
+                    status: FILE_ABSENT.into(),
+                    managed: true,
+                    reason: String::new(),
+                },
+                ConfigFileEntry {
+                    path: LOCAL.into(),
+                    status: FILE_LOADED.into(),
+                    managed: false,
+                    reason: String::new(),
+                },
+            ],
+        }
+        .to_wire()
+    }
+
+    #[zbus(signal)]
+    async fn config_changed(emitter: &SignalEmitter<'_>, serial: u32) -> zbus::Result<()>;
+
+    #[zbus(property)]
+    fn config_serial(&self) -> u32 {
+        self.config_serial
     }
 
     async fn acquire_preview(
@@ -962,10 +1163,12 @@ async fn proxy_reads_every_property() {
             settings_schema_serial: Some(1),
             modules_serial: Some(1),
             backend_profile: Some("quality".into()),
+            config_serial: Some(1),
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 9);
+    assert_eq!(INTERFACE_REVISION, 10);
+    assert_eq!(INTERFACE_REVISION, CONFIG_REVISION);
     assert_eq!(proxy.inner().interface().as_str(), INTERFACE);
 }
 
@@ -1933,4 +2136,169 @@ async fn the_module_members_round_trip() {
     within("pin", proxy.set_stage_pin("hello", ""))
         .await
         .unwrap();
+}
+
+/// The configuration members of revision 10: the schema, a write, a reset
+/// and their refusals, the file list, `ConfigChanged` and `ConfigSerial`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_config_members_round_trip() {
+    let (_server, client) = pair().await;
+    let proxy = OmarchyBroadcastProxy::builder(&client)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .unwrap();
+    let mut changes = proxy.receive_config_changed().await.unwrap();
+    let schema = within("schema", proxy.config_schema()).await.unwrap();
+    assert_eq!(
+        schema,
+        ConfigSchema {
+            serial: 1,
+            groups: mock_config()
+        }
+    );
+    let schema = within("schema", proxy.config_schema_no_autostart())
+        .await
+        .unwrap();
+    let aspect = schema.find(OVERRIDDEN).unwrap();
+    assert!(!aspect.enabled);
+    assert_eq!(aspect.overridden_by, LOCAL);
+    assert_eq!(proxy.config_serial().await.unwrap(), 1);
+
+    // A whole number for a float row.
+    within(
+        "SetConfig",
+        proxy.set_config_value("lifecycle.idle_grace_s", &ConfigValue::Int(10)),
+    )
+    .await
+    .unwrap();
+    let signal = within("ConfigChanged", changes.next()).await.unwrap();
+    assert_eq!(signal.args().unwrap().serial, 2);
+    let schema = within("schema", proxy.config_schema()).await.unwrap();
+    assert_eq!(schema.serial, 2);
+    let grace = schema.find("lifecycle.idle_grace_s").unwrap();
+    assert_eq!(grace.value, ConfigValue::Float(10.0));
+    assert_eq!(grace.source, "config.d/50-panel.toml");
+    within(
+        "SetConfig",
+        proxy.set_config_value(
+            "modules.enabled.org.example.hello",
+            &ConfigValue::Bool(false),
+        ),
+    )
+    .await
+    .unwrap();
+    within("ResetConfig", proxy.reset_config("lifecycle.idle_grace_s"))
+        .await
+        .unwrap();
+    let schema = within("schema", proxy.config_schema()).await.unwrap();
+    assert_eq!(schema.serial, 4);
+    assert_eq!(
+        schema.find("lifecycle.idle_grace_s").unwrap().value,
+        ConfigValue::Float(5.0)
+    );
+    assert_eq!(
+        schema
+            .find("modules.enabled.org.example.hello")
+            .unwrap()
+            .value,
+        ConfigValue::Bool(false)
+    );
+
+    // The refusals map back by name.
+    let e = within(
+        "SetConfig",
+        proxy.set_config_value(OVERRIDDEN, &ConfigValue::Str("crop".into())),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&e, IpcError::Disabled(m) if m == "Overridden by config.d/90-local.toml"),
+        "{e:?}"
+    );
+    let e = within("ResetConfig", proxy.reset_config("output.mode"))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, IpcError::Disabled(_)), "{e:?}");
+    let e = within(
+        "SetConfig",
+        proxy.set_config_value("output.nothing", &ConfigValue::Bool(true)),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(e, IpcError::UnknownSetting(_)), "{e:?}");
+    let e = within(
+        "SetConfig",
+        proxy.set_config_value("lifecycle.idle_grace_s", &ConfigValue::List(vec![])),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(e, IpcError::InvalidArgument(_)), "{e:?}");
+
+    let files = within("files", proxy.config_files()).await.unwrap();
+    assert_eq!(files.serial, 4);
+    assert_eq!(files.dir, "/home/u/.config/omarchy-broadcast");
+    let managed: Vec<&str> = files
+        .files
+        .iter()
+        .filter(|f| f.managed)
+        .map(|f| f.path.as_str())
+        .collect();
+    assert_eq!(managed, ["config.d/50-panel.toml"]);
+    let again = within("files", proxy.config_files_no_autostart())
+        .await
+        .unwrap();
+    assert_eq!(again, files);
+}
+
+/// `GetConfigSchema` and `GetConfigFiles` introspect with their out args,
+/// so a client sees `(u serial, aa{sv} groups)` and `(u serial, s dir,
+/// a(ssbs) files)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_config_methods_have_their_signatures() {
+    let (_server, client) = pair().await;
+    let xml = within(
+        "Introspect",
+        fdo::IntrospectableProxy::builder(&client)
+            .destination(obc_ipc::BUS_NAME)
+            .path(OBJECT_PATH)
+            .build(),
+    )
+    .await
+    .unwrap()
+    .introspect()
+    .await
+    .unwrap();
+    for (method, args) in [
+        (
+            "GetConfigSchema",
+            &[("serial", "u"), ("groups", "aa{sv}")][..],
+        ),
+        (
+            "GetConfigFiles",
+            &[("serial", "u"), ("dir", "s"), ("files", "a(ssbs)")][..],
+        ),
+    ] {
+        let m = method_element(&xml, method);
+        let outs: Vec<&str> = m
+            .split("<arg ")
+            .filter(|a| a.contains("direction=\"out\""))
+            .collect();
+        assert_eq!(outs.len(), args.len(), "{m}");
+        for (arg, (name, ty)) in outs.iter().zip(args) {
+            assert!(
+                arg.contains(&format!("name=\"{name}\""))
+                    && arg.contains(&format!("type=\"{ty}\"")),
+                "{name} {ty} not in {arg}"
+            );
+        }
+    }
+    for needle in [
+        r#"<method name="SetConfig">"#,
+        r#"<method name="ResetConfig">"#,
+        r#"<signal name="ConfigChanged">"#,
+        r#"<property name="ConfigSerial" type="u" access="read"/>"#,
+    ] {
+        assert!(xml.contains(needle), "{needle} not in {xml}");
+    }
 }

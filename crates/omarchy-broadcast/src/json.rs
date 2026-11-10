@@ -338,6 +338,10 @@ struct SnapshotLine<'a> {
     /// The settings schema version the daemon's settings follow
     /// ([`SETTINGS_SCHEMA`]); `null` before revision 7.
     settings_schema: Option<u32>,
+    /// `ModulesSerial`; `0` before revision 9.
+    modules_serial: u32,
+    /// `ConfigSerial`; `0` before revision 10.
+    config_serial: u32,
 }
 
 #[derive(Serialize)]
@@ -401,6 +405,15 @@ struct FrameLine<'a> {
     path: &'a str,
 }
 
+/// `config_changed` and `modules_changed`.
+#[derive(Serialize)]
+struct SerialLine {
+    v: u32,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    serial: u32,
+}
+
 #[derive(Serialize)]
 struct ErrorLine<'a> {
     v: u32,
@@ -433,6 +446,26 @@ fn bounded_cameras_line<'a>(
     }
 }
 
+/// `{"v":1,"type":"config_changed","serial":N}`: the daemon's
+/// `ConfigChanged` signal (revision 10).
+pub fn config_changed_line(serial: u32) -> String {
+    to_line(&SerialLine {
+        v: VERSION,
+        kind: "config_changed",
+        serial,
+    })
+}
+
+/// `{"v":1,"type":"modules_changed","serial":N}`: `ModulesSerial` moved
+/// (revision 9).
+pub fn modules_changed_line(serial: u32) -> String {
+    to_line(&SerialLine {
+        v: VERSION,
+        kind: "modules_changed",
+        serial,
+    })
+}
+
 /// `{"v":1,"type":"snapshot",...}`: every property. Should the line exceed
 /// [`MAX_LINE_BYTES`] (which only strings and lists at their bounds can
 /// make it do), its image controls are cut first, then its cameras.
@@ -451,6 +484,8 @@ pub fn snapshot_line(s: &Snapshot) -> String {
                 .map(|c| Controls::of(c, control_limit)),
             settings_revision: model::settings_revision(s),
             settings_schema: model::has_settings(s).then_some(SETTINGS_SCHEMA),
+            modules_serial: s.modules_serial.unwrap_or(0),
+            config_serial: s.config_serial.unwrap_or(0),
         })
     };
     let mut cameras = MAX_CAMERAS;
@@ -776,7 +811,7 @@ struct SettingsClearLine {
 /// with an empty array, keeps the line within [`MAX_LINE_BYTES`]: filled
 /// greedily, in order. An item too long to fit a line on its own (which the
 /// bounds prevent) is left out, so that the cap stays a guarantee.
-fn pack<T>(items: Vec<(T, usize)>, overhead: usize, max_items: usize) -> Vec<Vec<T>> {
+pub(crate) fn pack<T>(items: Vec<(T, usize)>, overhead: usize, max_items: usize) -> Vec<Vec<T>> {
     let mut runs = Vec::new();
     let mut run: Vec<T> = Vec::new();
     // Bytes of the run's items and the commas between them.
@@ -974,6 +1009,7 @@ mod tests {
             settings_schema_serial: None,
             modules_serial: None,
             backend_profile: None,
+            config_serial: None,
             interface_revision: 4,
         }
     }

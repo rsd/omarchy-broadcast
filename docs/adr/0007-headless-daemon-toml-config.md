@@ -1,6 +1,6 @@
 # ADR-0007: Headless daemon with a TOML config file
 
-- **Status:** Accepted. Amended by [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md): runtime changes go to a separate state file instead of being written back to `config.toml`, and the configuration is reloaded by `SIGHUP` or `ReloadConfig()` instead of by inotify
+- **Status:** Accepted. Amended by [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md): runtime changes go to a separate state file instead of being written back to `config.toml`, and the configuration is reloaded by `SIGHUP` or `ReloadConfig()` instead of by inotify. Amended further by [ADR-0026](0026-config-d-and-managed-config.md): the configuration is `config.toml` plus the files of `config.d/`, one of which the daemon manages
 
 ## Context
 - The existing nvbroadcast only works while its GUI is open, so a status-bar plugin cannot drive it alone.

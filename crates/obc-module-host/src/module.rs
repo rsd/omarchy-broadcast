@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use obc_backend::{Availability, HostBgr, StageId, StageList, Value};
 use obc_module_abi::{
@@ -190,6 +190,10 @@ struct ModuleCore {
     lock: Mutex<()>,
     id: String,
     log: LogSink,
+    /// The first settings description [`Module::settings`] read (and
+    /// validated), for the readers that must not call the module
+    /// ([`Module::cached_settings`]).
+    settings: OnceLock<SettingsDescription>,
 }
 
 // SAFETY: the module object is only used under `lock` (module calls) or
@@ -365,6 +369,7 @@ impl Module {
                 lock: Mutex::new(()),
                 id: manifest.id.clone(),
                 log,
+                settings: OnceLock::new(),
             }),
             manifest: Arc::new(manifest.clone()),
         })
@@ -442,7 +447,8 @@ impl Module {
     }
 
     /// The module's settings, validated (see [`crate::settings`]); each
-    /// setting dropped is logged.
+    /// setting dropped is logged. The first description read is kept for
+    /// [`Self::cached_settings`] (every clone shares it).
     pub fn settings(&self) -> Result<SettingsDescription, ModuleError> {
         let f = self
             .core
@@ -452,8 +458,18 @@ impl Module {
             .expect("checked at open");
         let json = self.core.json_call("The settings description", f)?;
         let stages: Vec<StageId> = self.manifest.stages.iter().map(|s| s.id.clone()).collect();
-        parse_settings(&json, &stages, |line| self.core.log(LogLevel::Warn, &line))
-            .map_err(|e| ModuleError::host(Status::Failed, e))
+        let settings = parse_settings(&json, &stages, |line| self.core.log(LogLevel::Warn, &line))
+            .map_err(|e| ModuleError::host(Status::Failed, e))?;
+        let _ = self.core.settings.set(settings.clone());
+        Ok(settings)
+    }
+
+    /// The settings description [`Self::settings`] read first, without
+    /// calling the module (`None` before a read succeeded): what a caller
+    /// outside the crash ledger's marker uses, the module's code having run
+    /// under it when it was opened.
+    pub fn cached_settings(&self) -> Option<SettingsDescription> {
+        self.core.settings.get().cloned()
     }
 
     /// Creates an unloaded instance.
