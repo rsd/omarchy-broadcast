@@ -1319,6 +1319,67 @@ mod tests {
         assert_eq!(failure.lock().unwrap().as_deref(), Some("static message"));
     }
 
+    /// A system-memory output on a fakesink, started.
+    fn cpu_output_started() -> Output {
+        require_elements(&["appsrc", "capssetter", "fakesink"]);
+        let contract: OutputContract = "320x240@30".parse().unwrap();
+        let mut o = Output::build_in(
+            OutputConfig::new(contract, OutputSink::Fake),
+            FrameMemory::System,
+        )
+        .unwrap();
+        o.start().unwrap();
+        o
+    }
+
+    /// A clock thread that panicked is an error, but the pipeline is taken
+    /// to NULL all the same: `reached_null` is true. CPU only.
+    #[test]
+    fn a_stop_after_an_observer_panic_reached_null() {
+        require_elements(&["appsrc", "capssetter", "fakesink"]);
+        let contract: OutputContract = "320x240@30".parse().unwrap();
+        let mut o = Output::build_in(
+            OutputConfig::new(contract, OutputSink::Fake),
+            FrameMemory::System,
+        )
+        .unwrap();
+        o.set_observer(Some(Arc::new(|_: &EmitInfo| panic!("observer failed"))));
+        o.start().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while o.is_running() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!o.is_running(), "the clock thread ended");
+        let e = o.stop_checked().unwrap_err();
+        assert!(e.reached_null, "{e}");
+        assert!(e.to_string().contains("observer failed"), "{e}");
+        // Idempotent: nothing left to fail.
+        assert!(o.stop_checked().is_ok());
+    }
+
+    /// A pipeline that ends its stop outside NULL (the bus handler raises
+    /// it back to READY as it reaches NULL) is `reached_null` false. CPU
+    /// only.
+    #[test]
+    fn a_stop_that_ends_outside_null_did_not_reach_null() {
+        let mut o = cpu_output_started();
+        o.pipeline().pipeline().set_auto_flush_bus(false);
+        let pipeline = o.pipeline().pipeline().downgrade();
+        o.pipeline().bus().set_sync_handler(move |_, msg| {
+            if let gst::MessageView::StateChanged(c) = msg.view()
+                && c.current() == gst::State::Null
+                && let Some(p) = pipeline.upgrade()
+                && msg.src() == Some(p.upcast_ref::<gst::Object>())
+            {
+                let _ = p.set_state(gst::State::Ready);
+            }
+            gst::BusSyncReply::Pass
+        });
+        let e = o.stop_checked().unwrap_err();
+        assert!(!e.reached_null, "{e}");
+        assert!(e.to_string().contains("not Null"), "{e}");
+    }
+
     #[test]
     fn a_dead_clock_thread_is_reported() {
         // A clock thread that ended without being stopped.

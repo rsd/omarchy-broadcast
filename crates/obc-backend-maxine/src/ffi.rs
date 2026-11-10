@@ -382,22 +382,46 @@ impl Registry {
         if let Some(why) = self.conflict(root, &wanted) {
             return Err(why);
         }
-        if let Some(o) = self
-            .opened
-            .iter()
-            .find(|o| o.names == *names && o.source == wanted)
-        {
-            return Ok(o.sdk);
+        if let Some(i) = serving(
+            self.opened.iter().map(|o| (&o.source, &o.names)),
+            names,
+            &wanted,
+        ) {
+            return Ok(self.opened[i].sdk);
         }
         let sdk = load(root, &wanted, names, &mut self.pin)?;
         let sdk: &'static Sdk = Box::leak(Box::new(sdk));
         self.opened.push(Opened {
-            source: wanted,
+            source: opened_source(wanted, self.pin.as_ref()),
             names: names.clone(),
             sdk,
         });
         Ok(sdk)
     }
+}
+
+/// The source to record for an SDK just loaded for `wanted`. An open from the
+/// search path wants `SearchPath(None)`, but the loader reported the
+/// directory it loaded from, and that is in `pin`: record it, so that a later
+/// open of that directory's root finds this SDK ([`serving`]).
+fn opened_source(wanted: Source, pin: Option<&Source>) -> Source {
+    match (&wanted, pin) {
+        (Source::SearchPath(None), Some(p @ Source::SearchPath(Some(_)))) => p.clone(),
+        _ => wanted,
+    }
+}
+
+/// The index of the SDK, among those opened (as their sources and names),
+/// that an open of `names` from `wanted` gets: one with the same names whose
+/// source [serves](Source::serves) `wanted`. Not only an equal source: an SDK
+/// loaded from the search path at a root's `lib` is that root's, and opening
+/// the root must not load it a second time.
+fn serving<'a>(
+    mut opened: impl Iterator<Item = (&'a Source, &'a LibNames)>,
+    names: &LibNames,
+    wanted: &Source,
+) -> Option<usize> {
+    opened.position(|(source, n)| n == names && source.serves(wanted))
 }
 
 /// What [`open`] would refuse `root` with because the SDK is already loaded
@@ -787,6 +811,54 @@ mod tests {
             "{e}"
         );
         assert_eq!(reg.pin, Some(Source::Root(a)));
+    }
+
+    /// `Sdk` cannot be built without the real libraries, so the lookup that
+    /// decides between reusing an SDK and loading again is tested on its own.
+    #[test]
+    fn a_root_open_reuses_the_sdk_the_search_path_loaded_from_its_lib() {
+        let b = PathBuf::from("/sdk/b");
+        let from_path = Source::SearchPath(Some("/sdk/b/lib".into()));
+        let loaded = [(&from_path, &NO_SUCH)];
+        // The root whose lib the search path served: the same SDK.
+        assert_eq!(
+            serving(loaded.iter().copied(), &NO_SUCH, &Source::Root(b)),
+            None,
+            "a lib that does not exist on disk is not canonical: not served"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("lib")).unwrap();
+        let from_path = Source::SearchPath(Some(root.join("lib")));
+        let loaded = [(&from_path, &NO_SUCH)];
+        let want = Source::Root(root.clone());
+        assert_eq!(serving(loaded.iter().copied(), &NO_SUCH, &want), Some(0));
+        // Other names, or another root: loaded again (or refused).
+        assert_eq!(serving(loaded.iter().copied(), &SDK_LIBS, &want), None);
+        let other = Source::Root(root.join("other"));
+        assert_eq!(serving(loaded.iter().copied(), &NO_SUCH, &other), None);
+        // An equal source is still found, and the search path again.
+        let same = [(&want, &NO_SUCH)];
+        assert_eq!(serving(same.iter().copied(), &NO_SUCH, &want), Some(0));
+        let any = Source::SearchPath(None);
+        assert_eq!(serving(loaded.iter().copied(), &NO_SUCH, &any), Some(0));
+        // What `Registry::open` records for a search-path open is the
+        // directory the loader reported (the pin), not the bare wish.
+        let recorded = opened_source(Source::SearchPath(None), Some(&from_path));
+        assert_eq!(recorded, from_path);
+        let loaded = [(&recorded, &NO_SUCH)];
+        assert_eq!(serving(loaded.iter().copied(), &NO_SUCH, &want), Some(0));
+        assert_eq!(
+            opened_source(Source::SearchPath(None), None),
+            Source::SearchPath(None)
+        );
+        assert_eq!(opened_source(want.clone(), Some(&from_path)), want);
+        // The registry sees the pin and the lookup agree.
+        let reg = Registry {
+            pin: Some(from_path),
+            opened: Vec::new(),
+        };
+        assert_eq!(reg.conflict(Some(&root), &want), None);
     }
 
     #[test]
