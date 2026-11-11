@@ -490,26 +490,29 @@ mod tests {
     #[test]
     fn without_a_watch_it_counts_every_second() {
         // A node that does not exist cannot be watched: polling instead.
+        // The holders live in a fake /proc, so nothing but a poll can see
+        // them change (no inotify watch, no real process whose fork or exec
+        // races other tests), and the deadline only bounds a failure.
         let dir = tempfile::tempdir().unwrap();
-        let node = fs::canonicalize(dir.path()).unwrap().join("video97");
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let node = root.join("video97");
+        let proc_dir = root.join("proc");
+        let fd_dir = proc_dir.join("4242").join("fd");
+        fs::create_dir_all(&fd_dir).unwrap();
         let seen: Arc<Mutex<Vec<u32>>> = Arc::default();
         let s = Arc::clone(&seen);
-        let w = ConsumerWatcher::spawn(PathBuf::from("/proc"), std::process::id(), move |n| {
-            s.lock().unwrap().push(n)
-        })
-        .unwrap();
+        let w = ConsumerWatcher::spawn(proc_dir, 1, move |n| s.lock().unwrap().push(n)).unwrap();
         w.watch(Some(node.clone()));
         let counts = || seen.lock().unwrap().clone();
-        assert!(wait_for(Duration::from_secs(2), || counts() == [0]));
-        // The node appears and a process holds it: the next poll sees it.
+        let limit = POLL_FALLBACK * 30;
+        assert!(wait_for(limit, || counts() == [0]), "{:?}", counts());
+        // The node appears and a process holds it: a later poll sees it.
         fs::write(&node, b"").unwrap();
-        let h = Holder::spawn(&node);
-        assert!(
-            wait_for(POLL_FALLBACK * 3, || counts() == [0, 1]),
-            "{:?}",
-            counts()
-        );
-        drop(h);
-        drop(w);
+        std::os::unix::fs::symlink(&node, fd_dir.join("0")).unwrap();
+        assert!(wait_for(limit, || counts() == [0, 1]), "{:?}", counts());
+        // And it keeps polling: the release is seen too.
+        fs::remove_file(fd_dir.join("0")).unwrap();
+        assert!(wait_for(limit, || counts() == [0, 1, 0]), "{:?}", counts());
+        w.stop();
     }
 }

@@ -1136,6 +1136,21 @@ async fn pair_serving(iface: impl zbus::object_server::Interface) -> (Connection
     tokio::try_join!(server, client).unwrap()
 }
 
+/// A proxy whose property cache is filled before it is returned, for the
+/// tests that follow property changes through the cache. A lazily cached
+/// proxy (`OmarchyBroadcastProxy::new`) sends its `GetAll` in the background,
+/// and the server answers it in a task of its own: a change made meanwhile
+/// can emit its `PropertiesChanged` after `GetAll` read the old values but
+/// before the reply goes out. The cache then drops the change as older than
+/// the reply and keeps the old value until the next change.
+async fn cached(client: &Connection) -> OmarchyBroadcastProxy<'static> {
+    OmarchyBroadcastProxy::builder(client)
+        .cache_properties(CacheProperties::Yes)
+        .build()
+        .await
+        .unwrap()
+}
+
 async fn within<F: std::future::Future>(what: &str, f: F) -> F::Output {
     tokio::time::timeout(TIMEOUT, f)
         .await
@@ -1354,7 +1369,7 @@ async fn proxy_calls_every_method_and_sees_changes() {
     // A caching proxy learns of changes from PropertiesChanged, which may
     // arrive after the method reply; an uncached one reads the server's
     // value at the time of the call.
-    let proxy = OmarchyBroadcastProxy::new(&client).await.unwrap();
+    let proxy = cached(&client).await;
     let uncached = OmarchyBroadcastProxy::builder(&client)
         .cache_properties(CacheProperties::No)
         .build()
@@ -1611,7 +1626,7 @@ async fn the_camera_control_methods_and_property() {
         .build()
         .await
         .unwrap();
-    let cached = OmarchyBroadcastProxy::new(&client).await.unwrap();
+    let cached = cached(&client).await;
     let mut changes = cached.receive_camera_controls_changed().await;
 
     let got = within("GetCameraControls", proxy.get_camera_controls(""))
@@ -1649,11 +1664,19 @@ async fn the_camera_control_methods_and_property() {
             controls: vec![sharpness(200, true)],
         }
     );
-    // The change is announced, and a cached proxy follows it.
-    let changed = within("CameraControls changed", changes.next())
-        .await
-        .expect("change stream");
-    assert_eq!(changed.get().await.unwrap(), view);
+    // The change is announced, and a cached proxy follows it. The property
+    // stream yields the value it was created with first, so the first item
+    // may still read the old value: wait for the item that carries the new
+    // one.
+    within("CameraControls changed", async {
+        loop {
+            let changed = changes.next().await.expect("change stream");
+            if changed.get().await.unwrap() == view {
+                break;
+            }
+        }
+    })
+    .await;
     let snap = within("snapshot", Snapshot::fetch(&proxy)).await.unwrap();
     assert_eq!(snap.camera_controls, Some(view));
 
@@ -1988,7 +2011,7 @@ async fn settings_changed_reaches_the_client_in_one_signal_per_operation() {
         .await
         .unwrap();
     let mut signals = proxy.receive_settings_changed().await.unwrap();
-    let cached = OmarchyBroadcastProxy::new(&client).await.unwrap();
+    let cached = cached(&client).await;
     let mut revisions = cached.receive_settings_revision_changed().await;
 
     // Turning automatic white balance off enables the temperature: both in
