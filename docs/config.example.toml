@@ -385,3 +385,12 @@ offer_nv12 = true
 # Example:
 #   [module."br.com.dias.maxine-vfx"]
 #   sdk_root = "/home/user/.local/opt/maxine/VideoFX"
+#
+# The Maxine AR module (eye contact and auto-framing) takes the same key for
+# the NVIDIA Maxine AR SDK, whose root is, in this order: the MAXINE_AR_ROOT
+# environment variable when it is set and not empty (the maxine-ar-sdk-local
+# environment file sets it, and then this key is ignored); this key;
+# /opt/nvidia/maxine/arsdk when that directory exists. It takes no other key.
+# See docs/setup/maxine.md.
+#   [module."br.com.dias.maxine-ar"]
+#   sdk_root = "/home/user/.local/opt/maxine/arsdk"

@@ -4,6 +4,8 @@ The video effects `blur` and `replace`, video noise removal, relighting and the 
 
 Without the SDK the daemon works as usual: the `none` effect and the passthrough need nothing from it, and an effect or noise removal that cannot load reports the reason in the daemon's `Error` property. Without the module (no manifest for it in a `modules.d` directory) the daemon offers no effect at all: the camera image passes through and `omarchy-broadcast modules` says `No effect modules installed`.
 
+The AR effects, eye contact and auto-framing, run on a second SDK through a second module, and are described in [The Maxine AR module](#the-maxine-ar-module).
+
 Background: [../research/maxine-linux.md](../research/maxine-linux.md) (access, licence, API). The SDK is never vendored in this repository, see [ADR-0003](../adr/0003-maxine-first-behind-backend-seam.md). The decision to leave the SDK tooling to omarchy-nvidia-sdks is in [ADR-0021](../adr/0021-nvidia-sdk-handover.md).
 
 ## The Maxine module
@@ -232,6 +234,58 @@ Problems with the SDK itself (download, package, architecture) are in omarchy-nv
 | The same, with a message that the frame size is out of range | The output contract is smaller than 80x80 or larger than 1920x1080 | Use an output mode within the range (`[output]` in `config.toml`); noise removal does not run outside it |
 | The daemon's `Warning` property (`Error` before interface revision 11) or the element's status names the mask-hardening kernel and a CUDA error `222` ("the NVIDIA driver is older than this build supports") | The driver rejects the PTX of the mask-hardening kernel: it is older than 570.26 | Update the NVIDIA driver to 570.26 or newer (`nvidia-smi --query-gpu=driver_version --format=csv,noheader`). With the default `on_failure = "black"` the virtual camera stays black until then |
 | The same, with CUDA error `221` | The driver cannot JIT-compile the kernel: `libnvidia-ptxjitcompiler.so.1` is missing from the driver installation | Reinstall the driver's userspace package (`nvidia-utils`) so that it provides `libnvidia-ptxjitcompiler.so.1`; check with `ldconfig -p \| grep ptxjitcompiler` |
+
+## The Maxine AR module
+
+Two more effects run on the NVIDIA Maxine **AR** SDK, through a second module of omarchy-broadcast, `br.com.dias.maxine-ar` ([ADR-0028](../adr/0028-maxine-ar-module.md)): **eye contact**, which redirects the eyes towards the camera, and **auto-framing**, a digital pan and zoom that keeps the face in frame. The AR SDK is a separate personal download from the Video Effects SDK; omarchy-nvidia-sdks packages it as `maxine-ar-sdk-local`. Everything on this page about not distributing the SDK (section 9) applies to it too.
+
+The module is the library `libobc_module_maxine_ar.so` and the manifest `maxine-ar.toml`. The Arch package installs it next to the Maxine module and lists `maxine-ar-sdk-local` as an optional dependency; `scripts/install-user.sh` installs it for the current user in the same way as the Maxine module (see "From a checkout" under [The Maxine module](#the-maxine-module)). It opens the SDK at run time, so it installs and loads without the SDK or an NVIDIA GPU. Without the SDK, or without the models the effect needs for your GPU, the effect's setting is greyed with the reason, for example `Maxine AR SDK not installed` or `No face detection models for this GPU (sm_120)`. Check it with `omarchy-broadcast modules` and `omarchy-broadcast modules info br.com.dias.maxine-ar`.
+
+| Stage | Setting | SDK features and models needed |
+|---|---|---|
+| `eye-contact` | `effect.eye_contact.enabled` | `nvarfaceboxdetection`, `nvarlandmarkdetection` and `nvargazeredirection`, with the models for your GPU architecture: face detection, 126-point face landmarks and gaze redirection |
+| `auto-frame` | `effect.auto_frame.enabled` | `nvarfaceboxdetection`, with its face detection models |
+
+The GPU and driver requirements are those of section 1. The names are those of the SDK's feature directories under `features/`; the daemon checks what is installed from these directories and the files in `lib/models`, without waking the GPU. `MAXINE_AR_FEATURES` in `/usr/share/maxine-ar/maxine-ar.env` lists the features the package was built with.
+
+**The SDK root.** The module takes it from the first of these that applies: `MAXINE_AR_ROOT` in the daemon's environment, when it is set and not empty (the package's environment file sets it); `sdk_root` in `[module."br.com.dias.maxine-ar"]` of `config.toml`; `/opt/nvidia/maxine/arsdk`, when that is a directory. Use an absolute path:
+
+```toml
+[module."br.com.dias.maxine-ar"]
+sdk_root = "/home/user/.local/opt/maxine/arsdk"
+```
+
+As for the Video Effects module, the environment file overrides the key, `LD_LIBRARY_PATH` is not needed (the module loads the SDK's libraries from the root by absolute path), and the SDK is loaded once per process: a different root takes `systemctl --user restart omarchy-broadcastd`. The two modules have separate roots, set separately. Any other key in the table is refused.
+
+**The os-release shim.** The AR SDK's feature libraries read `/etc/os-release` as the Video Effects SDK's do, so the daemon needs the shim described in section 3. The shim is process-wide: a daemon that already runs with the shipped drop-in (from `maxine-vfx-sdk-local`) needs nothing more for the AR module. The shipped drop-in names the Video Effects package's files, and the environment file it loads is that package's. If only `maxine-ar-sdk-local` is installed, write a drop-in of your own at `~/.config/systemd/user/omarchy-broadcastd.service.d/maxine-ar.conf` with the AR package's files, then `daemon-reload` and restart as in section 3:
+
+```ini
+[Service]
+EnvironmentFile=/usr/share/maxine-ar/maxine-ar.env
+Environment=LD_PRELOAD=/usr/lib/maxine-ar/os-release-shim.so
+```
+
+The environment file sets `MAXINE_AR_ROOT` and `MAXINE_OS_RELEASE` (so, as above, `sdk_root` is then ignored) and never `LD_PRELOAD`, which the drop-in sets. Without the package's environment file, the two lines that matter are `Environment=LD_PRELOAD=/usr/lib/maxine-ar/os-release-shim.so` and `Environment=MAXINE_OS_RELEASE=/usr/lib/maxine-ar/fake-os-release`.
+
+**Both SDKs in one process.** The two SDKs each ship a `libNVCVImage` of the same soname, and bundle the same major versions of CUDA and TensorRT. Using the Video Effects module and the AR module in one daemon is tested, with either SDK loaded first ([../testing.md](../testing.md#maxine-ar-module-tests-ignored)).
+
+**Using the effects.** Both are off by default, and are in the settings tree (the bar's panel and `omarchy-broadcast settings`):
+
+- **Eye contact** (`effect.eye_contact.enabled`). It redirects the eyes of the largest face in view towards the camera. With no face the picture is unchanged. There is no strength control: the SDK has none, and its other parameters are left at the SDK's defaults. **Natural look-away** (`effect.eye_contact.look_away`, applies on reload) lets the eyes leave the camera now and then, as a person's do.
+- **Auto-framing** (`effect.auto_frame.enabled`). It crops the frame around the largest face and scales the crop back to the frame's size, so the face stays centred as the person moves. **Framing** (`effect.auto_frame.framing`: Tight, Medium or Wide, live) sets how close the crop is. The zoom is capped at 1.5 times. Small head movements do not move the picture, the motion is smoothed, and when the face is lost the crop holds for about two seconds and then eases back to the full frame. It zooms the picture after the camera image has been scaled to the output size, so a zoomed picture shows less detail than the camera captured.
+- **Order.** They run before noise removal, the cut-out and relighting, eye contact first and auto-framing second by default; `omarchy-broadcast order` reorders them within that part of the pipeline.
+- **They fail open.** If a stage cannot load or run, it is dropped with a `Warning` and the video goes on without it.
+
+If the stage is greyed or does not run, the reason is the one `omarchy-broadcast modules` shows. The usual ones are in this table; the rows of section 7 about the shim and the unit apply to this module too.
+
+| Reason shown | Cause | Fix |
+|---|---|---|
+| `Maxine AR SDK not installed` | No SDK root was found, or it lacks the core libraries | Install `maxine-ar-sdk-local`, or set `sdk_root` or `MAXINE_AR_ROOT`; restart the daemon |
+| `Maxine AR face detection not installed`, `Maxine AR landmark detection not installed` or `Maxine AR eye contact not installed` | The package was built without that feature | Rebuild `maxine-ar-sdk-local` with the feature (the table above), reinstall it and restart the daemon |
+| `No face detection models for this GPU (sm_120)` (or `126-point face landmark`, or `Eye Contact`) | The package has no models of that kind for your GPU architecture | `ls /opt/nvidia/maxine/arsdk/lib/models`, and rebuild the package for your architecture |
+| The stage is available but is dropped, and the `Warning` names an SDK status | The shim is not applied to the daemon (the feature libraries read `/etc/os-release`), or the models are not found | The shim paragraph above and section 3; `MAXINE_OS_RELEASE_DEBUG=1` shows the redirect |
+
+To remove the module's drop-in, delete `maxine-ar.conf` as in section 8. The AR package is removed with `sudo pacman -R maxine-ar-sdk-local`, only if nothing else uses it.
 
 ## 8. Uninstall
 

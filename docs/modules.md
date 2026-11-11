@@ -9,7 +9,8 @@ Where to look:
 - the C header, [`crates/obc-module-abi/include/omarchy_broadcast_module.h`](../crates/obc-module-abi/include/omarchy_broadcast_module.h) (installed by the Arch package as `/usr/include/omarchy-broadcast/omarchy_broadcast_module.h`): the ABI, with a comment on every structure, function and constant;
 - the Rust SDK, `crates/obc-module-sdk`: a safe API over the ABI;
 - the example, [`examples/module-hello`](../examples/module-hello/README.md): a complete module, built on its own outside the workspace as a third-party module would be;
-- the Maxine module, `crates/obc-module-maxine`: a module with several stages, a probe of the filesystem, settings and CUDA frames.
+- the Maxine module, `crates/obc-module-maxine`: a module with several stages, a probe of the filesystem, settings and CUDA frames;
+- the Maxine AR module, `crates/obc-module-maxine-ar` ([ADR-0028](adr/0028-maxine-ar-module.md)): a second example, a module with two stages that share one SDK, its own configuration table and a probe that reports each stage's reason separately.
 
 ## What a module provides
 
@@ -119,7 +120,7 @@ The daemon reads manifests from these directories, in order; a later directory o
 
 Discovery reads manifests and nothing else: no library is opened, so a broken library cannot stop the daemon from starting. The daemon looks again at its start and on `SIGHUP` or `ReloadConfig`. A library is opened for a module that is **enabled** (all are, except the ones the configuration's `[modules] disabled`, a `modules.enabled.<id> = false`, the user, or the crash ledger disabled): `omarchy-broadcast modules enable|disable ID`.
 
-The Arch package installs the Maxine module as `/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so` with its manifest, `maxine-vfx.toml`, in `/usr/lib/omarchy-broadcast/modules.d` (the manifest names the library by absolute path). `scripts/install-user.sh` in a checkout builds the Maxine module and installs it for the current user, in `~/.local/share/omarchy-broadcast/modules/` with a manifest in `~/.local/share/omarchy-broadcast/modules.d/`, which replaces the packaged manifest of the same id. A module you build yourself goes in your own `modules.d`, with `library` relative to the manifest or absolute.
+The Arch package installs the Maxine module as `/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so` with its manifest, `maxine-vfx.toml`, in `/usr/lib/omarchy-broadcast/modules.d` (the manifest names the library by absolute path); the Maxine AR module is installed likewise (`libobc_module_maxine_ar.so`, `maxine-ar.toml`). `scripts/install-user.sh` in a checkout builds both Maxine modules and installs them for the current user, in `~/.local/share/omarchy-broadcast/modules/` with a manifest in `~/.local/share/omarchy-broadcast/modules.d/`, which replaces the packaged manifest of the same id. A module you build yourself goes in your own `modules.d`, with `library` relative to the manifest or absolute.
 
 **A rebuilt library needs a daemon restart.** Libraries are opened with `RTLD_NODELETE` and are never unloaded: a module may hold process-wide state that must outlive a reload, and code it started must never run unmapped. A library rebuilt at the same path is therefore not loaded again while the daemon runs; the code first loaded stays. A new or changed manifest, or a library at another path, is picked up on a reload; for a rebuilt library, run `systemctl --user restart omarchy-broadcastd`.
 

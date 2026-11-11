@@ -698,6 +698,29 @@ cargo test -p obc-module-maxine --test hardware -- --ignored --test-threads=1 --
 
 The frames are synthetic, so the tests assert what holds for any cut-out. The daemon's hardware tests (`crates/omarchy-broadcastd/tests/hardware.rs`, [Daemon effects test](#daemon-effects-test-ignored)) check first that the SDK can be loaded, then build the Maxine module (`cargo build -p obc-module-maxine`, in the profile of the test binary), write its manifest with the library's path into a directory and give it to the daemon they spawn as `OBC_MODULE_PATH`.
 
+### Maxine AR module tests (ignored)
+
+The module `br.com.dias.maxine-ar` ([ADR-0028](adr/0028-maxine-ar-module.md), `crates/obc-module-maxine-ar`) has a default suite that needs no SDK and no GPU:
+
+```sh
+cargo test -p obc-module-maxine-ar
+```
+
+It covers the manifest, the probe against temporary SDK trees (each stage's reason, by missing core library, feature or model), the configuration keys and the root precedence (`MAXINE_AR_ROOT`, then `sdk_root`, then the default), the settings, the framing arithmetic (the crop, the dead zone, the smoothing, the hold and the return to the full frame, at many frame sizes), the order the stages run in, and the exported library through the C ABI on a machine without the SDK.
+
+The hardware tests are `#[ignore]` and need the AR SDK, the os-release override and an NVIDIA GPU. They load the built library through the host as the daemon does, on CUDA frames in a context created like GStreamer's. Three test binaries: `hardware` (the two stages), and `hardware_vfx_first` and `hardware_ar_first`, which load the Video Effects module and the AR module in one process in the two possible orders (the two SDKs ship a `libNVCVImage` of the same soname); each is a binary of its own so that the load order is that of a fresh process. They need both SDKs' environment files:
+
+```sh
+set -a
+. /usr/share/maxine-ar/maxine-ar.env
+. /usr/share/maxine-vfx/maxine-vfx.env
+set +a
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env -u LD_LIBRARY_PATH LD_PRELOAD=/usr/lib/maxine-ar/os-release-shim.so MAXINE_OS_RELEASE=/usr/lib/maxine-ar/fake-os-release" \
+  cargo test -p obc-module-maxine-ar --test hardware --test hardware_vfx_first --test hardware_ar_first -- --ignored --test-threads=1 --nocapture
+```
+
+`OBC_TEST_FACE_IMAGE` names a binary PPM (P6) still of a face, 1920x1080 (`magick face.jpg face.ppm`), that the face cases run through the stages; without it those cases are skipped and the others run. For auto-framing the face should be small in the picture (its box under about 40 % of the height) and best off centre. `OBC_TEST_FACE_OUT`, when also set, writes the luma of the results as PGM files for a look at the pictures. The tests assert what holds for any face: a frame with no face passes through unchanged, a face changes the picture, an auto-framed picture is framed after a number of frames while the first frame is not, a temporal reset keeps the stages, and in both load orders each module's effect works with the other's loaded; they do not judge how the result looks. Some of them also print timings, which are for a local comparison and are not published.
+
 ## Manual test
 
 1. Create the loopback device as described in [setup/loopback.md](setup/loopback.md).
