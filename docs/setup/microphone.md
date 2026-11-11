@@ -1,6 +1,6 @@
 # Setting up the Omarchy Broadcast Mic
 
-"Omarchy Broadcast Mic" is an optional virtual microphone: your microphone with background noise removed, which any application can select like a hardware microphone. The processing is done by **audio modules**, loadable like the video effects ([modules.md](../modules.md#audio-modules)); the module that ships is a CPU one, with two engines (DeepFilterNet, the default, and RNNoise), so it needs no GPU and no vendor SDK. Other engines, including GPU ones, can be installed as further modules and appear as further providers of the same stage, with no change to this setup. The design and the reasons are in [ADR-0029](../adr/0029-audio-modules-mic-host-and-worker.md).
+"Omarchy Broadcast Mic" is an optional virtual microphone: your microphone with background noise removed, which any application can select like a hardware microphone. The processing is done by **audio modules**, loadable like the video effects ([modules.md](../modules.md#audio-modules)); the default module is a CPU one, with two engines (DeepFilterNet, the default, and RNNoise), so it needs no GPU and no vendor SDK. A second module, for NVIDIA GPUs, runs the NVIDIA Maxine Audio Effects (noise removal, room echo removal and studio voice); it needs the SDK, which you obtain yourself ([On an NVIDIA GPU](#on-an-nvidia-gpu-maxine-audio-effects)). Other engines can be installed as further modules and appear as further providers of the same stages, with no change to this setup. The design and the reasons are in [ADR-0029](../adr/0029-audio-modules-mic-host-and-worker.md).
 
 The microphone is independent of the virtual camera: neither needs the other, and the camera daemon is only the control panel of the microphone (it is not in the audio path). **Whatever stops, you keep a microphone**: if a module, the worker or the daemon stops, applications that chose "Omarchy Broadcast Mic" keep receiving your microphone's own audio, unprocessed, and get the processed audio again when the part is back. It is never silent because of an effect.
 
@@ -33,6 +33,7 @@ The processing adds a delay: 10 ms to hand the audio to the worker and back (20 
 - PipeWire with WirePlumber 0.5 (the default on Omarchy).
 - A systemd user session.
 - Nothing else for the CPU module: DeepFilterNet and RNNoise are built into it, with no model files and no LADSPA package.
+- Optional, for the GPU module: an NVIDIA GPU and the Maxine Audio Effects SDK, as the `maxine-afx-sdk-local` package ([On an NVIDIA GPU](#on-an-nvidia-gpu-maxine-audio-effects)).
 
 ## Install
 
@@ -45,7 +46,8 @@ The package installs:
 - the mic host's PipeWire configuration, `/usr/share/omarchy-broadcast/pipewire/omarchy-broadcast-mic.conf`, and its unit `omarchy-broadcast-mic.service` (whose `ExecStart=` names that configuration by absolute path);
 - the forwarding plugin, `/usr/lib/ladspa/libomarchy_broadcast_mic.so`, which the configuration finds by name;
 - the worker, `/usr/bin/omarchy-broadcast-audiod`, with its units `omarchy-broadcast-audiod.service` and `omarchy-broadcast-audiod.socket` and the D-Bus activation file `br.com.dias.OmarchyBroadcast.AudioWorker.service`;
-- the CPU voice module and its manifest in `/usr/lib/omarchy-broadcast/modules` and `modules.d`, and the third-party licence notices.
+- the CPU voice module and the Maxine audio effects module, each with its manifest, in `/usr/lib/omarchy-broadcast/modules` and `modules.d`, and the third-party licence notices. The Maxine module loads the NVIDIA SDK at run time, so it installs and loads without it;
+- the worker's drop-in for that SDK, as an inactive example in `/usr/share/doc/omarchy-broadcast/examples/systemd/omarchy-broadcast-audiod.service.d/maxine-afx.conf`. The package lists `maxine-afx-sdk-local` as an optional dependency and never contains the SDK.
 
 Building the package fetches the DeepFilterNet source from its upstream repository (a git dependency pinned by commit), so `makepkg` needs network access.
 
@@ -54,10 +56,10 @@ Building the package fetches the DeepFilterNet source from its upstream reposito
 From the repository root, `scripts/install-user.sh --audio` ([daemon.md](daemon.md#per-user-install-from-a-checkout)) builds and installs the same parts without root, under `~/.local`:
 
 - the worker in `${XDG_BIN_HOME:-~/.local/bin}`;
-- the plugin, the mic host's configuration (with the plugin's absolute path) and the module's library and manifest under `${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/`;
+- the plugin, the mic host's configuration (with the plugin's absolute path) and the library and manifest of the CPU module and of the Maxine audio effects module under `${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/`;
 - the units in `${XDG_DATA_HOME:-~/.local/share}/systemd/user/` and the activation file in `${XDG_DATA_HOME:-~/.local/share}/dbus-1/services/`.
 
-It enables nothing and prints the next steps. `--audio` and `--mic` (the ADR 0014 units) are alternatives: the script refuses both in one run. `scripts/install-user.sh --uninstall` removes what it installed; it refuses while a mic unit is enabled, so turn the microphone off first (see [Undo](#undo)). The DeepFilterNet source is fetched once, so the first build needs network access.
+It enables nothing and prints the next steps, among them the command that copies the worker's Maxine drop-in (it does not install the drop-in itself). `--audio` and `--mic` (the ADR 0014 units) are alternatives: the script refuses both in one run. `scripts/install-user.sh --uninstall` removes what it installed; it refuses while a mic unit is enabled, so turn the microphone off first (see [Undo](#undo)). The DeepFilterNet source is fetched once, so the first build needs network access.
 
 ## Turn it on
 
@@ -139,6 +141,7 @@ The settings are in the settings tree, which `omarchy-broadcast settings` shows 
 | `mic.noise.enabled` ("Noise removal") | Noise removal on or off |
 | `mic.noise.strength` ("Strength", 0 to 100 %) | How much noise goes. One control for every provider of noise removal: each engine maps it its own way. 100 % is the strongest. Applies live, with no break in the sound |
 | `mic.cpu.engine` ("Engine") | `deepfilternet` (the default) or `rnnoise`. Reloads the engine; the audio stays raw for the moment the new one loads |
+| `mic.echo.*`, `mic.voice.*` | Room echo removal and studio voice, offered by the GPU module only: [On an NVIDIA GPU](#on-an-nvidia-gpu-maxine-audio-effects) |
 
 ```sh
 omarchy-broadcast settings set mic.noise.strength 70
@@ -146,7 +149,7 @@ omarchy-broadcast settings set mic.cpu.engine rnnoise
 omarchy-broadcast settings set mic.input.enabled off     # raw audio through the same source
 ```
 
-A module installed later adds its own settings to the same page (a switch and a strength for room echo removal, for instance), and a setting that cannot be changed now is shown with the reason.
+A module installed later adds its own settings to the same page (the GPU module's switch and strength for room echo removal, for instance), and a setting that cannot be changed now is shown with the reason.
 
 ### Choosing the engine
 
@@ -170,9 +173,78 @@ The `[mic]` keys are in [config.example.toml](../config.example.toml); the panel
 | `pipeline_depth` | `0` | Blocks of 10 ms between the microphone and the processed audio, 0 to 4; 0 chooses by device (1 on the CPU, 2 when a stage runs on a GPU). More tolerates a late block at the cost of delay |
 | `idle_exit_s` | `30` | Seconds without sound before the worker exits and frees its memory (and a GPU); 0 never exits |
 | `gpu_policy` | `"always"` | When a GPU module may be used: `always`, `with-camera` (only in a microphone session that starts while the camera runs) or `never`. A stage the GPU may not run runs on the best CPU module that offers it. A level meter alone never wakes the GPU |
-| `force_conflicts` | `false` | Run effects that their modules declare as excluding each other, together. For testing; set in a file |
+| `force_conflicts` | `false` | Run effects that their modules declare as excluding each other, together (studio voice with noise or room echo removal, [below](#studio-voice-excludes-noise-and-echo-removal)). For testing; set in a file |
 
 Which module provides a stage is chosen as for video: by rank, by the backend profile (`omarchy-broadcast modules profile battery` prefers a CPU module over a GPU one) and by pin (`omarchy-broadcast modules pin mic-denoise MODULE`). `omarchy-broadcast modules` lists the audio modules with their stages next to the video ones.
+
+## On an NVIDIA GPU (Maxine audio effects)
+
+On a machine with an NVIDIA GPU the microphone can run the NVIDIA Maxine Audio Effects, through a second audio module, `br.com.dias.maxine-afx`. It provides the same noise removal stage as the CPU module, ranked above it, and two more: room echo removal and studio voice. NVIDIA's SDK is licensed by NVIDIA and is never distributed with omarchy-broadcast: you download it with your own NVIDIA account, and the sibling project omarchy-nvidia-sdks packages it for Arch as `maxine-afx-sdk-local`. The module is installed by the Arch package and by `install-user.sh --audio` and opens the SDK only at run time, so everything above works without the SDK, on any machine: the CPU module keeps the microphone going and the Maxine stages are listed as unavailable, with the reason. The SDK's licence terms and the compatibility shim are described for the video SDK in [maxine.md](maxine.md#9-licence-and-support); they apply to this one too.
+
+Only the audio worker loads this SDK. The video daemon never does, so the daemon's own Maxine drop-in is not needed for the microphone, and this one is not needed for the camera.
+
+### Enable the worker's drop-in
+
+The SDK finds its feature libraries through the dynamic linker's search path, which is read once, when the process starts, and its model loader refuses the distributions NVIDIA lists, which Omarchy is not. Both are set up for the worker by a systemd user drop-in, shipped as an example and not active. Copy the one that matches your install of omarchy-broadcast, then reload:
+
+```sh
+# Arch package:
+install -Dm644 /usr/share/doc/omarchy-broadcast/examples/systemd/omarchy-broadcast-audiod.service.d/maxine-afx.conf \
+    ~/.config/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf
+# checkout (install-user.sh), from the repository root:
+install -Dm644 dist/systemd/omarchy-broadcast-audiod.service.d/maxine-afx.conf \
+    ~/.config/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf
+
+systemctl --user daemon-reload
+systemctl --user try-restart omarchy-broadcast-audiod.service
+```
+
+The worker starts on demand and exits when the microphone is idle, so the next start uses the drop-in even without the restart. The drop-in's header explains each line. In short:
+
+- `EnvironmentFile=` reads the package's environment file, which sets `LD_LIBRARY_PATH` (the SDK's libraries and each effect's feature library) and the file the shim shows in place of `/etc/os-release`. It has a `-` prefix, so if the package is removed the worker still starts, without the SDK.
+- `Environment=LD_PRELOAD=` names the package's os-release shim, on the worker only. NVIDIA does not support running its SDK on a distribution it does not list; the shim is what makes this process (and only this one) see a listed one. The real file is not touched and the worker's child processes do not inherit the shim.
+- For an SDK tree without the package, the drop-in has a commented alternative; the line that matters most is `LD_LIBRARY_PATH`, which must name the libraries of the root in use.
+
+The module requires `LD_LIBRARY_PATH` to lead to the feature libraries. Without the drop-in the Maxine stages are unavailable, with a reason that names it, and the microphone uses the CPU module.
+
+### Where the SDK is
+
+The module looks for the SDK root in this order: `sdk_root` in the module's table of `config.toml` (`[module."br.com.dias.maxine-afx"]`), then the `MAXINE_AFX_ROOT` environment variable, then `/opt/nvidia/maxine/afx`, where the package installs it. **This is the reverse of the video modules**, where the environment variable wins over the configured root ([maxine.md](maxine.md#the-sdk-root)): here the configured root comes first, so the `MAXINE_AFX_ROOT` that the package's environment file sets does not hide a root you chose. If you choose another root, `LD_LIBRARY_PATH` must name that root's libraries too; the drop-in's header lists the entries. The table takes no other key. A root change takes effect when the worker next starts.
+
+### What the Mic tab offers
+
+With the module usable, the same page gains groups, and noise removal's switch and strength become the GPU module's:
+
+| Setting | What it does |
+|---|---|
+| `mic.noise.enabled`, `mic.noise.strength` | The same switch and strength as with the CPU module (shared by every provider of noise removal). The strength applies live: it mixes the processed sound with your own, delayed to match, so a change never steps or reloads |
+| `mic.echo.enabled`, `mic.echo.strength` ("Room echo removal", off by default) | Removes the room's reverberation from the voice, before noise removal. Its strength applies live. While noise removal is on, the strength is greyed: both effects then run as one combined model, whose single strength is noise removal's. Turn noise removal off to set the echo strength on its own |
+| `mic.voice.enabled` ("Studio voice (adds noticeable delay)", off by default), `mic.voice.profile` ("Mic profile") | Re-creates the voice as if recorded in a studio. The profile (None, Bright, Vibrant, Flat, Full, Thin or Warm) changes the character; changing it reloads the chain |
+
+When noise removal and room echo removal are both on, the combined model is used where the SDK has it installed; if it is not there or fails to load, the two run one after the other as two effects. `omarchy-broadcast settings` lists the same settings, and `mic.cpu.engine` has no effect while the GPU module provides noise removal.
+
+**Delay.** Studio voice adds a delay you can notice in a conversation, which is why its label says so. The module measures each effect's delay when the chain is loaded and reports the chain's total, so the delay shown by `omarchy-broadcast mic` (and in the panel) is the delay of the audio you are sending now, studio voice included. If it is too much for a call, turn studio voice off; the other effects add less.
+
+### Studio voice excludes noise and echo removal
+
+Studio voice already removes noise and echo, so its stage declares a conflict with the other two. While it is on, their switches are greyed with the reason "Studio voice already removes noise and echo", and they do not run; turn studio voice off to use them again. To run studio voice together with them anyway, for testing, set the override in a configuration file (the panel does not change it):
+
+```toml
+[mic]
+force_conflicts = true
+```
+
+The combination is not tuned and adds the delay of each effect. It applies to every pair of effects whose modules declare a conflict, not only these.
+
+### Which module runs a stage
+
+The GPU module ranks above the CPU one, so it provides noise removal whenever it can run it, subject to `[mic] gpu_policy`. The `battery` profile picks the CPU module instead: `omarchy-broadcast modules profile battery` (back with `quality`). To use the CPU module for noise removal while keeping the GPU for room echo removal or studio voice, pin it: `omarchy-broadcast modules pin mic-denoise br.com.dias.voice-cpu`. A stage the GPU module does not provide runs on the CPU module, or not at all, and the Mic tab says why.
+
+### What it does with the GPU
+
+The GPU is used only while an application records from the source, never by a level meter, and only from the moment the worker loads a chain. Some of the SDK's effects keep their GPU memory until the process ends, so it is released when the worker exits after `idle_exit_s` seconds without sound, not the moment recording stops.
+
+If one stage cannot be loaded, only that stage is dropped and the rest of the chain runs. If an effect fails while running, that stage passes the voice through at the same delay, so the delay does not jump, and the rest keeps running. The microphone is never silent because of an effect, and if the worker itself stops you get your own audio, as described in [When something stops](#when-something-stops).
 
 ## When something stops
 
@@ -210,12 +282,20 @@ journalctl --user -u omarchy-broadcastd                                # the dae
 | The voice sounds clipped or pumping | The reduction is too strong | Lower `mic.noise.strength`, or use the other engine |
 | High CPU while recording | DeepFilterNet is the heavier engine | `settings set mic.cpu.engine rnnoise`, or lower the load another way |
 | A module is `disabled` | It crashed the worker twice in a row | Read the worker's log, then `omarchy-broadcast modules enable ID` |
+| The GPU stages say the worker's `LD_LIBRARY_PATH` does not name the Maxine feature libraries | The worker runs without the drop-in, or with one whose `LD_LIBRARY_PATH` leads to another root than the one in use | Install the drop-in ([Enable the worker's drop-in](#enable-the-workers-drop-in)), then `systemctl --user daemon-reload` and `try-restart omarchy-broadcast-audiod.service`. The CPU module keeps working meanwhile |
+| The GPU stages say `Maxine Audio Effects SDK not installed` | No SDK root was found, or it lacks the core library | Install `maxine-afx-sdk-local`, or set `sdk_root` or `MAXINE_AFX_ROOT` ([Where the SDK is](#where-the-sdk-is)) |
+| `Maxine ... not installed`, or `No ... models for this GPU` | The package was built without that effect, or without models for your GPU architecture | Rebuild `maxine-afx-sdk-local` with the effect for your architecture and reinstall it; `omarchy-broadcast modules info br.com.dias.maxine-afx` shows each stage's reason |
+| `NVIDIA driver not loaded` | The probe found no NVIDIA driver (`/proc/driver/nvidia` is missing) | Load the NVIDIA driver; the CPU module is used meanwhile |
+| The GPU stages are available but a stage drops out when the chain loads | The SDK refused the distribution (the shim is not applied to the worker) or the model could not be loaded | `Environment=MAXINE_OS_RELEASE_DEBUG=1` in the drop-in logs each redirect to the worker's journal; check that the drop-in's `LD_PRELOAD` line is active |
+| The microphone uses the CPU module though the GPU module is installed | The `battery` profile, a pin, `gpu_policy` (`never`, or `with-camera` without the camera) or the stages above | `omarchy-broadcast modules` shows the provider of each stage and why; `modules profile quality` and `modules pin` change it |
+| The voice has a noticeable delay | Studio voice is on | Turn it off, or check `omarchy-broadcast mic` for the total delay in force |
+| The CPU module only, after removing `maxine-afx-sdk-local` | The package's environment file is gone | Nothing to fix: the worker starts without the SDK (the `-` prefix) and the CPU module works. The dynamic linker logs that the shim cannot be preloaded; remove the drop-in to silence it |
 
 ## What it touches
 
 - **PipeWire and WirePlumber.** Only on your explicit actions: `mic default` writes WirePlumber's default-source setting (`default.configured.audio.source` in its `default` metadata) and sets the target of the capture stream, which WirePlumber stores in its own saved state for that stream (restore-stream). `mic restore-default`, and `mic off` when the Omarchy Broadcast Mic is the default, write the default back and delete the target. Nothing else is written to WirePlumber, and your own WirePlumber configuration files are never touched.
 - **Files.** `config.d/50-panel.toml` (the daemon's managed drop-in, with `[mic]`), the daemon's state file (the previous default microphone and the module settings), `audio-settings.json` and `audio-modules-crash.json` in the state directory, the worker's socket in `$XDG_RUNTIME_DIR/omarchy-broadcast/`, and the installed units, plugin and module. The worker holds audio in memory only; these processes store and send no audio.
-- **The GPU.** A GPU module is loaded only while an application records from the source (a level meter does not count) and the policy allows it; the worker exits after the idle time and releases it.
+- **The GPU.** A GPU module is loaded only while an application records from the source (a level meter does not count) and the policy allows it; the worker exits after the idle time and releases it. The Maxine audio module's SDK runs in the worker only, with the worker's own `LD_PRELOAD` and library path from its drop-in; the real `/etc/os-release` and the camera daemon are not touched.
 
 ## Undo
 
@@ -227,6 +307,8 @@ Without the daemon: change the default microphone back (`wpctl set-default ID` o
 
 - Arch package: `sudo pacman -R omarchy-broadcast-git` removes the daemon too; the microphone files alone are not removable separately. Leaving the unit disabled is enough.
 - `install-user.sh --audio`: `scripts/install-user.sh --uninstall`.
+
+The Maxine drop-in is yours: remove `~/.config/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf` (then `systemctl --user daemon-reload`) to go back to the worker's default unit. The SDK package is removed with `sudo pacman -R maxine-afx-sdk-local`, only if nothing else uses it.
 
 ---
 

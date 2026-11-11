@@ -37,6 +37,9 @@
 #   its module manifest                   -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules.d/voice-cpu.toml
 #                                            (from crates/obc-module-voice-cpu/voice-cpu.toml, library pointing at
 #                                            the installed module library)
+#   NVIDIA Maxine audio module library   -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules/libobc_module_afx.so
+#   its module manifest                   -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules.d/maxine-afx.toml
+#                                            (from crates/obc-module-afx/maxine-afx.toml, likewise)
 #   third-party licence notices           -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules/THIRD-PARTY-NOTICES
 #                                            (from dist/licenses/, for the code built into the module and the worker)
 #
@@ -47,7 +50,11 @@
 # from the maxine-vfx-sdk-local and maxine-ar-sdk-local packages (built from
 # the omarchy-nvidia-sdks repository), and the Maxine drop-in that uses them
 # is a manual step, printed at the end (docs/setup/maxine.md, section 3). The
-# daemon loads a module library once and never reloads it: restart a running
+# The Maxine audio module (--audio only, like the CPU voice module) is built
+# and installed the same way: it loads its SDK (the maxine-afx-sdk-local
+# package) at run time, and the worker's drop-in that uses it is a manual step,
+# printed at the end (dist/systemd/omarchy-broadcast-audiod.service.d/maxine-afx.conf).
+# The daemon loads a module library once and never reloads it: restart a running
 # daemon to pick up a rebuilt module. An earlier version of this script
 # installed its own copy of the shim in ~/.local/lib/omarchy-broadcast; a
 # re-run removes that copy (see Ownership).
@@ -78,7 +85,7 @@
 #   --audio      Also install the microphone with audio modules (see above), the
 #                alternative to --mic: not combined with it in one run, and not
 #                run together with its units. The build then also covers the
-#                worker, the plugin and the CPU voice module (the DeepFilterNet
+#                worker, the plugin, the CPU voice module and the Maxine audio module (the DeepFilterNet
 #                git dependency needs network access once). Without it, files
 #                installed by an earlier run stay in place, as with --mic.
 #   --uninstall  Remove what this script installed, and only that, including
@@ -132,8 +139,12 @@ PLUGIN_LIB=libomarchy_broadcast_mic.so
 VOICE_MODULE_CRATE=obc-module-voice-cpu
 VOICE_MODULE_LIB=libobc_module_voice_cpu.so
 VOICE_MODULE_MANIFEST=voice-cpu.toml
+# The Maxine audio module (--audio), built and installed like the voice module.
+AFX_MODULE_CRATE=obc-module-afx
+AFX_MODULE_LIB=libobc_module_afx.so
+AFX_MODULE_MANIFEST=maxine-afx.toml
 # File names whose ownership is the manifest checksum, not a marker line.
-SUMMED=("${BINARIES[@]}" "$AUDIO_BINARY" "$PLUGIN_LIB" "$MODULE_LIB" "$AR_MODULE_LIB" "$VOICE_MODULE_LIB" "${LEGACY_SHIM[@]}")
+SUMMED=("${BINARIES[@]}" "$AUDIO_BINARY" "$PLUGIN_LIB" "$MODULE_LIB" "$AR_MODULE_LIB" "$VOICE_MODULE_LIB" "$AFX_MODULE_LIB" "${LEGACY_SHIM[@]}")
 UNIT_NAME=omarchy-broadcastd.service
 DBUS_NAME=br.com.dias.OmarchyBroadcast.service
 MIC_UNIT_NAME=omarchy-broadcast-mic@.service
@@ -226,6 +237,10 @@ notices_src=$repo/dist/licenses/$NOTICES_NAME
 voice_manifest_src=$repo/crates/$VOICE_MODULE_CRATE/$VOICE_MODULE_MANIFEST
 voice_lib_dst=$data_dir/omarchy-broadcast/modules/$VOICE_MODULE_LIB
 voice_manifest_dst=$data_dir/omarchy-broadcast/modules.d/$VOICE_MODULE_MANIFEST
+afx_manifest_src=$repo/crates/$AFX_MODULE_CRATE/$AFX_MODULE_MANIFEST
+afx_lib_dst=$data_dir/omarchy-broadcast/modules/$AFX_MODULE_LIB
+afx_manifest_dst=$data_dir/omarchy-broadcast/modules.d/$AFX_MODULE_MANIFEST
+afx_dropin_src=$repo/dist/systemd/omarchy-broadcast-audiod.service.d/maxine-afx.conf
 module_manifest_src=$repo/crates/$MODULE_CRATE/$MODULE_MANIFEST
 module_dir=$data_dir/omarchy-broadcast/modules
 notices_dst=$module_dir/$NOTICES_NAME
@@ -244,8 +259,8 @@ for b in "${BINARIES[@]}"; do bin_dsts+=("$bin_dir/$b"); done
 # checksum in the manifest) this run installs, only with --audio.
 audio_dsts=() audio_bin_dsts=()
 if ((want_audio)); then
-  audio_dsts=("$host_unit_dst" "$host_conf_dst" "$worker_unit_dst" "$worker_socket_dst" "$worker_dbus_dst" "$voice_manifest_dst" "$notices_dst")
-  audio_bin_dsts=("$worker_bin_dst" "$plugin_dst" "$voice_lib_dst")
+  audio_dsts=("$host_unit_dst" "$host_conf_dst" "$worker_unit_dst" "$worker_socket_dst" "$worker_dbus_dst" "$voice_manifest_dst" "$afx_manifest_dst" "$notices_dst")
+  audio_bin_dsts=("$worker_bin_dst" "$plugin_dst" "$voice_lib_dst" "$afx_lib_dst")
 fi
 # The microphone files this run installs: only with --mic.
 mic_dsts=()
@@ -445,7 +460,7 @@ if [[ $mode == uninstall ]]; then
   targets=("${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "$module_lib_dst" "$module_manifest_dst" "$ar_module_lib_dst" "$ar_module_manifest_dst" "$mic_unit_dst")
   for c in "${MIC_CONFS[@]}"; do targets+=("$mic_conf_dir/$c"); done
   # The audio-module microphone's files, for the same reason.
-  targets+=("$host_unit_dst" "$host_conf_dst" "$worker_unit_dst" "$worker_socket_dst" "$worker_dbus_dst" "$voice_manifest_dst" "$notices_dst" "$worker_bin_dst" "$plugin_dst" "$voice_lib_dst")
+  targets+=("$host_unit_dst" "$host_conf_dst" "$worker_unit_dst" "$worker_socket_dst" "$worker_dbus_dst" "$voice_manifest_dst" "$afx_manifest_dst" "$notices_dst" "$worker_bin_dst" "$plugin_dst" "$voice_lib_dst" "$afx_lib_dst")
   # Also what an earlier run wrote under other XDG directories.
   if [[ -f $manifest ]]; then
     while IFS= read -r line; do
@@ -502,7 +517,7 @@ if [[ $mode == uninstall ]]; then
       omarchy-broadcast-mic-*.conf) mic_removed=1 leaf_dirs+=("${path%/*}") ;;
       "$HOST_UNIT_NAME" | "$WORKER_UNIT_NAME" | "$WORKER_SOCKET_NAME" | "$AUDIO_BINARY") audio_removed=1 ;;
       "$HOST_CONF" | "$PLUGIN_LIB") audio_removed=1 leaf_dirs+=("${path%/*}") ;;
-      "$MODULE_LIB" | "$MODULE_MANIFEST" | "$AR_MODULE_LIB" | "$AR_MODULE_MANIFEST" | "$VOICE_MODULE_LIB" | "$VOICE_MODULE_MANIFEST" | "$NOTICES_NAME") leaf_dirs+=("${path%/*}") ;;
+      "$MODULE_LIB" | "$MODULE_MANIFEST" | "$AR_MODULE_LIB" | "$AR_MODULE_MANIFEST" | "$VOICE_MODULE_LIB" | "$VOICE_MODULE_MANIFEST" | "$AFX_MODULE_LIB" | "$AFX_MODULE_MANIFEST" | "$NOTICES_NAME") leaf_dirs+=("${path%/*}") ;;
     esac
   done
   # The legacy shim's library directory goes once it is empty (rmdir only
@@ -622,10 +637,10 @@ host_exec_re='^ExecStart=/usr/bin/pipewire -c omarchy-broadcast-mic\.conf$'
 worker_exec_re='^ExecStart=/usr/bin/omarchy-broadcast-audiod$'
 plugin_re='^([[:space:]]*)plugin = "libomarchy_broadcast_mic"$'
 if ((want_audio)); then
-  for f in "$host_unit_src" "$host_conf_src" "$worker_unit_src" "$worker_socket_src" "$worker_dbus_src" "$voice_manifest_src" "$notices_src"; do
+  for f in "$host_unit_src" "$host_conf_src" "$worker_unit_src" "$worker_socket_src" "$worker_dbus_src" "$voice_manifest_src" "$afx_manifest_src" "$afx_dropin_src" "$notices_src"; do
     [[ -f $f ]] || die "missing $f"
   done
-  for spec in "$host_exec_re|$host_unit_src" "$worker_exec_re|$worker_unit_src" "$plugin_re|$host_conf_src" "$lib_re|$voice_manifest_src"; do
+  for spec in "$host_exec_re|$host_unit_src" "$worker_exec_re|$worker_unit_src" "$plugin_re|$host_conf_src" "$lib_re|$voice_manifest_src" "$lib_re|$afx_manifest_src"; do
     n=$(grep -c -E -- "${spec%%|*}" "${spec#*|}" || true)
     ((n == 1)) || {
       printf 'install-user: expected exactly one line matching %s in %s, found %s\n' "${spec%%|*}" "${spec#*|}" "$n" >&2
@@ -696,7 +711,7 @@ if ((build)); then
 fi
 if ((want_audio && build)); then
   # Its own invocation too, for the same reason.
-  run cargo build --manifest-path "$repo/Cargo.toml" --release --locked -p omarchy-broadcast-audiod -p obc-mic-shim -p "$VOICE_MODULE_CRATE" || {
+  run cargo build --manifest-path "$repo/Cargo.toml" --release --locked -p omarchy-broadcast-audiod -p obc-mic-shim -p "$VOICE_MODULE_CRATE" -p "$AFX_MODULE_CRATE" || {
     printf 'install-user: cargo build failed; nothing was changed\n' >&2
     exit 1
   }
@@ -710,7 +725,7 @@ if ((!dry_run)); then
   done
   if ((want_audio)); then
     [[ -x $target_dir/release/$AUDIO_BINARY ]] || die "no built binary at $target_dir/release/$AUDIO_BINARY (run without --no-build)"
-    for lib in "$PLUGIN_LIB" "$VOICE_MODULE_LIB"; do
+    for lib in "$PLUGIN_LIB" "$VOICE_MODULE_LIB" "$AFX_MODULE_LIB"; do
       [[ -f $target_dir/release/$lib ]] || die "no built library at $target_dir/release/$lib (run without --no-build)"
     done
   fi
@@ -746,6 +761,7 @@ if ((want_audio)); then
   srcs+=("$target_dir/release/$AUDIO_BINARY") dsts+=("$worker_bin_dst") modes+=(755)
   srcs+=("$target_dir/release/$PLUGIN_LIB") dsts+=("$plugin_dst") modes+=(755)
   srcs+=("$target_dir/release/$VOICE_MODULE_LIB") dsts+=("$voice_lib_dst") modes+=(644)
+  srcs+=("$target_dir/release/$AFX_MODULE_LIB") dsts+=("$afx_lib_dst") modes+=(644)
 fi
 
 run mkdir -p -- "$bin_dir" "$module_dir"
@@ -816,6 +832,7 @@ fi
 
 if ((want_audio)); then
   put_text "$voice_manifest_dst" module_manifest_text "$VOICE_MODULE_CRATE" "$VOICE_MODULE_MANIFEST" "$voice_lib_dst"
+  put_text "$afx_manifest_dst" module_manifest_text "$AFX_MODULE_CRATE" "$AFX_MODULE_MANIFEST" "$afx_lib_dst"
   host_conf_text() {
     echo "$MARKER"
     echo "# Generated from dist/pipewire/$HOST_CONF; plugin points at the installed plugin."
@@ -939,5 +956,11 @@ enabled; the worker starts when something records from the source. Enable the
 mic host only if no ADR 0014 unit (omarchy-broadcast-mic@...) is enabled:
   systemctl --user daemon-reload
   systemctl --user enable --now omarchy-broadcast-mic.service
+The NVIDIA Maxine audio effects module $module_state ($(printf '%q' "$afx_lib_dst")).
+To use it, install the maxine-afx-sdk-local package (built from
+omarchy-nvidia-sdks) and copy the worker's drop-in:
+  install -Dm644 $(printf '%q' "$afx_dropin_src") $(printf '%q' "$config_dir/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf")
+Without it the Maxine stages report why they are unavailable, and the CPU
+module keeps the microphone working.
 EOF
 fi
