@@ -150,6 +150,9 @@ pub fn status_text(s: &Snapshot) -> String {
     if !s.error.is_empty() {
         out.push_str(&format!("Error:      {}\n", printable(&s.error)));
     }
+    if !s.warning.is_empty() {
+        out.push_str(&format!("Warning:    {}\n", printable(&s.warning)));
+    }
     out
 }
 
@@ -491,6 +494,9 @@ pub fn summary_line(s: &Snapshot) -> String {
     if !s.error.is_empty() {
         line.push_str(&format!(" | error: {}", printable(&s.error)));
     }
+    if !s.warning.is_empty() {
+        line.push_str(&format!(" | warning: {}", printable(&s.warning)));
+    }
     line
 }
 
@@ -503,6 +509,8 @@ pub fn change_lines(s: &Snapshot, changes: &Changes) -> Vec<String> {
             "enabled" => format!("enabled: {}", yes_no(s.enabled)),
             "error" if s.error.is_empty() => "error: (cleared)".into(),
             "error" => format!("error: {}", printable(&s.error)),
+            "warning" if s.warning.is_empty() => "warning: (cleared)".into(),
+            "warning" => format!("warning: {}", printable(&s.warning)),
             "active_camera" => format!("camera: {}", camera_label(s)),
             // Reported with `active_camera` when both change.
             "active_camera_name" if changes.fields.contains(&"active_camera") => continue,
@@ -579,6 +587,7 @@ mod tests {
         Snapshot {
             state: State::Idle,
             error: String::new(),
+            warning: String::new(),
             enabled: true,
             cameras: vec![
                 CameraInfo {
@@ -631,6 +640,28 @@ mod tests {
         e.active_camera.clear();
         let text = status_text(&e);
         assert!(text.ends_with("Error:      no camera\n"), "{text}");
+        let mut w = s.clone();
+        w.warning = "effect blur unavailable: x".into();
+        let warned = status_text(&w);
+        assert!(
+            warned.ends_with("Effect:     none\nWarning:    effect blur unavailable: x\n"),
+            "{warned}"
+        );
+        assert!(
+            summary_line(&w).ends_with(" | warning: effect blur unavailable: x"),
+            "{}",
+            summary_line(&w)
+        );
+        let mut cleared = w.clone();
+        cleared.warning.clear();
+        assert_eq!(
+            change_lines(&cleared, &model::diff(&w, &cleared)),
+            ["warning: (cleared)"]
+        );
+        assert_eq!(
+            change_lines(&w, &model::diff(&s, &w)),
+            ["warning: effect blur unavailable: x"]
+        );
         assert!(text.contains("Camera:     none\n"), "{text}");
         e.active_camera = "unlisted".into();
         assert_eq!(camera_label(&e), "unlisted");

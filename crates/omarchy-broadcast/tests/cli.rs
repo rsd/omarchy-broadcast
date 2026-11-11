@@ -394,6 +394,8 @@ struct Mock {
     enabled: bool,
     state: State,
     error: String,
+    /// `Warning` (revision 11).
+    warning: String,
     cameras: Vec<CameraInfo>,
     active: usize,
     /// Holding the loopback.
@@ -715,6 +717,7 @@ impl Mock {
             enabled: true,
             state: State::Idle,
             error: String::new(),
+            warning: String::new(),
             cameras: vec![
                 CameraInfo {
                     id: "usb-1234_abcd".into(),
@@ -1372,6 +1375,11 @@ impl Mock {
     }
 
     #[zbus(property)]
+    fn warning(&self) -> String {
+        self.warning.clone()
+    }
+
+    #[zbus(property)]
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -1845,6 +1853,16 @@ impl MockDaemon {
             m.loopback_consumers_changed(iface.signal_emitter())
                 .await
                 .unwrap();
+        });
+    }
+
+    /// `Warning` is `text`, announced.
+    fn set_warning(&self, text: &str) {
+        let iface = self.iface();
+        self.rt.block_on(async {
+            iface.get_mut().await.warning = text.into();
+            let m = iface.get().await;
+            m.warning_changed(iface.signal_emitter()).await.unwrap();
         });
     }
 
@@ -2466,6 +2484,7 @@ fn status_human_and_json() {
     assert_eq!(v["state"], "idle");
     assert_eq!(v["enabled"], true);
     assert_eq!(v["error"], "");
+    assert_eq!(v["warning"], "");
     assert_eq!(v["active_camera"], "usb-1234_abcd");
     assert_eq!(v["active_camera_name"], "First Camera");
     assert_eq!(v["consumers"], 0);
@@ -2481,6 +2500,37 @@ fn status_human_and_json() {
     assert_eq!(v["cameras"].as_array().unwrap().len(), 2);
     assert_eq!(v["cameras_truncated"], false);
     assert!(!bus.activation_attempted());
+}
+
+#[test]
+fn status_and_watch_show_the_warning() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let text = "effect blur, noise removal unavailable: NVIDIA Maxine video effects: Disabled; \
+                warm tint unavailable: Hello tint: Disabled";
+    mock.set_warning(text);
+    let out = bus.run(&["status"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(
+        out.stdout.ends_with(&format!("Warning:    {text}\n")),
+        "{}",
+        out.stdout
+    );
+    let v = json_line(&bus.run(&["status", "--json"]).stdout);
+    assert_eq!(
+        (v["state"].as_str(), v["warning"].as_str()),
+        (Some("idle"), Some(text))
+    );
+    assert_eq!(v["error"], "");
+    let watch = bus.watch(&["watch", "--json"], None);
+    let v = watch.next_json("the first snapshot");
+    assert_eq!(v["warning"], text, "{v}");
+    watch.settings_set("the settings after the snapshot");
+    mock.set_warning("");
+    let v = watch.next_json("warning");
+    assert_eq!(v["type"], "state", "{v}");
+    assert_eq!(v["changed"], serde_json::json!(["warning"]), "{v}");
+    assert_eq!(v["warning"], "", "{v}");
 }
 
 #[test]

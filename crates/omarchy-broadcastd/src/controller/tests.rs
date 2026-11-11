@@ -1074,6 +1074,7 @@ fn every_transition_of_the_lifecycle_is_announced_in_order() {
             Change::Cameras(c) => format!("cameras={}", c.len()),
             Change::ActiveCamera(a) => format!("active={a}"),
             Change::Error(e) => format!("error={e}"),
+            Change::Warning(w) => format!("warning={w}"),
             Change::OutputMode(m) => format!("mode={m}"),
             Change::Effect(e) => format!("effect={e}"),
             Change::BlurStrength(v) => format!("strength={v}"),
@@ -1699,7 +1700,11 @@ fn the_effect_methods_persist_publish_and_survive_a_restart() {
 
 #[test]
 fn clearing_the_image_brings_back_the_configs_image() {
-    let cfg_image = "/cfg/office.png";
+    // The config's image, a file that can be read.
+    let images = tempfile::tempdir().unwrap();
+    let cfg_image = images.path().join("office.png");
+    fs::write(&cfg_image, b"an image").unwrap();
+    let cfg_image = cfg_image.display().to_string();
     let config = format!("[effect]\nmode = \"replace\"\nbackground_image = \"{cfg_image}\"\n");
     let mut h = H::new(&config, |_| {});
     let image = h.image();
@@ -1767,7 +1772,7 @@ fn a_repeated_setting_neither_rewrites_the_state_nor_reloads_the_effect() {
 }
 
 #[test]
-fn an_effect_error_with_none_ends_with_the_session() {
+fn an_effect_warning_with_none_ends_with_the_session() {
     let config = "[effect]\nmode = \"blur\"\non_failure = \"none\"\n\
                   [lifecycle]\nidle_grace_s = 0.0\nstart_debounce_ms = 0\n";
     let mut h = H::new(config, |_| {});
@@ -1775,20 +1780,28 @@ fn an_effect_error_with_none_ends_with_the_session() {
     h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
     h.tick(1000);
     assert_eq!(h.state(), State::Active);
-    assert!(h.snap().error.contains("without the effect"));
-    // The consumer leaves: idle, and the effect's error is gone with it.
+    let warning = shown_without("processing a frame failed");
+    assert_eq!(h.snap().warning, warning);
+    assert_eq!(h.snap().error, "");
+    // The consumer leaves: idle, and the effect's warning is gone with it.
     h.consumers(0, 2000);
     h.tick(3000);
     assert_eq!(h.state(), State::Idle);
-    assert_eq!(h.snap().error, "");
+    assert_eq!(
+        (h.snap().error, h.snap().warning),
+        (String::new(), String::new())
+    );
     // Off ends it too.
     h.activate(4000);
     h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
     h.tick(5000);
-    assert!(h.snap().error.contains("without the effect"));
+    assert_eq!(h.snap().warning, warning);
     h.call(|r| Command::SetEnabled(false, r), 6000).unwrap();
     assert_eq!(h.state(), State::Off);
-    assert_eq!(h.snap().error, "");
+    assert_eq!(
+        (h.snap().error, h.snap().warning),
+        (String::new(), String::new())
+    );
 }
 
 #[test]
@@ -1956,34 +1969,88 @@ fn off_and_idle_stop_the_session_whatever_the_effect() {
     assert_eq!(h.world().session_starts, 2);
 }
 
+/// `Warning` of a selected `blur` that cannot run for `reason`, with
+/// `on_failure = "black"`.
+fn black(reason: &str) -> String {
+    format!("effect blur unavailable: {reason}; the video is black until it can run")
+}
+
+/// `Warning` of a selected `blur` that cannot run for `reason`, with
+/// `on_failure = "none"`.
+fn shown_without(reason: &str) -> String {
+    format!(
+        "effect blur unavailable: {reason}; the camera image is shown without the effect \
+         (effect.on_failure = \"none\")"
+    )
+}
+
 #[test]
-fn an_unavailable_effect_with_black_is_an_error_before_the_camera_opens() {
+fn an_unavailable_effect_with_black_streams_black_with_a_warning_and_a_call_retries() {
     let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
         w.effect_unavailable = Some("libVideoFX.so not found".into())
     });
-    h.activate_expecting_error();
-    assert_eq!(
-        h.snap().error,
-        "effect blur unavailable: libVideoFX.so not found"
-    );
+    h.activate(0);
+    let want = black("libVideoFX.so not found");
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", &*want));
     {
         let w = h.world();
-        assert_eq!(w.session_starts, 0, "no output was built");
-        assert!(w.ingests.is_empty(), "no camera was opened");
+        assert_eq!(w.session_starts, 1, "the output was built");
+        assert_eq!(w.ingests.len(), 1, "the camera was opened");
         assert_eq!(w.effect_probes, 1);
+        // The element is given the effect, with `black`: its load fails,
+        // and its frames are black (the room hidden).
+        let e = w.effect.as_ref().unwrap();
+        assert_eq!(
+            (e.mode, e.on_failure),
+            (EffectMode::Blur, EffectOnFailure::Black)
+        );
+        assert!(matches!(w.effect_status, EffectStatus::Failed(_)));
     }
-    // No retry by itself, and no spinning.
+    // No retry by itself, no spinning, and no error.
     h.tick(10_000);
-    assert_eq!(h.world().effect_probes, 1);
-    // A control call retries: still unavailable, still error.
-    h.set_effect("blur", 11_000).unwrap();
-    assert_eq!(h.state(), State::Error);
-    assert_eq!(h.world().effect_probes, 2);
-    // Selecting no effect: the camera starts.
-    h.set_effect("none", 12_000).unwrap();
     assert_eq!(h.state(), State::Active);
-    assert_eq!(h.snap().error, "");
+    assert_eq!(h.world().effect_probes, 1);
+    assert_eq!(h.world().session_starts, 1);
+    // A control call retries: still unavailable, still streaming.
+    h.set_effect("blur", 11_000).unwrap();
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.snap().warning, want);
+    // Once it can run, the next call gives it, in the same session.
+    h.world().effect_unavailable = None;
+    h.set_effect("blur", 12_000).unwrap();
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", ""));
+    assert_eq!(h.world().effect_status, EffectStatus::Ready);
+    assert_eq!(h.world().session_starts, 1);
+    // Selecting no effect clears it too.
+    h.world().effect_unavailable = Some("libVideoFX.so not found".into());
+    h.set_effect("none", 12_500).unwrap();
+    h.set_effect("blur", 13_000).unwrap();
+    assert_eq!(h.snap().warning, want);
+    h.set_effect("none", 14_000).unwrap();
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.snap().warning, "");
     assert_eq!(h.applied(), Some(EffectMode::None));
+}
+
+#[test]
+fn settings_the_output_cannot_be_built_with_are_still_an_error_with_black() {
+    // `replace` with an image that cannot be read: not a module's failure,
+    // and the output cannot be built with it.
+    let mut h = H::new(
+        "[effect]\nmode = \"replace\"\nbackground_image = \"/nonexistent.png\"\n",
+        |_| {},
+    );
+    h.activate_expecting_error();
+    assert!(
+        h.snap().error.starts_with("effect replace unavailable: "),
+        "{}",
+        h.snap().error
+    );
+    assert_eq!(h.snap().warning, "");
+    assert_eq!(h.world().session_starts, 0, "no output was built");
+    assert!(h.world().ingests.is_empty(), "no camera was opened");
 }
 
 #[test]
@@ -1993,24 +2060,23 @@ fn an_unavailable_effect_with_none_streams_without_it_and_says_why() {
     });
     h.activate(0);
     assert_eq!(h.applied(), Some(EffectMode::None), "started without it");
-    let e = h.snap().error;
-    assert!(
-        e.starts_with("effect blur unavailable: libVideoFX.so not found;")
-            && e.contains("without the effect"),
-        "{e}"
-    );
+    let snap = h.snap();
+    assert_eq!(snap.warning, shown_without("libVideoFX.so not found"));
+    assert_eq!(snap.error, "");
+    assert_eq!(h.state(), State::Active);
     assert_eq!(h.snap().effect, "blur", "the selection is still blur");
     h.tick(2000);
-    assert_eq!(h.snap().error, e, "the error stays while it streams");
+    assert_eq!(h.snap().warning, snap.warning, "it stays while it streams");
     // A replace with no image cannot run either: the same rule.
     let mut h = H::new("[effect]\non_failure = \"none\"\n", |_| {});
     h.runtime_effect(EffectMode::Replace);
     h.activate(0);
     assert!(
-        h.snap().error.contains("needs a background image"),
+        h.snap().warning.contains("needs a background image"),
         "{}",
-        h.snap().error
+        h.snap().warning
     );
+    assert_eq!(h.snap().error, "");
 }
 
 impl H {
@@ -2028,52 +2094,79 @@ impl H {
 }
 
 #[test]
-fn an_effect_failure_with_black_stops_the_session_in_error_and_a_call_retries() {
+fn an_effect_failure_with_black_streams_black_with_a_warning_and_a_call_retries() {
     let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| w.effect_slow = true);
     h.activate(0);
     assert_eq!(h.world().effect_status, EffectStatus::Loading);
     h.world().effect_status = EffectStatus::Ready;
     h.tick(500);
     h.drain();
-    // The effect fails while streaming (a frame, the GPU).
+    // The effect fails while streaming (a frame, the GPU): the element's
+    // frames are black from then on, the session runs on.
     h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
     h.tick(1000);
-    assert_eq!(h.state(), State::Error);
-    assert_eq!(
-        h.snap().error,
-        "effect blur unavailable: processing a frame failed"
-    );
-    assert!(h.world().session.is_none(), "camera closed, GPU released");
-    assert_eq!(h.world().writer_starts, 1, "the writer keeps the stream");
-    assert_eq!(h.states(), [State::Error]);
+    assert_eq!(h.state(), State::Active);
+    let want = black("processing a frame failed");
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", &*want));
+    {
+        let w = h.world();
+        assert!(w.session.is_some(), "the camera stays open");
+        assert_eq!(w.session_stops, 0);
+        let e = w.effect.as_ref().unwrap();
+        assert_eq!(
+            (e.mode, e.on_failure),
+            (EffectMode::Blur, EffectOnFailure::Black)
+        );
+    }
+    let (changes, _) = h.drain();
+    assert_eq!(states_in(&changes), [], "no state change");
+    assert!(changes.contains(&Change::Warning(want.clone())));
+    assert!(!changes.iter().any(|c| matches!(c, Change::Error(_))));
     // Nothing restarts by itself while the consumer stays.
     h.tick(20_000);
     assert_eq!(h.world().session_starts, 1);
-    // A control call leaves error: the session starts again.
-    h.set_strength(0.4, 21_000).unwrap();
+    assert_eq!(h.snap().warning, want);
+    // A call for the effect retries: it runs again, in the same session.
+    h.world().effect_slow = false;
+    h.set_effect("blur", 22_000).unwrap();
     assert_eq!(h.state(), State::Active);
-    assert_eq!(h.world().session_starts, 2);
-    assert_eq!(h.snap().error, "");
-    // A failure at load, at start, is an error in the same step.
+    assert_eq!(h.world().session_starts, 1);
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", ""));
+    // A failure at load, at start, is the same, in the same step.
     let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
         w.effect_fail = Some("the model did not load".into())
     });
-    h.activate_expecting_error();
-    assert_eq!(
-        h.snap().error,
-        "effect blur unavailable: the model did not load"
-    );
-    assert!(h.world().session.is_none());
-    // The consumer leaves: idle, and back: tried again.
-    h.consumers(0, 1000);
-    assert_eq!(h.state(), State::Idle);
+    h.activate(0);
+    let snap = h.snap();
+    let want = black("the model did not load");
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", &*want));
+    assert_eq!(h.world().ingests.len(), 1, "the camera is open");
+    // A reload retries it too: once it loads, the warning clears.
     h.world().effect_fail = None;
-    h.activate(2000);
-    assert_eq!(h.snap().error, "");
+    h.reload("[effect]\nmode = \"blur\"\n", 1000).unwrap();
+    assert_eq!(h.world().effect_status, EffectStatus::Ready);
+    assert_eq!(h.snap().warning, "");
+    assert_eq!(h.world().session_starts, 1);
+    // The consumer leaves with the effect failing: the warning ends with
+    // the session, and the next one tries again.
+    h.world().effect_fail = Some("the model did not load".into());
+    h.set_effect("none", 1500).unwrap();
+    h.set_effect("blur", 2000).unwrap();
+    assert_eq!(h.snap().warning, want);
+    h.consumers(0, 3000);
+    h.tick(70_000);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.snap().warning, "");
+    h.world().effect_fail = None;
+    h.activate(71_000);
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", ""));
 }
 
 #[test]
-fn an_effect_failure_with_none_keeps_streaming_with_the_reason_in_error() {
+fn an_effect_failure_with_none_keeps_streaming_with_the_reason_in_the_warning() {
     let mut h = H::new("[effect]\nmode = \"blur\"\non_failure = \"none\"\n", |_| {});
     h.activate(0);
     h.drain();
@@ -2081,29 +2174,27 @@ fn an_effect_failure_with_none_keeps_streaming_with_the_reason_in_error() {
     h.tick(1000);
     assert_eq!(h.state(), State::Active);
     assert!(h.world().session.is_some());
-    let e = h.snap().error;
-    assert!(
-        e.starts_with("effect blur unavailable: processing a frame failed;"),
-        "{e}"
-    );
+    let w = shown_without("processing a frame failed");
+    assert_eq!(h.snap().warning, w);
+    assert_eq!(h.snap().error, "");
     // Reported once, not on every poll.
     h.tick(1250);
     h.tick(1500);
-    let errors = h
+    let warnings = h
         .drain()
         .0
         .into_iter()
-        .filter(|c| matches!(c, Change::Error(_)))
+        .filter(|c| matches!(c, Change::Warning(_)))
         .count();
-    assert_eq!(errors, 1);
+    assert_eq!(warnings, 1);
     // A retry that fails the same way is reported again.
     h.world().effect_fail = Some("processing a frame failed".into());
     h.set_effect("blur", 1800).unwrap();
-    assert_eq!(h.snap().error, e, "the same failure, reported again");
+    assert_eq!(h.snap().warning, w, "the same failure, reported again");
     h.world().effect_fail = None;
     // A call retries the effect on the running session; ready clears it.
     h.set_effect("blur", 2000).unwrap();
-    assert_eq!(h.snap().error, "");
+    assert_eq!(h.snap().warning, "");
     assert_eq!(h.world().session_starts, 1);
     assert_eq!(h.world().effect_status, EffectStatus::Ready);
     // A setting the session refuses (the image vanished): Failed, and the
@@ -2117,7 +2208,8 @@ fn an_effect_failure_with_none_keeps_streaming_with_the_reason_in_error() {
     }
     assert_eq!(h.state(), State::Active);
     assert_eq!(h.applied(), Some(EffectMode::None));
-    assert!(h.snap().error.contains("unreadable"));
+    assert!(h.snap().warning.contains("unreadable"));
+    assert_eq!(h.snap().error, "");
 }
 
 #[test]
@@ -2253,7 +2345,7 @@ fn a_repeated_set_denoise_neither_rewrites_the_state_nor_reloads_the_session() {
 fn set_denoise_clears_a_fault_and_the_session_starts_again() {
     let mut h = H::new("[effect]\nmode = \"blur\"\n", |_| {});
     h.activate(0);
-    h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
+    h.world().failure = Some(Failure::Output("output pipeline failed: boom".into()));
     h.tick(1000);
     assert_eq!(h.state(), State::Error);
     assert!(h.world().session.is_none());
@@ -2388,11 +2480,11 @@ fn a_reload_or_the_end_of_the_session_clears_a_denoise_failure() {
 }
 
 #[test]
-fn an_effect_failure_comes_before_a_denoise_failure_in_error() {
+fn an_effect_failure_is_in_the_warning_and_a_denoise_failure_in_error() {
     let config = "[effect]\nmode = \"blur\"\ndenoise = true\non_failure = \"none\"\n";
     let effect_reason = "the model did not load";
-    // Both fail at once: the effect's text, which matters more (the
-    // background shows).
+    // Both fail at once: the effect's text in `Warning`, the denoise one
+    // in `Error`; neither hides the other.
     let mut h = H::new(config, |w| {
         w.effect_fail = Some(effect_reason.into());
         w.denoise_fail = Some(NO_DENOISE.into());
@@ -2400,23 +2492,21 @@ fn an_effect_failure_comes_before_a_denoise_failure_in_error() {
     h.activate(0);
     h.tick(500);
     assert_eq!(h.state(), State::Active);
-    let effect_error = h.snap().error;
-    assert!(
-        effect_error.starts_with(&format!("effect blur unavailable: {effect_reason};")),
-        "{effect_error}"
-    );
+    let snap = h.snap();
+    assert_eq!(snap.warning, shown_without(effect_reason));
+    assert_eq!(snap.error, denoise_error(NO_DENOISE));
     assert!(h.ctrl.denoise_failure().is_some());
-    // The effect recovers: the denoise failure, still standing, shows.
+    // The effect recovers: the denoise failure still shows.
     h.world().effect_status = EffectStatus::Ready;
     h.tick(1000);
     assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    assert_eq!(h.snap().warning, "");
     // Noise removal recovers: nothing left.
     h.world().denoise_status = EffectStatus::Ready;
     h.tick(1500);
     assert_eq!(h.snap().error, "");
     // The other order: noise removal fails first (taken as its own once the
-    // next poll confirms it, the effect still ready), then the effect: the
-    // effect's text replaces it, and gives way to it again.
+    // next poll confirms it, the effect still ready), then the effect.
     h.world().denoise_status = EffectStatus::Failed(NO_DENOISE.into());
     h.tick(1750);
     assert_eq!(h.snap().error, "", "held for one poll");
@@ -2424,41 +2514,47 @@ fn an_effect_failure_comes_before_a_denoise_failure_in_error() {
     assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
     h.world().effect_status = EffectStatus::Failed(effect_reason.into());
     h.tick(2500);
-    assert_eq!(h.snap().error, effect_error);
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    assert_eq!(h.snap().warning, shown_without(effect_reason));
     h.world().effect_status = EffectStatus::Ready;
     h.tick(3000);
     assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    assert_eq!(h.snap().warning, "");
     assert_eq!(h.state(), State::Active);
     assert_eq!(h.world().session_starts, 1);
 }
 
 #[test]
-fn an_effect_fault_ends_a_denoise_failure_with_the_session() {
+fn a_fault_ends_a_denoise_failure_with_the_session() {
     let config = "[effect]\nmode = \"blur\"\ndenoise = true\n";
     let mut h = H::new(config, |w| w.denoise_fail = Some(NO_DENOISE.into()));
     h.activate(0);
     h.tick(500);
     assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
-    // The effect fails with `black`: a fault, the session stops, and the
-    // fault's text is the error; the denoise failure ended with the
-    // session.
+    // The effect fails with `black`: the session runs on, black, the
+    // denoise failure still in `Error`, the effect's in `Warning`.
     h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
+    h.tick(800);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    assert_eq!(h.snap().warning, black("processing a frame failed"));
+    // The output fails: a fault, the session stops, and the fault's text
+    // is the error; the denoise failure ended with the session.
+    h.world().failure = Some(Failure::Output("output pipeline failed: boom".into()));
     h.tick(1000);
     assert_eq!(h.state(), State::Error);
-    assert_eq!(
-        h.snap().error,
-        "effect blur unavailable: processing a frame failed"
-    );
+    assert_eq!(h.snap().error, "output pipeline failed: boom");
+    assert_eq!(h.snap().warning, "");
     assert_eq!(h.ctrl.denoise_failure(), None);
     // The consumer leaves: the fault is cleared (its text stays, as the
     // latest error), the denoise failure does not come back.
     h.consumers(0, 2000);
     h.tick(2100);
     assert_eq!(h.state(), State::Idle);
-    assert!(h.snap().error.starts_with("effect blur"));
+    assert!(h.snap().error.starts_with("output pipeline"));
     // An unavailable effect with `none` at start, and noise removal
-    // failing too: the effect's text first, then the denoise one once an
-    // effect method selects `none`.
+    // failing too: the effect's text in `Warning` until an effect method
+    // selects `none`, the denoise one in `Error`.
     let config = "[effect]\nmode = \"blur\"\ndenoise = true\non_failure = \"none\"\n";
     let mut h = H::new(config, |w| {
         w.effect_unavailable = Some("libVideoFX.so not found".into());
@@ -2468,13 +2564,12 @@ fn an_effect_fault_ends_a_denoise_failure_with_the_session() {
     h.tick(500);
     assert_eq!(h.applied(), Some(EffectMode::None));
     assert_eq!(h.denoise_applied(), Some(true), "noise removal still tried");
-    assert!(
-        h.snap().error.starts_with("effect blur unavailable:"),
-        "{}",
-        h.snap().error
-    );
+    let snap = h.snap();
+    assert_eq!(snap.warning, shown_without("libVideoFX.so not found"));
+    assert_eq!(snap.error, denoise_error(NO_DENOISE));
     h.set_effect("none", 1000).unwrap();
     assert_eq!(h.snap().error, denoise_error(NO_DENOISE));
+    assert_eq!(h.snap().warning, "");
     assert_eq!(h.state(), State::Active);
 }
 
@@ -2518,18 +2613,20 @@ fn a_failure_of_the_whole_chain_is_the_effects_not_noise_removals() {
     let failed = EffectStatus::Failed(GREEN_SCREEN.into());
     assert_eq!(h.world().denoise_status, failed);
     assert_eq!(h.state(), State::Active);
-    let effect_error = h.snap().error;
-    assert!(
-        effect_error.starts_with(&format!("effect blur unavailable: {GREEN_SCREEN};")),
-        "{effect_error}"
-    );
+    let effect_warning = shown_without(GREEN_SCREEN);
+    let snap = h.snap();
+    assert_eq!(snap.warning, effect_warning);
+    assert_eq!(snap.error, "");
     assert_eq!(h.ctrl.denoise_failure(), None);
     assert_no_denoise_text(&mut h);
     // The effect recovers, seen a poll before the stage does: nothing
     // stale is left.
     h.world().effect_status = EffectStatus::Ready;
     h.tick(1000);
-    assert_eq!(h.snap().error, "");
+    assert_eq!(
+        (h.snap().error, h.snap().warning),
+        (String::new(), String::new())
+    );
     h.world().denoise_status = EffectStatus::Ready;
     h.tick(1250);
     assert_eq!(h.snap().error, "");
@@ -2539,13 +2636,17 @@ fn a_failure_of_the_whole_chain_is_the_effects_not_noise_removals() {
     assert_eq!(h.world().denoise_status, failed);
     h.tick(1750);
     h.tick(2000);
-    assert_eq!(h.snap().error, effect_error);
+    assert_eq!(h.snap().warning, effect_warning);
+    assert_eq!(h.snap().error, "");
     h.world().effect_fail = None;
     h.set_strength(0.4, 2500).unwrap();
     h.tick(2750);
     h.tick(3000);
     assert_eq!(h.world().denoise_status, EffectStatus::Ready);
-    assert_eq!(h.snap().error, "");
+    assert_eq!(
+        (h.snap().error, h.snap().warning),
+        (String::new(), String::new())
+    );
     assert_eq!(h.ctrl.denoise_failure(), None);
     assert_no_denoise_text(&mut h);
     assert_eq!(h.world().session_starts, 1);
@@ -2554,7 +2655,7 @@ fn a_failure_of_the_whole_chain_is_the_effects_not_noise_removals() {
 #[test]
 fn a_failure_of_the_whole_chain_seen_a_poll_apart_is_still_the_effects() {
     let failed = EffectStatus::Failed(GREEN_SCREEN.into());
-    let effect_text = format!("effect blur unavailable: {GREEN_SCREEN};");
+    let effect_text = shown_without(GREEN_SCREEN);
     for before in [EffectStatus::Ready, EffectStatus::Loading] {
         // The stage's status shows the failure first: the effect's was
         // read before it changed.
@@ -2570,9 +2671,11 @@ fn a_failure_of_the_whole_chain_seen_a_poll_apart_is_still_the_effects() {
         assert_eq!(h.snap().error, "", "{before:?}: not the stage's yet");
         h.world().effect_status = failed.clone();
         h.tick(1250);
-        assert!(h.snap().error.starts_with(&effect_text), "{before:?}");
+        assert_eq!(h.snap().warning, effect_text, "{before:?}");
+        assert_eq!(h.snap().error, "", "{before:?}");
         h.tick(1500);
-        assert!(h.snap().error.starts_with(&effect_text), "{before:?}");
+        assert_eq!(h.snap().warning, effect_text, "{before:?}");
+        assert_eq!(h.snap().error, "", "{before:?}");
         assert_eq!(h.ctrl.denoise_failure(), None, "{before:?}");
         assert_no_denoise_text(&mut h);
         // Then it recovers: nothing stale.
@@ -2580,6 +2683,7 @@ fn a_failure_of_the_whole_chain_seen_a_poll_apart_is_still_the_effects() {
         h.world().denoise_status = EffectStatus::Ready;
         h.tick(1750);
         assert_eq!(h.snap().error, "", "{before:?}");
+        assert_eq!(h.snap().warning, "", "{before:?}");
 
         // The effect's status shows it first.
         let mut h = H::new(BLUR_DENOISE_NONE, |w| {
@@ -2590,16 +2694,19 @@ fn a_failure_of_the_whole_chain_seen_a_poll_apart_is_still_the_effects() {
         h.drain();
         h.world().effect_status = failed.clone();
         h.tick(1000);
-        assert!(h.snap().error.starts_with(&effect_text), "{before:?}");
+        assert_eq!(h.snap().warning, effect_text, "{before:?}");
+        assert_eq!(h.snap().error, "", "{before:?}");
         h.world().denoise_status = failed.clone();
         h.tick(1250);
         h.tick(1500);
-        assert!(h.snap().error.starts_with(&effect_text), "{before:?}");
+        assert_eq!(h.snap().warning, effect_text, "{before:?}");
+        assert_eq!(h.snap().error, "", "{before:?}");
         assert_eq!(h.ctrl.denoise_failure(), None, "{before:?}");
         // The effect recovers before the stage does: nothing stale.
         h.world().effect_status = EffectStatus::Ready;
         h.tick(1750);
         assert_eq!(h.snap().error, "", "{before:?}");
+        assert_eq!(h.snap().warning, "", "{before:?}");
         assert_no_denoise_text(&mut h);
     }
 }
@@ -2624,15 +2731,17 @@ fn a_noise_removal_failure_under_a_healthy_effect_is_still_reported() {
         h.tick(1050);
         assert_eq!(errors_published(&mut h), [denoise_error(NO_DENOISE)]);
         assert_eq!(h.state(), State::Active);
-        // An effect failure with another reason does not hide it: it comes
-        // first, and gives way to it again.
+        // An effect failure with another reason does not hide it: it is in
+        // `Warning`, and goes again.
         h.world().effect_status = EffectStatus::Failed(GREEN_SCREEN.into());
         h.tick(1300);
-        assert!(h.snap().error.starts_with("effect blur unavailable:"));
+        assert_eq!(h.snap().warning, shown_without(GREEN_SCREEN));
+        assert_eq!(h.snap().error, denoise_error(NO_DENOISE), "slow {slow}");
         assert!(h.ctrl.denoise_failure().is_some());
         h.world().effect_status = EffectStatus::Ready;
         h.tick(1550);
         assert_eq!(h.snap().error, denoise_error(NO_DENOISE), "slow {slow}");
+        assert_eq!(h.snap().warning, "", "slow {slow}");
     }
 }
 
@@ -6314,7 +6423,7 @@ fn global_writes_refuse_as_the_methods_do_in_the_order_of_the_checks() {
 fn a_global_write_clears_a_fault_as_the_methods_do() {
     let mut h = H::new("[effect]\nmode = \"blur\"\n", |_| {});
     h.activate(0);
-    h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
+    h.world().failure = Some(Failure::Output("output pipeline failed: boom".into()));
     h.tick(1000);
     assert_eq!(h.state(), State::Error);
     h.set_setting(DENOISE_ID, SettingValue::Bool(true), 2000)
@@ -6584,11 +6693,15 @@ fn a_change_of_what_is_installed_never_requests_an_effect_the_session_started_wi
         "the rejected effect is never requested: {:?}",
         h.world().effect_sets
     );
-    let e = h.snap().error;
-    assert!(
-        e.starts_with("effect blur unavailable: libVideoFX.so not found;"),
-        "{e}"
+    let snap = h.snap();
+    assert_eq!(
+        snap.warning,
+        format!(
+            "{}; noise removal unavailable: NVIDIA Maxine video effects: {REASON_NOT_INSTALLED}",
+            shown_without("libVideoFX.so not found")
+        )
     );
+    assert_eq!(snap.error, "");
     assert_eq!(h.snap().effect, "blur", "the selection is kept");
     h.tick(1000);
     assert_eq!(h.applied(), Some(EffectMode::None));
@@ -6602,8 +6715,8 @@ fn a_session_start_that_learns_what_is_installed_sends_one_settings_changed() {
         w.features_with_cc = Some(denoise_missing("no Denoise model for this GPU (sm_86)"));
     });
     h.activate(0);
-    // The effect fails: the camera stops, a fault.
-    h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
+    // The output fails: the camera stops, a fault.
+    h.world().failure = Some(Failure::Output("output pipeline failed: boom".into()));
     h.tick(1000);
     assert_eq!(h.state(), State::Error);
     // The next session learns the GPU, and with it that noise removal is
@@ -7097,8 +7210,9 @@ fn enhance_applies_only_where_it_pays() {
 }
 
 /// A noise removal or enhancement failure shows in `Error` only when no
-/// higher cause holds (the writer missing, a fault, an effect failure,
-/// noise removal over enhancement), and over a damaged state file.
+/// higher cause holds (the writer missing, a fault, noise removal over
+/// enhancement), and over a damaged state file. An effect failure is no
+/// such cause: it is in `Warning`.
 #[test]
 fn stage_failures_never_overwrite_a_higher_cause_in_error() {
     let failed = |r: &str| EffectStatus::Failed(r.into());
@@ -7108,15 +7222,12 @@ fn stage_failures_never_overwrite_a_higher_cause_in_error() {
         h
     };
     type Raise = fn(&mut Controller<FakeBackend>);
-    let higher: [(&str, Raise); 3] = [
+    let higher: [(&str, Raise); 2] = [
         ("writer", |c| {
             c.writer = None;
             c.writer_error = Some("no loopback device".into());
         }),
         ("fault", |c| c.fault = Some("the output failed".into())),
-        ("effect", |c| {
-            c.effect_failure = Some("effect unavailable: x".into())
-        }),
     ];
     for (what, raise) in higher {
         let mut h = fresh();
@@ -7131,6 +7242,16 @@ fn stage_failures_never_overwrite_a_higher_cause_in_error() {
         assert_eq!(h.ctrl.error, top, "enhance under {what}");
         assert!(h.ctrl.denoise_failure().is_some() && h.ctrl.enhance_failure.is_some());
     }
+    let mut h = fresh();
+    h.ctrl.effect_failure = Some("effect unavailable: x".into());
+    assert_eq!(
+        h.ctrl.standing_error(),
+        "",
+        "an effect failure is not in Error"
+    );
+    h.ctrl
+        .poll_denoise(failed("no denoiser"), &EffectStatus::Off);
+    assert_eq!(h.ctrl.error, denoise_failure_text("no denoiser"));
     // Noise removal over enhancement, either order.
     let mut h = fresh();
     h.ctrl
@@ -7601,7 +7722,8 @@ fn a_whole_chain_failure_is_the_effects_not_relightings() {
         h.world().relight_status,
         EffectStatus::Failed(reason.into())
     );
-    assert!(h.snap().error.starts_with("effect blur unavailable"));
+    assert_eq!(h.snap().warning, shown_without(reason));
+    assert_eq!(h.snap().error, "");
     assert_eq!(h.ctrl.relight_failure(), None);
 }
 
@@ -7615,13 +7737,20 @@ fn a_relighting_failure_sits_between_noise_removal_and_enhancement() {
         h.ctrl.error.clear();
         h
     };
+    // A fault over relighting.
     let mut h = fresh();
-    h.ctrl.effect_failure = Some("effect unavailable: x".into());
-    h.ctrl.error = "effect unavailable: x".into();
+    h.ctrl.fault = Some("the output failed".into());
+    h.ctrl.error = "the output failed".into();
     h.ctrl
         .poll_relight(failed("no relight"), &EffectStatus::Off);
-    assert_eq!(h.ctrl.error, "effect unavailable: x");
+    assert_eq!(h.ctrl.error, "the output failed");
     assert!(h.ctrl.relight_failure().is_some());
+    // An effect failure is in `Warning`, never over it in `Error`.
+    let mut h = fresh();
+    h.ctrl.effect_failure = Some("effect unavailable: x".into());
+    h.ctrl
+        .poll_relight(failed("no relight"), &EffectStatus::Off);
+    assert_eq!(h.ctrl.error, relight_error("no relight"));
     // Noise removal over relighting.
     let mut h = fresh();
     h.ctrl
@@ -7758,20 +7887,39 @@ fn with_no_module_the_camera_passes_through_and_no_effect_group_is_shown() {
     assert!(h.ctrl.order_ids().is_empty());
 }
 
+/// `Warning` of a selected `blur` whose module (Maxine) is disabled.
+const NO_BLUR: &str = "effect blur unavailable: NVIDIA Maxine video effects: Disabled";
+
+/// `Warning` of a selected `blur` no installed module provides.
+const NO_MODULE_BLUR: &str = "effect blur unavailable: No installed module provides it";
+
 #[test]
-fn a_background_effect_with_no_module_to_run_it_fails_closed() {
+fn a_background_effect_with_no_module_to_run_it_is_dropped_with_a_warning() {
     let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| w.maxine = false);
     // The method of revision 8 still takes the choice.
     h.call(|r| Command::SetEffect("blur".into(), r), 0).unwrap();
+    assert_eq!(
+        h.snap().warning,
+        NO_MODULE_BLUR,
+        "known before a session starts"
+    );
     h.consumers(1, 100);
     h.tick(400);
-    assert_eq!(h.state(), State::Error);
-    let error = h.snap().error;
-    assert!(
-        error.starts_with("effect blur unavailable: no effect module provides the background"),
-        "{error}"
+    // The feed streams without it, closed by default or not.
+    assert_eq!(h.state(), State::Active);
+    let snap = h.snap();
+    assert_eq!(
+        (snap.error.as_str(), snap.warning.as_str()),
+        ("", NO_MODULE_BLUR)
     );
-    assert!(h.world().session.is_none(), "the camera stays closed");
+    assert_eq!(snap.effect, "blur", "the choice is kept");
+    assert_eq!(h.applied(), Some(EffectMode::None));
+    // A call for the effect is taken, and changes nothing of that.
+    h.set_effect("blur", 500).unwrap();
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.applied(), Some(EffectMode::None));
+    assert_eq!(h.snap().error, "");
+    assert_eq!(h.persisted().effect, Some(EffectMode::Blur));
 }
 
 #[test]
@@ -8871,4 +9019,969 @@ fn enabling_a_module_that_fails_to_open_is_kept_and_says_why_in_its_status() {
     assert!(m.enabled);
     assert_eq!(m.status, "unavailable");
     assert!(m.reason.contains("/nonexistent/libx.so"), "{}", m.reason);
+}
+
+// ---- a stage no module provides is dropped, the feed kept ----
+
+impl H {
+    fn set_module(&mut self, id: &str, on: bool, ms: u64) {
+        let id = id.to_string();
+        self.call(|r| Command::SetModuleEnabled(id, on, r), ms)
+            .unwrap();
+    }
+
+    /// The effect the running session was last given.
+    fn last_effect(&self) -> EffectRun {
+        self.world()
+            .effect_sets
+            .last()
+            .cloned()
+            .expect("an effect was given")
+    }
+}
+
+fn stage_on(effect: &EffectRun, id: &str) -> bool {
+    effect.stage(id).is_some_and(|s| s.enabled)
+}
+
+#[test]
+fn disabling_the_effect_module_drops_its_stages_and_keeps_the_feed_and_the_others() {
+    let dir = hello_modules_dir();
+    let config = format!(
+        "{}[effect]\nmode = \"blur\"\ndenoise = true\n",
+        modules_config(dir.path())
+    );
+    let mut h = H::new(&config, |w| w.real_modules = true);
+    h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
+        .unwrap();
+    h.activate(100);
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    assert_eq!(h.snap().warning, "");
+    let ingests = h.world().ingests.len();
+    h.drain();
+    h.set_module(MAXINE_MODULE, false, 1000);
+    // The session runs on, the camera open, without the effect module's
+    // stages; the other module's stage still runs.
+    assert_eq!(h.state(), State::Active);
+    {
+        let w = h.world();
+        assert_eq!(w.session_starts, 1);
+        assert_eq!(w.session_stops, 0);
+        assert_eq!(w.ingests.len(), ingests, "the camera is not reopened");
+    }
+    let last = h.last_effect();
+    assert_eq!(last.mode, EffectMode::None);
+    assert!(!stage_on(&last, "denoise") && !stage_on(&last, "relight"));
+    assert!(stage_on(&last, "hello"), "{last:?}");
+    // Every selected stage of the disabled module, in one clause.
+    let dropped = "effect blur, noise removal unavailable: NVIDIA Maxine video effects: Disabled";
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", dropped));
+    assert_eq!(snap.effect, "blur", "the choice is kept");
+    assert!(h.drain().0.contains(&Change::Warning(dropped.into())));
+    // The idle grace and polls change nothing.
+    h.tick(1500);
+    h.tick(5000);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.snap().error, "");
+    // Re-enabled: the stages come back in the same session, with no call
+    // for the effect, and the warning clears.
+    h.set_module(MAXINE_MODULE, true, 6000);
+    let last = h.last_effect();
+    assert_eq!(last.mode, EffectMode::Blur);
+    assert!(stage_on(&last, "denoise") && stage_on(&last, "hello"));
+    {
+        let w = h.world();
+        assert_eq!(w.session_starts, 1, "no restart");
+        assert_eq!(w.ingests.len(), ingests, "the camera is not reopened");
+    }
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", ""));
+    assert_eq!(h.state(), State::Active);
+    assert!(h.drain().0.contains(&Change::Warning(String::new())));
+    assert_eq!(h.snap().effect, "blur");
+    assert_eq!(h.persisted().effect, None, "nothing was written");
+}
+
+#[test]
+fn a_session_started_with_its_effect_module_disabled_streams_and_restarts_once_enabled() {
+    // `on_failure = "black"` (the default) does not apply: nothing failed.
+    let mut h = H::new(
+        "[effect]\nmode = \"blur\"\non_failure = \"black\"\n",
+        |_| {},
+    );
+    h.set_module(MAXINE_MODULE, false, 0);
+    h.activate(100);
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", NO_BLUR));
+    {
+        let w = h.world();
+        let (params, _) = w.session.as_ref().unwrap();
+        assert_eq!(params.effect.mode, EffectMode::None, "passthrough");
+        assert!(params.backends.effect.is_none());
+    }
+    // The same after the camera stops and starts again (the case that
+    // used to end in `error`).
+    h.consumers(0, 1000);
+    h.tick(60_000);
+    assert!(h.world().session.is_none());
+    h.activate(61_000);
+    assert_eq!(h.snap().warning, NO_BLUR);
+    assert_eq!(h.world().session_starts, 2);
+    // Enabled again: the session, built without it, is started again with
+    // it, by itself.
+    h.set_module(MAXINE_MODULE, true, 62_000);
+    h.tick(62_400);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().session_starts, 3);
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    {
+        let w = h.world();
+        let (params, _) = w.session.as_ref().unwrap();
+        assert_eq!(params.effect.mode, EffectMode::Blur);
+        assert!(params.backends.effect.is_some());
+    }
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", ""));
+    assert_eq!(snap.effect, "blur");
+}
+
+#[test]
+fn a_runtime_failure_of_a_provided_effect_follows_on_failure_and_never_stops_the_feed() {
+    // `black`: the element's frames black, `Warning` says why.
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| w.effect_slow = true);
+    h.activate(0);
+    h.world().effect_status = EffectStatus::Ready;
+    h.tick(500);
+    h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
+    h.tick(1000);
+    assert_eq!(h.state(), State::Active);
+    let snap = h.snap();
+    assert_eq!(snap.error, "");
+    assert_eq!(snap.warning, black("processing a frame failed"));
+    assert!(h.world().session.is_some());
+    assert_eq!(h.world().effect.as_ref().unwrap().mode, EffectMode::Blur);
+    // Its module disabled meanwhile: the effect is dropped (no module
+    // provides it) and the feed shows the camera, as for any stage no
+    // module provides; the failure is no longer what it shows.
+    h.set_module(MAXINE_MODULE, false, 2000);
+    assert_eq!(h.last_effect().mode, EffectMode::None);
+    assert_eq!(h.snap().warning, NO_BLUR);
+    // Enabled again: given again, a retry (it runs now).
+    h.world().effect_slow = false;
+    h.set_module(MAXINE_MODULE, true, 3000);
+    assert_eq!(h.last_effect().mode, EffectMode::Blur);
+    assert_eq!(h.world().effect_status, EffectStatus::Ready);
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", ""));
+    assert_eq!(h.world().session_starts, 1);
+    // `none`: the camera image, the reason in `Warning`, nothing in
+    // `Error`.
+    let mut h = H::new("[effect]\nmode = \"blur\"\non_failure = \"none\"\n", |w| {
+        w.effect_fail = Some("the model did not load".into())
+    });
+    h.activate(0);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(
+        h.world().effect.as_ref().unwrap().on_failure,
+        EffectOnFailure::None
+    );
+    let snap = h.snap();
+    assert_eq!(snap.warning, shown_without("the model did not load"));
+    assert_eq!(snap.error, "");
+}
+
+/// A module's reason as long as Maxine's first-run one, its hint (the
+/// part a user acts on) at the end.
+fn long_reason() -> String {
+    format!(
+        "NvVFX_Load(GreenScreen) returned -1209 ({}); see docs/setup/maxine.md, section 3 HINT-END",
+        "x".repeat(220)
+    )
+}
+
+#[test]
+fn a_black_failure_keeps_its_whole_reason_in_the_warning_and_the_journal() {
+    let reason = long_reason();
+    assert!(
+        reason.len() > 300 && reason.len() <= 400,
+        "{}",
+        reason.len()
+    );
+    // At run time.
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |_| {});
+    h.activate(0);
+    crate::log::take_lines();
+    h.world().effect_status = EffectStatus::Failed(reason.clone());
+    h.tick(1000);
+    assert_eq!(h.snap().warning, black(&reason));
+    let lines = crate::log::take_lines();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("warning: ") && l.contains(&reason)),
+        "{lines:?}"
+    );
+    // At the start, the module's check refusing it.
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+        w.effect_unavailable = Some(reason.clone())
+    });
+    crate::log::take_lines();
+    h.activate(0);
+    assert_eq!(h.snap().warning, black(&reason));
+    let lines = crate::log::take_lines();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("warning: ") && l.contains(&reason)),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn a_none_failure_is_in_the_warning_never_in_error() {
+    let config = "[effect]\nmode = \"blur\"\non_failure = \"none\"\n";
+    let effect_errors = |h: &mut H| {
+        errors_published(h)
+            .into_iter()
+            .filter(|e| e.contains("effect"))
+            .collect::<Vec<_>>()
+    };
+    // Refused at the start, failing at load, failing at run time.
+    for case in ["start", "load", "run"] {
+        let mut h = H::new(config, |w| match case {
+            "start" => w.effect_unavailable = Some("no model".into()),
+            "load" => w.effect_fail = Some("no model".into()),
+            _ => {}
+        });
+        h.activate(0);
+        if case == "run" {
+            h.world().effect_status = EffectStatus::Failed("no model".into());
+        }
+        h.tick(1000);
+        let snap = h.snap();
+        assert_eq!(snap.state, State::Active, "{case}");
+        assert_eq!(snap.error, "", "{case}");
+        assert_eq!(snap.warning, shown_without("no model"), "{case}");
+        assert_eq!(effect_errors(&mut h), Vec::<String>::new(), "{case}");
+    }
+}
+
+#[test]
+fn a_failed_effect_whose_module_is_disabled_leaves_one_clause() {
+    let config = "[effect]\nmode = \"blur\"\non_failure = \"none\"\n";
+    for at_start in [false, true] {
+        let mut h = H::new(config, |w| {
+            if at_start {
+                w.effect_unavailable = Some("no model".into());
+            }
+        });
+        h.activate(0);
+        if !at_start {
+            h.world().effect_status = EffectStatus::Failed("no model".into());
+            h.tick(500);
+        }
+        assert_eq!(h.snap().warning, shown_without("no model"), "{at_start}");
+        h.set_module(MAXINE_MODULE, false, 1000);
+        let snap = h.snap();
+        assert_eq!(
+            (snap.error.as_str(), snap.warning.as_str()),
+            ("", NO_BLUR),
+            "at start {at_start}: the dropped clause alone"
+        );
+    }
+}
+
+#[test]
+fn re_enabling_the_module_gives_a_failed_effect_again() {
+    let config = "[effect]\nmode = \"blur\"\non_failure = \"none\"\n";
+    for at_start in [false, true] {
+        let mut h = H::new(config, |w| {
+            if at_start {
+                w.effect_unavailable = Some("no model".into());
+            }
+        });
+        h.activate(0);
+        if !at_start {
+            h.world().effect_status = EffectStatus::Failed("no model".into());
+            h.tick(500);
+        }
+        h.set_module(MAXINE_MODULE, false, 1000);
+        // Fixed meanwhile: the module, enabled again, gives it again.
+        h.world().effect_unavailable = None;
+        h.world().effect_status = EffectStatus::Off;
+        h.set_module(MAXINE_MODULE, true, 2000);
+        assert_eq!(
+            h.last_effect().mode,
+            EffectMode::Blur,
+            "at start {at_start}"
+        );
+        h.tick(2500);
+        assert_eq!(h.world().effect_status, EffectStatus::Ready);
+        let snap = h.snap();
+        assert_eq!(
+            (snap.error.as_str(), snap.warning.as_str()),
+            ("", ""),
+            "at start {at_start}"
+        );
+        assert_eq!(h.world().session_starts, 1, "at start {at_start}");
+    }
+}
+
+#[test]
+fn a_refused_setting_at_start_with_black_names_the_effect_in_error() {
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+        w.effect_unavailable = Some("the module refuses a strength of 2".into());
+        w.fail_start = Some("output pipeline: the effect element did not link".into());
+    });
+    h.activate_expecting_error();
+    assert_eq!(
+        h.snap().error,
+        "effect blur unavailable: the module refuses a strength of 2"
+    );
+    // The build's own failure is its error when the effect's check passed.
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+        w.fail_start = Some("output pipeline: the effect element did not link".into());
+    });
+    h.activate_expecting_error();
+    assert_eq!(
+        h.snap().error,
+        "output pipeline: the effect element did not link"
+    );
+}
+
+#[test]
+fn an_effect_method_keeps_the_black_warning_until_the_effect_reports() {
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| w.effect_slow = true);
+    h.activate(0);
+    h.world().effect_status = EffectStatus::Failed("no model".into());
+    h.tick(500);
+    assert_eq!(h.snap().warning, black("no model"));
+    h.drain();
+    // A retry: the frames stay black while it loads, and so the text.
+    h.set_effect("blur", 1000).unwrap();
+    assert_eq!(h.snap().warning, black("no model"));
+    h.tick(1250);
+    assert_eq!(h.world().effect_status, EffectStatus::Loading);
+    assert_eq!(h.snap().warning, black("no model"));
+    let warnings: Vec<String> = h
+        .drain()
+        .0
+        .into_iter()
+        .filter_map(|c| match c {
+            Change::Warning(w) => Some(w),
+            _ => None,
+        })
+        .collect();
+    assert!(warnings.is_empty(), "never emptied: {warnings:?}");
+    // It reports ready: cleared.
+    h.world().effect_status = EffectStatus::Ready;
+    h.tick(1500);
+    assert_eq!(h.snap().warning, "");
+    // Under `none` the retry shows black while it loads: the old text
+    // goes at once.
+    let mut h = H::new("[effect]\nmode = \"blur\"\non_failure = \"none\"\n", |w| {
+        w.effect_slow = true
+    });
+    h.activate(0);
+    h.world().effect_status = EffectStatus::Failed("no model".into());
+    h.tick(500);
+    assert_eq!(h.snap().warning, shown_without("no model"));
+    h.set_effect("blur", 1000).unwrap();
+    assert_eq!(h.snap().warning, "");
+    // And with the effect turned off under `black`, it goes too.
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| w.effect_slow = true);
+    h.activate(0);
+    h.world().effect_status = EffectStatus::Failed("no model".into());
+    h.tick(500);
+    h.set_effect("none", 1000).unwrap();
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn the_warning_is_one_line_whatever_a_module_calls_itself() {
+    const EVIL: &str = "org.x.evil";
+    let entry = crate::modules::testing::entry(
+        &format!(
+            "abi = 1\nid = \"{EVIL}\"\nname = \"Evil\\nmodule\\u202E\"\nversion = \"1\"\n\
+             licence = \"MIT\"\nkind = \"video-stage\"\nlibrary = \"/m/evil.so\"\n\
+             [[stage]]\nid = \"tint\"\nslot = \"post-composite\"\nrank = 1\n\
+             device = \"cpu\"\nframes = [\"host\"]\nformats = [\"nv12\"]\n"
+        ),
+        "/m/evil.toml",
+    );
+    let settings = crate::modules::testing::settings(
+        r#"{"groups":[{"id":"evil","label":"Evil","settings":[
+            {"id":"effect.evil.enabled","label":"Warm\ntint\u202e","type":"bool",
+             "default":true,"stage":"tint","role":"enable","hint":"switch"}]}]}"#,
+        &["tint"],
+    );
+    let opened = Ok(crate::backend::OpenedModule {
+        module: None,
+        stages: vec![(
+            StageId::new("tint").unwrap(),
+            Availability::NotInstalled("no\nmodel\u{202E}".into()),
+        )],
+        settings,
+    });
+    let mut h = H::new("", move |w| w.modules = vec![(entry, opened)]);
+    h.activate(0);
+    let w = h.snap().warning;
+    assert_eq!(w, "warm tint unavailable: Evil module: no model");
+    assert!(!w.contains(['\n', '\u{202E}']), "{w:?}");
+}
+
+#[test]
+fn under_black_a_provided_effect_that_fails_is_never_given_off() {
+    // While a module of the session provides the effect, `black` never
+    // shows the room: every effect the session is given is the effect
+    // selected, under `black` (the element's frames black while it fails).
+    for case in ["start", "load", "run", "method"] {
+        let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| match case {
+            "start" => w.effect_unavailable = Some("no model".into()),
+            "load" => w.effect_fail = Some("no model".into()),
+            _ => {}
+        });
+        h.activate(0);
+        if case == "run" || case == "method" {
+            h.world().effect_status = EffectStatus::Failed("no model".into());
+        }
+        h.tick(500);
+        if case == "method" {
+            h.world().effect_fail = Some("no model".into());
+            h.set_effect("blur", 1000).unwrap();
+        }
+        h.tick(1500);
+        assert_eq!(h.state(), State::Active, "{case}");
+        assert_eq!(h.snap().warning, black("no model"), "{case}");
+        let w = h.world();
+        let started = &w.session.as_ref().unwrap().0.effect;
+        for e in std::iter::once(started).chain(w.effect_sets.iter()) {
+            assert_eq!(
+                (e.mode, e.on_failure),
+                (EffectMode::Blur, EffectOnFailure::Black),
+                "{case}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_effect_whose_module_the_crash_ledger_disabled_is_dropped_not_a_fault() {
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |_| {});
+    let ledger = h.paths.state.with_file_name(LEDGER_FILE);
+    fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+    h.paths.ledger = Some(ledger.clone());
+    for _ in 1..=2 {
+        let mut l = CrashLedger::open(&ledger);
+        l.begin(MAXINE_MODULE).unwrap();
+        drop(l);
+        h.restart();
+    }
+    assert!(!h.modules().find(MAXINE_MODULE).unwrap().enabled);
+    h.activate(0);
+    let snap = h.snap();
+    assert_eq!(snap.error, "");
+    // The crash ledger's reason, not a generic one.
+    assert_eq!(
+        snap.warning,
+        format!(
+            "effect blur unavailable: NVIDIA Maxine video effects: {}",
+            obc_module_host::REASON_CRASHED
+        )
+    );
+    assert_eq!(h.applied(), Some(EffectMode::None));
+}
+
+/// A module `id` (an NPU, rank 100) whose one stage is `stage` in `slot`,
+/// opened with the stage installed.
+fn npu_module(
+    id: &str,
+    stage: StageId,
+    slot: &str,
+) -> (
+    obc_module_host::discovery::ModuleEntry,
+    Result<crate::backend::OpenedModule, String>,
+) {
+    (
+        crate::modules::testing::entry(
+            &format!(
+                "abi = 1\nid = \"{id}\"\nname = \"NPU {stage}\"\nversion = \"1\"\n\
+                 licence = \"MIT\"\nkind = \"video-stage\"\nlibrary = \"/m/{id}.so\"\n\
+                 [[stage]]\nid = \"{stage}\"\nslot = \"{slot}\"\nrank = 100\n\
+                 device = \"npu\"\nframes = [\"host\"]\nformats = [\"nv12\"]\n"
+            ),
+            &format!("/m/{id}.toml"),
+        ),
+        Ok(crate::backend::OpenedModule {
+            module: None,
+            stages: vec![(stage, Availability::Installed)],
+            settings: Default::default(),
+        }),
+    )
+}
+
+impl H {
+    /// The session's params as it was started.
+    fn session_params(&self) -> SessionParams {
+        self.world().session.as_ref().expect("a session").0.clone()
+    }
+}
+
+#[test]
+fn an_effect_selected_while_its_module_is_disabled_is_given_once_it_is_enabled_again() {
+    let mut h = H::new("", |_| {});
+    h.activate(0);
+    h.set_module(MAXINE_MODULE, false, 1000);
+    h.set_effect("blur", 2000).unwrap();
+    assert_eq!(h.applied(), Some(EffectMode::None));
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", NO_BLUR));
+    assert_eq!(h.state(), State::Active);
+    // Its module is enabled again: the session, which has it, runs it
+    // with no further call.
+    h.set_module(MAXINE_MODULE, true, 3000);
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    assert_eq!(h.last_effect().mode, EffectMode::Blur);
+    assert_eq!(h.world().session_starts, 1, "no restart");
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", ""));
+}
+
+#[test]
+fn an_effect_selected_after_its_module_is_enabled_restarts_a_session_started_without_it() {
+    let mut h = H::new("", |_| {});
+    h.set_module(MAXINE_MODULE, false, 0);
+    h.activate(100);
+    assert!(h.session_params().backends.effect.is_none());
+    // Enabled with nothing of it selected: the session is kept.
+    h.set_module(MAXINE_MODULE, true, 1000);
+    h.tick(1400);
+    assert_eq!(h.world().session_starts, 1);
+    // The effect selected: only a new session can run it.
+    h.set_effect("blur", 2000).unwrap();
+    h.tick(2400);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().session_starts, 2);
+    let params = h.session_params();
+    assert_eq!(params.effect.mode, EffectMode::Blur);
+    assert!(params.backends.effect.is_some());
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", ""));
+    // Once: the new session runs it, and is kept.
+    h.set_strength(0.3, 3000).unwrap();
+    h.tick(5000);
+    assert_eq!(h.world().session_starts, 2);
+}
+
+#[test]
+fn a_stage_of_a_module_enabled_mid_session_comes_back_by_one_restart() {
+    let mut h = H::new("[effect]\ndenoise = true\n", |_| {});
+    h.set_module(MAXINE_MODULE, false, 0);
+    h.activate(100);
+    assert!(!stage_on(&h.session_params().effect, "denoise"));
+    // A stage other than the background effect is named alone.
+    let dropped = "noise removal unavailable: NVIDIA Maxine video effects: Disabled";
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", dropped));
+    // Idle, the same.
+    h.consumers(0, 200);
+    h.tick(60_000);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.snap().warning, dropped);
+    h.activate(60_100);
+    assert_eq!(h.world().session_starts, 2);
+    h.set_module(MAXINE_MODULE, true, 61_000);
+    h.tick(61_400);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().session_starts, 3);
+    let params = h.session_params();
+    assert!(params.backends.effect.is_some());
+    assert!(stage_on(&params.effect, "denoise"), "{params:?}");
+    assert_eq!(h.snap().warning, "");
+    // Not restarted again.
+    h.tick(63_000);
+    h.set_module(MAXINE_MODULE, true, 64_000);
+    h.tick(66_000);
+    assert_eq!(h.world().session_starts, 3);
+}
+
+#[test]
+fn disabling_the_enhancer_mid_session_reopens_the_camera_without_enhancement() {
+    let mut h = H::new("", |w| w.cameras = vec![small(alpha())]);
+    h.set_setting(ENHANCE_ID, SettingValue::Bool(true), 0)
+        .unwrap();
+    h.activate(100);
+    assert_eq!(h.enhance_requests(), [true]);
+    h.set_module(MAXINE_MODULE, false, 1000);
+    assert_eq!(h.enhance_requests(), [true, false]);
+    h.set_module(MAXINE_MODULE, true, 2000);
+    assert_eq!(h.enhance_requests(), [true, false, true]);
+    assert_eq!(
+        h.world().session_starts,
+        1,
+        "the camera reopened, no restart"
+    );
+    assert_eq!(h.state(), State::Active);
+}
+
+#[test]
+fn a_pin_to_another_module_keeps_the_running_stage_until_the_next_start() {
+    const DN: &str = "org.example.denoise";
+    const CUT: &str = "org.example.cutout";
+    let mut h = H::new("[effect]\nmode = \"blur\"\ndenoise = true\n", |w| {
+        w.modules = vec![
+            npu_module(DN, StageId::DENOISE, "pre-matte"),
+            npu_module(CUT, StageId::BACKGROUND, "matte"),
+        ];
+    });
+    h.activate(0);
+    let started = h.session_params();
+    assert!(stage_on(&started.effect, "denoise"));
+    let sets = h.world().effect_sets.len();
+    for (stage, module) in [("denoise", DN), ("background", CUT)] {
+        h.call(
+            |r| Command::SetStagePin(stage.into(), module.into(), r),
+            1000,
+        )
+        .unwrap();
+    }
+    h.tick(1400);
+    {
+        let w = h.world();
+        assert_eq!(w.session_starts, 1, "no restart");
+        assert_eq!(w.effect_sets.len(), sets, "nothing given to the session");
+    }
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    assert_eq!(h.snap().warning, "");
+    // The next start takes the pins.
+    h.consumers(0, 2000);
+    h.tick(70_000);
+    h.activate(71_000);
+    let next = h.session_params();
+    assert_eq!(
+        next.backends.effect.as_ref().map(|m| m.id.as_str()),
+        Some(CUT)
+    );
+    assert!(next.backends.chains.iter().any(|(_, m)| m.id == DN));
+}
+
+#[test]
+fn an_effect_its_module_can_no_longer_run_moves_to_the_module_that_can() {
+    const CUT: &str = "org.example.cutout";
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+        w.modules = vec![npu_module(CUT, StageId::BACKGROUND, "matte")];
+    });
+    h.activate(0);
+    let id = |h: &H| {
+        h.session_params()
+            .backends
+            .effect
+            .as_ref()
+            .map(|m| m.id.clone())
+    };
+    assert_eq!(id(&h).as_deref(), Some(MAXINE_MODULE));
+    // Maxine's cut-out cannot run any more; the other module's can.
+    h.world().features = Some(stage_missing(&StageId::BACKGROUND, "no model"));
+    h.reload("[effect]\nmode = \"blur\"\n", 1000).unwrap();
+    h.tick(1400);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().session_starts, 2);
+    assert_eq!(id(&h).as_deref(), Some(CUT));
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", ""));
+}
+
+#[test]
+fn no_warning_is_published_before_the_modules_are_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths {
+        config: dir.path().join("config.toml"),
+        state: dir.path().join("state").join("state.toml"),
+        cache: None,
+        runtime: None,
+        ledger: None,
+    };
+    // A selected effect, which only a module provides.
+    fs::write(&paths.config, "[effect]\nmode = \"blur\"\n").unwrap();
+    let fake = FakeBackend::default();
+    fake.world().cameras = vec![alpha()];
+    let (published, _notes) = Published::new(preliminary_snapshot(&paths));
+    let mut ctrl =
+        Controller::new_without_modules(fake.clone(), paths, published, None, Instant::now());
+    let snap = ctrl.snapshot();
+    assert_eq!(snap.effect, "blur");
+    assert_eq!(
+        snap.warning, "",
+        "what the modules provide is not known yet"
+    );
+    ctrl.load_modules(Instant::now());
+    assert_eq!(ctrl.snapshot().warning, "", "the effect module provides it");
+}
+
+// ---- a session start that learns another provider ----
+
+#[test]
+fn a_session_start_that_learns_another_provider_starts_again_in_the_same_step() {
+    const CUT: &str = "org.example.cutout";
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+        w.modules = vec![npu_module(CUT, StageId::BACKGROUND, "matte")];
+        w.features = Some(all_installed());
+        // Learnt once the GPU is up: Maxine has no cut-out model for it,
+        // and the other module takes the background effect over.
+        w.features_with_cc = Some(stage_missing(&StageId::BACKGROUND, "no model for sm_86"));
+        w.compute_capability = Some((8, 6));
+    });
+    h.drain();
+    h.consumers(1, 0);
+    // Driven as `run` drives it: each tick at the wakeup it asked for.
+    let mut now = h.at(0);
+    let end = h.at(2000);
+    while h.state() != State::Active {
+        let next = now + h.ctrl.next_wakeup(now);
+        if next > end {
+            break;
+        }
+        now = next;
+        h.ctrl.tick(now);
+    }
+    assert_eq!(h.state(), State::Active, "active within 2 s");
+    {
+        let w = h.world();
+        assert_eq!(w.session_starts, 2, "started again once, at once");
+        let (params, _) = w.session.as_ref().unwrap();
+        assert_eq!(
+            params.backends.effect.as_ref().map(|m| m.id.as_str()),
+            Some(CUT)
+        );
+        assert_eq!(params.effect.mode, EffectMode::Blur);
+    }
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", ""));
+    let changes = h.drain().0;
+    assert!(
+        !states_in(&changes).contains(&State::Idle),
+        "starting is not followed by idle: {changes:?}"
+    );
+    // And kept: no further restart.
+    let from = now.saturating_duration_since(h.t0).as_millis() as u64;
+    ticks_over(&mut h, from, Duration::from_secs(10));
+    assert_eq!(h.world().session_starts, 2);
+    assert_eq!(h.state(), State::Active);
+}
+
+#[test]
+fn a_provider_lost_again_on_the_second_start_pass_is_named_in_the_warning() {
+    const CUT: &str = "org.example.cutout";
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+        w.modules = vec![npu_module(CUT, StageId::BACKGROUND, "matte")];
+        w.features = Some(all_installed());
+        // Learnt once the GPU is up: Maxine has no cut-out model for it,
+        // and the other module takes the background effect over ...
+        w.features_with_cc = Some(stage_missing(&StageId::BACKGROUND, "no model for sm_86"));
+        w.compute_capability = Some((8, 6));
+        // ... which, probed again on the second pass, has lost it, while
+        // Maxine has it again: only a new session could run it.
+        w.probe_script = vec![
+            (
+                CUT.into(),
+                vec![(
+                    StageId::BACKGROUND,
+                    Availability::NotInstalled("the NPU is gone".into()),
+                )],
+            ),
+            (MAXINE_MODULE.into(), all_installed()),
+        ];
+    });
+    h.activate(0);
+    assert_eq!(h.world().session_starts, 2, "never a third start");
+    assert!(h.world().probe_script.is_empty(), "probed as scripted");
+    // The session's module cannot run it, and no restart: the camera
+    // image, never silently.
+    assert_eq!(h.applied(), Some(EffectMode::None));
+    let snap = h.snap();
+    assert_eq!(snap.error, "");
+    assert_eq!(
+        snap.warning,
+        "effect blur unavailable: it runs when the camera next starts"
+    );
+}
+
+#[test]
+fn a_session_start_with_one_module_that_loses_a_stage_starts_once() {
+    // Maxine alone, no cached capability: what it loses for this GPU is
+    // followed in the session, never by a restart.
+    let mut h = H::new("[effect]\nmode = \"blur\"\ndenoise = true\n", |w| {
+        w.features = Some(all_installed());
+        w.features_with_cc = Some(denoise_missing("no Denoise model for this GPU (sm_86)"));
+        w.compute_capability = Some((8, 6));
+    });
+    h.activate(0);
+    assert_eq!(h.world().session_starts, 1);
+    assert_eq!(h.denoise_applied(), Some(false));
+    assert_eq!(
+        h.snap().warning,
+        format!("noise removal unavailable: NVIDIA Maxine video effects: {REASON_NOT_INSTALLED}")
+    );
+}
+
+// ---- every selected stage no module provides is in `Warning` ----
+
+/// The example module's id and the warning of its stage, disabled.
+const HELLO: &str = "org.example.hello";
+const NO_HELLO: &str = "warm tint unavailable: Hello tint: Disabled";
+
+#[test]
+fn every_dropped_stage_is_named_in_the_warning_with_its_modules_reason() {
+    let config = "[effect]\nmode = \"blur\"\ndenoise = true\nrelight = true\n";
+    let mut h = H::new(config, |_| {});
+    h.activate(0);
+    assert_eq!(h.snap().warning, "");
+    h.set_module(MAXINE_MODULE, false, 1000);
+    let want =
+        "effect blur, noise removal, relighting unavailable: NVIDIA Maxine video effects: Disabled";
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", want));
+    assert_eq!(h.state(), State::Active);
+    let last = h.last_effect();
+    assert_eq!(last.mode, EffectMode::None);
+    assert!(!stage_on(&last, "denoise") && !stage_on(&last, "relight"));
+    // Re-enabled: all three back, the warning cleared.
+    h.set_module(MAXINE_MODULE, true, 2000);
+    let last = h.last_effect();
+    assert_eq!(last.mode, EffectMode::Blur);
+    assert!(stage_on(&last, "denoise") && stage_on(&last, "relight"));
+    assert_eq!(h.snap().warning, "");
+    assert_eq!(h.world().session_starts, 1);
+}
+
+#[test]
+fn the_warning_gives_why_a_module_failed_to_load() {
+    let mut cut = npu_module("org.example.cutout", StageId::BACKGROUND, "matte");
+    cut.1 = Err("cannot open /m/org.example.cutout.so: no such file".into());
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+        w.maxine = false;
+        w.modules = vec![cut];
+    });
+    assert_eq!(
+        h.snap().warning,
+        "effect blur unavailable: NPU background: cannot open /m/org.example.cutout.so: no \
+         such file"
+    );
+    h.activate(0);
+    assert_eq!(h.applied(), Some(EffectMode::None));
+    assert_eq!(h.snap().error, "");
+}
+
+#[test]
+fn the_warning_gives_why_a_stage_is_not_installed() {
+    let mut h = H::new("[effect]\ndenoise = true\n", |w| {
+        w.features = Some(denoise_missing("no Denoise model"));
+    });
+    let want =
+        format!("noise removal unavailable: NVIDIA Maxine video effects: {REASON_NOT_INSTALLED}");
+    assert_eq!(h.snap().warning, want, "idle");
+    h.activate(0);
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", &*want));
+    // Switched off: nothing to say.
+    h.set_denoise(false, 1000).unwrap();
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn dropped_stages_of_two_modules_are_two_clauses() {
+    let dir = hello_modules_dir();
+    let config = format!("{}[effect]\nmode = \"blur\"\n", modules_config(dir.path()));
+    let mut h = H::new(&config, |w| w.real_modules = true);
+    h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
+        .unwrap();
+    h.activate(100);
+    h.set_module(MAXINE_MODULE, false, 1000);
+    h.set_module(HELLO, false, 1100);
+    let snap = h.snap();
+    assert_eq!(
+        (snap.error.as_str(), snap.warning.as_str()),
+        ("", &*format!("{NO_BLUR}; {NO_HELLO}"))
+    );
+    assert_eq!(h.state(), State::Active);
+    assert!(!stage_on(&h.last_effect(), "hello"));
+}
+
+#[test]
+fn a_chain_module_toggled_mid_session_drops_and_restores_its_stage() {
+    let dir = hello_modules_dir();
+    let mut h = H::new(&modules_config(dir.path()), |w| w.real_modules = true);
+    h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
+        .unwrap();
+    h.activate(100);
+    assert!(stage_on(&h.session_params().effect, "hello"));
+    let ingests = h.world().ingests.len();
+    // Disabled: off in the running session, named in the warning.
+    h.set_module(HELLO, false, 1000);
+    assert!(!stage_on(&h.last_effect(), "hello"));
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", NO_HELLO));
+    assert_eq!(h.state(), State::Active);
+    // Enabled again: back in the same session, the camera kept open.
+    h.set_module(HELLO, true, 2000);
+    assert!(stage_on(&h.last_effect(), "hello"));
+    assert_eq!(h.snap().warning, "");
+    {
+        let w = h.world();
+        assert_eq!(w.session_starts, 1);
+        assert_eq!(w.ingests.len(), ingests);
+    }
+    // A session started with it disabled: enabling it restarts it once.
+    h.set_module(HELLO, false, 3000);
+    h.consumers(0, 3100);
+    h.tick(70_000);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.snap().warning, NO_HELLO, "remembered while idle");
+    h.activate(71_000);
+    assert_eq!(h.world().session_starts, 2);
+    assert!(h.session_params().backends.chains.is_empty());
+    assert_eq!(h.snap().warning, NO_HELLO, "and in the next session");
+    h.set_module(HELLO, true, 72_000);
+    h.tick(72_400);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().session_starts, 3);
+    assert!(stage_on(&h.session_params().effect, "hello"));
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn a_stage_switched_off_is_never_in_the_warning() {
+    let dir = hello_modules_dir();
+    let mut h = H::new(&modules_config(dir.path()), |w| w.real_modules = true);
+    // Noise removal, relighting and the module's stage are off; no effect.
+    h.activate(100);
+    h.set_module(MAXINE_MODULE, false, 1000);
+    h.set_module(HELLO, false, 1100);
+    assert_eq!(h.snap().warning, "");
+    h.consumers(0, 1200);
+    h.tick(70_000);
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn enhancement_is_warned_only_where_it_would_apply() {
+    let want = "enhance low-resolution camera unavailable: NVIDIA Maxine video effects: Disabled";
+    // A camera small enough for it.
+    let mut h = H::new("", |w| w.cameras = vec![small(alpha())]);
+    h.set_setting(ENHANCE_ID, SettingValue::Bool(true), 0)
+        .unwrap();
+    h.set_module(MAXINE_MODULE, false, 100);
+    assert_eq!(h.snap().warning, want);
+    h.activate(200);
+    assert_eq!(h.snap().warning, want);
+    // A camera at full resolution: nothing to enhance, nothing missing.
+    let mut h = H::new("[effect]\nenhance = true\n", |_| {});
+    h.set_module(MAXINE_MODULE, false, 100);
+    assert_eq!(h.snap().warning, "");
+    h.activate(200);
+    assert_eq!(h.snap().warning, "");
 }

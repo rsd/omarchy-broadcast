@@ -53,6 +53,8 @@ pub fn line(level: Level, msg: &str) {
     if level == Level::Debug && !verbose() {
         return;
     }
+    #[cfg(test)]
+    LINES.with(|l| l.borrow_mut().push(format!("{}{msg}", level.word())));
     let journal = *PREFIX.get_or_init(|| !std::io::stderr().is_terminal());
     // eprintln! (not a raw stderr handle): the test harness captures it.
     if journal {
@@ -60,6 +62,19 @@ pub fn line(level: Level, msg: &str) {
     } else {
         eprintln!("omarchy-broadcastd: {}{msg}", level.word());
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The lines this thread wrote (debug lines included only with `-v`).
+    static LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The lines this thread wrote since the last call, each with its level's
+/// word (`warning: `): what a test reads of the journal.
+#[cfg(test)]
+pub fn take_lines() -> Vec<String> {
+    LINES.with(|l| std::mem::take(&mut *l.borrow_mut()))
 }
 
 #[macro_export]

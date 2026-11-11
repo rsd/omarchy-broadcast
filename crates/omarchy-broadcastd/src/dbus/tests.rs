@@ -357,6 +357,7 @@ async fn every_property_reads_through_the_proxy() {
         Snapshot {
             state: State::Idle,
             error: String::new(),
+            warning: String::new(),
             enabled: true,
             cameras: vec![
                 CameraInfo {
@@ -393,8 +394,9 @@ async fn every_property_reads_through_the_proxy() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 10);
-    // GetAll returns the same twenty-two properties.
+    assert_eq!(INTERFACE_REVISION, 11);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::WARNING_REVISION);
+    // GetAll returns the same twenty-three properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
         .destination(obc_ipc::BUS_NAME)
         .path(OBJECT_PATH)
@@ -433,7 +435,8 @@ async fn every_property_reads_through_the_proxy() {
             "PreviewConsumers",
             "SettingsRevision",
             "SettingsSchemaSerial",
-            "State"
+            "State",
+            "Warning"
         ]
     );
     // Introspection: the methods, the signal, read-only properties that
@@ -848,26 +851,26 @@ async fn effect_methods_properties_and_their_errors() {
     assert_eq!(proxy.blur_strength().await.unwrap(), 0.75);
     assert_eq!(proxy.state().await.unwrap(), State::Idle);
 
-    // While active: an effect failure with on_failure black is the error
-    // state, with the reason in Error; selecting the effect again retries.
+    // While active: an effect that fails to load with on_failure black
+    // keeps the session, its frames black, with the reason in Warning;
+    // selecting the effect again retries.
     rig.world().effect_fail = Some("the model did not load".into());
     rig.consumers(1);
     wait_state(&proxy, State::Active).await;
     within("SetEffect", proxy.set_effect("blur")).await.unwrap();
-    wait_state(&proxy, State::Error).await;
-    assert_eq!(
-        proxy.error().await.unwrap(),
-        "effect blur unavailable: the model did not load"
-    );
-    assert!(rig.world().session.is_none(), "the camera is closed");
+    let black = "effect blur unavailable: the model did not load; the video is black until it \
+                 can run";
+    assert_eq!(proxy.warning().await.unwrap(), black);
+    assert_eq!(proxy.error().await.unwrap(), "");
+    assert_eq!(proxy.state().await.unwrap(), State::Active);
+    assert!(rig.world().session.is_some(), "the camera stays open");
     rig.world().effect_fail = None;
     within("SetEffect", proxy.set_effect("blur")).await.unwrap();
-    wait_state(&proxy, State::Active).await;
-    assert_eq!(proxy.error().await.unwrap(), "");
-    until("the error state and its recovery", &seen, |s| {
-        s.iter()
-            .any(|e| e == "Error=effect blur unavailable: the model did not load")
-            && s.last().is_some_and(|e| e == "State=active")
+    assert_eq!(proxy.warning().await.unwrap(), "");
+    until("the warning and its recovery", &seen, |s| {
+        s.iter().any(|e| *e == format!("Warning={black}"))
+            && s.last().is_some_and(|e| e == "Warning=")
+            && !s.iter().any(|e| e == "State=error")
     })
     .await;
 }
@@ -877,7 +880,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 10);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 11);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -929,6 +932,81 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     assert_eq!(proxy.state().await.unwrap(), State::Active);
 }
 
+/// An effect that fails with `on_failure = "none"` (revision 11): the
+/// camera image streams on, the reason in `Warning`, `Error` empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_none_failure_is_in_warning_and_error_stays_empty() {
+    let rig = Rig::new(
+        "[effect]\non_failure = \"none\"\n[lifecycle]\nstart_debounce_ms = 0\n",
+        |w| w.effect_fail = Some("the model did not load".into()),
+    )
+    .await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    let seen = rig.record_changes().await;
+    rig.consumers(1);
+    wait_state(&proxy, State::Active).await;
+    within("SetEffect", proxy.set_effect("blur")).await.unwrap();
+    let want = "effect blur unavailable: the model did not load; the camera image is shown \
+                without the effect (effect.on_failure = \"none\")";
+    assert_eq!(proxy.warning().await.unwrap(), want);
+    assert_eq!(proxy.error().await.unwrap(), "");
+    assert_eq!(proxy.state().await.unwrap(), State::Active);
+    until("the warning", &seen, |s| {
+        s.iter().any(|e| *e == format!("Warning={want}"))
+    })
+    .await;
+    assert!(
+        !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.starts_with("Error=effect")),
+        "never in Error"
+    );
+}
+
+/// `Warning` (revision 11): a selected effect no module provides streams
+/// without it, announced in `Warning`, never in `Error` or the state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn warning_names_a_dropped_effect_and_its_changes_are_announced() {
+    let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    assert_eq!(proxy.warning().await.unwrap(), "");
+    let seen = rig.record_changes().await;
+    within("SetEffect", proxy.set_effect("blur")).await.unwrap();
+    within(
+        "SetModuleEnabled",
+        proxy.set_module_enabled(crate::modules::MAXINE_MODULE, false),
+    )
+    .await
+    .unwrap();
+    let want = "effect blur unavailable: NVIDIA Maxine video effects: Disabled";
+    assert_eq!(proxy.warning().await.unwrap(), want);
+    until("the warning", &seen, |s| {
+        s.iter().any(|e| *e == format!("Warning={want}"))
+    })
+    .await;
+    rig.consumers(1);
+    wait_state(&proxy, State::Active).await;
+    assert_eq!(proxy.error().await.unwrap(), "");
+    assert_eq!(proxy.effect().await.unwrap(), "blur");
+    within(
+        "SetModuleEnabled",
+        proxy.set_module_enabled(crate::modules::MAXINE_MODULE, true),
+    )
+    .await
+    .unwrap();
+    assert_eq!(proxy.warning().await.unwrap(), "");
+    until("the warning cleared", &seen, |s| {
+        s.iter().any(|e| e == "Warning=")
+    })
+    .await;
+    let snap = within("snapshot", Snapshot::fetch(&proxy)).await.unwrap();
+    assert_eq!(snap.warning, "");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_pipewire_properties_and_their_changes() {
     let rig = Rig::new(
@@ -938,7 +1016,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 10);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 11);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -1054,7 +1132,7 @@ async fn preview_leases_by_bus_name_their_property_and_their_frames() {
     let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 10);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 11);
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
     let seen = rig.record_changes().await;
     let mut frames = proxy.receive_preview_frame().await.unwrap();

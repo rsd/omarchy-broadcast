@@ -188,7 +188,8 @@ pub struct World {
     /// Scans give every camera the requested size and rate (as a camera
     /// offering every mode would).
     pub follow_request: bool,
-    /// `effect_available` fails with this for any effect but `none`.
+    /// `effect_available` fails with this for any effect but `none`, and
+    /// so does the load of such an effect (as `effect_fail`).
     pub effect_unavailable: Option<String>,
     pub effect_probes: u32,
     /// An effect applied (at start or by `set_effect`) fails with this.
@@ -237,6 +238,10 @@ pub struct World {
     /// What it reports with one, when set (else [`World::features`]): the
     /// models of another GPU.
     pub features_with_cc: Option<Vec<(StageId, Availability)>>,
+    /// The next probes of a module by id (opens excepted), in order: each
+    /// reports its stages once, before what the module would report
+    /// otherwise (a probe that changes within one step).
+    pub probe_script: Vec<(String, Vec<(StageId, Availability)>)>,
     /// The compute capability of every probe of the fake Maxine module (at
     /// its opening and after), in order.
     pub feature_probes: Vec<Option<(u32, u32)>>,
@@ -381,6 +386,7 @@ impl Default for World {
             fail_set_effect: None,
             features: None,
             features_with_cc: None,
+            probe_script: Vec::new(),
             feature_probes: Vec::new(),
             compute_capability: None,
             cc_reads: 0,
@@ -539,9 +545,15 @@ impl World {
         self.denoise_status = stage(effect.denoise(), &self.denoise_fail);
         self.relight_status = stage(effect.relight(), &self.relight_fail);
         self.effect = Some(effect.clone());
+        // An effect the probe finds unavailable fails its load for the
+        // same reason, as in the element.
         self.effect_status = if effect.mode == EffectMode::None {
             EffectStatus::Off
-        } else if let Some(r) = &self.effect_fail {
+        } else if let Some(r) = self
+            .effect_fail
+            .as_ref()
+            .or(self.effect_unavailable.as_ref())
+        {
             EffectStatus::Failed(r.clone())
         } else if self.effect_slow {
             EffectStatus::Loading
@@ -833,6 +845,15 @@ impl MediaBackend for FakeBackend {
         if let Some(e) = w.fail_set_effect.take() {
             return Err(e);
         }
+        // As the real output: one built without an effect module cannot
+        // take an effect later.
+        let no_element = w
+            .session
+            .as_ref()
+            .is_some_and(|(p, _)| p.backends.effect.is_none());
+        if no_element && !effect.effect_idle() {
+            return Err("no effect module provides the effect".into());
+        }
         w.apply_effect(effect);
         Ok(())
     }
@@ -922,6 +943,9 @@ impl MediaBackend for FakeBackend {
         module: Option<&Module>,
     ) -> Result<Vec<(StageId, Availability)>, String> {
         let mut w = self.world();
+        if let Some(i) = w.probe_script.iter().position(|(m, _)| m == id) {
+            return Ok(w.probe_script.remove(i).1);
+        }
         if w.maxine && id == crate::modules::MAXINE_MODULE {
             let cc = w
                 .module_opens

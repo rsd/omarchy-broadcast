@@ -21,7 +21,7 @@ use obc_ipc::{
     CameraControl, CameraControls, CameraInfo, Condition, ConditionOp, INTERFACE,
     INTERFACE_REVISION, IpcError, OBJECT_PATH, OmarchyBroadcastProxy, ResetScope,
     SETTINGS_REVISION, Setting, SettingChange, SettingKind, SettingValue, SettingsGroup,
-    SettingsTree, Snapshot, State, Stats,
+    SettingsTree, Snapshot, State, Stats, WARNING_REVISION,
 };
 use obc_ipc::{ModuleInfo, ModuleList, StageInfo};
 use zbus::message::Flags;
@@ -35,6 +35,8 @@ struct Mock {
     enabled: bool,
     state: State,
     error: String,
+    /// `Warning` (revision 11).
+    warning: String,
     cameras: Vec<CameraInfo>,
     active: usize,
     /// Holding the loopback.
@@ -66,6 +68,9 @@ struct Mock {
 }
 
 const OVERRIDDEN: &str = "output.aspect";
+/// The mock's `Warning`.
+const WARNING: &str =
+    "effect blur, noise removal unavailable: NVIDIA Maxine video effects: Disabled";
 const LOCAL: &str = "config.d/90-local.toml";
 
 fn config_row(id: &str, kind: ConfigKind, value: ConfigValue, default: ConfigValue) -> ConfigRow {
@@ -283,6 +288,7 @@ impl Mock {
             enabled: true,
             state: State::Idle,
             error: String::new(),
+            warning: WARNING.into(),
             cameras: vec![
                 CameraInfo {
                     id: "usb-1234_abcd".into(),
@@ -899,6 +905,11 @@ impl Mock {
     }
 
     #[zbus(property)]
+    fn warning(&self) -> String {
+        self.warning.clone()
+    }
+
+    #[zbus(property)]
     fn enabled(&self) -> bool {
         self.enabled
     }
@@ -1142,6 +1153,7 @@ async fn proxy_reads_every_property() {
         Snapshot {
             state: State::Idle,
             error: String::new(),
+            warning: WARNING.into(),
             enabled: true,
             cameras: Mock::new().cameras,
             active_camera: "usb-1234_abcd".into(),
@@ -1167,8 +1179,9 @@ async fn proxy_reads_every_property() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 10);
-    assert_eq!(INTERFACE_REVISION, CONFIG_REVISION);
+    assert_eq!(INTERFACE_REVISION, 11);
+    assert_eq!(INTERFACE_REVISION, WARNING_REVISION);
+    assert_eq!(CONFIG_REVISION, 10);
     assert_eq!(proxy.inner().interface().as_str(), INTERFACE);
 }
 
@@ -1199,6 +1212,7 @@ async fn a_revision_1_daemon_reads_with_defaults_for_the_newer_properties() {
         assert_eq!(snap.camera_controls, None);
         assert_eq!(snap.settings_revision, None);
         assert_eq!(snap.settings_schema_serial, None);
+        assert_eq!(snap.warning, "");
     }
     let no_autostart = within("snapshot", Snapshot::fetch_no_autostart(&client))
         .await

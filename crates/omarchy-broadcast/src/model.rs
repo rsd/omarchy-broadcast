@@ -5,10 +5,11 @@ use obc_ipc::{CameraInfo, Snapshot};
 
 /// The JSON names of the scalar fields of a `state` line, in output order
 /// (`docs/cli-json.md`).
-pub const STATE_FIELDS: [&str; 16] = [
+pub const STATE_FIELDS: [&str; 17] = [
     "state",
     "enabled",
     "error",
+    "warning",
     "active_camera",
     "active_camera_name",
     "consumers",
@@ -89,6 +90,7 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Changes {
         old.state != new.state,
         old.enabled != new.enabled,
         old.error != new.error,
+        old.warning != new.warning,
         old.active_camera != new.active_camera,
         active_camera_name(old) != active_camera_name(new),
         old.consumers != new.consumers,
