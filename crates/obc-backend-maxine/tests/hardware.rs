@@ -43,19 +43,29 @@
 //! switching it on and off with its GPU memory, a
 //! load after the GPU was parked and unparked, and its GPU time per stage
 //! (logged).
+//!
+//! The `gpu_` tests cover the green screen's chair mode (a switch of
+//! [`BACKGROUND_CHAIR`] loads the green screen again in the other mode,
+//! with the effects that read its mask, a switch that keeps it reuses the
+//! model, and one whose new green screen or relighting fails to load keeps
+//! the previous chain running) and both methods of the enhance stage on the upscaler
+//! ([`MaxineVsr::load_with`]).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use obc_backend::enhance::{ChromaSiting, DeviceYuv420, EnhanceRequest, Enhancer, YuvLayout};
 use obc_backend::{
     BackendError, BackendFactory, ColourSpec, EffectKind, FrameParams, GpuContext, HostBgr,
     InferenceBackend, LoadRequest, Params, StageId, StageList, StageTimings, Value,
 };
 use obc_backend_maxine::matte::{HARDENING_LUT, apply_lut};
+use obc_backend_maxine::vsr::{EnhanceMethod, MaxineVsr, MaxineVsrFactory};
 use obc_backend_maxine::{
-    DenoiseFault, DenoiseFaultSwitch, MaskFault, MaskFaultSwitch, MaxineBackend, MaxineFactory,
-    RELIGHT_DIRECTION, RELIGHT_LIGHT, RelightFault, RelightFaultSwitch, RelightLight,
+    BACKGROUND_CHAIR, DenoiseFault, DenoiseFaultSwitch, GREEN_SCREEN_MODE_CHAIR_BACKGROUND,
+    GREEN_SCREEN_MODE_CHAIR_FOREGROUND, MaskFault, MaskFaultSwitch, MaxineBackend, MaxineFactory,
+    ModelLoads, RELIGHT_DIRECTION, RELIGHT_LIGHT, RelightFault, RelightFaultSwitch, RelightLight,
     SPLIT_MASK_RAMP, split_mask_value,
 };
 use obc_gpu::{
@@ -2471,4 +2481,262 @@ fn maxine_relight_stage_times() {
         }
         backend.unload();
     });
+}
+
+/// `relight_request` with the background stage's chair parameter.
+fn chair_request(effect: EffectKind, relight: bool, chair: bool) -> LoadRequest {
+    let mut req = relight_request(effect, RelightLight::Neutral);
+    if !relight {
+        req.stages = StageList::default();
+        req.params.clear();
+    }
+    req.params.insert(
+        StageId::BACKGROUND,
+        Params::from([(BACKGROUND_CHAIR.to_string(), Value::Bool(chair))]),
+    );
+    req
+}
+
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]
+fn gpu_a_chair_switch_loads_the_green_screen_again_and_keeps_the_cut_out() {
+    let f = factory();
+    fault_rig(|gpu, stream, src, dst| {
+        for (effect, relight) in [
+            (EffectKind::Blur, false),
+            (EffectKind::Replace, false),
+            (EffectKind::Blur, true),
+        ] {
+            let label = format!("{effect}{}", if relight { " + relight" } else { "" });
+            let mut backend = f.create_maxine().unwrap();
+            let mut step = |what: &str, chair: bool| {
+                let report = backend
+                    .load(gpu, &chair_request(effect, relight, chair))
+                    .unwrap_or_else(|e| panic!("{label}, {what}: {e}"));
+                for _ in 0..4 {
+                    backend
+                        .process(gpu, &relight_params(0.0), &src.frame(), &dst.frame())
+                        .unwrap_or_else(|e| panic!("{label}, {what}: process failed: {e}"));
+                }
+                stream.synchronize().unwrap();
+                // The frames ran through the loaded green screen's mask.
+                check_hardened(
+                    &format!("{label}, {what}"),
+                    &mut backend,
+                    gpu,
+                    relight_params(0.0),
+                    src,
+                    dst,
+                    &HARDENING_LUT,
+                );
+                assert_eq!(backend.relight_loaded(), relight, "{label}, {what}");
+                println!(
+                    "CHAIR {label}, {what}: {report:?}, {:?}",
+                    backend.model_loads()
+                );
+                (report, backend.model_loads(), backend.mask_mode())
+            };
+            let (_, first, mode) = step("chair as foreground", false);
+            assert_eq!(mode, Some(GREEN_SCREEN_MODE_CHAIR_FOREGROUND), "{label}");
+            let mut want = first;
+            assert_eq!(want.green_screen, 1, "{label}");
+            // Another mode: the green screen again, and the relighting it
+            // feeds; nothing else.
+            let (report, loads, mode) = step("chair as background", true);
+            assert_eq!(mode, Some(GREEN_SCREEN_MODE_CHAIR_BACKGROUND), "{label}");
+            assert!(!report.reused_model, "{label}: {report:?}");
+            want.green_screen += 1;
+            want.relight += u64::from(relight);
+            assert_eq!(loads, want, "{label}: a new green screen");
+            // The same mode: everything is reused.
+            let (report, loads, _) = step("chair as background again", true);
+            assert!(report.reused_model, "{label}: {report:?}");
+            assert_eq!(loads, want, "{label}: nothing loaded");
+            let (_, loads, mode) = step("chair as foreground again", false);
+            assert_eq!(mode, Some(GREEN_SCREEN_MODE_CHAIR_FOREGROUND), "{label}");
+            want.green_screen += 1;
+            want.relight += u64::from(relight);
+            assert_eq!(loads, want, "{label}: back to the first mode");
+            assert_eq!(
+                ModelLoads {
+                    green_screen: 0,
+                    relight: 0,
+                    ..loads
+                },
+                ModelLoads {
+                    green_screen: 0,
+                    relight: 0,
+                    ..first
+                },
+                "{label}: no other model"
+            );
+            backend.unload();
+        }
+    });
+}
+
+/// A chair switch whose new green screen, or the relighting bound to it,
+/// fails to load leaves the previous chain running: the load fails, the
+/// mask keeps its mode, no model is counted, and the next frames run
+/// through the loaded mask. Disarmed, the same switch then succeeds.
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]
+fn gpu_a_failed_chair_switch_keeps_the_previous_chain() {
+    let mask_switch = MaskFaultSwitch::default();
+    let relight_switch = RelightFaultSwitch::default();
+    let f = factory()
+        .with_mask_faults(mask_switch.clone())
+        .with_relight_faults(relight_switch.clone());
+    fault_rig(|gpu, stream, src, dst| {
+        for (effect, relight, mask_fault, relight_fault) in [
+            (EffectKind::Blur, false, Some(MaskFault::ModuleLoad), None),
+            (
+                EffectKind::Replace,
+                false,
+                Some(MaskFault::ModuleLoad),
+                None,
+            ),
+            (EffectKind::Blur, true, Some(MaskFault::ModuleLoad), None),
+            (EffectKind::Blur, true, None, Some(RelightFault::Load)),
+            (EffectKind::Replace, true, None, Some(RelightFault::Load)),
+        ] {
+            let label = format!(
+                "{effect}{}, {mask_fault:?} {relight_fault:?}",
+                if relight { " + relight" } else { "" }
+            );
+            mask_switch.set(None);
+            relight_switch.set(None);
+            let mut backend = f.create_maxine().unwrap();
+            let frames = |backend: &mut MaxineBackend, what: &str| {
+                for _ in 0..4 {
+                    backend
+                        .process(gpu, &relight_params(0.0), &src.frame(), &dst.frame())
+                        .unwrap_or_else(|e| panic!("{label}, {what}: process failed: {e}"));
+                }
+                stream.synchronize().unwrap();
+                check_hardened(
+                    &format!("{label}, {what}"),
+                    backend,
+                    gpu,
+                    relight_params(0.0),
+                    src,
+                    dst,
+                    &HARDENING_LUT,
+                );
+            };
+            backend
+                .load(gpu, &chair_request(effect, relight, false))
+                .unwrap_or_else(|e| panic!("{label}: the first load failed: {e}"));
+            frames(&mut backend, "chair as foreground");
+            let before = backend.model_loads();
+            assert_eq!(
+                backend.mask_mode(),
+                Some(GREEN_SCREEN_MODE_CHAIR_FOREGROUND),
+                "{label}"
+            );
+
+            mask_switch.set(mask_fault);
+            relight_switch.set(relight_fault);
+            let e = backend
+                .load(gpu, &chair_request(effect, relight, true))
+                .expect_err(&format!("{label}: the faulted chair switch loaded"));
+            println!("CHAIR FAULT {label}: {e}");
+            if relight_fault.is_some() {
+                assert!(e.to_string().contains("NvVFX_CreateEffect"), "{label}: {e}");
+            } else {
+                assert!(e.to_string().contains("cuModuleLoadData"), "{label}: {e}");
+            }
+            assert_eq!(
+                backend.mask_mode(),
+                Some(GREEN_SCREEN_MODE_CHAIR_FOREGROUND),
+                "{label}: the mask's mode changed"
+            );
+            assert_eq!(backend.model_loads(), before, "{label}: a model counted");
+            assert_eq!(backend.loaded_effect(), Some(effect), "{label}");
+            assert_eq!(backend.relight_loaded(), relight, "{label}");
+            // The previous chain runs on, the faults still armed (they act
+            // on loads only).
+            frames(&mut backend, "after the failed switch");
+            assert_eq!(backend.model_loads(), before, "{label}: a model counted");
+
+            // Disarmed, the same switch goes through.
+            mask_switch.set(None);
+            relight_switch.set(None);
+            backend
+                .load(gpu, &chair_request(effect, relight, true))
+                .unwrap_or_else(|e| panic!("{label}: the disarmed switch failed: {e}"));
+            assert_eq!(
+                backend.mask_mode(),
+                Some(GREEN_SCREEN_MODE_CHAIR_BACKGROUND),
+                "{label}"
+            );
+            frames(&mut backend, "chair as background");
+            backend.unload();
+        }
+    });
+}
+
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]
+fn gpu_enhance_upscales_with_either_method() {
+    let factory = MaxineVsrFactory::from_env();
+    assert!(factory.root().is_some(), "{SDK_HINT}");
+    let (w, h) = (640u32, 360u32);
+    let person = synthetic_person();
+    let ctx = OwnedContext::create(0).unwrap();
+    // SAFETY: `ctx` outlives the guard; everything below drops first.
+    let _g = unsafe { ContextGuard::push(ctx.raw()) }.unwrap();
+    let stream = Stream::new(true).unwrap();
+    let gpu = GpuContext {
+        context: ctx.raw(),
+        stream: stream.raw(),
+    };
+    // The top-left 640x360 of the synthetic frame.
+    let crop: Vec<u8> = (0..h as usize)
+        .flat_map(|y| {
+            let row = y * W as usize * 3;
+            person[row..row + w as usize * 3].iter().copied()
+        })
+        .collect();
+    let input = bgr_to_nv12(&crop, w as usize, h as usize);
+    let mean =
+        |nv12: &[u8], n: usize| nv12[..n].iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64;
+    let in_mean = mean(&input, (w * h) as usize);
+    let src = DeviceNv12Buffer::alloc(w, h).unwrap();
+    src.upload_packed(&input).unwrap();
+    for method in EnhanceMethod::ALL {
+        for scale in [2u32, 3, 4] {
+            let label = format!("{method} x{scale}");
+            let dst = DeviceNv12Buffer::alloc(scale * w, scale * h).unwrap();
+            let mut e: MaxineVsr = factory.create_vsr().unwrap();
+            let req = EnhanceRequest {
+                width: w,
+                height: h,
+                scale,
+                layout: YuvLayout::Nv12,
+                colour: ColourSpec::LIMITED_BT601,
+                chroma: ChromaSiting::Cosited,
+                params: Default::default(),
+            };
+            e.load_with(&gpu, &req, method)
+                .unwrap_or_else(|err| panic!("{label}: load failed: {err}"));
+            assert_eq!(e.loaded_method(), Some(method), "{label}");
+            for _ in 0..10 {
+                e.process(&gpu, &DeviceYuv420::from_nv12(&src.frame()), &dst.frame())
+                    .unwrap_or_else(|err| panic!("{label}: frame failed: {err}"));
+            }
+            stream.synchronize().unwrap();
+            let out = dst.download_packed().unwrap();
+            let out_mean = mean(&out, (scale * w * scale * h) as usize);
+            println!("ENHANCE {label}: in mean {in_mean:.2}, out mean {out_mean:.2}");
+            assert!(
+                (out_mean - in_mean).abs() < 6.0,
+                "{label}: the upscaled picture's level moved ({in_mean:.2} to {out_mean:.2})"
+            );
+            let t = e.timings().expect("timings after a synchronised frame");
+            assert!(t.upscale_ms > 0.0, "{label}: {t:?}");
+            e.unload();
+            assert_eq!(e.loaded_method(), None);
+        }
+    }
 }

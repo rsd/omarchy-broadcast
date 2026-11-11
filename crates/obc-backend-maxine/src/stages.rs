@@ -1,15 +1,25 @@
 //! The stages this backend offers, by [`StageId`], and what each of them
 //! needs: the SDK features it is made of ([`stage_features`],
 //! [`stage_availability_of`]), whether it consumes the matte
-//! ([`needs_mask`]), and how the relight stage reads its generic
-//! parameters ([`RelightParams`]).
+//! ([`needs_mask`]), and how the relight and background stages read their
+//! generic parameters ([`RelightParams`], [`BACKGROUND_CHAIR`]).
 //!
 //! | Stage id | SDK features | Runs |
 //! |---|---|---|
 //! | `background` | green screen, background blur | the matte and the effect of `blur` and `replace` |
 //! | `denoise` | denoise | before the mask |
 //! | `relight` | green screen, relighting | after the mask, on the person |
-//! | `enhance` | video super resolution | in the ingest ([`crate::vsr`]) |
+//! | `enhance` | video super resolution or upscale (either) | in the ingest ([`crate::vsr`]) |
+//!
+//! # The background stage's parameter
+//!
+//! At load time, under [`BACKGROUND_CHAIR`]: whether the green screen
+//! treats a chair as part of the background ([`Value::Bool`]; default
+//! `false`, a chair is kept with the person). It selects the green screen's
+//! quality mode with chairs as foreground or as background
+//! ([`green_screen_mode`]); the mode is fixed when the model loads, so a
+//! change loads the green screen again, with the effects that read its
+//! mask.
 //!
 //! # The relight stage's parameters
 //!
@@ -47,6 +57,15 @@ pub const RELIGHT_LIGHT: &str = "light";
 pub const RELIGHT_DIRECTION: &str = "direction";
 /// The live key of the relight stage's brightness, in percent.
 pub const RELIGHT_BRIGHTNESS: &str = "brightness";
+/// The load-time key of the background stage: a chair is cut out with the
+/// background (a boolean).
+pub const BACKGROUND_CHAIR: &str = "chair";
+
+/// The green screen's `Mode`: best quality, a chair kept with the person.
+pub const GREEN_SCREEN_MODE_CHAIR_FOREGROUND: u32 = 0;
+/// The green screen's `Mode`: best quality, a chair cut out with the
+/// background.
+pub const GREEN_SCREEN_MODE_CHAIR_BACKGROUND: u32 = 2;
 
 /// Every stage this backend offers, in the order of the table of the module
 /// documentation.
@@ -59,15 +78,23 @@ pub const STAGES: [StageId; 4] = [
 
 /// The SDK features `stage` is made of, or `None` for a stage this backend
 /// does not offer. A stage that consumes the matte needs the green screen
-/// that makes it.
+/// that makes it. The `enhance` stage is the exception: its features are
+/// alternative methods ([`crate::vsr::EnhanceMethod`]), and either one is
+/// enough ([`any_feature_suffices`]).
 pub fn stage_features(stage: &str) -> Option<&'static [Feature]> {
     Some(match stage {
         "background" => &[Feature::GreenScreen, Feature::BackgroundBlur],
         "denoise" => &[Feature::Denoise],
         "relight" => &[Feature::GreenScreen, Feature::Relighting],
-        "enhance" => &[Feature::VideoSuperResolution],
+        "enhance" => &[Feature::VideoSuperResolution, Feature::Upscale],
         _ => return None,
     })
+}
+
+/// Whether one installed feature of [`stage_features`] makes `stage`
+/// available (its features are alternatives), rather than all of them.
+pub fn any_feature_suffices(stage: &str) -> bool {
+    stage == StageId::ENHANCE
 }
 
 /// Whether `stage` consumes the green-screen matte: it then runs after the
@@ -80,11 +107,13 @@ pub fn needs_mask(stage: &str) -> bool {
 
 /// Whether `stage` can be offered, from the availability of each feature
 /// (as [`crate::feature_availability`] reports it): installed when every
-/// feature of [`stage_features`] is, else not installed with the reason. A
-/// stage made of one feature has that feature's reason; one made of several
-/// lists `<feature>: <reason>` for each one missing, joined by `; ` (a
-/// feature missing from `features` counts as not installed, "not
-/// reported"). A stage this backend does not offer is not installed.
+/// feature of [`stage_features`] is (for a stage whose features are
+/// alternatives, [`any_feature_suffices`], when one of them is), else not
+/// installed with the reason. A stage made of one feature has that
+/// feature's reason; one made of several lists `<feature>: <reason>` for
+/// each one missing, joined by `; ` (a feature missing from `features`
+/// counts as not installed, "not reported"). A stage this backend does not
+/// offer is not installed.
 pub fn stage_availability_of(features: &[(Feature, Availability)], stage: &str) -> Availability {
     let Some(needs) = stage_features(stage) else {
         return Availability::NotInstalled(format!("the Maxine backend has no stage {stage}"));
@@ -104,7 +133,12 @@ pub fn stage_availability_of(features: &[(Feature, Availability)], stage: &str) 
             None => Some(format!("{f}: not reported")),
         })
         .collect();
-    if missing.is_empty() {
+    let available = if any_feature_suffices(stage) {
+        missing.len() < needs.len()
+    } else {
+        missing.is_empty()
+    };
+    if available {
         Availability::Installed
     } else {
         Availability::NotInstalled(missing.join("; "))
@@ -332,12 +366,49 @@ pub(crate) fn relight_light(req: &LoadRequest) -> Result<RelightLight, BackendEr
 /// [`BackendFactory::check_params`](obc_backend::BackendFactory::check_params):
 /// for the relight stage, a known light and a direction and brightness of
 /// the right type within their ranges (checked whether or not the stage is
-/// on). Other stages take no parameters; unknown keys are accepted.
+/// on); for the background stage, a boolean [`BACKGROUND_CHAIR`]. Other
+/// stages take no parameters; unknown keys are accepted.
 pub fn check_stage_params(stage: &str, params: &Params, live: &Params) -> Result<(), String> {
     if stage == StageId::RELIGHT {
         RelightParams::from_params(Some(params), Some(live))?.validate()?;
     }
+    if stage == StageId::BACKGROUND {
+        chair_as_background(Some(params))?;
+    }
     Ok(())
+}
+
+/// Whether the background stage's load-time `params` cut a chair out with
+/// the background ([`BACKGROUND_CHAIR`]; absent: no). The reason if the
+/// value is not a boolean.
+fn chair_as_background(params: Option<&Params>) -> Result<bool, String> {
+    match params.and_then(|p| p.get(BACKGROUND_CHAIR)) {
+        None => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(v) => Err(format!(
+            "the background parameter {BACKGROUND_CHAIR} must be a boolean, not a {} ({v})",
+            v.kind()
+        )),
+    }
+}
+
+/// The green screen's `Mode` for `req`: the quality mode with a chair kept
+/// with the person ([`GREEN_SCREEN_MODE_CHAIR_FOREGROUND`]), or, when the
+/// background stage's [`BACKGROUND_CHAIR`] is `true`, cut out with the
+/// background ([`GREEN_SCREEN_MODE_CHAIR_BACKGROUND`]). A mask that only
+/// the relight stage reads (effect `none`) has no background stage, and
+/// the default mode. A malformed value refuses the request: it is the
+/// matte's, which never fails open.
+pub fn green_screen_mode(req: &LoadRequest) -> Result<u32, BackendError> {
+    let params = match req.effect {
+        EffectKind::None => None,
+        _ => req.stage_params(StageId::BACKGROUND.as_str()),
+    };
+    match chair_as_background(params) {
+        Ok(false) => Ok(GREEN_SCREEN_MODE_CHAIR_FOREGROUND),
+        Ok(true) => Ok(GREEN_SCREEN_MODE_CHAIR_BACKGROUND),
+        Err(m) => Err(BackendError::InvalidInput(m)),
+    }
 }
 
 /// Whether `req` makes the chain compute the mask: its effect composites
@@ -399,7 +470,7 @@ mod tests {
         );
         assert_eq!(
             stage_features("enhance"),
-            Some(&[Feature::VideoSuperResolution][..])
+            Some(&[Feature::VideoSuperResolution, Feature::Upscale][..])
         );
         assert_eq!(stage_features("hello"), None);
         let without_green_screen: Vec<(Feature, Availability)> = all_installed
@@ -436,7 +507,7 @@ mod tests {
         );
         assert_eq!(
             stage_availability_of(&[], "enhance").reason(),
-            Some("video-super-resolution: not reported")
+            Some("video-super-resolution: not reported; upscale: not reported")
         );
         assert!(
             stage_availability_of(&all_installed, "hello")
@@ -626,5 +697,104 @@ mod tests {
             ..req
         };
         assert_eq!(relight_light(&neutral).unwrap(), RelightLight::Neutral);
+    }
+
+    #[test]
+    fn enhance_is_available_with_either_of_its_methods() {
+        let with = |vsr: bool, upscale: bool| {
+            let a = |on: bool| {
+                if on {
+                    Installed
+                } else {
+                    NotInstalled("no library".into())
+                }
+            };
+            vec![
+                (Feature::VideoSuperResolution, a(vsr)),
+                (Feature::Upscale, a(upscale)),
+            ]
+        };
+        assert!(any_feature_suffices("enhance"));
+        for s in ["background", "denoise", "relight"] {
+            assert!(!any_feature_suffices(s), "{s}");
+        }
+        assert_eq!(
+            stage_availability_of(&with(true, true), "enhance"),
+            Installed
+        );
+        assert_eq!(
+            stage_availability_of(&with(true, false), "enhance"),
+            Installed
+        );
+        assert_eq!(
+            stage_availability_of(&with(false, true), "enhance"),
+            Installed
+        );
+        assert_eq!(
+            stage_availability_of(&with(false, false), "enhance"),
+            NotInstalled("video-super-resolution: no library; upscale: no library".into())
+        );
+        // One reported, the other not: the reported one decides.
+        let only_upscale = [(Feature::Upscale, Installed)];
+        assert_eq!(stage_availability_of(&only_upscale, "enhance"), Installed);
+    }
+
+    fn background_req(effect: EffectKind, chair: Option<Value>) -> LoadRequest {
+        LoadRequest {
+            effect,
+            stages: obc_backend::StageList::new([]).unwrap(),
+            width: 1280,
+            height: 720,
+            colour: Default::default(),
+            background: None,
+            params: chair
+                .map(|v| BTreeMap::from([(StageId::BACKGROUND, params(&[(BACKGROUND_CHAIR, v)]))]))
+                .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn the_chair_parameter_chooses_the_green_screen_mode() {
+        assert_eq!(GREEN_SCREEN_MODE_CHAIR_FOREGROUND, 0);
+        assert_eq!(GREEN_SCREEN_MODE_CHAIR_BACKGROUND, 2);
+        for effect in [EffectKind::Blur, EffectKind::Replace] {
+            for (chair, mode) in [
+                (None, GREEN_SCREEN_MODE_CHAIR_FOREGROUND),
+                (Some(Value::Bool(false)), GREEN_SCREEN_MODE_CHAIR_FOREGROUND),
+                (Some(Value::Bool(true)), GREEN_SCREEN_MODE_CHAIR_BACKGROUND),
+            ] {
+                assert_eq!(
+                    green_screen_mode(&background_req(effect, chair.clone())).unwrap(),
+                    mode,
+                    "{effect:?} {chair:?}"
+                );
+            }
+            for bad in [Value::Int(1), Value::Str("yes".into())] {
+                let e = green_screen_mode(&background_req(effect, Some(bad))).unwrap_err();
+                assert!(matches!(e, BackendError::InvalidInput(_)), "{e:?}");
+                assert!(e.to_string().contains("must be a boolean"), "{e}");
+            }
+        }
+        // Under none there is no background stage: the mask relighting
+        // reads has the default mode.
+        assert_eq!(
+            green_screen_mode(&background_req(EffectKind::None, Some(Value::Bool(true)))).unwrap(),
+            GREEN_SCREEN_MODE_CHAIR_FOREGROUND
+        );
+    }
+
+    #[test]
+    fn the_chair_parameter_is_checked_for_the_client() {
+        let check = |v: Value| {
+            check_stage_params(
+                "background",
+                &params(&[(BACKGROUND_CHAIR, v)]),
+                &Params::new(),
+            )
+        };
+        assert!(check(Value::Bool(true)).is_ok());
+        assert!(check(Value::Bool(false)).is_ok());
+        assert!(check(Value::Int(1)).unwrap_err().contains("chair"));
+        assert!(check_stage_params("background", &Params::new(), &Params::new()).is_ok());
     }
 }

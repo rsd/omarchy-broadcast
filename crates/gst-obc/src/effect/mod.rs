@@ -90,7 +90,7 @@ use std::sync::Arc;
 use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
-use obc_backend::BackendFactory;
+use obc_backend::{BackendFactory, Params, StageId};
 
 use crate::settings::{EffectSettings, EffectStats, EffectStatus};
 
@@ -178,7 +178,7 @@ impl ObcEffect {
     }
 
     /// Validates `settings` ([`EffectSettings::validate`], and each listed
-    /// stage's parameters with the backend factory's
+    /// stage's parameters, and the background stage's, with the backend factory's
     /// `BackendFactory::check_params` when the element has a factory) and
     /// applies them at once, as one change: one reload at most, and after a
     /// failure a new attempt even when nothing changed. A change of the
@@ -189,6 +189,13 @@ impl ObcEffect {
         if let Some(factory) = self.backend_factory() {
             for s in &settings.stages {
                 factory.check_params(&s.id, &s.params, &s.live)?;
+            }
+            if !settings.background_params.is_empty() {
+                factory.check_params(
+                    &StageId::BACKGROUND,
+                    &settings.background_params,
+                    &Params::new(),
+                )?;
             }
         }
         self.imp().apply(settings.clone(), true);

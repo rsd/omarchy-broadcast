@@ -169,6 +169,7 @@ fn apply_validates_and_sets_everything_at_once() {
             StageRequest::on(StageId::DENOISE),
             relight("cool", -45, 125),
         ],
+        background_params: [("chair".to_string(), Value::Bool(true))].into(),
     };
     fx.apply(&s).unwrap();
     assert_eq!(fx.settings(), s);
@@ -191,6 +192,13 @@ fn apply_validates_and_sets_everything_at_once() {
     let mut bad = s.clone();
     bad.stages[1] = relight("neutral", 0, 300);
     assert!(fx.apply(&bad).unwrap_err().contains("relight gain"));
+    assert_eq!(fx.settings(), s, "nothing applied");
+    // The background stage's too.
+    let mut bad = s.clone();
+    bad.background_params
+        .insert("chair".into(), Value::from("yes"));
+    let e = fx.apply(&bad).unwrap_err();
+    assert!(e.contains("chair must be a boolean"), "{e}");
     assert_eq!(fx.settings(), s, "nothing applied");
 }
 

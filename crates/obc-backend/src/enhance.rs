@@ -18,7 +18,7 @@
 //! request's [`GpuContext`] current, and the work is enqueued on its
 //! stream.
 
-use crate::{BackendError, ColourSpec, DeviceNv12, GpuContext, LoadReport};
+use crate::{BackendError, ColourSpec, DeviceNv12, GpuContext, LoadReport, Params};
 
 /// The smallest scale factor an enhancer is asked for: below it the stage
 /// is not worth its passes.
@@ -153,7 +153,7 @@ impl DeviceYuv420 {
 }
 
 /// What [`Enhancer::load`] should prepare.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EnhanceRequest {
     /// Input width in pixels (even); every input frame has it.
     pub width: u32,
@@ -170,6 +170,12 @@ pub struct EnhanceRequest {
     /// The chroma siting of the input frames; the output frames have the
     /// same.
     pub chroma: ChromaSiting,
+    /// The load-time parameters of the `enhance` stage (for example the
+    /// method of a module that has more than one), as
+    /// [`LoadRequest::params`](crate::LoadRequest::params) carries them for
+    /// the effect's stages; empty: the enhancer's defaults. A new value is a
+    /// new request, so the caller loads again.
+    pub params: Params,
 }
 
 impl EnhanceRequest {
@@ -324,15 +330,28 @@ mod tests {
             layout: YuvLayout::Nv12,
             colour: ColourSpec::LIMITED_BT601,
             chroma: ChromaSiting::default(),
+            params: Params::new(),
         };
         assert!(req.validate().is_ok());
         assert_eq!(req.chroma, ChromaSiting::Cosited, "MPEG-2 unless told");
         assert_eq!(req.output_size(), (1920, 1080));
         for scale in [0, 1, 5] {
-            let e = EnhanceRequest { scale, ..req }.validate().unwrap_err();
+            let e = EnhanceRequest {
+                scale,
+                ..req.clone()
+            }
+            .validate()
+            .unwrap_err();
             assert!(e.to_string().contains("2 to 4"), "{e}");
         }
-        assert!(EnhanceRequest { height: 541, ..req }.validate().is_err());
+        assert!(
+            EnhanceRequest {
+                height: 541,
+                ..req.clone()
+            }
+            .validate()
+            .is_err()
+        );
         assert_eq!(YuvLayout::I420.as_str(), "I420");
     }
 }

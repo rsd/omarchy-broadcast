@@ -121,14 +121,16 @@ pub mod vsr;
 
 pub use features::{Feature, feature_availability, feature_dir};
 pub use stages::{
+    BACKGROUND_CHAIR, GREEN_SCREEN_MODE_CHAIR_BACKGROUND, GREEN_SCREEN_MODE_CHAIR_FOREGROUND,
     RELIGHT_BRIGHTNESS, RELIGHT_DIRECTION, RELIGHT_LIGHT, RelightLight, RelightParams, STAGES,
-    check_stage_params, needs_mask, relight_frame, stage_availability_of, stage_features,
-    stages_availability,
+    any_feature_suffices, check_stage_params, green_screen_mode, needs_mask, relight_frame,
+    stage_availability_of, stage_features, stages_availability,
 };
 
 /// Whether `stage` can be offered from the SDK tree at `root`: every
 /// feature it needs ([`stage_features`]: for the relight stage, the
-/// relighting and the green screen that makes its matte) is installed, as
+/// relighting and the green screen that makes its matte; for the enhance
+/// stage, either of its methods) is installed, as
 /// [`feature_availability`] reports it ([`stage_availability_of`]). Reads
 /// directories only.
 pub fn stage_availability(
@@ -999,6 +1001,9 @@ struct Mask {
     // before the effect, the images after it.
     effect: Effect,
     state: Box<[StateHandle; 1]>,
+    /// The green screen's `Mode`, fixed at its load
+    /// ([`stages::green_screen_mode`]).
+    mode: u32,
     /// The raw mask the green-screen effect writes. Only the kernel reads it
     /// (and `read_mask`): the effects use `hard`.
     mask: GpuImage,
@@ -1444,6 +1449,16 @@ impl MaxineBackend {
         self.loaded.as_ref().is_some_and(|l| l.mask.is_some())
     }
 
+    /// The `Mode` the loaded green screen runs in
+    /// ([`GREEN_SCREEN_MODE_CHAIR_FOREGROUND`] or
+    /// [`GREEN_SCREEN_MODE_CHAIR_BACKGROUND`]), if one is loaded.
+    pub fn mask_mode(&self) -> Option<u32> {
+        self.loaded
+            .as_ref()
+            .and_then(|l| l.mask.as_ref())
+            .map(|m| m.mode)
+    }
+
     /// The models loaded and the light changes taken since this backend
     /// was created ([`ModelLoads`]).
     pub fn model_loads(&self) -> ModelLoads {
@@ -1680,14 +1695,15 @@ impl MaxineBackend {
         Ok((d, ms_since(t1)))
     }
 
-    /// Creates and loads the green-screen effect on the frame image, with
-    /// the masks and the hardening kernel, then runs it once to absorb the
-    /// first-run warm-up.
+    /// Creates and loads the green-screen effect in `mode` on the frame
+    /// image, with the masks and the hardening kernel, then runs it once to
+    /// absorb the first-run warm-up.
     fn load_mask(
         &self,
         frames: &mut Frames,
         (w, h): (u32, u32),
         stream: CuStream,
+        mode: u32,
     ) -> Result<(Mask, f64), BackendError> {
         let sdk = self.sdk;
         let dir = self.model_dir.as_path();
@@ -1719,7 +1735,9 @@ impl MaxineBackend {
         let effect = Effect::create(sdk, ffi::FX_GREEN_SCREEN, dir)?;
         effect.set_model_dir(dir)?;
         effect.set_stream(stream, dir)?;
-        effect.set_u32(ffi::P_MODE, 0, dir)?; // quality, chairs as foreground
+        // Before the load, which fixes it: the quality mode, with a chair as
+        // foreground or as background.
+        effect.set_u32(ffi::P_MODE, mode, dir)?;
         effect.set_u32(ffi::P_CUDA_GRAPH, 1, dir)?;
         effect.set_u32(ffi::P_MAX_INPUT_WIDTH, w, dir)?;
         effect.set_u32(ffi::P_MAX_INPUT_HEIGHT, h, dir)?;
@@ -1729,6 +1747,7 @@ impl MaxineBackend {
         let mut mask = Mask {
             effect,
             state: Box::new([std::ptr::null_mut()]),
+            mode,
             mask: mask_img,
             hard,
             lut,
@@ -1985,9 +2004,11 @@ impl MaxineBackend {
     /// denoise stage at `strength` iff `Some`). The new parts are built
     /// first, before anything of `l` changes, in chain order: the pre-mask
     /// stages (each fails with [`BackendError::Stage`]), then the green
-    /// screen (a failure of which is the relight stage's under `none`, where
-    /// only that stage needs it), then the post-mask stages, then the blur
-    /// or the background, then a new light on a loaded relight stage. On
+    /// screen in `mask_mode` (a failure of which is the relight stage's under
+    /// `none`, where only that stage needs it; a loaded one of another mode
+    /// is replaced, with the relight and blur effects bound to it), then the
+    /// post-mask stages, then the blur or the background, then a new light
+    /// on a loaded relight stage. On
     /// failure `l` is as it was, except that a failed new light drops the
     /// relight stage ([`BackendError::Stage`] for it). Only then are the
     /// parts the request no longer needs dropped.
@@ -1997,6 +2018,7 @@ impl MaxineBackend {
         req: &LoadRequest,
         strength: Option<f32>,
         light: RelightLight,
+        mask_mode: u32,
     ) -> Result<Configured, BackendError> {
         let (size, stream) = ((l.width, l.height), l.stream);
         let mut warmup_ms: Option<f64> = None;
@@ -2010,21 +2032,27 @@ impl MaxineBackend {
         };
         let needs_mask = stages::request_needs_mask(req);
         let relight = req.stages.contains(StageId::RELIGHT.as_str());
-        let mut new_mask = if needs_mask && l.mask.is_none() {
-            let (m, ms) =
-                self.load_mask(&mut l.frames, size, stream)
-                    .map_err(|e| match req.effect {
-                        // Only the relight stage needs the mask: it fails open.
-                        EffectKind::None => stage_load_err(StageId::RELIGHT, e),
-                        _ => e,
-                    })?;
+        // The green screen's mode is fixed at its load: a loaded mask of
+        // another mode is not reused.
+        let remask = needs_mask && l.mask.as_ref().is_none_or(|m| m.mode != mask_mode);
+        let mut new_mask = if remask {
+            let (m, ms) = self
+                .load_mask(&mut l.frames, size, stream, mask_mode)
+                .map_err(|e| match req.effect {
+                    // Only the relight stage needs the mask: it fails open.
+                    EffectKind::None => stage_load_err(StageId::RELIGHT, e),
+                    _ => e,
+                })?;
             *warmup_ms.get_or_insert(0.0) += ms;
             Some(m)
         } else {
             None
         };
+        // The effects that read the mask are bound to its images: a new mask
+        // in place of a loaded one needs them anew, on the new mask.
+        let replaces_mask = new_mask.is_some() && l.mask.is_some();
         // A new light on a loaded stage is a live rebind, done last (below).
-        let new_relight = if relight && l.relight.is_none() {
+        let new_relight = if relight && (l.relight.is_none() || replaces_mask) {
             let mask = new_mask
                 .as_mut()
                 .or(l.mask.as_mut())
@@ -2035,7 +2063,7 @@ impl MaxineBackend {
         } else {
             None
         };
-        let new_blur = if req.effect == EffectKind::Blur && l.blur.is_none() {
+        let new_blur = if req.effect == EffectKind::Blur && (l.blur.is_none() || replaces_mask) {
             let mask = new_mask
                 .as_mut()
                 .or(l.mask.as_mut())
@@ -2063,6 +2091,7 @@ impl MaxineBackend {
         // `new_mask` or of `l`) before the mask.
         let mut rebound = false;
         if relight
+            && new_relight.is_none()
             && let Some(r) = l.relight.as_mut()
             && r.light != light
         {
@@ -2090,7 +2119,8 @@ impl MaxineBackend {
         } else if strength.is_none() {
             l.denoise = None;
         }
-        // Before the mask, whose hardened mask it reads.
+        // Before the mask, whose hardened mask it reads: a relight stage
+        // replaced with the mask goes while the mask it reads is alive.
         if new_relight.is_some() {
             l.relight = new_relight;
         } else if !relight {
@@ -2507,6 +2537,7 @@ impl InferenceBackend for MaxineBackend {
         } else {
             RelightLight::default()
         };
+        let mask_mode = stages::green_screen_mode(req)?;
         let t0 = Instant::now();
         let reuse = self.loaded.as_ref().is_some_and(|l| {
             (l.width, l.height, l.colour, l.stream)
@@ -2525,7 +2556,7 @@ impl InferenceBackend for MaxineBackend {
             self.unload();
             Loaded::new(self.sdk, req, gpu.stream)?
         };
-        match self.configure(&mut loaded, req, strength, light) {
+        match self.configure(&mut loaded, req, strength, light, mask_mode) {
             Ok(c) => {
                 self.loaded = Some(loaded);
                 self.model_loads.add(c.counted);

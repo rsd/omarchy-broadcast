@@ -9,12 +9,15 @@
 //! ```
 //!
 //! * **Properties**: `scale` (`k`, 2 to 4, default 2; set before the
-//!   element starts), read-only `status`. The enhancer factory is set from
-//!   Rust ([`ObcEnhance::set_factory`]).
+//!   element starts), read-only `status`. The enhancer factory and the
+//!   stage's load-time parameters are set from Rust
+//!   ([`ObcEnhance::set_factory`], [`ObcEnhance::set_params`]).
 //! * **Loading** happens on the streaming thread, with the first frame: the
 //!   enhancer is created and loaded in the input's CUDA context, on a CUDA
 //!   stream the element creates in it. The ingest has not delivered a frame
-//!   yet, so the output keeps showing what it showed before.
+//!   yet, so the output keeps showing what it showed before. The request
+//!   is the caps, the factor and the parameters: when any of them differs
+//!   from what is loaded, the next frame loads again.
 //! * **The crop of the ingest.** The element reads the crop region
 //!   `videocrop` attaches (`GstVideoCropMeta`) and enhances that region
 //!   only; its output carries no crop.
@@ -39,6 +42,7 @@ use std::sync::Arc;
 use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
+use obc_backend::Params;
 use obc_backend::enhance::EnhancerFactory;
 
 use crate::settings::EffectStatus;
@@ -88,6 +92,19 @@ impl ObcEnhance {
     /// "no enhancer is configured".
     pub fn set_factory(&self, factory: Option<Arc<dyn EnhancerFactory>>) {
         self.imp().set_factory(factory);
+    }
+
+    /// Sets the `enhance` stage's load-time parameters the enhancer is
+    /// loaded with ([`EnhanceRequest::params`](obc_backend::enhance::EnhanceRequest::params)).
+    /// Set them before the element starts; a later change loads the
+    /// enhancer again with the next frame.
+    pub fn set_params(&self, params: Params) {
+        self.imp().set_params(params);
+    }
+
+    /// The `enhance` stage's load-time parameters.
+    pub fn params(&self) -> Params {
+        self.imp().params()
     }
 
     /// The scale factor.

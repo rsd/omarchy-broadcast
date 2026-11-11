@@ -1449,6 +1449,8 @@ fn the_backend_parks_the_gpu_between_sessions_without_a_camera() {
             stages: Vec::new(),
             chains: Vec::new(),
             enhance: false,
+            background_params: Default::default(),
+            enhance_params: Default::default(),
         },
         backends: Default::default(),
     };

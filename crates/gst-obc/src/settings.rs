@@ -143,6 +143,13 @@ pub struct EffectSettings {
     /// element's status message; one that is not listed is off too. Its
     /// parameters are kept while it is off.
     pub stages: Vec<StageRequest>,
+    /// The load-time parameters of the matte and compositor (the
+    /// `background` stage) other than the effect itself, which is
+    /// [`Self::kind`]: for example whether a chair is cut out with the
+    /// background. They load with blur and replace and change nothing for
+    /// `none`; a new value reloads the effect as any switch does, the
+    /// previous chain running until the new one is in force.
+    pub background_params: Params,
 }
 
 impl Default for EffectSettings {
@@ -154,6 +161,7 @@ impl Default for EffectSettings {
             fallback: EffectFallback::Black,
             fallback_image: None,
             stages: Vec::new(),
+            background_params: Params::new(),
         }
     }
 }
@@ -273,16 +281,21 @@ impl EffectSettings {
     }
 
     /// What the backend must have loaded for these settings: the effect,
-    /// for replace its image, and the stages that are on with their
-    /// load-time parameters, in order. The blur strength, the fallback, the
-    /// live parameters and the parameters of a stage that is off change
-    /// nothing that is loaded.
+    /// for replace its image, for blur and replace the background stage's
+    /// parameters, and the stages that are on with their load-time
+    /// parameters, in order. The blur strength, the fallback, the live
+    /// parameters and the parameters of a stage that is off (the
+    /// background stage's with `none`) change nothing that is loaded.
     pub(crate) fn target(&self) -> Target {
         Target {
             kind: self.kind,
             background: match self.kind {
                 EffectKind::Replace => self.background.clone(),
                 _ => None,
+            },
+            background_params: match self.kind {
+                EffectKind::None => Params::new(),
+                _ => self.background_params.clone(),
             },
             stages: self
                 .stages
@@ -300,6 +313,8 @@ impl EffectSettings {
 pub(crate) struct Target {
     pub kind: EffectKind,
     pub background: Option<PathBuf>,
+    /// The `background` stage's load-time parameters (empty with `none`).
+    pub background_params: Params,
     /// The requested stages, in order, with their load-time parameters.
     pub stages: Vec<(StageId, Params)>,
 }
@@ -335,13 +350,19 @@ impl Target {
             .expect("the settings list each stage once (validated)")
     }
 
-    /// The load-time parameters of the requested stages that have any.
+    /// The load-time parameters of the requested stages that have any,
+    /// with the `background` stage's when it has any.
     pub fn stage_params(&self) -> BTreeMap<StageId, Params> {
-        self.stages
+        let mut params: BTreeMap<StageId, Params> = self
+            .stages
             .iter()
             .filter(|(_, p)| !p.is_empty())
             .map(|(s, p)| (s.clone(), p.clone()))
-            .collect()
+            .collect();
+        if !self.background_params.is_empty() {
+            params.insert(StageId::BACKGROUND, self.background_params.clone());
+        }
+        params
     }
 }
 
@@ -596,6 +617,10 @@ mod tests {
             with(|s| s.stages[0].enabled = true),
             with(|s| s.kind = EffectKind::None),
             with(|s| {
+                s.background_params
+                    .insert("chair".into(), Value::Bool(true));
+            }),
+            with(|s| {
                 s.stages[1].live = relight().with_live("direction", 10).live;
                 s.fallback = EffectFallback::None;
             }),
@@ -772,6 +797,40 @@ mod tests {
         };
         assert!(alone.validate().is_ok());
         assert_eq!(alone.target().kind, EffectKind::None);
+    }
+
+    #[test]
+    fn the_target_carries_the_background_parameters_with_an_effect_only() {
+        let chair = |kind| EffectSettings {
+            background_params: [("chair".to_string(), Value::Bool(true))].into(),
+            ..EffectSettings::of(kind)
+        };
+        let blur = chair(EffectKind::Blur);
+        assert!(blur.validate().is_ok());
+        let t = blur.target();
+        assert_eq!(t.background_params.get("chair"), Some(&Value::Bool(true)));
+        assert_ne!(t, EffectSettings::of(EffectKind::Blur).target());
+        assert_eq!(
+            t.stage_params()
+                .get("background")
+                .and_then(|p| p.get("chair")),
+            Some(&Value::Bool(true))
+        );
+        // Off and on again are two loads; no stage is listed for them.
+        let mut off = blur.clone();
+        off.background_params
+            .insert("chair".into(), Value::Bool(false));
+        assert_ne!(off.target(), t);
+        assert!(!t.has_stages() && t.stage_list().is_empty());
+        // With `none` there is no matte: they load nothing.
+        assert_eq!(
+            chair(EffectKind::None).target(),
+            EffectSettings::default().target()
+        );
+        assert!(EffectSettings::default().target().stage_params().is_empty());
+        // A stage's removal keeps them.
+        let staged = chair(EffectKind::Blur).with_stage(relight());
+        assert_eq!(staged.target().without("relight"), t);
     }
 
     #[test]

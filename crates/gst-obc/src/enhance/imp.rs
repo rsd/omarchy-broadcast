@@ -46,7 +46,7 @@ use obc_backend::enhance::{
     ChromaSiting, DeviceYuv420, EnhanceRequest, Enhancer, EnhancerFactory, MAX_SCALE, MIN_SCALE,
     YuvLayout,
 };
-use obc_backend::{ColourMatrix, ColourSpec, DeviceNv12, GpuContext};
+use obc_backend::{ColourMatrix, ColourSpec, DeviceNv12, GpuContext, Params};
 use obc_gpu::{ContextGuard, CuContext, CuStream, Event};
 
 use super::{EnhanceStats, STATUS_MESSAGE};
@@ -71,6 +71,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 struct Shared {
     factory: Mutex<Option<Arc<dyn EnhancerFactory>>>,
     scale: AtomicU32,
+    /// The `enhance` stage's load-time parameters: part of every request,
+    /// so a change loads again with the next frame.
+    params: Mutex<Params>,
     /// The stage has failed: the caps are the same on both sides.
     failed: AtomicBool,
     status: Mutex<EffectStatus>,
@@ -86,6 +89,7 @@ impl Default for Shared {
         Shared {
             factory: Mutex::new(None),
             scale: AtomicU32::new(MIN_SCALE),
+            params: Mutex::new(Params::new()),
             failed: AtomicBool::new(false),
             status: Mutex::new(EffectStatus::Loading),
             enhanced: AtomicU64::new(0),
@@ -504,6 +508,14 @@ impl ObcEnhance {
         *lock(&self.shared.factory) = factory;
     }
 
+    pub(super) fn set_params(&self, params: Params) {
+        *lock(&self.shared.params) = params;
+    }
+
+    pub(super) fn params(&self) -> Params {
+        lock(&self.shared.params).clone()
+    }
+
     pub(super) fn status(&self) -> EffectStatus {
         lock(&self.shared.status).clone()
     }
@@ -626,22 +638,11 @@ impl ObcEnhance {
         Ok(())
     }
 
-    /// The request for the negotiated input caps.
+    /// The request for the negotiated input caps, the factor and the
+    /// stage's parameters.
     fn request(&self, st: &StreamState) -> Result<EnhanceRequest, String> {
         let info = st.in_info.as_ref().ok_or("no caps negotiated")?;
-        let layout = match info.format() {
-            gst_video::VideoFormat::Nv12 => YuvLayout::Nv12,
-            gst_video::VideoFormat::I420 => YuvLayout::I420,
-            other => return Err(format!("the enhance stage cannot read {other:?} frames")),
-        };
-        Ok(EnhanceRequest {
-            width: info.width(),
-            height: info.height(),
-            scale: self.scale(),
-            layout,
-            colour: colour_of(&info.colorimetry())?,
-            chroma: siting_of(info.chroma_site()),
-        })
+        request_of(info, self.scale(), self.params())
     }
 
     /// Makes sure the enhancer is loaded for the negotiated caps; returns
@@ -649,7 +650,7 @@ impl ObcEnhance {
     fn ensure_loaded(&self, st: &mut StreamState, inbuf: &gst::BufferRef) -> Result<bool, String> {
         self.ensure_gpu(st, inbuf)?;
         let req = self.request(st)?;
-        if st.loaded == Some(req) {
+        if !needs_load(st.loaded.as_ref(), &req) {
             return Ok(false);
         }
         st.loaded = None;
@@ -691,7 +692,7 @@ impl ObcEnhance {
         outbuf: &mut gst::BufferRef,
     ) -> Result<(), String> {
         let lib = cuda::gst_cuda()?;
-        let req = st.loaded.ok_or("the enhancer is not loaded")?;
+        let req = st.loaded.clone().ok_or("the enhancer is not loaded")?;
         let in_info = st.in_info.clone().ok_or("no caps negotiated")?;
         let out_info = st.out_info.clone().ok_or("no caps negotiated")?;
         let gpu = st.gpu.as_ref().ok_or("no CUDA resources")?;
@@ -1016,6 +1017,31 @@ impl BaseTransformImpl for ObcEnhance {
     }
 }
 
+/// The request for frames of `info`, by `scale`, with the stage's
+/// load-time `params`.
+fn request_of(info: &VideoInfo, scale: u32, params: Params) -> Result<EnhanceRequest, String> {
+    let layout = match info.format() {
+        gst_video::VideoFormat::Nv12 => YuvLayout::Nv12,
+        gst_video::VideoFormat::I420 => YuvLayout::I420,
+        other => return Err(format!("the enhance stage cannot read {other:?} frames")),
+    };
+    Ok(EnhanceRequest {
+        width: info.width(),
+        height: info.height(),
+        scale,
+        layout,
+        colour: colour_of(&info.colorimetry())?,
+        chroma: siting_of(info.chroma_site()),
+        params,
+    })
+}
+
+/// Whether `req` needs a load over what is `loaded`: nothing is, or
+/// anything of it differs, the parameters alone included.
+fn needs_load(loaded: Option<&EnhanceRequest>, req: &EnhanceRequest) -> bool {
+    loaded != Some(req)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1129,5 +1155,30 @@ mod tests {
         assert_eq!(c("2:4:5:1").unwrap(), ColourSpec::LIMITED_BT601);
         assert_eq!(c("1:4:0:0").unwrap(), ColourSpec::FULL_BT601);
         assert!(c("bt2020").is_err());
+    }
+    #[test]
+    fn a_change_of_the_parameters_alone_loads_again() {
+        gst::init().unwrap();
+        let info = VideoInfo::builder(gst_video::VideoFormat::Nv12, 640, 360)
+            .build()
+            .unwrap();
+        let ai = request_of(&info, 3, Params::new()).unwrap();
+        assert!(ai.params.is_empty());
+        assert!(needs_load(None, &ai), "nothing is loaded");
+        assert!(!needs_load(Some(&ai), &ai.clone()), "the same request");
+        let mut fast_params = Params::new();
+        fast_params.insert("method".into(), obc_backend::Value::Str("fast".into()));
+        let fast = request_of(&info, 3, fast_params.clone()).unwrap();
+        assert_eq!(fast.params, fast_params);
+        assert_eq!(
+            EnhanceRequest {
+                params: Params::new(),
+                ..fast.clone()
+            },
+            ai,
+            "only the parameters differ"
+        );
+        assert!(needs_load(Some(&ai), &fast));
+        assert!(needs_load(Some(&fast), &ai), "back to the default");
     }
 }

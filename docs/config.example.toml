@@ -193,7 +193,10 @@ blur_strength = 0.5
 denoise = false
 
 # Enhance a low-resolution camera: upscale the camera image to the output
-# size with the SDK's video super resolution, before the other stages, so a
+# size with the SDK's video super resolution (or, by the setting
+# effect.video.enhance_method, its fast non-AI upscale, which is lighter on
+# the GPU; that setting has no key here, see `omarchy-broadcast settings`),
+# before the other stages, so a
 # camera that captures well below the output (for example 960x540 or 640x360
 # into 1920x1080) is sharper than scaling alone makes it. It applies only
 # where it pays: the part of the camera frame the output shows must have at

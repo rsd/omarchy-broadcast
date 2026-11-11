@@ -11,7 +11,7 @@
 //!
 //! | Stage | Slot | Runs |
 //! |---|---|---|
-//! | `enhance` | pre-matte (position 0) | video super resolution, alone in its chain (the ingest's) |
+//! | `enhance` | pre-matte (position 0) | AI video super resolution or a fast upscale, alone in its chain (the ingest's) |
 //! | `denoise` | pre-matte | noise removal |
 //! | `background` | matte | the cut-out, and the blur or the replacement of the background |
 //! | `relight` | post-matte, needs the matte | relighting of the person |
@@ -19,13 +19,20 @@
 //!
 //! A chain of `background`, `denoise` and `relight` is the Maxine effect
 //! backend ([`obc_backend_maxine::MaxineBackend`]): the `background` stage's
-//! load-time parameter `mode` (`blur` or `replace`) is the effect, its live
-//! parameter `blur_strength` (0 to 1) the blur strength, and the chain's
-//! background frame the replacement image; without `background` the effect
-//! is `none`. A load on a loaded chain is a switch on the same backend, so
-//! models are reused as before. A chain of `enhance` alone is the Maxine
-//! upscaler ([`obc_backend_maxine::vsr::MaxineVsr`]): NV12 or I420 in, NV12
-//! an integer factor (2 to 4) larger out. Frames are CUDA frames only.
+//! load-time parameter `mode` (`blur` or `replace`) is the effect, its
+//! load-time parameter `chair` (a boolean, default `false`) whether a chair
+//! is cut out with the background, its live parameter `blur_strength` (from
+//! 0 to 1) the blur strength, and the chain's background frame the
+//! replacement image; without `background` the effect is `none`. A load
+//! on a loaded chain is a switch on the same backend, so models are reused
+//! as before; a new `chair` loads the green screen again, which the backend
+//! does as any switch, the previous chain kept running until the new one is
+//! in force. A chain of `enhance` alone is the Maxine upscaler
+//! ([`obc_backend_maxine::vsr::MaxineVsr`]): NV12 or I420 in, NV12 an
+//! integer factor (2 to 4) larger out, by the method of its load-time
+//! parameter `method`: `ai` (video super resolution) or `fast` (the SDK's
+//! lightweight upscale); without one, `ai` when it is installed, else
+//! `fast`. Frames are CUDA frames only.
 //!
 //! The `frame-generation` stage (the `VideoFrameGeneration` effect,
 //! [`obc_backend_maxine::vfg`]) runs last in a chain of any of the effect
@@ -59,7 +66,9 @@
 //! it never wakes a suspended GPU. A stage is available when every SDK
 //! feature it is made of is installed, with its models for the GPU; else
 //! it is unavailable, [`REASON_NOT_INSTALLED`] (the detail goes to the
-//! log). Relighting needs the cut-out of the `background` stage, so it is
+//! log); `enhance` is available when either of its methods is installed,
+//! and a load of a method that is not fails with the reason. Relighting
+//! needs the cut-out of the `background` stage, so it is
 //! unavailable whenever `background` is. Frame generation needs the video
 //! frame generation feature. Without an SDK root to read, nothing can be
 //! known, and every stage is reported available.
@@ -83,10 +92,10 @@ use obc_backend::{
     StageList, StageTimings, Value as BackendValue,
 };
 use obc_backend_maxine::vfg::{MaxineVfg, MaxineVfgFactory};
-use obc_backend_maxine::vsr::{MaxineVsr, MaxineVsrFactory};
+use obc_backend_maxine::vsr::{ENHANCE_METHOD, EnhanceMethod, MaxineVsr, MaxineVsrFactory};
 use obc_backend_maxine::{
-    Feature, MaxineBackend, MaxineFactory, RELIGHT_BRIGHTNESS, RELIGHT_DIRECTION, RELIGHT_LIGHT,
-    RelightLight, STAGES, feature_availability, stage_availability_of,
+    BACKGROUND_CHAIR, Feature, MaxineBackend, MaxineFactory, RELIGHT_BRIGHTNESS, RELIGHT_DIRECTION,
+    RELIGHT_LIGHT, RelightLight, STAGES, feature_availability, stage_availability_of,
 };
 use obc_module_sdk::{
     Apply, ChainRequest, ChromaSiting, ColourMatrix, Error, Frame, FrameKind, Group, Instance,
@@ -109,16 +118,29 @@ pub const FRAME_GENERATION: &str = "frame-generation";
 pub const REASON_NOT_INSTALLED: &str = "Not installed";
 /// Why a relighting setting is greyed while relighting is off.
 pub const REASON_TURN_ON_RELIGHT: &str = "Turn on relighting to change this";
+/// Why the enhancement method is greyed while enhancement is off.
+pub const REASON_TURN_ON_ENHANCE: &str = "Turn on enhancement to change this";
+/// Why the chair setting is greyed while the background effect is off.
+pub const REASON_TURN_ON_BACKGROUND: &str = "Turn on the background effect to change this";
 
 /// The `background` stage's load-time parameter with the effect.
 pub const BACKGROUND_MODE: &str = "mode";
 /// The `background` stage's live parameter with the blur strength.
 pub const BACKGROUND_BLUR_STRENGTH: &str = "blur_strength";
+/// The daemon's background effect setting, which the chair setting's
+/// condition reads.
+pub const DAEMON_BACKGROUND_MODE: &str = "effect.background.mode";
+
+/// The cut-out group's setting: a chair is cut out with the background
+/// (the `background` stage's [`BACKGROUND_CHAIR`]).
+pub const CHAIR: &str = "effect.cutout.chair";
 
 /// The video group's settings.
 pub const DENOISE: &str = "effect.video.denoise";
 /// See [`DENOISE`].
 pub const ENHANCE: &str = "effect.video.enhance";
+/// See [`DENOISE`]: the enhance stage's method ([`ENHANCE_METHOD`]).
+pub const ENHANCE_METHOD_SETTING: &str = "effect.video.enhance_method";
 /// The lighting group's settings.
 pub const RELIGHT: &str = "effect.lighting.relight";
 /// See [`RELIGHT`].
@@ -152,7 +174,8 @@ struct Config {
     host: HostKeys,
 }
 
-/// The settings of the module: the video group (noise removal and
+/// The settings of the module: the cut-out group (the chair, a parameter
+/// of the daemon's background effect), the video group (noise removal and
 /// enhancement) and the lighting group, as the daemon's settings model
 /// describes them.
 pub fn settings() -> SettingsDescription {
@@ -168,7 +191,22 @@ pub fn settings() -> SettingsDescription {
         RelightLight::Neutral => "Neutral",
         RelightLight::Cool => "Cool",
     };
+    let method_label = |m: EnhanceMethod| match m {
+        EnhanceMethod::Ai => "AI super resolution",
+        EnhanceMethod::Fast => "Fast upscale (lower power)",
+    };
     SettingsDescription::new()
+        .group(
+            Group::new("cutout", "Cut-out").setting(
+                Setting::bool(CHAIR, "Hide the chair with the background", false)
+                    .stage(StageId::BACKGROUND.as_str())
+                    .key(BACKGROUND_CHAIR)
+                    .apply(Apply::Reload)
+                    .enabled_when(DAEMON_BACKGROUND_MODE, Op::Ne, "none")
+                    .disabled_reason(REASON_TURN_ON_BACKGROUND)
+                    .hint("switch"),
+            ),
+        )
         .group(
             Group::new("video", "Video")
                 .setting(
@@ -182,6 +220,20 @@ pub fn settings() -> SettingsDescription {
                         .stage(StageId::ENHANCE.as_str())
                         .role(Role::Enable)
                         .hint("switch"),
+                )
+                .setting(
+                    Setting::enumeration(
+                        ENHANCE_METHOD_SETTING,
+                        "Enhancement method",
+                        EnhanceMethod::ALL.map(|m| (m.as_str(), method_label(m))),
+                        EnhanceMethod::default().as_str(),
+                    )
+                    .stage(StageId::ENHANCE.as_str())
+                    .key(ENHANCE_METHOD)
+                    .apply(Apply::Reload)
+                    .enabled_when(ENHANCE, Op::Eq, true)
+                    .disabled_reason(REASON_TURN_ON_ENHANCE)
+                    .hint("segmented"),
                 ),
         )
         .group(
@@ -367,6 +419,7 @@ impl Module for MaxineModule {
             effects: self.effects.clone(),
             enhance: self.enhance.clone(),
             framegen: self.framegen.clone(),
+            compute_capability: self.compute_capability,
             chain: Chain::Empty,
             gpu: None,
             blur_strength: FrameParams::default().blur_strength,
@@ -394,6 +447,8 @@ enum Chain {
 pub struct MaxineInstance {
     effects: MaxineFactory,
     enhance: MaxineVsrFactory,
+    /// The GPU's, as the module's configuration gives it.
+    compute_capability: Option<(u32, u32)>,
     chain: Chain,
     /// The context and stream of the last load.
     gpu: Option<GpuContext>,
@@ -551,6 +606,106 @@ fn host_bgr(f: &Frame<'_>) -> Result<HostBgr, Error> {
     })
 }
 
+/// The load-time parameters of the effect backend's stages from the
+/// request's: each stage's by key, the `background` stage's but its
+/// `mode` (which is the effect), none of frame generation's. A `chair`
+/// that is not a boolean is refused: it is the matte's, which never fails
+/// open.
+fn effect_params(params: &[Param<'_>]) -> Result<BTreeMap<StageId, Params>, Error> {
+    let mut out: BTreeMap<StageId, Params> = BTreeMap::new();
+    for p in params {
+        if p.stage == FRAME_GENERATION {
+            continue;
+        }
+        if p.stage == StageId::BACKGROUND.as_str() {
+            if p.key == BACKGROUND_MODE {
+                continue;
+            }
+            if p.key == BACKGROUND_CHAIR && p.value.as_bool().is_none() {
+                return Err(Error::invalid(format!(
+                    "the background stage's {BACKGROUND_CHAIR} must be a boolean, not {:?}",
+                    p.value
+                )));
+            }
+        }
+        let stage = StageId::new(p.stage).map_err(|e| Error::invalid(e.to_string()))?;
+        out.entry(stage)
+            .or_default()
+            .insert(p.key.to_string(), value(&p.value));
+    }
+    Ok(out)
+}
+
+/// The enhance stage's method the request asks for ([`ENHANCE_METHOD`]:
+/// `ai` or `fast`); `None` when it asks for none.
+fn enhance_method(params: &[Param<'_>]) -> Result<Option<EnhanceMethod>, Error> {
+    match Param::find(params, StageId::ENHANCE.as_str(), ENHANCE_METHOD) {
+        None => Ok(None),
+        Some(Value::Str(s)) => s.parse().map(Some).map_err(Error::invalid),
+        Some(other) => Err(Error::invalid(format!(
+            "the enhance stage's {ENHANCE_METHOD} must be ai or fast, not {other:?}"
+        ))),
+    }
+}
+
+/// Whether `method`'s feature is installed in the SDK tree at `root`, for
+/// a GPU of `compute_capability`: the stage is offered when either method
+/// is, so a load of the other one is refused here, with the reason. With
+/// no root nothing can be known, and the load decides.
+fn method_installed(
+    root: Option<&Path>,
+    compute_capability: Option<(u32, u32)>,
+    method: EnhanceMethod,
+) -> Result<(), Error> {
+    let Some(root) = root else {
+        return Ok(());
+    };
+    let feature = method.feature();
+    let why = feature_availability(root, compute_capability)
+        .into_iter()
+        .find(|(f, _)| *f == feature)
+        .and_then(|(_, a)| a.reason().map(str::to_string));
+    match why {
+        None => Ok(()),
+        Some(why) => Err(Error::unavailable(format!(
+            "the enhance method {method} needs the {feature} feature, which is not installed: \
+             {why}"
+        ))),
+    }
+}
+
+/// The method an enhance load runs, for the SDK tree at `root` and a GPU
+/// of `compute_capability`. A requested `fast` runs when its feature is
+/// installed, else is refused with the reason (never replaced by the
+/// costlier `ai`). A requested `ai` runs when installed; when its feature
+/// is missing but the upscale is installed, `fast` runs instead and a
+/// warning names why, since the daemon always sends the method (the default
+/// `ai` when the user chose none). With none requested, `ai` when it is
+/// installed, else `fast` when that is; neither installed is refused with
+/// the preferred method's reason. With no root nothing can be known: the
+/// requested method, or `ai`.
+fn resolve_enhance_method(
+    params: &[Param<'_>],
+    root: Option<&Path>,
+    compute_capability: Option<(u32, u32)>,
+) -> Result<EnhanceMethod, Error> {
+    let requested = enhance_method(params)?;
+    let preferred = requested.unwrap_or_default();
+    match method_installed(root, compute_capability, preferred) {
+        Ok(()) => Ok(preferred),
+        Err(e) if requested == Some(EnhanceMethod::Fast) => Err(e),
+        Err(e) => {
+            let fast = EnhanceMethod::Fast;
+            if method_installed(root, compute_capability, fast).is_ok() {
+                log::warn!("running the enhance method {fast} instead of {preferred}: {e:?}");
+                Ok(fast)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 impl MaxineInstance {
     /// Loads the effect backend for `stages`, the request's stages but
     /// frame generation.
@@ -599,17 +754,7 @@ impl MaxineInstance {
             }
         }
         let stages = StageList::new(ids).map_err(|e| Error::invalid(e.to_string()))?;
-        let mut params: BTreeMap<StageId, Params> = BTreeMap::new();
-        for p in req.params() {
-            if p.stage == StageId::BACKGROUND.as_str() || p.stage == FRAME_GENERATION {
-                continue;
-            }
-            let stage = StageId::new(p.stage).map_err(|e| Error::invalid(e.to_string()))?;
-            params
-                .entry(stage)
-                .or_default()
-                .insert(p.key.to_string(), value(&p.value));
-        }
+        let params = effect_params(req.params())?;
         let background = match (effect, req.background()) {
             (EffectKind::Replace, Some(f)) => Some(std::sync::Arc::new(host_bgr(f)?)),
             _ => None,
@@ -682,7 +827,14 @@ impl MaxineInstance {
             layout,
             colour: colour(req)?,
             chroma,
+            // The method, the stage's one parameter, is given to the load.
+            params: Params::new(),
         };
+        let method = resolve_enhance_method(
+            req.params(),
+            obc_backend_maxine::usable_root().as_deref(),
+            self.compute_capability,
+        )?;
         if !matches!(self.chain, Chain::Enhance(_)) {
             self.unload_chain();
             let vsr = self.enhance.create_vsr().map_err(module_error)?;
@@ -691,7 +843,9 @@ impl MaxineInstance {
         let Chain::Enhance(vsr) = &mut self.chain else {
             unreachable!("set above");
         };
-        let report = vsr.load(&gpu, &enhance).map_err(module_error)?;
+        let report = vsr
+            .load_with(&gpu, &enhance, method)
+            .map_err(module_error)?;
         Ok(LoadReport {
             load_ms: report.load_ms as f32,
             warmup_ms: report.warmup_ms.map(|w| w as f32),
@@ -966,14 +1120,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_settings_are_the_daemons_video_and_lighting_groups() {
+    fn the_settings_are_the_cutout_video_and_lighting_groups() {
         let doc: serde_json::Value = serde_json::from_str(&settings().to_json()).unwrap();
         let expected = serde_json::json!({"groups":[
+            {"id":"cutout","label":"Cut-out","settings":[
+                {"id":"effect.cutout.chair","label":"Hide the chair with the background",
+                 "type":"bool","default":false,"stage":"background","key":"chair",
+                 "apply":"reload","enabled_when":[["effect.background.mode","ne","none"]],
+                 "disabled_reason":"Turn on the background effect to change this",
+                 "hint":"switch"}]},
             {"id":"video","label":"Video","settings":[
                 {"id":"effect.video.denoise","label":"Noise removal","type":"bool","default":false,
                  "stage":"denoise","role":"enable","hint":"switch"},
                 {"id":"effect.video.enhance","label":"Enhance low-resolution camera","type":"bool",
-                 "default":false,"stage":"enhance","role":"enable","hint":"switch"}]},
+                 "default":false,"stage":"enhance","role":"enable","hint":"switch"},
+                {"id":"effect.video.enhance_method","label":"Enhancement method","type":"enum",
+                 "options":[["ai","AI super resolution"],["fast","Fast upscale (lower power)"]],
+                 "default":"ai","stage":"enhance","key":"method","apply":"reload",
+                 "enabled_when":[["effect.video.enhance","eq",true]],
+                 "disabled_reason":"Turn on enhancement to change this","hint":"segmented"}]},
             {"id":"lighting","label":"Lighting","settings":[
                 {"id":"effect.lighting.relight","label":"Relighting","type":"bool","default":false,
                  "stage":"relight","role":"enable","hint":"switch"},
@@ -994,8 +1159,179 @@ mod tests {
                  "disabled_reason":"Turn on relighting to change this","hint":"slider"}]}
         ]});
         assert_eq!(doc, expected);
-        // No setting of the daemon's own background group.
-        assert!(!settings().to_json().contains("effect.background"));
+        // No setting nor group of the daemon's own background group: the
+        // chair setting only reads its mode.
+        let d = settings();
+        assert!(d.groups.iter().all(|g| g.id != "background"));
+        assert!(
+            d.groups
+                .iter()
+                .flat_map(|g| &g.settings)
+                .all(|s| !s.id.starts_with("effect.background."))
+        );
+    }
+
+    fn param<'a>(stage: &'a str, key: &'a str, value: Value<'a>) -> Param<'a> {
+        Param { stage, key, value }
+    }
+
+    #[test]
+    fn the_enhance_method_is_read_from_the_stage_parameter() {
+        assert_eq!(enhance_method(&[]).unwrap(), None);
+        let p = |v| [param("enhance", "method", v)];
+        assert_eq!(
+            enhance_method(&p(Value::Str("ai"))).unwrap(),
+            Some(EnhanceMethod::Ai)
+        );
+        assert_eq!(
+            enhance_method(&p(Value::Str("fast"))).unwrap(),
+            Some(EnhanceMethod::Fast)
+        );
+        // Another stage's key of the same name is not the method.
+        assert_eq!(
+            enhance_method(&[param("denoise", "method", Value::Str("fast"))]).unwrap(),
+            None
+        );
+        for bad in [
+            Value::Str("turbo"),
+            Value::Str("FAST"),
+            Value::Bool(true),
+            Value::Int(1),
+        ] {
+            let e = enhance_method(&p(bad)).unwrap_err();
+            assert_eq!(e.kind(), obc_module_sdk::ErrorKind::Invalid, "{bad:?}");
+            assert!(e.wire_message().contains("ai or fast"), "{bad:?}: {e:?}");
+        }
+    }
+
+    #[test]
+    fn the_chair_reaches_the_backend_and_the_mode_does_not() {
+        let params = effect_params(&[
+            param("background", "mode", Value::Str("blur")),
+            param("background", "chair", Value::Bool(true)),
+            param("relight", "light", Value::Str("warm")),
+            param(FRAME_GENERATION, "x", Value::Int(1)),
+        ])
+        .unwrap();
+        assert_eq!(
+            params,
+            BTreeMap::from([
+                (
+                    StageId::BACKGROUND,
+                    Params::from([("chair".to_string(), BackendValue::Bool(true))])
+                ),
+                (
+                    StageId::RELIGHT,
+                    Params::from([("light".to_string(), BackendValue::Str("warm".into()))])
+                ),
+            ])
+        );
+        // The mode alone gives the background stage no parameter.
+        let params = effect_params(&[param("background", "mode", Value::Str("replace"))]).unwrap();
+        assert!(params.is_empty(), "{params:?}");
+        for bad in [Value::Str("yes"), Value::Int(1)] {
+            let e = effect_params(&[param("background", "chair", bad)]).unwrap_err();
+            assert_eq!(e.kind(), obc_module_sdk::ErrorKind::Invalid, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_method_whose_feature_is_not_installed_is_refused() {
+        let only_vsr = tree(&[VSR], &[]);
+        let only_upscale = tree(&[UPSCALE], &[]);
+        let both = tree(&[VSR, UPSCALE], &[]);
+        let ok = |t: &tempfile::TempDir, m| method_installed(Some(t.path()), Some((12, 0)), m);
+        assert!(ok(&only_vsr, EnhanceMethod::Ai).is_ok());
+        assert!(ok(&only_upscale, EnhanceMethod::Fast).is_ok());
+        assert!(ok(&both, EnhanceMethod::Ai).is_ok());
+        assert!(ok(&both, EnhanceMethod::Fast).is_ok());
+        let e = ok(&only_vsr, EnhanceMethod::Fast).unwrap_err();
+        assert_eq!(e.kind(), obc_module_sdk::ErrorKind::Unavailable);
+        assert!(e.wire_message().contains("fast"), "{e:?}");
+        assert!(e.wire_message().contains("nvvfxupscale"), "{e:?}");
+        let e = ok(&only_upscale, EnhanceMethod::Ai).unwrap_err();
+        assert!(e.wire_message().contains("nvvfxvideosuperres"), "{e:?}");
+        // No root: nothing can be known, the load decides.
+        assert!(method_installed(None, None, EnhanceMethod::Fast).is_ok());
+    }
+
+    #[test]
+    fn without_a_requested_method_the_installed_one_runs() {
+        let only_vsr = tree(&[VSR], &[]);
+        let only_upscale = tree(&[UPSCALE], &[]);
+        let both = tree(&[VSR, UPSCALE], &[]);
+        let none = tree(&[DENOISING], &[]);
+        let resolve =
+            |t: &tempfile::TempDir| resolve_enhance_method(&[], Some(t.path()), Some((12, 0)));
+        assert_eq!(resolve(&only_vsr).unwrap(), EnhanceMethod::Ai);
+        assert_eq!(resolve(&only_upscale).unwrap(), EnhanceMethod::Fast);
+        assert_eq!(resolve(&both).unwrap(), EnhanceMethod::Ai);
+        // Neither installed: refused with the preferred method's reason.
+        let e = resolve(&none).unwrap_err();
+        assert_eq!(e.kind(), obc_module_sdk::ErrorKind::Unavailable);
+        assert!(e.wire_message().contains("nvvfxvideosuperres"), "{e:?}");
+        // No root: nothing can be known, the default runs.
+        assert_eq!(
+            resolve_enhance_method(&[], None, None).unwrap(),
+            EnhanceMethod::Ai
+        );
+    }
+
+    #[test]
+    fn a_requested_ai_falls_back_to_fast_but_a_requested_fast_is_never_replaced() {
+        let only_vsr = tree(&[VSR], &[]);
+        let only_upscale = tree(&[UPSCALE], &[]);
+        let none = tree(&[DENOISING], &[]);
+        let ask = |t: &tempfile::TempDir, m| {
+            resolve_enhance_method(
+                &[param("enhance", "method", Value::Str(m))],
+                Some(t.path()),
+                Some((12, 0)),
+            )
+        };
+        assert_eq!(ask(&only_upscale, "ai").unwrap(), EnhanceMethod::Fast);
+        let e = ask(&only_vsr, "fast").unwrap_err();
+        assert_eq!(e.kind(), obc_module_sdk::ErrorKind::Unavailable);
+        assert!(e.wire_message().contains("nvvfxupscale"), "{e:?}");
+        let e = ask(&none, "ai").unwrap_err();
+        assert!(e.wire_message().contains("nvvfxvideosuperres"), "{e:?}");
+        assert_eq!(ask(&only_upscale, "fast").unwrap(), EnhanceMethod::Fast);
+        assert_eq!(ask(&only_vsr, "ai").unwrap(), EnhanceMethod::Ai);
+        // A malformed method is invalid whatever is installed.
+        let e = ask(&only_vsr, "turbo").unwrap_err();
+        assert_eq!(e.kind(), obc_module_sdk::ErrorKind::Invalid);
+    }
+
+    #[test]
+    fn enhance_is_offered_with_either_method_installed() {
+        let not = Some(REASON_NOT_INSTALLED.to_string());
+        for (features, available) in [
+            (&[VSR][..], true),
+            (&[UPSCALE][..], true),
+            (&[VSR, UPSCALE][..], true),
+            (&[DENOISING][..], false),
+        ] {
+            let t = tree(features, &[]);
+            let (r, details) = probe_root(Some(t.path()), Some((12, 0)));
+            let enhance = reasons(&r)
+                .into_iter()
+                .find(|(id, _, _)| id == "enhance")
+                .unwrap();
+            if available {
+                assert_eq!(enhance, ("enhance".into(), true, None), "{features:?}");
+                assert!(
+                    !details.iter().any(|d| d.starts_with("enhance:")),
+                    "{details:?}"
+                );
+            } else {
+                assert_eq!(enhance, ("enhance".into(), false, not.clone()));
+                let d = details.iter().find(|d| d.starts_with("enhance:")).unwrap();
+                assert!(
+                    d.contains("video-super-resolution: ") && d.contains("upscale: "),
+                    "{d}"
+                );
+            }
+        }
     }
 
     /// A fake SDK tree with the feature libraries of `dirs` (directory,
@@ -1020,6 +1356,7 @@ mod tests {
     const DENOISING: (&str, &str) = ("nvvfxdenoising", "libnvVFXDenoising.so");
     const RELIGHTING: (&str, &str) = ("nvvfxrelighting", "libnvVFXRelighting.so");
     const VSR: (&str, &str) = ("nvvfxvideosuperres", "libnvVFXVideoSuperRes.so");
+    const UPSCALE: (&str, &str) = ("nvvfxupscale", "libnvVFXUpscale.so");
     const VFG: (&str, &str) = (
         "nvvfxvideoframegeneration",
         "libnvVFXVideoFrameGeneration.so",

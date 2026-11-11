@@ -464,6 +464,7 @@ impl GstBackend {
         // the enhancer the session started with.
         cfg.enhance = params.effect.enhance && enhance.is_some();
         cfg.enhance_backend = enhance.cloned();
+        cfg.enhance_params = params.effect.enhance_params.clone();
         cfg
     }
 
@@ -510,8 +511,9 @@ fn stage_request(s: &StageRun) -> StageRequest {
 }
 
 /// The effect element's settings for what the session runs: the
-/// background effect, then its stages in stage order, each listed whether
-/// on or off, with its parameters (the module's keys and units).
+/// background effect with its stage's parameters, then its stages in stage
+/// order, each listed whether on or off, with its parameters (the module's
+/// keys and units).
 fn effect_settings(e: &EffectRun) -> EffectSettings {
     EffectSettings {
         kind: match e.mode {
@@ -529,6 +531,7 @@ fn effect_settings(e: &EffectRun) -> EffectSettings {
         },
         fallback_image: e.fallback_image.clone(),
         stages: e.stages.iter().map(stage_request).collect(),
+        background_params: e.background_params.clone(),
     }
 }
 
@@ -1665,6 +1668,10 @@ mod tests {
                 .collect(),
             chains: modules.chain_runs(&plan, &config, runtime),
             enhance: false,
+            background_params: modules
+                .stage_run(&plan, &config, runtime, &StageId::BACKGROUND)
+                .params,
+            enhance_params: Default::default(),
         }
     }
 
@@ -1730,5 +1737,50 @@ mod tests {
         let none = crate::modules::Modules::empty().plan();
         assert!(none.effect.is_none() && none.chains.is_empty());
         assert!(effect_backend(&none.backends()).is_none());
+    }
+
+    #[test]
+    fn the_background_and_enhance_parameters_reach_the_elements() {
+        use obc_pipeline::effect::{Params, Value};
+        let params = |k: &str, v: Value| -> Params { [(k.to_string(), v)].into() };
+        let run = EffectRun {
+            mode: EffectMode::Blur,
+            background_params: params("chair", Value::Bool(true)),
+            enhance: true,
+            enhance_params: params("method", Value::from("fast")),
+            ..maxine_run(&Default::default())
+        };
+        let s = effect_settings(&run);
+        assert_eq!(s.kind, obc_pipeline::effect::EffectKind::Blur);
+        assert_eq!(s.background_params, run.background_params);
+        assert!(s.stage("background").is_none(), "not a listed stage");
+        assert!(obc_pipeline::effect::check_settings(&s).is_ok());
+        let cfg = obc_core::config::Config::default();
+        let session = SessionParams {
+            contract: cfg.output_contract(),
+            aspect: cfg.output.aspect,
+            hold_timeout: cfg.hold_timeout(),
+            input_gap: cfg.input_gap(),
+            fixed_framerate: false,
+            effect: run.clone(),
+            backends: Default::default(),
+        };
+        let camera = Camera {
+            id: "usb-a".into(),
+            name: "A".into(),
+            card: "A".into(),
+            usb: None,
+            serial: None,
+            usb_path: None,
+            path: "/dev/video9".into(),
+            mode: "NV12:640x360@30".parse().unwrap(),
+            modes: Vec::new(),
+        };
+        let backend = EnhanceBackend::new(Arc::new(
+            obc_backend_maxine::vsr::MaxineVsrFactory::from_env(),
+        ));
+        let ingest = GstBackend::ingest_config(&session, &camera, Some(&backend));
+        assert!(ingest.enhance);
+        assert_eq!(ingest.enhance_params, run.enhance_params);
     }
 }
