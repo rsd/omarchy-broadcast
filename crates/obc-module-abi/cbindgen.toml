@@ -60,5 +60,8 @@ include = [
     "obc_chain_request",
     "obc_load_report",
     "obc_timing",
+    "obc_audio_buffer",
+    "obc_audio_request",
+    "obc_audio_load_report",
     "obc_module_vtable",
 ]

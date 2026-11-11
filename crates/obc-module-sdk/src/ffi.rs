@@ -10,13 +10,18 @@ use std::ptr;
 use std::sync::Mutex;
 
 use obc_module_abi::{
-    OBC_ERR_PANIC, OBC_MODULE_ABI_MAJOR, OBC_MODULE_ABI_VERSION, OBC_OK, obc_chain_request,
-    obc_frame, obc_host, obc_instance, obc_load_report, obc_module, obc_module_abi_major,
-    obc_module_vtable, obc_param, obc_status, obc_timing,
+    OBC_ERR_PANIC, OBC_MODULE_ABI_MAJOR, OBC_MODULE_ABI_VERSION, OBC_OK, obc_audio_buffer,
+    obc_audio_load_report, obc_audio_request, obc_chain_request, obc_frame, obc_host, obc_instance,
+    obc_load_report, obc_module, obc_module_abi_major, obc_module_vtable, obc_param, obc_status,
+    obc_timing,
 };
 
+use crate::audio::{AudioLoaded, buffers};
 use crate::log::{self, c_string};
-use crate::{ChainFrames, ChainRequest, Error, ErrorKind, Frame, Instance, Module, Param};
+use crate::{
+    AudioInstance, AudioRequest, ChainFrames, ChainRequest, Error, ErrorKind, Frame, Instance,
+    Module, Param,
+};
 
 thread_local! {
     /// The error of the last call made with a null object, or of the last
@@ -98,8 +103,11 @@ impl<M> ModuleBox<M> {
 /// What an `obc_instance *` points to.
 struct InstanceBox<I> {
     instance: I,
-    /// The frames of the loaded chain, when one is loaded.
+    /// The frames of the loaded chain, when a video chain is loaded.
     loaded: Option<ChainFrames>,
+    /// The block format of the loaded chain, when an audio chain is loaded
+    /// (never both).
+    audio: Option<AudioLoaded>,
     error: CString,
     dropped: CString,
     timing_steps: Vec<CString>,
@@ -126,6 +134,11 @@ impl<I: Instance> InstanceBox<I> {
             log::log(log::Level::Error, e.message());
         }
         self.loaded = None;
+        self.audio = None;
+    }
+
+    fn is_loaded(&self) -> bool {
+        self.loaded.is_some() || self.audio.is_some()
     }
 }
 
@@ -289,6 +302,7 @@ unsafe extern "C" fn module_instance_create<M: Module>(
                 let boxed = Box::new(InstanceBox {
                     instance,
                     loaded: None,
+                    audio: None,
                     error: CString::default(),
                     dropped: CString::default(),
                     timing_steps: Vec::new(),
@@ -311,7 +325,7 @@ unsafe extern "C" fn instance_destroy<I: Instance>(instance: *mut obc_instance) 
         // SAFETY: by the ABI contract, created by `instance_create` and
         // destroyed once.
         let mut boxed = unsafe { Box::from_raw(instance.cast::<InstanceBox<I>>()) };
-        if boxed.loaded.is_some() {
+        if boxed.is_loaded() {
             boxed.unload();
         }
         if let Err(e) = guard(|| {
@@ -370,7 +384,9 @@ unsafe extern "C" fn instance_load<I: Instance>(
         })();
         match result {
             Ok(()) => {
+                // A video chain replaces an audio one.
                 b.loaded = frames;
+                b.audio = None;
                 OBC_OK
             }
             Err(e) => {
@@ -413,6 +429,109 @@ unsafe extern "C" fn instance_process<I: Instance>(
             }
             let instance = &mut b.instance;
             guard(|| instance.process(&input, &output, &live))
+        })();
+        b.finish(result)
+    })
+}
+
+unsafe extern "C" fn audio_instance_load<I: AudioInstance>(
+    instance: *mut obc_instance,
+    request: *const obc_audio_request,
+    out_report: *mut obc_audio_load_report,
+) -> obc_status {
+    boundary(|| {
+        // SAFETY: by the ABI contract.
+        let Some(b) = (unsafe { instance_mut::<I>(instance) }) else {
+            return ErrorKind::Invalid.status();
+        };
+        // The format of the request, once it is read: whether a failure is
+        // that of a switch.
+        let mut format = None;
+        // Whether the module's own load succeeded: its previous chain is
+        // gone, so a failure after it unloads even on a switch.
+        let mut replaced = false;
+        let result = (|| {
+            if out_report.is_null() {
+                return Err(null_out("the audio load report"));
+            }
+            // SAFETY: non-null; only the first field is read before the
+            // size is known.
+            let report_size = unsafe { (*out_report).struct_size } as usize;
+            if report_size < size_of::<obc_audio_load_report>() {
+                return Err(Error::invalid(format!(
+                    "audio load report struct_size {report_size} is smaller than {}",
+                    size_of::<obc_audio_load_report>()
+                )));
+            }
+            // SAFETY: by the ABI contract, valid during the call.
+            let req = unsafe { AudioRequest::from_ptr(request) }?;
+            format = Some(req.format());
+            let instance = &mut b.instance;
+            let report = guard(|| instance.load_audio(&req))?;
+            replaced = true;
+            let frame_samples = report.frame_samples.unwrap_or(req.frame_samples());
+            if frame_samples == 0 {
+                return Err(Error::invalid("the module chose blocks of 0 samples"));
+            }
+            // SAFETY: writable and large enough, checked above. Field by
+            // field, so the host's `struct_size` stays.
+            unsafe {
+                (*out_report).load_ms = report.load_ms;
+                (*out_report).warmup_ms = report.warmup_ms.unwrap_or(-1.0);
+                (*out_report).frame_samples = frame_samples;
+                (*out_report).latency_samples = report.latency_samples;
+                (*out_report).reused_model = u8::from(report.reused_model);
+            }
+            Ok(AudioLoaded {
+                format: req.format(),
+                frame_samples,
+            })
+        })();
+        match result {
+            Ok(loaded) => {
+                // An audio chain replaces a video one.
+                b.audio = Some(loaded);
+                b.loaded = None;
+                OBC_OK
+            }
+            Err(e) => {
+                // As for a video load: a failed switch keeps the previous
+                // chain, anything else unloads. A load the module made but
+                // whose report is refused also unloads: the module holds
+                // the new chain, so the stored format would be stale.
+                let switch = b.audio.is_some_and(|a| Some(a.format) == format);
+                if !switch || replaced || e.kind() == ErrorKind::Panic {
+                    b.unload();
+                }
+                b.finish(Err(e))
+            }
+        }
+    })
+}
+
+unsafe extern "C" fn audio_instance_process<I: AudioInstance>(
+    instance: *mut obc_instance,
+    input: *const obc_audio_buffer,
+    output: *mut obc_audio_buffer,
+    live: *const obc_param,
+    n_live: usize,
+) -> obc_status {
+    boundary(|| {
+        // SAFETY: by the ABI contract.
+        let Some(b) = (unsafe { instance_mut::<I>(instance) }) else {
+            return ErrorKind::Invalid.status();
+        };
+        let result = (|| {
+            let Some(loaded) = b.audio else {
+                return Err(Error::state(
+                    "an audio block came before a successful audio load",
+                ));
+            };
+            // SAFETY (both): by the ABI contract, valid during the call.
+            let (input, mut output) = unsafe { buffers(input, output, loaded) }?;
+            let live = unsafe { Param::slice_from_raw(live, n_live) }?;
+            let instance = &mut b.instance;
+            guard(|| instance.process_audio(&input, &mut output, &live))
         })();
         b.finish(result)
     })
@@ -570,7 +689,8 @@ unsafe extern "C" fn module_destroy<M: Module>(module: *mut obc_module) {
     });
 }
 
-/// The vtable of module type `M`.
+/// The vtable of module type `M`, without the audio entries: a video
+/// module's.
 pub const fn vtable<M: Module>() -> obc_module_vtable {
     obc_module_vtable {
         struct_size: size_of::<obc_module_vtable>() as u32,
@@ -591,7 +711,21 @@ pub const fn vtable<M: Module>() -> obc_module_vtable {
         instance_last_error: Some(instance_last_error::<M::Instance>),
         destroy: Some(module_destroy::<M>),
         check: Some(module_check::<M>),
+        audio_instance_load: None,
+        audio_instance_process: None,
     }
+}
+
+/// The vtable of module type `M` with the audio entries: an `audio-filter`
+/// module's (ABI 1.2).
+pub const fn audio_vtable<M: Module>() -> obc_module_vtable
+where
+    M::Instance: AudioInstance,
+{
+    let mut v = vtable::<M>();
+    v.audio_instance_load = Some(audio_instance_load::<M::Instance>);
+    v.audio_instance_process = Some(audio_instance_process::<M::Instance>);
+    v
 }
 
 /// The body of `obc_module_entry`: checks `host` (non-null, large enough,

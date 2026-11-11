@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 use obc_ipc::settings::{VariantDict, WireChange, camera_option};
 use obc_ipc::{
     BUS_NAME, CameraControl, CameraControls, CameraInfo, Condition, ConditionOp,
-    INTERFACE_REVISION, IpcError, OBJECT_PATH, ResetScope, Setting, SettingChange, SettingKind,
-    SettingValue, SettingsGroup, SettingsTree, State,
+    INTERFACE_REVISION, IpcError, MicStatus, OBJECT_PATH, ResetScope, Setting, SettingChange,
+    SettingKind, SettingValue, SettingsGroup, SettingsTree, State,
 };
 use serde_json::Value;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
@@ -446,6 +446,10 @@ struct Mock {
     config: Vec<obc_ipc::ConfigGroup>,
     config_serial: u32,
     config_files: Vec<obc_ipc::ConfigFileEntry>,
+    /// The microphone (revision 13).
+    mic: MicStatus,
+    /// `SetMicHost` is refused with this (an ADR 0014 unit running).
+    mic_refusal: Option<String>,
 }
 
 fn control(name: &str, min: i32, max: i32, step: i32, default: i32) -> CameraControl {
@@ -563,6 +567,7 @@ fn mock_settings() -> Vec<SettingsGroup> {
         id: id.into(),
         label: label.into(),
         settings,
+        surface: None,
     };
     vec![
         group(
@@ -770,7 +775,18 @@ impl Mock {
                     reason: String::new(),
                 },
             ],
+            mic: MicStatus::default(),
+            mic_refusal: None,
         }
+    }
+
+    /// Announces every microphone property.
+    async fn mic_changed(&self, emitter: &SignalEmitter<'_>) -> zbus::Result<()> {
+        self.mic_consumers_changed(emitter).await?;
+        self.mic_provider_changed(emitter).await?;
+        self.mic_latency_ms_changed(emitter).await?;
+        self.mic_error_changed(emitter).await?;
+        self.mic_state_changed(emitter).await
     }
 
     /// The camera a settings method's `options` name (`""`: the active
@@ -1649,6 +1665,56 @@ impl Mock {
         self.config_serial
     }
 
+    async fn set_mic_host(
+        &mut self,
+        on: bool,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        self.calls.push(format!("SetMicHost({on})"));
+        if may_auto_start(&header) {
+            self.auto_start.push(format!("SetMicHost({on})"));
+        }
+        if let Some(m) = &self.mic_refusal {
+            return Err(IpcError::Unavailable(m.clone()));
+        }
+        self.mic = if on {
+            MicStatus {
+                state: "passthrough".into(),
+                ..MicStatus::default()
+            }
+        } else {
+            MicStatus::default()
+        };
+        self.mic_changed(&emitter).await?;
+        Ok(())
+    }
+
+    #[zbus(property)]
+    fn mic_state(&self) -> String {
+        self.mic.state.clone()
+    }
+
+    #[zbus(property)]
+    fn mic_consumers(&self) -> u32 {
+        self.mic.consumers
+    }
+
+    #[zbus(property)]
+    fn mic_provider(&self) -> String {
+        self.mic.provider.clone()
+    }
+
+    #[zbus(property)]
+    fn mic_latency_ms(&self) -> f64 {
+        self.mic.latency_ms
+    }
+
+    #[zbus(property)]
+    fn mic_error(&self) -> String {
+        self.mic.error.clone()
+    }
+
     #[zbus(property)]
     fn interface_revision(&self) -> u32 {
         INTERFACE_REVISION
@@ -1956,6 +2022,16 @@ impl MockDaemon {
             Mock::preview_frame(iface.signal_emitter(), seq)
                 .await
                 .unwrap();
+        });
+    }
+
+    /// The microphone becomes `m`, announced.
+    fn set_mic(&self, m: MicStatus) {
+        let iface = self.iface();
+        self.rt.block_on(async {
+            iface.get_mut().await.mic = m;
+            let m = iface.get().await;
+            m.mic_changed(iface.signal_emitter()).await.unwrap();
         });
     }
 
@@ -4682,6 +4758,8 @@ fn settings_usage_errors_exit_2_before_any_write() {
         &["settings", "reset", "camera.image.brightness"],
         &["settings", "reset", "--group=Exposure"],
         &["settings", "reset", "--group="],
+        &["settings", "reset", "--group=mic."],
+        &["settings", "reset", "--group=mic.no.ise"],
         &["settings", "reset", "--setting=exposure"],
         &[
             "settings",
@@ -5163,6 +5241,7 @@ fn settings_lines_stay_under_the_cap_with_hostile_strings() {
         id: "other".into(),
         label: evil.clone(),
         settings: (0..30).map(hostile).collect(),
+        surface: None,
     }]);
     let out = bus.run(&["settings", "--json"]);
     assert!(out.status.success(), "{}", out.stderr);
@@ -5233,6 +5312,7 @@ fn mock_global() -> Vec<SettingsGroup> {
                     "%",
                 )),
             ],
+            surface: None,
         },
         SettingsGroup {
             id: "video".into(),
@@ -5243,6 +5323,7 @@ fn mock_global() -> Vec<SettingsGroup> {
                 false,
                 false,
             ))],
+            surface: None,
         },
     ]
 }
@@ -5587,6 +5668,7 @@ fn mock_global_with_lighting(on: bool) -> Vec<SettingsGroup> {
                 "%",
             )),
         ],
+        surface: None,
     });
     groups
 }
@@ -6156,6 +6238,7 @@ fn the_capture_mode_and_the_output_mode_are_set_through_the_generic_paths() {
                 "auto",
                 "auto",
             )],
+            surface: None,
         },
     );
     mock.set_settings(groups);
@@ -6206,4 +6289,252 @@ fn the_capture_mode_and_the_output_mode_are_set_through_the_generic_paths() {
         "{}",
         out.stderr
     );
+}
+
+// ---------------------------------------------------------------------------
+// The microphone (revision 13)
+
+/// The daemon's `mic.input` group, as the mock serves it among the global
+/// ones.
+fn mic_input_group() -> SettingsGroup {
+    let scoped = |mut s: Setting| {
+        s.scope = "global".into();
+        s
+    };
+    SettingsGroup {
+        id: "input".into(),
+        label: "Microphone".into(),
+        settings: vec![
+            scoped(switch("mic.input.enabled", "Processing", true, true)),
+            scoped(choice(
+                "mic.input.device",
+                "Input device",
+                &[("default", "System default"), ("alsa_input.usb-a", "USB A")],
+                "default",
+                "default",
+            )),
+            scoped(setting(
+                "mic.input.make_default",
+                "Use as default microphone",
+                SettingKind::Action,
+                None,
+            )),
+        ],
+        surface: Some("mic".into()),
+    }
+}
+
+#[test]
+fn mic_status_shows_the_microphone_without_starting_the_daemon() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let out = bus.run(&["mic"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(out.stdout, "Microphone: off\nConsumers:  0\n");
+    mock.set_mic(MicStatus {
+        state: "active".into(),
+        consumers: 2,
+        provider: "mic-denoise: br.com.dias.voice-cpu".into(),
+        latency_ms: 20.0,
+        error: String::new(),
+    });
+    let out = bus.run(&["mic", "status"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "Microphone: active\nConsumers:  2\nProvider:   mic-denoise: br.com.dias.voice-cpu\n\
+         Latency:    20.0 ms\n"
+    );
+    for args in [&["mic", "--json"][..], &["mic", "status", "--json"]] {
+        let out = bus.run(args);
+        assert!(out.status.success(), "{}", out.stderr);
+        assert_eq!(out.stdout.lines().count(), 1, "{}", out.stdout);
+        let v = json_line(&out.stdout);
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "v": 1, "type": "mic", "state": "active", "consumers": 2,
+                "provider": "mic-denoise: br.com.dias.voice-cpu", "latency_ms": 20.0,
+                "error": "",
+            })
+        );
+    }
+    // The snapshot carries it too.
+    let v = json_line(&bus.run(&["status", "--json"]).stdout);
+    assert_eq!(v["mic"]["state"], "active", "{v}");
+    assert!(!bus.activation_attempted());
+    // `--json` with a subcommand is a usage error.
+    let out = bus.run(&["mic", "--json", "on"]);
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr);
+}
+
+#[test]
+fn mic_status_of_an_older_daemon_or_none() {
+    let bus = Bus::start();
+    let out = bus.run(&["mic", "--json"]);
+    assert_eq!(out.status.code(), Some(3), "{}", out.stderr);
+    assert_eq!(json_line(&out.stdout)["code"], "daemon-not-running");
+    assert!(!bus.activation_attempted());
+    let _old = OldDaemon::start(&bus, Rev1);
+    let out = bus.run(&["mic"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("does not support the microphone"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn mic_on_and_off_call_set_mic_host_and_print_the_state() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let out = bus.run(&["mic", "on"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "Microphone: passthrough\nConsumers:  0\nLatency:    0.0 ms\n"
+    );
+    let out = bus.run(&["mic", "off"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(out.stdout, "Microphone: off\nConsumers:  0\n");
+    assert_eq!(mock.take_calls(), ["SetMicHost(true)", "SetMicHost(false)"]);
+    // A method call may start the daemon.
+    mock.with(|m| {
+        assert_eq!(m.auto_start, ["SetMicHost(true)", "SetMicHost(false)"]);
+    });
+    // Refused: the reason, exit 1.
+    let unit = "omarchy-broadcast-mic@rnnoise.service is running: stop it first";
+    mock.with(|m| m.mic_refusal = Some(unit.into()));
+    let out = bus.run(&["mic", "on"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert!(out.stderr.contains(unit), "{}", out.stderr);
+    assert_eq!(out.stdout, "");
+}
+
+#[test]
+fn mic_device_and_default_set_the_input_settings() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    mock.with(|m| m.global = vec![mic_input_group()]);
+    let out = bus.run(&["mic", "device", "alsa_input.usb-a"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(out.stdout, "Microphone: off\nConsumers:  0\n");
+    let out = bus.run(&["mic", "default"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "SetSetting(,mic.input.device,Str(\"alsa_input.usb-a\"))",
+            "SetSetting(,mic.input.make_default,Bool(true))"
+        ]
+    );
+    // A device the daemon does not offer: its refusal.
+    let out = bus.run(&["mic", "device", "nope"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("not one of its options"),
+        "{}",
+        out.stderr
+    );
+    // No restore action in this tree: the daemon's refusal.
+    let out = bus.run(&["mic", "restore-default"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+}
+
+/// A PipeWire node name of 52 bytes, past the 32-byte bound of an option
+/// value in the JSON lines.
+const LONG_NODE_NAME: &str = "alsa_input.usb-K66_K66_20190805V001-00.analog-stereo";
+
+#[test]
+fn a_long_microphone_device_is_a_short_token_in_the_json_and_a_node_name_to_set() {
+    assert!(LONG_NODE_NAME.len() > 32);
+    // What the daemon offers for it: `pw-` and 12 hex characters, the
+    // description as the label (the node name stays in the config).
+    let token = "pw-0123456789ab";
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let mut group = mic_input_group();
+    group.settings[1] = choice(
+        "mic.input.device",
+        "Input device",
+        &[("default", "System default"), (token, "K66 Analog Stereo")],
+        "default",
+        token,
+    );
+    group.settings[1].scope = "global".into();
+    mock.with(|m| m.global = vec![group.clone()]);
+    let watch = bus.watch(&["watch", "--json"], None);
+    assert_eq!(watch.next_json("the snapshot")["type"], "snapshot");
+    let set = watch.settings_set("the settings");
+    let input = set
+        .iter()
+        .find(|v| v["group"]["id"] == "input")
+        .expect("the input group");
+    let device = input["group"]["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "mic.input.device")
+        .unwrap();
+    // The token and its label are carried whole, the value is the token.
+    assert_eq!(device["value"], token);
+    assert_eq!(device["options"][1]["value"], token);
+    assert_eq!(device["options"][1]["label"], "K66 Analog Stereo");
+    assert_eq!(device["default"], "default");
+
+    // By node name: the CLI sends the whole name. The daemon resolves it
+    // to the device (`mic::check_input`); the mock stands in for that by
+    // listing the name as an option.
+    if let SettingKind::Enum { options, .. } = &mut group.settings[1].kind {
+        options.push((LONG_NODE_NAME.into(), "K66 by name".into()));
+    }
+    mock.with(|m| m.global = vec![group]);
+    mock.take_calls();
+    let out = bus.run(&["mic", "device", LONG_NODE_NAME]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        mock.take_calls(),
+        [format!(
+            "SetSetting(,mic.input.device,Str({LONG_NODE_NAME:?}))"
+        )]
+    );
+}
+
+#[test]
+fn watch_json_carries_the_microphone_and_its_changes() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let watch = bus.watch(&["watch", "--json"], None);
+    let v = watch.next_json("the first snapshot");
+    assert_eq!(v["type"], "snapshot", "{v}");
+    assert_eq!(
+        v["mic"],
+        serde_json::json!({
+            "state": "off", "consumers": 0, "provider": "", "latency_ms": 0.0, "error": "",
+        })
+    );
+    watch.settings_set("the settings");
+    mock.set_mic(MicStatus {
+        state: "active".into(),
+        consumers: 1,
+        provider: "mic-denoise: voice".into(),
+        latency_ms: 10.0,
+        error: String::new(),
+    });
+    // A line per property that changed (the error did not), each with
+    // every field in force; the state comes last.
+    let mut lines = 0;
+    let last = loop {
+        let v = watch.next_json("a mic line");
+        assert_eq!(v["type"], "mic", "{v}");
+        lines += 1;
+        if v["state"] == "active" {
+            break v;
+        }
+    };
+    assert_eq!(lines, 4);
+    assert_eq!(last["consumers"], 1);
+    assert_eq!(last["provider"], "mic-denoise: voice");
+    assert_eq!(last["latency_ms"], 10.0);
 }

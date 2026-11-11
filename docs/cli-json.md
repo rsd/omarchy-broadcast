@@ -28,6 +28,10 @@
 | `omarchy-broadcast modules pin STAGE MODULE`, `pin STAGE --clear` | Pins the module that provides a stage, or clears the pin (`SetStagePin`), then prints who provides it. | No. |
 | `omarchy-broadcast order [show] [--json]` | Prints the order the effect stages run in (`GetStageOrder`). Never starts the daemon. | One `order` object. |
 | `omarchy-broadcast order set ID,ID,...`, `order reset` | Sets the stage order or goes back to the default (`SetStageOrder`), then prints it. | No. |
+| `omarchy-broadcast mic [status] [--json]` | Shows the Omarchy Broadcast Mic: its state, the applications recording from it, the modules processing it, the delay added and any error (the `Mic*` properties, interface revision 13). Never starts the daemon. See [Microphone](#microphone). | One `mic` object. |
+| `omarchy-broadcast mic on`, `mic off` | Turns the microphone on (enables and starts its user unit, which then starts at every login) or off (restores the previous default microphone if the Omarchy Broadcast Mic is the default, then stops and disables the unit) (`SetMicHost`), then prints the state read back. | No. |
+| `omarchy-broadcast mic device NAME` | Chooses the microphone it captures: `default`, or a PipeWire node name (`SetSetting` of `mic.input.device`), then prints the state. | No. |
+| `omarchy-broadcast mic default`, `mic restore-default` | Makes the Omarchy Broadcast Mic the default microphone (the previous one is remembered), or the previous one the default again (`SetSetting` of `mic.input.make_default` and `mic.input.restore_default`), then prints the state. | No. |
 | `omarchy-broadcast config [show] [--json]` | Prints every configuration key of the daemon by group, with its value, the file that sets it, whether it can be changed here and when a change applies (`GetConfigSchema`). Never starts the daemon. See [Config](#config). | The full set of `config_group` lines. |
 | `omarchy-broadcast config get KEY` | Prints the value of one key. Never starts the daemon. | No. |
 | `omarchy-broadcast config set [--] KEY VALUE`, `config reset [--] KEY` | Sets a key, or removes it from the daemon's managed file `config.d/50-panel.toml` so that the earlier files' value (or the default) applies again (`SetConfig`, `ResetConfig`), then prints the key as read back. | No. |
@@ -166,6 +170,28 @@ Lighting
 - Strings that come from the daemon are escaped in the human-readable output, as for `effect`.
 
 `controls` keeps working, with the five image controls only, and shares the storage of `settings`: a value set by one shows in the other. `controls reset` resets those five only; `settings reset` resets everything.
+
+## Microphone
+
+`omarchy-broadcast mic` shows and controls the Omarchy Broadcast Mic ([dbus-api.md](dbus-api.md#the-microphone-revision-13), [ADR-0029](adr/0029-audio-modules-mic-host-and-worker.md), the user's guide [setup/microphone.md](setup/microphone.md)): a microphone source with noise removal that applications select like any other. The daemon is the interface; the microphone itself is run by its own units.
+
+```text
+omarchy-broadcast mic
+Microphone: active
+Consumers:  1
+Provider:   mic-denoise: br.com.dias.voice-cpu
+Latency:    50.0 ms
+```
+
+The `Provider:` line appears when a stage runs, `Latency:` while the microphone is not `off`, and `Error:` when there is one; with the microphone off the output is `Microphone: off` and `Consumers:  0`. `mic status` is the same as `mic`, and `mic --json` is `mic status --json`.
+
+- **`on` and `off`.** `on` enables and starts the unit `omarchy-broadcast-mic.service`; the microphone then comes back at every login until `off`. It refuses, with status `1` and a message that names the unit, while a filter-chain unit of [ADR-0014](adr/0014-mic-noise-removal-filter-chain.md) (`omarchy-broadcast-mic@rnnoise.service` or `@deepfilter.service`) is running: they create the same source, so stop it first. `off` restores the previous default microphone first, when the Omarchy Broadcast Mic is the default, so that applications move to a live microphone as it goes.
+- **`device NAME`.** `default`, or a PipeWire `node.name` that `pw-cli list-objects Node` shows (the settings tree lists the microphones, with `pw-` tokens as option values; `device` takes either). The capture side is pinned to it the next time `default` runs.
+- **`default`, `restore-default`.** The first makes the Omarchy Broadcast Mic the system's default microphone, pins its capture side to the chosen device (else to the previous default), and remembers the previous default; the second puts the previous default back. `default` is refused with `Turn the microphone on first` while the microphone is off; `restore-default` with `The Omarchy Broadcast Mic was not made the default here` until `default` has run.
+- `mic`, `mic status` never start the daemon; `on`, `off`, `device`, `default` and `restore-default` may start it through D-Bus activation and give up after 30 s.
+- The microphone's settings (the switch, the device, the strength and the engine of a module) are also in `omarchy-broadcast settings`, under `All cameras:`, in the groups `mic.input`, `mic.noise`, ... (a microphone group is named by its id or by `mic.` and its id, for `settings reset --group`), and `settings set mic.noise.strength 70` writes one.
+- In `watch` without `--json`, a change of the microphone prints a line such as `mic: active | consumers 1 | mic-denoise: br.com.dias.voice-cpu | latency 50.0 ms`.
+- Against a daemon of interface revision 12 or lower the command prints `omarchy-broadcast: the daemon does not support the microphone (its interface revision is N, the microphone needs 13); update omarchy-broadcastd` and exits with status `1`; `mic --json` prints an `error` line with the code `unsupported-daemon` instead.
 
 ## Modules and order
 
@@ -366,8 +392,8 @@ omarchy-broadcast preview [--json] [--fps 15|30]
 
 ## Starting the daemon
 
-- `status`, `cameras`, `watch`, `preview`, `effect` without an effect, and `controls` and `settings` without a subcommand, and `modules` (list, info, `profile` without an argument) and `order` (show), never start the daemon. They read the properties with `org.freedesktop.DBus.Properties.GetAll` carrying the `NO_AUTO_START` flag, so looking at the daemon never launches it (`controls` also calls `GetCameraControls`, and `settings` calls `GetSettings`, with that flag). This is the read that the `obc-ipc` crate provides to Rust clients (`Snapshot::fetch_no_autostart`); [dbus-api.md](dbus-api.md#service-presence-and-activation) gives the `busctl` and `gdbus` equivalents.
-- `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`, `settings reset`, `modules enable`, `modules disable`, `modules profile <profile>`, `modules pin`, `order set` and `order reset` call methods without that flag: when the D-Bus activation file `br.com.dias.OmarchyBroadcast.service` is installed, the call starts the daemon, as `systemctl --user start omarchy-broadcastd` would. `off` on a stopped daemon therefore starts it and records the privacy state, which persists across restarts. Without an activation file, or if the start fails, the command reports that the daemon is not running.
+- `status`, `cameras`, `watch`, `preview`, `effect` without an effect, and `controls` and `settings` without a subcommand, `modules` (list, info, `profile` without an argument), `order` (show) and `mic` (status), never start the daemon. They read the properties with `org.freedesktop.DBus.Properties.GetAll` carrying the `NO_AUTO_START` flag, so looking at the daemon never launches it (`controls` also calls `GetCameraControls`, and `settings` calls `GetSettings`, with that flag). This is the read that the `obc-ipc` crate provides to Rust clients (`Snapshot::fetch_no_autostart`); [dbus-api.md](dbus-api.md#service-presence-and-activation) gives the `busctl` and `gdbus` equivalents.
+- `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`, `settings reset`, `modules enable`, `modules disable`, `modules profile <profile>`, `modules pin`, `order set`, `order reset`, `mic on`, `mic off`, `mic device`, `mic default` and `mic restore-default` call methods without that flag: when the D-Bus activation file `br.com.dias.OmarchyBroadcast.service` is installed, the call starts the daemon, as `systemctl --user start omarchy-broadcastd` would. `off` on a stopped daemon therefore starts it and records the privacy state, which persists across restarts. Without an activation file, or if the start fails, the command reports that the daemon is not running.
 
 When the daemon is not running, the human-readable commands print one line to stderr, for example:
 
@@ -380,7 +406,7 @@ omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.O
 | Status | Meaning |
 |---|---|
 | `0` | Success. Also the status of `watch` when it ends on `SIGTERM`, `SIGINT`, `SIGPIPE` or a closed stdout, and of `preview` when it ends on `SIGTERM`, `SIGINT`, `SIGHUP`, `SIGPIPE` or a closed stdout. |
-| `1` | The daemon rejected the request: one of the `br.com.dias.OmarchyBroadcast1.Error` errors (`NoSuchCamera`, `InvalidConfig`, `Unavailable`, `InvalidArgument`, `Failed`, and from revision 7 `UnknownSetting`, `Disabled`, `RateLimited`), or the daemon does not support the request (`effect` against interface revision 1, `denoise` against a revision below 4, `controls` against a revision below 6, `settings` against a revision below 7, `modules` and `order` against a revision below 9). Its message is printed to stderr. |
+| `1` | The daemon rejected the request: one of the `br.com.dias.OmarchyBroadcast1.Error` errors (`NoSuchCamera`, `InvalidConfig`, `Unavailable`, `InvalidArgument`, `Failed`, and from revision 7 `UnknownSetting`, `Disabled`, `RateLimited`), or the daemon does not support the request (`effect` against interface revision 1, `denoise` against a revision below 4, `controls` against a revision below 6, `settings` against a revision below 7, `modules` and `order` against a revision below 9, `mic` against a revision below 13). Its message is printed to stderr. |
 | `2` | Invalid command line. |
 | `3` | The daemon is not running (its name has no owner, or D-Bus could not start it), or there is no D-Bus session bus. |
 | `4` | Any other D-Bus failure (an unexpected reply, a lost connection), a timeout, or a failed write to stdout. |
@@ -392,7 +418,7 @@ omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.O
 ### General rules
 
 - Every object is printed on one line, terminated by `\n`, in UTF-8. `watch --json` flushes stdout after every line.
-- Every object has the field **`v`**, the schema version (an integer, `1` in this version), and the field **`type`**, a string naming the line type: `snapshot`, `state`, `cameras`, `controls`, `settings_group`, `settings_delta`, `settings_clear`, `modules`, `module`, `order`, `config_group`, `config_files`, `config_changed`, `modules_changed`, `stats`, `preview`, `frame` or `error`.
+- Every object has the field **`v`**, the schema version (an integer, `1` in this version), and the field **`type`**, a string naming the line type: `snapshot`, `state`, `cameras`, `controls`, `settings_group`, `settings_delta`, `settings_clear`, `modules`, `module`, `order`, `config_group`, `config_files`, `config_changed`, `modules_changed`, `mic`, `stats`, `preview`, `frame` or `error`.
 - The order of the fields within an object is not significant.
 - A client must ignore fields it does not know, and lines whose `type` it does not know.
 - **Line length.** No line is longer than **4096 bytes**, newline excluded. To guarantee it, strings are bounded in bytes of their JSON encoding (escapes included). A longer string is cut at a character boundary and ends with the ellipsis character `…` (U+2026); the result is always valid JSON. The bounds:
@@ -407,6 +433,8 @@ omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.O
   | `output_mode` | 64 |
   | `effect` | 32 |
   | `background_image` | 256 |
+  | `mic` `state` | 32 |
+  | `mic` `provider`, `mic` `error` | 256 |
 | image control `name` | 32 |
 | setting `id`, a condition's `id` | 48 |
 | settings group `id` | 32 |
@@ -418,11 +446,14 @@ omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.O
 | option `label` | 32 |
 | condition `op` | 8 |
 
+
+An option value is bounded to 32 bytes, which is why the options of `mic.input.device` are short tokens (`pw-` and 12 hexadecimal characters) and not PipeWire node names, which are longer; the label is the microphone's description.
+
 - **Clipping of a path.** `error` and the other strings keep their beginning and lose their end. `background_image` is the exception: the end of a path, the file name, is what identifies it, so a path over the bound is clipped at the **start** and begins with `…` (for example `…/Pictures/office/background-2026.jpg`). The bound is 256 bytes, not 512 as for `error`, because a line that carries many cameras and a long path must stay within the 4096-byte cap. Do not use a clipped path as an argument: read it back from the daemon.
 - **Camera list.** At most **12** cameras are listed; `cameras_truncated` is `true` when the daemon reported more. The list keeps the daemon's order, so the first 12 are listed. A clipped camera id can no longer be passed to `omarchy-broadcast camera`; real ids are far shorter than the bound.
 - **Control list.** At most **16** image controls are listed; `controls_truncated` is `true` when the daemon reported more (a daemon reports at most five). The names are bounded as in the table above.
 - **Settings lists.** An enum setting lists at most **16** options, a setting at most **4** `enabled_when` conditions, an `in` condition at most **8** operands (a list inside a list is printed empty), a `settings_group` line at most **8** settings and a `settings_delta` line at most **16** changes. A longer list is cut, in order. The lines are also packed by their encoded length, so no line passes the cap (see [`settings_group`](#settings_group)).
-- **A `snapshot` over the cap.** Twelve cameras with every string at its bound, and image controls with theirs, do not fit 4096 bytes together. Strings at those bounds do not occur in practice, but the guarantee holds: an over-cap `snapshot` gives up its controls first, one at a time (`controls` ends empty and `controls_truncated` is `true`), and only then its cameras (`cameras_truncated` is `true`). With realistic ids and names, twelve cameras and the controls fit. The two settings fields and the `warning` of a `snapshot` take the room of three cameras in that worst case: with every string at its bound and no controls, a `snapshot` lists 9 of the 12 cameras (`cameras_truncated` is `true`), and a `cameras` line all 12.
+- **A `snapshot` over the cap.** Twelve cameras with every string at its bound, and image controls with theirs, do not fit 4096 bytes together. Strings at those bounds do not occur in practice, but the guarantee holds: an over-cap `snapshot` gives up its controls first, one at a time (`controls` ends empty and `controls_truncated` is `true`), and only then its cameras (`cameras_truncated` is `true`). With realistic ids and names, twelve cameras and the controls fit. The two settings fields and the `warning` of a `snapshot` take the room of three cameras in that worst case, and its `mic` object (revision 13) the room of three more: with every string at its bound and no controls, a `snapshot` lists 6 of the 12 cameras (`cameras_truncated` is `true`), and a `cameras` line all 12. A `mic` line alone is far under the cap.
 
 ### State strings
 
@@ -460,6 +491,7 @@ Every property of the daemon at one moment. Printed by `status --json`, and by `
 | `settings_schema` | number or null | The settings schema version the settings lines follow (`1` in this version; see [Settings schema version](#settings-schema-version)). `null`, with the key present, from a daemon below interface revision 7, which has no settings. A client treats a missing key as `null`: an older CLI does not print it. |
 | `modules_serial` | number | The daemon's `ModulesSerial`, the counter of the module list and the stage order (from 1); `0` from a daemon below interface revision 9. A client reads `modules list --json` and `order show --json` again when it changes. Printed by every command that prints a `snapshot`. |
 | `config_serial` | number | The daemon's `ConfigSerial`, the counter of the configuration schema and the file list (from 1); `0` from a daemon below interface revision 10. A client reads `config show --json` again when it changes. |
+| `mic` | object or null | The microphone (interface revision 13): `state`, `consumers`, `provider`, `latency_ms` and `error`, as in the [`mic`](#mic) line without its `v` and `type`. `null`, with the key present, from a daemon below revision 13. Not in `state` lines: a change is a `mic` line. |
 
 A **camera object**:
 
@@ -519,6 +551,21 @@ A **control object**:
 
 `watch --json` prints a `controls` line when the property that carries them changes: the camera, or a control's range, default, value or `stored`. The daemon refreshes the controls when the active camera changes, when the cameras are rescanned, when the camera opens, once at its first frame, and after a set or reset; it does not poll the device, so a value changed by other software shows at the next of those moments. A `controls set` of the value already stored changes nothing and prints no line; the command exits with status `0`, and that is when a client settles its write.
 
+### `mic`
+
+The microphone (interface revision 13): `{"v":1,"type":"mic","state":"active","consumers":1,"provider":"mic-denoise: br.com.dias.voice-cpu","latency_ms":50.0,"error":""}`. Printed by `mic status --json` and by `watch --json` whenever it changes. The same fields are the `mic` object of a `snapshot`.
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `v`, `type` | | `1`, `"mic"`. |
+| `state` | string | `MicState`: `"off"`, `"passthrough"`, `"starting"`, `"active"` or `"error"`. The set may grow: show a value you do not know as it is. Bounded to 32 bytes. |
+| `consumers` | number | `MicConsumers`: the applications recording from the microphone (integer, 0 or more). |
+| `provider` | string | `MicProvider`: the module running each stage, as text for people, `<stage>: <module>` clauses joined by `, `; `""` when none runs. Bounded to 256 bytes. |
+| `latency_ms` | number | `MicLatencyMs`: the delay the processing adds, in milliseconds; `0` when it is not known or not finite. |
+| `error` | string | `MicError`: why stages that are on cannot run; `""` if none. Bounded to 256 bytes. |
+
+Strings are clipped as the [general rules](#general-rules) say. The microphone is not part of `state` lines, so a change of the camera's state never carries it.
+
 ### `settings_group`
 
 The settings of one camera, one group at a time, followed from interface revision 8 by the global groups (the video effects). Printed by `settings --json` (the full set) and by `watch --json` (after the `snapshot`, and again whenever the structure changes). The tree is a **set** of lines, because the settings of a camera do not fit one line of 4096 bytes.
@@ -533,7 +580,7 @@ The settings of one camera, one group at a time, followed from interface revisio
 | `index` | number | Position of this line in the set, from 0. |
 | `count` | number | The number of lines in the set (at least 1). |
 | `part`, `parts` | number | A group that does not fit one line is cut over several, repeating `group.id` and `group.label`: this line is part `part` of `parts`, from 1. `1` and `1` when the group is whole. Always present. |
-| `group` | object | `id`, `label` and `settings`, an array of setting objects (below). |
+| `group` | object | `id`, `label`, `surface` (optional) and `settings`, an array of setting objects (below). `surface` is where a client shows the group: `"mic"` (interface revision 13) for the microphone's groups, whose settings have ids `mic.<group>.<name>` and scope `"global"`; the key is left out for every other group, and a client that does not know the value shows the group with the global ones. |
 
 The lines of one set are consecutive, share `rev`, `serial` and `camera`, carry `index` from 0 to `count - 1` and `count` the same, and follow the daemon's group order, the parts of a group together and in order. A **packing rule** keeps each line within the cap: settings go into a line one after the other, in order, until it holds 8 or the next would pass 4096 bytes; the next line takes up from there. A single setting at every one of its bounds fits a line alone.
 
@@ -541,7 +588,7 @@ A **setting object** has the keys of its type only:
 
 | Field | JSON type | Present for | Meaning |
 |---|---|---|---|
-| `id` | string | all | The setting's id, `camera.<group>.<name>` or, for a global setting, `effect.<group>.<name>`. |
+| `id` | string | all | The setting's id, `camera.<group>.<name>` or, for a global setting, `effect.<group>.<name>` (`mic.<group>.<name>` for the microphone's). |
 | `label` | string | all | The name to show. |
 | `scope` | string | all | Where the value is kept: `"camera"` (per camera) or `"global"` (the same for every camera: the video effects). A client routes by it: a global setting is drawn apart from the camera's and written with no camera. Bounded to 16 bytes. A client that meets a scope it does not know leaves the setting out. |
 | `type` | string | all | `"bool"`, `"int"`, `"enum"` or `"action"`. |
@@ -707,6 +754,7 @@ A client treats `"active":false`, and any `error` line, as "no frames now", and 
 - **`v` stays 1 for the global settings.** Setting objects gain the key `scope` (`"camera"` or `"global"`), and a set gains groups after the camera's, which are also printed with no camera (`camera` `""`), where a revision-7 daemon printed a `settings_clear`. A client written for the earlier version ignores the key and the groups it does not draw. The settings schema stays 1 ([Settings schema version](#settings-schema-version)); the CLI's `snapshot` is unchanged, and `interface_revision` 8 tells a client that the groups can appear.
 - **`v` stays 1 for `warning`.** It is a new string field in the existing `snapshot` and `state` lines, and `changed` may name it. Against a daemon of interface revision 10 or lower the key is still printed, with the value `""`, which is also its value when there is no warning. What it reports was, up to revision 10, a failure of the effect in `error` (and, by default, the `error` state; with `on_failure = "none"`, `active` with the reason in `error`); a client written for the earlier version sees `active` and an empty `error` instead, which is what the daemon does. `warning` is bounded like `error`, 512 bytes, so the reason of an effect failure with a module's hint at its end is not cut; with every string at its bound a `snapshot` lists two cameras fewer than before (see [General rules](#general-rules)).
 - **`v` stays 1 for the capture and output modes.** Interface revision 12 adds no field and no line type: a `settings_group` set gains a group `capture` before the others (with one `enum` setting, `camera.capture.mode`), the `config_group` row of `output.mode` becomes an editable `enum` with options, `effect.on_failure` may have `image` among its options, and `warning` has more clauses. A client written for the earlier version draws what it knows and ignores the rest; `interface_revision` 12 tells a client that they can appear.
+- **`v` stays 1 for the microphone.** `mic` is a new line type, printed by a new command and by `watch --json`; the `snapshot` gains the field `mic` (not in `state`, so `changed` never names it); a `settings_group`'s `group` gains the optional key `surface`, and the settings of the groups it marks have ids `mic.<group>.<name>` with scope `"global"`; `unsupported-daemon` for `mic` is an existing code. Against a daemon of interface revision 12 or lower `mic` is `null` in the snapshot, with the key present, and no `mic` line is printed. A client written for the earlier version ignores the field, the line and the key, and draws the microphone's groups with the other global ones. The settings schema stays 1.
 - A **breaking change** raises `v`: a removed or renamed field or line type, a changed JSON type or meaning, a new state string, or a change to the rules above (line cap, outage behaviour).
 - **Not breaking**, made without raising `v`: a new field in an existing line type, a new line type, a new `error` code. Clients ignore what they do not know.
 - The schema is independent of the D-Bus `InterfaceRevision`; a new D-Bus property may appear as a new field.

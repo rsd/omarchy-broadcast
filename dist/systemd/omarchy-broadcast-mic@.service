@@ -19,7 +19,9 @@
 #   systemctl --user enable --now omarchy-broadcast-mic@rnnoise.service
 #
 # Run one instance at a time: both configurations create the same source
-# (node.name omarchy-broadcast-mic). To switch engines:
+# (node.name omarchy-broadcast-mic), and so does the audio-module mic host,
+# omarchy-broadcast-mic.service (the alternative to these single-engine
+# units, see that file). To switch engines:
 #   systemctl --user disable --now omarchy-broadcast-mic@rnnoise.service
 #   systemctl --user enable --now omarchy-broadcast-mic@deepfilter.service
 #
@@ -40,6 +42,9 @@ After=pipewire.service pipewire-session-manager.service
 # Stopped (and not left running against a dead server) whenever PipeWire
 # stops; see [Install] for how it comes back.
 BindsTo=pipewire.service
+# The mic host of the audio modules creates the same source; starting either
+# unit stops the other. The two are alternatives: enable only one of them.
+Conflicts=omarchy-broadcast-mic.service
 
 [Service]
 # Hardening, type, restart policy and slice as in PipeWire's own

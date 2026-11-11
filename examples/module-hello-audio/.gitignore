@@ -1,0 +1,2 @@
+# Build output of this example (cargo build --manifest-path ...).
+/target/

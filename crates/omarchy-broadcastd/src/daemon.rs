@@ -15,7 +15,9 @@
 //!    [`EXIT_NAME_TAKEN`] as well);
 //! 5. with the name taken, the controller loads the modules (counting the
 //!    crash ledger for this start) before it handles any command: an
-//!    instance that loses the name never touches the ledger.
+//!    instance that loses the name never touches the ledger; and the
+//!    microphone's agent starts ([`crate::mic::agent`]), so an instance
+//!    that loses the name never writes the audio settings either.
 //!
 //! Between 2 and 3, preview frame files a crashed daemon left in
 //! `$XDG_RUNTIME_DIR/omarchy-broadcast` are removed, and the subscription
@@ -233,6 +235,15 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
     .inspect_err(|e| warning!("camera hotplug detection is unavailable: {e}"))
     .ok();
 
+    // The microphone's agent: the controller sends to it from the name on.
+    let (mic_tx, mic_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mic_snapshot = paths
+        .state
+        .parent()
+        .map(|d| d.join(crate::mic::SNAPSHOT_FILE));
+    let mic_published = published.clone();
+    let mut mic_rx = Some(mic_rx);
+
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
     // The modules are loaded (and the crash ledger counted) once the name
     // is ours: an instance that loses it never touches the ledger.
@@ -257,6 +268,7 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
                 // Commands wait in the channel meanwhile; without the name
                 // the daemon stops (the sender is dropped).
                 if name_rx.blocking_recv().is_ok() {
+                    ctrl.set_mic(mic_tx);
                     ctrl.load_modules(Instant::now());
                 }
                 controller::run(ctrl, command_rx);
@@ -291,6 +303,15 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
                     env!("CARGO_PKG_VERSION")
                 );
                 tokio::spawn(run_publisher(conn.clone(), notes));
+                if let Some(rx) = mic_rx.take() {
+                    crate::mic::agent::spawn(
+                        conn.clone(),
+                        rx,
+                        commands.clone(),
+                        mic_published.clone(),
+                        mic_snapshot.clone(),
+                    );
+                }
                 if let Some(tx) = name_tx.take() {
                     let _ = tx.send(());
                 }

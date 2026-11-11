@@ -109,7 +109,25 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// output change waiting for the applications that hold the virtual
 /// camera, an output contract that could not start and an output rate
 /// that frame generation cannot make; `Warning` is at most 512 bytes.
-pub const INTERFACE_REVISION: u32 = 12;
+/// Revision 13 added the microphone ([`MicStatus`]): the `MicState`,
+/// `MicConsumers`, `MicProvider`, `MicLatencyMs` and `MicError`
+/// properties, the `MicStats` signal and `SetMicHost`; the `mic.*`
+/// settings (scope `global`, their groups with `surface` `mic`: the
+/// daemon's `mic.input` and the audio modules' groups), the `[mic]` config
+/// rows, and the audio modules in `GetModules`.
+pub const INTERFACE_REVISION: u32 = 13;
+/// The first [`INTERFACE_REVISION`] with the microphone: the `Mic*`
+/// properties, `MicStats`, `SetMicHost` and the `mic.*` settings.
+pub const MIC_REVISION: u32 = 13;
+/// The values of `MicState`: the mic host is not running (`off`); raw
+/// passthrough, nothing processed (`passthrough`); a chain loading or
+/// warming up (`starting`); the microphone processed (`active`); stages on
+/// that cannot run (`error`, `MicError` says why). The set may grow: a
+/// client shows a value it does not know as it is.
+pub const MIC_STATES: [&str; 5] = ["off", "passthrough", "starting", "active", "error"];
+/// `MicState` of a daemon whose mic host is not running, and of one that
+/// predates [`MIC_REVISION`].
+pub const MIC_OFF: &str = "off";
 /// The first [`INTERFACE_REVISION`] with `camera.capture.mode` and an
 /// editable `output.mode`.
 pub const MODES_REVISION: u32 = 12;
@@ -389,6 +407,37 @@ impl IpcError {
     }
 }
 
+/// The microphone's properties (revision 13): `MicState`,
+/// `MicConsumers`, `MicProvider`, `MicLatencyMs` and `MicError`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MicStatus {
+    /// `MicState`: one of [`MIC_STATES`] (or a later revision's value).
+    pub state: String,
+    /// `MicConsumers`: the applications recording from the microphone; 0
+    /// when not known.
+    pub consumers: u32,
+    /// `MicProvider`: the module running each stage, as text
+    /// (`mic-denoise: <module>, ...`); empty when nothing is processed.
+    pub provider: String,
+    /// `MicLatencyMs`: the delay processing adds, in milliseconds; 0 when
+    /// nothing is processed.
+    pub latency_ms: f64,
+    /// `MicError`: why stages that are on cannot run; empty when none.
+    pub error: String,
+}
+
+impl Default for MicStatus {
+    fn default() -> Self {
+        MicStatus {
+            state: MIC_OFF.into(),
+            consumers: 0,
+            provider: String::new(),
+            latency_ms: 0.0,
+            error: String::new(),
+        }
+    }
+}
+
 /// Every property of the interface at one moment, for `status`-style output.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Snapshot {
@@ -450,6 +499,9 @@ pub struct Snapshot {
     /// force or the config schema changes; `None` when the daemon does not
     /// offer it.
     pub config_serial: Option<u32>,
+    /// The microphone (revision 13): `None` when the daemon does not offer
+    /// it.
+    pub mic: Option<MicStatus>,
     pub interface_revision: u32,
 }
 
@@ -480,6 +532,7 @@ impl Snapshot {
             modules_serial: None,
             backend_profile: None,
             config_serial: None,
+            mic: None,
             interface_revision: 0,
         }
     }
@@ -528,10 +581,21 @@ impl Snapshot {
             "ModulesSerial" => self.modules_serial = Some(deserialize_for_property(value)?),
             "BackendProfile" => self.backend_profile = Some(deserialize_for_property(value)?),
             "ConfigSerial" => self.config_serial = Some(deserialize_for_property(value)?),
+            "MicState" => self.mic_mut().state = deserialize_for_property(value)?,
+            "MicConsumers" => self.mic_mut().consumers = deserialize_for_property(value)?,
+            "MicProvider" => self.mic_mut().provider = deserialize_for_property(value)?,
+            "MicLatencyMs" => self.mic_mut().latency_ms = deserialize_for_property(value)?,
+            "MicError" => self.mic_mut().error = deserialize_for_property(value)?,
             "InterfaceRevision" => self.interface_revision = deserialize_for_property(value)?,
             _ => {}
         }
         Ok(())
+    }
+
+    /// The microphone's properties, made (with their defaults) at the
+    /// first one read.
+    fn mic_mut(&mut self) -> &mut MicStatus {
+        self.mic.get_or_insert_with(MicStatus::default)
     }
 
     /// A snapshot from the properties returned by `GetAll`. `State` is
@@ -602,7 +666,7 @@ impl Snapshot {
     /// `BackgroundImage`, `PipeWireConsumers`, `PipeWireOutput`, `Denoise`,
     /// `PreviewConsumers`, `CameraControls`, `SettingsRevision`,
     /// `SettingsSchemaSerial`, `ModulesSerial`, `BackendProfile`, `ConfigSerial`,
-    /// `Warning`) keep their
+    /// `Warning`, the `Mic*` properties) keep their
     /// [`Snapshot::empty`] value when the daemon does not offer
     /// them (see [`is_unknown_property_error`]), and `LoopbackConsumers` is then
     /// `Consumers`, as [`Snapshot::from_properties`] does for a property
@@ -648,9 +712,25 @@ impl Snapshot {
                 empty.backend_profile,
             )?,
             config_serial: optional(proxy.config_serial().await.map(Some), empty.config_serial)?,
+            mic: fetch_mic(proxy).await?,
             interface_revision: proxy.interface_revision().await?,
         })
     }
+}
+
+/// The microphone's properties through `proxy`; `None` when the daemon
+/// does not have them (before [`MIC_REVISION`]).
+async fn fetch_mic(proxy: &OmarchyBroadcastProxy<'_>) -> zbus::Result<Option<MicStatus>> {
+    let Some(state) = optional(proxy.mic_state().await.map(Some), None)? else {
+        return Ok(None);
+    };
+    Ok(Some(MicStatus {
+        state,
+        consumers: proxy.mic_consumers().await?,
+        provider: proxy.mic_provider().await?,
+        latency_ms: proxy.mic_latency_ms().await?,
+        error: proxy.mic_error().await?,
+    }))
 }
 
 /// `value`, or `default` when the read failed because the daemon does not
@@ -710,6 +790,40 @@ pub async fn daemon_is_running(conn: &Connection) -> zbus::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mic_properties_fill_the_mic_status() {
+        let state = Variant::from("idle");
+        let mic = Variant::from("active");
+        let n = Variant::from(2u32);
+        let ms = Variant::from(20.5f64);
+        let text = Variant::from("mic-denoise: m");
+        let snap = Snapshot::from_properties([
+            ("State", &state),
+            ("MicState", &mic),
+            ("MicConsumers", &n),
+            ("MicLatencyMs", &ms),
+            ("MicProvider", &text),
+        ])
+        .unwrap();
+        assert_eq!(
+            snap.mic,
+            Some(MicStatus {
+                state: "active".into(),
+                consumers: 2,
+                provider: "mic-denoise: m".into(),
+                latency_ms: 20.5,
+                error: String::new(),
+            })
+        );
+        // Before revision 13: none.
+        let old = Snapshot::from_properties([("State", &state)]).unwrap();
+        assert_eq!(old.mic, None);
+        // A value of the wrong type is an error.
+        assert!(Snapshot::from_properties([("State", &state), ("MicConsumers", &mic)]).is_err());
+        assert_eq!(MicStatus::default().state, MIC_OFF);
+        assert!(MIC_STATES.contains(&MIC_OFF));
+    }
 
     #[test]
     fn names_are_consistent() {
@@ -1073,7 +1187,8 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, MODES_REVISION);
+        assert_eq!(INTERFACE_REVISION, MIC_REVISION);
+        const { assert!(MODES_REVISION < MIC_REVISION) };
         const { assert!(WARNING_REVISION < MODES_REVISION) };
         const { assert!(CONFIG_REVISION < WARNING_REVISION) };
         const { assert!(MODULES_REVISION < CONFIG_REVISION) };

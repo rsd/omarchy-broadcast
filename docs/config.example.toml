@@ -34,7 +34,8 @@
 # can change are: [camera] fixed_framerate; [output] mode, format, aspect,
 # hold_timeout_s and input_gap_ms; [lifecycle] idle_grace_s and
 # start_debounce_ms; [effect] on_failure; [pipewire] enabled and offer_nv12;
-# and in [modules] profile, enabled.<id> and pin.<stage>. Everything else,
+# [mic] enabled, device, pipeline_depth, idle_exit_s and gpu_policy; and in
+# [modules] profile, enabled.<id> and pin.<stage>. Everything else,
 # including the [effect] defaults (which a choice made in the panel overrides),
 # is set here. `omarchy-broadcast config show` lists every key with the file
 # that sets it, and `omarchy-broadcast config files` the files.
@@ -320,6 +321,58 @@ enabled = false
 # restarted for this key.
 # Default: true
 offer_nv12 = true
+
+[mic]
+# The Omarchy Broadcast Mic: a PipeWire source that applications can choose
+# like any microphone, with noise and room echo removal applied by the audio
+# modules. Three processes share the work: the mic host
+# (omarchy-broadcast-mic.service, which `omarchy-broadcast mic on` enables and
+# starts), the audio worker (omarchy-broadcast-audiod, started when sound
+# flows and stopped after idle_exit_s), and the daemon, which writes these
+# values to $XDG_STATE_HOME/omarchy-broadcast/audio-settings.json for the
+# worker. The microphone keeps working whatever stops: without processing,
+# its sound passes through unchanged. The panel's Mic tab and
+# `omarchy-broadcast config set` can change enabled, device, pipeline_depth,
+# idle_exit_s and gpu_policy; force_conflicts is set here only.
+
+# Process the microphone. Off, the sound passes through unchanged; it is
+# never muted.
+# Default: true
+enabled = true
+
+# The microphone captured: "default" (the capture follows the system's
+# default microphone, or the one that was the default when the Omarchy
+# Broadcast Mic was made the default), or a PipeWire node name, as listed in
+# the Mic tab or by `pw-cli list-objects Node`. At most 256 bytes.
+# Default: "default"
+device = "default"
+
+# Blocks of 10 ms between the microphone and the processed sound. 0 chooses
+# by device: 1 when every effect runs on the CPU, 2 when one runs on a GPU.
+# A larger value tolerates more scheduling delay at the cost of latency.
+# 0 to 4.
+# Default: 0
+pipeline_depth = 0
+
+# Seconds without sound before the audio worker exits and frees its memory
+# and the GPU; it starts again when sound flows. 0 to 86400; 0 never exits.
+# Default: 30
+idle_exit_s = 30
+
+# When the microphone's effects may run on a GPU: "always", "with-camera"
+# (only in a microphone session that starts while the camera runs, so the
+# GPU is not woken for the microphone alone) or "never". An effect that the
+# GPU may not run runs on the best CPU or NPU module that offers it, or not
+# at all, and the Mic tab says why. An NPU and the CPU may always be used.
+# Default: "always"
+gpu_policy = "always"
+
+# Run microphone effects that their modules declare as excluding each other
+# (Studio Voice with noise or room echo removal) together. Intended for
+# testing: the combination is not tuned and adds the delay of each effect.
+# Off, an effect that declares a conflict turns the other one off.
+# Default: false
+force_conflicts = false
 
 [modules]
 # The effects come from modules: a manifest (<name>.toml) in a modules.d

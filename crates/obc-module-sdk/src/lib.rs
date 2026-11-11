@@ -44,6 +44,25 @@
 //! obc_module_sdk::export_module!(Hello);
 //! ```
 //!
+//! # Audio modules (ABI 1.2)
+//!
+//! A module of the manifest kind `audio-filter` processes blocks of
+//! microphone audio. Its instance type also implements [`AudioInstance`]
+//! ([`AudioInstance::load_audio`], [`AudioInstance::process_audio`] over
+//! [`AudioBuffer`] and [`AudioBufferMut`]), and the module is exported with
+//! the `audio` form of the macro, which fills the vtable's audio entries:
+//!
+//! ```ignore
+//! obc_module_sdk::export_module!(MyAudioModule, audio);
+//! ```
+//!
+//! The plain form, `export_module!(MyModule)`, leaves them null: a video
+//! module compiles and behaves as before. An audio-only instance type
+//! implements [`Instance`] with only [`Instance::unload`]: the video
+//! [`Instance::load`] and [`Instance::process`] default to failing with
+//! [`ErrorKind::Unsupported`]. Unload, the temporal reset and the timings
+//! of [`Instance`] serve both kinds.
+//!
 //! # What the exported entry points do
 //!
 //! [`export_module!`] defines the two symbols the daemon looks up,
@@ -54,7 +73,8 @@
 //!   given, and refuse a null pointer or a structure smaller than this ABI
 //!   version's with [`ErrorKind::Invalid`];
 //! * convert the C structures into the safe views of this crate
-//!   ([`Frame`], [`ChainRequest`], [`Param`]) and the results back;
+//!   ([`Frame`], [`ChainRequest`], [`Param`], [`AudioRequest`],
+//!   [`AudioBuffer`], [`AudioBufferMut`]) and the results back;
 //! * catch a panic of the module's code: it becomes an
 //!   [`ErrorKind::Panic`] error carrying the panic message, and never
 //!   unwinds into the daemon. Do not build a module with `panic = "abort"`,
@@ -85,6 +105,7 @@ pub use obc_module_abi as abi;
 /// configuration.
 pub use serde_json;
 
+mod audio;
 mod describe;
 mod error;
 #[doc(hidden)]
@@ -93,6 +114,7 @@ mod frame;
 pub mod log;
 mod request;
 
+pub use audio::{AudioBuffer, AudioBufferMut, AudioFormat, AudioLoadReport, AudioRequest};
 pub use describe::{
     Apply, Condition, Group, Op, ProbeReport, Role, Setting, SettingKind, SettingsDescription,
     StageProbe,
@@ -161,6 +183,11 @@ pub trait Instance: Send + 'static {
     /// the next frames then run without it. When a first load or a reload
     /// fails, or a load panics, the SDK calls [`Instance::unload`], so
     /// `unload` must cope with a partial load.
+    ///
+    /// An audio-only module ([`AudioInstance`]) writes
+    /// [`no_video_stages!`] in its `impl Instance` instead of `load` and
+    /// [`Instance::process`]: they refuse every video chain with
+    /// [`ErrorKind::Unsupported`].
     fn load(&mut self, req: &ChainRequest<'_>) -> Result<LoadReport, Error>;
 
     /// Runs one frame through the loaded chain, from `input` into `output`.
@@ -216,6 +243,89 @@ pub trait Instance: Send + 'static {
     }
 }
 
+/// The audio side of an instance (ABI 1.2): one chain of a module's audio
+/// stages for one microphone stream, in the audio worker. All calls come
+/// from the worker's processing thread, one at a time; [`Instance::unload`],
+/// [`Instance::reset_temporal`] and [`Instance::timings`] serve it too.
+/// Export the module with `export_module!(MyModule, audio)`.
+pub trait AudioInstance: Instance {
+    /// Loads the audio chain the request names ([`AudioRequest::stages`], in
+    /// order) for its block format ([`AudioRequest::format`]). A load on a
+    /// loaded instance with the format of the loaded chain is a **switch**,
+    /// which may reuse models of the previous load (say so in
+    /// [`AudioLoadReport::reused_model`]); with another format it is a
+    /// **reload**. The failure rules are those of [`Instance::load`]: a
+    /// failed switch keeps the previous chain (less a stage after an
+    /// [`Error::stage`] it could not keep), a failed first load or reload,
+    /// and a panic, unload the instance.
+    ///
+    /// This is where a module may create its own GPU context (and
+    /// [`Instance::unload`] where it releases it): never in
+    /// [`Module::init`], [`Module::probe`] or [`Module::check`].
+    ///
+    /// The report gives the chain's algorithmic delay
+    /// ([`AudioLoadReport::latency_samples`]) and, when the module takes
+    /// blocks of another of the manifest's sizes than the request's, that
+    /// size ([`AudioLoadReport::frame_samples`]).
+    fn load_audio(&mut self, req: &AudioRequest<'_>) -> Result<AudioLoadReport, Error>;
+
+    /// Runs one block through the loaded audio chain, from `input` into
+    /// `output`, whose planes never overlap the input's; every sample of
+    /// `output` is written. `live` holds the per-block parameters, which
+    /// apply from this block on. Only called after a successful
+    /// [`AudioInstance::load_audio`], with blocks of the loaded format and
+    /// size. The deadline is one block (its duration); the worker fails a
+    /// stage open after a run of overruns. A stage that fails on its own is
+    /// an [`Error::stage`]: the instance has then dropped the stage, and the
+    /// next block runs without it (audio never has matte stages: every
+    /// stage fails open).
+    fn process_audio(
+        &mut self,
+        input: &AudioBuffer<'_>,
+        output: &mut AudioBufferMut<'_>,
+        live: &[Param<'_>],
+    ) -> Result<(), Error>;
+}
+
+/// The video side of an audio-only instance, written inside its
+/// `impl Instance`: [`Instance::load`] and [`Instance::process`] that refuse
+/// every video chain and frame with [`ErrorKind::Unsupported`] ("this
+/// module has no video stages"). The host never asks an `audio-filter`
+/// module for a video chain; the entries exist because the vtable's video
+/// entries are required of every module.
+///
+/// ```ignore
+/// impl obc_module_sdk::Instance for MyAudioInstance {
+///     obc_module_sdk::no_video_stages!();
+///
+///     fn unload(&mut self) { /* ... */ }
+/// }
+/// ```
+#[macro_export]
+macro_rules! no_video_stages {
+    () => {
+        fn load(
+            &mut self,
+            _req: &$crate::ChainRequest<'_>,
+        ) -> ::core::result::Result<$crate::LoadReport, $crate::Error> {
+            ::core::result::Result::Err($crate::Error::unsupported(
+                "this module has no video stages",
+            ))
+        }
+
+        fn process(
+            &mut self,
+            _input: &$crate::Frame<'_>,
+            _output: &$crate::Frame<'_>,
+            _live: &[$crate::Param<'_>],
+        ) -> ::core::result::Result<(), $crate::Error> {
+            ::core::result::Result::Err($crate::Error::unsupported(
+                "this module has no video stages",
+            ))
+        }
+    };
+}
+
 /// Exports a [`Module`] type as the module of this library: defines the
 /// `obc_module_abi_version` and `obc_module_entry` symbols and the vtable
 /// behind them. Use it once per library, at the crate root or in any
@@ -224,9 +334,17 @@ pub trait Instance: Send + 'static {
 /// ```ignore
 /// obc_module_sdk::export_module!(MyModule);
 /// ```
+///
+/// The `audio` form also fills the vtable's audio entries (ABI 1.2), for a
+/// module whose instance type implements [`AudioInstance`]; the plain form
+/// leaves them null:
+///
+/// ```ignore
+/// obc_module_sdk::export_module!(MyAudioModule, audio);
+/// ```
 #[macro_export]
 macro_rules! export_module {
-    ($module:ty) => {
+    (@export $module:ty, $vtable:expr) => {
         /// The packed ABI version this module was built against.
         #[unsafe(no_mangle)]
         pub extern "C" fn obc_module_abi_version() -> u32 {
@@ -244,7 +362,7 @@ macro_rules! export_module {
         pub unsafe extern "C" fn obc_module_entry(
             host: *const $crate::abi::obc_host,
         ) -> *const $crate::abi::obc_module_vtable {
-            static VTABLE: $crate::abi::obc_module_vtable = $crate::ffi::vtable::<$module>();
+            static VTABLE: $crate::abi::obc_module_vtable = $vtable;
             // SAFETY: the caller's contract is the one `ffi::entry` needs.
             unsafe { $crate::ffi::entry(host, &VTABLE) }
         }
@@ -252,5 +370,11 @@ macro_rules! export_module {
         // The exports have the types the ABI declares.
         const _: $crate::abi::obc_module_abi_version_fn = obc_module_abi_version;
         const _: $crate::abi::obc_module_entry_fn = obc_module_entry;
+    };
+    ($module:ty, audio) => {
+        $crate::export_module!(@export $module, $crate::ffi::audio_vtable::<$module>());
+    };
+    ($module:ty) => {
+        $crate::export_module!(@export $module, $crate::ffi::vtable::<$module>());
     };
 }

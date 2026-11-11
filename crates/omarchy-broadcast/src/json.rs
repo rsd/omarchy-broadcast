@@ -33,8 +33,8 @@
 use std::borrow::Cow;
 
 use obc_ipc::{
-    CameraControl, CameraControls, CameraInfo, Condition, SETTINGS_SCHEMA, Setting, SettingChange,
-    SettingKind, SettingValue, SettingsGroup, SettingsTree, Snapshot, Stats,
+    CameraControl, CameraControls, CameraInfo, Condition, MicStatus, SETTINGS_SCHEMA, Setting,
+    SettingChange, SettingKind, SettingValue, SettingsGroup, SettingsTree, Snapshot, Stats,
 };
 use serde::Serialize;
 
@@ -66,12 +66,18 @@ pub const MAX_MODE_BYTES: usize = 64;
 pub const MAX_EFFECT_BYTES: usize = 32;
 /// Bound of `pipewire_output`.
 pub const MAX_PIPEWIRE_OUTPUT_BYTES: usize = 32;
+/// The longest `mic.state`, in bytes.
+pub const MAX_MIC_STATE_BYTES: usize = 32;
+/// The longest `mic.provider`, in bytes.
+pub const MAX_MIC_PROVIDER_BYTES: usize = 256;
+/// The longest `mic.error`, in bytes.
+pub const MAX_MIC_ERROR_BYTES: usize = 256;
 /// Bound of `background_image`. A longer path is clipped at its start
 /// ([`clip_start`]), so the file name survives. With every string and
 /// number at its worst and no image controls, a `snapshot` line holds
-/// [`MAX_CAMERAS`] − 3 cameras under [`MAX_LINE_BYTES`] (its settings
-/// fields and its `warning` take the room of the last three), a `cameras`
-/// line all
+/// [`MAX_CAMERAS`] − 6 cameras under [`MAX_LINE_BYTES`] (its settings
+/// fields and its `warning` take the room of three, its `mic` of three
+/// more), a `cameras` line all
 /// [`MAX_CAMERAS`]; image controls at their worst take more, and
 /// [`snapshot_line`] cuts the controls, then the cameras, to keep the cap.
 pub const MAX_PATH_BYTES: usize = 256;
@@ -330,6 +336,52 @@ impl<'a> Controls<'a> {
     }
 }
 
+/// The microphone's fields (revision 13): the `mic` of a `snapshot` line,
+/// and the body of a `mic` line.
+#[derive(Serialize)]
+struct MicFields<'a> {
+    state: Cow<'a, str>,
+    consumers: u32,
+    provider: Cow<'a, str>,
+    latency_ms: f64,
+    error: Cow<'a, str>,
+}
+
+impl<'a> MicFields<'a> {
+    fn of(m: &'a MicStatus) -> Self {
+        MicFields {
+            state: clip(&m.state, MAX_MIC_STATE_BYTES),
+            consumers: m.consumers,
+            provider: clip(&m.provider, MAX_MIC_PROVIDER_BYTES),
+            latency_ms: if m.latency_ms.is_finite() && m.latency_ms >= 0.0 {
+                m.latency_ms
+            } else {
+                0.0
+            },
+            error: clip(&m.error, MAX_MIC_ERROR_BYTES),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct MicLine<'a> {
+    v: u32,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(flatten)]
+    fields: MicFields<'a>,
+}
+
+/// `{"v":1,"type":"mic",...}`: the microphone (revision 13), printed by
+/// `mic status --json` and by `watch --json` when it changes.
+pub fn mic_line(m: &MicStatus) -> String {
+    to_line(&MicLine {
+        v: VERSION,
+        kind: "mic",
+        fields: MicFields::of(m),
+    })
+}
+
 #[derive(Serialize)]
 struct SnapshotLine<'a> {
     v: u32,
@@ -350,6 +402,8 @@ struct SnapshotLine<'a> {
     modules_serial: u32,
     /// `ConfigSerial`; `0` before revision 10.
     config_serial: u32,
+    /// The microphone; `null` before revision 13.
+    mic: Option<MicFields<'a>>,
 }
 
 #[derive(Serialize)]
@@ -494,6 +548,7 @@ pub fn snapshot_line(s: &Snapshot) -> String {
             settings_schema: model::has_settings(s).then_some(SETTINGS_SCHEMA),
             modules_serial: s.modules_serial.unwrap_or(0),
             config_serial: s.config_serial.unwrap_or(0),
+            mic: s.mic.as_ref().map(MicFields::of),
         })
     };
     let mut cameras = MAX_CAMERAS;
@@ -762,6 +817,10 @@ impl<'a> SettingJson<'a> {
 struct GroupJson<'a, 'b> {
     id: Cow<'a, str>,
     label: Cow<'a, str>,
+    /// Where a client shows the group (revision 13: `mic`); left out when
+    /// the daemon gives none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    surface: Option<Cow<'a, str>>,
     settings: &'b [SettingJson<'a>],
 }
 
@@ -886,6 +945,7 @@ pub fn settings_lines(tree: &SettingsTree) -> Vec<String> {
             group: GroupJson {
                 id: clip(&group.id, MAX_GROUP_ID_BYTES),
                 label: clip(&group.label, MAX_LABEL_BYTES),
+                surface: group.surface.as_deref().map(|s| clip(s, MAX_SCOPE_BYTES)),
                 settings,
             },
         })
@@ -1019,6 +1079,7 @@ mod tests {
             modules_serial: None,
             backend_profile: None,
             config_serial: None,
+            mic: None,
             interface_revision: 4,
         }
     }
@@ -1479,11 +1540,25 @@ mod tests {
             .map(|i| cam(&format!("{i}{nasty}"), &nasty, &nasty))
             .collect();
         s.active_camera = s.cameras[3].id.clone();
+        // The microphone (revision 13) at its worst too.
+        s.mic = Some(MicStatus {
+            state: nasty.clone(),
+            consumers: u32::MAX,
+            provider: nasty.clone(),
+            latency_ms: 2.225_073_858_507_201_4e-308,
+            error: nasty.clone(),
+        });
+        let m = parse(&mic_line(s.mic.as_ref().unwrap()));
+        for key in ["state", "provider", "error"] {
+            assert!(m[key].as_str().unwrap().ends_with(ELLIPSIS), "{key}");
+        }
+        assert!(mic_line(s.mic.as_ref().unwrap()).len() <= MAX_LINE_BYTES);
         for (line, cameras) in [
             // The settings fields (revision 7, as `interface_revision` is
-            // here) and the warning (revision 11) leave no room for the
-            // last three cameras: the snapshot cuts them.
-            (snapshot_line(&s), MAX_CAMERAS - 3),
+            // here) and the warning (revision 11) leave no room for three
+            // cameras, the mic (revision 13) for three more: the snapshot
+            // cuts them.
+            (snapshot_line(&s), MAX_CAMERAS - 6),
             (cameras_line(&s), MAX_CAMERAS),
             (state_line(&s, &model::STATE_FIELDS), 0),
         ] {
@@ -1526,8 +1601,9 @@ mod tests {
         assert!(kept > 0 && kept < MAX_CAMERAS, "{kept} cameras kept");
         let v2 = parse(&controls_line(&worst_controls));
         assert_eq!(v2["controls"].as_array().unwrap().len(), MAX_CONTROLS);
-        // With fewer cameras, the controls a daemon reports fit whole.
-        with.cameras.truncate(4);
+        // With fewer cameras, the controls a daemon reports fit whole (the
+        // active one alone: the mic at its worst takes the room of three).
+        with.cameras = vec![with.cameras[3].clone()];
         with.camera_controls = Some(CameraControls {
             camera: with.active_camera.clone(),
             controls: obc_ipc::CAMERA_CONTROL_NAMES
@@ -1541,7 +1617,7 @@ mod tests {
             5
         );
         assert_eq!(w["camera_controls"]["controls_truncated"], false);
-        assert_eq!(w["cameras"].as_array().unwrap().len(), 4);
+        assert_eq!(w["cameras"].as_array().unwrap().len(), 1);
         assert!(v["error"].as_str().unwrap().ends_with(ELLIPSIS));
         assert!(v["warning"].as_str().unwrap().ends_with(ELLIPSIS));
         assert!(v["pipewire_output"].as_str().unwrap().ends_with(ELLIPSIS));
@@ -1637,6 +1713,7 @@ mod tests {
                             SettingKind::Unknown("colour".into()),
                         ),
                     ],
+                    surface: None,
                 },
                 SettingsGroup {
                     id: "white_balance".into(),
@@ -1646,6 +1723,7 @@ mod tests {
                         "Balance once",
                         SettingKind::Action,
                     )],
+                    surface: None,
                 },
                 // Nothing this client can show: no line.
                 SettingsGroup {
@@ -1656,6 +1734,7 @@ mod tests {
                         "X",
                         SettingKind::Unknown("colour".into()),
                     )],
+                    surface: None,
                 },
             ],
         }
@@ -1720,6 +1799,7 @@ mod tests {
                 enabled_when: Vec::new(),
                 hint: Some("switch".into()),
             }],
+            surface: None,
         };
         let mut tree = exposure_tree();
         tree.groups.push(global.clone());
@@ -1836,11 +1916,13 @@ mod tests {
                     id: "image".into(),
                     label: "Image".into(),
                     settings,
+                    surface: None,
                 },
                 SettingsGroup {
                     id: "focus".into(),
                     label: "Focus & zoom".into(),
                     settings: vec![setting("camera.focus.pan_reset", "P", SettingKind::Action)],
+                    surface: None,
                 },
             ],
         };
@@ -1943,12 +2025,18 @@ mod tests {
                     id: nasty.clone(),
                     label: nasty.clone(),
                     settings: vec![worst_setting(0, kind.clone())],
+                    // Revision 13's surface at its worst too.
+                    surface: Some(nasty.clone()),
                 }],
             };
             let lines = settings_lines(&tree);
             assert_eq!(lines.len(), 1, "{kind:?}");
             let v = parse(&lines[0]);
             assert_eq!(v["type"], "settings_group");
+            assert!(
+                v["group"]["surface"].as_str().unwrap().ends_with(ELLIPSIS),
+                "{kind:?}"
+            );
             let s = &v["group"]["settings"][0];
             assert!(s["label"].as_str().unwrap().ends_with(ELLIPSIS));
             assert!(s["disabled_reason"].as_str().unwrap().len() <= MAX_REASON_BYTES);
@@ -1975,6 +2063,7 @@ mod tests {
                 settings: (0..64)
                     .map(|i| worst_setting(g * 64 + i, worst_kinds()[i % 4].clone()))
                     .collect(),
+                surface: None,
             })
             .collect();
         let tree = SettingsTree {
@@ -2041,5 +2130,63 @@ mod tests {
         let v = parse(&state_line(&s, &["state"]));
         assert!(v.get("settings_revision").is_none());
         assert!(v.get("settings_schema").is_none());
+    }
+
+    #[test]
+    fn the_mic_line_and_the_snapshots_mic() {
+        let m = MicStatus {
+            state: "active".into(),
+            consumers: 1,
+            provider: "p".repeat(400),
+            latency_ms: f64::NAN,
+            error: String::new(),
+        };
+        let v = parse(&mic_line(&m));
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["type"], "mic");
+        assert_eq!(v["state"], "active");
+        assert_eq!(v["consumers"], 1);
+        assert_eq!(v["latency_ms"], 0.0);
+        assert_eq!(v["error"], "");
+        assert!(v["provider"].as_str().unwrap().len() <= MAX_MIC_PROVIDER_BYTES);
+        let mut s = sample();
+        assert_eq!(parse(&snapshot_line(&s))["mic"], Value::Null);
+        s.mic = Some(MicStatus::default());
+        let v = parse(&snapshot_line(&s));
+        assert_eq!(v["mic"]["state"], "off");
+        assert_eq!(v["mic"]["consumers"], 0);
+    }
+
+    #[test]
+    fn a_settings_group_line_carries_its_surface_when_it_has_one() {
+        let group = |surface: Option<&str>| SettingsGroup {
+            id: "noise".into(),
+            label: "Noise removal".into(),
+            settings: vec![Setting {
+                id: "mic.noise.enabled".into(),
+                label: "Noise removal".into(),
+                kind: SettingKind::Bool {
+                    default: true,
+                    value: true,
+                },
+                scope: "global".into(),
+                stored: false,
+                enabled: true,
+                disabled_reason: String::new(),
+                enabled_when: Vec::new(),
+                hint: None,
+            }],
+            surface: surface.map(str::to_string),
+        };
+        let tree = |g| SettingsTree {
+            revision: 1,
+            serial: 1,
+            camera: String::new(),
+            groups: vec![g],
+        };
+        let lines = settings_lines(&tree(group(Some("mic"))));
+        assert_eq!(parse(&lines[0])["group"]["surface"], "mic");
+        let lines = settings_lines(&tree(group(None)));
+        assert!(parse(&lines[0])["group"].get("surface").is_none());
     }
 }

@@ -320,6 +320,19 @@ pub fn require_modules(revision: u32) -> Result<(), Failure> {
 }
 
 /// Fails unless a daemon of interface revision `revision` has the
+/// microphone.
+pub fn require_mic(revision: u32) -> Result<(), Failure> {
+    if revision >= obc_ipc::MIC_REVISION {
+        return Ok(());
+    }
+    Err(Failure::Unsupported(format!(
+        "the daemon does not support the microphone (its interface revision is {revision}, \
+         the microphone needs {}); update omarchy-broadcastd",
+        obc_ipc::MIC_REVISION
+    )))
+}
+
+/// Fails unless a daemon of interface revision `revision` has the
 /// configuration methods.
 pub fn require_config(revision: u32) -> Result<(), Failure> {
     if revision >= obc_ipc::CONFIG_REVISION {

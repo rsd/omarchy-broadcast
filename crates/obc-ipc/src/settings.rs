@@ -7,7 +7,9 @@
 //!
 //! - `GetSettings(a{sv} options) -> (u revision, u serial, s camera, aa{sv} groups)`
 //!   ([`SettingsReply`], decoded by [`SettingsTree::from_wire`]);
-//! - a group: `id` s, `label` s, `settings` aa{sv};
+//! - a group: `id` s, `label` s, `settings` aa{sv}, and an optional
+//!   `surface` s (revision 13: `mic` for the microphone's groups; absent,
+//!   the group belongs where its scope puts it);
 //! - a setting: `id` s, `label` s, `type` s, `scope` s, `stored` b,
 //!   `enabled` b, `disabled_reason` s, `enabled_when` a(ssv), then by type
 //!   (int: `min`, `max`, `step`, `default`, `value` x and an optional
@@ -57,13 +59,24 @@ pub const SCOPE_CAMERA: &str = "camera";
 /// too.
 pub const SCOPE_GLOBAL: &str = "global";
 
-/// How every global setting id starts (revision 8): `effect.`.
+/// How every global setting id of the video effects starts (revision 8):
+/// `effect.`.
 pub const GLOBAL_ID_PREFIX: &str = "effect.";
 
-/// Whether `id` names a global setting ([`GLOBAL_ID_PREFIX`]): one the
-/// daemon answers whatever the camera, so its camera option is ignored.
+/// How every setting id of the microphone starts (revision 13): `mic.`.
+/// They are global settings too ([`SCOPE_GLOBAL`]).
+pub const MIC_ID_PREFIX: &str = "mic.";
+
+/// The `surface` of the microphone's groups (revision 13): a client shows
+/// them on its microphone page; one that does not know the key shows them
+/// with the other global groups.
+pub const SURFACE_MIC: &str = "mic";
+
+/// Whether `id` names a global setting ([`GLOBAL_ID_PREFIX`], or
+/// [`MIC_ID_PREFIX`] from revision 13): one the daemon answers whatever the
+/// camera, so its camera option is ignored.
 pub fn is_global_id(id: &str) -> bool {
-    id.starts_with(GLOBAL_ID_PREFIX)
+    id.starts_with(GLOBAL_ID_PREFIX) || id.starts_with(MIC_ID_PREFIX)
 }
 
 /// Whether `id` is a valid setting id: `^[a-z0-9]+(\.[a-z0-9_]+){1,3}$`, at
@@ -420,6 +433,9 @@ pub struct SettingsGroup {
     pub id: String,
     pub label: String,
     pub settings: Vec<Setting>,
+    /// Where a client shows the group (revision 13): [`SURFACE_MIC`] for
+    /// the microphone's; `None` (no `surface` key) where its scope puts it.
+    pub surface: Option<String>,
 }
 
 impl SettingsGroup {
@@ -431,13 +447,17 @@ impl SettingsGroup {
             .is_some_and(|s| s.scope == SCOPE_GLOBAL)
     }
 
-    /// The group dictionary: `id`, `label`, `settings` (aa{sv}).
+    /// The group dictionary: `id`, `label`, `settings` (aa{sv}), and
+    /// `surface` when set.
     pub fn to_dict(&self) -> VariantDict {
         let mut d = VariantDict::new();
         put(&mut d, "id", Variant::from(self.id.as_str()));
         put(&mut d, "label", Variant::from(self.label.as_str()));
         let settings: Vec<VariantDict> = self.settings.iter().map(Setting::to_dict).collect();
         d.insert("settings".into(), to_owned(&settings));
+        if let Some(surface) = &self.surface {
+            put(&mut d, "surface", Variant::from(surface.as_str()));
+        }
         d
     }
 
@@ -454,6 +474,7 @@ impl SettingsGroup {
             id: get_str(&e, "id")?.to_string(),
             label: get_str(&e, "label")?.to_string(),
             settings,
+            surface: get_str(&e, "surface").map(str::to_string),
         })
     }
 }
@@ -854,21 +875,25 @@ mod tests {
                     id: "white_balance".into(),
                     label: "White balance".into(),
                     settings: settings[..1].to_vec(),
+                    surface: None,
                 },
                 SettingsGroup {
                     id: "exposure".into(),
                     label: "Exposure".into(),
                     settings: settings[1..4].to_vec(),
+                    surface: None,
                 },
                 SettingsGroup {
                     id: "other".into(),
                     label: "Other".into(),
                     settings: settings[4..].to_vec(),
+                    surface: None,
                 },
                 SettingsGroup {
                     id: "focus".into(),
                     label: "Focus & zoom".into(),
                     settings: Vec::new(),
+                    surface: None,
                 },
             ],
         }
@@ -973,6 +998,7 @@ mod tests {
                 id: "background".into(),
                 label: "Background effect".into(),
                 settings: vec![mode],
+                surface: None,
             }],
         };
         let back = SettingsTree::from_wire(&over_the_wire(&tree.to_wire()));
@@ -1046,6 +1072,7 @@ mod tests {
             id: "g".into(),
             label: "G".into(),
             settings: Vec::new(),
+            surface: None,
         }
         .to_dict();
         assert_eq!(sig(&group, "settings"), "aa{sv}");
@@ -1179,6 +1206,7 @@ mod tests {
                 id: "exposure".into(),
                 label: "Exposure".into(),
                 settings: s[1..3].to_vec(),
+                surface: None,
             };
             let mut gd = group.to_dict();
             let mut settings: Vec<VariantDict> = s[1..3].iter().map(Setting::to_dict).collect();

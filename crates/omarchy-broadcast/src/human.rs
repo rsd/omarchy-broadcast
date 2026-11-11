@@ -355,6 +355,14 @@ fn settings_rows_text(out: &mut String, groups: &[(Cow<'_, str>, Vec<SettingRow<
     }
 }
 
+/// Whether the group id `id` (of `settings reset --group`) names `g`: its
+/// id, or `mic.<id>` for a microphone group (revision 13).
+fn names_group(id: &str, g: &obc_ipc::SettingsGroup) -> bool {
+    id == g.id
+        || (g.surface.as_deref() == Some(obc_ipc::settings::SURFACE_MIC)
+            && id.strip_prefix(obc_ipc::settings::MIC_ID_PREFIX) == Some(g.id.as_str()))
+}
+
 /// `settings`, and the result of `settings set|reset`: the camera, then the
 /// settings of `tree` (those `only` names) under their group's label, one
 /// line each: label, value (with its unit), id, what `settings set` takes,
@@ -368,7 +376,7 @@ pub fn settings_text(s: &Snapshot, tree: &SettingsTree, only: Only<'_>) -> Strin
     let mut camera_groups = Vec::new();
     let mut global_groups = Vec::new();
     for g in &tree.groups {
-        if matches!(only, Only::Group(id) if id != g.id) {
+        if matches!(only, Only::Group(id) if !names_group(id, g)) {
             continue;
         }
         let rows: Vec<SettingRow<'_>> = g
@@ -467,6 +475,49 @@ pub fn enabled_text(s: &Snapshot) -> String {
     )
 }
 
+/// `mic` / `mic status`: the microphone's properties.
+pub fn mic_text(m: &obc_ipc::MicStatus) -> String {
+    let mut out = format!(
+        "Microphone: {}\nConsumers:  {}\n",
+        printable(&m.state),
+        m.consumers
+    );
+    if !m.provider.is_empty() {
+        out.push_str(&format!("Provider:   {}\n", printable(&m.provider)));
+    }
+    if m.state != obc_ipc::MIC_OFF {
+        out.push_str(&format!("Latency:    {} ms\n", mic_latency(m.latency_ms)));
+    }
+    if !m.error.is_empty() {
+        out.push_str(&format!("Error:      {}\n", printable(&m.error)));
+    }
+    out
+}
+
+/// A latency in milliseconds, one decimal.
+fn mic_latency(ms: f64) -> String {
+    if ms.is_finite() && ms >= 0.0 {
+        format!("{ms:.1}")
+    } else {
+        "0.0".into()
+    }
+}
+
+/// `watch`: the microphone's line after a change.
+pub fn mic_change_line(m: &obc_ipc::MicStatus) -> String {
+    let mut line = format!("mic: {} | consumers {}", printable(&m.state), m.consumers);
+    if !m.provider.is_empty() {
+        line.push_str(&format!(" | {}", printable(&m.provider)));
+    }
+    if m.state != obc_ipc::MIC_OFF {
+        line.push_str(&format!(" | latency {} ms", mic_latency(m.latency_ms)));
+    }
+    if !m.error.is_empty() {
+        line.push_str(&format!(" | error: {}", printable(&m.error)));
+    }
+    line
+}
+
 /// After `camera ...`.
 pub fn camera_text(s: &Snapshot) -> String {
     format!("Camera: {}\n", camera_label(s))
@@ -556,6 +607,9 @@ pub fn change_lines(s: &Snapshot, changes: &Changes) -> Vec<String> {
     if let (true, Some(c)) = (changes.controls, &s.camera_controls) {
         lines.push(controls_change_line(c));
     }
+    if let (true, Some(m)) = (changes.mic, &s.mic) {
+        lines.push(mic_change_line(m));
+    }
     lines
 }
 
@@ -619,6 +673,7 @@ mod tests {
             modules_serial: None,
             backend_profile: None,
             config_serial: None,
+            mic: None,
             interface_revision: 3,
         }
     }
@@ -704,6 +759,7 @@ mod tests {
             fields: vec!["preview_consumers"],
             cameras: false,
             controls: false,
+            mic: false,
         };
         assert_eq!(change_lines(&s, &changes), ["preview consumers: 0"]);
     }
@@ -1018,6 +1074,20 @@ mod tests {
     }
 
     #[test]
+    fn a_microphone_group_is_named_by_its_id_or_mic_prefixed() {
+        let g = |id: &str, surface: Option<&str>| obc_ipc::SettingsGroup {
+            id: id.into(),
+            label: String::new(),
+            settings: Vec::new(),
+            surface: surface.map(str::to_string),
+        };
+        assert!(names_group("noise", &g("noise", Some("mic"))));
+        assert!(names_group("mic.noise", &g("noise", Some("mic"))));
+        assert!(!names_group("mic.noise", &g("noise", None)));
+        assert!(!names_group("mic.video", &g("noise", Some("mic"))));
+    }
+
+    #[test]
     fn command_results() {
         let mut s = sample();
         assert_eq!(enabled_text(&s), "Enabled (state: idle)\n");
@@ -1149,6 +1219,7 @@ mod tests {
                             unit: None,
                         },
                     )],
+                    surface: None,
                 },
                 SettingsGroup {
                     id: "exposure".into(),
@@ -1174,6 +1245,7 @@ mod tests {
                             SettingKind::Unknown("colour".into()),
                         ),
                     ],
+                    surface: None,
                 },
                 SettingsGroup {
                     id: "focus".into(),
@@ -1183,6 +1255,7 @@ mod tests {
                         "Recentre pan",
                         SettingKind::Action,
                     )],
+                    surface: None,
                 },
             ],
         }
@@ -1296,11 +1369,13 @@ mod tests {
                 id: "background".into(),
                 label: "Background effect".into(),
                 settings: vec![mode, blur],
+                surface: None,
             },
             obc_ipc::SettingsGroup {
                 id: "video".into(),
                 label: "Video".into(),
                 settings: vec![denoise],
+                surface: None,
             },
         ]
     }
@@ -1351,6 +1426,29 @@ mod tests {
                 "Camera:     none\nNo camera settings.\n\
                  The camera is not in use: changes apply the next time it opens.\n{GLOBAL_TEXT}"
             )
+        );
+    }
+
+    #[test]
+    fn the_microphone_is_shown_with_what_it_has() {
+        let off = obc_ipc::MicStatus::default();
+        assert_eq!(mic_text(&off), "Microphone: off\nConsumers:  0\n");
+        assert_eq!(mic_change_line(&off), "mic: off | consumers 0");
+        let on = obc_ipc::MicStatus {
+            state: "active".into(),
+            consumers: 2,
+            provider: "mic-denoise: voice".into(),
+            latency_ms: 20.0,
+            error: "e\x1b".into(),
+        };
+        assert_eq!(
+            mic_text(&on),
+            "Microphone: active\nConsumers:  2\nProvider:   mic-denoise: voice\n\
+             Latency:    20.0 ms\nError:      e\\x1b\n"
+        );
+        assert_eq!(
+            mic_change_line(&on),
+            "mic: active | consumers 2 | mic-denoise: voice | latency 20.0 ms | error: e\\x1b"
         );
     }
 }

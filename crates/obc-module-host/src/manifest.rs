@@ -26,17 +26,46 @@
 //! formats = ["nv12"]                    # nv12 | i420 | bgra | rgba | rgb-f32-planar
 //! ```
 //!
+//! An `audio-filter` module (ABI 1.2) declares audio stages: their ids
+//! start with [`AUDIO_STAGE_PREFIX`] (and a video stage's never do), their
+//! slot is one of the audio slots, they take host frames only, and they
+//! give the block formats they accept instead of pixel formats:
+//!
+//! ```toml
+//! kind = "audio-filter"
+//!
+//! [[stage]]
+//! id = "mic-denoise"
+//! slot = "clean"                        # clean | shape
+//! rank = 200
+//! device = "cpu"
+//! frames = ["host"]                     # host only
+//! rates = [48000]                       # samples per second
+//! frame_samples = [480]                 # samples per channel per block
+//! channels = 1                          # optional, 1 by default
+//! ```
+//!
+//! Each kind's keys and vocabulary are checked: a video stage with `rates`,
+//! an audio stage with `formats`, a slot (or a slot requirement) of the
+//! other kind, or a stage id against the prefix rule makes the manifest
+//! invalid.
+//!
 //! [`Manifest::parse`] refuses unknown keys, so a typo makes the module
 //! unavailable with the parse error as the reason instead of being ignored.
 //! A manifest of another ABI major version parses (so that it can be listed
 //! with its reason) but is never loaded ([`Manifest::abi_mismatch`]).
+//!
+//! Which kinds a host loads is its [`LoadKinds`]: the video daemon loads
+//! video stages only ([`LoadKinds::Video`], the default) and lists audio
+//! modules as unavailable; the audio worker loads audio filters only
+//! ([`LoadKinds::Audio`]).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use obc_backend::StageId;
-use obc_module_abi::OBC_MODULE_ABI_MAJOR;
+use obc_module_abi::{OBC_MAX_AUDIO_CHANNELS, OBC_MODULE_ABI_MAJOR};
 use serde::Deserialize;
 
 /// The longest module id, in bytes.
@@ -44,6 +73,14 @@ pub const MODULE_ID_MAX: usize = 64;
 
 /// The position of a stage that declares none.
 pub const DEFAULT_POSITION: i32 = 100;
+
+/// The prefix of every audio stage id (`mic-denoise`, `mic-dereverb`,
+/// `mic-enhance`), and of no video stage id: the two kinds share one
+/// namespace of stage ids.
+pub const AUDIO_STAGE_PREFIX: &str = "mic-";
+
+/// The channels of an audio stage that declares none.
+pub const DEFAULT_AUDIO_CHANNELS: u32 = 1;
 
 /// Whether `id` is a valid module id: reverse-DNS,
 /// `^[a-z0-9]+(\.[a-z0-9-]+)+$`, at most [`MODULE_ID_MAX`] bytes.
@@ -74,13 +111,14 @@ pub fn valid_module_id(id: &str) -> bool {
     rest > 0
 }
 
-/// What a module is. Only [`ModuleKind::VideoStage`] modules are loaded;
-/// the others are listed, unavailable ([`ModuleKind::unsupported_reason`]).
+/// What a module is. A host loads the kinds of its [`LoadKinds`] and lists
+/// the others, unavailable ([`LoadKinds::refusal`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModuleKind {
     /// Stages of the video pipeline (`video-stage`).
     VideoStage,
-    /// A microphone filter (`audio-filter`), reserved.
+    /// A microphone filter (`audio-filter`), loaded by the audio worker
+    /// (ABI 1.2).
     AudioFilter,
     /// An analyser of the stream, such as captions (`analyser`), reserved.
     Analyser,
@@ -96,19 +134,55 @@ impl ModuleKind {
         }
     }
 
-    /// Why a module of this kind is not loaded, or `None` for a kind that
-    /// is.
-    pub fn unsupported_reason(self) -> Option<&'static str> {
-        match self {
-            ModuleKind::VideoStage => None,
-            ModuleKind::AudioFilter => Some("Audio filter modules are not supported yet"),
-            ModuleKind::Analyser => Some("Analyser modules are not supported yet"),
+    /// Whether the module's stages are audio stages.
+    pub fn is_audio(self) -> bool {
+        self == ModuleKind::AudioFilter
+    }
+}
+
+/// The reason of an audio module in a host of [`LoadKinds::Video`].
+pub const REASON_AUDIO_IN_WORKER: &str = "Audio filter modules run in the audio worker";
+/// The reason of a video module in a host of [`LoadKinds::Audio`].
+pub const REASON_VIDEO_IN_DAEMON: &str = "Video stage modules run in the video daemon";
+/// The reason of an analyser module, which no host loads yet.
+pub const REASON_ANALYSER: &str = "Analyser modules are not supported yet";
+
+/// Which module kinds a host loads. The video daemon is a
+/// [`LoadKinds::Video`] host (the default) and never opens an audio
+/// module's library; the audio worker is a [`LoadKinds::Audio`] host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum LoadKinds {
+    /// `video-stage` modules only.
+    #[default]
+    Video,
+    /// `audio-filter` modules only.
+    Audio,
+}
+
+impl LoadKinds {
+    /// Whether this host loads modules of `kind`.
+    pub fn admits(self, kind: ModuleKind) -> bool {
+        self.refusal(kind).is_none()
+    }
+
+    /// Why this host does not load modules of `kind`, or `None` when it
+    /// does.
+    pub fn refusal(self, kind: ModuleKind) -> Option<&'static str> {
+        match (self, kind) {
+            (LoadKinds::Video, ModuleKind::VideoStage)
+            | (LoadKinds::Audio, ModuleKind::AudioFilter) => None,
+            (LoadKinds::Video, ModuleKind::AudioFilter) => Some(REASON_AUDIO_IN_WORKER),
+            (LoadKinds::Audio, ModuleKind::VideoStage) => Some(REASON_VIDEO_IN_DAEMON),
+            (_, ModuleKind::Analyser) => Some(REASON_ANALYSER),
         }
     }
 }
 
 /// Where a stage sits in the pipeline, in pipeline order: a stage in an
-/// earlier slot always runs before one in a later slot.
+/// earlier slot always runs before one in a later slot. The video slots
+/// ([`Slot::ALL`]) and the audio slots ([`Slot::AUDIO`]) are two
+/// vocabularies: a stage takes a slot of its module's kind
+/// ([`Slot::is_audio`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Slot {
     /// On the camera frame, before the cut-out (`pre-matte`).
@@ -119,16 +193,30 @@ pub enum Slot {
     PostMatte,
     /// On the composited frame (`post-composite`).
     PostComposite,
+    /// Audio: removing what is not the voice, noise and room echo
+    /// (`clean`).
+    Clean,
+    /// Audio: shaping the voice that is left, enhancement or equalisation
+    /// (`shape`), after every `clean` stage.
+    Shape,
 }
 
 impl Slot {
-    /// Every slot, in pipeline order.
+    /// Every video slot, in pipeline order.
     pub const ALL: [Slot; 4] = [
         Slot::PreMatte,
         Slot::Matte,
         Slot::PostMatte,
         Slot::PostComposite,
     ];
+
+    /// Every audio slot, in chain order.
+    pub const AUDIO: [Slot; 2] = [Slot::Clean, Slot::Shape];
+
+    /// Whether this is an audio slot.
+    pub fn is_audio(self) -> bool {
+        matches!(self, Slot::Clean | Slot::Shape)
+    }
 
     /// The manifest name.
     pub fn as_str(self) -> &'static str {
@@ -137,6 +225,8 @@ impl Slot {
             Slot::Matte => "matte",
             Slot::PostMatte => "post-matte",
             Slot::PostComposite => "post-composite",
+            Slot::Clean => "clean",
+            Slot::Shape => "shape",
         }
     }
 }
@@ -241,7 +331,11 @@ macro_rules! named_enum {
 }
 
 named_enum!(ModuleKind, "kind", [VideoStage, AudioFilter, Analyser]);
-named_enum!(Slot, "slot", [PreMatte, Matte, PostMatte, PostComposite]);
+named_enum!(
+    Slot,
+    "slot",
+    [PreMatte, Matte, PostMatte, PostComposite, Clean, Shape]
+);
 named_enum!(Device, "device", [NvidiaGpu, Gpu, Npu, Cpu]);
 named_enum!(Frames, "frame kind", [Cuda, Host, Dmabuf]);
 named_enum!(Format, "format", [Nv12, I420, Bgra, Rgba, RgbF32Planar]);
@@ -298,8 +392,23 @@ pub struct StageDecl {
     pub conflicts: Vec<StageId>,
     /// The frame kinds it takes, in the module's order of preference.
     pub frames: Vec<Frames>,
-    /// The pixel formats it takes.
+    /// The pixel formats it takes; empty for an audio stage.
     pub formats: Vec<Format>,
+    /// The block formats of an audio stage; `None` for a video stage.
+    pub audio: Option<AudioDecl>,
+}
+
+/// The block formats an audio stage takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioDecl {
+    /// The sample rates, in samples per second, in the module's order of
+    /// preference.
+    pub rates: Vec<u32>,
+    /// The samples per channel per block, in the module's order of
+    /// preference.
+    pub frame_samples: Vec<u32>,
+    /// The channels ([`DEFAULT_AUDIO_CHANNELS`] when not given).
+    pub channels: u32,
 }
 
 impl StageDecl {
@@ -378,7 +487,14 @@ struct RawStage {
     #[serde(default)]
     conflicts: Vec<String>,
     frames: Vec<String>,
-    formats: Vec<String>,
+    #[serde(default)]
+    formats: Option<Vec<String>>,
+    #[serde(default)]
+    rates: Option<Vec<u32>>,
+    #[serde(default)]
+    frame_samples: Option<Vec<u32>>,
+    #[serde(default)]
+    channels: Option<u32>,
 }
 
 fn non_empty(what: &str, v: String) -> Result<String, String> {
@@ -407,11 +523,55 @@ fn parse_list<T: FromStr<Err = String> + PartialEq>(
     Ok(out)
 }
 
+/// Whether `id` follows the prefix rule of `kind`: an audio stage id starts
+/// with [`AUDIO_STAGE_PREFIX`], a video one does not.
+fn prefix_error(kind: ModuleKind, id: &str, what: &str) -> Option<String> {
+    let audio = id.starts_with(AUDIO_STAGE_PREFIX);
+    match (kind.is_audio(), audio) {
+        (true, false) => Some(format!(
+            "{what} {id} of an audio-filter module must start with {AUDIO_STAGE_PREFIX:?}"
+        )),
+        (false, true) => Some(format!(
+            "{what} {id} of {} module must not start with {AUDIO_STAGE_PREFIX:?}, which is \
+             for audio stages",
+            a_kind(kind)
+        )),
+        _ => None,
+    }
+}
+
+/// A list of positive numbers, deduplicated in order.
+fn positive_list(stage: &StageId, what: &str, raw: Vec<u32>) -> Result<Vec<u32>, String> {
+    if raw.is_empty() {
+        return Err(format!("stage {stage}: {what} is empty"));
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for v in raw {
+        if v == 0 {
+            return Err(format!("stage {stage}: {what} has a 0"));
+        }
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    Ok(out)
+}
+
 impl RawStage {
-    fn validate(self) -> Result<StageDecl, String> {
+    fn validate(self, kind: ModuleKind) -> Result<StageDecl, String> {
         let id =
             StageId::new(self.id.clone()).map_err(|e| format!("stage id {:?}: {e}", self.id))?;
+        if let Some(e) = prefix_error(kind, id.as_str(), "the stage id") {
+            return Err(e);
+        }
         let slot: Slot = self.slot.parse().map_err(|e| format!("stage {id}: {e}"))?;
+        if slot.is_audio() != kind.is_audio() {
+            return Err(format!(
+                "stage {id}: the slot {slot} is not a slot of {} module (one of {})",
+                a_kind(kind),
+                slot_names(kind)
+            ));
+        }
         let device: Device = self
             .device
             .parse()
@@ -419,11 +579,23 @@ impl RawStage {
         let mut requires = Vec::new();
         for r in &self.requires {
             let req = match r.parse::<Slot>() {
+                Ok(slot) if slot.is_audio() != kind.is_audio() => {
+                    return Err(format!(
+                        "stage {id}: requires the slot {slot}, which is not a slot of {} module",
+                        a_kind(kind)
+                    ));
+                }
                 Ok(slot) => Requirement::Slot(slot),
                 Err(_) => Requirement::Stage(StageId::new(r.clone()).map_err(|_| {
                     format!("stage {id}: requires {r:?}, which is neither a stage id nor a slot")
                 })?),
             };
+            if let Requirement::Stage(s) = &req
+                && let Some(e) =
+                    prefix_error(kind, s.as_str(), &format!("stage {id}: the required stage"))
+            {
+                return Err(e);
+            }
             if req == Requirement::Stage(id.clone()) {
                 return Err(format!("stage {id}: requires itself"));
             }
@@ -439,12 +611,64 @@ impl RawStage {
             if c == id {
                 return Err(format!("stage {id}: conflicts with itself"));
             }
+            if let Some(e) = prefix_error(
+                kind,
+                c.as_str(),
+                &format!("stage {id}: the conflicting stage"),
+            ) {
+                return Err(e);
+            }
             if !conflicts.contains(&c) {
                 conflicts.push(c);
             }
         }
         let frames = parse_list(id.as_str(), "frames", &self.frames)?;
-        let formats = parse_list(id.as_str(), "formats", &self.formats)?;
+        let (formats, audio) = if kind.is_audio() {
+            if self.formats.is_some() {
+                return Err(format!(
+                    "stage {id}: formats is a key of video stages; an audio stage gives rates, \
+                     frame_samples and channels"
+                ));
+            }
+            if frames != [Frames::Host] {
+                return Err(format!("stage {id}: an audio stage takes host frames only"));
+            }
+            let rates = self
+                .rates
+                .ok_or_else(|| format!("stage {id}: an audio stage needs rates"))?;
+            let frame_samples = self
+                .frame_samples
+                .ok_or_else(|| format!("stage {id}: an audio stage needs frame_samples"))?;
+            let channels = self.channels.unwrap_or(DEFAULT_AUDIO_CHANNELS);
+            if channels == 0 || channels as usize > OBC_MAX_AUDIO_CHANNELS {
+                return Err(format!(
+                    "stage {id}: channels {channels} is not 1 to {OBC_MAX_AUDIO_CHANNELS}"
+                ));
+            }
+            let audio = AudioDecl {
+                rates: positive_list(&id, "rates", rates)?,
+                frame_samples: positive_list(&id, "frame_samples", frame_samples)?,
+                channels,
+            };
+            (Vec::new(), Some(audio))
+        } else {
+            for (key, given) in [
+                ("rates", self.rates.is_some()),
+                ("frame_samples", self.frame_samples.is_some()),
+                ("channels", self.channels.is_some()),
+            ] {
+                if given {
+                    return Err(format!(
+                        "stage {id}: {key} is a key of audio stages, not of {} module",
+                        a_kind(kind)
+                    ));
+                }
+            }
+            let formats = self
+                .formats
+                .ok_or_else(|| format!("stage {id}: a video stage needs formats"))?;
+            (parse_list(id.as_str(), "formats", &formats)?, None)
+        };
         Ok(StageDecl {
             id,
             slot,
@@ -455,8 +679,32 @@ impl RawStage {
             conflicts,
             frames,
             formats,
+            audio,
         })
     }
+}
+
+/// `a video-stage`, `an audio-filter`, `an analyser`: the kind with its
+/// article, for a reason.
+fn a_kind(kind: ModuleKind) -> String {
+    match kind {
+        ModuleKind::VideoStage => format!("a {kind}"),
+        ModuleKind::AudioFilter | ModuleKind::Analyser => format!("an {kind}"),
+    }
+}
+
+/// The slot names of `kind`, for a reason.
+fn slot_names(kind: ModuleKind) -> String {
+    let slots: &[Slot] = if kind.is_audio() {
+        &Slot::AUDIO
+    } else {
+        &Slot::ALL
+    };
+    slots
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl Manifest {
@@ -494,14 +742,14 @@ impl Manifest {
         };
         let mut stages: Vec<StageDecl> = Vec::with_capacity(raw.stages.len());
         for s in raw.stages {
-            let s = s.validate()?;
+            let s = s.validate(kind)?;
             if stages.iter().any(|t| t.id == s.id) {
                 return Err(format!("the stage {} is declared twice", s.id));
             }
             stages.push(s);
         }
-        if kind == ModuleKind::VideoStage && stages.is_empty() {
-            return Err("a video-stage module declares no stage".into());
+        if kind != ModuleKind::Analyser && stages.is_empty() {
+            return Err(format!("{} module declares no stage", a_kind(kind)));
         }
         Ok(Manifest {
             path: path.to_path_buf(),
@@ -534,11 +782,19 @@ impl Manifest {
         })
     }
 
-    /// Why the module is not loaded at all (another ABI major version, or a
-    /// kind that is not supported yet), or `None` when it can be.
+    /// Why the module is not loaded at all by the video daemon (another ABI
+    /// major version, or a kind it does not load: everything but
+    /// `video-stage`), or `None` when it can be: the reason for the
+    /// default [`LoadKinds::Video`] ([`Manifest::unloadable_reason_for`]).
     pub fn unloadable_reason(&self) -> Option<String> {
+        self.unloadable_reason_for(LoadKinds::Video)
+    }
+
+    /// Why a host of `kinds` does not load the module at all (another ABI
+    /// major version, or a kind it does not load), or `None` when it can.
+    pub fn unloadable_reason_for(&self, kinds: LoadKinds) -> Option<String> {
         self.abi_mismatch()
-            .or_else(|| self.kind.unsupported_reason().map(str::to_string))
+            .or_else(|| kinds.refusal(self.kind).map(str::to_string))
     }
 }
 
@@ -720,23 +976,221 @@ formats = ["nv12", "i420"]
         assert!(parse(&missing).unwrap_err().contains("rank"));
     }
 
+    const AUDIO: &str = r#"
+abi = 1
+id = "org.example.voice"
+name = "Voice"
+version = "0.1.0"
+licence = "MIT"
+kind = "audio-filter"
+library = "libvoice.so"
+
+[[stage]]
+id = "mic-denoise"
+slot = "clean"
+rank = 200
+device = "cpu"
+frames = ["host"]
+rates = [48000, 16000, 48000]
+frame_samples = [480, 960]
+
+[[stage]]
+id = "mic-enhance"
+slot = "shape"
+rank = 100
+device = "nvidia-gpu"
+requires = ["clean", "mic-denoise"]
+conflicts = ["mic-dereverb"]
+frames = ["host"]
+rates = [48000]
+frame_samples = [480]
+channels = 2
+"#;
+
     #[test]
-    fn a_video_module_needs_a_stage_but_a_reserved_kind_does_not() {
+    fn a_video_or_audio_module_needs_a_stage_but_an_analyser_does_not() {
         let head: String = HELLO.split("[[stage]]").next().unwrap().to_string();
         assert!(parse(&head).unwrap_err().contains("declares no stage"));
-        let audio = parse(&head.replace("video-stage", "audio-filter")).unwrap();
-        assert_eq!(audio.kind, ModuleKind::AudioFilter);
-        assert_eq!(
-            audio.unloadable_reason().as_deref(),
-            Some("Audio filter modules are not supported yet")
+        let e = parse(&head.replace("video-stage", "audio-filter")).unwrap_err();
+        assert!(
+            e.contains("an audio-filter module declares no stage"),
+            "{e}"
         );
         let analyser = parse(&head.replace("video-stage", "analyser")).unwrap();
-        assert!(
-            analyser
-                .unloadable_reason()
-                .unwrap()
-                .contains("not supported yet")
+        assert_eq!(
+            analyser.unloadable_reason().as_deref(),
+            Some(REASON_ANALYSER)
         );
+        assert_eq!(
+            analyser.unloadable_reason_for(LoadKinds::Audio).as_deref(),
+            Some(REASON_ANALYSER)
+        );
+    }
+
+    #[test]
+    fn an_audio_manifest_parses_with_its_block_formats() {
+        let m = parse(AUDIO).unwrap();
+        assert_eq!(m.kind, ModuleKind::AudioFilter);
+        let d = m.stage("mic-denoise").unwrap();
+        assert_eq!((d.slot, d.rank, d.device), (Slot::Clean, 200, Device::Cpu));
+        assert_eq!(d.frames, [Frames::Host]);
+        assert!(d.formats.is_empty());
+        assert_eq!(
+            d.audio,
+            Some(AudioDecl {
+                rates: vec![48000, 16000],
+                frame_samples: vec![480, 960],
+                channels: DEFAULT_AUDIO_CHANNELS,
+            }),
+            "deduplicated, one channel by default"
+        );
+        let e = m.stage("mic-enhance").unwrap();
+        assert_eq!(e.slot, Slot::Shape);
+        assert_eq!(
+            e.requires,
+            [
+                Requirement::Slot(Slot::Clean),
+                Requirement::Stage(StageId::new("mic-denoise").unwrap())
+            ]
+        );
+        assert_eq!(e.audio.as_ref().unwrap().channels, 2);
+        assert!(
+            parse(HELLO)
+                .unwrap()
+                .stages
+                .iter()
+                .all(|s| s.audio.is_none())
+        );
+        assert!(Slot::Clean < Slot::Shape);
+    }
+
+    #[test]
+    fn each_kind_is_loaded_by_its_own_host() {
+        let audio = parse(AUDIO).unwrap();
+        assert_eq!(
+            audio.unloadable_reason().as_deref(),
+            Some(REASON_AUDIO_IN_WORKER),
+            "the video daemon never loads an audio module"
+        );
+        assert_eq!(audio.unloadable_reason_for(LoadKinds::Audio), None);
+        let video = parse(HELLO).unwrap();
+        assert_eq!(video.unloadable_reason_for(LoadKinds::Video), None);
+        assert_eq!(
+            video.unloadable_reason_for(LoadKinds::Audio).as_deref(),
+            Some(REASON_VIDEO_IN_DAEMON)
+        );
+        assert_eq!(LoadKinds::default(), LoadKinds::Video);
+        assert!(LoadKinds::Audio.admits(ModuleKind::AudioFilter));
+        assert!(!LoadKinds::Audio.admits(ModuleKind::VideoStage));
+        let other = parse(&AUDIO.replace("abi = 1", "abi = 2")).unwrap();
+        assert!(
+            other
+                .unloadable_reason_for(LoadKinds::Audio)
+                .unwrap()
+                .contains("ABI 2")
+        );
+    }
+
+    #[test]
+    fn audio_stages_are_validated_per_kind() {
+        let cases = [
+            // The prefix rule, both ways.
+            (
+                r#"id = "mic-denoise""#,
+                r#"id = "denoise""#,
+                "must start with \"mic-\"",
+            ),
+            // An audio stage in a video slot.
+            (
+                r#"slot = "clean""#,
+                r#"slot = "pre-matte""#,
+                "not a slot of an audio-filter",
+            ),
+            (r#"slot = "clean""#, r#"slot = "loud""#, "unknown slot"),
+            (
+                r#"requires = ["clean", "mic-denoise"]"#,
+                r#"requires = ["matte"]"#,
+                "requires the slot matte",
+            ),
+            (
+                r#"requires = ["clean", "mic-denoise"]"#,
+                r#"requires = ["denoise"]"#,
+                "the required stage denoise",
+            ),
+            (
+                r#"conflicts = ["mic-dereverb"]"#,
+                r#"conflicts = ["relight"]"#,
+                "the conflicting stage relight",
+            ),
+            (
+                "frame_samples = [480, 960]",
+                "frame_samples = [480, 960]\nformats = [\"nv12\"]",
+                "formats is a key of video stages",
+            ),
+            (r#"rates = [48000, 16000, 48000]"#, "", "needs rates"),
+            ("frame_samples = [480, 960]", "", "needs frame_samples"),
+            (
+                r#"rates = [48000, 16000, 48000]"#,
+                "rates = []",
+                "rates is empty",
+            ),
+            (
+                "frame_samples = [480, 960]",
+                "frame_samples = [0]",
+                "frame_samples has a 0",
+            ),
+            ("channels = 2", "channels = 9", "channels 9 is not 1 to 8"),
+            ("channels = 2", "channels = 0", "channels 0"),
+        ];
+        for (from, to, want) in cases {
+            assert!(AUDIO.contains(from), "{from}");
+            let e = parse(&AUDIO.replacen(from, to, 1)).unwrap_err();
+            assert!(e.contains(want), "{to}: {e}");
+        }
+        let cuda = AUDIO.replacen(r#"frames = ["host"]"#, r#"frames = ["cuda"]"#, 1);
+        assert!(parse(&cuda).unwrap_err().contains("host frames only"));
+    }
+
+    #[test]
+    fn video_stages_refuse_the_audio_vocabulary() {
+        let cases = [
+            (
+                r#"id = "hello""#,
+                r#"id = "mic-x""#,
+                "must not start with \"mic-\"",
+            ),
+            (
+                r#"slot = "post-composite""#,
+                r#"slot = "shape""#,
+                "not a slot of a video-stage",
+            ),
+            (
+                r#"requires = ["matte", "denoise"]"#,
+                r#"requires = ["clean"]"#,
+                "requires the slot clean",
+            ),
+            (
+                r#"requires = ["matte", "denoise"]"#,
+                r#"requires = ["mic-denoise"]"#,
+                "the required stage mic-denoise",
+            ),
+            (
+                r#"formats = ["nv12"]"#,
+                "formats = [\"nv12\"]\nrates = [48000]",
+                "rates is a key of audio stages",
+            ),
+            (
+                r#"formats = ["nv12"]"#,
+                "formats = [\"nv12\"]\nchannels = 1",
+                "channels is a key of audio stages",
+            ),
+            (r#"formats = ["nv12"]"#, "", "needs formats"),
+        ];
+        for (from, to, want) in cases {
+            assert!(HELLO.contains(from), "{from}");
+            let e = parse(&HELLO.replacen(from, to, 1)).unwrap_err();
+            assert!(e.contains(want), "{to}: {e}");
+        }
     }
 
     #[test]
@@ -755,9 +1209,11 @@ formats = ["nv12", "i420"]
         assert!(Slot::PreMatte < Slot::Matte);
         assert!(Slot::Matte < Slot::PostMatte);
         assert!(Slot::PostMatte < Slot::PostComposite);
-        for s in Slot::ALL {
+        for s in Slot::ALL.into_iter().chain(Slot::AUDIO) {
             assert_eq!(s.as_str().parse::<Slot>().unwrap(), s);
         }
+        assert!(Slot::AUDIO.iter().all(|s| s.is_audio()));
+        assert!(!Slot::ALL.iter().any(|s| s.is_audio()));
         for d in [Device::NvidiaGpu, Device::Gpu, Device::Npu, Device::Cpu] {
             assert_eq!(d.to_string().parse::<Device>().unwrap(), d);
         }

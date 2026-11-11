@@ -391,12 +391,14 @@ async fn every_property_reads_through_the_proxy() {
             modules_serial: Some(1),
             backend_profile: Some("quality".into()),
             config_serial: Some(1),
+            // No microphone agent here: the mic host is off.
+            mic: Some(obc_ipc::MicStatus::default()),
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 12);
-    assert_eq!(INTERFACE_REVISION, obc_ipc::MODES_REVISION);
-    // GetAll returns the same twenty-three properties.
+    assert_eq!(INTERFACE_REVISION, 13);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::MIC_REVISION);
+    // GetAll returns the same twenty-eight properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
         .destination(obc_ipc::BUS_NAME)
         .path(OBJECT_PATH)
@@ -428,6 +430,11 @@ async fn every_property_reads_through_the_proxy() {
             "Error",
             "InterfaceRevision",
             "LoopbackConsumers",
+            "MicConsumers",
+            "MicError",
+            "MicLatencyMs",
+            "MicProvider",
+            "MicState",
             "ModulesSerial",
             "OutputMode",
             "PipeWireConsumers",
@@ -880,7 +887,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 12);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 13);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -1016,7 +1023,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 12);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 13);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -1132,7 +1139,7 @@ async fn preview_leases_by_bus_name_their_property_and_their_frames() {
     let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 12);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 13);
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
     let seen = rig.record_changes().await;
     let mut frames = proxy.receive_preview_frame().await.unwrap();

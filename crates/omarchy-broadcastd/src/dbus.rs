@@ -389,6 +389,25 @@ impl Server {
         Ok(files.to_wire())
     }
 
+    /// Turns the microphone on (the mic host unit enabled and started) or
+    /// off (the previous default microphone restored if the Omarchy
+    /// Broadcast Mic is the default, then the unit stopped and disabled)
+    /// (revision 13). Refused with `Unavailable` while an ADR 0014
+    /// filter-chain unit runs (naming it) or without a service manager.
+    async fn set_mic_host(&self, on: bool) -> Result<(), IpcError> {
+        self.call(|reply| Command::SetMicHost(on, reply)).await
+    }
+
+    /// About once per second while `MicState` is `active`, relayed from the
+    /// audio worker (revision 13).
+    #[zbus(signal)]
+    pub async fn mic_stats(
+        emitter: &SignalEmitter<'_>,
+        overruns: u32,
+        misses: u32,
+        voice: f64,
+    ) -> zbus::Result<()>;
+
     /// The configuration in force, its files or the config schema changed;
     /// `serial` is the new `ConfigSerial` (revision 10).
     #[zbus(signal)]
@@ -558,6 +577,38 @@ impl Server {
         self.snap().config_serial.unwrap_or(1)
     }
 
+    /// The microphone: `off` (the mic host does not run), `passthrough`,
+    /// `starting`, `active` or `error` (revision 13).
+    #[zbus(property)]
+    fn mic_state(&self) -> String {
+        self.snap().mic.unwrap_or_default().state
+    }
+
+    /// The applications recording from the microphone (revision 13).
+    #[zbus(property)]
+    fn mic_consumers(&self) -> u32 {
+        self.snap().mic.unwrap_or_default().consumers
+    }
+
+    /// The module running each microphone stage, as text (revision 13).
+    #[zbus(property)]
+    fn mic_provider(&self) -> String {
+        self.snap().mic.unwrap_or_default().provider
+    }
+
+    /// The delay the microphone processing adds, in milliseconds
+    /// (revision 13).
+    #[zbus(property)]
+    fn mic_latency_ms(&self) -> f64 {
+        self.snap().mic.unwrap_or_default().latency_ms
+    }
+
+    /// Why microphone stages that are on cannot run (revision 13).
+    #[zbus(property)]
+    fn mic_error(&self) -> String {
+        self.snap().mic.unwrap_or_default().error
+    }
+
     #[zbus(property)]
     fn interface_revision(&self) -> u32 {
         self.snap().interface_revision
@@ -595,8 +646,11 @@ async fn emit_change(emitter: &SignalEmitter<'_>, change: &Change) -> zbus::Resu
         | Change::Effect(v)
         | Change::BackgroundImage(v)
         | Change::PipeWireOutput(v)
-        | Change::BackendProfile(v) => emit_changed(emitter, name, v).await,
-        Change::BlurStrength(v) => emit_changed(emitter, name, v).await,
+        | Change::BackendProfile(v)
+        | Change::MicState(v)
+        | Change::MicProvider(v)
+        | Change::MicError(v) => emit_changed(emitter, name, v).await,
+        Change::BlurStrength(v) | Change::MicLatencyMs(v) => emit_changed(emitter, name, v).await,
         Change::Enabled(v) | Change::Denoise(v) => emit_changed(emitter, name, v).await,
         Change::Cameras(v) => emit_changed(emitter, name, v).await,
         Change::Consumers(v)
@@ -606,7 +660,8 @@ async fn emit_change(emitter: &SignalEmitter<'_>, change: &Change) -> zbus::Resu
         | Change::SettingsRevision(v)
         | Change::SettingsSchemaSerial(v)
         | Change::ModulesSerial(v)
-        | Change::ConfigSerial(v) => emit_changed(emitter, name, v).await,
+        | Change::ConfigSerial(v)
+        | Change::MicConsumers(v) => emit_changed(emitter, name, v).await,
         Change::CameraControls(v) => emit_changed(emitter, name, v).await,
     }
 }
@@ -649,6 +704,9 @@ pub async fn run_publisher(conn: Connection, mut notes: UnboundedReceiver<Note>)
                 Server::settings_changed(&emitter, *revision, *serial, changes).await
             }
             Note::ConfigChanged(serial) => Server::config_changed(&emitter, *serial).await,
+            Note::MicStats(overruns, misses, voice) => {
+                Server::mic_stats(&emitter, *overruns, *misses, *voice).await
+            }
         };
         if let Err(e) = res {
             crate::debug!("emitting a signal failed: {e}");

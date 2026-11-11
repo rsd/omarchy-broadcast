@@ -72,7 +72,8 @@ impl ProbeReport {
 /// A module's settings ([`crate::Module::settings`]): groups of settings,
 /// in the daemon's self-describing settings model.
 ///
-/// Setting ids are `effect.<group>.<name>` (lower-case letters, digits and
+/// Setting ids are `effect.<group>.<name>` for a video module and
+/// `mic.<group>.<name>` for an audio module (lower-case letters, digits and
 /// `_`; at most 48 bytes). A setting with a `stage` and the
 /// [`Role::Enable`] role switches that stage on and off; one with a `stage`
 /// and a `key` is a parameter of the stage, applied as its [`Apply`] says.
@@ -112,6 +113,10 @@ pub struct Group {
     pub id: String,
     /// The label shown.
     pub label: String,
+    /// Where the clients show the group, when not with the effects: `mic`
+    /// for the microphone's settings (ABI 1.2). Absent: with the effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
     /// The settings, in display order.
     pub settings: Vec<Setting>,
 }
@@ -122,8 +127,16 @@ impl Group {
         Group {
             id: id.into(),
             label: label.into(),
+            surface: None,
             settings: Vec::new(),
         }
+    }
+
+    /// Sets where the clients show the group (`mic`: with the
+    /// microphone's settings).
+    pub fn surface(mut self, surface: impl Into<String>) -> Self {
+        self.surface = Some(surface.into());
+        self
     }
 
     /// Adds a setting.
@@ -462,6 +475,25 @@ mod tests {
                  "step":5,"default":0,"unit":"°","stage":"relight","key":"direction","apply":"live",
                  "hint":"slider"},
                 {"id":"effect.lighting.reset","label":"Reset","type":"action"}]}]})
+        );
+        assert_eq!(
+            SettingsDescription::from_json(&desc.to_json()).unwrap(),
+            desc
+        );
+    }
+
+    #[test]
+    fn a_mic_group_carries_its_surface() {
+        let desc = SettingsDescription::new().group(
+            Group::new("noise", "Noise removal")
+                .surface("mic")
+                .setting(Setting::bool("mic.noise.enabled", "Noise removal", true)),
+        );
+        let value: serde_json::Value = serde_json::from_str(&desc.to_json()).unwrap();
+        assert_eq!(
+            value,
+            json!({"groups":[{"id":"noise","label":"Noise removal","surface":"mic","settings":[
+                {"id":"mic.noise.enabled","label":"Noise removal","type":"bool","default":true}]}]})
         );
         assert_eq!(
             SettingsDescription::from_json(&desc.to_json()).unwrap(),

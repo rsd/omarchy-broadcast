@@ -91,6 +91,12 @@ pub mod limits {
     /// steps of this (degrees, percent) from their minimum, the step the
     /// settings schema publishes.
     pub const RELIGHT_STEP: u32 = 5;
+    /// `mic.pipeline_depth`: 0 (by device) to this many blocks.
+    pub const MAX_MIC_PIPELINE_DEPTH: u32 = 4;
+    /// `mic.idle_exit_s`: 0 (never) to this many seconds, a day.
+    pub const MAX_MIC_IDLE_EXIT_S: u64 = 86_400;
+    /// `mic.device`: at most this many bytes.
+    pub const MAX_MIC_DEVICE_BYTES: usize = 256;
 }
 
 /// A config file that cannot be used. The previous config stays in force.
@@ -148,6 +154,8 @@ pub struct Config {
     pub lifecycle: LifecycleConfig,
     pub effect: EffectConfig,
     pub pipewire: PipeWireConfig,
+    /// `[mic]`: the Omarchy Broadcast Mic's processing ([`MicConfig`]).
+    pub mic: MicConfig,
     /// `[modules]`: which modules load, the stage order, the backend profile
     /// and the pins ([`ModulesConfig`]).
     #[serde(skip_serializing_if = "is_default_modules")]
@@ -439,6 +447,114 @@ impl Default for PipeWireConfig {
     }
 }
 
+/// `mic.gpu_policy`: when the microphone's stages may run on a GPU (an NPU
+/// and the CPU always may).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MicGpuPolicy {
+    /// Whenever a GPU module ranks first.
+    #[default]
+    Always,
+    /// Only in a microphone session that starts while the camera session
+    /// is active (the GPU is awake anyway).
+    WithCamera,
+    /// Never.
+    Never,
+}
+
+impl MicGpuPolicy {
+    /// The configuration's spelling: `always`, `with-camera`, `never`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MicGpuPolicy::Always => "always",
+            MicGpuPolicy::WithCamera => "with-camera",
+            MicGpuPolicy::Never => "never",
+        }
+    }
+}
+
+/// `[mic]`: the processing of the Omarchy Broadcast Mic (the audio worker
+/// runs it; the daemon hands it these values). The panel's switches write
+/// `enabled` and `device` to the managed file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MicConfig {
+    /// Process the microphone; off, the sound passes through unchanged
+    /// (never silence).
+    pub enabled: bool,
+    /// The microphone captured: `default` (the capture side follows the
+    /// system's choice) or a PipeWire `node.name`.
+    pub device: String,
+    /// Blocks of 10 ms between the microphone and the processed sound: 0
+    /// chooses by device (1 on the CPU, 2 with a stage on a GPU), else
+    /// 1 to [`limits::MAX_MIC_PIPELINE_DEPTH`].
+    pub pipeline_depth: u32,
+    /// Seconds without sound before the audio worker exits; 0 never.
+    pub idle_exit_s: u64,
+    /// When the stages may run on a GPU.
+    pub gpu_policy: MicGpuPolicy,
+    /// Loads stages that their modules declare in conflict (Studio Voice
+    /// with noise or room echo removal) together, for testing; off, the
+    /// conflicting stages are greyed.
+    pub force_conflicts: bool,
+}
+
+impl Default for MicConfig {
+    fn default() -> Self {
+        MicConfig {
+            enabled: true,
+            device: MIC_DEVICE_DEFAULT.into(),
+            pipeline_depth: 0,
+            idle_exit_s: 30,
+            gpu_policy: MicGpuPolicy::Always,
+            force_conflicts: false,
+        }
+    }
+}
+
+/// `mic.device` when the capture side follows the system's default.
+pub const MIC_DEVICE_DEFAULT: &str = "default";
+
+impl MicConfig {
+    /// Checks the values; the error names the key.
+    pub fn validate(&self) -> Result<(), (&'static str, String)> {
+        let d = &self.device;
+        if d.trim().is_empty() {
+            return Err(("mic.device", "must not be empty".into()));
+        }
+        if d.len() > limits::MAX_MIC_DEVICE_BYTES {
+            return Err((
+                "mic.device",
+                format!("must be at most {} bytes", limits::MAX_MIC_DEVICE_BYTES),
+            ));
+        }
+        if d.chars().any(char::is_control) {
+            return Err(("mic.device", "must not hold control characters".into()));
+        }
+        if self.pipeline_depth > limits::MAX_MIC_PIPELINE_DEPTH {
+            return Err((
+                "mic.pipeline_depth",
+                format!(
+                    "must be 0 (by device) to {}, got {}",
+                    limits::MAX_MIC_PIPELINE_DEPTH,
+                    self.pipeline_depth
+                ),
+            ));
+        }
+        if self.idle_exit_s > limits::MAX_MIC_IDLE_EXIT_S {
+            return Err((
+                "mic.idle_exit_s",
+                format!(
+                    "must be 0 (never) to {}, got {}",
+                    limits::MAX_MIC_IDLE_EXIT_S,
+                    self.idle_exit_s
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -449,6 +565,7 @@ impl Default for Config {
             lifecycle: LifecycleConfig::default(),
             effect: EffectConfig::default(),
             pipewire: PipeWireConfig::default(),
+            mic: MicConfig::default(),
             modules: ModulesConfig::default(),
             module: BTreeMap::new(),
         }
@@ -522,6 +639,9 @@ impl Config {
         check_start_debounce(self.lifecycle.start_debounce_ms)
             .map_err(invalid("lifecycle.start_debounce_ms"))?;
         self.effect.validate()?;
+        self.mic
+            .validate()
+            .map_err(|(key, reason)| ConfigError::Invalid { key, reason })?;
         self.modules
             .validate()
             .map_err(|(key, reason)| ConfigError::Invalid { key, reason })?;
@@ -1167,6 +1287,24 @@ pub struct RuntimeState {
         deserialize_with = "de_camera_modes"
     )]
     pub camera_modes: BTreeMap<String, ModeRequest>,
+    /// The default microphone (a PipeWire `node.name`) before "Use as
+    /// default microphone" made the Omarchy Broadcast Mic the default: the
+    /// one made the default again by the restore action and when the mic
+    /// host is turned off. The daemon's own record; `None` while the
+    /// Omarchy Broadcast Mic is not made the default by it. Read leniently:
+    /// a value that is not a string is dropped.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_mic_previous_default"
+    )]
+    pub mic_previous_default: Option<String>,
+}
+
+/// `mic_previous_default`, leniently: a string, else nothing; never an
+/// error.
+fn de_mic_previous_default<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let value = toml::Value::deserialize(d)?;
+    Ok(value.as_str().map(str::to_string))
 }
 
 /// `output_good`: the contract as its `Display` string.
@@ -1264,6 +1402,7 @@ impl Default for RuntimeState {
             settings: BTreeMap::new(),
             camera_modes: BTreeMap::new(),
             output_good: None,
+            mic_previous_default: None,
         }
     }
 }
@@ -1985,6 +2124,10 @@ offer_nv12 = false
             "maxine_root",
             "enabled",
             "offer_nv12",
+            "pipeline_depth",
+            "idle_exit_s",
+            "gpu_policy",
+            "force_conflicts",
         ] {
             assert!(
                 EXAMPLE.lines().any(|l| l
@@ -2261,6 +2404,22 @@ offer_nv12 = false
                 "pipewire.offer_nv12",
                 "invalid type",
             ),
+            (
+                "[mic]\npipeline_depth = 9",
+                "mic.pipeline_depth",
+                "must be 0 (by device) to 4",
+            ),
+            (
+                "[mic]\nidle_exit_s = 100000",
+                "mic.idle_exit_s",
+                "must be 0 (never)",
+            ),
+            ("[mic]\ndevice = \"  \"", "mic.device", "must not be empty"),
+            (
+                "[mic]\ngpu_policy = \"sometimes\"",
+                "mic.gpu_policy",
+                "unknown variant",
+            ),
         ];
         for (text, key, reason) in cases {
             let e = parse(text).unwrap_err();
@@ -2279,6 +2438,60 @@ offer_nv12 = false
             );
         }
         assert!(parse_err("[output\n").contains("config.toml:1:"));
+    }
+
+    #[test]
+    fn the_mic_section_reads_and_defaults() {
+        let c = parse(
+            "[mic]\nenabled = false\ndevice = \"alsa_input.usb-x\"\npipeline_depth = 3\n\
+             idle_exit_s = 0\ngpu_policy = \"with-camera\"\nforce_conflicts = true",
+        )
+        .unwrap();
+        assert_eq!(
+            c.mic,
+            MicConfig {
+                enabled: false,
+                device: "alsa_input.usb-x".into(),
+                pipeline_depth: 3,
+                idle_exit_s: 0,
+                gpu_policy: MicGpuPolicy::WithCamera,
+                force_conflicts: true,
+            }
+        );
+        assert_eq!(MicGpuPolicy::WithCamera.as_str(), "with-camera");
+        let d = Config::default().mic;
+        assert!(d.enabled);
+        assert_eq!(d.device, MIC_DEVICE_DEFAULT);
+        assert_eq!((d.pipeline_depth, d.idle_exit_s), (0, 30));
+        assert_eq!(d.gpu_policy, MicGpuPolicy::Always);
+        assert!(!d.force_conflicts);
+        // Spelled out with the other sections, and read back the same.
+        let text = c.to_toml();
+        assert!(text.contains("[mic]"), "{text}");
+        assert_eq!(parse(&text).unwrap(), c);
+    }
+
+    #[test]
+    fn the_previous_default_microphone_is_kept_and_read_leniently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let st = RuntimeState {
+            mic_previous_default: Some("alsa_input.usb-y".into()),
+            ..RuntimeState::default()
+        };
+        st.save(&path).unwrap();
+        let (back, damaged) = RuntimeState::load(&path);
+        assert_eq!(damaged, None);
+        assert_eq!(
+            back.mic_previous_default.as_deref(),
+            Some("alsa_input.usb-y")
+        );
+        std::fs::write(&path, "enabled = true\nmic_previous_default = 7\n").unwrap();
+        let (back, damaged) = RuntimeState::load(&path);
+        assert_eq!(damaged, None);
+        assert_eq!(back.mic_previous_default, None);
+        let text = toml::to_string(&RuntimeState::default()).unwrap();
+        assert!(!text.contains("mic_previous_default"), "{text}");
     }
 
     #[test]

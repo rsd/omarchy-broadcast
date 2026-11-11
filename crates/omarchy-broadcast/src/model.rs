@@ -76,11 +76,13 @@ pub struct Changes {
     /// Whether `CameraControls` changed (revision 6): its camera, or a
     /// control's range, default, value or stored mark.
     pub controls: bool,
+    /// Whether one of the microphone's properties changed (revision 13).
+    pub mic: bool,
 }
 
 impl Changes {
     pub fn is_empty(&self) -> bool {
-        self.fields.is_empty() && !self.cameras && !self.controls
+        self.fields.is_empty() && !self.cameras && !self.controls && !self.mic
     }
 }
 
@@ -116,6 +118,7 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Changes {
             .collect(),
         cameras: old.cameras != new.cameras,
         controls: old.camera_controls != new.camera_controls,
+        mic: old.mic != new.mic,
     }
 }
 
@@ -147,7 +150,8 @@ mod tests {
             Changes {
                 fields: vec!["state", "consumers"],
                 cameras: false,
-                controls: false
+                controls: false,
+                mic: false
             }
         );
 
@@ -174,7 +178,8 @@ mod tests {
                     "background_image"
                 ],
                 cameras: true,
-                controls: false
+                controls: false,
+                mic: false
             }
         );
         assert_eq!(active_camera_name(&new), Some("A2"));
@@ -250,7 +255,8 @@ mod tests {
             Changes {
                 fields: Vec::new(),
                 cameras: false,
-                controls: true
+                controls: true,
+                mic: false
             }
         );
         assert!(!changes.is_empty());
@@ -259,5 +265,21 @@ mod tests {
         assert!(diff(&old, &other).controls);
         // From an older daemon (no property) to a newer one: a change.
         assert!(diff(&Snapshot::empty(), &old).controls);
+    }
+
+    #[test]
+    fn diff_tells_a_change_of_the_microphone() {
+        let mut old = Snapshot::empty();
+        old.interface_revision = obc_ipc::MIC_REVISION;
+        // From an older daemon (no properties) to a newer one: a change.
+        let mut first = old.clone();
+        first.mic = Some(obc_ipc::MicStatus::default());
+        assert!(diff(&old, &first).mic);
+        old = first;
+        let mut new = old.clone();
+        new.mic.as_mut().unwrap().state = "active".into();
+        let changes = diff(&old, &new);
+        assert!(changes.mic && changes.fields.is_empty() && !changes.is_empty());
+        assert!(!diff(&old, &old.clone()).mic);
     }
 }

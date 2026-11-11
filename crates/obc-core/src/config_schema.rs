@@ -200,13 +200,14 @@ pub struct KeySpec {
 }
 
 /// The groups of the schema, `(id, label)`, in order.
-pub const GROUPS: [(&str, &str); 7] = [
+pub const GROUPS: [(&str, &str); 8] = [
     ("camera", "Camera"),
     ("output", "Output"),
     ("loopback", "Virtual camera device"),
     ("lifecycle", "Start and stop"),
     ("effect", "Effect defaults"),
     ("pipewire", "PipeWire output"),
+    ("mic", "Microphone"),
     ("modules", "Modules"),
 ];
 
@@ -480,6 +481,74 @@ pub const CORE_KEYS: &[KeySpec] = &[
         kind: SpecKind::Bool,
         editable: true,
         apply: Apply::Reload,
+    },
+    KeySpec {
+        key: "mic.enabled",
+        group: "mic",
+        label: "Microphone processing",
+        description: "Process the Omarchy Broadcast Mic. Off, its sound passes through unchanged.",
+        kind: SpecKind::Bool,
+        editable: true,
+        apply: Apply::Live,
+    },
+    KeySpec {
+        key: "mic.device",
+        group: "mic",
+        label: "Input device",
+        description: "The microphone it captures: default, or a PipeWire node name. Choose it in the Mic panel.",
+        kind: SpecKind::String,
+        editable: true,
+        apply: Apply::Live,
+    },
+    KeySpec {
+        key: "mic.pipeline_depth",
+        group: "mic",
+        label: "Processing delay",
+        description: "Blocks of 10 ms between the microphone and the processed sound; 0 chooses by device (1 on the CPU, 2 on a GPU).",
+        kind: SpecKind::Int {
+            min: 0,
+            max: crate::config::limits::MAX_MIC_PIPELINE_DEPTH as i64,
+            step: 1,
+            unit: "blocks",
+        },
+        editable: true,
+        apply: Apply::Reload,
+    },
+    KeySpec {
+        key: "mic.idle_exit_s",
+        group: "mic",
+        label: "Audio worker idle exit",
+        description: "How long the audio worker stays without sound before it exits and frees the GPU; 0 never.",
+        kind: SpecKind::Int {
+            min: 0,
+            max: crate::config::limits::MAX_MIC_IDLE_EXIT_S as i64,
+            step: 1,
+            unit: "s",
+        },
+        editable: true,
+        apply: Apply::Live,
+    },
+    KeySpec {
+        key: "mic.gpu_policy",
+        group: "mic",
+        label: "Microphone on the GPU",
+        description: "When the microphone's effects may run on a GPU: always, only while the camera runs, or never.",
+        kind: SpecKind::Enum(&[
+            ("always", "Always"),
+            ("with-camera", "Only with the camera"),
+            ("never", "Never"),
+        ]),
+        editable: true,
+        apply: Apply::Reload,
+    },
+    KeySpec {
+        key: "mic.force_conflicts",
+        group: "mic",
+        label: "Stack conflicting effects",
+        description: "For testing: run microphone effects that exclude each other together, such as Studio Voice with noise removal.",
+        kind: SpecKind::Bool,
+        editable: false,
+        apply: Apply::Live,
     },
     KeySpec {
         key: "modules.profile",

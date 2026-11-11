@@ -2,6 +2,8 @@
 
 - **Status:** Accepted (2026-11-09). Adds no setting, configuration key or D-Bus member, and no Rust code.
 
+> *Amended by [ADR-0029](0029-audio-modules-mic-host-and-worker.md): the microphone also has a stable host with audio modules (noise removal and room echo removal as loadable modules, run by an audio worker), and a GPU engine is no longer deferred as the only route to one. The units of this record stay, as a supported lightweight alternative; they create the same source name, so they and the new host exclude each other (`Conflicts=`, and `omarchy-broadcast mic on` refuses while one runs). The text below is the original decision.*
+
 ## Context
 - The project offers camera effects ([ADR-0012](0012-video-effects-and-maxine-backend.md)); users also want a cleaner microphone.
 - The engines available on Arch Linux:

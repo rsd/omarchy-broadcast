@@ -21,6 +21,10 @@
 //! `background` stage and the stages of the `matte` slot) never fail open:
 //! a stage failure of one is a failure of the whole chain, and the
 //! instance is unloaded, so no frame runs without its matte.
+//!
+//! An `audio-filter` module (ABI 1.2) is opened by a host of
+//! [`LoadKinds::Audio`] ([`Module::open_for`]), and its instances are
+//! [`crate::audio::AudioInstance`]s ([`Module::create_audio_instance`]).
 
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char};
@@ -37,9 +41,10 @@ use obc_module_abi::{
 };
 use serde::Deserialize;
 
+use crate::audio::AudioInstance;
 use crate::library::{Library, LogLevel, LogSink, frame_flags_of};
-use crate::manifest::{Manifest, Slot};
-use crate::settings::{SettingsDescription, parse_settings};
+use crate::manifest::{LoadKinds, Manifest, Slot};
+use crate::settings::{SettingsDescription, parse_settings_for};
 
 /// The reason of a stage the manifest declares and the probe does not
 /// report.
@@ -170,7 +175,7 @@ impl std::error::Error for ModuleError {}
 /// # Safety
 ///
 /// `ptr` is null or a NUL-terminated string valid during the call.
-unsafe fn owned_text(ptr: *const c_char) -> String {
+pub(crate) unsafe fn owned_text(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();
     }
@@ -181,14 +186,14 @@ unsafe fn owned_text(ptr: *const c_char) -> String {
 }
 
 /// The module object of a loaded library.
-struct ModuleCore {
+pub(crate) struct ModuleCore {
     /// Every instance holds an `Arc` of this, so the object is destroyed
     /// after all its instances, and the library closed after that.
-    lib: Arc<Library>,
+    pub(crate) lib: Arc<Library>,
     obj: *mut obc_module,
     /// Serialises the module-level calls.
     lock: Mutex<()>,
-    id: String,
+    pub(crate) id: String,
     log: LogSink,
     /// The first settings description [`Module::settings`] read (and
     /// validated), for the readers that must not call the module
@@ -221,7 +226,7 @@ impl ModuleCore {
         unsafe { owned_text(f(self.obj)) }
     }
 
-    fn log(&self, level: LogLevel, msg: &str) {
+    pub(crate) fn log(&self, level: LogLevel, msg: &str) {
         (self.log)(&self.id, level, msg);
     }
 
@@ -328,18 +333,39 @@ pub fn parse_probe(
 
 impl Module {
     /// Opens the library of `manifest` and creates the module object from
-    /// `config` (the module's configuration table; `{}` when it has none).
-    /// The module's log lines and the host's about it go to `log`. The
-    /// error is the reason shown for the module.
+    /// `config` (the module's configuration table; `{}` when it has none),
+    /// as the video daemon does: [`Module::open_for`] with
+    /// [`LoadKinds::Video`], so an audio module is refused before its
+    /// library is opened. The module's log lines and the host's about it go
+    /// to `log`. The error is the reason shown for the module.
     pub fn open(
         manifest: &Manifest,
         config: &serde_json::Value,
         log: LogSink,
     ) -> Result<Module, String> {
-        if let Some(reason) = manifest.unloadable_reason() {
+        Module::open_for(manifest, config, log, LoadKinds::Video)
+    }
+
+    /// [`Module::open`] in a host that loads `kinds`: a module of another
+    /// kind is refused before its library is opened. An `audio-filter`
+    /// module's library must be of ABI 1.2 or later and have the audio
+    /// entries ([`Library::audio_refusal`]); it is refused before `init`
+    /// otherwise.
+    pub fn open_for(
+        manifest: &Manifest,
+        config: &serde_json::Value,
+        log: LogSink,
+        kinds: LoadKinds,
+    ) -> Result<Module, String> {
+        if let Some(reason) = manifest.unloadable_reason_for(kinds) {
             return Err(reason);
         }
         let lib = Library::open(&manifest.library, &manifest.id, log.clone())?;
+        if manifest.kind.is_audio()
+            && let Some(reason) = lib.audio_refusal()
+        {
+            return Err(reason);
+        }
         let config = CString::new(config.to_string())
             .map_err(|_| "the module's configuration contains a NUL byte".to_string())?;
         let init = lib.vtable().init.expect("checked at open");
@@ -419,8 +445,12 @@ impl Module {
     }
 
     /// The stages of the manifest that make the matte: `background` and
-    /// those of the `matte` slot. They never fail open.
+    /// those of the `matte` slot. They never fail open. An audio module has
+    /// none: every audio stage fails open.
     pub fn matte_stages(&self) -> Vec<StageId> {
+        if self.manifest.kind.is_audio() {
+            return Vec::new();
+        }
         let mut matte: Vec<StageId> = self
             .manifest
             .stages
@@ -458,8 +488,10 @@ impl Module {
             .expect("checked at open");
         let json = self.core.json_call("The settings description", f)?;
         let stages: Vec<StageId> = self.manifest.stages.iter().map(|s| s.id.clone()).collect();
-        let settings = parse_settings(&json, &stages, |line| self.core.log(LogLevel::Warn, &line))
-            .map_err(|e| ModuleError::host(Status::Failed, e))?;
+        let settings = parse_settings_for(&json, &stages, self.manifest.kind, |line| {
+            self.core.log(LogLevel::Warn, &line)
+        })
+        .map_err(|e| ModuleError::host(Status::Failed, e))?;
         let _ = self.core.settings.set(settings.clone());
         Ok(settings)
     }
@@ -472,8 +504,52 @@ impl Module {
         self.core.settings.get().cloned()
     }
 
-    /// Creates an unloaded instance.
+    /// Creates an unloaded instance, of a video module (an `audio-filter`
+    /// module is refused with [`Status::Unsupported`]: its instances are
+    /// made by [`Self::create_audio_instance`]).
     pub fn create_instance(&self) -> Result<Instance, ModuleError> {
+        if self.manifest.kind.is_audio() {
+            return Err(ModuleError::host(
+                Status::Unsupported,
+                format!(
+                    "the module is an {} module: its instances are audio instances",
+                    self.manifest.kind
+                ),
+            ));
+        }
+        let raw = self.create_raw()?;
+        Ok(Instance {
+            core: self.core.clone(),
+            raw,
+            chain: Vec::new(),
+            loaded: None,
+            poisoned: None,
+            matte: self.matte_stages(),
+        })
+    }
+
+    /// Creates an unloaded audio instance, of an `audio-filter` module (a
+    /// module of another kind is refused with [`Status::Unsupported`]).
+    pub fn create_audio_instance(&self) -> Result<AudioInstance, ModuleError> {
+        if !self.manifest.kind.is_audio() {
+            return Err(ModuleError::host(
+                Status::Unsupported,
+                format!(
+                    "the module is a {} module, not an audio-filter one",
+                    self.manifest.kind
+                ),
+            ));
+        }
+        let raw = self.create_raw()?;
+        Ok(AudioInstance::new(
+            self.core.clone(),
+            self.manifest.clone(),
+            raw,
+        ))
+    }
+
+    /// The module's `instance_create`.
+    fn create_raw(&self) -> Result<*mut obc_instance, ModuleError> {
         let f = self
             .core
             .lib
@@ -497,14 +573,7 @@ impl Module {
             e.message = format!("the instance could not be created: {}", e.message);
             return Err(e);
         }
-        Ok(Instance {
-            core: self.core.clone(),
-            raw,
-            chain: Vec::new(),
-            loaded: None,
-            poisoned: None,
-            matte: self.matte_stages(),
-        })
+        Ok(raw)
     }
 }
 

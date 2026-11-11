@@ -1,0 +1,21 @@
+[package]
+name = "obc-mic-shim"
+description = "The real-time LADSPA forwarding plugin of Omarchy Broadcast Mic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+# The LADSPA plugin the mic host's filter-chain loads: libomarchy_broadcast_mic.so.
+name = "omarchy_broadcast_mic"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+obc-audio = { workspace = true }
+# poll(2) constants for the helper thread.
+libc = "0.2.191"
+
+[lints]
+workspace = true

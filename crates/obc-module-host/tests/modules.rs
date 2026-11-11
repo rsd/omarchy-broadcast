@@ -1,6 +1,6 @@
-//! The host against real module libraries: `examples/module-hello` and the
-//! fixture module of `tests/fixtures/module-fixture`, both built by these
-//! tests with cargo (into a directory under `CARGO_TARGET_TMPDIR`) and
+//! The host against real module libraries: `examples/module-hello`,
+//! `examples/module-hello-audio` and the fixture module of
+//! `tests/fixtures/module-fixture`, all built by these tests with cargo (into a directory under `CARGO_TARGET_TMPDIR`) and
 //! loaded with `dlopen`, as the daemon loads them.
 //!
 //! Each test that reads a module's log lines loads its own copy of the
@@ -20,9 +20,11 @@ use obc_backend::{
     StageChainFactory, StageId, StageList, Value,
 };
 use obc_module_host::discovery::dirs_from;
+use obc_module_host::manifest::{REASON_AUDIO_IN_WORKER, REASON_VIDEO_IN_DAEMON};
 use obc_module_host::{
-    LogLevel, LogSink, Manifest, Module, ModuleBackendFactory, ModuleChainFactory,
-    ModuleEnhancerFactory, ModuleStatus, Registry, SettingType, scan,
+    AudioBlock, AudioSpec, LoadKinds, LogLevel, LogSink, Manifest, Module, ModuleBackendFactory,
+    ModuleChainFactory, ModuleEnhancerFactory, ModuleStatus, Registry, SettingType, Status,
+    common_block_formats, scan,
 };
 
 // ---------------------------------------------------------------------------
@@ -74,6 +76,15 @@ fn hello_lib() -> PathBuf {
         "obc_module_hello",
         "",
         "hello",
+    )
+}
+
+fn hello_audio_lib() -> PathBuf {
+    build(
+        &repo().join("examples/module-hello-audio"),
+        "obc_module_hello_audio",
+        "",
+        "hello-audio",
     )
 }
 
@@ -157,6 +168,50 @@ formats = ["nv12", "i420"]
     )
 }
 
+/// The manifest of the fixture's `audio` build (or of another library,
+/// to see it refused).
+fn fixture_audio_manifest(id: &str, library: &Path) -> String {
+    format!(
+        r#"abi = 1
+id = "{id}"
+name = "Audio fixture"
+version = "0.1.0"
+licence = "MIT OR Apache-2.0"
+kind = "audio-filter"
+library = "{}"
+
+[[stage]]
+id = "mic-denoise"
+slot = "clean"
+rank = 200
+device = "cpu"
+frames = ["host"]
+rates = [48000]
+frame_samples = [480, 960]
+
+[[stage]]
+id = "mic-dereverb"
+slot = "clean"
+rank = 200
+device = "cpu"
+position = 50
+frames = ["host"]
+rates = [48000]
+frame_samples = [480, 960]
+
+[[stage]]
+id = "mic-enhance"
+slot = "shape"
+rank = 200
+device = "cpu"
+frames = ["host"]
+rates = [48000, 16000]
+frame_samples = [480]
+"#,
+        library.display()
+    )
+}
+
 /// A manifest parsed from `text` as if it were at `dir/name.toml`.
 fn manifest(text: &str, dir: &Path, name: &str) -> Manifest {
     let path = dir.join(format!("{name}.toml"));
@@ -189,6 +244,15 @@ fn last_line(lines: &Lines, prefix: &str) -> String {
         .find(|(_, _, m)| m.starts_with(prefix))
         .map(|(_, _, m)| m.clone())
         .unwrap_or_else(|| panic!("no log line starts with {prefix:?}"))
+}
+
+fn count(lines: &Lines, prefix: &str) -> usize {
+    lines
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, _, m)| m.starts_with(prefix))
+        .count()
 }
 
 /// An opened fixture module, with its own library copy and log.
@@ -416,7 +480,12 @@ fn broken_modules_are_unavailable_with_their_reasons_and_the_process_lives() {
     );
     write(
         "audio",
-        fixture_manifest("org.test.audio", &fixture, 1).replace("video-stage", "audio-filter"),
+        fixture_audio_manifest("org.test.audio", &fixture_lib("audio")),
+    );
+    write(
+        "video-slots",
+        fixture_manifest("org.test.video-slots", &fixture, 1)
+            .replace("video-stage", "audio-filter"),
     );
 
     let mut registry = Registry::new(scan(&[d.to_path_buf()]));
@@ -444,11 +513,11 @@ fn broken_modules_are_unavailable_with_their_reasons_and_the_process_lives() {
     // would abort the process) is called.
     let r = reason("org.test.major");
     assert!(
-        r.contains("module ABI 2.0") && r.contains("module ABI 1.1"),
+        r.contains("module ABI 2.0") && r.contains("module ABI 1.2"),
         "{r}"
     );
     let r = reason("org.test.minor");
-    assert!(r.contains("1.99, newer than") && r.contains("1.1"), "{r}");
+    assert!(r.contains("1.99, newer than") && r.contains("1.2"), "{r}");
     let r = reason("org.test.refuse");
     assert!(r.contains("refused this daemon"), "{r}");
     let r = reason("org.test.init");
@@ -465,9 +534,12 @@ fn broken_modules_are_unavailable_with_their_reasons_and_the_process_lives() {
         reason("org.test.typo").contains("license"),
         "keyed by its id"
     );
-    assert_eq!(
-        reason("org.test.audio"),
-        "Audio filter modules are not supported yet"
+    // The video registry lists an audio module, and never opens it.
+    assert_eq!(reason("org.test.audio"), REASON_AUDIO_IN_WORKER);
+    let r = reason("org.test.video-slots");
+    assert!(
+        r.contains("must start with \"mic-\""),
+        "an audio manifest of video stages is invalid: {r}"
     );
     // None of them provides anything.
     assert!(registry.module("org.test.probe").is_none());
@@ -576,7 +648,11 @@ fn a_panic_in_process_is_an_error_and_the_process_survives() {
 /// both process the repeat as before (the host never skips the call).
 #[test]
 fn a_repeat_is_flagged_for_a_module_of_abi_1_1_and_reprocessed_by_one_of_1_0() {
-    for (features, abi, flagged) in [("", "1.1", true), ("abi-1-0", "1.0", false)] {
+    for (features, abi, flagged) in [
+        ("", "1.2", true),
+        ("abi-1-1", "1.1", true),
+        ("abi-1-0", "1.0", false),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let lib = own_copy(&fixture_lib(features), dir.path(), "fixture");
         let m = manifest(
@@ -1147,4 +1223,621 @@ fn a_registry_open_fills_the_settings_cache_the_factory_checks_against() {
             .check_params(&s("alpha"), &p(90), &Params::new())
             .is_err()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Audio modules (ABI 1.2)
+// ---------------------------------------------------------------------------
+
+/// One mono block of `n` samples, ramping from 0.
+fn ramp(n: usize) -> Vec<f32> {
+    (0..n).map(|i| i as f32 / n as f32 - 0.5).collect()
+}
+
+fn audio_spec(stages: &[&str], params: &[(&str, &str, Value)]) -> AudioSpec {
+    AudioSpec {
+        stages: stages.iter().map(|i| s(i)).collect(),
+        sample_rate: 48_000,
+        channels_in: 1,
+        channels_out: 1,
+        frame_samples: 480,
+        params: params
+            .iter()
+            .map(|(st, k, v)| (s(st), k.to_string(), v.clone()))
+            .collect(),
+    }
+}
+
+/// An audio registry over `dir`, opened, with its log.
+fn audio_registry(dir: &Path) -> (Registry, Lines) {
+    let mut registry = Registry::new(scan(&[dir.to_path_buf()])).with_kinds(LoadKinds::Audio);
+    let (sink, lines) = capture();
+    registry.open_all(|_| serde_json::json!({}), &sink);
+    (registry, lines)
+}
+
+#[test]
+fn an_audio_module_loads_only_through_the_audio_kinds_and_runs_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = own_copy(&fixture_lib("audio"), dir.path(), "audio");
+    std::fs::write(
+        dir.path().join("audio.toml"),
+        fixture_audio_manifest("org.test.audio", &lib),
+    )
+    .unwrap();
+    let m = Manifest::load(&dir.path().join("audio.toml")).unwrap();
+
+    // The default (video) host never opens it.
+    let (sink, _) = capture();
+    assert_eq!(
+        Module::open(&m, &serde_json::json!({}), sink).unwrap_err(),
+        REASON_AUDIO_IN_WORKER
+    );
+    let mut video = Registry::new(scan(&[dir.path().to_path_buf()]));
+    let (sink, _) = capture();
+    video.open_all(|_| serde_json::json!({}), &sink);
+    assert_eq!(
+        video.status("org.test.audio"),
+        Some(ModuleStatus::Unavailable(REASON_AUDIO_IN_WORKER.into()))
+    );
+    assert!(video.stage_ids().is_empty());
+
+    // The audio host does.
+    let (registry, lines) = audio_registry(dir.path());
+    assert_eq!(
+        registry.status("org.test.audio"),
+        Some(ModuleStatus::Available)
+    );
+    assert_eq!(
+        registry.order(),
+        [s("mic-dereverb"), s("mic-denoise"), s("mic-enhance")],
+        "clean before shape, then the position"
+    );
+    let module = registry.module("org.test.audio").unwrap().clone();
+    assert_eq!(
+        obc_module_host::library::version_text(module.library().abi_version()),
+        "1.2"
+    );
+    assert!(module.library().has_audio());
+    assert!(module.matte_stages().is_empty());
+    let settings = module.settings().unwrap();
+    assert_eq!(settings.groups[0].surface.as_deref(), Some("mic"));
+    assert_eq!(
+        settings.enable_of("mic-denoise").unwrap().id,
+        "mic.fixture.denoise"
+    );
+    assert_eq!(
+        settings.param("mic-enhance", "gain_pct").unwrap().id,
+        "mic.fixture.gain"
+    );
+    let stages = [s("mic-denoise"), s("mic-enhance")];
+    assert_eq!(
+        common_block_formats(module.manifest(), &stages).unwrap(),
+        (vec![48_000], vec![480], 1)
+    );
+    // A video instance of it is still an instance; an audio one of a video
+    // module is refused (below). An audio instance:
+    let mut inst = module.create_audio_instance().unwrap();
+    assert!(!inst.is_loaded());
+    let input = ramp(480);
+    let mut out = vec![0.0f32; 480];
+    let e = inst
+        .process(&[&input], &mut [&mut out], AudioBlock::default(), &[])
+        .unwrap_err();
+    assert_eq!(e.status, Status::State);
+
+    let outcome = inst
+        .load(&audio_spec(
+            &["mic-denoise", "mic-enhance"],
+            &[("mic-enhance", "gain_pct", Value::Int(200))],
+        ))
+        .unwrap();
+    assert_eq!(
+        (
+            outcome.frame_samples,
+            outcome.latency_samples,
+            outcome.reused_model
+        ),
+        (480, 20, false)
+    );
+    assert_eq!(inst.frame_samples(), Some(480));
+    assert_eq!(inst.latency_samples(), Some(20));
+    let line = last_line(&lines, "fixture-audio-load");
+    assert!(
+        line.contains("stages=mic-denoise,mic-enhance rate=48000 in=1 out=1 frame=480")
+            && line.contains("mic-enhance.gain_pct=200"),
+        "{line}"
+    );
+    let block = AudioBlock {
+        pts_ns: Some(1_000),
+        flags: 0xff,
+    };
+    let voice = inst
+        .process(&[&input], &mut [&mut out], block, &[])
+        .unwrap();
+    assert_eq!(voice, Some(0.5));
+    let doubled: Vec<f32> = input.iter().map(|x| x * 2.0).collect();
+    assert_eq!(out, doubled);
+    let line = last_line(&lines, "fixture-audio-process");
+    assert!(
+        line.contains("n=1 flags=3 pts=Some(1000)"),
+        "unknown flags cleared: {line}"
+    );
+    // A live gain.
+    let half = Value::Int(50);
+    inst.process(
+        &[&input],
+        &mut [&mut out],
+        AudioBlock::default(),
+        &[("mic-enhance", "gain_pct", &half)],
+    )
+    .unwrap();
+    let halved: Vec<f32> = input.iter().map(|x| x * 0.5).collect();
+    assert_eq!(out, halved);
+
+    // Blocks of another shape are refused before the module is called.
+    let short = vec![0.0f32; 240];
+    let e = inst
+        .process(&[&short], &mut [&mut out], AudioBlock::default(), &[])
+        .unwrap_err();
+    assert_eq!(e.status, Status::Invalid);
+    let e = inst
+        .process(
+            &[&input, &input],
+            &mut [&mut out],
+            AudioBlock::default(),
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(e.status, Status::Invalid);
+
+    // A stage that fails on a block is dropped; the next runs without it.
+    let yes = Value::Bool(true);
+    let e = inst
+        .process(
+            &[&input],
+            &mut [&mut out],
+            AudioBlock::default(),
+            &[("mic-enhance", "fail", &yes)],
+        )
+        .unwrap_err();
+    assert_eq!(
+        (e.status, e.stage.clone()),
+        (Status::Stage, Some(s("mic-enhance")))
+    );
+    assert_eq!(inst.chain(), [s("mic-denoise")]);
+    inst.process(&[&input], &mut [&mut out], AudioBlock::default(), &[])
+        .unwrap();
+    assert_eq!(out, input, "a pass-through without the gain");
+
+    // A switch that adds a stage failing its load keeps the previous chain:
+    // the failure names the added stage, read against the request.
+    let e = inst
+        .load(&audio_spec(
+            &["mic-denoise", "mic-enhance"],
+            &[("mic-enhance", "fail_load", Value::Bool(true))],
+        ))
+        .unwrap_err();
+    assert_eq!(
+        (e.status, e.stage.clone()),
+        (Status::Stage, Some(s("mic-enhance")))
+    );
+    assert!(inst.is_loaded());
+    assert_eq!(inst.chain(), [s("mic-denoise")]);
+    inst.process(&[&input], &mut [&mut out], AudioBlock::default(), &[])
+        .unwrap();
+    assert_eq!(out, input, "the previous chain still runs");
+
+    // A spec the manifest does not declare is refused before the module is
+    // called, the chain kept.
+    for (what, spec) in [
+        ("a video stage", audio_spec(&["mic-denoise", "alpha"], &[])),
+        (
+            "an undeclared rate",
+            AudioSpec {
+                sample_rate: 44_100,
+                ..audio_spec(&["mic-denoise"], &[])
+            },
+        ),
+        (
+            "an undeclared block size",
+            AudioSpec {
+                frame_samples: 256,
+                ..audio_spec(&["mic-denoise"], &[])
+            },
+        ),
+        (
+            "undeclared input channels",
+            AudioSpec {
+                channels_in: 2,
+                ..audio_spec(&["mic-denoise"], &[])
+            },
+        ),
+        (
+            "undeclared output channels",
+            AudioSpec {
+                channels_out: 2,
+                ..audio_spec(&["mic-denoise"], &[])
+            },
+        ),
+    ] {
+        let before = count(&lines, "fixture-audio-load");
+        let e = inst.load(&spec).unwrap_err();
+        assert_eq!(e.status, Status::Invalid, "{what}: {e}");
+        assert_eq!(count(&lines, "fixture-audio-load"), before, "{what}");
+        assert_eq!(inst.chain(), [s("mic-denoise")], "{what}");
+        assert!(inst.is_loaded(), "{what}");
+    }
+
+    // A failed switch keeps the chain; a module's own block size is taken.
+    let e = inst
+        .load(&audio_spec(
+            &["mic-denoise"],
+            &[("mic-denoise", "fail_load", Value::Bool(true))],
+        ))
+        .unwrap_err();
+    assert_eq!(e.stage, Some(s("mic-denoise")));
+    assert!(
+        inst.chain().is_empty(),
+        "the host no longer counts on the stage"
+    );
+    let outcome = inst
+        .load(&audio_spec(
+            &["mic-denoise"],
+            &[("mic-denoise", "frame_samples", Value::Int(960))],
+        ))
+        .unwrap();
+    assert_eq!(outcome.frame_samples, 960);
+    let big = ramp(960);
+    let mut big_out = vec![0.0f32; 960];
+    inst.process(&[&big], &mut [&mut big_out], AudioBlock::default(), &[])
+        .unwrap();
+    assert_eq!(big_out, big);
+    // A block size the manifest does not declare for every stage unloads.
+    let e = inst
+        .load(&audio_spec(
+            &["mic-denoise", "mic-enhance"],
+            &[("mic-denoise", "frame_samples", Value::Int(960))],
+        ))
+        .unwrap_err();
+    assert_eq!(e.status, Status::Failed);
+    assert!(e.message.contains("960 samples"), "{e}");
+    assert!(!inst.is_loaded());
+
+    // A panic unloads and poisons until the next load.
+    inst.load(&audio_spec(&["mic-denoise"], &[])).unwrap();
+    let e = inst
+        .process(
+            &[&input],
+            &mut [&mut out],
+            AudioBlock::default(),
+            &[("mic-denoise", "panic", &yes)],
+        )
+        .unwrap_err();
+    assert_eq!(e.status, Status::Panic);
+    assert!(!inst.is_loaded());
+    let e = inst
+        .process(&[&input], &mut [&mut out], AudioBlock::default(), &[])
+        .unwrap_err();
+    assert!(e.message.contains("panicked earlier"), "{e}");
+    inst.load(&audio_spec(&["mic-denoise"], &[])).unwrap();
+    inst.process(&[&input], &mut [&mut out], AudioBlock::default(), &[])
+        .unwrap();
+    inst.unload();
+    assert!(!inst.is_loaded());
+}
+
+#[test]
+fn audio_modules_without_the_audio_abi_and_video_modules_in_the_worker_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let write =
+        |name: &str, text: String| std::fs::write(d.join(format!("{name}.toml")), text).unwrap();
+    // An audio manifest over a video-only library of ABI 1.2, and over one
+    // of ABI 1.1.
+    write(
+        "no-entries",
+        fixture_audio_manifest("org.test.no-entries", &fixture_lib("")),
+    );
+    write(
+        "old",
+        fixture_audio_manifest("org.test.old", &fixture_lib("abi-1-1")),
+    );
+    write(
+        "video",
+        fixture_manifest("org.test.video", &fixture_lib(""), 1),
+    );
+    let (registry, _) = audio_registry(d);
+    let reason = |id: &str| match registry.status(id).unwrap() {
+        ModuleStatus::Unavailable(r) => r,
+        other => panic!("{id} is {other:?}"),
+    };
+    assert_eq!(
+        reason("org.test.no-entries"),
+        "The module's vtable lacks the entries an audio-filter module needs: \
+         audio_instance_load, audio_instance_process"
+    );
+    assert_eq!(
+        reason("org.test.old"),
+        "The library is built for module ABI 1.1; an audio-filter module needs module ABI 1.2 \
+         or later"
+    );
+    assert_eq!(reason("org.test.video"), REASON_VIDEO_IN_DAEMON);
+
+    // An audio instance of a video module is refused.
+    let (_dir, video, _) = fixture(serde_json::json!({}));
+    let e = video.create_audio_instance().unwrap_err();
+    assert_eq!(e.status, Status::Unsupported);
+
+    // A video instance of an audio module is refused.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = own_copy(&fixture_lib("audio"), dir.path(), "audio");
+    std::fs::write(
+        dir.path().join("audio.toml"),
+        fixture_audio_manifest("org.test.audio", &lib),
+    )
+    .unwrap();
+    let (registry, _) = audio_registry(dir.path());
+    let audio = registry.module("org.test.audio").unwrap();
+    let e = audio.create_instance().unwrap_err();
+    assert_eq!(e.status, Status::Unsupported);
+    assert!(e.message.contains("audio-filter"), "{e}");
+    // A first load whose stage fails names it, read against the request,
+    // and leaves the instance unloaded.
+    let mut inst = audio.create_audio_instance().unwrap();
+    let e = inst
+        .load(&audio_spec(
+            &["mic-denoise", "mic-enhance"],
+            &[("mic-enhance", "fail_load", Value::Bool(true))],
+        ))
+        .unwrap_err();
+    assert_eq!(
+        (e.status, e.stage.clone()),
+        (Status::Stage, Some(s("mic-enhance")))
+    );
+    assert!(!inst.is_loaded());
+    assert!(inst.chain().is_empty());
+}
+
+/// The environment variables the audio fixture reads.
+const FIXTURE_ENV: [&str; 4] = [
+    "OBC_FIXTURE_AUDIO_FAIL_LOAD",
+    "OBC_FIXTURE_AUDIO_FAIL_AT",
+    "OBC_FIXTURE_AUDIO_ABORT_AT",
+    "OBC_FIXTURE_AUDIO_SLEEP_MS",
+];
+
+/// Set by the parent of [`audio_fixture_child`]: the library to load.
+const CHILD_LIB: &str = "OBC_TEST_AUDIO_CHILD_LIB";
+
+/// Runs only as a child of
+/// [`the_audio_fixture_fails_and_aborts_as_its_environment_says`] (a no-op
+/// otherwise): loads the audio fixture at `$OBC_TEST_AUDIO_CHILD_LIB` and
+/// runs five blocks, printing what each call gave.
+#[test]
+fn audio_fixture_child() {
+    let Some(lib) = std::env::var_os(CHILD_LIB) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let m = manifest(
+        &fixture_audio_manifest("org.test.child", Path::new(&lib)),
+        dir.path(),
+        "child",
+    );
+    let module = Module::open_for(
+        &m,
+        &serde_json::json!({}),
+        obc_module_host::stderr_log(),
+        LoadKinds::Audio,
+    )
+    .unwrap();
+    let mut inst = module.create_audio_instance().unwrap();
+    match inst.load(&audio_spec(&["mic-denoise", "mic-enhance"], &[])) {
+        Ok(_) => eprintln!("child: load ok"),
+        Err(e) => {
+            eprintln!(
+                "child: load err status={:?} stage={:?} {e}",
+                e.status,
+                e.stage.as_ref().map(|s| s.as_str())
+            );
+            return;
+        }
+    }
+    let input = ramp(480);
+    let mut out = vec![0.0f32; 480];
+    for n in 1..=5 {
+        let start = std::time::Instant::now();
+        let r = inst.process(&[&input], &mut [&mut out], AudioBlock::default(), &[]);
+        let ms = start.elapsed().as_millis();
+        match r {
+            Ok(_) => eprintln!("child: block {n} ok {ms}ms"),
+            Err(e) => eprintln!("child: block {n} err {e}"),
+        }
+    }
+}
+
+#[test]
+fn the_audio_fixture_fails_and_aborts_as_its_environment_says() {
+    let lib = fixture_lib("audio");
+    let run = |env: &[(&str, &str)]| {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "audio_fixture_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_LIB, &lib);
+        for k in FIXTURE_ENV {
+            cmd.env_remove(k);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        (
+            out.status,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    let (status, err) = run(&[]);
+    assert!(status.success(), "{err}");
+    assert!(
+        err.contains("child: load ok") && err.contains("child: block 5 ok"),
+        "{err}"
+    );
+
+    let (status, err) = run(&[("OBC_FIXTURE_AUDIO_FAIL_LOAD", "mic-enhance")]);
+    assert!(status.success(), "{err}");
+    assert!(
+        err.contains(
+            "child: load err status=Stage stage=Some(\"mic-enhance\") \
+             mic-enhance: mic-enhance was told to fail its load"
+        ),
+        "{err}"
+    );
+    let (_, err) = run(&[("OBC_FIXTURE_AUDIO_FAIL_LOAD", "chain")]);
+    assert!(
+        err.contains(
+            "child: load err status=Failed stage=None the audio chain was told to fail its load"
+        ),
+        "{err}"
+    );
+
+    let (status, err) = run(&[("OBC_FIXTURE_AUDIO_FAIL_AT", "2")]);
+    assert!(status.success(), "{err}");
+    assert!(
+        err.contains("child: block 1 ok")
+            && err.contains("child: block 2 err mic-denoise: mic-denoise was told to fail")
+            && err.contains("child: block 3 ok"),
+        "{err}"
+    );
+
+    let (_, err) = run(&[("OBC_FIXTURE_AUDIO_SLEEP_MS", "30")]);
+    let slow = err
+        .lines()
+        .filter_map(|l| l.strip_prefix("child: block "))
+        .filter_map(|l| l.split(' ').nth(2)?.strip_suffix("ms")?.parse::<u64>().ok())
+        .filter(|ms| *ms >= 30)
+        .count();
+    assert_eq!(slow, 5, "{err}");
+
+    // A crash of native code: the process dies on block 3, by SIGABRT.
+    let (status, err) = run(&[("OBC_FIXTURE_AUDIO_ABORT_AT", "3")]);
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(6), "{status:?}: {err}");
+    assert!(
+        err.contains("child: block 2 ok")
+            && err.contains("fixture-audio-abort n=3")
+            && !err.contains("child: block 3"),
+        "{err}"
+    );
+}
+
+#[test]
+fn hello_audio_is_discovered_in_the_worker_and_shapes_the_voice() {
+    let lib = hello_audio_lib();
+    let modules_d = tempfile::tempdir().unwrap();
+    let shipped =
+        std::fs::read_to_string(repo().join("examples/module-hello-audio/hello-audio.toml"))
+            .unwrap();
+    let installed = shipped.replace(
+        "library = \"target/release/libobc_module_hello_audio.so\"",
+        &format!("library = \"{}\"", lib.display()),
+    );
+    assert_ne!(shipped, installed, "the example's library line moved");
+    std::fs::write(modules_d.path().join("hello-audio.toml"), installed).unwrap();
+    const ID: &str = "org.example.hello-audio";
+
+    // Listed, never opened, by the video daemon's registry.
+    let mut video = Registry::new(scan(&[modules_d.path().to_path_buf()]));
+    let (sink, _) = capture();
+    video.open_all(|_| serde_json::json!({}), &sink);
+    assert_eq!(
+        video.status(ID),
+        Some(ModuleStatus::Unavailable(REASON_AUDIO_IN_WORKER.into()))
+    );
+
+    let (registry, _lines) = audio_registry(modules_d.path());
+    assert_eq!(registry.status(ID), Some(ModuleStatus::Available));
+    assert_eq!(
+        registry.resolve("mic-enhance").provider.as_deref(),
+        Some(ID)
+    );
+    let module = registry.module(ID).unwrap().clone();
+    let settings = module.settings().unwrap();
+    assert_eq!(settings.groups.len(), 1);
+    assert_eq!(settings.groups[0].surface.as_deref(), Some("mic"));
+    assert_eq!(
+        settings.enable_of("mic-enhance").unwrap().id,
+        "mic.hello.enabled"
+    );
+    assert!(matches!(
+        settings.param("mic-enhance", "gain_db").unwrap().kind,
+        SettingType::Int {
+            min: -12,
+            max: 12,
+            default: 0,
+            ..
+        }
+    ));
+    let (rates, sizes, channels) =
+        common_block_formats(module.manifest(), &[s("mic-enhance")]).unwrap();
+    assert_eq!((rates[0], sizes[0], channels), (48_000, 480, 1));
+
+    let mut inst = module.create_audio_instance().unwrap();
+    let outcome = inst
+        .load(&audio_spec(
+            &["mic-enhance"],
+            &[("mic-enhance", "gain_db", Value::Int(6))],
+        ))
+        .unwrap();
+    assert_eq!((outcome.frame_samples, outcome.latency_samples), (480, 0));
+    // +6 dB is a gain of 10^(6/20), about 1.995.
+    let input = vec![0.1f32; 480];
+    let mut out = vec![0.0f32; 480];
+    inst.process(&[&input], &mut [&mut out], AudioBlock::default(), &[])
+        .unwrap();
+    let gain = 10f32.powf(6.0 / 20.0);
+    assert!(
+        out.iter().all(|x| (x - 0.1 * gain).abs() < 1e-6),
+        "{:?}",
+        &out[..4]
+    );
+    // A live 0 dB is the identity.
+    let zero = Value::Int(0);
+    inst.process(
+        &[&input],
+        &mut [&mut out],
+        AudioBlock::default(),
+        &[("mic-enhance", "gain_db", &zero)],
+    )
+    .unwrap();
+    assert_eq!(out, input);
+    // The test tone: a 1 kHz sine at the level asked, added to silence.
+    inst.load(&audio_spec(
+        &["mic-enhance"],
+        &[
+            ("mic-enhance", "tone", Value::Bool(true)),
+            ("mic-enhance", "tone_level_pct", Value::Int(50)),
+        ],
+    ))
+    .unwrap();
+    let silence = vec![0.0f32; 480];
+    inst.process(&[&silence], &mut [&mut out], AudioBlock::default(), &[])
+        .unwrap();
+    let peak = out.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    assert!((peak - 0.5).abs() < 1e-3, "peak {peak}");
+    // 1 kHz at 48 kHz: 48 samples a period, so sample 12 is the crest.
+    assert!(
+        out[0].abs() < 1e-6 && (out[12] - 0.5).abs() < 1e-4,
+        "{:?}",
+        &out[..13]
+    );
+    // The phase carries on across blocks: 480 is 10 whole periods.
+    inst.process(&[&silence], &mut [&mut out], AudioBlock::default(), &[])
+        .unwrap();
+    assert!(out[0].abs() < 1e-4 && (out[12] - 0.5).abs() < 1e-4);
 }

@@ -72,7 +72,38 @@
 //!
 //! For [`OBC_FRAME_CUDA`] frames the host makes [`obc_cuda::context`]
 //! current on the calling thread around every instance call. A module never
-//! creates a CUDA context of its own, and never makes one current.
+//! creates a CUDA context of its own, and never makes one current. The
+//! audio kind is the one exception (see below).
+//!
+//! # Audio (since ABI 1.2)
+//!
+//! A module of the manifest kind `audio-filter` processes blocks of
+//! microphone audio instead of video frames. It is loaded by the audio
+//! worker, a process of its own, never by the video daemon. Its instances
+//! are made and released by the same entries as video instances
+//! (`instance_create`, `instance_destroy`, `instance_unload`,
+//! `instance_reset_temporal`, `instance_timings`, `instance_last_error`),
+//! but loaded by `audio_instance_load` ([`obc_audio_request`]) and run by
+//! `audio_instance_process` ([`obc_audio_buffer`]). The rules of the kind:
+//!
+//! * `audio_instance_process` runs on the worker's processing thread, which
+//!   is not a real-time thread, with a deadline of one block (its
+//!   `n_samples` at its `sample_rate`).
+//! * A module may create a GPU context of its own (a CUDA context, for
+//!   one), but only inside `audio_instance_load` and `instance_unload`:
+//!   never in `init`, `probe` or `check`, which must stay cheap and must
+//!   not wake a suspended GPU. The worker is a dedicated process, so the
+//!   video rule above does not bind it.
+//! * A stage that fails fails open: the stage is dropped and the audio
+//!   passes on without it, never silence ([`OBC_ERR_STAGE`]). Audio has no
+//!   matte stages.
+//! * The host fails a stage open after a run of consecutive overruns
+//!   (blocks that missed their deadline; 50 by default, half a second of
+//!   10 ms blocks), and reports it.
+//! * A module of the kind still sets the required video entries
+//!   (`instance_load`, `instance_process`): they may fail with
+//!   [`OBC_ERR_UNSUPPORTED`]. The host refuses an `audio-filter` module
+//!   whose vtable lacks the audio entries.
 
 // The names are the C names of the header, as in a `-sys` crate.
 #![allow(non_camel_case_types)]
@@ -89,7 +120,10 @@ pub const OBC_MODULE_ABI_MAJOR: u32 = 1;
 /// accepts a module built for its own or an older minor version.
 ///
 /// * 1.1 adds [`OBC_FRAME_FLAG_REPEAT`].
-pub const OBC_MODULE_ABI_MINOR: u32 = 1;
+/// * 1.2 adds audio: [`obc_audio_buffer`], [`obc_audio_request`],
+///   [`obc_audio_load_report`], their constants and the vtable entries
+///   `audio_instance_load` and `audio_instance_process`.
+pub const OBC_MODULE_ABI_MINOR: u32 = 2;
 
 /// The packed ABI version this crate describes: `major << 16 | minor`
 /// ([`obc_module_abi_pack`]).
@@ -158,7 +192,8 @@ pub const OBC_ERR_STATE: obc_status = 5;
 /// host should unload it.
 pub const OBC_ERR_PANIC: obc_status = 6;
 /// One stage of an instance's chain failed on its own; the rest of the
-/// chain is intact. Only `instance_load` and `instance_process` return it,
+/// chain is intact. Only `instance_load` and `instance_process` (and, for
+/// audio, `audio_instance_load` and `audio_instance_process`) return it,
 /// and `instance_last_error` is then `<stage id>: <reason>`: the id of the
 /// failed stage, one of the request's (for a load) or of the loaded
 /// chain's (for a frame), a colon and a space, and the reason. A host that
@@ -565,6 +600,129 @@ pub struct obc_timing {
 }
 
 // ---------------------------------------------------------------------------
+// Audio (ABI 1.2)
+// ---------------------------------------------------------------------------
+
+/// The sample format of an [`obc_audio_buffer`]. Since ABI 1.2.
+pub type obc_audio_format = u32;
+
+/// 32-bit float samples, nominally in -1.0 to 1.0, one plane per channel.
+pub const OBC_AUDIO_F32_PLANAR: obc_audio_format = 1;
+
+/// A bit of [`obc_audio_buffer::flags`]: this is the first block of a new
+/// source (a device switch or a restart), so temporal state should not
+/// carry over.
+pub const OBC_AUDIO_FLAG_NEW_SOURCE: u32 = 1 << 0;
+
+/// A bit of [`obc_audio_buffer::flags`]: this block does not follow the
+/// previous one without a gap (a block was dropped between them).
+pub const OBC_AUDIO_FLAG_DISCONT: u32 = 1 << 1;
+
+/// The [`obc_audio_buffer::flags`] bits of this ABI version.
+pub const OBC_AUDIO_FLAGS_ALL: u32 = OBC_AUDIO_FLAG_NEW_SOURCE | OBC_AUDIO_FLAG_DISCONT;
+
+/// The most channels an audio buffer has.
+pub const OBC_MAX_AUDIO_CHANNELS: usize = 8;
+
+/// A block of audio handed to `audio_instance_process`, as input or
+/// output. Since ABI 1.2. The structure only describes the block: its
+/// samples belong to the host, and the module may access them only during
+/// the call. The planes of the input and those of the output never
+/// overlap.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct obc_audio_buffer {
+    /// `sizeof(obc_audio_buffer)` as the host was built.
+    pub struct_size: u32,
+    /// An `OBC_AUDIO_*` format.
+    pub format: obc_audio_format,
+    /// Samples per second.
+    pub sample_rate: u32,
+    /// How many of `planes` are set (1 to [`OBC_MAX_AUDIO_CHANNELS`]).
+    pub channels: u32,
+    /// Samples per channel in this block: the `frame_samples` of the load.
+    pub n_samples: u32,
+    /// Zero.
+    pub reserved0: u32,
+    /// One host-owned plane of `n_samples` samples per channel, in channel
+    /// order; the others null. Read-only in the input, written by the
+    /// module in the output.
+    pub planes: [*mut f32; OBC_MAX_AUDIO_CHANNELS],
+    /// The capture time of the block's first sample in nanoseconds; -1
+    /// when unknown.
+    pub pts_ns: i64,
+    /// `OBC_AUDIO_FLAG_*` bits of the input; the others are zero. Zero in
+    /// the output.
+    pub flags: u32,
+    /// Output only: how likely the block holds speech, 0.0 to 1.0, as the
+    /// module's voice activity detection says; -1.0 when unknown. The host
+    /// sets -1.0 in the output before the call, and ignores it in the
+    /// input.
+    pub voice_probability: f32,
+}
+
+/// What `audio_instance_load` loads: a chain of the module's audio stages,
+/// in order, for one block format. Since ABI 1.2.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct obc_audio_request {
+    /// `sizeof(obc_audio_request)` as the host was built.
+    pub struct_size: u32,
+    /// Zero.
+    pub reserved0: u32,
+    /// The stage ids of the chain, in the order they run; `n_stages`
+    /// NUL-terminated strings. A module may run two stages of the request
+    /// as one model when it has one that does both (one frame of delay
+    /// instead of two).
+    pub stages: *const *const c_char,
+    /// The number of `stages`.
+    pub n_stages: usize,
+    /// Samples per second, one of the manifest's `rates` of every stage.
+    pub sample_rate: u32,
+    /// The channels of the input blocks.
+    pub channels_in: u32,
+    /// The channels of the output blocks.
+    pub channels_out: u32,
+    /// The samples per channel of every block the host proposes, one of the
+    /// manifest's `frame_samples` of every stage. The module may choose
+    /// another one of those in [`obc_audio_load_report::frame_samples`].
+    pub frame_samples: u32,
+    /// The load-time parameters of every stage of the chain; `n_params`
+    /// entries. May be null when `n_params` is 0.
+    pub params: *const obc_param,
+    /// The number of `params`.
+    pub n_params: usize,
+}
+
+/// What `audio_instance_load` reports. Since ABI 1.2. The host sets
+/// `struct_size`, sets `frame_samples` to the request's, `warmup_ms` to -1
+/// and zeroes the rest; the module fills in the fields that fit in
+/// `struct_size`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct obc_audio_load_report {
+    /// `sizeof(obc_audio_load_report)` as the host was built.
+    pub struct_size: u32,
+    /// How long the load took, in milliseconds.
+    pub load_ms: f32,
+    /// How long the warm-up took, in milliseconds; negative when there was
+    /// none.
+    pub warmup_ms: f32,
+    /// The samples per channel of every block the chain takes: the
+    /// request's, or another of the manifest's `frame_samples` the module
+    /// chose. The host hands blocks of this size only.
+    pub frame_samples: u32,
+    /// The chain's algorithmic delay, in samples, its lookahead included:
+    /// how much later a sound comes out than it went in.
+    pub latency_samples: u32,
+    /// 1 when the load reused models of the instance's previous load, else
+    /// 0; a reader takes any non-zero value as 1.
+    pub reused_model: u8,
+    /// Zero.
+    pub reserved0: [u8; 3],
+}
+
+// ---------------------------------------------------------------------------
 // The vtable
 // ---------------------------------------------------------------------------
 
@@ -696,6 +854,43 @@ pub struct obc_module_vtable {
             n_stages: usize,
         ) -> obc_status,
     >,
+    /// Since ABI 1.2. Required for an `audio-filter` module, null for the
+    /// others. Loads a chain of the module's audio stages. As for
+    /// `instance_load`, a load on a loaded instance is a **switch** when
+    /// the request keeps the block format of the loaded chain (the same
+    /// `sample_rate`, `channels_in`, `channels_out` and `frame_samples`:
+    /// only stages or parameters change), and may reuse its models; with
+    /// another block format it is a **reload**. A failed switch leaves the
+    /// previous chain loaded and running as it was, except after
+    /// [`OBC_ERR_STAGE`] (the previous chain, less the failed stage when the
+    /// switch could not leave it as it was) and [`OBC_ERR_PANIC`]. A failed
+    /// first load or reload, and a load that panicked, leave the instance
+    /// unloaded. A module may create its own GPU context here (see the
+    /// crate documentation).
+    pub audio_instance_load: Option<
+        unsafe extern "C" fn(
+            instance: *mut obc_instance,
+            request: *const obc_audio_request,
+            out_report: *mut obc_audio_load_report,
+        ) -> obc_status,
+    >,
+    /// Since ABI 1.2. Required for an `audio-filter` module, null for the
+    /// others. Runs one block through the loaded audio chain, from `input`
+    /// into the planes of `output` (which never overlap the input's), with
+    /// the block format of the load. The module writes every sample of the
+    /// output's planes and may set its `voice_probability`. The `n_live`
+    /// per-block parameters (`live` may be null when 0) apply from this
+    /// block on. After [`OBC_ERR_STAGE`] the module has dropped the stage,
+    /// and the output of this block is not written.
+    pub audio_instance_process: Option<
+        unsafe extern "C" fn(
+            instance: *mut obc_instance,
+            input: *const obc_audio_buffer,
+            output: *mut obc_audio_buffer,
+            live: *const obc_param,
+            n_live: usize,
+        ) -> obc_status,
+    >,
 }
 
 // ---------------------------------------------------------------------------
@@ -795,6 +990,71 @@ impl obc_load_report {
     }
 }
 
+impl obc_audio_buffer {
+    /// A buffer with `struct_size` set and everything else zero (no
+    /// planes), unknown time and unknown voice probability.
+    pub const fn empty() -> Self {
+        obc_audio_buffer {
+            struct_size: size_of::<obc_audio_buffer>() as u32,
+            format: 0,
+            sample_rate: 0,
+            channels: 0,
+            n_samples: 0,
+            reserved0: 0,
+            planes: [std::ptr::null_mut(); OBC_MAX_AUDIO_CHANNELS],
+            pts_ns: -1,
+            flags: 0,
+            voice_probability: -1.0,
+        }
+    }
+}
+
+impl Default for obc_audio_buffer {
+    fn default() -> Self {
+        obc_audio_buffer::empty()
+    }
+}
+
+impl obc_audio_request {
+    /// A request with `struct_size` set and everything else zero or null.
+    pub const fn empty() -> Self {
+        obc_audio_request {
+            struct_size: size_of::<obc_audio_request>() as u32,
+            reserved0: 0,
+            stages: std::ptr::null(),
+            n_stages: 0,
+            sample_rate: 0,
+            channels_in: 0,
+            channels_out: 0,
+            frame_samples: 0,
+            params: std::ptr::null(),
+            n_params: 0,
+        }
+    }
+}
+
+impl Default for obc_audio_request {
+    fn default() -> Self {
+        obc_audio_request::empty()
+    }
+}
+
+impl obc_audio_load_report {
+    /// A report as the host passes it for a request of `frame_samples`:
+    /// `struct_size` and `frame_samples` set, no warm-up.
+    pub const fn empty(frame_samples: u32) -> Self {
+        obc_audio_load_report {
+            struct_size: size_of::<obc_audio_load_report>() as u32,
+            load_ms: 0.0,
+            warmup_ms: -1.0,
+            frame_samples,
+            latency_samples: 0,
+            reused_model: 0,
+            reserved0: [0; 3],
+        }
+    }
+}
+
 impl obc_host {
     /// A host with `struct_size` and `abi_version` set, no user data and
     /// no log callback.
@@ -815,8 +1075,8 @@ mod tests {
 
     #[test]
     fn version_packing() {
-        assert_eq!(OBC_MODULE_ABI_VERSION, 0x0001_0001);
-        assert_eq!(obc_module_abi_pack(1, 1), OBC_MODULE_ABI_VERSION);
+        assert_eq!(OBC_MODULE_ABI_VERSION, 0x0001_0002);
+        assert_eq!(obc_module_abi_pack(1, 2), OBC_MODULE_ABI_VERSION);
         assert_eq!(obc_module_abi_pack(2, 7), 0x0002_0007);
         assert_eq!(obc_module_abi_major(0x0002_0007), 2);
         assert_eq!(obc_module_abi_minor(0x0002_0007), 7);
@@ -869,6 +1129,22 @@ mod tests {
             size_of::<obc_host>()
         );
         assert_eq!(obc_host::empty().abi_version, OBC_MODULE_ABI_VERSION);
+        assert_eq!(
+            obc_audio_buffer::empty().struct_size as usize,
+            size_of::<obc_audio_buffer>()
+        );
+        assert_eq!(obc_audio_buffer::empty().voice_probability, -1.0);
+        assert_eq!(obc_audio_buffer::empty().pts_ns, -1);
+        assert_eq!(
+            obc_audio_request::empty().struct_size as usize,
+            size_of::<obc_audio_request>()
+        );
+        let report = obc_audio_load_report::empty(480);
+        assert_eq!(
+            report.struct_size as usize,
+            size_of::<obc_audio_load_report>()
+        );
+        assert_eq!((report.frame_samples, report.warmup_ms), (480, -1.0));
     }
 
     /// The layout of every structure, pinned: a change here is an ABI
@@ -967,7 +1243,7 @@ mod tests {
                 size_of::<obc_module_vtable>(),
                 align_of::<obc_module_vtable>()
             ),
-            (8 + 16 * 8, 8)
+            (8 + 18 * 8, 8)
         );
         assert_eq!(offset_of!(obc_module_vtable, struct_size), 0);
         assert_eq!(offset_of!(obc_module_vtable, abi_version), 4);
@@ -987,6 +1263,60 @@ mod tests {
         assert_eq!(offset_of!(obc_module_vtable, instance_last_error), 112);
         assert_eq!(offset_of!(obc_module_vtable, destroy), 120);
         assert_eq!(offset_of!(obc_module_vtable, check), 128);
+        // ABI 1.2.
+        assert_eq!(offset_of!(obc_module_vtable, audio_instance_load), 136);
+        assert_eq!(offset_of!(obc_module_vtable, audio_instance_process), 144);
+
+        assert_eq!(
+            (
+                size_of::<obc_audio_buffer>(),
+                align_of::<obc_audio_buffer>()
+            ),
+            (104, 8)
+        );
+        assert_eq!(offset_of!(obc_audio_buffer, struct_size), 0);
+        assert_eq!(offset_of!(obc_audio_buffer, format), 4);
+        assert_eq!(offset_of!(obc_audio_buffer, sample_rate), 8);
+        assert_eq!(offset_of!(obc_audio_buffer, channels), 12);
+        assert_eq!(offset_of!(obc_audio_buffer, n_samples), 16);
+        assert_eq!(offset_of!(obc_audio_buffer, reserved0), 20);
+        assert_eq!(offset_of!(obc_audio_buffer, planes), 24);
+        assert_eq!(offset_of!(obc_audio_buffer, pts_ns), 88);
+        assert_eq!(offset_of!(obc_audio_buffer, flags), 96);
+        assert_eq!(offset_of!(obc_audio_buffer, voice_probability), 100);
+
+        assert_eq!(
+            (
+                size_of::<obc_audio_request>(),
+                align_of::<obc_audio_request>()
+            ),
+            (56, 8)
+        );
+        assert_eq!(offset_of!(obc_audio_request, struct_size), 0);
+        assert_eq!(offset_of!(obc_audio_request, reserved0), 4);
+        assert_eq!(offset_of!(obc_audio_request, stages), 8);
+        assert_eq!(offset_of!(obc_audio_request, n_stages), 16);
+        assert_eq!(offset_of!(obc_audio_request, sample_rate), 24);
+        assert_eq!(offset_of!(obc_audio_request, channels_in), 28);
+        assert_eq!(offset_of!(obc_audio_request, channels_out), 32);
+        assert_eq!(offset_of!(obc_audio_request, frame_samples), 36);
+        assert_eq!(offset_of!(obc_audio_request, params), 40);
+        assert_eq!(offset_of!(obc_audio_request, n_params), 48);
+
+        assert_eq!(
+            (
+                size_of::<obc_audio_load_report>(),
+                align_of::<obc_audio_load_report>()
+            ),
+            (24, 4)
+        );
+        assert_eq!(offset_of!(obc_audio_load_report, struct_size), 0);
+        assert_eq!(offset_of!(obc_audio_load_report, load_ms), 4);
+        assert_eq!(offset_of!(obc_audio_load_report, warmup_ms), 8);
+        assert_eq!(offset_of!(obc_audio_load_report, frame_samples), 12);
+        assert_eq!(offset_of!(obc_audio_load_report, latency_samples), 16);
+        assert_eq!(offset_of!(obc_audio_load_report, reused_model), 20);
+        assert_eq!(offset_of!(obc_audio_load_report, reserved0), 21);
     }
 
     #[test]
@@ -1023,6 +1353,16 @@ mod tests {
         assert_eq!(OBC_FRAME_FLAG_REPEAT, 2);
         assert_eq!(OBC_FRAME_FLAGS_1_0, 1);
         assert_eq!(OBC_FRAME_FLAGS_ALL, 3);
+        assert_eq!(OBC_AUDIO_F32_PLANAR, 1);
+        assert_eq!(
+            [
+                OBC_AUDIO_FLAG_NEW_SOURCE,
+                OBC_AUDIO_FLAG_DISCONT,
+                OBC_AUDIO_FLAGS_ALL
+            ],
+            [1, 2, 3]
+        );
+        assert_eq!(OBC_MAX_AUDIO_CHANNELS, 8);
         assert_eq!(
             [
                 OBC_VALUE_BOOL,

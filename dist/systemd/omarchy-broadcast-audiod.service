@@ -1,0 +1,66 @@
+# The Omarchy Broadcast audio worker as a systemd user service. It hosts the
+# audio modules (microphone noise removal, room echo removal) and processes
+# the blocks the mic host's forwarding plugin sends it over shared memory. It
+# is a unit of its own, not part of omarchy-broadcastd: restarting or
+# stopping the daemon does not stop it, and a crash in a module, a vendor
+# library or the GPU affects neither the daemon nor the microphone, which
+# falls back to the unprocessed audio until the worker is back.
+#
+# It is started on demand, by a connection to omarchy-broadcast-audiod.socket
+# or by a call to its D-Bus name (br.com.dias.OmarchyBroadcast.AudioWorker, an
+# internal interface used by omarchy-broadcastd), and exits by itself after
+# the microphone has been idle for a while. Installed as an inactive unit:
+# there is no [Install] section and nothing to enable. Install: the Arch
+# package (packaging/arch) installs it to /usr/lib/systemd/user/, and
+# `scripts/install-user.sh --audio` installs a copy whose ExecStart= names
+# the binary it installed.
+#
+# Logs: `journalctl --user -u omarchy-broadcast-audiod`.
+
+[Unit]
+Description=Omarchy Broadcast audio worker
+After=pipewire.service pipewire-session-manager.service
+# The worker watches and pins PipeWire nodes, and is useless without the
+# server: it is stopped with PipeWire and started again on the next
+# connection.
+BindsTo=pipewire.service
+# The socket is started with the worker, also when D-Bus activation starts it
+# first, so that the plugin finds it listening.
+Requires=omarchy-broadcast-audiod.socket
+After=omarchy-broadcast-audiod.socket
+# The start limit that ends a crash loop, as for the daemon: after 5 starts
+# within 60 s systemd stops restarting the unit, and the socket fails with it
+# (service-start-limit-hit), so the microphone stays unprocessed. To recover,
+# clear both and start the socket again (or restart the mic host, which
+# starts it):
+#   systemctl --user reset-failed omarchy-broadcast-audiod.service omarchy-broadcast-audiod.socket
+#   systemctl --user start omarchy-broadcast-audiod.socket
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+# Type=simple, not dbus: the worker releases its bus name while it confirms an
+# idle exit and may then decide to stay (the microphone came back), and with
+# Type=dbus systemd would stop it at that moment; a slow module probe or a
+# missing session bus would also time the start out. It is ready when it is
+# running. BusName= is kept so that the D-Bus activation file's
+# SystemdService= still finds this unit.
+Type=simple
+BusName=br.com.dias.OmarchyBroadcast.AudioWorker
+ExecStart=/usr/bin/omarchy-broadcast-audiod
+# A crash or kill restarts it; the clean exit after an idle period does not
+# (the socket starts it again when audio flows).
+Restart=on-failure
+RestartSec=250ms
+TimeoutStartSec=30
+# Hardening as in the mic host's unit, except MemoryDenyWriteExecute: an
+# audio module may load a GPU runtime (CUDA, TensorRT) that compiles code at
+# run time and needs memory that is writable and executable, and that flag
+# would stop it. The worker is also the only process that loads a module, so
+# this is where that freedom is confined.
+LockPersonality=yes
+NoNewPrivileges=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+Slice=session.slice

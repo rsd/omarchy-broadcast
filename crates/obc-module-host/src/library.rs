@@ -12,7 +12,9 @@
 //!    callback routes the module's lines to a [`LogSink`];
 //! 3. checks the vtable it returns: at least as large as the vtable of ABI
 //!    1.0 (an entry past its `struct_size` is taken as null), of the same
-//!    major version, with every required entry set.
+//!    major version, with every required entry set. The audio entries of
+//!    ABI 1.2 ([`Library::has_audio`]) are required of an `audio-filter`
+//!    module only, which [`crate::Module::open_for`] checks.
 //!
 //! The [`Library`] is shared ([`Arc`]) by every module object and instance
 //! made from it, and closed when the last one goes. One path is opened
@@ -189,6 +191,21 @@ const _: () = assert!(
         >()
         == VTABLE_SIZE_1_0
 );
+
+/// The size of the vtable of ABI 1.2, which appends the audio entries
+/// (`audio_instance_load`, `audio_instance_process`) to the 1.0 vtable
+/// (1.1 added no entry).
+pub const VTABLE_SIZE_1_2: usize = VTABLE_SIZE_1_0 + 2 * size_of::<usize>();
+
+// `audio_instance_process` is the last entry of ABI 1.2.
+const _: () = assert!(
+    std::mem::offset_of!(obc_module_vtable, audio_instance_load) == VTABLE_SIZE_1_0
+        && std::mem::offset_of!(obc_module_vtable, audio_instance_process) + size_of::<usize>()
+            == VTABLE_SIZE_1_2
+);
+
+/// The first minor version of ABI 1 with audio.
+pub const AUDIO_MINOR: u16 = 2;
 
 /// A loaded, checked module library.
 pub struct Library {
@@ -402,6 +419,47 @@ impl Library {
     pub fn abi_version(&self) -> u32 {
         self.abi_version
     }
+
+    /// Whether the vtable has both audio entries of ABI 1.2: what an
+    /// `audio-filter` module needs. A library of ABI 1.0 or 1.1 never has
+    /// them (its vtable ends before them).
+    pub fn has_audio(&self) -> bool {
+        self.vtable.audio_instance_load.is_some() && self.vtable.audio_instance_process.is_some()
+    }
+
+    /// Why this library cannot be an `audio-filter` module, or `None` when
+    /// it can: an ABI version before 1.2, or a vtable without the audio
+    /// entries.
+    pub fn audio_refusal(&self) -> Option<String> {
+        if obc_module_abi_minor(self.abi_version) < AUDIO_MINOR {
+            return Some(format!(
+                "The library is built for module ABI {}; an audio-filter module needs module ABI \
+                 1.{AUDIO_MINOR} or later",
+                version_text(self.abi_version)
+            ));
+        }
+        if self.has_audio() {
+            return None;
+        }
+        let missing: Vec<&str> = [
+            (
+                "audio_instance_load",
+                self.vtable.audio_instance_load.is_some(),
+            ),
+            (
+                "audio_instance_process",
+                self.vtable.audio_instance_process.is_some(),
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, set)| !set)
+        .map(|(name, _)| name)
+        .collect();
+        Some(format!(
+            "The module's vtable lacks the entries an audio-filter module needs: {}",
+            missing.join(", ")
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -414,16 +472,17 @@ mod tests {
         assert_eq!(check_abi_version(OBC_MODULE_ABI_VERSION), Ok(()));
         let e = check_abi_version(obc_module_abi_pack(2, 0)).unwrap_err();
         assert!(
-            e.contains("module ABI 2.0") && e.contains("module ABI 1.1"),
+            e.contains("module ABI 2.0") && e.contains("module ABI 1.2"),
             "{e}"
         );
         let e = check_abi_version(obc_module_abi_pack(0, 9)).unwrap_err();
         assert!(e.contains("0.9"), "{e}");
         let e = check_abi_version(obc_module_abi_pack(1, 7)).unwrap_err();
-        assert!(e.contains("1.7, newer than") && e.contains("1.1"), "{e}");
-        // A library built for ABI 1.0 or 1.1 loads.
+        assert!(e.contains("1.7, newer than") && e.contains("1.2"), "{e}");
+        // A library built for ABI 1.0, 1.1 or 1.2 loads.
         assert_eq!(check_abi_version(obc_module_abi_pack(1, 0)), Ok(()));
         assert_eq!(check_abi_version(obc_module_abi_pack(1, 1)), Ok(()));
+        assert_eq!(check_abi_version(obc_module_abi_pack(1, 2)), Ok(()));
     }
 
     #[test]
@@ -433,10 +492,12 @@ mod tests {
             frame_flags_of(obc_module_abi_pack(1, 0)),
             OBC_FRAME_FLAG_NEW_SOURCE
         );
-        assert_eq!(
-            frame_flags_of(obc_module_abi_pack(1, 1)),
-            OBC_FRAME_FLAG_NEW_SOURCE | OBC_FRAME_FLAG_REPEAT
-        );
+        for minor in [1, 2] {
+            assert_eq!(
+                frame_flags_of(obc_module_abi_pack(1, minor)),
+                OBC_FRAME_FLAG_NEW_SOURCE | OBC_FRAME_FLAG_REPEAT
+            );
+        }
     }
 
     #[test]
@@ -461,6 +522,23 @@ mod tests {
         // SAFETY: `short` bytes are readable.
         let read = unsafe { read_vtable(&vt, short) };
         assert!(read.destroy.is_none() && read.check.is_none());
+        // A 1.0 vtable never has the audio entries of 1.2, whatever lies
+        // past its end.
+        unsafe extern "C" fn load(
+            _: *mut obc_module_abi::obc_instance,
+            _: *const obc_module_abi::obc_audio_request,
+            _: *mut obc_module_abi::obc_audio_load_report,
+        ) -> obc_module_abi::obc_status {
+            0
+        }
+        vt.audio_instance_load = Some(load);
+        // SAFETY: the whole vtable is readable.
+        let read = unsafe { read_vtable(&vt, VTABLE_SIZE_1_0) };
+        assert!(read.audio_instance_load.is_none());
+        // SAFETY: as above.
+        let read = unsafe { read_vtable(&vt, VTABLE_SIZE_1_2) };
+        assert!(read.audio_instance_load.is_some());
+        assert_eq!(VTABLE_SIZE_1_2, size_of::<obc_module_vtable>());
     }
 
     #[test]

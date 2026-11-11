@@ -22,6 +22,9 @@
 //! serial when the active camera changes, so another camera is a new set
 //! too. After an outage, the set follows the fresh snapshot.
 //!
+//! The microphone's fields (revision 13) are in the snapshot (`mic`), and
+//! a change of them prints a `mic` line (or, for a person, a `mic:` line).
+//!
 //! Also with `--json`: a `modules_changed` line when `ModulesSerial` moves
 //! (revision 9), and a `config_changed` line for each `ConfigChanged`
 //! signal (revision 10), so a client reads the module list or the
@@ -71,6 +74,9 @@ impl Printer {
             }
             if let (true, Some(c)) = (changes.controls, &s.camera_controls) {
                 out::line(&json::controls_line(c));
+            }
+            if let (true, Some(m)) = (changes.mic, &s.mic) {
+                out::line(&json::mic_line(m));
             }
         } else {
             for line in human::change_lines(s, changes) {

@@ -1,0 +1,15 @@
+[package]
+name = "obc-audio"
+description = "Shared-memory audio transport between the Omarchy Broadcast Mic plugin and the audio worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# memfd, eventfd, SOCK_SEQPACKET and SCM_RIGHTS: thin syscall wrappers only.
+libc = "0.2.191"
+
+[lints]
+workspace = true
