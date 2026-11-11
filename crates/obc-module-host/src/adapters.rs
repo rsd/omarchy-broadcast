@@ -585,7 +585,11 @@ impl Enhancer for ModuleEnhancer {
             chroma_siting: chroma_siting(req.chroma),
             full_range: req.colour.full_range,
             cuda: cuda(gpu),
-            params: Vec::new(),
+            params: req
+                .params
+                .iter()
+                .map(|(k, v)| (StageId::ENHANCE, k.clone(), v.clone()))
+                .collect(),
             background: None,
         };
         self.instance

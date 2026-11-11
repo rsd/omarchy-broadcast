@@ -98,7 +98,28 @@ fn the_library_loads_without_the_sdk_and_describes_its_settings() {
         .iter()
         .map(|g| (g.id.as_str(), g.label.as_str(), g.settings.len()))
         .collect();
-    assert_eq!(groups, [("video", "Video", 2), ("lighting", "Lighting", 4)]);
+    assert_eq!(
+        groups,
+        [
+            ("cutout", "Cut-out", 1),
+            ("video", "Video", 3),
+            ("lighting", "Lighting", 4)
+        ]
+    );
+    // The parameters of the daemon's two stages, which the host accepts
+    // as any stage's.
+    let method = settings.param("enhance", "method").unwrap();
+    assert_eq!(method.id, "effect.video.enhance_method");
+    assert!(
+        matches!(method.kind, SettingType::Enum { .. }),
+        "{method:?}"
+    );
+    let chair = settings.param("background", "chair").unwrap();
+    assert_eq!(chair.id, "effect.cutout.chair");
+    assert!(
+        matches!(chair.kind, SettingType::Bool { default: false }),
+        "{chair:?}"
+    );
     assert_eq!(
         settings.enable_of("denoise").unwrap().id,
         "effect.video.denoise"

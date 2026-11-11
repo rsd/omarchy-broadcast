@@ -175,6 +175,13 @@ pub struct EffectRun {
     pub chains: Vec<ChainRun>,
     /// The ingest is built with the enhance stage (per camera).
     pub enhance: bool,
+    /// The load-time parameters of the `background` stage, from its
+    /// module's settings (the effect itself is [`Self::mode`]): for
+    /// example whether a chair is cut out with the background.
+    pub background_params: Params,
+    /// The load-time parameters of the ingest's enhance stage (per camera,
+    /// with [`Self::enhance`]; empty without it).
+    pub enhance_params: Params,
 }
 
 impl EffectRun {

@@ -384,6 +384,7 @@ fn maxine_module_enhance_upscales_through_the_abi() {
             layout: YuvLayout::Nv12,
             colour: ColourSpec::LIMITED_BT601,
             chroma: ChromaSiting::Cosited,
+            params: Default::default(),
         };
         e.load(gpu, &req)
             .unwrap_or_else(|err| panic!("enhance load failed: {err}"));

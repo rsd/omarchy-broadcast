@@ -14,7 +14,7 @@ use obc_pipeline::controls::{
     CTRL_FLAG_INACTIVE, CTRL_TYPE_BOOLEAN, CTRL_TYPE_BUTTON, CTRL_TYPE_INTEGER, CTRL_TYPE_MENU,
     CtrlInfo, DeviceControl, image_control_id,
 };
-use obc_pipeline::effect::{Availability, StageId};
+use obc_pipeline::effect::{Availability, Params, StageId};
 use obc_pipeline::xu::{FIELD_OF_VIEW, XuRow, XuState};
 
 use super::park::{ParkOps, Parker, StartError, StopFailure, StopSession};
@@ -181,6 +181,9 @@ pub struct World {
     /// Whether each ingest was built with the enhance stage, in the same
     /// order as `ingests`.
     pub ingest_enhance: Vec<bool>,
+    /// The enhance stage's load-time parameters each ingest was built with,
+    /// in the same order as `ingests`.
+    pub ingest_enhance_params: Vec<Params>,
     /// An ingest built with the enhance stage reports it failed with this
     /// (the stage passing the frames through, as the element does).
     pub enhance_fail: Option<String>,
@@ -261,6 +264,9 @@ pub struct World {
     /// The fake Maxine module is installed (the default): its manifest and
     /// settings are the real module's, its probe [`World::features`].
     pub maxine: bool,
+    /// The settings the fake Maxine module describes in place of
+    /// [`maxine_settings`](crate::modules::testing::maxine_settings).
+    pub maxine_settings: Option<obc_module_host::SettingsDescription>,
     /// More modules, each with what opening it gives.
     pub modules: Vec<(ModuleEntry, Result<OpenedModule, String>)>,
     /// The modules of the directories are discovered and opened for real
@@ -394,6 +400,7 @@ impl Default for World {
             ingest_modes: Vec::new(),
             ingest_fixed_framerate: Vec::new(),
             ingest_enhance: Vec::new(),
+            ingest_enhance_params: Vec::new(),
             enhance_fail: None,
             enhance_status: EffectStatus::Off,
             fail_start: None,
@@ -432,6 +439,7 @@ impl Default for World {
             effect_sets: Vec::new(),
             stage_status: std::collections::BTreeMap::new(),
             maxine: true,
+            maxine_settings: None,
             modules: Vec::new(),
             real_modules: false,
             module_opens: Vec::new(),
@@ -902,6 +910,8 @@ impl MediaBackend for FakeBackend {
         let mut w = self.world();
         w.ingest_fixed_framerate.push(params.fixed_framerate);
         w.ingest_enhance.push(params.effect.enhance);
+        w.ingest_enhance_params
+            .push(params.effect.enhance_params.clone());
         w.ingest_modes.push(camera.mode);
         let res = Self::start_ingest(&mut w, camera);
         w.enhance_status = match (&res, params.effect.enhance, &w.enhance_fail) {
@@ -1032,7 +1042,10 @@ impl MediaBackend for FakeBackend {
             return Ok(OpenedModule {
                 module: None,
                 stages: w.maxine_probe(cc),
-                settings: crate::modules::testing::maxine_settings(),
+                settings: w
+                    .maxine_settings
+                    .clone()
+                    .unwrap_or_else(crate::modules::testing::maxine_settings),
             });
         }
         if let Some((_, opened)) = w.modules.iter().find(|(e, _)| e.id == entry.id) {

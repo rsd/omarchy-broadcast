@@ -347,9 +347,10 @@ impl Plan {
             .map(|c| c.module.id.as_str())
     }
 
-    /// The settings of the module that runs `stage` in this plan.
+    /// The settings of the module that runs `stage` in this plan
+    /// (`background` included: the effect module's).
     pub fn settings_of(&self, stage: &StageId) -> Option<&SettingsDescription> {
-        if self.effect_stages.contains(stage) {
+        if *stage == StageId::BACKGROUND || self.effect_stages.contains(stage) {
             return self.effect.as_ref().map(|p| &p.settings);
         }
         if *stage == StageId::ENHANCE {
@@ -1225,8 +1226,9 @@ pub mod testing {
     /// The Maxine module's manifest, as installed.
     pub const MAXINE_MANIFEST: &str = include_str!("../../obc-module-maxine/maxine-vfx.toml");
 
-    /// The settings the Maxine module describes (its tests pin the same
-    /// document).
+    /// A subset of the settings the Maxine module describes: the stage
+    /// switches and a few of their parameters, enough for the tests that
+    /// use it. The full parameter document is `MAXINE_PARAM_SETTINGS`.
     pub const MAXINE_SETTINGS: &str = r#"{"groups":[
         {"id":"video","label":"Video","settings":[
             {"id":"effect.video.denoise","label":"Noise removal","type":"bool","default":false,
@@ -1252,6 +1254,38 @@ pub mod testing {
              "enabled_when":[["effect.lighting.relight","eq",true]],
              "disabled_reason":"Turn on relighting to change this","hint":"slider"}]}
     ]}"#;
+
+    /// The Maxine module's cut-out group (the background stage's chair)
+    /// and video group with the enhance stage's method, as the module
+    /// describes them (its tests pin the same groups), without its lighting
+    /// group: for the tests of these two parameters, which
+    /// [`MAXINE_SETTINGS`] does not have.
+    pub const MAXINE_PARAM_SETTINGS: &str = r#"{"groups":[
+        {"id":"cutout","label":"Cut-out","settings":[
+            {"id":"effect.cutout.chair","label":"Hide the chair with the background",
+             "type":"bool","default":false,"stage":"background","key":"chair",
+             "apply":"reload","enabled_when":[["effect.background.mode","ne","none"]],
+             "disabled_reason":"Turn on the background effect to change this",
+             "hint":"switch"}]},
+        {"id":"video","label":"Video","settings":[
+            {"id":"effect.video.denoise","label":"Noise removal","type":"bool","default":false,
+             "stage":"denoise","role":"enable","hint":"switch"},
+            {"id":"effect.video.enhance","label":"Enhance low-resolution camera","type":"bool",
+             "default":false,"stage":"enhance","role":"enable","hint":"switch"},
+            {"id":"effect.video.enhance_method","label":"Enhancement method","type":"enum",
+             "options":[["ai","AI super resolution"],["fast","Fast upscale (lower power)"]],
+             "default":"ai","stage":"enhance","key":"method","apply":"reload",
+             "enabled_when":[["effect.video.enhance","eq",true]],
+             "disabled_reason":"Turn on enhancement to change this","hint":"segmented"}]}
+    ]}"#;
+
+    /// The settings of [`MAXINE_PARAM_SETTINGS`].
+    pub fn maxine_param_settings() -> SettingsDescription {
+        settings(
+            MAXINE_PARAM_SETTINGS,
+            &["enhance", "denoise", "background", "relight"],
+        )
+    }
 
     /// An entry of `manifest`, as discovered at `path`.
     pub fn entry(manifest: &str, path: &str) -> ModuleEntry {

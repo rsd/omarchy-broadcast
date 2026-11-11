@@ -369,6 +369,7 @@ impl Args {
                     ..relight
                 },
             ],
+            background_params: Default::default(),
         }
     }
 

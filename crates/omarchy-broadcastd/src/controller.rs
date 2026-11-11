@@ -301,7 +301,7 @@ use obc_pipeline::controls::{
 use obc_pipeline::ctrl_events::{
     CTRL_CHANGE_FLAGS, CTRL_CHANGE_RANGE, CTRL_CHANGE_VALUE, CtrlEvent,
 };
-use obc_pipeline::effect::StageId;
+use obc_pipeline::effect::{Params, StageId};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::backend::{
@@ -1208,6 +1208,8 @@ struct Streaming {
     pinned: bool,
     /// That ingest was built with the enhance stage.
     enhance: bool,
+    /// With these load-time parameters of the stage.
+    enhance_params: Params,
     /// The output contract the session output started with: the last
     /// good one once a camera frame has reached it
     /// ([`Controller::output_proven`]).
@@ -2250,6 +2252,11 @@ impl<B: MediaBackend> Controller<B> {
                 &self.runtime,
             )),
             enhance: false,
+            background_params: self
+                .modules
+                .stage_run(plan, &self.config, &self.runtime, &StageId::BACKGROUND)
+                .params,
+            enhance_params: Params::new(),
         }
     }
 
@@ -2899,14 +2906,29 @@ impl<B: MediaBackend> Controller<B> {
     /// The session params for an ingest on `camera`: `fixed_framerate`
     /// only when its next open pins the frame rate
     /// ([`Self::fixed_framerate_for`]), the enhance stage only when it is
-    /// requested for that camera ([`Self::enhance_for`]).
+    /// requested for that camera ([`Self::enhance_for`]), with its
+    /// parameters ([`Self::enhance_params_for`]).
     fn session_params_for(&self, camera: &Camera) -> SessionParams {
         let mut params = SessionParams {
             fixed_framerate: self.fixed_framerate_for(&camera.id),
             ..self.session_params()
         };
         params.effect.enhance = self.enhance_for(camera);
+        params.effect.enhance_params = self.enhance_params_for(camera);
         params
+    }
+
+    /// The load-time parameters of the enhance stage of an ingest on
+    /// `camera`, from its module's settings in force: none when the ingest
+    /// has no enhance stage ([`Self::enhance_for`]).
+    fn enhance_params_for(&self, camera: &Camera) -> Params {
+        if !self.enhance_for(camera) {
+            return Params::new();
+        }
+        let plan = self.current_plan();
+        self.modules
+            .stage_run(&plan, &self.config, &self.runtime, &StageId::ENHANCE)
+            .params
     }
 
     /// The config asks for another output contract or loopback device than
@@ -3775,6 +3797,7 @@ impl<B: MediaBackend> Controller<B> {
                 s.open = false;
                 s.pinned = params.fixed_framerate;
                 s.enhance = params.effect.enhance;
+                s.enhance_params = params.effect.enhance_params.clone();
             }
             self.mark_running(&params.effect);
             match self.backend.switch_camera(&params, cam) {
@@ -3917,6 +3940,7 @@ impl<B: MediaBackend> Controller<B> {
             open: false,
             pinned: false,
             enhance: false,
+            enhance_params: Params::new(),
             contract: params.contract,
         });
         // `starting` is announced before the (slow) start; the settings it
@@ -4614,6 +4638,7 @@ impl<B: MediaBackend> Controller<B> {
                 s.open = false;
                 s.pinned = params.fixed_framerate;
                 s.enhance = params.effect.enhance;
+                s.enhance_params = params.effect.enhance_params.clone();
             }
             info!("switching to {}", cam.label());
             self.mark_running(&params.effect);
@@ -4825,8 +4850,10 @@ impl<B: MediaBackend> Controller<B> {
             Binding::Param(_, obc_module_host::settings::Apply::Live) => {
                 self.frame_params_changed(changed, now)
             }
-            Binding::Param(_, obc_module_host::settings::Apply::Reload) => {
-                self.effect_changed(changed, now)
+            // The enhance stage's are the ingest's: its camera reopens with
+            // them ([`Self::follow_enhance`]), as for its switch.
+            Binding::Param(stage, obc_module_host::settings::Apply::Reload) => {
+                self.effect_changed_with(changed, *stage == StageId::ENHANCE, now)
             }
             _ => {
                 let res = if changed { self.save_state() } else { Ok(()) };
@@ -5310,6 +5337,7 @@ impl<B: MediaBackend> Controller<B> {
             s.open = false;
             s.pinned = params.fixed_framerate;
             s.enhance = params.effect.enhance;
+            s.enhance_params = params.effect.enhance_params.clone();
         }
         self.mark_running(&params.effect);
         match self.backend.switch_camera(&params, cam) {
@@ -5326,8 +5354,9 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     /// Reopens the session's open camera when whether its ingest should
-    /// have the enhance stage ([`Self::enhance_for`]) differs from what it
-    /// was built with, or, with `retry`, when it should have it (a failed
+    /// have the enhance stage ([`Self::enhance_for`]), or the stage's
+    /// parameters ([`Self::enhance_params_for`]), differ from what it was
+    /// built with, or, with `retry`, when it should have it (a failed
     /// stage tried again). Nothing without a session or an open camera:
     /// it applies at the next open.
     fn follow_enhance(&mut self, retry: bool, now: Instant) -> Result<(), IpcError> {
@@ -5337,19 +5366,20 @@ impl<B: MediaBackend> Controller<B> {
         if !s.open {
             return Ok(());
         }
-        let has = s.enhance;
+        let has = (s.enhance, s.enhance_params.clone());
         let Some(cam) = self.session_camera().cloned() else {
             return Ok(());
         };
-        let want = self.enhance_for(&cam);
-        if want == has && !(retry && want) {
+        let want = (self.enhance_for(&cam), self.enhance_params_for(&cam));
+        if want == has && !(retry && want.0) {
             return Ok(());
         }
-        info!(
-            "enhance {}: reopening {}",
-            if want { "on" } else { "off" },
-            cam.label()
-        );
+        let what = match (want.0, has.0) {
+            (true, true) => "settings changed",
+            (true, false) => "on",
+            (false, _) => "off",
+        };
+        info!("enhance {what}: reopening {}", cam.label());
         self.reopen_camera(&cam, now)
     }
 

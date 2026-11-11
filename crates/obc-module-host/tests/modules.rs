@@ -852,6 +852,9 @@ fn the_backend_factory_carries_the_effect_through_the_abi() {
     };
     req.params
         .extend(params("gamma", &[("ignored", Value::Bool(true))]));
+    // The background stage's own parameters go with its effect.
+    req.params
+        .extend(params("background", &[("chair", Value::Bool(true))]));
     let report = backend.load(&gpu, &req).unwrap();
     assert_eq!(report.load_ms, 1.5);
     assert_eq!(report.warmup_ms, Some(0.5));
@@ -869,7 +872,7 @@ fn the_backend_factory_carries_the_effect_through_the_abi() {
         "{line}"
     );
     assert!(
-        line.contains("params=alpha.step=3;background.mode=replace"),
+        line.contains("params=alpha.step=3;background.chair=true;background.mode=replace"),
         "{line}"
     );
     assert!(line.contains("bg=host:bgr:4x2:1:cuda=no:7"), "{line}");
@@ -954,6 +957,7 @@ fn the_enhancer_factory_carries_the_enhance_stage_through_the_abi() {
         layout: YuvLayout::I420,
         colour: ColourSpec::LIMITED_BT601,
         chroma: ChromaSiting::Interstitial,
+        params: Params::new(),
     };
     e.load(&gpu, &req).unwrap();
     let line = last_line(&lines, "fixture-load");
@@ -962,6 +966,16 @@ fn the_enhancer_factory_carries_the_enhance_stage_through_the_abi() {
         "{line}"
     );
     assert!(line.contains("siting=Jpeg full=false"), "{line}");
+    assert!(line.contains("params= "), "none asked for: {line}");
+    // The stage's load-time parameters reach the module as the enhance
+    // stage's.
+    let fast = EnhanceRequest {
+        params: [("method".to_string(), Value::Str("fast".into()))].into(),
+        ..req.clone()
+    };
+    e.load(&gpu, &fast).unwrap();
+    let line = last_line(&lines, "fixture-load");
+    assert!(line.contains("params=enhance.method=fast "), "{line}");
     let src = DeviceYuv420 {
         layout: YuvLayout::I420,
         y: 0x1000,

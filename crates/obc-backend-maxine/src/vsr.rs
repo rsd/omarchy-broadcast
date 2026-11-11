@@ -1,25 +1,31 @@
-//! The enhance stage on Maxine: the `VideoSuperRes` effect (video super
-//! resolution) behind [`obc_backend::enhance`].
+//! The enhance stage on Maxine behind [`obc_backend::enhance`], by one of
+//! two methods ([`EnhanceMethod`]): the `VideoSuperRes` effect (AI video
+//! super resolution, the default) or the `Upscale` effect (a lightweight,
+//! non-AI upscaler with sharpening, for a lower GPU load).
 //!
 //! Per frame, all on the GPU and on the caller's stream, with no host copy:
 //!
 //! 1. the 4:2:0 input (NV12 or I420) to RGBA at the capture size
 //!    (`NvCVImage_TransferFromYUV`, matrix, range and chroma siting from the
 //!    request);
-//! 2. `VideoSuperRes` at the fixed quality level [`QUALITY_HIGH`], from that
-//!    image into an RGBA image `scale` times as wide and as high;
+//! 2. the method's effect, from that image into an RGBA image `scale` times
+//!    as wide and as high: `VideoSuperRes` at the fixed quality level
+//!    [`QUALITY_HIGH`], or `Upscale` at the SDK's default strength;
 //! 3. RGBA to NV12 into the destination (`NvCVImage_TransferToYUV`), with
 //!    the same matrix, range and chroma siting.
 //!
-//! The effect ships no model files and takes no model directory: the
-//! feature library is the whole feature
-//! ([`Feature::VideoSuperResolution`](crate::Feature)). The SDK is
-//! found and opened exactly as for the effects ([`MaxineFactory`]): one SDK
-//! per process, loaded from the same root.
+//! Neither effect ships model files or takes a model directory: the feature
+//! library is the whole feature ([`Feature::VideoSuperResolution`],
+//! [`Feature::Upscale`]). The SDK is found and opened exactly as for the
+//! effects ([`MaxineFactory`]): one SDK per process, loaded from the same
+//! root. A method whose feature is not installed fails its load, naming the
+//! feature library.
 
 use std::cell::Cell;
 use std::ffi::{CStr, c_void};
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
@@ -32,12 +38,14 @@ use obc_gpu::{CuStream, Event};
 
 use crate::ffi::{self, NvCvImage, NvCvStatus, Sdk};
 use crate::{
-    Effect, FAULT_SELECTOR, GpuImage, MaxineBackend, MaxineFactory, colour_flags, ms_since, record,
-    sync,
+    Effect, FAULT_SELECTOR, Feature, GpuImage, MaxineBackend, MaxineFactory, colour_flags,
+    feature_dir, ms_since, record, sync,
 };
 
-/// The effect selector.
+/// The effect selector of the AI method.
 const FX_VIDEO_SUPER_RES: &CStr = c"VideoSuperRes";
+/// The effect selector of the fast method.
+const FX_UPSCALE: &CStr = c"Upscale";
 /// The quality level parameter (`unsigned int`).
 const P_QUALITY_LEVEL: &CStr = c"QualityLevel";
 /// The image encoding parameter (`unsigned int`), set before `NvVFX_Load`.
@@ -48,8 +56,91 @@ pub const QUALITY_HIGH: u32 = 3;
 const ENCODING_RGB8: u32 = 0;
 /// `NvCVImage_PixelFormat` RGBA.
 const NVCV_RGBA: i32 = 6;
-/// The feature library, for error messages.
-const LIBRARY: &str = "libnvVFXVideoSuperRes.so";
+/// The load-time parameter of the `enhance` stage with its method: a
+/// string, `ai` or `fast` ([`EnhanceMethod`]; default `ai`).
+pub const ENHANCE_METHOD: &str = "method";
+
+/// How the enhance stage upscales.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum EnhanceMethod {
+    /// AI video super resolution (the `VideoSuperRes` effect).
+    #[default]
+    Ai,
+    /// The lightweight, non-AI `Upscale` effect, with its default
+    /// sharpening: a lower GPU load for a less detailed picture.
+    Fast,
+}
+
+impl EnhanceMethod {
+    /// Every method, in declaration order.
+    pub const ALL: [EnhanceMethod; 2] = [EnhanceMethod::Ai, EnhanceMethod::Fast];
+
+    /// The parameter value of the method: `ai` or `fast`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EnhanceMethod::Ai => "ai",
+            EnhanceMethod::Fast => "fast",
+        }
+    }
+
+    /// The SDK feature the method runs.
+    pub fn feature(self) -> Feature {
+        match self {
+            EnhanceMethod::Ai => Feature::VideoSuperResolution,
+            EnhanceMethod::Fast => Feature::Upscale,
+        }
+    }
+
+    /// The effect selector.
+    fn selector(self) -> &'static CStr {
+        match self {
+            EnhanceMethod::Ai => FX_VIDEO_SUPER_RES,
+            EnhanceMethod::Fast => FX_UPSCALE,
+        }
+    }
+
+    /// The effect's name in messages.
+    fn effect_name(self) -> &'static str {
+        match self {
+            EnhanceMethod::Ai => "VideoSuperRes",
+            EnhanceMethod::Fast => "Upscale",
+        }
+    }
+
+    /// The feature library, for error messages.
+    fn library(self) -> &'static str {
+        match self {
+            EnhanceMethod::Ai => "libnvVFXVideoSuperRes.so",
+            EnhanceMethod::Fast => "libnvVFXUpscale.so",
+        }
+    }
+
+    /// What the method is, for error messages.
+    fn description(self) -> &'static str {
+        match self {
+            EnhanceMethod::Ai => "the video super resolution feature",
+            EnhanceMethod::Fast => "the upscale feature",
+        }
+    }
+}
+
+impl fmt::Display for EnhanceMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for EnhanceMethod {
+    type Err = String;
+
+    /// `ai` or `fast`, exactly.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        EnhanceMethod::ALL
+            .into_iter()
+            .find(|m| m.as_str() == s)
+            .ok_or_else(|| format!("the enhance method must be ai or fast, not {s:?}"))
+    }
+}
 
 /// The NvCV colour-space flags of the request's frames: its matrix and range
 /// ([`colour_flags`], whose siting bits are MPEG-2's, all zero) with the
@@ -180,6 +271,7 @@ const EV_OUT: usize = 3;
 /// which holds both images, goes first.
 struct Loaded {
     effect: Effect,
+    method: EnhanceMethod,
     /// The converted input frame (capture size): the effect's source.
     src: GpuImage,
     /// The upscaled frame: the effect's destination.
@@ -227,37 +319,56 @@ impl MaxineVsr {
         self.loaded.is_some()
     }
 
-    /// A load error for `call` with the SDK's status `rc`, naming the feature
-    /// library when the SDK could not open it.
-    fn create_err(&self, rc: NvCvStatus) -> BackendError {
-        let mut message = format!(
-            "NvVFX_CreateEffect(VideoSuperRes) returned {rc} ({})",
-            self.sdk.error_string(rc)
-        );
-        if rc == ffi::NVCV_ERR_UNIMPLEMENTED {
-            message.push_str(&format!(
-                ": the SDK could not open the video super resolution feature ({LIBRARY}); \
-                 install it into the SDK root's features/nvvfxvideosuperres (docs/setup/maxine.md, \
-                 section 4)"
-            ));
-        }
-        BackendError::Load { code: rc, message }
+    /// The method of the loaded request.
+    pub fn loaded_method(&self) -> Option<EnhanceMethod> {
+        self.loaded.as_ref().map(|l| l.method)
     }
 
-    fn build(&self, req: &EnhanceRequest, stream: CuStream) -> Result<Loaded, BackendError> {
+    /// Loads `req` with `method`, as [`Enhancer::load`] (which loads
+    /// [`EnhanceMethod::Ai`]). On failure nothing is loaded.
+    pub fn load_with(
+        &mut self,
+        gpu: &GpuContext,
+        req: &EnhanceRequest,
+        method: EnhanceMethod,
+    ) -> Result<LoadReport, BackendError> {
+        MaxineBackend::check_context(gpu)?;
+        req.validate()?;
+        self.unload();
+        let t = Instant::now();
+        let loaded = self.build(req, gpu.stream, method)?;
+        // Surface an asynchronous fault of the load here, not on a frame.
+        sync(gpu.stream)?;
+        self.loaded = Some(loaded);
+        Ok(LoadReport {
+            load_ms: ms_since(t),
+            warmup_ms: None,
+            reused_model: false,
+        })
+    }
+
+    fn build(
+        &self,
+        req: &EnhanceRequest,
+        stream: CuStream,
+        method: EnhanceMethod,
+    ) -> Result<Loaded, BackendError> {
         let sdk = self.sdk;
         let dir = self.model_dir.as_path();
         let selector = match self.faults.get() {
             Some(EnhanceFault::Load) => FAULT_SELECTOR,
-            _ => FX_VIDEO_SUPER_RES,
+            _ => method.selector(),
         };
         let effect = Effect::create(sdk, selector, dir).map_err(|e| match e {
-            BackendError::Load { code, .. } => self.create_err(code),
+            BackendError::Load { code, .. } => create_err(sdk, method, code),
             other => other,
         })?;
         effect.set_stream(stream, dir)?;
-        effect.set_u32(P_QUALITY_LEVEL, QUALITY_HIGH, dir)?;
-        effect.set_u32(P_IMAGE_ENCODING_MODE, ENCODING_RGB8, dir)?;
+        if method == EnhanceMethod::Ai {
+            effect.set_u32(P_QUALITY_LEVEL, QUALITY_HIGH, dir)?;
+            effect.set_u32(P_IMAGE_ENCODING_MODE, ENCODING_RGB8, dir)?;
+        }
+        // The fast method keeps the SDK's default strength.
         let (ow, oh) = req.output_size();
         let mut src = GpuImage::alloc(sdk, req.width, req.height, NVCV_RGBA)?;
         let mut dst = GpuImage::alloc(sdk, ow, oh, NVCV_RGBA)?;
@@ -266,16 +377,43 @@ impl MaxineVsr {
         effect.load(dir)?;
         Ok(Loaded {
             effect,
+            method,
             src,
             dst,
             staging_in: Box::new(NvCvImage::empty()),
             staging_out: Box::new(NvCvImage::empty()),
-            req: *req,
+            req: req.clone(),
             stream,
             events: [Event::new()?, Event::new()?, Event::new()?, Event::new()?],
             recorded: false,
         })
     }
+}
+
+/// The load error of `method` for `NvVFX_CreateEffect`'s status `rc`,
+/// naming the feature library and its directory when the SDK could not
+/// open it.
+fn create_err(sdk: &Sdk, method: EnhanceMethod, rc: NvCvStatus) -> BackendError {
+    let mut message = format!(
+        "NvVFX_CreateEffect({}) returned {rc} ({})",
+        method.effect_name(),
+        sdk.error_string(rc)
+    );
+    if rc == ffi::NVCV_ERR_UNIMPLEMENTED {
+        message.push_str(&unimplemented_hint(method));
+    }
+    BackendError::Load { code: rc, message }
+}
+
+/// What to install when the SDK cannot open `method`'s feature library.
+fn unimplemented_hint(method: EnhanceMethod) -> String {
+    format!(
+        ": the SDK could not open {} ({}); install it into the SDK root's features/{} \
+         (docs/setup/maxine.md, section 4)",
+        method.description(),
+        method.library(),
+        feature_dir(method.feature())
+    )
 }
 
 /// Checks a frame against the loaded size.
@@ -294,20 +432,9 @@ impl Enhancer for MaxineVsr {
         "maxine-vsr"
     }
 
+    /// Loads `req` with [`EnhanceMethod::Ai`] ([`MaxineVsr::load_with`]).
     fn load(&mut self, gpu: &GpuContext, req: &EnhanceRequest) -> Result<LoadReport, BackendError> {
-        MaxineBackend::check_context(gpu)?;
-        req.validate()?;
-        self.unload();
-        let t = Instant::now();
-        let loaded = self.build(req, gpu.stream)?;
-        // Surface an asynchronous fault of the load here, not on a frame.
-        sync(gpu.stream)?;
-        self.loaded = Some(loaded);
-        Ok(LoadReport {
-            load_ms: ms_since(t),
-            warmup_ms: None,
-            reused_model: false,
-        })
+        self.load_with(gpu, req, EnhanceMethod::default())
     }
 
     fn process(
@@ -351,9 +478,10 @@ impl Enhancer for MaxineVsr {
             code: rc,
             message: format!("{call} returned {rc} ({})", sdk.error_string(rc)),
         };
+        let name = l.method.effect_name();
         if fault {
             return Err(run_err(
-                "NvVFX_Run(VideoSuperRes) [forced fault]",
+                &format!("NvVFX_Run({name}) [forced fault]"),
                 ffi::NVCV_ERR_GENERAL,
             ));
         }
@@ -390,7 +518,7 @@ impl Enhancer for MaxineVsr {
         record(&l.events[EV_IN], stream)?;
         let rc = l.effect.run(true);
         if rc != ffi::NVCV_SUCCESS {
-            return Err(run_err("NvVFX_Run(VideoSuperRes)", rc));
+            return Err(run_err(&format!("NvVFX_Run({name})"), rc));
         }
         record(&l.events[EV_UPSCALE], stream)?;
         // SAFETY: `dst` describes live NV12 device memory of the current
@@ -489,13 +617,14 @@ mod tests {
             layout: YuvLayout::I420,
             colour: ColourSpec::FULL_BT601,
             chroma: ChromaSiting::Interstitial,
+            params: obc_backend::Params::new(),
         };
         // jpegdec: full-range BT.601, centre-sited.
         assert_eq!(transfer_flags(&req), 0x04 | 0x08);
         let cosited = EnhanceRequest {
             chroma: ChromaSiting::Cosited,
             colour: ColourSpec::LIMITED_BT601,
-            ..req
+            ..req.clone()
         };
         assert_eq!(transfer_flags(&cosited), 0x00);
         let top_left = EnhanceRequest {
@@ -507,6 +636,36 @@ mod tests {
             ..req
         };
         assert_eq!(transfer_flags(&top_left), 0x01 | 0x10);
+    }
+
+    #[test]
+    fn the_methods_parse_exactly_and_name_their_feature() {
+        assert_eq!(EnhanceMethod::default(), EnhanceMethod::Ai);
+        for (s, m, f) in [
+            ("ai", EnhanceMethod::Ai, Feature::VideoSuperResolution),
+            ("fast", EnhanceMethod::Fast, Feature::Upscale),
+        ] {
+            assert_eq!(s.parse::<EnhanceMethod>().unwrap(), m);
+            assert_eq!(m.to_string(), s);
+            assert_eq!(m.feature(), f);
+        }
+        for bad in ["", "AI", "Fast", "upscale", "vsr"] {
+            let e = bad.parse::<EnhanceMethod>().unwrap_err();
+            assert!(e.contains("ai or fast"), "{bad}: {e}");
+        }
+        assert_eq!(EnhanceMethod::Ai.selector(), c"VideoSuperRes");
+        assert_eq!(EnhanceMethod::Fast.selector(), c"Upscale");
+    }
+
+    #[test]
+    fn a_missing_method_library_is_named_with_its_directory() {
+        let ai = unimplemented_hint(EnhanceMethod::Ai);
+        assert!(ai.contains("libnvVFXVideoSuperRes.so"), "{ai}");
+        assert!(ai.contains("features/nvvfxvideosuperres"), "{ai}");
+        let fast = unimplemented_hint(EnhanceMethod::Fast);
+        assert!(fast.contains("the upscale feature"), "{fast}");
+        assert!(fast.contains("libnvVFXUpscale.so"), "{fast}");
+        assert!(fast.contains("features/nvvfxupscale"), "{fast}");
     }
 
     #[test]

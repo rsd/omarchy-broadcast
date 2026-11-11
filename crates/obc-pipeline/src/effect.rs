@@ -100,6 +100,15 @@ pub fn check_settings_with(
             .check_params(&s.id, &s.params, &s.live)
             .map_err(PipelineError::Effect)?;
     }
+    if !settings.background_params.is_empty() {
+        factory
+            .check_params(
+                &StageId::BACKGROUND,
+                &settings.background_params,
+                &Params::new(),
+            )
+            .map_err(PipelineError::Effect)?;
+    }
     Ok(())
 }
 
@@ -231,6 +240,18 @@ mod tests {
         // Without a backend, and with another backend, its rules do not apply.
         assert!(check_settings(&bad).is_ok());
         assert!(check_settings_with(&bad, &Unavailable).is_ok());
+    }
+
+    #[test]
+    fn the_background_parameters_are_checked_with_the_backend() {
+        let mut s = EffectSettings::of(EffectKind::Blur);
+        s.background_params
+            .insert("direction".to_string(), Value::Int(200));
+        let e = check_settings_with(&s, &Strict).unwrap_err().to_string();
+        assert!(e.contains("background"), "{e}");
+        s.background_params
+            .insert("direction".to_string(), Value::Int(10));
+        assert!(check_settings_with(&s, &Strict).is_ok());
     }
 
     #[test]

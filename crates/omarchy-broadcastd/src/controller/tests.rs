@@ -6925,6 +6925,137 @@ fn enhance_toggled_while_streaming_reopens_the_camera_once_and_keeps_active() {
     assert_eq!(h.enhance_requests(), [false, true, false]);
 }
 
+/// The enhance method setting of the Maxine module.
+const ENHANCE_METHOD_ID: &str = "effect.video.enhance_method";
+/// The chair setting of the Maxine module.
+const CHAIR_ID: &str = "effect.cutout.chair";
+
+impl H {
+    /// The enhance stage's `method` each ingest was built with, in order
+    /// (`None`: none given).
+    fn enhance_methods(&self) -> Vec<Option<String>> {
+        self.world()
+            .ingest_enhance_params
+            .iter()
+            .map(|p| p.get("method").and_then(|v| v.as_str()).map(str::to_string))
+            .collect()
+    }
+}
+
+#[test]
+fn the_enhance_method_reaches_the_ingest_and_a_change_reopens_the_camera() {
+    let mut h = H::new("", |w| {
+        w.cameras = vec![small(alpha()), beta()];
+        w.maxine_settings = Some(crate::modules::testing::maxine_param_settings());
+    });
+    h.activate(0);
+    assert_eq!(h.enhance_methods(), [None], "no enhance stage: no method");
+    // Greyed while enhancement is off.
+    assert!(!h.setting(ENHANCE_METHOD_ID).enabled);
+    h.set_setting(ENHANCE_ID, SettingValue::Bool(true), 1000)
+        .unwrap();
+    assert_eq!(h.enhance_requests(), [false, true]);
+    assert_eq!(
+        h.enhance_methods(),
+        [None, Some("ai".into())],
+        "the default in force"
+    );
+    h.tick(1100);
+    assert_eq!(h.state(), State::Active);
+    h.signals();
+    // A new method reopens the camera once, with it: no new session.
+    h.set_setting(ENHANCE_METHOD_ID, s("fast"), 1200).unwrap();
+    assert_eq!(h.world().ingests, ["usb-a", "usb-a", "usb-a"]);
+    assert_eq!(h.enhance_requests(), [false, true, true]);
+    assert_eq!(
+        h.enhance_methods(),
+        [None, Some("ai".into()), Some("fast".into())]
+    );
+    assert_eq!(h.world().session_starts, 1);
+    assert_eq!(signal_ids(&h.signals()), [vec![ENHANCE_METHOD_ID]]);
+    h.tick(1300);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.snap().error, "");
+    // The same value again: nothing reopened.
+    h.set_setting(ENHANCE_METHOD_ID, s("fast"), 1400).unwrap();
+    assert_eq!(h.enhance_requests(), [false, true, true]);
+    // An effect method that does not touch it reopens nothing.
+    h.set_strength(0.3, 1500).unwrap();
+    assert_eq!(h.enhance_requests(), [false, true, true]);
+    // Off: reopened without the stage, and without its parameters.
+    h.set_setting(ENHANCE_ID, SettingValue::Bool(false), 1600)
+        .unwrap();
+    assert_eq!(h.enhance_requests(), [false, true, true, false]);
+    assert_eq!(h.enhance_methods().last(), Some(&None));
+    assert_eq!(h.state(), State::Active);
+}
+
+#[test]
+fn an_enhance_method_that_failed_is_tried_again_by_its_setting() {
+    let mut h = H::new("", |w| {
+        w.cameras = vec![small(alpha())];
+        w.maxine_settings = Some(crate::modules::testing::maxine_param_settings());
+        w.enhance_fail = Some(NO_VSR.into());
+    });
+    h.activate(0);
+    h.set_setting(ENHANCE_ID, SettingValue::Bool(true), 1000)
+        .unwrap();
+    h.tick(1100);
+    assert_eq!(h.snap().error, enhance_error(NO_VSR));
+    h.world().enhance_fail = None;
+    // Another method: the failure is cleared and the camera reopened with
+    // it, which now works.
+    h.set_setting(ENHANCE_METHOD_ID, s("fast"), 1200).unwrap();
+    assert_eq!(h.enhance_requests(), [false, true, true]);
+    assert_eq!(h.enhance_methods().last(), Some(&Some("fast".into())));
+    h.tick(1300);
+    assert_eq!(h.snap().error, "");
+    assert_eq!(h.state(), State::Active);
+}
+
+#[test]
+fn the_chair_reaches_the_background_stage_and_a_change_reloads_the_effect_only() {
+    let mut h = H::new("", |w| {
+        w.cameras = vec![small(alpha())];
+        w.maxine_settings = Some(crate::modules::testing::maxine_param_settings());
+    });
+    h.activate(0);
+    let chair = |e: &EffectRun| e.background_params.get("chair").cloned();
+    // Greyed while no background effect is selected.
+    assert!(!h.setting(CHAIR_ID).enabled);
+    h.set_effect("blur", 500).unwrap();
+    assert_eq!(h.last_effect().mode, EffectMode::Blur);
+    assert_eq!(
+        chair(&h.last_effect()),
+        Some(obc_pipeline::effect::Value::Bool(false)),
+        "the default in force"
+    );
+    h.tick(600);
+    h.signals();
+    let sets = h.world().effect_sets.len();
+    // On: one set_effect with it, the camera left open, no new session.
+    h.set_setting(CHAIR_ID, SettingValue::Bool(true), 1000)
+        .unwrap();
+    assert_eq!(h.world().effect_sets.len(), sets + 1);
+    let e = h.last_effect();
+    assert_eq!(e.mode, EffectMode::Blur);
+    assert_eq!(chair(&e), Some(obc_pipeline::effect::Value::Bool(true)));
+    assert_eq!(h.world().ingests, ["usb-a"], "no reopen");
+    assert_eq!(h.world().session_starts, 1);
+    assert_eq!(signal_ids(&h.signals()), [vec![CHAIR_ID]]);
+    h.tick(1100);
+    assert_eq!(h.state(), State::Active);
+    // The same value again: nothing given.
+    h.set_setting(CHAIR_ID, SettingValue::Bool(true), 1200)
+        .unwrap();
+    assert_eq!(h.world().effect_sets.len(), sets + 1);
+    // Kept for a later session.
+    assert_eq!(
+        h.ctrl.runtime.settings.get(CHAIR_ID),
+        Some(&StoredValue::Bool(true))
+    );
+}
+
 #[test]
 fn enhance_set_while_the_camera_is_closed_applies_at_the_next_open() {
     let mut h = H::new("", |w| w.cameras = vec![small(alpha())]);

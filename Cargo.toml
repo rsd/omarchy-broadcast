@@ -34,7 +34,7 @@ exclude = [
 
 [workspace.package]
 # Also the pkgver= of packaging/arch/PKGBUILD: bump both; CI checks they match.
-version = "0.31.0"
+version = "0.32.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Raul Dias"]

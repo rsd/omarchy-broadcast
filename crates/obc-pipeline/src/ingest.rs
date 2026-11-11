@@ -73,6 +73,7 @@ use std::sync::{Arc, Mutex};
 
 use gst::prelude::*;
 use gst_obc::{EffectStatus, EnhanceStats, ObcEnhance};
+use obc_backend::Params;
 use obc_backend::enhance::{EnhancerFactory, MAX_SCALE, MIN_SCALE};
 use obc_core::{AspectPolicy, OutputContract, VideoMode};
 
@@ -231,6 +232,9 @@ pub struct IngestConfig {
     /// The enhancer of the enhance stage; `None`: no enhance stage, whatever
     /// [`Self::enhance`] says.
     pub enhance_backend: Option<EnhanceBackend>,
+    /// The enhance stage's load-time parameters (the module's keys), which
+    /// the enhancer is loaded with; empty: its defaults.
+    pub enhance_params: Params,
 }
 
 impl IngestConfig {
@@ -244,6 +248,7 @@ impl IngestConfig {
             fixed_framerate: false,
             enhance: false,
             enhance_backend: None,
+            enhance_params: Params::new(),
         }
     }
 
@@ -329,11 +334,23 @@ fn tail_steps(memory: FrameMemory, aspect: AspectPolicy, enhance: bool) -> Vec<T
     steps
 }
 
-/// The enhance stage of an ingest being built: its factor and enhancer.
+/// The enhance stage of an ingest being built: its factor, enhancer and
+/// load-time parameters.
 #[derive(Debug, Clone)]
 struct EnhancePlan {
     scale: u32,
     backend: EnhanceBackend,
+    params: Params,
+}
+
+/// The `obcenhance` element of `plan`, named [`names::ENHANCE`].
+fn enhance_element(plan: &EnhancePlan) -> Result<gst::Element, PipelineError> {
+    gst_obc::enhance::register()
+        .map_err(|e| PipelineError::Cuda(format!("cannot register obcenhance: {e}")))?;
+    let e = ObcEnhance::new(Some(names::ENHANCE), plan.scale);
+    e.set_factory(Some(Arc::clone(plan.backend.factory())));
+    e.set_params(plan.params.clone());
+    Ok(e.upcast())
 }
 
 /// [`canonical_tail`] for canonical frames in `memory`, with the enhance
@@ -373,14 +390,7 @@ fn tail_in(
                 }
                 c
             }
-            TailStep::Enhance => {
-                let plan = enhance.expect("planned with an enhance stage");
-                gst_obc::enhance::register()
-                    .map_err(|e| PipelineError::Cuda(format!("cannot register obcenhance: {e}")))?;
-                let e = ObcEnhance::new(Some(ENHANCE), plan.scale);
-                e.set_factory(Some(Arc::clone(plan.backend.factory())));
-                e.upcast()
-            }
+            TailStep::Enhance => enhance_element(enhance.expect("planned with an enhance stage"))?,
             TailStep::Scale => {
                 let scaler = match memory {
                     FrameMemory::Cuda => "cudaconvertscale",
@@ -471,8 +481,12 @@ impl Ingest {
             &cfg.camera_io_mode,
             cfg.queue_buffers,
         )?;
-        let enhance = cfg.enhance.then(|| cfg.enhance_backend.clone()).flatten();
-        let mut ingest = Self::from_head_enhanced(
+        let enhance = cfg
+            .enhance
+            .then(|| cfg.enhance_backend.clone())
+            .flatten()
+            .map(|b| (b, cfg.enhance_params.clone()));
+        let mut ingest = Self::from_head_planned(
             head,
             path.upload_format(cfg.mode.format),
             (cfg.mode.width, cfg.mode.height),
@@ -513,10 +527,24 @@ impl Ingest {
         enhance: Option<EnhanceBackend>,
         writer: FrameWriter,
     ) -> Result<Self, PipelineError> {
+        let enhance = enhance.map(|b| (b, Params::new()));
+        Self::from_head_planned(head, upload_format, size, aspect, enhance, writer)
+    }
+
+    /// [`Self::from_head_enhanced`] with the enhance stage's load-time
+    /// parameters next to its enhancer.
+    fn from_head_planned(
+        head: Vec<gst::Element>,
+        upload_format: &str,
+        size: (u32, u32),
+        aspect: AspectPolicy,
+        enhance: Option<(EnhanceBackend, Params)>,
+        writer: FrameWriter,
+    ) -> Result<Self, PipelineError> {
         let source_id = writer.source_id();
         let memory = writer.memory();
         let canonical = writer.canonical();
-        let plan = enhance.and_then(|backend| {
+        let plan = enhance.and_then(|(backend, params)| {
             enhance_plan(
                 aspect,
                 upload_format,
@@ -524,7 +552,11 @@ impl Ingest {
                 (canonical.width, canonical.height),
             )
             .ok()
-            .map(|scale| EnhancePlan { scale, backend })
+            .map(|scale| EnhancePlan {
+                scale,
+                backend,
+                params,
+            })
         });
         let pipeline = gst::Pipeline::with_name(&format!("obc-ingest-{source_id}"));
         let (tail, crop) = tail_in(
@@ -1108,6 +1140,40 @@ mod tests {
             tail_steps(FrameMemory::System, AspectPolicy::Letterbox, true),
             vec![Scale, Canonical]
         );
+    }
+
+    /// The enhance element carries the factor and the stage's load-time
+    /// parameters of its plan. CPU only: the element is made, not run.
+    #[test]
+    fn the_enhance_element_carries_the_stage_parameters() {
+        gst::init().unwrap();
+        let params: Params = [("method".to_string(), obc_backend::Value::from("fast"))].into();
+        let plan = EnhancePlan {
+            scale: 3,
+            backend: maxine_vsr(),
+            params: params.clone(),
+        };
+        let e = enhance_element(&plan).unwrap();
+        assert_eq!(e.name(), names::ENHANCE);
+        let e = gst_obc::enhance::from_element(&e).unwrap();
+        assert_eq!(e.scale(), 3);
+        assert_eq!(e.params(), params);
+        let plain = enhance_element(&EnhancePlan {
+            params: Params::new(),
+            ..plan
+        })
+        .unwrap();
+        assert!(
+            gst_obc::enhance::from_element(&plain)
+                .unwrap()
+                .params()
+                .is_empty()
+        );
+        let cfg = IngestConfig::new(
+            "/dev/null-camera".into(),
+            "YUY2:960x540@30".parse().unwrap(),
+        );
+        assert!(cfg.enhance_params.is_empty(), "the defaults unless given");
     }
 
     /// A system-memory ingest refuses an applicable enhance stage, and
