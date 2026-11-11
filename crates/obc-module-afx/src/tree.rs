@@ -46,16 +46,32 @@ pub enum Effect {
     /// uses for the other effects; they are unverified until the feature
     /// is installed.
     SpeakerFocus,
+    /// Bandwidth extension (`superres`), 16 kHz in to 48 kHz out: restores
+    /// the high band of a narrowband (headset, 16 kHz) microphone. The
+    /// chain feeds it the 48 kHz input decimated to 16 kHz
+    /// ([`crate::decimate`]).
+    ///
+    /// The SDK's header names this effect only chained with others
+    /// (`denoiser16k_superres16kto48k` and the like). The feature
+    /// directory (`superres`, where NVIDIA's feature download puts its
+    /// `superres-16k_to_48k` and `superres-8k_to_16k` downloads), the
+    /// standalone selector (`superres`, so the feature library
+    /// `libnv_audiofx_superres.so.3`) and the model's file name follow the
+    /// layout that download uses for the other effects; they are
+    /// unverified until the feature is installed. The model is found by
+    /// name pattern ([`superres_model`]).
+    SuperRes,
 }
 
 impl Effect {
     /// Every effect.
-    pub const ALL: [Effect; 5] = [
+    pub const ALL: [Effect; 6] = [
         Effect::Denoiser,
         Effect::Dereverb,
         Effect::DereverbDenoiser,
         Effect::StudioVoice,
         Effect::SpeakerFocus,
+        Effect::SuperRes,
     ];
 
     /// The SDK's selector of the effect.
@@ -66,7 +82,21 @@ impl Effect {
             Effect::DereverbDenoiser => "dereverb_denoiser",
             Effect::StudioVoice => "studio_voice_low_latency",
             Effect::SpeakerFocus => "speaker_focus",
+            Effect::SuperRes => "superres",
         }
+    }
+
+    /// The sample rate it takes, in Hz.
+    pub fn input_rate(self) -> u32 {
+        match self {
+            Effect::SuperRes => 16_000,
+            _ => 48_000,
+        }
+    }
+
+    /// The sample rate it gives, in Hz.
+    pub fn output_rate(self) -> u32 {
+        48_000
     }
 
     /// The directory of its feature under `<root>/features`.
@@ -79,7 +109,8 @@ impl Effect {
 
     /// The name of its 48 kHz model (the file is `<name>` and
     /// [`MODEL_EXT`], or `<name>_<digits>` and [`MODEL_EXT`]: see
-    /// [`model_file`]).
+    /// [`model_file`]); for bandwidth extension, the description of the
+    /// files [`superres_model`] looks for.
     pub fn model(self) -> &'static str {
         match self {
             Effect::Denoiser => "denoiser_v2_48k",
@@ -87,6 +118,7 @@ impl Effect {
             Effect::DereverbDenoiser => "dereverb_denoiser_48k",
             Effect::StudioVoice => "studio_voice_low_latency_48k",
             Effect::SpeakerFocus => "speaker_focus_48k",
+            Effect::SuperRes => "superres 16k to 48k",
         }
     }
 
@@ -106,6 +138,7 @@ impl Effect {
             Effect::DereverbDenoiser => "noise and room echo removal",
             Effect::StudioVoice => "studio voice",
             Effect::SpeakerFocus => "speaker focus",
+            Effect::SuperRes => "headset bandwidth restoration",
         }
     }
 
@@ -114,15 +147,15 @@ impl Effect {
     /// the reason names what is missing.
     pub fn not_installed(self) -> Option<&'static str> {
         match self {
-            Effect::SpeakerFocus => Some(REASON_MODELS_NOT_INSTALLED),
+            Effect::SpeakerFocus | Effect::SuperRes => Some(REASON_MODELS_NOT_INSTALLED),
             _ => None,
         }
     }
 }
 
-/// The probe's reason when speaker focus, an Early Access feature that the
-/// SDK's download does not install by default, is not installed (its
-/// feature, library or models).
+/// The probe's reason when an effect the SDK's package does not install
+/// (speaker focus, an Early Access feature; bandwidth extension) is not
+/// installed (its feature, library or models).
 pub const REASON_MODELS_NOT_INSTALLED: &str = "Models not installed";
 
 /// The file name extension of a model.
@@ -178,6 +211,38 @@ pub fn model_file(dir: &Path, name: &str) -> Option<PathBuf> {
     found.into_iter().next()
 }
 
+/// The bandwidth extension model in `dir`: the first file, by name, whose
+/// name starts with `superres`, ends with [`MODEL_EXT`] and has `16k`
+/// and, after it, `48k` (the 16 kHz to 48 kHz model, not the 8 kHz to
+/// 16 kHz one). The exact file name NVIDIA uses is not known until the
+/// feature is installed.
+pub fn superres_model(dir: &Path) -> Option<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_prefix("superres"))
+                    .and_then(|n| n.strip_suffix(MODEL_EXT))
+                    .and_then(|n| n.find("16k").map(|at| &n[at + 3..]))
+                    .is_some_and(|rest| rest.contains("48k"))
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
+/// The file of `effect`'s main model in `dir` ([`Effect::model`]).
+pub fn main_model(dir: &Path, effect: Effect) -> Option<PathBuf> {
+    match effect {
+        Effect::SuperRes => superres_model(dir),
+        _ => model_file(dir, effect.model()),
+    }
+}
+
 /// The feature directory of `effect` under `root`.
 pub fn feature_dir(root: &Path, effect: Effect) -> PathBuf {
     root.join("features").join(effect.feature())
@@ -225,9 +290,11 @@ pub fn model_dirs(root: &Path, effect: Effect) -> Vec<PathBuf> {
 }
 
 fn has_models(dir: &Path, effect: Effect) -> bool {
-    std::iter::once(effect.model())
-        .chain(effect.extra_models().iter().copied())
-        .all(|m| model_file(dir, m).is_some())
+    main_model(dir, effect).is_some()
+        && effect
+            .extra_models()
+            .iter()
+            .all(|m| model_file(dir, m).is_some())
 }
 
 /// Why `effect` cannot run from the SDK tree at `root` on a GPU of
@@ -417,5 +484,53 @@ mod tests {
         std::fs::remove_dir_all(feature.join("lib")).unwrap();
         assert_eq!(why(None).as_deref(), Some(REASON_MODELS_NOT_INSTALLED));
         assert_eq!(models_for_gpu(root, e, None), Ok(sm));
+    }
+
+    #[test]
+    fn superres_missing_in_any_part_is_models_not_installed() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let e = Effect::SuperRes;
+        let why = |cc| unavailable(Some(root), cc, true, e);
+        touch(&root.join("nvafx/lib/libnv_audiofx.so.3"));
+        assert_eq!(why(None).as_deref(), Some(REASON_MODELS_NOT_INSTALLED));
+        let feature = root.join("features/superres");
+        touch(&feature.join("lib/libnv_audiofx_superres.so.3"));
+        assert_eq!(why(None).as_deref(), Some(REASON_MODELS_NOT_INSTALLED));
+        let sm = feature.join("models/sm_89");
+        // The 8 kHz to 16 kHz model alone does not count.
+        touch(&sm.join(format!("superres_8k_to_16k_2{MODEL_EXT}")));
+        assert_eq!(why(None).as_deref(), Some(REASON_MODELS_NOT_INSTALLED));
+        touch(&sm.join(format!("superres_16k_to_48k_2{MODEL_EXT}")));
+        assert_eq!(why(None), None);
+        assert_eq!(why(Some((8, 9))), None);
+        assert_eq!(
+            why(Some((12, 0))).as_deref(),
+            Some(REASON_MODELS_NOT_INSTALLED)
+        );
+        assert_eq!(models_for_gpu(root, e, None), Ok(sm.clone()));
+        assert_eq!(
+            main_model(&sm, e),
+            Some(sm.join(format!("superres_16k_to_48k_2{MODEL_EXT}")))
+        );
+        assert_eq!((e.input_rate(), e.output_rate()), (16_000, 48_000));
+    }
+
+    #[test]
+    fn the_superres_model_is_found_by_its_rates_whatever_its_exact_name() {
+        let d = tempfile::tempdir().unwrap();
+        let file = |n: &str| d.path().join(n);
+        assert_eq!(superres_model(d.path()), None);
+        touch(&file("superres_48k_16k.trtpkg"));
+        touch(&file("superres16kto48k.onnx"));
+        touch(&file("denoiser_16k_48k.trtpkg"));
+        assert_eq!(superres_model(d.path()), None, "rates in order, its ext");
+        touch(&file("superres16kto48k_v3.trtpkg"));
+        touch(&file("superres_16k_48k.trtpkg"));
+        assert_eq!(
+            superres_model(d.path()),
+            Some(file("superres16kto48k_v3.trtpkg")),
+            "the first by name"
+        );
     }
 }

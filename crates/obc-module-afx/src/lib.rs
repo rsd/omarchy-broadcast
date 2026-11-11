@@ -13,10 +13,13 @@
 //! |---|---|---|
 //! | `mic-focus` | clean (position 25) | speaker focus (`speaker_focus`), when installed |
 //! | `mic-dereverb` | clean (position 50) | room echo removal (`dereverb`) |
-//! | `mic-denoise` | clean | noise removal (`denoiser`, model version 2) |
+//! | `mic-denoise` | clean (position 100, the default) | noise removal (`denoiser`, model version 2) |
+//! | `mic-bandwidth` | clean (position 150) | headset bandwidth restoration (`superres`, 16 kHz to 48 kHz), when installed; after noise and echo removal |
 //! | `mic-enhance` | shape | studio voice, low latency, with a mic profile; conflicts with `mic-denoise` and `mic-dereverb` |
 //!
-//! All take 48 kHz mono blocks of 480 samples, on an NVIDIA GPU. A chain
+//! All take 48 kHz mono blocks of 480 samples, on an NVIDIA GPU
+//! (`mic-bandwidth` decimates them to 16 kHz for its effect, which gives
+//! 48 kHz back: [`chain`], [`decimate`]). A chain
 //! with room echo and noise removal runs them as one combined model
 //! (`dereverb_denoiser`) where it is installed ([`chain`]).
 //!
@@ -43,6 +46,16 @@
 //!   unavailable with the reason "Models not installed"
 //!   ([`tree::REASON_MODELS_NOT_INSTALLED`]). It removes neither noise nor
 //!   echo, so it conflicts with no other stage.
+//! * `mic.bandwidth.enabled`: headset bandwidth restoration, for
+//!   narrowband microphones (Bluetooth headsets, 16 kHz): the SDK's
+//!   bandwidth extension (`superres`, its 16 kHz to 48 kHz model) rebuilds
+//!   the high band the microphone does not capture. It runs after noise
+//!   and echo removal, as NVIDIA's own chains do, so that it does not
+//!   rebuild the high band from noisy input; it has no strength and
+//!   conflicts with no stage. The SDK package does not
+//!   install it: while its feature, library or models are missing the
+//!   probe reports its stage unavailable with the reason "Models not
+//!   installed".
 //!
 //! The chain's delay ([`AudioLoadReport::latency_samples`]) is measured on
 //! the loaded effects ([`latency`]). The voice probability of a block is
@@ -87,6 +100,7 @@ use obc_module_sdk::{
 };
 
 pub mod chain;
+pub mod decimate;
 pub mod ffi;
 pub mod latency;
 pub mod tree;
@@ -105,6 +119,8 @@ pub const DEREVERB: &str = "mic-dereverb";
 pub const ENHANCE: &str = "mic-enhance";
 /// The speaker focus stage.
 pub const FOCUS: &str = "mic-focus";
+/// The headset bandwidth restoration stage.
+pub const BANDWIDTH: &str = "mic-bandwidth";
 
 /// The probe's reason when the SDK's core is not there.
 pub const REASON_NO_SDK: &str = "Maxine Audio Effects SDK not installed";
@@ -140,6 +156,10 @@ pub const VOICE_PROFILE: &str = "mic.voice.profile";
 pub const FOCUS_ENABLED: &str = "mic.focus.enabled";
 /// Speaker focus's label, which says what it does.
 pub const FOCUS_LABEL: &str = "Speaker focus (removes other voices)";
+/// Headset bandwidth restoration's switch.
+pub const BANDWIDTH_ENABLED: &str = "mic.bandwidth.enabled";
+/// Headset bandwidth restoration's label, which says when it helps.
+pub const BANDWIDTH_LABEL: &str = "Restore headset audio (for narrowband mics)";
 
 /// Why noise and room echo removal are greyed while studio voice is on.
 pub const REASON_VOICE_ON: &str = "Studio voice already removes noise and echo";
@@ -293,6 +313,16 @@ pub fn settings() -> SettingsDescription {
             ),
         )
         .group(
+            Group::new("bandwidth", "Headset bandwidth")
+                .surface("mic")
+                .setting(
+                    Setting::bool(BANDWIDTH_ENABLED, BANDWIDTH_LABEL, false)
+                        .stage(BANDWIDTH)
+                        .role(Role::Enable)
+                        .hint("switch"),
+                ),
+        )
+        .group(
             Group::new("voice", "Studio voice")
                 .surface("mic")
                 .setting(
@@ -323,6 +353,7 @@ fn stage_effect(stage: &str) -> Kind {
         DEREVERB => Kind::Dereverb,
         ENHANCE => Kind::StudioVoice,
         FOCUS => Kind::SpeakerFocus,
+        BANDWIDTH => Kind::SuperRes,
         _ => Kind::Denoiser,
     }
 }
@@ -361,7 +392,7 @@ pub fn probe_root(
     ld_library_path: Option<&str>,
 ) -> ProbeReport {
     let mut report = ProbeReport::new();
-    for stage in [FOCUS, DEREVERB, DENOISE, ENHANCE] {
+    for stage in [BANDWIDTH, FOCUS, DEREVERB, DENOISE, ENHANCE] {
         let why = unavailable(
             root,
             compute_capability,
@@ -783,9 +814,13 @@ mod tests {
         std::fs::create_dir_all(d.path().join("nvafx/lib")).unwrap();
         std::fs::write(d.path().join("nvafx/lib/libnv_audiofx.so.3"), b"").unwrap();
         let json = probe_root(Some(d.path()), None, false, None).to_json();
-        assert_eq!(json.matches(REASON_NO_DRIVER).count(), 4, "{json}");
+        assert_eq!(json.matches(REASON_NO_DRIVER).count(), 5, "{json}");
         let json = probe_root(Some(d.path()), None, true, None).to_json();
-        assert!(json.contains(tree::REASON_MODELS_NOT_INSTALLED), "{json}");
+        assert_eq!(
+            json.matches(tree::REASON_MODELS_NOT_INSTALLED).count(),
+            2,
+            "speaker focus and bandwidth: {json}"
+        );
     }
 
     #[test]

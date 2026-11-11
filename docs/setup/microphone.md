@@ -179,7 +179,7 @@ Which module provides a stage is chosen as for video: by rank, by the backend pr
 
 ## On an NVIDIA GPU (Maxine audio effects)
 
-On a machine with an NVIDIA GPU the microphone can run the NVIDIA Maxine Audio Effects, through a second audio module, `br.com.dias.maxine-afx`. It provides the same noise removal stage as the CPU module, ranked above it, and three more: speaker focus, room echo removal and studio voice. Speaker focus needs an extra download, [described below](#speaker-focus). NVIDIA's SDK is licensed by NVIDIA and is never distributed with omarchy-broadcast: you download it with your own NVIDIA account, and the sibling project omarchy-nvidia-sdks packages it for Arch as `maxine-afx-sdk-local`. The module is installed by the Arch package and by `install-user.sh --audio` and opens the SDK only at run time, so everything above works without the SDK, on any machine: the CPU module keeps the microphone going and the Maxine stages are listed as unavailable, with the reason. The SDK's licence terms and the compatibility shim are described for the video SDK in [maxine.md](maxine.md#9-licence-and-support); they apply to this one too.
+On a machine with an NVIDIA GPU the microphone can run the NVIDIA Maxine Audio Effects, through a second audio module, `br.com.dias.maxine-afx`. It provides the same noise removal stage as the CPU module, ranked above it, and four more: speaker focus, room echo removal, headset bandwidth restoration and studio voice. Speaker focus and headset bandwidth restoration need an extra download, [described below](#optional-features-speaker-focus-and-headset-bandwidth). NVIDIA's SDK is licensed by NVIDIA and is never distributed with omarchy-broadcast: you download it with your own NVIDIA account, and the sibling project omarchy-nvidia-sdks packages it for Arch as `maxine-afx-sdk-local`. The module is installed by the Arch package and by `install-user.sh --audio` and opens the SDK only at run time, so everything above works without the SDK, on any machine: the CPU module keeps the microphone going and the Maxine stages are listed as unavailable, with the reason. The SDK's licence terms and the compatibility shim are described for the video SDK in [maxine.md](maxine.md#9-licence-and-support); they apply to this one too.
 
 Only the audio worker loads this SDK. The video daemon never does, so the daemon's own Maxine drop-in is not needed for the microphone, and this one is not needed for the camera.
 
@@ -218,25 +218,42 @@ With the module usable, the same page gains groups, and noise removal's switch a
 | Setting | What it does |
 |---|---|
 | `mic.noise.enabled`, `mic.noise.strength` | The same switch and strength as with the CPU module (shared by every provider of noise removal). The strength applies live: it mixes the processed sound with your own, delayed to match, so a change never steps or reloads |
-| `mic.focus.enabled` ("Speaker focus (removes other voices)", off by default) | Keeps the main speaker and removes other voices and background talk. It has no strength, and it removes neither noise nor echo, so it works alongside the other effects, studio voice included. It runs first in the chain. It needs a separate download: until that is installed the switch is greyed with the reason "Models not installed" ([below](#speaker-focus)) |
+| `mic.focus.enabled` ("Speaker focus (removes other voices)", off by default) | Keeps the main speaker and removes other voices and background talk. It has no strength, and it removes neither noise nor echo, so it works alongside the other effects, studio voice included. It runs first in the chain. It needs a separate download: until that is installed the switch is greyed with the reason "Models not installed" ([below](#optional-features-speaker-focus-and-headset-bandwidth)) |
 | `mic.echo.enabled`, `mic.echo.strength` ("Room echo removal", off by default) | Removes the room's reverberation from the voice, before noise removal. Its strength applies live. While noise removal is on, the strength is greyed: both effects then run as one combined model, whose single strength is noise removal's. Turn noise removal off to set the echo strength on its own |
+| `mic.bandwidth.enabled` ("Restore headset audio (for narrowband mics)", group "Headset bandwidth", off by default) | Restores the high band of a narrowband microphone, such as a Bluetooth headset in its 16 kHz mode, whose voice otherwise sounds muffled. It has no strength and conflicts with no other effect. It runs after noise and room echo removal, so it extends a signal that has already been cleaned. The audio is reduced to 16 kHz for it and rebuilt at 48 kHz, and the small delay that adds is counted in the chain's delay. It needs a separate download: until that is installed the switch is greyed with the reason "Models not installed" ([below](#optional-features-speaker-focus-and-headset-bandwidth)) |
 | `mic.voice.enabled` ("Studio voice (adds noticeable delay)", off by default), `mic.voice.profile` ("Mic profile") | Re-creates the voice as if recorded in a studio. The profile (None, Bright, Vibrant, Flat, Full, Thin or Warm) changes the character; changing it reloads the chain |
 
 When noise removal and room echo removal are both on, the combined model is used where the SDK has it installed; if it is not there or fails to load, the two run one after the other as two effects. `omarchy-broadcast settings` lists the same settings, and `mic.cpu.engine` has no effect while the GPU module provides noise removal.
 
 **Delay.** Studio voice adds a delay you can notice in a conversation, which is why its label says so. The module measures each effect's delay when the chain is loaded and reports the chain's total, so the delay shown by `omarchy-broadcast mic` (and in the panel) is the delay of the audio you are sending now, studio voice included. If it is too much for a call, turn studio voice off; the other effects add less.
 
-### Speaker focus
+### Optional features: speaker focus and headset bandwidth
 
-Speaker focus is an NVIDIA Early Access feature, and the SDK package does not include it. Until its library and models are installed, the Mic tab shows the switch greyed with the reason "Models not installed", and the rest of the microphone is unaffected. Early Access features may require NVIDIA's approval for your account.
+Two features are not part of NVIDIA's SDK package and need a separate download:
 
-To install it:
+- **Speaker focus** (`mic-focus`) is an NVIDIA Early Access feature, and may require NVIDIA's approval for your account.
+- **Headset bandwidth** (`mic-bandwidth`) is NVIDIA's superres feature, in its 16 kHz to 48 kHz model.
 
-1. In the `features/` directory of the Audio Effects SDK, run NVIDIA's `download_features.sh` with your NGC API key in the `NGC_API_KEY` environment variable, `--effects speaker_focus-48k`, and `--gpu` naming a GPU of the same compute capability as yours.
-2. Make sure the feature's files end up in the SDK root the module uses, as `features/speaker_focus/lib` and `features/speaker_focus/models/sm_<NN>`, where `<NN>` is your GPU's compute capability.
-3. Put the feature's library directory on the audio worker's library search path, in the `LD_LIBRARY_PATH` of the [drop-in](#enable-the-workers-drop-in) (`omarchy-broadcast-audiod.service.d/maxine-afx.conf`), then restart the worker.
+Until a feature's library and models are installed, the Mic tab shows its switch greyed with the reason "Models not installed", and the rest of the microphone is unaffected.
 
-The layout above follows NVIDIA's download and has not yet been verified against a real installation; if the switch stays greyed after the steps, `omarchy-broadcast modules` shows the stage's current reason.
+To install them:
+
+1. From the SDK's `features` directory, run NVIDIA's `download_features.sh` with your NGC API key in the `NGC_API_KEY` environment variable, downloading into a directory of your own, then copy the result into the SDK:
+
+   ```sh
+   cd /opt/nvidia/maxine/afx/features
+   NGC_API_KEY=<your NGC key> ./download_features.sh -o ~/maxine-afx-extra --effects speaker_focus-48k,superres-16k_to_48k
+   sudo cp -a ~/maxine-afx-extra/speaker_focus ~/maxine-afx-extra/superres /opt/nvidia/maxine/afx/features/
+   ```
+
+   - Run it from the `features` directory: the script then detects your GPU's compute capability itself. Its `--gpu` option lists only data-centre and workstation GPUs, so leave it out.
+   - `-o` downloads into a directory of your own, so the key is never used under `sudo`; only the copy into `/opt` needs it.
+   - Take only the effects you want: list `speaker_focus-48k` or `superres-16k_to_48k` alone if you need only one, and copy only that directory.
+2. Check that the files are in the SDK root the module uses, as `features/speaker_focus/lib` and `features/speaker_focus/models/sm_<NN>` for speaker focus, and `features/superres/lib` and `features/superres/models/sm_<NN>` for headset bandwidth, where `<NN>` is your GPU's compute capability.
+3. Put each feature's library directory on the audio worker's library search path. The `maxine-afx-sdk-local` package's environment file lists them from its next release, so with the package nothing more is needed. With an SDK tree of your own, add `features/speaker_focus/lib` and `features/superres/lib` to the `LD_LIBRARY_PATH` line of the [drop-in](#enable-the-workers-drop-in) (`omarchy-broadcast-audiod.service.d/maxine-afx.conf`; its commented example already names them).
+4. Restart the worker: `systemctl --user try-restart omarchy-broadcast-audiod.service`.
+
+The layout above follows NVIDIA's download and has not yet been verified against a real installation; if a switch stays greyed after the steps, `omarchy-broadcast modules` shows the stage's current reason.
 
 ### Studio voice excludes noise and echo removal
 

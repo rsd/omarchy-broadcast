@@ -6,7 +6,8 @@
 //!   `mic-dereverb` the `dereverb` effect; `mic-enhance` the low-latency
 //!   studio voice; `mic-focus` the `speaker_focus` effect, alone (not the
 //!   SDK's chained `speaker_focus48k_denoiser48k`: noise removal stays its
-//!   own stage). When a chain has both `mic-dereverb` and `mic-denoise`
+//!   own stage); `mic-bandwidth` the `superres` effect, 16 kHz to 48 kHz
+//!   (see below). When a chain has both `mic-dereverb` and `mic-denoise`
 //!   (one request of this module), they run as one `dereverb_denoiser`
 //!   effect where it is installed, in the place of the first of them; if
 //!   it fails to load, as the two effects.
@@ -20,6 +21,14 @@
 //!   of strength changes the mix only.
 //! * The studio voice's `mic_profile_model` is set before the load, its
 //!   `mic_profile_id` after it.
+//! * Bandwidth extension takes 16 kHz and gives 48 kHz: its
+//!   `input_sample_rate` (16000) and `output_sample_rate` (48000) are set
+//!   before the load, and each 48 kHz block is first decimated to 16 kHz
+//!   ([`crate::decimate`], whose state is carried across blocks). Its
+//!   frames must be 10 ms: 160 samples in (read before and after the
+//!   load) and 480 out (read after it); otherwise the load fails, saying
+//!   so. Its measured delay is that of the decimator and the effect
+//!   together, as the stage's input reaches its output.
 //! * Each effect's delay is measured after its load ([`crate::latency`]);
 //!   a stage whose delay cannot be measured fails. The chain's delay is
 //!   the sum of its effects'.
@@ -35,10 +44,11 @@ use std::time::Instant;
 
 use obc_module_sdk::{Error, log};
 
+use crate::decimate::Decimator;
 use crate::ffi::{self, Effect};
 use crate::latency;
 use crate::tree::{self, Effect as Kind};
-use crate::{DENOISE, DEREVERB, ENHANCE, FOCUS, Profile};
+use crate::{BANDWIDTH, DENOISE, DEREVERB, ENHANCE, FOCUS, Profile};
 
 /// The sample rate the module runs at.
 pub const RATE: u32 = 48_000;
@@ -83,7 +93,7 @@ pub struct Params {
 
 /// The stage id of the request's `id`, if it is one of the module's.
 pub fn stage_id(id: &str) -> Option<&'static str> {
-    [FOCUS, DENOISE, DEREVERB, ENHANCE]
+    [BANDWIDTH, FOCUS, DENOISE, DEREVERB, ENHANCE]
         .into_iter()
         .find(|s| *s == id)
 }
@@ -120,6 +130,7 @@ pub fn plan(stages: &[&str], params: Params, combined: bool) -> Result<Vec<Effec
             DENOISE => out.push(one(Kind::Denoiser, params.noise, Some(1.0), None)),
             DEREVERB => out.push(one(Kind::Dereverb, params.echo, None, None)),
             FOCUS => out.push(one(Kind::SpeakerFocus, 1.0, None, None)),
+            BANDWIDTH => out.push(one(Kind::SuperRes, 1.0, None, None)),
             _ => out.push(one(Kind::StudioVoice, 1.0, None, Some(params.profile))),
         }
     }
@@ -243,6 +254,42 @@ pub struct Running {
     intensity: Option<f32>,
     /// How long its last block took, in milliseconds.
     last_ms: Option<f32>,
+    /// The decimation in front of an effect that takes 16 kHz.
+    narrow: Option<Narrowband>,
+}
+
+/// The 48 kHz to 16 kHz decimation in front of an effect that takes
+/// 16 kHz, and the 16 kHz block it makes.
+#[derive(Debug)]
+struct Narrowband {
+    decimator: Decimator,
+    block: Vec<f32>,
+}
+
+impl Narrowband {
+    fn new() -> Narrowband {
+        Narrowband {
+            decimator: Decimator::new(),
+            block: Vec::with_capacity(FRAME),
+        }
+    }
+}
+
+/// Runs one 48 kHz block through `effect`, decimated first by `narrow`
+/// when there is one.
+fn run_effect(
+    effect: &mut Effect,
+    narrow: &mut Option<Narrowband>,
+    input: &[f32],
+    output: &mut [f32],
+) -> Result<(), ffi::AfxError> {
+    match narrow {
+        None => effect.run(input, output),
+        Some(n) => {
+            n.decimator.process(input, &mut n.block);
+            effect.run_resampled(&n.block, output)
+        }
+    }
 }
 
 /// The strengths a block runs at, when given (`None`: as they are).
@@ -270,10 +317,12 @@ pub struct Chain {
 /// The SDK parameters the module sets.
 mod param {
     pub const INPUT_SAMPLE_RATE: &str = "input_sample_rate";
+    pub const OUTPUT_SAMPLE_RATE: &str = "output_sample_rate";
     pub const MODEL_PATH: &str = "model_path";
     pub const EFFECT_VERSION: &str = "effect_version";
     pub const INTENSITY_RATIO: &str = "intensity_ratio";
     pub const FRAME: &str = "num_samples_per_input_frame";
+    pub const OUTPUT_FRAME: &str = "num_samples_per_output_frame";
     pub const FRAMES: &str = "supported_num_samples_per_frame";
     pub const MIC_PROFILE_MODEL: &str = "mic_profile_model";
     pub const MIC_PROFILE_ID: &str = "mic_profile_id";
@@ -320,23 +369,35 @@ pub fn build(
     let kind = plan.kind;
     let fail = |why: String| stage_error(plan, why);
     let models = tree::models_for_gpu(root, kind, cc).map_err(fail)?;
-    let model = tree::model_file(&models, kind.model())
+    let model = tree::main_model(&models, kind)
         .ok_or_else(|| fail(format!("no {} model in {}", kind.model(), models.display())))?;
     let mut effect = sdk
         .create(kind.selector(), &tree::library_dir(root, kind))
         .map_err(fail)?;
     let e = |x: ffi::AfxError| fail(x.to_string());
-    effect.set_u32(param::INPUT_SAMPLE_RATE, RATE).map_err(e)?;
+    let (in_rate, out_rate) = (kind.input_rate(), kind.output_rate());
+    // 10 ms blocks at the effect's input rate.
+    let in_frame = FRAME * in_rate as usize / RATE as usize;
+    let resamples = in_rate != out_rate;
+    effect
+        .set_u32(param::INPUT_SAMPLE_RATE, in_rate)
+        .map_err(e)?;
+    if resamples {
+        effect
+            .set_u32(param::OUTPUT_SAMPLE_RATE, out_rate)
+            .map_err(e)?;
+    }
     // The block size must be one the effect takes; it is read before the
     // load (the SDK refuses it after).
     match effect.get_u32_list(param::FRAMES) {
-        Ok(sizes) if !sizes.contains(&(FRAME as u32)) => {
+        Ok(sizes) if !sizes.contains(&(in_frame as u32)) => {
             return Err(fail(format!(
-                "the effect takes blocks of {sizes:?} samples, not {FRAME}"
+                "the effect takes blocks of {sizes:?} samples, not {in_frame}{}",
+                rate_note(resamples, in_rate)
             )));
         }
         Ok(sizes) if sizes.len() > 1 => {
-            if let Err(x) = effect.set_u32(param::FRAME, FRAME as u32) {
+            if let Err(x) = effect.set_u32(param::FRAME, in_frame as u32) {
                 log::debug!("{}: {x}; keeping the default block size", kind.selector());
             }
         }
@@ -371,10 +432,26 @@ pub fn build(
         ))
     })?;
     let frame = effect.get_u32(param::FRAME).map_err(e)?;
-    if frame as usize != FRAME {
+    if frame as usize != in_frame {
         return Err(fail(format!(
-            "the effect takes blocks of {frame} samples, not {FRAME}"
+            "the effect takes blocks of {frame} samples, not {in_frame}{}",
+            rate_note(resamples, in_rate)
         )));
+    }
+    if resamples {
+        // The output frame size must be known: it is what the run's
+        // output buffer is checked against.
+        let n = effect.get_u32(param::OUTPUT_FRAME).map_err(|x| {
+            fail(format!(
+                "the effect's output block size is unknown ({x}), so it cannot be run safely"
+            ))
+        })?;
+        if n as usize != FRAME {
+            return Err(fail(format!(
+                "the effect gives blocks of {n} samples, not {FRAME} (10 ms at {out_rate} Hz)"
+            )));
+        }
+        effect.set_frames(in_frame, n as usize);
     }
     let mut running = Running {
         plan: plan.clone(),
@@ -383,9 +460,19 @@ pub fn build(
         mixer: Mixer::new(1.0, 0),
         intensity: None,
         last_ms: None,
+        narrow: resamples.then(Narrowband::new),
     };
     running.apply(plan, true)?;
     Ok(running)
+}
+
+/// What a block size refers to, for an effect not at the chain's rate.
+fn rate_note(resamples: bool, rate: u32) -> String {
+    if resamples {
+        format!(" (10 ms at {rate} Hz)")
+    } else {
+        String::new()
+    }
 }
 
 impl Running {
@@ -421,9 +508,16 @@ impl Running {
             // From a clean state (a switch measures a running effect), and
             // left clean for the first block.
             effect.reset().map_err(|x| fail(x.to_string()))?;
-            let lag = latency::measure(FRAME, |i, o| effect.run(i, o))
+            let narrow = &mut self.narrow;
+            if let Some(n) = narrow.as_mut() {
+                n.decimator.reset();
+            }
+            let lag = latency::measure(FRAME, |i, o| run_effect(effect, narrow, i, o))
                 .map_err(|x| fail(x.to_string()))?;
             effect.reset().map_err(|x| fail(x.to_string()))?;
+            if let Some(n) = narrow.as_mut() {
+                n.decimator.reset();
+            }
             let lag =
                 lag.ok_or_else(|| fail("its delay could not be measured after the load".into()))?;
             log::debug!(
@@ -459,7 +553,7 @@ impl Running {
                     }
                 }
             }
-            Kind::StudioVoice | Kind::SpeakerFocus => {}
+            Kind::StudioVoice | Kind::SpeakerFocus | Kind::SuperRes => {}
         }
         Ok(())
     }
@@ -524,6 +618,9 @@ impl Chain {
         for i in 0..self.effects.len() {
             let r = &mut self.effects[i];
             r.mixer.clear();
+            if let Some(n) = r.narrow.as_mut() {
+                n.decimator.reset();
+            }
             if let Some(effect) = r.effect.as_mut()
                 && let Err(x) = effect.reset()
             {
@@ -564,7 +661,7 @@ impl Chain {
             let res = match r.effect.is_some() {
                 true => r.set_strengths(strengths).and_then(|()| {
                     let effect = r.effect.as_mut().expect("checked");
-                    effect.run(&self.a, &mut self.b)
+                    run_effect(effect, &mut r.narrow, &self.a, &mut self.b)
                 }),
                 false => Ok(()),
             };
@@ -626,6 +723,28 @@ mod tests {
             (Kind::SpeakerFocus, 1.0, None, None)
         );
         assert!(!p[0].mixes());
+        let p = plan(&[BANDWIDTH], params(), true).unwrap();
+        assert_eq!(
+            (p[0].kind, p[0].mix, p[0].intensity, p[0].profile),
+            (Kind::SuperRes, 1.0, None, None)
+        );
+        assert!(!p[0].mixes());
+    }
+
+    #[test]
+    fn bandwidth_runs_after_noise_and_echo_removal_and_alone() {
+        let p = plan(&[FOCUS, DEREVERB, DENOISE, BANDWIDTH], params(), true).unwrap();
+        let kinds: Vec<Kind> = p.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            [Kind::SpeakerFocus, Kind::DereverbDenoiser, Kind::SuperRes]
+        );
+        assert_eq!(p[1].stages, [DEREVERB, DENOISE]);
+        assert_eq!(p[2].stages, [BANDWIDTH]);
+        // Without the combined model: the two effects, then bandwidth.
+        let p = plan(&[DEREVERB, DENOISE, BANDWIDTH], params(), false).unwrap();
+        let kinds: Vec<Kind> = p.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, [Kind::Dereverb, Kind::Denoiser, Kind::SuperRes]);
     }
 
     #[test]

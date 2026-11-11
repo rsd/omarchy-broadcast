@@ -270,6 +270,7 @@ impl Sdk {
             sdk: self,
             h,
             selector: selector.to_string(),
+            frames: None,
         })
     }
 }
@@ -279,6 +280,9 @@ pub struct Effect {
     sdk: &'static Sdk,
     h: Handle,
     selector: String,
+    /// The block sizes (input, output) [`Effect::run_resampled`] checks
+    /// its buffers against, once [`Effect::set_frames`] gave them.
+    frames: Option<(usize, usize)>,
 }
 
 // SAFETY: the handle is used through `&mut self` only (and dropped once);
@@ -307,6 +311,33 @@ impl Drop for Effect {
             );
         }
     }
+}
+
+/// Whether a block of `input` samples in and `output` out suits an effect
+/// whose block sizes (input, output) are `frames`.
+fn check_resampled(
+    frames: Option<(usize, usize)>,
+    input: usize,
+    output: usize,
+) -> Result<(), AfxError> {
+    let refuse = |what: String| AfxError {
+        call: format!("Run (refused before the call: {what})"),
+        code: 3,
+    };
+    let Some((frame_in, frame_out)) = frames else {
+        return Err(refuse("the effect's block sizes are not known".into()));
+    };
+    if input != frame_in {
+        return Err(refuse(format!(
+            "{input} samples in, the effect takes {frame_in}"
+        )));
+    }
+    if output < frame_out {
+        return Err(refuse(format!(
+            "room for {output} samples out, the effect gives {frame_out}"
+        )));
+    }
+    Ok(())
 }
 
 fn cstr(s: &str) -> CString {
@@ -382,10 +413,36 @@ impl Effect {
     /// `NvAFX_Run` on one mono block (`input` and `output` of one length).
     pub fn run(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), AfxError> {
         assert_eq!(input.len(), output.len(), "one block size in and out");
+        self.run_unchecked(input, output)
+    }
+
+    /// Records the block sizes of the loaded effect: its
+    /// `num_samples_per_input_frame` and `num_samples_per_output_frame`,
+    /// which [`Effect::run_resampled`] requires of its buffers.
+    pub fn set_frames(&mut self, input: usize, output: usize) {
+        self.frames = Some((input, output));
+    }
+
+    /// `NvAFX_Run` on one mono block of an effect whose output rate is not
+    /// its input rate: `input` is one input frame and `output` holds at
+    /// least one output frame, both as [`Effect::set_frames`] recorded
+    /// them. A block of another size, or an effect whose sizes are not
+    /// recorded, is refused without calling the SDK, which writes a whole
+    /// output frame.
+    pub fn run_resampled(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), AfxError> {
+        check_resampled(self.frames, input.len(), output.len())?;
+        self.run_unchecked(input, output)
+    }
+
+    /// `NvAFX_Run`; the caller has checked that `output` is as long as the
+    /// effect's output frame.
+    fn run_unchecked(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), AfxError> {
         let ins = [input.as_ptr()];
         let mut outs = [output.as_mut_ptr()];
-        // SAFETY: a live handle; one channel of `len` samples each way,
-        // which the SDK reads and writes during the call only.
+        // SAFETY: a live handle; one channel of `input.len()` samples in
+        // and of the effect's output frame out (`output`, at least that
+        // long by the caller's check), which the SDK reads and writes
+        // during the call only.
         let code = unsafe {
             (self.sdk.run)(
                 self.h,
@@ -461,6 +518,25 @@ mod tests {
             code: 8,
         };
         assert_eq!(e.to_string(), "Load returned 8 (model load failed)");
+    }
+
+    #[test]
+    fn a_resampled_block_is_refused_unless_it_fits_the_effects_frames() {
+        let ok = |f, i, o| check_resampled(f, i, o);
+        assert_eq!(ok(Some((160, 480)), 160, 480), Ok(()));
+        // Room to spare out is fine: the SDK writes the output frame only.
+        assert_eq!(ok(Some((160, 480)), 160, 960), Ok(()));
+        for (f, i, o) in [
+            (Some((160, 480)), 160, 479),
+            (Some((160, 480)), 160, 0),
+            (Some((160, 480)), 159, 480),
+            (Some((160, 480)), 161, 480),
+            (None, 160, 480),
+        ] {
+            let e = ok(f, i, o).unwrap_err();
+            assert_eq!(e.code, 3, "{e}");
+            assert!(e.call.contains("refused before the call"), "{e}");
+        }
     }
 
     #[test]
