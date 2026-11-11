@@ -4,14 +4,16 @@
 //!
 //! * `mic-denoise` is the `denoiser` effect with model version 2;
 //!   `mic-dereverb` the `dereverb` effect; `mic-enhance` the low-latency
-//!   studio voice. When a chain has both `mic-dereverb` and `mic-denoise`
+//!   studio voice; `mic-focus` the `speaker_focus` effect, alone (not the
+//!   SDK's chained `speaker_focus48k_denoiser48k`: noise removal stays its
+//!   own stage). When a chain has both `mic-dereverb` and `mic-denoise`
 //!   (one request of this module), they run as one `dereverb_denoiser`
 //!   effect where it is installed, in the place of the first of them; if
 //!   it fails to load, as the two effects.
 //! * `intensity_ratio` is set after the load: to 1 on `denoiser`, to the
 //!   noise removal strength on `dereverb_denoiser` (again between two
-//!   blocks whenever the strength changes). It is not set on `dereverb`
-//!   or the studio voice.
+//!   blocks whenever the strength changes). It is not set on `dereverb`,
+//!   the studio voice or speaker focus, which has no strength.
 //! * The strengths of `denoiser` and `dereverb` are a mix of the effect's
 //!   output with its input delayed by the effect's measured delay
 //!   ([`Mixer`]); the delayed input is kept for every effect, so a change
@@ -36,7 +38,7 @@ use obc_module_sdk::{Error, log};
 use crate::ffi::{self, Effect};
 use crate::latency;
 use crate::tree::{self, Effect as Kind};
-use crate::{DENOISE, DEREVERB, ENHANCE, Profile};
+use crate::{DENOISE, DEREVERB, ENHANCE, FOCUS, Profile};
 
 /// The sample rate the module runs at.
 pub const RATE: u32 = 48_000;
@@ -81,7 +83,9 @@ pub struct Params {
 
 /// The stage id of the request's `id`, if it is one of the module's.
 pub fn stage_id(id: &str) -> Option<&'static str> {
-    [DENOISE, DEREVERB, ENHANCE].into_iter().find(|s| *s == id)
+    [FOCUS, DENOISE, DEREVERB, ENHANCE]
+        .into_iter()
+        .find(|s| *s == id)
 }
 
 /// The effects that run `stages` (in order, each once): `combined` says
@@ -115,6 +119,7 @@ pub fn plan(stages: &[&str], params: Params, combined: bool) -> Result<Vec<Effec
             }
             DENOISE => out.push(one(Kind::Denoiser, params.noise, Some(1.0), None)),
             DEREVERB => out.push(one(Kind::Dereverb, params.echo, None, None)),
+            FOCUS => out.push(one(Kind::SpeakerFocus, 1.0, None, None)),
             _ => out.push(one(Kind::StudioVoice, 1.0, None, Some(params.profile))),
         }
     }
@@ -454,7 +459,7 @@ impl Running {
                     }
                 }
             }
-            Kind::StudioVoice => {}
+            Kind::StudioVoice | Kind::SpeakerFocus => {}
         }
         Ok(())
     }
@@ -615,6 +620,27 @@ mod tests {
             (p[0].kind, p[0].mix, p[0].profile),
             (Kind::StudioVoice, 1.0, Some(Profile::Warm))
         );
+        let p = plan(&[FOCUS], params(), true).unwrap();
+        assert_eq!(
+            (p[0].kind, p[0].mix, p[0].intensity, p[0].profile),
+            (Kind::SpeakerFocus, 1.0, None, None)
+        );
+        assert!(!p[0].mixes());
+    }
+
+    #[test]
+    fn speaker_focus_runs_first_and_alone_before_the_combined_model() {
+        let p = plan(&[FOCUS, DEREVERB, DENOISE, ENHANCE], params(), true).unwrap();
+        let kinds: Vec<Kind> = p.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                Kind::SpeakerFocus,
+                Kind::DereverbDenoiser,
+                Kind::StudioVoice
+            ]
+        );
+        assert_eq!(p[0].stages, [FOCUS]);
     }
 
     #[test]

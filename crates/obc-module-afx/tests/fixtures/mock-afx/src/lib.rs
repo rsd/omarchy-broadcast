@@ -59,15 +59,17 @@ fn defaults(selector: &str) -> (usize, f32) {
         "dereverb" => (300, 0.8),
         "dereverb_denoiser" => (500, 0.4),
         "studio_voice_low_latency" => (1100, 0.9),
+        "speaker_focus" => (400, 0.7),
         _ => (0, 1.0),
     }
 }
 
-const SELECTORS: [&str; 4] = [
+const SELECTORS: [&str; 5] = [
     "denoiser",
     "dereverb",
     "dereverb_denoiser",
     "studio_voice_low_latency",
+    "speaker_focus",
 ];
 
 unsafe extern "C" {

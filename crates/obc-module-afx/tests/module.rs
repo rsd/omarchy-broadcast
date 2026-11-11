@@ -32,6 +32,7 @@ const DENOISER: (usize, f32) = (700, 0.5);
 const DEREVERB_D: (usize, f32) = (300, 0.8);
 const COMBINED: (usize, f32) = (500, 0.4);
 const VOICE: (usize, f32) = (1100, 0.9);
+const SPEAKER_FOCUS: (usize, f32) = (400, 0.7);
 const PROFILE_DELAY: usize = 200;
 
 fn config(root: &Path) -> serde_json::Value {
@@ -133,7 +134,7 @@ fn assert_delayed_from(x: &[f32], y: &[f32], delay: usize, gain: f32, from: usiz
 }
 
 #[test]
-fn the_manifest_declares_three_gpu_stages_above_the_cpu_provider() {
+fn the_manifest_declares_four_gpu_stages_above_the_cpu_provider() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("maxine-afx.toml");
     std::fs::copy(crate_dir().join("maxine-afx.toml"), &path).unwrap();
@@ -145,7 +146,7 @@ fn the_manifest_declares_three_gpu_stages_above_the_cpu_provider() {
     assert!(m.licence.contains("NVIDIA"), "{}", m.licence);
     assert!(m.description.as_deref().unwrap().contains("NVIDIA"));
     let ids: Vec<&str> = m.stages.iter().map(|s| s.id.as_str()).collect();
-    assert_eq!(ids, [DEREVERB, DENOISE, ENHANCE]);
+    assert_eq!(ids, [FOCUS, DEREVERB, DENOISE, ENHANCE]);
     for st in &m.stages {
         assert_eq!((st.rank, st.device), (300, Device::NvidiaGpu), "{}", st.id);
         assert!(st.rank > 200, "above the CPU module");
@@ -156,11 +157,16 @@ fn the_manifest_declares_three_gpu_stages_above_the_cpu_provider() {
         );
     }
     let slots: Vec<&str> = m.stages.iter().map(|s| s.slot.as_str()).collect();
-    assert_eq!(slots, ["clean", "clean", "shape"]);
+    assert_eq!(slots, ["clean", "clean", "clean", "shape"]);
     let enhance = m.stage(ENHANCE).unwrap();
     assert_eq!(enhance.conflicts, [s(DENOISE), s(DEREVERB)]);
     assert!(m.stage(DEREVERB).unwrap().position < m.stage(DENOISE).unwrap().position);
-    let all = [s(DEREVERB), s(DENOISE), s(ENHANCE)];
+    // Speaker focus first: it conflicts with nothing, and nothing with it.
+    let focus = m.stage(FOCUS).unwrap();
+    assert!(focus.position < m.stage(DEREVERB).unwrap().position);
+    assert!(focus.conflicts.is_empty());
+    assert!(m.stages.iter().all(|st| !st.conflicts.contains(&s(FOCUS))));
+    let all = [s(FOCUS), s(DEREVERB), s(DENOISE), s(ENHANCE)];
     let (rates, sizes, channels) = common_block_formats(&m, &all).unwrap();
     assert_eq!((rates[0], sizes[0], channels), (48_000, 480, 1));
 }
@@ -183,7 +189,7 @@ fn the_worker_opens_it_and_the_video_daemon_never_does() {
     let mut audio = Registry::new(scan(&[dir.path().to_path_buf()])).with_kinds(LoadKinds::Audio);
     audio.open_all(|_| conf.clone(), &sink);
     assert_eq!(audio.status(ID), Some(ModuleStatus::Available));
-    for st in [DEREVERB, DENOISE, ENHANCE] {
+    for st in [FOCUS, DEREVERB, DENOISE, ENHANCE] {
         assert_eq!(audio.resolve(st).provider.as_deref(), Some(ID), "{st}");
     }
 }
@@ -199,9 +205,115 @@ fn the_probe_and_the_check_read_the_tree_and_touch_no_effect() {
         "{probe:?}"
     );
     f.module
-        .check(&[s(DEREVERB), s(DENOISE), s(ENHANCE)])
+        .check(&[s(FOCUS), s(DEREVERB), s(DENOISE), s(ENHANCE)])
         .unwrap();
     assert_eq!(f.tree.log(), Vec::<String>::new(), "no SDK call");
+}
+
+#[test]
+fn speaker_focus_not_installed_is_models_not_installed() {
+    // The SDK as it is installed by default: no speaker focus feature.
+    let Some(f) = fixture_with("speaker_focus_not_installed_is_models_not_installed", |t| {
+        std::fs::remove_dir_all(t.root.join("features/speaker_focus")).unwrap();
+    }) else {
+        return;
+    };
+    let probe = f.module.probe().unwrap();
+    let reason = |id: &str| {
+        probe
+            .iter()
+            .find(|(s, _)| s.as_str() == id)
+            .map(|(_, a)| a.clone())
+            .unwrap()
+    };
+    assert_eq!(
+        reason(FOCUS),
+        Availability::NotInstalled("Models not installed".into())
+    );
+    for st in [DEREVERB, DENOISE, ENHANCE] {
+        assert_eq!(reason(st), Availability::Installed, "{st}");
+    }
+    // Its library without models, or models of another GPU only.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = f.tree.root.join("features/speaker_focus/lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join("libnv_audiofx_speaker_focus.so.3"), b"").unwrap();
+    let module = open(dir.path(), config(&f.tree.root));
+    assert!(
+        module
+            .probe()
+            .unwrap()
+            .iter()
+            .any(|(s, a)| s.as_str() == FOCUS
+                && *a == Availability::NotInstalled("Models not installed".into()))
+    );
+    let sm = f.tree.root.join("features/speaker_focus/models/sm_120");
+    std::fs::create_dir_all(&sm).unwrap();
+    std::fs::write(sm.join(format!("speaker_focus_48k{MODEL_EXT}")), b"mock").unwrap();
+    let mut conf = config(&f.tree.root);
+    conf["_host"]["compute_capability"] = json!([8, 6]);
+    let module = open(dir.path(), conf);
+    assert!(
+        module
+            .probe()
+            .unwrap()
+            .iter()
+            .any(|(s, a)| s.as_str() == FOCUS
+                && *a == Availability::NotInstalled("Models not installed".into()))
+    );
+}
+
+#[test]
+fn speaker_focus_loads_its_selector_and_model_and_runs() {
+    let Some(f) = fixture("speaker_focus_loads_its_selector_and_model_and_runs") else {
+        return;
+    };
+    let mut inst = f.module.create_audio_instance().unwrap();
+    let o = inst.load(&spec(&[FOCUS], &[])).unwrap();
+    assert_eq!(
+        (o.frame_samples, o.latency_samples, o.reused_model),
+        (480, SPEAKER_FOCUS.0 as u32, false)
+    );
+    let log = f.tree.log();
+    let at = |prefix: &str| {
+        log.iter()
+            .position(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix:?} in {log:#?}"))
+    };
+    assert_eq!(log[0], "create speaker_focus");
+    assert!(at("set_u32 input_sample_rate 48000 speaker_focus pre") < at("load speaker_focus 0"));
+    let model = &log[at("set_str model_path")];
+    assert!(
+        model.contains(&format!(
+            "/features/speaker_focus/models/sm_120/speaker_focus_48k{MODEL_EXT}"
+        )),
+        "{model}"
+    );
+    // No strength: no intensity_ratio, no effect version.
+    assert!(f.tree.calls("set_f32").is_empty(), "{log:#?}");
+    assert!(f.tree.calls("set_u32 effect_version").is_empty());
+    let x = tone(HOP * 10, 0.3);
+    let (y, _) = run(&mut inst, &x);
+    assert_delayed(&x, &y, SPEAKER_FOCUS.0, SPEAKER_FOCUS.1);
+    // First in a full chain, before the combined model; delays add up.
+    let mut inst = f.module.create_audio_instance().unwrap();
+    let o = inst
+        .load(&spec(&[FOCUS, DEREVERB, DENOISE, ENHANCE], &[]))
+        .unwrap();
+    assert_eq!(
+        o.latency_samples,
+        (SPEAKER_FOCUS.0 + COMBINED.0 + VOICE.0) as u32
+    );
+    assert_eq!(
+        inst.chain(),
+        [s(FOCUS), s(DEREVERB), s(DENOISE), s(ENHANCE)]
+    );
+    inst.unload();
+    assert!(
+        f.tree
+            .calls("destroy")
+            .contains(&"destroy speaker_focus".to_string())
+    );
 }
 
 #[test]
@@ -269,8 +381,9 @@ fn the_configured_root_comes_first_and_a_missing_sdk_is_told() {
 }
 
 #[test]
-fn the_settings_are_noise_echo_and_studio_voice_on_the_mic_surface() {
-    let Some(f) = fixture("the_settings_are_noise_echo_and_studio_voice_on_the_mic_surface") else {
+fn the_settings_are_focus_noise_echo_and_studio_voice_on_the_mic_surface() {
+    let Some(f) = fixture("the_settings_are_focus_noise_echo_and_studio_voice_on_the_mic_surface")
+    else {
         return;
     };
     let d = f.module.settings().unwrap();
@@ -284,9 +397,24 @@ fn the_settings_are_noise_echo_and_studio_voice_on_the_mic_surface() {
         [
             ("noise", Some("mic")),
             ("echo", Some("mic")),
+            ("focus", Some("mic")),
             ("voice", Some("mic"))
         ]
     );
+    let focus = d.enable_of(FOCUS).unwrap();
+    assert_eq!(
+        (focus.id.as_str(), focus.role),
+        ("mic.focus.enabled", Some(Role::Enable))
+    );
+    assert!(matches!(focus.kind, SettingType::Bool { default: false }));
+    assert!(focus.label.contains("other voices"), "{}", focus.label);
+    assert!(
+        focus.enabled_when.is_empty(),
+        "composable with studio voice"
+    );
+    assert!(d.param(FOCUS, "strength").is_none());
+    let group = d.groups.iter().find(|g| g.id == "focus").unwrap();
+    assert_eq!(group.label, "Speaker focus");
     // The noise removal ids are those of the CPU provider.
     let noise = d.enable_of(DENOISE).unwrap();
     assert_eq!(
