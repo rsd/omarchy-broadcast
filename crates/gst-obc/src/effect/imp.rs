@@ -130,7 +130,9 @@
 //! # The fallback image
 //!
 //! With `on-failure=image` and a `fallback-image`, the image is wanted for
-//! the path and the negotiated size and colour (`FallbackKey`). Each new
+//! the path, the file there (`background::FileStamp`: an image replaced
+//! at the same path is another key, so settings applied again read it
+//! again) and the negotiated size and colour (`FallbackKey`). Each new
 //! key (from `apply` or `set_caps`) starts a decode on a thread of its own
 //! (`obceffect-image`, [`background::decode_yuv420`]), numbered
 //! (`FallbackCtl::serial`) so that a result arriving after the key changed
@@ -247,11 +249,14 @@ struct LoadedKey {
     colour: ColourSpec,
 }
 
-/// What the fallback image is decoded for: its path, and the negotiated
-/// size and colour.
+/// What the fallback image is decoded for: its path and the file there,
+/// and the negotiated size and colour.
 #[derive(Debug, Clone, PartialEq)]
 struct FallbackKey {
     path: PathBuf,
+    /// The file at `path` when the key was made: an image replaced at the
+    /// same path is another key, decoded again.
+    file: Option<background::FileStamp>,
     width: u32,
     height: u32,
     colour: ColourSpec,
@@ -494,12 +499,22 @@ impl Control {
         true
     }
 
-    /// The fallback image the settings and the caps want, if any.
-    fn fallback_wanted(&self) -> Option<FallbackKey> {
+    /// The path of the fallback image the settings and the caps want, if
+    /// any.
+    fn fallback_path(&self) -> Option<&PathBuf> {
         let path = self.settings.fallback_image.as_ref()?;
+        self.format.as_ref()?;
+        (self.settings.fallback == EffectFallback::Image).then_some(path)
+    }
+
+    /// The fallback image the settings and the caps want, if any, the file
+    /// at its path ([`Self::fallback_path`]) being `file`.
+    fn fallback_wanted(&self, file: Option<background::FileStamp>) -> Option<FallbackKey> {
+        let path = self.fallback_path()?;
         let format = self.format.as_ref()?;
-        (self.settings.fallback == EffectFallback::Image).then(|| FallbackKey {
+        Some(FallbackKey {
             path: path.clone(),
+            file,
             width: format.width,
             height: format.height,
             colour: *format.colour.as_ref().unwrap_or(&format.black),
@@ -940,9 +955,19 @@ impl ObcEffect {
     /// (see "The fallback image" in the module docs), forgetting the
     /// previous one, when that is another; posts when its report changes.
     fn refresh_fallback(&self) {
+        // The file at the path is stat'ed with the control lock released:
+        // `stat` opens nothing, but it can hang on a stalled network or
+        // FUSE mount, and the streaming thread takes the lock every frame.
+        let path = lock(&self.shared.control).fallback_path().cloned();
+        let file = path.as_deref().and_then(background::FileStamp::of);
         let (start, posted) = {
             let mut c = lock(&self.shared.control);
-            let want = c.fallback_wanted();
+            // Another path is wanted now (new settings or caps): the
+            // refresh that follows them stats it.
+            if c.fallback_path() != path.as_ref() {
+                return;
+            }
+            let want = c.fallback_wanted(file);
             if want == c.fallback.key {
                 return;
             }
@@ -2480,8 +2505,47 @@ impl ObcEffect {
 
 #[cfg(test)]
 mod tests {
-    use super::OnExit;
+    use super::{ColourSpec, Control, EffectFallback, Format, OnExit, background};
     use std::cell::Cell;
+    use std::path::Path;
+
+    /// The fallback key `c` wants for the file now at `path`, as
+    /// `refresh_fallback` builds it.
+    fn key_now(c: &Control, path: &Path) -> Option<super::FallbackKey> {
+        c.fallback_wanted(background::FileStamp::of(path))
+    }
+
+    #[test]
+    fn a_fallback_image_replaced_at_its_path_is_another_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("away.png");
+        std::fs::write(&path, b"one").unwrap();
+        let mut c = Control::default();
+        c.settings.fallback = EffectFallback::Image;
+        c.settings.fallback_image = Some(path.clone());
+        assert_eq!(key_now(&c, &path), None, "no caps yet");
+        c.format = Some(Format {
+            width: 64,
+            height: 48,
+            colour: Ok(ColourSpec::LIMITED_BT601),
+            black: ColourSpec::LIMITED_BT601,
+        });
+        assert_eq!(c.fallback_path(), Some(&path));
+        let first = key_now(&c, &path).unwrap();
+        assert_eq!(key_now(&c, &path), Some(first.clone()), "unchanged file");
+        // Another file renamed onto the path, as an editor saves.
+        let next = dir.path().join("next.png");
+        std::fs::write(&next, b"two").unwrap();
+        std::fs::rename(&next, &path).unwrap();
+        let second = key_now(&c, &path).unwrap();
+        assert_ne!(second, first, "replaced file");
+        assert_eq!(second.path, first.path);
+        assert_eq!(key_now(&c, &path), Some(second), "unchanged again");
+        // Black wanted: no image, no key.
+        c.settings.fallback = EffectFallback::Black;
+        assert_eq!(c.fallback_path(), None);
+        assert_eq!(key_now(&c, &path), None);
+    }
 
     /// The shape of `render`: an early `?` return after work was queued.
     fn queue_then(fail_early: bool, synced: &Cell<u32>) -> Result<(), String> {

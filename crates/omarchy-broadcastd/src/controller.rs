@@ -341,6 +341,10 @@ pub const STATS_PERIOD: Duration = Duration::from_secs(1);
 const POLL_STARTING: Duration = Duration::from_millis(50);
 /// How often a running session is checked for failures.
 const POLL_RUNNING: Duration = Duration::from_millis(250);
+/// The longest the writer's placeholder is waited for while it decodes
+/// the fallback image: past it the image is said not to be readable, and
+/// the steps no longer come often for it (a decode that hung or died).
+const PLACEHOLDER_DECODE_LIMIT: Duration = Duration::from_secs(10);
 /// The longest sleep with nothing scheduled.
 const IDLE_WAKE: Duration = Duration::from_secs(60);
 /// How often the effect's GPU time is logged (debug) while it runs.
@@ -1238,6 +1242,15 @@ pub struct Controller<B: MediaBackend> {
     /// Why the writer's placeholder cannot show that image (a `Warning`
     /// clause).
     placeholder_failure: Option<String>,
+    /// The writer is still decoding that image: whether it can show it is
+    /// not known yet, so the steps come often until it is
+    /// ([`Self::next_wakeup`]).
+    placeholder_pending: bool,
+    /// When a step first saw that decode pending ([`Self::watch_placeholder`]).
+    placeholder_pending_since: Option<Instant>,
+    /// That decode has been pending for [`PLACEHOLDER_DECODE_LIMIT`]: the
+    /// image is said not to be readable, and the steps no longer come often.
+    placeholder_overdue: bool,
     /// Why the running session's effect element cannot show the fallback
     /// image, while its effect has failed (a `Warning` clause).
     fallback_failure: Option<String>,
@@ -1645,6 +1658,9 @@ impl<B: MediaBackend> Controller<B> {
             privacy_hold: None,
             placeholder_set: None,
             placeholder_failure: None,
+            placeholder_pending: false,
+            placeholder_pending_since: None,
+            placeholder_overdue: false,
             fallback_failure: None,
             error,
             state_damaged,
@@ -1931,6 +1947,12 @@ impl<B: MediaBackend> Controller<B> {
         }
         if let Some(t) = self.next_stats {
             at(t);
+        }
+        // The placeholder image's decode ends off this thread: its outcome
+        // (a `Warning` when it cannot be read) is looked for soon, until
+        // it is overdue.
+        if self.placeholder_pending && !self.placeholder_overdue {
+            at(now + POLL_RUNNING);
         }
         if let Some(t) = self.settings_deadline() {
             at(t);
@@ -2919,6 +2941,7 @@ impl<B: MediaBackend> Controller<B> {
     // ---- the step ----
 
     fn reconcile(&mut self, now: Instant) {
+        self.watch_placeholder(now);
         self.check_writer(now);
         self.check_session(now);
         if self.streams_without_black_effect() {
@@ -2946,21 +2969,22 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     /// The running session streams without its effects
-    /// ([`Self::passthrough`]) while a background effect a module provides
-    /// is selected with an `on_failure` that hides the camera (`black` or
-    /// `image`): it shows what the user asked never to be shown.
+    /// ([`Self::passthrough`]) while a session started now would be refused
+    /// without them ([`Self::refuses_passthrough`]): it shows what the user
+    /// asked never to be shown. A session whose module cannot run the
+    /// effect is left as it is (the raw picture and `Warning`, as a start
+    /// would give it).
     fn streams_without_black_effect(&self) -> bool {
-        if self.passthrough.is_none() {
-            return false;
-        }
-        let effect = self.effect();
-        effect.mode != EffectMode::None
-            && effect.on_failure.hides()
-            && self
-                .modules
-                .resolve(StageId::BACKGROUND.as_str())
-                .provider
-                .is_some()
+        self.passthrough.is_some() && self.refuses_passthrough()
+    }
+
+    /// A session started now would be given a background effect, under an
+    /// `on_failure` that hides the camera, and so is never started without
+    /// its effects ([`Self::start_passthrough`]): the effect is selected and
+    /// a module of a fresh plan can run it. The one test the guard and the
+    /// start both use.
+    fn refuses_passthrough(&self) -> bool {
+        Self::hides_effect(&self.effect_run_with(&self.fresh_plan()))
     }
 
     fn check_writer(&mut self, now: Instant) {
@@ -3835,6 +3859,7 @@ impl<B: MediaBackend> Controller<B> {
             }
             return false;
         }
+        let again = restart;
         let restart = restart && self.passthrough.is_none();
         // The GPU is up: the compute capability can be learnt, and what is
         // installed for this GPU read again (applied to the session if it
@@ -3845,6 +3870,19 @@ impl<B: MediaBackend> Controller<B> {
         }
         if self.session.is_none() {
             return false;
+        }
+        // Started without its effects while the effect could not run, it
+        // now can (learnt for this GPU): as the guard would, the session is
+        // stopped before the camera opens, and started again with the
+        // effect in this step (once) or the next.
+        if self.streams_without_black_effect() {
+            warning!(
+                "the effect can run now under on_failure = \"{}\": not streaming without it",
+                self.effect().on_failure
+            );
+            self.drop_session();
+            self.privacy_hold = Some(PrivacyHold::Guard);
+            return again;
         }
         // Turned off during the (slow) output build: no camera is opened;
         // the queued SetEnabled(false) is handled next.
@@ -3929,6 +3967,7 @@ impl<B: MediaBackend> Controller<B> {
         let stages = self.take_stage_failures();
         self.stages.clear();
         self.effect_failure = None;
+        self.fallback_failure = None;
         let enhance = self.enhance_failure.take();
         if stages || enhance.is_some_and(|e| e == self.error) {
             self.error = self.standing_error();
@@ -4016,7 +4055,14 @@ impl<B: MediaBackend> Controller<B> {
         }
     }
 
+    /// A lifecycle fault that is not privacy's: it ends any privacy hold
+    /// (the placeholder is black, as for any other fault).
     fn set_fault(&mut self, msg: String) {
+        self.privacy_hold = None;
+        self.fault_is(msg);
+    }
+
+    fn fault_is(&mut self, msg: String) {
         error!("{msg}");
         self.error = msg.clone();
         self.fault = Some(msg);
@@ -4027,7 +4073,7 @@ impl<B: MediaBackend> Controller<B> {
     /// stands, privacy holds the feed ([`Self::privacy_hold`]).
     fn set_privacy_fault(&mut self, msg: String) {
         self.privacy_hold = Some(PrivacyHold::Fault(msg.clone()));
-        self.set_fault(msg);
+        self.fault_is(msg);
     }
 
     /// A background effect is asked of the session with an `on_failure`
@@ -4078,11 +4124,44 @@ impl<B: MediaBackend> Controller<B> {
             }
             self.backend.set_placeholder(want.as_deref());
             self.placeholder_set = want;
+            self.restart_placeholder_wait();
         }
-        self.placeholder_failure = match self.placeholder_set {
+        self.placeholder_pending =
+            self.placeholder_set.is_some() && self.backend.placeholder_pending();
+        if !self.placeholder_pending {
+            self.restart_placeholder_wait();
+        }
+        self.placeholder_failure = match &self.placeholder_set {
+            Some(p) if self.placeholder_pending && self.placeholder_overdue => {
+                Some(obc_pipeline::effect::fallback_unreadable(
+                    p,
+                    &format!(
+                        "not decoded within {} s",
+                        PLACEHOLDER_DECODE_LIMIT.as_secs()
+                    ),
+                ))
+            }
             Some(_) => self.backend.placeholder_failure(),
             None => None,
         };
+    }
+
+    /// Times the writer's placeholder decode a step finds still pending
+    /// ([`Self::placeholder_pending`], as last read): overdue once it has
+    /// been for [`PLACEHOLDER_DECODE_LIMIT`].
+    fn watch_placeholder(&mut self, now: Instant) {
+        if !self.placeholder_pending {
+            return;
+        }
+        let since = *self.placeholder_pending_since.get_or_insert(now);
+        self.placeholder_overdue = now.saturating_duration_since(since) >= PLACEHOLDER_DECODE_LIMIT;
+    }
+
+    /// The placeholder's decode is waited for afresh: the image was given
+    /// to it again, or its outcome is known.
+    fn restart_placeholder_wait(&mut self) {
+        self.placeholder_pending_since = None;
+        self.placeholder_overdue = false;
     }
 
     /// `Warning`'s clauses of the fallback image: `on_failure = "image"`
@@ -4782,6 +4861,13 @@ impl<B: MediaBackend> Controller<B> {
     /// cannot take is an effect failure
     /// ([`Self::effect_failed`]), and the method's error.
     fn apply_effect(&mut self) -> Result<(), IpcError> {
+        self.apply_effect_with(false)
+    }
+
+    /// [`Self::apply_effect`]; with `again`, the effect is given to the
+    /// session even when unchanged (its element reads a replaced fallback
+    /// image again).
+    fn apply_effect_with(&mut self, again: bool) -> Result<(), IpcError> {
         let effect = self.effect_run();
         let failed = matches!(self.effect_seen, Some(EffectStatus::Failed(_)));
         let prev = self.effect_applied.clone();
@@ -4794,7 +4880,7 @@ impl<B: MediaBackend> Controller<B> {
         };
         let stages = all(&effect);
         let any_failed = stages.iter().any(|s| self.stage_failed(&s.id));
-        if !failed && !any_failed && prev.as_ref() == Some(&effect) {
+        if !again && !failed && !any_failed && prev.as_ref() == Some(&effect) {
             return Ok(());
         }
         if failed
@@ -6860,9 +6946,17 @@ impl<B: MediaBackend> Controller<B> {
         // Enhancement is followed below, once the cameras are read again.
         self.follow_modules(false, now, true);
         // The effect in force may have changed (or failed before): applied
-        // again, which retries a failed effect.
+        // again, which retries a failed effect. A fallback image is given
+        // again even when nothing changed, and so is the placeholder's: the
+        // file at its path may have been replaced, and is read again if so.
+        let image = self.effect().on_failure == EffectOnFailure::Image
+            && self.effect().fallback_image.is_some();
         if self.session.is_some() {
-            let _ = self.apply_effect();
+            let _ = self.apply_effect_with(image);
+        }
+        if let Some(p) = &self.placeholder_set {
+            self.backend.set_placeholder(Some(p));
+            self.restart_placeholder_wait();
         }
         let old_cameras = self.rescan_cameras();
         // The streaming camera's mode changed: reopen it in the new mode.

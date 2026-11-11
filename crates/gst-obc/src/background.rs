@@ -737,9 +737,59 @@ pub fn decode_yuv420(
     decode_as(path, width, height, Subject::FALLBACK).map(|bgr| bgr_to_yuv420(&bgr, colour))
 }
 
+/// What tells the file at a path from another one put in its place: its
+/// device, inode, size, and modification and change times, from `stat`
+/// (which opens nothing, so a FIFO cannot block it). `None` when the path
+/// cannot be stat'ed. An image replaced at the same path (written over, or
+/// renamed onto it) has another stamp: a holder of its decoded frame that
+/// compares stamps reads it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileStamp {
+    /// The stamp of the file at `path` now.
+    pub fn of(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path).ok()?;
+        Some(Self {
+            dev: m.dev(),
+            ino: m.ino(),
+            len: m.len(),
+            mtime: (m.mtime(), m.mtime_nsec()),
+            ctime: (m.ctime(), m.ctime_nsec()),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_replaced_at_the_same_path_has_another_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("away.png");
+        assert_eq!(FileStamp::of(&path), None, "no file");
+        std::fs::write(&path, b"one").unwrap();
+        let first = FileStamp::of(&path).unwrap();
+        assert_eq!(FileStamp::of(&path), Some(first), "unchanged");
+        // Renamed onto the path (as an editor saves): another inode.
+        let next = dir.path().join("next.png");
+        std::fs::write(&next, b"two").unwrap();
+        std::fs::rename(&next, &path).unwrap();
+        let second = FileStamp::of(&path).unwrap();
+        assert_ne!(second, first);
+        // Written over in place, same size: another change time at least.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, b"six").unwrap();
+        assert_ne!(FileStamp::of(&path), Some(second));
+    }
 
     fn crop(left: u32, right: u32, top: u32, bottom: u32) -> CropRect {
         CropRect {

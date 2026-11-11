@@ -820,6 +820,39 @@ fn gpu_an_unreadable_fallback_image_shows_black_and_says_why() {
 
 #[test]
 #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_fallback_image_put_at_its_path_is_read_when_the_settings_are_applied_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("away.png");
+    let fake = FakeFactory::new(FakeConfig {
+        fail_load: Some("fake load failure".into()),
+        ..FakeConfig::default()
+    });
+    let settings = EffectSettings {
+        fallback: EffectFallback::Image,
+        fallback_image: Some(path.clone()),
+        ..EffectSettings::of(EffectKind::Blur)
+    };
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &settings);
+    rig.frames_until(Duration::from_secs(10), |r| {
+        failed(r) && r.effect.stats().fallback_error.is_some()
+    });
+    assert_eq!(rig.frame(), Seen::Black);
+    // The image put at the same path: the same settings applied again
+    // read it.
+    assert_eq!(white_png(dir.path(), 400, 400), path);
+    rig.effect.apply(&settings).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !is_white(&rig.bytes_with(gst::BufferFlags::empty())) {
+        assert!(Instant::now() < deadline, "the image never showed");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert_eq!(rig.effect.stats().fallback_error, None);
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
 fn gpu_failures_show_black_or_the_input_as_configured() {
     let fake = FakeFactory::new(FakeConfig {
         fail_load: Some("fake load failure".into()),
