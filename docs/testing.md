@@ -728,7 +728,7 @@ The Omarchy Broadcast Mic ([ADR-0029](adr/0029-audio-modules-mic-host-and-worker
 ### Default suite (no PipeWire, no GPU, no camera)
 
 ```sh
-cargo test --locked -p obc-audio -p obc-mic-shim -p omarchy-broadcast-audiod -p obc-module-voice-cpu
+cargo test --locked -p obc-audio -p obc-mic-shim -p omarchy-broadcast-audiod -p obc-module-voice-cpu -p obc-module-afx
 cargo test --locked -p obc-module-abi -p obc-module-sdk -p obc-module-host
 cargo test --locked -p obc-core -p obc-ipc -p omarchy-broadcastd -p omarchy-broadcast
 cargo test --manifest-path examples/module-hello-audio/Cargo.toml --locked
@@ -759,6 +759,31 @@ The test re-runs itself inside `scripts/mic-pw-sandbox.sh`, which guarantees tha
 - the inner run refuses to start unless every directory PipeWire, WirePlumber and the worker use is the sandbox's temporary one.
 
 It covers what no fake can: the device list (both virtual microphones, never the Omarchy Broadcast Mic's own nodes); "use as default microphone", which makes the node the default and pins the capture side to the previous default, and again to the other microphone, with the previous default still the first and never the Omarchy Broadcast Mic; the pin surviving a restart of the mic host (WirePlumber's restore-stream sets it on the new capture node) and of the worker; consumers (a level meter is not one, a recorder is); the node's `ProcessLatency` published for the graph's quantum; and the restore, which makes the first microphone the default again and removes the pin, idempotently and across a mic host restart. The sandbox script can run any command, so another PipeWire test is `scripts/mic-pw-sandbox.sh -- COMMAND` (`--plugin` and `--conf` choose the plugin and the mic host configuration).
+
+### The Maxine audio effects module
+
+`crates/obc-module-afx` (`br.com.dias.maxine-afx`, [setup/microphone.md](setup/microphone.md#on-an-nvidia-gpu-maxine-audio-effects)) runs the NVIDIA Maxine Audio Effects SDK, which cannot be in this repository, so its default suite runs over a **stand-in SDK** and needs no NVIDIA software, GPU, PipeWire or camera:
+
+```sh
+cargo test --locked -p obc-module-afx
+```
+
+The stand-in is `crates/obc-module-afx/tests/fixtures/mock-afx`, a small library of its own (built by the tests with `cargo build --locked` into a directory under `CARGO_TARGET_TMPDIR`; its `Cargo.lock` is committed and must not be rewritten). It contains no NVIDIA code: it exports the entry points the module calls, as effects that are a delay and a gain, finds each effect's feature library by name on the library search path as the real SDK does, logs every call, and is steered by a file beside it (which call fails, each effect's delay and gain). A fixture SDK tree (a core library, a feature library and model files per effect) is made for each test.
+
+- **Unit tests** (20, in `src/`): the planning of a chain from its stages (which effect each stage is, where a strength is honoured, the combined effect where installed, unknown and repeated stages refused, a failed combined effect naming both stages), the delay-matched mix and its one-block ramp, the delay measurement (a probe signal, a delay found to the sample), the SDK's file layout and the probe's reasons (the core library, the driver, a feature, its models), the root precedence, the configuration keys (`sdk_root` and `_host`; any other refused), the profiles' mapping and the strengths read and clamped, the search-path check and that the audio entries are exported.
+- **The module as the worker sees it** (`tests/module.rs`, 26 tests), through `obc-module-host` with the audio kinds: the manifest declares three GPU stages ranked above the CPU provider; the worker opens the library and the video daemon's registry lists it without opening it; the probe and the check read the tree and touch no effect; the probe names what is missing; **the configured root comes first**, then `MAXINE_AFX_ROOT`, then the default root, and a missing SDK is said; the settings of the `mic` surface and their greyed reasons; noise removal as the version 2 model with its parameters set in order; a lower strength mixes in the delayed input; **a strength is live**, changing the mix between blocks with no reload and no change of the delay, including on the combined model; a request of the same effects keeps them in place (a switch); noise and echo together run as the combined model, and as two effects one after the other when it is absent or fails to load; studio voice takes its profile after the load; a stage that fails to load fails alone and leaks no effect; an effect that fails on a block is replaced by its delay and the rest runs; a delay that cannot be measured fails the stage; a feature library that cannot be found fails its stage; unload and drop destroy every effect; a new source resets the effects; only mono 48 kHz blocks of 480 samples are taken; load, process and unload on three threads; and the search path: libraries reached through links are found, and **without the search path every stage fails with a reason that names the drop-in**.
+
+Because the dynamic linker reads `LD_LIBRARY_PATH` once, when a process starts, a test that uses the effects runs in a child process of the test binary started with the path leading to its fixture tree, as the worker's drop-in starts the worker.
+
+**Hardware tests (ignored).** `crates/obc-module-afx/tests/hardware.rs` runs the module over the real SDK and an NVIDIA GPU: the probe and the check find every stage, every chain loads, runs and reports the delay the output has, and a switch in place keeps the effect. Each test does nothing unless `MAXINE_AFX_ROOT` names the SDK, and the process must start as the worker's drop-in starts the worker, with the package's environment file (whose `LD_LIBRARY_PATH` the module requires) and the os-release shim preloaded:
+
+```sh
+cargo test --manifest-path crates/obc-module-afx/Cargo.toml --no-run
+set -a; . /usr/share/maxine-afx/maxine-afx.env; set +a
+env LD_PRELOAD=$MAXINE_AFX_OS_RELEASE_SHIM <the hardware test binary> --ignored --nocapture --test-threads=1
+```
+
+Each chain is loaded on one thread, run on another and unloaded on a third, as the worker does, with the strengths passed live. The tests assert only what must hold anywhere (the stages load, the output is finite and not silent, the reported delay is the delay the output has, every effect is destroyed); they print what they measured, and those figures are for local comparison and are not published.
 
 ## Manual test
 

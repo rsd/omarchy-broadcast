@@ -19,6 +19,7 @@ members = [
     "crates/obc-mic-shim",
     "crates/omarchy-broadcast-audiod",
     "crates/obc-module-voice-cpu",
+    "crates/obc-module-afx",
 ]
 # Built on its own, as a module outside the workspace would be (CI builds it).
 exclude = [
@@ -26,11 +27,14 @@ exclude = [
     "examples/module-hello-audio",
     # The test module of obc-module-host, built by its tests.
     "crates/obc-module-host/tests/fixtures/module-fixture",
+    # The stand-in for the NVIDIA audio SDK library, built by the tests of
+    # obc-module-afx.
+    "crates/obc-module-afx/tests/fixtures/mock-afx",
 ]
 
 [workspace.package]
 # Also the pkgver= of packaging/arch/PKGBUILD: bump both; CI checks they match.
-version = "0.29.0"
+version = "0.30.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Raul Dias"]

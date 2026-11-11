@@ -1,0 +1,55 @@
+# The manifest of the NVIDIA Maxine audio effects module. It is installed in
+# /usr/lib/omarchy-broadcast/modules.d with the library; the audio worker
+# loads it, the video daemon lists it and never opens it. The module needs
+# the NVIDIA Maxine Audio Effects SDK at run time, which is not part of
+# omarchy-broadcast (see its documentation).
+abi = 1
+id = "br.com.dias.maxine-afx"
+name = "NVIDIA Maxine audio effects"
+version = "0.30.0"
+licence = "MIT OR Apache-2.0 (module); NVIDIA Maxine Audio Effects SDK under its own licence"
+kind = "audio-filter"
+library = "/usr/lib/omarchy-broadcast/modules/libobc_module_afx.so"
+description = "Microphone noise removal, room echo removal and studio voice on NVIDIA GPUs, with NVIDIA Maxine Audio Effects"
+
+[requires]
+hardware = ["nvidia-turing+"]
+
+# Removes the room's echo (reverberation) from the voice, before noise
+# removal; with noise removal, both run as one combined model.
+[[stage]]
+id = "mic-dereverb"
+slot = "clean"
+rank = 300
+device = "nvidia-gpu"
+position = 50
+frames = ["host"]
+rates = [48000]
+frame_samples = [480]
+channels = 1
+
+# Removes background noise from the voice. Ranked above the CPU provider,
+# so this one is chosen when the GPU can run it.
+[[stage]]
+id = "mic-denoise"
+slot = "clean"
+rank = 300
+device = "nvidia-gpu"
+frames = ["host"]
+rates = [48000]
+frame_samples = [480]
+channels = 1
+
+# Studio voice: resynthesises the voice as if recorded in a studio, with a
+# choice of mic profile. It already removes noise and echo, so it turns the
+# other two stages off.
+[[stage]]
+id = "mic-enhance"
+slot = "shape"
+rank = 300
+device = "nvidia-gpu"
+conflicts = ["mic-denoise", "mic-dereverb"]
+frames = ["host"]
+rates = [48000]
+frame_samples = [480]
+channels = 1

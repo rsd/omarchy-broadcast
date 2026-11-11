@@ -4,7 +4,7 @@ The video effects `blur` and `replace`, video noise removal, relighting and the 
 
 Without the SDK the daemon works as usual: the `none` effect and the passthrough need nothing from it, and an effect or noise removal that cannot load reports the reason in the daemon's `Error` property. Without the module (no manifest for it in a `modules.d` directory) the daemon offers no effect at all: the camera image passes through and `omarchy-broadcast modules` says `No effect modules installed`.
 
-The AR effects, eye contact and auto-framing, run on a second SDK through a second module, and are described in [The Maxine AR module](#the-maxine-ar-module).
+The AR effects, eye contact and auto-framing, run on a second SDK through a second module, and are described in [The Maxine AR module](#the-maxine-ar-module). The microphone's GPU effects (noise removal, room echo removal and studio voice) run on a third, the Audio Effects SDK, through a third module that the audio worker loads, not the daemon, and are described in [The Maxine audio effects module](#the-maxine-audio-effects-module).
 
 Background: [../research/maxine-linux.md](../research/maxine-linux.md) (access, licence, API). The SDK is never vendored in this repository, see [ADR-0003](../adr/0003-maxine-first-behind-backend-seam.md). The decision to leave the SDK tooling to omarchy-nvidia-sdks is in [ADR-0021](../adr/0021-nvidia-sdk-handover.md).
 
@@ -287,6 +287,20 @@ If the stage is greyed or does not run, the reason is the one `omarchy-broadcast
 
 To remove the module's drop-in, delete `maxine-ar.conf` as in section 8. The AR package is removed with `sudo pacman -R maxine-ar-sdk-local`, only if nothing else uses it.
 
+## The Maxine audio effects module
+
+The microphone's GPU effects run on the NVIDIA Maxine **Audio Effects** SDK, through a third module of omarchy-broadcast, `br.com.dias.maxine-afx` (an `audio-filter` module: [../modules.md](../modules.md#the-audio-modules-in-this-repository), [ADR-0029](../adr/0029-audio-modules-mic-host-and-worker.md)). The Audio Effects SDK is a separate personal download from the Video Effects and AR SDKs; omarchy-nvidia-sdks packages it as `maxine-afx-sdk-local`. Section 9 applies to it too.
+
+It differs from the two video modules in three ways, which is why it is not described with them:
+
+- **The audio worker loads it, not the daemon.** The worker is the unit `omarchy-broadcast-audiod.service`, so its drop-in is `omarchy-broadcast-audiod.service.d/maxine-afx.conf`, not the daemon's. The daemon never opens the audio SDK, and the audio drop-in is not needed for the camera, nor the camera's for the microphone. A machine can have any of the three drop-ins.
+- **`LD_LIBRARY_PATH` is required.** The SDK opens its effects' feature libraries by a name that only the library search path resolves, read when the process starts, so (unlike the video modules, which load their libraries by absolute path) the module requires the path to lead to the feature libraries of the root in use. The package's environment file sets it. Without it the stages are unavailable, with a reason that names the drop-in.
+- **The root is searched in the other order.** `sdk_root` in `[module."br.com.dias.maxine-afx"]`, then `MAXINE_AFX_ROOT`, then `/opt/nvidia/maxine/afx`: the configured root comes first, whereas for the video modules the environment variable comes first (section 4).
+
+The os-release shim of section 3 applies to the worker in the same way, set by the drop-in on the worker only. The Arch package installs the module and ships the drop-in as an inactive example (`/usr/share/doc/omarchy-broadcast/examples/systemd/omarchy-broadcast-audiod.service.d/maxine-afx.conf`); `scripts/install-user.sh --audio` installs the module and prints the command that copies the drop-in. The module installs and loads without the SDK, and without the SDK or the drop-in the microphone uses its CPU module.
+
+What the effects do, the settings in the Mic tab, studio voice's exclusion of noise and echo removal and its delay, the choice of provider, enabling the drop-in and troubleshooting are in [microphone.md](microphone.md#on-an-nvidia-gpu-maxine-audio-effects). Check the module with `omarchy-broadcast modules` and `omarchy-broadcast modules info br.com.dias.maxine-afx`, which show each stage's reason.
+
 ## 8. Uninstall
 
 ```bash
@@ -307,6 +321,8 @@ rm -f ~/.local/share/omarchy-broadcast/modules.d/maxine-vfx.toml ~/.local/lib/om
 Restart the daemon after either. The packaged module goes with the omarchy-broadcast package, and `omarchy-broadcast modules disable br.com.dias.maxine-vfx` turns it off without removing it.
 
 An os-release shim installed by `scripts/install-user.sh` of an older omarchy-broadcast release, under `~/.local/lib/omarchy-broadcast/`, is removed by `scripts/install-user.sh --uninstall` of the current script, and by reinstalling with it. To remove it by hand: `rm -f ~/.local/lib/omarchy-broadcast/os-release-shim.so ~/.local/lib/omarchy-broadcast/fake-os-release`.
+
+The audio module's drop-in is removed the same way: delete `~/.config/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf` and run `systemctl --user daemon-reload`; the worker starts without the SDK from its next start. The package is `maxine-afx-sdk-local`. The module's library and manifest of a checkout are removed by `scripts/install-user.sh --uninstall`, and the packaged ones go with the omarchy-broadcast package; `omarchy-broadcast modules disable br.com.dias.maxine-afx` turns the module off without removing it.
 
 The NGC CLI, the NGC key and the downloads belong to omarchy-nvidia-sdks; its documentation covers removing them.
 

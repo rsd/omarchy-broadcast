@@ -54,6 +54,15 @@
 # does. Enable it with
 #   systemctl --user enable --now omarchy-broadcast-mic.service
 # It is the alternative to the ADR 0014 units above: run one of them.
+# The NVIDIA Maxine Audio Effects SDK (microphone noise removal, room echo
+# removal, studio voice on an NVIDIA GPU) is licensed separately by NVIDIA and
+# is never part of this package either. It comes from the maxine-afx-sdk-local
+# package (optional dependency), which each user builds from their own download
+# with the omarchy-nvidia-sdks repository. The Maxine audio module that uses it
+# is installed (the worker loads it, and it loads the SDK at run time, so it
+# installs without it); the example drop-in that runs the worker with the SDK
+# is shipped, not active (docs/setup/microphone.md):
+#   /usr/share/doc/omarchy-broadcast/examples/systemd/omarchy-broadcast-audiod.service.d/maxine-afx.conf
 # DeepFilterNet is a git dependency (the upstream repository, pinned by commit
 # in Cargo.lock): `cargo fetch` in prepare() needs network access for it, and
 # the build cannot be done offline without a prepared vendor directory.
@@ -63,7 +72,7 @@
 
 pkgname=omarchy-broadcast-git
 _pkgname=omarchy-broadcast
-pkgver=0.29.0
+pkgver=0.30.0
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API and a CLI'
 arch=('x86_64')
@@ -102,6 +111,7 @@ optdepends=(
   'deepfilternet-ladspa: DeepFilterNet engine for the noise-removed microphone'
   'maxine-vfx-sdk-local: NVIDIA Maxine video effects (build it from omarchy-nvidia-sdks)'
   'maxine-ar-sdk-local: NVIDIA Maxine AR effects, eye contact (build it from omarchy-nvidia-sdks)'
+  'maxine-afx-sdk-local: NVIDIA Maxine audio effects for the microphone (build it from omarchy-nvidia-sdks)'
 )
 # No LTO: with makepkg's -flto, libspa's build script compiles its C wrapper
 # into GCC LTO bitcode, which rust-lld cannot link (undefined libspa_rs_*).
@@ -135,12 +145,14 @@ build() {
   # The Maxine modules: libraries the daemon loads (no Maxine code is linked
   # into the daemon).
   cargo build --frozen --release -p obc-module-maxine -p obc-module-maxine-ar
-  # The audio worker, the LADSPA forwarding plugin (libomarchy_broadcast_mic.so)
-  # and the CPU voice module. A separate invocation, as for the modules above:
+  # The audio worker, the LADSPA forwarding plugin (libomarchy_broadcast_mic.so),
+  # the CPU voice module and the Maxine audio module. A separate invocation, as
+  # for the modules above:
   # one invocation unifies the features of its packages. The plugin and the
   # module are libraries the mic host's filter-chain and the worker load.
   cargo build --frozen --release \
-    -p omarchy-broadcast-audiod -p obc-mic-shim -p obc-module-voice-cpu
+    -p omarchy-broadcast-audiod -p obc-mic-shim -p obc-module-voice-cpu \
+    -p obc-module-afx
 }
 
 check() {
@@ -153,9 +165,9 @@ check() {
   # PipeWire node's unit tests (the feature the package is built with);
   # they contact no PipeWire daemon, and the live PipeWire tests are
   # ignored.
-  env -u MAXINE_VFX_ROOT -u MAXINE_AR_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u MAXINE_OS_RELEASE \
+  env -u MAXINE_VFX_ROOT -u MAXINE_AR_ROOT -u MAXINE_AFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u MAXINE_OS_RELEASE \
     cargo test --frozen --workspace
-  env -u MAXINE_VFX_ROOT -u MAXINE_AR_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u MAXINE_OS_RELEASE \
+  env -u MAXINE_VFX_ROOT -u MAXINE_AR_ROOT -u MAXINE_AFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u MAXINE_OS_RELEASE \
     cargo test --frozen -p obc-pipeline -p omarchy-broadcastd --features omarchy-broadcastd/pipewire
 }
 
@@ -214,6 +226,16 @@ package() {
     "$pkgdir/usr/lib/$_pkgname/modules.d/voice-cpu.toml" ||
     { echo 'voice-cpu.toml: the library path is not the packaged one' >&2; return 1; }
 
+  # The Maxine audio module (audio worker), likewise: the library and its
+  # manifest. The worker loads it; it loads the SDK at run time.
+  install -Dm755 -t "$pkgdir/usr/lib/$_pkgname/modules" \
+    target/release/libobc_module_afx.so
+  install -Dm644 -t "$pkgdir/usr/lib/$_pkgname/modules.d" \
+    crates/obc-module-afx/maxine-afx.toml
+  grep -qx 'library = "/usr/lib/omarchy-broadcast/modules/libobc_module_afx.so"' \
+    "$pkgdir/usr/lib/$_pkgname/modules.d/maxine-afx.toml" ||
+    { echo 'maxine-afx.toml: the library path is not the packaged one' >&2; return 1; }
+
   # The C header of the module interface, for modules built out of tree.
   install -Dm644 -t "$pkgdir/usr/include/$_pkgname" \
     crates/obc-module-abi/include/omarchy_broadcast_module.h
@@ -233,13 +255,16 @@ package() {
   install -Dm644 -t "$doc/docs/setup" docs/setup/*.md
 
   # Opt-in drop-ins, shipped verbatim as inactive examples: one orders
-  # WirePlumber after the daemon, the other runs the daemon with the Maxine
-  # SDK of the maxine-vfx-sdk-local package. Each file's header says where to
-  # copy it.
+  # WirePlumber after the daemon, one runs the daemon with the Maxine SDK of
+  # the maxine-vfx-sdk-local package, and one runs the audio worker with the
+  # Maxine Audio Effects SDK of the maxine-afx-sdk-local package. Each file's
+  # header says where to copy it.
   install -Dm644 -t "$doc/examples/systemd/wireplumber.service.d" \
     dist/systemd/wireplumber.service.d/omarchy-broadcast.conf
   install -Dm644 dist/systemd/omarchy-broadcastd.service.d/maxine.conf \
     "$doc/examples/systemd/omarchy-broadcastd.service.d/maxine.conf"
+  install -Dm644 dist/systemd/omarchy-broadcast-audiod.service.d/maxine-afx.conf \
+    "$doc/examples/systemd/omarchy-broadcast-audiod.service.d/maxine-afx.conf"
 
   # The optional noise-removed microphone: the filter-chain configurations
   # and the template unit, inactive (docs/setup/microphone.md). The packaged

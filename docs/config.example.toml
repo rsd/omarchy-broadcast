@@ -450,3 +450,14 @@ force_conflicts = false
 # See docs/setup/maxine.md.
 #   [module."br.com.dias.maxine-ar"]
 #   sdk_root = "/home/user/.local/opt/maxine/arsdk"
+#
+# The Maxine audio effects module (the microphone's GPU noise removal, room
+# echo removal and studio voice, run by the audio worker) takes the same key
+# for the NVIDIA Maxine Audio Effects SDK. Its root is, in this order, the
+# reverse of the video modules': this key when set; else the MAXINE_AFX_ROOT
+# environment variable (the maxine-afx-sdk-local environment file sets it, and
+# this key still wins); else /opt/nvidia/maxine/afx when that directory
+# exists. The worker's LD_LIBRARY_PATH must lead to that root's libraries (the
+# worker's drop-in sets it). It takes no other key. See docs/setup/microphone.md.
+#   [module."br.com.dias.maxine-afx"]
+#   sdk_root = "/home/user/.local/opt/maxine/afx"

@@ -12,7 +12,8 @@ Where to look:
 - the audio example, [`examples/module-hello-audio`](../examples/module-hello-audio/README.md): a complete audio module (a gain and an optional test tone for the microphone), built the same way (see [Audio modules](#audio-modules));
 - the Maxine module, `crates/obc-module-maxine`: a module with several stages, a probe of the filesystem, settings and CUDA frames;
 - the Maxine AR module, `crates/obc-module-maxine-ar` ([ADR-0028](adr/0028-maxine-ar-module.md)): a second example, a module with two stages that share one SDK, its own configuration table and a probe that reports each stage's reason separately;
-- the CPU voice module, `crates/obc-module-voice-cpu`: an audio module with one stage and two engines, which needs no model files.
+- the CPU voice module, `crates/obc-module-voice-cpu`: an audio module with one stage and two engines, which needs no model files;
+- the Maxine audio effects module, `crates/obc-module-afx`: an audio module with three stages over an SDK it opens at run time, live strengths, a combined effect with a fallback, and a delay it measures at load (see [The audio modules in this repository](#the-audio-modules-in-this-repository)).
 
 ## What a module provides
 
@@ -126,7 +127,7 @@ The daemon reads manifests from these directories, in order; a later directory o
 
 Discovery reads manifests and nothing else: no library is opened, so a broken library cannot stop the daemon from starting. The daemon looks again at its start and on `SIGHUP` or `ReloadConfig`. A library is opened for a module that is **enabled** (all are, except the ones the configuration's `[modules] disabled`, a `modules.enabled.<id> = false`, the user, or the crash ledger disabled): `omarchy-broadcast modules enable|disable ID`.
 
-The Arch package installs the Maxine module as `/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so` with its manifest, `maxine-vfx.toml`, in `/usr/lib/omarchy-broadcast/modules.d` (the manifest names the library by absolute path); the Maxine AR module is installed likewise (`libobc_module_maxine_ar.so`, `maxine-ar.toml`). `scripts/install-user.sh` in a checkout builds both Maxine modules and installs them for the current user, in `~/.local/share/omarchy-broadcast/modules/` with a manifest in `~/.local/share/omarchy-broadcast/modules.d/`, which replaces the packaged manifest of the same id. A module you build yourself goes in your own `modules.d`, with `library` relative to the manifest or absolute.
+The Arch package installs the Maxine module as `/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so` with its manifest, `maxine-vfx.toml`, in `/usr/lib/omarchy-broadcast/modules.d` (the manifest names the library by absolute path); the Maxine AR module is installed likewise (`libobc_module_maxine_ar.so`, `maxine-ar.toml`). `scripts/install-user.sh` in a checkout builds both Maxine modules and installs them for the current user, in `~/.local/share/omarchy-broadcast/modules/` with a manifest in `~/.local/share/omarchy-broadcast/modules.d/`, which replaces the packaged manifest of the same id. The two audio modules ([The audio modules in this repository](#the-audio-modules-in-this-repository)) are installed likewise, by the package and by `install-user.sh --audio`. A module you build yourself goes in your own `modules.d`, with `library` relative to the manifest or absolute.
 
 **A rebuilt library needs a daemon restart.** Libraries are opened with `RTLD_NODELETE` and are never unloaded: a module may hold process-wide state that must outlive a reload, and code it started must never run unmapped. A library rebuilt at the same path is therefore not loaded again while the daemon runs; the code first loaded stays. A new or changed manifest, or a library at another path, is picked up on a reload; for a rebuilt library, run `systemctl --user restart omarchy-broadcastd`.
 
@@ -299,6 +300,36 @@ obc_module_sdk::export_module!(MyModule, audio);
 
 The `audio` form of the macro fills the vtable's audio entries and leaves a video module's alone; a panic is caught at the boundary as for video. [`examples/module-hello-audio`](../examples/module-hello-audio/README.md) is a complete module: one stage, `mic-enhance` in `shape`, a gain and an optional test tone, with its settings in the `mic` group `hello`. It is built outside the workspace (CI builds it with `--locked`), installed in a `modules.d` directory like any module, and its README lists the steps. A module in another language implements the header directly: set `audio_instance_load` and `audio_instance_process`, report ABI 1.2 or later, and let the video entries fail with `OBC_ERR_UNSUPPORTED`.
 
+## The audio modules in this repository
+
+Two `audio-filter` modules are built here and installed by the Arch package and by `scripts/install-user.sh --audio`, each a library with a manifest in a `modules.d` directory. Both provide stages of the microphone and take 48 kHz mono blocks of 480 samples. The user's side is [setup/microphone.md](setup/microphone.md).
+
+| Module | Id | Stages (slot) | Device | Rank | Needs |
+|---|---|---|---|---|---|
+| CPU voice, `crates/obc-module-voice-cpu` | `br.com.dias.voice-cpu` | `mic-denoise` (clean) | `cpu` | 200 | Nothing: its engines, DeepFilterNet and RNNoise, are built in |
+| NVIDIA Maxine audio effects, `crates/obc-module-afx` | `br.com.dias.maxine-afx` | `mic-dereverb` (clean, position 50), `mic-denoise` (clean), `mic-enhance` (shape) | `nvidia-gpu` | 300, above the CPU module | An NVIDIA GPU and the Maxine Audio Effects SDK, which is NVIDIA's, under its licence, and is not part of omarchy-broadcast |
+
+Settings ids, all on the `mic` surface:
+
+| Module | Settings |
+|---|---|
+| CPU voice | `mic.noise.enabled`, `mic.noise.strength` (shared with the GPU module), `mic.cpu.engine` (`deepfilternet` or `rnnoise`, reloads) |
+| Maxine audio effects | `mic.noise.enabled`, `mic.noise.strength` (live), `mic.echo.enabled`, `mic.echo.strength` (live), `mic.voice.enabled`, `mic.voice.profile` (reloads) |
+
+Two providers of `mic-denoise` describe the same `noise` group, so the panel shows one switch and one strength, and each engine maps the strength its own way. The Maxine module is the only provider of `mic-dereverb` and `mic-enhance`; its `mic-enhance` (studio voice) declares `conflicts = ["mic-denoise", "mic-dereverb"]`, so turning it on turns the other two off unless `[mic] force_conflicts` is set.
+
+How the Maxine module behaves, for anyone writing a module over a vendor SDK:
+
+- **The SDK is opened at run time**, never linked, so the library loads on a machine without it. `probe` reads only the SDK tree, `/proc/driver/nvidia` and the process's library search path; `check` opens the SDK's core library, and neither creates a CUDA context. The GPU is first used in `audio_instance_load`, and every effect is destroyed at unload.
+- **The search path is a requirement.** The SDK opens an effect's feature library by a name that only the dynamic linker's search path resolves, and that path is read once, when the process starts, so a module cannot repair it. The module therefore requires `LD_LIBRARY_PATH` to lead to the feature libraries of the root in use, and without it the stages are unavailable with a reason that names the worker's drop-in. The module never changes the worker's working directory.
+- **A combined effect, with a fallback.** When one request holds both `mic-dereverb` and `mic-denoise`, the module runs them as one combined model where the SDK has it, and as two effects one after the other if it is not installed or fails to load. The combined model's one strength is noise removal's.
+- **Strengths are live.** Each strength arrives with every block and mixes the effect's output with its input delayed by the effect's own delay, so a change affects the mix only and the chain's delay stays what it reported. Studio voice has no strength; its profile reloads the chain.
+- **The delay is measured when the chain loads**, on the loaded effects, and reported as `latency_samples`; a stage whose delay cannot be measured fails to load.
+- **A failed effect becomes a delay line.** An effect that fails on a block is replaced by its input delayed by the same amount, so the chain's delay does not change and the other stages keep running; it is destroyed with the chain at unload, not on the processing thread.
+- **Some effects keep GPU memory until the process ends.** This is why the worker exits after the microphone has been idle, which releases it.
+
+**Where the SDK is found (the difference from the video modules).** The module's root is, in this order: `sdk_root` in `[module."br.com.dias.maxine-afx"]`, then the `MAXINE_AFX_ROOT` environment variable, then `/opt/nvidia/maxine/afx`. The Maxine video modules take the environment variable first and then the table (`MAXINE_VFX_ROOT`, `MAXINE_AR_ROOT`). The audio module reverses it so that the `MAXINE_AFX_ROOT` of the package's environment file, which the worker's drop-in loads, does not hide a root the user configured. The table takes `sdk_root` and the daemon's `_host` key, and no other. The worker's drop-in is `dist/systemd/omarchy-broadcast-audiod.service.d/maxine-afx.conf` (the Arch package ships it as an example under `/usr/share/doc/omarchy-broadcast/examples/systemd/`).
+
 ## Reserved names, in one place
 
 | Kind | Rule |
@@ -321,4 +352,5 @@ The `audio` form of the macro fills the vtable's audio entries and leaves a vide
 - To run a module in the real host without a camera, `crates/obc-module-host/tests/modules.rs` builds the example and a fixture module, loads them with `dlopen` as the daemon does and drives the registry and the adapters; the fixture's features export a library of another major version, of a newer minor version, and one that refuses the host.
 - The commands, and the tests that need a GPU or the Maxine SDK, are in [testing.md](testing.md#modules).
 - For an audio module, `examples/module-hello-audio` has unit tests of its gain and tone, `crates/obc-module-sdk/tests/audio_vtable.rs` drives an exported audio module through the vtable with raw ABI structures, and `crates/obc-module-host/tests/modules.rs` loads the audio example and an audio fixture through the worker's host.
+- `crates/obc-module-afx` shows a module over a vendor SDK tested without the SDK: a mock SDK fixture stands in for it, and its hardware tests are ignored ([testing.md](testing.md#the-maxine-audio-effects-module)).
 - To try a module in the daemon: put its manifest in a directory, run the daemon with `OBC_MODULE_PATH` set to it (`omarchy-broadcast modules` lists what it found, with the reasons), and use `omarchy-broadcast settings` to turn its stage on.

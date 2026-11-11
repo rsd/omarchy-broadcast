@@ -1,0 +1,27 @@
+[package]
+name = "obc-module-afx"
+description = "NVIDIA Maxine Audio Effects (microphone noise removal, room echo removal, studio voice) as an omarchy-broadcast audio module (the SDK is loaded at run time)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+# The module library the audio worker loads: libobc_module_afx.so.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+obc-module-sdk = { workspace = true }
+# Run-time loading of the SDK and the CUDA driver: nothing links against
+# them, so the module builds and loads without either.
+libloading = { workspace = true }
+
+[dev-dependencies]
+obc-module-host = { workspace = true }
+obc-backend = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
