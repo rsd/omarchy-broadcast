@@ -260,7 +260,10 @@ on_failure = "black"
 # The still image that on_failure = "image" shows: an absolute path to a PNG
 # or JPEG file (at most 32 MiB and 8192x8192 pixels, as for background_image),
 # scaled with a centre crop to fill the frame. It is read when it is first
-# shown, not when the effect loads. Set in this file only: the setup dialog
+# shown, not when the effect loads, and again when a configuration reload
+# finds another file at the path (an unchanged file is not read again). An
+# image that is not decoded within 10 seconds counts as unreadable. Set in
+# this file only: the setup dialog
 # shows it and does not change it. A still image only.
 # Default: "" (no image). Example:
 # fallback_image = "/home/user/Pictures/away.png"

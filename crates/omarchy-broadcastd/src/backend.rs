@@ -496,8 +496,14 @@ pub trait MediaBackend: Send + 'static {
     /// it is ready, and when it cannot be read
     /// ([`Self::placeholder_failure`]). Kept across writers: a new writer
     /// shows it too, decoded for its contract. The crash cover stays black.
-    /// Never blocks. Idempotent.
+    /// Never blocks. The image already shown, given again, is read again
+    /// only when the file at its path was replaced (a reload re-sends it).
     fn set_placeholder(&mut self, image: Option<&Path>);
+
+    /// Whether the image [`Self::set_placeholder`] asked for is still being
+    /// decoded: whether it can be shown is not known yet
+    /// ([`Self::placeholder_failure`]).
+    fn placeholder_pending(&mut self) -> bool;
 
     /// Why the image [`Self::set_placeholder`] asked for cannot be shown
     /// (black is, in its place), once known, as

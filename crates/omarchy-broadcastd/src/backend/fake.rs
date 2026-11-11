@@ -142,6 +142,12 @@ pub struct World {
     /// Every switch of the placeholder (`set_placeholder` that changed
     /// it), in order.
     pub placeholder_sets: Vec<Option<PathBuf>>,
+    /// The image given again to the placeholder that already showed it
+    /// (the real writer reads it again if the file was replaced), in order.
+    pub placeholder_resends: Vec<PathBuf>,
+    /// The placeholder image is still being decoded: neither shown nor
+    /// known to be unreadable (`placeholder_pending`).
+    pub placeholder_decoding: bool,
     /// Why the writer cannot decode the placeholder image: reported by
     /// `placeholder_failure` while an image is asked for and a writer runs.
     pub placeholder_unreadable: Option<String>,
@@ -371,6 +377,8 @@ impl Default for World {
             writer_failure: None,
             placeholder: None,
             placeholder_sets: Vec::new(),
+            placeholder_resends: Vec::new(),
+            placeholder_decoding: false,
             placeholder_unreadable: None,
             fallback_error: None,
             holders: 0,
@@ -808,13 +816,23 @@ impl MediaBackend for FakeBackend {
             let image = image.map(Path::to_path_buf);
             w.placeholder = image.clone();
             w.placeholder_sets.push(image);
+        } else if let Some(p) = image {
+            w.placeholder_resends.push(p.to_path_buf());
         }
+    }
+
+    fn placeholder_pending(&mut self) -> bool {
+        let w = self.world();
+        w.writer.is_some() && w.placeholder.is_some() && w.placeholder_decoding
     }
 
     fn placeholder_failure(&mut self) -> Option<String> {
         let w = self.world();
         w.writer.as_ref()?;
         let path = w.placeholder.as_ref()?;
+        if w.placeholder_decoding {
+            return None;
+        }
         w.placeholder_unreadable
             .as_ref()
             .map(|why| obc_pipeline::effect::fallback_unreadable(path, why))

@@ -97,6 +97,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use gst::prelude::*;
+use gst_obc::background::FileStamp;
 use obc_core::OutputContract;
 use serde::Serialize;
 
@@ -228,8 +229,9 @@ struct Shared {
 struct PlaceholderFrame {
     /// The frame pushed: the black one, or the image once decoded.
     buffer: gst::Buffer,
-    /// The image asked for (`None`: black).
-    image: Option<PathBuf>,
+    /// The image asked for (`None`: black), with the file at its path
+    /// then ([`gst_obc::background::FileStamp`]).
+    image: Option<(PathBuf, Option<FileStamp>)>,
     /// Counts the requests: a decode's result is kept only if no later one
     /// was made.
     serial: u64,
@@ -766,16 +768,18 @@ impl LoopbackWriter {
     /// `image` ([`image_contract_frame`]), decoded on a thread of its own
     /// (black until it is ready; black, [`PlaceholderState::Failed`], when
     /// it cannot be read). The image already asked for is not decoded
-    /// again. Never blocks for the decode; kept across [`Self::stop`] and
-    /// [`Self::start`].
+    /// again, unless the file at its path is another one now (replaced at
+    /// the same path: [`FileStamp`]). Never blocks for the decode; kept
+    /// across [`Self::stop`] and [`Self::start`].
     pub fn set_placeholder_image(&self, image: Option<&Path>) {
+        let want = image.map(|p| (p.to_path_buf(), FileStamp::of(p)));
         let serial = {
             let mut f = self.shared.frame.lock().unwrap_or_else(|e| e.into_inner());
-            if f.image.as_deref() == image {
+            if f.image == want {
                 return;
             }
             f.serial += 1;
-            f.image = image.map(Path::to_path_buf);
+            f.image = want;
             f.buffer = self.placeholder.clone();
             f.state = if image.is_some() {
                 PlaceholderState::Pending
@@ -1190,6 +1194,20 @@ mod tests {
             assert_eq!(w.placeholder_state(), PlaceholderState::Image);
             let n = count();
             after(n, "the image again", |b| b.white);
+            // Replaced at the same path: asked again, it is read again.
+            let gone = dir.path().join("moved.png");
+            std::fs::rename(&png, &gone).unwrap();
+            std::fs::write(&png, b"not an image").unwrap();
+            w.set_placeholder_image(Some(&png));
+            wait_until(Duration::from_secs(10), "the new file read", || {
+                matches!(w.placeholder_state(), PlaceholderState::Failed(_))
+            });
+            std::fs::rename(&gone, &png).unwrap();
+            w.set_placeholder_image(Some(&png));
+            wait_until(Duration::from_secs(10), "the image read again", || {
+                w.placeholder_state() == PlaceholderState::Image
+            });
+            after(count(), "the image once more", |b| b.white);
 
             // Black at once.
             w.set_placeholder_image(None);

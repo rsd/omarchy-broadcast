@@ -11475,3 +11475,286 @@ fn a_reload_to_image_stops_a_session_without_its_effect_and_shows_the_image() {
     assert_eq!(h.state(), State::Error);
     assert_eq!(h.world().placeholder, Some(PathBuf::from(AWAY)));
 }
+
+// ---- the guard and the start agree on a session without its effects ----
+
+const BLUR_BLACK: &str = "[effect]\nmode = \"blur\"\non_failure = \"black\"\n";
+
+/// A session start whose output cannot be built with its effects, under
+/// `config`, while the module cannot run the background effect until the
+/// GPU is up: what it reports for this GPU, once known, is `with_cc`.
+fn background_learnt_at_start(config: &str, with_cc: Option<Vec<(StageId, Availability)>>) -> H {
+    H::new(config, |w| {
+        w.fail_start_effects = Some("obc-module: no CUDA memory".into());
+        w.features = Some(stage_missing(
+            &StageId::BACKGROUND,
+            "not known for this GPU yet",
+        ));
+        w.features_with_cc = with_cc;
+        w.compute_capability = Some((8, 6));
+    })
+}
+
+#[test]
+fn a_start_that_learns_the_effect_can_run_never_opens_the_camera_without_it() {
+    for config in [BLUR_BLACK.to_string(), image_config("")] {
+        // Started without its effects (the effect could not run then); the
+        // GPU up, the module can run it: the room is never shown.
+        let mut h = background_learnt_at_start(&config, Some(all_installed()));
+        h.consumers(1, 0);
+        h.tick(300);
+        assert!(h.world().ingests.is_empty(), "{config}: no camera opened");
+        assert!(h.world().session.is_none(), "{config}: {:?}", h.snap());
+        assert_eq!(h.state(), State::Error, "{config}");
+        // Started again with the effect, in the same step: it cannot start,
+        // and is not started without it.
+        assert_eq!(h.world().session_starts, 1, "{config}");
+        // Further steps never open the camera.
+        ticks_over(&mut h, 300, Duration::from_secs(2));
+        assert!(h.world().ingests.is_empty(), "{config}");
+        assert_eq!(h.world().session_starts, 1, "{config}");
+        let image = config.contains("image").then(|| PathBuf::from(AWAY));
+        assert_eq!(h.world().placeholder, image, "{config}");
+    }
+}
+
+#[test]
+fn a_session_without_an_effect_its_module_cannot_run_is_not_restarted_by_the_guard() {
+    for config in [BLUR_BLACK.to_string(), image_config("")] {
+        // The module never can run the effect: the documented raw picture
+        // with a warning, started once, its camera opened once.
+        let mut h = background_learnt_at_start(&config, None);
+        h.consumers(1, 0);
+        h.tick(300);
+        assert_eq!(h.state(), State::Active, "{config}: {:?}", h.snap());
+        assert!(h.snap().warning.contains("streaming without them"));
+        ticks_over(&mut h, 300, Duration::from_secs(2));
+        assert_eq!(h.state(), State::Active, "{config}");
+        assert_eq!(h.world().session_starts, 1, "{config}");
+        assert_eq!(h.world().ingests.len(), 1, "{config}: camera opened once");
+    }
+}
+
+#[test]
+fn a_second_start_that_learns_the_effect_can_run_never_opens_the_camera_without_it() {
+    // No model for the background effect is known until the GPU is up.
+    // The first session runs noise removal with Maxine, which loses it for
+    // this GPU: restarted for the other module that has it. The second
+    // start cannot build its effects and streams without them (the
+    // background effect still unknown), then learns the background effect
+    // can run after all: stopped before the camera opens, and not started
+    // again in this step.
+    const DN: &str = "org.example.denoise";
+    let mut h = H::new(&format!("{BLUR_BLACK}denoise = true\n"), |w| {
+        w.modules = vec![npu_module(DN, StageId::DENOISE, "pre-matte")];
+        w.features = Some(stage_missing(
+            &StageId::BACKGROUND,
+            "not known for this GPU yet",
+        ));
+        // Reopened for this GPU: neither model.
+        w.features_with_cc = Some(
+            STAGES
+                .into_iter()
+                .map(|s| {
+                    let a = if s == StageId::BACKGROUND || s == StageId::DENOISE {
+                        Availability::NotInstalled("no model for sm_86".into())
+                    } else {
+                        Availability::Installed
+                    };
+                    (s, a)
+                })
+                .collect(),
+        );
+        w.compute_capability = Some((8, 6));
+        // Probed again on the second start: both.
+        w.probe_script = vec![(MAXINE_MODULE.into(), all_installed())];
+    });
+    // The first output builds; from the second on, one with effects cannot.
+    let fake = h.fake.clone();
+    let mut builds = 0;
+    h.world().during_start = Some(Hook(Box::new(move || {
+        builds += 1;
+        if builds == 2 {
+            fake.world().fail_start_effects = Some("obc-module: no CUDA memory".into());
+        }
+    })));
+    h.consumers(1, 0);
+    h.tick(300);
+    assert!(h.world().probe_script.is_empty(), "probed as scripted");
+    assert_eq!(h.world().session_starts, 2, "never a third start");
+    assert!(h.world().ingests.is_empty(), "no camera opened");
+    assert!(h.world().session.is_none(), "{:?}", h.snap());
+    assert_eq!(h.ctrl.passthrough, None);
+    assert_eq!(h.ctrl.privacy_hold, Some(PrivacyHold::Guard));
+    // Further steps start with the effect, which cannot start: the camera
+    // is never opened without it.
+    ticks_over(&mut h, 300, Duration::from_secs(2));
+    assert!(h.world().ingests.is_empty());
+    assert_eq!(h.world().session_starts, 2);
+    assert_eq!(h.state(), State::Error, "{:?}", h.snap());
+}
+
+// ---- the fallback image: its outcome, a reload, the hold, a new session ----
+
+#[test]
+fn an_unreadable_fallback_image_is_said_within_a_poll_of_its_decode_ending() {
+    let mut h = H::new(&image_config(""), |w| {
+        w.fail_start_effects = Some("obc-module: no CUDA memory".into());
+        w.placeholder_decoding = true;
+    });
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.world().placeholder, Some(PathBuf::from(AWAY)));
+    assert_eq!(h.snap().warning, "", "not known yet");
+    // Decoding: the next step is soon, not an idle minute away.
+    let now = h.at(300);
+    assert!(h.ctrl.next_wakeup(now) <= POLL_RUNNING);
+    // The decode failed: said at that step.
+    {
+        let mut w = h.world();
+        w.placeholder_decoding = false;
+        w.placeholder_unreadable = Some("the image file is unreadable: gone".into());
+    }
+    let next = now + h.ctrl.next_wakeup(now);
+    h.ctrl.tick(next);
+    assert!(
+        h.snap()
+            .warning
+            .starts_with(&format!("Fallback image {AWAY} could not be read")),
+        "{:?}",
+        h.snap()
+    );
+    // Known: no more short polls for it.
+    assert!(h.ctrl.next_wakeup(next) > POLL_RUNNING);
+}
+
+#[test]
+fn a_fallback_image_decode_that_never_ends_is_said_unreadable_at_its_limit() {
+    // The writer's decode hung (or its thread died): still pending.
+    let mut h = H::new(&image_config(""), |w| {
+        w.fail_start_effects = Some("obc-module: no CUDA memory".into());
+        w.placeholder_decoding = true;
+    });
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.world().placeholder, Some(PathBuf::from(AWAY)));
+    // Polled often, said nothing, up to the limit.
+    let mut now = h.at(300);
+    let end = now + PLACEHOLDER_DECODE_LIMIT;
+    while now < end {
+        let wait = h.ctrl.next_wakeup(now);
+        assert!(wait <= POLL_RUNNING, "{wait:?}");
+        now += wait;
+        h.ctrl.tick(now);
+        if now < end {
+            assert_eq!(h.snap().warning, "", "not known yet");
+        }
+    }
+    // Then once more: overdue, said, and no more short polls for it.
+    now += h.ctrl.next_wakeup(now);
+    h.ctrl.tick(now);
+    assert_eq!(
+        h.snap().warning,
+        format!("Fallback image {AWAY} could not be read (not decoded within 10 s): showing black")
+    );
+    assert!(h.ctrl.next_wakeup(now) > POLL_RUNNING);
+    // A decode that ends after all (the image shown): nothing to say.
+    h.world().placeholder_decoding = false;
+    now += Duration::from_secs(1);
+    h.ctrl.tick(now);
+    assert_eq!(h.snap().warning, "");
+    assert!(h.ctrl.next_wakeup(now) > POLL_RUNNING);
+}
+
+#[test]
+fn a_reload_gives_the_fallback_image_again_to_be_read_if_replaced() {
+    // The placeholder shows it: a reload of the same configuration gives
+    // it again (the writer reads it again if the file was replaced).
+    let mut h = H::new(&image_config(""), |w| {
+        w.fail_start_effects = Some("obc-module: no CUDA memory".into())
+    });
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.world().placeholder, Some(PathBuf::from(AWAY)));
+    h.reload(&image_config(""), 1000).unwrap();
+    assert_eq!(h.world().placeholder_resends, [PathBuf::from(AWAY)]);
+    assert_eq!(h.world().placeholder, Some(PathBuf::from(AWAY)));
+    // A running session's effect element is given it again too.
+    let mut h = H::new(&image_config(""), |_| {});
+    h.activate(0);
+    let sets = h.world().effect_sets.len();
+    h.reload(&image_config(""), 1000).unwrap();
+    let w = h.world();
+    assert_eq!(w.effect_sets.len(), sets + 1);
+    assert_eq!(
+        w.effect_sets.last().unwrap().fallback_image,
+        Some(PathBuf::from(AWAY))
+    );
+    drop(w);
+    // Without an image nothing is given again.
+    let mut h = H::new(BLUR_BLACK, |_| {});
+    h.activate(0);
+    let sets = h.world().effect_sets.len();
+    h.reload(BLUR_BLACK, 1000).unwrap();
+    assert_eq!(h.world().effect_sets.len(), sets);
+}
+
+#[test]
+fn a_fault_that_is_not_privacys_ends_the_guards_hold_and_shows_black() {
+    // `image`, no camera left to start on.
+    let mut h = H::new(&image_config(""), |w| w.cameras.clear());
+    h.consumers(1, 0);
+    // The guard holds the feed (it stopped a session without its effect);
+    // the start that follows fails for another reason.
+    h.ctrl.privacy_hold = Some(PrivacyHold::Guard);
+    h.tick(300);
+    assert_eq!(h.state(), State::Error, "{:?}", h.snap());
+    assert_eq!(h.snap().error, "no camera is available");
+    assert_eq!(h.ctrl.privacy_hold, None);
+    // Black, as for any other fault: never the image.
+    assert!(
+        placeholder_sets(&h).is_empty(),
+        "{:?}",
+        placeholder_sets(&h)
+    );
+}
+
+#[test]
+fn the_element_s_fallback_image_failure_ends_with_its_session() {
+    let mut h = H::new(&image_config(""), |w| w.effect_slow = true);
+    h.activate(0);
+    let why = format!("Fallback image {AWAY} could not be read (no such file): showing black");
+    h.world().fallback_error = Some(why.clone());
+    h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
+    h.tick(1000);
+    assert!(h.snap().warning.ends_with(&why), "{:?}", h.snap());
+    // The session stops: its element's report goes with it.
+    h.consumers(0, 2000);
+    h.tick(20_000);
+    assert_eq!(h.state(), State::Idle, "{:?}", h.snap());
+    assert_eq!(h.ctrl.fallback_failure, None);
+    assert!(!h.snap().warning.contains(&why));
+    // The next session's effect runs: its `Warning`, as published from its
+    // start on, never carries the old session's clause.
+    {
+        let mut w = h.world();
+        w.fallback_error = None;
+        w.effect_status = EffectStatus::Ready;
+    }
+    h.drain();
+    h.activate(21_000);
+    let warnings: Vec<String> = h
+        .drain()
+        .0
+        .into_iter()
+        .filter_map(|c| match c {
+            Change::Warning(w) => Some(w),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        warnings.iter().all(|w| !w.contains("could not be read")),
+        "{warnings:?}"
+    );
+    assert!(!h.snap().warning.contains("could not be read"));
+}

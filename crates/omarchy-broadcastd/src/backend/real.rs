@@ -875,17 +875,24 @@ impl MediaBackend for GstBackend {
     }
 
     fn set_placeholder(&mut self, image: Option<&Path>) {
-        if self.placeholder.as_deref() == image {
-            return;
+        // The same image given again reaches the writer: it reads it again
+        // if the file at its path was replaced.
+        if self.placeholder.as_deref() != image {
+            match image {
+                Some(p) => crate::info!("the writer's placeholder shows {}", p.display()),
+                None => crate::info!("the writer's placeholder is black"),
+            }
+            self.placeholder = image.map(Path::to_path_buf);
         }
-        match image {
-            Some(p) => crate::info!("the writer's placeholder shows {}", p.display()),
-            None => crate::info!("the writer's placeholder is black"),
-        }
-        self.placeholder = image.map(Path::to_path_buf);
         if let Some(w) = &self.writer {
             w.set_placeholder_image(image);
         }
+    }
+
+    fn placeholder_pending(&mut self) -> bool {
+        self.writer
+            .as_ref()
+            .is_some_and(|w| w.placeholder_state() == PlaceholderState::Pending)
     }
 
     fn placeholder_failure(&mut self) -> Option<String> {
