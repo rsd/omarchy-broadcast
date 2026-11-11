@@ -1277,11 +1277,14 @@ pub struct Controller<B: MediaBackend> {
     mode_failed: HashMap<String, ModeFailed>,
     /// A lifecycle fault: `error` until its cause can have changed.
     fault: Option<String>,
-    /// Privacy holds the feed: no session runs because the effect, under an
-    /// `on_failure` that hides the camera, refused it (the fault it set,
-    /// while that fault stands) or the guard dropped it
-    /// ([`Self::streams_without_black_effect`]). With `on_failure =
-    /// "image"` the writer's placeholder shows the fallback image meanwhile
+    /// Privacy holds the feed: no session streams because the effect, under
+    /// an `on_failure` that hides the camera, refused it (the fault it set)
+    /// or the guard dropped it ([`Self::streams_without_black_effect`]).
+    /// Held until a session streams (is live): with no session, while that
+    /// fault stands; a start tried again under the hold keeps it until its
+    /// first frame, or until it is refused or fails. Disabled or without a
+    /// consumer, it ends. With `on_failure = "image"` the writer's
+    /// placeholder shows the fallback image meanwhile
     /// ([`Self::placeholder_image`]).
     privacy_hold: Option<PrivacyHold>,
     /// The image the writer's placeholder was last given (`None`: black).
@@ -4173,17 +4176,25 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     /// The image the writer's placeholder shows now: the fallback image
-    /// while privacy holds the feed ([`Self::privacy_hold`]: no session,
-    /// enabled, a consumer, the hold's fault still standing) and a
-    /// background effect is selected with `on_failure = "image"` and an
-    /// image; `None` (black) in every other case: off, idle, a camera
-    /// switch's gap or another fault. A hold that no longer applies is
-    /// forgotten.
+    /// while privacy holds the feed ([`Self::privacy_hold`]: enabled, a
+    /// consumer, and either no session with the hold's fault still
+    /// standing, or a session started again under the hold that has not
+    /// streamed yet) and a background effect is selected with
+    /// `on_failure = "image"` and an image; `None` (black) in every other
+    /// case: off, idle, a camera switch's gap of a session that streamed or
+    /// another fault. A hold that no longer applies is forgotten: once the
+    /// session's first frame reached the output, its frames take over and
+    /// the hold ends. A start tried again under the hold so keeps the image
+    /// (a still, never the camera) until then, not black meanwhile.
     fn placeholder_image(&mut self) -> Option<PathBuf> {
-        if self.session.is_some() || !self.runtime.enabled || self.consumers == 0 {
+        let live = self.session.as_ref().is_some_and(|s| s.live);
+        if live || !self.runtime.enabled || self.consumers == 0 {
             self.privacy_hold = None;
         }
-        if let Some(PrivacyHold::Fault(f)) = &self.privacy_hold
+        // The fault a start tried again cleared: the hold stands until
+        // that session streams, or is refused (a fault of its own).
+        if self.session.is_none()
+            && let Some(PrivacyHold::Fault(f)) = &self.privacy_hold
             && self.fault.as_ref() != Some(f)
         {
             self.privacy_hold = None;

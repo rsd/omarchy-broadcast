@@ -27,7 +27,9 @@
 //!   ([`image_contract_frame`]), decoded on a thread of its own: the
 //!   placeholder stays black until the image is ready, and when it cannot be
 //!   read ([`PlaceholderState::Failed`]). Switching back to black is
-//!   immediate. The crash cover stays black whatever the placeholder shows.
+//!   immediate. The last image decoded is kept: asked for again while the
+//!   file at its path is the same one, it is shown at once, never black
+//!   meanwhile. The crash cover stays black whatever the placeholder shows.
 //! * **Forwarded frames.** [`WriterHandle::push`], called by the active
 //!   output (an [`OutputSink::Writer`](crate::output::OutputSink::Writer)
 //!   output ends in an `appsink` that forwards every buffer). The buffer is
@@ -236,6 +238,11 @@ struct PlaceholderFrame {
     /// was made.
     serial: u64,
     state: PlaceholderState,
+    /// The last image decoded, with what it was asked for as (a file that
+    /// could be stat'ed): shown at once when the same is asked for again.
+    /// Kept across black; dropped when another path is asked for. A failed
+    /// decode is never kept.
+    decoded: Option<((PathBuf, FileStamp), gst::Buffer)>,
 }
 
 /// What the writer's placeholder shows.
@@ -595,6 +602,7 @@ impl LoopbackWriter {
                 image: None,
                 serial: 0,
                 state: PlaceholderState::Black,
+                decoded: None,
             }),
         });
         let recorder = Arc::downgrade(&shared);
@@ -769,8 +777,11 @@ impl LoopbackWriter {
     /// (black until it is ready; black, [`PlaceholderState::Failed`], when
     /// it cannot be read). The image already asked for is not decoded
     /// again, unless the file at its path is another one now (replaced at
-    /// the same path: [`FileStamp`]). Never blocks for the decode; kept
-    /// across [`Self::stop`] and [`Self::start`].
+    /// the same path: [`FileStamp`]). The last image decoded is kept across
+    /// black, until another path is asked for: the same file asked for
+    /// again is shown at once ([`PlaceholderState::Image`], no decode).
+    /// Never blocks for the
+    /// decode; kept across [`Self::stop`] and [`Self::start`].
     pub fn set_placeholder_image(&self, image: Option<&Path>) {
         let want = image.map(|p| (p.to_path_buf(), FileStamp::of(p)));
         let serial = {
@@ -779,7 +790,24 @@ impl LoopbackWriter {
                 return;
             }
             f.serial += 1;
+            // Another image asked for: the one kept is not shown again.
+            if let Some((p, _)) = &want
+                && f.decoded.as_ref().is_some_and(|((dp, _), _)| dp != p)
+            {
+                f.decoded = None;
+            }
+            let cached = match (&want, &f.decoded) {
+                (Some((p, Some(stamp))), Some(((dp, ds), b))) if p == dp && stamp == ds => {
+                    Some(b.clone())
+                }
+                _ => None,
+            };
             f.image = want;
+            if let Some(b) = cached {
+                f.buffer = b;
+                f.state = PlaceholderState::Image;
+                return;
+            }
             f.buffer = self.placeholder.clone();
             f.state = if image.is_some() {
                 PlaceholderState::Pending
@@ -959,6 +987,9 @@ fn placeholder_decoded(
     }
     match frame {
         Ok(b) => {
+            if let Some((p, Some(stamp))) = &f.image {
+                f.decoded = Some(((p.clone(), *stamp), b.clone()));
+            }
             f.buffer = b;
             f.state = PlaceholderState::Image;
         }
@@ -1241,6 +1272,70 @@ mod tests {
             assert!(log.caps_events.len() <= 1, "never renegotiated");
             assert!(log.buffers.iter().all(|b| b.black || b.white), "{format:?}");
         }
+    }
+
+    /// The image asked for again after black, the file at its path the
+    /// same, is shown at once: not decoded again, never black meanwhile.
+    /// Another image asked for in between, or a file replaced at the same
+    /// path, it is read afresh.
+    #[test]
+    fn an_image_asked_for_again_after_black_is_shown_at_once() {
+        require_elements(ELEMENTS);
+        require_elements(IMAGE_ELEMENTS);
+        let dir = tempfile::tempdir().unwrap();
+        let png = white_png(dir.path(), 160, 160);
+        let mut w = LoopbackWriter::build(small(OutputFormat::Nv12), WriterSink::Fake).unwrap();
+        let log = watch_sink(&w);
+        w.start().unwrap();
+        let count = || log.lock().unwrap().buffers.len();
+        let more = |n: usize, what: &str| {
+            wait_until(Duration::from_secs(10), what, || count() >= n);
+        };
+        w.set_placeholder_image(Some(&png));
+        wait_until(Duration::from_secs(10), "the image decoded", || {
+            w.placeholder_state() == PlaceholderState::Image
+        });
+        w.set_placeholder_image(None);
+        assert_eq!(w.placeholder_state(), PlaceholderState::Black);
+        let n = count() + 1;
+        more(n + 1, "black pushed");
+        // Asked for again: the image at once, no decode pending.
+        w.set_placeholder_image(Some(&png));
+        assert_eq!(w.placeholder_state(), PlaceholderState::Image);
+        // The push lock orders pushes: one in flight may still be black,
+        // every one after is the image.
+        let n = count() + 1;
+        more(n + 5, "the image pushed");
+        assert!(
+            log.lock().unwrap().buffers.iter().skip(n).all(|b| b.white),
+            "never black once asked for again"
+        );
+        // Another image asked for in between: the one kept is dropped, and
+        // asked for again (after black) it is read again.
+        let other = dir.path().join("other.png");
+        std::fs::write(&other, b"not an image").unwrap();
+        w.set_placeholder_image(Some(&other));
+        w.set_placeholder_image(None);
+        w.set_placeholder_image(Some(&png));
+        assert_eq!(w.placeholder_state(), PlaceholderState::Pending);
+        wait_until(Duration::from_secs(10), "the image decoded again", || {
+            w.placeholder_state() == PlaceholderState::Image
+        });
+        // Replaced at the same path: read afresh, not the image kept.
+        w.set_placeholder_image(None);
+        let gone = dir.path().join("moved.png");
+        std::fs::rename(&png, &gone).unwrap();
+        std::fs::write(&png, b"not an image").unwrap();
+        w.set_placeholder_image(Some(&png));
+        assert_ne!(w.placeholder_state(), PlaceholderState::Image);
+        wait_until(Duration::from_secs(10), "the new file read", || {
+            matches!(w.placeholder_state(), PlaceholderState::Failed(_))
+        });
+        // A failed decode is not kept: asked for again, read again.
+        w.set_placeholder_image(None);
+        w.set_placeholder_image(Some(&png));
+        assert_eq!(w.placeholder_state(), PlaceholderState::Pending);
+        w.stop().unwrap();
     }
 
     #[test]

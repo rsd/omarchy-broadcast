@@ -11726,6 +11726,182 @@ fn a_fault_that_is_not_privacys_ends_the_guards_hold_and_shows_black() {
     );
 }
 
+/// The placeholder the writer showed whenever a session start began
+/// (inside the slow start, before its outcome).
+fn placeholder_at_starts(h: &mut H) -> Arc<Mutex<Vec<Option<PathBuf>>>> {
+    let seen: Arc<Mutex<Vec<Option<PathBuf>>>> = Arc::default();
+    let (fake, out) = (h.fake.clone(), Arc::clone(&seen));
+    h.world().during_start = Some(Hook(Box::new(move || {
+        let p = fake.world().placeholder.clone();
+        out.lock().unwrap().push(p);
+    })));
+    seen
+}
+
+#[test]
+fn a_start_tried_again_under_image_keeps_the_fallback_image_until_it_streams() {
+    let away = || Some(PathBuf::from(AWAY));
+    let mut h = H::new(&image_config(""), |w| {
+        w.fail_start_effects = Some("obc-module: no CUDA memory".into())
+    });
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(placeholder_sets(&h), [away()]);
+    let seen = placeholder_at_starts(&mut h);
+    // Tried again (a reload clears the fault) and refused again: the image
+    // throughout, never black in between.
+    h.reload(&image_config(""), 1000).unwrap();
+    assert_eq!(h.state(), State::Error, "{:?}", h.snap());
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [away()],
+        "the image during the start"
+    );
+    assert_eq!(placeholder_sets(&h), [away()]);
+    // Tried again, the effect can run now, the camera slow to deliver: the
+    // image until its first frame, then black (its frames take over).
+    {
+        let mut w = h.world();
+        w.fail_start_effects = None;
+        w.frames = false;
+    }
+    h.reload(&image_config(""), 2000).unwrap();
+    assert_eq!(h.state(), State::Starting, "{:?}", h.snap());
+    assert_eq!(h.world().placeholder, away());
+    h.tick(2300);
+    assert_eq!(h.world().placeholder, away());
+    h.world().frames = true;
+    h.tick(2600);
+    assert_eq!(h.state(), State::Active, "{:?}", h.snap());
+    assert_eq!(h.world().placeholder, None);
+    assert_eq!(placeholder_sets(&h), [away(), None]);
+    assert_eq!(h.ctrl.privacy_hold, None);
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+/// Privacy holds the feed with the fallback image shown, and a start tried
+/// again under the hold (a reload clears the fault) has a session that has
+/// not streamed yet (its camera slow to deliver): the image still shown.
+fn retried_under_the_hold_not_live() -> H {
+    let away = Some(PathBuf::from(AWAY));
+    let mut h = H::new(&image_config(""), |w| {
+        w.fail_start_effects = Some("obc-module: no CUDA memory".into())
+    });
+    h.consumers(1, 0);
+    h.tick(300);
+    {
+        let mut w = h.world();
+        w.fail_start_effects = None;
+        w.frames = false;
+    }
+    h.reload(&image_config(""), 1000).unwrap();
+    assert_eq!(h.state(), State::Starting, "{:?}", h.snap());
+    assert!(h.world().session.is_some());
+    assert_eq!(h.world().placeholder, away);
+    assert_eq!(placeholder_sets(&h), [away]);
+    h
+}
+
+#[test]
+fn a_start_tried_again_under_the_hold_goes_black_when_the_hold_ends_before_it_streams() {
+    let away = || Some(PathBuf::from(AWAY));
+    let black_once = |h: &H, what: &str| {
+        assert_eq!(h.world().placeholder, None, "{what}: {:?}", h.snap());
+        assert_eq!(placeholder_sets(h), [away(), None], "{what}");
+    };
+    // The effect turned off.
+    let mut h = retried_under_the_hold_not_live();
+    h.set_effect("none", 1500).unwrap();
+    h.tick(1800);
+    black_once(&h, "effect off");
+    // `on_failure` no longer `image`: `black`, then `none`.
+    for on_failure in ["black", "none"] {
+        let mut h = retried_under_the_hold_not_live();
+        h.reload(
+            &format!(
+                "[effect]\nmode = \"blur\"\non_failure = \"{on_failure}\"\n\
+                 fallback_image = \"{AWAY}\"\n"
+            ),
+            1500,
+        )
+        .unwrap();
+        h.tick(1800);
+        // The hold itself is not `on_failure`'s: only the image is.
+        black_once(&h, on_failure);
+    }
+    // The application closes the virtual camera: black at once, the
+    // session still within its idle grace.
+    let mut h = retried_under_the_hold_not_live();
+    h.consumers(0, 1500);
+    h.tick(1800);
+    black_once(&h, "no consumer");
+    assert_eq!(h.ctrl.privacy_hold, None);
+    // Disabled.
+    let mut h = retried_under_the_hold_not_live();
+    h.call(|r| Command::SetEnabled(false, r), 1500).unwrap();
+    assert_eq!(h.state(), State::Off);
+    black_once(&h, "disabled");
+    assert_eq!(h.ctrl.privacy_hold, None);
+    // Every camera failing (no first frame from any): a fault that is not
+    // privacy's. The image while the next camera is tried, black once none
+    // is left.
+    let mut h = retried_under_the_hold_not_live();
+    h.tick(1000 + 10_000);
+    assert_eq!(h.world().ingests, ["usb-a", "usb-b"]);
+    assert_eq!(h.state(), State::Starting, "{:?}", h.snap());
+    assert_eq!(h.world().placeholder, away(), "the next camera tried");
+    h.tick(1000 + 20_000);
+    assert_eq!(h.state(), State::Error, "{:?}", h.snap());
+    assert!(h.world().session.is_none());
+    black_once(&h, "every camera failed");
+    assert_eq!(h.ctrl.privacy_hold, None);
+}
+
+#[test]
+fn a_start_the_guard_drops_under_the_hold_keeps_the_fallback_image() {
+    let away = || Some(PathBuf::from(AWAY));
+    // Privacy holds the feed, the image shown.
+    let mut h = background_learnt_at_start(&image_config(""), Some(all_installed()));
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(placeholder_sets(&h), [away()]);
+    // Tried again: the background effect unknown again, the session starts
+    // without its effects, learns it can run once the GPU is up, and is
+    // dropped as the guard would before the camera opens; started again
+    // with the effect, it is refused.
+    let seen: Arc<Mutex<Vec<Option<PathBuf>>>> = Arc::default();
+    {
+        let (fake, out) = (h.fake.clone(), Arc::clone(&seen));
+        let mut w = h.world();
+        w.features_with_cc = Some(stage_missing(
+            &StageId::BACKGROUND,
+            "not known for this GPU yet",
+        ));
+        w.during_start = Some(Hook(Box::new(move || {
+            let mut w = fake.world();
+            out.lock().unwrap().push(w.placeholder.clone());
+            w.features_with_cc = Some(all_installed());
+        })));
+    }
+    let (starts, stops) = {
+        let w = h.world();
+        (w.session_starts, w.session_stops)
+    };
+    h.reload(&image_config(""), 1000).unwrap();
+    assert_eq!(h.world().session_starts, starts + 1, "started without them");
+    assert_eq!(h.world().session_stops, stops + 1, "dropped by the guard");
+    assert!(h.world().ingests.is_empty(), "no camera opened");
+    assert_eq!(h.state(), State::Error, "{:?}", h.snap());
+    // The image throughout, never black in between.
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.len() >= 2 && seen.iter().all(|p| *p == away()),
+        "{seen:?}"
+    );
+    assert_eq!(placeholder_sets(&h), [away()]);
+    assert_eq!(h.world().placeholder, away());
+}
+
 #[test]
 fn the_element_s_fallback_image_failure_ends_with_its_session() {
     let mut h = H::new(&image_config(""), |w| w.effect_slow = true);
