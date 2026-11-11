@@ -138,6 +138,14 @@ fn exercise(
     }
 }
 
+fn focus_installed(module: &obc_module_host::Module) -> bool {
+    module
+        .probe()
+        .unwrap()
+        .iter()
+        .any(|(s, a)| s.as_str() == FOCUS && *a == Availability::Installed)
+}
+
 fn module() -> Option<obc_module_host::Module> {
     let root = root()?;
     let dir = tempfile::tempdir().unwrap();
@@ -152,13 +160,19 @@ fn the_probe_and_the_check_find_every_stage() {
     let Some(module) = module() else { return };
     let probe = module.probe().unwrap();
     println!("AFX probe: {probe:?}");
+    // Speaker focus is an Early Access feature the SDK does not install by
+    // default: either installed or told so.
     assert!(
-        probe.iter().all(|(_, a)| *a == Availability::Installed),
+        probe.iter().all(|(s, a)| *a == Availability::Installed
+            || (s.as_str() == "mic-focus"
+                && *a == Availability::NotInstalled("Models not installed".into()))),
         "{probe:?}"
     );
-    module
-        .check(&[s(DEREVERB), s(DENOISE), s(ENHANCE)])
-        .unwrap();
+    let mut stages = vec![s(DEREVERB), s(DENOISE), s(ENHANCE)];
+    if focus_installed(&module) {
+        stages.push(s(FOCUS));
+    }
+    module.check(&stages).unwrap();
 }
 
 #[test]
@@ -187,6 +201,9 @@ fn every_chain_loads_runs_and_reports_its_delay() {
         &[],
         &[(DENOISE, "strength", Value::Int(80))],
     );
+    if focus_installed(&module) {
+        exercise(&module, "focus", &[FOCUS], &[], &[]);
+    }
     exercise(&module, "enhance passthrough", &[ENHANCE], &[], &[]);
     exercise(
         &module,

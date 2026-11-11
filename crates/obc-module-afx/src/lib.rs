@@ -11,9 +11,10 @@
 //!
 //! | Stage | Slot | Runs |
 //! |---|---|---|
+//! | `mic-focus` | clean (position 25) | speaker focus (`speaker_focus`), when installed |
 //! | `mic-dereverb` | clean (position 50) | room echo removal (`dereverb`) |
 //! | `mic-denoise` | clean | noise removal (`denoiser`, model version 2) |
-//! | `mic-enhance` | shape | studio voice, low latency, with a mic profile; conflicts with the other two |
+//! | `mic-enhance` | shape | studio voice, low latency, with a mic profile; conflicts with `mic-denoise` and `mic-dereverb` |
 //!
 //! All take 48 kHz mono blocks of 480 samples, on an NVIDIA GPU. A chain
 //! with room echo and noise removal runs them as one combined model
@@ -33,8 +34,15 @@
 //! * `mic.voice.enabled`, `mic.voice.profile`: studio voice (which adds a
 //!   noticeable delay, said in its label) and its mic profile, which
 //!   reloads the chain (it changes the delay). Studio voice already
-//!   removes noise and echo: its stage conflicts with the other two, whose
+//!   removes noise and echo: its stage conflicts with `mic-denoise` and `mic-dereverb`, whose
 //!   switches are greyed while it is on.
+//! * `mic.focus.enabled`: speaker focus, which keeps the main speaker and
+//!   removes other voices. It has no strength. It is an Early Access
+//!   feature of the SDK, not installed by default: while its feature,
+//!   library or models are missing the probe reports its stage
+//!   unavailable with the reason "Models not installed"
+//!   ([`tree::REASON_MODELS_NOT_INSTALLED`]). It removes neither noise nor
+//!   echo, so it conflicts with no other stage.
 //!
 //! The chain's delay ([`AudioLoadReport::latency_samples`]) is measured on
 //! the loaded effects ([`latency`]). The voice probability of a block is
@@ -95,6 +103,8 @@ pub const DENOISE: &str = "mic-denoise";
 pub const DEREVERB: &str = "mic-dereverb";
 /// The studio voice stage.
 pub const ENHANCE: &str = "mic-enhance";
+/// The speaker focus stage.
+pub const FOCUS: &str = "mic-focus";
 
 /// The probe's reason when the SDK's core is not there.
 pub const REASON_NO_SDK: &str = "Maxine Audio Effects SDK not installed";
@@ -126,6 +136,10 @@ pub const ECHO_STRENGTH: &str = "mic.echo.strength";
 pub const VOICE_ENABLED: &str = "mic.voice.enabled";
 /// Studio voice's mic profile.
 pub const VOICE_PROFILE: &str = "mic.voice.profile";
+/// Speaker focus's switch.
+pub const FOCUS_ENABLED: &str = "mic.focus.enabled";
+/// Speaker focus's label, which says what it does.
+pub const FOCUS_LABEL: &str = "Speaker focus (removes other voices)";
 
 /// Why noise and room echo removal are greyed while studio voice is on.
 pub const REASON_VOICE_ON: &str = "Studio voice already removes noise and echo";
@@ -271,6 +285,14 @@ pub fn settings() -> SettingsDescription {
                 ),
         )
         .group(
+            Group::new("focus", "Speaker focus").surface("mic").setting(
+                Setting::bool(FOCUS_ENABLED, FOCUS_LABEL, false)
+                    .stage(FOCUS)
+                    .role(Role::Enable)
+                    .hint("switch"),
+            ),
+        )
+        .group(
             Group::new("voice", "Studio voice")
                 .surface("mic")
                 .setting(
@@ -300,6 +322,7 @@ fn stage_effect(stage: &str) -> Kind {
     match stage {
         DEREVERB => Kind::Dereverb,
         ENHANCE => Kind::StudioVoice,
+        FOCUS => Kind::SpeakerFocus,
         _ => Kind::Denoiser,
     }
 }
@@ -338,7 +361,7 @@ pub fn probe_root(
     ld_library_path: Option<&str>,
 ) -> ProbeReport {
     let mut report = ProbeReport::new();
-    for stage in [DEREVERB, DENOISE, ENHANCE] {
+    for stage in [FOCUS, DEREVERB, DENOISE, ENHANCE] {
         let why = unavailable(
             root,
             compute_capability,
@@ -760,7 +783,9 @@ mod tests {
         std::fs::create_dir_all(d.path().join("nvafx/lib")).unwrap();
         std::fs::write(d.path().join("nvafx/lib/libnv_audiofx.so.3"), b"").unwrap();
         let json = probe_root(Some(d.path()), None, false, None).to_json();
-        assert_eq!(json.matches(REASON_NO_DRIVER).count(), 3, "{json}");
+        assert_eq!(json.matches(REASON_NO_DRIVER).count(), 4, "{json}");
+        let json = probe_root(Some(d.path()), None, true, None).to_json();
+        assert!(json.contains(tree::REASON_MODELS_NOT_INSTALLED), "{json}");
     }
 
     #[test]

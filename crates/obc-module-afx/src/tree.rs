@@ -35,15 +35,27 @@ pub enum Effect {
     DereverbDenoiser,
     /// Studio voice, low latency (`studio_voice_low_latency`).
     StudioVoice,
+    /// Speaker focus (`speaker_focus`): keeps the main, nearest speaker
+    /// and removes other voices and background talk.
+    ///
+    /// The SDK's header names this effect only chained with noise removal
+    /// (`speaker_focus48k_denoiser48k`). The feature directory
+    /// (`speaker_focus`), the standalone selector (`speaker_focus`, so the
+    /// feature library `libnv_audiofx_speaker_focus.so`) and the model name
+    /// (`speaker_focus_48k`) follow the layout NVIDIA's feature download
+    /// uses for the other effects; they are unverified until the feature
+    /// is installed.
+    SpeakerFocus,
 }
 
 impl Effect {
     /// Every effect.
-    pub const ALL: [Effect; 4] = [
+    pub const ALL: [Effect; 5] = [
         Effect::Denoiser,
         Effect::Dereverb,
         Effect::DereverbDenoiser,
         Effect::StudioVoice,
+        Effect::SpeakerFocus,
     ];
 
     /// The SDK's selector of the effect.
@@ -53,6 +65,7 @@ impl Effect {
             Effect::Dereverb => "dereverb",
             Effect::DereverbDenoiser => "dereverb_denoiser",
             Effect::StudioVoice => "studio_voice_low_latency",
+            Effect::SpeakerFocus => "speaker_focus",
         }
     }
 
@@ -73,6 +86,7 @@ impl Effect {
             Effect::Dereverb => "dereverb_48k",
             Effect::DereverbDenoiser => "dereverb_denoiser_48k",
             Effect::StudioVoice => "studio_voice_low_latency_48k",
+            Effect::SpeakerFocus => "speaker_focus_48k",
         }
     }
 
@@ -91,9 +105,25 @@ impl Effect {
             Effect::Dereverb => "room echo removal",
             Effect::DereverbDenoiser => "noise and room echo removal",
             Effect::StudioVoice => "studio voice",
+            Effect::SpeakerFocus => "speaker focus",
+        }
+    }
+
+    /// The one reason given whenever its feature, its library or its
+    /// models (for this GPU) are missing, when the effect has one; `None`:
+    /// the reason names what is missing.
+    pub fn not_installed(self) -> Option<&'static str> {
+        match self {
+            Effect::SpeakerFocus => Some(REASON_MODELS_NOT_INSTALLED),
+            _ => None,
         }
     }
 }
+
+/// The probe's reason when speaker focus, an Early Access feature that the
+/// SDK's download does not install by default, is not installed (its
+/// feature, library or models).
+pub const REASON_MODELS_NOT_INSTALLED: &str = "Models not installed";
 
 /// The file name extension of a model.
 pub const MODEL_EXT: &str = ".trtpkg";
@@ -214,6 +244,15 @@ pub fn unavailable(
     };
     if !driver {
         return Some(crate::REASON_NO_DRIVER.into());
+    }
+    if let Some(why) = effect.not_installed() {
+        let models = match compute_capability {
+            Some(cc) => model_dirs(root, effect)
+                .iter()
+                .any(|d| d.file_name().and_then(|n| n.to_str()) == Some(sm(cc).as_str())),
+            None => !model_dirs(root, effect).is_empty(),
+        };
+        return (!has_library(root, effect) || !models).then(|| why.to_string());
     }
     if !has_library(root, effect) {
         return Some(format!("Maxine {} not installed", effect.label()));
@@ -346,5 +385,37 @@ mod tests {
         assert_eq!(models_for_gpu(root, e, Some((12, 0))), Ok(sm));
         assert!(models_for_gpu(root, e, Some((8, 9))).is_err());
         assert!(models_for_gpu(root, Effect::Denoiser, None).is_err());
+    }
+
+    #[test]
+    fn speaker_focus_missing_in_any_part_is_models_not_installed() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let e = Effect::SpeakerFocus;
+        let why = |cc| unavailable(Some(root), cc, true, e);
+        assert_eq!(why(None).as_deref(), Some(crate::REASON_NO_SDK));
+        touch(&root.join("nvafx/lib/libnv_audiofx.so.3"));
+        assert_eq!(
+            unavailable(Some(root), None, false, e).as_deref(),
+            Some(crate::REASON_NO_DRIVER),
+            "the driver is still said first"
+        );
+        assert_eq!(why(None).as_deref(), Some(REASON_MODELS_NOT_INSTALLED));
+        let feature = root.join("features/speaker_focus");
+        std::fs::create_dir_all(&feature).unwrap();
+        assert_eq!(why(None).as_deref(), Some(REASON_MODELS_NOT_INSTALLED));
+        touch(&feature.join("lib/libnv_audiofx_speaker_focus.so.3"));
+        assert_eq!(why(None).as_deref(), Some(REASON_MODELS_NOT_INSTALLED));
+        let sm = feature.join("models/sm_120");
+        touch(&sm.join(format!("speaker_focus_48k_3{MODEL_EXT}")));
+        assert_eq!(why(None), None);
+        assert_eq!(why(Some((12, 0))), None);
+        assert_eq!(
+            why(Some((8, 6))).as_deref(),
+            Some(REASON_MODELS_NOT_INSTALLED)
+        );
+        std::fs::remove_dir_all(feature.join("lib")).unwrap();
+        assert_eq!(why(None).as_deref(), Some(REASON_MODELS_NOT_INSTALLED));
+        assert_eq!(models_for_gpu(root, e, None), Ok(sm));
     }
 }
