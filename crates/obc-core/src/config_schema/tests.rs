@@ -27,7 +27,20 @@ fn facts() -> RegistryFacts {
                 id: "hello".into(),
                 modules: vec!["org.example.hello".into()],
             },
+            StageFact {
+                id: "frame-generation".into(),
+                modules: vec!["br.com.dias.maxine-vfx".into()],
+            },
         ],
+        output_modes: vec![
+            (
+                "1920x1080@60".into(),
+                "1920x1080 \u{b7} 60 fps (generated)".into(),
+            ),
+            ("1920x1080@30".into(), "1920x1080 \u{b7} 30 fps".into()),
+            ("1280x720@30".into(), "1280x720 \u{b7} 30 fps".into()),
+        ],
+        ..RegistryFacts::default()
     }
 }
 
@@ -109,6 +122,7 @@ fn the_editable_and_apply_table_is_the_decided_one() {
         editable,
         [
             "camera.fixed_framerate",
+            "output.mode",
             "output.format",
             "output.aspect",
             "output.hold_timeout_s",
@@ -180,8 +194,15 @@ fn rows_carry_value_default_source_and_override() {
 
     let r = find(&groups, "output.mode");
     assert_eq!(r.value, ConfigValue::Str("1920x1080@30".into()));
-    assert!(!r.editable);
+    assert_eq!(r.default, Some(ConfigValue::Str("1920x1080@30".into())));
+    assert!(r.editable);
     assert_eq!(r.source, "");
+    assert_eq!(
+        r.kind,
+        RowKind::Enum {
+            options: facts().output_modes
+        }
+    );
 
     let r = find(&groups, "camera.preference");
     assert_eq!(r.value, ConfigValue::List(vec!["Brio".into()]));
@@ -268,6 +289,66 @@ fn the_module_rows_come_from_the_registry() {
 }
 
 #[test]
+fn output_mode_offers_the_runtime_options_and_the_value_in_force() {
+    let (_tmp, set) = load(&[
+        ("config.toml", "[output]\nmode = \"1920x1080@30\"\n"),
+        (MANAGED_REL, "[output]\nmode = \"1600x900@25\"\n"),
+    ]);
+    let groups = config_schema(&set, &facts());
+    let r = find(&groups, "output.mode");
+    assert_eq!(r.value, ConfigValue::Str("1600x900@25".into()));
+    assert_eq!(r.source, MANAGED_REL);
+    let RowKind::Enum { options } = &r.kind else {
+        panic!("{:?}", r.kind)
+    };
+    assert_eq!(options.len(), 4);
+    assert_eq!(options[3], ("1600x900@25".into(), "1600x900@25".into()));
+    // Written as an enum: one of the runtime options, nothing else.
+    let kind = lookup("output.mode", &facts()).unwrap().kind;
+    assert_eq!(
+        to_toml(
+            "output.mode",
+            &kind,
+            &ConfigValue::Str("1280x720@30".into())
+        )
+        .unwrap(),
+        toml::Value::String("1280x720@30".into())
+    );
+    let e = to_toml("output.mode", &kind, &ConfigValue::Str("800x600@30".into())).unwrap_err();
+    assert!(e.contains("is not one of"), "{e}");
+    assert!(to_toml("output.mode", &kind, &ConfigValue::Int(30)).is_err());
+    // With no option computed, nothing is accepted.
+    let kind = lookup("output.mode", &RegistryFacts::default())
+        .unwrap()
+        .kind;
+    assert!(
+        to_toml(
+            "output.mode",
+            &kind,
+            &ConfigValue::Str("1920x1080@30".into())
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn the_frame_generation_pin_is_shown_only_with_a_choice_of_module() {
+    let (_tmp, set) = load(&[]);
+    let groups = config_schema(&set, &facts());
+    assert!(
+        !groups
+            .iter()
+            .flat_map(|g| g.rows.iter())
+            .any(|r| r.id == "modules.pin.frame-generation")
+    );
+    let mut two = facts();
+    two.stages[2].modules.push("org.example.hello".into());
+    let groups = config_schema(&set, &two);
+    let r = find(&groups, "modules.pin.frame-generation");
+    assert!(r.editable);
+}
+
+#[test]
 fn a_pin_to_a_module_not_offering_the_stage_is_still_an_option() {
     let (_tmp, set) = load(&[(
         "config.toml",
@@ -314,4 +395,93 @@ fn values_convert_to_the_type_of_the_key() {
     assert!(lookup("modules.enabled.org.unknown.x", &facts()).is_none());
     assert!(lookup("modules.pin.unknown", &facts()).is_none());
     assert!(lookup("version", &facts()).is_none());
+}
+
+fn options(r: &ConfigRow) -> Vec<(&str, &str)> {
+    let RowKind::Enum { options } = &r.kind else {
+        panic!("{:?}", r.kind)
+    };
+    options
+        .iter()
+        .map(|(v, l)| (v.as_str(), l.as_str()))
+        .collect()
+}
+
+#[test]
+fn on_failure_offers_the_image_only_with_a_fallback_image() {
+    // No image: black and the camera.
+    let (_tmp, set) = load(&[]);
+    let groups = config_schema(&set, &facts());
+    let r = find(&groups, "effect.on_failure");
+    assert_eq!(r.label, "When an effect can't run");
+    assert!(r.editable);
+    assert_eq!(r.value, ConfigValue::Str("black".into()));
+    assert_eq!(r.default, Some(ConfigValue::Str("black".into())));
+    assert_eq!(
+        options(r),
+        [
+            ("black", "Hide the camera: black"),
+            ("none", "Show the camera")
+        ]
+    );
+    let image = find(&groups, "effect.fallback_image");
+    assert_eq!(image.kind, RowKind::Path);
+    assert!(!image.editable);
+    assert_eq!(image.value, ConfigValue::Str(String::new()));
+    assert_eq!(image.default, None);
+
+    // With one: the image too, between them.
+    let (_tmp, set) = load(&[(
+        "config.toml",
+        "[effect]\nfallback_image = \"/srv/away.png\"\n",
+    )]);
+    let groups = config_schema(&set, &facts());
+    assert_eq!(
+        options(find(&groups, "effect.on_failure")),
+        [
+            ("black", "Hide the camera: black"),
+            ("image", "Hide the camera: image"),
+            ("none", "Show the camera")
+        ]
+    );
+    let image = find(&groups, "effect.fallback_image");
+    assert_eq!(image.value, ConfigValue::Str("/srv/away.png".into()));
+    assert_eq!(image.source, "config.toml");
+
+    // `image` in force without an image: still an option.
+    let (_tmp, set) = load(&[("config.toml", "[effect]\non_failure = \"image\"\n")]);
+    let groups = config_schema(&set, &facts());
+    let r = find(&groups, "effect.on_failure");
+    assert_eq!(r.value, ConfigValue::Str("image".into()));
+    assert_eq!(options(r).len(), 3);
+    assert_eq!(options(r)[1], ("image", "Hide the camera: image"));
+}
+
+#[test]
+fn on_failure_is_written_as_one_of_the_options_the_daemon_computed() {
+    let mut effect = crate::config::EffectConfig::default();
+    assert_eq!(on_failure_options(&effect).len(), 2);
+    // Without computed options, those of the defaults: no image.
+    let kind = lookup(ON_FAILURE, &RegistryFacts::default()).unwrap().kind;
+    let image = ConfigValue::Str("image".into());
+    let e = to_toml(ON_FAILURE, &kind, &image).unwrap_err();
+    assert!(e.contains("is not one of: black, none"), "{e}");
+    assert!(to_toml(ON_FAILURE, &kind, &ConfigValue::Str("none".into())).is_ok());
+    // With an image configured, the image is accepted.
+    effect.fallback_image = Some("/srv/away.png".into());
+    let facts = RegistryFacts {
+        on_failure_options: on_failure_options(&effect),
+        ..facts()
+    };
+    let kind = lookup(ON_FAILURE, &facts).unwrap().kind;
+    assert_eq!(
+        to_toml(ON_FAILURE, &kind, &image).unwrap(),
+        toml::Value::String("image".into())
+    );
+    // Every option parses as the configuration reads it.
+    for (v, _) in on_failure_options(&effect) {
+        assert!(crate::EffectOnFailure::from_str(&v).is_ok(), "{v}");
+    }
+    // The image row cannot be written: paths are set in the file.
+    assert!(!lookup("effect.fallback_image", &facts).unwrap().editable);
 }

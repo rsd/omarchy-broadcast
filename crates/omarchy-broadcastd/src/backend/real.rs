@@ -61,6 +61,11 @@
 //! and a writer runs; a new writer (a new contract) gets a new encoder.
 //! Its frames' sequence numbers come from one counter for the backend's
 //! life, so they keep increasing across encoders. It makes no CUDA call.
+//!
+//! The writer's placeholder ([`MediaBackend::set_placeholder`]): the image
+//! asked for is kept here and given to every writer started, which decodes
+//! it for its own contract on a thread of its own
+//! ([`LoopbackWriter::set_placeholder_image`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -85,9 +90,9 @@ use obc_pipeline::xu::{SYSFS_ROOT, XuControl, XuRow, find_xu_controls};
 use obc_pipeline::{
     ConsumerCover, CtrlNotice, CtrlWatcher, DiscoveryRoute, EffectFallback, EffectKind,
     EffectSettings, FrameTap, IngestConfig, LiveStats, LoopbackWriter, Output, OutputConfig,
-    OutputSink, PipelineError, PreviewConfig, PreviewEncoder, Session, StopError, WriterCounts,
-    WriterHandle, WriterSink, choose_mode, effect_backend_available_with, list_cameras, scan_sysfs,
-    select_sink,
+    OutputSink, PipelineError, PlaceholderState, PreviewConfig, PreviewEncoder, Session, StopError,
+    WriterCounts, WriterHandle, WriterSink, choose_mode, effect_backend_available_with,
+    list_cameras, scan_sysfs, select_sink,
 };
 
 use super::park::{Parker, StartError, StopFailure, StopSession};
@@ -95,10 +100,10 @@ use super::{
     Backends, ControlEvent, ControlEventReporter, ControlNode, ControlScan, EffectReport,
     EffectRun, EffectStatus, Failure, MediaBackend, Module, ModuleEntry, OpenedModule,
     PipeWireEvent, PipeWireGeneration, PipeWireReporter, PipeWireState, Placement, PreviewReporter,
-    PreviewRequest, SessionParams, StageRun, WatchGeneration,
+    PreviewRequest, SessionError, SessionParams, StageRun, WatchGeneration, WriterError,
 };
 use crate::camera::{Camera, stable_id, usb_origin};
-use crate::consumers::{NodeId, count_holders};
+use crate::consumers::{NodeId, count_holders, holder_names};
 use crate::settings::XuReading;
 
 /// Environment variable that makes the daemon stamp every frame it
@@ -236,6 +241,8 @@ pub struct GstBackend {
     watcher: Option<CtrlWatcher>,
     /// The generation of the last watcher started (0: none yet).
     watch_generation: WatchGeneration,
+    /// The image the writer's placeholder shows (`None`: black).
+    placeholder: Option<PathBuf>,
 }
 
 /// The writer's one tap: the PipeWire output's, the preview encoder's, or
@@ -280,6 +287,7 @@ impl GstBackend {
             control_reporter: None,
             watcher: None,
             watch_generation: 0,
+            placeholder: None,
         })
     }
 
@@ -361,6 +369,7 @@ impl GstBackend {
     ) -> Result<(), PipelineError> {
         let mut writer = LoopbackWriter::build(contract, sink)?;
         writer.on_consumer_cover(Some(Arc::new(log_consumer_cover)));
+        writer.set_placeholder_image(self.placeholder.as_deref());
         writer.start()?;
         self.writer = Some(writer);
         self.start_encoder();
@@ -516,7 +525,9 @@ fn effect_settings(e: &EffectRun) -> EffectSettings {
         fallback: match e.on_failure {
             EffectOnFailure::Black => EffectFallback::Black,
             EffectOnFailure::None => EffectFallback::None,
+            EffectOnFailure::Image => EffectFallback::Image,
         },
+        fallback_image: e.fallback_image.clone(),
         stages: e.stages.iter().map(stage_request).collect(),
     }
 }
@@ -652,35 +663,16 @@ fn build_session(
     params: &SessionParams,
     writer: WriterHandle,
     stamp: bool,
+    contract: &mut bool,
 ) -> Result<Running, StartError> {
-    let mut ocfg = OutputConfig::new(params.contract, OutputSink::Writer(writer));
-    ocfg.gap_threshold = params.input_gap;
-    ocfg.hold_timeout = params.hold_timeout;
-    // With the element whenever a module provides the effect: an output
-    // built without it cannot take an effect later. Without one, no
-    // element (the frames pass through).
-    let backend = effect_backend(&params.backends);
-    let has_effect = backend.is_some();
-    if has_effect {
-        ocfg.effect = Some(effect_settings(&params.effect));
-        ocfg.effect_backend = backend;
-    }
-    ocfg.module_stages = module_stages(&params.effect, &params.backends);
-    let chains: Vec<String> = ocfg.module_stages.iter().map(|m| m.name.clone()).collect();
-    let mut output = Output::build(ocfg).map_err(|e| format!("output pipeline: {e}"))?;
     let live = LiveStats::new();
-    output.set_observer(Some(live.observer()));
-    if stamp {
-        stamp_forwarded(&output);
-    }
-    // The mapping (`start_failed`) is unit-tested; this wiring only by the
-    // hardware tests.
-    if let Err(e) = output.start() {
-        return Err(start_failed(
-            format!("output pipeline: {e}"),
-            output.stop_checked(),
-        ));
-    }
+    let observer = live.observer();
+    let output = build_output(params, OutputSink::Writer(writer), contract, |output| {
+        output.set_observer(Some(observer));
+        if stamp {
+            stamp_forwarded(output);
+        }
+    })?;
     // Started already: `Session::new` has nothing left to fail on. Should it
     // fail all the same, the output went with it unchecked.
     let session = Session::new(output).map_err(|e| {
@@ -712,9 +704,58 @@ fn build_session(
         counts: WriterCounts::default(),
         unclean: None,
         enhance: enhance_backend(&params.backends),
-        effect: has_effect,
-        chains,
+        effect: has_effect_element(&params.backends),
+        chains: module_stages(&params.effect, &params.backends)
+            .iter()
+            .map(|m| m.name.clone())
+            .collect(),
     })
+}
+
+/// Whether a session of `backends` has the effect element: whenever a
+/// module provides the effect.
+fn has_effect_element(backends: &Backends) -> bool {
+    effect_backend(backends).is_some()
+}
+
+/// Builds and starts the output of a session of `params` into `sink`,
+/// `prepare` called between the build and the start. `contract` says
+/// whether a failure is the output contract's ([`contract_fault`]). On
+/// error, what was built is gone, as [`build_session`] says.
+fn build_output(
+    params: &SessionParams,
+    sink: OutputSink,
+    contract: &mut bool,
+    prepare: impl FnOnce(&mut Output),
+) -> Result<Output, StartError> {
+    let mut ocfg = OutputConfig::new(params.contract, sink);
+    ocfg.gap_threshold = params.input_gap;
+    ocfg.hold_timeout = params.hold_timeout;
+    // With the element whenever a module provides the effect: an output
+    // built without it cannot take an effect later. Without one, no
+    // element (the frames pass through).
+    let backend = effect_backend(&params.backends);
+    let has_effect = backend.is_some();
+    if has_effect {
+        ocfg.effect = Some(effect_settings(&params.effect));
+        ocfg.effect_backend = backend;
+    }
+    ocfg.module_stages = module_stages(&params.effect, &params.backends);
+    let mut output = Output::build(ocfg).map_err(|e| {
+        *contract = contract_fault(&e);
+        format!("output pipeline: {e}")
+    })?;
+    prepare(&mut output);
+    // The mapping (`start_failed`) is unit-tested; this wiring only by the
+    // hardware tests.
+    if let Err(e) = output.start() {
+        *contract = contract_fault(&e);
+        return Err(start_failed(
+            format!("output pipeline: {e}"),
+            output.stop_checked(),
+        ));
+    }
+    Ok(output)
 }
 
 impl MediaBackend for GstBackend {
@@ -742,6 +783,11 @@ impl MediaBackend for GstBackend {
                     usb_path,
                     path: d.path.clone(),
                     mode: choice.mode,
+                    modes: d
+                        .capabilities
+                        .as_ref()
+                        .map(|c| c.modes.clone())
+                        .unwrap_or_default(),
                 })
             })
             .collect()
@@ -751,13 +797,21 @@ impl MediaBackend for GstBackend {
         &mut self,
         sink: &SinkSelector,
         contract: &OutputContract,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<PathBuf, WriterError> {
         self.stop_writer();
         let devices = scan_sysfs();
         let device = select_sink(&devices, sink).map_err(|e| e.to_string())?;
         let path = device.path.clone();
         self.run_writer(*contract, WriterSink::Loopback(path.clone()))
-            .map_err(|e| format!("loopback {}: {e}", path.display()))?;
+            .map_err(|e| WriterError {
+                held: matches!(e, PipelineError::LoopbackFormatHeld { .. }),
+                revertible: contract_fault(&e),
+                held_as: match &e {
+                    PipelineError::LoopbackFormatHeld { held_as, .. } => *held_as,
+                    _ => None,
+                },
+                message: format!("loopback {}: {e}", path.display()),
+            })?;
         Ok(path)
     }
 
@@ -820,23 +874,55 @@ impl MediaBackend for GstBackend {
             .map(|e| format!("loopback writer failed: {e}"))
     }
 
+    fn set_placeholder(&mut self, image: Option<&Path>) {
+        if self.placeholder.as_deref() == image {
+            return;
+        }
+        match image {
+            Some(p) => crate::info!("the writer's placeholder shows {}", p.display()),
+            None => crate::info!("the writer's placeholder is black"),
+        }
+        self.placeholder = image.map(Path::to_path_buf);
+        if let Some(w) = &self.writer {
+            w.set_placeholder_image(image);
+        }
+    }
+
+    fn placeholder_failure(&mut self) -> Option<String> {
+        match self.writer.as_ref()?.placeholder_state() {
+            PlaceholderState::Failed(why) => Some(why),
+            _ => None,
+        }
+    }
+
     fn loopback_holders(&mut self, node: &Path) -> u32 {
         // The daemon's own descriptors (the writer, the crash cover's
         // short-lived ones) are not counted.
         count_holders(Path::new("/proc"), &NodeId::of(node), std::process::id())
     }
 
-    fn start_session(&mut self, params: &SessionParams) -> Result<(), String> {
+    fn loopback_holder_names(&mut self, node: &Path) -> Vec<String> {
+        holder_names(Path::new("/proc"), &NodeId::of(node), std::process::id())
+    }
+
+    fn start_session(&mut self, params: &SessionParams) -> Result<(), SessionError> {
         let Some(writer) = self.writer.as_ref().map(LoopbackWriter::handle) else {
             self.stop_session();
-            return Err("no loopback writer is running".into());
+            return Err(SessionError::from(
+                "no loopback writer is running".to_string(),
+            ));
         };
         let stamp = self.stamp;
+        // Whether the output's build or start failed for the contract.
+        let mut contract = false;
         // A running session stopped without parking in between; the GPU
         // unparked before the output (CUDA) or NVML touch it, and parked
         // again if the build fails (`Parker::start_session`).
         self.parker
-            .start_session(&mut self.running, || build_session(params, writer, stamp))?;
+            .start_session(&mut self.running, || {
+                build_session(params, writer, stamp, &mut contract)
+            })
+            .map_err(|message| SessionError { message, contract })?;
         let counts = self.writer_counts();
         if let Some(r) = self.running.as_mut() {
             r.counts = counts;
@@ -1025,6 +1111,7 @@ impl MediaBackend for GstBackend {
             load_ms: stats.last_load_ms,
             reused: stats.last_load_reused,
             gpu_ms_p50: stats.gpu_ms_p50,
+            fallback_error: stats.fallback_error,
         })
     }
 
@@ -1248,6 +1335,21 @@ impl Drop for GstBackend {
     }
 }
 
+/// Whether a writer's `e` is the output contract's fault: the loopback
+/// refuses it, or its caps or elements cannot be made for it. Not a held
+/// loopback ([`WriterError::held`]), a missing element, a device that
+/// cannot be opened or another state change failure: those are retried
+/// with the same contract.
+fn contract_fault(e: &PipelineError) -> bool {
+    matches!(
+        e,
+        PipelineError::LoopbackRefused { .. }
+            | PipelineError::Caps(_)
+            | PipelineError::Link(_)
+            | PipelineError::InvalidProperty { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1259,6 +1361,41 @@ mod tests {
             queue_dropped,
             ..WriterCounts::default()
         }
+    }
+
+    #[test]
+    fn only_errors_of_the_contract_revert_it() {
+        let refused = PipelineError::LoopbackRefused {
+            device: "/dev/video11".into(),
+            accepted: "NV12 1920x1080@30".into(),
+            wanted: "NV12 1280x720@30".into(),
+        };
+        assert!(contract_fault(&refused));
+        assert!(contract_fault(&PipelineError::Caps("video/x-raw".into())));
+        let held = PipelineError::LoopbackFormatHeld {
+            device: "/dev/video11".into(),
+            accepted: "NV12 1920x1080@30".into(),
+            wanted: "NV12 1280x720@30".into(),
+            held_as: Some(OutputContract::default()),
+        };
+        assert!(!contract_fault(&held));
+        // A link failure is the contract's only when it is told so at its
+        // origin: a module stage element's or the effect element's is
+        // theirs (`Output::build`).
+        assert!(contract_fault(&PipelineError::Link(
+            "to_out to download".into()
+        )));
+        assert!(!contract_fault(&PipelineError::Module(
+            "obc-fg-gen cannot be linked".into()
+        )));
+        assert!(!contract_fault(&PipelineError::Effect(
+            "effect cannot be linked".into()
+        )));
+        assert!(!contract_fault(&PipelineError::State("busy".into())));
+        assert!(!contract_fault(&PipelineError::Cuda("no device".into())));
+        // A sink that cannot be selected is not the contract's.
+        let e = WriterError::from("no loopback device labelled \"x\"".to_string());
+        assert!(!e.held && !e.revertible);
     }
 
     fn stop_err(what: &str, reached_null: bool) -> Result<(), StopError> {
@@ -1513,6 +1650,7 @@ mod tests {
             blur_strength: 0.5,
             background_image: None,
             on_failure: EffectOnFailure::Black,
+            fallback_image: None,
             stages: plan
                 .effect_stages
                 .iter()

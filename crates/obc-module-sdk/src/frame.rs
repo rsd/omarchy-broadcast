@@ -4,8 +4,9 @@ use std::ffi::c_void;
 
 use obc_module_abi::{
     OBC_FORMAT_BGR, OBC_FORMAT_BGRA, OBC_FORMAT_I420, OBC_FORMAT_NV12, OBC_FORMAT_RGB_F32_PLANAR,
-    OBC_FORMAT_RGBA, OBC_FRAME_CUDA, OBC_FRAME_DMABUF, OBC_FRAME_FLAG_NEW_SOURCE, OBC_FRAME_HOST,
-    OBC_MAX_PLANES, obc_cuda, obc_format, obc_frame, obc_frame_kind, obc_plane,
+    OBC_FORMAT_RGBA, OBC_FRAME_CUDA, OBC_FRAME_DMABUF, OBC_FRAME_FLAG_NEW_SOURCE,
+    OBC_FRAME_FLAG_REPEAT, OBC_FRAME_HOST, OBC_MAX_PLANES, obc_cuda, obc_format, obc_frame,
+    obc_frame_kind, obc_plane,
 };
 
 use crate::Error;
@@ -285,6 +286,16 @@ impl<'a> Frame<'a> {
         self.raw.flags & OBC_FRAME_FLAG_NEW_SOURCE != 0
     }
 
+    /// Whether this frame repeats the camera frame of the previous call
+    /// ([`OBC_FRAME_FLAG_REPEAT`], ABI 1.1): the output clock had no new
+    /// camera frame for this tick and emitted the last one again. A module
+    /// that does not look at it processes the repeat as any other frame,
+    /// which is what a module of ABI 1.0 does (the host never sets the flag
+    /// for one).
+    pub fn is_repeat(&self) -> bool {
+        self.raw.flags & OBC_FRAME_FLAG_REPEAT != 0
+    }
+
     /// Whether `other` describes the same memory (same kind, and planes
     /// that start at the same address, `ptr_or_fd + offset`, with the same
     /// pitch): an in-place call.
@@ -549,6 +560,10 @@ mod tests {
         assert!(!Frame::new(&d).unwrap().overlaps(&Frame::new(&b).unwrap()));
         a.flags = OBC_FRAME_FLAG_NEW_SOURCE;
         assert!(Frame::new(&a).unwrap().is_new_source());
+        assert!(!Frame::new(&a).unwrap().is_repeat());
+        a.flags = OBC_FRAME_FLAG_REPEAT;
+        assert!(Frame::new(&a).unwrap().is_repeat());
+        assert!(!Frame::new(&a).unwrap().is_new_source());
         assert_eq!(Frame::new(&a).unwrap().pts_ns(), None);
         a.pts_ns = 5;
         assert_eq!(Frame::new(&a).unwrap().pts_ns(), Some(5));

@@ -116,6 +116,7 @@ pub mod hdri;
 pub mod matte;
 mod preload;
 pub mod stages;
+pub mod vfg;
 pub mod vsr;
 
 pub use features::{Feature, feature_availability, feature_dir};

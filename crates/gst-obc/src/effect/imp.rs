@@ -102,6 +102,48 @@
 //! processed (passed through, or black) keeps the reset pending for the
 //! next processed one.
 //!
+//! # A repeat
+//!
+//! The output clock marks a tick that emits the last camera frame again
+//! with [`REPEAT_FLAG`](super::REPEAT_FLAG). [`decide`] runs on it as on
+//! any frame. When the frame is to be processed and the element holds the
+//! output of the last processed frame, made under the same request
+//! (`Control::generation`), epoch (`Control::epoch`: no apply, load, switch,
+//! unload or failure since), per-frame parameters and caps, with no
+//! temporal reset pending, that output is sent again and no effect runs:
+//! a frame generation module downstream answers a repeat with its held
+//! frame, so the work would be thrown away. Otherwise the repeat is
+//! processed as any frame; black stays black, and a repeat is never passed
+//! through as it came while an effect is asked.
+//!
+//! The cache is written only from a processed frame (`generate_output`
+//! keeps a reference to the buffer pushed downstream), and dropped by any
+//! frame that goes out black or as the input, the new-source flag, new
+//! caps, a flush and a stop. The re-sent buffer is a new buffer on the same
+//! memory, with the repeat's timestamps and flags. Downstream never writes
+//! the cached memory: it is shared with the cache's buffer, so a map for
+//! writing (`obcmodule` processes in place) fails to lock it and GStreamer
+//! writes into a copy of it (`gst_memory_make_mapped`). That copy is the
+//! price of the cache, on every processed frame a module downstream writes
+//! into. A re-sent frame counts in no frame counter of the statistics.
+//!
+//! # The fallback image
+//!
+//! With `on-failure=image` and a `fallback-image`, the image is wanted for
+//! the path and the negotiated size and colour (`FallbackKey`). Each new
+//! key (from `apply` or `set_caps`) starts a decode on a thread of its own
+//! (`obceffect-image`, [`background::decode_yuv420`]), numbered
+//! (`FallbackCtl::serial`) so that a result arriving after the key changed
+//! again is dropped; any other fallback, or no path, wants none. The
+//! decoded NV12 is kept in `Control`, read by the streaming thread with
+//! the rest of the frame's decision, uploaded once into a device frame of
+//! the element's context (`GpuResources::fallback`, dropped with the other
+//! CUDA objects) and copied, on the element's stream, into every frame
+//! decided black and every failed frame `on-failure` hides. Until it is
+//! ready, or when it cannot be read or uploaded, those frames are black
+//! and the reason is reported (`FallbackCtl::error`: the statistics and the
+//! status message).
+//!
 //! # CUDA context and stream
 //!
 //! The context is the one the first input memory belongs to (the stream's
@@ -134,7 +176,9 @@ use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst_base::prelude::*;
-use gst_base::subclass::base_transform::{InputBuffer, PrepareOutputBufferSuccess};
+use gst_base::subclass::base_transform::{
+    GenerateOutputSuccess, InputBuffer, PrepareOutputBufferSuccess,
+};
 use gst_base::subclass::prelude::*;
 use gst_video::VideoInfo;
 use obc_backend::{
@@ -143,12 +187,12 @@ use obc_backend::{
 };
 use obc_gpu::{ContextGuard, CuContext, CuStream, Event};
 
-use super::{STATUS_MESSAGE, has_new_source_flag};
+use super::{STATUS_MESSAGE, has_new_source_flag, has_repeat_flag};
 use crate::background;
 use crate::cuda::{self, MAP_CUDA};
 use crate::settings::{
     EffectFallback, EffectSettings, EffectStats, EffectStatus, FrameAction, StageStats, Target,
-    decide, parse_effect, percentile,
+    decide, fallback_unreadable, parse_effect, percentile,
 };
 use crate::video::{CudaFrame, colour_of, input_context};
 
@@ -203,6 +247,39 @@ struct LoadedKey {
     colour: ColourSpec,
 }
 
+/// What the fallback image is decoded for: its path, and the negotiated
+/// size and colour.
+#[derive(Debug, Clone, PartialEq)]
+struct FallbackKey {
+    path: PathBuf,
+    width: u32,
+    height: u32,
+    colour: ColourSpec,
+}
+
+/// The decoded fallback image, packed NV12 of its key's size.
+#[derive(Debug)]
+struct FallbackFrame {
+    /// The [`FallbackCtl::serial`] of its decode.
+    serial: u64,
+    width: u32,
+    height: u32,
+    nv12: Vec<u8>,
+}
+
+/// The fallback image (see "The fallback image" in the module docs).
+#[derive(Debug, Default)]
+struct FallbackCtl {
+    /// What is decoded, or being decoded; `None`: no image is wanted.
+    key: Option<FallbackKey>,
+    /// Counts the decodes started: the number of the one for `key`.
+    serial: u64,
+    /// The image of `key`, once decoded.
+    frame: Option<Arc<FallbackFrame>>,
+    /// Why the image of `key` cannot be shown ([`fallback_unreadable`]).
+    error: Option<String>,
+}
+
 #[derive(Default)]
 struct Engine {
     instance: Option<Box<dyn InferenceBackend>>,
@@ -215,6 +292,13 @@ struct Control {
     /// the number of the request for it.
     target: Target,
     generation: u64,
+    /// Counts every change that a processed frame depends on and
+    /// `generation` does not count: any `apply` (the per-frame parameters
+    /// included), a load, switch or unload published by the worker, a
+    /// failure, a stage dropped or rebuilt, new caps, a stop. The cached
+    /// output of a repeat (see "A repeat" in the module docs) is valid only
+    /// under the epoch it was written in.
+    epoch: u64,
     status: EffectStatus,
     /// The failure and status of every stage the settings have listed, in
     /// the order they were first listed (a stage stays here once listed, so
@@ -237,6 +321,7 @@ struct Control {
     last_load_ms: Option<f64>,
     last_load_reused: bool,
     loads: u64,
+    fallback: FallbackCtl,
 }
 
 impl Default for Control {
@@ -245,6 +330,7 @@ impl Default for Control {
             settings: EffectSettings::default(),
             target: Target::default(),
             generation: 0,
+            epoch: 0,
             status: EffectStatus::Off,
             stages: Vec::new(),
             frame: Arc::new(FrameParams::default()),
@@ -256,6 +342,7 @@ impl Default for Control {
             last_load_ms: None,
             last_load_reused: false,
             loads: 0,
+            fallback: FallbackCtl::default(),
         }
     }
 }
@@ -407,8 +494,21 @@ impl Control {
         true
     }
 
+    /// The fallback image the settings and the caps want, if any.
+    fn fallback_wanted(&self) -> Option<FallbackKey> {
+        let path = self.settings.fallback_image.as_ref()?;
+        let format = self.format.as_ref()?;
+        (self.settings.fallback == EffectFallback::Image).then(|| FallbackKey {
+            path: path.clone(),
+            width: format.width,
+            height: format.height,
+            colour: *format.colour.as_ref().unwrap_or(&format.black),
+        })
+    }
+
     fn report(&self) -> Report {
         Report {
+            fallback_error: self.fallback.error.clone(),
             kind: self.settings.kind,
             status: self.status.clone(),
             stages: self
@@ -427,13 +527,16 @@ struct Report {
     status: EffectStatus,
     /// The status of every stage the settings have listed, in order.
     stages: Vec<(StageId, EffectStatus)>,
+    /// Why the fallback image cannot be shown ([`FallbackCtl::error`]).
+    fallback_error: Option<String>,
 }
 
 impl Report {
     /// `Some(now)` when `now` differs from `self`: a message to post. A
     /// stage newly listed, and off, changes nothing.
     fn changed(&self, now: Report) -> Option<Report> {
-        let same = (self.kind, &self.status) == (now.kind, &now.status)
+        let same = (self.kind, &self.status, &self.fallback_error)
+            == (now.kind, &now.status, &now.fallback_error)
             && self
                 .stages
                 .iter()
@@ -511,6 +614,9 @@ struct GpuResources {
     /// Destroyed in `drop`, with the context current.
     start: ManuallyDrop<Event>,
     end: ManuallyDrop<Event>,
+    /// The fallback image uploaded, with the serial of its decode; freed
+    /// in `drop`, with the context current.
+    fallback: Option<(u64, obc_gpu::DeviceNv12Buffer)>,
 }
 
 // SAFETY: the raw pointers are a GStreamer CUDA context and stream
@@ -540,6 +646,7 @@ impl Drop for GpuResources {
                 if let Some(pool) = self.pool.take() {
                     let _ = pool.set_active(false);
                 }
+                drop(self.fallback.take());
                 // SAFETY: created in `ensure_gpu`, dropped only here, once.
                 unsafe {
                     ManuallyDrop::drop(&mut self.start);
@@ -557,6 +664,10 @@ impl Drop for GpuResources {
                 );
                 if let Some(pool) = self.pool.take() {
                     let _ = pool.set_active(false);
+                }
+                // Freed with the context, like the events.
+                if let Some((_, buffer)) = self.fallback.take() {
+                    std::mem::forget(buffer);
                 }
             }
         }
@@ -621,11 +732,37 @@ struct StreamState {
     /// live parameters.
     frame: Arc<FrameParams>,
     fallback: EffectFallback,
+    /// The fallback image when the action was decided (with
+    /// `on-failure=image`, once decoded).
+    fallback_frame: Option<Arc<FallbackFrame>>,
     /// A frame of a new source arrived
     /// ([`NEW_SOURCE_FLAG`](super::NEW_SOURCE_FLAG)): reset the backend's
     /// temporal state before the next processed frame.
     reset_pending: bool,
+    /// The epoch ([`Control::epoch`]) the action was decided under.
+    epoch: u64,
+    /// This frame is a repeat that gets the cached output (see "A repeat"
+    /// in the module docs): no effect runs on it.
+    resend: bool,
+    /// `render` processed this frame: its output becomes the cache.
+    processed: bool,
+    /// The last processed output, while it is valid.
+    cache: Option<Cached>,
     gpu: Option<GpuResources>,
+}
+
+/// The last processed output buffer, kept to answer a repeat, and what it
+/// was made under.
+struct Cached {
+    /// A reference to the very buffer pushed downstream. Holding it keeps
+    /// its memory shared, so a downstream map for writing copies the
+    /// memory first and never writes this one.
+    buffer: gst::Buffer,
+    generation: u64,
+    epoch: u64,
+    /// The per-frame parameters the frame was processed with.
+    frame: Arc<FrameParams>,
+    caps: gst::Caps,
 }
 
 #[derive(Default)]
@@ -648,7 +785,11 @@ fn post_status(element: &super::ObcEffect, r: &Report) {
     let mut b = gst::Structure::builder(STATUS_MESSAGE)
         .field("effect", r.kind.as_str())
         .field("status", r.status.as_str())
-        .field("reason", r.status.reason().unwrap_or(""));
+        .field("reason", r.status.reason().unwrap_or(""))
+        .field(
+            "fallback-image-error",
+            r.fallback_error.as_deref().unwrap_or(""),
+        );
     for (stage, status) in &r.stages {
         b = b.field(stage.as_str(), status.as_str()).field(
             format!("{stage}-reason").as_str(),
@@ -681,7 +822,7 @@ impl ObcEffect {
     }
 
     pub(super) fn stats(&self) -> EffectStats {
-        let (effect, status, stage_statuses, last_load_ms, last_load_reused, loads) = {
+        let (effect, status, stage_statuses, last_load_ms, last_load_reused, loads, fallback_error) = {
             let c = lock(&self.shared.control);
             (
                 c.settings.kind,
@@ -693,6 +834,7 @@ impl ObcEffect {
                 c.last_load_ms,
                 c.last_load_reused,
                 c.loads,
+                c.fallback.error.clone(),
             )
         };
         let gpu_window: Vec<f32> = lock(&self.shared.gpu_ms).iter().copied().collect();
@@ -729,6 +871,7 @@ impl ObcEffect {
             last_load_reused,
             loads,
             cuda_active: s.cuda_active.load(Ordering::Relaxed),
+            fallback_error,
         }
     }
 
@@ -749,6 +892,7 @@ impl ObcEffect {
     pub(super) fn apply(&self, new: EffectSettings, retry: bool) {
         let posted = {
             let mut c = lock(&self.shared.control);
+            c.epoch += 1;
             let retry = retry && !c.settings.changes_frame_params_only(&new);
             let before = c.report();
             let target = new.target();
@@ -789,6 +933,123 @@ impl ObcEffect {
             );
             post_status(&self.obj(), &r);
         }
+        self.refresh_fallback();
+    }
+
+    /// Starts decoding the fallback image the settings and caps now want
+    /// (see "The fallback image" in the module docs), forgetting the
+    /// previous one, when that is another; posts when its report changes.
+    fn refresh_fallback(&self) {
+        let (start, posted) = {
+            let mut c = lock(&self.shared.control);
+            let want = c.fallback_wanted();
+            if want == c.fallback.key {
+                return;
+            }
+            let before = c.report();
+            c.epoch += 1;
+            c.fallback.serial += 1;
+            c.fallback.key = want.clone();
+            c.fallback.frame = None;
+            c.fallback.error = None;
+            (
+                want.map(|k| (k, c.fallback.serial)),
+                before.changed(c.report()),
+            )
+        };
+        if let Some(r) = posted {
+            post_status(&self.obj(), &r);
+        }
+        let Some((key, serial)) = start else {
+            return;
+        };
+        let shared = Arc::clone(&self.shared);
+        let element = self.obj().downgrade();
+        let k = key.clone();
+        let spawned = std::thread::Builder::new()
+            .name("obceffect-image".into())
+            .spawn(move || {
+                let res = background::decode_yuv420(&k.path, k.width, k.height, k.colour);
+                let frame = res.map(|img| FallbackFrame {
+                    serial,
+                    width: img.width,
+                    height: img.height,
+                    nv12: img.nv12_packed(),
+                });
+                fallback_decoded(&shared, &element, serial, &k.path, frame);
+            });
+        if let Err(e) = spawned {
+            let why = format!("no thread to decode it: {e}");
+            fallback_decoded(
+                &self.shared,
+                &self.obj().downgrade(),
+                serial,
+                &key.path,
+                Err(why),
+            );
+        }
+    }
+
+    /// The fallback image of decode `serial` could not be uploaded (`why`):
+    /// black in its place from now on, reported (unless superseded).
+    fn fallback_upload_failed(&self, serial: u64, why: String) {
+        let posted = {
+            let mut c = lock(&self.shared.control);
+            if c.fallback.serial != serial || c.fallback.frame.is_none() {
+                return;
+            }
+            let before = c.report();
+            c.epoch += 1;
+            c.fallback.frame = None;
+            c.fallback.error = c
+                .fallback
+                .key
+                .as_ref()
+                .map(|k| fallback_unreadable(&k.path, &format!("cannot upload it: {why}")));
+            before.changed(c.report())
+        };
+        if let Some(r) = posted {
+            gst::warning!(
+                CAT,
+                imp = self,
+                "{}",
+                r.fallback_error.as_deref().unwrap_or("")
+            );
+            post_status(&self.obj(), &r);
+        }
+    }
+
+    /// Fills `dst` with what hides the input: the fallback image `image`
+    /// when there is one of `dst`'s size (uploaded into `gpu` once per
+    /// decode), else black of `black`; on `stream`.
+    fn fill_hidden(
+        &self,
+        gpu: &mut GpuResources,
+        image: Option<&Arc<FallbackFrame>>,
+        dst: &DeviceNv12,
+        black: ColourSpec,
+        stream: CuStream,
+    ) -> Result<(), String> {
+        if let Some(img) = image.filter(|i| (i.width, i.height) == (dst.width, dst.height)) {
+            if gpu.fallback.as_ref().is_none_or(|(s, _)| *s != img.serial) {
+                // The old frame first (the context is current).
+                gpu.fallback = None;
+                let up = obc_gpu::DeviceNv12Buffer::alloc(img.width, img.height)
+                    .and_then(|b| b.upload_packed(&img.nv12).map(|()| b));
+                match up {
+                    Ok(b) => gpu.fallback = Some((img.serial, b)),
+                    Err(e) => self.fallback_upload_failed(img.serial, e.to_string()),
+                }
+            }
+            if let Some((_, b)) = gpu.fallback.as_ref().filter(|(s, _)| *s == img.serial) {
+                // SAFETY: both frames are live allocations of our context,
+                // of the same size; the image is only read.
+                return unsafe { obc_gpu::copy_nv12_async(&b.frame(), dst, stream) }
+                    .map_err(|e| e.to_string());
+            }
+        }
+        // SAFETY: `dst` is our mapped output frame; `stream` is ours.
+        unsafe { obc_gpu::fill_black_nv12(dst, black, stream) }.map_err(|e| e.to_string())
     }
 
     /// Marks request `generation` as failed (unless superseded), and posts.
@@ -797,6 +1058,7 @@ impl ObcEffect {
     fn fail(&self, generation: u64, reason: String) {
         let posted = {
             let mut c = lock(&self.shared.control);
+            c.epoch += 1;
             if c.generation != generation || matches!(c.status, EffectStatus::Failed(_)) {
                 None
             } else {
@@ -826,6 +1088,7 @@ impl ObcEffect {
     fn fail_stage(&self, stage: &StageId, generation: Option<u64>, reason: String) {
         let posted = {
             let mut c = lock(&self.shared.control);
+            c.epoch += 1;
             let before = c.report();
             let reconcile = !matches!(c.status, EffectStatus::Failed(_));
             if c.record_stage_failure(stage, generation, reason, reconcile) && reconcile {
@@ -846,6 +1109,7 @@ impl ObcEffect {
     fn rebuild_stages(&self, stages: &[StageId]) {
         let posted = {
             let mut c = lock(&self.shared.control);
+            c.epoch += 1;
             let before = c.report();
             let mut wanted = false;
             for s in stages {
@@ -914,6 +1178,7 @@ impl ObcEffect {
                 pool: None,
                 start: ManuallyDrop::new(start),
                 end: ManuallyDrop::new(end),
+                fallback: None,
             });
             self.shared.cuda_active.store(true, Ordering::Relaxed);
             let gpu = st.gpu.as_ref().map(GpuResources::gpu_context);
@@ -943,7 +1208,12 @@ impl ObcEffect {
 
     /// Releases the backend, then the CUDA objects (see the module docs).
     fn release_gpu(&self) {
-        let gpu = lock(&self.stream).gpu.take();
+        let (gpu, cached) = {
+            let mut st = lock(&self.stream);
+            (st.gpu.take(), st.cache.take())
+        };
+        // The cached output is memory of our pool and context: gone first.
+        drop(cached);
         let Some(gpu) = gpu else {
             return;
         };
@@ -970,6 +1240,7 @@ impl ObcEffect {
         let mut c = lock(&self.shared.control);
         c.gpu = None;
         c.loaded_kind = None;
+        c.epoch += 1;
         gst::info!(
             CAT,
             imp = self,
@@ -1008,9 +1279,18 @@ impl ObcEffect {
         inbuf: &gst::Buffer,
         outbuf: &mut gst::BufferRef,
     ) -> Result<(), String> {
+        // Whatever this frame becomes, the previous output is no longer the
+        // last one.
+        st.processed = false;
+        st.cache = None;
         let lib = cuda::gst_cuda()?;
         let info = st.info.clone().ok_or("no caps negotiated")?;
         let format = st.format.clone().ok_or("no caps negotiated")?;
+        // What hides the input: the fallback image with `image`, else black.
+        let image = match st.fallback {
+            EffectFallback::Image => st.fallback_frame.clone(),
+            _ => None,
+        };
         let gpu = st.gpu.as_mut().ok_or("no CUDA resources")?;
         // SAFETY: our context reference is live.
         let _guard = unsafe { ContextGuard::push(gpu.cu_ctx) }.map_err(|e| e.to_string())?;
@@ -1024,11 +1304,6 @@ impl ObcEffect {
         }?;
         let dst = out.nv12();
         let stream = gpu.cu_stream;
-        let fill_black = |dst: &DeviceNv12| {
-            // SAFETY: `dst` is our mapped output frame; `stream` is ours.
-            unsafe { obc_gpu::fill_black_nv12(dst, format.black, stream) }
-                .map_err(|e| e.to_string())
-        };
         let mut processed = false;
         // The stages that ran on the processed frame.
         let mut ran: Vec<StageId> = Vec::new();
@@ -1049,7 +1324,9 @@ impl ObcEffect {
             FrameAction::Passthrough => {
                 return Err("internal: passthrough frame in transform".into());
             }
-            FrameAction::Black => fill_black(&dst)?,
+            FrameAction::Black => {
+                self.fill_hidden(gpu, image.as_ref(), &dst, format.black, stream)?
+            }
             FrameAction::Process => {
                 let mem = inbuf.peek_memory(0);
                 // SAFETY: `ensure_gpu` checked that this is a GstCudaMemory
@@ -1200,7 +1477,9 @@ impl ObcEffect {
                     }
                     // The effect failed (recorded above).
                     Some(Err(_)) => match st.fallback {
-                        EffectFallback::Black => fill_black(&dst)?,
+                        EffectFallback::Black | EffectFallback::Image => {
+                            self.fill_hidden(gpu, image.as_ref(), &dst, format.black, stream)?
+                        }
                         EffectFallback::None => {
                             copy(&src, &dst)?;
                             copied = true;
@@ -1213,7 +1492,7 @@ impl ObcEffect {
                         copy(&src, &dst)?;
                         copied = true;
                     }
-                    None => fill_black(&dst)?,
+                    None => self.fill_hidden(gpu, image.as_ref(), &dst, format.black, stream)?,
                 }
             }
         }
@@ -1223,6 +1502,9 @@ impl ObcEffect {
         unsafe { obc_gpu::stream_synchronize(stream) }.map_err(|e| e.to_string())?;
         drop(input_frame);
         drop(out);
+        // Only a processed frame is cached (`generate_output`); black or
+        // the input leaves no cache behind.
+        st.processed = processed;
         if processed {
             self.shared.processed.fetch_add(1, Ordering::Relaxed);
             if !ran.is_empty() {
@@ -1381,6 +1663,7 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
             let mut c = lock(&shared.control);
             let before = c.report();
             c.loaded_kind = loaded_kind;
+            c.epoch += 1;
             if let Outcome::Loaded(r) = &outcome {
                 c.loads += 1;
                 c.last_load_ms = Some(r.load_ms + r.warmup_ms.unwrap_or(0.0));
@@ -1448,6 +1731,47 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
     }
 }
 
+/// The decode `serial` of the fallback image at `path` ended with `frame`:
+/// kept (or its reason) unless a later decode started; posts when the
+/// report changes.
+fn fallback_decoded(
+    shared: &Shared,
+    element: &glib::WeakRef<super::ObcEffect>,
+    serial: u64,
+    path: &std::path::Path,
+    frame: Result<FallbackFrame, String>,
+) {
+    let posted = {
+        let mut c = lock(&shared.control);
+        if c.fallback.serial != serial {
+            return;
+        }
+        let before = c.report();
+        c.epoch += 1;
+        match frame {
+            Ok(f) => c.fallback.frame = Some(Arc::new(f)),
+            Err(why) => c.fallback.error = Some(fallback_unreadable(path, &why)),
+        }
+        before.changed(c.report())
+    };
+    if let Some(el) = element.upgrade() {
+        match &posted {
+            Some(r) if r.fallback_error.is_some() => {
+                gst::warning!(
+                    CAT,
+                    obj = el,
+                    "{}",
+                    r.fallback_error.as_deref().unwrap_or("")
+                )
+            }
+            _ => gst::debug!(CAT, obj = el, "fallback image {} decoded", path.display()),
+        }
+        if let Some(r) = posted {
+            post_status(&el, &r);
+        }
+    }
+}
+
 fn superseded(shared: &Shared, generation: u64) -> bool {
     let c = lock(&shared.control);
     c.stop || c.generation != generation
@@ -1496,7 +1820,11 @@ fn run_job(shared: &Shared, job: &Job) -> JobResult {
 
 /// Unloads the backend instance (keeping it for the next load).
 fn unload(shared: &Shared, job: &Job) {
-    lock(&shared.control).loaded_kind = None;
+    {
+        let mut c = lock(&shared.control);
+        c.loaded_kind = None;
+        c.epoch += 1;
+    }
     // SAFETY: the element keeps the context alive until it has joined
     // this thread.
     let guard = unsafe { ContextGuard::push(job.gpu.context) };
@@ -1573,7 +1901,9 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
             .is_some_and(|k| k.target.kind == EffectKind::None);
     if (full || cold_effect) && current.is_some() {
         // The streaming thread must not wait for this load.
-        lock(&shared.control).loaded_kind = None;
+        let mut c = lock(&shared.control);
+        c.loaded_kind = None;
+        c.epoch += 1;
     }
     // SAFETY: as for the unload above.
     let _guard = match unsafe { ContextGuard::push(job.gpu.context) } {
@@ -1667,8 +1997,20 @@ impl ObjectImpl for ObcEffect {
                     .build(),
                 glib::ParamSpecString::builder("on-failure")
                     .nick("On failure")
-                    .blurb("Output after a failure: black | none (the unprocessed input)")
+                    .blurb(
+                        "Output after a failure: black | image (the fallback image) | none \
+                         (the unprocessed input)",
+                    )
                     .default_value(Some("black"))
+                    .flags(rw)
+                    .build(),
+                glib::ParamSpecString::builder("fallback-image")
+                    .nick("Fallback image")
+                    .blurb(
+                        "Absolute path of the image shown in place of black with \
+                         on-failure=image (empty: none, black)",
+                    )
+                    .default_value(Some(""))
                     .flags(rw)
                     .build(),
                 glib::ParamSpecString::builder("status")
@@ -1722,6 +2064,23 @@ impl ObjectImpl for ObcEffect {
                 s.background = p;
                 true
             }
+            "fallback-image" => {
+                let t = text();
+                let p = (!t.is_empty()).then(|| PathBuf::from(t));
+                if let Some(p) = &p
+                    && !p.is_absolute()
+                {
+                    gst::warning!(
+                        CAT,
+                        imp = self,
+                        "ignoring fallback-image {}: not an absolute path",
+                        p.display()
+                    );
+                    return;
+                }
+                s.fallback_image = p;
+                false
+            }
             "on-failure" => match text().parse::<EffectFallback>() {
                 Ok(f) => {
                     s.fallback = f;
@@ -1748,6 +2107,11 @@ impl ObjectImpl for ObcEffect {
                 .unwrap_or_default()
                 .to_value(),
             "on-failure" => s.fallback.as_str().to_value(),
+            "fallback-image" => s
+                .fallback_image
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+                .to_value(),
             "status" => self.status().to_string().to_value(),
             other => unreachable!("no property {other}"),
         }
@@ -1833,6 +2197,7 @@ impl BaseTransformImpl for ObcEffect {
             // A restart loads again (and retries a failure of the effect; a
             // stage failure stays recorded until the request changes).
             c.generation += 1;
+            c.epoch += 1;
             c.status = c.pending_status();
             c.set_pending_stage_statuses();
             before.changed(c.report())
@@ -1843,6 +2208,8 @@ impl BaseTransformImpl for ObcEffect {
         let mut st = lock(&self.stream);
         st.action = FrameAction::Passthrough;
         st.reset_pending = false;
+        st.resend = false;
+        st.cache = None;
         Ok(())
     }
 
@@ -1871,12 +2238,16 @@ impl BaseTransformImpl for ObcEffect {
             {
                 let _ = pool.set_active(false);
             }
+            if st.caps.as_ref() != Some(incaps) {
+                st.cache = None;
+            }
             st.info = Some(info);
             st.caps = Some(incaps.clone());
             st.format = Some(format.clone());
         }
         let posted = {
             let mut c = lock(&self.shared.control);
+            c.epoch += 1;
             let before = c.report();
             if c.format.as_ref() != Some(&format) {
                 c.format = Some(format);
@@ -1891,6 +2262,8 @@ impl BaseTransformImpl for ObcEffect {
         if let Some(r) = posted {
             post_status(&self.obj(), &r);
         }
+        // The fallback image is decoded for the size and colour.
+        self.refresh_fallback();
         Ok(())
     }
 
@@ -1924,9 +2297,26 @@ impl BaseTransformImpl for ObcEffect {
             InputBuffer::Readable(b) => b,
             InputBuffer::Writable(b) => &*b,
         };
-        let st = lock(&self.stream);
+        let mut st = lock(&self.stream);
         if st.action == FrameAction::Passthrough {
             return Ok(PrepareOutputBufferSuccess::InputBuffer);
+        }
+        if st.resend {
+            match st.cache.as_ref() {
+                Some(cached) => {
+                    // A new buffer on the cached memory (shared, not
+                    // copied), with the repeat's timestamps and flags.
+                    let mut out = cached.buffer.copy();
+                    drop(st);
+                    let outref = out.get_mut().ok_or(gst::FlowError::Error)?;
+                    self.parent_copy_metadata(inbuf, outref)
+                        .map_err(|_| gst::FlowError::Error)?;
+                    return Ok(PrepareOutputBufferSuccess::Buffer(out));
+                }
+                // Not reachable (the cache goes only between frames); the
+                // repeat is processed then.
+                None => st.resend = false,
+            }
         }
         let Some(pool) = st.gpu.as_ref().and_then(|g| g.pool.as_ref()) else {
             gst::element_imp_error!(
@@ -1956,6 +2346,10 @@ impl BaseTransformImpl for ObcEffect {
         outbuf: &mut gst::BufferRef,
     ) -> Result<gst::FlowSuccess, gst::FlowError> {
         let mut st = lock(&self.stream);
+        if st.resend {
+            // The cached output, already in `outbuf`.
+            return Ok(gst::FlowSuccess::Ok);
+        }
         if let Err(reason) = self.render(&mut st, inbuf, outbuf) {
             drop(st);
             gst::element_imp_error!(
@@ -1967,6 +2361,34 @@ impl BaseTransformImpl for ObcEffect {
         }
         Ok(gst::FlowSuccess::Ok)
     }
+
+    fn generate_output(&self) -> Result<GenerateOutputSuccess, gst::FlowError> {
+        let out = self.parent_generate_output()?;
+        let mut st = lock(&self.stream);
+        if std::mem::take(&mut st.processed)
+            && let GenerateOutputSuccess::Buffer(buffer) = &out
+            && let Some(caps) = st.caps.clone()
+        {
+            st.cache = Some(Cached {
+                buffer: buffer.clone(),
+                generation: st.generation,
+                epoch: st.epoch,
+                frame: Arc::clone(&st.frame),
+                caps,
+            });
+        }
+        st.resend = false;
+        Ok(out)
+    }
+
+    fn sink_event(&self, event: gst::Event) -> bool {
+        if event.type_() == gst::EventType::FlushStop {
+            let mut st = lock(&self.stream);
+            st.cache = None;
+            st.resend = false;
+        }
+        self.parent_sink_event(event)
+    }
 }
 
 impl ObcEffect {
@@ -1974,7 +2396,7 @@ impl ObcEffect {
     /// match, creating the CUDA objects when the frame needs them (or the
     /// stages alone need them loaded: they pass frames through until then).
     fn prepare_frame(&self, inbuf: &gst::BufferRef) {
-        let (kind, status, fallback, loaded, stages, frame, generation) = {
+        let (kind, status, fallback, loaded, stages, frame, generation, epoch, fallback_frame) = {
             let c = lock(&self.shared.control);
             (
                 c.settings.kind,
@@ -1984,6 +2406,8 @@ impl ObcEffect {
                 c.any_effective(),
                 Arc::clone(&c.frame),
                 c.generation,
+                c.epoch,
+                c.fallback.frame.clone(),
             )
         };
         let mut action = decide(kind, &status, fallback, loaded, stages);
@@ -2015,12 +2439,33 @@ impl ObcEffect {
         }
         if has_new_source_flag(inbuf) {
             st.reset_pending = true;
+            st.cache = None;
         }
+        // A frame decided black or the input ends the cache; a repeat to
+        // process gets the cached output when it is still valid.
+        if action != FrameAction::Process {
+            st.cache = None;
+        }
+        let valid = st.cache.as_ref().is_some_and(|c| {
+            c.generation == generation
+                && c.epoch == epoch
+                && Arc::ptr_eq(&c.frame, &frame)
+                && st.caps.as_ref() == Some(&c.caps)
+        });
+        if !valid {
+            st.cache = None;
+        }
+        st.resend = action == FrameAction::Process
+            && has_repeat_flag(inbuf)
+            && !st.reset_pending
+            && st.cache.is_some();
         st.action = action;
         st.generation = generation;
+        st.epoch = epoch;
         st.kind = kind;
         st.frame = frame;
         st.fallback = fallback;
+        st.fallback_frame = fallback_frame;
         drop(st);
         let passthrough = action == FrameAction::Passthrough;
         if passthrough {

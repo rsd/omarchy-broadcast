@@ -38,9 +38,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
 use obc_module_abi::{
-    OBC_LOG_DEBUG, OBC_LOG_ERROR, OBC_LOG_INFO, OBC_LOG_TRACE, OBC_LOG_WARN, OBC_MODULE_ABI_MAJOR,
-    OBC_MODULE_ABI_MINOR, OBC_MODULE_ABI_VERSION, obc_host, obc_log_level, obc_module_abi_major,
-    obc_module_abi_minor, obc_module_abi_version_fn, obc_module_entry_fn, obc_module_vtable,
+    OBC_FRAME_FLAGS_1_0, OBC_FRAME_FLAGS_ALL, OBC_LOG_DEBUG, OBC_LOG_ERROR, OBC_LOG_INFO,
+    OBC_LOG_TRACE, OBC_LOG_WARN, OBC_MODULE_ABI_MAJOR, OBC_MODULE_ABI_MINOR,
+    OBC_MODULE_ABI_VERSION, obc_host, obc_log_level, obc_module_abi_major, obc_module_abi_minor,
+    obc_module_abi_version_fn, obc_module_entry_fn, obc_module_vtable,
 };
 
 /// The level of a log line.
@@ -154,6 +155,19 @@ pub fn check_abi_version(version: u32) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The `OBC_FRAME_FLAG_*` bits a module built for ABI `version` (one this
+/// host accepts, [`check_abi_version`]) knows: the host clears the others
+/// on every frame it hands the module, so that a module of an older minor
+/// version never sees a flag added after it. ABI 1.0 knows
+/// `OBC_FRAME_FLAG_NEW_SOURCE`; 1.1 adds `OBC_FRAME_FLAG_REPEAT`.
+pub fn frame_flags_of(version: u32) -> u32 {
+    if obc_module_abi_minor(version) == 0 {
+        OBC_FRAME_FLAGS_1_0
+    } else {
+        OBC_FRAME_FLAGS_ALL
+    }
 }
 
 /// The size of the vtable of ABI 1.0, the smallest a host of this major
@@ -400,13 +414,29 @@ mod tests {
         assert_eq!(check_abi_version(OBC_MODULE_ABI_VERSION), Ok(()));
         let e = check_abi_version(obc_module_abi_pack(2, 0)).unwrap_err();
         assert!(
-            e.contains("module ABI 2.0") && e.contains("module ABI 1.0"),
+            e.contains("module ABI 2.0") && e.contains("module ABI 1.1"),
             "{e}"
         );
         let e = check_abi_version(obc_module_abi_pack(0, 9)).unwrap_err();
         assert!(e.contains("0.9"), "{e}");
         let e = check_abi_version(obc_module_abi_pack(1, 7)).unwrap_err();
-        assert!(e.contains("1.7, newer than") && e.contains("1.0"), "{e}");
+        assert!(e.contains("1.7, newer than") && e.contains("1.1"), "{e}");
+        // A library built for ABI 1.0 or 1.1 loads.
+        assert_eq!(check_abi_version(obc_module_abi_pack(1, 0)), Ok(()));
+        assert_eq!(check_abi_version(obc_module_abi_pack(1, 1)), Ok(()));
+    }
+
+    #[test]
+    fn a_module_of_abi_1_0_is_handed_only_the_flags_it_knows() {
+        use obc_module_abi::{OBC_FRAME_FLAG_NEW_SOURCE, OBC_FRAME_FLAG_REPEAT};
+        assert_eq!(
+            frame_flags_of(obc_module_abi_pack(1, 0)),
+            OBC_FRAME_FLAG_NEW_SOURCE
+        );
+        assert_eq!(
+            frame_flags_of(obc_module_abi_pack(1, 1)),
+            OBC_FRAME_FLAG_NEW_SOURCE | OBC_FRAME_FLAG_REPEAT
+        );
     }
 
     #[test]

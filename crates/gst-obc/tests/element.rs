@@ -61,6 +61,7 @@ fn properties_have_their_defaults() {
     assert_eq!(e.property::<f64>("blur-strength"), 0.5);
     assert_eq!(e.property::<String>("background"), "");
     assert_eq!(e.property::<String>("on-failure"), "black");
+    assert_eq!(e.property::<String>("fallback-image"), "");
     for stage_property in ["denoise", "relight", "relight-light"] {
         assert!(
             e.find_property(stage_property).is_none(),
@@ -112,6 +113,21 @@ fn properties_parse_and_invalid_values_are_ignored() {
     assert_eq!(fx.settings().fallback, EffectFallback::None);
     e.set_property("on-failure", "raw");
     assert_eq!(e.property::<String>("on-failure"), "none");
+    e.set_property("on-failure", "image");
+    assert_eq!(fx.settings().fallback, EffectFallback::Image);
+    e.set_property("fallback-image", "away.png");
+    assert_eq!(
+        e.property::<String>("fallback-image"),
+        "",
+        "a relative path is ignored"
+    );
+    e.set_property("fallback-image", "/srv/away.png");
+    assert_eq!(fx.settings().fallback_image, Some("/srv/away.png".into()));
+    // No caps yet: nothing is decoded, nothing is reported.
+    assert_eq!(fx.stats().fallback_error, None);
+    e.set_property("fallback-image", "");
+    assert_eq!(fx.settings().fallback_image, None);
+    e.set_property("on-failure", "none");
     e.set_property("background", "");
     assert_eq!(fx.settings().background, None);
     e.set_property("effect", "none");
@@ -148,6 +164,7 @@ fn apply_validates_and_sets_everything_at_once() {
         blur_strength: 0.25,
         background: Some("/srv/bg.png".into()),
         fallback: EffectFallback::None,
+        fallback_image: Some("/srv/away.png".into()),
         stages: vec![
             StageRequest::on(StageId::DENOISE),
             relight("cool", -45, 125),

@@ -24,6 +24,12 @@ pub const STAGE_ID_MAX: usize = 32;
 /// The longest module id, in bytes.
 pub const MODULE_ID_MAX: usize = 64;
 
+/// The stage id of frame generation (vendor neutral), which the daemon adds
+/// to a session itself when the output rate is twice the camera's: never a
+/// user's switch, nor part of `modules.order`. The same id as
+/// `obc_module_host::registry::FRAME_GENERATION`.
+pub const FRAME_GENERATION_STAGE: &str = "frame-generation";
+
 /// Whether `id` is a stage id: `^[a-z][a-z0-9-]{0,31}$`.
 pub fn valid_stage_id(id: &str) -> bool {
     let mut bytes = id.bytes();

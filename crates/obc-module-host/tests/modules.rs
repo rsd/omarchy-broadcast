@@ -444,11 +444,11 @@ fn broken_modules_are_unavailable_with_their_reasons_and_the_process_lives() {
     // would abort the process) is called.
     let r = reason("org.test.major");
     assert!(
-        r.contains("module ABI 2.0") && r.contains("module ABI 1.0"),
+        r.contains("module ABI 2.0") && r.contains("module ABI 1.1"),
         "{r}"
     );
     let r = reason("org.test.minor");
-    assert!(r.contains("1.99, newer than") && r.contains("1.0"), "{r}");
+    assert!(r.contains("1.99, newer than") && r.contains("1.1"), "{r}");
     let r = reason("org.test.refuse");
     assert!(r.contains("refused this daemon"), "{r}");
     let r = reason("org.test.init");
@@ -569,6 +569,53 @@ fn a_panic_in_process_is_an_error_and_the_process_survives() {
         .process(ChainFrame::Host(&mut f), &BTreeMap::new())
         .unwrap();
     assert_eq!(img.y, [70; 8]);
+}
+
+/// A repeat of the output clock reaches a module of ABI 1.1 with
+/// `OBC_FRAME_FLAG_REPEAT`; a module of ABI 1.0 never sees the flag, and
+/// both process the repeat as before (the host never skips the call).
+#[test]
+fn a_repeat_is_flagged_for_a_module_of_abi_1_1_and_reprocessed_by_one_of_1_0() {
+    for (features, abi, flagged) in [("", "1.1", true), ("abi-1-0", "1.0", false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = own_copy(&fixture_lib(features), dir.path(), "fixture");
+        let m = manifest(
+            &fixture_manifest("org.test.fixture", &lib, 1),
+            dir.path(),
+            "fixture",
+        );
+        let (sink, lines) = capture();
+        let module = Module::open(&m, &serde_json::json!({}), sink).expect("the fixture opens");
+        assert_eq!(
+            obc_module_host::library::version_text(module.library().abi_version()),
+            abi
+        );
+        let factory = ModuleChainFactory::new(module, &[s("alpha")]).unwrap();
+        let mut chain = factory.create().unwrap();
+        chain
+            .load(&host_request(&["alpha"], BTreeMap::new()))
+            .unwrap();
+        let mut img = HostImage::new(4, 2, 50, 128);
+        let mut f = img.frame();
+        chain
+            .process(ChainFrame::Host(&mut f), &BTreeMap::new())
+            .unwrap();
+        assert!(
+            last_line(&lines, "fixture-process").contains(" repeat=false "),
+            "{abi}: a fresh frame"
+        );
+        chain
+            .process_repeat(ChainFrame::Host(&mut f), &BTreeMap::new())
+            .unwrap();
+        let line = last_line(&lines, "fixture-process");
+        assert!(
+            line.contains(&format!(" repeat={flagged} ")),
+            "{abi}: {line}"
+        );
+        // The fixture processes every frame it is given: the repeat ran
+        // through the chain too.
+        assert_eq!(img.y, [70; 8], "{abi}");
+    }
 }
 
 #[test]

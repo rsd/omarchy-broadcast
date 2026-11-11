@@ -4,11 +4,11 @@
 abi = 1
 id = "br.com.dias.maxine-vfx"
 name = "NVIDIA Maxine video effects"
-version = "0.26.0"
+version = "0.27.0"
 licence = "MIT OR Apache-2.0 (module); NVIDIA Maxine SDK under its own licence"
 kind = "video-stage"
 library = "/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so"
-description = "Background blur and replacement, noise removal, relighting and low-resolution enhancement on NVIDIA GPUs"
+description = "Background blur and replacement, noise removal, relighting, low-resolution enhancement and frame generation on NVIDIA GPUs"
 
 [requires]
 hardware = ["nvidia-turing+"]
@@ -46,5 +46,17 @@ slot = "post-matte"
 rank = 300
 device = "nvidia-gpu"
 requires = ["matte"]
+frames = ["cuda"]
+formats = ["nv12"]
+
+# Makes the frame midway between two camera frames, for an output at twice
+# the camera rate. The daemon adds it when the rate doubles; it runs after
+# every other stage (the largest position of the last slot).
+[[stage]]
+id = "frame-generation"
+slot = "post-composite"
+rank = 300
+device = "nvidia-gpu"
+position = 2147483647
 frames = ["cuda"]
 formats = ["nv12"]

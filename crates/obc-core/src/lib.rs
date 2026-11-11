@@ -47,7 +47,7 @@ pub enum CoreError {
     InvalidAspectPolicy(String),
     #[error("unknown effect {0:?} (supported: none, blur, replace)")]
     InvalidEffect(String),
-    #[error("unsupported effect failure policy {0:?} (supported: black, none)")]
+    #[error("unsupported effect failure policy {0:?} (supported: black, image, none)")]
     InvalidEffectOnFailure(String),
     #[error("unknown relighting light {0:?} (supported: warm, neutral, cool)")]
     InvalidRelightLight(String),
@@ -319,15 +319,27 @@ pub enum EffectOnFailure {
     Black,
     /// The camera image without the effect, with the reason in `Error`.
     None,
+    /// As [`EffectOnFailure::Black`], with the still image of
+    /// `effect.fallback_image` in place of the black frames (black when it
+    /// is not set or cannot be read, with a `Warning` saying so).
+    Image,
 }
 
 impl EffectOnFailure {
-    /// `black` or `none`.
+    /// `black`, `none` or `image`.
     pub fn as_str(self) -> &'static str {
         match self {
             EffectOnFailure::Black => "black",
             EffectOnFailure::None => "none",
+            EffectOnFailure::Image => "image",
         }
+    }
+
+    /// Whether the camera is hidden when the effect cannot run: `black` and
+    /// `image` hide it (every privacy rule treats them alike), `none` shows
+    /// it.
+    pub fn hides(self) -> bool {
+        matches!(self, EffectOnFailure::Black | EffectOnFailure::Image)
     }
 }
 
@@ -344,6 +356,7 @@ impl FromStr for EffectOnFailure {
         match s.trim().to_ascii_lowercase().as_str() {
             "black" => Ok(EffectOnFailure::Black),
             "none" => Ok(EffectOnFailure::None),
+            "image" => Ok(EffectOnFailure::Image),
             _ => Err(CoreError::InvalidEffectOnFailure(s.to_string())),
         }
     }
@@ -1160,6 +1173,13 @@ mod tests {
         assert!("raw".parse::<EffectOnFailure>().is_err());
         assert_eq!(EffectOnFailure::default(), EffectOnFailure::Black);
         assert_eq!(EffectOnFailure::None.to_string(), "none");
+        assert_eq!(
+            "Image".parse::<EffectOnFailure>().unwrap(),
+            EffectOnFailure::Image
+        );
+        assert_eq!(EffectOnFailure::Image.to_string(), "image");
+        assert!(EffectOnFailure::Black.hides() && EffectOnFailure::Image.hides());
+        assert!(!EffectOnFailure::None.hides());
     }
 
     #[test]

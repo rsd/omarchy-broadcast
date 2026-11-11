@@ -51,6 +51,9 @@ fn module() -> Module {
             for (stage, a) in &probe {
                 assert_eq!(*a, Availability::Installed, "{stage}: {SDK_HINT}");
             }
+            // As the registry's open does: the description the factories
+            // check parameters against.
+            module.settings().unwrap();
             (dir, module)
         })
         .1
@@ -404,5 +407,114 @@ fn maxine_module_enhance_upscales_through_the_abi() {
         println!("TIMINGS enhance: {t:?}");
         assert!(t.upscale_ms > 0.0, "{t:?}");
         e.unload();
+    });
+}
+
+/// A grey 1920x1080 frame with a white square whose left edge is at `x`,
+/// packed BT.601 limited-range NV12.
+fn square_at(x: usize) -> Vec<u8> {
+    let (w, h) = (FG_W as usize, FG_H as usize);
+    let mut bgr = vec![90u8; w * h * 3];
+    for y in h / 2 - 120..h / 2 + 120 {
+        for px in x..x + 240 {
+            let i = (y * w + px) * 3;
+            bgr[i..i + 3].copy_from_slice(&[235, 235, 235]);
+        }
+    }
+    bgr_to_nv12(&bgr, w, h)
+}
+
+/// The mean absolute difference of two equal-size byte frames.
+fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
+    let sum: u64 = a.iter().zip(b).map(|(&x, &y)| x.abs_diff(y) as u64).sum();
+    sum as f64 / a.len() as f64
+}
+
+const FG_W: u32 = 1920;
+const FG_H: u32 = 1080;
+
+/// Frame generation alone, as the daemon runs it after the effect: the
+/// first frame goes out as it is, a repeat goes out as the last fresh
+/// frame (with the repeat flag of ABI 1.1, through the host's chain
+/// adapter), and a fresh frame goes out as a frame between the previous
+/// one and itself, for a pattern that moves.
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK, the os-release override and an NVIDIA GPU"]
+fn gpu_frame_generation_interpolates_fresh_frames_and_holds_repeats() {
+    use obc_backend::{ChainFrame, ChainRequest, FrameKind, StageChain, StageChainFactory};
+    use obc_module_host::ModuleChainFactory;
+    use std::collections::BTreeMap;
+
+    let module = module();
+    let stage = StageId::new("frame-generation").unwrap();
+    let factory = ModuleChainFactory::new(module, std::slice::from_ref(&stage)).unwrap();
+    assert_eq!(factory.kinds(), [FrameKind::Cuda]);
+    rig(|gpu, stream| {
+        let frame = DeviceNv12Buffer::alloc(FG_W, FG_H).unwrap();
+        let mut chain = factory.create().unwrap();
+        let r = chain
+            .load(&ChainRequest {
+                stages: StageList::from(stage.clone()),
+                params: BTreeMap::new(),
+                width: FG_W,
+                height: FG_H,
+                colour: ColourSpec::LIMITED_BT601,
+                kind: FrameKind::Cuda,
+                gpu: Some(*gpu),
+            })
+            .unwrap_or_else(|e| panic!("frame generation load failed: {e}"));
+        println!("LOAD frame-generation: {r:?}");
+        let none = BTreeMap::new();
+        // Runs `input` through the chain in place and returns the output.
+        let run = |chain: &mut dyn StageChain, input: &[u8], repeat: bool| -> Vec<u8> {
+            frame.upload_packed(input).unwrap();
+            let f = frame.frame();
+            let cf = ChainFrame::Cuda { gpu, frame: &f };
+            let result = if repeat {
+                chain.process_repeat(cf, &none)
+            } else {
+                chain.process(cf, &none)
+            };
+            result.unwrap_or_else(|e| panic!("frame generation frame failed: {e}"));
+            stream.synchronize().unwrap();
+            frame.download_packed().unwrap()
+        };
+        let (a, b, c) = (square_at(400), square_at(560), square_at(1200));
+        assert_eq!(
+            run(&mut *chain, &a, false),
+            a,
+            "the first frame goes out as it is"
+        );
+        // A repeat of a: the held frame, whatever the input says.
+        assert_eq!(
+            run(&mut *chain, &b, true),
+            a,
+            "a repeat goes out as the held frame"
+        );
+        let mid = run(&mut *chain, &b, false);
+        let (to_a, to_b) = (mean_abs_diff(&mid, &a), mean_abs_diff(&mid, &b));
+        println!("FRAME GENERATION mean difference to a {to_a:.3}, to b {to_b:.3}");
+        assert!(
+            to_a > 0.1 && to_b > 0.1,
+            "the generated frame is one of its inputs"
+        );
+        let ab = mean_abs_diff(&a, &b);
+        assert!(
+            to_a < ab && to_b < ab,
+            "the generated frame is not between its inputs ({ab:.3} between them)"
+        );
+        assert_eq!(
+            run(&mut *chain, &a, true),
+            b,
+            "the repeat after it is the fresh frame"
+        );
+        // After a reset there is no previous frame.
+        assert!(chain.reset_temporal().unwrap().is_empty());
+        assert_eq!(
+            run(&mut *chain, &c, false),
+            c,
+            "the first frame after a reset"
+        );
+        chain.unload();
     });
 }

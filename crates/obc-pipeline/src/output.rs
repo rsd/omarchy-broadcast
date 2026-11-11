@@ -93,6 +93,11 @@
 //! instead of blending two cameras. `DISCONT` cannot carry this: the clock
 //! sets it after every skipped tick too.
 //!
+//! **Repeat.** Likewise the clock marks every repeat tick (the last frame
+//! emitted again) with [`gst_obc::REPEAT_FLAG`] and clears it on every
+//! other buffer, so a module stage can tell a repeat from a fresh frame
+//! (`obcmodule` hands it to its chain as one).
+//!
 //! **CUDA context.** The output pipeline's CUDA elements create the
 //! `GstCudaContext` when the pipeline opens; [`Output::cuda_context`] hands
 //! it to every ingest pipeline so canonical frames stay in one context.
@@ -674,7 +679,25 @@ impl Output {
                 None
             }
         };
-        add_linked(&pipeline, &chain)?;
+        // Linked pair by pair, so that a failure is told at its origin: a
+        // module stage element's or the effect element's is theirs, not the
+        // contract's ([`link_failure`]).
+        pipeline
+            .add_many(&chain)
+            .map_err(|e| PipelineError::Link(e.to_string()))?;
+        let module_names: Vec<String> = modules.iter().map(|(_, m)| m.name().to_string()).collect();
+        let effect_name = effect.as_ref().map(|fx| fx.name().to_string());
+        for pair in chain.windows(2) {
+            pair[0].link(&pair[1]).map_err(|e| {
+                link_failure(
+                    &pair[0].name(),
+                    &pair[1].name(),
+                    &module_names,
+                    effect_name.as_deref(),
+                    &e.to_string(),
+                )
+            })?;
+        }
 
         Ok(Output {
             pipeline: MediaPipeline::from_parts(pipeline, loopback_caps),
@@ -1137,6 +1160,11 @@ impl ClockContext {
                 } else {
                     b.unset_flags(gst_obc::NEW_SOURCE_FLAG);
                 }
+                if kind == TickKind::Repeat && latest.is_some() {
+                    b.set_flags(gst_obc::REPEAT_FLAG);
+                } else {
+                    b.unset_flags(gst_obc::REPEAT_FLAG);
+                }
             }
             drop(latest);
             let emitted_at = Instant::now();
@@ -1302,10 +1330,67 @@ fn make_placeholder(
     Ok(buffer)
 }
 
+/// What a failure `e` to link the output's element `from` to `to` is: the
+/// module stage element's when either is one of `modules`
+/// ([`PipelineError::Module`]), else the effect element's when either is
+/// `effect` ([`PipelineError::Effect`]), else the pipeline's
+/// ([`PipelineError::Link`], which counts as the output contract's fault).
+fn link_failure(
+    from: &str,
+    to: &str,
+    modules: &[String],
+    effect: Option<&str>,
+    e: &str,
+) -> PipelineError {
+    let is_module = |n: &str| modules.iter().any(|m| m == n);
+    if let Some(m) = [from, to].into_iter().find(|n| is_module(n)) {
+        return PipelineError::Module(format!("{m} cannot be linked ({from} to {to}): {e}"));
+    }
+    if let Some(fx) = effect.filter(|fx| *fx == from || *fx == to) {
+        return PipelineError::Effect(format!("{fx} cannot be linked ({from} to {to}): {e}"));
+    }
+    PipelineError::Link(format!("{from} to {to}: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::fake_chain::FakeChainLog as FakeLog;
+
+    #[test]
+    fn a_link_failure_at_a_module_or_effect_element_is_theirs_not_a_link_error() {
+        let modules = vec!["module-a".to_string(), "module-b".to_string()];
+        let f = |from: &str, to: &str| link_failure(from, to, &modules, Some("effect"), "refused");
+        // Either side a module element: the module's, even next to the
+        // effect element.
+        for (from, to) in [
+            ("frames_src", "module-a"),
+            ("module-a", "effect"),
+            ("effect", "module-b"),
+            ("module-b", "to_out"),
+        ] {
+            match f(from, to) {
+                PipelineError::Module(m) => assert!(m.contains(from) && m.contains(to), "{m}"),
+                other => panic!("{from} to {to}: {other:?}"),
+            }
+        }
+        // The effect element without a module: the effect's.
+        for (from, to) in [("frames_src", "effect"), ("effect", "download")] {
+            assert!(
+                matches!(f(from, to), PipelineError::Effect(_)),
+                "{from} to {to}"
+            );
+        }
+        // Neither: a link error (the contract's).
+        match f("download", "download_caps") {
+            PipelineError::Link(m) => assert_eq!(m, "download to download_caps: refused"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            link_failure("a", "effect", &[], None, "x"),
+            PipelineError::Link(_)
+        ));
+    }
     use crate::test_support::require_elements;
 
     #[test]
@@ -1797,7 +1882,9 @@ mod tests {
     /// The first fresh frame of each source carries the new-source flag
     /// out of `appsrc`'s queue and down to the sink; no other buffer does
     /// (later fresh frames, repeats, placeholders), even when the slot's
-    /// buffer carries it. A source that comes back is new again. CPU only.
+    /// buffer carries it. A source that comes back is new again. The
+    /// repeat flag is on the repeat ticks, and on no other buffer. CPU
+    /// only.
     #[test]
     fn the_first_fresh_frame_of_each_source_is_flagged_down_to_the_sink() {
         require_elements(&["appsrc", "capssetter", "fakesink"]);
@@ -1812,8 +1899,8 @@ mod tests {
         o.set_observer(Some(Arc::new(move |e: &EmitInfo| {
             t.lock().unwrap().push(*e);
         })));
-        // (tick, flagged) of every buffer reaching the sink.
-        let at_sink: Arc<Mutex<Vec<(u64, bool)>>> = Arc::default();
+        // (tick, flagged, repeat) of every buffer reaching the sink.
+        let at_sink: Arc<Mutex<Vec<(u64, bool, bool)>>> = Arc::default();
         let a = Arc::clone(&at_sink);
         o.pipeline()
             .element(names::LOOPBACK)
@@ -1823,7 +1910,8 @@ mod tests {
             .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
                 if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
                     let flagged = gst_obc::has_new_source_flag(b);
-                    a.lock().unwrap().push((b.offset(), flagged));
+                    let repeat = gst_obc::has_repeat_flag(b);
+                    a.lock().unwrap().push((b.offset(), flagged, repeat));
                 }
                 gst::PadProbeReturn::Ok
             });
@@ -1837,7 +1925,7 @@ mod tests {
                 let r = b.get_mut().unwrap();
                 r.set_pts(gst::ClockTime::from_mseconds(i * 33));
                 // A flag already on the slot's buffer must not leak out.
-                r.set_flags(gst_obc::NEW_SOURCE_FLAG);
+                r.set_flags(gst_obc::NEW_SOURCE_FLAG | gst_obc::REPEAT_FLAG);
                 w.put(b);
                 std::thread::sleep(Duration::from_millis(33));
             }
@@ -1870,6 +1958,13 @@ mod tests {
             ticks.iter().any(|e| e.kind == TickKind::Repeat),
             "the run had repeats"
         );
+        let repeats: Vec<u64> = ticks
+            .iter()
+            .filter(|e| e.kind == TickKind::Repeat)
+            .map(|e| e.tick)
+            .collect();
+        let marked: Vec<u64> = at_sink.iter().filter(|s| s.2).map(|s| s.0).collect();
+        assert_eq!(marked, repeats, "repeat-flagged buffers at the sink");
     }
 
     #[test]

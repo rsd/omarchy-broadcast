@@ -93,6 +93,36 @@ pub fn count_holders(proc_dir: &Path, node: &NodeId, exclude: u32) -> u32 {
     n
 }
 
+/// The process names (`/proc/<pid>/comm`, trimmed; the pid when it
+/// cannot be read) of the processes other than `exclude` that hold `node`
+/// open, from the `/proc` tree at `proc_dir`, one per process.
+pub fn holder_names(proc_dir: &Path, node: &NodeId, exclude: u32) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(proc_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in entries.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == exclude {
+            continue;
+        }
+        let Ok(fds) = fs::read_dir(e.path().join("fd")) else {
+            continue;
+        };
+        if fds.flatten().any(|fd| node.is(&fd.path())) {
+            let name = fs::read_to_string(e.path().join("comm"))
+                .map(|s| s.trim().to_string())
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("process {pid}"));
+            out.push(name);
+        }
+    }
+    out
+}
+
 /// Whether inotify event `e` asks for a count: an event of the watch `mine`,
 /// or a queue overflow (`wd` -1: events were lost, the count may be stale).
 fn wants_count(e: &Event, mine: Option<i32>) -> bool {
@@ -381,6 +411,25 @@ mod tests {
         let _c = Holder::spawn(&other);
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(count_holders(proc_dir, &id, me), 0);
+    }
+
+    #[test]
+    fn the_holders_are_named_by_their_process_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = dir.path().join("video98");
+        fs::write(&node, b"").unwrap();
+        let id = NodeId::of(&node);
+        let me = std::process::id();
+        let proc_dir = Path::new("/proc");
+        assert!(holder_names(proc_dir, &id, me).is_empty());
+        let _a = Holder::spawn(&node);
+        let _b = Holder::spawn(&node);
+        assert!(wait_for(Duration::from_secs(5), || holder_names(
+            proc_dir, &id, me
+        )
+        .len()
+            == 2));
+        assert_eq!(holder_names(proc_dir, &id, me), ["sleep", "sleep"]);
     }
 
     #[test]

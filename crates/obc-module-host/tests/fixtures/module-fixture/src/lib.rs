@@ -28,6 +28,11 @@
 //!
 //! With a feature, the library exports another ABI version (or refuses the
 //! host) by hand, and its entry point aborts the process if it is called.
+//! With `abi-1-0` it is the same module, exported as one of ABI 1.0 (its
+//! version and its vtable say 1.0), as a module built before ABI 1.1 is.
+//!
+//! The process log line has `repeat=<bool>`, whether the frame carried
+//! `OBC_FRAME_FLAG_REPEAT`; the frame is processed either way.
 
 #[cfg(not(any(
     feature = "abi-major-2",
@@ -239,10 +244,11 @@ mod module {
             live: &[Param<'_>],
         ) -> Result<(), Error> {
             log::info!(
-                "fixture-process in={} out={} same={} live={}",
+                "fixture-process in={} out={} same={} repeat={} live={}",
                 frame(input),
                 frame(output),
                 input.same_memory(output),
+                input.is_repeat(),
                 params(live)
             );
             if Param::find(live, "alpha", "panic") == Some(Value::Bool(true)) {
@@ -299,7 +305,38 @@ mod module {
         }
     }
 
+    #[cfg(not(feature = "abi-1-0"))]
     obc_module_sdk::export_module!(Fixture);
+
+    /// The exports of `export_module!`, claiming ABI 1.0.
+    #[cfg(feature = "abi-1-0")]
+    mod abi_1_0 {
+        use obc_module_sdk::abi::{obc_host, obc_module_abi_pack, obc_module_vtable};
+
+        /// ABI 1.0.
+        #[unsafe(no_mangle)]
+        pub extern "C" fn obc_module_abi_version() -> u32 {
+            obc_module_abi_pack(1, 0)
+        }
+
+        /// The SDK's entry point, with a vtable that says 1.0.
+        ///
+        /// # Safety
+        ///
+        /// As `export_module!`'s: `host` is null or valid until unload.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn obc_module_entry(
+            host: *const obc_host,
+        ) -> *const obc_module_vtable {
+            static VTABLE: obc_module_vtable = {
+                let mut v = obc_module_sdk::ffi::vtable::<super::Fixture>();
+                v.abi_version = obc_module_abi_pack(1, 0);
+                v
+            };
+            // SAFETY: the caller's contract is the one `ffi::entry` needs.
+            unsafe { obc_module_sdk::ffi::entry(host, &VTABLE) }
+        }
+    }
 }
 
 #[cfg(any(

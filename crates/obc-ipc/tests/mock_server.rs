@@ -1179,8 +1179,9 @@ async fn proxy_reads_every_property() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 11);
-    assert_eq!(INTERFACE_REVISION, WARNING_REVISION);
+    assert_eq!(INTERFACE_REVISION, 12);
+    assert_eq!(WARNING_REVISION, 11);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::MODES_REVISION);
     assert_eq!(CONFIG_REVISION, 10);
     assert_eq!(proxy.inner().interface().as_str(), INTERFACE);
 }

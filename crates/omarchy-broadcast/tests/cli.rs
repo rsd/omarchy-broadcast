@@ -6130,3 +6130,80 @@ fn order_and_modules_json_carry_the_moves_and_the_overrides() {
         out.stdout
     );
 }
+
+// ---------------------------------------------------------------------------
+// The capture and output modes (revision 12)
+
+#[test]
+fn the_capture_mode_and_the_output_mode_are_set_through_the_generic_paths() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    // The capture mode: an enum setting of the camera, first group.
+    let mut groups = mock_settings();
+    groups.insert(
+        0,
+        SettingsGroup {
+            id: "capture".into(),
+            label: "Capture".into(),
+            settings: vec![choice(
+                "camera.capture.mode",
+                "Resolution and frame rate",
+                &[
+                    ("auto", "Automatic"),
+                    ("3840x2160@30", "3840x2160 \u{b7} 30 fps"),
+                    ("1920x1080@60", "1920x1080 \u{b7} 60 fps"),
+                ],
+                "auto",
+                "auto",
+            )],
+        },
+    );
+    mock.set_settings(groups);
+    let out = bus.run(&["settings", "set", "camera.capture.mode", "3840x2160@30"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(
+        out.stdout.contains("Resolution and frame rate"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        mock.take_calls()
+            .contains(&"SetSetting(,camera.capture.mode,Str(\"3840x2160@30\"))".to_string())
+    );
+    // The output mode: an editable enum row of the config schema.
+    mock.with(|m| {
+        let row = m
+            .config
+            .iter_mut()
+            .flat_map(|g| g.rows.iter_mut())
+            .find(|r| r.id == "output.mode")
+            .unwrap();
+        row.editable = true;
+        row.apply = "reload".into();
+        row.kind = obc_ipc::ConfigKind::Enum {
+            options: vec![
+                ("1920x1080@30".into(), "1920x1080 \u{b7} 30 fps".into()),
+                ("1280x720@30".into(), "1280x720 \u{b7} 30 fps".into()),
+            ],
+        };
+    });
+    let out = bus.run(&["config", "set", "output.mode", "1280x720@30"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert!(
+        out.stdout.contains("output.mode = 1280x720@30"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        mock.take_calls()
+            .contains(&"SetConfig(output.mode, Some(Str(\"1280x720@30\")))".to_string())
+    );
+    // Not an option: the daemon's refusal.
+    let out = bus.run(&["config", "set", "output.mode", "800x600@30"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        out.stderr.contains("not one of its options"),
+        "{}",
+        out.stderr
+    );
+}

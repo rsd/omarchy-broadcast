@@ -28,7 +28,18 @@ fn the_manifest_is_valid_and_declares_the_maxine_stages() {
             ("denoise", "pre-matte", 100, 300),
             ("background", "matte", 100, 300),
             ("relight", "post-matte", 100, 300),
+            ("frame-generation", "post-composite", i32::MAX, 300),
         ]
+    );
+    // Frame generation is last of the last slot, on CUDA NV12 frames.
+    let fg = m.stage("frame-generation").unwrap();
+    assert_eq!(
+        fg.formats.iter().map(|f| f.as_str()).collect::<Vec<_>>(),
+        ["nv12"]
+    );
+    assert_eq!(
+        fg.frames.iter().map(|f| f.as_str()).collect::<Vec<_>>(),
+        ["cuda"]
     );
     assert!(m.stage("relight").unwrap().needs_matte());
     assert!(m.stages.iter().all(|s| s.device.as_str() == "nvidia-gpu"));
@@ -62,7 +73,13 @@ fn the_library_loads_without_the_sdk_and_describes_its_settings() {
     let ids: Vec<&str> = probe.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(
         ids,
-        ["enhance", "denoise", "background", "relight"],
+        [
+            "enhance",
+            "denoise",
+            "background",
+            "relight",
+            "frame-generation"
+        ],
         "manifest order"
     );
     if std::env::var_os("MAXINE_VFX_ROOT").is_none_or(|v| v.is_empty()) {
@@ -107,6 +124,13 @@ fn the_library_loads_without_the_sdk_and_describes_its_settings() {
     );
     assert!(settings.param("relight", "light").is_some());
     assert!(settings.param("relight", "brightness").is_some());
+    // Frame generation has no setting: the daemon adds it.
+    assert!(settings.enable_of("frame-generation").is_none());
+    assert!(settings.groups.iter().flat_map(|g| &g.settings).all(|s| {
+        s.stage
+            .as_ref()
+            .is_none_or(|id| id.as_str() != "frame-generation")
+    }));
     // An instance can be made without the SDK: nothing is opened yet.
     let mut instance = module.create_instance().unwrap();
     instance.unload();

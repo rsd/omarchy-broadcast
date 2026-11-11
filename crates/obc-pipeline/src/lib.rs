@@ -91,8 +91,8 @@ pub use geometry::{Crop, crop_for};
 pub use ingest::{ControlReport, Ingest, IngestConfig};
 pub use live::{LiveStats, LiveWindow};
 pub use loopback::{
-    FrameTap, LoopbackWriter, WriterConfig, WriterCounts, WriterHandle, WriterSink,
-    writer_caps_string,
+    FrameTap, LoopbackWriter, PlaceholderState, WriterConfig, WriterCounts, WriterHandle,
+    WriterSink, image_contract_frame, writer_caps_string,
 };
 pub use loopback_cover::{ConsumerCover, CoverReport};
 pub use module::{ModulePlacement, ModuleStageSpec, ModuleStats};

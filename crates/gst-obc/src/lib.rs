@@ -7,12 +7,14 @@
 //!   status, the status of each stage, statistics); see [`effect`] for its
 //!   behaviour.
 //! * [`NEW_SOURCE_FLAG`]: the buffer flag the output clock marks the first
-//!   frame of a new source with.
+//!   frame of a new source with, and [`REPEAT_FLAG`] the one it marks a
+//!   repeated frame with.
 //! * [`EffectSettings`] (with its [`StageRequest`]s), [`EffectFallback`],
 //!   [`EffectStatus`], [`EffectStats`] (with its [`StageStats`]): what it
 //!   is asked to do and what it reports.
 //! * [`background`]: the replace effect's image (file checks, decoding,
-//!   crop to fill).
+//!   crop to fill), and the fallback image of `on-failure=image` as YUV
+//!   4:2:0 ([`background::decode_yuv420`]).
 //! * [`cuda`]: the subset of GStreamer's CUDA library it uses, opened at run
 //!   time.
 
@@ -25,12 +27,12 @@ mod settings;
 mod video;
 
 pub use effect::{
-    ELEMENT_NAME, NEW_SOURCE_FLAG, ObcEffect, STATUS_MESSAGE, from_element, has_new_source_flag,
-    register,
+    ELEMENT_NAME, NEW_SOURCE_FLAG, ObcEffect, REPEAT_FLAG, STATUS_MESSAGE, from_element,
+    has_new_source_flag, has_repeat_flag, register,
 };
 pub use enhance::{EnhanceStats, ObcEnhance};
 pub use module::{ModuleStats, ObcModule};
 pub use settings::{
     EffectFallback, EffectKind, EffectSettings, EffectStats, EffectStatus, Params, StageId,
-    StageRequest, StageStats, Value, parse_effect,
+    StageRequest, StageStats, Value, fallback_unreadable, parse_effect,
 };

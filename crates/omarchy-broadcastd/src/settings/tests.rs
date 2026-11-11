@@ -1078,3 +1078,150 @@ fn sanitise_strips_what_cannot_be_shown() {
     assert_eq!(sanitise("ééé", 5), "éé");
     assert_eq!(sanitise("\u{7}\u{1b}", 48), "");
 }
+
+// ---- the capture mode setting ----
+
+fn brio_modes() -> Vec<VideoMode> {
+    obc_pipeline::capability::parse_v4l2_ctl(include_str!(
+        "../../../obc-pipeline/tests/data/mx-brio-046d-0944.v4l2-ctl.txt"
+    ))
+    .modes
+}
+
+fn mode_options(s: &Setting) -> Vec<(String, String)> {
+    match &s.kind {
+        SettingKind::Enum { options, .. } => options.clone(),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_capture_mode_setting_is_auto_then_the_camera_modes() {
+    assert_eq!(mode_setting(&[], None), None);
+    let s = mode_setting(&brio_modes(), None).unwrap();
+    assert!(valid_setting_id(&s.id));
+    assert_eq!(s.id, MODE);
+    let options = mode_options(&s);
+    assert_eq!(options.len(), 16);
+    assert!(options.len() <= MAX_OPTIONS);
+    assert_eq!(options[0], (MODE_AUTO.into(), MODE_AUTO_LABEL.into()));
+    assert_eq!(options[1].0, "3840x2160@30");
+    assert!(options.iter().all(|(_, l)| l.len() <= LABEL_MAX));
+    assert_eq!(s.kind.value(), Some(SettingValue::Str("auto".into())));
+    assert!(!s.stored);
+    // A stored mode the camera offers is the value; one it does not is an
+    // option of its own, in place of the last choice.
+    let m: ModeRequest = "1280x720@30".parse().unwrap();
+    let s = mode_setting(&brio_modes(), Some(&m)).unwrap();
+    assert_eq!(
+        s.kind.value(),
+        Some(SettingValue::Str("1280x720@30".into()))
+    );
+    assert!(s.stored);
+    let gone: ModeRequest = "4096x2160@30".parse().unwrap();
+    let s = mode_setting(&brio_modes(), Some(&gone)).unwrap();
+    let options = mode_options(&s);
+    assert_eq!(options.len(), 16);
+    assert_eq!(
+        options[15],
+        (
+            "4096x2160@30".to_string(),
+            "4096x2160 \u{b7} 30 fps (gone)".to_string()
+        )
+    );
+}
+
+#[test]
+fn every_capture_mode_label_fits_the_option_label_bound() {
+    let fixtures = [
+        include_str!("../../../obc-pipeline/tests/data/mx-brio-046d-0944.v4l2-ctl.txt"),
+        include_str!("../../../obc-pipeline/tests/data/fhd-camera-5986-1193-colour.v4l2-ctl.txt"),
+        include_str!("../../../obc-pipeline/tests/data/fhd-camera-5986-1193-ir.v4l2-ctl.txt"),
+        include_str!("../../../obc-pipeline/tests/data/synthetic-yuyv-only-1209-0001.v4l2-ctl.txt"),
+    ];
+    // Stored modes no camera offers: the widest sizes and the longest
+    // rates (a fractional one over 100 fps), marked as gone.
+    let gone: Vec<ModeRequest> = [
+        "3840x2160@30",
+        "7680x4320@120000/1001",
+        "15360x8640@120000/1001",
+        "99999x99999@240000/1001",
+    ]
+    .iter()
+    .map(|m| m.parse().unwrap())
+    .collect();
+    let worst =
+        obc_pipeline::capability::mode_label(99999, 99999, 240_000, 1001) + MODE_UNAVAILABLE_SUFFIX;
+    assert_eq!(worst, "99999x99999 \u{b7} 239.76 fps (gone)");
+    for text in fixtures {
+        let modes = obc_pipeline::capability::parse_v4l2_ctl(text).modes;
+        if modes.is_empty() {
+            continue;
+        }
+        let stored = std::iter::once(None).chain(gone.iter().map(Some));
+        for m in stored {
+            let s = mode_setting(&modes, m).unwrap();
+            for (_, l) in mode_options(&s) {
+                assert!(l.len() <= OPTION_LABEL_MAX, "{l:?}: {} bytes", l.len());
+            }
+        }
+    }
+}
+
+#[test]
+fn a_capture_mode_write_is_checked_against_the_options() {
+    let s = mode_setting(&brio_modes(), None).unwrap();
+    let v = |x: &str| SettingValue::Str(x.into());
+    assert_eq!(check_mode(Some(&s), "c", Some(&v("auto"))), Ok(None));
+    assert_eq!(
+        check_mode(Some(&s), "c", Some(&v("3840x2160@30"))),
+        Ok(Some("3840x2160@30".parse().unwrap()))
+    );
+    assert!(matches!(
+        check_mode(Some(&s), "c", Some(&v("3840x2160@24"))),
+        Err(Refusal::Invalid(_))
+    ));
+    assert!(matches!(
+        check_mode(Some(&s), "c", Some(&SettingValue::Int(1))),
+        Err(Refusal::Invalid(_))
+    ));
+    assert!(matches!(
+        check_mode(None, "c", Some(&v("auto"))),
+        Err(Refusal::Unknown(_))
+    ));
+}
+
+#[test]
+fn the_capture_mode_is_the_first_group_and_its_changes_are_diffed() {
+    let with = |stored: Option<&str>| CameraSettings {
+        camera: "c".into(),
+        mode: mode_setting(&brio_modes(), stored.map(|s| s.parse().unwrap()).as_ref()),
+        ..CameraSettings::none()
+    };
+    let a = with(None);
+    let groups = a.groups();
+    assert_eq!(groups[0].id, catalogue::CAPTURE);
+    assert_eq!(groups[0].settings[0].id, MODE);
+    // A new value: a change of it.
+    let b = with(Some("1280x720@30"));
+    let d = diff(&a, &b).unwrap();
+    assert!(!d.structural);
+    assert_eq!(d.changes.len(), 1);
+    assert_eq!(d.changes[0].id, MODE);
+    // A new option (a stored mode not offered): structural.
+    let c = with(Some("4096x2160@30"));
+    assert!(diff(&a, &c).unwrap().structural);
+    // Gone: structural.
+    assert!(
+        diff(
+            &a,
+            &CameraSettings {
+                camera: "c".into(),
+                ..CameraSettings::none()
+            }
+        )
+        .unwrap()
+        .structural
+    );
+    assert_eq!(diff(&a, &with(None)), None);
+}

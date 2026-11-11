@@ -2327,6 +2327,8 @@ fn a_repeated_set_denoise_neither_rewrites_the_state_nor_reloads_the_session() {
     h.tick(500);
     assert_eq!(h.ctrl.denoise_seen(), Some(EffectStatus::Ready));
     let sets = h.world().effect_sets.len();
+    // The last good contract, kept at the first frame, saved first.
+    h.ctrl.flush_settings();
     fs::remove_file(&h.paths.state).unwrap();
     h.set_denoise(true, 1000).unwrap();
     h.tick(1500);
@@ -2422,6 +2424,8 @@ fn an_effect_method_retries_noise_removal_and_a_new_failure_is_reported_again() 
     // The value already in force: nothing written, but the failed stage
     // is retried. It fails the same way and is reported again.
     let sets = h.world().effect_sets.len();
+    // The last good contract, kept at the first frame, saved first.
+    h.ctrl.flush_settings();
     fs::remove_file(&h.paths.state).unwrap();
     h.set_denoise(true, 1000).unwrap();
     assert!(!h.paths.state.exists());
@@ -3443,7 +3447,11 @@ fn a_failed_start_parks_the_gpu_again() {
     assert_eq!(h.state(), State::Error);
     let w = h.world();
     assert!(w.parked, "parked again after the failed start");
-    assert_eq!(w.gpu_log, ["build", "park", "unpark", "park"]);
+    // The start, then its retry without the effects: each parks again.
+    assert_eq!(
+        w.gpu_log,
+        ["build", "park", "unpark", "park", "unpark", "park"]
+    );
 }
 
 #[test]
@@ -7941,7 +7949,9 @@ fn the_maxine_module_offers_the_groups_and_stages_of_revision_8() {
             ("enhance", "pre-matte", true),
             ("denoise", "pre-matte", true),
             ("background", "matte", true),
-            ("relight", "post-matte", true)
+            ("relight", "post-matte", true),
+            // The manifest declares it; the fake's probe does not offer it.
+            ("frame-generation", "post-composite", false)
         ]
     );
     // It is the effect element's backend and the ingest's enhancer.
@@ -8802,8 +8812,13 @@ fn set_config_refuses_unknown_read_only_and_invalid_values() {
         Err(IpcError::UnknownSetting(_))
     ));
     assert!(matches!(
-        h.set_config("output.mode", V::Str("1280x720@30".into())),
+        h.set_config("camera.mode", V::Str("1280x720@30".into())),
         Err(IpcError::Disabled(_))
+    ));
+    // Not one of the output modes offered.
+    assert!(matches!(
+        h.set_config("output.mode", V::Str("1281x720@30".into())),
+        Err(IpcError::InvalidArgument(_))
     ));
     assert!(matches!(
         h.set_config("output.hold_timeout_s", V::Str("x".into())),
@@ -9984,4 +9999,1479 @@ fn enhancement_is_warned_only_where_it_would_apply() {
     assert_eq!(h.snap().warning, "");
     h.activate(200);
     assert_eq!(h.snap().warning, "");
+}
+
+// ---- capture and output modes, frame generation, the Warning bound ----
+
+const BRIO_FORMATS: &str =
+    include_str!("../../../obc-pipeline/tests/data/mx-brio-046d-0944.v4l2-ctl.txt");
+const FHD_FORMATS: &str =
+    include_str!("../../../obc-pipeline/tests/data/fhd-camera-5986-1193-colour.v4l2-ctl.txt");
+
+fn vmode(s: &str) -> obc_core::VideoMode {
+    s.parse().unwrap()
+}
+
+/// `alpha()` with the MX Brio's modes.
+fn brio_cam() -> Camera {
+    let mut c = alpha();
+    c.modes = obc_pipeline::capability::parse_v4l2_ctl(BRIO_FORMATS).modes;
+    c
+}
+
+/// `beta()` with the FHD Camera's modes.
+fn fhd_cam() -> Camera {
+    let mut c = beta();
+    c.modes = obc_pipeline::capability::parse_v4l2_ctl(FHD_FORMATS).modes;
+    c
+}
+
+fn enum_of(s: &Setting) -> (Vec<(String, String)>, String, String) {
+    match &s.kind {
+        SettingKind::Enum {
+            options,
+            default,
+            value,
+        } => (options.clone(), default.clone(), value.clone()),
+        other => panic!("not an enum: {other:?}"),
+    }
+}
+
+fn str_value(v: &str) -> SettingValue {
+    SettingValue::Str(v.into())
+}
+
+#[test]
+fn the_capture_mode_row_offers_the_camera_modes_and_applies_live() {
+    let mut h = H::new("", |w| w.cameras = vec![brio_cam(), fhd_cam()]);
+    let tree = h.get_settings("", 0).unwrap();
+    assert_eq!(tree.groups[0].id, "capture");
+    assert_eq!(tree.groups[0].label, "Capture");
+    assert_eq!(tree.groups[0].settings[0].id, settings::MODE);
+    let s = h.setting(settings::MODE);
+    assert_eq!(s.label, "Resolution and frame rate");
+    assert_eq!(s.scope, obc_ipc::settings::SCOPE_CAMERA);
+    let (options, default, value) = enum_of(&s);
+    assert_eq!(options[0], ("auto".into(), "Automatic".into()));
+    assert!(options.contains(&("3840x2160@30".into(), "3840x2160 \u{b7} 30 fps".into())));
+    assert!(options.len() <= settings::MAX_OPTIONS);
+    assert_eq!(
+        (default.as_str(), value.as_str(), s.stored),
+        ("auto", "auto", false)
+    );
+    // The FHD Camera has no 4K mode.
+    let fhd = h.get_settings("usb-b", 0).unwrap();
+    let (options, ..) = enum_of(fhd.find(settings::MODE).unwrap());
+    assert_eq!(options[1].0, "1920x1080@30");
+    assert!(!options.iter().any(|(v, _)| v.starts_with("3840x2160")));
+
+    // Automatic: the config's 1920x1080@60, NV12 on the Brio.
+    h.activate(100);
+    assert_eq!(h.world().ingest_modes, [vmode("NV12:1920x1080@60")]);
+    let writers = h.world().writer_starts;
+    // 4K30: asked without a format, MJPEG chosen; the camera is reopened,
+    // the session and the loopback kept.
+    h.set_setting(settings::MODE, str_value("3840x2160@30"), 1000)
+        .unwrap();
+    {
+        let w = h.world();
+        assert_eq!(
+            w.ingest_modes,
+            [vmode("NV12:1920x1080@60"), vmode("MJPEG:3840x2160@30")]
+        );
+        assert_eq!(w.ingests, ["usb-a", "usb-a"]);
+        assert_eq!(w.writer_starts, writers, "the loopback is not touched");
+        assert_eq!(w.session_starts, 1);
+    }
+    h.tick(1100);
+    assert_eq!(h.state(), State::Active);
+    let s = h.setting(settings::MODE);
+    assert_eq!((enum_of(&s).2.as_str(), s.stored), ("3840x2160@30", true));
+    assert_eq!(
+        h.persisted().camera_modes["usb-a"].to_string(),
+        "3840x2160@30"
+    );
+    assert_eq!(h.snap().warning, "");
+    // The same mode again: nothing reopened.
+    h.set_setting(settings::MODE, str_value("3840x2160@30"), 1200)
+        .unwrap();
+    assert_eq!(h.world().ingest_modes.len(), 2);
+    // Not an option, or not a string: refused, nothing changed.
+    assert!(matches!(
+        h.set_setting(settings::MODE, str_value("1234x567@30"), 1300),
+        Err(IpcError::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        h.set_setting(settings::MODE, SettingValue::Int(30), 1300),
+        Err(IpcError::InvalidArgument(_))
+    ));
+    // Automatic again: the config's mode, the choice forgotten.
+    h.set_setting(settings::MODE, str_value("auto"), 2000)
+        .unwrap();
+    assert_eq!(
+        h.world().ingest_modes.last(),
+        Some(&vmode("NV12:1920x1080@60"))
+    );
+    assert!(h.persisted().camera_modes.is_empty());
+    // A reset of the group, of the setting or of the camera forgets it.
+    for scope in ["group:capture", "setting:camera.capture.mode", "camera"] {
+        h.set_setting(settings::MODE, str_value("1280x720@30"), 3000)
+            .unwrap();
+        assert_eq!(
+            h.world().ingest_modes.last(),
+            Some(&vmode("NV12:1280x720@30"))
+        );
+        h.reset_settings(scope, 3100).unwrap();
+        assert!(h.persisted().camera_modes.is_empty(), "{scope}");
+        assert_eq!(
+            h.world().ingest_modes.last(),
+            Some(&vmode("NV12:1920x1080@60")),
+            "{scope}"
+        );
+    }
+    // Kept across a restart.
+    h.set_setting(settings::MODE, str_value("2560x1440@30"), 4000)
+        .unwrap();
+    h.ctrl.flush_settings();
+    h.restart();
+    let s = h.setting(settings::MODE);
+    assert_eq!(enum_of(&s).2, "2560x1440@30");
+}
+
+#[test]
+fn a_camera_without_known_modes_has_no_capture_mode_row() {
+    let mut h = H::new("", |_| {});
+    assert!(
+        h.get_settings("", 0)
+            .unwrap()
+            .find(settings::MODE)
+            .is_none()
+    );
+    assert!(matches!(
+        h.set_setting(settings::MODE, str_value("auto"), 0),
+        Err(IpcError::UnknownSetting(_))
+    ));
+}
+
+#[test]
+fn a_stored_mode_the_camera_no_longer_offers_takes_the_nearest_with_a_warning() {
+    let mut h = H::new("", |w| w.cameras = vec![brio_cam()]);
+    h.set_setting(settings::MODE, str_value("3840x2160@30"), 0)
+        .unwrap();
+    assert_eq!(h.snap().warning, "");
+    // The same camera, now reporting the FHD Camera's modes.
+    let modes = fhd_cam().modes;
+    h.world().cameras[0].modes = modes;
+    h.rescan(100);
+    assert_eq!(
+        h.snap().warning,
+        "Alpha Cam does not offer 3840x2160@30: it captures 1920x1080@30 instead"
+    );
+    // The choice is kept, shown as not offered; the feed streams.
+    let s = h.setting(settings::MODE);
+    let (options, _, value) = enum_of(&s);
+    assert_eq!(value, "3840x2160@30");
+    assert_eq!(
+        options.last().unwrap(),
+        &(
+            "3840x2160@30".to_string(),
+            "3840x2160 \u{b7} 30 fps (gone)".to_string()
+        )
+    );
+    h.activate(200);
+    assert_eq!(h.world().ingest_modes, [vmode("MJPEG:1920x1080@30")]);
+    // Automatic clears the warning.
+    h.set_setting(settings::MODE, str_value("auto"), 1000)
+        .unwrap();
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn output_mode_is_set_over_set_config_into_the_managed_file_only() {
+    let config = "# mine\n[output]\nmode = \"1920x1080@30\" # keep\n";
+    let mut h = H::new(config, |w| w.cameras = vec![brio_cam()]);
+    let row = h.row("output.mode");
+    assert!(row.editable && row.enabled);
+    let obc_ipc::ConfigKind::Enum { options } = &row.kind else {
+        panic!("{:?}", row.kind)
+    };
+    let values: Vec<&str> = options.iter().map(|(v, _)| v.as_str()).collect();
+    assert_eq!(values[0], "3840x2160@30");
+    assert!(values.contains(&"1280x720@30"));
+    // No frame generation: no generated rate.
+    assert!(!options.iter().any(|(_, l)| l.ends_with("(generated)")));
+    h.set_config(
+        "output.mode",
+        obc_ipc::ConfigValue::Str("1280x720@30".into()),
+    )
+    .unwrap();
+    assert_eq!(
+        h.managed_key("output.mode"),
+        Some(toml::Value::String("1280x720@30".into()))
+    );
+    assert_eq!(fs::read_to_string(&h.paths.config).unwrap(), config);
+    // Nobody holds the device: applied at once.
+    assert_eq!(h.snap().output_mode, "NV12 1280x720@30");
+    let row = h.row("output.mode");
+    assert_eq!(row.value, obc_ipc::ConfigValue::Str("1280x720@30".into()));
+    // With frame generation offered, the generated rates are options.
+    let mut h = H::new("", |w| {
+        w.cameras = vec![brio_cam()];
+        w.modules = vec![fg_module()];
+    });
+    let row = h.row("output.mode");
+    let obc_ipc::ConfigKind::Enum { options } = &row.kind else {
+        panic!("{:?}", row.kind)
+    };
+    assert_eq!(
+        options[0],
+        (
+            "3840x2160@60".to_string(),
+            "3840x2160 \u{b7} 60 fps (generated)".to_string()
+        )
+    );
+}
+
+#[test]
+fn an_output_change_waiting_for_consumers_names_them_and_clears_after_the_rebuild() {
+    let mut h = H::new("", |w| {
+        w.holder_names = ["obs", "obs", "firefox", "chrome", "zoom"]
+            .map(String::from)
+            .to_vec();
+    });
+    h.activate(0);
+    h.set_config(
+        "output.mode",
+        obc_ipc::ConfigValue::Str("1280x720@30".into()),
+    )
+    .unwrap();
+    assert_eq!(h.snap().output_mode, "NV12 1920x1080@30", "deferred");
+    assert_eq!(
+        h.snap().warning,
+        "Output 1280x720@30 applies when obs, firefox, chrome and 1 more release the \
+         virtual camera"
+    );
+    let reads = h.world().holder_name_reads;
+    h.tick(1000);
+    assert_eq!(h.world().holder_name_reads, reads, "read once per count");
+    // Unnamed holders.
+    h.world().holder_names.clear();
+    h.consumers(2, 1100);
+    assert_eq!(
+        h.snap().warning,
+        "Output 1280x720@30 applies when the apps using it release the virtual camera"
+    );
+    // Released: the writer is rebuilt after the grace, the warning goes.
+    h.consumers(0, 2000);
+    h.tick(7000);
+    assert_eq!(h.snap().output_mode, "NV12 1280x720@30");
+    assert_eq!(h.snap().warning, "");
+    // A loopback change alone is no output change.
+    let mut h = H::new("", |_| {});
+    h.consumers(1, 0);
+    h.reload("[loopback]\nlabel = \"Other\"\n", 100).unwrap();
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn a_new_output_contract_that_cannot_start_reverts_to_the_last_one_that_did() {
+    let new: OutputContract = "1280x720@30".parse().unwrap();
+    let mut h = H::new("", |w| w.refused_contracts = vec![(new, false)]);
+    let starts = h.world().writer_starts;
+    h.set_config(
+        "output.mode",
+        obc_ipc::ConfigValue::Str("1280x720@30".into()),
+    )
+    .unwrap();
+    {
+        let w = h.world();
+        assert_eq!(w.writer_starts, starts + 1, "the old contract again");
+        assert_eq!(w.writer.as_ref().unwrap().1.width, 1920);
+    }
+    let snap = h.snap();
+    assert_eq!(snap.state, State::Idle);
+    assert_eq!(snap.error, "");
+    assert_eq!(snap.output_mode, "NV12 1920x1080@30");
+    assert_eq!(
+        snap.warning,
+        "Output 1280x720@30 could not start (loopback /dev/video11: cannot stream NV12 \
+         1280x720@30): streaming 1920x1080@30 instead"
+    );
+    // The configuration is not rewritten, and nothing is retried.
+    assert_eq!(
+        h.managed_key("output.mode"),
+        Some(toml::Value::String("1280x720@30".into()))
+    );
+    h.tick(5000);
+    assert_eq!(h.world().writer_starts, starts + 1);
+    // The session streams the contract that works.
+    h.activate(6000);
+    assert_eq!(h.session_params().contract.width, 1920);
+    // Another contract asked for: tried, the warning gone.
+    h.consumers(0, 7000);
+    h.tick(20_000);
+    h.set_config(
+        "output.mode",
+        obc_ipc::ConfigValue::Str("1920x1080@30".into()),
+    )
+    .unwrap();
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn a_missing_loopback_at_a_contract_change_is_retried_never_a_failed_contract() {
+    let mut h = H::new("", |_| {});
+    // The new contract and a loopback that cannot be found: not the
+    // contract's fault, so it is not pinned to the old one.
+    h.world().sink = Err("no loopback device labelled \"Other\"".into());
+    h.set_config(
+        "output.mode",
+        obc_ipc::ConfigValue::Str("1280x720@30".into()),
+    )
+    .unwrap();
+    assert!(h.ctrl.failed_contract.is_none());
+    assert_eq!(h.state(), State::Error);
+    assert!(
+        h.snap().error.contains("no loopback device"),
+        "{}",
+        h.snap().error
+    );
+    // Found again: the new contract starts.
+    h.world().sink = Ok("/dev/video11".into());
+    h.tick(3000);
+    assert_eq!(h.world().writer.as_ref().unwrap().1.width, 1280);
+    assert_eq!(h.snap().warning, "");
+    assert_eq!(h.state(), State::Idle);
+}
+
+#[test]
+fn a_new_output_contract_on_a_held_loopback_keeps_the_last_writer_and_waits() {
+    let new: OutputContract = "1280x720@30".parse().unwrap();
+    let mut h = H::new("", |w| w.refused_contracts = vec![(new, true)]);
+    let starts = h.world().writer_starts;
+    h.set_config(
+        "output.mode",
+        obc_ipc::ConfigValue::Str("1280x720@30".into()),
+    )
+    .unwrap();
+    // The last good writer streams again: never a dead device, never a
+    // failed contract.
+    assert_eq!(
+        h.world().writer_starts,
+        starts + 1,
+        "the old contract again"
+    );
+    assert_eq!(h.world().writer.as_ref().unwrap().1.width, 1920);
+    let snap = h.snap();
+    assert_eq!(snap.state, State::Idle);
+    assert_eq!(snap.error, "");
+    assert_eq!(snap.output_mode, "NV12 1920x1080@30");
+    let waits =
+        format!("Output 1280x720@30 applies when {HOLDERS_UNKNOWN} release the virtual camera");
+    assert_eq!(snap.warning, waits);
+    assert!(h.ctrl.failed_contract.is_none());
+    // Not tried again before the retry is due.
+    h.tick(1000);
+    assert_eq!(h.world().writer_starts, starts + 1);
+    // Still held at the retry: the last writer again, the wait doubled.
+    h.tick(2500);
+    assert_eq!(h.world().writer_starts, starts + 2);
+    assert_eq!(h.world().writer.as_ref().unwrap().1.width, 1920);
+    assert_eq!(h.snap().warning, waits);
+    h.tick(5000);
+    assert_eq!(
+        h.world().writer_starts,
+        starts + 2,
+        "4 s after the last try"
+    );
+    // Released: the new contract starts, the warning goes.
+    h.world().refused_contracts.clear();
+    h.tick(7000);
+    assert_eq!(h.world().writer.as_ref().unwrap().1.width, 1280);
+    assert_eq!(h.snap().output_mode, "NV12 1280x720@30");
+    assert_eq!(h.snap().warning, "");
+    assert_eq!(h.state(), State::Idle);
+}
+
+impl H {
+    /// The daemon restarted, as [`H::restart`], with `setup` applied to the
+    /// new world before the controller starts.
+    fn restart_with(&mut self, setup: impl FnOnce(&mut World)) {
+        let fake = FakeBackend::default();
+        {
+            let old = self.fake.world();
+            let mut w = fake.world();
+            w.cameras = old.cameras.clone();
+            w.controls = old.controls.clone();
+            setup(&mut w);
+        }
+        self.ctrl.shutdown();
+        let (ctrl, notes) = Self::controller(&fake, &self.paths, self.t0);
+        self.ctrl = ctrl;
+        self.notes = notes;
+        self.fake = fake;
+    }
+
+    /// When the held contract is tried again, in ms from `t0`, and the
+    /// wait that led there.
+    fn held_retry(&self) -> (u64, Duration) {
+        let r = self.ctrl.held_retry.as_ref().expect("a held retry");
+        let at = u64::try_from((r.at - self.t0).as_millis()).unwrap();
+        (at, r.delay)
+    }
+}
+
+#[test]
+fn a_loopback_change_is_not_delayed_by_a_held_output_retry() {
+    let new: OutputContract = "1280x720@30".parse().unwrap();
+    let mut h = H::new("", |w| w.refused_contracts = vec![(new, true)]);
+    let starts = h.world().writer_starts;
+    h.set_config(
+        "output.mode",
+        obc_ipc::ConfigValue::Str("1280x720@30".into()),
+    )
+    .unwrap();
+    assert_eq!(h.world().writer_starts, starts + 1);
+    assert_eq!(h.held_retry().0, 2000);
+    // Inside the wait, the loopback changes: the writer restarts on it in
+    // that step (the new contract tried there, the last good one again as
+    // it is still held), not at the old retry time.
+    h.reload("[loopback]\nlabel = \"Other\"\n", 500).unwrap();
+    assert_eq!(h.world().writer_starts, starts + 2, "restarted at once");
+    let w = h.ctrl.writer.as_ref().unwrap();
+    assert_eq!(w.sink, h.ctrl.config.sink_selector());
+    assert_eq!(w.contract.width, 1920);
+    // The wait is the new device's, from the start.
+    let r = h.ctrl.held_retry.as_ref().unwrap();
+    assert_eq!(r.sink, h.ctrl.config.sink_selector());
+    assert_eq!(h.held_retry(), (2500, WRITER_RETRY));
+}
+
+#[test]
+fn the_held_retry_starts_again_at_two_seconds_when_the_configuration_comes_back_to_the_contract() {
+    let new: OutputContract = "1280x720@30".parse().unwrap();
+    let mut h = H::new("", |w| w.refused_contracts = vec![(new, true)]);
+    let set = |h: &mut H, mode: &str| {
+        h.set_config("output.mode", obc_ipc::ConfigValue::Str(mode.into()))
+            .unwrap();
+    };
+    set(&mut h, "1280x720@30");
+    h.tick(2100);
+    h.tick(6200);
+    assert_eq!(h.held_retry(), (14_200, Duration::from_secs(8)));
+    // Back to the contract that streams: the record goes, and the warning.
+    set(&mut h, "1920x1080@30");
+    assert!(h.ctrl.held_retry.is_none());
+    assert_eq!(h.snap().warning, "");
+    // The new contract again: tried at once, next try 2 s later, not 16.
+    let starts = h.world().writer_starts;
+    h.tick(7000);
+    set(&mut h, "1280x720@30");
+    assert_eq!(h.world().writer_starts, starts + 1, "tried at once");
+    let (at, delay) = h.held_retry();
+    assert_eq!(delay, WRITER_RETRY);
+    h.tick(at - 100);
+    assert_eq!(h.world().writer_starts, starts + 1);
+    h.tick(at);
+    assert_eq!(h.world().writer_starts, starts + 2);
+}
+
+#[test]
+fn the_held_retry_wait_doubles_up_to_the_cap() {
+    let new: OutputContract = "1280x720@30".parse().unwrap();
+    let mut h = H::new("", |w| w.refused_contracts = vec![(new, true)]);
+    h.set_config(
+        "output.mode",
+        obc_ipc::ConfigValue::Str("1280x720@30".into()),
+    )
+    .unwrap();
+    for secs in [2, 4, 8, 16, 32, 32, 32] {
+        let (at, delay) = h.held_retry();
+        assert_eq!(delay, Duration::from_secs(secs));
+        assert!(delay <= HELD_RETRY_MAX);
+        let starts = h.world().writer_starts;
+        h.tick(at - 1);
+        assert_eq!(h.world().writer_starts, starts, "not before {at} ms");
+        // Still tried at the cap.
+        h.tick(at);
+        assert_eq!(h.world().writer_starts, starts + 1, "tried at {at} ms");
+        assert_eq!(h.world().writer.as_ref().unwrap().1.width, 1920);
+    }
+}
+
+#[test]
+fn a_held_output_whose_last_good_writer_cannot_start_either_is_the_writer_error() {
+    let new: OutputContract = "1280x720@30".parse().unwrap();
+    let good = OutputContract::default();
+    let mut h = H::new("", |w| w.refused_contracts = vec![(new, true)]);
+    h.world().refused_contracts.push((good, false));
+    h.set_config(
+        "output.mode",
+        obc_ipc::ConfigValue::Str("1280x720@30".into()),
+    )
+    .unwrap();
+    assert_eq!(h.state(), State::Error);
+    assert!(h.world().writer.is_none());
+    assert!(
+        h.snap().error.contains("cannot stream NV12 1920x1080@30"),
+        "{}",
+        h.snap().error
+    );
+    assert!(h.ctrl.failed_contract.is_none());
+    // Retried every 2 s.
+    h.tick(1000);
+    assert_eq!(h.state(), State::Error);
+    h.world().refused_contracts.retain(|(c, _)| *c != good);
+    h.tick(1900);
+    assert!(h.world().writer.is_none(), "not before the retry");
+    h.tick(2100);
+    assert_eq!(h.world().writer.as_ref().unwrap().1, good);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.snap().error, "");
+    assert_eq!(
+        h.snap().warning,
+        format!("Output 1280x720@30 applies when {HOLDERS_UNKNOWN} release the virtual camera")
+    );
+    assert!(h.ctrl.failed_contract.is_none());
+}
+
+#[test]
+fn a_start_on_a_loopback_held_in_another_format_streams_that_format_and_waits() {
+    // The daemon starts with no writer of this run to fall back to; the
+    // device is held in 1920x1080@25.
+    let new: OutputContract = "1280x720@30".parse().unwrap();
+    let held: OutputContract = "1920x1080@25".parse().unwrap();
+    let mut h = H::new("[output]\nmode = \"1280x720@30\"\n", |w| {
+        w.refused_contracts = vec![(new, true)];
+        w.held_as = Some(held);
+    });
+    assert_eq!(h.world().writer.as_ref().unwrap().1, held);
+    let snap = h.snap();
+    assert_eq!(snap.state, State::Idle);
+    assert_eq!(snap.error, "");
+    assert_eq!(snap.output_mode, "NV12 1920x1080@25");
+    assert_eq!(
+        snap.warning,
+        format!("Output 1280x720@30 applies when {HOLDERS_UNKNOWN} release the virtual camera")
+    );
+    assert!(h.ctrl.failed_contract.is_none());
+    // Released: the configured contract starts at the retry.
+    h.world().refused_contracts.clear();
+    h.tick(2100);
+    assert_eq!(h.world().writer.as_ref().unwrap().1, new);
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn a_refused_contract_at_the_first_start_falls_back_to_the_default_contract() {
+    let new: OutputContract = "1280x720@30".parse().unwrap();
+    let mut h = H::new("[output]\nmode = \"1280x720@30\"\n", |w| {
+        w.refused_contracts = vec![(new, false)];
+    });
+    assert_eq!(
+        h.world().writer.as_ref().unwrap().1,
+        OutputContract::default()
+    );
+    let snap = h.snap();
+    assert_eq!(snap.state, State::Idle);
+    assert_eq!(snap.error, "");
+    assert_eq!(
+        snap.warning,
+        "Output 1280x720@30 could not start (loopback /dev/video11: cannot stream NV12 \
+         1280x720@30): streaming 1920x1080@30 instead"
+    );
+    // The session streams it.
+    h.activate(100);
+    assert_eq!(h.session_params().contract, OutputContract::default());
+}
+
+#[test]
+fn a_restart_streams_the_last_good_contract_of_the_earlier_run_while_the_configured_one_is_held() {
+    let good: OutputContract = "1280x720@30".parse().unwrap();
+    let mut h = H::new("[output]\nmode = \"1280x720@30\"\n", |_| {});
+    // A writer and a session output start with it: the last good one,
+    // kept for the next run.
+    h.activate(0);
+    assert_eq!(h.persisted().output_good, Some(good));
+    // A new format, deferred while the app holds the virtual camera, then
+    // the daemon restarts with the device still held in another format it
+    // cannot name.
+    let new: OutputContract = "1280x720@25".parse().unwrap();
+    h.reload("[output]\nmode = \"1280x720@25\"\n", 1000)
+        .unwrap();
+    h.restart_with(|w| w.refused_contracts = vec![(new, true)]);
+    // The last good contract of the earlier run streams, not the default.
+    assert_eq!(h.world().writer.as_ref().unwrap().1, good);
+    let snap = h.snap();
+    assert_eq!(snap.error, "");
+    assert_eq!(snap.output_mode, "NV12 1280x720@30");
+    assert_eq!(
+        snap.warning,
+        format!("Output 1280x720@25 applies when {HOLDERS_UNKNOWN} release the virtual camera")
+    );
+    // And a session streams it.
+    h.activate(2000);
+    assert_eq!(h.session_params().contract, good);
+}
+
+#[test]
+fn a_chosen_capture_mode_that_cannot_open_falls_back_to_the_automatic_mode_with_a_warning() {
+    let mut h = H::new("", |w| {
+        w.cameras = vec![brio_cam()];
+        w.fail_ingest_modes = vec![("usb-a".into(), vmode("MJPEG:3840x2160@30"))];
+    });
+    h.activate(100);
+    h.set_setting(settings::MODE, str_value("3840x2160@30"), 1000)
+        .unwrap();
+    // Tried, failed before a first frame: the automatic mode at once, the
+    // feed kept.
+    assert_eq!(
+        h.world().ingest_modes,
+        [
+            vmode("NV12:1920x1080@60"),
+            vmode("MJPEG:3840x2160@30"),
+            vmode("NV12:1920x1080@60")
+        ]
+    );
+    h.tick(1100);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(
+        h.snap().warning,
+        "Alpha Cam could not open 3840x2160@30 (reopening Alpha Cam (usb-a): Alpha Cam \
+         (usb-a): cannot open): it captures 1920x1080@60 instead"
+    );
+    // The choice is kept, in the row and the state file.
+    let s = h.setting(settings::MODE);
+    assert_eq!((enum_of(&s).2.as_str(), s.stored), ("3840x2160@30", true));
+    assert_eq!(
+        h.persisted().camera_modes["usb-a"].to_string(),
+        "3840x2160@30"
+    );
+    // Automatic: the warning goes.
+    h.set_setting(settings::MODE, str_value("auto"), 2000)
+        .unwrap();
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn a_failed_capture_mode_is_tried_again_only_when_chosen_again() {
+    let mut h = H::new("", |w| {
+        w.cameras = vec![brio_cam()];
+        w.fail_ingest_modes = vec![("usb-a".into(), vmode("MJPEG:3840x2160@30"))];
+    });
+    h.set_setting(settings::MODE, str_value("3840x2160@30"), 0)
+        .unwrap();
+    // The first start tries it, then the automatic mode.
+    h.activate(100);
+    assert_eq!(
+        h.world().ingest_modes,
+        [vmode("MJPEG:3840x2160@30"), vmode("NV12:1920x1080@60")]
+    );
+    assert!(h.snap().warning.contains("could not open 3840x2160@30"));
+    // The next session of this run does not try it again.
+    h.consumers(0, 1000);
+    h.tick(7000);
+    h.activate(8000);
+    assert_eq!(
+        h.world().ingest_modes.last(),
+        Some(&vmode("NV12:1920x1080@60"))
+    );
+    assert_eq!(h.world().ingest_modes.len(), 3);
+    // Chosen again: tried again (and it fails again).
+    h.set_setting(settings::MODE, str_value("3840x2160@30"), 9000)
+        .unwrap();
+    assert_eq!(
+        h.world().ingest_modes[3..],
+        [vmode("MJPEG:3840x2160@30"), vmode("NV12:1920x1080@60")]
+    );
+    assert_eq!(h.state(), State::Active);
+    // Now it opens: chosen again, it is the mode.
+    h.world().fail_ingest_modes.clear();
+    h.set_setting(settings::MODE, str_value("3840x2160@30"), 10_000)
+        .unwrap();
+    assert_eq!(
+        h.world().ingest_modes.last(),
+        Some(&vmode("MJPEG:3840x2160@30"))
+    );
+    h.tick(10_100);
+    assert_eq!(h.snap().warning, "");
+    // The camera reporting other modes forgets the failure too.
+    h.world().fail_ingest_modes = vec![("usb-a".into(), vmode("MJPEG:3840x2160@30"))];
+    h.consumers(0, 11_000);
+    h.tick(17_000);
+    h.ctrl.mode_failed.insert(
+        "usb-a".into(),
+        super::ModeFailed {
+            asked: "3840x2160@30".parse().unwrap(),
+            why: "x".into(),
+            modes: Vec::new(),
+            confirmed: true,
+        },
+    );
+    h.rescan(18_000);
+    assert!(h.ctrl.mode_failed.is_empty());
+}
+
+#[test]
+fn a_camera_that_fails_after_its_first_frame_is_not_blamed_on_its_mode() {
+    let mut h = H::new("", |w| w.cameras = vec![brio_cam(), fhd_cam()]);
+    h.set_setting(settings::MODE, str_value("3840x2160@30"), 0)
+        .unwrap();
+    h.activate(100);
+    assert_eq!(h.world().ingest_modes, [vmode("MJPEG:3840x2160@30")]);
+    // Streaming, then the camera fails: the next camera takes over, the
+    // mode is not blamed.
+    h.world().failure = Some(Failure::Camera("Alpha Cam: device lost".into()));
+    h.tick(1000);
+    assert!(h.ctrl.mode_failed.is_empty());
+    assert_eq!(h.world().ingests.last().map(String::as_str), Some("usb-b"));
+    assert!(!h.snap().warning.contains("could not open"));
+}
+
+#[test]
+fn a_capture_mode_is_not_blamed_when_the_automatic_mode_cannot_open_either() {
+    // Chosen while streaming: the chosen mode fails, then the automatic
+    // one too (the camera busy): not the mode's fault.
+    let mut h = H::new("", |w| w.cameras = vec![brio_cam()]);
+    h.activate(100);
+    h.world().fail_ingest = vec!["usb-a".into()];
+    let _ = h.set_setting(settings::MODE, str_value("3840x2160@30"), 1000);
+    assert_eq!(
+        h.world().ingest_modes[1..],
+        [vmode("MJPEG:3840x2160@30"), vmode("NV12:1920x1080@60")]
+    );
+    assert!(h.ctrl.mode_failed.is_empty());
+    assert_eq!(h.state(), State::Error);
+    assert!(
+        !h.snap().warning.contains("could not open"),
+        "{:?}",
+        h.snap()
+    );
+    // The camera free again: the chosen mode is tried first, and opens.
+    h.world().fail_ingest.clear();
+    h.consumers(0, 2000);
+    h.tick(9000);
+    h.activate(10_000);
+    assert_eq!(
+        h.world().ingest_modes.last(),
+        Some(&vmode("MJPEG:3840x2160@30"))
+    );
+    assert_eq!(h.snap().warning, "");
+    // At a session start: the same.
+    h.consumers(0, 11_000);
+    h.tick(18_000);
+    h.world().fail_ingest = vec!["usb-a".into()];
+    let opens = h.world().ingest_modes.len();
+    h.consumers(1, 19_000);
+    h.tick(19_300);
+    assert_eq!(
+        h.world().ingest_modes[opens..],
+        [vmode("MJPEG:3840x2160@30"), vmode("NV12:1920x1080@60")]
+    );
+    assert!(h.ctrl.mode_failed.is_empty());
+    assert_eq!(h.state(), State::Error);
+    // The automatic mode opens but delivers no frame either: not blamed
+    // (the record goes at the timeout).
+    h.consumers(0, 20_000);
+    h.tick(28_000);
+    h.world().fail_ingest.clear();
+    h.world().fail_ingest_modes = vec![("usb-a".into(), vmode("MJPEG:3840x2160@30"))];
+    h.world().frames = false;
+    h.consumers(1, 29_000);
+    h.tick(29_300);
+    assert!(!h.ctrl.mode_failed["usb-a"].confirmed);
+    assert!(!h.snap().warning.contains("could not open"));
+    h.tick(29_300 + START_TIMEOUT.as_millis() as u64 + 100);
+    assert!(h.ctrl.mode_failed.is_empty());
+    // It delivers in the automatic mode: the mode is blamed.
+    h.world().frames = true;
+    h.consumers(0, 40_000);
+    h.tick(48_000);
+    h.consumers(1, 49_000);
+    h.tick(49_300);
+    assert_eq!(h.state(), State::Active);
+    assert!(h.ctrl.mode_failed["usb-a"].confirmed);
+    assert!(h.snap().warning.contains("could not open 3840x2160@30"));
+}
+
+/// A module that provides frame generation.
+fn fg_module() -> (
+    obc_module_host::discovery::ModuleEntry,
+    Result<crate::backend::OpenedModule, String>,
+) {
+    npu_module(
+        "org.example.fg",
+        StageId::new(FRAME_GENERATION).unwrap(),
+        "post-composite",
+    )
+}
+
+/// The chains of the session as started: (name, stage ids and on).
+fn chains_of(h: &H) -> Vec<(String, Vec<(String, bool)>)> {
+    h.session_params()
+        .effect
+        .chains
+        .iter()
+        .map(|c| {
+            (
+                c.name.clone(),
+                c.stages
+                    .iter()
+                    .map(|s| (s.id.to_string(), s.enabled))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn frame_generation_runs_last_when_the_output_rate_is_twice_the_camera_rate() {
+    // A 30 fps camera (the fake's NV12 1920x1080@30) into 60.
+    let mut h = H::new("[output]\nmode = \"1920x1080@60\"\n", |w| {
+        w.modules = vec![
+            npu_module(
+                "org.example.hello",
+                StageId::new("hello").unwrap(),
+                "post-composite",
+            ),
+            fg_module(),
+        ];
+    });
+    assert!(!h.ctrl.order_ids().contains(&FRAME_GENERATION.to_string()));
+    h.activate(0);
+    let chains = chains_of(&h);
+    assert_eq!(
+        chains.last().unwrap(),
+        &(
+            "org.example.fg-gen".to_string(),
+            vec![(FRAME_GENERATION.to_string(), true)]
+        ),
+        "{chains:?}"
+    );
+    assert_eq!(h.snap().warning, "");
+    // Never a toggle of its own.
+    let tree = h.get_settings("", 0).unwrap();
+    assert!(
+        tree.groups
+            .iter()
+            .flat_map(|g| g.settings.iter())
+            .all(|s| !s.id.contains("frame"))
+    );
+    // Dropped at runtime: the frames repeat, and Warning says so.
+    h.set_module("org.example.fg", false, 1000);
+    assert_eq!(
+        h.snap().warning,
+        "60 fps output repeats frames: no frame generation available"
+    );
+    assert_eq!(h.state(), State::Active);
+}
+
+#[test]
+fn frame_generation_is_left_out_unless_the_rate_doubles() {
+    // Same rates: no frame generation.
+    let mut h = H::new("[output]\nmode = \"1920x1080@30\"\n", |w| {
+        w.modules = vec![fg_module()]
+    });
+    h.activate(0);
+    assert!(
+        chains_of(&h)
+            .iter()
+            .all(|(_, stages)| stages.iter().all(|(id, _)| id != FRAME_GENERATION))
+    );
+    assert_eq!(h.snap().warning, "");
+    // A 60 fps camera into 60.
+    let mut h = H::new("[output]\nmode = \"1920x1080@60\"\n", |w| {
+        w.modules = vec![fg_module()];
+        w.cameras = vec![brio_cam()];
+    });
+    h.activate(0);
+    assert_eq!(h.world().ingest_modes, [vmode("NV12:1920x1080@60")]);
+    // Planned, as the camera offers 30 fps modes, but off.
+    assert!(
+        chains_of(&h)
+            .iter()
+            .all(|(_, stages)| stages.iter().all(|(id, on)| id != FRAME_GENERATION || !on))
+    );
+    // A generated rate with no module to make it: repeats, with a warning.
+    let mut h = H::new("[output]\nmode = \"1920x1080@60\"\n", |_| {});
+    let want = "60 fps output repeats frames: no frame generation available";
+    assert_eq!(h.snap().warning, want);
+    h.activate(0);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.snap().warning, want);
+    assert!(
+        chains_of(&h)
+            .iter()
+            .all(|(_, stages)| stages.iter().all(|(id, _)| id != FRAME_GENERATION))
+    );
+}
+
+#[test]
+fn frame_generation_follows_a_capture_mode_change() {
+    let mut h = H::new("[output]\nmode = \"1920x1080@60\"\n", |w| {
+        w.modules = vec![fg_module()];
+        w.cameras = vec![brio_cam()];
+    });
+    h.set_setting(settings::MODE, str_value("1920x1080@30"), 0)
+        .unwrap();
+    h.activate(100);
+    assert_eq!(
+        chains_of(&h).last().unwrap().1,
+        [(FRAME_GENERATION.to_string(), true)]
+    );
+    // 60 fps from the camera: the stage is turned off in the session.
+    h.set_setting(settings::MODE, str_value("1920x1080@60"), 1000)
+        .unwrap();
+    let last = h.world().effect_sets.last().cloned().expect("given again");
+    assert!(!stage_on(&last, FRAME_GENERATION));
+    assert_eq!(h.snap().warning, "");
+    assert_eq!(h.state(), State::Active);
+}
+
+#[test]
+fn frame_generation_starts_mid_session_when_the_camera_rate_halves() {
+    // A session that starts at 60 from the camera into 60 has the stage
+    // planned but off: the Brio offers 30 fps modes.
+    let mut h = H::new("[output]\nmode = \"1920x1080@60\"\n", |w| {
+        w.modules = vec![fg_module()];
+        w.cameras = vec![brio_cam()];
+    });
+    h.activate(0);
+    assert_eq!(h.world().ingest_modes, [vmode("NV12:1920x1080@60")]);
+    assert_eq!(
+        chains_of(&h).last().unwrap(),
+        &(
+            "org.example.fg-gen".to_string(),
+            vec![(FRAME_GENERATION.to_string(), false)]
+        )
+    );
+    let starts = h.world().session_starts;
+    // 30 fps from the camera: the stage is turned on in the same session.
+    h.set_setting(settings::MODE, str_value("1920x1080@30"), 1000)
+        .unwrap();
+    let last = h.world().effect_sets.last().cloned().expect("given again");
+    assert!(stage_on(&last, FRAME_GENERATION));
+    assert_eq!(h.world().session_starts, starts, "no restart");
+    assert_eq!(
+        h.world().ingest_modes.last(),
+        Some(&vmode("NV12:1920x1080@30"))
+    );
+    assert_eq!(h.snap().warning, "");
+    assert_eq!(h.state(), State::Active);
+    // And off again at 60.
+    h.set_setting(settings::MODE, str_value("1920x1080@60"), 2000)
+        .unwrap();
+    let last = h.world().effect_sets.last().cloned().expect("given again");
+    assert!(!stage_on(&last, FRAME_GENERATION));
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn frame_generation_follows_a_fail_over_to_a_camera_of_half_the_rate() {
+    // The Brio at 60 into 60, then it fails: the FHD Camera takes over at
+    // 30 and frame generation makes the 60.
+    let mut h = H::new("[output]\nmode = \"1920x1080@60\"\n", |w| {
+        w.modules = vec![fg_module()];
+        w.cameras = vec![brio_cam(), fhd_cam()];
+    });
+    h.activate(0);
+    assert!(!chains_of(&h).last().unwrap().1[0].1);
+    let starts = h.world().session_starts;
+    h.world().failure = Some(Failure::Camera("Alpha: streaming error".into()));
+    h.tick(1000);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.snap().active_camera, "usb-b");
+    assert!((h.world().ingest_modes.last().unwrap().fps() - 30.0).abs() < 0.01);
+    let last = h.world().effect_sets.last().cloned().expect("given again");
+    assert!(stage_on(&last, FRAME_GENERATION));
+    assert_eq!(h.world().session_starts, starts, "no restart");
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn the_warning_is_bounded_on_a_character_boundary() {
+    let mut h = H::new("", |_| {});
+    let reason = "é".repeat(400);
+    h.ctrl.effect_failure = Some(format!("effect blur unavailable: {reason}"));
+    let w = h.ctrl.warning();
+    assert!(w.len() <= WARNING_MAX, "{}", w.len());
+    assert!(w.ends_with('\u{2026}'), "{w}");
+    assert!(w.starts_with("effect blur unavailable: é"));
+    assert!(w.len() > WARNING_MAX - 8, "{}", w.len());
+    // Short text is as it was.
+    assert_eq!(cap_warning("a  b"), "a b");
+    let exact = "x".repeat(WARNING_MAX);
+    assert_eq!(cap_warning(&exact), exact);
+    let cut = cap_warning(&format!("{exact}y"));
+    assert_eq!(cut.len(), WARNING_MAX);
+    assert!(cut.ends_with('\u{2026}'));
+}
+
+#[test]
+fn holders_are_named_without_duplicates_up_to_three() {
+    let t = |n: &[&str]| holders_text(&n.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    assert_eq!(t(&[]), HOLDERS_UNKNOWN);
+    assert_eq!(t(&["obs"]), "obs");
+    assert_eq!(t(&["obs", "obs", "zoom"]), "obs and zoom");
+    assert_eq!(t(&["a", "b", "c"]), "a, b and c");
+    assert_eq!(t(&["a", "b", "c", "d", "e", "a"]), "a, b, c and 2 more");
+    assert_eq!(t(&["\u{202e}evil\nname"]), "evil name");
+}
+
+#[test]
+fn a_gpu_fault_at_a_session_start_never_fails_the_new_contract() {
+    let mut h = H::new("", |_| {});
+    h.activate(0);
+    h.consumers(0, 1000);
+    h.tick(10_000);
+    h.set_config(
+        "output.mode",
+        obc_ipc::ConfigValue::Str("1280x720@30".into()),
+    )
+    .unwrap();
+    // Not the contract's fault: the error path, the contract kept.
+    h.world().fail_start = Some("CUDA initialisation failed".into());
+    h.consumers(1, 11_000);
+    h.tick(11_300);
+    assert_eq!(h.state(), State::Error);
+    assert!(h.ctrl.failed_contract.is_none());
+    assert_eq!(h.snap().warning, "");
+    assert_eq!(h.snap().output_mode, "NV12 1280x720@30");
+    // The GPU back: the next session streams the new contract.
+    h.world().fail_start = None;
+    h.consumers(0, 12_000);
+    h.tick(20_000);
+    h.activate(21_000);
+    assert_eq!(h.session_params().contract.width, 1280);
+}
+
+#[test]
+fn a_session_output_that_cannot_start_even_without_its_effects_reverts_once_the_camera_is_released()
+{
+    let mut h = H::new("", |_| {});
+    h.activate(0);
+    h.consumers(0, 1000);
+    h.tick(10_000);
+    h.set_config(
+        "output.mode",
+        obc_ipc::ConfigValue::Str("1280x720@30".into()),
+    )
+    .unwrap();
+    // The writer takes it; the session output cannot start with it, with
+    // or without the effects.
+    assert_eq!(h.world().writer.as_ref().unwrap().1.width, 1280);
+    h.world().fail_start = Some("cudaconvertscale refused 1280x720".into());
+    h.world().fail_start_contract = true;
+    h.consumers(1, 11_000);
+    h.tick(11_300);
+    assert_eq!(h.state(), State::Error);
+    assert!(h.world().session.is_none());
+    // The app keeps the format it opened: no revert under it.
+    assert_eq!(h.world().writer.as_ref().unwrap().1.width, 1280);
+    assert_eq!(
+        h.snap().warning,
+        format!(
+            "Output 1280x720@30 could not start (cudaconvertscale refused 1280x720): streaming \
+             1920x1080@30 instead; Output 1920x1080@30 applies when {HOLDERS_UNKNOWN} release \
+             the virtual camera"
+        )
+    );
+    // Released: the writer reverts to the last good contract, and the next
+    // app gets the camera at it.
+    h.world().fail_start = None;
+    h.world().fail_start_contract = false;
+    h.consumers(0, 12_000);
+    h.tick(20_000);
+    assert_eq!(h.world().writer.as_ref().unwrap().1.width, 1920);
+    assert_eq!(h.snap().output_mode, "NV12 1920x1080@30");
+    h.activate(21_000);
+    assert_eq!(h.session_params().contract.width, 1920);
+    // The configured one is kept for when it is picked again.
+    assert_eq!(
+        h.managed_key("output.mode"),
+        Some(toml::Value::String("1280x720@30".into()))
+    );
+}
+
+#[test]
+fn the_last_good_contract_is_kept_only_once_a_frame_was_streamed() {
+    let mut h = H::new("[output]\nmode = \"1280x720@30\"\n", |w| w.frames = false);
+    let contract: OutputContract = "1280x720@30".parse().unwrap();
+    // The output started, but no frame reached it: not proven.
+    h.consumers(1, 0);
+    h.tick(300);
+    assert!(h.world().session.is_some());
+    assert_eq!(h.state(), State::Starting);
+    assert_eq!(h.ctrl.session_good, None);
+    assert_eq!(h.persisted().output_good, None);
+    // A frame: the last good contract, kept for the next run.
+    h.world().frames = true;
+    h.tick(400);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.ctrl.session_good, Some(contract));
+    assert_eq!(h.persisted().output_good, Some(contract));
+}
+
+#[test]
+fn a_session_output_that_cannot_start_at_a_new_contract_streams_without_its_effects() {
+    let mut h = H::new("", |_| {});
+    h.activate(0);
+    h.consumers(0, 1000);
+    h.tick(10_000);
+    h.set_config(
+        "output.mode",
+        obc_ipc::ConfigValue::Str("1280x720@30".into()),
+    )
+    .unwrap();
+    assert_eq!(h.snap().output_mode, "NV12 1280x720@30");
+    // The start fails with the effects: the session starts once more
+    // without them, at the same contract.
+    h.world().fail_start_effects = Some("obc-module: no CUDA memory".into());
+    h.world().fail_start_contract = true;
+    h.consumers(1, 11_000);
+    h.tick(11_300);
+    assert_eq!(h.state(), State::Active, "{:?}", h.snap());
+    let params = h.session_params();
+    assert_eq!(params.contract.width, 1280);
+    assert!(params.backends.effect.is_none() && params.backends.chains.is_empty());
+    assert_eq!(params.effect.mode, EffectMode::None);
+    assert_eq!(
+        h.snap().warning,
+        "Output 1280x720@30 could not start with its effects (obc-module: no CUDA memory): \
+         streaming without them"
+    );
+    assert!(h.ctrl.failed_contract.is_none(), "the contract works");
+    // The next session tries with them again.
+    h.world().fail_start_effects = None;
+    h.world().fail_start_contract = false;
+    h.consumers(0, 12_000);
+    h.tick(20_000);
+    assert_eq!(h.snap().warning, "");
+    h.activate(21_000);
+    assert!(h.session_params().backends.effect.is_some());
+    // Without effects to drop, or failing without them too: the error, as
+    // before.
+    h.consumers(0, 22_000);
+    h.tick(30_000);
+    h.world().fail_start = Some("CUDA initialisation failed".into());
+    h.consumers(1, 31_000);
+    h.tick(31_300);
+    assert_eq!(h.state(), State::Error);
+}
+
+/// A session streaming without its effects ([`super::Controller::passthrough`])
+/// after its output could not start with them: `config`, the effect
+/// element's start failing.
+fn streaming_without_effects(config: &str) -> H {
+    let mut h = H::new(config, |w| {
+        w.fail_start_effects = Some("obc-module: no CUDA memory".into());
+    });
+    h.activate(0);
+    let params = h.session_params();
+    assert!(params.backends.effect.is_none() && params.backends.chains.is_empty());
+    assert_eq!(params.effect.mode, EffectMode::None);
+    assert!(h.snap().warning.contains("streaming without them"));
+    h
+}
+
+#[test]
+fn a_blur_switched_on_in_a_session_without_its_effects_is_never_shown_raw() {
+    // No effect selected (`black`, the default): the session streams
+    // without the effect element.
+    let mut h = streaming_without_effects("");
+    let starts = h.world().session_starts;
+    // Blur switched on: never the raw picture. The session is started
+    // again with the effect; it still cannot start, and under `black` it
+    // is not started without it.
+    let _ = h.set_effect("blur", 1000);
+    assert!(h.world().session.is_none(), "{:?}", h.snap());
+    assert_eq!(h.world().session_starts, starts);
+    assert_eq!(h.state(), State::Error);
+    // The cause gone: the effect runs.
+    h.world().fail_start_effects = None;
+    h.consumers(0, 2000);
+    h.tick(10_000);
+    h.activate(11_000);
+    let params = h.session_params();
+    assert!(params.backends.effect.is_some());
+    assert_eq!(params.effect.mode, EffectMode::Blur);
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn a_reload_to_black_stops_a_session_that_streams_without_its_effect() {
+    let none = "[effect]\nmode = \"blur\"\non_failure = \"none\"\n";
+    let black = "[effect]\nmode = \"blur\"\non_failure = \"black\"\n";
+    // Under `none` the raw picture is the user's choice.
+    let mut h = streaming_without_effects(none);
+    h.reload(black, 1000).unwrap();
+    assert!(h.world().session.is_none(), "{:?}", h.snap());
+    assert_eq!(h.state(), State::Error);
+    // However `black` comes to be in force, the next step stops such a
+    // session.
+    let mut h = streaming_without_effects(none);
+    h.ctrl.config.effect.on_failure = EffectOnFailure::Black;
+    h.tick(1000);
+    assert!(h.world().session.is_none(), "{:?}", h.snap());
+    // No effect selected: nothing is withheld, the session stands.
+    let mut h = streaming_without_effects(none);
+    h.ctrl.config.effect.on_failure = EffectOnFailure::Black;
+    h.ctrl.config.effect.mode = EffectMode::None;
+    h.tick(1000);
+    assert!(h.world().session.is_some());
+}
+
+#[test]
+fn a_control_call_retries_the_effects_of_a_session_without_them_under_none() {
+    let mut h = streaming_without_effects("[effect]\nmode = \"blur\"\non_failure = \"none\"\n");
+    // A control call tries them again; still failing, the session streams
+    // without them once more (`none`): the feed is kept.
+    let ingests = h.world().ingests.len();
+    h.set_effect("blur", 500).unwrap();
+    assert_eq!(h.state(), State::Active, "{:?}", h.snap());
+    assert_eq!(h.world().ingests.len(), ingests + 1, "the camera reopened");
+    assert!(h.session_params().backends.effect.is_none());
+    assert!(h.snap().warning.contains("streaming without them"));
+    // The cause gone, a control call starts the session again with them.
+    h.world().fail_start_effects = None;
+    let starts = h.world().session_starts;
+    h.set_effect("blur", 1000).unwrap();
+    h.tick(1300);
+    assert_eq!(h.world().session_starts, starts + 1);
+    assert_eq!(h.state(), State::Active, "{:?}", h.snap());
+    let params = h.session_params();
+    assert!(params.backends.effect.is_some());
+    assert_eq!(params.effect.mode, EffectMode::Blur);
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn a_blur_with_black_on_failure_is_never_dropped_to_start_the_output() {
+    let mut h = H::new(
+        "[effect]\nmode = \"blur\"\non_failure = \"black\"\n",
+        |_| {},
+    );
+    h.world().fail_start_effects = Some("obc-module: no CUDA memory".into());
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Error);
+    assert_eq!(h.world().session_starts, 0);
+}
+
+// ---- the fallback image (`on_failure = "image"`) ----
+
+const AWAY: &str = "/srv/away.png";
+
+fn image_config(extra: &str) -> String {
+    format!(
+        "[effect]\nmode = \"blur\"\non_failure = \"image\"\nfallback_image = \"{AWAY}\"\n{extra}"
+    )
+}
+
+fn placeholder_sets(h: &H) -> Vec<Option<PathBuf>> {
+    h.world().placeholder_sets.clone()
+}
+
+#[test]
+fn a_start_refused_under_image_shows_the_fallback_image_until_the_effect_is_off() {
+    let mut h = H::new(&image_config(""), |w| {
+        w.fail_start_effects = Some("obc-module: no CUDA memory".into())
+    });
+    h.consumers(1, 0);
+    h.tick(300);
+    // As under `black`: never streamed without the effect.
+    assert_eq!(h.state(), State::Error);
+    assert_eq!(h.world().session_starts, 0);
+    assert!(h.world().session.is_none());
+    // The writer's placeholder shows the image meanwhile.
+    assert_eq!(h.world().placeholder, Some(PathBuf::from(AWAY)));
+    assert_eq!(placeholder_sets(&h), [Some(PathBuf::from(AWAY))]);
+    assert_eq!(h.snap().warning, "", "the image can be read");
+    // Further steps change nothing.
+    h.tick(1000);
+    assert_eq!(placeholder_sets(&h).len(), 1);
+    // The effect turned off: the session starts without it, and the
+    // placeholder is black again.
+    h.set_effect("none", 1500).unwrap();
+    h.tick(1800);
+    assert!(h.world().session.is_some(), "{:?}", h.snap());
+    assert_eq!(h.world().placeholder, None);
+    assert_eq!(
+        placeholder_sets(&h),
+        [Some(PathBuf::from(AWAY)), None],
+        "switched once each way"
+    );
+}
+
+#[test]
+fn a_start_refused_under_image_goes_black_again_when_the_camera_stops() {
+    let mut h = H::new(&image_config(""), |w| {
+        w.fail_start_effects = Some("obc-module: no CUDA memory".into())
+    });
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.world().placeholder, Some(PathBuf::from(AWAY)));
+    // The application closes the virtual camera: idle, black.
+    h.consumers(0, 1000);
+    h.tick(1200);
+    assert_eq!(h.state(), State::Idle, "{:?}", h.snap());
+    assert_eq!(h.world().placeholder, None);
+    // Opened again: refused again, the image again.
+    h.consumers(1, 2000);
+    h.tick(2300);
+    assert_eq!(h.state(), State::Error);
+    assert_eq!(h.world().placeholder, Some(PathBuf::from(AWAY)));
+    // Turned off: black.
+    h.call(|r| Command::SetEnabled(false, r), 3000).unwrap();
+    assert_eq!(h.state(), State::Off);
+    assert_eq!(h.world().placeholder, None);
+    assert_eq!(
+        placeholder_sets(&h),
+        [
+            Some(PathBuf::from(AWAY)),
+            None,
+            Some(PathBuf::from(AWAY)),
+            None
+        ]
+    );
+}
+
+#[test]
+fn black_keeps_a_refused_start_black_and_other_faults_stay_black() {
+    // `black`: the placeholder is never switched.
+    let mut h = H::new(
+        &format!(
+            "[effect]\nmode = \"blur\"\non_failure = \"black\"\nfallback_image = \"{AWAY}\"\n"
+        ),
+        |w| w.fail_start_effects = Some("obc-module: no CUDA memory".into()),
+    );
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Error);
+    assert!(placeholder_sets(&h).is_empty());
+    // `image`, but a fault that is not the effect's (no camera): black.
+    let mut h = H::new(&image_config(""), |w| w.cameras.clear());
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Error, "{:?}", h.snap());
+    assert!(placeholder_sets(&h).is_empty());
+}
+
+#[test]
+fn a_replace_that_cannot_read_its_background_under_image_shows_the_fallback_image() {
+    // The settings fault found before the camera opens.
+    let mut h = H::new(
+        &format!(
+            "[effect]\nmode = \"replace\"\nbackground_image = \"/nowhere/bg.png\"\n\
+             on_failure = \"image\"\nfallback_image = \"{AWAY}\"\n"
+        ),
+        |_| {},
+    );
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Error);
+    assert!(
+        h.snap().error.contains("effect replace unavailable"),
+        "{:?}",
+        h.snap()
+    );
+    assert_eq!(h.world().placeholder, Some(PathBuf::from(AWAY)));
+}
+
+#[test]
+fn an_unreadable_fallback_image_is_black_with_a_warning() {
+    let mut h = H::new(&image_config(""), |w| {
+        w.fail_start_effects = Some("obc-module: no CUDA memory".into());
+        w.placeholder_unreadable = Some("the image file is unreadable: gone".into());
+    });
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Error);
+    // Asked for: the writer shows black in its place, and says why.
+    assert_eq!(h.world().placeholder, Some(PathBuf::from(AWAY)));
+    let warning = h.snap().warning;
+    assert_eq!(
+        warning,
+        format!(
+            "Fallback image {AWAY} could not be read (the image file is unreadable: gone): \
+             showing black"
+        )
+    );
+    // Once the image is no longer asked for, nothing to say.
+    h.world().fail_start_effects = None;
+    h.set_effect("none", 1000).unwrap();
+    h.tick(1300);
+    assert_eq!(h.world().placeholder, None);
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn image_without_a_fallback_image_is_black_with_a_warning() {
+    const NO_IMAGE: &str =
+        "effect.on_failure is \"image\" but effect.fallback_image is not set: showing black";
+    let mut h = H::new("[effect]\nmode = \"blur\"\non_failure = \"image\"\n", |w| {
+        w.fail_start_effects = Some("obc-module: no CUDA memory".into())
+    });
+    // Said as soon as it is configured.
+    assert_eq!(h.snap().warning, NO_IMAGE);
+    h.consumers(1, 0);
+    h.tick(300);
+    // As `black`: no session, the placeholder black.
+    assert_eq!(h.state(), State::Error);
+    assert_eq!(h.world().session_starts, 0);
+    assert!(placeholder_sets(&h).is_empty());
+    assert_eq!(h.snap().warning, NO_IMAGE);
+    // The session is given `image` with no image: the element shows black.
+    let mut h = H::new(
+        "[effect]\nmode = \"blur\"\non_failure = \"image\"\n",
+        |_| {},
+    );
+    h.activate(0);
+    let e = h.world().effect.clone().unwrap();
+    assert_eq!(
+        (e.on_failure, e.fallback_image),
+        (EffectOnFailure::Image, None)
+    );
+}
+
+#[test]
+fn a_session_under_image_gives_the_element_the_image_and_reports_what_it_cannot_read() {
+    let mut h = H::new(&image_config(""), |w| w.effect_slow = true);
+    h.activate(0);
+    let e = h.world().effect.clone().unwrap();
+    assert_eq!(
+        (e.on_failure, e.fallback_image),
+        (EffectOnFailure::Image, Some(PathBuf::from(AWAY)))
+    );
+    // The session runs: the placeholder is not involved.
+    assert!(placeholder_sets(&h).is_empty());
+    // The element cannot read it: said only while the effect has failed
+    // (until then the image is not what shows).
+    let why = format!("Fallback image {AWAY} could not be read (no such file): showing black");
+    h.world().fallback_error = Some(why.clone());
+    h.world().effect_status = EffectStatus::Ready;
+    h.tick(500);
+    assert_eq!(h.snap().warning, "");
+    h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
+    h.tick(1000);
+    assert_eq!(h.state(), State::Active);
+    let warning = h.snap().warning;
+    assert_eq!(
+        warning,
+        format!(
+            "effect blur unavailable: processing a frame failed; the fallback image is shown \
+             until it can run; {why}"
+        )
+    );
+}
+
+#[test]
+fn a_reload_to_image_stops_a_session_without_its_effect_and_shows_the_image() {
+    let none = "[effect]\nmode = \"blur\"\non_failure = \"none\"\n";
+    let mut h = streaming_without_effects(none);
+    assert!(placeholder_sets(&h).is_empty());
+    h.reload(&image_config(""), 1000).unwrap();
+    assert!(h.world().session.is_none(), "{:?}", h.snap());
+    assert_eq!(h.state(), State::Error);
+    assert_eq!(h.world().placeholder, Some(PathBuf::from(AWAY)));
 }

@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use obc_core::config::{Config, RuntimeState};
 use obc_core::modules::{BackendProfile, StoredValue};
-use obc_module_host::registry::Profile;
+use obc_module_host::registry::{FRAME_GENERATION, Profile};
 use obc_module_host::settings::{Apply, Role};
 use obc_module_host::{
     CrashLedger, ModuleStatus, Registry, SettingDesc, SettingType, SettingsDescription, Slot,
@@ -369,6 +369,16 @@ fn chain_name(module: &str, placement: Placement) -> String {
         Placement::BeforeEffect => "pre",
         Placement::AfterEffect => "post",
     };
+    chain_name_with(module, suffix)
+}
+
+/// The name of the chain of frame generation, run by `module` after every
+/// other chain.
+fn frame_generation_chain_name(module: &str) -> String {
+    chain_name_with(module, "gen")
+}
+
+fn chain_name_with(module: &str, suffix: &str) -> String {
     let max = obc_pipeline::module::MAX_NAME_LEN - suffix.len() - 1;
     let head: String = module.chars().take(max).collect();
     format!("{head}-{suffix}")
@@ -1070,8 +1080,37 @@ impl Modules {
         }
     }
 
+    /// Frame generation for `plan`: the provider of [`FRAME_GENERATION`]
+    /// at the next session, as a chain of its own after every other
+    /// (whatever its slot, and never in the stage order). Whether it was
+    /// added (`false`: no enabled module provides it now).
+    pub fn add_frame_generation(&self, plan: &mut Plan) -> bool {
+        let Some(provider) = self.registry.resolve(FRAME_GENERATION).provider else {
+            return false;
+        };
+        let Some(o) = self.opened.get(&provider) else {
+            return false;
+        };
+        let Ok(stage) = StageId::new(FRAME_GENERATION) else {
+            return false;
+        };
+        plan.chains.push(PlannedChain {
+            name: frame_generation_chain_name(&provider),
+            module: Planned {
+                id: provider.clone(),
+                module: o.module.clone(),
+                settings: o.settings.clone(),
+            },
+            placement: Placement::AfterEffect,
+            stages: vec![stage],
+        });
+        true
+    }
+
     /// Whether the session's `stage` is requested: its switch's value (on
-    /// when the module gives it none), and the stage can run now.
+    /// when the module gives it none), and the stage can run now. Frame
+    /// generation has no switch: in a plan only when it is wanted, it is on
+    /// while it can run.
     pub fn stage_on(
         &self,
         plan: &Plan,
@@ -1083,6 +1122,9 @@ impl Modules {
             return false;
         };
         let module = self.provider_in(plan, stage);
+        if stage.as_str() == FRAME_GENERATION {
+            return module.is_some_and(|m| self.able(m, stage.as_str()));
+        }
         let on = settings
             .enable_of(stage.as_str())
             .and_then(|s| value_of(config, runtime, s))

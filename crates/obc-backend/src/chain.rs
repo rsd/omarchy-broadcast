@@ -258,6 +258,20 @@ pub trait StageChain: Send {
         live: &BTreeMap<StageId, Params>,
     ) -> Result<(), BackendError>;
 
+    /// Runs a **repeat** as [`StageChain::process`] runs a frame: the output
+    /// clock had no new camera frame for this tick and emitted the last one
+    /// again, so `frame` carries the camera frame of the previous call. The
+    /// default runs it as any other frame; a chain whose stages can tell a
+    /// repeat apart (a module of ABI 1.1, which sees the repeat flag)
+    /// overrides it.
+    fn process_repeat(
+        &mut self,
+        frame: ChainFrame<'_>,
+        live: &BTreeMap<StageId, Params>,
+    ) -> Result<(), BackendError> {
+        self.process(frame, live)
+    }
+
     /// Forgets the temporal state of the loaded stages, so the next frame is
     /// treated as the first of a new source, and returns the stages that had
     /// to be dropped instead, as
