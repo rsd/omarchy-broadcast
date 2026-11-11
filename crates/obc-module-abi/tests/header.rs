@@ -82,6 +82,9 @@ fn layout_checks() -> String {
     size("obc_chain_request", size_of::<obc_chain_request>());
     size("obc_load_report", size_of::<obc_load_report>());
     size("obc_timing", size_of::<obc_timing>());
+    size("obc_audio_buffer", size_of::<obc_audio_buffer>());
+    size("obc_audio_request", size_of::<obc_audio_request>());
+    size("obc_audio_load_report", size_of::<obc_audio_load_report>());
     size("obc_module_vtable", size_of::<obc_module_vtable>());
     let mut offset = |ty: &str, field: &str, n: usize| {
         checks.push(format!(
@@ -131,8 +134,59 @@ fn layout_checks() -> String {
         "check",
         offset_of!(obc_module_vtable, check),
     );
+    offset(
+        "obc_module_vtable",
+        "audio_instance_load",
+        offset_of!(obc_module_vtable, audio_instance_load),
+    );
+    offset(
+        "obc_module_vtable",
+        "audio_instance_process",
+        offset_of!(obc_module_vtable, audio_instance_process),
+    );
+    offset(
+        "obc_audio_buffer",
+        "planes",
+        offset_of!(obc_audio_buffer, planes),
+    );
+    offset(
+        "obc_audio_buffer",
+        "pts_ns",
+        offset_of!(obc_audio_buffer, pts_ns),
+    );
+    offset(
+        "obc_audio_buffer",
+        "voice_probability",
+        offset_of!(obc_audio_buffer, voice_probability),
+    );
+    offset(
+        "obc_audio_request",
+        "sample_rate",
+        offset_of!(obc_audio_request, sample_rate),
+    );
+    offset(
+        "obc_audio_request",
+        "params",
+        offset_of!(obc_audio_request, params),
+    );
+    offset(
+        "obc_audio_load_report",
+        "latency_samples",
+        offset_of!(obc_audio_load_report, latency_samples),
+    );
+    offset(
+        "obc_audio_load_report",
+        "reused_model",
+        offset_of!(obc_audio_load_report, reused_model),
+    );
     checks.push(format!(
         "_Static_assert(OBC_MODULE_ABI_VERSION == {OBC_MODULE_ABI_VERSION}u, \"version\");"
+    ));
+    checks.push(format!(
+        "_Static_assert(OBC_MAX_AUDIO_CHANNELS == {OBC_MAX_AUDIO_CHANNELS}, \"channels\");"
+    ));
+    checks.push(format!(
+        "_Static_assert(OBC_AUDIO_F32_PLANAR == {OBC_AUDIO_F32_PLANAR}, \"audio format\");"
     ));
     checks.push(format!(
         "_Static_assert(OBC_FORMAT_RGB_F32_PLANAR == {OBC_FORMAT_RGB_F32_PLANAR}, \"format\");"

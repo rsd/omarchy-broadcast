@@ -183,6 +183,16 @@ pub trait OmarchyBroadcast {
     /// files)`, read with [`OmarchyBroadcastProxy::config_files`].
     fn get_config_files(&self) -> Result<ConfigFilesReply, IpcError>;
 
+    /// Turns the microphone on (`true`: the mic host unit
+    /// `omarchy-broadcast-mic.service` enabled and started, so it also runs
+    /// at the next login) or off (`false`: the previous default microphone
+    /// made the default again if the Omarchy Broadcast Mic is the default,
+    /// then the unit stopped and disabled). Refused with `Unavailable`,
+    /// naming the unit, while an `omarchy-broadcast-mic@<engine>.service`
+    /// filter-chain runs, or without a service manager; `Failed` when the
+    /// service manager refuses. Revision 13.
+    fn set_mic_host(&self, on: bool) -> Result<(), IpcError>;
+
     /// Roughly once per second while `active`; `-1` marks a value that
     /// cannot be measured.
 
@@ -200,6 +210,13 @@ pub trait OmarchyBroadcast {
     /// from 1. Revision 5.
     #[zbus(signal)]
     fn preview_frame(&self, seq: u32) -> zbus::Result<()>;
+
+    /// About once per second while `MicState` is `active`: blocks over the
+    /// processing deadline since the audio worker started, blocks played
+    /// raw because the processed one was late, and the voice probability
+    /// of the last block (`-1` when unknown). Revision 13.
+    #[zbus(signal)]
+    fn mic_stats(&self, overruns: u32, misses: u32, voice: f64) -> zbus::Result<()>;
 
     /// The configuration in force or the config schema changed;
     /// `serial` is the new `ConfigSerial`. Revision 10.
@@ -321,6 +338,31 @@ pub trait OmarchyBroadcast {
     /// clauses joined by `; `, for people, not to be parsed. Revision 11.
     #[zbus(property)]
     fn warning(&self) -> zbus::Result<String>;
+
+    /// The microphone: `off`, `passthrough`, `starting`, `active` or
+    /// `error` ([`crate::MIC_STATES`]). Revision 13.
+    #[zbus(property)]
+    fn mic_state(&self) -> zbus::Result<String>;
+
+    /// The applications recording from the microphone; 0 when not known.
+    /// Revision 13.
+    #[zbus(property)]
+    fn mic_consumers(&self) -> zbus::Result<u32>;
+
+    /// The module running each microphone stage, as text; empty when
+    /// nothing is processed. Revision 13.
+    #[zbus(property)]
+    fn mic_provider(&self) -> zbus::Result<String>;
+
+    /// The delay the microphone processing adds, in milliseconds.
+    /// Revision 13.
+    #[zbus(property)]
+    fn mic_latency_ms(&self) -> zbus::Result<f64>;
+
+    /// Why microphone stages that are on cannot run; empty when none.
+    /// Revision 13.
+    #[zbus(property)]
+    fn mic_error(&self) -> zbus::Result<String>;
 
     /// Revision of the interface the daemon implements.
     #[zbus(property)]

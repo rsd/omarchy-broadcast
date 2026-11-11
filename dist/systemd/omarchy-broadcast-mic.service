@@ -1,0 +1,74 @@
+# Omarchy Broadcast Mic as a systemd user service: the stable microphone host.
+# It runs one filter-chain as a dedicated PipeWire client process,
+# `pipewire -c omarchy-broadcast-mic.conf`, which creates the virtual source
+# "Omarchy Broadcast Mic" (node.name omarchy-broadcast-mic). The audio
+# modules (noise removal, room echo removal) run in a separate process, the
+# audio worker (omarchy-broadcast-audiod.service); this process never loads
+# a module, a vendor library or a model, only the Omarchy Broadcast forwarding
+# plugin (libomarchy_broadcast_mic.so). When the worker is missing, stopped or
+# crashed, the source keeps delivering the microphone's own audio. Independent
+# of omarchy-broadcastd: neither unit needs the other.
+#
+# This is the alternative to the ADR 0014 single-engine units
+# (omarchy-broadcast-mic@rnnoise.service and
+# omarchy-broadcast-mic@deepfilter.service). All of them create the same
+# source name, so only one may run: each declares Conflicts= with the others,
+# and starting one stops the other. Use one or the other.
+#
+# The configuration is looked up by name: PipeWire searches
+# ~/.config/pipewire, /etc/pipewire and /usr/share/pipewire. The Arch package
+# and `scripts/install-user.sh --audio` install a copy of this unit whose
+# ExecStart= names the installed configuration by absolute path. The plugin
+# is found in a LADSPA directory (/usr/lib/ladspa for the package; the
+# installed configuration of install-user.sh names it by absolute path).
+#
+# Nothing enables this unit on installation. Turn the feature on with
+#   systemctl --user enable --now omarchy-broadcast-mic.service
+# and off with
+#   systemctl --user disable --now omarchy-broadcast-mic.service
+# If "Omarchy Broadcast Mic" is the default input, change the default back to
+# a physical microphone first, so that applications are not left on a source
+# that is going away. Starting this unit also starts the worker's socket
+# (omarchy-broadcast-audiod.socket); the worker itself starts only when
+# something records from the source.
+#
+# Logs: `journalctl --user -u omarchy-broadcast-mic.service`.
+# More: docs/setup/microphone.md.
+
+[Unit]
+Description=Omarchy Broadcast Mic (stable microphone host)
+
+After=pipewire.service pipewire-session-manager.service
+# Stopped (and not left running against a dead server) whenever PipeWire
+# stops; see [Install] for how it comes back.
+BindsTo=pipewire.service
+# The socket the plugin connects to. It only listens: the worker is started
+# by a connection, so a mic host that nothing records from does not start it.
+Wants=omarchy-broadcast-audiod.socket
+After=omarchy-broadcast-audiod.socket
+# The ADR 0014 instances create the same source; see the header.
+Conflicts=omarchy-broadcast-mic@rnnoise.service omarchy-broadcast-mic@deepfilter.service
+
+[Service]
+# Hardening, type, restart policy and slice as in PipeWire's own
+# filter-chain.service and the ADR 0014 unit. MemoryDenyWriteExecute stays on
+# because this process runs no effect and no JIT-compiled code, only the
+# forwarding plugin.
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+Type=simple
+ExecStart=/usr/bin/pipewire -c omarchy-broadcast-mic.conf
+Restart=on-failure
+Slice=session.slice
+
+[Install]
+# WantedBy=pipewire.service, as wireplumber.service: BindsTo= stops this
+# unit with PipeWire, and enabling it here starts it again whenever
+# pipewire.service starts, including on `systemctl --user restart pipewire`.
+# WantedBy=default.target alone would start it only at login, so a PipeWire
+# restart would leave the source gone until it was started by hand.
+WantedBy=pipewire.service

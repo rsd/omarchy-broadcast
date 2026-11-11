@@ -21,6 +21,24 @@
 #                                            omarchy-broadcast-mic-deepfilter.conf, from dist/pipewire/)
 #   its systemd user unit template        -> ${XDG_DATA_HOME:-~/.local/share}/systemd/user/omarchy-broadcast-mic@.service
 #                                            (from dist/, ExecStart pointing at the installed configurations)
+# and, with --audio, the microphone with audio modules (noise removal, room
+# echo removal; the alternative to --mic):
+#   audio worker                          -> ${XDG_BIN_HOME:-~/.local/bin}/omarchy-broadcast-audiod
+#   its systemd user units                -> ${XDG_DATA_HOME:-~/.local/share}/systemd/user/omarchy-broadcast-audiod.service
+#                                            and omarchy-broadcast-audiod.socket (from dist/, ExecStart pointing at
+#                                            the installed worker)
+#   its D-Bus activation file             -> ${XDG_DATA_HOME:-~/.local/share}/dbus-1/services/br.com.dias.OmarchyBroadcast.AudioWorker.service
+#   mic host unit                         -> ${XDG_DATA_HOME:-~/.local/share}/systemd/user/omarchy-broadcast-mic.service
+#                                            (from dist/, ExecStart pointing at the installed configuration)
+#   mic host PipeWire configuration       -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/pipewire/omarchy-broadcast-mic.conf
+#                                            (from dist/pipewire/, plugin pointing at the installed plugin)
+#   LADSPA forwarding plugin              -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/ladspa/libomarchy_broadcast_mic.so
+#   CPU voice module library              -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules/libobc_module_voice_cpu.so
+#   its module manifest                   -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules.d/voice-cpu.toml
+#                                            (from crates/obc-module-voice-cpu/voice-cpu.toml, library pointing at
+#                                            the installed module library)
+#   third-party licence notices           -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules/THIRD-PARTY-NOTICES
+#                                            (from dist/licenses/, for the code built into the module and the worker)
 #
 # The Maxine module is always built and installed (the library builds without
 # the Maxine SDK), and so is the Maxine AR module (likewise without the AR
@@ -36,7 +54,15 @@
 #
 # It runs no systemctl command and enables nothing; it prints the next steps.
 # It does not install the WirePlumber drop-in, the Maxine drop-in or, without
-# --mic, the microphone. The Omarchy bar plugin is a separate project.
+# --mic or --audio, a microphone. The Omarchy bar plugin is a separate project.
+#
+# The two microphones are alternatives: --mic installs the ADR 0014 units
+# (omarchy-broadcast-mic@rnnoise and @deepfilter, one fixed engine each) and
+# --audio the mic host with audio modules (omarchy-broadcast-mic.service). All
+# of them create the same source name, so only one may run: their units declare
+# Conflicts= with each other, and starting one stops the other. Give only one
+# of the two options per run (both together are refused); both can be installed
+# by separate runs, and enable only one unit. Nothing is enabled here.
 #
 # Usage:
 #   scripts/install-user.sh [options]
@@ -45,13 +71,20 @@
 #   --dry-run    Print every action; build nothing, change nothing.
 #   --no-build   Build nothing: install the binaries and the module library
 #                already in ${CARGO_TARGET_DIR:-target}/release.
-#   --mic        Also install the noise-removed microphone (see above). Without
-#                it, microphone files installed by an earlier run stay in
-#                place and in the manifest, so --uninstall still removes them.
+#   --mic        Also install the noise-removed microphone of ADR 0014 (see
+#                above). Without it, microphone files installed by an earlier
+#                run stay in place and in the manifest, so --uninstall still
+#                removes them.
+#   --audio      Also install the microphone with audio modules (see above), the
+#                alternative to --mic: not combined with it in one run, and not
+#                run together with its units. The build then also covers the
+#                worker, the plugin and the CPU voice module (the DeepFilterNet
+#                git dependency needs network access once). Without it, files
+#                installed by an earlier run stay in place, as with --mic.
 #   --uninstall  Remove what this script installed, and only that, including
-#                the Maxine module and its manifest, the microphone's files,
+#                the Maxine module and its manifest, the microphones' files,
 #                and the directories ~/.local/share/omarchy-broadcast/modules,
-#                modules.d and pipewire and ~/.local/share/omarchy-broadcast
+#                modules.d, pipewire and ladspa and ~/.local/share/omarchy-broadcast
 #                once they are empty (modules and modules.d even when no file
 #                of theirs was installed), and the shim an earlier version
 #                installed (with ~/.local/lib/omarchy-broadcast once it is
@@ -61,7 +94,7 @@
 # Ownership: every text file it writes carries a marker comment line, and the
 # manifest lists every path it wrote, with the sha256 of each binary. It
 # overwrites or removes a text file only if it carries the marker, and a
-# binary (the daemon, the CLI and the module library) only if the manifest
+# binary (the daemon, the CLI, the worker, the plugin and the module libraries) only if the manifest
 # lists it with the checksum of the file on disk.
 # Any other file at a target path stops it before anything is changed.
 # Re-running it over its own install updates that install. The shim files of
@@ -91,12 +124,26 @@ MODULE_MANIFEST=maxine-vfx.toml
 AR_MODULE_CRATE=obc-module-maxine-ar
 AR_MODULE_LIB=libobc_module_maxine_ar.so
 AR_MODULE_MANIFEST=maxine-ar.toml
+# The audio-module microphone (--audio): the worker binary, the LADSPA
+# forwarding plugin (crate obc-mic-shim) and the CPU voice module, whose
+# manifest is generated like the Maxine ones.
+AUDIO_BINARY=omarchy-broadcast-audiod
+PLUGIN_LIB=libomarchy_broadcast_mic.so
+VOICE_MODULE_CRATE=obc-module-voice-cpu
+VOICE_MODULE_LIB=libobc_module_voice_cpu.so
+VOICE_MODULE_MANIFEST=voice-cpu.toml
 # File names whose ownership is the manifest checksum, not a marker line.
-SUMMED=("${BINARIES[@]}" "$MODULE_LIB" "$AR_MODULE_LIB" "${LEGACY_SHIM[@]}")
+SUMMED=("${BINARIES[@]}" "$AUDIO_BINARY" "$PLUGIN_LIB" "$MODULE_LIB" "$AR_MODULE_LIB" "$VOICE_MODULE_LIB" "${LEGACY_SHIM[@]}")
 UNIT_NAME=omarchy-broadcastd.service
 DBUS_NAME=br.com.dias.OmarchyBroadcast.service
 MIC_UNIT_NAME=omarchy-broadcast-mic@.service
 MIC_CONFS=(omarchy-broadcast-mic-rnnoise.conf omarchy-broadcast-mic-deepfilter.conf)
+HOST_UNIT_NAME=omarchy-broadcast-mic.service
+HOST_CONF=omarchy-broadcast-mic.conf
+WORKER_UNIT_NAME=omarchy-broadcast-audiod.service
+WORKER_SOCKET_NAME=omarchy-broadcast-audiod.socket
+WORKER_DBUS_NAME=br.com.dias.OmarchyBroadcast.AudioWorker.service
+NOTICES_NAME=THIRD-PARTY-NOTICES
 
 usage() {
   sed -n '2,/^set -euo pipefail$/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0"
@@ -112,17 +159,22 @@ warn() { printf 'install-user: warning: %s\n' "$*" >&2; }
 dry_run=0
 build=1
 want_mic=0
+want_audio=0
 mode=install
 while (($#)); do
   case $1 in
     --dry-run) dry_run=1; shift ;;
     --no-build) build=0; shift ;;
     --mic) want_mic=1; shift ;;
+    --audio) want_audio=1; shift ;;
     --uninstall) mode=uninstall; shift ;;
     -h | --help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
 done
+
+((!want_mic || !want_audio)) ||
+  die "--mic and --audio are alternatives (both create the source omarchy-broadcast-mic); give one (see --help)"
 
 if ((EUID == 0)); then
   die "refusing to run as root: this is a per-user install into your home directory; run it as your own user"
@@ -157,8 +209,26 @@ manifest=$state_dir/install-user.manifest
 mic_unit_src=$repo/dist/systemd/$MIC_UNIT_NAME
 mic_unit_dst=$data_dir/systemd/user/$MIC_UNIT_NAME
 mic_conf_dir=$data_dir/omarchy-broadcast/pipewire
+host_unit_src=$repo/dist/systemd/$HOST_UNIT_NAME
+host_unit_dst=$data_dir/systemd/user/$HOST_UNIT_NAME
+host_conf_src=$repo/dist/pipewire/$HOST_CONF
+host_conf_dst=$mic_conf_dir/$HOST_CONF
+worker_unit_src=$repo/dist/systemd/$WORKER_UNIT_NAME
+worker_unit_dst=$data_dir/systemd/user/$WORKER_UNIT_NAME
+worker_socket_src=$repo/dist/systemd/$WORKER_SOCKET_NAME
+worker_socket_dst=$data_dir/systemd/user/$WORKER_SOCKET_NAME
+worker_dbus_src=$repo/dist/dbus-1/services/$WORKER_DBUS_NAME
+worker_dbus_dst=$data_dir/dbus-1/services/$WORKER_DBUS_NAME
+ladspa_dir=$data_dir/omarchy-broadcast/ladspa
+plugin_dst=$ladspa_dir/$PLUGIN_LIB
+worker_bin_dst=$bin_dir/$AUDIO_BINARY
+notices_src=$repo/dist/licenses/$NOTICES_NAME
+voice_manifest_src=$repo/crates/$VOICE_MODULE_CRATE/$VOICE_MODULE_MANIFEST
+voice_lib_dst=$data_dir/omarchy-broadcast/modules/$VOICE_MODULE_LIB
+voice_manifest_dst=$data_dir/omarchy-broadcast/modules.d/$VOICE_MODULE_MANIFEST
 module_manifest_src=$repo/crates/$MODULE_CRATE/$MODULE_MANIFEST
 module_dir=$data_dir/omarchy-broadcast/modules
+notices_dst=$module_dir/$NOTICES_NAME
 module_lib_dst=$module_dir/$MODULE_LIB
 module_manifest_dst=$data_dir/omarchy-broadcast/modules.d/$MODULE_MANIFEST
 ar_module_manifest_src=$repo/crates/$AR_MODULE_CRATE/$AR_MODULE_MANIFEST
@@ -170,6 +240,13 @@ maxine_dropin=$config_dir/systemd/user/omarchy-broadcastd.service.d/maxine.conf
 
 bin_dsts=()
 for b in "${BINARIES[@]}"; do bin_dsts+=("$bin_dir/$b"); done
+# The microphone with audio modules: the text files and the binaries (with a
+# checksum in the manifest) this run installs, only with --audio.
+audio_dsts=() audio_bin_dsts=()
+if ((want_audio)); then
+  audio_dsts=("$host_unit_dst" "$host_conf_dst" "$worker_unit_dst" "$worker_socket_dst" "$worker_dbus_dst" "$voice_manifest_dst" "$notices_dst")
+  audio_bin_dsts=("$worker_bin_dst" "$plugin_dst" "$voice_lib_dst")
+fi
 # The microphone files this run installs: only with --mic.
 mic_dsts=()
 if ((want_mic)); then
@@ -367,6 +444,8 @@ if [[ $mode == uninstall ]]; then
   # So are the modules' files, for the same reason.
   targets=("${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "$module_lib_dst" "$module_manifest_dst" "$ar_module_lib_dst" "$ar_module_manifest_dst" "$mic_unit_dst")
   for c in "${MIC_CONFS[@]}"; do targets+=("$mic_conf_dir/$c"); done
+  # The audio-module microphone's files, for the same reason.
+  targets+=("$host_unit_dst" "$host_conf_dst" "$worker_unit_dst" "$worker_socket_dst" "$worker_dbus_dst" "$voice_manifest_dst" "$notices_dst" "$worker_bin_dst" "$plugin_dst" "$voice_lib_dst")
   # Also what an earlier run wrote under other XDG directories.
   if [[ -f $manifest ]]; then
     while IFS= read -r line; do
@@ -382,12 +461,14 @@ if [[ $mode == uninstall ]]; then
   # Removing the file of an enabled unit leaves a dangling enable link:
   # disable it first.
   # A microphone instance's link (pipewire.service.wants/omarchy-broadcast-mic@
-  # rnnoise.service) points at the template unit file.
+  # rnnoise.service) points at the template unit file; the mic host's
+  # (omarchy-broadcast-mic.service) at its own.
   enabled=0 mic_links=()
-  for link in "$config_dir"/systemd/user/*.wants/{"$UNIT_NAME",omarchy-broadcast-mic@*.service}; do
+  for link in "$config_dir"/systemd/user/*.wants/{"$UNIT_NAME","$HOST_UNIT_NAME",omarchy-broadcast-mic@*.service}; do
     [[ -L $link ]] || continue
-    unit=$UNIT_NAME
-    [[ ${link##*/} == "$UNIT_NAME" ]] || unit=$MIC_UNIT_NAME
+    unit=$MIC_UNIT_NAME
+    [[ ${link##*/} != "$UNIT_NAME" ]] || unit=$UNIT_NAME
+    [[ ${link##*/} != "$HOST_UNIT_NAME" ]] || unit=$HOST_UNIT_NAME
     for path in "${targets[@]}"; do
       if [[ ${path##*/} == "$unit" && $(readlink -- "$link") == "$path" ]]; then
         printf 'install-user: %s is still enabled (%s)\n' "${link##*/}" "$link" >&2
@@ -409,7 +490,7 @@ if [[ $mode == uninstall ]]; then
 
   check_targets "${targets[@]}" "$manifest"
 
-  removed=0 mic_removed=0
+  removed=0 mic_removed=0 audio_removed=0
   lib_dirs=() leaf_dirs=()
   for path in "${targets[@]}"; do
     [[ -e $path ]] || continue
@@ -419,7 +500,9 @@ if [[ $mode == uninstall ]]; then
     case ${path##*/} in
       "$MIC_UNIT_NAME") mic_removed=1 ;;
       omarchy-broadcast-mic-*.conf) mic_removed=1 leaf_dirs+=("${path%/*}") ;;
-      "$MODULE_LIB" | "$MODULE_MANIFEST" | "$AR_MODULE_LIB" | "$AR_MODULE_MANIFEST") leaf_dirs+=("${path%/*}") ;;
+      "$HOST_UNIT_NAME" | "$WORKER_UNIT_NAME" | "$WORKER_SOCKET_NAME" | "$AUDIO_BINARY") audio_removed=1 ;;
+      "$HOST_CONF" | "$PLUGIN_LIB") audio_removed=1 leaf_dirs+=("${path%/*}") ;;
+      "$MODULE_LIB" | "$MODULE_MANIFEST" | "$AR_MODULE_LIB" | "$AR_MODULE_MANIFEST" | "$VOICE_MODULE_LIB" | "$VOICE_MODULE_MANIFEST" | "$NOTICES_NAME") leaf_dirs+=("${path%/*}") ;;
     esac
   done
   # The legacy shim's library directory goes once it is empty (rmdir only
@@ -431,8 +514,8 @@ if [[ $mode == uninstall ]]; then
       fi
     done < <(printf '%s\n' "${lib_dirs[@]}" | sort -u)
   fi
-  # So do the omarchy-broadcast/{pipewire,modules,modules.d} directories of
-  # the microphone and the module, and then omarchy-broadcast itself, once
+  # So do the omarchy-broadcast/{pipewire,ladspa,modules,modules.d} directories
+  # of the microphones and the modules, and then omarchy-broadcast itself, once
   # the files are gone. Each is removed only while it exists and only if it
   # is empty.
   # The module's two directories are always tried, so an empty one left by an
@@ -441,7 +524,7 @@ if [[ $mode == uninstall ]]; then
   parent_dirs=()
   while IFS= read -r path; do
     case $path in
-      */omarchy-broadcast/pipewire | */omarchy-broadcast/modules | */omarchy-broadcast/modules.d)
+      */omarchy-broadcast/pipewire | */omarchy-broadcast/ladspa | */omarchy-broadcast/modules | */omarchy-broadcast/modules.d)
         if [[ -d $path ]]; then run rmdir --ignore-fail-on-non-empty -- "$path"; fi
         parent_dirs+=("${path%/*}")
         ;;
@@ -484,6 +567,15 @@ reload:
   systemctl --user daemon-reload
 EOF
   fi
+  if ((audio_removed)); then
+    cat <<EOF
+
+The microphone with audio modules is gone; stop what is still running and
+reload:
+  systemctl --user stop omarchy-broadcast-mic.service omarchy-broadcast-audiod.service omarchy-broadcast-audiod.socket
+  systemctl --user daemon-reload
+EOF
+  fi
   exit 0
 fi
 
@@ -519,6 +611,29 @@ done
 [[ $data_dir =~ ^/[A-Za-z0-9._/@+-]*$ ]] ||
   die "data dir '$data_dir' contains characters that would need escaping in the module manifest and in ExecStart; set XDG_DATA_HOME to a plain path"
 
+# The audio-module microphone (--audio): each source file must exist, and the
+# lines that are rewritten must be there exactly once. The mic host unit names
+# its configuration by file name (looked up by PipeWire, not under XDG_DATA_HOME),
+# the configuration names the plugin by file name (searched in a LADSPA
+# directory), and the worker unit names the binary under /usr/bin: all three
+# are rewritten to the installed paths (the data and bin dirs are checked
+# above).
+host_exec_re='^ExecStart=/usr/bin/pipewire -c omarchy-broadcast-mic\.conf$'
+worker_exec_re='^ExecStart=/usr/bin/omarchy-broadcast-audiod$'
+plugin_re='^([[:space:]]*)plugin = "libomarchy_broadcast_mic"$'
+if ((want_audio)); then
+  for f in "$host_unit_src" "$host_conf_src" "$worker_unit_src" "$worker_socket_src" "$worker_dbus_src" "$voice_manifest_src" "$notices_src"; do
+    [[ -f $f ]] || die "missing $f"
+  done
+  for spec in "$host_exec_re|$host_unit_src" "$worker_exec_re|$worker_unit_src" "$plugin_re|$host_conf_src" "$lib_re|$voice_manifest_src"; do
+    n=$(grep -c -E -- "${spec%%|*}" "${spec#*|}" || true)
+    ((n == 1)) || {
+      printf 'install-user: expected exactly one line matching %s in %s, found %s\n' "${spec%%|*}" "${spec#*|}" "$n" >&2
+      exit 2
+    }
+  done
+fi
+
 # The microphone unit's ExecStart names its configuration by file name, which
 # PipeWire does not look up under XDG_DATA_HOME: it is rewritten to the
 # installed path (the data dir is checked above).
@@ -551,7 +666,7 @@ if [[ -f $manifest ]]; then
       "$unit_dst" | "$dbus_dst" | "$module_lib_dst" | "$module_manifest_dst" | "$ar_module_lib_dst" | "$ar_module_manifest_dst") continue ;;
     esac
     for dst in "${bin_dsts[@]}"; do [[ $path == "$dst" ]] && continue 2; done
-    for dst in "${mic_dsts[@]}"; do [[ $path == "$dst" ]] && continue 2; done
+    for dst in "${mic_dsts[@]}" "${audio_dsts[@]}" "${audio_bin_dsts[@]}"; do [[ $path == "$dst" ]] && continue 2; done
     if is_legacy_shim "$path"; then
       if owned "$path"; then
         # Listed once per checksum while an install was in progress: once here.
@@ -565,7 +680,7 @@ if [[ -f $manifest ]]; then
   done <"$manifest"
 fi
 
-check_targets "${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "$module_lib_dst" "$module_manifest_dst" "$ar_module_lib_dst" "$ar_module_manifest_dst" "${mic_dsts[@]}" "$manifest"
+check_targets "${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "$module_lib_dst" "$module_manifest_dst" "$ar_module_lib_dst" "$ar_module_manifest_dst" "${mic_dsts[@]}" "${audio_dsts[@]}" "${audio_bin_dsts[@]}" "$manifest"
 
 if ((build)); then
   run cargo build --manifest-path "$repo/Cargo.toml" --release --locked -p omarchy-broadcastd -p omarchy-broadcast || {
@@ -579,6 +694,13 @@ if ((build)); then
     exit 1
   }
 fi
+if ((want_audio && build)); then
+  # Its own invocation too, for the same reason.
+  run cargo build --manifest-path "$repo/Cargo.toml" --release --locked -p omarchy-broadcast-audiod -p obc-mic-shim -p "$VOICE_MODULE_CRATE" || {
+    printf 'install-user: cargo build failed; nothing was changed\n' >&2
+    exit 1
+  }
+fi
 if ((!dry_run)); then
   for b in "${BINARIES[@]}"; do
     [[ -x $target_dir/release/$b ]] || die "no built binary at $target_dir/release/$b (run without --no-build)"
@@ -586,6 +708,12 @@ if ((!dry_run)); then
   for lib in "$MODULE_LIB" "$AR_MODULE_LIB"; do
     [[ -f $target_dir/release/$lib ]] || die "no built module at $target_dir/release/$lib (run without --no-build)"
   done
+  if ((want_audio)); then
+    [[ -x $target_dir/release/$AUDIO_BINARY ]] || die "no built binary at $target_dir/release/$AUDIO_BINARY (run without --no-build)"
+    for lib in "$PLUGIN_LIB" "$VOICE_MODULE_LIB"; do
+      [[ -f $target_dir/release/$lib ]] || die "no built library at $target_dir/release/$lib (run without --no-build)"
+    done
+  fi
 fi
 
 # The shim files of an earlier version go before the manifest is rewritten
@@ -604,7 +732,7 @@ fi
 manifest_text() {
   echo "$MARKER"
   echo "# Paths written by install-user.sh, one per line; a binary as \"<sha256>  <path>\"."
-  printf '%s\n' "${kept[@]}" "$@" "$unit_dst" "$dbus_dst" "$module_manifest_dst" "$ar_module_manifest_dst" "${mic_dsts[@]}" | sort -u
+  printf '%s\n' "${kept[@]}" "$@" "$unit_dst" "$dbus_dst" "$module_manifest_dst" "$ar_module_manifest_dst" "${mic_dsts[@]}" "${audio_dsts[@]}" | sort -u
 }
 
 # What to install with a checksum in the manifest: source, destination, mode.
@@ -614,8 +742,14 @@ for b in "${BINARIES[@]}"; do
 done
 srcs+=("$target_dir/release/$MODULE_LIB") dsts+=("$module_lib_dst") modes+=(644)
 srcs+=("$target_dir/release/$AR_MODULE_LIB") dsts+=("$ar_module_lib_dst") modes+=(644)
+if ((want_audio)); then
+  srcs+=("$target_dir/release/$AUDIO_BINARY") dsts+=("$worker_bin_dst") modes+=(755)
+  srcs+=("$target_dir/release/$PLUGIN_LIB") dsts+=("$plugin_dst") modes+=(755)
+  srcs+=("$target_dir/release/$VOICE_MODULE_LIB") dsts+=("$voice_lib_dst") modes+=(644)
+fi
 
 run mkdir -p -- "$bin_dir" "$module_dir"
+((!want_audio)) || run mkdir -p -- "$ladspa_dir"
 # Install beside the target, then rename: replacing a running binary in place
 # would fail with "Text file busy".
 old_sums=() new_sums=()
@@ -680,11 +814,57 @@ if ((want_mic)); then
   put_text "$mic_unit_dst" mic_unit_text
 fi
 
+if ((want_audio)); then
+  put_text "$voice_manifest_dst" module_manifest_text "$VOICE_MODULE_CRATE" "$VOICE_MODULE_MANIFEST" "$voice_lib_dst"
+  host_conf_text() {
+    echo "$MARKER"
+    echo "# Generated from dist/pipewire/$HOST_CONF; plugin points at the installed plugin."
+    sed -E "s|$plugin_re|\\1plugin = \"$plugin_dst\"|" "$host_conf_src"
+  }
+  put_text "$host_conf_dst" host_conf_text
+  host_unit_text() {
+    echo "$MARKER"
+    echo "# Generated from dist/systemd/$HOST_UNIT_NAME; ExecStart points at the installed configuration."
+    sed "s|$host_exec_re|ExecStart=/usr/bin/pipewire -c $host_conf_dst|" "$host_unit_src"
+  }
+  put_text "$host_unit_dst" host_unit_text
+  worker_unit_text() {
+    echo "$MARKER"
+    echo "# Generated from dist/systemd/$WORKER_UNIT_NAME; ExecStart points at the installed worker."
+    sed "s|$worker_exec_re|ExecStart=$worker_bin_dst|" "$worker_unit_src"
+  }
+  put_text "$worker_unit_dst" worker_unit_text
+  worker_socket_text() {
+    echo "$MARKER"
+    cat "$worker_socket_src"
+  }
+  put_text "$worker_socket_dst" worker_socket_text
+  worker_dbus_text() {
+    echo "$MARKER"
+    cat "$worker_dbus_src"
+  }
+  put_text "$worker_dbus_dst" worker_dbus_text
+  # The licence notices of the code built into the module and the worker,
+  # beside the module library; the marker line comes first.
+  notices_text() {
+    echo "$MARKER"
+    cat "$notices_src"
+  }
+  put_text "$notices_dst" notices_text
+fi
+
 if [[ -e $config_dir/systemd/user/$UNIT_NAME ]]; then
   warn "$config_dir/systemd/user/$UNIT_NAME exists and takes precedence over $unit_dst, which it shadows; to use the new unit: systemctl --user disable omarchy-broadcastd, then remove that file"
 fi
 if ((want_mic)) && [[ -e $config_dir/systemd/user/$MIC_UNIT_NAME ]]; then
   warn "$config_dir/systemd/user/$MIC_UNIT_NAME exists and takes precedence over $mic_unit_dst, which it shadows; to use the new unit: systemctl --user disable omarchy-broadcast-mic@rnnoise.service omarchy-broadcast-mic@deepfilter.service, then remove that file"
+fi
+if ((want_audio)); then
+  for f in "$HOST_UNIT_NAME" "$WORKER_UNIT_NAME" "$WORKER_SOCKET_NAME"; do
+    if [[ -e $config_dir/systemd/user/$f ]]; then
+      warn "$config_dir/systemd/user/$f exists and takes precedence over $data_dir/systemd/user/$f, which it shadows; to use the new unit: systemctl --user disable $f, then remove that file"
+    fi
+  done
 fi
 case ":${PATH:-}:" in
   *":$bin_dir:"*) ;;
@@ -747,5 +927,17 @@ one instance at a time:
     (RNNoise, the default; needs the package noise-suppression-for-voice)
   or, with DeepFilterNet (needs the package deepfilternet-ladspa):
   systemctl --user enable --now omarchy-broadcast-mic@deepfilter.service
+EOF
+fi
+if ((want_audio)); then
+  cat <<EOF
+
+Optional, the microphone with audio modules (noise removal, room echo
+removal; see docs/setup/microphone.md). The CPU voice module $module_state
+($(printf '%q' "$voice_lib_dst")). The mic host and the worker are not
+enabled; the worker starts when something records from the source. Enable the
+mic host only if no ADR 0014 unit (omarchy-broadcast-mic@...) is enabled:
+  systemctl --user daemon-reload
+  systemctl --user enable --now omarchy-broadcast-mic.service
 EOF
 fi

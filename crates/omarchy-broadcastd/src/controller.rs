@@ -311,6 +311,7 @@ use crate::backend::{
 };
 use crate::camera::{self, Camera};
 use crate::gpu_cache;
+use crate::mic::{self, agent::MicEvent, agent::MicLink, agent::MicRequest};
 use crate::modules::{self, Modules, Plan};
 use crate::preview::{Leases, PreviewDir, check_fps};
 use crate::settings::catalogue::{self, DYNAMIC_FRAMERATE};
@@ -483,6 +484,10 @@ pub enum Command {
     PipeWire(PipeWireGeneration, PipeWireEvent),
     /// Video nodes appeared or disappeared: scan the cameras again.
     Rescan,
+    /// `SetMicHost(b)` (revision 13).
+    SetMicHost(bool, Reply),
+    /// What the microphone's agent found or did ([`crate::mic::agent`]).
+    Mic(MicEvent),
     /// Stop everything and end the controller loop.
     Shutdown,
 }
@@ -512,6 +517,11 @@ pub enum Change {
     ModulesSerial(u32),
     BackendProfile(String),
     ConfigSerial(u32),
+    MicState(String),
+    MicConsumers(u32),
+    MicProvider(String),
+    MicLatencyMs(f64),
+    MicError(String),
 }
 
 impl Change {
@@ -540,6 +550,11 @@ impl Change {
             Change::ModulesSerial(_) => "ModulesSerial",
             Change::BackendProfile(_) => "BackendProfile",
             Change::ConfigSerial(_) => "ConfigSerial",
+            Change::MicState(_) => "MicState",
+            Change::MicConsumers(_) => "MicConsumers",
+            Change::MicProvider(_) => "MicProvider",
+            Change::MicLatencyMs(_) => "MicLatencyMs",
+            Change::MicError(_) => "MicError",
         }
     }
 }
@@ -565,6 +580,9 @@ pub enum Note {
     /// (`ConfigChanged`): sent after the snapshot with the new
     /// `ConfigSerial`.
     ConfigChanged(u32),
+    /// `MicStats(overruns, misses, voice)`, relayed from the audio worker
+    /// (not by the controller).
+    MicStats(u32, u32, f64),
 }
 
 /// What the controller and the D-Bus side share: the property snapshot the
@@ -635,6 +653,12 @@ impl Published {
     /// preview encoder's thread, through the backend's preview reporter.
     pub fn preview_frame(&self, seq: u32) {
         let _ = self.notes.send(Note::PreviewFrame(seq));
+    }
+
+    /// Announces the audio worker's counters (`MicStats`): called by the
+    /// microphone's agent.
+    pub fn mic_stats(&self, overruns: u32, misses: u32, voice: f64) {
+        let _ = self.notes.send(Note::MicStats(overruns, misses, voice));
     }
 
     /// Announces a `SetEnabled(false)` about to be queued (the D-Bus side
@@ -742,6 +766,27 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Vec<Change> {
     }
     if old.warning != new.warning {
         out.push(Change::Warning(new.warning.clone()));
+    }
+    if old.mic != new.mic {
+        let (o, n) = (
+            old.mic.clone().unwrap_or_default(),
+            new.mic.clone().unwrap_or_default(),
+        );
+        if o.consumers != n.consumers {
+            out.push(Change::MicConsumers(n.consumers));
+        }
+        if o.provider != n.provider {
+            out.push(Change::MicProvider(n.provider.clone()));
+        }
+        if o.latency_ms.to_bits() != n.latency_ms.to_bits() {
+            out.push(Change::MicLatencyMs(n.latency_ms));
+        }
+        if o.error != n.error {
+            out.push(Change::MicError(n.error.clone()));
+        }
+        if o.state != n.state {
+            out.push(Change::MicState(n.state));
+        }
     }
     if old.state != new.state {
         out.push(Change::State(new.state));
@@ -852,6 +897,8 @@ pub fn preliminary_snapshot(paths: &Paths) -> Snapshot {
                 .to_string(),
         ),
         config_serial: Some(1),
+        // What the mic host runs is not known before the agent asked.
+        mic: Some(obc_ipc::MicStatus::default()),
         interface_revision: INTERFACE_REVISION,
     }
 }
@@ -1387,6 +1434,23 @@ pub struct Controller<B: MediaBackend> {
     compute_capability_learnt: bool,
     published: Published,
     sink_hook: Option<SinkHook>,
+    /// The microphone's agent ([`crate::mic::agent`]); `None` without one
+    /// (the tests that do not test the microphone).
+    mic: Option<MicLink>,
+    /// The `Mic*` properties, as the agent last told them.
+    mic_status: obc_ipc::MicStatus,
+    /// The worker's modules, settings and devices, as the agent last told
+    /// them.
+    mic_catalogue: mic::Catalogue,
+    /// The audio settings snapshot last sent to the agent.
+    mic_sent: Option<String>,
+    /// `mic.device` as of the last snapshot sent (`None` before the first):
+    /// a change while the Omarchy Broadcast Mic is the default re-pins the
+    /// capture side.
+    mic_device_sent: Option<String>,
+    /// Bumped when the worker's modules change: `ModulesSerial` is the
+    /// registry's serial plus this.
+    mic_serial: u32,
 }
 
 /// Where a stage the user may have selected stands for a plan (the
@@ -1529,6 +1593,15 @@ impl<B: MediaBackend> Controller<B> {
         now: Instant,
     ) -> Self {
         Self::new_with(backend, paths, published, sink_hook, now, false)
+    }
+
+    /// Connects the microphone's agent: the audio settings snapshot is sent
+    /// to it now and at every change ([`crate::mic`]).
+    pub fn set_mic(&mut self, link: MicLink) {
+        self.mic = Some(link);
+        self.mic_sent = None;
+        self.mic_device_sent = None;
+        self.push_mic_snapshot();
     }
 
     /// Discovers, opens and probes the modules (counting the crash ledger
@@ -1708,6 +1781,12 @@ impl<B: MediaBackend> Controller<B> {
             compute_capability_learnt: false,
             published,
             sink_hook,
+            mic: None,
+            mic_status: obc_ipc::MicStatus::default(),
+            mic_catalogue: mic::Catalogue::default(),
+            mic_sent: None,
+            mic_device_sent: None,
+            mic_serial: 0,
         };
         c.rescan_cameras();
         // The output modes the cameras found offer are known from the
@@ -1816,6 +1895,13 @@ impl<B: MediaBackend> Controller<B> {
                         Some(&SettingValue::Str(settings::MODE_AUTO.into())),
                         now,
                     ),
+                    Some(ResetScope::Group(g)) if self.mic_group_of(&g).is_some() => {
+                        let g = self.mic_group_of(&g).unwrap_or(g);
+                        self.reset_mic(&ResetWhat::Group(g), now)
+                    }
+                    Some(ResetScope::Setting(id)) if mic::is_mic(&id) => {
+                        self.reset_mic(&ResetWhat::Setting(id), now)
+                    }
                     Some(ResetScope::Group(g)) => {
                         let what = ResetWhat::Group(g);
                         match self.reset_global(&what, now) {
@@ -1891,6 +1977,8 @@ impl<B: MediaBackend> Controller<B> {
                 self.reconcile(now);
             }
             Command::Rescan => self.rescan(now),
+            Command::SetMicHost(on, reply) => self.set_mic_host(on, reply),
+            Command::Mic(event) => self.mic_event(event),
             Command::Shutdown => return false,
         }
         true
@@ -2913,7 +3001,7 @@ impl<B: MediaBackend> Controller<B> {
             camera_controls: Some(self.controls_view.clone()),
             settings_revision: Some(self.settings_revision),
             settings_schema_serial: Some(self.settings_serial),
-            modules_serial: Some(self.modules.serial()),
+            modules_serial: Some(self.modules_serial()),
             backend_profile: Some(
                 self.config
                     .modules
@@ -2922,9 +3010,11 @@ impl<B: MediaBackend> Controller<B> {
                     .to_string(),
             ),
             config_serial: Some(self.config_serial),
+            mic: Some(self.mic_status.clone()),
             interface_revision: INTERFACE_REVISION,
         };
         self.published.update(snap);
+        self.push_mic_snapshot();
         if self.config_announced != self.config_serial {
             self.config_announced = self.config_serial;
             self.published.config_changed(self.config_serial);
@@ -5414,6 +5504,7 @@ impl<B: MediaBackend> Controller<B> {
         });
         let mut built = built;
         built.global = self.global_settings();
+        built.mic = self.mic_groups();
         built.mode = self.mode_setting_of(&camera.id);
         for note in &built.notes {
             if self
@@ -5531,6 +5622,7 @@ impl<B: MediaBackend> Controller<B> {
                     mode: self.mode_setting_of(&active),
                     camera: active,
                     global: self.global_settings(),
+                    mic: self.mic_groups(),
                     ..CameraSettings::none()
                 }
             }
@@ -5843,6 +5935,7 @@ impl<B: MediaBackend> Controller<B> {
             if camera.is_empty() && self.cameras.is_empty() {
                 let none = CameraSettings {
                     global: self.global_settings(),
+                    mic: self.mic_groups(),
                     ..CameraSettings::none()
                 };
                 return Ok(none.tree(rev, serial));
@@ -5888,6 +5981,12 @@ impl<B: MediaBackend> Controller<B> {
     /// now, or held for the coalescing window (a held request of the same
     /// setting is replaced, and answered `Ok`).
     fn set_request(&mut self, camera: &str, req: SetRequest, reply: Reply, now: Instant) {
+        if let SetRequest::Setting { id, value } = &req
+            && mic::is_mic(id)
+        {
+            self.set_mic_setting(id, value.as_ref(), reply, now);
+            return;
+        }
         if let SetRequest::Setting { id, value } = &req
             && effects::is_global(id)
         {
@@ -6007,9 +6106,14 @@ impl<B: MediaBackend> Controller<B> {
     /// `GetModules`.
     fn module_list(&self) -> obc_ipc::ModuleList {
         obc_ipc::ModuleList {
-            serial: self.modules.serial(),
-            modules: self.modules.info(),
+            serial: self.modules_serial(),
+            modules: mic::merge_modules(self.modules.info(), &self.mic_catalogue.modules),
         }
+    }
+
+    /// `ModulesSerial`: the registry's, moved on by the worker's modules.
+    fn modules_serial(&self) -> u32 {
+        self.modules.serial().wrapping_add(self.mic_serial)
     }
 
     /// The stages in force, each with its slot and whether the order with
@@ -6204,6 +6308,13 @@ impl<B: MediaBackend> Controller<B> {
             }
         };
         info!("configuration: {what}");
+        // An audio module enabled: the worker's crash ledger forgives it,
+        // after the snapshot that enables it.
+        let audio_reset = forgive.filter(|id| {
+            mic::merge_modules(self.modules.info(), &self.mic_catalogue.modules)
+                .iter()
+                .any(|m| m.id == *id && m.kind == "audio-filter")
+        });
         let config = in_force(&set.config, &self.runtime);
         // The registry's refusal for the module the request named (as
         // `SetModuleEnabled` answered before; a module that fails to open
@@ -6244,6 +6355,9 @@ impl<B: MediaBackend> Controller<B> {
             }
         }
         self.reconcile(now);
+        if let (Some(id), Some(link)) = (audio_reset, &self.mic) {
+            let _ = link.send(MicRequest::ResetModule(id.to_string()));
+        }
         match refused {
             Some(e) => Err(IpcError::Failed(e)),
             None => Ok(()),
@@ -6998,6 +7112,275 @@ impl<B: MediaBackend> Controller<B> {
     }
 }
 
+// ---- the microphone (crate::mic) ----
+
+impl<B: MediaBackend> Controller<B> {
+    /// The `mic.*` groups of the tree now.
+    fn mic_groups(&self) -> Vec<obc_ipc::SettingsGroup> {
+        mic::groups(&mic::Inputs {
+            config: &self.config,
+            config_set: &self.config_set,
+            runtime: &self.runtime,
+            catalogue: &self.mic_catalogue,
+            host_on: self.mic_status.state != obc_ipc::MIC_OFF,
+        })
+    }
+
+    /// The microphone group a `group:` reset scope names: `mic.<id>`
+    /// always names the microphone's group `<id>`; a bare `<id>` names it
+    /// only when no camera or global group (the video effects, which
+    /// modules extend) has that id, so that a camera's or video module's
+    /// group never resets the microphone's by mistake.
+    fn mic_group_of(&self, scope: &str) -> Option<String> {
+        let groups = self.mic_groups();
+        let is_mic = |id: &str| groups.iter().any(|g| g.id == id);
+        if let Some(id) = scope.strip_prefix(obc_ipc::settings::MIC_ID_PREFIX) {
+            return is_mic(id).then(|| id.to_string());
+        }
+        let taken = catalogue::GROUPS.iter().any(|g| g.id == scope)
+            || self.global_settings().iter().any(|e| e.group == scope);
+        (!taken && is_mic(scope)).then(|| scope.to_string())
+    }
+
+    /// The camera session runs (for `gpu_policy = "with-camera"`).
+    fn camera_active(&self) -> bool {
+        matches!(self.state(), State::Starting | State::Active)
+    }
+
+    /// Sends the audio settings snapshot to the agent when it changed.
+    fn push_mic_snapshot(&mut self) {
+        let Some(link) = &self.mic else {
+            return;
+        };
+        let text = mic::snapshot(&self.config, &self.runtime, self.camera_active());
+        if self.mic_sent.as_deref() != Some(text.as_str()) {
+            if link.send(MicRequest::Snapshot(text.clone())).is_err() {
+                debug!("the microphone's agent is gone");
+            }
+            self.mic_sent = Some(text);
+        }
+        // The device chosen changed while ours is the default: the capture
+        // side follows at once (the record of the previous default stays).
+        let device = self.config.mic.device.clone();
+        let changed = self
+            .mic_device_sent
+            .as_deref()
+            .is_some_and(|sent| sent != device);
+        if changed && self.runtime.mic_previous_default.is_some() {
+            let target = match device.as_str() {
+                obc_core::config::MIC_DEVICE_DEFAULT => String::new(),
+                d => d.to_string(),
+            };
+            if link.send(MicRequest::Repin { target }).is_err() {
+                debug!("the microphone's agent is gone");
+            }
+        }
+        self.mic_device_sent = Some(device);
+    }
+
+    /// `SetSetting` of a `mic.*` id: checked against the tree as it is
+    /// now; a config key written as `SetConfig` writes it, a module's value
+    /// kept in the state file (and the snapshot sent), an action handed to
+    /// the agent, which answers.
+    fn set_mic_setting(
+        &mut self,
+        id: &str,
+        value: Option<&SettingValue>,
+        reply: Reply,
+        now: Instant,
+    ) {
+        let groups = self.mic_groups();
+        let write = match mic::check_input(
+            &groups,
+            &self.mic_catalogue.devices,
+            &self.config.mic.device,
+            id,
+            value,
+        ) {
+            Ok(w) => w,
+            Err(r) => {
+                let _ = reply.send(Err(refusal_error(r)));
+                return;
+            }
+        };
+        let res = match write {
+            mic::Write::Config(key, value) => {
+                self.settle_pending_move(now);
+                let facts = self.schema_facts();
+                let res = config_d::set_config(&self.paths.config, &facts, key, &value);
+                self.config_written(&format!("{key} set"), res, None, now)
+            }
+            mic::Write::Value(id, v) => {
+                info!("{id} set");
+                self.runtime.settings.insert(id, v);
+                let res = self.settings_saved(now);
+                self.publish();
+                res
+            }
+            mic::Write::MakeDefault => {
+                let target = match self.config.mic.device.as_str() {
+                    obc_core::config::MIC_DEVICE_DEFAULT => String::new(),
+                    d => d.to_string(),
+                };
+                return self.ask_mic(reply, |reply| MicRequest::MakeDefault { target, reply });
+            }
+            mic::Write::RestoreDefault => {
+                let previous = self
+                    .runtime
+                    .mic_previous_default
+                    .clone()
+                    .unwrap_or_default();
+                return self.ask_mic(reply, |reply| MicRequest::RestoreDefault {
+                    previous,
+                    reply,
+                });
+            }
+        };
+        let _ = reply.send(res);
+    }
+
+    /// Hands a request with its reply to the agent; without one, the reply
+    /// is `Unavailable`.
+    fn ask_mic(&self, reply: Reply, make: impl FnOnce(Reply) -> MicRequest) {
+        match &self.mic {
+            Some(link) => {
+                if let Err(e) = link.send(make(reply)) {
+                    let reply = match e.0 {
+                        MicRequest::Host { reply, .. }
+                        | MicRequest::MakeDefault { reply, .. }
+                        | MicRequest::RestoreDefault { reply, .. } => reply,
+                        _ => return,
+                    };
+                    let _ = reply.send(Err(IpcError::Unavailable(
+                        "the microphone cannot be controlled: the daemon is stopping".into(),
+                    )));
+                }
+            }
+            None => {
+                let _ = reply.send(Err(IpcError::Unavailable(
+                    "this daemon does not control the microphone".into(),
+                )));
+            }
+        }
+    }
+
+    /// `SetMicHost(on)`: handed to the agent, with the default microphone
+    /// recorded now to restore on the way off (the agent restores in any
+    /// case, with the one it knows when this is empty: a "Use as default
+    /// microphone" queued before may complete first).
+    fn set_mic_host(&mut self, on: bool, reply: Reply) {
+        let previous = (!on)
+            .then(|| self.runtime.mic_previous_default.clone())
+            .flatten();
+        self.ask_mic(reply, |reply| MicRequest::Host {
+            on,
+            previous,
+            reply,
+        });
+    }
+
+    /// Records the default microphone made by the agent (`None`: the
+    /// Omarchy Broadcast Mic is no longer the default) and saves it; a
+    /// save that fails is logged and answered.
+    fn remember_default(&mut self, previous: Option<String>) -> Result<(), IpcError> {
+        if self.runtime.mic_previous_default == previous {
+            return Ok(());
+        }
+        self.runtime.mic_previous_default = previous;
+        self.save_state()
+    }
+
+    /// What the agent found or did.
+    fn mic_event(&mut self, event: MicEvent) {
+        match event {
+            MicEvent::Status(status) => {
+                self.mic_status = status;
+                self.publish();
+            }
+            MicEvent::Catalogue(catalogue) => {
+                if catalogue.modules != self.mic_catalogue.modules {
+                    self.mic_serial = self.mic_serial.wrapping_add(1);
+                }
+                self.mic_catalogue = catalogue;
+                self.publish();
+            }
+            MicEvent::DefaultMade { previous, reply } => {
+                let res = self.remember_default(Some(previous));
+                self.publish();
+                let _ = reply.send(res);
+            }
+            MicEvent::DefaultRestored { result, reply } => {
+                let res = result.and_then(|()| self.remember_default(None));
+                self.publish();
+                let _ = reply.send(res);
+            }
+            MicEvent::HostDone {
+                restored,
+                result,
+                reply,
+            } => {
+                let saved = if restored {
+                    self.remember_default(None)
+                } else {
+                    Ok(())
+                };
+                self.publish();
+                let _ = reply.send(result.and(saved));
+            }
+        }
+    }
+
+    /// `ResetSettings` of a microphone group or setting: a module's values
+    /// forgotten (their defaults apply), the daemon's own settings removed
+    /// from the managed file (an earlier file's value, or the default,
+    /// applies).
+    fn reset_mic(&mut self, what: &ResetWhat, now: Instant) -> Result<(), IpcError> {
+        let groups = self.mic_groups();
+        let (keys, ids): (Vec<&'static str>, Vec<String>) = match what {
+            ResetWhat::Group(g) if g == mic::INPUT => (mic::INPUT_KEYS.to_vec(), Vec::new()),
+            ResetWhat::Group(g) => match mic::module_group_ids(&groups, g) {
+                Some(ids) => (Vec::new(), ids),
+                None => {
+                    return Err(IpcError::UnknownSetting(format!("there is no group {g:?}")));
+                }
+            },
+            ResetWhat::Setting(id) => match mic::config_key_of(id) {
+                Some(key) => (vec![key], Vec::new()),
+                None if mic::find(&groups, id).is_some()
+                    || self.runtime.settings.contains_key(id) =>
+                {
+                    (Vec::new(), vec![id.clone()])
+                }
+                None => {
+                    return Err(IpcError::UnknownSetting(format!(
+                        "there is no setting {id:?}"
+                    )));
+                }
+            },
+            _ => return Err(IpcError::UnknownSetting("not a microphone setting".into())),
+        };
+        let mut res = Ok(());
+        if !ids.is_empty() {
+            let mut changed = false;
+            for id in &ids {
+                changed |= self.runtime.settings.remove(id).is_some();
+            }
+            info!("{} reset", ids.join(", "));
+            if changed {
+                res = self.settings_saved(now);
+            }
+            self.publish();
+        }
+        for key in keys {
+            self.settle_pending_move(now);
+            let facts = self.schema_facts();
+            let r = config_d::reset_config(&self.paths.config, &facts, key);
+            res = res.and(self.config_written(&format!("{key} reset"), r, None, now));
+        }
+        res
+    }
+}
+
 /// The configuration in force for the loaded `config`: the state file's
 /// module choices laid over it while they wait to move into the managed
 /// file ([`migrate_choices`] could not write it, or the set did not load),
@@ -7111,6 +7494,8 @@ fn choices_only(old: &Config, new: &Config) -> bool {
     n.modules.profile = old.modules.profile;
     n.modules.pin = old.modules.pin.clone();
     n.modules.order = old.modules.order.clone();
+    // The microphone's keys go to the audio worker, not to the camera.
+    n.mic = old.mic.clone();
     n == *old
 }
 

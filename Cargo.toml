@@ -15,17 +15,22 @@ members = [
     "crates/obc-module-host",
     "crates/obc-module-maxine",
     "crates/obc-module-maxine-ar",
+    "crates/obc-audio",
+    "crates/obc-mic-shim",
+    "crates/omarchy-broadcast-audiod",
+    "crates/obc-module-voice-cpu",
 ]
 # Built on its own, as a module outside the workspace would be (CI builds it).
 exclude = [
     "examples/module-hello",
+    "examples/module-hello-audio",
     # The test module of obc-module-host, built by its tests.
     "crates/obc-module-host/tests/fixtures/module-fixture",
 ]
 
 [workspace.package]
 # Also the pkgver= of packaging/arch/PKGBUILD: bump both; CI checks they match.
-version = "0.28.1"
+version = "0.29.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Raul Dias"]
@@ -42,6 +47,7 @@ gst-obc = { path = "crates/gst-obc" }
 obc-module-abi = { path = "crates/obc-module-abi" }
 obc-module-sdk = { path = "crates/obc-module-sdk" }
 obc-module-host = { path = "crates/obc-module-host" }
+obc-audio = { path = "crates/obc-audio" }
 gst = { package = "gstreamer", version = "0.25", features = ["v1_28"] }
 gst-video = { package = "gstreamer-video", version = "0.25", features = ["v1_28"] }
 gst-app = { package = "gstreamer-app", version = "0.25", features = ["v1_28"] }

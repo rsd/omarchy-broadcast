@@ -262,12 +262,15 @@ fn load(vt: &obc_module_vtable, instance: *mut obc_instance) -> (obc_status, obc
 
 #[test]
 fn abi_version_is_packed() {
-    assert_eq!(obc_module_abi_version(), obc_module_abi_pack(1, 1));
+    assert_eq!(obc_module_abi_version(), obc_module_abi_pack(1, 2));
     assert_eq!(obc_module_abi_major(obc_module_abi_version()), 1);
     let vt = vtable();
     assert_eq!(vt.struct_size as usize, size_of::<obc_module_vtable>());
     assert_eq!(vt.abi_version, OBC_MODULE_ABI_VERSION);
     assert!(vt.instance_park.is_some() && vt.destroy.is_some());
+    // The plain form of the macro: a video module, without the audio
+    // entries of ABI 1.2.
+    assert!(vt.audio_instance_load.is_none() && vt.audio_instance_process.is_none());
 }
 
 #[test]

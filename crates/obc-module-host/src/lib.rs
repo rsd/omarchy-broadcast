@@ -11,6 +11,9 @@
 //!   anything else of it runs ([`library::Library::open`]);
 //! * [`module`]: the safe handles over a loaded module ([`Module`]: probe,
 //!   settings, instances) and its instances ([`module::Instance`]);
+//! * [`audio`]: the instances of an `audio-filter` module
+//!   ([`AudioInstance`], ABI 1.2), which only a host of
+//!   [`LoadKinds::Audio`] (the audio worker) opens;
 //! * [`settings`]: the typed, validated model of a module's settings
 //!   description;
 //! * [`adapters`]: [`ModuleBackendFactory`], [`ModuleEnhancerFactory`] and
@@ -34,6 +37,7 @@
 //! ledger keeps such a module from doing it more than twice in a row.
 
 pub mod adapters;
+pub mod audio;
 pub mod crash;
 pub mod discovery;
 pub mod library;
@@ -46,10 +50,14 @@ pub use adapters::{
     BACKGROUND_BLUR_STRENGTH, BACKGROUND_MODE, ModuleBackendFactory, ModuleChainFactory,
     ModuleEnhancerFactory,
 };
+pub use audio::{AudioBlock, AudioInstance, AudioLoadOutcome, AudioSpec, common_block_formats};
 pub use crash::{CrashLedger, REASON_CRASHED};
 pub use discovery::{Discovery, ModuleEntry, default_dirs, scan};
 pub use library::{LogLevel, LogSink, stderr_log};
-pub use manifest::{Device, Format, Frames, Manifest, ModuleKind, Requirement, Slot, StageDecl};
+pub use manifest::{
+    AudioDecl, Device, Format, Frames, LoadKinds, Manifest, ModuleKind, Requirement, Slot,
+    StageDecl,
+};
 pub use module::{Instance, Module, ModuleError, Status};
 pub use registry::{
     ModuleInfo, ModuleStatus, Profile, Provider, Registry, StageInfo, StageResolution,

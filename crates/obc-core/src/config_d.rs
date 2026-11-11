@@ -763,8 +763,9 @@ fn load_for_write(config_toml: &Path) -> Result<ConfigSet, WriteError> {
 
 /// Writes `bytes` to `path` atomically: a temporary hidden file in the same
 /// directory (created when needed), flushed, renamed over `path`, then the
-/// directory flushed.
-fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// directory flushed. Also the daemon's writer of the audio settings
+/// snapshot (`audio-settings.json`).
+pub fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let dir = config_dir(path);
     // The directories created here, each flushed into its parent.
     let mut created = Vec::new();

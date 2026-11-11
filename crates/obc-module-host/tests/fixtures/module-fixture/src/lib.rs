@@ -32,7 +32,41 @@
 //! version and its vtable say 1.0), as a module built before ABI 1.1 is.
 //!
 //! The process log line has `repeat=<bool>`, whether the frame carried
-//! `OBC_FRAME_FLAG_REPEAT`; the frame is processed either way.
+//! `OBC_FRAME_FLAG_REPEAT`; the frame is processed either way. With
+//! `abi-1-1` it is exported as one of ABI 1.1, its vtable of the size of
+//! 1.1 (without the audio entries of 1.2).
+//!
+//! With `audio` it is an `audio-filter` module of ABI 1.2 instead, for the
+//! audio worker's tests. Its probe reports the audio stages `mic-denoise`,
+//! `mic-dereverb` and `mic-enhance` (the configuration's `unavailable` and
+//! `omit` apply), its settings are a `fixture` group of the `mic` surface,
+//! and its instances, loaded with `audio_instance_load`:
+//!
+//! * copy the input to the output, channel by channel (an output channel
+//!   past the input's last takes the last), times the gain of
+//!   `mic-enhance` when it is in the chain: `mic-enhance.gain_pct`
+//!   (load-time and live, an int percentage, 100 by default);
+//! * report a voice probability of 0.5 while `mic-denoise` is in the
+//!   chain, none otherwise, and a latency of 10 samples per stage (the
+//!   audio is not delayed);
+//! * take the proposed block size, or the load-time
+//!   `mic-denoise.frame_samples` (an int) when given;
+//! * fail the load as a stage failure of `<stage>` with the load-time
+//!   `<stage>.fail_load`, or with `OBC_FIXTURE_AUDIO_FAIL_LOAD=<stage>`
+//!   (`chain`: a failure of the whole chain, `OBC_ERR_FAILED`);
+//! * fail a block as a stage failure of `<stage>`, which is dropped, with
+//!   the live `<stage>.fail`; with `OBC_FIXTURE_AUDIO_FAIL_AT=<n>`, block
+//!   `n` fails as a stage failure of the chain's first stage;
+//! * panic on the live `mic-denoise.panic`;
+//! * abort the process on block `n` with `OBC_FIXTURE_AUDIO_ABORT_AT=<n>`
+//!   (a crash, for the worker's crash ledger);
+//! * sleep `OBC_FIXTURE_AUDIO_SLEEP_MS` milliseconds in every block (an
+//!   overrun, for the worker's fail-open counter).
+//!
+//! Blocks count from 1 since the last successful audio load; the
+//! environment is read at each audio load. Every audio load is logged at
+//! info level (`fixture-audio-load ...`) and every block at debug level
+//! (`fixture-audio-process n=<block> ...`).
 
 #[cfg(not(any(
     feature = "abi-major-2",
@@ -46,7 +80,12 @@ mod module {
         serde_json,
     };
 
+    #[cfg(not(feature = "audio"))]
     const STAGES: [&str; 5] = ["alpha", "beta", "gamma", "background", "enhance"];
+    #[cfg(feature = "audio")]
+    const STAGES: [&str; 3] = ["mic-denoise", "mic-dereverb", "mic-enhance"];
+    /// The stages a video load accepts.
+    const VIDEO_STAGES: [&str; 5] = ["alpha", "beta", "gamma", "background", "enhance"];
 
     /// The inits since the library was first loaded.
     static INITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -141,6 +180,24 @@ mod module {
 
         fn settings(&self) -> SettingsDescription {
             log::info!("fixture-settings");
+            if cfg!(feature = "audio") {
+                return SettingsDescription::new().group(
+                    Group::new("fixture", "Fixture")
+                        .surface("mic")
+                        .setting(
+                            Setting::bool("mic.fixture.denoise", "Denoise", true)
+                                .stage("mic-denoise")
+                                .role(Role::Enable),
+                        )
+                        .setting(
+                            Setting::int("mic.fixture.gain", "Gain", 0, 400, 25, 100)
+                                .unit("%")
+                                .stage("mic-enhance")
+                                .key("gain_pct")
+                                .apply(Apply::Live),
+                        ),
+                );
+            }
             let mut g = Group::new("fixture", "Fixture")
                 .setting(
                     Setting::bool("effect.fixture.alpha", "Alpha", false)
@@ -172,6 +229,20 @@ mod module {
     pub struct FixtureInstance {
         stages: Vec<String>,
         step: u8,
+        /// The audio side.
+        #[cfg_attr(not(feature = "audio"), allow(dead_code))]
+        audio: AudioState,
+    }
+
+    /// What an audio load set.
+    #[derive(Default)]
+    #[cfg_attr(not(feature = "audio"), allow(dead_code))]
+    struct AudioState {
+        gain: f32,
+        blocks: u64,
+        abort_at: Option<u64>,
+        fail_at: Option<u64>,
+        sleep_ms: u64,
     }
 
     impl Instance for FixtureInstance {
@@ -203,7 +274,7 @@ mod module {
                 params(req.params()),
                 bg.unwrap_or_else(|| "none".into()),
             );
-            if let Some(other) = req.stages().iter().find(|s| !STAGES.contains(s)) {
+            if let Some(other) = req.stages().iter().find(|s| !VIDEO_STAGES.contains(s)) {
                 return Err(Error::invalid(format!("unknown stage {other:?}")));
             }
             let told = |stage: &str, key: &str| {
@@ -288,6 +359,7 @@ mod module {
 
         fn unload(&mut self) {
             self.stages.clear();
+            self.audio = AudioState::default();
         }
 
         fn timings(&self) -> Vec<(String, f32)> {
@@ -305,21 +377,167 @@ mod module {
         }
     }
 
-    #[cfg(not(feature = "abi-1-0"))]
+    #[cfg(feature = "audio")]
+    mod audio {
+        use super::{AudioState, FixtureInstance, params};
+        use obc_module_sdk::{
+            AudioBuffer, AudioBufferMut, AudioInstance, AudioLoadReport, AudioRequest, Error,
+            Param, log,
+        };
+
+        fn env_number(name: &str) -> Option<u64> {
+            std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
+        }
+
+        fn gain_of(v: Option<obc_module_sdk::Value<'_>>) -> Option<f32> {
+            v.and_then(|v| v.as_int())
+                .map(|p| p.clamp(0, 1000) as f32 / 100.0)
+        }
+
+        impl AudioInstance for FixtureInstance {
+            fn load_audio(&mut self, req: &AudioRequest<'_>) -> Result<AudioLoadReport, Error> {
+                log::info!(
+                    "fixture-audio-load stages={} rate={} in={} out={} frame={} params={}",
+                    req.stages().join(","),
+                    req.sample_rate(),
+                    req.channels_in(),
+                    req.channels_out(),
+                    req.frame_samples(),
+                    params(req.params()),
+                );
+                if let Some(other) = req.stages().iter().find(|s| !super::STAGES.contains(s)) {
+                    return Err(Error::invalid(format!("unknown stage {other:?}")));
+                }
+                let env_fail = std::env::var("OBC_FIXTURE_AUDIO_FAIL_LOAD").ok();
+                if env_fail.as_deref() == Some("chain") {
+                    return Err(Error::failed("the audio chain was told to fail its load"));
+                }
+                for stage in req.stages() {
+                    let told = req.param(stage, "fail_load").and_then(|v| v.as_bool())
+                        == Some(true)
+                        || env_fail.as_deref() == Some(*stage);
+                    if told {
+                        return Err(Error::stage(
+                            *stage,
+                            format!("{stage} was told to fail its load"),
+                        ));
+                    }
+                }
+                let frame_samples = req
+                    .param("mic-denoise", "frame_samples")
+                    .and_then(|v| v.as_int())
+                    .map(|n| n as u32);
+                let reused = !self.stages.is_empty();
+                self.stages = req.stages().iter().map(|s| s.to_string()).collect();
+                self.audio = AudioState {
+                    gain: gain_of(req.param("mic-enhance", "gain_pct")).unwrap_or(1.0),
+                    blocks: 0,
+                    abort_at: env_number("OBC_FIXTURE_AUDIO_ABORT_AT"),
+                    fail_at: env_number("OBC_FIXTURE_AUDIO_FAIL_AT"),
+                    sleep_ms: env_number("OBC_FIXTURE_AUDIO_SLEEP_MS").unwrap_or(0),
+                };
+                Ok(AudioLoadReport {
+                    load_ms: 2.0,
+                    warmup_ms: None,
+                    frame_samples,
+                    latency_samples: 10 * req.stages().len() as u32,
+                    reused_model: reused,
+                })
+            }
+
+            fn process_audio(
+                &mut self,
+                input: &AudioBuffer<'_>,
+                output: &mut AudioBufferMut<'_>,
+                live: &[Param<'_>],
+            ) -> Result<(), Error> {
+                let a = &mut self.audio;
+                a.blocks += 1;
+                log::debug!(
+                    "fixture-audio-process n={} flags={} pts={:?} live={}",
+                    a.blocks,
+                    input.flags(),
+                    input.pts_ns(),
+                    params(live)
+                );
+                if a.abort_at == Some(a.blocks) {
+                    log::error!("fixture-audio-abort n={}", a.blocks);
+                    std::process::abort();
+                }
+                if a.sleep_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(a.sleep_ms));
+                }
+                if Param::find(live, "mic-denoise", "panic").and_then(|v| v.as_bool()) == Some(true)
+                {
+                    panic!("mic-denoise was told to panic");
+                }
+                let failing = self
+                    .stages
+                    .iter()
+                    .find(|s| Param::find(live, s, "fail").and_then(|v| v.as_bool()) == Some(true))
+                    .cloned()
+                    .or_else(|| {
+                        (a.fail_at == Some(a.blocks))
+                            .then(|| self.stages.first().cloned())
+                            .flatten()
+                    });
+                if let Some(stage) = failing {
+                    self.stages.retain(|s| *s != stage);
+                    return Err(Error::stage(
+                        stage.clone(),
+                        format!("{stage} was told to fail"),
+                    ));
+                }
+                if let Some(g) = gain_of(Param::find(live, "mic-enhance", "gain_pct")) {
+                    a.gain = g;
+                }
+                let gain = if self.stages.iter().any(|s| s == "mic-enhance") {
+                    a.gain
+                } else {
+                    1.0
+                };
+                let last = input.channels() - 1;
+                for c in 0..output.channels() {
+                    let src = input.plane(c.min(last)).unwrap_or_default();
+                    if let Some(dst) = output.plane_mut(c) {
+                        for (d, s) in dst.iter_mut().zip(src) {
+                            *d = s * gain;
+                        }
+                    }
+                }
+                let denoise = self.stages.iter().any(|s| s == "mic-denoise");
+                output.set_voice_probability(denoise.then_some(0.5));
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(not(any(feature = "abi-1-0", feature = "abi-1-1", feature = "audio")))]
     obc_module_sdk::export_module!(Fixture);
 
-    /// The exports of `export_module!`, claiming ABI 1.0.
-    #[cfg(feature = "abi-1-0")]
+    #[cfg(feature = "audio")]
+    obc_module_sdk::export_module!(Fixture, audio);
+
+    /// The exports of `export_module!`, claiming ABI 1.0 (or 1.1), with a
+    /// vtable of that version's size: it ends before the audio entries of
+    /// 1.2.
+    #[cfg(any(feature = "abi-1-0", feature = "abi-1-1"))]
     mod abi_1_0 {
         use obc_module_sdk::abi::{obc_host, obc_module_abi_pack, obc_module_vtable};
 
-        /// ABI 1.0.
+        /// The minor version claimed.
+        const MINOR: u16 = if cfg!(feature = "abi-1-0") { 0 } else { 1 };
+
+        /// The size of the vtable of ABI 1.0 and 1.1.
+        const SIZE: u32 = std::mem::offset_of!(obc_module_vtable, audio_instance_load) as u32;
+
+        /// ABI 1.0 or 1.1.
         #[unsafe(no_mangle)]
         pub extern "C" fn obc_module_abi_version() -> u32 {
-            obc_module_abi_pack(1, 0)
+            obc_module_abi_pack(1, MINOR)
         }
 
-        /// The SDK's entry point, with a vtable that says 1.0.
+        /// The SDK's entry point, with a vtable that says 1.0 or 1.1.
         ///
         /// # Safety
         ///
@@ -330,7 +548,8 @@ mod module {
         ) -> *const obc_module_vtable {
             static VTABLE: obc_module_vtable = {
                 let mut v = obc_module_sdk::ffi::vtable::<super::Fixture>();
-                v.abi_version = obc_module_abi_pack(1, 0);
+                v.abi_version = obc_module_abi_pack(1, MINOR);
+                v.struct_size = SIZE;
                 v
             };
             // SAFETY: the caller's contract is the one `ffi::entry` needs.

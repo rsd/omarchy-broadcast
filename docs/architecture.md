@@ -281,7 +281,7 @@ flowchart LR
     PIPE -. "instance_load / instance_process<br/>through the C ABI" .-> LIB
 ```
 
-1. At start (and on `SIGHUP` or `ReloadConfig`) the daemon scans the manifest directories. No library is opened. A manifest that cannot be read, a kind that is not supported yet and an ABI major version that does not match each become an entry with a reason.
+1. At start (and on `SIGHUP` or `ReloadConfig`) the daemon scans the manifest directories. No library is opened. A manifest that cannot be read, a kind that is not supported yet (`analyser`) and an ABI major version that does not match each become an entry with a reason. An `audio-filter` module is listed too, from its manifest, and its library is never opened: the audio worker opens it ([The microphone](#the-microphone-host-and-worker)).
 2. Each enabled module is opened: `dlopen` with `RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE`, the ABI version checked before anything else of the library runs, `init` with the module's `[module."<id>"]` table, `probe` (filesystem only, so the GPU is never woken), and `describe_settings`. The crash ledger counts the starts that find a module's code running. A reload keeps a module open when its manifest, library file and configuration are unchanged.
 3. When a camera session starts, the controller makes the **plan**: for each stage, the provider by pin and profile, and where it runs. The plan, the modules whose code the session runs, is fixed for the session, and a change of modules, order, profile or pin (written to `config.d/50-panel.toml`) applies at the next start, with two exceptions that keep a feed: a stage whose module is disabled or can no longer run it is dropped from the running session at once (and comes back when the module can run it again), and when a selected stage (the background effect among them) has no module in the session able to run it but one provides it now, the controller restarts the session once with a new plan (an output built without a module cannot take it later). A profile, pin or order change alone never does either. A selected stage with no provider at session start is dropped the same way, never a fault; `Warning` names every dropped stage, with its module and reason, and a provided effect that cannot run.
 4. **Placement.** The provider of `background` runs the whole cut-out family inside `obceffect`: its stages in `pre-matte`, `matte` and `post-matte` (denoise, the cut-out with the blur or replacement, relighting for Maxine), on one CUDA stream, as before the module system. The provider of `enhance` runs it in the ingest tail (`obcenhance`). The stages of any other module run in `obcmodule` elements, one chain per module and side, in the stage order: those in `pre-matte` before `obceffect`, the others (`post-matte`, `post-composite`) after it. A stage that needs the cut-out but is provided by another module than the `background` provider is unavailable, with a reason (the cut-out of one module cannot yet feed another's stage). The exception to the order is `frame-generation`: the daemon plans it as a chain of its own, `<module>-gen`, after the effect element and every other chain, in no order and with no switch, and turns it on only while the output rate is twice the camera's ([modules.md](modules.md#the-frame-generation-stage)); on a fresh tick it outputs the picture between the previous frame and this one, on a repeat tick the held frame, so the output is one output tick later.
@@ -290,6 +290,57 @@ flowchart LR
 7. The settings tree is built from the enabled modules' descriptions, with the daemon's own `background` group (the compositor's mode and blur strength) shown while a module provides `background`. Writes reach the stage as load-time or per-frame parameters according to each setting's `apply`.
 
 The calling rules of the ABI are in [modules.md](modules.md#threading-and-cuda-rules): the host serialises the calls on a module and on each instance, calls on one instance come from the streaming thread, and the host makes the stream's CUDA context current around every call on a CUDA chain.
+
+### The microphone: host and worker
+
+The microphone is the one part of the system that is not in the daemon. Three processes share it ([ADR-0029](adr/0029-audio-modules-mic-host-and-worker.md)); the user's side is in [setup/microphone.md](setup/microphone.md).
+
+```mermaid
+flowchart LR
+    HW[("Hardware<br/>microphone")]
+    APPS["Applications<br/>(Omarchy Broadcast Mic)"]
+    WP["WirePlumber<br/>default metadata,<br/>restore-stream"]
+
+    subgraph HOST["omarchy-broadcast-mic.service (pipewire -c, filter-chain)"]
+        CAP["capture side<br/>(passive, pinned)"] --> SHIM["forwarding plugin<br/>real-time safe,<br/>no vendor code"] --> PLAY["playback side<br/>node omarchy-broadcast-mic"]
+    end
+
+    subgraph WORK["omarchy-broadcast-audiod.service (socket- and bus-activated, exits when idle)"]
+        PT["processing thread<br/>one 10 ms block at a time"]
+        CH["chain: audio modules<br/>in-process, C ABI 1.2<br/>fail open"]
+        PWC["PipeWire control<br/>devices, default source,<br/>pinning, consumers, latency"]
+        PT --> CH
+    end
+
+    subgraph DAE["omarchy-broadcastd"]
+        FAC["facade: mic.* settings,<br/>Mic* properties, SetMicHost"]
+    end
+
+    HW --> CAP
+    PLAY --> APPS
+    SHIM <-- "memfd rings + wake socket<br/>audio.sock<br/>(raw audio if the result is not there)" --> PT
+    FAC -- "ApplySnapshot, GetModules,<br/>GetSettings, MakeDefault<br/>(internal bus interface)" --> WORK
+    FAC -- "audio-settings.json<br/>(read by the worker at start)" --> PT
+    FAC -- "enable and start / stop and<br/>disable the unit (systemd)" --> HOST
+    PWC -- "default.configured.audio.source,<br/>target.object, ProcessLatency" --> WP
+    WP -.-> CAP
+```
+
+1. **The mic host** is a `pipewire -c` process with one filter-chain node, the forwarding plugin. The plugin splits the audio into blocks of 480 samples (10 ms), writes each into a shared-memory ring and plays back the worker's block for it a constant delay later. When that block is not there (no worker, a crash, a stall, a load in progress) it plays the microphone's own audio, delayed the same, with a 5 ms crossfade at each switch. It never loads a module, a model or a vendor library, so the node survives anything that happens to the effects.
+2. **The worker** (`omarchy-broadcast-audiod`) is started by a connection to its socket or a call to its internal D-Bus name, exits after `idle_exit_s` of silence, and is a unit of its own: the daemon's restart does not stop it. It discovers modules from the same `modules.d` directories as the daemon and opens only the `audio-filter` ones, runs the chain on its processing thread (not real time, deadline one block), fails a stage or a group open when it errors or overruns, aborts itself if a module hangs (systemd restarts it, the ledger counts a strike), and is the only process with PipeWire code for the microphone: the device list, the default source, the pin of the capture side, the consumers (a level meter is not one) and the node's latency.
+3. **The daemon** is the façade. It describes the `mic.*` settings (its own `mic.input` group, then the groups the worker reports), publishes the `Mic*` properties and the `MicStats` signal, turns the mic host unit on and off (`SetMicHost`), and is the single writer: every change is a snapshot that it writes atomically to `audio-settings.json` and pushes to the worker if it runs. It never opens an audio library and has no PipeWire code for the microphone. It calls the worker with `NO_AUTO_START` for everything but what only the worker knows, so it never keeps an idle worker alive.
+
+What each failure does:
+
+| What stops | What the applications get |
+|---|---|
+| The daemon | Nothing changes: the worker reads the snapshot file it wrote |
+| The worker, or a module (crash, hang, overrun) | The microphone's raw audio within one block, processed again after the restart |
+| Processing switched off (`mic.input.enabled`) | Raw audio, never silence |
+| A GPU or a GPU module | The stage runs on a CPU module when one offers it, else raw audio |
+| The mic host (`mic off`) | The previous default microphone is restored first, so the applications move to a live microphone |
+
+The ADR 0014 filter-chain units are a separate, simpler way to the same node name and are mutually exclusive with the mic host.
 
 ## 3. Lifecycle
 

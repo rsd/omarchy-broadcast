@@ -6,6 +6,7 @@ mod bus;
 mod config;
 mod human;
 mod json;
+mod mic;
 mod model;
 mod modules;
 mod out;
@@ -45,11 +46,11 @@ Exit status:
 
 `status`, `cameras`, `watch`, `preview`, `effect` without an effect, `controls` and
 `settings` without a subcommand, `modules list`, `modules info`, `modules profile` without
-a profile, `order show` and `config show|get|files` never start the daemon. `on`, `off`,
-`camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`,
-`settings reset`, `modules enable|disable|profile <profile>|pin`, `order set|reset` and
-`config set|reset` may start it through D-Bus activation when its activation file is
-installed.
+a profile, `order show`, `config show|get|files` and `mic` or `mic status` never start the
+daemon. `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls
+reset`, `settings set`, `settings reset`, `modules enable|disable|profile <profile>|pin`,
+`order set|reset`, `config set|reset` and `mic on|off|device|default|restore-default` may
+start it through D-Bus activation when its activation file is installed.
 
 `--json` output is documented in docs/cli-json.md; the D-Bus interface in docs/dbus-api.md.";
 
@@ -223,6 +224,23 @@ enum Command {
         #[command(subcommand)]
         action: Option<config::ConfigAction>,
     },
+    /// Show or control the Omarchy Broadcast Mic, the microphone with
+    /// noise and room echo removal.
+    ///
+    /// Without a subcommand, shows its state (`off` while it is turned
+    /// off, `passthrough` while nothing is processed, `starting`, `active`
+    /// or `error`). Examples: `omarchy-broadcast mic on`,
+    /// `omarchy-broadcast mic device alsa_input.usb-...`,
+    /// `omarchy-broadcast mic default`.
+    #[command(args_conflicts_with_subcommands = true)]
+    Mic {
+        /// Print one JSON object (`"type":"mic"`); only without a
+        /// subcommand (as `mic status --json`).
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<mic::MicAction>,
+    },
     /// Follow state changes and stats until interrupted.
     Watch {
         /// Print one JSON object per line (NDJSON).
@@ -313,16 +331,21 @@ fn parse_setting_id(s: &str) -> Result<String, String> {
 /// A group id: lowercase letters, digits and `_`, at most
 /// [`json::MAX_GROUP_ID_BYTES`] bytes.
 fn parse_group_id(s: &str) -> Result<String, String> {
-    let ok = !s.is_empty()
-        && s.len() <= json::MAX_GROUP_ID_BYTES
-        && s.bytes()
+    // `mic.<id>` names a microphone group (revision 13) unambiguously.
+    let bare = s
+        .strip_prefix(obc_ipc::settings::MIC_ID_PREFIX)
+        .unwrap_or(s);
+    let ok = !bare.is_empty()
+        && bare.len() <= json::MAX_GROUP_ID_BYTES
+        && bare
+            .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
     if ok {
         Ok(s.to_string())
     } else {
         Err(format!(
             "not a group id (lowercase letters, digits and `_`, such as white_balance, at most \
-             {} bytes)",
+             {} bytes; mic.<id> for a microphone group)",
             json::MAX_GROUP_ID_BYTES
         ))
     }
@@ -939,6 +962,7 @@ async fn run(job: Job) -> u8 {
             let show = config::ConfigAction::Show { json: *json };
             config::run(action.as_ref().unwrap_or(&show)).await
         }
+        Job::Command(Command::Mic { json, action }) => mic::run(action.as_ref(), *json).await,
         Job::Command(Command::Controls { json, action: None }) => show_controls(*json).await,
         Job::Command(Command::Controls {
             action: Some(action),

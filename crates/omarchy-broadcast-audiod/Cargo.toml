@@ -1,0 +1,32 @@
+[package]
+name = "omarchy-broadcast-audiod"
+description = "The audio worker of Omarchy Broadcast: hosts audio modules for the Omarchy Broadcast Mic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+obc-audio = { workspace = true }
+obc-module-host = { workspace = true }
+# The audio buffer flags of the module ABI.
+obc-module-abi = { workspace = true }
+# Stage ids and parameter values of the module host.
+obc-backend = { workspace = true }
+# The configuration (module directories, module tables) and the XDG paths.
+obc-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The internal control interface (br.com.dias.OmarchyBroadcast.AudioWorker1).
+zbus = { workspace = true }
+tokio = { workspace = true }
+libc = { workspace = true }
+# The PipeWire side (default source, capture pinning, consumers, latency).
+pipewire = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

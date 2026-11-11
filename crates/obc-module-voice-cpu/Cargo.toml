@@ -1,0 +1,33 @@
+[package]
+name = "obc-module-voice-cpu"
+description = "Microphone noise removal on the CPU (DeepFilterNet, RNNoise) as an omarchy-broadcast audio module"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+# The module library the audio worker loads: libobc_module_voice_cpu.so.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+obc-module-sdk = { workspace = true }
+# DeepFilterNet 3 (libDF, MIT OR Apache-2.0) with its model embedded, run by
+# tract (no ONNX Runtime). crates.io has only 0.2.5 (2022, no tract, no
+# model), so this is the upstream repository at tag v0.5.6, pinned by the
+# tag's commit.
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "978576aa8400552a4ce9730838c635aa30db5e61", default-features = false, features = ["tract", "default-model"] }
+# The array type of libDF's frame API (the version libDF uses).
+ndarray = { version = "0.15", default-features = false }
+# RNNoise in pure Rust (BSD-3-Clause), its model built in.
+nnnoiseless = { version = "0.5.2", default-features = false }
+
+[dev-dependencies]
+obc-module-host = { workspace = true }
+obc-backend = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

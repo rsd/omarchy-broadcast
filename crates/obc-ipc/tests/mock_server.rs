@@ -23,6 +23,7 @@ use obc_ipc::{
     SETTINGS_REVISION, Setting, SettingChange, SettingKind, SettingValue, SettingsGroup,
     SettingsTree, Snapshot, State, Stats, WARNING_REVISION,
 };
+use obc_ipc::{MIC_REVISION, MicStatus};
 use obc_ipc::{ModuleInfo, ModuleList, StageInfo};
 use zbus::message::Flags;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
@@ -65,6 +66,19 @@ struct Mock {
     /// The config schema (revision 10), with `ConfigSerial`.
     config: Vec<ConfigGroup>,
     config_serial: u32,
+    /// The microphone (revision 13).
+    mic: MicStatus,
+}
+
+/// The mock's microphone while its host runs.
+fn mic_on() -> MicStatus {
+    MicStatus {
+        state: "active".into(),
+        consumers: 2,
+        provider: "mic-denoise: br.com.dias.voice-cpu".into(),
+        latency_ms: 20.0,
+        error: String::new(),
+    }
 }
 
 const OVERRIDDEN: &str = "output.aspect";
@@ -216,6 +230,7 @@ fn mock_settings() -> Vec<SettingsGroup> {
                     },
                 ),
             ],
+            surface: None,
         },
         SettingsGroup {
             id: "white_balance".into(),
@@ -231,6 +246,7 @@ fn mock_settings() -> Vec<SettingsGroup> {
                 ),
                 temperature,
             ],
+            surface: None,
         },
         SettingsGroup {
             id: "exposure".into(),
@@ -247,6 +263,7 @@ fn mock_settings() -> Vec<SettingsGroup> {
                     value: "aperture_priority".into(),
                 },
             )],
+            surface: None,
         },
         SettingsGroup {
             id: "focus".into(),
@@ -256,6 +273,7 @@ fn mock_settings() -> Vec<SettingsGroup> {
                 "Recentre pan",
                 SettingKind::Action,
             )],
+            surface: None,
         },
     ]
 }
@@ -334,6 +352,7 @@ impl Mock {
             profile: "quality".into(),
             config: mock_config(),
             config_serial: 1,
+            mic: mic_on(),
         }
     }
 
@@ -894,6 +913,64 @@ impl Mock {
     #[zbus(signal)]
     async fn preview_frame(emitter: &SignalEmitter<'_>, seq: u32) -> zbus::Result<()>;
 
+    /// On: the mock's microphone as [`mic_on`], and one `MicStats`; off:
+    /// `off`. Refused while the mock's microphone is in `error` (as the
+    /// daemon refuses with an ADR 0014 unit running).
+    async fn set_mic_host(
+        &mut self,
+        on: bool,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        if self.mic.state == "error" {
+            return Err(IpcError::Unavailable(
+                "omarchy-broadcast-mic@rnnoise.service is running: stop it first".into(),
+            ));
+        }
+        self.mic = if on { mic_on() } else { MicStatus::default() };
+        self.mic_state_changed(&emitter).await?;
+        self.mic_consumers_changed(&emitter).await?;
+        self.mic_provider_changed(&emitter).await?;
+        self.mic_latency_ms_changed(&emitter).await?;
+        self.mic_error_changed(&emitter).await?;
+        if on {
+            Mock::mic_stats(&emitter, 3, 1, 0.75).await?;
+        }
+        Ok(())
+    }
+
+    #[zbus(signal)]
+    async fn mic_stats(
+        emitter: &SignalEmitter<'_>,
+        overruns: u32,
+        misses: u32,
+        voice: f64,
+    ) -> zbus::Result<()>;
+
+    #[zbus(property)]
+    fn mic_state(&self) -> String {
+        self.mic.state.clone()
+    }
+
+    #[zbus(property)]
+    fn mic_consumers(&self) -> u32 {
+        self.mic.consumers
+    }
+
+    #[zbus(property)]
+    fn mic_provider(&self) -> String {
+        self.mic.provider.clone()
+    }
+
+    #[zbus(property)]
+    fn mic_latency_ms(&self) -> f64 {
+        self.mic.latency_ms
+    }
+
+    #[zbus(property)]
+    fn mic_error(&self) -> String {
+        self.mic.error.clone()
+    }
+
     #[zbus(property)]
     fn state(&self) -> State {
         self.state
@@ -1191,12 +1268,14 @@ async fn proxy_reads_every_property() {
             modules_serial: Some(1),
             backend_profile: Some("quality".into()),
             config_serial: Some(1),
+            mic: Some(mic_on()),
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 12);
+    assert_eq!(INTERFACE_REVISION, 13);
+    assert_eq!(INTERFACE_REVISION, MIC_REVISION);
     assert_eq!(WARNING_REVISION, 11);
-    assert_eq!(INTERFACE_REVISION, obc_ipc::MODES_REVISION);
+    assert_eq!(obc_ipc::MODES_REVISION, 12);
     assert_eq!(CONFIG_REVISION, 10);
     assert_eq!(proxy.inner().interface().as_str(), INTERFACE);
 }
@@ -1229,6 +1308,7 @@ async fn a_revision_1_daemon_reads_with_defaults_for_the_newer_properties() {
         assert_eq!(snap.settings_revision, None);
         assert_eq!(snap.settings_schema_serial, None);
         assert_eq!(snap.warning, "");
+        assert_eq!(snap.mic, None);
     }
     let no_autostart = within("snapshot", Snapshot::fetch_no_autostart(&client))
         .await
@@ -2339,4 +2419,90 @@ async fn the_config_methods_have_their_signatures() {
     ] {
         assert!(xml.contains(needle), "{needle} not in {xml}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_microphone_properties_method_and_signal() {
+    let (server, client) = pair().await;
+    let proxy = OmarchyBroadcastProxy::builder(&client)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .unwrap();
+    let mut stats = proxy.receive_mic_stats().await.unwrap();
+    let props = fdo::PropertiesProxy::builder(&client)
+        .destination(obc_ipc::BUS_NAME)
+        .path(OBJECT_PATH)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .unwrap();
+    let mut changed = props.receive_properties_changed().await.unwrap();
+
+    let before = within("snapshot", Snapshot::fetch(&proxy)).await.unwrap();
+    assert_eq!(before.mic, Some(mic_on()));
+
+    within("SetMicHost", proxy.set_mic_host(false))
+        .await
+        .unwrap();
+    // The changes, applied one by one as a client follows them.
+    let mut followed = before.clone();
+    while followed.mic != Some(MicStatus::default()) {
+        let signal = within("PropertiesChanged", changed.next())
+            .await
+            .expect("PropertiesChanged ended");
+        let args = signal.args().unwrap();
+        for (k, v) in args.changed_properties() {
+            followed.apply_property(k, v).unwrap();
+        }
+    }
+    let after = within("snapshot", Snapshot::fetch(&proxy)).await.unwrap();
+    assert_eq!(after.mic, Some(MicStatus::default()));
+    assert_eq!(after.mic.as_ref().unwrap().state, obc_ipc::MIC_OFF);
+
+    within("SetMicHost", proxy.set_mic_host(true))
+        .await
+        .unwrap();
+    let signal = within("MicStats", stats.next())
+        .await
+        .expect("MicStats ended");
+    let args = signal.args().unwrap();
+    assert_eq!((args.overruns, args.misses, args.voice), (3, 1, 0.75));
+
+    // A refusal comes back as its error.
+    let iface: InterfaceRef<Mock> = server.object_server().interface(OBJECT_PATH).await.unwrap();
+    iface.get_mut().await.mic.state = "error".into();
+    match within("SetMicHost", proxy.set_mic_host(true)).await {
+        Err(IpcError::Unavailable(m)) => assert!(m.contains("@rnnoise"), "{m}"),
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_group_surface_round_trips_and_is_left_out_when_absent() {
+    let mut group = SettingsGroup {
+        id: "noise".into(),
+        label: "Noise removal".into(),
+        settings: vec![setting(
+            "mic.noise.enabled",
+            "Noise removal",
+            SettingKind::Bool {
+                default: true,
+                value: true,
+            },
+        )],
+        surface: Some(obc_ipc::settings::SURFACE_MIC.into()),
+    };
+    let dict = group.to_dict();
+    assert_eq!(
+        SettingsGroup::from_dict(&dict).unwrap().surface.as_deref(),
+        Some("mic")
+    );
+    group.surface = None;
+    let dict = group.to_dict();
+    assert!(!dict.contains_key("surface"));
+    assert_eq!(SettingsGroup::from_dict(&dict).unwrap(), group);
+    assert!(obc_ipc::settings::is_global_id("mic.noise.enabled"));
+    assert!(obc_ipc::settings::is_global_id("effect.video.denoise"));
+    assert!(!obc_ipc::settings::is_global_id("camera.image.brightness"));
 }

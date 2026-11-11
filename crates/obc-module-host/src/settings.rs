@@ -18,11 +18,17 @@
 //! malformed or breaks a rule is dropped with a log line, never the module
 //! or the rest of the description. The rules:
 //!
-//! * a group id is one setting-id segment (`a-z`, `0-9`, `_`), not
-//!   [`CORE_GROUP`] (the daemon's own background group), and unique; its
-//!   label is non-empty and at most [`LABEL_MAX`] bytes;
-//! * a setting id is `effect.<group>.<name>`, `<group>` its group's id, a
-//!   valid setting id ([`valid_setting_id`]), unique in the description;
+//! * a group id is one setting-id segment (`a-z`, `0-9`, `_`), not the
+//!   daemon's own group of the module's kind ([`CORE_GROUP`], the
+//!   background group, for a video module; [`AUDIO_CORE_GROUP`], the
+//!   microphone input group, for an audio module), and unique; its label
+//!   is non-empty and at most [`LABEL_MAX`] bytes; its optional `surface`
+//!   (where the clients show it: `mic` for the microphone's settings) is
+//!   one segment too, or it is left out with a log line;
+//! * a setting id is `effect.<group>.<name>` for a video module and
+//!   `mic.<group>.<name>` for an audio module ([`id_prefix`]), `<group>`
+//!   its group's id, a valid setting id ([`valid_setting_id`]), unique in
+//!   the description;
 //! * a label is non-empty and at most [`LABEL_MAX`] bytes;
 //! * `int`: `min <= default <= max`, `step > 0`; `enum`: 1 to
 //!   [`MAX_OPTIONS`] options of unique values and valid labels, the default
@@ -39,6 +45,8 @@ use std::collections::BTreeSet;
 use obc_backend::StageId;
 use serde::Deserialize;
 
+use crate::manifest::ModuleKind;
+
 /// The most settings a module describes.
 pub const MAX_SETTINGS: usize = 64;
 /// The most options of an `enum` setting.
@@ -47,11 +55,38 @@ pub const MAX_OPTIONS: usize = 16;
 pub const LABEL_MAX: usize = 48;
 /// The longest setting id, in bytes.
 pub const SETTING_ID_MAX: usize = 48;
-/// The prefix of every module setting id.
+/// The prefix of every video module setting id.
 pub const ID_PREFIX: &str = "effect.";
+/// The prefix of every audio module setting id (ABI 1.2).
+pub const AUDIO_ID_PREFIX: &str = "mic.";
 /// The group the daemon describes itself (the `background` stage's mode
-/// and blur strength): a module's group of this id is dropped.
+/// and blur strength): a video module's group of this id is dropped.
 pub const CORE_GROUP: &str = "background";
+/// The microphone group the daemon describes itself (`mic.input`: the
+/// processing switch and the input device): an audio module's group of
+/// this id is dropped.
+pub const AUDIO_CORE_GROUP: &str = "input";
+/// The `surface` of the microphone's settings groups.
+pub const SURFACE_MIC: &str = "mic";
+
+/// The prefix of the setting ids of a module of `kind`: [`AUDIO_ID_PREFIX`]
+/// for an audio filter, [`ID_PREFIX`] for the others.
+pub fn id_prefix(kind: ModuleKind) -> &'static str {
+    if kind.is_audio() {
+        AUDIO_ID_PREFIX
+    } else {
+        ID_PREFIX
+    }
+}
+
+/// The daemon's own group of the settings of a module of `kind`.
+pub fn core_group(kind: ModuleKind) -> &'static str {
+    if kind.is_audio() {
+        AUDIO_CORE_GROUP
+    } else {
+        CORE_GROUP
+    }
+}
 
 /// Whether `id` is a valid setting id, as the daemon's settings channel
 /// says: `^[a-z0-9]+(\.[a-z0-9_]+){1,3}$`, at most [`SETTING_ID_MAX`]
@@ -128,6 +163,10 @@ pub struct SettingsGroup {
     pub id: String,
     /// The label shown.
     pub label: String,
+    /// Where the clients show the group, when the module said
+    /// ([`SURFACE_MIC`]: with the microphone's settings); `None`: with the
+    /// effects.
+    pub surface: Option<String>,
     /// Its settings; a group whose settings were all dropped is kept,
     /// empty.
     pub settings: Vec<SettingDesc>,
@@ -224,7 +263,8 @@ pub struct Condition {
 /// One setting.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingDesc {
-    /// The id, `effect.<group>.<name>`.
+    /// The id, `effect.<group>.<name>` (`mic.<group>.<name>` for an audio
+    /// module).
     pub id: String,
     /// The label.
     pub label: String,
@@ -256,6 +296,8 @@ struct RawDoc {
 struct RawGroup {
     id: String,
     label: String,
+    #[serde(default)]
+    surface: Option<serde_json::Value>,
     #[serde(default)]
     settings: Vec<serde_json::Value>,
 }
@@ -299,9 +341,14 @@ fn need<T>(v: Option<T>, setting: &str, key: &str) -> Result<T, String> {
 }
 
 impl RawSetting {
-    fn validate(self, group: &str, stages: &[StageId]) -> Result<SettingDesc, String> {
+    fn validate(
+        self,
+        group: &str,
+        stages: &[StageId],
+        kind: ModuleKind,
+    ) -> Result<SettingDesc, String> {
         let id = self.id;
-        let prefix = format!("{ID_PREFIX}{group}.");
+        let prefix = format!("{}{group}.", id_prefix(kind));
         let name_ok = id.strip_prefix(&prefix).is_some_and(valid_segment);
         if !name_ok || !valid_setting_id(&id) {
             return Err(format!(
@@ -438,15 +485,29 @@ impl RawSetting {
     }
 }
 
-/// Reads and validates the settings description `json` of a module whose
-/// manifest declares `stages`. Each setting or group dropped is reported to
-/// `drop_line` with the reason. Malformed JSON, or a document without a
-/// `groups` list, is an error.
+/// Reads and validates the settings description `json` of a video module
+/// whose manifest declares `stages` ([`parse_settings_for`] of
+/// [`ModuleKind::VideoStage`]).
 pub fn parse_settings(
     json: &str,
     stages: &[StageId],
+    drop_line: impl FnMut(String),
+) -> Result<SettingsDescription, String> {
+    parse_settings_for(json, stages, ModuleKind::VideoStage, drop_line)
+}
+
+/// Reads and validates the settings description `json` of a module of
+/// `kind` whose manifest declares `stages`. Each setting or group dropped
+/// (and each `surface` left out) is reported to `drop_line` with the
+/// reason. Malformed JSON, or a document without a `groups` list, is an
+/// error.
+pub fn parse_settings_for(
+    json: &str,
+    stages: &[StageId],
+    kind: ModuleKind,
     mut drop_line: impl FnMut(String),
 ) -> Result<SettingsDescription, String> {
+    let core = core_group(kind);
     let doc: RawDoc = serde_json::from_str(json)
         .map_err(|e| format!("the settings description is malformed: {e}"))?;
     let mut groups: Vec<SettingsGroup> = Vec::new();
@@ -467,9 +528,9 @@ pub fn parse_settings(
             ));
             continue;
         }
-        if group.id == CORE_GROUP {
+        if group.id == core {
             drop_line(format!(
-                "the settings group {CORE_GROUP} was dropped: the daemon describes it"
+                "the settings group {core} was dropped: the daemon describes it"
             ));
             continue;
         }
@@ -484,11 +545,23 @@ pub fn parse_settings(
             drop_line(format!("the settings group {} was dropped: {e}", group.id));
             continue;
         }
+        let surface = match group.surface {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) if valid_segment(&s) => Some(s),
+            Some(other) => {
+                drop_line(format!(
+                    "the surface {other} of the settings group {} was left out: not a valid \
+                     surface",
+                    group.id
+                ));
+                None
+            }
+        };
         let mut settings = Vec::new();
         for raw in group.settings {
             let parsed = serde_json::from_value::<RawSetting>(raw)
                 .map_err(|e| format!("a setting of the group {} is malformed: {e}", group.id))
-                .and_then(|s| s.validate(&group.id, stages));
+                .and_then(|s| s.validate(&group.id, stages, kind));
             match parsed {
                 Err(e) => drop_line(format!("a setting was dropped: {e}")),
                 Ok(s) if ids.contains(&s.id) => {
@@ -510,6 +583,7 @@ pub fn parse_settings(
         groups.push(SettingsGroup {
             id: group.id,
             label: group.label,
+            surface,
             settings,
         });
     }
@@ -664,6 +738,56 @@ mod tests {
         assert_eq!(d.groups[0].label, "Video");
         assert_eq!(dropped.len(), 5, "{dropped:#?}");
         assert!(dropped[0].contains("the daemon describes it"));
+    }
+
+    #[test]
+    fn an_audio_module_describes_mic_settings_with_a_surface() {
+        let stages = [StageId::new("mic-denoise").unwrap()];
+        let doc = json!({"groups":[
+            {"id":"noise","label":"Noise removal","surface":"mic","settings":[
+                {"id":"mic.noise.enabled","label":"Noise removal","type":"bool","default":true,
+                 "stage":"mic-denoise","role":"enable"},
+                {"id":"mic.noise.strength","label":"Strength","type":"int","min":0,"max":100,
+                 "step":5,"default":100,"stage":"mic-denoise","key":"strength","apply":"live"},
+                {"id":"effect.noise.x","label":"Video id","type":"bool","default":true}]},
+            {"id":"input","label":"Input","settings":[]},
+            {"id":"echo","label":"Echo","surface":"Not ok","settings":[]},
+            {"id":"plain","label":"Plain","settings":[]},
+        ]});
+        let mut dropped = Vec::new();
+        let d = parse_settings_for(&doc.to_string(), &stages, ModuleKind::AudioFilter, |l| {
+            dropped.push(l)
+        })
+        .unwrap();
+        let ids: Vec<&str> = d.groups.iter().map(|g| g.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["noise", "echo", "plain"],
+            "the daemon's input group is dropped"
+        );
+        assert_eq!(d.groups[0].surface.as_deref(), Some(SURFACE_MIC));
+        assert_eq!(d.groups[1].surface, None, "an invalid surface is left out");
+        assert_eq!(d.groups[2].surface, None);
+        assert_eq!(d.enable_of("mic-denoise").unwrap().id, "mic.noise.enabled");
+        assert_eq!(
+            d.param("mic-denoise", "strength").unwrap().apply,
+            Some(Apply::Live)
+        );
+        assert_eq!(dropped.len(), 3, "{dropped:#?}");
+        assert!(dropped[0].contains("mic.noise.<name>"), "{}", dropped[0]);
+        assert!(dropped[1].contains("the daemon describes it"));
+        assert!(dropped[2].contains("left out"));
+
+        // A video module keeps its prefix, and may carry a surface too.
+        let (d, dropped) = parse(json!({"groups":[{"id":"video","label":"Video",
+            "surface":"mic","settings":[
+            {"id":"mic.video.x","label":"X","type":"bool","default":true},
+            {"id":"effect.video.y","label":"Y","type":"bool","default":true}]}]}));
+        assert_eq!(d.groups[0].settings.len(), 1);
+        assert_eq!(d.groups[0].surface.as_deref(), Some("mic"));
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(id_prefix(ModuleKind::VideoStage), ID_PREFIX);
+        assert_eq!(id_prefix(ModuleKind::AudioFilter), AUDIO_ID_PREFIX);
     }
 
     #[test]

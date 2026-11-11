@@ -1,20 +1,22 @@
 # Writing and installing modules
 
-The effects of omarchy-broadcast are provided by **modules**: a TOML manifest and a shared library that exports a versioned C ABI. The daemon finds the manifests, loads the libraries of the modules that are enabled, and shows the settings each module describes in its clients, with no change to them. This page is the reference for module authors and for people who install modules. The design and the reasons for it are in [ADR-0025](adr/0025-loadable-modules.md); the daemon's side is in [architecture.md](architecture.md#modules), the D-Bus members in [dbus-api.md](dbus-api.md#modules) and the CLI in [cli-json.md](cli-json.md#modules-and-order).
+The effects of omarchy-broadcast are provided by **modules**: a TOML manifest and a shared library that exports a versioned C ABI. The daemon finds the manifests, loads the libraries of the modules that are enabled, and shows the settings each module describes in its clients, with no change to them. This page is the reference for module authors and for people who install modules. The design and the reasons for it are in [ADR-0025](adr/0025-loadable-modules.md), and for the audio kind (the microphone) in [ADR-0029](adr/0029-audio-modules-mic-host-and-worker.md); the daemon's side is in [architecture.md](architecture.md#modules), the D-Bus members in [dbus-api.md](dbus-api.md#modules) and the CLI in [cli-json.md](cli-json.md#modules-and-order).
 
-The module interface is **ABI 1.x (1.1 at present), and it is not yet declared stable**: until it is, it may change in breaking ways, so a module built outside this repository may need rebuilding against the matching SDK or header after an update of omarchy-broadcast. No module outside this repository exists yet, so a promise of stability (when a major version changes, and what a minor version may add) has not been made. The version rules the host enforces are in [The ABI](#the-abi-and-the-sdk), and they are unchanged by this.
+The module interface is **ABI 1.x (1.2 at present), and it is not yet declared stable**: until it is, it may change in breaking ways, so a module built outside this repository may need rebuilding against the matching SDK or header after an update of omarchy-broadcast. No module outside this repository exists yet, so a promise of stability (when a major version changes, and what a minor version may add) has not been made. The version rules the host enforces are in [The ABI](#the-abi-and-the-sdk), and they are unchanged by this.
 
 Where to look:
 
 - the C header, [`crates/obc-module-abi/include/omarchy_broadcast_module.h`](../crates/obc-module-abi/include/omarchy_broadcast_module.h) (installed by the Arch package as `/usr/include/omarchy-broadcast/omarchy_broadcast_module.h`): the ABI, with a comment on every structure, function and constant;
 - the Rust SDK, `crates/obc-module-sdk`: a safe API over the ABI;
 - the example, [`examples/module-hello`](../examples/module-hello/README.md): a complete module, built on its own outside the workspace as a third-party module would be;
+- the audio example, [`examples/module-hello-audio`](../examples/module-hello-audio/README.md): a complete audio module (a gain and an optional test tone for the microphone), built the same way (see [Audio modules](#audio-modules));
 - the Maxine module, `crates/obc-module-maxine`: a module with several stages, a probe of the filesystem, settings and CUDA frames;
-- the Maxine AR module, `crates/obc-module-maxine-ar` ([ADR-0028](adr/0028-maxine-ar-module.md)): a second example, a module with two stages that share one SDK, its own configuration table and a probe that reports each stage's reason separately.
+- the Maxine AR module, `crates/obc-module-maxine-ar` ([ADR-0028](adr/0028-maxine-ar-module.md)): a second example, a module with two stages that share one SDK, its own configuration table and a probe that reports each stage's reason separately;
+- the CPU voice module, `crates/obc-module-voice-cpu`: an audio module with one stage and two engines, which needs no model files.
 
 ## What a module provides
 
-A module provides **stages**. A stage is one step of the video pipeline: noise removal, relighting, the cut-out of the person, a colour tint. A stage is named by an id (`denoise`), sits in a **slot** (where it runs relative to the cut-out), has a **rank** and a **device** (which the daemon uses to choose between modules that provide the same stage), and declares the **frame kinds** and **pixel formats** it takes. A module also describes the **settings** a user can change (a switch for each stage, parameters), in the same self-describing model as the camera's settings, so that the CLI and the bar plugin draw them with no code of their own.
+A module provides **stages**. A stage is one step of the video pipeline (or, for an audio module, of the microphone's: see [Audio modules](#audio-modules)): noise removal, relighting, the cut-out of the person, a colour tint. A stage is named by an id (`denoise`), sits in a **slot** (where it runs relative to the cut-out), has a **rank** and a **device** (which the daemon uses to choose between modules that provide the same stage), and declares the **frame kinds** and **pixel formats** it takes. A module also describes the **settings** a user can change (a switch for each stage, parameters), in the same self-describing model as the camera's settings, so that the CLI and the bar plugin draw them with no code of their own.
 
 Three stage ids have a meaning to the daemon:
 
@@ -77,25 +79,29 @@ Top-level keys:
 | `abi` | yes | The ABI **major** version the module is built for (an integer; `1`). A manifest of another major version is listed with the reason `Built for module ABI N; this daemon supports module ABI 1`, and its library is never opened |
 | `id` | yes | The module's id: reverse-DNS, lower-case letters, digits and hyphens in at least two dot-separated segments (`^[a-z0-9]+(\.[a-z0-9-]+)+$`), at most 64 bytes. Unique: a module with the same id in a later directory replaces it |
 | `name`, `version`, `licence` | yes | Shown in the module list; non-empty text. The `licence` is the module's own (a module can be proprietary or under a licence of its own) |
-| `kind` | yes | `video-stage`. `audio-filter` and `analyser` are reserved: such a module is listed as unavailable ("not supported yet") and never loaded |
+| `kind` | yes | `video-stage` (loaded by the daemon) or `audio-filter` (ABI 1.2: loaded by the audio worker, see [Audio modules](#audio-modules); the daemon lists it and never opens its library). `analyser` is reserved: such a module is listed as unavailable ("not supported yet") and never loaded |
 | `library` | yes | The shared library: an absolute path, or a path relative to the manifest's directory |
 | `description` | no | One line of text |
 | `[requires] hardware` | no | A list of text, informational only: the daemon does not use it, and the probe says what can run |
-| `[[stage]]` | at least one for `video-stage` | One table per stage provided; a stage id twice is an error |
+| `[[stage]]` | at least one for `video-stage` and for `audio-filter` | One table per stage provided; a stage id twice is an error. The keys of a stage depend on the kind (below) |
 
 Keys of a `[[stage]]`:
 
 | Key | Required | Meaning |
 |---|---|---|
-| `id` | yes | The stage id. A lower-case letter followed by up to 31 lower-case letters, digits or `-` (`^[a-z][a-z0-9-]{0,31}$`). Not `status`, `effect`, `reason`, `module`, nor any name ending in `-reason` (those are field names of the daemon's status messages). Stage ids are one namespace across modules: two modules that declare the same id are two providers of that stage |
-| `slot` | yes | Where the stage runs relative to the person's cut-out, in pipeline order: `pre-matte` (on the camera frame, before the cut-out), `matte` (the cut-out itself), `post-matte` (on the person, after the cut-out), `post-composite` (on the finished picture). A stage never comes after a stage of a later slot |
+| `id` | yes | The stage id. A lower-case letter followed by up to 31 lower-case letters, digits or `-` (`^[a-z][a-z0-9-]{0,31}$`). Not `status`, `effect`, `reason`, `module`, nor any name ending in `-reason` (those are field names of the daemon's status messages). Stage ids are one namespace across modules: two modules that declare the same id are two providers of that stage. The ids of an `audio-filter` module must start with `mic-` and those of a `video-stage` module must not (`mic-denoise`, `mic-dereverb` and `mic-enhance` are the ones in use) |
+| `slot` | yes | For a video stage, where the stage runs relative to the person's cut-out, in pipeline order: `pre-matte` (on the camera frame, before the cut-out), `matte` (the cut-out itself), `post-matte` (on the person, after the cut-out), `post-composite` (on the finished picture). A stage never comes after a stage of a later slot. For an audio stage the slots are `clean` (removing what is not the voice: noise, room echo) and then `shape` (working on the voice that is left: enhancement, equalisation); a slot of the other kind is an error |
 | `rank` | yes | A non-negative integer. When several modules provide the same stage, the `quality` profile takes the highest rank |
 | `device` | yes | `nvidia-gpu`, `gpu`, `npu` or `cpu`: what the stage runs on. The `battery` profile prefers an NPU, then the CPU, then a GPU, then an NVIDIA GPU, and then the rank |
 | `position` | no | An integer (default 100). Where the stage prefers to sit within its slot in the default order: lower first, then by stage id |
 | `requires` | no | A list of stage ids and slot names that must come earlier in the order. A slot name (`matte`) is met by any earlier stage of that slot. A requirement that no enabled module offers is not an error of the order; the stage's provider decides whether it can run |
 | `conflicts` | no | A list of stage ids that cannot be active with this one. In this version the field is validated and kept, and the daemon does not act on it |
-| `frames` | yes | The frame kinds the stage takes, in order of preference: `cuda` (device memory) or `host` (system memory). `dmabuf` is reserved in the ABI and accepted in the manifest, and no host offers it |
-| `formats` | yes | The pixel formats the stage takes: `nv12`, `i420`, `bgra`, `rgba` or `rgb-f32-planar` |
+| `frames` | yes | The frame kinds the stage takes, in order of preference: `cuda` (device memory) or `host` (system memory). `dmabuf` is reserved in the ABI and accepted in the manifest, and no host offers it. An audio stage takes `["host"]` only |
+| `formats` | video stages | The pixel formats the stage takes: `nv12`, `i420`, `bgra`, `rgba` or `rgb-f32-planar`. An audio stage has none |
+| `rates`, `frame_samples` | audio stages | The sample rates (`[48000]`) and the block sizes in samples per channel (`[480]`) the stage takes, in order of preference. Not keys of a video stage |
+| `channels` | no (audio stages) | The channels the stage takes, 1 to 8; 1 when not given |
+
+Each kind's keys and vocabularies are checked: a video stage with `rates`, an audio stage with `formats`, a slot or a slot requirement of the other kind, or a stage id that breaks the `mic-` rule makes the manifest invalid, and the module is listed unavailable with the parse error as the reason.
 
 **Provider, order and placement.** The provider of a stage is the module the user pinned, if it can run it, else the best by the profile; the choice is made when the camera starts and never changes while it runs. The stages of all enabled modules have one order, which the user may change within the slots and the `requires` entries (the default is by slot, `position` and id). The provider of `background` runs the whole cut-out family (its stages in `pre-matte`, `matte` and `post-matte`) inside the effect element, so a stage that `requires` the `matte` slot or the `background` stage is run only by that module: if another module provides it, it is unavailable with the reason "Needs the cut-out of the module that provides it". The stages of any other module run in their own element, those in `pre-matte` before the effect element and the others after it. The `enhance` stage runs in the ingest, in a chain of its own.
 
@@ -148,7 +154,8 @@ A module library exports two C symbols:
 
 **Version rules.** The host refuses a library whose major version is not its own, and one built for a **newer minor** version than its own, each with a reason naming both versions; the entry point is not called then. A library built for an older minor version of the same major version loads. A structure that can grow starts with `struct_size`, and a reader reads a field only when it fits in `struct_size`; vtable entries and fields are only ever appended; a vtable at least as large as that of ABI 1.0 is accepted, and an entry past its `struct_size` counts as not set. A boolean crossing the boundary is a `uint8_t`.
 
-**ABI 1.1** adds one thing, `OBC_FRAME_FLAG_REPEAT` (below). The change is additive: a library built for ABI 1.0 loads and runs unchanged, because the host hands a module only the `obc_frame::flags` bits that its ABI version defines, and clears the others on every frame. A module of ABI 1.0 therefore never sees the new flag and processes a repeat as any other frame. The `obc-module-abi` and `obc-module-sdk` crates are 1.1.0.
+**ABI 1.1** adds one thing, `OBC_FRAME_FLAG_REPEAT` (below). The change is additive: a library built for ABI 1.0 loads and runs unchanged, because the host hands a module only the `obc_frame::flags` bits that its ABI version defines, and clears the others on every frame. A module of ABI 1.0 therefore never sees the new flag and processes a repeat as any other frame. 
+**ABI 1.2** adds the audio kind ([Audio modules](#audio-modules)): the structures `obc_audio_request`, `obc_audio_load_report` and `obc_audio_buffer`, the constants `OBC_AUDIO_F32_PLANAR`, `OBC_AUDIO_FLAG_NEW_SOURCE`, `OBC_AUDIO_FLAG_DISCONT` and `OBC_MAX_AUDIO_CHANNELS`, and two vtable entries at the end, `audio_instance_load` and `audio_instance_process`. Nothing existing changes: a library built for ABI 1.0 or 1.1 has a vtable that ends before the new entries, which the host counts as not set, and loads and runs unchanged. The `obc-module-abi` and `obc-module-sdk` crates are 1.2.0.
 
 **Stability.** The version numbers are the host's check, not yet a promise. ABI 1.x may still change in breaking ways, even without a change of the major version, until it is declared stable and its stability promise is stated (see [ADR-0025](adr/0025-loadable-modules.md)). A module built for one release of omarchy-broadcast may therefore need rebuilding, against the `obc-module-sdk` or the header of the matching release, after an update. The checks above are unchanged: a library of another major version, or of a newer minor version, is still refused with its reason.
 
@@ -161,11 +168,13 @@ A module library exports two C symbols:
 | `check(module, stages, n)` | Optional. A deeper check, before a stream that needs the module starts, that the stages can run: it may open the module's own runtime libraries, never touch the GPU. A non-zero status (`OBC_ERR_UNAVAILABLE` for a runtime that is not there) with the reason in `last_error` tells the user before the camera opens |
 | `describe_settings(module, &json)` | The module's settings, below |
 | `instance_create`, `instance_destroy` | An **instance** runs one chain of this module's stages for one stream; all instances are destroyed before the module |
-| `instance_load(instance, request, &report)` | Loads the chain of stages the request names, in order, for one frame geometry (below) |
-| `instance_process(instance, in, out, live, n_live)` | Runs one frame through the loaded chain. `out` equals `in` only for an in-place chain. The per-frame parameters apply from this frame |
+| `instance_load(instance, request, &report)` | Required for a `video-stage` module (an `audio-filter` module sets it to fail with `OBC_ERR_UNSUPPORTED`). Loads the chain of stages the request names, in order, for one frame geometry (below) |
+| `instance_process(instance, in, out, live, n_live)` | Required for a `video-stage` module, likewise. Runs one frame through the loaded chain. `out` equals `in` only for an in-place chain. The per-frame parameters apply from this frame |
 | `instance_reset_temporal(instance, &dropped_json)` | Forget temporal state (a new camera); returns, as a JSON array, the stage ids that could not keep running and were dropped |
 | `instance_unload` | Release what the last load loaded; the instance can be loaded again. Must cope with any failed load |
 | `instance_timings` | Optional: how long each step of the last frame took, for statistics |
+| `audio_instance_load(instance, request, &report)` | ABI 1.2, required for an `audio-filter` module, null for the others. Loads a chain of audio stages for one block format; the report carries the load time, the warm-up, the block size chosen and the chain's algorithmic delay in samples |
+| `audio_instance_process(instance, in, out, live, n_live)` | ABI 1.2, required for an `audio-filter` module. Runs one block of audio through the loaded chain; `out` never overlaps `in`; the module may set the output's `voice_probability` |
 | `instance_park`, `instance_unpark` | Optional hooks for a stream that stops for a while. This version of the daemon does not call them (a session's instances are unloaded when it stops) |
 | `last_error`, `instance_last_error` | The reason of the last failed call; never null |
 | `destroy` | Releases the module object |
@@ -178,7 +187,7 @@ A failing call returns a non-zero status: `OBC_ERR_INVALID` (1), `OBC_ERR_UNSUPP
 
 **Repeats** (ABI 1.1). The output clock emits a frame on every tick of the output rate. When no new camera frame has arrived since the last tick it emits the last one again: a **repeat**. The host marks it with `OBC_FRAME_FLAG_REPEAT` for a module built for ABI 1.1 or later (the Rust SDK: `Frame::is_repeat()`); the frame has the same picture as the previous call's, which that call has processed. A module may use the flag to skip work on a repeat, to answer it from what it keeps, or to tell a repeat from a fresh frame (a frame-generation stage makes a picture from two fresh frames); a module that ignores it processes the repeat as any frame, as a module of ABI 1.0 does. It still writes `output` on a repeat (an in-place chain's frame may be left as it came). In the daemon the flag reaches a module through an `obcmodule` element. The effect element, which runs the stages of the `background` provider, sends its last processed output on a repeat instead of running its chain, and processes the repeat only when it has no valid output to send ([ADR-0027](adr/0027-output-modes-frame-generation-and-privacy-fallback.md)).
 
-**The Rust SDK.** `obc-module-sdk` wraps all of this. A module is a `cdylib` crate that depends on the SDK, implements `Module` (`init`, `probe`, `settings`, optionally `check`, `create_instance`) and `Instance` (`load`, `process`, optionally `reset_temporal`, `unload`, `timings`, `park`, `unpark`; `Frame::is_new_source()` and `Frame::is_repeat()` tell the flags of a frame), and exports it with `obc_module_sdk::export_module!(MyModule);`. The macro defines the two symbols and the vtable. For every call it checks the pointers and the `struct_size` of every structure, converts the C structures to safe views (`Frame`, `ChainRequest`, `Param`), **catches a panic** (it becomes an error that carries the message, and never unwinds into the daemon: do not build a module with `panic = "abort"`) and keeps every string it hands back alive until the next call on the same object. Log lines go to the daemon's log with the `log` module of the SDK. A module outside this repository depends on the SDK through a path or a git dependency, as `examples/module-hello/Cargo.toml` shows for the path form. The example's `Cargo.lock` is committed and CI builds it with `--locked`.
+**The Rust SDK.** `obc-module-sdk` wraps all of this. A module is a `cdylib` crate that depends on the SDK, implements `Module` (`init`, `probe`, `settings`, optionally `check`, `create_instance`) and `Instance` (`unload`; `load` and `process` for video stages, which default to failing with `Unsupported`, so that an audio-only instance writes `no_video_stages!()` instead; optionally `reset_temporal`, `timings`, `park`, `unpark`; `Frame::is_new_source()` and `Frame::is_repeat()` tell the flags of a frame), and exports it with `obc_module_sdk::export_module!(MyModule);`. The macro defines the two symbols and the vtable. For every call it checks the pointers and the `struct_size` of every structure, converts the C structures to safe views (`Frame`, `ChainRequest`, `Param`), **catches a panic** (it becomes an error that carries the message, and never unwinds into the daemon: do not build a module with `panic = "abort"`) and keeps every string it hands back alive until the next call on the same object. Log lines go to the daemon's log with the `log` module of the SDK. An audio module also implements `AudioInstance` and is exported with `obc_module_sdk::export_module!(MyModule, audio);` ([Audio modules](#audio-modules)). A module outside this repository depends on the SDK through a path or a git dependency, as `examples/module-hello/Cargo.toml` shows for the path form. The example's `Cargo.lock` is committed and CI builds it with `--locked`.
 
 A module in another language implements the header directly: export the two symbols, fill in a vtable of `struct_size` bytes with the entries it supports, and follow the rules above and in the header's comments.
 
@@ -196,14 +205,14 @@ A module in another language implements the header directly: export the two symb
    "disabled_reason":"Turn on the warm tint to change this","hint":"slider"}]}]}
 ```
 
-- A **group** has an `id` (one setting-id segment: lower-case letters, digits and `_`; not `background`, which is the daemon's) and a `label`.
-- A **setting** has an `id` of the form `effect.<group id>.<name>` (the grammar `^[a-z0-9]+(\.[a-z0-9_]+){1,3}$`, at most 48 bytes, unique), a `label` (at most 48 bytes), and a `type`: `bool` (`default`), `int` (`min`, `max`, `step`, `default`, optional `unit`), `enum` (`options` as `[value id, label]` pairs, at most 16, and `default`, one of them) or `action` (no value). `hint` (`switch`, `slider`, `segmented`) is a suggestion.
+- A **group** has an `id` (one setting-id segment: lower-case letters, digits and `_`; not `background`, which is the daemon's, and for an audio module not `input`, which is the daemon's microphone group), a `label` and, optionally, a `surface`: where clients show the group. `mic` is the microphone's page (an audio module's groups should carry it); a client that does not know a surface shows the group with the effects, and an invalid one is left out with a log line.
+- A **setting** has an `id` of the form `effect.<group id>.<name>` (`mic.<group id>.<name>` for an audio module, and a setting of the other prefix is dropped; the grammar `^[a-z0-9]+(\.[a-z0-9_]+){1,3}$`, at most 48 bytes, unique), a `label` (at most 48 bytes), and a `type`: `bool` (`default`), `int` (`min`, `max`, `step`, `default`, optional `unit`), `enum` (`options` as `[value id, label]` pairs, at most 16, and `default`, one of them) or `action` (no value). `hint` (`switch`, `slider`, `segmented`) is a suggestion.
 - A setting binds to a stage with `stage`, which must be a stage of the manifest. `"role": "enable"` (a `bool`) is the stage's on/off switch: a stage with no such setting runs whenever it is provided, with one exception: `frame-generation` has no switch and is not given one (a setting with `"role": "enable"` bound to it is left out of the tree), because the daemon decides whether it runs, from the output rate (see [The frame-generation stage](#the-frame-generation-stage)). `"key"` makes the setting a **parameter** of the stage, passed to the module under that key: at load time, in `obc_chain_request`, or per frame, in `instance_process`, as `apply` says. `apply` is `live` (per frame, no reload), `reload` (the default for a bound key; the chain is loaded again, a switch that may reuse models) or `restart` (kept, applied when the camera next starts). A parameter's value arrives as an `obc_value`: a boolean, an integer, or a string (an `enum`'s option id).
 - `enabled_when` is a list of `[setting id, op, value]` conditions (`eq`, `ne`, `in`), all of which must hold for the setting to be enabled, and `disabled_reason` is what to say while one does not. The daemon applies them; a client evaluates nothing.
 - The daemon greys a stage's switch and its parameters, with the stage's reason, while the probe says the stage cannot run ("Not installed").
 - At most 64 settings in all. A setting or a group that is malformed or breaks a rule is dropped with a line in the log, and the module and the rest of its description stay.
 
-The values the user sets are kept by setting id in the state file, and reach the module as parameters. The daemon publishes the settings as `scope` `global` settings of the tree, after the camera's, so that `omarchy-broadcast settings`, `SetSetting` and the bar plugin show and write them.
+The values the user sets are kept by setting id in the state file, and reach the module as parameters (those of an audio module reach the worker in the audio settings snapshot, [ADR-0029](adr/0029-audio-modules-mic-host-and-worker.md)). The daemon publishes the settings as `scope` `global` settings of the tree, after the camera's, so that `omarchy-broadcast settings`, `SetSetting` and the bar plugin show and write them.
 
 ## Threading and CUDA rules
 
@@ -211,6 +220,7 @@ The values the user sets are kept by setting id in the state file, and reach the
 - A string a module returns is owned by the module and stays valid until the next call on the same object.
 - For **CUDA frames** the host makes the context of `obc_cuda.context` current on the calling thread around every instance call, and the module enqueues its work on `obc_cuda.stream` (a null stream with a context is the legacy default stream). **A module never creates a CUDA context of its own, and never makes one current.** The context is the one GStreamer's CUDA elements share ([ADR-0012](adr/0012-video-effects-and-maxine-backend.md)); releasing it at teardown leaves no CUDA context in the process, which is what lets the GPU be parked at idle ([ADR-0017](adr/0017-cuda-checkpoint-parking.md)). Do not initialise CUDA in `init`, `probe` or `check`.
 - A `host` chain gets CUDA frames through a page-locked host copy that the host makes: you declare the memory your stage takes, and the host converts only at the boundary of your chain.
+- The rules of the audio kind differ in three places (the processing thread is not real time, a module may create its own GPU context in its load and unload, and a load, a process and an unload of one instance may run on different threads): see [Audio modules](#audio-modules).
 - A frame is processed in place for an in-place chain; the output clock may push the same frame twice, so the host copies a frame before a stage writes it (and, when a chain fails halfway, restores the input before running again).
 
 ## Failure semantics
@@ -220,23 +230,88 @@ The values the user sets are kept by setting id in the state file, and reach the
 - **A matte never fails open.** A failure of the `background` stage, or of any stage in the `matte` slot, is taken as a failure of the whole chain, and the instance is unloaded, so that no frame runs without its cut-out; the effect then follows `[effect] on_failure` (black by default, which is what the user chose when they asked to hide the room behind them): the feed keeps streaming, its frames black until the effect runs again, and the daemon's `Warning` property says why; the camera is not closed. This governs a module that provides the stage and fails to load or run. When no module provides a selected stage (the module is disabled, disabled by the crash ledger, `unavailable`, or the stage not installed), the host does not run it at all: the stage is dropped, the feed keeps streaming with the stages that still have a provider, and the daemon's `Warning` property names the stage and the module's reason ([dbus-api.md](dbus-api.md#video-effects)). For a stage of your own module that holds once the daemon has read your settings (the `role = "enable"` switch) since it started.
 - **A failed switch keeps the previous chain** when the frames of the request are those of the loaded chain: it keeps running as it was. A failed first load, a failed load at another geometry (a reload) and a load that panicked leave the instance unloaded; the host then calls `instance_unload`, which must be safe after any failure.
 - **A panic** in a module written with the SDK is caught at the boundary and returned as `OBC_ERR_PANIC`; the host unloads the instance.
-- **A crash of native code** (a segmentation fault, an `abort`) takes the daemon down with it: modules run in the daemon's process. The unit's restart and the loopback's timeout frames keep applications that hold the camera alive ([ADR-0022](adr/0022-crash-recovery-for-consumers.md)), and the crash ledger below keeps a module from doing it again and again.
+- **A crash of native code** (a segmentation fault, an `abort`) takes the daemon down with it: modules run in the daemon's process. (An audio module runs in the audio worker, which a crash takes down instead: the microphone then passes the raw audio until the worker is back.) The unit's restart and the loopback's timeout frames keep applications that hold the camera alive ([ADR-0022](adr/0022-crash-recovery-for-consumers.md)), and the crash ledger below keeps a module from doing it again and again.
 
 ## The crash ledger
 
 The daemon keeps a small JSON file, `modules-crash.json`, in its state directory (`$XDG_STATE_HOME/omarchy-broadcast/`). While a module's code runs a pipeline or a probe, the file holds a marker for the module; a clean stop clears it. At each start the daemon counts, per module, the consecutive starts that found its marker (a start that finds none resets the count). A module that was running when the daemon went down **twice in a row** is disabled, with the reason `Disabled after crashing the daemon twice in a row`, until the user enables it again (`omarchy-broadcast modules enable ID`), which forgives it. A session marks only the modules that run in it: the effect module while the background effect is on or one of its stages is requested, the enhancer while enhancement is on, and another module's chain while one of its stages is. A damaged ledger file counts as empty.
+
+The audio worker keeps the same kind of ledger for audio modules in its own file, `audio-modules-crash.json`, in the same directory, so that a strike of an audio module never counts against the camera and the other way round. A call into an audio module that does not return within two seconds aborts the worker, and leaves the marker: it counts as a crash. `omarchy-broadcast modules enable ID` forgives an audio module too.
+
+## Audio modules
+
+ABI 1.2 adds the **`audio-filter` kind**: modules that process the microphone, such as noise removal, room echo removal (dereverberation) and voice enhancement. The design and the reasons for it are in [ADR-0029](adr/0029-audio-modules-mic-host-and-worker.md); for the user's side, see [setup/microphone.md](setup/microphone.md).
+
+**Where an audio module runs.** Not in the daemon. The microphone has a worker process, `omarchy-broadcast-audiod`, which discovers modules in the same `modules.d` directories, opens only the `audio-filter` ones and runs them in-process through the C ABI. The daemon (and `omarchy-broadcast modules`) lists an audio module from its manifest and the worker's report, and never opens its library; the worker never opens a video module. Install an audio module as a video one: its manifest and its library in a `modules.d` directory.
+
+```toml
+abi = 1
+id = "org.example.hello-audio"
+name = "Hello voice"
+version = "0.1.0"
+licence = "MIT OR Apache-2.0"
+kind = "audio-filter"
+library = "libobc_module_hello_audio.so"
+
+[[stage]]
+id = "mic-enhance"
+slot = "shape"
+rank = 100
+device = "cpu"
+frames = ["host"]
+rates = [48000]
+frame_samples = [480]
+channels = 1
+```
+
+**Stages.** An audio stage id starts with `mic-` in both directions: an audio module's ids must, a video module's must not, so the one namespace of stage ids needs no other rule. The ids in use are `mic-denoise`, `mic-dereverb` and `mic-enhance`. The slots are `clean` (taking away what is not the voice) and then `shape` (working on the voice that is left); a stage that needs another to come first lists it in `requires` as for video. `rank`, `device`, the `quality` and `battery` profiles and pins choose the provider of a stage exactly as for video; the order of the audio stages is fixed by slot, `position` and id (there is no `SetStageOrder` for audio). Consecutive stages of one module reach it as one request, so a module that has one model for two stages (noise and room echo together) can run them as one. A stage that declares a `conflicts` entry with another stage that is on turns that one off, unless `[mic] force_conflicts` is set.
+
+**Block format.** `rates`, `frame_samples` and `channels` declare what a stage accepts. The microphone host's format is fixed: mono, 48 kHz, blocks of 480 samples (10 ms). The worker runs a chain only if the stages of its request all list 48000 among their `rates`, 480 among their `frame_samples` and one channel; otherwise the stages fail to load with the reason "The module does not take 48 kHz mono blocks of 480 samples". Declaring other rates or sizes is allowed, but they do not reach the module in this version. Samples are planar 32-bit floats in [-1, 1]; the buffers belong to the host and are valid only during the call.
+
+**Settings.** Ids are `mic.<group>.<name>` and the group carries `surface: "mic"`; the daemon's own group, `mic.input` (the processing switch, the input device and the default-microphone actions), cannot be redeclared. The daemon shows one group per id, the active provider's, so two providers of `mic-denoise` that describe the group `noise` with `mic.noise.enabled` and `mic.noise.strength` share one switch and one strength, and the strength is whatever each engine makes of 0 to 100 %. A setting whose `apply` is `live` reaches the module with each block, one that reloads is a switch of the chain.
+
+**The rules of the kind** (also in the header):
+- `audio_instance_process` runs on the worker's **processing thread, which is not a real-time thread**, with a **deadline of one block** (480 samples are 10 ms). The worker counts the blocks that miss it; after **50 consecutive overruns** it fails the group of the module **open** (its blocks pass through unchanged from then on) and reports it.
+- A module **may create its own GPU context**, but only inside `audio_instance_load` (and release it in `instance_unload`), never in `init`, `probe` or `check`, which must stay cheap and must not wake a suspended GPU. The worker is a process of its own that exits after the microphone has been idle, so the process exit releases what the module held. The video rule (a module never creates a context) does not bind it.
+- **A stage that fails fails open.** Return `OBC_ERR_STAGE` naming the stage (the SDK's `Error::stage`): the module has dropped the stage, the output of that block is not written, and the worker passes the block through the rest of the chain. The audio is never silence because of a stage. There is no matte stage in audio.
+- **Load, process and unload of one instance may run on different threads**, one after the other and never at the same time: the worker loads a chain on a loader thread, runs it on the processing thread and unloads it on a retire thread, so that a switch never holds a block up. State a module keeps per instance must not be thread-local, and instances of one module are loaded, run and unloaded concurrently.
+- A load on a loaded instance that keeps the block format is a **switch** and may reuse its models; the worker warms the new chain up, with the old one still processing, and crossfades one block. A failed switch keeps the previous chain (less the failed stage), a failed first load or reload leaves the instance unloaded.
+- `latency_samples` in the load report is the chain's algorithmic delay in samples, lookahead included: the worker adds it to the transport delay and publishes the total as the microphone's latency. A delay that varies with the settings or the input makes the crossfades between the processed and the raw audio audible, so keep it constant.
+- A block with `OBC_AUDIO_FLAG_NEW_SOURCE` is the first of a new stream (the previous one's state should not carry over); `OBC_AUDIO_FLAG_DISCONT` follows a gap. `voice_probability` in the output buffer (0 to 1, or -1 when the module has none; the SDK's `AudioBufferMut::set_voice_probability`) is optional.
+- A call into a module that does not return within two seconds aborts the worker (the [crash ledger](#the-crash-ledger) counts it as a crash), and an audio module that crashes the worker twice in a row is disabled with the reason.
+
+**The SDK.** An audio module implements `Module`, `Instance` (only `unload`, with the macro `no_video_stages!()` standing for the video entries) and `AudioInstance`:
+
+```rust
+impl obc_module_sdk::Instance for MyInstance {
+    obc_module_sdk::no_video_stages!();
+    fn unload(&mut self) { /* release what the load made */ }
+}
+
+impl obc_module_sdk::AudioInstance for MyInstance {
+    fn load_audio(&mut self, req: &AudioRequest<'_>) -> Result<AudioLoadReport, Error> { /* ... */ }
+    fn process_audio(&mut self, input: &AudioBuffer<'_>, output: &mut AudioBufferMut<'_>,
+                     live: &[Param<'_>]) -> Result<(), Error> { /* write every sample of the output */ }
+}
+
+obc_module_sdk::export_module!(MyModule, audio);
+```
+
+The `audio` form of the macro fills the vtable's audio entries and leaves a video module's alone; a panic is caught at the boundary as for video. [`examples/module-hello-audio`](../examples/module-hello-audio/README.md) is a complete module: one stage, `mic-enhance` in `shape`, a gain and an optional test tone, with its settings in the `mic` group `hello`. It is built outside the workspace (CI builds it with `--locked`), installed in a `modules.d` directory like any module, and its README lists the steps. A module in another language implements the header directly: set `audio_instance_load` and `audio_instance_process`, report ABI 1.2 or later, and let the video entries fail with `OBC_ERR_UNSUPPORTED`.
 
 ## Reserved names, in one place
 
 | Kind | Rule |
 |---|---|
 | Module id | `^[a-z0-9]+(\.[a-z0-9-]+)+$`, at most 64 bytes |
-| Stage id | `^[a-z][a-z0-9-]{0,31}$`; not `status`, `effect`, `reason`, `module`, or any name ending in `-reason`. `background`, `enhance` and `frame-generation` have a meaning to the daemon |
-| Slot | `pre-matte`, `matte`, `post-matte`, `post-composite` |
+| Stage id | `^[a-z][a-z0-9-]{0,31}$`; not `status`, `effect`, `reason`, `module`, or any name ending in `-reason`. `background`, `enhance` and `frame-generation` have a meaning to the daemon. An audio stage id starts with `mic-`, a video stage id does not |
+| Slot | video: `pre-matte`, `matte`, `post-matte`, `post-composite`; audio: `clean`, `shape` |
 | Device | `nvidia-gpu`, `gpu`, `npu`, `cpu` |
-| Frame kind | `cuda`, `host`; `dmabuf` reserved |
+| Frame kind | `cuda`, `host`; `dmabuf` reserved; an audio stage takes `host` |
+| Audio block | `OBC_AUDIO_F32_PLANAR` (planar 32-bit float), at most 8 channels; the stages in use take 48 kHz mono in blocks of 480 samples |
+| Group `surface` | `mic` (the microphone's settings) |
 | Format | `nv12`, `i420`, `bgra`, `rgba`, `rgb-f32-planar` |
-| Setting id | `effect.<group>.<name>`, at most 48 bytes; the group `background` is the daemon's |
+| Setting id | `effect.<group>.<name>` (video) or `mic.<group>.<name>` (audio), at most 48 bytes; the groups `background` (video) and `input` (audio) are the daemon's |
 | Configuration | `[module."<id>"]` for the module's table; `_host` is the daemon's key inside it |
 | Environment | `OBC_MODULE_PATH`: extra manifest directories, colon-separated |
 
@@ -245,4 +320,5 @@ The daemon keeps a small JSON file, `modules-crash.json`, in its state directory
 - Test the logic with the SDK's types, as `examples/module-hello/src/lib.rs` does (its unit tests build frames and call the instance directly), and the exported library through the C ABI: `crates/obc-module-sdk/tests/vtable.rs` calls the vtable as a host does.
 - To run a module in the real host without a camera, `crates/obc-module-host/tests/modules.rs` builds the example and a fixture module, loads them with `dlopen` as the daemon does and drives the registry and the adapters; the fixture's features export a library of another major version, of a newer minor version, and one that refuses the host.
 - The commands, and the tests that need a GPU or the Maxine SDK, are in [testing.md](testing.md#modules).
+- For an audio module, `examples/module-hello-audio` has unit tests of its gain and tone, `crates/obc-module-sdk/tests/audio_vtable.rs` drives an exported audio module through the vtable with raw ABI structures, and `crates/obc-module-host/tests/modules.rs` loads the audio example and an audio fixture through the worker's host.
 - To try a module in the daemon: put its manifest in a directory, run the daemon with `OBC_MODULE_PATH` set to it (`omarchy-broadcast modules` lists what it found, with the reasons), and use `omarchy-broadcast settings` to turn its stage on.

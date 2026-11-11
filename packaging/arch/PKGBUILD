@@ -44,16 +44,33 @@
 # copy the drop-in (docs/setup/maxine.md, section 3):
 #   /usr/share/doc/omarchy-broadcast/examples/systemd/omarchy-broadcastd.service.d/maxine.conf
 #
+# The microphone with audio modules (noise removal and room echo removal) is
+# installed too, and not enabled: the mic host (omarchy-broadcast-mic.service
+# with its PipeWire configuration and the forwarding plugin
+# libomarchy_broadcast_mic.so in /usr/lib/ladspa), the audio worker
+# (/usr/bin/omarchy-broadcast-audiod with its socket unit and D-Bus activation
+# file) and the CPU voice module (DeepFilterNet and RNNoise built into the
+# library, no model files). The host never loads module code; the worker
+# does. Enable it with
+#   systemctl --user enable --now omarchy-broadcast-mic.service
+# It is the alternative to the ADR 0014 units above: run one of them.
+# DeepFilterNet is a git dependency (the upstream repository, pinned by commit
+# in Cargo.lock): `cargo fetch` in prepare() needs network access for it, and
+# the build cannot be done offline without a prepared vendor directory.
+#
 # The C header of the module interface is installed in
 # /usr/include/omarchy-broadcast, for modules built out of tree.
 
 pkgname=omarchy-broadcast-git
 _pkgname=omarchy-broadcast
-pkgver=0.28.1
+pkgver=0.29.0
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API and a CLI'
 arch=('x86_64')
-license=('MIT OR Apache-2.0')
+# The project is MIT OR Apache-2.0. The audio module statically includes
+# nnnoiseless (RNNoise, BSD-3-Clause) and the worker libloading (ISC), whose
+# notices (with DeepFilterNet's) are in THIRD-PARTY-NOTICES.
+license=('MIT OR Apache-2.0' 'BSD-3-Clause' 'ISC')
 depends=(
   'libgcc'                 # libgcc_s.so.1 (split out of gcc-libs on current Arch)
   'glibc'
@@ -80,7 +97,7 @@ checkdepends=(
 optdepends=(
   'omarchy: the Omarchy shell, for the bar widget in the separate omarchy-broadcast-plugin repository'
   'v4l2loopback-utils: runtime-only loopback setup without modprobe.d'
-  'pipewire: the optional PipeWire camera node ([pipewire] enabled in config.toml) and the optional noise-removed microphone'
+  'pipewire: the optional PipeWire camera node ([pipewire] enabled in config.toml), the optional noise-removed microphone (ADR 0014) and the microphone host with its audio worker (omarchy-broadcast-mic.service, omarchy-broadcast-audiod)'
   'noise-suppression-for-voice: RNNoise engine for the noise-removed microphone (default)'
   'deepfilternet-ladspa: DeepFilterNet engine for the noise-removed microphone'
   'maxine-vfx-sdk-local: NVIDIA Maxine video effects (build it from omarchy-nvidia-sdks)'
@@ -118,6 +135,12 @@ build() {
   # The Maxine modules: libraries the daemon loads (no Maxine code is linked
   # into the daemon).
   cargo build --frozen --release -p obc-module-maxine -p obc-module-maxine-ar
+  # The audio worker, the LADSPA forwarding plugin (libomarchy_broadcast_mic.so)
+  # and the CPU voice module. A separate invocation, as for the modules above:
+  # one invocation unifies the features of its packages. The plugin and the
+  # module are libraries the mic host's filter-chain and the worker load.
+  cargo build --frozen --release \
+    -p omarchy-broadcast-audiod -p obc-mic-shim -p obc-module-voice-cpu
 }
 
 check() {
@@ -148,6 +171,20 @@ package() {
   install -Dm644 dist/dbus-1/services/br.com.dias.OmarchyBroadcast.service \
     "$pkgdir/usr/share/dbus-1/services/br.com.dias.OmarchyBroadcast.service"
 
+  # The audio worker, its units and its D-Bus activation file (an internal
+  # interface of the daemon). Its units are inactive: the socket has no
+  # [Install] section, and the worker is started by a connection or a bus call.
+  install -Dm755 -t "$pkgdir/usr/bin" target/release/omarchy-broadcast-audiod
+  install -Dm644 -t "$pkgdir/usr/lib/systemd/user" \
+    dist/systemd/omarchy-broadcast-audiod.service \
+    dist/systemd/omarchy-broadcast-audiod.socket
+  install -Dm644 \
+    dist/dbus-1/services/br.com.dias.OmarchyBroadcast.AudioWorker.service \
+    "$pkgdir/usr/share/dbus-1/services/br.com.dias.OmarchyBroadcast.AudioWorker.service"
+  grep -qx 'ExecStart=/usr/bin/omarchy-broadcast-audiod' \
+    "$pkgdir/usr/lib/systemd/user/omarchy-broadcast-audiod.service" ||
+    { echo 'omarchy-broadcast-audiod.service: ExecStart is not the packaged binary' >&2; return 1; }
+
   # The Maxine module: the library, and its manifest in the system
   # modules.d directory (it names the library by absolute path).
   install -Dm755 -t "$pkgdir/usr/lib/$_pkgname/modules" \
@@ -166,11 +203,26 @@ package() {
     "$pkgdir/usr/lib/$_pkgname/modules.d/maxine-ar.toml" ||
     { echo 'maxine-ar.toml: the library path is not the packaged one' >&2; return 1; }
 
+  # The CPU voice module (audio worker), likewise: the library and its
+  # manifest, which names it by absolute path. The worker loads it; the
+  # daemon lists the manifest and never opens the library.
+  install -Dm755 -t "$pkgdir/usr/lib/$_pkgname/modules" \
+    target/release/libobc_module_voice_cpu.so
+  install -Dm644 -t "$pkgdir/usr/lib/$_pkgname/modules.d" \
+    crates/obc-module-voice-cpu/voice-cpu.toml
+  grep -qx 'library = "/usr/lib/omarchy-broadcast/modules/libobc_module_voice_cpu.so"' \
+    "$pkgdir/usr/lib/$_pkgname/modules.d/voice-cpu.toml" ||
+    { echo 'voice-cpu.toml: the library path is not the packaged one' >&2; return 1; }
+
   # The C header of the module interface, for modules built out of tree.
   install -Dm644 -t "$pkgdir/usr/include/$_pkgname" \
     crates/obc-module-abi/include/omarchy_broadcast_module.h
 
-  install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE-MIT LICENSE-APACHE
+  # The project's licences, and the notices that the code statically linked
+  # into the CPU voice module and the audio worker requires (nnnoiseless,
+  # DeepFilterNet and its model, libloading).
+  install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE-MIT LICENSE-APACHE \
+    dist/licenses/THIRD-PARTY-NOTICES
 
   # Documentation, in the repository's layout so that links between the
   # shipped files resolve. Links to files that are not shipped (decision
@@ -203,4 +255,24 @@ package() {
   chmod 644 "$mic_unit"
   grep -qx 'ExecStart=/usr/bin/pipewire -c /usr/share/omarchy-broadcast/pipewire/omarchy-broadcast-mic-%i.conf' "$mic_unit" ||
     { echo 'omarchy-broadcast-mic@.service: the ExecStart rewrite did not take' >&2; return 1; }
+
+  # The microphone host of the audio modules: its configuration (beside the
+  # ADR 0014 ones; the glob above matches only the "-<engine>.conf" names), the
+  # LADSPA forwarding plugin where the configuration finds it by name
+  # (plugin = "libomarchy_broadcast_mic" is searched in /usr/lib/ladspa), and
+  # the unit, whose ExecStart= names the packaged configuration by absolute
+  # path. Inactive: `systemctl --user enable --now omarchy-broadcast-mic.service`.
+  install -Dm644 dist/pipewire/omarchy-broadcast-mic.conf \
+    "$pkgdir/usr/share/$_pkgname/pipewire/omarchy-broadcast-mic.conf"
+  grep -qx '[[:space:]]*plugin = "libomarchy_broadcast_mic"' \
+    "$pkgdir/usr/share/$_pkgname/pipewire/omarchy-broadcast-mic.conf" ||
+    { echo 'omarchy-broadcast-mic.conf: the plugin line is not the by-name one' >&2; return 1; }
+  install -Dm755 target/release/libomarchy_broadcast_mic.so \
+    "$pkgdir/usr/lib/ladspa/libomarchy_broadcast_mic.so"
+  local host_unit="$pkgdir/usr/lib/systemd/user/omarchy-broadcast-mic.service"
+  sed 's|^ExecStart=/usr/bin/pipewire -c omarchy-broadcast-mic\.conf$|ExecStart=/usr/bin/pipewire -c /usr/share/omarchy-broadcast/pipewire/omarchy-broadcast-mic.conf|' \
+    dist/systemd/omarchy-broadcast-mic.service >"$host_unit"
+  chmod 644 "$host_unit"
+  grep -qx 'ExecStart=/usr/bin/pipewire -c /usr/share/omarchy-broadcast/pipewire/omarchy-broadcast-mic.conf' "$host_unit" ||
+    { echo 'omarchy-broadcast-mic.service: the ExecStart rewrite did not take' >&2; return 1; }
 }

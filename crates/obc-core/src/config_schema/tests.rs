@@ -75,6 +75,7 @@ fn the_core_table_is_well_formed() {
             "lifecycle",
             "effect",
             "pipewire",
+            "mic",
             "modules"
         ]
     );
@@ -100,6 +101,9 @@ fn the_core_table_is_well_formed() {
         "effect.relight_light" => crate::RelightLight::from_str(v).is_ok(),
         "effect.on_failure" => crate::EffectOnFailure::from_str(v).is_ok(),
         "modules.profile" => crate::modules::BackendProfile::from_str(v).is_ok(),
+        "mic.gpu_policy" => {
+            toml::from_str::<crate::config::MicConfig>(&format!("gpu_policy = \"{v}\"")).is_ok()
+        }
         other => panic!("enum {other} not checked"),
     };
     for k in CORE_KEYS {
@@ -132,6 +136,11 @@ fn the_editable_and_apply_table_is_the_decided_one() {
             "effect.on_failure",
             "pipewire.enabled",
             "pipewire.offer_nv12",
+            "mic.enabled",
+            "mic.device",
+            "mic.pipeline_depth",
+            "mic.idle_exit_s",
+            "mic.gpu_policy",
             "modules.profile",
         ]
     );
@@ -145,7 +154,14 @@ fn the_editable_and_apply_table_is_the_decided_one() {
         let live = k.key.starts_with("lifecycle.")
             || (k.key.starts_with("effect.") && k.key != "effect.maxine_root")
             || k.key == "camera.preference"
-            || k.key == "camera.mode";
+            || k.key == "camera.mode"
+            || [
+                "mic.enabled",
+                "mic.device",
+                "mic.idle_exit_s",
+                "mic.force_conflicts",
+            ]
+            .contains(&k.key);
         assert_eq!(k.apply == Apply::Live, live, "{}", k.key);
     }
 }
@@ -484,4 +500,62 @@ fn on_failure_is_written_as_one_of_the_options_the_daemon_computed() {
     }
     // The image row cannot be written: paths are set in the file.
     assert!(!lookup("effect.fallback_image", &facts).unwrap().editable);
+}
+
+#[test]
+fn the_mic_rows_carry_their_values_and_take_writes() {
+    let (_tmp, set) = load(&[(
+        "config.toml",
+        "[mic]\nenabled = false\ngpu_policy = \"never\"\n",
+    )]);
+    let groups = config_schema(&set, &facts());
+    let mic = groups.iter().find(|g| g.id == "mic").unwrap();
+    let ids: Vec<&str> = mic.rows.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "mic.enabled",
+            "mic.device",
+            "mic.pipeline_depth",
+            "mic.idle_exit_s",
+            "mic.gpu_policy",
+            "mic.force_conflicts"
+        ]
+    );
+    assert_eq!(find(&groups, "mic.enabled").value, ConfigValue::Bool(false));
+    assert_eq!(
+        find(&groups, "mic.enabled").default,
+        Some(ConfigValue::Bool(true))
+    );
+    assert_eq!(
+        find(&groups, "mic.device").value,
+        ConfigValue::Str("default".into())
+    );
+    assert_eq!(find(&groups, "mic.idle_exit_s").value, ConfigValue::Int(30));
+    assert_eq!(
+        find(&groups, "mic.force_conflicts").value,
+        ConfigValue::Bool(false)
+    );
+    assert!(!find(&groups, "mic.force_conflicts").editable);
+    assert_eq!(
+        find(&groups, "mic.gpu_policy").value,
+        ConfigValue::Str("never".into())
+    );
+    let info = lookup("mic.gpu_policy", &RegistryFacts::default()).unwrap();
+    assert!(
+        to_toml(
+            "mic.gpu_policy",
+            &info.kind,
+            &ConfigValue::Str("with-camera".into())
+        )
+        .is_ok()
+    );
+    assert!(
+        to_toml(
+            "mic.gpu_policy",
+            &info.kind,
+            &ConfigValue::Str("sometimes".into())
+        )
+        .is_err()
+    );
 }

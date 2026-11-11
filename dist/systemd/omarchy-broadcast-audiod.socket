@@ -1,0 +1,31 @@
+# The socket of the Omarchy Broadcast audio worker. The microphone plugin in
+# the mic host (omarchy-broadcast-mic.service) connects here when audio flows;
+# systemd then starts omarchy-broadcast-audiod.service and hands it this
+# socket. While the worker is not running, the plugin plays the microphone
+# unprocessed, so a connection that finds no worker costs nothing but the
+# unprocessed audio.
+#
+# Started by omarchy-broadcast-mic.service (Wants=) and by the worker unit
+# itself, so it has no [Install] section: there is nothing to enable. The
+# parent directory, $XDG_RUNTIME_DIR/omarchy-broadcast, is created by systemd.
+#
+# It is stopped and restarted with the mic host (PartOf=), so that stopping the
+# microphone also stops its worker. It does not need the mic host: the daemon
+# starts the worker by its D-Bus name (GetDevices, GetSettings) while the mic
+# host is off, and the worker unit then starts this socket.
+#
+# After a crash loop the socket is failed along with the worker; recover with
+#   systemctl --user reset-failed omarchy-broadcast-audiod.service omarchy-broadcast-audiod.socket
+#   systemctl --user start omarchy-broadcast-audiod.socket
+#
+# Logs: `journalctl --user -u omarchy-broadcast-audiod.socket`.
+
+[Unit]
+Description=Omarchy Broadcast audio worker socket
+PartOf=omarchy-broadcast-mic.service
+
+[Socket]
+ListenSequentialPacket=%t/omarchy-broadcast/audio.sock
+# Only the user's own processes connect.
+SocketMode=0600
+DirectoryMode=0700

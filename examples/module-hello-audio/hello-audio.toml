@@ -1,0 +1,23 @@
+# The manifest of the example audio module. Install it with the library:
+# copy this file and libobc_module_hello_audio.so into a modules.d
+# directory, and set `library` to the library's path (absolute, or
+# relative to this file). The audio worker loads it; the video daemon lists
+# it and never opens it.
+abi = 1
+id = "org.example.hello-audio"
+name = "Hello voice"
+version = "0.1.0"
+licence = "MIT OR Apache-2.0"
+kind = "audio-filter"
+library = "target/release/libobc_module_hello_audio.so"
+description = "Example audio module: a gain and an optional test tone, on the CPU"
+
+[[stage]]
+id = "mic-enhance"
+slot = "shape"
+rank = 100
+device = "cpu"
+frames = ["host"]
+rates = [48000]
+frame_samples = [480]
+channels = 1

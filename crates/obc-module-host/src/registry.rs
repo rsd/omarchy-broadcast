@@ -38,6 +38,17 @@
 //! business, not the order's. Conflicts do not constrain the order: they
 //! are checked when stages are turned on ([`Registry::conflict`]).
 //!
+//! # Kinds
+//!
+//! A registry loads the module kinds of its [`LoadKinds`]: the video
+//! daemon's registry ([`Registry::new`], [`LoadKinds::Video`]) offers
+//! video stages only and lists an audio module as unavailable
+//! ([`crate::manifest::REASON_AUDIO_IN_WORKER`]) without ever opening its
+//! library; the audio worker's ([`Registry::with_kinds`] of
+//! [`LoadKinds::Audio`]) offers the `mic-*` stages of audio modules only,
+//! in slot order (`clean`, then `shape`). Rank, pins and profile apply to
+//! both alike.
+//!
 //! Everything here but [`Registry::open`] is pure: the probe results can be
 //! recorded directly ([`Registry::record_probe`]), which the tests do.
 
@@ -51,7 +62,7 @@ use obc_backend::{Availability, StageId};
 
 use crate::discovery::{Discovery, ModuleEntry};
 use crate::library::{LogLevel, LogSink};
-use crate::manifest::{Device, Manifest, Requirement, Slot, StageDecl};
+use crate::manifest::{Device, LoadKinds, Manifest, Requirement, Slot, StageDecl};
 use crate::module::Module;
 
 /// The reason of a module the user disabled.
@@ -164,6 +175,8 @@ enum Opened {
 #[derive(Debug, Clone)]
 struct Record {
     entry: ModuleEntry,
+    /// The kinds of the registry.
+    kinds: LoadKinds,
     disabled: Option<String>,
     module: Option<Module>,
     opened: Opened,
@@ -176,7 +189,7 @@ impl Record {
             .manifest
             .as_ref()
             .ok()
-            .filter(|m| m.unloadable_reason().is_none())
+            .filter(|m| m.unloadable_reason_for(self.kinds).is_none())
     }
 
     /// The manifest of a module whose stages count: enabled and loadable.
@@ -192,7 +205,7 @@ impl Record {
             Ok(m) => m,
             Err(e) => return ModuleStatus::Unavailable(e.clone()),
         };
-        if let Some(r) = manifest.unloadable_reason() {
+        if let Some(r) = manifest.unloadable_reason_for(self.kinds) {
             return ModuleStatus::Unavailable(r);
         }
         match &self.opened {
@@ -292,13 +305,16 @@ pub struct StageResolution {
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
     records: BTreeMap<String, Record>,
+    kinds: LoadKinds,
     profile: Profile,
     pins: BTreeMap<StageId, String>,
     order: Option<Vec<StageId>>,
 }
 
 impl Registry {
-    /// A registry of the discovered modules, all enabled and none opened.
+    /// A registry of the discovered modules, all enabled and none opened,
+    /// that loads video modules ([`LoadKinds::Video`]; see
+    /// [`Registry::with_kinds`]).
     pub fn new(discovery: Discovery) -> Registry {
         Registry::from_entries(discovery.entries)
     }
@@ -313,6 +329,7 @@ impl Registry {
                     entry.id.clone(),
                     Record {
                         entry,
+                        kinds: LoadKinds::default(),
                         disabled: None,
                         module: None,
                         opened: Opened::No,
@@ -324,6 +341,25 @@ impl Registry {
             records,
             ..Registry::default()
         }
+    }
+
+    /// This registry, loading the modules of `kinds` instead (the audio
+    /// worker's: [`LoadKinds::Audio`]). Modules opened before are closed.
+    pub fn with_kinds(mut self, kinds: LoadKinds) -> Registry {
+        self.kinds = kinds;
+        for r in self.records.values_mut() {
+            if r.kinds != kinds {
+                r.kinds = kinds;
+                r.module = None;
+                r.opened = Opened::No;
+            }
+        }
+        self
+    }
+
+    /// The kinds of module this registry loads.
+    pub fn kinds(&self) -> LoadKinds {
+        self.kinds
     }
 
     fn record_mut(&mut self, id: &str) -> Result<&mut Record, String> {
@@ -390,7 +426,7 @@ impl Registry {
         let Some(manifest) = r.loadable().cloned() else {
             return Ok(());
         };
-        match Module::open(&manifest, config, log.clone()) {
+        match Module::open_for(&manifest, config, log.clone(), r.kinds) {
             Err(e) => {
                 log(id, LogLevel::Warn, &format!("unavailable: {e}"));
                 r.opened = Opened::Failed(e);
@@ -1014,6 +1050,103 @@ mod tests {
             all_installed(&mut r, id);
         }
         r
+    }
+
+    /// An audio module of `id` with `stages`: `(id, slot, rank, device)`.
+    fn audio_entry(id: &str, stages: &[(&str, &str, u32, &str)]) -> ModuleEntry {
+        let mut text = format!(
+            "abi = 1\nid = \"{id}\"\nname = \"N\"\nversion = \"1\"\nlicence = \"MIT\"\n\
+             kind = \"audio-filter\"\nlibrary = \"/l/{id}.so\"\n"
+        );
+        for (sid, slot, rank, device) in stages {
+            text.push_str(&format!(
+                "[[stage]]\nid = \"{sid}\"\nslot = \"{slot}\"\nrank = {rank}\n\
+                 device = \"{device}\"\nframes = [\"host\"]\nrates = [48000]\n\
+                 frame_samples = [480]\n"
+            ));
+        }
+        let path = Path::new("/m").join(format!("{id}.toml"));
+        let manifest = Manifest::parse(&text, &path);
+        ModuleEntry {
+            id: id.into(),
+            manifest_path: path,
+            manifest,
+        }
+    }
+
+    const AFX: &str = "br.com.dias.maxine-afx";
+    const VOICE: &str = "br.com.dias.voice-cpu";
+
+    fn audio_entries() -> [ModuleEntry; 3] {
+        [
+            audio_entry(
+                AFX,
+                &[
+                    ("mic-enhance", "shape", 300, "nvidia-gpu"),
+                    ("mic-denoise", "clean", 300, "nvidia-gpu"),
+                    ("mic-dereverb", "clean", 300, "nvidia-gpu"),
+                ],
+            ),
+            audio_entry(VOICE, &[("mic-denoise", "clean", 200, "cpu")]),
+            hello(),
+        ]
+    }
+
+    #[test]
+    fn the_video_registry_lists_audio_modules_and_never_offers_their_stages() {
+        let mut r = Registry::from_entries(audio_entries());
+        assert_eq!(r.kinds(), LoadKinds::Video);
+        all_installed(&mut r, HELLO);
+        assert_eq!(
+            r.status(AFX),
+            Some(ModuleStatus::Unavailable(
+                crate::manifest::REASON_AUDIO_IN_WORKER.into()
+            ))
+        );
+        assert_eq!(r.stage_ids(), [s("hello")]);
+        assert_eq!(r.order(), [s("hello")]);
+        assert_eq!(r.resolve("mic-denoise").provider, None);
+        // Opening an audio module in the video registry never opens its
+        // library (which does not exist here).
+        let log: LogSink = std::sync::Arc::new(|_, _, _| {});
+        r.open(AFX, &serde_json::json!({}), &log).unwrap();
+        assert_eq!(
+            r.status(AFX).unwrap().reason(),
+            crate::manifest::REASON_AUDIO_IN_WORKER
+        );
+    }
+
+    #[test]
+    fn the_audio_registry_offers_mic_stages_by_rank_pin_and_profile() {
+        let mut r = Registry::from_entries(audio_entries()).with_kinds(LoadKinds::Audio);
+        assert_eq!(r.kinds(), LoadKinds::Audio);
+        for id in [AFX, VOICE] {
+            all_installed(&mut r, id);
+        }
+        assert_eq!(
+            r.status(HELLO),
+            Some(ModuleStatus::Unavailable(
+                crate::manifest::REASON_VIDEO_IN_DAEMON.into()
+            ))
+        );
+        assert_eq!(r.status(AFX), Some(ModuleStatus::Available));
+        // Slot order: clean before shape, then the stage id.
+        assert_eq!(
+            r.order(),
+            [s("mic-denoise"), s("mic-dereverb"), s("mic-enhance")]
+        );
+        assert_eq!(r.resolve("mic-denoise").provider.as_deref(), Some(AFX));
+        r.set_profile(Profile::Battery);
+        assert_eq!(r.resolve("mic-denoise").provider.as_deref(), Some(VOICE));
+        r.set_profile(Profile::Quality);
+        r.set_pin(s("mic-denoise"), Some(VOICE.into()));
+        assert_eq!(r.resolve("mic-denoise").provider.as_deref(), Some(VOICE));
+        assert!(r.resolve("hello").provider.is_none());
+        // A shape stage cannot come before a clean one.
+        let e = r
+            .validate_order(&[s("mic-enhance"), s("mic-denoise"), s("mic-dereverb")])
+            .unwrap_err();
+        assert!(e.contains("cannot come after"), "{e}");
     }
 
     #[test]

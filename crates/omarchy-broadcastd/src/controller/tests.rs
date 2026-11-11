@@ -195,6 +195,7 @@ impl H {
                     changes,
                 } => self.settings_notes.push((revision, serial, changes)),
                 Note::ConfigChanged(serial) => self.config_notes.push(serial),
+                Note::MicStats(..) => {}
             }
         }
         (changes, stats)
@@ -1090,6 +1091,11 @@ fn every_transition_of_the_lifecycle_is_announced_in_order() {
             Change::ModulesSerial(n) => format!("modules_serial={n}"),
             Change::BackendProfile(p) => format!("profile={p}"),
             Change::ConfigSerial(n) => format!("config_serial={n}"),
+            Change::MicState(v) | Change::MicProvider(v) | Change::MicError(v) => {
+                format!("mic={v}")
+            }
+            Change::MicConsumers(n) => format!("mic_consumers={n}"),
+            Change::MicLatencyMs(v) => format!("mic_latency={v}"),
         })
         .collect();
     assert_eq!(
@@ -8856,6 +8862,7 @@ fn the_schema_has_the_module_rows_and_follows_the_modules_found() {
             "lifecycle",
             "effect",
             "pipewire",
+            "mic",
             "modules"
         ]
     );
@@ -11757,4 +11764,402 @@ fn the_element_s_fallback_image_failure_ends_with_its_session() {
         "{warnings:?}"
     );
     assert!(!h.snap().warning.contains("could not be read"));
+}
+
+// ---- the microphone (crate::mic) ----
+
+/// The worker's settings as the agent hands them: a noise group.
+fn mic_catalogue() -> mic::Catalogue {
+    let doc = serde_json::json!({"groups": [
+        {"id": "noise", "label": "Noise removal", "module": "voice", "settings": [
+            {"id": "mic.noise.enabled", "label": "Noise removal", "type": "bool",
+             "enabled": true, "default": true, "value": true},
+            {"id": "mic.noise.strength", "label": "Strength", "type": "int",
+             "enabled": true, "min": 0, "max": 100, "step": 1, "default": 80, "value": 80}]}]});
+    mic::Catalogue {
+        known: true,
+        groups: mic::parse_groups(&doc),
+        modules: mic::parse_modules(&serde_json::json!({"modules": [
+            {"id": "voice", "kind": "audio-filter", "name": "Voice", "status": "available",
+             "enabled": true}]})),
+        devices: vec![("alsa_input.usb-a".into(), "USB A".into())],
+    }
+}
+
+impl H {
+    /// Connects a microphone agent: what the controller sends it.
+    fn mic_link(&mut self) -> UnboundedReceiver<MicRequest> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.ctrl.set_mic(tx);
+        rx
+    }
+
+    fn mic(&mut self, event: MicEvent) {
+        let now = self.at(0);
+        assert!(self.ctrl.handle(Command::Mic(event), now));
+    }
+
+    /// The snapshots sent to the agent since the last call, parsed.
+    fn mic_snapshots(rx: &mut UnboundedReceiver<MicRequest>) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(r) = rx.try_recv() {
+            if let MicRequest::Snapshot(t) = r {
+                out.push(serde_json::from_str(&t).unwrap());
+            }
+        }
+        out
+    }
+
+    fn host_on(&mut self) {
+        self.mic(MicEvent::Status(obc_ipc::MicStatus {
+            state: "passthrough".into(),
+            ..obc_ipc::MicStatus::default()
+        }));
+    }
+}
+
+#[test]
+fn the_microphone_snapshot_is_sent_at_once_and_on_every_change() {
+    let mut h = H::new("", |_| {});
+    let mut rx = h.mic_link();
+    let first = H::mic_snapshots(&mut rx);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0]["enabled"], serde_json::json!(true));
+    assert_eq!(first[0]["camera_active"], serde_json::json!(false));
+    // Nothing changed: nothing sent.
+    h.tick(10);
+    assert!(H::mic_snapshots(&mut rx).is_empty());
+    // The camera session: camera_active, then not.
+    h.activate(100);
+    let s = H::mic_snapshots(&mut rx);
+    assert_eq!(s.last().unwrap()["camera_active"], serde_json::json!(true));
+    h.consumers(0, 1000);
+    h.tick(7000);
+    assert_eq!(h.state(), State::Idle);
+    let s = H::mic_snapshots(&mut rx);
+    assert_eq!(s.last().unwrap()["camera_active"], serde_json::json!(false));
+}
+
+#[test]
+fn the_microphone_settings_follow_the_worker_and_write_where_they_belong() {
+    let mut h = H::new("", |_| {});
+    let mut rx = h.mic_link();
+    // No worker known: no microphone group.
+    let tree = h.get_settings("", 0).unwrap();
+    assert!(!tree.groups.iter().any(|g| g.surface.is_some()));
+    h.mic(MicEvent::Catalogue(mic_catalogue()));
+    let tree = h.get_settings("", 0).unwrap();
+    let mic_groups: Vec<&str> = tree
+        .groups
+        .iter()
+        .filter(|g| g.surface.as_deref() == Some("mic"))
+        .map(|g| g.id.as_str())
+        .collect();
+    assert_eq!(mic_groups, ["input", "noise"]);
+    // The groups follow the global ones, at the end.
+    assert_eq!(tree.groups.last().unwrap().id, "noise");
+    H::mic_snapshots(&mut rx);
+
+    // A module's value: kept in the state file, in the snapshot.
+    h.set_setting("mic.noise.strength", SettingValue::Int(40), 0)
+        .unwrap();
+    let s = H::mic_snapshots(&mut rx);
+    assert_eq!(
+        s.last().unwrap()["values"],
+        serde_json::json!({"mic.noise.strength": 40})
+    );
+    assert!(h.setting("mic.noise.strength").stored);
+    assert_eq!(
+        h.persisted().settings.get("mic.noise.strength"),
+        Some(&StoredValue::Int(40))
+    );
+    assert!(matches!(
+        h.set_setting("mic.noise.strength", SettingValue::Int(400), 0),
+        Err(IpcError::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        h.set_setting("mic.noise.nothing", SettingValue::Int(4), 0),
+        Err(IpcError::UnknownSetting(_))
+    ));
+
+    // The daemon's switch: the config key in the managed file.
+    h.set_setting(mic::ENABLED, SettingValue::Bool(false), 0)
+        .unwrap();
+    assert_eq!(
+        h.managed_key("mic.enabled"),
+        Some(toml::Value::Boolean(false))
+    );
+    let enabled = h.setting(mic::ENABLED);
+    assert!(enabled.stored);
+    assert_eq!(enabled.kind.value(), Some(SettingValue::Bool(false)));
+    let s = H::mic_snapshots(&mut rx);
+    assert_eq!(s.last().unwrap()["enabled"], serde_json::json!(false));
+    h.set_setting(mic::DEVICE, SettingValue::Str("alsa_input.usb-a".into()), 0)
+        .unwrap();
+    assert_eq!(
+        h.managed_key("mic.device"),
+        Some(toml::Value::String("alsa_input.usb-a".into()))
+    );
+    // The camera is left alone by a microphone key.
+    assert_eq!(h.state(), State::Idle);
+
+    // Resets: the module group forgets its values, the input group its
+    // keys; `mic.<id>` names a microphone group whatever else is there.
+    h.reset_settings("group:noise", 0).unwrap();
+    assert!(!h.setting("mic.noise.strength").stored);
+    h.set_setting("mic.noise.strength", SettingValue::Int(40), 0)
+        .unwrap();
+    h.reset_settings("group:mic.noise", 0).unwrap();
+    assert!(!h.setting("mic.noise.strength").stored);
+    assert!(matches!(
+        h.reset_settings("group:mic.nothing", 0),
+        Err(IpcError::UnknownSetting(_))
+    ));
+    h.reset_settings("group:input", 0).unwrap();
+    assert_eq!(h.managed_key("mic.enabled"), None);
+    assert_eq!(h.managed_key("mic.device"), None);
+    let s = H::mic_snapshots(&mut rx);
+    let last = s.last().unwrap();
+    assert_eq!(last["enabled"], serde_json::json!(true));
+    assert_eq!(last["values"], serde_json::json!({}));
+}
+
+#[test]
+fn a_long_microphone_node_name_is_set_by_token_or_by_name() {
+    const LONG: &str = "alsa_input.usb-K66_K66_20190805V001-00.analog-stereo";
+    let mut h = H::new("", |_| {});
+    let _rx = h.mic_link();
+    let mut catalogue = mic_catalogue();
+    catalogue
+        .devices
+        .push((LONG.into(), "K66 Analog Stereo".into()));
+    h.mic(MicEvent::Catalogue(catalogue));
+    let token = mic::device_token(LONG);
+    let options = |h: &mut H| match h.setting(mic::DEVICE).kind {
+        SettingKind::Enum { options, value, .. } => (options, value),
+        other => panic!("{other:?}"),
+    };
+    let (opts, value) = options(&mut h);
+    assert_eq!(value, "default");
+    assert!(opts.contains(&(token.clone(), "K66 Analog Stereo".to_string())));
+    assert!(opts.iter().all(|(v, _)| v.len() <= 32));
+
+    // By token: the config key stores the node name, the setting shows the
+    // token.
+    h.set_setting(mic::DEVICE, SettingValue::Str(token.clone()), 0)
+        .unwrap();
+    assert_eq!(
+        h.managed_key("mic.device"),
+        Some(toml::Value::String(LONG.into()))
+    );
+    assert_eq!(options(&mut h).1, token);
+    // By node name (the CLI's `mic device NAME`).
+    h.set_setting(mic::DEVICE, SettingValue::Str("alsa_input.usb-a".into()), 0)
+        .unwrap();
+    assert_eq!(
+        h.managed_key("mic.device"),
+        Some(toml::Value::String("alsa_input.usb-a".into()))
+    );
+    h.set_setting(mic::DEVICE, SettingValue::Str(LONG.into()), 0)
+        .unwrap();
+    assert_eq!(options(&mut h).1, token);
+    // An unknown token or name: invalid, the config untouched.
+    for bad in ["pw-000000000000", "alsa_input.nothing"] {
+        assert!(matches!(
+            h.set_setting(mic::DEVICE, SettingValue::Str(bad.into()), 0),
+            Err(IpcError::InvalidArgument(_))
+        ));
+    }
+    assert_eq!(
+        h.managed_key("mic.device"),
+        Some(toml::Value::String(LONG.into()))
+    );
+    // The device unplugged: still the value, listed as unavailable.
+    h.mic(MicEvent::Catalogue(mic_catalogue()));
+    let (opts, value) = options(&mut h);
+    assert_eq!(value, token);
+    assert!(opts.contains(&(token, format!("Unavailable: {}", &LONG[..35]))));
+}
+
+#[test]
+fn the_microphone_properties_are_the_agents() {
+    let mut h = H::new("", |_| {});
+    let _rx = h.mic_link();
+    assert_eq!(h.snap().mic, Some(obc_ipc::MicStatus::default()));
+    h.drain();
+    h.mic(MicEvent::Status(obc_ipc::MicStatus {
+        state: "active".into(),
+        consumers: 2,
+        provider: "mic-denoise: voice".into(),
+        latency_ms: 20.0,
+        error: String::new(),
+    }));
+    // The host running shows the input group too (a structural change).
+    let names: Vec<&str> = h
+        .drain()
+        .0
+        .iter()
+        .map(Change::name)
+        .filter(|n| n.starts_with("Mic"))
+        .collect();
+    assert_eq!(
+        names,
+        ["MicConsumers", "MicProvider", "MicLatencyMs", "MicState"]
+    );
+    assert_eq!(h.snap().mic.unwrap().state, "active");
+    // GetModules: the worker's entry for the audio module, the serial moved.
+    let before = h.snap().modules_serial.unwrap();
+    h.mic(MicEvent::Catalogue(mic_catalogue()));
+    assert_ne!(h.snap().modules_serial.unwrap(), before);
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    assert!(h.ctrl.handle(Command::GetModules(tx), h.at(0)));
+    let list = rx.try_recv().unwrap().unwrap();
+    assert_eq!(list.serial, h.snap().modules_serial.unwrap());
+    assert!(list.modules.iter().any(|m| m.id == "voice"));
+}
+
+#[test]
+fn the_default_microphone_is_made_remembered_and_restored() {
+    let mut h = H::new("", |_| {});
+    let mut rx = h.mic_link();
+    h.mic(MicEvent::Catalogue(mic_catalogue()));
+    // Greyed while the host is off.
+    assert!(matches!(
+        h.set_setting(mic::MAKE_DEFAULT, SettingValue::Bool(true), 0),
+        Err(IpcError::Disabled(m)) if m == mic::REASON_HOST_OFF
+    ));
+    h.host_on();
+    H::mic_snapshots(&mut rx);
+    let mut reply = h.send_set("", mic::MAKE_DEFAULT, Some(SettingValue::Bool(true)), 0);
+    // Answered by the agent, not yet.
+    assert!(reply.try_recv().is_err());
+    let Ok(MicRequest::MakeDefault { target, reply: r }) = rx.try_recv() else {
+        panic!("MakeDefault not sent")
+    };
+    assert_eq!(target, "", "the device is the default: the previous one");
+    h.mic(MicEvent::DefaultMade {
+        previous: "alsa_input.usb-a".into(),
+        reply: r,
+    });
+    reply.try_recv().unwrap().unwrap();
+    assert_eq!(
+        h.persisted().mic_previous_default.as_deref(),
+        Some("alsa_input.usb-a")
+    );
+    assert!(h.setting(mic::RESTORE_DEFAULT).enabled);
+    // Still offered: the user may have picked another microphone since.
+    assert!(h.setting(mic::MAKE_DEFAULT).enabled);
+    // Across a restart.
+    h.restart();
+    let mut rx = h.mic_link();
+    h.mic(MicEvent::Catalogue(mic_catalogue()));
+    assert!(h.setting(mic::RESTORE_DEFAULT).enabled);
+    // mic off: the previous default goes with the request; restored, it
+    // is forgotten.
+    let (tx, mut reply) = tokio::sync::oneshot::channel();
+    assert!(h.ctrl.handle(Command::SetMicHost(false, tx), h.at(0)));
+    let req = std::iter::from_fn(|| rx.try_recv().ok())
+        .find(|r| matches!(r, MicRequest::Host { .. }))
+        .expect("Host sent");
+    let MicRequest::Host {
+        on,
+        previous,
+        reply: r,
+    } = req
+    else {
+        unreachable!()
+    };
+    assert!(!on);
+    assert_eq!(previous.as_deref(), Some("alsa_input.usb-a"));
+    h.mic(MicEvent::HostDone {
+        restored: true,
+        result: Ok(()),
+        reply: r,
+    });
+    reply.try_recv().unwrap().unwrap();
+    assert_eq!(h.persisted().mic_previous_default, None);
+}
+
+#[test]
+fn choosing_another_microphone_re_pins_the_capture_side_while_ours_is_the_default() {
+    let repins = |rx: &mut UnboundedReceiver<MicRequest>| -> Vec<String> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|r| match r {
+                MicRequest::Repin { target } => Some(target),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut h = H::new("", |_| {});
+    let mut rx = h.mic_link();
+    h.mic(MicEvent::Catalogue(mic_catalogue()));
+    h.host_on();
+    // Ours is not the default: the choice is only the next target.
+    h.set_setting(mic::DEVICE, SettingValue::Str("alsa_input.usb-a".into()), 0)
+        .unwrap();
+    assert!(repins(&mut rx).is_empty());
+    // Made the default (the record kept) ...
+    let mut reply = h.send_set("", mic::MAKE_DEFAULT, Some(SettingValue::Bool(true)), 0);
+    let Ok(MicRequest::MakeDefault { target, reply: r }) =
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|r| matches!(r, MicRequest::MakeDefault { .. }))
+            .ok_or(())
+    else {
+        panic!("MakeDefault not sent")
+    };
+    assert_eq!(target, "alsa_input.usb-a");
+    h.mic(MicEvent::DefaultMade {
+        previous: "alsa_input.usb-b".into(),
+        reply: r,
+    });
+    reply.try_recv().unwrap().unwrap();
+    assert!(repins(&mut rx).is_empty());
+    // ... then another choice moves the pin; the record stays.
+    h.set_setting(mic::DEVICE, SettingValue::Str("default".into()), 0)
+        .unwrap();
+    assert_eq!(repins(&mut rx), [String::new()]);
+    assert_eq!(
+        h.persisted().mic_previous_default.as_deref(),
+        Some("alsa_input.usb-b")
+    );
+    // Writing the same value again moves nothing.
+    h.set_setting(mic::DEVICE, SettingValue::Str("default".into()), 0)
+        .unwrap();
+    assert!(repins(&mut rx).is_empty());
+    h.set_setting(mic::DEVICE, SettingValue::Str("alsa_input.usb-a".into()), 0)
+        .unwrap();
+    assert_eq!(repins(&mut rx), ["alsa_input.usb-a"]);
+}
+
+#[test]
+fn without_an_agent_the_microphone_cannot_be_controlled() {
+    let mut h = H::new("", |_| {});
+    let res = h.call(|r| Command::SetMicHost(true, r), 0);
+    assert!(matches!(res, Err(IpcError::Unavailable(_))), "{res:?}");
+}
+
+#[test]
+fn a_microphone_group_sharing_a_video_groups_id_is_reset_only_by_its_full_name() {
+    let mut h = H::new("", |_| {});
+    let _rx = h.mic_link();
+    assert!(h.global_groups().contains(&"video".to_string()));
+    let doc = serde_json::json!({"groups": [
+        {"id": "video", "label": "Video", "settings": [
+            {"id": "mic.video.level", "label": "Level", "type": "int",
+             "enabled": true, "min": 0, "max": 10, "default": 5}]}]});
+    h.mic(MicEvent::Catalogue(mic::Catalogue {
+        known: true,
+        groups: mic::parse_groups(&doc),
+        ..mic::Catalogue::default()
+    }));
+    h.set_setting("mic.video.level", SettingValue::Int(7), 0)
+        .unwrap();
+    h.set_denoise(true, 0).unwrap();
+    // The bare id is the video effects' group.
+    h.reset_settings("group:video", 10).unwrap();
+    assert!(!h.snap().denoise);
+    assert!(h.setting("mic.video.level").stored);
+    // `mic.video` is the microphone's.
+    h.reset_settings("group:mic.video", 20).unwrap();
+    assert!(!h.setting("mic.video.level").stored);
 }

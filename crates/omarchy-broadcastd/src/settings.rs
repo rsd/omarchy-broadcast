@@ -307,6 +307,9 @@ pub struct CameraSettings {
     /// The global settings published with them, after them
     /// ([`effects::build`]; empty until the controller attaches them).
     pub global: Vec<effects::GlobalEntry>,
+    /// The microphone's groups, after the global ones ([`crate::mic::groups`];
+    /// empty until the controller attaches them).
+    pub mic: Vec<SettingsGroup>,
     /// The capture mode setting ([`mode_setting`]), first, in the
     /// [`catalogue::CAPTURE`] group (`None` until the controller attaches
     /// it, or when the camera's modes are not known).
@@ -432,6 +435,7 @@ pub fn build(inp: &Inputs<'_>) -> CameraSettings {
         camera: inp.camera.to_string(),
         entries,
         global: Vec::new(),
+        mic: Vec::new(),
         mode: None,
         notes,
     }
@@ -991,13 +995,14 @@ impl CameraSettings {
 
     /// The published groups, in [`catalogue::GROUPS`] order, then the
     /// global ones in the order [`effects::build`] gives them, those with no
-    /// setting left out.
+    /// setting left out, then the microphone's.
     pub fn groups(&self) -> Vec<SettingsGroup> {
         let group = |g: &catalogue::Group, settings: Vec<Setting>| {
             (!settings.is_empty()).then(|| SettingsGroup {
                 id: g.id.into(),
                 label: g.label.into(),
                 settings,
+                surface: None,
             })
         };
         let camera = catalogue::GROUPS.iter().filter_map(|g| {
@@ -1021,10 +1026,14 @@ impl CameraSettings {
                     id: e.group.clone(),
                     label: e.group_label.clone(),
                     settings: vec![e.setting.clone()],
+                    surface: None,
                 }),
             }
         }
-        camera.chain(global).collect()
+        camera
+            .chain(global)
+            .chain(self.mic.iter().cloned())
+            .collect()
     }
 
     /// The `GetSettings` reply of these settings at `revision` and
@@ -1090,6 +1099,17 @@ pub fn diff(old: &CameraSettings, new: &CameraSettings) -> Option<Delta> {
             a.group != b.group
                 || a.group_label != b.group_label
                 || shape(&a.setting) != shape(&b.setting)
+        })
+        || old.mic.len() != new.mic.len()
+        || old.mic.iter().zip(&new.mic).any(|(a, b)| {
+            a.id != b.id
+                || a.label != b.label
+                || a.surface != b.surface
+                || a.settings.len() != b.settings.len()
+                || a.settings
+                    .iter()
+                    .zip(&b.settings)
+                    .any(|(x, y)| shape(x) != shape(y))
         });
     if structural {
         return Some(Delta {
@@ -1108,9 +1128,15 @@ pub fn diff(old: &CameraSettings, new: &CameraSettings) -> Option<Delta> {
         .zip(&new.global)
         .map(|(a, b)| (&a.setting, &b.setting));
     let mode = old.mode.iter().zip(&new.mode);
+    let mic = old
+        .mic
+        .iter()
+        .zip(&new.mic)
+        .flat_map(|(a, b)| a.settings.iter().zip(&b.settings));
     let changes: Vec<SettingChange> = mode
         .chain(camera)
         .chain(global)
+        .chain(mic)
         .filter(|(a, b)| a != b)
         .map(|(_, b)| change_of(b))
         .collect();
