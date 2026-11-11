@@ -21,7 +21,13 @@
 //!   rate whenever no forwarded frame has been pushed for
 //!   [`WriterConfig::placeholder_after`] (default two contract periods):
 //!   while frames are forwarded it pushes nothing, and it resumes that long
-//!   after the last one.
+//!   after the last one. It can be switched at run time
+//!   ([`LoopbackWriter::set_placeholder_image`]) to a still image, cropped
+//!   to fill the contract's frame and laid out as the black one
+//!   ([`image_contract_frame`]), decoded on a thread of its own: the
+//!   placeholder stays black until the image is ready, and when it cannot be
+//!   read ([`PlaceholderState::Failed`]). Switching back to black is
+//!   immediate. The crash cover stays black whatever the placeholder shows.
 //! * **Forwarded frames.** [`WriterHandle::push`], called by the active
 //!   output (an [`OutputSink::Writer`](crate::output::OutputSink::Writer)
 //!   output ends in an `appsink` that forwards every buffer). The buffer is
@@ -84,7 +90,7 @@
 //! message, so a pipeline that lives as long as the daemon never queues
 //! messages nobody reads.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -213,6 +219,35 @@ struct Shared {
     push_failed: AtomicU64,
     /// The first ERROR the pipeline posted.
     error: Mutex<Option<String>>,
+    /// What the placeholder thread pushes, and the image asked for.
+    frame: Mutex<PlaceholderFrame>,
+}
+
+/// The placeholder in force ([`LoopbackWriter::set_placeholder_image`]).
+#[derive(Debug)]
+struct PlaceholderFrame {
+    /// The frame pushed: the black one, or the image once decoded.
+    buffer: gst::Buffer,
+    /// The image asked for (`None`: black).
+    image: Option<PathBuf>,
+    /// Counts the requests: a decode's result is kept only if no later one
+    /// was made.
+    serial: u64,
+    state: PlaceholderState,
+}
+
+/// What the writer's placeholder shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaceholderState {
+    /// Black: no image is asked for.
+    Black,
+    /// Black while the image asked for is decoded.
+    Pending,
+    /// The image asked for.
+    Image,
+    /// Black: the image asked for cannot be shown; the reason, as
+    /// [`gst_obc::fallback_unreadable`] words it.
+    Failed(String),
 }
 
 /// What a push carries.
@@ -438,6 +473,55 @@ pub fn writer_caps_string(contract: &OutputContract) -> String {
     format!("{},pixel-aspect-ratio=1/1", contract_caps_string(contract))
 }
 
+/// One frame of `contract` showing the image at `path` (PNG or JPEG,
+/// checked and decoded as the replace effect's background, cropped to fill
+/// the frame, centred), in system memory laid out as
+/// [`black_contract_frame`] lays out black (BT.601, the contract's range).
+/// Blocks for the decode. The reason names the file, not the path.
+pub fn image_contract_frame(contract: &OutputContract, path: &Path) -> Result<gst::Buffer, String> {
+    let s = writer_caps_string(contract);
+    let caps: gst::Caps = s.parse().map_err(|_| format!("caps {s}"))?;
+    let info = gst_video::VideoInfo::from_caps(&caps).map_err(|_| format!("caps {s}"))?;
+    let colour = obc_backend::ColourSpec {
+        matrix: obc_backend::ColourMatrix::Bt601,
+        full_range: contract.range == obc_core::ColourRange::Full,
+    };
+    let img = gst_obc::background::decode_yuv420(path, info.width(), info.height(), colour)?;
+    let mut data = black_contract_frame(contract)
+        .map_err(|e| e.to_string())?
+        .map_readable()
+        .map_err(|e| e.to_string())?
+        .to_vec();
+    let rows = |plane: usize,
+                src: &[u8],
+                width: usize,
+                height: usize,
+                step: usize,
+                at: usize,
+                data: &mut [u8]| {
+        let (offset, stride) = (info.offset()[plane], info.stride()[plane] as usize);
+        for r in 0..height {
+            for c in 0..width {
+                data[offset + r * stride + c * step + at] = src[r * width + c];
+            }
+        }
+    };
+    let (w, h) = (img.width as usize, img.height as usize);
+    let (cw, ch) = (img.chroma_width(), img.chroma_height());
+    rows(0, &img.y, w, h, 1, 0, &mut data);
+    match contract.format {
+        obc_core::OutputFormat::Nv12 => {
+            rows(1, &img.u, cw, ch, 2, 0, &mut data);
+            rows(1, &img.v, cw, ch, 2, 1, &mut data);
+        }
+        obc_core::OutputFormat::I420 => {
+            rows(1, &img.u, cw, ch, 1, 0, &mut data);
+            rows(2, &img.v, cw, ch, 1, 0, &mut data);
+        }
+    }
+    Ok(gst::Buffer::from_mut_slice(data))
+}
+
 /// One black frame of `contract` in system memory, laid out as
 /// `GstVideoInfo` lays out the writer's caps (NV12 or I420): Y = black of
 /// the contract's range (16 for limited), chroma 128, padding included.
@@ -504,6 +588,12 @@ impl LoopbackWriter {
             forwarded: AtomicU64::new(0),
             push_failed: AtomicU64::new(0),
             error: Mutex::default(),
+            frame: Mutex::new(PlaceholderFrame {
+                buffer: black_contract_frame(&contract)?,
+                image: None,
+                serial: 0,
+                state: PlaceholderState::Black,
+            }),
         });
         let recorder = Arc::downgrade(&shared);
         pipeline
@@ -568,17 +658,13 @@ impl LoopbackWriter {
         }
         let stop = Arc::new(StopSignal::default());
         let failure: Arc<Mutex<Option<String>>> = Arc::default();
-        let (shared, placeholder, after) = (
-            Arc::clone(&self.shared),
-            self.placeholder.clone(),
-            self.cfg.placeholder_after,
-        );
+        let (shared, after) = (Arc::clone(&self.shared), self.cfg.placeholder_after);
         let (thread_stop, thread_failure) = (Arc::clone(&stop), Arc::clone(&failure));
         let handle = std::thread::Builder::new()
             .name("obc-placeholder".into())
             .spawn(move || {
                 run_recording_panic(
-                    move || placeholder_loop(&shared, &placeholder, after, &thread_stop),
+                    move || placeholder_loop(&shared, after, &thread_stop),
                     &thread_failure,
                 )
             })
@@ -674,6 +760,59 @@ impl LoopbackWriter {
     /// [`Self::stop`] and [`Self::start`].
     pub fn set_tap(&self, tap: Option<FrameTap>) {
         self.shared.lock().tap = TapSlot(tap);
+    }
+
+    /// Switches the placeholder: black (`None`, at once), or the image at
+    /// `image` ([`image_contract_frame`]), decoded on a thread of its own
+    /// (black until it is ready; black, [`PlaceholderState::Failed`], when
+    /// it cannot be read). The image already asked for is not decoded
+    /// again. Never blocks for the decode; kept across [`Self::stop`] and
+    /// [`Self::start`].
+    pub fn set_placeholder_image(&self, image: Option<&Path>) {
+        let serial = {
+            let mut f = self.shared.frame.lock().unwrap_or_else(|e| e.into_inner());
+            if f.image.as_deref() == image {
+                return;
+            }
+            f.serial += 1;
+            f.image = image.map(Path::to_path_buf);
+            f.buffer = self.placeholder.clone();
+            f.state = if image.is_some() {
+                PlaceholderState::Pending
+            } else {
+                PlaceholderState::Black
+            };
+            f.serial
+        };
+        let Some(path) = image.map(Path::to_path_buf) else {
+            return;
+        };
+        let (shared, contract) = (Arc::clone(&self.shared), self.cfg.contract);
+        let p = path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("obc-placeholder-image".into())
+            .spawn(move || {
+                let frame = image_contract_frame(&contract, &p);
+                placeholder_decoded(&shared, serial, &p, frame);
+            });
+        if let Err(e) = spawned {
+            placeholder_decoded(
+                &self.shared,
+                serial,
+                &path,
+                Err(format!("no thread to decode it: {e}")),
+            );
+        }
+    }
+
+    /// What the placeholder shows ([`Self::set_placeholder_image`]).
+    pub fn placeholder_state(&self) -> PlaceholderState {
+        self.shared
+            .frame
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state
+            .clone()
     }
 
     /// A handle for the active output to forward its frames with.
@@ -775,20 +914,21 @@ impl Drop for LoopbackWriter {
 /// placeholders would be due, and starts a new grid there: they resume
 /// [`WriterConfig::placeholder_after`] after the last forwarded frame, not
 /// on the next tick of the old grid.
-fn placeholder_loop(
-    shared: &Shared,
-    placeholder: &gst::Buffer,
-    after: Duration,
-    stop: &StopSignal,
-) {
+fn placeholder_loop(shared: &Shared, after: Duration, stop: &StopSignal) {
     let period = Duration::from_nanos(shared.period_ns.max(1));
     let mut next = Instant::now();
     loop {
         if stop.wait_until(next) {
             return;
         }
-        // A shallow copy: new metadata, the one black frame's memory.
-        if let Pushed::NotDue(due) = shared.push(placeholder.copy(), Producer::Placeholder, after) {
+        // A shallow copy: new metadata, the placeholder frame's memory.
+        let placeholder = shared
+            .frame
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .buffer
+            .copy();
+        if let Pushed::NotDue(due) = shared.push(placeholder, Producer::Placeholder, after) {
             next = due;
             continue;
         }
@@ -797,6 +937,28 @@ fn placeholder_loop(
         if next + period < now {
             next = now;
         }
+    }
+}
+
+/// The decode `serial` of the placeholder image at `path` ended with
+/// `frame`: it becomes the placeholder (or its reason is kept, black in its
+/// place), unless a later request was made.
+fn placeholder_decoded(
+    shared: &Shared,
+    serial: u64,
+    path: &Path,
+    frame: Result<gst::Buffer, String>,
+) {
+    let mut f = shared.frame.lock().unwrap_or_else(|e| e.into_inner());
+    if f.serial != serial {
+        return;
+    }
+    match frame {
+        Ok(b) => {
+            f.buffer = b;
+            f.state = PlaceholderState::Image;
+        }
+        Err(why) => f.state = PlaceholderState::Failed(gst_obc::fallback_unreadable(path, &why)),
     }
 }
 
@@ -840,6 +1002,8 @@ mod tests {
         data: usize,
         /// Every Y byte 16 and every chroma byte 128 (limited black).
         black: bool,
+        /// Every Y byte 235 and every chroma byte 128 (limited white).
+        white: bool,
         info: Option<gst_video::VideoInfo>,
     }
 
@@ -850,9 +1014,14 @@ mod tests {
     }
 
     fn is_black(info: &gst_video::VideoInfo, data: &[u8]) -> bool {
+        is_uniform(info, data, 16)
+    }
+
+    /// Every byte of the luma plane `y`, every byte after it 128.
+    fn is_uniform(info: &gst_video::VideoInfo, data: &[u8], y: u8) -> bool {
         let luma_end = info.offset()[0] + info.stride()[0] as usize * info.height() as usize;
         data.len() == info.size()
-            && data[..luma_end].iter().all(|&b| b == 16)
+            && data[..luma_end].iter().all(|&b| b == y)
             && data[luma_end..].iter().all(|&b| b == 128)
     }
 
@@ -880,7 +1049,9 @@ mod tests {
                             .and_then(|c| gst_video::VideoInfo::from_caps(&c).ok());
                         let map = b.map_readable().unwrap();
                         let black = info.as_ref().is_some_and(|i| is_black(i, &map));
+                        let white = info.as_ref().is_some_and(|i| is_uniform(i, &map, 235));
                         let entry = AtSink {
+                            white,
                             pts: b.pts().map(|p| p.nseconds()).unwrap_or(u64::MAX),
                             duration: b.duration().map(|d| d.nseconds()),
                             size: map.size(),
@@ -911,6 +1082,146 @@ mod tests {
         OutputContract {
             format,
             .."320x240@30".parse().unwrap()
+        }
+    }
+
+    /// A white PNG of `w x h` in `dir`.
+    fn white_png(dir: &Path, w: u32, h: u32) -> PathBuf {
+        let path = dir.join("away.png");
+        let p = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=1 pattern=white ! video/x-raw,format=RGB,width={w},\
+             height={h} ! pngenc snapshot=true ! filesink location={}",
+            path.display()
+        ))
+        .unwrap();
+        p.set_state(gst::State::Playing).unwrap();
+        let m = p
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(
+                gst::ClockTime::from_seconds(10),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            )
+            .unwrap();
+        assert_eq!(m.type_(), gst::MessageType::Eos, "{m:?}");
+        p.set_state(gst::State::Null).unwrap();
+        path
+    }
+
+    const IMAGE_ELEMENTS: &[&str] = &[
+        "videotestsrc",
+        "pngenc",
+        "pngdec",
+        "filesink",
+        "videoconvert",
+        "videocrop",
+        "videoscale",
+    ];
+
+    /// An image frame is laid out as the black one, in both formats, with
+    /// the rows' padding left as it is.
+    #[test]
+    fn an_image_frame_fills_the_contract_layout() {
+        require_elements(IMAGE_ELEMENTS);
+        let dir = tempfile::tempdir().unwrap();
+        // A square image into 4:3 and an odd-stride width: cropped to fill.
+        let png = white_png(dir.path(), 200, 200);
+        for format in [OutputFormat::Nv12, OutputFormat::I420] {
+            for mode in ["320x240@30", "642x480@30"] {
+                let c = OutputContract {
+                    format,
+                    ..mode.parse().unwrap()
+                };
+                let caps: gst::Caps = writer_caps_string(&c).parse().unwrap();
+                let info = gst_video::VideoInfo::from_caps(&caps).unwrap();
+                let b = image_contract_frame(&c, &png).unwrap();
+                let map = b.map_readable().unwrap();
+                assert_eq!(map.size(), info.size(), "{c}");
+                let (w, h) = (info.width() as usize, info.height() as usize);
+                let planes: &[(usize, usize, usize)] = match format {
+                    OutputFormat::Nv12 => &[(0, w, h), (1, w, h / 2)],
+                    OutputFormat::I420 => &[(0, w, h), (1, w / 2, h / 2), (2, w / 2, h / 2)],
+                };
+                for &(plane, bytes, rows) in planes {
+                    let (o, stride) = (info.offset()[plane], info.stride()[plane] as usize);
+                    let want = if plane == 0 { 235 } else { 128 };
+                    for r in 0..rows {
+                        let row = &map[o + r * stride..o + r * stride + bytes];
+                        assert!(row.iter().all(|&b| b == want), "{c} plane {plane} row {r}");
+                    }
+                }
+            }
+        }
+        let e = image_contract_frame(&small(OutputFormat::Nv12), &dir.path().join("gone.png"))
+            .unwrap_err();
+        assert!(e.contains("the image file is unreadable"), "{e}");
+    }
+
+    /// The placeholder switches to an image (decoded off the caller's
+    /// thread: black meanwhile) and back to black at once; an image that
+    /// cannot be read leaves it black, with the reason.
+    #[test]
+    fn the_placeholder_switches_between_black_and_an_image() {
+        require_elements(ELEMENTS);
+        require_elements(IMAGE_ELEMENTS);
+        let dir = tempfile::tempdir().unwrap();
+        let png = white_png(dir.path(), 160, 160);
+        let missing = dir.path().join("gone.png");
+        for format in [OutputFormat::Nv12, OutputFormat::I420] {
+            let mut w = LoopbackWriter::build(small(format), WriterSink::Fake).unwrap();
+            assert_eq!(w.placeholder_state(), PlaceholderState::Black);
+            let log = watch_sink(&w);
+            w.start().unwrap();
+            let after = |n: usize, what: &str, want: fn(&AtSink) -> bool| {
+                wait_until(Duration::from_secs(10), what, || {
+                    log.lock().unwrap().buffers.iter().skip(n).any(want)
+                });
+            };
+            let count = || log.lock().unwrap().buffers.len();
+            after(0, "a black placeholder", |b| b.black);
+
+            w.set_placeholder_image(Some(&png));
+            wait_until(Duration::from_secs(10), "the image decoded", || {
+                w.placeholder_state() == PlaceholderState::Image
+            });
+            after(count(), "the image", |b| b.white);
+            // Asked again: nothing changes.
+            w.set_placeholder_image(Some(&png));
+            assert_eq!(w.placeholder_state(), PlaceholderState::Image);
+            let n = count();
+            after(n, "the image again", |b| b.white);
+
+            // Black at once.
+            w.set_placeholder_image(None);
+            assert_eq!(w.placeholder_state(), PlaceholderState::Black);
+            // The push lock orders pushes: one in flight may still be the
+            // image, the ones after are black.
+            let n = count() + 1;
+            after(n, "black again", |b| b.black);
+            assert!(log.lock().unwrap().buffers.iter().skip(n).all(|b| b.black));
+
+            // Unreadable: black, and why.
+            w.set_placeholder_image(Some(&missing));
+            wait_until(Duration::from_secs(10), "the decode failed", || {
+                matches!(w.placeholder_state(), PlaceholderState::Failed(_))
+            });
+            let PlaceholderState::Failed(why) = w.placeholder_state() else {
+                unreachable!()
+            };
+            assert!(
+                why.starts_with(&format!(
+                    "Fallback image {} could not be read (the image file is unreadable",
+                    missing.display()
+                )) && why.ends_with("): showing black"),
+                "{why}"
+            );
+            let n = count();
+            after(n, "black with the failure", |b| b.black);
+            assert!(log.lock().unwrap().buffers.iter().skip(n).all(|b| b.black));
+            w.stop().unwrap();
+            let log = log.lock().unwrap();
+            assert!(log.caps_events.len() <= 1, "never renegotiated");
+            assert!(log.buffers.iter().all(|b| b.black || b.white), "{format:?}");
         }
     }
 

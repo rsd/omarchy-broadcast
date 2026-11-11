@@ -167,6 +167,8 @@ pub struct EffectRun {
     pub background_image: Option<PathBuf>,
     /// What shows when the background effect cannot run.
     pub on_failure: EffectOnFailure,
+    /// The image shown in place of black with `on_failure = "image"`.
+    pub fallback_image: Option<PathBuf>,
     /// The other stages of the effect element, in order.
     pub stages: Vec<StageRun>,
     /// The chains of the other modules, in order.
@@ -266,6 +268,10 @@ pub struct EffectReport {
     pub reused: bool,
     /// Median GPU time of one processed frame, in milliseconds.
     pub gpu_ms_p50: Option<f64>,
+    /// With `on_failure = "image"`: why the effect element cannot show the
+    /// fallback image (it shows black in its place), as
+    /// [`obc_pipeline::effect::fallback_unreadable`] words it.
+    pub fallback_error: Option<String>,
 }
 
 /// The state of the optional PipeWire output (`[pipewire] enabled`), the
@@ -346,6 +352,70 @@ pub struct PreviewRequest {
 /// across encoders, from 1.
 pub type PreviewReporter = Arc<dyn Fn(u32) + Send + Sync>;
 
+/// Why the writer could not start ([`MediaBackend::start_writer`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterError {
+    pub message: String,
+    /// A consumer holds the loopback in the format of an earlier stream
+    /// (`LoopbackFormatHeld`): retried as it is, never a reason to give up
+    /// on the contract.
+    pub held: bool,
+    /// The contract is at fault (the loopback refuses it, its caps or the
+    /// writer's elements cannot be made for it): the last contract that
+    /// started streams instead. `false` for anything else (no such device,
+    /// another error of the device or the writer), which is retried as it
+    /// is.
+    pub revertible: bool,
+    /// With `held`: the format the consumer holds the loopback in, as an
+    /// output contract, when it is one the daemon can stream (`None`:
+    /// unknown, or not such a format).
+    pub held_as: Option<OutputContract>,
+}
+
+impl From<String> for WriterError {
+    /// An error that is not the contract's (neither held nor revertible).
+    fn from(message: String) -> Self {
+        WriterError {
+            message,
+            held: false,
+            revertible: false,
+            held_as: None,
+        }
+    }
+}
+
+impl std::fmt::Display for WriterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Why the session could not start ([`MediaBackend::start_session`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionError {
+    pub message: String,
+    /// The output contract is at fault: the output cannot be built or
+    /// started for it (its caps, the elements made or linked for it). A
+    /// GPU fault, a missing element or a module's failure is not.
+    pub contract: bool,
+}
+
+impl From<String> for SessionError {
+    /// An error that is not the contract's.
+    fn from(message: String) -> Self {
+        SessionError {
+            message,
+            contract: false,
+        }
+    }
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Why a running session failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
@@ -368,15 +438,16 @@ pub trait MediaBackend: Send + 'static {
     /// Finds the loopback `sink` names and starts the persistent writer on
     /// it with `contract`, stopping the running one (and its PipeWire
     /// output) first. Returns the device node. Fails if the device is
-    /// missing or another application holds it in another format. Starts
-    /// no PipeWire output: [`Self::start_pipewire`] does. A preview asked
-    /// for ([`Self::set_preview`]) is encoded from the new writer's frames,
+    /// missing or another application holds it in another format
+    /// ([`WriterError::held`]). Starts no PipeWire output:
+    /// [`Self::start_pipewire`] does. A preview asked for
+    /// ([`Self::set_preview`]) is encoded from the new writer's frames,
     /// with its contract.
     fn start_writer(
         &mut self,
         sink: &SinkSelector,
         contract: &OutputContract,
-    ) -> Result<PathBuf, String>;
+    ) -> Result<PathBuf, WriterError>;
 
     /// Stops the writer (the device is closed), the PipeWire output and the
     /// preview encoder (which removes its frame files); a preview still
@@ -419,15 +490,34 @@ pub trait MediaBackend: Send + 'static {
     /// Why the running writer has failed, if it has.
     fn writer_failure(&mut self) -> Option<String>;
 
+    /// Sets what the writer's placeholder shows: black (`None`), or the
+    /// image at `image`, cropped to fill the writer's frame. The image is
+    /// decoded off the controller thread: the placeholder stays black until
+    /// it is ready, and when it cannot be read
+    /// ([`Self::placeholder_failure`]). Kept across writers: a new writer
+    /// shows it too, decoded for its contract. The crash cover stays black.
+    /// Never blocks. Idempotent.
+    fn set_placeholder(&mut self, image: Option<&Path>);
+
+    /// Why the image [`Self::set_placeholder`] asked for cannot be shown
+    /// (black is, in its place), once known, as
+    /// [`obc_pipeline::effect::fallback_unreadable`] words it; `None` while it is shown,
+    /// still decoding, or not asked for, and while no writer runs.
+    fn placeholder_failure(&mut self) -> Option<String>;
+
     /// The number of other processes holding the loopback `node` open,
     /// counted now (the consumer watcher's count can lag a fresh open).
     fn loopback_holders(&mut self, node: &Path) -> u32;
+
+    /// The process names (`comm`) of the other processes holding the
+    /// loopback `node` open, read now, in `/proc` order (one per process).
+    fn loopback_holder_names(&mut self, node: &Path) -> Vec<String>;
 
     /// Builds and starts the output (CUDA) forwarding to the writer, with
     /// no ingest yet ([`Self::switch_camera`] adds it). The GPU is unparked
     /// first (see [`park`]); an error doing so is this call's error. On
     /// error nothing of the session is left, and the GPU is parked again.
-    fn start_session(&mut self, params: &SessionParams) -> Result<(), String>;
+    fn start_session(&mut self, params: &SessionParams) -> Result<(), SessionError>;
 
     /// Makes `camera` the running session's ingest, replacing the current
     /// one (the output holds the last frame meanwhile). On error the

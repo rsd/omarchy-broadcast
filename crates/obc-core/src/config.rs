@@ -308,6 +308,15 @@ pub struct EffectConfig {
     /// What the virtual camera shows when the effect cannot run.
     #[serde(serialize_with = "ser_display", deserialize_with = "de_from_str")]
     pub on_failure: EffectOnFailure,
+    /// The still image shown in place of black frames with
+    /// `on_failure = "image"`: an absolute path, empty (`None`) by default.
+    /// Whether the file can be read is found out when it is shown, not
+    /// here; without it, or when it cannot be read, the frames are black.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_background_image"
+    )]
+    pub fallback_image: Option<PathBuf>,
     /// The NVIDIA Maxine Video Effects SDK root (the directory with `lib/`,
     /// `features/` and `external/`): an absolute path. `MAXINE_VFX_ROOT`,
     /// when set and non-empty, takes precedence (the `maxine-vfx-sdk-local`
@@ -342,6 +351,9 @@ impl EffectConfig {
             .map_err(invalid("effect.relight_brightness"))?;
         if let Some(p) = &self.background_image {
             check_background_image(p).map_err(invalid("effect.background_image"))?;
+        }
+        if let Some(p) = &self.fallback_image {
+            check_background_image(p).map_err(invalid("effect.fallback_image"))?;
         }
         if let Some(p) = &self.maxine_root {
             check_maxine_root(p).map_err(invalid("effect.maxine_root"))?;
@@ -397,6 +409,7 @@ impl Default for EffectConfig {
             relight_direction: 0,
             relight_brightness: Self::DEFAULT_RELIGHT_BRIGHTNESS,
             on_failure: EffectOnFailure::Black,
+            fallback_image: None,
             maxine_root: None,
         }
     }
@@ -834,8 +847,8 @@ fn de_blur_strength<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
     de_number(d, "a number from 0 to 1", check_blur_strength)
 }
 
-/// `effect.background_image`: empty is `None`, anything else an absolute
-/// path.
+/// `effect.background_image` and `effect.fallback_image`: empty is `None`,
+/// anything else an absolute path.
 fn de_background_image<'de, D: Deserializer<'de>>(d: D) -> Result<Option<PathBuf>, D::Error> {
     let v = String::deserialize(d)?;
     if v.is_empty() {
@@ -1090,6 +1103,19 @@ pub struct RuntimeState {
         deserialize_with = "de_state_relight_brightness"
     )]
     pub relight_brightness: Option<u32>,
+    /// The last output contract a writer and a session output both started
+    /// with: the daemon's own record, never a choice of the user. After a
+    /// restart it is what the virtual camera streams when the configured
+    /// contract cannot start. In the file as `nv12:1920x1080@30 limited`
+    /// (the contract's `Display`), left out when unknown. Read leniently: a
+    /// value that is not such a contract is dropped as unknown and never
+    /// damages the file.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_output_good",
+        deserialize_with = "de_output_good"
+    )]
+    pub output_good: Option<OutputContract>,
     /// The camera controls set (with `SetCameraControl` or `SetSetting`) or
     /// reset while the camera was closed, by camera id. Never holds an
     /// empty entry ([`CameraControlState::is_empty`]). In the file, one
@@ -1128,6 +1154,95 @@ pub struct RuntimeState {
         deserialize_with = "crate::modules::de_settings"
     )]
     pub settings: BTreeMap<String, StoredValue>,
+    /// The capture mode chosen for a camera with `SetSetting`
+    /// (`camera.capture.mode`), by camera id: a size and rate without a
+    /// format (`WxH@FPS`), asked of that camera instead of the config's
+    /// `camera.mode`. No entry is the automatic choice (the config's). The
+    /// `[camera_modes]` table, left out when empty. Read leniently: an entry
+    /// that is not such a string is dropped with a warning
+    /// ([`RuntimeState::load_noting`]) and never damages the file.
+    #[serde(
+        skip_serializing_if = "BTreeMap::is_empty",
+        serialize_with = "ser_camera_modes",
+        deserialize_with = "de_camera_modes"
+    )]
+    pub camera_modes: BTreeMap<String, ModeRequest>,
+}
+
+/// `output_good`: the contract as its `Display` string.
+fn ser_output_good<S: Serializer>(c: &Option<OutputContract>, s: S) -> Result<S::Ok, S::Error> {
+    match c {
+        Some(c) => s.serialize_str(&c.to_string()),
+        None => s.serialize_none(),
+    }
+}
+
+/// `output_good`, leniently ([`output_contract_from`]); never an error.
+fn de_output_good<'de, D: Deserializer<'de>>(d: D) -> Result<Option<OutputContract>, D::Error> {
+    let value = toml::Value::deserialize(d)?;
+    Ok(value.as_str().and_then(output_contract_from))
+}
+
+/// The contract written as `nv12:1920x1080@30 limited` (its `Display`),
+/// checked; `None` for anything else.
+fn output_contract_from(s: &str) -> Option<OutputContract> {
+    let (format, rest) = s.trim().split_once(':')?;
+    let (mode, range) = rest.trim().split_once(' ')?;
+    let c = OutputContract {
+        format: format.parse().ok()?,
+        range: range.parse().ok()?,
+        ..mode.parse::<OutputContract>().ok()?
+    };
+    c.validate().ok().map(|()| c)
+}
+
+/// `[camera_modes]`: each mode as its `WxH@FPS` string.
+fn ser_camera_modes<S: Serializer>(
+    modes: &BTreeMap<String, ModeRequest>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    s.collect_map(modes.iter().map(|(k, v)| (k, v.to_string())))
+}
+
+/// `[camera_modes]`, leniently ([`camera_modes_from`]); never an error.
+fn de_camera_modes<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<String, ModeRequest>, D::Error> {
+    let value = toml::Value::deserialize(d)?;
+    Ok(camera_modes_from(&value).0)
+}
+
+/// The camera modes of the `[camera_modes]` value, and a warning for each
+/// entry dropped: not a table, an empty camera id, a value that is not a
+/// string, not `WxH@FPS`, or that names a format.
+fn camera_modes_from(value: &toml::Value) -> (BTreeMap<String, ModeRequest>, Vec<String>) {
+    let mut out = BTreeMap::new();
+    let mut warnings = Vec::new();
+    let Some(table) = value.as_table() else {
+        warnings.push(format!(
+            "camera_modes must be a table (found {}): ignored",
+            value.type_str()
+        ));
+        return (out, warnings);
+    };
+    for (camera, v) in table {
+        let parsed = match v.as_str() {
+            None => Err(format!("must be a string (found {})", v.type_str())),
+            Some(s) => match s.parse::<ModeRequest>() {
+                Ok(r) if r.format.is_none() => Ok(r),
+                Ok(_) => Err(format!("{s:?} names a format, which is not chosen here")),
+                Err(e) => Err(e.to_string()),
+            },
+        };
+        match parsed {
+            Ok(r) if !camera.is_empty() => {
+                out.insert(camera.clone(), r);
+            }
+            Ok(_) => warnings.push("camera_modes: an empty camera id: ignored".to_string()),
+            Err(why) => warnings.push(format!("camera_modes.{camera:?} {why}: ignored")),
+        }
+    }
+    (out, warnings)
 }
 
 impl Default for RuntimeState {
@@ -1147,6 +1262,8 @@ impl Default for RuntimeState {
             camera_controls: BTreeMap::new(),
             modules: ModulesState::default(),
             settings: BTreeMap::new(),
+            camera_modes: BTreeMap::new(),
+            output_good: None,
         }
     }
 }
@@ -1415,7 +1532,8 @@ impl RuntimeState {
     }
 
     /// The effect settings in force: each key of `config` overridden by
-    /// this state's value when it has one (`on_failure` is config only).
+    /// this state's value when it has one (`on_failure`, `fallback_image`
+    /// and `maxine_root` are config only).
     pub fn effect_over(&self, config: &EffectConfig) -> EffectConfig {
         EffectConfig {
             mode: self.effect.unwrap_or(config.mode),
@@ -1432,6 +1550,7 @@ impl RuntimeState {
             relight_direction: self.relight_direction.unwrap_or(config.relight_direction),
             relight_brightness: self.relight_brightness.unwrap_or(config.relight_brightness),
             on_failure: config.on_failure,
+            fallback_image: config.fallback_image.clone(),
             maxine_root: config.maxine_root.clone(),
         }
     }
@@ -1475,9 +1594,15 @@ impl RuntimeState {
                     .and_then(|t| t.get("settings").map(crate::modules::settings_from))
                     .map(|(_, w)| w)
                     .unwrap_or_default();
+                let modes = table
+                    .as_ref()
+                    .and_then(|t| t.get("camera_modes").map(camera_modes_from))
+                    .map(|(_, w)| w)
+                    .unwrap_or_default();
                 let notes = controls
                     .into_iter()
                     .chain(settings)
+                    .chain(modes)
                     .map(|w| format!("{}: {w}", path.display()))
                     .collect();
                 (state, None, notes)
@@ -1717,6 +1842,7 @@ relight_light = "warm"
 relight_direction = -45
 relight_brightness = 150
 on_failure = "none"
+fallback_image = "/home/u/Pictures/away.png"
 maxine_root = "/home/u/sdk/VideoFX"
 
 [pipewire]
@@ -1764,6 +1890,7 @@ offer_nv12 = false
                 relight_direction: -45,
                 relight_brightness: 150,
                 on_failure: EffectOnFailure::None,
+                fallback_image: Some("/home/u/Pictures/away.png".into()),
                 maxine_root: Some("/home/u/sdk/VideoFX".into()),
             }
         );
@@ -1814,6 +1941,7 @@ offer_nv12 = false
         ];
         expected.loopback.device = Some("/dev/video11".into());
         expected.effect.background_image = Some("/home/user/Pictures/background.png".into());
+        expected.effect.fallback_image = Some("/home/user/Pictures/away.png".into());
         expected.effect.maxine_root = Some("/home/user/.local/opt/maxine/VideoFX".into());
         expected.modules = ModulesConfig {
             dirs: vec!["/home/user/omarchy-modules".into()],
@@ -1853,6 +1981,7 @@ offer_nv12 = false
             "relight_direction",
             "relight_brightness",
             "on_failure",
+            "fallback_image",
             "maxine_root",
             "enabled",
             "offer_nv12",
@@ -2108,6 +2237,11 @@ offer_nv12 = false
                 "unsupported effect failure policy",
             ),
             (
+                "[effect]\nfallback_image = \"away.png\"",
+                "effect.fallback_image",
+                "must be an absolute path",
+            ),
+            (
                 "[effect]\nmode = \"replace\"",
                 "effect.mode",
                 "needs a background image",
@@ -2193,6 +2327,16 @@ offer_nv12 = false
         ));
         c.effect.background_image = Some("/a/b.png".into());
         c.validate().unwrap();
+        c.effect.fallback_image = Some("away.png".into());
+        assert!(matches!(
+            c.validate(),
+            Err(ConfigError::Invalid {
+                key: "effect.fallback_image",
+                ..
+            })
+        ));
+        c.effect.fallback_image = Some("/a/away.png".into());
+        c.validate().unwrap();
         for bad in ["", "sdk/VideoFX"] {
             c.effect.maxine_root = Some(bad.into());
             assert!(matches!(
@@ -2261,6 +2405,18 @@ offer_nv12 = false
         assert_eq!(c.effect.relight_direction, 0);
         assert_eq!(c.effect.relight_brightness, 100);
         assert_eq!(c.effect.on_failure, EffectOnFailure::Black);
+        assert_eq!(c.effect.fallback_image, None);
+        // `image` needs no image: without one it shows black (the daemon
+        // says so in `Warning`). An empty path is none, as for the
+        // background.
+        let c = parse("[effect]\non_failure = \"image\"\nfallback_image = \"\"\n").unwrap();
+        assert_eq!(c.effect.on_failure, EffectOnFailure::Image);
+        assert_eq!(c.effect.fallback_image, None);
+        assert!(!c.to_toml().contains("fallback_image"));
+        let c = parse("[effect]\non_failure = \"image\"\nfallback_image = \"/nowhere/x.png\"\n")
+            .unwrap();
+        assert_eq!(c.effect.fallback_image, Some("/nowhere/x.png".into()));
+        assert_eq!(parse(&c.to_toml()).unwrap(), c);
         // An empty image is the default, and is not written back.
         let c = parse("[effect]\nbackground_image = \"\"\n").unwrap();
         assert_eq!(c.effect.background_image, None);
@@ -2508,6 +2664,101 @@ offer_nv12 = false
             "{text}"
         );
         assert_eq!(RuntimeState::load_noting(&path), (st, None, vec![]));
+    }
+
+    #[test]
+    fn the_last_good_output_contract_round_trips_and_a_bad_one_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let st = RuntimeState {
+            output_good: Some(OutputContract {
+                format: OutputFormat::I420,
+                .."1280x720@30000/1001".parse().unwrap()
+            }),
+            ..RuntimeState::default()
+        };
+        st.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("output_good = \"i420:1280x720@30000/1001 limited\"\n"),
+            "{text}"
+        );
+        let (got, damaged, notes) = RuntimeState::load_noting(&path);
+        assert_eq!(damaged, None);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(got, st);
+        // Unknown: no key.
+        RuntimeState::default().save(&path).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("output_good"));
+        // A bad value is unknown; the file is not damaged.
+        for bad in [
+            "output_good = 3",
+            "output_good = \"1920x1080@30\"",
+            "output_good = \"yuyv:1920x1080@30 limited\"",
+            "output_good = \"nv12:1921x1080@30 limited\"",
+            "output_good = \"nv12:1920x1080@30 wide\"",
+        ] {
+            fs::write(&path, format!("enabled = false\n{bad}\n")).unwrap();
+            let (got, damaged, _) = RuntimeState::load_noting(&path);
+            assert_eq!(damaged, None, "{bad}");
+            assert!(!got.enabled, "{bad}");
+            assert_eq!(got.output_good, None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn camera_modes_round_trip_and_bad_entries_are_dropped_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let mut st = RuntimeState::default();
+        st.camera_modes.insert(
+            "pci-0000:00:14.0-usb-0:2:1.0-video-index0".into(),
+            "3840x2160@30".parse().unwrap(),
+        );
+        st.camera_modes
+            .insert("usb-x".into(), "1280x720@30000/1001".parse().unwrap());
+        st.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[camera_modes]\n"), "{text}");
+        assert!(
+            text.contains("\"pci-0000:00:14.0-usb-0:2:1.0-video-index0\" = \"3840x2160@30\""),
+            "{text}"
+        );
+        let (got, damaged, notes) = RuntimeState::load_noting(&path);
+        assert_eq!(damaged, None);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(got, st);
+        // Nothing chosen: no table.
+        RuntimeState::default().save(&path).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("camera_modes"));
+        // A bad entry is dropped with a note; the file is not damaged.
+        fs::write(
+            &path,
+            "enabled = false\n[camera_modes]\ngood = \"1920x1080@60\"\nnum = 3\n\
+             fmt = \"MJPEG:1920x1080@30\"\nbad = \"fast\"\n",
+        )
+        .unwrap();
+        let (got, damaged, notes) = RuntimeState::load_noting(&path);
+        assert_eq!(damaged, None);
+        assert!(!got.enabled);
+        assert_eq!(got.camera_modes.len(), 1);
+        assert_eq!(got.camera_modes["good"].to_string(), "1920x1080@60");
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("camera_modes.\"num\" must be a string"))
+        );
+        assert!(notes.iter().any(|n| n.contains("names a format")));
+        // Not a table.
+        fs::write(&path, "camera_modes = 3\n").unwrap();
+        let (got, damaged, notes) = RuntimeState::load_noting(&path);
+        assert_eq!(damaged, None);
+        assert!(got.camera_modes.is_empty());
+        assert!(
+            notes[0].contains("camera_modes must be a table"),
+            "{notes:?}"
+        );
     }
 
     #[test]
@@ -2885,7 +3136,8 @@ reset_all = false
             relight_light: RelightLight::Cool,
             relight_direction: 30,
             relight_brightness: 80,
-            on_failure: EffectOnFailure::None,
+            on_failure: EffectOnFailure::Image,
+            fallback_image: Some("/cfg/away.png".into()),
             maxine_root: Some("/cfg/sdk".into()),
         };
         // Nothing set: the config.
@@ -2916,7 +3168,8 @@ reset_all = false
                 relight_light: RelightLight::Warm,
                 relight_direction: -90,
                 relight_brightness: 200,
-                on_failure: EffectOnFailure::None,
+                on_failure: EffectOnFailure::Image,
+                fallback_image: Some("/cfg/away.png".into()),
                 maxine_root: Some("/cfg/sdk".into()),
             }
         );

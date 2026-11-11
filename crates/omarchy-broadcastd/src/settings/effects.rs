@@ -43,6 +43,7 @@ use obc_core::config::{Config, RuntimeState};
 use obc_core::modules::StoredValue;
 use obc_ipc::settings::SCOPE_GLOBAL;
 use obc_ipc::{Condition, ConditionOp, Setting, SettingKind, SettingValue};
+use obc_module_host::registry::FRAME_GENERATION;
 use obc_module_host::settings::{Apply, Op, Role};
 use obc_module_host::{SettingDesc, SettingType};
 use obc_pipeline::effect::StageId;
@@ -313,6 +314,15 @@ pub fn build(inp: &Inputs<'_>) -> Vec<GlobalEntry> {
     for (module, desc) in inp.modules.described() {
         for group in &desc.groups {
             for d in &group.settings {
+                // Frame generation is the output rate's choice, never a
+                // switch of its own.
+                if d.role == Some(Role::Enable)
+                    && d.stage
+                        .as_ref()
+                        .is_some_and(|s| s.as_str() == FRAME_GENERATION)
+                {
+                    continue;
+                }
                 match module_setting(inp, module, d, &values) {
                     Ok(setting) => out.push(GlobalEntry {
                         group: group.id.clone(),

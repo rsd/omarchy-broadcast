@@ -34,8 +34,13 @@ pub struct Camera {
     pub usb_path: Option<String>,
     /// The device node (`/dev/videoN`).
     pub path: PathBuf,
-    /// The capture mode the ingest opens it in.
+    /// The capture mode the ingest opens it in: the one chosen for the
+    /// config's request, or for the mode the user chose for this camera.
     pub mode: VideoMode,
+    /// Every mode its node offers in an ingestible format, in enumeration
+    /// order (empty when not known): what a mode is chosen from, and the
+    /// choices of its `camera.capture.mode` setting.
+    pub modes: Vec<VideoMode>,
 }
 
 impl Camera {
@@ -282,6 +287,7 @@ pub(crate) mod tests {
             usb_path: None,
             path: PathBuf::from(node),
             mode: "NV12:1920x1080@30".parse().unwrap(),
+            modes: Vec::new(),
         }
     }
 

@@ -415,6 +415,260 @@ pub fn parse_v4l2_ctl(text: &str) -> Capabilities {
     caps
 }
 
+// ---- the mode choices offered to the user ----
+
+/// A size and frame rate without a format: `(width, height, fps_num,
+/// fps_den)`, the rate a reduced fraction.
+type SizeRate = (u32, u32, u32, u32);
+
+/// The slowest capture rate offered as a camera mode choice.
+pub const INPUT_MIN_FPS: u32 = 15;
+/// The narrowest capture size offered as a camera mode choice.
+pub const INPUT_MIN_WIDTH: u32 = 640;
+/// The most camera mode choices besides "auto".
+pub const INPUT_MAX_OPTIONS: usize = 15;
+
+/// The output sizes that can be offered (16:9), largest first.
+pub const OUTPUT_SIZES: [(u32, u32); 6] = [
+    (3840, 2160),
+    (2560, 1440),
+    (1920, 1080),
+    (1280, 720),
+    (960, 540),
+    (640, 360),
+];
+/// The slowest output rate offered.
+pub const OUTPUT_MIN_FPS: u32 = 24;
+/// The fastest generated output rate offered.
+pub const OUTPUT_MAX_GENERATED_FPS: u32 = 60;
+/// The most output mode choices.
+pub const OUTPUT_MAX_OPTIONS: usize = 16;
+/// The suffix of the label of an output rate made by frame generation.
+pub const GENERATED_SUFFIX: &str = " (generated)";
+/// The output modes offered when no camera is selected (besides the
+/// current one).
+pub const OUTPUT_FALLBACK_MODES: [&str; 2] = ["1920x1080@30", "1280x720@30"];
+
+/// `WxH@FPS` (`N/D` for a fractional rate): the value of a mode choice,
+/// which [`ModeRequest`] and [`obc_core::OutputContract`] parse.
+pub fn mode_value(width: u32, height: u32, fps_num: u32, fps_den: u32) -> String {
+    let (n, d) = reduce_fraction(fps_num, fps_den);
+    if d == 1 {
+        format!("{width}x{height}@{n}")
+    } else {
+        format!("{width}x{height}@{n}/{d}")
+    }
+}
+
+/// `3840x2160 · 30 fps`: the label of a mode choice, a whole rate as an
+/// integer and a fractional one with two decimals (30000/1001 shows as
+/// 29.97), so that two rates of a size never share a label.
+pub fn mode_label(width: u32, height: u32, fps_num: u32, fps_den: u32) -> String {
+    let (n, d) = reduce_fraction(fps_num, fps_den);
+    if d == 1 {
+        format!("{width}x{height} \u{b7} {n} fps")
+    } else {
+        let fps = f64::from(n) / f64::from(d);
+        format!("{width}x{height} \u{b7} {fps:.2} fps")
+    }
+}
+
+fn fps_of(m: &SizeRate) -> f64 {
+    f64::from(m.2) / f64::from(m.3)
+}
+
+fn area(m: &SizeRate) -> u64 {
+    u64::from(m.0) * u64::from(m.1)
+}
+
+/// The distinct sizes and rates of `caps`, formats left out.
+fn size_rates(caps: &Capabilities) -> Vec<SizeRate> {
+    let mut out: Vec<SizeRate> = Vec::new();
+    for m in &caps.modes {
+        let (n, d) = reduce_fraction(m.fps_num, m.fps_den);
+        let sr = (m.width, m.height, n, d);
+        if !out.contains(&sr) {
+            out.push(sr);
+        }
+    }
+    out
+}
+
+/// Size descending (by area, then width), then rate descending.
+fn sort_choices(list: &mut [SizeRate]) {
+    list.sort_by(|a, b| {
+        area(b)
+            .cmp(&area(a))
+            .then(b.0.cmp(&a.0))
+            .then(fps_of(b).total_cmp(&fps_of(a)))
+    });
+}
+
+/// The camera mode choices of a capture node, as `(value, label)`, the
+/// "auto" choice not included: each distinct size and rate it offers in an
+/// ingestible format (the format is left to [`choose_mode`]), at
+/// [`INPUT_MIN_FPS`] or faster and [`INPUT_MIN_WIDTH`] or wider. Over
+/// `max`, the slowest rates go first (the slowest of all, a size keeping
+/// its fastest rate; ties drop the smaller size's), then the smallest
+/// sizes. Ordered by size, largest first, then by rate, fastest first.
+pub fn input_mode_choices(caps: &Capabilities, max: usize) -> Vec<(String, String)> {
+    let mut list: Vec<SizeRate> = size_rates(caps)
+        .into_iter()
+        .filter(|m| m.0 >= INPUT_MIN_WIDTH && fps_of(m) >= f64::from(INPUT_MIN_FPS) - 1e-9)
+        .collect();
+    sort_choices(&mut list);
+    while list.len() > max {
+        // The slowest rate of a size that has another one.
+        let shared = |m: &SizeRate| list.iter().filter(|o| (o.0, o.1) == (m.0, m.1)).count() > 1;
+        let victim = list
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| shared(m))
+            .min_by(|(_, a), (_, b)| fps_of(a).total_cmp(&fps_of(b)).then(area(a).cmp(&area(b))))
+            .map(|(i, _)| i);
+        match victim {
+            Some(i) => {
+                list.remove(i);
+            }
+            // One rate per size: the smallest size goes (the list is
+            // sorted, so it is the last).
+            None => {
+                list.pop();
+            }
+        }
+    }
+    list.iter()
+        .map(|m| {
+            (
+                mode_value(m.0, m.1, m.2, m.3),
+                mode_label(m.0, m.1, m.2, m.3),
+            )
+        })
+        .collect()
+}
+
+/// The output mode choices, as `(value, label)`, for a camera offering
+/// `caps` (`None`: no camera selected), with `current` (the configured
+/// `output.mode`, always offered) and whether frame generation can double
+/// a rate (`generated`):
+///
+/// - the sizes of [`OUTPUT_SIZES`] the camera offers, at any rate;
+/// - at each, the rates of [`OUTPUT_MIN_FPS`] or faster the camera offers
+///   at that size or a larger one;
+/// - with `generated`, twice each of those rates when that is at most
+///   [`OUTPUT_MAX_GENERATED_FPS`] and not one of them, labelled with
+///   [`GENERATED_SUFFIX`];
+/// - ordered by size, largest first, then by rate, fastest first, at most
+///   [`OUTPUT_MAX_OPTIONS`] (the last ones dropped; the current value is
+///   kept in their place).
+///
+/// With no camera: the current value, [`OUTPUT_FALLBACK_MODES`].
+pub fn output_mode_choices(
+    caps: Option<&Capabilities>,
+    current: &str,
+    generated: bool,
+) -> Vec<(String, String)> {
+    let parse = |s: &str| {
+        s.parse::<ModeRequest>()
+            .ok()
+            .filter(|r| r.format.is_none())
+            .map(|r| {
+                let (n, d) = reduce_fraction(r.fps_num, r.fps_den);
+                (r.width, r.height, n, d)
+            })
+    };
+    // (size and rate, generated)
+    let mut list: Vec<(SizeRate, bool)> = Vec::new();
+    match caps {
+        None => {
+            for v in OUTPUT_FALLBACK_MODES {
+                if let Some(m) = parse(v) {
+                    list.push((m, false));
+                }
+            }
+        }
+        Some(caps) => {
+            let offered = size_rates(caps);
+            for (w, h) in OUTPUT_SIZES {
+                if !offered.iter().any(|m| (m.0, m.1) == (w, h)) {
+                    continue;
+                }
+                let mut rates: Vec<(u32, u32)> = Vec::new();
+                for m in offered.iter().filter(|m| m.0 >= w && m.1 >= h) {
+                    if fps_of(m) >= f64::from(OUTPUT_MIN_FPS) - 1e-9 && !rates.contains(&(m.2, m.3))
+                    {
+                        rates.push((m.2, m.3));
+                    }
+                }
+                for &(n, d) in &rates {
+                    list.push(((w, h, n, d), false));
+                }
+                if generated {
+                    for &(n, d) in &rates {
+                        let Some(n2) = n.checked_mul(2) else { continue };
+                        let double = reduce_fraction(n2, d);
+                        let fps = f64::from(double.0) / f64::from(double.1);
+                        if fps <= f64::from(OUTPUT_MAX_GENERATED_FPS) + 1e-9
+                            && !rates.contains(&double)
+                            && !list.iter().any(|(m, _)| *m == (w, h, double.0, double.1))
+                        {
+                            list.push(((w, h, double.0, double.1), true));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut modes: Vec<SizeRate> = list.iter().map(|(m, _)| *m).collect();
+    sort_choices(&mut modes);
+    modes.truncate(OUTPUT_MAX_OPTIONS);
+    let label = |m: &SizeRate| {
+        let generated = list.iter().any(|(x, g)| x == m && *g);
+        let mut l = mode_label(m.0, m.1, m.2, m.3);
+        if generated {
+            l.push_str(GENERATED_SUFFIX);
+        }
+        l
+    };
+    let mut out: Vec<(String, String)> = modes
+        .iter()
+        .map(|m| (mode_value(m.0, m.1, m.2, m.3), label(m)))
+        .collect();
+    let current_known =
+        out.iter().any(|(v, _)| v == current) || parse(current).is_some_and(|c| modes.contains(&c));
+    if !current_known {
+        if out.len() >= OUTPUT_MAX_OPTIONS {
+            out.pop();
+        }
+        let entry = match parse(current) {
+            Some(m) => (current.to_string(), mode_label(m.0, m.1, m.2, m.3)),
+            None => (current.to_string(), current.to_string()),
+        };
+        // In its place by size and rate, else last.
+        let at = parse(current)
+            .and_then(|c| {
+                out.iter().position(|(v, _)| {
+                    parse(v).is_some_and(|m| {
+                        area(&m) < area(&c)
+                            || (area(&m) == area(&c) && m.0 < c.0)
+                            || ((m.0, m.1) == (c.0, c.1) && fps_of(&m) < fps_of(&c))
+                    })
+                })
+            })
+            .unwrap_or(out.len());
+        out.insert(at, entry);
+    } else if let Some(c) = parse(current)
+        && !out.iter().any(|(v, _)| v == current)
+    {
+        // The current value in its own spelling (`60/2` for `30`), so that
+        // it is one of the options as it is.
+        if let Some(o) = out.iter_mut().find(|(v, _)| parse(v) == Some(c)) {
+            o.0 = current.to_string();
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +683,226 @@ mod tests {
 
     fn mode(s: &str) -> VideoMode {
         s.parse().unwrap()
+    }
+
+    fn values(list: &[(String, String)]) -> Vec<&str> {
+        list.iter().map(|(v, _)| v.as_str()).collect()
+    }
+
+    #[test]
+    fn mx_brio_input_choices_keep_each_size_at_its_fastest_rate() {
+        let list = input_mode_choices(&parse_v4l2_ctl(BRIO), INPUT_MAX_OPTIONS);
+        assert_eq!(
+            values(&list),
+            vec![
+                "3840x2160@30",
+                "2560x1440@30",
+                "1920x1080@60",
+                "1920x1080@30",
+                "1600x896@60",
+                "1600x896@30",
+                "1280x720@60",
+                "1280x720@30",
+                "1024x576@60",
+                "960x540@60",
+                "800x600@60",
+                "848x480@60",
+                "800x448@60",
+                "640x480@60",
+                "640x360@60",
+            ]
+        );
+        assert_eq!(list[0].1, "3840x2160 \u{b7} 30 fps");
+        // The 4K choice is MJPEG once resolved: the format is left to
+        // the selection rule.
+        let req: ModeRequest = list[0].0.parse().unwrap();
+        assert_eq!(req.format, None);
+        assert_eq!(pick(BRIO, &list[0].0).mode, mode("MJPEG:3840x2160@30"));
+        // 1080p60 resolves to NV12.
+        assert_eq!(pick(BRIO, "1920x1080@60").mode, mode("NV12:1920x1080@60"));
+    }
+
+    #[test]
+    fn fhd_input_choices_have_no_4k_and_no_slow_or_narrow_mode() {
+        let list = input_mode_choices(&parse_v4l2_ctl(FHD), INPUT_MAX_OPTIONS);
+        assert_eq!(
+            values(&list),
+            vec![
+                "1920x1080@30",
+                "1280x720@30",
+                "960x540@30",
+                "960x540@15",
+                "848x480@30",
+                "848x480@15",
+                "640x480@30",
+                "640x360@30",
+            ]
+        );
+    }
+
+    #[test]
+    fn input_choices_over_the_limit_drop_slow_rates_then_small_sizes() {
+        let c = parse_v4l2_ctl(BRIO);
+        // Three: the slowest rates go first, then the smallest sizes.
+        let list = input_mode_choices(&c, 3);
+        assert_eq!(
+            values(&list),
+            vec!["3840x2160@30", "2560x1440@30", "1920x1080@60"]
+        );
+        // A fractional rate is shown with two decimals and kept exact.
+        let mut caps = Capabilities::default();
+        caps.push_mode(PixelFormat::Nv12, 1280, 720, 30000, 1001);
+        caps.push_mode(PixelFormat::Nv12, 1280, 720, 10, 1);
+        caps.push_mode(PixelFormat::Nv12, 320, 240, 30, 1);
+        let list = input_mode_choices(&caps, INPUT_MAX_OPTIONS);
+        assert_eq!(
+            list,
+            vec![(
+                "1280x720@30000/1001".to_string(),
+                "1280x720 \u{b7} 29.97 fps".to_string()
+            )]
+        );
+        // Next to 30 at the same size: two labels.
+        caps.push_mode(PixelFormat::Nv12, 1280, 720, 30, 1);
+        let list = input_mode_choices(&caps, INPUT_MAX_OPTIONS);
+        let labels: Vec<&str> = list.iter().map(|(_, l)| l.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["1280x720 \u{b7} 30 fps", "1280x720 \u{b7} 29.97 fps"]
+        );
+    }
+
+    #[test]
+    fn mode_labels_show_a_fractional_rate_with_two_decimals() {
+        assert_eq!(mode_label(1920, 1080, 30, 1), "1920x1080 \u{b7} 30 fps");
+        assert_eq!(mode_label(1920, 1080, 60, 2), "1920x1080 \u{b7} 30 fps");
+        assert_eq!(
+            mode_label(1920, 1080, 30000, 1001),
+            "1920x1080 \u{b7} 29.97 fps"
+        );
+        assert_eq!(
+            mode_label(1920, 1080, 60000, 1001),
+            "1920x1080 \u{b7} 59.94 fps"
+        );
+        assert_eq!(mode_label(640, 480, 15, 2), "640x480 \u{b7} 7.50 fps");
+        // The output choices follow the same rule, generated rates too.
+        let mut caps = Capabilities::default();
+        caps.push_mode(PixelFormat::Nv12, 1920, 1080, 30000, 1001);
+        caps.push_mode(PixelFormat::Nv12, 1920, 1080, 30, 1);
+        let list = output_mode_choices(Some(&caps), "1920x1080@30", true);
+        let labels: Vec<&str> = list.iter().map(|(_, l)| l.as_str()).collect();
+        assert!(labels.contains(&"1920x1080 \u{b7} 29.97 fps"), "{labels:?}");
+        assert!(labels.contains(&"1920x1080 \u{b7} 30 fps"), "{labels:?}");
+        assert!(
+            labels.contains(&"1920x1080 \u{b7} 59.94 fps (generated)"),
+            "{labels:?}"
+        );
+        let mut unique = labels.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), labels.len(), "{labels:?}");
+    }
+
+    #[test]
+    fn mx_brio_output_choices() {
+        let c = parse_v4l2_ctl(BRIO);
+        let list = output_mode_choices(Some(&c), "1920x1080@30", false);
+        assert_eq!(
+            values(&list),
+            vec![
+                "3840x2160@30",
+                "3840x2160@24",
+                "2560x1440@30",
+                "2560x1440@24",
+                "1920x1080@60",
+                "1920x1080@30",
+                "1920x1080@24",
+                "1280x720@60",
+                "1280x720@30",
+                "1280x720@24",
+                "960x540@60",
+                "960x540@30",
+                "960x540@24",
+                "640x360@60",
+                "640x360@30",
+                "640x360@24",
+            ]
+        );
+        // With frame generation: twice a native rate up to 60, when not
+        // native; cut at 16.
+        let list = output_mode_choices(Some(&c), "1920x1080@30", true);
+        assert_eq!(list.len(), OUTPUT_MAX_OPTIONS);
+        assert_eq!(
+            list[0],
+            (
+                "3840x2160@60".to_string(),
+                "3840x2160 \u{b7} 60 fps (generated)".to_string()
+            )
+        );
+        assert!(list.contains(&("1920x1080@60".into(), "1920x1080 \u{b7} 60 fps".into())));
+        assert!(list.contains(&(
+            "1920x1080@48".into(),
+            "1920x1080 \u{b7} 48 fps (generated)".into()
+        )));
+        assert!(!values(&list).contains(&"1920x1080@120"));
+    }
+
+    #[test]
+    fn fhd_output_choices() {
+        let c = parse_v4l2_ctl(FHD);
+        let list = output_mode_choices(Some(&c), "1920x1080@30", false);
+        assert_eq!(
+            values(&list),
+            vec!["1920x1080@30", "1280x720@30", "960x540@30", "640x360@30"]
+        );
+        let list = output_mode_choices(Some(&c), "1920x1080@30", true);
+        assert_eq!(
+            list[..2],
+            [
+                (
+                    "1920x1080@60".to_string(),
+                    "1920x1080 \u{b7} 60 fps (generated)".to_string()
+                ),
+                (
+                    "1920x1080@30".to_string(),
+                    "1920x1080 \u{b7} 30 fps".to_string()
+                ),
+            ]
+        );
+        assert_eq!(list.len(), 8);
+    }
+
+    #[test]
+    fn output_choices_always_offer_the_current_value() {
+        let c = parse_v4l2_ctl(FHD);
+        // Not offered by the camera: in its place by size.
+        let list = output_mode_choices(Some(&c), "1600x900@25", false);
+        assert_eq!(
+            values(&list),
+            vec![
+                "1920x1080@30",
+                "1600x900@25",
+                "1280x720@30",
+                "960x540@30",
+                "640x360@30"
+            ]
+        );
+        // In its own spelling.
+        let list = output_mode_choices(Some(&c), "1280x720@60/2", false);
+        assert!(values(&list).contains(&"1280x720@60/2"));
+        assert!(!values(&list).contains(&"1280x720@30"));
+        // A full list keeps it in place of the last.
+        let list = output_mode_choices(Some(&parse_v4l2_ctl(BRIO)), "800x600@20", false);
+        assert_eq!(list.len(), OUTPUT_MAX_OPTIONS);
+        assert!(values(&list).contains(&"800x600@20"));
+        // No camera: the current value and two common modes.
+        let list = output_mode_choices(None, "3840x2160@30", false);
+        assert_eq!(
+            values(&list),
+            vec!["3840x2160@30", "1920x1080@30", "1280x720@30"]
+        );
+        let list = output_mode_choices(None, "1920x1080@30", true);
+        assert_eq!(values(&list), vec!["1920x1080@30", "1280x720@30"]);
     }
 
     #[test]

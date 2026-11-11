@@ -87,7 +87,9 @@ pub const OBC_MODULE_ABI_MAJOR: u32 = 1;
 /// The minor version of this ABI. A minor version only adds (structure
 /// fields at the end, vtable entries at the end, constants): the host
 /// accepts a module built for its own or an older minor version.
-pub const OBC_MODULE_ABI_MINOR: u32 = 0;
+///
+/// * 1.1 adds [`OBC_FRAME_FLAG_REPEAT`].
+pub const OBC_MODULE_ABI_MINOR: u32 = 1;
 
 /// The packed ABI version this crate describes: `major << 16 | minor`
 /// ([`obc_module_abi_pack`]).
@@ -274,6 +276,25 @@ pub const OBC_FORMAT_BGR: obc_format = 6;
 /// (a camera switch or a restart), so temporal state should not carry over.
 pub const OBC_FRAME_FLAG_NEW_SOURCE: u32 = 1 << 0;
 
+/// A bit of [`obc_frame::flags`], since ABI 1.1: this frame repeats the
+/// camera frame of the previous call. The output clock emits a frame on
+/// every tick of the output rate; when no new camera frame has arrived
+/// since the last tick, it emits the last one again, and the frame of this
+/// call has the same picture as the previous one (it was processed in
+/// that call too). A module may use the flag to tell a repeat from a fresh
+/// frame, for instance to make an intermediate picture from two fresh
+/// frames; one that ignores it processes the repeat as any other frame.
+///
+/// The host sets it only for a module built for ABI 1.1 or later: a module
+/// of ABI 1.0 never sees it, and its repeats are processed as before.
+pub const OBC_FRAME_FLAG_REPEAT: u32 = 1 << 1;
+
+/// The [`obc_frame::flags`] bits of ABI 1.0.
+pub const OBC_FRAME_FLAGS_1_0: u32 = OBC_FRAME_FLAG_NEW_SOURCE;
+
+/// The [`obc_frame::flags`] bits of this ABI version.
+pub const OBC_FRAME_FLAGS_ALL: u32 = OBC_FRAME_FLAG_NEW_SOURCE | OBC_FRAME_FLAG_REPEAT;
+
 /// The most planes a frame has.
 pub const OBC_MAX_PLANES: usize = 4;
 
@@ -329,7 +350,9 @@ pub struct obc_frame {
     pub dmabuf_modifier: u64,
     /// The presentation time in nanoseconds; -1 when unknown.
     pub pts_ns: i64,
-    /// `OBC_FRAME_FLAG_*` bits; the others are zero.
+    /// `OBC_FRAME_FLAG_*` bits; the others are zero. The host sets only
+    /// the bits of the module's ABI version (ABI 1.0:
+    /// [`OBC_FRAME_FLAG_NEW_SOURCE`]; 1.1 adds [`OBC_FRAME_FLAG_REPEAT`]).
     pub flags: u32,
     /// Zero.
     pub reserved0: u32,
@@ -792,8 +815,8 @@ mod tests {
 
     #[test]
     fn version_packing() {
-        assert_eq!(OBC_MODULE_ABI_VERSION, 0x0001_0000);
-        assert_eq!(obc_module_abi_pack(1, 0), OBC_MODULE_ABI_VERSION);
+        assert_eq!(OBC_MODULE_ABI_VERSION, 0x0001_0001);
+        assert_eq!(obc_module_abi_pack(1, 1), OBC_MODULE_ABI_VERSION);
         assert_eq!(obc_module_abi_pack(2, 7), 0x0002_0007);
         assert_eq!(obc_module_abi_major(0x0002_0007), 2);
         assert_eq!(obc_module_abi_minor(0x0002_0007), 7);
@@ -997,6 +1020,9 @@ mod tests {
             [0, 1, 2, 3, 4, 5, 6, 7]
         );
         assert_eq!(OBC_FRAME_FLAG_NEW_SOURCE, 1);
+        assert_eq!(OBC_FRAME_FLAG_REPEAT, 2);
+        assert_eq!(OBC_FRAME_FLAGS_1_0, 1);
+        assert_eq!(OBC_FRAME_FLAGS_ALL, 3);
         assert_eq!(
             [
                 OBC_VALUE_BOOL,

@@ -56,6 +56,11 @@
 //!   [`StageChain::reset_temporal`](obc_backend::StageChain::reset_temporal) before the next frame it processes; a
 //!   stage the chain drops instead is loaded again by the worker, and the
 //!   frames run without it meanwhile.
+//! * **A repeat**: a buffer carrying [`REPEAT_FLAG`](crate::REPEAT_FLAG)
+//!   is run through
+//!   [`StageChain::process_repeat`](obc_backend::StageChain::process_repeat)
+//!   instead of `process`; a module of ABI 1.1 sees the flag, one of 1.0
+//!   processes the repeat as any frame.
 //! * **Stopping** (PAUSED to READY) unloads the chain synchronously (with
 //!   the CUDA context current for a CUDA chain), then releases the host
 //!   copy, the stream and the context reference.

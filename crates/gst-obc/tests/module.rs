@@ -367,7 +367,7 @@ impl Rig {
             let b = b.make_mut();
             b.set_pts(gst::ClockTime::from_nseconds(self.pts));
             b.set_duration(gst::ClockTime::from_nseconds(33_333_333));
-            b.unset_flags(gst_obc::NEW_SOURCE_FLAG);
+            b.unset_flags(gst_obc::NEW_SOURCE_FLAG | gst_obc::REPEAT_FLAG);
             b.set_flags(flags);
         }
         self.pts += 33_333_333;
@@ -935,6 +935,157 @@ fn the_new_source_flag_resets_the_temporal_state_and_reloads_a_dropped_stage() {
         r.frame();
     }
     assert_eq!(get(&fake.log.resets), 1, "once per new source");
+}
+
+#[test]
+fn a_repeat_goes_to_the_chain_as_a_repeat() {
+    let fake = FakeChainFactory::host(FakeChainConfig::default());
+    let mut r = Rig::new(Some(fake.clone()), &[tint()]);
+    r.until_status("tint", EffectStatus::Ready);
+    assert_eq!(r.frame(), tinted(FAKE_TINT_UV));
+    assert_eq!(get(&fake.log.repeats), 0, "a fresh frame");
+    let frames = get(&fake.log.frames);
+    assert_eq!(
+        r.frame_with(gst_obc::REPEAT_FLAG),
+        tinted(FAKE_TINT_UV),
+        "the chain ran on the repeat"
+    );
+    assert_eq!(get(&fake.log.repeats), 1);
+    assert_eq!(get(&fake.log.frames), frames + 1);
+    assert_eq!(r.frame(), tinted(FAKE_TINT_UV));
+    assert_eq!(get(&fake.log.repeats), 1, "the next fresh frame is not one");
+}
+
+/// The repeat flag as the session's output carries it: set by the output
+/// clock (here appsrc), through an element that writes every frame into a
+/// new buffer and copies the input's metadata with BaseTransform's
+/// default, as `obceffect` does (`prepare_output_buffer`; here a pair of
+/// `videoconvert`s, `obceffect` being CUDA only), then an `obcmodule` that
+/// processes in place, then a second one (as frame generation's chain runs
+/// after the others). Both chains get the repeat as a repeat.
+#[test]
+fn a_repeat_reaches_a_second_module_through_a_copying_element() {
+    require_elements(&["appsrc", "appsink", "videoconvert"]);
+    module::register().unwrap();
+    let launch = format!(
+        "appsrc name=src format=time is-live=true caps={SYSTEM} ! videoconvert ! \
+         video/x-raw,format=I420 ! videoconvert ! video/x-raw,format=NV12 ! obcmodule name=a ! \
+         obcmodule name=b ! appsink name=sink sync=false"
+    );
+    let pipeline = gst::parse::launch(&launch)
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+    let first = FakeChainFactory::host(FakeChainConfig::default());
+    let second = FakeChainFactory::host(FakeChainConfig::default());
+    for (name, fake, stage) in [("a", &first, tint()), ("b", &second, lift())] {
+        let m = pipeline
+            .by_name(name)
+            .unwrap()
+            .downcast::<ObcModule>()
+            .unwrap();
+        m.set_factory(Some(Arc::clone(fake) as Arc<dyn StageChainFactory>));
+        m.apply(&[stage]).unwrap();
+    }
+    // What leaves the copying element: a new buffer, the flags of the input.
+    let copied: Arc<Mutex<Vec<bool>>> = Arc::default();
+    let c = Arc::clone(&copied);
+    pipeline
+        .by_name("a")
+        .unwrap()
+        .static_pad("sink")
+        .unwrap()
+        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(b) = info.buffer() {
+                c.lock().unwrap().push(gst_obc::has_repeat_flag(b));
+            }
+            gst::PadProbeReturn::Ok
+        });
+    let src = pipeline
+        .by_name("src")
+        .unwrap()
+        .downcast::<gst_app::AppSrc>()
+        .unwrap();
+    let sink = pipeline
+        .by_name("sink")
+        .unwrap()
+        .downcast::<gst_app::AppSink>()
+        .unwrap();
+    pipeline.set_state(gst::State::Playing).unwrap();
+    let input = input_bytes();
+    let mut pts = 0u64;
+    let mut push = |flags: gst::BufferFlags| -> Vec<u8> {
+        let mut b = gst::Buffer::from_mut_slice(input.clone());
+        {
+            let b = b.get_mut().unwrap();
+            b.set_pts(gst::ClockTime::from_nseconds(pts));
+            b.set_duration(gst::ClockTime::from_nseconds(33_333_333));
+            b.set_flags(flags);
+        }
+        pts += 33_333_333;
+        src.push_buffer(b).expect("push");
+        let sample = sink
+            .try_pull_sample(gst::ClockTime::from_seconds(5))
+            .expect("an output frame");
+        packed_buffer(sample.buffer().unwrap(), sample.caps().unwrap())
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while get(&first.log.frames) == 0 || get(&second.log.frames) == 0 {
+        assert!(Instant::now() < deadline, "the chains never ran");
+        push(gst::BufferFlags::empty());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(get(&first.log.repeats), 0);
+    assert_eq!(get(&second.log.repeats), 0);
+    let both = Seen {
+        y: Some(FAKE_LIFT_Y),
+        ..tinted(FAKE_TINT_UV)
+    };
+    let (f1, f2) = (get(&first.log.frames), get(&second.log.frames));
+    let out = push(gst_obc::REPEAT_FLAG);
+    assert_eq!(
+        classify(&out, &input),
+        both,
+        "both chains ran on the repeat"
+    );
+    assert_eq!(get(&first.log.repeats), 1);
+    assert_eq!(
+        get(&second.log.repeats),
+        1,
+        "the second element saw the flag"
+    );
+    assert_eq!(get(&first.log.frames), f1 + 1);
+    assert_eq!(get(&second.log.frames), f2 + 1);
+    assert_eq!(copied.lock().unwrap().last(), Some(&true));
+    // A fresh frame is not a repeat.
+    push(gst::BufferFlags::empty());
+    assert_eq!(get(&first.log.repeats), 1);
+    assert_eq!(get(&second.log.repeats), 1);
+    assert_eq!(copied.lock().unwrap().last(), Some(&false));
+    pipeline.set_state(gst::State::Null).unwrap();
+}
+
+/// The only stage switched off while the element runs (frame generation
+/// off in its own chain at a capture mode change): the chain is unloaded
+/// and dropped at once, so nothing of it stays loaded, and the frames pass
+/// through.
+#[test]
+fn the_only_stage_switched_off_unloads_the_chain() {
+    let fake = FakeChainFactory::host(FakeChainConfig::default());
+    let mut r = Rig::new(Some(fake.clone()), &[tint()]);
+    r.until_status("tint", EffectStatus::Ready);
+    assert_eq!(r.frame(), tinted(FAKE_TINT_UV));
+    let mut off = tint();
+    off.enabled = false;
+    r.module.apply(&[off]).unwrap();
+    r.frames_until(Duration::from_secs(5), |_| get(&fake.log.unloads) == 1);
+    assert_eq!(r.frame(), INPUT);
+    let frames = get(&fake.log.frames);
+    assert_eq!(r.frame(), INPUT);
+    assert_eq!(get(&fake.log.frames), frames, "no chain call");
+    assert_eq!(get(&fake.log.unloads), 1);
+    r.stop();
+    assert_eq!(get(&fake.log.unloads), 1, "nothing left to unload");
 }
 
 #[test]

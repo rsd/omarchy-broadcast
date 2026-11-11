@@ -50,8 +50,8 @@ use obc_backend::{
 };
 use obc_module_abi::{
     OBC_CHROMA_SITING_COSITED, OBC_CHROMA_SITING_JPEG, OBC_CHROMA_SITING_MPEG2, OBC_FORMAT_I420,
-    OBC_FORMAT_NV12, OBC_FRAME_CUDA, OBC_FRAME_HOST, OBC_MATRIX_BT601, OBC_MATRIX_BT709, obc_cuda,
-    obc_frame, obc_matrix, obc_plane,
+    OBC_FORMAT_NV12, OBC_FRAME_CUDA, OBC_FRAME_FLAG_REPEAT, OBC_FRAME_HOST, OBC_MATRIX_BT601,
+    OBC_MATRIX_BT709, obc_cuda, obc_frame, obc_matrix, obc_plane,
 };
 
 use crate::manifest::{Frames, Slot};
@@ -777,33 +777,17 @@ impl StageChain for ModuleChain {
         frame: ChainFrame<'_>,
         live: &BTreeMap<StageId, Params>,
     ) -> Result<(), BackendError> {
-        if self.kind != Some(frame.kind()) {
-            return Err(BackendError::InvalidInput(format!(
-                "a {} frame for a chain loaded for {}",
-                frame.kind(),
-                self.kind.map_or("nothing", FrameKind::as_str)
-            )));
-        }
-        let chain = self.instance.chain().to_vec();
-        let live: Vec<(&str, &str, &Value)> = flatten(live, &chain).collect();
-        let raw = match &frame {
-            ChainFrame::Cuda { gpu, frame } => {
-                check_context(gpu)?;
-                frame.validate()?;
-                cuda_nv12(frame, gpu)
-            }
-            ChainFrame::Host(f) => {
-                f.validate()?;
-                host_nv12(f)
-            }
-        };
-        // SAFETY: in place. A CUDA frame is device memory of the current
-        // context (the seam's contract); a host frame's planes are valid for
-        // reads and writes of their extent and accessed by nothing else
-        // during the call (`HostNv12`'s contract), and `frame` holds its
-        // only borrow.
-        let result = unsafe { self.instance.process(&raw, &raw, &live) };
-        result.map_err(|e| backend_error(e, Phase::Run))
+        self.run(frame, live, 0)
+    }
+
+    /// The frame with `OBC_FRAME_FLAG_REPEAT`, which the module sees from
+    /// ABI 1.1 on (the host clears it for a module of ABI 1.0).
+    fn process_repeat(
+        &mut self,
+        frame: ChainFrame<'_>,
+        live: &BTreeMap<StageId, Params>,
+    ) -> Result<(), BackendError> {
+        self.run(frame, live, OBC_FRAME_FLAG_REPEAT)
     }
 
     fn reset_temporal(&mut self) -> Result<StageList, BackendError> {
@@ -818,6 +802,45 @@ impl StageChain for ModuleChain {
     fn unload(&mut self) {
         self.instance.unload();
         self.kind = None;
+    }
+}
+
+impl ModuleChain {
+    /// Runs one frame, in place, with the `OBC_FRAME_FLAG_*` bits `flags`.
+    fn run(
+        &mut self,
+        frame: ChainFrame<'_>,
+        live: &BTreeMap<StageId, Params>,
+        flags: u32,
+    ) -> Result<(), BackendError> {
+        if self.kind != Some(frame.kind()) {
+            return Err(BackendError::InvalidInput(format!(
+                "a {} frame for a chain loaded for {}",
+                frame.kind(),
+                self.kind.map_or("nothing", FrameKind::as_str)
+            )));
+        }
+        let chain = self.instance.chain().to_vec();
+        let live: Vec<(&str, &str, &Value)> = flatten(live, &chain).collect();
+        let mut raw = match &frame {
+            ChainFrame::Cuda { gpu, frame } => {
+                check_context(gpu)?;
+                frame.validate()?;
+                cuda_nv12(frame, gpu)
+            }
+            ChainFrame::Host(f) => {
+                f.validate()?;
+                host_nv12(f)
+            }
+        };
+        raw.flags = flags;
+        // SAFETY: in place. A CUDA frame is device memory of the current
+        // context (the seam's contract); a host frame's planes are valid for
+        // reads and writes of their extent and accessed by nothing else
+        // during the call (`HostNv12`'s contract), and `frame` holds its
+        // only borrow.
+        let result = unsafe { self.instance.process(&raw, &raw, &live) };
+        result.map_err(|e| backend_error(e, Phase::Run))
     }
 }
 

@@ -50,6 +50,14 @@
 //! drops are taken out of what is loaded and a new request has the worker
 //! load them again.
 //!
+//! # A repeat
+//!
+//! A buffer with the repeat flag (the output clock emitted the last camera
+//! frame again) is run through the chain with
+//! `StageChain::process_repeat`, so a module of ABI 1.1 sees it as a
+//! repeat (`OBC_FRAME_FLAG_REPEAT`); the rest is as for any frame (the
+//! copy, the restore, a stage dropped and the frame run again).
+//!
 //! # CUDA context and stream
 //!
 //! As in `obceffect`: the context is the one of the first input memory (the
@@ -81,7 +89,7 @@ use obc_gpu::{ContextGuard, CuContext, CuStream, DeviceNv12Buffer, PinnedHostBuf
 
 use super::{ModuleStats, STATUS_MESSAGE, chain_kind};
 use crate::cuda::{self, MAP_CUDA};
-use crate::effect::has_new_source_flag;
+use crate::effect::{has_new_source_flag, has_repeat_flag};
 use crate::settings::{EffectStatus, StageRequest, StageStats};
 use crate::video::{CudaFrame, colour_of, input_context};
 
@@ -500,6 +508,8 @@ struct StreamState {
     process: bool,
     live: Arc<BTreeMap<StageId, Params>>,
     reset_pending: bool,
+    /// This frame carries [`REPEAT_FLAG`](crate::REPEAT_FLAG).
+    repeat: bool,
     gpu: Option<Gpu>,
     /// The copy of a system-memory frame as it came in (see "Failures"
     /// above), kept for the next frame.
@@ -792,6 +802,7 @@ impl ObcModule {
         if has_new_source_flag(inbuf) {
             st.reset_pending = true;
         }
+        st.repeat = has_repeat_flag(inbuf);
         st.process = process;
         st.live = live;
         drop(st);
@@ -822,6 +833,7 @@ impl ObcModule {
         }
         let live = Arc::clone(&st.live);
         let reset = std::mem::take(&mut st.reset_pending);
+        let repeat = st.repeat;
         let mut run = Run::default();
         let mut converted = false;
         match (key.kind, cuda) {
@@ -839,7 +851,7 @@ impl ObcModule {
                     frame: frame.nv12(),
                     scratch: &mut gpu.scratch,
                 };
-                run = run_chain(chain.as_mut(), key, reset, &live, &mut target);
+                run = run_chain(chain.as_mut(), key, reset, repeat, &live, &mut target);
                 // SAFETY: our own stream; the frame stays mapped until it
                 // is done.
                 unsafe { obc_gpu::stream_synchronize(stream) }.map_err(|e| e.to_string())?;
@@ -867,7 +879,7 @@ impl ObcModule {
                     uv_len,
                     scratch: &mut st.scratch,
                 };
-                run = run_chain(chain.as_mut(), key, reset, &live, &mut target);
+                run = run_chain(chain.as_mut(), key, reset, repeat, &live, &mut target);
                 drop(frame);
             }
             (FrameKind::Host, true) => {
@@ -893,7 +905,7 @@ impl ObcModule {
                 let staging = gpu.staging.as_mut().expect("allocated above");
                 let host = staging.nv12(w, h, pitch).map_err(|e| e.to_string())?;
                 let mut target = HostCopy { dev, host, stream };
-                run = run_chain(chain.as_mut(), key, reset, &live, &mut target);
+                run = run_chain(chain.as_mut(), key, reset, repeat, &live, &mut target);
                 let host = target.host;
                 if run.ran.is_some() {
                     // SAFETY: as for the download.
@@ -1042,12 +1054,8 @@ trait RunFrame {
     fn save(&mut self) -> Result<(), String>;
     /// Puts the frame back as `save` found it.
     fn restore(&mut self) -> Result<(), String>;
-    /// Runs the chain on the frame.
-    fn process(
-        &mut self,
-        chain: &mut dyn StageChain,
-        live: &BTreeMap<StageId, Params>,
-    ) -> Result<(), BackendError>;
+    /// The frame, as the chain takes it.
+    fn frame(&mut self) -> ChainFrame<'_>;
 }
 
 /// A CUDA frame, run in place; the copy is a device buffer of the stream.
@@ -1091,18 +1099,11 @@ impl RunFrame for CudaInPlace<'_> {
             .map_err(|e| e.to_string())
     }
 
-    fn process(
-        &mut self,
-        chain: &mut dyn StageChain,
-        live: &BTreeMap<StageId, Params>,
-    ) -> Result<(), BackendError> {
-        chain.process(
-            ChainFrame::Cuda {
-                gpu: &self.gpu,
-                frame: &self.frame,
-            },
-            live,
-        )
+    fn frame(&mut self) -> ChainFrame<'_> {
+        ChainFrame::Cuda {
+            gpu: &self.gpu,
+            frame: &self.frame,
+        }
     }
 }
 
@@ -1144,12 +1145,8 @@ impl RunFrame for HostInPlace<'_> {
         Ok(())
     }
 
-    fn process(
-        &mut self,
-        chain: &mut dyn StageChain,
-        live: &BTreeMap<StageId, Params>,
-    ) -> Result<(), BackendError> {
-        chain.process(ChainFrame::Host(&mut self.host), live)
+    fn frame(&mut self) -> ChainFrame<'_> {
+        ChainFrame::Host(&mut self.host)
     }
 }
 
@@ -1178,12 +1175,8 @@ impl RunFrame for HostCopy {
         self.save()
     }
 
-    fn process(
-        &mut self,
-        chain: &mut dyn StageChain,
-        live: &BTreeMap<StageId, Params>,
-    ) -> Result<(), BackendError> {
-        chain.process(ChainFrame::Host(&mut self.host), live)
+    fn frame(&mut self) -> ChainFrame<'_> {
+        ChainFrame::Host(&mut self.host)
     }
 }
 
@@ -1191,11 +1184,14 @@ impl RunFrame for HostCopy {
 /// reset first, then the chain on `frame` with the live parameters of the
 /// loaded stages, again without a stage each time one fails alone. The
 /// frame is kept before the first call and put back after every failing
-/// one: a frame the chain did not process is as it came in.
+/// one: a frame the chain did not process is as it came in. A `repeat`
+/// (the buffer carried [`REPEAT_FLAG`](crate::REPEAT_FLAG)) goes to the
+/// chain as one ([`StageChain::process_repeat`]).
 fn run_chain(
     chain: &mut dyn StageChain,
     key: &mut LoadedKey,
     reset: bool,
+    repeat: bool,
     live: &BTreeMap<StageId, Params>,
     frame: &mut impl RunFrame,
 ) -> Run {
@@ -1229,7 +1225,12 @@ fn run_chain(
             .filter(|(s, _)| wants(&key.stages, s.as_str()))
             .map(|(s, p)| (s.clone(), p.clone()))
             .collect();
-        match frame.process(&mut *chain, &frame_live) {
+        let result = if repeat {
+            chain.process_repeat(frame.frame(), &frame_live)
+        } else {
+            chain.process(frame.frame(), &frame_live)
+        };
+        match result {
             Ok(()) => {
                 run.ran = Some(key.stages.iter().map(|(s, _)| s.clone()).collect());
                 break;

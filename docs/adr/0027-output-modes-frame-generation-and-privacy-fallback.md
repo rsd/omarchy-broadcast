@@ -1,0 +1,107 @@
+# ADR-0027: Capture and output modes chosen in the panel, frame generation as a stage, and a privacy fallback that can show an image
+
+- **Status:** Accepted (2026-11-11), implemented in daemon 0.27.0, D-Bus revision 12 and module ABI 1.1. Amends [ADR-0024](0024-stackable-stages-and-effects-in-the-settings-schema.md) (video frame generation is accepted, as a stage a module provides; the rejection of TrueHDR is kept, with a further reason) and [ADR-0012](0012-video-effects-and-maxine-backend.md) (a repeated frame is no longer processed again: the effect element sends its last processed output). Builds on [ADR-0010](0010-phase-locked-output-clock.md) and [ADR-0015](0015-cadence-emission-for-sub-rate-inputs.md) (the output clock and its repeats), [ADR-0023](0023-settings-schema.md) (the capture mode is a setting of the tree), [ADR-0025](0025-loadable-modules.md) (frame generation is a stage of a module; the ABI gains a flag) and [ADR-0026](0026-config-d-and-managed-config.md) (the output mode and the failure policy are rows of the config schema, written to the managed file). Reference: [../dbus-api.md](../dbus-api.md#capture-and-output-modes-revision-12), [../cli-json.md](../cli-json.md#config), [../modules.md](../modules.md#the-frame-generation-stage), [../config.example.toml](../config.example.toml), [../setup/loopback.md](../setup/loopback.md#changing-the-output-size-and-rate).
+
+## Context
+- A camera that offers 4K never delivered it. The default capture request is 1920x1080 at 60 fps, `camera.mode` was a free-form text row that the daemon did not let a client change, and no list of the modes a camera reports was published anywhere. Selecting a mode that the camera does offer was a hand edit of `config.toml`.
+- The output contract (size, rate) was the same kind of setting: read only in the config schema, fixed in `config.toml`, and nothing told a user which sizes and rates made sense for the camera in use. Changing it means the virtual camera's format changes, and a v4l2loopback device with `exclusive_caps` keeps the format an application opened it with for as long as that application holds it ([ADR-0004](0004-v4l2loopback-first.md), [ADR-0022](0022-crash-recovery-for-consumers.md)).
+- The output clock emits a frame on every tick of the output rate and repeats the last frame when the camera is slower ([ADR-0010](0010-phase-locked-output-clock.md)). A 30 fps camera into a 60 fps output therefore sends every picture twice. [ADR-0024](0024-stackable-stages-and-effects-in-the-settings-schema.md) rejected video frame generation because it needs the next frame and so adds latency. That reasoning compared it with a fresh frame going out on the next tick; it did not consider an output at twice the camera's rate, where the second tick of each pair is a repeat anyway.
+- Modules provide the effects ([ADR-0025](0025-loadable-modules.md)). A feature that makes an output rate faster than the camera's is not specific to one vendor, so it cannot be a Maxine setting.
+- Every app that holds the virtual camera, and the writer that feeds it, must keep a feed whatever the user picks. A new output format can be refused by the device, can be held by an application in another format, or can fail to start a session output. The camera must never show the room to someone who asked for a background effect, whichever of these happens.
+- `[effect] on_failure` ([ADR-0012](0012-video-effects-and-maxine-backend.md), revision 11) had two answers when an effect cannot run: black frames or the camera image. A user who wants the camera hidden but does not want a black picture in a call had no third choice.
+- TrueHDR, rejected in [ADR-0024](0024-stackable-stages-and-effects-in-the-settings-schema.md), was looked at again.
+
+## Decision
+
+### The capture mode is a per-camera setting in the panel
+- A setting `camera.capture.mode`, labelled "Resolution and frame rate", in a new first group "Capture" of the camera settings (scope `camera`, kept per camera in the state file's `[camera_modes]` table). Its value is `auto` (the configured `camera.mode` request, as before) or a `WxH@FPS` that the camera reports. The pixel format is not part of the choice: the existing mode selection picks the format that ingests best, so the setting hides it.
+- The options are filtered so that the list is usable: 15 fps or faster, 640 pixels wide or more, at most 15 of them (the slowest rates go first, a size keeping its fastest rate, then the smallest sizes). A fractional rate is labelled with two decimals (29.97), so that two rates of a size never share a label.
+- A change applies at once by reopening the camera; the virtual camera is untouched, because its format is the output contract and not the camera's. `auto` stays the default and never jumps to 4K, because a 4K MJPEG stream is decoded on the CPU ([ADR-0008](0008-cpu-ingest-adapters.md)): 4K capture is an explicit choice.
+- A stored mode that the camera no longer offers is shown with the suffix " (gone)" so that the value is always an option, and the camera captures the nearest mode it offers instead, with a `Warning`.
+- A chosen mode that the camera offers but fails to open falls back to `auto`, with a `Warning`, once `auto` has delivered a frame (so the mode, not the camera, is blamed). It is not tried again until it is chosen again or the camera changes. Without this a choice made in two clicks would fail on every start.
+
+### The output mode is an editable enum computed from the camera
+- `output.mode` becomes an `enum` row of the config schema, `editable`, with `apply` `reload`. Its options are computed at run time (the kind of row `modules.pin.<stage>` already is): the 16:9 sizes of 640x360 to 3840x2160 that the selected camera offers, at each the rates of 24 fps or more that the camera offers at that size or a larger one, and, when a module provides the frame-generation stage, a rate at twice each of those (up to 60 fps) labelled " (generated)". The configured value is always an option; with no camera there are a few defaults. The default stays 1920x1080@30.
+- A change is written to `config.d/50-panel.toml` like every other editable key ([ADR-0026](0026-config-d-and-managed-config.md)); `config.toml` syntax is unchanged and a value set in a later file overrides it as usual.
+- The format of the virtual camera cannot change under an application. A change while applications hold the virtual camera is **deferred** until they release it, as it always was, and is now visible: `Warning` says `Output <mode> applies when <names> release the virtual camera`. The names are those of the holding processes, deduplicated, at most three then a count.
+
+### A format that cannot start reverts, in a stated order
+When a new contract cannot start, something else streams, so the virtual camera never loses its feed. The fallbacks, in the order tried, never the contract itself:
+1. the format the device is held in (when an application holds it in a format the daemon streams);
+2. the last contract a writer started with in this run;
+3. the last contract that streamed a frame in an earlier run (`output_good` in the state file, written once a frame reached the output, so that it means "streamed" and not "started");
+4. the default 1920x1080@30.
+
+Two causes are told apart. A loopback held in another format is not the format's fault: the fallback streams meanwhile and the new contract is tried again with a backoff (2 s, doubling to 32 s, a record that exists only for the contract and the loopback wanted now), and `Warning` says it waits. A format that the writer or the session output cannot start is the format's fault: it reverts, with a `Warning`, until another format is chosen.
+
+### Start without effects
+When the session output cannot start with its effects at a format, the daemon starts it again at the same format without the effects and modules, so the application gets the camera rather than an error. This is never done when the user asked to hide the camera: with a background effect selected and `on_failure` of `black` or `image`, the session is refused and the writer's placeholder stays. A control call, a reload or a change of modules tries the effects again. A reconcile guard stops any session that streams without its background effect while privacy applies, so a blur switched on later in a session without its effects is never shown raw.
+
+### Frame generation is a stage
+- A vendor-neutral stage id, `frame-generation`, provided by the Maxine module with NVIDIA Video Frame Generation. It is lib-only: it needs no model files.
+- It is **never a user toggle**. It has no enable setting, it is not part of `modules.order` (a stored order that names it is kept without it; an order that names it is refused), and its pin row in the config schema is hidden unless two modules provide it. It is on while the output rate is twice the camera's rate (within 0.2%), and off otherwise; a capture-mode change, a camera switch or a fail-over turns it on or off in a running session without a restart.
+- The daemon plans it as a chain of its own, named `<module>-gen`, after the effect element and every other stage, whatever slot the module declares. It is planned up front when the rate of any camera the daemon knows can be doubled, so that the session does not restart.
+- On a fresh tick it outputs the frame midway between the previous frame and the current one; on a repeat tick it outputs the held current frame; the first frame after a load or a reset goes out as it is. The output is therefore one output tick later than without it. That is the cost [ADR-0024](0024-stackable-stages-and-effects-in-the-settings-schema.md) named, accepted here only where the user chose a "(generated)" rate.
+- It fails open and alone: on a failure only the stage is dropped, the output repeats frames as before, and `Warning` says the output rate repeats frames.
+
+### Module ABI 1.1: the repeat flag
+`OBC_FRAME_FLAG_REPEAT` (bit 1 of `obc_frame::flags`) marks a repeat tick. The change is additive: a module of ABI 1.0 is unchanged, because the host masks the flag bits that its ABI version does not know. The SDK gains `Frame::is_repeat()`, `obc-backend` gains `StageChain::process_repeat` (by default it runs the frame as any other), and `gst-obc` has `REPEAT_FLAG`, a buffer flag the output clock sets on repeat ticks and clears on every other buffer. The abi and sdk crates are 1.1.0.
+
+### `obceffect` sends its last processed output on a repeat
+This amends [ADR-0012](0012-video-effects-and-maxine-backend.md), whose consequence was that a repeated frame is processed again. On a repeat tick that would be processed, `obceffect` re-sends the output it last processed, with the repeat's timestamps and flags, and runs no effect. The cached output is valid only for the settings generation, an epoch (a load, a failure, a new source, new caps, a flush), the parameters and the caps it was made under; otherwise the repeat is processed. It is never the raw frame. The element has no property for it. The effect then costs GPU time per camera frame instead of per output tick, and a frame generation stage downstream sees a repeat as a repeat. With a module element downstream that processes in place, the re-sent frame is copied on the GPU once per processed frame so that the module's write does not change the cache.
+
+### The privacy switch can show an image
+- `[effect] on_failure` is `black`, `image` or `none`. The schema labels it "When an effect can't run", with the options "Hide the camera: black", "Hide the camera: image" (offered only when a fallback image is set, or when it is the value in force) and "Show the camera".
+- `[effect] fallback_image` is an absolute path to a PNG or JPEG file, set in the configuration file; the dialog shows it read only. It is a still image: no video.
+- Under `image`, every case in which privacy holds the feed shows the image, scaled to fill the frame, instead of black: in the effect element (the warm-up of an effect and a failure) and in the writer's placeholder while privacy holds the feed. The camera off, an idle camera and the gaps of a camera switch stay black, and so does the crash cover that the loopback shows when the daemon dies ([ADR-0022](0022-crash-recovery-for-consumers.md)).
+- An image that cannot be read, or `image` with no path, shows black with a `Warning`. Every privacy rule that holds for `black` holds for `image`.
+
+### TrueHDR stays not implemented
+TrueHDR converts an SDR picture to HDR10 (BT.2020 primaries, the PQ transfer, 10 bits per channel). To use it the output contract would have to carry that, and it does not: it is 8-bit SDR into v4l2loopback and PipeWire. A round trip back to SDR (our own tone mapper) was tried offline on camera frames: it gave only a subtle change of look compared with what a simple tone curve gives, so the effect does not justify a stage. A 10-bit or HDR output for applications that can use it, such as OBS, is future work, and then the feature is looked at again.
+
+### Other changes
+- `Warning` is capped at 512 bytes in the daemon, cut on a character boundary with an ellipsis; before, only the CLI bounded it.
+- D-Bus interface revision 12 is additive and adds no member: a setting, a row and `Warning` clauses.
+
+## Consequences
+- A camera's modes and the output's sizes and rates can be chosen in the bar's panel and the setup dialog, or from `omarchy-broadcast settings set` and `config set`, with no new method. Clients that draw the tree and the schema generically need no change; an enum row may now have up to sixteen options, which a client should be able to show as a list.
+- A format change while an application holds the virtual camera still waits, and now says for what. The wait is a property of the device, not a choice.
+- Frame generation adds one output tick of latency where it is on, and a GPU pass per fresh frame; where it is off (any other rate) it costs nothing. Figures for the Maxine backend are not published, per the NVIDIA Maxine SDK licence.
+- An effect runs per camera frame when frame generation is on, and the repeat tick repeats the processed picture, so an effect that is expensive per frame is paid at the camera's rate.
+- `obceffect` is no longer stateless between ticks: it keeps one cached frame. A change that touches how it decides what to process must keep the validity rules above, or a repeat could show a picture made under old settings.
+- `modules.md` said a stage with no enable setting runs whenever it is provided. Frame generation is the exception: it is provided, has no switch, and runs only while the output rate is twice the camera's.
+- The state file gains `[camera_modes]` and `output_good`; both are read leniently, and an entry that does not parse is dropped alone.
+
+### Known limits
+- **A held device restarts the writer at each retry, and the PipeWire node is recreated.** Each try of a deferred format stops the writer and starts it again at the last working format. The retries are 2 s, doubling to 32 s, and go on while the hold lasts. Counted holders (the loopback, PipeWire and preview) stop the retries, so the loop goes on only for a holder the daemon cannot see, such as another user's process; that holder sees a gap with each try.
+- **A device held in YUY2 gets no fallback.** The daemon streams NV12 and I420 only; a device held in YUY2 comes from another producer's stream, and no writer of ours can feed it. The error names the held format and the writer retries.
+- **A format whose session output cannot start, even without effects, leaves the first application on the placeholder** until it releases the device; the format cannot change under it. Later applications get the format that works. The cause is not found for the formats offered, which differ from a working one in numbers only, so no test build of a new format is made (see below).
+- **A camera plugged in during a session**, whose rate is half the output's, gets frame generation from the next session, because the stage is planned from the cameras known when the session starts.
+- **Frame generation needs the previous frame**, so the first output after a load or a reset is the current frame as it is, and the output is one tick late.
+- **The image is a still.** An animated or video fallback is not supported.
+
+## Alternatives considered
+
+| Alternative | Why rejected |
+|---|---|
+| Frame generation as an output option outside the module system (a setting or a built-in element of the daemon) | It would tie the output rate to one vendor's feature, add a second path for a GPU feature that the ABI, the crash ledger, the failure rules and the pin and profile choice already handle, and could not be provided by another module later. As a stage it follows every rule a module stage has |
+| A test build of a new format (start the session output with the new contract before applying it, to learn that it works) | Removed after it was built. It woke the GPU and loaded the models for each format change only to drop them, blocked the controller (and so every D-Bus call) for up to two seconds, could race an application opening the device in that time, and could blame a GPU fault on the format. It guarded a failure class that was not found for the formats offered. The writer start proves what the device takes, and a session output that cannot start still has the start without effects and the revert once the camera is released |
+| Passing repeats through raw while frame generation is on | The effect would not run on those frames, so the unprocessed picture, background included, would go out on every repeat tick, and during every load and failure of the stage. This breaks the privacy rule of [ADR-0012](0012-video-effects-and-maxine-backend.md). The processed output is sent again instead |
+| Processing every repeat again, as [ADR-0012](0012-video-effects-and-maxine-backend.md) did | At a rate of twice the camera's, half of the effect's work would be thrown away, and a stage after it could not tell a repeat from a new picture without its own copy of the logic |
+| A camera-off placeholder (an image instead of black while the camera is off) in this round | The camera off, an idle camera and the gaps of a camera switch stay black in this round. A placeholder for the off state is a separate decision, with its own setting and rules |
+| Frame generation as a user switch | It is only useful at a rate of twice the camera's and does nothing at any other. The output rate chooses it, so there is no state in which a switch and the rate disagree |
+| Frame generation in the stage order | It always runs after every other stage, and the daemon adds it from the output rate, so an order has nothing to say about it. A stored order that names it is kept without it |
+| Offering the pixel format with the capture mode | The user cannot judge which format ingests best, and the existing selection does. Listing each format would multiply the options for no benefit |
+| Letting `auto` pick the camera's largest mode | A 4K MJPEG stream is decoded on the CPU; a user who has not asked for it would pay for it. 4K is an explicit choice |
+| Retrying a failed capture mode at every start | The same failure would repeat on every start. It is tried again when chosen again or when the camera changes |
+| An animated or video fallback image | Not needed for the use: a still image is decoded once and copied into each frame |
+| Quietly showing the camera when no fallback image can be read | It would show what the user asked to hide. Black, with a `Warning`, is the safe side |
+| Implementing TrueHDR now | See the decision above. The picture it makes cannot be shown on the output, and the round trip gives a small change |
+
+## What would change this decision
+- An output contract of 10 bits per channel or HDR, for OBS or another application that can use it: TrueHDR would be looked at again, with its own stage and an output that carries it.
+- A hardware run in which an offered format's session output fails to start while the writer takes it and the effects are not the cause: a test build would return, in a sound form (a bare plan, before the holders are counted, off the controller thread).
+- A holder that the daemon cannot count and that shows the PipeWire node cycling in practice: the retries would stop after the cap and wait for a configuration apply, or the PipeWire output would stay up across a writer restart.
+- A second module that provides `frame-generation`: the pin row appears with no change, and the choice between two providers is the user's.
+- A way to interpolate without waiting for the current frame: the one-tick latency of the stage would go.
+- A request for a fallback image per effect, or for the camera-off state: a separate decision.

@@ -14,7 +14,13 @@ pub struct Group {
 }
 
 /// The groups, in display order. A group with no setting is not published.
-pub const GROUPS: [Group; 5] = [
+/// The first, [`CAPTURE`], holds the daemon's own capture mode setting
+/// (`crate::settings::MODE`), no control.
+pub const GROUPS: [Group; 6] = [
+    Group {
+        id: CAPTURE,
+        label: "Capture",
+    },
     Group {
         id: "image",
         label: "Image",
@@ -39,6 +45,9 @@ pub const GROUPS: [Group; 5] = [
 
 /// The group of the controls the catalogue does not know.
 pub const OTHER: &str = "other";
+
+/// The group of the capture mode setting.
+pub const CAPTURE: &str = "capture";
 
 /// What a rule's master must be for the setting to be enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

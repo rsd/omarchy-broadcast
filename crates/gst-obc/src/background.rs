@@ -29,6 +29,12 @@
 //!   handed only the first image's bytes, so it never sees a second image;
 //!   anything after the first image (a gain map, an embedded video, padding)
 //!   is ignored, and a file that ends before its first image does is refused.
+//!
+//! The fallback image of `on-failure=image` (shown in place of black frames
+//! when an effect cannot run) goes through the same checks and decode, then
+//! is converted on the CPU to YUV 4:2:0 in the frames' colour
+//! ([`decode_yuv420`], [`Yuv420`]); its reasons say "the image file", the
+//! caller naming the path ([`crate::fallback_unreadable`]).
 
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
@@ -38,7 +44,7 @@ use std::time::Duration;
 
 use gst::prelude::*;
 use gst_video::prelude::*;
-use obc_backend::HostBgr;
+use obc_backend::{ColourMatrix, ColourSpec, HostBgr};
 
 /// The largest background file accepted, in bytes (32 MiB).
 pub const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
@@ -111,15 +117,16 @@ pub fn crop_to_fill(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> CropRect 
 /// the daemon's controlling terminal, and Rust opens close-on-exec. The
 /// type and size come from the handle (`fstat`), not from the path, so a
 /// path swapped after the check cannot slip through.
-fn open_checked(path: &Path) -> Result<(std::fs::File, u64), String> {
+fn open_checked(path: &Path, subject: Subject) -> Result<(std::fs::File, u64), String> {
     if !path.is_absolute() {
         return Err(format!(
-            "the background image path {} is not absolute",
+            "{} path {} is not absolute",
+            subject.noun,
             path.display()
         ));
     }
-    let unreadable =
-        |e: std::io::Error| format!("the background image {} is unreadable: {e}", path.display());
+    let what = subject.of(path);
+    let unreadable = |e: std::io::Error| format!("{what} is unreadable: {e}");
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
@@ -127,44 +134,72 @@ fn open_checked(path: &Path) -> Result<(std::fs::File, u64), String> {
         .map_err(unreadable)?;
     let meta = file.metadata().map_err(unreadable)?;
     if !meta.is_file() {
-        return Err(format!(
-            "the background image {} is not a regular file",
-            path.display()
-        ));
+        return Err(format!("{what} is not a regular file"));
     }
     if meta.len() > MAX_FILE_BYTES {
-        return Err(too_big(path, meta.len()));
+        return Err(too_big(&what, meta.len()));
     }
     Ok((file, meta.len()))
 }
 
-fn too_big(path: &Path, bytes: u64) -> String {
+fn too_big(what: &str, bytes: u64) -> String {
     format!(
-        "the background image {} is {} bytes, more than the {} MiB limit",
-        path.display(),
-        bytes,
+        "{what} is {bytes} bytes, more than the {} MiB limit",
         MAX_FILE_BYTES / (1024 * 1024)
     )
+}
+
+/// How the reasons name the file.
+#[derive(Debug, Clone, Copy)]
+struct Subject {
+    noun: &'static str,
+    /// The path follows the noun.
+    with_path: bool,
+}
+
+impl Subject {
+    /// The replace effect's image: "the background image <path>".
+    const BACKGROUND: Subject = Subject {
+        noun: "the background image",
+        with_path: true,
+    };
+    /// The fallback image: "the image file" (its caller names the path).
+    const FALLBACK: Subject = Subject {
+        noun: "the image file",
+        with_path: false,
+    };
+
+    fn of(self, path: &Path) -> String {
+        if self.with_path {
+            format!("{} {}", self.noun, path.display())
+        } else {
+            self.noun.to_string()
+        }
+    }
 }
 
 /// Checks that `path` is an absolute path to a readable regular file of at
 /// most [`MAX_FILE_BYTES`]; returns its size. The reason names the path.
 /// Never blocks on a FIFO or a device (see [`read_file`]).
 pub fn check_file(path: &Path) -> Result<u64, String> {
-    open_checked(path).map(|(_, len)| len)
+    open_checked(path, Subject::BACKGROUND).map(|(_, len)| len)
 }
 
 /// Reads the background file into memory after the checks of
 /// [`check_file`], made on the same handle; at most [`MAX_FILE_BYTES`] are
 /// read even if the file grows meanwhile.
 pub fn read_file(path: &Path) -> Result<Vec<u8>, String> {
-    let (file, len) = open_checked(path)?;
+    read_file_as(path, Subject::BACKGROUND)
+}
+
+fn read_file_as(path: &Path, subject: Subject) -> Result<Vec<u8>, String> {
+    let (file, len) = open_checked(path, subject)?;
     let mut data = Vec::with_capacity(len as usize);
     file.take(MAX_FILE_BYTES + 1)
         .read_to_end(&mut data)
-        .map_err(|e| format!("the background image {} is unreadable: {e}", path.display()))?;
+        .map_err(|e| format!("{} is unreadable: {e}", subject.of(path)))?;
     if data.len() as u64 > MAX_FILE_BYTES {
-        return Err(too_big(path, data.len() as u64));
+        return Err(too_big(&subject.of(path), data.len() as u64));
     }
     Ok(data)
 }
@@ -377,11 +412,15 @@ fn check_dimensions(what: &str, w: u32, h: u32) -> Result<(), String> {
 /// case it differs from the header's). Blocks for the decode (bounded by a
 /// timeout); run it off the streaming thread.
 pub fn decode(path: &Path, width: u32, height: u32) -> Result<HostBgr, String> {
-    let mut data = read_file(path)?;
+    decode_as(path, width, height, Subject::BACKGROUND)
+}
+
+fn decode_as(path: &Path, width: u32, height: u32, subject: Subject) -> Result<HostBgr, String> {
+    let mut data = read_file_as(path, subject)?;
     if width == 0 || height == 0 {
-        return Err(format!("cannot scale a background to {width}x{height}"));
+        return Err(format!("cannot scale an image to {width}x{height}"));
     }
-    let what = format!("the background image {}", path.display());
+    let what = subject.of(path);
     let (format, w, h) = image_header(&data).map_err(|e| format!("cannot decode {what}: {e}"))?;
     check_dimensions(&what, w, h)?;
     let len = image_length(format, &data).map_err(|e| format!("cannot decode {what}: {e}"))?;
@@ -583,6 +622,119 @@ fn run_decode(
         .validate()
         .map_err(|e| format!("cannot decode {what}: {e}"))?;
     Ok(image)
+}
+
+/// A YUV 4:2:0 image in host memory, tightly packed planes: Y is `width x
+/// height`, U and V are `(width + 1) / 2 x (height + 1) / 2` each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Yuv420 {
+    pub width: u32,
+    pub height: u32,
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
+}
+
+impl Yuv420 {
+    /// The width of a chroma plane.
+    pub fn chroma_width(&self) -> usize {
+        (self.width as usize).div_ceil(2)
+    }
+
+    /// The height of a chroma plane.
+    pub fn chroma_height(&self) -> usize {
+        (self.height as usize).div_ceil(2)
+    }
+
+    /// The image as tightly packed NV12 (the Y rows, then the interleaved
+    /// U,V rows), as [`obc_gpu`]'s packed uploads take it.
+    pub fn nv12_packed(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.y.len() + self.u.len() * 2);
+        out.extend_from_slice(&self.y);
+        for (u, v) in self.u.iter().zip(&self.v) {
+            out.push(*u);
+            out.push(*v);
+        }
+        out
+    }
+}
+
+/// Converts packed BGR to YUV 4:2:0 in `colour` (its matrix and range):
+/// each luma sample from its pixel, each chroma sample from the mean of
+/// the 2 x 2 pixels it covers (fewer at an odd edge).
+pub fn bgr_to_yuv420(bgr: &HostBgr, colour: ColourSpec) -> Yuv420 {
+    let (kr, kb) = match colour.matrix {
+        ColourMatrix::Bt601 => (0.299, 0.114),
+        ColourMatrix::Bt709 => (0.2126, 0.0722),
+    };
+    let kg = 1.0 - kr - kb;
+    // Y' 0..1 to the luma code, Pb/Pr -0.5..0.5 to the chroma code.
+    let (y_off, y_scale, c_scale) = if colour.full_range {
+        (0.0, 255.0, 255.0)
+    } else {
+        (16.0, 219.0, 224.0)
+    };
+    let code = |v: f64| v.round().clamp(0.0, 255.0) as u8;
+    let (w, h) = (bgr.width as usize, bgr.height as usize);
+    let rgb = |x: usize, y: usize| {
+        let o = y * bgr.stride + x * 3;
+        let px = &bgr.data[o..o + 3];
+        (
+            f64::from(px[2]) / 255.0,
+            f64::from(px[1]) / 255.0,
+            f64::from(px[0]) / 255.0,
+        )
+    };
+    let luma = |(r, g, b): (f64, f64, f64)| kr * r + kg * g + kb * b;
+    let mut out = Yuv420 {
+        width: bgr.width,
+        height: bgr.height,
+        y: Vec::with_capacity(w * h),
+        u: Vec::new(),
+        v: Vec::new(),
+    };
+    for y in 0..h {
+        for x in 0..w {
+            out.y.push(code(y_off + y_scale * luma(rgb(x, y))));
+        }
+    }
+    let (cw, ch) = (out.chroma_width(), out.chroma_height());
+    out.u.reserve(cw * ch);
+    out.v.reserve(cw * ch);
+    for cy in 0..ch {
+        for cx in 0..cw {
+            let (mut r, mut g, mut b, mut n) = (0.0, 0.0, 0.0, 0.0);
+            for y in (2 * cy)..(2 * cy + 2).min(h) {
+                for x in (2 * cx)..(2 * cx + 2).min(w) {
+                    let p = rgb(x, y);
+                    r += p.0;
+                    g += p.1;
+                    b += p.2;
+                    n += 1.0;
+                }
+            }
+            let p = (r / n, g / n, b / n);
+            let l = luma(p);
+            let pb = (p.2 - l) / (2.0 * (1.0 - kb));
+            let pr = (p.0 - l) / (2.0 * (1.0 - kr));
+            out.u.push(code(128.0 + c_scale * pb));
+            out.v.push(code(128.0 + c_scale * pr));
+        }
+    }
+    out
+}
+
+/// The fallback image at `path`, checked and decoded as [`decode`] does
+/// (cropped to fill `width x height`, centred), converted to YUV 4:2:0 in
+/// `colour`. The reason names "the image file", not its path. Blocks for
+/// the decode: run it off the streaming thread.
+pub fn decode_yuv420(
+    path: &Path,
+    width: u32,
+    height: u32,
+    colour: ColourSpec,
+) -> Result<Yuv420, String> {
+    decode_as(path, width, height, Subject::FALLBACK).map(|bgr| bgr_to_yuv420(&bgr, colour))
 }
 
 #[cfg(test)]
@@ -848,6 +1000,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn solid(w: u32, h: u32, bgr: [u8; 3]) -> HostBgr {
+        HostBgr {
+            width: w,
+            height: h,
+            stride: w as usize * 3,
+            data: bgr.repeat((w * h) as usize),
+        }
+    }
+
+    #[test]
+    fn bgr_converts_to_yuv_in_the_range_and_matrix_asked() {
+        let limited = ColourSpec::LIMITED_BT601;
+        let full = ColourSpec::FULL_BT601;
+        let bt709 = ColourSpec {
+            matrix: ColourMatrix::Bt709,
+            full_range: false,
+        };
+        let one = |bgr: [u8; 3], c: ColourSpec| {
+            let y = bgr_to_yuv420(&solid(4, 2, bgr), c);
+            assert_eq!((y.y.len(), y.u.len(), y.v.len()), (8, 2, 2));
+            (y.y[0], y.u[0], y.v[0])
+        };
+        // Black and white: the range's ends, chroma neutral.
+        assert_eq!(one([0, 0, 0], limited), (16, 128, 128));
+        assert_eq!(one([255, 255, 255], limited), (235, 128, 128));
+        assert_eq!(one([0, 0, 0], full), (0, 128, 128));
+        assert_eq!(one([255, 255, 255], full), (255, 128, 128));
+        // Pure red, BT.601 limited: Y 81, Cb 90, Cr 240 (the textbook
+        // values); BT.709: Y 63, Cb 102, Cr 240.
+        assert_eq!(one([0, 0, 255], limited), (81, 90, 240));
+        assert_eq!(one([0, 0, 255], bt709), (63, 102, 240));
+        // Pure blue, BT.601 limited: Y 41, Cb 240, Cr 110.
+        assert_eq!(one([255, 0, 0], limited), (41, 240, 110));
+    }
+
+    #[test]
+    fn chroma_is_the_mean_of_its_pixels_and_nv12_interleaves_it() {
+        // Left half black, right half white, 4x2: one chroma sample each
+        // half, both neutral; an odd width keeps its last column.
+        let mut img = solid(4, 2, [0, 0, 0]);
+        for y in 0..2 {
+            for x in 2..4 {
+                let o = y * 12 + x * 3;
+                img.data[o..o + 3].copy_from_slice(&[255, 255, 255]);
+            }
+        }
+        let yuv = bgr_to_yuv420(&img, ColourSpec::LIMITED_BT601);
+        assert_eq!(yuv.y, [16, 16, 235, 235, 16, 16, 235, 235]);
+        assert_eq!(
+            (yuv.u.as_slice(), yuv.v.as_slice()),
+            (&[128, 128][..], &[128, 128][..])
+        );
+        assert_eq!(
+            yuv.nv12_packed(),
+            [16, 16, 235, 235, 16, 16, 235, 235, 128, 128, 128, 128]
+        );
+        let odd = bgr_to_yuv420(&solid(3, 3, [0, 0, 255]), ColourSpec::LIMITED_BT601);
+        assert_eq!((odd.chroma_width(), odd.chroma_height()), (2, 2));
+        assert_eq!(odd.u, [90; 4]);
     }
 
     #[test]

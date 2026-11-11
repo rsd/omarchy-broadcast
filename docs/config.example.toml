@@ -31,7 +31,7 @@
 # such as 90-local.toml, wins over it, and the daemon refuses to change that
 # key ("Overridden by config.d/90-local.toml"); remove it from that file to
 # change it again. The keys the dialog and `omarchy-broadcast config set`
-# can change are: [camera] fixed_framerate; [output] format, aspect,
+# can change are: [camera] fixed_framerate; [output] mode, format, aspect,
 # hold_timeout_s and input_gap_ms; [lifecycle] idle_grace_s and
 # start_debounce_ms; [effect] on_failure; [pipewire] enabled and offer_nv12;
 # and in [modules] profile, enabled.<id> and pin.<stage>. Everything else,
@@ -83,7 +83,19 @@ fixed_framerate = false
 # must be even and at most 8192; the rate is at most 240 fps and may be a
 # fraction. This never follows the camera: frames are scaled and paced to
 # it. Changing it while an application holds the virtual camera takes
-# effect once the last application closes it.
+# effect once the last application closes it; the daemon's Warning says
+# which applications it waits for, and the virtual camera keeps its
+# current format meanwhile.
+# The bar's setup dialog and `omarchy-broadcast config set output.mode`
+# offer the options the selected camera can feed: its 16:9 sizes (3840x2160
+# down to 640x360) at the rates of 24 fps or more it offers, and, when a
+# frame-generation module is available, twice each of those rates up to
+# 60 fps, labelled "(generated)". Frame generation is on only while the
+# output rate is twice the camera's, and adds one output tick of latency.
+# Written here, any valid mode is accepted. A mode that the loopback device
+# or the output cannot start reverts to the last one that worked (this run's,
+# then the one the daemon kept from an earlier run, then the default), with a
+# Warning.
 # Default: "1920x1080@30"
 mode = "1920x1080@30"
 
@@ -225,6 +237,14 @@ relight_brightness = 100
 #           replaces the black frames once it runs. Settings the stream
 #           cannot be built with (replace without a readable image) close
 #           the camera instead, with the reason in Error;
+#   "image" as "black", with the image of fallback_image (below) in place
+#           of the black frames, scaled to fill the frame: while an effect
+#           starts or has failed, and while the virtual camera is held back
+#           for privacy. The camera off, an idle camera and the gaps of a
+#           camera switch stay black. An image that is not set or cannot be
+#           read shows black, with the reason in the Warning property. This
+#           option is offered in the setup dialog only while fallback_image
+#           is set;
 #   "none"  the camera image without the effect, with the reason in the
 #           Warning property (in Error before interface revision 11).
 # The reason in Warning is at most 400 bytes; the journal has it whole.
@@ -236,6 +256,14 @@ relight_brightness = 100
 # the effect applies by itself once a module provides it.
 # Default: "black"
 on_failure = "black"
+
+# The still image that on_failure = "image" shows: an absolute path to a PNG
+# or JPEG file (at most 32 MiB and 8192x8192 pixels, as for background_image),
+# scaled with a centre crop to fill the frame. It is read when it is first
+# shown, not when the effect loads. Set in this file only: the setup dialog
+# shows it and does not change it. A still image only.
+# Default: "" (no image). Example:
+# fallback_image = "/home/user/Pictures/away.png"
 
 # Where the Maxine Video Effects SDK is: an absolute path to the SDK
 # directory, the one that contains lib/, features/ and external/. The daemon

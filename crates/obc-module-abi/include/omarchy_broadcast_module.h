@@ -22,8 +22,10 @@
  * The minor version of this ABI. A minor version only adds (structure
  * fields at the end, vtable entries at the end, constants): the host
  * accepts a module built for its own or an older minor version.
+ *
+ * * 1.1 adds `OBC_FRAME_FLAG_REPEAT`.
  */
-#define OBC_MODULE_ABI_MINOR 0
+#define OBC_MODULE_ABI_MINOR 1
 
 /**
  * The packed ABI version this crate describes: `major << 16 | minor`
@@ -36,6 +38,31 @@
  * (a camera switch or a restart), so temporal state should not carry over.
  */
 #define OBC_FRAME_FLAG_NEW_SOURCE (1 << 0)
+
+/**
+ * A bit of `obc_frame::flags`, since ABI 1.1: this frame repeats the
+ * camera frame of the previous call. The output clock emits a frame on
+ * every tick of the output rate; when no new camera frame has arrived
+ * since the last tick, it emits the last one again, and the frame of this
+ * call has the same picture as the previous one (it was processed in
+ * that call too). A module may use the flag to tell a repeat from a fresh
+ * frame, for instance to make an intermediate picture from two fresh
+ * frames; one that ignores it processes the repeat as any other frame.
+ *
+ * The host sets it only for a module built for ABI 1.1 or later: a module
+ * of ABI 1.0 never sees it, and its repeats are processed as before.
+ */
+#define OBC_FRAME_FLAG_REPEAT (1 << 1)
+
+/**
+ * The `obc_frame::flags` bits of ABI 1.0.
+ */
+#define OBC_FRAME_FLAGS_1_0 OBC_FRAME_FLAG_NEW_SOURCE
+
+/**
+ * The `obc_frame::flags` bits of this ABI version.
+ */
+#define OBC_FRAME_FLAGS_ALL (OBC_FRAME_FLAG_NEW_SOURCE | OBC_FRAME_FLAG_REPEAT)
 
 /**
  * The most planes a frame has.
@@ -244,7 +271,9 @@ typedef struct obc_frame {
      */
     int64_t pts_ns;
     /**
-     * `OBC_FRAME_FLAG_*` bits; the others are zero.
+     * `OBC_FRAME_FLAG_*` bits; the others are zero. The host sets only
+     * the bits of the module's ABI version (ABI 1.0:
+     * `OBC_FRAME_FLAG_NEW_SOURCE`; 1.1 adds `OBC_FRAME_FLAG_REPEAT`).
      */
     uint32_t flags;
     /**

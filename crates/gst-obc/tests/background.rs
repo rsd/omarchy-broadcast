@@ -430,3 +430,43 @@ fn a_fifo_is_refused_without_blocking() {
         );
     }
 }
+
+#[test]
+fn the_fallback_image_decodes_to_yuv_in_the_colour_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = tmp(&dir, "away.png");
+    // Red on the left half, blue on the right, 64x32 into 32x16.
+    write_png(&path, 64, 32, |x, _| {
+        if x < 32 { [255, 0, 0] } else { [0, 0, 255] }
+    });
+    let img =
+        gst_obc::background::decode_yuv420(&path, 32, 16, obc_backend::ColourSpec::LIMITED_BT601)
+            .unwrap();
+    assert_eq!((img.width, img.height), (32, 16));
+    assert_eq!((img.y.len(), img.u.len(), img.v.len()), (512, 128, 128));
+    // Away from the seam the scaler leaves the colours alone: BT.601
+    // limited red (81, 90, 240) and blue (41, 240, 110).
+    let near = |a: u8, b: u8| a.abs_diff(b) <= 2;
+    let (y0, y1) = (img.y[16 * 2], img.y[16 * 2 + 31]);
+    assert!(near(y0, 81) && near(y1, 41), "{y0} {y1}");
+    let (u0, v0) = (img.u[0], img.v[0]);
+    assert!(near(u0, 90) && near(v0, 240), "{u0} {v0}");
+    assert_eq!(img.nv12_packed().len(), 512 + 256);
+    // The reason names the file, not the path (the caller does).
+    let missing = tmp(&dir, "gone.png");
+    let e = gst_obc::background::decode_yuv420(
+        &missing,
+        32,
+        16,
+        obc_backend::ColourSpec::LIMITED_BT601,
+    )
+    .unwrap_err();
+    assert!(e.starts_with("the image file is unreadable: "), "{e}");
+    assert_eq!(
+        gst_obc::fallback_unreadable(&missing, &e),
+        format!(
+            "Fallback image {} could not be read ({e}): showing black",
+            missing.display()
+        )
+    );
+}

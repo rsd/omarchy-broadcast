@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use obc_core::{EffectMode, ModeRequest, OutputContract, SinkSelector};
+use obc_core::{EffectMode, ModeRequest, OutputContract, SinkSelector, VideoMode};
 use obc_gpu::{GpuError, NothingToPark, ParkError, ParkOutcome, UnparkOutcome};
 use obc_ipc::Stats;
 use obc_pipeline::control_node::{CaptureFormat, CtrlValue, MenuItem, MenuItemValue, NodeControl};
@@ -21,9 +21,10 @@ use super::park::{ParkOps, Parker, StartError, StopFailure, StopSession};
 use super::{
     Backends, ControlNode, ControlScan, EffectReport, EffectRun, EffectStatus, Failure,
     MediaBackend, Module, ModuleEntry, OpenedModule, PipeWireGeneration, PreviewRequest,
-    SessionParams, WatchGeneration,
+    SessionError, SessionParams, WatchGeneration, WriterError,
 };
 use crate::camera::Camera;
+use crate::controller::output_mode_string;
 use crate::log::Level;
 use crate::settings::XuReading;
 
@@ -135,9 +136,30 @@ pub struct World {
     pub preview_sets: Vec<Option<u32>>,
     /// Reported (once) by `writer_failure` while a writer runs.
     pub writer_failure: Option<String>,
+    /// The image the writer's placeholder shows (`None`: black), kept
+    /// across writers as the real backend keeps it.
+    pub placeholder: Option<PathBuf>,
+    /// Every switch of the placeholder (`set_placeholder` that changed
+    /// it), in order.
+    pub placeholder_sets: Vec<Option<PathBuf>>,
+    /// Why the writer cannot decode the placeholder image: reported by
+    /// `placeholder_failure` while an image is asked for and a writer runs.
+    pub placeholder_unreadable: Option<String>,
+    /// What the effect report says of the effect element's fallback image
+    /// (`EffectReport::fallback_error`).
+    pub fallback_error: Option<String>,
     /// What `loopback_holders` counts.
     pub holders: u32,
     pub holder_counts: u32,
+    /// What `loopback_holder_names` gives.
+    pub holder_names: Vec<String>,
+    pub holder_name_reads: u32,
+    /// Writers of these contracts fail to start (`true`: as a loopback a
+    /// consumer holds in another format).
+    pub refused_contracts: Vec<(OutputContract, bool)>,
+    /// What a held refusal reports the device held in
+    /// (`WriterError::held_as`).
+    pub held_as: Option<OutputContract>,
     /// The running session: its params and current camera id (`None`
     /// after a failed switch).
     pub session: Option<(SessionParams, Option<String>)>,
@@ -145,6 +167,8 @@ pub struct World {
     pub session_stops: u32,
     /// Every camera an ingest was started on, in order.
     pub ingests: Vec<String>,
+    /// The capture mode of every ingest switched to, in order.
+    pub ingest_modes: Vec<VideoMode>,
     /// The `fixed_framerate` each ingest was started with, in the same
     /// order as `ingests`.
     pub ingest_fixed_framerate: Vec<bool>,
@@ -159,9 +183,15 @@ pub struct World {
     pub enhance_status: EffectStatus,
     /// `start_session` fails with this.
     pub fail_start: Option<String>,
+    /// `start_session` fails with this when the session has the effect
+    /// element or a module stage element (a backend to run).
+    pub fail_start_effects: Option<String>,
     /// With `fail_start`: cleaning up the partly built output did not stop
     /// cleanly, with this (`backend::park::StartError::unclean`).
     pub fail_start_cleanup: Option<String>,
+    /// With `fail_start`: the failure is the output contract's
+    /// (`backend::SessionError::contract`).
+    pub fail_start_contract: bool,
     /// The next session stop is unclean, with this (taken by that stop):
     /// a pipeline left short of NULL.
     pub fail_stop: Option<String>,
@@ -178,6 +208,8 @@ pub struct World {
     pub during_start: Option<Hook>,
     /// Ingests on these camera ids fail to start.
     pub fail_ingest: Vec<String>,
+    /// Ingests on these camera ids in these modes fail to start.
+    pub fail_ingest_modes: Vec<(String, VideoMode)>,
     /// Whether a started ingest delivers frames.
     pub frames: bool,
     /// Reported (once) by `session_failure` while a session runs.
@@ -337,24 +369,36 @@ impl Default for World {
             preview: None,
             preview_sets: Vec::new(),
             writer_failure: None,
+            placeholder: None,
+            placeholder_sets: Vec::new(),
+            placeholder_unreadable: None,
+            fallback_error: None,
             holders: 0,
             holder_counts: 0,
+            holder_names: Vec::new(),
+            holder_name_reads: 0,
+            refused_contracts: Vec::new(),
+            held_as: None,
             session: None,
             session_starts: 0,
             session_stops: 0,
             ingests: Vec::new(),
+            ingest_modes: Vec::new(),
             ingest_fixed_framerate: Vec::new(),
             ingest_enhance: Vec::new(),
             enhance_fail: None,
             enhance_status: EffectStatus::Off,
             fail_start: None,
             fail_start_cleanup: None,
+            fail_start_contract: false,
+            fail_start_effects: None,
             fail_stop: None,
             fail_stop_at_null: None,
             unclean_switch: None,
             session_unclean: None,
             during_start: None,
             fail_ingest: Vec::new(),
+            fail_ingest_modes: Vec::new(),
             frames: true,
             failure: None,
             stats: Stats {
@@ -658,7 +702,11 @@ impl FakeBackend {
         };
         *current = None;
         w.ingests.push(camera.id.clone());
-        if w.fail_ingest.contains(&camera.id) {
+        if w.fail_ingest.contains(&camera.id)
+            || w.fail_ingest_modes
+                .iter()
+                .any(|(id, m)| *id == camera.id && *m == camera.mode)
+        {
             if let Some(why) = w.unclean_switch.clone()
                 && w.session_unclean.is_none()
             {
@@ -693,12 +741,24 @@ impl MediaBackend for FakeBackend {
         &mut self,
         _sink: &SinkSelector,
         contract: &OutputContract,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<PathBuf, WriterError> {
         let mut w = self.world();
         w.session = None;
         w.writer = None;
         w.stop_pipewire();
         let node = w.sink.clone()?;
+        if let Some((_, held)) = w.refused_contracts.iter().find(|(c, _)| c == contract) {
+            return Err(WriterError {
+                message: format!(
+                    "loopback {}: cannot stream {}",
+                    node.display(),
+                    output_mode_string(contract)
+                ),
+                held: *held,
+                revertible: !*held,
+                held_as: if *held { w.held_as } else { None },
+            });
+        }
         w.writer = Some((node.clone(), *contract));
         w.writer_starts += 1;
         Ok(node)
@@ -742,13 +802,37 @@ impl MediaBackend for FakeBackend {
         }
     }
 
+    fn set_placeholder(&mut self, image: Option<&Path>) {
+        let mut w = self.world();
+        if w.placeholder.as_deref() != image {
+            let image = image.map(Path::to_path_buf);
+            w.placeholder = image.clone();
+            w.placeholder_sets.push(image);
+        }
+    }
+
+    fn placeholder_failure(&mut self) -> Option<String> {
+        let w = self.world();
+        w.writer.as_ref()?;
+        let path = w.placeholder.as_ref()?;
+        w.placeholder_unreadable
+            .as_ref()
+            .map(|why| obc_pipeline::effect::fallback_unreadable(path, why))
+    }
+
     fn loopback_holders(&mut self, _node: &Path) -> u32 {
         let mut w = self.world();
         w.holder_counts += 1;
         w.holders
     }
 
-    fn start_session(&mut self, params: &SessionParams) -> Result<(), String> {
+    fn loopback_holder_names(&mut self, _node: &Path) -> Vec<String> {
+        let mut w = self.world();
+        w.holder_name_reads += 1;
+        w.holder_names.clone()
+    }
+
+    fn start_session(&mut self, params: &SessionParams) -> Result<(), SessionError> {
         // Without the world's lock: the test may look at it meanwhile.
         let hook = self.world().during_start.take();
         if let Some(mut hook) = hook {
@@ -769,28 +853,38 @@ impl MediaBackend for FakeBackend {
         // fails cleanly.
         let world = Arc::clone(&self.world);
         let mut running = self.running();
-        self.parker().start_session(&mut running, || {
-            let mut w = lock(&world);
-            if let Some(e) = w.fail_start.clone() {
-                return Err(match w.fail_start_cleanup.clone() {
-                    Some(why) => StartError::unclean(e, why),
-                    None => StartError::from(e),
-                });
-            }
-            w.cuda_initialised = true;
-            w.session_unclean = None;
-            w.gpu_log.push("build");
-            w.session = Some((params.clone(), None));
-            w.session_starts += 1;
-            w.apply_effect(&params.effect);
-            Ok(FakeSession(Arc::clone(&world)))
-        })
+        let contract = lock(&world).fail_start_contract;
+        self.parker()
+            .start_session(&mut running, || {
+                let mut w = lock(&world);
+                let effects =
+                    params.backends.effect.is_some() || !params.backends.chains.is_empty();
+                if let Some(e) = w
+                    .fail_start
+                    .clone()
+                    .or_else(|| w.fail_start_effects.clone().filter(|_| effects))
+                {
+                    return Err(match w.fail_start_cleanup.clone() {
+                        Some(why) => StartError::unclean(e, why),
+                        None => StartError::from(e),
+                    });
+                }
+                w.cuda_initialised = true;
+                w.session_unclean = None;
+                w.gpu_log.push("build");
+                w.session = Some((params.clone(), None));
+                w.session_starts += 1;
+                w.apply_effect(&params.effect);
+                Ok(FakeSession(Arc::clone(&world)))
+            })
+            .map_err(|message| SessionError { message, contract })
     }
 
     fn switch_camera(&mut self, params: &SessionParams, camera: &Camera) -> Result<(), String> {
         let mut w = self.world();
         w.ingest_fixed_framerate.push(params.fixed_framerate);
         w.ingest_enhance.push(params.effect.enhance);
+        w.ingest_modes.push(camera.mode);
         let res = Self::start_ingest(&mut w, camera);
         w.enhance_status = match (&res, params.effect.enhance, &w.enhance_fail) {
             (Ok(()), true, Some(r)) => EffectStatus::Failed(r.clone()),
@@ -889,6 +983,7 @@ impl MediaBackend for FakeBackend {
             load_ms: Some(120.0),
             reused: false,
             gpu_ms_p50: Some(1.2),
+            fallback_error: w.fallback_error.clone(),
         })
     }
 

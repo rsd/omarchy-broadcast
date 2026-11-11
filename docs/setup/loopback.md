@@ -58,6 +58,17 @@ The daemon logs the outcome at each writer start ([daemon.md](daemon.md#restarts
 
 Do not set `keep_format` or `sustain_framerate` for this daemon. `sustain_framerate=1` repeats the last frame, which would leave the camera image on screen while the daemon is down, and it inserted duplicate frames in steady state; `keep_format=1` refuses a new writer until it is cleared. The daemon never changes them.
 
+## Changing the output size and rate
+
+The size and frame rate of the virtual camera are `[output] mode` ([config.example.toml](../config.example.toml)). From daemon 0.27.0 they can be changed in the bar's setup dialog, or with `omarchy-broadcast config set output.mode 1280x720@30`, from a list the daemon computes for the camera in use (its 16:9 sizes from 3840x2160 to 640x360 at the rates it offers, and, with a frame-generation module, rates at twice the camera's marked "(generated)"). The change is written to `config.d/50-panel.toml`. The format of a loopback device that is open is fixed (`exclusive_caps=1`, above), so a format change cannot reach an application that already holds the device:
+
+- **It waits for the applications.** While any application holds the virtual camera, the camera keeps its current format and the daemon's `Warning` says `Output 1280x720@30 applies when <applications> release the virtual camera`, naming up to three by process name. The new format starts once the last one lets go; the applications that open the camera afterwards get it.
+- **A device held in another format is not a failure.** If the device turns out to be held in a format the daemon did not expect (a holder it could not count, such as another user's process), the camera keeps streaming the format it holds, if the daemon can feed that one (NV12 or I420), and tries the new format again after 2 s, then 4, 8 and 16, then every 32 s while the hold lasts. **Known limit:** each try stops and restarts the writer, so the native PipeWire node is recreated at each try; a holder the daemon can see (the loopback, PipeWire and the live preview are counted) stops the tries.
+- **A format that cannot start reverts.** If the loopback or the output cannot start at the format, the daemon streams another and says so in `Warning`, in this order: the format the device is held in, the last format that worked in this run, the last one that streamed a frame in an earlier run (kept in the state file as `output_good`) and then 1920x1080@30. It stays on that until another format is chosen.
+- **Two limits that cannot be removed here.** A device held in YUY2 by another producer gets no fallback: the daemon streams only NV12 and I420, and `Error` names the held format. A format whose session output cannot start even without effects leaves the first application on the writer's placeholder (black) until it releases the device, because the format cannot change under it; applications that open the camera later get the format that works.
+
+The capture mode of the camera is separate and changes at once, without touching the virtual camera: it is the setting "Resolution and frame rate" of the Capture group ([../dbus-api.md](../dbus-api.md#capture-and-output-modes-revision-12)).
+
 ## Notes
 
 - `max_buffers=4` is the value all recorded benchmarks used.

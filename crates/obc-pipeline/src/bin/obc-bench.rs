@@ -358,6 +358,7 @@ impl Args {
             blur_strength: self.blur_strength,
             background: self.background.clone(),
             fallback: self.effect_on_failure,
+            fallback_image: None,
             stages: vec![
                 StageRequest {
                     enabled: self.denoise,

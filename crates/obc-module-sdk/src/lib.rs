@@ -172,6 +172,13 @@ pub trait Instance: Send + 'static {
     /// daemon takes a stage failure of a matte stage (`background`, or a
     /// stage of the `matte` slot) as a failure of the whole chain and
     /// unloads the instance: a matte never fails open.
+    ///
+    /// The output clock emits a frame on every tick of the output rate, and
+    /// when no new camera frame has arrived it emits the last one again: a
+    /// **repeat**, which [`Frame::is_repeat`] tells from a fresh frame (ABI
+    /// 1.1). A module may skip work on a repeat or answer it from what it
+    /// keeps; it still writes `output` (an in-place chain's frame may be
+    /// left as it came).
     fn process(
         &mut self,
         input: &Frame<'_>,

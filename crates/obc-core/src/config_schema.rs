@@ -16,9 +16,10 @@
 //! after the managed one sets is overridden: not enabled, with the reason
 //! "Overridden by <file>".
 
-use crate::config::Config;
+use crate::EffectOnFailure;
+use crate::config::{Config, EffectConfig};
 use crate::config_d::{ConfigSet, table_get};
-use crate::modules::{valid_module_id, valid_stage_id};
+use crate::modules::{FRAME_GENERATION_STAGE, valid_module_id, valid_stage_id};
 
 /// The longest description of a row, in bytes.
 pub const DESCRIPTION_MAX: usize = 160;
@@ -120,12 +121,27 @@ pub enum SpecKind {
         unit: &'static str,
     },
     Enum(&'static [(&'static str, &'static str)]),
+    /// One of the options the daemon computes at run time
+    /// ([`RegistryFacts::output_modes`] for `output.mode`,
+    /// [`RegistryFacts::on_failure_options`] for `effect.on_failure`).
+    Runtime,
     String,
     Path,
     List,
 }
 
 impl SpecKind {
+    /// The row type, the options of a [`SpecKind::Runtime`] key `key` from
+    /// `facts` (or `config`, for those it can tell when `facts` has none).
+    fn row_kind_of(self, key: &str, facts: &RegistryFacts, config: Option<&Config>) -> RowKind {
+        match self {
+            SpecKind::Runtime => RowKind::Enum {
+                options: runtime_options(key, facts, config),
+            },
+            other => other.row_kind(),
+        }
+    }
+
     fn row_kind(self) -> RowKind {
         let unit = |u: &str| (!u.is_empty()).then(|| u.to_string());
         match self {
@@ -157,6 +173,9 @@ impl SpecKind {
                     .iter()
                     .map(|(v, l)| (v.to_string(), l.to_string()))
                     .collect(),
+            },
+            SpecKind::Runtime => RowKind::Enum {
+                options: Vec::new(),
             },
             SpecKind::String => RowKind::String,
             SpecKind::Path => RowKind::Path,
@@ -224,9 +243,9 @@ pub const CORE_KEYS: &[KeySpec] = &[
         key: "output.mode",
         group: "output",
         label: "Output size and rate",
-        description: "Size and frame rate of the virtual camera, WxH@FPS.",
-        kind: SpecKind::String,
-        editable: false,
+        description: "Size and frame rate of the virtual camera. A generated rate doubles the camera's with frame generation.",
+        kind: SpecKind::Runtime,
+        editable: true,
         apply: Apply::Reload,
     },
     KeySpec {
@@ -420,10 +439,19 @@ pub const CORE_KEYS: &[KeySpec] = &[
     KeySpec {
         key: "effect.on_failure",
         group: "effect",
-        label: "When an effect fails",
-        description: "What the virtual camera shows when the effect cannot run: black frames, or the camera image without the effect.",
-        kind: SpecKind::Enum(&[("black", "Black frames"), ("none", "Camera image")]),
+        label: "When an effect can't run",
+        description: "Hide the camera with black frames or your image, or show the camera without the effect.",
+        kind: SpecKind::Runtime,
         editable: true,
+        apply: Apply::Live,
+    },
+    KeySpec {
+        key: "effect.fallback_image",
+        group: "effect",
+        label: "Fallback image",
+        description: "The image that hides the camera when an effect can't run, with Hide the camera: image. Set it in the configuration file.",
+        kind: SpecKind::Path,
+        editable: false,
         apply: Apply::Live,
     },
     KeySpec {
@@ -494,6 +522,43 @@ pub const CORE_KEYS: &[KeySpec] = &[
 const RUNTIME_NOTE_MODE: &str =
     "The default background effect: none, blur or replace. The panel's choices override it.";
 
+/// The key whose options are the output modes of [`RegistryFacts`].
+pub const OUTPUT_MODE: &str = "output.mode";
+/// The key whose options are [`RegistryFacts::on_failure_options`].
+pub const ON_FAILURE: &str = "effect.on_failure";
+
+/// The options of the [`SpecKind::Runtime`] key `key`. For
+/// `effect.on_failure`, those of `facts`, else those of `config` (else of
+/// the defaults: black and none).
+fn runtime_options(
+    key: &str,
+    facts: &RegistryFacts,
+    config: Option<&Config>,
+) -> Vec<(String, String)> {
+    match key {
+        OUTPUT_MODE => facts.output_modes.clone(),
+        ON_FAILURE if !facts.on_failure_options.is_empty() => facts.on_failure_options.clone(),
+        ON_FAILURE => on_failure_options(&config.map(|c| c.effect.clone()).unwrap_or_default()),
+        _ => Vec::new(),
+    }
+}
+
+/// The options of `effect.on_failure` for `effect`, `(value, label)`:
+/// black, then the image (offered only when `effect.fallback_image` is
+/// set, or when it is the value in force), then none.
+pub fn on_failure_options(effect: &EffectConfig) -> Vec<(String, String)> {
+    let image = effect.fallback_image.is_some() || effect.on_failure == EffectOnFailure::Image;
+    [
+        (EffectOnFailure::Black, "Hide the camera: black", true),
+        (EffectOnFailure::Image, "Hide the camera: image", image),
+        (EffectOnFailure::None, "Show the camera", true),
+    ]
+    .into_iter()
+    .filter(|(_, _, offered)| *offered)
+    .map(|(v, label, _)| (v.as_str().to_string(), label.to_string()))
+    .collect()
+}
+
 /// The prefix of the row of each installed module.
 pub const ENABLED_PREFIX: &str = "modules.enabled.";
 /// The prefix of the row of each stage offered.
@@ -516,13 +581,23 @@ pub struct StageFact {
 }
 
 /// What the module registry found: the facts the module rows are made
-/// from.
+/// from; and the options the daemon computes for the
+/// [`SpecKind::Runtime`] keys.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegistryFacts {
     /// The installed modules, in display order.
     pub modules: Vec<ModuleFact>,
     /// The stages offered, in display order.
     pub stages: Vec<StageFact>,
+    /// The options of `output.mode`, `(value, label)`, in display order:
+    /// the modes the selected camera can feed (and those frame generation
+    /// can make), with the configured value among them. Empty: none is
+    /// accepted.
+    pub output_modes: Vec<(String, String)>,
+    /// The options of `effect.on_failure` ([`on_failure_options`] of the
+    /// configuration in force). Empty: those of the configuration the
+    /// schema is made of, or for a write those of the defaults.
+    pub on_failure_options: Vec<(String, String)>,
 }
 
 impl RegistryFacts {
@@ -568,7 +643,7 @@ fn pin_options(stage: &StageFact, facts: &RegistryFacts) -> Vec<(String, String)
 pub fn lookup(key: &str, facts: &RegistryFacts) -> Option<KeyInfo> {
     if let Some(spec) = core_key(key) {
         return Some(KeyInfo {
-            kind: spec.kind.row_kind(),
+            kind: spec.kind.row_kind_of(spec.key, facts, None),
             editable: spec.editable,
             apply: spec.apply,
         });
@@ -761,8 +836,15 @@ pub fn config_schema(set: &ConfigSet, facts: &RegistryFacts) -> Vec<ConfigGroup>
     let current = serialized(&set.config);
     let defaults = serialized(&Config::default());
     let core_row = |spec: &KeySpec| {
-        let kind = spec.kind.row_kind();
+        let mut kind = spec.kind.row_kind_of(spec.key, facts, Some(&set.config));
         let value = value_in(&current, spec.key, &kind);
+        // The value in force is always an option.
+        if let (RowKind::Enum { options }, ConfigValue::Str(v)) = (&mut kind, &value)
+            && spec.kind == SpecKind::Runtime
+            && !options.iter().any(|(o, _)| o == v)
+        {
+            options.push((v.clone(), v.clone()));
+        }
         let default = match (&kind, value_in(&defaults, spec.key, &kind)) {
             (RowKind::Path, ConfigValue::Str(s)) if s.is_empty() => None,
             (_, d) => Some(d),
@@ -792,6 +874,11 @@ pub fn config_schema(set: &ConfigSet, facts: &RegistryFacts) -> Vec<ConfigGroup>
             if *group == "modules" {
                 let mut dynamic = Vec::new();
                 for stage in &facts.stages {
+                    // Frame generation is no user's choice: its pin is
+                    // shown only when there is a choice of module.
+                    if stage.id == FRAME_GENERATION_STAGE && stage.modules.len() < 2 {
+                        continue;
+                    }
                     let id = format!("{PIN_PREFIX}{}", stage.id);
                     let mut options = pin_options(stage, facts);
                     let value = modules.pin.get(&stage.id).cloned().unwrap_or_default();

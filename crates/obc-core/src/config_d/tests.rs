@@ -55,6 +55,11 @@ fn facts() -> RegistryFacts {
             id: "background".into(),
             modules: vec!["br.com.dias.maxine-vfx".into()],
         }],
+        output_modes: vec![
+            ("1920x1080@30".into(), "1920x1080 \u{b7} 30 fps".into()),
+            ("1280x720@30".into(), "1280x720 \u{b7} 30 fps".into()),
+        ],
+        ..RegistryFacts::default()
     }
 }
 
@@ -323,6 +328,45 @@ fn set_config_writes_only_the_managed_file_atomically_with_its_header() {
 }
 
 #[test]
+fn output_mode_is_set_in_the_managed_file_with_config_toml_untouched() {
+    let d = Dir::new();
+    let original = "# mine\n[output]\nmode = \"1920x1080@30\" # keep\n";
+    d.write("config.toml", original);
+    let set = set_config(
+        &d.config_toml(),
+        &facts(),
+        "output.mode",
+        &ConfigValue::Str("1280x720@30".into()),
+    )
+    .unwrap();
+    assert_eq!(
+        set.config.output_contract().to_string(),
+        "nv12:1280x720@30 limited"
+    );
+    assert_eq!(set.source("output.mode"), MANAGED_REL);
+    let text = d.read(MANAGED_REL);
+    assert!(text.contains("[output]\nmode = \"1280x720@30\""), "{text}");
+    assert_eq!(d.read("config.toml"), original);
+    // Not an option: refused, nothing written.
+    let e = set_config(
+        &d.config_toml(),
+        &facts(),
+        "output.mode",
+        &ConfigValue::Str("1281x720@30".into()),
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("is not one of"), "{e}");
+    assert_eq!(d.read(MANAGED_REL), text);
+    // Reset: config.toml's value again.
+    let set = reset_config(&d.config_toml(), &facts(), "output.mode").unwrap();
+    assert_eq!(
+        set.config.output_contract().to_string(),
+        "nv12:1920x1080@30 limited"
+    );
+    assert_eq!(d.read("config.toml"), original);
+}
+
+#[test]
 fn a_write_that_changes_nothing_writes_nothing() {
     let d = Dir::new();
     reset_config(&d.config_toml(), &facts(), "output.format").unwrap();
@@ -353,8 +397,9 @@ fn invalid_values_are_refused_before_anything_is_written() {
     assert!(matches!(e, WriteError::UnknownKey(_)), "{e:?}");
     let e = set("modules.pin.relight", ConfigValue::Str(String::new())).unwrap_err();
     assert!(matches!(e, WriteError::UnknownKey(_)), "{e:?}");
+    let e = set("output.mode", ConfigValue::Str("x".into())).unwrap_err();
+    assert!(e.to_string().contains("not one of"), "{e}");
     for key in [
-        "output.mode",
         "camera.mode",
         "camera.preference",
         "loopback.label",

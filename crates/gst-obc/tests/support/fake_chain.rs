@@ -73,6 +73,9 @@ pub struct FakeChainLog {
     pub loads: AtomicU64,
     pub frames: AtomicU64,
     pub resets: AtomicU64,
+    /// The frames among `frames` that came as repeats
+    /// (`StageChain::process_repeat`); the fake processes them as any frame.
+    pub repeats: AtomicU64,
     pub unloads: AtomicU64,
     /// Calls with a frame of another kind or size than the load's, or a
     /// CUDA call without the load's context current.
@@ -348,6 +351,15 @@ impl StageChain for FakeChain {
             Some(err) => Err(err),
             None => Ok(()),
         }
+    }
+
+    fn process_repeat(
+        &mut self,
+        frame: ChainFrame<'_>,
+        live: &BTreeMap<StageId, Params>,
+    ) -> Result<(), BackendError> {
+        self.log.repeats.fetch_add(1, Ordering::SeqCst);
+        self.process(frame, live)
     }
 
     fn reset_temporal(&mut self) -> Result<StageList, BackendError> {

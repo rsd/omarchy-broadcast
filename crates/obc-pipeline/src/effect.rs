@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 pub use gst_obc::{
     EffectFallback, EffectKind, EffectSettings, EffectStats, EffectStatus, NEW_SOURCE_FLAG,
-    STATUS_MESSAGE, StageRequest, StageStats, has_new_source_flag,
+    STATUS_MESSAGE, StageRequest, StageStats, fallback_unreadable, has_new_source_flag,
 };
 use obc_backend::BackendFactory;
 pub use obc_backend::{Availability, Params, StageId, Value};

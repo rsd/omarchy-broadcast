@@ -283,13 +283,16 @@ use obc_core::config::{CAMERA_CONTROL_NAMES, Config, EffectConfig, RuntimeState}
 use obc_core::config_d::{self, ConfigSet, ManagedEdit, OverridePolicy, WriteError};
 use obc_core::config_schema::{self, ModuleFact, RegistryFacts, StageFact};
 use obc_core::modules::{BackendProfile, StoredValue, legacy};
-use obc_core::{EffectMode, EffectOnFailure, OutputContract};
+use obc_core::{EffectMode, EffectOnFailure, ModeRequest, OutputContract};
 use obc_ipc::settings::ResetScope;
 use obc_ipc::{
     CameraControl, CameraControls, CameraInfo, INTERFACE_REVISION, IpcError, SettingChange,
     SettingValue, SettingsTree, Snapshot, State, Stats,
 };
-use obc_pipeline::capability::IngestPath;
+use obc_module_host::registry::FRAME_GENERATION;
+use obc_pipeline::capability::{
+    Capabilities, IngestPath, choose_mode, mode_value, output_mode_choices,
+};
 use obc_pipeline::control_node::CtrlValue;
 use obc_pipeline::controls::{
     CTRL_FLAG_DISABLED, CTRL_FLAG_READ_ONLY, CTRL_FLAG_UPDATE, DeviceControl, IMAGE_CONTROLS,
@@ -310,13 +313,25 @@ use crate::camera::{self, Camera};
 use crate::gpu_cache;
 use crate::modules::{self, Modules, Plan};
 use crate::preview::{Leases, PreviewDir, check_fps};
-use crate::settings::catalogue::DYNAMIC_FRAMERATE;
+use crate::settings::catalogue::{self, DYNAMIC_FRAMERATE};
 use crate::settings::effects::{self, Binding, GlobalEntry, Write};
 use crate::settings::{self, CameraSettings, Entry, Inputs, Refusal, Target};
 use crate::{debug, error, info, warning};
 
+/// The longest `Warning`, in bytes (an ellipsis ends a longer one).
+pub const WARNING_MAX: usize = 512;
+/// The most holders a deferral warning names before "and N more".
+const HOLDERS_NAMED: usize = 3;
+/// The longest holder name shown, in bytes.
+const HOLDER_NAME_MAX: usize = 32;
+/// The holders of a deferral warning when none could be named.
+pub const HOLDERS_UNKNOWN: &str = "the apps using it";
+
 /// How often a missing or held loopback device is retried.
 pub const WRITER_RETRY: Duration = Duration::from_secs(2);
+/// The longest wait between two tries of a contract that found the
+/// loopback held although nobody was counted.
+pub const HELD_RETRY_MAX: Duration = Duration::from_secs(32);
 /// A camera that delivers no frame this long after its ingest started has
 /// failed.
 pub const START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -944,7 +959,9 @@ impl Fallback for EffectRun {
 /// (`Error`) or a method's answer.
 fn effect_failure_text(effect: &impl Fallback, reason: &str) -> String {
     match effect.on_failure() {
-        EffectOnFailure::Black => format!("effect {} unavailable: {reason}", effect.mode()),
+        EffectOnFailure::Black | EffectOnFailure::Image => {
+            format!("effect {} unavailable: {reason}", effect.mode())
+        }
         EffectOnFailure::None => format!(
             "effect {} unavailable: {reason}; the camera image is shown without the effect \
              (effect.on_failure = \"none\")",
@@ -956,7 +973,8 @@ fn effect_failure_text(effect: &impl Fallback, reason: &str) -> String {
 /// The `Warning` clause of the background effect, provided by a module
 /// but unable to load or run (`reason`): the session streams on, with
 /// `effect.on_failure = "black"` the effect element's frames black until
-/// the effect runs, with `"none"` the camera image. The reason is made
+/// the effect runs (with `"image"` the fallback image), with `"none"` the
+/// camera image. The reason is made
 /// safe to show and bounded ([`STAGE_REASON_MAX`], as a stage's in
 /// `Error`: a module's hint at its end survives).
 fn effect_warning_text(effect: &impl Fallback, reason: &str) -> String {
@@ -964,6 +982,10 @@ fn effect_warning_text(effect: &impl Fallback, reason: &str) -> String {
     match effect.on_failure() {
         EffectOnFailure::Black => format!(
             "effect {} unavailable: {reason}; the video is black until it can run",
+            effect.mode()
+        ),
+        EffectOnFailure::Image => format!(
+            "effect {} unavailable: {reason}; the fallback image is shown until it can run",
             effect.mode()
         ),
         EffectOnFailure::None => format!(
@@ -1071,6 +1093,45 @@ struct WriterOn {
     pipewire_offer_nv12: bool,
 }
 
+/// A new contract that found the loopback held in another format although
+/// nobody was counted ([`Controller::held_retry`]): it and the loopback it
+/// was tried on, when it is tried again, and the wait that led there.
+#[derive(Debug, Clone, PartialEq)]
+struct HeldRetry {
+    contract: OutputContract,
+    sink: obc_core::SinkSelector,
+    at: Instant,
+    delay: Duration,
+}
+
+/// A capture mode chosen for a camera that could not open
+/// ([`Controller::mode_failed`]).
+#[derive(Debug, Clone, PartialEq)]
+struct ModeFailed {
+    /// What was asked of the camera.
+    asked: ModeRequest,
+    /// Why it could not open in the mode chosen for it.
+    why: String,
+    /// The camera's modes then: the record goes when they change.
+    modes: Vec<obc_core::VideoMode>,
+    /// The camera delivered a frame in its automatic mode since: the
+    /// chosen mode is to blame. Until then the record only steers the
+    /// retry: a camera that cannot open in its automatic mode either is
+    /// not failing for its mode, and the record goes
+    /// ([`Controller::forget_unconfirmed_mode`]); `Warning` shows only a
+    /// confirmed record.
+    confirmed: bool,
+}
+
+/// Why privacy holds the feed ([`Controller::privacy_hold`]).
+#[derive(Debug, Clone, PartialEq)]
+enum PrivacyHold {
+    /// A start or a change the effect refused set this fault.
+    Fault(String),
+    /// The guard dropped a session that streamed without the effect.
+    Guard,
+}
+
 /// The running session.
 #[derive(Debug, Clone, PartialEq)]
 struct Streaming {
@@ -1096,6 +1157,10 @@ struct Streaming {
     pinned: bool,
     /// That ingest was built with the enhance stage.
     enhance: bool,
+    /// The output contract the session output started with: the last
+    /// good one once a camera frame has reached it
+    /// ([`Controller::output_proven`]).
+    contract: OutputContract,
 }
 
 /// The lifecycle state machine (see the module docs).
@@ -1127,9 +1192,55 @@ pub struct Controller<B: MediaBackend> {
     /// A deferred writer rebuild found the loopback held although the
     /// watcher counted nobody: when to count again.
     rebuild_recount_at: Option<Instant>,
+    /// A new contract found the loopback held in another format although
+    /// nobody was counted: the last good writer streams instead, the
+    /// deferral shows in `Warning`, and that contract is tried again at
+    /// the time given, after the delay given (doubled at each try, up to
+    /// [`HELD_RETRY_MAX`]: each try stops the writer). It exists only for
+    /// the contract and the loopback wanted now
+    /// ([`Self::forget_stale_held_retry`]). `None`: no such fallback runs.
+    held_retry: Option<HeldRetry>,
+    /// What [`Self::holder_names`] were read for: the loopback count and
+    /// the output contract waiting (`None`: no output change waits).
+    holders_read: Option<(u32, OutputContract)>,
+    /// The process names holding the loopback while an output change waits
+    /// for them, for `Warning`.
+    holder_names: Vec<String>,
+    /// The contract of the last writer that started in this run.
+    writer_good: Option<OutputContract>,
+    /// The contract of the last session output that started in this run.
+    session_good: Option<OutputContract>,
+    /// A configured output contract that could not start in this run
+    /// (its writer or its session output, not a loopback a consumer
+    /// holds): it, why, and the contract streamed instead. It stands while
+    /// the configuration asks for that contract ([`Self::wanted_contract`]);
+    /// the configuration files are not rewritten.
+    failed_contract: Option<(OutputContract, String, OutputContract)>,
     session: Option<Streaming>,
+    /// The cameras, by id, whose chosen capture mode could not open before
+    /// a first frame in this run: they capture in the automatic mode (the
+    /// config's `camera.mode`, [`Self::mode_request_for`]) and `Warning`
+    /// says so, until the mode is chosen again, the choice is forgotten,
+    /// or the camera goes or reports other modes. The choice stays in the
+    /// state file.
+    mode_failed: HashMap<String, ModeFailed>,
     /// A lifecycle fault: `error` until its cause can have changed.
     fault: Option<String>,
+    /// Privacy holds the feed: no session runs because the effect, under an
+    /// `on_failure` that hides the camera, refused it (the fault it set,
+    /// while that fault stands) or the guard dropped it
+    /// ([`Self::streams_without_black_effect`]). With `on_failure =
+    /// "image"` the writer's placeholder shows the fallback image meanwhile
+    /// ([`Self::placeholder_image`]).
+    privacy_hold: Option<PrivacyHold>,
+    /// The image the writer's placeholder was last given (`None`: black).
+    placeholder_set: Option<PathBuf>,
+    /// Why the writer's placeholder cannot show that image (a `Warning`
+    /// clause).
+    placeholder_failure: Option<String>,
+    /// Why the running session's effect element cannot show the fallback
+    /// image, while its effect has failed (a `Warning` clause).
+    fallback_failure: Option<String>,
     /// The `Error` property.
     error: String,
     /// The state file could not be read or parsed: why (the `Error` text).
@@ -1246,6 +1357,10 @@ pub struct Controller<B: MediaBackend> {
     /// The running session's plan: which module runs each stage, fixed
     /// when it started (`None`: no session).
     plan: Option<Plan>,
+    /// The running session's output could not start with its effects and
+    /// module stages and streams without them (its plan is empty): the
+    /// `Warning` clause saying so. Ends with the session.
+    passthrough: Option<String>,
     /// The modules whose code the running session has run (marked in the
     /// crash ledger until it stops): those of what it was given, added to
     /// as the effect or the ingest changes ([`Self::mark_running`]).
@@ -1518,8 +1633,19 @@ impl<B: MediaBackend> Controller<B> {
             writer_error: None,
             writer_retry_at: None,
             rebuild_recount_at: None,
+            held_retry: None,
+            holders_read: None,
+            holder_names: Vec::new(),
+            writer_good: None,
+            session_good: None,
+            failed_contract: None,
             session: None,
+            mode_failed: HashMap::new(),
             fault: None,
+            privacy_hold: None,
+            placeholder_set: None,
+            placeholder_failure: None,
+            fallback_failure: None,
             error,
             state_damaged,
             save_failure: None,
@@ -1560,6 +1686,7 @@ impl<B: MediaBackend> Controller<B> {
             event_refresh_at: None,
             modules,
             plan: None,
+            passthrough: None,
             marked: Vec::new(),
             compute_capability,
             compute_capability_learnt: false,
@@ -1567,6 +1694,9 @@ impl<B: MediaBackend> Controller<B> {
             sink_hook,
         };
         c.rescan_cameras();
+        // The output modes the cameras found offer are known from the
+        // first schema.
+        c.config_facts.1 = c.schema_facts();
         c.reconcile(now);
         c
     }
@@ -1651,7 +1781,25 @@ impl<B: MediaBackend> Controller<B> {
                     None => Err(IpcError::InvalidArgument(format!(
                         "{scope:?} is not a reset scope (camera, group:<id> or setting:<id>)"
                     ))),
-                    Some(ResetScope::Camera) => self.reset(&camera, ResetWhat::Camera, now),
+                    Some(ResetScope::Camera) => {
+                        let forgot = self.forget_camera_mode(&camera, now);
+                        let res = self.reset(&camera, ResetWhat::Camera, now);
+                        if forgot {
+                            self.follow_camera_modes(now);
+                            self.reconcile(now);
+                        }
+                        res
+                    }
+                    Some(ResetScope::Group(g)) if g == catalogue::CAPTURE => self.set_camera_mode(
+                        &camera,
+                        Some(&SettingValue::Str(settings::MODE_AUTO.into())),
+                        now,
+                    ),
+                    Some(ResetScope::Setting(id)) if id == settings::MODE => self.set_camera_mode(
+                        &camera,
+                        Some(&SettingValue::Str(settings::MODE_AUTO.into())),
+                        now,
+                    ),
                     Some(ResetScope::Group(g)) => {
                         let what = ResetWhat::Group(g);
                         match self.reset_global(&what, now) {
@@ -1748,7 +1896,7 @@ impl<B: MediaBackend> Controller<B> {
             at(t);
         }
         if self.rebuild_due()
-            && let Some(t) = self.rebuild_recount_at
+            && let Some(t) = self.rebuild_recount_at.or_else(|| self.held_retry_due())
         {
             at(t);
         }
@@ -1887,8 +2035,71 @@ impl<B: MediaBackend> Controller<B> {
     fn current_plan(&self) -> Plan {
         match &self.plan {
             Some(p) => p.clone(),
-            None => self.modules.plan(),
+            None => self.fresh_plan(),
         }
+    }
+
+    /// The plan a session started now would run: the modules' plan, with
+    /// frame generation after every other stage when a module provides it
+    /// and the output rate could be generated: twice the rate of a mode a
+    /// known camera offers ([`Self::frame_generation_possible`]), not only
+    /// of the mode the session starts in. The stage is on only while the
+    /// output rate is twice the camera's ([`Self::frame_generation_follows`]),
+    /// so a capture mode change or a fail-over mid-session turns it on or
+    /// off without a restart; off, its element passes the frames through
+    /// and loads nothing.
+    fn fresh_plan(&self) -> Plan {
+        let mut plan = self.modules.plan();
+        if self.frame_generation_possible() {
+            self.modules.add_frame_generation(&mut plan);
+        }
+        plan
+    }
+
+    /// Whether the output contract's rate is twice `camera`'s capture
+    /// rate (within 0.2%): frame generation makes the frames between.
+    fn frame_generation_wanted(&self, camera: &Camera) -> bool {
+        doubles(self.output_contract().fps(), camera.mode.fps())
+    }
+
+    /// Whether the output contract's rate is twice the rate of a mode of a
+    /// known camera (its mode now, or one it offers).
+    fn frame_generation_possible(&self) -> bool {
+        let out = self.output_contract().fps();
+        self.cameras
+            .iter()
+            .any(|c| doubles(out, c.mode.fps()) || c.modes.iter().any(|m| doubles(out, m.fps())))
+    }
+
+    /// The frame generation stage id.
+    fn frame_generation_id() -> StageId {
+        StageId::new(FRAME_GENERATION).expect("a valid stage id")
+    }
+
+    /// `Warning`'s clause for an output rate that frame generation should
+    /// make but cannot (no module provides it, it was dropped or failed):
+    /// the frames are repeated.
+    fn frame_generation_warning(&self) -> Option<String> {
+        if !self.modules_loaded {
+            return None;
+        }
+        let camera = self.settings_camera()?;
+        if !self.frame_generation_wanted(camera) {
+            return None;
+        }
+        let fg = Self::frame_generation_id();
+        let plan = self.current_plan();
+        let failed = self
+            .stages
+            .iter()
+            .any(|(s, t)| *s == fg && t.failure.is_some());
+        if self.runs_in(&plan, &fg) && !self.stage_failed(&fg) && !failed {
+            return None;
+        }
+        Some(format!(
+            "{:.0} fps output repeats frames: no frame generation available",
+            self.output_contract().fps().round()
+        ))
     }
 
     /// What the session is given: the background effect in force, the
@@ -1914,14 +2125,39 @@ impl<B: MediaBackend> Controller<B> {
             blur_strength: effect.blur_strength,
             background_image: effect.background_image,
             on_failure: effect.on_failure,
+            fallback_image: effect.fallback_image,
             stages: plan
                 .effect_stages
                 .iter()
                 .map(|s| self.modules.stage_run(plan, &self.config, &self.runtime, s))
                 .collect(),
-            chains: self.modules.chain_runs(plan, &self.config, &self.runtime),
+            chains: self.frame_generation_follows(self.modules.chain_runs(
+                plan,
+                &self.config,
+                &self.runtime,
+            )),
             enhance: false,
         }
+    }
+
+    /// `chains` with frame generation off unless the output rate is twice
+    /// the camera's now (the camera the settings describe): a plan keeps
+    /// the stage for the whole session, while the capture mode may change.
+    fn frame_generation_follows(
+        &self,
+        mut chains: Vec<crate::backend::ChainRun>,
+    ) -> Vec<crate::backend::ChainRun> {
+        let wanted = self
+            .settings_camera()
+            .is_some_and(|c| self.frame_generation_wanted(c));
+        if !wanted {
+            for s in chains.iter_mut().flat_map(|c| c.stages.iter_mut()) {
+                if s.id.as_str() == FRAME_GENERATION {
+                    s.enabled = false;
+                }
+            }
+        }
+        chains
     }
 
     /// Whether the module of `plan` for `stage` can run it now.
@@ -1997,6 +2233,11 @@ impl<B: MediaBackend> Controller<B> {
             .into_iter()
             .chain([StageId::DENOISE, StageId::RELIGHT])
         {
+            // Frame generation has a clause of its own
+            // ([`Self::frame_generation_warning`]).
+            if s.as_str() == FRAME_GENERATION {
+                continue;
+            }
             if s != StageId::BACKGROUND && s != StageId::ENHANCE && !stages.contains(&s) {
                 stages.push(s);
             }
@@ -2041,19 +2282,94 @@ impl<B: MediaBackend> Controller<B> {
     /// provides, which the feed streams without, grouped by module and
     /// reason ([`dropped_text`]), joined by `; `, made one line safe to
     /// show whatever a module calls itself; empty when nothing.
+    ///
+    /// Then frame generation that cannot make the output rate
+    /// ([`Self::frame_generation_warning`]), a capture mode the camera does
+    /// not offer ([`Self::mode_warning`]) and the output contract's
+    /// clauses ([`Self::output_warnings`]). At most [`WARNING_MAX`] bytes
+    /// ([`cap_warning`]).
     fn warning(&self) -> String {
-        let dropped = match &self.plan {
-            Some(p) => self.dropped_stages(p),
-            None => self.dropped_stages(&self.modules.plan()),
+        // Without its effects, the session's clause says why, not each
+        // stage.
+        let dropped = match (&self.passthrough, &self.plan) {
+            (Some(_), _) => Vec::new(),
+            (None, Some(p)) => self.dropped_stages(p),
+            (None, None) => self.dropped_stages(&self.fresh_plan()),
         };
         let text = self
             .effect_failure
             .iter()
             .cloned()
+            .chain(self.passthrough.clone())
+            .chain(self.fallback_warnings())
             .chain(dropped_text(&dropped))
+            .chain(self.frame_generation_warning())
+            .chain(self.mode_warning())
+            .chain(self.output_warnings())
             .collect::<Vec<_>>()
             .join("; ");
-        settings::sanitise(&text, usize::MAX)
+        cap_warning(&text)
+    }
+
+    /// `Warning`'s clause for a capture mode the user chose for the
+    /// camera the settings describe that it does not offer: the mode asked
+    /// for, and the nearest one it captures instead
+    /// ([`obc_pipeline::choose_mode`]).
+    fn mode_warning(&self) -> Option<String> {
+        let camera = self.settings_camera()?;
+        if let Some(f) = self.mode_failed.get(&camera.id) {
+            if !f.confirmed {
+                return None;
+            }
+            let m = camera.mode;
+            return Some(format!(
+                "{} could not open {} ({}): it captures {} instead",
+                camera.name,
+                settings::mode_choice_value(&f.asked),
+                f.why,
+                mode_value(m.width, m.height, m.fps_num, m.fps_den)
+            ));
+        }
+        let asked = self.runtime.camera_modes.get(&camera.id)?;
+        if camera.modes.is_empty() || asked.is_exact(&camera.mode) {
+            return None;
+        }
+        let m = camera.mode;
+        Some(format!(
+            "{} does not offer {}: it captures {} instead",
+            camera.name,
+            settings::mode_choice_value(asked),
+            mode_value(m.width, m.height, m.fps_num, m.fps_den)
+        ))
+    }
+
+    /// `Warning`'s clauses of the output contract: a configured contract
+    /// that could not start ([`Self::failed_contract`]), and one that waits
+    /// for the applications holding the virtual camera to release it.
+    fn output_warnings(&self) -> Vec<String> {
+        let sr = |c: &OutputContract| mode_value(c.width, c.height, c.fps_num, c.fps_den);
+        let mut out = Vec::new();
+        if let Some((failed, why, instead)) = &self.failed_contract
+            && *failed == self.config.output_contract()
+        {
+            out.push(format!(
+                "Output {} could not start ({why}): streaming {} instead",
+                sr(failed),
+                sr(instead)
+            ));
+        }
+        let waits = self
+            .writer
+            .as_ref()
+            .is_some_and(|w| w.contract != self.wanted_contract());
+        if waits && (self.consumers > 0 || self.held_retry_due().is_some()) {
+            out.push(format!(
+                "Output {} applies when {} release the virtual camera",
+                sr(&self.wanted_contract()),
+                holders_text(&self.holder_names)
+            ));
+        }
+        out
     }
 
     /// The running session follows what the modules provide now (a module
@@ -2106,7 +2422,7 @@ impl<B: MediaBackend> Controller<B> {
     fn restart_for(&self) -> Option<String> {
         self.session.as_ref()?;
         let plan = self.plan.as_ref()?;
-        let next = self.modules.plan();
+        let next = self.fresh_plan();
         if plan_ids(plan) == plan_ids(&next) {
             return None;
         }
@@ -2312,6 +2628,46 @@ impl<B: MediaBackend> Controller<B> {
         }
     }
 
+    /// Frame generation in the running session follows the camera it
+    /// streams now (a capture mode change, a switch, a fail-over): on while
+    /// the output rate is twice the camera's, off otherwise
+    /// ([`Self::frame_generation_follows`]). Only that stage changes; a
+    /// session planned without it ([`Self::fresh_plan`]) is left as it is.
+    fn follow_frame_generation(&mut self) {
+        let Some(mut effect) = self.effect_applied.clone() else {
+            return;
+        };
+        let run = self.effect_run();
+        let Some(on) = run.stage(FRAME_GENERATION).map(|s| s.enabled) else {
+            return;
+        };
+        let mut changed = false;
+        for s in effect
+            .chains
+            .iter_mut()
+            .flat_map(|c| c.stages.iter_mut())
+            .filter(|s| s.id.as_str() == FRAME_GENERATION && s.enabled != on)
+        {
+            s.enabled = on;
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        info!(
+            "frame generation {} for the camera's rate",
+            if on { "on" } else { "off" }
+        );
+        let t = self.track(&Self::frame_generation_id());
+        t.seen = None;
+        t.held = None;
+        self.effect_applied = Some(effect.clone());
+        self.mark_running(&effect);
+        if let Err(reason) = self.backend.set_effect(&effect) {
+            let _ = self.effect_refused(effect, &reason);
+        }
+    }
+
     /// The tracking of stage `id`, made when first needed.
     fn track(&mut self, id: &StageId) -> &mut StageTrack {
         let i = match self.stages.iter().position(|(s, _)| s == id) {
@@ -2401,7 +2757,18 @@ impl<B: MediaBackend> Controller<B> {
     fn output_contract(&self) -> OutputContract {
         self.writer
             .as_ref()
-            .map_or_else(|| self.config.output_contract(), |w| w.contract)
+            .map_or_else(|| self.wanted_contract(), |w| w.contract)
+    }
+
+    /// The output contract the writer is to have: the configured one,
+    /// unless it could not start in this run, then the one streamed
+    /// instead ([`Self::failed_contract`]).
+    fn wanted_contract(&self) -> OutputContract {
+        let c = self.config.output_contract();
+        match &self.failed_contract {
+            Some((failed, _, instead)) if *failed == c => *instead,
+            _ => c,
+        }
     }
 
     fn session_params(&self) -> SessionParams {
@@ -2434,7 +2801,7 @@ impl<B: MediaBackend> Controller<B> {
     /// ([`Self::sync_pipewire`]).
     fn writer_outdated(&self) -> bool {
         self.writer.as_ref().is_some_and(|w| {
-            w.contract != self.config.output_contract() || w.sink != self.config.sink_selector()
+            w.contract != self.wanted_contract() || w.sink != self.config.sink_selector()
         })
     }
 
@@ -2454,9 +2821,11 @@ impl<B: MediaBackend> Controller<B> {
     /// (`docs/adr/0023-settings-schema.md`); the properties then carry the
     /// revision published so far.
     fn publish_with(&mut self, settings: bool) {
+        self.sync_placeholder();
         if self.controls_view.camera != self.active_camera() {
             self.refresh_controls();
         }
+        self.read_holders();
         let delta = if settings {
             let tree = self.current_settings();
             // The first tree is revision 1.
@@ -2477,14 +2846,20 @@ impl<B: MediaBackend> Controller<B> {
         } else {
             None
         };
-        // The modules found make the module rows of the config schema.
-        if self.config_facts.0 != self.modules.serial() {
-            let facts = registry_facts(&self.modules);
-            if facts != self.config_facts.1 {
-                self.bump_config();
-            }
-            self.config_facts = (self.modules.serial(), facts);
+        // The modules found make the module rows of the config schema, the
+        // camera the settings describe the options of `output.mode`.
+        let mut facts = if self.config_facts.0 != self.modules.serial() {
+            registry_facts(&self.modules)
+        } else {
+            self.config_facts.1.clone()
+        };
+        facts.output_modes = self.output_mode_options();
+        facts.on_failure_options =
+            config_schema::on_failure_options(&self.config_set.config.effect);
+        if facts != self.config_facts.1 {
+            self.bump_config();
         }
+        self.config_facts = (self.modules.serial(), facts);
         let effect = self.effect();
         // Computed once per publish, and logged where it changes.
         let warning = self.warning();
@@ -2546,6 +2921,17 @@ impl<B: MediaBackend> Controller<B> {
     fn reconcile(&mut self, now: Instant) {
         self.check_writer(now);
         self.check_session(now);
+        if self.streams_without_black_effect() {
+            // However it came to this (a control call, a reload, a module
+            // change), the room is never shown: the lifecycle starts a
+            // session with the effect, or none.
+            warning!(
+                "an effect under on_failure = \"{}\" is not in the session: stopping it",
+                self.effect().on_failure
+            );
+            self.drop_session();
+            self.privacy_hold = Some(PrivacyHold::Guard);
+        }
         let had_session = self.session.is_some();
         self.decide(now);
         if !had_session && self.session.is_some() {
@@ -2559,7 +2945,26 @@ impl<B: MediaBackend> Controller<B> {
         self.maybe_stats(now);
     }
 
+    /// The running session streams without its effects
+    /// ([`Self::passthrough`]) while a background effect a module provides
+    /// is selected with an `on_failure` that hides the camera (`black` or
+    /// `image`): it shows what the user asked never to be shown.
+    fn streams_without_black_effect(&self) -> bool {
+        if self.passthrough.is_none() {
+            return false;
+        }
+        let effect = self.effect();
+        effect.mode != EffectMode::None
+            && effect.on_failure.hides()
+            && self
+                .modules
+                .resolve(StageId::BACKGROUND.as_str())
+                .provider
+                .is_some()
+    }
+
     fn check_writer(&mut self, now: Instant) {
+        self.forget_stale_held_retry();
         if self.writer.is_some() {
             if let Some(f) = self.backend.writer_failure() {
                 error!("{f}");
@@ -2639,6 +3044,9 @@ impl<B: MediaBackend> Controller<B> {
         let Some(node) = self.writer.as_ref().map(|w| w.node.clone()) else {
             return;
         };
+        if self.held_retry_due().is_some_and(|t| now < t) {
+            return;
+        }
         let held = self.backend.loopback_holders(&node);
         if held > 0 {
             if self.rebuild_recount_at.is_none() {
@@ -2660,49 +3068,182 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     fn start_writer(&mut self, now: Instant) {
+        self.start_writer_with(self.wanted_contract(), now);
+    }
+
+    /// Starts the writer with `contract`. A contract that cannot start
+    /// falls back to another ([`Self::fallback_contracts`]: the last one
+    /// that started in this run, the format a held loopback holds, the last
+    /// good one of an earlier run, the built-in default), the first that
+    /// starts: as a failed contract ([`Self::failed_contract`]) when the
+    /// contract is at fault, as a deferral ([`Self::held_retry`]) when the
+    /// loopback is held in another format. Without one that starts, the
+    /// writer is retried as it is.
+    fn start_writer_with(&mut self, contract: OutputContract, now: Instant) {
         let sink = self.config.sink_selector();
-        let contract = self.config.output_contract();
-        match self.backend.start_writer(&sink, &contract) {
-            Ok(node) => {
-                let offer_nv12 = self.config.pipewire.offer_nv12;
-                let pipewire = self
-                    .config
-                    .pipewire
-                    .enabled
-                    .then(|| self.backend.start_pipewire(offer_nv12));
-                info!(
-                    "virtual camera {} ({}) is ready{}",
-                    node.display(),
-                    output_mode_string(&contract),
-                    if pipewire.is_some() {
-                        ", with the PipeWire output"
-                    } else {
-                        ""
+        let e = match self.try_writer(contract, &sink, now) {
+            Ok(()) => return,
+            Err(e) => e,
+        };
+        // A new contract that cannot start: another streams instead, so
+        // the virtual camera keeps a feed.
+        let mut last = e.clone();
+        if e.held || e.revertible {
+            let held_as = e.held_as.filter(|_| e.held);
+            let fallbacks = self.fallback_contracts(&contract, held_as);
+            if e.held {
+                // Not the contract's fault: tried again once the device is
+                // released. Known limit: each try stops the writer, so the
+                // PipeWire output's node is recreated at every try (2, 4,
+                // 8, 16, then every 32 s while the hold lasts); only a
+                // holder the watcher cannot count (another user's process)
+                // keeps it going.
+                let delay = match &self.held_retry {
+                    Some(h) if h.contract == contract && h.sink == sink => {
+                        (h.delay * 2).min(HELD_RETRY_MAX)
                     }
-                );
-                if let Some(old) = self.writer_error.take()
-                    && self.error == old
-                {
-                    self.error = self.standing_error();
-                }
-                self.writer_retry_at = None;
-                self.writer = Some(WriterOn {
-                    node: node.clone(),
+                    _ => WRITER_RETRY,
+                };
+                self.held_retry = Some(HeldRetry {
                     contract,
-                    sink,
-                    pipewire,
-                    pipewire_offer_nv12: offer_nv12,
+                    sink: sink.clone(),
+                    at: now + delay,
+                    delay,
                 });
-                self.notify_sink(Some(&node), now);
             }
-            Err(e) => {
-                if self.writer_error.as_deref() != Some(e.as_str()) {
-                    error!("{e} (retrying every {} s)", WRITER_RETRY.as_secs());
+            for good in &fallbacks {
+                match self.try_writer(*good, &sink, now) {
+                    Ok(()) => {
+                        if e.held {
+                            warning!(
+                                "the output {} waits for the virtual camera to be released \
+                                 ({e}): streaming {} meanwhile",
+                                output_mode_string(&contract),
+                                output_mode_string(good)
+                            );
+                        } else {
+                            warning!(
+                                "the output {} could not start ({e}): streaming {} instead",
+                                output_mode_string(&contract),
+                                output_mode_string(good)
+                            );
+                            self.failed_contract = Some((contract, e.message, *good));
+                        }
+                        return;
+                    }
+                    Err(f) => last = f,
                 }
-                self.writer_error = Some(e.clone());
-                self.error = e;
-                self.writer_retry_at = Some(now + WRITER_RETRY);
             }
+            // None started: the first fallback is the one retried.
+            if !e.held
+                && let Some(first) = fallbacks.first()
+            {
+                self.failed_contract = Some((contract, e.message.clone(), *first));
+            }
+        }
+        let e = last.message;
+        if self.writer_error.as_deref() != Some(e.as_str()) {
+            error!("{e} (retrying every {} s)", WRITER_RETRY.as_secs());
+        }
+        self.writer_error = Some(e.clone());
+        self.error = e;
+        self.writer_retry_at = Some(now + WRITER_RETRY);
+    }
+
+    /// Starts the writer on `sink` with `contract`, and the PipeWire output
+    /// next to it if one is configured.
+    fn try_writer(
+        &mut self,
+        contract: OutputContract,
+        sink: &obc_core::SinkSelector,
+        now: Instant,
+    ) -> Result<(), crate::backend::WriterError> {
+        let node = self.backend.start_writer(sink, &contract)?;
+        let offer_nv12 = self.config.pipewire.offer_nv12;
+        let pipewire = self
+            .config
+            .pipewire
+            .enabled
+            .then(|| self.backend.start_pipewire(offer_nv12));
+        info!(
+            "virtual camera {} ({}) is ready{}",
+            node.display(),
+            output_mode_string(&contract),
+            if pipewire.is_some() {
+                ", with the PipeWire output"
+            } else {
+                ""
+            }
+        );
+        if let Some(old) = self.writer_error.take()
+            && self.error == old
+        {
+            self.error = self.standing_error();
+        }
+        self.writer_retry_at = None;
+        self.writer = Some(WriterOn {
+            node: node.clone(),
+            contract,
+            sink: sink.clone(),
+            pipewire,
+            pipewire_offer_nv12: offer_nv12,
+        });
+        self.writer_good = Some(contract);
+        if contract == self.wanted_contract() {
+            self.held_retry = None;
+        }
+        self.notify_sink(Some(&node), now);
+        Ok(())
+    }
+
+    /// What streams instead of `contract` when it cannot, in the order
+    /// tried: the format a held loopback holds (`held_as`), the last
+    /// contract a writer started with in this run, the last one a writer and
+    /// a session output both started with, in this run or an earlier one
+    /// (the state file's `output_good`), and the built-in default; each
+    /// once, and never `contract` itself.
+    fn fallback_contracts(
+        &self,
+        contract: &OutputContract,
+        held_as: Option<OutputContract>,
+    ) -> Vec<OutputContract> {
+        let mut out: Vec<OutputContract> = Vec::new();
+        // A held loopback takes only the format it holds: tried first,
+        // rather than a start that must fail.
+        for c in [
+            held_as,
+            self.writer_good,
+            self.runtime.output_good,
+            Some(OutputContract::default()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if c != *contract && !out.contains(&c) {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// When the contract wanted, found the loopback held, is tried again
+    /// ([`Self::held_retry`]); `None` when no fallback runs for it.
+    fn held_retry_due(&self) -> Option<Instant> {
+        self.held_retry
+            .as_ref()
+            .filter(|h| {
+                h.contract == self.wanted_contract() && h.sink == self.config.sink_selector()
+            })
+            .map(|h| h.at)
+    }
+
+    /// Drops the held-retry record ([`Self::held_retry`]) once its contract
+    /// or its loopback is no longer the one wanted (a configuration change,
+    /// a contract that failed in the meantime): a change of either is tried
+    /// at once, and a return to it starts again from [`WRITER_RETRY`].
+    fn forget_stale_held_retry(&mut self) {
+        if self.held_retry.is_some() && self.held_retry_due().is_none() {
+            self.held_retry = None;
         }
     }
 
@@ -2754,13 +3295,23 @@ impl<B: MediaBackend> Controller<B> {
         if let Some(since) = s.awaiting {
             if self.backend.first_frame() {
                 let first = !s.live;
+                let contract = s.contract;
                 if let Some(s) = self.session.as_mut() {
                     s.live = true;
                     s.awaiting = None;
                     // A camera delivered: every camera may be tried again.
                     s.failed.clear();
                 }
+                // A frame in the automatic mode of a camera whose chosen
+                // mode could not open: the mode is to blame.
+                if let Some(id) = self.session.as_ref().map(|s| s.camera.clone())
+                    && let Some(f) = self.mode_failed.get_mut(&id)
+                {
+                    f.confirmed = true;
+                }
                 if first {
+                    // A frame streamed: the contract is the last good one.
+                    self.output_proven(contract, now);
                     info!("streaming from {}", self.session_label());
                     self.error = self.standing_error();
                     // The first window starts at the first frame.
@@ -2789,6 +3340,12 @@ impl<B: MediaBackend> Controller<B> {
     fn poll_effect(&mut self, now: Instant) -> bool {
         let Some(report) = self.backend.effect_report() else {
             return false;
+        };
+        // What the element shows in the effect's place matters while the
+        // effect has failed.
+        self.fallback_failure = match &report.status {
+            EffectStatus::Failed(_) => report.fallback_error.clone(),
+            _ => None,
         };
         if self.follow_effect(&report, now) {
             return true;
@@ -2999,8 +3556,26 @@ impl<B: MediaBackend> Controller<B> {
     /// failed yet (since a camera last delivered) takes over, with the
     /// hold; with none, the session stops and the state is `error`.
     fn camera_failed(&mut self, reason: String, now: Instant) {
-        if self.session.is_none() {
+        let Some(s) = &self.session else {
             return;
+        };
+        // Before its first frame in a chosen mode: that mode is blamed and
+        // the camera tried once more in its automatic mode.
+        if s.awaiting.is_some()
+            && let Some(id) = self.session_camera().map(|c| c.id.clone())
+            && let Some(cam) = self.blame_mode(&id, &reason)
+        {
+            if let Some(s) = self.session.as_mut() {
+                // A new deadline for the new mode.
+                s.awaiting = None;
+            }
+            if self.reopen_camera(&cam, now).is_ok() {
+                self.follow_stages();
+            }
+            return;
+        }
+        if let Some(id) = self.session_camera().map(|c| c.id.clone()) {
+            self.forget_unconfirmed_mode(&id);
         }
         warning!("{reason}");
         self.mark_failed();
@@ -3050,6 +3625,30 @@ impl<B: MediaBackend> Controller<B> {
     fn try_cameras(&mut self, candidates: &[Camera], now: Instant) -> Result<(), Option<String>> {
         let mut last = None;
         for cam in candidates {
+            let mut res = self.open_candidate(cam, now);
+            // In a chosen mode that cannot open: once more in its
+            // automatic mode.
+            if let Err(e) = &res
+                && let Some(auto) = self.blame_mode(&cam.id, e)
+            {
+                res = self.open_candidate(&auto, now);
+            }
+            match res {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    self.forget_unconfirmed_mode(&cam.id);
+                    warning!("{e}");
+                    self.mark_failed();
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last)
+    }
+
+    /// Starts the ingest on `cam` ([`Self::try_cameras`]).
+    fn open_candidate(&mut self, cam: &Camera, now: Instant) -> Result<(), String> {
+        {
             self.leaving_camera();
             let params = self.session_params_for(cam);
             if let Some(s) = self.session.as_mut() {
@@ -3072,16 +3671,11 @@ impl<B: MediaBackend> Controller<B> {
                         cam.mode.fps()
                     );
                     self.camera_opened(cam);
-                    return Ok(());
+                    Ok(())
                 }
-                Err(e) => {
-                    warning!("{e}");
-                    self.mark_failed();
-                    last = Some(e);
-                }
+                Err(e) => Err(e),
             }
         }
-        Err(last)
     }
 
     fn decide(&mut self, now: Instant) {
@@ -3150,8 +3744,9 @@ impl<B: MediaBackend> Controller<B> {
             return false;
         };
         // Which module runs each stage is decided now, for the whole
-        // session.
-        self.plan = Some(self.modules.plan());
+        // session (frame generation when the first camera's rate is half
+        // the output's).
+        self.plan = Some(self.fresh_plan());
         // A selected stage no module provides is dropped (the effect run
         // has it off): the session streams on without it, whatever
         // `on_failure` says, and `Warning` says why.
@@ -3175,12 +3770,12 @@ impl<B: MediaBackend> Controller<B> {
                 .and_then(|()| self.effect_check(&params.effect));
             if let Err(reason) = res {
                 match params.effect.on_failure {
-                    EffectOnFailure::Black if settings.is_err() => {
+                    EffectOnFailure::Black | EffectOnFailure::Image if settings.is_err() => {
                         self.plan = None;
-                        self.set_fault(effect_failure_text(&params.effect, &reason));
+                        self.set_privacy_fault(effect_failure_text(&params.effect, &reason));
                         return false;
                     }
-                    EffectOnFailure::Black => {
+                    EffectOnFailure::Black | EffectOnFailure::Image => {
                         warning!("effect {} cannot run: {reason}", params.effect.mode);
                         self.effect_failure = Some(effect_warning_text(&params.effect, &reason));
                         refused = Some(reason);
@@ -3205,6 +3800,7 @@ impl<B: MediaBackend> Controller<B> {
             open: false,
             pinned: false,
             enhance: false,
+            contract: params.contract,
         });
         // `starting` is announced before the (slow) start; the settings it
         // changes (what is installed for this GPU, learnt once it is up)
@@ -3213,19 +3809,33 @@ impl<B: MediaBackend> Controller<B> {
         // From here the modules' code runs: marked in the crash ledger
         // until the session stops.
         self.mark_running(&params.effect);
-        if let Err(e) = self.backend.start_session(&params) {
+        if let Err(e) = self.backend.start_session(&params)
+            && self.start_passthrough(&params, &e.message).is_none()
+        {
             self.drop_session();
+            if e.contract {
+                self.session_contract_failed(&params.contract, &e.message);
+            }
+            let e = e.message;
             // The effect's check refused it before: that is the cause the
             // user can act on, the build's text a consequence.
-            match refused {
+            let msg = match refused {
                 Some(reason) => {
                     warning!("the output could not be built: {e}");
-                    self.set_fault(effect_failure_text(&params.effect, &reason));
+                    effect_failure_text(&params.effect, &reason)
                 }
-                None => self.set_fault(e),
+                None => e,
+            };
+            // Without its effect the output was not tried
+            // ([`Self::start_passthrough`]): privacy holds the feed.
+            if Self::hides_effect(&params.effect) {
+                self.set_privacy_fault(msg);
+            } else {
+                self.set_fault(msg);
             }
             return false;
         }
+        let restart = restart && self.passthrough.is_none();
         // The GPU is up: the compute capability can be learnt, and what is
         // installed for this GPU read again (applied to the session if it
         // changed what runs, or the session stopped to be started again
@@ -3307,6 +3917,7 @@ impl<B: MediaBackend> Controller<B> {
         }
         // The modules' code stopped (cleanly: the daemon is still here).
         self.plan = None;
+        self.passthrough = None;
         let marked = std::mem::take(&mut self.marked);
         self.modules.session_ended(&marked);
         self.next_stats = None;
@@ -3324,10 +3935,175 @@ impl<B: MediaBackend> Controller<B> {
         }
     }
 
+    /// The session output could not be built with `contract` (`e`): when
+    /// that is the configured contract, another one is streamed instead
+    /// from the next writer rebuild (once no application holds the virtual
+    /// camera, which keeps the format it opened): the last one that
+    /// started a session in this run, else the last good one of an earlier
+    /// run (`output_good`), else the built-in default.
+    fn session_contract_failed(&mut self, contract: &OutputContract, e: &str) {
+        if let Some(good) = self.session_fallback(contract)
+            && *contract == self.config.output_contract()
+        {
+            warning!(
+                "the output {} could not be built ({e}): {} is streamed instead once the \
+                 virtual camera is released",
+                output_mode_string(contract),
+                output_mode_string(&good)
+            );
+            self.failed_contract = Some((*contract, e.to_string(), good));
+        }
+    }
+
+    /// A session output that could not start with `params` (`why`) is
+    /// started once more at the same contract without the effect and the
+    /// module stages (an empty plan: the frames pass through), so that the
+    /// application that opened the virtual camera gets the camera rather
+    /// than an error. Not when a background effect is asked with
+    /// `on_failure = "black"` (the user's choice is black over an
+    /// unprocessed picture), nor when there is nothing to drop. The params
+    /// it started with, `None` if it was not tried or failed too.
+    fn start_passthrough(&mut self, params: &SessionParams, why: &str) -> Option<SessionParams> {
+        let black = Self::hides_effect(&params.effect);
+        let bare_plan = Plan::default();
+        if black || plan_ids(&bare_plan) == plan_ids(&self.current_plan()) {
+            return None;
+        }
+        let plan = self.plan.replace(bare_plan);
+        let bare = SessionParams {
+            contract: params.contract,
+            ..self.session_params()
+        };
+        if let Err(e) = self.backend.start_session(&bare) {
+            warning!("the output could not start without its effects either: {e}");
+            self.plan = plan;
+            return None;
+        }
+        let sr = |c: &OutputContract| mode_value(c.width, c.height, c.fps_num, c.fps_den);
+        warning!(
+            "the output {} could not start with its effects ({why}): streaming without them",
+            output_mode_string(&params.contract)
+        );
+        self.passthrough = Some(format!(
+            "Output {} could not start with its effects ({why}): streaming without them",
+            sr(&params.contract)
+        ));
+        self.effect_applied = Some(bare.effect.clone());
+        Some(bare)
+    }
+
+    /// What a session output that cannot be built with `contract` falls
+    /// back to ([`Self::session_contract_failed`]), never `contract`.
+    fn session_fallback(&self, contract: &OutputContract) -> Option<OutputContract> {
+        [
+            self.session_good,
+            self.runtime.output_good,
+            Some(OutputContract::default()),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|g| g != contract)
+    }
+
+    /// A writer and a session output started with `contract`, and a camera
+    /// frame reached the output: it is the last good one, kept in the state file (write-behind) for the next
+    /// run, unless the file is damaged (left alone until `SetEnabled`).
+    fn output_proven(&mut self, contract: OutputContract, now: Instant) {
+        self.session_good = Some(contract);
+        if self.runtime.output_good != Some(contract) && self.state_damaged.is_none() {
+            self.runtime.output_good = Some(contract);
+            self.settings_changed(now);
+        }
+    }
+
     fn set_fault(&mut self, msg: String) {
         error!("{msg}");
         self.error = msg.clone();
         self.fault = Some(msg);
+    }
+
+    /// [`Self::set_fault`] for a session refused for privacy: the effect
+    /// cannot run and `on_failure` hides the camera. While the fault
+    /// stands, privacy holds the feed ([`Self::privacy_hold`]).
+    fn set_privacy_fault(&mut self, msg: String) {
+        self.privacy_hold = Some(PrivacyHold::Fault(msg.clone()));
+        self.set_fault(msg);
+    }
+
+    /// A background effect is asked of the session with an `on_failure`
+    /// that hides the camera: the session never streams without it.
+    fn hides_effect(effect: &EffectRun) -> bool {
+        effect.mode != EffectMode::None && effect.on_failure.hides()
+    }
+
+    /// The image the writer's placeholder shows now: the fallback image
+    /// while privacy holds the feed ([`Self::privacy_hold`]: no session,
+    /// enabled, a consumer, the hold's fault still standing) and a
+    /// background effect is selected with `on_failure = "image"` and an
+    /// image; `None` (black) in every other case: off, idle, a camera
+    /// switch's gap or another fault. A hold that no longer applies is
+    /// forgotten.
+    fn placeholder_image(&mut self) -> Option<PathBuf> {
+        if self.session.is_some() || !self.runtime.enabled || self.consumers == 0 {
+            self.privacy_hold = None;
+        }
+        if let Some(PrivacyHold::Fault(f)) = &self.privacy_hold
+            && self.fault.as_ref() != Some(f)
+        {
+            self.privacy_hold = None;
+        }
+        let effect = self.effect();
+        if self.privacy_hold.is_none()
+            || effect.mode == EffectMode::None
+            || effect.on_failure != EffectOnFailure::Image
+        {
+            return None;
+        }
+        effect.fallback_image
+    }
+
+    /// Gives the writer's placeholder the image it shows now
+    /// ([`Self::placeholder_image`]) when that changed, and reads whether
+    /// it can.
+    fn sync_placeholder(&mut self) {
+        let want = self.placeholder_image();
+        if want != self.placeholder_set {
+            match &want {
+                Some(p) => info!(
+                    "privacy holds the feed: the placeholder shows the fallback image {}",
+                    p.display()
+                ),
+                None if self.placeholder_set.is_some() => info!("the placeholder is black again"),
+                None => {}
+            }
+            self.backend.set_placeholder(want.as_deref());
+            self.placeholder_set = want;
+        }
+        self.placeholder_failure = match self.placeholder_set {
+            Some(_) => self.backend.placeholder_failure(),
+            None => None,
+        };
+    }
+
+    /// `Warning`'s clauses of the fallback image: `on_failure = "image"`
+    /// without one (black is shown in its place, whenever the camera is
+    /// hidden), and an image the writer's placeholder or the running
+    /// session's effect element cannot read.
+    fn fallback_warnings(&self) -> Vec<String> {
+        let effect = self.effect();
+        let mut out = Vec::new();
+        if effect.on_failure == EffectOnFailure::Image && effect.fallback_image.is_none() {
+            out.push(
+                "effect.on_failure is \"image\" but effect.fallback_image is not set: showing \
+                 black"
+                    .to_string(),
+            );
+        }
+        out.extend(self.placeholder_failure.clone());
+        if self.session.is_some() {
+            out.extend(self.fallback_failure.clone());
+        }
+        out
     }
 
     fn maybe_stats(&mut self, now: Instant) {
@@ -3430,6 +4206,7 @@ impl<B: MediaBackend> Controller<B> {
             &mut self.cameras,
             camera::order(found, &self.config.camera_preference()),
         );
+        self.apply_camera_modes();
         let renamed = self.follow_renames(&old);
         debug!(
             "cameras: {}",
@@ -4056,10 +4833,10 @@ impl<B: MediaBackend> Controller<B> {
     fn effect_refused(&mut self, effect: EffectRun, reason: &str) -> IpcError {
         let msg = effect_failure_text(&effect, reason);
         match effect.on_failure {
-            EffectOnFailure::Black => {
+            EffectOnFailure::Black | EffectOnFailure::Image => {
                 info!("stopping the camera: the session refused the effect");
                 self.drop_session();
-                self.set_fault(msg.clone());
+                self.set_privacy_fault(msg.clone());
             }
             EffectOnFailure::None => {
                 warning!("{msg}");
@@ -4134,6 +4911,7 @@ impl<B: MediaBackend> Controller<B> {
         if let Some(s) = self.session.as_mut() {
             s.open = true;
         }
+        self.follow_frame_generation();
         let ids = self.apply_camera_controls(camera);
         self.start_watch(camera, &ids);
     }
@@ -4146,6 +4924,188 @@ impl<B: MediaBackend> Controller<B> {
         self.stop_watch();
         self.flush_settings();
         self.clear_enhance_failure();
+    }
+
+    /// The capture mode setting of camera `id` (`None`: no such camera, or
+    /// its modes are not known).
+    fn mode_setting_of(&self, id: &str) -> Option<obc_ipc::Setting> {
+        let cam = self.cameras.iter().find(|c| c.id == id)?;
+        settings::mode_setting(&cam.modes, self.runtime.camera_modes.get(id))
+    }
+
+    /// The mode asked of camera `id`: the one the user chose for it, else
+    /// (or while that one could not open, [`Self::mode_failed`]) the
+    /// config's `camera.mode`.
+    fn mode_request_for(&self, id: &str) -> ModeRequest {
+        self.runtime
+            .camera_modes
+            .get(id)
+            .filter(|_| !self.mode_failed.contains_key(id))
+            .copied()
+            .unwrap_or_else(|| self.config.camera_mode())
+    }
+
+    /// Camera `id` failed (`why`) before its first frame in the mode
+    /// chosen for it: unless that already happened in this run, or its
+    /// automatic mode is the same one, the failure is put down to the mode
+    /// ([`Self::mode_failed`]) and the camera, in its automatic mode, is
+    /// returned to be tried once more.
+    fn blame_mode(&mut self, id: &str, why: &str) -> Option<Camera> {
+        if self.mode_failed.contains_key(id) {
+            return None;
+        }
+        let asked = *self.runtime.camera_modes.get(id)?;
+        let cam = self.cameras.iter().find(|c| c.id == id)?;
+        let (before, modes) = (cam.mode, cam.modes.clone());
+        self.mode_failed.insert(
+            id.to_string(),
+            ModeFailed {
+                asked,
+                why: why.to_string(),
+                modes,
+                confirmed: false,
+            },
+        );
+        self.apply_camera_modes();
+        let cam = self.cameras.iter().find(|c| c.id == id)?.clone();
+        if cam.mode == before {
+            self.mode_failed.remove(id);
+            self.apply_camera_modes();
+            return None;
+        }
+        warning!(
+            "{} could not open {} ({why}): trying its automatic mode {}",
+            cam.label(),
+            settings::mode_choice_value(&asked),
+            cam.mode
+        );
+        Some(cam)
+    }
+
+    /// Camera `id` failed in its automatic mode before a first frame there:
+    /// its chosen mode is not to blame. An unconfirmed record
+    /// ([`ModeFailed::confirmed`]) goes, the chosen mode applies again
+    /// (tried at the camera's next open); a confirmed one stays.
+    fn forget_unconfirmed_mode(&mut self, id: &str) {
+        if self.mode_failed.get(id).is_some_and(|f| !f.confirmed) {
+            self.mode_failed.remove(id);
+            self.apply_camera_modes();
+        }
+    }
+
+    /// Each camera whose modes are known takes the mode chosen for what is
+    /// asked of it ([`Self::mode_request_for`], [`choose_mode`]: the size,
+    /// then the rate, then NV12 over YUY2 over MJPEG; a mode it does not
+    /// offer gives the nearest). The others keep the scan's.
+    fn apply_camera_modes(&mut self) {
+        // A camera gone, or reporting other modes, is no longer blamed.
+        let cameras = &self.cameras;
+        self.mode_failed
+            .retain(|id, f| cameras.iter().any(|c| c.id == *id && c.modes == f.modes));
+        for i in 0..self.cameras.len() {
+            if self.cameras[i].modes.is_empty() {
+                continue;
+            }
+            let req = self.mode_request_for(&self.cameras[i].id);
+            let caps = Capabilities {
+                modes: self.cameras[i].modes.clone(),
+                other_formats: Vec::new(),
+            };
+            if let Some(choice) = choose_mode(&caps, &req) {
+                self.cameras[i].mode = choice.mode;
+            }
+        }
+    }
+
+    /// The cameras take their modes again ([`Self::apply_camera_modes`]):
+    /// the session's open camera, when its mode changed, is reopened in the
+    /// new one (through the switch path: the output holds the last frame,
+    /// and the loopback is not touched), and its stages follow (frame
+    /// generation runs only while the output rate is twice the camera's).
+    fn follow_camera_modes(&mut self, now: Instant) {
+        let before = self.session_camera().map(|c| c.mode);
+        self.apply_camera_modes();
+        let Some(cam) = self.session_camera().cloned() else {
+            return;
+        };
+        if before.is_some_and(|m| m != cam.mode) && self.session.as_ref().is_some_and(|s| s.open) {
+            info!("camera mode {}: reopening {}", cam.mode, cam.label());
+            if self.reopen_camera(&cam, now).is_ok() {
+                self.follow_stages();
+            }
+        }
+    }
+
+    /// `SetSetting` of the capture mode ([`settings::MODE`]) on `camera`:
+    /// checked against its options, stored for that camera (`auto`: the
+    /// choice forgotten, the config's `camera.mode` applies), saved and
+    /// applied at once ([`Self::follow_camera_modes`]).
+    fn set_camera_mode(
+        &mut self,
+        camera: &str,
+        value: Option<&SettingValue>,
+        now: Instant,
+    ) -> Result<(), IpcError> {
+        let cam = self.control_camera(camera)?;
+        let setting = settings::mode_setting(&cam.modes, self.runtime.camera_modes.get(&cam.id));
+        let want = settings::check_mode(setting.as_ref(), &cam.id, value).map_err(refusal_error)?;
+        let old = match want {
+            Some(m) => self.runtime.camera_modes.insert(cam.id.clone(), m),
+            None => self.runtime.camera_modes.remove(&cam.id),
+        };
+        // A mode that could not open is tried again when chosen again.
+        let failed = self.mode_failed.remove(&cam.id).is_some();
+        if old == want && !failed {
+            return Ok(());
+        }
+        info!(
+            "{}: capture mode {}",
+            cam.label(),
+            want.as_ref()
+                .map_or_else(|| "automatic".to_string(), settings::mode_choice_value)
+        );
+        let res = self.settings_saved(now);
+        self.follow_camera_modes(now);
+        self.reconcile(now);
+        res
+    }
+
+    /// Forgets the capture mode chosen for `camera` (a reset of the whole
+    /// camera), the save scheduled; whether there was one.
+    fn forget_camera_mode(&mut self, camera: &str, now: Instant) -> bool {
+        let Ok(cam) = self.control_camera(camera) else {
+            return false;
+        };
+        self.mode_failed.remove(&cam.id);
+        let forgot = self.runtime.camera_modes.remove(&cam.id).is_some();
+        if forgot {
+            self.settings_changed(now);
+        }
+        forgot
+    }
+
+    /// Reads who holds the loopback while an output change waits for them
+    /// (again when their count or the contract waiting changes), for
+    /// `Warning`; forgets them when nothing waits.
+    fn read_holders(&mut self) {
+        let waiting = self.loopback_consumers > 0
+            && self
+                .writer
+                .as_ref()
+                .is_some_and(|w| w.contract != self.wanted_contract());
+        if !waiting {
+            self.holders_read = None;
+            self.holder_names.clear();
+            return;
+        }
+        let key = (self.loopback_consumers, self.wanted_contract());
+        if self.holders_read == Some(key) {
+            return;
+        }
+        if let Some(node) = self.writer.as_ref().map(|w| w.node.clone()) {
+            self.holder_names = self.backend.loopback_holder_names(&node);
+        }
+        self.holders_read = Some(key);
     }
 
     /// Reopens the session's `camera` (a new ingest on the same camera,
@@ -4368,6 +5328,7 @@ impl<B: MediaBackend> Controller<B> {
         });
         let mut built = built;
         built.global = self.global_settings();
+        built.mode = self.mode_setting_of(&camera.id);
         for note in &built.notes {
             if self
                 .settings_noted
@@ -4481,6 +5442,7 @@ impl<B: MediaBackend> Controller<B> {
             other => {
                 self.settings_scan = other;
                 CameraSettings {
+                    mode: self.mode_setting_of(&active),
                     camera: active,
                     global: self.global_settings(),
                     ..CameraSettings::none()
@@ -4847,6 +5809,13 @@ impl<B: MediaBackend> Controller<B> {
             let _ = reply.send(res);
             return;
         }
+        if let SetRequest::Setting { id, value } = &req
+            && id == settings::MODE
+        {
+            let res = self.set_camera_mode(camera, value.as_ref(), now);
+            let _ = reply.send(res);
+            return;
+        }
         match self.try_set(camera, &req, now, false, true) {
             SetOutcome::Done(res) => {
                 let _ = reply.send(res);
@@ -4997,9 +5966,42 @@ impl<B: MediaBackend> Controller<B> {
         self.modules.order().iter().map(|s| s.to_string()).collect()
     }
 
+    /// The facts the config schema is made from: the modules', the
+    /// options of `output.mode` ([`Self::output_mode_options`]) and those of
+    /// `effect.on_failure` (the image only with one configured).
+    fn schema_facts(&self) -> RegistryFacts {
+        let mut facts = registry_facts(&self.modules);
+        facts.output_modes = self.output_mode_options();
+        facts.on_failure_options =
+            config_schema::on_failure_options(&self.config_set.config.effect);
+        facts
+    }
+
+    /// The options of `output.mode`: what the camera the settings describe
+    /// can feed (no camera, or one whose modes are not known: two common
+    /// modes), twice its rates when a module provides frame generation,
+    /// and the configured value ([`output_mode_choices`]).
+    fn output_mode_options(&self) -> Vec<(String, String)> {
+        let c = self.config_set.config.output.mode;
+        let current = if c.fps_den == 1 {
+            format!("{}x{}@{}", c.width, c.height, c.fps_num)
+        } else {
+            format!("{}x{}@{}/{}", c.width, c.height, c.fps_num, c.fps_den)
+        };
+        let caps = self
+            .settings_camera()
+            .filter(|c| !c.modes.is_empty())
+            .map(|c| Capabilities {
+                modes: c.modes.clone(),
+                other_formats: Vec::new(),
+            });
+        let generated = self.modules.resolve(FRAME_GENERATION).provider.is_some();
+        output_mode_choices(caps.as_ref(), &current, generated)
+    }
+
     /// `GetConfigSchema`.
     fn config_schema(&self) -> obc_ipc::ConfigSchema {
-        let facts = registry_facts(&self.modules);
+        let facts = self.schema_facts();
         obc_ipc::ConfigSchema {
             serial: self.config_serial,
             groups: config_schema::config_schema(&self.config_set, &facts)
@@ -5041,7 +6043,7 @@ impl<B: MediaBackend> Controller<B> {
             ))
         })?;
         self.settle_pending_move(now);
-        let facts = registry_facts(&self.modules);
+        let facts = self.schema_facts();
         let res = config_d::set_config(&self.paths.config, &facts, key, &value);
         // Enabling a module is the same as `SetModuleEnabled`: one the
         // crash ledger disabled is forgiven.
@@ -5055,7 +6057,7 @@ impl<B: MediaBackend> Controller<B> {
     /// `ResetConfig`: the key removed from the managed file, applied.
     fn reset_config(&mut self, key: &str, now: Instant) -> Result<(), IpcError> {
         self.settle_pending_move(now);
-        let facts = registry_facts(&self.modules);
+        let facts = self.schema_facts();
         let res = config_d::reset_config(&self.paths.config, &facts, key);
         self.config_written(&format!("{key} reset"), res, None, now)
     }
@@ -5810,6 +6812,15 @@ impl<B: MediaBackend> Controller<B> {
 
     fn apply_config(&mut self, new: Config, now: Instant) {
         let old = std::mem::replace(&mut self.config, new);
+        // A contract that could not start is tried again once the
+        // configuration asks for another one.
+        if self
+            .failed_contract
+            .as_ref()
+            .is_some_and(|(f, ..)| *f != self.config.output_contract())
+        {
+            self.failed_contract = None;
+        }
         if let Some(note) = maxine_root_note(
             Some(old.effect.maxine_root.as_deref()),
             self.config.effect.maxine_root.as_deref(),
@@ -5992,6 +7003,8 @@ fn registry_facts(modules: &Modules) -> RegistryFacts {
             })
             .collect(),
         stages,
+        output_modes: Vec::new(),
+        on_failure_options: Vec::new(),
     }
 }
 
@@ -6104,6 +7117,58 @@ fn refusal_error(r: Refusal) -> IpcError {
         Refusal::Unknown(m) => IpcError::UnknownSetting(m),
         Refusal::Disabled(m) => IpcError::Disabled(m),
         Refusal::Invalid(m) => IpcError::InvalidArgument(m),
+    }
+}
+
+/// `text` made one line safe to show ([`settings::sanitise`]) and at most
+/// [`WARNING_MAX`] bytes: a longer one is cut on a character boundary and
+/// ends with an ellipsis, counted in the bound.
+fn cap_warning(text: &str) -> String {
+    let mut s = settings::sanitise(text, usize::MAX);
+    if s.len() <= WARNING_MAX {
+        return s;
+    }
+    const ELLIPSIS: &str = "\u{2026}";
+    let mut end = WARNING_MAX - ELLIPSIS.len();
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    let trimmed = s.trim_end().len();
+    s.truncate(trimmed);
+    s.push_str(ELLIPSIS);
+    s
+}
+
+/// Whether `out` fps is twice `camera` fps (within 0.2%).
+fn doubles(out: f64, camera: f64) -> bool {
+    let twice = 2.0 * camera;
+    twice > 0.0 && ((out - twice) / twice).abs() <= 0.002
+}
+
+/// The holders of a deferral warning: their names made safe to show and
+/// without duplicates, at most [`HOLDERS_NAMED`] then "and N more";
+/// [`HOLDERS_UNKNOWN`] when none could be named.
+fn holders_text(names: &[String]) -> String {
+    let mut unique: Vec<String> = Vec::new();
+    for n in names {
+        let n = settings::sanitise(n, HOLDER_NAME_MAX);
+        if !n.is_empty() && !unique.contains(&n) {
+            unique.push(n);
+        }
+    }
+    match unique.len() {
+        0 => HOLDERS_UNKNOWN.to_string(),
+        1 => unique.remove(0),
+        n if n <= HOLDERS_NAMED => {
+            let last = unique.pop().unwrap_or_default();
+            format!("{} and {last}", unique.join(", "))
+        }
+        n => format!(
+            "{} and {} more",
+            unique[..HOLDERS_NAMED].join(", "),
+            n - HOLDERS_NAMED
+        ),
     }
 }
 

@@ -99,8 +99,20 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// an effect a module provides that cannot load or run no longer stops
 /// the feed (with `on_failure = "black"` its frames are black, with
 /// `"none"` the camera image shows) and `Warning` says why. Neither is
-/// `Error` and the `error` state any more.
-pub const INTERFACE_REVISION: u32 = 11;
+/// `Error` and the `error` state any more. Revision 12 added the capture
+/// and output modes, with no new member: the camera setting
+/// `camera.capture.mode` (group `capture`, first: `auto` or a `WxH@FPS`
+/// the camera offers, kept per camera), the config row `output.mode` made
+/// an editable `enum` whose options the daemon computes (the selected
+/// camera's 16:9 modes, and twice a rate when a module provides frame
+/// generation), and `Warning` clauses for a capture mode not offered, an
+/// output change waiting for the applications that hold the virtual
+/// camera, an output contract that could not start and an output rate
+/// that frame generation cannot make; `Warning` is at most 512 bytes.
+pub const INTERFACE_REVISION: u32 = 12;
+/// The first [`INTERFACE_REVISION`] with `camera.capture.mode` and an
+/// editable `output.mode`.
+pub const MODES_REVISION: u32 = 12;
 /// The first [`INTERFACE_REVISION`] with `LoopbackConsumers`,
 /// `PipeWireConsumers` and `PipeWireOutput`.
 pub const PIPEWIRE_REVISION: u32 = 3;
@@ -1061,7 +1073,8 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, WARNING_REVISION);
+        assert_eq!(INTERFACE_REVISION, MODES_REVISION);
+        const { assert!(WARNING_REVISION < MODES_REVISION) };
         const { assert!(CONFIG_REVISION < WARNING_REVISION) };
         const { assert!(MODULES_REVISION < CONFIG_REVISION) };
         const { assert!(GLOBAL_SETTINGS_REVISION < MODULES_REVISION) };

@@ -17,7 +17,8 @@ use obc_module_sdk::{
 // ---------------------------------------------------------------------------
 
 /// Adds `step` (from its configuration) to every luma byte of a host NV12
-/// frame, in place; panics on the live parameter `test.panic`.
+/// frame, in place, except on a repeat (`OBC_FRAME_FLAG_REPEAT`), which it
+/// leaves as it came; panics on the live parameter `test.panic`.
 struct TestModule {
     step: u8,
 }
@@ -114,6 +115,9 @@ impl Instance for TestInstance {
             panic!("boom at frame {}", self.frames);
         }
         assert!(input.same_memory(output));
+        if input.is_repeat() {
+            return Ok(());
+        }
         // SAFETY: the host passes a host frame it owns for the call, in
         // place; only the output's plane is touched.
         let y = unsafe { output.host_plane_mut(0) }?;
@@ -258,7 +262,7 @@ fn load(vt: &obc_module_vtable, instance: *mut obc_instance) -> (obc_status, obc
 
 #[test]
 fn abi_version_is_packed() {
-    assert_eq!(obc_module_abi_version(), obc_module_abi_pack(1, 0));
+    assert_eq!(obc_module_abi_version(), obc_module_abi_pack(1, 1));
     assert_eq!(obc_module_abi_major(obc_module_abi_version()), 1);
     let vt = vtable();
     assert_eq!(vt.struct_size as usize, size_of::<obc_module_vtable>());
@@ -437,6 +441,15 @@ fn load_and_process_a_host_nv12_frame() {
     );
     assert_eq!(&buf[..8], &[12; 8], "luma moved by the step");
     assert_eq!(&buf[8..], &[10; 4], "chroma untouched");
+
+    // A repeat reaches the module as one: this one leaves it as it came.
+    let mut repeat = frame;
+    repeat.flags = OBC_FRAME_FLAG_REPEAT;
+    // SAFETY: as above.
+    let status =
+        unsafe { vt.instance_process.unwrap()(instance, &repeat, &repeat, ptr::null(), 0) };
+    assert_eq!(status, OBC_OK);
+    assert_eq!(&buf[..8], &[12; 8], "the repeat was told apart");
 
     let (mut timings, mut n) = (ptr::null(), 0usize);
     // SAFETY: a live instance.

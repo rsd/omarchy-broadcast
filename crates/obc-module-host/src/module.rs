@@ -37,7 +37,7 @@ use obc_module_abi::{
 };
 use serde::Deserialize;
 
-use crate::library::{Library, LogLevel, LogSink};
+use crate::library::{Library, LogLevel, LogSink, frame_flags_of};
 use crate::manifest::{Manifest, Slot};
 use crate::settings::{SettingsDescription, parse_settings};
 
@@ -846,6 +846,9 @@ impl Instance {
     /// the module to read (and, for `output`, write) during the call, and
     /// that nothing else accesses meanwhile; for CUDA frames, their context
     /// is current on the calling thread.
+    ///
+    /// The `flags` bits of the frames that the module's ABI version does not
+    /// know are cleared before the call ([`frame_flags_of`]).
     pub unsafe fn process(
         &mut self,
         input: &obc_frame,
@@ -871,9 +874,16 @@ impl Instance {
             .vtable()
             .instance_process
             .expect("checked at open");
-        // SAFETY: a live instance; the frames by the caller's contract; the
-        // parameters live across the call.
-        let status = unsafe { f(self.raw, input, output, params.as_ptr(), params.len()) };
+        // Only the flags of the module's ABI version: a module of ABI 1.0
+        // never sees a repeat marked, and processes it as any frame.
+        let known = frame_flags_of(self.core.lib.abi_version());
+        let (mut input, mut output) = (*input, *output);
+        input.flags &= known;
+        output.flags &= known;
+        // SAFETY: a live instance; the frames by the caller's contract (the
+        // copies describe the same memory); the parameters live across the
+        // call.
+        let status = unsafe { f(self.raw, &input, &output, params.as_ptr(), params.len()) };
         if status != OBC_OK {
             let chain = self.chain.clone();
             let mut e = self.fail(status, "a frame", &chain);

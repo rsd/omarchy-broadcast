@@ -19,6 +19,12 @@ pub enum EffectFallback {
     Black,
     /// The input, unprocessed: the user opted into showing the raw image.
     None,
+    /// As [`EffectFallback::Black`], with the still image of
+    /// [`EffectSettings::fallback_image`] (cropped to fill the frame) in
+    /// place of every black frame; black while there is none, while it is
+    /// decoded, and when it cannot be read (reported in
+    /// [`EffectStats::fallback_error`]).
+    Image,
 }
 
 impl EffectFallback {
@@ -27,7 +33,13 @@ impl EffectFallback {
         match self {
             EffectFallback::Black => "black",
             EffectFallback::None => "none",
+            EffectFallback::Image => "image",
         }
+    }
+
+    /// Whether the input stays hidden after a failure: `black` and `image`.
+    pub fn hides(self) -> bool {
+        matches!(self, EffectFallback::Black | EffectFallback::Image)
     }
 }
 
@@ -39,12 +51,13 @@ impl fmt::Display for EffectFallback {
 
 impl FromStr for EffectFallback {
     type Err = String;
-    /// Parses `black` or `none`, ignoring ASCII case.
+    /// Parses `black`, `none` or `image`, ignoring ASCII case.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "black" => Ok(EffectFallback::Black),
             "none" => Ok(EffectFallback::None),
-            _ => Err(format!("unknown on-failure value {s:?} (black|none)")),
+            "image" => Ok(EffectFallback::Image),
+            _ => Err(format!("unknown on-failure value {s:?} (black|image|none)")),
         }
     }
 }
@@ -120,6 +133,10 @@ pub struct EffectSettings {
     pub background: Option<PathBuf>,
     /// The output after a failure (`on-failure`).
     pub fallback: EffectFallback,
+    /// The still image of [`EffectFallback::Image`] (`fallback-image`): an
+    /// absolute path. Read when it is first shown, never loaded with the
+    /// effect.
+    pub fallback_image: Option<PathBuf>,
     /// The stackable stages, in the order the backend gets them (see
     /// `obc_backend` for how a backend runs them around the matte), each id
     /// at most once. A stage that is listed but off is reported (off) by the
@@ -135,6 +152,7 @@ impl Default for EffectSettings {
             blur_strength: Self::DEFAULT_BLUR_STRENGTH,
             background: None,
             fallback: EffectFallback::Black,
+            fallback_image: None,
             stages: Vec::new(),
         }
     }
@@ -205,6 +223,14 @@ impl EffectSettings {
         {
             return Err(format!(
                 "the background image path {} is not absolute",
+                p.display()
+            ));
+        }
+        if let Some(p) = &self.fallback_image
+            && !p.is_absolute()
+        {
+            return Err(format!(
+                "the fallback image path {} is not absolute",
                 p.display()
             ));
         }
@@ -411,7 +437,8 @@ pub struct EffectStats {
     pub stages: Vec<StageStats>,
     /// Frames the backend processed.
     pub frames_processed: u64,
-    /// Black frames output (warm-up, or a failure with `on-failure=black`).
+    /// Black frames output (warm-up, or a failure with `on-failure=black`),
+    /// or with `on-failure=image` the fallback image in their place.
     pub frames_black: u64,
     /// Frames passed through untouched (`none`, or a failure with
     /// `on-failure=none`), and input frames copied unprocessed into an
@@ -434,6 +461,20 @@ pub struct EffectStats {
     /// and a context reference): false until an effect is first requested
     /// on a running stream, and again after the element stops.
     pub cuda_active: bool,
+    /// With `on-failure=image`: why the fallback image cannot be shown
+    /// (black is, in its place), as [`fallback_unreadable`] words it.
+    /// `None` while it can (or has not been tried yet), and with any other
+    /// fallback.
+    pub fallback_error: Option<String>,
+}
+
+/// The report of a fallback image that cannot be shown: `"Fallback image
+/// <path> could not be read (<why>): showing black"`.
+pub fn fallback_unreadable(path: &std::path::Path, why: &str) -> String {
+    format!(
+        "Fallback image {} could not be read ({why}): showing black",
+        path.display()
+    )
 }
 
 impl EffectStats {
@@ -457,7 +498,8 @@ pub(crate) enum FrameAction {
     /// The input buffer downstream, untouched (BaseTransform passthrough).
     #[default]
     Passthrough,
-    /// A black frame in a new output buffer.
+    /// A black frame in a new output buffer (with `on-failure=image`, the
+    /// fallback image when it is ready).
     Black,
     /// The loaded effect into a new output buffer (black if, by the time
     /// the backend is locked, nothing is loaded any more).
@@ -466,7 +508,8 @@ pub(crate) enum FrameAction {
 
 /// The decision of the privacy rules (ADR-0012): the raw input is shown only
 /// for `none`, or after a failure with `on-failure=none`; an effect that is
-/// not loaded yet shows black; a loaded effect (the requested one, or the
+/// not loaded yet shows black (`image` is `black` here: the frame is then
+/// filled with the fallback image); a loaded effect (the requested one, or the
 /// previous one while the requested one loads) processes the frame.
 ///
 /// `loaded` says a chain usable for the request is loaded: for blur and
@@ -490,7 +533,9 @@ pub(crate) fn decide(
         };
     }
     match (status, fallback) {
-        (EffectStatus::Failed(_), EffectFallback::Black) => FrameAction::Black,
+        (EffectStatus::Failed(_), EffectFallback::Black | EffectFallback::Image) => {
+            FrameAction::Black
+        }
         (EffectStatus::Failed(_), EffectFallback::None) => FrameAction::Passthrough,
         _ if loaded => FrameAction::Process,
         _ => FrameAction::Black,
@@ -612,9 +657,17 @@ mod tests {
             "raw"
                 .parse::<EffectFallback>()
                 .unwrap_err()
-                .contains("black|none")
+                .contains("black|image|none")
         );
         assert_eq!(EffectFallback::default().to_string(), "black");
+        assert_eq!("Image".parse::<EffectFallback>(), Ok(EffectFallback::Image));
+        assert_eq!(EffectFallback::Image.to_string(), "image");
+        assert!(EffectFallback::Image.hides() && !EffectFallback::None.hides());
+        let s = EffectSettings {
+            fallback_image: Some("away.png".into()),
+            ..EffectSettings::default()
+        };
+        assert!(s.validate().unwrap_err().contains("fallback image"));
         assert_eq!(parse_effect("Replace"), Ok(EffectKind::Replace));
         assert!(
             parse_effect("sepia")
@@ -751,7 +804,11 @@ mod tests {
             EffectStatus::Ready,
             failed.clone(),
         ] {
-            for fb in [EffectFallback::Black, EffectFallback::None] {
+            for fb in [
+                EffectFallback::Black,
+                EffectFallback::Image,
+                EffectFallback::None,
+            ] {
                 for loaded in [false, true] {
                     // none: always the input.
                     assert_eq!(decide(None, &status, fb, loaded, false), Passthrough);
@@ -787,6 +844,13 @@ mod tests {
         );
         assert_eq!(decide(Blur, &EffectStatus::Ready, fb, true, false), Process);
         assert_eq!(decide(Blur, &failed, fb, true, false), Black);
+        // `image` is decided as `black` (the frame gets the image).
+        for status in [&EffectStatus::Loading, &failed] {
+            assert_eq!(
+                decide(Replace, status, EffectFallback::Image, false, false),
+                Black
+            );
+        }
         assert_eq!(
             decide(Blur, &failed, EffectFallback::None, true, false),
             Passthrough
@@ -803,7 +867,11 @@ mod tests {
             EffectStatus::Ready,
             EffectStatus::Failed("x".into()),
         ] {
-            for fb in [EffectFallback::Black, EffectFallback::None] {
+            for fb in [
+                EffectFallback::Black,
+                EffectFallback::Image,
+                EffectFallback::None,
+            ] {
                 // Loading (or reloading): the input, never black.
                 assert_eq!(decide(None, &status, fb, false, true), Passthrough);
                 // Loaded: the denoise stage runs.

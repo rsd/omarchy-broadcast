@@ -57,10 +57,14 @@
 //!   camera's, and are there with no camera too. [`diff`] covers them.
 
 use obc_core::config::{CameraControlState, valid_control_name};
+use obc_core::{ModeRequest, VideoMode};
 use obc_ipc::settings::SCOPE_CAMERA;
 use obc_ipc::{
     Condition, ConditionOp, Setting, SettingChange, SettingKind, SettingValue, SettingsGroup,
     SettingsTree, valid_setting_id,
+};
+use obc_pipeline::capability::{
+    Capabilities, INPUT_MAX_OPTIONS, input_mode_choices, mode_label, mode_value,
 };
 use obc_pipeline::control_node::{CtrlValue, MenuItemValue, NodeControl, is_never_exposed};
 use obc_pipeline::controls::{
@@ -88,6 +92,18 @@ pub const LABEL_MAX: usize = 48;
 /// The longest option label taken from a device string (a menu item's
 /// name), in bytes: the bound the CLI's JSON lines keep.
 pub const OPTION_LABEL_MAX: usize = 32;
+
+/// The capture mode setting: `auto` (the config's `camera.mode`) or one
+/// of the sizes and rates the camera offers.
+pub const MODE: &str = "camera.capture.mode";
+/// Its label.
+pub const MODE_LABEL: &str = "Resolution and frame rate";
+/// The option of the config's `camera.mode`.
+pub const MODE_AUTO: &str = "auto";
+/// Its label.
+pub const MODE_AUTO_LABEL: &str = "Automatic";
+/// The suffix of a stored mode the camera does not offer.
+pub const MODE_UNAVAILABLE_SUFFIX: &str = " (gone)";
 
 /// Why a disabled or read-only control is greyed.
 pub const REASON_FIXED: &str = "The camera does not allow changing this";
@@ -291,6 +307,10 @@ pub struct CameraSettings {
     /// The global settings published with them, after them
     /// ([`effects::build`]; empty until the controller attaches them).
     pub global: Vec<effects::GlobalEntry>,
+    /// The capture mode setting ([`mode_setting`]), first, in the
+    /// [`catalogue::CAPTURE`] group (`None` until the controller attaches
+    /// it, or when the camera's modes are not known).
+    pub mode: Option<Setting>,
     /// What was left out or cut, for the caller to log (once per camera
     /// and text).
     pub notes: Vec<String>,
@@ -412,8 +432,97 @@ pub fn build(inp: &Inputs<'_>) -> CameraSettings {
         camera: inp.camera.to_string(),
         entries,
         global: Vec::new(),
+        mode: None,
         notes,
     }
+}
+
+/// The value of a capture mode: `WxH@FPS`, without a format.
+pub fn mode_choice_value(m: &ModeRequest) -> String {
+    mode_value(m.width, m.height, m.fps_num, m.fps_den)
+}
+
+/// The capture mode setting of a camera whose node offers `modes`, with
+/// what the user chose for it (`stored`; `None`: automatic): options
+/// `auto` then the camera's choices ([`input_mode_choices`]: at most
+/// [`INPUT_MAX_OPTIONS`]), and a stored mode the camera does not offer
+/// (labelled with [`MODE_UNAVAILABLE_SUFFIX`], in place of the last
+/// choice when they are as many), so that the value is always an option.
+/// `None` when the modes are not known.
+pub fn mode_setting(modes: &[VideoMode], stored: Option<&ModeRequest>) -> Option<Setting> {
+    if modes.is_empty() {
+        return None;
+    }
+    let caps = Capabilities {
+        modes: modes.to_vec(),
+        other_formats: Vec::new(),
+    };
+    let mut choices = input_mode_choices(&caps, INPUT_MAX_OPTIONS);
+    let value = stored.map_or_else(|| MODE_AUTO.to_string(), mode_choice_value);
+    if let Some(m) = stored
+        && !choices.iter().any(|(v, _)| *v == value)
+    {
+        choices.truncate(INPUT_MAX_OPTIONS - 1);
+        let mut label = mode_label(m.width, m.height, m.fps_num, m.fps_den);
+        label.push_str(MODE_UNAVAILABLE_SUFFIX);
+        choices.push((value.clone(), label));
+    }
+    let options = std::iter::once((MODE_AUTO.to_string(), MODE_AUTO_LABEL.to_string()))
+        .chain(choices)
+        .collect();
+    Some(Setting {
+        id: MODE.into(),
+        label: MODE_LABEL.into(),
+        kind: SettingKind::Enum {
+            options,
+            default: MODE_AUTO.into(),
+            value,
+        },
+        scope: SCOPE_CAMERA.into(),
+        stored: stored.is_some(),
+        enabled: true,
+        disabled_reason: String::new(),
+        enabled_when: Vec::new(),
+        hint: None,
+    })
+}
+
+/// The mode a `SetSetting` of [`MODE`] asks for, checked against the
+/// setting as published (`setting`; `None`: the camera's modes are not
+/// known): `None` for `auto`, else the size and rate (no format).
+pub fn check_mode(
+    setting: Option<&Setting>,
+    camera: &str,
+    value: Option<&SettingValue>,
+) -> Result<Option<ModeRequest>, Refusal> {
+    let Some(setting) = setting else {
+        return Err(Refusal::Unknown(format!(
+            "the camera {camera} has no setting {MODE:?}: its modes are not known"
+        )));
+    };
+    let SettingKind::Enum { options, .. } = &setting.kind else {
+        return Err(Refusal::Invalid(format!("{MODE}: not an enum")));
+    };
+    let Some(SettingValue::Str(v)) = value else {
+        return Err(Refusal::Invalid(format!(
+            "{MODE}: expects an option id (s)"
+        )));
+    };
+    if !options.iter().any(|(o, _)| o == v) {
+        let ids: Vec<&str> = options.iter().map(|(i, _)| i.as_str()).collect();
+        return Err(Refusal::Invalid(format!(
+            "{MODE}: {v:?} is not one of its options ({})",
+            ids.join(", ")
+        )));
+    }
+    if v == MODE_AUTO {
+        return Ok(None);
+    }
+    v.parse::<ModeRequest>()
+        .ok()
+        .filter(|r| r.format.is_none())
+        .map(Some)
+        .ok_or_else(|| Refusal::Invalid(format!("{MODE}: {v:?} is not a mode")))
 }
 
 /// The candidate of one enumerated control, or `None` (with a note when it
@@ -892,14 +1001,17 @@ impl CameraSettings {
             })
         };
         let camera = catalogue::GROUPS.iter().filter_map(|g| {
-            group(
-                g,
+            let mut settings: Vec<Setting> = Vec::new();
+            if g.id == catalogue::CAPTURE {
+                settings.extend(self.mode.iter().cloned());
+            }
+            settings.extend(
                 self.entries
                     .iter()
                     .filter(|e| e.group == g.id)
-                    .map(|e| e.setting.clone())
-                    .collect(),
-            )
+                    .map(|e| e.setting.clone()),
+            );
+            group(g, settings)
         });
         let mut global: Vec<SettingsGroup> = Vec::new();
         for e in &self.global {
@@ -966,6 +1078,7 @@ pub fn change_of(s: &Setting) -> SettingChange {
 /// What changed from `old` to `new`, `None` when nothing did.
 pub fn diff(old: &CameraSettings, new: &CameraSettings) -> Option<Delta> {
     let structural = old.camera != new.camera
+        || old.mode.as_ref().map(shape) != new.mode.as_ref().map(shape)
         || old.entries.len() != new.entries.len()
         || old.global.len() != new.global.len()
         || old
@@ -994,7 +1107,9 @@ pub fn diff(old: &CameraSettings, new: &CameraSettings) -> Option<Delta> {
         .iter()
         .zip(&new.global)
         .map(|(a, b)| (&a.setting, &b.setting));
-    let changes: Vec<SettingChange> = camera
+    let mode = old.mode.iter().zip(&new.mode);
+    let changes: Vec<SettingChange> = mode
+        .chain(camera)
         .chain(global)
         .filter(|(a, b)| a != b)
         .map(|(_, b)| change_of(b))

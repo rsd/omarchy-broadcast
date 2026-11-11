@@ -15,6 +15,7 @@
 //! | `denoise` | pre-matte | noise removal |
 //! | `background` | matte | the cut-out, and the blur or the replacement of the background |
 //! | `relight` | post-matte, needs the matte | relighting of the person |
+//! | `frame-generation` | post-composite, last | a frame between two camera frames, for an output at twice the camera rate |
 //!
 //! A chain of `background`, `denoise` and `relight` is the Maxine effect
 //! backend ([`obc_backend_maxine::MaxineBackend`]): the `background` stage's
@@ -25,6 +26,20 @@
 //! models are reused as before. A chain of `enhance` alone is the Maxine
 //! upscaler ([`obc_backend_maxine::vsr::MaxineVsr`]): NV12 or I420 in, NV12
 //! an integer factor (2 to 4) larger out. Frames are CUDA frames only.
+//!
+//! The `frame-generation` stage (the `VideoFrameGeneration` effect,
+//! [`obc_backend_maxine::vfg`]) runs last in a chain of any of the effect
+//! stages, or alone, on NV12 frames of one size. The daemon adds it when the
+//! output runs at twice the camera rate, so that the output clock's repeats
+//! become new pictures: a fresh frame runs the other stages and goes out as
+//! the frame midway between the previous result and this one, at medium
+//! quality and with automatic shot-change detection; a repeat
+//! (`Frame::is_repeat`, ABI 1.1) skips the other stages and goes out as the
+//! last result; the first frame after a load or a temporal reset goes out
+//! as it is ([`framegen`]). The output is therefore one output tick late.
+//! The stage has no setting. When it fails to load, or on a frame, it alone
+//! is dropped (a stage failure) and the rest of the chain runs on every
+//! frame, repeats included, as without it.
 //!
 //! # Configuration
 //!
@@ -45,8 +60,9 @@
 //! feature it is made of is installed, with its models for the GPU; else
 //! it is unavailable, [`REASON_NOT_INSTALLED`] (the detail goes to the
 //! log). Relighting needs the cut-out of the `background` stage, so it is
-//! unavailable whenever `background` is. Without an SDK root to read,
-//! nothing can be known, and every stage is reported available.
+//! unavailable whenever `background` is. Frame generation needs the video
+//! frame generation feature. Without an SDK root to read, nothing can be
+//! known, and every stage is reported available.
 //!
 //! The deeper check (the ABI's `check`, run before a stream starts) does
 //! what the factories of the built-in backend did: it opens the SDK
@@ -66,9 +82,10 @@ use obc_backend::{
     EffectKind, FrameParams, GpuContext, HostBgr, InferenceBackend, LoadRequest, Params, StageId,
     StageList, StageTimings, Value as BackendValue,
 };
+use obc_backend_maxine::vfg::{MaxineVfg, MaxineVfgFactory};
 use obc_backend_maxine::vsr::{MaxineVsr, MaxineVsrFactory};
 use obc_backend_maxine::{
-    MaxineBackend, MaxineFactory, RELIGHT_BRIGHTNESS, RELIGHT_DIRECTION, RELIGHT_LIGHT,
+    Feature, MaxineBackend, MaxineFactory, RELIGHT_BRIGHTNESS, RELIGHT_DIRECTION, RELIGHT_LIGHT,
     RelightLight, STAGES, feature_availability, stage_availability_of,
 };
 use obc_module_sdk::{
@@ -78,8 +95,15 @@ use obc_module_sdk::{
 };
 use serde::Deserialize;
 
+pub mod framegen;
+
+use framegen::{FrameGen, Step};
+
 /// The module id.
 pub const MODULE_ID: &str = "br.com.dias.maxine-vfx";
+
+/// The stage id of frame generation.
+pub const FRAME_GENERATION: &str = "frame-generation";
 
 /// The reason of a stage whose SDK features are not installed.
 pub const REASON_NOT_INSTALLED: &str = "Not installed";
@@ -211,7 +235,8 @@ pub fn settings() -> SettingsDescription {
 }
 
 /// The probe of the SDK tree at `root` for a GPU of `compute_capability`
-/// (`None`: any): every stage, with [`REASON_NOT_INSTALLED`] for those not
+/// (`None`: any): every stage (those of the effect backend, then
+/// [`FRAME_GENERATION`]), with [`REASON_NOT_INSTALLED`] for those not
 /// installed, and the detail of each of those (`stage: why`). With no root,
 /// every stage is available (nothing can be known). Reads directories only.
 pub fn probe_root(
@@ -224,7 +249,7 @@ pub fn probe_root(
         for s in STAGES {
             report = report.available(s.as_str());
         }
-        return (report, details);
+        return (report.available(FRAME_GENERATION), details);
     };
     let features = feature_availability(root, compute_capability);
     let background = stage_availability_of(&features, StageId::BACKGROUND.as_str());
@@ -247,6 +272,17 @@ pub fn probe_root(
             }
         };
     }
+    let framegen = features
+        .iter()
+        .find(|(f, _)| *f == Feature::VideoFrameGeneration)
+        .and_then(|(_, a)| a.reason().map(str::to_string));
+    report = match framegen {
+        None => report.available(FRAME_GENERATION),
+        Some(why) => {
+            details.push(format!("{FRAME_GENERATION}: {why}"));
+            report.unavailable(FRAME_GENERATION, REASON_NOT_INSTALLED)
+        }
+    };
     (report, details)
 }
 
@@ -254,6 +290,7 @@ pub fn probe_root(
 pub struct MaxineModule {
     effects: MaxineFactory,
     enhance: MaxineVsrFactory,
+    framegen: MaxineVfgFactory,
     compute_capability: Option<(u32, u32)>,
 }
 
@@ -272,6 +309,7 @@ impl Module for MaxineModule {
         obc_backend_maxine::set_configured_root(root);
         let effects = MaxineFactory::from_env();
         let enhance = MaxineVsrFactory::from_env();
+        let framegen = MaxineVfgFactory::from_env();
         match effects.root() {
             Some(r) => log::debug!("the Maxine SDK root is {}", r.display()),
             None => log::debug!("no Maxine SDK root: the library search path is used"),
@@ -279,6 +317,7 @@ impl Module for MaxineModule {
         Ok(MaxineModule {
             effects,
             enhance,
+            framegen,
             compute_capability: config.host.compute_capability,
         })
     }
@@ -303,8 +342,8 @@ impl Module for MaxineModule {
 
     /// Opens the SDK as the built-in factories' probes did: the effects'
     /// libraries and model directory for `background`, `denoise` and
-    /// `relight`, the upscaler's libraries for `enhance`. No CUDA context,
-    /// no model.
+    /// `relight`, the upscaler's libraries for `enhance`, the SDK's for
+    /// `frame-generation`. No CUDA context, no model.
     fn check(&self, stages: &[&str]) -> Result<(), Error> {
         let effect = |s: &&str| {
             [StageId::BACKGROUND, StageId::DENOISE, StageId::RELIGHT]
@@ -317,6 +356,9 @@ impl Module for MaxineModule {
         if stages.contains(&StageId::ENHANCE.as_str()) {
             EnhancerFactory::probe(&self.enhance).map_err(module_error)?;
         }
+        if stages.contains(&FRAME_GENERATION) {
+            self.framegen.probe().map_err(module_error)?;
+        }
         Ok(())
     }
 
@@ -324,10 +366,14 @@ impl Module for MaxineModule {
         Ok(MaxineInstance {
             effects: self.effects.clone(),
             enhance: self.enhance.clone(),
+            framegen: self.framegen.clone(),
             chain: Chain::Empty,
             gpu: None,
             blur_strength: FrameParams::default().blur_strength,
             live: BTreeMap::new(),
+            vfg: None,
+            vfg_in_chain: false,
+            fg: FrameGen::default(),
         })
     }
 }
@@ -340,6 +386,8 @@ enum Chain {
     Effect(Box<MaxineBackend>),
     /// The upscaler (loaded or not).
     Enhance(Box<MaxineVsr>),
+    /// No stage but frame generation is loaded.
+    FrameGenOnly,
 }
 
 /// One chain of the module's stages.
@@ -353,6 +401,13 @@ pub struct MaxineInstance {
     blur_strength: f32,
     /// The last live parameters frames gave, by stage.
     live: BTreeMap<StageId, Params>,
+    framegen: MaxineVfgFactory,
+    /// The frame generation effect, once one was loaded.
+    vfg: Option<MaxineVfg>,
+    /// Frame generation is in the loaded chain (`vfg` is loaded).
+    vfg_in_chain: bool,
+    /// What frame generation holds.
+    fg: FrameGen,
 }
 
 /// The module's error for a backend's.
@@ -365,6 +420,12 @@ fn module_error(e: BackendError) -> Error {
             Error::failed(message)
         }
     }
+}
+
+/// The stage error of frame generation for a backend's error: frame
+/// generation alone fails, and the rest of the chain goes on without it.
+fn framegen_error(e: BackendError) -> Error {
+    Error::stage(FRAME_GENERATION, e.to_string())
 }
 
 fn value(v: &Value<'_>) -> BackendValue {
@@ -491,9 +552,12 @@ fn host_bgr(f: &Frame<'_>) -> Result<HostBgr, Error> {
 }
 
 impl MaxineInstance {
+    /// Loads the effect backend for `stages`, the request's stages but
+    /// frame generation.
     fn load_effect(
         &mut self,
         req: &ChainRequest<'_>,
+        stages: &[&str],
         gpu: GpuContext,
     ) -> Result<LoadReport, Error> {
         if req.input_format() != PixelFormat::Nv12
@@ -520,12 +584,12 @@ impl MaxineInstance {
         } else {
             EffectKind::None
         };
-        let mut stages = Vec::new();
-        for s in req.stages() {
+        let mut ids = Vec::new();
+        for s in stages {
             match *s {
                 "background" => {}
                 "denoise" | "relight" => {
-                    stages.push(StageId::new(*s).map_err(|e| Error::invalid(e.to_string()))?)
+                    ids.push(StageId::new(*s).map_err(|e| Error::invalid(e.to_string()))?)
                 }
                 other => {
                     return Err(Error::invalid(format!(
@@ -534,10 +598,10 @@ impl MaxineInstance {
                 }
             }
         }
-        let stages = StageList::new(stages).map_err(|e| Error::invalid(e.to_string()))?;
+        let stages = StageList::new(ids).map_err(|e| Error::invalid(e.to_string()))?;
         let mut params: BTreeMap<StageId, Params> = BTreeMap::new();
         for p in req.params() {
-            if p.stage == StageId::BACKGROUND.as_str() {
+            if p.stage == StageId::BACKGROUND.as_str() || p.stage == FRAME_GENERATION {
                 continue;
             }
             let stage = StageId::new(p.stage).map_err(|e| Error::invalid(e.to_string()))?;
@@ -635,12 +699,124 @@ impl MaxineInstance {
         })
     }
 
+    /// Loads frame generation for the request's frames, unless the loaded
+    /// one already fits them. Changes nothing of the instance: the effect
+    /// is returned, to be kept once the rest of the chain has loaded too.
+    /// `None`: the loaded one is kept.
+    fn load_framegen(
+        &self,
+        req: &ChainRequest<'_>,
+        gpu: GpuContext,
+    ) -> Result<Option<(MaxineVfg, LoadReport)>, Error> {
+        if req.input_format() != PixelFormat::Nv12
+            || req.output_format() != PixelFormat::Nv12
+            || req.input_size() != req.output_size()
+        {
+            return Err(Error::unsupported(
+                "frame generation runs on NV12 frames, in place of the same size",
+            ));
+        }
+        let (width, height) = req.input_size();
+        let colour = colour(req)?;
+        if self
+            .vfg
+            .as_ref()
+            .is_some_and(|v| v.is_loaded_for(&gpu, width, height, colour))
+        {
+            return Ok(None);
+        }
+        let mut vfg = self.framegen.create_vfg().map_err(framegen_error)?;
+        let report = vfg
+            .load(&gpu, width, height, colour)
+            .map_err(framegen_error)?;
+        Ok(Some((
+            vfg,
+            LoadReport {
+                load_ms: report.load_ms as f32,
+                warmup_ms: None,
+                reused_model: false,
+            },
+        )))
+    }
+
     fn unload_chain(&mut self) {
         match &mut self.chain {
-            Chain::Empty => {}
+            Chain::Empty | Chain::FrameGenOnly => {}
             Chain::Effect(b) => b.unload(),
             Chain::Enhance(v) => v.unload(),
         }
+    }
+
+    /// Runs the chain but frame generation on one frame.
+    fn process_stages(
+        &mut self,
+        gpu: &GpuContext,
+        input: &Frame<'_>,
+        output: &Frame<'_>,
+    ) -> Result<(), Error> {
+        match &mut self.chain {
+            Chain::Empty => Err(Error::state("nothing is loaded")),
+            Chain::Effect(backend) => {
+                let params = FrameParams {
+                    blur_strength: self.blur_strength,
+                    live: self.live.clone(),
+                };
+                backend
+                    .process(gpu, &params, &device_nv12(input)?, &device_nv12(output)?)
+                    .map_err(module_error)
+            }
+            Chain::Enhance(vsr) => vsr
+                .process(gpu, &device_yuv420(input)?, &device_nv12(output)?)
+                .map_err(module_error),
+            Chain::FrameGenOnly => {
+                let (src, dst) = (device_nv12(input)?, device_nv12(output)?);
+                if input.same_memory(output) {
+                    return Ok(());
+                }
+                // SAFETY: the host's frames, of the current context, for the
+                // call; distinct (not the same memory).
+                unsafe { obc_gpu::copy_nv12_async(&src, &dst, gpu.stream) }
+                    .map_err(|e| Error::failed(e.to_string()))
+            }
+        }
+    }
+
+    /// Runs one frame through the chain with frame generation (see
+    /// [`framegen`]). A failure of frame generation drops it from the
+    /// chain.
+    fn process_framegen(
+        &mut self,
+        gpu: &GpuContext,
+        input: &Frame<'_>,
+        output: &Frame<'_>,
+    ) -> Result<(), Error> {
+        let step = self.fg.step(input.is_repeat());
+        let dst = device_nv12(output)?;
+        if step.runs_stages() {
+            self.process_stages(gpu, input, output)?;
+        }
+        let vfg = self
+            .vfg
+            .as_mut()
+            .ok_or_else(|| Error::state("frame generation is not loaded"))?;
+        let result = match step {
+            Step::Held => vfg.write_held(gpu, &dst),
+            Step::First => vfg.push(gpu, &dst),
+            Step::Interpolate => vfg
+                .push(gpu, &dst)
+                .and_then(|()| vfg.interpolate(gpu, &dst)),
+        };
+        if let Err(e) = result {
+            // Frame generation alone failed: the rest goes on without it.
+            self.vfg_in_chain = false;
+            self.fg.reset();
+            if let Some(v) = self.vfg.as_mut() {
+                v.unload();
+            }
+            return Err(framegen_error(e));
+        }
+        self.fg.done(step);
+        Ok(())
     }
 }
 
@@ -652,24 +828,63 @@ impl Instance for MaxineInstance {
             ));
         }
         let gpu = gpu_of(req.cuda())?;
-        let result = if req.has_stage(StageId::ENHANCE.as_str()) {
-            if req.stages().len() != 1 {
-                return Err(Error::unsupported(
-                    "the enhance stage runs alone in its chain",
-                ));
-            }
+        if req.has_stage(StageId::ENHANCE.as_str()) && req.stages().len() != 1 {
+            return Err(Error::unsupported(
+                "the enhance stage runs alone in its chain",
+            ));
+        }
+        let wants_framegen = req.has_stage(FRAME_GENERATION);
+        let others: Vec<&str> = req
+            .stages()
+            .iter()
+            .copied()
+            .filter(|s| *s != FRAME_GENERATION)
+            .collect();
+        // Frame generation first, so that its failure leaves everything as
+        // it was: the host loads again without it.
+        let framegen = if wants_framegen {
+            self.load_framegen(req, gpu)?
+        } else {
+            None
+        };
+        let result = if others.is_empty() {
+            self.unload_chain();
+            self.chain = Chain::FrameGenOnly;
+            Ok(LoadReport {
+                load_ms: 0.0,
+                warmup_ms: None,
+                reused_model: framegen.is_none(),
+            })
+        } else if req.has_stage(StageId::ENHANCE.as_str()) {
             self.load_enhance(req, gpu)
         } else {
-            self.load_effect(req, gpu)
+            self.load_effect(req, &others, gpu)
         };
-        if result.is_ok() {
-            self.gpu = Some(gpu);
-            // The live parameters of the previous chain do not carry over:
-            // each frame gives those in force.
-            self.live.clear();
-            self.blur_strength = FrameParams::default().blur_strength;
+        let mut result = result?;
+        match framegen {
+            Some((vfg, report)) => {
+                if let Some(mut old) = self.vfg.replace(vfg) {
+                    old.unload();
+                }
+                result.load_ms += report.load_ms;
+                result.reused_model = false;
+            }
+            None if !wants_framegen => {
+                if let Some(v) = self.vfg.as_mut() {
+                    v.unload();
+                }
+            }
+            None => {}
         }
-        result
+        self.vfg_in_chain = wants_framegen;
+        // A new chain has no previous frame.
+        self.fg.reset();
+        self.gpu = Some(gpu);
+        // The live parameters of the previous chain do not carry over:
+        // each frame gives those in force.
+        self.live.clear();
+        self.blur_strength = FrameParams::default().blur_strength;
+        Ok(result)
     }
 
     fn process(
@@ -694,24 +909,16 @@ impl Instance for MaxineInstance {
                 .or_default()
                 .insert(p.key.to_string(), value(&p.value));
         }
-        match &mut self.chain {
-            Chain::Empty => Err(Error::state("nothing is loaded")),
-            Chain::Effect(backend) => {
-                let params = FrameParams {
-                    blur_strength: self.blur_strength,
-                    live: self.live.clone(),
-                };
-                backend
-                    .process(&gpu, &params, &device_nv12(input)?, &device_nv12(output)?)
-                    .map_err(module_error)
-            }
-            Chain::Enhance(vsr) => vsr
-                .process(&gpu, &device_yuv420(input)?, &device_nv12(output)?)
-                .map_err(module_error),
+        if self.vfg_in_chain {
+            self.process_framegen(&gpu, input, output)
+        } else {
+            self.process_stages(&gpu, input, output)
         }
     }
 
     fn reset_temporal(&mut self) -> Result<Vec<String>, Error> {
+        // The next frame has no previous one.
+        self.fg.reset();
         let (Chain::Effect(backend), Some(gpu)) = (&mut self.chain, &self.gpu) else {
             return Ok(Vec::new());
         };
@@ -721,6 +928,14 @@ impl Instance for MaxineInstance {
 
     fn unload(&mut self) {
         self.unload_chain();
+        if matches!(self.chain, Chain::FrameGenOnly) {
+            self.chain = Chain::Empty;
+        }
+        if let Some(v) = self.vfg.as_mut() {
+            v.unload();
+        }
+        self.vfg_in_chain = false;
+        self.fg.reset();
         self.gpu = None;
         self.live.clear();
         self.blur_strength = FrameParams::default().blur_strength;
@@ -728,7 +943,7 @@ impl Instance for MaxineInstance {
 
     fn timings(&self) -> Vec<(String, f32)> {
         match &self.chain {
-            Chain::Empty => Vec::new(),
+            Chain::Empty | Chain::FrameGenOnly => Vec::new(),
             Chain::Effect(b) => b.timings().map(|t| t.steps().to_vec()).unwrap_or_default(),
             Chain::Enhance(v) => v
                 .timings()
@@ -805,6 +1020,10 @@ mod tests {
     const DENOISING: (&str, &str) = ("nvvfxdenoising", "libnvVFXDenoising.so");
     const RELIGHTING: (&str, &str) = ("nvvfxrelighting", "libnvVFXRelighting.so");
     const VSR: (&str, &str) = ("nvvfxvideosuperres", "libnvVFXVideoSuperRes.so");
+    const VFG: (&str, &str) = (
+        "nvvfxvideoframegeneration",
+        "libnvVFXVideoFrameGeneration.so",
+    );
     const SM120: &[&str] = &[
         "AIGS_288x512_120_m0.engine.trtpkg",
         "Denoise-agg-120.engine.trtpkg",
@@ -822,12 +1041,24 @@ mod tests {
 
     #[test]
     fn the_probe_reads_the_sdk_tree() {
-        let full = tree(&[GREEN_SCREEN, BLUR, DENOISING, RELIGHTING, VSR], SM120);
+        let full = tree(
+            &[GREEN_SCREEN, BLUR, DENOISING, RELIGHTING, VSR, VFG],
+            SM120,
+        );
         let (r, details) = probe_root(Some(full.path()), Some((12, 0)));
         assert!(r.stages.iter().all(|s| s.available), "{r:?}");
         assert!(details.is_empty());
         let ids: Vec<&str> = r.stages.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["background", "denoise", "relight", "enhance"]);
+        assert_eq!(
+            ids,
+            [
+                "background",
+                "denoise",
+                "relight",
+                "enhance",
+                "frame-generation"
+            ]
+        );
 
         // Models for another GPU only: the features with models are not
         // installed for this one; the upscaler has none to miss.
@@ -840,6 +1071,7 @@ mod tests {
                 ("denoise".into(), false, not.clone()),
                 ("relight".into(), false, not.clone()),
                 ("enhance".into(), true, None),
+                ("frame-generation".into(), true, None),
             ]
         );
         assert_eq!(details.len(), 3);
@@ -854,8 +1086,17 @@ mod tests {
                 ("background".into(), false, not.clone()),
                 ("denoise".into(), true, None),
                 ("relight".into(), false, not.clone()),
-                ("enhance".into(), false, not),
+                ("enhance".into(), false, not.clone()),
+                ("frame-generation".into(), false, not),
             ]
+        );
+        // Without its feature directory, frame generation is not
+        // installed, with the reason in the details.
+        assert!(
+            details
+                .iter()
+                .any(|d| d.starts_with("frame-generation: the feature library ")),
+            "{details:?}"
         );
         assert!(
             details
@@ -869,7 +1110,7 @@ mod tests {
     fn relighting_is_not_installed_without_the_background_stage() {
         // The green screen and relighting, but not the background effect:
         // relighting has no cut-out to run through.
-        let part = tree(&[GREEN_SCREEN, DENOISING, RELIGHTING, VSR], SM120);
+        let part = tree(&[GREEN_SCREEN, DENOISING, RELIGHTING, VSR, VFG], SM120);
         let (r, details) = probe_root(Some(part.path()), Some((12, 0)));
         let not = Some(REASON_NOT_INSTALLED.to_string());
         assert_eq!(
@@ -879,6 +1120,7 @@ mod tests {
                 ("denoise".into(), true, None),
                 ("relight".into(), false, not),
                 ("enhance".into(), true, None),
+                ("frame-generation".into(), true, None),
             ]
         );
         assert!(
@@ -911,7 +1153,7 @@ mod tests {
     #[test]
     fn without_a_root_nothing_is_known_and_every_stage_is_offered() {
         let (r, details) = probe_root(None, None);
-        assert_eq!(r.stages.len(), 4);
+        assert_eq!(r.stages.len(), 5);
         assert!(r.stages.iter().all(|s| s.available));
         assert!(details.is_empty());
     }
@@ -975,5 +1217,6 @@ mod tests {
         for s in STAGES {
             assert!(has(&format!("id = \"{s}\"")), "{s}");
         }
+        assert!(has(&format!("id = \"{FRAME_GENERATION}\"")));
     }
 }

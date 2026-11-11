@@ -67,6 +67,12 @@ pub const REASON_NO_PROVIDER: &str = "No enabled module provides it";
 /// one that provides `background` (the phase-1 placement rule).
 pub const REASON_NEEDS_CUTOUT: &str = "Needs the cut-out of the module that provides it";
 
+/// The stage id of frame generation (vendor neutral). The daemon adds it
+/// to a session by itself, after every other stage, when the output rate is
+/// twice the camera's: it is in no order ([`Registry::order`],
+/// [`Registry::validate_order`]). Its provider is chosen as any stage's.
+pub const FRAME_GENERATION: &str = "frame-generation";
+
 /// How the provider of a stage is chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Profile {
@@ -749,9 +755,18 @@ impl Registry {
         )
     }
 
-    /// The default order: by slot, position, then id.
-    pub fn default_order(&self) -> Vec<StageId> {
+    /// The stages an order is over: every stage offered but
+    /// [`FRAME_GENERATION`].
+    fn ordered_ids(&self) -> Vec<StageId> {
         let mut ids = self.stage_ids();
+        ids.retain(|s| s.as_str() != FRAME_GENERATION);
+        ids
+    }
+
+    /// The default order: by slot, position, then id
+    /// ([`FRAME_GENERATION`] left out).
+    pub fn default_order(&self) -> Vec<StageId> {
+        let mut ids = self.ordered_ids();
         ids.sort_by_cached_key(|s| self.order_key(s));
         ids
     }
@@ -763,7 +778,7 @@ impl Registry {
         let Some(set) = &self.order else {
             return self.default_order();
         };
-        let known = self.stage_ids();
+        let known = self.ordered_ids();
         let mut order: Vec<StageId> = set.iter().filter(|s| known.contains(s)).cloned().collect();
         for missing in self.default_order() {
             if order.contains(&missing) {
@@ -810,10 +825,15 @@ impl Registry {
     /// Whether `order` is a valid order of every offered stage (see the
     /// module documentation); the reason names the offending stages.
     pub fn validate_order(&self, order: &[StageId]) -> Result<(), String> {
-        let known = self.stage_ids();
+        let known = self.ordered_ids();
         for (i, s) in order.iter().enumerate() {
             if order[..i].contains(s) {
                 return Err(format!("The order names {s} twice"));
+            }
+            if s.as_str() == FRAME_GENERATION {
+                return Err(format!(
+                    "The order cannot name {s}: it always runs after the other stages"
+                ));
             }
             if !known.contains(s) {
                 return Err(format!("No enabled module offers the stage {s}"));
@@ -1284,6 +1304,38 @@ mod tests {
         );
         assert_eq!(r.order(), r.default_order());
         assert!(r.validate_order(&r.default_order()).is_ok());
+    }
+
+    #[test]
+    fn frame_generation_is_in_no_order_but_has_a_provider() {
+        let fg = entry(
+            "org.example.fg",
+            &[(FRAME_GENERATION, "post-composite", 100, "cpu", "")],
+        );
+        let mut r = Registry::from_entries([maxine(), onnx(), hello(), fg]);
+        for id in [MAXINE, ONNX, HELLO, "org.example.fg"] {
+            all_installed(&mut r, id);
+        }
+        assert!(r.stage_ids().contains(&s(FRAME_GENERATION)));
+        let order: Vec<String> = r.default_order().iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            order,
+            ["enhance", "denoise", "background", "relight", "hello"]
+        );
+        assert_eq!(r.order(), r.default_order());
+        // An order without it is complete; one naming it is refused.
+        assert!(r.validate_order(&r.default_order()).is_ok());
+        let mut with = r.default_order();
+        with.push(s(FRAME_GENERATION));
+        let e = r.validate_order(&with).unwrap_err();
+        assert!(e.contains("cannot name frame-generation"), "{e}");
+        // A stored order naming it is kept without it.
+        r.restore_order(Some(with));
+        assert_eq!(r.order(), r.default_order());
+        assert_eq!(
+            r.resolve(FRAME_GENERATION).provider.as_deref(),
+            Some("org.example.fg")
+        );
     }
 
     #[test]

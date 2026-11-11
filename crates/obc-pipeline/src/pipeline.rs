@@ -24,7 +24,7 @@
 
 use gst::glib;
 use gst::prelude::*;
-use obc_core::{OutputFormat, VideoMode};
+use obc_core::{OutputContract, OutputFormat, VideoMode};
 use serde::Serialize;
 
 use crate::capability::IngestPath;
@@ -114,6 +114,9 @@ pub enum PipelineError {
         device: String,
         accepted: String,
         wanted: String,
+        /// The held format as an output contract, when it is one this
+        /// daemon can stream ([`LoopbackMismatch::held_as`]).
+        held_as: Option<OutputContract>,
     },
     /// The loopback's accepted caps are not held by a consumer, but still
     /// do not admit the output contract.
@@ -481,6 +484,7 @@ impl MediaPipeline {
                 device,
                 accepted: m.accepted,
                 wanted: m.wanted,
+                held_as: m.held_as,
             }
         } else {
             PipelineError::LoopbackRefused {
@@ -602,6 +606,10 @@ pub struct LoopbackMismatch {
     /// The accepted caps (DMABuf variants aside) are fixed: a consumer holds
     /// the device in the format of an earlier stream.
     pub held: bool,
+    /// With `held`: the held format as an output contract (limited range,
+    /// as every loopback stream), when it is one an output can be built
+    /// for (NV12 or I420, a valid size and rate); `None` otherwise.
+    pub held_as: Option<OutputContract>,
 }
 
 /// `None` when the loopback's `accepted` caps admit the `wanted` stream;
@@ -617,10 +625,12 @@ pub struct LoopbackMismatch {
 /// `v4l2sink` would refuse it with `not-negotiated` once frames flow.
 pub fn loopback_mismatch(wanted: &gst::Caps, accepted: &gst::Caps) -> Option<LoopbackMismatch> {
     if !accepted.can_intersect(wanted) {
+        let held = is_held(accepted);
         return Some(LoopbackMismatch {
             accepted: describe_raw_caps(accepted),
             wanted: describe_raw_caps(wanted),
-            held: is_held(accepted),
+            held,
+            held_as: held.then(|| held_contract(accepted)).flatten(),
         });
     }
     if !is_held(accepted) {
@@ -641,7 +651,32 @@ pub fn loopback_mismatch(wanted: &gst::Caps, accepted: &gst::Caps) -> Option<Loo
         ),
         wanted: format!("{} colorimetry {wanted_label}", describe_raw_caps(wanted)),
         held: true,
+        held_as: held_contract(accepted),
     })
+}
+
+/// The output contract of a held loopback's fixed `caps` (the first
+/// system-memory structure; [`is_held`]): its format, size and rate, in
+/// limited range. `None` when that is no contract an output can carry.
+///
+/// A loopback held in a format no output carries (YUY2, say: another
+/// producer's stream, since the daemon only streams NV12 and I420) gets
+/// no fallback: no writer of ours can feed it. That is inherent; the
+/// mismatch names the format held and the writer is tried again.
+fn held_contract(caps: &gst::Caps) -> Option<OutputContract> {
+    let (s, _) = caps
+        .iter_with_features()
+        .find(|(_, f)| !f.contains("memory:DMABuf"))?;
+    let rate = s.get::<gst::Fraction>("framerate").ok()?;
+    let c = OutputContract {
+        format: s.get::<&str>("format").ok()?.parse::<OutputFormat>().ok()?,
+        width: u32::try_from(s.get::<i32>("width").ok()?).ok()?,
+        height: u32::try_from(s.get::<i32>("height").ok()?).ok()?,
+        fps_num: u32::try_from(rate.numer()).ok()?,
+        fps_den: u32::try_from(rate.denom()).ok()?,
+        range: obc_core::ColourRange::Limited,
+    };
+    c.validate().ok().map(|()| c)
 }
 
 /// The colour labels the system-memory structures of `caps` list (a
@@ -1036,10 +1071,12 @@ mod tests {
             };
             caps(&format!("{}; {}", one(",colorimetry={ bt601 }"), one("")))
         };
-        let mismatch = |accepted: &str, wanted: &str, held: bool| LoopbackMismatch {
+        // Held as `held_as` (`WxH@FPS`, NV12), or refused.
+        let mismatch = |accepted: &str, wanted: &str, held_as: Option<&str>| LoopbackMismatch {
             accepted: accepted.to_string(),
             wanted: wanted.to_string(),
-            held,
+            held: held_as.is_some(),
+            held_as: held_as.map(|c| c.parse().unwrap()),
         };
         assert_eq!(
             loopback_mismatch(&wanted, &held("30/1", "NV12", 1920)),
@@ -1058,7 +1095,7 @@ mod tests {
                 Some(mismatch(
                     "NV12 1920x1080@30 colorimetry bt601",
                     &format!("NV12 1920x1080@30 colorimetry {other}"),
-                    true
+                    Some("1920x1080@30")
                 )),
                 "{other}"
             );
@@ -1074,7 +1111,11 @@ mod tests {
         assert_eq!(loopback_mismatch(&wanted, &held_unlabelled), None);
         assert_eq!(
             loopback_mismatch(&wanted, &held("60/1", "NV12", 1920)),
-            Some(mismatch("NV12 1920x1080@60", "NV12 1920x1080@30", true))
+            Some(mismatch(
+                "NV12 1920x1080@60",
+                "NV12 1920x1080@30",
+                Some("1920x1080@60")
+            ))
         );
         let ntsc = caps("video/x-raw,format=I420,width=1920,height=1080,framerate=30000/1001");
         assert_eq!(
@@ -1082,7 +1123,7 @@ mod tests {
             Some(mismatch(
                 "NV12 1920x1080@30",
                 "I420 1920x1080@30000/1001",
-                true
+                Some("1920x1080@30")
             ))
         );
         assert!(
@@ -1090,6 +1131,18 @@ mod tests {
                 .unwrap()
                 .held
         );
+        // Held in I420: that contract; held in a format no output makes
+        // (YUY2): held, as nothing to stream instead.
+        let i420 = loopback_mismatch(&wanted, &held("25/1", "I420", 1280)).unwrap();
+        assert_eq!(
+            i420.held_as,
+            Some(OutputContract {
+                format: OutputFormat::I420,
+                .."1280x1080@25".parse().unwrap()
+            })
+        );
+        let yuy2 = loopback_mismatch(&wanted, &held("30/1", "YUY2", 1920)).unwrap();
+        assert!(yuy2.held && yuy2.held_as.is_none(), "{yuy2:?}");
 
         let free = caps(
             "video/x-raw,format={ I420, NV12, YUY2 },width=[ 2, 8192 ],height=[ 1, 8192 ],\
@@ -1103,7 +1156,7 @@ mod tests {
              framerate=[ 0/1, 2147483647/1 ]",
         );
         let m = loopback_mismatch(&wanted, &no_nv12).unwrap();
-        assert!(!m.held, "{m:?}");
+        assert!(!m.held && m.held_as.is_none(), "{m:?}");
         assert_eq!(m.wanted, "NV12 1920x1080@30");
         assert!(m.accepted.contains("YUY2"), "{m:?}");
         // Several formats at a fixed size and rate: not held.

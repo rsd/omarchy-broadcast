@@ -21,6 +21,8 @@
 
 #[path = "support/fake_backend.rs"]
 mod fake_backend;
+#[path = "support/fake_chain.rs"]
+mod fake_chain;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -195,6 +197,8 @@ struct Rig {
     denoise_messages: Vec<(String, String)>,
     /// The `relight` and `relight-reason` fields of the same messages.
     relight_messages: Vec<(String, String)>,
+    /// The `fallback-image-error` field of the same messages.
+    fallback_messages: Vec<String>,
 }
 
 impl Rig {
@@ -203,12 +207,22 @@ impl Rig {
     }
 
     fn with_factory(factory: Option<Arc<dyn BackendFactory>>, settings: &EffectSettings) -> Rig {
+        Rig::with_downstream(factory, settings, "")
+    }
+
+    /// The rig with `downstream` (elements, each followed by `!`) between
+    /// the effect and `cudadownload`.
+    fn with_downstream(
+        factory: Option<Arc<dyn BackendFactory>>,
+        settings: &EffectSettings,
+        downstream: &str,
+    ) -> Rig {
         require_elements(&["cudaupload", "cudadownload", "appsrc", "appsink"]);
         gst_obc::register().unwrap();
         let (input, ctx) = upload();
         let pipeline = gst::parse::launch(&format!(
             "appsrc name=src format=time is-live=true caps=\"{CANONICAL}\" ! \
-             obceffect name=fx ! cudadownload ! video/x-raw,format=NV12 ! \
+             obceffect name=fx ! {downstream}cudadownload ! video/x-raw,format=NV12 ! \
              appsink name=sink sync=false"
         ))
         .unwrap()
@@ -273,6 +287,7 @@ impl Rig {
             messages: Vec::new(),
             denoise_messages: Vec::new(),
             relight_messages: Vec::new(),
+            fallback_messages: Vec::new(),
         }
     }
 
@@ -284,6 +299,12 @@ impl Rig {
 
     /// [`Self::frame`] with `flags` set on the pushed buffer.
     fn frame_with(&mut self, flags: gst::BufferFlags) -> Seen {
+        let bytes = self.bytes_with(flags);
+        classify(&bytes, &self.input_bytes)
+    }
+
+    /// [`Self::frame_with`], the output's packed bytes.
+    fn bytes_with(&mut self, flags: gst::BufferFlags) -> Vec<u8> {
         let mut b = self.input.copy();
         {
             let b = b.make_mut();
@@ -299,7 +320,7 @@ impl Rig {
             .try_pull_sample(gst::ClockTime::from_seconds(5))
             .unwrap_or_else(|| panic!("no output frame; bus: {:?}", self.bus_errors()));
         self.drain_messages();
-        classify(&packed(&sample), &self.input_bytes)
+        packed(&sample)
     }
 
     /// Frames at about 30 fps until `done` or `timeout`; returns them.
@@ -339,6 +360,8 @@ impl Rig {
                 };
                 self.denoise_messages.push(stage("denoise"));
                 self.relight_messages.push(stage("relight"));
+                self.fallback_messages
+                    .push(s.get::<String>("fallback-image-error").unwrap());
             }
         }
     }
@@ -649,6 +672,150 @@ fn gpu_switches_never_show_the_input_while_an_effect_is_requested() {
         "unload/drop without the context"
     );
     assert_eq!(get(&fake.log.creates), 1);
+}
+
+/// A white PNG of `width x height` for the fallback image (its NV12 in the
+/// rig's limited range: Y 235, U = V = 128).
+fn white_png(dir: &Path, width: u32, height: u32) -> std::path::PathBuf {
+    gst::init().unwrap();
+    let path = dir.join("away.png");
+    let p = gst::parse::launch(&format!(
+        "videotestsrc num-buffers=1 pattern=white ! video/x-raw,format=RGB,width={width},\
+         height={height} ! pngenc snapshot=true ! filesink location={}",
+        path.display()
+    ))
+    .unwrap();
+    p.set_state(gst::State::Playing).unwrap();
+    let m = p
+        .bus()
+        .unwrap()
+        .timed_pop_filtered(
+            gst::ClockTime::from_seconds(10),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        )
+        .unwrap();
+    assert_eq!(m.type_(), gst::MessageType::Eos, "{m:?}");
+    p.set_state(gst::State::Null).unwrap();
+    path
+}
+
+/// Every Y byte 235 and every chroma byte 128: the white fallback image.
+fn is_white(frame: &[u8]) -> bool {
+    let (y, uv) = frame.split_at((W * H) as usize);
+    y.iter().all(|b| *b == 235) && uv.iter().all(|b| *b == 128)
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_on_failure_image_shows_the_fallback_image_where_black_would_be() {
+    let dir = tempfile::tempdir().unwrap();
+    // Another aspect ratio than the frames': cropped to fill them.
+    let image = white_png(dir.path(), 400, 400);
+    let fake = FakeFactory::new(FakeConfig {
+        fail_load: Some("fake load failure".into()),
+        ..FakeConfig::default()
+    });
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &EffectSettings::default());
+    assert_eq!(rig.frame(), Seen::Input);
+    let settings = EffectSettings {
+        fallback: EffectFallback::Image,
+        fallback_image: Some(image.clone()),
+        ..EffectSettings::of(EffectKind::Blur)
+    };
+    rig.effect.apply(&settings).unwrap();
+    // Black until the image is decoded, then the image: never the input.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let bytes = rig.bytes_with(gst::BufferFlags::empty());
+        if is_white(&bytes) && failed(&rig) {
+            break;
+        }
+        assert!(
+            classify(&bytes, &rig.input_bytes) == Seen::Black || is_white(&bytes),
+            "only black or the image: {:?}",
+            classify(&bytes, &rig.input_bytes)
+        );
+        assert!(Instant::now() < deadline, "the image never showed");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    for _ in 0..3 {
+        assert!(is_white(&rig.bytes_with(gst::BufferFlags::empty())));
+    }
+    let stats = rig.effect.stats();
+    assert_eq!(stats.fallback_error, None);
+    assert!(stats.frames_black > 0, "the image counts as a hidden frame");
+    // A process failure after a good load: the failing frame is the image.
+    fake.set(|c| c.fail_load = None);
+    rig.effect.apply(&settings).unwrap();
+    rig.frames_until(Duration::from_secs(5), status_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    fake.set(|c| c.fail_process = Some("fake frame failure".into()));
+    assert!(is_white(&rig.bytes_with(gst::BufferFlags::empty())));
+    assert!(failed(&rig));
+    // on-failure=black again: black, the image left unused.
+    rig.effect
+        .apply(&EffectSettings {
+            fallback: EffectFallback::Black,
+            ..settings.clone()
+        })
+        .unwrap();
+    rig.frames_until(Duration::from_secs(5), failed);
+    assert_eq!(rig.frame(), Seen::Black);
+    assert_eq!(rig.caps_events.load(Ordering::SeqCst), 1);
+    rig.stop();
+    assert!(!rig.effect.stats().cuda_active);
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_an_unreadable_fallback_image_shows_black_and_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("gone.png");
+    let fake = FakeFactory::new(FakeConfig {
+        fail_load: Some("fake load failure".into()),
+        ..FakeConfig::default()
+    });
+    let settings = EffectSettings {
+        fallback: EffectFallback::Image,
+        fallback_image: Some(missing.clone()),
+        ..EffectSettings::of(EffectKind::Blur)
+    };
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &settings);
+    let seen = rig.frames_until(Duration::from_secs(10), |r| {
+        failed(r) && r.effect.stats().fallback_error.is_some()
+    });
+    assert!(seen.iter().all(|s| *s == Seen::Black), "{seen:?}");
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::Black);
+    }
+    let why = rig.effect.stats().fallback_error.unwrap();
+    assert!(
+        why.starts_with(&format!(
+            "Fallback image {} could not be read (",
+            missing.display()
+        )) && why.ends_with("): showing black")
+            && why.contains("unreadable"),
+        "{why}"
+    );
+    // The status message carries it.
+    rig.drain_messages();
+    assert_eq!(
+        rig.fallback_messages.last(),
+        Some(&why),
+        "{:?}",
+        rig.messages
+    );
+    // Another fallback: no report any more.
+    rig.effect
+        .apply(&EffectSettings {
+            fallback: EffectFallback::Black,
+            ..settings
+        })
+        .unwrap();
+    assert_eq!(rig.effect.stats().fallback_error, None);
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
 }
 
 #[test]
@@ -2137,6 +2304,299 @@ fn gpu_frame_parameters_after_a_failure_load_nothing() {
     assert!(get(&fake.log.loads) > loads);
     rig.stop();
     assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
+/// What leaves the effect for each frame: its first memory, its PTS and
+/// whether it carries the repeat flag.
+type Sent = Arc<Mutex<Vec<(usize, Option<gst::ClockTime>, bool)>>>;
+
+fn record_sent(fx: &ObcEffect) -> Sent {
+    let sent: Sent = Arc::default();
+    let s = Arc::clone(&sent);
+    fx.static_pad("src")
+        .unwrap()
+        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
+                s.lock().unwrap().push((
+                    b.peek_memory(0).as_ptr() as usize,
+                    b.pts(),
+                    gst_obc::has_repeat_flag(b),
+                ));
+            }
+            gst::PadProbeReturn::Ok
+        });
+    sent
+}
+
+fn last(sent: &Sent) -> (usize, Option<gst::ClockTime>, bool) {
+    *sent
+        .lock()
+        .unwrap()
+        .last()
+        .expect("a frame left the effect")
+}
+
+/// A repeat of a processed frame gets the cached output: the same memory,
+/// the repeat's timestamp and flag, and no call into the backend; the next
+/// fresh frame is processed again.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_repeat_re_sends_the_last_processed_frame_and_runs_no_effect() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let mut rig = Rig::new(
+        Some(Arc::clone(&fake)),
+        &EffectSettings::of(EffectKind::Blur),
+    );
+    rig.frames_until(Duration::from_secs(5), status_is(EffectStatus::Ready));
+    let sent = record_sent(&rig.effect);
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    let (processed_mem, _, repeat) = last(&sent);
+    assert!(!repeat);
+    let processes = get(&fake.log.processes);
+    let stats = rig.effect.stats();
+    for _ in 0..3 {
+        let pts = gst::ClockTime::from_nseconds(rig.pts);
+        assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::FakeBlur);
+        let (mem, out_pts, repeat) = last(&sent);
+        assert_eq!(mem, processed_mem, "the cached memory is sent again");
+        assert_eq!(out_pts, Some(pts), "with the repeat's timestamp");
+        assert!(repeat, "and its flag");
+    }
+    assert_eq!(get(&fake.log.processes), processes, "no effect ran");
+    let after = rig.effect.stats();
+    assert_eq!(after.frames_processed, stats.frames_processed);
+    assert_eq!(after.frames_black, stats.frames_black);
+    assert_eq!(after.frames_passthrough, stats.frames_passthrough);
+    // A fresh frame is processed, and is the next one cached.
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    assert_eq!(get(&fake.log.processes), processes + 1);
+    let (fresh_mem, _, _) = last(&sent);
+    assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::FakeBlur);
+    assert_eq!(last(&sent).0, fresh_mem);
+    assert_eq!(get(&fake.log.processes), processes + 1);
+    assert_eq!(rig.input_now(), rig.input_bytes, "the input was written");
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
+/// A repeat after any change of the settings (a per-frame parameter, a
+/// stage switched on) or after a new source runs the effect: the cached
+/// frame was made under what came before.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_repeat_after_a_settings_change_is_processed_never_the_cached_frame() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let mut rig = Rig::new(
+        Some(Arc::clone(&fake)),
+        &EffectSettings::of(EffectKind::Blur),
+    );
+    rig.frames_until(Duration::from_secs(5), status_is(EffectStatus::Ready));
+    let sent = record_sent(&rig.effect);
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    // The blur strength alone: no new request, but a new frame parameter.
+    let processes = get(&fake.log.processes);
+    rig.effect
+        .apply(&EffectSettings {
+            blur_strength: 0.9,
+            ..EffectSettings::of(EffectKind::Blur)
+        })
+        .unwrap();
+    assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::FakeBlur);
+    assert_eq!(get(&fake.log.processes), processes + 1, "processed");
+    assert_eq!(
+        get(&fake.log.last_strength_milli),
+        900,
+        "with the new strength"
+    );
+    // The repeat processed under the new settings is the new cache.
+    let cached = last(&sent).0;
+    assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::FakeBlur);
+    assert_eq!(last(&sent).0, cached);
+    assert_eq!(get(&fake.log.processes), processes + 1);
+    // A stage switched on: every repeat is processed until it is ready,
+    // and the first one after shows the stage.
+    set_stage(&rig.effect, &StageId::DENOISE, true);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let before = get(&fake.log.processes);
+        let seen = rig.frame_with(gst_obc::REPEAT_FLAG);
+        assert!(
+            matches!(seen, Seen::FakeBlur | Seen::FakeBlurDenoised),
+            "{seen:?}"
+        );
+        assert_eq!(
+            get(&fake.log.processes),
+            before + 1,
+            "a repeat ran the effect"
+        );
+        if seen == Seen::FakeBlurDenoised {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the stage never ran");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert_eq!(rig.effect.stage_status("denoise"), EffectStatus::Ready);
+    // A new source: the repeat after it resets and processes.
+    assert_eq!(rig.frame(), Seen::FakeBlurDenoised);
+    let processes = get(&fake.log.processes);
+    let resets = get(&fake.log.resets);
+    assert_eq!(
+        rig.frame_with(gst_obc::NEW_SOURCE_FLAG | gst_obc::REPEAT_FLAG),
+        Seen::FakeBlurDenoised
+    );
+    assert_eq!(get(&fake.log.processes), processes + 1);
+    assert_eq!(get(&fake.log.resets), resets + 1);
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
+/// A repeat is black wherever a fresh frame is: while the effect loads,
+/// cold after `none`, and after a failure with `on-failure=black`, even
+/// with a processed frame cached before. Under `none` it is the input,
+/// which hides nothing.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_repeat_while_the_effect_loads_is_black_under_black() {
+    let fake = FakeFactory::new(FakeConfig {
+        load_delay: Duration::from_millis(400),
+        ..FakeConfig::default()
+    });
+    let mut rig = Rig::new(
+        Some(Arc::clone(&fake)),
+        &EffectSettings::of(EffectKind::Blur),
+    );
+    assert_eq!(rig.frame(), Seen::Black, "loading");
+    let mut repeats = 0;
+    while rig.effect.status() != EffectStatus::Ready {
+        assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::Black);
+        repeats += 1;
+        assert!(repeats < 200, "the effect never loaded");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(repeats > 0);
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::FakeBlur);
+    // To `none` and back: the input, then a cold load in black.
+    rig.effect.apply(&EffectSettings::default()).unwrap();
+    assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::Input);
+    rig.effect
+        .apply(&EffectSettings::of(EffectKind::Blur))
+        .unwrap();
+    let seen = rig.frames_until(Duration::from_secs(5), |r| {
+        r.effect.status() == EffectStatus::Loading
+    });
+    assert!(seen.iter().all(|s| *s == Seen::Input), "{seen:?}");
+    assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::Black);
+    while rig.effect.status() != EffectStatus::Ready {
+        assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::Black);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // A processed frame cached, then a failure: the repeat is black.
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    fake.set(|c| c.fail_process = Some("fake frame failure".into()));
+    assert_eq!(rig.frame(), Seen::Black);
+    assert!(failed(&rig));
+    assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::Black);
+    // The same with the failure only seen on the repeat itself.
+    fake.set(|c| c.fail_process = None);
+    rig.effect
+        .apply(&EffectSettings::of(EffectKind::Blur))
+        .unwrap();
+    rig.frames_until(Duration::from_secs(5), status_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    rig.effect
+        .apply(&EffectSettings {
+            blur_strength: 0.2,
+            ..EffectSettings::of(EffectKind::Blur)
+        })
+        .unwrap();
+    fake.set(|c| c.fail_process = Some("fake frame failure".into()));
+    assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::Black);
+    assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::Black);
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
+/// An `obcmodule` after the effect processes in place, with a stage that
+/// is not idempotent (`bump` adds to every luma byte). The cached frame is
+/// shared, so the module's write lands in a copy: the repeat, bumped again
+/// by the module, shows the cached blur bumped once, not twice.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_downstream_in_place_write_does_not_change_the_cached_frame() {
+    use fake_chain::{FAKE_BUMP_Y, FakeChainConfig, FakeChainFactory};
+    gst_obc::module::register().unwrap();
+    let fake = FakeFactory::new(FakeConfig::default());
+    let mut rig = Rig::with_downstream(
+        Some(Arc::clone(&fake) as Arc<dyn BackendFactory>),
+        &EffectSettings::of(EffectKind::Blur),
+        "obcmodule name=m ! ",
+    );
+    let module = rig
+        .pipeline
+        .by_name("m")
+        .unwrap()
+        .downcast::<gst_obc::ObcModule>()
+        .unwrap();
+    let chain = FakeChainFactory::cuda(FakeChainConfig::default());
+    module.set_factory(Some(
+        Arc::clone(&chain) as Arc<dyn obc_backend::StageChainFactory>
+    ));
+    module
+        .apply(&[StageRequest::on(StageId::new("bump").unwrap())])
+        .unwrap();
+    let module_out: Arc<Mutex<Vec<usize>>> = Arc::default();
+    let m = Arc::clone(&module_out);
+    module
+        .static_pad("src")
+        .unwrap()
+        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
+                m.lock().unwrap().push(b.peek_memory(0).as_ptr() as usize);
+            }
+            gst::PadProbeReturn::Ok
+        });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rig.effect.status() != EffectStatus::Ready
+        || module.stage_status("bump") != EffectStatus::Ready
+    {
+        assert!(Instant::now() < deadline, "not ready");
+        rig.frame();
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let sent = record_sent(&rig.effect);
+    let y_len = (W * H) as usize;
+    let once = FAKE_BLUR_Y.wrapping_add(FAKE_BUMP_Y);
+    let bumped_once = |bytes: &[u8]| bytes[..y_len].iter().all(|b| *b == once);
+    let fresh = rig.bytes_with(gst::BufferFlags::empty());
+    assert!(
+        bumped_once(&fresh),
+        "the module bumped the blur: {}",
+        fresh[0]
+    );
+    let cached = last(&sent).0;
+    assert_ne!(
+        module_out.lock().unwrap().last().copied(),
+        Some(cached),
+        "the module wrote into a copy of the effect's memory"
+    );
+    let processes = get(&fake.log.processes);
+    for _ in 0..3 {
+        let out = rig.bytes_with(gst_obc::REPEAT_FLAG);
+        assert_eq!(last(&sent).0, cached, "the cached memory was re-sent");
+        assert!(
+            bumped_once(&out),
+            "the cached frame changed under the module's write: Y {}",
+            out[0]
+        );
+    }
+    assert_eq!(get(&fake.log.processes), processes, "no effect ran");
+    assert_eq!(
+        fake_chain::FakeChainLog::get(&chain.log.repeats),
+        3,
+        "the module ran on every repeat"
+    );
+    rig.stop();
 }
 
 /// What the `maxine_*` tests need before the factory can find the SDK.
