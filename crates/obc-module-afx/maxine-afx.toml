@@ -6,11 +6,11 @@
 abi = 1
 id = "br.com.dias.maxine-afx"
 name = "NVIDIA Maxine audio effects"
-version = "0.32.0"
+version = "0.33.0"
 licence = "MIT OR Apache-2.0 (module); NVIDIA Maxine Audio Effects SDK under its own licence"
 kind = "audio-filter"
 library = "/usr/lib/omarchy-broadcast/modules/libobc_module_afx.so"
-description = "Microphone noise removal, room echo removal, speaker focus and studio voice on NVIDIA GPUs, with NVIDIA Maxine Audio Effects"
+description = "Microphone noise removal, room echo removal, speaker focus, headset bandwidth restoration and studio voice on NVIDIA GPUs, with NVIDIA Maxine Audio Effects"
 
 [requires]
 hardware = ["nvidia-turing+"]
@@ -51,6 +51,26 @@ id = "mic-denoise"
 slot = "clean"
 rank = 300
 device = "nvidia-gpu"
+frames = ["host"]
+rates = [48000]
+frame_samples = [480]
+channels = 1
+
+# Headset bandwidth restoration: rebuilds the high band of a narrowband
+# (Bluetooth headset, 16 kHz) microphone with the SDK's 16 kHz to 48 kHz
+# bandwidth extension, on the input decimated to 16 kHz. It runs after noise
+# and echo removal, as NVIDIA's own chains do (`denoiser16k_superres16kto48k`,
+# `dereverb16k_superres16kto48k`), so it does not rebuild the high band from
+# noisy input; position 150 is after `mic-denoise`'s default (100). It
+# conflicts with no other stage. It needs the SDK's bandwidth extension
+# feature, which is not installed by default: without it the stage is
+# listed unavailable.
+[[stage]]
+id = "mic-bandwidth"
+slot = "clean"
+rank = 300
+device = "nvidia-gpu"
+position = 150
 frames = ["host"]
 rates = [48000]
 frame_samples = [480]

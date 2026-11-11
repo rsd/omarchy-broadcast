@@ -33,6 +33,10 @@ const DEREVERB_D: (usize, f32) = (300, 0.8);
 const COMBINED: (usize, f32) = (500, 0.4);
 const VOICE: (usize, f32) = (1100, 0.9);
 const SPEAKER_FOCUS: (usize, f32) = (400, 0.7);
+/// Its delay is in output samples, after an interpolation that delays by
+/// two more.
+const SUPERRES: (usize, f32) = (600, 0.6);
+const SUPERRES_INTERPOLATION: usize = 2;
 const PROFILE_DELAY: usize = 200;
 
 fn config(root: &Path) -> serde_json::Value {
@@ -134,7 +138,7 @@ fn assert_delayed_from(x: &[f32], y: &[f32], delay: usize, gain: f32, from: usiz
 }
 
 #[test]
-fn the_manifest_declares_four_gpu_stages_above_the_cpu_provider() {
+fn the_manifest_declares_five_gpu_stages_above_the_cpu_provider() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("maxine-afx.toml");
     std::fs::copy(crate_dir().join("maxine-afx.toml"), &path).unwrap();
@@ -146,7 +150,7 @@ fn the_manifest_declares_four_gpu_stages_above_the_cpu_provider() {
     assert!(m.licence.contains("NVIDIA"), "{}", m.licence);
     assert!(m.description.as_deref().unwrap().contains("NVIDIA"));
     let ids: Vec<&str> = m.stages.iter().map(|s| s.id.as_str()).collect();
-    assert_eq!(ids, [FOCUS, DEREVERB, DENOISE, ENHANCE]);
+    assert_eq!(ids, [FOCUS, DEREVERB, DENOISE, BANDWIDTH, ENHANCE]);
     for st in &m.stages {
         assert_eq!((st.rank, st.device), (300, Device::NvidiaGpu), "{}", st.id);
         assert!(st.rank > 200, "above the CPU module");
@@ -157,7 +161,7 @@ fn the_manifest_declares_four_gpu_stages_above_the_cpu_provider() {
         );
     }
     let slots: Vec<&str> = m.stages.iter().map(|s| s.slot.as_str()).collect();
-    assert_eq!(slots, ["clean", "clean", "clean", "shape"]);
+    assert_eq!(slots, ["clean", "clean", "clean", "clean", "shape"]);
     let enhance = m.stage(ENHANCE).unwrap();
     assert_eq!(enhance.conflicts, [s(DENOISE), s(DEREVERB)]);
     assert!(m.stage(DEREVERB).unwrap().position < m.stage(DENOISE).unwrap().position);
@@ -166,7 +170,18 @@ fn the_manifest_declares_four_gpu_stages_above_the_cpu_provider() {
     assert!(focus.position < m.stage(DEREVERB).unwrap().position);
     assert!(focus.conflicts.is_empty());
     assert!(m.stages.iter().all(|st| !st.conflicts.contains(&s(FOCUS))));
-    let all = [s(FOCUS), s(DEREVERB), s(DENOISE), s(ENHANCE)];
+    // Bandwidth restoration after noise removal, as NVIDIA's own chains
+    // run it: the default position (100) is the noise stage's.
+    let bandwidth = m.stage(BANDWIDTH).unwrap();
+    assert!(bandwidth.position > m.stage(DENOISE).unwrap().position);
+    assert!(bandwidth.position > m.stage(DEREVERB).unwrap().position);
+    assert!(bandwidth.conflicts.is_empty());
+    assert!(
+        m.stages
+            .iter()
+            .all(|st| !st.conflicts.contains(&s(BANDWIDTH)))
+    );
+    let all = [s(FOCUS), s(DEREVERB), s(DENOISE), s(BANDWIDTH), s(ENHANCE)];
     let (rates, sizes, channels) = common_block_formats(&m, &all).unwrap();
     assert_eq!((rates[0], sizes[0], channels), (48_000, 480, 1));
 }
@@ -189,7 +204,7 @@ fn the_worker_opens_it_and_the_video_daemon_never_does() {
     let mut audio = Registry::new(scan(&[dir.path().to_path_buf()])).with_kinds(LoadKinds::Audio);
     audio.open_all(|_| conf.clone(), &sink);
     assert_eq!(audio.status(ID), Some(ModuleStatus::Available));
-    for st in [FOCUS, DEREVERB, DENOISE, ENHANCE] {
+    for st in [BANDWIDTH, FOCUS, DEREVERB, DENOISE, ENHANCE] {
         assert_eq!(audio.resolve(st).provider.as_deref(), Some(ID), "{st}");
     }
 }
@@ -205,9 +220,210 @@ fn the_probe_and_the_check_read_the_tree_and_touch_no_effect() {
         "{probe:?}"
     );
     f.module
-        .check(&[s(FOCUS), s(DEREVERB), s(DENOISE), s(ENHANCE)])
+        .check(&[s(FOCUS), s(DEREVERB), s(DENOISE), s(BANDWIDTH), s(ENHANCE)])
         .unwrap();
     assert_eq!(f.tree.log(), Vec::<String>::new(), "no SDK call");
+}
+
+/// The availability of each stage in `probe`, by stage id.
+fn availability(probe: &[(obc_backend::StageId, Availability)], id: &str) -> Availability {
+    probe
+        .iter()
+        .find(|(s, _)| s.as_str() == id)
+        .map(|(_, a)| a.clone())
+        .unwrap()
+}
+
+#[test]
+fn bandwidth_not_installed_is_models_not_installed() {
+    // The SDK as it is installed by default: no bandwidth extension.
+    let Some(f) = fixture_with("bandwidth_not_installed_is_models_not_installed", |t| {
+        std::fs::remove_dir_all(t.root.join("features/superres")).unwrap();
+    }) else {
+        return;
+    };
+    let probe = f.module.probe().unwrap();
+    assert_eq!(
+        availability(&probe, BANDWIDTH),
+        Availability::NotInstalled("Models not installed".into())
+    );
+    for st in [FOCUS, DEREVERB, DENOISE, ENHANCE] {
+        assert_eq!(availability(&probe, st), Availability::Installed, "{st}");
+    }
+    // Its library, then the 8 kHz to 16 kHz model only: still not.
+    let dir = tempfile::tempdir().unwrap();
+    let feature = f.tree.root.join("features/superres");
+    std::fs::create_dir_all(feature.join("lib")).unwrap();
+    for name in ["libnv_audiofx_superres.so.3", "libnv_audiofx_superres.so"] {
+        std::fs::write(feature.join("lib").join(name), b"").unwrap();
+    }
+    let sm = feature.join("models/sm_120");
+    std::fs::create_dir_all(&sm).unwrap();
+    std::fs::write(sm.join(format!("superres_8k_to_16k{MODEL_EXT}")), b"mock").unwrap();
+    let module = open(dir.path(), config(&f.tree.root));
+    assert_eq!(
+        availability(&module.probe().unwrap(), BANDWIDTH),
+        Availability::NotInstalled("Models not installed".into())
+    );
+    // The 16 kHz to 48 kHz model, under a name of its own: installed.
+    std::fs::write(sm.join(format!("superres16kto48k_v9{MODEL_EXT}")), b"mock").unwrap();
+    let module = open(dir.path(), config(&f.tree.root));
+    assert_eq!(
+        availability(&module.probe().unwrap(), BANDWIDTH),
+        Availability::Installed
+    );
+}
+
+#[test]
+fn bandwidth_with_a_model_of_another_name_is_available() {
+    let Some(f) = fixture_with("bandwidth_with_a_model_of_another_name_is_available", |t| {
+        let sm = t.root.join("features/superres/models/sm_120");
+        std::fs::remove_file(sm.join(format!("superres_16k_to_48k{MODEL_EXT}"))).unwrap();
+        std::fs::write(
+            sm.join(format!("superres-16k_to_48k_1.2{MODEL_EXT}")),
+            b"mock",
+        )
+        .unwrap();
+    }) else {
+        return;
+    };
+    let probe = f.module.probe().unwrap();
+    assert_eq!(availability(&probe, BANDWIDTH), Availability::Installed);
+    let mut inst = f.module.create_audio_instance().unwrap();
+    inst.load(&spec(&[BANDWIDTH], &[])).unwrap();
+    let model = f.tree.calls("set_str model_path");
+    assert!(
+        model[0].contains(&format!("/sm_120/superres-16k_to_48k_1.2{MODEL_EXT}")),
+        "{model:?}"
+    );
+}
+
+#[test]
+fn bandwidth_decimates_to_16_khz_runs_superres_and_reports_both_delays() {
+    let Some(f) = fixture("bandwidth_decimates_to_16_khz_runs_superres_and_reports_both_delays")
+    else {
+        return;
+    };
+    let mut inst = f.module.create_audio_instance().unwrap();
+    let o = inst.load(&spec(&[BANDWIDTH], &[])).unwrap();
+    let decimator = obc_module_afx::decimate::DELAY;
+    let expected = decimator + SUPERRES_INTERPOLATION + SUPERRES.0;
+    assert_eq!((o.frame_samples, o.reused_model), (480, false));
+    assert_eq!(
+        o.latency_samples as usize, expected,
+        "the decimator's {decimator} samples included"
+    );
+    let log = f.tree.log();
+    let at = |prefix: &str| {
+        log.iter()
+            .position(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix:?} in {log:#?}"))
+    };
+    assert_eq!(log[0], "create superres");
+    let load = at("load superres 0");
+    assert!(at("set_u32 input_sample_rate 16000 superres pre") < load);
+    assert!(at("set_u32 output_sample_rate 48000 superres pre") < load);
+    let model = &log[at("set_str model_path")];
+    assert!(
+        model.contains(&format!(
+            "/features/superres/models/sm_120/superres_16k_to_48k{MODEL_EXT}"
+        )),
+        "{model}"
+    );
+    // No strength, no frame size to choose (one is offered).
+    assert!(f.tree.calls("set_f32").is_empty(), "{log:#?}");
+    assert!(
+        f.tree
+            .calls("set_u32 num_samples_per_input_frame")
+            .is_empty()
+    );
+    // A low tone comes out whole, delayed by the decimator and the effect.
+    let x = tone(HOP * 20, 0.3);
+    let (y, _) = run(&mut inst, &x);
+    let delay = expected;
+    for i in (delay + 200)..x.len() {
+        assert!(
+            (y[i] - SUPERRES.1 * x[i - delay]).abs() < 2e-3,
+            "sample {i}: {} is not {} x {} ({delay} late)",
+            y[i],
+            SUPERRES.1,
+            x[i - delay]
+        );
+    }
+    assert!(y[..SUPERRES.0].iter().all(|v| v.abs() < 1e-6));
+    // Last of the cleaning stages in a full chain; delays add up.
+    let mut inst2 = f.module.create_audio_instance().unwrap();
+    let o2 = inst2
+        .load(&spec(&[FOCUS, DENOISE, BANDWIDTH], &[]))
+        .unwrap();
+    assert_eq!(
+        o2.latency_samples,
+        o.latency_samples + (SPEAKER_FOCUS.0 + DENOISER.0) as u32
+    );
+    assert_eq!(inst2.chain(), [s(FOCUS), s(DENOISE), s(BANDWIDTH)]);
+    // A new source resets the decimator with the effect: silence first.
+    f.tree.clear_log();
+    let new = AudioBlock {
+        pts_ns: None,
+        flags: 1, /* OBC_AUDIO_FLAG_NEW_SOURCE */
+    };
+    let mut out = vec![0.0f32; HOP];
+    inst.process(&[&x[..HOP]], &mut [&mut out], new, &[])
+        .unwrap();
+    assert_eq!(f.tree.calls("reset"), ["reset superres"]);
+    assert!(out.iter().all(|v| *v == 0.0));
+    inst.unload();
+    inst2.unload();
+    let destroyed = f.tree.calls("destroy");
+    assert_eq!(
+        destroyed
+            .iter()
+            .filter(|l| *l == "destroy superres")
+            .count(),
+        2,
+        "{destroyed:?}"
+    );
+}
+
+#[test]
+fn bandwidth_fails_to_load_unless_its_frames_are_10_ms() {
+    let Some(f) = fixture("bandwidth_fails_to_load_unless_its_frames_are_10_ms") else {
+        return;
+    };
+    let mut inst = f.module.create_audio_instance().unwrap();
+    f.tree.conf("frames.superres=320\n");
+    let e = inst.load(&spec(&[BANDWIDTH], &[])).unwrap_err();
+    assert_eq!(e.stage, Some(s(BANDWIDTH)));
+    assert!(
+        e.message
+            .contains("blocks of [320] samples, not 160 (10 ms at 16000 Hz)"),
+        "{}",
+        e.message
+    );
+    f.tree.conf("out_frame.superres=960\n");
+    let e = inst.load(&spec(&[BANDWIDTH], &[])).unwrap_err();
+    assert_eq!(e.stage, Some(s(BANDWIDTH)));
+    assert!(
+        e.message
+            .contains("gives blocks of 960 samples, not 480 (10 ms at 48000 Hz)"),
+        "{}",
+        e.message
+    );
+    assert_eq!(
+        f.tree.calls("destroy"),
+        ["destroy superres", "destroy superres"],
+        "nothing leaked"
+    );
+    // An output frame it does not report is a failed load, not a guess.
+    f.tree.conf("no_out_frame.superres=1\n");
+    let e = inst.load(&spec(&[BANDWIDTH], &[])).unwrap_err();
+    assert_eq!(e.stage, Some(s(BANDWIDTH)));
+    assert!(
+        e.message.contains("output block size is unknown"),
+        "{}",
+        e.message
+    );
+    assert_eq!(f.tree.calls("destroy").len(), 3, "nothing leaked");
 }
 
 #[test]
@@ -381,8 +597,9 @@ fn the_configured_root_comes_first_and_a_missing_sdk_is_told() {
 }
 
 #[test]
-fn the_settings_are_focus_noise_echo_and_studio_voice_on_the_mic_surface() {
-    let Some(f) = fixture("the_settings_are_focus_noise_echo_and_studio_voice_on_the_mic_surface")
+fn the_settings_are_focus_bandwidth_noise_echo_and_studio_voice_on_the_mic_surface() {
+    let Some(f) =
+        fixture("the_settings_are_focus_bandwidth_noise_echo_and_studio_voice_on_the_mic_surface")
     else {
         return;
     };
@@ -398,9 +615,24 @@ fn the_settings_are_focus_noise_echo_and_studio_voice_on_the_mic_surface() {
             ("noise", Some("mic")),
             ("echo", Some("mic")),
             ("focus", Some("mic")),
+            ("bandwidth", Some("mic")),
             ("voice", Some("mic"))
         ]
     );
+    let bandwidth = d.enable_of(BANDWIDTH).unwrap();
+    assert_eq!(
+        (bandwidth.id.as_str(), bandwidth.role),
+        ("mic.bandwidth.enabled", Some(Role::Enable))
+    );
+    assert!(matches!(
+        bandwidth.kind,
+        SettingType::Bool { default: false }
+    ));
+    assert!(bandwidth.label.contains("headset"), "{}", bandwidth.label);
+    assert!(bandwidth.enabled_when.is_empty());
+    assert!(d.param(BANDWIDTH, "strength").is_none());
+    let group = d.groups.iter().find(|g| g.id == "bandwidth").unwrap();
+    assert_eq!(group.label, "Headset bandwidth");
     let focus = d.enable_of(FOCUS).unwrap();
     assert_eq!(
         (focus.id.as_str(), focus.role),

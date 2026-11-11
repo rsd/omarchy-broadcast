@@ -23,6 +23,7 @@ pub const DENOISE: &str = "mic-denoise";
 pub const DEREVERB: &str = "mic-dereverb";
 pub const ENHANCE: &str = "mic-enhance";
 pub const FOCUS: &str = "mic-focus";
+pub const BANDWIDTH: &str = "mic-bandwidth";
 pub const HOP: usize = 480;
 const PACKAGED: &str = "library = \"/usr/lib/omarchy-broadcast/modules/libobc_module_afx.so\"";
 
@@ -105,7 +106,7 @@ pub fn install(dir: &Path) -> Manifest {
 }
 
 /// The features of the stand-in tree: `(feature dir, selector, models)`.
-pub const FEATURES: [(&str, &str, &[&str]); 5] = [
+pub const FEATURES: [(&str, &str, &[&str]); 6] = [
     ("denoiser", "denoiser", &["denoiser_48k", "denoiser_v2_48k"]),
     ("dereverb", "dereverb", &["dereverb_48k"]),
     (
@@ -124,6 +125,13 @@ pub const FEATURES: [(&str, &str, &[&str]); 5] = [
     // Speaker focus, by NVIDIA's download layout (not installed by
     // default: tests remove it to see the stage unavailable).
     ("speaker_focus", "speaker_focus", &["speaker_focus_48k"]),
+    // Bandwidth extension, by NVIDIA's download layout (not installed by
+    // default either), with both its models.
+    (
+        "superres",
+        "superres",
+        &["superres_8k_to_16k", "superres_16k_to_48k"],
+    ),
 ];
 
 /// A stand-in SDK tree in `root`: the stand-in library as the core and as

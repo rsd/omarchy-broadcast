@@ -138,12 +138,20 @@ fn exercise(
     }
 }
 
-fn focus_installed(module: &obc_module_host::Module) -> bool {
+fn installed(module: &obc_module_host::Module, stage: &str) -> bool {
     module
         .probe()
         .unwrap()
         .iter()
-        .any(|(s, a)| s.as_str() == FOCUS && *a == Availability::Installed)
+        .any(|(s, a)| s.as_str() == stage && *a == Availability::Installed)
+}
+
+fn focus_installed(module: &obc_module_host::Module) -> bool {
+    installed(module, FOCUS)
+}
+
+fn bandwidth_installed(module: &obc_module_host::Module) -> bool {
+    installed(module, BANDWIDTH)
 }
 
 fn module() -> Option<obc_module_host::Module> {
@@ -160,17 +168,20 @@ fn the_probe_and_the_check_find_every_stage() {
     let Some(module) = module() else { return };
     let probe = module.probe().unwrap();
     println!("AFX probe: {probe:?}");
-    // Speaker focus is an Early Access feature the SDK does not install by
-    // default: either installed or told so.
+    // Speaker focus (an Early Access feature) and bandwidth restoration
+    // are not installed by the SDK by default: either installed or told so.
     assert!(
         probe.iter().all(|(s, a)| *a == Availability::Installed
-            || (s.as_str() == "mic-focus"
+            || ([FOCUS, BANDWIDTH].contains(&s.as_str())
                 && *a == Availability::NotInstalled("Models not installed".into()))),
         "{probe:?}"
     );
     let mut stages = vec![s(DEREVERB), s(DENOISE), s(ENHANCE)];
     if focus_installed(&module) {
         stages.push(s(FOCUS));
+    }
+    if bandwidth_installed(&module) {
+        stages.push(s(BANDWIDTH));
     }
     module.check(&stages).unwrap();
 }
@@ -203,6 +214,9 @@ fn every_chain_loads_runs_and_reports_its_delay() {
     );
     if focus_installed(&module) {
         exercise(&module, "focus", &[FOCUS], &[], &[]);
+    }
+    if bandwidth_installed(&module) {
+        exercise(&module, "bandwidth", &[BANDWIDTH], &[], &[]);
     }
     exercise(&module, "enhance passthrough", &[ENHANCE], &[], &[]);
     exercise(

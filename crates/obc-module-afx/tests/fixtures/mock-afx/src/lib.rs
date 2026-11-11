@@ -8,15 +8,21 @@
 //!   unversioned name (`libnv_audiofx_<selector>.so`), from the library
 //!   search path or the working directory (this library's run path is
 //!   `./`), and fails with "effect not available" when it is not found.
-//! * Parameters: `input_sample_rate` (48000), `model_path` (a file that
+//! * Parameters: `input_sample_rate` (48000; 16000 for `superres`),
+//!   `output_sample_rate` (`superres` only, 48000, before the load),
+//!   `model_path` (a file that
 //!   exists), `effect_version` (before the load only; the `denoiser_v2`
 //!   model loads only with version 2), `num_samples_per_input_frame`,
 //!   `intensity_ratio` (refused by the studio voice effect;
 //!   ignored by `dereverb`), `mic_profile_model` (studio voice, needed by
 //!   its load) and `mic_profile_id` (studio voice, after the load only).
-//!   `supported_num_samples_per_frame` is read before the load only.
+//!   `supported_num_samples_per_frame` is read before the load only;
+//!   `num_samples_per_output_frame` after it.
 //! * `NvAFX_Run`: the output is the input delayed by the effect's delay and
-//!   scaled by its gain (see below).
+//!   scaled by its gain (see below). `superres` takes blocks of 160
+//!   samples and gives 480: the input linearly interpolated to three times
+//!   its rate (which delays it by two output samples), then delayed by its
+//!   delay (in output samples) and scaled by its gain.
 //!
 //! Each call is written to `mock-afx.log` beside this library (one line
 //! each; runs are not logged), and `mock-afx.conf` beside it, read at every
@@ -27,7 +33,10 @@
 //!   `MOCK_AFX_FAIL_CREATE`, `MOCK_AFX_FAIL_LOAD`, `MOCK_AFX_FAIL_RUN`);
 //! * `delay.<selector>`, `gain.<selector>`: the effect's delay in samples
 //!   and its gain (defaults in [`defaults`]); a mic profile other than
-//!   passthrough adds [`PROFILE_DELAY`] samples.
+//!   passthrough adds [`PROFILE_DELAY`] samples;
+//! * `frames.<selector>`: the block sizes the effect takes (comma-separated);
+//!   `out_frame.<selector>`: the output block size it reports;
+//!   `no_out_frame.<selector>` (any value): it does not report it.
 //!
 //! The gain is applied as the effect's strength says: an effect that
 //! honours `intensity_ratio` (`denoiser`, `dereverb_denoiser`) scales by
@@ -60,17 +69,22 @@ fn defaults(selector: &str) -> (usize, f32) {
         "dereverb_denoiser" => (500, 0.4),
         "studio_voice_low_latency" => (1100, 0.9),
         "speaker_focus" => (400, 0.7),
+        "superres" => (600, 0.6),
         _ => (0, 1.0),
     }
 }
 
-const SELECTORS: [&str; 5] = [
+const SELECTORS: [&str; 6] = [
     "denoiser",
     "dereverb",
     "dereverb_denoiser",
     "studio_voice_low_latency",
     "speaker_focus",
+    "superres",
 ];
+
+/// The effect that takes 16 kHz and gives 48 kHz.
+const SUPERRES: &str = "superres";
 
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
@@ -141,6 +155,7 @@ struct Fx {
     selector: String,
     loaded: bool,
     rate: u32,
+    out_rate: u32,
     frame: u32,
     model: Option<String>,
     profile_model: Option<String>,
@@ -148,6 +163,8 @@ struct Fx {
     intensity: f32,
     profile: i32,
     queue: VecDeque<f32>,
+    /// The last input sample, for the interpolation of `superres`.
+    prev: f32,
 }
 
 impl Fx {
@@ -168,12 +185,29 @@ impl Fx {
         }
     }
 
-    fn frames(&self) -> &'static [u32] {
-        if self.selector == "studio_voice_low_latency" {
-            &[480]
-        } else {
-            &[480, 960]
+    fn frames(&self) -> Vec<u32> {
+        if let Some(list) = conf(&format!("frames.{}", self.selector)) {
+            return list
+                .split(',')
+                .filter_map(|v| v.trim().parse().ok())
+                .collect();
         }
+        match self.selector.as_str() {
+            "studio_voice_low_latency" => vec![480],
+            SUPERRES => vec![160],
+            _ => vec![480, 960],
+        }
+    }
+
+    /// The output block size.
+    fn out_frame(&self) -> u32 {
+        conf(&format!("out_frame.{}", self.selector))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if self.selector == SUPERRES {
+                self.frame * 3
+            } else {
+                self.frame
+            })
     }
 
     fn when(&self) -> &'static str {
@@ -213,17 +247,20 @@ pub unsafe extern "C" fn NvAFX_CreateEffect(
         return NOT_AVAILABLE;
     }
     log(&format!("create {selector}"));
+    let frame = if selector == SUPERRES { 160 } else { 480 };
     let fx = Box::new(Fx {
         selector,
         loaded: false,
         rate: 0,
-        frame: 480,
+        out_rate: 0,
+        frame,
         model: None,
         profile_model: None,
         version: 1,
         intensity: 1.0,
         profile: -1,
         queue: VecDeque::new(),
+        prev: 0.0,
     });
     // SAFETY: writable by the caller's contract.
     unsafe { *effect = Box::into_raw(fx).cast() };
@@ -255,6 +292,8 @@ pub unsafe extern "C" fn NvAFX_SetU32(effect: *mut c_void, name: *const c_char, 
     let sv = fx.selector == "studio_voice_low_latency";
     match name {
         "input_sample_rate" if val == 48_000 || val == 16_000 => fx.rate = val,
+        "output_sample_rate" if fx.loaded => return IMMUTABLE_PARAM,
+        "output_sample_rate" if fx.selector == SUPERRES && val == 48_000 => fx.out_rate = val,
         "effect_version" if fx.loaded => return IMMUTABLE_PARAM,
         "effect_version" if fx.selector == "denoiser" && (1..=2).contains(&val) => fx.version = val,
         "num_samples_per_input_frame" if fx.loaded => return IMMUTABLE_PARAM,
@@ -335,6 +374,9 @@ pub unsafe extern "C" fn NvAFX_GetU32(
     };
     let v = match name {
         "num_samples_per_input_frame" => fx.frame,
+        "num_samples_per_output_frame" if fx.loaded && conf(&format!("no_out_frame.{}", fx.selector)).is_none() => {
+            fx.out_frame()
+        }
         "num_input_channels" | "num_output_channels" => 1,
         _ => return INVALID_PARAM,
     };
@@ -361,6 +403,7 @@ pub unsafe extern "C" fn NvAFX_GetU32List(
         return IMMUTABLE_PARAM;
     }
     let frames = fx.frames();
+    let frames = frames.as_slice();
     // SAFETY: readable and writable by the caller's contract.
     let cap = unsafe { *size } as usize;
     // SAFETY: as above.
@@ -387,6 +430,8 @@ pub unsafe extern "C" fn NvAFX_Load(effect: *mut c_void) -> c_int {
         FAILED
     } else if fx.rate == 0 || !present(&model) {
         MODEL_LOAD_FAILED
+    } else if fx.selector == SUPERRES && (fx.rate != 16_000 || fx.out_rate != 48_000) {
+        INVALID_PARAM
     } else if model.contains("denoiser_v2") && fx.version != 2 {
         FAILED
     } else if fx.selector == "studio_voice_low_latency"
@@ -425,17 +470,30 @@ pub unsafe extern "C" fn NvAFX_Run(
         log(&format!("run {} failed", fx.selector));
         return FAILED;
     }
-    // SAFETY: one channel of `n` samples each, by the caller's contract.
+    let out_n = fx.out_frame() as usize;
+    // SAFETY: one channel of `n` samples in and of the output frame out,
+    // by the caller's contract.
     let (src, dst) = unsafe {
         (
             std::slice::from_raw_parts(*input, n as usize),
-            std::slice::from_raw_parts_mut(*output, n as usize),
+            std::slice::from_raw_parts_mut(*output, out_n),
         )
     };
     let delay = fx.delay();
     let gain = fx.gain();
     while fx.queue.len() < delay {
         fx.queue.push_front(0.0);
+    }
+    if fx.selector == SUPERRES {
+        for (o, s) in dst.chunks_mut(3).zip(src) {
+            for (k, d) in o.iter_mut().enumerate() {
+                let t = (k + 1) as f32 / 3.0;
+                fx.queue.push_back(fx.prev + (s - fx.prev) * t);
+                *d = fx.queue.pop_front().unwrap_or(0.0) * gain;
+            }
+            fx.prev = *s;
+        }
+        return OK;
     }
     for (d, s) in dst.iter_mut().zip(src) {
         fx.queue.push_back(*s);
@@ -462,5 +520,6 @@ pub unsafe extern "C" fn NvAFX_Reset(
     }
     log(&format!("reset {}", fx.selector));
     fx.queue.clear();
+    fx.prev = 0.0;
     OK
 }
