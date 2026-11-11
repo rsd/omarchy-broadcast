@@ -1,0 +1,36 @@
+# The manifest of the NVIDIA Maxine AR effects module. It is installed in
+# /usr/lib/omarchy-broadcast/modules.d with the library; the module needs
+# the NVIDIA Maxine AR SDK at run time (see its documentation).
+abi = 1
+id = "br.com.dias.maxine-ar"
+name = "NVIDIA Maxine AR effects"
+version = "0.28.0"
+licence = "MIT OR Apache-2.0 (module); NVIDIA Maxine SDK under its own licence"
+kind = "video-stage"
+library = "/usr/lib/omarchy-broadcast/modules/libobc_module_maxine_ar.so"
+description = "Eye contact (gaze redirection) and automatic framing on NVIDIA GPUs"
+
+[requires]
+hardware = ["nvidia-turing+"]
+
+# Redirects the eyes towards the camera, on the camera frame, before the
+# cut-out.
+[[stage]]
+id = "eye-contact"
+slot = "pre-matte"
+rank = 300
+device = "nvidia-gpu"
+position = 10
+frames = ["cuda"]
+formats = ["nv12"]
+
+# A digital pan and zoom that keeps the face framed, on the camera frame
+# (after eye contact), before the cut-out.
+[[stage]]
+id = "auto-frame"
+slot = "pre-matte"
+rank = 300
+device = "nvidia-gpu"
+position = 20
+frames = ["cuda"]
+formats = ["nv12"]

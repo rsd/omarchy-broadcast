@@ -49,7 +49,7 @@
 
 pkgname=omarchy-broadcast-git
 _pkgname=omarchy-broadcast
-pkgver=0.27.0
+pkgver=0.28.0
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API and a CLI'
 arch=('x86_64')
@@ -84,6 +84,7 @@ optdepends=(
   'noise-suppression-for-voice: RNNoise engine for the noise-removed microphone (default)'
   'deepfilternet-ladspa: DeepFilterNet engine for the noise-removed microphone'
   'maxine-vfx-sdk-local: NVIDIA Maxine video effects (build it from omarchy-nvidia-sdks)'
+  'maxine-ar-sdk-local: NVIDIA Maxine AR effects, eye contact (build it from omarchy-nvidia-sdks)'
 )
 # No LTO: with makepkg's -flto, libspa's build script compiles its C wrapper
 # into GCC LTO bitcode, which rust-lld cannot link (undefined libspa_rs_*).
@@ -114,9 +115,9 @@ build() {
   export CARGO_TARGET_DIR=target
   cargo build --frozen --release --features omarchy-broadcastd/pipewire \
     -p omarchy-broadcastd -p omarchy-broadcast
-  # The Maxine module: a library the daemon loads (no Maxine code is linked
+  # The Maxine modules: libraries the daemon loads (no Maxine code is linked
   # into the daemon).
-  cargo build --frozen --release -p obc-module-maxine
+  cargo build --frozen --release -p obc-module-maxine -p obc-module-maxine-ar
 }
 
 check() {
@@ -129,9 +130,9 @@ check() {
   # PipeWire node's unit tests (the feature the package is built with);
   # they contact no PipeWire daemon, and the live PipeWire tests are
   # ignored.
-  env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u MAXINE_OS_RELEASE \
+  env -u MAXINE_VFX_ROOT -u MAXINE_AR_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u MAXINE_OS_RELEASE \
     cargo test --frozen --workspace
-  env -u MAXINE_VFX_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u MAXINE_OS_RELEASE \
+  env -u MAXINE_VFX_ROOT -u MAXINE_AR_ROOT -u LD_LIBRARY_PATH -u LD_PRELOAD -u MAXINE_OS_RELEASE \
     cargo test --frozen -p obc-pipeline -p omarchy-broadcastd --features omarchy-broadcastd/pipewire
 }
 
@@ -156,6 +157,14 @@ package() {
   grep -qx 'library = "/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so"' \
     "$pkgdir/usr/lib/$_pkgname/modules.d/maxine-vfx.toml" ||
     { echo 'maxine-vfx.toml: the library path is not the packaged one' >&2; return 1; }
+  # The Maxine AR module, likewise.
+  install -Dm755 -t "$pkgdir/usr/lib/$_pkgname/modules" \
+    target/release/libobc_module_maxine_ar.so
+  install -Dm644 -t "$pkgdir/usr/lib/$_pkgname/modules.d" \
+    crates/obc-module-maxine-ar/maxine-ar.toml
+  grep -qx 'library = "/usr/lib/omarchy-broadcast/modules/libobc_module_maxine_ar.so"' \
+    "$pkgdir/usr/lib/$_pkgname/modules.d/maxine-ar.toml" ||
+    { echo 'maxine-ar.toml: the library path is not the packaged one' >&2; return 1; }
 
   # The C header of the module interface, for modules built out of tree.
   install -Dm644 -t "$pkgdir/usr/include/$_pkgname" \

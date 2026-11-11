@@ -1,0 +1,28 @@
+[package]
+name = "obc-module-maxine-ar"
+description = "NVIDIA Maxine AR effects (eye contact, auto-framing) as an omarchy-broadcast module (the SDK is loaded at run time)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+# The module library the daemon loads: libobc_module_maxine_ar.so.
+crate-type = ["cdylib"]
+
+[dependencies]
+obc-module-sdk = { workspace = true }
+obc-backend = { workspace = true }
+obc-gpu = { workspace = true }
+serde = { workspace = true }
+libloading = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+obc-module-host = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

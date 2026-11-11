@@ -10,6 +10,9 @@
 #   its module manifest                   -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules.d/maxine-vfx.toml
 #                                            (from crates/obc-module-maxine/maxine-vfx.toml, library pointing at the
 #                                            installed module library)
+#   NVIDIA Maxine AR module library       -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules/libobc_module_maxine_ar.so
+#   its module manifest                   -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules.d/maxine-ar.toml
+#                                            (from crates/obc-module-maxine-ar/maxine-ar.toml, likewise)
 #   D-Bus activation file                 -> ${XDG_DATA_HOME:-~/.local/share}/dbus-1/services/br.com.dias.OmarchyBroadcast.service
 #   install manifest                      -> ${XDG_STATE_HOME:-~/.local/state}/omarchy-broadcast/install-user.manifest
 # and, with --mic, the noise-removed microphone:
@@ -20,11 +23,12 @@
 #                                            (from dist/, ExecStart pointing at the installed configurations)
 #
 # The Maxine module is always built and installed (the library builds without
-# the Maxine SDK). Without the SDK the daemon lists the module greyed out, with
-# the reason, so there is no flag for it. The SDK and the os-release shim it
-# needs still come from the maxine-vfx-sdk-local package (built from the
-# omarchy-nvidia-sdks repository), and the Maxine drop-in that uses them is a
-# manual step, printed at the end (docs/setup/maxine.md, section 3). The
+# the Maxine SDK), and so is the Maxine AR module (likewise without the AR
+# SDK). Without its SDK the daemon lists a module greyed out, with the reason,
+# so there is no flag for it. The SDKs and the os-release shim they need come
+# from the maxine-vfx-sdk-local and maxine-ar-sdk-local packages (built from
+# the omarchy-nvidia-sdks repository), and the Maxine drop-in that uses them
+# is a manual step, printed at the end (docs/setup/maxine.md, section 3). The
 # daemon loads a module library once and never reloads it: restart a running
 # daemon to pick up a rebuilt module. An earlier version of this script
 # installed its own copy of the shim in ~/.local/lib/omarchy-broadcast; a
@@ -83,8 +87,12 @@ LEGACY_SHIM=(os-release-shim.so fake-os-release)
 MODULE_CRATE=obc-module-maxine
 MODULE_LIB=libobc_module_maxine.so
 MODULE_MANIFEST=maxine-vfx.toml
+# The Maxine AR module, built and installed the same way.
+AR_MODULE_CRATE=obc-module-maxine-ar
+AR_MODULE_LIB=libobc_module_maxine_ar.so
+AR_MODULE_MANIFEST=maxine-ar.toml
 # File names whose ownership is the manifest checksum, not a marker line.
-SUMMED=("${BINARIES[@]}" "$MODULE_LIB" "${LEGACY_SHIM[@]}")
+SUMMED=("${BINARIES[@]}" "$MODULE_LIB" "$AR_MODULE_LIB" "${LEGACY_SHIM[@]}")
 UNIT_NAME=omarchy-broadcastd.service
 DBUS_NAME=br.com.dias.OmarchyBroadcast.service
 MIC_UNIT_NAME=omarchy-broadcast-mic@.service
@@ -153,6 +161,9 @@ module_manifest_src=$repo/crates/$MODULE_CRATE/$MODULE_MANIFEST
 module_dir=$data_dir/omarchy-broadcast/modules
 module_lib_dst=$module_dir/$MODULE_LIB
 module_manifest_dst=$data_dir/omarchy-broadcast/modules.d/$MODULE_MANIFEST
+ar_module_manifest_src=$repo/crates/$AR_MODULE_CRATE/$AR_MODULE_MANIFEST
+ar_module_lib_dst=$module_dir/$AR_MODULE_LIB
+ar_module_manifest_dst=$data_dir/omarchy-broadcast/modules.d/$AR_MODULE_MANIFEST
 maxine_src=$repo/dist/systemd/omarchy-broadcastd.service.d/maxine.conf
 # The user's Maxine drop-in, if any: only read, never written.
 maxine_dropin=$config_dir/systemd/user/omarchy-broadcastd.service.d/maxine.conf
@@ -353,8 +364,8 @@ if [[ $mode == uninstall ]]; then
   # The microphone files are always candidates too, so a lost manifest or a
   # changed XDG_STATE_HOME does not leave them behind; check_targets still
   # refuses one without the marker, and a missing one is skipped.
-  # So are the module's two files, for the same reason.
-  targets=("${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "$module_lib_dst" "$module_manifest_dst" "$mic_unit_dst")
+  # So are the modules' files, for the same reason.
+  targets=("${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "$module_lib_dst" "$module_manifest_dst" "$ar_module_lib_dst" "$ar_module_manifest_dst" "$mic_unit_dst")
   for c in "${MIC_CONFS[@]}"; do targets+=("$mic_conf_dir/$c"); done
   # Also what an earlier run wrote under other XDG directories.
   if [[ -f $manifest ]]; then
@@ -408,7 +419,7 @@ if [[ $mode == uninstall ]]; then
     case ${path##*/} in
       "$MIC_UNIT_NAME") mic_removed=1 ;;
       omarchy-broadcast-mic-*.conf) mic_removed=1 leaf_dirs+=("${path%/*}") ;;
-      "$MODULE_LIB" | "$MODULE_MANIFEST") leaf_dirs+=("${path%/*}") ;;
+      "$MODULE_LIB" | "$MODULE_MANIFEST" | "$AR_MODULE_LIB" | "$AR_MODULE_MANIFEST") leaf_dirs+=("${path%/*}") ;;
     esac
   done
   # The legacy shim's library directory goes once it is empty (rmdir only
@@ -481,6 +492,7 @@ fi
 [[ -f $unit_src ]] || die "missing $unit_src"
 [[ -f $dbus_src ]] || die "missing $dbus_src"
 [[ -f $module_manifest_src ]] || die "missing $module_manifest_src"
+[[ -f $ar_module_manifest_src ]] || die "missing $ar_module_manifest_src"
 
 # The shipped unit must have exactly one ExecStart naming the daemon, whatever
 # its path (/usr/bin for the package, %h/.cargo/bin in older checkouts).
@@ -491,15 +503,17 @@ n=$(grep -c -- "$exec_re" "$unit_src" || true)
   exit 2
 }
 
-# The module manifest names the library by absolute path, in a TOML basic
-# string: the shipped one must have exactly one such line, which is rewritten
+# A module manifest names the library by absolute path, in a TOML basic
+# string: each shipped one must have exactly one such line, which is rewritten
 # to the installed library.
 lib_re='^library = .*$'
-n=$(grep -c -- "$lib_re" "$module_manifest_src" || true)
-((n == 1)) || {
-  printf 'install-user: expected exactly one line matching %s in %s, found %s\n' "$lib_re" "$module_manifest_src" "$n" >&2
-  exit 2
-}
+for src in "$module_manifest_src" "$ar_module_manifest_src"; do
+  n=$(grep -c -- "$lib_re" "$src" || true)
+  ((n == 1)) || {
+    printf 'install-user: expected exactly one line matching %s in %s, found %s\n' "$lib_re" "$src" "$n" >&2
+    exit 2
+  }
+done
 # That path goes into a TOML string, and (with --mic) into ExecStart: the data
 # dir must need no escaping in either.
 [[ $data_dir =~ ^/[A-Za-z0-9._/@+-]*$ ]] ||
@@ -534,7 +548,7 @@ if [[ -f $manifest ]]; then
     path=$(manifest_path "$line")
     [[ -n $path && -e $path ]] || continue
     case $path in
-      "$unit_dst" | "$dbus_dst" | "$module_lib_dst" | "$module_manifest_dst") continue ;;
+      "$unit_dst" | "$dbus_dst" | "$module_lib_dst" | "$module_manifest_dst" | "$ar_module_lib_dst" | "$ar_module_manifest_dst") continue ;;
     esac
     for dst in "${bin_dsts[@]}"; do [[ $path == "$dst" ]] && continue 2; done
     for dst in "${mic_dsts[@]}"; do [[ $path == "$dst" ]] && continue 2; done
@@ -551,7 +565,7 @@ if [[ -f $manifest ]]; then
   done <"$manifest"
 fi
 
-check_targets "${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "$module_lib_dst" "$module_manifest_dst" "${mic_dsts[@]}" "$manifest"
+check_targets "${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "$module_lib_dst" "$module_manifest_dst" "$ar_module_lib_dst" "$ar_module_manifest_dst" "${mic_dsts[@]}" "$manifest"
 
 if ((build)); then
   run cargo build --manifest-path "$repo/Cargo.toml" --release --locked -p omarchy-broadcastd -p omarchy-broadcast || {
@@ -560,7 +574,7 @@ if ((build)); then
   }
   # Separate from the daemon's build: one invocation unifies the features of
   # its packages, which could change the daemon.
-  run cargo build --manifest-path "$repo/Cargo.toml" --release --locked -p "$MODULE_CRATE" || {
+  run cargo build --manifest-path "$repo/Cargo.toml" --release --locked -p "$MODULE_CRATE" -p "$AR_MODULE_CRATE" || {
     printf 'install-user: cargo build failed; nothing was changed\n' >&2
     exit 1
   }
@@ -569,7 +583,9 @@ if ((!dry_run)); then
   for b in "${BINARIES[@]}"; do
     [[ -x $target_dir/release/$b ]] || die "no built binary at $target_dir/release/$b (run without --no-build)"
   done
-  [[ -f $target_dir/release/$MODULE_LIB ]] || die "no built module at $target_dir/release/$MODULE_LIB (run without --no-build)"
+  for lib in "$MODULE_LIB" "$AR_MODULE_LIB"; do
+    [[ -f $target_dir/release/$lib ]] || die "no built module at $target_dir/release/$lib (run without --no-build)"
+  done
 fi
 
 # The shim files of an earlier version go before the manifest is rewritten
@@ -588,7 +604,7 @@ fi
 manifest_text() {
   echo "$MARKER"
   echo "# Paths written by install-user.sh, one per line; a binary as \"<sha256>  <path>\"."
-  printf '%s\n' "${kept[@]}" "$@" "$unit_dst" "$dbus_dst" "$module_manifest_dst" "${mic_dsts[@]}" | sort -u
+  printf '%s\n' "${kept[@]}" "$@" "$unit_dst" "$dbus_dst" "$module_manifest_dst" "$ar_module_manifest_dst" "${mic_dsts[@]}" | sort -u
 }
 
 # What to install with a checksum in the manifest: source, destination, mode.
@@ -597,6 +613,7 @@ for b in "${BINARIES[@]}"; do
   srcs+=("$target_dir/release/$b") dsts+=("$bin_dir/$b") modes+=(755)
 done
 srcs+=("$target_dir/release/$MODULE_LIB") dsts+=("$module_lib_dst") modes+=(644)
+srcs+=("$target_dir/release/$AR_MODULE_LIB") dsts+=("$ar_module_lib_dst") modes+=(644)
 
 run mkdir -p -- "$bin_dir" "$module_dir"
 # Install beside the target, then rename: replacing a running binary in place
@@ -636,14 +653,17 @@ dbus_text() {
 }
 put_text "$dbus_dst" dbus_text
 
+# The manifest of a module: $1 its crate, $2 its file name, $3 the installed
+# library.
 module_manifest_text() {
   echo "$MARKER"
-  echo "# Generated from crates/$MODULE_CRATE/$MODULE_MANIFEST; library points at the installed module."
+  echo "# Generated from crates/$1/$2; library points at the installed module."
   # The source's leading comment block describes the packaged install: left out.
-  awk 'started || !/^#/ { started = 1; print }' "$module_manifest_src" |
-    sed "s|$lib_re|library = \"$module_lib_dst\"|"
+  awk 'started || !/^#/ { started = 1; print }' "$repo/crates/$1/$2" |
+    sed "s|$lib_re|library = \"$3\"|"
 }
-put_text "$module_manifest_dst" module_manifest_text
+put_text "$module_manifest_dst" module_manifest_text "$MODULE_CRATE" "$MODULE_MANIFEST" "$module_lib_dst"
+put_text "$ar_module_manifest_dst" module_manifest_text "$AR_MODULE_CRATE" "$AR_MODULE_MANIFEST" "$ar_module_lib_dst"
 
 if ((want_mic)); then
   mic_conf_text() {
@@ -703,6 +723,10 @@ it (docs/setup/maxine.md, section 3), install the maxine-vfx-sdk-local package
   systemctl --user restart omarchy-broadcastd
 A running daemon never reloads a module library: restart it to pick up a
 rebuilt module.
+
+The NVIDIA Maxine AR effects module (eye contact, auto-framing) $module_state
+($(printf '%q' "$ar_module_lib_dst")). Without the maxine-ar-sdk-local package
+the daemon lists it greyed out, with the reason.
 EOF
 if ((${#legacy_rm[@]})); then
   if ((dry_run)); then
