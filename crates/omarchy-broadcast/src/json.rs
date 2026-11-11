@@ -50,6 +50,10 @@ pub const MAX_LINE_BYTES: usize = 4096;
 pub const MAX_CAMERAS: usize = 12;
 /// Bound of the `error` text.
 pub const MAX_ERROR_BYTES: usize = 512;
+/// Bound of the `warning` text: as `error`'s, so a module's reason with
+/// its hint at the end (an effect failure, [`MAX_ERROR_BYTES`] before
+/// revision 11) is never cut.
+pub const MAX_WARNING_BYTES: usize = 512;
 /// Bound of a camera id (`id`, `active_camera`).
 pub const MAX_ID_BYTES: usize = 96;
 /// Bound of a camera name (`name`, `active_camera_name`).
@@ -65,8 +69,9 @@ pub const MAX_PIPEWIRE_OUTPUT_BYTES: usize = 32;
 /// Bound of `background_image`. A longer path is clipped at its start
 /// ([`clip_start`]), so the file name survives. With every string and
 /// number at its worst and no image controls, a `snapshot` line holds
-/// [`MAX_CAMERAS`] − 1 cameras under [`MAX_LINE_BYTES`] (its settings
-/// fields take the room of the last one), a `cameras` line all
+/// [`MAX_CAMERAS`] − 3 cameras under [`MAX_LINE_BYTES`] (its settings
+/// fields and its `warning` take the room of the last three), a `cameras`
+/// line all
 /// [`MAX_CAMERAS`]; image controls at their worst take more, and
 /// [`snapshot_line`] cuts the controls, then the cameras, to keep the cap.
 pub const MAX_PATH_BYTES: usize = 256;
@@ -223,6 +228,8 @@ struct StateFields<'a> {
     state: &'static str,
     enabled: bool,
     error: Cow<'a, str>,
+    /// `Warning` (revision 11); `""` from a daemon too old to have it.
+    warning: Cow<'a, str>,
     active_camera: Cow<'a, str>,
     active_camera_name: Cow<'a, str>,
     consumers: u32,
@@ -245,6 +252,7 @@ impl<'a> StateFields<'a> {
             state: s.state.as_str(),
             enabled: s.enabled,
             error: clip(&s.error, MAX_ERROR_BYTES),
+            warning: clip(&s.warning, MAX_WARNING_BYTES),
             active_camera: clip(&s.active_camera, MAX_ID_BYTES),
             active_camera_name: clip(model::active_camera_name(s).unwrap_or(""), MAX_NAME_BYTES),
             consumers: s.consumers,
@@ -988,6 +996,7 @@ mod tests {
         Snapshot {
             state: State::Active,
             error: String::new(),
+            warning: String::new(),
             enabled: true,
             cameras: vec![
                 cam("usb-1234_abcd", "First Camera", "1234:abcd"),
@@ -1024,12 +1033,28 @@ mod tests {
     }
 
     #[test]
+    fn the_warning_is_a_string_of_the_snapshot_and_state_lines() {
+        let mut s = sample();
+        s.warning = "effect blur unavailable: NVIDIA Maxine video effects: Disabled".into();
+        let v = parse(&snapshot_line(&s));
+        assert_eq!(v["warning"], s.warning.as_str());
+        assert_eq!(v["state"], "active", "not an error");
+        let old = sample();
+        let changes = model::diff(&old, &s);
+        assert_eq!(changes.fields, ["warning"]);
+        let v = parse(&state_line(&s, &changes.fields));
+        assert_eq!(v["warning"], s.warning.as_str());
+        assert_eq!(v["changed"], serde_json::json!(["warning"]));
+    }
+
+    #[test]
     fn snapshot_line_has_every_field() {
         let v = parse(&snapshot_line(&sample()));
         assert_eq!(v["type"], "snapshot");
         assert_eq!(v["state"], "active");
         assert_eq!(v["enabled"], true);
         assert_eq!(v["error"], "");
+        assert_eq!(v["warning"], "", "none, and a daemon before revision 11");
         assert_eq!(v["active_camera"], "platform-video2");
         assert_eq!(v["active_camera_name"], "Second Camera");
         assert_eq!(v["consumers"], 2);
@@ -1411,11 +1436,32 @@ mod tests {
     }
 
     #[test]
+    fn a_warning_of_an_effect_failure_keeps_its_hint_under_the_cap() {
+        // The daemon's longest effect failure clause: its reason at 400
+        // bytes, the hint at its end, in the words `Warning` gives it.
+        let reason = format!(
+            "{}; see docs/setup/maxine.md, section 3",
+            "x".repeat(400 - "; see docs/setup/maxine.md, section 3".len())
+        );
+        assert_eq!(reason.len(), 400);
+        let mut s = sample();
+        s.warning = format!(
+            "effect replace unavailable: {reason}; the camera image is shown without the \
+             effect (effect.on_failure = \"none\")"
+        );
+        for line in [snapshot_line(&s), state_line(&s, &model::STATE_FIELDS)] {
+            let v = parse(&line);
+            assert_eq!(v["warning"], s.warning.as_str(), "not clipped");
+        }
+    }
+
+    #[test]
     fn worst_case_lines_stay_under_the_cap_and_valid() {
         // Every string at its worst: long and made of 6-byte escapes.
         let nasty = "\u{1}".repeat(2000);
         let mut s = sample();
         s.error = nasty.clone();
+        s.warning = nasty.clone();
         s.output_mode = nasty.clone();
         s.effect = nasty.clone();
         s.background_image = nasty.clone();
@@ -1435,8 +1481,9 @@ mod tests {
         s.active_camera = s.cameras[3].id.clone();
         for (line, cameras) in [
             // The settings fields (revision 7, as `interface_revision` is
-            // here) leave no room for the last camera: the snapshot cuts it.
-            (snapshot_line(&s), MAX_CAMERAS - 1),
+            // here) and the warning (revision 11) leave no room for the
+            // last three cameras: the snapshot cuts them.
+            (snapshot_line(&s), MAX_CAMERAS - 3),
             (cameras_line(&s), MAX_CAMERAS),
             (state_line(&s, &model::STATE_FIELDS), 0),
         ] {
@@ -1496,6 +1543,7 @@ mod tests {
         assert_eq!(w["camera_controls"]["controls_truncated"], false);
         assert_eq!(w["cameras"].as_array().unwrap().len(), 4);
         assert!(v["error"].as_str().unwrap().ends_with(ELLIPSIS));
+        assert!(v["warning"].as_str().unwrap().ends_with(ELLIPSIS));
         assert!(v["pipewire_output"].as_str().unwrap().ends_with(ELLIPSIS));
         assert!(
             v["background_image"]

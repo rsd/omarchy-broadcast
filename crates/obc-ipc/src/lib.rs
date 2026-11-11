@@ -93,8 +93,14 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// added the configuration ([`config`]): `GetConfigSchema`, `SetConfig`,
 /// `ResetConfig`, `GetConfigFiles`, the `ConfigChanged` signal and the
 /// `ConfigSerial` property; the daemon reads `config.d/` after
-/// `config.toml` and writes `config.d/50-panel.toml`.
-pub const INTERFACE_REVISION: u32 = 10;
+/// `config.toml` and writes `config.d/50-panel.toml`. Revision 11 added
+/// the `Warning` property: a selected stage that no module provides is
+/// dropped, the feed keeps streaming without it, and `Warning` says so;
+/// an effect a module provides that cannot load or run no longer stops
+/// the feed (with `on_failure = "black"` its frames are black, with
+/// `"none"` the camera image shows) and `Warning` says why. Neither is
+/// `Error` and the `error` state any more.
+pub const INTERFACE_REVISION: u32 = 11;
 /// The first [`INTERFACE_REVISION`] with `LoopbackConsumers`,
 /// `PipeWireConsumers` and `PipeWireOutput`.
 pub const PIPEWIRE_REVISION: u32 = 3;
@@ -117,6 +123,8 @@ pub const SETTINGS_REVISION: u32 = 7;
 /// The first [`INTERFACE_REVISION`] with global settings in the tree
 /// ([`settings::SCOPE_GLOBAL`]): the video effects.
 pub const GLOBAL_SETTINGS_REVISION: u32 = 8;
+/// The first [`INTERFACE_REVISION`] with the `Warning` property.
+pub const WARNING_REVISION: u32 = 11;
 /// The settings schema version this crate describes: the meaning of the
 /// setting dictionaries ([`settings`]), separate from
 /// [`INTERFACE_REVISION`]. Additions (a key, a setting type, a hint) keep
@@ -374,6 +382,11 @@ impl IpcError {
 pub struct Snapshot {
     pub state: State,
     pub error: String,
+    /// `Warning` (revision 11): what streams on without stages the user
+    /// selected (no module provides them), or black while the effect
+    /// cannot run; one line; empty when nothing, and when the daemon does
+    /// not offer it.
+    pub warning: String,
     pub enabled: bool,
     pub cameras: Vec<CameraInfo>,
     pub active_camera: String,
@@ -435,6 +448,7 @@ impl Snapshot {
         Snapshot {
             state: State::Off,
             error: String::new(),
+            warning: String::new(),
             enabled: false,
             cameras: Vec::new(),
             active_camera: String::new(),
@@ -475,6 +489,7 @@ impl Snapshot {
                     .map_err(|e: UnknownState| zbus::Error::Failure(e.to_string()))?;
             }
             "Error" => self.error = deserialize_for_property(value)?,
+            "Warning" => self.warning = deserialize_for_property(value)?,
             "Enabled" => self.enabled = deserialize_for_property(value)?,
             "Cameras" => self.cameras = deserialize_for_property::<Vec<CameraInfo>>(value)?,
             "ActiveCamera" => self.active_camera = deserialize_for_property(value)?,
@@ -574,7 +589,8 @@ impl Snapshot {
     /// The properties added after revision 1 (`BlurStrength`,
     /// `BackgroundImage`, `PipeWireConsumers`, `PipeWireOutput`, `Denoise`,
     /// `PreviewConsumers`, `CameraControls`, `SettingsRevision`,
-    /// `SettingsSchemaSerial`, `ModulesSerial`, `BackendProfile`, `ConfigSerial`) keep their
+    /// `SettingsSchemaSerial`, `ModulesSerial`, `BackendProfile`, `ConfigSerial`,
+    /// `Warning`) keep their
     /// [`Snapshot::empty`] value when the daemon does not offer
     /// them (see [`is_unknown_property_error`]), and `LoopbackConsumers` is then
     /// `Consumers`, as [`Snapshot::from_properties`] does for a property
@@ -585,6 +601,7 @@ impl Snapshot {
         Ok(Snapshot {
             state: proxy.state().await?,
             error: proxy.error().await?,
+            warning: optional(proxy.warning().await, empty.warning)?,
             enabled: proxy.enabled().await?,
             cameras: proxy.cameras().await?,
             active_camera: proxy.active_camera().await?,
@@ -1044,7 +1061,8 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, CONFIG_REVISION);
+        assert_eq!(INTERFACE_REVISION, WARNING_REVISION);
+        const { assert!(CONFIG_REVISION < WARNING_REVISION) };
         const { assert!(MODULES_REVISION < CONFIG_REVISION) };
         const { assert!(GLOBAL_SETTINGS_REVISION < MODULES_REVISION) };
         // Revision 9's properties; a daemon before it has neither.
@@ -1065,6 +1083,14 @@ mod tests {
             Snapshot::from_properties([("State", &state), ("ConfigSerial", &config_serial)])
                 .unwrap();
         assert_eq!((rev10.config_serial, old.config_serial), (Some(7), None));
+        // Revision 11's property; a daemon before it has none: empty.
+        let warning = Variant::from("effect blur unavailable: x");
+        let rev11 = Snapshot::from_properties([("State", &state), ("Warning", &warning)]).unwrap();
+        assert_eq!(
+            (rev11.warning.as_str(), old.warning.as_str()),
+            ("effect blur unavailable: x", "")
+        );
+        assert!(rev11.clone().apply_property("Warning", &serial).is_err());
         assert_eq!(
             (SETTINGS_REVISION, GLOBAL_SETTINGS_REVISION, SETTINGS_SCHEMA),
             (7, 8, 1)

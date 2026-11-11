@@ -431,6 +431,16 @@ impl Server {
         self.snap().error
     }
 
+    /// What runs other than the user asked, without being an error: the
+    /// selected stages no module provides, dropped while the feed streams
+    /// on without them, and an effect a module provides that cannot run
+    /// (the feed black with `on_failure = "black"`, the camera image with
+    /// `"none"`); one line, empty when none (revision 11).
+    #[zbus(property)]
+    fn warning(&self) -> String {
+        self.snap().warning
+    }
+
     #[zbus(property)]
     fn enabled(&self) -> bool {
         self.snap().enabled
@@ -579,6 +589,7 @@ async fn emit_change(emitter: &SignalEmitter<'_>, change: &Change) -> zbus::Resu
     match change {
         Change::State(v) => emit_changed(emitter, name, v).await,
         Change::Error(v)
+        | Change::Warning(v)
         | Change::ActiveCamera(v)
         | Change::OutputMode(v)
         | Change::Effect(v)

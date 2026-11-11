@@ -136,7 +136,8 @@ start_debounce_ms = 300
 # Video effects run on the GPU with the NVIDIA Maxine Video Effects SDK,
 # which is not part of omarchy-broadcast and must be installed separately; see
 # docs/setup/maxine.md. Without it the daemon runs normally, and a requested
-# effect fails as described under on_failure.
+# effect fails as described under on_failure, or, when no effect module
+# provides it at all, is left out as described there.
 #
 # A choice made at run time (SetEffect, SetBlurStrength, SetBackgroundImage,
 # SetDenoise, `omarchy-broadcast effect ...`, `omarchy-broadcast denoise ...`,
@@ -215,13 +216,24 @@ relight_direction = 0
 relight_brightness = 100
 
 # What the virtual camera shows when the requested effect cannot run (the
-# SDK is missing, a model or the background image fails to load):
-#   "black" black frames: the camera is closed, the daemon reports the
-#           reason in its Error property and enters the error state, so
-#           the background is never shown. It retries on the next control
-#           call (e.g. selecting the effect again), configuration reload
-#           or camera change;
-#   "none"  the camera image without the effect, with the reason in Error.
+# SDK is missing, a model or the background image fails to load, a frame
+# fails). The stream never stops for it and the state stays active:
+#   "black" black frames, so the background is never shown, with the
+#           reason in the Warning property. It is retried on the next
+#           control call (e.g. selecting the effect again), configuration
+#           reload, module enabled again or camera start, and the effect
+#           replaces the black frames once it runs. Settings the stream
+#           cannot be built with (replace without a readable image) close
+#           the camera instead, with the reason in Error;
+#   "none"  the camera image without the effect, with the reason in the
+#           Warning property (in Error before interface revision 11).
+# The reason in Warning is at most 400 bytes; the journal has it whole.
+# This applies to an effect that a module provides. An effect that no module
+# provides (no effect module installed or enabled, its module disabled or
+# disabled after crashing the daemon, or its SDK feature not installed) is
+# left out whatever this says: the camera image is shown with the other
+# stages, the state stays active, the reason is in the Warning property, and
+# the effect applies by itself once a module provides it.
 # Default: "black"
 on_failure = "black"
 

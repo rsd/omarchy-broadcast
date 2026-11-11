@@ -19,7 +19,9 @@
 //! pins) come from the configuration's `[modules]` alone (written to
 //! `config.d/50-panel.toml` by the methods that change them,
 //! [`obc_core::config_d`]). They apply to the next session: a running one
-//! keeps the [`Plan`] it started with.
+//! keeps the [`Plan`] it started with (the modules whose code it runs),
+//! but a stage whose module is disabled meanwhile (or can no longer run
+//! it) is turned off in it, and turned on again once its module can.
 //!
 //! The opening of libraries goes through the media backend
 //! ([`MediaBackend::open_module`]), so the controller's tests describe
@@ -52,6 +54,16 @@ pub const LEDGER_FILE: &str = "modules-crash.json";
 
 /// The reason of a module disabled by the user (or the config).
 pub const REASON_DISABLED: &str = "Disabled";
+
+/// The reason of a stage no installed module declares
+/// ([`Modules::absent_reason`]).
+pub const REASON_NOT_INSTALLED: &str = "No installed module provides it";
+
+/// The longest reason [`Modules::absent_reason`] gives, in bytes.
+pub const ABSENT_REASON_MAX: usize = 120;
+
+/// The longest module name [`Modules::absent_reason`] gives, in bytes.
+pub const NAME_MAX: usize = 64;
 
 /// What the daemon knows of an opened module.
 #[derive(Debug, Clone)]
@@ -107,6 +119,11 @@ pub struct Modules {
     /// What `GetModules` and `GetStageOrder` returned when last counted
     /// (what bumps the serial).
     listed: (Vec<obc_ipc::ModuleInfo>, Vec<StageId>),
+    /// The switch (`role = "enable"` setting) of every stage a module
+    /// described in this process, by stage: kept across a disable, a
+    /// crash and a reload, so that a stage whose module is not open now is
+    /// still known to be selected ([`Modules::switch_of`]).
+    switches: BTreeMap<StageId, SettingDesc>,
 }
 
 impl std::fmt::Debug for Modules {
@@ -316,8 +333,22 @@ impl Plan {
         ids
     }
 
+    /// The module that runs `stage` in this plan (`background` included).
+    pub fn provider(&self, stage: &StageId) -> Option<&str> {
+        if *stage == StageId::BACKGROUND || self.effect_stages.contains(stage) {
+            return self.effect.as_ref().map(|p| p.id.as_str());
+        }
+        if *stage == StageId::ENHANCE {
+            return self.enhance.as_ref().map(|p| p.id.as_str());
+        }
+        self.chains
+            .iter()
+            .find(|c| c.stages.contains(stage))
+            .map(|c| c.module.id.as_str())
+    }
+
     /// The settings of the module that runs `stage` in this plan.
-    fn settings_of(&self, stage: &StageId) -> Option<&SettingsDescription> {
+    pub fn settings_of(&self, stage: &StageId) -> Option<&SettingsDescription> {
         if self.effect_stages.contains(stage) {
             return self.effect.as_ref().map(|p| &p.settings);
         }
@@ -353,6 +384,19 @@ impl Modules {
             compute_capability: None,
             serial: 1,
             listed: (Vec::new(), Vec::new()),
+            switches: BTreeMap::new(),
+        }
+    }
+
+    /// Remembers the stage switches `settings` describes
+    /// ([`Self::switch_of`]).
+    fn remember_switches(&mut self, settings: &SettingsDescription) {
+        for s in settings.settings() {
+            if s.role == Some(Role::Enable)
+                && let Some(stage) = &s.stage
+            {
+                self.switches.insert(stage.clone(), s.clone());
+            }
         }
     }
 
@@ -485,6 +529,7 @@ impl Modules {
             Ok(stages) => {
                 debug!("module {id} unchanged: kept open");
                 let _ = self.registry.record_probe(id, Ok(stages));
+                self.remember_switches(&opened.settings);
                 self.opened.insert(id.to_string(), opened);
             }
             Err(e) => {
@@ -519,6 +564,7 @@ impl Modules {
             Ok(o) => {
                 debug!("module {id} ({}) opened", manifest.library.display());
                 let _ = self.registry.record_probe(id, Ok(o.stages));
+                self.remember_switches(&o.settings);
                 self.opened.insert(
                     id.to_string(),
                     Opened {
@@ -704,6 +750,11 @@ impl Modules {
     pub fn follow(&mut self, previous: &Modules) {
         self.serial = previous.serial;
         self.listed = previous.listed.clone();
+        for (stage, s) in &previous.switches {
+            self.switches
+                .entry(stage.clone())
+                .or_insert_with(|| s.clone());
+        }
         self.bump();
     }
 
@@ -828,9 +879,17 @@ impl Modules {
         }
     }
 
-    /// Whether `module` can run `stage` now.
-    pub fn runs(&self, module: &str, stage: &str) -> bool {
-        self.stage_reason(module, stage).is_none()
+    /// Whether `module` can run `stage` now, whoever the pins and the
+    /// profile would choose for it: enabled and available, with the stage
+    /// available in it. A running session keeps a stage of its own module
+    /// while this holds (a pin or the profile applies at the next start).
+    pub fn able(&self, module: &str, stage: &str) -> bool {
+        self.registry.status(module) == Some(ModuleStatus::Available)
+            && self
+                .registry
+                .providers(stage)
+                .iter()
+                .any(|p| p.module == module && p.availability.is_installed())
     }
 
     /// The name of module `id` (its id when it has none).
@@ -844,9 +903,90 @@ impl Modules {
     /// The label of `stage` in messages: its switch's label, lower-cased
     /// (`noise removal`), else the stage id.
     pub fn stage_label(&self, stage: &str) -> String {
+        self.switch_of(stage)
+            .map_or_else(|| stage.to_string(), |s| s.label.to_lowercase())
+    }
+
+    /// The switch of `stage`: an enabled module's that describes it, else
+    /// the last one a module described in this process (its module
+    /// disabled, crashed or unavailable since).
+    pub fn switch_of(&self, stage: &str) -> Option<&SettingDesc> {
         self.described()
             .find_map(|(_, d)| d.enable_of(stage))
-            .map_or_else(|| stage.to_string(), |s| s.label.to_lowercase())
+            .or_else(|| {
+                StageId::new(stage)
+                    .ok()
+                    .and_then(|id| self.switches.get(&id))
+            })
+    }
+
+    /// The stages a switch is known of ([`Self::switch_of`]), with the
+    /// stages the enabled modules offer, in the stage order first.
+    pub fn known_stages(&self) -> Vec<StageId> {
+        let mut out = self.order();
+        let described = self
+            .described()
+            .flat_map(|(_, d)| d.settings().filter_map(|s| s.stage.clone()))
+            .collect::<Vec<_>>();
+        for id in described.into_iter().chain(self.switches.keys().cloned()) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    /// Why no module can run `stage` now, for a stage that has no
+    /// provider ([`Self::resolve`]): the module that would (its name, when
+    /// one declares it) and its reason, as `GetModules` gives it. An
+    /// enabled module that declares it comes first (the pin's, cut-out's,
+    /// stage's or module's reason, as the resolution says); else a
+    /// disabled one (by the user, or by the crash ledger), with its
+    /// status's reason; with none installed, no name. The name and the
+    /// reason are made safe to show and bounded ([`NAME_MAX`],
+    /// [`ABSENT_REASON_MAX`]): a manifest's name has no rule of its own.
+    pub fn absent_reason(&self, stage: &str) -> (Option<String>, String) {
+        let declarers: Vec<obc_module_host::registry::ModuleInfo> = self
+            .registry
+            .modules()
+            .into_iter()
+            .filter(|m| {
+                m.manifest
+                    .as_ref()
+                    .is_some_and(|x| x.stage(stage).is_some())
+            })
+            .collect();
+        let clip = |r: &str| crate::settings::sanitise(r, ABSENT_REASON_MAX);
+        let name_of = |id: &str| crate::settings::sanitise(&self.name_of(id), NAME_MAX);
+        let enabled: Vec<_> = declarers.iter().filter(|m| m.enabled).collect();
+        if !enabled.is_empty() {
+            let reason = self
+                .registry
+                .resolve(stage)
+                .reason
+                .unwrap_or_else(|| obc_module_host::registry::REASON_NO_PROVIDER.into());
+            // The module whose own reason that is, else the first.
+            let own = |m: &obc_module_host::registry::ModuleInfo| match &m.status {
+                ModuleStatus::Available => m
+                    .stages
+                    .iter()
+                    .find(|s| s.id.as_str() == stage)
+                    .map(|s| s.reason.clone())
+                    .unwrap_or_default(),
+                st => st.reason().to_string(),
+            };
+            let module = enabled
+                .iter()
+                .find(|m| own(m) == reason)
+                .unwrap_or(&enabled[0]);
+            // A pin's reason names its module already.
+            let name = (!reason.starts_with("Pinned module")).then(|| name_of(&module.id));
+            return (name, clip(&reason));
+        }
+        if let Some(m) = declarers.first() {
+            return (Some(name_of(&m.id)), clip(m.status.reason()));
+        }
+        (None, REASON_NOT_INSTALLED.into())
     }
 
     /// The session plan: who runs each stage, and where (see [`Plan`]).
@@ -947,28 +1087,16 @@ impl Modules {
             .enable_of(stage.as_str())
             .and_then(|s| value_of(config, runtime, s))
             .is_none_or(|v| v == StoredValue::Bool(true));
-        // `Some(false)` only when it is known not to run: a module gone
-        // from the registry (disabled mid-session) keeps what it had.
-        on && module.is_none_or(|m| !self.installed(m) || self.runs_or_unknown(m, stage.as_str()))
-    }
-
-    /// Whether `module` runs `stage` now, or the registry cannot say (the
-    /// module is not enabled any more).
-    fn runs_or_unknown(&self, module: &str, stage: &str) -> bool {
-        !self.registry.is_enabled(module) || self.runs(module, stage)
+        // Off when its module cannot run it now: a module disabled since
+        // the session started (or crashed, unavailable, or gone at a
+        // reload) drops its stages from the running session, which streams
+        // on without them. A stage pinned to another module since is not
+        // one its module cannot run: it keeps running until the next start.
+        on && module.is_none_or(|m| self.able(m, stage.as_str()))
     }
 
     fn provider_in<'a>(&self, plan: &'a Plan, stage: &StageId) -> Option<&'a str> {
-        if plan.effect_stages.contains(stage) {
-            return plan.effect.as_ref().map(|p| p.id.as_str());
-        }
-        if *stage == StageId::ENHANCE {
-            return plan.enhance.as_ref().map(|p| p.id.as_str());
-        }
-        plan.chains
-            .iter()
-            .find(|c| c.stages.contains(stage))
-            .map(|c| c.module.id.as_str())
+        plan.provider(stage)
     }
 
     /// The request of the session's `stage`: on or off, with its parameters
@@ -1148,6 +1276,7 @@ pub mod testing {
             match opened {
                 Ok(o) => {
                     let _ = m.registry.record_probe(&e.id, Ok(o.stages));
+                    m.remember_switches(&o.settings);
                     m.opened.insert(
                         e.id.clone(),
                         super::Opened {
@@ -1169,5 +1298,92 @@ pub mod testing {
     /// The Maxine module alone, its stages available but `unavailable`.
     pub fn maxine(unavailable: &[(&str, &str)]) -> Modules {
         modules(vec![(maxine_entry(), Ok(maxine_opened(unavailable)))])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use obc_pipeline::effect::StageId;
+
+    use super::testing::{maxine, maxine_entry, maxine_opened, modules};
+    use super::{MAXINE_MODULE, REASON_DISABLED, REASON_NOT_INSTALLED};
+
+    const NAME: &str = "NVIDIA Maxine video effects";
+
+    fn named(reason: &str) -> (Option<String>, String) {
+        (Some(NAME.into()), reason.into())
+    }
+
+    #[test]
+    fn absent_reason_names_the_module_and_its_reason() {
+        let bg = StageId::BACKGROUND.as_str();
+        // Disabled by the user, or by the crash ledger: its status's reason.
+        let mut m = maxine(&[]);
+        m.registry.disable(MAXINE_MODULE, REASON_DISABLED).unwrap();
+        assert_eq!(m.absent_reason(bg), named(REASON_DISABLED));
+        let mut m = maxine(&[]);
+        m.registry
+            .disable(MAXINE_MODULE, obc_module_host::REASON_CRASHED)
+            .unwrap();
+        assert_eq!(m.absent_reason(bg), named(obc_module_host::REASON_CRASHED));
+        // Failed to open: why.
+        let m = modules(vec![(
+            maxine_entry(),
+            Err("libVideoFX.so: not found".into()),
+        )]);
+        assert_eq!(m.absent_reason(bg), named("libVideoFX.so: not found"));
+        // Open, the stage not installed: the stage's reason.
+        let m = maxine(&[("background", "no green screen model")]);
+        assert_eq!(m.absent_reason(bg), named("no green screen model"));
+        // None installed: no name.
+        let m = modules(Vec::new());
+        assert_eq!(m.absent_reason(bg), (None, REASON_NOT_INSTALLED.into()));
+        // A pin's reason names its module already.
+        let mut m = modules(vec![(
+            maxine_entry(),
+            Ok(maxine_opened(&[("background", "no model")])),
+        )]);
+        m.registry
+            .set_pin(StageId::BACKGROUND, Some(MAXINE_MODULE.into()));
+        let (name, reason) = m.absent_reason(bg);
+        assert_eq!(name, None);
+        assert!(reason.starts_with("Pinned module"), "{reason}");
+        // Bounded, and made safe to show.
+        let long = format!("bad\u{1}{}", "x".repeat(500));
+        let m = maxine(&[("background", long.as_str())]);
+        let (_, reason) = m.absent_reason(bg);
+        assert!(reason.len() <= super::ABSENT_REASON_MAX, "{}", reason.len());
+        assert!(!reason.contains('\u{1}'));
+    }
+
+    #[test]
+    fn absent_reason_makes_the_module_name_safe() {
+        let evil = format!("name = \"Evil\\nmodule\\u202E{}\"", "y".repeat(100));
+        let manifest = super::testing::MAXINE_MANIFEST
+            .replace("name = \"NVIDIA Maxine video effects\"", &evil);
+        assert_ne!(manifest, super::testing::MAXINE_MANIFEST, "the name line");
+        let entry = super::testing::entry(&manifest, "/m/evil.toml");
+        let m = modules(vec![(
+            entry,
+            Ok(maxine_opened(&[("background", "no model")])),
+        )]);
+        let (name, reason) = m.absent_reason("background");
+        let name = name.expect("named");
+        assert!(name.starts_with("Evil module"), "{name:?}");
+        assert!(!name.contains(['\n', '\u{202E}']), "{name:?}");
+        assert!(name.len() <= super::NAME_MAX, "{}", name.len());
+        assert_eq!(reason, "no model");
+    }
+
+    #[test]
+    fn a_stage_switch_is_remembered_once_its_module_is_disabled() {
+        let mut m = maxine(&[]);
+        assert!(m.switch_of("denoise").is_some());
+        m.registry.disable(MAXINE_MODULE, REASON_DISABLED).unwrap();
+        m.opened.clear();
+        let s = m.switch_of("denoise").expect("remembered");
+        assert_eq!(s.id, obc_core::modules::legacy::DENOISE);
+        assert_eq!(m.stage_label("denoise"), "noise removal");
+        assert!(m.known_stages().contains(&StageId::DENOISE));
     }
 }

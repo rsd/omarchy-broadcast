@@ -313,6 +313,15 @@ pub trait OmarchyBroadcast {
     #[zbus(property)]
     fn backend_profile(&self) -> zbus::Result<String>;
 
+    /// What runs other than the user asked, without being an error, empty
+    /// if nothing: the selected stages no module provides (the feed
+    /// streams without them), and an effect a module provides that cannot
+    /// run (the feed black with `on_failure = "black"`, the camera image
+    /// with `"none"`). One line of
+    /// clauses joined by `; `, for people, not to be parsed. Revision 11.
+    #[zbus(property)]
+    fn warning(&self) -> zbus::Result<String>;
+
     /// Revision of the interface the daemon implements.
     #[zbus(property)]
     fn interface_revision(&self) -> zbus::Result<u32>;
