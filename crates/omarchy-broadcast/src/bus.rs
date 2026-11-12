@@ -7,13 +7,14 @@
 //! flag), so `status`, `cameras` and `watch` never trigger D-Bus activation;
 //! `controls` reads the image controls with a `GetCameraControls` carrying
 //! the same flag ([`camera_controls`]), and `settings` and `watch` read the
-//! camera settings with a `GetSettings` carrying it ([`settings_tree`]).
+//! camera settings with a `GetSettings` carrying it ([`settings_tree`]),
+//! and `media` reads the gallery with a `GetMedia` carrying it ([`media`]).
 //! The generated property getters of [`obc_ipc::OmarchyBroadcastProxy`] (and its
 //! cache, filled by a `GetAll` without that flag) would. Methods go through
 //! the proxy, without the flag: `on`, `off`, `camera`, `effect <effect>`,
-//! `denoise`, `controls set`, `controls reset`, `settings set` and
-//! `settings reset` may start the daemon when its activation file is
-//! installed.
+//! `denoise`, `controls set`, `controls reset`, `settings set`,
+//! `settings reset`, `media import` and `media remove` may start the daemon
+//! when its activation file is installed.
 
 use std::time::Duration;
 
@@ -356,6 +357,33 @@ pub fn require_config(revision: u32) -> Result<(), Failure> {
          {revision}, they need {}); update omarchy-broadcastd",
         obc_ipc::CONFIG_REVISION
     )))
+}
+
+/// Fails unless a daemon of interface revision `revision` has the media
+/// gallery (`GetMedia`, `ImportMedia`, `RemoveMedia`).
+pub fn require_media(revision: u32) -> Result<(), Failure> {
+    if revision >= obc_ipc::MEDIA_REVISION {
+        return Ok(());
+    }
+    Err(Failure::Unsupported(format!(
+        "the daemon does not support the media gallery (its interface revision is {revision}, \
+         the gallery needs {}); update omarchy-broadcastd",
+        obc_ipc::MEDIA_REVISION
+    )))
+}
+
+/// `GetMedia(kind)` without starting the daemon, within [`READ_TIMEOUT`].
+pub async fn media(conn: &Connection, kind: &str) -> Result<obc_ipc::MediaReply, Failure> {
+    let call = async {
+        let proxy = proxy(conn).await?;
+        proxy
+            .media_no_autostart(kind)
+            .await
+            .map_err(no_autostart_error)
+    };
+    tokio::time::timeout(READ_TIMEOUT, call)
+        .await
+        .unwrap_or_else(|_| Err(timed_out(READ_TIMEOUT)))
 }
 
 /// `GetConfigSchema` without starting the daemon, within [`READ_TIMEOUT`].

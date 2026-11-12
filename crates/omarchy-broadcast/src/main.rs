@@ -6,6 +6,7 @@ mod bus;
 mod config;
 mod human;
 mod json;
+mod media;
 mod mic;
 mod model;
 mod modules;
@@ -46,11 +47,12 @@ Exit status:
 
 `status`, `cameras`, `watch`, `preview`, `effect` without an effect, `controls` and
 `settings` without a subcommand, `modules list`, `modules info`, `modules profile` without
-a profile, `order show`, `config show|get|files` and `mic` or `mic status` never start the
-daemon. `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls
-reset`, `settings set`, `settings reset`, `modules enable|disable|profile <profile>|pin`,
-`order set|reset`, `config set|reset` and `mic on|off|device|default|restore-default` may
-start it through D-Bus activation when its activation file is installed.
+a profile, `order show`, `config show|get|files`, `mic` or `mic status` and `media` or
+`media list` never start the daemon. `on`, `off`, `camera`, `effect <effect>`, `denoise`,
+`controls set`, `controls reset`, `settings set`, `settings reset`, `modules
+enable|disable|profile <profile>|pin`, `order set|reset`, `config set|reset`, `mic
+on|off|device|default|restore-default` and `media import|remove` may start it through D-Bus
+activation when its activation file is installed.
 
 `--json` output is documented in docs/cli-json.md; the D-Bus interface in docs/dbus-api.md.";
 
@@ -223,6 +225,27 @@ enum Command {
         json: bool,
         #[command(subcommand)]
         action: Option<config::ConfigAction>,
+    },
+    /// Show or manage the media gallery: the backgrounds of `replace` and
+    /// the away images, bundled or yours.
+    ///
+    /// Without a subcommand, lists the backgrounds (or the kind given).
+    /// Examples: `omarchy-broadcast media away`,
+    /// `omarchy-broadcast media import background ~/Pictures/office.jpg --select`,
+    /// `omarchy-broadcast media remove ~/.local/share/omarchy-broadcast/media/backgrounds/office.jpg`.
+    #[command(args_conflicts_with_subcommands = true)]
+    Media {
+        /// `background` (the default) or `away`; only without a
+        /// subcommand (as `media list KIND`).
+        #[arg(value_parser = obc_ipc::media::KINDS)]
+        kind: Option<String>,
+        /// Print JSON lines (a `"type":"media"` line, then one
+        /// `"type":"media_item"` line per item); only without a subcommand
+        /// (as `media list --json`).
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<media::MediaAction>,
     },
     /// Show or control the Omarchy Broadcast Mic, the microphone with
     /// noise and room echo removal.
@@ -913,11 +936,67 @@ async fn change_settings(action: &SettingsAction, camera: &str) -> u8 {
 enum Job {
     Command(Command),
     SetEffect(EffectRequest),
+    /// `media import`, the path made absolute.
+    MediaImport {
+        kind: String,
+        path: String,
+        select: bool,
+        json: bool,
+    },
+    /// `media remove`, the path made absolute.
+    MediaRemove(String),
 }
 
-/// Checks what clap cannot: the options of `effect <effect>`.
+/// A usage error of `media <action>`, found after the command line was
+/// read.
+fn media_usage(action: &str, kind: ErrorKind, msg: String) -> clap::Error {
+    let mut cmd = Cli::command();
+    cmd.build();
+    match cmd
+        .find_subcommand_mut("media")
+        .and_then(|s| s.find_subcommand_mut(action))
+    {
+        Some(sub) => sub.error(kind, msg),
+        None => cmd.error(kind, msg),
+    }
+}
+
+/// Checks what clap cannot: the options of `effect <effect>` and of
+/// `media import`, and the paths of `media`.
 fn job(cli: Cli) -> Result<Job, clap::Error> {
     match cli.command {
+        Command::Media {
+            action:
+                Some(media::MediaAction::Import {
+                    kind,
+                    path,
+                    select,
+                    json,
+                }),
+            ..
+        } => {
+            if select && kind != obc_ipc::media::KIND_BACKGROUND {
+                return Err(media_usage(
+                    "import",
+                    ErrorKind::ArgumentConflict,
+                    format!("--select applies to `background`, not `{kind}`"),
+                ));
+            }
+            let path = media::absolute_text(&path)
+                .map_err(|m| media_usage("import", ErrorKind::ValueValidation, m))?;
+            Ok(Job::MediaImport {
+                kind,
+                path,
+                select,
+                json,
+            })
+        }
+        Command::Media {
+            action: Some(media::MediaAction::Remove { path }),
+            ..
+        } => media::absolute_text(&path)
+            .map(Job::MediaRemove)
+            .map_err(|m| media_usage("remove", ErrorKind::ValueValidation, m)),
         Command::Effect {
             effect: Some(effect),
             strength,
@@ -944,6 +1023,22 @@ fn job(cli: Cli) -> Result<Job, clap::Error> {
 async fn run(job: Job) -> u8 {
     match &job {
         Job::SetEffect(req) => set_effect(req).await,
+        Job::MediaImport {
+            kind,
+            path,
+            select,
+            json,
+        } => media::run_import(kind, path, *select, *json).await,
+        Job::MediaRemove(path) => media::run_remove(path).await,
+        Job::Command(Command::Media {
+            kind, json, action, ..
+        }) => match action {
+            Some(media::MediaAction::List { kind, json }) => {
+                media::run_list(kind.as_deref(), *json).await
+            }
+            Some(_) => unreachable!("media import and remove are jobs of their own"),
+            None => media::run_list(kind.as_deref(), *json).await,
+        },
         Job::Command(Command::Status { json }) => show(*json, View::Status).await,
         Job::Command(Command::Cameras { json }) => show(*json, View::Cameras).await,
         Job::Command(Command::Effect { json, .. }) => show(*json, View::Effect).await,

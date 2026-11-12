@@ -45,6 +45,7 @@ use zbus::{Connection, DBusError, OwnedVariant, Type, Variant};
 
 pub mod client;
 pub mod config;
+pub mod media;
 pub mod modules;
 pub mod settings;
 
@@ -53,6 +54,7 @@ pub use config::{
     CONFIG_REVISION, ConfigFileEntry, ConfigFiles, ConfigGroup, ConfigKind, ConfigRow,
     ConfigSchema, ConfigValue,
 };
+pub use media::{MEDIA_REVISION, MediaEntry, MediaReply};
 pub use modules::{FORCED_REVISION, MODULES_REVISION, ModuleInfo, ModuleList, StageInfo};
 pub use settings::{
     Condition, ConditionOp, ResetScope, Setting, SettingChange, SettingKind, SettingValue,
@@ -124,7 +126,9 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// <b> despite a declared conflict (modules.forced)`), and of the module a
 /// running session keeps for its background effect although it is
 /// refused since (`<name> unavailable from the next start: <reason>`).
-pub const INTERFACE_REVISION: u32 = 14;
+/// Revision 15 added the media gallery ([`media`]): `GetMedia`,
+/// `ImportMedia`, `RemoveMedia` and the `MediaSerial` property.
+pub const INTERFACE_REVISION: u32 = 15;
 /// The first [`INTERFACE_REVISION`] with the microphone: the `Mic*`
 /// properties, `MicStats`, `SetMicHost` and the `mic.*` settings.
 pub const MIC_REVISION: u32 = 13;
@@ -1196,7 +1200,8 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, FORCED_REVISION);
+        assert_eq!(INTERFACE_REVISION, MEDIA_REVISION);
+        const { assert!(FORCED_REVISION < MEDIA_REVISION) };
         const { assert!(MIC_REVISION < FORCED_REVISION) };
         const { assert!(MODES_REVISION < MIC_REVISION) };
         const { assert!(WARNING_REVISION < MODES_REVISION) };

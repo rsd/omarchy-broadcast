@@ -1272,8 +1272,9 @@ async fn proxy_reads_every_property() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 14);
-    assert_eq!(INTERFACE_REVISION, obc_ipc::FORCED_REVISION);
+    assert_eq!(INTERFACE_REVISION, 15);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::MEDIA_REVISION);
+    assert_eq!(obc_ipc::FORCED_REVISION, 14);
     assert_eq!(MIC_REVISION, 13);
     assert_eq!(WARNING_REVISION, 11);
     assert_eq!(obc_ipc::MODES_REVISION, 12);

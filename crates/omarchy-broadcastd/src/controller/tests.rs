@@ -1743,6 +1743,141 @@ fn clearing_the_image_brings_back_the_configs_image() {
     assert_eq!(h.snap().background_image, cfg_image);
 }
 
+// ---- the media gallery's removals (RemoveMedia, revision 15) ----
+
+/// A gallery under `root` with the user background `name` in it.
+fn gallery_with(root: &Path, name: &str) -> (Arc<MediaStore>, PathBuf) {
+    let store = MediaStore::new(root.join("bundled"), root.join("user"));
+    let dir = store.user_dir(crate::media::MediaKind::Background);
+    fs::create_dir_all(&dir).unwrap();
+    let item = dir.join(name);
+    fs::write(&item, b"an image").unwrap();
+    (Arc::new(store), item)
+}
+
+impl H {
+    fn release_media(
+        &mut self,
+        store: &Arc<MediaStore>,
+        path: &Path,
+        ms: u64,
+    ) -> Result<(), IpcError> {
+        let (store, path) = (Arc::clone(store), path.to_path_buf());
+        self.call(|reply| Command::ReleaseMedia { store, path, reply }, ms)
+    }
+}
+
+fn refusal(r: Result<(), IpcError>) -> String {
+    match r {
+        Err(IpcError::InvalidArgument(m)) => m,
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_file_the_configuration_names_is_never_removed() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, item) = gallery_with(root.path(), "office.png");
+    // Named through another spelling of the same file: compared
+    // canonically.
+    let spelled = root
+        .path()
+        .join("user/backgrounds/../backgrounds/office.png");
+    for key in ["background_image", "fallback_image"] {
+        let config = format!(
+            "[effect]\nmode = \"blur\"\n{key} = \"{}\"\n",
+            spelled.display()
+        );
+        let mut h = H::new(&config, |_| {});
+        assert_eq!(h.snap().error, "");
+        let msg = refusal(h.release_media(&store, &item, 0));
+        assert_eq!(
+            msg,
+            format!(
+                "{} is set in the configuration ([effect] {key}); change it there first",
+                item.display()
+            )
+        );
+        assert!(item.exists(), "{key}");
+    }
+    // Another file of the configuration does not hold this one.
+    let other = root.path().join("other.png");
+    fs::write(&other, b"an image").unwrap();
+    let config = format!("[effect]\nbackground_image = \"{}\"\n", other.display());
+    let mut h = H::new(&config, |_| {});
+    h.release_media(&store, &item, 0).unwrap();
+    assert!(!item.exists());
+    assert_eq!(h.snap().background_image, other.display().to_string());
+}
+
+#[test]
+fn removing_the_run_time_background_clears_it_in_the_same_step() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, item) = gallery_with(root.path(), "office.png");
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |_| {});
+    h.set_image(&item.display().to_string(), 0).unwrap();
+    h.release_media(&store, &item, 100).unwrap();
+    assert!(!item.exists());
+    assert_eq!(h.snap().background_image, "");
+    assert_eq!(h.persisted().background_image, None);
+    // Gone, it cannot be chosen again afterwards.
+    assert!(refusal(h.set_image(&item.display().to_string(), 200)).contains("unreadable"));
+
+    // Under `replace` with no configured image the clear is refused, and
+    // so is the removal: the file and the choice stay.
+    let (store, item) = gallery_with(root.path(), "room.png");
+    h.set_image(&item.display().to_string(), 300).unwrap();
+    h.set_effect("replace", 300).unwrap();
+    let msg = refusal(h.release_media(&store, &item, 400));
+    assert!(msg.contains("select another effect"), "{msg}");
+    assert!(item.exists());
+    assert_eq!(h.snap().background_image, item.display().to_string());
+    assert_eq!(h.snap().effect, "replace");
+}
+
+#[test]
+fn a_failed_removal_restores_the_background_it_cleared() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, _) = gallery_with(root.path(), "office.png");
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |_| {});
+    // The run-time background is a file the store refuses to remove (not
+    // in its user directory): it is cleared, the removal fails, and the
+    // choice comes back, saved.
+    let image = h.image();
+    h.set_image(&image, 0).unwrap();
+    h.drain();
+    let msg = refusal(h.release_media(&store, Path::new(&image), 100));
+    assert!(
+        msg.contains("is not an item of the user's media gallery"),
+        "{msg}"
+    );
+    assert!(Path::new(&image).exists());
+    assert_eq!(h.snap().background_image, image);
+    assert_eq!(
+        h.persisted().background_image.as_deref(),
+        Some(Path::new(&image))
+    );
+
+    // A gallery item whose directory cannot be written: `Failed`, the
+    // choice restored (unless the test runs with the power to write it).
+    use std::os::unix::fs::PermissionsExt;
+    let (store, item) = gallery_with(root.path(), "room.png");
+    h.set_image(&item.display().to_string(), 200).unwrap();
+    let dir = item.parent().unwrap();
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let res = h.release_media(&store, &item, 300);
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+    if item.exists() {
+        match res {
+            Err(IpcError::Failed(m)) => assert!(m.contains("cannot remove"), "{m}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(h.snap().background_image, item.display().to_string());
+    } else {
+        res.unwrap();
+    }
+}
+
 #[test]
 fn a_repeated_setting_neither_rewrites_the_state_nor_reloads_the_effect() {
     let mut h = H::new("[effect]\nmode = \"blur\"\n", |_| {});

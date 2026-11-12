@@ -18,6 +18,8 @@
 //! [`OmarchyBroadcastProxy::config_schema`],
 //! [`OmarchyBroadcastProxy::set_config_value`] and
 //! [`OmarchyBroadcastProxy::config_files`] (and the `_no_autostart` reads).
+//! The media gallery (revision 15) has [`OmarchyBroadcastProxy::media`] and
+//! [`OmarchyBroadcastProxy::media_no_autostart`].
 
 use std::collections::HashMap;
 
@@ -25,6 +27,7 @@ use zbus::Variant;
 use zbus::proxy::MethodFlags;
 
 use crate::config::{ConfigFiles, ConfigFilesReply, ConfigSchema, ConfigSchemaReply, ConfigValue};
+use crate::media::{MediaReply, MediaWire};
 use crate::modules::{ModuleList, ModulesReply};
 use crate::settings::{
     ResetScope, SettingChange, SettingValue, SettingsReply, SettingsTree, VariantDict,
@@ -192,6 +195,30 @@ pub trait OmarchyBroadcast {
     /// filter-chain runs, or without a service manager; `Failed` when the
     /// service manager refuses. Revision 13.
     fn set_mic_host(&self, on: bool) -> Result<(), IpcError>;
+
+    /// The media gallery of `kind`, `background` or `away` (revision 15):
+    /// `(serial, bundled_dir, user_dir, items)`, read with
+    /// [`OmarchyBroadcastProxy::media`]. Fails with `InvalidArgument` for
+    /// another kind, `Failed` when the daemon has no gallery (no user data
+    /// directory).
+    fn get_media(&self, kind: &str) -> Result<MediaWire, IpcError>;
+
+    /// Copies the image at `path` (absolute, read by the daemon) into the
+    /// user's gallery of `kind` after checking it, and returns the stored
+    /// file's absolute path; a file already in that gallery with the same
+    /// bytes is returned instead of being copied again. Refused with
+    /// `InvalidArgument` and the reason (an unknown kind, a relative path,
+    /// not an accepted image, too large, no decoder, a video); `Failed`
+    /// when the gallery cannot be written. Revision 15.
+    fn import_media(&self, kind: &str, path: &str) -> Result<String, IpcError>;
+
+    /// Removes the item at `path` from the user's gallery. Removing the
+    /// background in force first clears it as an empty
+    /// `SetBackgroundImage` does, and is refused with that call's error
+    /// when the clear is refused. Refused with `InvalidArgument` for a
+    /// bundled item or any path that is not a user item; `Failed` when the
+    /// file cannot be removed. Revision 15.
+    fn remove_media(&self, path: &str) -> Result<(), IpcError>;
 
     /// Roughly once per second while `active`; `-1` marks a value that
     /// cannot be measured.
@@ -364,6 +391,11 @@ pub trait OmarchyBroadcast {
     #[zbus(property)]
     fn mic_error(&self) -> zbus::Result<String>;
 
+    /// Bumped whenever what `GetMedia` returns changes through the daemon
+    /// (an import that stored a file, a removal); from 1. Revision 15.
+    #[zbus(property)]
+    fn media_serial(&self) -> zbus::Result<u32>;
+
     /// Revision of the interface the daemon implements.
     #[zbus(property)]
     fn interface_revision(&self) -> zbus::Result<u32>;
@@ -493,6 +525,25 @@ impl OmarchyBroadcastProxy<'_> {
             IpcError::ZBus(zbus::Error::Failure("GetModules returned no reply".into()))
         })?;
         Ok(ModuleList::from_wire(&reply))
+    }
+
+    /// `GetMedia(kind)`, read into [`MediaReply`].
+    pub async fn media(&self, kind: &str) -> Result<MediaReply, IpcError> {
+        Ok(MediaReply::from_wire(&self.get_media(kind).await?))
+    }
+
+    /// `GetMedia(kind)` with the `NO_AUTO_START` flag: never starts the
+    /// daemon.
+    pub async fn media_no_autostart(&self, kind: &str) -> Result<MediaReply, IpcError> {
+        let reply: Option<MediaWire> = self
+            .inner()
+            .call_with_flags("GetMedia", MethodFlags::NO_AUTO_START, &(kind,))
+            .await
+            .map_err(IpcError::from)?;
+        let reply = reply.ok_or_else(|| {
+            IpcError::ZBus(zbus::Error::Failure("GetMedia returned no reply".into()))
+        })?;
+        Ok(MediaReply::from_wire(&reply))
     }
 
     /// `GetStageOrder` with the `NO_AUTO_START` flag: never starts the

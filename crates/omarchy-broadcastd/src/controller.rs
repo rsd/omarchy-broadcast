@@ -323,6 +323,7 @@ use crate::backend::{
 };
 use crate::camera::{self, Camera};
 use crate::gpu_cache;
+use crate::media::{MediaStore, same_file};
 use crate::mic::{self, agent::MicEvent, agent::MicLink, agent::MicRequest};
 use crate::modules::{self, Modules, Plan};
 use crate::preview::{Leases, PreviewDir, check_fps};
@@ -420,6 +421,19 @@ pub enum Command {
     SetBlurStrength(f64, Reply),
     /// `SetBackgroundImage(s)` (empty: clear it).
     SetBackgroundImage(String, Reply),
+    /// `RemoveMedia(s)`, once the path was checked to be an item of the
+    /// user's gallery: refused while the configuration names the file
+    /// (`[effect] background_image` or `fallback_image`); the run-time
+    /// background cleared when it is the file (as an empty
+    /// `SetBackgroundImage`, a refusal of that refusing the removal); then
+    /// the file removed from `store`, here, so no `SetBackgroundImage` can
+    /// choose it in between. A failed removal restores the run-time
+    /// choice it cleared.
+    ReleaseMedia {
+        store: Arc<MediaStore>,
+        path: PathBuf,
+        reply: Reply,
+    },
     /// `SetDenoise(b)`.
     SetDenoise(bool, Reply),
     /// `AcquirePreview(u)` from the unique bus name `name`.
@@ -1860,6 +1874,10 @@ impl<B: MediaBackend> Controller<B> {
             }
             Command::SetBackgroundImage(path, reply) => {
                 let res = self.set_background_image(&path, now);
+                let _ = reply.send(res);
+            }
+            Command::ReleaseMedia { store, path, reply } => {
+                let res = self.release_media(&store, &path, now);
                 let _ = reply.send(res);
             }
             Command::SetDenoise(on, reply) => {
@@ -5072,6 +5090,47 @@ impl<B: MediaBackend> Controller<B> {
         let changed = self.runtime.background_image != new;
         self.runtime.background_image = new;
         self.effect_changed(changed, now)
+    }
+
+    /// `RemoveMedia` of `path` from `store` ([`Command::ReleaseMedia`]).
+    fn release_media(
+        &mut self,
+        store: &MediaStore,
+        path: &Path,
+        now: Instant,
+    ) -> Result<(), IpcError> {
+        let effect = &self.config.effect;
+        for (key, configured) in [
+            ("background_image", &effect.background_image),
+            ("fallback_image", &effect.fallback_image),
+        ] {
+            if configured.as_deref().is_some_and(|p| same_file(p, path)) {
+                return Err(IpcError::InvalidArgument(format!(
+                    "{} is set in the configuration ([effect] {key}); change it there first",
+                    path.display()
+                )));
+            }
+        }
+        let previous = self.runtime.background_image.clone();
+        let cleared = previous.as_deref().is_some_and(|p| same_file(p, path));
+        if cleared {
+            self.set_background_image("", now)?;
+        }
+        if let Err(e) = store.remove(path) {
+            if cleared {
+                info!(
+                    "{} was not removed: the background image is chosen again",
+                    path.display()
+                );
+                self.runtime.background_image = previous;
+                if let Err(r) = self.effect_changed(true, now) {
+                    warning!("restoring the background image: {}", r.message());
+                }
+            }
+            return Err(e.to_ipc());
+        }
+        info!("removed from the media gallery: {}", path.display());
+        Ok(())
     }
 
     /// `SetDenoise`: noise removal on or off, before the effect (or alone
