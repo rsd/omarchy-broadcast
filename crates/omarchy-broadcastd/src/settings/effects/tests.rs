@@ -10,6 +10,8 @@ use obc_ipc::valid_setting_id;
 
 const VIDEO: &str = "video";
 const LIGHTING: &str = "lighting";
+/// The Maxine module's switch of the HDR look.
+const HDR_LOOK: &str = "effect.video.hdr";
 const REASON_NOT_INSTALLED: &str = "Not installed";
 const REASON_TURN_ON_RELIGHT: &str = "Turn on relighting to change this";
 /// The global settings with the Maxine module, its stages available
@@ -95,6 +97,7 @@ fn the_effects_are_three_global_groups_with_valid_ids() {
             BLUR_STRENGTH,
             DENOISE,
             ENHANCE,
+            HDR_LOOK,
             RELIGHT,
             LIGHT,
             DIRECTION,
@@ -116,9 +119,10 @@ fn the_effects_are_three_global_groups_with_valid_ids() {
     };
     assert_eq!(in_group(LIGHTING), [RELIGHT, LIGHT, DIRECTION, BRIGHTNESS]);
     assert_eq!(in_group(BACKGROUND), [MODE, BLUR_STRENGTH]);
-    assert_eq!(in_group(VIDEO), [DENOISE, ENHANCE]);
+    assert_eq!(in_group(VIDEO), [DENOISE, ENHANCE, HDR_LOOK]);
     assert!(in_group("image").is_empty());
     let bindings: Vec<&Binding> = e.iter().map(|g| &g.binding).collect();
+    let hdr = Binding::Enable(StageId::new("hdr").unwrap());
     assert_eq!(
         bindings,
         [
@@ -126,6 +130,7 @@ fn the_effects_are_three_global_groups_with_valid_ids() {
             &Binding::BlurStrength,
             &Binding::Enable(StageId::DENOISE),
             &Binding::Enable(StageId::ENHANCE),
+            &hdr,
             &Binding::Enable(StageId::RELIGHT),
             &Binding::Param(StageId::RELIGHT, Apply::Reload),
             &Binding::Param(StageId::RELIGHT, Apply::Live),
@@ -142,7 +147,7 @@ fn the_effects_are_three_global_groups_with_valid_ids() {
         shown,
         [
             ("background", "Background effect", 2),
-            ("video", "Video", 2),
+            ("video", "Video", 3),
             ("lighting", "Lighting", 4)
         ]
     );
@@ -221,11 +226,14 @@ fn the_values_and_defaults_are_the_effect_settings() {
             value: true
         }
     );
+    // Stored: what the state holds (here the background, noise removal
+    // and enhancement); the HDR look's switch is at its default.
     assert!(
         e.iter()
-            .filter(|e| e.group() != LIGHTING)
+            .filter(|e| e.group() != LIGHTING && e.setting.id != HDR_LOOK)
             .all(|e| e.setting.stored)
     );
+    assert!(!get(&e, HDR_LOOK).stored);
     assert!(
         e.iter()
             .filter(|e| e.group() == LIGHTING)

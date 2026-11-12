@@ -147,6 +147,7 @@ Background effect
 Video
   Noise removal                  off      effect.video.denoise             on|off
   Enhance low-resolution camera  off      effect.video.enhance             on|off             (The camera already captures at full resolution)
+  HDR look                       off      effect.video.hdr                 on|off
 Lighting
   Relighting                     off      effect.lighting.relight          on|off
   Light                          Neutral  effect.lighting.light            warm|neutral|cool  (Turn on relighting to change this)
@@ -603,7 +604,7 @@ A **setting object** has the keys of its type only:
 | `options` | array | `enum` | Objects `{"value", "label"}`, in display order. |
 | `hint` | string | optional | A widget suggestion: `"slider"`, `"switch"`, `"segmented"`. |
 
-An `action` has no `value` or `default`. A setting whose `type` the CLI does not know is left out of the line, and a group with nothing left prints no line; a tree for which nothing is left gives a `settings_clear` line. The groups of one scope share it. The global groups are `background` ("Background effect": `effect.background.mode`, `effect.background.blur_strength`), `cutout` ("Cut-out": `effect.cutout.chair`), `video` ("Video": `effect.video.denoise`, `effect.video.enhance`, `effect.video.enhance_method`) and `lighting` ("Lighting": `effect.lighting.relight`, `.light`, `.direction`, `.brightness`), after the camera's groups; their settings and reasons are in [dbus-api.md](dbus-api.md#global-settings-the-video-effects). They are present with no camera, and a client assembles them with the rest of the set.
+An `action` has no `value` or `default`. A setting whose `type` the CLI does not know is left out of the line, and a group with nothing left prints no line; a tree for which nothing is left gives a `settings_clear` line. The groups of one scope share it. The global groups are `background` ("Background effect": `effect.background.mode`, `effect.background.blur_strength`), `cutout` ("Cut-out": `effect.cutout.chair`), `video` ("Video": `effect.video.denoise`, `effect.video.enhance`, `effect.video.enhance_method`, `effect.video.hdr`) and `lighting` ("Lighting": `effect.lighting.relight`, `.light`, `.direction`, `.brightness`), after the camera's groups; their settings and reasons are in [dbus-api.md](dbus-api.md#global-settings-the-video-effects). They are present with no camera, and a client assembles them with the rest of the set.
 
 A client keeps the order, ignores keys it does not know, skips a setting whose `type` it does not know, and trusts `enabled` and `disabled_reason` without evaluating `enabled_when`.
 

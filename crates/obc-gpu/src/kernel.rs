@@ -1,4 +1,4 @@
-//! The one custom CUDA kernel: a byte lookup table over a pitched 8-bit
+//! A custom CUDA kernel: a byte lookup table over a pitched 8-bit
 //! plane ([`Lut8`]).
 //!
 //! The kernel ships as PTX text (`kernels/lut8.ptx`, generated from
@@ -31,7 +31,7 @@ const CUDA_ERROR_UNSUPPORTED_PTX_VERSION: i32 = 222;
 
 /// What a failed `cuModuleLoadData` most likely means, for the two causes a
 /// user can fix; `None` for anything else.
-fn module_load_hint(code: i32) -> Option<&'static str> {
+pub(crate) fn module_load_hint(code: i32) -> Option<&'static str> {
     match code {
         CUDA_ERROR_UNSUPPORTED_PTX_VERSION => Some(
             "the NVIDIA driver is older than this build supports: it cannot load the \
@@ -309,7 +309,7 @@ mod tests {
     #[test]
     #[ignore = "needs ptxas (CUDA toolkit)"]
     fn ptxas_assembles_the_committed_ptx_for_sm_75_and_sm_120() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/kernels/lut8.ptx");
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/kernels");
         let candidates: Vec<String> = match std::env::var("PTXAS") {
             Ok(p) if !p.is_empty() => vec![p],
             _ => vec!["ptxas".into(), "/opt/cuda/bin/ptxas".into()],
@@ -323,16 +323,19 @@ mod tests {
                     .is_ok_and(|o| o.status.success())
             })
             .unwrap_or_else(|| panic!("no ptxas found (tried {candidates:?}); set PTXAS"));
-        for arch in ["sm_75", "sm_120"] {
-            let out = std::process::Command::new(ptxas)
-                .args([&format!("-arch={arch}"), "-o", "/dev/null", path])
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "ptxas -arch={arch} failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+        for file in ["lut8.ptx", "pq_to_sdr.ptx"] {
+            let path = format!("{dir}/{file}");
+            for arch in ["sm_75", "sm_120"] {
+                let out = std::process::Command::new(ptxas)
+                    .args([&format!("-arch={arch}"), "-o", "/dev/null", &path])
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "ptxas -arch={arch} {file} failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
         }
     }
 }

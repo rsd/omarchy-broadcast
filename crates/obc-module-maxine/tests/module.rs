@@ -28,8 +28,22 @@ fn the_manifest_is_valid_and_declares_the_maxine_stages() {
             ("denoise", "pre-matte", 100, 300),
             ("background", "matte", 100, 300),
             ("relight", "post-matte", 100, 300),
+            ("hdr", "post-composite", 100, 300),
             ("frame-generation", "post-composite", i32::MAX, 300),
         ]
+    );
+    // The HDR look runs on the composited frame, before frame generation,
+    // on CUDA NV12 frames, and needs no cut-out.
+    let hdr = m.stage("hdr").unwrap();
+    assert!(hdr.position < m.stage("frame-generation").unwrap().position);
+    assert!(!hdr.needs_matte());
+    assert_eq!(
+        hdr.formats.iter().map(|f| f.as_str()).collect::<Vec<_>>(),
+        ["nv12"]
+    );
+    assert_eq!(
+        hdr.frames.iter().map(|f| f.as_str()).collect::<Vec<_>>(),
+        ["cuda"]
     );
     // Frame generation is last of the last slot, on CUDA NV12 frames.
     let fg = m.stage("frame-generation").unwrap();
@@ -78,6 +92,7 @@ fn the_library_loads_without_the_sdk_and_describes_its_settings() {
             "denoise",
             "background",
             "relight",
+            "hdr",
             "frame-generation"
         ],
         "manifest order"
@@ -102,7 +117,7 @@ fn the_library_loads_without_the_sdk_and_describes_its_settings() {
         groups,
         [
             ("cutout", "Cut-out", 1),
-            ("video", "Video", 3),
+            ("video", "Video", 4),
             ("lighting", "Lighting", 4)
         ]
     );
@@ -131,6 +146,17 @@ fn the_library_loads_without_the_sdk_and_describes_its_settings() {
     assert_eq!(
         settings.enable_of("relight").unwrap().id,
         "effect.lighting.relight"
+    );
+    // The HDR look has its switch and nothing else.
+    assert_eq!(settings.enable_of("hdr").unwrap().id, "effect.video.hdr");
+    assert_eq!(
+        settings
+            .groups
+            .iter()
+            .flat_map(|g| &g.settings)
+            .filter(|s| s.stage.as_ref().is_some_and(|id| id.as_str() == "hdr"))
+            .count(),
+        1
     );
     let direction = settings.param("relight", "direction").unwrap();
     assert_eq!(
@@ -171,7 +197,11 @@ fn the_registry_offers_the_stages_in_the_rev8_order() {
         &sink,
     );
     let order: Vec<String> = registry.order().iter().map(|s| s.to_string()).collect();
-    assert_eq!(order, ["enhance", "denoise", "background", "relight"]);
+    // The HDR look last of the order; frame generation is in none.
+    assert_eq!(
+        order,
+        ["enhance", "denoise", "background", "relight", "hdr"]
+    );
     if std::env::var_os("MAXINE_VFX_ROOT").is_none_or(|v| v.is_empty()) {
         assert_eq!(
             registry.status(obc_module_maxine_id()),

@@ -551,6 +551,7 @@ impl World {
             StageId::DENOISE,
             StageId::BACKGROUND,
             StageId::RELIGHT,
+            StageId::new("hdr").expect("a valid stage id"),
         ]
         .into_iter()
         .map(|s| {

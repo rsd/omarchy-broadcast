@@ -1690,6 +1690,7 @@ async fn settings_methods_their_signal_their_properties_and_their_errors() {
             ("effect.background.blur_strength", "global"),
             ("effect.video.denoise", "global"),
             ("effect.video.enhance", "global"),
+            ("effect.video.hdr", "global"),
             ("effect.lighting.relight", "global"),
             ("effect.lighting.light", "global"),
             ("effect.lighting.direction", "global"),
@@ -1945,11 +1946,11 @@ async fn the_module_members_over_the_bus() {
         within("GetStageOrder", proxy.get_stage_order())
             .await
             .unwrap(),
-        ["enhance", "denoise", "background", "relight"]
+        ["enhance", "denoise", "background", "relight", "hdr"]
     );
     let e = within(
         "SetStageOrder",
-        proxy.set_stage_order(&["relight", "enhance", "denoise", "background"]),
+        proxy.set_stage_order(&["relight", "enhance", "denoise", "background", "hdr"]),
     )
     .await
     .unwrap_err();
@@ -2092,10 +2093,10 @@ async fn the_config_members_over_the_bus() {
     let moves = within("GetStageOrderMoves", proxy.get_stage_order_moves())
         .await
         .unwrap();
-    assert_eq!(moves.len(), 4);
+    assert_eq!(moves.len(), 5);
     assert_eq!(
         (moves[0].0.as_str(), moves[0].2, moves[0].3),
         ("enhance", false, true)
     );
-    assert!(!moves[3].3);
+    assert!(!moves[4].3);
 }

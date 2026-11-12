@@ -519,3 +519,118 @@ fn gpu_frame_generation_interpolates_fresh_frames_and_holds_repeats() {
         chain.unload();
     });
 }
+
+/// The HDR look alone, as the daemon runs it when no other stage of the
+/// effect element is on: every frame, a repeat too, goes out as the look of
+/// its own input (never of the frame before: two different frames in a row
+/// give two different outputs, and the same input the same output), and a
+/// failure on a frame (a frame on another stream than the load's) is the
+/// stage's: the chain drops it and passes the next frames through as they
+/// came.
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK, the os-release override and an NVIDIA GPU"]
+fn gpu_the_hdr_look_runs_on_every_frame_and_a_failure_drops_only_it() {
+    use obc_backend::{
+        BackendError, ChainFrame, ChainRequest, FrameKind, StageChain, StageChainFactory,
+    };
+    use obc_module_host::ModuleChainFactory;
+    use std::collections::BTreeMap;
+
+    let module = module();
+    let stage = StageId::new("hdr").unwrap();
+    let factory = ModuleChainFactory::new(module, std::slice::from_ref(&stage)).unwrap();
+    assert_eq!(factory.kinds(), [FrameKind::Cuda]);
+    rig(|gpu, stream| {
+        let frame = DeviceNv12Buffer::alloc(W, H).unwrap();
+        let mut chain = factory.create().unwrap();
+        let r = chain
+            .load(&ChainRequest {
+                stages: StageList::from(stage.clone()),
+                params: BTreeMap::new(),
+                width: W,
+                height: H,
+                colour: ColourSpec::LIMITED_BT601,
+                kind: FrameKind::Cuda,
+                gpu: Some(*gpu),
+            })
+            .unwrap_or_else(|e| panic!("HDR look load failed: {e}"));
+        println!("LOAD hdr: {r:?}");
+        let none = BTreeMap::new();
+        // Runs `input` through the chain in place on `on` and returns the
+        // output, or the failure.
+        let run = |chain: &mut dyn StageChain,
+                   on: &GpuContext,
+                   input: &[u8],
+                   repeat: bool|
+         -> Result<Vec<u8>, BackendError> {
+            frame.upload_packed(input).unwrap();
+            let f = frame.frame();
+            let cf = ChainFrame::Cuda { gpu: on, frame: &f };
+            if repeat {
+                chain.process_repeat(cf, &none)?;
+            } else {
+                chain.process(cf, &none)?;
+            }
+            stream.synchronize().unwrap();
+            Ok(frame.download_packed().unwrap())
+        };
+        let a = bgr_to_nv12(
+            &synthetic_person(W as usize, H as usize),
+            W as usize,
+            H as usize,
+        );
+        let b = noisy_grey(7);
+        let centre = |f: &[u8]| centre_luma(f, W as usize, H as usize).0;
+        let out_a = run(&mut *chain, gpu, &a, false).unwrap();
+        assert_ne!(out_a, a, "the HDR look changed nothing");
+        println!(
+            "HDR LOOK a: centre luma in {:.2}, out {:.2}",
+            centre(&a),
+            centre(&out_a)
+        );
+        assert!(
+            (centre(&out_a) - centre(&a)).abs() < 12.0,
+            "the look moved the mid-tones"
+        );
+        // A repeat runs too, on its own input: b, not the output of a.
+        let rep_b = run(&mut *chain, gpu, &b, true).unwrap();
+        assert_ne!(rep_b, out_a, "a repeat went out as the output before it");
+        assert_ne!(rep_b, b, "the HDR look skipped a repeat");
+        let out_b = run(&mut *chain, gpu, &b, false).unwrap();
+        assert_ne!(out_b, out_a, "a fresh frame went out as the look of a");
+        println!(
+            "HDR LOOK b: centre luma in {:.2}, out {:.2}",
+            centre(&b),
+            centre(&out_b)
+        );
+        assert!(
+            (centre(&out_b) - centre(&b)).abs() < 12.0,
+            "b's output is not the look of b"
+        );
+        // The same input, the same look: no state from the frames before.
+        let d = mean_abs_diff(&out_b, &rep_b);
+        assert!(d < 0.5, "b twice differs by {d:.3} on average");
+        let again = run(&mut *chain, gpu, &a, false).unwrap();
+        let d = mean_abs_diff(&again, &out_a);
+        assert!(d < 0.5, "a after b differs from a by {d:.3} on average");
+
+        // A failure of the HDR look is its own: the chain drops it.
+        let other = Stream::new(true).unwrap();
+        let elsewhere = GpuContext {
+            context: gpu.context,
+            stream: other.raw(),
+        };
+        let e = run(&mut *chain, &elsewhere, &a, false).unwrap_err();
+        match &e {
+            BackendError::Stage { stage, .. } => assert_eq!(stage.as_str(), "hdr", "{e}"),
+            other => panic!("not a stage failure: {other:?}"),
+        }
+        assert_eq!(
+            run(&mut *chain, gpu, &a, false).unwrap(),
+            a,
+            "without the HDR look the frame passes as it came"
+        );
+        assert_eq!(run(&mut *chain, gpu, &b, true).unwrap(), b);
+        chain.unload();
+    });
+}
