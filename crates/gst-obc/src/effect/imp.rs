@@ -16,7 +16,56 @@
 //!   usable for the request is loaded ([`Control::usable`]), so a cold load
 //!   on the worker never blocks it; a switch on the loaded instance blocks
 //!   it for the switch itself: milliseconds between two effects, a stage's
-//!   load when a switch adds it (see below).
+//!   load when a switch adds it (see below). A frame of a toggle mid-stream
+//!   (see there) only tries the lock, so it never waits either.
+//!
+//! # A toggle mid-stream, a start, a new source, a failure
+//!
+//! A requested effect (blur or replace) that is not loaded yet holds black
+//! (with `on-failure=image`, the fallback image) only where the room it
+//! hides was never on screen. The streaming thread keeps
+//! `StreamState::raw_on_screen`: the last frame output was the unprocessed
+//! picture, the input passed through or copied, or processed by the stages
+//! alone (they hide nothing). It is set by such a frame and cleared by any
+//! frame that goes out black (or the image) or processed by an effect, and
+//! by a stop (so a start begins without it), new caps, a flush and a frame
+//! with [`NEW_SOURCE_FLAG`](super::NEW_SOURCE_FLAG), before that frame is
+//! decided ([`decide_frame`]):
+//!
+//! * **A toggle mid-stream** (`none` to blur or replace while the input, or
+//!   the stages alone, are on screen) keeps sending the frames as before
+//!   until the effect is ready: the input passed through, or with stages
+//!   loaded alone and in force, the frame processed by them. A black hold
+//!   would protect nothing: the room was already shown. While the cold load
+//!   holds the instance, the stages cannot run and the input is passed
+//!   through (copied, when a frame decided for the stages finds the lock
+//!   taken: such a frame tries the `Engine` lock and never waits for it).
+//!   The first frame decided with the effect loaded is processed by it. A
+//!   toggle frame that finds the effect already installed under the lock
+//!   (the worker has not published it yet) is an effect frame: processed
+//!   by it, its failure the effect's, and the frames after it count the
+//!   effect as loaded until the worker publishes (`StreamState::toggle_found`),
+//!   so no black frame follows it. The flag moves by
+//!   [`raw_on_screen_after`].
+//! * **A start** with the effect requested (the element's first frames, and
+//!   the first after a stop) holds black until the effect is ready, so the
+//!   camera is never shown raw while an effect is in force.
+//! * **A new source** (a camera switch) while the effect is requested and
+//!   not ready holds black from its first frame: the new camera's room was
+//!   never shown.
+//! * **A failure** of the effect or of its module takes `on-failure`
+//!   (black, the image, or with `none` the input), whatever was on screen.
+//! * Once a frame has gone out black or processed by the effect, a later
+//!   state without the effect loaded (a reload for new caps, a retry after
+//!   a failure, a backend that lost its chain) holds black, never the input;
+//!   so does a repeat.
+//!
+//! A toggle from `none` always loads the effect cold on the worker, even
+//! when the backend may still hold its models (a warm reload): the
+//! `InferenceBackend` seam reports a reused model only after a load
+//! (`LoadReport::reused_model`), so the element cannot tell a warm toggle
+//! from a cold one beforehand and does not make the streaming thread wait
+//! for it.
 //!
 //! # The stages
 //!
@@ -33,10 +82,12 @@
 //! * `none` with stages passes the input through until they are loaded,
 //!   then processes every frame. Without a stage `none` makes no CUDA call.
 //! * From `none` (with or without stages) to blur or replace, the matte
-//!   loads cold: the stages alone do not count as loaded for an effect, so
-//!   the frames are black until the effect is ready and the streaming thread
-//!   never waits for that load (and under the `Engine` lock a frame decided
-//!   for an effect is black if only the stages are loaded).
+//!   loads cold: the stages alone do not count as loaded for an effect, and
+//!   the streaming thread never waits for that load (under the `Engine`
+//!   lock a frame decided for an effect is black if only the stages are
+//!   loaded). Mid-stream the frames are those of `none` until the effect is
+//!   ready (the stages' while they are loaded, else the input); at a start
+//!   or on a new source they are black (see "A toggle mid-stream" above).
 //! * Every other change (turning a stage on or off under an effect, a new
 //!   load-time parameter of a stage, blur and replace with stages, an effect
 //!   to `none` with stages) is a switch on the loaded instance, done under
@@ -100,7 +151,9 @@
 //! that saw the previous source, so camera A's person never shows in camera
 //! B's frames. A flagged frame that is not
 //! processed (passed through, or black) keeps the reset pending for the
-//! next processed one.
+//! next processed one. While a requested effect is not ready, the flagged
+//! frame and the ones after it are black, not the input (see "A toggle
+//! mid-stream" above).
 //!
 //! # A repeat
 //!
@@ -113,8 +166,9 @@
 //! temporal reset pending, that output is sent again and no effect runs:
 //! a frame generation module downstream answers a repeat with its held
 //! frame, so the work would be thrown away. Otherwise the repeat is
-//! processed as any frame; black stays black, and a repeat is never passed
-//! through as it came while an effect is asked.
+//! processed as any frame; black stays black, and a repeat is passed
+//! through as it came while an effect is asked only as any frame is: in a
+//! toggle mid-stream, before the effect is first shown (see above).
 //!
 //! The cache is written only from a processed frame (`generate_output`
 //! keeps a reference to the buffer pushed downstream), and dropped by any
@@ -193,8 +247,9 @@ use super::{STATUS_MESSAGE, has_new_source_flag, has_repeat_flag};
 use crate::background;
 use crate::cuda::{self, MAP_CUDA};
 use crate::settings::{
-    EffectFallback, EffectSettings, EffectStats, EffectStatus, FrameAction, StageStats, Target,
-    decide, fallback_unreadable, parse_effect, percentile,
+    EffectFallback, EffectSettings, EffectStats, EffectStatus, FrameAction, FrameOutput,
+    ScreenEvent, StageStats, Target, decide, decide_frame, fallback_unreadable, parse_effect,
+    percentile, raw_on_screen_after,
 };
 use crate::video::{CudaFrame, colour_of, input_context};
 
@@ -742,7 +797,13 @@ struct StreamState {
     action: FrameAction,
     /// The request the action was decided for, and its per-frame settings.
     generation: u64,
+    /// The effect the frame is decided as: the requested one, or `none`
+    /// for a toggle mid-stream (`toggle`).
     kind: EffectKind,
+    /// The frame is of a requested effect that loads, decided as `none`
+    /// because the room is on screen (see "A toggle mid-stream" in the
+    /// module docs): it never waits for the `Engine` lock.
+    toggle: bool,
     /// The parameters of each frame: the blur strength and the stages'
     /// live parameters.
     frame: Arc<FrameParams>,
@@ -761,6 +822,18 @@ struct StreamState {
     resend: bool,
     /// `render` processed this frame: its output becomes the cache.
     processed: bool,
+    /// The last frame output was the unprocessed picture: the input passed
+    /// through or copied, or processed by the stages alone. False at a
+    /// start, after a frame that went out black or processed by an effect,
+    /// and on new caps, a flush, a stop and a new source (see "A toggle
+    /// mid-stream" in the module docs).
+    raw_on_screen: bool,
+    /// A toggle frame found the effect loaded (the worker installed it
+    /// after the frame was decided, and has not published it yet) and ran
+    /// it: the generation and epoch it was decided under. While the
+    /// control's are the same the effect counts as loaded, so the frames
+    /// after it are not black until the worker publishes it.
+    toggle_found: Option<(u64, u64)>,
     /// The last processed output, while it is valid.
     cache: Option<Cached>,
     gpu: Option<GpuResources>,
@@ -1335,6 +1408,8 @@ impl ObcEffect {
         // The input copied into the output (a failed frame with nothing to
         // hide, or on-failure=none).
         let mut copied = false;
+        // The processed frame went through an effect (not the stages alone).
+        let mut effect_ran = false;
         // The input stays mapped until the stream has finished reading it.
         let mut input_frame: Option<CudaFrame> = None;
         // Every exit from here waits for the stream before the frames are
@@ -1371,14 +1446,40 @@ impl ObcEffect {
                 // chain with the effect. A frame of `none` needs a chain
                 // with something in it (a stage, or the previous effect
                 // while switching).
-                let alone = st.kind == EffectKind::None;
+                let mut alone = st.kind == EffectKind::None;
                 // The stages that failed on this frame (the backend has
                 // dropped them), whatever the frame then got.
                 let mut stage_failures: Vec<(StageId, String)> = Vec::new();
                 // The stages the temporal reset dropped, to load again.
                 let mut rebuild: Vec<StageId> = Vec::new();
-                let mut e = lock(&self.shared.engine);
-                let Engine { instance, loaded } = &mut *e;
+                // A toggle frame never waits for the worker (its cold load
+                // may hold the lock for as long as it takes): busy, it is
+                // the input, as when nothing is loaded.
+                let mut held = if st.toggle {
+                    match self.shared.engine.try_lock() {
+                        Ok(e) => Some(e),
+                        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+                        Err(std::sync::TryLockError::WouldBlock) => None,
+                    }
+                } else {
+                    Some(lock(&self.shared.engine))
+                };
+                let mut idle = Engine::default();
+                let Engine { instance, loaded } = match held.as_mut() {
+                    Some(e) => &mut **e,
+                    None => &mut idle,
+                };
+                // A toggle frame that finds the effect loaded (the worker
+                // installed it after the decision) is an effect frame: the
+                // effect runs on it, and its failure is the effect's.
+                let promoted = st.toggle
+                    && loaded
+                        .as_ref()
+                        .is_some_and(|k| k.target.kind != EffectKind::None)
+                    && instance.as_ref().is_some_and(|i| i.is_loaded());
+                if promoted {
+                    alone = false;
+                }
                 // A backend that lost its chain on its own (a module
                 // instance unloaded after a panic) runs nothing: as if
                 // unloaded since the decision.
@@ -1461,6 +1562,7 @@ impl ObcEffect {
                             && let Some(k) = loaded.as_ref()
                         {
                             ran = k.target.stages.iter().map(|(s, _)| s.clone()).collect();
+                            effect_ran = k.target.kind != EffectKind::None;
                         }
                         // SAFETY: our own stream.
                         let _ = unsafe { gpu.end.record(stream) };
@@ -1468,7 +1570,10 @@ impl ObcEffect {
                     }
                     _ => None,
                 };
-                drop(e);
+                drop(held);
+                if promoted && effect_ran {
+                    st.toggle_found = Some((st.generation, st.epoch));
+                }
                 if !rebuild.is_empty() {
                     self.rebuild_stages(&rebuild);
                 }
@@ -1530,6 +1635,15 @@ impl ObcEffect {
         // Only a processed frame is cached (`generate_output`); black or
         // the input leaves no cache behind.
         st.processed = processed;
+        // The room stays on screen after the input or the stages alone;
+        // black or an effect frame ends it.
+        let output = match (processed, effect_ran, copied) {
+            (true, true, _) => FrameOutput::Effect,
+            (true, false, _) => FrameOutput::Stages,
+            (false, _, true) => FrameOutput::Input,
+            (false, _, false) => FrameOutput::Hidden,
+        };
+        st.raw_on_screen = raw_on_screen_after(st.raw_on_screen, ScreenEvent::Output(output));
         if processed {
             self.shared.processed.fetch_add(1, Ordering::Relaxed);
             if !ran.is_empty() {
@@ -2235,6 +2349,8 @@ impl BaseTransformImpl for ObcEffect {
         st.reset_pending = false;
         st.resend = false;
         st.cache = None;
+        st.raw_on_screen = raw_on_screen_after(st.raw_on_screen, ScreenEvent::Reset);
+        st.toggle_found = None;
         Ok(())
     }
 
@@ -2265,6 +2381,8 @@ impl BaseTransformImpl for ObcEffect {
             }
             if st.caps.as_ref() != Some(incaps) {
                 st.cache = None;
+                st.raw_on_screen = raw_on_screen_after(st.raw_on_screen, ScreenEvent::Reset);
+                st.toggle_found = None;
             }
             st.info = Some(info);
             st.caps = Some(incaps.clone());
@@ -2373,6 +2491,8 @@ impl BaseTransformImpl for ObcEffect {
         let mut st = lock(&self.stream);
         if st.resend {
             // The cached output, already in `outbuf`.
+            st.raw_on_screen =
+                raw_on_screen_after(st.raw_on_screen, ScreenEvent::Output(FrameOutput::Resent));
             return Ok(gst::FlowSuccess::Ok);
         }
         if let Err(reason) = self.render(&mut st, inbuf, outbuf) {
@@ -2411,6 +2531,8 @@ impl BaseTransformImpl for ObcEffect {
             let mut st = lock(&self.stream);
             st.cache = None;
             st.resend = false;
+            st.raw_on_screen = raw_on_screen_after(st.raw_on_screen, ScreenEvent::Reset);
+            st.toggle_found = None;
         }
         self.parent_sink_event(event)
     }
@@ -2421,13 +2543,34 @@ impl ObcEffect {
     /// match, creating the CUDA objects when the frame needs them (or the
     /// stages alone need them loaded: they pass frames through until then).
     fn prepare_frame(&self, inbuf: &gst::BufferRef) {
-        let (kind, status, fallback, loaded, stages, frame, generation, epoch, fallback_frame) = {
+        // A new source's room was never shown: the hold applies to it.
+        let (raw_on_screen, toggle_found) = {
+            let mut st = lock(&self.stream);
+            let arrived = ScreenEvent::Arrived {
+                new_source: has_new_source_flag(inbuf),
+            };
+            st.raw_on_screen = raw_on_screen_after(st.raw_on_screen, arrived);
+            (st.raw_on_screen, st.toggle_found)
+        };
+        let (
+            kind,
+            status,
+            fallback,
+            loaded,
+            any_loaded,
+            stages,
+            frame,
+            generation,
+            epoch,
+            fallback_frame,
+        ) = {
             let c = lock(&self.shared.control);
             (
                 c.settings.kind,
                 c.status.clone(),
                 c.settings.fallback,
                 c.usable(),
+                c.loaded_kind.is_some(),
                 c.any_effective(),
                 Arc::clone(&c.frame),
                 c.generation,
@@ -2435,8 +2578,25 @@ impl ObcEffect {
                 c.fallback.frame.clone(),
             )
         };
-        let mut action = decide(kind, &status, fallback, loaded, stages);
-        let needs_gpu = action != FrameAction::Passthrough || (kind == EffectKind::None && stages);
+        // An effect a toggle frame found loaded and ran counts as loaded
+        // until the worker publishes something (then `usable` says it).
+        let found = toggle_found == Some((generation, epoch)) && kind != EffectKind::None;
+        let loaded = loaded || found;
+        // `shown`: what the frame is decided as, `none` for a toggle
+        // mid-stream while the effect loads (see the module docs).
+        let (mut shown, mut action) = decide_frame(
+            kind,
+            &status,
+            fallback,
+            loaded,
+            any_loaded,
+            stages,
+            raw_on_screen,
+        );
+        // The stages alone need CUDA to load, and a requested effect does
+        // (the worker loads once the streaming thread has a context).
+        let needs_gpu = action != FrameAction::Passthrough
+            || (shown == EffectKind::None && (stages || kind != EffectKind::None));
         let mut st = lock(&self.stream);
         if needs_gpu && let Err(reason) = self.ensure_gpu(&mut st, inbuf) {
             drop(st);
@@ -2452,6 +2612,7 @@ impl ObcEffect {
                 action = FrameAction::Passthrough;
             } else {
                 self.fail(generation, reason.clone());
+                shown = kind;
                 action = decide(
                     kind,
                     &EffectStatus::Failed(reason),
@@ -2484,10 +2645,18 @@ impl ObcEffect {
             && has_repeat_flag(inbuf)
             && !st.reset_pending
             && st.cache.is_some();
+        if action == FrameAction::Passthrough {
+            st.raw_on_screen =
+                raw_on_screen_after(st.raw_on_screen, ScreenEvent::Output(FrameOutput::Input));
+        }
+        if !found {
+            st.toggle_found = None;
+        }
         st.action = action;
         st.generation = generation;
         st.epoch = epoch;
-        st.kind = kind;
+        st.kind = shown;
+        st.toggle = shown != kind;
         st.frame = frame;
         st.fallback = fallback;
         st.fallback_frame = fallback_frame;

@@ -3139,23 +3139,24 @@ fn gpu_an_output_switches_effects_while_streaming() {
     );
     let c = len();
     let warm = lumas(a, b);
-    let first_black = warm.iter().position(|v| *v == 16).expect("black warm-up");
-    assert!(first_black <= 1, "at most the frame in flight: {warm:?}");
+    // A toggle mid-stream: the room is on screen already, so the source
+    // frames go on while the effect loads (no black hold), then the blur.
+    assert!(!warm.contains(&16), "no black frame: {warm:?}");
+    let first_blur = warm
+        .iter()
+        .position(|v| *v == FAKE_BLUR_Y)
+        .unwrap_or(warm.len());
     assert!(
-        warm[first_black..]
-            .iter()
-            .all(|v| *v == 16 || *v == FAKE_BLUR_Y),
-        "{warm:?}"
+        warm[..first_blur].iter().all(|v| *v == 235),
+        "the source until the blur: {warm:?}"
     );
-    if let Some(first_blur) = warm.iter().position(|v| *v == FAKE_BLUR_Y) {
-        assert!(
-            warm[first_blur..].iter().all(|v| *v == FAKE_BLUR_Y),
-            "black, then processed; never processed, then black: {warm:?}"
-        );
-    }
     assert!(
-        warm.iter().filter(|v| **v == 16).count() >= 15,
-        "the 800 ms load is about 24 black frames: {warm:?}"
+        warm[first_blur..].iter().all(|v| *v == FAKE_BLUR_Y),
+        "the source, then processed; never the source after the blur: {warm:?}"
+    );
+    assert!(
+        first_blur >= 15,
+        "the 800 ms load is about 24 source frames: {warm:?}"
     );
     assert!(
         lumas(b, c).iter().all(|v| *v == FAKE_BLUR_Y),
@@ -3217,8 +3218,12 @@ fn gpu_an_output_switches_effects_while_streaming() {
         );
     }
     assert_eq!(caps_events.load(Ordering::Relaxed), 1, "one negotiation");
-    assert!(stats.frames_processed > 20 && stats.frames_black >= 15);
-    assert!(stats.frames_passthrough > 20);
+    // The load ran with the source on screen: no frame went out black.
+    assert!(
+        stats.frames_processed > 20 && stats.frames_black == 0,
+        "{stats:?}"
+    );
+    assert!(stats.frames_passthrough > 35, "{stats:?}");
     assert_eq!(counts.queue_dropped, 0);
     assert_eq!(FakeLog::get(&fake.log.wrong_context), 0);
     assert_eq!(FakeLog::get(&fake.log.wrong_stream), 0);

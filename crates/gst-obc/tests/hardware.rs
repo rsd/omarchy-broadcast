@@ -498,6 +498,14 @@ fn get(a: &AtomicU64) -> u64 {
     FakeLog::get(a)
 }
 
+/// `seen` is `hold` frames, then at most one `then` frame: the frame decided
+/// just after the status turned may already be processed (the status is
+/// read before the frame is taken).
+fn held_then(seen: &[Seen], hold: Seen, then: Seen) -> bool {
+    let n = seen.iter().take_while(|s| **s == hold).count();
+    n + 1 >= seen.len() && seen[n..].iter().all(|s| *s == then)
+}
+
 /// A background PNG for replace.
 fn background(dir: &Path) -> std::path::PathBuf {
     // Tests call this before the rig exists, which is what inits otherwise.
@@ -547,7 +555,7 @@ fn gpu_none_passes_the_input_buffer_through_without_cuda() {
 
 #[test]
 #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
-fn gpu_switches_never_show_the_input_while_an_effect_is_requested() {
+fn gpu_a_toggle_mid_stream_keeps_the_input_until_ready_and_switches_never_show_it() {
     let dir = tempfile::tempdir().unwrap();
     let bg = background(dir.path());
     let fake = FakeFactory::new(FakeConfig {
@@ -558,7 +566,8 @@ fn gpu_switches_never_show_the_input_while_an_effect_is_requested() {
     let mut rig = Rig::new(Some(Arc::clone(&fake)), &EffectSettings::default());
     assert_eq!(rig.frame(), Seen::Input);
 
-    // none -> blur: black until the (slow) load is done, then processed.
+    // none -> blur mid-stream: the room is on screen, so the input until
+    // the (slow) load is done, never black, then processed.
     let blur = EffectSettings {
         blur_strength: 0.7,
         ..EffectSettings::of(EffectKind::Blur)
@@ -568,13 +577,7 @@ fn gpu_switches_never_show_the_input_while_an_effect_is_requested() {
     let warm = rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
     let warm_ms = t0.elapsed().as_millis();
     assert!(warm.len() >= 10, "{warm:?}");
-    // The frame decided just after the status turned ready may already be
-    // processed: the status is read before the frame is taken.
-    let black = warm.iter().take_while(|s| **s == Seen::Black).count();
-    assert!(
-        black + 1 >= warm.len() && warm[black..].iter().all(|s| *s == Seen::FakeBlur),
-        "{warm:?}"
-    );
+    assert!(held_then(&warm, Seen::Input, Seen::FakeBlur), "{warm:?}");
     assert!(warm_ms >= 750, "the load took {warm_ms} ms");
     for _ in 0..5 {
         assert_eq!(rig.frame(), Seen::FakeBlur);
@@ -623,16 +626,11 @@ fn gpu_switches_never_show_the_input_while_an_effect_is_requested() {
     }
     assert_eq!(rig.frame(), Seen::Input);
 
-    // none -> blur again: the model was unloaded, so black first.
+    // none -> blur again: the model was unloaded, a cold load; the input
+    // (on screen) until it is done.
     rig.effect.apply(&blur).unwrap();
     let again = rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
-    // The frame decided just after the status turned ready may already be
-    // processed: the status is read before the frame is taken.
-    let black = again.iter().take_while(|s| **s == Seen::Black).count();
-    assert!(
-        black + 1 >= again.len() && again[black..].iter().all(|s| *s == Seen::FakeBlur),
-        "{again:?}"
-    );
+    assert!(held_then(&again, Seen::Input, Seen::FakeBlur), "{again:?}");
     assert_eq!(rig.frame(), Seen::FakeBlur);
 
     assert_eq!(
@@ -648,7 +646,8 @@ fn gpu_switches_never_show_the_input_while_an_effect_is_requested() {
     );
     let stats = rig.effect.stats();
     assert!(stats.cuda_active);
-    assert!(stats.frames_processed > 0 && stats.frames_black > 0);
+    assert!(stats.frames_processed > 0);
+    assert_eq!(stats.frames_black, 0, "a toggle mid-stream is never black");
     assert!(stats.gpu_ms_p50.is_some() && stats.gpu_ms_p95 >= stats.gpu_ms_p50);
     assert!(stats.last_load_ms.unwrap() >= 750.0);
     rig.drain_messages();
@@ -672,6 +671,66 @@ fn gpu_switches_never_show_the_input_while_an_effect_is_requested() {
         "unload/drop without the context"
     );
     assert_eq!(get(&fake.log.creates), 1);
+}
+
+/// The hold stays where the room was never shown: a start with the effect
+/// requested, and a new source while the effect loads. A toggle mid-stream
+/// is the input until the effect is ready; a new source during it is black
+/// from that frame until the effect is ready.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_start_or_a_new_source_while_the_effect_loads_is_black() {
+    let fake = FakeFactory::new(FakeConfig {
+        load_delay: Duration::from_millis(600),
+        ..FakeConfig::default()
+    });
+    let blur = EffectSettings::of(EffectKind::Blur);
+    // A start with blur requested: black until it is ready.
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &blur);
+    let warm = rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert!(warm.len() >= 5, "{warm:?}");
+    assert!(held_then(&warm, Seen::Black, Seen::FakeBlur), "{warm:?}");
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    rig.stop();
+
+    // none, then blur mid-stream: the input; a new source while it loads:
+    // black from that frame on (its room was never shown), then the blur.
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &EffectSettings::default());
+    assert_eq!(rig.frame(), Seen::Input);
+    rig.effect.apply(&blur).unwrap();
+    assert_eq!(rig.frame(), Seen::Input, "the toggle keeps the picture");
+    assert_eq!(rig.frame(), Seen::Input);
+    assert_eq!(rig.effect.status(), EffectStatus::Loading);
+    assert_eq!(rig.frame_with(gst_obc::NEW_SOURCE_FLAG), Seen::Black);
+    let rest = rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert!(held_then(&rest, Seen::Black, Seen::FakeBlur), "{rest:?}");
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    assert!(rig.effect.stats().frames_black > 0);
+
+    // A new source under none passes through as ever; a toggle after it is
+    // the input again.
+    rig.effect.apply(&EffectSettings::default()).unwrap();
+    assert_eq!(rig.frame(), Seen::Input);
+    assert_eq!(rig.frame_with(gst_obc::NEW_SOURCE_FLAG), Seen::Input);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while get(&fake.log.unloads) == 0 {
+        assert!(Instant::now() < deadline, "no unload");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let black = rig.effect.stats().frames_black;
+    rig.effect.apply(&blur).unwrap();
+    let toggle = rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert!(
+        held_then(&toggle, Seen::Input, Seen::FakeBlur),
+        "{toggle:?}"
+    );
+    assert_eq!(
+        rig.effect.stats().frames_black,
+        black,
+        "the toggle is never black"
+    );
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
 }
 
 /// A white PNG of `width x height` for the fallback image (its NV12 in the
@@ -723,18 +782,22 @@ fn gpu_on_failure_image_shows_the_fallback_image_where_black_would_be() {
         ..EffectSettings::of(EffectKind::Blur)
     };
     rig.effect.apply(&settings).unwrap();
-    // Black until the image is decoded, then the image: never the input.
+    // The input (on screen) while the load runs, as for any toggle
+    // mid-stream; once it has failed, black until the image is decoded, then
+    // the image: never the input again.
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut hidden = false;
     loop {
         let bytes = rig.bytes_with(gst::BufferFlags::empty());
         if is_white(&bytes) && failed(&rig) {
             break;
         }
+        let seen = classify(&bytes, &rig.input_bytes);
         assert!(
-            classify(&bytes, &rig.input_bytes) == Seen::Black || is_white(&bytes),
-            "only black or the image: {:?}",
-            classify(&bytes, &rig.input_bytes)
+            seen == Seen::Black || is_white(&bytes) || (seen == Seen::Input && !hidden),
+            "only black or the image once hidden: {seen:?}",
         );
+        hidden |= seen != Seen::Input;
         assert!(Instant::now() < deadline, "the image never showed");
         std::thread::sleep(Duration::from_millis(30));
     }
@@ -863,8 +926,11 @@ fn gpu_failures_show_black_or_the_input_as_configured() {
     rig.effect
         .apply(&EffectSettings::of(EffectKind::Blur))
         .unwrap();
+    // The input (on screen) while the load runs, as for any toggle
+    // mid-stream (the failure may win the race with the first frame); the
+    // frame taken once the status says failed is already black.
     let seen = rig.frames_until(Duration::from_secs(5), failed);
-    assert!(seen.iter().all(|s| *s == Seen::Black), "{seen:?}");
+    assert!(held_then(&seen, Seen::Input, Seen::Black), "{seen:?}");
     assert_eq!(
         rig.effect.status(),
         EffectStatus::Failed("fake load failure".into())
@@ -887,8 +953,8 @@ fn gpu_failures_show_black_or_the_input_as_configured() {
         ..EffectSettings::of(EffectKind::Blur)
     };
     rig.effect.apply(&open).unwrap();
-    // Black while the retry loads; the input once it has failed (the
-    // failure may win the race with the first frame).
+    // Black while the retry loads (black is on screen); the input once it
+    // has failed (the failure may win the race with the first frame).
     let seen = rig.frames_until(Duration::from_secs(5), failed);
     assert!(
         seen.iter().all(|s| matches!(s, Seen::Black | Seen::Input)),
@@ -1218,7 +1284,8 @@ fn gpu_blur_with_a_failed_denoise_load_runs_the_blur_alone() {
     assert_eq!(rig.frame(), Seen::Input);
     rig.effect.apply(&denoised(EffectKind::Blur)).unwrap();
     let warm = rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
-    assert!(warm.iter().all(|s| *s == Seen::Black), "{warm:?}");
+    // A toggle mid-stream: the input (on screen) until the blur is ready.
+    assert!(held_then(&warm, Seen::Input, Seen::FakeBlur), "{warm:?}");
     for _ in 0..3 {
         assert_eq!(rig.frame(), Seen::FakeBlur, "the blur, without the stage");
     }
@@ -1479,7 +1546,7 @@ fn gpu_a_denoise_frame_failure_of_an_earlier_request_is_recorded() {
 
 #[test]
 #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
-fn gpu_the_green_screen_from_none_with_denoise_loads_black_without_blocking() {
+fn gpu_the_green_screen_from_none_with_denoise_loads_without_black_or_blocking() {
     let load = Duration::from_millis(800);
     let fake = FakeFactory::new(FakeConfig {
         load_delay: load,
@@ -1490,8 +1557,10 @@ fn gpu_the_green_screen_from_none_with_denoise_loads_black_without_blocking() {
     rig.frames_until(Duration::from_secs(10), denoise_is(EffectStatus::Ready));
     assert_eq!(rig.frame(), Seen::FakeDenoise);
 
-    // none + denoise -> blur + denoise: the green screen loads cold. Black,
-    // never the (denoised) input, and no frame waits for the load.
+    // none + denoise -> blur + denoise: the green screen loads cold, a
+    // toggle mid-stream. The denoised input stays on screen (the input
+    // itself once the cold load holds the instance), never black, and no
+    // frame waits for the load.
     rig.effect.apply(&denoised(EffectKind::Blur)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut seen = Vec::new();
@@ -1504,7 +1573,19 @@ fn gpu_the_green_screen_from_none_with_denoise_loads_black_without_blocking() {
         std::thread::sleep(Duration::from_millis(30));
     }
     assert!(seen.len() >= 10, "{seen:?}");
-    assert!(seen.iter().all(|s| *s == Seen::Black), "{seen:?}");
+    let held = seen
+        .iter()
+        .take_while(|s| matches!(s, Seen::FakeDenoise | Seen::Input))
+        .count();
+    assert!(
+        held + 1 >= seen.len() && seen[held..].iter().all(|s| *s == Seen::FakeBlurDenoised),
+        "{seen:?}"
+    );
+    assert!(
+        seen.contains(&Seen::Input),
+        "the instance mid-load: {seen:?}"
+    );
+    assert_eq!(rig.effect.stats().frames_black, 0, "never black");
     assert!(
         slowest < load / 2,
         "a frame waited {slowest:?} for the {load:?} load"
@@ -1907,6 +1988,7 @@ fn gpu_a_relight_load_failure_runs_the_chain_without_it() {
     let bg = background(dir.path());
     let mut rig = Rig::new(Some(Arc::clone(&fake)), &EffectSettings::default());
     assert_eq!(rig.frame(), Seen::Input);
+    let mut inputs = 1;
     for (kind, want) in [
         (EffectKind::Blur, Seen::FakeBlur),
         (EffectKind::Replace, Seen::FakeReplace),
@@ -1916,9 +1998,17 @@ fn gpu_a_relight_load_failure_runs_the_chain_without_it() {
             ..relit(kind, RelightLight::Cool)
         };
         rig.effect.apply(&settings).unwrap();
-        rig.frames_until(Duration::from_secs(10), |r| {
+        let seen = rig.frames_until(Duration::from_secs(10), |r| {
             relight_failed(r) && r.effect.status() == EffectStatus::Ready
         });
+        // The blur loads as a toggle mid-stream (the input on screen until
+        // it is ready); replace is a switch from it, never the input.
+        if kind == EffectKind::Blur {
+            assert!(held_then(&seen, Seen::Input, want), "{seen:?}");
+            inputs += seen.iter().filter(|s| **s == Seen::Input).count() as u64;
+        } else {
+            assert!(!seen.contains(&Seen::Input), "{seen:?}");
+        }
         for _ in 0..3 {
             assert_eq!(rig.frame(), want, "{kind}: the effect, without the stage");
         }
@@ -1930,8 +2020,8 @@ fn gpu_a_relight_load_failure_runs_the_chain_without_it() {
     }
     assert_eq!(
         rig.effect.stats().frames_passthrough,
-        1,
-        "only the first frame"
+        inputs,
+        "only the first frame and the toggle's"
     );
     // The stage alone: the input, with the reason; the effect never fails.
     let black = rig.effect.stats().frames_black;
@@ -2483,10 +2573,11 @@ fn gpu_a_repeat_after_a_settings_change_is_processed_never_the_cached_frame() {
     assert_eq!(get(&fake.log.wrong_context), 0);
 }
 
-/// A repeat is black wherever a fresh frame is: while the effect loads,
-/// cold after `none`, and after a failure with `on-failure=black`, even
-/// with a processed frame cached before. Under `none` it is the input,
-/// which hides nothing.
+/// A repeat is black wherever a fresh frame is: while the effect loads at
+/// a start, and after a failure with `on-failure=black`, even with a
+/// processed frame cached before. Under `none` it is the input, which hides
+/// nothing, and so is it in a toggle mid-stream from `none`, while the
+/// input is on screen.
 #[test]
 #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
 fn gpu_a_repeat_while_the_effect_loads_is_black_under_black() {
@@ -2499,17 +2590,21 @@ fn gpu_a_repeat_while_the_effect_loads_is_black_under_black() {
         &EffectSettings::of(EffectKind::Blur),
     );
     assert_eq!(rig.frame(), Seen::Black, "loading");
-    let mut repeats = 0;
+    let mut repeats = Vec::new();
     while rig.effect.status() != EffectStatus::Ready {
-        assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::Black);
-        repeats += 1;
-        assert!(repeats < 200, "the effect never loaded");
+        repeats.push(rig.frame_with(gst_obc::REPEAT_FLAG));
+        assert!(repeats.len() < 200, "the effect never loaded");
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(repeats > 0);
+    assert!(!repeats.is_empty());
+    assert!(
+        held_then(&repeats, Seen::Black, Seen::FakeBlur),
+        "{repeats:?}"
+    );
     assert_eq!(rig.frame(), Seen::FakeBlur);
     assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::FakeBlur);
-    // To `none` and back: the input, then a cold load in black.
+    // To `none` and back: the input, then a cold load as a toggle
+    // mid-stream: the room is on screen, so its repeats stay the input.
     rig.effect.apply(&EffectSettings::default()).unwrap();
     assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::Input);
     rig.effect
@@ -2519,11 +2614,13 @@ fn gpu_a_repeat_while_the_effect_loads_is_black_under_black() {
         r.effect.status() == EffectStatus::Loading
     });
     assert!(seen.iter().all(|s| *s == Seen::Input), "{seen:?}");
-    assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::Black);
+    assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::Input);
+    let mut held = Vec::new();
     while rig.effect.status() != EffectStatus::Ready {
-        assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::Black);
+        held.push(rig.frame_with(gst_obc::REPEAT_FLAG));
         std::thread::sleep(Duration::from_millis(10));
     }
+    assert!(held_then(&held, Seen::Input, Seen::FakeBlur), "{held:?}");
     // A processed frame cached, then a failure: the repeat is black.
     assert_eq!(rig.frame(), Seen::FakeBlur);
     fake.set(|c| c.fail_process = Some("fake frame failure".into()));

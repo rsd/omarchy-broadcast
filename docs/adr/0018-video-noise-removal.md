@@ -30,7 +30,7 @@
 
 ### Switching
 - `none` to `none` with noise removal: the raw image is shown until the stage is ready, because noise removal hides nothing.
-- `none`, with or without noise removal, to `blur` or `replace`: black until the green screen is ready, the privacy rule of [ADR-0012](0012-video-effects-and-maxine-backend.md), unchanged.
+- `none`, with or without noise removal, to `blur` or `replace`: black until the green screen is ready, the privacy rule of [ADR-0012](0012-video-effects-and-maxine-backend.md), unchanged. *Amendment (daemon 0.36.0): this holds at a start and on a new source. Mid-stream, with the camera picture (or the picture with noise removal) already on screen, the frames of `none` continue until the green screen is ready, the noise-removed ones while that stage is loaded and the camera's own otherwise; see the amendment to [ADR-0012](0012-video-effects-and-maxine-backend.md) of the same version.*
 - Turning noise removal on or off under a running `blur` or `replace`, and `blur` or `replace` to `none` with noise removal, is a switch on the loaded instance, of the same kind as `blur` to `replace`: the streaming thread waits for the switch, including the load of the stage's model, the last processed frame stays on screen, and no raw frame is shown.
 
 ### Failure policy: fail open

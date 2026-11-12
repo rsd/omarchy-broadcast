@@ -85,12 +85,16 @@ impl Framing {
         Framing::ALL.into_iter().find(|f| f.as_str() == s)
     }
 
-    /// The share of the crop's height the face's box takes.
+    /// The share of the crop's height the face's box takes. Tuned for a
+    /// desk, where a face is 35-45 % of the frame's height: at a 40 % face
+    /// every setting zooms past the dead zone (a zoom of about 1.087), Tight
+    /// to the cap, Medium to about 1.3, Wide to about 1.1. Wide stays at the
+    /// full frame for a face above about 41 % (0.45 / 1.087).
     pub fn face_share(self) -> f64 {
         match self {
-            Framing::Tight => 0.42,
-            Framing::Medium => 0.30,
-            Framing::Wide => 0.22,
+            Framing::Tight => 0.65,
+            Framing::Medium => 0.52,
+            Framing::Wide => 0.45,
         }
     }
 }
@@ -383,9 +387,9 @@ mod tests {
 
     #[test]
     fn the_target_frames_the_face_by_the_framing() {
-        // A face of 300 pixels: tight is at the zoom cap, medium frames it
-        // as it says, wide is the full frame.
-        let face = face(900.0, 450.0, 300.0);
+        // A face of 400 pixels: tight is at the zoom cap, medium and wide
+        // frame it as they say.
+        let face = face(900.0, 450.0, 400.0);
         let target = |framing| Framer::new(W, H, framing).target_rect(&face);
         let (tight, medium, wide) = (
             target(Framing::Tight),
@@ -397,14 +401,36 @@ mod tests {
         }
         assert!(tight.height < medium.height && medium.height < wide.height);
         assert!((tight.height - 1080.0 / MAX_ZOOM).abs() < 1e-9, "{tight:?}");
-        assert!((wide.height - 1080.0).abs() < 1e-9, "{wide:?}");
+        assert!((400.0 / wide.height - Framing::Wide.face_share()).abs() < 1e-9);
         // Medium: the face's share of the crop, centred on the face, the
         // face a little above the middle.
-        assert!((300.0 / medium.height - Framing::Medium.face_share()).abs() < 1e-9);
+        assert!((400.0 / medium.height - Framing::Medium.face_share()).abs() < 1e-9);
         assert!((medium.x + medium.width / 2.0 - 900.0).abs() < 1e-9);
         assert!(((450.0 - medium.y) / medium.height - FACE_LINE).abs() < 1e-9);
         // Capped, the face keeps its line too.
         assert!(((450.0 - tight.y) / tight.height - FACE_LINE).abs() < 1e-9);
+    }
+
+    #[test]
+    fn every_framing_zooms_past_the_dead_zone_on_a_desk_face() {
+        // Desk faces are 35-45 % of the frame's height.
+        for pct in [0.35, 0.40, 0.45] {
+            let size = H as f64 * pct;
+            let mut row = Vec::new();
+            for framing in Framing::ALL {
+                let mut f = Framer::new(W, H, framing);
+                let fc = face(960.0, 500.0, size);
+                run(&mut f, 0.0, 10.0, 30.0, Some(&fc));
+                row.push(H as f64 / f.crop().height);
+            }
+            // A 45 % face is exactly Wide's share (0.45 * 1080 / 486 = 1.0):
+            // Wide has nothing to zoom on a face that large, by design.
+            let zooming = if pct > 0.44 { &row[..2] } else { &row[..] };
+            for z in zooming {
+                assert!(*z > 1.0 + DEAD_ZONE + 1e-3, "{pct}: {row:?}");
+            }
+            assert!(row[0] >= row[1] && row[1] >= row[2], "{pct}: {row:?}");
+        }
     }
 
     #[test]
@@ -609,7 +635,7 @@ mod tests {
     #[test]
     fn a_change_of_framing_moves_to_the_new_target() {
         let mut f = Framer::new(W, H, Framing::Wide);
-        let face = face(960.0, 450.0, 220.0);
+        let face = face(960.0, 450.0, 400.0);
         f.update(0.0, Some(&face));
         let t = run(&mut f, 0.0, 10.0, 30.0, Some(&face));
         let wide = f.crop();
