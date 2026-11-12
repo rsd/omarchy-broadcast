@@ -569,6 +569,26 @@ pub trait MediaBackend: Send + 'static {
     /// nothing changed. Without a session it does nothing.
     fn set_effect(&mut self, effect: &EffectRun) -> Result<(), String>;
 
+    /// Whether the running session's effect element can drop its backend
+    /// while it streams ([`Self::revoke_effect_backend`]). Without it, the
+    /// controller drops a background effect whose module the session lost
+    /// (the camera image).
+    fn can_revoke_effect_backend(&self) -> bool;
+
+    /// The running session's effect element drops its backend instance
+    /// (the module the session started the effect with can no longer run
+    /// it): the effect fails at once, and the element shows what
+    /// `on_failure` says (black or the fallback image) until
+    /// [`Self::restore_effect_backend`]. The camera stays open. Without a
+    /// session it does nothing.
+    fn revoke_effect_backend(&mut self) -> Result<(), String>;
+
+    /// The running session's effect element takes its session's backend
+    /// again after [`Self::revoke_effect_backend`], and loads the effect
+    /// it is asked for again, with no restart. Without a session it does
+    /// nothing.
+    fn restore_effect_backend(&mut self) -> Result<(), String>;
+
     /// The running session's effect (`None`: no session).
     fn effect_report(&mut self) -> Option<EffectReport>;
 

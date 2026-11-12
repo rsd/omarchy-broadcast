@@ -130,6 +130,15 @@ pub struct ModulesConfig {
     /// `SetModuleEnabled` and the setup dialog (`config.d/50-panel.toml`).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub enabled: BTreeMap<String, bool>,
+    /// Modules forced (`true`), by module id: the conflicts their
+    /// manifests declare, or others declare with them, are not enforced
+    /// (both modules load, both stages run). For debugging and testing; a
+    /// module's required modules are enforced all the same. Video modules
+    /// only: the audio worker does not read it (`[mic] force_conflicts`
+    /// lifts its conflicts). Set per module with the key
+    /// `modules.forced.<id>` (`SetConfig`, `omarchy-broadcast config set`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub forced: BTreeMap<String, bool>,
     /// The stage order, by stage id; empty: the default order (by slot,
     /// then each stage's preferred position). An order that is not valid
     /// for the modules found is replaced by the default, with a warning.
@@ -164,6 +173,9 @@ impl ModulesConfig {
         if let Some(id) = self.enabled.keys().find(|id| !valid_module_id(id)) {
             return Err(("modules.enabled", not_a_module_id(id)));
         }
+        if let Some(id) = self.forced.keys().find(|id| !valid_module_id(id)) {
+            return Err(("modules.forced", not_a_module_id(id)));
+        }
         for (i, s) in self.order.iter().enumerate() {
             if !valid_stage_id(s) {
                 return Err(("modules.order", not_a_stage_id(s)));
@@ -190,6 +202,20 @@ impl ModulesConfig {
             .get(id)
             .copied()
             .unwrap_or_else(|| !self.disabled.iter().any(|d| d == id))
+    }
+
+    /// Whether module `id` is forced ([`Self::forced`]; not when unset).
+    pub fn is_forced(&self, id: &str) -> bool {
+        self.forced.get(id).copied().unwrap_or(false)
+    }
+
+    /// The ids of the modules forced, by id.
+    pub fn forced_ids(&self) -> Vec<String> {
+        self.forced
+            .iter()
+            .filter(|(_, on)| **on)
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// The profile of the configuration alone (`quality` when unset).
@@ -564,6 +590,27 @@ mod tests {
             ..ModulesConfig::default()
         };
         assert_eq!(bad.validate().unwrap_err().0, "modules.enabled");
+    }
+
+    #[test]
+    fn the_forced_table_is_read_and_checked() {
+        let config: ModulesConfig =
+            toml::from_str("[forced]\n\"org.x.a\" = true\n\"org.x.b\" = false\n").unwrap();
+        assert!(config.validate().is_ok());
+        assert!(config.is_forced("org.x.a"));
+        assert!(!config.is_forced("org.x.b"));
+        assert!(!config.is_forced("org.x.c"), "not forced by default");
+        assert_eq!(config.forced_ids(), ["org.x.a"]);
+        assert!(!ModulesConfig::default().is_forced("org.x.a"));
+        let bad = ModulesConfig {
+            forced: [("hello".to_string(), true)].into(),
+            ..ModulesConfig::default()
+        };
+        assert_eq!(bad.validate().unwrap_err().0, "modules.forced");
+        // A value of another type is an error.
+        assert!(toml::from_str::<ModulesConfig>("[forced]\n\"org.x.a\" = 1\n").is_err());
+        // Unknown keys are still refused.
+        assert!(toml::from_str::<ModulesConfig>("[force]\n\"org.x.a\" = true\n").is_err());
     }
 
     #[test]

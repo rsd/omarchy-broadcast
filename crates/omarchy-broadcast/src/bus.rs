@@ -319,6 +319,19 @@ pub fn require_modules(revision: u32) -> Result<(), Failure> {
     )))
 }
 
+/// Fails unless a daemon of interface revision `revision` can force a
+/// module past its conflicts (`modules.forced.<id>`).
+pub fn require_forced(revision: u32) -> Result<(), Failure> {
+    if revision >= obc_ipc::FORCED_REVISION {
+        return Ok(());
+    }
+    Err(Failure::Unsupported(format!(
+        "the daemon cannot force a module past its conflicts (its interface revision is \
+         {revision}, forcing needs {}); update omarchy-broadcastd",
+        obc_ipc::FORCED_REVISION
+    )))
+}
+
 /// Fails unless a daemon of interface revision `revision` has the
 /// microphone.
 pub fn require_mic(revision: u32) -> Result<(), Failure> {

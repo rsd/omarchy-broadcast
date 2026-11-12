@@ -10,9 +10,11 @@
 //! kind = "video-stage"
 //! library = "libobc_module_hello.so"   # absolute, or relative to this file
 //! description = "Tints the picture warm"  # optional
+//! conflicts = ["org.example.other"]     # optional: module ids
 //!
-//! [requires]                            # optional, informational
-//! hardware = ["nvidia-turing+"]
+//! [requires]                            # optional
+//! hardware = ["nvidia-turing+"]         # informational
+//! modules = ["org.example.base"]        # module ids, enforced
 //!
 //! [[stage]]
 //! id = "hello"
@@ -49,6 +51,10 @@
 //! an audio stage with `formats`, a slot (or a slot requirement) of the
 //! other kind, or a stage id against the prefix rule makes the manifest
 //! invalid.
+//!
+//! A module's `conflicts` names modules it cannot be loaded with, and
+//! `[requires] modules` modules it cannot be loaded without; the registry
+//! enforces both ([`crate::registry`]).
 //!
 //! [`Manifest::parse`] refuses unknown keys, so a typo makes the module
 //! unavailable with the parse error as the reason instead of being ignored.
@@ -444,6 +450,12 @@ pub struct Manifest {
     /// The hardware the module says it needs (informational: the probe
     /// decides).
     pub hardware: Vec<String>,
+    /// The modules it needs enabled (`[requires] modules`), by id, each
+    /// once, never itself.
+    pub requires_modules: Vec<String>,
+    /// The modules it cannot be loaded with (`conflicts`), by id, each
+    /// once, never itself.
+    pub conflicts: Vec<String>,
     /// The stages, in manifest order.
     pub stages: Vec<StageDecl>,
 }
@@ -461,6 +473,8 @@ struct RawManifest {
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
+    conflicts: Vec<String>,
+    #[serde(default)]
     requires: Option<RawRequires>,
     #[serde(default, rename = "stage")]
     stages: Vec<RawStage>,
@@ -471,6 +485,8 @@ struct RawManifest {
 struct RawRequires {
     #[serde(default)]
     hardware: Vec<String>,
+    #[serde(default)]
+    modules: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -495,6 +511,27 @@ struct RawStage {
     frame_samples: Option<Vec<u32>>,
     #[serde(default)]
     channels: Option<u32>,
+}
+
+/// The module ids of a module-level list (`conflicts`, `[requires]
+/// modules`) of module `own`: each a valid module id, never `own`, each
+/// once. `what` words the error (`conflicts with`).
+fn module_list(own: &str, what: &str, raw: Vec<String>) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    for id in raw {
+        if !valid_module_id(&id) {
+            return Err(format!(
+                "the module {what} {id:?}, which is not a module id"
+            ));
+        }
+        if id == own {
+            return Err(format!("the module {what} itself"));
+        }
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
 }
 
 fn non_empty(what: &str, v: String) -> Result<String, String> {
@@ -751,6 +788,12 @@ impl Manifest {
         if kind != ModuleKind::Analyser && stages.is_empty() {
             return Err(format!("{} module declares no stage", a_kind(kind)));
         }
+        let (hardware, requires_modules) = raw
+            .requires
+            .map(|r| (r.hardware, r.modules))
+            .unwrap_or_default();
+        let requires_modules = module_list(&raw.id, "requires the module", requires_modules)?;
+        let conflicts = module_list(&raw.id, "conflicts with", raw.conflicts)?;
         Ok(Manifest {
             path: path.to_path_buf(),
             abi: raw.abi,
@@ -761,7 +804,9 @@ impl Manifest {
             kind,
             library,
             description: raw.description.filter(|d| !d.trim().is_empty()),
-            hardware: raw.requires.map(|r| r.hardware).unwrap_or_default(),
+            hardware,
+            requires_modules,
+            conflicts,
             stages,
         })
     }
@@ -974,6 +1019,54 @@ formats = ["nv12", "i420"]
         assert!(parse(&twice).unwrap_err().contains("declared twice"));
         let missing = HELLO.replace("rank = 100\n", "");
         assert!(parse(&missing).unwrap_err().contains("rank"));
+    }
+
+    #[test]
+    fn module_conflicts_and_required_modules_parse_and_are_checked() {
+        let m = parse(HELLO).unwrap();
+        assert!(m.conflicts.is_empty());
+        assert!(m.requires_modules.is_empty());
+        let text = HELLO
+            .replace(
+                "description = \"A tint\"",
+                "description = \"A tint\"\nconflicts = [\"org.x.b\", \"org.x.a\", \"org.x.b\"]",
+            )
+            .replace(
+                "hardware = [\"any\"]",
+                "hardware = [\"any\"]\nmodules = [\"org.x.base\", \"org.x.base\"]",
+            );
+        let m = parse(&text).unwrap();
+        assert_eq!(
+            m.conflicts,
+            ["org.x.b", "org.x.a"],
+            "deduplicated, in order"
+        );
+        assert_eq!(m.requires_modules, ["org.x.base"]);
+        assert_eq!(m.hardware, ["any"]);
+        // `[requires] modules` alone, without `hardware`.
+        let m =
+            parse(&HELLO.replace("hardware = [\"any\"]", "modules = [\"org.x.base\"]")).unwrap();
+        assert!(m.hardware.is_empty());
+        assert_eq!(m.requires_modules, ["org.x.base"]);
+        let bad = |from: &str, to: &str| parse(&HELLO.replace(from, to)).unwrap_err();
+        let desc = "description = \"A tint\"";
+        let e = bad(desc, "description = \"A tint\"\nconflicts = [\"Other\"]");
+        assert!(
+            e.contains("invalid") && e.contains("not a module id"),
+            "{e}"
+        );
+        let e = bad(
+            desc,
+            "description = \"A tint\"\nconflicts = [\"org.example.hello\"]",
+        );
+        assert!(e.contains("conflicts with itself"), "{e}");
+        let e = bad(desc, "description = \"A tint\"\nconflicts = \"org.x.a\"");
+        assert!(e.contains("malformed"), "{e}");
+        let hw = "hardware = [\"any\"]";
+        let e = bad(hw, "modules = [\"hello\"]");
+        assert!(e.contains("not a module id"), "{e}");
+        let e = bad(hw, "modules = [\"org.example.hello\"]");
+        assert!(e.contains("requires the module itself"), "{e}");
     }
 
     const AUDIO: &str = r#"

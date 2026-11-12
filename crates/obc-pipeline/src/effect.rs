@@ -13,7 +13,12 @@
 //! inserts the element in passthrough, which costs no copy and no CUDA
 //! call; `none` with a stage runs the stages alone. An output built
 //! without it (`effect: None`, the default) has no element at all and
-//! cannot take an effect later.
+//! cannot take an effect later; the daemon builds every session output
+//! with it, with or without a backend
+//! ([`OutputConfig::effect_backend`](crate::OutputConfig::effect_backend)).
+//! The backend can be taken away and given back while the output runs
+//! ([`Output::revoke_effect_backend`](crate::Output::revoke_effect_backend),
+//! [`Output::set_effect_backend`](crate::Output::set_effect_backend)).
 //!
 //! The element reports the effect's state as [`EffectStatus`], each
 //! stage's as an [`EffectStatus`] of its own
@@ -41,8 +46,9 @@ use crate::pipeline::{PipelineError, names};
 
 /// The inference backend an output's effect element creates its instance
 /// with: a factory the caller provides (the daemon's comes from the module
-/// that provides the `background` stage). There is no default: an output
-/// without one has no effect element ([`crate::OutputConfig::effect_backend`]).
+/// that provides the `background` stage). There is no default: on an output
+/// without one ([`crate::OutputConfig::effect_backend`]) every effect fails
+/// with the no-backend reason.
 #[derive(Clone)]
 pub struct EffectBackend(pub Arc<dyn BackendFactory>);
 
@@ -182,6 +188,30 @@ mod tests {
                 _ => Ok(()),
             }
         }
+    }
+
+    /// The element `Output::revoke_effect_backend` and
+    /// `Output::set_effect_backend` drive: a revoked backend fails the
+    /// effect at once with the no-backend reason, and a backend set after
+    /// it re-arms the effect (loading again). No GPU: the element is never
+    /// started.
+    #[test]
+    fn a_revoked_effect_backend_fails_at_once_and_a_new_one_rearms() {
+        gst::init().unwrap();
+        let backend = EffectBackend::new(Arc::new(Strict));
+        let fx = effect_element(&EffectSettings::of(EffectKind::Blur), Some(&backend)).unwrap();
+        assert_eq!(fx.status(), EffectStatus::Loading);
+        fx.revoke_backend();
+        assert!(fx.backend_factory().is_none());
+        match fx.status() {
+            EffectStatus::Failed(r) => assert!(r.contains("no inference backend"), "{r}"),
+            s => panic!("not failed: {s}"),
+        }
+        // Idempotent.
+        fx.revoke_backend();
+        assert!(matches!(fx.status(), EffectStatus::Failed(_)));
+        fx.set_backend_factory(Some(Arc::clone(backend.factory())));
+        assert_eq!(fx.status(), EffectStatus::Loading);
     }
 
     #[test]

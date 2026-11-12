@@ -1625,6 +1625,13 @@ impl Mock {
                 "{key}: {v:?} is not one of its options"
             )));
         }
+        if let (Some(id), obc_ipc::ConfigValue::Bool(b)) =
+            (key.strip_prefix("modules.forced."), &value)
+            && let Some(m) = self.modules.iter_mut().find(|m| m.id == id)
+        {
+            m.forced = *b;
+        }
+        let row = self.config_row(&key)?;
         row.value = value;
         row.source = "config.d/50-panel.toml".into();
         self.config_changed_now(&emitter).await;
@@ -5887,6 +5894,172 @@ fn modules_and_order_list_change_and_refuse() {
             "GetStageOrderMoves()",
             "GetConfigSchema()"
         ]
+    );
+}
+
+/// `modules enable --force`, the `forced` field of the list and of `info`,
+/// and the plain enable that clears a force.
+#[test]
+fn modules_force_is_shown_set_cleared_and_refused() {
+    const ID: &str = "br.com.dias.maxine-vfx";
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    mock.with(|m| {
+        m.modules = vec![
+            obc_ipc::ModuleInfo {
+                id: ID.into(),
+                name: "NVIDIA Maxine video effects".into(),
+                version: "0.24.0".into(),
+                enabled: false,
+                status: "disabled".into(),
+                reason: "Disabled".into(),
+                ..obc_ipc::ModuleInfo::default()
+            },
+            obc_ipc::ModuleInfo {
+                id: "org.x.audio".into(),
+                name: "Audio".into(),
+                enabled: false,
+                status: "disabled".into(),
+                ..obc_ipc::ModuleInfo::default()
+            },
+        ];
+        m.config[2].rows.push(config_row(
+            &format!("modules.forced.{ID}"),
+            "Forced",
+            obc_ipc::ConfigKind::Bool,
+            obc_ipc::ConfigValue::Bool(false),
+        ));
+    });
+    // Not forced: nothing says so.
+    let out = bus.run(&["modules", "list"]);
+    assert!(!out.stdout.contains("forced"), "{}", out.stdout);
+    let out = bus.run(&["modules", "list", "--json"]);
+    let lines = json_lines(&out.stdout);
+    assert_eq!(lines[1]["module"]["forced"], false);
+    mock.take_calls();
+
+    let out = bus.run(&["modules", "enable", ID, "--force"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert!(
+        out.stdout.contains(&format!(
+            "Forced: conflicts are not enforced (modules.forced.{ID})\n"
+        )),
+        "{}",
+        out.stdout
+    );
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "GetModules()",
+            format!("SetConfig(modules.forced.{ID}, Some(Bool(true)))").as_str(),
+            &format!("SetModuleEnabled({ID}, true)"),
+            "GetModules()",
+            "GetConfigSchema()"
+        ]
+    );
+    let out = bus.run(&["modules", "list"]);
+    assert!(
+        out.stdout.contains("available forced\n"),
+        "list: {}",
+        out.stdout
+    );
+    let out = bus.run(&["modules", "list", "--json"]);
+    assert_eq!(json_lines(&out.stdout)[1]["module"]["forced"], true);
+    let out = bus.run(&["modules", "info", ID, "--json"]);
+    assert_eq!(json_line(&out.stdout)["module"]["forced"], true);
+    let out = bus.run(&["modules", "info", ID]);
+    assert!(
+        out.stdout.contains(&format!(
+            "Forced: conflicts are not enforced (modules.forced.{ID})\n"
+        )),
+        "{}",
+        out.stdout
+    );
+
+    // Disable leaves the force alone.
+    mock.take_calls();
+    let out = bus.run(&["modules", "disable", ID]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert_eq!(
+        mock.take_calls(),
+        [
+            &format!("SetModuleEnabled({ID}, false)")[..],
+            "GetModules()",
+            "GetConfigSchema()"
+        ]
+    );
+
+    // A plain enable clears the force.
+    let out = bus.run(&["modules", "enable", ID]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert!(!out.stdout.contains("Forced:"), "{}", out.stdout);
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "GetModules()",
+            &format!("SetModuleEnabled({ID}, true)")[..],
+            &format!("SetConfig(modules.forced.{ID}, Some(Bool(false)))"),
+            "GetModules()",
+            "GetConfigSchema()"
+        ]
+    );
+
+    // A plain enable of a module that is not forced writes no config.
+    let out = bus.run(&["modules", "enable", ID]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "GetModules()",
+            &format!("SetModuleEnabled({ID}, true)")[..],
+            "GetModules()",
+            "GetConfigSchema()"
+        ]
+    );
+
+    // The daemon refuses the key (an audio module has none): its error, the
+    // exit code of a refused `config set`.
+    let refused = bus.run(&["config", "set", "modules.forced.org.x.audio", "true"]);
+    let out = bus.run(&["modules", "enable", "org.x.audio", "--force"]);
+    assert_ne!(out.status.code(), Some(0), "{}", out.stdout);
+    assert_eq!(out.status.code(), refused.status.code(), "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("No configuration key modules.forced.org.x.audio"),
+        "{}",
+        out.stderr
+    );
+    // Refused, so nothing changed: the module is still disabled.
+    let list = bus.run(&["modules", "info", "org.x.audio", "--json"]);
+    assert_eq!(
+        json_line(&list.stdout)["module"]["enabled"],
+        false,
+        "{}",
+        list.stdout
+    );
+    assert!(
+        !mock
+            .take_calls()
+            .iter()
+            .any(|c| c == "SetModuleEnabled(org.x.audio, true)"),
+        "enabled despite the refusal"
+    );
+
+    // A module the list says is audio is refused before any call.
+    mock.with(|m| m.modules[1].kind = "audio-filter".into());
+    mock.take_calls();
+    let out = bus.run(&["modules", "enable", "org.x.audio", "--force"]);
+    assert_ne!(out.status.code(), Some(0), "{}", out.stdout);
+    assert!(
+        out.stderr.contains("[mic] force_conflicts"),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        mock.take_calls()
+            .iter()
+            .all(|c| c == "GetModules()" || c == "GetConfigSchema()"),
+        "a change was sent"
     );
 }
 

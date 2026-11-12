@@ -23,6 +23,20 @@
 //! but a stage whose module is disabled meanwhile (or can no longer run
 //! it) is turned off in it, and turned on again once its module can.
 //!
+//! Module conflicts and requirements (the registry's rules) decide which
+//! enabled modules are opened: a refused one is listed with its reason and
+//! never opened, and one refused after it was opened is closed. Stage
+//! conflicts turn off, in a session, the losing stage of two that are both
+//! switched on ([`Modules::stage_on`]): the feed streams on without it, as
+//! without a stage no module provides. `[modules.forced]` lifts both kinds
+//! of conflict for the modules it names (debugging and testing).
+//!
+//! A refusal never takes the background effect from a running session:
+//! the module a session runs the effect from ([`Modules::hold`]) is kept
+//! open and able to run its stages until that session ends, its refusal
+//! applying at the next start as a pin does (`GetModules` lists it refused
+//! meanwhile, and `Warning` says so: [`Modules::held_refusal`]).
+//!
 //! The opening of libraries goes through the media backend
 //! ([`MediaBackend::open_module`]), so the controller's tests describe
 //! modules without a library.
@@ -59,11 +73,16 @@ pub const REASON_DISABLED: &str = "Disabled";
 /// ([`Modules::absent_reason`]).
 pub const REASON_NOT_INSTALLED: &str = "No installed module provides it";
 
+/// The words before the winner's label of a stage a stage conflict turns
+/// off ([`Modules::conflict_reason`]).
+pub const REASON_CONFLICT: &str = "Cannot run together with";
+
 /// The longest reason [`Modules::absent_reason`] gives, in bytes.
 pub const ABSENT_REASON_MAX: usize = 120;
 
-/// The longest module name [`Modules::absent_reason`] gives, in bytes.
-pub const NAME_MAX: usize = 64;
+/// The longest module name [`Modules::absent_reason`] gives, in bytes (as
+/// the registry's reasons do).
+pub const NAME_MAX: usize = obc_module_host::registry::NAME_MAX;
 
 /// What the daemon knows of an opened module.
 #[derive(Debug, Clone)]
@@ -124,6 +143,13 @@ pub struct Modules {
     /// crash and a reload, so that a stage whose module is not open now is
     /// still known to be selected ([`Modules::switch_of`]).
     switches: BTreeMap<StageId, SettingDesc>,
+    /// The stages of the session's plan a stage conflict turns off, with
+    /// why ([`Modules::follow_switches`]): what `GetModules` lists for
+    /// them.
+    excluded: BTreeMap<StageId, String>,
+    /// The module the running session runs the background effect from
+    /// ([`Modules::hold`]): a refusal does not close it.
+    held: Option<String>,
 }
 
 impl std::fmt::Debug for Modules {
@@ -396,6 +422,8 @@ impl Modules {
             serial: 1,
             listed: (Vec::new(), Vec::new()),
             switches: BTreeMap::new(),
+            excluded: BTreeMap::new(),
+            held: None,
         }
     }
 
@@ -466,7 +494,14 @@ impl Modules {
         self.apply_enabled(config);
         for id in self.registry.ids() {
             match before.remove(&id) {
-                Some(o) if self.unchanged(config, &id, &o) => self.keep(backend, &id, o),
+                // A refused module is not kept, but for the running
+                // session's background effect.
+                Some(o)
+                    if self.unchanged(config, &id, &o)
+                        && (!self.registry.is_refused(&id) || self.is_held(&id)) =>
+                {
+                    self.keep(backend, &id, o)
+                }
                 _ => self.open(backend, config, &id),
             }
         }
@@ -484,8 +519,14 @@ impl Modules {
     }
 
     /// Sets each module enabled or disabled: by the crash ledger, then the
-    /// configuration (`[modules] enabled` over `disabled`).
+    /// configuration (`[modules] enabled` over `disabled`); the modules
+    /// forced (`[modules.forced]`), the profile and the pins (which module
+    /// gives the cut-out decides which side of a module conflict is
+    /// refused): all that decides which modules are refused, before any is
+    /// opened.
     fn apply_enabled(&mut self, config: &Config) {
+        self.registry.set_forced(config.modules.forced_ids());
+        self.apply_pins(config);
         for id in self.registry.ids() {
             let crashed = self
                 .ledger
@@ -506,7 +547,7 @@ impl Modules {
     }
 
     /// What module `id` would be opened from now, if it is enabled and
-    /// loadable.
+    /// loadable (refused or not).
     fn opened_from(&self, config: &Config, id: &str) -> Option<OpenedFrom> {
         if !self.registry.is_enabled(id) {
             return None;
@@ -550,10 +591,26 @@ impl Modules {
         }
     }
 
-    /// Opens and probes module `id` if it is enabled, loadable and not open
-    /// yet. Its code runs under the crash ledger's marker.
+    /// Opens and probes module `id` if it is enabled, loadable, not
+    /// refused (a module conflict or requirement) and not open yet. Its
+    /// code runs under the crash ledger's marker.
+    ///
+    /// The module the running session keeps ([`Self::hold`]) is opened
+    /// refused or not (a reload that changed it gives the session a
+    /// provider again); one in a module conflict with it is not opened
+    /// while it is held, so that two conflicting libraries never run in
+    /// one process: it is opened when the hold ends.
     fn open<B: MediaBackend>(&mut self, backend: &mut B, config: &Config, id: &str) {
-        if !self.registry.is_enabled(id) || self.opened.contains_key(id) {
+        if !self.registry.is_enabled(id)
+            || (self.registry.is_refused(id) && !self.is_held(id))
+            || self.opened.contains_key(id)
+        {
+            return;
+        }
+        if let Some(held) = self.held.as_deref()
+            && self.registry.conflict_between(held, id)
+        {
+            debug!("module {id} is not opened while the session keeps {held}");
             return;
         }
         let Some(entry) = self.registry.entry(id).cloned() else {
@@ -597,16 +654,7 @@ impl Modules {
     /// one, with a warning. The serial moves when what `GetModules` lists
     /// (the stages `selected`, among them) or the order changed.
     pub fn apply_choices(&mut self, config: &Config) {
-        self.registry
-            .set_profile(profile_of(config.modules.profile_or_default()));
-        for stage in self.registry.pins().keys().cloned().collect::<Vec<_>>() {
-            self.registry.set_pin(stage, None);
-        }
-        for (stage, module) in config.modules.pins() {
-            if let Ok(s) = StageId::new(stage) {
-                self.registry.set_pin(s, Some(module));
-            }
-        }
+        self.apply_pins(config);
         self.registry.reset_order();
         let stored = &config.modules.order;
         if !stored.is_empty() {
@@ -619,6 +667,38 @@ impl Modules {
             }
         }
         self.bump();
+    }
+
+    /// The profile and the pins of `config` in force (the stage order
+    /// apart).
+    fn apply_pins(&mut self, config: &Config) {
+        self.registry
+            .set_profile(profile_of(config.modules.profile_or_default()));
+        let pins: BTreeMap<StageId, String> = config
+            .modules
+            .pins()
+            .into_iter()
+            .filter_map(|(stage, module)| Some((StageId::new(stage).ok()?, module)))
+            .collect();
+        if *self.registry.pins() == pins {
+            return;
+        }
+        for stage in self.registry.pins().keys().cloned().collect::<Vec<_>>() {
+            self.registry.set_pin(stage, None);
+        }
+        for (stage, module) in pins {
+            self.registry.set_pin(stage, Some(module));
+        }
+    }
+
+    /// [`Self::apply_choices`], then the module rules followed
+    /// ([`Self::settle`]): the profile and the pins decide which side of a
+    /// module conflict gives the cut-out, and so is kept.
+    pub fn apply_choices_settled<B: MediaBackend>(&mut self, backend: &mut B, config: &Config) {
+        self.apply_choices(config);
+        if self.settle(backend, config) {
+            self.apply_choices(config);
+        }
     }
 
     /// Probes every opened module again, after reopening them all when the
@@ -683,9 +763,141 @@ impl Modules {
             self.opened.remove(id);
             was
         };
+        // Another module may be refused, or no longer, now.
+        let _ = self.settle(backend, config);
         self.apply_choices(config);
         self.bump();
         Ok(changed)
+    }
+
+    /// Follows the module rules after what they depend on changed (a
+    /// module enabled or disabled, the forced set, the profile, the pins):
+    /// a module refused now is closed (a session that runs it holds its
+    /// own reference, and its stages turn off there), but the one the
+    /// running session runs the background effect from ([`Self::hold`]);
+    /// an enabled one that is not refused and was not tried since it was
+    /// last closed is opened, once (one that failed to open is not opened
+    /// again here; one refused meanwhile is, once its refusal is lifted).
+    /// Whether a module was opened or closed.
+    fn settle<B: MediaBackend>(&mut self, backend: &mut B, config: &Config) -> bool {
+        let mut changed = false;
+        for id in self.registry.ids() {
+            if self.registry.is_refused(&id) {
+                if self.is_held(&id) {
+                    continue;
+                }
+                if self.opened.remove(&id).is_some() {
+                    info!(
+                        "module {id} closed: {}",
+                        self.registry
+                            .status(&id)
+                            .map(|s| s.reason().to_string())
+                            .unwrap_or_default()
+                    );
+                    changed = true;
+                }
+                // A failure to open it is forgotten too: it is tried once
+                // its refusal is lifted.
+                let _ = self.registry.close(&id);
+            } else if self.registry.is_enabled(&id) && !self.registry.tried(&id) {
+                self.open(backend, config, &id);
+                changed |= self.registry.tried(&id);
+            }
+        }
+        changed
+    }
+
+    /// The module the running session keeps ([`Self::hold`]).
+    #[cfg(test)]
+    pub fn held(&self) -> Option<&str> {
+        self.held.as_deref()
+    }
+
+    /// Whether module `id` is open (opened and probed, not closed since).
+    #[cfg(test)]
+    pub fn is_open(&self, id: &str) -> bool {
+        self.opened.contains_key(id)
+    }
+
+    /// Whether module `id` is the one the running session runs the
+    /// background effect from ([`Self::hold`]).
+    fn is_held(&self, id: &str) -> bool {
+        self.held.as_deref() == Some(id)
+    }
+
+    /// The running session runs the background effect from `module`
+    /// (`None`: no session, or none runs it). A refusal arriving while it
+    /// runs does not close that module, which stays able to run its stages
+    /// ([`Self::able`]) until the session ends: the refusal applies at the
+    /// next start, as a pin does, so it never turns the effect into the
+    /// raw picture. A module in a conflict with it is not opened meanwhile
+    /// ([`Self::open`]). When the hold ends, the module held before is
+    /// closed if it is refused, and the module rules are followed
+    /// ([`Self::settle`]: the side kept is opened now). Whether a module
+    /// was opened or closed.
+    pub fn hold<B: MediaBackend>(
+        &mut self,
+        backend: &mut B,
+        config: &Config,
+        module: Option<&str>,
+    ) -> bool {
+        if self.held.as_deref() == module {
+            return false;
+        }
+        let Some(id) = std::mem::replace(&mut self.held, module.map(str::to_string)) else {
+            return false;
+        };
+        let mut changed = false;
+        if self.registry.is_refused(&id) {
+            if self.opened.remove(&id).is_some() {
+                info!("module {id} closed: the session that kept it ended");
+                changed = true;
+            }
+            let _ = self.registry.close(&id);
+        }
+        if self.settle(backend, config) {
+            self.apply_choices(config);
+            changed = true;
+        }
+        if changed {
+            self.bump();
+        }
+        changed
+    }
+
+    /// The module the running session keeps although it is refused
+    /// ([`Self::hold`]): its name and why it is refused.
+    pub fn held_refusal(&self) -> Option<(String, String)> {
+        let id = self.held.as_deref()?;
+        if !self.registry.is_refused(id) {
+            return None;
+        }
+        let why = self.registry.status(id)?.reason().to_string();
+        Some((self.name_of(id), why))
+    }
+
+    /// The modules forced by `config` (`[modules.forced]`) put in force:
+    /// the conflicts they lift or bring back open or close modules
+    /// ([`Self::settle`]). Whether that changed the forced set.
+    pub fn apply_forced<B: MediaBackend>(&mut self, backend: &mut B, config: &Config) -> bool {
+        let forced = config.modules.forced_ids();
+        let now: Vec<String> = self
+            .registry
+            .ids()
+            .into_iter()
+            .filter(|id| self.registry.is_forced(id))
+            .collect();
+        let installed: Vec<String> = forced
+            .iter()
+            .filter(|id| self.registry.entry(id).is_some())
+            .cloned()
+            .collect();
+        let changed = installed != now;
+        self.registry.set_forced(forced);
+        let _ = self.settle(backend, config);
+        self.apply_choices(config);
+        self.bump();
+        changed
     }
 
     fn ledger_begin(&mut self, id: &str) {
@@ -784,7 +996,9 @@ impl Modules {
         self.registry.entry(id).is_some()
     }
 
-    /// The `GetModules` list.
+    /// The `GetModules` list: a module forced says so, and the stage a
+    /// stage conflict turns off ([`Self::follow_switches`]) is unavailable
+    /// in its provider, with why.
     pub fn info(&self) -> Vec<obc_ipc::ModuleInfo> {
         self.registry
             .modules()
@@ -806,17 +1020,23 @@ impl Modules {
                     enabled: m.enabled,
                     status: m.status.as_str().into(),
                     reason: m.status.reason().into(),
+                    forced: m.forced,
                     stages: m
                         .stages
                         .iter()
-                        .map(|s| obc_ipc::StageInfo {
-                            id: s.id.to_string(),
-                            slot: s.slot.as_str().into(),
-                            rank: s.rank,
-                            device: s.device.as_str().into(),
-                            available: s.available,
-                            reason: s.reason.clone(),
-                            selected: s.selected,
+                        .map(|s| {
+                            // The provider's stage a conflict turns off
+                            // cannot run, and says why.
+                            let lost = s.selected.then(|| self.excluded.get(&s.id)).flatten();
+                            obc_ipc::StageInfo {
+                                id: s.id.to_string(),
+                                slot: s.slot.as_str().into(),
+                                rank: s.rank,
+                                device: s.device.as_str().into(),
+                                available: s.available && lost.is_none(),
+                                reason: lost.cloned().unwrap_or_else(|| s.reason.clone()),
+                                selected: s.selected,
+                            }
                         })
                         .collect(),
                 }
@@ -866,13 +1086,17 @@ impl Modules {
             .find_map(|(m, d)| d.setting(id).map(|s| (m, s)))
     }
 
-    /// Whether an enabled, opened module declares `stage`.
+    /// Whether an enabled, opened module that is not refused declares
+    /// `stage` (one a session keeps although it is refused, [`Self::hold`],
+    /// is in no new plan).
     pub fn declares(&self, stage: &str) -> Option<&str> {
         self.described().map(|(id, _)| id).find(|id| {
-            self.registry
-                .entry(id)
-                .and_then(|e| e.manifest.as_ref().ok())
-                .is_some_and(|m| m.stage(stage).is_some())
+            !self.registry.is_refused(id)
+                && self
+                    .registry
+                    .entry(id)
+                    .and_then(|e| e.manifest.as_ref().ok())
+                    .is_some_and(|m| m.stage(stage).is_some())
         })
     }
 
@@ -894,7 +1118,16 @@ impl Modules {
     /// profile would choose for it: enabled and available, with the stage
     /// available in it. A running session keeps a stage of its own module
     /// while this holds (a pin or the profile applies at the next start).
+    ///
+    /// The module the running session keeps although it is refused since
+    /// ([`Self::hold`]) can run what its probe said it could.
     pub fn able(&self, module: &str, stage: &str) -> bool {
+        if self.is_held(module) && self.registry.is_refused(module) {
+            return self
+                .registry
+                .probed(module, stage)
+                .is_some_and(|a| a.is_installed());
+        }
         self.registry.status(module) == Some(ModuleStatus::Available)
             && self
                 .registry
@@ -1112,7 +1345,24 @@ impl Modules {
     /// when the module gives it none), and the stage can run now. Frame
     /// generation has no switch: in a plan only when it is wanted, it is on
     /// while it can run.
+    ///
+    /// A stage that loses a stage conflict with another one that is on
+    /// ([`Self::losers`]) is off: the feed streams on without it.
     pub fn stage_on(
+        &self,
+        plan: &Plan,
+        config: &Config,
+        runtime: &RuntimeState,
+        stage: &StageId,
+    ) -> bool {
+        self.switched(plan, config, runtime, stage)
+            && (stage.as_str() == FRAME_GENERATION
+                || !self.losers(plan, config, runtime).contains_key(stage))
+    }
+
+    /// [`Self::stage_on`] without the stage conflicts: the switch, and
+    /// whether the stage can run now.
+    fn switched(
         &self,
         plan: &Plan,
         config: &Config,
@@ -1140,6 +1390,127 @@ impl Modules {
 
     fn provider_in<'a>(&self, plan: &'a Plan, stage: &StageId) -> Option<&'a str> {
         plan.provider(stage)
+    }
+
+    /// The stages of `plan` switched on (before the stage conflicts), in
+    /// the stage order: the background effect when its mode is not `none`
+    /// and the plan's module can run it, every other stage as
+    /// [`Self::stage_on`] reads its switch. Frame generation is in no
+    /// order, and in no conflict.
+    pub fn switched_on(
+        &self,
+        plan: &Plan,
+        config: &Config,
+        runtime: &RuntimeState,
+    ) -> Vec<StageId> {
+        let background = runtime.effect_over(&config.effect).mode != obc_core::EffectMode::None
+            && plan
+                .provider(&StageId::BACKGROUND)
+                .is_some_and(|m| self.able(m, StageId::BACKGROUND.as_str()));
+        self.order()
+            .into_iter()
+            .filter(|s| {
+                if *s == StageId::BACKGROUND {
+                    background
+                } else {
+                    plan.provider(s).is_some() && self.switched(plan, config, runtime, s)
+                }
+            })
+            .collect()
+    }
+
+    /// Whether the module of `plan` for `stage` is forced: its conflicts
+    /// are not enforced.
+    fn forced_in(&self, plan: &Plan, stage: &StageId) -> bool {
+        plan.provider(stage)
+            .is_some_and(|m| self.registry.is_forced(m))
+    }
+
+    /// The stages of `plan` a stage conflict turns off, each with the
+    /// stage that wins over it ([`Registry::excluded`] over
+    /// [`Self::switched_on`]; not for a forced module).
+    pub fn losers(
+        &self,
+        plan: &Plan,
+        config: &Config,
+        runtime: &RuntimeState,
+    ) -> BTreeMap<StageId, StageId> {
+        let on = self.switched_on(plan, config, runtime);
+        if on.len() < 2 {
+            return BTreeMap::new();
+        }
+        self.registry.excluded(&on, |s| self.forced_in(plan, s))
+    }
+
+    /// The stage conflicts of `plan` a forced module lets through: the
+    /// pairs both on (switched on, able to run, and turned off by no other
+    /// conflict), the earlier in the order first
+    /// ([`Registry::forced_stage_conflicts`]).
+    pub fn forced_stage_conflicts(
+        &self,
+        plan: &Plan,
+        config: &Config,
+        runtime: &RuntimeState,
+    ) -> Vec<(StageId, StageId)> {
+        let losers = self.losers(plan, config, runtime);
+        let mut on = self.switched_on(plan, config, runtime);
+        on.retain(|s| !losers.contains_key(s));
+        self.registry
+            .forced_stage_conflicts(&on, |s| self.forced_in(plan, s))
+    }
+
+    /// The module conflicts a forced module lets through, by module id
+    /// ([`Registry::forced_module_conflicts`]).
+    pub fn forced_module_conflicts(&self) -> Vec<(String, String)> {
+        self.registry.forced_module_conflicts()
+    }
+
+    /// The label of `stage` in a conflict's text: `effect <mode>` for the
+    /// background effect, else [`Self::stage_label`], made safe to show and
+    /// bounded.
+    pub fn conflict_label(
+        &self,
+        stage: &StageId,
+        config: &Config,
+        runtime: &RuntimeState,
+    ) -> String {
+        if *stage == StageId::BACKGROUND {
+            return format!("effect {}", runtime.effect_over(&config.effect).mode);
+        }
+        crate::settings::sanitise(
+            &self.stage_label(stage.as_str()),
+            obc_module_host::settings::LABEL_MAX,
+        )
+    }
+
+    /// Why a stage that loses a stage conflict to `winner` is off:
+    /// [`REASON_CONFLICT`] and the winner's label.
+    pub fn conflict_reason(
+        &self,
+        winner: &StageId,
+        config: &Config,
+        runtime: &RuntimeState,
+    ) -> String {
+        format!(
+            "{REASON_CONFLICT} {}",
+            self.conflict_label(winner, config, runtime)
+        )
+    }
+
+    /// Follows the switches of the session's `plan` (the running one's, or
+    /// the one a session would start with): the stages a stage conflict
+    /// turns off are what `GetModules` lists unavailable; the serial moves
+    /// when that changed.
+    pub fn follow_switches(&mut self, plan: &Plan, config: &Config, runtime: &RuntimeState) {
+        let excluded: BTreeMap<StageId, String> = self
+            .losers(plan, config, runtime)
+            .into_iter()
+            .map(|(loser, winner)| (loser, self.conflict_reason(&winner, config, runtime)))
+            .collect();
+        if excluded != self.excluded {
+            self.excluded = excluded;
+            self.bump();
+        }
     }
 
     /// The request of the session's `stage`: on or off, with its parameters

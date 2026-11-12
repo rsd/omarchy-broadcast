@@ -62,6 +62,10 @@ pub enum ModulesAction {
     Enable {
         /// The module id.
         id: String,
+        /// Do not enforce the module's declared conflicts (for debugging and
+        /// testing); the daemon shows a Warning while this is in effect.
+        #[arg(long)]
+        force: bool,
     },
     /// Disable a module (from the next camera start).
     Disable {
@@ -198,13 +202,14 @@ pub fn list_text(list: &ModuleList, profile: &str, over: &Overrides) -> String {
     let mut out = format!("Profile: {}{}\n", printable(profile), set_by(&over.profile));
     for m in &list.modules {
         out.push_str(&format!(
-            "{}  {} {}  {}{}{}\n",
+            "{}  {} {}  {}{}{}{}\n",
             printable(&m.id),
             printable(&m.name),
             printable(&m.version),
             status_text(m),
             if m.enabled { "" } else { " (disabled)" },
-            set_by(over.enabled_of(&m.id))
+            set_by(over.enabled_of(&m.id)),
+            if m.forced { " forced" } else { "" }
         ));
         stage_lines(m, &mut out);
     }
@@ -230,6 +235,12 @@ pub fn info_text(m: &ModuleInfo, over: &Overrides) -> String {
     row("Enabled:", if m.enabled { "yes" } else { "no" });
     row("Set by:", over.enabled_of(&m.id));
     row("Status:", &status_text(m));
+    if m.forced {
+        out.push_str(&format!(
+            "Forced: conflicts are not enforced (modules.forced.{})\n",
+            printable(&m.id)
+        ));
+    }
     out.push_str("Stages:\n");
     stage_lines(m, &mut out);
     out
@@ -301,6 +312,7 @@ struct ModuleJson<'a> {
     library: std::borrow::Cow<'a, str>,
     manifest: std::borrow::Cow<'a, str>,
     enabled: bool,
+    forced: bool,
     status: std::borrow::Cow<'a, str>,
     reason: std::borrow::Cow<'a, str>,
     stages: Vec<StageJson<'a>>,
@@ -353,6 +365,7 @@ fn module_json<'a>(m: &'a ModuleInfo, overridden_by: &'a str) -> ModuleJson<'a> 
         library: clip_start(&m.library, MAX_PATH_BYTES),
         manifest: clip_start(&m.manifest, MAX_PATH_BYTES),
         enabled: m.enabled,
+        forced: m.forced,
         status: clip(&m.status, MAX_STAGE_FIELD_BYTES),
         reason: clip(&m.reason, MAX_REASON_BYTES),
         stages: m
@@ -590,7 +603,46 @@ async fn change_modules(action: &ModulesAction) -> u8 {
             .map_err(|e| bus::classify(&e, true))?;
         bus::require_modules(revision)?;
         let reply = match action {
-            ModulesAction::Enable { id } => proxy.set_module_enabled(id, true).await,
+            ModulesAction::Enable { id, force } => {
+                if *force {
+                    bus::require_forced(revision)?;
+                }
+                // Read before the change: a plain enable clears a force that
+                // is in effect, and writes nothing when there is none.
+                let found = if *force || revision >= obc_ipc::FORCED_REVISION {
+                    bus::modules(&conn).await?.find(id).cloned()
+                } else {
+                    None
+                };
+                if *force && found.as_ref().is_some_and(|m| m.kind == "audio-filter") {
+                    return Err(Failure::Rejected(IpcError::InvalidArgument(format!(
+                        "{id} is an audio module: it cannot be forced; its conflicts are \
+                         set by [mic] force_conflicts"
+                    ))));
+                }
+                let was_forced = found.is_some_and(|m| m.forced);
+                let key = format!("modules.forced.{id}");
+                let set_force = |on: bool| {
+                    let (proxy, key) = (&proxy, &key);
+                    async move {
+                        proxy
+                            .set_config_value(key, &obc_ipc::ConfigValue::Bool(on))
+                            .await
+                    }
+                };
+                if *force {
+                    // The force first: a refusal changes nothing.
+                    set_force(true).await.map_err(bus::classify_ipc)?;
+                }
+                let reply = proxy.set_module_enabled(id, true).await;
+                if *force && reply.is_err() {
+                    // Enabling failed: take the force back (best effort).
+                    let _ = set_force(false).await;
+                } else if !*force && was_forced && reply.is_ok() {
+                    set_force(false).await.map_err(bus::classify_ipc)?;
+                }
+                reply
+            }
             ModulesAction::Disable { id } => proxy.set_module_enabled(id, false).await,
             ModulesAction::Profile { profile: Some(p) } => proxy.set_backend_profile(p).await,
             ModulesAction::Pin {
@@ -614,7 +666,7 @@ async fn change_modules(action: &ModulesAction) -> u8 {
     match res {
         Ok((list, profile, over)) => {
             let text = match action {
-                ModulesAction::Enable { id } | ModulesAction::Disable { id } => {
+                ModulesAction::Enable { id, .. } | ModulesAction::Disable { id } => {
                     list.find(id).map_or_else(
                         || list_text(&list, &profile, &over),
                         |m| info_text(m, &over),
@@ -792,6 +844,32 @@ mod tests {
         );
         let info = info_text(&list.modules[0], &over);
         assert!(info.contains("Set by:      config.d/90-x.toml\n"), "{info}");
+    }
+
+    #[test]
+    fn a_forced_module_says_so_in_text_and_json() {
+        let mut m = maxine();
+        let none = Overrides::default();
+        let list = |m: &ModuleInfo| ModuleList {
+            serial: 1,
+            modules: vec![m.clone()],
+        };
+        assert!(!list_text(&list(&m), "quality", &none).contains("forced"));
+        assert!(!info_text(&m, &none).contains("Forced:"));
+        let v: serde_json::Value = serde_json::from_str(&module_line(1, 0, 1, &m, "")).unwrap();
+        assert_eq!(v["module"]["forced"], false);
+        m.forced = true;
+        let text = list_text(&list(&m), "quality", &none);
+        assert!(text.contains("  available forced\n"), "{text}");
+        let info = info_text(&m, &none);
+        assert!(
+            info.contains(
+                "Forced: conflicts are not enforced (modules.forced.br.com.dias.maxine-vfx)\n"
+            ),
+            "{info}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&module_line(1, 0, 1, &m, "")).unwrap();
+        assert_eq!(v["module"]["forced"], true);
     }
 
     #[test]

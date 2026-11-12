@@ -55,6 +55,12 @@
 //!   never shown.
 //! * **A failure** of the effect or of its module takes `on-failure`
 //!   (black, the image, or with `none` the input), whatever was on screen.
+//!   A revoked backend (`ObcEffect::revoke_backend`) is such a failure,
+//!   from the next frame decided: its status is failed, so no toggle
+//!   applies, and its new request number and epoch end any effect a
+//!   toggle frame found. The worker drops its instance before anything
+//!   else (`drop_revoked`), so neither a warm switch nor a re-armed load
+//!   reuses it.
 //! * Once a frame has gone out black or processed by the effect, a later
 //!   state without the effect loaded (a reload for new caps, a retry after
 //!   a failure, a backend that lost its chain) holds black, never the input;
@@ -344,6 +350,10 @@ struct FallbackCtl {
 struct Engine {
     instance: Option<Box<dyn InferenceBackend>>,
     loaded: Option<LoadedKey>,
+    /// `Control::revocations` when the instance was created: an instance
+    /// of an earlier count belongs to a revoked backend, and the worker
+    /// drops it before anything else ([`drop_revoked`]).
+    revocation: u64,
 }
 
 struct Control {
@@ -377,6 +387,18 @@ struct Control {
     gpu: Option<GpuContext>,
     format: Option<Format>,
     factory: Option<Arc<dyn BackendFactory>>,
+    /// The factory was taken by [`Control::revoke`]: the next factory set
+    /// starts a new request ([`Control::rearm`]).
+    revoked: bool,
+    /// How many times the backend was revoked: the worker drops an
+    /// instance created before the last revocation
+    /// (`Engine::revocation`), even when a new factory came before it did.
+    revocations: u64,
+    /// Why the factory of the last re-arm refused the background effect's
+    /// parameters ([`Control::rearm`]): every load of the effect fails with
+    /// it until settings checked with the factory are applied
+    /// ([`ObcEffect::apply_checked`]).
+    refused: Option<String>,
     stop: bool,
     last_load_ms: Option<f64>,
     last_load_reused: bool,
@@ -398,6 +420,9 @@ impl Default for Control {
             gpu: None,
             format: None,
             factory: None,
+            revoked: false,
+            revocations: 0,
+            refused: None,
             stop: false,
             last_load_ms: None,
             last_load_reused: false,
@@ -576,6 +601,63 @@ impl Control {
         })
     }
 
+    /// Takes the backend away ([`ObcEffect::revoke_backend`]): the factory
+    /// is cleared and a new request starts, so the worker drops the
+    /// instance; the effect (unless `none`) and every effective stage fail
+    /// at once with [`NO_BACKEND`], so the next frame decided follows
+    /// `on-failure`. False (nothing done) without a factory.
+    fn revoke(&mut self) -> bool {
+        if self.factory.is_none() {
+            return false;
+        }
+        self.factory = None;
+        self.revoked = true;
+        self.revocations += 1;
+        self.generation += 1;
+        self.epoch += 1;
+        self.loaded_kind = None;
+        for s in self.stage_ids() {
+            if self.effective(s.as_str()) {
+                self.stage_mut(&s).status = EffectStatus::Failed(NO_BACKEND.into());
+            }
+        }
+        if self.settings.kind != EffectKind::None {
+            self.status = EffectStatus::Failed(NO_BACKEND.into());
+        }
+        true
+    }
+
+    /// Sets `factory`; after a revocation, starts a new request for it
+    /// (the effect and the stages loading again) and returns true. The
+    /// stage failures the revocation caused (no backend) are forgotten;
+    /// the settings applied meanwhile were checked without a factory, so
+    /// what `factory` refuses of them (`refused`, [`refusals`]) fails: a
+    /// refused stage is dropped as a failed one, a refused background
+    /// effect fails its loads ([`Control::refused`]).
+    fn rearm(&mut self, factory: Arc<dyn BackendFactory>, refused: Refusals) -> bool {
+        self.factory = Some(factory);
+        if !self.revoked {
+            return false;
+        }
+        self.revoked = false;
+        for (_, ctl) in &mut self.stages {
+            if ctl.failure.as_deref() == Some(NO_BACKEND) {
+                ctl.failure = None;
+            }
+        }
+        for (stage, reason) in refused.stages {
+            self.record_stage_failure(&stage, None, reason, false);
+        }
+        self.refused = refused
+            .effect
+            .filter(|_| self.target.kind != EffectKind::None);
+        self.generation += 1;
+        self.epoch += 1;
+        self.status = self.pending_status();
+        self.set_pending_stage_statuses();
+        true
+    }
+
     fn report(&self) -> Report {
         Report {
             fallback_error: self.fallback.error.clone(),
@@ -587,6 +669,56 @@ impl Control {
                 .map(|(s, c)| (s.clone(), c.status.clone()))
                 .collect(),
         }
+    }
+}
+
+/// What a backend factory refuses of settings checked without it: each
+/// listed stage's parameters, and the background effect's.
+#[derive(Debug, Default, PartialEq)]
+struct Refusals {
+    stages: Vec<(StageId, String)>,
+    effect: Option<String>,
+}
+
+/// The parameters of `settings` that `factory` refuses
+/// (`BackendFactory::check_params`), checked as `ObcEffect::apply` checks
+/// them.
+fn refusals(settings: &EffectSettings, factory: &dyn BackendFactory) -> Refusals {
+    Refusals {
+        stages: settings
+            .stages
+            .iter()
+            .filter_map(|s| {
+                factory
+                    .check_params(&s.id, &s.params, &s.live)
+                    .err()
+                    .map(|why| (s.id.clone(), why))
+            })
+            .collect(),
+        effect: if settings.background_params.is_empty() {
+            None
+        } else {
+            factory
+                .check_params(
+                    &StageId::BACKGROUND,
+                    &settings.background_params,
+                    &obc_backend::Params::new(),
+                )
+                .err()
+        },
+    }
+}
+
+/// The effect `Control::loaded_kind` takes when the worker publishes what a
+/// job left loaded (`loaded`): `None` when the backend was revoked after the
+/// job was built (`revocation`, its count then), so an instance it created
+/// or kept never processes a frame, even with a new factory set before the
+/// next job drops it.
+fn published_kind(c: &Control, revocation: u64, loaded: Option<EffectKind>) -> Option<EffectKind> {
+    if revocation == c.revocations {
+        loaded
+    } else {
+        None
     }
 }
 
@@ -889,8 +1021,69 @@ fn post_status(element: &super::ObcEffect, r: &Report) {
 }
 
 impl ObcEffect {
+    /// Sets the backend factory; after a revocation `Some` re-arms the
+    /// element ([`Control::rearm`]), the settings applied meanwhile checked
+    /// with it first (with the `Control` lock released, as `apply` checks).
     pub(super) fn set_backend_factory(&self, factory: Option<Arc<dyn BackendFactory>>) {
-        lock(&self.shared.control).factory = factory;
+        let Some(f) = factory else {
+            lock(&self.shared.control).factory = None;
+            return;
+        };
+        let posted = loop {
+            let checked = {
+                let c = lock(&self.shared.control);
+                c.revoked.then(|| c.settings.clone())
+            };
+            let refused = checked
+                .as_ref()
+                .map(|s| refusals(s, f.as_ref()))
+                .unwrap_or_default();
+            let mut c = lock(&self.shared.control);
+            // Settings applied, or a revocation, since the check: again.
+            if c.revoked.then_some(&c.settings) != checked.as_ref() {
+                continue;
+            }
+            let before = c.report();
+            if c.rearm(Arc::clone(&f), refused) {
+                self.shared.wake.notify_all();
+            }
+            break before.changed(c.report());
+        };
+        if let Some(r) = posted {
+            gst::info!(
+                CAT,
+                imp = self,
+                "backend restored: effect {}: {}; stages: {}",
+                r.kind,
+                r.status,
+                r.stages_text()
+            );
+            post_status(&self.obj(), &r);
+        }
+    }
+
+    /// Takes the backend away at once (see [`Control::revoke`]). Takes the
+    /// `Control` lock only: never waits for a load the worker runs.
+    pub(super) fn revoke_backend(&self) {
+        let posted = {
+            let mut c = lock(&self.shared.control);
+            let before = c.report();
+            if c.revoke() {
+                self.shared.wake.notify_all();
+            }
+            before.changed(c.report())
+        };
+        if let Some(r) = posted {
+            gst::warning!(
+                CAT,
+                imp = self,
+                "backend revoked: effect {}: {}; stages: {}",
+                r.kind,
+                r.status,
+                r.stages_text()
+            );
+            post_status(&self.obj(), &r);
+        }
     }
 
     pub(super) fn backend_factory(&self) -> Option<Arc<dyn BackendFactory>> {
@@ -977,6 +1170,15 @@ impl ObcEffect {
     /// parameters alone (blur strength, the stages' live parameters) is
     /// never a retry: they load nothing, and a slider moved after
     /// a failure would otherwise reload what failed on every step.
+    /// [`Self::apply`] of settings checked with the element's factory
+    /// (`ObcEffect::apply`): a refusal of the background effect's
+    /// parameters by the last re-arm ([`Control::refused`]) is over, and
+    /// the retry loads the effect again.
+    pub(super) fn apply_checked(&self, new: EffectSettings) {
+        lock(&self.shared.control).refused = None;
+        self.apply(new, true);
+    }
+
     pub(super) fn apply(&self, new: EffectSettings, retry: bool) {
         let posted = {
             let mut c = lock(&self.shared.control);
@@ -1465,7 +1667,9 @@ impl ObcEffect {
                     Some(lock(&self.shared.engine))
                 };
                 let mut idle = Engine::default();
-                let Engine { instance, loaded } = match held.as_mut() {
+                let Engine {
+                    instance, loaded, ..
+                } = match held.as_mut() {
                     Some(e) => &mut **e,
                     None => &mut idle,
                 };
@@ -1715,6 +1919,10 @@ struct Job {
     gpu: GpuContext,
     format: Format,
     factory: Option<Arc<dyn BackendFactory>>,
+    /// `Control::revocations` when the job was built.
+    revocation: u64,
+    /// `Control::refused` when the job was built.
+    refused: Option<String>,
 }
 
 /// Why a load failed; the backend's error, when it came from the backend,
@@ -1778,6 +1986,8 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                         gpu,
                         format,
                         factory: c.factory.clone(),
+                        revocation: c.revocations,
+                        refused: c.refused.clone(),
                     };
                 }
                 c = shared.wake.wait(c).unwrap_or_else(|e| e.into_inner());
@@ -1801,7 +2011,7 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
         let posted = {
             let mut c = lock(&shared.control);
             let before = c.report();
-            c.loaded_kind = loaded_kind;
+            c.loaded_kind = published_kind(&c, job.revocation, loaded_kind);
             c.epoch += 1;
             if let Outcome::Loaded(r) = &outcome {
                 c.loads += 1;
@@ -1957,8 +2167,42 @@ fn run_job(shared: &Shared, job: &Job) -> JobResult {
     }
 }
 
+/// Drops the instance of a revoked backend (created before the job's
+/// revocation count): unloaded and dropped with the context pushed, as
+/// `release_gpu` does, so no later load reuses it.
+fn drop_revoked(shared: &Shared, job: &Job) {
+    let stale = {
+        let mut e = lock(&shared.engine);
+        if e.instance.is_none() || e.revocation >= job.revocation {
+            return;
+        }
+        e.loaded = None;
+        e.instance.take()
+    };
+    {
+        // The streaming thread must not take the dropped chain as loaded.
+        let mut c = lock(&shared.control);
+        c.loaded_kind = None;
+        c.epoch += 1;
+    }
+    let Some(mut instance) = stale else {
+        return;
+    };
+    // SAFETY: the element keeps the context alive until it has joined
+    // this thread.
+    match unsafe { ContextGuard::push(job.gpu.context) } {
+        Ok(guard) => {
+            instance.unload();
+            drop(instance);
+            drop(guard);
+        }
+        Err(err) => leak_backend(instance, &err.to_string()),
+    }
+}
+
 /// Unloads the backend instance (keeping it for the next load).
 fn unload(shared: &Shared, job: &Job) {
+    drop_revoked(shared, job);
     {
         let mut c = lock(&shared.control);
         c.loaded_kind = None;
@@ -1985,9 +2229,19 @@ fn unload(shared: &Shared, job: &Job) {
     drop(guard);
 }
 
+/// Why an effect fails without a backend factory (none set, or revoked).
+const NO_BACKEND: &str = "no inference backend is configured for the effects";
+
 /// Loads `target` (an effect, its stages, or the stages alone) for `job`.
+/// The instance of a revoked backend is dropped first.
 fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
+    drop_revoked(shared, job);
     let kind = target.kind;
+    if kind != EffectKind::None
+        && let Some(reason) = &job.refused
+    {
+        return Outcome::Failed(Failure::new(reason.clone()));
+    }
     let colour = match &job.format.colour {
         Ok(c) => *c,
         Err(reason) => return Outcome::Failed(Failure::new(reason.clone())),
@@ -2024,9 +2278,7 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
         return Outcome::Superseded;
     }
     let Some(factory) = job.factory.clone() else {
-        return Outcome::Failed(Failure::new(
-            "no inference backend is configured for the effects",
-        ));
+        return Outcome::Failed(Failure::new(NO_BACKEND));
     };
     // A full load for the backend: nothing loaded, or another size or
     // colour (the instance is left unloaded if it fails).
@@ -2056,7 +2308,10 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
     let mut e = lock(&shared.engine);
     if e.instance.is_none() {
         match factory.create() {
-            Ok(i) => e.instance = Some(i),
+            Ok(i) => {
+                e.instance = Some(i);
+                e.revocation = job.revocation;
+            }
             Err(err) => {
                 return Outcome::Failed(Failure {
                     reason: err.to_string(),
@@ -2674,9 +2929,15 @@ impl ObcEffect {
 
 #[cfg(test)]
 mod tests {
-    use super::{ColourSpec, Control, EffectFallback, Format, OnExit, background};
+    use super::{
+        BackendError, BackendFactory, ColourSpec, Control, EffectFallback, EffectKind,
+        EffectSettings, EffectStatus, Format, FrameAction, InferenceBackend, NO_BACKEND, OnExit,
+        Refusals, StageId, background, decide, decide_frame, published_kind, refusals,
+    };
+    use crate::settings::StageRequest;
     use std::cell::Cell;
     use std::path::Path;
+    use std::sync::Arc;
 
     /// The fallback key `c` wants for the file now at `path`, as
     /// `refresh_fallback` builds it.
@@ -2733,5 +2994,309 @@ mod tests {
         assert_eq!(synced.get(), 1, "an early return synchronises");
         queue_then(false, &synced).unwrap();
         assert_eq!(synced.get(), 1, "a disarmed guard does nothing");
+    }
+
+    /// A factory the revocation tests hand over (never asked to create).
+    struct NoInstance;
+
+    impl BackendFactory for NoInstance {
+        fn name(&self) -> &'static str {
+            "none"
+        }
+
+        fn probe(&self) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn create(&self) -> Result<Box<dyn InferenceBackend>, BackendError> {
+            Err(BackendError::Unavailable("test".into()))
+        }
+    }
+
+    /// Blur ready on a loaded instance of a factory.
+    fn blur_ready() -> Control {
+        let mut c = Control::default();
+        c.settings = EffectSettings::of(EffectKind::Blur);
+        c.target = c.settings.target();
+        c.status = EffectStatus::Ready;
+        c.loaded_kind = Some(EffectKind::Blur);
+        c.factory = Some(Arc::new(NoInstance));
+        c
+    }
+
+    #[test]
+    fn a_revoked_backend_fails_the_effect_at_once() {
+        let mut c = blur_ready();
+        let (generation, epoch, revocations) = (c.generation, c.epoch, c.revocations);
+        assert!(c.revoke());
+        assert!(c.factory.is_none());
+        assert!(c.revoked);
+        assert_eq!(c.generation, generation + 1, "a new request");
+        assert_eq!(c.epoch, epoch + 1);
+        assert_eq!(c.revocations, revocations + 1, "the instance is stale");
+        assert!(!c.usable());
+        assert_eq!(c.status, EffectStatus::Failed(NO_BACKEND.into()));
+        for fallback in [EffectFallback::Black, EffectFallback::Image] {
+            assert_eq!(
+                decide(EffectKind::Blur, &c.status, fallback, c.usable(), false),
+                FrameAction::Black
+            );
+            // With the room on screen still no toggle: a failure.
+            assert_eq!(
+                decide_frame(
+                    EffectKind::Blur,
+                    &c.status,
+                    fallback,
+                    c.usable(),
+                    false,
+                    false,
+                    true
+                ),
+                (EffectKind::Blur, FrameAction::Black)
+            );
+        }
+        assert_eq!(
+            decide(
+                EffectKind::Blur,
+                &c.status,
+                EffectFallback::None,
+                c.usable(),
+                false
+            ),
+            FrameAction::Passthrough
+        );
+        // Idempotent: the factory is gone.
+        assert!(!c.revoke());
+        assert_eq!(c.generation, generation + 1);
+    }
+
+    #[test]
+    fn a_revocation_without_a_factory_does_nothing() {
+        let mut c = Control::default();
+        assert!(!c.revoke());
+        assert_eq!((c.generation, c.revocations), (0, 0));
+        assert!(!c.revoked);
+        assert_eq!(c.status, EffectStatus::Off);
+    }
+
+    #[test]
+    fn a_factory_set_after_a_revocation_starts_a_new_request() {
+        let mut c = blur_ready();
+        assert!(c.revoke());
+        let generation = c.generation;
+        assert!(c.rearm(Arc::new(NoInstance), Refusals::default()));
+        assert!(c.factory.is_some());
+        assert!(!c.revoked);
+        assert_eq!(c.generation, generation + 1);
+        assert_eq!(c.status, EffectStatus::Loading);
+        // Black until ready (the hidden room was never shown again).
+        assert_eq!(
+            decide_frame(
+                EffectKind::Blur,
+                &c.status,
+                EffectFallback::Black,
+                c.usable(),
+                false,
+                false,
+                false
+            ),
+            (EffectKind::Blur, FrameAction::Black)
+        );
+        // A second factory starts nothing more.
+        assert!(!c.rearm(Arc::new(NoInstance), Refusals::default()));
+        assert_eq!(c.generation, generation + 1);
+    }
+
+    #[test]
+    fn a_factory_set_without_a_revocation_starts_no_request() {
+        let mut c = Control::default();
+        assert!(!c.rearm(Arc::new(NoInstance), Refusals::default()));
+        assert!(c.factory.is_some());
+        assert_eq!(c.generation, 0);
+        assert_eq!(c.status, EffectStatus::Off);
+    }
+
+    #[test]
+    fn a_revocation_under_none_fails_the_stages_alone_and_passes_through() {
+        let mut c = Control::default();
+        c.settings = EffectSettings::default().with_stage(StageRequest::on(StageId::DENOISE));
+        c.target = c.settings.target();
+        c.stage_mut(&StageId::DENOISE).status = EffectStatus::Ready;
+        c.loaded_kind = Some(EffectKind::None);
+        c.factory = Some(Arc::new(NoInstance));
+        assert!(c.usable());
+        assert!(c.revoke());
+        assert_eq!(c.status, EffectStatus::Off);
+        assert_eq!(
+            c.stage_status(StageId::DENOISE.as_str()),
+            &EffectStatus::Failed(NO_BACKEND.into())
+        );
+        assert_eq!(
+            decide(
+                EffectKind::None,
+                &c.status,
+                EffectFallback::Black,
+                c.usable(),
+                c.any_effective()
+            ),
+            FrameAction::Passthrough
+        );
+    }
+
+    /// A factory whose check refuses a `direction` past 90 and a
+    /// background `mode` other than 1.
+    struct Picky;
+
+    impl BackendFactory for Picky {
+        fn name(&self) -> &'static str {
+            "picky"
+        }
+
+        fn probe(&self) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn create(&self) -> Result<Box<dyn InferenceBackend>, BackendError> {
+            Err(BackendError::Unavailable("test".into()))
+        }
+
+        fn check_params(
+            &self,
+            stage: &StageId,
+            params: &obc_backend::Params,
+            live: &obc_backend::Params,
+        ) -> Result<(), String> {
+            use obc_backend::Value;
+            match live.get("direction").or_else(|| params.get("direction")) {
+                Some(Value::Int(d)) if d.abs() > 90 => {
+                    return Err(format!("{stage}: direction {d}"));
+                }
+                _ => {}
+            }
+            match params.get("mode") {
+                Some(Value::Int(m)) if *m != 1 => Err(format!("{stage}: mode {m}")),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn a_rearm_forgets_the_stage_failures_of_the_revocation() {
+        // `none` with noise removal, revoked: the worker's load without a
+        // factory records the stage's failure. The re-arm forgets it, so
+        // the stage loads again.
+        let mut c = Control::default();
+        c.settings = EffectSettings::default().with_stage(StageRequest::on(StageId::DENOISE));
+        c.target = c.settings.target();
+        c.loaded_kind = Some(EffectKind::None);
+        c.factory = Some(Arc::new(NoInstance));
+        assert!(c.revoke());
+        let generation = c.generation;
+        assert!(c.record_stage_failure(
+            &StageId::DENOISE,
+            Some(generation),
+            NO_BACKEND.into(),
+            false
+        ));
+        assert!(!c.job_target().wants(StageId::DENOISE.as_str()));
+        // Another stage failure is not the revocation's: kept.
+        let relight = StageId::RELIGHT;
+        c.settings = c
+            .settings
+            .clone()
+            .with_stage(StageRequest::on(relight.clone()));
+        c.target = c.settings.target();
+        assert!(c.record_stage_failure(&relight, None, "no model".into(), false));
+        assert!(c.rearm(Arc::new(NoInstance), Refusals::default()));
+        assert_eq!(c.generation, generation + 1);
+        assert!(
+            c.stage(StageId::DENOISE.as_str())
+                .unwrap()
+                .failure
+                .is_none()
+        );
+        assert_eq!(
+            c.stage_status(StageId::DENOISE.as_str()),
+            &EffectStatus::Loading
+        );
+        assert!(c.job_target().wants(StageId::DENOISE.as_str()));
+        assert_eq!(
+            c.stage_status(relight.as_str()),
+            &EffectStatus::Failed("no model".into())
+        );
+        assert!(c.refused.is_none());
+    }
+
+    #[test]
+    fn a_rearm_fails_what_its_factory_refuses_of_the_settings_applied_meanwhile() {
+        use obc_backend::{Params, Value};
+        let mut c = blur_ready();
+        assert!(c.revoke());
+        // Applied while revoked (no factory to check them with).
+        let mut relight = StageRequest::on(StageId::RELIGHT);
+        relight.live = Params::from([("direction".to_string(), Value::Int(120))]);
+        let mut s = EffectSettings::of(EffectKind::Blur)
+            .with_stage(StageRequest::on(StageId::DENOISE))
+            .with_stage(relight);
+        s.background_params = Params::from([("mode".to_string(), Value::Int(3))]);
+        let refused = refusals(&s, &Picky);
+        assert_eq!(
+            refused,
+            Refusals {
+                stages: vec![(StageId::RELIGHT, "relight: direction 120".into())],
+                effect: Some("background: mode 3".into()),
+            }
+        );
+        assert_eq!(refusals(&s, &NoInstance), Refusals::default());
+        c.settings = s;
+        c.target = c.settings.target();
+        for st in c.settings.stages.clone() {
+            c.stage_mut(&st.id);
+        }
+        assert!(c.rearm(Arc::new(Picky), refused));
+        // The refused stage is dropped as a failed one; the other loads.
+        assert_eq!(
+            c.stage_status(StageId::RELIGHT.as_str()),
+            &EffectStatus::Failed("relight: direction 120".into())
+        );
+        assert!(!c.job_target().wants(StageId::RELIGHT.as_str()));
+        assert!(c.job_target().wants(StageId::DENOISE.as_str()));
+        // The effect's loads fail with the refusal (the job carries it).
+        assert_eq!(c.refused.as_deref(), Some("background: mode 3"));
+        // Under `none` there is no background effect to refuse.
+        let mut c = Control {
+            factory: Some(Arc::new(NoInstance)),
+            ..Control::default()
+        };
+        assert!(c.revoke());
+        let refused = Refusals {
+            stages: Vec::new(),
+            effect: Some("background: mode 3".into()),
+        };
+        assert!(c.rearm(Arc::new(Picky), refused));
+        assert!(c.refused.is_none());
+    }
+
+    #[test]
+    fn a_job_built_before_a_revocation_publishes_nothing_loaded() {
+        let mut c = blur_ready();
+        let revocation = c.revocations;
+        // The job finishes before any revocation: what it loaded.
+        assert_eq!(
+            published_kind(&c, revocation, Some(EffectKind::Blur)),
+            Some(EffectKind::Blur)
+        );
+        // Revoked (and re-armed) while it ran: the instance it left is the
+        // revoked backend's, never usable, until the next job drops it.
+        assert!(c.revoke());
+        assert!(c.rearm(Arc::new(NoInstance), Refusals::default()));
+        assert_eq!(published_kind(&c, revocation, Some(EffectKind::Blur)), None);
+        c.loaded_kind = published_kind(&c, revocation, Some(EffectKind::Blur));
+        assert!(!c.usable());
+        // A job of the new count publishes again.
+        assert_eq!(
+            published_kind(&c, c.revocations, Some(EffectKind::Blur)),
+            Some(EffectKind::Blur)
+        );
     }
 }
