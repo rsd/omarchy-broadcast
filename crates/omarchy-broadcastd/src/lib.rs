@@ -41,6 +41,7 @@ pub mod gpu_cache;
 pub mod hotplug;
 pub mod inotify;
 pub mod log;
+pub mod media;
 pub mod mic;
 pub mod modules;
 pub mod preview;

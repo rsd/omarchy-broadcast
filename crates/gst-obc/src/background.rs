@@ -3,9 +3,9 @@
 //! to the output size, as packed BGR in host memory
 //! (`docs/adr/0012-video-effects-and-maxine-backend.md`).
 //!
-//! The file is limited to [`MAX_FILE_BYTES`], to PNG and JPEG, and to
-//! [`MAX_DIMENSION`] pixels on each side; anything else is refused with a
-//! reason before any decoder runs:
+//! The file is limited to [`MAX_FILE_BYTES`], to PNG, JPEG and still WebP,
+//! and to [`MAX_DIMENSION`] pixels on each side; anything else is refused
+//! with a reason before any decoder runs:
 //!
 //! * The file is opened once, without blocking (`O_NONBLOCK | O_NOCTTY`,
 //!   and close-on-exec), checked on the open handle (`fstat`: a regular
@@ -14,21 +14,30 @@
 //!   path that is (or is swapped for) a FIFO or a device is refused at once
 //!   instead of blocking the caller.
 //! * The size is read from the image's own header (the PNG `IHDR` chunk,
-//!   the JPEG frame header `SOFn`) before the decoder is started, because a
-//!   decoder allocates the full image as soon as it knows its size: a small
-//!   file declaring 60000 x 60000 pixels would otherwise cost about 10 GB.
-//!   Only formats whose header this module reads are accepted; GStreamer's
-//!   parsers are not relied on for the size (they are in gst-plugins-bad,
-//!   and not every format has one). The size the decoder reports is checked
-//!   again before anything downstream of it allocates.
+//!   the JPEG frame header `SOFn`, the first chunk of the WebP RIFF
+//!   container: `VP8 `, `VP8L`, or `VP8X` and then the first `VP8 ` or
+//!   `VP8L` bitstream, whose size must match the canvas) before the decoder
+//!   is started, because a decoder allocates the full image as soon as it
+//!   knows its size: a small file declaring 60000 x 60000 pixels would
+//!   otherwise cost about 10 GB. Only formats whose header this module reads are accepted:
+//!   PNG, JPEG and still WebP (an animated WebP, flagged in `VP8X` or
+//!   carrying an `ANIM` or `ANMF` chunk, is refused). GStreamer's parsers
+//!   are not relied on for the size (they are in gst-plugins-bad, and not
+//!   every format has one). The size the decoder reports is checked again
+//!   before anything downstream of it allocates.
 //! * The first image in the file is delimited by walking its structure
-//!   (PNG chunks up to `IEND`, JPEG segments and scans up to `EOI`):
-//!   `pngdec` and `jpegdec` decode every image in their input, and only the
-//!   first one's header was read, so a small image followed by a second one
-//!   declaring a huge size would otherwise reach the decoder. The decoder is
-//!   handed only the first image's bytes, so it never sees a second image;
-//!   anything after the first image (a gain map, an embedded video, padding)
-//!   is ignored, and a file that ends before its first image does is refused.
+//!   (PNG chunks up to `IEND`, JPEG segments and scans up to `EOI`, the
+//!   WebP RIFF container by its declared size, which must cover its first
+//!   chunk): `pngdec`, `jpegdec` and `webpdec` decode every image in their
+//!   input, and only the first one's header was read, so a small image followed by a second one declaring a
+//!   huge size would otherwise reach the decoder. The decoder is handed only
+//!   the first image's bytes, so it never sees a second image; anything
+//!   after the first image (a gain map, an embedded video, padding) is
+//!   ignored, and a file that ends before its first image does is refused.
+//!
+//! PNG and JPEG are decoded by gst-plugins-good; WebP needs `webpdec`, from
+//! gst-plugins-bad, which is optional: without it a WebP file is refused
+//! with a reason that names it.
 //!
 //! The fallback image of `on-failure=image` (shown in place of black frames
 //! when an effect cannot run) goes through the same checks and decode, then
@@ -168,6 +177,11 @@ impl Subject {
         noun: "the image file",
         with_path: false,
     };
+    /// Any other image: "the image file <path>".
+    const IMAGE_FILE: Subject = Subject {
+        noun: "the image file",
+        with_path: true,
+    };
 
     fn of(self, path: &Path) -> String {
         if self.with_path {
@@ -192,6 +206,12 @@ pub fn read_file(path: &Path) -> Result<Vec<u8>, String> {
     read_file_as(path, Subject::BACKGROUND)
 }
 
+/// [`read_file`] for an image that is not the background: the reasons say
+/// "the image file <path>".
+pub fn read_image_file(path: &Path) -> Result<Vec<u8>, String> {
+    read_file_as(path, Subject::IMAGE_FILE)
+}
+
 fn read_file_as(path: &Path, subject: Subject) -> Result<Vec<u8>, String> {
     let (file, len) = open_checked(path, subject)?;
     let mut data = Vec::with_capacity(len as usize);
@@ -209,25 +229,173 @@ fn read_file_as(path: &Path, subject: Subject) -> Result<Vec<u8>, String> {
 pub enum ImageFormat {
     Png,
     Jpeg,
+    /// A still WebP image (lossy `VP8 `, lossless `VP8L`, or extended
+    /// `VP8X` without animation).
+    Webp,
 }
 
 impl ImageFormat {
-    /// The caps the decoder takes, and the decoder (both in gst-plugins-good).
+    /// The file name extension of the format: `png`, `jpg` or `webp`.
+    pub fn extension(self) -> &'static str {
+        match self {
+            ImageFormat::Png => "png",
+            ImageFormat::Jpeg => "jpg",
+            ImageFormat::Webp => "webp",
+        }
+    }
+
+    /// The caps the decoder takes, and the decoder (`pngdec` and `jpegdec`
+    /// in gst-plugins-good, `webpdec` in gst-plugins-bad).
     fn decoder(self) -> (&'static str, &'static str) {
         match self {
             ImageFormat::Png => ("image/png", "pngdec"),
             ImageFormat::Jpeg => ("image/jpeg", "jpegdec"),
+            ImageFormat::Webp => ("image/webp", "webpdec"),
         }
+    }
+
+    /// The reason the format cannot be decoded here, if its decoder is
+    /// optional and not installed (`webpdec` is not a dependency of the
+    /// package).
+    fn missing_decoder(self) -> Option<&'static str> {
+        match self {
+            ImageFormat::Webp if gst::ElementFactory::find("webpdec").is_none() => {
+                Some("WebP needs the GStreamer WebP decoder (webpdec, in gst-plugins-bad)")
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Whether images of `format` can be decoded here: the reason when its
+/// decoder is optional and not installed (see [`ImageFormat`]; WebP needs
+/// `webpdec`). Initialises GStreamer if needed.
+pub fn decoder_available(format: ImageFormat) -> Result<(), String> {
+    gst::init().map_err(|e| format!("GStreamer: {e}"))?;
+    match format.missing_decoder() {
+        Some(reason) => Err(reason.to_string()),
+        None => Ok(()),
     }
 }
 
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 
+/// The VP8X flag of an animated WebP.
+const WEBP_ANIMATION_FLAG: u8 = 0x02;
+
+fn webp_animated() -> String {
+    "animated WebP is not supported as a still image".into()
+}
+
+/// Whether `data` starts like a WebP file: `RIFF`, then (if that much is
+/// there) a size and `WEBP`. A shorter file starting with `RIFF` is taken
+/// for a truncated WebP, so its reason says so.
+fn looks_like_webp(data: &[u8]) -> bool {
+    data.starts_with(b"RIFF") && data.get(8..12).is_none_or(|kind| kind == b"WEBP")
+}
+
+/// The declared width and height of a still WebP: the RIFF header, then the
+/// first chunk, `VP8 ` (a lossy key frame: frame tag, start code `9D 01 2A`,
+/// then 14-bit width and height), `VP8L` (lossless: signature `2F`, then
+/// 14-bit width - 1 and height - 1 packed), or `VP8X` (extended: flags, then
+/// 24-bit canvas width - 1 and height - 1). An animated file (the `VP8X`
+/// animation flag, or an `ANIM` or `ANMF` chunk among those present) is
+/// refused.
+///
+/// After `VP8X` the chunks are walked (skipping `ALPH`, `ICCP` and any other
+/// chunk by its size) to the first `VP8 ` or `VP8L` chunk, whose own size is
+/// read: that is what the decoder allocates, so a file without one, or whose
+/// bitstream size differs from the canvas, is refused, and the size returned
+/// is the bitstream's.
+fn webp_header(data: &[u8]) -> Result<(u32, u32), String> {
+    let invalid = || "it is a WebP file without a valid header".to_string();
+    let le24 = |o: usize| u32::from_le_bytes([data[o], data[o + 1], data[o + 2], 0]);
+    let le32 = |o: usize| u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+    // RIFF header (12 bytes), then the first chunk's type and size.
+    let Some(kind) = data.get(12..16) else {
+        return Err(invalid());
+    };
+    let p = 20; // The first chunk's payload.
+    match kind {
+        b"VP8 " | b"VP8L" => webp_bitstream_size(data, kind, p).ok_or_else(invalid),
+        b"VP8X" => {
+            if data.len() < p + 10 {
+                return Err(invalid());
+            }
+            if data[p] & WEBP_ANIMATION_FLAG != 0 {
+                return Err(webp_animated());
+            }
+            let canvas = (le24(p + 4) + 1, le24(p + 7) + 1);
+            // The other chunks, as far as the file and its RIFF size go:
+            // an animation chunk is refused even without the flag, and the
+            // first image chunk is kept.
+            let riff_end = (le32(4) as usize).saturating_add(8).min(data.len());
+            let mut image = None;
+            let mut i = 12usize;
+            while let Some(head_end) = i.checked_add(8).filter(|&e| e <= riff_end) {
+                let head = &data[i..head_end];
+                let kind = &head[..4];
+                if kind == b"ANIM" || kind == b"ANMF" {
+                    return Err(webp_animated());
+                }
+                if image.is_none() && (kind == b"VP8 " || kind == b"VP8L") {
+                    image = Some((i, head_end));
+                }
+                let size = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
+                let Some(next) = size
+                    .checked_add(size & 1)
+                    .and_then(|n| n.checked_add(8))
+                    .and_then(|n| n.checked_add(i))
+                else {
+                    break;
+                };
+                i = next;
+            }
+            let Some((at, payload)) = image else {
+                return Err("it is a WebP file without a VP8 or VP8L image chunk".into());
+            };
+            let size = webp_bitstream_size(&data[..riff_end], &data[at..at + 4], payload)
+                .ok_or_else(invalid)?;
+            if size != canvas {
+                return Err("the WebP canvas and its image differ in size".into());
+            }
+            Ok(size)
+        }
+        b"ANIM" | b"ANMF" => Err(webp_animated()),
+        _ => Err("it is a WebP file whose first chunk is not VP8, VP8L or VP8X".into()),
+    }
+}
+
+/// The width and height of the `VP8 ` or `VP8L` bitstream (`kind`) whose
+/// payload starts at `p` in `data`; `None` when `data` ends first or the
+/// start code or signature is wrong.
+fn webp_bitstream_size(data: &[u8], kind: &[u8], p: usize) -> Option<(u32, u32)> {
+    let le16 = |o: usize| u32::from(u16::from_le_bytes([data[o], data[o + 1]]));
+    let need = |n: usize| p.checked_add(n).is_some_and(|end| end <= data.len());
+    match kind {
+        b"VP8 " => {
+            if !need(10) || data[p + 3..p + 6] != [0x9D, 0x01, 0x2A] {
+                return None;
+            }
+            Some((le16(p + 6) & 0x3FFF, le16(p + 8) & 0x3FFF))
+        }
+        b"VP8L" => {
+            if !need(5) || data[p] != 0x2F {
+                return None;
+            }
+            let bits = u32::from_le_bytes([data[p + 1], data[p + 2], data[p + 3], data[p + 4]]);
+            Some(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1))
+        }
+        _ => None,
+    }
+}
+
 /// The format and the declared width and height of an image, read from
 /// its header without decoding it: the PNG `IHDR` chunk (which the PNG
 /// specification places first), or the first JPEG frame header (`SOF0` to
 /// `SOF15`, other than the `DHT`, `JPG` and `DAC` markers that share the
-/// range), reached by skipping the segments before it by their lengths.
+/// range), reached by skipping the segments before it by their lengths, or
+/// the first chunk of a still WebP (see `webp_header`).
 pub fn image_header(data: &[u8]) -> Result<(ImageFormat, u32, u32), String> {
     let be32 = |o: usize| u32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
     let be16 = |o: usize| u32::from(u16::from_be_bytes([data[o], data[o + 1]]));
@@ -278,12 +446,17 @@ pub fn image_header(data: &[u8]) -> Result<(ImageFormat, u32, u32), String> {
             i += len;
         }
     }
-    Err("it is neither a PNG nor a JPEG file".into())
+    if looks_like_webp(data) {
+        let (w, h) = webp_header(data)?;
+        return Ok((ImageFormat::Webp, w, h));
+    }
+    Err("it is not a PNG, JPEG or WebP file".into())
 }
 
 /// The length in bytes of the first image in `data`, whose format
 /// [`image_header`] found: the PNG signature and its chunks up to and
-/// including `IEND`, or the JPEG from `SOI` to its `EOI` marker. A file
+/// including `IEND`, the JPEG from `SOI` to its `EOI` marker, or the WebP
+/// RIFF container (8 bytes, then its declared size, padded to even). A file
 /// that ends first is refused.
 ///
 /// PNG chunks are skipped by their lengths (a length above 2^31 - 1 is
@@ -297,7 +470,40 @@ pub fn image_length(format: ImageFormat, data: &[u8]) -> Result<usize, String> {
     match format {
         ImageFormat::Png => png_length(data),
         ImageFormat::Jpeg => jpeg_length(data),
+        ImageFormat::Webp => webp_length(data),
     }
+}
+
+/// The RIFF container: its declared size must cover `WEBP` and the first
+/// chunk (header and declared payload).
+fn webp_length(data: &[u8]) -> Result<usize, String> {
+    let invalid = || "it is a WebP file with an invalid RIFF size".to_string();
+    let truncated = || "it is a WebP file that ends before its RIFF size".to_string();
+    if !data.starts_with(b"RIFF") {
+        return Err(invalid());
+    }
+    let Some(size) = data.get(4..8) else {
+        return Err(truncated());
+    };
+    let size = u32::from_le_bytes([size[0], size[1], size[2], size[3]]) as usize;
+    // "WEBP" and at least the first chunk's header.
+    if size < 12 {
+        return Err(invalid());
+    }
+    let end = size
+        .checked_add(size & 1)
+        .and_then(|n| n.checked_add(8))
+        .ok_or_else(invalid)?;
+    if end > data.len() {
+        return Err(truncated());
+    }
+    // The RIFF size covers the first chunk's declared payload (`end` is at
+    // least 20, so its header is there).
+    let chunk = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+    if (size as u64) < 12 + u64::from(chunk) {
+        return Err(invalid());
+    }
+    Ok(end)
 }
 
 fn png_length(data: &[u8]) -> Result<usize, String> {
@@ -387,8 +593,9 @@ fn jpeg_length(data: &[u8]) -> Result<usize, String> {
     }
 }
 
-/// The reason a `w` x `h` image is refused, if it is.
-fn check_dimensions(what: &str, w: u32, h: u32) -> Result<(), String> {
+/// The reason a `w` x `h` image is refused (either side 0 or above
+/// [`MAX_DIMENSION`]), naming it `what`, if it is.
+pub fn check_dimensions(what: &str, w: u32, h: u32) -> Result<(), String> {
     if w > MAX_DIMENSION || h > MAX_DIMENSION || w == 0 || h == 0 {
         return Err(format!(
             "{what} is {w}x{h} pixels, outside the {MAX_DIMENSION}x{MAX_DIMENSION} limit"
@@ -403,7 +610,7 @@ fn check_dimensions(what: &str, w: u32, h: u32) -> Result<(), String> {
 /// [`image_length`]; anything after the first image is ignored); then:
 ///
 /// ```text
-/// appsrc (the bytes) ! pngdec | jpegdec ! videoconvert ! BGR ! videocrop
+/// appsrc (the bytes) ! pngdec | jpegdec | webpdec ! videoconvert ! BGR ! videocrop
 ///        ! videoscale ! BGR,width,height ! appsink
 /// ```
 ///
@@ -425,7 +632,7 @@ fn decode_as(path: &Path, width: u32, height: u32, subject: Subject) -> Result<H
     check_dimensions(&what, w, h)?;
     let len = image_length(format, &data).map_err(|e| format!("cannot decode {what}: {e}"))?;
     data.truncate(len);
-    gst::init().map_err(|e| format!("GStreamer: {e}"))?;
+    decoder_available(format).map_err(|reason| format!("cannot decode {what}: {reason}"))?;
     let make = |factory: &str| {
         gst::ElementFactory::make(factory)
             .build()
@@ -865,6 +1072,13 @@ mod tests {
         std::fs::write(&ok, b"x").unwrap();
         assert_eq!(check_file(&ok).unwrap(), 1);
         assert_eq!(read_file(&ok).unwrap(), b"x");
+        // The neutral reader names the image file, not the background.
+        assert_eq!(read_image_file(&ok).unwrap(), b"x");
+        let e = read_image_file(&big).unwrap_err();
+        assert!(
+            e.starts_with("the image file /") && e.contains("32 MiB"),
+            "{e}"
+        );
         assert!(read_file(&big).unwrap_err().contains("32 MiB"));
     }
 
@@ -911,7 +1125,7 @@ mod tests {
     #[test]
     fn a_header_that_cannot_be_read_is_a_reason() {
         let other = image_header(b"GIF89a....").unwrap_err();
-        assert!(other.contains("neither a PNG nor a JPEG"), "{other}");
+        assert!(other.contains("not a PNG, JPEG or WebP"), "{other}");
         assert!(image_header(&[]).is_err());
         let png = png_header(10, 10);
         let e = image_header(&png[..20]).unwrap_err();
@@ -1036,19 +1250,341 @@ mod tests {
     /// each sample, at every position, through both parsers.
     #[test]
     fn the_parsers_survive_any_single_byte_change() {
-        for image in [png_file(), jpeg_file()] {
+        for image in [
+            png_file(),
+            jpeg_file(),
+            webp_extended(4, 4),
+            webp_file(&[vp8_chunk(4, 4)]),
+        ] {
             for at in 0..image.len() {
                 for byte in [0x00, 0x01, 0x7F, 0x80, 0xD8, 0xD9, 0xDA, 0xFE, 0xFF] {
                     let mut v = image.clone();
                     v[at] = byte;
                     let _ = image_header(&v);
-                    for format in [ImageFormat::Png, ImageFormat::Jpeg] {
+                    for format in [ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::Webp] {
                         if let Ok(len) = image_length(format, &v) {
                             assert!(len <= v.len());
                         }
                     }
                 }
             }
+        }
+    }
+
+    /// A RIFF chunk of `kind` with `data`, padded to even.
+    fn riff_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut v = kind.to_vec();
+        v.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        v.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            v.push(0);
+        }
+        v
+    }
+
+    /// A WebP RIFF container holding `chunks`, with the RIFF size set.
+    fn webp_file(chunks: &[Vec<u8>]) -> Vec<u8> {
+        let body: Vec<u8> = chunks.concat();
+        let mut v = b"RIFF".to_vec();
+        v.extend_from_slice(&(body.len() as u32 + 4).to_le_bytes());
+        v.extend_from_slice(b"WEBP");
+        v.extend(body);
+        v
+    }
+
+    /// A lossy `VP8 ` chunk declaring `w` x `h` (scale bits set, ignored).
+    fn vp8_chunk(w: u16, h: u16) -> Vec<u8> {
+        let mut d = vec![0x10, 0x02, 0x00, 0x9D, 0x01, 0x2A];
+        d.extend_from_slice(&(w | 0x4000).to_le_bytes());
+        d.extend_from_slice(&(h | 0xC000).to_le_bytes());
+        d.extend_from_slice(&[0xAB; 7]);
+        riff_chunk(b"VP8 ", &d)
+    }
+
+    /// A lossless `VP8L` chunk declaring `w` x `h` (1 to 16384).
+    fn vp8l_chunk(w: u32, h: u32) -> Vec<u8> {
+        let bits = (w - 1) | ((h - 1) << 14) | (1 << 28);
+        let mut d = vec![0x2F];
+        d.extend_from_slice(&bits.to_le_bytes());
+        d.extend_from_slice(&[0x55; 4]);
+        riff_chunk(b"VP8L", &d)
+    }
+
+    /// An extended `VP8X` chunk with `flags`, declaring a `w` x `h` canvas.
+    fn vp8x_chunk(flags: u8, w: u32, h: u32) -> Vec<u8> {
+        let mut d = vec![flags, 0, 0, 0];
+        d.extend_from_slice(&(w - 1).to_le_bytes()[..3]);
+        d.extend_from_slice(&(h - 1).to_le_bytes()[..3]);
+        riff_chunk(b"VP8X", &d)
+    }
+
+    /// A still extended WebP: `VP8X`, an `ICCP` profile, then the image.
+    fn webp_extended(w: u32, h: u32) -> Vec<u8> {
+        webp_file(&[
+            vp8x_chunk(0x20, w, h),
+            riff_chunk(b"ICCP", &[1, 2, 3]),
+            vp8l_chunk(w, h),
+        ])
+    }
+
+    #[test]
+    fn the_size_of_a_webp_is_read_from_its_first_chunk() {
+        assert_eq!(
+            image_header(&webp_file(&[vp8_chunk(16_000, 3)])).unwrap(),
+            (ImageFormat::Webp, 16_000, 3)
+        );
+        assert_eq!(
+            image_header(&webp_file(&[vp8l_chunk(16_384, 1)])).unwrap(),
+            (ImageFormat::Webp, 16_384, 1)
+        );
+        assert_eq!(
+            image_header(&webp_file(&[vp8l_chunk(640, 480)])).unwrap(),
+            (ImageFormat::Webp, 640, 480)
+        );
+        // An extended file: the size of its bitstream, past an ALPH chunk.
+        let alpha = webp_file(&[
+            vp8x_chunk(0x10, 640, 480),
+            riff_chunk(b"ALPH", &[0; 9]),
+            vp8_chunk(640, 480),
+        ]);
+        assert_eq!(image_header(&alpha).unwrap(), (ImageFormat::Webp, 640, 480));
+        assert_eq!(
+            image_header(&webp_extended(16_384, 2)).unwrap(),
+            (ImageFormat::Webp, 16_384, 2)
+        );
+        // A declared size beyond the limit is returned as it is, and refused
+        // by the dimension check before any decoder runs.
+        let big = webp_file(&[vp8x_chunk(0x00, 9000, 3), vp8_chunk(9000, 3)]);
+        let (format, w, h) = image_header(&big).unwrap();
+        assert_eq!((format, w, h), (ImageFormat::Webp, 9000, 3));
+        let e = check_dimensions("x", w, h).unwrap_err();
+        assert!(e.contains("9000x3"), "{e}");
+    }
+
+    #[test]
+    fn an_extended_webp_needs_an_image_of_its_canvas_size() {
+        // The canvas declares 60000 x 3 (or 2^24 a side), the bitstream the
+        // decoder would allocate something else.
+        for image in [
+            webp_file(&[vp8x_chunk(0x00, 60_000, 3), vp8l_chunk(16_384, 3)]),
+            webp_file(&[vp8x_chunk(0x00, 1 << 24, 1 << 24), vp8l_chunk(64, 64)]),
+            webp_file(&[vp8x_chunk(0x00, 64, 64), vp8l_chunk(8192, 8192)]),
+            webp_file(&[
+                vp8x_chunk(0x10, 64, 64),
+                riff_chunk(b"ALPH", &[0; 4]),
+                vp8_chunk(65, 64),
+            ]),
+        ] {
+            let e = image_header(&image).unwrap_err();
+            assert_eq!(e, "the WebP canvas and its image differ in size");
+        }
+        // No image chunk at all, or only one beyond the RIFF size.
+        let bare = webp_file(&[vp8x_chunk(0x20, 64, 64), riff_chunk(b"ICCP", &[1, 2, 3])]);
+        let e = image_header(&bare).unwrap_err();
+        assert!(e.contains("without a VP8 or VP8L image chunk"), "{e}");
+        let mut outside = webp_file(&[vp8x_chunk(0x00, 64, 64)]);
+        outside.extend(vp8l_chunk(64, 64));
+        let e = image_header(&outside).unwrap_err();
+        assert!(e.contains("without a VP8 or VP8L image chunk"), "{e}");
+        // The first image chunk counts, not a later one.
+        let two = webp_file(&[
+            vp8x_chunk(0x00, 64, 64),
+            vp8l_chunk(32, 32),
+            vp8l_chunk(64, 64),
+        ]);
+        assert!(image_header(&two).is_err());
+        // An image chunk cut short, or with a wrong signature.
+        let mut bad = webp_extended(64, 64);
+        let at = bad.len() - 10;
+        assert_eq!(bad[at], 0x2F);
+        bad[at] = 0x2E;
+        assert!(image_header(&bad).unwrap_err().contains("valid header"));
+    }
+
+    #[test]
+    fn a_webp_header_that_cannot_be_read_is_a_reason() {
+        for image in [
+            webp_file(&[vp8_chunk(10, 10)]),
+            webp_file(&[vp8l_chunk(10, 10)]),
+            webp_extended(10, 10),
+        ] {
+            // Through the size fields: VP8 needs 10 payload bytes, VP8L 5;
+            // VP8X its 10, then the VP8L chunk past the ICCP one.
+            let need = match &image[12..16] {
+                b"VP8L" => 25,
+                b"VP8 " => 30,
+                _ => 55,
+            };
+            for cut in 0..need {
+                let e = image_header(&image[..cut]).unwrap_err();
+                let want = if cut < 4 {
+                    "not a PNG, JPEG or WebP"
+                } else if (30..50).contains(&cut) && need == 55 {
+                    "without a VP8 or VP8L image chunk"
+                } else {
+                    "without a valid header"
+                };
+                assert!(e.contains(want), "cut {cut}: {e}");
+            }
+            assert!(image_header(&image[..need]).is_ok());
+        }
+        // A wrong VP8 start code or VP8L signature.
+        let mut vp8 = webp_file(&[vp8_chunk(10, 10)]);
+        vp8[23] = 0x9C;
+        assert!(image_header(&vp8).unwrap_err().contains("valid header"));
+        let mut vp8l = webp_file(&[vp8l_chunk(10, 10)]);
+        vp8l[20] = 0x2E;
+        assert!(image_header(&vp8l).unwrap_err().contains("valid header"));
+        // Another first chunk, and another RIFF format.
+        let e = image_header(&webp_file(&[riff_chunk(b"ALPH", &[0; 10])])).unwrap_err();
+        assert!(e.contains("first chunk is not VP8"), "{e}");
+        let mut avi = webp_file(&[vp8_chunk(10, 10)]);
+        avi[8..12].copy_from_slice(b"AVI ");
+        let e = image_header(&avi).unwrap_err();
+        assert!(e.contains("not a PNG, JPEG or WebP"), "{e}");
+    }
+
+    #[test]
+    fn an_animated_webp_is_refused() {
+        let frame = riff_chunk(b"ANMF", &[0; 16]);
+        for image in [
+            // The VP8X animation flag (with alpha, as encoders write it).
+            webp_file(&[vp8x_chunk(0x12, 64, 64), riff_chunk(b"ANIM", &[0; 6])]),
+            webp_file(&[vp8x_chunk(0x02, 64, 64)]),
+            // An animation chunk without the flag, after VP8X or first.
+            webp_file(&[vp8x_chunk(0x00, 64, 64), riff_chunk(b"ANIM", &[0; 6])]),
+            webp_file(&[
+                vp8x_chunk(0x00, 64, 64),
+                riff_chunk(b"XMP ", &[1]),
+                frame.clone(),
+            ]),
+            webp_file(&[riff_chunk(b"ANIM", &[0; 6])]),
+            webp_file(std::slice::from_ref(&frame)),
+        ] {
+            let e = image_header(&image).unwrap_err();
+            assert_eq!(e, "animated WebP is not supported as a still image");
+        }
+        // A chunk beyond the RIFF size is not part of the file.
+        let mut still = webp_file(&[vp8x_chunk(0x00, 64, 64), vp8l_chunk(64, 64)]);
+        still.extend(riff_chunk(b"ANIM", &[0; 6]));
+        assert_eq!(image_header(&still).unwrap(), (ImageFormat::Webp, 64, 64));
+    }
+
+    #[test]
+    fn a_webp_ends_at_its_riff_size() {
+        let webp = webp_extended(4, 4);
+        assert_eq!(image_length(ImageFormat::Webp, &webp), Ok(webp.len()));
+        // A second image, or anything else, after the first is not part of
+        // it.
+        let mut two = webp.clone();
+        two.extend_from_slice(&webp);
+        assert_eq!(image_length(ImageFormat::Webp, &two), Ok(webp.len()));
+        two.truncate(webp.len() + 1);
+        assert_eq!(image_length(ImageFormat::Webp, &two), Ok(webp.len()));
+        // An odd RIFF size is padded to even.
+        let mut odd = b"RIFF\x0D\0\0\0WEBPVP8L\x01\0\0\0x\0".to_vec();
+        assert_eq!(image_length(ImageFormat::Webp, &odd), Ok(22));
+        odd.pop();
+        let e = image_length(ImageFormat::Webp, &odd).unwrap_err();
+        assert!(e.contains("before its RIFF size"), "{e}");
+        // Every cut ends before the RIFF size.
+        for cut in 0..webp.len() {
+            let e = image_length(ImageFormat::Webp, &webp[..cut]).unwrap_err();
+            assert!(
+                e.contains("before its RIFF size") || e.contains("invalid RIFF size"),
+                "cut {cut}: {e}"
+            );
+        }
+        // A RIFF size below 12 (it counts "WEBP" and the first chunk's
+        // header), or one short of the first chunk's payload (VP8X, 10
+        // bytes: at least 22).
+        for size in [0u32, 3, 11, 21] {
+            let mut v = webp.clone();
+            v[4..8].copy_from_slice(&size.to_le_bytes());
+            let e = image_length(ImageFormat::Webp, &v).unwrap_err();
+            assert!(e.contains("invalid RIFF size"), "{size}: {e}");
+        }
+        // A lossless file whose RIFF size stops inside its VP8L payload.
+        let mut vp8l = webp_file(&[vp8l_chunk(4, 4)]);
+        assert_eq!(image_length(ImageFormat::Webp, &vp8l), Ok(vp8l.len()));
+        vp8l[4..8].copy_from_slice(&(4 + 8 + 9 - 1u32).to_le_bytes());
+        let e = image_length(ImageFormat::Webp, &vp8l).unwrap_err();
+        assert!(e.contains("invalid RIFF size"), "{e}");
+        // The largest one.
+        let mut huge = webp.clone();
+        huge[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        let e = image_length(ImageFormat::Webp, &huge).unwrap_err();
+        assert!(e.contains("before its RIFF size"), "{e}");
+        assert!(image_length(ImageFormat::Webp, b"GIF89a....").is_err());
+    }
+
+    /// Encodes a `w` x `h` test pattern as WebP with GStreamer's `webpenc`
+    /// (`lossless` picks VP8L over VP8), or `None` if `webpenc` or `webpdec`
+    /// is not installed.
+    fn encode_webp(w: i32, h: i32, lossless: bool) -> Option<Vec<u8>> {
+        gst::init().unwrap();
+        if gst::ElementFactory::find("webpenc").is_none()
+            || gst::ElementFactory::find("webpdec").is_none()
+        {
+            eprintln!("skipped: GStreamer webpenc or webpdec is not installed");
+            return None;
+        }
+        let pipeline = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=1 ! video/x-raw,format=RGB,width={w},height={h} \
+             ! webpenc lossless={lossless} ! appsink name=sink sync=false"
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let sink = pipeline
+            .by_name("sink")
+            .unwrap()
+            .downcast::<gst_app::AppSink>()
+            .unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let sample = sink
+            .try_pull_sample(gst::ClockTime::from_seconds(10))
+            .expect("webpenc produced an image");
+        let bytes = sample.buffer().unwrap().map_readable().unwrap().to_vec();
+        pipeline.set_state(gst::State::Null).unwrap();
+        Some(bytes)
+    }
+
+    #[test]
+    fn a_real_webp_decodes_to_the_size_asked() {
+        for (lossless, chunk) in [(false, b"VP8 "), (true, b"VP8L")] {
+            let Some(webp) = encode_webp(64, 48, lossless) else {
+                return;
+            };
+            assert_eq!(&webp[12..16], chunk);
+            assert_eq!(image_header(&webp).unwrap(), (ImageFormat::Webp, 64, 48));
+            assert_eq!(image_length(ImageFormat::Webp, &webp), Ok(webp.len()));
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("bg.webp");
+            // Trailing bytes after the RIFF container are ignored.
+            let mut file = webp.clone();
+            file.extend_from_slice(b"trailing");
+            std::fs::write(&path, &file).unwrap();
+            let image = decode(&path, 32, 18).unwrap();
+            assert_eq!((image.width, image.height), (32, 18));
+            assert_eq!(image.data.len(), image.stride * 18);
+        }
+    }
+
+    #[test]
+    fn formats_name_their_extension_and_decoder() {
+        assert_eq!(ImageFormat::Png.extension(), "png");
+        assert_eq!(ImageFormat::Jpeg.extension(), "jpg");
+        assert_eq!(ImageFormat::Webp.extension(), "webp");
+        // PNG and JPEG are decoded by gst-plugins-good, always there.
+        assert_eq!(decoder_available(ImageFormat::Png), Ok(()));
+        assert_eq!(decoder_available(ImageFormat::Jpeg), Ok(()));
+        gst::init().unwrap();
+        let webp = decoder_available(ImageFormat::Webp);
+        if gst::ElementFactory::find("webpdec").is_some() {
+            assert_eq!(webp, Ok(()));
+        } else {
+            assert!(webp.unwrap_err().contains("webpdec"));
         }
     }
 

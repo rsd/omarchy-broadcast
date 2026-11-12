@@ -1,0 +1,59 @@
+# Provenance of every file bundled in this directory (installed to
+# /usr/share/omarchy-broadcast/media/backgrounds/). One [[item]] per file, in
+# display order. Generated items are original work, made by the script named
+# in `source` and licensed with the repository. Photographs may only be added
+# if they are CC0-1.0, with the source URL in `source`.
+
+[[item]]
+file = "dusk-gradient.jpg"
+title = "Dusk gradient"
+author = "omarchy-broadcast contributors"
+licence = "MIT OR Apache-2.0"
+source = "scripts/gen-backgrounds.sh"
+retrieved = "2026-11-12"
+edits = "none"
+
+[[item]]
+file = "studio-blue.jpg"
+title = "Studio blue"
+author = "omarchy-broadcast contributors"
+licence = "MIT OR Apache-2.0"
+source = "scripts/gen-backgrounds.sh"
+retrieved = "2026-11-12"
+edits = "none"
+
+[[item]]
+file = "warm-bokeh.jpg"
+title = "Warm bokeh"
+author = "omarchy-broadcast contributors"
+licence = "MIT OR Apache-2.0"
+source = "scripts/gen-backgrounds.sh"
+retrieved = "2026-11-12"
+edits = "none"
+
+[[item]]
+file = "cool-bokeh.jpg"
+title = "Cool bokeh"
+author = "omarchy-broadcast contributors"
+licence = "MIT OR Apache-2.0"
+source = "scripts/gen-backgrounds.sh"
+retrieved = "2026-11-12"
+edits = "none"
+
+[[item]]
+file = "soft-shapes.jpg"
+title = "Soft shapes"
+author = "omarchy-broadcast contributors"
+licence = "MIT OR Apache-2.0"
+source = "scripts/gen-backgrounds.sh"
+retrieved = "2026-11-12"
+edits = "none"
+
+[[item]]
+file = "graphite.jpg"
+title = "Graphite"
+author = "omarchy-broadcast contributors"
+licence = "MIT OR Apache-2.0"
+source = "scripts/gen-backgrounds.sh"
+retrieved = "2026-11-12"
+edits = "none"

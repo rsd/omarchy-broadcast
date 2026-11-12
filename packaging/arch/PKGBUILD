@@ -72,7 +72,7 @@
 
 pkgname=omarchy-broadcast-git
 _pkgname=omarchy-broadcast
-pkgver=0.34.2
+pkgver=0.35.0
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API and a CLI'
 arch=('x86_64')
@@ -112,6 +112,7 @@ optdepends=(
   'maxine-vfx-sdk-local: NVIDIA Maxine video effects (build it from omarchy-nvidia-sdks)'
   'maxine-ar-sdk-local: NVIDIA Maxine AR effects, eye contact (build it from omarchy-nvidia-sdks)'
   'maxine-afx-sdk-local: NVIDIA Maxine audio effects for the microphone (build it from omarchy-nvidia-sdks)'
+  'gst-plugins-bad: WebP background and away images (webpdec)'
 )
 # No LTO: with makepkg's -flto, libspa's build script compiles its C wrapper
 # into GCC LTO bitcode, which rust-lld cannot link (undefined libspa_rs_*).
@@ -245,6 +246,11 @@ package() {
   # DeepFilterNet and its model, libloading).
   install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE-MIT LICENSE-APACHE \
     dist/licenses/THIRD-PARTY-NOTICES
+
+  # The bundled background gallery (procedural images made by
+  # scripts/gen-backgrounds.sh) and the provenance of every file in it.
+  install -Dm644 -t "$pkgdir/usr/share/$_pkgname/media/backgrounds" \
+    assets/media/backgrounds/*.jpg assets/media/backgrounds/SOURCES.toml
 
   # Documentation, in the repository's layout so that links between the
   # shipped files resolve. Links to files that are not shipped (decision
