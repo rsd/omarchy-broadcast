@@ -375,6 +375,7 @@ fn names_group(id: &str, g: &obc_ipc::SettingsGroup) -> bool {
 pub fn settings_text(s: &Snapshot, tree: &SettingsTree, only: Only<'_>) -> String {
     let mut camera_groups = Vec::new();
     let mut global_groups = Vec::new();
+    let mut mic_groups = Vec::new();
     for g in &tree.groups {
         if matches!(only, Only::Group(id) if !names_group(id, g)) {
             continue;
@@ -409,15 +410,18 @@ pub fn settings_text(s: &Snapshot, tree: &SettingsTree, only: Only<'_>) -> Strin
         if rows.is_empty() {
             continue;
         }
-        if g.is_global() {
+        if g.surface.as_deref() == Some(obc_ipc::settings::SURFACE_MIC) {
+            mic_groups.push((printable(&g.label), rows));
+        } else if g.is_global() {
             global_groups.push((printable(&g.label), rows));
         } else {
             camera_groups.push((printable(&g.label), rows));
         }
     }
     let mut out = String::new();
-    let camera_part =
-        matches!(only, Only::All) || !camera_groups.is_empty() || global_groups.is_empty();
+    let camera_part = matches!(only, Only::All)
+        || !camera_groups.is_empty()
+        || (global_groups.is_empty() && mic_groups.is_empty());
     if camera_part {
         out.push_str(&format!(
             "Camera:     {}\n",
@@ -442,10 +446,17 @@ pub fn settings_text(s: &Snapshot, tree: &SettingsTree, only: Only<'_>) -> Strin
         settings_rows_text(&mut out, &global_groups);
     } else if matches!(only, Only::All)
         && s.interface_revision >= obc_ipc::MODULES_REVISION
-        && !tree.groups.iter().any(|g| g.is_global())
+        && !tree
+            .groups
+            .iter()
+            .any(|g| g.is_global() && g.surface.as_deref() != Some(obc_ipc::settings::SURFACE_MIC))
     {
         // From revision 9 the effects are the modules': none, none shown.
         out.push_str(&format!("All cameras: {}\n", crate::modules::NO_MODULES));
+    }
+    if !mic_groups.is_empty() {
+        // The microphone's groups name themselves; they are not "All cameras".
+        settings_rows_text(&mut out, &mic_groups);
     }
     out
 }
@@ -1378,6 +1389,21 @@ mod tests {
                 surface: None,
             },
         ]
+    }
+
+    #[test]
+    fn microphone_settings_are_not_listed_under_all_cameras() {
+        let s = sample();
+        let mut tree = SettingsTree {
+            groups: global_groups(),
+            ..SettingsTree::default()
+        };
+        for g in &mut tree.groups {
+            g.surface = Some("mic".into());
+        }
+        let text = settings_text(&s, &tree, Only::Setting("effect.video.denoise"));
+        assert!(!text.contains("All cameras"), "{text}");
+        assert!(text.starts_with("Video\n"), "{text}");
     }
 
     const GLOBAL_TEXT: &str = "All cameras:\n\

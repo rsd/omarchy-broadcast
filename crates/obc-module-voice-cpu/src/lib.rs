@@ -223,7 +223,7 @@ impl AudioInstance for VoiceInstance {
         let engine = self.engine.as_ref().expect("loaded above");
         let load_ms = start.elapsed().as_secs_f32() * 1e3;
         log::info!(
-            "mic-denoise: {} at {strength} %, {} samples of delay ({load_ms:.0} ms{})",
+            "mic-denoise: {} at {strength} %, {} samples of delay (loaded in {load_ms:.0} ms{})",
             kind.label(),
             engine.latency_samples(),
             if reused { ", reused" } else { "" }

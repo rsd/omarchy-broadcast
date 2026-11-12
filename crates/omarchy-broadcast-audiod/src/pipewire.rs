@@ -63,7 +63,8 @@ pub trait PipeWireControl: Send + Sync {
     fn devices(&self) -> Result<Vec<SourceDevice>, PipeWireError>;
 
     /// Makes the microphone the default source and pins its capture side to
-    /// `target` (a device's `node.name`; empty: the previous default), so
+    /// `target` (a device's `node.name`; empty: the previous default, else
+    /// the default in force when the previous one is unplugged), so
     /// that it never loops onto itself nor picks between equal-priority
     /// mics. Returns the previous default's `node.name` (empty when not
     /// known), for [`PipeWireControl::restore_default`]; called again, it
@@ -73,7 +74,11 @@ pub trait PipeWireControl: Send + Sync {
 
     /// Makes `previous` the default source again, if the microphone is
     /// still the default (WirePlumber's choice when `previous` is empty),
-    /// and unpins the capture side.
+    /// and unpins the capture side; with another connected device (the
+    /// pinned one, else WirePlumber's own choice) written under `previous`
+    /// in WirePlumber's history, so that ours does not become the default by
+    /// itself when `previous` is unplugged. With no other device connected,
+    /// it still can (see [`graph::Graph::restore_default`]).
     fn restore_default(&self, previous: &str) -> Result<(), PipeWireError>;
 
     /// The consumers of the microphone node, debounced

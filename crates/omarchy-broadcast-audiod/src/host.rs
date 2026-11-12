@@ -738,7 +738,18 @@ impl Host {
     /// setting dictionaries (with `stage`, `key`, `apply` and `role` too);
     /// `enabled` computed from the conditions, the stage's provider and the
     /// conflicts in force.
+    ///
+    /// It describes what the user may configure, so only the policy gates
+    /// ([`GpuGate::Never`], [`GpuGate::CameraOff`]: the stage cannot run in
+    /// this session) grey a GPU stage's settings; the transient ones
+    /// ([`GpuGate::NoRecorder`], [`GpuGate::Pending`]) are planned as
+    /// allowed, as when an application records. The status keeps the
+    /// stage's reason for those.
     pub fn settings_json(&self, snapshot: &Snapshot, gate: GpuGate) -> Json {
+        let gate = match gate {
+            GpuGate::NoRecorder | GpuGate::Pending => GpuGate::Allowed,
+            g => g,
+        };
         let plan = self.plan(snapshot, gate);
         let mut groups = Vec::new();
         for id in self.registry.ids() {

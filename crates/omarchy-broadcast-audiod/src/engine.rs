@@ -1022,7 +1022,14 @@ impl Engine {
         });
     }
 
+    /// The status. With no plugin connected nothing records, so the state is
+    /// `passthrough` (`off` when processing is off), with no provider and no
+    /// latency, whatever chain is still loaded or ran last; the stages keep
+    /// their own states and reasons. A connection dropped for a deeper
+    /// pipeline counts as connected while the plugin connects again (the
+    /// app still records): the status does not flip for it.
     fn status(&self) -> Status {
+        let connected = self.endpoint.is_some() || self.renegotiating.is_some();
         let running: BTreeMap<String, String> = self
             .active
             .as_ref()
@@ -1060,6 +1067,8 @@ impl Engine {
         let wanted = !self.plan.groups.is_empty();
         let state = if !self.plan.enabled {
             State::Off
+        } else if !connected {
+            State::Passthrough
         } else if processing {
             State::Active
         } else if wanted && (loading || self.active.is_some() || !self.armed) {
@@ -1079,23 +1088,28 @@ impl Engine {
             String::new()
         };
         let consumers = self.shared.pipewire.consumers();
-        let (depth, transport) = if self.endpoint.is_some() {
-            (self.depth, self.transport_delay())
+        let depth = if self.endpoint.is_some() {
+            self.depth
         } else {
-            let depth = self.open_depth;
-            (
-                depth,
-                obc_audio::transport_delay(BLOCK_SAMPLES as u32, depth),
-            )
+            self.open_depth
         };
-        let latency = self.latency_now();
+        let (transport, latency) = if self.endpoint.is_some() {
+            (self.transport_delay(), self.latency_now())
+        } else if connected {
+            (
+                obc_audio::transport_delay(BLOCK_SAMPLES as u32, depth),
+                self.latency_now(),
+            )
+        } else {
+            (0, 0)
+        };
         let samples_per_ms = f64::from(obc_audio::SAMPLE_RATE) / 1000.0;
         Status {
             state,
             consumers: consumers.map_or(0, |c| c.real),
             consumers_known: consumers.is_some(),
-            connected: self.endpoint.is_some(),
-            provider: running,
+            connected,
+            provider: if connected { running } else { BTreeMap::new() },
             latency_ms: f64::from(transport + latency) / samples_per_ms,
             latency_samples: latency,
             pipeline_depth: depth,

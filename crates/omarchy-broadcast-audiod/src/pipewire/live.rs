@@ -462,6 +462,9 @@ fn on_node(ctx: &Rc<Ctx>, g: &pw::registry::GlobalObject<&spa::utils::dict::Dict
             description,
             media_class: class,
             serial: props_of(g, "object.serial"),
+            priority: props_of(g, "priority.session")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             monitor: None,
         },
     );
@@ -672,8 +675,10 @@ fn connect(
     })
 }
 
-/// Executes `writes` on the `default` metadata, and applies them to the
-/// graph at once.
+/// Executes `writes` on the `default` metadata, in their order (one proxy on
+/// one connection: the server receives them in that order, which
+/// [`Graph::restore_default`] relies on), and applies them to the graph at
+/// once.
 fn write(ctx: &Ctx, writes: &[MetaWrite]) -> Result<(), PipeWireError> {
     if writes.is_empty() {
         return Ok(());

@@ -357,8 +357,9 @@ device = "default"
 # Default: 0
 pipeline_depth = 0
 
-# Seconds without sound before the audio worker exits and frees its memory
-# and the GPU; it starts again when sound flows. 0 to 86400; 0 never exits.
+# Seconds without audio and without a call to the audio worker before it
+# exits and frees its memory and the GPU; it starts again when sound flows.
+# 0 to 86400; 0 never exits.
 # Default: 30
 idle_exit_s = 30
 

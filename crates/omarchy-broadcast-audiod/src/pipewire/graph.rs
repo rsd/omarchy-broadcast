@@ -63,6 +63,9 @@ pub struct NodeInfo {
     pub media_class: String,
     /// `object.serial`.
     pub serial: Option<String>,
+    /// `priority.session` (0 when absent or not a number): the rank
+    /// WirePlumber gives a node when no history decides.
+    pub priority: i64,
     /// Whether it is a monitor stream (`stream.monitor` or
     /// `resample.peaks`: a level meter): `None` until its properties are
     /// known.
@@ -283,11 +286,50 @@ impl Graph {
             .map(|n| n.name.clone())
     }
 
+    /// The `object.serial` of the device named `name`, when it is connected
+    /// (see [`NodeInfo::is_device`]).
+    fn device_serial(&self, name: &str) -> Option<String> {
+        self.node_by_name(name)
+            .filter(|(_, n)| n.is_device())
+            .and_then(|(_, n)| n.serial.clone())
+    }
+
+    /// The device to write under `previous` in WirePlumber's history on a
+    /// restore: the one the capture side is pinned to, when it is a
+    /// connected device other than `previous`; else the connected device
+    /// other than `previous` that WirePlumber itself would choose with no
+    /// history (the highest `priority.session`, the lowest node id on a
+    /// tie). `None` when there is no such device.
+    fn fallback_source(&self, previous: &str) -> Option<String> {
+        self.pin()
+            .filter(|p| p != previous && self.device_serial(p).is_some())
+            .or_else(|| {
+                self.nodes
+                    .values()
+                    .filter(|n| n.is_device() && n.name != previous)
+                    // `max_by_key` keeps the last of equal keys: reversed,
+                    // the first (lowest id) of the highest priority.
+                    .rev()
+                    .max_by_key(|n| n.priority)
+                    .map(|n| n.name.clone())
+            })
+    }
+
     /// "Use as default microphone": the writes that make ours the default
-    /// source and pin the capture side to `target` (empty: the previous
-    /// default), and the previous default to remember. When ours is the
-    /// default already, the previous one is the pin in force (empty when
+    /// source and pin the capture side, and the previous default to
+    /// remember.
+    ///
+    /// The previous default is the user's configured one (else the one in
+    /// force), so that a restore writes back exactly what the user had; when
+    /// ours is the default already, it is the pin in force (empty when
     /// none): ours is never returned as the previous one.
+    ///
+    /// The pin is `target` when given; else the previous default when it is
+    /// a connected device; else the default in force (`default.audio.source`)
+    /// when it is a connected device and not ours: a configured default that
+    /// is unplugged (WirePlumber already fell back from it) does not stop the
+    /// microphone from being made the default. Else, with a previous default
+    /// to pin to, it fails; with none, nothing is pinned.
     pub fn make_default(&self, target: &str) -> Result<(String, Vec<MetaWrite>), PipeWireError> {
         let (capture, _) = self
             .node_by_name(CAPTURE_NODE)
@@ -302,24 +344,26 @@ impl Graph {
             Some(c) if !c.starts_with(MIC_NODE) => c,
             _ => self.pin().unwrap_or_default(),
         };
-        let pin = if target.is_empty() {
-            previous.as_str()
+        let pin = if !target.is_empty() {
+            target.to_string()
+        } else if previous.is_empty() || self.device_serial(&previous).is_some() {
+            previous.clone()
         } else {
-            target
+            self.meta_value(0, SOURCE_KEY)
+                .and_then(name_of_json)
+                .filter(|n| !n.starts_with(MIC_NODE) && self.device_serial(n).is_some())
+                .unwrap_or_else(|| previous.clone())
         };
         // The pin first: by the time WirePlumber sees ours as the default,
         // the capture side is already pinned away from it (never a loop).
         let mut writes = Vec::new();
         if !pin.is_empty() {
-            let serial = self
-                .node_by_name(pin)
-                .filter(|(_, n)| n.is_device())
-                .and_then(|(_, n)| n.serial.clone())
-                .ok_or_else(|| {
-                    PipeWireError::Invalid(format!(
-                        "{pin} is not connected: the microphone cannot be pinned to it"
-                    ))
-                })?;
+            let serial = self.device_serial(&pin).ok_or_else(|| {
+                PipeWireError::Invalid(format!(
+                    "{pin} is not connected: the microphone cannot be pinned to it; \
+                     choose one with `omarchy-broadcast mic device`"
+                ))
+            })?;
             writes.push(MetaWrite::Set {
                 subject: capture,
                 key: TARGET_KEY.into(),
@@ -340,6 +384,18 @@ impl Graph {
     /// WirePlumber picks one, when empty), only if ours is still the
     /// configured default; and the capture side unpinned. Never makes ours
     /// the default.
+    ///
+    /// WirePlumber keeps a history of configured defaults (each write of
+    /// `default.configured.audio.source` moves that name to its top) and,
+    /// when the configured node is absent, picks the available one highest
+    /// in it. Writing `previous` alone would leave ours second, so that with
+    /// `previous` unplugged ours would become the default by itself on its
+    /// next start. So, before `previous`, another device is written (see
+    /// [`Graph::fallback_source`]): the history becomes `previous`, that
+    /// device, ours. With no other device connected only `previous` is
+    /// written, and ours stays second in the history: with `previous`
+    /// unplugged and no other source there, ours can still become the
+    /// default by itself. The writes are executed in the order returned.
     pub fn restore_default(&self, previous: &str) -> Vec<MetaWrite> {
         let mut writes = Vec::new();
         let ours = self
@@ -352,6 +408,14 @@ impl Graph {
                     key: CONFIGURED_SOURCE_KEY.into(),
                 });
             } else {
+                if let Some(other) = self.fallback_source(previous) {
+                    writes.push(MetaWrite::Set {
+                        subject: 0,
+                        key: CONFIGURED_SOURCE_KEY.into(),
+                        type_: JSON_TYPE.into(),
+                        value: json_of_name(&other),
+                    });
+                }
                 writes.push(MetaWrite::Set {
                     subject: 0,
                     key: CONFIGURED_SOURCE_KEY.into(),
@@ -382,6 +446,7 @@ mod tests {
             description: format!("{name} desc"),
             media_class: class.into(),
             serial: Some(serial.to_string()),
+            priority: 0,
             monitor: None,
         }
     }
@@ -481,6 +546,79 @@ mod tests {
     }
 
     #[test]
+    fn make_default_with_an_unplugged_configured_default_pins_to_the_one_in_force() {
+        let mut g = graph();
+        g.meta_event(
+            0,
+            Some(CONFIGURED_SOURCE_KEY),
+            Some(JSON_TYPE),
+            Some(r#"{"name":"unplugged"}"#),
+        );
+        g.meta_event(
+            0,
+            Some(SOURCE_KEY),
+            Some(JSON_TYPE),
+            Some(r#"{"name":"usb-b"}"#),
+        );
+        let (previous, writes) = g.make_default("").unwrap();
+        // Remembered as the user had it; pinned to the one in force.
+        assert_eq!(previous, "unplugged");
+        assert_eq!(
+            writes,
+            [
+                MetaWrite::Set {
+                    subject: 20,
+                    key: TARGET_KEY.into(),
+                    type_: ID_TYPE.into(),
+                    value: "111".into(),
+                },
+                MetaWrite::Set {
+                    subject: 0,
+                    key: CONFIGURED_SOURCE_KEY.into(),
+                    type_: JSON_TYPE.into(),
+                    value: r#"{"name":"omarchy-broadcast-mic"}"#.into(),
+                },
+            ]
+        );
+        // A connected previous default wins over the one in force.
+        g.meta_event(
+            0,
+            Some(CONFIGURED_SOURCE_KEY),
+            Some(JSON_TYPE),
+            Some(r#"{"name":"usb-a"}"#),
+        );
+        let (previous, writes) = g.make_default("").unwrap();
+        assert_eq!(previous, "usb-a");
+        assert!(matches!(&writes[0], MetaWrite::Set { value, .. } if value == "110"));
+    }
+
+    #[test]
+    fn make_default_never_pins_to_ours_or_an_absent_default_in_force() {
+        let mut g = graph();
+        g.meta_event(
+            0,
+            Some(CONFIGURED_SOURCE_KEY),
+            Some(JSON_TYPE),
+            Some(r#"{"name":"unplugged"}"#),
+        );
+        for in_force in [MIC_NODE, "gone-too", "speakers"] {
+            g.meta_event(
+                0,
+                Some(SOURCE_KEY),
+                Some(JSON_TYPE),
+                Some(&json_of_name(in_force)),
+            );
+            match g.make_default("") {
+                Err(PipeWireError::Invalid(m)) => {
+                    assert!(m.starts_with("unplugged "), "{m}");
+                    assert!(m.ends_with("`omarchy-broadcast mic device`"), "{m}");
+                }
+                other => panic!("{in_force}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn make_default_refuses_without_mic_host_or_with_an_unknown_target() {
         let mut g = graph();
         assert!(matches!(
@@ -513,6 +651,14 @@ mod tests {
         assert_eq!(
             writes,
             [
+                // The pinned device under the previous one in WirePlumber's
+                // history, above ours.
+                MetaWrite::Set {
+                    subject: 0,
+                    key: CONFIGURED_SOURCE_KEY.into(),
+                    type_: JSON_TYPE.into(),
+                    value: r#"{"name":"usb-b"}"#.into(),
+                },
                 MetaWrite::Set {
                     subject: 0,
                     key: CONFIGURED_SOURCE_KEY.into(),
@@ -556,6 +702,149 @@ mod tests {
                 key: CONFIGURED_SOURCE_KEY.into(),
             }
         );
+    }
+
+    #[test]
+    fn restore_writes_the_pinned_device_before_the_previous_one() {
+        // The configured default unplugged: pinned to the one in force.
+        let mut g = graph();
+        g.meta_event(
+            0,
+            Some(CONFIGURED_SOURCE_KEY),
+            Some(JSON_TYPE),
+            Some(r#"{"name":"unplugged"}"#),
+        );
+        g.meta_event(
+            0,
+            Some(SOURCE_KEY),
+            Some(JSON_TYPE),
+            Some(r#"{"name":"usb-b"}"#),
+        );
+        let (previous, writes) = g.make_default("").unwrap();
+        g.apply(&writes);
+        let writes = g.restore_default(&previous);
+        // In this order: WirePlumber's history becomes unplugged, usb-b,
+        // ours; with "unplugged" absent, usb-b wins over ours.
+        assert_eq!(
+            writes,
+            [
+                MetaWrite::Set {
+                    subject: 0,
+                    key: CONFIGURED_SOURCE_KEY.into(),
+                    type_: JSON_TYPE.into(),
+                    value: r#"{"name":"usb-b"}"#.into(),
+                },
+                MetaWrite::Set {
+                    subject: 0,
+                    key: CONFIGURED_SOURCE_KEY.into(),
+                    type_: JSON_TYPE.into(),
+                    value: r#"{"name":"unplugged"}"#.into(),
+                },
+                MetaWrite::Delete {
+                    subject: 20,
+                    key: TARGET_KEY.into(),
+                },
+            ]
+        );
+        g.apply(&writes);
+        assert_eq!(g.configured_source().as_deref(), Some("unplugged"));
+    }
+
+    fn set_configured(name: &str) -> MetaWrite {
+        MetaWrite::Set {
+            subject: 0,
+            key: CONFIGURED_SOURCE_KEY.into(),
+            type_: JSON_TYPE.into(),
+            value: json_of_name(name),
+        }
+    }
+
+    #[test]
+    fn restore_pinned_to_the_previous_or_unpinned_writes_another_device_first() {
+        let unpin = MetaWrite::Delete {
+            subject: 20,
+            key: TARGET_KEY.into(),
+        };
+        // Pinned to the previous one: the other device under it.
+        let mut g = graph();
+        let (previous, writes) = g.make_default("").unwrap();
+        g.apply(&writes);
+        assert_eq!(g.pin().as_deref(), Some("usb-a"));
+        assert_eq!(
+            g.restore_default(&previous),
+            [
+                set_configured("usb-b"),
+                set_configured("usb-a"),
+                unpin.clone()
+            ]
+        );
+        // No pin: the same.
+        g.apply(std::slice::from_ref(&unpin));
+        assert_eq!(g.pin(), None);
+        assert_eq!(
+            g.restore_default(&previous),
+            [set_configured("usb-b"), set_configured("usb-a")]
+        );
+        // Pinned to a device that went away, the previous one the only
+        // device left: the previous one alone.
+        g.meta_event(20, Some(TARGET_KEY), Some(ID_TYPE), Some("111"));
+        g.remove(11);
+        assert_eq!(g.restore_default(&previous)[..1], [set_configured("usb-a")]);
+        assert_eq!(
+            g.restore_default(&previous)
+                .iter()
+                .filter(|w| matches!(w, MetaWrite::Set { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn restore_writes_only_the_previous_with_no_other_device() {
+        let mut g = graph();
+        g.remove(11);
+        // Neither a sink, a monitor nor ours counts.
+        g.add_node(14, node("x.monitor", "Audio/Source", 114));
+        let (previous, writes) = g.make_default("").unwrap();
+        g.apply(&writes);
+        assert_eq!(
+            g.restore_default(&previous),
+            [
+                set_configured("usb-a"),
+                MetaWrite::Delete {
+                    subject: 20,
+                    key: TARGET_KEY.into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_picks_the_highest_priority_device_then_the_lowest_id() {
+        let mut g = graph();
+        let mut n = node("usb-c", "Audio/Source", 113);
+        n.priority = 2000;
+        g.add_node(13, n);
+        let mut n = node("virt", "Audio/Source/Virtual", 114);
+        n.priority = 2000;
+        g.add_node(14, n);
+        // The previous one is never chosen, whatever its priority.
+        let mut n = node("usb-a", "Audio/Source", 110);
+        n.priority = 9000;
+        g.add_node(10, n);
+        let (previous, writes) = g.make_default("").unwrap();
+        g.apply(&writes);
+        g.apply(&[MetaWrite::Delete {
+            subject: 20,
+            key: TARGET_KEY.into(),
+        }]);
+        assert_eq!(
+            g.restore_default(&previous),
+            [set_configured("usb-c"), set_configured("usb-a")]
+        );
+        // A pin to another device wins over priority.
+        g.meta_event(20, Some(TARGET_KEY), Some(ID_TYPE), Some("111"));
+        assert_eq!(g.restore_default(&previous)[0], set_configured("usb-b"));
     }
 
     #[test]

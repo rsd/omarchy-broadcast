@@ -802,6 +802,11 @@ fn a_deeper_pipeline_is_negotiated_again() {
     p.run(Duration::from_secs(1));
     assert!(!p.connected(), "{}", w.log_text());
     w.wait_log("needs a pipeline depth of 2", SEC);
+    // The app still records while the plugin connects again: no flip to
+    // passthrough.
+    let s = bus.status();
+    assert_eq!(s["connected"], true, "{s}");
+    assert_ne!(s["state"], "passthrough", "{s}");
     p.connect(5 * SEC).unwrap();
     assert_eq!(p.accept().pipeline_depth, 2);
     assert!(
@@ -838,4 +843,63 @@ fn calls_keep_the_worker_up_and_it_exits_idle_after_them() {
     assert!(status.success(), "{status:?}\n{}", w.log_text());
     assert!(w.log_text().contains("idle: exiting"));
     assert!(bus.call("GetStatus", None).is_err(), "the name is gone");
+}
+
+/// With no plugin connected nothing records: `passthrough`, with no
+/// provider and no latency, before the first recorder and after the last
+/// one (the chain that ran last stays loaded); `off` when processing is off.
+#[test]
+fn the_state_is_passthrough_while_no_plugin_is_connected() {
+    let bus = PrivateBus::start();
+    let mut env = Env::new();
+    env.bus = Some(bus.address.clone());
+    env.fixture("");
+    env.snapshot(fixture_snapshot(100, json!({})));
+    let w = env.spawn();
+    bus.wait_for_worker(5 * SEC);
+    let idle = |s: &serde_json::Value| {
+        assert_eq!(s["state"], "passthrough", "{s}");
+        assert_eq!(s["connected"], false, "{s}");
+        assert_eq!(s["provider"], json!({}), "{s}");
+        assert_eq!(s["latency_ms"], 0.0, "{s}");
+        assert_eq!(s["latency_samples"], 0, "{s}");
+        assert_eq!(s["stages"].as_array().unwrap().len(), 3, "{s}");
+    };
+    idle(&bus.status());
+
+    let mut p = Plugin::new(&env.socket_path);
+    p.connect(5 * SEC).unwrap();
+    assert!(
+        p.run_until(5 * SEC, |o| processed(o).len() >= 5),
+        "{}",
+        w.log_text()
+    );
+    let s = bus.status();
+    assert_eq!(s["state"], "active", "{s}");
+    assert_eq!(s["provider"]["mic-enhance"], FIXTURE_ID, "{s}");
+    assert!(s["latency_ms"].as_f64().unwrap() > 0.0, "{s}");
+
+    p.disconnect();
+    let mut gone = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        if bus.status()["connected"] == false {
+            gone = true;
+            break;
+        }
+    }
+    assert!(gone, "{}\n{}", bus.status(), w.log_text());
+    idle(&bus.status());
+
+    let off = fixture_snapshot(100, json!({ "enabled": false }));
+    bus.call("ApplySnapshot", Some(&off.to_string())).unwrap();
+    let mut off = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        if bus.status()["state"] == "off" {
+            off = true;
+            break;
+        }
+    }
+    assert!(off, "{}", bus.status());
 }
