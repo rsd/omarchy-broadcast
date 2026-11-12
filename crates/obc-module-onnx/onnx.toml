@@ -1,0 +1,37 @@
+# The manifest of the open-model cut-out: the person's cut-out (background
+# blur and replacement) with open ONNX models run by ONNX Runtime, which the
+# module opens at run time (libonnxruntime.so, any build of 1.29 or later).
+# Install it in a modules.d directory with the library, and set `library` to
+# the library's path (absolute, or relative to this file); the models go in
+# a model directory (see README.md).
+abi = 1
+id = "br.com.dias.onnx-cutout"
+name = "Open-model cut-out"
+version = "0.38.0"
+licence = "MIT OR Apache-2.0 (module); models Apache-2.0 (MediaPipe, PP-HumanSeg, MODNet)"
+kind = "video-stage"
+library = "/usr/lib/omarchy-broadcast/modules/libobc_module_onnx.so"
+description = "Background blur and replacement with open models (MediaPipe, PP-HumanSeg, MODNet) through ONNX Runtime"
+
+[requires]
+hardware = ["any"]
+
+# The cut-out of the person. Ranked below the NVIDIA module's (300), so the
+# quality profile keeps Maxine where it runs; `device = "cpu"` makes the
+# battery profile prefer this one.
+#
+# `frames`: the module takes both kinds. CUDA comes first because it is what
+# runs today: the effect element hands the provider of `background` CUDA
+# frames whatever this list says (obc-module-host's ModuleBackend always
+# loads an OBC_FRAME_CUDA chain), and only the chains of other stages
+# (ModuleChainFactory) read the list, in order, which `background` never
+# runs in. With CUDA first, a host that comes to honour the order keeps
+# today's path; `host` is there for a host that runs the effect on system
+# memory (no CUDA device at all), which the module also handles.
+[[stage]]
+id = "background"
+slot = "matte"
+rank = 200
+device = "cpu"
+frames = ["cuda", "host"]
+formats = ["nv12"]

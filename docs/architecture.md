@@ -44,7 +44,7 @@ flowchart LR
             CS --> SLOT --> FX
         end
         MH["obc-module-host<br/>manifests, registry, loader, crash ledger"]
-        MOD["Modules (shared libraries, C ABI)<br/>Maxine module: dlopen of the user-installed SDK<br/>others: third-party"]
+        MOD["Modules (shared libraries, C ABI)<br/>Maxine module: dlopen of the user-installed SDK<br/>Open-model cut-out: dlopen of ONNX Runtime<br/>others: third-party"]
     end
 
     LB[("v4l2loopback<br/>/dev/videoN")]
@@ -258,6 +258,7 @@ flowchart LR
 | `obc-module-sdk` | The Rust SDK for module authors: the `Module` and `Instance` traits, safe views of frames and requests, the settings-description builder, and the `export_module!` macro that defines the two exported symbols and the vtable and catches panics at the boundary |
 | `obc-module-host` | The host side, inside the daemon: manifest parsing, discovery, the library loader and its ABI check, the safe `Module` and `Instance` handles, the settings model, the registry (status, providers by rank, pin and profile, the stage order), the adapters that implement the `obc-backend` seams over a module, and the crash ledger |
 | `obc-module-maxine` | The Maxine module (`libobc_module_maxine.so` and `maxine-vfx.toml`): the Maxine backend of `obc-backend-maxine` behind the ABI. Opens the SDK at run time |
+| `obc-module-onnx` | The open-model cut-out (`libobc_module_onnx.so` and `onnx.toml`): a second `background` provider (rank 200, device `cpu`) that runs open Apache-2.0 models through ONNX Runtime, opened at run time with whatever engines the installed build offers; the one module with a bounded exception to the CUDA context rule ([ADR-0031](adr/0031-onnx-cutout-module.md), [setup/onnx.md](setup/onnx.md)) |
 | `obc-backend` (`chain.rs`) | The generic chain seam next to `InferenceBackend`: `StageChainFactory` and `StageChain`, frames in CUDA or host memory (`FrameKind`, `HostNv12`), stage ids and parameters as strings and values |
 | `gst-obc` (`module/`) | The `obcmodule` element: one chain of one module's stages, run in place on the frames between two other elements |
 | `obc-pipeline` (`module.rs`) | Where `obcmodule` elements sit in the output, and their status |
@@ -444,6 +445,7 @@ Raw 4K tops out at 15 fps; 4K at 30 fps is only available as MJPEG, which is wha
 ## Known limitations / future work
 
 - **No HDR or 10-bit output.** The output contract is 8-bit SDR NV12 or I420 into v4l2loopback and PipeWire. The SDK's TrueHDR feature (SDR to HDR10: BT.2020, PQ, 10 bits) is implemented as the `hdr` stage, the "HDR look", which tone-maps its result back to SDR, so every 8-bit output carries the look and none carries HDR. A 10-bit HDR PipeWire node was tried in a spike and is a preliminary no-go: a native producer can publish it, but OBS Studio's PipeWire camera source reads no P010 and ignores the transfer function, and browsers take 8-bit only. It is revisited if a consumer gains P010 or PQ support, or if a recording path of our own consumes the 10-bit image ([ADR-0030](adr/0030-hdr-look-and-truehdr.md); [ADR-0024](adr/0024-stackable-stages-and-effects-in-the-settings-schema.md) and [ADR-0027](adr/0027-output-modes-frame-generation-and-privacy-fallback.md) rejected TrueHDR earlier).
+- **The effect element runs on CUDA frames only.** The open-model cut-out module handles host frames too, but the daemon hands a `background` provider CUDA frames whatever the module declares, so a machine with no NVIDIA GPU cannot yet run the daemon's effect path. A pipeline that runs the effect on system memory is future work ([ADR-0031](adr/0031-onnx-cutout-module.md)).
 - **Modules, phase 1** ([ADR-0025](adr/0025-loadable-modules.md)). A stage cannot use the cut-out of a module other than the `background` provider; a rebuilt module library is not loaded again until the daemon restarts; only `video-stage` modules load; the module interface is not yet frozen. Enabled modules, order, profile and pins are kept in `config.d/50-panel.toml` (phase 2, [ADR-0026](adr/0026-config-d-and-managed-config.md)) and apply at the next camera start.
 - **MJPEG is decoded on the CPU.** GStreamer's `nvjpegdec` (NVDEC) is not used: on the reference machine it rejects the 4:2:2 MJPEG that typical UVC webcams send (`unhandled chroma format 2`). The cost is CPU time that scales with resolution and frame rate (see [benchmarks/ingest-paths.md](benchmarks/ingest-paths.md)). GPU JPEG decode, for example through an element built on the nvJPEG library, is future work. See [ADR-0008](adr/0008-cpu-ingest-adapters.md).
 - **YUYV/UYVY are converted on the CPU.** A custom CUDA kernel for these formats is deferred.

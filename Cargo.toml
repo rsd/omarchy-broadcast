@@ -20,6 +20,7 @@ members = [
     "crates/omarchy-broadcast-audiod",
     "crates/obc-module-voice-cpu",
     "crates/obc-module-afx",
+    "crates/obc-module-onnx",
 ]
 # Built on its own, as a module outside the workspace would be (CI builds it).
 exclude = [
@@ -34,7 +35,7 @@ exclude = [
 
 [workspace.package]
 # Also the pkgver= of packaging/arch/PKGBUILD: bump both; CI checks they match.
-version = "0.37.0"
+version = "0.38.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Raul Dias"]
