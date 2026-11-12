@@ -6,7 +6,7 @@ use super::*;
 
 /// A PNG signature and IHDR chunk declaring `w` x `h`, an IDAT carrying
 /// `tag` (so files differ), then IEND (CRCs not computed).
-fn png(w: u32, h: u32, tag: u8) -> Vec<u8> {
+pub(crate) fn png(w: u32, h: u32, tag: u8) -> Vec<u8> {
     let chunk = |kind: &[u8; 4], data: &[u8]| {
         let mut v = (data.len() as u32).to_be_bytes().to_vec();
         v.extend_from_slice(kind);
@@ -330,8 +330,19 @@ fn importing_the_same_bytes_again_returns_the_stored_file() {
     let first = f.store.import(MediaKind::Background, &a).unwrap();
     assert_eq!(f.store.import(MediaKind::Background, &a).unwrap(), first);
     assert_eq!(f.store.import(MediaKind::Background, &b).unwrap(), first);
+    // `import_stored` tells a copy from a file found in the gallery.
+    assert_eq!(
+        f.store.import_stored(MediaKind::Background, &b).unwrap(),
+        (first.clone(), false)
+    );
     let dir = f.store.user_dir(MediaKind::Background);
     assert_eq!(names(&dir), BTreeSet::from(["a.png".into()]));
+    let c = f.src.join("c.png");
+    write(&c, &png(10, 10, 3));
+    assert_eq!(
+        f.store.import_stored(MediaKind::Background, &c).unwrap(),
+        (dir.join("c.png"), true)
+    );
     // The same bytes in the other kind are a separate item.
     let away = f.store.import(MediaKind::Away, &a).unwrap();
     assert_eq!(away, f.store.user_dir(MediaKind::Away).join("a.png"));

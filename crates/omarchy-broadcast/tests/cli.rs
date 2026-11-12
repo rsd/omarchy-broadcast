@@ -450,6 +450,56 @@ struct Mock {
     mic: MicStatus,
     /// `SetMicHost` is refused with this (an ADR 0014 unit running).
     mic_refusal: Option<String>,
+    /// The media gallery (revision 15): the items of each kind (the
+    /// bundled ones first) and `MediaSerial`.
+    media: std::collections::BTreeMap<String, Vec<obc_ipc::MediaEntry>>,
+    media_serial: u32,
+    /// The user's gallery root ([`USER_MEDIA`] unless a test sets one);
+    /// an import writes an empty file there when it exists.
+    media_user: String,
+}
+
+/// The mock's user gallery root.
+const USER_MEDIA: &str = "/home/u/.local/share/omarchy-broadcast/media";
+
+/// The mock's gallery directories of `kind`: bundled and the user's under
+/// `user`.
+fn media_dirs(kind: &str, user: &str) -> (String, String) {
+    let dir = if kind == "background" {
+        "backgrounds"
+    } else {
+        kind
+    };
+    (
+        format!("/usr/share/omarchy-broadcast/media/{dir}"),
+        format!("{user}/{dir}"),
+    )
+}
+
+/// An image item of the mock's gallery.
+fn media_item(kind: &str, name: &str, label: &str, bundled: bool) -> obc_ipc::MediaEntry {
+    media_item_in(USER_MEDIA, kind, name, label, bundled)
+}
+
+/// An image item of the mock's gallery, the user's under `user`.
+fn media_item_in(
+    user: &str,
+    kind: &str,
+    name: &str,
+    label: &str,
+    bundled: bool,
+) -> obc_ipc::MediaEntry {
+    let (b, u) = media_dirs(kind, user);
+    obc_ipc::MediaEntry {
+        path: format!("{}/{name}", if bundled { b } else { u }),
+        label: label.into(),
+        bundled,
+        media_type: "image".into(),
+        width: 3840,
+        height: 2160,
+        duration_ms: 0,
+        poster: String::new(),
+    }
 }
 
 fn control(name: &str, min: i32, max: i32, step: i32, default: i32) -> CameraControl {
@@ -777,6 +827,16 @@ impl Mock {
             ],
             mic: MicStatus::default(),
             mic_refusal: None,
+            media: [
+                (
+                    "background".to_string(),
+                    vec![media_item("background", "dusk.webp", "Dusk", true)],
+                ),
+                ("away".to_string(), Vec::new()),
+            ]
+            .into(),
+            media_serial: 1,
+            media_user: USER_MEDIA.into(),
         }
     }
 
@@ -1720,6 +1780,102 @@ impl Mock {
     #[zbus(property)]
     fn mic_error(&self) -> String {
         self.mic.error.clone()
+    }
+
+    #[zbus(out_args("serial", "bundled_dir", "user_dir", "items"))]
+    async fn get_media(
+        &mut self,
+        kind: String,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<(u32, String, String, Vec<VariantDict>), IpcError> {
+        self.calls.push(format!("GetMedia({kind})"));
+        if may_auto_start(&header) {
+            self.auto_start.push(format!("GetMedia({kind})"));
+        }
+        let items = self
+            .media
+            .get(&kind)
+            .ok_or_else(|| IpcError::InvalidArgument(format!("unknown media kind {kind:?}")))?;
+        let (bundled_dir, user_dir) = media_dirs(&kind, &self.media_user);
+        Ok(obc_ipc::MediaReply {
+            serial: self.media_serial,
+            bundled_dir,
+            user_dir,
+            items: items.clone(),
+        }
+        .to_wire())
+    }
+
+    /// Stores the file under its name in the user's directory; a `.txt`
+    /// stands for a file that is not an image.
+    async fn import_media(
+        &mut self,
+        kind: String,
+        path: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<String, IpcError> {
+        self.calls.push(format!("ImportMedia({kind}, {path})"));
+        let Some(items) = self.media.get_mut(&kind) else {
+            return Err(IpcError::InvalidArgument(format!(
+                "unknown media kind {kind:?}"
+            )));
+        };
+        if path.ends_with(".txt") {
+            return Err(IpcError::InvalidArgument(format!(
+                "cannot import {path}: not a PNG, JPEG or WebP image"
+            )));
+        }
+        let name = Path::new(&path).file_name().unwrap().to_string_lossy();
+        let item = media_item_in(&self.media_user, &kind, &name, "Imported", false);
+        let stored = item.path.clone();
+        if let Some(dir) = Path::new(&stored).parent().filter(|d| d.is_dir()) {
+            std::fs::write(dir.join(&*name), b"").unwrap();
+        }
+        if !items.iter().any(|i| i.path == stored) {
+            items.push(item);
+            self.media_serial += 1;
+            self.media_serial_changed(&emitter).await?;
+        }
+        Ok(stored)
+    }
+
+    /// As the daemon: a user item only; the background in force cleared
+    /// first, refused while `replace` is selected.
+    async fn remove_media(
+        &mut self,
+        path: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        self.calls.push(format!("RemoveMedia({path})"));
+        let found = self.media.iter().find_map(|(kind, items)| {
+            let at = items.iter().position(|i| i.path == path && !i.bundled)?;
+            Some((kind.clone(), at))
+        });
+        let Some((kind, at)) = found else {
+            return Err(IpcError::InvalidArgument(format!(
+                "{path} is not an item of the user's media gallery"
+            )));
+        };
+        if self.background_image == path && self.effect == "replace" {
+            return Err(IpcError::InvalidArgument(
+                "the replace effect is selected and needs its background image: select \
+                 another effect before clearing it"
+                    .into(),
+            ));
+        }
+        self.media.get_mut(&kind).unwrap().remove(at);
+        if self.background_image == path {
+            self.background_image.clear();
+            self.background_image_changed(&emitter).await?;
+        }
+        self.media_serial += 1;
+        self.media_serial_changed(&emitter).await?;
+        Ok(())
+    }
+
+    #[zbus(property)]
+    fn media_serial(&self) -> u32 {
+        self.media_serial
     }
 
     #[zbus(property)]
@@ -6765,4 +6921,294 @@ fn modules_pin_words_the_pin_it_set_not_the_stale_provider() {
     let out = bus.run(&["modules", "pin", "mic-denoise", "--clear"]);
     assert!(out.status.success(), "{}", out.stderr);
     assert_eq!(out.stdout, "mic-denoise: pin cleared\n");
+}
+
+// ---------------------------------------------------------------------------
+// The media gallery (revision 15)
+
+#[test]
+fn media_lists_the_gallery_and_never_starts_the_daemon() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    mock.with(|m| {
+        m.media.get_mut("background").unwrap().push(media_item(
+            "background",
+            "office.png",
+            "Office",
+            false,
+        ));
+    });
+    let user = "/home/u/.local/share/omarchy-broadcast/media/backgrounds";
+    let human = format!(
+        "Bundled: /usr/share/omarchy-broadcast/media/backgrounds\n\
+         Yours:   {user}\n\
+         Dusk  image  3840x2160  bundled  /usr/share/omarchy-broadcast/media/backgrounds/dusk.webp\n\
+         Office  image  3840x2160  yours  {user}/office.png\n"
+    );
+    for args in [&["media"][..], &["media", "background"], &["media", "list"]] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {}", out.stderr);
+        assert_eq!(out.stdout, human, "{args:?}");
+    }
+    let out = bus.run(&["media", "list", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    let lines = json_lines(&out.stdout);
+    assert_eq!(lines.len(), 3, "{}", out.stdout);
+    let v = &lines[0];
+    assert_eq!(v["type"], "media");
+    assert_eq!(v["kind"], "background");
+    assert_eq!(v["serial"], 1);
+    assert_eq!(v["user_dir"], user);
+    assert_eq!(v["items"], 2);
+    assert_eq!(v["items_truncated"], false);
+    let items = &lines[1..];
+    assert!(
+        items
+            .iter()
+            .all(|i| i["type"] == "media_item" && i["kind"] == "background")
+    );
+    assert_eq!(items[1]["path"], format!("{user}/office.png"));
+    assert_eq!(items[1]["bundled"], false);
+    assert_eq!(items[0]["media_type"], "image");
+    assert_eq!(items[0]["width"], 3840);
+    assert_eq!(items[0]["duration_ms"], 0);
+    assert_eq!(items[0]["poster"], "");
+
+    for args in [
+        &["media", "away", "--json"][..],
+        &["media", "list", "away", "--json"],
+    ] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {}", out.stderr);
+        let v = json_line(&out.stdout);
+        assert_eq!(v["kind"], "away", "{args:?}");
+        assert_eq!(v["items"], 0);
+    }
+    let out = bus.run(&["media", "away"]);
+    assert!(
+        out.stdout.ends_with("No away items in the gallery\n"),
+        "{}",
+        out.stdout
+    );
+
+    // Every read was made without starting the daemon.
+    let mut auto = Vec::new();
+    mock.with(|m| auto = m.auto_start.clone());
+    assert_eq!(auto, Vec::<String>::new());
+    assert_eq!(
+        mock.take_calls()
+            .iter()
+            .filter(|c| c.starts_with("GetMedia"))
+            .count(),
+        7
+    );
+
+    // Usage errors, before any call.
+    for args in [
+        &["media", "wallpaper"][..],
+        &["media", "list", "away", "background"],
+        &["media", "away", "list"],
+        &["media", "import", "background"],
+        &["media", "remove"],
+    ] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", out.stderr);
+    }
+    assert!(mock.take_calls().is_empty());
+}
+
+#[test]
+fn media_import_and_remove_change_the_gallery() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let root = bus.dir.join("media");
+    for kind in ["backgrounds", "away"] {
+        std::fs::create_dir_all(root.join(kind)).unwrap();
+    }
+    let user = root.display().to_string();
+    mock.with(|m| m.media_user = user.clone());
+
+    // A relative path is given to the daemon made absolute against the
+    // current directory; the stored path is printed.
+    let cwd = bus.dir.join("pictures");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let args = ["media", "import", "away", "me.png"];
+    let mut cmd = bus.cli(&args);
+    cmd.current_dir(&cwd);
+    let out = run_cmd(cmd, &args);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert_eq!(out.stdout, format!("{user}/away/me.png\n"));
+    assert_eq!(
+        mock.take_calls(),
+        [format!("ImportMedia(away, {}/me.png)", cwd.display())]
+    );
+
+    // --select: then the background and `replace`, as `effect replace
+    // --image` does.
+    let out = bus.run(&[
+        "media",
+        "import",
+        "background",
+        "/pics/office.jpg",
+        "--select",
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    let stored = format!("{user}/backgrounds/office.jpg");
+    let v = json_line(&out.stdout);
+    assert_eq!(
+        v,
+        serde_json::json!({"v": 1, "type": "media_import", "kind": "background",
+            "path": stored, "path_truncated": false, "selected": true})
+    );
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "ImportMedia(background, /pics/office.jpg)".to_string(),
+            format!("SetBackgroundImage({stored})"),
+            "SetEffect(replace)".to_string(),
+        ]
+    );
+    let out = bus.run(&["media", "import", "away", "/pics/b.png", "--json"]);
+    assert_eq!(json_line(&out.stdout)["selected"], false);
+    let out = bus.run(&["media", "--json"]);
+    assert_eq!(json_lines(&out.stdout)[0]["serial"], 4);
+
+    // --select is for backgrounds only: a usage error, nothing sent.
+    let out = bus.run(&["media", "import", "away", "/pics/c.png", "--select"]);
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("--select applies to `background`, not `away`"),
+        "{}",
+        out.stderr
+    );
+    mock.take_calls();
+
+    // A refusal: exit 1 with the daemon's reason (on stdout with --json).
+    let out = bus.run(&["media", "import", "background", "/pics/notes.txt"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert_eq!(
+        out.stderr,
+        "omarchy-broadcast: cannot import /pics/notes.txt: not a PNG, JPEG or WebP image\n"
+    );
+    let out = bus.run(&["media", "import", "background", "/pics/notes.txt", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert_eq!(json_line(&out.stdout)["type"], "error");
+
+    // The background in force under `replace` cannot be removed; under
+    // another effect it is cleared and removed.
+    let out = bus.run(&["media", "remove", &stored]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("select another effect"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(bus.run(&["effect", "none"]).status.code(), Some(0));
+    let out = bus.run(&["media", "remove", &stored]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert_eq!(out.stdout, format!("Removed {stored}\n"));
+    let out = bus.run(&["effect", "--json"]);
+    assert_eq!(json_line(&out.stdout)["background_image"], "");
+    let bundled = "/usr/share/omarchy-broadcast/media/backgrounds/dusk.webp";
+    let out = bus.run(&["media", "remove", bundled]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("is not an item of the user's media gallery"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn media_json_lines_stay_within_the_cap_and_long_paths_are_left_out() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let long = format!("/home/u/{}x.png", "deep/".repeat(800));
+    mock.with(|m| {
+        let items = m.media.get_mut("background").unwrap();
+        items.push(media_item("background", "office.png", "Office", false));
+        items.push(obc_ipc::MediaEntry {
+            path: long.clone(),
+            ..media_item("background", "x.png", "Deep", false)
+        });
+    });
+    let out = bus.run(&["media", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    // `json_line` holds every line to 4096 bytes.
+    let lines = json_lines(&out.stdout);
+    assert_eq!(lines.len(), 3, "{}", out.stdout);
+    assert_eq!(lines[0]["items"], 2);
+    assert_eq!(lines[0]["items_truncated"], true);
+    assert!(lines[1..].iter().all(|l| l["path"] != long.as_str()));
+    // The human list is not bounded: every item is shown.
+    let out = bus.run(&["media"]);
+    assert!(out.stdout.contains(&long), "{}", out.stdout);
+
+    // An import stored under a path over the bound: printed as "", with
+    // path_truncated, and the import succeeded.
+    let user = format!("/home/{}", "u/".repeat(1950));
+    mock.with(|m| m.media_user = user.clone());
+    let out = bus.run(&["media", "import", "away", "/pics/b.png", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    let v = json_line(&out.stdout);
+    assert_eq!(
+        v,
+        serde_json::json!({"v": 1, "type": "media_import", "kind": "away",
+            "path": "", "path_truncated": true, "selected": false})
+    );
+    let out = bus.run(&["media", "away", "--json"]);
+    let lines = json_lines(&out.stdout);
+    assert_eq!(lines[0]["user_dir"], "");
+    assert_eq!(lines[0]["items"], 0);
+    assert_eq!(lines[0]["items_truncated"], true);
+}
+
+#[test]
+fn media_against_an_older_daemon_says_it_is_unsupported() {
+    let bus = Bus::start();
+    let _daemon = OldDaemon::start(&bus, Rev6);
+    for args in [
+        &["media"][..],
+        &["media", "list", "--json"],
+        &["media", "import", "background", "/pics/a.png"],
+        &["media", "remove", "/pics/a.png"],
+    ] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", out.stderr);
+        let text = if args.contains(&"--json") {
+            let v = json_line(&out.stdout);
+            assert_eq!(v["code"], "unsupported-daemon");
+            v["error"].as_str().unwrap().to_string()
+        } else {
+            out.stderr
+        };
+        assert!(
+            text.contains(
+                "the daemon does not support the media gallery (its interface revision is 6, \
+                 the gallery needs 15)"
+            ),
+            "{args:?}: {text}"
+        );
+    }
+}
+
+#[test]
+fn media_list_never_starts_the_daemon_but_import_and_remove_may() {
+    let bus = Bus::start();
+    for args in [&["media"][..], &["media", "list", "away", "--json"]] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(3), "{args:?}: {}", out.stderr);
+    }
+    assert!(!bus.activation_attempted());
+    let out = bus.run(&["media", "import", "background", "/pics/a.png"]);
+    assert_eq!(out.status.code(), Some(3), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("D-Bus could not start it"),
+        "{}",
+        out.stderr
+    );
+    assert!(bus.activation_attempted());
 }

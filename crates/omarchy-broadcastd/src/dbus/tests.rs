@@ -26,6 +26,8 @@ use crate::backend::fake::{FakeBackend, Hook, World};
 use crate::backend::{PipeWireEvent, PipeWireState};
 use crate::camera::tests::cam;
 use crate::controller::{self, Command, Controller, Paths, Published, preliminary_snapshot};
+use crate::media::tests::png;
+use crate::media::{MediaError, MediaStore};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -130,9 +132,24 @@ impl Drop for PrivateBus {
     }
 }
 
+/// The media gallery of a rig: its two roots under the rig's directory.
+fn rig_media(dir: &std::path::Path) -> Result<MediaStore, MediaError> {
+    Ok(MediaStore::new(
+        dir.join("media-bundled"),
+        dir.join("media-user"),
+    ))
+}
+
 impl Rig {
     async fn new(config: &str, setup: impl FnOnce(&mut World)) -> Rig {
         Self::build(config, setup, false).await
+    }
+
+    /// A rig whose object gets the gallery `media` makes of its directory.
+    async fn with_media(
+        media: impl FnOnce(&std::path::Path) -> Result<MediaStore, MediaError>,
+    ) -> Rig {
+        Self::build_with("", |_| {}, false, media).await
     }
 
     /// The object on a private bus, owning the daemon's name there, with
@@ -143,6 +160,15 @@ impl Rig {
     }
 
     async fn build(config: &str, setup: impl FnOnce(&mut World), on_bus: bool) -> Rig {
+        Self::build_with(config, setup, on_bus, rig_media).await
+    }
+
+    async fn build_with(
+        config: &str,
+        setup: impl FnOnce(&mut World),
+        on_bus: bool,
+        media: impl FnOnce(&std::path::Path) -> Result<MediaStore, MediaError>,
+    ) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths {
             config: dir.path().join("config.toml"),
@@ -164,7 +190,7 @@ impl Rig {
         }
         let (published, notes) = Published::new(preliminary_snapshot(&paths));
         let (commands, rx) = std::sync::mpsc::channel();
-        let object = Server::new(published.clone(), commands.clone());
+        let object = Server::new(published.clone(), commands.clone(), media(dir.path()));
         let (server, client, bus) = if on_bus {
             let bus = PrivateBus::start(dir.path());
             let server = connection::Builder::address(bus.address.as_str())
@@ -396,8 +422,8 @@ async fn every_property_reads_through_the_proxy() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 14);
-    assert_eq!(INTERFACE_REVISION, obc_ipc::FORCED_REVISION);
+    assert_eq!(INTERFACE_REVISION, 15);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::MEDIA_REVISION);
     // GetAll returns the same twenty-eight properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
         .destination(obc_ipc::BUS_NAME)
@@ -430,6 +456,7 @@ async fn every_property_reads_through_the_proxy() {
             "Error",
             "InterfaceRevision",
             "LoopbackConsumers",
+            "MediaSerial",
             "MicConsumers",
             "MicError",
             "MicLatencyMs",
@@ -492,6 +519,12 @@ async fn every_property_reads_through_the_proxy() {
         "<property name=\"PipeWireConsumers\" type=\"u\" access=\"read\"",
         "<property name=\"PipeWireOutput\" type=\"s\" access=\"read\"",
         "<property name=\"InterfaceRevision\" type=\"u\" access=\"read\"",
+        "<method name=\"GetMedia\">",
+        "<method name=\"ImportMedia\">",
+        "<method name=\"RemoveMedia\">",
+        "<arg name=\"bundled_dir\" type=\"s\" direction=\"out\"/>",
+        "<arg name=\"items\" type=\"aa{sv}\" direction=\"out\"/>",
+        "<property name=\"MediaSerial\" type=\"u\" access=\"read\"",
     ] {
         assert!(xml.contains(m), "{m} missing from {xml}");
     }
@@ -887,7 +920,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 14);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 15);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -1025,7 +1058,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 14);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 15);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -1141,7 +1174,7 @@ async fn preview_leases_by_bus_name_their_property_and_their_frames() {
     let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 14);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 15);
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
     let seen = rig.record_changes().await;
     let mut frames = proxy.receive_preview_frame().await.unwrap();
@@ -2101,4 +2134,261 @@ async fn the_config_members_over_the_bus() {
         ("enhance", false, true)
     );
     assert!(!moves[4].3);
+}
+
+// ---------------------------------------------------------------------------
+// The media gallery (revision 15)
+
+/// The error of a gallery call, checked to be `InvalidArgument`.
+fn refused<T: std::fmt::Debug>(res: Result<T, IpcError>) -> String {
+    match res {
+        Err(e @ IpcError::InvalidArgument(_)) => e.message(),
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+}
+
+/// Writes `data` to `path`, creating its directory.
+fn put_file(path: &std::path::Path, data: &[u8]) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, data).unwrap();
+}
+
+/// Waits until `MediaSerial` reads `want`, and its change was announced.
+async fn media_serial_is(
+    proxy: &OmarchyBroadcastProxy<'_>,
+    seen: &Arc<Mutex<Vec<String>>>,
+    want: u32,
+) {
+    assert_eq!(proxy.media_serial().await.unwrap(), want);
+    let entry = format!("MediaSerial={want}");
+    until(&entry, seen, |s| s.contains(&entry)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_gallery_lists_imports_and_removes() {
+    let rig = Rig::new("", |_| {}).await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    let seen = rig.record_changes().await;
+    let root = rig._dir.path();
+    let bundled = root.join("media-bundled/backgrounds/dusk.png");
+    put_file(&bundled, &png(3840, 2160, 1));
+    let bundled = bundled.display().to_string();
+
+    // The kinds, with their directories; the bundled items first.
+    assert_eq!(proxy.media_serial().await.unwrap(), 1);
+    let list = within("GetMedia", proxy.media("background")).await.unwrap();
+    assert_eq!(list.serial, 1);
+    assert_eq!(
+        list.bundled_dir,
+        root.join("media-bundled/backgrounds").display().to_string()
+    );
+    assert_eq!(
+        list.user_dir,
+        root.join("media-user/backgrounds").display().to_string()
+    );
+    assert_eq!(
+        list.items,
+        [obc_ipc::MediaEntry {
+            path: bundled.clone(),
+            label: "Dusk".into(),
+            bundled: true,
+            media_type: "image".into(),
+            width: 3840,
+            height: 2160,
+            duration_ms: 0,
+            poster: String::new(),
+        }]
+    );
+    // The raw reply carries the documented keys.
+    let raw = within("GetMedia", proxy.get_media("background"))
+        .await
+        .unwrap();
+    let mut keys: Vec<&str> = raw.3[0].keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "bundled",
+            "duration_ms",
+            "height",
+            "label",
+            "path",
+            "poster",
+            "type",
+            "width"
+        ]
+    );
+    let away = within("GetMedia", proxy.media("away")).await.unwrap();
+    assert!(away.items.is_empty());
+    assert!(
+        away.user_dir.ends_with("media-user/away"),
+        "{}",
+        away.user_dir
+    );
+    let msg = refused(within("GetMedia", proxy.media("wallpaper")).await);
+    assert!(msg.contains("unknown media kind \"wallpaper\""), "{msg}");
+
+    // An import stores the file and moves the serial.
+    let src = root.join("src/Office view.png");
+    put_file(&src, &png(1920, 1080, 2));
+    let stored = within(
+        "ImportMedia",
+        proxy.import_media("background", &src.display().to_string()),
+    )
+    .await
+    .unwrap();
+    let want = root.join("media-user/backgrounds/Office view.png");
+    assert_eq!(stored, want.display().to_string());
+    assert_eq!(fs::read(&want).unwrap(), png(1920, 1080, 2));
+    media_serial_is(&proxy, &seen, 2).await;
+    let list = within("GetMedia", proxy.media("background")).await.unwrap();
+    assert_eq!(list.serial, 2);
+    let item = list.find(&stored).unwrap();
+    assert_eq!(
+        (item.label.as_str(), item.bundled, item.width, item.height),
+        ("Office view", false, 1920, 1080)
+    );
+
+    // The same bytes again (under another name): the stored path, no copy,
+    // the serial unmoved.
+    let again = root.join("src/copy.png");
+    put_file(&again, &png(1920, 1080, 2));
+    let second = within(
+        "ImportMedia",
+        proxy.import_media("background", &again.display().to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second, stored);
+    assert_eq!(proxy.media_serial().await.unwrap(), 2);
+
+    // The refusals carry the store's reason; nothing changes.
+    let text = root.join("src/notes.txt");
+    put_file(&text, b"hello, not an image");
+    for (kind, path, why) in [
+        (
+            "background",
+            "relative.png".to_string(),
+            "is not an absolute path",
+        ),
+        ("background", text.display().to_string(), "cannot import"),
+        (
+            "background",
+            "/nowhere/at/all.png".to_string(),
+            "cannot import",
+        ),
+        (
+            "background",
+            root.join("src/clip.mp4").display().to_string(),
+            "videos are not supported yet",
+        ),
+        ("portrait", src.display().to_string(), "unknown media kind"),
+    ] {
+        let msg = refused(within("ImportMedia", proxy.import_media(kind, &path)).await);
+        assert!(msg.contains(why), "{path}: {msg}");
+    }
+    let msg = refused(within("RemoveMedia", proxy.remove_media(&bundled)).await);
+    assert!(
+        msg.contains("is not an item of the user's media gallery"),
+        "{msg}"
+    );
+    assert!(std::path::Path::new(&bundled).exists());
+    for bad in ["relative.png", "/etc/hostname"] {
+        let msg = refused(within("RemoveMedia", proxy.remove_media(bad)).await);
+        assert!(msg.contains(bad), "{bad}: {msg}");
+    }
+    assert_eq!(proxy.media_serial().await.unwrap(), 2);
+
+    // A removal deletes the user's item and moves the serial.
+    within("RemoveMedia", proxy.remove_media(&stored))
+        .await
+        .unwrap();
+    assert!(!want.exists());
+    media_serial_is(&proxy, &seen, 3).await;
+    let list = within("GetMedia", proxy.media("background")).await.unwrap();
+    assert_eq!(list.items.len(), 1);
+    assert!(list.items[0].bundled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_the_background_in_force_clears_it_first() {
+    let rig = Rig::new("", |_| {}).await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    let src = rig._dir.path().join("src/room.png");
+    put_file(&src, &png(640, 360, 1));
+    let import = || async {
+        within(
+            "ImportMedia",
+            proxy.import_media("away", &src.display().to_string()),
+        )
+        .await
+        .unwrap()
+    };
+
+    // In force with another effect: cleared, then removed.
+    let stored = import().await;
+    within("SetBackgroundImage", proxy.set_background_image(&stored))
+        .await
+        .unwrap();
+    assert_eq!(proxy.background_image().await.unwrap(), stored);
+    within("RemoveMedia", proxy.remove_media(&stored))
+        .await
+        .unwrap();
+    assert_eq!(proxy.background_image().await.unwrap(), "");
+    assert!(!std::path::Path::new(&stored).exists());
+    assert_eq!(proxy.media_serial().await.unwrap(), 3);
+
+    // In force under `replace`: the clear is refused, and so is the
+    // removal, with its reason; the file and the choice stay.
+    let stored = import().await;
+    within("SetBackgroundImage", proxy.set_background_image(&stored))
+        .await
+        .unwrap();
+    within("SetEffect", proxy.set_effect("replace"))
+        .await
+        .unwrap();
+    let msg = refused(within("RemoveMedia", proxy.remove_media(&stored)).await);
+    assert!(msg.contains("select another effect"), "{msg}");
+    assert!(std::path::Path::new(&stored).exists());
+    assert_eq!(proxy.background_image().await.unwrap(), stored);
+    assert_eq!(proxy.effect().await.unwrap(), "replace");
+    assert_eq!(proxy.media_serial().await.unwrap(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_a_gallery_the_media_methods_fail_with_the_reason() {
+    let rig = Rig::with_media(|_| Err(MediaError::NoDataDir)).await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    let failed = |res: Result<(), IpcError>| match res {
+        Err(IpcError::Failed(m)) => m,
+        other => panic!("expected Failed, got {other:?}"),
+    };
+    let msgs = [
+        failed(
+            within("GetMedia", proxy.get_media("background"))
+                .await
+                .map(|_| ()),
+        ),
+        failed(
+            within("ImportMedia", proxy.import_media("background", "/a.png"))
+                .await
+                .map(|_| ()),
+        ),
+        failed(within("RemoveMedia", proxy.remove_media("/a.png")).await),
+    ];
+    for msg in msgs {
+        assert!(
+            msg.contains("media gallery is unavailable: neither XDG_DATA_HOME nor HOME"),
+            "{msg}"
+        );
+    }
+    // The rest of the object serves on.
+    assert_eq!(proxy.media_serial().await.unwrap(), 1);
+    assert_eq!(
+        proxy.interface_revision().await.unwrap(),
+        INTERFACE_REVISION
+    );
 }

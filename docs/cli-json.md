@@ -36,6 +36,9 @@
 | `omarchy-broadcast config get KEY` | Prints the value of one key. Never starts the daemon. | No. |
 | `omarchy-broadcast config set [--] KEY VALUE`, `config reset [--] KEY` | Sets a key, or removes it from the daemon's managed file `config.d/50-panel.toml` so that the earlier files' value (or the default) applies again (`SetConfig`, `ResetConfig`), then prints the key as read back. | No. |
 | `omarchy-broadcast config files [--json]` | Lists the configuration files in load order, with their status (`GetConfigFiles`). Never starts the daemon. | One `config_files` line. |
+| `omarchy-broadcast media [list] [KIND] [--json]` | Lists the background gallery of `KIND` (`background`, the default, or `away`): the directories and one line per item, the bundled ones first (`GetMedia`). Never starts the daemon. See [Media](#media). | A `media` line, then one `media_item` line each. |
+| `omarchy-broadcast media import KIND PATH [--select] [--json]` | Copies an image into your gallery after the daemon has checked it, and prints the stored path (`ImportMedia`); with `--select`, also makes it the background and selects `replace`. | One `media_import` object. |
+| `omarchy-broadcast media remove PATH` | Removes an item of your gallery (`RemoveMedia`). | No. |
 | `omarchy-broadcast preview [--json] [--fps 15\|30]` | Holds a live preview lease on the daemon and prints a line for each frame it writes, until interrupted. See [Preview](#preview). | One object per line (NDJSON). |
 | `omarchy-broadcast watch` | Follows the daemon: a summary when it connects, then a line for each change and each `Stats` signal (about once per second while `active`), until interrupted. The summary ends with `| error: ...` and `| warning: ...` when they are set, and a change of either is a line (`warning: ...`, `warning: (cleared)`). | One object per line (NDJSON). |
 
@@ -63,7 +66,7 @@ omarchy-broadcast effect [none|blur|replace] [--strength X] [--image PATH]
   The `Denoise:` line is printed from interface revision 4; `status` shows it after the effect lines in the same way.
 
 - `none`, `blur` and `replace` select the effect. `--strength X` (0.0 to 1.0) is accepted with `blur` only and `--image PATH` with `replace` only; giving one with another effect is a usage error (status `2`), as is a strength outside 0 to 1 or an image that does not exist or is not a regular file.
-- `PATH` is made absolute against the current directory, so the daemon, which has its own working directory, is always given an absolute path. The daemon requires a PNG or JPEG file; other files are rejected by the daemon (status `1`) or fail when the effect starts (the daemon's `Error` property says why).
+- `PATH` is made absolute against the current directory, so the daemon, which has its own working directory, is always given an absolute path. The daemon requires a PNG, JPEG or still WebP file (an animated WebP is refused, and WebP needs the GStreamer decoder `webpdec`, in gst-plugins-bad: without it the file is refused with a reason that names it); other files are rejected by the daemon (status `1`) or fail when the effect starts (the daemon's `Error` property says why). The images of the gallery ([Media](#media)) are the ones a panel offers.
 - The options are applied before the effect is selected (`SetBlurStrength` and `SetBackgroundImage`, then `SetEffect`), so the effect starts with them. If an option is rejected, the effect is not selected. `omarchy-broadcast effect replace` without `--image` uses the image the daemon already has (the earlier choice or the configuration's); with none, the daemon rejects it with the message `the replace effect needs a background image: set one with SetBackgroundImage first`.
 - The settings persist across restarts of the daemon and take precedence over `config.toml` ([dbus-api.md](dbus-api.md#video-effects)).
 - Status `1` also covers the daemon's `InvalidArgument` error (an unacceptable value, with its message on stderr).
@@ -373,6 +376,85 @@ The strings are bounded in bytes of their JSON encoding: a key (`id`) 128, a gro
 | `files` | array | The files in load order: `path` (relative to `dir`), `status` (`"loaded"`, `"absent"` or `"error"`), `managed` (boolean: the daemon writes it; `config.d/50-panel.toml`) and `reason` (the error, at most 160 bytes; `""` otherwise). At most 16 are listed. The list is read from disk when the command runs. |
 | `files_truncated` | boolean | `true` when files were left out (more than 16, or the line would pass the cap; files are given up from the end). |
 
+## Media
+
+`omarchy-broadcast media` shows and manages the background gallery ([dbus-api.md](dbus-api.md#the-background-gallery-revision-15), [ADR-0032](adr/0032-background-gallery.md)): the images that `effect replace` can use as a background, and the images for the `away` kind, either bundled with the package or imported by the user. The daemon owns the gallery; the command wraps its three methods and needs a daemon of interface revision 15.
+
+```text
+omarchy-broadcast media [list] [KIND] [--json]
+omarchy-broadcast media import KIND PATH [--select] [--json]
+omarchy-broadcast media remove PATH
+```
+
+`KIND` is `background` or `away`; another value is a usage error (status `2`). `media` and `media list` without a kind list the backgrounds.
+
+- **`media`**, **`media list`** print the two directories of the kind, then one line per item: its label, its type, its size (`?` when unknown), `bundled` or `yours`, and its path. Bundled items come first. A list with no item says so:
+
+  ```text
+  omarchy-broadcast media
+  Bundled: /usr/share/omarchy-broadcast/media/backgrounds
+  Yours:   /home/user/.local/share/omarchy-broadcast/media/backgrounds
+  Dusk gradient  image  3840x2160  bundled  /usr/share/omarchy-broadcast/media/backgrounds/dusk-gradient.jpg
+  Office  image  1920x1080  yours  /home/user/.local/share/omarchy-broadcast/media/backgrounds/office.jpg
+  ```
+
+  ```text
+  omarchy-broadcast media away
+  Bundled: /usr/share/omarchy-broadcast/media/away
+  Yours:   /home/user/.local/share/omarchy-broadcast/media/away
+  No away items in the gallery
+  ```
+
+  The two directories are printed whether or not they exist. The strings come from the daemon and are printed with control characters and bidirectional-text marks escaped, as in [Effect](#effect).
+- **`media import KIND PATH`** copies the image into the user's gallery and prints the stored path alone, one line. `PATH` is made absolute against the current directory, so the daemon is always given an absolute path; a path that is not valid UTF-8 is a usage error (status `2`), since D-Bus cannot carry it. The daemon checks the file as it checks a background image: PNG, JPEG or still WebP, found from the content and not from the name, at most 32 MiB and 8192x8192 pixels, a complete first image, and a decoder installed for the format (WebP needs `webpdec`). A video is refused with `videos are not supported yet`. The stored name is made from the file's name (made safe, a suffix added when the name is taken, never overwriting a file), and a file with the same bytes as an image already in that directory is not copied again: its path is printed. The rules are in [dbus-api.md](dbus-api.md#the-background-gallery-revision-15).
+  - **`--select`** then sets the stored image as the background and selects `replace`, as `effect replace --image <stored path>` does (`SetBackgroundImage`, then `SetEffect`). It applies to `background` only; with `away` it is a usage error (status `2`). If the import succeeds and the selection fails, the image stays in the gallery, and the message says so: `<path> was imported, but selecting it failed: <reason>` (status of the failure; with `--json` an `error` line with that message).
+- **`media remove PATH`** removes an item of the user's gallery and prints `Removed PATH`. `PATH` is as `media list` prints it (made absolute against the current directory, not resolved). A bundled item, or a path that is not an item of the user's gallery, is refused with status `1`; so is a file that the configuration names (`[effect] background_image` or `fallback_image`), with the key in the message. Removing the image that is the background in force clears that choice first, as `SetBackgroundImage` with an empty path does, which the daemon refuses while `replace` is selected and the configuration has no image: select another effect or image first.
+- `media` and `media list` never start the daemon and give up after 5 s; `media import` and `media remove` may start it through D-Bus activation and give up after 30 s.
+- Against a daemon of interface revision 14 or lower the commands print `omarchy-broadcast: the daemon does not support the media gallery (its interface revision is N, the gallery needs 15); update omarchy-broadcastd` and exit with status `1`; with `--json` they print an `error` line with the code `unsupported-daemon` instead.
+
+### `media`, `media_item` and `media_import` lines
+
+`media --json` (and `media list --json`) prints one `media` line, then one `media_item` line per item, in the daemon's order (the bundled items, then the user's). The first line says how many follow, so a client reads exactly that many.
+
+`{"v":1,"type":"media","kind":"background","serial":3,"bundled_dir":"/usr/share/omarchy-broadcast/media/backgrounds","user_dir":"/home/u/.local/share/omarchy-broadcast/media/backgrounds","items":2,"items_truncated":false}`
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `v`, `type` | | `1`, `"media"`. |
+| `kind` | string | The kind listed: `"background"` or `"away"`. |
+| `serial` | number | The daemon's `MediaSerial` when the list was made. It restarts at 1 with the daemon: compare it only within one daemon run. |
+| `bundled_dir`, `user_dir` | string | The kind's directory in the package's read-only gallery and in the user's. Never clipped, since a client opens them; one over 3800 bytes of JSON encoding is `""`, and its items are left out. When both together would not fit the line, `bundled_dir` is `""` and its items are left out. |
+| `items` | number | The number of `media_item` lines that follow (at most 500). |
+| `items_truncated` | boolean | `true` when items were left out: more than 500, an item whose paths are over the bound, or the items of a directory printed as `""`. |
+
+`{"v":1,"type":"media_item","kind":"background","path":"/usr/share/omarchy-broadcast/media/backgrounds/dusk-gradient.jpg","label":"Dusk gradient","bundled":true,"media_type":"image","width":3840,"height":2160,"duration_ms":0,"poster":""}`
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `v`, `type` | | `1`, `"media_item"`. |
+| `kind` | string | The kind of the list, as in the `media` line. |
+| `path` | string | The file's absolute path. Never clipped: an item whose `path` and `poster` together take more than 3800 bytes of JSON encoding is left out (and `items_truncated` is `true`). |
+| `label` | string | The name to show. Bounded to 96 bytes. |
+| `bundled` | boolean | `true` for an item of the package's gallery, which cannot be removed. |
+| `media_type` | string | `"image"`. A later version may add `"video"`; show a value you do not know as it is. Bounded to 16 bytes. |
+| `width`, `height` | number | The size in pixels; `0` when unknown. |
+| `duration_ms` | number | `0` for a still image or when unknown. |
+| `poster` | string | The path of a video's poster image; `""` for a still image. Counted with `path` in the bound above. |
+
+`media import --json` prints one line:
+
+`{"v":1,"type":"media_import","kind":"background","path":"/home/u/.local/share/omarchy-broadcast/media/backgrounds/office.jpg","path_truncated":false,"selected":true}`
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `v`, `type` | | `1`, `"media_import"`. |
+| `kind` | string | The kind imported into. |
+| `path` | string | The stored file's absolute path. Never clipped: over 3800 bytes of JSON encoding it is `""` and `path_truncated` is `true` (the file is stored all the same; list the gallery to find it). |
+| `path_truncated` | boolean | `true` when `path` was left out for its length. |
+| `selected` | boolean | `true` when `--select` was given and the image was selected as the background. |
+
+Strings are clipped as the [general rules](#general-rules) say. A failure is an `error` line (see [`error`](#error)); `media remove` has no `--json`.
+
 ## Preview
 
 `omarchy-broadcast preview` holds a live preview lease ([dbus-api.md](dbus-api.md#live-preview), [ADR-0019](adr/0019-live-preview.md)) and prints one line per frame the daemon writes, until it is interrupted. It is how a client that cannot speak D-Bus, such as the bar plugin, gets a preview of the virtual camera: the frames are JPEG files, and the lines say when to read them.
@@ -394,8 +476,8 @@ omarchy-broadcast preview [--json] [--fps 15|30]
 
 ## Starting the daemon
 
-- `status`, `cameras`, `watch`, `preview`, `effect` without an effect, and `controls` and `settings` without a subcommand, `modules` (list, info, `profile` without an argument), `order` (show) and `mic` (status), never start the daemon. They read the properties with `org.freedesktop.DBus.Properties.GetAll` carrying the `NO_AUTO_START` flag, so looking at the daemon never launches it (`controls` also calls `GetCameraControls`, and `settings` calls `GetSettings`, with that flag). This is the read that the `obc-ipc` crate provides to Rust clients (`Snapshot::fetch_no_autostart`); [dbus-api.md](dbus-api.md#service-presence-and-activation) gives the `busctl` and `gdbus` equivalents.
-- `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`, `settings reset`, `modules enable`, `modules disable`, `modules profile <profile>`, `modules pin`, `order set`, `order reset`, `mic on`, `mic off`, `mic device`, `mic default` and `mic restore-default` call methods without that flag: when the D-Bus activation file `br.com.dias.OmarchyBroadcast.service` is installed, the call starts the daemon, as `systemctl --user start omarchy-broadcastd` would. `off` on a stopped daemon therefore starts it and records the privacy state, which persists across restarts. Without an activation file, or if the start fails, the command reports that the daemon is not running.
+- `status`, `cameras`, `watch`, `preview`, `effect` without an effect, and `controls` and `settings` without a subcommand, `modules` (list, info, `profile` without an argument), `order` (show), `mic` (status) and `media` (list), never start the daemon. They read the properties with `org.freedesktop.DBus.Properties.GetAll` carrying the `NO_AUTO_START` flag, so looking at the daemon never launches it (`controls` also calls `GetCameraControls`, `settings` calls `GetSettings` and `media` calls `GetMedia`, with that flag). This is the read that the `obc-ipc` crate provides to Rust clients (`Snapshot::fetch_no_autostart`); [dbus-api.md](dbus-api.md#service-presence-and-activation) gives the `busctl` and `gdbus` equivalents.
+- `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`, `settings reset`, `modules enable`, `modules disable`, `modules profile <profile>`, `modules pin`, `order set`, `order reset`, `mic on`, `mic off`, `mic device`, `mic default`, `mic restore-default`, `media import` and `media remove` call methods without that flag: when the D-Bus activation file `br.com.dias.OmarchyBroadcast.service` is installed, the call starts the daemon, as `systemctl --user start omarchy-broadcastd` would. `off` on a stopped daemon therefore starts it and records the privacy state, which persists across restarts. Without an activation file, or if the start fails, the command reports that the daemon is not running.
 
 When the daemon is not running, the human-readable commands print one line to stderr, for example:
 
@@ -408,19 +490,19 @@ omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.O
 | Status | Meaning |
 |---|---|
 | `0` | Success. Also the status of `watch` when it ends on `SIGTERM`, `SIGINT`, `SIGPIPE` or a closed stdout, and of `preview` when it ends on `SIGTERM`, `SIGINT`, `SIGHUP`, `SIGPIPE` or a closed stdout. |
-| `1` | The daemon rejected the request: one of the `br.com.dias.OmarchyBroadcast1.Error` errors (`NoSuchCamera`, `InvalidConfig`, `Unavailable`, `InvalidArgument`, `Failed`, and from revision 7 `UnknownSetting`, `Disabled`, `RateLimited`), or the daemon does not support the request (`effect` against interface revision 1, `denoise` against a revision below 4, `controls` against a revision below 6, `settings` against a revision below 7, `modules` and `order` against a revision below 9, `mic` against a revision below 13). Its message is printed to stderr. |
+| `1` | The daemon rejected the request: one of the `br.com.dias.OmarchyBroadcast1.Error` errors (`NoSuchCamera`, `InvalidConfig`, `Unavailable`, `InvalidArgument`, `Failed`, and from revision 7 `UnknownSetting`, `Disabled`, `RateLimited`), or the daemon does not support the request (`effect` against interface revision 1, `denoise` against a revision below 4, `controls` against a revision below 6, `settings` against a revision below 7, `modules` and `order` against a revision below 9, `mic` against a revision below 13, `media` against a revision below 15). Its message is printed to stderr. |
 | `2` | Invalid command line. |
 | `3` | The daemon is not running (its name has no owner, or D-Bus could not start it), or there is no D-Bus session bus. |
 | `4` | Any other D-Bus failure (an unexpected reply, a lost connection), a timeout, or a failed write to stdout. |
 
-`status`, `cameras`, `controls`, `settings`, `modules` (reads) and `order` (show) give up after 5 s, and `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`, `settings reset` and the changing forms of `modules` and `order` after 30 s (time for the daemon to be started), with status `4`. `watch` gives each read of the properties 5 s as well (see [Daemon absent or gone](#daemon-absent-or-gone)). `omarchy-broadcast --help` lists the exit statuses.
+`status`, `cameras`, `controls`, `settings`, `modules` (reads), `order` (show) and `media` (list) give up after 5 s, and `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`, `settings reset`, `media import`, `media remove` and the changing forms of `modules` and `order` after 30 s (time for the daemon to be started), with status `4`. `watch` gives each read of the properties 5 s as well (see [Daemon absent or gone](#daemon-absent-or-gone)). `omarchy-broadcast --help` lists the exit statuses.
 
 ## JSON output
 
 ### General rules
 
 - Every object is printed on one line, terminated by `\n`, in UTF-8. `watch --json` flushes stdout after every line.
-- Every object has the field **`v`**, the schema version (an integer, `1` in this version), and the field **`type`**, a string naming the line type: `snapshot`, `state`, `cameras`, `controls`, `settings_group`, `settings_delta`, `settings_clear`, `modules`, `module`, `order`, `config_group`, `config_files`, `config_changed`, `modules_changed`, `mic`, `stats`, `preview`, `frame` or `error`.
+- Every object has the field **`v`**, the schema version (an integer, `1` in this version), and the field **`type`**, a string naming the line type: `snapshot`, `state`, `cameras`, `controls`, `settings_group`, `settings_delta`, `settings_clear`, `modules`, `module`, `order`, `config_group`, `config_files`, `config_changed`, `modules_changed`, `mic`, `media`, `media_item`, `media_import`, `stats`, `preview`, `frame` or `error`.
 - The order of the fields within an object is not significant.
 - A client must ignore fields it does not know, and lines whose `type` it does not know.
 - **Line length.** No line is longer than **4096 bytes**, newline excluded. To guarantee it, strings are bounded in bytes of their JSON encoding (escapes included). A longer string is cut at a character boundary and ends with the ellipsis character `…` (U+2026); the result is always valid JSON. The bounds:
@@ -437,6 +519,9 @@ omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.O
   | `background_image` | 256 |
   | `mic` `state` | 32 |
   | `mic` `provider`, `mic` `error` | 256 |
+  | `media_item` `label` | 96 |
+  | `media_item` `media_type` | 16 |
+  | an item's `path` and `poster` together, `bundled_dir`, `user_dir`, an imported `path` (JSON encoding; never clipped, see below) | 3800 |
 | image control `name` | 32 |
 | setting `id`, a condition's `id` | 48 |
 | settings group `id` | 32 |
@@ -452,6 +537,7 @@ omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.O
 An option value is bounded to 32 bytes, which is why the options of `mic.input.device` are short tokens (`pw-` and 12 hexadecimal characters) and not PipeWire node names, which are longer; the label is the microphone's description.
 
 - **Clipping of a path.** `error` and the other strings keep their beginning and lose their end. `background_image` is the exception: the end of a path, the file name, is what identifies it, so a path over the bound is clipped at the **start** and begins with `…` (for example `…/Pictures/office/background-2026.jpg`). The bound is 256 bytes, not 512 as for `error`, because a line that carries many cameras and a long path must stay within the 4096-byte cap. Do not use a clipped path as an argument: read it back from the daemon.
+- **Paths of the gallery.** A path of the gallery is never clipped, because a client opens it: one that does not fit is left out. An item whose `path` and `poster` together take more than **3800** bytes of JSON encoding (escapes included) is left out of the list, a directory over that is printed as `""` with its items left out, and an imported `path` over that is `""` with `path_truncated` `true`; `items_truncated` says that items were left out. At most **500** `media_item` lines follow a `media` line.
 - **Camera list.** At most **12** cameras are listed; `cameras_truncated` is `true` when the daemon reported more. The list keeps the daemon's order, so the first 12 are listed. A clipped camera id can no longer be passed to `omarchy-broadcast camera`; real ids are far shorter than the bound.
 - **Control list.** At most **16** image controls are listed; `controls_truncated` is `true` when the daemon reported more (a daemon reports at most five). The names are bounded as in the table above.
 - **Settings lists.** An enum setting lists at most **16** options, a setting at most **4** `enabled_when` conditions, an `in` condition at most **8** operands (a list inside a list is printed empty), a `settings_group` line at most **8** settings and a `settings_delta` line at most **16** changes. A longer list is cut, in order. The lines are also packed by their encoded length, so no line passes the cap (see [`settings_group`](#settings_group)).
@@ -688,7 +774,7 @@ The `path` of these two lines is never clipped, unlike the other strings (see [G
 | Field | JSON type | Meaning |
 |---|---|---|
 | `v`, `type` | | `1`, `"error"`. |
-| `code` | string | `"daemon-not-running"`: the daemon is not running, or there is no D-Bus session bus. `"dbus-error"`: any other failure to talk to the daemon (an unexpected reply, a lost connection, a timeout). `"unsupported-daemon"`: the daemon is too old for the request (`preview` needs interface revision 5, `controls` needs 6, `settings` needs 7, `modules` and `order` need 9, `config` needs 10); printed by `preview --json`, `controls --json`, `settings --json`, `modules list --json`, `modules info --json`, `order show --json`, `config show --json` and `config files --json` only. `"preview-path-too-long"`: the daemon's frame path does not fit a line; printed by `preview --json` only. New codes may be added; treat an unknown code like `"dbus-error"`. |
+| `code` | string | `"daemon-not-running"`: the daemon is not running, or there is no D-Bus session bus. `"dbus-error"`: any other failure to talk to the daemon (an unexpected reply, a lost connection, a timeout). `"unsupported-daemon"`: the daemon is too old for the request (`preview` needs interface revision 5, `controls` needs 6, `settings` needs 7, `modules` and `order` need 9, `config` needs 10, `mic` needs 13, `media` needs 15); printed by `preview --json`, `controls --json`, `settings --json`, `modules list --json`, `modules info --json`, `order show --json`, `config show --json`, `config files --json`, `mic --json`, `media --json` and `media import --json` only. `"preview-path-too-long"`: the daemon's frame path does not fit a line; printed by `preview --json` only. New codes may be added; treat an unknown code like `"dbus-error"`. |
 | `error` | string | A one-line explanation for people. Match on `code`, never on this text. |
 
 `status --json`, `cameras --json`, `controls --json` and `settings --json` print an `error` object instead of their usual one when they fail to read the daemon, and exit with the status of the failure (`3` or `4`).
@@ -757,6 +843,7 @@ A client treats `"active":false`, and any `error` line, as "no frames now", and 
 - **`v` stays 1 for `warning`.** It is a new string field in the existing `snapshot` and `state` lines, and `changed` may name it. Against a daemon of interface revision 10 or lower the key is still printed, with the value `""`, which is also its value when there is no warning. What it reports was, up to revision 10, a failure of the effect in `error` (and, by default, the `error` state; with `on_failure = "none"`, `active` with the reason in `error`); a client written for the earlier version sees `active` and an empty `error` instead, which is what the daemon does. `warning` is bounded like `error`, 512 bytes, so the reason of an effect failure with a module's hint at its end is not cut; with every string at its bound a `snapshot` lists two cameras fewer than before (see [General rules](#general-rules)).
 - **`v` stays 1 for the capture and output modes.** Interface revision 12 adds no field and no line type: a `settings_group` set gains a group `capture` before the others (with one `enum` setting, `camera.capture.mode`), the `config_group` row of `output.mode` becomes an editable `enum` with options, `effect.on_failure` may have `image` among its options, and `warning` has more clauses. A client written for the earlier version draws what it knows and ignores the rest; `interface_revision` 12 tells a client that they can appear.
 - **`v` stays 1 for the microphone.** `mic` is a new line type, printed by a new command and by `watch --json`; the `snapshot` gains the field `mic` (not in `state`, so `changed` never names it); a `settings_group`'s `group` gains the optional key `surface`, and the settings of the groups it marks have ids `mic.<group>.<name>` with scope `"global"`; `unsupported-daemon` for `mic` is an existing code. Against a daemon of interface revision 12 or lower `mic` is `null` in the snapshot, with the key present, and no `mic` line is printed. A client written for the earlier version ignores the field, the line and the key, and draws the microphone's groups with the other global ones. The settings schema stays 1.
+- **`v` stays 1 for the gallery.** `media`, `media_item` and `media_import` are new line types, printed by a new command only (`watch --json` and the `snapshot` are unchanged); `unsupported-daemon` for `media` is an existing code. A client written for the earlier version never runs the command. `media_type` may later take the value `"video"`, and a client shows a value it does not know as it is; the keys `poster` and `duration_ms` are present now, with the values of a still image.
 - A **breaking change** raises `v`: a removed or renamed field or line type, a changed JSON type or meaning, a new state string, or a change to the rules above (line cap, outage behaviour).
 - **Not breaking**, made without raising `v`: a new field in an existing line type, a new line type, a new `error` code. Clients ignore what they do not know.
 - The schema is independent of the D-Bus `InterfaceRevision`; a new D-Bus property may appear as a new field.
@@ -890,6 +977,7 @@ omarchy-broadcast preview --json
 - On `controls`, replace the record's image controls (they are also in `snapshot`, as `camera_controls`).
 - For the camera settings, keep one tree: on a complete set of `settings_group` lines (or `settings_clear`) replace it, on a `settings_delta` of the same `serial` update the listed settings' `value`, `stored`, `enabled` and `disabled_reason`, and on a `snapshot` drop it and wait for the set that follows (see [Client assembly rules](#client-assembly-rules)). Draw the tree generically, by `type`, and show `disabled_reason` for a setting that is not `enabled`.
 - Show `error` whenever it is non-empty, whatever the state.
+- To offer the background gallery, run `omarchy-broadcast media --json` when the panel opens (and after the daemon returns), read the `media` line and then exactly its `items` `media_item` lines, and read again when a later `media` line has a different `serial` within the same daemon run (the serial restarts at 1 with the daemon). Run `media import background PATH --select --json` for an image the user picked and `media remove PATH` for a removal, and show the message of a failure; do not copy into or delete from the gallery's directories yourself. Treat `items_truncated` as "the list is not complete". Only if `interface_revision` is 15 or more.
 - To stop, send `SIGTERM` or close the pipe.
 - To show the live preview, run `omarchy-broadcast preview --json` as a second long-lived child process next to `watch`, and only while the user wants the preview: it keeps the camera running. Open the `path` of each `frame` line (or reload the image from it) and keep the lease for as long as the preview is shown; stop the process to end it. The frame file is replaced by a rename, so a reader never sees a partial image.
 - Control the daemon by running `omarchy-broadcast on`, `off`, `camera next`, `camera <id>`, `effect <effect>` `denoise on|off`, `controls set NAME VALUE`, `controls reset`, `settings set --camera=ID -- ID VALUE` (no `--camera` for an `effect.…` id) or `settings reset --camera=ID`, and check the exit status; the resulting change arrives on the `watch` stream.

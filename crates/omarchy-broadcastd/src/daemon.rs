@@ -51,6 +51,7 @@ use crate::consumers::ConsumerWatcher;
 use crate::controller::{self, Command, Controller, Paths, Published, preliminary_snapshot};
 use crate::dbus::{Server, run_owner_watch, run_publisher, subscribe_owners};
 use crate::hotplug::{CameraWatcher, SECOND_SCAN, SETTLE};
+use crate::media::MediaStore;
 use crate::preview::PreviewDir;
 use crate::{error, info, warning};
 
@@ -202,10 +203,12 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
 
     let (published, notes) = Published::new(preliminary_snapshot(&paths));
     let (commands, command_rx) = channel::<Command>();
+    let media =
+        MediaStore::from_env().inspect_err(|e| warning!("the media gallery is unavailable: {e}"));
     let conn = zbus::connection::Builder::session()
         .serve_at(
             OBJECT_PATH,
-            Server::new(published.clone(), commands.clone()),
+            Server::new(published.clone(), commands.clone(), media),
         )
         .build()
         .await?;

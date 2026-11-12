@@ -407,6 +407,16 @@ impl MediaStore {
     /// outside [`background::MAX_DIMENSION`], and a format whose decoder is
     /// not installed. Never overwrites a file.
     pub fn import(&self, kind: MediaKind, src: &Path) -> Result<PathBuf, MediaError> {
+        self.import_stored(kind, src).map(|(path, _)| path)
+    }
+
+    /// [`MediaStore::import`], also saying whether a new file was stored
+    /// (`false`: an identical file of the gallery was returned).
+    pub fn import_stored(
+        &self,
+        kind: MediaKind,
+        src: &Path,
+    ) -> Result<(PathBuf, bool), MediaError> {
         if !src.is_absolute() {
             return Err(MediaError::NotAbsolute(src.to_path_buf()));
         }
@@ -444,7 +454,7 @@ impl MediaStore {
                 src.display(),
                 existing.display()
             );
-            return Ok(existing);
+            return Ok((existing, false));
         }
 
         let stem = sanitise_stem(
@@ -471,7 +481,7 @@ impl MediaStore {
                             source,
                         });
                     }
-                    return Ok(target);
+                    return Ok((target, true));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(source) => {
@@ -543,6 +553,37 @@ impl MediaStore {
         }
         None
     }
+}
+
+impl MediaError {
+    /// The D-Bus error of a gallery operation: the store's refusals are
+    /// `InvalidArgument`, a gallery that cannot be used or written
+    /// `Failed`; the message is the store's.
+    pub fn to_ipc(self) -> obc_ipc::IpcError {
+        use obc_ipc::IpcError;
+        match self {
+            MediaError::NoDataDir | MediaError::Io { .. } | MediaError::NoFreeName { .. } => {
+                IpcError::Failed(self.to_string())
+            }
+            MediaError::UnknownKind(_)
+            | MediaError::NotAbsolute(_)
+            | MediaError::VideoUnsupported(_)
+            | MediaError::Unreadable(_)
+            | MediaError::NotAnImage { .. }
+            | MediaError::NoDecoder { .. }
+            | MediaError::NotAUserItem(_) => IpcError::InvalidArgument(self.to_string()),
+        }
+    }
+}
+
+/// Whether `a` and `b` name the same file: the same text, or the same
+/// canonical path.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
 }
 
 /// A file name stem made safe to store: whitespace runs (line breaks and
@@ -900,4 +941,4 @@ impl Drop for TempFile {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

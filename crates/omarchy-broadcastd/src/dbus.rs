@@ -17,16 +17,30 @@
 //! lease): so once the lease is recorded, `AcquirePreview` asks the bus
 //! whether the name still has an owner, and ends the lease if not. Over a
 //! peer-to-peer connection (no bus, no sender) `AcquirePreview` fails.
+//!
+//! The media gallery (revision 15) is the object's own: [`Server::new`]
+//! takes the [`MediaStore`] (or why there is none, then `GetMedia`,
+//! `ImportMedia` and `RemoveMedia` answer `Failed` with that reason), its
+//! calls run on the blocking pool, and `MediaSerial` is kept here, from 1,
+//! raised after each import that stored a file and each removal, with its
+//! `PropertiesChanged`. It restarts at 1 at each daemon start: a client
+//! compares serials within one daemon run (a new owner of the bus name is
+//! a new run). A removal is checked here (a user item), then checked
+//! against the configuration, cleared from the run-time background and
+//! performed by the controller in one step ([`Command::ReleaseMedia`]).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 
 use futures_util::StreamExt;
 use obc_ipc::settings::{VariantDict, WireChange, camera_option};
 use obc_ipc::{
-    CameraControl, CameraControls, CameraInfo, INTERFACE, IpcError, OBJECT_PATH, SettingValue,
-    Snapshot, State,
+    CameraControl, CameraControls, CameraInfo, INTERFACE, IpcError, MediaEntry, MediaReply,
+    OBJECT_PATH, SettingValue, Snapshot, State,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 use zbus::fdo::NameOwnerChangedStream;
@@ -40,18 +54,47 @@ use crate::controller::{
     Change, Command, ConfigFilesReply, ConfigSchemaReply, ControlsReply, MovesReply, Note,
     PathReply, Published, Reply, SettingsReply,
 };
+use crate::media::{MediaError, MediaItem, MediaKind, MediaStore};
 
 /// The D-Bus object (see the module docs).
 pub struct Server {
     published: Published,
     commands: Sender<Command>,
+    /// The media gallery, or why there is none (its message).
+    media: Result<Arc<MediaStore>, String>,
+    /// `MediaSerial`.
+    media_serial: AtomicU32,
 }
 
 impl Server {
-    pub fn new(published: Published, commands: Sender<Command>) -> Self {
+    /// The object over the controller's snapshot and command channel, and
+    /// the media gallery `media` (normally [`MediaStore::from_env`]; its
+    /// error is the reason the gallery methods answer `Failed`).
+    pub fn new(
+        published: Published,
+        commands: Sender<Command>,
+        media: Result<MediaStore, MediaError>,
+    ) -> Self {
         Server {
             published,
             commands,
+            media: media.map(Arc::new).map_err(|e| e.to_string()),
+            media_serial: AtomicU32::new(1),
+        }
+    }
+
+    /// The media gallery, or `Failed` with why there is none.
+    fn store(&self) -> Result<Arc<MediaStore>, IpcError> {
+        self.media.clone().map_err(|reason| {
+            IpcError::Failed(format!("the media gallery is unavailable: {reason}"))
+        })
+    }
+
+    /// Raises `MediaSerial` and announces it.
+    async fn media_changed(&self, emitter: &SignalEmitter<'_>) {
+        self.media_serial.fetch_add(1, Ordering::SeqCst);
+        if let Err(e) = self.media_serial_changed(emitter).await {
+            crate::debug!("emitting a signal failed: {e}");
         }
     }
 
@@ -104,6 +147,56 @@ async fn still_there(conn: &Connection, name: &str) -> bool {
         Err(_) => return true,
     };
     dbus.name_has_owner(bus_name).await.unwrap_or(true)
+}
+
+/// The D-Bus error of a gallery operation ([`MediaError::to_ipc`]).
+fn media_error(e: MediaError) -> IpcError {
+    e.to_ipc()
+}
+
+/// Runs the gallery work `f` on the blocking pool, off the executor.
+async fn off_executor<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, IpcError> + Send + 'static,
+) -> Result<T, IpcError> {
+    tokio::task::spawn_blocking(f).await.unwrap_or_else(|e| {
+        Err(IpcError::Failed(format!(
+            "the media gallery task failed: {e}"
+        )))
+    })
+}
+
+/// `path` as D-Bus text: `None` when it is not UTF-8.
+fn path_text(path: &Path) -> Option<String> {
+    path.to_str().map(str::to_string)
+}
+
+/// The item on the wire; `None` for a path that is not UTF-8, which D-Bus
+/// cannot carry (a poster that is not is left out).
+fn media_entry(item: &MediaItem) -> Option<MediaEntry> {
+    Some(MediaEntry {
+        path: path_text(&item.path)?,
+        label: item.label.clone(),
+        bundled: item.bundled,
+        media_type: item.media_type.as_str().into(),
+        width: item.width,
+        height: item.height,
+        duration_ms: item.duration_ms,
+        poster: item
+            .poster
+            .as_deref()
+            .and_then(path_text)
+            .unwrap_or_default(),
+    })
+}
+
+/// The `GetMedia` reply for `kind`, at `serial`.
+fn media_reply(store: &MediaStore, kind: MediaKind, serial: u32) -> MediaReply {
+    MediaReply {
+        serial,
+        bundled_dir: store.bundled_dir(kind).to_string_lossy().into_owned(),
+        user_dir: store.user_dir(kind).to_string_lossy().into_owned(),
+        items: store.list(kind).iter().filter_map(media_entry).collect(),
+    }
 }
 
 #[interface(name = "br.com.dias.OmarchyBroadcast1")]
@@ -398,6 +491,96 @@ impl Server {
         self.call(|reply| Command::SetMicHost(on, reply)).await
     }
 
+    /// The media gallery of `kind`, `background` or `away` (revision 15):
+    /// `(serial, bundled_dir, user_dir, items)`, `serial` being
+    /// `MediaSerial` when the list was made, the directories the kind's in
+    /// the packaged and the user's gallery, each item a dictionary
+    /// (`obc_ipc::media`), the bundled ones first. Refused with
+    /// `InvalidArgument` for another kind.
+    #[zbus(out_args("serial", "bundled_dir", "user_dir", "items"))]
+    async fn get_media(
+        &self,
+        kind: String,
+    ) -> Result<(u32, String, String, Vec<VariantDict>), IpcError> {
+        let kind: MediaKind = kind.parse().map_err(media_error)?;
+        let store = self.store()?;
+        // Read before the list: a change made meanwhile is announced after.
+        let serial = self.media_serial.load(Ordering::SeqCst);
+        let reply = off_executor(move || Ok(media_reply(&store, kind, serial))).await?;
+        Ok(reply.to_wire())
+    }
+
+    /// Copies the image at `path` (absolute) into the user's gallery of
+    /// `kind` after the checks of a background, and returns the stored
+    /// path; a file of that gallery with the same bytes is returned
+    /// instead, without a copy (revision 15). `MediaSerial` moves only when
+    /// a file was stored. Refused with `InvalidArgument` and the reason;
+    /// `Failed` when the gallery cannot be written.
+    async fn import_media(
+        &self,
+        kind: String,
+        path: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<String, IpcError> {
+        let kind: MediaKind = kind.parse().map_err(media_error)?;
+        let store = self.store()?;
+        let src = PathBuf::from(path);
+        let (stored, new) =
+            off_executor(move || store.import_stored(kind, &src).map_err(media_error)).await?;
+        if new {
+            self.media_changed(&emitter).await;
+        }
+        path_text(&stored).ok_or_else(|| {
+            IpcError::Failed(format!(
+                "{} was stored, but its path is not UTF-8, which D-Bus cannot carry",
+                stored.display()
+            ))
+        })
+    }
+
+    /// Removes the item at `path` from the user's gallery (revision 15).
+    /// Refused with `InvalidArgument` for a bundled item or any path that
+    /// is not a user item, and while the configuration names the file
+    /// (`[effect] background_image` or `fallback_image`). When it is the
+    /// run-time background, that choice is cleared first, as an empty
+    /// `SetBackgroundImage` does, and a refusal of that refuses the
+    /// removal with its error. The check, the clear and the removal are
+    /// one controller step ([`Command::ReleaseMedia`]), so no
+    /// `SetBackgroundImage` can choose the file in between. `Failed` when
+    /// the file cannot be removed (the cleared choice is restored).
+    async fn remove_media(
+        &self,
+        path: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        let store = self.store()?;
+        let target = PathBuf::from(&path);
+        {
+            let (store, target) = (Arc::clone(&store), target.clone());
+            off_executor(move || {
+                if !target.is_absolute() {
+                    return Err(media_error(MediaError::NotAbsolute(target)));
+                }
+                if store
+                    .is_gallery_item(&target)
+                    .is_none_or(|(_, bundled)| bundled)
+                {
+                    return Err(media_error(MediaError::NotAUserItem(target)));
+                }
+                Ok(())
+            })
+            .await?;
+        }
+        self.call(|reply| Command::ReleaseMedia {
+            store,
+            path: target,
+            reply,
+        })
+        .await?;
+        self.media_changed(&emitter).await;
+        Ok(())
+    }
+
     /// About once per second while `MicState` is `active`, relayed from the
     /// audio worker (revision 13).
     #[zbus(signal)]
@@ -607,6 +790,14 @@ impl Server {
     #[zbus(property)]
     fn mic_error(&self) -> String {
         self.snap().mic.unwrap_or_default().error
+    }
+
+    /// Bumped after each import that stored a file and each removal from
+    /// the media gallery; from 1, restarting at 1 at each daemon start, so
+    /// compared only within one daemon run (revision 15).
+    #[zbus(property)]
+    fn media_serial(&self) -> u32 {
+        self.media_serial.load(Ordering::SeqCst)
     }
 
     #[zbus(property)]
