@@ -621,7 +621,28 @@ async fn change_modules(action: &ModulesAction) -> u8 {
                     )
                 }
                 ModulesAction::Profile { .. } => format!("Profile: {}\n", printable(&profile)),
+                // The pin just set is what the reply says: an audio stage's
+                // provider in the list is the worker's catalogue, refreshed
+                // after the call, so it still names the previous one.
+                ModulesAction::Pin {
+                    stage,
+                    module: Some(module),
+                    clear: false,
+                } => {
+                    let name = list
+                        .find(module)
+                        .map_or(module.as_str(), |m| m.name.as_str());
+                    format!(
+                        "{}: pinned to {} ({})\n",
+                        printable(stage),
+                        printable(name),
+                        printable(module)
+                    )
+                }
                 ModulesAction::Pin { stage, .. } => match list.provider_of(stage) {
+                    Some(m) if m.kind == "audio-filter" => {
+                        format!("{}: pin cleared\n", printable(stage))
+                    }
                     Some(m) => format!(
                         "{}: provided by {} ({})\n",
                         printable(stage),
@@ -694,7 +715,6 @@ mod tests {
             kind: "video-stage".into(),
             library: "/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so".into(),
             manifest: "/usr/lib/omarchy-broadcast/modules.d/maxine-vfx.toml".into(),
-            description: String::new(),
             enabled: true,
             status: "available".into(),
             reason: String::new(),
@@ -718,6 +738,7 @@ mod tests {
                     selected: false,
                 },
             ],
+            ..ModuleInfo::default()
         }
     }
 

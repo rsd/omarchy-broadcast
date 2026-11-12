@@ -23,7 +23,7 @@ flowchart LR
 ```
 
 - The **mic host** is a small PipeWire process that creates the source. It runs no effect: a forwarding plugin hands each 10 ms of audio to the worker and plays the result back, or your microphone's own audio when the result is not there.
-- The **audio worker** runs the modules. It starts when an application starts recording from the source and exits after 30 seconds without sound, which also frees a GPU module's memory. It runs in its own unit, so restarting the daemon does not stop it, and its crash does not stop the microphone.
+- The **audio worker** runs the modules. It starts when an application starts recording from the source and exits after 30 seconds (`idle_exit_s`) with no audio from the source and no call from the daemon or the panel, which also frees a GPU module's memory. Audio stops a few seconds after the last application stops recording, when PipeWire suspends the source; a status query from the daemon or the panel postpones the exit. It runs in its own unit, so restarting the daemon does not stop it, and its crash does not stop the microphone.
 - The **daemon** is where you control it: `omarchy-broadcast mic`, the settings tree and the bar. It writes your settings to a file the worker reads, so the microphone works as you set it with the daemon down.
 
 The processing adds a delay: 10 ms to hand the audio to the worker and back (20 ms when a stage runs on a GPU), plus the engine's own: about 10 ms for RNNoise and about 30 ms for DeepFilterNet. `omarchy-broadcast mic` shows the total in force.
@@ -109,8 +109,8 @@ omarchy-broadcast mic restore-default    # go back to the microphone that was th
 
 Making it the default is an explicit action; nothing turns it into the default by itself. What `mic default` does:
 
-1. It remembers which microphone is the default now.
-2. It pins the capture side of the Omarchy Broadcast Mic to the microphone you chose ([Choosing the microphone](#choosing-the-microphone)), or to the one that was the default, so that it never captures from itself.
+1. It remembers the configured default microphone, which `mic restore-default` gives back.
+2. It pins the capture side of the Omarchy Broadcast Mic, so that it never captures from itself: to the microphone you chose ([Choosing the microphone](#choosing-the-microphone)); otherwise to the configured default microphone, when it is connected; otherwise, when that one is unplugged, to the microphone WirePlumber is using in its place (`default.audio.source`). If none of these can be pinned, the command fails and suggests `omarchy-broadcast mic device`.
 3. It makes the Omarchy Broadcast Mic the default, so that applications that follow the default use it.
 
 `mic restore-default` makes the remembered microphone the default again and removes the pin. `mic off` does that first, when the Omarchy Broadcast Mic is the default, before it stops the microphone, so applications move to a live microphone as it goes. Making it the default is safe: the capture side and the output side of the node share one link group, which WirePlumber never links to each other.
@@ -171,7 +171,7 @@ The `[mic]` keys are in [config.example.toml](../config.example.toml); the panel
 | `enabled` | `true` | The master switch above |
 | `device` | `"default"` | The microphone captured, a PipeWire `node.name` |
 | `pipeline_depth` | `0` | Blocks of 10 ms between the microphone and the processed audio, 0 to 4; 0 chooses by device (1 on the CPU, 2 when a stage runs on a GPU). More tolerates a late block at the cost of delay |
-| `idle_exit_s` | `30` | Seconds without sound before the worker exits and frees its memory (and a GPU); 0 never exits |
+| `idle_exit_s` | `30` | Seconds with no audio from the source and no call from the daemon or the panel before the worker exits and frees its memory (and a GPU); 0 never exits |
 | `gpu_policy` | `"always"` | When a GPU module may be used: `always`, `with-camera` (only in a microphone session that starts while the camera runs) or `never`. A stage the GPU may not run runs on the best CPU module that offers it. A level meter alone never wakes the GPU |
 | `force_conflicts` | `false` | Run effects that their modules declare as excluding each other, together (studio voice with noise or room echo removal, [below](#studio-voice-excludes-noise-and-echo-removal)). For testing; set in a file |
 
@@ -257,7 +257,7 @@ The layout above follows NVIDIA's download and has not yet been verified against
 
 ### Studio voice excludes noise and echo removal
 
-Studio voice already removes noise and echo, so its stage declares a conflict with the other two. While it is on, their switches are greyed with the reason "Studio voice already removes noise and echo", and they do not run; turn studio voice off to use them again. To run studio voice together with them anyway, for testing, set the override in a configuration file (the panel does not change it):
+Studio voice already removes noise and echo, so its stage declares a conflict with the other two. While it is on, their switches are greyed with the reason "Cannot run together with studio voice (adds noticeable delay)", and they do not run; turn studio voice off to use them again. To run studio voice together with them anyway, for testing, set the override in a configuration file (the panel does not change it):
 
 ```toml
 [mic]
@@ -272,7 +272,7 @@ The GPU module ranks above the CPU one, so it provides noise removal whenever it
 
 ### What it does with the GPU
 
-The GPU is used only while an application records from the source, never by a level meter, and only from the moment the worker loads a chain. Some of the SDK's effects keep their GPU memory until the process ends, so it is released when the worker exits after `idle_exit_s` seconds without sound, not the moment recording stops.
+The GPU is used only while an application records from the source, never by a level meter, and only from the moment the worker loads a chain. Some of the SDK's effects keep their GPU memory until the process ends, so it is released when the worker exits after `idle_exit_s` seconds without audio or calls, not the moment recording stops.
 
 If one stage cannot be loaded, only that stage is dropped and the rest of the chain runs. If an effect fails while running, that stage passes the voice through at the same delay, so the delay does not jump, and the rest keeps running. The microphone is never silent because of an effect, and if the worker itself stops you get your own audio, as described in [When something stops](#when-something-stops).
 
@@ -323,7 +323,7 @@ journalctl --user -u omarchy-broadcastd                                # the dae
 
 ## What it touches
 
-- **PipeWire and WirePlumber.** Only on your explicit actions: `mic default` writes WirePlumber's default-source setting (`default.configured.audio.source` in its `default` metadata) and sets the target of the capture stream, which WirePlumber stores in its own saved state for that stream (restore-stream). `mic restore-default`, and `mic off` when the Omarchy Broadcast Mic is the default, write the default back and delete the target. Nothing else is written to WirePlumber, and your own WirePlumber configuration files are never touched.
+- **PipeWire and WirePlumber.** Only on your explicit actions: `mic default` writes WirePlumber's default-source setting (`default.configured.audio.source` in its `default` metadata) and sets the target of the capture stream, which WirePlumber stores in its own saved state for that stream (restore-stream). `mic restore-default`, and `mic off` when the Omarchy Broadcast Mic is the default, write the default back in two steps, both to `default.configured.audio.source`: first a connected hardware microphone, then the remembered default microphone; then they delete the target. The first step keeps a hardware microphone more recent than the Omarchy Broadcast Mic in WirePlumber's history of configured defaults, so that the Omarchy Broadcast Mic does not become the default by itself when the remembered microphone is unplugged. If no other microphone is connected, only the remembered one is written. Nothing else is written to WirePlumber, and your own WirePlumber configuration files are never touched.
 - **Files.** `config.d/50-panel.toml` (the daemon's managed drop-in, with `[mic]`), the daemon's state file (the previous default microphone and the module settings), `audio-settings.json` and `audio-modules-crash.json` in the state directory, the worker's socket in `$XDG_RUNTIME_DIR/omarchy-broadcast/`, and the installed units, plugin and module. The worker holds audio in memory only; these processes store and send no audio.
 - **The GPU.** A GPU module is loaded only while an application records from the source (a level meter does not count) and the policy allows it; the worker exits after the idle time and releases it. The Maxine audio module's SDK runs in the worker only, with the worker's own `LD_PRELOAD` and library path from its drop-in; the real `/etc/os-release` and the camera daemon are not touched.
 

@@ -725,7 +725,7 @@ impl AudioInstance for AfxInstance {
         let latency = chain.latency();
         let load_ms = start.elapsed().as_secs_f32() * 1e3;
         log::info!(
-            "{}: {} samples of delay ({load_ms:.0} ms)",
+            "{}: {} samples of delay (loaded in {load_ms:.0} ms)",
             chain
                 .effects
                 .iter()

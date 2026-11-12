@@ -8,7 +8,8 @@ use serde::Serialize;
 pub enum State {
     /// Processing is off: raw passthrough.
     Off,
-    /// On, but no stage runs (none is on, or none can run): raw.
+    /// On, but nothing is processed: no plugin is connected (nothing
+    /// records), or no stage is on or able to run: raw.
     Passthrough,
     /// A chain is loading or warming up: raw until it is ready.
     Starting,
@@ -39,14 +40,18 @@ pub struct Status {
     pub consumers: u32,
     /// Whether the consumers are known (PipeWire control available).
     pub consumers_known: bool,
-    /// Whether a mic plugin is connected.
+    /// Whether a mic plugin is connected (or connecting again, after the
+    /// connection was dropped for a deeper pipeline).
     pub connected: bool,
-    /// The module that runs each running stage.
+    /// The module that runs each running stage (empty while no plugin is
+    /// connected).
     pub provider: std::collections::BTreeMap<String, String>,
     /// The delay processing adds at a 480-sample quantum, in milliseconds:
-    /// the pipeline depth plus the chain's algorithmic delay.
+    /// the pipeline depth plus the chain's algorithmic delay (0 while no
+    /// plugin is connected).
     pub latency_ms: f64,
-    /// The chain's algorithmic delay, in samples.
+    /// The chain's algorithmic delay, in samples (0 while no plugin is
+    /// connected).
     pub latency_samples: u32,
     /// The pipeline depth in blocks (of the connection, else of the plan).
     pub pipeline_depth: u32,

@@ -6538,3 +6538,58 @@ fn watch_json_carries_the_microphone_and_its_changes() {
     assert_eq!(last["provider"], "mic-denoise: voice");
     assert_eq!(last["latency_ms"], 10.0);
 }
+
+#[test]
+fn settings_set_of_a_mic_setting_has_no_all_cameras_heading() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    mock.with(|m| m.global = vec![mic_input_group()]);
+    let out = bus.run(&["settings", "set", "mic.input.enabled", "off"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(!out.stdout.contains("All cameras"), "{}", out.stdout);
+    assert!(out.stdout.contains("mic.input.enabled"), "{}", out.stdout);
+}
+
+#[test]
+fn modules_pin_words_the_pin_it_set_not_the_stale_provider() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let stage = |selected| obc_ipc::StageInfo {
+        id: "mic-denoise".into(),
+        available: true,
+        selected,
+        ..obc_ipc::StageInfo::default()
+    };
+    mock.with(|m| {
+        m.modules = vec![
+            obc_ipc::ModuleInfo {
+                id: "br.com.dias.maxine-afx".into(),
+                name: "NVIDIA Maxine audio effects".into(),
+                kind: "audio-filter".into(),
+                enabled: true,
+                status: "available".into(),
+                // The catalogue still names the old provider.
+                stages: vec![stage(true)],
+                ..obc_ipc::ModuleInfo::default()
+            },
+            obc_ipc::ModuleInfo {
+                id: "br.com.dias.voice-cpu".into(),
+                name: "Voice on the CPU".into(),
+                kind: "audio-filter".into(),
+                enabled: true,
+                status: "available".into(),
+                stages: vec![stage(false)],
+                ..obc_ipc::ModuleInfo::default()
+            },
+        ];
+    });
+    let out = bus.run(&["modules", "pin", "mic-denoise", "br.com.dias.voice-cpu"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "mic-denoise: pinned to Voice on the CPU (br.com.dias.voice-cpu)\n"
+    );
+    let out = bus.run(&["modules", "pin", "mic-denoise", "--clear"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(out.stdout, "mic-denoise: pin cleared\n");
+}
