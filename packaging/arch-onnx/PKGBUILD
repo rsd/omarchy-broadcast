@@ -28,7 +28,7 @@
 
 pkgname=omarchy-broadcast-onnx-git
 _pkgname=omarchy-broadcast
-pkgver=0.38.0
+pkgver=0.38.1
 pkgrel=1
 pkgdesc='Open-model cut-out (ONNX Runtime) module for omarchy-broadcast: background blur and replacement'
 arch=('x86_64')
@@ -91,11 +91,11 @@ _onnx_sums=(
 # is checked against its sha256 above, whichever way it arrives.
 # PLACEHOLDER: that repository's first release is not published yet
 # (publishing it needs the user: a push), and the owner below is not final.
-# Once it is: set _onnx_models_owner and _onnx_models_ver (the release tag,
+# Once it is: set _onnx_models_owner (and _onnx_models_ver, the release tag
 # without the leading v) and enable the URL line. Until then the files come
 # from the local fallback directory.
 _onnx_models_owner='PLACEHOLDER-OWNER'
-_onnx_models_ver='PLACEHOLDER-VERSION'
+_onnx_models_ver='1.0.0'  # the first omarchy-onnx-models release tag, v1.0.0 (not published yet)
 #_onnx_models_url="https://github.com/$_onnx_models_owner/omarchy-onnx-models/releases/download/v$_onnx_models_ver"
 # When it is set, the files are downloaded from "$_onnx_models_url/<name>".
 _onnx_models_url=''

@@ -57,7 +57,7 @@ Without the variable the module is installed and shows as unavailable until the 
 3. `$XDG_DATA_HOME/omarchy-broadcast/models/onnx/` (by default `~/.local/share/omarchy-broadcast/models/onnx/`);
 4. `/usr/share/omarchy-broadcast/models/onnx/`.
 
-**The models** are the project's own conversions to ONNX of the upstream releases, which keep the weights of the originals. The scripts that make them, and their checksums, are in [`crates/obc-module-onnx/model-sources/`](../../crates/obc-module-onnx/model-sources/README.md). Each file is checked against its SHA-256 when it loads; a missing or different file fails the load, with a reason that names the file and the directories searched.
+**The models** are the project's own conversions to ONNX of the upstream releases, which keep the weights of the originals. They are published, with the scripts that make them and their checksums, by the omarchy-onnx-models repository ([`crates/obc-module-onnx/model-sources/README.md`](../../crates/obc-module-onnx/model-sources/README.md) points to it). Each file is checked against its SHA-256 when it loads; a missing or different file fails the load, with a reason that names the file and the directories searched.
 
 | Setting value | File | Upstream |
 |---|---|---|
