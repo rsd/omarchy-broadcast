@@ -19,7 +19,23 @@
 //! | no writer, or a lifecycle fault           | `error`    |
 //! | otherwise                                 | `idle`     |
 //!
-//! A session (camera + CUDA output) runs only while it is wanted: enabled,
+//! **Video memory.** Each camera start resolves where the session keeps
+//! its frames (`[video] memory`: `auto`, `cuda` or `system`) with the CUDA
+//! presence probe ([`MediaBackend::cuda_unusable`], no CUDA call), logs
+//! the effective memory once per change, and gives it to the modules
+//! before the plan (stage availability, `_host.cuda`); a reload resolves it
+//! again, and a change applies at the next camera start: a running session
+//! keeps the memory it started in. In system memory nothing is planned that
+//! needs CUDA frames (enhance, frame generation), no frame generation rate
+//! is offered, and the compute capability is never read. Under `auto` only,
+//! a start whose CUDA output fails for want of CUDA
+//! ([`crate::backend::SessionError::no_cuda`]) is tried again at once, once,
+//! in system memory, which stays in force until the next reload; `cuda`
+//! never falls back, and neither does a GPU that could not be unparked.
+//! The effective memory is reported by the log and the description of the
+//! `video.memory` configuration row.
+//!
+//! A session (camera + output) runs only while it is wanted: enabled,
 //! the writer running, no fault, and a consumer present for the start
 //! debounce, or (once running) a consumer present or gone for less than the
 //! idle grace. A fault (no camera, start failed, camera lost with no
@@ -291,7 +307,10 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use obc_core::config::{CAMERA_CONTROL_NAMES, Config, EffectConfig, RuntimeState};
+use obc_core::config::{
+    CAMERA_CONTROL_NAMES, Config, EffectConfig, EffectiveMemory, MemoryChoice, RuntimeState,
+    VideoMemory, resolve_memory,
+};
 use obc_core::config_d::{self, ConfigSet, ManagedEdit, OverridePolicy, WriteError};
 use obc_core::config_schema::{self, ModuleFact, RegistryFacts, StageFact};
 use obc_core::modules::{BackendProfile, StoredValue, legacy};
@@ -325,7 +344,7 @@ use crate::camera::{self, Camera};
 use crate::gpu_cache;
 use crate::media::{MediaStore, same_file};
 use crate::mic::{self, agent::MicEvent, agent::MicLink, agent::MicRequest};
-use crate::modules::{self, Modules, Plan};
+use crate::modules::{self, HostMemory, Modules, Plan};
 use crate::preview::{Leases, PreviewDir, check_fps};
 use crate::settings::catalogue::{self, DYNAMIC_FRAMERATE};
 use crate::settings::effects::{self, Binding, GlobalEntry, Write};
@@ -1240,6 +1259,22 @@ struct Streaming {
     /// good one once a camera frame has reached it
     /// ([`Controller::output_proven`]).
     contract: OutputContract,
+    /// Where the session keeps its frames, from its start to its stop.
+    memory: VideoMemory,
+}
+
+/// What [`Controller::start_session_once`] asks of the start that called
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Again {
+    /// Nothing: the start is over (started, or failed).
+    No,
+    /// The session was stopped to be started again with the modules as
+    /// refreshed once the GPU was up.
+    Restart,
+    /// The CUDA output failed for want of CUDA under `auto`: start again in
+    /// system memory.
+    SystemMemory,
 }
 
 /// The lifecycle state machine (see the module docs).
@@ -1475,6 +1510,14 @@ pub struct Controller<B: MediaBackend> {
     compute_capability: Option<(u32, u32)>,
     /// A session of this process has read [`Self::compute_capability`].
     compute_capability_learnt: bool,
+    /// The video memory the next session starts in, and why: resolved at
+    /// start, at each reload and at each camera start (logged when it
+    /// changes); the running session's is its own ([`Streaming::memory`]).
+    memory: EffectiveMemory,
+    /// Under `auto`: why a session start fell back to system memory (its
+    /// CUDA output failed for want of CUDA). System memory stays in force
+    /// until the next reload.
+    memory_fallback: Option<String>,
     published: Published,
     sink_hook: Option<SinkHook>,
     /// The microphone's agent ([`crate::mic::agent`]); `None` without one
@@ -1658,6 +1701,7 @@ impl<B: MediaBackend> Controller<B> {
             &self.config,
             self.paths.ledger.as_deref(),
             self.compute_capability,
+            HostMemory::of(&self.memory),
         );
         // The empty list was published before: the loaded one is a change.
         loaded.follow(&self.modules);
@@ -1739,17 +1783,22 @@ impl<B: MediaBackend> Controller<B> {
             }
         );
         let mut backend = backend;
+        // Before the modules open: their configuration and what they offer
+        // depend on it.
+        let memory = memory_of(&mut backend, &config, None);
+        info!("video memory: {memory}");
         let modules = if load_modules {
             Modules::load(
                 &mut backend,
                 &config,
                 paths.ledger.as_deref(),
                 compute_capability,
+                HostMemory::of(&memory),
             )
         } else {
             Modules::empty()
         };
-        let config_facts = (modules.serial(), registry_facts(&modules));
+        let config_facts = (modules.serial(), registry_facts(&modules, &memory));
         let mut c = Controller {
             backend,
             paths,
@@ -1827,6 +1876,8 @@ impl<B: MediaBackend> Controller<B> {
             marked: Vec::new(),
             compute_capability,
             compute_capability_learnt: false,
+            memory,
+            memory_fallback: None,
             published,
             sink_hook,
             mic: None,
@@ -2210,12 +2261,55 @@ impl<B: MediaBackend> Controller<B> {
     /// so a capture mode change or a fail-over mid-session turns it on or
     /// off without a restart; off, its element passes the frames through
     /// and loads nothing.
+    ///
+    /// In system memory neither enhance nor frame generation is planned:
+    /// both take CUDA frames.
     fn fresh_plan(&self) -> Plan {
         let mut plan = self.modules.plan();
-        if self.frame_generation_possible() {
+        if self.session_memory() == VideoMemory::System {
+            plan.enhance = None;
+        } else if self.frame_generation_possible() {
             self.modules.add_frame_generation(&mut plan);
         }
         plan
+    }
+
+    /// Resolves [`Self::memory`] again ([`memory_of`]), logged when it
+    /// changed.
+    fn resolve_memory(&mut self) {
+        let memory = memory_of(
+            &mut self.backend,
+            &self.config,
+            self.memory_fallback.as_deref(),
+        );
+        if memory != self.memory {
+            info!("video memory: {memory}");
+            self.memory = memory;
+        }
+    }
+
+    /// The memory of the running session, else the one the next session
+    /// starts in ([`Self::memory`]).
+    fn session_memory(&self) -> VideoMemory {
+        self.session
+            .as_ref()
+            .map_or(self.memory.memory, |s| s.memory)
+    }
+
+    /// Resolves the effective video memory again ([`memory_of`]), logged
+    /// when it changed, and gives it to the modules unless a session runs
+    /// (it keeps its own). What the modules then offer is published with
+    /// the next snapshot (their serial moves).
+    fn follow_memory(&mut self) {
+        self.resolve_memory();
+        if self.session.is_some() {
+            return;
+        }
+        self.modules.set_memory(
+            &mut self.backend,
+            &self.config,
+            HostMemory::of(&self.memory),
+        );
     }
 
     /// Whether the output contract's rate is twice `camera`'s capture
@@ -2225,8 +2319,12 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     /// Whether the output contract's rate is twice the rate of a mode of a
-    /// known camera (its mode now, or one it offers).
+    /// known camera (its mode now, or one it offers). Never in system
+    /// memory: frame generation takes CUDA frames.
     fn frame_generation_possible(&self) -> bool {
+        if self.session_memory() == VideoMemory::System {
+            return false;
+        }
         let out = self.output_contract().fps();
         self.cameras
             .iter()
@@ -2853,7 +2951,9 @@ impl<B: MediaBackend> Controller<B> {
     /// camera.
     fn enhance_for(&self, camera: &Camera) -> bool {
         let plan = self.current_plan();
-        plan.enhance.is_some()
+        // The stage takes CUDA frames.
+        self.session_memory() == VideoMemory::Cuda
+            && plan.enhance.is_some()
             && self
                 .modules
                 .stage_on(&plan, &self.config, &self.runtime, &StageId::ENHANCE)
@@ -2880,8 +2980,14 @@ impl<B: MediaBackend> Controller<B> {
     ///
     /// Whether the session was stopped to be started again with another
     /// module ([`Self::follow_modules`]; never without `restart`).
+    ///
+    /// A session in system memory never reads the compute capability: it
+    /// makes no GPU call.
     fn refresh_features(&mut self, now: Instant, restart: bool) -> bool {
-        if self.session.is_some() && !self.compute_capability_learnt {
+        if self.session.is_some()
+            && !self.compute_capability_learnt
+            && self.session_memory() == VideoMemory::Cuda
+        {
             self.learn_compute_capability();
         }
         self.modules
@@ -3106,6 +3212,7 @@ impl<B: MediaBackend> Controller<B> {
             fixed_framerate: self.config.camera.fixed_framerate,
             effect: self.effect_run(),
             backends: self.current_plan().backends(),
+            memory: self.session_memory(),
         }
     }
 
@@ -3204,13 +3311,15 @@ impl<B: MediaBackend> Controller<B> {
         // The modules found make the module rows of the config schema, the
         // camera the settings describe the options of `output.mode`.
         let mut facts = if self.config_facts.0 != self.modules.serial() {
-            registry_facts(&self.modules)
+            registry_facts(&self.modules, &self.memory)
         } else {
             self.config_facts.1.clone()
         };
         facts.output_modes = self.output_mode_options();
+        facts.no_frame_generation = self.session_memory() == VideoMemory::System;
         facts.on_failure_options =
             config_schema::on_failure_options(&self.config_set.config.effect);
+        facts.video_memory = Some(self.memory.clone());
         if facts != self.config_facts.1 {
             self.bump_config();
         }
@@ -4075,16 +4184,33 @@ impl<B: MediaBackend> Controller<B> {
     /// again with it in the same step, once: the second start plans with
     /// the modules as refreshed and never restarts, and nothing is
     /// published in between (`starting` is not followed by `idle`).
+    ///
+    /// Under `auto`, a start whose CUDA output failed for want of CUDA is
+    /// started again at once in system memory, also once, with nothing
+    /// published in between either.
     fn start_session(&mut self, now: Instant) {
-        if self.start_session_once(now, true) {
-            self.start_session_once(now, false);
+        let mut restart = true;
+        let mut announce = true;
+        loop {
+            match self.start_session_once(now, restart, announce) {
+                Again::No => break,
+                Again::Restart => restart = false,
+                // Once: the fallback stands until the next reload, so the
+                // next start is in system memory. The start was announced
+                // already.
+                Again::SystemMemory => announce = false,
+            }
         }
     }
 
     /// One start of [`Self::start_session`]; with `restart`, the session
     /// may be stopped to be started again ([`Self::refresh_features`]):
-    /// whether it was.
-    fn start_session_once(&mut self, now: Instant, restart: bool) -> bool {
+    /// whether it was ([`Again::Restart`]), or is to be started again in
+    /// system memory ([`Again::SystemMemory`]). The effective memory is
+    /// resolved first and given to the modules ([`Self::follow_memory`]).
+    /// With `announce`, the start is logged (the retry in system memory is
+    /// the same start, not logged again).
+    fn start_session_once(&mut self, now: Instant, restart: bool, announce: bool) -> Again {
         let mut candidates: Vec<Camera> = Vec::with_capacity(self.cameras.len());
         if let Some(c) = self.chosen_camera() {
             candidates.push(c.clone());
@@ -4096,12 +4222,15 @@ impl<B: MediaBackend> Controller<B> {
         }
         if self.published.disable_pending() {
             debug!("SetEnabled(false) is queued: not starting the camera");
-            return false;
+            return Again::No;
         }
         let Some(first) = candidates.first() else {
             self.set_fault("no camera is available".into());
-            return false;
+            return Again::No;
         };
+        // The memory the session runs in is decided now too, and the
+        // modules told before the plan (what they offer depends on it).
+        self.follow_memory();
         // Which module runs each stage is decided now, for the whole
         // session (frame generation when the first camera's rate is half
         // the output's).
@@ -4142,7 +4271,7 @@ impl<B: MediaBackend> Controller<B> {
                         self.plan = None;
                         self.hold_background();
                         self.set_privacy_fault(effect_failure_text(&params.effect, &reason));
-                        return false;
+                        return Again::No;
                     }
                     EffectOnFailure::Black | EffectOnFailure::Image => {
                         warning!("effect {} cannot run: {reason}", params.effect.mode);
@@ -4159,8 +4288,11 @@ impl<B: MediaBackend> Controller<B> {
         }
         let first = first.clone();
         self.effect_applied = Some(params.effect.clone());
-        info!("an application opened the virtual camera: starting");
+        if announce {
+            info!("an application opened the virtual camera: starting");
+        }
         self.session = Some(Streaming {
+            memory: params.memory,
             camera: first.id.clone(),
             node: first.path.clone(),
             failed: Vec::new(),
@@ -4179,7 +4311,28 @@ impl<B: MediaBackend> Controller<B> {
         // From here the modules' code runs: marked in the crash ledger
         // until the session stops.
         self.mark_running(&params.effect);
-        if let Err(e) = self.backend.start_session(&params)
+        let started = self.backend.start_session(&params);
+        // Under `auto`, a CUDA output that failed for want of CUDA (not
+        // the contract's fault, not a GPU that could not be unparked) is
+        // tried again at once in system memory, once: the fallback stands
+        // until the next reload. Before the start without effects, which
+        // would want CUDA as much.
+        if let Err(e) = &started
+            && e.no_cuda
+            && params.memory == VideoMemory::Cuda
+            && self.memory.choice == MemoryChoice::Auto
+            && self.memory_fallback.is_none()
+        {
+            warning!(
+                "the CUDA video pipeline could not start ({}): starting in system memory until \
+                 the next reload",
+                e.message
+            );
+            self.memory_fallback = Some(format!("CUDA could not start: {}", e.message));
+            self.drop_session();
+            return Again::SystemMemory;
+        }
+        if let Err(e) = started
             && self.start_passthrough(&params, &e.message).is_none()
         {
             self.drop_session();
@@ -4203,7 +4356,7 @@ impl<B: MediaBackend> Controller<B> {
             } else {
                 self.set_fault(msg);
             }
-            return false;
+            return Again::No;
         }
         let again = restart;
         let restart = restart && self.passthrough.is_none();
@@ -4212,10 +4365,10 @@ impl<B: MediaBackend> Controller<B> {
         // changed what runs, or the session stopped to be started again
         // with another module).
         if self.refresh_features(now, restart) {
-            return true;
+            return Again::Restart;
         }
         if self.session.is_none() {
-            return false;
+            return Again::No;
         }
         // Started without its effects while the effect could not run, it
         // now can (learnt for this GPU): as the guard would, the session is
@@ -4228,20 +4381,20 @@ impl<B: MediaBackend> Controller<B> {
             );
             self.drop_session();
             self.privacy_hold = Some(PrivacyHold::Guard);
-            return again;
+            return if again { Again::Restart } else { Again::No };
         }
         // Turned off during the (slow) output build: no camera is opened;
         // the queued SetEnabled(false) is handled next.
         if self.published.disable_pending() {
             info!("disabled while starting: the camera is not opened");
             self.drop_session();
-            return false;
+            return Again::No;
         }
         if let Err(last) = self.try_cameras(&candidates, now) {
             self.drop_session();
             self.set_fault(last.unwrap_or_else(|| "no camera is available".into()));
         }
-        false
+        Again::No
     }
 
     /// Before the session runs `effect` (started, given a camera or
@@ -4373,10 +4526,12 @@ impl<B: MediaBackend> Controller<B> {
     /// Stops the session. An effect failure of that session (in
     /// `Warning`), a noise removal failure, a relighting failure and an
     /// enhancement failure end with it: the stages' `Error` gives way to
-    /// the causes still standing.
+    /// the causes still standing. The modules then follow the memory the
+    /// next session starts in ([`Self::follow_memory`]).
     fn drop_session(&mut self) {
         self.stop_watch();
-        if self.session.take().is_some() {
+        let dropped = self.session.take().is_some();
+        if dropped {
             self.backend.stop_session();
         }
         // The modules' code stopped (cleanly: the daemon is still here).
@@ -4399,6 +4554,12 @@ impl<B: MediaBackend> Controller<B> {
         let enhance = self.enhance_failure.take();
         if stages || enhance.is_some_and(|e| e == self.error) {
             self.error = self.standing_error();
+        }
+        // A memory change made while it ran applies now to the modules, so
+        // that what they offer while idle (the stage reasons) matches the
+        // memory the `video.memory` row says is in force.
+        if dropped {
+            self.follow_memory();
         }
     }
 
@@ -6553,8 +6714,9 @@ impl<B: MediaBackend> Controller<B> {
     /// options of `output.mode` ([`Self::output_mode_options`]) and those of
     /// `effect.on_failure` (the image only with one configured).
     fn schema_facts(&self) -> RegistryFacts {
-        let mut facts = registry_facts(&self.modules);
+        let mut facts = registry_facts(&self.modules, &self.memory);
         facts.output_modes = self.output_mode_options();
+        facts.no_frame_generation = self.session_memory() == VideoMemory::System;
         facts.on_failure_options =
             config_schema::on_failure_options(&self.config_set.config.effect);
         facts
@@ -6578,7 +6740,10 @@ impl<B: MediaBackend> Controller<B> {
                 modes: c.modes.clone(),
                 other_formats: Vec::new(),
             });
-        let generated = self.modules.resolve(FRAME_GENERATION).provider.is_some();
+        // No frame generation in system memory (it takes CUDA frames): the
+        // running session's memory, else the next session's.
+        let generated = self.session_memory() == VideoMemory::Cuda
+            && self.modules.resolve(FRAME_GENERATION).provider.is_some();
         output_mode_choices(caps.as_ref(), &current, generated)
     }
 
@@ -7456,8 +7621,22 @@ impl<B: MediaBackend> Controller<B> {
         // have changed, or a feature been installed: found and opened again.
         // A running session keeps the modules it started with, and follows
         // what they provide now ([`Self::follow_modules`]).
-        self.modules
-            .reload(&mut self.backend, &self.config, self.compute_capability);
+        // The video memory is resolved again (a fallback of `auto` to
+        // system memory ends here), and applies at the next camera start:
+        // a running session keeps its memory, and the modules with it.
+        self.memory_fallback = None;
+        self.resolve_memory();
+        let memory = if self.session.is_some() {
+            self.modules.memory()
+        } else {
+            HostMemory::of(&self.memory)
+        };
+        self.modules.reload(
+            &mut self.backend,
+            &self.config,
+            self.compute_capability,
+            memory,
+        );
         // Enhancement is followed below, once the cameras are read again.
         self.follow_modules(false, now, true);
         // The effect in force may have changed (or failed before): applied
@@ -7850,10 +8029,29 @@ fn migrate_choices(paths: &Paths, set: ConfigSet, runtime: &mut RuntimeState) ->
     }
 }
 
+/// The effective video memory of `config`: under `auto`, system memory for
+/// `fallback` when a start fell back to it (until the next reload), else
+/// what the CUDA presence probe finds; `cuda` and `system` are what they
+/// say, with no probe.
+fn memory_of<B: MediaBackend>(
+    backend: &mut B,
+    config: &Config,
+    fallback: Option<&str>,
+) -> EffectiveMemory {
+    match (config.video.memory, fallback) {
+        (MemoryChoice::Auto, Some(why)) => EffectiveMemory::auto_system(why),
+        (MemoryChoice::Auto, None) => {
+            resolve_memory(MemoryChoice::Auto, backend.cuda_unusable().as_deref())
+        }
+        (choice, _) => resolve_memory(choice, None),
+    }
+}
+
 /// What the module registry found, for the module rows of the config
 /// schema: the installed modules (by name) and, for each stage they offer,
-/// the modules offering it.
-fn registry_facts(modules: &Modules) -> RegistryFacts {
+/// the modules offering it; and the video memory in force (the
+/// description of `video.memory`).
+fn registry_facts(modules: &Modules, memory: &EffectiveMemory) -> RegistryFacts {
     let info = modules.info();
     let mut stages: Vec<StageFact> = Vec::new();
     for m in &info {
@@ -7885,6 +8083,9 @@ fn registry_facts(modules: &Modules) -> RegistryFacts {
         stages,
         output_modes: Vec::new(),
         on_failure_options: Vec::new(),
+        video_memory: Some(memory.clone()),
+        // The callers that know of a running session set its memory's.
+        no_frame_generation: memory.memory == VideoMemory::System,
     }
 }
 

@@ -141,3 +141,65 @@ fn a_bad_configuration_makes_the_module_unavailable() {
         .unwrap_err();
     assert!(e.contains("threads"), "{e}");
 }
+
+/// With `_host.cuda = false` the module makes no CUDA call: `auto` skips
+/// TensorRT and CUDA with the reason, an explicit `cuda` or `tensorrt`
+/// fails the load with it, and the CPU runs. Needs the runtime and models
+/// of the environment (`ORT_DYLIB_PATH`, `OBC_ONNX_MODEL_DIR`).
+#[test]
+fn with_cuda_off_in_the_host_configuration_no_cuda_engine_is_tried() {
+    const OFF: &str = "CUDA is off: the video pipeline runs in system memory";
+    let Ok((_, models)) = common::runtime_env() else {
+        eprintln!("skipped: ORT_DYLIB_PATH and OBC_ONNX_MODEL_DIR are not both set");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let model_dir = common::model_dir(&models, dir.path());
+    let log = Log::default();
+    let module = open(
+        dir.path(),
+        json!({"model_dir": model_dir, "_host": {"cuda": false}}),
+        &log,
+    );
+    module.check(&[common::s("background")]).unwrap();
+    let lines = log.take();
+    for engine in ["NVIDIA TensorRT", "NVIDIA CUDA"] {
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with(&format!("ONNX cut-out: {engine} ")))
+            .unwrap_or_else(|| panic!("no {engine} line in {lines:#?}"));
+        assert!(line.contains(OFF), "{line}");
+    }
+    let mut inst = module.create_instance().unwrap();
+    for engine in ["cuda", "tensorrt"] {
+        let e = inst
+            .load(&common::host_chain(
+                1280,
+                720,
+                &[("mode", "blur"), ("engine", engine)],
+                None,
+            ))
+            .unwrap_err();
+        assert!(e.message.contains(OFF), "{engine}: {e:?}");
+        assert!(!inst.is_loaded());
+    }
+    log.take();
+    inst.load(&common::host_chain(
+        1280,
+        720,
+        &[("mode", "blur"), ("engine", "auto")],
+        None,
+    ))
+    .unwrap();
+    let lines = log.take();
+    assert!(
+        lines.iter().all(|l| !l.contains("runs on NVIDIA")),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("NVIDIA TensorRT unavailable") && l.contains(OFF)),
+        "{lines:#?}"
+    );
+}

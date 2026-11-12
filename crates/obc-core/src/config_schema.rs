@@ -19,7 +19,7 @@
 //! "Overridden by <file>".
 
 use crate::EffectOnFailure;
-use crate::config::{Config, EffectConfig};
+use crate::config::{Config, EffectConfig, EffectiveMemory};
 use crate::config_d::{ConfigSet, table_get};
 use crate::modules::{FRAME_GENERATION_STAGE, valid_module_id, valid_stage_id};
 
@@ -202,9 +202,10 @@ pub struct KeySpec {
 }
 
 /// The groups of the schema, `(id, label)`, in order.
-pub const GROUPS: [(&str, &str); 8] = [
+pub const GROUPS: [(&str, &str); 9] = [
     ("camera", "Camera"),
     ("output", "Output"),
+    ("video", "Video processing"),
     ("loopback", "Virtual camera device"),
     ("lifecycle", "Start and stop"),
     ("effect", "Effect defaults"),
@@ -246,7 +247,7 @@ pub const CORE_KEYS: &[KeySpec] = &[
         key: "output.mode",
         group: "output",
         label: "Output size and rate",
-        description: "Size and frame rate of the virtual camera. A generated rate doubles the camera's with frame generation.",
+        description: OUTPUT_MODE_NOTE,
         kind: SpecKind::Runtime,
         editable: true,
         apply: Apply::Reload,
@@ -294,6 +295,19 @@ pub const CORE_KEYS: &[KeySpec] = &[
             step: 1,
             unit: "ms",
         },
+        editable: true,
+        apply: Apply::Reload,
+    },
+    KeySpec {
+        key: "video.memory",
+        group: "video",
+        label: "Video memory",
+        description: VIDEO_MEMORY_NOTE,
+        kind: SpecKind::Enum(&[
+            ("auto", "Automatic"),
+            ("cuda", "GPU memory (CUDA)"),
+            ("system", "System memory"),
+        ]),
         editable: true,
         apply: Apply::Reload,
     },
@@ -590,6 +604,17 @@ pub const CORE_KEYS: &[KeySpec] = &[
     },
 ];
 
+/// The description of `output.mode`; without its second sentence when
+/// frame generation cannot run ([`RegistryFacts::no_frame_generation`]).
+const OUTPUT_MODE_NOTE: &str = "Size and frame rate of the virtual camera. A generated rate doubles the camera's with frame generation.";
+/// [`OUTPUT_MODE_NOTE`] when frame generation cannot run.
+const OUTPUT_MODE_NOTE_PLAIN: &str = "Size and frame rate of the virtual camera.";
+
+/// The description of `video.memory` when the daemon has not said which
+/// memory is in force ([`RegistryFacts::video_memory`]).
+const VIDEO_MEMORY_NOTE: &str = "Where the video frames are processed: GPU memory with CUDA, or system memory. \
+     Automatic uses CUDA when it is usable. Applies at the next camera start.";
+
 const RUNTIME_NOTE_MODE: &str =
     "The default background effect: none, blur or replace. The panel's choices override it.";
 
@@ -597,6 +622,8 @@ const RUNTIME_NOTE_MODE: &str =
 pub const OUTPUT_MODE: &str = "output.mode";
 /// The key whose options are [`RegistryFacts::on_failure_options`].
 pub const ON_FAILURE: &str = "effect.on_failure";
+/// The key whose description is that of [`RegistryFacts::video_memory`].
+pub const VIDEO_MEMORY: &str = "video.memory";
 
 /// The options of the [`SpecKind::Runtime`] key `key`. For
 /// `effect.on_failure`, those of `facts`, else those of `config` (else of
@@ -677,6 +704,13 @@ pub struct RegistryFacts {
     /// configuration in force). Empty: those of the configuration the
     /// schema is made of, or for a write those of the defaults.
     pub on_failure_options: Vec<(String, String)>,
+    /// The video memory in force and why: the description of
+    /// `video.memory` is then [`EffectiveMemory::description`]. `None`: the
+    /// row's fixed description.
+    pub video_memory: Option<EffectiveMemory>,
+    /// Frame generation cannot run (the video pipeline runs in system
+    /// memory): the description of `output.mode` does not mention it.
+    pub no_frame_generation: bool,
 }
 
 impl RegistryFacts {
@@ -939,11 +973,16 @@ pub fn config_schema(set: &ConfigSet, facts: &RegistryFacts) -> Vec<ConfigGroup>
             (RowKind::Path, ConfigValue::Str(s)) if s.is_empty() => None,
             (_, d) => Some(d),
         };
+        let description = match (spec.key, &facts.video_memory) {
+            (VIDEO_MEMORY, Some(m)) => m.description(),
+            (OUTPUT_MODE, _) if facts.no_frame_generation => OUTPUT_MODE_NOTE_PLAIN.to_string(),
+            _ => spec.description.to_string(),
+        };
         row(
             set,
             spec.key.to_string(),
             spec.label,
-            spec.description,
+            &description,
             kind,
             value,
             default,

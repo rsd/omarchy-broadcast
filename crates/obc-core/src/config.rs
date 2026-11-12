@@ -156,6 +156,9 @@ pub struct Config {
     pub pipewire: PipeWireConfig,
     /// `[mic]`: the Omarchy Broadcast Mic's processing ([`MicConfig`]).
     pub mic: MicConfig,
+    /// `[video]`: where the video pipeline keeps its frames
+    /// ([`VideoConfig`]).
+    pub video: VideoConfig,
     /// `[modules]`: which modules load, the stage order, the backend profile
     /// and the pins ([`ModulesConfig`]).
     #[serde(skip_serializing_if = "is_default_modules")]
@@ -555,6 +558,151 @@ impl MicConfig {
     }
 }
 
+/// `video.memory`: where the video pipeline keeps its frames, as the
+/// configuration asks ([`resolve_memory`] makes the effective
+/// [`VideoMemory`] of it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryChoice {
+    /// GPU memory when CUDA is usable on this machine, else system memory.
+    #[default]
+    Auto,
+    /// GPU memory (CUDA), always: a camera start that cannot build the
+    /// CUDA pipeline fails, it never falls back.
+    Cuda,
+    /// System memory, also on a machine where CUDA is usable: the video
+    /// pipeline makes no CUDA call.
+    System,
+}
+
+impl MemoryChoice {
+    /// The configuration's spelling: `auto`, `cuda`, `system`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryChoice::Auto => "auto",
+            MemoryChoice::Cuda => "cuda",
+            MemoryChoice::System => "system",
+        }
+    }
+}
+
+/// Where the video pipeline of a camera session keeps its frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoMemory {
+    /// GPU memory, through CUDA.
+    Cuda,
+    /// System memory, on the CPU.
+    System,
+}
+
+impl VideoMemory {
+    /// `cuda` or `system`, the spelling of the log and of
+    /// [`MemoryChoice`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VideoMemory::Cuda => "cuda",
+            VideoMemory::System => "system",
+        }
+    }
+
+    /// The phrase a user reads: `GPU memory (CUDA)` or `system memory`.
+    pub fn label(self) -> &'static str {
+        match self {
+            VideoMemory::Cuda => "GPU memory (CUDA)",
+            VideoMemory::System => "system memory",
+        }
+    }
+}
+
+/// The effective video memory and why: the result of [`resolve_memory`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveMemory {
+    /// The memory a camera session starts in.
+    pub memory: VideoMemory,
+    /// The configuration's choice it was made from.
+    pub choice: MemoryChoice,
+    /// Why `auto` chose system memory (the probe's reason, or the CUDA
+    /// error of a start that fell back); `None` when the choice is
+    /// explicit or `auto` chose CUDA.
+    pub reason: Option<String>,
+}
+
+impl EffectiveMemory {
+    /// `auto` falling back to system memory for `reason`.
+    pub fn auto_system(reason: impl Into<String>) -> EffectiveMemory {
+        EffectiveMemory {
+            memory: VideoMemory::System,
+            choice: MemoryChoice::Auto,
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// The text of the `video.memory` configuration row: the effective
+    /// memory and why, then when a change applies. At most
+    /// [`crate::config_schema::DESCRIPTION_MAX`] bytes (a long reason is
+    /// shortened).
+    pub fn description(&self) -> String {
+        const APPLIES: &str = " Applies at the next camera start.";
+        let why = match (self.choice, &self.reason) {
+            (MemoryChoice::Auto, Some(r)) => r.as_str(),
+            (MemoryChoice::Auto, None) => "detected automatically",
+            _ => "set in the configuration",
+        };
+        let mut now = format!("Now: {}, {why}.", self.memory.label());
+        let max = crate::config_schema::DESCRIPTION_MAX - APPLIES.len();
+        if now.len() > max {
+            let mut end = max - '…'.len_utf8();
+            while !now.is_char_boundary(end) {
+                end -= 1;
+            }
+            now.truncate(end);
+            now.push('…');
+        }
+        now + APPLIES
+    }
+}
+
+/// The log form, after `video memory: `: `system (auto: no NVIDIA driver
+/// is loaded)`, `cuda (auto)`, `system (set in the configuration)`.
+impl fmt::Display for EffectiveMemory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let memory = self.memory.as_str();
+        match (self.choice, &self.reason) {
+            (MemoryChoice::Auto, Some(r)) => write!(f, "{memory} (auto: {r})"),
+            (MemoryChoice::Auto, None) => write!(f, "{memory} (auto)"),
+            _ => write!(f, "{memory} (set in the configuration)"),
+        }
+    }
+}
+
+/// The effective memory of `choice`, given whether CUDA is usable on this
+/// machine: `cuda_unusable` is `None` when it is, else the reason it is
+/// not (the CUDA presence probe's, `obc_gpu::presence`). `auto` is CUDA
+/// when usable, else system memory with that reason; `cuda` and `system`
+/// are what they say, whatever the probe found (`cuda` never falls back).
+pub fn resolve_memory(choice: MemoryChoice, cuda_unusable: Option<&str>) -> EffectiveMemory {
+    let (memory, reason) = match (choice, cuda_unusable) {
+        (MemoryChoice::Auto, None) => (VideoMemory::Cuda, None),
+        (MemoryChoice::Auto, Some(r)) => (VideoMemory::System, Some(r.to_string())),
+        (MemoryChoice::Cuda, _) => (VideoMemory::Cuda, None),
+        (MemoryChoice::System, _) => (VideoMemory::System, None),
+    };
+    EffectiveMemory {
+        memory,
+        choice,
+        reason,
+    }
+}
+
+/// `[video]`: the video pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VideoConfig {
+    /// Where the frames are kept: `auto` (the default), `cuda` or
+    /// `system`. A change applies at the next camera start.
+    pub memory: MemoryChoice,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -566,6 +714,7 @@ impl Default for Config {
             effect: EffectConfig::default(),
             pipewire: PipeWireConfig::default(),
             mic: MicConfig::default(),
+            video: VideoConfig::default(),
             modules: ModulesConfig::default(),
             module: BTreeMap::new(),
         }
@@ -2111,6 +2260,7 @@ offer_nv12 = false
             "device",
             "idle_grace_s",
             "start_debounce_ms",
+            "memory",
             "blur_strength",
             "background_image",
             "denoise",
@@ -2438,6 +2588,139 @@ offer_nv12 = false
             );
         }
         assert!(parse_err("[output\n").contains("config.toml:1:"));
+    }
+
+    #[test]
+    fn the_video_section_reads_and_defaults() {
+        assert_eq!(Config::default().video.memory, MemoryChoice::Auto);
+        for (v, want) in [
+            ("auto", MemoryChoice::Auto),
+            ("cuda", MemoryChoice::Cuda),
+            ("system", MemoryChoice::System),
+        ] {
+            let c = parse(&format!("[video]\nmemory = \"{v}\"")).unwrap();
+            assert_eq!(c.video.memory, want);
+            assert_eq!(want.as_str(), v);
+            // Spelled out, and read back the same.
+            assert_eq!(parse(&c.to_toml()).unwrap(), c);
+        }
+        for (text, key, reason) in [
+            (
+                "[video]\nmemory = \"gpu\"",
+                "video.memory",
+                "unknown variant",
+            ),
+            (
+                "[video]\nmemory = \"CUDA\"",
+                "video.memory",
+                "unknown variant",
+            ),
+            ("[video]\nmemory = 1", "video.memory", "wanted string"),
+            (
+                "[video]\nmemroy = \"cuda\"",
+                "video.memroy",
+                "unknown field",
+            ),
+        ] {
+            let e = parse(text).unwrap_err();
+            let s = e.to_string();
+            match &e {
+                ConfigError::Parse { line, key: k, .. } => {
+                    assert_eq!(k.as_deref(), Some(key), "{text}: {s}");
+                    assert_eq!(*line, Some(2), "{text}: {s}");
+                }
+                other => panic!("{text}: expected a parse error, got {other:?}"),
+            }
+            assert!(s.contains(reason), "{text}: {s}");
+        }
+    }
+
+    #[test]
+    fn the_effective_memory_follows_the_choice_and_the_probe() {
+        let reason = "no NVIDIA driver is loaded";
+        let cases = [
+            (
+                MemoryChoice::Auto,
+                None,
+                VideoMemory::Cuda,
+                None,
+                "cuda (auto)",
+            ),
+            (
+                MemoryChoice::Auto,
+                Some(reason),
+                VideoMemory::System,
+                Some(reason),
+                "system (auto: no NVIDIA driver is loaded)",
+            ),
+            (
+                MemoryChoice::Cuda,
+                None,
+                VideoMemory::Cuda,
+                None,
+                "cuda (set in the configuration)",
+            ),
+            // Forced: never falls back, whatever the probe found.
+            (
+                MemoryChoice::Cuda,
+                Some(reason),
+                VideoMemory::Cuda,
+                None,
+                "cuda (set in the configuration)",
+            ),
+            (
+                MemoryChoice::System,
+                None,
+                VideoMemory::System,
+                None,
+                "system (set in the configuration)",
+            ),
+            (
+                MemoryChoice::System,
+                Some(reason),
+                VideoMemory::System,
+                None,
+                "system (set in the configuration)",
+            ),
+        ];
+        for (choice, probe, memory, why, log) in cases {
+            let m = resolve_memory(choice, probe);
+            assert_eq!(m.memory, memory, "{choice:?} {probe:?}");
+            assert_eq!(m.choice, choice);
+            assert_eq!(m.reason.as_deref(), why, "{choice:?} {probe:?}");
+            assert_eq!(m.to_string(), log);
+        }
+        assert_eq!(
+            EffectiveMemory::auto_system("the output pipeline opened no CUDA context"),
+            resolve_memory(
+                MemoryChoice::Auto,
+                Some("the output pipeline opened no CUDA context")
+            )
+        );
+        assert_eq!(
+            (VideoMemory::Cuda.as_str(), VideoMemory::System.as_str()),
+            ("cuda", "system")
+        );
+    }
+
+    #[test]
+    fn the_memory_description_names_the_memory_and_fits_the_row() {
+        use crate::config_schema::DESCRIPTION_MAX;
+        assert_eq!(
+            resolve_memory(MemoryChoice::Auto, None).description(),
+            "Now: GPU memory (CUDA), detected automatically. Applies at the next camera start."
+        );
+        assert_eq!(
+            resolve_memory(MemoryChoice::System, None).description(),
+            "Now: system memory, set in the configuration. Applies at the next camera start."
+        );
+        let long = "\u{e9}".repeat(200);
+        let d = EffectiveMemory::auto_system(long).description();
+        assert!(d.len() <= DESCRIPTION_MAX, "{} bytes", d.len());
+        assert!(
+            d.ends_with("\u{2026} Applies at the next camera start."),
+            "{d}"
+        );
     }
 
     #[test]

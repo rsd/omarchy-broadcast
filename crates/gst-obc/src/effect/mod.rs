@@ -6,6 +6,7 @@
 //!
 //! ```text
 //! sink, src: video/x-raw(memory:CUDAMemory), format=NV12   (same caps both sides)
+//!            video/x-raw, format=NV12                       (system memory)
 //! ```
 //!
 //! * **Properties**, all changeable while playing: `effect` (`none`, `blur`,
@@ -85,6 +86,17 @@
 //!   copy. Black frames and passed-through input leave no cache.
 //! * **Stopping** (PAUSED to READY) unloads the backend synchronously, with
 //!   the context pushed, before the element drops its context reference.
+//! * **System memory**: on caps without the CUDA memory feature the element
+//!   does all of the above on host frames, with no CUDA call at all (no
+//!   context, no stream, GStreamer's CUDA library not opened). Black frames
+//!   are filled and the input and the fallback image copied on the CPU, the
+//!   output buffers come from a system-memory pool, the input is only read,
+//!   and the backend is called on host frames (`InferenceBackend::load_host`,
+//!   `process_host`, `reset_temporal_host`). A backend factory that does not
+//!   list host frames (`BackendFactory::kinds`) fails the effect with the
+//!   reason, which then follows `on-failure`. Every rule above is the same in
+//!   both memories; only the pixel work differs. Without CUDA there is no GPU
+//!   time: [`EffectStats::gpu_ms_p50`] and `gpu_ms_p95` stay empty.
 
 mod imp;
 

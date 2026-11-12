@@ -61,7 +61,11 @@ use std::fmt;
 use obc_core::{ModeRequest, PixelFormat, VideoMode, reduce_fraction};
 use serde::Serialize;
 
-/// How frames of a given format reach CUDA memory.
+/// How frames of a given format reach CUDA memory. In an ingest of
+/// system-memory frames the CPU convert path has no adapter of its own: the
+/// canonical tail's `videoconvertscale` converts the captured frames
+/// ([`crate::pipeline::ingest_adapter`]); [`Self::upload_format`] and
+/// [`Self::stages`] describe the CUDA ingest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum IngestPath {

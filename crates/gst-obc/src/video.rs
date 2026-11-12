@@ -1,12 +1,13 @@
 //! Frame helpers shared by the elements: the colour description of the
-//! caps, the CUDA context of an input buffer, and a video frame mapped
-//! with `GST_MAP_CUDA`.
+//! caps, the CUDA context of an input buffer, a video frame mapped with
+//! `GST_MAP_CUDA`, and the pixel operations on NV12 frames in system memory
+//! (a fill, a copy, a copy of a packed image).
 
 use std::ffi::c_void;
 
 use gst::glib;
 use gst_video::VideoInfo;
-use obc_backend::{ColourMatrix, ColourSpec, DeviceNv12};
+use obc_backend::{ColourMatrix, ColourSpec, DeviceNv12, HostNv12};
 
 use crate::cuda::{self, CudaMemoryHead};
 
@@ -113,5 +114,221 @@ impl Drop for CudaFrame {
     fn drop(&mut self) {
         // SAFETY: mapped by `map`, unmapped once.
         unsafe { gst_video::ffi::gst_video_frame_unmap(&mut self.frame) };
+    }
+}
+
+/// A mapped system-memory NV12 frame as the backend seam describes it: its
+/// plane pointers, pitches and size.
+///
+/// The pointers are those of the map: valid while `frame` stays mapped.
+/// For a frame mapped read-only the planes are only ever read (the seam's
+/// rule for a source frame).
+pub(crate) fn host_nv12(frame: &impl gst_video::VideoFrameExt) -> HostNv12 {
+    // SAFETY: `GstVideoFrame::data` holds the plane addresses of the mapped
+    // frame; reading them takes no access to the pixels.
+    let data = unsafe { (*frame.as_ptr()).data };
+    HostNv12 {
+        y: data[0].cast(),
+        y_pitch: frame.plane_stride()[0].max(0) as usize,
+        uv: data[1].cast(),
+        uv_pitch: frame.plane_stride()[1].max(0) as usize,
+        width: frame.width(),
+        height: frame.height(),
+    }
+}
+
+/// Fills the visible part of `dst` (every row's first `width` bytes) with
+/// luma `y` and chroma `uv`: black for [`ColourSpec::black_nv12`].
+///
+/// **Even sizes only.** This and the other pixel operations here take
+/// frames of even, non-zero width and height (NV12's chroma plane is half
+/// the size both ways, and `HostNv12::planes_mut` refuses anything else).
+/// A frame of odd size is an error, and nothing of it is written: the
+/// effect then fails the stream rather than show a partly written frame.
+/// That never happens in this daemon's pipeline, whose canonical sizes are
+/// always even; it is a deliberate fail-closed limit, not a gap.
+///
+/// # Safety
+/// `dst`'s planes are as [`HostNv12`] documents: valid for writes of their
+/// whole extent and not accessed through anything else during the call.
+pub(crate) unsafe fn fill_nv12(dst: &mut HostNv12, (y, uv): (u8, u8)) -> Result<(), String> {
+    let (w, h) = (dst.width as usize, dst.height as usize);
+    let (yp, uvp) = (dst.y_pitch, dst.uv_pitch);
+    // SAFETY: the caller's contract.
+    let (y_plane, uv_plane) = unsafe { dst.planes_mut() }.map_err(|e| e.to_string())?;
+    for r in 0..h {
+        y_plane[r * yp..r * yp + w].fill(y);
+    }
+    for r in 0..h / 2 {
+        uv_plane[r * uvp..r * uvp + w].fill(uv);
+    }
+    Ok(())
+}
+
+/// Copies the visible part of `src` into `dst`, row by row. Both have the
+/// same, even size (see [`fill_nv12`]).
+///
+/// # Safety
+/// Both are as [`HostNv12`] documents; `src` is only read (it may be
+/// mapped read-only), and the two do not overlap.
+pub(crate) unsafe fn copy_nv12(src: &HostNv12, dst: &mut HostNv12) -> Result<(), String> {
+    src.validate().map_err(|e| e.to_string())?;
+    if (src.width, src.height) != (dst.width, dst.height) {
+        return Err(format!(
+            "cannot copy a {}x{} frame into a {}x{} one",
+            src.width, src.height, dst.width, dst.height
+        ));
+    }
+    let (w, h) = (src.width as usize, src.height as usize);
+    let (dyp, duvp) = (dst.y_pitch, dst.uv_pitch);
+    // SAFETY: the caller's contract for `dst`.
+    let (y_plane, uv_plane) = unsafe { dst.planes_mut() }.map_err(|e| e.to_string())?;
+    for r in 0..h {
+        // SAFETY: row `r` of the source's Y plane is `w` readable bytes
+        // (validated above), apart from `dst`.
+        let row = unsafe { std::slice::from_raw_parts(src.y.add(r * src.y_pitch), w) };
+        y_plane[r * dyp..r * dyp + w].copy_from_slice(row);
+    }
+    for r in 0..h / 2 {
+        // SAFETY: as above, for the UV plane.
+        let row = unsafe { std::slice::from_raw_parts(src.uv.add(r * src.uv_pitch), w) };
+        uv_plane[r * duvp..r * duvp + w].copy_from_slice(row);
+    }
+    Ok(())
+}
+
+/// Copies packed NV12 of `dst`'s size (the Y rows, then the UV rows, each
+/// `width` bytes, as the fallback image is decoded) into `dst`, of even size
+/// (see [`fill_nv12`]).
+///
+/// # Safety
+/// As [`fill_nv12`].
+pub(crate) unsafe fn copy_packed_nv12(packed: &[u8], dst: &mut HostNv12) -> Result<(), String> {
+    let (w, h) = (dst.width as usize, dst.height as usize);
+    if packed.len() != w * h * 3 / 2 {
+        return Err(format!(
+            "a packed {w}x{h} NV12 image is {} bytes, not {}",
+            w * h * 3 / 2,
+            packed.len()
+        ));
+    }
+    let (yp, uvp) = (dst.y_pitch, dst.uv_pitch);
+    // SAFETY: the caller's contract.
+    let (y_plane, uv_plane) = unsafe { dst.planes_mut() }.map_err(|e| e.to_string())?;
+    let (y_rows, uv_rows) = packed.split_at(w * h);
+    for (r, row) in y_rows.chunks_exact(w).enumerate() {
+        y_plane[r * yp..r * yp + w].copy_from_slice(row);
+    }
+    for (r, row) in uv_rows.chunks_exact(w).enumerate() {
+        uv_plane[r * uvp..r * uvp + w].copy_from_slice(row);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 4x4 NV12 frame with 6-byte rows, every byte `v`.
+    struct Planes {
+        y: Vec<u8>,
+        uv: Vec<u8>,
+    }
+
+    const W: u32 = 4;
+    const H: u32 = 4;
+    const PITCH: usize = 6;
+
+    impl Planes {
+        fn new(v: u8) -> Planes {
+            Planes {
+                y: vec![v; PITCH * H as usize],
+                uv: vec![v; PITCH * H as usize / 2],
+            }
+        }
+
+        fn frame(&mut self) -> HostNv12 {
+            HostNv12 {
+                y: self.y.as_mut_ptr(),
+                y_pitch: PITCH,
+                uv: self.uv.as_mut_ptr(),
+                uv_pitch: PITCH,
+                width: W,
+                height: H,
+            }
+        }
+
+        /// The visible bytes, packed.
+        fn visible(&self) -> Vec<u8> {
+            let w = W as usize;
+            let mut out = Vec::new();
+            for r in 0..H as usize {
+                out.extend_from_slice(&self.y[r * PITCH..r * PITCH + w]);
+            }
+            for r in 0..H as usize / 2 {
+                out.extend_from_slice(&self.uv[r * PITCH..r * PITCH + w]);
+            }
+            out
+        }
+
+        /// The padding bytes past the width of every row.
+        fn padding(&self) -> Vec<u8> {
+            let w = W as usize;
+            self.y
+                .chunks(PITCH)
+                .chain(self.uv.chunks(PITCH))
+                .flat_map(|row| row[w..].to_vec())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn a_fill_writes_the_visible_rows_only() {
+        let mut p = Planes::new(7);
+        // SAFETY: the planes are `p`'s vectors, alive and unaliased.
+        unsafe { fill_nv12(&mut p.frame(), ColourSpec::LIMITED_BT601.black_nv12()) }.unwrap();
+        let v = p.visible();
+        let y_len = (W * H) as usize;
+        assert!(v[..y_len].iter().all(|b| *b == 16), "{v:?}");
+        assert!(v[y_len..].iter().all(|b| *b == 128), "{v:?}");
+        assert!(p.padding().iter().all(|b| *b == 7), "the padding is kept");
+        // SAFETY: as above.
+        unsafe { fill_nv12(&mut p.frame(), ColourSpec::FULL_BT601.black_nv12()) }.unwrap();
+        assert!(p.visible()[..y_len].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn a_copy_takes_every_visible_byte_and_reads_the_source_only() {
+        let mut src = Planes::new(0);
+        for (i, b) in src.y.iter_mut().chain(src.uv.iter_mut()).enumerate() {
+            *b = i as u8;
+        }
+        let before = (src.y.clone(), src.uv.clone());
+        let mut dst = Planes::new(9);
+        let s = src.frame();
+        // SAFETY: two distinct pairs of vectors, alive and unaliased.
+        unsafe { copy_nv12(&s, &mut dst.frame()) }.unwrap();
+        assert_eq!(dst.visible(), src.visible());
+        assert!(dst.padding().iter().all(|b| *b == 9));
+        assert_eq!((src.y, src.uv), before, "the source is unchanged");
+        let mut small = Planes::new(0);
+        let mut f = small.frame();
+        f.width = 2;
+        // SAFETY: as above.
+        let e = unsafe { copy_nv12(&s, &mut f) }.unwrap_err();
+        assert!(e.contains("4x4 frame into a 2x4"), "{e}");
+    }
+
+    #[test]
+    fn a_packed_image_lands_row_by_row() {
+        let packed: Vec<u8> = (0..(W * H * 3 / 2) as u8).collect();
+        let mut dst = Planes::new(5);
+        // SAFETY: the planes are `dst`'s vectors, alive and unaliased.
+        unsafe { copy_packed_nv12(&packed, &mut dst.frame()) }.unwrap();
+        assert_eq!(dst.visible(), packed);
+        assert!(dst.padding().iter().all(|b| *b == 5));
+        // SAFETY: as above.
+        let e = unsafe { copy_packed_nv12(&packed[1..], &mut dst.frame()) }.unwrap_err();
+        assert!(e.contains("is 24 bytes, not 23"), "{e}");
     }
 }

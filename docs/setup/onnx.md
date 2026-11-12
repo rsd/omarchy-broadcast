@@ -6,9 +6,36 @@ The **open-model cut-out** is a loadable module of omarchy-broadcast ([../module
 
 This page covers installing the module, its runtime and its models, choosing the model and the engine, reading the reasons an engine is not used, and the failures that are specific to omarchy-broadcast. The module's own reference (every setting, key and variable) is its [README](../../crates/obc-module-onnx/README.md).
 
-## Current limitation: the effect path needs an NVIDIA GPU
+## Using it on a machine without an NVIDIA GPU
 
-The module takes frames in CUDA memory (it copies them to host memory, runs the model on the CPU or on the engine, and copies the result back) and frames in host memory. The daemon today runs its effect element on CUDA frames only. A machine with no NVIDIA GPU therefore cannot yet run the daemon's effect path with this module, whatever engine it would use: the module is useful today on a machine that has an NVIDIA GPU and wants an open model, a lower-power engine, or no NVIDIA SDK. A daemon pipeline that runs the effect on system memory is future work, with no date. The module already declares that it handles host frames, so that work needs no change to it.
+The module needs no NVIDIA GPU, and neither does the daemon's effect path. When the machine has no usable CUDA, the daemon keeps the video frames in system memory ([ADR-0033](../adr/0033-system-memory-pipeline.md)) and hands the module host frames. Install the CPU build of ONNX Runtime (`onnxruntime-cpu`, section 2), the module and the models (section 3), and the blur and the replacement work.
+
+**What the daemon decides, and how to see it.** `[video] memory` in `config.toml` is `auto` by default: CUDA when the NVIDIA driver is loaded and lists a GPU, `libcuda.so.1` opens, `CUDA_VISIBLE_DEVICES` does not hide every GPU and GStreamer's CUDA elements are installed; otherwise system memory. The daemon logs the choice and the reason, once per change:
+
+```bash
+journalctl --user -u omarchy-broadcastd | grep "video memory"
+# video memory: system (auto: no NVIDIA driver is loaded)
+omarchy-broadcast config show | grep -A1 video.memory      # "Now: system memory, ..."
+omarchy-broadcast modules                                  # the Maxine stages: unavailable, "Needs an NVIDIA GPU (CUDA)"
+```
+
+With both the Maxine and the ONNX module installed, `background` is provided by this module in system memory whatever the profile, and a pin to the Maxine module falls back to it with the reason. Nothing else is needed: with no NVIDIA driver the probe says so without touching a GPU.
+
+**What is unavailable.** The effects that need CUDA frames: the Maxine cut-out, noise removal, relighting, the HDR look, enhancement, eye contact, auto-framing and frame generation (so no "(generated)" output rate is offered). They are greyed in the settings with the reason. This module's cut-out and the host modules work.
+
+**On an NVIDIA machine** you can choose the same path with `[video] memory = "system"` (for instance to keep the GPU asleep, or to run the CPU path for a check). Then the daemon makes no CUDA call, and the module is told so: under `auto` it skips TensorRT and CUDA with the reason `CUDA is off: the video pipeline runs in system memory` and runs on the CPU, or on OpenVINO if your ONNX Runtime has it; an explicit `effect.onnx.engine` of `cuda` or `tensorrt` fails the load with that reason. A change of `memory` applies at the next camera start. If CUDA looks usable but fails when the camera starts (a driver and library that do not match, or `CUDA_VISIBLE_DEVICES` naming a GPU that is not there), `auto` starts again once in system memory, logs a warning with the CUDA error, and stays there until the next reload.
+
+**The cost on the CPU.** Measured on the reference machine (an Intel Core Ultra 9 275HX laptop, the CPU build of ONNX Runtime 1.31.1, the default MediaPipe model, the module's default of 4 threads), with the virtual camera read by an application at 30 fps and the blur on:
+
+| Camera, output | Daemon CPU, blur (effect off) | Effect, per processed frame |
+|---|---|---|
+| MJPEG 1080p30, 1080p30 | 42 % of one core (17 %) | 6.0 ms median, 7.2 ms at p95 |
+| NV12 1080p60, 1080p30 | 29 % of one core (1 %) | 6.3 ms median, 7.4 ms at p95 |
+| MJPEG 720p30, 720p30 | 25 % of one core (8.5 %) | not measured |
+
+The virtual camera held 30 fps with no dropped frame in every row. The blur adds about 25 to 27 % of one core at 1080p and about 16 % at 720p; the rest is the camera's own decode and conversion, which is the cost of an MJPEG camera in any case. This is a high-end laptop CPU: a machine with four low-power cores is expected to take two to three times as long per frame, which has not been measured. A 720p camera mode into a 720p output costs about 40 % less (25 % against 42 %); a 720p output from a 1080p camera does not, because the camera is still decoded at 1080p and then scaled (43 %). Method and the per-step figures: [../benchmarks/system-memory.md](../benchmarks/system-memory.md). `threads` in the module's table sets the CPU threads (see the module's [README](../../crates/obc-module-onnx/README.md)); more threads shorten a frame and cost more CPU in total.
+
+The privacy rules are the same as with CUDA: the room is never shown while an effect is on and cannot run (black frames by default, or the image of `[effect] on_failure`), the picture goes black at a start until the matte is ready, and turning the blur on mid-stream keeps the picture for under a frame on the CPU and then switches with no black frame ([ADR-0033](../adr/0033-system-memory-pipeline.md)).
 
 ## 1. What you need
 
@@ -17,7 +44,7 @@ The module takes frames in CUDA memory (it copies them to host memory, runs the 
 | The module | Installed from the package `omarchy-broadcast-onnx-git` or by `scripts/install-user.sh` (section 3) |
 | ONNX Runtime | `libonnxruntime.so`, version 1.29 or newer, from any Arch `onnxruntime-*` package (section 2) |
 | The models | Four `.onnx` files, in one of the directories of section 3. A single file is enough to use that model |
-| An NVIDIA GPU | Needed by the daemon's effect path today (see above). Not needed by the model: the CPU engine runs it |
+| An NVIDIA GPU | Not needed: the CPU engine runs the model, and the daemon runs the effect path in system memory when it finds no usable CUDA (see above). An NVIDIA GPU adds the TensorRT and CUDA engines |
 
 Without ONNX Runtime, or without any model file, the module still loads and `omarchy-broadcast modules` lists its stage as `unavailable`, with the reason: `ONNX Runtime not installed (libonnxruntime.so not found)` or `No cut-out model installed (searched: ...)`. Nothing else is affected.
 
@@ -134,6 +161,7 @@ The module writes one line per engine to the daemon's log (`journalctl --user -u
 | `OpenVINO NPU: ...`, `OpenVINO GPU: ...` | OpenVINO could not use the device (an NPU needs its user-space driver) |
 | `the provider was registered but ran no part of the model` | The provider started and ran nothing: OpenVINO does this when its device is missing |
 | `partly on the CPU (k of n kernels)` | The engine runs, but ONNX Runtime left some of the model to the CPU |
+| `CUDA is off: the video pipeline runs in system memory` | The daemon runs in system memory and told the module not to use CUDA, so TensorRT and CUDA are skipped (an explicit one fails the load). Set `[video] memory = "cuda"` to use them |
 
 "Partly on the CPU" is measured and not guessed: the module profiles the first run of a session, which tells which provider ran each kernel, and stops profiling after that run. The profile goes in a new private directory under `$XDG_RUNTIME_DIR` (else the temporary directory) and is removed at once.
 
@@ -162,7 +190,8 @@ ONNX Runtime's CUDA and TensorRT engines run through the CUDA runtime, which act
 | The model runs on the CPU although you have an NVIDIA GPU | `auto` found nothing better: the installed build is `onnxruntime-cpu`, or the CUDA reason says why (`CUDA not available: ...`) | Install `onnxruntime-opt-cuda` and `cudnn`, and read the reason in the log (section 5) |
 | An explicit engine fails the load | By design there is no fallback | Read the reason; choose `auto` or another engine |
 | The picture is black for many seconds the first time the effect is on | The TensorRT engine is being built | Wait for `the TensorRT engine for <model> is ready` in the log (section 6) |
-| On a machine without an NVIDIA GPU the effect never runs | The daemon's effect path runs on CUDA frames only today | See "Current limitation" at the top of this page |
+| On a machine without an NVIDIA GPU the picture is black and `Warning` says the Maxine module cannot run | Only the Maxine module provides `background` (the ONNX module or its models or its runtime are missing, so its stage is `unavailable`) | Install the module, the models and `onnxruntime-cpu` (sections 2 and 3); `omarchy-broadcast modules` shows the reason |
+| The log says `video memory: system` on an NVIDIA machine | `[video] memory` is `system`, or the probe found no usable CUDA (`auto`), or a start fell back after CUDA failed | The log line gives the reason; set `memory = "cuda"` to require CUDA, and reload |
 | After a first install the module does not appear | The daemon reads manifests at start and on reload | `systemctl --user restart omarchy-broadcastd` |
 
 ## 9. Uninstall

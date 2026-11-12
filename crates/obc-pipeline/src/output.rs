@@ -70,9 +70,11 @@
 //! on the output pipeline's bus ([`crate::effect::STATUS_MESSAGE`]). The
 //! element sits after the clock, so a repeated frame is processed again.
 //! It does not combine with [`GpuStage::Roundtrip`] (which stands in for an
-//! effect) and needs frames in CUDA memory. When the output stops, the
-//! element unloads its backend (with the context current) before the
-//! pipeline releases the CUDA context.
+//! effect). It takes frames in either memory: on CUDA frames, when the
+//! output stops, the element unloads its backend (with the context current)
+//! before the pipeline releases the CUDA context; on system-memory frames
+//! it makes no CUDA call, and an effect whose backend takes CUDA frames
+//! only fails with that reason (`on_failure` decides what is shown).
 //!
 //! **Module stages.** Each entry of [`OutputConfig::module_stages`] adds
 //! one `obcmodule` element ([`crate::module`]) for the output's whole life,
@@ -102,11 +104,23 @@
 //! `GstCudaContext` when the pipeline opens; [`Output::cuda_context`] hands
 //! it to every ingest pipeline so canonical frames stay in one context.
 //!
-//! **System memory.** Inside the crate the same output can also carry
-//! canonical frames in system memory (`FrameMemory::System`), for the
-//! CPU-only tests: no `cudadownload`, `videoconvert` in place of
-//! `cudaconvert`, a black placeholder made on the CPU, and no CUDA context.
-//! The Process stage must then be empty.
+//! **System memory.** [`Output::build_in`] with [`VideoMemory::System`]
+//! carries canonical frames in system memory, with no CUDA element and no
+//! CUDA context:
+//!
+//! ```text
+//! appsrc        <canonical caps, system memory>,framerate=<contract>
+//!   [ ! obcmodule ... ] [ ! obceffect ] [ ! obcmodule ... ]
+//!   [ ! videoconvert ]                                  contract format != NV12
+//!   ! capsfilter  <contract caps>, canonical label
+//!   ! capssetter  colorimetry=<sink label>
+//!   ! capsfilter  <contract caps>
+//!   ! <sink>
+//! ```
+//!
+//! The black placeholder is made on the CPU. The Process stage must be
+//! empty ([`GpuStage::Roundtrip`] runs on CUDA), and every module stage's
+//! chain must take host frames.
 //!
 //! **Forwarding to a loopback writer.** With [`OutputSink::Writer`] the
 //! chain is the same up to and including the relabel and the contract
@@ -141,7 +155,7 @@ use serde::Serialize;
 
 use crate::clock::{Latest, Pacer, PacerConfig, PacerCounts, PhaseLockConfig, Step, TickKind};
 use crate::effect::{EffectBackend, EffectSettings, EffectStats, EffectStatus, effect_element};
-use crate::frame::{Canonical, Frame, FrameMemory, FrameWriter};
+use crate::frame::{Canonical, Frame, FrameWriter};
 use crate::ingest::CUDA_CONTEXT_TYPE;
 use crate::loopback::WriterHandle;
 use crate::module::{ModulePlacement, ModuleStageSpec, ModuleStats, check_specs, module_element};
@@ -151,6 +165,12 @@ use crate::pipeline::{
 };
 use crate::process::{GpuStage, process_elements};
 use crate::slot::Slot;
+use obc_core::config::VideoMemory;
+
+/// The [`PipelineError::Cuda`] message of a CUDA output whose elements
+/// reached PAUSED without opening a CUDA context ([`Output::start`]): CUDA
+/// is not usable.
+pub const NO_CUDA_CONTEXT: &str = "the output pipeline opened no CUDA context";
 
 /// Where the output pipeline delivers its frames.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,7 +465,7 @@ pub struct Output {
     observer: Option<EmitObserver>,
     cuda: Option<gst::Context>,
     clock: Option<ClockThread>,
-    memory: FrameMemory,
+    memory: VideoMemory,
     effect: Option<gst_obc::ObcEffect>,
     /// The module stage elements, by spec name, in pipeline order.
     modules: Vec<(String, gst_obc::ObcModule)>,
@@ -545,16 +565,24 @@ pub(crate) fn frames_src(name: &str, caps: &gst::Caps, max_buffers: u64) -> gst_
 }
 
 impl Output {
-    /// Builds (but does not start) the output pipeline. Its elements can be
-    /// inspected and probed before [`Self::start`]. A contract the sink
-    /// cannot carry is refused here ([`check_sink_range`]).
+    /// Builds (but does not start) the output pipeline for canonical frames
+    /// in CUDA memory: [`Self::build_in`] with [`VideoMemory::Cuda`]. Its
+    /// elements can be inspected and probed before [`Self::start`]. A
+    /// contract the sink cannot carry is refused here
+    /// ([`check_sink_range`]).
     pub fn build(cfg: OutputConfig) -> Result<Self, PipelineError> {
-        Self::build_in(cfg, FrameMemory::Cuda)
+        Self::build_in(cfg, VideoMemory::Cuda)
     }
 
-    /// [`Self::build`] for canonical frames in `memory` (see the module
-    /// docs).
-    pub(crate) fn build_in(cfg: OutputConfig, memory: FrameMemory) -> Result<Self, PipelineError> {
+    /// [`Self::build`] for canonical frames in `memory`. In
+    /// [`VideoMemory::System`] the pipeline has no CUDA element (no element
+    /// of the `nvcodec` plugin is made, so it builds where that plugin does
+    /// not load) and starts without a CUDA context; what needs CUDA frames
+    /// is refused: the roundtrip Process stage ([`PipelineError::Cuda`]) and
+    /// a module stage whose chain takes CUDA frames only
+    /// ([`PipelineError::Module`]). The effect element takes either memory
+    /// (see the module docs).
+    pub fn build_in(cfg: OutputConfig, memory: VideoMemory) -> Result<Self, PipelineError> {
         use names::*;
         let contract = cfg.contract;
         contract
@@ -569,33 +597,26 @@ impl Output {
                 writer.contract()
             )));
         }
-        if memory == FrameMemory::System && cfg.process != GpuStage::Passthrough {
+        if memory == VideoMemory::System && cfg.process != GpuStage::Passthrough {
             return Err(PipelineError::Cuda(format!(
                 "the {} process stage needs frames in CUDA memory",
                 cfg.process
             )));
         }
-        if cfg.effect.is_some() {
-            if memory == FrameMemory::System {
-                return Err(PipelineError::Cuda(
-                    "the effect element needs frames in CUDA memory".into(),
-                ));
-            }
-            if cfg.process != GpuStage::Passthrough {
-                return Err(PipelineError::Effect(format!(
-                    "the effect element does not combine with the {} process stage",
-                    cfg.process
-                )));
-            }
+        if cfg.effect.is_some() && cfg.process != GpuStage::Passthrough {
+            return Err(PipelineError::Effect(format!(
+                "the effect element does not combine with the {} process stage",
+                cfg.process
+            )));
         }
-        check_specs(&cfg.module_stages, memory == FrameMemory::Cuda)?;
+        check_specs(&cfg.module_stages, memory == VideoMemory::Cuda)?;
         let canonical = Canonical::of(&contract);
         let pipeline = gst::Pipeline::with_name("obc-output");
         let queue = cfg.pacer().max_burst;
 
         let src_caps = parse_caps(&format!(
             "{},framerate={}/{}",
-            memory.caps_string(&canonical),
+            canonical.caps_in(memory),
             contract.fps_num,
             contract.fps_den
         ))?;
@@ -623,7 +644,7 @@ impl Output {
         };
         place(&mut chain, ModulePlacement::AfterEffect)?;
         match memory {
-            FrameMemory::Cuda => {
+            VideoMemory::Cuda => {
                 if contract.format != OutputFormat::Nv12 {
                     chain.push(make("cudaconvert", TO_OUT)?);
                     chain.push(capsfilter(
@@ -638,10 +659,10 @@ impl Output {
                 chain.push(make("cudadownload", DOWNLOAD)?);
             }
             // Already in system memory: DOWNLOAD_CAPS fixes the format.
-            FrameMemory::System if contract.format != OutputFormat::Nv12 => {
+            VideoMemory::System if contract.format != OutputFormat::Nv12 => {
                 chain.push(make("videoconvert", TO_OUT)?);
             }
-            FrameMemory::System => {}
+            VideoMemory::System => {}
         }
         // System memory with the canonical label, then the sink's label on
         // the same buffers (see the module docs).
@@ -845,11 +866,17 @@ impl Output {
     /// pipeline's elements create, prepares the placeholder frame, goes to
     /// PLAYING and starts the clock. A second call does nothing. On error
     /// the pipeline is back in NULL.
+    ///
+    /// A state change that failed with an element's error on the bus is
+    /// [`PipelineError::ElementState`], naming it
+    /// ([`MediaPipeline::state_failure`]).
     pub fn start(&mut self) -> Result<(), PipelineError> {
         if self.clock.is_some() {
             return Ok(());
         }
-        let res = self.start_inner();
+        let res = self
+            .start_inner()
+            .map_err(|e| self.pipeline.state_failure(e));
         if res.is_err() {
             let _ = self.pipeline.pipeline().set_state(gst::State::Null);
             self.cuda = None;
@@ -860,12 +887,12 @@ impl Output {
     fn start_inner(&mut self) -> Result<(), PipelineError> {
         self.pipeline.prepare()?;
         let (cuda, placeholder) = match self.memory {
-            FrameMemory::Cuda => {
+            VideoMemory::Cuda => {
                 let cuda = self.acquire_cuda_context()?;
                 let placeholder = make_placeholder(&self.canonical, &cuda)?;
                 (Some(cuda), placeholder)
             }
-            FrameMemory::System => (None, black_frame(&self.canonical)),
+            VideoMemory::System => (None, black_frame(&self.canonical)),
         };
         self.cuda = cuda;
         self.pipeline
@@ -929,9 +956,8 @@ impl Output {
         // Elements that open their context later do so on READY -> PAUSED.
         p.set_state(gst::State::Paused)
             .map_err(|e| PipelineError::State(e.to_string()))?;
-        p.context(CUDA_CONTEXT_TYPE).ok_or_else(|| {
-            PipelineError::Cuda("the output pipeline opened no CUDA context".to_string())
-        })
+        p.context(CUDA_CONTEXT_TYPE)
+            .ok_or_else(|| PipelineError::Cuda(NO_CUDA_CONTEXT.to_string()))
     }
 
     /// The CUDA context ingest pipelines must use (after [`Self::start`]).
@@ -946,8 +972,9 @@ impl Output {
             .in_memory(self.memory)
     }
 
-    /// Where the canonical frames this output takes live.
-    pub(crate) fn memory(&self) -> FrameMemory {
+    /// Where the canonical frames this output takes live
+    /// ([`Self::build_in`]).
+    pub fn memory(&self) -> VideoMemory {
         self.memory
     }
 
@@ -1516,7 +1543,7 @@ mod tests {
         let contract: OutputContract = "320x240@30".parse().unwrap();
         let mut o = Output::build_in(
             OutputConfig::new(contract, OutputSink::Fake),
-            FrameMemory::System,
+            VideoMemory::System,
         )
         .unwrap();
         o.start().unwrap();
@@ -1531,7 +1558,7 @@ mod tests {
         let contract: OutputContract = "320x240@30".parse().unwrap();
         let mut o = Output::build_in(
             OutputConfig::new(contract, OutputSink::Fake),
-            FrameMemory::System,
+            VideoMemory::System,
         )
         .unwrap();
         o.set_observer(Some(Arc::new(|_: &EmitInfo| panic!("observer failed"))));
@@ -1869,7 +1896,8 @@ mod tests {
     }
 
     /// System-memory frames: no download, `videoconvert` in place of
-    /// `cudaconvert` for a contract format other than NV12, and a Process
+    /// `cudaconvert` for a contract format other than NV12, the effect
+    /// element in place, no element of the `nvcodec` plugin, and a Process
     /// stage that needs CUDA refused. CPU only.
     #[test]
     fn a_system_memory_output_has_no_cuda_element() {
@@ -1879,12 +1907,12 @@ mod tests {
                 format,
                 ..OutputContract::default()
             };
-            let o = Output::build_in(
-                OutputConfig::new(contract, OutputSink::Fake),
-                FrameMemory::System,
-            )
-            .unwrap();
+            let mut cfg = OutputConfig::new(contract, OutputSink::Fake);
+            cfg.effect = Some(EffectSettings::default());
+            let o = Output::build_in(cfg, VideoMemory::System).unwrap();
             let p = o.pipeline();
+            crate::test_support::assert_no_cuda_element(p.pipeline());
+            assert!(p.element(names::EFFECT).is_some(), "{format}");
             assert!(p.element(names::DOWNLOAD).is_none(), "{format}");
             assert!(p.element(names::OUT_CUDA_CAPS).is_none(), "{format}");
             assert_eq!(
@@ -1896,12 +1924,12 @@ mod tests {
             let src = p.element(names::FRAMES_SRC).unwrap();
             let caps = src.property::<gst::Caps>("caps").to_string();
             assert!(!caps.contains("CUDAMemory"), "{caps}");
-            assert_eq!(o.frame_writer().memory(), FrameMemory::System);
+            assert_eq!(o.frame_writer().memory(), VideoMemory::System);
         }
         let mut cfg = OutputConfig::new(OutputContract::default(), OutputSink::Fake);
         cfg.process = GpuStage::Roundtrip;
         assert!(matches!(
-            Output::build_in(cfg, FrameMemory::System),
+            Output::build_in(cfg, VideoMemory::System),
             Err(PipelineError::Cuda(_))
         ));
     }
@@ -1918,7 +1946,7 @@ mod tests {
         let contract: OutputContract = "320x240@30".parse().unwrap();
         let mut o = Output::build_in(
             OutputConfig::new(contract, OutputSink::Fake),
-            FrameMemory::System,
+            VideoMemory::System,
         )
         .unwrap();
         let ticks: Arc<Mutex<Vec<EmitInfo>>> = Arc::default();
@@ -2000,7 +2028,7 @@ mod tests {
         assert_eq!(cfg.effect, None);
         assert!(cfg.effect_backend.is_none(), "no built-in backend");
         require_elements(&["appsrc", "videoconvert", "capssetter", "fakesink"]);
-        let o = Output::build_in(cfg, FrameMemory::System).unwrap();
+        let o = Output::build_in(cfg, VideoMemory::System).unwrap();
         assert!(o.pipeline().element(names::EFFECT).is_none());
         assert_eq!(o.effect_status(), EffectStatus::Off);
         assert_eq!(o.effect_stats(), None);
@@ -2012,18 +2040,23 @@ mod tests {
         assert!(e.to_string().contains("without the effect element"), "{e}");
     }
 
-    /// The effect element needs CUDA frames and does not combine with the
-    /// roundtrip stage; both are refused before any element is made.
+    /// The effect element takes system-memory frames too, and does not
+    /// combine with the roundtrip stage, refused before any element is
+    /// made. CPU only.
     #[test]
-    fn an_effect_needs_cuda_frames_and_no_roundtrip() {
-        gst::init().unwrap();
+    fn an_effect_takes_system_memory_but_no_roundtrip() {
+        require_elements(&["appsrc", "capssetter", "fakesink"]);
         let mut cfg = OutputConfig::new(OutputContract::default(), OutputSink::Fake);
         cfg.effect = Some(EffectSettings::default());
+        let o = Output::build_in(cfg.clone(), VideoMemory::System).unwrap();
+        assert!(o.pipeline().element(names::EFFECT).is_some());
+        assert_eq!(o.memory(), VideoMemory::System);
+        drop(o);
+        cfg.process = GpuStage::Roundtrip;
         assert!(matches!(
-            Output::build_in(cfg.clone(), FrameMemory::System),
+            Output::build_in(cfg.clone(), VideoMemory::System),
             Err(PipelineError::Cuda(_))
         ));
-        cfg.process = GpuStage::Roundtrip;
         let e = Output::build(cfg.clone()).unwrap_err();
         assert!(
             matches!(&e, PipelineError::Effect(m) if m.contains("roundtrip")),
@@ -2070,7 +2103,7 @@ mod tests {
                 placement: ModulePlacement::BeforeEffect,
             },
         ];
-        let mut o = Output::build_in(cfg.clone(), FrameMemory::System).unwrap();
+        let mut o = Output::build_in(cfg.clone(), VideoMemory::System).unwrap();
         assert_eq!(o.module_names(), ["pre", "post"]);
         let order: Vec<String> = {
             let mut v = Vec::new();
@@ -2185,11 +2218,11 @@ mod tests {
         // before anything is built; so is a name used twice.
         let mut cuda_only = cfg.clone();
         cuda_only.module_stages[0].factory = FakeChainFactory::cuda(FakeChainConfig::default());
-        let e = Output::build_in(cuda_only, FrameMemory::System).unwrap_err();
+        let e = Output::build_in(cuda_only, VideoMemory::System).unwrap_err();
         assert!(e.to_string().contains("cuda frames only"), "{e}");
         let mut twice = cfg;
         twice.module_stages[1].name = "post".into();
-        let e = Output::build_in(twice, FrameMemory::System).unwrap_err();
+        let e = Output::build_in(twice, VideoMemory::System).unwrap_err();
         assert!(e.to_string().contains("used twice"), "{e}");
     }
 
@@ -2198,7 +2231,7 @@ mod tests {
         require_elements(&["appsrc", "capssetter", "fakesink"]);
         let cfg = OutputConfig::new("320x240@30".parse().unwrap(), OutputSink::Fake);
         assert!(cfg.module_stages.is_empty());
-        let o = Output::build_in(cfg, FrameMemory::System).unwrap();
+        let o = Output::build_in(cfg, VideoMemory::System).unwrap();
         assert!(o.module_names().is_empty());
         let mut e = o.pipeline().element(names::FRAMES_SRC);
         while let Some(el) = e {

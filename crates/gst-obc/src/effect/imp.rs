@@ -225,6 +225,36 @@
 //!   input buffer may go back to its ingest pool as soon as it is released,
 //!   and its next write must not race this frame's read. Downstream
 //!   (`cudadownload`, on the same thread) would wait for that work anyway.
+//!
+//! # System memory
+//!
+//! Caps without the CUDA memory feature (`Format::cuda` false) run the same
+//! element with no CUDA object: what a frame gets is decided by the same
+//! code for both memories ([`decide_frame`], `run_frame`), and only its
+//! pixel work differs (`FramePixels`: `CudaPixels` on the element's
+//! stream, `HostPixels` on the CPU). On system memory:
+//!
+//! * black is two row-by-row fills of the mapped output (Y to the black of
+//!   the caps' range, UV to 128), the input and the decoded fallback image
+//!   are row-by-row copies, and the backend reads the mapped input and
+//!   writes the mapped output (`InferenceBackend::process_host`);
+//! * the output buffers come from a system-memory video pool
+//!   (`StreamState::host_pool`), created by the first frame the element
+//!   writes; passthrough allocates nothing;
+//! * the worker loads as soon as the caps are known (it waits for no
+//!   context), with `InferenceBackend::load_host`, and only with a factory
+//!   that lists host frames (`BackendFactory::kinds`); an instance is never
+//!   called with a context current, and one created for the other memory
+//!   (new caps) is unloaded and dropped before a load (`drop_revoked`);
+//! * the repeat cache is the same: the re-sent buffer shares the cached
+//!   memory, so a downstream element that writes in place maps a copy
+//!   (`gst_memory_make_mapped`), on the CPU here;
+//! * the frame size must be even both ways, as the pipeline's canonical
+//!   caps always are: the CPU fills and copies (`crate::video`) refuse an
+//!   odd size, so a frame the element would write fails the stream with an
+//!   error instead of going out partly written. Passthrough is unaffected.
+//!   The pad templates do not restrict the size: the limit is the pixel
+//!   operations', and it fails closed.
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -244,8 +274,9 @@ use gst_base::subclass::base_transform::{
 use gst_base::subclass::prelude::*;
 use gst_video::VideoInfo;
 use obc_backend::{
-    BackendError, BackendFactory, ColourSpec, DeviceNv12, EffectKind, FrameParams, GpuContext,
-    InferenceBackend, LoadReport, LoadRequest, StageId, StageTimings,
+    BackendError, BackendFactory, ColourSpec, DeviceNv12, EffectKind, FrameKind, FrameParams,
+    GpuContext, HostNv12, InferenceBackend, LoadReport, LoadRequest, StageId, StageList,
+    StageTimings,
 };
 use obc_gpu::{ContextGuard, CuContext, CuStream, Event};
 
@@ -257,7 +288,9 @@ use crate::settings::{
     ScreenEvent, StageStats, Target, decide, decide_frame, fallback_unreadable, parse_effect,
     percentile, raw_on_screen_after,
 };
-use crate::video::{CudaFrame, colour_of, input_context};
+use crate::video::{
+    CudaFrame, colour_of, copy_nv12, copy_packed_nv12, fill_nv12, host_nv12, input_context,
+};
 
 static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
     gst::DebugCategory::new(
@@ -281,10 +314,13 @@ struct Format {
     colour: Result<ColourSpec, String>,
     /// Black for this range (the matrix does not matter for black).
     black: ColourSpec,
+    /// The frames are in CUDA memory; else in system memory (see "System
+    /// memory" in the module docs).
+    cuda: bool,
 }
 
 impl Format {
-    fn of(info: &VideoInfo) -> Format {
+    fn of(info: &VideoInfo, cuda: bool) -> Format {
         let c = info.colorimetry();
         let full = c.range() == gst_video::VideoColorRange::Range0_255;
         let black = if full {
@@ -297,6 +333,16 @@ impl Format {
             height: info.height(),
             colour: colour_of(&c),
             black,
+            cuda,
+        }
+    }
+
+    /// The memory of the frames, as the backend seam names it.
+    fn kind(&self) -> FrameKind {
+        if self.cuda {
+            FrameKind::Cuda
+        } else {
+            FrameKind::Host
         }
     }
 }
@@ -308,6 +354,8 @@ struct LoadedKey {
     width: u32,
     height: u32,
     colour: ColourSpec,
+    /// The memory of the frames it was loaded for.
+    kind: FrameKind,
 }
 
 /// What the fallback image is decoded for: its path and the file there,
@@ -354,6 +402,10 @@ struct Engine {
     /// of an earlier count belongs to a revoked backend, and the worker
     /// drops it before anything else ([`drop_revoked`]).
     revocation: u64,
+    /// The memory of the frames the instance was created for: its calls
+    /// take the CUDA context ([`FrameKind::Cuda`]) or none
+    /// ([`FrameKind::Host`]).
+    kind: Option<FrameKind>,
 }
 
 struct Control {
@@ -969,6 +1021,9 @@ struct StreamState {
     /// The last processed output, while it is valid.
     cache: Option<Cached>,
     gpu: Option<GpuResources>,
+    /// The output pool for system-memory caps (rebuilt when they change),
+    /// once a frame needs it.
+    host_pool: Option<gst::BufferPool>,
 }
 
 /// The last processed output buffer, kept to answer a repeat, and what it
@@ -1290,8 +1345,9 @@ impl ObcEffect {
         }
     }
 
-    /// The fallback image of decode `serial` could not be uploaded (`why`):
-    /// black in its place from now on, reported (unless superseded).
+    /// The fallback image of decode `serial` could not be put into a frame
+    /// (`why`: uploaded, or copied in system memory): black in its place
+    /// from now on, reported (unless superseded).
     fn fallback_upload_failed(&self, serial: u64, why: String) {
         let posted = {
             let mut c = lock(&self.shared.control);
@@ -1305,7 +1361,7 @@ impl ObcEffect {
                 .fallback
                 .key
                 .as_ref()
-                .map(|k| fallback_unreadable(&k.path, &format!("cannot upload it: {why}")));
+                .map(|k| fallback_unreadable(&k.path, &why));
             before.changed(c.report())
         };
         if let Some(r) = posted {
@@ -1338,7 +1394,9 @@ impl ObcEffect {
                     .and_then(|b| b.upload_packed(&img.nv12).map(|()| b));
                 match up {
                     Ok(b) => gpu.fallback = Some((img.serial, b)),
-                    Err(e) => self.fallback_upload_failed(img.serial, e.to_string()),
+                    Err(e) => {
+                        self.fallback_upload_failed(img.serial, format!("cannot upload it: {e}"))
+                    }
                 }
             }
             if let Some((_, b)) = gpu.fallback.as_ref().filter(|(s, _)| *s == img.serial) {
@@ -1506,34 +1564,73 @@ impl ObcEffect {
         Ok(())
     }
 
-    /// Releases the backend, then the CUDA objects (see the module docs).
+    /// Creates the output pool for system-memory caps if there is none: all
+    /// a frame the element writes needs there.
+    fn ensure_host(&self, st: &mut StreamState) -> Result<(), String> {
+        if st.host_pool.is_none() {
+            let (Some(caps), Some(info)) = (&st.caps, &st.info) else {
+                return Err("no caps negotiated".into());
+            };
+            st.host_pool = Some(make_host_pool(caps, info)?);
+        }
+        Ok(())
+    }
+
+    /// Releases the backend, then the CUDA objects (see the module docs),
+    /// or on system memory the backend and the output pool. The instance is
+    /// released under the memory it was created for (`Engine::kind`), not
+    /// the current frames': one of host frames with no CUDA context
+    /// current, one of CUDA frames with its context pushed (leaked if that
+    /// fails). Runs after the worker has been joined.
     fn release_gpu(&self) {
-        let (gpu, cached) = {
+        let (gpu, cached, host_pool) = {
             let mut st = lock(&self.stream);
-            (st.gpu.take(), st.cache.take())
+            (st.gpu.take(), st.cache.take(), st.host_pool.take())
         };
         // The cached output is memory of our pool and context: gone first.
         drop(cached);
+        if let Some(pool) = host_pool {
+            let _ = pool.set_active(false);
+        }
+        let instance = {
+            let mut e = lock(&self.shared.engine);
+            e.loaded = None;
+            // An instance always has its kind; CUDA, the stricter, if not.
+            let kind = e.kind.take().unwrap_or(FrameKind::Cuda);
+            e.instance.take().map(|i| (i, kind))
+        };
+        let unloaded = instance.is_some();
+        match instance {
+            None => {}
+            Some((mut instance, FrameKind::Host)) => {
+                instance.unload();
+                drop(instance);
+            }
+            Some((mut instance, FrameKind::Cuda)) => match &gpu {
+                Some(gpu) => {
+                    // SAFETY: the context reference is still ours.
+                    match unsafe { ContextGuard::push(gpu.cu_ctx) } {
+                        Ok(guard) => {
+                            instance.unload();
+                            drop(instance);
+                            drop(guard);
+                        }
+                        Err(err) => leak_backend(instance, &err.to_string()),
+                    }
+                }
+                None => leak_backend(instance, "the effect has no CUDA context"),
+            },
+        }
         let Some(gpu) = gpu else {
+            if unloaded {
+                let mut c = lock(&self.shared.control);
+                c.loaded_kind = None;
+                c.epoch += 1;
+                drop(c);
+                gst::info!(CAT, imp = self, "backend unloaded");
+            }
             return;
         };
-        {
-            // SAFETY: the context reference is still ours.
-            let guard = unsafe { ContextGuard::push(gpu.cu_ctx) };
-            let mut e = lock(&self.shared.engine);
-            if let Some(mut instance) = e.instance.take() {
-                match &guard {
-                    Ok(_) => {
-                        instance.unload();
-                        drop(instance);
-                    }
-                    Err(err) => leak_backend(instance, &err.to_string()),
-                }
-            }
-            e.loaded = None;
-            drop(e);
-            drop(guard);
-        }
         // The pool, the events, the stream and the context reference.
         drop(gpu);
         self.shared.cuda_active.store(false, Ordering::Relaxed);
@@ -1572,7 +1669,8 @@ impl ObcEffect {
         e.instance.as_ref()?.timings()
     }
 
-    /// Fills `out` for `action` on the element's stream and waits for it.
+    /// Fills `out` for `action` and waits for it: on the element's CUDA
+    /// stream for CUDA caps, on the CPU for system memory.
     fn render(
         &self,
         st: &mut StreamState,
@@ -1583,7 +1681,6 @@ impl ObcEffect {
         // last one.
         st.processed = false;
         st.cache = None;
-        let lib = cuda::gst_cuda()?;
         let info = st.info.clone().ok_or("no caps negotiated")?;
         let format = st.format.clone().ok_or("no caps negotiated")?;
         // What hides the input: the fallback image with `image`, else black.
@@ -1591,27 +1688,46 @@ impl ObcEffect {
             EffectFallback::Image => st.fallback_frame.clone(),
             _ => None,
         };
-        let gpu = st.gpu.as_mut().ok_or("no CUDA resources")?;
+        if !format.cuda {
+            return self.render_host(st, inbuf, outbuf, &info, &format, image.as_ref());
+        }
+        let lib = cuda::gst_cuda()?;
+        // Taken for the frame (the decision below borrows the rest of the
+        // stream state), and always put back.
+        let mut gpu = st.gpu.take().ok_or("no CUDA resources")?;
+        let result = self.render_cuda(
+            st,
+            (&mut gpu, lib),
+            (inbuf, outbuf),
+            &info,
+            &format,
+            image.as_ref(),
+        );
+        st.gpu = Some(gpu);
+        result
+    }
+
+    /// [`Self::render`] on CUDA frames, with the element's context pushed.
+    fn render_cuda(
+        &self,
+        st: &mut StreamState,
+        (gpu, lib): (&mut GpuResources, &'static cuda::GstCuda),
+        (inbuf, outbuf): (&gst::Buffer, &mut gst::BufferRef),
+        info: &VideoInfo,
+        format: &Format,
+        image: Option<&Arc<FallbackFrame>>,
+    ) -> Result<(), String> {
         // SAFETY: our context reference is live.
         let _guard = unsafe { ContextGuard::push(gpu.cu_ctx) }.map_err(|e| e.to_string())?;
         // SAFETY: the output buffer is ours, writable, from our CUDA pool.
         let out = unsafe {
             CudaFrame::map(
                 outbuf.as_mut_ptr(),
-                &info,
+                info,
                 gst::ffi::GST_MAP_WRITE | MAP_CUDA,
             )
         }?;
-        let dst = out.nv12();
         let stream = gpu.cu_stream;
-        let mut processed = false;
-        // The stages that ran on the processed frame.
-        let mut ran: Vec<StageId> = Vec::new();
-        // The input copied into the output (a failed frame with nothing to
-        // hide, or on-failure=none).
-        let mut copied = false;
-        // The processed frame went through an effect (not the stages alone).
-        let mut effect_ran = false;
         // The input stays mapped until the stream has finished reading it.
         let mut input_frame: Option<CudaFrame> = None;
         // Every exit from here waits for the stream before the frames are
@@ -1622,28 +1738,85 @@ impl ObcEffect {
             // SAFETY: our own stream; the context is still pushed.
             let _ = unsafe { obc_gpu::stream_synchronize(stream) };
         });
+        let rendered = {
+            let mut px = CudaPixels {
+                fx: self,
+                lib,
+                gpu: &mut *gpu,
+                info,
+                inbuf,
+                dst: out.nv12(),
+                input: &mut input_frame,
+                src: None,
+            };
+            self.run_frame(st, format, image, &mut px)?
+        };
+        sync_on_exit.disarm();
+        // SAFETY: our own stream. Waiting here also ends this frame's read
+        // of the input (see the module docs for why).
+        unsafe { obc_gpu::stream_synchronize(stream) }.map_err(|e| e.to_string())?;
+        drop(input_frame);
+        drop(out);
+        let gpu_ms = if rendered.processed {
+            Event::elapsed_ms(&gpu.start, &gpu.end).ok()
+        } else {
+            None
+        };
+        self.account(st, rendered, gpu_ms);
+        Ok(())
+    }
+
+    /// [`Self::render`] on system-memory frames: the CPU fills and copies,
+    /// and the backend's host methods. No CUDA call.
+    fn render_host(
+        &self,
+        st: &mut StreamState,
+        inbuf: &gst::Buffer,
+        outbuf: &mut gst::BufferRef,
+        info: &VideoInfo,
+        format: &Format,
+        image: Option<&Arc<FallbackFrame>>,
+    ) -> Result<(), String> {
+        let out = gst_video::VideoFrameRef::from_buffer_ref_writable(outbuf, info)
+            .map_err(|_| "could not map an output frame for writing")?;
+        let dst = host_nv12(&out);
+        let rendered = {
+            let mut px = HostPixels {
+                fx: self,
+                _out: out,
+                dst,
+                inbuf,
+                info,
+                _input: None,
+                src: None,
+            };
+            self.run_frame(st, format, image, &mut px)?
+        };
+        // No GPU time on the CPU path.
+        self.account(st, rendered, None);
+        Ok(())
+    }
+
+    /// Decides and writes one output frame through `px`, the pixel work of
+    /// the negotiated memory: every rule of the module docs, the same for
+    /// CUDA and system memory. Returns what the frame got; the caller waits
+    /// for the work, then accounts for it ([`Self::account`]).
+    fn run_frame<P: FramePixels>(
+        &self,
+        st: &mut StreamState,
+        format: &Format,
+        image: Option<&Arc<FallbackFrame>>,
+        px: &mut P,
+    ) -> Result<Rendered, String> {
+        let mut r = Rendered::default();
         match st.action {
             FrameAction::Passthrough => {
                 return Err("internal: passthrough frame in transform".into());
             }
-            FrameAction::Black => {
-                self.fill_hidden(gpu, image.as_ref(), &dst, format.black, stream)?
-            }
+            FrameAction::Black => px.fill_hidden(image, format.black)?,
             FrameAction::Process => {
-                let mem = inbuf.peek_memory(0);
-                // SAFETY: `ensure_gpu` checked that this is a GstCudaMemory
-                // of our context; the sync only waits for its producer.
-                unsafe { (lib.gst_cuda_memory_sync)(mem.as_mut_ptr().cast()) };
-                // SAFETY: read-only CUDA map of the input; it is never
-                // written.
-                let input = unsafe {
-                    CudaFrame::map(inbuf.as_mut_ptr(), &info, gst::ffi::GST_MAP_READ | MAP_CUDA)
-                }?;
-                let src = input.nv12();
-                // Owned by the outer scope, so it outlives `sync_on_exit`.
-                input_frame = Some(input);
+                px.map_input()?;
                 let params = Arc::clone(&st.frame);
-                let ctx = gpu.gpu_context();
                 // The stages alone hide nothing: an effect frame needs a
                 // chain with the effect. A frame of `none` needs a chain
                 // with something in it (a stage, or the previous effect
@@ -1674,28 +1847,35 @@ impl ObcEffect {
                     None => &mut idle,
                 };
                 // A toggle frame that finds the effect loaded (the worker
-                // installed it after the decision) is an effect frame: the
-                // effect runs on it, and its failure is the effect's.
+                // installed it after the decision) for frames in this
+                // frame's memory is an effect frame: the effect runs on it,
+                // and its failure is the effect's. A chain loaded for the
+                // other memory (new caps mid-toggle) does not promote it: it
+                // stays a toggle frame (the input), as `usable` below would
+                // not run that chain either.
                 let promoted = st.toggle
                     && loaded
                         .as_ref()
-                        .is_some_and(|k| k.target.kind != EffectKind::None)
+                        .is_some_and(|k| k.kind == px.kind() && k.target.kind != EffectKind::None)
                     && instance.as_ref().is_some_and(|i| i.is_loaded());
                 if promoted {
                     alone = false;
                 }
                 // A backend that lost its chain on its own (a module
                 // instance unloaded after a panic) runs nothing: as if
-                // unloaded since the decision.
+                // unloaded since the decision. Nor does a chain loaded for
+                // frames in the other memory (new caps the worker has not
+                // loaded for yet).
                 let usable = loaded.as_ref().is_some_and(|k| {
-                    k.target.kind != EffectKind::None || (alone && k.target.has_stages())
+                    k.kind == px.kind()
+                        && (k.target.kind != EffectKind::None || (alone && k.target.has_stages()))
                 }) && instance.as_ref().is_some_and(|i| i.is_loaded());
                 let result = match (instance.as_mut(), usable) {
                     (Some(instance), true) => 'frame: {
                         // Before the start event: the reset may wait for
                         // the stream, which is not this frame's GPU time.
                         let reset = if std::mem::take(&mut st.reset_pending) {
-                            instance.reset_temporal(&ctx)
+                            px.reset_temporal(&mut **instance)
                         } else {
                             Ok(Default::default())
                         };
@@ -1727,10 +1907,8 @@ impl ObcEffect {
                         {
                             break 'frame None;
                         }
-                        // SAFETY: our own stream.
-                        let _ = unsafe { gpu.start.record(stream) };
-                        let mut r =
-                            reset.and_then(|()| instance.process(&ctx, &params, &src, &dst));
+                        px.start_timing();
+                        let mut res = reset.and_then(|()| px.process(&mut **instance, &params));
                         // A stage failure: the backend has dropped the stage
                         // (and any failure of the stages alone drops them
                         // all), so the chain loaded from now on is without
@@ -1739,7 +1917,7 @@ impl ObcEffect {
                         // processed (never the input, nor black, for a
                         // healthy effect), as often as stages fail. Without
                         // an effect the frame is the input.
-                        while let Err(err) = &r {
+                        while let Err(err) = &res {
                             let Some(k) = loaded.as_mut() else { break };
                             let failed: Vec<StageId> = match stage_of(err) {
                                 Some(s) if k.target.wants(s.as_str()) => vec![s],
@@ -1760,22 +1938,21 @@ impl ObcEffect {
                             if alone {
                                 break;
                             }
-                            r = instance.process(&ctx, &params, &src, &dst);
+                            res = px.process(&mut **instance, &params);
                         }
-                        if r.is_ok()
+                        if res.is_ok()
                             && let Some(k) = loaded.as_ref()
                         {
-                            ran = k.target.stages.iter().map(|(s, _)| s.clone()).collect();
-                            effect_ran = k.target.kind != EffectKind::None;
+                            r.ran = k.target.stages.iter().map(|(s, _)| s.clone()).collect();
+                            r.effect_ran = k.target.kind != EffectKind::None;
                         }
-                        // SAFETY: our own stream.
-                        let _ = unsafe { gpu.end.record(stream) };
-                        Some(r)
+                        px.end_timing();
+                        Some(res)
                     }
                     _ => None,
                 };
                 drop(held);
-                if promoted && effect_ran {
+                if promoted && r.effect_ran {
                     st.toggle_found = Some((st.generation, st.epoch));
                 }
                 if !rebuild.is_empty() {
@@ -1796,64 +1973,60 @@ impl ObcEffect {
                     // the new one).
                     self.fail_stage(stage, None, reason.clone());
                 }
-                let copy = |src: &DeviceNv12, dst: &DeviceNv12| {
-                    // SAFETY: both are the mapped CUDA frames of this call,
-                    // in our context, same size; the input is only read.
-                    unsafe { obc_gpu::copy_nv12_async(src, dst, stream) }.map_err(|e| e.to_string())
-                };
                 match result {
-                    Some(Ok(())) => processed = true,
+                    Some(Ok(())) => r.processed = true,
                     // The stages alone failed (recorded above): nothing to
                     // hide, the input.
                     Some(Err(_)) if alone => {
-                        copy(&src, &dst)?;
-                        copied = true;
+                        px.copy_input()?;
+                        r.copied = true;
                     }
                     // The effect failed (recorded above).
                     Some(Err(_)) => match st.fallback {
                         EffectFallback::Black | EffectFallback::Image => {
-                            self.fill_hidden(gpu, image.as_ref(), &dst, format.black, stream)?
+                            px.fill_hidden(image, format.black)?
                         }
                         EffectFallback::None => {
-                            copy(&src, &dst)?;
-                            copied = true;
+                            px.copy_input()?;
+                            r.copied = true;
                         }
                     },
                     // Unloaded since the decision: the input for `none`
                     // (nothing to hide), black for an effect, never the
                     // input.
                     None if alone => {
-                        copy(&src, &dst)?;
-                        copied = true;
+                        px.copy_input()?;
+                        r.copied = true;
                     }
-                    None => self.fill_hidden(gpu, image.as_ref(), &dst, format.black, stream)?,
+                    None => px.fill_hidden(image, format.black)?,
                 }
             }
         }
-        sync_on_exit.disarm();
-        // SAFETY: our own stream. Waiting here also ends this frame's read
-        // of the input (see the module docs for why).
-        unsafe { obc_gpu::stream_synchronize(stream) }.map_err(|e| e.to_string())?;
-        drop(input_frame);
-        drop(out);
+        Ok(r)
+    }
+
+    /// Records what a frame written by [`Self::run_frame`] got, once its
+    /// work is done: the cache flag, what is on screen, the counters, the
+    /// stage times and `gpu_ms` (the frame's GPU time, if measured).
+    fn account(&self, st: &mut StreamState, r: Rendered, gpu_ms: Option<f32>) {
         // Only a processed frame is cached (`generate_output`); black or
         // the input leaves no cache behind.
-        st.processed = processed;
+        st.processed = r.processed;
         // The room stays on screen after the input or the stages alone;
         // black or an effect frame ends it.
-        let output = match (processed, effect_ran, copied) {
+        let output = match (r.processed, r.effect_ran, r.copied) {
             (true, true, _) => FrameOutput::Effect,
             (true, false, _) => FrameOutput::Stages,
             (false, _, true) => FrameOutput::Input,
             (false, _, false) => FrameOutput::Hidden,
         };
         st.raw_on_screen = raw_on_screen_after(st.raw_on_screen, ScreenEvent::Output(output));
-        if processed {
+        if r.processed {
             self.shared.processed.fetch_add(1, Ordering::Relaxed);
-            if !ran.is_empty() {
+            if !r.ran.is_empty() {
                 let times = self.stage_times();
                 let mut figures = lock(&self.shared.stage_figures);
-                for id in ran {
+                for id in r.ran {
                     let i = match figures.iter().position(|(s, _)| *s == id) {
                         Some(i) => i,
                         None => {
@@ -1870,15 +2043,276 @@ impl ObcEffect {
                     }
                 }
             }
-            if let Ok(ms) = Event::elapsed_ms(&gpu.start, &gpu.end) {
+            if let Some(ms) = gpu_ms {
                 push_window(&self.shared.gpu_ms, ms);
             }
-        } else if copied {
+        } else if r.copied {
             self.shared.passthrough.fetch_add(1, Ordering::Relaxed);
         } else {
             self.shared.black.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+/// What [`ObcEffect::run_frame`] wrote into a frame.
+#[derive(Default)]
+struct Rendered {
+    /// Processed by the backend (an effect, or the stages alone).
+    processed: bool,
+    /// The processed frame went through an effect (not the stages alone).
+    effect_ran: bool,
+    /// The input copied into the output (a failed frame with nothing to
+    /// hide, or on-failure=none).
+    copied: bool,
+    /// The stages that ran on the processed frame.
+    ran: Vec<StageId>,
+}
+
+/// The pixel work of one output frame in the memory of the negotiated caps:
+/// [`CudaPixels`] on the element's stream, [`HostPixels`] on the CPU. What
+/// a frame gets is decided once, in [`ObcEffect::run_frame`], for both.
+trait FramePixels {
+    /// The memory of the frames.
+    fn kind(&self) -> FrameKind;
+    /// Maps the input for reading (a frame to process only).
+    fn map_input(&mut self) -> Result<(), String>;
+    /// Fills the output with what hides the input: the fallback image
+    /// `image` when there is one of the output's size, else black of
+    /// `black`.
+    fn fill_hidden(
+        &mut self,
+        image: Option<&Arc<FallbackFrame>>,
+        black: ColourSpec,
+    ) -> Result<(), String>;
+    /// Copies the mapped input into the output.
+    fn copy_input(&mut self) -> Result<(), String>;
+    /// The backend's temporal reset, for this memory.
+    fn reset_temporal(
+        &mut self,
+        instance: &mut dyn InferenceBackend,
+    ) -> Result<StageList, BackendError>;
+    /// Marks the start of the backend's work on the frame (its GPU time).
+    fn start_timing(&mut self);
+    /// The backend's work on the mapped input into the output.
+    fn process(
+        &mut self,
+        instance: &mut dyn InferenceBackend,
+        params: &FrameParams,
+    ) -> Result<(), BackendError>;
+    /// Marks the end of the backend's work on the frame.
+    fn end_timing(&mut self);
+}
+
+/// A CUDA output frame, written on the element's stream (the context is
+/// pushed for as long as it lives).
+struct CudaPixels<'a> {
+    fx: &'a ObcEffect,
+    lib: &'static cuda::GstCuda,
+    gpu: &'a mut GpuResources,
+    info: &'a VideoInfo,
+    inbuf: &'a gst::Buffer,
+    /// The mapped output frame.
+    dst: DeviceNv12,
+    /// The input once mapped, owned by the caller so that it stays mapped
+    /// until the stream has finished reading it.
+    input: &'a mut Option<CudaFrame>,
+    src: Option<DeviceNv12>,
+}
+
+impl CudaPixels<'_> {
+    fn src(&self) -> Result<DeviceNv12, String> {
+        self.src
+            .ok_or_else(|| "internal: the input is not mapped".to_owned())
+    }
+}
+
+impl FramePixels for CudaPixels<'_> {
+    fn kind(&self) -> FrameKind {
+        FrameKind::Cuda
+    }
+
+    fn map_input(&mut self) -> Result<(), String> {
+        let mem = self.inbuf.peek_memory(0);
+        // SAFETY: `ensure_gpu` checked that this is a GstCudaMemory of our
+        // context; the sync only waits for its producer.
+        unsafe { (self.lib.gst_cuda_memory_sync)(mem.as_mut_ptr().cast()) };
+        // SAFETY: read-only CUDA map of the input; it is never written.
+        let input = unsafe {
+            CudaFrame::map(
+                self.inbuf.as_mut_ptr(),
+                self.info,
+                gst::ffi::GST_MAP_READ | MAP_CUDA,
+            )
+        }?;
+        self.src = Some(input.nv12());
+        // Owned by the caller's scope, so it outlives its stream guard.
+        *self.input = Some(input);
         Ok(())
+    }
+
+    fn fill_hidden(
+        &mut self,
+        image: Option<&Arc<FallbackFrame>>,
+        black: ColourSpec,
+    ) -> Result<(), String> {
+        let stream = self.gpu.cu_stream;
+        self.fx
+            .fill_hidden(self.gpu, image, &self.dst, black, stream)
+    }
+
+    fn copy_input(&mut self) -> Result<(), String> {
+        let src = self.src()?;
+        // SAFETY: both are the mapped CUDA frames of this call, in our
+        // context, same size; the input is only read.
+        unsafe { obc_gpu::copy_nv12_async(&src, &self.dst, self.gpu.cu_stream) }
+            .map_err(|e| e.to_string())
+    }
+
+    fn reset_temporal(
+        &mut self,
+        instance: &mut dyn InferenceBackend,
+    ) -> Result<StageList, BackendError> {
+        instance.reset_temporal(&self.gpu.gpu_context())
+    }
+
+    fn start_timing(&mut self) {
+        // SAFETY: our own stream.
+        let _ = unsafe { self.gpu.start.record(self.gpu.cu_stream) };
+    }
+
+    fn process(
+        &mut self,
+        instance: &mut dyn InferenceBackend,
+        params: &FrameParams,
+    ) -> Result<(), BackendError> {
+        let src = self.src().map_err(BackendError::InvalidInput)?;
+        instance.process(&self.gpu.gpu_context(), params, &src, &self.dst)
+    }
+
+    fn end_timing(&mut self) {
+        // SAFETY: our own stream.
+        let _ = unsafe { self.gpu.end.record(self.gpu.cu_stream) };
+    }
+}
+
+/// A system-memory output frame, written on the CPU before each call
+/// returns. No CUDA call.
+struct HostPixels<'a> {
+    fx: &'a ObcEffect,
+    /// The output frame, mapped for writing while this lives.
+    _out: gst_video::VideoFrameRef<&'a mut gst::BufferRef>,
+    /// Its planes.
+    dst: HostNv12,
+    inbuf: &'a gst::Buffer,
+    info: &'a VideoInfo,
+    /// The input once mapped (for reading only).
+    _input: Option<gst_video::VideoFrameRef<&'a gst::BufferRef>>,
+    /// Its planes, only ever read.
+    src: Option<HostNv12>,
+}
+
+impl FramePixels for HostPixels<'_> {
+    fn kind(&self) -> FrameKind {
+        FrameKind::Host
+    }
+
+    fn map_input(&mut self) -> Result<(), String> {
+        let input = gst_video::VideoFrameRef::from_buffer_ref_readable(self.inbuf, self.info)
+            .map_err(|_| "could not map an input frame for reading")?;
+        self.src = Some(host_nv12(&input));
+        self._input = Some(input);
+        Ok(())
+    }
+
+    fn fill_hidden(
+        &mut self,
+        image: Option<&Arc<FallbackFrame>>,
+        black: ColourSpec,
+    ) -> Result<(), String> {
+        if let Some(img) =
+            image.filter(|i| (i.width, i.height) == (self.dst.width, self.dst.height))
+        {
+            // SAFETY: `dst` is the output frame mapped for writing in
+            // `_out`, accessed through nothing else.
+            match unsafe { copy_packed_nv12(&img.nv12, &mut self.dst) } {
+                Ok(()) => return Ok(()),
+                Err(e) => self
+                    .fx
+                    .fallback_upload_failed(img.serial, format!("cannot copy it: {e}")),
+            }
+        }
+        // SAFETY: as above.
+        unsafe { fill_nv12(&mut self.dst, black.black_nv12()) }
+    }
+
+    fn copy_input(&mut self) -> Result<(), String> {
+        let src = self
+            .src
+            .as_ref()
+            .ok_or("internal: the input is not mapped")?;
+        // SAFETY: `src` is the input mapped for reading in `_input`, only
+        // read; `dst` the output mapped for writing in `_out`: another
+        // buffer, so they do not overlap.
+        unsafe { copy_nv12(src, &mut self.dst) }
+    }
+
+    fn reset_temporal(
+        &mut self,
+        instance: &mut dyn InferenceBackend,
+    ) -> Result<StageList, BackendError> {
+        instance.reset_temporal_host()
+    }
+
+    fn start_timing(&mut self) {}
+
+    fn process(
+        &mut self,
+        instance: &mut dyn InferenceBackend,
+        params: &FrameParams,
+    ) -> Result<(), BackendError> {
+        let src = self
+            .src
+            .as_ref()
+            .ok_or_else(|| BackendError::InvalidInput("the input is not mapped".into()))?;
+        instance.process_host(params, src, &mut self.dst)
+    }
+
+    fn end_timing(&mut self) {}
+}
+
+/// A system-memory buffer pool for `caps`, with video meta (its strides
+/// may be padded).
+fn make_host_pool(caps: &gst::Caps, info: &VideoInfo) -> Result<gst::BufferPool, String> {
+    let pool = gst_video::VideoBufferPool::new();
+    let mut config = pool.config();
+    config.set_params(Some(caps), info.size() as u32, 2, 0);
+    config.add_option(gst_video::BUFFER_POOL_OPTION_VIDEO_META);
+    pool.set_config(config)
+        .map_err(|e| format!("system-memory buffer pool configuration: {e}"))?;
+    pool.set_active(true)
+        .map_err(|e| format!("system-memory buffer pool activation: {e}"))?;
+    Ok(pool.upcast())
+}
+
+/// Makes current the context the calls on an instance created for `kind`
+/// frames take: the CUDA context of `gpu`, or none for host frames.
+///
+/// # Safety
+/// `gpu`'s context is alive: the element keeps it alive until it has
+/// joined the worker.
+unsafe fn push_for(
+    kind: FrameKind,
+    gpu: Option<GpuContext>,
+) -> Result<Option<ContextGuard>, String> {
+    match kind {
+        FrameKind::Host => Ok(None),
+        FrameKind::Cuda => {
+            let gpu = gpu.ok_or("the effect has no CUDA context")?;
+            // SAFETY: the caller's contract.
+            unsafe { ContextGuard::push(gpu.context) }
+                .map(Some)
+                .map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -1916,7 +2350,12 @@ struct Job {
     /// What to load: the request without the stages that failed
     /// ([`Control::job_target`]).
     target: Target,
-    gpu: GpuContext,
+    /// The memory of the frames ([`Format::kind`]).
+    kind: FrameKind,
+    /// The CUDA context and the element's stream, once created: always for
+    /// CUDA frames, and for system memory only if the element ran on CUDA
+    /// before (to release an instance made for those frames).
+    gpu: Option<GpuContext>,
     format: Format,
     factory: Option<Arc<dyn BackendFactory>>,
     /// `Control::revocations` when the job was built.
@@ -1977,13 +2416,17 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                 if c.stop {
                     return;
                 }
+                // CUDA frames need the streaming thread's context first;
+                // system memory needs nothing.
                 if handled != Some(c.generation)
-                    && let (Some(gpu), Some(format)) = (c.gpu, c.format.clone())
+                    && let Some(format) = c.format.clone()
+                    && (c.gpu.is_some() || !format.cuda)
                 {
                     break Job {
                         generation: c.generation,
                         target: c.job_target(),
-                        gpu,
+                        kind: format.kind(),
+                        gpu: c.gpu,
                         format,
                         factory: c.factory.clone(),
                         revocation: c.revocations,
@@ -2168,16 +2611,20 @@ fn run_job(shared: &Shared, job: &Job) -> JobResult {
 }
 
 /// Drops the instance of a revoked backend (created before the job's
-/// revocation count): unloaded and dropped with the context pushed, as
-/// `release_gpu` does, so no later load reuses it.
+/// revocation count), or one created for frames in the other memory (new
+/// caps): unloaded and dropped with its context pushed (none for host
+/// frames), as `release_gpu` does, so no later load reuses it.
 fn drop_revoked(shared: &Shared, job: &Job) {
     let stale = {
         let mut e = lock(&shared.engine);
-        if e.instance.is_none() || e.revocation >= job.revocation {
+        if e.instance.is_none()
+            || (e.revocation >= job.revocation && e.kind.is_none_or(|k| k == job.kind))
+        {
             return;
         }
         e.loaded = None;
-        e.instance.take()
+        let kind = e.kind.take().unwrap_or(FrameKind::Cuda);
+        e.instance.take().map(|i| (i, kind))
     };
     {
         // The streaming thread must not take the dropped chain as loaded.
@@ -2185,18 +2632,18 @@ fn drop_revoked(shared: &Shared, job: &Job) {
         c.loaded_kind = None;
         c.epoch += 1;
     }
-    let Some(mut instance) = stale else {
+    let Some((mut instance, kind)) = stale else {
         return;
     };
     // SAFETY: the element keeps the context alive until it has joined
     // this thread.
-    match unsafe { ContextGuard::push(job.gpu.context) } {
+    match unsafe { push_for(kind, job.gpu) } {
         Ok(guard) => {
             instance.unload();
             drop(instance);
             drop(guard);
         }
-        Err(err) => leak_backend(instance, &err.to_string()),
+        Err(err) => leak_backend(instance, &err),
     }
 }
 
@@ -2208,9 +2655,10 @@ fn unload(shared: &Shared, job: &Job) {
         c.loaded_kind = None;
         c.epoch += 1;
     }
+    // The instance left is of the job's memory (`drop_revoked`).
     // SAFETY: the element keeps the context alive until it has joined
     // this thread.
-    let guard = unsafe { ContextGuard::push(job.gpu.context) };
+    let guard = unsafe { push_for(job.kind, job.gpu) };
     let mut e = lock(&shared.engine);
     match &guard {
         Ok(_) => {
@@ -2220,7 +2668,8 @@ fn unload(shared: &Shared, job: &Job) {
         }
         Err(err) => {
             if let Some(instance) = e.instance.take() {
-                leak_backend(instance, &err.to_string());
+                e.kind = None;
+                leak_backend(instance, err);
             }
         }
     }
@@ -2251,6 +2700,7 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
         width: job.format.width,
         height: job.format.height,
         colour,
+        kind: job.kind,
     };
     let current = {
         let mut e = lock(&shared.engine);
@@ -2280,6 +2730,12 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
     let Some(factory) = job.factory.clone() else {
         return Outcome::Failed(Failure::new(NO_BACKEND));
     };
+    if job.kind == FrameKind::Host && !factory.kinds().contains(&FrameKind::Host) {
+        return Outcome::Failed(Failure::new(format!(
+            "the {} backend takes CUDA frames only, and these frames are in system memory",
+            factory.name()
+        )));
+    }
     // A full load for the backend: nothing loaded, or another size or
     // colour (the instance is left unloaded if it fails).
     let full = current
@@ -2296,8 +2752,9 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
         c.loaded_kind = None;
         c.epoch += 1;
     }
-    // SAFETY: as for the unload above.
-    let _guard = match unsafe { ContextGuard::push(job.gpu.context) } {
+    // SAFETY: as for the unload above. An instance of the other memory
+    // went in `drop_revoked`.
+    let _guard = match unsafe { push_for(job.kind, job.gpu) } {
         Ok(g) => g,
         Err(e) => {
             return Outcome::Failed(Failure::new(format!(
@@ -2311,6 +2768,7 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
             Ok(i) => {
                 e.instance = Some(i);
                 e.revocation = job.revocation;
+                e.kind = Some(job.kind);
             }
             Err(err) => {
                 return Outcome::Failed(Failure {
@@ -2329,11 +2787,15 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
         background,
         params: target.stage_params(),
     };
-    let result = e
-        .instance
-        .as_mut()
-        .expect("created above")
-        .load(&job.gpu, &req);
+    let instance = e.instance.as_mut().expect("created above");
+    let result = match (job.kind, &job.gpu) {
+        (FrameKind::Cuda, Some(gpu)) => instance.load(gpu, &req),
+        // Not reached: the guard above needs the context.
+        (FrameKind::Cuda, None) => Err(BackendError::InvalidInput(
+            "the effect has no CUDA context".into(),
+        )),
+        (FrameKind::Host, _) => instance.load_host(&req),
+    };
     match result {
         Ok(report) => {
             e.loaded = Some(key);
@@ -2521,8 +2983,8 @@ impl ElementImpl for ObcEffect {
                 "omarchy-broadcast effect",
                 "Filter/Effect/Video/Hardware",
                 "Background blur or replacement, and stackable stages such as video noise \
-                 removal, on NV12 CUDA frames through an inference backend; passthrough \
-                 without either",
+                 removal, on NV12 frames in CUDA or system memory through an inference \
+                 backend; passthrough without either",
                 "Raul Dias",
             )
         });
@@ -2531,10 +2993,20 @@ impl ElementImpl for ObcEffect {
 
     fn pad_templates() -> &'static [gst::PadTemplate] {
         static TEMPLATES: LazyLock<Vec<gst::PadTemplate>> = LazyLock::new(|| {
-            let caps = gst::Caps::builder("video/x-raw")
-                .features(["memory:CUDAMemory"])
+            // CUDA memory first (the preferred path), then system memory.
+            // Any size: in system memory a frame the element writes must be
+            // of even width and height, as the pipeline's canonical sizes
+            // are; an odd one fails the stream (see "System memory" in the
+            // module docs).
+            let mut caps = gst::Caps::builder("video/x-raw")
+                .features([cuda::MEMORY_FEATURE])
                 .field("format", "NV12")
                 .build();
+            caps.merge(
+                gst::Caps::builder("video/x-raw")
+                    .field("format", "NV12")
+                    .build(),
+            );
             vec![
                 gst::PadTemplate::new(
                     "sink",
@@ -2625,12 +3097,20 @@ impl BaseTransformImpl for ObcEffect {
     fn set_caps(&self, incaps: &gst::Caps, _outcaps: &gst::Caps) -> Result<(), gst::LoggableError> {
         let info = VideoInfo::from_caps(incaps)
             .map_err(|e| gst::loggable_error!(CAT, "caps {incaps}: {e}"))?;
-        let format = Format::of(&info);
+        let cuda = incaps
+            .features(0)
+            .is_some_and(|f| f.contains(cuda::MEMORY_FEATURE));
+        let format = Format::of(&info, cuda);
         {
             let mut st = lock(&self.stream);
             if st.caps.as_ref() != Some(incaps)
                 && let Some(gpu) = st.gpu.as_mut()
                 && let Some(pool) = gpu.pool.take()
+            {
+                let _ = pool.set_active(false);
+            }
+            if st.caps.as_ref() != Some(incaps)
+                && let Some(pool) = st.host_pool.take()
             {
                 let _ = pool.set_active(false);
             }
@@ -2716,11 +3196,16 @@ impl BaseTransformImpl for ObcEffect {
                 None => st.resend = false,
             }
         }
-        let Some(pool) = st.gpu.as_ref().and_then(|g| g.pool.as_ref()) else {
+        let (pool, memory) = if st.format.as_ref().is_some_and(|f| !f.cuda) {
+            (st.host_pool.as_ref(), "system-memory")
+        } else {
+            (st.gpu.as_ref().and_then(|g| g.pool.as_ref()), "CUDA")
+        };
+        let Some(pool) = pool else {
             gst::element_imp_error!(
                 self,
                 gst::CoreError::Failed,
-                ["the effect has no CUDA buffer pool to write black or processed frames"]
+                ["the effect has no {memory} buffer pool to write black or processed frames"]
             );
             return Err(gst::FlowError::Error);
         };
@@ -2728,7 +3213,7 @@ impl BaseTransformImpl for ObcEffect {
             gst::error!(
                 CAT,
                 imp = self,
-                "no output buffer from the CUDA pool: {e:?}"
+                "no output buffer from the {memory} pool: {e:?}"
             );
         })?;
         drop(st);
@@ -2853,7 +3338,21 @@ impl ObcEffect {
         let needs_gpu = action != FrameAction::Passthrough
             || (shown == EffectKind::None && (stages || kind != EffectKind::None));
         let mut st = lock(&self.stream);
-        if needs_gpu && let Err(reason) = self.ensure_gpu(&mut st, inbuf) {
+        // System memory needs no CUDA: only the output pool, and only for a
+        // frame the element writes (the worker loads without anything).
+        let host = st.format.as_ref().is_some_and(|f| !f.cuda);
+        let ready = if host {
+            if action != FrameAction::Passthrough {
+                self.ensure_host(&mut st)
+            } else {
+                Ok(())
+            }
+        } else if needs_gpu {
+            self.ensure_gpu(&mut st, inbuf)
+        } else {
+            Ok(())
+        };
+        if let Err(reason) = ready {
             drop(st);
             if kind == EffectKind::None {
                 // Only the stages needed CUDA: drop them, pass through.
@@ -2959,6 +3458,7 @@ mod tests {
             height: 48,
             colour: Ok(ColourSpec::LIMITED_BT601),
             black: ColourSpec::LIMITED_BT601,
+            cuda: true,
         });
         assert_eq!(c.fallback_path(), Some(&path));
         let first = key_now(&c, &path).unwrap();

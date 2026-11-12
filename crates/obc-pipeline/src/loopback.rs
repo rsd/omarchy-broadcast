@@ -1009,11 +1009,11 @@ mod tests {
     use obc_core::{AspectPolicy, ColourRange, OutputFormat};
 
     use super::*;
-    use crate::frame::FrameMemory;
     use crate::ingest::Ingest;
     use crate::output::{Output, OutputConfig};
     use crate::session::Session;
     use crate::test_support::require_elements;
+    use obc_core::config::VideoMemory;
 
     const ELEMENTS: &[&str] = &[
         "appsrc",
@@ -1718,7 +1718,7 @@ mod tests {
         let w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
         let o = Output::build_in(
             OutputConfig::new(contract, OutputSink::Writer(w.handle())),
-            FrameMemory::System,
+            VideoMemory::System,
         )
         .unwrap();
         let sink = o.pipeline().element(names::LOOPBACK).unwrap();
@@ -1733,7 +1733,7 @@ mod tests {
         assert!(matches!(
             Output::build_in(
                 OutputConfig::new(other, OutputSink::Writer(w.handle())),
-                FrameMemory::System,
+                VideoMemory::System,
             ),
             Err(PipelineError::Caps(_))
         ));
@@ -1769,7 +1769,7 @@ mod tests {
 
         let output = Output::build_in(
             OutputConfig::new(contract, OutputSink::Writer(w.handle())),
-            FrameMemory::System,
+            VideoMemory::System,
         )
         .unwrap();
         let mut session = Session::new(output).unwrap();

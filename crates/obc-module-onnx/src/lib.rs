@@ -42,7 +42,11 @@
 //! * `ort_library`: the ONNX Runtime library (`$ORT_DYLIB_PATH` wins);
 //! * `model_dir`: the first model directory searched ([`model_files`]);
 //! * `threads`: the CPU threads of a session (default 4);
-//! * `_host`: the daemon's, accepted and ignored.
+//! * `_host`: the daemon's. `compute_capability` is accepted and ignored.
+//!   `{"_host": {"cuda": false}}` (the video pipeline runs in system
+//!   memory) makes the module make no CUDA call: `auto` skips TensorRT and
+//!   CUDA, an explicit `tensorrt` or `cuda` engine fails the load, and a
+//!   chain of CUDA frames is refused. Absent or `true`: CUDA as usual.
 //!
 //! # Failures
 //!
@@ -118,6 +122,14 @@ struct Config {
     _host: Option<serde_json::Value>,
 }
 
+/// Whether the host's reserved `_host` key leaves CUDA on: only an explicit
+/// `"cuda": false` turns it off.
+fn host_allows_cuda(host: Option<&serde_json::Value>) -> bool {
+    host.and_then(|h| h.get("cuda"))
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+}
+
 /// The module's settings.
 pub fn settings() -> SettingsDescription {
     let bound = |s: Setting, key: &str| {
@@ -156,6 +168,8 @@ struct Shared {
     model_dirs: Vec<PathBuf>,
     threads: usize,
     caches: Caches,
+    /// False when the host turned CUDA off (`_host.cuda`).
+    cuda: bool,
 }
 
 /// The module.
@@ -181,6 +195,7 @@ impl Module for OnnxModule {
                 )));
             }
         };
+        let cuda = host_allows_cuda(config._host.as_ref());
         let library = runtime::library_source(
             std::env::var_os(runtime::DYLIB_ENV),
             config.ort_library.as_deref(),
@@ -189,7 +204,8 @@ impl Module for OnnxModule {
             model_files::search_dirs(config.model_dir.as_deref(), |n| std::env::var_os(n));
         let caches = Caches::from_env(|n| std::env::var_os(n));
         log::debug!(
-            "ONNX cut-out: runtime {library:?}, model directories {model_dirs:?}, {threads} threads"
+            "ONNX cut-out: runtime {library:?}, model directories {model_dirs:?}, {threads} threads, CUDA {}",
+            if cuda { "allowed" } else { "off" }
         );
         Ok(OnnxModule {
             shared: Arc::new(Shared {
@@ -197,6 +213,7 @@ impl Module for OnnxModule {
                 model_dirs,
                 threads,
                 caches,
+                cuda,
             }),
         })
     }
@@ -220,7 +237,7 @@ impl Module for OnnxModule {
                 format!("No cut-out model installed (searched: {})", dirs.join(", ")),
             );
         }
-        for (engine, reason) in engine::static_reasons(&library) {
+        for (engine, reason) in engine::static_reasons(&library, self.shared.cuda) {
             log::info!("ONNX cut-out: {} unavailable: {reason}", engine.label());
         }
         ProbeReport::new().available(STAGE)
@@ -239,10 +256,12 @@ impl Module for OnnxModule {
             return Ok(());
         }
         let rt = runtime::runtime(&self.shared.library).map_err(Error::unavailable)?;
-        let statics = engine::static_reasons(&rt.library);
+        let statics = engine::static_reasons(&rt.library, self.shared.cuda);
         for e in engine::AUTO_ORDER {
             let name = e.provider().expect("a concrete engine");
-            let line = if !rt.has_provider(name) {
+            let line = if e.uses_cuda() && !self.shared.cuda {
+                format!("unavailable: {}", engine::REASON_CUDA_OFF)
+            } else if !rt.has_provider(name) {
                 format!("unavailable: {}", engine::REASON_NOT_IN_BUILD)
             } else if let Some((_, r)) = statics.iter().find(|(s, _)| *s == e) {
                 format!("unavailable: {r}")
@@ -529,6 +548,12 @@ impl OnnxInstance {
         let s = &self.shared;
         let model = model_files::resolve(req.model, &s.model_dirs).map_err(Error::unavailable)?;
         let rt = runtime::runtime(&s.library).map_err(Error::unavailable)?;
+        if req.kind == FrameKind::Cuda && !s.cuda {
+            return Err(Error::unsupported(format!(
+                "CUDA frames are not supported: {}",
+                engine::REASON_CUDA_OFF
+            )));
+        }
         // Recorded before any session is made, dropped after it.
         let frames = cuda::FramesContext::register(match req.kind {
             FrameKind::Cuda => req.cuda.0,
@@ -548,6 +573,7 @@ impl OnnxInstance {
             threads: s.threads,
             caches: &s.caches,
             switch: self.chain.is_some(),
+            cuda: s.cuda,
         };
         let (started, _reasons) =
             engine::start(&engine_req, req.engine).map_err(Error::unavailable)?;
@@ -857,6 +883,17 @@ mod tests {
         .unwrap();
         assert_eq!(m.shared.threads, 2);
         assert_eq!(m.shared.model_dirs[0], PathBuf::from("/m"));
+        assert!(m.shared.cuda);
+        for (host, cuda) in [
+            (json!({"cuda": false}), false),
+            (json!({"cuda": false, "compute_capability": [12, 0]}), false),
+            (json!({"cuda": true}), true),
+            (json!({}), true),
+            (json!({"cuda": "no"}), true),
+        ] {
+            let m = OnnxModule::init(json!({"_host": host})).unwrap();
+            assert_eq!(m.shared.cuda, cuda, "{host}");
+        }
         assert!(OnnxModule::init(json!({"nope": 1})).is_err());
         assert!(OnnxModule::init(json!({"threads": 0})).is_err());
     }

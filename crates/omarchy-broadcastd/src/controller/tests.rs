@@ -9262,6 +9262,7 @@ fn the_schema_has_the_module_rows_and_follows_the_modules_found() {
         [
             "camera",
             "output",
+            "video",
             "loopback",
             "lifecycle",
             "effect",
@@ -13815,4 +13816,583 @@ fn a_restored_backend_reads_as_loading_not_as_missing() {
     assert_eq!(h.world().shown(), Some(Shown::Effect));
     assert_eq!(h.snap().warning, "");
     assert_eq!(h.snap().error, "");
+}
+
+// ---- the video memory (system memory without CUDA) ----
+
+use obc_module_host::registry::{REASON_CUDA_OFF, REASON_NEEDS_CUDA};
+
+const NO_DRIVER: &str = "no NVIDIA driver is loaded";
+/// The CUDA output's error for want of CUDA, as the fake reports it.
+const NO_CUDADOWNLOAD: &str =
+    "output pipeline: GStreamer element \"cudadownload\" is unavailable (no such element)";
+const HOST_CUTOUT: &str = "org.example.cutout";
+
+/// A cut-out module that takes CUDA and host frames, as the ONNX one does.
+fn host_cutout() -> (
+    obc_module_host::discovery::ModuleEntry,
+    Result<crate::backend::OpenedModule, String>,
+) {
+    (
+        crate::modules::testing::entry(
+            &format!(
+                "abi = 1\nid = \"{HOST_CUTOUT}\"\nname = \"Cut-out\"\nversion = \"1\"\n\
+                 licence = \"MIT\"\nkind = \"video-stage\"\nlibrary = \"/m/cutout.so\"\n\
+                 [[stage]]\nid = \"background\"\nslot = \"matte\"\nrank = 100\n\
+                 device = \"cpu\"\nframes = [\"cuda\", \"host\"]\nformats = [\"nv12\"]\n"
+            ),
+            "/m/cutout.toml",
+        ),
+        Ok(crate::backend::OpenedModule {
+            module: None,
+            stages: vec![(StageId::BACKGROUND, Availability::Installed)],
+            settings: Default::default(),
+        }),
+    )
+}
+
+/// A module of `stage` that takes CUDA frames only, as the Maxine ones do.
+fn cuda_module(
+    id: &str,
+    stage: StageId,
+    slot: &str,
+) -> (
+    obc_module_host::discovery::ModuleEntry,
+    Result<crate::backend::OpenedModule, String>,
+) {
+    (
+        crate::modules::testing::entry(
+            &format!(
+                "abi = 1\nid = \"{id}\"\nname = \"GPU {stage}\"\nversion = \"1\"\n\
+                 licence = \"MIT\"\nkind = \"video-stage\"\nlibrary = \"/m/{id}.so\"\n\
+                 [[stage]]\nid = \"{stage}\"\nslot = \"{slot}\"\nrank = 100\n\
+                 device = \"nvidia-gpu\"\nframes = [\"cuda\"]\nformats = [\"nv12\"]\n"
+            ),
+            &format!("/m/{id}.toml"),
+        ),
+        Ok(crate::backend::OpenedModule {
+            module: None,
+            stages: vec![(stage, Availability::Installed)],
+            settings: Default::default(),
+        }),
+    )
+}
+
+impl H {
+    /// The configuration module `id` was last opened with.
+    fn opened_with(&self, id: &str) -> serde_json::Value {
+        self.world()
+            .module_opens
+            .iter()
+            .rev()
+            .find(|(m, _)| m == id)
+            .map(|(_, c)| c.clone())
+            .unwrap_or_else(|| panic!("{id} was never opened"))
+    }
+
+    /// The times module `id` was opened.
+    fn opens_of(&self, id: &str) -> usize {
+        self.world()
+            .module_opens
+            .iter()
+            .filter(|(m, _)| m == id)
+            .count()
+    }
+
+    /// Stage `stage` of module `module` as `GetModules` lists it:
+    /// (available, reason).
+    fn stage_listed(&mut self, module: &str, stage: &str) -> (bool, String) {
+        let list = self.modules();
+        let m = list.find(module).unwrap_or_else(|| panic!("no {module}"));
+        let s = m
+            .stages
+            .iter()
+            .find(|s| s.id == stage)
+            .unwrap_or_else(|| panic!("{module} lists no {stage}"));
+        (s.available, s.reason.clone())
+    }
+}
+
+#[test]
+fn auto_without_usable_cuda_runs_in_system_memory_with_no_cuda_call() {
+    let mut h = H::new("", |w| {
+        w.cuda_unusable = Some(NO_DRIVER.into());
+        w.modules = vec![host_cutout()];
+    });
+    // Said once, from the start (the modules are opened for it).
+    let lines = crate::log::take_lines();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("video memory: "))
+            .collect::<Vec<_>>(),
+        [&format!("video memory: system (auto: {NO_DRIVER})")],
+        "{lines:?}"
+    );
+    // CUDA-only stages are unavailable with the reason; the cut-out falls
+    // to the module that takes host frames.
+    assert_eq!(
+        h.stage_listed(MAXINE_MODULE, "denoise"),
+        (false, REASON_NEEDS_CUDA.to_string())
+    );
+    assert!(h.stage_listed(HOST_CUTOUT, "background").0);
+    // Every module is told CUDA is off.
+    for id in [MAXINE_MODULE, HOST_CUTOUT] {
+        assert_eq!(h.opened_with(id)["_host"]["cuda"], false, "{id}");
+    }
+    // The config row says which memory is in force, and why.
+    assert_eq!(
+        h.row("video.memory").description,
+        format!("Now: system memory, {NO_DRIVER}. Applies at the next camera start.")
+    );
+    h.activate_then_idle(0);
+    let w = h.world();
+    assert_eq!(w.start_memories, [VideoMemory::System]);
+    // No CUDA call anywhere: nothing unparked, built on the GPU or parked,
+    // and the compute capability never read.
+    assert_eq!((w.parks, w.unparks), (0, 0));
+    assert!(w.gpu_log.is_empty(), "{:?}", w.gpu_log);
+    assert!(!w.cuda_initialised);
+    assert_eq!(w.cc_reads, 0);
+}
+
+#[test]
+fn a_session_in_system_memory_plans_nothing_that_takes_cuda_frames() {
+    let mut h = H::new("", |w| {
+        w.cuda_unusable = Some(NO_DRIVER.into());
+        w.modules = vec![host_cutout()];
+    });
+    h.activate(0);
+    let params = h.session_params();
+    assert_eq!(params.memory, VideoMemory::System);
+    // The cut-out from the module that takes host frames; no enhancer
+    // (the Maxine module declares one, for CUDA frames only).
+    assert_eq!(
+        params.backends.effect.as_ref().map(|c| c.id.as_str()),
+        Some(HOST_CUTOUT)
+    );
+    assert!(params.backends.enhance.is_none());
+    assert!(!params.effect.enhance);
+    assert_eq!(h.world().ingest_enhance, [false]);
+    // In CUDA memory the Maxine module is the enhancer, as before.
+    let mut h = H::new("", |w| w.modules = vec![host_cutout()]);
+    h.activate(0);
+    let params = h.session_params();
+    assert_eq!(params.memory, VideoMemory::Cuda);
+    assert_eq!(
+        params.backends.enhance.as_ref().map(|c| c.id.as_str()),
+        Some(MAXINE_MODULE)
+    );
+    assert!(h.opened_with(MAXINE_MODULE)["_host"].get("cuda").is_none());
+}
+
+#[test]
+fn system_memory_set_in_the_configuration_gives_the_cuda_off_reason() {
+    let mut h = H::new("[video]\nmemory = \"system\"\n", |_| {});
+    assert_eq!(
+        h.stage_listed(MAXINE_MODULE, "denoise"),
+        (false, REASON_CUDA_OFF.to_string())
+    );
+    assert_eq!(h.opened_with(MAXINE_MODULE)["_host"]["cuda"], false);
+    assert_eq!(
+        h.row("video.memory").description,
+        "Now: system memory, set in the configuration. Applies at the next camera start."
+    );
+    h.activate(0);
+    let w = h.world();
+    assert_eq!(w.start_memories, [VideoMemory::System]);
+    // An explicit choice needs no probe.
+    assert_eq!(w.cuda_probes, 0);
+}
+
+#[test]
+fn cuda_set_in_the_configuration_never_falls_back() {
+    let mut h = H::new("[video]\nmemory = \"cuda\"\n", |w| {
+        // The probe is not even asked.
+        w.cuda_unusable = Some(NO_DRIVER.into());
+        w.fail_start_no_cuda = Some(NO_CUDADOWNLOAD.into());
+    });
+    assert!(h.stage_listed(MAXINE_MODULE, "denoise").0);
+    h.activate_expecting_error();
+    assert_eq!(h.snap().error, NO_CUDADOWNLOAD);
+    let w = h.world();
+    assert!(!w.start_memories.is_empty());
+    assert!(
+        w.start_memories.iter().all(|m| *m == VideoMemory::Cuda),
+        "{:?}",
+        w.start_memories
+    );
+    assert_eq!(w.cuda_probes, 0);
+    // Not parked after a start that failed for want of CUDA.
+    assert_eq!(w.park_calls, 0);
+}
+
+#[test]
+fn auto_falls_back_to_system_memory_once_when_the_cuda_output_wants_cuda() {
+    let mut h = H::new("", |w| {
+        w.fail_start_no_cuda = Some(NO_CUDADOWNLOAD.into());
+    });
+    crate::log::take_lines();
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Active, "{:?}", h.snap());
+    assert_eq!(h.snap().error, "");
+    assert_eq!(
+        h.world().start_memories,
+        [VideoMemory::Cuda, VideoMemory::System],
+        "retried at once, in system memory"
+    );
+    assert_eq!(h.session_params().memory, VideoMemory::System);
+    // Nothing published in between: `starting`, then `active`.
+    assert!(!h.states().contains(&State::Error));
+    // One warning, with the CUDA error; the new memory said once.
+    let lines = crate::log::take_lines();
+    let warnings: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("warning: ") && l.contains(NO_CUDADOWNLOAD))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{lines:?}");
+    let said: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("video memory: "))
+        .collect();
+    assert_eq!(said.len(), 1, "{lines:?}");
+    assert!(said[0].starts_with("video memory: system (auto: CUDA could not start"));
+    // The retry is the same start: announced once.
+    let starting = lines
+        .iter()
+        .filter(|l| l.ends_with("an application opened the virtual camera: starting"))
+        .count();
+    assert_eq!(starting, 1, "{lines:?}");
+    // The modules were opened again with CUDA off before the retry.
+    assert_eq!(h.opened_with(MAXINE_MODULE)["_host"]["cuda"], false);
+    // No park was asked of the driver, for the failed CUDA start nor for
+    // the system-memory session (CUDA was initialised all the same).
+    {
+        let w = h.world();
+        assert!(w.cuda_initialised);
+        assert_eq!((w.park_calls, w.parks, w.unparks), (0, 0, 0));
+        assert!(w.gpu_log.is_empty(), "{:?}", w.gpu_log);
+    }
+    // The stages follow, with the reason of auto.
+    assert_eq!(
+        h.stage_listed(MAXINE_MODULE, "denoise"),
+        (false, REASON_NEEDS_CUDA.to_string())
+    );
+    assert!(
+        h.row("video.memory")
+            .description
+            .starts_with("Now: system memory, CUDA could not start"),
+    );
+    // Until the next reload: the next start is in system memory at once.
+    h.consumers(0, 1000);
+    h.tick(6000);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(
+        h.world().park_calls,
+        0,
+        "a system-memory stop parks nothing"
+    );
+    h.activate(10_000);
+    assert_eq!(
+        h.world().start_memories,
+        [VideoMemory::Cuda, VideoMemory::System, VideoMemory::System]
+    );
+    // A reload ends it; CUDA works again.
+    h.consumers(0, 11_000);
+    h.tick(16_000);
+    h.world().fail_start_no_cuda = None;
+    h.reload("", 17_000).unwrap();
+    assert!(h.stage_listed(MAXINE_MODULE, "denoise").0);
+    h.activate(20_000);
+    assert_eq!(h.session_params().memory, VideoMemory::Cuda);
+    assert_eq!(h.world().start_memories.last(), Some(&VideoMemory::Cuda));
+}
+
+#[test]
+fn the_fallback_to_system_memory_is_tried_once_only() {
+    let mut h = H::new("", |w| {
+        w.fail_start_no_cuda = Some(NO_CUDADOWNLOAD.into());
+        // Fails in system memory too.
+        w.fail_start = Some("output pipeline: busy".into());
+    });
+    h.activate_expecting_error();
+    assert_eq!(h.snap().error, "output pipeline: busy");
+    let w = h.world();
+    assert_eq!(w.start_memories[0], VideoMemory::Cuda);
+    assert_eq!(
+        w.start_memories
+            .iter()
+            .filter(|m| **m == VideoMemory::Cuda)
+            .count(),
+        1,
+        "{:?}",
+        w.start_memories
+    );
+    assert!(w.start_memories.len() <= 3, "{:?}", w.start_memories);
+}
+
+#[test]
+fn an_unpark_failure_never_falls_back_to_system_memory() {
+    let mut h = H::new("", |_| {});
+    h.activate_then_idle(0);
+    h.world().fail_unpark = Some("cuCheckpointProcessRestore failed".into());
+    h.activate_expecting_error();
+    assert!(
+        h.snap()
+            .error
+            .starts_with("the GPU could not be restored from its parked state"),
+        "{}",
+        h.snap().error
+    );
+    let w = h.world();
+    assert!(
+        w.start_memories.iter().all(|m| *m == VideoMemory::Cuda),
+        "{:?}",
+        w.start_memories
+    );
+    assert!(w.parked, "still parked");
+}
+
+#[test]
+fn a_contract_fault_never_falls_back_to_system_memory() {
+    let mut h = H::new("", |w| {
+        w.fail_start = Some("output pipeline: invalid caps".into());
+        w.fail_start_contract = true;
+    });
+    h.activate_expecting_error();
+    assert!(
+        h.world()
+            .start_memories
+            .iter()
+            .all(|m| *m == VideoMemory::Cuda)
+    );
+}
+
+#[test]
+fn no_generated_output_mode_is_offered_in_system_memory() {
+    let generated = |h: &mut H| {
+        let row = h.row("output.mode");
+        let obc_ipc::ConfigKind::Enum { options } = &row.kind else {
+            panic!("{:?}", row.kind)
+        };
+        options.iter().any(|(_, l)| l.ends_with("(generated)"))
+    };
+    let fg = || {
+        cuda_module(
+            "org.example.gpu-fg",
+            StageId::new(FRAME_GENERATION).unwrap(),
+            "post-composite",
+        )
+    };
+    // In CUDA memory a frame generation module offers the doubled rates.
+    let mut h = H::new("", |w| {
+        w.cameras = vec![brio_cam()];
+        w.modules = vec![fg()];
+    });
+    assert!(generated(&mut h));
+    assert!(
+        h.row("output.mode")
+            .description
+            .contains("frame generation")
+    );
+    // Not in system memory, and the row does not mention it.
+    let mut h = H::new("[video]\nmemory = \"system\"\n", |w| {
+        w.cameras = vec![brio_cam()];
+        w.modules = vec![fg()];
+    });
+    assert!(!generated(&mut h));
+    assert_eq!(
+        h.row("output.mode").description,
+        "Size and frame rate of the virtual camera."
+    );
+    // A doubled rate configured stays in force: it repeats frames, with
+    // the warning, and frame generation is not planned.
+    let mut h = H::new(
+        "[video]\nmemory = \"system\"\n[output]\nmode = \"1920x1080@60\"\n",
+        |w| w.modules = vec![fg()],
+    );
+    h.activate(0);
+    assert!(
+        chains_of(&h)
+            .iter()
+            .all(|(_, stages)| stages.iter().all(|(id, _)| id != FRAME_GENERATION))
+    );
+    assert_eq!(
+        h.snap().warning,
+        "60 fps output repeats frames: no frame generation available"
+    );
+}
+
+#[test]
+fn a_memory_change_applies_at_the_next_camera_start() {
+    let mut h = H::new("", |_| {});
+    h.activate(0);
+    assert_eq!(h.session_params().memory, VideoMemory::Cuda);
+    let opens = h.opens_of(MAXINE_MODULE);
+    crate::log::take_lines();
+    // Set to system memory under a running session: said, not applied.
+    h.reload("[video]\nmemory = \"system\"\n", 1000).unwrap();
+    let lines = crate::log::take_lines();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "video memory: system (set in the configuration)"),
+        "{lines:?}"
+    );
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.session_params().memory, VideoMemory::Cuda);
+    assert_eq!(h.world().session_starts, 1, "the session is not restarted");
+    // The running session's modules keep their memory too.
+    assert!(h.stage_listed(MAXINE_MODULE, "denoise").0);
+    assert_eq!(h.opens_of(MAXINE_MODULE), opens);
+    // At the next start: system memory, the modules opened again with CUDA
+    // off, and no unpark (the GPU stays parked from the CUDA session).
+    h.consumers(0, 2000);
+    h.tick(8000);
+    assert_eq!(h.state(), State::Idle);
+    assert!(h.world().parked);
+    // Once it stopped, the modules follow the memory the row says is in
+    // force: re-opened with CUDA off, their stages unavailable for it.
+    assert_eq!(h.opens_of(MAXINE_MODULE), opens + 1);
+    assert_eq!(h.opened_with(MAXINE_MODULE)["_host"]["cuda"], false);
+    assert_eq!(
+        h.stage_listed(MAXINE_MODULE, "denoise"),
+        (false, REASON_CUDA_OFF.to_string())
+    );
+    assert!(
+        h.row("video.memory")
+            .description
+            .starts_with("Now: system memory, set in the configuration")
+    );
+    h.activate(10_000);
+    assert_eq!(h.session_params().memory, VideoMemory::System);
+    assert_eq!(h.opens_of(MAXINE_MODULE), opens + 1);
+    assert_eq!(h.opened_with(MAXINE_MODULE)["_host"]["cuda"], false);
+    assert_eq!(
+        h.stage_listed(MAXINE_MODULE, "denoise"),
+        (false, REASON_CUDA_OFF.to_string())
+    );
+    let w = h.world();
+    assert!(w.parked, "a system-memory session leaves the GPU parked");
+    assert_eq!((w.parks, w.unparks), (1, 0));
+    assert_eq!(w.gpu_log, ["build", "park"]);
+}
+
+#[test]
+fn the_output_modes_follow_the_running_session_memory() {
+    let generated = |h: &mut H| {
+        let row = h.row("output.mode");
+        let obc_ipc::ConfigKind::Enum { options } = &row.kind else {
+            panic!("{:?}", row.kind)
+        };
+        options.iter().any(|(_, l)| l.ends_with("(generated)"))
+    };
+    let mut h = H::new("", |w| {
+        w.cameras = vec![brio_cam()];
+        w.modules = vec![cuda_module(
+            "org.example.gpu-fg",
+            StageId::new(FRAME_GENERATION).unwrap(),
+            "post-composite",
+        )];
+    });
+    h.activate(0);
+    assert!(generated(&mut h));
+    // System memory set under a CUDA session: that session can still make
+    // the doubled rates, until it stops.
+    h.reload("[video]\nmemory = \"system\"\n", 1000).unwrap();
+    assert_eq!(h.session_params().memory, VideoMemory::Cuda);
+    assert!(generated(&mut h));
+    assert!(
+        h.row("output.mode")
+            .description
+            .contains("frame generation")
+    );
+    h.consumers(0, 2000);
+    h.tick(8000);
+    assert_eq!(h.state(), State::Idle);
+    assert!(!generated(&mut h));
+    assert_eq!(
+        h.row("output.mode").description,
+        "Size and frame rate of the virtual camera."
+    );
+}
+
+#[test]
+fn in_system_memory_with_only_a_cuda_cut_out_the_effect_follows_on_failure() {
+    // Only the Maxine module, whose cut-out takes CUDA frames only: it is
+    // never handed to the effect element, and `Warning` is the one of an
+    // effect no module can run, with the stage's reason.
+    for (memory, reason) in [
+        ("[video]\nmemory = \"system\"\n", REASON_CUDA_OFF),
+        ("", REASON_NEEDS_CUDA),
+    ] {
+        let why = format!("NVIDIA Maxine video effects: {reason}");
+        for on_failure in ON_FAILURE {
+            let config = format!("{memory}{}", blur_with(on_failure));
+            let mut h = H::new(&config, |w| {
+                if memory.is_empty() {
+                    w.cuda_unusable = Some(NO_DRIVER.into());
+                }
+            });
+            assert_eq!(
+                h.snap().warning,
+                closed(on_failure, &why),
+                "{on_failure}: known before a session starts"
+            );
+            h.activate(0);
+            assert_eq!(h.session_params().memory, VideoMemory::System);
+            assert_follows_on_failure(&h, on_failure, &why);
+            // No module code for the effect: the element has no backend.
+            assert!(
+                h.session_params().backends.effect.is_none(),
+                "{on_failure}: {:?}",
+                h.session_params().backends.effect
+            );
+            let shown = h.world().shown();
+            match on_failure {
+                "black" => assert_eq!(shown, Some(Shown::Black)),
+                "image" => assert_eq!(shown, Some(Shown::Image)),
+                // `none`: the effect is off, the camera image shown (the
+                // user's choice), as with no module at all.
+                _ => assert_eq!(shown, Some(Shown::Camera)),
+            }
+        }
+    }
+}
+
+#[test]
+fn a_system_memory_session_that_did_not_stop_cleanly_is_warned_and_never_taints() {
+    let mut h = H::new("[video]\nmemory = \"system\"\n", |_| {});
+    h.world().fail_stop = Some("output pipeline: ended in Paused, not Null".into());
+    h.activate(0);
+    h.consumers(0, 1000);
+    h.tick(7000);
+    assert_eq!(h.state(), State::Idle, "{:?}", h.snap());
+    assert_eq!(h.snap().error, "");
+    assert!(!h.fake.parking_tainted());
+    {
+        let w = h.world();
+        let warned: Vec<_> = w
+            .parker_said
+            .iter()
+            .filter(|(l, _)| *l == Level::Warning)
+            .collect();
+        assert_eq!(warned.len(), 1, "{:?}", w.parker_said);
+        assert!(
+            warned[0]
+                .1
+                .starts_with("stopping the session (system memory): ")
+                && warned[0].1.contains("ended in Paused, not Null"),
+            "{}",
+            warned[0].1
+        );
+        assert_eq!((w.park_calls, w.unparks), (0, 0));
+    }
+    // A later CUDA session still parks when it stops.
+    h.reload("", 8000).unwrap();
+    h.activate_then_idle(10_000);
+    let w = h.world();
+    assert_eq!(w.parks, 1);
+    assert_eq!(w.gpu_log, ["build", "park"]);
 }

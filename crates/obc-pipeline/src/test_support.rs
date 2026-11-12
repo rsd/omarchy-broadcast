@@ -20,6 +20,22 @@ pub(crate) fn require_elements(factories: &[&str]) {
     assert!(missing.is_empty(), "{}", missing_elements(&missing));
 }
 
+/// Fails unless no element of `pipeline` (bins included) comes from the
+/// `nvcodec` plugin or is a CUDA element: a system-memory pipeline builds
+/// where that plugin does not load.
+pub(crate) fn assert_no_cuda_element(pipeline: &gst::Pipeline) {
+    use gst::prelude::*;
+    for e in pipeline.iterate_recurse().into_iter().flatten() {
+        // appsrc and appsink are made by their builders, without a factory.
+        if let Some(factory) = e.factory() {
+            let plugin = factory.plugin_name().map(|n| n.to_string());
+            assert_ne!(plugin.as_deref(), Some("nvcodec"), "{}", e.name());
+            assert!(!factory.name().starts_with("cuda"), "{}", e.name());
+        }
+        assert!(!e.type_().name().starts_with("GstCuda"), "{}", e.name());
+    }
+}
+
 /// Why a test cannot run without the `missing` GStreamer elements.
 fn missing_elements(missing: &[&str]) -> String {
     let cuda = missing.iter().any(|f| f.starts_with("cuda"));

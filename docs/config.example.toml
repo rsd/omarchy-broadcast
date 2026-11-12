@@ -33,7 +33,7 @@
 # change it again. The keys the dialog and `omarchy-broadcast config set`
 # can change are: [camera] fixed_framerate; [output] mode, format, aspect,
 # hold_timeout_s and input_gap_ms; [lifecycle] idle_grace_s and
-# start_debounce_ms; [effect] on_failure; [pipewire] enabled and offer_nv12;
+# start_debounce_ms; [video] memory; [effect] on_failure; [pipewire] enabled and offer_nv12;
 # [mic] enabled, device, pipeline_depth, idle_exit_s and gpu_policy; and in
 # [modules] profile, enabled.<id>, forced.<id> and pin.<stage>. Everything else,
 # including the [effect] defaults (which a choice made in the panel overrides),
@@ -144,6 +144,28 @@ idle_grace_s = 5.0
 # 0 to 10000; 0 starts at once.
 # Default: 300
 start_debounce_ms = 300
+
+[video]
+# Where the video pipeline keeps its frames: "auto", "cuda" or "system".
+#   - "cuda": GPU memory, through CUDA (NVIDIA only). A camera start that
+#     cannot build the CUDA pipeline fails; it never falls back.
+#   - "system": system memory, on the CPU. No CUDA call is made by the video
+#     pipeline or by the modules, also on a machine with an NVIDIA GPU (this
+#     keeps the GPU asleep). The effects that need CUDA (the Maxine stages,
+#     frame generation and so the "(generated)" output rates) are
+#     unavailable, with the reason; the open-model cut-out and the other host
+#     modules run.
+#   - "auto": "cuda" when CUDA is usable, else "system". Usable means that
+#     CUDA_VISIBLE_DEVICES does not hide every GPU, the NVIDIA driver lists a
+#     GPU, libcuda.so.1 opens and GStreamer's CUDA elements are installed;
+#     this is found out without waking the GPU. A start that then fails for
+#     want of CUDA is tried again once in system memory, until the next
+#     reload.
+# The memory in force and why is in the log (`video memory: ...`) and in the
+# description of this key in `omarchy-broadcast config show`. A change
+# applies at the next camera start.
+# Default: "auto"
+memory = "auto"
 
 [effect]
 # Video effects run on the GPU with the NVIDIA Maxine Video Effects SDK,
