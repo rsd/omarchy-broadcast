@@ -51,6 +51,7 @@
 
 ## Consequences
 - A user with the AR SDK gets two new switches in the settings tree, in the bar and in `omarchy-broadcast settings`, with no change to the clients. Without the SDK or the models for the GPU they are greyed, with the reason.
+- The AR SDK's `libNVCVImage` exports the GCC 8 `libstdc++` it links statically. The module opens the system `libstdc++.so.6` globally before the SDK's libraries, so that one runtime serves the process. Without it, `NvAR_Load` of the face-box model could abort with `free(): invalid size` when the system runtime was loaded first, for example by GStreamer's CUDA plugins.
 - The shim of the Video Effects drop-in is process-wide, so it serves both SDKs. A machine with only the AR SDK needs the AR package's own shim and environment, and the shipped drop-in names the Video Effects package's files ([../setup/maxine.md](../setup/maxine.md#the-maxine-ar-module)).
 - Auto-framing costs detail at high zoom (above). Eye contact changes the eyes only, and only for one face.
 - The NVIDIA licence applies as for the other module: the SDK is the user's own download, is never distributed here, and no figures are published.
