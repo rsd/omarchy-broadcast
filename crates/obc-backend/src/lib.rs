@@ -82,6 +82,23 @@
 //! takes host frames ([`HostNv12`]) through the generic chain seam
 //! ([`StageChain`], [`FrameKind::Host`]); the element then downloads each
 //! frame, calls the chain and uploads the result.
+//!
+//! # Host frames for the effect
+//!
+//! When the video pipeline runs in system memory, the effect element hands
+//! the backend canonical NV12 frames in host memory instead: a factory says
+//! which memory its instances take frames in ([`BackendFactory::kinds`],
+//! CUDA alone by default), and an instance that takes host frames loads
+//! with [`InferenceBackend::load_host`], processes with
+//! [`InferenceBackend::process_host`] and forgets its temporal state with
+//! [`InferenceBackend::reset_temporal_host`]. No CUDA context exists on that
+//! path: every call on an instance loaded with `load_host` (`unload`,
+//! `is_loaded` and `timings` included) is made with no context current, and
+//! the backend must not create or make current one of its own. The defaults
+//! of the three methods refuse ([`BackendError::Unavailable`]), so a
+//! CUDA-only backend implements nothing for them. One instance is loaded on
+//! one memory at a time: the caller never mixes the CUDA and the host
+//! methods on a loaded instance.
 
 use std::borrow::{Borrow, Cow};
 use std::collections::BTreeMap;
@@ -863,7 +880,9 @@ pub enum BackendError {
 /// * calls on one instance are serialised by `&mut self`, but may come from
 ///   different threads (`load` from a worker, `process` from the streaming
 ///   thread), hence `Send`;
-/// * `process` and `load` take the same [`GpuContext`] (same stream).
+/// * `process` and `load` take the same [`GpuContext`] (same stream);
+/// * an instance loaded on host frames ([`InferenceBackend::load_host`]) is
+///   called with no context current instead, for every method.
 pub trait InferenceBackend: Send {
     /// A short name for logs (`"maxine"`).
     fn name(&self) -> &'static str;
@@ -938,6 +957,49 @@ pub trait InferenceBackend: Send {
         let _ = gpu;
         Ok(StageList::default())
     }
+
+    /// [`InferenceBackend::load`] for frames in host memory: the same
+    /// request and rules (a switch on a loaded instance, a failure that
+    /// keeps the previous chain, [`BackendError::Stage`]), with no CUDA
+    /// context (see "Host frames for the effect" in the crate docs). Called
+    /// only when the factory's [`BackendFactory::kinds`] lists
+    /// [`FrameKind::Host`]. The default refuses with
+    /// [`BackendError::Unavailable`].
+    fn load_host(&mut self, req: &LoadRequest) -> Result<LoadReport, BackendError> {
+        let _ = req;
+        Err(cuda_only(self.name()))
+    }
+
+    /// [`InferenceBackend::process`] for frames in host memory: reads `src`,
+    /// writes `dst`, both of the loaded size, before it returns. `src` is
+    /// only read: its planes may be mapped read-only, and the backend never
+    /// writes through them (the output clock may push the same input
+    /// again). `src` and `dst` never overlap. A [`BackendError::Stage`]
+    /// means what it means for `process`: the stage is dropped and `dst` is
+    /// not written. The default refuses with [`BackendError::Unavailable`].
+    fn process_host(
+        &mut self,
+        params: &FrameParams,
+        src: &HostNv12,
+        dst: &mut HostNv12,
+    ) -> Result<(), BackendError> {
+        let _ = (params, src, dst);
+        Err(cuda_only(self.name()))
+    }
+
+    /// [`InferenceBackend::reset_temporal`] for an instance loaded with
+    /// [`InferenceBackend::load_host`]: the same meaning, and the same
+    /// returned list of the stages dropped instead of reset, with no CUDA
+    /// context. The default refuses with [`BackendError::Unavailable`].
+    fn reset_temporal_host(&mut self) -> Result<StageList, BackendError> {
+        Err(cuda_only(self.name()))
+    }
+}
+
+/// What the host-frame methods of a backend that takes CUDA frames only
+/// return.
+fn cuda_only(name: &str) -> BackendError {
+    BackendError::Unavailable(format!("{name} takes CUDA frames only"))
 }
 
 /// Creates instances of one kind of backend and reports whether it can run.
@@ -951,6 +1013,14 @@ pub trait BackendFactory: Send + Sync {
 
     /// Creates an unloaded instance. Does what `probe` does, and no more.
     fn create(&self) -> Result<Box<dyn InferenceBackend>, BackendError>;
+
+    /// The memory the instances take frames in, in order of preference:
+    /// [`FrameKind::Cuda`] for [`InferenceBackend::load`] and `process`,
+    /// [`FrameKind::Host`] for [`InferenceBackend::load_host`] and
+    /// `process_host`. The default is CUDA alone. Never empty.
+    fn kinds(&self) -> &[FrameKind] {
+        &[FrameKind::Cuda]
+    }
 
     /// Checks the parameters a client sets for `stage` (`params` at load
     /// time, `live` per frame) without loading anything, with the reason if
@@ -1311,6 +1381,76 @@ mod tests {
             stream: std::ptr::null_mut(),
         };
         assert_eq!(Stateless.reset_temporal(&gpu), Ok(StageList::default()));
+    }
+
+    #[test]
+    fn a_cuda_backend_refuses_host_frames_by_default() {
+        struct CudaOnly;
+        impl InferenceBackend for CudaOnly {
+            fn name(&self) -> &'static str {
+                "cuda-only"
+            }
+            fn load(
+                &mut self,
+                _: &GpuContext,
+                _: &LoadRequest,
+            ) -> Result<LoadReport, BackendError> {
+                Ok(LoadReport::default())
+            }
+            fn process(
+                &mut self,
+                _: &GpuContext,
+                _: &FrameParams,
+                _: &DeviceNv12,
+                _: &DeviceNv12,
+            ) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn unload(&mut self) {}
+            fn timings(&self) -> Option<StageTimings> {
+                None
+            }
+        }
+        struct Factory;
+        impl BackendFactory for Factory {
+            fn name(&self) -> &'static str {
+                "cuda-only"
+            }
+            fn probe(&self) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn create(&self) -> Result<Box<dyn InferenceBackend>, BackendError> {
+                Ok(Box::new(CudaOnly))
+            }
+        }
+        assert_eq!(Factory.kinds(), &[FrameKind::Cuda]);
+        let mut b = Factory.create().unwrap();
+        let refused = BackendError::Unavailable("cuda-only takes CUDA frames only".into());
+        let req = LoadRequest {
+            effect: EffectKind::Blur,
+            stages: StageList::default(),
+            width: 4,
+            height: 2,
+            colour: ColourSpec::default(),
+            background: None,
+            params: BTreeMap::new(),
+        };
+        assert_eq!(b.load_host(&req), Err(refused.clone()));
+        let (mut y, mut uv) = (vec![0u8; 8], vec![0u8; 4]);
+        let mut frame = || HostNv12 {
+            y: y.as_mut_ptr(),
+            y_pitch: 4,
+            uv: uv.as_mut_ptr(),
+            uv_pitch: 4,
+            width: 4,
+            height: 2,
+        };
+        let (src, mut dst) = (frame(), frame());
+        assert_eq!(
+            b.process_host(&FrameParams::default(), &src, &mut dst),
+            Err(refused.clone())
+        );
+        assert_eq!(b.reset_temporal_host(), Err(refused));
     }
 
     #[test]

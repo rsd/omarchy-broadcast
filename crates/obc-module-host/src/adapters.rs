@@ -9,7 +9,10 @@
 //!   background image as a host BGR frame; the frame's blur strength
 //!   becomes the live parameter [`BACKGROUND_BLUR_STRENGTH`] (a float, 0 to
 //!   1). The chain is the request's pre-matte stages, `background`, then
-//!   its other stages, by the slots of the manifest.
+//!   its other stages, by the slots of the manifest. It runs on the frame
+//!   kinds the manifest's `background` declares: CUDA frames
+//!   ([`InferenceBackend::load`]) and, when `host` is listed, host frames
+//!   ([`InferenceBackend::load_host`]).
 //! * [`ModuleEnhancerFactory`]: [`EnhancerFactory`] / [`Enhancer`], for the
 //!   ingest's `enhance` stage: a 4:2:0 CUDA frame (NV12 or I420) in, an NV12
 //!   frame `scale` times as large out.
@@ -34,7 +37,8 @@
 //! the camera opens.
 //!
 //! The caller keeps the seams' CUDA rule: the context of the frames is
-//! current around every call. These adapters never touch it.
+//! current around every call on CUDA frames, and none is on host frames.
+//! These adapters never touch it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -292,6 +296,21 @@ pub struct ModuleBackendFactory {
     module: Module,
     name: &'static str,
     settings: Option<SettingsDescription>,
+    /// The frame kinds of the manifest's `background`, never empty.
+    kinds: Vec<FrameKind>,
+}
+
+/// The CUDA and host kinds of `frames`, in its order (a DMA-BUF kind is not
+/// offered yet).
+fn frame_kinds(frames: &[Frames]) -> Vec<FrameKind> {
+    frames
+        .iter()
+        .filter_map(|f| match f {
+            Frames::Cuda => Some(FrameKind::Cuda),
+            Frames::Host => Some(FrameKind::Host),
+            Frames::Dmabuf => None,
+        })
+        .collect()
 }
 
 impl ModuleBackendFactory {
@@ -301,12 +320,25 @@ impl ModuleBackendFactory {
     /// factory never calls the module for it, so no module code runs
     /// outside the crash ledger's marker. Without one every parameter is
     /// accepted.
+    ///
+    /// Its frame kinds ([`BackendFactory::kinds`]) are the CUDA and host
+    /// kinds of the manifest's `background`, in its order; CUDA alone when
+    /// the manifest lists neither.
     pub fn new(module: Module) -> ModuleBackendFactory {
         let settings = module.cached_settings();
+        let mut kinds = module
+            .manifest()
+            .stage(StageId::BACKGROUND.as_str())
+            .map(|d| frame_kinds(&d.frames))
+            .unwrap_or_default();
+        if kinds.is_empty() {
+            kinds.push(FrameKind::Cuda);
+        }
         ModuleBackendFactory {
             name: intern(module.id()),
             module,
             settings,
+            kinds,
         }
     }
 
@@ -346,7 +378,14 @@ impl BackendFactory for ModuleBackendFactory {
             name: self.name,
             slots,
             background: false,
+            host: self.kinds.contains(&FrameKind::Host),
+            kind: None,
         }))
+    }
+
+    /// The frame kinds of the manifest's `background`, in its order.
+    fn kinds(&self) -> &[FrameKind] {
+        &self.kinds
     }
 
     fn check_params(&self, stage: &StageId, params: &Params, live: &Params) -> Result<(), String> {
@@ -383,15 +422,16 @@ pub struct ModuleBackend {
     slots: BTreeMap<StageId, Slot>,
     /// Whether the loaded chain has the `background` stage.
     background: bool,
+    /// Whether the module takes host frames for the effect.
+    host: bool,
+    /// The frame kind of the loaded chain.
+    kind: Option<FrameKind>,
 }
 
-impl InferenceBackend for ModuleBackend {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn load(&mut self, gpu: &GpuContext, req: &LoadRequest) -> Result<LoadReport, BackendError> {
-        check_context(gpu)?;
+impl ModuleBackend {
+    /// The chain of `req` on frames of `kind` with the CUDA handles `cuda`
+    /// (null for host frames).
+    fn spec(&self, req: &LoadRequest, kind: u32, cuda: obc_cuda) -> ChainSpec {
         let stages = effect_chain(req, &self.slots);
         let mut params: Vec<(StageId, String, Value)> = flatten(&req.params, &stages)
             .map(|(s, k, v)| {
@@ -409,9 +449,9 @@ impl InferenceBackend for ModuleBackend {
                 Value::Str(req.effect.as_str().into()),
             ));
         }
-        let spec = ChainSpec {
+        ChainSpec {
             stages,
-            kind: OBC_FRAME_CUDA,
+            kind,
             input_format: OBC_FORMAT_NV12,
             input_size: (req.width, req.height),
             output_format: OBC_FORMAT_NV12,
@@ -419,17 +459,106 @@ impl InferenceBackend for ModuleBackend {
             matrix: matrix(req.colour.matrix),
             chroma_siting: OBC_CHROMA_SITING_MPEG2,
             full_range: req.colour.full_range,
-            cuda: cuda(gpu),
+            cuda,
             params,
             background: (req.effect == EffectKind::Replace)
                 .then(|| req.background.clone())
                 .flatten(),
-        };
-        let result = self.instance.load(&spec);
+        }
+    }
+
+    /// Loads `spec`, of frames of `kind`.
+    fn load_spec(&mut self, spec: &ChainSpec, kind: FrameKind) -> Result<LoadReport, BackendError> {
+        let result = self.instance.load(spec);
         self.background = self.instance.chain().contains(&StageId::BACKGROUND);
+        if result.is_ok() {
+            self.kind = Some(kind);
+        } else if !self.instance.is_loaded() {
+            self.kind = None;
+        }
         result
             .map(load_report)
             .map_err(|e| backend_error(e, Phase::Load))
+    }
+
+    /// The live parameters of a frame: the blur strength while the chain
+    /// has `background`, then the request's for the loaded stages.
+    fn live<'a>(
+        &self,
+        params: &'a FrameParams,
+        chain: &'a [StageId],
+        strength: &'a Value,
+    ) -> Vec<(&'a str, &'a str, &'a Value)> {
+        let mut live: Vec<(&str, &str, &Value)> = Vec::new();
+        if self.background {
+            live.push((
+                StageId::BACKGROUND.as_str(),
+                BACKGROUND_BLUR_STRENGTH,
+                strength,
+            ));
+        }
+        live.extend(flatten(&params.live, chain));
+        live
+    }
+
+    /// Forgets the temporal state of the loaded chain: the stages dropped
+    /// instead.
+    fn reset(&mut self) -> Result<StageList, BackendError> {
+        if !self.instance.is_loaded() {
+            return Ok(StageList::default());
+        }
+        let dropped = self
+            .instance
+            .reset_temporal()
+            .map_err(|e| backend_error(e, Phase::Run))?;
+        if dropped.contains(StageId::BACKGROUND.as_str()) {
+            self.background = false;
+        }
+        Ok(dropped)
+    }
+
+    /// Refuses a host call on an instance loaded on CUDA frames.
+    fn check_host(&self) -> Result<(), BackendError> {
+        check_kind(self.name, self.kind, FrameKind::Host)
+    }
+
+    /// Refuses a CUDA call on an instance loaded on host frames.
+    fn check_cuda(&self) -> Result<(), BackendError> {
+        check_kind(self.name, self.kind, FrameKind::Cuda)
+    }
+}
+
+/// Refuses a call on frames of `call` when the chain of the backend `name`
+/// is loaded for frames of the other kind (`loaded`). Nothing loaded passes:
+/// the module itself refuses a call with no chain.
+fn check_kind(name: &str, loaded: Option<FrameKind>, call: FrameKind) -> Result<(), BackendError> {
+    match loaded {
+        Some(k) if k != call => Err(BackendError::InvalidInput(format!(
+            "the {name} chain is loaded for {} frames, not {} frames",
+            kind_label(k),
+            kind_label(call)
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// A frame kind as the refusals name it.
+fn kind_label(kind: FrameKind) -> &'static str {
+    match kind {
+        FrameKind::Cuda => "CUDA",
+        FrameKind::Host => "host",
+    }
+}
+
+impl InferenceBackend for ModuleBackend {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn load(&mut self, gpu: &GpuContext, req: &LoadRequest) -> Result<LoadReport, BackendError> {
+        check_context(gpu)?;
+        let spec = self.spec(req, OBC_FRAME_CUDA, cuda(gpu));
+        self.load_spec(&spec, FrameKind::Cuda)
     }
 
     fn process(
@@ -440,19 +569,12 @@ impl InferenceBackend for ModuleBackend {
         dst: &DeviceNv12,
     ) -> Result<(), BackendError> {
         check_context(gpu)?;
+        self.check_cuda()?;
         src.validate()?;
         dst.validate()?;
         let chain = self.instance.chain().to_vec();
         let strength = Value::Float(f64::from(params.blur_strength.clamp(0.0, 1.0)));
-        let mut live: Vec<(&str, &str, &Value)> = Vec::new();
-        if self.background {
-            live.push((
-                StageId::BACKGROUND.as_str(),
-                BACKGROUND_BLUR_STRENGTH,
-                &strength,
-            ));
-        }
-        live.extend(flatten(&params.live, &chain));
+        let live = self.live(params, &chain, &strength);
         let (input, output) = (cuda_nv12(src, gpu), cuda_nv12(dst, gpu));
         // SAFETY: the seam's contract: the frames are device memory of the
         // current context, valid while the work is enqueued; the module
@@ -464,6 +586,7 @@ impl InferenceBackend for ModuleBackend {
     fn unload(&mut self) {
         self.instance.unload();
         self.background = false;
+        self.kind = None;
     }
 
     /// Whether the instance holds a chain: not after a failed full load, a
@@ -486,17 +609,49 @@ impl InferenceBackend for ModuleBackend {
 
     fn reset_temporal(&mut self, gpu: &GpuContext) -> Result<StageList, BackendError> {
         let _ = gpu;
-        if !self.instance.is_loaded() {
-            return Ok(StageList::default());
+        self.check_cuda()?;
+        self.reset()
+    }
+
+    /// The chain of [`InferenceBackend::load`] on host frames, with null
+    /// CUDA handles. Refused when the manifest's `background` does not take
+    /// host frames.
+    fn load_host(&mut self, req: &LoadRequest) -> Result<LoadReport, BackendError> {
+        if !self.host {
+            return Err(BackendError::Unavailable(format!(
+                "{} takes CUDA frames only",
+                self.name
+            )));
         }
-        let dropped = self
-            .instance
-            .reset_temporal()
-            .map_err(|e| backend_error(e, Phase::Run))?;
-        if dropped.contains(StageId::BACKGROUND.as_str()) {
-            self.background = false;
-        }
-        Ok(dropped)
+        let spec = self.spec(req, OBC_FRAME_HOST, obc_cuda::null());
+        self.load_spec(&spec, FrameKind::Host)
+    }
+
+    fn process_host(
+        &mut self,
+        params: &FrameParams,
+        src: &HostNv12,
+        dst: &mut HostNv12,
+    ) -> Result<(), BackendError> {
+        self.check_host()?;
+        src.validate()?;
+        dst.validate()?;
+        let chain = self.instance.chain().to_vec();
+        let strength = Value::Float(f64::from(params.blur_strength.clamp(0.0, 1.0)));
+        let live = self.live(params, &chain, &strength);
+        let (input, output) = (host_nv12(src), host_nv12(dst));
+        // SAFETY: the seam's contract: both frames are host memory of the
+        // loaded size, valid for the call and accessed by nothing else
+        // meanwhile; `src` and `dst` never overlap; the module only reads
+        // its input and writes its output (the ABI's rule), so the
+        // read-only planes of `src` are never written.
+        let result = unsafe { self.instance.process(&input, &output, &live) };
+        result.map_err(|e| backend_error(e, Phase::Run))
+    }
+
+    fn reset_temporal_host(&mut self) -> Result<StageList, BackendError> {
+        self.check_host()?;
+        self.reset()
     }
 }
 
@@ -995,6 +1150,32 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn a_call_on_the_other_memory_than_the_chain_is_refused() {
+        use FrameKind::{Cuda, Host};
+        let refused = |loaded, call| match check_kind("org.x.m", loaded, call) {
+            Err(BackendError::InvalidInput(m)) => Some(m),
+            Ok(()) => None,
+            Err(e) => panic!("{e:?}"),
+        };
+        assert_eq!(
+            refused(Some(Host), Cuda).as_deref(),
+            Some("the org.x.m chain is loaded for host frames, not CUDA frames")
+        );
+        assert_eq!(
+            refused(Some(Cuda), Host).as_deref(),
+            Some("the org.x.m chain is loaded for CUDA frames, not host frames")
+        );
+        for (loaded, call) in [
+            (Some(Cuda), Cuda),
+            (Some(Host), Host),
+            (None, Cuda),
+            (None, Host),
+        ] {
+            assert_eq!(refused(loaded, call), None, "{loaded:?} {call:?}");
+        }
     }
 
     #[test]

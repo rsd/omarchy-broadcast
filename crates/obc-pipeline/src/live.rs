@@ -229,9 +229,9 @@ mod tests {
     use obc_core::{AspectPolicy, OutputContract};
 
     use super::*;
-    use crate::frame::FrameMemory;
     use crate::output::{FrameOrigin, Output, OutputConfig, OutputSink};
     use crate::test_support::require_elements;
+    use obc_core::config::VideoMemory;
 
     fn tick(kind: TickKind, origin: Option<(u64, u64)>, at: Instant) -> EmitInfo {
         EmitInfo {
@@ -322,7 +322,7 @@ mod tests {
         let stats = LiveStats::new();
         let mut output = Output::build_in(
             OutputConfig::new(contract, OutputSink::Fake),
-            FrameMemory::System,
+            VideoMemory::System,
         )
         .unwrap();
         output.set_observer(Some(stats.observer()));
@@ -396,7 +396,7 @@ mod tests {
         require_elements(&["videotestsrc", "videocrop", "videoconvertscale", "appsink"]);
         let output = Output::build_in(
             OutputConfig::new("320x240@30".parse().unwrap(), OutputSink::Fake),
-            FrameMemory::System,
+            VideoMemory::System,
         )
         .unwrap();
         let ingest = Ingest::from_head(

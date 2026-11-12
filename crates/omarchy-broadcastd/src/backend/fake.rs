@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use obc_core::config::VideoMemory;
 use obc_core::{EffectMode, EffectOnFailure, ModeRequest, OutputContract, SinkSelector, VideoMode};
 use obc_gpu::{GpuError, NothingToPark, ParkError, ParkOutcome, UnparkOutcome};
 use obc_ipc::Stats;
@@ -218,6 +219,20 @@ pub struct World {
     /// With `fail_start`: the failure is the output contract's
     /// (`backend::SessionError::contract`).
     pub fail_start_contract: bool,
+    /// A start in CUDA memory fails with this, for want of CUDA
+    /// (`backend::SessionError::no_cuda`: a missing `nvcodec` element, no
+    /// CUDA context); one in system memory does not. As GStreamer's CUDA
+    /// library does, the failed start initialises CUDA all the same
+    /// (`cuda_initialised`), so a park after it would reach the driver.
+    pub fail_start_no_cuda: Option<String>,
+    /// The memory of every session start tried (the unpark refused
+    /// included), in order.
+    pub start_memories: Vec<VideoMemory>,
+    /// What the CUDA presence probe finds (`cuda_unusable`): `None`, CUDA
+    /// is usable (the default), else why not.
+    pub cuda_unusable: Option<String>,
+    /// The CUDA presence probes made.
+    pub cuda_probes: u32,
     /// The next session stop is unclean, with this (taken by that stop):
     /// a pipeline left short of NULL.
     pub fail_stop: Option<String>,
@@ -332,6 +347,9 @@ pub struct World {
     pub parked: bool,
     pub parks: u32,
     pub unparks: u32,
+    /// Every park asked of the driver, whatever it answered (with nothing
+    /// to park, already parked or failed included).
+    pub park_calls: u32,
     /// Parking fails with this (the GPU stays awake), counted in
     /// `park_failures`.
     pub fail_park: Option<String>,
@@ -433,6 +451,10 @@ impl Default for World {
             fail_start: None,
             fail_start_cleanup: None,
             fail_start_contract: false,
+            fail_start_no_cuda: None,
+            start_memories: Vec::new(),
+            cuda_unusable: None,
+            cuda_probes: 0,
             fail_start_effects: None,
             fail_stop: None,
             fail_stop_at_null: None,
@@ -485,6 +507,7 @@ impl Default for World {
             parked: false,
             parks: 0,
             unparks: 0,
+            park_calls: 0,
             fail_park: None,
             park_failures: 0,
             fail_unpark: None,
@@ -525,6 +548,7 @@ pub struct WorldGpu(Arc<Mutex<World>>);
 impl ParkOps for WorldGpu {
     fn park(&mut self) -> Result<ParkOutcome, ParkError> {
         let mut w = lock(&self.0);
+        w.park_calls += 1;
         if !w.cuda_initialised {
             return Ok(ParkOutcome::NothingToPark(NothingToPark::NotInitialised));
         }
@@ -709,10 +733,14 @@ impl World {
 /// The running session (the world's `session`), as the parker's
 /// lifecycle sees it: its stop is the world's, unclean with `fail_stop` or
 /// after an unclean switch (`session_unclean`), failed at NULL with
-/// `fail_stop_at_null`.
-struct FakeSession(Arc<Mutex<World>>);
+/// `fail_stop_at_null`. It uses CUDA unless it is in system memory.
+struct FakeSession(Arc<Mutex<World>>, VideoMemory);
 
 impl StopSession for FakeSession {
+    fn uses_cuda(&self) -> bool {
+        self.1 == VideoMemory::Cuda
+    }
+
     fn stop(self) -> Result<(), StopFailure> {
         let mut w = lock(&self.0);
         if w.session.take().is_some() {
@@ -777,8 +805,8 @@ impl FakeBackend {
 
     /// The running session, for the parker's lifecycle.
     fn running(&self) -> Option<FakeSession> {
-        let running = self.world().session.is_some();
-        running.then(|| FakeSession(Arc::clone(&self.world)))
+        let memory = self.world().session.as_ref().map(|(p, _)| p.memory);
+        memory.map(|m| FakeSession(Arc::clone(&self.world), m))
     }
 
     /// Whether the parker is tainted (a session did not stop cleanly).
@@ -950,35 +978,52 @@ impl MediaBackend for FakeBackend {
         }
         // The real parker's lifecycle: a running session stopped, the GPU
         // unparked before anything touches it, parked again if the start
-        // fails cleanly.
+        // fails cleanly; in system memory neither (`start_session_in`).
         let world = Arc::clone(&self.world);
         let mut running = self.running();
-        let contract = lock(&world).fail_start_contract;
+        let memory = params.memory;
+        let mut contract = false;
+        let mut no_cuda = false;
+        lock(&world).start_memories.push(memory);
         self.parker()
-            .start_session(&mut running, || {
+            .start_session_in(&mut running, memory, || {
                 let mut w = lock(&world);
                 let effects =
                     params.backends.effect.is_some() || !params.backends.chains.is_empty();
+                if memory == VideoMemory::Cuda
+                    && let Some(e) = w.fail_start_no_cuda.clone()
+                {
+                    no_cuda = true;
+                    w.cuda_initialised = true;
+                    return Err(StartError::from(e).for_want_of_cuda(true));
+                }
                 if let Some(e) = w
                     .fail_start
                     .clone()
                     .or_else(|| w.fail_start_effects.clone().filter(|_| effects))
                 {
+                    contract = w.fail_start_contract;
                     return Err(match w.fail_start_cleanup.clone() {
                         Some(why) => StartError::unclean(e, why),
                         None => StartError::from(e),
                     });
                 }
-                w.cuda_initialised = true;
+                if memory == VideoMemory::Cuda {
+                    w.cuda_initialised = true;
+                    w.gpu_log.push("build");
+                }
                 w.session_unclean = None;
-                w.gpu_log.push("build");
                 w.session = Some((params.clone(), None));
                 w.session_starts += 1;
                 w.effect_revoked = false;
                 w.apply_effect(&params.effect);
-                Ok(FakeSession(Arc::clone(&world)))
+                Ok(FakeSession(Arc::clone(&world), memory))
             })
-            .map_err(|message| SessionError { message, contract })
+            .map_err(|message| SessionError {
+                message,
+                contract,
+                no_cuda,
+            })
     }
 
     fn switch_camera(&mut self, params: &SessionParams, camera: &Camera) -> Result<(), String> {
@@ -1197,6 +1242,12 @@ impl MediaBackend for FakeBackend {
             Some(m) => m.probe().map_err(|e| e.message),
             None => Err("the module is not loaded".into()),
         }
+    }
+
+    fn cuda_unusable(&mut self) -> Option<String> {
+        let mut w = self.world();
+        w.cuda_probes += 1;
+        w.cuda_unusable.clone()
     }
 
     fn compute_capability(&mut self) -> Option<(u32, u32)> {

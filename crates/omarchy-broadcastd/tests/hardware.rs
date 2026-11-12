@@ -1453,6 +1453,7 @@ fn the_backend_parks_the_gpu_between_sessions_without_a_camera() {
             enhance_params: Default::default(),
         },
         backends: Default::default(),
+        memory: obc_core::config::VideoMemory::Cuda,
     };
     let mut backend = GstBackend::new(None, None).unwrap();
     backend

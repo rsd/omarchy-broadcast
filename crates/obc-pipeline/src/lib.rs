@@ -21,6 +21,13 @@
 //!   emits one frame per period (fresh, repeated, or a black placeholder),
 //!   converts to the contract format, downloads and writes to the loopback.
 //!
+//! Canonical frames live in CUDA memory by default. An output built with
+//! [`Output::build_in`] and [`obc_core::config::VideoMemory::System`] runs
+//! the same three stages in system memory instead, on the CPU, with no CUDA
+//! element and no CUDA context: the ingest scales with `videoconvertscale`,
+//! the effect element and the module stages take host frames, and the
+//! output has no download ([`frame`]).
+//!
 //! [`session::Session`] owns an output and its current ingest and switches
 //! sources without touching the output. In the daemon, the output forwards
 //! its frames to the persistent [`loopback::LoopbackWriter`], which owns the

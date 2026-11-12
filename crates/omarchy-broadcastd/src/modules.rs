@@ -8,8 +8,9 @@
 //! (in the state directory) counts the starts that found a module's code
 //! running; each enabled module is opened with its configuration (its
 //! `[module."<id>"]` table as JSON, the `[effect] maxine_root` alias for
-//! the Maxine module, and the GPU's compute capability when it is known
-//! without waking the GPU) and probed. Nothing a module does stops the
+//! the Maxine module, the GPU's compute capability when it is known
+//! without waking the GPU, and `_host.cuda = false` when the video
+//! pipeline runs in system memory) and probed. Nothing a module does stops the
 //! daemon: a missing, broken, mismatched or crashing module is listed
 //! with its reason and offers nothing. A reload keeps a module open (and
 //! probes it again) when its manifest, its library file and its
@@ -37,6 +38,14 @@
 //! applying at the next start as a pin does (`GetModules` lists it refused
 //! meanwhile, and `Warning` says so: [`Modules::held_refusal`]).
 //!
+//! The memory the next session runs in ([`HostMemory`], set at start, at
+//! a reload and at each camera start by the controller) decides what the
+//! modules offer: in system memory a stage that takes CUDA frames only is
+//! unavailable with a reason ([`Registry::set_memory`]), so the plan, the
+//! pins, the profile, the requirements and the listing follow; and every
+//! module's configuration carries `_host.cuda = false`, which re-opens it
+//! when the memory changes, as any configuration change does.
+//!
 //! The opening of libraries goes through the media backend
 //! ([`MediaBackend::open_module`]), so the controller's tests describe
 //! modules without a library.
@@ -44,15 +53,16 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use obc_core::config::{Config, RuntimeState};
+use obc_core::config::{Config, EffectiveMemory, MemoryChoice, RuntimeState, VideoMemory};
 use obc_core::modules::{BackendProfile, StoredValue};
-use obc_module_host::registry::{FRAME_GENERATION, Profile};
+use obc_module_host::registry::{FRAME_GENERATION, Profile, REASON_CUDA_OFF, REASON_NEEDS_CUDA};
 use obc_module_host::settings::{Apply, Role};
 use obc_module_host::{
     CrashLedger, ModuleStatus, Registry, SettingDesc, SettingType, SettingsDescription, Slot,
     StageResolution,
 };
 use obc_pipeline::effect::{Params, StageId, Value};
+use obc_pipeline::module::FrameKind;
 
 use crate::backend::{
     Backends, ChainRun, EffectRun, MediaBackend, Module, ModuleChoice, Placement, StageRun,
@@ -134,6 +144,8 @@ pub struct Modules {
     ledger: Option<CrashLedger>,
     /// The compute capability the modules were opened with.
     compute_capability: Option<(u32, u32)>,
+    /// The memory the modules were opened for.
+    memory: HostMemory,
     serial: u32,
     /// What `GetModules` and `GetStageOrder` returned when last counted
     /// (what bumps the serial).
@@ -161,11 +173,49 @@ impl std::fmt::Debug for Modules {
     }
 }
 
+/// Where the next session's video frames are, as the modules are told: the
+/// registry's stage availability and the `_host.cuda` key of their
+/// configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HostMemory {
+    /// CUDA memory (the default): nothing is filtered.
+    #[default]
+    Cuda,
+    /// System memory: a stage that takes CUDA frames only is unavailable
+    /// with this reason, and CUDA is off for the modules.
+    System(&'static str),
+}
+
+impl HostMemory {
+    /// The modules' view of the effective memory `m`: in system memory,
+    /// the reason is [`REASON_CUDA_OFF`] when the configuration chose it,
+    /// else [`REASON_NEEDS_CUDA`] (`auto` found no usable CUDA).
+    pub fn of(m: &EffectiveMemory) -> HostMemory {
+        match (m.memory, m.choice) {
+            (VideoMemory::Cuda, _) => HostMemory::Cuda,
+            (VideoMemory::System, MemoryChoice::System) => HostMemory::System(REASON_CUDA_OFF),
+            (VideoMemory::System, _) => HostMemory::System(REASON_NEEDS_CUDA),
+        }
+    }
+
+    /// Whether the modules are told CUDA is off.
+    pub fn cuda_off(self) -> bool {
+        matches!(self, HostMemory::System(_))
+    }
+}
+
 /// The configuration a module is opened with: its `[module."<id>"]` table
 /// as JSON (`{}` without one); for the Maxine module, `sdk_root` from
-/// `[effect] maxine_root` when the table sets none; and
-/// `_host.compute_capability` (`[major, minor]`, or null when unknown).
-pub fn module_config(config: &Config, id: &str, cc: Option<(u32, u32)>) -> serde_json::Value {
+/// `[effect] maxine_root` when the table sets none; and `_host`:
+/// `compute_capability` (`[major, minor]`, or null when unknown) and, with
+/// `cuda_off` (the video pipeline runs in system memory), `cuda: false`.
+/// The module must then make no CUDA call.
+pub fn module_config(
+    config: &Config,
+    id: &str,
+    cc: Option<(u32, u32)>,
+    cuda_off: bool,
+) -> serde_json::Value {
     let mut table = config
         .module
         .get(id)
@@ -188,10 +238,11 @@ pub fn module_config(config: &Config, id: &str, cc: Option<(u32, u32)>) -> serde
         Some((major, minor)) => serde_json::json!([major, minor]),
         None => serde_json::Value::Null,
     };
-    table.insert(
-        "_host".into(),
-        serde_json::json!({ "compute_capability": cc }),
-    );
+    let mut host = serde_json::json!({ "compute_capability": cc });
+    if cuda_off && let Some(h) = host.as_object_mut() {
+        h.insert("cuda".into(), serde_json::Value::Bool(false));
+    }
+    table.insert("_host".into(), host);
     serde_json::Value::Object(table)
 }
 
@@ -419,6 +470,7 @@ impl Modules {
             opened: BTreeMap::new(),
             ledger: None,
             compute_capability: None,
+            memory: HostMemory::Cuda,
             serial: 1,
             listed: (Vec::new(), Vec::new()),
             switches: BTreeMap::new(),
@@ -440,13 +492,14 @@ impl Modules {
     }
 
     /// Discovers, opens and probes the modules (see the module
-    /// documentation), with the crash ledger at `ledger` (`None`: none) and
-    /// the compute capability `cc` when known.
+    /// documentation), with the crash ledger at `ledger` (`None`: none),
+    /// the compute capability `cc` when known, for a session in `memory`.
     pub fn load<B: MediaBackend>(
         backend: &mut B,
         config: &Config,
         ledger: Option<&Path>,
         cc: Option<(u32, u32)>,
+        memory: HostMemory,
     ) -> Modules {
         let mut m = Modules::empty();
         m.ledger = ledger.map(|path| {
@@ -464,7 +517,7 @@ impl Modules {
             }
             l
         });
-        m.reload(backend, config, cc);
+        m.reload(backend, config, cc, memory);
         // The first list is serial 1.
         m.serial = 1;
         m.listed = m.listing();
@@ -474,12 +527,14 @@ impl Modules {
     /// Discovers the modules again, as at start (the ledger is kept, and
     /// not counted again). A module already open whose manifest (its file
     /// and content), library file and configuration are unchanged is kept
-    /// open and probed again; the others are opened anew.
+    /// open and probed again; the others are opened anew (a change of
+    /// `memory` changes every module's configuration).
     pub fn reload<B: MediaBackend>(
         &mut self,
         backend: &mut B,
         config: &Config,
         cc: Option<(u32, u32)>,
+        memory: HostMemory,
     ) {
         let dirs = module_dirs(config);
         let entries = backend.discover_modules(&dirs);
@@ -491,6 +546,8 @@ impl Modules {
         self.registry = Registry::from_entries(entries);
         let mut before = std::mem::take(&mut self.opened);
         self.compute_capability = cc;
+        self.memory = memory;
+        self.apply_memory();
         self.apply_enabled(config);
         for id in self.registry.ids() {
             match before.remove(&id) {
@@ -561,7 +618,7 @@ impl Modules {
             manifest_path: entry.manifest_path.clone(),
             manifest: manifest.clone(),
             library: FileId::of(&manifest.library),
-            config: module_config(config, id, self.compute_capability),
+            config: module_config(config, id, self.compute_capability, self.memory.cuda_off()),
         })
     }
 
@@ -624,7 +681,7 @@ impl Modules {
             return;
         }
         let from = self.opened_from(config, id);
-        let json = module_config(config, id, self.compute_capability);
+        let json = module_config(config, id, self.compute_capability, self.memory.cuda_off());
         self.ledger_begin(id);
         let res = backend.open_module(&entry, &json);
         self.ledger_end_probe(id);
@@ -647,6 +704,55 @@ impl Modules {
                 let _ = self.registry.record_probe(id, Err(e));
             }
         }
+    }
+
+    /// The registry's memory: [`Self::memory`]'s.
+    fn apply_memory(&mut self) {
+        match self.memory {
+            HostMemory::Cuda => self.registry.set_memory(FrameKind::Cuda, ""),
+            HostMemory::System(reason) => self.registry.set_memory(FrameKind::Host, reason),
+        }
+    }
+
+    /// The memory the modules were opened for.
+    pub fn memory(&self) -> HostMemory {
+        self.memory
+    }
+
+    /// The next session runs in `memory`: the registry's stage
+    /// availability follows it, and, when CUDA turns on or off for the
+    /// modules, every open module is closed and opened again with its new
+    /// configuration (`_host.cuda`). Then the module rules are followed
+    /// ([`Self::settle`]: the cut-out a module conflict keeps may be
+    /// another's now). Called with no session running (a camera start,
+    /// before its plan). Whether anything changed.
+    pub fn set_memory<B: MediaBackend>(
+        &mut self,
+        backend: &mut B,
+        config: &Config,
+        memory: HostMemory,
+    ) -> bool {
+        if memory == self.memory {
+            return false;
+        }
+        let reopen = memory.cuda_off() != self.memory.cuda_off();
+        self.memory = memory;
+        self.apply_memory();
+        if reopen {
+            // Those that failed to open are tried again too: their
+            // configuration changed.
+            for id in self.registry.ids() {
+                if self.is_held(&id) {
+                    continue;
+                }
+                self.opened.remove(&id);
+                let _ = self.registry.close(&id);
+            }
+        }
+        let _ = self.settle(backend, config);
+        self.apply_choices(config);
+        self.bump();
+        true
     }
 
     /// The profile, the pins and the stage order in force; a stored order
@@ -1100,6 +1206,17 @@ impl Modules {
         })
     }
 
+    /// [`Self::declares`], among the modules whose declaration of `stage`
+    /// takes the next session's frames
+    /// ([`Registry::declares_for_memory`]): in system memory a module that
+    /// declares it for CUDA frames only is never the one a plan falls back
+    /// to, as it could not run it however its features change.
+    fn declares_in_memory(&self, stage: &str) -> Option<&str> {
+        self.described().map(|(id, _)| id).find(|id| {
+            !self.registry.is_refused(id) && self.registry.declares_for_memory(id, stage)
+        })
+    }
+
     /// Why `module` cannot run `stage` at the next session, `None` when it
     /// can: the stage's reason, or that another module provides it.
     pub fn stage_reason(&self, module: &str, stage: &str) -> Option<String> {
@@ -1243,8 +1360,11 @@ impl Modules {
             })
         };
         let background = self.registry.resolve(StageId::BACKGROUND.as_str());
+        // Else the module that declares it, when none can run it now, so
+        // that it runs once it can (its features installed later); never
+        // one that cannot take the session's frames.
         let effect_id = background.provider.clone().or_else(|| {
-            self.declares(StageId::BACKGROUND.as_str())
+            self.declares_in_memory(StageId::BACKGROUND.as_str())
                 .map(String::from)
         });
         let effect = effect_id.as_deref().and_then(planned);
@@ -1257,7 +1377,10 @@ impl Modules {
             .registry
             .resolve(StageId::ENHANCE.as_str())
             .provider
-            .or_else(|| self.declares(StageId::ENHANCE.as_str()).map(String::from))
+            .or_else(|| {
+                self.declares_in_memory(StageId::ENHANCE.as_str())
+                    .map(String::from)
+            })
             .as_deref()
             .and_then(planned);
         let mut effect_stages = Vec::new();
@@ -1865,5 +1988,38 @@ mod tests {
         assert_eq!(s.id, obc_core::modules::legacy::DENOISE);
         assert_eq!(m.stage_label("denoise"), "noise removal");
         assert!(m.known_stages().contains(&StageId::DENOISE));
+    }
+
+    #[test]
+    fn the_host_key_says_cuda_is_off_only_in_system_memory() {
+        use obc_core::config::{Config, MemoryChoice, resolve_memory};
+
+        use super::{HostMemory, REASON_CUDA_OFF, REASON_NEEDS_CUDA, module_config};
+        let config = Config::default();
+        let cuda = module_config(&config, "org.example.m", Some((8, 9)), false);
+        assert_eq!(
+            cuda["_host"],
+            serde_json::json!({ "compute_capability": [8, 9] })
+        );
+        let host = module_config(&config, "org.example.m", None, true);
+        assert_eq!(
+            host["_host"],
+            serde_json::json!({ "compute_capability": null, "cuda": false })
+        );
+        // The reasons: auto found no CUDA, or the configuration chose
+        // system memory.
+        let of = |choice, probe| HostMemory::of(&resolve_memory(choice, probe));
+        assert_eq!(of(MemoryChoice::Auto, None), HostMemory::Cuda);
+        assert_eq!(of(MemoryChoice::Cuda, Some("x")), HostMemory::Cuda);
+        assert_eq!(
+            of(MemoryChoice::Auto, Some("no NVIDIA driver is loaded")),
+            HostMemory::System(REASON_NEEDS_CUDA)
+        );
+        assert_eq!(
+            of(MemoryChoice::System, None),
+            HostMemory::System(REASON_CUDA_OFF)
+        );
+        assert!(!HostMemory::Cuda.cuda_off());
+        assert!(HostMemory::System(REASON_CUDA_OFF).cuda_off());
     }
 }

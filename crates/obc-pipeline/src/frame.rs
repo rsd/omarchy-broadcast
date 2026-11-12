@@ -1,14 +1,22 @@
 //! Canonical frames and the handle an ingest pipeline writes them with.
 //!
 //! The **canonical frame** is what every ingest pipeline produces and the
-//! output pipeline consumes: NV12 in CUDA memory, at the processing size
-//! (the contract size), square pixels, with the contract's colour label
+//! output pipeline consumes: NV12 at the processing size (the contract
+//! size), square pixels, with the contract's colour label
 //! (`docs/adr/0009-ingest-process-output.md`). Its frame rate is whatever
 //! the source delivers; the output clock sets the rate.
+//!
+//! **Memory.** Canonical frames live in the memory the output was built
+//! for ([`VideoMemory`], [`crate::output::Output::build_in`]): CUDA memory
+//! (the default, [`crate::output::Output::build`]) or system memory, where
+//! the whole stream runs on the CPU and makes no CUDA call. Every pipeline
+//! of a session uses the same memory: an ingest takes it from the
+//! [`FrameWriter`] the output hands out.
 
 use std::sync::Arc;
 use std::time::Instant;
 
+use obc_core::config::VideoMemory;
 use obc_core::{ColourRange, OutputContract};
 
 use crate::pipeline::CUDA_MEMORY_FEATURE;
@@ -51,6 +59,15 @@ impl Canonical {
         )
     }
 
+    /// The caps of canonical frames in `memory`, without a frame rate:
+    /// [`Self::caps_string`] or [`Self::system_caps_string`].
+    pub fn caps_in(&self, memory: VideoMemory) -> String {
+        match memory {
+            VideoMemory::Cuda => self.caps_string(),
+            VideoMemory::System => self.system_caps_string(),
+        }
+    }
+
     /// Black in this format: `(Y, chroma)`. Limited range puts black at
     /// Y=16, full range at Y=0; neutral chroma is 128 in both.
     pub fn black(&self) -> (u8, u8) {
@@ -61,32 +78,11 @@ impl Canonical {
     }
 }
 
-/// Where canonical frames live. Production frames are always in CUDA
-/// memory; system memory runs the same ingest, clock and output code on the
-/// CPU (the CPU-only session tests), with CPU stand-ins for the CUDA
-/// elements and no CUDA context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum FrameMemory {
-    #[default]
-    Cuda,
-    #[cfg_attr(not(test), allow(dead_code))]
-    System,
-}
-
-impl FrameMemory {
-    /// The caps of canonical frames in this memory, without a frame rate.
-    pub(crate) fn caps_string(self, canonical: &Canonical) -> String {
-        match self {
-            FrameMemory::Cuda => canonical.caps_string(),
-            FrameMemory::System => canonical.system_caps_string(),
-        }
-    }
-}
-
 /// A canonical frame in the slot, with where it came from.
 #[derive(Debug, Clone)]
 pub struct Frame {
-    /// NV12 in CUDA memory. Cloning it takes a reference, never a copy.
+    /// NV12 in the output's memory (CUDA or system). Cloning it takes a
+    /// reference, never a copy.
     pub buffer: gst::Buffer,
     /// The source that produced it ([`FrameWriter::source_id`]).
     pub source_id: u64,
@@ -102,7 +98,7 @@ pub struct FrameWriter {
     epoch: Instant,
     source_id: u64,
     canonical: Canonical,
-    memory: FrameMemory,
+    memory: VideoMemory,
 }
 
 impl FrameWriter {
@@ -119,17 +115,18 @@ impl FrameWriter {
             epoch,
             source_id,
             canonical,
-            memory: FrameMemory::Cuda,
+            memory: VideoMemory::Cuda,
         }
     }
 
     /// The same writer for frames in `memory`.
-    pub(crate) fn in_memory(self, memory: FrameMemory) -> Self {
+    pub(crate) fn in_memory(self, memory: VideoMemory) -> Self {
         FrameWriter { memory, ..self }
     }
 
-    /// Where the frames written must live.
-    pub(crate) fn memory(&self) -> FrameMemory {
+    /// Where the frames written must live: the memory of the output that
+    /// handed the writer out ([`crate::output::Output::build_in`]).
+    pub fn memory(&self) -> VideoMemory {
         self.memory
     }
 

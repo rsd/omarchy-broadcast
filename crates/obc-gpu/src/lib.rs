@@ -29,6 +29,9 @@
 //!   process, so an idle daemon holds no GPU device (module `checkpoint`).
 //!   While parked, every helper here returns [`GpuError::Parked`] instead
 //!   of blocking in the driver.
+//! * [`presence::probe`]: whether CUDA is usable on this machine, told
+//!   without a CUDA call (no context, no `cuInit`, no device opened), so
+//!   allowed while parked and while the GPU is runtime-suspended.
 //!
 //! Unless stated otherwise every call needs a context current on the calling
 //! thread (the one the memory and streams belong to). Functions that take
@@ -43,6 +46,7 @@ use obc_backend::{BackendError, ColourSpec, DeviceNv12, HostNv12};
 mod checkpoint;
 mod driver;
 mod kernel;
+pub mod presence;
 pub mod tonemap;
 
 pub use checkpoint::{
@@ -55,6 +59,7 @@ pub use driver::{
     Driver, driver,
 };
 pub use kernel::{LUT8_BLOCK, LUT8_ENTRY, LUT8_PTX, Lut8};
+pub use presence::{Presence, ProbeEnv};
 pub use tonemap::PqToSdr;
 
 /// A CUDA failure.

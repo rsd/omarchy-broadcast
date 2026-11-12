@@ -1,6 +1,6 @@
 # ADR-0031: The open-model cut-out: a second `background` provider on ONNX Runtime
 
-- **Status:** Accepted (2026-11-12), implemented in module version 0.38.0 (`crates/obc-module-onnx`). Builds on [ADR-0025](0025-loadable-modules.md) (a second provider of a stage, by rank, pin and profile), [ADR-0012](0012-video-effects-and-maxine-backend.md) (the cut-out never fails open). Amends the CUDA context rule of [modules.md](../modules.md#threading-and-cuda-rules) with one bounded exception, and leaves [ADR-0017](0017-cuda-checkpoint-parking.md) (parking) in force.
+- **Status:** Accepted (2026-11-12), implemented in module version 0.38.0 (`crates/obc-module-onnx`); amended 2026-11-12 by [ADR-0033](0033-system-memory-pipeline.md): the known limitation that the effect element runs on CUDA frames only is lifted. Builds on [ADR-0025](0025-loadable-modules.md) (a second provider of a stage, by rank, pin and profile), [ADR-0012](0012-video-effects-and-maxine-backend.md) (the cut-out never fails open). Amends the CUDA context rule of [modules.md](../modules.md#threading-and-cuda-rules) with one bounded exception, and leaves [ADR-0017](0017-cuda-checkpoint-parking.md) (parking) in force.
 
 ## Context
 - Until now the only provider of the `background` stage was the Maxine module, which needs NVIDIA's SDK, a personal download that the project cannot distribute ([ADR-0003](0003-maxine-first-behind-backend-seam.md), [ADR-0021](0021-nvidia-sdk-handover.md)). Without the SDK there was no cut-out at all.
@@ -8,7 +8,7 @@
 - Person segmentation models under open licences exist, and ONNX is the common file format they can be brought to. ONNX Runtime runs an ONNX file on the CPU, on NVIDIA GPUs (CUDA, TensorRT) and on Intel hardware (OpenVINO), through *execution providers* (engines), each present or not in a given build of the library.
 - Arch Linux packages ONNX Runtime in several variants (`onnxruntime-cpu`, `-cuda`, `-opt-cuda`, `-rocm`, `-opt-rocm`) that each provide `onnxruntime` and conflict with one another. The Arch builds include the CPU, CUDA and ROCm providers; TensorRT and OpenVINO need a build that includes them.
 - ONNX Runtime's CUDA and TensorRT engines run through the CUDA runtime, which activates the device's primary CUDA context. That collides with the module rule that no module creates a CUDA context, and with parking, which requires that no context remains at idle.
-- The daemon's effect element runs on CUDA frames only.
+- The daemon's effect element runs on CUDA frames only. *(Amended 2026-11-12: no longer; see [ADR-0033](0033-system-memory-pipeline.md).)*
 
 ## Decision
 **A new module, `br.com.dias.onnx-cutout` ("Open-model cut-out"), provides `background` with open Apache-2.0 models run by ONNX Runtime, which the module opens at run time. It is a separate Arch package. It ranks below Maxine and declares the device `cpu`.**
@@ -59,7 +59,7 @@ The rule in [modules.md](../modules.md#threading-and-cuda-rules) says a video mo
 ## Consequences
 - A user without an NVIDIA SDK has a cut-out. The `battery` profile can prefer it over Maxine on a machine that has both. The cost is a second `background` provider to maintain, with its own model catalogue and its own licence notices.
 - ONNX Runtime stays optional and the user's to choose. Whatever engine the user's build offers is used, and the reasons for those that are not are in the log.
-- **Known limitation: the effect element is CUDA-only.** The daemon runs the effect on CUDA frames only, so a machine with no NVIDIA GPU cannot yet run the daemon's effect path, whichever provider it uses. The module is written for host frames too, and has been tested with them at the module level, so a daemon pipeline that runs the effect on system memory needs no change to it. That pipeline is future work, with no date.
+- **Known limitation: the effect element is CUDA-only.** The daemon runs the effect on CUDA frames only, so a machine with no NVIDIA GPU cannot yet run the daemon's effect path, whichever provider it uses. The module is written for host frames too, and has been tested with them at the module level, so a daemon pipeline that runs the effect on system memory needs no change to it. That pipeline is future work, with no date. *Lifted on 2026-11-12 by [ADR-0033](0033-system-memory-pipeline.md): the effect element runs on system-memory frames, a `background` provider is given host frames when the session is in system memory, and the module runs on a machine with no NVIDIA GPU, told by `_host.cuda = false` not to use CUDA or TensorRT.*
 - The CUDA context rule has one exception, documented with its bounds in modules.md. The next module that wants to hold a primary context has to meet the same bounds: count, reset when the last ends, restore the caller's context, never touch the frames' context.
 - TensorRT's first build is a one-off wait per model, GPU and library version, and an upgrade of ONNX Runtime or TensorRT rebuilds it. Old cache directories are not removed by the module.
 - The model files are about 70 MB together and are not in the git repository.
@@ -82,10 +82,10 @@ The rule in [modules.md](../modules.md#threading-and-cuda-rules) says a video mo
 | **The model files in git** | About 70 MB of binary files, in a repository whose history is permanent and whose clones everyone pays for. A release asset with a checksum in the `PKGBUILD` gives the same integrity |
 | **Download the models on first use** | Kept as an option for a model whose licence is unclear (the user accepts it, the project does not distribute it). Not used for these four: a package that works offline, with its files verified at build time, is better for the models that are clear |
 | **The module in the core package** | The core would depend on an ONNX Runtime variant (see above), or on none and fail to load the module |
-| **A CPU-only effect path in the daemon, as part of this change** | A larger change to the effect element and the output, separate from adding the module. Deferred, and recorded as the limitation above |
+| **A CPU-only effect path in the daemon, as part of this change** | A larger change to the effect element and the output, separate from adding the module. Deferred, and recorded as the limitation above. Built later, in [ADR-0033](0033-system-memory-pipeline.md) |
 
 ## Future work
-- **A daemon pipeline that runs the effect on host memory**, so that the module runs on a machine with no NVIDIA GPU. No date.
+- ~~**A daemon pipeline that runs the effect on host memory**, so that the module runs on a machine with no NVIDIA GPU.~~ Done 2026-11-12: [ADR-0033](0033-system-memory-pipeline.md).
 - **A published release host** for the model files, replacing the placeholder in `packaging/arch-onnx/PKGBUILD`.
 - **A download on first use** for any model of unclear licence added to the catalogue.
 - Confirmation of the training-data terms of PP-HumanSeg and MODNet.

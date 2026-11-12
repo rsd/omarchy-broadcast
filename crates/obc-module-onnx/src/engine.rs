@@ -252,6 +252,10 @@ pub struct Request<'a> {
     /// Whether the load is a switch: a chain is running, and the stream
     /// waits for this load.
     pub switch: bool,
+    /// Whether CUDA may be used at all: false when the host's configuration
+    /// says the video pipeline runs in system memory. Then no engine that
+    /// uses CUDA is tried and no CUDA call is made.
+    pub cuda: bool,
 }
 
 /// Why the engines that did not start did not.
@@ -262,32 +266,63 @@ pub type Reasons = Vec<(Engine, String)>;
 /// each, and returned with its reason; the error of an engine chosen
 /// explicitly, or of `auto` when none starts, names them.
 pub fn start(req: &Request<'_>, wanted: Engine) -> Result<(Started, Reasons), String> {
+    let (started, reasons) = first_that_starts(
+        wanted,
+        req.cuda,
+        req.model.id,
+        || req.switch && tensorrt_would_build(req),
+        |engine| try_engine(req, engine),
+    )?;
+    log_started(req, &started);
+    Ok((started, reasons))
+}
+
+/// [`start`]'s choice of engine, with the attempt itself (`try_one`) and
+/// the question whether a TensorRT start would build its engine
+/// (`trt_would_build_on_switch`, asked only when TensorRT is to be tried)
+/// passed in, so that the order and the rules are tested without a runtime.
+/// Returns what `try_one` returned for the engine that started, with the
+/// reasons of those that did not.
+fn first_that_starts<T>(
+    wanted: Engine,
+    cuda: bool,
+    model_id: &str,
+    mut trt_would_build_on_switch: impl FnMut() -> bool,
+    mut try_one: impl FnMut(Engine) -> Result<T, String>,
+) -> Result<(T, Reasons), String> {
     let mut reasons = Reasons::new();
     for engine in wanted.candidates() {
-        if engine == Engine::TensorRt && req.switch && tensorrt_would_build(req) {
+        if engine.uses_cuda() && !cuda {
+            // Before anything that could reach the CUDA driver (the
+            // TensorRT cache key reads the device).
+            log::info!(
+                "ONNX cut-out: {} unavailable: {REASON_CUDA_OFF}",
+                engine.label()
+            );
+            reasons.push((engine, REASON_CUDA_OFF.to_string()));
+            continue;
+        }
+        if engine == Engine::TensorRt && trt_would_build_on_switch() {
             if wanted == Engine::Auto {
                 // Logged with the engine used instead, once one starts.
                 reasons.push((engine, REASON_TRT_NOT_BUILT.to_string()));
                 continue;
             }
             log::warn!(
-                "ONNX cut-out: building the TensorRT engine for {} while the camera runs: the feed pauses until it is ready (this takes a while)",
-                req.model.id
+                "ONNX cut-out: building the TensorRT engine for {model_id} while the camera runs: the feed pauses until it is ready (this takes a while)"
             );
         }
-        match try_engine(req, engine) {
+        match try_one(engine) {
             Ok(started) => {
                 if reasons
                     .iter()
                     .any(|(e, r)| *e == Engine::TensorRt && r == REASON_TRT_NOT_BUILT)
                 {
                     log::warn!(
-                        "ONNX cut-out: {}: TensorRT engine not built yet; using {} for now. It builds at the next camera start.",
-                        req.model.id,
-                        started.engine.label()
+                        "ONNX cut-out: {model_id}: TensorRT engine not built yet; using {} for now. It builds at the next camera start.",
+                        engine.label()
                     );
                 }
-                log_started(req, &started);
                 return Ok((started, reasons));
             }
             Err(reason) => {
@@ -325,6 +360,8 @@ fn log_started(req: &Request<'_>, s: &Started) {
 
 /// The reason an engine of a provider the runtime lacks cannot run.
 pub const REASON_NOT_IN_BUILD: &str = "not in this ONNX Runtime build";
+/// Why an engine that uses CUDA cannot run when the host turned CUDA off.
+pub const REASON_CUDA_OFF: &str = "CUDA is off: the video pipeline runs in system memory";
 /// Why `auto` skips TensorRT in a switch whose engine is not cached: the
 /// build would hold the stream for up to a minute.
 pub const REASON_TRT_NOT_BUILT: &str =
@@ -336,7 +373,7 @@ pub const REASON_TRT_NOT_BUILT: &str =
 fn tensorrt_would_build(req: &Request<'_>) -> bool {
     let name = Engine::TensorRt.provider().expect("a concrete engine");
     if !req.runtime.has_provider(name)
-        || static_reasons(&req.runtime.library)
+        || static_reasons(&req.runtime.library, req.cuda)
             .iter()
             .any(|(e, _)| *e == Engine::TensorRt)
     {
@@ -363,8 +400,9 @@ fn tensorrt_cache(req: &Request<'_>) -> Option<PathBuf> {
 
 /// What a filesystem and environment look can say of the engines without
 /// opening the runtime (for the probe's log): the provider libraries
-/// beside the runtime's library, and whether CUDA devices are hidden.
-pub fn static_reasons(library: &Path) -> Reasons {
+/// beside the runtime's library, whether the host turned CUDA off (`cuda`
+/// is false), and whether CUDA devices are hidden.
+pub fn static_reasons(library: &Path, cuda: bool) -> Reasons {
     let dir = library.parent().unwrap_or(Path::new("/"));
     let has = |name: &str| {
         dir.join(format!("libonnxruntime_providers_{name}.so"))
@@ -383,7 +421,9 @@ pub fn static_reasons(library: &Path) -> Reasons {
             Engine::OpenVinoNpu | Engine::OpenVinoGpu | Engine::OpenVinoCpu => "openvino",
             _ => continue,
         };
-        let reason = if !has(lib) {
+        let reason = if engine.uses_cuda() && !cuda {
+            REASON_CUDA_OFF.to_string()
+        } else if !has(lib) {
             format!(
                 "{REASON_NOT_IN_BUILD} (no libonnxruntime_providers_{lib}.so beside {})",
                 library.display()
@@ -596,7 +636,7 @@ fn try_engine(req: &Request<'_>, engine: Engine) -> Result<Started, String> {
         .then(|| tensorrt_cache(req))
         .flatten()
         .map(|d| count_engines(&d));
-    let ruled_out = static_reasons(&req.runtime.library)
+    let ruled_out = static_reasons(&req.runtime.library, req.cuda)
         .iter()
         .any(|(e, _)| *e == engine);
     if engine == Engine::TensorRt && cache_before == Some(0) && !ruled_out {
@@ -807,6 +847,167 @@ mod tests {
         );
         assert_eq!(Engine::Cuda.candidates(), [Engine::Cuda]);
         assert!(Engine::TensorRt.uses_cuda() && !Engine::OpenVinoGpu.uses_cuda());
+    }
+
+    /// The engines `wanted` tries on a runtime with every provider
+    /// library, with CUDA `allowed` or not, and those ruled out.
+    fn tried_and_skipped(wanted: Engine, cuda: bool) -> (Vec<Engine>, Vec<(Engine, String)>) {
+        let dir = tempfile::tempdir().unwrap();
+        for lib in ["tensorrt", "cuda", "openvino"] {
+            std::fs::write(
+                dir.path()
+                    .join(format!("libonnxruntime_providers_{lib}.so")),
+                b"",
+            )
+            .unwrap();
+        }
+        let skipped: Vec<_> = static_reasons(&dir.path().join("libonnxruntime.so"), cuda)
+            .into_iter()
+            // The machine's own CUDA state is not what is tested here.
+            .filter(|(_, r)| r == REASON_CUDA_OFF || !r.starts_with("CUDA not available"))
+            .filter(|(e, _)| wanted.candidates().contains(e))
+            .collect();
+        let tried = wanted
+            .candidates()
+            .into_iter()
+            .filter(|e| !skipped.iter().any(|(s, _)| s == e))
+            .collect();
+        (tried, skipped)
+    }
+
+    #[test]
+    fn with_cuda_off_auto_skips_tensorrt_and_cuda_and_keeps_the_rest() {
+        let (tried, skipped) = tried_and_skipped(Engine::Auto, false);
+        assert_eq!(
+            tried,
+            [
+                Engine::OpenVinoNpu,
+                Engine::OpenVinoGpu,
+                Engine::OpenVinoCpu,
+                Engine::Cpu
+            ]
+        );
+        assert_eq!(
+            skipped,
+            [
+                (Engine::TensorRt, REASON_CUDA_OFF.to_string()),
+                (Engine::Cuda, REASON_CUDA_OFF.to_string())
+            ]
+        );
+        assert_eq!(
+            REASON_CUDA_OFF,
+            "CUDA is off: the video pipeline runs in system memory"
+        );
+    }
+
+    #[test]
+    fn with_cuda_off_an_explicit_cuda_engine_is_ruled_out_with_the_reason() {
+        for e in [Engine::Cuda, Engine::TensorRt] {
+            let (tried, skipped) = tried_and_skipped(e, false);
+            assert!(tried.is_empty(), "{e:?}");
+            assert_eq!(skipped, [(e, REASON_CUDA_OFF.to_string())]);
+        }
+    }
+
+    #[test]
+    fn with_cuda_off_the_cpu_and_openvino_engines_are_unaffected() {
+        for e in [
+            Engine::Cpu,
+            Engine::OpenVinoNpu,
+            Engine::OpenVinoGpu,
+            Engine::OpenVinoCpu,
+        ] {
+            let (tried, skipped) = tried_and_skipped(e, false);
+            assert_eq!(tried, [e]);
+            assert!(skipped.is_empty(), "{e:?}: {skipped:?}");
+        }
+    }
+
+    /// What [`first_that_starts`] tried and returned for `wanted` with
+    /// CUDA `cuda`, every attempt failing except one on `starts` (if any).
+    /// The TensorRT build question panics when CUDA is off: it reads the
+    /// device, so it must not be asked then.
+    fn choose(
+        wanted: Engine,
+        cuda: bool,
+        starts: Option<Engine>,
+    ) -> (Vec<Engine>, Result<(Engine, Reasons), String>) {
+        let mut tried = Vec::new();
+        let r = first_that_starts(
+            wanted,
+            cuda,
+            "model",
+            || {
+                assert!(cuda, "the TensorRT cache was looked at with CUDA off");
+                false
+            },
+            |e| {
+                tried.push(e);
+                if Some(e) == starts {
+                    Ok(e)
+                } else {
+                    Err(format!("{e:?} failed"))
+                }
+            },
+        );
+        (tried, r)
+    }
+
+    #[test]
+    fn start_with_cuda_off_never_tries_tensorrt_or_cuda() {
+        // `auto`: the first engine tried is OpenVINO, and the reasons start
+        // with the two CUDA engines ruled out.
+        let (tried, r) = choose(Engine::Auto, false, Some(Engine::Cpu));
+        assert_eq!(
+            tried,
+            [
+                Engine::OpenVinoNpu,
+                Engine::OpenVinoGpu,
+                Engine::OpenVinoCpu,
+                Engine::Cpu
+            ]
+        );
+        let (engine, reasons) = r.unwrap();
+        assert_eq!(engine, Engine::Cpu);
+        assert_eq!(
+            reasons[..2],
+            [
+                (Engine::TensorRt, REASON_CUDA_OFF.to_string()),
+                (Engine::Cuda, REASON_CUDA_OFF.to_string())
+            ]
+        );
+        // Chosen explicitly: nothing is tried, the error gives the reason.
+        for e in [Engine::TensorRt, Engine::Cuda] {
+            let (tried, r) = choose(e, false, Some(e));
+            assert!(tried.is_empty(), "{e:?} tried {tried:?}");
+            assert_eq!(
+                r.unwrap_err(),
+                format!("{} was chosen and cannot run: {REASON_CUDA_OFF}", e.label())
+            );
+        }
+    }
+
+    #[test]
+    fn start_with_cuda_on_tries_the_cuda_engines_first() {
+        let (tried, r) = choose(Engine::Auto, true, Some(Engine::Cuda));
+        assert_eq!(tried, [Engine::TensorRt, Engine::Cuda]);
+        let (engine, reasons) = r.unwrap();
+        assert_eq!(engine, Engine::Cuda);
+        assert_eq!(reasons, [(Engine::TensorRt, "TensorRt failed".to_string())]);
+        // None starts: `auto`'s error lists every engine.
+        let (tried, r) = choose(Engine::Auto, true, None);
+        assert_eq!(tried, Engine::Auto.candidates());
+        assert!(
+            r.unwrap_err()
+                .starts_with("No engine could run the model (")
+        );
+    }
+
+    #[test]
+    fn with_cuda_on_nothing_is_ruled_out_for_that_reason() {
+        let (tried, skipped) = tried_and_skipped(Engine::Auto, true);
+        assert_eq!(tried, Engine::Auto.candidates());
+        assert!(skipped.iter().all(|(_, r)| r != REASON_CUDA_OFF));
     }
 
     #[test]

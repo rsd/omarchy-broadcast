@@ -943,6 +943,157 @@ fn the_backend_factory_carries_the_effect_through_the_abi() {
     assert!(backend.timings().is_none());
 }
 
+/// The fixture with a `background` that takes CUDA and host frames, as the
+/// ONNX module's does.
+fn host_fixture() -> (tempfile::TempDir, Module, Lines) {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = own_copy(&fixture_lib(""), dir.path(), "fixture");
+    let cuda_only = "id = \"background\"\nslot = \"matte\"\nrank = 100\ndevice = \"cpu\"\n\
+                     frames = [\"cuda\"]";
+    let text = fixture_manifest("org.test.fixture", &lib, 1);
+    assert!(text.contains(cuda_only));
+    let text = text.replace(
+        cuda_only,
+        &cuda_only.replace("[\"cuda\"]", "[\"cuda\", \"host\"]"),
+    );
+    let m = manifest(&text, dir.path(), "fixture");
+    let (sink, lines) = capture();
+    let module = Module::open(&m, &serde_json::json!({}), sink).expect("the fixture opens");
+    (dir, module, lines)
+}
+
+#[test]
+fn the_backend_factory_carries_the_effect_on_host_frames_through_the_abi() {
+    let (_dir, module, lines) = host_fixture();
+    let factory = ModuleBackendFactory::new(module);
+    assert_eq!(factory.kinds(), [FrameKind::Cuda, FrameKind::Host]);
+    let mut backend = factory.create().unwrap();
+    let bgr = HostBgr {
+        width: 4,
+        height: 2,
+        stride: 12,
+        data: (0..24).map(|i| i as u8 + 7).collect(),
+    };
+    let mut req = LoadRequest {
+        effect: EffectKind::Replace,
+        stages: StageList::new([s("beta"), s("alpha")]).unwrap(),
+        width: 4,
+        height: 2,
+        colour: ColourSpec::FULL_BT601,
+        background: Some(Arc::new(bgr)),
+        params: params("alpha", &[("step", Value::Int(3))]),
+    };
+    let report = backend.load_host(&req).unwrap();
+    assert_eq!(report.load_ms, 1.5);
+    let line = last_line(&lines, "fixture-load");
+    assert!(line.contains("stages=alpha,background,beta"), "{line}");
+    assert!(
+        line.contains("kind=host in=nv12:4x2 out=nv12:4x2"),
+        "{line}"
+    );
+    assert!(
+        line.contains("matrix=Bt601 siting=Mpeg2 full=true cuda=no"),
+        "no CUDA handles: {line}"
+    );
+    assert!(
+        line.contains("params=alpha.step=3;background.mode=replace"),
+        "{line}"
+    );
+    assert!(line.contains("bg=host:bgr:4x2:1:cuda=no:7"), "{line}");
+    assert!(backend.is_loaded());
+
+    // The two host frames cross as they are: the source's planes and the
+    // destination's, never the same memory.
+    let mut src_img = HostImage::new(4, 2, 16, 128);
+    let mut dst_img = HostImage::new(4, 2, 0, 0);
+    let (src, mut dst) = (src_img.frame(), dst_img.frame());
+    let fp = FrameParams {
+        blur_strength: 0.25,
+        live: params("beta", &[("x", Value::Int(1))]),
+    };
+    backend.process_host(&fp, &src, &mut dst).unwrap();
+    let line = last_line(&lines, "fixture-process");
+    assert!(
+        line.contains("in=host:nv12:4x2:2:cuda=no out=host:nv12:4x2:2:cuda=no same=false"),
+        "{line}"
+    );
+    assert!(
+        line.contains("live=background.blur_strength=0.25;beta.x=1"),
+        "{line}"
+    );
+    assert_eq!(src_img.y, [16; 8], "the source is only read");
+    assert_eq!(
+        backend.reset_temporal_host().unwrap(),
+        StageList::from(s("beta"))
+    );
+
+    // A failure of the cut-out is never a stage failure: it fails the chain
+    // and unloads it, as on CUDA frames.
+    let fail = FrameParams {
+        blur_strength: 0.0,
+        live: params("background", &[("fail", Value::Bool(true))]),
+    };
+    let (src, mut dst) = (src_img.frame(), dst_img.frame());
+    let e = backend.process_host(&fail, &src, &mut dst).unwrap_err();
+    assert!(matches!(&e, BackendError::Run { .. }), "{e:?}");
+    assert!(!backend.is_loaded());
+    backend.load_host(&req).unwrap();
+
+    // A malformed frame is refused before the module.
+    let mut bad = src_img.frame();
+    bad.y = std::ptr::null_mut();
+    let mut dst = dst_img.frame();
+    assert!(matches!(
+        backend.process_host(&FrameParams::default(), &bad, &mut dst),
+        Err(BackendError::InvalidInput(_))
+    ));
+
+    // One memory at a time: an instance loaded on CUDA frames refuses host
+    // calls.
+    req.effect = EffectKind::Blur;
+    backend.load(&fake_gpu(), &req).unwrap();
+    assert!(
+        last_line(&lines, "fixture-load").contains("kind=cuda"),
+        "a reload on CUDA frames"
+    );
+    let (src, mut dst) = (src_img.frame(), dst_img.frame());
+    assert!(matches!(
+        backend.process_host(&FrameParams::default(), &src, &mut dst),
+        Err(BackendError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        backend.reset_temporal_host(),
+        Err(BackendError::InvalidInput(_))
+    ));
+    backend.unload();
+    assert!(!backend.is_loaded());
+    assert_eq!(backend.reset_temporal_host(), Ok(StageList::default()));
+    backend.load_host(&req).unwrap();
+    assert!(last_line(&lines, "fixture-load").contains("kind=host"));
+}
+
+#[test]
+fn a_cuda_only_background_takes_no_host_frames() {
+    let (_dir, module, _lines) = fixture(serde_json::json!({}));
+    let factory = ModuleBackendFactory::new(module);
+    assert_eq!(factory.kinds(), [FrameKind::Cuda]);
+    let mut backend = factory.create().unwrap();
+    let req = LoadRequest {
+        effect: EffectKind::Blur,
+        stages: StageList::default(),
+        width: 4,
+        height: 2,
+        colour: ColourSpec::LIMITED_BT601,
+        background: None,
+        params: BTreeMap::new(),
+    };
+    assert_eq!(
+        backend.load_host(&req).unwrap_err(),
+        BackendError::Unavailable("org.test.fixture takes CUDA frames only".into())
+    );
+    assert!(!backend.is_loaded());
+}
+
 #[test]
 fn the_enhancer_factory_carries_the_enhance_stage_through_the_abi() {
     let (_dir, module, lines) = fixture(serde_json::json!({}));

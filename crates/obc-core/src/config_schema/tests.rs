@@ -73,6 +73,7 @@ fn the_core_table_is_well_formed() {
         [
             "camera",
             "output",
+            "video",
             "loopback",
             "lifecycle",
             "effect",
@@ -106,6 +107,9 @@ fn the_core_table_is_well_formed() {
         "mic.gpu_policy" => {
             toml::from_str::<crate::config::MicConfig>(&format!("gpu_policy = \"{v}\"")).is_ok()
         }
+        "video.memory" => {
+            toml::from_str::<crate::config::VideoConfig>(&format!("memory = \"{v}\"")).is_ok()
+        }
         other => panic!("enum {other} not checked"),
     };
     for k in CORE_KEYS {
@@ -133,6 +137,7 @@ fn the_editable_and_apply_table_is_the_decided_one() {
             "output.aspect",
             "output.hold_timeout_s",
             "output.input_gap_ms",
+            "video.memory",
             "lifecycle.idle_grace_s",
             "lifecycle.start_debounce_ms",
             "effect.on_failure",
@@ -590,4 +595,89 @@ fn the_mic_rows_carry_their_values_and_take_writes() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn the_video_memory_row_states_the_memory_in_force() {
+    use crate::config::{MemoryChoice, resolve_memory};
+    let (_tmp, set) = load(&[(MANAGED_REL, "[video]\nmemory = \"system\"\n")]);
+    let groups = config_schema(&set, &facts());
+    let video = groups.iter().find(|g| g.id == "video").unwrap();
+    assert_eq!(
+        video.rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+        ["video.memory"]
+    );
+    let r = find(&groups, VIDEO_MEMORY);
+    assert_eq!(r.value, ConfigValue::Str("system".into()));
+    assert_eq!(r.default, Some(ConfigValue::Str("auto".into())));
+    assert_eq!(r.source, MANAGED_REL);
+    assert!(r.editable && r.enabled);
+    assert_eq!(r.apply, Apply::Reload);
+    let RowKind::Enum { options } = &r.kind else {
+        panic!("{:?}", r.kind)
+    };
+    assert_eq!(
+        options.iter().map(|(v, _)| v.as_str()).collect::<Vec<_>>(),
+        ["auto", "cuda", "system"]
+    );
+    // Without the daemon's word, the fixed text.
+    assert!(
+        r.description.contains("next camera start"),
+        "{}",
+        r.description
+    );
+    assert!(!r.description.starts_with("Now:"), "{}", r.description);
+
+    // With it, the memory in force and why.
+    let facts = RegistryFacts {
+        video_memory: Some(resolve_memory(
+            MemoryChoice::Auto,
+            Some("no NVIDIA driver is loaded"),
+        )),
+        ..facts()
+    };
+    let groups = config_schema(&set, &facts);
+    assert_eq!(
+        find(&groups, VIDEO_MEMORY).description,
+        "Now: system memory, no NVIDIA driver is loaded. Applies at the next camera start."
+    );
+    // Other rows keep theirs.
+    assert_eq!(
+        find(&groups, "output.format").description,
+        core_key("output.format").unwrap().description
+    );
+}
+
+#[test]
+fn a_video_memory_write_is_checked_against_its_options() {
+    let info = lookup(VIDEO_MEMORY, &RegistryFacts::default()).unwrap();
+    assert!(info.editable);
+    assert_eq!(info.apply, Apply::Reload);
+    assert_eq!(
+        to_toml(VIDEO_MEMORY, &info.kind, &ConfigValue::Str("cuda".into())),
+        Ok(toml::Value::String("cuda".into()))
+    );
+    let e = to_toml(VIDEO_MEMORY, &info.kind, &ConfigValue::Str("gpu".into())).unwrap_err();
+    assert!(
+        e.contains("\"gpu\" is not one of: auto, cuda, system"),
+        "{e}"
+    );
+}
+
+#[test]
+fn the_output_mode_row_mentions_frame_generation_only_where_it_can_run() {
+    let (_tmp, set) = load(&[]);
+    let groups = config_schema(&set, &facts());
+    let full = find(&groups, OUTPUT_MODE).description.clone();
+    assert!(full.contains("frame generation"), "{full}");
+    let facts = RegistryFacts {
+        no_frame_generation: true,
+        ..facts()
+    };
+    let groups = config_schema(&set, &facts);
+    assert_eq!(
+        find(&groups, OUTPUT_MODE).description,
+        "Size and frame rate of the virtual camera."
+    );
+    assert!(full.starts_with(&find(&groups, OUTPUT_MODE).description));
 }

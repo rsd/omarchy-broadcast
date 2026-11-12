@@ -1,5 +1,13 @@
 //! The media backend of the running daemon: the persistent loopback writer
-//! and, while active, a CUDA [`Session`] whose output forwards to it.
+//! and, while active, a [`Session`] whose output forwards to it, in the
+//! memory the controller chose for it ([`SessionParams::memory`]).
+//!
+//! **System memory.** A session in [`VideoMemory::System`] makes no CUDA
+//! call: its output and ingests have no CUDA element (the `nvcodec`
+//! plugin is not loaded for it), NVML is not started (`gpu_percent` is not
+//! measurable), the GPU is neither unparked nor parked, and the compute
+//! capability is not read. What follows of CUDA applies to a session in
+//! CUDA memory.
 //!
 //! Before the first session nothing here touches CUDA or loads the
 //! `nvcodec` plugin: the writer is `appsrc ! v4l2sink` on the CPU, and the
@@ -73,6 +81,7 @@ use std::sync::atomic::AtomicU32;
 use std::time::{Duration, Instant};
 
 use gst::prelude::*;
+use obc_core::config::VideoMemory;
 use obc_core::{EffectMode, EffectOnFailure, ModeRequest, OutputContract, SinkSelector};
 use obc_ipc::Stats;
 use obc_module_host::{
@@ -84,6 +93,7 @@ use obc_pipeline::effect::{Availability, StageId, StageRequest};
 use obc_pipeline::gpu::GpuSampler;
 use obc_pipeline::ingest::EnhanceBackend;
 use obc_pipeline::module::{ModulePlacement, ModuleStageSpec};
+use obc_pipeline::output::NO_CUDA_CONTEXT;
 use obc_pipeline::pipeline::names;
 use obc_pipeline::stats::{cpu_usage, online_cpus, self_cpu_ticks, ticks_per_sec};
 use obc_pipeline::xu::{SYSFS_ROOT, XuControl, XuRow, find_xu_controls};
@@ -145,9 +155,15 @@ struct Running {
     effect_backend: Option<obc_pipeline::EffectBackend>,
     /// The chains of the output, by element name.
     chains: Vec<String>,
+    /// Where the session keeps its frames.
+    memory: VideoMemory,
 }
 
 impl StopSession for Running {
+    fn uses_cuda(&self) -> bool {
+        self.memory == VideoMemory::Cuda
+    }
+
     /// The NVML sampler stopped, then ingest and output to NULL and
     /// dropped, then the rest: when this returns, nothing of the session is
     /// left. Unclean ([`StopFailure::reached_null`] false) when a pipeline
@@ -463,8 +479,10 @@ impl GstBackend {
         cfg.aspect = params.aspect;
         cfg.fixed_framerate = params.fixed_framerate;
         // Requested only where it applies (the controller's choice), with
-        // the enhancer the session started with.
-        cfg.enhance = params.effect.enhance && enhance.is_some();
+        // the enhancer the session started with; never in system memory
+        // (the stage takes CUDA frames).
+        cfg.enhance =
+            params.effect.enhance && enhance.is_some() && params.memory == VideoMemory::Cuda;
         cfg.enhance_backend = enhance.cloned();
         cfg.enhance_params = params.effect.enhance_params.clone();
         cfg
@@ -664,15 +682,17 @@ fn stamp_forwarded(output: &Output) {
 /// made and linked, in NULL, and are dropped with it. One that failed to
 /// start is stopped here, its result seen, rather than by its drop, which
 /// ignores it: unclean only if it did not reach NULL ([`start_failed`]).
+///
+/// In system memory NVML is not started: the session makes no GPU call.
 fn build_session(
     params: &SessionParams,
     writer: WriterHandle,
     stamp: bool,
-    contract: &mut bool,
+    fault: &mut StartFault,
 ) -> Result<Running, StartError> {
     let live = LiveStats::new();
     let observer = live.observer();
-    let output = build_output(params, OutputSink::Writer(writer), contract, |output| {
+    let output = build_output(params, OutputSink::Writer(writer), fault, |output| {
         output.set_observer(Some(observer));
         if stamp {
             stamp_forwarded(output);
@@ -687,16 +707,19 @@ fn build_session(
         )
     })?;
     let epoch = Instant::now();
-    let gpu = match GpuSampler::start(
-        GPU_INDEX,
-        GPU_INTERVAL,
-        Arc::new(move || u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)),
-    ) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            crate::debug!("GPU statistics unavailable: {e}");
-            None
-        }
+    let gpu = match params.memory {
+        VideoMemory::System => None,
+        VideoMemory::Cuda => match GpuSampler::start(
+            GPU_INDEX,
+            GPU_INTERVAL,
+            Arc::new(move || u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)),
+        ) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                crate::debug!("GPU statistics unavailable: {e}");
+                None
+            }
+        },
     };
     Ok(Running {
         session,
@@ -714,17 +737,37 @@ fn build_session(
             .iter()
             .map(|m| m.name.clone())
             .collect(),
+        memory: params.memory,
     })
 }
 
-/// Builds and starts the output of a session of `params` into `sink`,
-/// `prepare` called between the build and the start. `contract` says
-/// whether a failure is the output contract's ([`contract_fault`]). On
-/// error, what was built is gone, as [`build_session`] says.
+/// What a failed output build or start was due to, for
+/// [`SessionError`]: the output contract ([`contract_fault`]), or the want
+/// of CUDA ([`wants_cuda`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StartFault {
+    contract: bool,
+    no_cuda: bool,
+}
+
+impl StartFault {
+    fn of(e: &PipelineError, memory: VideoMemory) -> StartFault {
+        StartFault {
+            contract: contract_fault(e),
+            no_cuda: memory == VideoMemory::Cuda && wants_cuda(e),
+        }
+    }
+}
+
+/// Builds and starts the output of a session of `params` into `sink`, in
+/// the session's memory, `prepare` called between the build and the
+/// start. `fault` says whether a failure is the output contract's
+/// ([`contract_fault`]) or for want of CUDA ([`wants_cuda`]). On error,
+/// what was built is gone, as [`build_session`] says.
 fn build_output(
     params: &SessionParams,
     sink: OutputSink,
-    contract: &mut bool,
+    fault: &mut StartFault,
     prepare: impl FnOnce(&mut Output),
 ) -> Result<Output, StartError> {
     let mut ocfg = OutputConfig::new(params.contract, sink);
@@ -739,19 +782,20 @@ fn build_output(
     ocfg.effect = Some(effect_settings(&params.effect));
     ocfg.effect_backend = effect_backend(&params.backends);
     ocfg.module_stages = module_stages(&params.effect, &params.backends);
-    let mut output = Output::build(ocfg).map_err(|e| {
-        *contract = contract_fault(&e);
-        format!("output pipeline: {e}")
+    // A failure for want of CUDA is not parked after (`StartError::no_cuda`).
+    let mut output = Output::build_in(ocfg, params.memory).map_err(|e| {
+        *fault = StartFault::of(&e, params.memory);
+        StartError::from(format!("output pipeline: {e}")).for_want_of_cuda(fault.no_cuda)
     })?;
     prepare(&mut output);
     // The mapping (`start_failed`) is unit-tested; this wiring only by the
     // hardware tests.
     if let Err(e) = output.start() {
-        *contract = contract_fault(&e);
-        return Err(start_failed(
-            format!("output pipeline: {e}"),
-            output.stop_checked(),
-        ));
+        *fault = StartFault::of(&e, params.memory);
+        return Err(
+            start_failed(format!("output pipeline: {e}"), output.stop_checked())
+                .for_want_of_cuda(fault.no_cuda),
+        );
     }
     Ok(output)
 }
@@ -918,16 +962,24 @@ impl MediaBackend for GstBackend {
             ));
         };
         let stamp = self.stamp;
-        // Whether the output's build or start failed for the contract.
-        let mut contract = false;
-        // A running session stopped without parking in between; the GPU
-        // unparked before the output (CUDA) or NVML touch it, and parked
-        // again if the build fails (`Parker::start_session`).
+        // Whether the output's build or start failed for the contract, or
+        // for want of CUDA; neither when the GPU could not be unparked (the
+        // build did not run).
+        let mut fault = StartFault::default();
+        // In CUDA memory a running session stopped without parking in
+        // between; the GPU unparked before the output (CUDA) or NVML touch
+        // it, and parked again if the build fails (`Parker::start_session`).
+        // In system memory nothing is unparked or parked
+        // (`Parker::start_session_in`).
         self.parker
-            .start_session(&mut self.running, || {
-                build_session(params, writer, stamp, &mut contract)
+            .start_session_in(&mut self.running, params.memory, || {
+                build_session(params, writer, stamp, &mut fault)
             })
-            .map_err(|message| SessionError { message, contract })?;
+            .map_err(|message| SessionError {
+                message,
+                contract: fault.contract,
+                no_cuda: fault.no_cuda,
+            })?;
         let counts = self.writer_counts();
         if let Some(r) = self.running.as_mut() {
             r.counts = counts;
@@ -1184,6 +1236,18 @@ impl MediaBackend for GstBackend {
             .compute_capability
     }
 
+    fn cuda_unusable(&mut self) -> Option<String> {
+        // `find` reads GStreamer's registry (its cache) and loads no
+        // plugin: making a CUDA element would load `nvcodec`, whose
+        // initialisation calls `cuInit`.
+        let registered = obc_gpu::presence::CUDA_ELEMENTS
+            .iter()
+            .all(|name| gst::ElementFactory::find(name).is_some());
+        obc_gpu::presence::probe_process(registered)
+            .unusable_reason()
+            .map(str::to_string)
+    }
+
     fn open_camera_controls(
         &mut self,
         camera: &Camera,
@@ -1371,6 +1435,24 @@ fn contract_fault(e: &PipelineError) -> bool {
             | PipelineError::Link(_)
             | PipelineError::InvalidProperty { .. }
     )
+}
+
+/// Whether an output's `e` is for want of CUDA: an element of the
+/// `nvcodec` plugin is missing (the plugin is not installed, or loaded
+/// without registering its elements because CUDA did not initialise), one
+/// failed its state change with an error of its own on the bus (no device
+/// to open a context on, say), or the output opened no CUDA context
+/// ([`NO_CUDA_CONTEXT`]). A contract fault, a module's or the effect
+/// element's error, another element's state change failure, or another
+/// CUDA error is not.
+fn wants_cuda(e: &PipelineError) -> bool {
+    let cuda_element = |factory: &str| factory.starts_with("cuda") || factory.starts_with("nv");
+    match e {
+        PipelineError::MissingElement { factory, .. }
+        | PipelineError::ElementState { factory, .. } => cuda_element(factory),
+        PipelineError::Cuda(m) => m == NO_CUDA_CONTEXT,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1777,6 +1859,7 @@ mod tests {
             fixed_framerate: false,
             effect: run.clone(),
             backends: Default::default(),
+            memory: VideoMemory::Cuda,
         };
         let camera = Camera {
             id: "usb-a".into(),
@@ -1795,5 +1878,50 @@ mod tests {
         let ingest = GstBackend::ingest_config(&session, &camera, Some(&backend));
         assert!(ingest.enhance);
         assert_eq!(ingest.enhance_params, run.enhance_params);
+        // Never in system memory: the stage takes CUDA frames.
+        let host = SessionParams {
+            memory: VideoMemory::System,
+            ..session
+        };
+        assert!(!GstBackend::ingest_config(&host, &camera, Some(&backend)).enhance);
+    }
+
+    #[test]
+    fn only_a_missing_cuda_element_or_no_cuda_context_is_for_want_of_cuda() {
+        let missing = |factory: &str| PipelineError::MissingElement {
+            factory: factory.into(),
+            source: gst::glib::bool_error!("no such element factory"),
+        };
+        assert!(wants_cuda(&missing("cudadownload")));
+        assert!(wants_cuda(&missing("cudaupload")));
+        assert!(!wants_cuda(&missing("v4l2sink")));
+        assert!(wants_cuda(&PipelineError::Cuda(NO_CUDA_CONTEXT.into())));
+        // A state change failed with an error from a CUDA element on the
+        // bus; not one from another element, nor one with no element.
+        let state = |factory: &str| PipelineError::ElementState {
+            element: "upload".into(),
+            factory: factory.into(),
+            message: "Failed to get CUDA context".into(),
+        };
+        assert!(wants_cuda(&state("cudaupload")));
+        assert!(wants_cuda(&state("nvh264enc")));
+        assert!(!wants_cuda(&state("v4l2sink")));
+        assert!(!wants_cuda(&state("")));
+        assert!(!wants_cuda(&PipelineError::State(
+            "Element failed to change its state".into()
+        )));
+        assert!(StartFault::of(&state("cudaconvert"), VideoMemory::Cuda).no_cuda);
+        assert!(!StartFault::of(&state("cudaconvert"), VideoMemory::System).no_cuda);
+        assert!(!wants_cuda(&PipelineError::Cuda(
+            "the roundtrip process stage needs frames in CUDA memory".into()
+        )));
+        assert!(!wants_cuda(&PipelineError::Caps("video/x-raw".into())));
+        assert!(!wants_cuda(&PipelineError::Module("obc-fg-gen".into())));
+        // Only in CUDA memory: a session in system memory has none to want.
+        let f = StartFault::of(&missing("cudadownload"), VideoMemory::Cuda);
+        assert!(f.no_cuda && !f.contract);
+        assert!(!StartFault::of(&missing("cudadownload"), VideoMemory::System).no_cuda);
+        let f = StartFault::of(&PipelineError::Caps("x".into()), VideoMemory::Cuda);
+        assert!(f.contract && !f.no_cuda);
     }
 }

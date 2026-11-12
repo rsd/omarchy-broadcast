@@ -90,6 +90,20 @@
 //! behind the person: the other stage is the one dropped). A conflict is
 //! not enforced when either stage's module is forced.
 //!
+//! # Session memory
+//!
+//! The registry knows where the session's video frames are
+//! ([`Registry::set_memory`]): in CUDA memory (the default) or in system
+//! memory ([`FrameKind::Host`]). In system memory a stage whose manifest
+//! `frames` does not list `host` cannot run, with the reason the caller
+//! gives ([`REASON_NEEDS_CUDA`], [`REASON_CUDA_OFF`]), exactly as a stage
+//! whose probe said it cannot: the providers, the pins, the profile, the
+//! requirements and the module statuses follow from it, so a stage falls
+//! to a provider that takes host frames when there is one. The module
+//! conflicts keep for the cut-out a party whose `background` takes the
+//! session's frames. In CUDA memory nothing is filtered: a stage that takes
+//! host frames only runs on a host copy of the CUDA frames.
+//!
 //! # Kinds
 //!
 //! A registry loads the module kinds of its [`LoadKinds`]: the video
@@ -110,11 +124,11 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use obc_backend::{Availability, StageId};
+use obc_backend::{Availability, FrameKind, StageId};
 
 use crate::discovery::{Discovery, ModuleEntry};
 use crate::library::{LogLevel, LogSink};
-use crate::manifest::{Device, LoadKinds, Manifest, Requirement, Slot, StageDecl};
+use crate::manifest::{Device, Frames, LoadKinds, Manifest, Requirement, Slot, StageDecl};
 use crate::module::Module;
 
 /// The reason of a module the user disabled.
@@ -129,6 +143,12 @@ pub const REASON_NO_PROVIDER: &str = "No enabled module provides it";
 /// The reason of a stage that needs the cut-out of another module than the
 /// one that provides `background` (the phase-1 placement rule).
 pub const REASON_NEEDS_CUTOUT: &str = "Needs the cut-out of the module that provides it";
+/// The reason of a stage that takes CUDA frames only, when the session's
+/// frames are in system memory because no usable CUDA was found.
+pub const REASON_NEEDS_CUDA: &str = "Needs an NVIDIA GPU (CUDA)";
+/// The reason of a stage that takes CUDA frames only, when the
+/// configuration sets the video pipeline to system memory.
+pub const REASON_CUDA_OFF: &str = "Needs CUDA; the video pipeline is set to system memory";
 
 /// The longest module name a reason gives ("Conflicts with <name> (<id>)"),
 /// in bytes.
@@ -279,6 +299,16 @@ struct Record {
     refused: Option<String>,
     module: Option<Module>,
     opened: Opened,
+    /// The reason of a stage that does not take host frames while the
+    /// session's frames are in system memory; `None` in CUDA memory
+    /// ([`Registry::set_memory`]).
+    host_memory: Option<String>,
+}
+
+/// Whether the declaration `decl` takes the frames of a session whose
+/// memory is system memory when `host_memory` is set.
+fn takes_memory(decl: &StageDecl, host_memory: Option<&str>) -> bool {
+    host_memory.is_none() || decl.frames.contains(&Frames::Host)
 }
 
 impl Record {
@@ -303,6 +333,24 @@ impl Record {
         self.candidate().filter(|_| self.refused.is_none())
     }
 
+    /// `probed`, the probe's word on `stage`, under the session's memory: a
+    /// stage that could run but does not take its frames cannot.
+    fn under_memory(&self, stage: &str, probed: &Availability) -> Availability {
+        if let Some(reason) = &self.host_memory
+            && probed.is_installed()
+            && self
+                .entry
+                .manifest
+                .as_ref()
+                .ok()
+                .and_then(|m| m.stage(stage))
+                .is_some_and(|d| !takes_memory(d, Some(reason)))
+        {
+            return Availability::NotInstalled(reason.clone());
+        }
+        probed.clone()
+    }
+
     fn status(&self) -> ModuleStatus {
         if let Some(r) = &self.disabled {
             return ModuleStatus::Disabled(r.clone());
@@ -321,11 +369,14 @@ impl Record {
             Opened::No => ModuleStatus::Unavailable(REASON_NOT_LOADED.into()),
             Opened::Failed(e) => ModuleStatus::Unavailable(e.clone()),
             Opened::Probed(stages) => {
-                if stages.iter().any(|(_, a)| a.is_installed()) {
+                let stages: Vec<Availability> = stages
+                    .iter()
+                    .map(|(s, a)| self.under_memory(s.as_str(), a))
+                    .collect();
+                if stages.iter().any(Availability::is_installed) {
                     return ModuleStatus::Available;
                 }
-                let mut reasons: Vec<&str> =
-                    stages.iter().filter_map(|(_, a)| a.reason()).collect();
+                let mut reasons: Vec<&str> = stages.iter().filter_map(|a| a.reason()).collect();
                 reasons.dedup();
                 match reasons.as_slice() {
                     [one] => ModuleStatus::Unavailable((*one).to_string()),
@@ -344,7 +395,7 @@ impl Record {
             return stages
                 .iter()
                 .find(|(s, _)| s == stage)
-                .map(|(_, a)| a.clone())
+                .map(|(_, a)| self.under_memory(stage, a))
                 .unwrap_or_else(|| Availability::NotInstalled(crate::module::NOT_REPORTED.into()));
         }
         Availability::NotInstalled(self.status().reason().to_string())
@@ -425,6 +476,8 @@ pub struct Registry {
     order: Option<Vec<StageId>>,
     /// The modules whose conflicts are not enforced.
     forced: BTreeSet<String>,
+    /// See [`Record::host_memory`].
+    host_memory: Option<String>,
 }
 
 impl Registry {
@@ -450,6 +503,7 @@ impl Registry {
                         refused: None,
                         module: None,
                         opened: Opened::No,
+                        host_memory: None,
                     },
                 )
             })
@@ -480,6 +534,46 @@ impl Registry {
     /// The kinds of module this registry loads.
     pub fn kinds(&self) -> LoadKinds {
         self.kinds
+    }
+
+    /// Sets where the session's video frames are: [`FrameKind::Cuda`] (the
+    /// default) or [`FrameKind::Host`], system memory. In system memory a
+    /// stage whose manifest `frames` does not list `host` cannot run, for
+    /// `reason` ([`REASON_NEEDS_CUDA`] when no usable CUDA was found,
+    /// [`REASON_CUDA_OFF`] when the configuration chose system memory); in
+    /// CUDA memory `reason` is unused. See "Session memory" in the module
+    /// documentation. Modules stay open: only what they offer changes.
+    pub fn set_memory(&mut self, memory: FrameKind, reason: impl Into<String>) {
+        self.host_memory = (memory == FrameKind::Host).then(|| reason.into());
+        for r in self.records.values_mut() {
+            r.host_memory.clone_from(&self.host_memory);
+        }
+        // The cut-out's module the conflicts keep may be another now.
+        self.refresh_refusals();
+    }
+
+    /// Whether module `id` declares `stage` in a form that takes the
+    /// session's frames ([`Self::set_memory`]): in CUDA memory any
+    /// declaration does; in system memory only one whose `frames` lists
+    /// `host`. `false` for a module that declares no such stage, or whose
+    /// manifest did not parse. The probes are not asked: a caller choosing
+    /// a module that runs the stage once it can (its features installed
+    /// later) must still never choose one that cannot take the frames.
+    pub fn declares_for_memory(&self, id: &str, stage: &str) -> bool {
+        self.records
+            .get(id)
+            .and_then(|r| r.entry.manifest.as_ref().ok())
+            .and_then(|m| m.stage(stage))
+            .is_some_and(|d| takes_memory(d, self.host_memory.as_deref()))
+    }
+
+    /// Where the session's video frames are ([`Self::set_memory`]).
+    pub fn memory(&self) -> FrameKind {
+        if self.host_memory.is_some() {
+            FrameKind::Host
+        } else {
+            FrameKind::Cuda
+        }
     }
 
     fn record_mut(&mut self, id: &str) -> Result<&mut Record, String> {
@@ -561,14 +655,18 @@ impl Registry {
 
     /// The module the module conflicts keep for the cut-out: among the
     /// `parties` (enabled, loadable, no module requirement unmet) that
-    /// declare `background`, the one that would provide it by pin and
-    /// profile (whatever their probes say: the rules are static).
+    /// declare a `background` that takes the session's frames, the one that
+    /// would provide it by pin and profile (whatever their probes say: the
+    /// rules are static).
     fn background_keeper(&self, parties: &BTreeSet<String>) -> Option<String> {
         let bg = StageId::BACKGROUND.as_str();
         let offers: Vec<Provider> = parties
             .iter()
             .filter_map(|id| {
                 let decl = self.records.get(id)?.candidate()?.stage(bg)?;
+                if !takes_memory(decl, self.host_memory.as_deref()) {
+                    return None;
+                }
                 Some(Provider {
                     module: id.clone(),
                     decl: decl.clone(),
@@ -1471,7 +1569,8 @@ mod tests {
         for (sid, slot, rank, device, extra) in stages {
             text.push_str(&format!(
                 "[[stage]]\nid = \"{sid}\"\nslot = \"{slot}\"\nrank = {rank}\n\
-                 device = \"{device}\"\nframes = [\"cuda\"]\nformats = [\"nv12\"]\n{extra}\n"
+                 device = \"{device}\"\n{}formats = [\"nv12\"]\n{extra}\n",
+                default_frames(extra)
             ));
         }
         let path = Path::new("/m").join(format!("{id}.toml"));
@@ -1480,6 +1579,16 @@ mod tests {
             id: id.into(),
             manifest_path: path,
             manifest,
+        }
+    }
+
+    /// The `frames` line of a stage whose extra lines do not give one: CUDA
+    /// frames.
+    fn default_frames(extra: &str) -> &'static str {
+        if extra.contains("frames =") {
+            ""
+        } else {
+            "frames = [\"cuda\"]\n"
         }
     }
 
@@ -2154,7 +2263,8 @@ mod tests {
         for (sid, slot, rank, device, extra) in stages {
             text.push_str(&format!(
                 "[[stage]]\nid = \"{sid}\"\nslot = \"{slot}\"\nrank = {rank}\n\
-                 device = \"{device}\"\nframes = [\"cuda\"]\nformats = [\"nv12\"]\n{extra}\n"
+                 device = \"{device}\"\n{}formats = [\"nv12\"]\n{extra}\n",
+                default_frames(extra)
             ));
         }
         e.manifest = Manifest::parse(&text, &path);
@@ -2854,6 +2964,230 @@ mod tests {
         assert!(!hello.enabled);
         assert_eq!(hello.stages[0].reason, REASON_DISABLED);
         assert!(!hello.stages[0].available);
+    }
+
+    /// Maxine (CUDA frames only, with frame generation), an ONNX cut-out
+    /// that takes both kinds and a host-only stage, all probed installed.
+    fn memory_registry() -> Registry {
+        let mut r = Registry::from_entries([
+            entry(
+                MAXINE,
+                &[
+                    ("denoise", "pre-matte", 300, "nvidia-gpu", ""),
+                    ("background", "matte", 300, "nvidia-gpu", ""),
+                    (FRAME_GENERATION, "post-composite", 300, "nvidia-gpu", ""),
+                ],
+            ),
+            entry(
+                ONNX,
+                &[(
+                    "background",
+                    "matte",
+                    200,
+                    "gpu",
+                    "frames = [\"cuda\", \"host\"]",
+                )],
+            ),
+            entry(
+                HELLO,
+                &[("hello", "post-composite", 100, "cpu", "frames = [\"host\"]")],
+            ),
+        ]);
+        for id in [MAXINE, ONNX, HELLO] {
+            all_installed(&mut r, id);
+        }
+        r
+    }
+
+    fn provider(r: &Registry, stage: &str) -> Option<String> {
+        r.resolve(stage).provider
+    }
+
+    #[test]
+    fn in_cuda_memory_every_stage_runs_as_its_probe_says() {
+        let mut r = memory_registry();
+        assert_eq!(r.memory(), FrameKind::Cuda);
+        let cuda = |r: &Registry| {
+            assert_eq!(provider(r, "background").as_deref(), Some(MAXINE));
+            assert_eq!(provider(r, "denoise").as_deref(), Some(MAXINE));
+            assert_eq!(provider(r, FRAME_GENERATION).as_deref(), Some(MAXINE));
+            // A host-only stage runs on a host copy of the CUDA frames.
+            assert_eq!(provider(r, "hello").as_deref(), Some(HELLO));
+            assert_eq!(r.status(MAXINE), Some(ModuleStatus::Available));
+            assert!(
+                r.modules()
+                    .iter()
+                    .all(|m| m.stages.iter().all(|s| s.available))
+            );
+        };
+        cuda(&r);
+        // The reason is unused in CUDA memory.
+        r.set_memory(FrameKind::Cuda, REASON_NEEDS_CUDA);
+        cuda(&r);
+        // Back from system memory, nothing is left of it.
+        r.set_memory(FrameKind::Host, REASON_NEEDS_CUDA);
+        r.set_memory(FrameKind::Cuda, "");
+        assert_eq!(r.memory(), FrameKind::Cuda);
+        cuda(&r);
+    }
+
+    #[test]
+    fn in_system_memory_cuda_only_stages_are_unavailable_with_the_reason() {
+        let mut r = memory_registry();
+        r.set_memory(FrameKind::Host, REASON_CUDA_OFF);
+        assert_eq!(r.memory(), FrameKind::Host);
+        // The cut-out falls to the provider that takes host frames.
+        assert_eq!(
+            r.resolve("background"),
+            StageResolution {
+                stage: Some(s("background")),
+                provider: Some(ONNX.into()),
+                reason: None,
+            }
+        );
+        for stage in ["denoise", FRAME_GENERATION] {
+            assert_eq!(
+                r.resolve(stage),
+                StageResolution {
+                    stage: Some(s(stage)),
+                    provider: None,
+                    reason: Some(REASON_CUDA_OFF.into()),
+                },
+                "{stage}"
+            );
+        }
+        assert_eq!(provider(&r, "hello").as_deref(), Some(HELLO));
+        // A module none of whose stages takes host frames is unavailable for
+        // it; it stays open and probed.
+        assert_eq!(
+            r.status(MAXINE),
+            Some(ModuleStatus::Unavailable(REASON_CUDA_OFF.into()))
+        );
+        assert_eq!(
+            r.probed(MAXINE, "background"),
+            Some(Availability::Installed)
+        );
+        let info = r.modules();
+        let maxine = info.iter().find(|m| m.id == MAXINE).unwrap();
+        for st in &maxine.stages {
+            assert!(!st.available, "{}", st.id);
+            assert_eq!(st.reason, REASON_CUDA_OFF, "{}", st.id);
+            assert!(!st.selected, "{}", st.id);
+        }
+        let onnx = info.iter().find(|m| m.id == ONNX).unwrap();
+        assert!(onnx.stages[0].available && onnx.stages[0].selected);
+        assert_eq!(onnx.status, ModuleStatus::Available);
+        // A pin to the CUDA-only provider falls back and says why.
+        r.set_pin(s("background"), Some(MAXINE.into()));
+        assert_eq!(
+            r.resolve("background"),
+            StageResolution {
+                stage: Some(s("background")),
+                provider: Some(ONNX.into()),
+                reason: Some(format!(
+                    "Pinned module {MAXINE} is unavailable: {REASON_CUDA_OFF}"
+                )),
+            }
+        );
+        // In CUDA memory the pin is honoured again.
+        r.set_memory(FrameKind::Cuda, "");
+        assert_eq!(
+            r.resolve("background"),
+            StageResolution {
+                stage: Some(s("background")),
+                provider: Some(MAXINE.into()),
+                reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn in_system_memory_with_no_host_provider_the_stage_has_none() {
+        let mut r = memory_registry();
+        r.set_enabled(ONNX, false).unwrap();
+        r.set_memory(FrameKind::Host, REASON_NEEDS_CUDA);
+        assert_eq!(
+            r.resolve("background"),
+            StageResolution {
+                stage: Some(s("background")),
+                provider: None,
+                reason: Some(REASON_NEEDS_CUDA.into()),
+            }
+        );
+        // A probe that already said no keeps its own reason.
+        r.record_probe(
+            MAXINE,
+            Ok(vec![
+                (s("denoise"), Availability::NotInstalled("No model".into())),
+                (s("background"), Availability::Installed),
+                (s(FRAME_GENERATION), Availability::Installed),
+            ]),
+        )
+        .unwrap();
+        let info = r.modules();
+        let reasons: Vec<&str> = info[0].stages.iter().map(|s| s.reason.as_str()).collect();
+        assert_eq!(reasons, ["No model", REASON_NEEDS_CUDA, REASON_NEEDS_CUDA]);
+        // The reasons differ: the module's status says none can run.
+        assert_eq!(
+            r.status(MAXINE),
+            Some(ModuleStatus::Unavailable(REASON_NO_STAGE.into()))
+        );
+    }
+
+    #[test]
+    fn a_declaration_takes_the_session_frames_only_with_host_in_system_memory() {
+        let mut r = memory_registry();
+        for (id, stage) in [
+            (MAXINE, "background"),
+            (ONNX, "background"),
+            (HELLO, "hello"),
+        ] {
+            assert!(r.declares_for_memory(id, stage), "{id} {stage}");
+        }
+        assert!(!r.declares_for_memory(HELLO, "background"), "not declared");
+        assert!(!r.declares_for_memory("org.example.none", "background"));
+        r.set_memory(FrameKind::Host, REASON_NEEDS_CUDA);
+        assert!(!r.declares_for_memory(MAXINE, "background"));
+        assert!(!r.declares_for_memory(MAXINE, FRAME_GENERATION));
+        assert!(r.declares_for_memory(ONNX, "background"));
+        assert!(r.declares_for_memory(HELLO, "hello"));
+        r.set_memory(FrameKind::Cuda, "");
+        assert!(r.declares_for_memory(MAXINE, "background"));
+    }
+
+    #[test]
+    fn in_system_memory_the_conflicts_keep_the_cut_out_that_takes_host_frames() {
+        // Maxine declares a conflict with the ONNX module and is kept for its
+        // higher rank in CUDA memory; in system memory its cut-out cannot
+        // run, and the ONNX module's is kept.
+        let mut r = Registry::from_entries([
+            entry_with(
+                MAXINE,
+                &format!("conflicts = [\"{ONNX}\"]"),
+                &[("background", "matte", 300, "nvidia-gpu", "")],
+            ),
+            entry(
+                ONNX,
+                &[(
+                    "background",
+                    "matte",
+                    200,
+                    "gpu",
+                    "frames = [\"cuda\", \"host\"]",
+                )],
+            ),
+        ]);
+        all_installed(&mut r, MAXINE);
+        all_installed(&mut r, ONNX);
+        assert!(r.is_refused(ONNX));
+        assert!(!r.is_refused(MAXINE));
+        r.set_memory(FrameKind::Host, REASON_NEEDS_CUDA);
+        assert!(!r.is_refused(ONNX));
+        assert!(r.is_refused(MAXINE));
+        assert_eq!(provider(&r, "background").as_deref(), Some(ONNX));
+        r.set_memory(FrameKind::Cuda, "");
+        assert!(r.is_refused(ONNX));
+        assert_eq!(provider(&r, "background").as_deref(), Some(MAXINE));
     }
 
     #[test]

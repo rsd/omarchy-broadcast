@@ -19,8 +19,17 @@
 //! completed on the GPU (a CUDA event recorded after it), so a caller that
 //! reads them before synchronising the stream gets none.
 //!
-//! Shared by the GPU tests of `gst-obc` and `obc-pipeline` (included with
-//! `#[path]`).
+//! It takes host frames too (`load_host`, `process_host`,
+//! `reset_temporal_host`, the factory's `kinds` listing both memories unless
+//! made with [`FakeFactory::cuda_only`]): the same behaviour and output,
+//! written on the CPU, with no CUDA call at all, so the system-memory tests
+//! run without a GPU. One difference: on host frames the first Y row is the
+//! input's first Y row plus one (saturating), so the output depends on the
+//! input. It records a call of one memory's methods on an
+//! instance loaded on the other ([`FakeLog::wrong_memory`]).
+//!
+//! Shared by the tests of `gst-obc` (the GPU ones and the system-memory
+//! ones of `tests/element.rs`) and `obc-pipeline` (included with `#[path]`).
 
 #![allow(dead_code)] // each including test uses a different subset
 
@@ -31,8 +40,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use obc_backend::{
-    BackendError, BackendFactory, DeviceNv12, EffectKind, FrameParams, GpuContext,
-    InferenceBackend, LoadReport, LoadRequest, Params, StageId, StageList, StageTimings,
+    BackendError, BackendFactory, DeviceNv12, EffectKind, FrameKind, FrameParams, GpuContext,
+    HostNv12, InferenceBackend, LoadReport, LoadRequest, Params, StageId, StageList, StageTimings,
 };
 // The fake takes the relight stage's parameters as the Maxine backend does.
 use obc_backend_maxine::{RELIGHT_LIGHT, RelightLight, relight_frame};
@@ -174,6 +183,14 @@ pub struct FakeLog {
     pub relight_rebinds: AtomicU64,
     /// Chains lost on their own ([`FakeConfig::lose_chain_on_process`]).
     pub lost_chains: AtomicU64,
+    /// Successful `load_host` calls (counted in [`Self::loads`] too).
+    pub host_loads: AtomicU64,
+    /// Successful `process_host` calls (counted in [`Self::processes`]
+    /// too).
+    pub host_processes: AtomicU64,
+    /// Calls of the CUDA methods on an instance loaded on host frames, or
+    /// of the host methods on one loaded on CUDA frames.
+    pub wrong_memory: AtomicU64,
 }
 
 impl FakeLog {
@@ -186,13 +203,27 @@ impl FakeLog {
 pub struct FakeFactory {
     pub config: Arc<Mutex<FakeConfig>>,
     pub log: Arc<FakeLog>,
+    /// What `kinds` says.
+    kinds: Vec<FrameKind>,
 }
 
 impl FakeFactory {
+    /// A fake that takes CUDA and host frames.
     pub fn new(config: FakeConfig) -> Arc<FakeFactory> {
+        FakeFactory::with_kinds(config, vec![FrameKind::Cuda, FrameKind::Host])
+    }
+
+    /// A fake whose factory says it takes CUDA frames only (its instances
+    /// would still take host frames if asked).
+    pub fn cuda_only(config: FakeConfig) -> Arc<FakeFactory> {
+        FakeFactory::with_kinds(config, vec![FrameKind::Cuda])
+    }
+
+    fn with_kinds(config: FakeConfig, kinds: Vec<FrameKind>) -> Arc<FakeFactory> {
         Arc::new(FakeFactory {
             config: Arc::new(Mutex::new(config)),
             log: Arc::default(),
+            kinds,
         })
     }
 
@@ -212,6 +243,10 @@ impl BackendFactory for FakeFactory {
 
     fn check_params(&self, stage: &StageId, params: &Params, live: &Params) -> Result<(), String> {
         obc_backend_maxine::check_stage_params(stage.as_str(), params, live)
+    }
+
+    fn kinds(&self) -> &[FrameKind] {
+        &self.kinds
     }
 
     fn probe(&self) -> Result<(), BackendError> {
@@ -236,6 +271,8 @@ impl BackendFactory for FakeFactory {
             context: 0,
             done: None,
             timed: (false, false),
+            host: false,
+            host_done: false,
         }))
     }
 }
@@ -260,6 +297,11 @@ pub struct FakeBackend {
     done: Option<Event>,
     /// The stages that ran on the last frame (denoise, relight).
     timed: (bool, bool),
+    /// The last load was `load_host`: no CUDA call is made for this
+    /// instance (no context check, no event).
+    host: bool,
+    /// The last frame was processed on the host: its work is complete.
+    host_done: bool,
 }
 
 impl FakeBackend {
@@ -269,15 +311,22 @@ impl FakeBackend {
             self.log.wrong_context.fetch_add(1, Ordering::SeqCst);
         }
     }
-}
 
-impl InferenceBackend for FakeBackend {
-    fn name(&self) -> &'static str {
-        "fake"
+    /// Records a call of the `host` memory's methods on an instance
+    /// loaded on the other one.
+    fn check_memory(&self, host: bool) {
+        if self.loaded.is_some() && self.host != host {
+            self.log.wrong_memory.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
-    fn load(&mut self, gpu: &GpuContext, req: &LoadRequest) -> Result<LoadReport, BackendError> {
-        self.check_context(gpu.context);
+    /// `load` and `load_host`: `gpu` is the CUDA context and stream, `None`
+    /// for host frames.
+    fn load_on(
+        &mut self,
+        gpu: Option<&GpuContext>,
+        req: &LoadRequest,
+    ) -> Result<LoadReport, BackendError> {
         let denoise = req.stages.contains("denoise");
         let relight = req.stages.contains("relight");
         let light = req
@@ -387,9 +436,13 @@ impl InferenceBackend for FakeBackend {
         self.denoise = denoise;
         self.relight = relight;
         self.light = light;
-        self.stream = gpu.stream as usize;
-        self.context = gpu.context as usize;
+        self.stream = gpu.map_or(0, |g| g.stream as usize);
+        self.context = gpu.map_or(0, |g| g.context as usize);
+        self.host = gpu.is_none();
         self.log.loads.fetch_add(1, Ordering::SeqCst);
+        if self.host {
+            self.log.host_loads.fetch_add(1, Ordering::SeqCst);
+        }
         self.log.loaded.lock().unwrap().push(req.effect);
         self.log
             .requests
@@ -409,17 +462,9 @@ impl InferenceBackend for FakeBackend {
         })
     }
 
-    fn process(
-        &mut self,
-        gpu: &GpuContext,
-        params: &FrameParams,
-        src: &DeviceNv12,
-        dst: &DeviceNv12,
-    ) -> Result<(), BackendError> {
-        self.check_context(gpu.context);
-        if gpu.stream as usize != self.stream {
-            self.log.wrong_stream.fetch_add(1, Ordering::SeqCst);
-        }
+    /// The luma and chroma of a frame of the loaded chain, after the test's
+    /// hooks and failures (shared by both memories).
+    fn frame_output(&mut self) -> Result<(u8, u8), BackendError> {
         let hook = self.config.lock().unwrap().on_process.take();
         if let Some(hook) = hook {
             (hook.0)();
@@ -478,8 +523,11 @@ impl InferenceBackend for FakeBackend {
             y
         };
         let uv = if self.denoise { FAKE_DENOISE_UV } else { 128 };
-        src.validate()?;
-        dst.validate()?;
+        Ok((y, uv))
+    }
+
+    /// Counts a frame about to be written (shared by both memories).
+    fn count_frame(&self, params: &FrameParams) {
         self.log.processes.fetch_add(1, Ordering::SeqCst);
         if self.denoise {
             self.log.denoised.fetch_add(1, Ordering::SeqCst);
@@ -497,6 +545,53 @@ impl InferenceBackend for FakeBackend {
             (params.blur_strength * 1000.0).round() as u64,
             Ordering::SeqCst,
         );
+    }
+
+    /// `reset_temporal` and `reset_temporal_host`.
+    fn reset(&mut self) -> Result<StageList, BackendError> {
+        self.log.resets.fetch_add(1, Ordering::SeqCst);
+        let in_place = self.config.lock().unwrap().relight_resets_in_place;
+        if self.relight && self.loaded.is_some() && !in_place {
+            self.relight = false;
+            self.log
+                .relight_resets_dropped
+                .fetch_add(1, Ordering::SeqCst);
+            return Ok(StageId::RELIGHT.into());
+        }
+        Ok(StageList::default())
+    }
+}
+
+impl InferenceBackend for FakeBackend {
+    fn name(&self) -> &'static str {
+        "fake"
+    }
+
+    fn load(&mut self, gpu: &GpuContext, req: &LoadRequest) -> Result<LoadReport, BackendError> {
+        self.check_context(gpu.context);
+        self.load_on(Some(gpu), req)
+    }
+
+    fn load_host(&mut self, req: &LoadRequest) -> Result<LoadReport, BackendError> {
+        self.load_on(None, req)
+    }
+
+    fn process(
+        &mut self,
+        gpu: &GpuContext,
+        params: &FrameParams,
+        src: &DeviceNv12,
+        dst: &DeviceNv12,
+    ) -> Result<(), BackendError> {
+        self.check_context(gpu.context);
+        self.check_memory(false);
+        if gpu.stream as usize != self.stream {
+            self.log.wrong_stream.fetch_add(1, Ordering::SeqCst);
+        }
+        let (y, uv) = self.frame_output()?;
+        src.validate()?;
+        dst.validate()?;
+        self.count_frame(params);
         let (w, h) = (dst.width as usize, dst.height as usize);
         // SAFETY: `dst` is the caller's mapped output frame in the current
         // context; the stream is the caller's.
@@ -516,6 +611,48 @@ impl InferenceBackend for FakeBackend {
                 .record(gpu.stream)?
         };
         self.timed = (self.denoise, self.relight);
+        self.host_done = false;
+        Ok(())
+    }
+
+    /// The same frame as `process`, written on the CPU, except that the
+    /// first Y row follows the input: each of its pixels is the input's
+    /// plus one (saturating), so a test can tell the output was made from
+    /// `src` (and that `src` and `dst` were not swapped). `src` is never
+    /// written.
+    fn process_host(
+        &mut self,
+        params: &FrameParams,
+        src: &HostNv12,
+        dst: &mut HostNv12,
+    ) -> Result<(), BackendError> {
+        self.check_memory(true);
+        let (y, uv) = self.frame_output()?;
+        src.validate()?;
+        dst.validate()?;
+        if (src.width, src.height) != (dst.width, dst.height) {
+            return Err(BackendError::InvalidInput("src and dst differ".into()));
+        }
+        self.count_frame(params);
+        self.log.host_processes.fetch_add(1, Ordering::SeqCst);
+        let (w, h) = (dst.width as usize, dst.height as usize);
+        let (yp, uvp) = (dst.y_pitch, dst.uv_pitch);
+        // SAFETY: the caller's frame, as `HostNv12` documents it.
+        let (y_plane, uv_plane) = unsafe { dst.planes_mut() }?;
+        for r in 0..h {
+            y_plane[r * yp..r * yp + w].fill(y);
+        }
+        for r in 0..h / 2 {
+            uv_plane[r * uvp..r * uvp + w].fill(uv);
+        }
+        // SAFETY: `src` is the caller's readable frame of at least `w`
+        // bytes per Y row (validated above), and does not overlap `dst`.
+        let src_row = unsafe { std::slice::from_raw_parts(src.y.cast_const(), w) };
+        for (d, s) in y_plane[..w].iter_mut().zip(src_row) {
+            *d = s.saturating_add(1);
+        }
+        self.timed = (self.denoise, self.relight);
+        self.host_done = true;
         Ok(())
     }
 
@@ -528,10 +665,14 @@ impl InferenceBackend for FakeBackend {
         self.denoise = false;
         self.relight = false;
         self.timed = (false, false);
+        self.host_done = false;
         // Destroyed with the context current (the caller's rule for unload).
         self.done = None;
         if self.loaded.take().is_some() {
-            self.check_context(self.context as *mut c_void);
+            // An instance of host frames has no context to check.
+            if !self.host {
+                self.check_context(self.context as *mut c_void);
+            }
             self.log.unloads.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -542,10 +683,11 @@ impl InferenceBackend for FakeBackend {
     /// events): before the caller synchronises the stream, the frame is
     /// most likely still queued and there is nothing to report.
     fn timings(&self) -> Option<StageTimings> {
-        let complete = self
-            .done
-            .as_ref()
-            .is_some_and(|e| e.is_complete().unwrap_or(false));
+        let complete = self.host_done
+            || self
+                .done
+                .as_ref()
+                .is_some_and(|e| e.is_complete().unwrap_or(false));
         let (denoise, relight) = self.timed;
         (self.loaded.is_some() && (denoise || relight) && complete).then(|| {
             let mut t = StageTimings::new();
@@ -561,16 +703,13 @@ impl InferenceBackend for FakeBackend {
 
     fn reset_temporal(&mut self, gpu: &GpuContext) -> Result<StageList, BackendError> {
         self.check_context(gpu.context);
-        self.log.resets.fetch_add(1, Ordering::SeqCst);
-        let in_place = self.config.lock().unwrap().relight_resets_in_place;
-        if self.relight && self.loaded.is_some() && !in_place {
-            self.relight = false;
-            self.log
-                .relight_resets_dropped
-                .fetch_add(1, Ordering::SeqCst);
-            return Ok(StageId::RELIGHT.into());
-        }
-        Ok(StageList::default())
+        self.check_memory(false);
+        self.reset()
+    }
+
+    fn reset_temporal_host(&mut self) -> Result<StageList, BackendError> {
+        self.check_memory(true);
+        self.reset()
     }
 }
 

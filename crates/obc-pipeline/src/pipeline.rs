@@ -15,6 +15,11 @@
 //! is future work. The CPU convert path keeps the camera's colorimetry label
 //! through `videoconvert` ([`pinned_caps`]).
 //!
+//! An ingest of canonical frames in system memory has no upload: its
+//! `videoconvertscale` takes the camera's frames as captured (YUY2/UYVY
+//! included, with no separate `videoconvert`) or as decoded by `jpegdec`
+//! ([`ingest_adapter`]).
+//!
 //! **CUDA memory from `cudaupload` on.** The CUDAMemory capsfilter right
 //! after `cudaupload` is load-bearing: without it, `cudaupload` and the next
 //! CUDA element may negotiate plain system memory and silently pass frames
@@ -24,7 +29,8 @@
 
 use gst::glib;
 use gst::prelude::*;
-use obc_core::{OutputContract, OutputFormat, VideoMode};
+use obc_core::config::VideoMemory;
+use obc_core::{ColourRange, OutputContract, OutputFormat, PixelFormat, VideoMode};
 use serde::Serialize;
 
 use crate::capability::IngestPath;
@@ -37,7 +43,12 @@ pub mod names {
     pub const QUEUE: &str = "queue";
     /// `jpegdec` (CPU decode path only).
     pub const DECODE: &str = "decode";
-    /// `videoconvert` (CPU convert path only).
+    /// `videobalance` of the system-memory MJPEG range conversion (limited
+    /// contract only).
+    pub const RANGE_BALANCE: &str = "range_balance";
+    /// `capssetter` relabelling the balanced frames as limited range.
+    pub const RANGE_RELABEL: &str = "range_relabel";
+    /// `videoconvert` (CPU convert path in CUDA memory only).
     pub const INGEST_CONVERT: &str = "ingest_convert";
     /// System-memory capsfilter after the CPU adapter.
     pub const INGEST_CAPS: &str = "ingest_caps";
@@ -102,6 +113,15 @@ pub enum PipelineError {
     Link(String),
     #[error("state change failed: {0}")]
     State(String),
+    /// A state change that failed with the error an element posted on the
+    /// bus for it ([`MediaPipeline::state_failure`]): which element, the
+    /// factory it was made from, and its error.
+    #[error("state change failed: {element} ({factory}): {message}")]
+    ElementState {
+        element: String,
+        factory: String,
+        message: String,
+    },
     /// v4l2loopback keeps the format of an earlier stream while any consumer
     /// still holds the device open, and refuses every other one.
     #[error(
@@ -327,16 +347,19 @@ pub struct MediaPipeline {
     loopback_caps: Option<gst::Caps>,
 }
 
-/// The camera end of an ingest chain, up to (not including) `cudaupload`:
-/// `v4l2src ! capsfilter (mode) ! queue (leaky) [! CPU adapter]`. The last
-/// element carries the system-memory frames handed to `cudaupload`, in
-/// [`IngestPath::upload_format`].
+/// The camera end of an ingest chain of canonical frames in `memory`, up
+/// to the canonical tail (`cudaupload` in CUDA memory):
+/// `v4l2src ! capsfilter (mode) ! queue (leaky) [! CPU adapter]`
+/// ([`ingest_adapter`]). Returns the elements in link order and the format
+/// of the system-memory frames the last one hands the tail.
 pub(crate) fn camera_head(
     camera: &std::path::Path,
     mode: &VideoMode,
     io_mode: &str,
     queue_buffers: u32,
-) -> Result<Vec<gst::Element>, PipelineError> {
+    memory: VideoMemory,
+    range: ColourRange,
+) -> Result<(Vec<gst::Element>, &'static str), PipelineError> {
     use names::*;
     let src = make("v4l2src", CAMERA)?;
     src.set_property("device", camera.to_string_lossy().as_ref());
@@ -348,27 +371,99 @@ pub(crate) fn camera_head(
     queue.set_property("max-size-time", 0u64);
     set_enum(&queue, "leaky", "downstream")?;
 
-    let ingest = IngestPath::of(mode.format);
-    let in_format = ingest.upload_format(mode.format);
     let camera_caps = capsfilter(CAMERA_CAPS, &mode.to_caps_string())?;
     let mut chain = vec![src, camera_caps.clone(), queue];
-    // CPU ingest adapters (see the module docs).
-    match ingest {
-        IngestPath::GpuDirect => {}
-        IngestPath::CpuConvert => {
+    let (adapter, format) = ingest_adapter(&camera_caps, mode.format, memory, range)?;
+    chain.extend(adapter);
+    Ok((chain, format))
+}
+
+/// The CPU ingest adapter after `camera_caps` (the capsfilter of the
+/// camera mode) for a camera format, in an ingest of canonical frames in
+/// `memory` (see the module docs): the elements in link order (none on the
+/// GPU-direct path) and the format of the system-memory frames they
+/// deliver to the canonical tail.
+///
+/// In CUDA memory the format is [`IngestPath::upload_format`]. In system
+/// memory the tail's `videoconvertscale` converts the format, the size and
+/// the colour label in one pass, so the CPU convert path has no adapter
+/// (a separate `videoconvert` would convert twice) and hands the tail the
+/// camera's packed 4:2:2 frames as captured; MJPEG is still decoded by
+/// `jpegdec` into I420.
+///
+/// `range` is the contract's colour range. For a limited contract the
+/// system-memory MJPEG path converts the decoder's full range to limited
+/// range itself ([`FULL_TO_LIMITED_BALANCE`]): `videoconvertscale` does not,
+/// see there.
+pub fn ingest_adapter(
+    camera_caps: &gst::Element,
+    format: PixelFormat,
+    memory: VideoMemory,
+    range: ColourRange,
+) -> Result<(Vec<gst::Element>, &'static str), PipelineError> {
+    use names::*;
+    let path = IngestPath::of(format);
+    match (path, memory) {
+        (IngestPath::GpuDirect, _) | (IngestPath::CpuConvert, VideoMemory::System) => {
+            Ok((Vec::new(), format.gst_name()))
+        }
+        (IngestPath::CpuConvert, VideoMemory::Cuda) => {
             // Keep the camera's colorimetry label through the CPU
             // conversion (videoconvert would otherwise pick its own).
-            chain.extend(cpu_convert_stage(&camera_caps, in_format)?);
+            let to = path.upload_format(format);
+            Ok((cpu_convert_stage(camera_caps, to)?.into(), to))
         }
-        IngestPath::CpuDecode => {
-            chain.push(make("jpegdec", DECODE)?);
-            chain.push(capsfilter(
-                INGEST_CAPS,
-                &format!("video/x-raw,format={in_format}"),
-            )?);
+        (IngestPath::CpuDecode, _) => {
+            let to = path.upload_format(format);
+            let decode = make("jpegdec", DECODE)?;
+            let caps = capsfilter(INGEST_CAPS, &format!("video/x-raw,format={to}"))?;
+            let mut chain = vec![decode, caps];
+            if memory == VideoMemory::System && range == ColourRange::Limited {
+                chain.extend(full_to_limited_range()?);
+            }
+            Ok((chain, to))
         }
     }
-    Ok(chain)
+}
+
+/// Luma gain of the full-range to limited-range conversion: 219/255 (the
+/// limited luma span over the full one).
+const LUMA_CONTRAST: f64 = 219.0 / 255.0;
+/// Luma offset of the conversion, as `videobalance` brightness:
+/// 16 * 219 / 255^2. With the gain above it maps Y=0 to 16 and Y=255 to
+/// 235 (checked against `videobalance` 1.28 in the ingest tests).
+const LUMA_BRIGHTNESS: f64 = 16.0 * 219.0 / (255.0 * 255.0);
+/// Chroma gain of the conversion: 224/255 (the limited chroma span over the
+/// full one), about the neutral 128.
+const CHROMA_SATURATION: f64 = 224.0 / 255.0;
+/// The colorimetry the balanced frames are relabelled with: BT.601, limited
+/// range (the matrix and the transfer of `jpegdec`'s `1:4:0:0`, the range
+/// of the contract).
+const LIMITED_RELABEL: &str = "video/x-raw,colorimetry=(string)2:4:0:0";
+
+/// Converts `jpegdec`'s full-range I420 to limited range:
+/// `videobalance ! capssetter`.
+///
+/// GStreamer 1.28's `videoconvert` / `videoconvertscale` do not convert
+/// the range when it is the only difference: the converter compares the
+/// matrix and the primaries, so full-range BT.601 (`1:4:0:0`) reaching the
+/// limited canonical caps (`2:4:5:1`) would pass through unchanged, with
+/// black at Y=0. `videobalance` applies the exact levels instead (the
+/// constants above), and `capssetter` then labels the frames limited range.
+/// The relabel is essential: a GStreamer whose converter does check the
+/// range would otherwise see full-range frames and convert them a second
+/// time.
+fn full_to_limited_range() -> Result<[gst::Element; 2], PipelineError> {
+    let balance = make("videobalance", names::RANGE_BALANCE)?;
+    balance.set_property("contrast", LUMA_CONTRAST);
+    balance.set_property("brightness", LUMA_BRIGHTNESS);
+    balance.set_property("saturation", CHROMA_SATURATION);
+    let relabel = make("capssetter", names::RANGE_RELABEL)?;
+    let caps: gst::Caps = LIMITED_RELABEL
+        .parse()
+        .map_err(|_| PipelineError::Link(format!("bad caps {LIMITED_RELABEL}")))?;
+    relabel.set_property("caps", &caps);
+    Ok([balance, relabel])
 }
 
 /// Adds `chain` to `pipeline` and links it in order.
@@ -555,6 +650,37 @@ impl MediaPipeline {
     /// not hold element references beyond this point.
     pub fn shutdown(self) -> Result<(), PipelineError> {
         self.shutdown_checked().map_err(Into::into)
+    }
+
+    /// What the state change failure `e` was, with the bus's word: when
+    /// `e` is a [`PipelineError::State`] and an element posted an error on
+    /// the bus, [`PipelineError::ElementState`] naming the first one that
+    /// did (its element, factory and error); else `e`. It takes the bus's
+    /// pending error messages, so call it before the pipeline goes back to
+    /// NULL (which flushes the bus).
+    pub fn state_failure(&self, e: PipelineError) -> PipelineError {
+        if !matches!(e, PipelineError::State(_)) {
+            return e;
+        }
+        let bus = self.bus();
+        while let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error]) {
+            let gst::MessageView::Error(err) = msg.view() else {
+                continue;
+            };
+            let Some(element) = msg.src().and_then(|s| s.downcast_ref::<gst::Element>()) else {
+                continue;
+            };
+            let factory = element
+                .factory()
+                .map(|f| f.name().to_string())
+                .unwrap_or_default();
+            return PipelineError::ElementState {
+                element: element.name().to_string(),
+                factory,
+                message: err.error().to_string(),
+            };
+        }
+        e
     }
 
     /// [`Self::shutdown`], its error saying whether the pipeline reached
@@ -1195,5 +1321,49 @@ mod tests {
             cuda_caps("NV12"),
             "video/x-raw(memory:CUDAMemory),format=NV12"
         );
+    }
+
+    /// CUDA-free: a state change an element failed with an error on the
+    /// bus names that element and its factory; another error is kept.
+    #[test]
+    fn a_state_failure_names_the_element_that_posted_the_error() {
+        require_elements(&["filesrc", "fakesink"]);
+        let pipeline = gst::Pipeline::with_name("state-failure-test");
+        let src = make("filesrc", "upload").unwrap();
+        src.set_property("location", "/nonexistent/obc-state-failure-test");
+        let sink = make("fakesink", "sink").unwrap();
+        pipeline.add_many([&src, &sink]).unwrap();
+        src.link(&sink).unwrap();
+        let p = MediaPipeline {
+            pipeline,
+            loopback_caps: None,
+        };
+        let e = p.play().unwrap_err();
+        assert!(matches!(e, PipelineError::State(_)), "{e:?}");
+        let e = p.state_failure(e);
+        let PipelineError::ElementState {
+            element,
+            factory,
+            message,
+        } = &e
+        else {
+            panic!("{e:?}")
+        };
+        assert_eq!((element.as_str(), factory.as_str()), ("upload", "filesrc"));
+        assert!(!message.is_empty());
+        assert!(
+            e.to_string()
+                .starts_with("state change failed: upload (filesrc): "),
+            "{e}"
+        );
+        // Back in NULL the bus is flushed: with no error on it a failure
+        // is kept as it is, and an error other than a state change is
+        // never looked up.
+        p.pipeline().set_state(gst::State::Null).unwrap();
+        let other = p.state_failure(PipelineError::State("busy".into()));
+        assert!(matches!(other, PipelineError::State(m) if m == "busy"));
+        let caps = p.state_failure(PipelineError::Caps("x".into()));
+        assert!(matches!(caps, PipelineError::Caps(_)));
+        p.shutdown().unwrap();
     }
 }

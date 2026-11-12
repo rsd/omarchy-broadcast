@@ -1,6 +1,6 @@
 # ADR-0017: Park the daemon's GPU state at Idle with the CUDA checkpoint API
 
-- **Status:** Accepted (2026-11-09; amended 2026-11-09: a session that does not stop cleanly disables parking until the daemon restarts, and `unpark` sets the parked flag before it restores a process checkpointed by another tool). Amends [ADR-0006](0006-on-demand-gpu-lifecycle.md) (what Idle holds after an activation) and [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md) (the worker-process fallback is replaced by this).
+- **Status:** Accepted (2026-11-09; amended 2026-11-09: a session that does not stop cleanly disables parking until the daemon restarts, and `unpark` sets the parked flag before it restores a process checkpointed by another tool; amended 2026-11-12 by [ADR-0033](0033-system-memory-pipeline.md): the CUDA presence probe is allowed at any time, and a session in system memory is neither unparked nor parked). Amends [ADR-0006](0006-on-demand-gpu-lifecycle.md) (what Idle holds after an activation) and [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md) (the worker-process fallback is replaced by this).
 
 ## Context
 - [ADR-0006](0006-on-demand-gpu-lifecycle.md) needs the dGPU to be able to runtime-suspend while the daemon idles. [../benchmarks/dgpu-idle.md](../benchmarks/dgpu-idle.md) showed that tearing the pipeline down releases the CUDA context but leaves 7 `/dev/nvidia*` fds (`nvidia0` x4, `nvidiactl` x1, `nvidia-uvm` x2) until the process exits, and left open whether they block suspend. [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md) named a worker process as the fallback.
@@ -30,6 +30,8 @@
 - A park failure keeps the GPU awake (the previous behaviour) and logs a warning.
 - An unpark failure fails the session start with "the GPU could not be restored from its parked state: <err>; restart the daemon". The controller enters `error` and the loopback keeps sending its black placeholder frames (fail closed).
 - A start that fails after a successful unpark parks again.
+- *Amendment (2026-11-12, [ADR-0033](0033-system-memory-pipeline.md)):* a start that fails **for want of CUDA** (no usable device, the `nvcodec` elements missing, no CUDA context opened) is not parked: the process holds no CUDA context to release, and the driver's checkpoint lock crashed inside `libcuda` there (measured with `CUDA_VISIBLE_DEVICES` naming no GPU). No driver call is made.
+- *Amendment (2026-11-12, [ADR-0033](0033-system-memory-pipeline.md)):* a session whose frames are in **system memory** makes no CUDA call, so it is neither unparked nor parked: it starts while the process is parked, leaves the GPU as it found it, and never taints the parker (an unclean stop of it is warned about only). A CUDA session that one replaces is stopped and parked first, as at any stop. An unpark failure still fails a CUDA start with the error above; under `auto` it does not fall back to system memory, because the process is then parked.
 - **Taint.** If a teardown leaves a pipeline that did not reach NULL, something of the session may still be alive and call CUDA, which would block once the process is parked. **Taint disables parking until the daemon restarts**: the daemon logs one warning and the GPU stays awake, as before parking existed. It covers:
   - a session stop that did not reach NULL;
   - a restart whose stop of the previous session did not reach NULL;
@@ -49,6 +51,7 @@ Each was checked:
 - the effect capability check, which the controller runs before the session starts, so while parked: it only `dlopen`s the SDK libraries and checks the model directory;
 - the loopback writer and the PipeWire tap: forwarded buffers are system memory from a `GstVideoBufferPool` (observed with GStreamer 1.28.8), so releasing them needs no CUDA;
 - process exit while parked, which is prompt.
+- *Amendment (2026-11-12, [ADR-0033](0033-system-memory-pipeline.md)):* the CUDA presence probe (`obc_gpu::presence`), which decides whether a session keeps its frames in GPU or system memory. It reads the environment, lists `/proc/driver/nvidia/gpus` (no file inside is read), opens `libcuda.so.1` with `dlopen` (which opens no device node, as `obc-gpu::checkpoint` already does) and looks the CUDA elements up in GStreamer's registry (which loads no plugin). It calls no `cu*` function, NVML or `ElementFactory::make` of a CUDA element, so it is allowed while parked and at Idle, and may run at any time, including before the first activation.
 
 ## Consequences
 - **Hazard: a CUDA call made while parked blocks until the next unpark** (one was measured waiting 2.3 s). While parked, `driver()` refuses with `GpuError::Parked` (mapped to `BackendError::Unavailable`) instead of blocking. Refusals are counted and the daemon logs a warning when the count grows. A future code path at Idle must not call CUDA, directly or through a library; the list above is the set that was checked.

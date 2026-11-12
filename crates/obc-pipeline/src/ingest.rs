@@ -52,10 +52,29 @@
 //! frames reach the output as CUDA memory of the same context, without a
 //! copy.
 //!
-//! **System memory.** Inside the crate the same stage can also produce
-//! canonical frames in system memory (`FrameMemory::System`), for the
-//! CPU-only tests: no `cudaupload`, `videoconvertscale` in place of
-//! `cudaconvertscale`, and no CUDA context.
+//! **System memory.** An ingest writing for an output built in system
+//! memory ([`crate::output::Output::build_in`] with [`VideoMemory::System`];
+//! the memory comes with the [`FrameWriter`]) produces canonical frames in
+//! system memory, with no CUDA element and no CUDA context:
+//!
+//! ```text
+//! v4l2src ! capsfilter <camera mode> ! queue
+//!   [ ! jpegdec ! capsfilter video/x-raw,format=I420 ]      CPU decode (MJPEG)
+//!   [ ! videobalance ! capssetter ]                         MJPEG, limited contract: range
+//!   [ ! videocrop ]                                         crop-to-fill policy only
+//!   ! videoconvertscale add-borders=<letterbox>
+//!   ! capsfilter  <canonical caps, system memory>
+//!   ! appsink
+//! ```
+//!
+//! `videoconvertscale` converts the format, the size and the colour label
+//! in one pass (but not the range when it is the only difference: the
+//! decoder's full range is converted by the `videobalance` step,
+//! [`crate::pipeline::ingest_adapter`]), so YUY2 and UYVY reach it as captured, with no separate
+//! `videoconvert` ([`crate::pipeline::ingest_adapter`]); a camera mode
+//! already at the canonical caps passes through without a copy. The enhance
+//! stage runs on CUDA frames only: an ingest in system memory refuses it
+//! where it would apply ([`PipelineError::Cuda`]).
 //!
 //! **Camera controls.** An ingest optionally pins the UVC
 //! `exposure_dynamic_framerate` control off while it runs (a camera with it
@@ -79,12 +98,13 @@ use obc_core::{AspectPolicy, OutputContract, VideoMode};
 
 use crate::capability::IngestPath;
 use crate::controls::{CID_EXPOSURE_AUTO_PRIORITY, ControlGuard, CtrlSkip, get_ctrl, probe_ctrl};
-use crate::frame::{Canonical, FrameMemory, FrameWriter};
+use crate::frame::{Canonical, FrameWriter};
 use crate::geometry::{Crop, crop_for};
 use crate::pipeline::{
     MediaPipeline, PipelineError, StopError, add_linked, both_stopped, camera_head, capsfilter,
     cuda_caps, make, names,
 };
+use obc_core::config::VideoMemory;
 
 /// The GStreamer context type that carries a `GstCudaContext`.
 pub const CUDA_CONTEXT_TYPE: &str = "gst.cuda.context";
@@ -289,7 +309,7 @@ pub fn canonical_tail(
     aspect: AspectPolicy,
 ) -> Result<(Vec<gst::Element>, Crop), PipelineError> {
     tail_in(
-        FrameMemory::Cuda,
+        VideoMemory::Cuda,
         upload_format,
         (width, height),
         canonical,
@@ -318,8 +338,8 @@ enum TailStep {
 /// The elements of the canonical tail for frames in `memory` under
 /// `aspect`, with the enhance stage when `enhance` (CUDA frames only: in
 /// system memory it is never there).
-fn tail_steps(memory: FrameMemory, aspect: AspectPolicy, enhance: bool) -> Vec<TailStep> {
-    let cuda = memory == FrameMemory::Cuda;
+fn tail_steps(memory: VideoMemory, aspect: AspectPolicy, enhance: bool) -> Vec<TailStep> {
+    let cuda = memory == VideoMemory::Cuda;
     let mut steps = Vec::with_capacity(6);
     if cuda {
         steps.extend([TailStep::Upload, TailStep::CudaCaps]);
@@ -359,7 +379,7 @@ fn enhance_element(plan: &EnhancePlan) -> Result<gst::Element, PipelineError> {
 /// videoconvertscale ! capsfilter (canonical, system memory)`; an enhance
 /// stage is refused there.
 fn tail_in(
-    memory: FrameMemory,
+    memory: VideoMemory,
     upload_format: &str,
     (width, height): (u32, u32),
     canonical: &Canonical,
@@ -367,7 +387,7 @@ fn tail_in(
     enhance: Option<&EnhancePlan>,
 ) -> Result<(Vec<gst::Element>, Crop), PipelineError> {
     use names::*;
-    if enhance.is_some() && memory != FrameMemory::Cuda {
+    if enhance.is_some() && memory != VideoMemory::Cuda {
         return Err(PipelineError::Cuda(
             "the enhance stage needs an ingest of CUDA frames".into(),
         ));
@@ -393,14 +413,14 @@ fn tail_in(
             TailStep::Enhance => enhance_element(enhance.expect("planned with an enhance stage"))?,
             TailStep::Scale => {
                 let scaler = match memory {
-                    FrameMemory::Cuda => "cudaconvertscale",
-                    FrameMemory::System => "videoconvertscale",
+                    VideoMemory::Cuda => "cudaconvertscale",
+                    VideoMemory::System => "videoconvertscale",
                 };
                 let scale = make(scaler, SCALE)?;
                 scale.set_property("add-borders", aspect == AspectPolicy::Letterbox);
                 scale
             }
-            TailStep::Canonical => capsfilter(CANONICAL_CAPS, &memory.caps_string(canonical))?,
+            TailStep::Canonical => capsfilter(CANONICAL_CAPS, &canonical.caps_in(memory))?,
         });
     }
     Ok((tail, crop))
@@ -464,7 +484,7 @@ pub struct Ingest {
     path: Option<IngestPath>,
     crop: Crop,
     controls: ControlReport,
-    memory: FrameMemory,
+    memory: VideoMemory,
     /// The enhance stage, when the pipeline has one.
     enhance: Option<ObcEnhance>,
     /// The first failure [`Self::poll_failure`] found (sticky).
@@ -472,14 +492,21 @@ pub struct Ingest {
 }
 
 impl Ingest {
-    /// Builds (but does not start) a camera ingest writing into `writer`.
+    /// Builds (but does not start) a camera ingest writing into `writer`,
+    /// in the writer's memory ([`FrameWriter::memory`]; see the module
+    /// docs). In system memory an enhance stage is refused
+    /// ([`PipelineError::Cuda`]): it runs on CUDA frames only, so a caller
+    /// building a system-memory session leaves [`IngestConfig::enhance`]
+    /// off.
     pub fn build(cfg: &IngestConfig, writer: FrameWriter) -> Result<Self, PipelineError> {
         let path = cfg.ingest_path();
-        let head = camera_head(
+        let (head, tail_format) = camera_head(
             &cfg.camera,
             &cfg.mode,
             &cfg.camera_io_mode,
             cfg.queue_buffers,
+            writer.memory(),
+            writer.canonical().range,
         )?;
         let enhance = cfg
             .enhance
@@ -488,7 +515,7 @@ impl Ingest {
             .map(|b| (b, cfg.enhance_params.clone()));
         let mut ingest = Self::from_head_planned(
             head,
-            path.upload_format(cfg.mode.format),
+            tail_format,
             (cfg.mode.width, cfg.mode.height),
             cfg.aspect,
             enhance,
@@ -599,10 +626,11 @@ impl Ingest {
         self.start_with(Some(cuda))
     }
 
-    /// [`Self::start`] with the output's CUDA context if it has one: an
-    /// ingest of system-memory frames ([`FrameMemory::System`]) starts
-    /// without one, an ingest of CUDA frames refuses to.
-    pub(crate) fn start_with(&mut self, cuda: Option<&gst::Context>) -> Result<(), PipelineError> {
+    /// [`Self::start`] with the output's CUDA context if it has one
+    /// ([`crate::output::Output::cuda_context`]): an ingest of
+    /// system-memory frames ([`VideoMemory::System`]) starts without one, an
+    /// ingest of CUDA frames refuses to.
+    pub fn start_with(&mut self, cuda: Option<&gst::Context>) -> Result<(), PipelineError> {
         match cuda {
             Some(cuda) if cuda.context_type() != CUDA_CONTEXT_TYPE => {
                 return Err(PipelineError::Cuda(format!(
@@ -610,7 +638,7 @@ impl Ingest {
                     cuda.context_type()
                 )));
             }
-            None if self.memory == FrameMemory::Cuda => {
+            None if self.memory == VideoMemory::Cuda => {
                 return Err(PipelineError::Cuda(format!(
                     "an ingest of CUDA frames needs the output's {CUDA_CONTEXT_TYPE} context"
                 )));
@@ -772,7 +800,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use obc_core::OutputContract;
+    use obc_core::{ColourRange, OutputContract};
 
     use super::*;
     use crate::slot::Slot;
@@ -942,7 +970,7 @@ mod tests {
                 "NV12",
                 (640, 480),
                 aspect,
-                writer(&contract).in_memory(FrameMemory::System),
+                writer(&contract).in_memory(VideoMemory::System),
             )
             .unwrap();
             let pipeline = p.pipeline();
@@ -967,6 +995,394 @@ mod tests {
         }
     }
 
+    /// A camera ingest in system memory, per camera format: no upload and
+    /// no CUDA element; YUY2 and UYVY go to `videoconvertscale` as
+    /// captured (no separate `videoconvert`), MJPEG through `jpegdec` to
+    /// I420, NV12 with no adapter. Built, not started: the node is never
+    /// opened. CPU only.
+    #[test]
+    fn a_system_memory_camera_ingest_has_the_cpu_adapters_and_no_cuda_element() {
+        require_elements(&[
+            "v4l2src",
+            "queue",
+            "jpegdec",
+            "videocrop",
+            "videoconvertscale",
+            "appsink",
+        ]);
+        let contract = OutputContract::default();
+        for (mode, decode) in [
+            ("NV12:1920x1080@30", false),
+            ("YUY2:1280x720@30", false),
+            ("UYVY:640x480@30", false),
+            ("MJPEG:1920x1080@30", true),
+        ] {
+            let cfg = IngestConfig::new("/dev/null-camera".into(), mode.parse().unwrap());
+            let ingest =
+                Ingest::build(&cfg, writer(&contract).in_memory(VideoMemory::System)).unwrap();
+            let p = ingest.pipeline();
+            crate::test_support::assert_no_cuda_element(p.pipeline());
+            assert!(p.element(names::UPLOAD).is_none(), "{mode}");
+            assert!(p.element(names::INGEST_CONVERT).is_none(), "{mode}");
+            assert_eq!(p.element(names::DECODE).is_some(), decode, "{mode}");
+            assert_eq!(
+                p.element(names::INGEST_CAPS)
+                    .map(|c| c.property::<gst::Caps>("caps").to_string()),
+                decode.then(|| "video/x-raw, format=(string)I420".to_string()),
+                "{mode}"
+            );
+            let scale = p.element(names::SCALE).unwrap();
+            assert_eq!(scale.factory().unwrap().name(), "videoconvertscale");
+            assert_eq!(
+                p.element(names::CANONICAL_CAPS)
+                    .unwrap()
+                    .property::<gst::Caps>("caps")
+                    .to_string(),
+                "video/x-raw, format=(string)NV12, width=(int)1920, height=(int)1080, \
+                 pixel-aspect-ratio=(fraction)1/1, colorimetry=(string)2:4:5:1",
+                "{mode}"
+            );
+            assert_eq!(ingest.ingest_path(), Some(IngestPath::of(cfg.mode.format)));
+        }
+        // The CUDA ingest keeps its CPU convert adapter.
+        let (adapter, format) = crate::pipeline::ingest_adapter(
+            &make("capsfilter", names::CAMERA_CAPS).unwrap(),
+            obc_core::PixelFormat::Yuy2,
+            VideoMemory::Cuda,
+            ColourRange::Limited,
+        )
+        .unwrap();
+        assert_eq!(format, "NV12");
+        assert_eq!(adapter[0].factory().unwrap().name(), "videoconvert");
+    }
+
+    /// System-memory ingests stream canonical frames from each camera
+    /// format: NV12 and YUY2 as captured, MJPEG through the decode adapter
+    /// (from `jpegenc`, standing in for the camera). The frames in the slot
+    /// carry the canonical caps (system memory, the contract's label), with
+    /// neutral chroma, and a limited-range raw black stays black (Y=16).
+    /// CPU only.
+    #[test]
+    fn system_memory_ingests_stream_canonical_frames_per_camera_format() {
+        use gst_video::prelude::*;
+        require_elements(&[
+            "videotestsrc",
+            "capsfilter",
+            "jpegenc",
+            "jpegdec",
+            "videocrop",
+            "videoconvertscale",
+            "appsink",
+        ]);
+        let contract: OutputContract = "320x240@30".parse().unwrap();
+        let canonical = Canonical::of(&contract);
+        for format in [
+            obc_core::PixelFormat::Nv12,
+            obc_core::PixelFormat::Yuy2,
+            obc_core::PixelFormat::Mjpeg,
+        ] {
+            let src = make("videotestsrc", "src").unwrap();
+            src.set_property("is-live", true);
+            src.set_property_from_str("pattern", "black");
+            let raw = if format == obc_core::PixelFormat::Mjpeg {
+                "I420"
+            } else {
+                format.gst_name()
+            };
+            let raw_caps = capsfilter(
+                "raw_caps",
+                &format!(
+                    "video/x-raw,format={raw},width=640,height=480,framerate=30/1,\
+                     colorimetry=2:4:5:1"
+                ),
+            )
+            .unwrap();
+            let mut head = vec![src, raw_caps.clone()];
+            let camera_caps = if format == obc_core::PixelFormat::Mjpeg {
+                head.push(make("jpegenc", "encode").unwrap());
+                let c = capsfilter(names::CAMERA_CAPS, "image/jpeg").unwrap();
+                head.push(c.clone());
+                c
+            } else {
+                raw_caps
+            };
+            let (adapter, tail_format) = crate::pipeline::ingest_adapter(
+                &camera_caps,
+                format,
+                VideoMemory::System,
+                ColourRange::Limited,
+            )
+            .unwrap();
+            head.extend(adapter);
+            let slot = Arc::new(Slot::new());
+            let w = FrameWriter::new(Arc::clone(&slot), Instant::now(), 1, canonical)
+                .in_memory(VideoMemory::System);
+            let mut ingest =
+                Ingest::from_head(head, tail_format, (640, 480), AspectPolicy::Crop, w).unwrap();
+            crate::test_support::assert_no_cuda_element(ingest.pipeline().pipeline());
+            ingest.start_with(None).unwrap();
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            while slot.written() < 3 {
+                assert!(Instant::now() < deadline, "{format}: no frames");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let caps = ingest
+                .pipeline()
+                .element(names::FRAMES_SINK)
+                .unwrap()
+                .static_pad("sink")
+                .unwrap()
+                .current_caps()
+                .unwrap();
+            let want: gst::Caps = format!("{},framerate=30/1", canonical.system_caps_string())
+                .parse()
+                .unwrap();
+            assert!(caps.is_subset(&want), "{format}: {caps}");
+            let info = gst_video::VideoInfo::from_caps(&caps).unwrap();
+            let buffer = slot.latest().unwrap().frame.buffer.clone();
+            let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(&buffer, &info).unwrap();
+            let y = frame.plane_data(0).unwrap();
+            let uv = frame.plane_data(1).unwrap();
+            let centre = 120 * frame.plane_stride()[0] as usize + 160;
+            assert_eq!(uv[0], 128, "{format}: neutral chroma");
+            // The decoded MJPEG frames are labelled full range; their luma
+            // is not checked here (the range conversion is a separate
+            // question).
+            if format != obc_core::PixelFormat::Mjpeg {
+                assert_eq!(y[centre], 16, "{format}: black luma");
+            }
+            ingest.stop().unwrap();
+        }
+    }
+
+    /// The JPEG of a `size` x `size` I420 frame of one full-range luma
+    /// value `y` and one chroma pair `(u, v)`, as a camera's MJPEG carries
+    /// it.
+    fn full_range_jpeg(y: u8, (u, v): (u8, u8), size: usize) -> Vec<u8> {
+        let pipeline = gst::parse::launch(&format!(
+            "appsrc name=in format=time caps=video/x-raw,format=I420,width={size},\
+             height={size},framerate=30/1 ! jpegenc quality=100 ! appsink name=out"
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let src = pipeline
+            .by_name("in")
+            .unwrap()
+            .downcast::<gst_app::AppSrc>()
+            .unwrap();
+        let sink = pipeline
+            .by_name("out")
+            .unwrap()
+            .downcast::<gst_app::AppSink>()
+            .unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let mut raw = vec![y; size * size];
+        raw.resize(size * size * 5 / 4, u);
+        raw.resize(size * size * 3 / 2, v);
+        src.push_buffer(gst::Buffer::from_slice(raw)).unwrap();
+        src.end_of_stream().unwrap();
+        let sample = sink.pull_sample().unwrap();
+        let bytes = sample.buffer().unwrap().map_readable().unwrap().to_vec();
+        pipeline.set_state(gst::State::Null).unwrap();
+        bytes
+    }
+
+    /// The Y plane's centre sample and the first chroma pair (U, V) of the
+    /// canonical (NV12) frames a system-memory MJPEG ingest of a frame of
+    /// luma `y` and chroma `uv` produces under a contract of `range`.
+    fn mjpeg_ingest_levels(y: u8, uv: (u8, u8), range: ColourRange) -> (u8, (u8, u8)) {
+        use gst_video::prelude::*;
+        let contract = OutputContract {
+            range,
+            .."320x240@30".parse().unwrap()
+        };
+        let canonical = Canonical::of(&contract);
+        let dir = std::env::temp_dir().join(format!(
+            "obc-mjpeg-{}-{y}-{}-{}-{range}",
+            std::process::id(),
+            uv.0,
+            uv.1
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("frame.jpg");
+        std::fs::write(&file, full_range_jpeg(y, uv, 64)).unwrap();
+
+        let src = make("multifilesrc", "src").unwrap();
+        src.set_property("location", file.to_string_lossy().as_ref());
+        src.set_property("loop", true);
+        src.set_property(
+            "caps",
+            "image/jpeg,framerate=30/1".parse::<gst::Caps>().unwrap(),
+        );
+        let pace = make("identity", "pace").unwrap();
+        pace.set_property("sync", true);
+        let camera_caps = capsfilter(names::CAMERA_CAPS, "image/jpeg").unwrap();
+        let (adapter, tail_format) = crate::pipeline::ingest_adapter(
+            &camera_caps,
+            obc_core::PixelFormat::Mjpeg,
+            VideoMemory::System,
+            range,
+        )
+        .unwrap();
+        let mut head = vec![src, pace, camera_caps];
+        head.extend(adapter);
+        let slot = Arc::new(Slot::new());
+        let w = FrameWriter::new(Arc::clone(&slot), Instant::now(), 1, canonical)
+            .in_memory(VideoMemory::System);
+        let mut ingest =
+            Ingest::from_head(head, tail_format, (64, 64), AspectPolicy::Crop, w).unwrap();
+        ingest.start_with(None).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while slot.written() < 3 {
+            assert!(Instant::now() < deadline, "no frames");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let caps = ingest
+            .pipeline()
+            .element(names::FRAMES_SINK)
+            .unwrap()
+            .static_pad("sink")
+            .unwrap()
+            .current_caps()
+            .unwrap();
+        let info = gst_video::VideoInfo::from_caps(&caps).unwrap();
+        let buffer = slot.latest().unwrap().frame.buffer.clone();
+        let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(&buffer, &info).unwrap();
+        let centre = 160 * frame.plane_stride()[0] as usize + 120;
+        let chroma = frame.plane_data(1).unwrap();
+        let levels = (frame.plane_data(0).unwrap()[centre], (chroma[0], chroma[1]));
+        ingest.stop().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        levels
+    }
+
+    /// Full-range MJPEG (`jpegdec` labels it `1:4:0:0`) in a system-memory
+    /// ingest of a limited contract: `videoconvertscale` leaves the range
+    /// alone, so the balance step maps black to Y=16 and white to Y=235,
+    /// chroma staying neutral. CPU only.
+    #[test]
+    fn system_memory_mjpeg_is_converted_to_limited_range() {
+        require_elements(&[
+            "multifilesrc",
+            "identity",
+            "appsrc",
+            "jpegenc",
+            "jpegdec",
+            "videobalance",
+            "capssetter",
+            "videocrop",
+            "videoconvertscale",
+            "appsink",
+        ]);
+        for (y, want) in [(0u8, 16i32), (255, 235)] {
+            let (luma, (u, v)) = mjpeg_ingest_levels(y, (128, 128), ColourRange::Limited);
+            assert!((i32::from(luma) - want).abs() <= 1, "Y={y} gave {luma}");
+            for c in [u, v] {
+                assert!((i32::from(c) - 128).abs() <= 1, "Y={y}: chroma {c}");
+            }
+        }
+    }
+
+    /// The balance step scales chroma about the neutral 128 by 224/255
+    /// ([`crate::pipeline::ingest_adapter`]'s `saturation`): a non-neutral
+    /// pair lands where the limited range puts it (U=64 and V=192 at
+    /// 128 -/+ 64*224/255, about 72 and 184; U=16 and V=240, the
+    /// extremes, at about 30 and 226), not where neutral or an unscaled
+    /// chroma would. CPU only.
+    #[test]
+    fn system_memory_mjpeg_chroma_is_scaled_to_the_limited_range() {
+        require_elements(&[
+            "multifilesrc",
+            "identity",
+            "appsrc",
+            "jpegenc",
+            "jpegdec",
+            "videobalance",
+            "capssetter",
+            "videocrop",
+            "videoconvertscale",
+            "appsink",
+        ]);
+        let limited = |c: u8| 128.0 + (f64::from(c) - 128.0) * 224.0 / 255.0;
+        for uv in [(64u8, 192u8), (16, 240)] {
+            let (luma, (u, v)) = mjpeg_ingest_levels(128, uv, ColourRange::Limited);
+            // Y=128 maps to 16 + 128*219/255, about 126.
+            assert!((i32::from(luma) - 126).abs() <= 1, "{uv:?}: Y {luma}");
+            for (got, sent) in [(u, uv.0), (v, uv.1)] {
+                let want = limited(sent);
+                assert!(
+                    (f64::from(got) - want).abs() <= 1.5,
+                    "{uv:?}: {sent} gave {got}, want {want:.1}"
+                );
+            }
+            // Unscaled (full range) it would pass as sent.
+            let (_, full) = mjpeg_ingest_levels(128, uv, ColourRange::Full);
+            for (got, sent) in [(full.0, uv.0), (full.1, uv.1)] {
+                assert!(
+                    (i32::from(got) - i32::from(sent)).abs() <= 1,
+                    "{got} {sent}"
+                );
+            }
+        }
+    }
+
+    /// Under a full-range contract the frames are already in range: no
+    /// balance step, and the luma passes through (0 stays 0, 255 stays
+    /// 255). Nor does any other adapter get the step: a raw camera, or the
+    /// CUDA path (where `cudaconvertscale` converts the range).
+    #[test]
+    fn full_range_contract_adds_no_balance_step() {
+        require_elements(&[
+            "multifilesrc",
+            "identity",
+            "appsrc",
+            "jpegenc",
+            "jpegdec",
+            "videobalance",
+            "capssetter",
+            "videocrop",
+            "videoconvertscale",
+            "appsink",
+        ]);
+        let adapter = |format, memory, range| {
+            let caps = make("capsfilter", names::CAMERA_CAPS).unwrap();
+            let (chain, _) = crate::pipeline::ingest_adapter(&caps, format, memory, range).unwrap();
+            chain
+                .iter()
+                .map(|e| e.name().to_string())
+                .collect::<Vec<_>>()
+        };
+        let mjpeg = obc_core::PixelFormat::Mjpeg;
+        assert_eq!(
+            adapter(mjpeg, VideoMemory::System, ColourRange::Limited),
+            [
+                names::DECODE,
+                names::INGEST_CAPS,
+                names::RANGE_BALANCE,
+                names::RANGE_RELABEL
+            ]
+        );
+        assert_eq!(
+            adapter(mjpeg, VideoMemory::System, ColourRange::Full),
+            [names::DECODE, names::INGEST_CAPS]
+        );
+        assert_eq!(
+            adapter(mjpeg, VideoMemory::Cuda, ColourRange::Limited),
+            [names::DECODE, names::INGEST_CAPS]
+        );
+        for format in [obc_core::PixelFormat::Nv12, obc_core::PixelFormat::Yuy2] {
+            assert!(adapter(format, VideoMemory::System, ColourRange::Limited).is_empty());
+        }
+        for (y, want) in [(0u8, 0u8), (255, 255)] {
+            let (luma, (u, v)) = mjpeg_ingest_levels(y, (128, 128), ColourRange::Full);
+            assert_eq!(luma, want, "Y={y}");
+            for c in [u, v] {
+                assert!((i32::from(c) - 128).abs() <= 1, "chroma {c}");
+            }
+        }
+    }
+
     /// A camera ingest whose device node disappears reports it
     /// ([`Ingest::poll_failure`]), sticky; a test source (no camera) never
     /// does on that ground. The node is a plain file here, never opened:
@@ -980,7 +1396,7 @@ mod tests {
         std::fs::write(&node, b"").unwrap();
         let contract = OutputContract::default();
         let cfg = IngestConfig::new(node.clone(), "NV12:640x480@30".parse().unwrap());
-        let ingest = Ingest::build(&cfg, writer(&contract).in_memory(FrameMemory::System)).unwrap();
+        let ingest = Ingest::build(&cfg, writer(&contract).in_memory(VideoMemory::System)).unwrap();
         assert_eq!(ingest.poll_failure(), None, "the node is there");
         std::fs::remove_file(&node).unwrap();
         std::fs::remove_dir(&dir).unwrap();
@@ -995,7 +1411,7 @@ mod tests {
             "NV12",
             (640, 480),
             AspectPolicy::Crop,
-            writer(&contract).in_memory(FrameMemory::System),
+            writer(&contract).in_memory(VideoMemory::System),
         )
         .unwrap();
         assert_eq!(pattern.poll_failure(), None);
@@ -1123,7 +1539,7 @@ mod tests {
     #[test]
     fn the_enhance_stage_sits_before_the_scaler_only_when_on() {
         use TailStep::*;
-        let cuda = FrameMemory::Cuda;
+        let cuda = VideoMemory::Cuda;
         assert_eq!(
             tail_steps(cuda, AspectPolicy::Crop, false),
             vec![Upload, CudaCaps, Crop, Scale, Canonical]
@@ -1137,7 +1553,7 @@ mod tests {
             vec![Upload, CudaCaps, Enhance, Scale, Canonical]
         );
         assert_eq!(
-            tail_steps(FrameMemory::System, AspectPolicy::Letterbox, true),
+            tail_steps(VideoMemory::System, AspectPolicy::Letterbox, true),
             vec![Scale, Canonical]
         );
     }
@@ -1189,7 +1605,7 @@ mod tests {
                 size,
                 AspectPolicy::Crop,
                 Some(maxine_vsr()),
-                writer(&contract).in_memory(FrameMemory::System),
+                writer(&contract).in_memory(VideoMemory::System),
             )
         };
         assert!(matches!(build((960, 540)), Err(PipelineError::Cuda(_))));

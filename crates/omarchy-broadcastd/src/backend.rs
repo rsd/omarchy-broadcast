@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use obc_core::config::VideoMemory;
 use obc_core::{
     AspectPolicy, EffectMode, EffectOnFailure, ModeRequest, OutputContract, SinkSelector,
 };
@@ -119,6 +120,10 @@ pub struct SessionParams {
     /// The modules whose code the session runs, chosen when it starts and
     /// kept until it stops: a backend never changes mid-session.
     pub backends: Backends,
+    /// Where the session keeps its frames, chosen when it starts and kept
+    /// until it stops. In [`VideoMemory::System`] the session makes no
+    /// CUDA call: no CUDA element, no NVML, no parking.
+    pub memory: VideoMemory,
 }
 
 /// One stage of a chain the session runs, with its parameters: those read
@@ -405,14 +410,22 @@ pub struct SessionError {
     /// started for it (its caps, the elements made or linked for it). A
     /// GPU fault, a missing element or a module's failure is not.
     pub contract: bool,
+    /// The output was built in CUDA memory and failed for want of CUDA: a
+    /// CUDA element of the `nvcodec` plugin is missing or failed its state
+    /// change with an error of its own, or the output opened no CUDA
+    /// context. The GPU is then not parked after the failed start. Never
+    /// set for a GPU that could not be unparked, nor for the contract's
+    /// fault.
+    pub no_cuda: bool,
 }
 
 impl From<String> for SessionError {
-    /// An error that is not the contract's.
+    /// An error that is not the contract's, nor for want of CUDA.
     fn from(message: String) -> Self {
         SessionError {
             message,
             contract: false,
+            no_cuda: false,
         }
     }
 }
@@ -526,10 +539,13 @@ pub trait MediaBackend: Send + 'static {
     /// loopback `node` open, read now, in `/proc` order (one per process).
     fn loopback_holder_names(&mut self, node: &Path) -> Vec<String>;
 
-    /// Builds and starts the output (CUDA) forwarding to the writer, with
-    /// no ingest yet ([`Self::switch_camera`] adds it). The GPU is unparked
-    /// first (see [`park`]); an error doing so is this call's error. On
-    /// error nothing of the session is left, and the GPU is parked again.
+    /// Builds and starts the output forwarding to the writer, in the
+    /// memory of `params`, with no ingest yet ([`Self::switch_camera`]
+    /// adds it). In CUDA memory the GPU is unparked first (see [`park`]);
+    /// an error doing so is this call's error. On error nothing of the
+    /// session is left, and the GPU is parked again, unless the start
+    /// failed for want of CUDA ([`SessionError::no_cuda`]). In system memory
+    /// nothing is unparked or parked: the session makes no CUDA call.
     fn start_session(&mut self, params: &SessionParams) -> Result<(), SessionError>;
 
     /// Makes `camera` the running session's ingest, replacing the current
@@ -540,7 +556,7 @@ pub trait MediaBackend: Send + 'static {
     /// Stops the session: camera closed, its controls restored, CUDA
     /// context released, then the GPU parked if the session stopped cleanly
     /// (see [`park`]; a session that did not, or a park that fails, leaves
-    /// it awake). Idempotent.
+    /// it awake). A session in system memory is not parked. Idempotent.
     fn stop_session(&mut self);
 
     /// Whether the current ingest (since the last start or switch) has
@@ -620,6 +636,13 @@ pub trait MediaBackend: Send + 'static {
     /// session). Called only while a session runs, when the GPU is awake
     /// anyway: it may ask the driver.
     fn compute_capability(&mut self) -> Option<(u32, u32)>;
+
+    /// Why CUDA cannot be used on this machine (`None`: it can), as the
+    /// CUDA presence probe finds it ([`obc_gpu::presence`]): the
+    /// environment, the driver's procfs listing, the driver library opened
+    /// without `cuInit`, and GStreamer's registry. It makes no CUDA call and
+    /// loads no plugin, so it may run at idle and while the GPU is parked.
+    fn cuda_unusable(&mut self) -> Option<String>;
 
     /// Opens `camera`'s node for its controls (for writing as well when
     /// `write`): one open for the whole operation, its enumerations,

@@ -12,13 +12,19 @@
 //! without a switch ([`Session::stop_ingest`]) or an ingest that fails arms
 //! no hold: the output repeats the last frame and sends placeholders after
 //! the gap threshold.
+//!
+//! **Memory.** A session runs in the memory its output was built for
+//! ([`Output::build_in`]: CUDA by default, or system memory): the ingests it
+//! builds ([`Session::build_ingest`]) write canonical frames in that
+//! memory, and in system memory no pipeline of the session holds a CUDA
+//! context.
 
 use std::time::{Duration, Instant};
 
-use crate::frame::FrameMemory;
 use crate::ingest::{Ingest, IngestConfig};
 use crate::output::Output;
 use crate::pipeline::{PipelineError, StopError, both_stopped};
+use obc_core::config::VideoMemory;
 
 /// When a source switch happened, or how it failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,7 +105,8 @@ impl Session {
 
     /// Makes `next` the current source: arms the output's hold for `next`
     /// (when a source is streaming), stops the current ingest, then starts
-    /// `next` with the output's CUDA context. If stopping the current
+    /// `next` with the output's CUDA context (none for an output in system
+    /// memory, [`Output::memory`]). If stopping the current
     /// ingest fails, `next` is not started (it is dropped), unless the old
     /// pipeline reached NULL and only a pinned control could not be put
     /// back: that is logged and the switch goes on; if starting
@@ -166,14 +173,14 @@ impl Session {
             }
             timing.previous_stopped = Some(Instant::now());
         }
-        // System-memory frames (CPU-only tests) need no CUDA context.
+        // System-memory frames need no CUDA context.
         let cuda = match self.output.memory() {
-            FrameMemory::Cuda => Some(self.output.cuda_context().ok_or_else(|| {
+            VideoMemory::Cuda => Some(self.output.cuda_context().ok_or_else(|| {
                 PipelineError::Cuda(
                     "the output is not running: it has no CUDA context to share".into(),
                 )
             })?),
-            FrameMemory::System => None,
+            VideoMemory::System => None,
         };
         if let Err(e) = next.start_with(cuda) {
             // Back to NULL and dropped here, checked, rather than by its
@@ -236,7 +243,7 @@ impl Session {
 }
 
 /// Source switching on the CPU: the session, ingest and output code of the
-/// stream, with canonical frames in system memory (`FrameMemory::System`),
+/// stream, with canonical frames in system memory (`VideoMemory::System`),
 /// test-pattern sources and a `fakesink` output. The assertions count and
 /// order ticks; the only times compared are lower bounds a loaded machine
 /// can only lengthen.
@@ -291,7 +298,7 @@ mod tests {
         let mut cfg = OutputConfig::new(contract, OutputSink::Fake);
         cfg.gap_threshold = GAP;
         cfg.hold_timeout = hold;
-        let mut output = Output::build_in(cfg, FrameMemory::System).expect("build output");
+        let mut output = Output::build_in(cfg, VideoMemory::System).expect("build output");
         let ticks: Ticks = Arc::default();
         let t = Arc::clone(&ticks);
         output.set_observer(Some(Arc::new(move |e: &EmitInfo| {

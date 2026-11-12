@@ -23,6 +23,11 @@
 //! * an unpark that fails is an error for the session start: nothing may
 //!   touch CUDA, so no session can run (the caller fails closed);
 //! * a process that never initialised CUDA has nothing to park;
+//! * a session start that failed for want of CUDA ([`StartError::no_cuda`])
+//!   is not parked: it left no CUDA context or memory to release, and the
+//!   driver's checkpoint lock is not safe there (with `CUDA_VISIBLE_DEVICES`
+//!   naming no GPU, it crashed inside `libcuda`), so no driver call is
+//!   made;
 //! * a CUDA call `obc_gpu` refused while parked (it would have blocked) is
 //!   a caller that ran when it should not have: warned once per park;
 //! * a session that did not stop cleanly taints the parker for the rest of
@@ -53,9 +58,18 @@
 //! [`Parker::stop_session`] and [`Parker::start_session`] are the session
 //! lifecycle around it, over any [`StopSession`]: the GStreamer backend's
 //! order, unit-tested here with a recording session.
+//!
+//! **System memory.** A session whose frames stay in system memory makes
+//! no CUDA call, so it is neither unparked nor parked
+//! ([`Parker::start_session_in`], [`StopSession::uses_cuda`]): it starts
+//! while the GPU is parked, leaves the GPU as it found it (parked, or awake
+//! after a park that failed), and never taints the parker (nothing of it
+//! could call CUDA). A CUDA session it replaces is stopped and parked first,
+//! as at any stop.
 
 use std::time::Duration;
 
+use obc_core::config::VideoMemory;
 use obc_gpu::{GpuError, NothingToPark, ParkError, ParkOutcome, UnparkOutcome};
 
 use crate::log::Level;
@@ -95,6 +109,13 @@ pub trait StopSession {
     /// cleanly: once this returns, nothing of it uses CUDA. An error says
     /// whether that holds all the same ([`StopFailure::reached_null`]).
     fn stop(self) -> Result<(), StopFailure>;
+
+    /// Whether the session's frames are in CUDA memory (the default): a
+    /// session in system memory made no CUDA call, and its stop parks
+    /// nothing.
+    fn uses_cuda(&self) -> bool {
+        true
+    }
 }
 
 /// How a session stop failed ([`StopSession::stop`]).
@@ -130,9 +151,10 @@ impl StopFailure {
 }
 
 /// Why a session start failed, as [`Parker::starting`] sees it: the error,
-/// and whether what the start had built was cleaned up cleanly. A `String`
-/// converts into a clean one: a start that failed before it built anything
-/// that could use CUDA, or whose partial build stopped cleanly.
+/// whether what the start had built was cleaned up cleanly, and whether it
+/// failed for want of CUDA. A `String` converts into a clean one that is
+/// not for want of CUDA: a start that failed before it built anything that
+/// could use CUDA, or whose partial build stopped cleanly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartError {
     /// The start's error, as the caller reports it.
@@ -141,6 +163,12 @@ pub struct StartError {
     /// it was cleaned up (a pipeline left short of NULL, say): something of
     /// it may still be alive and call CUDA.
     pub unclean: Option<String>,
+    /// The start failed for want of CUDA (no usable device, the `nvcodec`
+    /// elements missing, no CUDA context opened): the process holds no CUDA
+    /// context or memory, so a park has nothing to release, and none is
+    /// made. The driver's checkpoint lock is not safe there: with
+    /// `CUDA_VISIBLE_DEVICES` naming no GPU, it crashed inside `libcuda`.
+    pub no_cuda: bool,
 }
 
 impl StartError {
@@ -150,7 +178,16 @@ impl StartError {
         StartError {
             error: error.into(),
             unclean: Some(why.into()),
+            no_cuda: false,
         }
+    }
+
+    /// The same error, marked as for want of CUDA ([`Self::no_cuda`]) when
+    /// `no_cuda`.
+    #[must_use]
+    pub fn for_want_of_cuda(mut self, no_cuda: bool) -> Self {
+        self.no_cuda = no_cuda;
+        self
     }
 }
 
@@ -159,6 +196,7 @@ impl From<String> for StartError {
         StartError {
             error,
             unclean: None,
+            no_cuda: false,
         }
     }
 }
@@ -372,7 +410,8 @@ impl<O: ParkOps> Parker<O> {
     /// and the GPU is parked again, so a failed start does not keep it
     /// awake, unless what it had built did not stop cleanly
     /// ([`StartError::unclean`]): that taints the parker instead (see the
-    /// module docs).
+    /// module docs). A start that failed for want of CUDA
+    /// ([`StartError::no_cuda`]) is not parked: no driver call is made.
     pub fn starting<T, E: Into<StartError>>(
         &mut self,
         start: impl FnOnce() -> Result<T, E>,
@@ -381,13 +420,22 @@ impl<O: ParkOps> Parker<O> {
         match start() {
             Ok(t) => Ok(t),
             Err(e) => {
-                let StartError { error, unclean } = e.into();
+                let StartError {
+                    error,
+                    unclean,
+                    no_cuda,
+                } = e.into();
                 match unclean {
-                    None => self.park(),
                     Some(why) => self.taint(&format!(
                         "the session start failed ({error}), and cleaning up what it had built \
                          did not stop cleanly: {why}"
                     )),
+                    None if no_cuda => (self.log)(
+                        Level::Debug,
+                        "GPU not parked: the session start failed for want of CUDA, so the \
+                         daemon holds no CUDA context to park",
+                    ),
+                    None => self.park(),
                 }
                 Err(error)
             }
@@ -403,6 +451,17 @@ impl<O: ParkOps> Parker<O> {
         let Some(session) = running.take() else {
             return;
         };
+        if !session.uses_cuda() {
+            // Nothing of it could call CUDA: whatever its stop left, no
+            // park is needed and parking is not at risk.
+            if let Err(StopFailure { error, .. }) = session.stop() {
+                (self.log)(
+                    Level::Warning,
+                    &format!("stopping the session (system memory): {error}"),
+                );
+            }
+            return;
+        }
         match session.stop() {
             Ok(()) => self.park(),
             Err(StopFailure {
@@ -456,6 +515,44 @@ impl<O: ParkOps> Parker<O> {
         }
         *running = Some(self.starting(build)?);
         Ok(())
+    }
+
+    /// [`Self::start_session`] for a session in `memory`. In
+    /// [`VideoMemory::Cuda`] it is [`Self::start_session`]. In
+    /// [`VideoMemory::System`] the session makes no CUDA call: a session
+    /// running is stopped as [`Self::stop_session`] stops it (a CUDA one is
+    /// parked), then `build` runs with no unpark, and a build that fails is
+    /// not parked after, nor does an unclean cleanup of it taint the
+    /// parker (it is warned). On error `running` is empty.
+    pub fn start_session_in<S: StopSession, E: Into<StartError>>(
+        &mut self,
+        running: &mut Option<S>,
+        memory: VideoMemory,
+        build: impl FnOnce() -> Result<S, E>,
+    ) -> Result<(), String> {
+        if memory == VideoMemory::Cuda {
+            return self.start_session(running, build);
+        }
+        self.stop_session(running);
+        match build() {
+            Ok(s) => {
+                *running = Some(s);
+                Ok(())
+            }
+            Err(e) => {
+                let StartError { error, unclean, .. } = e.into();
+                if let Some(why) = unclean {
+                    (self.log)(
+                        Level::Warning,
+                        &format!(
+                            "the session start failed ({error}), and cleaning up what it had \
+                             built did not stop cleanly: {why}"
+                        ),
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     /// A teardown was unclean (`what` says which, and why): parking is off
@@ -569,10 +666,12 @@ mod tests {
         }
     }
 
-    /// A recording session: its stop is an event, and fails with `fail`.
+    /// A recording session: its stop is an event, and fails with `fail`;
+    /// in system memory with `host`.
     struct Rec {
         ops: ScriptOps,
         fail: Option<StopFailure>,
+        host: bool,
     }
 
     impl StopSession for Rec {
@@ -580,12 +679,24 @@ mod tests {
             self.ops.event("stop");
             self.fail.map_or(Ok(()), Err)
         }
+
+        fn uses_cuda(&self) -> bool {
+            !self.host
+        }
     }
 
     fn rec(ops: &ScriptOps) -> Rec {
         Rec {
             ops: ops.clone(),
             fail: None,
+            host: false,
+        }
+    }
+
+    fn host_rec(ops: &ScriptOps) -> Rec {
+        Rec {
+            host: true,
+            ..rec(ops)
         }
     }
 
@@ -942,6 +1053,7 @@ mod tests {
         Rec {
             ops: ops.clone(),
             fail: Some(StopFailure::unclean(why)),
+            host: false,
         }
     }
 
@@ -950,6 +1062,7 @@ mod tests {
         Rec {
             ops: ops.clone(),
             fail: Some(StopFailure::at_null(why)),
+            host: false,
         }
     }
 
@@ -1090,6 +1203,53 @@ mod tests {
         assert_eq!(e, "output pipeline: no cudaupload");
         assert_eq!(ops.events(), ["unpark", "park"]);
         assert!(!p.tainted());
+    }
+
+    #[test]
+    fn a_start_that_failed_for_want_of_cuda_makes_no_park_call() {
+        let (mut p, ops, logged) = parker();
+        ops.0
+            .lock()
+            .unwrap()
+            .unpark
+            .push_back(Ok(UnparkOutcome::NotParked));
+        let mut running: Option<Rec> = None;
+        let o = ops.clone();
+        let e = p
+            .start_session(&mut running, || -> Result<Rec, StartError> {
+                o.event("build");
+                Err(
+                    StartError::from("output pipeline: no cudaupload".to_string())
+                        .for_want_of_cuda(true),
+                )
+            })
+            .unwrap_err();
+        assert_eq!(e, "output pipeline: no cudaupload");
+        assert!(running.is_none());
+        // No park is asked of the driver (an unscripted one would panic).
+        assert_eq!(ops.events(), ["unpark", "build"]);
+        assert_eq!(ops.0.lock().unwrap().parks, 0);
+        assert!(!p.tainted());
+        let l = take(&logged);
+        assert!(l.iter().all(|(lv, _)| *lv == Level::Debug), "{l:?}");
+        // An unclean cleanup of such a start still taints, with no park
+        // either.
+        ops.0
+            .lock()
+            .unwrap()
+            .unpark
+            .push_back(Ok(UnparkOutcome::NotParked));
+        let e = p
+            .starting(|| -> Result<(), StartError> {
+                Err(
+                    StartError::unclean("no CUDA context", "upload stuck in READY")
+                        .for_want_of_cuda(true),
+                )
+            })
+            .unwrap_err();
+        assert_eq!(e, "no CUDA context");
+        assert!(p.tainted());
+        assert_eq!(ops.0.lock().unwrap().parks, 0);
     }
 
     #[test]
@@ -1297,5 +1457,103 @@ mod tests {
         assert!(e.contains("state Failed"), "{e}");
         assert!(running.is_none());
         assert_eq!(ops.events(), ["unpark"]);
+    }
+
+    #[test]
+    fn a_session_in_system_memory_is_neither_unparked_nor_parked() {
+        // No driver call is scripted: any would panic.
+        let (mut p, ops, logged) = parker();
+        let mut running: Option<Rec> = None;
+        let o = ops.clone();
+        p.start_session_in(
+            &mut running,
+            VideoMemory::System,
+            || -> Result<Rec, String> {
+                o.event("build");
+                Ok(host_rec(&o))
+            },
+        )
+        .unwrap();
+        assert!(running.is_some());
+        p.stop_session(&mut running);
+        assert!(running.is_none());
+        assert_eq!(ops.events(), ["build", "stop"]);
+        let s = ops.0.lock().unwrap();
+        assert_eq!((s.parks, s.unparks), (0, 0));
+        drop(s);
+        assert!(take(&logged).is_empty());
+    }
+
+    #[test]
+    fn a_failed_start_in_system_memory_parks_nothing_and_never_taints() {
+        let (mut p, ops, logged) = parker();
+        let mut running: Option<Rec> = None;
+        let e = p
+            .start_session_in(
+                &mut running,
+                VideoMemory::System,
+                || -> Result<Rec, StartError> {
+                    Err(StartError::unclean(
+                        "output pipeline: busy",
+                        "convert stuck in PAUSED",
+                    ))
+                },
+            )
+            .unwrap_err();
+        assert_eq!(e, "output pipeline: busy");
+        assert!(running.is_none());
+        assert!(
+            !p.tainted(),
+            "nothing of a system-memory session can call CUDA"
+        );
+        let l = take(&logged);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert_eq!(l[0].0, Level::Warning);
+        // An unclean stop of a system-memory session is warned, not tainting.
+        let mut running = Some(Rec {
+            fail: Some(StopFailure::unclean("sink stuck")),
+            ..host_rec(&ops)
+        });
+        p.stop_session(&mut running);
+        assert!(!p.tainted());
+        assert_eq!(ops.events(), ["stop"]);
+        assert_eq!(take(&logged)[0].0, Level::Warning);
+    }
+
+    #[test]
+    fn a_cuda_session_replaced_by_one_in_system_memory_is_parked_first() {
+        let (mut p, ops, _logged) = parker();
+        ops.0.lock().unwrap().park.push_back(Ok(PARKED));
+        let mut running = Some(rec(&ops));
+        let o = ops.clone();
+        p.start_session_in(
+            &mut running,
+            VideoMemory::System,
+            || -> Result<Rec, String> {
+                o.event("build");
+                Ok(host_rec(&o))
+            },
+        )
+        .unwrap();
+        assert_eq!(ops.events(), ["stop", "park", "build"]);
+        assert_eq!(ops.0.lock().unwrap().unparks, 0);
+    }
+
+    #[test]
+    fn a_start_in_cuda_memory_is_the_parked_lifecycle() {
+        let (mut p, ops, _logged) = parker();
+        ops.0.lock().unwrap().unpark.push_back(Ok(UNPARKED));
+        let mut running: Option<Rec> = None;
+        let o = ops.clone();
+        p.start_session_in(
+            &mut running,
+            VideoMemory::Cuda,
+            || -> Result<Rec, String> {
+                o.event("build");
+                Ok(rec(&o))
+            },
+        )
+        .unwrap();
+        assert_eq!(ops.events(), ["unpark", "build"]);
     }
 }
