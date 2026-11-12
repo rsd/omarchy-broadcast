@@ -13,8 +13,17 @@
 #   NVIDIA Maxine AR module library       -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules/libobc_module_maxine_ar.so
 #   its module manifest                   -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules.d/maxine-ar.toml
 #                                            (from crates/obc-module-maxine-ar/maxine-ar.toml, likewise)
+#   open-model cut-out module library     -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules/libobc_module_onnx.so
+#   its module manifest                   -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules.d/onnx.toml
+#                                            (from crates/obc-module-onnx/onnx.toml, likewise)
 #   D-Bus activation file                 -> ${XDG_DATA_HOME:-~/.local/share}/dbus-1/services/br.com.dias.OmarchyBroadcast.service
 #   install manifest                      -> ${XDG_STATE_HOME:-~/.local/state}/omarchy-broadcast/install-user.manifest
+# and, with OBC_ONNX_MODELS_DIR set, the four model files of the open-model cut-out:
+#   selfie_segmentation_landscape.onnx, pp_humansegv2_mobile_192x192.onnx,
+#   pp_humansegv2_lite_192x192.onnx, modnet_photographic.onnx
+#                                         -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/models/onnx/
+#                                            (copied from that directory once their sha256 match the module's
+#                                            catalogue, crates/obc-module-onnx/src/catalogue.rs)
 # and, with --mic, the noise-removed microphone:
 #   its PipeWire configurations           -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/pipewire/
 #                                            (omarchy-broadcast-mic-rnnoise.conf and
@@ -42,6 +51,14 @@
 #                                            (from crates/obc-module-afx/maxine-afx.toml, likewise)
 #   third-party licence notices           -> ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules/THIRD-PARTY-NOTICES
 #                                            (from dist/licenses/, for the code built into the module and the worker)
+#
+# The open-model cut-out module is always built and installed too: it opens
+# ONNX Runtime (libonnxruntime.so, 1.29 or later, the Arch package onnxruntime
+# or one of its variants) at run time, so it builds and installs without it.
+# The model files are not in the repository (crates/obc-module-onnx/README.md,
+# "Models"): without OBC_ONNX_MODELS_DIR the module is installed and the daemon
+# lists it as "model not installed" until the files are in
+# ${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/models/onnx.
 #
 # The Maxine module is always built and installed (the library builds without
 # the Maxine SDK), and so is the Maxine AR module (likewise without the AR
@@ -89,14 +106,24 @@
 #                git dependency needs network access once). Without it, files
 #                installed by an earlier run stay in place, as with --mic.
 #   --uninstall  Remove what this script installed, and only that, including
-#                the Maxine module and its manifest, the microphones' files,
+#                the Maxine and open-model cut-out modules and their manifests,
+#                the model files, the microphones' files,
 #                and the directories ~/.local/share/omarchy-broadcast/modules,
-#                modules.d, pipewire and ladspa and ~/.local/share/omarchy-broadcast
+#                modules.d, models/onnx, models, pipewire and ladspa and
+#                ~/.local/share/omarchy-broadcast
 #                once they are empty (modules and modules.d even when no file
 #                of theirs was installed), and the shim an earlier version
 #                installed (with ~/.local/lib/omarchy-broadcast once it is
 #                empty).
 #   -h, --help   Show this help.
+#
+# Environment:
+#   OBC_ONNX_MODELS_DIR   A directory with the four model files of the open-model
+#                cut-out, under the names above. They are installed only if each
+#                one's sha256 is the catalogue's; a missing or different file
+#                stops the run before anything is changed. Without it, models
+#                installed by an earlier run stay in place.
+#   CARGO_TARGET_DIR, XDG_*_HOME   As described above.
 #
 # Ownership: every text file it writes carries a marker comment line, and the
 # manifest lists every path it wrote, with the sha256 of each binary. It
@@ -143,8 +170,27 @@ VOICE_MODULE_MANIFEST=voice-cpu.toml
 AFX_MODULE_CRATE=obc-module-afx
 AFX_MODULE_LIB=libobc_module_afx.so
 AFX_MODULE_MANIFEST=maxine-afx.toml
+# The open-model cut-out module, built and installed like the Maxine ones.
+ONNX_MODULE_CRATE=obc-module-onnx
+ONNX_MODULE_LIB=libobc_module_onnx.so
+ONNX_MODULE_MANIFEST=onnx.toml
+# Its model files and their SHA-256: the names and checksums of
+# crates/obc-module-onnx/src/catalogue.rs (keep both in step; the PKGBUILD
+# has the same list).
+ONNX_MODELS=(
+  selfie_segmentation_landscape.onnx
+  pp_humansegv2_mobile_192x192.onnx
+  pp_humansegv2_lite_192x192.onnx
+  modnet_photographic.onnx
+)
+ONNX_SUMS=(
+  fa02222275c455638fa1190493b659d25ad31e86f1b6459f17bd501f02cbe43d
+  2bca11ec1f2a662146147d97523d613f5ef4ebf2a89803a95a0cbabfe2bd70a9
+  ca96b4436f1ce6a76059e8902e20a9617f6829fb11f6c6c9e876563e6352e6b4
+  07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9
+)
 # File names whose ownership is the manifest checksum, not a marker line.
-SUMMED=("${BINARIES[@]}" "$AUDIO_BINARY" "$PLUGIN_LIB" "$MODULE_LIB" "$AR_MODULE_LIB" "$VOICE_MODULE_LIB" "$AFX_MODULE_LIB" "${LEGACY_SHIM[@]}")
+SUMMED=("${BINARIES[@]}" "$AUDIO_BINARY" "$PLUGIN_LIB" "$MODULE_LIB" "$AR_MODULE_LIB" "$ONNX_MODULE_LIB" "$VOICE_MODULE_LIB" "$AFX_MODULE_LIB" "${ONNX_MODELS[@]}" "${LEGACY_SHIM[@]}")
 UNIT_NAME=omarchy-broadcastd.service
 DBUS_NAME=br.com.dias.OmarchyBroadcast.service
 MIC_UNIT_NAME=omarchy-broadcast-mic@.service
@@ -249,6 +295,11 @@ module_manifest_dst=$data_dir/omarchy-broadcast/modules.d/$MODULE_MANIFEST
 ar_module_manifest_src=$repo/crates/$AR_MODULE_CRATE/$AR_MODULE_MANIFEST
 ar_module_lib_dst=$module_dir/$AR_MODULE_LIB
 ar_module_manifest_dst=$data_dir/omarchy-broadcast/modules.d/$AR_MODULE_MANIFEST
+onnx_manifest_src=$repo/crates/$ONNX_MODULE_CRATE/$ONNX_MODULE_MANIFEST
+onnx_lib_dst=$module_dir/$ONNX_MODULE_LIB
+onnx_manifest_dst=$data_dir/omarchy-broadcast/modules.d/$ONNX_MODULE_MANIFEST
+onnx_models_root=$data_dir/omarchy-broadcast/models
+onnx_models_dir=$onnx_models_root/onnx
 maxine_src=$repo/dist/systemd/omarchy-broadcastd.service.d/maxine.conf
 # The user's Maxine drop-in, if any: only read, never written.
 maxine_dropin=$config_dir/systemd/user/omarchy-broadcastd.service.d/maxine.conf
@@ -261,6 +312,12 @@ audio_dsts=() audio_bin_dsts=()
 if ((want_audio)); then
   audio_dsts=("$host_unit_dst" "$host_conf_dst" "$worker_unit_dst" "$worker_socket_dst" "$worker_dbus_dst" "$voice_manifest_dst" "$afx_manifest_dst" "$notices_dst")
   audio_bin_dsts=("$worker_bin_dst" "$plugin_dst" "$voice_lib_dst" "$afx_lib_dst")
+fi
+# The model files this run installs: only with OBC_ONNX_MODELS_DIR. The ones
+# an earlier run installed stay in place and listed when it is not given.
+onnx_model_dsts=()
+if [[ -n ${OBC_ONNX_MODELS_DIR:-} ]]; then
+  for f in "${ONNX_MODELS[@]}"; do onnx_model_dsts+=("$onnx_models_dir/$f"); done
 fi
 # The microphone files this run installs: only with --mic.
 mic_dsts=()
@@ -457,8 +514,9 @@ if [[ $mode == uninstall ]]; then
   # changed XDG_STATE_HOME does not leave them behind; check_targets still
   # refuses one without the marker, and a missing one is skipped.
   # So are the modules' files, for the same reason.
-  targets=("${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "$module_lib_dst" "$module_manifest_dst" "$ar_module_lib_dst" "$ar_module_manifest_dst" "$mic_unit_dst")
+  targets=("${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "$module_lib_dst" "$module_manifest_dst" "$ar_module_lib_dst" "$ar_module_manifest_dst" "$onnx_lib_dst" "$onnx_manifest_dst" "$mic_unit_dst")
   for c in "${MIC_CONFS[@]}"; do targets+=("$mic_conf_dir/$c"); done
+  for f in "${ONNX_MODELS[@]}"; do targets+=("$onnx_models_dir/$f"); done
   # The audio-module microphone's files, for the same reason.
   targets+=("$host_unit_dst" "$host_conf_dst" "$worker_unit_dst" "$worker_socket_dst" "$worker_dbus_dst" "$voice_manifest_dst" "$afx_manifest_dst" "$notices_dst" "$worker_bin_dst" "$plugin_dst" "$voice_lib_dst" "$afx_lib_dst")
   # Also what an earlier run wrote under other XDG directories.
@@ -517,7 +575,7 @@ if [[ $mode == uninstall ]]; then
       omarchy-broadcast-mic-*.conf) mic_removed=1 leaf_dirs+=("${path%/*}") ;;
       "$HOST_UNIT_NAME" | "$WORKER_UNIT_NAME" | "$WORKER_SOCKET_NAME" | "$AUDIO_BINARY") audio_removed=1 ;;
       "$HOST_CONF" | "$PLUGIN_LIB") audio_removed=1 leaf_dirs+=("${path%/*}") ;;
-      "$MODULE_LIB" | "$MODULE_MANIFEST" | "$AR_MODULE_LIB" | "$AR_MODULE_MANIFEST" | "$VOICE_MODULE_LIB" | "$VOICE_MODULE_MANIFEST" | "$AFX_MODULE_LIB" | "$AFX_MODULE_MANIFEST" | "$NOTICES_NAME") leaf_dirs+=("${path%/*}") ;;
+      "$MODULE_LIB" | "$MODULE_MANIFEST" | "$AR_MODULE_LIB" | "$AR_MODULE_MANIFEST" | "$VOICE_MODULE_LIB" | "$VOICE_MODULE_MANIFEST" | "$AFX_MODULE_LIB" | "$AFX_MODULE_MANIFEST" | "$ONNX_MODULE_LIB" | "$ONNX_MODULE_MANIFEST" | "$NOTICES_NAME") leaf_dirs+=("${path%/*}") ;;
     esac
   done
   # The legacy shim's library directory goes once it is empty (rmdir only
@@ -537,6 +595,11 @@ if [[ $mode == uninstall ]]; then
   # interrupted first install goes too.
   leaf_dirs+=("$module_dir" "${module_manifest_dst%/*}")
   parent_dirs=()
+  # The model directory and its parent, once empty (the files are
+  # checksummed targets above; anything else in them is left alone).
+  for path in "$onnx_models_dir" "$onnx_models_root"; do
+    if [[ -d $path ]]; then run rmdir --ignore-fail-on-non-empty -- "$path"; fi
+  done
   while IFS= read -r path; do
     case $path in
       */omarchy-broadcast/pipewire | */omarchy-broadcast/ladspa | */omarchy-broadcast/modules | */omarchy-broadcast/modules.d)
@@ -600,6 +663,7 @@ fi
 [[ -f $dbus_src ]] || die "missing $dbus_src"
 [[ -f $module_manifest_src ]] || die "missing $module_manifest_src"
 [[ -f $ar_module_manifest_src ]] || die "missing $ar_module_manifest_src"
+[[ -f $onnx_manifest_src ]] || die "missing $onnx_manifest_src"
 
 # The shipped unit must have exactly one ExecStart naming the daemon, whatever
 # its path (/usr/bin for the package, %h/.cargo/bin in older checkouts).
@@ -614,7 +678,7 @@ n=$(grep -c -- "$exec_re" "$unit_src" || true)
 # string: each shipped one must have exactly one such line, which is rewritten
 # to the installed library.
 lib_re='^library = .*$'
-for src in "$module_manifest_src" "$ar_module_manifest_src"; do
+for src in "$module_manifest_src" "$ar_module_manifest_src" "$onnx_manifest_src"; do
   n=$(grep -c -- "$lib_re" "$src" || true)
   ((n == 1)) || {
     printf 'install-user: expected exactly one line matching %s in %s, found %s\n' "$lib_re" "$src" "$n" >&2
@@ -625,6 +689,20 @@ done
 # dir must need no escaping in either.
 [[ $data_dir =~ ^/[A-Za-z0-9._/@+-]*$ ]] ||
   die "data dir '$data_dir' contains characters that would need escaping in the module manifest and in ExecStart; set XDG_DATA_HOME to a plain path"
+
+# The model files (OBC_ONNX_MODELS_DIR): each must be there with the
+# catalogue's sha256, before anything is changed (a given directory that
+# cannot be used is an error, not a skipped step).
+if ((${#onnx_model_dsts[@]})); then
+  [[ -d $OBC_ONNX_MODELS_DIR ]] || die "OBC_ONNX_MODELS_DIR=$OBC_ONNX_MODELS_DIR is not a directory"
+  for i in "${!ONNX_MODELS[@]}"; do
+    f=$OBC_ONNX_MODELS_DIR/${ONNX_MODELS[i]}
+    [[ -f $f ]] || die "missing model file $f"
+    sum=$(file_sum "$f") || die "cannot read $f"
+    [[ $sum == "${ONNX_SUMS[i]}" ]] ||
+      die "$f has sha256 $sum, expected ${ONNX_SUMS[i]} (the catalogue of crates/$ONNX_MODULE_CRATE/src/catalogue.rs)"
+  done
+fi
 
 # The audio-module microphone (--audio): each source file must exist, and the
 # lines that are rewritten must be there exactly once. The mic host unit names
@@ -678,10 +756,10 @@ if [[ -f $manifest ]]; then
     path=$(manifest_path "$line")
     [[ -n $path && -e $path ]] || continue
     case $path in
-      "$unit_dst" | "$dbus_dst" | "$module_lib_dst" | "$module_manifest_dst" | "$ar_module_lib_dst" | "$ar_module_manifest_dst") continue ;;
+      "$unit_dst" | "$dbus_dst" | "$module_lib_dst" | "$module_manifest_dst" | "$ar_module_lib_dst" | "$ar_module_manifest_dst" | "$onnx_lib_dst" | "$onnx_manifest_dst") continue ;;
     esac
     for dst in "${bin_dsts[@]}"; do [[ $path == "$dst" ]] && continue 2; done
-    for dst in "${mic_dsts[@]}" "${audio_dsts[@]}" "${audio_bin_dsts[@]}"; do [[ $path == "$dst" ]] && continue 2; done
+    for dst in "${mic_dsts[@]}" "${audio_dsts[@]}" "${audio_bin_dsts[@]}" "${onnx_model_dsts[@]}"; do [[ $path == "$dst" ]] && continue 2; done
     if is_legacy_shim "$path"; then
       if owned "$path"; then
         # Listed once per checksum while an install was in progress: once here.
@@ -695,7 +773,7 @@ if [[ -f $manifest ]]; then
   done <"$manifest"
 fi
 
-check_targets "${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "$module_lib_dst" "$module_manifest_dst" "$ar_module_lib_dst" "$ar_module_manifest_dst" "${mic_dsts[@]}" "${audio_dsts[@]}" "${audio_bin_dsts[@]}" "$manifest"
+check_targets "${bin_dsts[@]}" "$unit_dst" "$dbus_dst" "$module_lib_dst" "$module_manifest_dst" "$ar_module_lib_dst" "$ar_module_manifest_dst" "$onnx_lib_dst" "$onnx_manifest_dst" "${onnx_model_dsts[@]}" "${mic_dsts[@]}" "${audio_dsts[@]}" "${audio_bin_dsts[@]}" "$manifest"
 
 if ((build)); then
   run cargo build --manifest-path "$repo/Cargo.toml" --release --locked -p omarchy-broadcastd -p omarchy-broadcast || {
@@ -704,7 +782,7 @@ if ((build)); then
   }
   # Separate from the daemon's build: one invocation unifies the features of
   # its packages, which could change the daemon.
-  run cargo build --manifest-path "$repo/Cargo.toml" --release --locked -p "$MODULE_CRATE" -p "$AR_MODULE_CRATE" || {
+  run cargo build --manifest-path "$repo/Cargo.toml" --release --locked -p "$MODULE_CRATE" -p "$AR_MODULE_CRATE" -p "$ONNX_MODULE_CRATE" || {
     printf 'install-user: cargo build failed; nothing was changed\n' >&2
     exit 1
   }
@@ -720,7 +798,7 @@ if ((!dry_run)); then
   for b in "${BINARIES[@]}"; do
     [[ -x $target_dir/release/$b ]] || die "no built binary at $target_dir/release/$b (run without --no-build)"
   done
-  for lib in "$MODULE_LIB" "$AR_MODULE_LIB"; do
+  for lib in "$MODULE_LIB" "$AR_MODULE_LIB" "$ONNX_MODULE_LIB"; do
     [[ -f $target_dir/release/$lib ]] || die "no built module at $target_dir/release/$lib (run without --no-build)"
   done
   if ((want_audio)); then
@@ -747,7 +825,7 @@ fi
 manifest_text() {
   echo "$MARKER"
   echo "# Paths written by install-user.sh, one per line; a binary as \"<sha256>  <path>\"."
-  printf '%s\n' "${kept[@]}" "$@" "$unit_dst" "$dbus_dst" "$module_manifest_dst" "$ar_module_manifest_dst" "${mic_dsts[@]}" "${audio_dsts[@]}" | sort -u
+  printf '%s\n' "${kept[@]}" "$@" "$unit_dst" "$dbus_dst" "$module_manifest_dst" "$ar_module_manifest_dst" "$onnx_manifest_dst" "${mic_dsts[@]}" "${audio_dsts[@]}" | sort -u
 }
 
 # What to install with a checksum in the manifest: source, destination, mode.
@@ -757,6 +835,11 @@ for b in "${BINARIES[@]}"; do
 done
 srcs+=("$target_dir/release/$MODULE_LIB") dsts+=("$module_lib_dst") modes+=(644)
 srcs+=("$target_dir/release/$AR_MODULE_LIB") dsts+=("$ar_module_lib_dst") modes+=(644)
+srcs+=("$target_dir/release/$ONNX_MODULE_LIB") dsts+=("$onnx_lib_dst") modes+=(644)
+# The model files, checksummed like the libraries (verified above).
+for i in "${!onnx_model_dsts[@]}"; do
+  srcs+=("$OBC_ONNX_MODELS_DIR/${ONNX_MODELS[i]}") dsts+=("${onnx_model_dsts[i]}") modes+=(644)
+done
 if ((want_audio)); then
   srcs+=("$target_dir/release/$AUDIO_BINARY") dsts+=("$worker_bin_dst") modes+=(755)
   srcs+=("$target_dir/release/$PLUGIN_LIB") dsts+=("$plugin_dst") modes+=(755)
@@ -765,6 +848,7 @@ if ((want_audio)); then
 fi
 
 run mkdir -p -- "$bin_dir" "$module_dir"
+((${#onnx_model_dsts[@]} == 0)) || run mkdir -p -- "$onnx_models_dir"
 ((!want_audio)) || run mkdir -p -- "$ladspa_dir"
 # Install beside the target, then rename: replacing a running binary in place
 # would fail with "Text file busy".
@@ -814,6 +898,7 @@ module_manifest_text() {
 }
 put_text "$module_manifest_dst" module_manifest_text "$MODULE_CRATE" "$MODULE_MANIFEST" "$module_lib_dst"
 put_text "$ar_module_manifest_dst" module_manifest_text "$AR_MODULE_CRATE" "$AR_MODULE_MANIFEST" "$ar_module_lib_dst"
+put_text "$onnx_manifest_dst" module_manifest_text "$ONNX_MODULE_CRATE" "$ONNX_MODULE_MANIFEST" "$onnx_lib_dst"
 
 if ((want_mic)); then
   mic_conf_text() {
@@ -925,6 +1010,20 @@ The NVIDIA Maxine AR effects module (eye contact, auto-framing) $module_state
 ($(printf '%q' "$ar_module_lib_dst")). Without the maxine-ar-sdk-local package
 the daemon lists it greyed out, with the reason.
 EOF
+if ((${#onnx_model_dsts[@]})); then
+  cat <<EOF
+
+The open-model cut-out module $module_state ($(printf '%q' "$onnx_lib_dst")),
+with its models in $(printf '%q' "$onnx_models_dir"). It needs ONNX Runtime 1.29
+or later (the Arch package onnxruntime).
+EOF
+else
+  have_models=0
+  for f in "${ONNX_MODELS[@]}"; do [[ -e $onnx_models_dir/$f ]] && have_models=1; done
+  if ((!have_models)); then
+    printf '\nThe open-model cut-out module %s; it shows "model not installed" until its models are: re-run with OBC_ONNX_MODELS_DIR=<directory of the four .onnx files> (crates/obc-module-onnx/README.md).\n' "$module_state"
+  fi
+fi
 if ((${#legacy_rm[@]})); then
   if ((dry_run)); then
     legacy_shim_note "The os-release shim of an earlier install-user.sh would be removed: the

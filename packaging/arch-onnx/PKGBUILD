@@ -1,0 +1,168 @@
+# Maintainer: Raul Dias
+#
+# Arch package of the omarchy-broadcast open-model cut-out module: background
+# blur and replacement with open ONNX models (MediaPipe, PP-HumanSeg, MODNet)
+# through ONNX Runtime; see crates/obc-module-onnx/README.md and
+# docs/setup/onnx.md. It is a package of its own, apart from the core
+# (packaging/arch), because the ONNX Runtime variants of the Arch repository
+# conflict with one another: the core must not pull one in, and the core
+# builds with none of this package's sources. Build the core first.
+#
+# Built from the local git checkout that holds this file (two directories
+# up), as the core is: only committed content is built, and makepkg rewrites
+# pkgver= below on each build (that change need not be committed). The
+# committed pkgver= is the workspace version in Cargo.toml, and CI fails
+# while they differ.
+#
+# The four model files (about 70 MB, Apache-2.0) are sources of this build,
+# checked by sha256. Until a release host publishes them (_onnx_models_url
+# below), makepkg takes them from a local directory, $startdir/models or
+# $OBC_ONNX_MODELS_DIR, under the catalogue's names
+# (crates/obc-module-onnx/model-sources/README.md says how they are made).
+# Without them makepkg stops at the missing sources.
+#
+# Build (from packaging/arch-onnx, after packaging/arch):
+#   OBC_ONNX_MODELS_DIR=/path/to/models makepkg -s
+# Install the result with the core package:
+#   sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst omarchy-broadcast-onnx-git-*.pkg.tar.zst
+
+pkgname=omarchy-broadcast-onnx-git
+_pkgname=omarchy-broadcast
+pkgver=0.38.0
+pkgrel=1
+pkgdesc='Open-model cut-out (ONNX Runtime) module for omarchy-broadcast: background blur and replacement'
+arch=('x86_64')
+# The module is MIT OR Apache-2.0; the models are Apache-2.0 (MediaPipe,
+# PP-HumanSeg, MODNet) and the module statically includes libloading (ISC).
+license=('MIT OR Apache-2.0' 'Apache-2.0' 'ISC')
+# The module ABI must match the core's: the module interface is not pinned
+# across versions, so the module depends on the core of this very commit.
+# The core's provides is unversioned, hence its name and the pkgver that
+# both PKGBUILDs compute the same way (version.rN.gHASH); build the two from
+# one commit, or pacman refuses the pair.
+#
+# onnxruntime is the Arch package name, and the name every variant provides
+# (onnxruntime-cpu, -cuda, -opt-cuda, -rocm, -opt-rocm each have
+# provides=onnxruntime=1.29.0). onnxruntime-full (another repository) has
+# provides=("onnxruntime=1.29.0" 'libonnxruntime.so') and conflicts with
+# every Arch variant, so it satisfies onnxruntime>=1.29 too. The module opens
+# libonnxruntime.so at run time (nothing links against it) and needs the C
+# API of 1.29 or later.
+depends=(
+  "omarchy-broadcast-git=$pkgver"
+  'libgcc'
+  'glibc'
+  'onnxruntime>=1.29'
+)
+makedepends=(
+  'cargo'
+  'git'
+)
+optdepends=(
+  'onnxruntime-opt-cuda: ONNX Runtime with the NVIDIA GPU (CUDA execution provider), instead of the CPU one'
+  'cudnn: needed by the CUDA execution provider of onnxruntime-opt-cuda'
+  'onnxruntime-full: the TensorRT and OpenVINO engines need an ONNX Runtime build that includes them (planned package)'
+)
+# No LTO, as in the core (packaging/arch).
+options=('!lto')
+provides=("$_pkgname-onnx")
+conflicts=("$_pkgname-onnx")
+# The checkout that holds this PKGBUILD (packaging/arch-onnx); resolved at
+# build time, so the package builds from wherever the repository is cloned.
+source=("$_pkgname::git+file://$(realpath -- "$startdir/../..")")
+sha256sums=('SKIP')
+
+# The model files: the names and checksums of
+# crates/obc-module-onnx/src/catalogue.rs, in this order (keep both in step).
+_onnx_models=(
+  selfie_segmentation_landscape.onnx
+  pp_humansegv2_mobile_192x192.onnx
+  pp_humansegv2_lite_192x192.onnx
+  modnet_photographic.onnx
+)
+_onnx_sums=(
+  'fa02222275c455638fa1190493b659d25ad31e86f1b6459f17bd501f02cbe43d'
+  '2bca11ec1f2a662146147d97523d613f5ef4ebf2a89803a95a0cbabfe2bd70a9'
+  'ca96b4436f1ce6a76059e8902e20a9617f6829fb11f6c6c9e876563e6352e6b4'
+  '07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9'
+)
+# The converted models are release assets of the omarchy-onnx-models
+# repository, which also holds their conversion scripts and licences. Each file
+# is checked against its sha256 above, whichever way it arrives.
+# PLACEHOLDER: that repository's first release is not published yet
+# (publishing it needs the user: a push), and the owner below is not final.
+# Once it is: set _onnx_models_owner and _onnx_models_ver (the release tag,
+# without the leading v) and enable the URL line. Until then the files come
+# from the local fallback directory.
+_onnx_models_owner='PLACEHOLDER-OWNER'
+_onnx_models_ver='PLACEHOLDER-VERSION'
+#_onnx_models_url="https://github.com/$_onnx_models_owner/omarchy-onnx-models/releases/download/v$_onnx_models_ver"
+# When it is set, the files are downloaded from "$_onnx_models_url/<name>".
+_onnx_models_url=''
+_onnx_models_dir=${OBC_ONNX_MODELS_DIR:-$startdir/models}
+_onnx_missing=()
+for _f in "${_onnx_models[@]}"; do
+  if [[ -n $_onnx_models_url ]]; then
+    source+=("$_f::$_onnx_models_url/$_f")
+  else
+    # The local fallback: a directory of files under the names above.
+    source+=("$_f::file://$_onnx_models_dir/$_f")
+    [[ -r $_onnx_models_dir/$_f ]] || _onnx_missing+=("$_f")
+  fi
+done
+if ((${#_onnx_missing[@]})); then
+  echo "$pkgname: model files not found in $_onnx_models_dir: ${_onnx_missing[*]}" >&2
+  echo "$pkgname: set _onnx_models_url in this PKGBUILD, or put the model files in \$OBC_ONNX_MODELS_DIR (default: \$startdir/models)" >&2
+fi
+unset _f _onnx_missing
+sha256sums+=("${_onnx_sums[@]}")
+
+pkgver() {
+  cd "$_pkgname"
+  local version
+  version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+  printf '%s.r%s.g%s' "$version" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # Only the module: the core package builds, and tests, everything else.
+  cargo build --release --locked -p obc-module-onnx
+}
+
+package() {
+  cd "$_pkgname"
+
+  # The module: the library, and its manifest in the system modules.d
+  # directory (it names the library by absolute path).
+  install -Dm755 -t "$pkgdir/usr/lib/$_pkgname/modules" \
+    target/release/libobc_module_onnx.so
+  install -Dm644 -t "$pkgdir/usr/lib/$_pkgname/modules.d" \
+    crates/obc-module-onnx/onnx.toml
+  grep -qx 'library = "/usr/lib/omarchy-broadcast/modules/libobc_module_onnx.so"' \
+    "$pkgdir/usr/lib/$_pkgname/modules.d/onnx.toml" ||
+    { echo 'onnx.toml: the library path is not the packaged one' >&2; return 1; }
+
+  # The model files, in the last directory of the module's search order
+  # (model_files.rs: SYSTEM_MODEL_DIR). The sources are checked by makepkg.
+  local f
+  for f in "${_onnx_models[@]}"; do
+    install -Dm644 -t "$pkgdir/usr/share/$_pkgname/models/onnx" "$srcdir/$f"
+  done
+
+  # The licences of the models (Apache-2.0 asks for the text and the
+  # notices to ship with them), and the project's own with the notices of
+  # the statically linked libloading.
+  install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" \
+    crates/obc-module-onnx/model-sources/LICENSES.md \
+    crates/obc-module-onnx/model-sources/LICENSE-APACHE-2.0 \
+    LICENSE-MIT LICENSE-APACHE dist/licenses/THIRD-PARTY-NOTICES
+}

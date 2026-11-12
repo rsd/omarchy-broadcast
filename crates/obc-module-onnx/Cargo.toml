@@ -1,0 +1,43 @@
+[package]
+name = "obc-module-onnx"
+description = "Person cut-out (background blur and replacement) with open ONNX models through ONNX Runtime, as an omarchy-broadcast module"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+# The module library the daemon loads: libobc_module_onnx.so. The rlib is
+# for the unit tests and the integration tests' helpers.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+obc-module-sdk = { workspace = true }
+# The CUDA driver, opened lazily on the first CUDA frame chain: the module
+# loads and probes on a machine without libcuda.
+obc-gpu = { workspace = true }
+# The frame descriptions obc-gpu copies.
+obc-backend = { workspace = true }
+# The CUDA driver calls obc-gpu lacks (cuCtxGetCurrent, cuCtxSetCurrent),
+# and the version query of the runtime library; the version ort uses.
+libloading = "0.9"
+# ONNX Runtime, opened at run time (`load-dynamic`): nothing links against
+# libonnxruntime.so. `api-29` is the C API of ONNX Runtime 1.29 (Arch's);
+# the C API is backward compatible, so newer runtimes work too.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-29", "cuda", "tensorrt", "openvino"] }
+# The module's own small pool of threads for the frame-wide passes (no
+# thread is spawned per frame; rayon's global pool is not used).
+rayon = "1"
+serde = { workspace = true }
+sha2 = "0.10"
+
+[dev-dependencies]
+obc-module-host = { workspace = true }
+tempfile = { workspace = true }
+# Decodes the test images of the integration tests.
+png = "0.18"
+
+[lints]
+workspace = true
