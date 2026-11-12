@@ -143,10 +143,15 @@ pub fn managed_path(config_toml: &Path) -> PathBuf {
 }
 
 /// The segments of a dotted key path. The last segment of
-/// `modules.enabled.<id>` and `modules.pin.<stage>` is kept whole (a module
-/// id holds dots); any other key splits at every dot.
+/// `modules.enabled.<id>`, `modules.forced.<id>` and `modules.pin.<stage>`
+/// is kept whole (a module id holds dots); any other key splits at every
+/// dot.
 pub fn key_segments(key: &str) -> Vec<&str> {
-    for (table, sub) in [("modules", "enabled"), ("modules", "pin")] {
+    for (table, sub) in [
+        ("modules", "enabled"),
+        ("modules", "forced"),
+        ("modules", "pin"),
+    ] {
         let prefix_len = table.len() + sub.len() + 2;
         if key.len() > prefix_len
             && key.starts_with(table)

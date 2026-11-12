@@ -49,7 +49,10 @@
 //!   switches to the stages alone).
 //! * **Failures** (no backend, a failed load, a frame or a background
 //!   image) set [`EffectStatus::Failed`]; the element then outputs black
-//!   (`on-failure=black`) or the input (`on-failure=none`).
+//!   (`on-failure=black`) or the input (`on-failure=none`). A backend
+//!   taken away while running ([`ObcEffect::revoke_backend`]: its module
+//!   can no longer run the effect) is such a failure at once; the instance
+//!   is dropped, and a factory set after it loads again.
 //! * **The fallback image** (`on-failure=image`): every frame the element
 //!   would output black (a failure, and the warm-up of an effect) shows the
 //!   still image of `fallback-image` instead, cropped to fill the frame. It
@@ -167,9 +170,27 @@ impl ObcEffect {
     /// Sets the backend factory the element creates its instance with. Set
     /// it before an effect is requested; a change applies to the next
     /// instance the element creates. Without one, every effect fails with
-    /// "no inference backend is configured".
+    /// "no inference backend is configured". A factory set after
+    /// [`Self::revoke_backend`] re-arms the element: the effect and its
+    /// stages load again with it, with no restart. The settings applied
+    /// while revoked were checked without a factory: they are checked with
+    /// it then, as [`Self::apply`] does, and what it refuses fails (a
+    /// refused stage is dropped, a refused background effect fails until
+    /// settings it accepts are applied).
     pub fn set_backend_factory(&self, factory: Option<Arc<dyn BackendFactory>>) {
         self.imp().set_backend_factory(factory);
+    }
+
+    /// Takes the backend away while the element runs: the factory is
+    /// cleared, and the effect and every effective stage fail at once with
+    /// the no-backend reason, so the next frames follow `on-failure`
+    /// (black, the fallback image, or with `none` the input). The worker
+    /// drops the instance (unloaded with the context pushed); no later
+    /// load reuses it. A frame already decided before the call may still
+    /// be processed by it. Never waits for a load under way. Without a
+    /// factory it does nothing.
+    pub fn revoke_backend(&self) {
+        self.imp().revoke_backend();
     }
 
     /// The current backend factory.
@@ -198,7 +219,7 @@ impl ObcEffect {
                 )?;
             }
         }
-        self.imp().apply(settings.clone(), true);
+        self.imp().apply_checked(settings.clone());
         Ok(())
     }
 

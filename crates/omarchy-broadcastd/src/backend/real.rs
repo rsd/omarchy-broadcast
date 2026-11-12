@@ -139,8 +139,10 @@ struct Running {
     /// The ingests' enhancer, chosen when the session started (`None`: no
     /// enhance stage).
     enhance: Option<EnhanceBackend>,
-    /// The output has the effect element.
-    effect: bool,
+    /// The effect element's backend, chosen when the session started
+    /// (`None`: no effect module), handed back to the element after a
+    /// revocation ([`MediaBackend::restore_effect_backend`]).
+    effect_backend: Option<obc_pipeline::EffectBackend>,
     /// The chains of the output, by element name.
     chains: Vec<String>,
 }
@@ -707,18 +709,12 @@ fn build_session(
         counts: WriterCounts::default(),
         unclean: None,
         enhance: enhance_backend(&params.backends),
-        effect: has_effect_element(&params.backends),
+        effect_backend: effect_backend(&params.backends),
         chains: module_stages(&params.effect, &params.backends)
             .iter()
             .map(|m| m.name.clone())
             .collect(),
     })
-}
-
-/// Whether a session of `backends` has the effect element: whenever a
-/// module provides the effect.
-fn has_effect_element(backends: &Backends) -> bool {
-    effect_backend(backends).is_some()
 }
 
 /// Builds and starts the output of a session of `params` into `sink`,
@@ -734,15 +730,14 @@ fn build_output(
     let mut ocfg = OutputConfig::new(params.contract, sink);
     ocfg.gap_threshold = params.input_gap;
     ocfg.hold_timeout = params.hold_timeout;
-    // With the element whenever a module provides the effect: an output
-    // built without it cannot take an effect later. Without one, no
-    // element (the frames pass through).
-    let backend = effect_backend(&params.backends);
-    let has_effect = backend.is_some();
-    if has_effect {
-        ocfg.effect = Some(effect_settings(&params.effect));
-        ocfg.effect_backend = backend;
-    }
+    // Always with the element (in passthrough it costs nothing): an output
+    // built without it cannot take an effect later. Without a module that
+    // provides the effect it has no backend, and a background effect asked
+    // of it fails, `on_failure` deciding what it shows (black, the
+    // fallback image or the camera image): the room is never shown for
+    // want of a module.
+    ocfg.effect = Some(effect_settings(&params.effect));
+    ocfg.effect_backend = effect_backend(&params.backends);
     ocfg.module_stages = module_stages(&params.effect, &params.backends);
     let mut output = Output::build(ocfg).map_err(|e| {
         *contract = contract_fault(&e);
@@ -1066,18 +1061,36 @@ impl MediaBackend for GstBackend {
             return Ok(());
         };
         let output = r.session.output();
-        if r.effect {
-            output
-                .set_effect(&effect_settings(effect))
-                .map_err(effect_error)?;
-        } else if !effect.effect_idle() {
-            return Err("no effect module provides the effect".into());
-        }
+        output
+            .set_effect(&effect_settings(effect))
+            .map_err(effect_error)?;
         for c in effect.chains.iter().filter(|c| r.chains.contains(&c.name)) {
             let stages: Vec<StageRequest> = c.stages.iter().map(stage_request).collect();
             output
                 .set_module_stages(&c.name, &stages)
                 .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// `obceffect` drops its backend instance mid-session
+    /// (`ObcEffect::revoke_backend`) and is re-armed by a factory.
+    fn can_revoke_effect_backend(&self) -> bool {
+        true
+    }
+
+    fn revoke_effect_backend(&mut self) -> Result<(), String> {
+        if let Some(r) = self.running.as_ref() {
+            r.session.output().revoke_effect_backend();
+        }
+        Ok(())
+    }
+
+    fn restore_effect_backend(&mut self) -> Result<(), String> {
+        if let Some(r) = self.running.as_ref() {
+            r.session
+                .output()
+                .set_effect_backend(r.effect_backend.as_ref());
         }
         Ok(())
     }
@@ -1733,7 +1746,7 @@ mod tests {
                     .is_ok()
             );
         }
-        // No module: no effect element, no chain.
+        // No module: an effect element without a backend, no chain.
         let none = crate::modules::Modules::empty().plan();
         assert!(none.effect.is_none() && none.chains.is_empty());
         assert!(effect_backend(&none.backends()).is_none());

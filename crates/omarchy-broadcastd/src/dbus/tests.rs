@@ -396,8 +396,8 @@ async fn every_property_reads_through_the_proxy() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 13);
-    assert_eq!(INTERFACE_REVISION, obc_ipc::MIC_REVISION);
+    assert_eq!(INTERFACE_REVISION, 14);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::FORCED_REVISION);
     // GetAll returns the same twenty-eight properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
         .destination(obc_ipc::BUS_NAME)
@@ -887,7 +887,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 13);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 14);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -973,8 +973,9 @@ async fn a_none_failure_is_in_warning_and_error_stays_empty() {
     );
 }
 
-/// `Warning` (revision 11): a selected effect no module provides streams
-/// without it, announced in `Warning`, never in `Error` or the state.
+/// `Warning` (revision 11): a selected effect no module provides follows
+/// `on_failure` (black by default), announced in `Warning`, never in
+/// `Error` or the state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn warning_names_a_dropped_effect_and_its_changes_are_announced() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
@@ -989,7 +990,8 @@ async fn warning_names_a_dropped_effect_and_its_changes_are_announced() {
     )
     .await
     .unwrap();
-    let want = "effect blur unavailable: NVIDIA Maxine video effects: Disabled";
+    let want = "effect blur unavailable: NVIDIA Maxine video effects: Disabled; the video is \
+                black until it can run";
     assert_eq!(proxy.warning().await.unwrap(), want);
     until("the warning", &seen, |s| {
         s.iter().any(|e| *e == format!("Warning={want}"))
@@ -1023,7 +1025,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 13);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 14);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -1139,7 +1141,7 @@ async fn preview_leases_by_bus_name_their_property_and_their_frames() {
     let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 13);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 14);
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
     let seen = rig.record_changes().await;
     let mut frames = proxy.receive_preview_frame().await.unwrap();

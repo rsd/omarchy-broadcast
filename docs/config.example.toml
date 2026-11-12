@@ -35,7 +35,7 @@
 # hold_timeout_s and input_gap_ms; [lifecycle] idle_grace_s and
 # start_debounce_ms; [effect] on_failure; [pipewire] enabled and offer_nv12;
 # [mic] enabled, device, pipeline_depth, idle_exit_s and gpu_policy; and in
-# [modules] profile, enabled.<id> and pin.<stage>. Everything else,
+# [modules] profile, enabled.<id>, forced.<id> and pin.<stage>. Everything else,
 # including the [effect] defaults (which a choice made in the panel overrides),
 # is set here. `omarchy-broadcast config show` lists every key with the file
 # that sets it, and `omarchy-broadcast config files` the files.
@@ -410,6 +410,24 @@ force_conflicts = false
 # (`omarchy-broadcast config reset modules.enabled.ID`) or set it false.
 # Default: none. Example (a table; indented so as not to read as a key):
 #   [modules.enabled]
+#   "org.example.hello" = true
+
+# Modules whose declared conflicts are not enforced, one entry per module id:
+# true. For debugging and testing only. A module whose manifest declares a
+# conflict with another enabled module is refused (unavailable, "Conflicts
+# with <name> (<id>)") and never loaded, and of two stages that are on and
+# conflict one is dropped; a module named here loads and runs next to the
+# module it conflicts with, and its stages run together, with a Warning
+# ("forced: <A> runs together with <B> despite a declared conflict
+# (modules.forced)") while that is so. It lifts conflicts only: a module a
+# module needs (`requires`), a stage's requirements and the cut-out's
+# placement are enforced all the same. Video modules only: the microphone's
+# conflicts are lifted by [mic] force_conflicts. `omarchy-broadcast modules
+# enable ID --force` and `omarchy-broadcast config set modules.forced.ID
+# true` write it to config.d/50-panel.toml; a plain `modules enable ID`
+# clears it. The module list and the setup dialog mark a forced module.
+# Default: none. Example (a table; indented so as not to read as a key):
+#   [modules.forced]
 #   "org.example.hello" = true
 
 # The order of the effect stages, by stage id: every stage the enabled modules

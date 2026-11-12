@@ -12,10 +12,12 @@ fn facts() -> RegistryFacts {
             ModuleFact {
                 id: "org.example.hello".into(),
                 name: "Hello tint".into(),
+                forceable: true,
             },
             ModuleFact {
                 id: "br.com.dias.maxine-vfx".into(),
                 name: "NVIDIA Maxine".into(),
+                forceable: true,
             },
         ],
         stages: vec![
@@ -259,6 +261,8 @@ fn the_module_rows_come_from_the_registry() {
             "modules.pin.hello",
             "modules.enabled.org.example.hello",
             "modules.enabled.br.com.dias.maxine-vfx",
+            "modules.forced.org.example.hello",
+            "modules.forced.br.com.dias.maxine-vfx",
             "modules.order",
             "modules.dirs",
             "modules.disabled",
@@ -297,6 +301,34 @@ fn the_module_rows_come_from_the_registry() {
     let r = find(&groups, "modules.enabled.br.com.dias.maxine-vfx");
     assert_eq!(r.value, ConfigValue::Bool(true));
     assert_eq!(r.source, "");
+    // The force rows: off by default, a switch, editable.
+    let r = find(&groups, "modules.forced.org.example.hello");
+    assert_eq!(r.label, "Force Hello tint");
+    assert_eq!(r.kind, RowKind::Bool);
+    assert_eq!(r.value, ConfigValue::Bool(false));
+    assert_eq!(r.default, Some(ConfigValue::Bool(false)));
+    assert!(r.editable && r.enabled);
+    assert!(r.description.contains("debugging"), "{}", r.description);
+    assert!(r.description.len() <= DESCRIPTION_MAX);
+    assert_eq!(
+        lookup("modules.forced.org.example.hello", &facts()).map(|k| k.kind),
+        Some(RowKind::Bool)
+    );
+    assert!(lookup("modules.forced.org.unknown.x", &facts()).is_none());
+    // An audio module has no force row (`[mic] force_conflicts` instead).
+    let mut audio = facts();
+    audio.modules[0].forceable = false;
+    let groups = config_schema(&set, &audio);
+    let ids: Vec<&str> = groups
+        .iter()
+        .flat_map(|g| &g.rows)
+        .map(|r| r.id.as_str())
+        .collect();
+    assert!(!ids.contains(&"modules.forced.org.example.hello"));
+    assert!(ids.contains(&"modules.enabled.org.example.hello"));
+    assert!(ids.contains(&"modules.forced.br.com.dias.maxine-vfx"));
+    assert!(lookup("modules.forced.org.example.hello", &audio).is_none());
+    assert!(lookup("modules.enabled.org.example.hello", &audio).is_some());
 
     // No registry: no module rows, the fixed ones stay.
     let groups = config_schema(&set, &RegistryFacts::default());

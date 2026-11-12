@@ -188,14 +188,19 @@ pub struct OutputConfig {
     /// `None` (the default) builds no element, and the output cannot take
     /// an effect later; `Some` inserts `obceffect` with these settings
     /// (`EffectSettings::default()`: passthrough until
-    /// [`Output::set_effect`]). Does not combine with
-    /// [`GpuStage::Roundtrip`].
+    /// [`Output::set_effect`], at no cost). The daemon always sets it, with
+    /// or without [`Self::effect_backend`], so that an effect asked of a
+    /// session no module can run follows its fallback. Does not combine
+    /// with [`GpuStage::Roundtrip`].
     pub effect: Option<EffectSettings>,
     /// The backend the effect element creates its instance with: none by
     /// default, and there is no built-in one (the daemon's comes from the
     /// module that provides the `background` stage). Without one the
-    /// element passes frames through and fails any other request with the
-    /// reason. Unused without [`Self::effect`].
+    /// element passes frames through under `none` and fails any other
+    /// request with the no-backend reason, its fallback deciding what it
+    /// shows. It can be taken away and set again while the output runs
+    /// ([`Output::revoke_effect_backend`], [`Output::set_effect_backend`]).
+    /// Unused without [`Self::effect`].
     pub effect_backend: Option<EffectBackend>,
     /// The module stage elements ([`crate::module`]), one per entry, in
     /// order within their placement: none by default. Their names must be
@@ -781,6 +786,28 @@ impl Output {
         })?;
         crate::effect::check_settings(settings)?;
         fx.apply(settings).map_err(PipelineError::Effect)
+    }
+
+    /// Takes the effect element's backend away at once: the effect and its
+    /// stages fail with the no-backend reason, so the next frames follow
+    /// the fallback (black, the fallback image, or the input with `none`),
+    /// and the element drops its backend instance on its worker
+    /// ([`gst_obc::ObcEffect::revoke_backend`]). Never waits for a load.
+    /// Does nothing without an effect element or a backend.
+    pub fn revoke_effect_backend(&self) {
+        if let Some(fx) = &self.effect {
+            fx.revoke_backend();
+        }
+    }
+
+    /// Sets the effect element's backend (`None`: none for the next
+    /// instance). After [`Self::revoke_effect_backend`] a backend re-arms
+    /// the element: the effect and its stages load again with it, with no
+    /// restart. Does nothing without an effect element.
+    pub fn set_effect_backend(&self, backend: Option<&EffectBackend>) {
+        if let Some(fx) = &self.effect {
+            fx.set_backend_factory(backend.map(|b| Arc::clone(b.factory())));
+        }
     }
 
     /// The state of the requested effect; [`EffectStatus::Off`] without an

@@ -11,7 +11,7 @@ use tempfile::TempDir;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::*;
-use crate::backend::fake::{FakeBackend, Hook, World};
+use crate::backend::fake::{FakeBackend, Hook, Shown, World};
 use crate::camera::tests::cam;
 use crate::log::Level;
 
@@ -1979,6 +1979,12 @@ fn off_and_idle_stop_the_session_whatever_the_effect() {
 /// `on_failure = "black"`.
 fn black(reason: &str) -> String {
     format!("effect blur unavailable: {reason}; the video is black until it can run")
+}
+
+/// `Warning` of a selected `blur` that cannot run for `reason`, with
+/// `on_failure = "image"`.
+fn imaged(reason: &str) -> String {
+    format!("effect blur unavailable: {reason}; the fallback image is shown until it can run")
 }
 
 /// `Warning` of a selected `blur` that cannot run for `reason`, with
@@ -8032,39 +8038,154 @@ fn with_no_module_the_camera_passes_through_and_no_effect_group_is_shown() {
     assert!(h.ctrl.order_ids().is_empty());
 }
 
-/// `Warning` of a selected `blur` whose module (Maxine) is disabled.
-const NO_BLUR: &str = "effect blur unavailable: NVIDIA Maxine video effects: Disabled";
+/// Why a selected `blur` cannot run while its module (Maxine) is
+/// disabled.
+const MAXINE_DISABLED: &str = "NVIDIA Maxine video effects: Disabled";
 
-/// `Warning` of a selected `blur` no installed module provides.
-const NO_MODULE_BLUR: &str = "effect blur unavailable: No installed module provides it";
+/// `Warning` of a selected `blur` that the running session lost the
+/// module of (Maxine disabled while it runs): dropped, as a stage no
+/// module provides ([`Controller::background_lost`]).
+const DROPPED_BLUR: &str = "effect blur unavailable: NVIDIA Maxine video effects: Disabled";
 
-#[test]
-fn a_background_effect_with_no_module_to_run_it_is_dropped_with_a_warning() {
-    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| w.maxine = false);
-    // The method of revision 8 still takes the choice.
-    h.call(|r| Command::SetEffect("blur".into(), r), 0).unwrap();
-    assert_eq!(
-        h.snap().warning,
-        NO_MODULE_BLUR,
-        "known before a session starts"
+/// Why a selected `blur` no installed module provides cannot run.
+const NO_MODULE: &str = "No installed module provides it";
+
+/// The `[effect]` of a selected `blur` with `on_failure` (the image
+/// configured for `image`).
+fn blur_with(on_failure: &str) -> String {
+    match on_failure {
+        "image" => image_config(""),
+        _ => format!("[effect]\nmode = \"blur\"\non_failure = \"{on_failure}\"\n"),
+    }
+}
+
+/// `Warning` of a selected `blur` that cannot run for `reason`, under
+/// `on_failure`.
+fn closed(on_failure: &str, reason: &str) -> String {
+    match on_failure {
+        "black" => black(reason),
+        "image" => imaged(reason),
+        _ => shown_without(reason),
+    }
+}
+
+/// The running session follows `on_failure` for a selected `blur` that
+/// no module of it can run (`why`): still `active` with the camera open,
+/// `Error` empty, `Warning` saying why; under `black` and `image` the
+/// effect element is asked for the effect all the same and fails it (no
+/// backend, or one that cannot run it), showing black or the fallback
+/// image; under `none` the effect is off (the camera image, the user's
+/// choice).
+fn assert_follows_on_failure(h: &H, on_failure: &str, why: &str) {
+    assert_eq!(h.state(), State::Active, "{on_failure}: {:?}", h.snap());
+    assert!(
+        !h.world().ingests.is_empty(),
+        "{on_failure}: the camera is open"
     );
-    h.consumers(1, 100);
-    h.tick(400);
-    // The feed streams without it, closed by default or not.
-    assert_eq!(h.state(), State::Active);
     let snap = h.snap();
     assert_eq!(
         (snap.error.as_str(), snap.warning.as_str()),
-        ("", NO_MODULE_BLUR)
+        ("", closed(on_failure, why).as_str()),
+        "{on_failure}"
     );
-    assert_eq!(snap.effect, "blur", "the choice is kept");
-    assert_eq!(h.applied(), Some(EffectMode::None));
-    // A call for the effect is taken, and changes nothing of that.
-    h.set_effect("blur", 500).unwrap();
-    assert_eq!(h.state(), State::Active);
-    assert_eq!(h.applied(), Some(EffectMode::None));
-    assert_eq!(h.snap().error, "");
-    assert_eq!(h.persisted().effect, Some(EffectMode::Blur));
+    assert_eq!(snap.effect, "blur", "{on_failure}: the choice is kept");
+    let w = h.world();
+    let given = w.effect.clone().expect("the session has an effect");
+    if on_failure == "none" {
+        assert_eq!(given.mode, EffectMode::None, "the camera image");
+        assert_eq!(w.effect_status, EffectStatus::Off);
+    } else {
+        assert_eq!(given.mode, EffectMode::Blur, "{on_failure}: never raw");
+        assert!(
+            matches!(w.effect_status, EffectStatus::Failed(_)),
+            "{on_failure}: the element shows its fallback: {:?}",
+            w.effect_status
+        );
+        let want = if on_failure == "image" {
+            EffectOnFailure::Image
+        } else {
+            EffectOnFailure::Black
+        };
+        assert_eq!(given.on_failure, want);
+        if on_failure == "image" {
+            assert_eq!(given.fallback_image, Some(PathBuf::from(AWAY)));
+        }
+    }
+}
+
+const ON_FAILURE: [&str; 3] = ["black", "image", "none"];
+
+#[test]
+fn a_background_effect_with_no_module_to_run_it_follows_on_failure() {
+    for on_failure in ON_FAILURE {
+        let mut h = H::new(&blur_with(on_failure), |w| w.maxine = false);
+        // The method of revision 8 still takes the choice.
+        h.call(|r| Command::SetEffect("blur".into(), r), 0).unwrap();
+        assert_eq!(
+            h.snap().warning,
+            closed(on_failure, NO_MODULE),
+            "{on_failure}: known before a session starts"
+        );
+        h.activate(100);
+        assert_follows_on_failure(&h, on_failure, NO_MODULE);
+        // No module code runs: the element has no backend.
+        assert_eq!(h.session_params().backends, Backends::default());
+        // A call for the effect is taken, and changes nothing of that.
+        h.set_effect("blur", 500).unwrap();
+        assert_follows_on_failure(&h, on_failure, NO_MODULE);
+        assert_eq!(h.persisted().effect, Some(EffectMode::Blur));
+        assert_eq!(h.world().session_starts, 1, "{on_failure}");
+    }
+}
+
+#[test]
+fn a_background_effect_selected_mid_session_with_no_module_follows_on_failure() {
+    for on_failure in ON_FAILURE {
+        let config = blur_with(on_failure).replace("mode = \"blur\"", "mode = \"none\"");
+        let mut h = H::new(&config, |w| w.maxine = false);
+        h.activate(0);
+        assert_eq!(h.snap().warning, "", "{on_failure}");
+        // The element is there, without a backend: no restart for it.
+        h.set_effect("blur", 500).unwrap();
+        assert_follows_on_failure(&h, on_failure, NO_MODULE);
+        assert_eq!(h.world().session_starts, 1, "{on_failure}");
+    }
+}
+
+#[test]
+fn a_session_with_no_module_keeps_its_backendless_element_and_needs_no_bare_start() {
+    // The effect element is always built; without a backend it starts
+    // nothing that can fail (passthrough under `none`, no CUDA call), so
+    // only a session with module code can fail its start for its effects
+    // (`fail_start_effects`) and fall back to the bare passthrough. A
+    // session with no module starts once, as it is: under `none` the camera
+    // image, under `black` or `image` a selected effect hidden by the
+    // element, never the room.
+    for (mode, on_failure, shown) in [
+        ("none", "black", Shown::Camera),
+        ("none", "none", Shown::Camera),
+        ("blur", "none", Shown::Camera),
+        ("blur", "black", Shown::Black),
+        ("blur", "image", Shown::Image),
+    ] {
+        let what = format!("{mode} under {on_failure}");
+        let config =
+            blur_with(on_failure).replace("mode = \"blur\"", &format!("mode = \"{mode}\""));
+        let mut h = H::new(&config, |w| {
+            w.maxine = false;
+            w.fail_start_effects = Some("obc-module: no CUDA memory".into());
+        });
+        h.activate(0);
+        assert_eq!(h.state(), State::Active, "{what}: {:?}", h.snap());
+        assert_eq!(h.world().session_starts, 1, "{what}");
+        assert_eq!(h.ctrl.passthrough, None, "{what}: no bare fallback");
+        assert!(
+            !h.snap().warning.contains("streaming without them"),
+            "{what}"
+        );
+        assert_eq!(h.session_params().backends, Backends::default(), "{what}");
+        assert_eq!(h.world().shown(), Some(shown), "{what}");
+    }
 }
 
 #[test]
@@ -9221,7 +9342,13 @@ fn disabling_the_effect_module_drops_its_stages_and_keeps_the_feed_and_the_other
         "{}[effect]\nmode = \"blur\"\ndenoise = true\n",
         modules_config(dir.path())
     );
-    let mut h = H::new(&config, |w| w.real_modules = true);
+    // An effect element that cannot drop its backend mid-session (the
+    // real one until gst-obc can): the background effect is dropped with
+    // the module's other stages.
+    let mut h = H::new(&config, |w| {
+        w.real_modules = true;
+        w.revoke_unsupported = true;
+    });
     h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
         .unwrap();
     h.activate(100);
@@ -9274,46 +9401,40 @@ fn disabling_the_effect_module_drops_its_stages_and_keeps_the_feed_and_the_other
 }
 
 #[test]
-fn a_session_started_with_its_effect_module_disabled_streams_and_restarts_once_enabled() {
-    // `on_failure = "black"` (the default) does not apply: nothing failed.
-    let mut h = H::new(
-        "[effect]\nmode = \"blur\"\non_failure = \"black\"\n",
-        |_| {},
-    );
-    h.set_module(MAXINE_MODULE, false, 0);
-    h.activate(100);
-    let snap = h.snap();
-    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", NO_BLUR));
-    {
-        let w = h.world();
-        let (params, _) = w.session.as_ref().unwrap();
-        assert_eq!(params.effect.mode, EffectMode::None, "passthrough");
-        assert!(params.backends.effect.is_none());
+fn a_session_started_with_its_effect_module_disabled_follows_on_failure_and_restarts_once_enabled()
+{
+    for on_failure in ON_FAILURE {
+        let mut h = H::new(&blur_with(on_failure), |_| {});
+        h.set_module(MAXINE_MODULE, false, 0);
+        h.activate(100);
+        assert_follows_on_failure(&h, on_failure, MAXINE_DISABLED);
+        assert!(h.session_params().backends.effect.is_none());
+        // The same after the camera stops and starts again (the case that
+        // used to end in `error`).
+        h.consumers(0, 1000);
+        h.tick(60_000);
+        assert!(h.world().session.is_none());
+        h.activate(61_000);
+        assert_follows_on_failure(&h, on_failure, MAXINE_DISABLED);
+        assert_eq!(h.world().session_starts, 2);
+        // Enabled again: the session, built without it, is started again
+        // with it, by itself.
+        h.set_module(MAXINE_MODULE, true, 62_000);
+        h.tick(62_400);
+        assert_eq!(h.state(), State::Active);
+        assert_eq!(h.world().session_starts, 3, "{on_failure}");
+        assert_eq!(h.applied(), Some(EffectMode::Blur));
+        assert_eq!(h.world().effect_status, EffectStatus::Ready);
+        {
+            let w = h.world();
+            let (params, _) = w.session.as_ref().unwrap();
+            assert_eq!(params.effect.mode, EffectMode::Blur);
+            assert!(params.backends.effect.is_some());
+        }
+        let snap = h.snap();
+        assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", ""));
+        assert_eq!(snap.effect, "blur");
     }
-    // The same after the camera stops and starts again (the case that
-    // used to end in `error`).
-    h.consumers(0, 1000);
-    h.tick(60_000);
-    assert!(h.world().session.is_none());
-    h.activate(61_000);
-    assert_eq!(h.snap().warning, NO_BLUR);
-    assert_eq!(h.world().session_starts, 2);
-    // Enabled again: the session, built without it, is started again with
-    // it, by itself.
-    h.set_module(MAXINE_MODULE, true, 62_000);
-    h.tick(62_400);
-    assert_eq!(h.state(), State::Active);
-    assert_eq!(h.world().session_starts, 3);
-    assert_eq!(h.applied(), Some(EffectMode::Blur));
-    {
-        let w = h.world();
-        let (params, _) = w.session.as_ref().unwrap();
-        assert_eq!(params.effect.mode, EffectMode::Blur);
-        assert!(params.backends.effect.is_some());
-    }
-    let snap = h.snap();
-    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", ""));
-    assert_eq!(snap.effect, "blur");
 }
 
 #[test]
@@ -9331,12 +9452,13 @@ fn a_runtime_failure_of_a_provided_effect_follows_on_failure_and_never_stops_the
     assert_eq!(snap.warning, black("processing a frame failed"));
     assert!(h.world().session.is_some());
     assert_eq!(h.world().effect.as_ref().unwrap().mode, EffectMode::Blur);
-    // Its module disabled meanwhile: the effect is dropped (no module
-    // provides it) and the feed shows the camera, as for any stage no
-    // module provides; the failure is no longer what it shows.
+    // Its module disabled meanwhile: the element drops the module's
+    // backend and stays black, the effect still asked; `Warning` gives
+    // the module's reason, not the frame's failure.
     h.set_module(MAXINE_MODULE, false, 2000);
-    assert_eq!(h.last_effect().mode, EffectMode::None);
-    assert_eq!(h.snap().warning, NO_BLUR);
+    assert_eq!(h.world().effect.as_ref().unwrap().mode, EffectMode::Blur);
+    assert_eq!(h.world().shown(), Some(Shown::Black));
+    assert_eq!(h.snap().warning, black(MAXINE_DISABLED));
     // Enabled again: given again, a retry (it runs now).
     h.world().effect_slow = false;
     h.set_module(MAXINE_MODULE, true, 3000);
@@ -9456,8 +9578,8 @@ fn a_failed_effect_whose_module_is_disabled_leaves_one_clause() {
         let snap = h.snap();
         assert_eq!(
             (snap.error.as_str(), snap.warning.as_str()),
-            ("", NO_BLUR),
-            "at start {at_start}: the dropped clause alone"
+            ("", shown_without(MAXINE_DISABLED).as_str()),
+            "at start {at_start}: the module's clause alone"
         );
     }
 }
@@ -9637,30 +9759,27 @@ fn under_black_a_provided_effect_that_fails_is_never_given_off() {
 }
 
 #[test]
-fn an_effect_whose_module_the_crash_ledger_disabled_is_dropped_not_a_fault() {
-    let mut h = H::new("[effect]\nmode = \"blur\"\n", |_| {});
-    let ledger = h.paths.state.with_file_name(LEDGER_FILE);
-    fs::create_dir_all(ledger.parent().unwrap()).unwrap();
-    h.paths.ledger = Some(ledger.clone());
-    for _ in 1..=2 {
-        let mut l = CrashLedger::open(&ledger);
-        l.begin(MAXINE_MODULE).unwrap();
-        drop(l);
-        h.restart();
-    }
-    assert!(!h.modules().find(MAXINE_MODULE).unwrap().enabled);
-    h.activate(0);
-    let snap = h.snap();
-    assert_eq!(snap.error, "");
-    // The crash ledger's reason, not a generic one.
-    assert_eq!(
-        snap.warning,
-        format!(
-            "effect blur unavailable: NVIDIA Maxine video effects: {}",
+fn an_effect_whose_module_the_crash_ledger_disabled_follows_on_failure_not_a_fault() {
+    for on_failure in ON_FAILURE {
+        let mut h = H::new(&blur_with(on_failure), |_| {});
+        let ledger = h.paths.state.with_file_name(LEDGER_FILE);
+        fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        h.paths.ledger = Some(ledger.clone());
+        for _ in 1..=2 {
+            let mut l = CrashLedger::open(&ledger);
+            l.begin(MAXINE_MODULE).unwrap();
+            drop(l);
+            h.restart();
+        }
+        assert!(!h.modules().find(MAXINE_MODULE).unwrap().enabled);
+        h.activate(0);
+        // The crash ledger's reason, not a generic one.
+        let why = format!(
+            "NVIDIA Maxine video effects: {}",
             obc_module_host::REASON_CRASHED
-        )
-    );
-    assert_eq!(h.applied(), Some(EffectMode::None));
+        );
+        assert_follows_on_failure(&h, on_failure, &why);
+    }
 }
 
 /// A module `id` (an NPU, rank 100) whose one stage is `stage` in `slot`,
@@ -9703,16 +9822,23 @@ fn an_effect_selected_while_its_module_is_disabled_is_given_once_it_is_enabled_a
     let mut h = H::new("", |_| {});
     h.activate(0);
     h.set_module(MAXINE_MODULE, false, 1000);
+    // Asked of the element, which has dropped the module's backend: black
+    // (`on_failure = "black"`, the default), never the camera image.
     h.set_effect("blur", 2000).unwrap();
-    assert_eq!(h.applied(), Some(EffectMode::None));
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    assert_eq!(h.world().shown(), Some(Shown::Black));
     let snap = h.snap();
-    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", NO_BLUR));
+    assert_eq!(
+        (snap.error.as_str(), snap.warning.as_str()),
+        ("", black(MAXINE_DISABLED).as_str())
+    );
     assert_eq!(h.state(), State::Active);
     // Its module is enabled again: the session, which has it, runs it
     // with no further call.
     h.set_module(MAXINE_MODULE, true, 3000);
     assert_eq!(h.applied(), Some(EffectMode::Blur));
     assert_eq!(h.last_effect().mode, EffectMode::Blur);
+    assert_eq!(h.world().shown(), Some(Shown::Effect));
     assert_eq!(h.world().session_starts, 1, "no restart");
     let snap = h.snap();
     assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", ""));
@@ -9969,15 +10095,14 @@ fn a_provider_lost_again_on_the_second_start_pass_is_named_in_the_warning() {
     h.activate(0);
     assert_eq!(h.world().session_starts, 2, "never a third start");
     assert!(h.world().probe_script.is_empty(), "probed as scripted");
-    // The session's module cannot run it, and no restart: the camera
-    // image, never silently.
-    assert_eq!(h.applied(), Some(EffectMode::None));
+    // The session's module cannot run it, and no restart: the element
+    // drops its backend and the video is black (`on_failure = "black"`),
+    // never silently.
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    assert_eq!(h.world().shown(), Some(Shown::Black));
     let snap = h.snap();
     assert_eq!(snap.error, "");
-    assert_eq!(
-        snap.warning,
-        "effect blur unavailable: it runs when the camera next starts"
-    );
+    assert_eq!(snap.warning, black("it runs when the camera next starts"));
 }
 
 #[test]
@@ -10007,7 +10132,9 @@ const NO_HELLO: &str = "warm tint unavailable: Hello tint: Disabled";
 #[test]
 fn every_dropped_stage_is_named_in_the_warning_with_its_modules_reason() {
     let config = "[effect]\nmode = \"blur\"\ndenoise = true\nrelight = true\n";
-    let mut h = H::new(config, |_| {});
+    // An effect element that cannot drop its backend mid-session: the
+    // background effect is one of the dropped stages.
+    let mut h = H::new(config, |w| w.revoke_unsupported = true);
     h.activate(0);
     assert_eq!(h.snap().warning, "");
     h.set_module(MAXINE_MODULE, false, 1000);
@@ -10029,21 +10156,21 @@ fn every_dropped_stage_is_named_in_the_warning_with_its_modules_reason() {
 }
 
 #[test]
-fn the_warning_gives_why_a_module_failed_to_load() {
-    let mut cut = npu_module("org.example.cutout", StageId::BACKGROUND, "matte");
-    cut.1 = Err("cannot open /m/org.example.cutout.so: no such file".into());
-    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
-        w.maxine = false;
-        w.modules = vec![cut];
-    });
-    assert_eq!(
-        h.snap().warning,
-        "effect blur unavailable: NPU background: cannot open /m/org.example.cutout.so: no \
-         such file"
-    );
-    h.activate(0);
-    assert_eq!(h.applied(), Some(EffectMode::None));
-    assert_eq!(h.snap().error, "");
+fn a_background_effect_whose_module_failed_to_open_follows_on_failure() {
+    let why = "NPU background: cannot open /m/org.example.cutout.so: no such file";
+    for on_failure in ON_FAILURE {
+        let mut cut = npu_module("org.example.cutout", StageId::BACKGROUND, "matte");
+        cut.1 = Err("cannot open /m/org.example.cutout.so: no such file".into());
+        let mut h = H::new(&blur_with(on_failure), |w| {
+            w.maxine = false;
+            w.modules = vec![cut];
+        });
+        // The warning gives why the module failed to load.
+        assert_eq!(h.snap().warning, closed(on_failure, why), "idle");
+        h.activate(0);
+        assert_follows_on_failure(&h, on_failure, why);
+        assert!(h.session_params().backends.effect.is_none());
+    }
 }
 
 #[test]
@@ -10075,7 +10202,7 @@ fn dropped_stages_of_two_modules_are_two_clauses() {
     let snap = h.snap();
     assert_eq!(
         (snap.error.as_str(), snap.warning.as_str()),
-        ("", &*format!("{NO_BLUR}; {NO_HELLO}"))
+        ("", &*format!("{}; {NO_HELLO}", black(MAXINE_DISABLED)))
     );
     assert_eq!(h.state(), State::Active);
     assert!(!stage_on(&h.last_effect(), "hello"));
@@ -11651,47 +11778,87 @@ fn background_learnt_at_start(config: &str, with_cc: Option<Vec<(StageId, Availa
 }
 
 #[test]
-fn a_start_that_learns_the_effect_can_run_never_opens_the_camera_without_it() {
+fn a_start_whose_output_cannot_take_its_effect_module_never_opens_the_camera() {
     for config in [BLUR_BLACK.to_string(), image_config("")] {
-        // Started without its effects (the effect could not run then); the
-        // GPU up, the module can run it: the room is never shown.
+        // The effect is asked of the session although its module cannot
+        // run it yet (it fails closed): the output cannot be built with
+        // the module, and is never started without it. The room is never
+        // shown.
         let mut h = background_learnt_at_start(&config, Some(all_installed()));
         h.consumers(1, 0);
         h.tick(300);
         assert!(h.world().ingests.is_empty(), "{config}: no camera opened");
         assert!(h.world().session.is_none(), "{config}: {:?}", h.snap());
         assert_eq!(h.state(), State::Error, "{config}");
-        // Started again with the effect, in the same step: it cannot start,
-        // and is not started without it.
-        assert_eq!(h.world().session_starts, 1, "{config}");
+        assert_eq!(h.world().session_starts, 0, "{config}");
+        assert_eq!(h.ctrl.passthrough, None);
         // Further steps never open the camera.
         ticks_over(&mut h, 300, Duration::from_secs(2));
         assert!(h.world().ingests.is_empty(), "{config}");
-        assert_eq!(h.world().session_starts, 1, "{config}");
+        assert_eq!(h.world().session_starts, 0, "{config}");
         let image = config.contains("image").then(|| PathBuf::from(AWAY));
         assert_eq!(h.world().placeholder, image, "{config}");
     }
 }
 
 #[test]
-fn a_session_without_an_effect_its_module_cannot_run_is_not_restarted_by_the_guard() {
+fn an_effect_asked_while_its_module_could_not_run_it_is_given_again_once_it_can() {
+    // Not known for this GPU until it is up: the session is asked for the
+    // effect all the same (the element fails it, the video black); the GPU
+    // up, the module can run it, and the element is given it again, with
+    // no restart.
+    let mut h = H::new(BLUR_BLACK, |w| {
+        w.features = Some(stage_missing(
+            &StageId::BACKGROUND,
+            "not known for this GPU yet",
+        ));
+        w.features_with_cc = Some(all_installed());
+        w.compute_capability = Some((8, 6));
+    });
+    assert_eq!(
+        h.snap().warning,
+        black(&format!("{MAXINE_NAME}: {REASON_NOT_INSTALLED}")),
+        "idle"
+    );
+    h.activate(0);
+    assert_eq!(
+        h.session_params().effect.mode,
+        EffectMode::Blur,
+        "never raw"
+    );
+    let given: Vec<EffectMode> = h.world().effect_sets.iter().map(|e| e.mode).collect();
+    assert_eq!(given, [EffectMode::Blur], "given again once it can run");
+    assert_eq!(h.world().session_starts, 1, "no restart");
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", ""));
+}
+
+#[test]
+fn a_session_whose_module_cannot_run_the_effect_never_streams_without_its_effects() {
     for config in [BLUR_BLACK.to_string(), image_config("")] {
-        // The module never can run the effect: the documented raw picture
-        // with a warning, started once, its camera opened once.
+        // The module never can run the effect, and the output cannot be
+        // built with the module: under `black` or `image` the session is
+        // never started without its effects (the raw picture), the camera
+        // never opened; the placeholder shows black or the image.
         let mut h = background_learnt_at_start(&config, None);
         h.consumers(1, 0);
         h.tick(300);
-        assert_eq!(h.state(), State::Active, "{config}: {:?}", h.snap());
-        assert!(h.snap().warning.contains("streaming without them"));
+        assert_eq!(h.state(), State::Error, "{config}: {:?}", h.snap());
+        assert!(!h.snap().warning.contains("streaming without them"));
         ticks_over(&mut h, 300, Duration::from_secs(2));
-        assert_eq!(h.state(), State::Active, "{config}");
-        assert_eq!(h.world().session_starts, 1, "{config}");
-        assert_eq!(h.world().ingests.len(), 1, "{config}: camera opened once");
+        assert_eq!(h.state(), State::Error, "{config}");
+        assert_eq!(h.world().session_starts, 0, "{config}");
+        assert!(
+            h.world().ingests.is_empty(),
+            "{config}: camera never opened"
+        );
+        let image = config.contains("image").then(|| PathBuf::from(AWAY));
+        assert_eq!(h.world().placeholder, image, "{config}");
     }
 }
 
 #[test]
-fn a_second_start_that_learns_the_effect_can_run_never_opens_the_camera_without_it() {
+fn a_second_start_that_cannot_build_its_effects_never_opens_the_camera_without_them() {
     // No model for the background effect is known until the GPU is up.
     // The first session runs noise removal with Maxine, which loses it for
     // this GPU: restarted for the other module that has it. The second
@@ -11735,17 +11902,20 @@ fn a_second_start_that_learns_the_effect_can_run_never_opens_the_camera_without_
     })));
     h.consumers(1, 0);
     h.tick(300);
-    assert!(h.world().probe_script.is_empty(), "probed as scripted");
-    assert_eq!(h.world().session_starts, 2, "never a third start");
+    // The second start cannot build its effects, and is never started
+    // without them: the effect is asked of it although its module cannot
+    // run it yet (it fails closed). It is not probed again.
+    assert_eq!(h.world().probe_script.len(), 1, "never probed again");
+    assert_eq!(h.world().session_starts, 1, "the second start was refused");
     assert!(h.world().ingests.is_empty(), "no camera opened");
     assert!(h.world().session.is_none(), "{:?}", h.snap());
     assert_eq!(h.ctrl.passthrough, None);
-    assert_eq!(h.ctrl.privacy_hold, Some(PrivacyHold::Guard));
+    assert!(matches!(h.ctrl.privacy_hold, Some(PrivacyHold::Fault(_))));
     // Further steps start with the effect, which cannot start: the camera
     // is never opened without it.
     ticks_over(&mut h, 300, Duration::from_secs(2));
     assert!(h.world().ingests.is_empty());
-    assert_eq!(h.world().session_starts, 2);
+    assert_eq!(h.world().session_starts, 1);
     assert_eq!(h.state(), State::Error, "{:?}", h.snap());
 }
 
@@ -12006,17 +12176,16 @@ fn a_start_tried_again_under_the_hold_goes_black_when_the_hold_ends_before_it_st
 }
 
 #[test]
-fn a_start_the_guard_drops_under_the_hold_keeps_the_fallback_image() {
+fn a_start_refused_again_under_the_hold_keeps_the_fallback_image() {
     let away = || Some(PathBuf::from(AWAY));
     // Privacy holds the feed, the image shown.
     let mut h = background_learnt_at_start(&image_config(""), Some(all_installed()));
     h.consumers(1, 0);
     h.tick(300);
     assert_eq!(placeholder_sets(&h), [away()]);
-    // Tried again: the background effect unknown again, the session starts
-    // without its effects, learns it can run once the GPU is up, and is
-    // dropped as the guard would before the camera opens; started again
-    // with the effect, it is refused.
+    // Tried again: the background effect unknown again, the session is
+    // asked for it all the same (it fails closed), its output cannot be
+    // built with the module, and it is never started without it.
     let seen: Arc<Mutex<Vec<Option<PathBuf>>>> = Arc::default();
     {
         let (fake, out) = (h.fake.clone(), Arc::clone(&seen));
@@ -12036,14 +12205,14 @@ fn a_start_the_guard_drops_under_the_hold_keeps_the_fallback_image() {
         (w.session_starts, w.session_stops)
     };
     h.reload(&image_config(""), 1000).unwrap();
-    assert_eq!(h.world().session_starts, starts + 1, "started without them");
-    assert_eq!(h.world().session_stops, stops + 1, "dropped by the guard");
+    assert_eq!(h.world().session_starts, starts, "never without them");
+    assert_eq!(h.world().session_stops, stops);
     assert!(h.world().ingests.is_empty(), "no camera opened");
     assert_eq!(h.state(), State::Error, "{:?}", h.snap());
     // The image throughout, never black in between.
     let seen = seen.lock().unwrap().clone();
     assert!(
-        seen.len() >= 2 && seen.iter().all(|p| *p == away()),
+        !seen.is_empty() && seen.iter().all(|p| *p == away()),
         "{seen:?}"
     );
     assert_eq!(placeholder_sets(&h), [away()]);
@@ -12486,4 +12655,1029 @@ fn a_microphone_group_sharing_a_video_groups_id_is_reset_only_by_its_full_name()
     // `mic.video` is the microphone's.
     h.reset_settings("group:mic.video", 20).unwrap();
     assert!(!h.setting("mic.video.level").stored);
+}
+
+// ---- module and stage conflicts, and the forced override ----
+
+/// A module `id` named `name`, with `head` (top-level keys) and one stage
+/// `stage` (post-composite, CPU) with `extra` keys, opened with the stage
+/// installed and no settings (so its stage is on whenever provided).
+fn conflict_module(
+    id: &str,
+    name: &str,
+    head: &str,
+    stage: &str,
+    extra: &str,
+) -> (
+    obc_module_host::discovery::ModuleEntry,
+    Result<crate::backend::OpenedModule, String>,
+) {
+    (
+        crate::modules::testing::entry(
+            &format!(
+                "abi = 1\nid = \"{id}\"\nname = \"{name}\"\nversion = \"1\"\n\
+                 licence = \"MIT\"\nkind = \"video-stage\"\nlibrary = \"/m/{id}.so\"\n{head}\n\
+                 [[stage]]\nid = \"{stage}\"\nslot = \"post-composite\"\nrank = 100\n\
+                 device = \"cpu\"\nframes = [\"host\"]\nformats = [\"nv12\"]\n{extra}\n"
+            ),
+            &format!("/m/{id}.toml"),
+        ),
+        Ok(crate::backend::OpenedModule {
+            module: None,
+            stages: vec![(StageId::new(stage).unwrap(), Availability::Installed)],
+            settings: Default::default(),
+        }),
+    )
+}
+
+const COOL: &str = "org.example.cool";
+const COOL_FORCED: &str = "forced: noise removal runs together with cool despite a declared \
+                           conflict (modules.forced)";
+
+fn denoise_of(list: &obc_ipc::ModuleList) -> obc_ipc::StageInfo {
+    list.find(MAXINE_MODULE)
+        .and_then(|m| m.stage("denoise"))
+        .cloned()
+        .expect("the Maxine module lists denoise")
+}
+
+#[test]
+fn of_two_conflicting_stages_on_the_loser_is_dropped_and_the_feed_kept() {
+    let mut h = H::new("[effect]\ndenoise = true\n", |w| {
+        w.modules = vec![conflict_module(
+            COOL,
+            "Cool tint",
+            "",
+            "cool",
+            "conflicts = [\"denoise\"]",
+        )];
+    });
+    let want = "noise removal unavailable: Cannot run together with cool";
+    assert_eq!(h.snap().warning, want, "idle");
+    let list = h.modules();
+    let d = denoise_of(&list);
+    assert!(!d.available && d.selected);
+    assert_eq!(d.reason, "Cannot run together with cool");
+    assert!(list.find(COOL).unwrap().stage("cool").unwrap().available);
+    h.activate(0);
+    assert_eq!(h.state(), State::Active);
+    let run = &h.session_params().effect;
+    assert!(!stage_on(run, "denoise"), "the loser does not run");
+    assert!(stage_on(run, "cool"), "the winner does");
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", want));
+    // Noise removal switched off: no conflict, and the serial moves with
+    // what `GetModules` lists.
+    let serial = h.snap().modules_serial.unwrap();
+    h.set_denoise(false, 1000).unwrap();
+    assert_eq!(h.snap().warning, "");
+    assert_ne!(h.snap().modules_serial.unwrap(), serial);
+    assert!(denoise_of(&h.modules()).available);
+    // On again: dropped again in the running session (nothing new is
+    // given to it), not restarted.
+    h.set_denoise(true, 2000).unwrap();
+    let given = h.world().effect_sets.last().cloned();
+    let given = given.unwrap_or_else(|| h.session_params().effect);
+    assert!(!stage_on(&given, "denoise") && stage_on(&given, "cool"));
+    assert_eq!(h.snap().warning, want);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().session_starts, 1);
+}
+
+#[test]
+fn a_forced_module_runs_both_conflicting_stages_and_the_warning_says_so() {
+    let mut h = H::new("[effect]\ndenoise = true\n", |w| {
+        w.modules = vec![conflict_module(
+            COOL,
+            "Cool tint",
+            "",
+            "cool",
+            "conflicts = [\"denoise\"]",
+        )];
+    });
+    let key = format!("modules.forced.{COOL}");
+    // The row exists for the installed module, off.
+    let row = h.row(&key);
+    assert_eq!(row.value, obc_ipc::ConfigValue::Bool(false));
+    h.set_config(&key, obc_ipc::ConfigValue::Bool(true))
+        .unwrap();
+    assert_eq!(h.row(&key).value, obc_ipc::ConfigValue::Bool(true));
+    assert!(
+        fs::read_to_string(h.config_d("50-panel.toml"))
+            .unwrap()
+            .contains("[modules.forced]")
+    );
+    let list = h.modules();
+    assert!(list.find(COOL).unwrap().forced);
+    assert!(!list.find(MAXINE_MODULE).unwrap().forced);
+    assert!(denoise_of(&list).available);
+    h.activate(0);
+    let run = &h.session_params().effect;
+    assert!(stage_on(run, "denoise") && stage_on(run, "cool"));
+    assert_eq!(h.snap().warning, COOL_FORCED);
+    // Noise removal off: no conflict is overridden, nothing to say.
+    h.set_denoise(false, 1000).unwrap();
+    assert_eq!(h.snap().warning, "");
+    h.set_denoise(true, 1500).unwrap();
+    assert_eq!(h.snap().warning, COOL_FORCED);
+    // Reset: enforced again, in the running session.
+    h.call(|r| Command::ResetConfig(key.clone(), r), 2000)
+        .unwrap();
+    assert!(!h.modules().find(COOL).unwrap().forced);
+    assert!(!stage_on(&h.last_effect(), "denoise"));
+    assert_eq!(
+        h.snap().warning,
+        "noise removal unavailable: Cannot run together with cool"
+    );
+    assert_eq!(h.state(), State::Active);
+}
+
+#[test]
+fn a_module_in_conflict_with_an_enabled_one_is_listed_refused_and_never_opened() {
+    let rival = "org.example.rival";
+    let mut h = H::new("", |w| {
+        w.modules = vec![conflict_module(
+            rival,
+            "Rival effects",
+            "conflicts = [\"br.com.dias.maxine-vfx\"]",
+            "rival",
+            "",
+        )];
+    });
+    let why = "Conflicts with NVIDIA Maxine video effects (br.com.dias.maxine-vfx)";
+    let list = h.modules();
+    let m = list.find(rival).unwrap();
+    assert_eq!(
+        (m.status.as_str(), m.reason.as_str(), m.enabled),
+        ("unavailable", why, true)
+    );
+    assert!(!m.stage("rival").unwrap().available);
+    assert!(!h.world().module_opens.iter().any(|(id, _)| id == rival));
+    // Its warning-free absence: nothing selected. The camera streams.
+    h.activate(0);
+    assert_eq!(h.state(), State::Active);
+    // The Maxine module disabled: no conflict, it is opened.
+    h.set_module(MAXINE_MODULE, false, 1000);
+    assert_eq!(h.modules().find(rival).unwrap().status, "available");
+    assert!(h.world().module_opens.iter().any(|(id, _)| id == rival));
+    // Enabled again: refused again (and closed).
+    h.set_module(MAXINE_MODULE, true, 2000);
+    let list = h.modules();
+    assert_eq!(list.find(rival).unwrap().reason, why);
+    // Forced: both load, and the warning names the override.
+    h.set_config(
+        &format!("modules.forced.{rival}"),
+        obc_ipc::ConfigValue::Bool(true),
+    )
+    .unwrap();
+    let list = h.modules();
+    assert_eq!(list.find(rival).unwrap().status, "available");
+    assert_eq!(list.find(MAXINE_MODULE).unwrap().status, "available");
+    assert_eq!(
+        h.snap().warning,
+        "forced: NVIDIA Maxine video effects runs together with Rival effects despite a \
+         declared conflict (modules.forced)"
+    );
+}
+
+/// A module `id` named `name`, with `head`, offering `background` at
+/// `rank` (NPU), opened with it installed.
+fn cutout_module(
+    id: &str,
+    name: &str,
+    head: &str,
+    rank: u32,
+) -> (
+    obc_module_host::discovery::ModuleEntry,
+    Result<crate::backend::OpenedModule, String>,
+) {
+    (
+        crate::modules::testing::entry(
+            &format!(
+                "abi = 1\nid = \"{id}\"\nname = \"{name}\"\nversion = \"1\"\n\
+                 licence = \"MIT\"\nkind = \"video-stage\"\nlibrary = \"/m/{id}.so\"\n{head}\n\
+                 [[stage]]\nid = \"background\"\nslot = \"matte\"\nrank = {rank}\n\
+                 device = \"npu\"\nframes = [\"host\"]\nformats = [\"nv12\"]\n"
+            ),
+            &format!("/m/{id}.toml"),
+        ),
+        Ok(crate::backend::OpenedModule {
+            module: None,
+            stages: vec![(StageId::BACKGROUND, Availability::Installed)],
+            settings: Default::default(),
+        }),
+    )
+}
+
+const MAXINE_NAME: &str = "NVIDIA Maxine video effects";
+
+#[test]
+fn a_module_conflict_never_refuses_the_cut_out_module() {
+    // The rival declares the conflict and has the higher id, but the Maxine
+    // module gives the cut-out (rank 300 over 100): the rival is refused.
+    let rival = "org.example.cut";
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+        w.modules = vec![cutout_module(
+            rival,
+            "Rival cut-out",
+            "conflicts = [\"br.com.dias.maxine-vfx\"]",
+            100,
+        )];
+    });
+    let list = h.modules();
+    assert_eq!(list.find(MAXINE_MODULE).unwrap().status, "available");
+    assert_eq!(
+        list.find(rival).unwrap().reason,
+        format!("Conflicts with {MAXINE_NAME} ({MAXINE_MODULE})")
+    );
+    // Pinned to the rival: it gives the cut-out, so the Maxine module is the
+    // one refused, though it declares nothing.
+    h.call(
+        |r| Command::SetStagePin("background".into(), rival.into(), r),
+        100,
+    )
+    .unwrap();
+    let list = h.modules();
+    assert_eq!(list.find(rival).unwrap().status, "available");
+    assert_eq!(
+        list.find(MAXINE_MODULE).unwrap().reason,
+        "Conflicts with Rival cut-out (org.example.cut)"
+    );
+    h.activate(200);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(
+        h.session_params()
+            .backends
+            .effect
+            .as_ref()
+            .map(|m| m.id.as_str()),
+        Some(rival)
+    );
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+}
+
+#[test]
+fn a_refusal_mid_session_never_turns_the_background_effect_into_the_raw_picture() {
+    // The rival outranks the Maxine module for the cut-out: enabled while a
+    // session runs the effect from Maxine, it refuses Maxine (the conflict
+    // keeps the cut-out's module), but the running session keeps Maxine
+    // until it ends.
+    let rival = "org.example.cut";
+    let config = "[effect]\nmode = \"blur\"\n[modules]\ndisabled = [\"org.example.cut\"]\n";
+    let mut h = H::new(config, |w| {
+        w.modules = vec![cutout_module(
+            rival,
+            "Rival cut-out",
+            "conflicts = [\"br.com.dias.maxine-vfx\"]",
+            900,
+        )];
+    });
+    h.activate(0);
+    let effect_of = |h: &H| {
+        h.session_params()
+            .backends
+            .effect
+            .as_ref()
+            .map(|m| m.id.clone())
+    };
+    assert_eq!(effect_of(&h).as_deref(), Some(MAXINE_MODULE));
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    h.set_module(rival, true, 1000);
+    h.tick(1400);
+    let why = "Conflicts with Rival cut-out (org.example.cut)";
+    let list = h.modules();
+    let m = list.find(MAXINE_MODULE).unwrap();
+    assert_eq!((m.status.as_str(), m.reason.as_str()), ("unavailable", why));
+    // The rival is not opened while the session keeps the module it
+    // conflicts with: never two conflicting libraries in one process.
+    let opened = |h: &H| h.world().module_opens.iter().any(|(id, _)| id == rival);
+    assert!(!opened(&h), "not opened while Maxine is held");
+    assert_eq!(list.find(rival).unwrap().status, "unavailable");
+    // The feed keeps the effect: never given off, no restart.
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    assert!(
+        h.world()
+            .effect_sets
+            .iter()
+            .all(|e| e.mode == EffectMode::Blur),
+        "the effect was never given off"
+    );
+    assert_eq!(h.world().session_starts, 1);
+    let held = format!("{MAXINE_NAME} unavailable from the next start: {why}");
+    let snap = h.snap();
+    assert_eq!(
+        (snap.error.as_str(), snap.warning.as_str()),
+        ("", held.as_str())
+    );
+    // The session ends: the hold with it, Maxine is closed and the rival
+    // opened.
+    h.consumers(0, 2000);
+    h.tick(70_000);
+    assert!(h.world().session.is_none());
+    assert!(opened(&h), "opened once the hold ended");
+    let list = h.modules();
+    assert_eq!(list.find(rival).unwrap().status, "available");
+    assert_eq!(list.find(MAXINE_MODULE).unwrap().reason, why);
+    assert_eq!(h.snap().warning, "", "nothing held any more");
+    // The next start runs the effect from the rival, and says nothing.
+    h.activate(71_000);
+    assert_eq!(effect_of(&h).as_deref(), Some(rival));
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    assert_eq!(h.snap().warning, "");
+
+    // The rival cannot run its cut-out here: refused all the same (the
+    // rule is static), with no module to move the effect to. The running
+    // session still keeps the Maxine module's effect.
+    let (entry, _) = cutout_module(
+        rival,
+        "Rival cut-out",
+        "conflicts = [\"br.com.dias.maxine-vfx\"]",
+        900,
+    );
+    let opened = Ok(crate::backend::OpenedModule {
+        module: None,
+        stages: vec![(
+            StageId::BACKGROUND,
+            Availability::NotInstalled("no model".into()),
+        )],
+        settings: Default::default(),
+    });
+    let mut h = H::new(config, move |w| w.modules = vec![(entry, opened)]);
+    h.activate(0);
+    h.set_module(rival, true, 1000);
+    h.tick(1400);
+    assert_eq!(h.modules().find(MAXINE_MODULE).unwrap().reason, why);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().session_starts, 1);
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    assert!(
+        h.world()
+            .effect_sets
+            .iter()
+            .all(|e| e.mode == EffectMode::Blur),
+        "the effect was never given off"
+    );
+    assert_eq!(h.snap().warning, held);
+}
+
+/// A session running `blur` from the Maxine module, with the rival
+/// cut-out module (`rank`, declaring a conflict with Maxine) installed
+/// under `config` (`[effect]` and `[modules]` as the case needs).
+fn with_rival_cutout(config: &str, rank: u32) -> H {
+    let mut h = H::new(config, move |w| {
+        w.modules = vec![cutout_module(
+            RIVAL_CUT,
+            "Rival cut-out",
+            "conflicts = [\"br.com.dias.maxine-vfx\"]",
+            rank,
+        )];
+    });
+    h.activate(0);
+    assert_eq!(
+        h.session_params()
+            .backends
+            .effect
+            .as_ref()
+            .map(|m| m.id.as_str()),
+        Some(MAXINE_MODULE)
+    );
+    assert_eq!(h.ctrl.modules.held(), Some(MAXINE_MODULE));
+    h
+}
+
+const RIVAL_CUT: &str = "org.example.cut";
+
+/// The `Warning` of the Maxine module kept by the session after the rival
+/// cut-out refused it.
+fn held_maxine() -> String {
+    format!(
+        "{MAXINE_NAME} unavailable from the next start: Conflicts with Rival cut-out \
+         (org.example.cut)"
+    )
+}
+
+#[test]
+fn a_pin_or_profile_change_mid_session_keeps_the_held_module_until_the_next_start() {
+    for change in ["pin", "profile"] {
+        // The rival (an NPU, rank 100) loses the cut-out to Maxine (rank
+        // 300): refused, never opened.
+        let mut h = with_rival_cutout("[effect]\nmode = \"blur\"\n", 100);
+        let opens = |h: &H, id: &str| {
+            h.world()
+                .module_opens
+                .iter()
+                .filter(|(m, _)| m == id)
+                .count()
+        };
+        assert_eq!(opens(&h, RIVAL_CUT), 0, "{change}");
+        // The pin, or the battery profile (the frugal device first), gives
+        // the cut-out to the rival: Maxine is refused, but the running
+        // session keeps it, and the rival is not opened meanwhile.
+        match change {
+            "pin" => h.call(
+                |r| Command::SetStagePin("background".into(), RIVAL_CUT.into(), r),
+                1000,
+            ),
+            _ => h.call(|r| Command::SetBackendProfile("battery".into(), r), 1000),
+        }
+        .unwrap();
+        h.tick(1400);
+        let list = h.modules();
+        assert_eq!(
+            list.find(MAXINE_MODULE).unwrap().reason,
+            "Conflicts with Rival cut-out (org.example.cut)",
+            "{change}"
+        );
+        assert!(h.ctrl.modules.is_open(MAXINE_MODULE), "{change}: kept open");
+        assert_eq!(opens(&h, RIVAL_CUT), 0, "{change}: never with Maxine");
+        assert_eq!(h.state(), State::Active);
+        assert_eq!(h.applied(), Some(EffectMode::Blur));
+        assert!(
+            h.world()
+                .effect_sets
+                .iter()
+                .all(|e| e.mode == EffectMode::Blur)
+        );
+        assert_eq!(h.world().session_starts, 1, "{change}: no restart");
+        let snap = h.snap();
+        assert_eq!(
+            (snap.error.as_str(), snap.warning.as_str()),
+            ("", held_maxine().as_str()),
+            "{change}"
+        );
+        // The session ends: Maxine closed, the rival opened; the next start
+        // runs the effect from the rival.
+        h.consumers(0, 2000);
+        h.tick(70_000);
+        assert!(h.world().session.is_none());
+        assert_eq!(h.ctrl.modules.held(), None);
+        assert!(!h.ctrl.modules.is_open(MAXINE_MODULE), "{change}: closed");
+        assert_eq!(opens(&h, RIVAL_CUT), 1, "{change}");
+        h.activate(71_000);
+        assert_eq!(
+            h.session_params()
+                .backends
+                .effect
+                .as_ref()
+                .map(|m| m.id.as_str()),
+            Some(RIVAL_CUT),
+            "{change}"
+        );
+        assert_eq!(h.snap().warning, "", "{change}");
+    }
+}
+
+#[test]
+fn a_failed_start_releases_the_hold() {
+    // The output cannot be built: the start fails, and with it the hold on
+    // the module it was to run the effect from.
+    let config = "[effect]\nmode = \"blur\"\n[modules]\ndisabled = [\"org.example.cut\"]\n";
+    let mut h = H::new(config, |w| {
+        w.modules = vec![cutout_module(
+            RIVAL_CUT,
+            "Rival cut-out",
+            "conflicts = [\"br.com.dias.maxine-vfx\"]",
+            900,
+        )];
+        w.fail_start = Some("the output pipeline cannot be built".into());
+    });
+    h.consumers(1, 0);
+    h.tick(300);
+    assert!(h.world().session.is_none(), "{:?}", h.snap());
+    assert_eq!(h.ctrl.modules.held(), None, "no session holds a module");
+    // The rival enabled now refuses Maxine, which nothing keeps: closed
+    // at once, and the rival opened.
+    h.set_module(RIVAL_CUT, true, 1000);
+    assert!(!h.ctrl.modules.is_open(MAXINE_MODULE));
+    assert!(h.ctrl.modules.is_open(RIVAL_CUT));
+    assert_eq!(h.modules().find(RIVAL_CUT).unwrap().status, "available");
+}
+
+#[test]
+fn a_reload_reopens_the_held_module_when_it_changed() {
+    // The rival (rank 900) enabled mid-session refuses Maxine, which the
+    // session keeps; a reload that changes Maxine's configuration opens it
+    // again (refused, but held), and the effect never stops.
+    let config = "[effect]\nmode = \"blur\"\n[modules]\ndisabled = [\"org.example.cut\"]\n";
+    let mut h = with_rival_cutout(config, 900);
+    h.set_module(RIVAL_CUT, true, 1000);
+    h.tick(1400);
+    assert_eq!(h.snap().warning, held_maxine());
+    let opens = |h: &H, id: &str| {
+        h.world()
+            .module_opens
+            .iter()
+            .filter(|(m, _)| m == id)
+            .count()
+    };
+    let before = opens(&h, MAXINE_MODULE);
+    let changed = format!("{config}[module.\"br.com.dias.maxine-vfx\"]\nquality = \"high\"\n");
+    h.reload(&changed, 2000).unwrap();
+    h.tick(2400);
+    assert_eq!(opens(&h, MAXINE_MODULE), before + 1, "opened again");
+    assert!(h.ctrl.modules.is_open(MAXINE_MODULE));
+    assert_eq!(opens(&h, RIVAL_CUT), 0, "never with Maxine");
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    assert!(
+        h.world()
+            .effect_sets
+            .iter()
+            .all(|e| e.mode == EffectMode::Blur)
+    );
+    assert_eq!(h.world().session_starts, 1, "no restart");
+    let snap = h.snap();
+    assert_eq!(
+        (snap.error.as_str(), snap.warning.as_str()),
+        ("", held_maxine().as_str())
+    );
+}
+
+#[test]
+fn a_module_conflict_that_leaves_no_cut_out_follows_on_failure() {
+    // The rival outranks Maxine for the cut-out, so the conflict refuses
+    // Maxine (the rule is static), but its probe says it cannot run it
+    // here: no module can run the background effect.
+    for on_failure in ON_FAILURE {
+        let (entry, _) = cutout_module(
+            RIVAL_CUT,
+            "Rival cut-out",
+            "conflicts = [\"br.com.dias.maxine-vfx\"]",
+            900,
+        );
+        let opened = Ok(crate::backend::OpenedModule {
+            module: None,
+            stages: vec![(
+                StageId::BACKGROUND,
+                Availability::NotInstalled("no model".into()),
+            )],
+            settings: Default::default(),
+        });
+        let mut h = H::new(&blur_with(on_failure), move |w| {
+            w.modules = vec![(entry, opened)];
+            // The element's backend is the rival, which declares the
+            // cut-out: its load fails, as its probe said.
+            w.effect_fail = Some("no model".into());
+        });
+        assert_eq!(
+            h.modules().find(MAXINE_MODULE).unwrap().reason,
+            "Conflicts with Rival cut-out (org.example.cut)"
+        );
+        h.activate(0);
+        // The module that would provide it, and why it cannot.
+        assert_follows_on_failure(&h, on_failure, "Rival cut-out: no model");
+    }
+}
+
+#[test]
+fn a_module_refused_mid_session_drops_its_stage_and_keeps_the_feed_and_the_effect() {
+    // Cool declares a conflict with the rival, disabled at first: enabling
+    // the rival refuses cool while its stage runs.
+    let rival = "org.example.rival";
+    let config = "[effect]\nmode = \"blur\"\n[modules]\ndisabled = [\"org.example.rival\"]\n";
+    let (entry, opened) = conflict_module(
+        COOL,
+        "Cool tint",
+        "conflicts = [\"org.example.rival\"]",
+        "cool",
+        "",
+    );
+    // A switch, on: the stage is selected wherever it runs.
+    let opened = opened.map(|mut o| {
+        o.settings = crate::modules::testing::settings(
+            r#"{"groups":[{"id":"cool","label":"Cool","settings":[
+                {"id":"effect.cool.enabled","label":"Cool tint","type":"bool",
+                 "default":true,"stage":"cool","role":"enable","hint":"switch"}]}]}"#,
+            &["cool"],
+        );
+        o
+    });
+    let mut h = H::new(config, move |w| {
+        w.modules = vec![
+            (entry, opened),
+            conflict_module(rival, "Rival", "", "rival", ""),
+        ];
+    });
+    h.activate(0);
+    assert!(stage_on(&h.session_params().effect, "cool"));
+    h.set_module(rival, true, 1000);
+    h.tick(1400);
+    let list = h.modules();
+    let cool = list.find(COOL).unwrap();
+    assert_eq!(
+        (cool.status.as_str(), cool.reason.as_str()),
+        ("unavailable", "Conflicts with Rival (org.example.rival)")
+    );
+    assert_eq!(h.state(), State::Active);
+    // Cool runs nowhere any more (in the running session, or the one
+    // started again for the rival's stage), and the effect was never off.
+    let last = h.world().effect_sets.last().cloned();
+    let now = last.unwrap_or_else(|| h.session_params().effect);
+    assert!(!stage_on(&now, "cool"));
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    assert!(
+        h.world()
+            .effect_sets
+            .iter()
+            .all(|e| e.mode == EffectMode::Blur)
+    );
+    assert_eq!(h.session_params().effect.mode, EffectMode::Blur);
+    assert_eq!(
+        h.snap().warning,
+        "cool tint unavailable: Cool tint: Conflicts with Rival (org.example.rival)"
+    );
+}
+
+#[test]
+fn a_stage_in_conflict_with_the_background_is_dropped_and_the_effect_kept() {
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+        w.modules = vec![conflict_module(
+            COOL,
+            "Cool tint",
+            "",
+            "cool",
+            "conflicts = [\"background\"]",
+        )];
+    });
+    let want = "cool unavailable: Cannot run together with effect blur";
+    assert_eq!(h.snap().warning, want, "idle");
+    let cool = h
+        .modules()
+        .find(COOL)
+        .unwrap()
+        .stage("cool")
+        .cloned()
+        .unwrap();
+    assert!(!cool.available && cool.selected);
+    h.activate(0);
+    assert_eq!(h.state(), State::Active);
+    let run = &h.session_params().effect;
+    assert!(!stage_on(run, "cool"), "the background never loses");
+    assert_eq!(run.mode, EffectMode::Blur);
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    assert_eq!(h.snap().warning, want);
+    // No effect: no conflict, the stage runs.
+    h.call(|r| Command::SetEffect("none".into(), r), 1000)
+        .unwrap();
+    assert_eq!(h.snap().warning, "");
+    assert!(stage_on(&h.last_effect(), "cool"));
+}
+
+#[test]
+fn a_module_whose_required_module_is_not_enabled_is_refused() {
+    let needy = "org.example.needy";
+    let base = "org.example.base";
+    let config = "[modules]\ndisabled = [\"org.example.base\"]\n";
+    let mut h = H::new(config, |w| {
+        w.modules = vec![
+            conflict_module(
+                needy,
+                "Needy",
+                "[requires]\nmodules = [\"org.example.base\"]",
+                "needy",
+                "",
+            ),
+            conflict_module(base, "Base", "", "base", ""),
+        ];
+    });
+    let list = h.modules();
+    let m = list.find(needy).unwrap();
+    assert_eq!(
+        (m.status.as_str(), m.reason.as_str()),
+        ("unavailable", "Needs the module org.example.base")
+    );
+    assert!(!m.stage("needy").unwrap().available);
+    assert!(!h.world().module_opens.iter().any(|(id, _)| id == needy));
+    // Forcing it does not lift a requirement.
+    h.set_config(
+        &format!("modules.forced.{needy}"),
+        obc_ipc::ConfigValue::Bool(true),
+    )
+    .unwrap();
+    assert_eq!(h.modules().find(needy).unwrap().status, "unavailable");
+    // The base enabled: it is opened, once.
+    h.set_module(base, true, 1000);
+    assert_eq!(h.modules().find(needy).unwrap().status, "available");
+    let opens = |h: &H| {
+        h.world()
+            .module_opens
+            .iter()
+            .filter(|(id, _)| id == needy)
+            .count()
+    };
+    assert_eq!(opens(&h), 1);
+}
+
+#[test]
+fn a_module_that_failed_to_open_is_not_opened_again_by_another_change() {
+    let broken = "org.example.broken";
+    let (entry, _) = conflict_module(broken, "Broken", "", "broken", "");
+    let mut h = H::new("[modules]\ndisabled = [\"org.example.cool\"]\n", |w| {
+        w.modules = vec![
+            (entry, Err("the library cannot be loaded".into())),
+            conflict_module(COOL, "Cool tint", "", "cool", ""),
+        ];
+    });
+    let opens = |h: &H, id: &str| {
+        h.world()
+            .module_opens
+            .iter()
+            .filter(|(m, _)| m == id)
+            .count()
+    };
+    assert_eq!(opens(&h, broken), 1);
+    assert_eq!(h.modules().find(broken).unwrap().status, "unavailable");
+    // Another module enabled and disabled, and a force set: not again.
+    h.set_module(COOL, true, 1000);
+    h.set_module(COOL, false, 2000);
+    h.set_config(
+        &format!("modules.forced.{COOL}"),
+        obc_ipc::ConfigValue::Bool(true),
+    )
+    .unwrap();
+    assert_eq!(opens(&h, broken), 1);
+    assert_eq!(opens(&h, COOL), 1);
+}
+
+// ---- a running session that loses its background module follows `on_failure` ----
+
+/// How the module a running session started its background effect with
+/// stops being able to run it (and comes back).
+#[derive(Clone, Copy, Debug)]
+enum Loss {
+    /// Disabled (and enabled again).
+    Disabled,
+    /// A reload probes it again and it cannot run the stage (then can).
+    Reprobe,
+    /// A reload that changed it opens it again and the open fails (then
+    /// succeeds).
+    Reopen,
+}
+
+const LOSSES: [Loss; 3] = [Loss::Disabled, Loss::Reprobe, Loss::Reopen];
+
+/// The cut-out module of [`Loss::Reopen`].
+const LOST_CUT: &str = "org.example.cutout";
+
+impl Loss {
+    /// The config of a session running `blur` under `on_failure`.
+    fn config(self, on_failure: &str, change: u32) -> String {
+        let base = blur_with(on_failure);
+        match self {
+            Loss::Reopen => format!("{base}[module.\"{LOST_CUT}\"]\nchange = {change}\n"),
+            _ => base,
+        }
+    }
+
+    /// The harness, its session active with the effect running.
+    fn session(self, on_failure: &str) -> H {
+        let mut h = H::new(&self.config(on_failure, 0), |w| match self {
+            Loss::Reopen => {
+                w.maxine = false;
+                w.modules = vec![npu_module(LOST_CUT, StageId::BACKGROUND, "matte")];
+            }
+            _ => w.features = Some(all_installed()),
+        });
+        h.activate(0);
+        assert_eq!(h.world().shown(), Some(Shown::Effect), "{self:?}");
+        assert_eq!(h.snap().warning, "", "{self:?}");
+        h
+    }
+
+    /// The module stops being able to run the effect; why, as `Warning`
+    /// gives it.
+    fn lose(self, h: &mut H, on_failure: &str) -> String {
+        match self {
+            Loss::Disabled => {
+                h.set_module(MAXINE_MODULE, false, 1000);
+                MAXINE_DISABLED.into()
+            }
+            Loss::Reprobe => {
+                h.world().features = Some(stage_missing(&StageId::BACKGROUND, "no model"));
+                h.reload(&self.config(on_failure, 0), 1000).unwrap();
+                format!("{MAXINE_NAME}: {REASON_NOT_INSTALLED}")
+            }
+            Loss::Reopen => {
+                h.world().modules[0].1 = Err(format!("cannot open /m/{LOST_CUT}.so: gone"));
+                h.reload(&self.config(on_failure, 1), 1000).unwrap();
+                format!("NPU background: cannot open /m/{LOST_CUT}.so: gone")
+            }
+        }
+    }
+
+    /// The module can run the effect again.
+    fn regain(self, h: &mut H, on_failure: &str) {
+        match self {
+            Loss::Disabled => h.set_module(MAXINE_MODULE, true, 3000),
+            Loss::Reprobe => {
+                h.world().features = Some(all_installed());
+                h.reload(&self.config(on_failure, 0), 3000).unwrap();
+            }
+            Loss::Reopen => {
+                h.world().modules[0].1 = npu_module(LOST_CUT, StageId::BACKGROUND, "matte").1;
+                h.reload(&self.config(on_failure, 2), 3000).unwrap();
+            }
+        }
+        h.tick(3400);
+    }
+}
+
+/// The session as it was (`ingests` the camera's opens): still active,
+/// not restarted, its camera not reopened, `Error` empty.
+fn assert_same_session(h: &H, ingests: usize, what: &str) {
+    assert_eq!(h.state(), State::Active, "{what}: {:?}", h.snap());
+    let w = h.world();
+    assert_eq!(w.session_starts, 1, "{what}: no restart");
+    assert_eq!(w.session_stops, 0, "{what}");
+    assert_eq!(
+        w.ingests.len(),
+        ingests,
+        "{what}: the camera is not reopened"
+    );
+    drop(w);
+    assert_eq!(h.snap().error, "", "{what}");
+    assert_eq!(h.snap().effect, "blur", "{what}: the choice is kept");
+}
+
+#[test]
+fn a_session_that_loses_its_background_module_shows_black_or_the_image_at_once() {
+    for loss in LOSSES {
+        for (on_failure, hidden) in [("black", Shown::Black), ("image", Shown::Image)] {
+            let what = format!("{loss:?} under {on_failure}");
+            let mut h = loss.session(on_failure);
+            let ingests = h.world().ingests.len();
+            let why = loss.lose(&mut h, on_failure);
+            h.tick(1400);
+            assert_same_session(&h, ingests, &what);
+            {
+                let w = h.world();
+                // Still asked of the element, which dropped the module's
+                // backend: never the camera image.
+                let given = w.effect.as_ref().expect("an effect");
+                assert_eq!(given.mode, EffectMode::Blur, "{what}");
+                assert!(
+                    w.effect_sets.iter().all(|e| e.mode == EffectMode::Blur),
+                    "{what}: never given off"
+                );
+                assert!(w.effect_revoked, "{what}");
+                assert_eq!(w.effect_revocations, [true], "{what}");
+                assert!(matches!(w.effect_status, EffectStatus::Failed(_)), "{what}");
+                assert_eq!(w.shown(), Some(hidden), "{what}");
+            }
+            assert_eq!(
+                h.snap().warning,
+                closed(on_failure, &why),
+                "{what}: the effect's clause"
+            );
+            // The polls and the idle grace change nothing.
+            h.tick(2000);
+            h.tick(2500);
+            assert_eq!(h.world().shown(), Some(hidden), "{what}");
+            assert_eq!(h.world().effect_revocations, [true], "{what}: once");
+            // The module can run it again: the element takes the backend
+            // back and runs the effect, with no restart.
+            loss.regain(&mut h, on_failure);
+            assert_same_session(&h, ingests, &what);
+            {
+                let w = h.world();
+                assert!(!w.effect_revoked, "{what}");
+                assert_eq!(w.effect_revocations, [true, false], "{what}");
+                assert_eq!(w.effect_status, EffectStatus::Ready, "{what}");
+                assert_eq!(w.shown(), Some(Shown::Effect), "{what}");
+            }
+            assert_eq!(h.snap().warning, "", "{what}");
+        }
+    }
+}
+
+#[test]
+fn a_session_that_loses_its_background_module_under_none_shows_the_camera_image() {
+    for loss in LOSSES {
+        let what = format!("{loss:?} under none");
+        let mut h = loss.session("none");
+        let ingests = h.world().ingests.len();
+        let why = loss.lose(&mut h, "none");
+        h.tick(1400);
+        assert_same_session(&h, ingests, &what);
+        {
+            let w = h.world();
+            // Dropped, as `none` says: the camera image.
+            assert_eq!(w.effect.as_ref().map(|e| e.mode), Some(EffectMode::None));
+            assert_eq!(w.shown(), Some(Shown::Camera), "{what}");
+            assert!(w.effect_revocations.is_empty(), "{what}: not revoked");
+        }
+        assert_eq!(h.snap().warning, shown_without(&why), "{what}");
+        // The module can run it again: given again, with no restart.
+        loss.regain(&mut h, "none");
+        assert_same_session(&h, ingests, &what);
+        assert_eq!(h.world().shown(), Some(Shown::Effect), "{what}");
+        assert_eq!(h.snap().warning, "", "{what}");
+    }
+}
+
+#[test]
+fn a_session_whose_element_cannot_revoke_drops_the_effect_of_a_lost_module() {
+    // The real effect element until gst-obc can drop its backend: the
+    // effect is dropped (today's behaviour), never revoked.
+    let mut h = H::new(BLUR_BLACK, |w| w.revoke_unsupported = true);
+    h.activate(0);
+    let ingests = h.world().ingests.len();
+    h.set_module(MAXINE_MODULE, false, 1000);
+    assert_same_session(&h, ingests, "unsupported");
+    assert_eq!(h.applied(), Some(EffectMode::None));
+    assert!(h.world().effect_revocations.is_empty());
+    assert_eq!(h.snap().warning, DROPPED_BLUR);
+    h.set_module(MAXINE_MODULE, true, 2000);
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    assert_eq!(h.world().shown(), Some(Shown::Effect));
+    assert!(h.world().effect_revocations.is_empty());
+}
+
+#[test]
+fn an_effect_turned_off_and_on_while_its_module_is_lost_stays_hidden_and_comes_back() {
+    // Revoked, the user turns the effect off (the camera image, asked
+    // for) and on again: black at once, never the module's old instance;
+    // the module enabled again brings it back.
+    let mut h = H::new(BLUR_BLACK, |_| {});
+    h.activate(0);
+    h.set_module(MAXINE_MODULE, false, 1000);
+    assert_eq!(h.world().shown(), Some(Shown::Black));
+    h.set_effect("none", 1500).unwrap();
+    assert_eq!(h.world().shown(), Some(Shown::Camera));
+    h.set_effect("blur", 2000).unwrap();
+    assert_eq!(h.applied(), Some(EffectMode::Blur));
+    assert_eq!(h.world().shown(), Some(Shown::Black));
+    assert!(h.world().effect_revoked);
+    assert_eq!(h.snap().warning, black(MAXINE_DISABLED));
+    h.set_module(MAXINE_MODULE, true, 3000);
+    assert_eq!(h.world().shown(), Some(Shown::Effect));
+    // Revoked for blur, taken back while the effect is off (only a
+    // background effect is revoked), revoked again before blur is given.
+    assert_eq!(h.world().effect_revocations, [true, false, true, false]);
+    assert_eq!(h.world().session_starts, 1, "no restart");
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn a_lost_background_stage_with_the_effect_off_keeps_the_stages_of_its_module() {
+    // The effect off, noise removal on under `black`: a probe that loses
+    // the background stage alone revokes nothing, so the module still
+    // runs noise removal and `Error` stays empty.
+    let config = "[effect]\ndenoise = true\non_failure = \"black\"\n";
+    let mut h = H::new(config, |w| w.features = Some(all_installed()));
+    h.activate(0);
+    h.tick(500);
+    assert_eq!(h.world().denoise_status, EffectStatus::Ready);
+    let ingests = h.world().ingests.len();
+    h.world().features = Some(stage_missing(&StageId::BACKGROUND, "no model"));
+    h.reload(config, 1000).unwrap();
+    h.tick(1400);
+    h.tick(1800);
+    let w = h.world();
+    assert!(w.effect_revocations.is_empty(), "not revoked");
+    assert!(!w.effect_revoked);
+    assert_eq!(w.denoise_status, EffectStatus::Ready);
+    assert_eq!(w.shown(), Some(Shown::Camera));
+    assert_eq!(w.session_starts, 1, "no restart");
+    assert_eq!(w.ingests.len(), ingests, "the camera is not reopened");
+    drop(w);
+    assert_eq!(h.snap().error, "");
+    assert_eq!(h.state(), State::Active);
+    // Blur selected now: revoked before it is given, black at once.
+    h.set_effect("blur", 2000).unwrap();
+    assert_eq!(h.world().effect_revocations, [true]);
+    assert_eq!(h.world().shown(), Some(Shown::Black));
+}
+
+#[test]
+fn a_restored_backend_reads_as_loading_not_as_missing() {
+    // While the element loads the effect again after its backend was taken
+    // back, `Warning` carries no no-backend failure: the effect is loading.
+    let mut h = H::new(BLUR_BLACK, |_| {});
+    h.activate(0);
+    h.set_module(MAXINE_MODULE, false, 1000);
+    h.tick(1400);
+    assert!(
+        h.ctrl.effect_failure.is_some(),
+        "the element's failure polled"
+    );
+    h.world().effect_slow = true;
+    h.set_module(MAXINE_MODULE, true, 3000);
+    assert_eq!(h.world().effect_revocations, [true, false]);
+    assert_eq!(h.world().effect_status, EffectStatus::Loading);
+    assert_eq!(h.ctrl.effect_failure, None);
+    assert_eq!(h.snap().warning, "");
+    h.tick(3400);
+    assert_eq!(h.snap().warning, "", "the poll reads it loading");
+    assert_eq!(
+        h.world().shown(),
+        Some(Shown::Black),
+        "held black while it loads"
+    );
+    h.world().effect_status = EffectStatus::Ready;
+    h.tick(3800);
+    assert_eq!(h.world().shown(), Some(Shown::Effect));
+    assert_eq!(h.snap().warning, "");
+    assert_eq!(h.snap().error, "");
 }

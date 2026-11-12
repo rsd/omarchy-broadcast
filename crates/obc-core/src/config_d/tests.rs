@@ -45,10 +45,12 @@ fn facts() -> RegistryFacts {
             ModuleFact {
                 id: "org.example.hello".into(),
                 name: "Hello tint".into(),
+                forceable: true,
             },
             ModuleFact {
                 id: "br.com.dias.maxine-vfx".into(),
                 name: "NVIDIA Maxine".into(),
+                forceable: true,
             },
         ],
         stages: vec![StageFact {
@@ -184,6 +186,81 @@ fn module_ids_with_dots_are_one_key_segment() {
         set.source("modules.enabled.org.example.hello"),
         "config.d/20-x.toml"
     );
+}
+
+#[test]
+fn the_forced_table_merges_across_files_and_takes_writes() {
+    assert_eq!(
+        key_segments("modules.forced.org.example.hello"),
+        ["modules", "forced", "org.example.hello"]
+    );
+    let d = Dir::new();
+    d.write(
+        "config.toml",
+        "[modules.forced]\n\"org.example.hello\" = true\n\"br.com.dias.maxine-vfx\" = true\n",
+    );
+    d.write(
+        "config.d/20-x.toml",
+        "[modules.forced]\n\"br.com.dias.maxine-vfx\" = false\n",
+    );
+    let set = d.load().unwrap();
+    assert!(set.config.modules.is_forced("org.example.hello"));
+    assert!(!set.config.modules.is_forced("br.com.dias.maxine-vfx"));
+    assert_eq!(
+        set.source("modules.forced.br.com.dias.maxine-vfx"),
+        "config.d/20-x.toml"
+    );
+    // A write goes to the managed file, and a reset removes it.
+    let set = set_config(
+        &d.config_toml(),
+        &facts(),
+        "modules.forced.org.example.hello",
+        &ConfigValue::Bool(false),
+    )
+    .unwrap();
+    assert!(!set.config.modules.is_forced("org.example.hello"));
+    assert_eq!(set.source("modules.forced.org.example.hello"), MANAGED_REL);
+    assert!(d.read(MANAGED_REL).contains("[modules.forced]"));
+    let set = reset_config(
+        &d.config_toml(),
+        &facts(),
+        "modules.forced.org.example.hello",
+    )
+    .unwrap();
+    assert!(set.config.modules.is_forced("org.example.hello"));
+    // A file after the managed one that sets it refuses the write.
+    d.write(
+        "config.d/90-z.toml",
+        "[modules.forced]\n\"br.com.dias.maxine-vfx\" = false\n",
+    );
+    let e = set_config(
+        &d.config_toml(),
+        &facts(),
+        "modules.forced.br.com.dias.maxine-vfx",
+        &ConfigValue::Bool(true),
+    )
+    .unwrap_err();
+    assert!(matches!(e, WriteError::Overridden { .. }), "{e:?}");
+    // Only for an installed module, and only a switch.
+    let e = set_config(
+        &d.config_toml(),
+        &facts(),
+        "modules.forced.org.not.installed",
+        &ConfigValue::Bool(true),
+    )
+    .unwrap_err();
+    assert!(matches!(e, WriteError::UnknownKey(_)), "{e:?}");
+    let e = set_config(
+        &d.config_toml(),
+        &facts(),
+        "modules.forced.org.example.hello",
+        &ConfigValue::Int(1),
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("true or false"), "{e}");
+    // A module id that is not one makes the file invalid.
+    d.write("config.d/30-y.toml", "[modules.forced]\nhello = true\n");
+    assert!(d.load().is_err());
 }
 
 #[test]

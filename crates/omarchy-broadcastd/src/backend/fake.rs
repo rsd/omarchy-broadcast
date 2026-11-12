@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use obc_core::{EffectMode, ModeRequest, OutputContract, SinkSelector, VideoMode};
+use obc_core::{EffectMode, EffectOnFailure, ModeRequest, OutputContract, SinkSelector, VideoMode};
 use obc_gpu::{GpuError, NothingToPark, ParkError, ParkOutcome, UnparkOutcome};
 use obc_ipc::Stats;
 use obc_pipeline::control_node::{CaptureFormat, CtrlValue, MenuItem, MenuItemValue, NodeControl};
@@ -27,6 +27,23 @@ use crate::camera::Camera;
 use crate::controller::output_mode_string;
 use crate::log::Level;
 use crate::settings::XuReading;
+
+/// The reason the effect element of a session without an effect module
+/// fails an effect with (gst-obc's words).
+pub const NO_BACKEND: &str = "no inference backend is configured for the effects";
+
+/// What the running session's output shows ([`World::shown`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shown {
+    /// The camera image, unprocessed.
+    Camera,
+    /// The camera image under the background effect.
+    Effect,
+    /// Black.
+    Black,
+    /// The fallback image.
+    Image,
+}
 
 /// A fake camera with any controls ([`World::devices`]): types, menus and
 /// flags as the test builds them, dependencies that flip a control's
@@ -258,6 +275,16 @@ pub struct World {
     pub effect: Option<EffectRun>,
     /// Every `set_effect` on a running session, in order.
     pub effect_sets: Vec<EffectRun>,
+    /// The effect element cannot drop its backend mid-session, as the
+    /// real one until gst-obc can ([`MediaBackend::can_revoke_effect_backend`]).
+    pub revoke_unsupported: bool,
+    /// The running session's effect element has dropped its backend
+    /// ([`MediaBackend::revoke_effect_backend`]): it fails any effect, as
+    /// one without a backend does. Ends with the session.
+    pub effect_revoked: bool,
+    /// Every revocation (`true`) and restoration (`false`) of the running
+    /// session's effect backend, in order.
+    pub effect_revocations: Vec<bool>,
     /// What `effect_report` reports for the other stages (a module's), by
     /// id; a stage applied on is `Ready` unless set here.
     pub stage_status: std::collections::BTreeMap<String, EffectStatus>,
@@ -437,6 +464,9 @@ impl Default for World {
             relight_status: EffectStatus::Off,
             effect: None,
             effect_sets: Vec::new(),
+            revoke_unsupported: false,
+            effect_revoked: false,
+            effect_revocations: Vec::new(),
             stage_status: std::collections::BTreeMap::new(),
             maxine: true,
             maxine_settings: None,
@@ -584,6 +614,31 @@ impl World {
         self.preview.as_ref().map(|p| p.fps)
     }
 
+    /// What the running session's output shows, as the effect element
+    /// decides it (`None` without a session): the camera image for `none`
+    /// and for a failed effect under `on_failure = "none"`, black or the
+    /// fallback image for a failed effect under `black` or `image` and
+    /// while one loads, the effect once it is ready.
+    pub fn shown(&self) -> Option<Shown> {
+        self.session.as_ref()?;
+        let effect = self.effect.as_ref()?;
+        if effect.mode == EffectMode::None {
+            return Some(Shown::Camera);
+        }
+        let hidden = match effect.on_failure {
+            EffectOnFailure::Black => Shown::Black,
+            EffectOnFailure::Image => Shown::Image,
+            EffectOnFailure::None => Shown::Camera,
+        };
+        Some(match &self.effect_status {
+            EffectStatus::Ready => Shown::Effect,
+            EffectStatus::Failed(_) => hidden,
+            // The element holds black (the image) while it loads.
+            _ if hidden == Shown::Camera => Shown::Black,
+            _ => hidden,
+        })
+    }
+
     /// The camera the session streams from.
     pub fn streaming(&self) -> Option<&str> {
         self.session.as_ref().and_then(|(_, c)| c.as_deref())
@@ -594,7 +649,7 @@ impl World {
     /// and relighting, apart, are each off unless requested, else ready
     /// (or fail, themselves or with the whole chain).
     fn apply_effect(&mut self, effect: &EffectRun) {
-        let stage = |on: bool, fail: &Option<String>| {
+        let stage = |on: bool, fail: Option<&String>| {
             if !on {
                 EffectStatus::Off
             } else if let Some(r) = fail {
@@ -603,13 +658,31 @@ impl World {
                 EffectStatus::Ready
             }
         };
-        self.denoise_status = stage(effect.denoise(), &self.denoise_fail);
-        self.relight_status = stage(effect.relight(), &self.relight_fail);
+        // A revoked backend runs no stage either.
+        let revoked = self.effect_revoked.then(|| NO_BACKEND.to_string());
+        self.denoise_status = stage(
+            effect.denoise(),
+            self.denoise_fail.as_ref().or(revoked.as_ref()),
+        );
+        self.relight_status = stage(
+            effect.relight(),
+            self.relight_fail.as_ref().or(revoked.as_ref()),
+        );
         self.effect = Some(effect.clone());
+        // As the real output: the element of a session without an effect
+        // module has no backend, and fails any effect; so does one whose
+        // backend was revoked.
+        let no_backend = self.effect_revoked
+            || self
+                .session
+                .as_ref()
+                .is_some_and(|(p, _)| p.backends.effect.is_none());
         // An effect the probe finds unavailable fails its load for the
         // same reason, as in the element.
         self.effect_status = if effect.mode == EffectMode::None {
             EffectStatus::Off
+        } else if no_backend {
+            EffectStatus::Failed(NO_BACKEND.into())
         } else if let Some(r) = self
             .effect_fail
             .as_ref()
@@ -901,6 +974,7 @@ impl MediaBackend for FakeBackend {
                 w.gpu_log.push("build");
                 w.session = Some((params.clone(), None));
                 w.session_starts += 1;
+                w.effect_revoked = false;
                 w.apply_effect(&params.effect);
                 Ok(FakeSession(Arc::clone(&world)))
             })
@@ -968,16 +1042,49 @@ impl MediaBackend for FakeBackend {
         if let Some(e) = w.fail_set_effect.take() {
             return Err(e);
         }
-        // As the real output: one built without an effect module cannot
-        // take an effect later.
-        let no_element = w
-            .session
-            .as_ref()
-            .is_some_and(|(p, _)| p.backends.effect.is_none());
-        if no_element && !effect.effect_idle() {
-            return Err("no effect module provides the effect".into());
-        }
         w.apply_effect(effect);
+        Ok(())
+    }
+
+    fn can_revoke_effect_backend(&self) -> bool {
+        !self.world().revoke_unsupported
+    }
+
+    fn revoke_effect_backend(&mut self) -> Result<(), String> {
+        let mut w = self.world();
+        if w.session.is_none() {
+            return Ok(());
+        }
+        assert!(!w.revoke_unsupported, "revoked although unsupported");
+        let w = &mut *w;
+        w.effect_revocations.push(true);
+        w.effect_revoked = true;
+        // As the element: the effect (unless `none`) and every stage it
+        // runs fail at once, the stages alone too.
+        if let Some(effect) = w.effect.as_ref() {
+            if effect.mode != EffectMode::None {
+                w.effect_status = EffectStatus::Failed(NO_BACKEND.into());
+            }
+            for s in [&mut w.denoise_status, &mut w.relight_status] {
+                if *s != EffectStatus::Off {
+                    *s = EffectStatus::Failed(NO_BACKEND.into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_effect_backend(&mut self) -> Result<(), String> {
+        let mut w = self.world();
+        if w.session.is_none() {
+            return Ok(());
+        }
+        w.effect_revocations.push(false);
+        w.effect_revoked = false;
+        // The element loads what it is asked for again.
+        if let Some(effect) = w.effect.clone() {
+            w.apply_effect(&effect);
+        }
         Ok(())
     }
 

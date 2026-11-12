@@ -53,7 +53,7 @@ pub use config::{
     CONFIG_REVISION, ConfigFileEntry, ConfigFiles, ConfigGroup, ConfigKind, ConfigRow,
     ConfigSchema, ConfigValue,
 };
-pub use modules::{MODULES_REVISION, ModuleInfo, ModuleList, StageInfo};
+pub use modules::{FORCED_REVISION, MODULES_REVISION, ModuleInfo, ModuleList, StageInfo};
 pub use settings::{
     Condition, ConditionOp, ResetScope, Setting, SettingChange, SettingKind, SettingValue,
     SettingsGroup, SettingsTree, valid_setting_id,
@@ -114,8 +114,17 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// properties, the `MicStats` signal and `SetMicHost`; the `mic.*`
 /// settings (scope `global`, their groups with `surface` `mic`: the
 /// daemon's `mic.input` and the audio modules' groups), the `[mic]` config
-/// rows, and the audio modules in `GetModules`.
-pub const INTERFACE_REVISION: u32 = 13;
+/// rows, and the audio modules in `GetModules`. Revision 14 enforces the
+/// module conflicts and requirements manifests declare, with no new
+/// member: a module's `forced` key in `GetModules`
+/// ([`modules::FORCED_REVISION`]), the `modules.forced.<id>` config rows,
+/// and the `Warning` clauses of a stage turned off by a conflict
+/// (`<stage> unavailable: Cannot run together with <stage>`) and of a
+/// conflict a forced module lets through (`forced: <a> runs together with
+/// <b> despite a declared conflict (modules.forced)`), and of the module a
+/// running session keeps for its background effect although it is
+/// refused since (`<name> unavailable from the next start: <reason>`).
+pub const INTERFACE_REVISION: u32 = 14;
 /// The first [`INTERFACE_REVISION`] with the microphone: the `Mic*`
 /// properties, `MicStats`, `SetMicHost` and the `mic.*` settings.
 pub const MIC_REVISION: u32 = 13;
@@ -1187,7 +1196,8 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, MIC_REVISION);
+        assert_eq!(INTERFACE_REVISION, FORCED_REVISION);
+        const { assert!(MIC_REVISION < FORCED_REVISION) };
         const { assert!(MODES_REVISION < MIC_REVISION) };
         const { assert!(WARNING_REVISION < MODES_REVISION) };
         const { assert!(CONFIG_REVISION < WARNING_REVISION) };

@@ -987,6 +987,58 @@ fn gpu_failures_show_black_or_the_input_as_configured() {
     assert_eq!(get(&fake.log.wrong_context), 0);
 }
 
+/// A revoked backend (its module can no longer run the effect) is a
+/// failure at once: black from the next frame, the instance unloaded and
+/// dropped with the context current; a factory set after it loads again,
+/// with a new instance, no restart. A factory set again at once, before
+/// the worker has dropped the instance, never reuses it.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_revoked_backend_is_black_at_once_and_a_new_factory_loads_again() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let blur = EffectSettings::of(EffectKind::Blur);
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &blur);
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    assert_eq!(get(&fake.log.creates), 1);
+
+    rig.effect.revoke_backend();
+    assert!(failed(&rig), "{:?}", rig.effect.status());
+    assert_eq!(rig.frame(), Seen::Black, "black from the next frame");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while get(&fake.log.drops) == 0 && Instant::now() < deadline {
+        assert_eq!(rig.frame(), Seen::Black);
+    }
+    assert_eq!(get(&fake.log.drops), 1, "the instance is dropped");
+    assert!(get(&fake.log.unloads) >= 1, "unloaded before the drop");
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::Black);
+    }
+
+    rig.effect
+        .set_backend_factory(Some(Arc::clone(&fake) as Arc<dyn BackendFactory>));
+    let seen = rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert!(
+        held_then(&seen, Seen::Black, Seen::FakeBlur),
+        "black until ready again: {seen:?}"
+    );
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    assert_eq!(get(&fake.log.creates), 2, "a new instance");
+
+    // Revoked and set again at once: the instance of the revoked backend
+    // goes all the same, and a third one runs the blur.
+    rig.effect.revoke_backend();
+    rig.effect
+        .set_backend_factory(Some(Arc::clone(&fake) as Arc<dyn BackendFactory>));
+    let seen = rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert!(held_then(&seen, Seen::Black, Seen::FakeBlur), "{seen:?}");
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    assert_eq!(get(&fake.log.creates), 3, "never the revoked instance");
+    assert_eq!(get(&fake.log.drops), 2);
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
 #[test]
 #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
 fn gpu_a_backend_that_lost_its_chain_is_loaded_again_on_a_retry() {

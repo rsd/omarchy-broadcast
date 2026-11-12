@@ -5,7 +5,9 @@
 //!
 //! The core keys are a table fixed at build time ([`CORE_KEYS`]); the rows
 //! of the module system are made from what the module registry found
-//! ([`RegistryFacts`]): `modules.enabled.<id>` for each installed module and
+//! ([`RegistryFacts`]): `modules.enabled.<id>` for each installed module,
+//! `modules.forced.<id>` for each installed video module (an audio
+//! module's conflicts are lifted by `[mic] force_conflicts` instead) and
 //! `modules.pin.<stage>` for each stage a module offers. The daemon turns
 //! the rows into the D-Bus dictionaries of `GetConfigSchema`.
 //!
@@ -632,6 +634,10 @@ pub fn on_failure_options(effect: &EffectConfig) -> Vec<(String, String)> {
 pub const ENABLED_PREFIX: &str = "modules.enabled.";
 /// The prefix of the row of each stage offered.
 pub const PIN_PREFIX: &str = "modules.pin.";
+/// The prefix of the force row of each installed video module (its
+/// conflicts not enforced, for debugging and testing; an audio module has
+/// none: `[mic] force_conflicts` lifts the audio worker's conflicts).
+pub const FORCED_PREFIX: &str = "modules.forced.";
 
 /// An installed module, as the registry knows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -639,6 +645,10 @@ pub struct ModuleFact {
     pub id: String,
     /// Its display name.
     pub name: String,
+    /// Whether it has a `modules.forced.<id>` row: a video module. The
+    /// audio worker does not read `[modules.forced]`; an audio module's
+    /// conflicts are lifted by `[mic] force_conflicts`.
+    pub forceable: bool,
 }
 
 /// A stage some module offers.
@@ -707,8 +717,9 @@ fn pin_options(stage: &StageFact, facts: &RegistryFacts) -> Vec<(String, String)
 }
 
 /// What `key` is: a core key, `modules.enabled.<id>` of an installed
-/// module or `modules.pin.<stage>` of a stage offered; `None` for any other
-/// key.
+/// module, `modules.forced.<id>` of an installed video module
+/// ([`ModuleFact::forceable`]) or `modules.pin.<stage>` of a stage
+/// offered; `None` for any other key.
 pub fn lookup(key: &str, facts: &RegistryFacts) -> Option<KeyInfo> {
     if let Some(spec) = core_key(key) {
         return Some(KeyInfo {
@@ -717,14 +728,23 @@ pub fn lookup(key: &str, facts: &RegistryFacts) -> Option<KeyInfo> {
             apply: spec.apply,
         });
     }
+    let switch = |id: &str, forced: bool| {
+        (valid_module_id(id)
+            && facts
+                .modules
+                .iter()
+                .any(|m| m.id == id && (m.forceable || !forced)))
+        .then_some(KeyInfo {
+            kind: RowKind::Bool,
+            editable: true,
+            apply: Apply::Reload,
+        })
+    };
     if let Some(id) = key.strip_prefix(ENABLED_PREFIX) {
-        return (valid_module_id(id) && facts.modules.iter().any(|m| m.id == id)).then_some(
-            KeyInfo {
-                kind: RowKind::Bool,
-                editable: true,
-                apply: Apply::Reload,
-            },
-        );
+        return switch(id, false);
+    }
+    if let Some(id) = key.strip_prefix(FORCED_PREFIX) {
+        return switch(id, true);
     }
     if let Some(stage) = key.strip_prefix(PIN_PREFIX) {
         let fact = facts
@@ -899,8 +919,9 @@ fn row(
 /// the `modules` group holds `modules.profile`, a `modules.pin.<stage>` row
 /// per stage offered (options: automatic, `""`, then each module offering
 /// it, labelled with its name), a `modules.enabled.<id>` row per installed
-/// module (labelled with its name), then `modules.order`, `modules.dirs`
-/// and `modules.disabled`.
+/// module (labelled with its name), a `modules.forced.<id>` row per
+/// installed video module ([`ModuleFact::forceable`]), then `modules.order`, `modules.dirs` and
+/// `modules.disabled`.
 pub fn config_schema(set: &ConfigSet, facts: &RegistryFacts) -> Vec<ConfigGroup> {
     let current = serialized(&set.config);
     let defaults = serialized(&Config::default());
@@ -982,6 +1003,23 @@ pub fn config_schema(set: &ConfigSet, facts: &RegistryFacts) -> Vec<ConfigGroup>
                         RowKind::Bool,
                         ConfigValue::Bool(modules.is_enabled(&m.id)),
                         Some(ConfigValue::Bool(true)),
+                        true,
+                        Apply::Reload,
+                        &source,
+                    ));
+                }
+                for m in facts.modules.iter().filter(|m| m.forceable) {
+                    let id = format!("{FORCED_PREFIX}{}", m.id);
+                    let source = set.source(&id).to_string();
+                    dynamic.push(row(
+                        set,
+                        id,
+                        &format!("Force {}", m.name),
+                        "For debugging and testing: the conflicts declared with this module are \
+                         not enforced, so both modules load and both stages run.",
+                        RowKind::Bool,
+                        ConfigValue::Bool(modules.is_forced(&m.id)),
+                        Some(ConfigValue::Bool(false)),
                         true,
                         Apply::Reload,
                         &source,

@@ -60,17 +60,29 @@
 //! check refused the effect is that fault, in the effect's words.
 //!
 //! A selected stage that no module provides now (none installed or
-//! enabled, its module disabled, disabled by the crash ledger or unable to
-//! load, the stage not installed for this machine) is never a failure,
-//! whatever `on_failure` says: the stage is dropped (the session is given
-//! it off) and the feed keeps streaming with the stages that still have a
-//! module, the state is `starting`/`active` as usual, `Error` is untouched
-//! and `Warning` names it with its module's reason ([`Standing`],
-//! [`Controller::dropped_stages`]). That holds for every stage: the
-//! background effect, noise removal, relighting, enhancement (where it
-//! applies to the camera) and a module's own stages (once a module has
-//! described its switch in this process). The choice is kept (`Effect`,
-//! the settings, the state file). A session keeps the modules whose code
+//! enabled, its module disabled, refused by a module conflict, disabled by
+//! the crash ledger or unable to load, the stage not installed for this
+//! machine) is never a failure: the state is `starting`/`active` as usual,
+//! `Error` is untouched and `Warning` names it with its module's reason
+//! ([`Standing`], [`Controller::dropped_stages`]). Noise removal,
+//! relighting, enhancement (where it applies to the camera) and a module's
+//! own stages (once a module has described its switch in this process) are
+//! dropped (the session is given them off), whatever `on_failure` says,
+//! and the feed keeps streaming with the stages that still have a module.
+//! The background effect follows `on_failure` instead, as a provided
+//! effect that cannot load does ([`Controller::fails_closed`]): with
+//! `black` or `image` it is asked of the effect element all the same,
+//! which fails it and shows black or the fallback image (an output always
+//! has the element, without a backend when no module provides the
+//! effect), so the room is never shown for want of a module; with `none`
+//! it is dropped (the camera image). A session that loses the module it
+//! started the effect with ([`Controller::background_lost`]) follows
+//! `on_failure` too, with the camera kept open: under `black` or `image`
+//! the effect element drops that module's backend instance and fails the
+//! effect at once ([`Controller::follow_effect_backend`]), and takes it
+//! back once the module can run it again, the effect given again with no
+//! restart; under `none` the effect is dropped (the camera image).
+//! The choice is kept (`Effect`, the settings, the state file). A session keeps the modules whose code
 //! it started with, but follows what they provide
 //! ([`Controller::follow_modules`]): after a module is enabled or disabled,
 //! a reload or a probe, a stage whose module can no longer run it is
@@ -1422,6 +1434,18 @@ pub struct Controller<B: MediaBackend> {
     /// The running session's plan: which module runs each stage, fixed
     /// when it started (`None`: no session).
     plan: Option<Plan>,
+    /// The module of [`Self::plan`] could run the background effect when
+    /// the session started ([`Self::background_lost`]).
+    background_planned: bool,
+    /// The running session was last given a background effect that no
+    /// module of its plan could run ([`Self::fails_closed`]), as of the
+    /// last publication: once one can, it is given again
+    /// ([`Self::follow_background`]).
+    background_closed: bool,
+    /// The running session's effect element was made to drop its backend
+    /// ([`Self::follow_effect_backend`]): the module the session started
+    /// the background effect with can no longer run it.
+    background_revoked: bool,
     /// The running session's output could not start with its effects and
     /// module stages and streams without them (its plan is empty): the
     /// `Warning` clause saying so. Ends with the session.
@@ -1471,9 +1495,11 @@ enum Standing {
     /// profile would choose at the next start).
     Runs,
     /// No module provides it (none installed or enabled, its module
-    /// disabled, crashed or unavailable, the stage not installed): the
-    /// stage is dropped and the feed streams on without it. The module
-    /// that would run it (its name) and why it cannot, for `Warning`.
+    /// disabled, refused, crashed or unavailable, the stage not
+    /// installed): the stage is dropped and the feed streams on without
+    /// it; the background effect follows `on_failure`
+    /// ([`Controller::fails_closed`]). The module that would run it (its
+    /// name) and why it cannot, for `Warning`.
     Missing {
         module: Option<String>,
         reason: String,
@@ -1780,6 +1806,9 @@ impl<B: MediaBackend> Controller<B> {
             event_refresh_at: None,
             modules,
             plan: None,
+            background_planned: false,
+            background_closed: false,
+            background_revoked: false,
             passthrough: None,
             marked: Vec::new(),
             compute_capability,
@@ -2228,9 +2257,11 @@ impl<B: MediaBackend> Controller<B> {
 
     fn effect_run_with(&self, plan: &Plan) -> EffectRun {
         let effect = self.effect();
-        // A background effect no module of the plan can run is dropped:
-        // the session streams on without it ([`Standing`]).
-        let mode = if self.runs_in(plan, &StageId::BACKGROUND) {
+        // A background effect no module of the plan can run follows
+        // `on_failure` ([`Self::fails_closed`]): asked of the effect element
+        // all the same under `black` and `image` (it fails, and shows black
+        // or the fallback image), dropped under `none` (the camera image).
+        let mode = if self.runs_in(plan, &StageId::BACKGROUND) || self.fails_closed(plan) {
             effect.mode
         } else {
             EffectMode::None
@@ -2280,6 +2311,66 @@ impl<B: MediaBackend> Controller<B> {
         chains
     }
 
+    /// A selected background effect that no module of `plan` can run is
+    /// asked of the effect element all the same: under an `on_failure`
+    /// that hides the camera (`black`, `image`) the element fails it and
+    /// shows what `on_failure` says, as for a provided effect that cannot
+    /// load, so the room is never shown for want of a module (a module
+    /// conflict, disabled, a failed open or probe, the crash ledger, none
+    /// installed, a pin to nothing). Also for a session that lost the
+    /// module it started with ([`Self::background_lost`]): its element
+    /// drops that module's instance ([`Self::follow_effect_backend`]); but
+    /// with a media backend that cannot have it do so, the effect is
+    /// dropped (the element would go on with that module's instance).
+    fn fails_closed(&self, plan: &Plan) -> bool {
+        self.effect().on_failure.hides()
+            && (!self.background_lost(plan) || self.backend.can_revoke_effect_backend())
+    }
+
+    /// `plan` is the running session's, whose module could run the
+    /// background effect when the session started and can no longer.
+    fn background_lost(&self, plan: &Plan) -> bool {
+        let provider = plan.provider(&StageId::BACKGROUND);
+        self.background_planned
+            && provider.is_some()
+            && self
+                .plan
+                .as_ref()
+                .is_some_and(|p| p.provider(&StageId::BACKGROUND) == provider)
+            && !self.runs_in(plan, &StageId::BACKGROUND)
+    }
+
+    /// `Warning`'s clause of a selected background effect that no module
+    /// of `plan` can run ([`Standing::Missing`]; or only a new session's
+    /// can, [`Standing::Elsewhere`], while the effect is asked closed of
+    /// this one, [`Self::fails_closed`]), in the words of a provided
+    /// effect that cannot load ([`effect_warning_text`]): the module that
+    /// would provide it and why it cannot, and what `on_failure` shows
+    /// meanwhile. `None` otherwise, and for a session that lost its module
+    /// and drops the effect ([`Self::fails_closed`]: the stage is dropped,
+    /// [`dropped_text`]).
+    fn background_absent(&self, plan: &Plan) -> Option<String> {
+        if !self.modules_loaded {
+            return None;
+        }
+        let why = match self.standing(plan, &StageId::BACKGROUND) {
+            Standing::Missing { module, reason } => match module {
+                Some(name) => format!("{name}: {reason}"),
+                None => reason,
+            },
+            Standing::Elsewhere if self.fails_closed(plan) => REASON_NEXT_START.to_string(),
+            _ => return None,
+        };
+        let effect = self.effect();
+        if effect.on_failure.hides()
+            && self.background_lost(plan)
+            && !self.backend.can_revoke_effect_backend()
+        {
+            return None;
+        }
+        Some(effect_warning_text(&effect, &why))
+    }
+
     /// Whether the module of `plan` for `stage` can run it now.
     fn runs_in(&self, plan: &Plan, stage: &StageId) -> bool {
         plan.provider(stage)
@@ -2317,7 +2408,8 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     /// Where `stage` stands for `plan`: not selected, run by it, missing
-    /// (no module provides it now: which would and why) or provided by a
+    /// (no module provides it now: which would and why; or a stage
+    /// conflict turns it off: which stage wins) or provided by a
     /// module `plan` does not run (only a new session can). A running
     /// session keeps its own module while that module can run the stage,
     /// even if another module would be chosen now (a pin or the profile
@@ -2325,6 +2417,19 @@ impl<B: MediaBackend> Controller<B> {
     fn standing(&self, plan: &Plan, stage: &StageId) -> Standing {
         if !self.selected(plan, stage) {
             return Standing::Off;
+        }
+        // Turned off by a stage conflict: dropped, and the winner named.
+        if let Some(winner) = self
+            .modules
+            .losers(plan, &self.config, &self.runtime)
+            .get(stage)
+        {
+            return Standing::Missing {
+                module: None,
+                reason: self
+                    .modules
+                    .conflict_reason(winner, &self.config, &self.runtime),
+            };
         }
         if self.runs_in(plan, stage) {
             return Standing::Runs;
@@ -2363,6 +2468,11 @@ impl<B: MediaBackend> Controller<B> {
             }
         }
         stages.push(StageId::ENHANCE);
+        // A background effect with a clause of its own follows `on_failure`
+        // ([`Self::background_absent`]).
+        if self.background_absent(plan).is_some() {
+            stages.retain(|s| *s != StageId::BACKGROUND);
+        }
         stages
             .iter()
             .filter_map(|s| match self.standing(plan, s) {
@@ -2403,7 +2513,9 @@ impl<B: MediaBackend> Controller<B> {
     /// reason ([`dropped_text`]), joined by `; `, made one line safe to
     /// show whatever a module calls itself; empty when nothing.
     ///
-    /// Then frame generation that cannot make the output rate
+    /// Then the conflicts a forced module lets through
+    /// ([`Self::forced_warnings`]), frame generation that cannot make the
+    /// output rate
     /// ([`Self::frame_generation_warning`]), a capture mode the camera does
     /// not offer ([`Self::mode_warning`]) and the output contract's
     /// clauses ([`Self::output_warnings`]). At most [`WARNING_MAX`] bytes
@@ -2411,24 +2523,82 @@ impl<B: MediaBackend> Controller<B> {
     fn warning(&self) -> String {
         // Without its effects, the session's clause says why, not each
         // stage.
-        let dropped = match (&self.passthrough, &self.plan) {
-            (Some(_), _) => Vec::new(),
-            (None, Some(p)) => self.dropped_stages(p),
-            (None, None) => self.dropped_stages(&self.fresh_plan()),
+        let plan = match (&self.passthrough, &self.plan) {
+            (Some(_), _) => None,
+            (None, Some(p)) => Some(p.clone()),
+            (None, None) => Some(self.fresh_plan()),
         };
-        let text = self
-            .effect_failure
-            .iter()
-            .cloned()
+        let dropped = plan
+            .as_ref()
+            .map(|p| self.dropped_stages(p))
+            .unwrap_or_default();
+        // A background effect no module can run says so in the effect's
+        // clause: the element's own failure (it has no backend, or one
+        // that cannot run it) is a consequence.
+        let effect = plan
+            .as_ref()
+            .and_then(|p| self.background_absent(p))
+            .or_else(|| self.effect_failure.clone());
+        let text = effect
+            .into_iter()
             .chain(self.passthrough.clone())
             .chain(self.fallback_warnings())
             .chain(dropped_text(&dropped))
+            .chain(self.held_warning())
+            .chain(self.forced_warnings())
             .chain(self.frame_generation_warning())
             .chain(self.mode_warning())
             .chain(self.output_warnings())
             .collect::<Vec<_>>()
             .join("; ");
         cap_warning(&text)
+    }
+
+    /// `Warning`'s clause of the module the running session keeps for its
+    /// background effect although it is refused since
+    /// ([`Modules::held_refusal`]): it stops at the next start.
+    fn held_warning(&self) -> Option<String> {
+        let (name, why) = self.modules.held_refusal()?;
+        Some(format!(
+            "{} unavailable from the next start: {why}",
+            settings::sanitise(&name, modules::NAME_MAX)
+        ))
+    }
+
+    /// `Warning`'s clauses of the conflicts a forced module
+    /// (`[modules.forced]`) lets through, while one does: each module
+    /// conflict between two modules that are both available (opened, not
+    /// refused otherwise; by module id), then each stage conflict between
+    /// two stages of the session that are both on (in the stage order;
+    /// none while the session runs without its effects).
+    /// Nothing when the force overrides no conflict.
+    fn forced_warnings(&self) -> Vec<String> {
+        if !self.modules_loaded {
+            return Vec::new();
+        }
+        let clause = |a: &str, b: &str| {
+            format!(
+                "forced: {a} runs together with {b} despite a declared conflict (modules.forced)"
+            )
+        };
+        let name = |id: &str| settings::sanitise(&self.modules.name_of(id), modules::NAME_MAX);
+        let mut out: Vec<String> = self
+            .modules
+            .forced_module_conflicts()
+            .iter()
+            .map(|(a, b)| clause(&name(a), &name(b)))
+            .collect();
+        if self.passthrough.is_none() {
+            let plan = self.current_plan();
+            let label = |s: &StageId| self.modules.conflict_label(s, &self.config, &self.runtime);
+            out.extend(
+                self.modules
+                    .forced_stage_conflicts(&plan, &self.config, &self.runtime)
+                    .iter()
+                    .map(|(a, b)| clause(&label(a), &label(b))),
+            );
+        }
+        out
     }
 
     /// `Warning`'s clause for a capture mode the user chose for the
@@ -2577,7 +2747,9 @@ impl<B: MediaBackend> Controller<B> {
     /// The background effect of the running session (`effect`, what it
     /// was last given, `run` what it would be given now) follows whether a
     /// module it runs can run it: dropped (given off; `Warning` says why)
-    /// when none can, given again (followed from its load) when one can.
+    /// when none can and it does not fail closed ([`Self::fails_closed`]),
+    /// given again (followed from its load) when one can, also when it was
+    /// asked while none could (the element failed it).
     /// An effect the session streams without because it failed
     /// (`on_failure = "none"`) is not given again here: only a control
     /// call or a reload retries it. With no background effect to run (none
@@ -2591,6 +2763,21 @@ impl<B: MediaBackend> Controller<B> {
             self.effect_failure = None;
         }
         if run.mode == effect.mode {
+            // Asked while no module of the plan could run it (the element
+            // failed it, showing what `on_failure` says): a module can now,
+            // so the element tries it again.
+            if run.mode != EffectMode::None
+                && self.background_closed
+                && self.runs_in(&self.current_plan(), &StageId::BACKGROUND)
+            {
+                info!(
+                    "a module can run the background effect now: effect {}",
+                    run.mode
+                );
+                self.background_closed = false;
+                self.effect_seen = None;
+                return true;
+            }
             return false;
         }
         if run.mode == EffectMode::None {
@@ -2715,6 +2902,7 @@ impl<B: MediaBackend> Controller<B> {
     /// (rejected by [`Self::effect_check`] with `on_failure = "none"`) is
     /// not requested again: only a control call or a reload retries it.
     fn follow_stages(&mut self) {
+        self.follow_effect_backend();
         let run = self.effect_run();
         let Some(mut effect) = self.effect_applied.clone() else {
             return;
@@ -2743,7 +2931,7 @@ impl<B: MediaBackend> Controller<B> {
         }
         self.effect_applied = Some(effect.clone());
         self.mark_running(&effect);
-        if let Err(reason) = self.backend.set_effect(&effect) {
+        if let Err(reason) = self.give_effect(&effect) {
             let _ = self.effect_refused(effect, &reason);
         }
     }
@@ -2783,7 +2971,7 @@ impl<B: MediaBackend> Controller<B> {
         t.held = None;
         self.effect_applied = Some(effect.clone());
         self.mark_running(&effect);
-        if let Err(reason) = self.backend.set_effect(&effect) {
+        if let Err(reason) = self.give_effect(&effect) {
             let _ = self.effect_refused(effect, &reason);
         }
     }
@@ -2956,6 +3144,20 @@ impl<B: MediaBackend> Controller<B> {
     /// (`docs/adr/0023-settings-schema.md`); the properties then carry the
     /// revision published so far.
     fn publish_with(&mut self, settings: bool) {
+        // The module the session keeps for its background effect, and the
+        // stages a stage conflict turns off, as `GetModules` lists them
+        // (the serial moves when they change).
+        self.hold_background();
+        self.follow_effect_backend();
+        let plan = self.current_plan();
+        self.modules
+            .follow_switches(&plan, &self.config, &self.runtime);
+        self.background_closed = self.session.is_some()
+            && self
+                .effect_applied
+                .as_ref()
+                .is_some_and(|e| e.mode != EffectMode::None)
+            && !self.runs_in(&plan, &StageId::BACKGROUND);
         self.sync_placeholder();
         if self.controls_view.camera != self.active_camera() {
             self.refresh_controls();
@@ -3086,18 +3288,17 @@ impl<B: MediaBackend> Controller<B> {
     /// The running session streams without its effects
     /// ([`Self::passthrough`]) while a session started now would be refused
     /// without them ([`Self::refuses_passthrough`]): it shows what the user
-    /// asked never to be shown. A session whose module cannot run the
-    /// effect is left as it is (the raw picture and `Warning`, as a start
-    /// would give it).
+    /// asked never to be shown.
     fn streams_without_black_effect(&self) -> bool {
         self.passthrough.is_some() && self.refuses_passthrough()
     }
 
     /// A session started now would be given a background effect, under an
     /// `on_failure` that hides the camera, and so is never started without
-    /// its effects ([`Self::start_passthrough`]): the effect is selected and
-    /// a module of a fresh plan can run it. The one test the guard and the
-    /// start both use.
+    /// its effects ([`Self::start_passthrough`]): the effect is selected,
+    /// whether or not a module of a fresh plan can run it
+    /// ([`Self::fails_closed`]). The one test the guard and the start both
+    /// use.
     fn refuses_passthrough(&self) -> bool {
         Self::hides_effect(&self.effect_run_with(&self.fresh_plan()))
     }
@@ -3887,9 +4088,18 @@ impl<B: MediaBackend> Controller<B> {
         // session (frame generation when the first camera's rate is half
         // the output's).
         self.plan = Some(self.fresh_plan());
+        self.background_planned = self
+            .plan
+            .as_ref()
+            .is_some_and(|p| self.runs_in(p, &StageId::BACKGROUND));
+        self.background_revoked = false;
+        self.hold_background();
         // A selected stage no module provides is dropped (the effect run
         // has it off): the session streams on without it, whatever
-        // `on_failure` says, and `Warning` says why.
+        // `on_failure` says, and `Warning` says why. But the background
+        // effect: under `black` or `image` it is asked of the effect element
+        // all the same, which fails it and shows what `on_failure` says
+        // ([`Self::fails_closed`]).
         let mut params = self.session_params();
         self.effect_failure = None;
         self.stages.clear();
@@ -3912,6 +4122,7 @@ impl<B: MediaBackend> Controller<B> {
                 match params.effect.on_failure {
                     EffectOnFailure::Black | EffectOnFailure::Image if settings.is_err() => {
                         self.plan = None;
+                        self.hold_background();
                         self.set_privacy_fault(effect_failure_text(&params.effect, &reason));
                         return false;
                     }
@@ -4061,6 +4272,86 @@ impl<B: MediaBackend> Controller<B> {
         res
     }
 
+    /// The modules keep the module the session's plan runs the background
+    /// effect from open while the plan is in force, refused or not
+    /// ([`Modules::hold`]): a refusal never turns a running effect into the
+    /// raw picture, it applies at the next start. When the hold ends, the
+    /// module rules are followed (the side of a conflict kept is opened).
+    fn hold_background(&mut self) {
+        let held = self
+            .plan
+            .as_ref()
+            .and_then(|p| p.provider(&StageId::BACKGROUND))
+            .map(str::to_string);
+        self.modules
+            .hold(&mut self.backend, &self.config, held.as_deref());
+    }
+
+    /// The running session's effect element keeps its backend while the
+    /// module the session started the background effect with can run it.
+    /// Under an `on_failure` that hides the camera (`black`, `image`), a
+    /// session that lost that module ([`Self::background_lost`]: disabled,
+    /// a failed probe, a failed reopen on a reload) has the element drop
+    /// its backend instance ([`MediaBackend::revoke_effect_backend`]): it
+    /// fails the effect at once and shows black or the fallback image, the
+    /// effect still asked of it ([`Self::fails_closed`]) and the camera
+    /// kept open. Once the module can run it again (or the effect is no
+    /// longer to be hidden), the element takes its backend back
+    /// ([`MediaBackend::restore_effect_backend`]) and the effect is given
+    /// again ([`Self::follow_background`]), with no restart. Under `none`
+    /// the effect is dropped instead (the camera image), and a media
+    /// backend that cannot revoke drops it too.
+    ///
+    /// Only while a background effect is selected: with the effect off
+    /// (mode `none`) the element runs the stages alone, which the module
+    /// may still run (a probe that lost the background stage only), and a
+    /// revocation would fail them. An effect selected again is followed
+    /// here before it is given ([`Self::give_effect`]), so the element
+    /// never runs it on the lost module's instance. The element's backend
+    /// taken back, the effect's failure for want of it
+    /// ([`Self::effect_failure`]) is over: the effect reads as loading
+    /// until it is ready, as at a start.
+    fn follow_effect_backend(&mut self) {
+        let revoke = self.session.is_some()
+            && self.effect().mode != EffectMode::None
+            && self.effect().on_failure.hides()
+            && self.backend.can_revoke_effect_backend()
+            && self.plan.as_ref().is_some_and(|p| self.background_lost(p));
+        if revoke == self.background_revoked {
+            return;
+        }
+        let done = if revoke {
+            info!(
+                "the session's effect module cannot run the background effect: its backend dropped"
+            );
+            self.backend.revoke_effect_backend()
+        } else {
+            info!(
+                "the session's effect module can run the background effect again: its backend taken back"
+            );
+            self.backend.restore_effect_backend()
+        };
+        match done {
+            Ok(()) => {
+                self.background_revoked = revoke;
+                if !revoke {
+                    // The element loads the effect again: the next poll
+                    // reads it loading (or ready), not failed.
+                    self.effect_failure = None;
+                    self.effect_seen = None;
+                }
+            }
+            Err(e) => warning!("the effect element's backend: {e}"),
+        }
+    }
+
+    /// Gives `effect` to the running session, its effect element's backend
+    /// followed first ([`Self::follow_effect_backend`]).
+    fn give_effect(&mut self, effect: &EffectRun) -> Result<(), String> {
+        self.follow_effect_backend();
+        self.backend.set_effect(effect)
+    }
+
     /// Stops the session. An effect failure of that session (in
     /// `Warning`), a noise removal failure, a relighting failure and an
     /// enhancement failure end with it: the stages' `Error` gives way to
@@ -4072,6 +4363,8 @@ impl<B: MediaBackend> Controller<B> {
         }
         // The modules' code stopped (cleanly: the daemon is still here).
         self.plan = None;
+        self.background_revoked = false;
+        self.hold_background();
         self.passthrough = None;
         let marked = std::mem::take(&mut self.marked);
         self.modules.session_ended(&marked);
@@ -4924,7 +5217,7 @@ impl<B: MediaBackend> Controller<B> {
         }
         self.effect_applied = Some(effect.clone());
         self.mark_running(&effect);
-        let Err(reason) = self.backend.set_effect(&effect) else {
+        let Err(reason) = self.give_effect(&effect) else {
             return Ok(());
         };
         Err(self.effect_refused(effect, &reason))
@@ -5031,7 +5324,7 @@ impl<B: MediaBackend> Controller<B> {
         }
         self.effect_applied = Some(effect.clone());
         self.mark_running(&effect);
-        let Err(reason) = self.backend.set_effect(&effect) else {
+        let Err(reason) = self.give_effect(&effect) else {
             return Ok(());
         };
         Err(self.effect_refused(effect, &reason))
@@ -6365,6 +6658,11 @@ impl<B: MediaBackend> Controller<B> {
             let old = std::mem::replace(&mut self.config, config);
             self.adopt_set(set);
             let mut changed = old.modules != self.config.modules;
+            // The modules forced first: what they lift decides what
+            // enabling a module opens.
+            if old.modules.forced != self.config.modules.forced {
+                changed |= self.modules.apply_forced(&mut self.backend, &self.config);
+            }
             for m in self.modules.info() {
                 let on = self.config.modules.is_enabled(&m.id);
                 let named = forgive == Some(m.id.as_str());
@@ -6379,7 +6677,10 @@ impl<B: MediaBackend> Controller<B> {
                     }
                 }
             }
-            self.modules.apply_choices(&self.config);
+            // The pins and the profile decide which side of a module
+            // conflict gives the cut-out.
+            self.modules
+                .apply_choices_settled(&mut self.backend, &self.config);
             if changed {
                 self.follow_modules(true, now, true);
             }
@@ -7518,6 +7819,8 @@ fn registry_facts(modules: &Modules) -> RegistryFacts {
                 } else {
                     m.name.clone()
                 },
+                // `[mic] force_conflicts` lifts an audio module's.
+                forceable: m.kind == obc_module_host::ModuleKind::VideoStage.as_str(),
             })
             .collect(),
         stages,
@@ -7526,11 +7829,12 @@ fn registry_facts(modules: &Modules) -> RegistryFacts {
     }
 }
 
-/// Whether `new` differs from `old` in the module choices alone (enabled
-/// and disabled modules, profile, pins, order), or not at all.
+/// Whether `new` differs from `old` in the module choices alone (enabled,
+/// disabled and forced modules, profile, pins, order), or not at all.
 fn choices_only(old: &Config, new: &Config) -> bool {
     let mut n = new.clone();
     n.modules.enabled = old.modules.enabled.clone();
+    n.modules.forced = old.modules.forced.clone();
     n.modules.disabled = old.modules.disabled.clone();
     n.modules.profile = old.modules.profile;
     n.modules.pin = old.modules.pin.clone();

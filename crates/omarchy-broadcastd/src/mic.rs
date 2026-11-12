@@ -877,6 +877,7 @@ pub fn parse_modules(doc: &Json) -> Vec<ModuleInfo> {
                 enabled: flag(m, "enabled").unwrap_or(false),
                 status: text(m, "status", STATE_MAX),
                 reason: text(m, "reason", REASON_MAX),
+                forced: false,
                 stages,
             })
         })

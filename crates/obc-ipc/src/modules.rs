@@ -6,7 +6,10 @@
 //! dictionary with `id`, `name`, `version`, `licence`, `kind`, `library`,
 //! `manifest` (the manifest file), `description`, `enabled` (b), `status`
 //! (`available`, `unavailable` or `disabled`), `reason` (why it is not
-//! available, empty when it is) and `stages` (aa{sv}): each with `id`,
+//! available, empty when it is), `forced` (b, revision 14: the module's
+//! conflicts are not enforced, `modules.forced.<id>`; always false for an
+//! audio module, whose conflicts `[mic] force_conflicts` lifts; missing
+//! reads as false) and `stages` (aa{sv}): each with `id`,
 //! `slot`, `rank` (u), `device`, `available` (b), `reason` and `selected`
 //! (b: this module provides the stage at the next pipeline start).
 //!
@@ -29,6 +32,11 @@ pub const MODULES_REVISION: u32 = 9;
 
 /// The `GetModules` reply on the wire.
 pub type ModulesReply = (u32, Vec<VariantDict>);
+
+/// The first [`crate::INTERFACE_REVISION`] with module conflicts and
+/// requirements enforced, the `forced` key of a module and the
+/// `modules.forced.<id>` config rows (of video modules).
+pub const FORCED_REVISION: u32 = 14;
 
 /// A module's `status`: it can run.
 pub const STATUS_AVAILABLE: &str = "available";
@@ -70,6 +78,10 @@ pub struct ModuleInfo {
     /// [`STATUS_AVAILABLE`], [`STATUS_UNAVAILABLE`] or [`STATUS_DISABLED`].
     pub status: String,
     pub reason: String,
+    /// Its conflicts are not enforced (`modules.forced.<id>`, for
+    /// debugging and testing). Always false for an audio module (`[mic]
+    /// force_conflicts` lifts the audio worker's conflicts).
+    pub forced: bool,
     pub stages: Vec<StageInfo>,
 }
 
@@ -126,6 +138,7 @@ impl ModuleInfo {
             put(&mut d, k, Variant::from(v.as_str()));
         }
         put(&mut d, "enabled", Variant::from(self.enabled));
+        put(&mut d, "forced", Variant::from(self.forced));
         let stages: Vec<VariantDict> = self.stages.iter().map(StageInfo::to_dict).collect();
         d.insert("stages".into(), to_owned(&stages));
         d
@@ -156,6 +169,7 @@ impl ModuleInfo {
             enabled: get_bool(&e, "enabled").unwrap_or_default(),
             status: text(&e, "status"),
             reason: text(&e, "reason"),
+            forced: get_bool(&e, "forced").unwrap_or_default(),
             stages,
         })
     }
@@ -225,6 +239,7 @@ mod tests {
                 enabled: true,
                 status: STATUS_AVAILABLE.into(),
                 reason: String::new(),
+                forced: true,
                 stages: vec![StageInfo {
                     id: "hello".into(),
                     slot: "post-composite".into(),
@@ -250,6 +265,17 @@ mod tests {
         assert_eq!(back, list);
         assert_eq!(back.provider_of("hello").unwrap().id, "org.example.hello");
         assert!(back.provider_of("denoise").is_none());
+        assert!(back.modules[0].forced);
+    }
+
+    #[test]
+    fn forced_is_false_when_missing() {
+        let mut d = sample().modules[0].to_dict();
+        assert!(ModuleInfo::from_dict(&d).unwrap().forced);
+        d.remove("forced");
+        assert!(!ModuleInfo::from_dict(&d).unwrap().forced);
+        d.insert("forced".into(), OwnedVariant::from(7u32));
+        assert!(!ModuleInfo::from_dict(&d).unwrap().forced);
     }
 
     #[test]
