@@ -316,6 +316,10 @@ fn gpu_auto_frame_moves_towards_a_still_face_when_one_is_given() {
             // A live change to the widest framing and a temporal reset: the
             // reset snaps back to the full frame at once.
             gpu::run_chain(&mut *chain, g, &frame, &gpu::live_framing("wide"), false);
+            // The framed write of that frame lands on the stream: let it
+            // finish before the input is uploaded over it, as the host does
+            // before it reuses a buffer, or it can overwrite the input.
+            stream.synchronize().unwrap();
             assert!(chain.reset_temporal().unwrap().is_empty());
             frame.upload_packed(&input).unwrap();
             gpu::run_chain(&mut *chain, g, &frame, &none, false);

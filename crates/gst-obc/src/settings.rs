@@ -528,10 +528,12 @@ pub(crate) enum FrameAction {
 }
 
 /// The decision of the privacy rules (ADR-0012): the raw input is shown only
-/// for `none`, or after a failure with `on-failure=none`; an effect that is
-/// not loaded yet shows black (`image` is `black` here: the frame is then
-/// filled with the fallback image); a loaded effect (the requested one, or the
-/// previous one while the requested one loads) processes the frame.
+/// for `none`, or after a failure with `on-failure=none` (and, through
+/// [`decide_frame`], while an effect turned on mid-stream loads with the
+/// room already on screen); an effect that is not loaded yet shows black
+/// (`image` is `black` here: the frame is then filled with the fallback
+/// image); a loaded effect (the requested one, or the previous one while the
+/// requested one loads) processes the frame.
 ///
 /// `loaded` says a chain usable for the request is loaded: for blur and
 /// replace one with an effect (the stages alone hide nothing), for `none`
@@ -560,6 +562,89 @@ pub(crate) fn decide(
         (EffectStatus::Failed(_), EffectFallback::None) => FrameAction::Passthrough,
         _ if loaded => FrameAction::Process,
         _ => FrameAction::Black,
+    }
+}
+
+/// What a frame of a running stream gets, and the effect it is decided as:
+/// [`decide`], except for a toggle mid-stream.
+///
+/// A requested effect (blur or replace) that is not loaded and has not
+/// failed holds black (or the fallback image) only when the room is not on
+/// screen already. `raw_on_screen` says the last frame output was the
+/// unprocessed picture: the input passed through, or processed by the
+/// stages alone (they hide nothing). Then a black hold would protect
+/// nothing, so the frame gets what `none` with the same stages would: the
+/// input, or the stages alone when `any_loaded` (a chain is loaded: the
+/// stages alone, while the request is not usable) and `stages`. The
+/// returned effect is then [`EffectKind::None`]; otherwise it is `kind`
+/// and the action is [`decide`]'s.
+///
+/// `raw_on_screen` is false at a start (the first frames of the element)
+/// and on a new source, and after any frame that went out black or
+/// processed by an effect, so the hold stays for a start, a new camera,
+/// and once the effect has been shown; a failure takes `on-failure` as
+/// before.
+pub(crate) fn decide_frame(
+    kind: EffectKind,
+    status: &EffectStatus,
+    fallback: EffectFallback,
+    loaded: bool,
+    any_loaded: bool,
+    stages: bool,
+    raw_on_screen: bool,
+) -> (EffectKind, FrameAction) {
+    let toggle = kind != EffectKind::None
+        && !loaded
+        && raw_on_screen
+        && !matches!(status, EffectStatus::Failed(_));
+    if toggle {
+        let none = EffectKind::None;
+        (none, decide(none, status, fallback, any_loaded, stages))
+    } else {
+        (kind, decide(kind, status, fallback, loaded, stages))
+    }
+}
+
+/// What a frame went out as, for [`raw_on_screen_after`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameOutput {
+    /// The input, passed through or copied into the output.
+    Input,
+    /// Processed by the stages alone (they hide nothing).
+    Stages,
+    /// Processed by an effect.
+    Effect,
+    /// Black, or the fallback image.
+    Hidden,
+    /// A repeat given the cached output of an earlier frame.
+    Resent,
+}
+
+/// What moves the streaming thread's `raw_on_screen` flag (the room is on
+/// screen, see [`decide_frame`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScreenEvent {
+    /// A stop, new caps or a flush: the frames after it start over.
+    Reset,
+    /// A frame arrived, before it is decided. `new_source` is its
+    /// `NEW_SOURCE` flag: that room was never shown.
+    Arrived { new_source: bool },
+    /// The frame went out.
+    Output(FrameOutput),
+}
+
+/// `raw_on_screen` after `event`, from `raw`. It is set by a frame that
+/// went out as the unprocessed picture (the input, or the stages alone)
+/// and cleared by black or an effect frame, by a reset, and by a new
+/// source before its first frame is decided. A repeat given the cached
+/// output shows what was shown: it changes nothing.
+pub(crate) fn raw_on_screen_after(raw: bool, event: ScreenEvent) -> bool {
+    match event {
+        ScreenEvent::Reset => false,
+        ScreenEvent::Arrived { new_source } => raw && !new_source,
+        ScreenEvent::Output(FrameOutput::Input | FrameOutput::Stages) => true,
+        ScreenEvent::Output(FrameOutput::Effect | FrameOutput::Hidden) => false,
+        ScreenEvent::Output(FrameOutput::Resent) => raw,
     }
 }
 
@@ -940,6 +1025,174 @@ mod tests {
                 assert_eq!(decide(None, &status, fb, true, false), Passthrough);
             }
         }
+    }
+
+    #[test]
+    fn an_effect_turned_on_mid_stream_keeps_the_picture_on_screen_while_it_loads() {
+        use EffectKind::*;
+        use FrameAction::*;
+        let fallbacks = [
+            EffectFallback::Black,
+            EffectFallback::Image,
+            EffectFallback::None,
+        ];
+        for kind in [Blur, Replace] {
+            for fb in fallbacks {
+                for status in [
+                    EffectStatus::Loading,
+                    EffectStatus::Ready,
+                    EffectStatus::Off,
+                ] {
+                    let at = |any_loaded, stages, raw| {
+                        decide_frame(kind, &status, fb, false, any_loaded, stages, raw)
+                    };
+                    // The room is on screen: what `none` gives, never black.
+                    assert_eq!(at(false, false, true), (None, Passthrough));
+                    assert_eq!(at(true, false, true), (None, Passthrough));
+                    // A stage in force and loaded alone: processed by it.
+                    assert_eq!(at(true, true, true), (None, Process), "{kind} {fb}");
+                    // The stages not loaded (or the instance mid-load).
+                    assert_eq!(at(false, true, true), (None, Passthrough));
+                    // A start, a new source, or an effect (or black) already
+                    // shown: the hold, black or the image.
+                    for any_loaded in [false, true] {
+                        for stages in [false, true] {
+                            assert_eq!(
+                                at(any_loaded, stages, false),
+                                (kind, Black),
+                                "{kind} {status} {fb} {any_loaded} {stages}"
+                            );
+                        }
+                    }
+                }
+                // Loaded: processed by the effect, whatever is on screen.
+                for raw in [false, true] {
+                    for stages in [false, true] {
+                        assert_eq!(
+                            decide_frame(kind, &EffectStatus::Loading, fb, true, true, stages, raw),
+                            (kind, Process)
+                        );
+                    }
+                }
+                // A failure takes on-failure, unchanged by the picture shown.
+                let failed = EffectStatus::Failed("x".into());
+                for raw in [false, true] {
+                    for loaded in [false, true] {
+                        let want = if fb == EffectFallback::None {
+                            Passthrough
+                        } else {
+                            Black
+                        };
+                        assert_eq!(
+                            decide_frame(kind, &failed, fb, loaded, loaded, true, raw),
+                            (kind, want),
+                            "{kind} {fb} {raw} {loaded}"
+                        );
+                    }
+                }
+            }
+        }
+        // `none` is decided as before.
+        for raw in [false, true] {
+            for fb in fallbacks {
+                assert_eq!(
+                    decide_frame(None, &EffectStatus::Off, fb, true, true, true, raw),
+                    (None, Process)
+                );
+                assert_eq!(
+                    decide_frame(None, &EffectStatus::Off, fb, false, false, true, raw),
+                    (None, Passthrough)
+                );
+                assert_eq!(
+                    decide_frame(None, &EffectStatus::Off, fb, true, true, false, raw),
+                    (None, Passthrough)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_unprocessed_picture_sets_the_flag_and_black_or_an_effect_clears_it() {
+        use FrameOutput::*;
+        for raw in [false, true] {
+            let out = |o| raw_on_screen_after(raw, ScreenEvent::Output(o));
+            assert!(out(Input), "the input, from {raw}");
+            assert!(out(Stages), "the stages alone, from {raw}");
+            assert!(!out(Effect), "an effect frame, from {raw}");
+            assert!(!out(Hidden), "black, from {raw}");
+            assert!(!raw_on_screen_after(raw, ScreenEvent::Reset), "a reset");
+        }
+    }
+
+    #[test]
+    fn a_new_source_clears_the_flag_before_its_frame_is_decided() {
+        let arrived =
+            |raw, new_source| raw_on_screen_after(raw, ScreenEvent::Arrived { new_source });
+        assert!(!arrived(true, true), "a new source's room was never shown");
+        assert!(!arrived(false, true));
+        assert!(arrived(true, false), "another frame of the same source");
+        assert!(!arrived(false, false));
+        // The new source's first frame of a toggle is then held, not the
+        // input.
+        let raw = arrived(true, true);
+        let (_, action) = decide_frame(
+            EffectKind::Blur,
+            &EffectStatus::Loading,
+            EffectFallback::Black,
+            false,
+            false,
+            false,
+            raw,
+        );
+        assert_eq!(action, FrameAction::Black);
+    }
+
+    #[test]
+    fn a_resent_repeat_or_a_repeated_outcome_keeps_the_flag() {
+        use FrameOutput::*;
+        for raw in [false, true] {
+            assert_eq!(raw_on_screen_after(raw, ScreenEvent::Output(Resent)), raw);
+        }
+        for o in [Input, Stages, Effect, Hidden, Resent] {
+            for raw in [false, true] {
+                let once = raw_on_screen_after(raw, ScreenEvent::Output(o));
+                let twice = raw_on_screen_after(once, ScreenEvent::Output(o));
+                assert_eq!(once, twice, "{o:?} twice, from {raw}");
+            }
+        }
+    }
+
+    /// The streaming thread's flag, frame after frame, through
+    /// [`raw_on_screen_after`]: once a frame goes out black or processed by
+    /// the effect, a later state without the effect loaded holds black,
+    /// never the input.
+    #[test]
+    fn once_the_effect_or_black_is_shown_an_unloaded_effect_never_gives_the_input() {
+        use FrameAction::*;
+        let fb = EffectFallback::Black;
+        let blur = EffectKind::Blur;
+        let loading = EffectStatus::Loading;
+        let mut raw = raw_on_screen_after(false, ScreenEvent::Output(FrameOutput::Input));
+        let mut step = |loaded: bool| {
+            raw = raw_on_screen_after(raw, ScreenEvent::Arrived { new_source: false });
+            let (shown, action) = decide_frame(blur, &loading, fb, loaded, false, false, raw);
+            let output = match action {
+                Passthrough => FrameOutput::Input,
+                Black => FrameOutput::Hidden,
+                Process if shown == EffectKind::None => FrameOutput::Stages,
+                Process => FrameOutput::Effect,
+            };
+            raw = raw_on_screen_after(raw, ScreenEvent::Output(output));
+            action
+        };
+        assert_eq!(step(false), Passthrough, "the toggle, while loading");
+        assert_eq!(step(false), Passthrough);
+        assert_eq!(step(true), Process, "ready");
+        // Unloaded again (a reload): black from now on, never the input.
+        for _ in 0..3 {
+            assert_eq!(step(false), Black);
+        }
+        assert_eq!(step(true), Process);
     }
 
     #[test]
