@@ -366,7 +366,16 @@ pub fn tensorrt_version(library: &Path) -> Option<String> {
                     Some(tensorrt_version_string(v))
                 }
             };
-            let loaded = TENSORRT_NAMES.iter().find_map(|name| {
+            let dir = library.parent().unwrap_or(Path::new("/"));
+            let provider = dir.join("libonnxruntime_providers_tensorrt.so");
+            // Only the sonames the provider links, in both lookups: another
+            // module may have loaded a different major (Maxine's own
+            // `libnvinfer.so.10` beside a provider linked to `.so.11`), and
+            // its version would key engines the provider builds. When the
+            // provider's links cannot be determined this is every name,
+            // as before.
+            let names = tensorrt_names_linked(&provider);
+            let loaded = names.iter().find_map(|name| {
                 // SAFETY: opens only a library already loaded (its
                 // initialisers have run); takes another reference to it.
                 let lib = unsafe {
@@ -381,16 +390,12 @@ pub fn tensorrt_version(library: &Path) -> Option<String> {
             if loaded.is_some() {
                 return loaded;
             }
-            let dir = library.parent().unwrap_or(Path::new("/"));
-            let provider = dir.join("libonnxruntime_providers_tensorrt.so");
-            tensorrt_names_linked(&provider)
-                .into_iter()
-                .find_map(|name| {
-                    // SAFETY: loading TensorRT runs its initialisers, which
-                    // have no preconditions.
-                    let lib = unsafe { libloading::Library::new(name) }.ok()?;
-                    read(lib)
-                })
+            names.into_iter().find_map(|name| {
+                // SAFETY: loading TensorRT runs its initialisers, which
+                // have no preconditions.
+                let lib = unsafe { libloading::Library::new(name) }.ok()?;
+                read(lib)
+            })
         })
         .clone()
 }
@@ -515,6 +520,10 @@ mod tests {
         assert_eq!(tensorrt_names_linked(&p), ["libnvinfer.so.10"]);
         std::fs::write(&p, b"libnvinfer.so.11\0libnvinfer.so.10\0").unwrap();
         assert_eq!(tensorrt_names_linked(&p), TENSORRT_NAMES);
+        // A provider linked to the newer name alone is not given the older
+        // one to probe in the already-loaded libraries.
+        std::fs::write(&p, b"libnvinfer.so.11\0libc.so.6\0").unwrap();
+        assert_eq!(tensorrt_names_linked(&p), ["libnvinfer.so.11"]);
         // A prefix of another name is not that name.
         std::fs::write(&p, b"libnvinfer.so.100\0").unwrap();
         assert_eq!(tensorrt_names_linked(&p), TENSORRT_NAMES);

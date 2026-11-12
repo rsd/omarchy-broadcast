@@ -1,8 +1,9 @@
 //! The models the module can run: one entry per model, with its file, its
 //! checksum, the input it takes and how its output reads as a matte.
 //!
-//! The pre-processing of each entry is the one the spike measured
-//! (`model-sources/README.md`): the frame scaled to the model's input
+//! The pre-processing of each entry is the one the spike measured (each
+//! model's input and output are recorded in the omarchy-onnx-models
+//! repository's `docs/models.md`): the frame scaled to the model's input
 //! (an area average, ignoring the aspect ratio for the square models, as
 //! the spike's `cv2.resize` did), RGB, normalised to `[0, 1]` or `[-1, 1]`.
 
@@ -110,8 +111,8 @@ pub const DEFAULT_MODEL: &str = "mediapipe-landscape";
 /// `selfie_segmentation_landscape.tflite` (tf2onnx and `fix_tconv.py`), not
 /// the community `mp_selfie_landscape.onnx`: the two give the same matte
 /// (a largest difference of 3.8e-5), and ours is reproducible from the
-/// upstream file with the scripts in `model-sources/`, so its provenance is
-/// one step from Google's release. Ours keeps the TFLite layout, NHWC.
+/// upstream file with the conversion scripts of the omarchy-onnx-models
+/// repository, so its provenance is one step from Google's release. Ours keeps the TFLite layout, NHWC.
 pub const MODELS: [ModelSpec; 4] = [
     ModelSpec {
         id: DEFAULT_MODEL,

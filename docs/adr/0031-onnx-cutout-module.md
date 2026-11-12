@@ -1,6 +1,6 @@
 # ADR-0031: The open-model cut-out: a second `background` provider on ONNX Runtime
 
-- **Status:** Accepted (2026-11-12), implemented in module version 0.36.0 (`crates/obc-module-onnx`). Builds on [ADR-0025](0025-loadable-modules.md) (a second provider of a stage, by rank, pin and profile), [ADR-0012](0012-video-effects-and-maxine-backend.md) (the cut-out never fails open). Amends the CUDA context rule of [modules.md](../modules.md#threading-and-cuda-rules) with one bounded exception, and leaves [ADR-0017](0017-cuda-checkpoint-parking.md) (parking) in force.
+- **Status:** Accepted (2026-11-12), implemented in module version 0.38.0 (`crates/obc-module-onnx`). Builds on [ADR-0025](0025-loadable-modules.md) (a second provider of a stage, by rank, pin and profile), [ADR-0012](0012-video-effects-and-maxine-backend.md) (the cut-out never fails open). Amends the CUDA context rule of [modules.md](../modules.md#threading-and-cuda-rules) with one bounded exception, and leaves [ADR-0017](0017-cuda-checkpoint-parking.md) (parking) in force.
 
 ## Context
 - Until now the only provider of the `background` stage was the Maxine module, which needs NVIDIA's SDK, a personal download that the project cannot distribute ([ADR-0003](0003-maxine-first-behind-backend-seam.md), [ADR-0021](0021-nvidia-sdk-handover.md)). Without the SDK there was no cut-out at all.
@@ -28,7 +28,7 @@
 | `modnet` | MODNet, photographic | Sharp hair; for a GPU |
 
 - All four are Apache-2.0, recorded with their notices in `crates/obc-module-onnx/model-sources/LICENSES.md`, and the package ships the licence text with the files. The **training-data terms of PP-HumanSeg and MODNet are unconfirmed** (PP-HumanSeg's data set is available from its publisher on request with no public licence; MODNet's README does not name its data), and the file says so. That is why the default is MediaPipe and the others are a choice the user makes in the settings, not what a fresh install runs.
-- The files are the project's own conversions to ONNX of the upstream releases, with unchanged weights, reproducible with the scripts in `model-sources/`. The MediaPipe conversion is ours and not the community's ONNX file: both give the same matte (the largest difference is 4e-5), and ours is one step from Google's release. A modified file carries the notice that Apache-2.0 requires. The MODNet file is the upstream ONNX export unmodified.
+- The files are the project's own conversions to ONNX of the upstream releases, with unchanged weights, reproducible with the conversion scripts that the omarchy-onnx-models repository publishes with the files (`crates/obc-module-onnx/model-sources/README.md` points to it). The MediaPipe conversion is ours and not the community's ONNX file: both give the same matte (the largest difference is 4e-5), and ours is one step from Google's release. A modified file carries the notice that Apache-2.0 requires. The MODNet file is the upstream ONNX export unmodified.
 - Each file is checked against its SHA-256 when it loads, so a wrong or truncated file fails the load with a reason that names it.
 
 ### ONNX Runtime opened at run time, every build's engines probed generically

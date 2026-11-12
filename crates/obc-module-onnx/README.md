@@ -48,7 +48,7 @@ The library is `crates/obc-module-onnx/target/release/libobc_module_onnx.so`. No
    | `pphumanseg-v2-lite` | `pp_humansegv2_lite_192x192.onnx` | `ca96b4436f1ce6a76059e8902e20a9617f6829fb11f6c6c9e876563e6352e6b4` |
    | `modnet` | `modnet_photographic.onnx` | `07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9` |
 
-   Each file is checked against its SHA-256 when it loads; a missing or different file fails the load, with a reason that names the file and the directories searched. Install [model-sources/LICENSE-APACHE-2.0](model-sources/LICENSE-APACHE-2.0) and [model-sources/LICENSES.md](model-sources/LICENSES.md) with the files. How the files are made is in [model-sources/README.md](model-sources/README.md).
+   Each file is checked against its SHA-256 when it loads; a missing or different file fails the load, with a reason that names the file and the directories searched. Install [model-sources/LICENSE-APACHE-2.0](model-sources/LICENSE-APACHE-2.0) and [model-sources/LICENSES.md](model-sources/LICENSES.md) with the files. The files, their conversion scripts and their checksums are published by the omarchy-onnx-models repository; see [model-sources/README.md](model-sources/README.md).
 
 4. `systemctl --user restart omarchy-broadcastd`, then `omarchy-broadcast modules`: the module is listed with its stage, or with the reason it cannot run.
 
