@@ -10,6 +10,9 @@ rust-version.workspace = true
 [dependencies]
 obc-core = { workspace = true }
 obc-pipeline = { workspace = true }
+# The hardened image checks (bounded reads, headers, size limits) of the
+# media gallery.
+gst-obc = { workspace = true }
 obc-gpu = { workspace = true }
 obc-ipc = { workspace = true }
 # The modules: discovery, loading, the registry and the crash ledger.
