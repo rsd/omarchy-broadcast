@@ -21,6 +21,22 @@
 //! `libnvinfer.so.10` opens the bundled `libnvJitLink.so.12` by name at run
 //! time, so that one is loaded here too.
 //!
+//! The system C++ runtime is opened first, by name, with `RTLD_NOW |
+//! RTLD_GLOBAL`. The AR SDK's `libNVCVImage.so` links a GCC 8 `libstdc++`
+//! statically and exports all of it, `std::locale` included. If that
+//! library reached the global scope before the system `libstdc++.so.6`, a
+//! process that already has the system runtime (the daemon: GStreamer's
+//! C++ plugins load it locally and it binds to itself) would run two
+//! runtimes, and an object made by one could be destroyed by the other. A
+//! `std::locale` holding the system runtime's static classic facets, torn
+//! down by the SDK's `~locale`, underflows its reference count and frees
+//! static storage, and `NvAR_Load` of the face-box model aborts with
+//! `free(): invalid size`. With the system runtime in the global scope
+//! first, every `std::` lookup (the feature libraries, TensorRT, cuDNN and
+//! `libNVCVImage`'s own PLT and GOT slots) resolves to that one runtime.
+//! It is not an SDK library, so it is not listed in [`Preloaded::loaded`];
+//! a failure to open it is recorded in [`Preloaded::failed`].
+//!
 //! The handles are never closed: the SDK stays mapped for the life of the
 //! process, as [`crate::ffi`] keeps it.
 
@@ -34,6 +50,9 @@ use std::path::{Path, PathBuf};
 /// The bundled CUDA library TensorRT (`libnvinfer.so.10`) opens by name at
 /// run time; no library lists it as a dependency.
 const NVJITLINK: &str = "external/cuda/lib/libnvJitLink.so.12";
+
+/// The system C++ runtime, opened by name so the system loader finds its own.
+const CXX_RUNTIME: &str = "libstdc++.so.6";
 
 /// What [`preload`] did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -66,8 +85,11 @@ impl Preloaded {
 /// to find is reported when it is opened.
 pub(crate) fn preload(root: &Path, core: &[&str], features: &[&str]) -> Preloaded {
     let mut done = Preloaded::default();
+    if let Err(e) = dlopen(Path::new(CXX_RUNTIME), libc::RTLD_NOW | libc::RTLD_GLOBAL) {
+        done.failed.push((PathBuf::from(CXX_RUNTIME), e));
+    }
     for path in plan(root, core, features) {
-        match dlopen_global(&path) {
+        match dlopen(&path, libc::RTLD_LAZY | libc::RTLD_GLOBAL) {
             Ok(()) => done.loaded.push(path),
             Err(e) => done.failed.push((path, e)),
         }
@@ -75,13 +97,13 @@ pub(crate) fn preload(root: &Path, core: &[&str], features: &[&str]) -> Preloade
     done
 }
 
-/// Opens `path` with `RTLD_LAZY | RTLD_GLOBAL` and leaks the handle.
-fn dlopen_global(path: &Path) -> Result<(), String> {
+/// Opens `path` with `flags` and leaks the handle.
+fn dlopen(path: &Path, flags: libc::c_int) -> Result<(), String> {
     let c =
         CString::new(path.as_os_str().as_bytes()).map_err(|_| "a NUL in the path".to_string())?;
     // SAFETY: `c` is a NUL-terminated path. Loading an SDK library runs its
     // initialisers, which have no preconditions for the caller.
-    let handle = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL) };
+    let handle = unsafe { libc::dlopen(c.as_ptr(), flags) };
     if handle.is_null() {
         // SAFETY: dlerror returns null or a NUL-terminated string owned by
         // the loader, valid until the next dl call on this thread.
@@ -526,7 +548,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(plan(dir.path(), CORE, FX).is_empty());
         let done = preload(dir.path(), CORE, FX);
-        assert_eq!(done, Preloaded::default());
+        assert!(done.loaded.is_empty());
         assert_eq!(done.failures(), None);
         // Directories alone, and files that are not libraries, change
         // nothing.
@@ -536,6 +558,28 @@ mod tests {
         std::fs::write(dir.path().join("features/a/lib/README"), b"").unwrap();
         assert!(plan(dir.path(), CORE, FX).is_empty());
         assert!(search_dirs(dir.path()).contains(&dir.path().join("features/a/lib")));
+    }
+
+    #[test]
+    fn the_system_cxx_runtime_is_global_before_the_sdk_libraries() {
+        let dir = tempfile::tempdir().unwrap();
+        let done = preload(dir.path(), CORE, FX);
+        assert!(done.failed.is_empty(), "{:?}", done.failed);
+        // A Rust test binary does not link libstdc++: the symbol is
+        // visible only because the preload opened it globally.
+        let name = CString::new("_ZNSt6localeD1Ev").unwrap();
+        // SAFETY: a NUL-terminated name and the default scope.
+        let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+        assert!(
+            !sym.is_null(),
+            "std::locale::~locale is not in the global scope"
+        );
+        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+        // SAFETY: `sym` is an address in a loaded object; `info` is writable.
+        assert_ne!(unsafe { libc::dladdr(sym, &mut info) }, 0);
+        // SAFETY: dli_fname is a NUL-terminated string owned by the loader.
+        let file = unsafe { CStr::from_ptr(info.dli_fname) }.to_string_lossy();
+        assert!(file.contains("libstdc++.so.6"), "{file}");
     }
 
     #[test]
@@ -558,7 +602,7 @@ mod tests {
         );
         let done = preload(dir.path(), CORE, FX);
         assert!(done.loaded.is_empty());
-        assert_eq!(done.failed.len(), 2);
+        assert_eq!(done.failed.len(), 2, "{:?}", done.failed);
         let m = done.failures().unwrap();
         assert!(m.contains("libNVCVImage.so.1: "), "{m}");
         assert!(m.contains("libnvARFx.so: "), "{m}");
