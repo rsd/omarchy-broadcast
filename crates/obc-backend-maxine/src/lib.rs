@@ -116,6 +116,7 @@ pub mod hdri;
 pub mod matte;
 mod preload;
 pub mod stages;
+pub mod truehdr;
 pub mod vfg;
 pub mod vsr;
 
@@ -762,6 +763,19 @@ impl Effect {
         self.check(&format!("NvVFX_SetU32 {}", p.to_string_lossy()), rc, dir)
     }
 
+    /// The value of the `unsigned int` parameter `p`.
+    fn get_u32(&self, p: &std::ffi::CStr) -> Result<u32, NvCvStatus> {
+        let mut v = 0u32;
+        // SAFETY: live handle; static NUL-terminated parameter name; `v` is
+        // a valid out-pointer.
+        let rc = unsafe { (self.sdk.NvVFX_GetU32)(self.handle, p.as_ptr(), &mut v) };
+        if rc == ffi::NVCV_SUCCESS {
+            Ok(v)
+        } else {
+            Err(rc)
+        }
+    }
+
     fn set_f32(&self, p: &std::ffi::CStr, v: f32) -> NvCvStatus {
         // SAFETY: live handle; static NUL-terminated parameter name.
         unsafe { (self.sdk.NvVFX_SetF32)(self.handle, p.as_ptr(), v) }
@@ -862,6 +876,34 @@ impl GpuImage {
         format: i32,
         alignment: u32,
     ) -> Result<GpuImage, BackendError> {
+        Self::alloc_component(sdk, width, height, format, ffi::NVCV_U8, alignment)
+    }
+
+    /// A tightly pitched image of packed RGB10A2 words (`NVCV_RGB10A2`,
+    /// `NVCV_P32`), as the TrueHDR effect writes.
+    fn alloc_rgb10a2_tight(
+        sdk: &'static Sdk,
+        width: u32,
+        height: u32,
+    ) -> Result<GpuImage, BackendError> {
+        Self::alloc_component(
+            sdk,
+            width,
+            height,
+            ffi::NVCV_RGB10A2,
+            ffi::NVCV_P32,
+            ffi::NVCV_TIGHT_PITCH,
+        )
+    }
+
+    fn alloc_component(
+        sdk: &'static Sdk,
+        width: u32,
+        height: u32,
+        format: i32,
+        component: i32,
+        alignment: u32,
+    ) -> Result<GpuImage, BackendError> {
         let mut image = Box::new(NvCvImage::empty());
         // SAFETY: `image` is an empty descriptor; alignment 0 lets the SDK
         // choose the GPU pitch, 1 makes it tight.
@@ -871,7 +913,7 @@ impl GpuImage {
                 width,
                 height,
                 format,
-                ffi::NVCV_U8,
+                component,
                 ffi::NVCV_CHUNKY,
                 ffi::NVCV_GPU,
                 alignment,

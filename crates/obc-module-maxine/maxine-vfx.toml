@@ -4,11 +4,11 @@
 abi = 1
 id = "br.com.dias.maxine-vfx"
 name = "NVIDIA Maxine video effects"
-version = "0.33.0"
+version = "0.34.0"
 licence = "MIT OR Apache-2.0 (module); NVIDIA Maxine SDK under its own licence"
 kind = "video-stage"
 library = "/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so"
-description = "Background blur and replacement, noise removal, relighting, low-resolution enhancement and frame generation on NVIDIA GPUs"
+description = "Background blur and replacement, noise removal, relighting, low-resolution enhancement, an HDR look and frame generation on NVIDIA GPUs"
 
 [requires]
 hardware = ["nvidia-turing+"]
@@ -46,6 +46,16 @@ slot = "post-matte"
 rank = 300
 device = "nvidia-gpu"
 requires = ["matte"]
+frames = ["cuda"]
+formats = ["nv12"]
+
+# The HDR look: NVIDIA TrueHDR, tone-mapped back to 8 bits, on the
+# composited frame. Frame generation, when the daemon adds it, runs after.
+[[stage]]
+id = "hdr"
+slot = "post-composite"
+rank = 300
+device = "nvidia-gpu"
 frames = ["cuda"]
 formats = ["nv12"]
 

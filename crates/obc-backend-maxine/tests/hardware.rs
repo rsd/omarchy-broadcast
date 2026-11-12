@@ -49,7 +49,11 @@
 //! with the effects that read its mask, a switch that keeps it reuses the
 //! model, and one whose new green screen or relighting fails to load keeps
 //! the previous chain running) and both methods of the enhance stage on the upscaler
-//! ([`MaxineVsr::load_with`]).
+//! ([`MaxineVsr::load_with`]), and the HDR look
+//! ([`obc_backend_maxine::truehdr::MaxineTrueHdr`]): TrueHDR loads and runs,
+//! each frame's output is the Rust tone map of the effect's 10-bit image of
+//! that frame (not of the frame before), a mid-grey stays mid-grey, and
+//! misuse is refused.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -2739,4 +2743,213 @@ fn gpu_enhance_upscales_with_either_method() {
             assert_eq!(e.loaded_method(), None);
         }
     }
+}
+
+/// Mean luma and mean U and V of the central quarter of a packed NV12
+/// frame of `W` x `H`.
+fn centre_yuv(nv12: &[u8]) -> (f64, f64, f64) {
+    let (w, h) = (W as usize, H as usize);
+    let (mut n, mut y, mut u, mut v) = (0f64, 0f64, 0f64, 0f64);
+    for row in h / 4..3 * h / 4 {
+        for x in w / 4..3 * w / 4 {
+            n += 1.0;
+            y += nv12[row * w + x] as f64;
+            let c = w * h + (row / 2) * w + (x / 2) * 2;
+            u += nv12[c] as f64;
+            v += nv12[c + 1] as f64;
+        }
+    }
+    (y / n, u / n, v / n)
+}
+
+/// The HDR look on a mid-grey, then on the synthetic person, each run
+/// once: TrueHDR loads with its default peak, the RGB10A2 image is opaque,
+/// and each frame's output is, pixel for pixel, the Rust tone map of the
+/// effect's image of that same frame (its luma, BT.601 limited range, to
+/// the rounding of the two conversions): the person's is not the grey's
+/// image, nor zero. A mid-grey stays mid-grey, a frame in place works, and
+/// calls before a load, on another stream or of another size are refused.
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]
+fn gpu_truehdr_runs_and_its_output_is_the_reference_tone_map() {
+    use obc_backend_maxine::truehdr::{
+        DEFAULT_LUMINANCE, MaxineTrueHdrFactory, TrueHdrFault, TrueHdrFaultSwitch,
+    };
+    use obc_gpu::tonemap::{DIFFUSE_GAIN, ToneMap, pq_to_sdr, unpack_rgb10a2};
+
+    let switch = TrueHdrFaultSwitch::default();
+    let f = MaxineTrueHdrFactory::from_env().with_faults(switch.clone());
+    assert!(f.root().is_some(), "{SDK_HINT}");
+    f.probe()
+        .unwrap_or_else(|e| panic!("Maxine probe failed: {e}"));
+    fault_rig(|gpu, stream, src, dst| {
+        let mut hdr = f.create_truehdr().unwrap();
+        let e = hdr.process(gpu, &src.frame(), &dst.frame()).unwrap_err();
+        assert!(matches!(e, BackendError::InvalidInput(_)), "{e}");
+        let r = hdr
+            .load(gpu, W, H, ColourSpec::LIMITED_BT601)
+            .unwrap_or_else(|e| panic!("TrueHDR load failed: {e}"));
+        println!("LOAD truehdr: {r:?}");
+        assert!(hdr.is_loaded_for(gpu, W, H, ColourSpec::LIMITED_BT601));
+        assert!(!hdr.is_loaded_for(gpu, W, H, ColourSpec::FULL_BT601));
+        let peak = hdr.peak_luminance().unwrap();
+        assert_eq!(peak, DEFAULT_LUMINANCE as f32, "the SDK's default peak");
+
+        let tm = ToneMap::new(DIFFUSE_GAIN, peak).unwrap();
+        let (w, h) = (W as usize, H as usize);
+        // The effect's image now, as RGB10A2 words.
+        let hdr_words = |hdr: &obc_backend_maxine::truehdr::MaxineTrueHdr| -> Vec<u32> {
+            let img = hdr.hdr_image().unwrap();
+            assert_eq!((img.width, img.height), (W, H));
+            let mut raw = vec![0u8; w * 4 * h];
+            // SAFETY: the image lies inside the effect's allocation; the
+            // caller synchronised the stream.
+            unsafe { obc_gpu::download_2d(img.ptr, img.pitch, &mut raw, w * 4, w * 4, h) }.unwrap();
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_le_bytes(*b))
+                .collect()
+        };
+        // Every sampled pixel of `out` against the tone map of `words`:
+        // its luma within `tol` code values of the reference's, the worst
+        // difference returned.
+        let check = |label: &str, out: &[u8], words: &[u32], tol: u8| -> u8 {
+            let mut worst = 0u8;
+            for row in (0..h).step_by(37) {
+                for x in (0..w).step_by(41) {
+                    let p = words[row * w + x];
+                    assert_eq!(unpack_rgb10a2(p)[3], 3, "{label}: alpha at ({x}, {row})");
+                    let [r, g, b, _] = pq_to_sdr(p, tm);
+                    let want =
+                        16.0 + (65.481 * r as f64 + 128.553 * g as f64 + 24.966 * b as f64) / 255.0;
+                    let got = out[row * w + x];
+                    let d = (got as f64 - want).abs().round() as u8;
+                    worst = worst.max(d);
+                    assert!(
+                        d <= tol,
+                        "{label} ({x}, {row}): Y {got}, the reference gives {want:.2}"
+                    );
+                }
+            }
+            println!("TRUEHDR {label} luma vs the reference: worst {worst} code values");
+            worst
+        };
+
+        // Mid-grey: Y 126, no chroma. One frame, nothing before it.
+        let mut grey = vec![128u8; w * h * 3 / 2];
+        grey[..w * h].fill(126);
+        let person = bgr_to_nv12(&synthetic_person(), w, h);
+        src.upload_packed(&grey).unwrap();
+        hdr.process(gpu, &src.frame(), &dst.frame())
+            .unwrap_or_else(|e| panic!("TrueHDR frame failed: {e}"));
+        stream.synchronize().unwrap();
+        let out = dst.download_packed().unwrap();
+        assert_eq!(
+            src.download_packed().unwrap(),
+            grey,
+            "the source was written"
+        );
+        let (y, u, v) = centre_yuv(&out);
+        println!("TRUEHDR mid-grey: Y {y:.2} U {u:.2} V {v:.2} (in: 126, 128, 128)");
+        assert!((y - 126.0).abs() < 8.0, "mid-grey moved to Y {y:.2}");
+        assert!(
+            (u - 128.0).abs() < 4.0 && (v - 128.0).abs() < 4.0,
+            "grey got a tint"
+        );
+        let grey_words = hdr_words(&hdr);
+        // A grey frame stays grey in the HDR image.
+        for &p in grey_words.iter().step_by(997) {
+            let [r, g, b, _] = pq_to_sdr(p, tm);
+            assert!(r.abs_diff(g) <= 2 && g.abs_diff(b) <= 2, "{r} {g} {b}");
+        }
+        check("grey", &out, &grey_words, 2);
+
+        // The person, once, right after: its output is the tone map of its
+        // own image, which is neither the grey's nor empty.
+        src.upload_packed(&person).unwrap();
+        hdr.process(gpu, &src.frame(), &dst.frame())
+            .unwrap_or_else(|e| panic!("TrueHDR frame failed: {e}"));
+        stream.synchronize().unwrap();
+        let out = dst.download_packed().unwrap();
+        let person_words = hdr_words(&hdr);
+        let moved = person_words
+            .iter()
+            .zip(&grey_words)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            moved > w * h / 2,
+            "the person's HDR image is the grey's at {} of {} pixels",
+            w * h - moved,
+            w * h
+        );
+        assert!(
+            person_words.iter().any(|&p| p & 0x3FFF_FFFF != 0),
+            "the person's HDR image is black"
+        );
+        check("person", &out, &person_words, 3);
+        // Its output is a picture, not one flat grey: the head (centre,
+        // upper third) and the shoulders (centre, bottom) differ.
+        let (head, shoulders) = (
+            out[(h * 38 / 100) * w + w / 2],
+            out[(h * 9 / 10) * w + w / 2],
+        );
+        assert!(
+            head.abs_diff(shoulders) > 40,
+            "head Y {head}, shoulders Y {shoulders}"
+        );
+
+        // In place, on a picture: processed, not the input.
+        src.upload_packed(&person).unwrap();
+        hdr.process(gpu, &src.frame(), &src.frame()).unwrap();
+        stream.synchronize().unwrap();
+        let looked = src.download_packed().unwrap();
+        assert_ne!(looked, person, "the HDR look changed nothing");
+        let apart: f64 = looked
+            .iter()
+            .zip(&out)
+            .map(|(a, b)| a.abs_diff(*b) as f64)
+            .sum::<f64>()
+            / looked.len() as f64;
+        assert!(
+            apart < 0.5,
+            "in place differs from out of place by {apart:.3}"
+        );
+        let diff: f64 = looked[..w * h]
+            .iter()
+            .zip(&person[..w * h])
+            .map(|(a, b)| a.abs_diff(*b) as f64)
+            .sum::<f64>()
+            / (w * h) as f64;
+        println!("TRUEHDR person: mean luma difference {diff:.2}");
+        assert!(
+            diff < 20.0,
+            "the look moved the picture by {diff:.2} on average"
+        );
+
+        // A forced run failure is a run error, and the next frame runs.
+        switch.set(Some(TrueHdrFault::Run));
+        let e = hdr.process(gpu, &src.frame(), &dst.frame()).unwrap_err();
+        assert!(matches!(e, BackendError::Run { .. }), "{e}");
+        switch.set(None);
+        hdr.process(gpu, &src.frame(), &dst.frame()).unwrap();
+        stream.synchronize().unwrap();
+
+        // Misuse.
+        let other = Stream::new(true).unwrap();
+        let elsewhere = GpuContext {
+            context: gpu.context,
+            stream: other.raw(),
+        };
+        let e = hdr
+            .process(&elsewhere, &src.frame(), &dst.frame())
+            .unwrap_err();
+        assert!(matches!(e, BackendError::InvalidInput(_)), "{e}");
+        let small = DeviceNv12Buffer::alloc(W / 2, H / 2).unwrap();
+        let e = hdr.process(gpu, &src.frame(), &small.frame()).unwrap_err();
+        assert!(matches!(e, BackendError::InvalidInput(_)), "{e}");
+        hdr.unload();
+        assert!(!hdr.is_loaded() && hdr.hdr_image().is_none());
+    });
 }

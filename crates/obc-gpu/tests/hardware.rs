@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use obc_backend::ColourSpec;
 use obc_gpu::{
     ContextGuard, DeviceBuffer, DeviceNv12Buffer, Event, GpuError, Lut8, NothingToPark,
-    OwnedContext, ParkOutcome, PinnedHostBuffer, ProcessState, Stream, UnparkOutcome,
+    OwnedContext, ParkOutcome, PinnedHostBuffer, PqToSdr, ProcessState, Stream, UnparkOutcome,
     copy_nv12_async, current_context, download_2d, download_nv12_async, mem_get_info,
     memset_2d_async, park, parked, parked_refusals, primary_context_active, process_state,
     stream_synchronize, unpark, upload_nv12_async,
@@ -274,6 +274,122 @@ fn gpu_lut8_matches_the_host_table_bit_for_bit() {
                 }
             }
         }
+    });
+}
+
+/// The HDR tone map on the GPU against its Rust reference
+/// (`obc_gpu::tonemap::pq_to_sdr`): every grey code, and pseudo-random
+/// colours, at TrueHDR's default peak and a lower one, within one code value
+/// per channel, alpha 255, the pitch padding never written.
+#[test]
+#[ignore = "needs an NVIDIA GPU"]
+fn gpu_pq_to_sdr_matches_the_rust_reference_within_one_code_value() {
+    use obc_gpu::tonemap::{DIFFUSE_GAIN, ToneMap, pack_rgb10a2, pq_to_sdr};
+    in_created_context(|stream| {
+        let kernel = PqToSdr::load().expect("the embedded PTX loads");
+        // 1029 is not a multiple of the block row and 37 rows end in a
+        // partial block; row 0 holds every grey code.
+        let (w, h) = (1029usize, 37usize);
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut code = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 1024) as u16
+        };
+        let words: Vec<u32> = (0..w * h)
+            .map(|i| {
+                if i < w {
+                    let c = (i % 1024) as u16;
+                    pack_rgb10a2(c, c, c, 3)
+                } else {
+                    pack_rgb10a2(code(), code(), code(), 3)
+                }
+            })
+            .collect();
+        let bytes: Vec<u8> = words.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let src = DeviceBuffer::alloc_pitch(w * 4, h).unwrap();
+        let dst = DeviceBuffer::alloc_pitch(w * 4, h).unwrap();
+        src.upload(&bytes, w * 4).unwrap();
+        for peak in [650.0f32, 400.0] {
+            let tm = ToneMap::new(DIFFUSE_GAIN, peak).unwrap();
+            // SAFETY: our own allocations, full pitch, on this context.
+            unsafe {
+                memset_2d_async(
+                    dst.ptr(),
+                    dst.pitch(),
+                    SENTINEL,
+                    dst.pitch(),
+                    h,
+                    stream.raw(),
+                )
+                .unwrap();
+                stream_synchronize(std::ptr::null_mut()).unwrap();
+                kernel
+                    .launch(
+                        src.ptr(),
+                        src.pitch(),
+                        dst.ptr(),
+                        dst.pitch(),
+                        w as u32,
+                        h as u32,
+                        tm,
+                        stream.raw(),
+                    )
+                    .unwrap();
+            }
+            stream.synchronize().unwrap();
+            let pitch = dst.pitch();
+            let mut out = vec![0u8; pitch * h];
+            // SAFETY: the whole pitched rectangle lies inside our allocation.
+            unsafe { download_2d(dst.ptr(), pitch, &mut out, pitch, pitch, h) }.unwrap();
+            let (mut exact, mut off_by_one) = (0usize, 0usize);
+            for y in 0..h {
+                for x in 0..w {
+                    let want = pq_to_sdr(words[y * w + x], tm);
+                    let got = &out[y * pitch + x * 4..y * pitch + x * 4 + 4];
+                    assert_eq!(got[3], 255, "alpha at ({x}, {y})");
+                    for c in 0..3 {
+                        let d = got[c].abs_diff(want[c]);
+                        assert!(
+                            d <= 1,
+                            "peak {peak}: ({x}, {y}) channel {c}: GPU {} reference {} for {:#010x}",
+                            got[c],
+                            want[c],
+                            words[y * w + x]
+                        );
+                        if d == 0 {
+                            exact += 1;
+                        } else {
+                            off_by_one += 1;
+                        }
+                    }
+                }
+                assert!(
+                    out[y * pitch + w * 4..(y + 1) * pitch]
+                        .iter()
+                        .all(|&b| b == SENTINEL),
+                    "the kernel wrote the padding of row {y}"
+                );
+            }
+            println!("PQ_TO_SDR peak {peak}: {exact} channels exact, {off_by_one} one code apart");
+        }
+        // A bad geometry is refused before any launch.
+        // SAFETY: refused before the launch.
+        let e = unsafe {
+            kernel.launch(
+                src.ptr(),
+                16,
+                dst.ptr(),
+                dst.pitch(),
+                w as u32,
+                1,
+                ToneMap::new(DIFFUSE_GAIN, 650.0).unwrap(),
+                stream.raw(),
+            )
+        }
+        .unwrap_err();
+        assert!(matches!(e, GpuError::InvalidArgument(_)), "{e}");
     });
 }
 

@@ -1234,7 +1234,9 @@ pub mod testing {
             {"id":"effect.video.denoise","label":"Noise removal","type":"bool","default":false,
              "stage":"denoise","role":"enable","hint":"switch"},
             {"id":"effect.video.enhance","label":"Enhance low-resolution camera","type":"bool",
-             "default":false,"stage":"enhance","role":"enable","hint":"switch"}]},
+             "default":false,"stage":"enhance","role":"enable","hint":"switch"},
+            {"id":"effect.video.hdr","label":"HDR look","type":"bool","default":false,
+             "stage":"hdr","role":"enable","hint":"switch"}]},
         {"id":"lighting","label":"Lighting","settings":[
             {"id":"effect.lighting.relight","label":"Relighting","type":"bool","default":false,
              "stage":"relight","role":"enable","hint":"switch"},
@@ -1318,14 +1320,14 @@ pub mod testing {
     pub fn maxine_settings() -> SettingsDescription {
         settings(
             MAXINE_SETTINGS,
-            &["enhance", "denoise", "background", "relight"],
+            &["enhance", "denoise", "background", "relight", "hdr"],
         )
     }
 
     /// The Maxine module opened, its stages available but those of
     /// `unavailable` (stage, reason).
     pub fn maxine_opened(unavailable: &[(&str, &str)]) -> OpenedModule {
-        let stages = ["enhance", "denoise", "background", "relight"]
+        let stages = ["enhance", "denoise", "background", "relight", "hdr"]
             .into_iter()
             .map(|s| {
                 let a = unavailable
@@ -1382,7 +1384,7 @@ mod tests {
     use obc_pipeline::effect::StageId;
 
     use super::testing::{maxine, maxine_entry, maxine_opened, modules};
-    use super::{MAXINE_MODULE, REASON_DISABLED, REASON_NOT_INSTALLED};
+    use super::{MAXINE_MODULE, Placement, REASON_DISABLED, REASON_NOT_INSTALLED};
 
     const NAME: &str = "NVIDIA Maxine video effects";
 
@@ -1449,6 +1451,37 @@ mod tests {
         assert!(!name.contains(['\n', '\u{202E}']), "{name:?}");
         assert!(name.len() <= super::NAME_MAX, "{}", name.len());
         assert_eq!(reason, "no model");
+    }
+
+    /// The HDR look of the module that runs the cut-out is one of the
+    /// effect element's stages, last of the order; frame generation is in
+    /// no order and runs as a chain of its own after it.
+    #[test]
+    fn the_hdr_look_runs_in_the_effect_element_before_frame_generation() {
+        use obc_pipeline::effect::Availability;
+        let mut opened = maxine_opened(&[]);
+        opened.stages.push((
+            StageId::new("frame-generation").unwrap(),
+            Availability::Installed,
+        ));
+        let m = modules(vec![(maxine_entry(), Ok(opened))]);
+        let order: Vec<String> = m.order().iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            order,
+            ["enhance", "denoise", "background", "relight", "hdr"]
+        );
+        let mut plan = m.plan();
+        let ids: Vec<&str> = plan.effect_stages.iter().map(|s| s.as_str()).collect();
+        assert_eq!(ids, ["denoise", "relight", "hdr"]);
+        assert!(plan.chains.is_empty(), "nothing outside the effect element");
+        assert!(m.add_frame_generation(&mut plan));
+        let chains: Vec<Vec<&str>> = plan
+            .chains
+            .iter()
+            .map(|c| c.stages.iter().map(|s| s.as_str()).collect())
+            .collect();
+        assert_eq!(chains, [["frame-generation"]]);
+        assert_eq!(plan.chains[0].placement, Placement::AfterEffect);
     }
 
     #[test]

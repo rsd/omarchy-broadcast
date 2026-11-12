@@ -8087,6 +8087,7 @@ fn the_maxine_module_offers_the_groups_and_stages_of_revision_8() {
             ("denoise", "pre-matte", true),
             ("background", "matte", true),
             ("relight", "post-matte", true),
+            ("hdr", "post-composite", true),
             // The manifest declares it; the fake's probe does not offer it.
             ("frame-generation", "post-composite", false)
         ]
@@ -8104,7 +8105,8 @@ fn the_maxine_module_offers_the_groups_and_stages_of_revision_8() {
         Some(MAXINE_MODULE)
     );
     let ids: Vec<&str> = params.effect.stages.iter().map(|s| s.id.as_str()).collect();
-    assert_eq!(ids, ["denoise", "relight"]);
+    // The HDR look runs in the effect element too, after the others.
+    assert_eq!(ids, ["denoise", "relight", "hdr"]);
     assert!(params.effect.chains.is_empty());
     // Its configuration: the module's table, the revision-8 SDK root
     // alias, and the GPU's compute capability when known.
@@ -8419,12 +8421,17 @@ fn the_stage_order_is_validated_kept_and_reset() {
     let mut h = H::new("", |_| {});
     assert_eq!(
         h.ctrl.order_ids(),
-        ["enhance", "denoise", "background", "relight"]
+        ["enhance", "denoise", "background", "relight", "hdr"]
     );
     let order = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let e = h
         .call(
-            |r| Command::SetStageOrder(order(&["enhance", "relight", "denoise", "background"]), r),
+            |r| {
+                Command::SetStageOrder(
+                    order(&["enhance", "relight", "denoise", "background", "hdr"]),
+                    r,
+                )
+            },
             0,
         )
         .unwrap_err();
@@ -8437,26 +8444,31 @@ fn the_stage_order_is_validated_kept_and_reset() {
         .unwrap_err();
     assert!(e.message().contains("leaves out"), "{e:?}");
     h.call(
-        |r| Command::SetStageOrder(order(&["denoise", "enhance", "background", "relight"]), r),
+        |r| {
+            Command::SetStageOrder(
+                order(&["denoise", "enhance", "background", "relight", "hdr"]),
+                r,
+            )
+        },
         0,
     )
     .unwrap();
     assert_eq!(
         h.ctrl.order_ids(),
-        ["denoise", "enhance", "background", "relight"]
+        ["denoise", "enhance", "background", "relight", "hdr"]
     );
     assert!(h.managed_key("modules.order").is_some());
     assert!(h.persisted().modules.is_empty(), "not in the state file");
     h.restart();
     assert_eq!(
         h.ctrl.order_ids(),
-        ["denoise", "enhance", "background", "relight"]
+        ["denoise", "enhance", "background", "relight", "hdr"]
     );
     h.call(|r| Command::SetStageOrder(Vec::new(), r), 0)
         .unwrap();
     assert_eq!(
         h.ctrl.order_ids(),
-        ["enhance", "denoise", "background", "relight"]
+        ["enhance", "denoise", "background", "relight", "hdr"]
     );
     assert_eq!(h.managed_key("modules.order"), None);
 }
@@ -8470,7 +8482,7 @@ fn a_stored_order_that_no_longer_fits_falls_back_to_the_default() {
     h.restart();
     assert_eq!(
         h.ctrl.order_ids(),
-        ["enhance", "denoise", "background", "relight"]
+        ["enhance", "denoise", "background", "relight", "hdr"]
     );
 }
 
@@ -8541,7 +8553,12 @@ fn the_profile_and_pins_are_reported_in_the_module_list() {
     moved(&mut h, "unpinned");
     let order = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     h.call(
-        |r| Command::SetStageOrder(order(&["denoise", "enhance", "background", "relight"]), r),
+        |r| {
+            Command::SetStageOrder(
+                order(&["denoise", "enhance", "background", "relight", "hdr"]),
+                r,
+            )
+        },
         0,
     )
     .unwrap();
@@ -9015,8 +9032,8 @@ fn the_order_moves_are_those_the_order_check_accepts() {
     let mut h = H::new("", |_| {});
     let moves = h.ask(Command::GetStageOrderMoves).unwrap();
     let ids: Vec<&str> = moves.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(ids, ["enhance", "denoise", "background", "relight"]);
-    assert!(!moves[0].up && !moves[3].down, "no neighbour");
+    assert_eq!(ids, ["enhance", "denoise", "background", "relight", "hdr"]);
+    assert!(!moves[0].up && !moves[4].down, "no neighbour");
     // enhance and denoise may swap (an order the method accepts).
     assert!(moves[0].down && moves[1].up);
     assert_eq!(moves[2].slot, "matte");
@@ -9096,11 +9113,11 @@ fn no_order_move_is_offered_when_a_later_file_sets_the_order() {
     assert!(moves.iter().any(|m| m.up || m.down));
     h.write_drop_in(
         "90-local.toml",
-        "[modules]\norder = [\"enhance\", \"denoise\", \"background\", \"relight\"]\n",
+        "[modules]\norder = [\"enhance\", \"denoise\", \"background\", \"relight\", \"hdr\"]\n",
     );
     h.call(|r| Command::ReloadConfig(Some(r)), 0).unwrap();
     let moves = h.ask(Command::GetStageOrderMoves).unwrap();
-    assert_eq!(moves.len(), 4);
+    assert_eq!(moves.len(), 5);
     assert!(moves.iter().all(|m| !m.up && !m.down), "{moves:?}");
     // As SetStageOrder refuses every order.
     let mut o = h.ctrl.order_ids();

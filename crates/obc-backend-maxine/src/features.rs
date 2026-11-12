@@ -42,11 +42,13 @@ pub enum Feature {
     Upscale,
     /// Video frame generation (frames interpolated between two inputs).
     VideoFrameGeneration,
+    /// TrueHDR: SDR to HDR (PQ, BT.2020) inverse tone mapping.
+    TrueHdr,
 }
 
 impl Feature {
     /// Every feature, in declaration order.
-    pub const ALL: [Feature; 7] = [
+    pub const ALL: [Feature; 8] = [
         Feature::GreenScreen,
         Feature::BackgroundBlur,
         Feature::Denoise,
@@ -54,6 +56,7 @@ impl Feature {
         Feature::VideoSuperResolution,
         Feature::Upscale,
         Feature::VideoFrameGeneration,
+        Feature::TrueHdr,
     ];
 
     /// A stable lower-case name for logs and interfaces.
@@ -66,6 +69,7 @@ impl Feature {
             Feature::VideoSuperResolution => "video-super-resolution",
             Feature::Upscale => "upscale",
             Feature::VideoFrameGeneration => "video-frame-generation",
+            Feature::TrueHdr => "true-hdr",
         }
     }
 }
@@ -167,6 +171,7 @@ fn spec(feature: Feature) -> Spec {
             "libnvVFXVideoFrameGeneration.so",
             &[][..],
         ),
+        Feature::TrueHdr => ("nvvfxtruehdr", "libnvVFXTrueHDR.so", &[][..]),
     };
     Spec {
         dir,
@@ -311,7 +316,8 @@ mod tests {
                 "relighting",
                 "video-super-resolution",
                 "upscale",
-                "video-frame-generation"
+                "video-frame-generation",
+                "true-hdr"
             ]
         );
         assert_eq!(Feature::Relighting.to_string(), "relighting");
@@ -376,6 +382,7 @@ mod tests {
             Feature::VideoSuperResolution,
             Feature::Upscale,
             Feature::VideoFrameGeneration,
+            Feature::TrueHdr,
         ] {
             assert!(of(&all, f).is_installed(), "{f}");
         }
@@ -477,7 +484,8 @@ mod tests {
                 "nvvfxrelighting",
                 "nvvfxvideosuperres",
                 "nvvfxupscale",
-                "nvvfxvideoframegeneration"
+                "nvvfxvideoframegeneration",
+                "nvvfxtruehdr"
             ]
         );
     }

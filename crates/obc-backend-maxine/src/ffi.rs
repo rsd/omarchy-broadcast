@@ -43,10 +43,14 @@ pub(crate) const NVCV_A: i32 = 2;
 pub(crate) const NVCV_RGB: i32 = 4;
 pub(crate) const NVCV_BGR: i32 = 5;
 pub(crate) const NVCV_YUV420: i32 = 10;
+// Packed R10G10B10A2 (with `NVCV_P32`).
+pub(crate) const NVCV_RGB10A2: i32 = 13;
 // `NvCVImage_ComponentType`: unsigned 8-bit.
 pub(crate) const NVCV_U8: i32 = 1;
 // `NvCVImage_ComponentType`: 32-bit float.
 pub(crate) const NVCV_F32: i32 = 7;
+// `NvCVImage_ComponentType`: one packed 32-bit word per pixel.
+pub(crate) const NVCV_P32: i32 = 11;
 // Layout: interleaved components.
 pub(crate) const NVCV_CHUNKY: u32 = 0;
 /// `NvCVImage_Alloc` alignment 1: rows exactly `width * pixel bytes` apart

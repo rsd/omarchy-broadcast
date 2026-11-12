@@ -15,6 +15,7 @@
 //! | `denoise` | pre-matte | noise removal |
 //! | `background` | matte | the cut-out, and the blur or the replacement of the background |
 //! | `relight` | post-matte, needs the matte | relighting of the person |
+//! | `hdr` | post-composite | the HDR look: NVIDIA TrueHDR, tone-mapped back to SDR |
 //! | `frame-generation` | post-composite, last | a frame between two camera frames, for an output at twice the camera rate |
 //!
 //! A chain of `background`, `denoise` and `relight` is the Maxine effect
@@ -48,6 +49,21 @@
 //! is dropped (a stage failure) and the rest of the chain runs on every
 //! frame, repeats included, as without it.
 //!
+//! The `hdr` stage (the `TrueHDR` effect, [`obc_backend_maxine::truehdr`])
+//! runs after the other stages of its chain (any of the effect stages, or
+//! alone), before frame generation, on NV12 frames of one size: the frame
+//! goes to RGBA, through TrueHDR into a 10-bit image (PQ, BT.2020), and
+//! back to 8 bits through a tone map that keeps the mid-tones at their SDR
+//! level ([`obc_gpu::tonemap`]), so an SDR output shows what the HDR pass
+//! changed. The effect runs at its default parameters. It runs on every frame it gets, repeats included, holding
+//! nothing: a repeat is the camera frame again, and the other stages of its
+//! chain made it afresh (with, say, a new cut-out), so the look is made
+//! afresh too; the effect element caches the repeats it sends itself.
+//! Under frame generation a repeat runs no stage, the HDR look included
+//! ([`framegen`]). Its one setting is its switch ([`HDR_LOOK`]). It is not part of the
+//! cut-out: when it fails to load, or on a frame, it alone is dropped (a
+//! stage failure) and the rest of the chain runs as without it.
+//!
 //! # Configuration
 //!
 //! The module's configuration table (`[module."br.com.dias.maxine-vfx"]`):
@@ -70,7 +86,7 @@
 //! and a load of a method that is not fails with the reason. Relighting
 //! needs the cut-out of the `background` stage, so it is
 //! unavailable whenever `background` is. Frame generation needs the video
-//! frame generation feature. Without an SDK root to read, nothing can be
+//! frame generation feature, the HDR look the TrueHDR feature. Without an SDK root to read, nothing can be
 //! known, and every stage is reported available.
 //!
 //! The deeper check (the ABI's `check`, run before a stream starts) does
@@ -91,6 +107,7 @@ use obc_backend::{
     EffectKind, FrameParams, GpuContext, HostBgr, InferenceBackend, LoadRequest, Params, StageId,
     StageList, StageTimings, Value as BackendValue,
 };
+use obc_backend_maxine::truehdr::{MaxineTrueHdr, MaxineTrueHdrFactory};
 use obc_backend_maxine::vfg::{MaxineVfg, MaxineVfgFactory};
 use obc_backend_maxine::vsr::{ENHANCE_METHOD, EnhanceMethod, MaxineVsr, MaxineVsrFactory};
 use obc_backend_maxine::{
@@ -105,6 +122,8 @@ use obc_module_sdk::{
 use serde::Deserialize;
 
 pub mod framegen;
+#[cfg(test)]
+mod gpu_tests;
 
 use framegen::{FrameGen, Step};
 
@@ -113,6 +132,8 @@ pub const MODULE_ID: &str = "br.com.dias.maxine-vfx";
 
 /// The stage id of frame generation.
 pub const FRAME_GENERATION: &str = "frame-generation";
+/// The stage id of the HDR look.
+pub const HDR: &str = "hdr";
 
 /// The reason of a stage whose SDK features are not installed.
 pub const REASON_NOT_INSTALLED: &str = "Not installed";
@@ -141,6 +162,8 @@ pub const DENOISE: &str = "effect.video.denoise";
 pub const ENHANCE: &str = "effect.video.enhance";
 /// See [`DENOISE`]: the enhance stage's method ([`ENHANCE_METHOD`]).
 pub const ENHANCE_METHOD_SETTING: &str = "effect.video.enhance_method";
+/// See [`DENOISE`]: the switch of the [`HDR`] stage.
+pub const HDR_LOOK: &str = "effect.video.hdr";
 /// The lighting group's settings.
 pub const RELIGHT: &str = "effect.lighting.relight";
 /// See [`RELIGHT`].
@@ -234,6 +257,12 @@ pub fn settings() -> SettingsDescription {
                     .enabled_when(ENHANCE, Op::Eq, true)
                     .disabled_reason(REASON_TURN_ON_ENHANCE)
                     .hint("segmented"),
+                )
+                .setting(
+                    Setting::bool(HDR_LOOK, "HDR look", false)
+                        .stage(HDR)
+                        .role(Role::Enable)
+                        .hint("switch"),
                 ),
         )
         .group(
@@ -287,8 +316,8 @@ pub fn settings() -> SettingsDescription {
 }
 
 /// The probe of the SDK tree at `root` for a GPU of `compute_capability`
-/// (`None`: any): every stage (those of the effect backend, then
-/// [`FRAME_GENERATION`]), with [`REASON_NOT_INSTALLED`] for those not
+/// (`None`: any): every stage (those of the effect backend, then [`HDR`]
+/// and [`FRAME_GENERATION`]), with [`REASON_NOT_INSTALLED`] for those not
 /// installed, and the detail of each of those (`stage: why`). With no root,
 /// every stage is available (nothing can be known). Reads directories only.
 pub fn probe_root(
@@ -301,7 +330,7 @@ pub fn probe_root(
         for s in STAGES {
             report = report.available(s.as_str());
         }
-        return (report.available(FRAME_GENERATION), details);
+        return (report.available(HDR).available(FRAME_GENERATION), details);
     };
     let features = feature_availability(root, compute_capability);
     let background = stage_availability_of(&features, StageId::BACKGROUND.as_str());
@@ -324,17 +353,23 @@ pub fn probe_root(
             }
         };
     }
-    let framegen = features
-        .iter()
-        .find(|(f, _)| *f == Feature::VideoFrameGeneration)
-        .and_then(|(_, a)| a.reason().map(str::to_string));
-    report = match framegen {
-        None => report.available(FRAME_GENERATION),
-        Some(why) => {
-            details.push(format!("{FRAME_GENERATION}: {why}"));
-            report.unavailable(FRAME_GENERATION, REASON_NOT_INSTALLED)
-        }
-    };
+    // The stages of one feature each.
+    for (stage, feature) in [
+        (HDR, Feature::TrueHdr),
+        (FRAME_GENERATION, Feature::VideoFrameGeneration),
+    ] {
+        let why = features
+            .iter()
+            .find(|(f, _)| *f == feature)
+            .and_then(|(_, a)| a.reason().map(str::to_string));
+        report = match why {
+            None => report.available(stage),
+            Some(why) => {
+                details.push(format!("{stage}: {why}"));
+                report.unavailable(stage, REASON_NOT_INSTALLED)
+            }
+        };
+    }
     (report, details)
 }
 
@@ -343,6 +378,7 @@ pub struct MaxineModule {
     effects: MaxineFactory,
     enhance: MaxineVsrFactory,
     framegen: MaxineVfgFactory,
+    truehdr: MaxineTrueHdrFactory,
     compute_capability: Option<(u32, u32)>,
 }
 
@@ -362,6 +398,7 @@ impl Module for MaxineModule {
         let effects = MaxineFactory::from_env();
         let enhance = MaxineVsrFactory::from_env();
         let framegen = MaxineVfgFactory::from_env();
+        let truehdr = MaxineTrueHdrFactory::from_env();
         match effects.root() {
             Some(r) => log::debug!("the Maxine SDK root is {}", r.display()),
             None => log::debug!("no Maxine SDK root: the library search path is used"),
@@ -370,6 +407,7 @@ impl Module for MaxineModule {
             effects,
             enhance,
             framegen,
+            truehdr,
             compute_capability: config.host.compute_capability,
         })
     }
@@ -395,7 +433,7 @@ impl Module for MaxineModule {
     /// Opens the SDK as the built-in factories' probes did: the effects'
     /// libraries and model directory for `background`, `denoise` and
     /// `relight`, the upscaler's libraries for `enhance`, the SDK's for
-    /// `frame-generation`. No CUDA context, no model.
+    /// `frame-generation` and `hdr`. No CUDA context, no model.
     fn check(&self, stages: &[&str]) -> Result<(), Error> {
         let effect = |s: &&str| {
             [StageId::BACKGROUND, StageId::DENOISE, StageId::RELIGHT]
@@ -410,6 +448,9 @@ impl Module for MaxineModule {
         }
         if stages.contains(&FRAME_GENERATION) {
             self.framegen.probe().map_err(module_error)?;
+        }
+        if stages.contains(&HDR) {
+            self.truehdr.probe().map_err(module_error)?;
         }
         Ok(())
     }
@@ -427,6 +468,9 @@ impl Module for MaxineModule {
             vfg: None,
             vfg_in_chain: false,
             fg: FrameGen::default(),
+            truehdr: self.truehdr.clone(),
+            hdr: None,
+            hdr_in_chain: false,
         })
     }
 }
@@ -439,8 +483,9 @@ enum Chain {
     Effect(Box<MaxineBackend>),
     /// The upscaler (loaded or not).
     Enhance(Box<MaxineVsr>),
-    /// No stage but frame generation is loaded.
-    FrameGenOnly,
+    /// No stage but frame generation or the HDR look is loaded: the frame
+    /// goes to them as it came.
+    Passthrough,
 }
 
 /// One chain of the module's stages.
@@ -463,6 +508,11 @@ pub struct MaxineInstance {
     vfg_in_chain: bool,
     /// What frame generation holds.
     fg: FrameGen,
+    truehdr: MaxineTrueHdrFactory,
+    /// The HDR look, once one was loaded.
+    hdr: Option<MaxineTrueHdr>,
+    /// The HDR look is in the loaded chain (`hdr` is loaded).
+    hdr_in_chain: bool,
 }
 
 /// The module's error for a backend's.
@@ -481,6 +531,12 @@ fn module_error(e: BackendError) -> Error {
 /// generation alone fails, and the rest of the chain goes on without it.
 fn framegen_error(e: BackendError) -> Error {
     Error::stage(FRAME_GENERATION, e.to_string())
+}
+
+/// The stage error of the HDR look for a backend's error: the HDR look
+/// alone fails, and the rest of the chain goes on without it.
+fn hdr_error(e: BackendError) -> Error {
+    Error::stage(HDR, e.to_string())
 }
 
 fn value(v: &Value<'_>) -> BackendValue {
@@ -608,13 +664,14 @@ fn host_bgr(f: &Frame<'_>) -> Result<HostBgr, Error> {
 
 /// The load-time parameters of the effect backend's stages from the
 /// request's: each stage's by key, the `background` stage's but its
-/// `mode` (which is the effect), none of frame generation's. A `chair`
+/// `mode` (which is the effect), none of frame generation's or the HDR
+/// look's. A `chair`
 /// that is not a boolean is refused: it is the matte's, which never fails
 /// open.
 fn effect_params(params: &[Param<'_>]) -> Result<BTreeMap<StageId, Params>, Error> {
     let mut out: BTreeMap<StageId, Params> = BTreeMap::new();
     for p in params {
-        if p.stage == FRAME_GENERATION {
+        if p.stage == FRAME_GENERATION || p.stage == HDR {
             continue;
         }
         if p.stage == StageId::BACKGROUND.as_str() {
@@ -893,16 +950,89 @@ impl MaxineInstance {
         )))
     }
 
+    /// Loads the HDR look for the request's frames, unless the loaded one
+    /// already fits them, as [`Self::load_framegen`]: changes nothing of
+    /// the instance. Every failure is the stage's.
+    fn load_hdr(
+        &self,
+        req: &ChainRequest<'_>,
+        gpu: GpuContext,
+    ) -> Result<Option<(MaxineTrueHdr, LoadReport)>, Error> {
+        if req.input_format() != PixelFormat::Nv12
+            || req.output_format() != PixelFormat::Nv12
+            || req.input_size() != req.output_size()
+        {
+            return Err(Error::stage(
+                HDR,
+                "the HDR look runs on NV12 frames, in place of the same size",
+            ));
+        }
+        let (width, height) = req.input_size();
+        let colour = colour(req).map_err(|e| Error::stage(HDR, e.wire_message()))?;
+        if self
+            .hdr
+            .as_ref()
+            .is_some_and(|h| h.is_loaded_for(&gpu, width, height, colour))
+        {
+            return Ok(None);
+        }
+        let mut hdr = self.truehdr.create_truehdr().map_err(hdr_error)?;
+        let report = hdr.load(&gpu, width, height, colour).map_err(hdr_error)?;
+        Ok(Some((
+            hdr,
+            LoadReport {
+                load_ms: report.load_ms as f32,
+                warmup_ms: None,
+                reused_model: false,
+            },
+        )))
+    }
+
     fn unload_chain(&mut self) {
         match &mut self.chain {
-            Chain::Empty | Chain::FrameGenOnly => {}
+            Chain::Empty | Chain::Passthrough => {}
             Chain::Effect(b) => b.unload(),
             Chain::Enhance(v) => v.unload(),
         }
     }
 
-    /// Runs the chain but frame generation on one frame.
+    /// Runs the chain but frame generation on one frame: the other stages,
+    /// then the HDR look when it is in the chain, on every frame (repeats
+    /// included). A failure of the HDR look drops it from the chain; the
+    /// output then holds what the other stages wrote (or what the look had
+    /// written of it), and the host runs the frame again without it.
     fn process_stages(
+        &mut self,
+        gpu: &GpuContext,
+        input: &Frame<'_>,
+        output: &Frame<'_>,
+    ) -> Result<(), Error> {
+        if !self.hdr_in_chain {
+            return self.process_others(gpu, input, output);
+        }
+        let dst = device_nv12(output)?;
+        let src = if matches!(self.chain, Chain::Passthrough) {
+            // Without another stage the HDR look reads the input itself.
+            device_nv12(input)?
+        } else {
+            self.process_others(gpu, input, output)?;
+            dst
+        };
+        let look = self
+            .hdr
+            .as_mut()
+            .ok_or_else(|| Error::state("the HDR look is not loaded"))?;
+        if let Err(e) = look.process(gpu, &src, &dst) {
+            // The HDR look alone failed: the rest goes on without it.
+            self.hdr_in_chain = false;
+            look.unload();
+            return Err(hdr_error(e));
+        }
+        Ok(())
+    }
+
+    /// Runs the chain but frame generation and the HDR look on one frame.
+    fn process_others(
         &mut self,
         gpu: &GpuContext,
         input: &Frame<'_>,
@@ -922,7 +1052,7 @@ impl MaxineInstance {
             Chain::Enhance(vsr) => vsr
                 .process(gpu, &device_yuv420(input)?, &device_nv12(output)?)
                 .map_err(module_error),
-            Chain::FrameGenOnly => {
+            Chain::Passthrough => {
                 let (src, dst) = (device_nv12(input)?, device_nv12(output)?);
                 if input.same_memory(output) {
                     return Ok(());
@@ -988,26 +1118,33 @@ impl Instance for MaxineInstance {
             ));
         }
         let wants_framegen = req.has_stage(FRAME_GENERATION);
+        let wants_hdr = req.has_stage(HDR);
         let others: Vec<&str> = req
             .stages()
             .iter()
             .copied()
-            .filter(|s| *s != FRAME_GENERATION)
+            .filter(|s| *s != FRAME_GENERATION && *s != HDR)
             .collect();
-        // Frame generation first, so that its failure leaves everything as
-        // it was: the host loads again without it.
+        // Frame generation and the HDR look first, so that a failure of
+        // either leaves everything as it was: the host loads again without
+        // it.
         let framegen = if wants_framegen {
             self.load_framegen(req, gpu)?
         } else {
             None
         };
+        let hdr = if wants_hdr {
+            self.load_hdr(req, gpu)?
+        } else {
+            None
+        };
         let result = if others.is_empty() {
             self.unload_chain();
-            self.chain = Chain::FrameGenOnly;
+            self.chain = Chain::Passthrough;
             Ok(LoadReport {
                 load_ms: 0.0,
                 warmup_ms: None,
-                reused_model: framegen.is_none(),
+                reused_model: framegen.is_none() && hdr.is_none(),
             })
         } else if req.has_stage(StageId::ENHANCE.as_str()) {
             self.load_enhance(req, gpu)
@@ -1031,6 +1168,22 @@ impl Instance for MaxineInstance {
             None => {}
         }
         self.vfg_in_chain = wants_framegen;
+        match hdr {
+            Some((look, report)) => {
+                if let Some(mut old) = self.hdr.replace(look) {
+                    old.unload();
+                }
+                result.load_ms += report.load_ms;
+                result.reused_model = false;
+            }
+            None if !wants_hdr => {
+                if let Some(h) = self.hdr.as_mut() {
+                    h.unload();
+                }
+            }
+            None => {}
+        }
+        self.hdr_in_chain = wants_hdr;
         // A new chain has no previous frame.
         self.fg.reset();
         self.gpu = Some(gpu);
@@ -1071,7 +1224,8 @@ impl Instance for MaxineInstance {
     }
 
     fn reset_temporal(&mut self) -> Result<Vec<String>, Error> {
-        // The next frame has no previous one.
+        // The next frame has no previous one. The HDR look has no temporal
+        // state (`obc_backend_maxine::truehdr`).
         self.fg.reset();
         let (Chain::Effect(backend), Some(gpu)) = (&mut self.chain, &self.gpu) else {
             return Ok(Vec::new());
@@ -1082,7 +1236,7 @@ impl Instance for MaxineInstance {
 
     fn unload(&mut self) {
         self.unload_chain();
-        if matches!(self.chain, Chain::FrameGenOnly) {
+        if matches!(self.chain, Chain::Passthrough) {
             self.chain = Chain::Empty;
         }
         if let Some(v) = self.vfg.as_mut() {
@@ -1090,6 +1244,10 @@ impl Instance for MaxineInstance {
         }
         self.vfg_in_chain = false;
         self.fg.reset();
+        if let Some(h) = self.hdr.as_mut() {
+            h.unload();
+        }
+        self.hdr_in_chain = false;
         self.gpu = None;
         self.live.clear();
         self.blur_strength = FrameParams::default().blur_strength;
@@ -1097,7 +1255,7 @@ impl Instance for MaxineInstance {
 
     fn timings(&self) -> Vec<(String, f32)> {
         match &self.chain {
-            Chain::Empty | Chain::FrameGenOnly => Vec::new(),
+            Chain::Empty | Chain::Passthrough => Vec::new(),
             Chain::Effect(b) => b.timings().map(|t| t.steps().to_vec()).unwrap_or_default(),
             Chain::Enhance(v) => v
                 .timings()
@@ -1138,7 +1296,9 @@ mod tests {
                  "options":[["ai","AI super resolution"],["fast","Fast upscale (lower power)"]],
                  "default":"ai","stage":"enhance","key":"method","apply":"reload",
                  "enabled_when":[["effect.video.enhance","eq",true]],
-                 "disabled_reason":"Turn on enhancement to change this","hint":"segmented"}]},
+                 "disabled_reason":"Turn on enhancement to change this","hint":"segmented"},
+                {"id":"effect.video.hdr","label":"HDR look","type":"bool","default":false,
+                 "stage":"hdr","role":"enable","hint":"switch"}]},
             {"id":"lighting","label":"Lighting","settings":[
                 {"id":"effect.lighting.relight","label":"Relighting","type":"bool","default":false,
                  "stage":"relight","role":"enable","hint":"switch"},
@@ -1211,6 +1371,7 @@ mod tests {
             param("background", "chair", Value::Bool(true)),
             param("relight", "light", Value::Str("warm")),
             param(FRAME_GENERATION, "x", Value::Int(1)),
+            param(HDR, "x", Value::Int(1)),
         ])
         .unwrap();
         assert_eq!(
@@ -1361,6 +1522,7 @@ mod tests {
         "nvvfxvideoframegeneration",
         "libnvVFXVideoFrameGeneration.so",
     );
+    const TRUEHDR: (&str, &str) = ("nvvfxtruehdr", "libnvVFXTrueHDR.so");
     const SM120: &[&str] = &[
         "AIGS_288x512_120_m0.engine.trtpkg",
         "Denoise-agg-120.engine.trtpkg",
@@ -1379,7 +1541,7 @@ mod tests {
     #[test]
     fn the_probe_reads_the_sdk_tree() {
         let full = tree(
-            &[GREEN_SCREEN, BLUR, DENOISING, RELIGHTING, VSR, VFG],
+            &[GREEN_SCREEN, BLUR, DENOISING, RELIGHTING, VSR, VFG, TRUEHDR],
             SM120,
         );
         let (r, details) = probe_root(Some(full.path()), Some((12, 0)));
@@ -1393,6 +1555,7 @@ mod tests {
                 "denoise",
                 "relight",
                 "enhance",
+                "hdr",
                 "frame-generation"
             ]
         );
@@ -1408,6 +1571,7 @@ mod tests {
                 ("denoise".into(), false, not.clone()),
                 ("relight".into(), false, not.clone()),
                 ("enhance".into(), true, None),
+                ("hdr".into(), true, None),
                 ("frame-generation".into(), true, None),
             ]
         );
@@ -1424,6 +1588,7 @@ mod tests {
                 ("denoise".into(), true, None),
                 ("relight".into(), false, not.clone()),
                 ("enhance".into(), false, not.clone()),
+                ("hdr".into(), false, not.clone()),
                 ("frame-generation".into(), false, not),
             ]
         );
@@ -1455,8 +1620,9 @@ mod tests {
             [
                 ("background".into(), false, not.clone()),
                 ("denoise".into(), true, None),
-                ("relight".into(), false, not),
+                ("relight".into(), false, not.clone()),
                 ("enhance".into(), true, None),
+                ("hdr".into(), false, not),
                 ("frame-generation".into(), true, None),
             ]
         );
@@ -1490,7 +1656,7 @@ mod tests {
     #[test]
     fn without_a_root_nothing_is_known_and_every_stage_is_offered() {
         let (r, details) = probe_root(None, None);
-        assert_eq!(r.stages.len(), 5);
+        assert_eq!(r.stages.len(), 6);
         assert!(r.stages.iter().all(|s| s.available));
         assert!(details.is_empty());
     }
@@ -1555,5 +1721,38 @@ mod tests {
             assert!(has(&format!("id = \"{s}\"")), "{s}");
         }
         assert!(has(&format!("id = \"{FRAME_GENERATION}\"")));
+        assert!(has(&format!("id = \"{HDR}\"")));
+    }
+
+    #[test]
+    fn the_hdr_look_is_offered_with_the_truehdr_feature_alone() {
+        let not = Some(REASON_NOT_INSTALLED.to_string());
+        let hdr_of = |t: &tempfile::TempDir| {
+            let (r, details) = probe_root(Some(t.path()), Some((12, 0)));
+            let a = reasons(&r)
+                .into_iter()
+                .find(|(id, _, _)| id == HDR)
+                .unwrap();
+            (a, details)
+        };
+        // TrueHDR ships no model: its library is enough, whatever GPU.
+        let only = tree(&[TRUEHDR], &[]);
+        let (a, details) = hdr_of(&only);
+        assert_eq!(a, (HDR.into(), true, None));
+        assert!(
+            !details.iter().any(|d| d.starts_with("hdr:")),
+            "{details:?}"
+        );
+        let (r, _) = probe_root(Some(only.path()), Some((7, 5)));
+        assert!(r.stages.iter().any(|s| s.id == HDR && s.available));
+        // Without it: not installed, the library named in the details.
+        let without = tree(&[GREEN_SCREEN, BLUR, DENOISING, VFG], SM120);
+        let (a, details) = hdr_of(&without);
+        assert_eq!(a, (HDR.into(), false, not));
+        let d = details.iter().find(|d| d.starts_with("hdr: ")).unwrap();
+        assert!(
+            d.contains("nvvfxtruehdr") && d.contains("libnvVFXTrueHDR.so"),
+            "{d}"
+        );
     }
 }

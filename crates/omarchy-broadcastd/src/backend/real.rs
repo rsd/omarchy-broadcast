@@ -1698,8 +1698,8 @@ mod tests {
         assert!(!d.is_enabled("relight") && !d.is_enabled("denoise"));
         assert_eq!(
             d.stages.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
-            ["denoise", "relight"],
-            "both listed, noise removal first"
+            ["denoise", "relight", "hdr"],
+            "all listed, in the stage order"
         );
         let dr = d.stage("relight").unwrap();
         assert_eq!(dr.params.get("light"), Some(&Value::from("neutral")));

@@ -91,7 +91,7 @@ Keys of a `[[stage]]`:
 | Key | Required | Meaning |
 |---|---|---|
 | `id` | yes | The stage id. A lower-case letter followed by up to 31 lower-case letters, digits or `-` (`^[a-z][a-z0-9-]{0,31}$`). Not `status`, `effect`, `reason`, `module`, nor any name ending in `-reason` (those are field names of the daemon's status messages). Stage ids are one namespace across modules: two modules that declare the same id are two providers of that stage. The ids of an `audio-filter` module must start with `mic-` and those of a `video-stage` module must not (`mic-denoise`, `mic-dereverb` and `mic-enhance` are the ones in use) |
-| `slot` | yes | For a video stage, where the stage runs relative to the person's cut-out, in pipeline order: `pre-matte` (on the camera frame, before the cut-out), `matte` (the cut-out itself), `post-matte` (on the person, after the cut-out), `post-composite` (on the finished picture). A stage never comes after a stage of a later slot. For an audio stage the slots are `clean` (removing what is not the voice: noise, room echo) and then `shape` (working on the voice that is left: enhancement, equalisation); a slot of the other kind is an error |
+| `slot` | yes | For a video stage, where the stage runs relative to the person's cut-out, in pipeline order: `pre-matte` (on the camera frame, before the cut-out), `matte` (the cut-out itself), `post-matte` (on the person, after the cut-out), `post-composite` (on the finished picture: the Maxine module's HDR look is one). A stage never comes after a stage of a later slot. For an audio stage the slots are `clean` (removing what is not the voice: noise, room echo) and then `shape` (working on the voice that is left: enhancement, equalisation); a slot of the other kind is an error |
 | `rank` | yes | A non-negative integer. When several modules provide the same stage, the `quality` profile takes the highest rank |
 | `device` | yes | `nvidia-gpu`, `gpu`, `npu` or `cpu`: what the stage runs on. The `battery` profile prefers an NPU, then the CPU, then a GPU, then an NVIDIA GPU, and then the rank |
 | `position` | no | An integer (default 100). Where the stage prefers to sit within its slot in the default order: lower first, then by stage id |
@@ -115,6 +115,21 @@ The stage id `frame-generation` is vendor neutral: any module may provide it, as
 - **What it does with each tick.** A module author follows this contract: on a **fresh** frame, write the frame midway between the previous frame and this one (so the output is one output tick later than the input); on a **repeat** (`OBC_FRAME_FLAG_REPEAT`), write the held current frame; on the first frame after a load or `reset_temporal`, which has no previous frame, write the frame as it is.
 - **It fails open, and alone.** If it cannot load or fails on a frame, only the stage is dropped (`OBC_ERR_STAGE`): the frame goes out as it came, the output repeats frames as before and the daemon's `Warning` says so (`60 fps output repeats frames: no frame generation available`). Nothing else changes.
 - **Choosing it.** The user chooses a rate with `(generated)` in its label for `output.mode` ([dbus-api.md](dbus-api.md#capture-and-output-modes-revision-12)). Those options are offered only while some enabled module provides the stage.
+
+### The Maxine module stages
+
+The Maxine module (`br.com.dias.maxine-vfx`) provides these video stages, in the order the daemon runs them. A stage whose SDK feature is not installed is listed as `unavailable: Not installed` and its setting is greyed. The features are in [setup/maxine.md](setup/maxine.md#1-requirements).
+
+| Stage | Slot | What it does | Setting |
+|---|---|---|---|
+| `enhance` | `pre-matte`, position 0 | Upscales a low-resolution camera, in the ingest | `effect.video.enhance`, `effect.video.enhance_method` |
+| `denoise` | `pre-matte` | Video noise removal | `effect.video.denoise` |
+| `background` | `matte` | The cut-out of the person | `effect.background.*`, `effect.cutout.chair` |
+| `relight` | `post-matte`, needs the cut-out | Relighting of the person | `effect.lighting.*` |
+| `hdr` | `post-composite` | The HDR look: NVIDIA TrueHDR, tone-mapped back to SDR | `effect.video.hdr` |
+| `frame-generation` | `post-composite`, last | The picture between two camera frames, while the output rate is twice the camera's | none (see above) |
+
+**The `post-composite` slot** is the finished picture: the cut-out, the blur or the replacement, and every stage before it are done. The Maxine module has two stages there. `hdr` is the HDR look: it converts the NV12 frame to RGBA, runs NVIDIA's TrueHDR (SDR to HDR10: the PQ transfer, BT.2020 primaries, 10 bits), tone-maps the result back to SDR (PQ decode, a scaling that keeps the mid-tones at their SDR level, the BT.2390 EETF on the luminance to a 100-nit target, BT.2020 to BT.709, a clip and the re-encode) and converts it to NV12, all on the GPU, so every 8-bit output carries the look. It has a switch (off by default) and no other setting, it runs on every frame it receives, and it fails open and alone: a failure drops the stage and the composite goes out ([ADR-0030](adr/0030-hdr-look-and-truehdr.md)). The daemon runs it inside the effect element with the module's other stages, before `frame-generation`.
 
 ## Discovery and installation
 

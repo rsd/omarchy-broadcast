@@ -21,8 +21,10 @@
 //!   lifecycle checks;
 //! * [`OwnedContext`]: a context created with `cuCtxCreate`, as GStreamer's
 //!   CUDA library creates one, for tests;
-//! * [`Lut8`]: the one custom kernel, a byte lookup table over a pitched
-//!   8-bit plane, shipped as PTX and compiled by the driver at load time;
+//! * [`Lut8`] and [`PqToSdr`]: the custom kernels, shipped as PTX and
+//!   compiled by the driver at load time: a byte lookup table over a pitched
+//!   8-bit plane, and the tone map of an HDR (PQ, BT.2020) RGB10A2 image to
+//!   SDR RGBA8 ([`tonemap`]);
 //! * [`park`], [`unpark`], [`parked`]: the driver's checkpoint API on this
 //!   process, so an idle daemon holds no GPU device (module `checkpoint`).
 //!   While parked, every helper here returns [`GpuError::Parked`] instead
@@ -41,6 +43,7 @@ use obc_backend::{BackendError, ColourSpec, DeviceNv12, HostNv12};
 mod checkpoint;
 mod driver;
 mod kernel;
+pub mod tonemap;
 
 pub use checkpoint::{
     NothingToPark, PARK_LOCK_TIMEOUT, ParkError, ParkOutcome, ProcessState, UnparkOutcome, park,
@@ -52,6 +55,7 @@ pub use driver::{
     Driver, driver,
 };
 pub use kernel::{LUT8_BLOCK, LUT8_ENTRY, LUT8_PTX, Lut8};
+pub use tonemap::PqToSdr;
 
 /// A CUDA failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
