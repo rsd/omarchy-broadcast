@@ -35,10 +35,11 @@ exclude = [
 
 [workspace.package]
 # Also the pkgver= of packaging/arch/PKGBUILD: bump both; CI checks they match.
-version = "0.45.0"
+version = "0.45.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Raul Dias"]
+repository = "https://github.com/rsd/omarchy-broadcast"
 rust-version = "1.92"
 
 [workspace.dependencies]
