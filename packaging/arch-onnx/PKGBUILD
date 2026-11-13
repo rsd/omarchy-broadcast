@@ -11,8 +11,8 @@
 # Built from the local git checkout that holds this file (two directories
 # up), as the core is: only committed content is built, and makepkg rewrites
 # pkgver= below on each build (that change need not be committed). The
-# committed pkgver= is the workspace version in Cargo.toml, and CI fails
-# while they differ.
+# committed pkgver= is the workspace version in Cargo.toml, and
+# scripts/check-all.sh fails while they differ.
 #
 # The four model files (about 70 MB, Apache-2.0) are sources of this build,
 # checked by sha256. Until a release host publishes them (_onnx_models_url
@@ -28,7 +28,7 @@
 
 pkgname=omarchy-broadcast-onnx-git
 _pkgname=omarchy-broadcast
-pkgver=0.45.1
+pkgver=0.45.2
 pkgrel=1
 pkgdesc='Open-model cut-out (ONNX Runtime) module for omarchy-broadcast: background blur and replacement'
 arch=('x86_64')

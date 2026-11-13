@@ -96,7 +96,7 @@ systemctl --user enable --now omarchy-broadcastd
 
 `cargo install` of the two crates and a copy of the unit file with `ExecStart=` rewritten: see [docs/setup/daemon.md](docs/setup/daemon.md#install).
 
-The continuous integration (`.github/workflows/ci.yml`) runs the format check, clippy, the workspace tests, the example modules' own format check, clippy and tests (the video and the audio example are built outside the workspace, as third-party modules would be) and shellcheck in an Arch Linux container without a GPU, and a second job that builds, lints and tests `obc-pipeline` and `omarchy-broadcastd` with the PipeWire feature.
+`scripts/check-all.sh` runs every check of the repository in one go and stops at the first failure: the format check, clippy and the workspace tests (with `--locked`); the same three for the video and the audio example module, which are built outside the workspace as third-party modules would be; clippy and the tests of `obc-pipeline` and `omarchy-broadcastd` with the PipeWire feature; that the `pkgver=` of both PKGBUILDs matches the workspace version; and shellcheck over the shell scripts. It needs neither a GPU nor a camera. Besides the Rust toolchain and the packages listed in [docs/testing.md](docs/testing.md), it needs libpipewire, clang and pipewire for the PipeWire build, and either `shellcheck` or `uvx` (which fetches it).
 
 ## Run
 
