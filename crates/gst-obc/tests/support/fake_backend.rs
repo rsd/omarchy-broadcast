@@ -205,6 +205,16 @@ pub struct FakeLog {
     /// Calls of the CUDA methods on an instance loaded on host frames, or
     /// of the host methods on one loaded on CUDA frames.
     pub wrong_memory: AtomicU64,
+    /// For each successful `process` call, the instance that ran it (the
+    /// first created is 1, in the order of [`Self::creates`]).
+    pub processed_by: Mutex<Vec<u64>>,
+    /// Successful loads as (instance, the background stage's load-time
+    /// parameters), in order.
+    pub background_loads: Mutex<Vec<(u64, Params)>>,
+    /// The instances unloaded with a chain loaded, and those dropped, in
+    /// order.
+    pub unloaded_ids: Mutex<Vec<u64>>,
+    pub dropped_ids: Mutex<Vec<u64>>,
 }
 
 impl FakeLog {
@@ -272,8 +282,9 @@ impl BackendFactory for FakeFactory {
 
     fn create(&self) -> Result<Box<dyn InferenceBackend>, BackendError> {
         self.probe()?;
-        self.log.creates.fetch_add(1, Ordering::SeqCst);
+        let id = self.log.creates.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(Box::new(FakeBackend {
+            id,
             config: Arc::clone(&self.config),
             log: Arc::clone(&self.log),
             loaded: None,
@@ -292,6 +303,8 @@ impl BackendFactory for FakeFactory {
 }
 
 pub struct FakeBackend {
+    /// Its number, in the order of creation ([`FakeLog::creates`]).
+    id: u64,
     config: Arc<Mutex<FakeConfig>>,
     log: Arc<FakeLog>,
     loaded: Option<EffectKind>,
@@ -468,6 +481,10 @@ impl FakeBackend {
             req.stages.as_slice().to_vec(),
             light,
         ));
+        self.log.background_loads.lock().unwrap().push((
+            self.id,
+            req.stage_params("background").cloned().unwrap_or_default(),
+        ));
         let ms = t0.elapsed().as_secs_f64() * 1e3;
         Ok(LoadReport {
             load_ms: ms,
@@ -543,6 +560,7 @@ impl FakeBackend {
     /// Counts a frame about to be written (shared by both memories).
     fn count_frame(&self, params: &FrameParams) {
         self.log.processes.fetch_add(1, Ordering::SeqCst);
+        self.log.processed_by.lock().unwrap().push(self.id);
         if self.denoise {
             self.log.denoised.fetch_add(1, Ordering::SeqCst);
         }
@@ -688,6 +706,7 @@ impl InferenceBackend for FakeBackend {
                 self.check_context(self.context as *mut c_void);
             }
             self.log.unloads.fetch_add(1, Ordering::SeqCst);
+            self.log.unloaded_ids.lock().unwrap().push(self.id);
         }
     }
 
@@ -754,5 +773,6 @@ impl Drop for FakeBackend {
             self.check_context(self.context as *mut c_void);
         }
         self.log.drops.fetch_add(1, Ordering::SeqCst);
+        self.log.dropped_ids.lock().unwrap().push(self.id);
     }
 }

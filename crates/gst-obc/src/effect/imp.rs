@@ -16,7 +16,10 @@
 //!   usable for the request is loaded ([`Control::usable`]), so a cold load
 //!   on the worker never blocks it; a switch on the loaded instance blocks
 //!   it for the switch itself: milliseconds between two effects, a stage's
-//!   load when a switch adds it (see below). A frame of a toggle mid-stream
+//!   load when a switch adds it (see below). On system memory a switch of
+//!   the background stage's load-time parameters never blocks it: it loads
+//!   on a second instance outside the lock, and only the swap takes it (see
+//!   "A switch on a second instance" below). A frame of a toggle mid-stream
 //!   (see there) only tries the lock, so it never waits either.
 //!
 //! # A toggle mid-stream, a start, a new source, a failure
@@ -53,6 +56,73 @@
 //! * **A new source** (a camera switch) while the effect is requested and
 //!   not ready holds black from its first frame: the new camera's room was
 //!   never shown.
+//! * **A refused switch** is not a failure. A switch that keeps the effect
+//!   (blur stays blur, replace stays replace) on the same frames (the same
+//!   size, colour and memory), whose load fails while the previous chain
+//!   stays loaded, leaves that chain processing every frame as before: new
+//!   load-time parameters of the background stage, another image of
+//!   replace (one that cannot be read included), a stage turned on or off
+//!   or rebound with them. The seam keeps the previous chain on such a
+//!   failure; on a second instance (below) the loaded one was never
+//!   touched. The reason is the element's `switch_error`
+//!   ([`EffectStats::switch_error`], the status message's `switch-error`),
+//!   and the settings stay as applied: the element never rewrites them.
+//!   When the switch changed the background effect's settings (its
+//!   parameters, replace's still), the refused ones are remembered with
+//!   those in force (`Control::switch_refused`), and the rest of the
+//!   request loads at once against the chain that runs, on the loaded
+//!   instance: a stage turned on loads, one turned off goes. From then on
+//!   every request that still asks for the refused settings loads against
+//!   those in force (`Control::job_request`): a stage turned on, blur to
+//!   replace, a stage rebuilt on a new source load what runs, and the
+//!   refused value is not tried again; it is, when a request changes it
+//!   (the previous value set again finds its chain loaded) and on an
+//!   `apply` with `retry` that changes nothing. The effect's status stays
+//!   (or turns) ready, never failed; a requested stage the chain in force
+//!   has is ready, one it lacks (a stage-only switch refused, or that load
+//!   refused) shows failed with the reason without the failure being
+//!   recorded (it is not dropped). Not a refusal, but the failure: a frame
+//!   of the previous chain that failed meanwhile (the effect's failure
+//!   stands), and a previous chain lost meanwhile (a module that panicked
+//!   on a frame: the frames are black). `switch_error` stays while a job
+//!   loads against the settings in force, and is cleared (with the
+//!   remembered settings) when a later request loads or finds its chain
+//!   loaded with the settings it asks for, on an unload, a failure of the
+//!   effect, a revocation, new caps (a full reload, which loads or fails)
+//!   and a stop. Not refused: a failure of one stage alone on the loaded
+//!   instance (`BackendError::Stage`, the stage rules below), a full load
+//!   (new caps, or nothing loaded), a backend that lost its chain with the
+//!   failure (a module that panicked), and a switch to another effect (blur
+//!   and replace, an effect and `none`): those fail as before.
+//! * **A switch on a second instance.** On system memory, a switch that
+//!   keeps the effect and changes the background stage's load-time
+//!   parameters (a provider's own settings, another model or engine: their
+//!   session start can take seconds) is loaded on a second instance from
+//!   the same factory, on the worker, without the `Engine` lock: the full
+//!   target, stages included. Meanwhile the streaming thread keeps
+//!   processing every frame with the loaded instance, which is not
+//!   touched. Loaded, the new instance takes the old one's place under the
+//!   lock (with its key, the job's revocation count and memory, and the
+//!   load-time still back in force as after any load), the epoch moves, and
+//!   the old instance is unloaded and dropped; the next frame is the new
+//!   chain's. Any failure unloads and drops the new instance and is a
+//!   refused switch (above), a stage's included: the loaded chain is intact
+//!   and the stage may have failed only for want of room for two instances
+//!   (it then loads against the chain in force, where its failure drops
+//!   it). A request superseded meanwhile (a new request, a revocation: its
+//!   new request number, a stop) drops the new instance, unloaded, before
+//!   it is installed, and the next job runs from the loaded one; a
+//!   revocation between that check and the swap leaves an instance of the
+//!   revoked count, which processes no frame (`published_kind`, the effect
+//!   failed) and is dropped first by the next job (`drop_revoked`). Two
+//!   instances of the backend are alive for the duration of the load (an
+//!   ABI module runs calls on two instances concurrently). On CUDA frames
+//!   the switch runs on the loaded instance under the lock, as every other
+//!   switch (see "The stages"): the backend binds the element's one stream
+//!   at load time, and a second instance's load (its warm-up, a CUDA graph
+//!   captured, the stream synchronised) on the stream the streaming thread
+//!   is processing frames on could fail those frames or capture their
+//!   work.
 //! * **A failure** of the effect or of its module takes `on-failure`
 //!   (black, the image, or with `none` the input), whatever was on screen.
 //!   A revoked backend (`ObcEffect::revoke_backend`) is such a failure,
@@ -97,7 +167,11 @@
 //! * Every other change (turning a stage on or off under an effect, a new
 //!   load-time parameter of a stage, blur and replace with stages, an effect
 //!   to `none` with stages) is a switch on the loaded instance, done under
-//!   the `Engine` lock as for blur to replace. The streaming thread waits for
+//!   the `Engine` lock as for blur to replace, except on system memory a
+//!   new value of the background stage's load-time parameters under the
+//!   same effect, which loads on a second instance with every requested
+//!   stage (see "A switch on a second instance" above: no wait, the
+//!   previous chain processing the frames). The streaming thread waits for
 //!   it there; when the switch adds a stage under blur or replace, or goes
 //!   from an effect to `none` with stages, that wait is the stage's load (a
 //!   new load-time parameter costs what the backend says: a relighting
@@ -140,7 +214,10 @@
 //! read after the frame's stream synchronisation (a backend reports a frame
 //! only once its work has completed), under a `try_lock` of `Engine` so the
 //! streaming thread never waits for a load for it: while the worker holds
-//! the lock, that frame's figures are skipped. The backend's status values
+//! the lock, that frame's figures are skipped, and so are those of a frame
+//! whose instance a switch on a second instance replaced before they were
+//! read (`Engine::serial`): never the new instance's warm-up figures for
+//! the old one's frame. The backend's status values
 //! (`InferenceBackend::status_values`, auto-frame's zoom for one) are read
 //! in the same `try_lock` and replace the element's; a skipped frame leaves
 //! them as they were.
@@ -487,6 +564,10 @@ struct Engine {
     kind: Option<FrameKind>,
     /// The video background frames handed to the instance.
     bg: BgState,
+    /// Counts the instances put in place by a switch on a second instance
+    /// ([`load_aside`]): a frame's figures are read only from the instance
+    /// that processed it (see "Timings" in the module docs).
+    serial: u64,
 }
 
 /// What the instance has of the video background (see "The video
@@ -546,6 +627,23 @@ struct Control {
     /// it until settings checked with the factory are applied
     /// ([`ObcEffect::apply_checked`]).
     refused: Option<String>,
+    /// Why the last switch of the same effect was refused, the previous
+    /// chain loaded and running in its place ([`EffectStats::switch_error`];
+    /// see "A refused switch" in the module docs). Cleared by a request
+    /// that loads, or finds its chain loaded; by an unload, a failure of
+    /// the effect, a revocation, new caps and a stop
+    /// ([`Control::clear_switch`]), never by a job loaded against
+    /// [`Control::switch_refused`].
+    switch_error: Option<String>,
+    /// The background effect's load-time settings that the last refused
+    /// switch asked for, and those running in their place, while that
+    /// refusal stands: the worker loads every later request that still asks
+    /// for them against the ones in force ([`Control::job_request`]), so
+    /// that a stage turned on, another effect or a stage rebuilt on a new
+    /// source loads what runs and never tries the refused value again. It
+    /// is tried again when the request changes it, and on an `apply` with
+    /// `retry` that changes nothing.
+    switch_refused: Option<RefusedBackground>,
     stop: bool,
     last_load_ms: Option<f64>,
     last_load_reused: bool,
@@ -620,6 +718,8 @@ impl Default for Control {
             revoked: false,
             revocations: 0,
             refused: None,
+            switch_error: None,
+            switch_refused: None,
             stop: false,
             last_load_ms: None,
             last_load_reused: false,
@@ -686,6 +786,29 @@ impl Control {
     /// Whether a requested stage has a failure recorded.
     fn any_stage_failed(&self) -> bool {
         self.stages.iter().any(|(_, c)| c.failure.is_some())
+    }
+
+    /// What the worker loads for the request ([`Self::job_target`]), with
+    /// the background effect's settings in force in place of refused ones
+    /// the request still asks for ([`Control::switch_refused`]), and
+    /// whether they were put in place.
+    fn job_request(&self) -> (Target, bool) {
+        let target = self.job_target();
+        match self
+            .switch_refused
+            .as_ref()
+            .and_then(|r| r.in_place_of(&target))
+        {
+            Some(t) => (t, true),
+            None => (target, false),
+        }
+    }
+
+    /// Ends a refused switch: its reason and the refused settings
+    /// ([`Control::switch_error`], [`Control::switch_refused`]).
+    fn clear_switch(&mut self) {
+        self.switch_error = None;
+        self.switch_refused = None;
     }
 
     /// What the worker loads for the request: the target without the
@@ -814,6 +937,7 @@ impl Control {
         self.generation += 1;
         self.epoch += 1;
         self.loaded_kind = None;
+        self.clear_switch();
         for s in self.stage_ids() {
             if self.effective(s.as_str()) {
                 self.stage_mut(&s).status = EffectStatus::Failed(NO_BACKEND.into());
@@ -860,6 +984,7 @@ impl Control {
         Report {
             fallback_error: self.fallback.error.clone(),
             background_error: self.video.error.clone(),
+            switch_error: self.switch_error.clone(),
             kind: self.settings.kind,
             status: self.status.clone(),
             stages: self
@@ -868,6 +993,56 @@ impl Control {
                 .map(|(s, c)| (s.clone(), c.status.clone()))
                 .collect(),
         }
+    }
+}
+
+/// The background effect's load-time settings of a refused switch (see "A
+/// refused switch" in the module docs): those the switch asked for, and
+/// those of the chain that runs in their place.
+#[derive(Debug, Clone, PartialEq)]
+struct RefusedBackground {
+    /// The background stage's load-time parameters asked for, and in force.
+    params: (obc_backend::Params, obc_backend::Params),
+    /// Replace's still asked for, and in force (`Target::background`,
+    /// `Target::black_still`).
+    still: ((Option<PathBuf>, bool), (Option<PathBuf>, bool)),
+}
+
+impl RefusedBackground {
+    /// Of a switch to `asked` refused while `in_force` runs (the same
+    /// effect); `None` when the switch kept the background effect's
+    /// settings (a stage alone changed).
+    fn of(asked: &Target, in_force: &Target) -> Option<RefusedBackground> {
+        let r = RefusedBackground {
+            params: (
+                asked.background_params.clone(),
+                in_force.background_params.clone(),
+            ),
+            still: (
+                (asked.background.clone(), asked.black_still),
+                (in_force.background.clone(), in_force.black_still),
+            ),
+        };
+        (r.params.0 != r.params.1 || r.still.0 != r.still.1).then_some(r)
+    }
+
+    /// `target` with the settings in force in place of the refused ones it
+    /// still asks for; `None` when it asks for none of them.
+    fn in_place_of(&self, target: &Target) -> Option<Target> {
+        let mut t = target.clone();
+        if t.kind != EffectKind::None
+            && self.params.0 != self.params.1
+            && t.background_params == self.params.0
+        {
+            t.background_params = self.params.1.clone();
+        }
+        if t.kind == EffectKind::Replace
+            && self.still.0 != self.still.1
+            && (&t.background, t.black_still) == (&self.still.0.0, self.still.0.1)
+        {
+            (t.background, t.black_still) = self.still.1.clone();
+        }
+        (t != *target).then_some(t)
     }
 }
 
@@ -932,6 +1107,8 @@ struct Report {
     fallback_error: Option<String>,
     /// Why the video background does not play ([`VideoCtl::error`]).
     background_error: Option<String>,
+    /// Why the last switch was refused ([`Control::switch_error`]).
+    switch_error: Option<String>,
 }
 
 impl Report {
@@ -943,11 +1120,13 @@ impl Report {
             &self.status,
             &self.fallback_error,
             &self.background_error,
+            &self.switch_error,
         ) == (
             now.kind,
             &now.status,
             &now.fallback_error,
             &now.background_error,
+            &now.switch_error,
         ) && self
             .stages
             .iter()
@@ -1248,7 +1427,8 @@ fn post_status(element: &super::ObcEffect, r: &Report) {
         .field(
             "background-error",
             r.background_error.as_deref().unwrap_or(""),
-        );
+        )
+        .field("switch-error", r.switch_error.as_deref().unwrap_or(""));
     for (stage, status) in &r.stages {
         b = b.field(stage.as_str(), status.as_str()).field(
             format!("{stage}-reason").as_str(),
@@ -1351,6 +1531,7 @@ impl ObcEffect {
             loads,
             fallback_error,
             background_error,
+            switch_error,
         ) = {
             let c = lock(&self.shared.control);
             (
@@ -1365,6 +1546,7 @@ impl ObcEffect {
                 c.loads,
                 c.fallback.error.clone(),
                 c.video.error.clone(),
+                c.switch_error.clone(),
             )
         };
         let background_video = self.shared.video_running.load(Ordering::SeqCst);
@@ -1416,6 +1598,7 @@ impl ObcEffect {
             cuda_active: s.cuda_active.load(Ordering::Relaxed),
             fallback_error,
             background_error,
+            switch_error,
             background_video,
             stage_values,
         }
@@ -1424,7 +1607,8 @@ impl ObcEffect {
     /// Applies new settings. A change of what has to be loaded (the effect,
     /// the image of replace, a stage request: on or off, or its load-time
     /// parameters) is a new request for the worker; `retry` makes one after
-    /// a failure (of the effect or of a stage) even when nothing changed. A
+    /// a failure (of the effect or of a stage) or a refused switch even when
+    /// nothing changed. A
     /// stage's recorded failure is forgotten when its request changes or on
     /// a retry. The effect's status turns
     /// loading (off for `none`) when the effect changes or had failed; a
@@ -1486,7 +1670,9 @@ impl ObcEffect {
             let before = c.report();
             let target = new.target_with_video(c.video.path.is_some());
             let effect_failed = matches!(c.status, EffectStatus::Failed(_));
-            let stage_failed = c.any_stage_failed();
+            // A refused switch is tried again too: the previous chain runs
+            // meanwhile, so the attempt costs no frame.
+            let other_failed = c.any_stage_failed() || c.switch_error.is_some();
             let effect_changed =
                 (target.kind, &target.background) != (c.target.kind, &c.target.background);
             for st in &new.stages {
@@ -1494,12 +1680,18 @@ impl ObcEffect {
             }
             c.frame = Arc::new(new.frame_params());
             c.settings = new;
-            if target != c.target || (retry && (effect_failed || stage_failed)) {
+            if target != c.target || (retry && (effect_failed || other_failed)) {
                 let old = c.target.clone();
                 for (s, ctl) in &mut c.stages {
                     if retry || target.stage_request(s.as_str()) != old.stage_request(s.as_str()) {
                         ctl.failure = None;
                     }
+                }
+                // A retry that changes nothing tries the refused settings
+                // again; any other request loads against those in force
+                // while it still asks for the refused ones.
+                if retry && target == c.target {
+                    c.switch_refused = None;
                 }
                 let prev = std::mem::replace(&mut c.target, target);
                 c.generation += 1;
@@ -1721,6 +1913,9 @@ impl ObcEffect {
                     }
                 }
                 c.status = EffectStatus::Failed(reason);
+                // The chain kept in place of a refused switch has failed
+                // too: the failure says it all.
+                c.clear_switch();
                 before.changed(c.report())
             }
         };
@@ -1966,14 +2161,20 @@ impl ObcEffect {
     /// unload under way), this frame's figures are skipped.
     ///
     /// The status values the backend reports after that frame come with
-    /// them; `None` when the lock was not taken (the values are then left
-    /// as they were).
-    fn stage_figures(&self) -> (Option<StageTimings>, Option<Vec<StageValue>>) {
+    /// them; `None` when the lock was not taken, or when the instance that
+    /// processed the frame (`serial`, `Engine::serial`) was replaced since
+    /// (the values are then left as they were).
+    fn stage_figures(&self, serial: u64) -> (Option<StageTimings>, Option<Vec<StageValue>>) {
         let e = match self.shared.engine.try_lock() {
             Ok(e) => e,
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return (None, None),
         };
+        // Another instance took its place since (a switch on a second
+        // instance): its figures are not this frame's.
+        if e.serial != serial {
+            return (None, None);
+        }
         match e.instance.as_ref() {
             Some(i) => (i.timings(), Some(i.status_values())),
             None => (None, Some(Vec::new())),
@@ -2158,6 +2359,7 @@ impl ObcEffect {
                     instance,
                     loaded,
                     bg,
+                    serial,
                     ..
                 } = match held.as_mut() {
                     Some(e) => &mut **e,
@@ -2187,6 +2389,7 @@ impl ObcEffect {
                     k.kind == px.kind()
                         && (k.target.kind != EffectKind::None || (alone && k.target.has_stages()))
                 }) && instance.as_ref().is_some_and(|i| i.is_loaded());
+                r.serial = *serial;
                 let result = match (instance.as_mut(), usable) {
                     (Some(instance), true) => 'frame: {
                         // Before the start event: the reset may wait for
@@ -2362,7 +2565,7 @@ impl ObcEffect {
         if r.processed {
             self.shared.processed.fetch_add(1, Ordering::Relaxed);
             if !r.ran.is_empty() || r.effect_ran {
-                let (times, values) = self.stage_figures();
+                let (times, values) = self.stage_figures(r.serial);
                 update_stage_values(&mut lock(&self.shared.stage_values), values, &r);
                 let mut figures = lock(&self.shared.stage_figures);
                 for id in r.ran {
@@ -2417,6 +2620,8 @@ struct Rendered {
     copied: bool,
     /// The stages that ran on the processed frame.
     ran: Vec<StageId>,
+    /// `Engine::serial` of the instance that processed it.
+    serial: u64,
 }
 
 /// The pixel work of one output frame in the memory of the negotiated caps:
@@ -2880,6 +3085,10 @@ struct Job {
     revocation: u64,
     /// `Control::refused` when the job was built.
     refused: Option<String>,
+    /// `target` has the background effect's settings in force in place of
+    /// refused ones ([`Control::job_request`]): loading it leaves the
+    /// refusal standing.
+    substituted: bool,
 }
 
 /// Why a load failed; the backend's error, when it came from the backend,
@@ -2915,6 +3124,10 @@ enum Outcome {
     Loaded(LoadReport),
     AlreadyLoaded,
     Failed(Failure),
+    /// A switch that keeps the effect failed, and the previous chain is
+    /// still loaded and runs (see "A refused switch" in the module docs):
+    /// not a failure of the effect.
+    Refused(Failure),
     Superseded,
 }
 
@@ -2923,6 +3136,9 @@ enum Outcome {
 struct JobResult {
     outcome: Outcome,
     stage_failures: Vec<(StageId, String)>,
+    /// The background effect's settings a refused switch of this job asked
+    /// for ([`Outcome::Refused`]), if it changed them.
+    refused: Option<RefusedBackground>,
 }
 
 fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
@@ -2940,9 +3156,11 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                     && let Some(format) = c.format.clone()
                     && (c.gpu.is_some() || !format.cuda)
                 {
+                    let (target, substituted) = c.job_request();
                     break Job {
                         generation: c.generation,
-                        target: c.job_target(),
+                        target,
+                        substituted,
                         kind: format.kind(),
                         gpu: c.gpu,
                         format,
@@ -2958,14 +3176,27 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
         let JobResult {
             outcome,
             stage_failures,
+            refused,
         } = run_job(&shared, &job);
-        let (loaded_kind, in_force, live) = {
+        let (loaded_kind, in_force, live, alive) = {
             let e = lock(&shared.engine);
             let k = e.loaded.as_ref();
             let live = k
                 .and(e.instance.as_ref())
                 .map(|i| (i.name(), i.supports_live_background()));
-            (k.map(|k| k.target.kind), k.map(|k| k.target.clone()), live)
+            let alive = k.is_some() && e.instance.as_ref().is_some_and(|i| i.is_loaded());
+            (
+                k.map(|k| k.target.kind),
+                k.map(|k| k.target.clone()),
+                live,
+                alive,
+            )
+        };
+        // A refusal needs the previous chain running: one lost meanwhile (a
+        // module that panicked on a frame) leaves black, a failure.
+        let outcome = match outcome {
+            Outcome::Refused(f) if !alive => Outcome::Failed(f),
+            o => o,
         };
         let in_force_target = in_force.clone();
         let in_force_list = in_force
@@ -2991,8 +3222,14 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                 }
                 let effect = c.target.kind != EffectKind::None;
                 match &outcome {
-                    Outcome::Unloaded | Outcome::Superseded => {}
+                    Outcome::Superseded => {}
+                    Outcome::Unloaded => c.clear_switch(),
                     Outcome::Loaded(_) | Outcome::AlreadyLoaded => {
+                        // Loaded against the settings in force in place of
+                        // refused ones: the refusal stands.
+                        if !job.substituted {
+                            c.clear_switch();
+                        }
                         if effect {
                             c.status = EffectStatus::Ready;
                         }
@@ -3003,12 +3240,43 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                         }
                     }
                     Outcome::Failed(f) => {
+                        c.clear_switch();
                         if effect {
                             c.status = EffectStatus::Failed(f.reason.clone());
                         }
                         for s in c.stage_ids() {
                             if c.effective(s.as_str()) {
                                 c.stage_mut(&s).status = EffectStatus::Failed(f.reason.clone());
+                            }
+                        }
+                    }
+                    // A frame of the previous chain failed during the job
+                    // (`fail`): that failure stands, and nothing runs in
+                    // place of the refused settings.
+                    Outcome::Refused(_) if matches!(c.status, EffectStatus::Failed(_)) => {
+                        c.clear_switch();
+                    }
+                    // The previous chain runs: the effect is ready, and so
+                    // is each requested stage it has; one it lacks is not
+                    // running, and says why (not recorded as the stage's
+                    // failure: it was not dropped).
+                    Outcome::Refused(f) => {
+                        c.switch_error = Some(f.reason.clone());
+                        // A job loaded against refused settings keeps them
+                        // unless it was refused other ones.
+                        if !job.substituted || refused.is_some() {
+                            c.switch_refused.clone_from(&refused);
+                        }
+                        if effect {
+                            c.status = EffectStatus::Ready;
+                        }
+                        for s in c.stage_ids() {
+                            if c.effective(s.as_str()) {
+                                c.stage_mut(&s).status = if in_force(s.as_str()) {
+                                    EffectStatus::Ready
+                                } else {
+                                    EffectStatus::Failed(f.reason.clone())
+                                };
                             }
                         }
                     }
@@ -3035,6 +3303,14 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                     r.reused_model
                 ),
                 Outcome::Unloaded => gst::info!(CAT, obj = el, "unloaded"),
+                Outcome::Refused(f) => gst::warning!(
+                    CAT,
+                    obj = el,
+                    "switch to {} with stages {} refused, the previous chain runs on: {}",
+                    job.target.kind,
+                    job.target.stage_list(),
+                    f.reason
+                ),
                 _ => {}
             }
             for (stage, reason) in &stage_failures {
@@ -3295,16 +3571,38 @@ fn superseded(shared: &Shared, generation: u64) -> bool {
 /// alone (`none`: then of every one of them), is returned as the job's
 /// stage failure, and the job goes on without the stage: the rest of the
 /// chain, or an unload for `none` without another stage.
+///
+/// A refused switch that changed the background effect's settings goes on
+/// with those in force in their place ([`RefusedBackground`]): the rest of
+/// the request (a stage turned on or off, rebound) loads against the chain
+/// that runs, on the loaded instance. The job is then refused whatever that
+/// load does, unless it supersedes or fails the effect.
 fn run_job(shared: &Shared, job: &Job) -> JobResult {
     let mut target = job.target.clone();
     let mut stage_failures = Vec::new();
+    let mut refusal: Option<(Failure, RefusedBackground)> = None;
+    let done = |outcome: Outcome,
+                stage_failures: Vec<(StageId, String)>,
+                refusal: Option<(Failure, RefusedBackground)>| {
+        match (outcome, refusal) {
+            (o @ (Outcome::Failed(_) | Outcome::Superseded | Outcome::Unloaded), _) | (o, None) => {
+                JobResult {
+                    outcome: o,
+                    stage_failures,
+                    refused: None,
+                }
+            }
+            (_, Some((f, r))) => JobResult {
+                outcome: Outcome::Refused(f),
+                stage_failures,
+                refused: Some(r),
+            },
+        }
+    };
     loop {
         if target.kind == EffectKind::None && !target.has_stages() {
             unload(shared, job);
-            return JobResult {
-                outcome: Outcome::Unloaded,
-                stage_failures,
-            };
+            return done(Outcome::Unloaded, stage_failures, refusal);
         }
         match load(shared, job, &target) {
             Outcome::Failed(f)
@@ -3321,12 +3619,21 @@ fn run_job(shared: &Shared, job: &Job) -> JobResult {
                     stage_failures.push((s, f.reason.clone()));
                 }
             }
-            outcome => {
-                return JobResult {
-                    outcome,
-                    stage_failures,
-                };
+            Outcome::Refused(f) if refusal.is_none() => {
+                let in_force = lock(&shared.engine)
+                    .loaded
+                    .as_ref()
+                    .map(|k| k.target.clone());
+                let r = in_force.and_then(|t| RefusedBackground::of(&target, &t));
+                match r.as_ref().and_then(|r| r.in_place_of(&target)) {
+                    Some(t) => {
+                        target = t;
+                        refusal = Some((f, r.expect("matched above")));
+                    }
+                    None => return done(Outcome::Refused(f), stage_failures, None),
+                }
             }
+            outcome => return done(outcome, stage_failures, refusal),
         }
     }
 }
@@ -3406,6 +3713,13 @@ const NO_BACKEND: &str = "no inference backend is configured for the effects";
 
 /// Loads `target` (an effect, its stages, or the stages alone) for `job`.
 /// The instance of a revoked backend is dropped first.
+///
+/// A switch that keeps the effect on the same frames, whose load fails
+/// (or whose new image of replace cannot be read) with the previous chain
+/// still loaded, is [`Outcome::Refused`], except a failure of one stage
+/// alone; a new value of the background stage's load-time parameters loads
+/// on a second instance ([`load_aside`]). See "A refused switch" and "A
+/// switch on a second instance" in the module docs.
 fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
     drop_revoked(shared, job);
     let kind = target.kind;
@@ -3437,6 +3751,15 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
     if current.as_ref() == Some(&key) {
         return Outcome::AlreadyLoaded;
     }
+    // A switch that keeps the effect (blur stays blur, replace stays
+    // replace) on the same frames: failing, it leaves the previous chain
+    // running, a refusal and not a failure of the effect.
+    let same_effect = kind != EffectKind::None
+        && current.as_ref().is_some_and(|k| {
+            k.target.kind == kind
+                && (k.kind, k.width, k.height, k.colour)
+                    == (key.kind, key.width, key.height, key.colour)
+        });
     let background = match (kind, &target.background) {
         // A video and no still: black behind the person until its first
         // frame (and for good if it cannot play).
@@ -3446,6 +3769,7 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
         }
         (EffectKind::Replace, Some(path)) => match decode_background(path, &job.format) {
             Ok(b) => Some(Arc::new(b)),
+            Err(reason) if same_effect => return Outcome::Refused(Failure::new(reason)),
             Err(reason) => return Outcome::Failed(Failure::new(reason)),
         },
         _ => None,
@@ -3478,6 +3802,18 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
         c.loaded_kind = None;
         c.epoch += 1;
     }
+    // New load-time parameters of the background stage (a provider's own
+    // settings: another model or engine) load on a second instance, the
+    // loaded one processing the frames meanwhile: on system memory only.
+    // On CUDA frames both instances would share the element's one stream
+    // (the backend binds it at load time), and a load's warm-up (CUDA
+    // graph capture, synchronisations) on a stream the streaming thread is
+    // using would race its frames: they switch on the loaded instance.
+    let aside = same_effect
+        && job.kind == FrameKind::Host
+        && current
+            .as_ref()
+            .is_some_and(|k| k.target.background_params != target.background_params);
     // SAFETY: as for the unload above. An instance of the other memory
     // went in `drop_revoked`.
     let _guard = match unsafe { push_for(job.kind, job.gpu) } {
@@ -3488,6 +3824,18 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
             )));
         }
     };
+    let req = LoadRequest {
+        effect: kind,
+        stages: target.stage_list(),
+        width: key.width,
+        height: key.height,
+        colour,
+        background,
+        params: target.stage_params(),
+    };
+    if aside {
+        return load_aside(shared, job, key, &req, factory.as_ref());
+    }
     let mut e = lock(&shared.engine);
     if e.instance.is_none() {
         match factory.create() {
@@ -3504,15 +3852,6 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
             }
         }
     }
-    let req = LoadRequest {
-        effect: kind,
-        stages: target.stage_list(),
-        width: key.width,
-        height: key.height,
-        colour,
-        background,
-        params: target.stage_params(),
-    };
     let instance = e.instance.as_mut().expect("created above");
     let result = match (job.kind, &job.gpu) {
         (FrameKind::Cuda, Some(gpu)) => instance.load(gpu, &req),
@@ -3541,12 +3880,96 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
             } else if let (Some(stage), Some(k)) = (stage_of(&err), e.loaded.as_mut()) {
                 k.target = k.target.without(stage.as_str());
             }
-            Outcome::Failed(Failure {
+            // The seam's rule for a failed switch other than a stage's:
+            // the previous chain is loaded and runs as it was (unless the
+            // backend lost it, a module that panicked).
+            let kept = same_effect
+                && stage_of(&err).is_none()
+                && e.loaded.is_some()
+                && e.instance.as_ref().is_some_and(|i| i.is_loaded());
+            let f = Failure {
                 reason: err.to_string(),
                 error: Some(err),
-            })
+            };
+            if kept {
+                Outcome::Refused(f)
+            } else {
+                Outcome::Failed(f)
+            }
         }
     }
+}
+
+/// Loads `req` (for `key`, on system memory: no context is current) on a
+/// second instance of `factory`, created and loaded on the worker without
+/// the `Engine` lock, so that the streaming thread keeps processing every
+/// frame with the loaded instance meanwhile (see "A switch on a second
+/// instance" in the module docs). On success the new instance takes the
+/// loaded one's place under the lock (its chain in force, the load-time
+/// still back in force as after any load, a new `Engine::serial`), the
+/// epoch moves, and the old instance is unloaded and dropped. A failure,
+/// or a request superseded meanwhile (a new request, a revocation, a
+/// stop), unloads and drops the new instance and leaves the loaded one as
+/// it was: any failure is a refusal ([`Outcome::Refused`]), a stage's
+/// included (the loaded chain is intact, and the stage may have failed
+/// only for want of room for two instances).
+fn load_aside(
+    shared: &Shared,
+    job: &Job,
+    key: LoadedKey,
+    req: &LoadRequest,
+    factory: &dyn BackendFactory,
+) -> Outcome {
+    let refused = |err: BackendError| {
+        Outcome::Refused(Failure {
+            reason: err.to_string(),
+            error: Some(err),
+        })
+    };
+    let discard = |mut instance: Box<dyn InferenceBackend>| {
+        instance.unload();
+        drop(instance);
+    };
+    let mut fresh = match factory.create() {
+        Ok(i) => i,
+        Err(err) => return refused(err),
+    };
+    let report = match fresh.load_host(req) {
+        Ok(report) => report,
+        Err(err) => {
+            discard(fresh);
+            return refused(err);
+        }
+    };
+    // A newer request (a revocation and a stop are too) runs next, from
+    // the instance loaded now. A revocation after this check leaves an
+    // instance of the job's revocation count: the next job drops it
+    // (`drop_revoked`), and this one publishes nothing loaded
+    // (`published_kind`).
+    if superseded(shared, job.generation) {
+        discard(fresh);
+        return Outcome::Superseded;
+    }
+    let old = {
+        let mut e = lock(&shared.engine);
+        e.loaded = Some(key);
+        e.revocation = job.revocation;
+        e.kind = Some(job.kind);
+        // The load-time still is in force again: the last video frame is
+        // given again on the next fresh frame.
+        e.bg.sent = None;
+        e.bg.live = false;
+        // A frame processed by the old instance reads no figure of this one.
+        e.serial += 1;
+        e.instance.replace(fresh)
+    };
+    // The repeat cache follows the new instance from its first frame.
+    lock(&shared.control).epoch += 1;
+    // Of the job's memory (`drop_revoked` dropped any other).
+    if let Some(old) = old {
+        discard(old);
+    }
+    Outcome::Loaded(report)
 }
 
 fn decode_background(
@@ -3834,6 +4257,8 @@ impl BaseTransformImpl for ObcEffect {
             c.epoch += 1;
             c.status = c.pending_status();
             c.set_pending_stage_statuses();
+            // Nothing is loaded any more: a restart loads the request.
+            c.clear_switch();
             before.changed(c.report())
         };
         if let Some(r) = posted {
@@ -3897,10 +4322,13 @@ impl BaseTransformImpl for ObcEffect {
             let before = c.report();
             if c.format.as_ref() != Some(&format) {
                 c.format = Some(format);
-                // Loading depends on the size and colour: a new request.
+                // Loading depends on the size and colour: a new request,
+                // a full reload that loads the settings or fails (no
+                // refused switch stands: nothing of it stays loaded).
                 c.generation += 1;
                 c.status = c.pending_status();
                 c.set_pending_stage_statuses();
+                c.clear_switch();
                 self.shared.wake.notify_all();
             }
             before.changed(c.report())
@@ -4231,8 +4659,8 @@ mod tests {
     use super::{
         BackendError, BackendFactory, ColourSpec, Control, EffectFallback, EffectKind,
         EffectSettings, EffectStatus, Format, FrameAction, InferenceBackend, NO_BACKEND, OnExit,
-        Refusals, Rendered, StageId, StageValue, background, decide, decide_frame, published_kind,
-        refusals, update_stage_values,
+        Refusals, RefusedBackground, Rendered, StageId, StageValue, background, decide,
+        decide_frame, published_kind, refusals, update_stage_values,
     };
     use crate::settings::StageRequest;
     use std::cell::Cell;
@@ -4646,5 +5074,50 @@ mod tests {
             published_kind(&c, c.revocations, Some(EffectKind::Blur)),
             Some(EffectKind::Blur)
         );
+    }
+
+    /// Blur (or replace with `image`) with `chair` as the background
+    /// stage's load-time parameter, and denoise on with `denoise`.
+    fn chair_target(
+        kind: EffectKind,
+        chair: bool,
+        image: Option<&str>,
+        denoise: bool,
+    ) -> crate::settings::Target {
+        let mut s = EffectSettings::of(kind);
+        s.background = image.map(Into::into);
+        s.background_params
+            .insert("chair".into(), obc_backend::Value::Bool(chair));
+        if denoise {
+            s.stage_mut(&StageId::DENOISE).enabled = true;
+        }
+        s.target()
+    }
+
+    #[test]
+    fn a_refused_background_is_put_in_place_only_while_it_is_asked_for() {
+        let blur = |chair, denoise| chair_target(EffectKind::Blur, chair, None, denoise);
+        // A stage alone changed: nothing of the background was refused.
+        assert_eq!(
+            RefusedBackground::of(&blur(false, true), &blur(false, false)),
+            None
+        );
+        let r = RefusedBackground::of(&blur(true, false), &blur(false, false)).unwrap();
+        // Asked for again (a stage turned on): what is in force instead.
+        assert_eq!(r.in_place_of(&blur(true, true)), Some(blur(false, true)));
+        // Another effect asking for it too.
+        let replace = |chair| chair_target(EffectKind::Replace, chair, Some("/a.png"), false);
+        assert_eq!(r.in_place_of(&replace(true)), Some(replace(false)));
+        // Changed: tried as asked.
+        assert_eq!(r.in_place_of(&blur(false, true)), None);
+        let none = chair_target(EffectKind::None, true, None, true);
+        assert_eq!(r.in_place_of(&none), None);
+
+        // Replace's still refused: the one in force, under replace only.
+        let img = |path| chair_target(EffectKind::Replace, false, Some(path), false);
+        let r = RefusedBackground::of(&img("/junk.png"), &img("/good.png")).unwrap();
+        assert_eq!(r.in_place_of(&img("/junk.png")), Some(img("/good.png")));
+        assert_eq!(r.in_place_of(&img("/other.png")), None);
+        assert_eq!(r.in_place_of(&blur(false, false)), None);
     }
 }

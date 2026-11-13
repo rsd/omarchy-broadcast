@@ -72,7 +72,7 @@
 
 pkgname=omarchy-broadcast-git
 _pkgname=omarchy-broadcast
-pkgver=0.45.3
+pkgver=0.45.4
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API and a CLI'
 arch=('x86_64')

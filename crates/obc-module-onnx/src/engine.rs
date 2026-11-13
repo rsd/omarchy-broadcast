@@ -18,6 +18,14 @@
 //!
 //! An engine chosen explicitly that cannot run fails the load with its
 //! reason; only `auto` moves on to the next.
+//!
+//! **OpenVINO on the GPU and the NVIDIA GPU.** Before the first session of
+//! `openvino-gpu` (chosen, or reached by `auto`), the OpenCL drivers the
+//! process sees are limited to the Intel GPU ones ([`crate::opencl`]):
+//! OpenVINO's GPU device would otherwise open NVIDIA's OpenCL driver, which
+//! wakes a suspended NVIDIA GPU and holds it until the process exits. The
+//! `openvino-npu` and `openvino-cpu` engines do not load OpenVINO's GPU
+//! plugin and are not concerned.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -751,6 +759,11 @@ fn try_engine(req: &Request<'_>, engine: Engine) -> Result<Started, String> {
         return Err(REASON_NOT_IN_BUILD.to_string());
     }
     take_warnings();
+    // OpenVINO's GPU device lists the OpenCL drivers, NVIDIA's among them,
+    // which would wake the NVIDIA GPU: limited before its first session.
+    if engine == Engine::OpenVinoGpu {
+        crate::opencl::limit_once(req.caches.root.as_deref());
+    }
     // Counted before any provider is registered, dropped last (after the
     // session, on success or failure): see `GpuSession`.
     let gpu = engine.uses_cuda().then(crate::cuda::GpuSession::begin);

@@ -15468,6 +15468,42 @@ fn the_elements_as_a_still_report_is_a_warning_clause_while_it_holds() {
     assert!(!h.snap().warning.contains(&still), "{}", h.snap().warning);
 }
 
+/// A switch of the background effect's settings that the element refused
+/// (another engine its module cannot start): a `Warning` clause naming the
+/// module, while it holds; `Error`, the state and the stored setting stay.
+#[test]
+fn the_elements_refused_switch_is_a_warning_clause_while_it_holds() {
+    let mut h = H::new("", |_| {});
+    h.set_effect("blur", 0).unwrap();
+    h.activate(100);
+    let before = h.snap();
+    let why = "TensorRT is not installed\u{1}";
+    h.world().switch_error = Some(why.into());
+    h.tick(1000);
+    let snap = h.snap();
+    assert!(
+        snap.warning.contains(
+            "NVIDIA Maxine video effects: TensorRT is not installed; the previous \
+                       setting keeps running"
+        ),
+        "{}",
+        snap.warning
+    );
+    assert!(
+        !snap.warning.contains('\u{1}'),
+        "sanitised: {}",
+        snap.warning
+    );
+    assert_eq!(snap.error, before.error, "never Error");
+    assert_eq!(snap.state, before.state);
+    assert_eq!(snap.effect, "blur", "the setting stays");
+    h.world().switch_error = None;
+    h.tick(2000);
+    let snap = h.snap();
+    assert!(!snap.warning.contains("keeps running"), "{}", snap.warning);
+    assert_eq!(snap.state, before.state);
+}
+
 #[test]
 fn background_changes_mid_stream_never_restart_the_session() {
     use crate::media::{Codec, Container};

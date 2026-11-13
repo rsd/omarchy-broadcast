@@ -1304,6 +1304,7 @@ impl MediaBackend for GstBackend {
             gpu_ms_p50: stats.gpu_ms_p50,
             fallback_error: stats.fallback_error,
             background_error: stats.background_error,
+            switch_error: stats.switch_error,
             stage_values: output.stage_values(),
         })
     }

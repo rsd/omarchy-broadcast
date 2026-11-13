@@ -533,6 +533,17 @@ pub struct EffectStats {
     /// ([`crate::video_background::video_as_still`]). `None` while it
     /// plays (or starts), and without a video.
     pub background_error: Option<String>,
+    /// Why the backend refused the last switch that kept the effect (blur
+    /// stays blur, replace stays replace: new load-time parameters of the
+    /// background stage, another image of replace, a stage turned on with
+    /// them): the previous chain is still loaded and processes every frame,
+    /// the effect's status is not failed, and the settings stay as they were
+    /// applied. It stays while later requests load against the settings in
+    /// force; `None` once a later request is loaded with the settings it
+    /// asks for (or finds its chain loaded: the previous setting applied
+    /// again), and after an unload, a full reload (new caps), a failure of
+    /// the effect, a revocation and a stop.
+    pub switch_error: Option<String>,
     /// Whether the video background's decode pipeline exists: only while
     /// replace with a video is loaded on a backend that takes per-frame
     /// backgrounds, and, after the video is turned off, until the requested

@@ -50,6 +50,14 @@
 //!   CUDA, an explicit `tensorrt` or `cuda` engine fails the load, and a
 //!   chain of CUDA frames is refused. Absent or `true`: CUDA as usual.
 //!
+//! # The NVIDIA GPU left alone
+//!
+//! With CUDA off the module makes no CUDA call, and no engine but TensorRT
+//! and CUDA touches the NVIDIA GPU: `openvino-gpu` runs on the Intel GPU
+//! with the OpenCL drivers limited to Intel's ([`opencl`]; the user's own
+//! `OCL_ICD_*` variables win), so a runtime-suspended NVIDIA GPU stays
+//! suspended. `tests/intel_gpu.rs` checks it.
+//!
 //! # Failures
 //!
 //! A matte never fails open. Every failure of a frame is a failure of the
@@ -64,6 +72,7 @@ pub mod cuda;
 pub mod engine;
 pub mod image;
 pub mod model_files;
+pub mod opencl;
 pub mod runtime;
 
 use std::path::PathBuf;

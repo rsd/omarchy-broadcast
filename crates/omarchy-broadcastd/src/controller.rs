@@ -1415,6 +1415,10 @@ pub struct Controller<B: MediaBackend> {
     /// background, or that its module shows it as a still (a `Warning`
     /// clause).
     background_failure: Option<String>,
+    /// Why the running session's effect element refused the last switch
+    /// of the background effect's settings, the previous setting running
+    /// on (a `Warning` clause, [`Self::switch_warning`]).
+    switch_failure: Option<String>,
     /// What video backgrounds are asked of ([`Self::set_videos`]).
     videos: Box<dyn VideoService>,
     /// The background in force last examined by [`Self::follow_video`].
@@ -1891,6 +1895,7 @@ impl<B: MediaBackend> Controller<B> {
             placeholder_overdue: false,
             fallback_failure: None,
             background_failure: None,
+            switch_failure: None,
             videos: Box::new(NoGallery),
             video_for: None,
             video: None,
@@ -2737,6 +2742,7 @@ impl<B: MediaBackend> Controller<B> {
                 .chain(self.passthrough.clone())
                 .chain(self.fallback_warnings())
                 .chain(self.video_warnings())
+                .chain(self.switch_warning())
                 .chain(still_video)
                 .chain(dropped_text(&dropped))
                 .chain(self.held_warning())
@@ -2748,6 +2754,30 @@ impl<B: MediaBackend> Controller<B> {
                 .join("; ")
         };
         capped_with_path(&text, self.still_video_warning())
+    }
+
+    /// `Warning`'s clause of a change of the background effect's settings
+    /// that the running session's effect element refused (another model or
+    /// engine its module cannot start, an image it cannot read): the
+    /// module's name (the effect's mode without one) and the element's
+    /// reason, made safe to show and bounded as the other clauses, and that
+    /// the previous setting keeps running. Neither `Error` nor the state
+    /// changes, and the setting stays as the user stored it.
+    fn switch_warning(&self) -> Option<String> {
+        self.session.as_ref()?;
+        let why = self.switch_failure.as_deref()?;
+        let label = self
+            .plan
+            .as_ref()
+            .and_then(|p| p.provider(&StageId::BACKGROUND))
+            .map_or_else(
+                || format!("effect {}", self.effect().mode),
+                |id| settings::sanitise(&self.modules.name_of(id), modules::NAME_MAX),
+            );
+        Some(format!(
+            "{label}: {}; the previous setting keeps running",
+            settings::sanitise(why, STAGE_REASON_MAX)
+        ))
     }
 
     /// `Warning`'s clause of the module the running session keeps for its
@@ -3924,6 +3954,7 @@ impl<B: MediaBackend> Controller<B> {
             _ => None,
         };
         self.background_failure.clone_from(&report.background_error);
+        self.switch_failure.clone_from(&report.switch_error);
         if self.follow_effect(&report, now) {
             return true;
         }
@@ -4730,6 +4761,7 @@ impl<B: MediaBackend> Controller<B> {
         self.effect_failure = None;
         self.fallback_failure = None;
         self.background_failure = None;
+        self.switch_failure = None;
         let enhance = self.enhance_failure.take();
         if stages || enhance.is_some_and(|e| e == self.error) {
             self.error = self.standing_error();

@@ -942,6 +942,88 @@ fn gpu_a_fallback_image_put_at_its_path_is_read_when_the_settings_are_applied_ag
     assert_eq!(get(&fake.log.wrong_context), 0);
 }
 
+/// New load-time parameters of the background stage on CUDA frames switch
+/// on the loaded instance, under the element's one stream: no second
+/// instance (its load would share the stream the frames run on), the last
+/// frame held during the switch and never black; a refused one leaves the
+/// loaded chain running, and a stage turned on meanwhile loads against
+/// the parameters in force.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_new_background_parameters_switch_on_the_loaded_instance_and_its_stream() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let mut blur = EffectSettings::of(EffectKind::Blur);
+    blur.background_params
+        .insert("chair".into(), Value::Bool(false));
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &blur);
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    let black = rig.effect.stats().frames_black;
+    let loads = get(&fake.log.loads);
+    fake.set(|c| c.switch_delay = Duration::from_millis(300));
+    let mut chair = blur.clone();
+    chair
+        .background_params
+        .insert("chair".into(), Value::Bool(true));
+    rig.effect.apply(&chair).unwrap();
+    let seen = rig.frames_until(Duration::from_secs(5), |_| get(&fake.log.loads) > loads);
+    assert!(seen.iter().all(|s| *s == Seen::FakeBlur), "{seen:?}");
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    assert_eq!(get(&fake.log.creates), 1, "no second instance");
+    assert_eq!(
+        fake.log.background_loads.lock().unwrap().last(),
+        Some(&(1, [("chair".to_string(), Value::Bool(true))].into()))
+    );
+    assert!(
+        fake.log
+            .processed_by
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|i| *i == 1)
+    );
+
+    // Refused: the loaded chain runs on.
+    fake.set(|c| c.fail_load = Some("the engine is not installed".into()));
+    rig.effect.apply(&blur).unwrap();
+    let seen = rig.frames_until(Duration::from_secs(5), |r| {
+        r.effect.stats().switch_error.is_some()
+    });
+    assert!(seen.iter().all(|s| *s == Seen::FakeBlur), "{seen:?}");
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    assert_eq!(rig.effect.status(), EffectStatus::Ready);
+
+    // A stage turned on loads against what runs: the refused value is not
+    // tried again.
+    fake.set(|c| c.fail_load = None);
+    let mut denoise = blur.clone();
+    denoise.stage_mut(&StageId::DENOISE).enabled = true;
+    rig.effect.apply(&denoise).unwrap();
+    let seen = rig.frames_until(Duration::from_secs(5), |r| {
+        r.effect.stage_status("denoise") == EffectStatus::Ready
+    });
+    assert!(
+        seen.iter()
+            .all(|s| matches!(s, Seen::FakeBlur | Seen::FakeBlurDenoised)),
+        "{seen:?}"
+    );
+    assert_eq!(rig.frame(), Seen::FakeBlurDenoised);
+    assert_eq!(
+        fake.log.background_loads.lock().unwrap().last(),
+        Some(&(1, [("chair".to_string(), Value::Bool(true))].into()))
+    );
+    assert!(
+        rig.effect.stats().switch_error.is_some(),
+        "the refusal stands"
+    );
+    assert_eq!(rig.effect.stats().frames_black, black, "no black frame");
+    rig.stop();
+    assert_eq!(get(&fake.log.creates), 1);
+    assert_eq!(get(&fake.log.drops), 1);
+    assert_eq!(get(&fake.log.wrong_context), 0);
+    assert_eq!(get(&fake.log.wrong_stream), 0);
+}
+
 #[test]
 #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
 fn gpu_failures_show_black_or_the_input_as_configured() {

@@ -300,6 +300,12 @@ pub struct EffectReport {
     /// element words it (`EffectStats::background_error`); `None` while it
     /// plays, and without a video.
     pub background_error: Option<String>,
+    /// Why the effect element refused the last change of the background
+    /// effect's settings that kept the effect (another model or engine of
+    /// its module, another image), as it words it
+    /// (`EffectStats::switch_error`): the previous setting keeps running,
+    /// the effect is not failed. `None` while there is none.
+    pub switch_error: Option<String>,
     /// The status values the stages report after the last frame they
     /// processed (a module of ABI 1.3: auto-frame's zoom), the chains'
     /// first, then the effect element's; empty when none reports.
