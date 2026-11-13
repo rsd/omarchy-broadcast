@@ -55,6 +55,21 @@
 //!   taken away while running ([`ObcEffect::revoke_backend`]: its module
 //!   can no longer run the effect) is such a failure at once; the instance
 //!   is dropped, and a factory set after it loads again.
+//! * **A refused switch** is not a failure: a change that keeps the effect
+//!   (blur stays blur, replace stays replace: new load-time parameters of
+//!   the background stage, another image) and fails while the previous
+//!   chain stays loaded leaves that chain processing every frame, the
+//!   status ready. Why is in [`EffectStats::switch_error`] and in the status
+//!   message's `switch-error` field (empty while there is none), until a
+//!   later request loads with the settings it asks for. While it stands,
+//!   later requests (a stage turned on, another effect, a stage rebuilt on
+//!   a new source) load against the settings in force, never the refused
+//!   ones, which are tried again only when changed or on a retry that
+//!   changes nothing. On system memory new load-time parameters of the
+//!   background stage load on a second instance while the loaded one keeps
+//!   processing the frames, so a slow model or engine start never stalls
+//!   the stream; on CUDA frames they switch on the loaded instance, the
+//!   last frame held meanwhile (never black).
 //! * **The fallback image** (`on-failure=image`): every frame the element
 //!   would output black (a failure, and the warm-up of an effect) shows the
 //!   still image of `fallback-image` instead, cropped to fill the frame. It

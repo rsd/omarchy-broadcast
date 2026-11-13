@@ -215,6 +215,9 @@ pub struct World {
     /// What the effect report says of the video background
     /// (`EffectReport::background_error`).
     pub background_error: Option<String>,
+    /// What the effect report says of a refused switch
+    /// (`EffectReport::switch_error`).
+    pub switch_error: Option<String>,
     /// What `effect_report` reports as the stages' status values while a
     /// session runs.
     pub stage_values: Vec<obc_pipeline::effect::StageValue>,
@@ -487,6 +490,7 @@ impl Default for World {
             restart_holds: Vec::new(),
             fallback_error: None,
             background_error: None,
+            switch_error: None,
             stage_values: Vec::new(),
             holders: 0,
             holder_counts: 0,
@@ -1263,6 +1267,7 @@ impl MediaBackend for FakeBackend {
             gpu_ms_p50: Some(1.2),
             fallback_error: w.fallback_error.clone(),
             background_error: w.background_error.clone(),
+            switch_error: w.switch_error.clone(),
             stage_values: w.stage_values.clone(),
         })
     }

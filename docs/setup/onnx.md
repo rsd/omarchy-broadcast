@@ -168,6 +168,12 @@ The blur strength and the replacement image are the daemon's own background sett
 
 A change of either setting is a **switch** while the camera runs: the previous model keeps running until the new one is loaded, then the picture changes, with no black frame.
 
+**A switch that cannot load is refused, and the picture does not change.** If the new model or engine cannot start (an explicit `tensorrt` on a machine without TensorRT's libraries, a model file that is missing), the previous one keeps processing every frame: the picture stays the cut-out it was, never black and never the away image, and the effect stays ready. `Error` stays empty, and `Warning` says why, with the clause `<module>: <reason>; the previous setting keeps running`. The setting itself is not rewritten: what you chose stays chosen, and the settings keep showing it, so the engine that runs and the engine that is stored can differ until you act. The refused value is tried again only when you change it or apply the unchanged settings again; other changes meanwhile (turning a stage on, blur to replace, another camera) load against the model and engine that run. Turning the effect off, or a new camera format, ends the refusal.
+
+A refused value that is still stored is tried at the next camera start, where black or the away image is allowed: an explicit engine that cannot run fails the load, as described below. Set the setting back, or to `auto`, to avoid it.
+
+With system-memory frames the new model loads on a second instance of the module while the first keeps running, and the picture changes when it is ready; the two are alive together while it loads, which costs the memory of a second session. With CUDA frames the switch loads on the running instance instead (the module's CUDA stream is bound when it loads, and a second one is not safe to use mid-frame), so a slow switch there, a first TensorRT engine build, holds the last frame for as long as it takes. It is never black.
+
 **Engines under `auto`.** `auto` tries the engines in this order and takes the first that starts:
 
 1. NVIDIA TensorRT
@@ -237,6 +243,15 @@ The build runs when the effect is turned on or when the camera starts, and until
 
 ONNX Runtime's CUDA and TensorRT engines run through the CUDA runtime, which activates the device's primary CUDA context. When the last session that used one of them ends (an unload, or a failed attempt of `auto`), the module resets that primary context, so that no CUDA context of the module's outlives its sessions and the GPU can be parked at idle ([ADR-0017](../adr/0017-cuda-checkpoint-parking.md)). The context of the frames, GStreamer's, is another context and is untouched. The rule and its bounds are in [../modules.md](../modules.md#threading-and-cuda-rules).
 
+**The Intel GPU engine and the NVIDIA GPU.** OpenVINO's GPU engine (`openvino-gpu`, or `auto` reaching it) starts OpenCL, and the OpenCL loader opens every driver listed in `/etc/OpenCL/vendors/`, NVIDIA's included. On a laptop with both GPUs that wakes the NVIDIA GPU, which then stays awake with its `/dev/nvidia*` files open until the daemon exits, and it made the first OpenVINO GPU session take about 2.7 s instead of about 0.1 s. So before its first OpenVINO GPU session the module limits the loader to the Intel GPU's driver:
+
+- It makes `$XDG_RUNTIME_DIR/omarchy-broadcast/opencl-vendors/` (mode 0700), links in it the `.icd` files of `/etc/OpenCL/vendors/` that name Intel's compute runtime (`libigdrcl`), and sets `OCL_ICD_VENDORS` to that directory, with a trailing slash (the loader that the CUDA toolkit installs needs it). Both OpenCL loaders that may be installed, ocl-icd's and CUDA's `/opt/cuda/lib64/libOpenCL.so.1`, honour the setting.
+- The variable is set once, in the daemon's own environment, and the processes the daemon starts afterwards inherit it. Nothing under `/etc` is changed.
+- It is left alone when any `OCL_ICD_*` variable is already set, which is your override (put your own `OCL_ICD_VENDORS` in the daemon's environment to choose the drivers yourself), and when no Intel GPU driver is installed.
+- The NPU and CPU engines load no OpenCL and are not affected.
+
+The NVIDIA GPU then stays asleep under `openvino-gpu`; the log says whether the limit was applied.
+
 ## 8. Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -247,6 +262,8 @@ ONNX Runtime's CUDA and TensorRT engines run through the CUDA runtime, which act
 | The model runs on the CPU although you have an NVIDIA GPU | `auto` found nothing better: the installed build is `onnxruntime-cpu`, or the CUDA reason says why (`CUDA not available: ...`) | Install `onnxruntime-full` (or `onnxruntime-opt-cuda`) and `cudnn`, and read the reason in the log (section 5) |
 | The log says TensorRT's libraries are not on the daemon's library path, and the model runs on CUDA | The daemon's `LD_LIBRARY_PATH` lacks TensorRT's directory (`/opt/nvidia/tensorrt/lib` with `nvidia-tensorrt-sdk`) | Add the drop-in of section 2, "TensorRT's library path", then reload systemd and restart the daemon |
 | An explicit engine fails the load | By design there is no fallback | Read the reason; choose `auto` or another engine |
+| After changing the engine or model the picture did not change, and `Warning` ends `the previous setting keeps running` | The new setting could not load; the previous one keeps running by design | Read the reason before the semicolon and fix it, or set the setting back; change it again or apply it again to try it once more |
+| The NVIDIA GPU wakes up when `openvino-gpu` is chosen | The OpenCL loader opened NVIDIA's driver: the module's limit was not applied (an `OCL_ICD_*` variable was already set, or the loader was in the process before) | Remove your `OCL_ICD_*` setting from the daemon's environment, or make it list the Intel driver only; the log says why the limit was left alone |
 | The picture is black for many seconds the first time the effect is on | The TensorRT engine is being built | Wait for `the TensorRT engine for <model> is ready` in the log (section 6) |
 | On a machine without an NVIDIA GPU the picture is black and `Warning` says the Maxine module cannot run | Only the Maxine module provides `background` (the ONNX module or its models or its runtime are missing, so its stage is `unavailable`) | Install the module, the models and `onnxruntime-cpu` (sections 2 and 3); `omarchy-broadcast modules` shows the reason |
 | The log says `video memory: system` on an NVIDIA machine | `[video] memory` is `system`, or the probe found no usable CUDA (`auto`), or a start fell back after CUDA failed | The log line gives the reason; set `memory = "cuda"` to require CUDA, and reload |
