@@ -260,3 +260,125 @@ fn a_cuda_only_backend_fails_the_effect_on_a_system_memory_session() {
     );
     assert_eq!(FakeLog::get(&log.processes), 0);
 }
+
+/// A session forwarding to a started writer, blur loaded and showing, on
+/// the fake backend; CPU only.
+fn blurred_session() -> (LoopbackWriter, Arc<FakeFactory>, Session) {
+    require_elements(ELEMENTS);
+    let contract: OutputContract = "320x240@30".parse().unwrap();
+    let mut writer = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+    writer.start().unwrap();
+    let fake = FakeFactory::new(FakeConfig::default());
+    let mut cfg = OutputConfig::new(contract, OutputSink::Writer(writer.handle()));
+    cfg.effect = Some(EffectSettings::default());
+    cfg.effect_backend = Some(EffectBackend::new(fake.clone()));
+    let output = Output::build_in(cfg, VideoMemory::System).expect("build output");
+    let lumas = centre_luma(&output, 320, 240);
+    let mut session = Session::new(output).expect("start output");
+    let ingest = yuy2_pattern(session.output());
+    session.switch_to(ingest).expect("start source");
+    wait_for(Duration::from_secs(10), "the camera image", || {
+        lumas.lock().unwrap().iter().filter(|&&y| y == 235).count() >= 10
+    });
+    session
+        .output()
+        .set_effect(&EffectSettings::of(EffectKind::Blur))
+        .unwrap();
+    wait_for(Duration::from_secs(10), "the effect to load", || {
+        session.output().effect_status() == EffectStatus::Ready
+    });
+    let from = lumas.lock().unwrap().len();
+    wait_for(Duration::from_secs(10), "blurred frames", || {
+        lumas.lock().unwrap()[from..]
+            .iter()
+            .filter(|&&y| y == FAKE_BLUR_Y)
+            .count()
+            >= 10
+    });
+    (writer, fake, session)
+}
+
+/// Turns the denoise stage on under blur, a switch the fake backend takes
+/// 300 ms over: about 9 periods with no frame from the output.
+fn switch_on_denoise_slowly(fake: &FakeFactory, session: &Session) {
+    use obc_pipeline::effect::{StageId, StageRequest};
+    fake.set(|c| c.switch_delay = Duration::from_millis(300));
+    session
+        .output()
+        .set_effect(
+            &EffectSettings::of(EffectKind::Blur).with_stage(StageRequest::on(StageId::DENOISE)),
+        )
+        .unwrap();
+}
+
+/// A deliberate switch on the loaded effect (a stage turned on under blur)
+/// stalls the output's streaming thread for as long as the backend takes
+/// to switch: the writer holds the output's last frame meanwhile, and
+/// sends no placeholder. Once the session is stopped (the camera off), the
+/// placeholder resumes. CPU only.
+#[test]
+fn a_stage_switch_under_blur_holds_the_last_frame_not_the_placeholder() {
+    let (mut writer, fake, session) = blurred_session();
+    let before = writer.counts();
+    switch_on_denoise_slowly(&fake, &session);
+    wait_for(Duration::from_secs(10), "frames after the switch", || {
+        session
+            .output()
+            .stage_values()
+            .iter()
+            .any(|v| v.stage.as_str() == "denoise" && v.value == FAKE_DENOISE_LEVEL)
+            && writer.counts().forwarded >= before.forwarded + 10
+    });
+    let after = writer.counts();
+    assert_eq!(
+        after.placeholder, before.placeholder,
+        "placeholders during a stage switch: {before:?} -> {after:?}"
+    );
+    assert!(
+        after.held > before.held,
+        "the last frame was not held: {before:?} -> {after:?}"
+    );
+
+    // The camera off: the writer's placeholder follows, not a frozen frame.
+    session.stop().unwrap();
+    let stopped = writer.counts();
+    wait_for(
+        Duration::from_secs(1),
+        "the placeholder after the stop",
+        || writer.counts().placeholder >= stopped.placeholder + 5,
+    );
+    let end = writer.counts();
+    writer.stop().unwrap();
+    assert_eq!(
+        end.held, stopped.held,
+        "held after the stop: {stopped:?} -> {end:?}"
+    );
+}
+
+/// The camera turned off in the middle of a 300 ms switch stall: the
+/// session's stop detaches the output from the writer, so the placeholder
+/// takes over and nothing is held once the stop has returned. CPU only.
+#[test]
+fn a_stop_during_a_switch_stall_hands_over_to_the_placeholder() {
+    let (mut writer, fake, session) = blurred_session();
+    let before = writer.counts();
+    switch_on_denoise_slowly(&fake, &session);
+    // The stall has begun: the writer holds the last frame.
+    wait_for(Duration::from_secs(10), "held frames", || {
+        writer.counts().held >= before.held + 2
+    });
+    session.stop().unwrap();
+    let stopped = writer.counts();
+    wait_for(
+        Duration::from_secs(10),
+        "the placeholder after the stop",
+        || writer.counts().placeholder >= stopped.placeholder + 5,
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    let end = writer.counts();
+    writer.stop().unwrap();
+    assert_eq!(
+        end.held, stopped.held,
+        "held after the stop: {stopped:?} -> {end:?}"
+    );
+}

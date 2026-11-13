@@ -752,7 +752,7 @@ One `Stats` signal of the daemon, printed by `watch --json`. The daemon sends it
 | Field | JSON type | Meaning |
 |---|---|---|
 | `v`, `type` | | `1`, `"stats"`. |
-| `fps` | number | Frames delivered to the virtual camera per second over the last interval, camera and black placeholder frames alike (the `fps` of the `Stats` signal, [dbus-api.md](dbus-api.md#statsd-fps-d-latency_p50_ms-d-cpu_percent-d-gpu_percent)). |
+| `fps` | number | Frames delivered to the virtual camera per second over the last interval, camera, held and black placeholder frames alike (the `fps` of the `Stats` signal, [dbus-api.md](dbus-api.md#statsd-fps-d-latency_p50_ms-d-cpu_percent-d-gpu_percent)). |
 | `latency_p50_ms` | number | Median latency from camera capture to the virtual camera, in milliseconds. |
 | `cpu_percent` | number | CPU time used by the daemon, in percent of one core (can exceed 100). |
 | `gpu_percent` | number | Utilisation of the GPU the pipeline runs on, in percent. |
