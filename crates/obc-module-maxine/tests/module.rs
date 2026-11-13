@@ -216,3 +216,17 @@ fn the_registry_offers_the_stages_in_the_rev8_order() {
         );
     }
 }
+
+/// The module takes per-frame backgrounds (ABI 1.4): its vtable sets
+/// `instance_set_background`, so a video background is not shown as a
+/// still.
+#[test]
+fn the_library_takes_a_per_frame_background() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty_root = tempfile::tempdir().unwrap();
+    let (module, _lines) = support::open(
+        dir.path(),
+        serde_json::json!({"sdk_root": empty_root.path()}),
+    );
+    assert!(module.library().has_live_background());
+}

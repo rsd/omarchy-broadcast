@@ -35,7 +35,7 @@ exclude = [
 
 [workspace.package]
 # Also the pkgver= of packaging/arch/PKGBUILD: bump both; CI checks they match.
-version = "0.42.1"
+version = "0.43.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Raul Dias"]
@@ -69,6 +69,8 @@ nvml-wrapper = "0.13"
 zbus = { version = "6.2.1", default-features = false, features = ["tokio", "proxy", "service"] }
 tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util", "fs"] }
 futures-util = "0.3"
+# Content hashes of the media gallery (SHA-256).
+sha2 = "0.10"
 toml = "1.2"
 tempfile = "3"
 # Run-time loading of the CUDA driver and the Maxine SDK (ADR-0012): nothing

@@ -656,6 +656,112 @@ impl HostBgr {
     }
 }
 
+/// A canonical NV12 frame in host memory that is only read: the planes as
+/// [`HostNv12`] describes them, borrowed as byte slices. The Y plane is
+/// `height` rows of at least `width` bytes, `y_stride` bytes apart; the
+/// interleaved UV plane is `height / 2` rows of at least `width` bytes,
+/// `uv_stride` bytes apart. `width` and `height` are even.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostNv12View<'a> {
+    /// The Y plane, from pixel (0, 0).
+    pub y: &'a [u8],
+    /// Bytes between the starts of two Y rows.
+    pub y_stride: usize,
+    /// The UV plane, from its first U,V pair.
+    pub uv: &'a [u8],
+    /// Bytes between the starts of two UV rows.
+    pub uv_stride: usize,
+    /// Width in pixels (even).
+    pub width: u32,
+    /// Height in pixels (even).
+    pub height: u32,
+}
+
+impl HostNv12View<'_> {
+    /// Checks the description is self-consistent: even non-zero size,
+    /// strides of at least `width` bytes, and planes long enough for their
+    /// rows (the last row of each may be only `width` bytes).
+    pub fn validate(&self) -> Result<(), BackendError> {
+        if self.width == 0
+            || self.height == 0
+            || !self.width.is_multiple_of(2)
+            || !self.height.is_multiple_of(2)
+        {
+            return Err(BackendError::InvalidInput(format!(
+                "host NV12 frame size {}x{} must be even and non-zero",
+                self.width, self.height
+            )));
+        }
+        let (w, h) = (self.width as usize, self.height as usize);
+        if self.y_stride < w || self.uv_stride < w {
+            return Err(BackendError::InvalidInput(format!(
+                "host NV12 strides (Y {}, UV {}) are smaller than the width {}",
+                self.y_stride, self.uv_stride, self.width
+            )));
+        }
+        let y_need = self.y_stride * (h - 1) + w;
+        let uv_need = self.uv_stride * (h / 2 - 1) + w;
+        if self.y.len() < y_need || self.uv.len() < uv_need {
+            return Err(BackendError::InvalidInput(format!(
+                "host NV12 frame {}x{} needs {y_need} Y and {uv_need} UV bytes, has {} and {}",
+                self.width,
+                self.height,
+                self.y.len(),
+                self.uv.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// One frame of a video background: the per-frame counterpart of
+/// [`LoadRequest::background`], handed to
+/// [`InferenceBackend::set_background_frame`]. NV12 of the loaded size and
+/// colour ([`LoadRequest::width`], [`LoadRequest::height`],
+/// [`LoadRequest::colour`]), in the memory of the loaded instance's
+/// frames. A backend copies or converts what it keeps: a host frame is
+/// borrowed for the call only; a CUDA frame is valid in stream order (the
+/// caller keeps it alive and unwritten until the work the backend enqueued
+/// on the instance's stream during the call has completed, and nothing
+/// may read it after the call on another stream).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundFrame<'a> {
+    /// In CUDA device memory of the instance's [`GpuContext`], ready on its
+    /// stream (the stream of the load): for an instance loaded with
+    /// [`InferenceBackend::load`].
+    Cuda(DeviceNv12),
+    /// In host memory: for an instance loaded with
+    /// [`InferenceBackend::load_host`].
+    Host(HostNv12View<'a>),
+}
+
+impl BackgroundFrame<'_> {
+    /// The size in pixels.
+    pub fn size(&self) -> (u32, u32) {
+        match self {
+            BackgroundFrame::Cuda(f) => (f.width, f.height),
+            BackgroundFrame::Host(f) => (f.width, f.height),
+        }
+    }
+
+    /// The frame kind of its memory.
+    pub fn kind(&self) -> FrameKind {
+        match self {
+            BackgroundFrame::Cuda(_) => FrameKind::Cuda,
+            BackgroundFrame::Host(_) => FrameKind::Host,
+        }
+    }
+
+    /// Checks the description is self-consistent
+    /// ([`DeviceNv12::validate`], [`HostNv12View::validate`]).
+    pub fn validate(&self) -> Result<(), BackendError> {
+        match self {
+            BackgroundFrame::Cuda(f) => f.validate(),
+            BackgroundFrame::Host(f) => f.validate(),
+        }
+    }
+}
+
 /// The CUDA context and stream a backend runs in: those of the GStreamer
 /// stream the element belongs to.
 ///
@@ -954,6 +1060,43 @@ pub trait InferenceBackend: Send {
     /// does. The default reports none.
     fn status_values(&self) -> Vec<StageValue> {
         Vec::new()
+    }
+
+    /// Whether [`InferenceBackend::set_background_frame`] takes frames: a
+    /// backend that says no shows a video background as a still (the
+    /// load-time [`LoadRequest::background`]), and the caller reports that
+    /// it does. A property of the backend (for a module, of its ABI version
+    /// and vtable), not of the loaded chain. The default is `false`.
+    fn supports_live_background(&self) -> bool {
+        false
+    }
+
+    /// Replaces the background of the loaded [`EffectKind::Replace`] with
+    /// `frame` for the following frames, until the next call: the
+    /// per-frame counterpart of [`LoadRequest::background`], for a video
+    /// background. Called between two frames, only on an instance loaded
+    /// with `Replace`, and only when
+    /// [`InferenceBackend::supports_live_background`] says yes. `frame` is
+    /// NV12 of the loaded size and colour, of the loaded frame kind
+    /// ([`BackgroundFrame`]: a host frame valid during the call, a CUDA
+    /// frame in stream order). `None` returns to the load-time image, and
+    /// so does every load ([`InferenceBackend::load`],
+    /// [`InferenceBackend::load_host`], a switch as a full load): the caller
+    /// gives a frame again after it when it wants one. A frame of the
+    /// wrong size or kind is
+    /// [`BackendError::InvalidInput`]; any failure leaves the previous
+    /// background in force. Called with the context current on CUDA
+    /// frames, none on host frames, as the other methods. The default
+    /// refuses with [`BackendError::Unavailable`].
+    fn set_background_frame(
+        &mut self,
+        frame: Option<BackgroundFrame<'_>>,
+    ) -> Result<(), BackendError> {
+        let _ = frame;
+        Err(BackendError::Unavailable(format!(
+            "{} shows a video background as a still",
+            self.name()
+        )))
     }
 
     /// Forgets the temporal state of the loaded stages and of the mask, so
@@ -1398,6 +1541,62 @@ mod tests {
             stream: std::ptr::null_mut(),
         };
         assert_eq!(Stateless.reset_temporal(&gpu), Ok(StageList::default()));
+        // No per-frame background by default.
+        assert!(!Stateless.supports_live_background());
+        assert_eq!(
+            Stateless.set_background_frame(None),
+            Err(BackendError::Unavailable(
+                "stateless shows a video background as a still".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn background_frames_are_checked() {
+        let (y, uv) = (vec![0u8; 4 * 2], vec![0u8; 4]);
+        let view = HostNv12View {
+            y: &y,
+            y_stride: 4,
+            uv: &uv,
+            uv_stride: 4,
+            width: 4,
+            height: 2,
+        };
+        let host = BackgroundFrame::Host(view);
+        assert_eq!(host.validate(), Ok(()));
+        assert_eq!((host.size(), host.kind()), ((4, 2), FrameKind::Host));
+        // A short plane, a narrow stride, an odd size.
+        let short = HostNv12View { y: &y[..7], ..view };
+        assert!(matches!(
+            short.validate(),
+            Err(BackendError::InvalidInput(m)) if m.contains("needs 8 Y")
+        ));
+        let narrow = HostNv12View {
+            uv_stride: 2,
+            ..view
+        };
+        assert!(narrow.validate().is_err());
+        let odd = HostNv12View { width: 3, ..view };
+        assert!(odd.validate().is_err());
+        let device = BackgroundFrame::Cuda(DeviceNv12 {
+            y: 0x1000,
+            y_pitch: 512,
+            uv: 0x2000,
+            uv_pitch: 512,
+            width: 8,
+            height: 4,
+        });
+        assert_eq!(device.validate(), Ok(()));
+        assert_eq!((device.size(), device.kind()), ((8, 4), FrameKind::Cuda));
+        let null = BackgroundFrame::Cuda(DeviceNv12 {
+            y: 0,
+            y_pitch: 8,
+            uv: 0,
+            uv_pitch: 8,
+            width: 8,
+            height: 4,
+        });
+        assert!(null.validate().is_err());
     }
 
     #[test]

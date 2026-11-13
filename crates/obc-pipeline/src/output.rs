@@ -212,7 +212,9 @@ use obc_core::{ColourRange, OutputContract, OutputFormat};
 use serde::Serialize;
 
 use crate::clock::{Latest, Pacer, PacerConfig, PacerCounts, PhaseLockConfig, Step, TickKind};
-use crate::effect::{EffectBackend, EffectSettings, EffectStats, EffectStatus, effect_element};
+use crate::effect::{
+    EffectBackend, EffectSettings, EffectStats, EffectStatus, effect_element_with_video,
+};
 use crate::frame::{Canonical, Frame, FrameWriter};
 use crate::ingest::CUDA_CONTEXT_TYPE;
 use crate::loopback::{PlaceholderState, WriterAttachment, WriterHandle, image_contract_frame};
@@ -283,6 +285,12 @@ pub struct OutputConfig {
     /// ([`Output::revoke_effect_backend`], [`Output::set_effect_backend`]).
     /// Unused without [`Self::effect`].
     pub effect_backend: Option<EffectBackend>,
+    /// The video background of replace the effect element starts with
+    /// ([`gst_obc::ObcEffect::set_background_video`]; the settings'
+    /// `background` is then its load-time still): none by default.
+    /// [`Output::set_effect_video`] changes it while the output runs.
+    /// Unused without [`Self::effect`].
+    pub effect_background_video: Option<PathBuf>,
     /// The module stage elements ([`crate::module`]), one per entry, in
     /// order within their placement: none by default. Their names must be
     /// unique; on system-memory frames every factory must take host
@@ -308,6 +316,7 @@ impl OutputConfig {
             phase_lock: PhaseLockConfig::default(),
             effect: None,
             effect_backend: None,
+            effect_background_video: None,
             module_stages: Vec::new(),
             placeholder_image: None,
         }
@@ -713,7 +722,11 @@ impl Output {
         place(&mut chain, ModulePlacement::BeforeEffect)?;
         let effect = match &cfg.effect {
             Some(settings) => {
-                let fx = effect_element(settings, cfg.effect_backend.as_ref())?;
+                let fx = effect_element_with_video(
+                    settings,
+                    cfg.effect_backend.as_ref(),
+                    cfg.effect_background_video.as_deref(),
+                )?;
                 chain.push(fx.clone().upcast());
                 Some(fx)
             }
@@ -889,6 +902,35 @@ impl Output {
         })?;
         crate::effect::check_settings(settings)?;
         fx.apply(settings).map_err(PipelineError::Effect)
+    }
+
+    /// [`Self::set_effect`] with the video background `video` of replace
+    /// ([`gst_obc::ObcEffect::set_background_video`]; the settings'
+    /// `background` is its load-time still), as one change: a new video is
+    /// set before the settings are applied, and a video taken away after
+    /// them, so the element never holds replace with neither a still nor a
+    /// video. Changing the video alone reloads nothing.
+    pub fn set_effect_video(
+        &self,
+        settings: &EffectSettings,
+        video: Option<&Path>,
+    ) -> Result<(), PipelineError> {
+        let fx = self.effect.as_ref().ok_or_else(|| {
+            PipelineError::Effect(
+                "this output was built without the effect element (OutputConfig::effect)".into(),
+            )
+        })?;
+        crate::effect::check_settings_video(settings, video.is_some())?;
+        if video.is_some() {
+            fx.set_background_video(video)
+                .map_err(PipelineError::Effect)?;
+        }
+        fx.apply(settings).map_err(PipelineError::Effect)?;
+        if video.is_none() && fx.background_video().is_some() {
+            fx.set_background_video(None)
+                .map_err(PipelineError::Effect)?;
+        }
+        Ok(())
     }
 
     /// Takes the effect element's backend away at once: the effect and its

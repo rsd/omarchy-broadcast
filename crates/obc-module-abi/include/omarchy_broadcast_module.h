@@ -29,8 +29,10 @@
  *   `audio_instance_load` and `audio_instance_process`.
  * * 1.3 adds named status values: `obc_status_value` and the vtable
  *   entry `instance_status_values`.
+ * * 1.4 adds the per-frame background: the vtable entry
+ *   `instance_set_background` (see the crate documentation).
  */
-#define OBC_MODULE_ABI_MINOR 3
+#define OBC_MODULE_ABI_MINOR 4
 
 /**
  * The packed ABI version this crate describes: `major << 16 | minor`
@@ -805,6 +807,29 @@ typedef struct obc_module_vtable {
     obc_status (*instance_status_values)(struct obc_instance *instance,
                                          const struct obc_status_value **out,
                                          size_t *n);
+    /**
+     * Since ABI 1.4. Nullable (null: the module shows a video background
+     * as the load-time still). Replaces the background of a loaded chain
+     * that includes `background` under replace, for the following
+     * `instance_process` calls until the next call; the host calls it
+     * between two `instance_process` calls. `background` is an NV12 frame
+     * of the chain's output size, colour description and frame kind (CUDA
+     * device memory on the chain's context and stream, or host memory).
+     * A host frame is valid only during the call. A CUDA frame is valid in
+     * stream order: the module may enqueue reads of it on the chain's
+     * stream during the call, and the host keeps it alive and unwritten
+     * until the work so enqueued has completed; it must not be read after
+     * the call on any other stream, nor kept. Either way the module copies
+     * or converts what it keeps. A null `background` returns to the
+     * load-time background image. Every load of the chain (a switch or a
+     * full reload) also returns to the load-time image of that load: a
+     * frame given before it is no longer in force, and the host gives one
+     * again when it wants it. `OBC_ERR_INVALID` for a frame of the
+     * wrong size, format or kind; any failure leaves the previous
+     * background in force.
+     */
+    obc_status (*instance_set_background)(struct obc_instance *instance,
+                                          const struct obc_frame *background);
 } obc_module_vtable;
 
 /**

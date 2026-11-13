@@ -90,6 +90,17 @@ fn kept(input: &Nv12, out: &Nv12) -> f64 {
     n as f64 / (input.w * input.h) as f64
 }
 
+/// A `w x h` NV12 frame of one colour, rows `pitch` bytes apart.
+fn solid(w: usize, h: usize, pitch: usize, y: u8, (u, v): (u8, u8)) -> Nv12 {
+    let mut data = vec![y; pitch * (h + h / 2)];
+    for row in data[pitch * h..].chunks_mut(pitch) {
+        for c in row[..w].chunks_mut(2) {
+            c.copy_from_slice(&[u, v]);
+        }
+    }
+    Nv12 { w, h, pitch, data }
+}
+
 fn median(mut v: Vec<f32>) -> f32 {
     v.sort_by(f32::total_cmp);
     v[v.len() / 2]
@@ -225,6 +236,43 @@ fn with_onnx_runtime_and_the_models() {
         / (W * H) as f64;
     eprintln!("replace: {:.1} % of the picture is the image", 100.0 * grey);
     assert!(grey > 0.03, "{grey}");
+
+    // A per-frame background (ABI 1.4) shows where the room was, in
+    // place of the image; `None` returns to the image; a frame of another
+    // size is refused and leaves the one in force.
+    let share = |out: &Nv12, luma: i32| {
+        (0..H)
+            .flat_map(|y| (0..W).map(move |x| (x, y)))
+            .filter(|&(x, y)| (i32::from(out.y(x, y)) - luma).abs() <= 1)
+            .count() as f64
+            / (W * H) as f64
+    };
+    let mut live = solid(W, H, W + 32, 60, (100, 150));
+    let f = live.frame(0);
+    // SAFETY: host memory of this test, valid during the call.
+    unsafe { inst.set_background(Some(&f)) }.unwrap();
+    live.data.fill(0); // copied: the frame is valid only during the call
+    let out = run(&mut inst, &frame, 0);
+    let (shown, still) = (share(&out, 60), share(&out, 126));
+    eprintln!(
+        "per-frame background: {:.1} % of the picture",
+        100.0 * shown
+    );
+    assert!(
+        (shown - grey).abs() < 0.02 && still < 0.01,
+        "{shown} {still}"
+    );
+    let mut small = solid(W - 2, H, W, 30, (128, 128));
+    let f = small.frame(0);
+    // SAFETY: as above.
+    let e = unsafe { inst.set_background(Some(&f)) }.unwrap_err();
+    assert_eq!(e.status, obc_module_host::Status::Invalid, "{e:?}");
+    let out = run(&mut inst, &frame, 0);
+    assert!(share(&out, 60) > 0.03, "the previous background stays");
+    // SAFETY: no frame.
+    unsafe { inst.set_background(None) }.unwrap();
+    let out = run(&mut inst, &frame, 0);
+    assert!((share(&out, 126) - grey).abs() < 0.02 && share(&out, 60) < 0.01);
 
     // A failed switch keeps the previous chain running: an engine this
     // build lacks fails the load, and the replace chain still runs.
@@ -442,6 +490,50 @@ fn with_onnx_runtime_and_the_models() {
         medians.join(", ")
     );
     assert!(total < 100.0, "{total} ms a frame");
+
+    // A video background at 1080p: the frame handed in before each frame
+    // (its copy, timed here), and the composite over it.
+    let bg = HostBgr {
+        width: 64,
+        height: 36,
+        stride: 64 * 3,
+        data: vec![128; 64 * 3 * 36],
+    };
+    inst.load(&host_chain(
+        1920,
+        1080,
+        &[("mode", "replace"), ("engine", "cpu")],
+        Some(bg),
+    ))
+    .unwrap();
+    let mut live = solid(1920, 1080, 1920, 60, (100, 150));
+    let (mut set, mut still, mut over) = (Vec::new(), Vec::new(), Vec::new());
+    for i in 0..60 {
+        let flags = if i == 0 { OBC_FRAME_FLAG_NEW_SOURCE } else { 0 };
+        run(&mut inst, &frame, flags);
+        let composite = |inst: &obc_module_host::Instance| inst.timings()[2].1;
+        let c0 = composite(&inst);
+        let f = live.frame(0);
+        let t = std::time::Instant::now();
+        // SAFETY: host memory of this test, valid during the call.
+        unsafe { inst.set_background(Some(&f)) }.unwrap();
+        let ms = t.elapsed().as_secs_f32() * 1e3;
+        run(&mut inst, &frame, OBC_FRAME_FLAG_REPEAT);
+        let c1 = composite(&inst);
+        // SAFETY: no frame.
+        unsafe { inst.set_background(None) }.unwrap();
+        if i >= 10 {
+            set.push(ms);
+            still.push(c0);
+            over.push(c1);
+        }
+    }
+    eprintln!(
+        "1080p video background: set_background {:.2} ms; composite over it {:.2} ms, over the image {:.2} ms (median)",
+        median(set),
+        median(over),
+        median(still)
+    );
 
     // The same on the engine `auto` chose, when it is not the CPU.
     if engine != "CPU" {

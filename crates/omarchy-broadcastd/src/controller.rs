@@ -342,7 +342,7 @@ use crate::backend::{
 };
 use crate::camera::{self, Camera};
 use crate::gpu_cache;
-use crate::media::{MediaStore, same_file};
+use crate::media::{self, CopyEvent, CopyState, MediaStore, VideoInfo, same_file};
 use crate::mic::{self, agent::MicEvent, agent::MicLink, agent::MicRequest};
 use crate::modules::{self, HostMemory, Modules, Plan};
 use crate::preview::{Leases, PreviewDir, check_fps};
@@ -441,8 +441,11 @@ pub enum Command {
     SetEffect(String, Reply),
     /// `SetBlurStrength(d)`.
     SetBlurStrength(f64, Reply),
-    /// `SetBackgroundImage(s)` (empty: clear it).
-    SetBackgroundImage(String, Reply),
+    /// `SetBackgroundImage(s)` (empty: clear it), with the check of the
+    /// video it names, made by the caller off this thread (`None`: not a
+    /// video, or not checked; a video is then checked on the poster's
+    /// thread).
+    SetBackgroundImage(String, Option<VideoInfo>, Reply),
     /// `RemoveMedia(s)`, once the path was checked to be an item of the
     /// user's gallery: refused while the configuration names the file
     /// (`[effect] background_image` or `fallback_image`); the run-time
@@ -536,6 +539,16 @@ pub enum Command {
     SetMicHost(bool, Reply),
     /// What the microphone's agent found or did ([`crate::mic::agent`]).
     Mic(MicEvent),
+    /// A step of a playback copy job ([`VideoService::ensure_copy`]).
+    PlaybackCopy(CopyEvent),
+    /// The check and the poster of the video `source` asked for
+    /// ([`VideoService::request_poster`]): the poster `None` when it cannot
+    /// be made.
+    VideoPoster {
+        source: PathBuf,
+        info: Result<VideoInfo, String>,
+        poster: Option<PathBuf>,
+    },
     /// Stop everything and end the controller loop.
     Shutdown,
 }
@@ -1400,6 +1413,16 @@ pub struct Controller<B: MediaBackend> {
     /// Why the running session's effect element cannot show the fallback
     /// image, while its effect has failed (a `Warning` clause).
     fallback_failure: Option<String>,
+    /// Why the running session's effect element does not play the video
+    /// background, or that its module shows it as a still (a `Warning`
+    /// clause).
+    background_failure: Option<String>,
+    /// What video backgrounds are asked of ([`Self::set_videos`]).
+    videos: Box<dyn VideoService>,
+    /// The background in force last examined by [`Self::follow_video`].
+    video_for: Option<PathBuf>,
+    /// The background in force when it is a video.
+    video: Option<VideoChoice>,
     /// The `Error` property.
     error: String,
     /// The state file could not be read or parsed: why (the `Error` text).
@@ -1869,6 +1892,10 @@ impl<B: MediaBackend> Controller<B> {
             placeholder_pending_since: None,
             placeholder_overdue: false,
             fallback_failure: None,
+            background_failure: None,
+            videos: Box::new(NoGallery),
+            video_for: None,
+            video: None,
             error,
             state_damaged,
             save_failure: None,
@@ -1965,8 +1992,8 @@ impl<B: MediaBackend> Controller<B> {
                 let res = self.set_blur_strength(v, now);
                 let _ = reply.send(res);
             }
-            Command::SetBackgroundImage(path, reply) => {
-                let res = self.set_background_image(&path, now);
+            Command::SetBackgroundImage(path, info, reply) => {
+                let res = self.set_background_image_checked(&path, info, now);
                 let _ = reply.send(res);
             }
             Command::ReleaseMedia { store, path, reply } => {
@@ -2124,6 +2151,12 @@ impl<B: MediaBackend> Controller<B> {
             Command::Rescan => self.rescan(now),
             Command::SetMicHost(on, reply) => self.set_mic_host(on, reply),
             Command::Mic(event) => self.mic_event(event),
+            Command::PlaybackCopy(event) => self.copy_ended(&event, now),
+            Command::VideoPoster {
+                source,
+                info,
+                poster,
+            } => self.poster_made(&source, info, poster, now),
             Command::Shutdown => return false,
         }
         true
@@ -2424,10 +2457,13 @@ impl<B: MediaBackend> Controller<B> {
         } else {
             EffectMode::None
         };
+        let (background_image, background_video) = self.background_parts(effect.background_image);
         EffectRun {
             mode,
             blur_strength: effect.blur_strength,
-            background_image: effect.background_image,
+            background_image,
+            // Played only under `replace`.
+            background_video: background_video.filter(|_| mode == EffectMode::Replace),
             on_failure: effect.on_failure,
             fallback_image: effect.fallback_image,
             stages: plan
@@ -2701,6 +2737,7 @@ impl<B: MediaBackend> Controller<B> {
             .into_iter()
             .chain(self.passthrough.clone())
             .chain(self.fallback_warnings())
+            .chain(self.video_warnings())
             .chain(dropped_text(&dropped))
             .chain(self.held_warning())
             .chain(self.forced_warnings())
@@ -3885,6 +3922,7 @@ impl<B: MediaBackend> Controller<B> {
             EffectStatus::Failed(_) => report.fallback_error.clone(),
             _ => None,
         };
+        self.background_failure.clone_from(&report.background_error);
         if self.follow_effect(&report, now) {
             return true;
         }
@@ -4343,6 +4381,8 @@ impl<B: MediaBackend> Controller<B> {
         // The memory the session runs in is decided now too, and the
         // modules told before the plan (what they offer depends on it).
         self.follow_memory();
+        // A video background's copy follows that memory.
+        self.follow_video(true);
         // Which module runs each stage is decided now, for the whole
         // session (frame generation when the first camera's rate is half
         // the output's).
@@ -4533,9 +4573,12 @@ impl<B: MediaBackend> Controller<B> {
         if effect.mode != EffectMode::Replace {
             return Ok(());
         }
-        match &effect.background_image {
-            None => Err("the replace effect needs a background image".into()),
-            Some(p) => check_background_file(p),
+        match (&effect.background_image, &effect.background_video) {
+            (None, None) => Err("the replace effect needs a background image".into()),
+            // A video's still: its poster, or the still in force.
+            (Some(p), _) => check_background_file(p),
+            // A video that cannot play says so in the element's report.
+            (None, Some(_)) => Ok(()),
         }
     }
 
@@ -4685,6 +4728,7 @@ impl<B: MediaBackend> Controller<B> {
         self.stages.clear();
         self.effect_failure = None;
         self.fallback_failure = None;
+        self.background_failure = None;
         let enhance = self.enhance_failure.take();
         if stages || enhance.is_some_and(|e| e == self.error) {
             self.error = self.standing_error();
@@ -5482,6 +5526,20 @@ impl<B: MediaBackend> Controller<B> {
     /// refused while `replace` is in force and the config has no image to
     /// fall back to.
     fn set_background_image(&mut self, path: &str, now: Instant) -> Result<(), IpcError> {
+        self.set_background_image_checked(path, None, now)
+    }
+
+    /// [`Self::set_background_image`] with `info`, the check of the video
+    /// `path` names, made by the caller (never here: it can take seconds).
+    /// A video without it is checked on the poster's thread; a file that
+    /// starts like a video but is over the video limit is refused with
+    /// that limit.
+    fn set_background_image_checked(
+        &mut self,
+        path: &str,
+        info: Option<VideoInfo>,
+        now: Instant,
+    ) -> Result<(), IpcError> {
         let new = if path.is_empty() {
             if self.effect().mode == EffectMode::Replace
                 && self.config.effect.background_image.is_none()
@@ -5502,8 +5560,22 @@ impl<B: MediaBackend> Controller<B> {
             None
         } else {
             let p = PathBuf::from(path);
-            check_background_file(&p).map_err(IpcError::InvalidArgument)?;
-            info!("background image: {}", p.display());
+            if p.is_absolute() && is_video_file(&p) {
+                if let Some(info) = &info {
+                    // Looked up by `follow_video` (a `stat`).
+                    media::remember_video_info(&p, info);
+                }
+                info!("background video: {}", p.display());
+            } else if let Some(reason) = p
+                .is_absolute()
+                .then(|| media::oversized_video(&p))
+                .flatten()
+            {
+                return Err(IpcError::InvalidArgument(reason));
+            } else {
+                check_background_file(&p).map_err(IpcError::InvalidArgument)?;
+                info!("background image: {}", p.display());
+            }
             Some(p)
         };
         let changed = self.runtime.background_image != new;
@@ -5550,6 +5622,218 @@ impl<B: MediaBackend> Controller<B> {
         }
         info!("removed from the media gallery: {}", path.display());
         Ok(())
+    }
+
+    // ---- video backgrounds ----
+
+    /// Sets what video backgrounds are asked of (the daemon's
+    /// [`GalleryVideos`]; [`NoGallery`] until then), and asks it to prune
+    /// the cache, keeping what the background in force needs when it is a
+    /// video (one outside the gallery included). The background is
+    /// examined again with it.
+    pub fn set_videos(&mut self, videos: Box<dyn VideoService>) {
+        self.videos = videos;
+        let outside = self.effect().background_image.filter(|p| is_video_file(p));
+        self.videos.prune(outside.as_deref());
+        self.video_for = None;
+        self.video = None;
+        self.follow_video(false);
+    }
+
+    /// Follows the background in force when it is a video
+    /// ([`video`](self::video)): a new choice takes its check when this
+    /// run made it ([`media::known_video_info`]), asks for its poster (and
+    /// the check, when not known) off this thread and keeps the still in
+    /// force until it comes (a copy job of the previous choice is
+    /// cancelled); under `replace` in a system-memory session a video that
+    /// is not CPU-ready gets its playback copy asked for, once per choice
+    /// and again at each camera start (`start`: a copy removed from the
+    /// cache is made again, a failed job runs once more, and the still of
+    /// the last session is dropped). Cheap when nothing changed: a `stat`.
+    /// Never runs the video check.
+    fn follow_video(&mut self, start: bool) {
+        let effect = self.effect();
+        if self.video_for != effect.background_image {
+            self.video_for.clone_from(&effect.background_image);
+            if self
+                .video
+                .take()
+                .is_some_and(|v| v.copy == Some(CopyState::Preparing))
+            {
+                self.videos.cancel_copy();
+            }
+            if let Some(path) = effect.background_image.filter(|p| is_video_file(p)) {
+                let info = media::known_video_info(&path);
+                // The still the element has now stays until the poster.
+                let still_before = self
+                    .session
+                    .as_ref()
+                    .and(self.effect_applied.as_ref())
+                    .and_then(|e| e.background_image.clone());
+                self.videos.request_poster(&path);
+                self.video = Some(VideoChoice {
+                    source: path,
+                    checked: info.is_some(),
+                    info,
+                    poster: None,
+                    still_before,
+                    copy: None,
+                });
+            }
+        } else if start && let Some(v) = &mut self.video {
+            v.copy = None;
+            v.still_before = None;
+        }
+        if let Some(v) = &mut self.video {
+            v.drop_gone_still();
+        }
+        self.ask_copy(start);
+    }
+
+    /// Under `replace` in a system-memory session, asks for the playback
+    /// copy of the video chosen when its check says it needs one and it
+    /// was not asked for yet (`retry`: a failed job runs once more).
+    fn ask_copy(&mut self, retry: bool) {
+        let effect = self.effect();
+        let system = self.session_memory() == VideoMemory::System;
+        if let Some(v) = &mut self.video
+            && effect.mode == EffectMode::Replace
+            && system
+            && v.checked
+            && v.needs_copy()
+            && v.copy.is_none()
+        {
+            let state = self.videos.ensure_copy(&v.source, retry);
+            match &state {
+                CopyState::Ready(p) => {
+                    info!("background video: playing its copy {}", p.display());
+                }
+                CopyState::Checking => debug!(
+                    "background video: looking for the copy of {}",
+                    v.source.display()
+                ),
+                CopyState::Preparing => info!(
+                    "background video: preparing {} for playback on the CPU",
+                    v.source.display()
+                ),
+                CopyState::NoFfmpeg => warning!(
+                    "background video: {} is shown as a still: ffmpeg is not installed",
+                    v.source.display()
+                ),
+                CopyState::Failed(why) => warning!(
+                    "background video: {} is shown as a still: {why}",
+                    v.source.display()
+                ),
+            }
+            v.copy = Some(state);
+        }
+    }
+
+    /// The still and the video the effect element is given for the
+    /// background `image` in force: the image itself and no video, or for
+    /// the video chosen its still and what plays
+    /// ([`VideoChoice::still`], [`VideoChoice::playing`]).
+    fn background_parts(&self, image: Option<PathBuf>) -> (Option<PathBuf>, Option<PathBuf>) {
+        match &self.video {
+            Some(v) if image.as_ref() == Some(&v.source) => (
+                v.still(),
+                v.playing(self.session_memory() == VideoMemory::System),
+            ),
+            _ => (image, None),
+        }
+    }
+
+    /// A step of a playback copy job ([`Command::PlaybackCopy`]): for the
+    /// video in force, a ready copy is given to the running session with
+    /// no restart (the still stays until the copy's first frame); a
+    /// failure keeps the still; a transcode starting is said in `Warning`.
+    fn copy_ended(&mut self, event: &CopyEvent, now: Instant) {
+        let Some(v) = self.video.as_mut() else {
+            return;
+        };
+        if !v.copy_step(event) {
+            return;
+        }
+        match &event.state {
+            CopyState::Ready(p) => info!("background video: its copy is ready: {}", p.display()),
+            CopyState::Preparing => info!(
+                "background video: preparing {} for playback on the CPU",
+                event.source.display()
+            ),
+            CopyState::Failed(why) => warning!(
+                "background video: {} is shown as a still: {why}",
+                event.source.display()
+            ),
+            CopyState::Checking | CopyState::NoFfmpeg => {}
+        }
+        if self.session.is_some()
+            && let Err(e) = self.apply_effect()
+        {
+            warning!("background video: {}", e.message());
+        }
+        self.reconcile(now);
+    }
+
+    /// The check and the poster of `source` came
+    /// ([`Command::VideoPoster`]): for the video in force, a check not
+    /// known yet is taken (and its copy asked for when it needs one), and
+    /// the poster becomes the still the running session is given.
+    fn poster_made(
+        &mut self,
+        source: &Path,
+        info: Result<VideoInfo, String>,
+        poster: Option<PathBuf>,
+        now: Instant,
+    ) {
+        let Some(v) = self.video.as_mut().filter(|v| v.source == source) else {
+            return;
+        };
+        let mut changed = false;
+        if !v.checked {
+            v.checked = true;
+            changed = true;
+            match info {
+                Ok(i) => v.info = Some(i),
+                Err(e) => warning!("background video: {e}"),
+            }
+        }
+        if v.poster != poster {
+            v.poster = poster;
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        self.ask_copy(false);
+        if self.session.is_some()
+            && let Err(e) = self.apply_effect()
+        {
+            warning!("background video: {}", e.message());
+        }
+        self.reconcile(now);
+    }
+
+    /// `Warning`'s clauses of the video background: why the running
+    /// session's element does not play it, or that its module shows it as
+    /// a still; then, under `replace` in a system-memory session, a
+    /// playback copy that is not ready ([`copy_clause`]).
+    fn video_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.session.is_some() {
+            out.extend(self.background_failure.clone());
+        }
+        let effect = self.effect();
+        if let Some(v) = &self.video
+            && effect.mode == EffectMode::Replace
+            && effect.background_image.as_ref() == Some(&v.source)
+            && self.session_memory() == VideoMemory::System
+            && v.checked
+            && v.needs_copy()
+            && let Some(copy) = &v.copy
+        {
+            out.extend(copy_clause(copy, v.still().is_some()));
+        }
+        out
     }
 
     /// `SetDenoise`: noise removal on or off, before the effect (or alone
@@ -5717,6 +6001,8 @@ impl<B: MediaBackend> Controller<B> {
             self.error = self.standing_error();
         }
         let stages = self.take_stage_failures();
+        // A video chosen now: its poster, and in system memory its copy.
+        self.follow_video(false);
         // Tried again below: the next report says whether it still fails.
         // Under `black` the frames stay black meanwhile, so the text
         // stands until that report (ready clears it, a failure replaces
@@ -5767,6 +6053,7 @@ impl<B: MediaBackend> Controller<B> {
     /// session even when unchanged (its element reads a replaced fallback
     /// image again).
     fn apply_effect_with(&mut self, again: bool) -> Result<(), IpcError> {
+        self.follow_video(false);
         let effect = self.effect_run();
         let failed = matches!(self.effect_seen, Some(EffectStatus::Failed(_)));
         let prev = self.effect_applied.clone();
@@ -8619,6 +8906,8 @@ fn maxine_root_note(
 /// Runs `ctrl` until [`Command::Shutdown`] or until every sender is gone,
 /// then shuts it down.
 pub fn run<B: MediaBackend>(mut ctrl: Controller<B>, commands: Receiver<Command>) {
+    // A video check here would block every command behind it.
+    media::probe::forbid_on_this_thread();
     loop {
         let wait = ctrl.next_wakeup(Instant::now());
         match commands.recv_timeout(wait) {
@@ -8636,6 +8925,11 @@ pub fn run<B: MediaBackend>(mut ctrl: Controller<B>, commands: Receiver<Command>
 
 #[cfg(test)]
 mod tests;
+
+mod video;
+
+pub use video::{GalleryVideos, NoGallery, VideoService, is_video_file};
+use video::{VideoChoice, copy_clause};
 
 #[cfg(test)]
 mod maxine_root_tests {

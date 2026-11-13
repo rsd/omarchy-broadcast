@@ -15,9 +15,9 @@ use obc_backend::enhance::{
     ChromaSiting, DeviceYuv420, EnhanceRequest, EnhancerFactory, YuvLayout,
 };
 use obc_backend::{
-    Availability, BackendError, BackendFactory, ChainFrame, ChainRequest, ColourSpec, DeviceNv12,
-    EffectKind, FrameKind, FrameParams, GpuContext, HostBgr, HostNv12, LoadRequest, Params,
-    StageChainFactory, StageId, StageList, Value,
+    Availability, BackendError, BackendFactory, BackgroundFrame, ChainFrame, ChainRequest,
+    ColourSpec, DeviceNv12, EffectKind, FrameKind, FrameParams, GpuContext, HostBgr, HostNv12,
+    HostNv12View, LoadRequest, Params, StageChainFactory, StageId, StageList, Value,
 };
 use obc_module_host::discovery::dirs_from;
 use obc_module_host::manifest::{REASON_AUDIO_IN_WORKER, REASON_VIDEO_IN_DAEMON};
@@ -513,11 +513,11 @@ fn broken_modules_are_unavailable_with_their_reasons_and_the_process_lives() {
     // would abort the process) is called.
     let r = reason("org.test.major");
     assert!(
-        r.contains("module ABI 2.0") && r.contains("module ABI 1.3"),
+        r.contains("module ABI 2.0") && r.contains("module ABI 1.4"),
         "{r}"
     );
     let r = reason("org.test.minor");
-    assert!(r.contains("1.99, newer than") && r.contains("1.3"), "{r}");
+    assert!(r.contains("1.99, newer than") && r.contains("1.4"), "{r}");
     let r = reason("org.test.refuse");
     assert!(r.contains("refused this daemon"), "{r}");
     let r = reason("org.test.init");
@@ -649,7 +649,8 @@ fn a_panic_in_process_is_an_error_and_the_process_survives() {
 #[test]
 fn a_repeat_is_flagged_for_a_module_of_abi_1_1_and_reprocessed_by_one_of_1_0() {
     for (features, abi, flagged) in [
-        ("", "1.3", true),
+        ("", "1.4", true),
+        ("abi-1-3", "1.3", true),
         ("abi-1-2", "1.2", true),
         ("abi-1-1", "1.1", true),
         ("abi-1-0", "1.0", false),
@@ -706,7 +707,7 @@ fn status_values_cross_from_a_module_of_abi_1_3_and_none_from_one_of_1_2() {
         name: name.into(),
         value,
     };
-    for (features, abi, reports) in [("", "1.3", true), ("abi-1-2", "1.2", false)] {
+    for (features, abi, reports) in [("", "1.4", true), ("abi-1-2", "1.2", false)] {
         let dir = tempfile::tempdir().unwrap();
         let lib = own_copy(&fixture_lib(features), dir.path(), "fixture");
         let m = manifest(
@@ -1053,6 +1054,180 @@ fn the_backend_factory_carries_the_effect_through_the_abi() {
     backend.unload();
     assert!(backend.timings().is_none());
     assert!(backend.status_values().is_empty());
+}
+
+/// The replace request of the per-frame background tests: `background`
+/// alone, at `w` x `h`.
+fn replace_request(effect: EffectKind, w: u32, h: u32) -> LoadRequest {
+    LoadRequest {
+        effect,
+        stages: StageList::default(),
+        width: w,
+        height: h,
+        colour: ColourSpec::FULL_BT601,
+        background: Some(Arc::new(HostBgr {
+            width: w,
+            height: h,
+            stride: 3 * w as usize,
+            data: vec![7; (3 * w * h) as usize],
+        })),
+        params: BTreeMap::new(),
+    }
+}
+
+/// A module of ABI 1.4 that sets `instance_set_background` takes a
+/// per-frame background through the effect seam, on CUDA frames with the
+/// chain's handles; the host refuses, without calling the module, a frame
+/// of the wrong size, a call before a load and one on a chain that does
+/// not replace the background; the module's own refusal is a frame error.
+#[test]
+fn a_per_frame_background_reaches_a_module_of_abi_1_4() {
+    let (_dir, module, lines) = fixture(serde_json::json!({}));
+    let factory = ModuleBackendFactory::new(module);
+    let mut backend = factory.create().unwrap();
+    assert!(backend.supports_live_background());
+    let gpu = fake_gpu();
+    let frame = BackgroundFrame::Cuda(fake_nv12(640, 360));
+    assert!(matches!(
+        backend.set_background_frame(Some(frame)),
+        Err(BackendError::InvalidInput(m)) if m.contains("not loaded")
+    ));
+
+    backend
+        .load(&gpu, &replace_request(EffectKind::Replace, 640, 360))
+        .unwrap();
+    backend.set_background_frame(Some(frame)).unwrap();
+    assert_eq!(
+        last_line(&lines, "fixture-background"),
+        "fixture-background frame=cuda:nv12:640x360:2:cuda=yes:0"
+    );
+    // The wrong size, or host memory on a CUDA chain: never called.
+    let calls = count(&lines, "fixture-background");
+    let small = BackgroundFrame::Cuda(fake_nv12(320, 180));
+    assert!(matches!(
+        backend.set_background_frame(Some(small)),
+        Err(BackendError::InvalidInput(m)) if m.contains("output size 640x360")
+    ));
+    let (y, uv) = (vec![1u8; 640 * 360], vec![128u8; 640 * 180]);
+    let host = BackgroundFrame::Host(HostNv12View {
+        y: &y,
+        y_stride: 640,
+        uv: &uv,
+        uv_stride: 640,
+        width: 640,
+        height: 360,
+    });
+    assert!(matches!(
+        backend.set_background_frame(Some(host)),
+        Err(BackendError::InvalidInput(m)) if m.contains("not host frames")
+    ));
+    assert_eq!(count(&lines, "fixture-background"), calls);
+    // Back to the load-time image.
+    backend.set_background_frame(None).unwrap();
+    assert_eq!(
+        last_line(&lines, "fixture-background"),
+        "fixture-background none"
+    );
+    // A frame still runs after a refused background.
+    backend
+        .process(
+            &gpu,
+            &FrameParams::default(),
+            &fake_nv12(640, 360),
+            &fake_nv12(640, 360),
+        )
+        .unwrap();
+
+    // A blur chain does not replace the background.
+    backend
+        .load(&gpu, &replace_request(EffectKind::Blur, 640, 360))
+        .unwrap();
+    assert!(matches!(
+        backend.set_background_frame(Some(frame)),
+        Err(BackendError::InvalidInput(m)) if m.contains("does not replace")
+    ));
+    backend.unload();
+    assert!(backend.set_background_frame(None).is_err());
+    assert_eq!(count(&lines, "fixture-background"), calls + 1);
+}
+
+/// On host frames the background crosses as a host NV12 frame the module
+/// reads; the module's refusal fails the call and the chain keeps
+/// running.
+#[test]
+fn a_per_frame_background_reaches_a_module_on_host_frames() {
+    let (_dir, module, lines) = host_fixture();
+    let factory = ModuleBackendFactory::new(module);
+    let mut backend = factory.create().unwrap();
+    backend
+        .load_host(&replace_request(EffectKind::Replace, 4, 2))
+        .unwrap();
+    let mut view = |luma: u8| {
+        let (y, uv) = (vec![luma; 8], vec![128u8; 4]);
+        let frame = BackgroundFrame::Host(HostNv12View {
+            y: &y,
+            y_stride: 4,
+            uv: &uv,
+            uv_stride: 4,
+            width: 4,
+            height: 2,
+        });
+        backend.set_background_frame(Some(frame))
+    };
+    view(30).unwrap();
+    assert_eq!(
+        last_line(&lines, "fixture-background"),
+        "fixture-background frame=host:nv12:4x2:2:cuda=no:30"
+    );
+    let e = view(99).unwrap_err();
+    assert!(
+        matches!(&e, BackendError::Run { message, .. } if message.contains("luma 99")),
+        "{e:?}"
+    );
+    assert!(backend.is_loaded());
+    let mut img = HostImage::new(4, 2, 50, 128);
+    let src = img.frame();
+    let mut out = HostImage::new(4, 2, 0, 0);
+    let mut dst = out.frame();
+    backend
+        .process_host(&FrameParams::default(), &src, &mut dst)
+        .unwrap();
+}
+
+/// A module of ABI 1.3 is never handed a per-frame background, even when
+/// its vtable is large enough to hold the entry and sets it: the backend
+/// says it shows a video background as a still.
+#[test]
+fn a_module_of_abi_1_3_is_never_handed_a_per_frame_background() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = own_copy(&fixture_lib("abi-1-3"), dir.path(), "fixture");
+    let m = manifest(
+        &fixture_manifest("org.test.fixture", &lib, 1),
+        dir.path(),
+        "fixture",
+    );
+    let (sink, lines) = capture();
+    let module = Module::open(&m, &serde_json::json!({}), sink).expect("the fixture opens");
+    assert_eq!(
+        obc_module_host::library::version_text(module.library().abi_version()),
+        "1.3"
+    );
+    assert!(!module.library().has_live_background());
+    let factory = ModuleBackendFactory::new(module);
+    let mut backend = factory.create().unwrap();
+    assert!(!backend.supports_live_background());
+    backend
+        .load(&fake_gpu(), &replace_request(EffectKind::Replace, 640, 360))
+        .unwrap();
+    let e = backend
+        .set_background_frame(Some(BackgroundFrame::Cuda(fake_nv12(640, 360))))
+        .unwrap_err();
+    assert_eq!(
+        e,
+        BackendError::Unavailable("org.test.fixture shows a video background as a still".into())
+    );
+    assert!(backend.set_background_frame(None).is_err());
+    assert_eq!(count(&lines, "fixture-background"), 0);
 }
 
 /// The fixture with a `background` that takes CUDA and host frames, as the
@@ -1573,7 +1748,7 @@ fn an_audio_module_loads_only_through_the_audio_kinds_and_runs_blocks() {
     let module = registry.module("org.test.audio").unwrap().clone();
     assert_eq!(
         obc_module_host::library::version_text(module.library().abi_version()),
-        "1.3"
+        "1.4"
     );
     assert!(module.library().has_audio());
     assert!(module.matte_stages().is_empty());

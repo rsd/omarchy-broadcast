@@ -18,6 +18,9 @@
 //!   4:2:0 ([`background::decode_yuv420`]).
 //! * [`cuda`]: the subset of GStreamer's CUDA library it uses, opened at run
 //!   time.
+//! * [`video_background`]: the replace effect's video, decoded in a loop
+//!   into the composite (the file and container checks, the reasons the
+//!   element reports).
 
 pub mod background;
 pub mod cuda;
@@ -26,6 +29,7 @@ pub mod enhance;
 pub mod module;
 mod settings;
 mod video;
+pub mod video_background;
 
 pub use effect::{
     ELEMENT_NAME, NEW_SOURCE_FLAG, ObcEffect, PLACEHOLDER_FLAG, REPEAT_FLAG, STATUS_MESSAGE,

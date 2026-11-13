@@ -216,14 +216,27 @@ mode = "none"
 # Default: 0.5
 blur_strength = 0.5
 
-# Image shown behind the person with "replace": an absolute path to an
-# PNG or JPEG file (at most 32 MiB and 8192x8192 pixels; only the first
+# Image or video shown behind the person with "replace": an absolute path to
+# an PNG or JPEG file (at most 32 MiB and 8192x8192 pixels; only the first
 # image of the file is used, so data after it, such as the gain map or video
 # of a phone photo, is ignored), scaled with a centre crop to fill the
 # frame. Required when mode = "replace".
 # The file is read when the effect starts; a file that is missing or cannot
 # be decoded then is an effect failure (see on_failure).
-# Default: "" (no image). Example:
+# It may also be a video (interface revision 18): an MP4, M4V, MOV, MKV or
+# WebM file holding H.264, HEVC, VP9 or AV1, 8-bit 4:2:0, at most 512 MiB and
+# 3840x2160, played in a loop behind the person (the audio is ignored). A
+# video is checked when the camera starts, not when the configuration is read,
+# and one that cannot play is not an effect failure: the picture in force
+# stays and the Warning property says why. With an NVIDIA GPU the video plays
+# as it is. In system memory ([video] memory) only a VP9 video of at most
+# 1920x1080 and 30 fps plays as it is, on the CPU; of any other video the
+# daemon makes a VP9 copy of at most 1920x1080 and 30 fps in its cache the
+# first time it needs it (this needs ffmpeg; the video's poster, a still
+# image, is shown meanwhile). Videos of the gallery
+# (omarchy-broadcast media) are the ones a panel offers.
+# Default: "" (no image). Examples: "/home/user/Pictures/background.png",
+# or a video, "/home/user/Videos/loop.webm".
 # background_image = "/home/user/Pictures/background.png"
 
 # Video noise removal: reduces the grain of a dim or small camera sensor.

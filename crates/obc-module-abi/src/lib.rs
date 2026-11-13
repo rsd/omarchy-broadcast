@@ -104,6 +104,39 @@
 //!   (`instance_load`, `instance_process`): they may fail with
 //!   [`OBC_ERR_UNSUPPORTED`]. The host refuses an `audio-filter` module
 //!   whose vtable lacks the audio entries.
+//!
+//! # The per-frame background (since ABI 1.4)
+//!
+//! A chain that replaces the background (its `background` stage under the
+//! replace mode) gets its background image at load time
+//! ([`obc_chain_request::background`]). A host that shows a video as the
+//! background hands the module one background frame at a time through the
+//! nullable vtable entry `instance_set_background`:
+//!
+//! * The host calls it between two `instance_process` calls, only on a
+//!   loaded instance whose chain includes `background` under replace.
+//! * The frame has the chain's output size and colour description (matrix,
+//!   chroma siting, range), is NV12 ([`OBC_FORMAT_NV12`]) and of the
+//!   chain's frame kind: CUDA device memory on the chain's context and
+//!   stream for a CUDA chain, host memory for a host chain. The module
+//!   copies or converts what it keeps.
+//! * A host frame is valid only during the call. A CUDA frame is valid in
+//!   stream order: the module may enqueue reads of it on the chain's
+//!   stream during the call, and the host keeps the memory alive and
+//!   unwritten until the work so enqueued has completed. It is never read
+//!   after the call on another stream, nor kept.
+//! * It replaces the background of the following `instance_process` calls,
+//!   until the next call. A null frame returns to the load-time background
+//!   image, and so does every load of the chain (a switch as well as a
+//!   full reload): after one the load-time image of that load is in force
+//!   until the host gives a frame again.
+//! * A frame of the wrong size, format or kind is refused with
+//!   [`OBC_ERR_INVALID`]. Any failure leaves the previous background in
+//!   force.
+//!
+//! A module of ABI 1.3 or older, or one that leaves the entry null, is
+//! never called: the host shows the video background as a still (the
+//! load-time image), and reports that it does.
 
 // The names are the C names of the header, as in a `-sys` crate.
 #![allow(non_camel_case_types)]
@@ -125,7 +158,9 @@ pub const OBC_MODULE_ABI_MAJOR: u32 = 1;
 ///   `audio_instance_load` and `audio_instance_process`.
 /// * 1.3 adds named status values: [`obc_status_value`] and the vtable
 ///   entry `instance_status_values`.
-pub const OBC_MODULE_ABI_MINOR: u32 = 3;
+/// * 1.4 adds the per-frame background: the vtable entry
+///   `instance_set_background` (see the crate documentation).
+pub const OBC_MODULE_ABI_MINOR: u32 = 4;
 
 /// The packed ABI version this crate describes: `major << 16 | minor`
 /// ([`obc_module_abi_pack`]).
@@ -921,6 +956,31 @@ pub struct obc_module_vtable {
             n: *mut usize,
         ) -> obc_status,
     >,
+    /// Since ABI 1.4. Nullable (null: the module shows a video background
+    /// as the load-time still). Replaces the background of a loaded chain
+    /// that includes `background` under replace, for the following
+    /// `instance_process` calls until the next call; the host calls it
+    /// between two `instance_process` calls. `background` is an NV12 frame
+    /// of the chain's output size, colour description and frame kind (CUDA
+    /// device memory on the chain's context and stream, or host memory).
+    /// A host frame is valid only during the call. A CUDA frame is valid in
+    /// stream order: the module may enqueue reads of it on the chain's
+    /// stream during the call, and the host keeps it alive and unwritten
+    /// until the work so enqueued has completed; it must not be read after
+    /// the call on any other stream, nor kept. Either way the module copies
+    /// or converts what it keeps. A null `background` returns to the
+    /// load-time background image. Every load of the chain (a switch or a
+    /// full reload) also returns to the load-time image of that load: a
+    /// frame given before it is no longer in force, and the host gives one
+    /// again when it wants it. [`OBC_ERR_INVALID`] for a frame of the
+    /// wrong size, format or kind; any failure leaves the previous
+    /// background in force.
+    pub instance_set_background: Option<
+        unsafe extern "C" fn(
+            instance: *mut obc_instance,
+            background: *const obc_frame,
+        ) -> obc_status,
+    >,
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,8 +1165,8 @@ mod tests {
 
     #[test]
     fn version_packing() {
-        assert_eq!(OBC_MODULE_ABI_VERSION, 0x0001_0003);
-        assert_eq!(obc_module_abi_pack(1, 3), OBC_MODULE_ABI_VERSION);
+        assert_eq!(OBC_MODULE_ABI_VERSION, 0x0001_0004);
+        assert_eq!(obc_module_abi_pack(1, 4), OBC_MODULE_ABI_VERSION);
         assert_eq!(obc_module_abi_pack(2, 7), 0x0002_0007);
         assert_eq!(obc_module_abi_major(0x0002_0007), 2);
         assert_eq!(obc_module_abi_minor(0x0002_0007), 7);
@@ -1286,7 +1346,7 @@ mod tests {
                 size_of::<obc_module_vtable>(),
                 align_of::<obc_module_vtable>()
             ),
-            (8 + 19 * 8, 8)
+            (8 + 20 * 8, 8)
         );
         assert_eq!(offset_of!(obc_module_vtable, struct_size), 0);
         assert_eq!(offset_of!(obc_module_vtable, abi_version), 4);
@@ -1311,6 +1371,8 @@ mod tests {
         assert_eq!(offset_of!(obc_module_vtable, audio_instance_process), 144);
         // ABI 1.3.
         assert_eq!(offset_of!(obc_module_vtable, instance_status_values), 152);
+        // ABI 1.4.
+        assert_eq!(offset_of!(obc_module_vtable, instance_set_background), 160);
 
         assert_eq!(
             (

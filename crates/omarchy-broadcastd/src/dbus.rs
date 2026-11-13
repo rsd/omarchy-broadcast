@@ -22,19 +22,28 @@
 //! takes the [`MediaStore`] (or why there is none, then `GetMedia`,
 //! `ImportMedia` and `RemoveMedia` answer `Failed` with that reason), its
 //! calls run on the blocking pool, and `MediaSerial` is kept here, from 1,
-//! raised after each import that stored a file and each removal, with its
-//! `PropertiesChanged`. It restarts at 1 at each daemon start: a client
+//! raised after each import that stored a file, each removal and each
+//! poster made, with its `PropertiesChanged`. `GetMedia` lists posters
+//! that exist only (the listing never decodes, ADR 0032) and hands the
+//! videos without one to the store's one [`PosterMaker`]; each poster it
+//! makes raises `MediaSerial` (posters landing together raise it once), so
+//! a client lists again and finds it. It restarts at 1 at each daemon
+//! start: a client
 //! compares serials within one daemon run (a new owner of the bus name is
 //! a new run). A removal is checked here (a user item), then checked
 //! against the configuration, cleared from the run-time background and
 //! performed by the controller in one step ([`Command::ReleaseMedia`]).
+//!
+//! `SetBackgroundImage` of a video runs the video check here, on the
+//! blocking pool, and hands its result to the controller with the
+//! command: the controller's thread never runs it (it can take seconds).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
 use obc_ipc::settings::{VariantDict, WireChange, camera_option};
@@ -42,7 +51,7 @@ use obc_ipc::{
     CameraControl, CameraControls, CameraInfo, INTERFACE, IpcError, MediaEntry, MediaReply,
     OBJECT_PATH, SettingValue, Snapshot, State,
 };
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use zbus::fdo::NameOwnerChangedStream;
 use zbus::message::Header;
 use zbus::names::{BusName, InterfaceName};
@@ -54,7 +63,7 @@ use crate::controller::{
     Change, Command, ConfigFilesReply, ConfigSchemaReply, ControlsReply, MovesReply, Note,
     PathReply, Published, Reply, SettingsReply,
 };
-use crate::media::{MediaError, MediaItem, MediaKind, MediaStore};
+use crate::media::{self, MediaError, MediaItem, MediaKind, MediaStore, MediaType, PosterMaker};
 
 /// The D-Bus object (see the module docs).
 pub struct Server {
@@ -63,7 +72,12 @@ pub struct Server {
     /// The media gallery, or why there is none (its message).
     media: Result<Arc<MediaStore>, String>,
     /// `MediaSerial`.
-    media_serial: AtomicU32,
+    media_serial: Arc<AtomicU32>,
+    /// The maker of the posters `GetMedia` found missing (with a gallery).
+    posters: Option<PosterMaker>,
+    /// Each poster made, until the first `GetMedia` takes it to raise
+    /// `MediaSerial` ([`Server::follow_posters`]).
+    posters_made: Mutex<Option<UnboundedReceiver<()>>>,
 }
 
 impl Server {
@@ -75,12 +89,45 @@ impl Server {
         commands: Sender<Command>,
         media: Result<MediaStore, MediaError>,
     ) -> Self {
+        let (made_tx, made_rx) = unbounded_channel();
+        let posters = media.as_ref().ok().map(|store| {
+            PosterMaker::new(store.clone(), move |_| {
+                let _ = made_tx.send(());
+            })
+        });
         Server {
             published,
             commands,
             media: media.map(Arc::new).map_err(|e| e.to_string()),
-            media_serial: AtomicU32::new(1),
+            media_serial: Arc::new(AtomicU32::new(1)),
+            posters,
+            posters_made: Mutex::new(Some(made_rx)),
         }
+    }
+
+    /// From the first call on, a task raising `MediaSerial` (and announcing
+    /// it through `emitter`) for the posters made: those landing together
+    /// raise it once.
+    fn follow_posters(&self, emitter: &SignalEmitter<'_>) {
+        let Some(mut made) = self
+            .posters_made
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        else {
+            return;
+        };
+        let emitter = emitter.to_owned();
+        let serial = Arc::clone(&self.media_serial);
+        tokio::spawn(async move {
+            while made.recv().await.is_some() {
+                while made.try_recv().is_ok() {}
+                let now = serial.fetch_add(1, Ordering::SeqCst) + 1;
+                if let Err(e) = emit_changed(&emitter, "MediaSerial", &now).await {
+                    crate::debug!("emitting a signal failed: {e}");
+                }
+            }
+        });
     }
 
     /// The media gallery, or `Failed` with why there is none.
@@ -189,14 +236,22 @@ fn media_entry(item: &MediaItem) -> Option<MediaEntry> {
     })
 }
 
-/// The `GetMedia` reply for `kind`, at `serial`.
-fn media_reply(store: &MediaStore, kind: MediaKind, serial: u32) -> MediaReply {
-    MediaReply {
+/// The `GetMedia` reply for `kind`, at `serial`, and the videos listed
+/// without a poster.
+fn media_reply(store: &MediaStore, kind: MediaKind, serial: u32) -> (MediaReply, Vec<PathBuf>) {
+    let items = store.list(kind);
+    let missing = items
+        .iter()
+        .filter(|i| i.media_type == MediaType::Video && i.poster.is_none())
+        .map(|i| i.path.clone())
+        .collect();
+    let reply = MediaReply {
         serial,
         bundled_dir: store.bundled_dir(kind).to_string_lossy().into_owned(),
         user_dir: store.user_dir(kind).to_string_lossy().into_owned(),
-        items: store.list(kind).iter().filter_map(media_entry).collect(),
-    }
+        items: items.iter().filter_map(media_entry).collect(),
+    };
+    (reply, missing)
 }
 
 #[interface(name = "br.com.dias.OmarchyBroadcast1")]
@@ -242,10 +297,29 @@ impl Server {
     }
 
     /// Sets the background image of `replace`: an absolute path to a
-    /// readable regular file of at most 32 MiB; empty clears it. Persists
-    /// across restarts.
+    /// readable regular file of at most 32 MiB, or from revision 18 a video
+    /// the video check accepts (MP4, M4V, MOV, MKV or WebM, at most
+    /// 512 MiB), played in a loop behind the person; empty clears it.
+    /// Persists across restarts.
     async fn set_background_image(&self, path: String) -> Result<(), IpcError> {
-        self.call(|r| Command::SetBackgroundImage(path, r)).await
+        let p = PathBuf::from(&path);
+        // A video is checked here, off the controller's thread.
+        let info = if p.is_absolute() {
+            off_executor(move || {
+                if crate::controller::is_video_file(&p) {
+                    media::check_video(&p)
+                        .map(Some)
+                        .map_err(IpcError::InvalidArgument)
+                } else {
+                    Ok(None)
+                }
+            })
+            .await?
+        } else {
+            None
+        };
+        self.call(|r| Command::SetBackgroundImage(path, info, r))
+            .await
     }
 
     /// Switches video noise removal on or off: it runs before the effect,
@@ -501,19 +575,28 @@ impl Server {
     async fn get_media(
         &self,
         kind: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> Result<(u32, String, String, Vec<VariantDict>), IpcError> {
         let kind: MediaKind = kind.parse().map_err(media_error)?;
         let store = self.store()?;
         // Read before the list: a change made meanwhile is announced after.
         let serial = self.media_serial.load(Ordering::SeqCst);
-        let reply = off_executor(move || Ok(media_reply(&store, kind, serial))).await?;
+        let (reply, missing) = off_executor(move || Ok(media_reply(&store, kind, serial))).await?;
+        if let Some(posters) = &self.posters
+            && !missing.is_empty()
+        {
+            self.follow_posters(&emitter);
+            posters.request(missing);
+        }
         Ok(reply.to_wire())
     }
 
     /// Copies the image at `path` (absolute) into the user's gallery of
     /// `kind` after the checks of a background, and returns the stored
     /// path; a file of that gallery with the same bytes is returned
-    /// instead, without a copy (revision 15). `MediaSerial` moves only when
+    /// instead, without a copy (revision 15). A background may also be a
+    /// video, stored as it is after its check, or an animated image,
+    /// transcoded to a VP9 WebM with ffmpeg ([`MediaStore::import`]). `MediaSerial` moves only when
     /// a file was stored. Refused with `InvalidArgument` and the reason;
     /// `Failed` when the gallery cannot be written.
     async fn import_media(
@@ -567,6 +650,9 @@ impl Server {
                 {
                     return Err(media_error(MediaError::NotAUserItem(target)));
                 }
+                // Here, not on the controller: a video's content hash,
+                // which names its poster and playback copies.
+                store.warm_hash(&target);
                 Ok(())
             })
             .await?;
@@ -792,8 +878,9 @@ impl Server {
         self.snap().mic.unwrap_or_default().error
     }
 
-    /// Bumped after each import that stored a file and each removal from
-    /// the media gallery; from 1, restarting at 1 at each daemon start, so
+    /// Bumped after each import that stored a file, each removal from the
+    /// media gallery and each poster made for a video `GetMedia` listed
+    /// without one; from 1, restarting at 1 at each daemon start, so
     /// compared only within one daemon run (revision 15).
     #[zbus(property)]
     fn media_serial(&self) -> u32 {

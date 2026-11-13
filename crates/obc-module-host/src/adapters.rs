@@ -48,9 +48,10 @@ use obc_backend::enhance::{
     YuvLayout,
 };
 use obc_backend::{
-    BackendError, BackendFactory, ChainFrame, ChainRequest, ColourMatrix, DeviceNv12, EffectKind,
-    FrameKind, FrameParams, GpuContext, HostNv12, InferenceBackend, LoadReport, LoadRequest,
-    Params, StageChain, StageChainFactory, StageId, StageList, StageTimings, StageValue, Value,
+    BackendError, BackendFactory, BackgroundFrame, ChainFrame, ChainRequest, ColourMatrix,
+    DeviceNv12, EffectKind, FrameKind, FrameParams, GpuContext, HostNv12, HostNv12View,
+    InferenceBackend, LoadReport, LoadRequest, Params, StageChain, StageChainFactory, StageId,
+    StageList, StageTimings, StageValue, Value,
 };
 use obc_module_abi::{
     OBC_CHROMA_SITING_COSITED, OBC_CHROMA_SITING_JPEG, OBC_CHROMA_SITING_MPEG2, OBC_FORMAT_I420,
@@ -197,6 +198,20 @@ fn host_nv12(f: &HostNv12) -> obc_frame {
     o.n_planes = 2;
     o.planes[0] = plane(f.y as u64, f.y_pitch);
     o.planes[1] = plane(f.uv as u64, f.uv_pitch);
+    o
+}
+
+/// A host NV12 frame over the read-only planes of `f`: the module only
+/// reads it.
+fn host_nv12_view(f: &HostNv12View<'_>) -> obc_frame {
+    let mut o = obc_frame::empty();
+    o.kind = OBC_FRAME_HOST;
+    o.format = OBC_FORMAT_NV12;
+    o.width = f.width;
+    o.height = f.height;
+    o.n_planes = 2;
+    o.planes[0] = plane(f.y.as_ptr() as u64, f.y_stride);
+    o.planes[1] = plane(f.uv.as_ptr() as u64, f.uv_stride);
     o
 }
 
@@ -378,8 +393,10 @@ impl BackendFactory for ModuleBackendFactory {
             name: self.name,
             slots,
             background: false,
+            replace: false,
             host: self.kinds.contains(&FrameKind::Host),
             kind: None,
+            gpu: None,
         }))
     }
 
@@ -422,10 +439,15 @@ pub struct ModuleBackend {
     slots: BTreeMap<StageId, Slot>,
     /// Whether the loaded chain has the `background` stage.
     background: bool,
+    /// Whether the loaded chain's effect is [`EffectKind::Replace`].
+    replace: bool,
     /// Whether the module takes host frames for the effect.
     host: bool,
     /// The frame kind of the loaded chain.
     kind: Option<FrameKind>,
+    /// The CUDA context and stream of the loaded chain (none for host
+    /// frames): those of a per-frame background.
+    gpu: Option<GpuContext>,
 }
 
 impl ModuleBackend {
@@ -467,14 +489,26 @@ impl ModuleBackend {
         }
     }
 
-    /// Loads `spec`, of frames of `kind`.
-    fn load_spec(&mut self, spec: &ChainSpec, kind: FrameKind) -> Result<LoadReport, BackendError> {
+    /// Loads `spec`, of frames of `kind`, for `effect`.
+    fn load_spec(
+        &mut self,
+        spec: &ChainSpec,
+        kind: FrameKind,
+        effect: EffectKind,
+    ) -> Result<LoadReport, BackendError> {
         let result = self.instance.load(spec);
         self.background = self.instance.chain().contains(&StageId::BACKGROUND);
         if result.is_ok() {
             self.kind = Some(kind);
+            self.replace = effect == EffectKind::Replace;
+            self.gpu = (kind == FrameKind::Cuda).then_some(GpuContext {
+                context: spec.cuda.context,
+                stream: spec.cuda.stream,
+            });
         } else if !self.instance.is_loaded() {
             self.kind = None;
+            self.replace = false;
+            self.gpu = None;
         }
         result
             .map(load_report)
@@ -558,7 +592,7 @@ impl InferenceBackend for ModuleBackend {
     fn load(&mut self, gpu: &GpuContext, req: &LoadRequest) -> Result<LoadReport, BackendError> {
         check_context(gpu)?;
         let spec = self.spec(req, OBC_FRAME_CUDA, cuda(gpu));
-        self.load_spec(&spec, FrameKind::Cuda)
+        self.load_spec(&spec, FrameKind::Cuda, req.effect)
     }
 
     fn process(
@@ -586,7 +620,9 @@ impl InferenceBackend for ModuleBackend {
     fn unload(&mut self) {
         self.instance.unload();
         self.background = false;
+        self.replace = false;
         self.kind = None;
+        self.gpu = None;
     }
 
     /// Whether the instance holds a chain: not after a failed full load, a
@@ -615,6 +651,66 @@ impl InferenceBackend for ModuleBackend {
         self.instance.status_values()
     }
 
+    /// A module of ABI 1.4 or later that sets `instance_set_background`.
+    fn supports_live_background(&self) -> bool {
+        self.instance.has_live_background()
+    }
+
+    /// Hands the frame to the module's `instance_set_background` (ABI
+    /// 1.4), on the loaded chain's CUDA handles for a CUDA frame. Refused
+    /// without calling the module: by a module without the entry
+    /// ([`BackendError::Unavailable`]), and with
+    /// [`BackendError::InvalidInput`] when nothing is loaded, when the
+    /// loaded chain does not replace the background, and for a frame that
+    /// is malformed or not of the loaded kind and size.
+    fn set_background_frame(
+        &mut self,
+        frame: Option<BackgroundFrame<'_>>,
+    ) -> Result<(), BackendError> {
+        if !self.instance.has_live_background() {
+            return Err(BackendError::Unavailable(format!(
+                "{} shows a video background as a still",
+                self.name
+            )));
+        }
+        let Some(kind) = self.kind.filter(|_| self.instance.is_loaded()) else {
+            return Err(BackendError::InvalidInput(format!(
+                "the {} chain is not loaded: a background came before a successful load",
+                self.name
+            )));
+        };
+        if !(self.background && self.replace) {
+            return Err(BackendError::InvalidInput(format!(
+                "the loaded {} chain does not replace the background",
+                self.name
+            )));
+        }
+        let raw = match frame {
+            None => None,
+            Some(f) => {
+                f.validate()?;
+                check_kind(self.name, Some(kind), f.kind())?;
+                Some(match f {
+                    BackgroundFrame::Cuda(d) => {
+                        let gpu = self.gpu.ok_or_else(|| {
+                            BackendError::InvalidInput(format!(
+                                "the {} chain has no CUDA context",
+                                self.name
+                            ))
+                        })?;
+                        cuda_nv12(&d, &gpu)
+                    }
+                    BackgroundFrame::Host(h) => host_nv12_view(&h),
+                })
+            }
+        };
+        // SAFETY: the seam's contract: the frame is memory of the loaded
+        // kind, valid for the call (device memory of the current context
+        // for a CUDA frame); the module only reads it.
+        let result = unsafe { self.instance.set_background(raw.as_ref()) };
+        result.map_err(|e| backend_error(e, Phase::Run))
+    }
+
     fn reset_temporal(&mut self, gpu: &GpuContext) -> Result<StageList, BackendError> {
         let _ = gpu;
         self.check_cuda()?;
@@ -632,7 +728,7 @@ impl InferenceBackend for ModuleBackend {
             )));
         }
         let spec = self.spec(req, OBC_FRAME_HOST, obc_cuda::null());
-        self.load_spec(&spec, FrameKind::Host)
+        self.load_spec(&spec, FrameKind::Host, req.effect)
     }
 
     fn process_host(

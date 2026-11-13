@@ -847,6 +847,8 @@ fn build_output(
     // fallback image or the camera image): the room is never shown for
     // want of a module.
     ocfg.effect = Some(effect_settings(&params.effect));
+    ocfg.effect_background_video
+        .clone_from(&params.effect.background_video);
     ocfg.effect_backend = effect_backend(&params.backends);
     ocfg.module_stages = module_stages(&params.effect, &params.backends);
     // The away image of `output.placeholder = "image"` (`None`: black),
@@ -1214,8 +1216,9 @@ impl MediaBackend for GstBackend {
         // the module's own libraries, but neither makes a CUDA call (a CUDA
         // call would block until unparked).
         effect_backend_available_with(backend.factory().as_ref())?;
-        obc_pipeline::effect::check_settings_with(
+        obc_pipeline::effect::check_settings_with_video(
             &effect_settings(effect),
+            effect.background_video.is_some(),
             backend.factory().as_ref(),
         )
         .map_err(effect_error)
@@ -1227,7 +1230,7 @@ impl MediaBackend for GstBackend {
         };
         let output = r.session.output();
         output
-            .set_effect(&effect_settings(effect))
+            .set_effect_video(&effect_settings(effect), effect.background_video.as_deref())
             .map_err(effect_error)?;
         for c in effect.chains.iter().filter(|c| r.chains.contains(&c.name)) {
             let stages: Vec<StageRequest> = c.stages.iter().map(stage_request).collect();
@@ -1300,6 +1303,7 @@ impl MediaBackend for GstBackend {
             reused: stats.last_load_reused,
             gpu_ms_p50: stats.gpu_ms_p50,
             fallback_error: stats.fallback_error,
+            background_error: stats.background_error,
             stage_values: output.stage_values(),
         })
     }
@@ -1887,6 +1891,7 @@ mod tests {
             mode: EffectMode::None,
             blur_strength: 0.5,
             background_image: None,
+            background_video: None,
             on_failure: EffectOnFailure::Black,
             fallback_image: None,
             stages: plan

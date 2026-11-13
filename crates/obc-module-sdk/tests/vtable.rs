@@ -27,6 +27,8 @@ struct TestInstance {
     step: u8,
     stages: Vec<String>,
     frames: u32,
+    /// The first luma byte of the per-frame background in force, if any.
+    background: Option<u8>,
 }
 
 impl Module for TestModule {
@@ -77,6 +79,7 @@ impl Module for TestModule {
             step: self.step,
             stages: Vec::new(),
             frames: 0,
+            background: None,
         })
     }
 }
@@ -145,7 +148,28 @@ impl Instance for TestInstance {
         if self.frames == 0 {
             return Vec::new();
         }
-        vec![StatusValue::new("test", "frames", f64::from(self.frames))]
+        let mut values = vec![StatusValue::new("test", "frames", f64::from(self.frames))];
+        if let Some(y) = self.background {
+            values.push(StatusValue::new("test", "background", f64::from(y)));
+        }
+        values
+    }
+
+    const LIVE_BACKGROUND: bool = true;
+
+    /// Keeps the first luma byte; a background of luma 99 is refused.
+    fn set_background(&mut self, frame: Option<&Frame<'_>>) -> Result<(), Error> {
+        let Some(frame) = frame else {
+            self.background = None;
+            return Ok(());
+        };
+        // SAFETY: a host frame the host owns for the call.
+        let y = unsafe { frame.host_plane(0) }?[0];
+        if y == 99 {
+            return Err(Error::failed("the background could not be taken"));
+        }
+        self.background = Some(y);
+        Ok(())
     }
 }
 
@@ -270,7 +294,7 @@ fn load(vt: &obc_module_vtable, instance: *mut obc_instance) -> (obc_status, obc
 
 #[test]
 fn abi_version_is_packed() {
-    assert_eq!(obc_module_abi_version(), obc_module_abi_pack(1, 3));
+    assert_eq!(obc_module_abi_version(), obc_module_abi_pack(1, 4));
     assert_eq!(obc_module_abi_major(obc_module_abi_version()), 1);
     let vt = vtable();
     assert_eq!(vt.struct_size as usize, size_of::<obc_module_vtable>());
@@ -279,6 +303,8 @@ fn abi_version_is_packed() {
     // The plain form of the macro: a video module, without the audio
     // entries of ABI 1.2.
     assert!(vt.audio_instance_load.is_none() && vt.audio_instance_process.is_none());
+    // The instance declares a per-frame background (ABI 1.4).
+    assert!(vt.instance_set_background.is_some());
 }
 
 #[test]
@@ -294,7 +320,7 @@ fn entry_refuses_a_bad_host() {
     // SAFETY: as above.
     assert!(unsafe { obc_module_entry(&other_major) }.is_null());
     let mut newer_minor = *host();
-    newer_minor.abi_version = obc_module_abi_pack(1, 3);
+    newer_minor.abi_version = obc_module_abi_pack(1, 5);
     // SAFETY: as above.
     assert!(!unsafe { obc_module_entry(&newer_minor) }.is_null());
 }
@@ -532,6 +558,94 @@ fn status_values(
             (text(v.stage), text(v.name), v.value)
         })
         .collect()
+}
+
+/// Hands `frame` (null: none) to `instance_set_background`.
+fn set_background(
+    vt: &obc_module_vtable,
+    instance: *mut obc_instance,
+    frame: Option<&obc_frame>,
+) -> obc_status {
+    let ptr = frame.map_or(ptr::null(), |f| f as *const obc_frame);
+    // SAFETY: a live instance; the frame lives across the call.
+    unsafe { vt.instance_set_background.unwrap()(instance, ptr) }
+}
+
+/// The per-frame background value the instance reports, if any.
+fn background_value(vt: &obc_module_vtable, instance: *mut obc_instance) -> Option<f64> {
+    status_values(vt, instance)
+        .into_iter()
+        .find(|(_, name, _)| name == "background")
+        .map(|(_, _, v)| v)
+}
+
+#[test]
+fn a_per_frame_background_is_checked_and_replaces_the_previous() {
+    let vt = vtable();
+    let module = init(vt, c"{}");
+    let instance = create(vt, module);
+
+    let mut buf = vec![40u8; 4 * 2 + 4];
+    let good = nv12(&mut buf, 4, 2);
+    // Before a load: the wrong state.
+    assert_eq!(set_background(vt, instance, Some(&good)), OBC_ERR_STATE);
+    assert_eq!(load(vt, instance).0, OBC_OK);
+
+    // A frame of the output size, NV12 and host: taken.
+    assert_eq!(set_background(vt, instance, Some(&good)), OBC_OK);
+    // The value is read after a frame.
+    let mut fbuf = vec![10u8; 4 * 2 + 4];
+    let frame = nv12(&mut fbuf, 4, 2);
+    // SAFETY: the frame's memory lives across the call; in place.
+    let status = unsafe { vt.instance_process.unwrap()(instance, &frame, &frame, ptr::null(), 0) };
+    assert_eq!(status, OBC_OK);
+    assert_eq!(background_value(vt, instance), Some(40.0));
+
+    // The wrong size, format or kind: refused, the previous stays.
+    let mut small_buf = vec![50u8; 2 * 2 + 2];
+    let small = nv12(&mut small_buf, 2, 2);
+    assert_eq!(set_background(vt, instance, Some(&small)), OBC_ERR_INVALID);
+    assert!(text(unsafe { vt.instance_last_error.unwrap()(instance) }).contains("output size 4x2"));
+    let mut bgra = good;
+    bgra.format = OBC_FORMAT_BGRA;
+    bgra.n_planes = 1;
+    assert_eq!(set_background(vt, instance, Some(&bgra)), OBC_ERR_INVALID);
+    let mut cuda = good;
+    cuda.kind = OBC_FRAME_CUDA;
+    assert_eq!(set_background(vt, instance, Some(&cuda)), OBC_ERR_INVALID);
+    // The module's own refusal: the previous stays too.
+    let mut refused_buf = vec![99u8; 4 * 2 + 4];
+    let refused = nv12(&mut refused_buf, 4, 2);
+    assert_eq!(set_background(vt, instance, Some(&refused)), OBC_ERR_FAILED);
+    assert_eq!(background_value(vt, instance), Some(40.0));
+
+    // Null: back to the load-time image.
+    assert_eq!(set_background(vt, instance, None), OBC_OK);
+    assert_eq!(background_value(vt, instance), None);
+
+    // SAFETY: destroyed once, the instance before the module.
+    unsafe {
+        vt.instance_destroy.unwrap()(instance);
+        vt.destroy.unwrap()(module);
+    }
+}
+
+/// An instance that keeps the defaults declares no per-frame background.
+#[test]
+fn the_default_takes_no_per_frame_background() {
+    struct Plain;
+    impl Instance for Plain {
+        fn load(&mut self, _req: &ChainRequest<'_>) -> Result<LoadReport, Error> {
+            Ok(LoadReport::default())
+        }
+        fn process(&mut self, _: &Frame<'_>, _: &Frame<'_>, _: &[Param<'_>]) -> Result<(), Error> {
+            Ok(())
+        }
+        fn unload(&mut self) {}
+    }
+    const { assert!(!<Plain as Instance>::LIVE_BACKGROUND) };
+    let e = Plain.set_background(None).unwrap_err();
+    assert_eq!(e.kind(), obc_module_sdk::ErrorKind::Unsupported);
 }
 
 #[test]

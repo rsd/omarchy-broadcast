@@ -226,6 +226,58 @@
 //! and the reason is reported (`FallbackCtl::error`: the statistics and the
 //! status message).
 //!
+//! # The video background
+//!
+//! `ObcEffect::set_background_video` sets `VideoCtl::path`, outside the
+//! settings: it is not part of what is loaded, except that replace without
+//! an image loads black as its still (`Target::black_still`). The source
+//! (`crate::video_background::VideoSource`) is reconciled with what is
+//! wanted ([`video_want`]: replace requested and loaded, the caps known, the
+//! backend taking per-frame backgrounds, and on CUDA frames the element's
+//! context shared as a `GstContext`) by [`refresh_video`], called after an
+//! apply, new caps and every worker job; [`stop_video`] stops it
+//! on a stop. `Shared::video` serialises them and is taken before
+//! `Control`, never with `Engine` held; the pipeline is stopped with no
+//! lock but that one held, and a source no longer wanted is detached
+//! ([`VideoSource::detach`]: its decoder's teardown is never waited for,
+//! so never on the streaming thread, which calls [`refresh_video`] on new
+//! caps). Only [`stop_video`], in the element's `stop`, waits for it. A
+//! flush leaves the source playing where it is: its pipeline runs on its
+//! own clock, apart from the stream that flushed. The statistics read
+//! whether a source runs from `Shared::video_running`, never waiting for
+//! that lock.
+//!
+//! A request without the video (a still, or another effect) does not stop
+//! the video while the chain in force still has it, that is while the
+//! loaded target's background ([`Target::same_background`]) is not yet the
+//! requested one (`VideoCtl::in_force`: a still to decode and load, blur to
+//! switch to): the source keeps playing and the frames keep its
+//! background, never the black or previous still of the chain in force.
+//! The source stops, and a frame in force goes back to the load-time still,
+//! once the requested background is the one loaded.
+//!
+//! Each source has a new `Slot`, published in `VideoCtl::slot` before it
+//! starts (its reporter records a failure only while its slot is the
+//! current one). The streaming thread takes the slot with the frame's
+//! decision, and on a fresh camera frame decided for replace, under the
+//! `Engine` lock and before `process`, [`feed_background`] gives the
+//! backend the slot's newest frame if it has not had it
+//! (`BgState::sent`), mapped for the call (CUDA: synchronised with its
+//! producer, and checked to be memory of the element's context). After
+//! a load (the still back in force: every load, switch or full, resets the
+//! backend's background) and until the current slot has a frame, the last
+//! frame given (`BgState::last`) is given again, so a change of video or of
+//! the still never shows anything but the previous background before the
+//! new video's first frame. Without a video wanted, a frame in force goes
+//! back to the load-time still (`None`) once the requested background is
+//! loaded (above). A frame is tried once; a refusal leaves the previous
+//! background and is reported (`VideoCtl::error`, cleared by the next
+//! frame given). A repeat is answered from the cache, so the cache stays
+//! valid; a repeat that is processed (after a load, an apply) never
+//! advances the video, but it does give the last frame again when a load
+//! has put the still back in force, so that the frame after a reload is
+//! never the still. The placeholder never gets here.
+//!
 //! # CUDA context and stream
 //!
 //! The context is the one the first input memory belongs to (the stream's
@@ -294,9 +346,9 @@ use gst_base::subclass::base_transform::{
 use gst_base::subclass::prelude::*;
 use gst_video::VideoInfo;
 use obc_backend::{
-    BackendError, BackendFactory, ColourSpec, DeviceNv12, EffectKind, FrameKind, FrameParams,
-    GpuContext, HostNv12, InferenceBackend, LoadReport, LoadRequest, StageId, StageList,
-    StageTimings, StageValue,
+    BackendError, BackendFactory, BackgroundFrame, ColourSpec, DeviceNv12, EffectKind, FrameKind,
+    FrameParams, GpuContext, HostNv12, HostNv12View, InferenceBackend, LoadReport, LoadRequest,
+    StageId, StageList, StageTimings, StageValue,
 };
 use obc_gpu::{ContextGuard, CuContext, CuStream, Event};
 
@@ -310,6 +362,9 @@ use crate::settings::{
 };
 use crate::video::{
     CudaFrame, colour_of, copy_nv12, copy_packed_nv12, fill_nv12, host_nv12, input_context,
+};
+use crate::video_background::{
+    self, Slot, SlotFrame, SourceSpec, VideoSource, video_as_still, video_unplayable,
 };
 
 static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
@@ -337,6 +392,9 @@ struct Format {
     /// The frames are in CUDA memory; else in system memory (see "System
     /// memory" in the module docs).
     cuda: bool,
+    /// The caps' colorimetry, as a caps string: the video background is
+    /// converted to it.
+    colorimetry: String,
 }
 
 impl Format {
@@ -354,6 +412,7 @@ impl Format {
             colour: colour_of(&c),
             black,
             cuda,
+            colorimetry: c.to_string(),
         }
     }
 
@@ -426,6 +485,22 @@ struct Engine {
     /// take the CUDA context ([`FrameKind::Cuda`]) or none
     /// ([`FrameKind::Host`]).
     kind: Option<FrameKind>,
+    /// The video background frames handed to the instance.
+    bg: BgState,
+}
+
+/// What the instance has of the video background (see "The video
+/// background" in the module docs).
+#[derive(Default)]
+struct BgState {
+    /// The slot frame in force (slot id, number), if one is.
+    sent: Option<(u64, u64)>,
+    /// A frame given since the last load: the load-time still is not in
+    /// force.
+    live: bool,
+    /// The last frame given, kept across a reload and a change of video so
+    /// that it can be given again until the new video's first frame.
+    last: Option<SlotFrame>,
 }
 
 struct Control {
@@ -476,6 +551,56 @@ struct Control {
     last_load_reused: bool,
     loads: u64,
     fallback: FallbackCtl,
+    video: VideoCtl,
+}
+
+/// The video background, as the streaming thread and the status see it.
+#[derive(Default)]
+struct VideoCtl {
+    /// The video of replace (`background-video`), if any.
+    path: Option<PathBuf>,
+    /// The slot of the running source.
+    slot: Option<Arc<Slot>>,
+    /// Why the video does not play ([`EffectStats::background_error`]).
+    error: Option<String>,
+    /// The backend's name and whether it takes per-frame backgrounds, as
+    /// the worker found the instance after its last load; `None` when
+    /// nothing is loaded.
+    live: Option<(&'static str, bool)>,
+    /// The element's CUDA context as a `GstContext` for the video pipeline,
+    /// made with the CUDA resources (or why it could not be).
+    cuda: Option<Result<gst::Context, String>>,
+    /// `error` is a refusal of a frame by the backend
+    /// (`ObcEffect::video_frame_refused`): the next frame given clears it.
+    refused: bool,
+    /// The target in force as the worker last published it (`None`:
+    /// nothing loaded).
+    in_force: Option<Target>,
+}
+
+/// The running video source and what it was started for (serialises the
+/// starts and stops: they may block for a pipeline's state change).
+#[derive(Default)]
+struct VideoHolder {
+    wanted: Option<VideoWant>,
+    source: Option<VideoSource>,
+}
+
+/// What the video background should be now.
+#[derive(Debug, Clone, PartialEq)]
+enum VideoWant {
+    /// Playing `path` (the file `file` there) into frames of this size,
+    /// colour and memory (`cuda`: the shared context's address).
+    Play {
+        path: PathBuf,
+        file: Option<background::FileStamp>,
+        width: u32,
+        height: u32,
+        colorimetry: String,
+        cuda: Option<usize>,
+    },
+    /// No source, and this is why (reported).
+    Still(String),
 }
 
 impl Default for Control {
@@ -500,6 +625,7 @@ impl Default for Control {
             last_load_reused: false,
             loads: 0,
             fallback: FallbackCtl::default(),
+            video: VideoCtl::default(),
         }
     }
 }
@@ -733,6 +859,7 @@ impl Control {
     fn report(&self) -> Report {
         Report {
             fallback_error: self.fallback.error.clone(),
+            background_error: self.video.error.clone(),
             kind: self.settings.kind,
             status: self.status.clone(),
             stages: self
@@ -803,19 +930,29 @@ struct Report {
     stages: Vec<(StageId, EffectStatus)>,
     /// Why the fallback image cannot be shown ([`FallbackCtl::error`]).
     fallback_error: Option<String>,
+    /// Why the video background does not play ([`VideoCtl::error`]).
+    background_error: Option<String>,
 }
 
 impl Report {
     /// `Some(now)` when `now` differs from `self`: a message to post. A
     /// stage newly listed, and off, changes nothing.
     fn changed(&self, now: Report) -> Option<Report> {
-        let same = (self.kind, &self.status, &self.fallback_error)
-            == (now.kind, &now.status, &now.fallback_error)
-            && self
-                .stages
-                .iter()
-                .chain(&now.stages)
-                .all(|(s, _)| self.stage(s.as_str()) == now.stage(s.as_str()));
+        let same = (
+            self.kind,
+            &self.status,
+            &self.fallback_error,
+            &self.background_error,
+        ) == (
+            now.kind,
+            &now.status,
+            &now.fallback_error,
+            &now.background_error,
+        ) && self
+            .stages
+            .iter()
+            .chain(&now.stages)
+            .all(|(s, _)| self.stage(s.as_str()) == now.stage(s.as_str()));
         (!same).then_some(now)
     }
 
@@ -851,6 +988,15 @@ struct Shared {
     /// The status values the backend reported after the last processed
     /// frame whose figures were read (see "Timings" in the module docs).
     stage_values: Mutex<Vec<StageValue>>,
+    /// The video background's source. Locked before `control`, never
+    /// while `engine` is held.
+    video: Mutex<VideoHolder>,
+    /// A video source runs (`VideoHolder::source` is some), for the
+    /// statistics: read without waiting for a start or a stop.
+    video_running: AtomicBool,
+    /// Mirrors `VideoCtl::refused`, so the streaming thread clears a
+    /// refusal without taking the control lock on every frame.
+    video_refused: AtomicBool,
 }
 
 /// The counters of one stage.
@@ -1043,6 +1189,17 @@ struct StreamState {
     toggle_found: Option<(u64, u64)>,
     /// The last processed output, while it is valid.
     cache: Option<Cached>,
+    /// The frame is a fresh camera frame (no repeat): the video background
+    /// may advance on it.
+    fresh: bool,
+    /// The video background's slot when the frame was decided, and whether
+    /// a video is wanted at all (replace with a video).
+    bg_slot: Option<Arc<Slot>>,
+    bg_wanted: bool,
+    /// Without a video wanted, while replace is loaded: the requested
+    /// target, so that the video stays in force until its background is
+    /// the one loaded (see "The video background" in the module docs).
+    bg_request: Option<Target>,
     gpu: Option<GpuResources>,
     /// The output pool for system-memory caps (rebuilt when they change),
     /// once a frame needs it.
@@ -1087,6 +1244,10 @@ fn post_status(element: &super::ObcEffect, r: &Report) {
         .field(
             "fallback-image-error",
             r.fallback_error.as_deref().unwrap_or(""),
+        )
+        .field(
+            "background-error",
+            r.background_error.as_deref().unwrap_or(""),
         );
     for (stage, status) in &r.stages {
         b = b.field(stage.as_str(), status.as_str()).field(
@@ -1181,7 +1342,16 @@ impl ObcEffect {
     }
 
     pub(super) fn stats(&self) -> EffectStats {
-        let (effect, status, stage_statuses, last_load_ms, last_load_reused, loads, fallback_error) = {
+        let (
+            effect,
+            status,
+            stage_statuses,
+            last_load_ms,
+            last_load_reused,
+            loads,
+            fallback_error,
+            background_error,
+        ) = {
             let c = lock(&self.shared.control);
             (
                 c.settings.kind,
@@ -1194,8 +1364,10 @@ impl ObcEffect {
                 c.last_load_reused,
                 c.loads,
                 c.fallback.error.clone(),
+                c.video.error.clone(),
             )
         };
+        let background_video = self.shared.video_running.load(Ordering::SeqCst);
         // Only the values of what is ready: a stage of the list that is,
         // or one of the effect's chain while the effect is.
         let stage_values = lock(&self.shared.stage_values)
@@ -1243,6 +1415,8 @@ impl ObcEffect {
             loads,
             cuda_active: s.cuda_active.load(Ordering::Relaxed),
             fallback_error,
+            background_error,
+            background_video,
             stage_values,
         }
     }
@@ -1270,13 +1444,47 @@ impl ObcEffect {
         self.apply(new, true);
     }
 
+    /// Sets the video of replace (an absolute path, or none) and applies
+    /// the settings again with it: replace without an image loads black as
+    /// its still then, and the source starts once replace is loaded (see
+    /// "The video background" in the module docs).
+    pub(super) fn set_background_video(&self, path: Option<PathBuf>) -> Result<(), String> {
+        if let Some(p) = &path
+            && !p.is_absolute()
+        {
+            return Err(format!(
+                "the background video path {} is not absolute",
+                p.display()
+            ));
+        }
+        let settings = {
+            let mut c = lock(&self.shared.control);
+            if c.video.path == path {
+                return Ok(());
+            }
+            c.video.path = path;
+            c.settings.clone()
+        };
+        self.apply(settings, true);
+        Ok(())
+    }
+
+    pub(super) fn background_video(&self) -> Option<PathBuf> {
+        lock(&self.shared.control).video.path.clone()
+    }
+
+    /// Whether a video background is set.
+    pub(super) fn has_background_video(&self) -> bool {
+        lock(&self.shared.control).video.path.is_some()
+    }
+
     pub(super) fn apply(&self, new: EffectSettings, retry: bool) {
         let posted = {
             let mut c = lock(&self.shared.control);
             c.epoch += 1;
             let retry = retry && !c.settings.changes_frame_params_only(&new);
             let before = c.report();
-            let target = new.target();
+            let target = new.target_with_video(c.video.path.is_some());
             let effect_failed = matches!(c.status, EffectStatus::Failed(_));
             let stage_failed = c.any_stage_failed();
             let effect_changed =
@@ -1315,6 +1523,7 @@ impl ObcEffect {
             post_status(&self.obj(), &r);
         }
         self.refresh_fallback();
+        refresh_video(&self.shared, &self.obj().downgrade());
     }
 
     /// Starts decoding the fallback image the settings and caps now want
@@ -1407,6 +1616,55 @@ impl ObcEffect {
                 "{}",
                 r.fallback_error.as_deref().unwrap_or("")
             );
+            post_status(&self.obj(), &r);
+        }
+    }
+
+    /// The backend refused a video background frame (`why`): the background
+    /// in force stays; reported as the video's error (once per reason).
+    fn video_frame_refused(&self, why: String) {
+        let posted = {
+            let mut c = lock(&self.shared.control);
+            let Some(path) = c.video.path.clone() else {
+                return;
+            };
+            let before = c.report();
+            c.video.error = Some(video_unplayable(
+                &path,
+                &format!("the backend refused a frame: {why}"),
+            ));
+            c.video.refused = true;
+            self.shared.video_refused.store(true, Ordering::SeqCst);
+            before.changed(c.report())
+        };
+        if let Some(r) = posted {
+            gst::warning!(
+                CAT,
+                imp = self,
+                "{}",
+                r.background_error.as_deref().unwrap_or("")
+            );
+            post_status(&self.obj(), &r);
+        }
+    }
+
+    /// A video background frame was given after a refusal: the refusal is
+    /// over (an error of another kind stays).
+    fn video_frame_given(&self) {
+        if !self.shared.video_refused.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let posted = {
+            let mut c = lock(&self.shared.control);
+            if !c.video.refused {
+                return;
+            }
+            let before = c.report();
+            c.video.refused = false;
+            c.video.error = None;
+            before.changed(c.report())
+        };
+        if let Some(r) = posted {
             post_status(&self.obj(), &r);
         }
     }
@@ -1576,8 +1834,12 @@ impl ObcEffect {
             });
             self.shared.cuda_active.store(true, Ordering::Relaxed);
             let gpu = st.gpu.as_ref().map(GpuResources::gpu_context);
+            // SAFETY: `context` is live, and ours for as long as the
+            // resources are; the GstContext takes its own reference.
+            let share = unsafe { video_background::share_cuda_context(context) };
             let mut c = lock(&self.shared.control);
             c.gpu = gpu;
+            c.video.cuda = Some(share);
             self.shared.wake.notify_all();
             gst::info!(
                 CAT,
@@ -1632,6 +1894,8 @@ impl ObcEffect {
         let instance = {
             let mut e = lock(&self.shared.engine);
             e.loaded = None;
+            // The video frames go before the context reference.
+            e.bg = BgState::default();
             // An instance always has its kind; CUDA, the stricter, if not.
             let kind = e.kind.take().unwrap_or(FrameKind::Cuda);
             e.instance.take().map(|i| (i, kind))
@@ -1662,6 +1926,7 @@ impl ObcEffect {
             if unloaded {
                 let mut c = lock(&self.shared.control);
                 c.loaded_kind = None;
+                c.video.live = None;
                 c.epoch += 1;
                 drop(c);
                 gst::info!(CAT, imp = self, "backend unloaded");
@@ -1673,6 +1938,8 @@ impl ObcEffect {
         self.shared.cuda_active.store(false, Ordering::Relaxed);
         let mut c = lock(&self.shared.control);
         c.gpu = None;
+        c.video.cuda = None;
+        c.video.live = None;
         c.loaded_kind = None;
         c.epoch += 1;
         gst::info!(
@@ -1884,8 +2151,14 @@ impl ObcEffect {
                     Some(lock(&self.shared.engine))
                 };
                 let mut idle = Engine::default();
+                // Why the backend refused a video background frame.
+                let mut bg_refused: Option<String> = None;
+                let mut bg_given = false;
                 let Engine {
-                    instance, loaded, ..
+                    instance,
+                    loaded,
+                    bg,
+                    ..
                 } = match held.as_mut() {
                     Some(e) => &mut **e,
                     None => &mut idle,
@@ -1951,6 +2224,22 @@ impl ObcEffect {
                         {
                             break 'frame None;
                         }
+                        // The video background, before the frame is
+                        // processed: it advances on fresh camera frames only
+                        // (a repeat keeps the frame's background, as it
+                        // keeps the frame), and a repeat after a load gets
+                        // the last frame again (never the still).
+                        if reset.is_ok()
+                            && !alone
+                            && let Some(k) = loaded
+                                .as_ref()
+                                .filter(|k| k.target.kind == EffectKind::Replace)
+                        {
+                            match feed_background(st, format, &k.target, bg, &mut **instance, px) {
+                                Ok(given) => bg_given = given,
+                                Err(why) => bg_refused = Some(why),
+                            }
+                        }
                         px.start_timing();
                         let mut res = reset.and_then(|()| px.process(&mut **instance, &params));
                         // A stage failure: the backend has dropped the stage
@@ -1996,6 +2285,11 @@ impl ObcEffect {
                     _ => None,
                 };
                 drop(held);
+                if let Some(why) = bg_refused {
+                    self.video_frame_refused(why);
+                } else if bg_given {
+                    self.video_frame_given();
+                }
                 if promoted && r.effect_ran {
                     st.toggle_found = Some((st.generation, st.epoch));
                 }
@@ -2158,6 +2452,114 @@ trait FramePixels {
     ) -> Result<(), BackendError>;
     /// Marks the end of the backend's work on the frame.
     fn end_timing(&mut self);
+    /// Gives the backend `sample`, a video background frame of the output's
+    /// size in this memory, mapped for the call
+    /// (`InferenceBackend::set_background_frame`).
+    fn set_background(
+        &mut self,
+        instance: &mut dyn InferenceBackend,
+        sample: &gst::Sample,
+    ) -> Result<(), String>;
+}
+
+/// The buffer and video layout of a video background frame.
+fn sample_frame(sample: &gst::Sample) -> Result<(&gst::BufferRef, VideoInfo), String> {
+    let buffer = sample
+        .buffer()
+        .ok_or("a video background frame has no buffer")?;
+    let caps = sample
+        .caps()
+        .ok_or("a video background frame has no caps")?;
+    let info = VideoInfo::from_caps(caps)
+        .map_err(|e| format!("a video background frame has caps {caps}: {e}"))?;
+    if info.format() != gst_video::VideoFormat::Nv12 {
+        return Err(format!(
+            "a video background frame is {:?}, not NV12",
+            info.format()
+        ));
+    }
+    Ok((buffer, info))
+}
+
+/// Gives the backend the video background's newest frame, if it has not
+/// had it (see "The video background" in the module docs): on a frame
+/// processed with replace loaded (`loaded`, the target in force), before
+/// it is processed. Only a fresh camera frame advances to a new frame of
+/// the slot; any frame, a repeat too, gives the last frame again after a
+/// load put the load-time still back in force. Without a video wanted, a
+/// frame in force goes back to the load-time still once the requested
+/// background is the loaded one (until then the video stays in force, and
+/// advances). A frame is tried once; whether one was given is returned, or
+/// why it was refused.
+fn feed_background<P: FramePixels>(
+    st: &StreamState,
+    format: &Format,
+    loaded: &Target,
+    bg: &mut BgState,
+    instance: &mut dyn InferenceBackend,
+    px: &mut P,
+) -> Result<bool, String> {
+    // The request without the video is not loaded yet: the chain in force
+    // keeps the video's frames (its own still is the previous background).
+    let holding = !st.bg_wanted
+        && st
+            .bg_request
+            .as_ref()
+            .is_some_and(|r| !r.same_background(loaded));
+    if !st.bg_wanted && !holding {
+        bg.last = None;
+        if bg.live {
+            bg.live = false;
+            bg.sent = None;
+            instance
+                .set_background_frame(None)
+                .map_err(|e| e.to_string())?;
+        }
+        return Ok(false);
+    }
+    if holding && !bg.live {
+        // A load since: its still is the one to show.
+        return Ok(false);
+    }
+    // The running source's newest frame, on a fresh camera frame; else,
+    // after a load (the still back in force), the last frame given before.
+    let newest = if st.fresh {
+        st.bg_slot.as_ref().and_then(|s| s.latest())
+    } else {
+        None
+    };
+    let candidate = match newest {
+        Some(f) => Some(f),
+        None if !bg.live => bg.last.clone(),
+        None => None,
+    };
+    let Some(frame) = candidate else {
+        return Ok(false);
+    };
+    if bg.sent == Some((frame.slot, frame.seq)) {
+        return Ok(false);
+    }
+    // A frame of other caps (made before new caps) is never given.
+    let size = frame
+        .sample
+        .caps()
+        .and_then(|c| VideoInfo::from_caps(c).ok())
+        .map(|i| (i.width(), i.height()));
+    if size != Some((format.width, format.height)) {
+        if bg
+            .last
+            .as_ref()
+            .is_some_and(|l| l.seq == frame.seq && l.slot == frame.slot)
+        {
+            bg.last = None;
+        }
+        return Ok(false);
+    }
+    bg.sent = Some((frame.slot, frame.seq));
+    px.set_background(instance, &frame.sample)?;
+    bg.live = true;
+    bg.last = Some(frame);
+    Ok(true)
 }
 
 /// A CUDA output frame, written on the element's stream (the context is
@@ -2250,6 +2652,38 @@ impl FramePixels for CudaPixels<'_> {
         // SAFETY: our own stream.
         let _ = unsafe { self.gpu.end.record(self.gpu.cu_stream) };
     }
+
+    fn set_background(
+        &mut self,
+        instance: &mut dyn InferenceBackend,
+        sample: &gst::Sample,
+    ) -> Result<(), String> {
+        let (buffer, info) = sample_frame(sample)?;
+        // Only memory of the element's own context is read: the video
+        // pipeline was given it.
+        let context = input_context(self.lib, buffer)
+            .map_err(|e| format!("a video background frame: {e}"))?;
+        if context != self.gpu.context {
+            return Err("a video background frame is in another CUDA context".into());
+        }
+        let mem = buffer.peek_memory(0);
+        // SAFETY: a GstCudaMemory of our context (checked above); the sync
+        // only waits for its producer (the converter's stream).
+        unsafe { (self.lib.gst_cuda_memory_sync)(mem.as_mut_ptr().cast()) };
+        // SAFETY: read-only CUDA map of a live buffer the sample holds; it
+        // stays mapped until the call returns, and the buffer alive until
+        // the element's stream has finished the frame (`BgState::last`).
+        let frame = unsafe {
+            CudaFrame::map(
+                buffer.as_mut_ptr(),
+                &info,
+                gst::ffi::GST_MAP_READ | MAP_CUDA,
+            )
+        }?;
+        let r = instance.set_background_frame(Some(BackgroundFrame::Cuda(frame.nv12())));
+        drop(frame);
+        r.map_err(|e| e.to_string())
+    }
 }
 
 /// A system-memory output frame, written on the CPU before each call
@@ -2335,6 +2769,33 @@ impl FramePixels for HostPixels<'_> {
     }
 
     fn end_timing(&mut self) {}
+
+    fn set_background(
+        &mut self,
+        instance: &mut dyn InferenceBackend,
+        sample: &gst::Sample,
+    ) -> Result<(), String> {
+        let (buffer, info) = sample_frame(sample)?;
+        let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
+            .map_err(|_| "could not map a video background frame for reading")?;
+        let plane = |i: u32| {
+            frame
+                .plane_data(i)
+                .map_err(|e| format!("a video background frame's plane {i}: {e}"))
+        };
+        let strides = gst_video::prelude::VideoFrameExt::plane_stride(&frame);
+        let view = HostNv12View {
+            y: plane(0)?,
+            y_stride: strides[0].max(0) as usize,
+            uv: plane(1)?,
+            uv_stride: strides[1].max(0) as usize,
+            width: info.width(),
+            height: info.height(),
+        };
+        instance
+            .set_background_frame(Some(BackgroundFrame::Host(view)))
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// A system-memory buffer pool for `caps`, with video meta (its strides
@@ -2498,11 +2959,15 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
             outcome,
             stage_failures,
         } = run_job(&shared, &job);
-        let (loaded_kind, in_force) = {
+        let (loaded_kind, in_force, live) = {
             let e = lock(&shared.engine);
             let k = e.loaded.as_ref();
-            (k.map(|k| k.target.kind), k.map(|k| k.target.clone()))
+            let live = k
+                .and(e.instance.as_ref())
+                .map(|i| (i.name(), i.supports_live_background()));
+            (k.map(|k| k.target.kind), k.map(|k| k.target.clone()), live)
         };
+        let in_force_target = in_force.clone();
         let in_force_list = in_force
             .as_ref()
             .map(|t| t.stage_list().to_string())
@@ -2512,6 +2977,8 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
             let mut c = lock(&shared.control);
             let before = c.report();
             c.loaded_kind = published_kind(&c, job.revocation, loaded_kind);
+            c.video.live = c.loaded_kind.and(live);
+            c.video.in_force = c.loaded_kind.and(in_force_target);
             c.epoch += 1;
             if let Outcome::Loaded(r) = &outcome {
                 c.loads += 1;
@@ -2577,6 +3044,8 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                 post_status(&el, &r);
             }
         }
+        // The video background follows what is loaded.
+        refresh_video(&shared, &element);
     }
 }
 
@@ -2619,6 +3088,201 @@ fn fallback_decoded(
             post_status(&el, &r);
         }
     }
+}
+
+/// What the video background should be for `c` (see "The video
+/// background" in the module docs), the file at its path being `file`;
+/// `None`: no source and nothing to report.
+fn video_want(c: &Control, file: Option<background::FileStamp>) -> Option<VideoWant> {
+    let path = c.video.path.as_ref()?;
+    if c.settings.kind != EffectKind::Replace || c.loaded_kind != Some(EffectKind::Replace) {
+        return None;
+    }
+    let format = c.format.as_ref()?;
+    if let (name, false) = c.video.live? {
+        return Some(VideoWant::Still(video_as_still(name)));
+    }
+    let cuda = if format.cuda {
+        match c.video.cuda.as_ref()? {
+            Ok(ctx) => Some(ctx.as_ptr() as usize),
+            Err(why) => return Some(VideoWant::Still(video_unplayable(path, why))),
+        }
+    } else {
+        None
+    };
+    Some(VideoWant::Play {
+        path: path.clone(),
+        file,
+        width: format.width,
+        height: format.height,
+        colorimetry: format.colorimetry.clone(),
+        cuda,
+    })
+}
+
+/// Brings the video background's source in line with what the control
+/// state wants ([`video_want`]): stops the source that is no longer
+/// wanted, starts the one that is, records why none plays; posts when the
+/// report changes. Never holds the control lock while a pipeline stops.
+fn refresh_video(shared: &Arc<Shared>, element: &glib::WeakRef<super::ObcEffect>) {
+    let mut holder = lock(&shared.video);
+    // Stat'ed with the control lock released (see `refresh_fallback`).
+    let path = lock(&shared.control).video.path.clone();
+    let file = path.as_deref().and_then(background::FileStamp::of);
+    let (want, cuda, holding) = {
+        let c = lock(&shared.control);
+        let want = video_want(&c, file);
+        let cuda = c.video.cuda.as_ref().and_then(|r| r.as_ref().ok()).cloned();
+        // The request has no video, and the chain in force still shows it:
+        // it plays on until the requested background is loaded.
+        let holding = want.is_none()
+            && c.loaded_kind == Some(EffectKind::Replace)
+            && c.video
+                .in_force
+                .as_ref()
+                .is_some_and(|t| !t.same_background(&c.target));
+        (want, cuda, holding)
+    };
+    if want == holder.wanted || (holding && matches!(holder.wanted, Some(VideoWant::Play { .. }))) {
+        return;
+    }
+    // The instance keeps the last frame it was given until the new
+    // source's first one.
+    let old = holder.source.take();
+    shared.video_running.store(false, Ordering::SeqCst);
+    holder.wanted = want.clone();
+    let slot = match &want {
+        Some(VideoWant::Play { .. }) => Some(Slot::new()),
+        _ => None,
+    };
+    {
+        let mut c = lock(&shared.control);
+        c.video.slot = slot.clone();
+    }
+    // Never waited for: this may be the streaming thread (new caps).
+    if let Some(old) = old {
+        old.detach();
+    }
+    let error = match (want, slot) {
+        (
+            Some(VideoWant::Play {
+                path,
+                width,
+                height,
+                colorimetry,
+                cuda: on_cuda,
+                ..
+            }),
+            Some(slot),
+        ) => {
+            let spec = SourceSpec {
+                path: path.clone(),
+                width,
+                height,
+                colorimetry,
+                // The context the want was made with (read under the same
+                // lock); system memory never gets one.
+                cuda: on_cuda.and(cuda),
+            };
+            let reporter = video_reporter(shared, element, slot.id, path.clone());
+            match VideoSource::start(spec, slot, reporter) {
+                Ok(source) => {
+                    holder.source = Some(source);
+                    shared.video_running.store(true, Ordering::SeqCst);
+                    None
+                }
+                Err(why) => Some(video_unplayable(&path, &why)),
+            }
+        }
+        (Some(VideoWant::Still(why)), _) => Some(why),
+        _ => None,
+    };
+    let posted = {
+        let mut c = lock(&shared.control);
+        let before = c.report();
+        if error.is_some() && holder.source.is_none() {
+            c.video.slot = None;
+        }
+        c.video.error = error;
+        c.video.refused = false;
+        shared.video_refused.store(false, Ordering::SeqCst);
+        before.changed(c.report())
+    };
+    let running = holder.source.is_some();
+    drop(holder);
+    if let Some(el) = element.upgrade() {
+        match posted.as_ref().and_then(|r| r.background_error.as_deref()) {
+            Some(why) => gst::warning!(CAT, obj = el, "{why}"),
+            None => gst::debug!(CAT, obj = el, "video background running: {running}"),
+        }
+        if let Some(r) = posted {
+            post_status(&el, &r);
+        }
+    }
+}
+
+/// Stops the video background's source, if any, waiting for its
+/// pipeline to stop (the element's `stop`: the CUDA context goes next), and
+/// forgets why it did not play. A later [`refresh_video`] starts it again.
+fn stop_video(shared: &Arc<Shared>, element: &glib::WeakRef<super::ObcEffect>) {
+    let mut holder = lock(&shared.video);
+    holder.wanted = None;
+    let old = holder.source.take();
+    shared.video_running.store(false, Ordering::SeqCst);
+    let posted = {
+        let mut c = lock(&shared.control);
+        let before = c.report();
+        c.video.slot = None;
+        c.video.error = None;
+        c.video.refused = false;
+        shared.video_refused.store(false, Ordering::SeqCst);
+        before.changed(c.report())
+    };
+    drop(old);
+    drop(holder);
+    if let (Some(el), Some(r)) = (element.upgrade(), posted) {
+        post_status(&el, &r);
+    }
+}
+
+/// The reporter of the source of slot `id`, playing `path`: records the
+/// first failure as the video's error while that slot is the running one
+/// (the last frame it gave stays in force), and posts.
+fn video_reporter(
+    shared: &Arc<Shared>,
+    element: &glib::WeakRef<super::ObcEffect>,
+    id: u64,
+    path: PathBuf,
+) -> video_background::Reporter {
+    let shared = Arc::downgrade(shared);
+    let element = element.clone();
+    Arc::new(move |why: String| {
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        let posted = {
+            let mut c = lock(&shared.control);
+            if c.video.slot.as_ref().map(|s| s.id) != Some(id) {
+                return;
+            }
+            let before = c.report();
+            c.video.error = Some(video_unplayable(&path, &why));
+            c.video.refused = false;
+            shared.video_refused.store(false, Ordering::SeqCst);
+            before.changed(c.report())
+        };
+        if let Some(el) = element.upgrade()
+            && let Some(r) = posted
+        {
+            gst::warning!(
+                CAT,
+                obj = el,
+                "{}",
+                r.background_error.as_deref().unwrap_or("")
+            );
+            post_status(&el, &r);
+        }
+    })
 }
 
 fn superseded(shared: &Shared, generation: u64) -> bool {
@@ -2680,6 +3344,7 @@ fn drop_revoked(shared: &Shared, job: &Job) {
             return;
         }
         e.loaded = None;
+        e.bg = BgState::default();
         let kind = e.kind.take().unwrap_or(FrameKind::Cuda);
         e.instance.take().map(|i| (i, kind))
     };
@@ -2731,6 +3396,7 @@ fn unload(shared: &Shared, job: &Job) {
         }
     }
     e.loaded = None;
+    e.bg = BgState::default();
     drop(e);
     drop(guard);
 }
@@ -2772,6 +3438,9 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
         return Outcome::AlreadyLoaded;
     }
     let background = match (kind, &target.background) {
+        // A video and no still: black behind the person until its first
+        // frame (and for good if it cannot play).
+        (EffectKind::Replace, None) if target.black_still => Some(Arc::new(black_bgr(&job.format))),
         (EffectKind::Replace, None) => {
             return Outcome::Failed(Failure::new("the replace effect needs a background image"));
         }
@@ -2856,6 +3525,10 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
     match result {
         Ok(report) => {
             e.loaded = Some(key);
+            // The load-time still is in force again: the last video frame
+            // is given again on the next fresh frame.
+            e.bg.sent = None;
+            e.bg.live = false;
             Outcome::Loaded(report)
         }
         Err(err) => {
@@ -2883,6 +3556,18 @@ fn decode_background(
     background::decode(path, format.width, format.height)
 }
 
+/// A black BGR image of the frame size: the load-time background of a video
+/// without a still.
+fn black_bgr(format: &Format) -> obc_backend::HostBgr {
+    let stride = format.width as usize * 3;
+    obc_backend::HostBgr {
+        width: format.width,
+        height: format.height,
+        stride,
+        data: vec![0; stride * format.height as usize],
+    }
+}
+
 impl ObjectImpl for ObcEffect {
     fn properties() -> &'static [glib::ParamSpec] {
         static PROPS: LazyLock<Vec<glib::ParamSpec>> = LazyLock::new(|| {
@@ -2905,6 +3590,16 @@ impl ObjectImpl for ObcEffect {
                 glib::ParamSpecString::builder("background")
                     .nick("Background image")
                     .blurb("Absolute path of the replace effect's image (empty: none)")
+                    .default_value(Some(""))
+                    .flags(rw)
+                    .build(),
+                glib::ParamSpecString::builder("background-video")
+                    .nick("Background video")
+                    .blurb(
+                        "Absolute path of the replace effect's video (MP4, MOV, MKV, WebM), \
+                         played in a loop behind the person; the background image is then its \
+                         load-time still (empty: none)",
+                    )
                     .default_value(Some(""))
                     .flags(rw)
                     .build(),
@@ -2977,6 +3672,14 @@ impl ObjectImpl for ObcEffect {
                 s.background = p;
                 true
             }
+            "background-video" => {
+                let t = text();
+                let p = (!t.is_empty()).then(|| PathBuf::from(t));
+                if let Err(e) = self.set_background_video(p) {
+                    gst::warning!(CAT, imp = self, "ignoring background-video: {e}");
+                }
+                return;
+            }
             "fallback-image" => {
                 let t = text();
                 let p = (!t.is_empty()).then(|| PathBuf::from(t));
@@ -3016,6 +3719,11 @@ impl ObjectImpl for ObcEffect {
             "blur-strength" => f64::from(s.blur_strength).to_value(),
             "background" => s
                 .background
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+                .to_value(),
+            "background-video" => self
+                .background_video()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default()
                 .to_value(),
@@ -3112,6 +3820,9 @@ impl BaseTransformImpl for ObcEffect {
     }
 
     fn stop(&self) -> Result<(), gst::ErrorMessage> {
+        // The video background first: its frames are of the context the
+        // release below lets go of.
+        stop_video(&self.shared, &self.obj().downgrade());
         self.stop_worker();
         self.release_gpu();
         let posted = {
@@ -3197,8 +3908,10 @@ impl BaseTransformImpl for ObcEffect {
         if let Some(r) = posted {
             post_status(&self.obj(), &r);
         }
-        // The fallback image is decoded for the size and colour.
+        // The fallback image is decoded for the size and colour, and the
+        // video background played for them.
         self.refresh_fallback();
+        refresh_video(&self.shared, &self.obj().downgrade());
         Ok(())
     }
 
@@ -3330,6 +4043,10 @@ impl BaseTransformImpl for ObcEffect {
             st.resend = false;
             st.raw_on_screen = raw_on_screen_after(st.raw_on_screen, ScreenEvent::Reset);
             st.toggle_found = None;
+            // The video background plays on where it is: its pipeline runs
+            // on its own clock, apart from this stream, so a flush here
+            // gives it no reason to start over (and a restart would wait
+            // for its decoder's teardown on the streaming thread).
         }
         self.parent_sink_event(event)
     }
@@ -3373,6 +4090,7 @@ impl ObcEffect {
             generation,
             epoch,
             fallback_frame,
+            (bg_slot, bg_wanted, bg_request),
         ) = {
             let c = lock(&self.shared.control);
             (
@@ -3386,6 +4104,14 @@ impl ObcEffect {
                 c.generation,
                 c.epoch,
                 c.fallback.frame.clone(),
+                {
+                    let wanted = c.settings.kind == EffectKind::Replace && c.video.path.is_some();
+                    // Only needed (and cloned) while a video may be in
+                    // force without being wanted.
+                    let request = (!wanted && c.loaded_kind == Some(EffectKind::Replace))
+                        .then(|| c.target.clone());
+                    (c.video.slot.clone(), wanted, request)
+                },
             )
         };
         // An effect a toggle frame found loaded and ran counts as loaded
@@ -3484,6 +4210,10 @@ impl ObcEffect {
         st.frame = frame;
         st.fallback = fallback;
         st.fallback_frame = fallback_frame;
+        st.fresh = !has_repeat_flag(inbuf);
+        st.bg_slot = bg_slot;
+        st.bg_wanted = bg_wanted;
+        st.bg_request = bg_request;
         drop(st);
         let passthrough = action == FrameAction::Passthrough;
         if passthrough {
@@ -3576,6 +4306,7 @@ mod tests {
             colour: Ok(ColourSpec::LIMITED_BT601),
             black: ColourSpec::LIMITED_BT601,
             cuda: true,
+            colorimetry: "bt601".into(),
         });
         assert_eq!(c.fallback_path(), Some(&path));
         let first = key_now(&c, &path).unwrap();

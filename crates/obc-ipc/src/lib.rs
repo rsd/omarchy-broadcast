@@ -131,8 +131,9 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// Revision 16 added the `StageValues` property ([`StageValue`]): the named
 /// numeric values the running stages report (auto-frame's zoom).
 /// Revision 17 added the away image, with no new member
-/// ([`PLACEHOLDER_REVISION`]).
-pub const INTERFACE_REVISION: u32 = 17;
+/// ([`PLACEHOLDER_REVISION`]). Revision 18 added video backgrounds, with no
+/// new member ([`VIDEO_BACKGROUND_REVISION`]).
+pub const INTERFACE_REVISION: u32 = 18;
 /// The first [`INTERFACE_REVISION`] with the `StageValues` property.
 pub const STAGE_VALUES_REVISION: u32 = 16;
 /// The first [`INTERFACE_REVISION`] with the away image, and no new member:
@@ -143,6 +144,23 @@ pub const STAGE_VALUES_REVISION: u32 = 16;
 /// not set: showing black`, `Away image <path> could not be read (<why>):
 /// showing black`).
 pub const PLACEHOLDER_REVISION: u32 = 17;
+/// The first [`INTERFACE_REVISION`] with video backgrounds, and no new
+/// member: `SetBackgroundImage` (and `[effect] background_image`) accepts
+/// a video file (MP4, M4V, MOV, MKV or WebM holding H.264, HEVC, VP9 or
+/// AV1, at most 512 MiB), played in a loop behind the person; `ImportMedia`
+/// of a background accepts such a video (stored as it is) and an animated
+/// GIF, WebP or PNG (stored as a VP9 WebM, with ffmpeg); `GetMedia` lists
+/// videos with `type` `video`, their `width`, `height` and `duration_ms`,
+/// and their `poster` (a JPEG in the daemon's cache; empty until it is
+/// made, `MediaSerial` then moves). `Warning` gains the clauses of a video
+/// shown as a still (`<module> shows the video background as a still`,
+/// `The video background is shown as a still: <why>`), of a video being
+/// prepared for playback on the CPU (`The video background is being
+/// prepared for playback on the CPU; a still is shown until it is ready`,
+/// or `…; the background is black until it is ready` with no still) and of
+/// a video that cannot play (`Video background <path> could not be played
+/// (<why>)`).
+pub const VIDEO_BACKGROUND_REVISION: u32 = 18;
 /// The smallest move of a value that announces a change of
 /// `StageValues` (a change of the set always does).
 pub const STAGE_VALUE_STEP: f64 = 0.01;
@@ -1272,7 +1290,8 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, PLACEHOLDER_REVISION);
+        assert_eq!(INTERFACE_REVISION, VIDEO_BACKGROUND_REVISION);
+        const { assert!(PLACEHOLDER_REVISION < VIDEO_BACKGROUND_REVISION) };
         const { assert!(STAGE_VALUES_REVISION < PLACEHOLDER_REVISION) };
         const { assert!(MEDIA_REVISION < STAGE_VALUES_REVISION) };
         const { assert!(FORCED_REVISION < MEDIA_REVISION) };

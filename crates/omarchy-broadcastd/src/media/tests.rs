@@ -268,18 +268,14 @@ fn listing_skips_bad_headers_links_directories_and_special_files() {
     write(&user.join("sub.png").join("inner.png"), &png(10, 10, 5));
     std::os::unix::fs::symlink(&good, user.join("link.png")).unwrap();
     mkfifo(&user.join("pipe.png"));
+    // A video the check refuses is skipped as a bad image header is.
     write(&user.join("clip.mp4"), b"\0\0\0\x18ftypmp42");
     // A bundled symbolic link is followed (packaging may link files).
     std::fs::create_dir_all(&bundled).unwrap();
     std::os::unix::fs::symlink(&good, bundled.join("shared.png")).unwrap();
 
     let items = f.store.list(MediaKind::Background);
-    assert_eq!(
-        labels(&items),
-        [("Shared", true), ("Clip", false), ("Ok", false)]
-    );
-    assert_eq!(items[1].media_type, MediaType::Video);
-    assert_eq!((items[1].width, items[1].height), (0, 0));
+    assert_eq!(labels(&items), [("Shared", true), ("Ok", false)]);
 }
 
 #[test]
@@ -418,17 +414,25 @@ fn imports_refuse_what_the_background_checks_refuse() {
     let kind = MediaKind::Background;
     let err = |src: &Path| f.store.import(kind, src).unwrap_err().to_string();
 
+    // A video signature with nothing playable behind it.
     let video = f.src.join("clip.MP4");
     write(&video, b"\0\0\0\x18ftypmp42");
     let e = err(&video);
-    assert!(e.contains("videos are not supported yet"), "{e}");
+    assert!(e.contains("could not be read as a video"), "{e}");
     assert!(e.contains("clip.MP4"), "{e}");
+    // Neither an image nor a video.
+    let text = f.src.join("notes.png");
+    write(&text, b"hello, not an image");
+    let e = err(&text);
+    assert!(e.contains("is not an accepted image"), "{e}");
+    assert!(e.contains("notes.png"), "{e}");
 
     let e = err(Path::new("relative/x.png"));
     assert!(e.contains("relative/x.png is not an absolute path"), "{e}");
 
     let big = f.src.join("big.png");
-    let file = std::fs::File::create(&big).unwrap();
+    write(&big, &png(10, 10, 1));
+    let file = std::fs::File::options().write(true).open(&big).unwrap();
     file.set_len(MAX_FILE_BYTES + 1).unwrap();
     let e = err(&big);
     assert!(e.contains("32 MiB"), "{e}");
@@ -439,11 +443,15 @@ fn imports_refuse_what_the_background_checks_refuse() {
     let e = err(&fifo);
     assert!(e.contains("not a regular file"), "{e}");
 
+    // A GIF (whatever its name) goes to the transcode, which junk fails.
     let gif = f.src.join("anim.png");
     write(&gif, b"GIF89a................");
     let e = err(&gif);
     assert!(e.contains("anim.png"), "{e}");
-    assert!(e.contains("PNG"), "{e}");
+    assert!(
+        e.contains("converting the animation to a video failed") || e.contains("needs ffmpeg"),
+        "{e}"
+    );
 
     let huge = f.src.join("huge.png");
     write(&huge, &png(9000, 100, 1));
@@ -528,7 +536,9 @@ fn only_regular_files_of_the_user_root_are_removed() {
 /// Every bundled file of the repository is described in its directory's
 /// `SOURCES.toml` (exactly once, with a title, an author, an accepted
 /// licence and a source), every entry names an existing file, and every
-/// image passes the checks an import makes.
+/// image passes the checks an import makes. A shipped poster
+/// (`<stem>.poster.jpg`) is a derived file, not an item: it has no entry,
+/// its video exists, and it is a JPEG the cache accepts.
 #[test]
 fn bundled_assets_are_covered_by_their_sources() {
     let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/media"));
@@ -566,6 +576,23 @@ fn bundled_assets_are_covered_by_their_sources() {
         for entry in std::fs::read_dir(&dir).unwrap().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name == SOURCES_FILE || name.starts_with("LICENSE") {
+                continue;
+            }
+            if let Some(stem) = name.strip_suffix(SHIPPED_POSTER_SUFFIX) {
+                let video = VIDEO_EXTENSIONS
+                    .iter()
+                    .any(|ext| dir.join(format!("{stem}.{ext}")).is_file());
+                assert!(video, "{name} is the poster of no video");
+                assert!(
+                    !sources
+                        .item
+                        .iter()
+                        .any(|e| e.file.as_deref() == Some(name.as_str())),
+                    "{name} is derived: no SOURCES.toml entry"
+                );
+                let data = std::fs::read(entry.path()).unwrap();
+                assert!(data.starts_with(cache::JPEG_MAGIC), "{name}");
+                assert!(data.len() < 8 << 20, "{name}");
                 continue;
             }
             let count = sources
@@ -644,7 +671,12 @@ fn animated_or_oversized_webp_is_refused() {
         "anim.webp",
         &webp_file(&[vp8x_chunk(0x12, 64, 64), riff_chunk(b"ANIM", &[0; 6])]),
     );
-    assert!(e.contains("animated WebP"), "{e}");
+    // An animated WebP goes to the transcode, which this one fails (or
+    // needs ffmpeg where there is none).
+    assert!(
+        e.contains("converting the animation to a video failed") || e.contains("needs ffmpeg"),
+        "{e}"
+    );
     let e = err(
         "big.webp",
         &webp_file(&[vp8x_chunk(0x00, 9000, 10), vp8_chunk(9000, 10)]),

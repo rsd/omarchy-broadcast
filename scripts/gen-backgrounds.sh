@@ -15,7 +15,8 @@
 # files with the same ImageMagick version. They are calm and low-contrast in
 # the centre, as they sit behind a person.
 #
-# Tools needed: ImageMagick 7 (the `magick` command) and awk.
+# Tools needed: ImageMagick 7 (the `magick` command), awk, and ffmpeg for the
+# video loops.
 #
 # The outputs are committed (the package installs them; nothing runs this
 # script at build time) and are original work, licensed with the repository
@@ -28,6 +29,22 @@
 #   away-soft   the same card without the glyph
 # The away images are made after the backgrounds with their own fixed seeds,
 # so they never change the backgrounds' bytes.
+#
+# Finally it makes two animated backgrounds (video loops) into the backgrounds
+# directory (WebM, VP9 profile 0, yuv420p, 1920x1080, 30 fps, 10 s, no audio):
+#   slow-aurora     soft colour bands drifting slowly on a dark sky
+#   drifting-bokeh  soft out-of-focus light discs drifting slowly
+# They loop seamlessly: every motion is a periodic function of the time with a
+# period of exactly 10 s (the clip length), so the last frame flows into the
+# first. Frames are computed small (640x360, 16-bit planes) with ffmpeg's geq
+# filter, scaled up, given a little fixed dither before the step down to 8 bits
+# (against banding) and encoded at CRF 28 (8 Mbit/s ceiling, a keyframe every
+# 2 s). The loops need ffmpeg with libvpx-vp9 and are made last, so they never
+# change the images' bytes. Each loop also gets its poster, NAME.poster.jpg
+# beside it: the first frame scaled to 640x360 (JPEG). The daemon copies it into
+# its cache as the poster the gallery shows, so a bundled loop has one without
+# ffmpeg; it is a derived file of the loop, not a gallery item, and has no
+# SOURCES.toml entry of its own.
 #
 # Usage: scripts/gen-backgrounds.sh [backgrounds-directory [away-directory]]
 # (the away directory defaults to "away" next to the backgrounds directory)
@@ -239,3 +256,127 @@ cool_bokeh
 shapes
 graphite_img
 away_images
+
+# --- video loops -------------------------------------------------------------
+LW=640 # the loops are computed at 640x360 and scaled up to 1920x1080
+LH=360
+
+# loop_encode NAME MIX R-EXPR G-EXPR B-EXPR [POST]: render NAME.webm, 300
+# frames at 30 fps. The geq expressions (0..65535 per plane, time T in seconds)
+# are evaluated in 16-bit RGB planes; MIX is a colorchannelmixer argument
+# string that remixes the planes (empty for none) and POST an optional filter
+# run after it. Working in 16 bits and dithering the step down to 8 bits keeps
+# the dark gradients free of banding.
+loop_encode() {
+  local name=$1 mix=$2 r=$3 g=$4 b=$5 post=${6:-} dither
+  # Fixed dither at full size, before the step down to 8 bits: one pseudo-random
+  # value per pixel and frame (a sine hash), +-1.5 steps of 8 bits.
+  dither="385*(2*(sin(X*12.9898+Y*78.233+N*37.719)*43758.5453-floor(sin(X*12.9898+Y*78.233+N*37.719)*43758.5453))-1)"
+  {
+    echo "format=gbrp16le,"
+    echo "geq=r='$r':g='$g':b='$b',"
+    [[ -z $mix ]] || echo "colorchannelmixer=$mix,"
+    [[ -z $post ]] || echo "$post,"
+    echo "scale=1920:1080:flags=bicubic:out_color_matrix=bt709:out_range=tv,"
+    echo "format=gbrp16le,"
+    echo "geq=r='r(X,Y)+$dither':g='g(X,Y)+$dither':b='b(X,Y)+$dither',"
+    echo "format=yuv420p"
+  } >"$work/$name.filter"
+  ffmpeg -nostdin -hide_banner -loglevel error -y \
+    -f lavfi -i "nullsrc=s=${LW}x${LH}:r=30" \
+    -/filter:v "$work/$name.filter" -frames:v 300 -an \
+    -map_metadata -1 -fflags +bitexact -flags:v +bitexact \
+    -c:v libvpx-vp9 -profile:v 0 -pix_fmt yuv420p -crf 28 -b:v 8M \
+    -maxrate 8M -bufsize 16M -g 60 -keyint_min 60 -row-mt 1 -threads 8 \
+    -deadline good -cpu-used 2 -auto-alt-ref 1 -lag-in-frames 16 \
+    -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv \
+    "$out/$name.webm"
+  echo "wrote $out/$name.webm"
+  loop_poster "$name"
+}
+
+# loop_poster NAME: NAME.poster.jpg, the first frame of NAME.webm at 640x360.
+loop_poster() {
+  local name=$1
+  ffmpeg -nostdin -hide_banner -loglevel error -y \
+    -f webm -i "$out/$name.webm" -map 0:v:0 -frames:v 1 -an \
+    -vf "scale=640:360:flags=bicubic" -map_metadata -1 \
+    -fflags +bitexact -flags:v +bitexact -q:v 3 -c:v mjpeg -f image2 \
+    "$out/$name.poster.jpg"
+  echo "wrote $out/$name.poster.jpg"
+}
+
+# --- slow-aurora -------------------------------------------------------------
+# Two curtains of light, teal-green and violet, whose centre lines and
+# brightness ripple with the phase p = 2*pi*T/10 (whole multiples of p only, so
+# the loop closes). Only slow, wide variations along the width: no fine
+# structure, so the bands stay smooth. A soft mask keeps the middle calm.
+aurora() {
+  local pre
+  # Variables: 0 and 1 the position, 2 the phase, 3 the calm mask, 4 and 5 the
+  # two curtain intensities.
+  pre="st(0,X/W);st(1,Y/H);st(2,2*PI*T/10);"
+  pre+="st(3,1-0.78*exp(-(pow((ld(0)-0.5)/0.24,2)+pow((ld(1)-0.55)/0.42,2))));"
+  pre+="st(4,exp(-pow((ld(1)-0.30-0.07*sin(2*PI*1.2*ld(0)+ld(2))-0.035*sin(2*PI*2.9*ld(0)-2*ld(2)+1))/0.12,2))"
+  pre+="*(0.7+0.3*sin(2*PI*1.3*ld(0)+ld(2)+2)));"
+  pre+="st(5,exp(-pow((ld(1)-0.56-0.08*sin(2*PI*0.9*ld(0)-ld(2)+2)-0.03*sin(2*PI*2.1*ld(0)+2*ld(2)))/0.15,2))"
+  pre+="*(0.7+0.3*sin(2*PI*1.1*ld(0)-ld(2)+0.5)));"
+  pre+="st(4,ld(4)*ld(3));st(5,ld(5)*ld(3));"
+  # A dark navy base plus each curtain's colour, per plane.
+  loop_encode slow-aurora "" \
+    "${pre}257*clip(5+4*ld(1)+ld(4)*32+ld(5)*78,0,255)" \
+    "${pre}257*clip(10+6*ld(1)+ld(4)*135+ld(5)*52,0,255)" \
+    "${pre}257*clip(22+10*ld(1)+ld(4)*100+ld(5)*135,0,255)"
+}
+
+# --- drifting-bokeh ----------------------------------------------------------
+# Thirty soft discs on a dark base. Each drifts on a small closed path (whole
+# multiples of the phase p = 2*pi*T/10) and breathes slightly; the discs keep
+# mostly out of the middle third, and a calm mask dims what drifts into it.
+# To keep the render fast each disc colour (amber, dusty rose, soft blue) is
+# one geq plane (a third of the discs per plane); colorchannelmixer then turns
+# the three planes into RGB and a second geq adds the dark base glow.
+bokeh_loop() {
+  local terms t0 t1 t2 pre
+  terms=$(awk -v w="$LW" -v h="$LH" '
+    BEGIN {
+      srand(307)
+      for (k = 0; k < 30; k++) {
+        x = rand() * w; y = rand() * h
+        if (x > w * 0.34 && x < w * 0.66 && rand() < 0.8) { k--; continue }
+        rad = 14 + 40 * rand() * rand()
+        a = 0.10 + 0.20 * rand()
+        c = int(rand() * 3)
+        ax = 6 + 16 * rand(); ay = 6 + 16 * rand()
+        kx = 1 + int(rand() * 2); ky = 1 + int(rand() * 2)
+        fx = rand() * 6.2832; fy = rand() * 6.2832; fb = rand() * 6.2832
+        # The centre drifts on a closed path; the edge is about 2.5 px soft.
+        d = sprintf("clip((%.1f-hypot(X-(%.1f+%.1f*sin(ld(2)*%d+%.2f)),Y-(%.1f+%.1f*sin(ld(2)*%d+%.2f))))/2.5+0.5,0,1)*%.3f*(1+0.18*sin(ld(2)+%.2f))",
+          rad, x, ax, kx, fx, y, ay, ky, fy, a, fb)
+        t[c] = t[c] (t[c] == "" ? "" : "+") d
+      }
+      print t[0]; print t[1]; print t[2]
+    }')
+  { IFS= read -r t0; IFS= read -r t1; IFS= read -r t2; } <<<"$terms"
+  # Variables: the position (0, 1), the phase (2) and the calm mask (3).
+  pre="st(0,X/W);st(1,Y/H);st(2,2*PI*T/10);"
+  pre+="st(3,1-0.55*exp(-(pow((ld(0)-0.5)/0.22,2)+pow((ld(1)-0.55)/0.45,2))));"
+  # The dark radial glow of the base, added to the mixed planes (the mixer's
+  # alpha path garbles the last row of each thread slice, so it is not used).
+  glow="exp(-(pow((X/W-0.5)*1.3,2)+pow(Y/H-0.45,2))/(2*0.45*0.45))"
+  # Planes: g amber discs, b rose discs, r blue discs. The mixer gives the
+  # output red, green and blue from them.
+  loop_encode drifting-bokeh \
+    "rr=0.45:rg=1.00:rb=0.95:gr=0.72:gg=0.72:gb=0.52:br=1.00:bg=0.42:bb=0.64" \
+    "${pre}257*clip(255*ld(3)*($t2),0,255)" \
+    "${pre}257*clip(255*ld(3)*($t0),0,255)" \
+    "${pre}257*clip(255*ld(3)*($t1),0,255)" \
+    "geq=r='r(X,Y)+257*(8+14*$glow)':g='g(X,Y)+257*(9+14*$glow)':b='b(X,Y)+257*(16+20*$glow)'"
+}
+
+command -v ffmpeg >/dev/null || {
+  echo "gen-backgrounds: ffmpeg is required for the video loops" >&2
+  exit 1
+}
+aurora
+bokeh_loop

@@ -63,6 +63,15 @@
 //! [`ErrorKind::Unsupported`]. Unload, the temporal reset and the timings
 //! of [`Instance`] serve both kinds.
 //!
+//! # A per-frame background (ABI 1.4)
+//!
+//! A module whose `background` stage can replace the background with a
+//! video sets [`Instance::LIVE_BACKGROUND`] to `true` and implements
+//! [`Instance::set_background`]: the daemon then hands it one NV12
+//! background frame at a time, between frames. Without it the vtable's
+//! entry stays null, and the daemon shows a video background as the
+//! load-time still.
+//!
 //! # What the exported entry points do
 //!
 //! [`export_module!`] defines the two symbols the daemon looks up,
@@ -256,6 +265,43 @@ pub trait Instance: Send + 'static {
     /// streaming thread. The default reports none.
     fn status_values(&self) -> Vec<StatusValue> {
         Vec::new()
+    }
+
+    /// Whether the instance takes a per-frame background
+    /// ([`Instance::set_background`], ABI 1.4). Only when it is `true` does
+    /// [`export_module!`] fill the vtable's `instance_set_background`
+    /// entry; with the default, `false`, the entry is null and the daemon
+    /// shows a video background as the load-time still. Set it together
+    /// with an implementation of [`Instance::set_background`].
+    const LIVE_BACKGROUND: bool = false;
+
+    /// Replaces the background of a replacement (the `background` stage
+    /// under replace) for the following [`Instance::process`] calls, until
+    /// the next call: the per-frame counterpart of
+    /// [`ChainRequest::background`] (ABI 1.4). Only called when
+    /// [`Instance::LIVE_BACKGROUND`] is `true`, between two frames, on a
+    /// loaded instance whose chain includes `background` under replace.
+    ///
+    /// `frame` is an NV12 frame of the loaded chain's output size and
+    /// colour description, of the chain's frame kind (CUDA device memory
+    /// on the chain's context and stream, or host memory): the SDK refuses
+    /// any other with [`ErrorKind::Invalid`] before calling. A host frame
+    /// is valid only during the call. A CUDA frame is valid in stream
+    /// order: work enqueued on the chain's stream during the call may read
+    /// it (the host keeps it alive and unwritten until that work has
+    /// completed), but nothing may read it after the call on another
+    /// stream, nor keep it. Copy or convert what is kept. `None` returns
+    /// to the load-time background image, and so does every load of the
+    /// chain (a switch or a full reload): the host gives a frame again
+    /// after it when it wants one. A failure must leave the previous
+    /// background in force.
+    ///
+    /// The default fails with [`ErrorKind::Unsupported`].
+    fn set_background(&mut self, frame: Option<&Frame<'_>>) -> Result<(), Error> {
+        let _ = frame;
+        Err(Error::unsupported(
+            "this module takes no per-frame background",
+        ))
     }
 
     /// The stream is about to stop for a while: release what can be rebuilt

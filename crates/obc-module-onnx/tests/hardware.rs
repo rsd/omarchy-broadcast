@@ -205,6 +205,72 @@ fn cuda_frames_are_processed_and_the_hosts_context_stays_current() {
         src.upload_packed(&host.data).unwrap();
     }
 
+    // A video background in CUDA frames: copied on the chain's stream and
+    // shown where the room was; a frame on another stream is refused.
+    {
+        let mut inst = module.create_instance().unwrap();
+        let bg = obc_backend::HostBgr {
+            width: 64,
+            height: 36,
+            stride: 64 * 3,
+            data: vec![128; 64 * 3 * 36],
+        };
+        inst.load(&ChainSpec {
+            kind: OBC_FRAME_CUDA,
+            cuda,
+            background: Some(std::sync::Arc::new(bg)),
+            ..host_chain(
+                w as u32,
+                h as u32,
+                &[("mode", "replace"), ("engine", "cpu")],
+                None,
+            )
+        })
+        .unwrap();
+        let mut packed = vec![60u8; w * h];
+        packed.extend(std::iter::repeat_n([100u8, 150], w * h / 4).flatten());
+        let live = DeviceNv12Buffer::alloc(w as u32, h as u32).unwrap();
+        live.upload_packed(&packed).unwrap();
+        let other = Stream::new(true).unwrap();
+        let elsewhere = obc_cuda {
+            context: ctx.raw(),
+            stream: other.raw(),
+        };
+        // SAFETY: a device frame of the current context, valid during the
+        // call.
+        let e = unsafe { inst.set_background(Some(&cuda_frame(&live, elsewhere, 0))) }.unwrap_err();
+        assert_eq!(e.status, obc_module_host::Status::Invalid, "{e:?}");
+        // SAFETY: as above.
+        unsafe { inst.set_background(Some(&cuda_frame(&live, cuda, 0))) }.unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            // SAFETY: as above.
+            unsafe { inst.set_background(Some(&cuda_frame(&live, cuda, 0))) }.unwrap();
+        }
+        let set_ms = t.elapsed().as_secs_f32() * 1e3 / 20.0;
+        let (fi, fo) = (
+            cuda_frame(&src, cuda, OBC_FRAME_FLAG_NEW_SOURCE),
+            cuda_frame(&dst, cuda, 0),
+        );
+        // SAFETY: device frames of the current context, valid during the call.
+        unsafe { inst.process(&fi, &fo, &[]) }.unwrap();
+        stream.synchronize().unwrap();
+        let out = dst.download_packed().unwrap();
+        let shown = out[..w * h]
+            .iter()
+            .filter(|&&y| (i32::from(y) - 60).abs() <= 1)
+            .count() as f64
+            / (w * h) as f64;
+        eprintln!(
+            "CUDA video background: {:.1} % of the picture, set_background {set_ms:.2} ms (720p)",
+            100.0 * shown
+        );
+        assert!(shown > 0.03, "{shown}");
+        assert_eq!(obc_gpu::current_context().unwrap(), ctx.raw());
+        inst.unload();
+        drop((live, other));
+    }
+
     if !nvidia {
         eprintln!("no NVIDIA engine ran: the two-chain and host-frame steps are not run");
         return;
