@@ -42,6 +42,24 @@
 //!   meters). Unknown consumers (no PipeWire) do not close the gate; a
 //!   PipeWire connection that has not synced yet does
 //!   ([`GpuGate::Pending`]).
+//! * The warm grace: when the last application stops recording (or the
+//!   PipeWire graph is not known for a while) after a recorder used the
+//!   GPU plan in force, the gate stays open for `gpu_warm_s` seconds (0:
+//!   it closes at once), so that the next recording starts with the GPU
+//!   chain already loaded; a recorder back within it cancels it, and
+//!   nothing reloads. A plugin that disconnects and connects again keeps
+//!   it, and so does a change of live parameters; a change of what the
+//!   chain loads (a load-time setting, a stage) ends it, so that no new GPU
+//!   chain loads while nobody records. The policy (`never`, `with-camera`
+//!   with the camera off, a change of it) closes the gate at once, never
+//!   held. A worker that never served a recorder is never warm. When the
+//!   grace ends while a plugin is connected, the plan goes to the CPU; when
+//!   it ends while none is (and `gpu_warm_s` is not 0), nothing changes:
+//!   the GPU plan and its chain stay, unused, with no new load and no
+//!   status change (so no call from the daemon follows, and the idle exit
+//!   is not put off), until the next connection decides the gate afresh
+//!   (a recorder keeps the chain, a level meter gets the CPU plan), the
+//!   policy closes it or the loads change.
 //! * The pipeline depth is negotiated at connect for the deepest chain the
 //!   session may need: as if the consumers gate were open (the GPU policy
 //!   alone decides), so that a recorder starting does not need a new
@@ -54,7 +72,9 @@
 //!   depth)`, plus the chain's algorithmic delay) is set as the node's
 //!   `ProcessLatency` whenever it changes.
 //! * Exit on idle: no input block and no D-Bus call for `idle_exit_s`
-//!   seconds (0: never), and no D-Bus call in flight: the bus name is
+//!   seconds (0: never), no D-Bus call in flight and no warm grace running
+//!   (the worker exits at the later of the two; a grace ending with no
+//!   plugin connected is no activity): the bus name is
 //!   released first, then, if still idle (no call came meanwhile), the
 //!   connection is closed and the thread ends; otherwise the name is taken
 //!   again and the worker goes on. The shutdown flag ends it too.
@@ -322,6 +342,21 @@ pub struct Engine {
     renegotiating: Option<Instant>,
     /// [`Engine::session_depth`] at the last plan, for the status.
     open_depth: u32,
+    /// The loads of the GPU plan a recorder last used since the gate last
+    /// closed: a close by the consumers is held (the warm grace) while the
+    /// plan in force still has them.
+    recorded: Option<LoadKey>,
+    /// The snapshot's GPU policy at the last snapshot: a change ends the
+    /// warm grace.
+    policy: GpuPolicy,
+    /// The warm grace (see the module documentation) runs: since when the
+    /// last recorder left.
+    warm_since: Option<Instant>,
+    /// The warm grace ended while no plugin was connected: the GPU plan
+    /// with these loads (and its chain) stays, unused, the gate held open,
+    /// so that the end makes no plan, load or status change; the next
+    /// connection, the policy or a change of the loads lets it go.
+    stale: Option<LoadKey>,
 }
 
 impl Engine {
@@ -375,8 +410,13 @@ impl Engine {
             watchdog: Arc::new(Watchdog::new()),
             renegotiating: None,
             open_depth: 1,
+            recorded: None,
+            warm_since: None,
+            stale: None,
+            policy: GpuPolicy::Always,
         };
-        e.gate = e.gate_now(&e.snapshot());
+        e.policy = e.snapshot().gpu_policy();
+        e.gate = e.gate_now(&e.snapshot()).0;
         e.replan();
         e.publish_status();
         e
@@ -395,20 +435,118 @@ impl Engine {
         }
     }
 
-    /// The GPU gate now (see the module documentation).
-    fn gate_now(&self, snapshot: &Snapshot) -> GpuGate {
+    /// The GPU gate now (see the module documentation), without the warm
+    /// grace; and whether an application records (known to).
+    fn gate_now(&self, snapshot: &Snapshot) -> (GpuGate, bool) {
         let gate = self.policy_gate(snapshot);
         if !gate.allows() {
-            return gate;
+            return (gate, false);
         }
         let pipewire = &self.shared.pipewire;
         match pipewire.consumers() {
-            Some(c) if c.real == 0 => GpuGate::NoRecorder,
-            Some(_) => GpuGate::Allowed,
+            Some(c) if c.real == 0 => (GpuGate::NoRecorder, false),
+            Some(_) => (GpuGate::Allowed, true),
             // Connected, the graph not known yet: closed until it is.
-            None if pipewire.consumers_pending() => GpuGate::Pending,
-            None => GpuGate::Allowed,
+            None if pipewire.consumers_pending() => (GpuGate::Pending, false),
+            None => (GpuGate::Allowed, false),
         }
+    }
+
+    /// The GPU gate now, the warm grace applied: a close by the consumers
+    /// alone ([`GpuGate::NoRecorder`], [`GpuGate::Pending`]) of the GPU plan
+    /// a recorder used (the same loads) is held for `gpu_warm_s` from the
+    /// moment the last recorder left (see the module documentation).
+    fn gate_warm(&mut self, snapshot: &Snapshot) -> GpuGate {
+        let (gate, recording) = self.gate_now(snapshot);
+        if gate.allows() {
+            if self.warm_since.take().is_some() {
+                info!("an application records again: the GPU chain was kept warm for it");
+            }
+            self.stale = None;
+            if recording {
+                self.recorded = self.plan.gpu().then(|| self.plan.load_key());
+            }
+            return gate;
+        }
+        let warm = Duration::from_secs(snapshot.gpu_warm_s);
+        let transient = matches!(gate, GpuGate::NoRecorder | GpuGate::Pending);
+        if transient && self.gate.allows() {
+            if self.stale.is_some() {
+                if self.stale.as_ref() == Some(&self.plan.load_key()) {
+                    return GpuGate::Allowed;
+                }
+                self.stale = None;
+                info!(
+                    "the chain's settings changed while no application records: the unused \
+                     GPU chain is let go"
+                );
+            }
+            match &self.recorded {
+                Some(key) if *key == self.plan.load_key() => {
+                    let since = match self.warm_since {
+                        Some(t) => t,
+                        None => {
+                            let now = Instant::now();
+                            if !warm.is_zero() {
+                                info!(
+                                    "no application records: keeping the GPU chain warm for {} s",
+                                    warm.as_secs()
+                                );
+                            }
+                            self.warm_since = Some(now);
+                            now
+                        }
+                    };
+                    if since.elapsed() < warm {
+                        return GpuGate::Allowed;
+                    }
+                    // No plugin connected: nothing would use a new plan,
+                    // and making one would load a chain and change the
+                    // status (a call from the daemon, so a later idle
+                    // exit). The plan stays, unused, until the next
+                    // connection decides the gate afresh.
+                    if !warm.is_zero() && self.endpoint.is_none() && self.renegotiating.is_none() {
+                        info!(
+                            "the GPU chain was kept warm for {} s: no mic plugin is connected, \
+                             so it stays as it is until one connects",
+                            warm.as_secs()
+                        );
+                        self.warm_since = None;
+                        self.stale = self.recorded.take();
+                        return GpuGate::Allowed;
+                    }
+                }
+                Some(_) => {
+                    self.end_grace("the chain's settings changed while no application records")
+                }
+                None => {}
+            }
+        }
+        if self.warm_since.take().is_some() && !warm.is_zero() {
+            if transient {
+                info!(
+                    "the GPU chain was kept warm for {} s: letting it go",
+                    warm.as_secs()
+                );
+            } else {
+                info!("the GPU policy closes the GPU: the GPU chain is no longer kept warm");
+            }
+        }
+        self.recorded = None;
+        self.stale = None;
+        gate
+    }
+
+    /// Ends the warm grace, if one runs, and forgets the recorder's plan
+    /// (and a plan held after a grace, `stale`): `why` is logged.
+    fn end_grace(&mut self, why: &str) {
+        if self.warm_since.take().is_some() {
+            info!("{why}: the GPU chain is no longer kept warm");
+        }
+        if self.stale.take().is_some() {
+            info!("{why}: the unused GPU chain is let go");
+        }
+        self.recorded = None;
     }
 
     /// The pipeline depth of a session: the deepest the plan may need
@@ -474,7 +612,8 @@ impl Engine {
 
     /// Follows the GPU gate: a new plan when it moved.
     fn follow_gate(&mut self) {
-        let gate = self.gate_now(&self.snapshot());
+        let snapshot = self.snapshot();
+        let gate = self.gate_warm(&snapshot);
         if gate != self.gate {
             debug!("GPU gate: {gate:?}");
             self.gate = gate;
@@ -615,6 +754,11 @@ impl Engine {
         }
         self.generation = g;
         let snapshot = self.snapshot();
+        // A new policy ends the warm grace, never held.
+        if snapshot.gpu_policy() != self.policy {
+            self.policy = snapshot.gpu_policy();
+            self.end_grace("the GPU policy changed");
+        }
         // A new policy applies at once; the camera's state only at the
         // next session.
         if let Some((policy, _)) = self.session
@@ -622,7 +766,10 @@ impl Engine {
         {
             self.session = Some((snapshot.gpu_policy(), snapshot.camera_active));
         }
-        self.gate = self.gate_now(&snapshot);
+        // A change of the loads during the grace ends it at the next
+        // `follow_gate`, before any load starts: the gate is decided here
+        // on the plan before the snapshot.
+        self.gate = self.gate_warm(&snapshot);
         self.replan();
     }
 
@@ -833,6 +980,9 @@ impl Engine {
             self.session = Some((snapshot.gpu_policy(), snapshot.camera_active));
         }
         self.renegotiating = None;
+        // A plan held after a grace (`stale`) is decided afresh for this
+        // connection: a recorder keeps it, a level meter gets the CPU plan.
+        self.stale = None;
         self.follow_gate();
         let depth = self.session_depth(&snapshot);
         let latency = self.latency_now();
@@ -1004,7 +1154,10 @@ impl Engine {
     /// Whether the worker has been idle long enough to exit.
     fn idle(&self) -> bool {
         let secs = lock(&self.shared.snapshot).idle_exit_s;
-        if secs == 0 || self.shared.in_flight.load(Ordering::SeqCst) > 0 {
+        if secs == 0
+            || self.warm_since.is_some()
+            || self.shared.in_flight.load(Ordering::SeqCst) > 0
+        {
             return false;
         }
         let last = (*lock(&self.shared.last_call)).max(self.last_input);

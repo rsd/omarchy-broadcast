@@ -35,7 +35,7 @@
 # hold_timeout_s, input_gap_ms and placeholder; [lifecycle] idle_grace_s and
 # start_debounce_ms; [video] memory; [effect] on_failure and fallback_image;
 # [pipewire] enabled and offer_nv12;
-# [mic] enabled, device, pipeline_depth, idle_exit_s and gpu_policy; and in
+# [mic] enabled, device, pipeline_depth, idle_exit_s, gpu_warm_s and gpu_policy; and in
 # [modules] profile, enabled.<id>, forced.<id> and pin.<stage>. Everything else,
 # including the [effect] defaults (which a choice made in the panel overrides),
 # is set here. `omarchy-broadcast config show` lists every key with the file
@@ -399,7 +399,7 @@ offer_nv12 = true
 # worker. The microphone keeps working whatever stops: without processing,
 # its sound passes through unchanged. The panel's Mic tab and
 # `omarchy-broadcast config set` can change enabled, device, pipeline_depth,
-# idle_exit_s and gpu_policy; force_conflicts is set here only.
+# idle_exit_s, gpu_warm_s and gpu_policy; force_conflicts is set here only.
 
 # Process the microphone. Off, the sound passes through unchanged; it is
 # never muted.
@@ -425,6 +425,14 @@ pipeline_depth = 0
 # 0 to 86400; 0 never exits.
 # Default: 30
 idle_exit_s = 30
+
+# Seconds the microphone's GPU effects stay loaded after the last
+# application stops recording, so that the next recording starts with them
+# instead of waiting seconds for them to load again. The worker does not exit
+# while they are kept, so a value above idle_exit_s keeps the worker, and the
+# GPU, awake that much longer. 0 to 86400; 0 drops them at once.
+# Default: 30
+gpu_warm_s = 30
 
 # When the microphone's effects may run on a GPU: "always", "with-camera"
 # (only in a microphone session that starts while the camera runs, so the

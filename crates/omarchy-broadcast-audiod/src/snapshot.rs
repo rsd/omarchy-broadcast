@@ -30,11 +30,17 @@ pub const VERSION: u32 = 1;
 /// The default `idle_exit_s`.
 pub const DEFAULT_IDLE_EXIT_S: u64 = 30;
 
+/// The default `gpu_warm_s`.
+pub const DEFAULT_GPU_WARM_S: u64 = 30;
+
 /// The largest snapshot file read: 1 MiB.
 pub const MAX_FILE_SIZE: u64 = 1 << 20;
 
 /// The longest `idle_exit_s` taken: a day.
 pub const MAX_IDLE_EXIT_S: u64 = 86_400;
+
+/// The longest `gpu_warm_s` taken: a day, as `idle_exit_s`.
+pub const MAX_GPU_WARM_S: u64 = MAX_IDLE_EXIT_S;
 
 /// The pipeline depth: by device, or one value for every chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +106,9 @@ pub struct Snapshot {
     /// Seconds without an input block (and without a D-Bus call) before
     /// the worker exits; 0 never.
     pub idle_exit_s: u64,
+    /// Seconds the GPU stages stay planned after the last application
+    /// stops recording (the worker stays meanwhile); 0 drops them at once.
+    pub gpu_warm_s: u64,
     /// `always`, `with-camera` or `never` (see [`GpuPolicy`]).
     pub gpu_policy: String,
     /// The camera session is active (the daemon says so); read for
@@ -125,6 +134,7 @@ impl Default for Snapshot {
             device: "default".into(),
             pipeline_depth: PipelineDepth::default(),
             idle_exit_s: DEFAULT_IDLE_EXIT_S,
+            gpu_warm_s: DEFAULT_GPU_WARM_S,
             gpu_policy: GpuPolicy::Always.as_str().into(),
             camera_active: false,
             profile: Profile::Quality.as_str().into(),
@@ -237,6 +247,7 @@ impl Snapshot {
     /// The snapshot with its numbers in range.
     fn normalised(mut self) -> Snapshot {
         self.idle_exit_s = self.idle_exit_s.min(MAX_IDLE_EXIT_S);
+        self.gpu_warm_s = self.gpu_warm_s.min(MAX_GPU_WARM_S);
         self
     }
 
@@ -314,7 +325,7 @@ mod tests {
     fn a_full_snapshot_parses() {
         let s = Snapshot::parse(
             r#"{"version":1,"enabled":false,"device":"alsa_input.x","pipeline_depth":3,
-                "idle_exit_s":5,"gpu_policy":"never","profile":"battery",
+                "idle_exit_s":5,"gpu_warm_s":7,"gpu_policy":"never","profile":"battery",
                 "pins":{"mic-denoise":"m"},"values":{"mic.a.b":true},
                 "disabled_modules":["x"],"forced_conflicts":true,"future":1}"#,
         )
@@ -323,6 +334,7 @@ mod tests {
         assert_eq!(s.pipeline_depth, PipelineDepth::Override(3));
         assert_eq!(s.pipeline_depth.blocks(false), 3);
         assert_eq!(s.idle_exit_s, 5);
+        assert_eq!(s.gpu_warm_s, 7);
         assert_eq!(s.profile(), Profile::Battery);
         assert_eq!(s.pins["mic-denoise"], "m");
         assert!(s.forced_conflicts);
@@ -380,7 +392,7 @@ mod tests {
         let p = dir.path().join(FILE);
         std::fs::write(
             &p,
-            r#"{"version":1,"idle_exit_s":"soon","enabled":false,
+            r#"{"version":1,"idle_exit_s":"soon","gpu_warm_s":-1,"enabled":false,
                 "disabled_modules":["a.b"],"pins":7,"future":{"x":1}}"#,
         )
         .unwrap();
@@ -388,14 +400,27 @@ mod tests {
         assert_eq!(s.disabled_modules, ["a.b"]);
         assert!(!s.enabled);
         assert_eq!(s.idle_exit_s, DEFAULT_IDLE_EXIT_S);
+        assert_eq!(s.gpu_warm_s, DEFAULT_GPU_WARM_S);
         assert!(s.pins.is_empty());
         let note = note.unwrap();
         assert!(
-            note.contains("idle_exit_s") && note.contains("pins"),
+            note.contains("idle_exit_s") && note.contains("gpu_warm_s") && note.contains("pins"),
             "{note}"
         );
         // ApplySnapshot stays strict.
         assert!(Snapshot::parse(r#"{"version":1,"pins":7}"#).is_err());
+    }
+
+    #[test]
+    fn the_seconds_are_clamped_to_a_day() {
+        let s =
+            Snapshot::parse(r#"{"version":1,"idle_exit_s":999999,"gpu_warm_s":999999}"#).unwrap();
+        assert_eq!(s.idle_exit_s, MAX_IDLE_EXIT_S);
+        assert_eq!(s.gpu_warm_s, MAX_GPU_WARM_S);
+        let d = Snapshot::default();
+        assert_eq!(d.gpu_warm_s, DEFAULT_GPU_WARM_S);
+        let s = Snapshot::parse(r#"{"version":1,"gpu_warm_s":0}"#).unwrap();
+        assert_eq!(s.gpu_warm_s, 0);
     }
 
     #[test]

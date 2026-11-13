@@ -554,6 +554,20 @@ pub const CORE_KEYS: &[KeySpec] = &[
         apply: Apply::Live,
     },
     KeySpec {
+        key: "mic.gpu_warm_s",
+        group: "mic",
+        label: "Keep the GPU effects ready",
+        description: "How long the microphone's GPU effects stay loaded after the last application stops recording, so that the next recording starts with them; 0 drops them at once.",
+        kind: SpecKind::Int {
+            min: 0,
+            max: crate::config::limits::MAX_MIC_GPU_WARM_S as i64,
+            step: 1,
+            unit: "s",
+        },
+        editable: true,
+        apply: Apply::Live,
+    },
+    KeySpec {
         key: "mic.gpu_policy",
         group: "mic",
         label: "Microphone on the GPU",
