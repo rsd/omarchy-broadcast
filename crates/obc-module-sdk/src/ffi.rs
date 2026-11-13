@@ -20,7 +20,7 @@ use crate::audio::{AudioLoaded, buffers};
 use crate::log::{self, c_string};
 use crate::{
     AudioInstance, AudioRequest, ChainFrames, ChainRequest, Error, ErrorKind, Frame, Instance,
-    Module, Param,
+    Module, Param, PixelFormat,
 };
 
 thread_local! {
@@ -679,6 +679,60 @@ unsafe extern "C" fn instance_status_values<I: Instance>(
     })
 }
 
+unsafe extern "C" fn instance_set_background<I: Instance>(
+    instance: *mut obc_instance,
+    background: *const obc_frame,
+) -> obc_status {
+    boundary(|| {
+        // SAFETY: by the ABI contract.
+        let Some(b) = (unsafe { instance_mut::<I>(instance) }) else {
+            return ErrorKind::Invalid.status();
+        };
+        let result = (|| {
+            let Some(loaded) = b.loaded else {
+                return Err(Error::state("a background came before a successful load"));
+            };
+            if background.is_null() {
+                let instance = &mut b.instance;
+                return guard(|| instance.set_background(None));
+            }
+            // SAFETY: non-null; by the ABI contract, valid during the call.
+            let frame = unsafe { Frame::from_ptr(background) }
+                .map_err(|e| Error::new(e.kind(), format!("background: {e}")))?;
+            check_background(&frame, &loaded)?;
+            let instance = &mut b.instance;
+            guard(|| instance.set_background(Some(&frame)))
+        })();
+        b.finish(result)
+    })
+}
+
+/// Refuses a per-frame background that is not an NV12 frame of the loaded
+/// chain's kind and output size.
+fn check_background(frame: &Frame<'_>, loaded: &ChainFrames) -> Result<(), Error> {
+    if frame.format() != PixelFormat::Nv12 {
+        return Err(Error::invalid(format!(
+            "background: the format is {}, not NV12",
+            frame.format().name().unwrap_or("unknown")
+        )));
+    }
+    if frame.kind() != loaded.kind {
+        return Err(Error::invalid(format!(
+            "background: the frame kind is {}, not the chain's {}",
+            frame.kind().name().unwrap_or("unknown"),
+            loaded.kind.name().unwrap_or("unknown")
+        )));
+    }
+    let size = (frame.width(), frame.height());
+    if size != loaded.output_size {
+        return Err(Error::invalid(format!(
+            "background: the size is {}x{}, not the chain's output size {}x{}",
+            size.0, size.1, loaded.output_size.0, loaded.output_size.1
+        )));
+    }
+    Ok(())
+}
+
 unsafe extern "C" fn instance_park<I: Instance>(instance: *mut obc_instance) -> obc_status {
     boundary(|| {
         // SAFETY: by the ABI contract.
@@ -771,6 +825,11 @@ pub const fn vtable<M: Module>() -> obc_module_vtable {
         audio_instance_load: None,
         audio_instance_process: None,
         instance_status_values: Some(instance_status_values::<M::Instance>),
+        instance_set_background: if <M::Instance as Instance>::LIVE_BACKGROUND {
+            Some(instance_set_background::<M::Instance>)
+        } else {
+            None
+        },
     }
 }
 

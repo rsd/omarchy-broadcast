@@ -35,6 +35,14 @@ use crate::bus::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Failure, READ_TIMEOUT};
 /// which may wait for D-Bus activation of the daemon.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Time allowed for `media import`, which waits for the daemon to check, hash
+/// and copy a video of up to 512 MiB and, for an animated GIF, WebP or APNG,
+/// to convert it with ffmpeg (the daemon bounds that at 120 s). It is the
+/// bound the daemon needs with a margin, and below the 610 s the bar
+/// plugin's flow watchdog allows. zbus sets no method timeout of its own, so this is
+/// the only limit on the call.
+const IMPORT_TIMEOUT: Duration = Duration::from_secs(600);
+
 const AFTER_HELP: &str = "\
 Exit status:
   0  success
@@ -107,8 +115,9 @@ enum Command {
         /// Blur strength, from 0.0 to 1.0 (with `blur`).
         #[arg(long, value_name = "X", value_parser = parse_strength, requires = "effect")]
         strength: Option<f64>,
-        /// Background image (with `replace`). A relative path is taken from
-        /// the current directory; the daemon is given the absolute path.
+        /// Background image or video (with `replace`; a video needs a
+        /// daemon of D-Bus revision 18). A relative path is taken from the
+        /// current directory; the daemon is given the absolute path.
         #[arg(long, value_name = "PATH", requires = "effect")]
         image: Option<PathBuf>,
         /// Print one JSON object (`"type":"snapshot"`); only without an

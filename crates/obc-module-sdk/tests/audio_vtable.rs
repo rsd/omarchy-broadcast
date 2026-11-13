@@ -256,10 +256,12 @@ fn last_error(vt: &obc_module_vtable, instance: *mut obc_instance) -> String {
 
 #[test]
 fn the_audio_form_of_the_macro_fills_the_audio_entries() {
-    assert_eq!(obc_module_abi_version(), obc_module_abi_pack(1, 3));
+    assert_eq!(obc_module_abi_version(), obc_module_abi_pack(1, 4));
     let vt = vtable();
     assert_eq!(vt.struct_size as usize, size_of::<obc_module_vtable>());
     assert!(vt.audio_instance_load.is_some() && vt.audio_instance_process.is_some());
+    // The audio instance keeps the default: no per-frame background.
+    assert!(vt.instance_set_background.is_none());
     // The video entries stay set, as the ABI requires.
     assert!(vt.instance_load.is_some() && vt.instance_process.is_some());
 }

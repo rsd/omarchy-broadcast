@@ -48,7 +48,9 @@ use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use crate::backend::real::GstBackend;
 use crate::backend::{ControlEventReporter, PipeWireReporter, PreviewReporter};
 use crate::consumers::ConsumerWatcher;
-use crate::controller::{self, Command, Controller, Paths, Published, preliminary_snapshot};
+use crate::controller::{
+    self, Command, Controller, GalleryVideos, Paths, Published, preliminary_snapshot,
+};
 use crate::dbus::{Server, run_owner_watch, run_publisher, subscribe_owners};
 use crate::hotplug::{CameraWatcher, SECOND_SCAN, SETTLE};
 use crate::media::MediaStore;
@@ -205,6 +207,10 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
     let (commands, command_rx) = channel::<Command>();
     let media =
         MediaStore::from_env().inspect_err(|e| warning!("the media gallery is unavailable: {e}"));
+    // Video backgrounds: posters and playback copies of the gallery's cache
+    // (started now, its first job a prune once the controller names what
+    // the background in force needs).
+    let videos = GalleryVideos::new(media.as_ref().ok().cloned(), commands.clone());
     let conn = zbus::connection::Builder::session()
         .serve_at(
             OBJECT_PATH,
@@ -272,6 +278,9 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
                 // the daemon stops (the sender is dropped).
                 if name_rx.blocking_recv().is_ok() {
                     ctrl.set_mic(mic_tx);
+                    // Once the name is ours: its prune must not race
+                    // another instance's jobs in the same cache.
+                    ctrl.set_videos(Box::new(videos));
                     ctrl.load_modules(Instant::now());
                 }
                 controller::run(ctrl, command_rx);

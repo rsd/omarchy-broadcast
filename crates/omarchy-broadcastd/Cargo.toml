@@ -30,6 +30,8 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 libc = { workspace = true }
 clap = { workspace = true }
+# The content hashes naming posters and playback copies.
+sha2 = { workspace = true }
 
 [features]
 # The PipeWire camera node; off by default (needs libpipewire headers and clang).

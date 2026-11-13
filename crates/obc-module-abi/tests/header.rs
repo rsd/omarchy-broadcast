@@ -166,6 +166,11 @@ fn layout_checks() -> String {
         offset_of!(obc_module_vtable, instance_status_values),
     );
     offset(
+        "obc_module_vtable",
+        "instance_set_background",
+        offset_of!(obc_module_vtable, instance_set_background),
+    );
+    offset(
         "obc_audio_buffer",
         "planes",
         offset_of!(obc_audio_buffer, planes),

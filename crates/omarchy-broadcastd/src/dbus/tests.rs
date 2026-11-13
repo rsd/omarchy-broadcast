@@ -444,8 +444,9 @@ async fn every_property_reads_through_the_proxy() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 17);
-    assert_eq!(INTERFACE_REVISION, obc_ipc::PLACEHOLDER_REVISION);
+    assert_eq!(INTERFACE_REVISION, 18);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::VIDEO_BACKGROUND_REVISION);
+    assert_eq!(obc_ipc::PLACEHOLDER_REVISION, 17);
     // GetAll returns the same twenty-nine properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
         .destination(obc_ipc::BUS_NAME)
@@ -944,7 +945,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 17);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 18);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -1128,7 +1129,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 17);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 18);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -1244,7 +1245,7 @@ async fn preview_leases_by_bus_name_their_property_and_their_frames() {
     let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 17);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 18);
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
     let seen = rig.record_changes().await;
     let mut frames = proxy.receive_preview_frame().await.unwrap();
@@ -2365,7 +2366,7 @@ async fn the_gallery_lists_imports_and_removes() {
         (
             "background",
             root.join("src/clip.mp4").display().to_string(),
-            "videos are not supported yet",
+            "cannot import",
         ),
         ("portrait", src.display().to_string(), "unknown media kind"),
     ] {
@@ -2475,4 +2476,120 @@ async fn without_a_gallery_the_media_methods_fail_with_the_reason() {
         proxy.interface_revision().await.unwrap(),
         INTERFACE_REVISION
     );
+}
+
+/// The bundled loops of the repository.
+fn asset(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../assets/media/backgrounds"
+    ))
+    .join(name)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_video_background_is_checked_before_the_controller_takes_it() {
+    let rig = Rig::new("", |_| {}).await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    let dir = rig._dir.path();
+    // It starts like an MP4, and the check refuses it: refused here, with
+    // the check's reason (the controller never runs the check).
+    let bad = dir.join("bad.mp4");
+    put_file(&bad, b"\0\0\0\x18ftypisom\0\0\0\0");
+    let msg = refused(
+        within(
+            "SetBackgroundImage",
+            proxy.set_background_image(&bad.display().to_string()),
+        )
+        .await,
+    );
+    assert!(msg.contains("the video file"), "{msg}");
+    assert_eq!(proxy.background_image().await.unwrap(), "");
+    // Over the video limit: the video limit is the reason.
+    let big = dir.join("big.mp4");
+    put_file(&big, b"\0\0\0\x18ftypisom\0\0\0\0");
+    fs::File::options()
+        .write(true)
+        .open(&big)
+        .unwrap()
+        .set_len(crate::media::probe::MAX_VIDEO_BYTES + 1)
+        .unwrap();
+    let msg = refused(
+        within(
+            "SetBackgroundImage",
+            proxy.set_background_image(&big.display().to_string()),
+        )
+        .await,
+    );
+    assert!(msg.contains("512 MiB limit"), "{msg}");
+    // A loop the check accepts: taken, and its check is known to the run.
+    let good = dir.join("loop.webm");
+    fs::copy(asset("slow-aurora.webm"), &good).unwrap();
+    within(
+        "SetBackgroundImage",
+        proxy.set_background_image(&good.display().to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        proxy.background_image().await.unwrap(),
+        good.display().to_string()
+    );
+    assert!(crate::media::known_video_info(&good).is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_media_lists_the_posters_found_and_announces_each_poster_made() {
+    let rig = Rig::with_media(|dir| {
+        Ok(
+            MediaStore::new(dir.join("media-bundled"), dir.join("media-user"))
+                .with_cache(crate::media::MediaCache::new(dir.join("cache"))),
+        )
+    })
+    .await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    let seen = rig.record_changes().await;
+    let root = rig._dir.path();
+    let bundled = root.join("media-bundled/backgrounds");
+    for name in ["slow-aurora.webm", "slow-aurora.poster.jpg"] {
+        put_file(&bundled.join(name), &fs::read(asset(name)).unwrap());
+    }
+    let user = root.join("media-user/backgrounds/mine.webm");
+    put_file(&user, &fs::read(asset("drifting-bokeh.webm")).unwrap());
+
+    let list = within("GetMedia", proxy.media("background")).await.unwrap();
+    let posters: Vec<(String, String)> = list
+        .items
+        .iter()
+        .map(|i| (i.label.clone(), i.poster.clone()))
+        .collect();
+    assert_eq!(
+        posters.len(),
+        2,
+        "the shipped poster is no item: {posters:?}"
+    );
+    // The bundled loop's shipped poster, copied into the cache at once.
+    let cache = root.join("cache/posters").display().to_string();
+    assert!(posters[0].1.starts_with(&cache), "{posters:?}");
+    // The user's video had none: the listing made none (it never
+    // decodes); the poster maker does, and the serial moves when it
+    // lands.
+    assert_eq!(posters[1].1, "", "{posters:?}");
+    if crate::media::ffmpeg::Ffmpeg::locate().is_err() {
+        eprintln!("skipped the rest: ffmpeg is not installed");
+        return;
+    }
+    until("MediaSerial=2", &seen, |s| {
+        s.iter().any(|c| c == "MediaSerial=2")
+    })
+    .await;
+    assert_eq!(proxy.media_serial().await.unwrap(), 2);
+    let list = within("GetMedia", proxy.media("background")).await.unwrap();
+    assert_eq!(list.serial, 2);
+    assert!(list.items[1].poster.starts_with(&cache), "{:?}", list.items);
+    // Listed again with every poster: nothing more is made.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(proxy.media_serial().await.unwrap(), 2);
 }

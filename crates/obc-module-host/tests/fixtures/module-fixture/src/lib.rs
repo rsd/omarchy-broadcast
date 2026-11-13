@@ -38,6 +38,15 @@
 //! ABI 1.2, its vtable of the size of 1.2 (without the status values of
 //! 1.3).
 //!
+//! Its instances take a per-frame background (ABI 1.4,
+//! `instance_set_background`): each call is logged at info level,
+//! `fixture-background frame=<frame>:<first luma byte>` (the byte of a
+//! host frame, 0 for a CUDA one) or `fixture-background none`; a host
+//! frame whose first luma byte is 99 is refused (`OBC_ERR_FAILED`). With
+//! `abi-1-3` it is exported as one of ABI 1.3 whose vtable is nevertheless
+//! of the size of 1.4, its `instance_set_background` set: the host must
+//! never call it.
+//!
 //! While `alpha` is loaded, the status values (ABI 1.3) report
 //! `alpha`/`step`, its step, and `alpha`/`frames`, the frames processed
 //! since the load; none otherwise.
@@ -397,6 +406,26 @@ mod module {
             ]
         }
 
+        const LIVE_BACKGROUND: bool = true;
+
+        fn set_background(&mut self, background: Option<&Frame<'_>>) -> Result<(), Error> {
+            let Some(f) = background else {
+                log::info!("fixture-background none");
+                return Ok(());
+            };
+            let first = if f.kind() == FrameKind::Host {
+                // SAFETY: a host frame the host owns for the call; only read.
+                unsafe { f.host_plane(0) }?.first().copied().unwrap_or(0)
+            } else {
+                0
+            };
+            log::info!("fixture-background frame={}:{first}", frame(f));
+            if first == 99 {
+                return Err(Error::failed("the fixture refuses a background of luma 99"));
+            }
+            Ok(())
+        }
+
         fn timings(&self) -> Vec<(String, f32)> {
             let mut t: Vec<(String, f32)> = self
                 .stages
@@ -551,6 +580,7 @@ mod module {
         feature = "abi-1-0",
         feature = "abi-1-1",
         feature = "abi-1-2",
+        feature = "abi-1-3",
         feature = "raw-status-values",
         feature = "audio"
     )))]
@@ -671,11 +701,17 @@ mod module {
     #[cfg(feature = "audio")]
     obc_module_sdk::export_module!(Fixture, audio);
 
-    /// The exports of `export_module!`, claiming ABI 1.0 (or 1.1, or 1.2),
-    /// with a vtable of that version's size: it ends before the audio
+    /// The exports of `export_module!`, claiming ABI 1.0 (or 1.1, 1.2 or
+    /// 1.3), with a vtable of that version's size: it ends before the audio
     /// entries of 1.2 (1.0 and 1.1), or before the status values of 1.3
-    /// (1.2).
-    #[cfg(any(feature = "abi-1-0", feature = "abi-1-1", feature = "abi-1-2"))]
+    /// (1.2). The 1.3 vtable is the whole of 1.4's, with the per-frame
+    /// background of 1.4 set, which the host must ignore by the version.
+    #[cfg(any(
+        feature = "abi-1-0",
+        feature = "abi-1-1",
+        feature = "abi-1-2",
+        feature = "abi-1-3"
+    ))]
     mod abi_1_0 {
         use obc_module_sdk::abi::{obc_host, obc_module_abi_pack, obc_module_vtable};
 
@@ -684,24 +720,29 @@ mod module {
             0
         } else if cfg!(feature = "abi-1-1") {
             1
-        } else {
+        } else if cfg!(feature = "abi-1-2") {
             2
+        } else {
+            3
         };
 
         /// The size of the vtable of that version.
         const SIZE: u32 = if MINOR < 2 {
             std::mem::offset_of!(obc_module_vtable, audio_instance_load) as u32
-        } else {
+        } else if MINOR == 2 {
             std::mem::offset_of!(obc_module_vtable, instance_status_values) as u32
+        } else {
+            size_of::<obc_module_vtable>() as u32
         };
 
-        /// ABI 1.0, 1.1 or 1.2.
+        /// ABI 1.0, 1.1, 1.2 or 1.3.
         #[unsafe(no_mangle)]
         pub extern "C" fn obc_module_abi_version() -> u32 {
             obc_module_abi_pack(1, MINOR)
         }
 
-        /// The SDK's entry point, with a vtable that says 1.0, 1.1 or 1.2.
+        /// The SDK's entry point, with a vtable that says 1.0, 1.1, 1.2 or
+        /// 1.3.
         ///
         /// # Safety
         ///

@@ -3,6 +3,10 @@
 # display order. Generated items are original work, made by the script named
 # in `source` and licensed with the repository. Photographs may only be added
 # if they are CC0-1.0, with the source URL in `source`.
+#
+# A video's poster, `<stem>.poster.jpg` (its first frame at 640x360, made by
+# the same script), is a derived file of that video, not an item: it has no
+# entry of its own, and the gallery does not list it.
 
 [[item]]
 file = "dusk-gradient.jpg"
@@ -56,4 +60,22 @@ author = "omarchy-broadcast contributors"
 licence = "MIT OR Apache-2.0"
 source = "scripts/gen-backgrounds.sh"
 retrieved = "2026-11-12"
+edits = "none"
+
+[[item]]
+file = "slow-aurora.webm"
+title = "Slow aurora"
+author = "omarchy-broadcast contributors"
+licence = "MIT OR Apache-2.0"
+source = "scripts/gen-backgrounds.sh"
+retrieved = "2026-11-13"
+edits = "none"
+
+[[item]]
+file = "drifting-bokeh.webm"
+title = "Drifting bokeh"
+author = "omarchy-broadcast contributors"
+licence = "MIT OR Apache-2.0"
+source = "scripts/gen-backgrounds.sh"
+retrieved = "2026-11-13"
 edits = "none"

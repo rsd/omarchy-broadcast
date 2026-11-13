@@ -1444,6 +1444,7 @@ fn the_backend_parks_the_gpu_between_sessions_without_a_camera() {
             mode: obc_core::EffectMode::None,
             blur_strength: 0.5,
             background_image: None,
+            background_video: None,
             on_failure: obc_core::EffectOnFailure::Black,
             fallback_image: None,
             stages: Vec::new(),

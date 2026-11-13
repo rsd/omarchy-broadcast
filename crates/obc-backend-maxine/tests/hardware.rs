@@ -54,6 +54,13 @@
 //! each frame's output is the Rust tone map of the effect's 10-bit image of
 //! that frame (not of the frame before), a mid-grey stays mid-grey, and
 //! misuse is refused.
+//!
+//! `maxine_a_per_frame_background_` covers the per-frame background of a
+//! replace (a video background): a solid NV12 frame replaces the
+//! load-time image from the next frame on, never for a frame enqueued
+//! before it, the load-time image returns with `None`, misuse is refused
+//! and leaves the picture in force, and the conversion's GPU time is
+//! logged.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -61,16 +68,17 @@ use std::time::Instant;
 
 use obc_backend::enhance::{ChromaSiting, DeviceYuv420, EnhanceRequest, Enhancer, YuvLayout};
 use obc_backend::{
-    BackendError, BackendFactory, ColourSpec, EffectKind, FrameParams, GpuContext, HostBgr,
-    InferenceBackend, LoadRequest, Params, StageId, StageList, StageTimings, Value,
+    BackendError, BackendFactory, BackgroundFrame, ColourSpec, EffectKind, FrameParams, GpuContext,
+    HostBgr, HostNv12View, InferenceBackend, LoadRequest, Params, StageId, StageList, StageTimings,
+    Value,
 };
 use obc_backend_maxine::matte::{HARDENING_LUT, apply_lut};
 use obc_backend_maxine::vsr::{EnhanceMethod, MaxineVsr, MaxineVsrFactory};
 use obc_backend_maxine::{
-    BACKGROUND_CHAIR, DenoiseFault, DenoiseFaultSwitch, GREEN_SCREEN_MODE_CHAIR_BACKGROUND,
-    GREEN_SCREEN_MODE_CHAIR_FOREGROUND, MaskFault, MaskFaultSwitch, MaxineBackend, MaxineFactory,
-    ModelLoads, RELIGHT_DIRECTION, RELIGHT_LIGHT, RelightFault, RelightFaultSwitch, RelightLight,
-    SPLIT_MASK_RAMP, split_mask_value,
+    BACKGROUND_CHAIR, BACKGROUND_STEP, DenoiseFault, DenoiseFaultSwitch,
+    GREEN_SCREEN_MODE_CHAIR_BACKGROUND, GREEN_SCREEN_MODE_CHAIR_FOREGROUND, MaskFault,
+    MaskFaultSwitch, MaxineBackend, MaxineFactory, ModelLoads, RELIGHT_DIRECTION, RELIGHT_LIGHT,
+    RelightFault, RelightFaultSwitch, RelightLight, SPLIT_MASK_RAMP, split_mask_value,
 };
 use obc_gpu::{
     ContextGuard, DeviceNv12Buffer, OwnedContext, ParkOutcome, Stream, UnparkOutcome, mem_get_info,
@@ -2951,5 +2959,200 @@ fn gpu_truehdr_runs_and_its_output_is_the_reference_tone_map() {
         assert!(matches!(e, BackendError::InvalidInput(_)), "{e}");
         hdr.unload();
         assert!(!hdr.is_loaded() && hdr.hdr_image().is_none());
+    });
+}
+
+/// The columns left of the split mask's ramp, where the hardened mask is
+/// 0 and the output is the background alone, clear of the ramp by a margin
+/// (for the subsampled chroma).
+const BG_COLUMNS: usize = (W / 2 - SPLIT_MASK_RAMP / 2 - 16) as usize;
+
+/// The mean Y, U and V of the background columns ([`BG_COLUMNS`]) of a
+/// packed NV12 frame.
+fn background_yuv(nv12: &[u8]) -> (f64, f64, f64) {
+    let (w, h) = (W as usize, H as usize);
+    let (mut y, mut u, mut v) = (0f64, 0f64, 0f64);
+    for row in 0..h {
+        for x in 0..BG_COLUMNS {
+            y += nv12[row * w + x] as f64;
+        }
+    }
+    for row in 0..h / 2 {
+        for x in 0..BG_COLUMNS / 2 {
+            let i = w * h + row * w + 2 * x;
+            u += nv12[i] as f64;
+            v += nv12[i + 1] as f64;
+        }
+    }
+    let (n, c) = ((BG_COLUMNS * h) as f64, (BG_COLUMNS / 2 * h / 2) as f64);
+    (y / n, u / c, v / c)
+}
+
+/// The luma of the background columns against `reference`'s.
+fn background_diff(out: &[u8], reference: &[u8]) -> LumaDiff {
+    let w = W as usize;
+    luma_diff(out, reference, |i| i % w < BG_COLUMNS)
+}
+
+/// A solid BT.601 limited-range red, as NV12 (Y, U, V).
+const SOLID: (u8, u8, u8) = (81, 90, 240);
+
+/// Asserts that the background columns of `out` are [`SOLID`], within the
+/// colour round trip (NV12 to BGR and back).
+fn assert_solid(label: &str, out: &[u8]) {
+    let (y, u, v) = background_yuv(out);
+    println!("BACKGROUND {label}: Y {y:.2}, U {u:.2}, V {v:.2}");
+    let near = |a: f64, b: u8| (a - b as f64).abs() <= 2.0;
+    assert!(
+        near(y, SOLID.0) && near(u, SOLID.1) && near(v, SOLID.2),
+        "{label}: the background is not the solid frame: Y {y:.2}, U {u:.2}, V {v:.2}"
+    );
+}
+
+/// A replace takes a per-frame background: a solid NV12 frame replaces
+/// the load-time image for the frames enqueued after it, never for one
+/// enqueued before (stream order, no synchronisation in between), refused
+/// frames leave it in force, `None` brings the load-time image back, and a
+/// new solid frame after that shows again. Uses the split-mask fault, so
+/// the left columns are background whatever the model makes of the
+/// synthetic frame. Logs the conversion's GPU time at 1080p.
+#[test]
+#[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT), the os-release override and an NVIDIA GPU"]
+fn maxine_a_per_frame_background_replaces_the_background_and_none_restores_it() {
+    let switch = MaskFaultSwitch::default();
+    let f = factory().with_mask_faults(switch.clone());
+    fault_rig(|gpu, stream, src, dst| {
+        switch.set(Some(MaskFault::SplitMask));
+        let mut backend = f.create_maxine().unwrap();
+        assert!(backend.supports_live_background());
+        let solid_nv12 = {
+            let (w, h) = (W as usize, H as usize);
+            let mut v = vec![SOLID.0; w * h * 3 / 2];
+            for pair in v[w * h..].as_chunks_mut::<2>().0 {
+                *pair = [SOLID.1, SOLID.2];
+            }
+            v
+        };
+        let solid = DeviceNv12Buffer::alloc(W, H).unwrap();
+        solid.upload_packed(&solid_nv12).unwrap();
+        let bg_nv12 = bgr_to_nv12(&background().data, W as usize, H as usize);
+
+        // Nothing loaded, then blur loaded: refused.
+        assert!(
+            backend
+                .set_background_frame(Some(BackgroundFrame::Cuda(solid.frame())))
+                .is_err()
+        );
+        backend.load(gpu, &blur_request()).unwrap();
+        assert!(matches!(
+            backend.set_background_frame(Some(BackgroundFrame::Cuda(solid.frame()))),
+            Err(BackendError::InvalidInput(_))
+        ));
+
+        let req = LoadRequest {
+            effect: EffectKind::Replace,
+            background: Some(Arc::new(background())),
+            ..blur_request()
+        };
+        backend.load(gpu, &req).unwrap();
+        let params = FrameParams::default();
+        let frame = |b: &mut MaxineBackend, out: &DeviceNv12Buffer| {
+            b.process(gpu, &params, &src.frame(), &out.frame())
+                .unwrap_or_else(|e| panic!("process failed: {e}"));
+        };
+        frame(&mut backend, dst);
+        stream.synchronize().unwrap();
+        let d = background_diff(&dst.download_packed().unwrap(), &bg_nv12);
+        println!("BACKGROUND load-time image: {d}");
+        assert_opaque_is_input("the load-time image", &d);
+        assert_eq!(backend.timings().unwrap().step_ms(BACKGROUND_STEP), None);
+
+        // A frame enqueued before the per-frame background keeps the
+        // load-time image; the frame after it shows the new one.
+        let after = DeviceNv12Buffer::alloc(W, H).unwrap();
+        frame(&mut backend, dst);
+        backend
+            .set_background_frame(Some(BackgroundFrame::Cuda(solid.frame())))
+            .unwrap();
+        frame(&mut backend, &after);
+        stream.synchronize().unwrap();
+        let d = background_diff(&dst.download_packed().unwrap(), &bg_nv12);
+        println!("BACKGROUND the frame before: {d}");
+        assert_opaque_is_input("the frame enqueued before", &d);
+        assert_solid("the frame after", &after.download_packed().unwrap());
+        let t = backend.timings().unwrap();
+        assert!(ms(&t, BACKGROUND_STEP) > 0.0, "{t:?}");
+        assert_eq!(t.steps()[0].0, BACKGROUND_STEP, "{t:?}");
+        // The next frame converted nothing: no step.
+        frame(&mut backend, &after);
+        stream.synchronize().unwrap();
+        assert_eq!(backend.timings().unwrap().step_ms(BACKGROUND_STEP), None);
+
+        // Misuse is refused and leaves the solid background.
+        let (y, uv) = (
+            vec![0u8; (W * H) as usize],
+            vec![128u8; (W * H / 2) as usize],
+        );
+        let host = HostNv12View {
+            y: &y,
+            y_stride: W as usize,
+            uv: &uv,
+            uv_stride: W as usize,
+            width: W,
+            height: H,
+        };
+        assert!(matches!(
+            backend.set_background_frame(Some(BackgroundFrame::Host(host))),
+            Err(BackendError::InvalidInput(m)) if m.contains("CUDA")
+        ));
+        let small = DeviceNv12Buffer::alloc(W / 2, H / 2).unwrap();
+        assert!(matches!(
+            backend.set_background_frame(Some(BackgroundFrame::Cuda(small.frame()))),
+            Err(BackendError::InvalidInput(m)) if m.contains("960x540")
+        ));
+        frame(&mut backend, &after);
+        stream.synchronize().unwrap();
+        assert_solid("after refused frames", &after.download_packed().unwrap());
+
+        // The conversion's GPU time, one per frame as a video plays.
+        let mut times = Vec::with_capacity(FRAMES);
+        for _ in 0..FRAMES {
+            backend
+                .set_background_frame(Some(BackgroundFrame::Cuda(solid.frame())))
+                .unwrap();
+            frame(&mut backend, &after);
+            stream.synchronize().unwrap();
+            times.push(ms(&backend.timings().unwrap(), BACKGROUND_STEP));
+        }
+        assert_solid("after many frames", &after.download_packed().unwrap());
+        println!(
+            "TIMING per-frame background {W}x{H} NV12 to BGR: p50 {:.3} ms, p95 {:.3} ms \
+             ({FRAMES} frames)",
+            percentile(&mut times.clone(), 0.5),
+            percentile(&mut times, 0.95)
+        );
+
+        // None: the load-time image again, then a new frame shows again.
+        backend.set_background_frame(None).unwrap();
+        frame(&mut backend, &after);
+        stream.synchronize().unwrap();
+        let d = background_diff(&after.download_packed().unwrap(), &bg_nv12);
+        println!("BACKGROUND after None: {d}");
+        assert_opaque_is_input("after None", &d);
+        backend
+            .set_background_frame(Some(BackgroundFrame::Cuda(solid.frame())))
+            .unwrap();
+        frame(&mut backend, &after);
+        stream.synchronize().unwrap();
+        assert_solid("a frame after None", &after.download_packed().unwrap());
+
+        // A new load shows its own image until the next frame.
+        backend.load(gpu, &req).unwrap();
+        frame(&mut backend, &after);
+        stream.synchronize().unwrap();
+        let d = background_diff(&after.download_packed().unwrap(), &bg_nv12);
+        assert_opaque_is_input("after a new load", &d);
+        backend.unload();
+        switch.set(None);
     });
 }

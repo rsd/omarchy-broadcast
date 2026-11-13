@@ -60,6 +60,15 @@
 //!    and no extra image is needed;
 //! 7. BGR to NV12 into the destination (`NvCVImage_TransferToYUV`).
 //!
+//! A replace composites over its load-time background image, or over the
+//! per-frame background in force
+//! ([`InferenceBackend::set_background_frame`], for a video background):
+//! each such NV12 frame is converted as the camera frames are (step 1),
+//! on the same stream, into one of two images of its own, so the load-time
+//! image stays for a return to it, a failure leaves the previous picture,
+//! and stream order alone keeps a queued composite from reading a
+//! half-written one ([`BACKGROUND_STEP`] is its time).
+//!
 //! Each stage has a slot of its own in the loaded chain, a branch in the
 //! validation, in `configure` and in the frame, and is released with the
 //! chain.
@@ -104,9 +113,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use obc_backend::{
-    Availability, BackendError, BackendFactory, ColourMatrix, ColourSpec, DeviceNv12, EffectKind,
-    FrameParams, GpuContext, HostBgr, InferenceBackend, LoadReport, LoadRequest, Params, StageId,
-    StageList, StageTimings,
+    Availability, BackendError, BackendFactory, BackgroundFrame, ColourMatrix, ColourSpec,
+    DeviceNv12, EffectKind, FrameParams, GpuContext, HostBgr, InferenceBackend, LoadReport,
+    LoadRequest, Params, StageId, StageList, StageTimings,
 };
 use obc_gpu::{CuStream, DeviceBuffer, Event, GpuError, LUT8_BLOCK, Lut8};
 
@@ -1217,6 +1226,9 @@ impl Relight {
 /// [`InferenceBackend::timings`] knows which of its events it recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Stages {
+    /// A per-frame background was converted since the frame before
+    /// ([`MaxineBackend::set_background_frame`]).
+    background: bool,
     denoise: bool,
     /// The green screen and the composite (they are loaded together).
     mask: bool,
@@ -1225,8 +1237,11 @@ struct Stages {
 
 /// The stage boundaries of a frame, as indices into [`Loaded::events`]:
 /// before the conversion, after it, after the denoise run, after the mask,
-/// after the relight run, after the effect, after the conversion back. A
-/// stage that is not loaded records no event, and has no step in the
+/// after the relight run, after the effect, after the conversion back; and
+/// before and after the conversion of the per-frame background that the
+/// frame was the first to show, which ran before the frame (the pair is
+/// recorded into [`LiveBackground::events`] and moved here by the frame).
+/// A stage that is not loaded records no event, and has no step in the
 /// timings.
 const EV_START: usize = 0;
 const EV_IN: usize = 1;
@@ -1235,6 +1250,16 @@ const EV_MASK: usize = 3;
 const EV_RELIGHT: usize = 4;
 const EV_EFFECT: usize = 5;
 const EV_OUT: usize = 6;
+const EV_BG_START: usize = 7;
+const EV_BG_END: usize = 8;
+
+/// The step of [`StageTimings`] for the conversion of a per-frame
+/// background ([`MaxineBackend::set_background_frame`]) into the image the
+/// composite reads: in the timings of the first frame that shows it, before
+/// [`StageTimings::CONVERT_IN`] (it ran before the frame). Not
+/// `StageId::BACKGROUND`: a step of that name would be taken for the time
+/// of the `background` stage itself.
+pub const BACKGROUND_STEP: &str = "background-convert";
 
 /// The stage times of a frame that ran `stages`, from `span(a, b)`, the
 /// time between events `a` and `b`; `None` if a span is unavailable.
@@ -1242,7 +1267,11 @@ fn stage_timings(
     stages: Stages,
     span: impl Fn(usize, usize) -> Option<f32>,
 ) -> Option<StageTimings> {
-    let mut t = StageTimings::new().with(StageTimings::CONVERT_IN, span(EV_START, EV_IN)?);
+    let mut t = StageTimings::new();
+    if stages.background {
+        t.push(BACKGROUND_STEP, span(EV_BG_START, EV_BG_END)?);
+    }
+    t.push(StageTimings::CONVERT_IN, span(EV_START, EV_IN)?);
     let mut last = EV_IN;
     if stages.denoise {
         t.push(StageId::DENOISE.as_str(), span(EV_IN, EV_DENOISE)?);
@@ -1271,10 +1300,17 @@ struct Loaded {
     width: u32,
     height: u32,
     colour: ColourSpec,
+    /// The context of the load, current around every call on it.
+    context: *mut c_void,
     stream: CuStream,
     effect: EffectKind,
     blur: Option<(Effect, f32)>,
+    /// The load-time background image of a replace
+    /// ([`LoadRequest::background`]). Never written by a per-frame
+    /// background, so that `None` there returns to it.
     background: Option<GpuImage>,
+    /// The per-frame backgrounds of a replace, once one was given.
+    live: Option<LiveBackground>,
     /// The stages, one slot each, in reverse chain order (drop order): a
     /// post-mask stage reads the hardened mask, so its slot goes before
     /// `mask`. Each is `Some` iff the request asked for the stage (and it
@@ -1286,7 +1322,7 @@ struct Loaded {
     mask: Option<Mask>,
     frames: Frames,
     /// Stage boundaries of the last recorded frame (`EV_*`).
-    events: [Event; 7],
+    events: [Event; 9],
     /// The stages of the last frame whose events were all recorded; `None`
     /// before the first, and while a frame is being enqueued.
     recorded: Option<Stages>,
@@ -1302,15 +1338,17 @@ impl Loaded {
     }
 
     /// The frame images and events for `req`, with no stage yet.
-    fn new(sdk: &'static Sdk, req: &LoadRequest, stream: CuStream) -> Result<Loaded, BackendError> {
+    fn new(sdk: &'static Sdk, req: &LoadRequest, gpu: &GpuContext) -> Result<Loaded, BackendError> {
         Ok(Loaded {
             width: req.width,
             height: req.height,
             colour: req.colour,
-            stream,
+            context: gpu.context,
+            stream: gpu.stream,
             effect: EffectKind::None,
             blur: None,
             background: None,
+            live: None,
             relight: None,
             denoise: None,
             mask: None,
@@ -1323,9 +1361,105 @@ impl Loaded {
                 Event::new()?,
                 Event::new()?,
                 Event::new()?,
+                Event::new()?,
+                Event::new()?,
             ],
             recorded: None,
         })
+    }
+}
+
+/// The per-frame backgrounds of a replace
+/// ([`MaxineBackend::set_background_frame`]): two BGR images of the frame
+/// size, the SDK's GPU pitch (as the load-time image), converted into in
+/// turn. A conversion writes the image the composite does not read, and
+/// only a conversion that was enqueued whole makes it the one read, so a
+/// failure leaves the background in force untouched.
+///
+/// Everything is on the load's stream, so stream order alone makes it
+/// safe: a composite enqueued before a conversion runs before it (and the
+/// conversion writes the other image anyway), the composite of the next
+/// frame is enqueued after it and reads the finished picture, and the
+/// conversion after that writes the image the frame before last read,
+/// once that composite has run. No host synchronisation is needed.
+struct LiveBackground {
+    images: [GpuImage; 2],
+    /// The image the composite reads; `None`: the load-time image.
+    shown: Option<usize>,
+    /// Before and after the last conversion, moved into the timings of the
+    /// next frame ([`EV_BG_START`]).
+    events: [Event; 2],
+    /// A conversion was enqueued that no frame has shown yet.
+    fresh: bool,
+    /// The SDK's scratch image for these conversions, apart from the
+    /// frames' ([`Frames::staging`]).
+    staging: Box<NvCvImage>,
+}
+
+impl LiveBackground {
+    fn alloc(sdk: &'static Sdk, width: u32, height: u32) -> Result<LiveBackground, BackendError> {
+        Ok(LiveBackground {
+            images: [
+                GpuImage::alloc(sdk, width, height, ffi::NVCV_BGR)?,
+                GpuImage::alloc(sdk, width, height, ffi::NVCV_BGR)?,
+            ],
+            shown: None,
+            events: [Event::new()?, Event::new()?],
+            fresh: false,
+            staging: Box::new(NvCvImage::empty()),
+        })
+    }
+
+    fn shown(&self) -> Option<&GpuImage> {
+        self.shown.map(|i| &self.images[i])
+    }
+}
+
+impl Drop for LiveBackground {
+    fn drop(&mut self) {
+        // SAFETY: the staging image is empty or was grown by the SDK's
+        // transfers; it is freed once.
+        unsafe { (self.images[0].sdk.NvCVImage_Dealloc)(&mut *self.staging) };
+    }
+}
+
+/// Enqueues the conversion of the NV12 frame `src` into the BGR image
+/// `dst` on `stream` (`NvCVImage_TransferFromYUV`, with the colour of
+/// `flags`), through the SDK's scratch image `staging`.
+///
+/// # Safety
+/// `src` describes live NV12 device memory of the current context, read
+/// only (U and V interleaved in the UV plane, V one byte after U); `dst`
+/// and `staging` are the backend's images of that context, and `stream` a
+/// live stream of it.
+unsafe fn transfer_from_nv12(
+    sdk: &Sdk,
+    src: &DeviceNv12,
+    flags: u32,
+    dst: &mut NvCvImage,
+    stream: CuStream,
+    staging: &mut NvCvImage,
+) -> NvCvStatus {
+    // SAFETY: the caller's contract.
+    unsafe {
+        (sdk.NvCVImage_TransferFromYUV)(
+            src.y as *const c_void,
+            1,
+            src.y_pitch as i32,
+            src.uv as *const c_void,
+            (src.uv + 1) as *const c_void,
+            2,
+            src.uv_pitch as i32,
+            ffi::NVCV_YUV420,
+            ffi::NVCV_U8,
+            flags,
+            ffi::NVCV_GPU,
+            dst,
+            std::ptr::null(),
+            1.0,
+            stream,
+            staging,
+        )
     }
 }
 
@@ -2174,11 +2308,21 @@ impl MaxineBackend {
                     l.blur = new_blur;
                 }
                 l.background = None;
+                l.live = None;
             }
-            EffectKind::Replace => l.blur = None,
+            EffectKind::Replace => {
+                l.blur = None;
+                // A load shows its own background image until the next
+                // per-frame one; the images stay for it.
+                if let Some(v) = l.live.as_mut() {
+                    v.shown = None;
+                    v.fresh = false;
+                }
+            }
             EffectKind::None => {
                 l.blur = None;
                 l.background = None;
+                l.live = None;
             }
         }
         // After the blur and relighting effects, which read the hardened
@@ -2234,7 +2378,18 @@ impl MaxineBackend {
             message: format!("{call} returned {rc} ({})", sdk.error_string(rc)),
         };
         let runs_mask = l.runs_mask();
+        // The first frame after a per-frame background carries its
+        // conversion's events.
+        let background = match l.live.as_mut() {
+            Some(v) if v.fresh => {
+                v.fresh = false;
+                l.events[EV_BG_START..=EV_BG_END].swap_with_slice(&mut v.events);
+                true
+            }
+            _ => false,
+        };
         let stages = Stages {
+            background,
             denoise: l.denoise.is_some(),
             mask: runs_mask,
             relight: l.relight.is_some(),
@@ -2257,26 +2412,7 @@ impl MaxineBackend {
         // context (caller's contract), read only; U and V interleave in the UV
         // plane (V one byte after U, two bytes per pair). The destination and
         // staging images are ours.
-        let rc = unsafe {
-            (sdk.NvCVImage_TransferFromYUV)(
-                src.y as *const c_void,
-                1,
-                src.y_pitch as i32,
-                src.uv as *const c_void,
-                (src.uv + 1) as *const c_void,
-                2,
-                src.uv_pitch as i32,
-                ffi::NVCV_YUV420,
-                ffi::NVCV_U8,
-                flags,
-                ffi::NVCV_GPU,
-                converted,
-                std::ptr::null(),
-                1.0,
-                stream,
-                &mut **staging,
-            )
-        };
+        let rc = unsafe { transfer_from_nv12(sdk, src, flags, converted, stream, staging) };
         if rc != ffi::NVCV_SUCCESS {
             return Err(run_err("NvCVImage_TransferFromYUV", rc));
         }
@@ -2435,7 +2571,10 @@ impl MaxineBackend {
                     }
                 }
                 EffectKind::Replace => {
-                    let Some(bg) = l.background.as_ref() else {
+                    // The per-frame background in force, else the
+                    // load-time one.
+                    let shown = l.live.as_ref().and_then(LiveBackground::shown);
+                    let Some(bg) = shown.or(l.background.as_ref()) else {
                         break 'post Err(PostMaskError::Effect(not_loaded()));
                     };
                     let fg = relit.unwrap_or(&frame_bgr.image);
@@ -2596,7 +2735,7 @@ impl InferenceBackend for MaxineBackend {
             l
         } else {
             self.unload();
-            Loaded::new(self.sdk, req, gpu.stream)?
+            Loaded::new(self.sdk, req, gpu)?
         };
         match self.configure(&mut loaded, req, strength, light, mask_mode) {
             Ok(c) => {
@@ -2655,6 +2794,92 @@ impl InferenceBackend for MaxineBackend {
             }
         }
         self.last_timings.borrow().clone()
+    }
+
+    /// Yes: a replace takes per-frame backgrounds.
+    fn supports_live_background(&self) -> bool {
+        true
+    }
+
+    /// Converts `frame` (CUDA NV12 of the loaded size and colour) on the
+    /// load's stream into the background image the composite reads, with
+    /// the conversion of the camera frames (`NvCVImage_TransferFromYUV`),
+    /// GPU to GPU. It goes into the one of two images that the composite
+    /// does not read, which becomes the one read only once the conversion
+    /// is enqueued, so a failure leaves the previous background; stream
+    /// order does the rest ([`LiveBackground`]). The frame's memory is read
+    /// by that queued conversion, in the stream order in which the caller
+    /// handed it over, as the source of a frame is. `None` returns to the
+    /// load-time image, which is never written. The conversion's GPU time
+    /// is the [`BACKGROUND_STEP`] of the next frame's timings.
+    fn set_background_frame(
+        &mut self,
+        frame: Option<BackgroundFrame<'_>>,
+    ) -> Result<(), BackendError> {
+        let sdk = self.sdk;
+        let l = self.loaded.as_mut().ok_or_else(not_loaded)?;
+        if l.effect != EffectKind::Replace {
+            return Err(BackendError::InvalidInput(format!(
+                "a per-frame background needs replace loaded, not {}",
+                l.effect
+            )));
+        }
+        let Some(frame) = frame else {
+            if let Some(v) = l.live.as_mut() {
+                v.shown = None;
+                v.fresh = false;
+            }
+            return Ok(());
+        };
+        let src = match frame {
+            BackgroundFrame::Cuda(f) => f,
+            BackgroundFrame::Host(_) => {
+                return Err(BackendError::InvalidInput(
+                    "the Maxine backend takes CUDA background frames only".into(),
+                ));
+            }
+        };
+        src.validate()?;
+        if (src.width, src.height) != (l.width, l.height) {
+            return Err(BackendError::InvalidInput(format!(
+                "the background frame is {}x{}, the backend is loaded for {}x{}",
+                src.width, src.height, l.width, l.height
+            )));
+        }
+        Self::check_context(&GpuContext {
+            context: l.context,
+            stream: l.stream,
+        })?;
+        if l.live.is_none() {
+            l.live = Some(LiveBackground::alloc(sdk, l.width, l.height)?);
+        }
+        let (stream, flags) = (l.stream, colour_flags(l.colour));
+        let v = l.live.as_mut().expect("allocated above");
+        let target = v.shown.map_or(0, |i| 1 - i);
+        record(&v.events[0], stream)?;
+        let LiveBackground {
+            images, staging, ..
+        } = v;
+        // SAFETY: `src` describes live NV12 device memory of the current
+        // context (checked above), ready on `stream` (caller's contract),
+        // read only; the destination and staging images are ours, and no
+        // queued composite reads the destination (it is not the one shown).
+        let rc = unsafe {
+            transfer_from_nv12(sdk, &src, flags, &mut images[target].image, stream, staging)
+        };
+        if rc != ffi::NVCV_SUCCESS {
+            return Err(BackendError::Run {
+                code: rc,
+                message: format!(
+                    "NvCVImage_TransferFromYUV of the background frame returned {rc} ({})",
+                    sdk.error_string(rc)
+                ),
+            });
+        }
+        record(&v.events[1], stream)?;
+        v.shown = Some(target);
+        v.fresh = true;
+        Ok(())
     }
 
     /// Zeroes the denoise state (on the stream) and resets the green
@@ -3211,6 +3436,7 @@ mod tests {
         // which events it was measured between.
         let span = |a: usize, b: usize| Some((b - a) as f32);
         let st = |denoise, mask, relight| Stages {
+            background: false,
             denoise,
             mask,
             relight,
@@ -3279,6 +3505,41 @@ mod tests {
                 .then_some((b - a) as f32)),
             None
         );
+    }
+
+    #[test]
+    fn a_fresh_background_frame_is_a_step_before_the_conversion() {
+        let span = |a: usize, b: usize| Some((b - a) as f32);
+        let st = Stages {
+            background: true,
+            denoise: false,
+            mask: true,
+            relight: false,
+        };
+        let t = stage_timings(st, span).unwrap();
+        assert_eq!(
+            t.steps().first(),
+            Some(&(BACKGROUND_STEP.to_string(), 1.0)),
+            "measured between its own two events, first: it ran before the frame"
+        );
+        assert_eq!(t.step_ms(StageTimings::CONVERT_IN), Some(1.0));
+        assert_eq!(t.total_ms(), 7.0);
+        // Its span unreadable: no timings, as for any step.
+        assert_eq!(
+            stage_timings(st, |a, b| (a != EV_BG_START).then_some((b - a) as f32)),
+            None
+        );
+        // Without one, no step.
+        let none = stage_timings(
+            Stages {
+                background: false,
+                ..st
+            },
+            span,
+        )
+        .unwrap();
+        assert_eq!(none.step_ms(BACKGROUND_STEP), None);
+        assert_ne!(BACKGROUND_STEP, StageId::BACKGROUND.as_str());
     }
 
     #[test]

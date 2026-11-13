@@ -34,6 +34,7 @@
 //! [`PLACEHOLDER_FLAG`], which the element passes through untouched.
 
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 
 pub use gst_obc::{
@@ -87,7 +88,16 @@ pub fn effect_backend_available_with(factory: &dyn BackendFactory) -> Result<(),
 /// the size limit ([`gst_obc::background::check_file`]). Whether the image
 /// decodes is found out when the effect loads.
 pub fn check_settings(settings: &EffectSettings) -> Result<(), PipelineError> {
-    settings.validate().map_err(PipelineError::Effect)?;
+    check_settings_video(settings, false)
+}
+
+/// [`check_settings`] for an element that has a video background
+/// (`video`, [`gst_obc::ObcEffect::set_background_video`]): replace then
+/// needs no image ([`EffectSettings::validate_with_video`]).
+pub fn check_settings_video(settings: &EffectSettings, video: bool) -> Result<(), PipelineError> {
+    settings
+        .validate_with_video(video)
+        .map_err(PipelineError::Effect)?;
     if settings.kind == EffectKind::Replace
         && let Some(path) = &settings.background
     {
@@ -102,7 +112,17 @@ pub fn check_settings_with(
     settings: &EffectSettings,
     factory: &dyn BackendFactory,
 ) -> Result<(), PipelineError> {
-    check_settings(settings)?;
+    check_settings_with_video(settings, false, factory)
+}
+
+/// [`check_settings_with`] for an element that has a video background
+/// (`video`, see [`check_settings_video`]).
+pub fn check_settings_with_video(
+    settings: &EffectSettings,
+    video: bool,
+    factory: &dyn BackendFactory,
+) -> Result<(), PipelineError> {
+    check_settings_video(settings, video)?;
     for s in &settings.stages {
         factory
             .check_params(&s.id, &s.params, &s.live)
@@ -122,18 +142,32 @@ pub fn check_settings_with(
 
 /// The effect element for an output, configured and named
 /// [`names::EFFECT`].
+#[cfg(test)]
 pub(crate) fn effect_element(
     settings: &EffectSettings,
     backend: Option<&EffectBackend>,
 ) -> Result<gst_obc::ObcEffect, PipelineError> {
+    effect_element_with_video(settings, backend, None)
+}
+
+/// [`effect_element`] with the video background `video` of replace
+/// ([`gst_obc::ObcEffect::set_background_video`]), set before the settings
+/// are applied.
+pub(crate) fn effect_element_with_video(
+    settings: &EffectSettings,
+    backend: Option<&EffectBackend>,
+    video: Option<&Path>,
+) -> Result<gst_obc::ObcEffect, PipelineError> {
     match backend {
-        Some(b) => check_settings_with(settings, b.factory().as_ref())?,
-        None => check_settings(settings)?,
+        Some(b) => check_settings_with_video(settings, video.is_some(), b.factory().as_ref())?,
+        None => check_settings_video(settings, video.is_some())?,
     }
     gst_obc::register()
         .map_err(|e| PipelineError::Effect(format!("cannot register obceffect: {e}")))?;
     let fx = gst_obc::ObcEffect::new(Some(names::EFFECT));
     fx.set_backend_factory(backend.map(|b| Arc::clone(b.factory())));
+    fx.set_background_video(video)
+        .map_err(PipelineError::Effect)?;
     fx.apply(settings).map_err(PipelineError::Effect)?;
     Ok(fx)
 }
@@ -236,6 +270,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("needs a background"), "{e}");
+        // With a video background replace needs no image.
+        assert!(check_settings_video(&EffectSettings::of(EffectKind::Replace), true).is_ok());
     }
 
     #[test]

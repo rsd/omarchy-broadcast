@@ -173,8 +173,15 @@ pub struct EffectRun {
     pub mode: EffectMode,
     /// The blur strength, 0 to 1.
     pub blur_strength: f64,
-    /// The image of `replace`.
+    /// The image of `replace`; with [`Self::background_video`], its
+    /// load-time still (the video's poster, or the still in force while
+    /// the poster is made; `None`: black behind the person).
     pub background_image: Option<PathBuf>,
+    /// The video `replace` plays behind the person (the selected video, or
+    /// its playback copy in system memory), `None` without one or while
+    /// only its still can be shown. Changing it alone reloads nothing: the
+    /// background in force stays until the new video's first frame.
+    pub background_video: Option<PathBuf>,
     /// What shows when the background effect cannot run.
     pub on_failure: EffectOnFailure,
     /// The image shown in place of black with `on_failure = "image"`.
@@ -289,6 +296,11 @@ pub struct EffectReport {
     /// fallback image (it shows black in its place), as
     /// [`obc_pipeline::effect::fallback_unreadable`] words it.
     pub fallback_error: Option<String>,
+    /// With `replace` and a video background: why the video does not play,
+    /// or that the effect's module shows it as a still, as the effect
+    /// element words it (`EffectStats::background_error`); `None` while it
+    /// plays, and without a video.
+    pub background_error: Option<String>,
     /// The status values the stages report after the last frame they
     /// processed (a module of ABI 1.3: auto-frame's zoom), the chains'
     /// first, then the effect element's; empty when none reports.

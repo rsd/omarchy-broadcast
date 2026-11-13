@@ -22,9 +22,11 @@
 //! the matte scaled up bilinearly in the composite ([`image::Compositor`]):
 //! the person over the room blurred (an area average to a quarter size, a
 //! blur weighted by how much of each pixel is room, scaled back up) or over
-//! the replacement image. A repeated frame (ABI 1.1) reuses the matte of
-//! the frame it repeats and is composited again: the output is always
-//! written.
+//! the replacement image, or over the last per-frame background (ABI 1.4,
+//! a video background: each NV12 frame copied into a buffer kept for the
+//! chain, a CUDA one through the frame buffer on the chain's stream). A
+//! repeated frame (ABI 1.1) reuses the matte of the frame it repeats and
+//! is composited again: the output is always written.
 //!
 //! # Settings
 //!
@@ -301,6 +303,11 @@ struct Chain {
     started: Started,
     input: (u32, u32),
     mode: Mode,
+    /// The per-frame background ([`Instance::set_background`]): the last
+    /// frame copied, in force while `live_on`; the buffer is kept for the
+    /// chain's life, so the frames after the first allocate nothing.
+    live: Option<image::Nv12>,
+    live_on: bool,
     tensor: Vec<f32>,
     matte: Vec<f32>,
     has_matte: bool,
@@ -536,6 +543,8 @@ impl OnnxInstance {
             // A switch: only the effect or its image changes.
             let mut c = old;
             c.mode = req.mode;
+            // The new load-time image is in force until the next frame.
+            c.live_on = false;
             c.ema.reset();
             c.has_matte = false;
             let report = LoadReport {
@@ -606,6 +615,8 @@ impl OnnxInstance {
             started,
             input,
             mode: req.mode,
+            live: None,
+            live_on: false,
             tensor: vec![0.0; 3 * plane],
             matte: vec![0.0; plane],
             has_matte: false,
@@ -715,8 +726,12 @@ impl OnnxInstance {
         }
         timings.push(("mask".to_string(), t.elapsed().as_secs_f32() * 1e3));
         let t = Instant::now();
-        c.compositor
-            .composite(&src, &dst, &c.matte, &c.mode, strength);
+        match (&c.mode, c.live.as_ref()) {
+            (Mode::Replace(_), Some(live)) if c.live_on => {
+                c.compositor.replace(&src, &dst, &c.matte, live);
+            }
+            (mode, _) => c.compositor.composite(&src, &dst, &c.matte, mode, strength),
+        }
         timings.push(("composite".to_string(), t.elapsed().as_secs_f32() * 1e3));
         let t = Instant::now();
         if c.kind == FrameKind::Cuda {
@@ -725,6 +740,55 @@ impl OnnxInstance {
         }
         timings.push(("convert-out".to_string(), t.elapsed().as_secs_f32() * 1e3));
         self.timings = timings;
+        Ok(())
+    }
+
+    /// Keeps `frame` (NV12 of the chain's kind and size, checked by the
+    /// SDK) as the background of the following frames. A CUDA frame is
+    /// copied to the host through the frame buffer, which is free between
+    /// frames (the last upload is ordered before the copy on the chain's
+    /// stream). Nothing changes on a failure.
+    fn keep_background(&mut self, frame: &Frame<'_>) -> Result<(), Error> {
+        let c = self
+            .chain
+            .as_mut()
+            .ok_or_else(|| Error::state("no chain is loaded"))?;
+        if !matches!(c.mode, Mode::Replace(_)) {
+            return Err(Error::state(
+                "the chain blurs the room: it takes no background frame",
+            ));
+        }
+        let src = match c.kind {
+            FrameKind::Cuda => {
+                if frame.cuda().stream as usize != c.cuda.1 {
+                    return Err(Error::invalid(
+                        "the background frame is not on the chain's CUDA stream",
+                    ));
+                }
+                let staging = c
+                    .staging
+                    .as_mut()
+                    .ok_or_else(|| Error::state("no frame buffer"))?;
+                let host = staging
+                    .download(frame)
+                    .map_err(|e| Error::new(e.kind(), format!("background: {e}")))?;
+                Planes {
+                    y: host.y,
+                    y_pitch: host.y_pitch,
+                    uv: host.uv,
+                    uv_pitch: host.uv_pitch,
+                    width: c.width as usize,
+                    height: c.height as usize,
+                }
+            }
+            _ => host_planes(frame, c.width, c.height, false)
+                .map_err(|e| Error::new(e.kind(), format!("background: {e}")))?,
+        };
+        let (w, h) = (c.width as usize, c.height as usize);
+        let live = c.live.get_or_insert_with(|| image::Nv12::new(w, h));
+        live.copy_from(&src)
+            .map_err(|e| Error::invalid(format!("background: {e}")))?;
+        c.live_on = true;
         Ok(())
     }
 }
@@ -770,6 +834,25 @@ impl Instance for OnnxInstance {
             self.drop_chain();
             Error::stage(STAGE, e)
         })
+    }
+
+    /// A video background (ABI 1.4): host frames copied, CUDA frames
+    /// copied to the host on the chain's stream (the composite is on the
+    /// CPU either way).
+    const LIVE_BACKGROUND: bool = true;
+
+    fn set_background(&mut self, frame: Option<&Frame<'_>>) -> Result<(), Error> {
+        match frame {
+            Some(f) => self.keep_background(f),
+            None => {
+                let c = self
+                    .chain
+                    .as_mut()
+                    .ok_or_else(|| Error::state("no chain is loaded"))?;
+                c.live_on = false;
+                Ok(())
+            }
+        }
     }
 
     fn reset_temporal(&mut self) -> Result<Vec<String>, Error> {

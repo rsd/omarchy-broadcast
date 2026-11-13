@@ -130,6 +130,11 @@ pub struct EffectSettings {
     /// Blur strength, 0.0 to 1.0 (`blur-strength`); used by blur only.
     pub blur_strength: f32,
     /// The background image of replace (`background`): an absolute path.
+    /// With a video background
+    /// ([`ObcEffect::set_background_video`](crate::ObcEffect::set_background_video))
+    /// it is the load-time still: what shows until the video's first frame
+    /// when nothing was shown before, when the video cannot play, and for
+    /// good with a backend that takes no per-frame background.
     pub background: Option<PathBuf>,
     /// The output after a failure (`on-failure`).
     pub fallback: EffectFallback,
@@ -220,6 +225,13 @@ impl EffectSettings {
     /// Whether the file is there and decodable is checked when the effect
     /// loads ([`crate::background::check_file`] checks it up front).
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_with_video(false)
+    }
+
+    /// [`Self::validate`] for an element that has a video background
+    /// (`video`): replace then needs no image (black is its load-time
+    /// still, D4).
+    pub fn validate_with_video(&self, video: bool) -> Result<(), String> {
         if !self.blur_strength.is_finite() || !(0.0..=1.0).contains(&self.blur_strength) {
             return Err(format!(
                 "blur strength {} is outside 0 to 1",
@@ -242,7 +254,7 @@ impl EffectSettings {
                 p.display()
             ));
         }
-        if self.kind == EffectKind::Replace && self.background.is_none() {
+        if self.kind == EffectKind::Replace && self.background.is_none() && !video {
             return Err("the replace effect needs a background image".into());
         }
         StageList::new(self.stages.iter().map(|s| s.id.clone()))
@@ -286,13 +298,21 @@ impl EffectSettings {
     /// parameters, in order. The blur strength, the fallback, the live
     /// parameters and the parameters of a stage that is off (the
     /// background stage's with `none`) change nothing that is loaded.
+    #[cfg(test)]
     pub(crate) fn target(&self) -> Target {
+        self.target_with_video(false)
+    }
+
+    /// [`Self::target`] for an element with a video background (`video`):
+    /// replace without an image loads black as its still.
+    pub(crate) fn target_with_video(&self, video: bool) -> Target {
         Target {
             kind: self.kind,
             background: match self.kind {
                 EffectKind::Replace => self.background.clone(),
                 _ => None,
             },
+            black_still: self.kind == EffectKind::Replace && self.background.is_none() && video,
             background_params: match self.kind {
                 EffectKind::None => Params::new(),
                 _ => self.background_params.clone(),
@@ -313,6 +333,9 @@ impl EffectSettings {
 pub(crate) struct Target {
     pub kind: EffectKind,
     pub background: Option<PathBuf>,
+    /// Replace with a video and no still: the load-time background is
+    /// black (behind the person) until the video's first frame.
+    pub black_still: bool,
     /// The `background` stage's load-time parameters (empty with `none`).
     pub background_params: Params,
     /// The requested stages, in order, with their load-time parameters.
@@ -320,6 +343,22 @@ pub(crate) struct Target {
 }
 
 impl Target {
+    /// Whether `other` loads the same background as this: the same effect,
+    /// image, black still and background parameters (the stages aside).
+    pub fn same_background(&self, other: &Target) -> bool {
+        (
+            self.kind,
+            &self.background,
+            self.black_still,
+            &self.background_params,
+        ) == (
+            other.kind,
+            &other.background,
+            other.black_still,
+            &other.background_params,
+        )
+    }
+
     /// Whether `stage` is requested.
     pub fn wants(&self, stage: &str) -> bool {
         self.stages.iter().any(|(s, _)| s == stage)
@@ -487,6 +526,18 @@ pub struct EffectStats {
     /// `None` while it can (or has not been tried yet), and with any other
     /// fallback.
     pub fallback_error: Option<String>,
+    /// With replace and a video background: why the video does not play
+    /// (the background in force stays: the previous one, the load-time
+    /// still, or black; [`crate::video_background::video_unplayable`]),
+    /// or that the backend shows it as a still
+    /// ([`crate::video_background::video_as_still`]). `None` while it
+    /// plays (or starts), and without a video.
+    pub background_error: Option<String>,
+    /// Whether the video background's decode pipeline exists: only while
+    /// replace with a video is loaded on a backend that takes per-frame
+    /// backgrounds, and, after the video is turned off, until the requested
+    /// background (a still, another effect) is loaded.
+    pub background_video: bool,
     /// The status values the backend reported after the last processed
     /// frame (a module of ABI 1.3), of the stages that are ready; empty when
     /// none reports.
@@ -817,6 +868,34 @@ mod tests {
             };
             assert!(bad.validate().unwrap_err().contains("0 to 1"), "{s}");
         }
+    }
+
+    #[test]
+    fn the_same_background_ignores_the_stages_only() {
+        let replace = |bg: Option<&str>| EffectSettings {
+            background: bg.map(PathBuf::from),
+            ..EffectSettings::of(EffectKind::Replace)
+        };
+        let video = replace(None).target_with_video(true);
+        assert!(video.same_background(&video.clone()));
+        let with_denoise = replace(None)
+            .with_stage(StageRequest::on(StageId::DENOISE))
+            .target_with_video(true);
+        assert!(video.same_background(&with_denoise), "stages aside");
+        // Video to a still, to blur, to another still: another background.
+        assert!(!video.same_background(&replace(Some("/a.png")).target()));
+        assert!(!video.same_background(&EffectSettings::of(EffectKind::Blur).target()));
+        assert!(
+            !replace(Some("/a.png"))
+                .target()
+                .same_background(&replace(Some("/b.png")).target())
+        );
+        // The still kept and the video dropped: the same load.
+        assert!(
+            replace(Some("/a.png"))
+                .target_with_video(true)
+                .same_background(&replace(Some("/a.png")).target())
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ use serde::Serialize;
 use crate::bus::{self, EXIT_OK, Failure, READ_TIMEOUT};
 use crate::human::printable;
 use crate::json::{MAX_LINE_BYTES, VERSION, clip};
-use crate::{CALL_TIMEOUT, out, report, within};
+use crate::{CALL_TIMEOUT, IMPORT_TIMEOUT, out, report, within};
 
 /// The kind listed when none is given.
 pub const DEFAULT_KIND: &str = obc_ipc::media::KIND_BACKGROUND;
@@ -329,11 +329,15 @@ pub async fn run_list(kind: Option<&str>, json: bool) -> u8 {
 /// absolute: the import, then with `select` the background set to the
 /// stored file and `replace` selected, or (`away`) the stored file set as
 /// `effect.fallback_image` (`SetConfig`, revision 17).
+///
+/// The whole command is bound by [`IMPORT_TIMEOUT`], not [`CALL_TIMEOUT`]:
+/// importing a video or an animation takes as long as the daemon's check,
+/// copy and conversion do.
 pub async fn run_import(kind: &str, path: &str, select: bool, json: bool) -> u8 {
     // The stored path, once the daemon has imported the file: a failure
     // after that is the selection's, and the message says so.
     let stored = std::cell::RefCell::new(None::<String>);
-    let res = within(CALL_TIMEOUT, async {
+    let res = within(IMPORT_TIMEOUT, async {
         let conn = bus::connect().await?;
         let proxy = bus::proxy(&conn).await?;
         let revision = proxy
@@ -433,6 +437,16 @@ mod tests {
             duration_ms: 0,
             poster: String::new(),
         }
+    }
+
+    #[test]
+    fn the_import_waits_longer_than_other_calls_but_within_the_plugin_watchdog() {
+        use crate::{CALL_TIMEOUT, IMPORT_TIMEOUT};
+        use std::time::Duration;
+        assert!(IMPORT_TIMEOUT > CALL_TIMEOUT);
+        // The daemon bounds an animation's conversion at 120 s.
+        assert!(IMPORT_TIMEOUT >= Duration::from_secs(120 + 60));
+        assert!(IMPORT_TIMEOUT <= Duration::from_secs(610));
     }
 
     fn reply(items: Vec<MediaEntry>) -> MediaReply {

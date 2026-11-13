@@ -38,20 +38,56 @@
 //! lock: two imports of the same file running at the same time may both
 //! store a copy.
 //!
-//! Videos ([`MediaType::Video`]) are listed when found but not imported yet.
+//! Videos ([`MediaType::Video`]) are recognised from their content and
+//! checked with GStreamer without decoding ([`probe::probe_video`]: MP4,
+//! M4V, MOV, MKV or WebM holding H.264, HEVC, VP9 or AV1, at most 512 MiB
+//! and 3840x2160, 8-bit 4:2:0; audio is ignored). A background video is
+//! stored as it is, with the extension of its container, and found again
+//! by its content hash (SHA-256) instead of its bytes. An animated GIF,
+//! WebP or PNG is transcoded at import with ffmpeg into a CPU-ready VP9
+//! WebM ([`ffmpeg::vp9_args`]), which is the stored item; the source's
+//! hash is recorded in the kind directory's hidden `.sources/` so the same
+//! source is not stored twice; without ffmpeg it is refused. Away images
+//! are stills only. A poster (the first frame as a JPEG) is made for every
+//! video at import in the cache ([`cache::MediaCache`]). Listing a video
+//! reads its size and duration with the same check (remembered per file
+//! for the daemon's run, [`check_video`]) and finds its poster, never
+//! decoding: a bundled video ships its poster beside it
+//! (`<stem>.poster.jpg`, a derived file, not an item), copied into the
+//! cache the first time it is listed; a video with no poster yet gets one
+//! from [`posters::PosterMaker`], off the listing. Removing a video also
+//! removes its poster and playback copies ([`playback::PlaybackCopies`])
+//! and cancels a copy job for it.
 
+pub mod cache;
+pub mod ffmpeg;
+mod hash;
+pub mod playback;
+pub mod posters;
+pub mod probe;
+
+pub use cache::MediaCache;
+pub use playback::{CopyEvent, CopyState, PlaybackCopies, PruneReport, is_cpu_ready};
+pub use posters::PosterMaker;
+pub use probe::{Codec, Container, VideoInfo, probe_video};
+
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{File, Metadata, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use gst_obc::background::{self, MAX_FILE_BYTES};
 use serde::Deserialize;
 
+use self::ffmpeg::{Ffmpeg, FfmpegJob};
+use self::hash::FileKey;
+use self::probe::MAX_VIDEO_BYTES;
 use crate::{debug, warning};
 
 /// The bundled root of the packaged gallery.
@@ -65,6 +101,11 @@ pub const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
 
 /// The extensions of the video files listed (lower case).
 pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mov", "mkv", "webm"];
+
+/// The end of the name of a bundled video's shipped poster
+/// (`<stem>.poster.jpg` beside `<stem>.<ext>`): a derived file, never
+/// listed as an item.
+pub const SHIPPED_POSTER_SUFFIX: &str = ".poster.jpg";
 
 /// The longest stored file stem, in bytes (before the suffix and the
 /// extension).
@@ -152,7 +193,7 @@ impl FromStr for MediaKind {
 pub enum MediaType {
     /// A still image (PNG, JPEG or WebP).
     Image,
-    /// A video; listed when found, not imported yet.
+    /// A video (a background; also the transcode of an animated image).
     Video,
 }
 
@@ -191,13 +232,14 @@ pub struct MediaItem {
     pub bundled: bool,
     /// Whether it is a still image or a video.
     pub media_type: MediaType,
-    /// The width in pixels from the header; 0 when unknown (videos).
+    /// The width in pixels, from the image's header or the video's check.
     pub width: u32,
-    /// The height in pixels from the header; 0 when unknown (videos).
+    /// The height in pixels, as [`MediaItem::width`].
     pub height: u32,
     /// The duration in milliseconds; 0 for a still image or when unknown.
     pub duration_ms: u64,
-    /// The poster image of a video, when there is one.
+    /// The poster image of a video (a JPEG in the cache), when there is
+    /// one; `None` for a still.
     pub poster: Option<PathBuf>,
 }
 
@@ -214,9 +256,35 @@ pub enum MediaError {
     /// A relative path where an absolute one is required.
     #[error("{} is not an absolute path", .0.display())]
     NotAbsolute(PathBuf),
-    /// A video given to import.
-    #[error("cannot import {}: videos are not supported yet", .0.display())]
+    /// A video or animated image given to import as an away image.
+    #[error(
+        "cannot import {}: an away image must be a still image (PNG, JPEG or WebP)",
+        .0.display()
+    )]
     VideoUnsupported(PathBuf),
+    /// The source is neither an accepted image nor an accepted video, or a
+    /// video the check refuses.
+    #[error("cannot import {}: {reason}", path.display())]
+    NotAVideo {
+        /// The source file.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// An animated image, which needs ffmpeg to be transcoded.
+    #[error(
+        "cannot import {}: an animated image needs ffmpeg, which is not installed",
+        .0.display()
+    )]
+    NeedsFfmpeg(PathBuf),
+    /// The transcode of an animated image failed.
+    #[error("cannot import {}: converting the animation to a video failed: {reason}", path.display())]
+    Transcode {
+        /// The source file.
+        path: PathBuf,
+        /// Why.
+        reason: String,
+    },
     /// The source file could not be read under the checks (its reason
     /// names the path).
     #[error("cannot import: {0}")]
@@ -291,26 +359,47 @@ pub(crate) struct SourceEntry {
     pub(crate) edits: Option<String>,
 }
 
-/// The gallery's two roots.
+/// The gallery's two roots, and the cache of files derived from its
+/// videos (posters, playback copies) when it has one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaStore {
     bundled_root: PathBuf,
     user_root: PathBuf,
+    cache: Option<MediaCache>,
+}
+
+/// How [`video_facts`] treats posters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Posters {
+    /// Look up, and make a missing one with ffmpeg.
+    Make,
+    /// Look up only (a shipped poster is copied into the cache).
+    Find,
 }
 
 impl MediaStore {
     /// A store over `bundled_root` (read only) and `user_root` (read and
-    /// write), each holding one directory per [`MediaKind`].
+    /// write), each holding one directory per [`MediaKind`], without a
+    /// cache (no posters; see [`MediaStore::with_cache`]).
     pub fn new(bundled_root: impl Into<PathBuf>, user_root: impl Into<PathBuf>) -> Self {
         MediaStore {
             bundled_root: bundled_root.into(),
             user_root: user_root.into(),
+            cache: None,
         }
+    }
+
+    /// The store with its derived files in `cache`.
+    pub fn with_cache(mut self, cache: MediaCache) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     /// The store of this session: [`BUNDLED_ROOT`], and
     /// `$XDG_DATA_HOME/omarchy-broadcast/media`, else
-    /// `$HOME/.local/share/omarchy-broadcast/media`.
+    /// `$HOME/.local/share/omarchy-broadcast/media`; the cache in
+    /// `$XDG_CACHE_HOME/omarchy-broadcast`, else
+    /// `$HOME/.cache/omarchy-broadcast`.
     pub fn from_env() -> Result<Self, MediaError> {
         Self::from_env_in(|k| std::env::var_os(k))
     }
@@ -323,10 +412,13 @@ impl MediaStore {
         let data = absolute("XDG_DATA_HOME")
             .or_else(|| absolute("HOME").map(|h| h.join(".local/share")))
             .ok_or(MediaError::NoDataDir)?;
-        Ok(Self::new(
-            BUNDLED_ROOT,
-            data.join("omarchy-broadcast").join("media"),
-        ))
+        let cache =
+            absolute("XDG_CACHE_HOME").or_else(|| absolute("HOME").map(|h| h.join(".cache")));
+        let store = Self::new(BUNDLED_ROOT, data.join("omarchy-broadcast").join("media"));
+        Ok(match cache {
+            Some(c) => store.with_cache(MediaCache::new(c.join("omarchy-broadcast"))),
+            None => store,
+        })
     }
 
     /// The bundled root.
@@ -337,6 +429,11 @@ impl MediaStore {
     /// The user root.
     pub fn user_root(&self) -> &Path {
         &self.user_root
+    }
+
+    /// The cache of derived files, if the store has one.
+    pub fn cache(&self) -> Option<&MediaCache> {
+        self.cache.as_ref()
     }
 
     /// The directory of `kind` in the bundled root.
@@ -352,17 +449,50 @@ impl MediaStore {
     /// The items of `kind`: the bundled ones first (in `SOURCES.toml`
     /// order, then the rest by name), then the user's (by name, ignoring
     /// case). A missing directory lists nothing; a file whose header cannot
-    /// be read is skipped and logged.
+    /// be read, or a video the check refuses, is skipped and logged. A
+    /// video gets its size and duration from the check (remembered per
+    /// file: the first listing of a new video takes a moment), and its
+    /// poster when the cache has one; a bundled video's shipped poster is
+    /// copied into the cache first. No poster is made here (nothing is
+    /// decoded): [`PosterMaker`] makes the missing ones.
     pub fn list(&self, kind: MediaKind) -> Vec<MediaItem> {
         let mut items = self.list_bundled(kind);
         items.extend(self.list_user(kind));
         items
     }
 
+    /// The video files of `kind` in both roots (by their name: no check,
+    /// no read), for a prune.
+    pub(crate) fn video_paths(&self, kind: MediaKind) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for (dir, follow) in [(self.bundled_dir(kind), true), (self.user_dir(kind), false)] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_name().to_string_lossy().starts_with('.')
+                    || MediaType::from_path(&path) != Some(MediaType::Video)
+                {
+                    continue;
+                }
+                let meta = if follow {
+                    std::fs::metadata(&path)
+                } else {
+                    std::fs::symlink_metadata(&path)
+                };
+                if meta.is_ok_and(|m| m.is_file()) {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
     fn list_bundled(&self, kind: MediaKind) -> Vec<MediaItem> {
         let dir = self.bundled_dir(kind);
         let sources = read_sources(&dir);
-        let mut found = scan_dir(&dir, true);
+        let mut found = scan_dir(&dir, true, self.cache.as_ref());
         // SOURCES.toml order first, then by name.
         let rank = |name: &str| {
             sources
@@ -393,19 +523,31 @@ impl MediaStore {
     }
 
     fn list_user(&self, kind: MediaKind) -> Vec<MediaItem> {
-        let mut found = scan_dir(&self.user_dir(kind), false);
+        let mut found = scan_dir(&self.user_dir(kind), false, self.cache.as_ref());
         found.sort_by(|a, b| (a.0.to_lowercase(), &a.0).cmp(&(b.0.to_lowercase(), &b.0)));
         found.into_iter().map(|(_, item)| item).collect()
     }
 
-    /// Copies the image `src` (an absolute path) into the user directory of
-    /// `kind` and returns the stored file's absolute path; when a file of
-    /// that directory already has the same bytes, returns its path without
-    /// copying. Refuses videos, anything [`background::read_image_file`]
-    /// refuses (not a regular file, over [`MAX_FILE_BYTES`]), content that
-    /// is not an accepted image or whose first image is incomplete, sizes
-    /// outside [`background::MAX_DIMENSION`], and a format whose decoder is
-    /// not installed. Never overwrites a file.
+    /// Copies the image or video `src` (an absolute path) into the user
+    /// directory of `kind` and returns the stored file's absolute path;
+    /// when a file of that directory already has the same content, returns
+    /// its path without copying. What it is comes from the content, never
+    /// the extension:
+    ///
+    /// * a still image is checked as a background is: refused when
+    ///   [`background::read_image_file`] refuses it (not a regular file,
+    ///   over [`MAX_FILE_BYTES`]), when the content is not an accepted image
+    ///   or its first image is incomplete, for sizes outside
+    ///   [`background::MAX_DIMENSION`], and when the format's decoder is not
+    ///   installed;
+    /// * an animated GIF, WebP or PNG (a background only) is transcoded
+    ///   with ffmpeg into a CPU-ready VP9 WebM, which is stored; refused
+    ///   without ffmpeg or when the transcode fails;
+    /// * a video (a background only) is checked by [`probe::probe_video`]
+    ///   and stored as it is, with the extension of its container.
+    ///
+    /// A video gets its poster in the cache (a failure there is logged,
+    /// not a refusal). Never overwrites a file.
     pub fn import(&self, kind: MediaKind, src: &Path) -> Result<PathBuf, MediaError> {
         self.import_stored(kind, src).map(|(path, _)| path)
     }
@@ -420,23 +562,81 @@ impl MediaStore {
         if !src.is_absolute() {
             return Err(MediaError::NotAbsolute(src.to_path_buf()));
         }
-        if MediaType::from_path(src) == Some(MediaType::Video) {
+        // Named as the background checks name an image; a background may
+        // be a video too.
+        let subject = match kind {
+            MediaKind::Away => "the image file",
+            MediaKind::Background => "the file",
+        };
+        let (mut file, _) = open_limited(src, true, MAX_VIDEO_BYTES).map_err(|reason| {
+            let reason = reason.strip_prefix("it ").unwrap_or(&reason);
+            MediaError::Unreadable(format!("{subject} {} {reason}", src.display()))
+        })?;
+        let mut head = [0u8; 16];
+        let head_len = read_head(&mut file, &mut head).map_err(|e| {
+            MediaError::Unreadable(format!("{subject} {} is unreadable: {e}", src.display()))
+        })?;
+        let head = &head[..head_len];
+        if is_image_signature(head) {
+            let data = background::read_image_file(src).map_err(MediaError::Unreadable)?;
+            if let Some(anim) = animated_format(&data) {
+                if kind != MediaKind::Background {
+                    return Err(MediaError::VideoUnsupported(src.to_path_buf()));
+                }
+                return self.import_animated(kind, src, &data, &file, anim);
+            }
+            return self.import_still(kind, src, &data);
+        }
+        if !is_container_signature(head) {
+            return Err(MediaError::NotAVideo {
+                path: src.to_path_buf(),
+                reason: "it is not an accepted image (PNG, JPEG, WebP; GIF and APNG as \
+                         animations) or video (MP4, M4V, MOV, MKV, WebM)"
+                    .into(),
+            });
+        }
+        if kind != MediaKind::Background {
             return Err(MediaError::VideoUnsupported(src.to_path_buf()));
         }
-        let data = background::read_image_file(src).map_err(MediaError::Unreadable)?;
+        self.import_video(kind, src, file)
+    }
+
+    fn import_still(
+        &self,
+        kind: MediaKind,
+        src: &Path,
+        data: &[u8],
+    ) -> Result<(PathBuf, bool), MediaError> {
         let not_image = |reason: String| MediaError::NotAnImage {
             path: src.to_path_buf(),
             reason,
         };
-        let (format, width, height) = background::image_header(&data).map_err(not_image)?;
+        let (format, width, height) = background::image_header(data).map_err(not_image)?;
         background::check_dimensions("it", width, height).map_err(not_image)?;
-        background::image_length(format, &data).map_err(not_image)?;
+        background::image_length(format, data).map_err(not_image)?;
         background::decoder_available(format).map_err(|reason| MediaError::NoDecoder {
             path: src.to_path_buf(),
             reason,
         })?;
         let ext = format.extension();
 
+        let dir = self.prepare_dir(kind)?;
+        if let Some(existing) = find_identical(&dir, data) {
+            debug!(
+                "media: {} is already in the gallery as {}",
+                src.display(),
+                existing.display()
+            );
+            return Ok((existing, false));
+        }
+        let temp = TempFile::create(&dir, data)?;
+        let target = link_unique(&dir, &temp.path, &self.stem_of(kind, src), ext, src)?;
+        Ok((target, true))
+    }
+
+    /// The user directory of `kind`, created, with stale temporary files of
+    /// interrupted imports removed.
+    fn prepare_dir(&self, kind: MediaKind) -> Result<PathBuf, MediaError> {
         let dir = self.user_dir(kind);
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -448,7 +648,44 @@ impl MediaStore {
                 source,
             })?;
         remove_stale_temps(&dir);
-        if let Some(existing) = find_identical(&dir, &data) {
+        Ok(dir)
+    }
+
+    fn stem_of(&self, kind: MediaKind, src: &Path) -> String {
+        sanitise_stem(
+            &src.file_stem().unwrap_or_default().to_string_lossy(),
+            kind.fallback_stem(),
+        )
+    }
+
+    /// Stores the video `file` (opened from `src`) as it is.
+    fn import_video(
+        &self,
+        kind: MediaKind,
+        src: &Path,
+        mut file: File,
+    ) -> Result<(PathBuf, bool), MediaError> {
+        let refused = |reason: String| MediaError::NotAVideo {
+            path: src.to_path_buf(),
+            reason,
+        };
+        let info = probe::probe_open(&file).map_err(refused)?;
+        let dir = self.prepare_dir(kind)?;
+        let rewind = |file: &mut File| {
+            file.rewind().map_err(|source| MediaError::Io {
+                action: "read",
+                path: src.to_path_buf(),
+                source,
+            })
+        };
+        // The duplicate check first, from the source's hash: an item
+        // already there costs no copy.
+        rewind(&mut file)?;
+        let source_hash = hash::hash_file(&mut file, MAX_VIDEO_BYTES, None).map_err(|e| {
+            let e = e.strip_prefix("it ").unwrap_or(&e);
+            MediaError::Unreadable(format!("the file {} {e}", src.display()))
+        })?;
+        if let Some(existing) = find_identical_video(&dir, &source_hash) {
             debug!(
                 "media: {} is already in the gallery as {}",
                 src.display(),
@@ -456,47 +693,112 @@ impl MediaStore {
             );
             return Ok((existing, false));
         }
-
-        let stem = sanitise_stem(
-            &src.file_stem().unwrap_or_default().to_string_lossy(),
-            kind.fallback_stem(),
-        );
-        let temp = TempFile::create(&dir, &data)?;
-        for n in 1..=MAX_SUFFIX {
-            let name = if n == 1 {
-                format!("{stem}.{ext}")
-            } else {
-                format!("{stem}-{n}.{ext}")
-            };
-            let target = dir.join(&name);
-            match std::fs::hard_link(&temp.path, &target) {
-                Ok(()) => {
-                    if let Err(source) = sync_dir(&dir) {
-                        // The import fails as a whole: the name is freed
-                        // again (the temporary file goes with `temp`).
-                        let _ = std::fs::remove_file(&target);
-                        return Err(MediaError::Io {
-                            action: "sync",
-                            path: dir,
-                            source,
-                        });
-                    }
-                    return Ok((target, true));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(source) => {
-                    return Err(MediaError::Io {
-                        action: "write",
-                        path: target,
-                        source,
-                    });
-                }
-            }
+        rewind(&mut file)?;
+        // The copy's own hash: the source may have changed since.
+        let (temp, content_hash) = TempFile::copy_from(&dir, &mut file, MAX_VIDEO_BYTES)?;
+        let target = link_unique(
+            &dir,
+            &temp.path,
+            &self.stem_of(kind, src),
+            info.container.extension(),
+            src,
+        )?;
+        drop(temp);
+        if let Ok(meta) = std::fs::symlink_metadata(&target) {
+            hash::remember(FileKey::of(&meta), &content_hash);
         }
-        Err(MediaError::NoFreeName {
-            src: src.to_path_buf(),
-            dir,
-        })
+        remember_info(&target, &info);
+        self.make_poster(&target, &info, &content_hash);
+        Ok((target, true))
+    }
+
+    /// Transcodes the animated image `data` (read from `src`, opened as
+    /// `file`) into a CPU-ready WebM and stores it.
+    fn import_animated(
+        &self,
+        kind: MediaKind,
+        src: &Path,
+        data: &[u8],
+        file: &File,
+        anim: Animated,
+    ) -> Result<(PathBuf, bool), MediaError> {
+        let dir = self.prepare_dir(kind)?;
+        let source_hash = hash::to_hex(&hash::sha256(data));
+        if let Some(existing) = transcoded_from(&dir, &source_hash) {
+            debug!(
+                "media: {} is already in the gallery as {}",
+                src.display(),
+                existing.display()
+            );
+            return Ok((existing, false));
+        }
+        let ffmpeg = Ffmpeg::locate().map_err(|_| MediaError::NeedsFfmpeg(src.to_path_buf()))?;
+        let failed = |reason: String| MediaError::Transcode {
+            path: src.to_path_buf(),
+            reason,
+        };
+        let pending = cache::PendingFile::new_in(&dir, ANIMATED_TEMP_PREFIX);
+        let job = FfmpegJob {
+            input: file,
+            input_format: anim.ffmpeg_format(),
+            output_args: ffmpeg::vp9_args(),
+            output: &pending.path,
+            timeout: ffmpeg::ANIMATED_TIMEOUT,
+        };
+        ffmpeg
+            .run(&job, &AtomicBool::new(false))
+            .map_err(|e| failed(e.to_string()))?;
+        let info = probe::probe_video(&pending.path).map_err(failed)?;
+        if !is_cpu_ready(&info) {
+            return Err(failed(format!(
+                "ffmpeg made a {} {} video of {}x{}, not a CPU-ready VP9 WebM",
+                info.container.as_str(),
+                info.codec.as_str(),
+                info.width,
+                info.height
+            )));
+        }
+        cache::sync_file(&pending.path).map_err(failed)?;
+        let target = link_unique(&dir, &pending.path, &self.stem_of(kind, src), "webm", src)?;
+        drop(pending);
+        record_transcode(&dir, &source_hash, &target);
+        remember_info(&target, &info);
+        if let Ok(mut f) = probe::open_video(&target)
+            && let Ok(h) = hash::hash_file(&mut f, MAX_VIDEO_BYTES, None)
+        {
+            self.make_poster(&target, &info, &h);
+        }
+        Ok((target, true))
+    }
+
+    /// Makes the poster of the stored video `path`; a failure is logged.
+    fn make_poster(&self, path: &Path, info: &VideoInfo, content_hash: &str) {
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        let Ok(ffmpeg) = Ffmpeg::locate() else {
+            debug!(
+                "media: no poster for {}: ffmpeg is not installed",
+                path.display()
+            );
+            return;
+        };
+        let made = probe::open_video(path)
+            .and_then(|f| cache::ensure_poster(cache, &ffmpeg, &f, info, content_hash));
+        if let Err(e) = made {
+            warning!("media: no poster for {}: {e}", path.display());
+        }
+    }
+
+    /// Reads the content hash of the gallery video `path` now, so a later
+    /// [`MediaStore::remove`] of it (on the controller thread) finds it
+    /// remembered instead of reading the file. Nothing for other files.
+    pub fn warm_hash(&self, path: &Path) {
+        if MediaType::from_path(path) == Some(MediaType::Video)
+            && let Ok((mut f, _)) = open_limited(path, false, MAX_VIDEO_BYTES)
+        {
+            let _ = hash::hash_file(&mut f, MAX_VIDEO_BYTES, None);
+        }
     }
 
     /// Removes `path`, which must be a regular file (not a symbolic link)
@@ -504,6 +806,11 @@ impl MediaStore {
     /// any other path, is [`MediaError::NotAUserItem`]. The file removed is
     /// the one checked: its name in the canonical kind directory, so a
     /// directory link in `path` swapped meanwhile cannot redirect it.
+    /// For a video, a playback copy job for it is cancelled and its poster
+    /// and playback copies are removed from the cache (its content hash is
+    /// read before the removal: remembered when the file was listed or
+    /// imported in this run, see [`MediaStore::warm_hash`]; a failure there
+    /// is logged, the files then go at the next prune).
     /// Whether the item is in use is the caller's concern.
     pub fn remove(&self, path: &Path) -> Result<(), MediaError> {
         if !path.is_absolute() {
@@ -520,11 +827,36 @@ impl MediaStore {
             Some((_, false)) => {}
             _ => return Err(not_user()),
         }
+        let video = MediaType::from_path(&checked) == Some(MediaType::Video);
+        let content_hash = if video {
+            playback::forget_everywhere(path);
+            playback::forget_everywhere(&checked);
+            open_limited(&checked, false, MAX_VIDEO_BYTES)
+                .and_then(|(mut f, _)| hash::hash_file(&mut f, MAX_VIDEO_BYTES, None))
+                .inspect_err(|e| {
+                    warning!(
+                        "media: the derived files of {} stay until the next prune: {e}",
+                        checked.display()
+                    )
+                })
+                .ok()
+        } else {
+            None
+        };
         std::fs::remove_file(&checked).map_err(|source| MediaError::Io {
             action: "remove",
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        if video {
+            if let Some(dir) = checked.parent() {
+                forget_transcode(dir, &checked);
+            }
+            if let (Some(cache), Some(h)) = (&self.cache, content_hash) {
+                cache.remove_derived(&h);
+            }
+        }
+        Ok(())
     }
 
     /// The kind of `path` and whether it is bundled, when it is a regular
@@ -568,6 +900,9 @@ impl MediaError {
             MediaError::UnknownKind(_)
             | MediaError::NotAbsolute(_)
             | MediaError::VideoUnsupported(_)
+            | MediaError::NotAVideo { .. }
+            | MediaError::NeedsFfmpeg(_)
+            | MediaError::Transcode { .. }
             | MediaError::Unreadable(_)
             | MediaError::NotAnImage { .. }
             | MediaError::NoDecoder { .. }
@@ -702,8 +1037,10 @@ fn read_sources(dir: &Path) -> Sources {
 
 /// The listable files directly in `dir`, each with its file name. Hidden
 /// files (a leading dot, such as an import in progress) are skipped;
-/// symbolic links are followed only when `follow`.
-fn scan_dir(dir: &Path, follow: bool) -> Vec<(String, MediaItem)> {
+/// symbolic links are followed only when `follow` (the bundled root, whose
+/// shipped posters, `<stem>.poster.jpg`, are not items but the posters of
+/// its videos).
+fn scan_dir(dir: &Path, follow: bool, cache: Option<&MediaCache>) -> Vec<(String, MediaItem)> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
@@ -719,7 +1056,7 @@ fn scan_dir(dir: &Path, follow: bool) -> Vec<(String, MediaItem)> {
             debug!("media: skipping {}: not a UTF-8 name", path.display());
             continue;
         };
-        if name.starts_with('.') {
+        if name.starts_with('.') || (follow && is_shipped_poster(&name)) {
             continue;
         }
         let Some(media_type) = MediaType::from_path(&path) else {
@@ -730,21 +1067,30 @@ fn scan_dir(dir: &Path, follow: bool) -> Vec<(String, MediaItem)> {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
-        let (width, height) = match media_type {
+        let (width, height, duration_ms, poster) = match media_type {
             MediaType::Image => match image_size(&path, follow) {
-                Ok(size) => size,
+                Ok((w, h)) => (w, h, 0, None),
                 Err(reason) => {
                     debug!("media: skipping {}: {reason}", path.display());
                     continue;
                 }
             },
-            MediaType::Video => {
-                if let Err(reason) = open_regular(&path, follow) {
+            MediaType::Video => match video_facts(
+                &path,
+                follow,
+                cache,
+                Posters::Find,
+                follow
+                    .then(|| shipped_poster_of(&path))
+                    .flatten()
+                    .as_deref(),
+            ) {
+                Ok((info, poster)) => (info.width, info.height, info.duration_ms, poster),
+                Err(reason) => {
                     debug!("media: skipping {}: {reason}", path.display());
                     continue;
                 }
-                (0, 0)
-            }
+            },
         };
         found.push((
             name,
@@ -755,8 +1101,8 @@ fn scan_dir(dir: &Path, follow: bool) -> Vec<(String, MediaItem)> {
                 media_type,
                 width,
                 height,
-                duration_ms: 0,
-                poster: None,
+                duration_ms,
+                poster,
             },
         ));
     }
@@ -767,6 +1113,11 @@ fn scan_dir(dir: &Path, follow: bool) -> Vec<(String, MediaItem)> {
 /// without following a symbolic link), and checks on the handle that it is
 /// a regular file of at most [`MAX_FILE_BYTES`].
 fn open_regular(path: &Path, follow: bool) -> Result<(File, Metadata), String> {
+    open_limited(path, follow, MAX_FILE_BYTES)
+}
+
+/// [`open_regular`] with the size limit `limit`.
+fn open_limited(path: &Path, follow: bool, limit: u64) -> Result<(File, Metadata), String> {
     let mut flags = libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
     if !follow {
         flags |= libc::O_NOFOLLOW;
@@ -782,11 +1133,11 @@ fn open_regular(path: &Path, follow: bool) -> Result<(File, Metadata), String> {
     if !meta.is_file() {
         return Err("it is not a regular file".into());
     }
-    if meta.len() > MAX_FILE_BYTES {
+    if meta.len() > limit {
         return Err(format!(
             "it is {} bytes, more than the {} MiB limit",
             meta.len(),
-            MAX_FILE_BYTES / (1024 * 1024)
+            limit / (1024 * 1024)
         ));
     }
     Ok((file, meta))
@@ -844,6 +1195,416 @@ fn find_identical(dir: &Path, data: &[u8]) -> Option<PathBuf> {
             .is_ok()
             && content == data
     })
+}
+
+/// The prefix of the temporary output of an animated image's transcode
+/// (an `.import-*.tmp` name, so an interrupted one is cleaned up as an
+/// interrupted copy is).
+const ANIMATED_TEMP_PREFIX: &str = ".import-anim-";
+
+/// The hidden directory of a kind directory recording, per source hash,
+/// the file an animated image was transcoded into.
+const TRANSCODED_DIR: &str = ".sources";
+
+/// An animated image format, transcoded at import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Animated {
+    /// GIF (every GIF, a single frame included).
+    Gif,
+    /// APNG: a PNG with an `acTL` chunk before its image data.
+    Apng,
+    /// An animated WebP (the `VP8X` animation flag, or an `ANIM`/`ANMF`
+    /// chunk).
+    Webp,
+}
+
+impl Animated {
+    /// The ffmpeg demuxer forced for it.
+    pub(crate) fn ffmpeg_format(self) -> &'static str {
+        match self {
+            Animated::Gif => "gif",
+            Animated::Apng => "apng",
+            Animated::Webp => "webp_anim",
+        }
+    }
+}
+
+/// Reads up to `buf.len()` bytes from the start of `file`.
+fn read_head(file: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match file.read(&mut buf[n..])? {
+            0 => break,
+            k => n += k,
+        }
+    }
+    Ok(n)
+}
+
+/// Whether `head` starts like an image the gallery takes (PNG, JPEG,
+/// WebP, GIF).
+fn is_image_signature(head: &[u8]) -> bool {
+    head.starts_with(b"\x89PNG\r\n\x1a\n")
+        || head.starts_with(&[0xFF, 0xD8, 0xFF])
+        || (head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP")
+        || head.starts_with(b"GIF87a")
+        || head.starts_with(b"GIF89a")
+}
+
+/// Whether `head` starts like an ISO base media / QuickTime file (a box
+/// type the format starts with at offset 4) or an EBML (Matroska, WebM)
+/// one. The check proper is GStreamer's typefind; this only tells a video
+/// from a file that is neither image nor video, for the reason given.
+fn is_container_signature(head: &[u8]) -> bool {
+    head.starts_with(cache::EBML_MAGIC)
+        || (head.len() >= 8
+            && matches!(
+                &head[4..8],
+                b"ftyp" | b"moov" | b"mdat" | b"free" | b"skip" | b"wide" | b"pnot"
+            ))
+}
+
+/// The animated format of the image `data`, if it is one.
+pub(crate) fn animated_format(data: &[u8]) -> Option<Animated> {
+    if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        return Some(Animated::Gif);
+    }
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        // Chunks: length (4, big endian), type (4), data, CRC (4).
+        let mut at = 8usize;
+        while at + 8 <= data.len() {
+            let len = u32::from_be_bytes(data[at..at + 4].try_into().ok()?) as usize;
+            match &data[at + 4..at + 8] {
+                b"acTL" => return Some(Animated::Apng),
+                b"IDAT" | b"IEND" => return None,
+                _ => {}
+            }
+            at = at.checked_add(12)?.checked_add(len)?;
+        }
+        return None;
+    }
+    if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        // Chunks: FourCC (4), size (4, little endian), data padded to even.
+        let mut at = 12usize;
+        while at + 8 <= data.len() {
+            let kind = &data[at..at + 4];
+            let len = u32::from_le_bytes(data[at + 4..at + 8].try_into().ok()?) as usize;
+            match kind {
+                b"VP8X" if data.get(at + 8).is_some_and(|f| f & 0x02 != 0) => {
+                    return Some(Animated::Webp);
+                }
+                b"ANIM" | b"ANMF" => return Some(Animated::Webp),
+                _ => {}
+            }
+            at = at.checked_add(8)?.checked_add(len)?.checked_add(len % 2)?;
+        }
+    }
+    None
+}
+
+/// Links the complete file `temp` in `dir` to the first free name of
+/// `<stem>.<ext>`, `<stem>-2.<ext>`, …, then syncs the directory (the
+/// name is freed again when that fails). Never overwrites.
+fn link_unique(
+    dir: &Path,
+    temp: &Path,
+    stem: &str,
+    ext: &str,
+    src: &Path,
+) -> Result<PathBuf, MediaError> {
+    for n in 1..=MAX_SUFFIX {
+        let name = if n == 1 {
+            format!("{stem}.{ext}")
+        } else {
+            format!("{stem}-{n}.{ext}")
+        };
+        let target = dir.join(&name);
+        match std::fs::hard_link(temp, &target) {
+            Ok(()) => {
+                if let Err(source) = sync_dir(dir) {
+                    // The import fails as a whole: the name is freed
+                    // again (the temporary file goes with its guard).
+                    let _ = std::fs::remove_file(&target);
+                    return Err(MediaError::Io {
+                        action: "sync",
+                        path: dir.to_path_buf(),
+                        source,
+                    });
+                }
+                return Ok(target);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(MediaError::Io {
+                    action: "write",
+                    path: target,
+                    source,
+                });
+            }
+        }
+    }
+    Err(MediaError::NoFreeName {
+        src: src.to_path_buf(),
+        dir: dir.to_path_buf(),
+    })
+}
+
+/// A regular video file directly in `dir` (not hidden, with a video
+/// extension, not a link) whose content hash is `content_hash`, if any.
+fn find_identical_video(dir: &Path, content_hash: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut names: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| e.path())
+        .filter(|p| MediaType::from_path(p) == Some(MediaType::Video))
+        .collect();
+    names.sort();
+    names.into_iter().find(|path| {
+        open_limited(path, false, MAX_VIDEO_BYTES)
+            .ok()
+            .and_then(|(mut f, _)| hash::hash_file(&mut f, MAX_VIDEO_BYTES, None).ok())
+            .is_some_and(|h| h == content_hash)
+    })
+}
+
+/// The stored transcode of the animated source of hash `source_hash` in
+/// `dir`, when its record names a regular file there.
+fn transcoded_from(dir: &Path, source_hash: &str) -> Option<PathBuf> {
+    let record = dir.join(TRANSCODED_DIR).join(source_hash);
+    let (file, _) = open_limited(&record, false, 4096).ok()?;
+    let mut name = String::new();
+    file.take(4096).read_to_string(&mut name).ok()?;
+    let name = name.trim();
+    if name.is_empty() || name.contains('/') || name.starts_with('.') {
+        return None;
+    }
+    let target = dir.join(name);
+    std::fs::symlink_metadata(&target)
+        .ok()
+        .filter(Metadata::is_file)
+        .map(|_| target)
+}
+
+/// Records that the animated source of hash `source_hash` was stored as
+/// `target` (in `dir`); a failure is logged (the next import of the same
+/// source then stores another copy).
+fn record_transcode(dir: &Path, source_hash: &str, target: &Path) {
+    let records = dir.join(TRANSCODED_DIR);
+    let Some(name) = target.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let written = cache::create_dir(&records).and_then(|()| {
+        let pending = cache::PendingFile::new_in(&records, cache::temp_prefix());
+        std::fs::write(&pending.path, name)
+            .map_err(|e| format!("cannot write {}: {e}", pending.path.display()))?;
+        pending.commit(&records.join(source_hash))
+    });
+    if let Err(e) = written {
+        warning!(
+            "media: cannot record the source of {}: {e}",
+            target.display()
+        );
+    }
+}
+
+/// Removes the records of transcodes stored as `removed` (in `dir`).
+fn forget_transcode(dir: &Path, removed: &Path) {
+    let Some(name) = removed.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let records = dir.join(TRANSCODED_DIR);
+    let Ok(entries) = std::fs::read_dir(&records) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let names_it = open_limited(&path, false, 4096)
+            .ok()
+            .and_then(|(f, _)| {
+                let mut text = String::new();
+                f.take(4096).read_to_string(&mut text).ok().map(|_| text)
+            })
+            .is_some_and(|t| t.trim() == name);
+        if names_it {
+            cache::remove_logged(&path);
+        }
+    }
+}
+
+/// The checks of listed videos, remembered per file for the daemon's run.
+fn infos() -> &'static Mutex<HashMap<FileKey, VideoInfo>> {
+    static INFOS: OnceLock<Mutex<HashMap<FileKey, VideoInfo>>> = OnceLock::new();
+    INFOS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Remembers `info` as the check of the file at `path`.
+fn remember_info(path: &Path, info: &VideoInfo) {
+    if let (Ok(meta), Ok(mut m)) = (std::fs::symlink_metadata(path), infos().lock()) {
+        if m.len() >= 4096 {
+            m.clear();
+        }
+        m.insert(FileKey::of(&meta), info.clone());
+    }
+}
+
+/// Whether `name` is a shipped poster's ([`SHIPPED_POSTER_SUFFIX`]).
+fn is_shipped_poster(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(SHIPPED_POSTER_SUFFIX)
+}
+
+/// The shipped poster beside the bundled video `path`, if there is one.
+fn shipped_poster_of(path: &Path) -> Option<PathBuf> {
+    let stem = path.file_stem()?.to_str()?;
+    let poster = path.with_file_name(format!("{stem}{SHIPPED_POSTER_SUFFIX}"));
+    poster.is_file().then_some(poster)
+}
+
+/// The check of the video at `path` (in or outside the gallery, a
+/// symbolic link followed) and its poster in `store`'s cache: the existing
+/// one, a bundled video's shipped one, else one made now with ffmpeg;
+/// `None` when it cannot be made (no cache, no ffmpeg, a failed job:
+/// logged). Probes and hashes the file and may run ffmpeg: never on the
+/// controller thread. The reason when the video's check refuses it.
+pub fn video_poster(
+    store: Option<&MediaStore>,
+    path: &Path,
+) -> Result<(VideoInfo, Option<PathBuf>), String> {
+    let shipped = store
+        .filter(|s| matches!(s.is_gallery_item(path), Some((_, true))))
+        .and_then(|_| shipped_poster_of(path));
+    video_facts(
+        path,
+        true,
+        store.and_then(MediaStore::cache),
+        Posters::Make,
+        shipped.as_deref(),
+    )
+    .map_err(|e| format!("the video file {}: {e}", path.display()))
+}
+
+/// The check of the video at `path` ([`probe::probe_video`]), remembered
+/// per file for the daemon's run, so a second check of the same file
+/// (the listing, a choice of it, a camera start) reads nothing. Never on
+/// the controller thread.
+pub fn check_video(path: &Path) -> Result<VideoInfo, String> {
+    let shown = path.display();
+    let (file, meta) = open_limited(path, true, MAX_VIDEO_BYTES)
+        .map_err(|e| format!("the video file {shown}: {e}"))?;
+    let key = FileKey::of(&meta);
+    if let Some(i) = infos().lock().ok().and_then(|m| m.get(&key).cloned()) {
+        return Ok(i);
+    }
+    let info = probe::probe_open(&file).map_err(|e| format!("the video file {shown}: {e}"))?;
+    remember_key(key, &info);
+    Ok(info)
+}
+
+/// The check of the video at `path` when it was made in this run for the
+/// file as it is now ([`check_video`]): a `stat` and a lookup, for the
+/// controller thread.
+pub fn known_video_info(path: &Path) -> Option<VideoInfo> {
+    let key = FileKey::of(&std::fs::metadata(path).ok()?);
+    infos().lock().ok()?.get(&key).cloned()
+}
+
+/// Remembers `info` as the check of the file at `path` as it is now (a
+/// symbolic link followed): what a caller that checked it elsewhere hands
+/// on (a `stat`, for the controller thread).
+pub fn remember_video_info(path: &Path, info: &VideoInfo) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        remember_key(FileKey::of(&meta), info);
+    }
+}
+
+fn remember_key(key: FileKey, info: &VideoInfo) {
+    if let Ok(mut m) = infos().lock() {
+        if m.len() >= 4096 {
+            m.clear();
+        }
+        m.insert(key, info.clone());
+    }
+}
+
+/// When `path` starts like a video (MP4, MOV, MKV or WebM) but is larger
+/// than a video may be: the reason, naming the video limit. A `stat` and
+/// the first bytes.
+pub fn oversized_video(path: &Path) -> Option<String> {
+    let (mut file, meta) = open_limited(path, true, u64::MAX).ok()?;
+    if meta.len() <= MAX_VIDEO_BYTES {
+        return None;
+    }
+    let mut head = [0u8; 16];
+    let n = read_head(&mut file, &mut head).ok()?;
+    is_container_signature(&head[..n]).then(|| {
+        format!(
+            "the video file {} is {} bytes, more than the {} MiB limit",
+            path.display(),
+            meta.len(),
+            MAX_VIDEO_BYTES / (1024 * 1024)
+        )
+    })
+}
+
+/// The check of the video at `path` (remembered per file) and its poster:
+/// the cached one, else `shipped` (a bundled video's poster) copied into
+/// the cache, else, with [`Posters::Make`] and ffmpeg, one made now.
+fn video_facts(
+    path: &Path,
+    follow: bool,
+    cache: Option<&MediaCache>,
+    posters: Posters,
+    shipped: Option<&Path>,
+) -> Result<(VideoInfo, Option<PathBuf>), String> {
+    let (mut file, meta) = open_limited(path, follow, MAX_VIDEO_BYTES)?;
+    let key = FileKey::of(&meta);
+    let known = infos().lock().ok().and_then(|m| m.get(&key).cloned());
+    let info = match known {
+        Some(i) => i,
+        None => {
+            let i = probe::probe_open(&file)?;
+            if let Ok(mut m) = infos().lock() {
+                if m.len() >= 4096 {
+                    m.clear();
+                }
+                m.insert(key, i.clone());
+            }
+            i
+        }
+    };
+    let Some(cache) = cache else {
+        return Ok((info, None));
+    };
+    let content_hash = match hash::hash_file(&mut file, MAX_VIDEO_BYTES, None) {
+        Ok(h) => h,
+        Err(e) => {
+            debug!("media: no poster for {}: {e}", path.display());
+            return Ok((info, None));
+        }
+    };
+    let poster = cache.poster_path(&content_hash);
+    if cache::has_magic(&poster, cache::JPEG_MAGIC) {
+        return Ok((info, Some(poster)));
+    }
+    if let Some(shipped) = shipped {
+        match cache::install_poster(cache, shipped, &content_hash) {
+            Ok(p) => return Ok((info, Some(p))),
+            Err(e) => warning!("media: the shipped poster of {}: {e}", path.display()),
+        }
+    }
+    if posters == Posters::Find {
+        return Ok((info, None));
+    }
+    let Ok(ffmpeg) = Ffmpeg::locate() else {
+        return Ok((info, None));
+    };
+    match cache::ensure_poster(cache, &ffmpeg, &file, &info, &content_hash) {
+        Ok(p) => Ok((info, Some(p))),
+        Err(e) => {
+            warning!("media: no poster for {}: {e}", path.display());
+            Ok((info, None))
+        }
+    }
 }
 
 /// Syncs the directory `dir`, so a name just linked in it survives a crash.
@@ -932,6 +1693,48 @@ impl TempFile {
     }
 }
 
+impl TempFile {
+    /// A synced temporary copy in `dir` of what `reader` gives (at most
+    /// `limit` bytes; more is a refusal), with its content hash.
+    fn copy_from(
+        dir: &Path,
+        reader: &mut impl Read,
+        limit: u64,
+    ) -> Result<(TempFile, String), MediaError> {
+        let temp = TempFile::create(dir, &[])?;
+        let io = |action, source| MediaError::Io {
+            action,
+            path: temp.path.clone(),
+            source,
+        };
+        let mut out = OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&temp.path)
+            .map_err(|e| io("write", e))?;
+        let mut sha = hash::Sha256::new();
+        let mut buf = vec![0u8; 1 << 20];
+        let mut total = 0u64;
+        loop {
+            let n = reader.read(&mut buf).map_err(|e| io("read", e))?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            if total > limit {
+                return Err(io(
+                    "copy",
+                    std::io::Error::other(format!("the source grew past {limit} bytes")),
+                ));
+            }
+            sha.update(&buf[..n]);
+            out.write_all(&buf[..n]).map_err(|e| io("write", e))?;
+        }
+        out.sync_all().map_err(|e| io("write", e))?;
+        Ok((temp, hash::to_hex(&sha.finish())))
+    }
+}
+
 impl Drop for TempFile {
     fn drop(&mut self) {
         if let Err(e) = std::fs::remove_file(&self.path) {
@@ -942,3 +1745,5 @@ impl Drop for TempFile {
 
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(test)]
+mod video_tests;

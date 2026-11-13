@@ -160,6 +160,28 @@ impl Nv12 {
         }
     }
 
+    /// Copies `src` (a frame of this image's size) into it, row by row:
+    /// a frame kept beyond the call it is valid in, with no allocation.
+    pub fn copy_from(&mut self, src: &Planes) -> Result<(), String> {
+        if (src.width, src.height) != (self.width, self.height) {
+            return Err(format!(
+                "a {}x{} frame for a {}x{} image",
+                src.width, src.height, self.width, self.height
+            ));
+        }
+        src.check()?;
+        let w = self.width;
+        for (r, row) in self.y.chunks_exact_mut(w).enumerate() {
+            // SAFETY: r < height; the frame is only read, during the call.
+            unsafe { src.copy_y_row(r, row) };
+        }
+        for (r, row) in self.uv.chunks_exact_mut(w).enumerate() {
+            // SAFETY: r < height / 2; as above.
+            unsafe { src.copy_uv_row(r, row) };
+        }
+        Ok(())
+    }
+
     /// The planes over it.
     pub fn planes(&mut self) -> Planes {
         Planes {
@@ -611,11 +633,7 @@ impl Compositor {
         // The matte in 12-bit fixed point.
         let m12: Vec<u16> = matte.iter().map(|m| (m * 4096.0).round() as u16).collect();
         match mode {
-            Mode::Replace(bg) => {
-                debug_assert_eq!((bg.width, bg.height), (self.width, self.height));
-                let bg = Bg::Image(bg);
-                self.blend(input, output, &m12, &bg);
-            }
+            Mode::Replace(bg) => self.blend_image(input, output, &m12, bg),
             Mode::Blur => {
                 let r = self.blur_radius(strength);
                 if r == 0 {
@@ -633,6 +651,20 @@ impl Compositor {
                 this.blend(input, output, &m12, &bg);
             }
         }
+    }
+
+    /// Composites `input` into `output` over `bg` (an image of the
+    /// frame's size), as [`Mode::Replace`] does: the replacement of one
+    /// frame, a per-frame background.
+    pub fn replace(&mut self, input: &Planes, output: &Planes, matte: &[f32], bg: &Nv12) {
+        debug_assert_eq!(matte.len(), self.mh * self.mw);
+        let m12: Vec<u16> = matte.iter().map(|m| (m * 4096.0).round() as u16).collect();
+        self.blend_image(input, output, &m12, bg);
+    }
+
+    fn blend_image(&self, input: &Planes, output: &Planes, m12: &[u16], bg: &Nv12) {
+        debug_assert_eq!((bg.width, bg.height), (self.width, self.height));
+        self.blend(input, output, m12, &Bg::Image(bg));
     }
 
     /// Fills the small blurred images of the room: the frame averaged
@@ -1347,6 +1379,44 @@ mod tests {
         bg.y.fill(0);
         c.composite(&input, &output, &half, &Mode::Replace(bg), 1.0);
         assert_eq!(out_buf[(h / 2) * pitch + 4], 100);
+    }
+
+    #[test]
+    fn a_background_frame_is_copied_and_composited_where_the_matte_is_zero() {
+        let (w, h, pitch) = (64, 36, 72);
+        let (mut b, matte, m) = scene(w, h, pitch);
+        let input = planes(&mut b, w, h, pitch);
+        // A padded host frame, copied into the kept image.
+        let mut src = frame(w, h, pitch + 8, 70, (110, 140));
+        let mut bg = Nv12::new(w, h);
+        let (y, uv) = (bg.y.as_ptr(), bg.uv.as_ptr());
+        bg.copy_from(&planes(&mut src, w, h, pitch + 8)).unwrap();
+        assert_eq!((bg.y.as_ptr(), bg.uv.as_ptr()), (y, uv), "no allocation");
+        assert!(bg.y.iter().all(|&v| v == 70));
+        assert!(bg.uv.chunks(2).all(|c| c == [110, 140]));
+        src.fill(0);
+        let mut out_buf = vec![0u8; pitch * (h + h / 2)];
+        let output = planes(&mut out_buf, w, h, pitch);
+        let mut c = Compositor::new(w, h, m, 2);
+        c.replace(&input, &output, &matte, &bg);
+        assert_eq!(out_buf[(h / 2) * pitch + 4], 200, "the person");
+        assert_eq!(out_buf[(h / 2) * pitch + w - 4], 70, "the background frame");
+        let uv = (h + h / 4) * pitch;
+        assert_eq!(out_buf[uv + w - 4..uv + w - 2], [110, 140]);
+        // The same as the load-time image's replace.
+        let mut still = vec![0u8; pitch * (h + h / 2)];
+        c.composite(
+            &input,
+            &planes(&mut still, w, h, pitch),
+            &matte,
+            &Mode::Replace(bg.clone()),
+            1.0,
+        );
+        assert_eq!(still, out_buf);
+        // A frame of another size is refused, the image left as it was.
+        let mut other = frame(w - 2, h, pitch, 1, (2, 3));
+        assert!(bg.copy_from(&planes(&mut other, w - 2, h, pitch)).is_err());
+        assert!(bg.y.iter().all(|&v| v == 70));
     }
 
     #[test]

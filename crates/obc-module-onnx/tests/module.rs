@@ -133,6 +133,30 @@ fn without_a_runtime_the_stage_is_unavailable_with_the_reason() {
     }
 }
 
+/// The module takes a per-frame background (ABI 1.4); with nothing
+/// loaded it refuses one, and a host frame of no chain's size is refused
+/// before the module sees it.
+#[test]
+fn the_module_takes_a_per_frame_background() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nowhere/libonnxruntime.so");
+    let module = open(dir.path(), json!({"ort_library": missing}), &Log::default());
+    let mut inst = module.create_instance().unwrap();
+    assert!(inst.has_live_background());
+    let mut bg = common::Nv12 {
+        w: 64,
+        h: 36,
+        pitch: 64,
+        data: vec![128; 64 * 54],
+    };
+    let f = bg.frame(0);
+    // SAFETY: host memory of this test, valid during the call.
+    let e = unsafe { inst.set_background(Some(&f)) }.unwrap_err();
+    assert_eq!(e.status, obc_module_host::Status::State, "{e:?}");
+    let e = unsafe { inst.set_background(None) }.unwrap_err();
+    assert_eq!(e.status, obc_module_host::Status::State, "{e:?}");
+}
+
 #[test]
 fn a_bad_configuration_makes_the_module_unavailable() {
     let dir = tempfile::tempdir().unwrap();

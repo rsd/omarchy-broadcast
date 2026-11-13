@@ -72,7 +72,7 @@
 
 pkgname=omarchy-broadcast-git
 _pkgname=omarchy-broadcast
-pkgver=0.42.1
+pkgver=0.43.0
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API and a CLI'
 arch=('x86_64')
@@ -113,6 +113,7 @@ optdepends=(
   'maxine-ar-sdk-local: NVIDIA Maxine AR effects, eye contact (build it from omarchy-nvidia-sdks)'
   'maxine-afx-sdk-local: NVIDIA Maxine audio effects for the microphone (build it from omarchy-nvidia-sdks)'
   'gst-plugins-bad: WebP background and away images (webpdec)'
+  'ffmpeg: animated imports, posters and playback copies of video backgrounds'
 )
 # No LTO: with makepkg's -flto, libspa's build script compiles its C wrapper
 # into GCC LTO bitcode, which rust-lld cannot link (undefined libspa_rs_*).
@@ -247,10 +248,13 @@ package() {
   install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE-MIT LICENSE-APACHE \
     dist/licenses/THIRD-PARTY-NOTICES
 
-  # The bundled background gallery (procedural images made by
-  # scripts/gen-backgrounds.sh) and the provenance of every file in it.
+  # The bundled background gallery (procedural images and video loops made by
+  # scripts/gen-backgrounds.sh), each loop's shipped poster (<stem>.poster.jpg,
+  # matched by *.jpg; the daemon copies it into its cache, so no ffmpeg is
+  # needed for it) and the provenance of every file in it.
   install -Dm644 -t "$pkgdir/usr/share/$_pkgname/media/backgrounds" \
-    assets/media/backgrounds/*.jpg assets/media/backgrounds/SOURCES.toml
+    assets/media/backgrounds/*.jpg assets/media/backgrounds/*.webm \
+    assets/media/backgrounds/SOURCES.toml
 
   # The bundled away images (shown in a call when the camera is off) and
   # their provenance.

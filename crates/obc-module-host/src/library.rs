@@ -14,7 +14,9 @@
 //!    1.0 (an entry past its `struct_size` is taken as null), of the same
 //!    major version, with every required entry set. The audio entries of
 //!    ABI 1.2 ([`Library::has_audio`]) are required of an `audio-filter`
-//!    module only, which [`crate::Module::open_for`] checks.
+//!    module only, which [`crate::Module::open_for`] checks. The
+//!    per-frame background entry of ABI 1.4 is kept only for a library
+//!    built for ABI 1.4 or later ([`Library::has_live_background`]).
 //!
 //! The [`Library`] is shared ([`Arc`]) by every module object and instance
 //! made from it, and closed when the last one goes. One path is opened
@@ -215,8 +217,36 @@ const _: () = assert!(
             == VTABLE_SIZE_1_3
 );
 
+/// The size of the vtable of ABI 1.4, which appends
+/// `instance_set_background` to the 1.3 vtable.
+pub const VTABLE_SIZE_1_4: usize = VTABLE_SIZE_1_3 + size_of::<usize>();
+
+// `instance_set_background` is the last entry of ABI 1.4.
+const _: () = assert!(
+    std::mem::offset_of!(obc_module_vtable, instance_set_background) == VTABLE_SIZE_1_3
+        && std::mem::offset_of!(obc_module_vtable, instance_set_background) + size_of::<usize>()
+            == VTABLE_SIZE_1_4
+);
+
 /// The first minor version of ABI 1 with audio.
 pub const AUDIO_MINOR: u16 = 2;
+
+/// The first minor version of ABI 1 with the per-frame background
+/// (`instance_set_background`).
+pub const LIVE_BACKGROUND_MINOR: u16 = 4;
+
+/// The vtable `vt` of a library built for ABI `version` (one this host
+/// accepts), less the entries that version does not know: a library built
+/// for an older minor version never has an entry appended after it called,
+/// whatever its `struct_size` says. Only the per-frame background of 1.4
+/// is masked so: the entries before it were read by size alone when they
+/// came, and stay so.
+fn mask_vtable(mut vt: obc_module_vtable, version: u32) -> obc_module_vtable {
+    if obc_module_abi_minor(version) < LIVE_BACKGROUND_MINOR {
+        vt.instance_set_background = None;
+    }
+    vt
+}
 
 /// A loaded, checked module library.
 pub struct Library {
@@ -393,7 +423,7 @@ impl Library {
         }
         // SAFETY: `size` bytes, at least the 1.0 vtable's, valid while the
         // library is loaded; copied.
-        let vtable = unsafe { read_vtable(raw, size) };
+        let vtable = mask_vtable(unsafe { read_vtable(raw, size) }, abi_version);
         if u32::from(obc_module_abi_major(vtable.abi_version)) != OBC_MODULE_ABI_MAJOR {
             return Err(format!(
                 "The module's vtable is of module ABI {}; this daemon supports module ABI {}",
@@ -429,6 +459,13 @@ impl Library {
     /// The packed ABI version the library is built for.
     pub fn abi_version(&self) -> u32 {
         self.abi_version
+    }
+
+    /// Whether the library takes a per-frame background: built for ABI 1.4
+    /// or later, with `instance_set_background` set. A library without it
+    /// shows a video background as the load-time still.
+    pub fn has_live_background(&self) -> bool {
+        self.vtable.instance_set_background.is_some()
     }
 
     /// Whether the vtable has both audio entries of ABI 1.2: what an
@@ -483,18 +520,19 @@ mod tests {
         assert_eq!(check_abi_version(OBC_MODULE_ABI_VERSION), Ok(()));
         let e = check_abi_version(obc_module_abi_pack(2, 0)).unwrap_err();
         assert!(
-            e.contains("module ABI 2.0") && e.contains("module ABI 1.3"),
+            e.contains("module ABI 2.0") && e.contains("module ABI 1.4"),
             "{e}"
         );
         let e = check_abi_version(obc_module_abi_pack(0, 9)).unwrap_err();
         assert!(e.contains("0.9"), "{e}");
         let e = check_abi_version(obc_module_abi_pack(1, 7)).unwrap_err();
-        assert!(e.contains("1.7, newer than") && e.contains("1.3"), "{e}");
-        // A library built for ABI 1.0, 1.1, 1.2 or 1.3 loads.
+        assert!(e.contains("1.7, newer than") && e.contains("1.4"), "{e}");
+        // A library built for ABI 1.0, 1.1, 1.2, 1.3 or 1.4 loads.
         assert_eq!(check_abi_version(obc_module_abi_pack(1, 0)), Ok(()));
         assert_eq!(check_abi_version(obc_module_abi_pack(1, 1)), Ok(()));
         assert_eq!(check_abi_version(obc_module_abi_pack(1, 2)), Ok(()));
         assert_eq!(check_abi_version(obc_module_abi_pack(1, 3)), Ok(()));
+        assert_eq!(check_abi_version(obc_module_abi_pack(1, 4)), Ok(()));
     }
 
     #[test]
@@ -504,7 +542,7 @@ mod tests {
             frame_flags_of(obc_module_abi_pack(1, 0)),
             OBC_FRAME_FLAG_NEW_SOURCE
         );
-        for minor in [1, 2, 3] {
+        for minor in [1, 2, 3, 4] {
             assert_eq!(
                 frame_flags_of(obc_module_abi_pack(1, minor)),
                 OBC_FRAME_FLAG_NEW_SOURCE | OBC_FRAME_FLAG_REPEAT
@@ -565,7 +603,45 @@ mod tests {
         // SAFETY: as above.
         let read = unsafe { read_vtable(&vt, VTABLE_SIZE_1_3) };
         assert!(read.instance_status_values.is_some());
-        assert_eq!(VTABLE_SIZE_1_3, size_of::<obc_module_vtable>());
+        // A 1.3 vtable never has the per-frame background of 1.4.
+        unsafe extern "C" fn background(
+            _: *mut obc_module_abi::obc_instance,
+            _: *const obc_module_abi::obc_frame,
+        ) -> obc_module_abi::obc_status {
+            0
+        }
+        vt.instance_set_background = Some(background);
+        // SAFETY: as above.
+        let read = unsafe { read_vtable(&vt, VTABLE_SIZE_1_3) };
+        assert!(read.instance_set_background.is_none());
+        // SAFETY: as above.
+        let read = unsafe { read_vtable(&vt, VTABLE_SIZE_1_4) };
+        assert!(read.instance_set_background.is_some());
+        assert_eq!(VTABLE_SIZE_1_4, size_of::<obc_module_vtable>());
+    }
+
+    /// A library built for ABI 1.3 never has the per-frame background,
+    /// even with a vtable large enough to hold it.
+    #[test]
+    fn the_per_frame_background_is_masked_by_abi_version() {
+        unsafe extern "C" fn background(
+            _: *mut obc_module_abi::obc_instance,
+            _: *const obc_module_abi::obc_frame,
+        ) -> obc_module_abi::obc_status {
+            0
+        }
+        // SAFETY: all zero bytes are a valid vtable.
+        let mut vt: obc_module_vtable = unsafe { std::mem::zeroed() };
+        vt.instance_set_background = Some(background);
+        for minor in [0, 1, 2, 3] {
+            let masked = mask_vtable(vt, obc_module_abi_pack(1, minor));
+            assert!(masked.instance_set_background.is_none(), "1.{minor}");
+        }
+        assert!(
+            mask_vtable(vt, obc_module_abi_pack(1, 4))
+                .instance_set_background
+                .is_some()
+        );
     }
 
     #[test]

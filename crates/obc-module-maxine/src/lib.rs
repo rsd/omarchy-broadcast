@@ -24,7 +24,10 @@
 //! load-time parameter `chair` (a boolean, default `false`) whether a chair
 //! is cut out with the background, its live parameter `blur_strength` (from
 //! 0 to 1) the blur strength, and the chain's background frame the
-//! replacement image; without `background` the effect is `none`. A load
+//! replacement image; without `background` the effect is `none`. Under
+//! replace the module takes a per-frame background (ABI 1.4,
+//! `Instance::set_background`, for a video background): each CUDA NV12
+//! frame is converted on the GPU into the backend's background image. A load
 //! on a loaded chain is a switch on the same backend, so models are reused
 //! as before; a new `chair` loads the green screen again, which the backend
 //! does as any switch, the previous chain kept running until the new one is
@@ -103,9 +106,9 @@ use obc_backend::enhance::{
     YuvLayout,
 };
 use obc_backend::{
-    BackendError, BackendFactory, ColourMatrix as BackendMatrix, ColourSpec, DeviceNv12,
-    EffectKind, FrameParams, GpuContext, HostBgr, InferenceBackend, LoadRequest, Params, StageId,
-    StageList, StageTimings, Value as BackendValue,
+    BackendError, BackendFactory, BackgroundFrame, ColourMatrix as BackendMatrix, ColourSpec,
+    DeviceNv12, EffectKind, FrameParams, GpuContext, HostBgr, InferenceBackend, LoadRequest,
+    Params, StageId, StageList, StageTimings, Value as BackendValue,
 };
 use obc_backend_maxine::truehdr::{MaxineTrueHdr, MaxineTrueHdrFactory};
 use obc_backend_maxine::vfg::{MaxineVfg, MaxineVfgFactory};
@@ -1221,6 +1224,29 @@ impl Instance for MaxineInstance {
         } else {
             self.process_stages(&gpu, input, output)
         }
+    }
+
+    const LIVE_BACKGROUND: bool = true;
+
+    /// Hands the frame to the effect backend, which converts it into the
+    /// background image of its composite on the chain's stream
+    /// ([`MaxineBackend`]'s `set_background_frame`).
+    fn set_background(&mut self, frame: Option<&Frame<'_>>) -> Result<(), Error> {
+        let Chain::Effect(backend) = &mut self.chain else {
+            return Err(Error::invalid(
+                "a per-frame background needs the background stage under replace",
+            ));
+        };
+        let frame = match frame {
+            None => None,
+            Some(f) if f.kind() != FrameKind::Cuda => {
+                return Err(Error::invalid(
+                    "the Maxine module takes CUDA background frames only",
+                ));
+            }
+            Some(f) => Some(BackgroundFrame::Cuda(device_nv12(f)?)),
+        };
+        backend.set_background_frame(frame).map_err(module_error)
     }
 
     fn reset_temporal(&mut self) -> Result<Vec<String>, Error> {

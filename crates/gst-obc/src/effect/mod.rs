@@ -11,9 +11,10 @@
 //!
 //! * **Properties**, all changeable while playing: `effect` (`none`, `blur`,
 //!   `replace`), `blur-strength` (0 to 1, default 0.5; applies on the next
-//!   frame), `background` (an absolute path, or empty), `on-failure`
-//!   (`black`, `image`, `none`), `fallback-image` (an absolute path, or
-//!   empty); read-only `status`. The stackable stages have no
+//!   frame), `background` (an absolute path, or empty), `background-video`
+//!   (an absolute path, or empty; [`ObcEffect::set_background_video`]),
+//!   `on-failure` (`black`, `image`, `none`), `fallback-image` (an absolute
+//!   path, or empty); read-only `status`. The stackable stages have no
 //!   property: [`ObcEffect::apply`] sets them with the rest
 //!   ([`EffectSettings::stages`], each a [`StageId`](obc_backend::StageId)
 //!   with its parameters), validated.
@@ -63,6 +64,31 @@
 //!   read, the frames are black; the reason is in
 //!   [`EffectStats::fallback_error`] and in the status message's
 //!   `fallback-image-error` field (empty while there is none).
+//! * **The video background** (`background-video`, replace only): a video
+//!   played in a loop behind the person
+//!   ([`crate::video_background`]: NVDEC into the element's own CUDA
+//!   context on CUDA frames, `vp9dec` for VP9 alone on system memory, no
+//!   CUDA element there). The settings' `background` is its load-time
+//!   still (black when there is none). Its decode pipeline exists only
+//!   while replace is loaded on a backend that takes per-frame backgrounds
+//!   (`InferenceBackend::supports_live_background`); it stops on a stop,
+//!   and on a change to a still or another effect once that is loaded
+//!   (until then the video stays behind the person, never the previous
+//!   still); a flush leaves it playing; it never runs at idle. Each fresh
+//!   camera frame (not a repeat, not the placeholder) hands the newest
+//!   decoded frame, if new, to the backend
+//!   (`InferenceBackend::set_background_frame`) before it is processed; any
+//!   processed frame, a repeat too, gives the last one again after a
+//!   reload (which puts the load-time still back in the backend).
+//!   Changing the video reloads nothing: the background in force (the
+//!   still, or the last frame of the previous video, given again after a
+//!   reload) stays until the new video's first frame; a video that cannot
+//!   play (no frames, larger than 3840x2160, ...) keeps it for good.
+//!   Neither is ever black frames or the camera.
+//!   Why the video does not play, or that the backend shows it as a still,
+//!   is in [`EffectStats::background_error`] and in the status message's
+//!   `background-error` field (empty while there is none);
+//!   [`EffectStats::background_video`] says whether the pipeline exists.
 //! * Every change of
 //!   the effect's or a stage's status is also posted on the bus as an
 //!   element message named [`STATUS_MESSAGE`], with the fields `effect`
@@ -245,8 +271,11 @@ impl ObcEffect {
     /// failure a new attempt even when nothing changed. A change of the
     /// per-frame parameters alone
     /// ([`EffectSettings::changes_frame_params_only`]) makes no new attempt.
+    ///
+    /// With a video background ([`Self::set_background_video`]) replace
+    /// needs no image ([`EffectSettings::validate_with_video`]).
     pub fn apply(&self, settings: &EffectSettings) -> Result<(), String> {
-        settings.validate()?;
+        settings.validate_with_video(self.imp().has_background_video())?;
         if let Some(factory) = self.backend_factory() {
             for s in &settings.stages {
                 factory.check_params(&s.id, &s.params, &s.live)?;
@@ -261,6 +290,22 @@ impl ObcEffect {
         }
         self.imp().apply_checked(settings.clone());
         Ok(())
+    }
+
+    /// Sets the video background of replace (`background-video`): an
+    /// absolute path to an MP4, MOV, MKV or WebM file, or `None`. The
+    /// settings' `background` is then its load-time still (black when there
+    /// is none). Changing the video alone reloads nothing: the background
+    /// in force stays until the new video's first frame. Refuses a relative
+    /// path. Set it before applying replace without an image.
+    pub fn set_background_video(&self, path: Option<&std::path::Path>) -> Result<(), String> {
+        self.imp()
+            .set_background_video(path.map(std::path::Path::to_path_buf))
+    }
+
+    /// The video background of replace, if one is set.
+    pub fn background_video(&self) -> Option<std::path::PathBuf> {
+        self.imp().background_video()
     }
 
     /// The current settings.

@@ -74,6 +74,9 @@ struct H {
 
 impl H {
     fn new(config: &str, setup: impl FnOnce(&mut World)) -> H {
+        // The controller runs on the test's thread: the video check must
+        // never run on it (it panics there).
+        crate::media::probe::forbid_on_this_thread();
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths {
             config: dir.path().join("config.toml"),
@@ -1704,7 +1707,18 @@ impl H {
 
     fn set_image(&mut self, path: &str, ms: u64) -> Result<(), IpcError> {
         let path = path.to_string();
-        self.call(|r| Command::SetBackgroundImage(path, r), ms)
+        self.call(|r| Command::SetBackgroundImage(path, None, r), ms)
+    }
+
+    /// `SetBackgroundImage` of a video with the check the D-Bus side made.
+    fn set_checked(
+        &mut self,
+        path: &Path,
+        info: crate::media::VideoInfo,
+        ms: u64,
+    ) -> Result<(), IpcError> {
+        let path = path.display().to_string();
+        self.call(|r| Command::SetBackgroundImage(path, Some(info), r), ms)
     }
 
     /// A background image file in the test's directory.
@@ -15106,4 +15120,612 @@ fn a_system_memory_session_that_did_not_stop_cleanly_is_warned_and_never_taints(
     let w = h.world();
     assert_eq!(w.parks, 1);
     assert_eq!(w.gpu_log, ["build", "park"]);
+}
+
+// ---- video backgrounds (revision 18; ADR-0035, "CUDA and system memory") ----
+
+/// What the fake video service was asked and answers.
+#[derive(Default)]
+struct VideoWorld {
+    /// What `ensure_copy` answers per source (absent: `Preparing`).
+    copies: HashMap<PathBuf, CopyState>,
+    posters_asked: Vec<PathBuf>,
+    ensured: Vec<PathBuf>,
+    /// The `ensure_copy` calls asking a failed job to run again.
+    retries: Vec<PathBuf>,
+    cancels: u32,
+    prunes: Vec<Option<PathBuf>>,
+}
+
+#[derive(Clone, Default)]
+struct FakeVideos(Arc<Mutex<VideoWorld>>);
+
+impl FakeVideos {
+    fn world(&self) -> std::sync::MutexGuard<'_, VideoWorld> {
+        self.0.lock().unwrap()
+    }
+}
+
+impl VideoService for FakeVideos {
+    fn request_poster(&mut self, path: &Path) {
+        self.world().posters_asked.push(path.to_path_buf());
+    }
+    fn ensure_copy(&mut self, path: &Path, retry: bool) -> CopyState {
+        let mut w = self.world();
+        w.ensured.push(path.to_path_buf());
+        if retry {
+            w.retries.push(path.to_path_buf());
+        }
+        w.copies.get(path).cloned().unwrap_or(CopyState::Preparing)
+    }
+    fn cancel_copy(&mut self) {
+        self.world().cancels += 1;
+    }
+    fn prune(&mut self, outside: Option<&Path>) {
+        self.world().prunes.push(outside.map(Path::to_path_buf));
+    }
+}
+
+/// A 1080p30 video of `codec` in `container`.
+fn video_info(
+    container: crate::media::Container,
+    codec: crate::media::Codec,
+) -> crate::media::VideoInfo {
+    crate::media::VideoInfo {
+        container,
+        codec,
+        profile: String::new(),
+        width: 1920,
+        height: 1080,
+        fps_num: 30,
+        fps_den: 1,
+        duration_ms: 10_000,
+    }
+}
+
+const PREPARING: &str = "The video background is being prepared for playback on the CPU; a \
+                         still is shown until it is ready";
+
+impl H {
+    /// The fake video service, given to the controller.
+    fn videos(&mut self) -> FakeVideos {
+        let v = FakeVideos::default();
+        self.ctrl.set_videos(Box::new(v.clone()));
+        v
+    }
+
+    /// A video file `name` (an MP4 by its first bytes, or with a `.webm`
+    /// name a WebM) in the test's directory, checked earlier in the run as
+    /// `info` says (the check the D-Bus side made, remembered).
+    fn video(&self, name: &str, info: crate::media::VideoInfo) -> PathBuf {
+        let p = self.unchecked_video(name);
+        crate::media::remember_video_info(&p, &info);
+        p
+    }
+
+    /// A video file `name` never checked in this run.
+    fn unchecked_video(&self, name: &str) -> PathBuf {
+        let p = self._dir.path().join(name);
+        let head: &[u8] = if name.ends_with(".webm") {
+            &[0x1A, 0x45, 0xDF, 0xA3, 0, 0, 0, 0, 0, 0, 0, 0]
+        } else {
+            b"\0\0\0\x18ftypisom\0\0\0\0"
+        };
+        fs::write(&p, head).unwrap();
+        p
+    }
+
+    /// A still file `name` in the test's directory.
+    fn still(&self, name: &str) -> PathBuf {
+        let p = self._dir.path().join(name);
+        fs::write(&p, b"an image").unwrap();
+        p
+    }
+
+    fn poster(&mut self, source: &Path, poster: Option<&Path>, ms: u64) {
+        self.poster_checked(source, Err("not asked".into()), poster, ms);
+    }
+
+    /// The poster's thread answers with the check `info` and `poster`.
+    fn poster_checked(
+        &mut self,
+        source: &Path,
+        info: Result<crate::media::VideoInfo, String>,
+        poster: Option<&Path>,
+        ms: u64,
+    ) {
+        let now = self.at(ms);
+        let (source, poster) = (source.to_path_buf(), poster.map(Path::to_path_buf));
+        assert!(self.ctrl.handle(
+            Command::VideoPoster {
+                source,
+                info,
+                poster
+            },
+            now
+        ));
+    }
+
+    fn copy_done(&mut self, source: &Path, result: Result<PathBuf, String>, ms: u64) {
+        let state = match result {
+            Ok(p) => CopyState::Ready(p),
+            Err(r) => CopyState::Failed(r),
+        };
+        self.copy_step(source, state, ms);
+    }
+
+    fn copy_step(&mut self, source: &Path, state: CopyState, ms: u64) {
+        let now = self.at(ms);
+        let event = CopyEvent {
+            source: source.to_path_buf(),
+            state,
+        };
+        assert!(self.ctrl.handle(Command::PlaybackCopy(event), now));
+    }
+
+    /// What the running session's effect element has: (still, video).
+    fn background(&self) -> (Option<PathBuf>, Option<PathBuf>) {
+        let w = self.world();
+        let e = w.effect.as_ref().expect("an effect");
+        (e.background_image.clone(), e.background_video.clone())
+    }
+}
+
+#[test]
+fn a_video_is_accepted_as_the_background_with_the_check_the_caller_made() {
+    use crate::media::{Codec, Container};
+    let mut h = H::new("", |_| {});
+    let v = h.videos();
+    let clip = h.unchecked_video("clip.mp4");
+    h.set_checked(&clip, video_info(Container::Mp4, Codec::H264), 0)
+        .unwrap();
+    assert_eq!(h.snap().background_image, clip.display().to_string());
+    assert_eq!(v.world().posters_asked, std::slice::from_ref(&clip));
+    // The check handed on is the one this run knows.
+    assert_eq!(
+        crate::media::known_video_info(&clip).map(|i| i.codec),
+        Some(Codec::H264)
+    );
+    // Not under `replace`: no copy is asked for.
+    assert!(v.world().ensured.is_empty());
+    // A still is checked as before.
+    let still = h.still("office.png");
+    h.set_image(&still.display().to_string(), 200).unwrap();
+    assert_eq!(h.snap().background_image, still.display().to_string());
+}
+
+#[test]
+fn a_video_over_the_video_limit_is_refused_with_that_limit() {
+    let mut h = H::new("", |_| {});
+    let big = h._dir.path().join("big.mp4");
+    let f = fs::File::create(&big).unwrap();
+    use std::io::Write;
+    (&f).write_all(b"\0\0\0\x18ftypisom\0\0\0\0").unwrap();
+    // Sparse: no disk is used.
+    f.set_len(crate::media::probe::MAX_VIDEO_BYTES + 1).unwrap();
+    let msg = refusal(h.set_image(&big.display().to_string(), 0));
+    assert!(msg.contains("the video file"), "{msg}");
+    assert!(msg.contains("512 MiB"), "{msg}");
+}
+
+#[test]
+fn a_cuda_session_plays_the_original_and_never_asks_for_a_copy() {
+    use crate::media::{Codec, Container};
+    let mut h = H::new("", |_| {});
+    let v = h.videos();
+    let clip = h.video("clip.mp4", video_info(Container::Mp4, Codec::Hevc));
+    let poster = h.still("poster.jpg");
+    h.set_image(&clip.display().to_string(), 0).unwrap();
+    h.set_effect("replace", 0).unwrap();
+    h.activate(100);
+    assert_eq!(h.session_params().memory, VideoMemory::Cuda);
+    // No poster yet, nothing shown before: black behind the person until
+    // the video's first frame (a camera start).
+    assert_eq!(
+        h.session_params().effect.background_video,
+        Some(clip.clone())
+    );
+    assert_eq!(h.session_params().effect.background_image, None);
+    h.poster(&clip, Some(&poster), 1000);
+    assert_eq!(h.background(), (Some(poster.clone()), Some(clip.clone())));
+    assert!(v.world().ensured.is_empty(), "a CUDA session makes no copy");
+    assert_eq!(h.snap().warning, "");
+    assert_eq!(h.world().session_starts, 1);
+}
+
+#[test]
+fn a_system_memory_session_plays_a_cpu_ready_video_as_it_is() {
+    use crate::media::{Codec, Container};
+    let mut h = H::new("[video]\nmemory = \"system\"\n", |_| {});
+    let v = h.videos();
+    let clip = h.video("loop.webm", video_info(Container::WebM, Codec::Vp9));
+    h.set_image(&clip.display().to_string(), 0).unwrap();
+    h.set_effect("replace", 0).unwrap();
+    h.activate(100);
+    assert_eq!(h.session_params().memory, VideoMemory::System);
+    assert_eq!(h.background().1, Some(clip.clone()));
+    assert!(v.world().ensured.is_empty(), "CPU-ready: no copy");
+    assert!(
+        !h.snap().warning.contains("video background"),
+        "{}",
+        h.snap().warning
+    );
+}
+
+#[test]
+fn a_system_memory_session_plays_a_ready_copy() {
+    use crate::media::{Codec, Container};
+    let mut h = H::new("[video]\nmemory = \"system\"\n", |_| {});
+    let v = h.videos();
+    let clip = h.video("clip.mp4", video_info(Container::Mp4, Codec::H264));
+    let copy = h.still("copy.webm");
+    v.world()
+        .copies
+        .insert(clip.clone(), CopyState::Ready(copy.clone()));
+    h.set_image(&clip.display().to_string(), 0).unwrap();
+    h.set_effect("replace", 0).unwrap();
+    h.activate(100);
+    assert_eq!(h.background().1, Some(copy));
+    assert!(v.world().ensured.contains(&clip));
+    assert!(
+        !h.snap().warning.contains("video background"),
+        "{}",
+        h.snap().warning
+    );
+}
+
+#[test]
+fn a_copy_being_prepared_shows_the_still_then_the_video_without_a_restart() {
+    use crate::media::{Codec, Container};
+    let mut h = H::new("[video]\nmemory = \"system\"\n", |_| {});
+    let v = h.videos();
+    let office = h.still("office.png");
+    let clip = h.video("clip.mp4", video_info(Container::Mp4, Codec::H264));
+    let poster = h.still("poster.jpg");
+    h.set_image(&office.display().to_string(), 0).unwrap();
+    h.set_effect("replace", 0).unwrap();
+    h.activate(100);
+    assert_eq!(h.background(), (Some(office.clone()), None));
+    // The video chosen mid-stream: the still in force stays until the
+    // poster, then the poster; nothing plays until the copy is ready.
+    h.set_image(&clip.display().to_string(), 1000).unwrap();
+    assert_eq!(v.world().ensured, std::slice::from_ref(&clip));
+    assert_eq!(h.background(), (Some(office.clone()), None));
+    assert!(h.snap().warning.contains(PREPARING), "{}", h.snap().warning);
+    h.poster(&clip, Some(&poster), 1100);
+    assert_eq!(h.background(), (Some(poster.clone()), None));
+    // The copy is ready: the running element is given it, no restart.
+    let copy = h.still("copy.webm");
+    h.copy_done(&clip, Ok(copy.clone()), 2000);
+    assert_eq!(h.background(), (Some(poster.clone()), Some(copy.clone())));
+    assert!(
+        !h.snap().warning.contains(PREPARING),
+        "{}",
+        h.snap().warning
+    );
+    // The event of another source changes nothing.
+    h.copy_done(&office, Ok(office.clone()), 2100);
+    assert_eq!(h.background(), (Some(poster), Some(copy)));
+    let w = h.world();
+    assert_eq!((w.session_starts, w.session_stops), (1, 0));
+    assert_eq!(h.state(), State::Active);
+}
+
+#[test]
+fn without_ffmpeg_or_after_a_failed_job_the_poster_is_shown_with_the_reason() {
+    use crate::media::{Codec, Container};
+    let mut h = H::new("[video]\nmemory = \"system\"\n", |_| {});
+    let v = h.videos();
+    let clip = h.video("clip.mp4", video_info(Container::Mp4, Codec::Av1));
+    let poster = h.still("poster.jpg");
+    v.world().copies.insert(clip.clone(), CopyState::NoFfmpeg);
+    h.set_image(&clip.display().to_string(), 0).unwrap();
+    h.set_effect("replace", 0).unwrap();
+    h.poster(&clip, Some(&poster), 10);
+    h.activate(100);
+    assert_eq!(h.background(), (Some(poster.clone()), None));
+    assert!(
+        h.snap()
+            .warning
+            .contains("The video background is shown as a still: ffmpeg is not installed"),
+        "{}",
+        h.snap().warning
+    );
+    // A job that fails.
+    let mut h = H::new("[video]\nmemory = \"system\"\n", |_| {});
+    let _v = h.videos();
+    let clip = h.video("clip.mp4", video_info(Container::Mp4, Codec::H264));
+    h.set_image(&clip.display().to_string(), 0).unwrap();
+    h.set_effect("replace", 0).unwrap();
+    h.poster(&clip, Some(&poster), 10);
+    h.activate(100);
+    assert!(h.snap().warning.contains(PREPARING));
+    // The reason as the copy service gives it (the runner's).
+    let reason = crate::media::ffmpeg::FfmpegError::Failed("boom: bad input (exit 1)".into());
+    h.copy_done(&clip, Err(reason.to_string()), 1000);
+    assert_eq!(h.background(), (Some(poster), None));
+    let warning = h.snap().warning;
+    assert!(
+        warning.contains(
+            "The video background is shown as a still: preparing it for playback on the CPU \
+             failed (ffmpeg failed: boom: bad input (exit 1))"
+        ),
+        "{warning}"
+    );
+    assert_eq!(
+        warning.matches("preparing it for playback").count(),
+        1,
+        "{warning}"
+    );
+    assert!(!warning.contains(PREPARING), "{warning}");
+    assert_eq!(h.world().session_starts, 1);
+}
+
+#[test]
+fn the_elements_as_a_still_report_is_a_warning_clause_while_it_holds() {
+    use crate::media::{Codec, Container};
+    let mut h = H::new("", |_| {});
+    let _v = h.videos();
+    let clip = h.video("clip.mp4", video_info(Container::Mp4, Codec::H264));
+    h.set_image(&clip.display().to_string(), 0).unwrap();
+    h.set_effect("replace", 0).unwrap();
+    h.activate(100);
+    let still = gst_obc::video_background::video_as_still("NVIDIA Maxine");
+    h.world().background_error = Some(still.clone());
+    h.tick(1000);
+    assert!(h.snap().warning.contains(&still), "{}", h.snap().warning);
+    h.world().background_error = None;
+    h.tick(2000);
+    assert!(!h.snap().warning.contains(&still), "{}", h.snap().warning);
+}
+
+#[test]
+fn background_changes_mid_stream_never_restart_the_session() {
+    use crate::media::{Codec, Container};
+    let mut h = H::new("", |_| {});
+    let _v = h.videos();
+    let office = h.still("office.png");
+    let a = h.video("a.mp4", video_info(Container::Mp4, Codec::H264));
+    let b = h.video("b.webm", video_info(Container::WebM, Codec::Vp9));
+    let (pa, pb) = (h.still("a.jpg"), h.still("b.jpg"));
+    h.set_image(&office.display().to_string(), 0).unwrap();
+    h.set_effect("replace", 0).unwrap();
+    h.activate(100);
+    h.drain();
+    // Still to video: the still in force until the poster.
+    h.set_image(&a.display().to_string(), 1000).unwrap();
+    assert_eq!(h.background(), (Some(office.clone()), Some(a.clone())));
+    h.poster(&a, Some(&pa), 1100);
+    assert_eq!(h.background(), (Some(pa.clone()), Some(a.clone())));
+    // Video to video: the first one's poster until the second's.
+    h.set_image(&b.display().to_string(), 2000).unwrap();
+    assert_eq!(h.background(), (Some(pa.clone()), Some(b.clone())));
+    h.poster(&b, Some(&pb), 2100);
+    assert_eq!(h.background(), (Some(pb.clone()), Some(b.clone())));
+    // Replace to blur and back, and none.
+    h.set_effect("blur", 3000).unwrap();
+    assert_eq!(h.background().1, None, "played only under replace");
+    h.set_effect("replace", 3100).unwrap();
+    assert_eq!(h.background(), (Some(pb.clone()), Some(b.clone())));
+    h.set_effect("none", 3200).unwrap();
+    h.set_effect("replace", 3300).unwrap();
+    // A late poster of a video no longer chosen changes nothing.
+    h.poster(&a, Some(&pb), 3400);
+    // Video to still.
+    h.set_image(&office.display().to_string(), 4000).unwrap();
+    assert_eq!(h.background(), (Some(office), None));
+    h.tick(5000);
+    assert_eq!(h.state(), State::Active);
+    assert!(h.states().is_empty(), "the state never left active");
+    let w = h.world();
+    assert_eq!((w.session_starts, w.session_stops), (1, 0));
+    assert_eq!(w.ingests, ["usb-a"], "the camera was not reopened");
+}
+
+#[test]
+fn removing_the_video_in_force_stops_the_elements_video() {
+    use crate::media::{Codec, Container};
+    let root = tempfile::tempdir().unwrap();
+    let (store, item) = gallery_with(root.path(), "clip.mp4");
+    fs::write(&item, b"\0\0\0\x18ftypisom\0\0\0\0").unwrap();
+    let office = root.path().join("office.png");
+    fs::write(&office, b"an image").unwrap();
+    let config = format!(
+        "[effect]\nmode = \"replace\"\nbackground_image = \"{}\"\n",
+        office.display()
+    );
+    let mut h = H::new(&config, |_| {});
+    let _v = h.videos();
+    crate::media::remember_video_info(&item, &video_info(Container::Mp4, Codec::H264));
+    h.activate(0);
+    h.set_image(&item.display().to_string(), 1000).unwrap();
+    assert_eq!(h.background().1, Some(item.clone()));
+    h.release_media(&store, &item, 2000).unwrap();
+    assert!(!item.exists());
+    // The configuration's still applies again, and the video stops.
+    assert_eq!(h.background(), (Some(office.clone()), None));
+    assert_eq!(h.snap().background_image, office.display().to_string());
+    assert_eq!(h.world().session_starts, 1);
+}
+
+#[test]
+fn a_configured_video_is_kept_by_the_prune_and_its_copy_asked_at_each_camera_start() {
+    use crate::media::{Codec, Container};
+    let dir = tempfile::tempdir().unwrap();
+    let clip = dir.path().join("clip.mp4");
+    fs::write(&clip, b"\0\0\0\x18ftypisom\0\0\0\0").unwrap();
+    let config = format!(
+        "[video]\nmemory = \"system\"\n[effect]\nmode = \"replace\"\nbackground_image = \"{}\"\n",
+        clip.display()
+    );
+    let mut h = H::new(&config, |_| {});
+    let v = FakeVideos::default();
+    h.ctrl.set_videos(Box::new(v.clone()));
+    assert_eq!(v.world().prunes, [Some(clip.clone())]);
+    // Never checked in this run: checked on the poster's thread, which
+    // answers with the poster; the copy is asked for then.
+    assert_eq!(v.world().posters_asked, std::slice::from_ref(&clip));
+    assert!(v.world().ensured.is_empty());
+    h.poster_checked(&clip, Ok(video_info(Container::Mp4, Codec::Hevc)), None, 10);
+    assert_eq!(
+        v.world().ensured,
+        std::slice::from_ref(&clip),
+        "asked once checked"
+    );
+    h.activate_then_idle(100);
+    h.activate(20_000);
+    // Once at the check, then at each of the two camera starts (each
+    // allowed to run a failed job once more).
+    assert_eq!(v.world().ensured.len(), 3);
+    assert_eq!(v.world().retries.len(), 2);
+    // No still and no copy yet: the element is given the original, and
+    // says itself that it cannot play it (black behind the person, D4);
+    // the clause says the copy is coming.
+    assert_eq!(h.background(), (None, Some(clip)));
+    let warning = h.snap().warning;
+    assert!(
+        warning.contains(
+            "The video background is being prepared for playback on the CPU; the background is \
+             black until it is ready"
+        ),
+        "{warning}"
+    );
+}
+
+#[test]
+fn a_video_not_checked_yet_shows_the_still_in_system_memory_until_its_check() {
+    use crate::media::{Codec, Container};
+    let mut h = H::new("[video]\nmemory = \"system\"\n", |_| {});
+    let v = h.videos();
+    let office = h.still("office.png");
+    h.set_image(&office.display().to_string(), 0).unwrap();
+    h.set_effect("replace", 0).unwrap();
+    h.activate(100);
+    let clip = h.unchecked_video("clip.webm");
+    h.set_image(&clip.display().to_string(), 1000).unwrap();
+    // Unknown: nothing plays, the still in force stays, no copy asked.
+    assert_eq!(h.background(), (Some(office.clone()), None));
+    assert!(v.world().ensured.is_empty());
+    // CPU-ready, as the poster's thread found: it plays as it is.
+    h.poster_checked(
+        &clip,
+        Ok(video_info(Container::WebM, Codec::Vp9)),
+        None,
+        1100,
+    );
+    assert_eq!(h.background(), (Some(office), Some(clip)));
+    assert!(v.world().ensured.is_empty());
+    assert_eq!(h.world().session_starts, 1);
+}
+
+#[test]
+fn the_still_of_an_earlier_choice_goes_at_a_camera_start_and_when_its_file_is_gone() {
+    use crate::media::{Codec, Container};
+    let mut h = H::new("", |_| {});
+    let _v = h.videos();
+    let office = h.still("office.png");
+    let clip = h.video("clip.mp4", video_info(Container::Mp4, Codec::H264));
+    h.set_image(&office.display().to_string(), 0).unwrap();
+    h.set_effect("replace", 0).unwrap();
+    h.activate(100);
+    h.set_image(&clip.display().to_string(), 1000).unwrap();
+    assert_eq!(h.background(), (Some(office.clone()), Some(clip.clone())));
+    // A new session: the last session's still is not kept.
+    h.activate_then_idle(2000);
+    h.activate(30_000);
+    assert_eq!(h.background(), (None, Some(clip.clone())));
+    // Mid-session again, then the still's file removed.
+    let other = h.still("other.png");
+    h.set_image(&other.display().to_string(), 31_000).unwrap();
+    let clip2 = h.video("clip2.mp4", video_info(Container::Mp4, Codec::H264));
+    h.set_image(&clip2.display().to_string(), 32_000).unwrap();
+    assert_eq!(h.background(), (Some(other.clone()), Some(clip2.clone())));
+    fs::remove_file(&other).unwrap();
+    h.set_effect("blur", 33_000).unwrap();
+    h.set_effect("replace", 33_100).unwrap();
+    assert_eq!(h.background(), (None, Some(clip2)));
+}
+
+#[test]
+fn the_controller_never_runs_the_video_check() {
+    // A file that looks like a video and that the check refuses: the
+    // daemon's own service checks it on the poster's thread and answers
+    // through the command channel; the controller (on this thread, where
+    // a check panics) only takes the answer.
+    let mut h = H::new("[video]\nmemory = \"system\"\n", |_| {});
+    let (tx, rx) = std::sync::mpsc::channel();
+    h.ctrl
+        .set_videos(Box::new(super::GalleryVideos::new(None, tx)));
+    let bad = h.unchecked_video("bad.mp4");
+    h.set_image(&bad.display().to_string(), 0).unwrap();
+    h.set_effect("replace", 0).unwrap();
+    h.activate(100);
+    let cmd = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the poster's answer");
+    assert!(
+        matches!(&cmd, Command::VideoPoster { source, info: Err(_), poster: None } if *source == bad),
+        "{cmd:?}"
+    );
+    let now = h.at(2000);
+    assert!(h.ctrl.handle(cmd, now));
+    // Refused: the element is given it and says it cannot play it.
+    assert_eq!(h.background(), (None, Some(bad)));
+    assert_eq!(h.state(), State::Active);
+}
+
+#[test]
+#[should_panic(expected = "the video check ran")]
+fn the_video_check_panics_on_the_controllers_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("x.mp4");
+    fs::write(&f, b"\0\0\0\x18ftypisom\0\0\0\0").unwrap();
+    crate::media::probe::forbid_on_this_thread();
+    let _ = crate::media::probe_video(&f);
+}
+
+#[test]
+fn a_failed_copy_runs_once_more_at_the_next_camera_start() {
+    use crate::media::{Codec, Container};
+    let mut h = H::new("[video]\nmemory = \"system\"\n", |_| {});
+    let v = h.videos();
+    let clip = h.video("clip.mp4", video_info(Container::Mp4, Codec::H264));
+    h.set_image(&clip.display().to_string(), 0).unwrap();
+    h.set_effect("replace", 0).unwrap();
+    h.activate(100);
+    h.copy_done(&clip, Err("ffmpeg failed: boom (exit 1)".into()), 1000);
+    let asked = v.world().ensured.len();
+    let retried = v.world().retries.len();
+    // Nothing asks again in this session.
+    h.tick(5000);
+    h.set_effect("blur", 5100).unwrap();
+    h.set_effect("replace", 5200).unwrap();
+    assert_eq!(v.world().ensured.len(), asked);
+    // The next camera start asks with the retry allowed.
+    h.activate_then_idle(6000);
+    h.activate(40_000);
+    assert_eq!(v.world().ensured.len(), asked + 1);
+    assert_eq!(v.world().retries.len(), retried + 1);
+    assert_eq!(v.world().retries.last(), Some(&clip));
+}
+
+#[test]
+fn a_copy_looked_for_shows_no_clause_and_its_transcode_step_does() {
+    use crate::media::{Codec, Container};
+    let mut h = H::new("[video]\nmemory = \"system\"\n", |_| {});
+    let v = h.videos();
+    let clip = h.video("clip.mp4", video_info(Container::Mp4, Codec::H264));
+    let poster = h.still("poster.jpg");
+    v.world().copies.insert(clip.clone(), CopyState::Checking);
+    h.set_image(&clip.display().to_string(), 0).unwrap();
+    h.set_effect("replace", 0).unwrap();
+    h.poster(&clip, Some(&poster), 10);
+    h.activate(100);
+    assert!(
+        !h.snap().warning.contains("video background"),
+        "{}",
+        h.snap().warning
+    );
+    h.copy_step(&clip, CopyState::Preparing, 500);
+    assert!(h.snap().warning.contains(PREPARING), "{}", h.snap().warning);
 }

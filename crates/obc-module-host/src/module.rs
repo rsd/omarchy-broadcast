@@ -34,8 +34,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use obc_backend::{Availability, HostBgr, StageId, StageList, StageValue, Value};
 use obc_module_abi::{
     OBC_ERR_FAILED, OBC_ERR_INVALID, OBC_ERR_PANIC, OBC_ERR_STAGE, OBC_ERR_STATE,
-    OBC_ERR_UNAVAILABLE, OBC_ERR_UNSUPPORTED, OBC_FORMAT_BGR, OBC_FRAME_HOST, OBC_OK,
-    obc_chain_request, obc_chroma_siting, obc_cuda, obc_format, obc_frame, obc_frame_kind,
+    OBC_ERR_UNAVAILABLE, OBC_ERR_UNSUPPORTED, OBC_FORMAT_BGR, OBC_FORMAT_NV12, OBC_FRAME_HOST,
+    OBC_OK, obc_chain_request, obc_chroma_siting, obc_cuda, obc_format, obc_frame, obc_frame_kind,
     obc_instance, obc_load_report, obc_matrix, obc_module, obc_param, obc_plane, obc_status,
     obc_status_value, obc_timing, obc_value,
 };
@@ -1155,6 +1155,105 @@ impl Instance {
                 })
             })
             .collect()
+    }
+
+    /// Whether the module takes a per-frame background (ABI 1.4, with the
+    /// entry set): without it, [`Instance::set_background`] refuses every
+    /// call and a video background shows as the load-time still.
+    pub fn has_live_background(&self) -> bool {
+        self.core.lib.has_live_background()
+    }
+
+    /// Hands the module the background of the following frames (ABI 1.4):
+    /// `background` is an NV12 frame of the loaded chain's output size and
+    /// kind, or `None` to return to the load-time image. A failure leaves
+    /// the previous background in force; a panic unloads the instance, as
+    /// for any call.
+    ///
+    /// Refused with [`Status::Unsupported`] by a module without the entry
+    /// (never called then), with [`Status::State`] when nothing is loaded
+    /// or the module panicked earlier, and with [`Status::Invalid`] for a
+    /// frame that is not NV12 of the loaded chain's kind and output size
+    /// (the module is not called either).
+    ///
+    /// # Safety
+    ///
+    /// `background` describes memory of its kind that is valid for the
+    /// module to read during the call; for a CUDA frame, its context is
+    /// current on the calling thread.
+    pub unsafe fn set_background(
+        &mut self,
+        background: Option<&obc_frame>,
+    ) -> Result<(), ModuleError> {
+        let Some(f) = self.core.lib.vtable().instance_set_background else {
+            return Err(ModuleError::host(
+                Status::Unsupported,
+                format!(
+                    "{} shows a video background as a still (it takes no per-frame background)",
+                    self.core.id
+                ),
+            ));
+        };
+        if let Some(reason) = &self.poisoned {
+            return Err(ModuleError::host(
+                Status::State,
+                format!("the module panicked earlier and must be loaded again: {reason}"),
+            ));
+        }
+        let Some(loaded) = self.loaded else {
+            return Err(ModuleError::host(
+                Status::State,
+                "no chain is loaded: a background came before a successful load",
+            ));
+        };
+        if let Some(frame) = background {
+            let size = (frame.width, frame.height);
+            if frame.format != OBC_FORMAT_NV12
+                || frame.kind != loaded.kind
+                || size != loaded.output_size
+            {
+                return Err(ModuleError::host(
+                    Status::Invalid,
+                    format!(
+                        "the background frame (kind {}, format {}, {}x{}) is not NV12 of the \
+                         chain's kind {} and output size {}x{}",
+                        frame.kind,
+                        frame.format,
+                        size.0,
+                        size.1,
+                        loaded.kind,
+                        loaded.output_size.0,
+                        loaded.output_size.1
+                    ),
+                ));
+            }
+        }
+        // The flags of the module's ABI version only, as for frames.
+        let frame = background.map(|f| {
+            let mut f = *f;
+            f.flags &= frame_flags_of(self.core.lib.abi_version());
+            f
+        });
+        let ptr = frame
+            .as_ref()
+            .map_or(std::ptr::null(), |f| f as *const obc_frame);
+        // SAFETY: a live instance; the frame by the caller's contract (the
+        // copy describes the same memory), alive across the call.
+        let status = unsafe { f(self.raw, ptr) };
+        if status != OBC_OK {
+            let chain = self.chain.clone();
+            let mut e = self.fail(status, "a background", &chain);
+            if e.status == Status::Stage {
+                // No stage is dropped here: the previous background stays,
+                // and the chain with it.
+                e.status = Status::Failed;
+                if let Some(stage) = e.stage.take() {
+                    e.message = format!("{stage}: {}", e.message);
+                }
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// The stream stops for a while (ADR 0017): the module may release what
