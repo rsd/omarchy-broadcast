@@ -28,7 +28,7 @@
 
 pkgname=omarchy-broadcast-onnx-git
 _pkgname=omarchy-broadcast
-pkgver=0.43.1
+pkgver=0.44.0
 pkgrel=1
 pkgdesc='Open-model cut-out (ONNX Runtime) module for omarchy-broadcast: background blur and replacement'
 arch=('x86_64')

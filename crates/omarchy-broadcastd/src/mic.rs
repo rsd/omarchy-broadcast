@@ -606,6 +606,7 @@ pub fn snapshot(config: &Config, runtime: &RuntimeState, camera_active: bool) ->
         "device": mic.device,
         "pipeline_depth": depth,
         "idle_exit_s": mic.idle_exit_s,
+        "gpu_warm_s": mic.gpu_warm_s,
         "gpu_policy": mic.gpu_policy.as_str(),
         "camera_active": camera_active,
         "profile": m.profile_or_default().as_str(),

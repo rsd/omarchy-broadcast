@@ -96,6 +96,9 @@ pub mod limits {
     pub const MAX_MIC_PIPELINE_DEPTH: u32 = 4;
     /// `mic.idle_exit_s`: 0 (never) to this many seconds, a day.
     pub const MAX_MIC_IDLE_EXIT_S: u64 = 86_400;
+    /// `mic.gpu_warm_s`: 0 (drop at once) to this many seconds, a day (the
+    /// same limit as `mic.idle_exit_s`).
+    pub const MAX_MIC_GPU_WARM_S: u64 = MAX_MIC_IDLE_EXIT_S;
     /// `mic.device`: at most this many bytes.
     pub const MAX_MIC_DEVICE_BYTES: usize = 256;
 }
@@ -501,6 +504,10 @@ pub struct MicConfig {
     pub pipeline_depth: u32,
     /// Seconds without sound before the audio worker exits; 0 never.
     pub idle_exit_s: u64,
+    /// Seconds the GPU stages stay loaded after the last application stops
+    /// recording, so that the next recording starts with them; 0 drops
+    /// them at once.
+    pub gpu_warm_s: u64,
     /// When the stages may run on a GPU.
     pub gpu_policy: MicGpuPolicy,
     /// Loads stages that their modules declare in conflict (Studio Voice
@@ -516,6 +523,7 @@ impl Default for MicConfig {
             device: MIC_DEVICE_DEFAULT.into(),
             pipeline_depth: 0,
             idle_exit_s: 30,
+            gpu_warm_s: 30,
             gpu_policy: MicGpuPolicy::Always,
             force_conflicts: false,
         }
@@ -558,6 +566,16 @@ impl MicConfig {
                     "must be 0 (never) to {}, got {}",
                     limits::MAX_MIC_IDLE_EXIT_S,
                     self.idle_exit_s
+                ),
+            ));
+        }
+        if self.gpu_warm_s > limits::MAX_MIC_GPU_WARM_S {
+            return Err((
+                "mic.gpu_warm_s",
+                format!(
+                    "must be 0 (drop at once) to {}, got {}",
+                    limits::MAX_MIC_GPU_WARM_S,
+                    self.gpu_warm_s
                 ),
             ));
         }
@@ -2286,6 +2304,7 @@ offer_nv12 = false
             "offer_nv12",
             "pipeline_depth",
             "idle_exit_s",
+            "gpu_warm_s",
             "gpu_policy",
             "force_conflicts",
         ] {
@@ -2579,6 +2598,11 @@ offer_nv12 = false
                 "mic.idle_exit_s",
                 "must be 0 (never)",
             ),
+            (
+                "[mic]\ngpu_warm_s = 100000",
+                "mic.gpu_warm_s",
+                "must be 0 (drop at once)",
+            ),
             ("[mic]\ndevice = \"  \"", "mic.device", "must not be empty"),
             (
                 "[mic]\ngpu_policy = \"sometimes\"",
@@ -2742,7 +2766,7 @@ offer_nv12 = false
     fn the_mic_section_reads_and_defaults() {
         let c = parse(
             "[mic]\nenabled = false\ndevice = \"alsa_input.usb-x\"\npipeline_depth = 3\n\
-             idle_exit_s = 0\ngpu_policy = \"with-camera\"\nforce_conflicts = true",
+             idle_exit_s = 0\ngpu_warm_s = 5\ngpu_policy = \"with-camera\"\nforce_conflicts = true",
         )
         .unwrap();
         assert_eq!(
@@ -2752,6 +2776,7 @@ offer_nv12 = false
                 device: "alsa_input.usb-x".into(),
                 pipeline_depth: 3,
                 idle_exit_s: 0,
+                gpu_warm_s: 5,
                 gpu_policy: MicGpuPolicy::WithCamera,
                 force_conflicts: true,
             }
@@ -2760,7 +2785,7 @@ offer_nv12 = false
         let d = Config::default().mic;
         assert!(d.enabled);
         assert_eq!(d.device, MIC_DEVICE_DEFAULT);
-        assert_eq!((d.pipeline_depth, d.idle_exit_s), (0, 30));
+        assert_eq!((d.pipeline_depth, d.idle_exit_s, d.gpu_warm_s), (0, 30, 30));
         assert_eq!(d.gpu_policy, MicGpuPolicy::Always);
         assert!(!d.force_conflicts);
         // Spelled out with the other sections, and read back the same.

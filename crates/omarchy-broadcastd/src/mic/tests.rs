@@ -414,7 +414,7 @@ fn the_snapshot_carries_the_config_values_pins_and_disabled_modules() {
         json!({
             "version": 1, "enabled": true, "device": "default",
             "pipeline_depth": {"cpu": 1, "gpu": 2}, "idle_exit_s": 30,
-            "gpu_policy": "always", "camera_active": false, "profile": "quality",
+            "gpu_warm_s": 30, "gpu_policy": "always", "camera_active": false, "profile": "quality",
             "pins": {}, "values": {}, "disabled_modules": [], "forced_conflicts": false,
         })
     );
@@ -427,6 +427,7 @@ fn the_snapshot_carries_the_config_values_pins_and_disabled_modules() {
     config.mic.device = "alsa_input.usb-a".into();
     config.mic.pipeline_depth = 3;
     config.mic.idle_exit_s = 0;
+    config.mic.gpu_warm_s = 0;
     config.mic.gpu_policy = MicGpuPolicy::WithCamera;
     config
         .modules
@@ -454,6 +455,7 @@ fn the_snapshot_carries_the_config_values_pins_and_disabled_modules() {
     assert_eq!(d["device"], json!("alsa_input.usb-a"));
     assert_eq!(d["pipeline_depth"], json!(3));
     assert_eq!(d["idle_exit_s"], json!(0));
+    assert_eq!(d["gpu_warm_s"], json!(0));
     assert_eq!(d["gpu_policy"], json!("with-camera"));
     assert_eq!(d["camera_active"], json!(true));
     assert_eq!(d["pins"], json!({"mic-denoise": "br.com.dias.voice-cpu"}));

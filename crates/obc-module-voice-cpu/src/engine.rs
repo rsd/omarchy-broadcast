@@ -38,8 +38,9 @@ pub const DF_DITHER: f32 = 1e-3;
 pub const DF_QUIET_MEAN_SQUARE: f32 = 2e-7;
 
 /// libDF's own silence threshold: a block whose mean square is under this
-/// gets zeros from it (the output of such a block is gated to zeros here
-/// too, see [`DeepFilter`]).
+/// gets zeros from it. Quiet is not silence, so here such an output block
+/// is not zeros: it is the input it is aligned with, passed through at the
+/// delay (see [`DeepFilter`]).
 pub const DF_SILENCE_MEAN_SQUARE: f32 = 1e-7;
 /// The blocks of the input that decide the gate of an output block: the one
 /// it is aligned with (that many blocks back, as the delay) and the one
@@ -128,7 +129,9 @@ struct Models {
 // the state a reset restores (the STFT and model state) is cloned apart.
 unsafe impl Send for Models {}
 
-/// DeepFilterNet 3, one mono stream.
+/// DeepFilterNet 3, one mono stream. Its output is [`Engine::latency_samples`]
+/// late; quiet input (under [`DF_SILENCE_MEAN_SQUARE`]) is passed through at
+/// that same delay rather than zeroed, so no signal turns into silence.
 pub struct DeepFilter {
     models: Models,
     strength: u8,
@@ -137,6 +140,13 @@ pub struct DeepFilter {
     /// Whether each of the last [`DF_SILENT_BLOCKS`] input blocks (the
     /// current one last) was under libDF's silence threshold.
     silent: [bool; DF_SILENT_BLOCKS],
+    /// The raw (un-dithered) input of the last [`DF_DELAY_BLOCKS`] blocks,
+    /// the oldest first: the oldest is the block the next output is aligned
+    /// with. Zeros before any input.
+    delayed: [[f32; HOP]; DF_DELAY_BLOCKS],
+    /// The slot of the oldest block in `delayed` (a ring: the next input
+    /// overwrites it).
+    delayed_oldest: usize,
 }
 
 impl DeepFilter {
@@ -169,6 +179,8 @@ impl DeepFilter {
             latency,
             quiet,
             silent: [true; DF_SILENT_BLOCKS],
+            delayed: [[0.0; HOP]; DF_DELAY_BLOCKS],
+            delayed_oldest: 0,
         })
     }
 
@@ -199,14 +211,19 @@ impl DeepFilter {
         self.models.model = self.models.fresh.clone();
         self.models.model.set_atten_lim(df_atten_db(self.strength));
         self.silent = [true; DF_SILENT_BLOCKS];
+        self.delayed = [[0.0; HOP]; DF_DELAY_BLOCKS];
+        self.delayed_oldest = 0;
     }
 
     fn process(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), String> {
+        let raw = input;
         let mean_square = input.iter().map(|x| x * x).sum::<f32>() / HOP as f32;
         // The delay is exactly DF_DELAY_BLOCKS blocks: the output block is
         // the input block of that many blocks ago, so it is built from the
-        // aligned block and the one before it. When every one of them was
-        // digital silence, the output is the dither's residue only: zeros.
+        // aligned block and the one before it. When both were under libDF's
+        // silence threshold, the output is the dither's residue, not the
+        // sound: the aligned input block itself comes out instead, at the
+        // same delay (exact zeros only where it was exact zeros).
         self.silent.rotate_left(1);
         self.silent[DF_SILENT_BLOCKS - 1] = mean_square < DF_SILENCE_MEAN_SQUARE;
         let mut dithered = [0.0f32; HOP];
@@ -227,8 +244,10 @@ impl DeepFilter {
             .map_err(|e| format!("DeepFilterNet: {e:#}"))?;
         // `silent[..2]` are the aligned block and the one before it.
         if self.silent[..DF_GATE_BLOCKS].iter().all(|s| *s) {
-            output.fill(0.0);
+            output.copy_from_slice(&self.delayed[self.delayed_oldest]);
         }
+        self.delayed[self.delayed_oldest].copy_from_slice(raw);
+        self.delayed_oldest = (self.delayed_oldest + 1) % DF_DELAY_BLOCKS;
         Ok(())
     }
 }
@@ -394,5 +413,141 @@ mod tests {
         }
         assert_eq!(EngineKind::from_id("speex"), None);
         assert_eq!(EngineKind::default(), EngineKind::DeepFilterNet);
+    }
+
+    /// Deterministic noise in [-1, 1).
+    fn noise(seed: &mut u32) -> f32 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 17;
+        *seed ^= *seed << 5;
+        (*seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+    }
+
+    fn db_gain(db: f32) -> f32 {
+        10f32.powf(db / 20.0)
+    }
+
+    fn run(df: &mut Engine, input: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        input
+            .iter()
+            .map(|b| {
+                let mut o = vec![0.0; HOP];
+                df.process(b, &mut o).unwrap();
+                o
+            })
+            .collect()
+    }
+
+    fn block(level_db: Option<f32>, seed: &mut u32) -> Vec<f32> {
+        match level_db {
+            None => vec![0.0; HOP],
+            Some(db) => (0..HOP).map(|_| noise(seed) * db_gain(db)).collect(),
+        }
+    }
+
+    /// No output block after the delay is all zeros unless its aligned input
+    /// was; a gated (quiet) one equals the aligned input.
+    fn check_pass_through(input: &[Vec<f32>], out: &[Vec<f32>]) {
+        for n in DF_DELAY_BLOCKS..input.len() {
+            let aligned = &input[n - DF_DELAY_BLOCKS];
+            let zero_in = aligned.iter().all(|x| *x == 0.0);
+            let zero_out = out[n].iter().all(|x| *x == 0.0);
+            assert!(!zero_out || zero_in, "block {n}: zeros out of signal");
+            let ms = |b: &[f32]| b.iter().map(|x| x * x).sum::<f32>() / HOP as f32;
+            let silent_before = n == DF_DELAY_BLOCKS
+                || ms(&input[n - DF_DELAY_BLOCKS - 1]) < DF_SILENCE_MEAN_SQUARE;
+            if silent_before && ms(aligned) < DF_SILENCE_MEAN_SQUARE {
+                assert_eq!(&out[n], aligned, "block {n}: quiet not passed through");
+            }
+        }
+        // The first blocks are the delay itself: zeros.
+        for o in &out[..DF_DELAY_BLOCKS] {
+            assert!(o.iter().all(|x| *x == 0.0));
+        }
+    }
+
+    #[test]
+    fn a_quiet_start_ramping_up_is_never_zeroed() {
+        let mut df = Engine::new(EngineKind::DeepFilterNet, 100).unwrap();
+        let mut seed = 12345;
+        let mut input = vec![block(None, &mut seed); 2];
+        for i in 0..20 {
+            input.push(block(Some(-160.0 + 100.0 * i as f32 / 19.0), &mut seed));
+        }
+        for _ in 0..30 {
+            input.push(block(Some(-30.0), &mut seed));
+        }
+        let out = run(&mut df, &input);
+        check_pass_through(&input, &out);
+        // The boundary: at the first model-processed block after the quiet
+        // run, the step from the last passed-through sample stays within
+        // about twice the quiet input's peak.
+        let peak = |b: &[f32]| b.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let ms = |b: &[f32]| b.iter().map(|x| x * x).sum::<f32>() / HOP as f32;
+        let gated = |n: usize| {
+            ms(&input[n - DF_DELAY_BLOCKS]) < DF_SILENCE_MEAN_SQUARE
+                && (n == DF_DELAY_BLOCKS
+                    || ms(&input[n - DF_DELAY_BLOCKS - 1]) < DF_SILENCE_MEAN_SQUARE)
+        };
+        let mut checked = false;
+        for n in DF_DELAY_BLOCKS + 1..input.len() {
+            if gated(n - 1) && !gated(n) {
+                let step = (out[n][0] - out[n - 1][HOP - 1]).abs();
+                let limit = 2.0 * peak(&input[n - 1 - DF_DELAY_BLOCKS]);
+                eprintln!("boundary block {n}: step {step:e}, limit {limit:e}");
+                assert!(step <= limit, "block {n}: step {step:e} > {limit:e}");
+                checked = true;
+            }
+        }
+        assert!(checked, "no quiet-to-model transition seen");
+    }
+
+    #[test]
+    fn a_mid_stream_quiet_pause_is_passed_through() {
+        let mut df = Engine::new(EngineKind::DeepFilterNet, 100).unwrap();
+        let mut seed = 99;
+        let mut input = Vec::new();
+        for _ in 0..20 {
+            input.push(block(Some(-30.0), &mut seed));
+        }
+        for _ in 0..25 {
+            input.push(block(Some(-90.0), &mut seed));
+        }
+        for _ in 0..20 {
+            input.push(block(Some(-30.0), &mut seed));
+        }
+        let out = run(&mut df, &input);
+        check_pass_through(&input, &out);
+    }
+
+    #[test]
+    fn the_delay_of_quiet_input_is_the_latency() {
+        let mut df = Engine::new(EngineKind::DeepFilterNet, 100).unwrap();
+        let latency = df.latency_samples() as usize;
+        assert_eq!(latency, DF_DELAY_BLOCKS * HOP);
+        let mut input = vec![vec![0.0f32; HOP]; 20];
+        input[8][100] = 1e-4; // a marker well under -70 dBFS mean square
+        let out = run(&mut df, &input);
+        let flat: Vec<f32> = out.concat();
+        let at = 8 * HOP + 100 + latency;
+        assert_eq!(flat[at], 1e-4);
+        assert_eq!(flat.iter().filter(|x| **x != 0.0).count(), 1);
+    }
+
+    #[test]
+    fn reset_restarts_the_delay_line() {
+        let mut df = Engine::new(EngineKind::DeepFilterNet, 100).unwrap();
+        let mut seed = 7;
+        let loud: Vec<_> = (0..10).map(|_| block(Some(-20.0), &mut seed)).collect();
+        run(&mut df, &loud);
+        df.reset();
+        let mut quiet = vec![block(Some(-100.0), &mut seed); 8];
+        quiet[0][0] = 1e-4;
+        let out = run(&mut df, &quiet);
+        // The old loud blocks do not come out; the delay starts again.
+        for o in &out[..DF_DELAY_BLOCKS] {
+            assert!(o.iter().all(|x| *x == 0.0));
+        }
+        assert_eq!(out[DF_DELAY_BLOCKS][0], 1e-4);
     }
 }

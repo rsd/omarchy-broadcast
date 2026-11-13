@@ -3,10 +3,17 @@
 
 mod common;
 
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use common::{Env, FIXTURE_ID, Out, Plugin, PrivateBus};
 use obc_audio::proto::RefuseReason;
+use omarchy_broadcast_audiod::engine::{Engine, Exit, Shared};
+use omarchy_broadcast_audiod::host::{GpuGate, Host};
+use omarchy_broadcast_audiod::listener;
+use omarchy_broadcast_audiod::pipewire::{Consumers, PipeWireControl, PipeWireError, SourceDevice};
+use omarchy_broadcast_audiod::snapshot::Snapshot;
 use serde_json::json;
 
 const SEC: Duration = Duration::from_secs(1);
@@ -902,4 +909,555 @@ fn the_state_is_passthrough_while_no_plugin_is_connected() {
         }
     }
     assert!(off, "{}", bus.status());
+}
+
+// ---- the warm grace: the engine in process, with fake consumers ----
+
+/// What [`FakePipeWire`] reports: the consumers, and whether they are
+/// pending (PipeWire connected, its graph not synced yet).
+type FakeConsumers = Arc<Mutex<(Option<Consumers>, bool)>>;
+
+/// A PipeWire whose consumers the test sets.
+struct FakePipeWire(FakeConsumers);
+
+impl PipeWireControl for FakePipeWire {
+    fn devices(&self) -> Result<Vec<SourceDevice>, PipeWireError> {
+        Err(PipeWireError::Unavailable("fake".into()))
+    }
+
+    fn make_default(&self, _target: &str) -> Result<String, PipeWireError> {
+        Err(PipeWireError::Unavailable("fake".into()))
+    }
+
+    fn restore_default(&self, _previous: &str) -> Result<(), PipeWireError> {
+        Err(PipeWireError::Unavailable("fake".into()))
+    }
+
+    fn consumers(&self) -> Option<Consumers> {
+        self.0.lock().unwrap().0
+    }
+
+    fn consumers_pending(&self) -> bool {
+        self.0.lock().unwrap().1
+    }
+}
+
+fn consumers_of(real: Option<u32>) -> Option<Consumers> {
+    real.map(|real| Consumers { real, monitors: 0 })
+}
+
+/// The engine run in this process over the GPU fixture and the example
+/// module (see [`gpu_fixture_and_hello`]), its consumers set by the test.
+struct InProcess {
+    shared: Arc<Shared>,
+    consumers: FakeConsumers,
+    /// The modules' log lines.
+    lines: Arc<Mutex<Vec<String>>>,
+    engine: Option<std::thread::JoinHandle<Exit>>,
+    socket: std::path::PathBuf,
+    started: Instant,
+    _env: Env,
+}
+
+impl Drop for InProcess {
+    fn drop(&mut self) {
+        self.shared.shutdown.store(true, Ordering::SeqCst);
+        if let Some(e) = self.engine.take() {
+            let _ = e.join();
+        }
+    }
+}
+
+/// The snapshot of the warm tests: every stage on, `gpu_warm_s` as given;
+/// `values` in `extra` are set over those.
+fn warm_snapshot(extra: serde_json::Value) -> Snapshot {
+    let mut values = json!({ "mic.fixture.gain": 100, "mic.hello.enabled": true });
+    if let Some(v) = extra.get("values").and_then(|v| v.as_object()) {
+        for (k, x) in v {
+            values[k] = x.clone();
+        }
+    }
+    let mut s = fixture_snapshot(100, extra);
+    s["values"] = values;
+    Snapshot::parse(&s.to_string()).unwrap()
+}
+
+impl InProcess {
+    /// Starts it with `real` recorders (`None`: unknown), `pending` or not.
+    fn start(snapshot: Snapshot, (real, pending): (Option<u32>, bool)) -> InProcess {
+        let mut env = Env::new();
+        gpu_fixture_and_hello(&mut env);
+        let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink: obc_module_host::LogSink = {
+            let lines = lines.clone();
+            Arc::new(move |_, _, msg| lines.lock().unwrap().push(msg.to_string()))
+        };
+        let host = Host::load(
+            obc_core::config::Config::default(),
+            std::slice::from_ref(&env.modules),
+            Some(&env.ledger_path()),
+            &snapshot,
+            sink,
+        );
+        let consumers: FakeConsumers = Arc::new(Mutex::new((consumers_of(real), pending)));
+        let shared = Arc::new(Shared::new(
+            host,
+            snapshot,
+            Box::new(FakePipeWire(consumers.clone())),
+        ));
+        let socket = env.sockets.path().join("in-process.sock");
+        let engine = Engine::new(shared.clone(), listener::bind(&socket).unwrap());
+        let engine = std::thread::spawn(move || engine.run());
+        InProcess {
+            shared,
+            consumers,
+            lines,
+            engine: Some(engine),
+            socket,
+            started: Instant::now(),
+            _env: env,
+        }
+    }
+
+    fn set_consumers(&self, real: Option<u32>, pending: bool) {
+        *self.consumers.lock().unwrap() = (consumers_of(real), pending);
+    }
+
+    fn gate(&self) -> GpuGate {
+        *self.shared.gpu_gate.lock().unwrap()
+    }
+
+    /// The module planned for `mic-denoise` (the GPU fixture's only).
+    fn denoise_provider(&self) -> Option<String> {
+        self.shared
+            .status
+            .borrow()
+            .stages
+            .iter()
+            .find(|s| s.id == "mic-denoise")
+            .and_then(|s| s.provider.clone())
+    }
+
+    /// Loads of the GPU chain (the fixture's three stages together).
+    fn gpu_loads(&self) -> usize {
+        self.lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with("fixture-audio-load stages=mic-dereverb,mic-denoise"))
+            .count()
+    }
+
+    /// Loads of any chain of the GPU fixture.
+    fn fixture_loads(&self) -> usize {
+        self.lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with("fixture-audio-load "))
+            .count()
+    }
+
+    /// Runs the plugin (connected or not) until `cond`, at most `timeout`.
+    fn run_until(&self, p: &mut Plugin, timeout: Duration, cond: impl Fn(&Self) -> bool) -> bool {
+        let end = Instant::now() + timeout;
+        while !cond(self) {
+            if Instant::now() > end {
+                return false;
+            }
+            p.run(Duration::from_millis(20));
+        }
+        true
+    }
+
+    /// A recorder: connects the plugin and runs until the GPU chain
+    /// processes.
+    fn record(&self, p: &mut Plugin) {
+        self.set_consumers(Some(1), false);
+        p.connect(5 * SEC).unwrap();
+        assert!(
+            self.run_until(p, 5 * SEC, |s| s.gpu_loads() == 1
+                && s.denoise_provider().as_deref() == Some(FIXTURE_ID)),
+            "the GPU chain did not load: {:?}",
+            self.lines.lock().unwrap()
+        );
+        assert!(p.run_until(5 * SEC, |o| processed(o).len() >= 5));
+        assert_eq!(self.gate(), GpuGate::Allowed);
+    }
+
+    /// Whether the engine has exited (when it did).
+    fn wait_exit(&mut self, timeout: Duration) -> Option<(Exit, Duration)> {
+        let end = Instant::now() + timeout;
+        while !self.engine.as_ref().unwrap().is_finished() {
+            if Instant::now() > end {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let at = self.started.elapsed();
+        Some((self.engine.take().unwrap().join().unwrap(), at))
+    }
+}
+
+/// The last recorder leaves: the GPU plan stays for `gpu_warm_s`, and a
+/// recorder back within it finds the chain loaded (no reload); after it the
+/// plan goes to the CPU.
+#[test]
+fn the_gpu_chain_stays_warm_for_the_grace_after_the_last_recorder() {
+    let w = InProcess::start(warm_snapshot(json!({ "gpu_warm_s": 3 })), (Some(0), false));
+    let mut p = Plugin::new(&w.socket);
+    // Nobody records yet: CPU.
+    assert_eq!(w.gate(), GpuGate::NoRecorder);
+    w.record(&mut p);
+
+    // Well inside the grace, even on a slow machine.
+    w.set_consumers(Some(0), false);
+    p.run(Duration::from_millis(500));
+    assert_eq!(w.gate(), GpuGate::Allowed, "held within the grace");
+    assert_eq!(w.denoise_provider().as_deref(), Some(FIXTURE_ID));
+
+    // Back within the grace: the same chain goes on.
+    w.set_consumers(Some(1), false);
+    let n = p.out.len();
+    assert!(p.run_until(5 * SEC, |o| processed(&o[n..]).len() >= 20));
+    assert_eq!(w.gpu_loads(), 1, "reloaded: {:?}", w.lines.lock().unwrap());
+    assert!(p.out[n..].iter().all(|o| !o.raw()), "a raw block");
+
+    // Gone again: CPU after the grace, counted from the moment it left.
+    w.set_consumers(Some(0), false);
+    let left = Instant::now();
+    assert!(w.run_until(&mut p, 5 * SEC, |s| s.gate() == GpuGate::NoRecorder));
+    let held = left.elapsed();
+    assert!(held >= Duration::from_millis(2900), "held {held:?}");
+    assert!(w.run_until(&mut p, 2 * SEC, |s| s.denoise_provider().is_none()));
+    p.assert_in_order();
+}
+
+/// `gpu_warm_s = 0`: the GPU plan goes at once (as before the grace); a
+/// worker that never served a recorder is never warm.
+#[test]
+fn no_grace_at_zero_or_without_a_recorder() {
+    let w = InProcess::start(warm_snapshot(json!({ "gpu_warm_s": 0 })), (Some(0), false));
+    let mut p = Plugin::new(&w.socket);
+    w.record(&mut p);
+    w.set_consumers(Some(0), false);
+    assert!(w.run_until(&mut p, SEC, |s| s.gate() == GpuGate::NoRecorder));
+
+    let w = InProcess::start(warm_snapshot(json!({ "gpu_warm_s": 30 })), (None, true));
+    let mut p = Plugin::new(&w.socket);
+    p.connect(5 * SEC).unwrap();
+    p.run(Duration::from_millis(300));
+    assert_eq!(w.gate(), GpuGate::Pending);
+    w.set_consumers(Some(0), false);
+    assert!(w.run_until(&mut p, SEC, |s| s.gate() == GpuGate::NoRecorder));
+    p.run(Duration::from_millis(300));
+    assert_eq!(w.gpu_loads(), 0);
+}
+
+/// The policy closes the GPU at once, also within the grace.
+#[test]
+fn the_gpu_policy_closes_at_once_within_the_grace() {
+    for (policy, want) in [
+        (json!({ "gpu_policy": "never" }), GpuGate::Never),
+        (
+            json!({ "gpu_policy": "with-camera", "camera_active": false }),
+            GpuGate::CameraOff,
+        ),
+    ] {
+        let w = InProcess::start(warm_snapshot(json!({ "gpu_warm_s": 30 })), (Some(0), false));
+        let mut p = Plugin::new(&w.socket);
+        w.record(&mut p);
+        w.set_consumers(Some(0), false);
+        p.run(Duration::from_millis(500));
+        assert_eq!(w.gate(), GpuGate::Allowed, "held");
+        let mut extra = policy.clone();
+        extra["gpu_warm_s"] = json!(30);
+        w.shared.apply_snapshot(warm_snapshot(extra));
+        assert!(
+            w.run_until(&mut p, SEC, |s| s.gate() == want),
+            "{policy}: {:?}",
+            w.gate()
+        );
+        assert!(w.run_until(&mut p, 2 * SEC, |s| s.denoise_provider().is_none()));
+    }
+}
+
+/// The gate open only because the consumers were not known (no PipeWire)
+/// is not a recorder: when PipeWire reports none, the GPU plan goes at
+/// once.
+#[test]
+fn unknown_consumers_are_not_a_recorder() {
+    let w = InProcess::start(warm_snapshot(json!({ "gpu_warm_s": 30 })), (None, false));
+    let mut p = Plugin::new(&w.socket);
+    p.connect(5 * SEC).unwrap();
+    assert!(
+        w.run_until(&mut p, 5 * SEC, |s| s.gpu_loads() == 1
+            && s.denoise_provider().as_deref() == Some(FIXTURE_ID)),
+        "the GPU chain did not load: {:?}",
+        w.lines.lock().unwrap()
+    );
+    assert_eq!(w.gate(), GpuGate::Allowed);
+    w.set_consumers(Some(0), false);
+    assert!(w.run_until(&mut p, SEC, |s| s.gate() == GpuGate::NoRecorder));
+    assert!(w.run_until(&mut p, 2 * SEC, |s| s.denoise_provider().is_none()));
+}
+
+/// A change of what the chain loads (here a stage off) within the grace
+/// ends it at once: no new GPU chain loads while nobody records.
+#[test]
+fn a_load_change_within_the_grace_ends_it() {
+    let w = InProcess::start(warm_snapshot(json!({ "gpu_warm_s": 30 })), (Some(0), false));
+    let mut p = Plugin::new(&w.socket);
+    w.record(&mut p);
+    w.set_consumers(Some(0), false);
+    p.run(Duration::from_millis(300));
+    assert_eq!(w.gate(), GpuGate::Allowed, "held");
+    w.shared.apply_snapshot(warm_snapshot(json!({
+        "gpu_warm_s": 30,
+        "values": { "mic.fixture.denoise": false },
+    })));
+    assert!(
+        w.run_until(&mut p, SEC, |s| s.gate() == GpuGate::NoRecorder),
+        "{:?}",
+        w.gate()
+    );
+    p.run(Duration::from_millis(500));
+    assert_eq!(w.gate(), GpuGate::NoRecorder);
+    assert_eq!(
+        w.fixture_loads(),
+        1,
+        "a GPU chain loaded: {:?}",
+        w.lines.lock().unwrap()
+    );
+}
+
+/// A change of live parameters within the grace keeps it: the same chain,
+/// no reload.
+#[test]
+fn a_live_change_within_the_grace_keeps_it() {
+    let w = InProcess::start(warm_snapshot(json!({ "gpu_warm_s": 30 })), (Some(0), false));
+    let mut p = Plugin::new(&w.socket);
+    w.record(&mut p);
+    w.set_consumers(Some(0), false);
+    p.run(Duration::from_millis(300));
+    w.shared.apply_snapshot(warm_snapshot(json!({
+        "gpu_warm_s": 30,
+        "values": { "mic.fixture.gain": 200 },
+    })));
+    p.run(Duration::from_millis(500));
+    assert_eq!(w.gate(), GpuGate::Allowed, "held");
+    assert_eq!(w.denoise_provider().as_deref(), Some(FIXTURE_ID));
+    assert_eq!(
+        w.fixture_loads(),
+        1,
+        "reloaded: {:?}",
+        w.lines.lock().unwrap()
+    );
+}
+
+/// A change of the policy within the grace ends it, also to one that
+/// still allows the GPU (`with-camera` with the camera on).
+#[test]
+fn a_policy_change_within_the_grace_ends_it() {
+    let w = InProcess::start(warm_snapshot(json!({ "gpu_warm_s": 30 })), (Some(0), false));
+    let mut p = Plugin::new(&w.socket);
+    w.record(&mut p);
+    w.set_consumers(Some(0), false);
+    p.run(Duration::from_millis(300));
+    assert_eq!(w.gate(), GpuGate::Allowed, "held");
+    w.shared.apply_snapshot(warm_snapshot(json!({
+        "gpu_warm_s": 30,
+        "gpu_policy": "with-camera",
+        "camera_active": true,
+    })));
+    assert!(
+        w.run_until(&mut p, SEC, |s| s.gate() == GpuGate::NoRecorder),
+        "{:?}",
+        w.gate()
+    );
+    assert!(w.run_until(&mut p, 2 * SEC, |s| s.denoise_provider().is_none()));
+}
+
+/// The plugin disconnects and connects again within the grace, PipeWire's
+/// graph not known for a while (pending): the warm chain stays and serves
+/// the next recorder without a reload.
+#[test]
+fn a_reconnect_within_the_grace_keeps_the_warm_chain() {
+    let w = InProcess::start(warm_snapshot(json!({ "gpu_warm_s": 30 })), (Some(0), false));
+    let mut p = Plugin::new(&w.socket);
+    w.record(&mut p);
+    w.set_consumers(Some(0), false);
+    p.run(Duration::from_millis(300));
+    p.disconnect();
+    w.set_consumers(None, true);
+    p.run(Duration::from_millis(500));
+    assert_eq!(w.gate(), GpuGate::Allowed, "held while pending");
+    p.connect(5 * SEC).unwrap();
+    p.run(Duration::from_millis(300));
+    assert_eq!(w.gate(), GpuGate::Allowed);
+    w.set_consumers(Some(1), false);
+    let n = p.out.len();
+    assert!(p.run_until(5 * SEC, |o| processed(&o[n..]).len() >= 20));
+    assert_eq!(w.gpu_loads(), 1, "reloaded: {:?}", w.lines.lock().unwrap());
+    assert_eq!(w.denoise_provider().as_deref(), Some(FIXTURE_ID));
+}
+
+/// The idle exit waits for the end of the grace (the later of the two).
+#[test]
+fn the_idle_exit_waits_for_the_grace() {
+    let mut w = InProcess::start(
+        warm_snapshot(json!({ "gpu_warm_s": 3, "idle_exit_s": 1 })),
+        (Some(0), false),
+    );
+    let mut p = Plugin::new(&w.socket);
+    w.record(&mut p);
+    w.set_consumers(Some(0), false);
+    let left = w.started.elapsed();
+    p.disconnect();
+    let (exit, at) = w.wait_exit(10 * SEC).expect("the worker did not exit");
+    assert_eq!(exit, Exit::Idle);
+    let after = at - left;
+    assert!(
+        after >= Duration::from_millis(2900) && after < Duration::from_secs(6),
+        "exited {after:?} after the recorder left"
+    );
+}
+
+/// A stand-in for the video daemon: every `StatusChanged` is answered at
+/// once with calls (it asks for the modules and the settings), which are
+/// activity for the idle exit. Records when each change came.
+struct Daemon {
+    changes: Arc<Mutex<Vec<Instant>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Daemon {
+    fn start(shared: &Arc<Shared>) -> Daemon {
+        let changes: Arc<Mutex<Vec<Instant>>> = Arc::default();
+        let stop: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let thread = {
+            let (shared, changes, stop) = (shared.clone(), changes.clone(), stop.clone());
+            let mut rx = shared.status.subscribe();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) && !shared.shutdown.load(Ordering::SeqCst) {
+                    if rx.has_changed().unwrap_or(false) {
+                        rx.borrow_and_update();
+                        changes.lock().unwrap().push(Instant::now());
+                        drop(shared.call());
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+        Daemon {
+            changes,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// The status changes since `t`.
+    fn changes_since(&self, t: Instant) -> usize {
+        self.changes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| **c >= t)
+            .count()
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The grace ends while no plugin is connected (the recorder stopped, then
+/// the plugin left): the plan and the chain stay as they are, with no load
+/// and no status change, so that the daemon's answer to one does not put
+/// the idle exit off. The worker exits at the later of the last activity
+/// plus `idle_exit_s` and the grace's end, also when the grace outlasts
+/// the idle clock.
+#[test]
+fn a_grace_ending_with_no_plugin_changes_nothing_and_the_idle_exit_is_not_put_off() {
+    // (gpu_warm_s, idle_exit_s, the plugin leaves after the recorder, ms)
+    for (warm, idle, plays) in [(3u64, 2u64, 1500u64), (3, 1, 0)] {
+        let mut w = InProcess::start(
+            warm_snapshot(json!({ "gpu_warm_s": warm, "idle_exit_s": idle })),
+            (Some(0), false),
+        );
+        let daemon = Daemon::start(&w.shared);
+        let mut p = Plugin::new(&w.socket);
+        w.record(&mut p);
+        w.set_consumers(Some(0), false);
+        let left = Instant::now();
+        p.run(Duration::from_millis(plays));
+        p.disconnect();
+        let last_input = Instant::now();
+        let grace_end = left + Duration::from_secs(warm);
+        let want = (last_input + Duration::from_secs(idle)).max(grace_end);
+        let (exit, _) = w.wait_exit(15 * SEC).expect("the worker did not exit");
+        let at = Instant::now();
+        assert_eq!(exit, Exit::Idle);
+        let late = at.saturating_duration_since(want);
+        assert!(
+            at + Duration::from_millis(100) >= want && late < Duration::from_millis(700),
+            "warm {warm} s, idle {idle} s: exited {:?} after the recorder left, wanted {:?}",
+            at - left,
+            want - left
+        );
+        assert_eq!(
+            daemon.changes_since(grace_end - Duration::from_millis(100)),
+            0,
+            "a status change at the grace's end"
+        );
+        assert_eq!(w.gate(), GpuGate::Allowed, "replanned at the grace's end");
+        assert_eq!(w.denoise_provider().as_deref(), Some(FIXTURE_ID));
+        assert_eq!(
+            w.fixture_loads(),
+            1,
+            "a chain loaded: {:?}",
+            w.lines.lock().unwrap()
+        );
+    }
+}
+
+/// After a grace that ended with no plugin connected, the next connection
+/// decides the gate afresh: a level meter gets the CPU plan; a recorder
+/// gets the GPU chain still loaded, with no reload.
+#[test]
+fn a_connection_after_a_grace_ended_with_no_plugin_decides_afresh() {
+    for recorder in [false, true] {
+        let w = InProcess::start(warm_snapshot(json!({ "gpu_warm_s": 1 })), (Some(0), false));
+        let mut p = Plugin::new(&w.socket);
+        w.record(&mut p);
+        w.set_consumers(Some(0), false);
+        p.disconnect();
+        // Well past the grace.
+        p.run(Duration::from_millis(1800));
+        assert_eq!(w.gate(), GpuGate::Allowed, "held after the grace");
+        assert_eq!(w.denoise_provider().as_deref(), Some(FIXTURE_ID));
+
+        w.set_consumers(Some(u32::from(recorder)), false);
+        p.connect(5 * SEC).unwrap();
+        if recorder {
+            let n = p.out.len();
+            assert!(p.run_until(5 * SEC, |o| processed(&o[n..]).len() >= 20));
+            assert_eq!(w.gate(), GpuGate::Allowed);
+            assert_eq!(w.denoise_provider().as_deref(), Some(FIXTURE_ID));
+            assert_eq!(w.gpu_loads(), 1, "reloaded: {:?}", w.lines.lock().unwrap());
+        } else {
+            assert!(
+                w.run_until(&mut p, SEC, |s| s.gate() == GpuGate::NoRecorder),
+                "a level meter kept the GPU plan: {:?}",
+                w.gate()
+            );
+            assert!(w.run_until(&mut p, 2 * SEC, |s| s.denoise_provider().is_none()));
+        }
+    }
 }

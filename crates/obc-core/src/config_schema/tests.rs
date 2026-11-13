@@ -150,6 +150,7 @@ fn the_editable_and_apply_table_is_the_decided_one() {
             "mic.device",
             "mic.pipeline_depth",
             "mic.idle_exit_s",
+            "mic.gpu_warm_s",
             "mic.gpu_policy",
             "modules.profile",
         ]
@@ -170,6 +171,7 @@ fn the_editable_and_apply_table_is_the_decided_one() {
                 "mic.enabled",
                 "mic.device",
                 "mic.idle_exit_s",
+                "mic.gpu_warm_s",
                 "mic.force_conflicts",
             ]
             .contains(&k.key);
@@ -589,6 +591,7 @@ fn the_mic_rows_carry_their_values_and_take_writes() {
             "mic.device",
             "mic.pipeline_depth",
             "mic.idle_exit_s",
+            "mic.gpu_warm_s",
             "mic.gpu_policy",
             "mic.force_conflicts"
         ]
@@ -603,6 +606,7 @@ fn the_mic_rows_carry_their_values_and_take_writes() {
         ConfigValue::Str("default".into())
     );
     assert_eq!(find(&groups, "mic.idle_exit_s").value, ConfigValue::Int(30));
+    assert_eq!(find(&groups, "mic.gpu_warm_s").value, ConfigValue::Int(30));
     assert_eq!(
         find(&groups, "mic.force_conflicts").value,
         ConfigValue::Bool(false)

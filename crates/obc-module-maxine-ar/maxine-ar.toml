@@ -4,7 +4,7 @@
 abi = 1
 id = "br.com.dias.maxine-ar"
 name = "NVIDIA Maxine AR effects"
-version = "0.43.1"
+version = "0.44.0"
 licence = "MIT OR Apache-2.0 (module); NVIDIA Maxine SDK under its own licence"
 kind = "video-stage"
 library = "/usr/lib/omarchy-broadcast/modules/libobc_module_maxine_ar.so"
