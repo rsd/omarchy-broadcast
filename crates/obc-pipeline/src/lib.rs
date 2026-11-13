@@ -52,6 +52,7 @@
 
 pub mod capability;
 pub mod clock;
+pub mod colour_range;
 pub mod control_node;
 pub mod controls;
 pub mod ctrl_events;
@@ -59,6 +60,7 @@ pub mod device;
 pub mod discovery;
 pub mod effect;
 pub mod frame;
+pub mod frame_guard;
 pub mod geometry;
 pub mod gpu;
 pub mod ingest;
@@ -73,6 +75,7 @@ pub mod pipeline;
 pub mod pipewire;
 pub mod preview;
 pub mod process;
+pub mod quirks;
 pub mod session;
 pub mod slot;
 pub mod stamp;
@@ -94,6 +97,7 @@ pub use effect::{
     effect_backend_available_with,
 };
 pub use frame::{Canonical, Frame, FrameWriter};
+pub use frame_guard::CorruptFrames;
 pub use geometry::{Crop, crop_for};
 pub use ingest::{ControlReport, Ingest, IngestConfig};
 pub use live::{LiveStats, LiveWindow};

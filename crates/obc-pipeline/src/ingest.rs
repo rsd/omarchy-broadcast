@@ -2,8 +2,9 @@
 //! frames in the output's slot (`docs/adr/0009-ingest-process-output.md`).
 //!
 //! ```text
-//! v4l2src device=<camera> io-mode=mmap
+//! v4l2src device=<camera> io-mode=mmap                       corrupt-frame guard on src
 //!   ! capsfilter  <camera mode>
+//!   [ ! capssetter <full range> ]                            range quirk row only
 //!   ! queue       max-size-buffers=2 leaky=downstream
 //!   [ ! videoconvert ! capsfilter video/x-raw,format=NV12 ]   CPU convert (YUY2, UYVY)
 //!   [ ! jpegdec      ! capsfilter video/x-raw,format=I420 ]   CPU decode (MJPEG)
@@ -46,6 +47,17 @@
 //! contract's is converted. A camera mode that already matches the canonical
 //! caps passes through without CUDA work. The CPU convert adapter keeps the
 //! camera's label up to `cudaupload` ([`crate::pipeline::pinned_caps`]).
+//! A raw camera with a range quirk row ([`crate::quirks`], its USB id read
+//! from sysfs by the node) sends full range under a limited label: its
+//! frames are relabelled full range right after the camera, so
+//! `cudaconvertscale` converts them to the contract's range
+//! ([`crate::colour_range`]).
+//!
+//! **Corrupt frames.** A probe on the camera source drops the frames the
+//! driver flagged corrupted and, in MJPEG, the JPEGs that are not whole
+//! (no start or end marker), before anything else sees them; the output
+//! repeats the last good frame. [`Ingest::corrupt_frames`] counts them
+//! ([`crate::frame_guard`]).
 //!
 //! **One CUDA context.** [`Ingest::start`] sets the output pipeline's CUDA
 //! context on the ingest pipeline before it opens anything, so canonical
@@ -58,7 +70,10 @@
 //! system memory, with no CUDA element and no CUDA context:
 //!
 //! ```text
-//! v4l2src ! capsfilter <camera mode> ! queue
+//! v4l2src ! capsfilter <camera mode>
+//!   [ ! capssetter <full range> ]                           range quirk, full contract
+//!   ! queue
+//!   [ ! videobalance ]                                      range quirk, limited contract
 //!   [ ! jpegdec ! capsfilter video/x-raw,format=I420 ]      CPU decode (MJPEG)
 //!   [ ! videobalance ! capssetter ]                         MJPEG, limited contract: range
 //!   [ ! videocrop ]                                         crop-to-fill policy only
@@ -70,7 +85,8 @@
 //! `videoconvertscale` converts the format, the size and the colour label
 //! in one pass (but not the range when it is the only difference: the
 //! decoder's full range is converted by the `videobalance` step,
-//! [`crate::pipeline::ingest_adapter`]), so YUY2 and UYVY reach it as captured, with no separate
+//! [`crate::pipeline::ingest_adapter`], and so is a raw camera's with a
+//! range quirk row, keeping its limited label), so YUY2 and UYVY reach it as captured, with no separate
 //! `videoconvert` ([`crate::pipeline::ingest_adapter`]); a camera mode
 //! already at the canonical caps passes through without a copy. The enhance
 //! stage runs on CUDA frames only: an ingest in system memory refuses it
@@ -97,12 +113,14 @@ use obc_backend::enhance::{EnhancerFactory, MAX_SCALE, MIN_SCALE};
 use obc_core::{AspectPolicy, OutputContract, VideoMode};
 
 use crate::capability::IngestPath;
+use crate::colour_range::camera_usb_id;
 use crate::controls::{CID_EXPOSURE_AUTO_PRIORITY, ControlGuard, CtrlSkip, get_ctrl, probe_ctrl};
 use crate::frame::{Canonical, FrameWriter};
+use crate::frame_guard::{CorruptFrames, FrameGuard};
 use crate::geometry::{Crop, crop_for};
 use crate::pipeline::{
-    MediaPipeline, PipelineError, StopError, add_linked, both_stopped, camera_head, capsfilter,
-    cuda_caps, make, names,
+    CameraHead, MediaPipeline, PipelineError, StopError, add_linked, both_stopped, camera_head,
+    capsfilter, cuda_caps, make, names,
 };
 use obc_core::config::VideoMemory;
 
@@ -489,6 +507,8 @@ pub struct Ingest {
     enhance: Option<ObcEnhance>,
     /// The first failure [`Self::poll_failure`] found (sticky).
     failure: Mutex<Option<String>>,
+    /// The camera's corrupt-frame guard (a camera ingest only).
+    guard_frames: Option<Arc<FrameGuard>>,
 }
 
 impl Ingest {
@@ -500,13 +520,19 @@ impl Ingest {
     /// off.
     pub fn build(cfg: &IngestConfig, writer: FrameWriter) -> Result<Self, PipelineError> {
         let path = cfg.ingest_path();
-        let (head, tail_format) = camera_head(
+        let usb = camera_usb_id(std::path::Path::new(crate::xu::SYSFS_ROOT), &cfg.camera);
+        let CameraHead {
+            chain: head,
+            format: tail_format,
+            guard,
+        } = camera_head(
             &cfg.camera,
             &cfg.mode,
             &cfg.camera_io_mode,
             cfg.queue_buffers,
             writer.memory(),
             writer.canonical().range,
+            usb,
         )?;
         let enhance = cfg
             .enhance
@@ -524,6 +550,7 @@ impl Ingest {
         ingest.camera = Some(cfg.camera.clone());
         ingest.fixed_framerate = cfg.fixed_framerate;
         ingest.path = Some(path);
+        ingest.guard_frames = Some(guard);
         Ok(ingest)
     }
 
@@ -613,6 +640,7 @@ impl Ingest {
             memory,
             enhance,
             failure: Mutex::new(None),
+            guard_frames: None,
         })
     }
 
@@ -703,9 +731,14 @@ impl Ingest {
             pipeline,
             guard,
             camera,
+            guard_frames,
             ..
         } = self;
         let stopped = pipeline.shutdown_checked();
+        // The last drops the rate limit held back (no more frames come).
+        if let Some(g) = &guard_frames {
+            g.flush_log();
+        }
         let restored = match guard {
             Some(g) => g.restore().map_err(|e| StopError {
                 error: PipelineError::Control {
@@ -792,6 +825,15 @@ impl Ingest {
     /// one.
     pub fn enhance_stats(&self) -> Option<EnhanceStats> {
         self.enhance.as_ref().map(ObcEnhance::stats)
+    }
+
+    /// The corrupt camera frames dropped at the source so far, per cause
+    /// ([`crate::frame_guard`]); zero for a source that is not a camera.
+    pub fn corrupt_frames(&self) -> CorruptFrames {
+        self.guard_frames
+            .as_ref()
+            .map(|g| g.counts())
+            .unwrap_or_default()
     }
 }
 
@@ -2118,5 +2160,500 @@ mod tests {
             run.ingest.stop().unwrap();
             faults.set(None);
         }
+    }
+}
+
+/// The camera head's corrupt-frame guard and range quirk, on pipelines fed
+/// by an `appsrc` named as the camera. CPU only, except the one `gpu_`
+/// test.
+#[cfg(test)]
+mod camera_head_tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use gst_video::prelude::*;
+    use obc_core::{ColourRange, OutputContract, PixelFormat, UsbId};
+
+    use super::*;
+    use crate::colour_range::full_range_caps;
+    use crate::live::LiveStats;
+    use crate::pipeline::{camera_chain, same_colorimetry};
+    use crate::slot::Slot;
+    use crate::test_support::require_elements;
+
+    const VX800: UsbId = UsbId {
+        vendor: 0x045e,
+        product: 0x0766,
+    };
+    const C930E: UsbId = UsbId {
+        vendor: 0x046d,
+        product: 0x0843,
+    };
+
+    /// A live `appsrc` named as the camera, with `caps`.
+    fn camera_src(caps: &str) -> gst_app::AppSrc {
+        gst_app::AppSrc::builder()
+            .name(names::CAMERA)
+            .caps(&caps.parse::<gst::Caps>().unwrap())
+            .format(gst::Format::Time)
+            .is_live(true)
+            .build()
+    }
+
+    fn system_writer(
+        slot: &Arc<Slot<crate::frame::Frame>>,
+        contract: &OutputContract,
+    ) -> FrameWriter {
+        FrameWriter::new(Arc::clone(slot), Instant::now(), 1, Canonical::of(contract))
+            .in_memory(VideoMemory::System)
+    }
+
+    fn names_of(chain: &[gst::Element]) -> Vec<String> {
+        chain.iter().map(|e| e.name().to_string()).collect()
+    }
+
+    /// The elements the camera head builds, per range fix: a quirk camera
+    /// gets the relabel right after its capsfilter in CUDA memory (on the
+    /// CPU convert and the GPU-direct path alike) and under a full
+    /// contract, the levels after the queue in system memory under a
+    /// limited one; a camera with no row, or MJPEG, gets neither. Built,
+    /// not started (no CUDA element is in the head).
+    #[test]
+    fn the_head_applies_the_range_fix_of_the_quirk_row() {
+        require_elements(&[
+            "v4l2src",
+            "queue",
+            "capssetter",
+            "videobalance",
+            "videoconvert",
+            "jpegdec",
+        ]);
+        use ColourRange::{Full, Limited};
+        use names::*;
+        let head = |format: PixelFormat, memory, range, usb| {
+            let src = make("v4l2src", CAMERA).unwrap();
+            let caps = format!(
+                "{},width=640,height=480",
+                if format == PixelFormat::Mjpeg {
+                    "image/jpeg".to_string()
+                } else {
+                    format!("video/x-raw,format={}", format.gst_name())
+                }
+            );
+            let h = camera_chain(src, "test", &caps, format, 2, memory, range, usb).unwrap();
+            names_of(&h.chain)
+        };
+        let yuy2 = PixelFormat::Yuy2;
+        assert_eq!(
+            head(yuy2, VideoMemory::Cuda, Limited, Some(VX800)),
+            [
+                CAMERA,
+                CAMERA_CAPS,
+                RANGE_QUIRK_RELABEL,
+                QUEUE,
+                INGEST_CONVERT,
+                INGEST_CAPS
+            ]
+        );
+        assert_eq!(
+            head(
+                PixelFormat::Nv12,
+                VideoMemory::Cuda,
+                Limited,
+                Some(UsbId {
+                    vendor: 0x046d,
+                    product: 0x0944
+                })
+            ),
+            [CAMERA, CAMERA_CAPS, RANGE_QUIRK_RELABEL, QUEUE]
+        );
+        assert_eq!(
+            head(yuy2, VideoMemory::System, Limited, Some(VX800)),
+            [CAMERA, CAMERA_CAPS, QUEUE, RANGE_BALANCE, RANGE_RELABEL]
+        );
+        assert_eq!(
+            head(yuy2, VideoMemory::System, Full, Some(VX800)),
+            [CAMERA, CAMERA_CAPS, RANGE_QUIRK_RELABEL, QUEUE]
+        );
+        for usb in [Some(C930E), None] {
+            assert_eq!(
+                head(yuy2, VideoMemory::System, Limited, usb),
+                [CAMERA, CAMERA_CAPS, QUEUE]
+            );
+        }
+        // The VX-800's row lists YUY2 only.
+        assert_eq!(
+            head(
+                PixelFormat::Mjpeg,
+                VideoMemory::System,
+                Limited,
+                Some(VX800)
+            ),
+            [
+                CAMERA,
+                CAMERA_CAPS,
+                QUEUE,
+                DECODE,
+                INGEST_CAPS,
+                RANGE_BALANCE,
+                RANGE_RELABEL
+            ]
+        );
+    }
+
+    /// One 320x240 YUY2 frame, full range: luma 0 in the left half, 255
+    /// in the right, neutral chroma.
+    fn black_and_white_yuy2(n: u64) -> gst::Buffer {
+        let (w, h) = (320usize, 240usize);
+        let mut data = Vec::with_capacity(w * h * 2);
+        for _ in 0..h {
+            for x in (0..w).step_by(2) {
+                let y = if x < w / 2 { 0 } else { 255 };
+                data.extend([y, 128, y, 128]);
+            }
+        }
+        let mut b = gst::Buffer::from_slice(data);
+        let r = b.get_mut().unwrap();
+        r.set_pts(gst::ClockTime::from_mseconds(33 * n));
+        r.set_duration(gst::ClockTime::from_mseconds(33));
+        b
+    }
+
+    const YUY2_LIMITED: &str =
+        "video/x-raw,format=YUY2,width=320,height=240,framerate=30/1,colorimetry=2:4:5:4";
+
+    /// Pushes full-range YUY2 frames labelled limited through a
+    /// system-memory camera ingest (`usb` selecting the quirk row or not)
+    /// under `range`: the luma of the canonical frame's black and white
+    /// halves, and its first chroma pair.
+    fn system_levels(usb: Option<UsbId>, range: ColourRange) -> (u8, u8, (u8, u8)) {
+        let contract = OutputContract {
+            range,
+            .."320x240@30".parse().unwrap()
+        };
+        let src = camera_src(YUY2_LIMITED);
+        let head = camera_chain(
+            src.clone().upcast(),
+            "test",
+            YUY2_LIMITED,
+            PixelFormat::Yuy2,
+            2,
+            VideoMemory::System,
+            range,
+            usb,
+        )
+        .unwrap();
+        let slot = Arc::new(Slot::new());
+        let mut ingest = Ingest::from_head(
+            head.chain,
+            head.format,
+            (320, 240),
+            AspectPolicy::Crop,
+            system_writer(&slot, &contract),
+        )
+        .unwrap();
+        ingest.start_with(None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut n = 0;
+        while slot.written() < 3 {
+            assert!(Instant::now() < deadline, "no frames");
+            src.push_buffer(black_and_white_yuy2(n)).unwrap();
+            n += 1;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let caps = ingest
+            .pipeline()
+            .element(names::FRAMES_SINK)
+            .unwrap()
+            .static_pad("sink")
+            .unwrap()
+            .current_caps()
+            .unwrap();
+        let info = gst_video::VideoInfo::from_caps(&caps).unwrap();
+        let buffer = slot.latest().unwrap().frame.buffer.clone();
+        let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(&buffer, &info).unwrap();
+        let row = 120 * frame.plane_stride()[0] as usize;
+        let y = frame.plane_data(0).unwrap();
+        let uv = frame.plane_data(1).unwrap();
+        let levels = (y[row + 80], y[row + 240], (uv[0], uv[1]));
+        ingest.stop().unwrap();
+        levels
+    }
+
+    /// A quirk camera in a system-memory ingest of a limited contract: the
+    /// levels step maps its full-range black to Y=16 and white to Y=235
+    /// (within 1), chroma neutral. Without the row the frames pass as they
+    /// are (`videoconvertscale` leaves a range-only difference alone), and
+    /// under a full contract the relabel passes them unchanged too. CPU
+    /// only.
+    #[test]
+    fn a_quirk_camera_reaches_the_limited_range_in_system_memory() {
+        require_elements(&[
+            "appsrc",
+            "queue",
+            "videobalance",
+            "capssetter",
+            "videocrop",
+            "videoconvertscale",
+            "appsink",
+        ]);
+        let near = |got: u8, want: i32| (i32::from(got) - want).abs() <= 1;
+        let (black, white, (u, v)) = system_levels(Some(VX800), ColourRange::Limited);
+        assert!(near(black, 16) && near(white, 235), "{black} {white}");
+        assert!(near(u, 128) && near(v, 128), "chroma {u} {v}");
+        let (black, white, _) = system_levels(Some(C930E), ColourRange::Limited);
+        assert_eq!((black, white), (0, 255), "no row: as labelled");
+        let (black, white, (u, v)) = system_levels(Some(VX800), ColourRange::Full);
+        assert_eq!((black, white), (0, 255), "full contract");
+        assert!(near(u, 128) && near(v, 128), "chroma {u} {v}");
+    }
+
+    /// A quirk camera in a system-memory ingest of a limited contract: the
+    /// balanced frames leave the relabel labelled limited range, the rest
+    /// of the camera's label kept, also should the camera label them full
+    /// (a later conversion must not compress them again). CPU only.
+    #[test]
+    fn the_balanced_frames_of_a_quirk_camera_are_relabelled_limited() {
+        require_elements(&["appsrc", "queue", "videobalance", "capssetter", "fakesink"]);
+        let yuy2 = "video/x-raw,format=YUY2,width=320,height=240,framerate=30/1";
+        for (label, want) in [
+            ("2:4:5:4", "2:4:5:4"),
+            ("1:4:5:4", "2:4:5:4"),
+            ("1:3:5:1", "2:3:5:1"),
+        ] {
+            let caps = format!("{yuy2},colorimetry={label}");
+            let src = camera_src(&caps);
+            let head = camera_chain(
+                src.clone().upcast(),
+                "test",
+                &caps,
+                PixelFormat::Yuy2,
+                2,
+                VideoMemory::System,
+                ColourRange::Limited,
+                Some(VX800),
+            )
+            .unwrap();
+            let pipeline = gst::Pipeline::with_name("quirk-system-head");
+            let sink = make("fakesink", "sink").unwrap();
+            sink.set_property("sync", false);
+            let mut chain = head.chain;
+            chain.push(sink);
+            add_linked(&pipeline, &chain).unwrap();
+            pipeline.set_state(gst::State::Playing).unwrap();
+            for n in 0..3 {
+                src.push_buffer(black_and_white_yuy2(n)).unwrap();
+            }
+            src.end_of_stream().unwrap();
+            let msg = pipeline
+                .bus()
+                .unwrap()
+                .timed_pop_filtered(
+                    gst::ClockTime::from_seconds(10),
+                    &[gst::MessageType::Eos, gst::MessageType::Error],
+                )
+                .expect("EOS or error");
+            assert!(matches!(msg.view(), gst::MessageView::Eos(_)), "{msg:?}");
+            let out = pipeline
+                .by_name(names::RANGE_RELABEL)
+                .unwrap()
+                .static_pad("src")
+                .unwrap()
+                .current_caps()
+                .unwrap();
+            pipeline.set_state(gst::State::Null).unwrap();
+            let got = out
+                .structure(0)
+                .unwrap()
+                .get::<String>("colorimetry")
+                .unwrap();
+            assert!(same_colorimetry(&got, want), "{label}: {got} {want}");
+        }
+    }
+
+    /// The CUDA CPU convert path of a quirk camera, up to `cudaupload`
+    /// (here a `fakesink`): `videoconvert`'s NV12 carries the camera's
+    /// label made full range, so `cudaconvertscale` converts the range;
+    /// the data are untouched. Without the row, the camera's label. CPU
+    /// only.
+    #[test]
+    fn a_quirk_camera_is_uploaded_labelled_full_range() {
+        require_elements(&["appsrc", "queue", "capssetter", "videoconvert", "fakesink"]);
+        for (usb, want_full) in [(Some(VX800), true), (Some(C930E), false), (None, false)] {
+            let src = camera_src(YUY2_LIMITED);
+            let head = camera_chain(
+                src.clone().upcast(),
+                "test",
+                YUY2_LIMITED,
+                PixelFormat::Yuy2,
+                2,
+                VideoMemory::Cuda,
+                ColourRange::Limited,
+                usb,
+            )
+            .unwrap();
+            assert_eq!(head.format, "NV12");
+            let pipeline = gst::Pipeline::with_name("quirk-cuda-head");
+            let sink = make("fakesink", "sink").unwrap();
+            sink.set_property("sync", false);
+            let mut chain = head.chain;
+            chain.push(sink);
+            add_linked(&pipeline, &chain).unwrap();
+            pipeline.set_state(gst::State::Playing).unwrap();
+            for n in 0..3 {
+                src.push_buffer(black_and_white_yuy2(n)).unwrap();
+            }
+            src.end_of_stream().unwrap();
+            let msg = pipeline
+                .bus()
+                .unwrap()
+                .timed_pop_filtered(
+                    gst::ClockTime::from_seconds(10),
+                    &[gst::MessageType::Eos, gst::MessageType::Error],
+                )
+                .expect("EOS or error");
+            assert!(matches!(msg.view(), gst::MessageView::Eos(_)), "{msg:?}");
+            let caps = pipeline
+                .by_name(names::INGEST_CAPS)
+                .unwrap()
+                .static_pad("src")
+                .unwrap()
+                .current_caps()
+                .unwrap();
+            pipeline.set_state(gst::State::Null).unwrap();
+            let s = caps.structure(0).unwrap();
+            assert_eq!(s.get::<&str>("format").unwrap(), "NV12");
+            let label = s.get::<String>("colorimetry").unwrap();
+            let want = if want_full {
+                let full = full_range_caps(&YUY2_LIMITED.parse::<gst::Caps>().unwrap()).unwrap();
+                full.structure(0)
+                    .unwrap()
+                    .get::<String>("colorimetry")
+                    .unwrap()
+            } else {
+                "2:4:5:4".to_string()
+            };
+            assert!(same_colorimetry(&label, &want), "{usb:?}: {label} {want}");
+        }
+    }
+
+    /// [`LiveStats`] probes the same camera pad as the frame guard: it
+    /// records only the frames the guard passes (GStreamer calls a pad's
+    /// probes in the order they were added and stops at the first DROP;
+    /// the guard is installed when the head is built, before
+    /// [`LiveStats::attach`]). No output ticks, so every recorded frame
+    /// stays pending. CPU only.
+    #[test]
+    fn live_stats_never_record_a_dropped_frame() {
+        require_elements(&[
+            "appsrc",
+            "queue",
+            "videocrop",
+            "videoconvertscale",
+            "appsink",
+        ]);
+        let caps = "video/x-raw,format=NV12,width=160,height=120,framerate=30/1,\
+                    colorimetry=2:4:5:1";
+        let src = camera_src(caps);
+        let head = camera_chain(
+            src.clone().upcast(),
+            "test",
+            caps,
+            PixelFormat::Nv12,
+            2,
+            VideoMemory::System,
+            ColourRange::Limited,
+            None,
+        )
+        .unwrap();
+        let guard = Arc::clone(&head.guard);
+        let slot = Arc::new(Slot::new());
+        let mut ingest = Ingest::from_head(
+            head.chain,
+            head.format,
+            (160, 120),
+            AspectPolicy::Crop,
+            system_writer(&slot, &"320x240@30".parse().unwrap()),
+        )
+        .unwrap();
+        let stats = LiveStats::new();
+        stats.attach(&ingest).unwrap();
+        ingest.start_with(None).unwrap();
+        let total = 10u64;
+        for n in 0..total {
+            let mut b = gst::Buffer::from_slice(vec![16u8; 160 * 120 * 3 / 2]);
+            let r = b.get_mut().unwrap();
+            r.set_pts(gst::ClockTime::from_mseconds(33 * n));
+            if n % 3 == 0 {
+                r.set_flags(gst::BufferFlags::CORRUPTED);
+            }
+            src.push_buffer(b).unwrap();
+        }
+        let dropped = 4; // n = 0, 3, 6, 9
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while guard.counts().total() + (stats.pending() as u64) < total {
+            assert!(Instant::now() < deadline, "frames still in flight");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(guard.counts().flagged, dropped);
+        assert_eq!(stats.pending() as u64, total - dropped);
+        ingest.stop().unwrap();
+    }
+
+    /// `cudaconvertscale` converts a range-only difference: full-range NV12
+    /// (labelled so, as the quirk relabel leaves it) reaches the limited
+    /// canonical label with black at Y=16 and white at Y=235.
+    #[test]
+    #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+    fn gpu_cudaconvertscale_converts_full_to_limited_range() {
+        require_elements(&[
+            "appsrc",
+            "cudaupload",
+            "cudaconvertscale",
+            "cudadownload",
+            "appsink",
+        ]);
+        let (w, h) = (320usize, 240usize);
+        let pipeline = gst::parse::launch(&format!(
+            "appsrc name=in format=time caps=video/x-raw,format=NV12,width={w},height={h},\
+             framerate=30/1,colorimetry=1:4:5:4 \
+             ! cudaupload ! video/x-raw(memory:CUDAMemory),format=NV12 \
+             ! cudaconvertscale \
+             ! video/x-raw(memory:CUDAMemory),format=NV12,width={w},height={h},\
+             colorimetry=2:4:5:4 \
+             ! cudadownload ! video/x-raw,format=NV12 ! appsink name=out"
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let src = pipeline
+            .by_name("in")
+            .unwrap()
+            .downcast::<gst_app::AppSrc>()
+            .unwrap();
+        let sink = pipeline
+            .by_name("out")
+            .unwrap()
+            .downcast::<gst_app::AppSink>()
+            .unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let mut data = Vec::with_capacity(w * h * 3 / 2);
+        for _ in 0..h {
+            data.extend((0..w).map(|x| if x < w / 2 { 0u8 } else { 255 }));
+        }
+        data.resize(w * h * 3 / 2, 128);
+        src.push_buffer(gst::Buffer::from_slice(data)).unwrap();
+        src.end_of_stream().unwrap();
+        let sample = sink.pull_sample().unwrap();
+        let info = gst_video::VideoInfo::from_caps(sample.caps().unwrap()).unwrap();
+        let buffer = sample.buffer().unwrap();
+        let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info).unwrap();
+        let row = 120 * frame.plane_stride()[0] as usize;
+        let y = frame.plane_data(0).unwrap();
+        let (black, white) = (y[row + 80], y[row + 240]);
+        pipeline.set_state(gst::State::Null).unwrap();
+        let near = |got: u8, want: i32| (i32::from(got) - want).abs() <= 1;
+        assert!(near(black, 16) && near(white, 235), "{black} {white}");
     }
 }

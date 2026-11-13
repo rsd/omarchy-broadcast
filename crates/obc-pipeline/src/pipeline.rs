@@ -20,6 +20,17 @@
 //! included, with no separate `videoconvert`) or as decoded by `jpegdec`
 //! ([`ingest_adapter`]).
 //!
+//! **The camera end** ([`camera_head`]). The camera source's `src` pad
+//! carries the corrupt-frame guard, which drops frames the driver flagged
+//! and incomplete JPEGs before anything else sees them
+//! ([`crate::frame_guard`]). A raw camera with a range quirk row (full
+//! range under a limited label, [`crate::quirks`]) is relabelled full range
+//! right after its capsfilter, or in a system-memory ingest of a limited
+//! contract gets the full-to-limited levels after its queue, relabelled
+//! limited range; a raw camera
+//! with no row has its first frames' luma looked at once, which only logs
+//! ([`crate::colour_range`]).
+//!
 //! **CUDA memory from `cudaupload` on.** The CUDAMemory capsfilter right
 //! after `cudaupload` is load-bearing: without it, `cudaupload` and the next
 //! CUDA element may negotiate plain system memory and silently pass frames
@@ -30,10 +41,12 @@
 use gst::glib;
 use gst::prelude::*;
 use obc_core::config::VideoMemory;
-use obc_core::{ColourRange, OutputContract, OutputFormat, PixelFormat, VideoMode};
+use obc_core::{ColourRange, OutputContract, OutputFormat, PixelFormat, UsbId, VideoMode};
 use serde::Serialize;
+use std::sync::Arc;
 
 use crate::capability::IngestPath;
+use crate::frame_guard::FrameGuard;
 pub use crate::process::GpuStage;
 
 /// Element names in the ingest, output and consumer pipelines.
@@ -43,11 +56,15 @@ pub mod names {
     pub const QUEUE: &str = "queue";
     /// `jpegdec` (CPU decode path only).
     pub const DECODE: &str = "decode";
-    /// `videobalance` of the system-memory MJPEG range conversion (limited
-    /// contract only).
+    /// `videobalance` of the system-memory full-to-limited range
+    /// conversion (MJPEG, or a range quirk camera; limited contract only).
     pub const RANGE_BALANCE: &str = "range_balance";
-    /// `capssetter` relabelling the balanced frames as limited range.
+    /// `capssetter` relabelling the balanced frames as limited range (the
+    /// MJPEG path's, and a range quirk camera's in system memory).
     pub const RANGE_RELABEL: &str = "range_relabel";
+    /// `capssetter` relabelling a raw camera's frames as full range, for a
+    /// camera with a range quirk row ([`crate::colour_range`]).
+    pub const RANGE_QUIRK_RELABEL: &str = "range_quirk_relabel";
     /// `videoconvert` (CPU convert path in CUDA memory only).
     pub const INGEST_CONVERT: &str = "ingest_convert";
     /// System-memory capsfilter after the CPU adapter.
@@ -347,11 +364,22 @@ pub struct MediaPipeline {
     loopback_caps: Option<gst::Caps>,
 }
 
+/// The camera end of an ingest ([`camera_head`]): its elements in link
+/// order, the format of the system-memory frames the last one hands the
+/// canonical tail, and the camera's frame guard.
+pub(crate) struct CameraHead {
+    pub chain: Vec<gst::Element>,
+    pub format: &'static str,
+    /// The corrupt-frame guard on the camera source ([`crate::frame_guard`]).
+    pub guard: Arc<FrameGuard>,
+}
+
 /// The camera end of an ingest chain of canonical frames in `memory`, up
 /// to the canonical tail (`cudaupload` in CUDA memory):
-/// `v4l2src ! capsfilter (mode) ! queue (leaky) [! CPU adapter]`
-/// ([`ingest_adapter`]). Returns the elements in link order and the format
-/// of the system-memory frames the last one hands the tail.
+/// `v4l2src ! capsfilter (mode) [! capssetter] ! queue (leaky)
+/// [! videobalance ! capssetter] [! CPU adapter]` ([`camera_chain`]).
+/// `usb` is the camera's USB id ([`crate::colour_range::camera_usb_id`]):
+/// it selects a range quirk row.
 pub(crate) fn camera_head(
     camera: &std::path::Path,
     mode: &VideoMode,
@@ -359,11 +387,53 @@ pub(crate) fn camera_head(
     queue_buffers: u32,
     memory: VideoMemory,
     range: ColourRange,
-) -> Result<(Vec<gst::Element>, &'static str), PipelineError> {
-    use names::*;
-    let src = make("v4l2src", CAMERA)?;
+    usb: Option<UsbId>,
+) -> Result<CameraHead, PipelineError> {
+    let src = make("v4l2src", names::CAMERA)?;
     src.set_property("device", camera.to_string_lossy().as_ref());
     set_enum(&src, "io-mode", io_mode)?;
+    camera_chain(
+        src,
+        &camera.display().to_string(),
+        &mode.to_caps_string(),
+        mode.format,
+        queue_buffers,
+        memory,
+        range,
+        usb,
+    )
+}
+
+/// [`camera_head`] after its source `src` (named [`names::CAMERA`]; any
+/// source in the tests): `camera_caps` the caps of the camera mode, in
+/// `format`, `label` the camera for the logs.
+///
+/// * The frame guard goes on `src`'s `src` pad first, before any other
+///   probe on it ([`crate::frame_guard`]).
+/// * A raw camera with a range quirk row ([`crate::quirks`]) gets the fix
+///   [`crate::colour_range::range_fix`] chooses: a full-range relabel
+///   right after `camera_caps`, or the full-to-limited levels after the
+///   queue followed by a limited-range relabel that keeps the rest of the
+///   camera's label. The CPU adapter then pins its colorimetry from the
+///   relabel, so `videoconvert` keeps the relabelled range.
+/// * A raw camera with a USB id and no row gets the range watch
+///   ([`crate::colour_range::watch_range`]), which only logs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn camera_chain(
+    src: gst::Element,
+    label: &str,
+    camera_caps: &str,
+    format: PixelFormat,
+    queue_buffers: u32,
+    memory: VideoMemory,
+    range: ColourRange,
+    usb: Option<UsbId>,
+) -> Result<CameraHead, PipelineError> {
+    use crate::colour_range::{
+        RangeFix, full_range_relabel, limited_range_relabel, range_fix, watch_range,
+    };
+    use names::*;
+    let guard = crate::frame_guard::install(&src, label, format == PixelFormat::Mjpeg);
 
     let queue = make("queue", QUEUE)?;
     queue.set_property("max-size-buffers", queue_buffers.max(1));
@@ -371,15 +441,44 @@ pub(crate) fn camera_head(
     queue.set_property("max-size-time", 0u64);
     set_enum(&queue, "leaky", "downstream")?;
 
-    let camera_caps = capsfilter(CAMERA_CAPS, &mode.to_caps_string())?;
-    let mut chain = vec![src, camera_caps.clone(), queue];
-    let (adapter, format) = ingest_adapter(&camera_caps, mode.format, memory, range)?;
+    let camera_caps = capsfilter(CAMERA_CAPS, camera_caps)?;
+    let fix = range_fix(
+        crate::quirks::full_range_despite_label(usb, format),
+        memory,
+        range,
+    );
+    let mut chain = vec![src, camera_caps.clone()];
+    // The element whose src caps carry the camera's (relabelled) label.
+    let mut labelled = camera_caps.clone();
+    match (fix, usb) {
+        (RangeFix::RelabelFull, _) => {
+            labelled = full_range_relabel(&camera_caps)?;
+            chain.push(labelled.clone());
+        }
+        (RangeFix::None, Some(usb)) => {
+            let _ = watch_range(&camera_caps, usb, format);
+        }
+        _ => {}
+    }
+    chain.push(queue);
+    if fix == RangeFix::LimitLevels {
+        let balance = full_to_limited_levels()?;
+        labelled = limited_range_relabel(&balance)?;
+        chain.extend([balance, labelled.clone()]);
+    }
+    let (adapter, format) = ingest_adapter(&labelled, format, memory, range)?;
     chain.extend(adapter);
-    Ok((chain, format))
+    Ok(CameraHead {
+        chain,
+        format,
+        guard,
+    })
 }
 
 /// The CPU ingest adapter after `camera_caps` (the capsfilter of the
-/// camera mode) for a camera format, in an ingest of canonical frames in
+/// camera mode, or the range quirk relabel after it: the element whose
+/// `src` caps carry the camera's label) for a camera format, in an ingest
+/// of canonical frames in
 /// `memory` (see the module docs): the elements in link order (none on the
 /// GPU-direct path) and the format of the system-memory frames they
 /// deliver to the canonical tail.
@@ -393,8 +492,9 @@ pub(crate) fn camera_head(
 ///
 /// `range` is the contract's colour range. For a limited contract the
 /// system-memory MJPEG path converts the decoder's full range to limited
-/// range itself ([`FULL_TO_LIMITED_BALANCE`]): `videoconvertscale` does not,
-/// see there.
+/// range itself ([`full_to_limited_range`]): `videoconvertscale` does not,
+/// see there. A raw camera's range quirk is applied by [`camera_head`], not
+/// here.
 pub fn ingest_adapter(
     camera_caps: &gst::Element,
     format: PixelFormat,
@@ -454,16 +554,27 @@ const LIMITED_RELABEL: &str = "video/x-raw,colorimetry=(string)2:4:0:0";
 /// range would otherwise see full-range frames and convert them a second
 /// time.
 fn full_to_limited_range() -> Result<[gst::Element; 2], PipelineError> {
-    let balance = make("videobalance", names::RANGE_BALANCE)?;
-    balance.set_property("contrast", LUMA_CONTRAST);
-    balance.set_property("brightness", LUMA_BRIGHTNESS);
-    balance.set_property("saturation", CHROMA_SATURATION);
+    let balance = full_to_limited_levels()?;
     let relabel = make("capssetter", names::RANGE_RELABEL)?;
     let caps: gst::Caps = LIMITED_RELABEL
         .parse()
         .map_err(|_| PipelineError::Link(format!("bad caps {LIMITED_RELABEL}")))?;
     relabel.set_property("caps", &caps);
     Ok([balance, relabel])
+}
+
+/// The levels of [`full_to_limited_range`] alone: a `videobalance`
+/// ([`names::RANGE_BALANCE`]) that maps full-range luma and chroma to the
+/// limited range, the caps passed as they are. `videobalance` 1.28 takes
+/// the raw camera formats as they are (YUY2, UYVY, NV12, NV21, I420, YV12
+/// among others), so a raw camera with a range quirk needs no conversion
+/// before it ([`crate::colour_range`]).
+pub(crate) fn full_to_limited_levels() -> Result<gst::Element, PipelineError> {
+    let balance = make("videobalance", names::RANGE_BALANCE)?;
+    balance.set_property("contrast", LUMA_CONTRAST);
+    balance.set_property("brightness", LUMA_BRIGHTNESS);
+    balance.set_property("saturation", CHROMA_SATURATION);
+    Ok(balance)
 }
 
 /// Adds `chain` to `pipeline` and links it in order.

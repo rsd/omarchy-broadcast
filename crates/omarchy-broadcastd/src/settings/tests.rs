@@ -195,6 +195,7 @@ struct Case {
     stored: Option<CameraControlState>,
     open: bool,
     fixed: bool,
+    hidden: Vec<u32>,
 }
 
 impl Case {
@@ -205,6 +206,7 @@ impl Case {
             stored: None,
             open: false,
             fixed: false,
+            hidden: Vec::new(),
         }
     }
 
@@ -215,6 +217,7 @@ impl Case {
             stored: None,
             open: false,
             fixed: false,
+            hidden: Vec::new(),
         }
     }
 
@@ -226,6 +229,7 @@ impl Case {
             stored: self.stored.as_ref(),
             open: self.open,
             fixed_framerate: self.fixed,
+            hidden: &self.hidden,
         })
     }
 }
@@ -583,6 +587,142 @@ fn flags_grey_a_setting_with_their_reason() {
         Some(REASON_XU_UNKNOWN)
     );
     assert_eq!(value(&s, "camera.focus.field_of_view"), str_value("m7"));
+}
+
+/// The controls of a Generalplus GENERAL WEBCAM (1b3f:2002) as it reports
+/// them: brightness, contrast and hue that change nothing, an
+/// `auto_exposure` the kernel left without an item (it could not query
+/// it), and an exposure time the device flags inactive for good.
+fn generalplus() -> Vec<NodeControl> {
+    vec![
+        int(0x0098_0900, "Brightness", 255, 128, 128),
+        int(0x0098_0901, "Contrast", 255, 128, 128),
+        int(0x0098_0902, "Saturation", 255, 128, 128),
+        ctrl(0x0098_0903, "Hue", CTRL_TYPE_INTEGER, (-180, 180, 1), 0, 0),
+        int(0x0098_091b, "Sharpness", 15, 7, 7),
+        menu(0x009a_0901, "Auto Exposure", &[], 0, 0),
+        flagged(
+            ctrl(
+                0x009a_0902,
+                "Exposure Time, Absolute",
+                CTRL_TYPE_INTEGER,
+                (1, 5000, 1),
+                156,
+                156,
+            ),
+            CTRL_FLAG_INACTIVE,
+        ),
+    ]
+}
+
+/// The controls of a Microsoft LifeCam VX-800 (045e:0766) that matter
+/// here: its manual white balance breaks the picture.
+fn vx800() -> Vec<NodeControl> {
+    vec![
+        int(0x0098_0900, "Brightness", 255, 128, 128),
+        boolean(0x0098_090c, "White Balance, Automatic", true, true),
+        flagged(
+            ctrl(
+                0x0098_091a,
+                "White Balance Temperature",
+                CTRL_TYPE_INTEGER,
+                (2800, 10000, 1),
+                4000,
+                4000,
+            ),
+            CTRL_FLAG_INACTIVE,
+        ),
+    ]
+}
+
+fn quirk_hidden(vendor: u16, product: u16) -> Vec<u32> {
+    obc_pipeline::quirks::hidden_controls(Some(obc_core::UsbId { vendor, product }))
+}
+
+#[test]
+fn a_quirk_row_hides_its_controls_and_an_empty_menu_is_absent() {
+    const NO_EXPOSURE: &str = "The camera does not allow its exposure to be set";
+    let exposure = "camera.exposure.exposure_time_absolute";
+    let mut c = Case::of(generalplus());
+    c.hidden = quirk_hidden(0x1b3f, 0x2002);
+    c.stored = Some(stored(&[
+        ("brightness", 200),
+        ("exposure_time_absolute", 10),
+    ]));
+    for open in [false, true] {
+        c.open = open;
+        let s = c.build();
+        // The hidden controls and the empty menu are not published, and
+        // nothing is noted for them.
+        assert_eq!(
+            ids(&s),
+            [
+                "camera.image.saturation",
+                "camera.image.sharpness",
+                exposure
+            ]
+        );
+        assert!(s.notes.is_empty(), "{:?}", s.notes);
+        assert_eq!(s.hidden, ["brightness", "contrast", "hue"]);
+        assert_eq!(s.absent, ["auto_exposure"]);
+        assert!(s.by_name("brightness").is_none());
+        // The exposure time has no master to wait for: greyed for good,
+        // with a reason that says so, and no condition.
+        assert_eq!(greyed(&s, exposure).as_deref(), Some(NO_EXPOSURE));
+        assert!(setting(&s, exposure).enabled_when.is_empty());
+        assert!(matches!(
+            s.check(exposure, Some(&SettingValue::Int(10))),
+            Err(Refusal::Disabled(r)) if r == NO_EXPOSURE
+        ));
+    }
+    // Without the row (another camera of the same make, say): the controls
+    // are there; the empty menu is still absent, without a note.
+    c.hidden = Vec::new();
+    let s = c.build();
+    assert!(s.by_name("brightness").is_some());
+    assert!(s.by_name("hue").is_some());
+    assert!(s.hidden.is_empty());
+    assert_eq!(s.absent, ["auto_exposure"]);
+    assert!(s.notes.is_empty(), "{:?}", s.notes);
+    // An active exposure time without its master is enabled.
+    c.controls[6].info.flags = 0;
+    assert_eq!(greyed(&c.build(), exposure), None);
+}
+
+#[test]
+fn the_vx800_row_hides_its_manual_white_balance() {
+    let mut c = Case::of(vx800());
+    c.hidden = quirk_hidden(0x045e, 0x0766);
+    c.stored = Some(stored(&[("white_balance_temperature", 6500)]));
+    let s = c.build();
+    assert_eq!(ids(&s), ["camera.image.brightness"]);
+    assert_eq!(
+        s.hidden,
+        ["white_balance_automatic", "white_balance_temperature"]
+    );
+    assert!(s.notes.is_empty(), "{:?}", s.notes);
+    // The stored temperature has no entry: nothing writes it.
+    assert!(s.by_name("white_balance_temperature").is_none());
+    assert!(matches!(
+        s.check(
+            "camera.white_balance.white_balance_temperature",
+            Some(&SettingValue::Int(6500))
+        ),
+        Err(Refusal::Unknown(_))
+    ));
+    // A camera without a row: unchanged.
+    c.hidden = quirk_hidden(0x046d, 0x0944);
+    assert!(c.hidden.is_empty());
+    let s = c.build();
+    assert_eq!(
+        ids(&s),
+        [
+            "camera.image.brightness",
+            "camera.white_balance.white_balance_automatic",
+            "camera.white_balance.white_balance_temperature",
+        ]
+    );
+    assert!(s.hidden.is_empty() && s.absent.is_empty());
 }
 
 #[test]

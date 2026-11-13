@@ -66,6 +66,11 @@ pub struct Rule {
     pub master: &'static str,
     pub operand: Operand,
     pub reason: &'static str,
+    /// The text shown while the node has the master but the settings leave
+    /// it out (its quirk row hides it, or the kernel left a menu without an
+    /// item) and the device flags the control inactive: nothing the user
+    /// can change makes it active.
+    pub no_master: &'static str,
 }
 
 /// A known menu item: the device's index, the stable option id and its
@@ -105,24 +110,28 @@ const WB_RULE: Rule = Rule {
     master: "white_balance_automatic",
     operand: Operand::Is(false),
     reason: "Turn off automatic white balance to change this",
+    no_master: "The camera does not allow its white balance to be set",
 };
 
 const EXPOSURE_RULE: Rule = Rule {
     master: "auto_exposure",
     operand: Operand::OneOf(&["manual", "shutter_priority"]),
     reason: "Set exposure to manual to change this",
+    no_master: "The camera does not allow its exposure to be set",
 };
 
 const FOCUS_RULE: Rule = Rule {
     master: "focus_automatic_continuous",
     operand: Operand::Is(false),
     reason: "Turn off continuous autofocus to change this",
+    no_master: "The camera does not allow its focus to be set",
 };
 
 const HUE_RULE: Rule = Rule {
     master: "hue_automatic",
     operand: Operand::Is(false),
     reason: "Turn off automatic hue to change this",
+    no_master: "The camera does not allow its hue to be set",
 };
 
 /// `auto_exposure`'s items. Item 3 (`aperture_priority`) is labelled

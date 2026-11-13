@@ -18,10 +18,14 @@
 //!   `other` as `camera.other.<name>`, labelled with the device's name
 //!   ([`sanitise`]d). A control whose value cannot be read, one whose name
 //!   is not a storable control name (`obc_core::config::valid_control_name`)
-//!   or is a catalogue name under another control id, and a menu without an
-//!   item are left out, each with a note for the caller to log once. At most
-//!   [`MAX_SETTINGS`] settings, [`MAX_OPTIONS`] options each and
-//!   [`MAX_CONDITIONS`] conditions each.
+//!   or is a catalogue name under another control id is left out, with a
+//!   note for the caller to log once. A control the camera's quirk row
+//!   hides ([`Inputs::hidden`]: it does nothing, or breaks the picture) is
+//!   left out without a note ([`CameraSettings::hidden`]), and so is a menu
+//!   without an item ([`CameraSettings::absent`]: the kernel disabled it
+//!   when it could not query it); both are as if the camera did not have
+//!   them. At most [`MAX_SETTINGS`] settings, [`MAX_OPTIONS`] options each
+//!   and [`MAX_CONDITIONS`] conditions each.
 //! - **Values.** The raw device value maps to the setting's: an int as it
 //!   is, a bool as `raw != 0` (the opposite for the inverted
 //!   `camera.exposure.keep_framerate`), a menu item to its option id, an
@@ -41,7 +45,10 @@
 //!   camera is open, the device does not flag it inactive (its reason is the
 //!   rule's); a rule whose master the camera does not expose (or exposes as
 //!   another type) is dropped. A control without a rule is not enabled while
-//!   the device flags it inactive ([`REASON_INACTIVE`]).
+//!   the device flags it inactive ([`REASON_INACTIVE`]), with the rule's
+//!   `no_master` reason instead when its master is one the node has but the
+//!   model left out (hidden or a menu without an item): nothing can make it
+//!   active.
 //! - **Writes.** [`CameraSettings::check`] validates a `SetSetting` value
 //!   (unknown, then disabled, then invalid) and gives the raw value to
 //!   write. [`CameraSettings::apply_order`] puts masters (settings without
@@ -186,6 +193,9 @@ pub struct Inputs<'a> {
     /// The camera's next open pins `exposure_dynamic_framerate` to 0
     /// (`[camera] fixed_framerate`, and nothing stored for it).
     pub fixed_framerate: bool,
+    /// The V4L2 ids of the controls its quirk row hides
+    /// (`obc_pipeline::quirks::hidden_controls` of its USB id).
+    pub hidden: &'a [u32],
 }
 
 /// What a setting is written to.
@@ -317,6 +327,13 @@ pub struct CameraSettings {
     /// What was left out or cut, for the caller to log (once per camera
     /// and text).
     pub notes: Vec<String>,
+    /// The names of the controls the node has that its quirk row hides
+    /// ([`Inputs::hidden`]): never published, nothing stored for them is
+    /// written.
+    pub hidden: Vec<String>,
+    /// The names of the menus the node has without an item, left out as if
+    /// the camera did not have them.
+    pub absent: Vec<String>,
 }
 
 /// Why [`CameraSettings::check`] refused a value.
@@ -357,9 +374,16 @@ struct Candidate {
 /// The settings of a camera (see the module docs).
 pub fn build(inp: &Inputs<'_>) -> CameraSettings {
     let mut notes = Vec::new();
+    let mut hidden = Vec::new();
+    let mut absent = Vec::new();
     let mut found: Vec<Candidate> = Vec::new();
     for (seq, c) in inp.controls.iter().enumerate() {
-        if let Some(cand) = control_candidate(c, seq, &mut notes) {
+        if inp.hidden.contains(&c.id) {
+            let name = catalogue::by_cid(c.id).map_or(c.name.as_str(), |(_, k)| k.name);
+            hidden.push(name.to_string());
+            continue;
+        }
+        if let Some(cand) = control_candidate(c, seq, &mut notes, &mut absent) {
             if found.iter().any(|f| f.name == cand.name) {
                 notes.push(format!(
                     "{} ({:#010x}) has the name of another control: left out",
@@ -393,7 +417,10 @@ pub fn build(inp: &Inputs<'_>) -> CameraSettings {
         let held = conditions
             .iter()
             .all(|(m, cond)| holds(cond, found[*m].values.of(effective[*m].unwrap_or(0))));
-        let (enabled, reason) = enabled(c, !conditions.is_empty(), held, inp.open);
+        let master_gone = c
+            .rule
+            .is_some_and(|r| hidden.iter().chain(&absent).any(|n| n == r.master));
+        let (enabled, reason) = enabled(c, !conditions.is_empty(), held, inp.open, master_gone);
         let value = effective[i];
         let kind = kind(c, value);
         let setting = Setting {
@@ -438,6 +465,8 @@ pub fn build(inp: &Inputs<'_>) -> CameraSettings {
         mic: Vec::new(),
         mode: None,
         notes,
+        hidden,
+        absent,
     }
 }
 
@@ -530,8 +559,14 @@ pub fn check_mode(
 }
 
 /// The candidate of one enumerated control, or `None` (with a note when it
-/// is worth one) when it is not published.
-fn control_candidate(c: &NodeControl, seq: usize, notes: &mut Vec<String>) -> Option<Candidate> {
+/// is worth one, its name in `absent` for a menu without an item) when it
+/// is not published.
+fn control_candidate(
+    c: &NodeControl,
+    seq: usize,
+    notes: &mut Vec<String>,
+    absent: &mut Vec<String>,
+) -> Option<Candidate> {
     if is_never_exposed(c.id, &c.name) {
         return None;
     }
@@ -605,7 +640,7 @@ fn control_candidate(c: &NodeControl, seq: usize, notes: &mut Vec<String>) -> Op
         CTRL_TYPE_MENU | CTRL_TYPE_INTEGER_MENU => {
             let (options, labels) = menu_options(c, k, &name, notes);
             if options.is_empty() {
-                notes.push(format!("{name} is a menu without an item: left out"));
+                absent.push(name);
                 return None;
             }
             (Values::Options(options), labels)
@@ -793,8 +828,15 @@ fn holds(cond: &Condition, master: Option<SettingValue>) -> bool {
     }
 }
 
-/// `(enabled, disabled_reason)` (see the module docs).
-fn enabled(c: &Candidate, ruled: bool, held: bool, open: bool) -> (bool, &'static str) {
+/// `(enabled, disabled_reason)` (see the module docs). `master_gone`: the
+/// node has the master of `c`'s rule but the model left it out.
+fn enabled(
+    c: &Candidate,
+    ruled: bool,
+    held: bool,
+    open: bool,
+    master_gone: bool,
+) -> (bool, &'static str) {
     if c.flags & (CTRL_FLAG_DISABLED | CTRL_FLAG_READ_ONLY) != 0 {
         return (false, REASON_FIXED);
     }
@@ -811,6 +853,8 @@ fn enabled(c: &Candidate, ruled: bool, held: bool, open: bool) -> (bool, &'stati
                 return (false, rule.reason);
             }
         }
+        // Its master is left out: nothing makes it active.
+        Some(rule) if inactive && master_gone => return (false, rule.no_master),
         _ => {
             if inactive {
                 return (false, REASON_INACTIVE);
