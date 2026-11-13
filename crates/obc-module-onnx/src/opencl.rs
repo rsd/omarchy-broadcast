@@ -8,9 +8,10 @@
 //! runtime-suspended NVIDIA GPU, and the process keeps the device files
 //! open until it exits, though OpenVINO then runs on the Intel GPU.
 //!
-//! So before the first `openvino-gpu` session (an explicit choice, or
-//! `auto` reaching it), [`limit_once`] points `OCL_ICD_VENDORS` at a
-//! directory holding links to the Intel GPU drivers' `.icd` files only
+//! So when the module starts (its `init`, whatever engine is chosen, so
+//! before any session of any engine), [`limit_once`] points
+//! `OCL_ICD_VENDORS` at a directory holding links to the Intel GPU
+//! drivers' `.icd` files only
 //! ([`intel_gpu_icds`]: those naming `libigdrcl*`, Intel's compute
 //! runtime), `$XDG_RUNTIME_DIR/omarchy-broadcast/opencl-vendors/` (else
 //! the module's cache directory). The value ends with `/`: the loader the
@@ -28,14 +29,15 @@
 //!
 //! The loader reads the variable once, at the first OpenCL call of the
 //! process; nothing else in the daemon makes one (the other modules use
-//! CUDA, not OpenCL), so the first `openvino-gpu` session is that call. If
-//! the loader is already in the process when the variable is set, a warning
-//! says the limit may come too late.
+//! CUDA, not OpenCL), so the first `openvino-gpu` session, which comes
+//! after `init`, is that call. If the loader is already in the process when
+//! the variable is set, a warning says the limit may come too late.
 //!
 //! The variable is set in the process's environment (no OpenCL loader
-//! takes its configuration any other way), which is the residual hazard:
-//! see the SAFETY comment in [`limit_once`]. It is inherited by the
-//! processes the daemon starts afterwards.
+//! takes its configuration any other way), at the earliest point the
+//! module controls: see the SAFETY comment in `limit` for the threads
+//! that exist then and the residual hazard. It is inherited by the
+//! processes the daemon starts afterwards (none of which uses OpenCL).
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -171,8 +173,10 @@ fn loader_loaded() -> bool {
 }
 
 /// Limits the OpenCL drivers to the Intel GPU ones ([`plan`]), once per
-/// process, before the first session on OpenVINO's GPU device. `cache` is
-/// the module's cache directory, used when `$XDG_RUNTIME_DIR` is not set.
+/// process (the module's library is never unloaded, so a second `init` in
+/// the process finds it done), from the module's `init`: before any
+/// session on OpenVINO's GPU device. `cache` is the module's cache
+/// directory, used when `$XDG_RUNTIME_DIR` is not set.
 pub fn limit_once(cache: Option<&Path>) {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| limit(cache));
@@ -211,15 +215,31 @@ fn limit(cache: Option<&Path>) {
         }
     };
     let late = loader_loaded();
-    // SAFETY: `setenv` is not synchronised with a `getenv` or a walk of
-    // `environ` in another thread that does not go through Rust's
-    // environment lock (C code: GStreamer, ONNX Runtime, OpenVINO). This
-    // runs once per process (`limit_once`), only on the thread loading an
-    // `openvino-gpu` session, and sets one variable no other code of the
-    // process reads before the OpenCL loader's first call, which this
-    // precedes; the residual hazard is another thread reading some other
-    // variable at the instant this one is added (glibc may move the array
-    // of variables then). There is no other way to configure the loader.
+    // SAFETY: `setenv` is synchronised with the other Rust threads (std's
+    // environment lock), not with C code that calls `getenv` or walks
+    // `environ` on another thread. This runs once per process
+    // (`limit_once`), from the module's `init`: the host's first call into
+    // the module, made on the thread that opens the modules (in the daemon,
+    // its controller thread). No thread of this module, of ONNX Runtime or
+    // of OpenVINO exists then: the runtime is loaded by the first `check`
+    // or load, after `init`, so the only code that reads the variable has
+    // not started. Which other threads exist depends on when the module is
+    // first opened. Usually that is the daemon's start-up, before any
+    // camera session: its own Rust threads (the async runtime, the D-Bus
+    // connection, the device, consumer and media watchers), whose
+    // environment reads take the lock, and, when the loopback writer
+    // already runs its idle output, the GStreamer threads of that pipeline.
+    // A module enabled, reloaded or released from a module conflict later
+    // is first opened while a session may run: then the session's GStreamer
+    // threads and the threads of the other modules' runtimes (CUDA,
+    // Maxine) exist too. All of that is C code the lock does not cover. The
+    // residual hazard is such code reading a variable at the instant this
+    // one is added (glibc may then move the array of variables). It is
+    // accepted: the window is one call, once per process, never on a frame
+    // path; the C libraries named read their environment mostly when they
+    // start, not per frame; and there is no other way to configure the
+    // OpenCL loader that keeps the daemon free of any knowledge of OpenCL
+    // or OpenVINO.
     unsafe { std::env::set_var(VENDORS_ENV, &value) };
     let names: Vec<String> = icds.iter().map(|p| p.display().to_string()).collect();
     log::info!(

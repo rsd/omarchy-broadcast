@@ -15608,6 +15608,60 @@ fn the_elements_refused_switch_is_a_warning_clause_while_it_holds() {
     assert_eq!(snap.state, before.state);
 }
 
+/// The notice of the effect module's load in force (an engine chosen that
+/// cannot run, and the one used): a `Warning` clause naming the module,
+/// after the refused switch's, bounded and sanitised, while it holds;
+/// `Error`, the state and the stored setting stay.
+#[test]
+fn the_elements_load_notice_is_a_warning_clause_while_it_holds() {
+    let mut h = H::new("", |_| {});
+    h.set_effect("blur", 0).unwrap();
+    h.activate(100);
+    let before = h.snap();
+    let notice = "NVIDIA TensorRT was chosen and cannot run: not installed\u{1}; using NVIDIA CUDA";
+    h.world().load_notice = Some(notice.into());
+    h.world().switch_error = Some("the image cannot be read".into());
+    h.tick(1000);
+    let snap = h.snap();
+    let clause = "NVIDIA Maxine video effects: NVIDIA TensorRT was chosen and cannot run: \
+                  not installed; using NVIDIA CUDA";
+    assert!(snap.warning.contains(clause), "{}", snap.warning);
+    assert!(
+        !snap.warning.contains('\u{1}'),
+        "sanitised: {}",
+        snap.warning
+    );
+    let refused = snap.warning.find("keeps running").unwrap();
+    assert!(
+        refused < snap.warning.find(clause).unwrap(),
+        "after the refused switch's clause: {}",
+        snap.warning
+    );
+    assert_eq!(snap.error, before.error, "never Error");
+    assert_eq!(snap.state, before.state);
+    assert_eq!(snap.effect, "blur", "the setting stays");
+    // Bounded as the other clauses: the whole stays within the cap.
+    h.world().load_notice = Some("x".repeat(4000));
+    h.tick(1500);
+    let snap = h.snap();
+    assert!(
+        snap.warning.len() <= super::WARNING_MAX,
+        "{}",
+        snap.warning.len()
+    );
+    h.world().load_notice = None;
+    h.world().switch_error = None;
+    h.tick(2000);
+    let snap = h.snap();
+    assert!(
+        !snap.warning.contains("chosen and cannot run"),
+        "{}",
+        snap.warning
+    );
+    assert!(!snap.warning.contains("xxxx"), "{}", snap.warning);
+    assert_eq!(snap.state, before.state);
+}
+
 #[test]
 fn background_changes_mid_stream_never_restart_the_session() {
     use crate::media::{Codec, Container};

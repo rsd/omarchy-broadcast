@@ -243,6 +243,7 @@ impl StageChain for FakeChain {
             load_ms: cfg.load_delay.as_secs_f64() * 1000.0,
             warmup_ms: None,
             reused_model: !had.is_empty(),
+            notice: None,
         })
     }
 

@@ -1306,6 +1306,7 @@ impl MediaBackend for GstBackend {
             fallback_error: stats.fallback_error,
             background_error: stats.background_error,
             switch_error: stats.switch_error,
+            load_notice: stats.load_notice,
             stage_values: output.stage_values(),
         })
     }

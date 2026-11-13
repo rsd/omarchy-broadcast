@@ -72,6 +72,9 @@ pub const FAKE_STRAY_STAGE: StageId = StageId::ENHANCE;
 /// The denoise stage time the fake reports (`timings`), in ms, for a
 /// completed frame the stage ran on.
 pub const FAKE_DENOISE_MS: f32 = 0.25;
+/// The reason of the first call of an instance whose chain was taken away
+/// ([`FakeConfig::lose_others_on_load`]).
+pub const LOST_REASON: &str = "the module panicked: its chain is lost";
 /// The luma the fake relight stage writes when it runs without an effect.
 pub const FAKE_RELIGHT_Y: u8 = 150;
 /// What the fake relight stage adds to an effect's luma.
@@ -109,6 +112,23 @@ pub struct FakeConfig {
     pub fail_create: Option<String>,
     /// `load` fails with this reason.
     pub fail_load: Option<String>,
+    /// `create` fails with this reason while another instance of the
+    /// factory is alive (created and not dropped): a backend without room
+    /// for two.
+    pub fail_beside_another: Option<String>,
+    /// Every `load` fails with `BackendError::Load` and this reason, and
+    /// the instance loses whatever chain it had, as a module instance whose
+    /// load panicked does (the host unloads it).
+    pub panic_load: Option<String>,
+    /// The next `load` (then cleared) first takes the chain of every
+    /// instance created before it away, as a module instance loses it
+    /// after a panic, without any call of theirs having failed yet: their
+    /// `is_loaded` is false, and their next call fails with
+    /// [`LOST_REASON`].
+    pub lose_others_on_load: bool,
+    /// Every `load` that succeeds reports this notice
+    /// (`LoadReport::notice`).
+    pub load_notice: Option<String>,
     /// `process` fails with this reason (after `fail_denoise_process`, so
     /// with both set a frame fails in the stage, then again without it).
     pub fail_process: Option<String>,
@@ -197,6 +217,9 @@ pub struct FakeLog {
     pub relight_rebinds: AtomicU64,
     /// Chains lost on their own ([`FakeConfig::lose_chain_on_process`]).
     pub lost_chains: AtomicU64,
+    /// The instances whose chain was taken away by
+    /// [`FakeConfig::lose_others_on_load`].
+    pub silently_lost: Mutex<Vec<u64>>,
     /// Successful `load_host` calls (counted in [`Self::loads`] too).
     pub host_loads: AtomicU64,
     /// Successful `process_host` calls (counted in [`Self::processes`]
@@ -282,6 +305,10 @@ impl BackendFactory for FakeFactory {
 
     fn create(&self) -> Result<Box<dyn InferenceBackend>, BackendError> {
         self.probe()?;
+        let alive = FakeLog::get(&self.log.creates) - FakeLog::get(&self.log.drops);
+        if let Some(r) = self.cfg().fail_beside_another.filter(|_| alive > 0) {
+            return Err(BackendError::Unavailable(r));
+        }
         let id = self.log.creates.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(Box::new(FakeBackend {
             id,
@@ -332,6 +359,11 @@ pub struct FakeBackend {
 }
 
 impl FakeBackend {
+    /// Its chain was taken away ([`FakeConfig::lose_others_on_load`]).
+    fn silently_lost(&self) -> bool {
+        self.log.silently_lost.lock().unwrap().contains(&self.id)
+    }
+
     fn check_context(&self, expected: *mut c_void) {
         let current = obc_gpu::current_context().unwrap_or(std::ptr::null_mut());
         if current.is_null() || current != expected {
@@ -361,6 +393,9 @@ impl FakeBackend {
             .and_then(|p| p.get(RELIGHT_LIGHT))
             .and_then(|v| v.as_str())
             .map_or(Ok(RelightLight::default()), str::parse)?;
+        if self.silently_lost() {
+            self.unload();
+        }
         let cfg = self.config.lock().unwrap().clone();
         let t0 = Instant::now();
         let reused = self.loaded.is_some();
@@ -371,6 +406,17 @@ impl FakeBackend {
         } else {
             cfg.switch_delay
         });
+        if cfg.lose_others_on_load {
+            self.config.lock().unwrap().lose_others_on_load = false;
+            self.log.silently_lost.lock().unwrap().extend(1..self.id);
+        }
+        if let Some(r) = cfg.panic_load {
+            self.unload();
+            return Err(BackendError::Load {
+                code: -7,
+                message: r,
+            });
+        }
         if let Some(r) = cfg.fail_load {
             if !reused {
                 self.loaded = None;
@@ -490,6 +536,7 @@ impl FakeBackend {
             load_ms: ms,
             warmup_ms: Some(0.0),
             reused_model: reused,
+            notice: cfg.load_notice,
         })
     }
 
@@ -499,6 +546,13 @@ impl FakeBackend {
         let hook = self.config.lock().unwrap().on_process.take();
         if let Some(hook) = hook {
             (hook.0)();
+        }
+        if self.silently_lost() {
+            self.unload();
+            return Err(BackendError::Run {
+                code: -7,
+                message: LOST_REASON.into(),
+            });
         }
         let lose = self.config.lock().unwrap().lose_chain_on_process.take();
         if let Some(r) = lose
@@ -688,12 +742,18 @@ impl InferenceBackend for FakeBackend {
         Ok(())
     }
 
-    /// Whether a chain is loaded: not after [`FakeConfig::lose_chain_on_process`].
+    /// Whether a chain is loaded: not after [`FakeConfig::lose_chain_on_process`]
+    /// or [`FakeConfig::lose_others_on_load`].
     fn is_loaded(&self) -> bool {
-        self.loaded.is_some()
+        self.loaded.is_some() && !self.silently_lost()
     }
 
     fn unload(&mut self) {
+        self.log
+            .silently_lost
+            .lock()
+            .unwrap()
+            .retain(|i| *i != self.id);
         self.denoise = false;
         self.relight = false;
         self.timed = (false, false);

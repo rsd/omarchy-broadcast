@@ -821,7 +821,7 @@ impl LoadRequest {
 }
 
 /// The outcome of a successful [`InferenceBackend::load`].
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct LoadReport {
     /// Wall time of the load itself (models, buffers), in milliseconds.
     pub load_ms: f64,
@@ -835,6 +835,12 @@ pub struct LoadReport {
     /// request needs were kept (the mask model, the stages' models), so the
     /// load cost only the effect-specific part.
     pub reused_model: bool,
+    /// What the user should know of this load, which succeeded: a setting
+    /// the backend could not honour and what runs in its place (an engine
+    /// chosen in a module's settings that cannot run, and the one the chain
+    /// runs on instead; a module's `notice`, ABI 1.5). It holds while the
+    /// chain runs: the next load that reports none ends it.
+    pub notice: Option<String>,
 }
 
 /// Per-frame parameters that change without a reload.

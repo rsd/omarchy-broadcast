@@ -544,6 +544,15 @@ pub struct EffectStats {
     /// again), and after an unload, a full reload (new caps), a failure of
     /// the effect, a revocation and a stop.
     pub switch_error: Option<String>,
+    /// What the backend said of the load in force, which succeeded: a
+    /// setting it could not honour and what runs in its place (a module's
+    /// notice, ABI 1.5: an engine chosen in its settings that cannot run,
+    /// and the one its chain runs on instead). The settings stay as they
+    /// were applied. Set by every load (`None` when it reports none), kept
+    /// while that chain runs (a refused switch leaves it), and `None` once
+    /// nothing is loaded (an unload, the effect turned off), after a failure
+    /// of the effect, a revocation, new caps and a stop.
+    pub load_notice: Option<String>,
     /// Whether the video background's decode pipeline exists: only while
     /// replace with a video is loaded on a backend that takes per-frame
     /// backgrounds, and, after the video is turned off, until the requested

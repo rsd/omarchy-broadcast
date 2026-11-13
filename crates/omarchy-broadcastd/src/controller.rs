@@ -1441,6 +1441,10 @@ pub struct Controller<B: MediaBackend> {
     /// of the background effect's settings, the previous setting running
     /// on (a `Warning` clause, [`Self::switch_warning`]).
     switch_failure: Option<String>,
+    /// What the running session's effect element's module said of the load
+    /// in force: a setting it could not honour and what runs in its place
+    /// (a `Warning` clause, [`Self::load_notice_warning`]).
+    load_notice: Option<String>,
     /// What video backgrounds are asked of ([`Self::set_videos`]).
     videos: Box<dyn VideoService>,
     /// The background in force last examined by [`Self::follow_video`].
@@ -1946,6 +1950,7 @@ impl<B: MediaBackend> Controller<B> {
             fallback_failure: None,
             background_failure: None,
             switch_failure: None,
+            load_notice: None,
             videos: Box::new(NoGallery),
             video_for: None,
             video: None,
@@ -2806,6 +2811,7 @@ impl<B: MediaBackend> Controller<B> {
                 .chain(self.fallback_warnings())
                 .chain(self.video_warnings())
                 .chain(self.switch_warning())
+                .chain(self.load_notice_warning())
                 .chain(still_video)
                 .chain(dropped_text(&dropped))
                 .chain(self.held_warning())
@@ -2829,18 +2835,41 @@ impl<B: MediaBackend> Controller<B> {
     fn switch_warning(&self) -> Option<String> {
         self.session.as_ref()?;
         let why = self.switch_failure.as_deref()?;
-        let label = self
-            .plan
+        Some(format!(
+            "{}: {}; the previous setting keeps running",
+            self.effect_module_label(),
+            settings::sanitise(why, STAGE_REASON_MAX)
+        ))
+    }
+
+    /// `Warning`'s clause of what the running session's effect module said
+    /// of the load in force, which succeeded (its notice, ABI 1.5: an
+    /// engine chosen in its settings that cannot run, and the one it runs
+    /// on instead): the module's name (the effect's mode without one) and
+    /// the notice, made safe to show and bounded as the other clauses.
+    /// Neither `Error` nor the state changes, and the setting stays as the
+    /// user stored it. A module of ABI 1.4 or older never has one.
+    fn load_notice_warning(&self) -> Option<String> {
+        self.session.as_ref()?;
+        let notice = self.load_notice.as_deref()?;
+        Some(format!(
+            "{}: {}",
+            self.effect_module_label(),
+            settings::sanitise(notice, STAGE_REASON_MAX)
+        ))
+    }
+
+    /// The name the effect element's clauses give its module: the module
+    /// that runs the background effect, made safe to show, or the effect's
+    /// mode without one.
+    fn effect_module_label(&self) -> String {
+        self.plan
             .as_ref()
             .and_then(|p| p.provider(&StageId::BACKGROUND))
             .map_or_else(
                 || format!("effect {}", self.effect().mode),
                 |id| settings::sanitise(&self.modules.name_of(id), modules::NAME_MAX),
-            );
-        Some(format!(
-            "{label}: {}; the previous setting keeps running",
-            settings::sanitise(why, STAGE_REASON_MAX)
-        ))
+            )
     }
 
     /// `Warning`'s clause of the module the running session keeps for its
@@ -4020,6 +4049,7 @@ impl<B: MediaBackend> Controller<B> {
         };
         self.background_failure.clone_from(&report.background_error);
         self.switch_failure.clone_from(&report.switch_error);
+        self.load_notice.clone_from(&report.load_notice);
         if self.follow_effect(&report, now) {
             return true;
         }
@@ -4827,6 +4857,7 @@ impl<B: MediaBackend> Controller<B> {
         self.fallback_failure = None;
         self.background_failure = None;
         self.switch_failure = None;
+        self.load_notice = None;
         let enhance = self.enhance_failure.take();
         if stages || enhance.is_some_and(|e| e == self.error) {
             self.error = self.standing_error();

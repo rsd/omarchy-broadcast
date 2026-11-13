@@ -1159,18 +1159,45 @@ fn blur_chair(on: bool) -> EffectSettings {
     s
 }
 
-/// The `switch-error` fields of the status messages posted so far.
-fn switch_errors(rig: &HostRig) -> Vec<String> {
+/// The `field` of the status messages posted so far (taken off the bus).
+fn status_fields(rig: &HostRig, field: &str) -> Vec<String> {
     let bus = rig.pipeline.bus().unwrap();
     let mut v = Vec::new();
     while let Some(m) = bus.pop_filtered(&[gst::MessageType::Element]) {
         if let Some(s) = m.structure()
             && s.name() == STATUS_MESSAGE
         {
-            v.push(s.get::<String>("switch-error").unwrap());
+            v.push(s.get::<String>(field).unwrap());
         }
     }
     v
+}
+
+/// The `switch-error` fields of the status messages posted so far.
+fn switch_errors(rig: &HostRig) -> Vec<String> {
+    status_fields(rig, "switch-error")
+}
+
+/// Waits until a status message posted since the bus was last read has
+/// `field` at `want`: a message is posted after the lock that changed the
+/// value is released, so it may come a moment after the value reads so,
+/// and messages of two threads (the worker's, an `apply`'s) may come in
+/// either order, so the one that says `want` need not be the last.
+#[track_caller]
+fn wait_posted(rig: &HostRig, field: &str, want: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut posted = Vec::new();
+    loop {
+        posted.extend(status_fields(rig, field));
+        if posted.iter().any(|v| v == want) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{field} {want:?} is posted; posted: {posted:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// The instances that processed the frames so far, in order.
@@ -1217,11 +1244,7 @@ fn host_a_refused_switch_of_the_same_effect_keeps_the_previous_chain_running() {
     assert!(processed_by(&fake).iter().all(|i| *i == 1));
     assert_eq!(get(&fake.log.creates), 2);
     assert_eq!(*fake.log.dropped_ids.lock().unwrap(), [2]);
-    assert_eq!(
-        switch_errors(&rig).last().map(String::as_str),
-        Some("the engine is not installed"),
-        "posted"
-    );
+    wait_posted(&rig, "switch-error", "the engine is not installed");
 
     // The previous value again: the chain loaded is the request's.
     chair(&rig.effect, false);
@@ -1230,12 +1253,7 @@ fn host_a_refused_switch_of_the_same_effect_keeps_the_previous_chain_running() {
     });
     assert!(seen.iter().all(|s| *s == Seen::FakeBlur), "{seen:?}");
     // Posted once the lock that cleared it is released.
-    let posted = std::cell::RefCell::new(Vec::new());
-    wait_for("the cleared switch-error is posted", || {
-        let mut p = posted.borrow_mut();
-        p.extend(switch_errors(&rig));
-        p.last().is_some_and(String::is_empty)
-    });
+    wait_posted(&rig, "switch-error", "");
     assert_eq!(get(&fake.log.creates), 2, "nothing loaded again");
 
     // A switch on the loaded instance (a stage turned on) refused without
@@ -1428,8 +1446,9 @@ fn host_a_second_instance_superseded_revoked_or_stopped_mid_load_is_never_instal
 /// What is not a refused switch fails as before: a switch to another
 /// effect fails the effect, and so does a full reload (new caps), which
 /// clears a refused switch. A stage failing on the second instance is a
-/// refusal (the loaded chain is intact); it then loads against the chain
-/// in force, where its failure drops it.
+/// refusal (the loaded chain is intact), with one load on a second
+/// instance, never tried on the loaded one; it then loads against the
+/// chain in force, where its failure drops it.
 #[test]
 fn host_a_stage_a_new_effect_or_a_full_reload_failing_is_not_a_refused_switch() {
     let fake = FakeFactory::new(FakeConfig::default());
@@ -1454,8 +1473,16 @@ fn host_a_stage_a_new_effect_or_a_full_reload_failing_is_not_a_refused_switch() 
     });
     assert!(seen.iter().all(|s| *s == Seen::FakeBlur), "{seen:?}");
     assert_eq!(rig.frame(), Seen::FakeBlur);
+    assert_eq!(get(&fake.log.creates), 2, "one second instance");
     assert_eq!(*fake.log.dropped_ids.lock().unwrap(), [2]);
     assert!(processed_by(&fake).iter().all(|i| *i == 1));
+    assert!(
+        chair_loads(&fake)
+            .iter()
+            .all(|(_, c)| *c != Some(Value::Bool(true))),
+        "the new parameters never loaded on the loaded instance: {:?}",
+        chair_loads(&fake)
+    );
     assert_eq!(rig.effect.status(), EffectStatus::Ready);
     assert_eq!(
         rig.effect.stage_status("denoise"),
@@ -1610,7 +1637,8 @@ fn host_requests_while_a_switch_stands_refused_load_against_the_parameters_in_fo
 
 /// A refusal needs the previous chain running: when it fails (or loses its
 /// chain) on a frame while the second instance loads, the effect's failure
-/// stands, black, and no refusal is reported.
+/// stands, black, with the frame's reason (the module that panicked, not
+/// the refused switch's), and no refusal is reported.
 #[test]
 fn host_a_refusal_never_hides_a_failure_of_the_previous_chain_meanwhile() {
     for lose in [false, true] {
@@ -1637,15 +1665,322 @@ fn host_a_refusal_never_hides_a_failure_of_the_previous_chain_meanwhile() {
         for _ in 0..3 {
             assert_eq!(rig.frame(), Seen::Black, "lose: {lose}");
         }
+        let frame_reason = if lose {
+            "the module panicked"
+        } else {
+            "broken"
+        };
+        let status = rig.effect.status();
         assert!(
-            matches!(rig.effect.status(), EffectStatus::Failed(_)),
-            "lose: {lose}: {:?}",
-            rig.effect.status()
+            matches!(&status, EffectStatus::Failed(r)
+                if r.contains(frame_reason) && !r.contains("not installed")),
+            "lose: {lose}: {status:?}"
         );
         assert_eq!(rig.effect.stats().switch_error, None, "lose: {lose}");
         rig.stop();
         assert_no_cuda(&rig, &fake);
     }
+}
+
+/// The background parameters loaded on the second instance whose load
+/// succeeded on the loaded one, by the instance that loaded them.
+fn chair_loads(fake: &FakeFactory) -> Vec<(u64, Option<Value>)> {
+    fake.log
+        .background_loads
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(id, p)| (*id, p.get("chair").cloned()))
+        .collect()
+}
+
+/// A switch for which no second instance can be created (a backend
+/// without room for two) loads on the loaded instance: not a refusal, the
+/// new parameters in force, no black frame.
+#[test]
+fn host_a_switch_without_room_for_a_second_instance_loads_on_the_loaded_one() {
+    let fake = FakeFactory::new(FakeConfig {
+        fail_beside_another: Some("no room for a second session".into()),
+        ..FakeConfig::default()
+    });
+    let mut rig = HostRig::new(Some(Arc::clone(&fake)), &blur_chair(false));
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    let black = rig.effect.stats().frames_black;
+    chair(&rig.effect, true);
+    let seen = rig.frames_until(Duration::from_secs(5), |_| {
+        chair_loads(&fake).last() == Some(&(1, Some(Value::Bool(true))))
+    });
+    assert!(seen.iter().all(|s| *s == Seen::FakeBlur), "{seen:?}");
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    assert_eq!(get(&fake.log.creates), 1, "no second instance");
+    assert!(fake.log.dropped_ids.lock().unwrap().is_empty());
+    let stats = rig.effect.stats();
+    assert_eq!(stats.status, EffectStatus::Ready);
+    assert_eq!(stats.switch_error, None, "not a refusal");
+    assert_eq!(stats.frames_black, black, "no black frame");
+    // Nothing is remembered as refused: the previous value loads too.
+    chair(&rig.effect, false);
+    rig.frames_until(Duration::from_secs(5), |_| {
+        chair_loads(&fake).last() == Some(&(1, Some(Value::Bool(false))))
+    });
+    assert_eq!(rig.effect.stats().switch_error, None);
+
+    // Its failure there is a refused switch, as on CUDA frames.
+    fake.set(|c| c.fail_load = Some("the engine is not installed".into()));
+    chair(&rig.effect, true);
+    let seen = rig.frames_until(Duration::from_secs(5), |r| {
+        r.effect.stats().switch_error.is_some()
+    });
+    assert!(seen.iter().all(|s| *s == Seen::FakeBlur), "{seen:?}");
+    assert_eq!(rig.effect.status(), EffectStatus::Ready);
+    assert_eq!(
+        rig.effect.stats().switch_error.as_deref(),
+        Some("the engine is not installed")
+    );
+    assert_eq!(get(&fake.log.creates), 1, "still no second instance");
+    rig.stop();
+    assert_no_cuda(&rig, &fake);
+}
+
+/// A load on the second instance that panics (the module host unloads
+/// that instance) is a refused switch at once: the running chain is not
+/// touched (never loaded again, never unloaded), every frame is the
+/// effect's, and nothing is tried on the loaded instance.
+#[test]
+fn host_a_panicking_load_on_the_second_instance_is_a_refusal() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let mut rig = HostRig::new(Some(Arc::clone(&fake)), &blur_chair(false));
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    let black = rig.effect.stats().frames_black;
+    let loads = get(&fake.log.loads);
+    fake.set(|c| c.panic_load = Some("the module panicked".into()));
+    chair(&rig.effect, true);
+    let seen = rig.frames_until(Duration::from_secs(5), |r| {
+        r.effect.stats().switch_error.is_some()
+    });
+    assert!(seen.iter().all(|s| *s == Seen::FakeBlur), "{seen:?}");
+    for _ in 0..5 {
+        assert_eq!(rig.frame(), Seen::FakeBlur);
+    }
+    let stats = rig.effect.stats();
+    assert_eq!(stats.status, EffectStatus::Ready);
+    assert_eq!(stats.switch_error.as_deref(), Some("the module panicked"));
+    assert_eq!(stats.frames_black, black, "no black frame");
+    assert_eq!(get(&fake.log.creates), 2);
+    assert_eq!(*fake.log.dropped_ids.lock().unwrap(), [2]);
+    assert!(
+        !fake.log.unloaded_ids.lock().unwrap().contains(&1),
+        "the running chain was unloaded"
+    );
+    assert!(processed_by(&fake).iter().all(|i| *i == 1));
+    assert_eq!(get(&fake.log.loads), loads, "no load succeeded");
+    rig.stop();
+    assert_no_cuda(&rig, &fake);
+}
+
+/// A refused switch that finds the previous chain lost before any frame
+/// failed on it (the module lost it on its own): the effect fails, black,
+/// with a reason that says the chain was lost and never the refusal's,
+/// in the status and in every status message; a retry loads afresh.
+#[test]
+fn host_a_chain_lost_before_any_frame_failed_is_never_reported_as_the_refusal() {
+    const REFUSAL: &str = "the engine is not installed";
+    let fake = FakeFactory::new(FakeConfig::default());
+    let mut rig = HostRig::new(Some(Arc::clone(&fake)), &blur_chair(false));
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    status_fields(&rig, "reason");
+    fake.set(|c| {
+        c.lose_others_on_load = true;
+        c.fail_load = Some(REFUSAL.into());
+    });
+    chair(&rig.effect, true);
+    // No frame meanwhile: the worker sees the chain lost first.
+    wait_for("the effect failed", || {
+        matches!(rig.effect.status(), EffectStatus::Failed(_))
+    });
+    let status = rig.effect.status();
+    assert!(
+        matches!(&status, EffectStatus::Failed(r) if r.contains("was lost") && !r.contains(REFUSAL)),
+        "{status:?}"
+    );
+    assert_eq!(rig.effect.stats().switch_error, None);
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::Black);
+    }
+    let mut reasons = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !reasons.iter().any(|r: &String| r.contains("was lost")) {
+        assert!(
+            Instant::now() < deadline,
+            "the failure is posted: {reasons:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        reasons.extend(status_fields(&rig, "reason"));
+    }
+    assert!(reasons.iter().all(|r| !r.contains(REFUSAL)), "{reasons:?}");
+
+    // A retry: nothing of the lost chain is in force, it loads again.
+    fake.set(|c| c.fail_load = None);
+    let same = rig.effect.settings();
+    rig.effect.apply(&same).unwrap();
+    rig.frames_until(Duration::from_secs(5), status_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    assert_eq!(rig.effect.stats().switch_error, None);
+    rig.stop();
+    assert_no_cuda(&rig, &fake);
+}
+
+/// Two settings refused one after the other (new background parameters,
+/// then an image that cannot be read) are both remembered: a later request
+/// that still asks for both loads against those in force, and neither is
+/// tried again in turn.
+#[test]
+fn host_two_refused_settings_are_both_remembered() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let dir = tempfile::tempdir().unwrap();
+    let good = png(dir.path(), "good.png", "smpte", W, H);
+    let junk = dir.path().join("junk.png");
+    std::fs::write(&junk, b"not an image").unwrap();
+    let mut start = blur_chair(false);
+    start.kind = EffectKind::Replace;
+    start.background = Some(good);
+    let mut rig = HostRig::new(Some(Arc::clone(&fake)), &start);
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeReplace);
+
+    // The parameters refused (on the second instance).
+    fake.set(|c| c.fail_load = Some("the engine is not installed".into()));
+    chair(&rig.effect, true);
+    rig.frames_until(Duration::from_secs(5), |r| {
+        r.effect.stats().switch_error.is_some()
+    });
+    // From now on a load of them would succeed: none may be made.
+    fake.set(|c| c.fail_load = None);
+    // Then the image refused, the parameters still asked for.
+    change(&rig.effect, |s| s.background = Some(junk.clone()));
+    rig.frames_until(Duration::from_secs(5), |r| {
+        r.effect
+            .stats()
+            .switch_error
+            .is_some_and(|e| e.contains("junk.png"))
+    });
+    // A stage turned on: loads against both settings in force.
+    change(&rig.effect, |s| {
+        s.stage_mut(&StageId::DENOISE).enabled = true
+    });
+    let seen = rig.frames_until(Duration::from_secs(5), |r| {
+        r.effect.stage_status("denoise") == EffectStatus::Ready
+    });
+    assert!(
+        seen.iter()
+            .all(|s| !matches!(s, Seen::Black | Seen::FullBlack | Seen::Input)),
+        "{seen:?}"
+    );
+    assert!(
+        chair_loads(&fake)
+            .iter()
+            .all(|(_, c)| *c != Some(Value::Bool(true))),
+        "the refused parameters were tried again: {:?}",
+        chair_loads(&fake)
+    );
+    let stats = rig.effect.stats();
+    assert_eq!(stats.status, EffectStatus::Ready);
+    assert!(stats.switch_error.is_some(), "the refusal stands");
+    rig.stop();
+    assert_no_cuda(&rig, &fake);
+}
+
+/// Setting a video background is no retry: a refused switch's settings
+/// are not tried again by it.
+#[test]
+fn host_setting_a_background_video_does_not_retry_a_refused_switch() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let mut rig = HostRig::new(Some(Arc::clone(&fake)), &blur_chair(false));
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    fake.set(|c| c.fail_load = Some("the engine is not installed".into()));
+    chair(&rig.effect, true);
+    rig.frames_until(Duration::from_secs(5), |r| {
+        r.effect.stats().switch_error.is_some()
+    });
+    fake.set(|c| c.fail_load = None);
+    let loads = get(&fake.log.loads);
+    rig.effect
+        .set_background_video(Some(Path::new("/nonexistent/clip.mp4")))
+        .unwrap();
+    for _ in 0..20 {
+        assert_eq!(rig.frame(), Seen::FakeBlur);
+    }
+    assert_eq!(get(&fake.log.loads), loads, "nothing loaded");
+    assert!(
+        chair_loads(&fake)
+            .iter()
+            .all(|(_, c)| *c != Some(Value::Bool(true))),
+        "{:?}",
+        chair_loads(&fake)
+    );
+    assert!(rig.effect.stats().switch_error.is_some());
+    rig.stop();
+    assert_no_cuda(&rig, &fake);
+}
+
+/// A load's notice (a module's, ABI 1.5: an engine chosen that cannot run,
+/// and the one used) is reported while its chain runs, in the stats and as
+/// the status message's `load-notice`; a refused switch keeps it (the chain
+/// runs), a load without one clears it, and so do the effect turned off
+/// and a stop.
+#[test]
+fn host_a_load_notice_is_reported_while_its_chain_runs() {
+    const NOTICE: &str = "Engine A was chosen and cannot run: no device; using B";
+    let fake = FakeFactory::new(FakeConfig {
+        load_notice: Some(NOTICE.into()),
+        ..FakeConfig::default()
+    });
+    let mut rig = HostRig::new(Some(Arc::clone(&fake)), &blur_chair(false));
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert_eq!(rig.effect.stats().load_notice.as_deref(), Some(NOTICE));
+    wait_posted(&rig, "load-notice", NOTICE);
+
+    // A refused switch: the chain in force runs on, and its notice holds.
+    fake.set(|c| c.fail_load = Some("the engine is not installed".into()));
+    chair(&rig.effect, true);
+    rig.frames_until(Duration::from_secs(5), |r| {
+        r.effect.stats().switch_error.is_some()
+    });
+    assert_eq!(rig.effect.stats().load_notice.as_deref(), Some(NOTICE));
+
+    // A load without a notice (the retry of the refused value) clears it.
+    fake.set(|c| {
+        c.fail_load = None;
+        c.load_notice = None;
+    });
+    let same = rig.effect.settings();
+    rig.effect.apply(&same).unwrap();
+    rig.frames_until(Duration::from_secs(5), |r| {
+        r.effect.stats().load_notice.is_none()
+    });
+    assert_eq!(rig.effect.stats().switch_error, None);
+    wait_posted(&rig, "load-notice", "");
+
+    // With one again, then the effect turned off: cleared.
+    fake.set(|c| c.load_notice = Some(NOTICE.into()));
+    chair(&rig.effect, false);
+    rig.frames_until(Duration::from_secs(5), |r| {
+        r.effect.stats().load_notice.is_some()
+    });
+    change(&rig.effect, |s| s.kind = EffectKind::None);
+    rig.frames_until(Duration::from_secs(5), |r| {
+        r.effect.stats().load_notice.is_none()
+    });
+    wait_posted(&rig, "load-notice", "");
+
+    // And a stop.
+    change(&rig.effect, |s| s.kind = EffectKind::Blur);
+    rig.frames_until(Duration::from_secs(5), |r| {
+        r.effect.stats().load_notice.is_some()
+    });
+    rig.stop();
+    assert_eq!(rig.effect.stats().load_notice, None, "a stop clears it");
+    assert_no_cuda(&rig, &fake);
 }
 
 /// New caps end a refused switch at once: nothing of it stays loaded, and

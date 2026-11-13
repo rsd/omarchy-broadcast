@@ -36,6 +36,9 @@ abi-1-2 = []
 # the host must never call it (a module of 1.3 takes no per-frame
 # background).
 abi-1-3 = []
+# The fixture module itself, exported as a module of ABI 1.4 (a module
+# built before ABI 1.5): the notice its loads report must never be read.
+abi-1-4 = []
 # The fixture module itself, its `instance_status_values` replaced by a raw
 # function that answers each call with the next shape of a fixed sequence
 # (a failure, a null or misaligned list, a list too long, bad entries), for

@@ -105,11 +105,20 @@
 //!   lock (with its key, the job's revocation count and memory, and the
 //!   load-time still back in force as after any load), the epoch moves, and
 //!   the old instance is unloaded and dropped; the next frame is the new
-//!   chain's. Any failure unloads and drops the new instance and is a
-//!   refused switch (above), a stage's included: the loaded chain is intact
-//!   and the stage may have failed only for want of room for two instances
-//!   (it then loads against the chain in force, where its failure drops
-//!   it). A request superseded meanwhile (a new request, a revocation: its
+//!   chain's. A failure of the new instance's load unloads and drops it
+//!   and is a refused switch at once (above), a stage's included: the
+//!   loaded chain is intact (the stage then loads against the chain in
+//!   force, where its failure drops it). It is never tried again on the
+//!   loaded instance: a load there builds the new chain before it lets the
+//!   old one go (the ONNX module's does), so it would free no room, and it
+//!   would hold the frames for a second load under the lock, and a panic
+//!   or a stage error in it would lose the running chain. Only when no
+//!   second instance can be created at all (the factory refuses it: a
+//!   backend without room for two) does the switch run on the loaded
+//!   instance under the lock, as on CUDA frames (the frames wait for it),
+//!   with their rules: its failure is a refused switch, or the failure of
+//!   the effect when the chain is lost with it. A request superseded
+//!   meanwhile (a new request, a revocation: its
 //!   new request number, a stop) drops the new instance, unloaded, before
 //!   it is installed, and the next job runs from the loaded one; a
 //!   revocation between that check and the swap leaves an instance of the
@@ -644,6 +653,19 @@ struct Control {
     /// is tried again when the request changes it, and on an `apply` with
     /// `retry` that changes nothing.
     switch_refused: Option<RefusedBackground>,
+    /// The backend's notice of the load in force ([`EffectStats::load_notice`]):
+    /// set by every load (none when it reports none), kept while that chain
+    /// runs (a refused switch included), and cleared when nothing is loaded
+    /// after a job, on a failure of the effect, a revocation, new caps and a
+    /// stop.
+    load_notice: Option<String>,
+    /// The reason the worker gave the effect's failure ([`LOST_CHAIN`],
+    /// never the refusal's) when a refused switch found the previous chain
+    /// lost (`worker_loop`): the frame that lost it, failing after,
+    /// replaces it with its own reason ([`ObcEffect::fail`]), which says
+    /// why the chain was lost. Cleared with the chain in force
+    /// ([`Control::end_chain`]).
+    lost_switch: Option<String>,
     stop: bool,
     last_load_ms: Option<f64>,
     last_load_reused: bool,
@@ -720,6 +742,8 @@ impl Default for Control {
             refused: None,
             switch_error: None,
             switch_refused: None,
+            load_notice: None,
+            lost_switch: None,
             stop: false,
             last_load_ms: None,
             last_load_reused: false,
@@ -809,6 +833,16 @@ impl Control {
     fn clear_switch(&mut self) {
         self.switch_error = None;
         self.switch_refused = None;
+    }
+
+    /// Forgets what the chain in force had: a refused switch
+    /// ([`Self::clear_switch`]), the load's notice and a failure given in
+    /// place of a lost chain's reason ([`Control::lost_switch`]). On a
+    /// failure of the effect, a revocation, new caps and a stop.
+    fn end_chain(&mut self) {
+        self.clear_switch();
+        self.load_notice = None;
+        self.lost_switch = None;
     }
 
     /// What the worker loads for the request: the target without the
@@ -937,7 +971,7 @@ impl Control {
         self.generation += 1;
         self.epoch += 1;
         self.loaded_kind = None;
-        self.clear_switch();
+        self.end_chain();
         for s in self.stage_ids() {
             if self.effective(s.as_str()) {
                 self.stage_mut(&s).status = EffectStatus::Failed(NO_BACKEND.into());
@@ -985,6 +1019,7 @@ impl Control {
             fallback_error: self.fallback.error.clone(),
             background_error: self.video.error.clone(),
             switch_error: self.switch_error.clone(),
+            load_notice: self.load_notice.clone(),
             kind: self.settings.kind,
             status: self.status.clone(),
             stages: self
@@ -1024,6 +1059,25 @@ impl RefusedBackground {
             ),
         };
         (r.params.0 != r.params.1 || r.still.0 != r.still.1).then_some(r)
+    }
+
+    /// This refusal with `newer`'s besides: each setting `newer` refused
+    /// (its parameters, its still) replaces this one's, and one it did not
+    /// refuse stays as this one had it. Both are of jobs loaded against the
+    /// settings in force, so those agree.
+    fn merged(self, newer: RefusedBackground) -> RefusedBackground {
+        RefusedBackground {
+            params: if newer.params.0 != newer.params.1 {
+                newer.params
+            } else {
+                self.params
+            },
+            still: if newer.still.0 != newer.still.1 {
+                newer.still
+            } else {
+                self.still
+            },
+        }
     }
 
     /// `target` with the settings in force in place of the refused ones it
@@ -1109,6 +1163,8 @@ struct Report {
     background_error: Option<String>,
     /// Why the last switch was refused ([`Control::switch_error`]).
     switch_error: Option<String>,
+    /// The notice of the load in force ([`Control::load_notice`]).
+    load_notice: Option<String>,
 }
 
 impl Report {
@@ -1121,12 +1177,14 @@ impl Report {
             &self.fallback_error,
             &self.background_error,
             &self.switch_error,
+            &self.load_notice,
         ) == (
             now.kind,
             &now.status,
             &now.fallback_error,
             &now.background_error,
             &now.switch_error,
+            &now.load_notice,
         ) && self
             .stages
             .iter()
@@ -1428,7 +1486,8 @@ fn post_status(element: &super::ObcEffect, r: &Report) {
             "background-error",
             r.background_error.as_deref().unwrap_or(""),
         )
-        .field("switch-error", r.switch_error.as_deref().unwrap_or(""));
+        .field("switch-error", r.switch_error.as_deref().unwrap_or(""))
+        .field("load-notice", r.load_notice.as_deref().unwrap_or(""));
     for (stage, status) in &r.stages {
         b = b.field(stage.as_str(), status.as_str()).field(
             format!("{stage}-reason").as_str(),
@@ -1532,6 +1591,7 @@ impl ObcEffect {
             fallback_error,
             background_error,
             switch_error,
+            load_notice,
         ) = {
             let c = lock(&self.shared.control);
             (
@@ -1547,6 +1607,7 @@ impl ObcEffect {
                 c.fallback.error.clone(),
                 c.video.error.clone(),
                 c.switch_error.clone(),
+                c.load_notice.clone(),
             )
         };
         let background_video = self.shared.video_running.load(Ordering::SeqCst);
@@ -1599,6 +1660,7 @@ impl ObcEffect {
             fallback_error,
             background_error,
             switch_error,
+            load_notice,
             background_video,
             stage_values,
         }
@@ -1631,7 +1693,9 @@ impl ObcEffect {
     /// Sets the video of replace (an absolute path, or none) and applies
     /// the settings again with it: replace without an image loads black as
     /// its still then, and the source starts once replace is loaded (see
-    /// "The video background" in the module docs).
+    /// "The video background" in the module docs). Not a retry: what the
+    /// video changes loads, and nothing else (a refused switch's settings
+    /// are not tried again, a failure not retried).
     pub(super) fn set_background_video(&self, path: Option<PathBuf>) -> Result<(), String> {
         if let Some(p) = &path
             && !p.is_absolute()
@@ -1649,7 +1713,7 @@ impl ObcEffect {
             c.video.path = path;
             c.settings.clone()
         };
-        self.apply(settings, true);
+        self.apply(settings, false);
         Ok(())
     }
 
@@ -1903,7 +1967,15 @@ impl ObcEffect {
         let posted = {
             let mut c = lock(&self.shared.control);
             c.epoch += 1;
-            if c.generation != generation || matches!(c.status, EffectStatus::Failed(_)) {
+            // The failure the worker gave a refused switch whose previous
+            // chain was lost gives way to this one, which says why.
+            let provisional = c
+                .lost_switch
+                .take()
+                .is_some_and(|r| matches!(&c.status, EffectStatus::Failed(s) if *s == r));
+            if c.generation != generation
+                || (matches!(c.status, EffectStatus::Failed(_)) && !provisional)
+            {
                 None
             } else {
                 let before = c.report();
@@ -1915,7 +1987,7 @@ impl ObcEffect {
                 c.status = EffectStatus::Failed(reason);
                 // The chain kept in place of a refused switch has failed
                 // too: the failure says it all.
-                c.clear_switch();
+                c.end_chain();
                 before.changed(c.report())
             }
         };
@@ -3193,10 +3265,13 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
             )
         };
         // A refusal needs the previous chain running: one lost meanwhile (a
-        // module that panicked on a frame) leaves black, a failure.
-        let outcome = match outcome {
-            Outcome::Refused(f) if !alive => Outcome::Failed(f),
-            o => o,
+        // module that panicked on a frame) leaves black, a failure, whose
+        // reason is the frame's (see below).
+        let lost = matches!(outcome, Outcome::Refused(_)) && !alive;
+        // The refusal's reason, for the log line of a lost chain.
+        let refusal = match &outcome {
+            Outcome::Refused(f) if lost => Some(f.reason.clone()),
+            _ => None,
         };
         let in_force_target = in_force.clone();
         let in_force_list = in_force
@@ -3204,9 +3279,24 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
             .map(|t| t.stage_list().to_string())
             .unwrap_or_default();
         let in_force = |s: &str| in_force.as_ref().is_some_and(|t| t.wants(s));
-        let posted = {
+        let (posted, outcome) = {
             let mut c = lock(&shared.control);
             let before = c.report();
+            // The frame that lost the chain has failed the effect already
+            // with its reason (`ObcEffect::fail`), which stands: the arm of
+            // a refusal under a failure below keeps it. Otherwise the
+            // effect fails with [`LOST_CHAIN`], never the refusal's reason
+            // (the switch did not lose the chain), until that frame's
+            // reason comes ([`Control::lost_switch`]).
+            let outcome = match outcome {
+                Outcome::Refused(_) if lost && !matches!(c.status, EffectStatus::Failed(_)) => {
+                    if c.generation == job.generation {
+                        c.lost_switch = Some(LOST_CHAIN.into());
+                    }
+                    Outcome::Failed(Failure::new(LOST_CHAIN))
+                }
+                o => o,
+            };
             c.loaded_kind = published_kind(&c, job.revocation, loaded_kind);
             c.video.live = c.loaded_kind.and(live);
             c.video.in_force = c.loaded_kind.and(in_force_target);
@@ -3215,6 +3305,11 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                 c.loads += 1;
                 c.last_load_ms = Some(r.load_ms + r.warmup_ms.unwrap_or(0.0));
                 c.last_load_reused = r.reused_model;
+                c.load_notice.clone_from(&r.notice);
+            }
+            // The notice is of the chain in force: none when nothing is.
+            if c.loaded_kind.is_none() {
+                c.load_notice = None;
             }
             if c.generation == job.generation {
                 for (stage, reason) in &stage_failures {
@@ -3262,11 +3357,19 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                     // failure: it was not dropped).
                     Outcome::Refused(f) => {
                         c.switch_error = Some(f.reason.clone());
-                        // A job loaded against refused settings keeps them
-                        // unless it was refused other ones.
-                        if !job.substituted || refused.is_some() {
-                            c.switch_refused.clone_from(&refused);
-                        }
+                        // A job loaded against refused settings keeps them,
+                        // with the ones it was refused besides (each
+                        // refused setting is remembered, so that two never
+                        // take turns being tried again); a job that asked
+                        // for none of them remembers only its own.
+                        c.switch_refused = match (job.substituted, refused.clone()) {
+                            (false, r) => r,
+                            (true, None) => c.switch_refused.take(),
+                            (true, Some(r)) => Some(match c.switch_refused.take() {
+                                Some(old) => old.merged(r),
+                                None => r,
+                            }),
+                        };
                         if effect {
                             c.status = EffectStatus::Ready;
                         }
@@ -3288,7 +3391,7 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                     }
                 }
             }
-            before.changed(c.report())
+            (before.changed(c.report()), outcome)
         };
         if let Some(el) = element.upgrade() {
             match &outcome {
@@ -3303,6 +3406,14 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                     r.reused_model
                 ),
                 Outcome::Unloaded => gst::info!(CAT, obj = el, "unloaded"),
+                Outcome::Refused(_) | Outcome::Failed(_) if lost => gst::warning!(
+                    CAT,
+                    obj = el,
+                    "switch to {} with stages {} failed, the previous chain was lost meanwhile: {}",
+                    job.target.kind,
+                    job.target.stage_list(),
+                    refusal.as_deref().unwrap_or_default()
+                ),
                 Outcome::Refused(f) => gst::warning!(
                     CAT,
                     obj = el,
@@ -3318,6 +3429,12 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
             }
             if let Some(r) = posted {
                 post_status(&el, &r);
+                // The frame that lost the chain may have posted its own
+                // failure between this one's lock and its post: the last
+                // message posted says what holds.
+                if lost && let Some(now) = r.changed(lock(&shared.control).report()) {
+                    post_status(&el, &now);
+                }
             }
         }
         // The video background follows what is loaded.
@@ -3592,6 +3709,18 @@ fn run_job(shared: &Shared, job: &Job) -> JobResult {
                     refused: None,
                 }
             }
+            // Refused again on the settings in force (a stage the switch
+            // turned on or rebound): both reasons, the first one's first.
+            (Outcome::Refused(again), Some((mut f, r))) => {
+                if again.reason != f.reason {
+                    f.reason = format!("{}; {}", f.reason, again.reason);
+                }
+                JobResult {
+                    outcome: Outcome::Refused(f),
+                    stage_failures,
+                    refused: Some(r),
+                }
+            }
             (_, Some((f, r))) => JobResult {
                 outcome: Outcome::Refused(f),
                 stage_failures,
@@ -3620,10 +3749,17 @@ fn run_job(shared: &Shared, job: &Job) -> JobResult {
                 }
             }
             Outcome::Refused(f) if refusal.is_none() => {
-                let in_force = lock(&shared.engine)
-                    .loaded
-                    .as_ref()
-                    .map(|k| k.target.clone());
+                // Nothing is in force once the backend lost the chain
+                // meanwhile (a module that panicked on a frame): no load
+                // against it, the refusal goes to the worker, which takes
+                // it for the failure it is (`worker_loop`).
+                let in_force = {
+                    let e = lock(&shared.engine);
+                    e.loaded
+                        .as_ref()
+                        .filter(|_| e.instance.as_ref().is_some_and(|i| i.is_loaded()))
+                        .map(|k| k.target.clone())
+                };
                 let r = in_force.and_then(|t| RefusedBackground::of(&target, &t));
                 match r.as_ref().and_then(|r| r.in_place_of(&target)) {
                     Some(t) => {
@@ -3710,6 +3846,11 @@ fn unload(shared: &Shared, job: &Job) {
 
 /// Why an effect fails without a backend factory (none set, or revoked).
 const NO_BACKEND: &str = "no inference backend is configured for the effects";
+
+/// Why the effect fails when the chain kept running by a refused switch was
+/// lost meanwhile (a module that panicked on a frame), until the frame that
+/// lost it gives its own reason ([`Control::lost_switch`]).
+const LOST_CHAIN: &str = "the effect's running chain was lost while a new setting was loading";
 
 /// Loads `target` (an effect, its stages, or the stages alone) for `job`.
 /// The instance of a revoked backend is dropped first.
@@ -3809,6 +3950,14 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
     // (the backend binds it at load time), and a load's warm-up (CUDA
     // graph capture, synchronisations) on a stream the streaming thread is
     // using would race its frames: they switch on the loaded instance.
+    // Such a switch holds the frames for its whole load, every engine a
+    // module tries in it included: on CUDA frames a live switch to an
+    // engine chosen explicitly that cannot run (TensorRT whose engine
+    // fails to build) starts the engines after it, one after the other,
+    // under the lock (the ONNX module's fallback, ABI 1.5), and the feed
+    // holds its last frame until one starts or all have failed (then a
+    // refused switch). Accepted: never black, and a refusal or a notice
+    // says what runs.
     let aside = same_effect
         && job.kind == FrameKind::Host
         && current
@@ -3833,10 +3982,36 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
         background,
         params: target.stage_params(),
     };
+    // Why no second instance could be created, when none could.
+    let mut no_room = None;
     if aside {
-        return load_aside(shared, job, key, &req, factory.as_ref());
+        match load_aside(shared, job, key.clone(), &req, factory.as_ref()) {
+            Aside::Done(outcome) => return outcome,
+            // No room for a second instance: the switch runs on the loaded
+            // one, which needs none, under the lock (a slow load holds the
+            // frames meanwhile), with the rules of a switch on CUDA frames.
+            Aside::NoInstance(f) => {
+                if superseded(shared, job.generation) {
+                    return Outcome::Superseded;
+                }
+                no_room = Some(f);
+            }
+        }
     }
     let mut e = lock(&shared.engine);
+    if let Some(f) = no_room {
+        // A loaded chain lost meanwhile (a module that panicked on a
+        // frame) is no switch to try: the worker takes the refusal for the
+        // failure it is.
+        if !(e.loaded.is_some() && e.instance.as_ref().is_some_and(|i| i.is_loaded())) {
+            return Outcome::Refused(f);
+        }
+        gst::info!(
+            CAT,
+            "no second instance for the switch ({}): switching on the loaded instance",
+            f.reason
+        );
+    }
     if e.instance.is_none() {
         match factory.create() {
             Ok(i) => {
@@ -3900,6 +4075,17 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
     }
 }
 
+/// What became of a switch on a second instance ([`load_aside`]).
+enum Aside {
+    /// The job's outcome: loaded and in place, refused (the load failed,
+    /// the loaded instance untouched), or superseded.
+    Done(Outcome),
+    /// No second instance could be created (the factory refused it: a
+    /// backend without room for two): [`load`] switches on the loaded
+    /// instance instead.
+    NoInstance(Failure),
+}
+
 /// Loads `req` (for `key`, on system memory: no context is current) on a
 /// second instance of `factory`, created and loaded on the worker without
 /// the `Engine` lock, so that the streaming thread keeps processing every
@@ -3907,24 +4093,25 @@ fn load(shared: &Shared, job: &Job, target: &Target) -> Outcome {
 /// instance" in the module docs). On success the new instance takes the
 /// loaded one's place under the lock (its chain in force, the load-time
 /// still back in force as after any load, a new `Engine::serial`), the
-/// epoch moves, and the old instance is unloaded and dropped. A failure,
-/// or a request superseded meanwhile (a new request, a revocation, a
-/// stop), unloads and drops the new instance and leaves the loaded one as
-/// it was: any failure is a refusal ([`Outcome::Refused`]), a stage's
-/// included (the loaded chain is intact, and the stage may have failed
-/// only for want of room for two instances).
+/// epoch moves, and the old instance is unloaded and dropped. A failure of
+/// the load, or a request superseded meanwhile (a new request, a
+/// revocation, a stop), unloads and drops the new instance and leaves the
+/// loaded one as it was: a failed load is a refusal ([`Outcome::Refused`])
+/// at once, a stage's included (the loaded chain is intact), never tried
+/// again on the loaded instance. Only an instance the factory cannot
+/// create is [`Aside::NoInstance`].
 fn load_aside(
     shared: &Shared,
     job: &Job,
     key: LoadedKey,
     req: &LoadRequest,
     factory: &dyn BackendFactory,
-) -> Outcome {
+) -> Aside {
     let refused = |err: BackendError| {
-        Outcome::Refused(Failure {
+        Aside::Done(Outcome::Refused(Failure {
             reason: err.to_string(),
             error: Some(err),
-        })
+        }))
     };
     let discard = |mut instance: Box<dyn InferenceBackend>| {
         instance.unload();
@@ -3932,7 +4119,12 @@ fn load_aside(
     };
     let mut fresh = match factory.create() {
         Ok(i) => i,
-        Err(err) => return refused(err),
+        Err(err) => {
+            return Aside::NoInstance(Failure {
+                reason: err.to_string(),
+                error: Some(err),
+            });
+        }
     };
     let report = match fresh.load_host(req) {
         Ok(report) => report,
@@ -3948,7 +4140,7 @@ fn load_aside(
     // (`published_kind`).
     if superseded(shared, job.generation) {
         discard(fresh);
-        return Outcome::Superseded;
+        return Aside::Done(Outcome::Superseded);
     }
     let old = {
         let mut e = lock(&shared.engine);
@@ -3969,7 +4161,7 @@ fn load_aside(
     if let Some(old) = old {
         discard(old);
     }
-    Outcome::Loaded(report)
+    Aside::Done(Outcome::Loaded(report))
 }
 
 fn decode_background(
@@ -4258,7 +4450,7 @@ impl BaseTransformImpl for ObcEffect {
             c.status = c.pending_status();
             c.set_pending_stage_statuses();
             // Nothing is loaded any more: a restart loads the request.
-            c.clear_switch();
+            c.end_chain();
             before.changed(c.report())
         };
         if let Some(r) = posted {
@@ -4328,7 +4520,7 @@ impl BaseTransformImpl for ObcEffect {
                 c.generation += 1;
                 c.status = c.pending_status();
                 c.set_pending_stage_statuses();
-                c.clear_switch();
+                c.end_chain();
                 self.shared.wake.notify_all();
             }
             before.changed(c.report())

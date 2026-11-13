@@ -772,7 +772,7 @@ fn bgr_frame(image: &HostBgr) -> obc_frame {
 }
 
 /// What a successful [`Instance::load`] reports.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LoadOutcome {
     /// The load time, in milliseconds.
     pub load_ms: f32,
@@ -780,6 +780,32 @@ pub struct LoadOutcome {
     pub warmup_ms: Option<f32>,
     /// Whether models of the previous load were reused.
     pub reused_model: bool,
+    /// The module's notice of the load ([`notice_of`]): what the user
+    /// should know of it, such as a setting it could not honour and what
+    /// runs in its place.
+    pub notice: Option<String>,
+}
+
+/// The notice of a load report (ABI 1.5) a module of ABI `abi_version`
+/// filled in: read only when the module knows the field and the report's
+/// `struct_size` covers it, so a module of ABI 1.4 or older never has one.
+/// Empty or blank text is none.
+///
+/// # Safety
+///
+/// `report.notice`, when the field is read, is null or a NUL-terminated
+/// string valid for the call (the module's, until the next call on the
+/// instance).
+unsafe fn notice_of(report: &obc_load_report, abi_version: u32) -> Option<String> {
+    let end = std::mem::offset_of!(obc_load_report, notice) + size_of::<*const c_char>();
+    if obc_module_abi::obc_module_abi_minor(abi_version) < 5 || (report.struct_size as usize) < end
+    {
+        return None;
+    }
+    // SAFETY: by the caller's contract.
+    let text = unsafe { owned_text(report.notice) };
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// An instance of a module: one chain of its stages for one stream.
@@ -962,6 +988,9 @@ impl Instance {
             load_ms: report.load_ms,
             warmup_ms: (report.warmup_ms >= 0.0).then_some(report.warmup_ms),
             reused_model: report.reused_model != 0,
+            // SAFETY: the module's string, valid until the next call on
+            // the instance; read before any.
+            notice: unsafe { notice_of(&report, self.core.lib.abi_version()) },
         })
     }
 
@@ -1290,6 +1319,33 @@ impl Instance {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// The notice (ABI 1.5) is read from a module that knows it and a
+    /// report with room for it only: a module of ABI 1.4 never has one,
+    /// nor does a report of 1.0's size; blank text is none.
+    #[test]
+    fn a_load_notice_is_read_only_where_the_abi_has_it() {
+        use obc_module_abi::{OBC_LOAD_REPORT_SIZE_1_0, obc_module_abi_pack};
+        let mut report = obc_load_report::empty();
+        report.notice = c" Engine A cannot run; using B ".as_ptr();
+        let v15 = obc_module_abi_pack(1, 5);
+        // SAFETY (all): the notice is a static string or null.
+        assert_eq!(
+            unsafe { notice_of(&report, v15) }.as_deref(),
+            Some("Engine A cannot run; using B")
+        );
+        assert_eq!(
+            unsafe { notice_of(&report, obc_module_abi_pack(1, 4)) },
+            None
+        );
+        let mut small = report;
+        small.struct_size = OBC_LOAD_REPORT_SIZE_1_0;
+        assert_eq!(unsafe { notice_of(&small, v15) }, None);
+        report.notice = c"  ".as_ptr();
+        assert_eq!(unsafe { notice_of(&report, v15) }, None);
+        report.notice = std::ptr::null();
+        assert_eq!(unsafe { notice_of(&report, v15) }, None);
+    }
 
     fn manifest() -> Manifest {
         Manifest::parse(

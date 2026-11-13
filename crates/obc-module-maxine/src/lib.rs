@@ -842,6 +842,7 @@ impl MaxineInstance {
             load_ms: report.load_ms as f32,
             warmup_ms: report.warmup_ms.map(|w| w as f32),
             reused_model: report.reused_model,
+            notice: None,
         })
     }
 
@@ -910,6 +911,7 @@ impl MaxineInstance {
             load_ms: report.load_ms as f32,
             warmup_ms: report.warmup_ms.map(|w| w as f32),
             reused_model: report.reused_model,
+            notice: None,
         })
     }
 
@@ -949,6 +951,7 @@ impl MaxineInstance {
                 load_ms: report.load_ms as f32,
                 warmup_ms: None,
                 reused_model: false,
+                notice: None,
             },
         )))
     }
@@ -987,6 +990,7 @@ impl MaxineInstance {
                 load_ms: report.load_ms as f32,
                 warmup_ms: None,
                 reused_model: false,
+                notice: None,
             },
         )))
     }
@@ -1148,6 +1152,7 @@ impl Instance for MaxineInstance {
                 load_ms: 0.0,
                 warmup_ms: None,
                 reused_model: framegen.is_none() && hdr.is_none(),
+                notice: None,
             })
         } else if req.has_stage(StageId::ENHANCE.as_str()) {
             self.load_enhance(req, gpu)

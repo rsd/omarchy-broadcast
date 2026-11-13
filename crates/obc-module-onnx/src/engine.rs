@@ -16,15 +16,24 @@
 //! start (OpenVINO falls back like this when its device is missing), and
 //! one that left some to the CPU is reported as "partly on the CPU".
 //!
-//! An engine chosen explicitly that cannot run fails the load with its
-//! reason; only `auto` moves on to the next.
+//! An engine chosen explicitly that cannot run (ruled out, CUDA off, or
+//! failing to start) falls back to the engines after it in `auto`'s order,
+//! never to one before it: a chosen OpenVINO or CPU engine never falls to
+//! TensorRT or CUDA, so it never wakes the NVIDIA GPU. The load then
+//! carries a notice naming the engine chosen, its reason and the engine
+//! used ([`fallback_notice`]); the setting stays as it is. Only when no
+//! engine from the chosen one on starts does the load fail, with an error
+//! that leads with the chosen engine's reason and then lists the later
+//! engines' (`"<chosen> was chosen and cannot run: <its reason>; no later
+//! engine could run it (<engine>: <reason>; …)"`).
 //!
-//! **OpenVINO on the GPU and the NVIDIA GPU.** Before the first session of
-//! `openvino-gpu` (chosen, or reached by `auto`), the OpenCL drivers the
-//! process sees are limited to the Intel GPU ones ([`crate::opencl`]):
-//! OpenVINO's GPU device would otherwise open NVIDIA's OpenCL driver, which
-//! wakes a suspended NVIDIA GPU and holds it until the process exits. The
-//! `openvino-npu` and `openvino-cpu` engines do not load OpenVINO's GPU
+//! **OpenVINO on the GPU and the NVIDIA GPU.** The OpenCL drivers the
+//! process sees are limited to the Intel GPU ones when the module starts
+//! ([`crate::opencl`], from [`crate::OnnxModule`]'s `init`), before any
+//! session: OpenVINO's GPU device (`openvino-gpu`, chosen, reached by
+//! `auto` or as a fallback) would otherwise open NVIDIA's OpenCL driver,
+//! which wakes a suspended NVIDIA GPU and holds it until the process exits.
+//! The `openvino-npu` and `openvino-cpu` engines do not load OpenVINO's GPU
 //! plugin and are not concerned.
 
 use std::path::{Path, PathBuf};
@@ -148,11 +157,13 @@ impl Engine {
         matches!(self, Engine::TensorRt | Engine::Cuda)
     }
 
-    /// The engines a request for `self` tries, in order.
+    /// The engines a request for `self` tries, in order: for `auto`, all
+    /// of [`AUTO_ORDER`]; for an engine chosen explicitly, that engine and
+    /// then, as its fallbacks, the engines after it in [`AUTO_ORDER`].
     pub fn candidates(self) -> Vec<Engine> {
         match self {
             Engine::Auto => AUTO_ORDER.to_vec(),
-            e => vec![e],
+            e => AUTO_ORDER.into_iter().skip_while(|c| *c != e).collect(),
         }
     }
 }
@@ -283,9 +294,10 @@ pub struct Request<'a> {
 pub type Reasons = Vec<(Engine, String)>;
 
 /// Starts the model on `wanted` (for `auto`, the first engine that
-/// starts). Every engine tried that did not start is logged, one line
-/// each, and returned with its reason; the error of an engine chosen
-/// explicitly, or of `auto` when none starts, names them.
+/// starts; for an engine chosen explicitly that cannot run, the first of
+/// its fallbacks that starts, [`Engine::candidates`]). Every engine tried
+/// that did not start is logged, one line each, and returned with its
+/// reason; the error, when none starts, names them.
 pub fn start(req: &Request<'_>, wanted: Engine) -> Result<(Started, Reasons), String> {
     let (started, reasons) = first_that_starts(
         wanted,
@@ -296,7 +308,27 @@ pub fn start(req: &Request<'_>, wanted: Engine) -> Result<(Started, Reasons), St
         |engine| try_engine(req, engine),
     )?;
     log_started(req, &started);
+    if let Some(notice) = fallback_notice(wanted, started.engine, &reasons) {
+        log::warn!("ONNX cut-out: {notice}");
+    }
     Ok((started, reasons))
+}
+
+/// The notice of a load that runs on `used` when `wanted` was chosen
+/// explicitly and could not run: `"<chosen> was chosen and cannot run:
+/// <its reason>; using <used>"`, the reason being the one the load's error
+/// would give ([`first_that_starts`]). None for `auto` and for the engine
+/// chosen.
+pub fn fallback_notice(wanted: Engine, used: Engine, reasons: &Reasons) -> Option<String> {
+    if wanted == Engine::Auto || wanted == used {
+        return None;
+    }
+    Some(format!(
+        "{} was chosen and cannot run: {}; using {}",
+        wanted.label(),
+        chosen_reason(wanted, reasons),
+        used.label()
+    ))
 }
 
 /// [`start`]'s choice of engine, with the attempt itself (`try_one`), the
@@ -306,7 +338,9 @@ pub fn start(req: &Request<'_>, wanted: Engine) -> Result<(Started, Reasons), St
 /// (`trt_would_build_on_switch`, asked only when TensorRT is to be tried)
 /// passed in, so that the order and the rules are tested without a runtime.
 /// Returns what `try_one` returned for the engine that started, with the
-/// reasons of those that did not.
+/// reasons of those that did not. An engine chosen explicitly is tried
+/// first and its fallbacks after it ([`Engine::candidates`]), under the
+/// same rules (CUDA off rules TensorRT and CUDA out).
 fn first_that_starts<T>(
     wanted: Engine,
     cuda: bool,
@@ -364,16 +398,40 @@ fn first_that_starts<T>(
             }
         }
     }
-    let list = reasons
-        .iter()
-        .map(|(e, r)| format!("{}: {r}", e.label()))
-        .collect::<Vec<_>>()
-        .join("; ");
-    Err(match (wanted, reasons.as_slice()) {
-        (Engine::Auto, _) => format!("No engine could run the model ({list})"),
-        (e, [(_, r)]) => format!("{} was chosen and cannot run: {r}", e.label()),
-        (e, _) => format!("{} was chosen and cannot run: {list}", e.label()),
+    let list = |of: &mut dyn Iterator<Item = &(Engine, String)>| {
+        of.map(|(e, r)| format!("{}: {r}", e.label()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    if wanted == Engine::Auto {
+        return Err(format!(
+            "No engine could run the model ({})",
+            list(&mut reasons.iter())
+        ));
+    }
+    let chosen = format!(
+        "{} was chosen and cannot run: {}",
+        wanted.label(),
+        chosen_reason(wanted, &reasons)
+    );
+    let mut later = reasons.iter().filter(|(e, _)| *e != wanted).peekable();
+    Err(if later.peek().is_none() {
+        chosen
+    } else {
+        format!(
+            "{chosen}; no later engine could run it ({})",
+            list(&mut later)
+        )
     })
+}
+
+/// Why `wanted`, chosen explicitly, did not start, as [`first_that_starts`]
+/// recorded it.
+fn chosen_reason(wanted: Engine, reasons: &Reasons) -> &str {
+    reasons
+        .iter()
+        .find(|(e, _)| *e == wanted)
+        .map_or("it did not start", |(_, r)| r.as_str())
 }
 
 fn log_started(req: &Request<'_>, s: &Started) {
@@ -760,10 +818,8 @@ fn try_engine(req: &Request<'_>, engine: Engine) -> Result<Started, String> {
     }
     take_warnings();
     // OpenVINO's GPU device lists the OpenCL drivers, NVIDIA's among them,
-    // which would wake the NVIDIA GPU: limited before its first session.
-    if engine == Engine::OpenVinoGpu {
-        crate::opencl::limit_once(req.caches.root.as_deref());
-    }
+    // which would wake the NVIDIA GPU: they were limited when the module
+    // started (`crate::opencl::limit_once`, from `init`).
     // Counted before any provider is registered, dropped last (after the
     // session, on success or failure): see `GpuSession`.
     let gpu = engine.uses_cuda().then(crate::cuda::GpuSession::begin);
@@ -1025,7 +1081,23 @@ mod tests {
                 Engine::Cpu
             ]
         );
-        assert_eq!(Engine::Cuda.candidates(), [Engine::Cuda]);
+        // Chosen explicitly: the engine, then those after it as fallbacks.
+        assert_eq!(
+            Engine::Cuda.candidates(),
+            [
+                Engine::Cuda,
+                Engine::OpenVinoNpu,
+                Engine::OpenVinoGpu,
+                Engine::OpenVinoCpu,
+                Engine::Cpu
+            ]
+        );
+        assert_eq!(
+            Engine::OpenVinoGpu.candidates(),
+            [Engine::OpenVinoGpu, Engine::OpenVinoCpu, Engine::Cpu]
+        );
+        assert_eq!(Engine::Cpu.candidates(), [Engine::Cpu]);
+        assert_eq!(Engine::TensorRt.candidates(), AUTO_ORDER);
         assert!(Engine::TensorRt.uses_cuda() && !Engine::OpenVinoGpu.uses_cuda());
     }
 
@@ -1082,11 +1154,24 @@ mod tests {
 
     #[test]
     fn with_cuda_off_an_explicit_cuda_engine_is_ruled_out_with_the_reason() {
-        for e in [Engine::Cuda, Engine::TensorRt] {
-            let (tried, skipped) = tried_and_skipped(e, false);
-            assert!(tried.is_empty(), "{e:?}");
-            assert_eq!(skipped, [(e, REASON_CUDA_OFF.to_string())]);
-        }
+        let others = [
+            Engine::OpenVinoNpu,
+            Engine::OpenVinoGpu,
+            Engine::OpenVinoCpu,
+            Engine::Cpu,
+        ];
+        let (tried, skipped) = tried_and_skipped(Engine::Cuda, false);
+        assert_eq!(tried, others, "only the fallbacks are left");
+        assert_eq!(skipped, [(Engine::Cuda, REASON_CUDA_OFF.to_string())]);
+        let (tried, skipped) = tried_and_skipped(Engine::TensorRt, false);
+        assert_eq!(tried, others);
+        assert_eq!(
+            skipped,
+            [
+                (Engine::TensorRt, REASON_CUDA_OFF.to_string()),
+                (Engine::Cuda, REASON_CUDA_OFF.to_string())
+            ]
+        );
     }
 
     #[test]
@@ -1098,7 +1183,8 @@ mod tests {
             Engine::OpenVinoCpu,
         ] {
             let (tried, skipped) = tried_and_skipped(e, false);
-            assert_eq!(tried, [e]);
+            assert_eq!(tried, e.candidates());
+            assert_eq!(tried[0], e);
             assert!(skipped.is_empty(), "{e:?}: {skipped:?}");
         }
     }
@@ -1172,15 +1258,128 @@ mod tests {
                 (Engine::Cuda, REASON_CUDA_OFF.to_string())
             ]
         );
-        // Chosen explicitly: nothing is tried, the error gives the reason.
+        // Chosen explicitly: neither CUDA engine is tried, the fallbacks
+        // are; when none starts, the error leads with the chosen one's
+        // reason, then the later ones'.
         for e in [Engine::TensorRt, Engine::Cuda] {
             let (tried, r) = choose(e, false, Some(e));
-            assert!(tried.is_empty(), "{e:?} tried {tried:?}");
             assert_eq!(
-                r.unwrap_err(),
-                format!("{} was chosen and cannot run: {REASON_CUDA_OFF}", e.label())
+                tried,
+                [
+                    Engine::OpenVinoNpu,
+                    Engine::OpenVinoGpu,
+                    Engine::OpenVinoCpu,
+                    Engine::Cpu
+                ],
+                "{e:?}"
+            );
+            let err = r.unwrap_err();
+            let cuda_after = if e == Engine::TensorRt {
+                format!("{}: {REASON_CUDA_OFF}; ", Engine::Cuda.label())
+            } else {
+                String::new()
+            };
+            let later = [
+                Engine::OpenVinoNpu,
+                Engine::OpenVinoGpu,
+                Engine::OpenVinoCpu,
+                Engine::Cpu,
+            ]
+            .map(|l| format!("{}: {l:?} failed", l.label()))
+            .join("; ");
+            assert_eq!(
+                err,
+                format!(
+                    "{} was chosen and cannot run: {REASON_CUDA_OFF}; no later engine could \
+                     run it ({cuda_after}{later})",
+                    e.label()
+                ),
             );
         }
+    }
+
+    /// CUDA off and `cuda` chosen: the load runs on the first OpenVINO
+    /// engine that starts, with a notice that says why.
+    #[test]
+    fn with_cuda_off_an_explicit_cuda_falls_to_openvino_with_a_notice() {
+        let (tried, r) = choose(Engine::Cuda, false, Some(Engine::OpenVinoGpu));
+        assert_eq!(tried, [Engine::OpenVinoNpu, Engine::OpenVinoGpu]);
+        let (engine, reasons) = r.unwrap();
+        assert_eq!(engine, Engine::OpenVinoGpu);
+        assert_eq!(
+            fallback_notice(Engine::Cuda, engine, &reasons).as_deref(),
+            Some(
+                "NVIDIA CUDA was chosen and cannot run: CUDA is off: the video pipeline runs in system memory; using OpenVINO GPU"
+            )
+        );
+    }
+
+    /// An engine chosen explicitly falls back to the engines after it in
+    /// `auto`'s order only: TensorRT to CUDA, a chosen NPU never to the
+    /// NVIDIA engines (not even asked about), and the CPU, the last, to
+    /// nothing.
+    #[test]
+    fn an_explicit_engine_falls_back_only_to_the_engines_after_it() {
+        let (tried, r) = choose(Engine::TensorRt, true, Some(Engine::Cuda));
+        assert_eq!(tried, [Engine::TensorRt, Engine::Cuda]);
+        let (engine, reasons) = r.unwrap();
+        assert_eq!(engine, Engine::Cuda);
+        assert_eq!(
+            fallback_notice(Engine::TensorRt, engine, &reasons).as_deref(),
+            Some("NVIDIA TensorRT was chosen and cannot run: TensorRt failed; using NVIDIA CUDA")
+        );
+
+        let mut looked_at = Vec::new();
+        let mut tried = Vec::new();
+        let r = first_that_starts(
+            Engine::OpenVinoNpu,
+            true,
+            "model",
+            |e| {
+                looked_at.push(e);
+                None
+            },
+            || panic!("the TensorRT cache was looked at for a chosen NPU"),
+            |e| {
+                tried.push(e);
+                Err::<Engine, _>(format!("{e:?} failed"))
+            },
+        );
+        let fallbacks = [
+            Engine::OpenVinoNpu,
+            Engine::OpenVinoGpu,
+            Engine::OpenVinoCpu,
+            Engine::Cpu,
+        ];
+        assert_eq!(tried, fallbacks);
+        assert_eq!(looked_at, fallbacks, "never TensorRT or CUDA");
+        assert_eq!(
+            r.unwrap_err(),
+            format!(
+                "OpenVINO NPU was chosen and cannot run: OpenVinoNpu failed; no later engine \
+                 could run it ({}: OpenVinoGpu failed; {}: OpenVinoCpu failed; {}: Cpu failed)",
+                Engine::OpenVinoGpu.label(),
+                Engine::OpenVinoCpu.label(),
+                Engine::Cpu.label()
+            ),
+            "the chosen engine's reason first"
+        );
+
+        let (tried, r) = choose(Engine::Cpu, true, None);
+        assert_eq!(tried, [Engine::Cpu]);
+        assert_eq!(
+            r.unwrap_err(),
+            "CPU was chosen and cannot run: Cpu failed",
+            "the error as before"
+        );
+
+        // The engine chosen, started: no notice; nor for `auto`.
+        let (_, r) = choose(Engine::OpenVinoGpu, true, Some(Engine::OpenVinoGpu));
+        let (engine, reasons) = r.unwrap();
+        assert_eq!(fallback_notice(Engine::OpenVinoGpu, engine, &reasons), None);
+        let (_, r) = choose(Engine::Auto, true, Some(Engine::Cpu));
+        let (engine, reasons) = r.unwrap();
+        assert_eq!(fallback_notice(Engine::Auto, engine, &reasons), None);
     }
 
     #[test]
@@ -1213,12 +1412,14 @@ mod tests {
         let (_, reasons) = r.unwrap();
         assert_eq!(reasons.len(), 5);
         assert!(reasons[2..].iter().all(|(_, r)| r == NOT_IN_BUILD));
-        // Chosen explicitly: nothing is tried, the error is the reason.
-        let (tried, r) = choose_ruling_out(Engine::OpenVinoNpu, true, None, &ov);
-        assert!(tried.is_empty(), "{tried:?}");
+        // Chosen explicitly: not tried; the fallback after the others ruled
+        // out is, and the notice gives the chosen engine's reason.
+        let (tried, r) = choose_ruling_out(Engine::OpenVinoNpu, true, Some(Engine::Cpu), &ov);
+        assert_eq!(tried, [Engine::Cpu]);
+        let (engine, reasons) = r.unwrap();
         assert_eq!(
-            r.unwrap_err(),
-            format!("OpenVINO NPU was chosen and cannot run: {NOT_IN_BUILD}")
+            fallback_notice(Engine::OpenVinoNpu, engine, &reasons).unwrap(),
+            format!("OpenVINO NPU was chosen and cannot run: {NOT_IN_BUILD}; using CPU")
         );
     }
 
@@ -1253,13 +1454,19 @@ mod tests {
             !asked_build,
             "a TensorRT ruled out was asked whether it builds"
         );
-        // Explicit: the load fails with the reason, and nothing is built.
-        let (tried, r) =
-            choose_ruling_out(Engine::TensorRt, true, None, &[(Engine::TensorRt, WHY)]);
-        assert!(tried.is_empty());
+        // Explicit: TensorRT is not tried (nothing is built), CUDA is,
+        // and the notice gives TensorRT's reason.
+        let (tried, r) = choose_ruling_out(
+            Engine::TensorRt,
+            true,
+            Some(Engine::Cuda),
+            &[(Engine::TensorRt, WHY)],
+        );
+        assert_eq!(tried, [Engine::Cuda]);
+        let (engine, reasons) = r.unwrap();
         assert_eq!(
-            r.unwrap_err(),
-            format!("NVIDIA TensorRT was chosen and cannot run: {WHY}")
+            fallback_notice(Engine::TensorRt, engine, &reasons).unwrap(),
+            format!("NVIDIA TensorRT was chosen and cannot run: {WHY}; using NVIDIA CUDA")
         );
     }
 

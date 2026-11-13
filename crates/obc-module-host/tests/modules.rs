@@ -513,11 +513,11 @@ fn broken_modules_are_unavailable_with_their_reasons_and_the_process_lives() {
     // would abort the process) is called.
     let r = reason("org.test.major");
     assert!(
-        r.contains("module ABI 2.0") && r.contains("module ABI 1.4"),
+        r.contains("module ABI 2.0") && r.contains("module ABI 1.5"),
         "{r}"
     );
     let r = reason("org.test.minor");
-    assert!(r.contains("1.99, newer than") && r.contains("1.4"), "{r}");
+    assert!(r.contains("1.99, newer than") && r.contains("1.5"), "{r}");
     let r = reason("org.test.refuse");
     assert!(r.contains("refused this daemon"), "{r}");
     let r = reason("org.test.init");
@@ -649,7 +649,7 @@ fn a_panic_in_process_is_an_error_and_the_process_survives() {
 #[test]
 fn a_repeat_is_flagged_for_a_module_of_abi_1_1_and_reprocessed_by_one_of_1_0() {
     for (features, abi, flagged) in [
-        ("", "1.4", true),
+        ("", "1.5", true),
         ("abi-1-3", "1.3", true),
         ("abi-1-2", "1.2", true),
         ("abi-1-1", "1.1", true),
@@ -707,7 +707,7 @@ fn status_values_cross_from_a_module_of_abi_1_3_and_none_from_one_of_1_2() {
         name: name.into(),
         value,
     };
-    for (features, abi, reports) in [("", "1.4", true), ("abi-1-2", "1.2", false)] {
+    for (features, abi, reports) in [("", "1.5", true), ("abi-1-2", "1.2", false)] {
         let dir = tempfile::tempdir().unwrap();
         let lib = own_copy(&fixture_lib(features), dir.path(), "fixture");
         let m = manifest(
@@ -745,6 +745,42 @@ fn status_values_cross_from_a_module_of_abi_1_3_and_none_from_one_of_1_2() {
         assert_eq!(chain.status_values(), expected, "{abi}");
         chain.unload();
         assert!(chain.status_values().is_empty(), "{abi}: unloaded");
+    }
+}
+
+/// A load's notice (ABI 1.5) crosses from a module of ABI 1.5 until a load
+/// without one; from a module of ABI 1.4 it is never read, though the SDK
+/// it is built with writes it.
+#[test]
+fn a_load_notice_crosses_from_a_module_of_abi_1_5_and_none_from_one_of_1_4() {
+    const NOTICE: &str = "Engine A was chosen and cannot run: no device; using B";
+    for (features, abi, reports) in [("", "1.5", true), ("abi-1-4", "1.4", false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = own_copy(&fixture_lib(features), dir.path(), "fixture");
+        let m = manifest(
+            &fixture_manifest("org.test.fixture", &lib, 1),
+            dir.path(),
+            "fixture",
+        );
+        let module = Module::open(&m, &serde_json::json!({}), obc_module_host::stderr_log())
+            .expect("the fixture opens");
+        assert_eq!(
+            obc_module_host::library::version_text(module.library().abi_version()),
+            abi
+        );
+        let factory = ModuleChainFactory::new(module, &[s("alpha")]).unwrap();
+        let mut chain = factory.create().unwrap();
+        let report = chain
+            .load(&host_request(
+                &["alpha"],
+                params("alpha", &[("notice", Value::Str(NOTICE.into()))]),
+            ))
+            .unwrap();
+        assert_eq!(report.notice.as_deref(), reports.then_some(NOTICE), "{abi}");
+        let report = chain
+            .load(&host_request(&["alpha"], BTreeMap::new()))
+            .unwrap();
+        assert_eq!(report.notice, None, "{abi}");
     }
 }
 
@@ -961,6 +997,7 @@ fn the_backend_factory_carries_the_effect_through_the_abi() {
     let report = backend.load(&gpu, &req).unwrap();
     assert_eq!(report.load_ms, 1.5);
     assert_eq!(report.warmup_ms, Some(0.5));
+    assert_eq!(report.notice, None);
     let line = last_line(&lines, "fixture-load");
     assert!(
         line.contains("stages=alpha,background,beta"),
@@ -1032,6 +1069,20 @@ fn the_backend_factory_carries_the_effect_through_the_abi() {
         )
         .unwrap();
     assert!(!last_line(&lines, "fixture-process").contains("blur_strength"));
+
+    // The module's notice of a load (ABI 1.5) reaches the effect seam,
+    // and the next load without one has none.
+    let alpha = req.params.get_mut(&s("alpha")).unwrap();
+    alpha.insert(
+        "notice".into(),
+        Value::Str("Engine A was chosen and cannot run; using B".into()),
+    );
+    assert_eq!(
+        backend.load(&gpu, &req).unwrap().notice.as_deref(),
+        Some("Engine A was chosen and cannot run; using B")
+    );
+    req.params.get_mut(&s("alpha")).unwrap().remove("notice");
+    assert_eq!(backend.load(&gpu, &req).unwrap().notice, None);
 
     // A stage failure of the load.
     req.params
@@ -1748,7 +1799,7 @@ fn an_audio_module_loads_only_through_the_audio_kinds_and_runs_blocks() {
     let module = registry.module("org.test.audio").unwrap().clone();
     assert_eq!(
         obc_module_host::library::version_text(module.library().abi_version()),
-        "1.4"
+        "1.5"
     );
     assert!(module.library().has_audio());
     assert!(module.matte_stages().is_empty());

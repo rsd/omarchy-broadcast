@@ -10,6 +10,7 @@
 //!
 //! Its own test binary: the OpenCL loader reads its configuration once per
 //! process, at the first OpenCL call, so no other test may make one first.
+//! The module limits the drivers when it starts (`init`), before any load.
 //! Without OpenCL for an Intel GPU (or with `OCL_ICD_*` set by the caller)
 //! the module leaves the loader alone; the test then only reports.
 
@@ -66,6 +67,9 @@ fn openvino_gpu_on_host_frames_leaves_the_nvidia_gpu_alone() {
     let tmp = tempfile::tempdir().unwrap();
     let models = model_dir(&models, tmp.path());
     let log = Log::default();
+    // Whether the caller set the loader's variables, before the module may.
+    let left_alone =
+        std::env::vars_os().any(|(k, _)| k.as_encoded_bytes().starts_with(b"OCL_ICD_"));
     let module = open(
         tmp.path(),
         json!({"model_dir": models, "_host": {"cuda": false}}),
@@ -73,6 +77,10 @@ fn openvino_gpu_on_host_frames_leaves_the_nvidia_gpu_alone() {
     );
     module.check(&[s("background")]).unwrap();
     let lines = log.take();
+    // Limited when the module started, before any session.
+    let limited = lines
+        .iter()
+        .any(|l| l.contains("OpenCL drivers limited to"));
     if lines
         .iter()
         .any(|l| l.starts_with("ONNX cut-out: OpenVINO GPU ") && l.contains("not in this"))
@@ -126,12 +134,7 @@ fn openvino_gpu_on_host_frames_leaves_the_nvidia_gpu_alone() {
     let fds = nvidia_fds();
     let mapped = nvidia_opencl_mapped();
     eprintln!("NVIDIA device files open: {fds:?}; NVIDIA OpenCL driver mapped: {mapped}");
-    let left_alone = std::env::var_os("OCL_ICD_VENDORS").is_some()
-        || std::env::var_os("OCL_ICD_FILENAMES").is_some();
-    if lines
-        .iter()
-        .any(|l| l.contains("OpenCL drivers limited to"))
-    {
+    if limited {
         assert!(fds.is_empty(), "NVIDIA device files open: {fds:?}");
         assert!(!mapped, "the NVIDIA OpenCL driver was loaded");
     } else {

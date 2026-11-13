@@ -47,8 +47,9 @@
 //! * `_host`: the daemon's. `compute_capability` is accepted and ignored.
 //!   `{"_host": {"cuda": false}}` (the video pipeline runs in system
 //!   memory) makes the module make no CUDA call: `auto` skips TensorRT and
-//!   CUDA, an explicit `tensorrt` or `cuda` engine fails the load, and a
-//!   chain of CUDA frames is refused. Absent or `true`: CUDA as usual.
+//!   CUDA, an explicit `tensorrt` or `cuda` engine falls back to the
+//!   OpenVINO engines and the CPU (with a notice, below), and a chain of
+//!   CUDA frames is refused. Absent or `true`: CUDA as usual.
 //!
 //! # The NVIDIA GPU left alone
 //!
@@ -64,8 +65,13 @@
 //! `background` stage ([`Error::stage`]), which the host takes as a failure
 //! of the whole chain. A failed load leaves what was loaded as it was (the
 //! host keeps the previous chain of a switch running; a first load or a
-//! reload ends unloaded). An engine chosen explicitly that cannot run fails
-//! the load with its reason.
+//! reload ends unloaded). An engine chosen explicitly that cannot run falls
+//! back to the engines after it in `auto`'s order ([`engine`]): the load
+//! succeeds on the first that starts and reports a notice (ABI 1.5,
+//! [`LoadReport::notice`]) naming the engine chosen, why it cannot run and
+//! the engine used; the setting is never rewritten. Only when none of them
+//! starts does the load fail: its error leads with the chosen engine's
+//! reason, then lists why each later engine could not run.
 
 pub mod catalogue;
 pub mod cuda;
@@ -214,6 +220,12 @@ impl Module for OnnxModule {
         let model_dirs =
             model_files::search_dirs(config.model_dir.as_deref(), |n| std::env::var_os(n));
         let caches = Caches::from_env(|n| std::env::var_os(n));
+        // The OpenCL drivers OpenVINO's GPU device will see, limited here,
+        // whatever engine is chosen: `init` is the host's first call into
+        // the module, before any instance, so before ONNX Runtime is loaded
+        // and any thread of its own or of OpenVINO exists (see
+        // `opencl::limit_once` for the environment change and its hazard).
+        opencl::limit_once(caches.root.as_deref());
         log::debug!(
             "ONNX cut-out: runtime {library:?}, model directories {model_dirs:?}, {threads} threads, CUDA {}",
             if cuda { "allowed" } else { "off" }
@@ -310,6 +322,11 @@ struct Chain {
     model: &'static ModelSpec,
     wanted: Engine,
     started: Started,
+    /// The notice of the load that started the session, when `wanted` was
+    /// chosen explicitly and the session runs on a fallback
+    /// ([`engine::fallback_notice`]): reported again by every switch that
+    /// reuses the session.
+    notice: Option<String>,
     input: (u32, u32),
     mode: Mode,
     /// The per-frame background ([`Instance::set_background`]): the last
@@ -560,6 +577,7 @@ impl OnnxInstance {
                 load_ms: t0.elapsed().as_secs_f32() * 1e3,
                 warmup_ms: None,
                 reused_model: true,
+                notice: c.notice.clone(),
             };
             return Ok((c, report));
         }
@@ -593,8 +611,9 @@ impl OnnxInstance {
             switch: self.chain.is_some(),
             cuda: s.cuda,
         };
-        let (started, _reasons) =
+        let (started, reasons) =
             engine::start(&engine_req, req.engine).map_err(Error::unavailable)?;
+        let notice = engine::fallback_notice(req.engine, started.engine, &reasons);
         log::debug!(
             "ONNX cut-out: {} from {}",
             req.model.id,
@@ -612,6 +631,7 @@ impl OnnxInstance {
             load_ms: t0.elapsed().as_secs_f32() * 1e3,
             warmup_ms: Some(started.warmup_ms),
             reused_model: false,
+            notice: notice.clone(),
         };
         let chain = Chain {
             kind: req.kind,
@@ -622,6 +642,7 @@ impl OnnxInstance {
             model: req.model,
             wanted: req.engine,
             started,
+            notice,
             input,
             mode: req.mode,
             live: None,
