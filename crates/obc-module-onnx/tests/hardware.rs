@@ -315,9 +315,14 @@ fn cuda_frames_are_processed_and_the_hosts_context_stays_current() {
     inst.unload();
     let lines = log.take();
     assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("the CUDA primary context is not reset")),
+        lines.iter().any(|l| {
+            // The two reasons `reset_blocker` gives: the frames' context is
+            // the primary one (current at the call here, and the chain's
+            // frames are in it), never a driver that lacks the reset.
+            l.contains("the CUDA primary context is not reset: ")
+                && (l.contains("the context current at the call")
+                    || l.contains("CUDA frames are in it"))
+        }),
         "{lines:#?}"
     );
     assert!(

@@ -513,6 +513,10 @@ impl PushState {
     }
 }
 
+/// The references a push no longer needs, dropped by the caller once the
+/// push lock is released: the last one may return a buffer to its pool.
+type Leftover = [Option<gst::Buffer>; 2];
+
 /// The outcome of a push.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pushed {
@@ -578,29 +582,31 @@ impl Shared {
             st.restart_hold = None;
             (buffer, producer)
         };
-        let (pushed, replaced) = self.push_locked(&mut st, buffer, producer, now);
+        let (pushed, leftover) = self.push_locked(&mut st, buffer, producer, now);
         drop(st);
         // A buffer of the output's pool goes back to it here, outside the
         // push lock.
-        drop((expired, replaced));
+        drop((expired, leftover));
         pushed
     }
 
-    /// [`Self::push`] once the frame is chosen; also returns the kept frame
-    /// a forwarded one replaced, for the caller to drop after the lock.
+    /// [`Self::push`] once the frame is chosen; also returns the references
+    /// it no longer needs (the frame a refused push did not hand over, the
+    /// tap's reference, the kept frame a forwarded one replaced), for the
+    /// caller to drop after the lock.
     fn push_locked(
         &self,
         st: &mut PushState,
         mut buffer: gst::Buffer,
         producer: Producer,
         now: Instant,
-    ) -> (Pushed, Option<gst::Buffer>) {
+    ) -> (Pushed, Leftover) {
         if !st.running {
             // A placeholder racing the stop is not a failure.
             if producer == Producer::Forwarded {
                 self.push_failed.fetch_add(1, Ordering::Relaxed);
             }
-            return (Pushed::Refused, None);
+            return (Pushed::Refused, [Some(buffer), None]);
         }
         let pts = next_pts(
             st.last_pts_ns,
@@ -630,10 +636,10 @@ impl Shared {
             if let (Some(tap), Some(b)) = (&st.tap.0, &reference) {
                 tap(b);
             }
-            let replaced = if keep {
-                std::mem::replace(&mut st.kept, reference)
+            let leftover = if keep {
+                [std::mem::replace(&mut st.kept, reference), None]
             } else {
-                None
+                [None, reference]
             };
             st.last_pts_ns = Some(pts);
             st.pushes += 1;
@@ -644,10 +650,10 @@ impl Shared {
                 Producer::Held => &self.held,
             }
             .fetch_add(1, Ordering::Relaxed);
-            (Pushed::Accepted, replaced)
+            (Pushed::Accepted, leftover)
         } else {
             self.push_failed.fetch_add(1, Ordering::Relaxed);
-            (Pushed::Refused, None)
+            (Pushed::Refused, [reference, None])
         }
     }
 
@@ -2259,6 +2265,76 @@ mod tests {
         assert_eq!(counts.forwarded, 5, "{counts:?}");
         assert!(counts.placeholder >= 1, "{counts:?}");
         assert_eq!(w.counts().push_failed, 2);
+    }
+
+    /// Memory that records, when it is freed, whether the freeing thread
+    /// was free of the push lock. The lock is not reentrant: held by the
+    /// freeing thread, it stays taken for the whole retry window; held by
+    /// another (the placeholder thread pushing meanwhile), it frees soon.
+    struct DropProbe {
+        data: Vec<u8>,
+        shared: std::sync::Weak<Shared>,
+        unlocked: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl AsRef<[u8]> for DropProbe {
+        fn as_ref(&self) -> &[u8] {
+            &self.data
+        }
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            let unlocked = self.shared.upgrade().is_none_or(|s| {
+                let until = Instant::now() + Duration::from_millis(500);
+                loop {
+                    if s.state.try_lock().is_ok() {
+                        break true;
+                    }
+                    if Instant::now() >= until {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            self.unlocked.lock().unwrap().push(unlocked);
+        }
+    }
+
+    /// A refused forwarded frame is freed after the push lock is released:
+    /// by a writer not running, and by `appsrc` (here, a pipeline set to
+    /// NULL behind a running writer) with a tap and an output attached,
+    /// whose references are the last ones.
+    #[test]
+    fn a_refused_forwarded_frame_is_freed_outside_the_push_lock() {
+        require_elements(ELEMENTS);
+        let contract = small(OutputFormat::Nv12);
+        let mut cfg = WriterConfig::new(contract, WriterSink::Fake);
+        cfg.placeholder_after = Duration::from_secs(10);
+        let mut w = LoopbackWriter::build_with(cfg).unwrap();
+        let h = w.handle();
+        let unlocked: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let shared = Arc::downgrade(&w.shared);
+        let frame = || {
+            let black = black_contract_frame(&contract).unwrap();
+            let data = black.map_readable().unwrap().to_vec();
+            gst::Buffer::from_slice(DropProbe {
+                data,
+                shared: shared.clone(),
+                unlocked: Arc::clone(&unlocked),
+            })
+        };
+        assert!(!h.push(frame()), "a writer not started refuses");
+        assert_eq!(*unlocked.lock().unwrap(), [true]);
+
+        w.start().unwrap();
+        w.set_tap(Some(Arc::new(|_: &gst::Buffer| {})));
+        let attached = h.attach(Duration::from_secs(10));
+        w.pipeline().pipeline().set_state(gst::State::Null).unwrap();
+        assert!(!h.push(frame()), "appsrc refuses once flushing");
+        assert_eq!(*unlocked.lock().unwrap(), [true, true]);
+        drop(attached);
+        w.stop().unwrap();
     }
 
     /// One buffer the tap saw.

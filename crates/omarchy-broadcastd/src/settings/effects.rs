@@ -19,6 +19,17 @@
 //!   `none` (a choice kept from when one did), the group holds the mode
 //!   alone, so that it can be turned off: a write of `blur` or `replace`
 //!   is then refused with [`REASON_NO_BACKGROUND`].
+//!   While the enabled modules that offer the stage cannot take the next
+//!   session's frames (they declare it for CUDA frames only, and the
+//!   session runs in system memory), the group is shown greyed with the
+//!   module's reason (as `GetModules` gives it): the blur strength always,
+//!   the mode while it is `none`; a mode in force that is not `none` stays
+//!   enabled so that it can be turned off, and a write of `blur` or
+//!   `replace` is refused with that reason.
+//!   Either way the refusal holds for `SetSetting` writes and for a
+//!   `ResetSettings` that would bring the configured `blur` or `replace`
+//!   back ([`check_reset`]) only: `SetEffect` and the `Effect` property
+//!   still accept them, and the session's `on_failure` then applies.
 //! - Then each enabled module's groups, as the module describes them. A
 //!   setting that switches a stage on (`role: enable`) is greyed and
 //!   published off, the stored choice kept, while the stage cannot run
@@ -39,7 +50,7 @@
 //! module describes them.
 
 use obc_core::EffectMode;
-use obc_core::config::{Config, RuntimeState};
+use obc_core::config::{Config, EffectConfig, RuntimeState};
 use obc_core::modules::StoredValue;
 use obc_ipc::settings::SCOPE_GLOBAL;
 use obc_ipc::{Condition, ConditionOp, Setting, SettingKind, SettingValue};
@@ -103,8 +114,13 @@ impl Applies {
 pub enum Binding {
     /// The background effect (`Effect`).
     Mode,
-    /// The background effect while no module offers it: only `none` can be
-    /// written; another mode is refused with this reason.
+    /// The background effect while no module offers it, or none that
+    /// offers it can take the session's frames: only `none` can be
+    /// written; another mode is refused with this reason. Enforced on
+    /// `SetSetting` writes ([`check`]) and `ResetSettings`
+    /// ([`check_reset`]) only: `SetEffect` and the `Effect` property still
+    /// accept `blur` and `replace` (the session's `on_failure` then
+    /// applies).
     ModeOffOnly(String),
     /// The blur strength (`BlurStrength`).
     BlurStrength,
@@ -225,15 +241,22 @@ fn left_out_once(id: &str, why: &str) {
 }
 
 /// The global settings now: the daemon's `background` group when an
-/// enabled module offers the stage (or its mode alone while one in force
-/// has no module to run it), then each enabled module's groups.
+/// enabled module offers the stage (greyed while none can take the
+/// session's frames; or its mode alone while one in force has no module
+/// to run it), then each enabled module's groups.
 pub fn build(inp: &Inputs<'_>) -> Vec<GlobalEntry> {
     let config = &inp.config.effect;
     let effect = inp.runtime.effect_over(config);
     let runtime = inp.runtime;
     let mut out = Vec::new();
-    let offered = inp.modules.declares(StageId::BACKGROUND.as_str()).is_some();
-    if offered || effect.mode != EffectMode::None {
+    let stage = StageId::BACKGROUND.as_str();
+    let declared = inp.modules.declares(stage).is_some();
+    // Declared only for CUDA frames, in a session in system memory: the
+    // module's reason, as `GetModules` gives it.
+    let cannot_run = (declared && inp.modules.declares_in_memory(stage).is_none())
+        .then(|| inp.modules.absent_reason(stage).1);
+    let offered = declared && cannot_run.is_none();
+    if declared || effect.mode != EffectMode::None {
         let setting =
             |id: &str, label: &str, kind: SettingKind, stored: bool, hint: &str| Setting {
                 id: id.into(),
@@ -246,7 +269,7 @@ pub fn build(inp: &Inputs<'_>) -> Vec<GlobalEntry> {
                 enabled_when: Vec::new(),
                 hint: Some(hint.into()),
             };
-        let mode = setting(
+        let mut mode = setting(
             MODE,
             "Effect",
             SettingKind::Enum {
@@ -287,10 +310,23 @@ pub fn build(inp: &Inputs<'_>) -> Vec<GlobalEntry> {
             blur.enabled = false;
             blur.disabled_reason = REASON_CHOOSE_BLUR.into();
         }
-        let shown = if offered {
-            vec![(mode, Binding::Mode), (blur, Binding::BlurStrength)]
-        } else {
-            vec![(mode, Binding::ModeOffOnly(REASON_NO_BACKGROUND.into()))]
+        let shown = match (offered, cannot_run) {
+            (true, _) => vec![(mode, Binding::Mode), (blur, Binding::BlurStrength)],
+            // Greyed with the module's reason; the mode stays enabled
+            // while one in force can still be turned off.
+            (false, Some(why)) => {
+                if effect.mode == EffectMode::None {
+                    mode.enabled = false;
+                    mode.disabled_reason.clone_from(&why);
+                }
+                blur.enabled = false;
+                blur.disabled_reason.clone_from(&why);
+                vec![
+                    (mode, Binding::ModeOffOnly(why)),
+                    (blur, Binding::BlurStrength),
+                ]
+            }
+            (false, None) => vec![(mode, Binding::ModeOffOnly(REASON_NO_BACKGROUND.into()))],
         };
         for (s, binding) in shown {
             out.push(GlobalEntry {
@@ -539,6 +575,36 @@ pub fn check(
             value,
         },
     })
+}
+
+/// Checks a reset of global settings `ids` (`forget` on each) against
+/// `entries` (as built now), as [`check`] does a write: a reset that would
+/// put a background effect other than `none` into a mode bound to
+/// [`Binding::ModeOffOnly`] (the configured mode, over a stored one that
+/// differs) is refused with that binding's reason, and nothing is
+/// forgotten. A reset that leaves the mode as it is passes.
+pub fn check_reset(
+    entries: &[GlobalEntry],
+    ids: &[String],
+    runtime: &RuntimeState,
+    config: &EffectConfig,
+) -> Result<(), Refusal> {
+    if !ids.iter().any(|id| id == MODE) {
+        return Ok(());
+    }
+    let Some(Binding::ModeOffOnly(why)) = entries
+        .iter()
+        .find(|e| e.setting.id == MODE)
+        .map(|e| &e.binding)
+    else {
+        return Ok(());
+    };
+    match runtime.effect {
+        Some(stored) if stored != config.mode && config.mode != EffectMode::None => {
+            Err(Refusal::Disabled(why.clone()))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Forgets the state file's value of global setting `id`: the configured

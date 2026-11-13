@@ -1211,7 +1211,7 @@ impl Modules {
     /// ([`Registry::declares_for_memory`]): in system memory a module that
     /// declares it for CUDA frames only is never the one a plan falls back
     /// to, as it could not run it however its features change.
-    fn declares_in_memory(&self, stage: &str) -> Option<&str> {
+    pub fn declares_in_memory(&self, stage: &str) -> Option<&str> {
         self.described().map(|(id, _)| id).find(|id| {
             !self.registry.is_refused(id) && self.registry.declares_for_memory(id, stage)
         })
@@ -1870,6 +1870,35 @@ pub mod testing {
     /// The Maxine module alone, its stages available but `unavailable`.
     pub fn maxine(unavailable: &[(&str, &str)]) -> Modules {
         modules(vec![(maxine_entry(), Ok(maxine_opened(unavailable)))])
+    }
+
+    /// The open-model cut-out's manifest, as installed.
+    pub const ONNX_MANIFEST: &str = include_str!("../../obc-module-onnx/onnx.toml");
+
+    /// The open-model cut-out's entry.
+    pub fn onnx_entry() -> ModuleEntry {
+        entry(
+            ONNX_MANIFEST,
+            "/usr/lib/omarchy-broadcast/modules.d/onnx.toml",
+        )
+    }
+
+    /// The open-model cut-out opened, its `background` stage available,
+    /// describing no settings.
+    pub fn onnx_opened() -> OpenedModule {
+        OpenedModule {
+            module: None,
+            stages: vec![(StageId::BACKGROUND, Availability::Installed)],
+            settings: settings(r#"{"groups":[]}"#, &["background"]),
+        }
+    }
+
+    /// `m` with its next session in `memory`, without reopening a module
+    /// (what [`Modules::set_memory`] tells the registry).
+    pub fn in_memory(m: &mut Modules, memory: super::HostMemory) {
+        m.memory = memory;
+        m.apply_memory();
+        m.listed = m.listing();
     }
 }
 

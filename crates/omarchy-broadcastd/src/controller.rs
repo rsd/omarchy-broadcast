@@ -6881,7 +6881,9 @@ impl<B: MediaBackend> Controller<B> {
     /// ignored): the state file's overrides in scope are forgotten, so the
     /// configuration's values apply again, at once and to the running
     /// session, as an effect method does (saved, a fault or effect failure
-    /// cleared). `None` when the scope is not global.
+    /// cleared). Refused, nothing forgotten, when it would bring back a
+    /// background effect nothing can run ([`effects::check_reset`]). `None`
+    /// when the scope is not global.
     fn reset_global(&mut self, what: &ResetWhat, now: Instant) -> Option<Result<(), IpcError>> {
         let entries = self.global_settings();
         let ids: Vec<String> = match what {
@@ -6902,6 +6904,9 @@ impl<B: MediaBackend> Controller<B> {
             }
             _ => return None,
         };
+        if let Err(r) = effects::check_reset(&entries, &ids, &self.runtime, &self.config.effect) {
+            return Some(Err(refusal_error(r)));
+        }
         let mut changed = false;
         for id in &ids {
             changed |= effects::forget(&mut self.runtime, id);

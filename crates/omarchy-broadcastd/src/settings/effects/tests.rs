@@ -845,6 +845,173 @@ fn a_background_effect_no_module_runs_can_still_be_turned_off() {
     ));
 }
 
+/// The global settings with the Maxine module
+/// (all its stages), the open-model cut-out when `onnx`, the next
+/// session in `memory`.
+fn in_memory(
+    runtime: &RuntimeState,
+    onnx: bool,
+    memory: crate::modules::HostMemory,
+) -> Vec<GlobalEntry> {
+    let mut list = vec![(testing::maxine_entry(), Ok(testing::maxine_opened(&[])))];
+    if onnx {
+        list.push((testing::onnx_entry(), Ok(testing::onnx_opened())));
+    }
+    let mut modules = testing::modules(list);
+    testing::in_memory(&mut modules, memory);
+    build(&Inputs {
+        config: &Config::default(),
+        runtime,
+        modules: &modules,
+        enhance_applies: None,
+    })
+}
+
+/// In CUDA memory the Maxine module runs the background effect: the
+/// group is offered as ever.
+#[test]
+fn in_cuda_memory_the_background_group_is_offered() {
+    use crate::modules::HostMemory;
+    for onnx in [false, true] {
+        let e = in_memory(&RuntimeState::default(), onnx, HostMemory::Cuda);
+        let mode = e.iter().find(|g| g.setting.id == MODE).unwrap();
+        assert_eq!(mode.binding, Binding::Mode, "onnx {onnx}");
+        assert!(mode.setting.enabled);
+        assert!(mode.setting.disabled_reason.is_empty());
+        assert_eq!(get(&e, BLUR_STRENGTH).disabled_reason, REASON_CHOOSE_BLUR);
+    }
+}
+
+/// In system memory with the open-model cut-out enabled (it takes host
+/// frames), the group is offered and blur can be chosen.
+#[test]
+fn in_system_memory_the_open_model_cut_out_offers_the_background_group() {
+    use crate::modules::HostMemory;
+    use obc_module_host::registry::REASON_CUDA_OFF;
+    let e = in_memory(
+        &RuntimeState::default(),
+        true,
+        HostMemory::System(REASON_CUDA_OFF),
+    );
+    let mode = e.iter().find(|g| g.setting.id == MODE).unwrap();
+    assert_eq!(mode.binding, Binding::Mode);
+    assert!(mode.setting.enabled);
+    assert_eq!(
+        check(&e, MODE, Some(&SettingValue::Str("blur".into()))),
+        Ok(Write::Mode(EffectMode::Blur))
+    );
+}
+
+/// In system memory with only the Maxine module (CUDA frames only), the
+/// group is shown greyed with the module's reason, as `GetModules` gives
+/// it: the mode while it is `none`, the blur strength always; a mode kept
+/// in force can still be turned off, and `blur` is refused with the reason.
+#[test]
+fn in_system_memory_with_only_maxine_the_background_group_is_greyed_with_its_reason() {
+    use crate::modules::HostMemory;
+    use obc_module_host::registry::{REASON_CUDA_OFF, REASON_NEEDS_CUDA};
+    let str_value = |s: &str| SettingValue::Str(s.into());
+    for reason in [REASON_CUDA_OFF, REASON_NEEDS_CUDA] {
+        let memory = HostMemory::System(reason);
+        let e = in_memory(&RuntimeState::default(), false, memory);
+        let in_group: Vec<&str> = e
+            .iter()
+            .filter(|g| g.group == BACKGROUND)
+            .map(|g| g.setting.id.as_str())
+            .collect();
+        assert_eq!(in_group, [MODE, BLUR_STRENGTH], "{reason}");
+        for id in [MODE, BLUR_STRENGTH] {
+            let s = get(&e, id);
+            assert!(!s.enabled, "{id} {reason}");
+            assert_eq!(s.disabled_reason, reason, "{id}");
+        }
+        assert_eq!(
+            check(&e, MODE, Some(&str_value("blur"))),
+            Err(Refusal::Disabled(reason.into()))
+        );
+        // A blur kept from a CUDA session: it can be turned off only.
+        let runtime = RuntimeState {
+            effect: Some(EffectMode::Blur),
+            ..RuntimeState::default()
+        };
+        let e = in_memory(&runtime, false, memory);
+        let mode = get(&e, MODE);
+        assert!(mode.enabled, "{reason}");
+        assert!(mode.disabled_reason.is_empty());
+        assert_eq!(mode.kind.value(), Some(str_value("blur")));
+        assert_eq!(get(&e, BLUR_STRENGTH).disabled_reason, reason);
+        assert_eq!(
+            check(&e, MODE, Some(&str_value("none"))),
+            Ok(Write::Mode(EffectMode::None))
+        );
+        for refused in ["blur", "replace"] {
+            assert_eq!(
+                check(&e, MODE, Some(&str_value(refused))),
+                Err(Refusal::Disabled(reason.into())),
+                "{refused}"
+            );
+        }
+        assert_eq!(
+            check(&e, BLUR_STRENGTH, Some(&SettingValue::Int(50))),
+            Err(Refusal::Disabled(reason.into()))
+        );
+    }
+}
+
+/// A reset that would bring back a configured background effect into a
+/// mode only `none` can be written to is refused with that binding's
+/// reason, in system memory with only the Maxine module as with no module
+/// at all; one that leaves the mode as it is, or brings back `none`, passes.
+#[test]
+fn a_reset_cannot_bring_back_a_background_effect_nothing_runs() {
+    use crate::modules::HostMemory;
+    use obc_module_host::registry::REASON_CUDA_OFF;
+    let ids = |list: &[&str]| -> Vec<String> { list.iter().map(|s| s.to_string()).collect() };
+    let group = ids(&[MODE, BLUR_STRENGTH]);
+    let blur = EffectConfig {
+        mode: EffectMode::Blur,
+        ..EffectConfig::default()
+    };
+    let stored = |m: Option<EffectMode>| RuntimeState {
+        effect: m,
+        ..RuntimeState::default()
+    };
+    // System memory, Maxine only: `[effect] mode = blur`, `none` stored.
+    let off = stored(Some(EffectMode::None));
+    let e = in_memory(&off, false, HostMemory::System(REASON_CUDA_OFF));
+    let refused = Err(Refusal::Disabled(REASON_CUDA_OFF.into()));
+    assert_eq!(check_reset(&e, &group, &off, &blur), refused);
+    assert_eq!(check_reset(&e, &ids(&[MODE]), &off, &blur), refused);
+    assert_eq!(check_reset(&e, &ids(&[BLUR_STRENGTH]), &off, &blur), Ok(()));
+    let none = EffectConfig::default();
+    assert_eq!(check_reset(&e, &group, &off, &none), Ok(()), "none back");
+    // The configured blur in force already: the mode stays as it is.
+    let kept = stored(Some(EffectMode::Blur));
+    let e = in_memory(&kept, false, HostMemory::System(REASON_CUDA_OFF));
+    assert_eq!(check_reset(&e, &group, &kept, &blur), Ok(()));
+    assert_eq!(
+        check_reset(&e, &group, &RuntimeState::default(), &blur),
+        Ok(())
+    );
+    // CUDA memory: the mode is bound as ever, any reset passes.
+    let e = in_memory(&off, false, HostMemory::Cuda);
+    assert_eq!(check_reset(&e, &group, &off, &blur), Ok(()));
+    // No module: `replace` stored, `blur` configured.
+    let modules = Modules::empty();
+    let replace = stored(Some(EffectMode::Replace));
+    let e = build(&Inputs {
+        config: &Config::default(),
+        runtime: &replace,
+        modules: &modules,
+        enhance_applies: None,
+    });
+    assert_eq!(
+        check_reset(&e, &group, &replace, &blur),
+        Err(Refusal::Disabled(REASON_NO_BACKGROUND.into()))
+    );
+    assert_eq!(check_reset(&e, &group, &replace, &none), Ok(()));
+}
+
 /// A condition's operand is published as it compares: a whole number
 /// written as a float is an integer; one no setting value can be leaves
 /// the setting out rather than dropping the condition (which would enable

@@ -337,6 +337,26 @@ async fn until(what: &str, seen: &Arc<Mutex<Vec<String>>>, done: impl Fn(&[Strin
     }
 }
 
+/// The first `SettingsChanged` on `signals` past `revision`. The
+/// publisher emits a step's signal after that step's method reply, so a
+/// stream subscribed after earlier steps may still receive theirs (at or
+/// below `revision`, the property read before this step): those are
+/// skipped.
+async fn settings_changed_after(
+    signals: &mut obc_ipc::client::SettingsChangedStream,
+    revision: u32,
+) -> obc_ipc::client::SettingsChanged {
+    within("SettingsChanged", async {
+        loop {
+            let sig = signals.next().await.unwrap();
+            if sig.args().unwrap().revision > revision {
+                return sig;
+            }
+        }
+    })
+    .await
+}
+
 /// The state file once `done` holds of its text (a settings change is
 /// saved after a delay).
 async fn state_file_until(rig: &Rig, done: impl Fn(&str) -> bool) -> String {
@@ -1895,7 +1915,7 @@ async fn settings_methods_their_signal_their_properties_and_their_errors() {
     )
     .await
     .unwrap();
-    let sig = within("SettingsChanged", signals.next()).await.unwrap();
+    let sig = settings_changed_after(&mut signals, before).await;
     let args = sig.args().unwrap();
     assert_eq!((args.revision, args.serial), (before + 1, serial));
     assert_eq!(
@@ -1973,7 +1993,7 @@ async fn settings_methods_their_signal_their_properties_and_their_errors() {
         enabled: true,
         disabled_reason: String::new(),
     };
-    let sig = within("SettingsChanged", signals.next()).await.unwrap();
+    let sig = settings_changed_after(&mut signals, before).await;
     let args = sig.args().unwrap();
     assert_eq!(args.revision, before + 1);
     assert_eq!(args.to_changes(), [denoise(true)]);
@@ -1984,36 +2004,50 @@ async fn settings_methods_their_signal_their_properties_and_their_errors() {
     )
     .await
     .unwrap();
-    let sig = within("SettingsChanged", signals.next()).await.unwrap();
-    assert_eq!(sig.args().unwrap().to_changes(), [denoise(false)]);
+    let sig = settings_changed_after(&mut signals, before + 1).await;
+    let args = sig.args().unwrap();
+    assert_eq!(args.revision, before + 2);
+    assert_eq!(args.to_changes(), [denoise(false)]);
     assert!(!proxy.denoise().await.unwrap());
     // Over the cap: RateLimited. (A signal stream left unread would fill
     // the client connection's queue and stall its replies.)
     drop(signals);
-    let mut limited = None;
-    // Six settings in turn: each written at most every 50 ms, so over
-    // 100 writes a second in all.
+    // Seven settings, each written at most every 50 ms: up to 140 writes
+    // a second. Each round sets all seven at once, so a round lasts about
+    // one window however slow a single call is, and the writes outpace
+    // the cap with margin to spare under load.
+    const WB_AUTO: &str = "camera.white_balance.white_balance_automatic";
+    const KEEP_FPS: &str = "camera.exposure.keep_framerate";
     let ids = [
         "camera.image.brightness",
         "camera.image.contrast",
         SHARP,
         "camera.exposure.gain",
-        "camera.white_balance.white_balance_automatic",
-        "camera.exposure.keep_framerate",
+        EXPOSURE,
+        WB_AUTO,
+        KEEP_FPS,
     ];
-    for k in 0..400usize {
-        let id = ids[k % ids.len()];
-        let v = if k % ids.len() < 4 {
-            SettingValue::Int((k % 2) as i64)
-        } else {
-            SettingValue::Bool(k % 2 == 0)
-        };
-        if let Err(e @ IpcError::RateLimited(_)) = within("SetSetting", set("", id, v)).await {
-            limited = Some(e);
+    let value = |id: &str, k: usize| match id {
+        WB_AUTO | KEEP_FPS => SettingValue::Bool(k.is_multiple_of(2)),
+        EXPOSURE => SettingValue::Int(100 + (k % 2) as i64),
+        _ => SettingValue::Int((k % 2) as i64),
+    };
+    let mut limited = None;
+    for k in 0..60usize {
+        let calls = ids.iter().map(|id| set("", id, value(id, k)));
+        let replies = within("SetSetting", futures_util::future::join_all(calls)).await;
+        for reply in replies {
+            match reply {
+                Ok(()) => {}
+                Err(e @ IpcError::RateLimited(_)) => limited = Some(e),
+                Err(e) => panic!("round {k}: {e:?}"),
+            }
+        }
+        if limited.is_some() {
             break;
         }
     }
-    let e = limited.expect("rate limited within 400 calls");
+    let e = limited.expect("rate limited within 60 rounds");
     assert_eq!(zbus::DBusError::name(&e).to_string(), name("RateLimited"));
 }
 
