@@ -2818,8 +2818,12 @@ const MAXINE_SETUP: &str = "this test needs the Maxine SDK: install the maxine-v
 /// The Maxine mask-hardening kernel fails closed through the element: a
 /// kernel that does not load fails the effect, and a kernel launch that
 /// fails on a frame blacks that frame, both with the reason in the status.
-/// The faults are real driver errors (garbage PTX, an oversized thread
-/// block), forced through the backend's test-only switch.
+/// Blur is turned on mid-stream, so its warm-up holds the picture on screen
+/// (the input, never black) until the failure; from the failure on every
+/// frame is black. The retry after a failure follows the privacy hold: the
+/// room was last hidden, so its warm-up is black too. The faults are real
+/// driver errors (garbage PTX, an oversized thread block), forced through the
+/// backend's test-only switch.
 #[test]
 #[ignore = "needs the NVIDIA Maxine VFX SDK (MAXINE_VFX_ROOT and its libraries on \
             LD_LIBRARY_PATH), the os-release override, an NVIDIA GPU and the GStreamer CUDA \
@@ -2834,13 +2838,18 @@ fn maxine_mask_kernel_failures_show_black_with_the_reason() {
     let mut rig = Rig::with_factory(Some(Arc::new(maxine)), &EffectSettings::default());
     assert_eq!(rig.frame(), Seen::Input);
 
-    // The kernel does not load: the load fails, black, status failed.
+    // The kernel does not load: a toggle mid-stream, so the input stays
+    // until the load fails; then black, status failed.
     switch.set(Some(MaskFault::ModuleLoad));
     rig.effect
         .apply(&EffectSettings::of(EffectKind::Blur))
         .unwrap();
     let seen = rig.frames_until(Duration::from_secs(60), failed);
-    assert!(seen.iter().all(|s| *s == Seen::Black), "{seen:?}");
+    // The status is checked before each frame, so the frame that straddles the
+    // failure may already be black: only the last one may be.
+    let (last, before) = seen.split_last().unwrap();
+    assert!(before.iter().all(|s| *s == Seen::Input), "{seen:?}");
+    assert!(matches!(last, Seen::Input | Seen::Black), "{seen:?}");
     let reason = rig.effect.status().reason().unwrap().to_string();
     println!("forced module-load failure: {reason}");
     assert!(reason.contains("cuModuleLoadData"), "{reason}");
@@ -2856,7 +2865,9 @@ fn maxine_mask_kernel_failures_show_black_with_the_reason() {
         rig.messages
     );
 
-    // A good load runs the effect; then frame launches fail: black.
+    // A good load runs the effect; then frame launches fail: black. The
+    // retry follows a failure (black on screen), so the privacy hold applies
+    // to the whole warm-up: black, never the input.
     switch.set(None);
     rig.effect
         .apply(&EffectSettings::of(EffectKind::Blur))
@@ -2883,11 +2894,12 @@ fn maxine_mask_kernel_failures_show_black_with_the_reason() {
 }
 
 /// The real denoise stage through the element: alone (the input until it
-/// is loaded, then denoised frames), under blur (the green screen loads
-/// black after the stage alone), and turned off and on while playing (a
-/// switch: every frame processed), and the stage's GPU time measured once
-/// frames are denoised. Needs the Maxine denoise feature
-/// (`features/nvvfxdenoising` of the SDK) installed.
+/// is loaded, then denoised frames), under blur (a toggle mid-stream: the
+/// green screen loads cold while the picture of the stage alone, or the
+/// input when the load holds the engine, stays on screen, never black), and
+/// turned off and on while playing (a switch: every frame processed), and the
+/// stage's GPU time measured once frames are denoised. Needs the Maxine
+/// denoise feature (`features/nvvfxdenoising` of the SDK) installed.
 #[test]
 #[ignore = "needs the NVIDIA Maxine VFX SDK with its denoising feature (MAXINE_VFX_ROOT and \
             its library directories on LD_LIBRARY_PATH), the os-release override, an NVIDIA \
@@ -2931,14 +2943,15 @@ fn maxine_denoise_alone_under_blur_and_toggled_while_playing() {
         "no denoise stage time after denoised frames"
     );
 
-    // Blur on top: the green screen loads cold, black until ready.
+    // Blur on top: the green screen loads cold; a toggle mid-stream, so the
+    // picture stays (the input, or the stage's frame), never black.
     rig.effect.apply(&denoised(EffectKind::Blur)).unwrap();
     let warm = rig.frames_until(Duration::from_secs(60), |r| {
         r.effect.status() != EffectStatus::Loading
     });
     assert_eq!(rig.effect.status(), EffectStatus::Ready);
     assert_eq!(rig.effect.stage_status("denoise"), EffectStatus::Ready);
-    assert!(warm.iter().all(|s| *s == Seen::Black), "{warm:?}");
+    assert!(warm.iter().all(|s| *s != Seen::Black), "{warm:?}");
     let processed = |s: &Seen| !matches!(s, Seen::Input | Seen::Black);
     for _ in 0..5 {
         let s = rig.frame();

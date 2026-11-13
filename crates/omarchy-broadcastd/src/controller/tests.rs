@@ -6778,6 +6778,35 @@ fn a_global_reset_puts_the_configurations_value_back_and_camera_reset_leaves_it(
     assert_eq!(h.state(), State::Active);
 }
 
+/// A reset never brings back a configured background effect nothing can
+/// run: with no module, `blur` configured and `replace` stored, the reset
+/// of the group is refused with the binding's reason and forgets nothing.
+#[test]
+fn a_global_reset_cannot_bring_back_a_background_effect_nothing_runs() {
+    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| w.maxine = false);
+    let image = h.image();
+    h.set_image(&image, 0).unwrap();
+    h.set_effect("replace", 0).unwrap();
+    assert_eq!(h.snap().effect, "replace");
+    let reason = crate::settings::effects::REASON_NO_BACKGROUND;
+    for scope in [
+        "group:background".to_string(),
+        format!("setting:{EFFECT_ID}"),
+    ] {
+        assert!(
+            matches!(
+                h.reset_settings(&scope, 10),
+                Err(IpcError::Disabled(ref m)) if m == reason
+            ),
+            "{scope}"
+        );
+        assert_eq!(saved_now(&h).effect, Some(EffectMode::Replace), "{scope}");
+    }
+    // Turning it off is still a write.
+    h.set_setting(EFFECT_ID, s("none"), 20).unwrap();
+    assert_eq!(h.snap().effect, "none");
+}
+
 #[test]
 fn global_settings_are_there_without_a_camera_and_work() {
     let mut h = H::new("", |w| w.cameras.clear());
