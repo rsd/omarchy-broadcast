@@ -1,24 +1,21 @@
 //! Tests of the video side of the gallery: the hash, the check of videos,
 //! the import of videos and animated images, posters, the ffmpeg runner
-//! and the playback copies.
+//! the command that converts a video for the CPU, and the cache's prune.
 //!
 //! Clips are made with the ffmpeg of `PATH` (lavfi `testsrc2`, a second
 //! or less); without it, or without an encoder a test needs, the test
-//! returns early and says so on stderr. The runner and the copy jobs are
-//! also driven by fake ffmpeg scripts that record their arguments and
-//! their niceness.
+//! returns early and says so on stderr. The runner is also driven by fake
+//! ffmpeg scripts that record their arguments and their niceness.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use super::ffmpeg::{self, ENCODE_SETTINGS_VERSION, Ffmpeg, FfmpegError, FfmpegJob};
+use super::ffmpeg::{self, Ffmpeg, FfmpegError, FfmpegJob};
 use super::hash::{self, Sha256};
-use super::playback::{CopyEvent, CopyState, PlaybackCopies, is_cpu_ready};
-use super::probe::{Codec, Container, MAX_VIDEO_BYTES, VideoInfo, probe_video};
+use super::probe::{Codec, Container, MAX_VIDEO_BYTES, VideoInfo, is_cpu_ready, probe_video};
 use super::*;
 
 const EVENT_WAIT: Duration = Duration::from_secs(60);
@@ -561,6 +558,69 @@ fn a_video_is_stored_as_it_is_with_the_extension_of_its_container() {
 }
 
 #[test]
+fn background_videos_and_animations_go_to_the_videos_folder() {
+    let f = fx();
+    let pictures = f.root.join("Pictures/omarchy-broadcast");
+    let videos = f.root.join("Videos/omarchy-broadcast");
+    let store = MediaStore::new(f.root.join("bundled"), &pictures)
+        .with_video_root(&videos)
+        .with_cache(MediaCache::new(f.root.join("cache")));
+    let kind = MediaKind::Background;
+    let Some(src) = h264(&f.src.join("clip.mp4"), "64x48", 10) else {
+        return;
+    };
+    let stored = store.import(kind, &src).unwrap();
+    assert_eq!(stored, videos.join("clip.mp4"));
+    assert!(names(&pictures).is_empty(), "{:?}", names(&pictures));
+
+    // A video dropped by hand into Pictures is listed, found as a
+    // duplicate, and its poster kept by the prune; so is the stored one.
+    let dropped = vp9(&pictures.join("dropped.webm"), "64x48", 10).unwrap();
+    let again = f.src.join("again.webm");
+    std::fs::copy(&dropped, &again).unwrap();
+    assert_eq!(
+        store.import_stored(kind, &again).unwrap(),
+        (dropped.clone(), false)
+    );
+    let listed: Vec<PathBuf> = store.list(kind).into_iter().map(|i| i.path).collect();
+    assert_eq!(listed, [stored.clone(), dropped.clone()]);
+    let mut paths = store.video_paths(kind);
+    paths.sort();
+    assert_eq!(paths, [dropped.clone(), stored.clone()]);
+
+    // An animated GIF's WebM and its source record are in Videos.
+    let gif = clip(&f.src.join("Party.gif"), "32x32", 10, 0.5, &["-f", "gif"]).unwrap();
+    let (webm, new) = store.import_stored(kind, &gif).unwrap();
+    assert!(new);
+    assert_eq!(webm, videos.join("Party.webm"));
+    assert_eq!(
+        std::fs::read_dir(videos.join(TRANSCODED_DIR))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert!(!pictures.join(TRANSCODED_DIR).exists());
+    assert_eq!(
+        store.import_stored(kind, &gif).unwrap(),
+        (webm.clone(), false)
+    );
+    store.remove(&webm).unwrap();
+    assert_eq!(
+        std::fs::read_dir(videos.join(TRANSCODED_DIR))
+            .unwrap()
+            .count(),
+        0
+    );
+
+    // The conversion of a video goes to the videos folder.
+    let command = cpu_convert_command(store.convert_dir(), &stored).unwrap();
+    assert_eq!(
+        shell_words(&command).last().unwrap(),
+        &videos.join("clip-cpu.webm").display().to_string()
+    );
+}
+
+#[test]
 fn an_away_image_must_be_a_still() {
     let f = fx();
     let Some(src) = h264(&f.src.join("clip.mp4"), "64x48", 10) else {
@@ -777,14 +837,13 @@ fn the_cache_follows_xdg_cache_home_then_home() {
         s.cache().unwrap().root(),
         Path::new("/h/.cache/omarchy-broadcast")
     );
-    let s = MediaStore::from_env_in(env(&[("XDG_DATA_HOME", "/d")])).unwrap();
-    assert!(s.cache().is_none());
+    // Without HOME there is no gallery at all (its root is in the
+    // pictures directory), so no store without a cache from the
+    // environment.
+    let e = MediaStore::from_env_in(env(&[("XDG_CACHE_HOME", "/c")])).unwrap_err();
+    assert!(matches!(e, MediaError::NoHome), "{e}");
     let h = "ab".repeat(32);
     let c = MediaCache::new("/c");
-    assert_eq!(
-        c.copy_path(&h),
-        PathBuf::from(format!("/c/playback/{h}-v{ENCODE_SETTINGS_VERSION}.webm"))
-    );
     assert_eq!(
         c.poster_path(&h),
         PathBuf::from(format!("/c/posters/{h}.jpg"))
@@ -968,302 +1027,125 @@ fn ffmpeg_is_found_on_path_or_reported_missing() {
     assert_eq!(FfmpegError::Missing.to_string(), "ffmpeg is not installed");
 }
 
-// --- playback copies --------------------------------------------------
+// --- the command that converts a video for the CPU --------------------
 
-fn next_event(rx: &Receiver<CopyEvent>) -> CopyEvent {
-    rx.recv_timeout(EVENT_WAIT).expect("a copy event")
-}
-
-/// The end of the next job (past its `Preparing` step).
-fn end_of(rx: &Receiver<CopyEvent>) -> Result<PathBuf, String> {
-    loop {
-        match next_event(rx).state {
-            CopyState::Preparing => {}
-            CopyState::Ready(p) => return Ok(p),
-            CopyState::Failed(r) => return Err(r),
-            other => panic!("not a job's step: {other:?}"),
-        }
-    }
-}
-
-#[test]
-fn a_copy_job_runs_once_and_its_copy_is_then_ready() {
-    let f = fx();
-    let Some(src) = h264(&f.src.join("a.mp4"), "64x48", 10) else {
-        return;
-    };
-    let bin = f.root.join("bin");
-    let cache = f.store.cache().unwrap().clone();
-    let (copies, rx) = PlaybackCopies::new(cache.clone(), Ok(fake(&bin, WRITES_WEBM)));
-    // Not hashed yet in this run: the job looks for a copy first, then
-    // says it makes one.
-    assert_eq!(copies.ensure(&src), CopyState::Checking);
-    let ev = next_event(&rx);
-    assert_eq!((&ev.source, &ev.state), (&src, &CopyState::Preparing));
-    let path = end_of(&rx).unwrap();
-    let content = hash::to_hex(&hash::sha256(&std::fs::read(&src).unwrap()));
-    assert_eq!(path, cache.copy_path(&content));
+/// The words a POSIX shell reads from `command` (`sh -c 'set -- …'`).
+fn shell_words(command: &str) -> Vec<String> {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!("set -- {command}; printf '%s\\0' \"$@\""))
+        .output()
+        .unwrap();
     assert!(
-        path.to_str()
-            .unwrap()
-            .ends_with(&format!("-v{ENCODE_SETTINGS_VERSION}.webm"))
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(copies.copy_path(&src).unwrap(), path);
-    // The demuxer forced is the source's container's.
-    let argv = argv_of(&bin);
-    let fi = argv.iter().position(|a| a == "-f").unwrap();
-    assert_eq!(argv[fi + 1], "mov");
-    assert_eq!(
-        std::fs::read_to_string(bin.join("nice")).unwrap().trim(),
-        "19"
-    );
-    // No temporary file is left.
-    let left: Vec<_> = std::fs::read_dir(cache.playback_dir())
+    String::from_utf8(out.stdout)
         .unwrap()
-        .flatten()
-        .map(|e| e.file_name())
-        .collect();
-    assert_eq!(left.len(), 1, "{left:?}");
-    assert_eq!(copies.ensure(&src), CopyState::Ready(path.clone()));
-
-    // A copy that is not a WebM any more is made again.
-    std::fs::write(&path, b"garbage").unwrap();
-    assert_eq!(copies.ensure(&src), CopyState::Preparing);
-    assert_eq!(end_of(&rx), Ok(path.clone()));
-    // So is a missing one.
-    std::fs::remove_file(&path).unwrap();
-    assert_eq!(copies.ensure(&src), CopyState::Preparing);
-    assert_eq!(end_of(&rx), Ok(path));
+        .split_terminator('\0')
+        .map(str::to_string)
+        .collect()
 }
 
 #[test]
-fn a_failed_job_is_remembered_until_the_source_is_forgotten() {
-    let f = fx();
-    let Some(src) = h264(&f.src.join("a.mp4"), "64x48", 10) else {
-        return;
-    };
-    let (copies, rx) = PlaybackCopies::new(
-        f.store.cache().unwrap().clone(),
-        Ok(fake(&f.root.join("bin"), FAILS)),
-    );
-    copies.ensure(&src);
-    let reason = end_of(&rx).unwrap_err();
-    // What failed, with no prefix of its own: `Warning` gives it one.
-    assert_eq!(reason, "ffmpeg failed: boom: bad input (exit 1)");
-    assert_eq!(copies.ensure(&src), CopyState::Failed(reason.clone()));
-    assert!(!copies.busy());
-    // A camera start runs it once more; a second failure stands.
-    assert_eq!(copies.retry(&src), CopyState::Preparing);
-    assert_eq!(end_of(&rx), Err(reason.clone()));
-    assert_eq!(copies.retry(&src), CopyState::Failed(reason.clone()));
-    assert_eq!(copies.ensure(&src), CopyState::Failed(reason));
-    assert!(!copies.busy());
-    copies.remove_for(&src);
-    assert_eq!(copies.ensure(&src), CopyState::Preparing);
-    assert!(end_of(&rx).is_err());
-}
-
-#[test]
-fn a_newer_request_cancels_the_running_job_for_another_source() {
-    let f = fx();
-    let Some(a) = h264(&f.src.join("a.mp4"), "64x48", 10) else {
-        return;
-    };
-    let b = h264(&f.src.join("b.mp4"), "64x48", 12).unwrap();
-    let c = h264(&f.src.join("c.mp4"), "64x48", 15).unwrap();
-    let bin = f.root.join("bin");
-    // The first run hangs (and takes the marker); later ones write.
-    std::fs::create_dir_all(&bin).unwrap();
-    std::fs::write(bin.join("hang"), b"").unwrap();
-    let body = format!(
-        "if [ -e '{0}/hang' ]; then rm '{0}/hang'; exec sleep 30; fi\n{WRITES_WEBM}",
-        bin.display()
-    );
-    let (copies, rx) = PlaybackCopies::new(f.store.cache().unwrap().clone(), Ok(fake(&bin, &body)));
-    assert_eq!(copies.ensure(&a), CopyState::Checking);
-    wait_for(&bin.join("pid"));
-    let hung = std::fs::read_to_string(bin.join("pid")).unwrap();
-    // The same source again: still preparing, no second job.
-    assert_eq!(copies.ensure(&a), CopyState::Preparing);
-    // Another source: the hung job is killed; a third replaces the second
-    // if it is still queued.
-    assert_eq!(copies.ensure(&b), CopyState::Checking);
-    assert_eq!(copies.ensure(&c), CopyState::Checking);
-    let mut seen = Vec::new();
-    loop {
-        let ev = next_event(&rx);
-        assert!(
-            matches!(ev.state, CopyState::Ready(_) | CopyState::Preparing),
-            "{ev:?}"
-        );
-        if matches!(ev.state, CopyState::Ready(_)) {
-            seen.push(ev.source.clone());
-        }
-        if ev.source == c && matches!(ev.state, CopyState::Ready(_)) {
-            break;
-        }
-    }
+fn the_convert_command_is_the_import_settings_as_one_shell_line() {
+    let input = Path::new("/home/u/My clips/it's \\ $HOME `x` (1).mp4");
+    let output = Path::new("/home/u/Pictures/omarchy-broadcast/it's (1)-cpu.webm");
+    let command = ffmpeg::cpu_convert_command(input, output).unwrap();
     assert!(
-        !seen.contains(&a),
-        "the cancelled job sent no event: {seen:?}"
+        command.starts_with(
+            "ffmpeg -nostdin -n -protocol_whitelist file -i '/home/u/My clips/it'\\''s"
+        ),
+        "{command}"
     );
-    assert!(
-        !pid_number_alive(hung.trim()),
-        "the cancelled ffmpeg was killed"
+    assert!(!command.contains('\n'));
+    let mut want = vec![
+        "ffmpeg".to_string(),
+        "-nostdin".into(),
+        "-n".into(),
+        "-protocol_whitelist".into(),
+        "file".into(),
+        "-i".into(),
+        input.display().to_string(),
+    ];
+    want.extend(
+        ffmpeg::vp9_args()
+            .iter()
+            .map(|a| a.to_str().unwrap().to_string()),
     );
-}
-
-#[test]
-fn choosing_back_the_source_of_a_cancelled_job_queues_it_again() {
-    let f = fx();
-    let Some(a) = h264(&f.src.join("a.mp4"), "64x48", 10) else {
-        return;
-    };
-    let b = h264(&f.src.join("b.mp4"), "64x48", 12).unwrap();
-    let bin = f.root.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    std::fs::write(bin.join("hang"), b"").unwrap();
-    let body = format!(
-        "if [ -e '{0}/hang' ]; then rm '{0}/hang'; exec sleep 30; fi\n{WRITES_WEBM}",
-        bin.display()
-    );
-    let (copies, rx) = PlaybackCopies::new(f.store.cache().unwrap().clone(), Ok(fake(&bin, &body)));
-    // A, then B (A's job cancelled), then A again: A must not wait on
-    // its cancelled job, which sends nothing.
-    copies.ensure(&a);
-    wait_for(&bin.join("pid"));
-    copies.ensure(&b);
-    assert_ne!(copies.ensure(&a), CopyState::Checking, "A's hash is known");
-    loop {
-        let ev = next_event(&rx);
-        if ev.source == a && matches!(ev.state, CopyState::Ready(_)) {
-            break;
-        }
-        assert_ne!(
-            ev.source, b,
-            "B was replaced while queued, or cancelled: {ev:?}"
-        );
-    }
-}
-
-#[test]
-fn an_existing_copy_is_found_without_running_ffmpeg() {
-    let f = fx();
-    let src = f.src.join("unhashed.mp4");
-    std::fs::write(&src, b"\0\0\0\x18ftypisom some bytes no one hashed yet").unwrap();
-    let cache = f.store.cache().unwrap().clone();
-    // The copy of an earlier run, named by the content's hash.
-    let content = hash::to_hex(&hash::sha256(&std::fs::read(&src).unwrap()));
-    let copy = cache.copy_path(&content);
-    std::fs::create_dir_all(cache.playback_dir()).unwrap();
-    std::fs::write(&copy, b"\x1a\x45\xdf\xa3 an earlier copy").unwrap();
-    let bin = f.root.join("bin");
-    let (copies, rx) = PlaybackCopies::new(cache, Ok(fake(&bin, FAILS)));
-    assert_eq!(copies.ensure(&src), CopyState::Checking, "not Preparing");
-    let ev = next_event(&rx);
+    want.push(output.display().to_string());
+    assert_eq!(shell_words(&command), want);
+    // The same settings as the animated import: the very arguments.
+    let words = shell_words(&command);
     assert_eq!(
-        ev.state,
-        CopyState::Ready(copy.clone()),
-        "no Preparing step"
+        words[7..words.len() - 1],
+        ffmpeg::vp9_args()
+            .iter()
+            .map(|a| a.to_str().unwrap().to_string())
+            .collect::<Vec<_>>()[..]
     );
-    assert!(!bin.join("argv").exists(), "ffmpeg was not run");
-    assert_eq!(copies.ensure(&src), CopyState::Ready(copy));
-}
-
-/// The ffmpeg [`relocating`] finds: none until set.
-static LOCATED: std::sync::Mutex<Option<Ffmpeg>> = std::sync::Mutex::new(None);
-
-fn relocating() -> Result<Ffmpeg, FfmpegError> {
-    LOCATED.lock().unwrap().clone().ok_or(FfmpegError::Missing)
+    // A path that is not UTF-8 has no command.
+    use std::os::unix::ffi::OsStrExt;
+    let odd = Path::new(std::ffi::OsStr::from_bytes(b"/x/\xff.mp4"));
+    assert_eq!(ffmpeg::cpu_convert_command(odd, output), None);
 }
 
 #[test]
-fn ffmpeg_installed_while_running_is_found_at_the_next_request() {
+fn the_conversion_goes_to_the_gallery_under_a_free_name() {
     let f = fx();
-    let Some(src) = h264(&f.src.join("late.mp4"), "64x48", 10) else {
+    let dir = f.store.user_dir(MediaKind::Background);
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = f.src.join("Beach day.webm");
+    assert_eq!(
+        cpu_convert_output(&dir, &input),
+        dir.join("Beach day-cpu.webm")
+    );
+    std::fs::write(dir.join("Beach day-cpu.webm"), b"x").unwrap();
+    std::fs::write(dir.join("Beach day-cpu-2.webm"), b"x").unwrap();
+    assert_eq!(
+        cpu_convert_output(&dir, &input),
+        dir.join("Beach day-cpu-3.webm")
+    );
+    let command = cpu_convert_command(&dir, &input).unwrap();
+    assert_eq!(
+        shell_words(&command).last().unwrap(),
+        &dir.join("Beach day-cpu-3.webm").display().to_string()
+    );
+}
+
+#[test]
+fn the_convert_command_makes_a_cpu_ready_video() {
+    let f = fx();
+    let Some(src) = h264(&f.src.join("fast clip.mp4"), "320x240", 60) else {
         return;
     };
-    let (copies, rx) = PlaybackCopies::with_locator(f.store.cache().unwrap().clone(), relocating);
-    assert_eq!(copies.ensure(&src), CopyState::NoFfmpeg);
-    assert_eq!(copies.ensure(&src), CopyState::NoFfmpeg);
-    *LOCATED.lock().unwrap() = Some(fake(&f.root.join("bin"), WRITES_WEBM));
-    assert_eq!(copies.ensure(&src), CopyState::Checking);
-    assert!(end_of(&rx).is_ok());
-}
-
-#[test]
-fn a_stopped_prune_removes_nothing() {
-    let f = fx();
-    let cache = f.store.cache().unwrap().clone();
-    std::fs::create_dir_all(cache.playback_dir()).unwrap();
-    let orphan = cache.copy_path(&"3".repeat(64));
-    std::fs::write(&orphan, b"x").unwrap();
-    let older = cache.copy_path(&"4".repeat(64));
-    std::fs::write(&older, b"x").unwrap();
-    // Stopped (the service dropped): what to keep is not known in full.
-    let stop = AtomicBool::new(true);
-    let report = super::playback::prune(&cache, &f.store, None, &stop);
-    assert!(report.removed.is_empty());
-    assert!(orphan.exists() && older.exists());
-}
-
-#[test]
-fn dropping_the_service_kills_its_job() {
-    let f = fx();
-    let Some(a) = h264(&f.src.join("a.mp4"), "64x48", 10) else {
+    if !has_encoder("libvpx-vp9") {
+        eprintln!("skipped: no libvpx-vp9 encoder");
         return;
-    };
-    let bin = f.root.join("bin");
-    let (copies, rx) = PlaybackCopies::new(f.store.cache().unwrap().clone(), Ok(fake(&bin, HANGS)));
-    copies.ensure(&a);
-    wait_for(&bin.join("pid"));
-    assert!(copies.busy());
-    let t = Instant::now();
-    drop(copies);
-    assert!(t.elapsed() < Duration::from_secs(10));
-    assert!(!pid_alive(&bin));
-    // Its transcode step at most: a cancelled job sends no end.
-    let steps: Vec<_> = rx.try_iter().map(|e| e.state).collect();
+    }
+    let out = f.root.join("out-cpu.webm");
+    let command = ffmpeg::cpu_convert_command(&src, &out).unwrap();
+    let run = Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
     assert!(
-        steps.iter().all(|s| *s == CopyState::Preparing),
-        "{steps:?}"
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
     );
-}
-
-#[test]
-fn without_ffmpeg_no_copy_and_a_cpu_ready_source_plays_as_it_is() {
-    let f = fx();
-    let cache = f.store.cache().unwrap().clone();
-    let (none, _rx) = PlaybackCopies::new(cache.clone(), Err(FfmpegError::Missing));
-    assert_eq!(none.ensure(Path::new("/nowhere.mp4")), CopyState::NoFfmpeg);
-    let Some(w) = vp9(&f.src.join("ready.webm"), "64x48", 10) else {
-        return;
-    };
-    let bin = f.root.join("bin");
-    let (copies, rx) = PlaybackCopies::new(cache, Ok(fake(&bin, FAILS)));
-    copies.ensure(&w);
-    assert_eq!(end_of(&rx), Ok(w));
-    assert!(!bin.join("argv").exists(), "ffmpeg was not run");
-    let missing = copies.ensure(&f.src.join("missing.mp4"));
-    assert!(matches!(missing, CopyState::Failed(r) if r.contains("unreadable")));
-}
-
-#[test]
-fn a_real_copy_is_cpu_ready() {
-    let f = fx();
-    let Some(src) = h264(&f.src.join("fast.mp4"), "320x240", 60) else {
-        return;
-    };
-    let (copies, rx) = PlaybackCopies::new(f.store.cache().unwrap().clone(), Ffmpeg::locate());
-    copies.ensure(&src);
-    let copy = end_of(&rx).unwrap();
-    let i = probe_video(&copy).unwrap();
+    let i = probe_video(&out).unwrap();
     assert!(is_cpu_ready(&i), "{i:?}");
     assert_eq!((i.width, i.height), (320, 240));
 }
 
+// --- the cache's prune -------------------------------------------------
+
 #[test]
-fn removing_a_video_removes_its_poster_and_copies() {
+fn removing_a_video_removes_its_poster() {
     let f = fx();
     let Some(src) = h264(&f.src.join("a.mp4"), "64x48", 10) else {
         return;
@@ -1271,22 +1153,30 @@ fn removing_a_video_removes_its_poster_and_copies() {
     let kind = MediaKind::Background;
     let stored = f.store.import(kind, &src).unwrap();
     let cache = f.store.cache().unwrap().clone();
-    let (copies, rx) =
-        PlaybackCopies::new(cache.clone(), Ok(fake(&f.root.join("bin"), WRITES_WEBM)));
-    copies.ensure(&stored);
-    let copy = end_of(&rx).unwrap();
     let content = hash::to_hex(&hash::sha256(&std::fs::read(&stored).unwrap()));
-    let old = cache.playback_dir().join(format!("{content}-v0.webm"));
-    std::fs::write(&old, b"old").unwrap();
     let poster = cache.poster_path(&content);
-    assert!(poster.exists() && copy.exists());
+    assert!(poster.exists());
     f.store.warm_hash(&stored);
     f.store.remove(&stored).unwrap();
-    assert!(!stored.exists() && !poster.exists() && !copy.exists() && !old.exists());
+    assert!(!stored.exists() && !poster.exists());
 }
 
 #[test]
-fn a_prune_keeps_what_gallery_videos_and_the_outside_file_need() {
+fn a_stopped_prune_removes_no_poster() {
+    let f = fx();
+    let cache = f.store.cache().unwrap().clone();
+    std::fs::create_dir_all(cache.posters_dir()).unwrap();
+    let orphan = cache.poster_path(&"3".repeat(64));
+    std::fs::write(&orphan, b"x").unwrap();
+    // Stopped (the service dropped): what to keep is not known in full.
+    let stop = AtomicBool::new(true);
+    let report = cache::prune(&cache, &f.store, None, &stop);
+    assert!(report.removed.is_empty());
+    assert!(orphan.exists());
+}
+
+#[test]
+fn the_prune_removes_the_playback_copies_and_the_posters_no_video_needs() {
     let f = fx();
     let dir = f.store.user_dir(MediaKind::Background);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1296,69 +1186,44 @@ fn a_prune_keeps_what_gallery_videos_and_the_outside_file_need() {
     let outside = h264(&f.src.join("outside.mp4"), "64x48", 12).unwrap();
     let h = |p: &Path| hash::to_hex(&hash::sha256(&std::fs::read(p).unwrap()));
     let (hi, ho) = (h(&item), h(&outside));
-    let (h1, h2) = ("1".repeat(64), "2".repeat(64));
     let cache = f.store.cache().unwrap().clone();
-    std::fs::create_dir_all(cache.playback_dir()).unwrap();
+    // The copies an earlier version made, with what else was in there.
+    let playback = cache.playback_dir();
+    std::fs::create_dir_all(playback.join("nested")).unwrap();
+    for name in [
+        format!("{hi}-v1.webm"),
+        ".part-1-0.tmp".into(),
+        "notes.txt".into(),
+    ] {
+        std::fs::write(playback.join(name), b"x").unwrap();
+    }
     std::fs::create_dir_all(cache.posters_dir()).unwrap();
     let put = |p: PathBuf| {
         std::fs::write(&p, b"x").unwrap();
         p
     };
-    let keep_item = put(cache.copy_path(&hi));
-    let old_version = put(cache.playback_dir().join(format!("{hi}-v0.webm")));
-    let older = put(cache.copy_path(&h1));
-    // Make h2's copy the newest.
-    std::thread::sleep(Duration::from_millis(20));
-    let newest = put(cache.copy_path(&h2));
-    let outside_copy = put(cache.copy_path(&ho));
-    let filetime = |p: &Path, secs_ago: u64| {
-        let t = SystemTime::now() - Duration::from_secs(secs_ago);
-        File::options()
-            .write(true)
-            .open(p)
-            .unwrap()
-            .set_modified(t)
-            .unwrap();
-    };
-    filetime(&outside_copy, 3600);
-    filetime(&older, 7200);
     let item_poster = put(cache.poster_path(&hi));
-    let stray_poster = put(cache.poster_path(&h1));
-    // Another process's temporary file: removed only once an hour old.
-    let part = put(cache.playback_dir().join(".part-1-0.tmp"));
-    filetime(&part, 2 * 3600);
-    let young_part = put(cache.playback_dir().join(".part-1-1.tmp"));
-    let stranger = put(cache.playback_dir().join("notes.txt"));
+    let outside_poster = put(cache.poster_path(&ho));
+    let stray_poster = put(cache.poster_path(&"1".repeat(64)));
+    let stranger = put(cache.posters_dir().join("notes.txt"));
 
-    let (copies, _rx) = PlaybackCopies::new(cache.clone(), Err(FfmpegError::Missing));
-    let report = copies.prune_orphans(&f.store, None);
+    let report = cache::prune(&cache, &f.store, Some(&outside), &AtomicBool::new(false));
     let gone: BTreeSet<_> = report.removed.into_iter().collect();
-    let want: BTreeSet<_> = [old_version, older, outside_copy.clone(), stray_poster, part]
-        .into_iter()
-        .collect();
+    let want: BTreeSet<_> = [playback.clone(), stray_poster].into_iter().collect();
     assert_eq!(gone, want);
-    assert!(keep_item.exists() && newest.exists() && item_poster.exists() && stranger.exists());
-    assert!(
-        young_part.exists(),
-        "a young temporary file of another process stays"
-    );
-
-    // Naming the outside file keeps its copy and drops the spare.
-    let outside_copy = put(outside_copy);
-    let report = copies.prune_orphans(&f.store, Some(&outside));
-    assert_eq!(report.removed, [newest]);
-    assert!(outside_copy.exists() && keep_item.exists());
-
-    // The same through the worker.
-    let spare = put(cache.copy_path(&h1));
-    let stray = put(cache.copy_path(&h2));
-    copies.request_prune(&f.store, Some(&outside));
-    let end = Instant::now() + Duration::from_secs(20);
-    while (spare.exists() || stray.exists()) && Instant::now() < end {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(!spare.exists() && !stray.exists());
-    assert!(outside_copy.exists() && keep_item.exists());
+    assert!(!playback.exists());
+    assert!(item_poster.exists() && outside_poster.exists() && stranger.exists());
+    // Without the outside file named, its poster goes; no playback
+    // directory is fine.
+    let report = cache::prune(&cache, &f.store, None, &AtomicBool::new(false));
+    assert_eq!(report.removed, [outside_poster]);
+    // A link where the directory was is removed, never followed.
+    let target = f.root.join("elsewhere");
+    std::fs::create_dir_all(&target).unwrap();
+    let kept = put(target.join("kept"));
+    std::os::unix::fs::symlink(&target, &playback).unwrap();
+    cache::prune(&cache, &f.store, None, &AtomicBool::new(false));
+    assert!(std::fs::symlink_metadata(&playback).is_err() && kept.exists());
 }
 
 fn names(dir: &Path) -> BTreeSet<String> {

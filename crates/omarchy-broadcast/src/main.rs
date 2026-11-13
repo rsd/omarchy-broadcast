@@ -59,8 +59,8 @@ a profile, `order show`, `config show|get|files`, `mic` or `mic status` and `med
 `media list` never start the daemon. `on`, `off`, `camera`, `effect <effect>`, `denoise`,
 `controls set`, `controls reset`, `settings set`, `settings reset`, `modules
 enable|disable|profile <profile>|pin`, `order set|reset`, `config set|reset`, `mic
-on|off|device|default|restore-default` and `media import|remove` may start it through D-Bus
-activation when its activation file is installed.
+on|off|device|default|restore-default` and `media import|remove|convert-command` may start it
+through D-Bus activation when its activation file is installed.
 
 `--json` output is documented in docs/cli-json.md; the D-Bus interface in docs/dbus-api.md.";
 
@@ -236,12 +236,16 @@ enum Command {
         action: Option<config::ConfigAction>,
     },
     /// Show or manage the media gallery: the backgrounds of `replace` and
-    /// the away images, bundled or yours.
+    /// the away images, bundled or yours. Yours are in two folders:
+    /// `omarchy-broadcast` in your pictures folder (background images; away
+    /// images in its `away` folder) and in your videos folder (background
+    /// videos); a file you drop into either is listed.
     ///
     /// Without a subcommand, lists the backgrounds (or the kind given).
     /// Examples: `omarchy-broadcast media away`,
     /// `omarchy-broadcast media import background ~/Pictures/office.jpg --select`,
-    /// `omarchy-broadcast media remove ~/.local/share/omarchy-broadcast/media/backgrounds/office.jpg`.
+    /// `omarchy-broadcast media remove ~/Pictures/omarchy-broadcast/office.jpg`,
+    /// `omarchy-broadcast media convert-command ~/Videos/beach.mp4`.
     #[command(args_conflicts_with_subcommands = true)]
     Media {
         /// `background` (the default) or `away`; only without a
@@ -954,6 +958,8 @@ enum Job {
     },
     /// `media remove`, the path made absolute.
     MediaRemove(String),
+    /// `media convert-command`, the path made absolute.
+    MediaConvertCommand(String),
 }
 
 /// A usage error of `media <action>`, found after the command line was
@@ -1002,6 +1008,12 @@ fn job(cli: Cli) -> Result<Job, clap::Error> {
         } => media::absolute_text(&path)
             .map(Job::MediaRemove)
             .map_err(|m| media_usage("remove", ErrorKind::ValueValidation, m)),
+        Command::Media {
+            action: Some(media::MediaAction::ConvertCommand { path }),
+            ..
+        } => media::absolute_text(&path)
+            .map(Job::MediaConvertCommand)
+            .map_err(|m| media_usage("convert-command", ErrorKind::ValueValidation, m)),
         Command::Effect {
             effect: Some(effect),
             strength,
@@ -1035,13 +1047,16 @@ async fn run(job: Job) -> u8 {
             json,
         } => media::run_import(kind, path, *select, *json).await,
         Job::MediaRemove(path) => media::run_remove(path).await,
+        Job::MediaConvertCommand(path) => media::run_convert_command(path).await,
         Job::Command(Command::Media {
             kind, json, action, ..
         }) => match action {
             Some(media::MediaAction::List { kind, json }) => {
                 media::run_list(kind.as_deref(), *json).await
             }
-            Some(_) => unreachable!("media import and remove are jobs of their own"),
+            Some(_) => {
+                unreachable!("media import, remove and convert-command are jobs of their own")
+            }
             None => media::run_list(kind.as_deref(), *json).await,
         },
         Job::Command(Command::Status { json }) => show(*json, View::Status).await,

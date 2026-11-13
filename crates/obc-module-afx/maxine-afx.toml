@@ -6,7 +6,7 @@
 abi = 1
 id = "br.com.dias.maxine-afx"
 name = "NVIDIA Maxine audio effects"
-version = "0.44.0"
+version = "0.45.0"
 licence = "MIT OR Apache-2.0 (module); NVIDIA Maxine Audio Effects SDK under its own licence"
 kind = "audio-filter"
 library = "/usr/lib/omarchy-broadcast/modules/libobc_module_afx.so"

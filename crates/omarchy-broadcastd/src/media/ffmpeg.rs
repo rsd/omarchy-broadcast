@@ -1,5 +1,7 @@
 //! The one place the daemon runs ffmpeg: the transcode of an animated
-//! image at import, the posters of videos and the playback copies.
+//! image at import and the posters of videos; and the command a user runs
+//! to convert a video for playback without the NVIDIA GPU
+//! ([`cpu_convert_command`]), which the daemon never runs itself.
 //!
 //! Every input is untrusted, so every run is the same hardened shape
 //! ([`Ffmpeg::argv`]):
@@ -34,11 +36,6 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-
-/// The version of the playback copy's encode settings ([`vp9_args`]); part
-/// of a copy's cache name, so a change of the settings makes new copies
-/// and the old ones are pruned.
-pub const ENCODE_SETTINGS_VERSION: u32 = 1;
 
 /// The longest side box of a CPU-ready video: 1920x1080.
 pub const CPU_MAX_WIDTH: u32 = 1920;
@@ -291,8 +288,8 @@ pub fn job_threads() -> usize {
 /// video stream only, no audio, subtitles, data or metadata; fitted inside
 /// 1920x1080 without upscaling, even sizes; at most 30 fps; `yuv420p`, VP9
 /// profile 0, realtime preset, constrained quality (CRF 32 under an
-/// 8 Mbit/s ceiling); a keyframe at least every 2 s. Versioned by
-/// [`ENCODE_SETTINGS_VERSION`].
+/// 8 Mbit/s ceiling); a keyframe at least every 2 s. The animated import
+/// runs them, and [`cpu_convert_command`] hands them to the user.
 pub fn vp9_args() -> Vec<OsString> {
     let fit = |side: &str| {
         format!("max(2\\,trunc(min(1\\,min({CPU_MAX_WIDTH}/iw\\,{CPU_MAX_HEIGHT}/ih))*{side}/2)*2)")
@@ -367,15 +364,48 @@ pub fn poster_args() -> Vec<OsString> {
     .collect()
 }
 
-/// The wall time of a playback copy of a video lasting `duration_ms`
-/// (0: unknown): two minutes plus four times its length, at most four
-/// hours; four hours when unknown.
-pub fn copy_timeout(duration_ms: u64) -> Duration {
-    const MAX: Duration = Duration::from_secs(4 * 3600);
-    if duration_ms == 0 {
-        return MAX;
+/// The shell command that converts the video `input` into a CPU-ready VP9
+/// WebM at `output`, for the user to run: `ffmpeg -nostdin -n
+/// -protocol_whitelist file -i <input>` (the input may be an untrusted
+/// file: nothing read from the terminal, nothing overwritten, only local
+/// files followed) then the very arguments of [`vp9_args`] and
+/// `<output>`, each word that needs it
+/// single-quoted (POSIX: a `'` is written `'\''`; the paths always), so it
+/// can be pasted into a shell as it is. `None` when a path is not UTF-8
+/// (the command would not name it).
+pub fn cpu_convert_command(input: &Path, output: &Path) -> Option<String> {
+    let mut words: Vec<String> = [
+        "ffmpeg",
+        "-nostdin",
+        "-n",
+        "-protocol_whitelist",
+        "file",
+        "-i",
+    ]
+    .map(String::from)
+    .into();
+    words.push(quote(input.to_str()?));
+    for arg in vp9_args() {
+        words.push(quote_if_needed(arg.to_str()?));
     }
-    (Duration::from_secs(120) + Duration::from_millis(duration_ms.saturating_mul(4))).min(MAX)
+    words.push(quote(output.to_str()?));
+    Some(words.join(" "))
+}
+
+/// `word` in single quotes, a `'` in it as `'\''`: one shell word, read
+/// back unchanged (POSIX).
+pub fn quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
+/// `word` as it is when a shell reads it as one word unchanged, else
+/// [`quote`]d.
+fn quote_if_needed(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./:=,+@%".contains(&b));
+    if plain { word.to_string() } else { quote(word) }
 }
 
 /// The last non-empty line of `bytes`, control characters removed, at

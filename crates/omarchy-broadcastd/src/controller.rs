@@ -342,7 +342,7 @@ use crate::backend::{
 };
 use crate::camera::{self, Camera};
 use crate::gpu_cache;
-use crate::media::{self, CopyEvent, CopyState, MediaStore, VideoInfo, same_file};
+use crate::media::{self, MediaStore, VideoInfo, same_file};
 use crate::mic::{self, agent::MicEvent, agent::MicLink, agent::MicRequest};
 use crate::modules::{self, HostMemory, Modules, Plan};
 use crate::preview::{Leases, PreviewDir, check_fps};
@@ -539,8 +539,6 @@ pub enum Command {
     SetMicHost(bool, Reply),
     /// What the microphone's agent found or did ([`crate::mic::agent`]).
     Mic(MicEvent),
-    /// A step of a playback copy job ([`VideoService::ensure_copy`]).
-    PlaybackCopy(CopyEvent),
     /// The check and the poster of the video `source` asked for
     /// ([`VideoService::request_poster`]): the poster `None` when it cannot
     /// be made.
@@ -2151,7 +2149,6 @@ impl<B: MediaBackend> Controller<B> {
             Command::Rescan => self.rescan(now),
             Command::SetMicHost(on, reply) => self.set_mic_host(on, reply),
             Command::Mic(event) => self.mic_event(event),
-            Command::PlaybackCopy(event) => self.copy_ended(&event, now),
             Command::VideoPoster {
                 source,
                 info,
@@ -2733,20 +2730,24 @@ impl<B: MediaBackend> Controller<B> {
             .as_ref()
             .and_then(|p| self.background_absent(p))
             .or_else(|| self.effect_failure.clone());
-        let text = effect
-            .into_iter()
-            .chain(self.passthrough.clone())
-            .chain(self.fallback_warnings())
-            .chain(self.video_warnings())
-            .chain(dropped_text(&dropped))
-            .chain(self.held_warning())
-            .chain(self.forced_warnings())
-            .chain(self.frame_generation_warning())
-            .chain(self.mode_warning())
-            .chain(self.output_warnings())
-            .collect::<Vec<_>>()
-            .join("; ");
-        cap_warning(&text)
+        let text = |still_video: Option<String>| {
+            effect
+                .clone()
+                .into_iter()
+                .chain(self.passthrough.clone())
+                .chain(self.fallback_warnings())
+                .chain(self.video_warnings())
+                .chain(still_video)
+                .chain(dropped_text(&dropped))
+                .chain(self.held_warning())
+                .chain(self.forced_warnings())
+                .chain(self.frame_generation_warning())
+                .chain(self.mode_warning())
+                .chain(self.output_warnings())
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        capped_with_path(&text, self.still_video_warning())
     }
 
     /// `Warning`'s clause of the module the running session keeps for its
@@ -5644,24 +5645,14 @@ impl<B: MediaBackend> Controller<B> {
     /// ([`video`](self::video)): a new choice takes its check when this
     /// run made it ([`media::known_video_info`]), asks for its poster (and
     /// the check, when not known) off this thread and keeps the still in
-    /// force until it comes (a copy job of the previous choice is
-    /// cancelled); under `replace` in a system-memory session a video that
-    /// is not CPU-ready gets its playback copy asked for, once per choice
-    /// and again at each camera start (`start`: a copy removed from the
-    /// cache is made again, a failed job runs once more, and the still of
-    /// the last session is dropped). Cheap when nothing changed: a `stat`.
+    /// force until it comes; at a camera start (`start`) the still of the
+    /// last session is dropped. Cheap when nothing changed: a `stat`.
     /// Never runs the video check.
     fn follow_video(&mut self, start: bool) {
         let effect = self.effect();
         if self.video_for != effect.background_image {
             self.video_for.clone_from(&effect.background_image);
-            if self
-                .video
-                .take()
-                .is_some_and(|v| v.copy == Some(CopyState::Preparing))
-            {
-                self.videos.cancel_copy();
-            }
+            self.video = None;
             if let Some(path) = effect.background_image.filter(|p| is_video_file(p)) {
                 let info = media::known_video_info(&path);
                 // The still the element has now stays until the poster.
@@ -5677,55 +5668,13 @@ impl<B: MediaBackend> Controller<B> {
                     info,
                     poster: None,
                     still_before,
-                    copy: None,
                 });
             }
         } else if start && let Some(v) = &mut self.video {
-            v.copy = None;
             v.still_before = None;
         }
         if let Some(v) = &mut self.video {
             v.drop_gone_still();
-        }
-        self.ask_copy(start);
-    }
-
-    /// Under `replace` in a system-memory session, asks for the playback
-    /// copy of the video chosen when its check says it needs one and it
-    /// was not asked for yet (`retry`: a failed job runs once more).
-    fn ask_copy(&mut self, retry: bool) {
-        let effect = self.effect();
-        let system = self.session_memory() == VideoMemory::System;
-        if let Some(v) = &mut self.video
-            && effect.mode == EffectMode::Replace
-            && system
-            && v.checked
-            && v.needs_copy()
-            && v.copy.is_none()
-        {
-            let state = self.videos.ensure_copy(&v.source, retry);
-            match &state {
-                CopyState::Ready(p) => {
-                    info!("background video: playing its copy {}", p.display());
-                }
-                CopyState::Checking => debug!(
-                    "background video: looking for the copy of {}",
-                    v.source.display()
-                ),
-                CopyState::Preparing => info!(
-                    "background video: preparing {} for playback on the CPU",
-                    v.source.display()
-                ),
-                CopyState::NoFfmpeg => warning!(
-                    "background video: {} is shown as a still: ffmpeg is not installed",
-                    v.source.display()
-                ),
-                CopyState::Failed(why) => warning!(
-                    "background video: {} is shown as a still: {why}",
-                    v.source.display()
-                ),
-            }
-            v.copy = Some(state);
         }
     }
 
@@ -5743,41 +5692,10 @@ impl<B: MediaBackend> Controller<B> {
         }
     }
 
-    /// A step of a playback copy job ([`Command::PlaybackCopy`]): for the
-    /// video in force, a ready copy is given to the running session with
-    /// no restart (the still stays until the copy's first frame); a
-    /// failure keeps the still; a transcode starting is said in `Warning`.
-    fn copy_ended(&mut self, event: &CopyEvent, now: Instant) {
-        let Some(v) = self.video.as_mut() else {
-            return;
-        };
-        if !v.copy_step(event) {
-            return;
-        }
-        match &event.state {
-            CopyState::Ready(p) => info!("background video: its copy is ready: {}", p.display()),
-            CopyState::Preparing => info!(
-                "background video: preparing {} for playback on the CPU",
-                event.source.display()
-            ),
-            CopyState::Failed(why) => warning!(
-                "background video: {} is shown as a still: {why}",
-                event.source.display()
-            ),
-            CopyState::Checking | CopyState::NoFfmpeg => {}
-        }
-        if self.session.is_some()
-            && let Err(e) = self.apply_effect()
-        {
-            warning!("background video: {}", e.message());
-        }
-        self.reconcile(now);
-    }
-
     /// The check and the poster of `source` came
     /// ([`Command::VideoPoster`]): for the video in force, a check not
-    /// known yet is taken (and its copy asked for when it needs one), and
-    /// the poster becomes the still the running session is given.
+    /// known yet is taken, and the poster becomes the still the running
+    /// session is given.
     fn poster_made(
         &mut self,
         source: &Path,
@@ -5804,7 +5722,6 @@ impl<B: MediaBackend> Controller<B> {
         if !changed {
             return;
         }
-        self.ask_copy(false);
         if self.session.is_some()
             && let Err(e) = self.apply_effect()
         {
@@ -5815,25 +5732,28 @@ impl<B: MediaBackend> Controller<B> {
 
     /// `Warning`'s clauses of the video background: why the running
     /// session's element does not play it, or that its module shows it as
-    /// a still; then, under `replace` in a system-memory session, a
-    /// playback copy that is not ready ([`copy_clause`]).
+    /// a still.
     fn video_warnings(&self) -> Vec<String> {
-        let mut out = Vec::new();
         if self.session.is_some() {
-            out.extend(self.background_failure.clone());
+            self.background_failure.iter().cloned().collect()
+        } else {
+            Vec::new()
         }
+    }
+
+    /// `Warning`'s clause of a video a system-memory session does not play
+    /// under `replace` (not CPU-ready), in its two forms
+    /// ([`still_clause`]): naming the video's path, and naming `<file>`
+    /// for when the path would not fit or not show unchanged.
+    fn still_video_warning(&self) -> Option<(Option<String>, String)> {
         let effect = self.effect();
-        if let Some(v) = &self.video
-            && effect.mode == EffectMode::Replace
+        let v = self.video.as_ref()?;
+        (effect.mode == EffectMode::Replace
             && effect.background_image.as_ref() == Some(&v.source)
             && self.session_memory() == VideoMemory::System
             && v.checked
-            && v.needs_copy()
-            && let Some(copy) = &v.copy
-        {
-            out.extend(copy_clause(copy, v.still().is_some()));
-        }
-        out
+            && v.not_cpu_ready())
+        .then(|| still_clause(&v.source, v.still().is_some()))
     }
 
     /// `SetDenoise`: noise removal on or off, before the effect (or alone
@@ -8778,6 +8698,29 @@ fn refusal_error(r: Refusal) -> IpcError {
     }
 }
 
+/// The `Warning` line `text` makes with the clause of a video shown as a
+/// still (`still`: its form naming the video's path, if any, and its form
+/// naming `<file>`), [`cap_warning`]ed: the path only whole and unchanged
+/// (a cut or changed path names no file); when it would be cut (or
+/// changed to be safe to show), the form naming `<file>`.
+fn capped_with_path(
+    text: &dyn Fn(Option<String>) -> String,
+    still: Option<(Option<String>, String)>,
+) -> String {
+    match still {
+        Some((Some(whole), short)) => {
+            let line = cap_warning(&text(Some(whole.clone())));
+            if line.contains(&whole) {
+                line
+            } else {
+                cap_warning(&text(Some(short)))
+            }
+        }
+        Some((None, short)) => cap_warning(&text(Some(short))),
+        None => cap_warning(&text(None)),
+    }
+}
+
 /// `text` made one line safe to show ([`settings::sanitise`]) and at most
 /// [`WARNING_MAX`] bytes: a longer one is cut on a character boundary and
 /// ends with an ellipsis, counted in the bound.
@@ -8929,7 +8872,7 @@ mod tests;
 mod video;
 
 pub use video::{GalleryVideos, NoGallery, VideoService, is_video_file};
-use video::{VideoChoice, copy_clause};
+use video::{VideoChoice, still_clause};
 
 #[cfg(test)]
 mod maxine_root_tests {

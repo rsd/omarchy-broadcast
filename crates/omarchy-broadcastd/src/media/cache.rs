@@ -5,9 +5,10 @@
 //!   ffmpeg at import or by the poster maker for a listed video that has
 //!   none ([`super::posters::PosterMaker`]), or copied from a bundled
 //!   video's shipped poster ([`install_poster`]);
-//! * `playback/<content hash>-v<settings version>.webm`: a CPU-ready VP9
-//!   copy of a video for playback in system memory
-//!   ([`super::playback::PlaybackCopies`]).
+//!
+//! Earlier versions also kept CPU-ready copies of videos in `playback/`;
+//! nothing makes them any more, and [`prune`] removes the directory at the
+//! daemon's start.
 //!
 //! The content hash is the SHA-256 of the source file, so the same bytes
 //! share their derived files wherever they live, and an edited file gets
@@ -16,6 +17,7 @@
 //! name always holds a complete file. Everything here can be deleted at
 //! any time: it is rebuilt when needed.
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -23,8 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use super::ffmpeg::{self, ENCODE_SETTINGS_VERSION, Ffmpeg, FfmpegJob};
-use super::probe::VideoInfo;
+use super::ffmpeg::{self, Ffmpeg, FfmpegJob};
+use super::probe::{self, MAX_VIDEO_BYTES, VideoInfo};
+use super::{MediaKind, MediaStore, hash};
 use crate::{debug, warning};
 
 /// The age past which a temporary file of this process is taken as left by
@@ -62,7 +65,8 @@ impl MediaCache {
         self.root.join("posters")
     }
 
-    /// The directory of playback copies.
+    /// The directory of the playback copies earlier versions made (removed
+    /// by [`prune`]).
     pub fn playback_dir(&self) -> PathBuf {
         self.root.join("playback")
     }
@@ -72,46 +76,15 @@ impl MediaCache {
         self.posters_dir().join(format!("{hash}.jpg"))
     }
 
-    /// The playback copy of the content `hash` under the current encode
-    /// settings ([`ENCODE_SETTINGS_VERSION`]).
-    pub fn copy_path(&self, hash: &str) -> PathBuf {
-        self.playback_dir()
-            .join(format!("{hash}-v{ENCODE_SETTINGS_VERSION}.webm"))
-    }
-
-    /// Removes the poster and every playback copy (any settings version)
-    /// of the content `hash`; returns what was removed.
+    /// Removes the poster of the content `hash`; returns what was removed.
     pub fn remove_derived(&self, hash: &str) -> Vec<PathBuf> {
-        let mut removed = Vec::new();
         let poster = self.poster_path(hash);
         if remove_logged(&poster) {
-            removed.push(poster);
+            vec![poster]
+        } else {
+            Vec::new()
         }
-        for (path, h, _) in copies_in(&self.playback_dir()) {
-            if h == hash && remove_logged(&path) {
-                removed.push(path);
-            }
-        }
-        removed
     }
-}
-
-/// The playback copies in `dir`: each path with its hash and settings
-/// version (`<hash>-v<n>.webm`); other names are left out.
-pub(crate) fn copies_in(dir: &Path) -> Vec<(PathBuf, String, u32)> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            let stem = name.strip_suffix(".webm")?;
-            let (hash, version) = stem.split_once("-v")?;
-            let version: u32 = version.parse().ok()?;
-            super::hash::is_hash(hash).then(|| (e.path(), hash.to_string(), version))
-        })
-        .collect()
 }
 
 /// The posters in `dir`: each path with its hash.
@@ -358,4 +331,84 @@ pub(crate) fn remove_stale_parts(dir: &Path) -> Vec<PathBuf> {
 /// The prefix of the cache's temporary files, for the other modules.
 pub(crate) fn temp_prefix() -> &'static str {
     TEMP_PREFIX
+}
+
+/// What a prune removed.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PruneReport {
+    /// The files and directories removed.
+    pub removed: Vec<PathBuf>,
+}
+
+/// The daemon's prune of `cache` at its start (off the controller thread:
+/// it hashes every gallery video, once per run): the `playback/` directory
+/// of earlier versions goes whole, as do the temporary files of
+/// interrupted poster runs; a poster is kept when its hash is a gallery
+/// video's (`store`, both kinds and roots) or the `outside` file's (a
+/// video outside the gallery the settings name), and removed otherwise.
+/// `stop` set (the service dropped) abandons the posters before anything
+/// of them is removed, since what to keep is then not known in full.
+pub fn prune(
+    cache: &MediaCache,
+    store: &MediaStore,
+    outside: Option<&Path>,
+    stop: &AtomicBool,
+) -> PruneReport {
+    let mut removed = Vec::new();
+    let playback = cache.playback_dir();
+    match std::fs::symlink_metadata(&playback) {
+        Ok(m) => {
+            let gone = if m.is_dir() {
+                std::fs::remove_dir_all(&playback)
+            } else {
+                std::fs::remove_file(&playback)
+            };
+            match gone {
+                Ok(()) => {
+                    debug!("media: removed {}", playback.display());
+                    removed.push(playback);
+                }
+                Err(e) => warning!("media: cannot remove {}: {e}", playback.display()),
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warning!("media: cannot remove {}: {e}", playback.display()),
+    }
+    let mut keep = gallery_hashes(store, stop);
+    if let Some(h) = outside.and_then(|p| hash_of(p, stop)) {
+        keep.insert(h);
+    }
+    if stop.load(Ordering::Relaxed) {
+        return PruneReport { removed };
+    }
+    let posters = cache.posters_dir();
+    removed.extend(remove_stale_parts(&posters));
+    for (path, h) in posters_in(&posters) {
+        if !keep.contains(&h) && remove_logged(&path) {
+            removed.push(path);
+        }
+    }
+    PruneReport { removed }
+}
+
+/// The content hashes of every video of `store` (both kinds, both roots);
+/// `stop` set abandons the reads.
+fn gallery_hashes(store: &MediaStore, stop: &AtomicBool) -> HashSet<String> {
+    let mut keep = HashSet::new();
+    for kind in MediaKind::ALL {
+        for path in store.video_paths(kind) {
+            if stop.load(Ordering::Relaxed) {
+                return keep;
+            }
+            if let Some(h) = hash_of(&path, stop) {
+                keep.insert(h);
+            }
+        }
+    }
+    keep
+}
+
+fn hash_of(path: &Path, stop: &AtomicBool) -> Option<String> {
+    let mut f = probe::open_video(path).ok()?;
+    hash::hash_file(&mut f, MAX_VIDEO_BYTES, Some(stop)).ok()
 }

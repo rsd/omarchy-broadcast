@@ -9,9 +9,18 @@
 //! user's gallery; each item is a dictionary with `path` (absolute), `label`,
 //! `bundled` (b), `type` ([`TYPE_IMAGE`] or [`TYPE_VIDEO`]), `width` (u),
 //! `height` (u), `duration_ms` (t, 0 for a still) and `poster` (the path of
-//! a video's poster image, `""` when there is none). `ImportMedia(s kind, s
+//! a video's poster image, `""` when there is none); from revision 19 a
+//! video also has `cpu_ready` (b: it plays without the NVIDIA GPU as it is)
+//! and, when that is false, `convert_command` (s: the shell command that
+//! converts it into a CPU-ready WebM in the user's gallery, absent when the
+//! daemon cannot name it). `ImportMedia(s kind, s
 //! path) -> s path` copies a file into the user's gallery and returns the
 //! stored path; `RemoveMedia(s path)` removes an item of the user's gallery.
+//! `GetMediaDirs(s kind) -> a{sv}` (revision 19, [`MEDIA_DIRS_REVISION`])
+//! names the kind's user directories ([`MediaDirs`]): `user_dir`, as
+//! `GetMedia` gives it, and `video_dir`, the user's videos folder for a
+//! background, where its videos are stored (`""` for `away`, which has
+//! stills only).
 //!
 //! Reading is tolerant, as for the settings channel: a key missing or of
 //! another type reads as its default (a number outside its type as 0), keys
@@ -25,6 +34,10 @@ use zbus::Variant;
 /// The first [`crate::INTERFACE_REVISION`] with the media gallery:
 /// `GetMedia`, `ImportMedia`, `RemoveMedia` and `MediaSerial`.
 pub const MEDIA_REVISION: u32 = 15;
+
+/// The first [`crate::INTERFACE_REVISION`] with `GetMediaDirs`
+/// ([`MediaDirs`]).
+pub const MEDIA_DIRS_REVISION: u32 = crate::CPU_CONVERT_REVISION;
 
 /// The `GetMedia` reply on the wire: `(serial, bundled_dir, user_dir,
 /// items)`.
@@ -62,6 +75,12 @@ pub struct MediaEntry {
     pub duration_ms: u64,
     /// The poster image of a video; `""` when there is none.
     pub poster: String,
+    /// Whether a video plays without the NVIDIA GPU as it is (revision
+    /// 19; on the wire for a video only, `false` when absent).
+    pub cpu_ready: bool,
+    /// For a video that is not CPU-ready, the shell command that converts
+    /// it (revision 19); `""` when there is none.
+    pub convert_command: String,
 }
 
 impl MediaEntry {
@@ -76,6 +95,16 @@ impl MediaEntry {
         put(&mut d, "height", Variant::from(self.height));
         put(&mut d, "duration_ms", Variant::from(self.duration_ms));
         put(&mut d, "poster", Variant::from(self.poster.as_str()));
+        if self.media_type == TYPE_VIDEO {
+            put(&mut d, "cpu_ready", Variant::from(self.cpu_ready));
+        }
+        if !self.convert_command.is_empty() {
+            put(
+                &mut d,
+                "convert_command",
+                Variant::from(self.convert_command.as_str()),
+            );
+        }
         d
     }
 
@@ -100,6 +129,8 @@ impl MediaEntry {
                 .and_then(|v| u64::try_from(v).ok())
                 .unwrap_or_default(),
             poster: text("poster"),
+            cpu_ready: get_bool(&e, "cpu_ready").unwrap_or_default(),
+            convert_command: text("convert_command"),
         })
     }
 }
@@ -144,6 +175,38 @@ impl MediaReply {
     }
 }
 
+/// The user directories of one kind, `GetMediaDirs`' dictionary
+/// (revision 19).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MediaDirs {
+    /// The kind's directory in the user's gallery, as `GetMedia` gives it.
+    pub user_dir: String,
+    /// The user's videos folder of the kind, where its videos are stored;
+    /// `""` when it has none (`away`).
+    pub video_dir: String,
+}
+
+impl MediaDirs {
+    /// The dictionary.
+    pub fn to_dict(&self) -> VariantDict {
+        let mut d = VariantDict::new();
+        put(&mut d, "user_dir", Variant::from(self.user_dir.as_str()));
+        put(&mut d, "video_dir", Variant::from(self.video_dir.as_str()));
+        d
+    }
+
+    /// The directories of a dictionary, read tolerantly (a key missing or
+    /// of another type is `""`).
+    pub fn from_dict(dict: &VariantDict) -> MediaDirs {
+        let e = entries_of_dict(dict);
+        let text = |key: &str| get_str(&e, key).unwrap_or_default().to_string();
+        MediaDirs {
+            user_dir: text("user_dir"),
+            video_dir: text("video_dir"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +229,8 @@ mod tests {
                     height: 2160,
                     duration_ms: 0,
                     poster: String::new(),
+                    cpu_ready: false,
+                    convert_command: String::new(),
                 },
                 MediaEntry {
                     path: "/home/u/.local/share/omarchy-broadcast/media/backgrounds/loop.webm"
@@ -177,6 +242,8 @@ mod tests {
                     height: 1080,
                     duration_ms: 10_000,
                     poster: "/home/u/.cache/omarchy-broadcast/posters/ab.jpg".into(),
+                    cpu_ready: false,
+                    convert_command: "ffmpeg -i '/home/u/loop.mp4' -an 'out.webm'".into(),
                 },
             ],
         }
@@ -194,7 +261,32 @@ mod tests {
         assert_eq!(back, reply);
         assert!(back.find(&reply.items[1].path).is_some_and(|i| !i.bundled));
         assert!(back.find("/nowhere.png").is_none());
-        // The keys on the wire.
+        // The keys on the wire: a video has `cpu_ready`, and the command
+        // when it is not.
+        let mut keys: Vec<&str> = wire.3[1].keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "bundled",
+                "convert_command",
+                "cpu_ready",
+                "duration_ms",
+                "height",
+                "label",
+                "path",
+                "poster",
+                "type",
+                "width"
+            ]
+        );
+        let mut ready = reply.items[1].clone();
+        ready.cpu_ready = true;
+        ready.convert_command.clear();
+        let d = ready.to_dict();
+        assert!(d.contains_key("cpu_ready") && !d.contains_key("convert_command"));
+        assert_eq!(MediaEntry::from_dict(&d), Some(ready));
+        // A still has neither.
         let mut keys: Vec<&str> = wire.3[0].keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(
@@ -233,5 +325,34 @@ mod tests {
         assert!(MediaEntry::from_dict(&d).is_none());
         let reply = MediaReply::from_wire(&(1, String::new(), String::new(), vec![d]));
         assert!(reply.items.is_empty());
+    }
+
+    #[test]
+    fn the_dirs_round_trip_through_the_wire_and_read_tolerantly() {
+        let dirs = MediaDirs {
+            user_dir: "/home/u/Pictures/omarchy-broadcast".into(),
+            video_dir: "/home/u/Videos/omarchy-broadcast".into(),
+        };
+        let d = dirs.to_dict();
+        let ctxt = Context::new(LE, 0);
+        let bytes = to_bytes(ctxt, &d).unwrap();
+        let (decoded, _): (VariantDict, _) = bytes.deserialize().unwrap();
+        assert_eq!(MediaDirs::from_dict(&decoded), dirs);
+        let mut keys: Vec<&str> = d.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["user_dir", "video_dir"]);
+        // An empty videos folder (away) is still on the wire.
+        let away = MediaDirs {
+            video_dir: String::new(),
+            ..dirs.clone()
+        };
+        assert!(away.to_dict().contains_key("video_dir"));
+        // Tolerant: another type or a missing key reads as "", an unknown
+        // key is ignored.
+        let mut d = dirs.to_dict();
+        d.insert("video_dir".into(), OwnedVariant::from(7u32));
+        d.remove("user_dir");
+        d.insert("later".into(), OwnedVariant::from(true));
+        assert_eq!(MediaDirs::from_dict(&d), MediaDirs::default());
     }
 }

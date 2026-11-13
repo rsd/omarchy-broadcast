@@ -27,7 +27,7 @@ use zbus::Variant;
 use zbus::proxy::MethodFlags;
 
 use crate::config::{ConfigFiles, ConfigFilesReply, ConfigSchema, ConfigSchemaReply, ConfigValue};
-use crate::media::{MediaReply, MediaWire};
+use crate::media::{MediaDirs, MediaReply, MediaWire};
 use crate::modules::{ModuleList, ModulesReply};
 use crate::settings::{
     ResetScope, SettingChange, SettingValue, SettingsReply, SettingsTree, VariantDict,
@@ -219,6 +219,25 @@ pub trait OmarchyBroadcast {
     /// bundled item or any path that is not a user item; `Failed` when the
     /// file cannot be removed. Revision 15.
     fn remove_media(&self, path: &str) -> Result<(), IpcError>;
+
+    /// The shell command that converts the video at `path` (absolute, read
+    /// by the daemon) into a VP9 WebM that plays without the NVIDIA GPU,
+    /// written into the user's gallery of backgrounds: the command
+    /// `GetMedia` gives as `convert_command`, for any file. The daemon
+    /// never runs it. Refused with `InvalidArgument` and the reason (a
+    /// relative path, not a video, refused by the video check, already
+    /// playable without the NVIDIA GPU, a path that is not UTF-8);
+    /// `Failed` when the daemon has no gallery. Revision 19
+    /// ([`crate::CPU_CONVERT_REVISION`]).
+    fn get_convert_command(&self, path: &str) -> Result<String, IpcError>;
+
+    /// The user directories of `kind`, `background` or `away`, read with
+    /// [`OmarchyBroadcastProxy::media_dirs`]: `user_dir` (as `GetMedia`
+    /// gives it) and `video_dir` (the user's videos folder for a
+    /// background, `""` for `away`). Fails as `GetMedia` does:
+    /// `InvalidArgument` for another kind, `Failed` when the daemon has no
+    /// gallery. Revision 19 ([`crate::MEDIA_DIRS_REVISION`]).
+    fn get_media_dirs(&self, kind: &str) -> Result<VariantDict, IpcError>;
 
     /// Roughly once per second while `active`; `-1` marks a value that
     /// cannot be measured.
@@ -553,6 +572,27 @@ impl OmarchyBroadcastProxy<'_> {
             IpcError::ZBus(zbus::Error::Failure("GetMedia returned no reply".into()))
         })?;
         Ok(MediaReply::from_wire(&reply))
+    }
+
+    /// `GetMediaDirs(kind)`, read into [`MediaDirs`].
+    pub async fn media_dirs(&self, kind: &str) -> Result<MediaDirs, IpcError> {
+        Ok(MediaDirs::from_dict(&self.get_media_dirs(kind).await?))
+    }
+
+    /// `GetMediaDirs(kind)` with the `NO_AUTO_START` flag: never starts
+    /// the daemon.
+    pub async fn media_dirs_no_autostart(&self, kind: &str) -> Result<MediaDirs, IpcError> {
+        let reply: Option<VariantDict> = self
+            .inner()
+            .call_with_flags("GetMediaDirs", MethodFlags::NO_AUTO_START, &(kind,))
+            .await
+            .map_err(IpcError::from)?;
+        let reply = reply.ok_or_else(|| {
+            IpcError::ZBus(zbus::Error::Failure(
+                "GetMediaDirs returned no reply".into(),
+            ))
+        })?;
+        Ok(MediaDirs::from_dict(&reply))
     }
 
     /// `GetStageOrder` with the `NO_AUTO_START` flag: never starts the

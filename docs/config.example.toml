@@ -230,10 +230,10 @@ blur_strength = 0.5
 # and one that cannot play is not an effect failure: the picture in force
 # stays and the Warning property says why. With an NVIDIA GPU the video plays
 # as it is. In system memory ([video] memory) only a VP9 video of at most
-# 1920x1080 and 30 fps plays as it is, on the CPU; of any other video the
-# daemon makes a VP9 copy of at most 1920x1080 and 30 fps in its cache the
-# first time it needs it (this needs ffmpeg; the video's poster, a still
-# image, is shown meanwhile). Videos of the gallery
+# 1920x1080 and 30 fps plays as it is, on the CPU; any other video shows its
+# poster, a still image, with a Warning that points at
+# `omarchy-broadcast media convert-command FILE` (revision 19), which prints
+# the ffmpeg command that converts it. Videos of the gallery
 # (omarchy-broadcast media) are the ones a panel offers.
 # Default: "" (no image). Examples: "/home/user/Pictures/background.png",
 # or a video, "/home/user/Videos/loop.webm".

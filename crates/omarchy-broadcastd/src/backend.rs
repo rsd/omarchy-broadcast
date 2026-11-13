@@ -177,9 +177,8 @@ pub struct EffectRun {
     /// load-time still (the video's poster, or the still in force while
     /// the poster is made; `None`: black behind the person).
     pub background_image: Option<PathBuf>,
-    /// The video `replace` plays behind the person (the selected video, or
-    /// its playback copy in system memory), `None` without one or while
-    /// only its still can be shown. Changing it alone reloads nothing: the
+    /// The video `replace` plays behind the person (the selected video),
+    /// `None` without one or while only its still can be shown. Changing it alone reloads nothing: the
     /// background in force stays until the new video's first frame.
     pub background_video: Option<PathBuf>,
     /// What shows when the background effect cannot run.

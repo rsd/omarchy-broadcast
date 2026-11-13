@@ -35,7 +35,7 @@ Nothing is enabled. Each user runs:
 systemctl --user enable --now omarchy-broadcastd
 ```
 
-The runtime dependencies include the NVIDIA driver userspace (`nvidia-utils`), `cuda` (NVRTC, used by GStreamer's CUDA converters), `gst-plugins-good`, `gst-plugins-bad-libs` and a v4l2loopback kernel module (for example `v4l2loopback-dkms`). The loopback device must still be configured as in [loopback.md](loopback.md). `ffmpeg` is an optional dependency (`optdepends`): the daemon runs it, at low priority, to convert an animated GIF, WebP or APNG at import, to make the poster of an imported video and, on a machine without an NVIDIA GPU, to make the VP9 copy (in `$XDG_CACHE_HOME/omarchy-broadcast/playback/`) that plays a video background that is not already VP9 of at most 1920x1080 and 30 fps. The bundled video loops need none of it, and with an NVIDIA GPU a video plays as it is ([../adr/0035-video-backgrounds.md](../adr/0035-video-backgrounds.md)). The NVIDIA Maxine VFX SDK is never part of the package; it is an optional dependency (`optdepends`) on `maxine-vfx-sdk-local`, which you build yourself from the omarchy-nvidia-sdks repository and install as in [maxine.md](maxine.md).
+The runtime dependencies include the NVIDIA driver userspace (`nvidia-utils`), `cuda` (NVRTC, used by GStreamer's CUDA converters), `gst-plugins-good`, `gst-plugins-bad-libs` and a v4l2loopback kernel module (for example `v4l2loopback-dkms`). The loopback device must still be configured as in [loopback.md](loopback.md). `ffmpeg` is an optional dependency (`optdepends`): the daemon runs it, at low priority, to convert an animated GIF, WebP or APNG at import and to make the poster of an imported video. On a machine without an NVIDIA GPU it is also the program of the command that converts a video the CPU cannot play ([Playing a video without an NVIDIA GPU](#playing-a-video-without-an-nvidia-gpu)); the daemon never runs that command. The bundled video loops need none of it, and with an NVIDIA GPU a video plays as it is ([../adr/0035-video-backgrounds.md](../adr/0035-video-backgrounds.md)). The NVIDIA Maxine VFX SDK is never part of the package; it is an optional dependency (`optdepends`) on `maxine-vfx-sdk-local`, which you build yourself from the omarchy-nvidia-sdks repository and install as in [maxine.md](maxine.md).
 
 ### Per-user install from a checkout
 
@@ -247,6 +247,42 @@ monitor.v4l2.rules = [
 ```
 
 and run `systemctl --user restart wireplumber`. Applications that open `/dev/video*` directly are unaffected. The package does not install this file. With it, the WirePlumber ordering drop-in is unnecessary for applications that use the native node; it stays useful for applications that reach the camera through v4l2 only. Remove the file and restart WirePlumber to undo it.
+
+## Where your backgrounds are
+
+The images you add as backgrounds, and your away images, are kept in a folder called `omarchy-broadcast` in your Pictures folder (`$(xdg-user-dir PICTURES)`, else `~/Pictures`), the away images in its `away` folder; the videos, and the WebM made from an animated image, are kept in one in your Videos folder (`$(xdg-user-dir VIDEOS)`, else `~/Videos`). A file you copy there yourself is listed the next time the gallery is shown. The folders have nothing to do with the desktop's wallpapers. A gallery that an earlier version kept in `~/.local/share/omarchy-broadcast/media` is moved there once, when the daemon starts ([../adr/0032-background-gallery.md](../adr/0032-background-gallery.md)). The posters of videos are in the cache, `~/.cache/omarchy-broadcast/`, and can be deleted at any time.
+
+## Playing a video without an NVIDIA GPU
+
+A video background plays on every machine, but how depends on the GPU. With an NVIDIA GPU the daemon plays any accepted video as it is. Without one (`[video] memory = system`, or no NVIDIA GPU at all) the CPU plays only one kind of file.
+
+**What plays on the CPU.** A **VP9** video, **profile 0** (8-bit 4:2:0), in a **WebM or Matroska** file, of **at most 1920x1080** and **at most 30 frames a second**. The two loops that come with the package are such files, and so is every animated GIF, WebP or APNG you import, since the daemon converts those to a WebM of this kind when you import them.
+
+**What happens otherwise.** An H.264, HEVC or AV1 video, or a VP9 one that is larger or faster, is shown as its **poster, a still picture** (the first frame), behind you. `omarchy-broadcast status` shows why in its warning:
+
+```text
+The video background is shown as a still: it can't play without an NVIDIA GPU; run omarchy-broadcast media convert-command '/home/user/Videos/clip.mp4' for the conversion command
+```
+
+The daemon does not convert the video itself; it tells you how, and you decide when.
+
+**Converting it.** Run the command the warning names, with the file as its argument. It prints one line, an `ffmpeg` command; it runs nothing:
+
+```sh
+omarchy-broadcast media convert-command ~/Videos/clip.mp4
+```
+
+```text
+ffmpeg -nostdin -n -protocol_whitelist file -i '/home/user/Videos/clip.mp4' -map 0:v:0 -an -sn -dn -map_metadata -1 -vf 'scale=w=max(2\,trunc(min(1\,min(1920/iw\,1080/ih))*iw/2)*2):h=max(2\,trunc(min(1\,min(1920/iw\,1080/ih))*ih/2)*2),setsar=1' -fpsmax 30 -pix_fmt yuv420p -c:v libvpx-vp9 -profile:v 0 -deadline realtime -cpu-used 8 -row-mt 1 -crf 32 -b:v 8M -g 60 -force_key_frames 'expr:gte(t,n_forced*2)' -f webm '/home/user/Videos/omarchy-broadcast/clip-cpu.webm'
+```
+
+Copy that line into a terminal and run it (it needs `ffmpeg` with `libvpx-vp9`). It makes a VP9 WebM that fits inside 1920x1080, at most 30 frames a second, without audio. The command refuses to overwrite a file (`-n`), and your original is not changed. Print it again for a new output name if you want to convert the same file twice.
+
+**Where the result goes.** The output is written to `omarchy-broadcast` in your **Videos** folder, as `<name>-cpu.webm` (`clip-cpu.webm` above; `clip-cpu-2.webm` when that name is taken). It is listed with your other videos the next time the gallery is shown, and plays on the CPU when you choose it.
+
+**In the panel.** The Backgrounds section of the bar's setup dialog (Omarchy Broadcast plugin) lists your videos. A video the CPU cannot play has a note under it, the same command, and a **Copy** button that puts the command on the clipboard; paste it in a terminal. The panel needs a daemon of interface revision 19 or later.
+
+A video chosen from outside the gallery, by a path in `config.toml`, has no row in the panel, but `omarchy-broadcast media convert-command PATH` works for any file ([../cli-json.md](../cli-json.md#media)). The rules, and why the daemon does not make the copy itself, are in [../adr/0035-video-backgrounds.md](../adr/0035-video-backgrounds.md).
 
 ## Configuration
 

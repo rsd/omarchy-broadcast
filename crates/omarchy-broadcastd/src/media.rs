@@ -1,16 +1,34 @@
 //! The media gallery: the background and away images the daemon offers,
 //! bundled with the package or imported by the user.
 //!
-//! The gallery has two roots, each with one directory per [`MediaKind`]
-//! (`backgrounds`, `away`):
+//! The gallery has three roots:
 //!
 //! * the **bundled** root, read only and packaged
-//!   (`/usr/share/omarchy-broadcast/media`), whose kind directories carry a
-//!   `SOURCES.toml` naming the title, author, licence and source of every
-//!   file;
-//! * the **user** root (`$XDG_DATA_HOME/omarchy-broadcast/media`, else
-//!   `$HOME/.local/share/omarchy-broadcast/media`), written only by the
-//!   daemon through [`MediaStore::import`] and [`MediaStore::remove`].
+//!   (`/usr/share/omarchy-broadcast/media`), with one directory per
+//!   [`MediaKind`] (`backgrounds`, `away`), each carrying a `SOURCES.toml`
+//!   naming the title, author, licence and source of every file;
+//! * the **user** root, `omarchy-broadcast` in the user's pictures
+//!   directory (`XDG_PICTURES_DIR` of `user-dirs.dirs`, else
+//!   `$HOME/Pictures`, [`pictures_dir_in`]), a folder of its own,
+//!   unrelated to the desktop's wallpapers: the background images are the
+//!   files directly in it (so a file dropped there is a background) and the
+//!   away images those of its `away` directory;
+//! * the **videos** root, `omarchy-broadcast` in the user's videos
+//!   directory (`XDG_VIDEOS_DIR`, else `$HOME/Videos`, [`videos_dir_in`]):
+//!   the background videos, imported ones and the WebM made from an
+//!   animated image, with the hidden `.sources/` of those. Away images are
+//!   stills only and have no videos directory.
+//!
+//! The backgrounds are the files directly in the user root and in the
+//! videos root ([`MediaStore::user_dirs`]): a still dropped into the videos
+//! root, or a video into the user root, is listed too, and when both roots
+//! are one directory it is listed once. The daemon writes them through
+//! [`MediaStore::import`] and [`MediaStore::remove`]; a gallery of an
+//! earlier version, under `$XDG_DATA_HOME/omarchy-broadcast/media`, is
+//! moved there once at start, each file by its type ([`migrate`]). A kind
+//! of a user file is told by its directory being exactly one of the
+//! kind's, never by a prefix, so the `away` directory and the hidden
+//! `.sources` are never background items.
 //!
 //! Listing ([`MediaStore::list`]) reads only the regular files directly in
 //! a kind directory, with an accepted extension; the size of an image is
@@ -21,16 +39,18 @@
 //! followed. Labels are made from the file stem, sanitised as stored names
 //! are.
 //!
-//! Importing copies a file into the user root after the checks the
+//! Importing copies a file into its root (a background video into the
+//! videos root, any image into the user root) after the checks the
 //! `replace` effect makes on a background (`gst_obc::background`): a
 //! bounded read of a regular file, the format from the content's signature
 //! (never from the extension), the size from the header within the
 //! dimension limit, a complete first image, and a decoder for the format
 //! (WebP needs the optional `webpdec`). The stored name is the source's
 //! name, sanitised (control and Unicode format characters removed), with
-//! the extension of the detected format; an image file already in the
-//! gallery with the same bytes is returned instead of being copied again,
-//! and an existing name is never overwritten (a numeric suffix is added).
+//! the extension of the detected format; an image file already in any
+//! user directory of the kind with the same bytes is returned instead of
+//! being copied again, and an existing name is never overwritten (a
+//! numeric suffix is added).
 //! The copy is written to a temporary file in the same directory, synced,
 //! linked to its final name, and the directory synced, so a reader never
 //! sees a partial file. A temporary file left by an interrupted import is
@@ -43,10 +63,11 @@
 //! M4V, MOV, MKV or WebM holding H.264, HEVC, VP9 or AV1, at most 512 MiB
 //! and 3840x2160, 8-bit 4:2:0; audio is ignored). A background video is
 //! stored as it is, with the extension of its container, and found again
-//! by its content hash (SHA-256) instead of its bytes. An animated GIF,
+//! (in any user directory of the kind) by its content hash (SHA-256)
+//! instead of its bytes. An animated GIF,
 //! WebP or PNG is transcoded at import with ffmpeg into a CPU-ready VP9
 //! WebM ([`ffmpeg::vp9_args`]), which is the stored item; the source's
-//! hash is recorded in the kind directory's hidden `.sources/` so the same
+//! hash is recorded in the videos root's hidden `.sources/` so the same
 //! source is not stored twice; without ffmpeg it is refused. Away images
 //! are stills only. A poster (the first frame as a JPEG) is made for every
 //! video at import in the cache ([`cache::MediaCache`]). Listing a video
@@ -56,20 +77,22 @@
 //! (`<stem>.poster.jpg`, a derived file, not an item), copied into the
 //! cache the first time it is listed; a video with no poster yet gets one
 //! from [`posters::PosterMaker`], off the listing. Removing a video also
-//! removes its poster and playback copies ([`playback::PlaybackCopies`])
-//! and cancels a copy job for it.
+//! removes its poster. A listed video says whether the CPU plays it
+//! ([`is_cpu_ready`]); one it does not comes with the command that
+//! converts it into the videos root ([`cpu_convert_command`]), which
+//! the user runs: the daemon never converts a video for playback.
 
 pub mod cache;
 pub mod ffmpeg;
 mod hash;
-pub mod playback;
+pub(crate) mod migrate;
 pub mod posters;
 pub mod probe;
 
 pub use cache::MediaCache;
-pub use playback::{CopyEvent, CopyState, PlaybackCopies, PruneReport, is_cpu_ready};
+pub use cache::PruneReport;
 pub use posters::PosterMaker;
-pub use probe::{Codec, Container, VideoInfo, probe_video};
+pub use probe::{Codec, Container, VideoInfo, is_cpu_ready, probe_video};
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -106,6 +129,16 @@ pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mov", "mkv", "webm"];
 /// (`<stem>.poster.jpg` beside `<stem>.<ext>`): a derived file, never
 /// listed as an item.
 pub const SHIPPED_POSTER_SUFFIX: &str = ".poster.jpg";
+
+/// The name of the user root in the pictures directory, and of the
+/// videos root in the videos directory.
+pub const USER_ROOT_NAME: &str = "omarchy-broadcast";
+
+/// The directory of the away images in the user root.
+pub const AWAY_DIR: &str = "away";
+
+/// The largest `user-dirs.dirs` read.
+const MAX_USER_DIRS_BYTES: u64 = 64 * 1024;
 
 /// The longest stored file stem, in bytes (before the suffix and the
 /// extension).
@@ -154,7 +187,9 @@ impl MediaKind {
         }
     }
 
-    /// The kind's directory under a gallery root: `backgrounds` or `away`.
+    /// The kind's directory under the bundled root (and the gallery of
+    /// earlier versions): `backgrounds` or `away`. The user root differs:
+    /// see [`MediaStore::user_dir`].
     pub fn dir_name(self) -> &'static str {
         match self {
             MediaKind::Background => "backgrounds",
@@ -241,15 +276,18 @@ pub struct MediaItem {
     /// The poster image of a video (a JPEG in the cache), when there is
     /// one; `None` for a still.
     pub poster: Option<PathBuf>,
+    /// Whether a video plays without the NVIDIA GPU as it is
+    /// ([`is_cpu_ready`]); `false` for a still.
+    pub cpu_ready: bool,
 }
 
 /// Why a gallery operation was refused or failed. Every message names the
 /// path concerned and the reason.
 #[derive(Debug, thiserror::Error)]
 pub enum MediaError {
-    /// Neither `XDG_DATA_HOME` nor `HOME` is an absolute path.
-    #[error("neither XDG_DATA_HOME nor HOME is set: the user's media gallery has no directory")]
-    NoDataDir,
+    /// `HOME` is not an absolute path, so there is no pictures directory.
+    #[error("HOME is not set: the user's media gallery has no directory")]
+    NoHome,
     /// A kind name other than `background` or `away`.
     #[error("unknown media kind {0:?}: expected \"background\" or \"away\"")]
     UnknownKind(String),
@@ -360,11 +398,12 @@ pub(crate) struct SourceEntry {
 }
 
 /// The gallery's two roots, and the cache of files derived from its
-/// videos (posters, playback copies) when it has one.
+/// videos (their posters) when it has one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaStore {
     bundled_root: PathBuf,
     user_root: PathBuf,
+    video_root: PathBuf,
     cache: Option<MediaCache>,
 }
 
@@ -378,15 +417,26 @@ enum Posters {
 }
 
 impl MediaStore {
-    /// A store over `bundled_root` (read only) and `user_root` (read and
-    /// write), each holding one directory per [`MediaKind`], without a
-    /// cache (no posters; see [`MediaStore::with_cache`]).
+    /// A store over `bundled_root` (read only, one directory per
+    /// [`MediaKind`]) and `user_root` (read and write, laid out as
+    /// [`MediaStore::user_dir`] says), without a cache (no posters; see
+    /// [`MediaStore::with_cache`]). The videos root is the user root itself
+    /// (one folder) until [`MediaStore::with_video_root`] sets one.
     pub fn new(bundled_root: impl Into<PathBuf>, user_root: impl Into<PathBuf>) -> Self {
+        let user_root = user_root.into();
         MediaStore {
             bundled_root: bundled_root.into(),
-            user_root: user_root.into(),
+            video_root: user_root.clone(),
+            user_root,
             cache: None,
         }
+    }
+
+    /// The store with its background videos in `video_root`
+    /// ([`MediaStore::video_dir`]).
+    pub fn with_video_root(mut self, video_root: impl Into<PathBuf>) -> Self {
+        self.video_root = video_root.into();
+        self
     }
 
     /// The store with its derived files in `cache`.
@@ -395,9 +445,10 @@ impl MediaStore {
         self
     }
 
-    /// The store of this session: [`BUNDLED_ROOT`], and
-    /// `$XDG_DATA_HOME/omarchy-broadcast/media`, else
-    /// `$HOME/.local/share/omarchy-broadcast/media`; the cache in
+    /// The store of this session: [`BUNDLED_ROOT`],
+    /// `<pictures>/omarchy-broadcast` ([`USER_ROOT_NAME`] in
+    /// [`pictures_dir_in`]) and `<videos>/omarchy-broadcast` (in
+    /// [`videos_dir_in`]); the cache in
     /// `$XDG_CACHE_HOME/omarchy-broadcast`, else
     /// `$HOME/.cache/omarchy-broadcast`.
     pub fn from_env() -> Result<Self, MediaError> {
@@ -408,13 +459,13 @@ impl MediaStore {
     /// `env`. A variable holding a relative path is ignored, as the XDG
     /// specification says.
     pub fn from_env_in(env: impl Fn(&str) -> Option<OsString>) -> Result<Self, MediaError> {
+        let pictures = pictures_dir_in(&env).ok_or(MediaError::NoHome)?;
+        let videos = videos_dir_in(&env).ok_or(MediaError::NoHome)?;
         let absolute = |k: &str| env(k).map(PathBuf::from).filter(|p| p.is_absolute());
-        let data = absolute("XDG_DATA_HOME")
-            .or_else(|| absolute("HOME").map(|h| h.join(".local/share")))
-            .ok_or(MediaError::NoDataDir)?;
         let cache =
             absolute("XDG_CACHE_HOME").or_else(|| absolute("HOME").map(|h| h.join(".cache")));
-        let store = Self::new(BUNDLED_ROOT, data.join("omarchy-broadcast").join("media"));
+        let store = Self::new(BUNDLED_ROOT, pictures.join(USER_ROOT_NAME))
+            .with_video_root(videos.join(USER_ROOT_NAME));
         Ok(match cache {
             Some(c) => store.with_cache(MediaCache::new(c.join("omarchy-broadcast"))),
             None => store,
@@ -431,6 +482,11 @@ impl MediaStore {
         &self.user_root
     }
 
+    /// The videos root: where background videos are stored.
+    pub fn video_root(&self) -> &Path {
+        &self.video_root
+    }
+
     /// The cache of derived files, if the store has one.
     pub fn cache(&self) -> Option<&MediaCache> {
         self.cache.as_ref()
@@ -441,9 +497,82 @@ impl MediaStore {
         self.bundled_root.join(kind.dir_name())
     }
 
-    /// The directory of `kind` in the user root.
+    /// The directory of `kind` in the user root: the root itself for
+    /// [`MediaKind::Background`], its `away` directory for
+    /// [`MediaKind::Away`].
     pub fn user_dir(&self, kind: MediaKind) -> PathBuf {
-        self.user_root.join(kind.dir_name())
+        match kind {
+            MediaKind::Background => self.user_root.clone(),
+            MediaKind::Away => self.user_root.join(AWAY_DIR),
+        }
+    }
+
+    /// The directory of `kind`'s videos: the videos root for
+    /// [`MediaKind::Background`] (imported videos and the transcodes of
+    /// animated images are stored there, with its hidden `.sources/`);
+    /// `None` for [`MediaKind::Away`] (stills only).
+    pub fn video_dir(&self, kind: MediaKind) -> Option<PathBuf> {
+        match kind {
+            MediaKind::Background => Some(self.video_root.clone()),
+            MediaKind::Away => None,
+        }
+    }
+
+    /// Every user directory of `kind`, listed and searched for duplicates:
+    /// [`MediaStore::user_dir`], then [`MediaStore::video_dir`] unless it is
+    /// the same directory (the same path, or the same device and inode).
+    pub fn user_dirs(&self, kind: MediaKind) -> Vec<PathBuf> {
+        let mut dirs = vec![self.user_dir(kind)];
+        if let Some(v) = self.video_dir(kind)
+            && !same_dir(&dirs[0], &v)
+        {
+            dirs.push(v);
+        }
+        dirs
+    }
+
+    /// The directory an import of `kind` stores a file of `media_type` in:
+    /// the videos root for a background video, else
+    /// [`MediaStore::user_dir`].
+    fn store_dir(&self, kind: MediaKind, media_type: MediaType) -> PathBuf {
+        match (media_type, self.video_dir(kind)) {
+            (MediaType::Video, Some(dir)) => dir,
+            _ => self.user_dir(kind),
+        }
+    }
+
+    /// The directory [`cpu_convert_command`] writes into: the videos root.
+    pub fn convert_dir(&self) -> &Path {
+        &self.video_root
+    }
+
+    /// Creates the user directory of `kind` when missing: the pictures
+    /// directory above the root with the default mode, the root and
+    /// `away` with 0o700 (as an import makes them). Never the videos root
+    /// ([`MediaStore::ensure_video_dir`]): one that cannot be made does
+    /// not stop an image. Returns the user directory.
+    pub fn ensure_user_dir(&self, kind: MediaKind) -> Result<PathBuf, MediaError> {
+        if let Some(parent) = self.user_root.parent() {
+            create_dir(parent, None)?;
+        }
+        create_dir(&self.user_root, Some(0o700))?;
+        let dir = self.user_dir(kind);
+        create_dir(&dir, Some(0o700))?;
+        Ok(dir)
+    }
+
+    /// Creates the videos directory of `kind` ([`MediaStore::video_dir`])
+    /// when missing: its parent with the default mode, itself with 0o700.
+    /// Returns it; `None` for a kind without one.
+    pub fn ensure_video_dir(&self, kind: MediaKind) -> Result<Option<PathBuf>, MediaError> {
+        let Some(videos) = self.video_dir(kind) else {
+            return Ok(None);
+        };
+        if let Some(parent) = videos.parent() {
+            create_dir(parent, None)?;
+        }
+        create_dir(&videos, Some(0o700))?;
+        Ok(Some(videos))
     }
 
     /// The items of `kind`: the bundled ones first (in `SOURCES.toml`
@@ -461,11 +590,13 @@ impl MediaStore {
         items
     }
 
-    /// The video files of `kind` in both roots (by their name: no check,
-    /// no read), for a prune.
+    /// The video files of `kind` in the bundled and every user directory
+    /// (by their name: no check, no read), for a prune.
     pub(crate) fn video_paths(&self, kind: MediaKind) -> Vec<PathBuf> {
         let mut out = Vec::new();
-        for (dir, follow) in [(self.bundled_dir(kind), true), (self.user_dir(kind), false)] {
+        let dirs = std::iter::once((self.bundled_dir(kind), true))
+            .chain(self.user_dirs(kind).into_iter().map(|d| (d, false)));
+        for (dir, follow) in dirs {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
@@ -523,8 +654,14 @@ impl MediaStore {
     }
 
     fn list_user(&self, kind: MediaKind) -> Vec<MediaItem> {
-        let mut found = scan_dir(&self.user_dir(kind), false, self.cache.as_ref());
-        found.sort_by(|a, b| (a.0.to_lowercase(), &a.0).cmp(&(b.0.to_lowercase(), &b.0)));
+        let mut found: Vec<(String, MediaItem)> = self
+            .user_dirs(kind)
+            .iter()
+            .flat_map(|d| scan_dir(d, false, self.cache.as_ref()))
+            .collect();
+        found.sort_by(|a, b| {
+            (a.0.to_lowercase(), &a.0, &a.1.path).cmp(&(b.0.to_lowercase(), &b.0, &b.1.path))
+        });
         found.into_iter().map(|(_, item)| item).collect()
     }
 
@@ -620,8 +757,12 @@ impl MediaStore {
         })?;
         let ext = format.extension();
 
-        let dir = self.prepare_dir(kind)?;
-        if let Some(existing) = find_identical(&dir, data) {
+        let dir = self.prepare_dir(kind, MediaType::Image)?;
+        if let Some(existing) = self
+            .user_dirs(kind)
+            .iter()
+            .find_map(|d| find_identical(d, data))
+        {
             debug!(
                 "media: {} is already in the gallery as {}",
                 src.display(),
@@ -634,21 +775,20 @@ impl MediaStore {
         Ok((target, true))
     }
 
-    /// The user directory of `kind`, created, with stale temporary files of
-    /// interrupted imports removed.
-    fn prepare_dir(&self, kind: MediaKind) -> Result<PathBuf, MediaError> {
-        let dir = self.user_dir(kind);
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)
-            .map_err(|source| MediaError::Io {
-                action: "create",
-                path: dir.clone(),
-                source,
-            })?;
-        remove_stale_temps(&dir);
-        Ok(dir)
+    /// The directory an import of `kind` stores a `media_type` in
+    /// ([`MediaStore::store_dir`]), created with the kind's user directory
+    /// (and, for a video, its videos directory: only a video needs it),
+    /// with stale temporary files of interrupted imports removed from each
+    /// of them.
+    fn prepare_dir(&self, kind: MediaKind, media_type: MediaType) -> Result<PathBuf, MediaError> {
+        self.ensure_user_dir(kind)?;
+        if media_type == MediaType::Video {
+            self.ensure_video_dir(kind)?;
+        }
+        for dir in self.user_dirs(kind) {
+            remove_stale_temps(&dir);
+        }
+        Ok(self.store_dir(kind, media_type))
     }
 
     fn stem_of(&self, kind: MediaKind, src: &Path) -> String {
@@ -670,7 +810,7 @@ impl MediaStore {
             reason,
         };
         let info = probe::probe_open(&file).map_err(refused)?;
-        let dir = self.prepare_dir(kind)?;
+        let dir = self.prepare_dir(kind, MediaType::Video)?;
         let rewind = |file: &mut File| {
             file.rewind().map_err(|source| MediaError::Io {
                 action: "read",
@@ -685,7 +825,11 @@ impl MediaStore {
             let e = e.strip_prefix("it ").unwrap_or(&e);
             MediaError::Unreadable(format!("the file {} {e}", src.display()))
         })?;
-        if let Some(existing) = find_identical_video(&dir, &source_hash) {
+        if let Some(existing) = self
+            .user_dirs(kind)
+            .iter()
+            .find_map(|d| find_identical_video(d, &source_hash))
+        {
             debug!(
                 "media: {} is already in the gallery as {}",
                 src.display(),
@@ -722,7 +866,7 @@ impl MediaStore {
         file: &File,
         anim: Animated,
     ) -> Result<(PathBuf, bool), MediaError> {
-        let dir = self.prepare_dir(kind)?;
+        let dir = self.prepare_dir(kind, MediaType::Video)?;
         let source_hash = hash::to_hex(&hash::sha256(data));
         if let Some(existing) = transcoded_from(&dir, &source_hash) {
             debug!(
@@ -802,12 +946,13 @@ impl MediaStore {
     }
 
     /// Removes `path`, which must be a regular file (not a symbolic link)
-    /// directly in a kind directory of the user root. A bundled item, or
-    /// any other path, is [`MediaError::NotAUserItem`]. The file removed is
+    /// directly in a user directory of a kind ([`MediaStore::user_dirs`]:
+    /// the pictures side or the videos root), with a name the listing
+    /// takes (UTF-8, not hidden, an image or video extension). A bundled
+    /// item, or any other path, is [`MediaError::NotAUserItem`]. The file removed is
     /// the one checked: its name in the canonical kind directory, so a
     /// directory link in `path` swapped meanwhile cannot redirect it.
-    /// For a video, a playback copy job for it is cancelled and its poster
-    /// and playback copies are removed from the cache (its content hash is
+    /// For a video, its poster is removed from the cache (its content hash is
     /// read before the removal: remembered when the file was listed or
     /// imported in this run, see [`MediaStore::warm_hash`]; a failure there
     /// is logged, the files then go at the next prune).
@@ -820,6 +965,12 @@ impl MediaStore {
         let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
             return Err(not_user());
         };
+        // Only what the listing shows: never a hidden file (a record, an
+        // import in progress) or another file of the folder.
+        if name.to_str().is_none_or(|n| n.starts_with('.')) || MediaType::from_path(path).is_none()
+        {
+            return Err(not_user());
+        }
         let checked = std::fs::canonicalize(parent)
             .map_err(|_| not_user())?
             .join(name);
@@ -829,8 +980,6 @@ impl MediaStore {
         }
         let video = MediaType::from_path(&checked) == Some(MediaType::Video);
         let content_hash = if video {
-            playback::forget_everywhere(path);
-            playback::forget_everywhere(&checked);
             open_limited(&checked, false, MAX_VIDEO_BYTES)
                 .and_then(|(mut f, _)| hash::hash_file(&mut f, MAX_VIDEO_BYTES, None))
                 .inspect_err(|e| {
@@ -860,15 +1009,18 @@ impl MediaStore {
     }
 
     /// The kind of `path` and whether it is bundled, when it is a regular
-    /// file directly in a kind directory of either root (the directories
-    /// compared canonically). A file in the user root must not be a
+    /// file directly in a kind directory of the bundled root or in a user
+    /// directory of the kind ([`MediaStore::user_dirs`]; the directories
+    /// compared canonically, never by prefix). A user file must not be a
     /// symbolic link; a bundled one may be.
     pub fn is_gallery_item(&self, path: &Path) -> Option<(MediaKind, bool)> {
         let parent = path.parent()?;
         path.file_name()?;
         let parent = std::fs::canonicalize(parent).ok()?;
         for kind in MediaKind::ALL {
-            for (dir, bundled) in [(self.bundled_dir(kind), true), (self.user_dir(kind), false)] {
+            let dirs = std::iter::once((self.bundled_dir(kind), true))
+                .chain(self.user_dirs(kind).into_iter().map(|d| (d, false)));
+            for (dir, bundled) in dirs {
                 let Ok(dir) = std::fs::canonicalize(&dir) else {
                     continue;
                 };
@@ -894,7 +1046,7 @@ impl MediaError {
     pub fn to_ipc(self) -> obc_ipc::IpcError {
         use obc_ipc::IpcError;
         match self {
-            MediaError::NoDataDir | MediaError::Io { .. } | MediaError::NoFreeName { .. } => {
+            MediaError::NoHome | MediaError::Io { .. } | MediaError::NoFreeName { .. } => {
                 IpcError::Failed(self.to_string())
             }
             MediaError::UnknownKind(_)
@@ -909,6 +1061,142 @@ impl MediaError {
             | MediaError::NotAUserItem(_) => IpcError::InvalidArgument(self.to_string()),
         }
     }
+}
+
+/// The user's pictures directory, as `xdg-user-dir PICTURES` finds it:
+/// `XDG_PICTURES_DIR` of `user-dirs.dirs` in `$XDG_CONFIG_HOME` (else
+/// `$HOME/.config`; a relative `XDG_CONFIG_HOME` is ignored), else
+/// `$HOME/Pictures`. A value is `"$HOME/..."` or an absolute path in double
+/// quotes (a backslash escapes the next character; only `$HOME` is
+/// expanded; the last line setting it wins); a relative or malformed value,
+/// or one that is `$HOME` itself (the specification's disabled directory),
+/// is ignored. The file is read up to 64 KiB. `None` when `HOME` is not an
+/// absolute path.
+pub fn pictures_dir_in(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    xdg_user_dir_in(env, b"XDG_PICTURES_DIR", "Pictures")
+}
+
+/// The user's videos directory, as `xdg-user-dir VIDEOS` finds it:
+/// `XDG_VIDEOS_DIR` of `user-dirs.dirs`, else `$HOME/Videos`, read as
+/// [`pictures_dir_in`] reads its key.
+pub fn videos_dir_in(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    xdg_user_dir_in(env, b"XDG_VIDEOS_DIR", "Videos")
+}
+
+/// The directory `key` of `user-dirs.dirs` names, else `$HOME/<fallback>`
+/// ([`pictures_dir_in`] says how the file is read).
+fn xdg_user_dir_in(
+    env: impl Fn(&str) -> Option<OsString>,
+    key: &[u8],
+    fallback: &str,
+) -> Option<PathBuf> {
+    let absolute = |k: &str| env(k).map(PathBuf::from).filter(|p| p.is_absolute());
+    let home = absolute("HOME")?;
+    let config = absolute("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
+    let text = File::open(config.join("user-dirs.dirs"))
+        .and_then(|f| {
+            let mut bytes = Vec::new();
+            f.take(MAX_USER_DIRS_BYTES).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })
+        .unwrap_or_default();
+    let found = text
+        .split(|&b| b == b'\n')
+        .filter_map(|line| user_dirs_value(line, key, &home))
+        .next_back();
+    let trimmed = |p: &Path| PathBuf::from(p.as_os_str().to_string_lossy().trim_end_matches('/'));
+    Some(
+        found
+            .filter(|p| trimmed(p) != trimmed(&home))
+            .unwrap_or_else(|| home.join(fallback)),
+    )
+}
+
+/// The path a `user-dirs.dirs` line sets `key` to, if it does with a value
+/// [`pictures_dir_in`] accepts (a key is matched whole: `XDG_VIDEOS_DIRS`
+/// is not `XDG_VIDEOS_DIR`).
+fn user_dirs_value(line: &[u8], key: &[u8], home: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let line = line.trim_ascii_start();
+    let rest = line.strip_prefix(key)?.trim_ascii_start();
+    let rest = rest.strip_prefix(b"=")?.trim_ascii_start();
+    let rest = rest.strip_prefix(b"\"")?;
+    let mut value = Vec::new();
+    let mut bytes = rest.iter();
+    loop {
+        match bytes.next()? {
+            b'"' => break,
+            b'\\' => value.push(*bytes.next()?),
+            &b => value.push(b),
+        }
+    }
+    let path = if let Some(tail) = value.strip_prefix(b"$HOME") {
+        match tail {
+            [] => home.to_path_buf(),
+            [b'/', more @ ..] => home.join(std::ffi::OsStr::from_bytes(more)),
+            _ => return None,
+        }
+    } else if value.starts_with(b"/") {
+        PathBuf::from(std::ffi::OsStr::from_bytes(&value))
+    } else {
+        return None;
+    };
+    Some(path)
+}
+
+/// Where [`cpu_convert_command`] writes the conversion of `input`: in
+/// `dir` (the videos root, [`MediaStore::convert_dir`], so it is listed
+/// with the backgrounds), as
+/// `<stem>-cpu.webm` (the stem made safe as an import makes it; `-cpu`
+/// keeps a WebM input from being overwritten), else the first free of
+/// `<stem>-cpu-2.webm`, `<stem>-cpu-3.webm`, … (a `stat` each).
+pub fn cpu_convert_output(dir: &Path, input: &Path) -> PathBuf {
+    let stem = sanitise_stem(
+        &input.file_stem().unwrap_or_default().to_string_lossy(),
+        MediaKind::Background.fallback_stem(),
+    );
+    let mut target = dir.join(format!("{stem}-cpu.webm"));
+    for n in 2..=MAX_SUFFIX {
+        if std::fs::symlink_metadata(&target).is_err() {
+            break;
+        }
+        target = dir.join(format!("{stem}-cpu-{n}.webm"));
+    }
+    target
+}
+
+/// The shell command that converts the video `input` into a CPU-ready VP9
+/// WebM in `dir` ([`cpu_convert_output`], [`ffmpeg::cpu_convert_command`]);
+/// `None` when a path is not UTF-8.
+pub fn cpu_convert_command(dir: &Path, input: &Path) -> Option<String> {
+    ffmpeg::cpu_convert_command(input, &cpu_convert_output(dir, input))
+}
+
+/// Creates the directory `dir` and the missing ones above it, `dir` with
+/// `mode` when given.
+fn create_dir(dir: &Path, mode: Option<u32>) -> Result<(), MediaError> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    if let Some(m) = mode {
+        b.mode(m);
+    }
+    b.create(dir).map_err(|source| MediaError::Io {
+        action: "create",
+        path: dir.to_path_buf(),
+        source,
+    })
+}
+
+/// Whether the directories `a` and `b` are one: the same path, or the same
+/// device and inode (a link or a bind mount). Missing ones are told by
+/// their path only.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a == b
+        || matches!(
+            (std::fs::metadata(a), std::fs::metadata(b)),
+            (Ok(x), Ok(y)) if x.dev() == y.dev() && x.ino() == y.ino()
+        )
 }
 
 /// Whether `a` and `b` name the same file: the same text, or the same
@@ -1067,9 +1355,9 @@ fn scan_dir(dir: &Path, follow: bool, cache: Option<&MediaCache>) -> Vec<(String
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
-        let (width, height, duration_ms, poster) = match media_type {
+        let (width, height, duration_ms, poster, cpu_ready) = match media_type {
             MediaType::Image => match image_size(&path, follow) {
-                Ok((w, h)) => (w, h, 0, None),
+                Ok((w, h)) => (w, h, 0, None, false),
                 Err(reason) => {
                     debug!("media: skipping {}: {reason}", path.display());
                     continue;
@@ -1085,7 +1373,13 @@ fn scan_dir(dir: &Path, follow: bool, cache: Option<&MediaCache>) -> Vec<(String
                     .flatten()
                     .as_deref(),
             ) {
-                Ok((info, poster)) => (info.width, info.height, info.duration_ms, poster),
+                Ok((info, poster)) => (
+                    info.width,
+                    info.height,
+                    info.duration_ms,
+                    poster,
+                    is_cpu_ready(&info),
+                ),
                 Err(reason) => {
                     debug!("media: skipping {}: {reason}", path.display());
                     continue;
@@ -1103,6 +1397,7 @@ fn scan_dir(dir: &Path, follow: bool, cache: Option<&MediaCache>) -> Vec<(String
                 height,
                 duration_ms,
                 poster,
+                cpu_ready,
             },
         ));
     }
@@ -1303,8 +1598,11 @@ pub(crate) fn animated_format(data: &[u8]) -> Option<Animated> {
 }
 
 /// Links the complete file `temp` in `dir` to the first free name of
-/// `<stem>.<ext>`, `<stem>-2.<ext>`, …, then syncs the directory (the
-/// name is freed again when that fails). Never overwrites.
+/// `<stem>.<ext>`, `<stem>-2.<ext>`, … ([`link_new`]: renamed where the
+/// file system has no hard links), then syncs the directory (the name is
+/// freed again when that fails). Never overwrites. The name always has an
+/// extension and a stem without a leading dot, so it is never the
+/// reserved `away` directory or the hidden `.sources`.
 fn link_unique(
     dir: &Path,
     temp: &Path,
@@ -1319,7 +1617,7 @@ fn link_unique(
             format!("{stem}-{n}.{ext}")
         };
         let target = dir.join(&name);
-        match std::fs::hard_link(temp, &target) {
+        match link_new(temp, &target) {
             Ok(()) => {
                 if let Err(source) = sync_dir(dir) {
                     // The import fails as a whole: the name is freed
@@ -1347,6 +1645,70 @@ fn link_unique(
         src: src.to_path_buf(),
         dir: dir.to_path_buf(),
     })
+}
+
+/// Gives the complete file `temp` the new name `target`, never replacing
+/// a file (`AlreadyExists` when `target` exists): a hard link (the
+/// caller's guard then unlinks `temp`), else, on a file system without
+/// hard links (exFAT, vfat, some FUSE ones: `EPERM`, `EOPNOTSUPP`), a
+/// rename refusing an existing name (`renameat2` with
+/// `RENAME_NOREPLACE`), after which `temp` is gone.
+fn link_new(temp: &Path, target: &Path) -> std::io::Result<()> {
+    let linked = if links_refused() {
+        Err(std::io::Error::from_raw_os_error(libc::EPERM))
+    } else {
+        std::fs::hard_link(temp, target)
+    };
+    match linked {
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EPERM | libc::EOPNOTSUPP)) => {
+            debug!(
+                "media: no hard link in {} ({e}): renaming",
+                target.display()
+            );
+            rename_noreplace(temp, target)
+        }
+        other => other,
+    }
+}
+
+/// Renames `from` to `to` unless `to` exists (`AlreadyExists`).
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+    };
+    let (from, to) = (c(from)?, c(to)?);
+    // SAFETY: both are NUL-terminated paths that live across the call.
+    let r = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Refuses hard links as exFAT does (tests).
+    pub(crate) static LINKS_REFUSED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether hard links fail as on a file system without them (tests only).
+fn links_refused() -> bool {
+    #[cfg(test)]
+    return LINKS_REFUSED.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    false
 }
 
 /// A regular video file directly in `dir` (not hidden, with a video
@@ -1649,7 +2011,8 @@ fn remove_stale_temps(dir: &Path) {
 }
 
 /// A synced temporary copy in the destination directory, unlinked when
-/// dropped (its content then lives on under the name it was linked to).
+/// dropped (its content then lives on under the name it was linked or
+/// renamed to).
 struct TempFile {
     path: PathBuf,
 }
@@ -1737,7 +2100,10 @@ impl TempFile {
 
 impl Drop for TempFile {
     fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.path) {
+        // Gone when it was renamed to its name (no hard links).
+        if let Err(e) = std::fs::remove_file(&self.path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
             warning!("media: cannot remove {}: {e}", self.path.display());
         }
     }

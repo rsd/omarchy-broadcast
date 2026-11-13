@@ -166,25 +166,397 @@ fn kinds_parse_and_name_their_directories() {
     assert_eq!(MediaType::from_path(Path::new("a.gif")), None);
 }
 
+/// An environment of `vars`, for [`MediaStore::from_env_in`].
+fn env_of(vars: Vec<(&'static str, String)>) -> impl Fn(&str) -> Option<OsString> {
+    move |k: &str| {
+        vars.iter()
+            .find(|(n, _)| *n == k)
+            .map(|(_, v)| OsString::from(v))
+    }
+}
+
 #[test]
-fn the_user_root_follows_xdg_data_home_then_home() {
-    let env = |vars: &'static [(&str, &str)]| {
-        move |k: &str| {
-            vars.iter()
-                .find(|(n, _)| *n == k)
-                .map(|(_, v)| OsString::from(v))
-        }
+fn the_user_root_is_in_the_pictures_directory_of_user_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let config = home.join(".config");
+    std::fs::create_dir_all(&config).unwrap();
+    let h = home.display().to_string();
+    let root_for = |line: &str, vars: Vec<(&'static str, String)>| {
+        std::fs::write(config.join("user-dirs.dirs"), line).unwrap();
+        MediaStore::from_env_in(env_of(vars))
+            .unwrap()
+            .user_root()
+            .to_path_buf()
     };
-    let s = MediaStore::from_env_in(env(&[("XDG_DATA_HOME", "/d"), ("HOME", "/h")])).unwrap();
-    assert_eq!(s.user_root(), Path::new("/d/omarchy-broadcast/media"));
-    assert_eq!(s.bundled_root(), Path::new(BUNDLED_ROOT));
-    let s = MediaStore::from_env_in(env(&[("XDG_DATA_HOME", "rel"), ("HOME", "/h")])).unwrap();
+    let only_home = || vec![("HOME", h.clone())];
+
+    // `$HOME/...`, the form xdg-user-dirs writes, with comments around.
     assert_eq!(
-        s.user_root(),
-        Path::new("/h/.local/share/omarchy-broadcast/media")
+        root_for(
+            "# written by xdg-user-dirs-update\nXDG_DESKTOP_DIR=\"$HOME/Desktop\"\n\
+             XDG_PICTURES_DIR=\"$HOME/Bilder\"\n",
+            only_home()
+        ),
+        home.join("Bilder/omarchy-broadcast")
     );
-    let e = MediaStore::from_env_in(env(&[])).unwrap_err();
-    assert!(matches!(e, MediaError::NoDataDir), "{e}");
+    // An absolute path, with spaces around `=` and an escaped quote; the
+    // last line setting it wins.
+    assert_eq!(
+        root_for(
+            "XDG_PICTURES_DIR=\"$HOME/old\"\n  XDG_PICTURES_DIR = \"/srv/My \\\"pics\\\"\"\n",
+            only_home()
+        ),
+        Path::new("/srv/My \"pics\"/omarchy-broadcast")
+    );
+    // Ignored: relative, `$HOME` itself (disabled), malformed.
+    for bad in [
+        "XDG_PICTURES_DIR=\"Pictures\"",
+        "XDG_PICTURES_DIR=\"$HOME\"",
+        "XDG_PICTURES_DIR=\"$HOME/\"",
+        &format!("XDG_PICTURES_DIR=\"{h}\""),
+        "XDG_PICTURES_DIR=\"$HOMEX/p\"",
+        "XDG_PICTURES_DIR=$HOME/p",
+        "XDG_PICTURES_DIR=\"$HOME/unterminated",
+        "XDG_PICTURES_DIRS=\"/x\"",
+    ] {
+        assert_eq!(
+            root_for(bad, only_home()),
+            home.join("Pictures/omarchy-broadcast"),
+            "{bad}"
+        );
+    }
+    // XDG_CONFIG_HOME is read first; a relative one is ignored.
+    let other = tmp.path().join("cfg");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(
+        other.join("user-dirs.dirs"),
+        "XDG_PICTURES_DIR=\"$HOME/Imagens\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        root_for(
+            "XDG_PICTURES_DIR=\"$HOME/Bilder\"\n",
+            vec![
+                ("HOME", h.clone()),
+                ("XDG_CONFIG_HOME", other.display().to_string())
+            ]
+        ),
+        home.join("Imagens/omarchy-broadcast")
+    );
+    assert_eq!(
+        root_for(
+            "XDG_PICTURES_DIR=\"$HOME/Bilder\"\n",
+            vec![("HOME", h.clone()), ("XDG_CONFIG_HOME", "cfg".into())]
+        ),
+        home.join("Bilder/omarchy-broadcast")
+    );
+    // No file: $HOME/Pictures. The data directory plays no part.
+    std::fs::remove_file(config.join("user-dirs.dirs")).unwrap();
+    let s = MediaStore::from_env_in(env_of(vec![
+        ("HOME", h.clone()),
+        ("XDG_DATA_HOME", "/d".into()),
+    ]))
+    .unwrap();
+    assert_eq!(s.user_root(), home.join("Pictures/omarchy-broadcast"));
+    assert_eq!(s.bundled_root(), Path::new(BUNDLED_ROOT));
+    // The cache is unchanged.
+    assert_eq!(
+        s.cache().unwrap().root(),
+        home.join(".cache/omarchy-broadcast")
+    );
+    // No HOME (or a relative one): no gallery.
+    for vars in [vec![], vec![("HOME", "rel".to_string())]] {
+        let e = MediaStore::from_env_in(env_of(vars)).unwrap_err();
+        assert!(matches!(e, MediaError::NoHome), "{e}");
+    }
+}
+
+#[test]
+fn backgrounds_are_the_root_and_away_images_its_away_directory() {
+    let f = fixture();
+    let root = f.store.user_root().to_path_buf();
+    assert_eq!(f.store.user_dir(MediaKind::Background), root);
+    assert_eq!(f.store.user_dir(MediaKind::Away), root.join("away"));
+    // The bundled tree keeps its kind directories.
+    assert_eq!(
+        f.store.bundled_dir(MediaKind::Background),
+        f.store.bundled_root().join("backgrounds")
+    );
+
+    // Each kind lists only its own files: never the `away` directory, the
+    // hidden `.sources`, or a directory with an image's name.
+    write(&root.join("bg.png"), &png(10, 10, 1));
+    write(&root.join("away/me.png"), &png(10, 10, 2));
+    write(&root.join(".sources/x"), b"bg.png");
+    std::fs::create_dir_all(root.join("dir.png")).unwrap();
+    write(&root.join("away.png"), &png(10, 10, 3));
+    let paths = |kind| -> Vec<PathBuf> { f.store.list(kind).into_iter().map(|i| i.path).collect() };
+    assert_eq!(
+        paths(MediaKind::Background),
+        [root.join("away.png"), root.join("bg.png")]
+    );
+    assert_eq!(paths(MediaKind::Away), [root.join("away/me.png")]);
+
+    // A kind is the directory's exactly.
+    assert_eq!(
+        f.store.is_gallery_item(&root.join("bg.png")),
+        Some((MediaKind::Background, false))
+    );
+    assert_eq!(
+        f.store.is_gallery_item(&root.join("away/me.png")),
+        Some((MediaKind::Away, false))
+    );
+    assert_eq!(f.store.is_gallery_item(&root.join("away")), None);
+    assert_eq!(f.store.is_gallery_item(&root.join(".sources/x")), None);
+    write(&root.join("away/sub/deep.png"), &png(10, 10, 4));
+    assert_eq!(
+        f.store.is_gallery_item(&root.join("away/sub/deep.png")),
+        None
+    );
+
+    // An import goes to its kind's directory; the same bytes in the other
+    // kind are not a duplicate.
+    let src = f.src.join("me.png");
+    write(&src, &png(10, 10, 2));
+    let bg = f.store.import(MediaKind::Background, &src).unwrap();
+    assert_eq!(bg, root.join("me.png"));
+    assert_eq!(
+        f.store.import(MediaKind::Away, &src).unwrap(),
+        root.join("away/me.png")
+    );
+
+    // Removals: an away item, then a background; the other kind stays.
+    f.store.remove(&root.join("away/me.png")).unwrap();
+    assert!(!root.join("away/me.png").exists());
+    assert!(bg.exists());
+    f.store.remove(&bg).unwrap();
+    assert!(!bg.exists());
+    assert!(root.join("away").is_dir());
+    let e = f.store.remove(&root.join("away")).unwrap_err();
+    assert!(matches!(e, MediaError::NotAUserItem(_)), "{e}");
+    let e = f.store.remove(&root.join(".sources/x")).unwrap_err();
+    assert!(matches!(e, MediaError::NotAUserItem(_)), "{e}");
+    assert_eq!(
+        names(&root.join("away")),
+        BTreeSet::from(["sub".to_string()])
+    );
+}
+
+#[test]
+fn the_user_directories_are_made_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture();
+    let dir = f.store.ensure_user_dir(MediaKind::Away).unwrap();
+    assert_eq!(dir, f.store.user_root().join("away"));
+    for d in [f.store.user_root(), dir.as_path()] {
+        let mode = std::fs::metadata(d).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{}", d.display());
+    }
+}
+
+/// A store whose videos root is a folder of its own (`<root>/Videos/…`
+/// beside `<root>/Pictures/…`), as a session's is.
+fn two_folders() -> (Fixture, PathBuf, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let pictures = root.join("Pictures/omarchy-broadcast");
+    let videos = root.join("Videos/omarchy-broadcast");
+    let store = MediaStore::new(root.join("bundled"), &pictures).with_video_root(&videos);
+    (
+        Fixture {
+            _tmp: tmp,
+            store,
+            src,
+        },
+        pictures,
+        videos,
+    )
+}
+
+#[test]
+fn the_videos_root_is_in_the_videos_directory_of_user_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let config = home.join(".config");
+    std::fs::create_dir_all(&config).unwrap();
+    let h = home.display().to_string();
+    let roots_for = |text: &str| {
+        std::fs::write(config.join("user-dirs.dirs"), text).unwrap();
+        let s = MediaStore::from_env_in(env_of(vec![("HOME", h.clone())])).unwrap();
+        (s.user_root().to_path_buf(), s.video_root().to_path_buf())
+    };
+    // Each key read on its own, the same way.
+    assert_eq!(
+        roots_for(
+            "XDG_PICTURES_DIR=\"$HOME/Bilder\"\nXDG_VIDEOS_DIR=\"$HOME/Filme\"\n\
+             XDG_VIDEOS_DIRS=\"/x\"\n"
+        ),
+        (
+            home.join("Bilder/omarchy-broadcast"),
+            home.join("Filme/omarchy-broadcast")
+        )
+    );
+    assert_eq!(
+        roots_for("XDG_VIDEOS_DIR=\"/srv/clips\"\n").1,
+        Path::new("/srv/clips/omarchy-broadcast")
+    );
+    // Missing, disabled or malformed: $HOME/Videos.
+    for text in [
+        "",
+        "XDG_VIDEOS_DIR=\"$HOME\"",
+        "XDG_VIDEOS_DIR=\"Videos\"",
+        "XDG_VIDEOS_DIRS=\"/x\"",
+    ] {
+        assert_eq!(
+            roots_for(text).1,
+            home.join("Videos/omarchy-broadcast"),
+            "{text}"
+        );
+    }
+    let env = env_of(vec![("HOME", h.clone())]);
+    assert_eq!(videos_dir_in(&env), Some(home.join("Videos")));
+    assert_eq!(videos_dir_in(env_of(vec![])), None);
+    // A plain store keeps one folder.
+    let one = MediaStore::new("/b", "/u");
+    assert_eq!(one.video_root(), Path::new("/u"));
+    assert_eq!(one.user_dirs(MediaKind::Background), [PathBuf::from("/u")]);
+}
+
+#[test]
+fn backgrounds_are_listed_from_both_folders_and_away_from_pictures_only() {
+    let (f, pictures, videos) = two_folders();
+    assert_eq!(
+        f.store.video_dir(MediaKind::Background),
+        Some(videos.clone())
+    );
+    assert_eq!(f.store.video_dir(MediaKind::Away), None);
+    assert_eq!(
+        f.store.user_dirs(MediaKind::Background),
+        [pictures.clone(), videos.clone()]
+    );
+    assert_eq!(f.store.user_dirs(MediaKind::Away), [pictures.join("away")]);
+    assert_eq!(f.store.convert_dir(), videos);
+
+    // Made at start, private, the videos root on its own.
+    use std::os::unix::fs::PermissionsExt;
+    f.store.ensure_user_dir(MediaKind::Background).unwrap();
+    assert!(!videos.exists());
+    assert_eq!(f.store.ensure_video_dir(MediaKind::Away).unwrap(), None);
+    assert_eq!(
+        f.store.ensure_video_dir(MediaKind::Background).unwrap(),
+        Some(videos.clone())
+    );
+    let mode = std::fs::metadata(&videos).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+
+    // Files dropped by hand in either folder are listed, sorted together;
+    // a still in the videos folder too. Away lists neither.
+    write(&pictures.join("b.png"), &png(10, 10, 1));
+    write(&videos.join("a still.png"), &png(10, 10, 2));
+    write(&videos.join("C.png"), &png(10, 10, 3));
+    write(&videos.join(".sources/x"), b"a.webm");
+    write(&videos.join("sub/deep.png"), &png(10, 10, 4));
+    let paths = |kind| -> Vec<PathBuf> { f.store.list(kind).into_iter().map(|i| i.path).collect() };
+    assert_eq!(
+        paths(MediaKind::Background),
+        [
+            videos.join("a still.png"),
+            pictures.join("b.png"),
+            videos.join("C.png")
+        ]
+    );
+    assert!(paths(MediaKind::Away).is_empty());
+
+    // A still is imported into Pictures, but one already in Videos with
+    // the same bytes is a duplicate.
+    let src = f.src.join("x.png");
+    write(&src, &png(10, 10, 2));
+    assert_eq!(
+        f.store.import_stored(MediaKind::Background, &src).unwrap(),
+        (videos.join("a still.png"), false)
+    );
+    write(&src, &png(10, 10, 9));
+    assert_eq!(
+        f.store.import(MediaKind::Background, &src).unwrap(),
+        pictures.join("x.png")
+    );
+
+    // Either folder's file is an item of the kind, removed in place; a
+    // file deeper down or beside the folder is not.
+    assert_eq!(
+        f.store.is_gallery_item(&videos.join("C.png")),
+        Some((MediaKind::Background, false))
+    );
+    for not_item in [
+        videos.join("sub/deep.png"),
+        videos.join(".sources/x"),
+        videos.parent().unwrap().join("C.png"),
+    ] {
+        write(&videos.parent().unwrap().join("C.png"), &png(10, 10, 5));
+        let e = f.store.remove(&not_item).unwrap_err();
+        assert!(matches!(e, MediaError::NotAUserItem(_)), "{e}");
+        assert!(not_item.exists());
+    }
+    f.store.remove(&videos.join("C.png")).unwrap();
+    assert!(!videos.join("C.png").exists());
+    assert_eq!(
+        names(&videos),
+        BTreeSet::from([
+            ".sources".to_string(),
+            "a still.png".to_string(),
+            "sub".to_string()
+        ])
+    );
+}
+
+#[test]
+fn one_folder_for_pictures_and_videos_is_listed_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let pictures = root.join("Pictures/omarchy-broadcast");
+    std::fs::create_dir_all(&pictures).unwrap();
+    // The videos root a link to the same folder.
+    std::fs::create_dir_all(root.join("Videos")).unwrap();
+    std::os::unix::fs::symlink(&pictures, root.join("Videos/omarchy-broadcast")).unwrap();
+    let store = MediaStore::new(root.join("bundled"), &pictures)
+        .with_video_root(root.join("Videos/omarchy-broadcast"));
+    assert_eq!(
+        store.user_dirs(MediaKind::Background),
+        std::slice::from_ref(&pictures)
+    );
+    write(&pictures.join("one.png"), &png(10, 10, 1));
+    let items = store.list(MediaKind::Background);
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(
+        store.video_paths(MediaKind::Background),
+        Vec::<PathBuf>::new()
+    );
+    store.ensure_user_dir(MediaKind::Background).unwrap();
+    store.remove(&pictures.join("one.png")).unwrap();
+}
+
+#[test]
+fn stale_temporary_files_go_from_both_folders() {
+    let (f, pictures, videos) = two_folders();
+    let old = SystemTime::now() - STALE_TEMP_AGE - Duration::from_secs(60);
+    for dir in [&pictures, &videos] {
+        let t = dir.join(".import-1-1.tmp");
+        write(&t, b"x");
+        File::options()
+            .write(true)
+            .open(&t)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    let src = f.src.join("y.png");
+    write(&src, &png(10, 10, 7));
+    f.store.import(MediaKind::Background, &src).unwrap();
+    assert!(!pictures.join(".import-1-1.tmp").exists());
+    assert!(!videos.join(".import-1-1.tmp").exists());
 }
 
 #[test]
@@ -314,6 +686,41 @@ fn importing_copies_under_the_detected_format_extension() {
     let items = f.store.list(MediaKind::Away);
     assert_eq!(labels(&items), [("Plain", false)]);
     assert_eq!((items[0].width, items[0].height), (16, 9));
+}
+
+#[test]
+fn importing_without_hard_links_renames_and_never_overwrites() {
+    LINKS_REFUSED.with(|c| c.set(true));
+    let f = fixture();
+    let a = f.src.join("one/shot.png");
+    let b = f.src.join("two/shot.png");
+    write(&a, &png(10, 10, 1));
+    write(&b, &png(10, 10, 2));
+    let dir = f.store.user_dir(MediaKind::Background);
+    assert_eq!(
+        f.store.import(MediaKind::Background, &a).unwrap(),
+        dir.join("shot.png")
+    );
+    assert_eq!(
+        f.store.import(MediaKind::Background, &b).unwrap(),
+        dir.join("shot-2.png")
+    );
+    assert_eq!(std::fs::read(dir.join("shot.png")).unwrap(), png(10, 10, 1));
+    assert_eq!(
+        std::fs::read(dir.join("shot-2.png")).unwrap(),
+        png(10, 10, 2)
+    );
+    // No temporary file is left behind.
+    assert_eq!(
+        names(&dir),
+        BTreeSet::from(["shot.png".into(), "shot-2.png".into()])
+    );
+    // The rename itself refuses an existing name.
+    let other = dir.join("other");
+    write(&other, b"x");
+    let err = rename_noreplace(&other, &dir.join("shot.png")).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    LINKS_REFUSED.with(|c| c.set(false));
 }
 
 #[test]
@@ -531,6 +938,26 @@ fn only_regular_files_of_the_user_root_are_removed() {
 
     let e = f.store.remove(Path::new("x.png")).unwrap_err();
     assert!(matches!(e, MediaError::NotAbsolute(_)), "{e}");
+
+    // Only what the listing shows: no hidden file, no other file.
+    for name in [".sources", ".hidden.png", "notes.txt", "README"] {
+        let p = user.join(name);
+        write(&p, b"x");
+        not_user(&p);
+        assert!(p.exists(), "{name}");
+    }
+}
+
+#[test]
+fn an_image_is_imported_when_the_videos_folder_cannot_be_made() {
+    let (f, pictures, videos) = two_folders();
+    // A file where the videos folder's parent should be.
+    write(videos.parent().unwrap(), b"not a directory");
+    let src = f.src.join("mine.png");
+    write(&src, &png(10, 10, 1));
+    let stored = f.store.import(MediaKind::Background, &src).unwrap();
+    assert_eq!(stored, pictures.join("mine.png"));
+    assert!(f.store.ensure_video_dir(MediaKind::Background).is_err());
 }
 
 /// Every bundled file of the repository is described in its directory's
