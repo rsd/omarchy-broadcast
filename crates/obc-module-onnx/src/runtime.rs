@@ -145,6 +145,16 @@ impl Runtime {
     }
 }
 
+/// The process's runtime, its environment among it, kept for the life of
+/// the process and never released: releasing ONNX Runtime's environment
+/// after the OpenVINO provider was used crashes the process at exit
+/// (`SIGSEGV`; ONNX Runtime 1.29 with OpenVINO 2026.4: the release unloads
+/// the provider and OpenVINO's plugins while OpenVINO's threads and
+/// thread-local destructors still run their code). So this stays a
+/// `static` that is never dropped (the host opens modules with
+/// `RTLD_NODELETE`, so not even at unload): never a `take()`, never a
+/// `Drop` path, never a field the module or an instance owns alone.
+/// `tests/exit.rs` checks that a process exits cleanly after OpenVINO ran.
 static RUNTIME: OnceLock<Result<Arc<Runtime>, String>> = OnceLock::new();
 static OPEN_LOCK: Mutex<()> = Mutex::new(());
 
@@ -347,10 +357,16 @@ pub fn tensorrt_names_linked(provider: &Path) -> Vec<&'static str> {
 /// session was made) is read without loading anything. Before that, the
 /// one the provider is linked against is opened by its soname, newest
 /// first, and kept: the provider would load it at its first session
-/// anyway, and the loader then reuses this one (same soname). That is the
-/// library the provider's own lookup finds: ONNX Runtime's provider
-/// libraries carry no `RUNPATH`, so both lookups search the same path
-/// (`LD_LIBRARY_PATH`, then the loader's cache).
+/// anyway, and the loader then reuses this one (same soname), so the
+/// version read is that of the library the provider runs.
+///
+/// This lookup is the module's, which has no `RUNPATH`: it searches
+/// `LD_LIBRARY_PATH`, then the loader's cache and default directories. A
+/// provider library may carry one (onnxruntime-full's TensorRT provider
+/// has `RUNPATH /opt/nvidia/tensorrt/lib`) and find `libnvinfer` where
+/// this lookup does not; then this is `None`, and TensorRT is not started
+/// ([`crate::engine`]): `libnvinfer`'s own `dlopen` of its builder
+/// resource does not search the provider's `RUNPATH` either, and fails.
 pub fn tensorrt_version(library: &Path) -> Option<String> {
     static VERSION: OnceLock<Option<String>> = OnceLock::new();
     VERSION
@@ -398,6 +414,86 @@ pub fn tensorrt_version(library: &Path) -> Option<String> {
             })
         })
         .clone()
+}
+
+/// The names TensorRT `version` (`11.4.0`) asks for its builder resource
+/// library by, on a GPU of compute capability `cc`.
+///
+/// `libnvinfer` opens it with `dlopen` by bare name when a builder is
+/// created, which ONNX Runtime's TensorRT provider does for an engine read
+/// from the cache too. The name is built at run time (seen with
+/// `LD_DEBUG=files`, and from the fragments in the library's strings):
+/// TensorRT 11 has one library per GPU architecture,
+/// `libnvinfer_builder_resource_sm<major><minor>.so.<version>`, and asks for
+/// that one only (with it missing it fails; it does not fall back to the
+/// `_ptx` library beside it). TensorRT 10 (10.9) has a single
+/// `libnvinfer_builder_resource.so.<version>`; the per-GPU name is
+/// accepted for 10 too, for a later 10.x that may have split it: the
+/// version in the name already ties either to that one release.
+pub fn tensorrt_builder_resource_names(version: &str, cc: (i32, i32)) -> Vec<String> {
+    let major: u32 = version
+        .split('.')
+        .next()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(0);
+    let per_gpu = format!(
+        "libnvinfer_builder_resource_sm{}{}.so.{version}",
+        cc.0, cc.1
+    );
+    if major >= 11 {
+        vec![per_gpu]
+    } else {
+        vec![format!("libnvinfer_builder_resource.so.{version}"), per_gpu]
+    }
+}
+
+/// The builder resource libraries of TensorRT `version` (`11.4.0`) in
+/// `dirs` (the loader's search directories, [`loader_dirs`]): their file
+/// names, `libnvinfer_builder_resource*.so.<version>`, sorted and without
+/// duplicates. A look at the files, so that whether a library is on the
+/// path does not depend on the loader's message, which is translated.
+pub fn builder_resources_reachable(version: &str, dirs: &[PathBuf]) -> Vec<String> {
+    let suffix = format!(".so.{version}");
+    let mut found: Vec<String> = dirs
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flatten()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with("libnvinfer_builder_resource") && n.ends_with(&suffix))
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Opens the library `name` by bare name, as another library's `dlopen`
+/// of that name would find it, and keeps it loaded: such a `dlopen` then
+/// matches the name already loaded. (Opening the file by its path would
+/// not do: a TensorRT builder resource's soname is
+/// `do_not_link_against_...`, so a later `dlopen` by the file's name does
+/// not match it.) The loader's message when it cannot be opened.
+///
+/// # Safety
+///
+/// Loading `name` runs its initialisers, and the library is never
+/// unloaded. The caller opens only libraries whose initialisers have no
+/// preconditions and which may stay loaded for the life of the process
+/// (TensorRT's builder resource libraries, which hold data).
+pub(crate) unsafe fn load_kept(name: &str) -> Result<(), String> {
+    // SAFETY: the caller's obligation (above).
+    match unsafe {
+        libloading::os::unix::Library::open(Some(name), libloading::os::unix::RTLD_LAZY)
+    } {
+        Ok(lib) => {
+            std::mem::forget(lib);
+            Ok(())
+        }
+        // `libloading`'s error says only "dlopen failed"; the loader's own
+        // message is its source.
+        Err(e) => {
+            Err(std::error::Error::source(&e).map_or_else(|| e.to_string(), |s| s.to_string()))
+        }
+    }
 }
 
 /// `getInferLibVersion`'s number as a version: TensorRT 10 and later give
@@ -531,6 +627,64 @@ mod tests {
             tensorrt_names_linked(&dir.path().join("missing.so")),
             TENSORRT_NAMES
         );
+    }
+
+    #[test]
+    fn the_builder_resource_is_named_by_tensorrt_version_and_gpu() {
+        // TensorRT 11: one library per GPU architecture, no fallback.
+        assert_eq!(
+            tensorrt_builder_resource_names("11.4.0", (12, 0)),
+            ["libnvinfer_builder_resource_sm120.so.11.4.0"]
+        );
+        assert_eq!(
+            tensorrt_builder_resource_names("11.4.0", (8, 6)),
+            ["libnvinfer_builder_resource_sm86.so.11.4.0"]
+        );
+        // TensorRT 10: the single library first.
+        assert_eq!(
+            tensorrt_builder_resource_names("10.9.0", (12, 0)),
+            [
+                "libnvinfer_builder_resource.so.10.9.0",
+                "libnvinfer_builder_resource_sm120.so.10.9.0"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_library_not_on_the_path_is_not_loaded() {
+        // SAFETY: no such library exists; nothing is loaded.
+        let e = unsafe { load_kept("libobc-no-such-library.so.0") }.unwrap_err();
+        assert!(e.contains("libobc-no-such-library.so.0"), "{e}");
+    }
+
+    #[test]
+    fn the_builder_resources_on_the_path_are_found_by_their_files() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        for (dir, name) in [
+            (&a, "libnvinfer_builder_resource_sm120.so.11.4.0"),
+            (&a, "libnvinfer_builder_resource_ptx.so.11.4.0"),
+            (&a, "libnvinfer_builder_resource_sm90.so.10.9.0"),
+            (&a, "libnvinfer.so.11.4.0"),
+            (&b, "libnvinfer_builder_resource_sm120.so.11.4.0"),
+            (&b, "libnvinfer_builder_resource_sm86.so.11.4.0"),
+        ] {
+            std::fs::write(dir.path().join(name), b"").unwrap();
+        }
+        let dirs = [
+            a.path().to_path_buf(),
+            b.path().join("missing"),
+            b.path().to_path_buf(),
+        ];
+        assert_eq!(
+            builder_resources_reachable("11.4.0", &dirs),
+            [
+                "libnvinfer_builder_resource_ptx.so.11.4.0",
+                "libnvinfer_builder_resource_sm120.so.11.4.0",
+                "libnvinfer_builder_resource_sm86.so.11.4.0",
+            ]
+        );
+        assert!(builder_resources_reachable("11.5.0", &dirs).is_empty());
     }
 
     #[test]

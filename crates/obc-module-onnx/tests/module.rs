@@ -84,7 +84,24 @@ fn the_settings_are_the_model_and_the_engine_of_the_cut_out() {
     match &engine.kind {
         SettingType::Enum { options, default } => {
             assert_eq!(default, "auto");
-            assert_eq!(options.len(), 7);
+            // The values are the settings' contract; the labels say what
+            // runs the model, in a user's words.
+            let options: Vec<(&str, &str)> = options
+                .iter()
+                .map(|(v, l)| (v.as_str(), l.as_str()))
+                .collect();
+            assert_eq!(
+                options,
+                [
+                    ("auto", "Automatic"),
+                    ("tensorrt", "NVIDIA GPU, TensorRT (fastest)"),
+                    ("cuda", "NVIDIA GPU, CUDA"),
+                    ("openvino-npu", "Intel NPU (battery saver)"),
+                    ("openvino-gpu", "Intel GPU (OpenVINO)"),
+                    ("openvino-cpu", "CPU, OpenVINO"),
+                    ("cpu", "CPU"),
+                ]
+            );
         }
         other => panic!("{other:?}"),
     }

@@ -94,8 +94,7 @@ impl Engine {
         Engine::ALL.into_iter().find(|e| e.as_str() == s)
     }
 
-    /// The option's label in the settings, and the engine's name in
-    /// reasons and logs.
+    /// The engine's name in reasons and logs.
     pub fn label(self) -> &'static str {
         match self {
             Engine::Auto => "Automatic",
@@ -104,6 +103,20 @@ impl Engine {
             Engine::OpenVinoNpu => "OpenVINO NPU",
             Engine::OpenVinoGpu => "OpenVINO GPU",
             Engine::OpenVinoCpu => "OpenVINO on the CPU",
+            Engine::Cpu => "CPU",
+        }
+    }
+
+    /// The option's label in the settings: what runs it, in a user's
+    /// words, rather than the provider's name.
+    pub fn option_label(self) -> &'static str {
+        match self {
+            Engine::Auto => "Automatic",
+            Engine::TensorRt => "NVIDIA GPU, TensorRT (fastest)",
+            Engine::Cuda => "NVIDIA GPU, CUDA",
+            Engine::OpenVinoNpu => "Intel NPU (battery saver)",
+            Engine::OpenVinoGpu => "Intel GPU (OpenVINO)",
+            Engine::OpenVinoCpu => "CPU, OpenVINO",
             Engine::Cpu => "CPU",
         }
     }
@@ -270,6 +283,7 @@ pub fn start(req: &Request<'_>, wanted: Engine) -> Result<(Started, Reasons), St
         wanted,
         req.cuda,
         req.model.id,
+        |engine| ruled_out(req, engine),
         || req.switch && tensorrt_would_build(req),
         |engine| try_engine(req, engine),
     )?;
@@ -277,8 +291,10 @@ pub fn start(req: &Request<'_>, wanted: Engine) -> Result<(Started, Reasons), St
     Ok((started, reasons))
 }
 
-/// [`start`]'s choice of engine, with the attempt itself (`try_one`) and
-/// the question whether a TensorRT start would build its engine
+/// [`start`]'s choice of engine, with the attempt itself (`try_one`), the
+/// reason an engine is ruled out without being tried (`ruled_out`, asked
+/// only of an engine CUDA being off does not rule out), and the question
+/// whether a TensorRT start would build its engine
 /// (`trt_would_build_on_switch`, asked only when TensorRT is to be tried)
 /// passed in, so that the order and the rules are tested without a runtime.
 /// Returns what `try_one` returned for the engine that started, with the
@@ -287,6 +303,7 @@ fn first_that_starts<T>(
     wanted: Engine,
     cuda: bool,
     model_id: &str,
+    mut ruled_out: impl FnMut(Engine) -> Option<String>,
     mut trt_would_build_on_switch: impl FnMut() -> bool,
     mut try_one: impl FnMut(Engine) -> Result<T, String>,
 ) -> Result<(T, Reasons), String> {
@@ -300,6 +317,14 @@ fn first_that_starts<T>(
                 engine.label()
             );
             reasons.push((engine, REASON_CUDA_OFF.to_string()));
+            continue;
+        }
+        // Not tried at all: registering a provider whose library or
+        // device is known to be missing fails with a rawer reason, and
+        // TensorRT without its libraries crashes the process.
+        if let Some(reason) = ruled_out(engine) {
+            log::info!("ONNX cut-out: {} unavailable: {reason}", engine.label());
+            reasons.push((engine, reason));
             continue;
         }
         if engine == Engine::TensorRt && trt_would_build_on_switch() {
@@ -360,6 +385,12 @@ fn log_started(req: &Request<'_>, s: &Started) {
 
 /// The reason an engine of a provider the runtime lacks cannot run.
 pub const REASON_NOT_IN_BUILD: &str = "not in this ONNX Runtime build";
+
+/// The reason of [`static_reasons`] when `/dev/nvidiactl` is missing. Only
+/// logged, never a refusal ([`ruled_out_by`]): the NVIDIA device nodes may
+/// be created by the first CUDA call (`nvidia-modprobe`).
+pub const REASON_NO_NVIDIA_DEVICE: &str = "CUDA not available: no NVIDIA device (/dev/nvidiactl)";
+
 /// Why an engine that uses CUDA cannot run when the host turned CUDA off.
 pub const REASON_CUDA_OFF: &str = "CUDA is off: the video pipeline runs in system memory";
 /// Why `auto` skips TensorRT in a switch whose engine is not cached: the
@@ -368,15 +399,12 @@ pub const REASON_TRT_NOT_BUILT: &str =
     "TensorRT engine not built yet; it builds at the next camera start";
 
 /// Whether starting TensorRT for `req` would build its engine (none is
-/// cached for this model, runtime, TensorRT and GPU), when TensorRT can
-/// be tried at all.
+/// cached for this model, runtime, TensorRT and GPU). Asked only of a
+/// TensorRT that [`ruled_out`] does not rule out; a build without the
+/// provider builds nothing.
 fn tensorrt_would_build(req: &Request<'_>) -> bool {
     let name = Engine::TensorRt.provider().expect("a concrete engine");
-    if !req.runtime.has_provider(name)
-        || static_reasons(&req.runtime.library, req.cuda)
-            .iter()
-            .any(|(e, _)| *e == Engine::TensorRt)
-    {
+    if !req.runtime.has_provider(name) {
         return false;
     }
     match tensorrt_cache(req) {
@@ -396,6 +424,139 @@ fn tensorrt_cache(req: &Request<'_>) -> Option<PathBuf> {
         device: Some(crate::cuda::device_identity()?),
     };
     req.caches.tensorrt_dir(req.model, &key, req.input)
+}
+
+/// Why `engine` cannot start for `req`, known without trying it: a reason
+/// of [`static_reasons`] that refuses ([`ruled_out_by`]), or for TensorRT,
+/// that its libraries cannot be loaded ([`tensorrt_libraries`]).
+fn ruled_out(req: &Request<'_>, engine: Engine) -> Option<String> {
+    let library = &req.runtime.library;
+    ruled_out_by(
+        engine,
+        static_reasons(library, req.cuda),
+        || {
+            req.runtime
+                .has_provider(engine.provider().expect("a concrete engine"))
+        },
+        || {
+            tensorrt_libraries(
+                || {
+                    let dir = library.parent().unwrap_or(Path::new("/"));
+                    crate::runtime::tensorrt_names_linked(
+                        &dir.join("libonnxruntime_providers_tensorrt.so"),
+                    )
+                },
+                crate::runtime::tensorrt_version(library).as_deref(),
+                || crate::cuda::device_identity().map(|(_, cc)| cc),
+                |version| {
+                    crate::runtime::builder_resources_reachable(
+                        version,
+                        &crate::runtime::loader_dirs(),
+                    )
+                },
+                // SAFETY: only TensorRT's builder resource libraries are
+                // opened here ([`crate::runtime::tensorrt_builder_resource_names`]):
+                // they hold data, their initialisers have no preconditions,
+                // and `libnvinfer` would load them for the process anyway.
+                |name| unsafe { crate::runtime::load_kept(name) },
+            )
+        },
+    )
+}
+
+/// [`ruled_out`]'s decision, with what it reads passed in so that it is
+/// tested without a runtime or a GPU: `statics` are [`static_reasons`],
+/// `has_provider` whether the runtime has `engine`'s provider, and
+/// `tensorrt` the TensorRT library check ([`tensorrt_libraries`]).
+///
+/// A reason of `statics` refuses first, except
+/// [`REASON_NO_NVIDIA_DEVICE`], which is only logged (by the probe): the
+/// device nodes may be created by the first CUDA call. Then, for TensorRT
+/// only and only when the runtime has its provider, the library check.
+fn ruled_out_by(
+    engine: Engine,
+    statics: Reasons,
+    has_provider: impl FnOnce() -> bool,
+    tensorrt: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if let Some((_, r)) = statics
+        .into_iter()
+        .find(|(e, r)| *e == engine && r != REASON_NO_NVIDIA_DEVICE)
+    {
+        return Some(r);
+    }
+    if engine != Engine::TensorRt || !has_provider() {
+        return None;
+    }
+    tensorrt()
+}
+
+/// The reason TensorRT cannot start because its libraries cannot be
+/// loaded, if they cannot: `version` is TensorRT's (none when no
+/// `libnvinfer` of the names `linked` gives loads from the module; asked
+/// only then, for the reason), `device` gives the GPU's compute
+/// capability, `reachable` the builder resource libraries of a version in
+/// the loader's search directories (asked only when the load fails), and
+/// `load` opens a library by bare name and keeps it.
+///
+/// TensorRT's `libnvinfer` opens its builder resource library with
+/// `dlopen` by bare name when ONNX Runtime creates a builder, for a cached
+/// engine too. The provider library's `RUNPATH` (where TensorRT may be
+/// found without `LD_LIBRARY_PATH`) does not apply to a `dlopen` made by
+/// `libnvinfer`; without the library, `createInferBuilder` fails and ONNX
+/// Runtime's TensorRT provider crashes the process (`SIGSEGV`). So the
+/// library is opened here first, by the same name and from a library
+/// without a `RUNPATH` (the module), so through the same search; once
+/// loaded it is kept, and `libnvinfer`'s `dlopen` matches it.
+///
+/// When the load fails, the reason depends on what the loader's
+/// directories hold (not on the loader's message, which is translated):
+/// the GPU's library there, the loader's message is quoted; other builder
+/// resource libraries of the version but not this GPU's, TensorRT has none
+/// for it (TensorRT 11.4 ships some architectures only) and is not started,
+/// as what it would do there is not known; none, they are off the path.
+fn tensorrt_libraries(
+    linked: impl FnOnce() -> Vec<&'static str>,
+    version: Option<&str>,
+    device: impl FnOnce() -> Option<(i32, i32)>,
+    reachable: impl FnOnce(&str) -> Vec<String>,
+    mut load: impl FnMut(&str) -> Result<(), String>,
+) -> Option<String> {
+    let not_found = |what: &str| {
+        format!(
+            "TensorRT not available: TensorRT's libraries are not on the daemon's library path ({what} not found; add TensorRT's lib directory to LD_LIBRARY_PATH)"
+        )
+    };
+    let Some(version) = version else {
+        return Some(not_found(&linked().join(" or ")));
+    };
+    let Some(cc) = device() else {
+        return Some(
+            "TensorRT not available: no NVIDIA GPU found through the CUDA driver".to_string(),
+        );
+    };
+    let names = crate::runtime::tensorrt_builder_resource_names(version, cc);
+    let mut errors = Vec::new();
+    for name in &names {
+        match load(name) {
+            Ok(()) => return None,
+            Err(e) => errors.push(e),
+        }
+    }
+    let found = reachable(version);
+    if let Some(name) = names.iter().find(|n| found.contains(n)) {
+        Some(format!(
+            "TensorRT not available: {name} cannot be loaded: {}",
+            one_line(&errors.join("; "))
+        ))
+    } else if found.is_empty() {
+        Some(not_found(&names[0]))
+    } else {
+        Some(format!(
+            "TensorRT not available: TensorRT {version} has no builder library for this GPU (sm{}{})",
+            cc.0, cc.1
+        ))
+    }
 }
 
 /// What a filesystem and environment look can say of the engines without
@@ -431,7 +592,7 @@ pub fn static_reasons(library: &Path, cuda: bool) -> Reasons {
         } else if engine.uses_cuda() && cuda_hidden {
             "CUDA not available: CUDA_VISIBLE_DEVICES hides every GPU".to_string()
         } else if engine.uses_cuda() && no_nvidia {
-            "CUDA not available: no NVIDIA device (/dev/nvidiactl)".to_string()
+            REASON_NO_NVIDIA_DEVICE.to_string()
         } else {
             continue;
         };
@@ -636,10 +797,9 @@ fn try_engine(req: &Request<'_>, engine: Engine) -> Result<Started, String> {
         .then(|| tensorrt_cache(req))
         .flatten()
         .map(|d| count_engines(&d));
-    let ruled_out = static_reasons(&req.runtime.library, req.cuda)
-        .iter()
-        .any(|(e, _)| *e == engine);
-    if engine == Engine::TensorRt && cache_before == Some(0) && !ruled_out {
+    // Only an engine not ruled out is tried ([`first_that_starts`]): this
+    // start does build.
+    if engine == Engine::TensorRt && cache_before == Some(0) {
         log::info!(
             "ONNX cut-out: preparing the TensorRT engine for {} (first use: this takes a while)…",
             req.model.id
@@ -832,7 +992,14 @@ mod tests {
         for e in Engine::ALL {
             assert_eq!(Engine::parse(e.as_str()), Some(e));
             assert!(e.label().len() <= 48);
+            assert!(e.option_label().len() <= 48);
         }
+        // The names in logs and reasons are not the settings' labels.
+        assert_eq!(Engine::TensorRt.label(), "NVIDIA TensorRT");
+        assert_eq!(
+            Engine::TensorRt.option_label(),
+            "NVIDIA GPU, TensorRT (fastest)"
+        );
         assert_eq!(Engine::parse("vulkan"), None);
         assert_eq!(
             Engine::Auto.candidates(),
@@ -932,11 +1099,27 @@ mod tests {
         cuda: bool,
         starts: Option<Engine>,
     ) -> (Vec<Engine>, Result<(Engine, Reasons), String>) {
+        choose_ruling_out(wanted, cuda, starts, &[])
+    }
+
+    /// [`choose`], with the engines of `out` ruled out with their reasons.
+    fn choose_ruling_out(
+        wanted: Engine,
+        cuda: bool,
+        starts: Option<Engine>,
+        out: &[(Engine, &str)],
+    ) -> (Vec<Engine>, Result<(Engine, Reasons), String>) {
         let mut tried = Vec::new();
         let r = first_that_starts(
             wanted,
             cuda,
             "model",
+            |e| {
+                assert!(cuda || !e.uses_cuda(), "{e:?} was looked at with CUDA off");
+                out.iter()
+                    .find(|(o, _)| *o == e)
+                    .map(|(_, r)| r.to_string())
+            },
             || {
                 assert!(cuda, "the TensorRT cache was looked at with CUDA off");
                 false
@@ -1000,6 +1183,286 @@ mod tests {
         assert!(
             r.unwrap_err()
                 .starts_with("No engine could run the model (")
+        );
+    }
+
+    #[test]
+    fn an_engine_ruled_out_is_not_tried_and_its_reason_is_the_reason() {
+        const NOT_IN_BUILD: &str = "not in this ONNX Runtime build (no libonnxruntime_providers_openvino.so beside /x/libonnxruntime.so)";
+        let ov = [
+            (Engine::OpenVinoNpu, NOT_IN_BUILD),
+            (Engine::OpenVinoGpu, NOT_IN_BUILD),
+            (Engine::OpenVinoCpu, NOT_IN_BUILD),
+        ];
+        // `auto` skips them with the reason and goes on.
+        let (tried, r) = choose_ruling_out(Engine::Auto, false, Some(Engine::Cpu), &ov);
+        assert_eq!(tried, [Engine::Cpu]);
+        let (_, reasons) = r.unwrap();
+        assert_eq!(reasons.len(), 5);
+        assert!(reasons[2..].iter().all(|(_, r)| r == NOT_IN_BUILD));
+        // Chosen explicitly: nothing is tried, the error is the reason.
+        let (tried, r) = choose_ruling_out(Engine::OpenVinoNpu, true, None, &ov);
+        assert!(tried.is_empty(), "{tried:?}");
+        assert_eq!(
+            r.unwrap_err(),
+            format!("OpenVINO NPU was chosen and cannot run: {NOT_IN_BUILD}")
+        );
+    }
+
+    #[test]
+    fn tensorrt_without_its_libraries_falls_to_cuda_and_builds_nothing() {
+        const WHY: &str = "TensorRT not available: TensorRT's libraries are not on the daemon's library path (x not found)";
+        let mut asked_build = false;
+        let mut tried = Vec::new();
+        let (engine, reasons) = first_that_starts(
+            Engine::Auto,
+            true,
+            "model",
+            |e| (e == Engine::TensorRt).then(|| WHY.to_string()),
+            || {
+                asked_build = true;
+                true
+            },
+            |e| {
+                tried.push(e);
+                if e == Engine::Cuda {
+                    Ok(e)
+                } else {
+                    Err("no".to_string())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(engine, Engine::Cuda);
+        assert_eq!(tried, [Engine::Cuda]);
+        assert_eq!(reasons, [(Engine::TensorRt, WHY.to_string())]);
+        assert!(
+            !asked_build,
+            "a TensorRT ruled out was asked whether it builds"
+        );
+        // Explicit: the load fails with the reason, and nothing is built.
+        let (tried, r) =
+            choose_ruling_out(Engine::TensorRt, true, None, &[(Engine::TensorRt, WHY)]);
+        assert!(tried.is_empty());
+        assert_eq!(
+            r.unwrap_err(),
+            format!("NVIDIA TensorRT was chosen and cannot run: {WHY}")
+        );
+    }
+
+    /// [`tensorrt_libraries`] with TensorRT `version` on a GPU of compute
+    /// capability `cc`, where the libraries `loads` load and `files` are
+    /// the builder resource libraries in the loader's directories; also the
+    /// names asked for.
+    fn trt_libs(
+        version: Option<&str>,
+        cc: (i32, i32),
+        loads: &[&str],
+        files: &[&str],
+    ) -> (Option<String>, Vec<String>) {
+        let mut asked = Vec::new();
+        let r = tensorrt_libraries(
+            || vec!["libnvinfer.so.11"],
+            version,
+            || Some(cc),
+            |v| {
+                assert_eq!(Some(v), version);
+                files.iter().map(|f| f.to_string()).collect()
+            },
+            |name| {
+                asked.push(name.to_string());
+                if loads.contains(&name) {
+                    Ok(())
+                } else {
+                    // A translated message: never read for the decision.
+                    Err(format!(
+                        "{name}: kann die Shared-Object-Datei nicht öffnen: Datei oder Verzeichnis nicht gefunden"
+                    ))
+                }
+            },
+        );
+        (r, asked)
+    }
+
+    const SM120: &str = "libnvinfer_builder_resource_sm120.so.11.4.0";
+    /// TensorRT 11.4's builder resource libraries, without sm120's.
+    const OTHERS: [&str; 3] = [
+        "libnvinfer_builder_resource_ptx.so.11.4.0",
+        "libnvinfer_builder_resource_sm86.so.11.4.0",
+        "libnvinfer_builder_resource_sm90.so.11.4.0",
+    ];
+
+    #[test]
+    fn tensorrt_starts_only_when_its_builder_resource_loads_by_name() {
+        // On the path: TensorRT may start, and the library was loaded.
+        let (r, asked) = trt_libs(Some("11.4.0"), (12, 0), &[SM120], &[SM120]);
+        assert_eq!(r, None);
+        assert_eq!(asked, [SM120]);
+        // TensorRT 10's single library.
+        let (r, _) = trt_libs(
+            Some("10.9.0"),
+            (12, 0),
+            &["libnvinfer_builder_resource.so.10.9.0"],
+            &[],
+        );
+        assert_eq!(r, None);
+        // No `libnvinfer` from the module: nothing is loaded, the GPU is
+        // not asked for, and TensorRT does not start.
+        let mut asked = Vec::new();
+        let r = tensorrt_libraries(
+            || vec!["libnvinfer.so.11"],
+            None,
+            || panic!("the GPU was asked for without a TensorRT version"),
+            |_| panic!("the path was looked at without a TensorRT version"),
+            |name| {
+                asked.push(name.to_string());
+                Ok(())
+            },
+        );
+        assert!(asked.is_empty());
+        assert_eq!(
+            r.unwrap(),
+            "TensorRT not available: TensorRT's libraries are not on the daemon's library path (libnvinfer.so.11 not found; add TensorRT's lib directory to LD_LIBRARY_PATH)"
+        );
+        // No GPU to name the library by.
+        let r = tensorrt_libraries(
+            || vec!["libnvinfer.so.11"],
+            Some("11.4.0"),
+            || None,
+            |_| Vec::new(),
+            |_| Ok(()),
+        );
+        assert!(
+            r.unwrap()
+                .starts_with("TensorRT not available: no NVIDIA GPU")
+        );
+    }
+
+    #[test]
+    fn the_reason_tensorrt_does_not_load_comes_from_the_files_on_the_path() {
+        // None on the path (TensorRT found through the provider's RUNPATH
+        // only): the reason names the library and the fix.
+        let (r, _) = trt_libs(Some("11.4.0"), (12, 0), &[], &[]);
+        assert_eq!(
+            r.unwrap(),
+            "TensorRT not available: TensorRT's libraries are not on the daemon's library path (libnvinfer_builder_resource_sm120.so.11.4.0 not found; add TensorRT's lib directory to LD_LIBRARY_PATH)"
+        );
+        // TensorRT's libraries on the path, but none for this GPU (an
+        // architecture TensorRT 11.4 does not ship): still refused, as
+        // what TensorRT does there is not known, with the true reason.
+        let (r, asked) = trt_libs(Some("11.4.0"), (12, 1), &[], &OTHERS);
+        assert_eq!(asked, ["libnvinfer_builder_resource_sm121.so.11.4.0"]);
+        assert_eq!(
+            r.unwrap(),
+            "TensorRT not available: TensorRT 11.4.0 has no builder library for this GPU (sm121)"
+        );
+        let (r, _) = trt_libs(Some("11.4.0"), (10, 3), &[], &OTHERS);
+        assert!(r.unwrap().ends_with("for this GPU (sm103)"));
+        // The GPU's library on the path and not loading: the loader's
+        // message is quoted, whatever its language.
+        let mut files = OTHERS.to_vec();
+        files.push(SM120);
+        let (r, _) = trt_libs(Some("11.4.0"), (12, 0), &[], &files);
+        assert_eq!(
+            r.unwrap(),
+            "TensorRT not available: libnvinfer_builder_resource_sm120.so.11.4.0 cannot be loaded: libnvinfer_builder_resource_sm120.so.11.4.0: kann die Shared-Object-Datei nicht öffnen: Datei oder Verzeichnis nicht gefunden"
+        );
+        // TensorRT 10: the library on the path is the one named.
+        let (r, _) = trt_libs(
+            Some("10.9.0"),
+            (12, 0),
+            &[],
+            &["libnvinfer_builder_resource_sm120.so.10.9.0"],
+        );
+        assert!(r.unwrap().starts_with(
+            "TensorRT not available: libnvinfer_builder_resource_sm120.so.10.9.0 cannot be loaded: "
+        ));
+    }
+
+    /// [`ruled_out_by`] for `engine` with `statics`, the provider in the
+    /// build or not, and the TensorRT check giving `trt`; also whether the
+    /// provider and the TensorRT check were asked.
+    fn rule(
+        engine: Engine,
+        statics: &[(Engine, &str)],
+        provider: bool,
+        trt: Option<&str>,
+    ) -> (Option<String>, bool, bool) {
+        let (mut asked_provider, mut asked_trt) = (false, false);
+        let r = ruled_out_by(
+            engine,
+            statics.iter().map(|(e, r)| (*e, r.to_string())).collect(),
+            || {
+                asked_provider = true;
+                provider
+            },
+            || {
+                asked_trt = true;
+                trt.map(str::to_string)
+            },
+        );
+        (r, asked_provider, asked_trt)
+    }
+
+    #[test]
+    fn a_static_reason_rules_out_before_the_tensorrt_libraries_are_looked_at() {
+        const HIDDEN: &str = "CUDA not available: CUDA_VISIBLE_DEVICES hides every GPU";
+        const LIBS: &str = "TensorRT not available: libraries";
+        let statics = [(Engine::TensorRt, HIDDEN), (Engine::Cuda, HIDDEN)];
+        let (r, _, asked_trt) = rule(Engine::TensorRt, &statics, true, Some(LIBS));
+        assert_eq!(r.as_deref(), Some(HIDDEN));
+        assert!(!asked_trt, "the libraries were looked at past a refusal");
+        let (r, _, _) = rule(Engine::Cuda, &statics, true, Some(LIBS));
+        assert_eq!(r.as_deref(), Some(HIDDEN));
+        // Not in the build: refused too.
+        let not_built = format!("{REASON_NOT_IN_BUILD} (no x)");
+        let (r, _, asked_trt) = rule(
+            Engine::TensorRt,
+            &[(Engine::TensorRt, &not_built)],
+            false,
+            Some(LIBS),
+        );
+        assert_eq!(r, Some(not_built));
+        assert!(!asked_trt);
+        // No static reason: TensorRT's library check is the reason.
+        let (r, asked_provider, asked_trt) = rule(Engine::TensorRt, &[], true, Some(LIBS));
+        assert_eq!(r.as_deref(), Some(LIBS));
+        assert!(asked_provider && asked_trt);
+        let (r, _, _) = rule(Engine::TensorRt, &[], true, None);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn the_tensorrt_libraries_are_looked_at_only_for_a_tensorrt_in_the_build() {
+        let (r, asked_provider, asked_trt) = rule(Engine::TensorRt, &[], false, Some("x"));
+        assert_eq!(r, None);
+        assert!(asked_provider && !asked_trt);
+        for e in [Engine::Cuda, Engine::OpenVinoGpu, Engine::Cpu] {
+            let (r, _, asked_trt) = rule(e, &[], true, Some("x"));
+            assert_eq!(r, None, "{e:?}");
+            assert!(!asked_trt, "{e:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_nvidia_device_node_is_logged_and_does_not_refuse() {
+        let statics = [
+            (Engine::TensorRt, REASON_NO_NVIDIA_DEVICE),
+            (Engine::Cuda, REASON_NO_NVIDIA_DEVICE),
+        ];
+        // CUDA is tried: the first CUDA call may create the node.
+        let (r, _, _) = rule(Engine::Cuda, &statics, true, None);
+        assert_eq!(r, None);
+        // TensorRT goes on to its library check.
+        let (r, _, asked_trt) = rule(Engine::TensorRt, &statics, true, None);
+        assert_eq!(r, None);
+        assert!(asked_trt);
+        let (r, _, _) = rule(Engine::TensorRt, &statics, true, Some("libs"));
+        assert_eq!(r.as_deref(), Some("libs"));
+        // static_reasons gives that reason by the constant.
+        assert_eq!(
+            REASON_NO_NVIDIA_DEVICE,
+            "CUDA not available: no NVIDIA device (/dev/nvidiactl)"
         );
     }
 

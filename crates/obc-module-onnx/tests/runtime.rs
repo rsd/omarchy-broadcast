@@ -18,7 +18,10 @@
 //! * a build with CUDA and `CUDA_VISIBLE_DEVICES=""`: the CUDA and TensorRT
 //!   engines are reported unavailable with a reason, `auto` falls to the
 //!   CPU and the blur still works, and an explicit `cuda` fails the load;
-//! * a build with CUDA and a GPU: `auto` picks TensorRT or CUDA.
+//! * a build with CUDA and a GPU: `auto` picks TensorRT or CUDA: CUDA when
+//!   TensorRT cannot start (TensorRT's libraries off the library path, as
+//!   when only the provider's `RUNPATH` finds them), with TensorRT's reason
+//!   logged.
 //!
 //! One test: the module's log callback is process-wide, so the steps that
 //! read it run in order.
@@ -179,14 +182,21 @@ fn with_onnx_runtime_and_the_models() {
             engine == "NVIDIA TensorRT" || engine == "NVIDIA CUDA",
             "auto with a GPU: {engine}"
         );
+        if engine == "NVIDIA CUDA" {
+            let why = lines
+                .iter()
+                .find(|l| l.contains("NVIDIA TensorRT unavailable: "))
+                .unwrap_or_else(|| panic!("auto on CUDA gives no TensorRT reason: {lines:#?}"));
+            eprintln!("{why}");
+        }
     } else {
         assert_eq!(engine, "CPU", "{lines:#?}");
         if eng.cuda_in_build {
-            // The hidden GPU: both NVIDIA engines tried and refused.
+            // The hidden GPU: both NVIDIA engines refused, with a reason.
             assert!(
                 lines
                     .iter()
-                    .any(|l| l.contains("NVIDIA TensorRT unavailable: TensorRT not available")),
+                    .any(|l| l.contains("NVIDIA TensorRT unavailable: ")),
                 "{lines:#?}"
             );
             assert!(

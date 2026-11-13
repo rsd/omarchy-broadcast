@@ -156,7 +156,7 @@ pub fn settings() -> SettingsDescription {
                 Setting::enumeration(
                     ENGINE_SETTING,
                     "Runs on",
-                    Engine::ALL.map(|e| (e.as_str(), e.label())),
+                    Engine::ALL.map(|e| (e.as_str(), e.option_label())),
                     Engine::Auto.as_str(),
                 ),
                 ENGINE_KEY,
