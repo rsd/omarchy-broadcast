@@ -396,6 +396,15 @@ pub trait OmarchyBroadcast {
     #[zbus(property)]
     fn media_serial(&self) -> zbus::Result<u32>;
 
+    /// The named numeric values the running stages report about the last
+    /// frame ([`crate::StageValue`]: auto-frame's `zoom`, for one), `a(ssd)`;
+    /// empty when the camera is idle or no stage reports. Its change is
+    /// announced when the set changes or a value moves by at least
+    /// [`crate::STAGE_VALUE_STEP`], at most every
+    /// [`crate::STAGE_VALUES_PERIOD_MS`] milliseconds. Revision 16.
+    #[zbus(property)]
+    fn stage_values(&self) -> zbus::Result<Vec<crate::StageValue>>;
+
     /// Revision of the interface the daemon implements.
     #[zbus(property)]
     fn interface_revision(&self) -> zbus::Result<u32>;

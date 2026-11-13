@@ -13,7 +13,7 @@ use obc_module_abi::{
     OBC_ERR_PANIC, OBC_MODULE_ABI_MAJOR, OBC_MODULE_ABI_VERSION, OBC_OK, obc_audio_buffer,
     obc_audio_load_report, obc_audio_request, obc_chain_request, obc_frame, obc_host, obc_instance,
     obc_load_report, obc_module, obc_module_abi_major, obc_module_vtable, obc_param, obc_status,
-    obc_timing,
+    obc_status_value, obc_timing,
 };
 
 use crate::audio::{AudioLoaded, buffers};
@@ -112,6 +112,9 @@ struct InstanceBox<I> {
     dropped: CString,
     timing_steps: Vec<CString>,
     timings: Vec<obc_timing>,
+    /// The strings and entries of the last `instance_status_values`.
+    value_names: Vec<(CString, CString)>,
+    values: Vec<obc_status_value>,
 }
 
 impl<I: Instance> InstanceBox<I> {
@@ -307,6 +310,8 @@ unsafe extern "C" fn module_instance_create<M: Module>(
                     dropped: CString::default(),
                     timing_steps: Vec::new(),
                     timings: Vec::new(),
+                    value_names: Vec::new(),
+                    values: Vec::new(),
                 });
                 // SAFETY: as above.
                 unsafe { *out = Box::into_raw(boxed).cast::<obc_instance>() };
@@ -622,6 +627,58 @@ unsafe extern "C" fn instance_timings<I: Instance>(
     })
 }
 
+unsafe extern "C" fn instance_status_values<I: Instance>(
+    instance: *mut obc_instance,
+    out: *mut *const obc_status_value,
+    n: *mut usize,
+) -> obc_status {
+    boundary(|| {
+        // SAFETY: by the ABI contract.
+        let Some(b) = (unsafe { instance_mut::<I>(instance) }) else {
+            return ErrorKind::Invalid.status();
+        };
+        if out.is_null() || n.is_null() {
+            return b.finish(Err(null_out("an output pointer of status values")));
+        }
+        // SAFETY: non-null and writable by the ABI contract.
+        unsafe {
+            *out = ptr::null();
+            *n = 0;
+        }
+        let instance = &b.instance;
+        match guard(|| Ok(instance.status_values())) {
+            Ok(values) => {
+                b.value_names = values
+                    .iter()
+                    .map(|v| (c_string(&v.stage), c_string(&v.name)))
+                    .collect();
+                b.values = b
+                    .value_names
+                    .iter()
+                    .zip(&values)
+                    .map(|((stage, name), v)| obc_status_value {
+                        stage: stage.as_ptr(),
+                        name: name.as_ptr(),
+                        value: v.value,
+                        reserved0: 0,
+                        reserved1: 0,
+                    })
+                    .collect();
+                if !b.values.is_empty() {
+                    // SAFETY: as above; the entries live until the next
+                    // call.
+                    unsafe {
+                        *out = b.values.as_ptr();
+                        *n = b.values.len();
+                    }
+                }
+                OBC_OK
+            }
+            Err(e) => b.finish(Err(e)),
+        }
+    })
+}
+
 unsafe extern "C" fn instance_park<I: Instance>(instance: *mut obc_instance) -> obc_status {
     boundary(|| {
         // SAFETY: by the ABI contract.
@@ -713,6 +770,7 @@ pub const fn vtable<M: Module>() -> obc_module_vtable {
         check: Some(module_check::<M>),
         audio_instance_load: None,
         audio_instance_process: None,
+        instance_status_values: Some(instance_status_values::<M::Instance>),
     }
 }
 

@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fake_backend::{
-    FAKE_BLUR_Y, FAKE_DENOISE_MS, FAKE_DENOISE_UV, FAKE_DENOISE_Y, FAKE_REPLACE_Y, FakeConfig,
-    FakeFactory, FakeLog,
+    FAKE_BLUR_Y, FAKE_COVERAGE, FAKE_DENOISE_LEVEL, FAKE_DENOISE_MS, FAKE_DENOISE_UV,
+    FAKE_DENOISE_Y, FAKE_REPLACE_Y, FakeConfig, FakeFactory, FakeLog,
 };
 use gst::glib;
 use gst::prelude::*;
@@ -782,6 +782,17 @@ fn host_a_toggle_mid_stream_keeps_the_input_until_ready_and_switches_never_show_
         assert_eq!(rig.frame(), Seen::FakeBlur);
     }
     assert_eq!(get(&fake.log.last_strength_milli), 700);
+    // Only the effect ran: its values are reported, not those of a stage
+    // outside the loaded chain.
+    assert_eq!(
+        rig.effect.stats().stage_values,
+        [obc_backend::StageValue {
+            stage: StageId::BACKGROUND,
+            name: "coverage".into(),
+            value: FAKE_COVERAGE,
+        }],
+        "the values of the effect's chain"
+    );
 
     // blur -> replace: blur until replace is ready, never black or input.
     rig.effect
@@ -1383,6 +1394,15 @@ fn host_none_with_denoise_passes_through_until_loaded_then_denoises() {
         Some(f64::from(FAKE_DENOISE_MS)),
         "the stage times of host frames"
     );
+    assert_eq!(
+        s.stage_values,
+        [obc_backend::StageValue {
+            stage: StageId::DENOISE,
+            name: "level".into(),
+            value: FAKE_DENOISE_LEVEL,
+        }],
+        "the status values of the last frame, none of a stage not loaded"
+    );
     assert_eq!(get(&fake.log.resets), 0);
     assert_eq!(rig.frame_with(gst_obc::NEW_SOURCE_FLAG), Seen::FakeDenoise);
     assert_eq!(get(&fake.log.resets), 1);
@@ -1391,6 +1411,10 @@ fn host_none_with_denoise_passes_through_until_loaded_then_denoises() {
     // Off again: the input at once; the worker unloads.
     rig.effect.apply(&EffectSettings::default()).unwrap();
     assert_eq!(rig.frame(), Seen::Input);
+    assert!(
+        rig.effect.stats().stage_values.is_empty(),
+        "a stage off reports nothing"
+    );
     wait_for("no unload", || get(&fake.log.unloads) == 1);
     assert_no_cuda(&rig, &fake);
     rig.stop();

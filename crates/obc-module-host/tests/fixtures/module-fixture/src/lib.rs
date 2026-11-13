@@ -34,7 +34,28 @@
 //! The process log line has `repeat=<bool>`, whether the frame carried
 //! `OBC_FRAME_FLAG_REPEAT`; the frame is processed either way. With
 //! `abi-1-1` it is exported as one of ABI 1.1, its vtable of the size of
-//! 1.1 (without the audio entries of 1.2).
+//! 1.1 (without the audio entries of 1.2), and with `abi-1-2` as one of
+//! ABI 1.2, its vtable of the size of 1.2 (without the status values of
+//! 1.3).
+//!
+//! While `alpha` is loaded, the status values (ABI 1.3) report
+//! `alpha`/`step`, its step, and `alpha`/`frames`, the frames processed
+//! since the load; none otherwise.
+//!
+//! With `raw-status-values` it is the same module of ABI 1.3, but its
+//! `instance_status_values` ignores the instance and answers call `k`
+//! (counted from 0 since the library was loaded) with shape `k % 6`:
+//!
+//! 0. `OBC_ERR_FAILED`, with one valid entry written out;
+//! 1. `OBC_OK` with a null list and a count of 3;
+//! 2. `OBC_OK` with a list misaligned for `obc_status_value`, of 1;
+//! 3. `OBC_OK` with 65 valid entries (`alpha`/`v<i>`, `i`);
+//! 4. `OBC_OK` with 64 valid entries, as above;
+//! 5. `OBC_OK` with, in order: `alpha`/`zoom` 1.5; `alpha`/`nan` NaN;
+//!    `alpha`/`inf` infinity; `alpha` with an empty name; `alpha` with a
+//!    null name; a null stage; the stage `Not a stage`; `alpha` with a name
+//!    of 40 `ü` (80 bytes); `alpha` with a name of 63 `a` and one `ü`
+//!    (65 bytes), each 2.0.
 //!
 //! With `audio` it is an `audio-filter` module of ABI 1.2 instead, for the
 //! audio worker's tests. Its probe reports the audio stages `mic-denoise`,
@@ -76,8 +97,8 @@
 mod module {
     use obc_module_sdk::{
         Apply, ChainRequest, Error, Frame, FrameKind, Group, Instance, LoadReport, Module, Op,
-        Param, PixelFormat, ProbeReport, Role, Setting, SettingsDescription, Value, log,
-        serde_json,
+        Param, PixelFormat, ProbeReport, Role, Setting, SettingsDescription, StatusValue, Value,
+        log, serde_json,
     };
 
     #[cfg(not(feature = "audio"))]
@@ -229,6 +250,8 @@ mod module {
     pub struct FixtureInstance {
         stages: Vec<String>,
         step: u8,
+        /// Frames processed since the last load (ABI 1.3 status values).
+        frames: u32,
         /// The audio side.
         #[cfg_attr(not(feature = "audio"), allow(dead_code))]
         audio: AudioState,
@@ -297,6 +320,7 @@ mod module {
             }
             let reused = !self.stages.is_empty();
             self.stages = req.stages().iter().map(|s| s.to_string()).collect();
+            self.frames = 0;
             self.step = req
                 .param("alpha", "step")
                 .and_then(|v| v.as_int())
@@ -348,6 +372,7 @@ mod module {
                     }
                 }
             }
+            self.frames += 1;
             Ok(())
         }
 
@@ -360,6 +385,16 @@ mod module {
         fn unload(&mut self) {
             self.stages.clear();
             self.audio = AudioState::default();
+        }
+
+        fn status_values(&self) -> Vec<StatusValue> {
+            if !self.stages.iter().any(|s| s == "alpha") {
+                return Vec::new();
+            }
+            vec![
+                StatusValue::new("alpha", "step", f64::from(self.step)),
+                StatusValue::new("alpha", "frames", f64::from(self.frames)),
+            ]
         }
 
         fn timings(&self) -> Vec<(String, f32)> {
@@ -512,32 +547,161 @@ mod module {
         }
     }
 
-    #[cfg(not(any(feature = "abi-1-0", feature = "abi-1-1", feature = "audio")))]
+    #[cfg(not(any(
+        feature = "abi-1-0",
+        feature = "abi-1-1",
+        feature = "abi-1-2",
+        feature = "raw-status-values",
+        feature = "audio"
+    )))]
     obc_module_sdk::export_module!(Fixture);
+
+    /// The exports of `export_module!`, with `instance_status_values`
+    /// replaced by [`raw_status_values::values`].
+    #[cfg(feature = "raw-status-values")]
+    mod raw_status_values {
+        use std::ffi::{CString, c_char};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use obc_module_sdk::abi::{
+            OBC_ERR_FAILED, OBC_OK, obc_host, obc_instance, obc_module_vtable, obc_status,
+            obc_status_value,
+        };
+
+        /// The calls so far.
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        /// An entry; `stage` and `name` are leaked (the fixture's lists
+        /// are few and small) or null.
+        fn entry(stage: Option<&str>, name: Option<&str>, value: f64) -> obc_status_value {
+            let leak = |s: Option<&str>| -> *const c_char {
+                s.map_or(std::ptr::null(), |s| {
+                    CString::new(s).unwrap().into_raw().cast_const()
+                })
+            };
+            obc_status_value {
+                stage: leak(stage),
+                name: leak(name),
+                value,
+                reserved0: 0,
+                reserved1: 0,
+            }
+        }
+
+        /// `n` valid entries, leaked.
+        fn valid(n: usize) -> &'static [obc_status_value] {
+            let v: Vec<_> = (0..n)
+                .map(|i| entry(Some("alpha"), Some(&format!("v{i}")), i as f64))
+                .collect();
+            Vec::leak(v)
+        }
+
+        /// The shapes described in the crate's documentation.
+        ///
+        /// # Safety
+        ///
+        /// `out` and `n` are writable.
+        unsafe extern "C" fn values(
+            _instance: *mut obc_instance,
+            out: *mut *const obc_status_value,
+            n: *mut usize,
+        ) -> obc_status {
+            let (status, list, count): (obc_status, *const obc_status_value, usize) =
+                match CALLS.fetch_add(1, Ordering::SeqCst) % 6 {
+                    0 => (OBC_ERR_FAILED, valid(1).as_ptr(), 1),
+                    1 => (OBC_OK, std::ptr::null(), 3),
+                    2 => {
+                        let base = valid(2).as_ptr().cast::<u8>();
+                        // SAFETY: within the leaked list of two entries.
+                        (OBC_OK, unsafe { base.add(4) }.cast(), 1)
+                    }
+                    3 => (OBC_OK, valid(65).as_ptr(), 65),
+                    4 => (OBC_OK, valid(64).as_ptr(), 64),
+                    _ => {
+                        let long_a = format!("{}ü", "a".repeat(63));
+                        let long_u = "ü".repeat(40);
+                        let v = vec![
+                            entry(Some("alpha"), Some("zoom"), 1.5),
+                            entry(Some("alpha"), Some("nan"), f64::NAN),
+                            entry(Some("alpha"), Some("inf"), f64::INFINITY),
+                            entry(Some("alpha"), Some(""), 2.0),
+                            entry(Some("alpha"), None, 2.0),
+                            entry(None, Some("nostage"), 2.0),
+                            entry(Some("Not a stage"), Some("bad"), 2.0),
+                            entry(Some("alpha"), Some(&long_u), 2.0),
+                            entry(Some("alpha"), Some(&long_a), 2.0),
+                        ];
+                        let v = Vec::leak(v);
+                        (OBC_OK, v.as_ptr(), v.len())
+                    }
+                };
+            // SAFETY: by the caller's contract.
+            unsafe {
+                *out = list;
+                *n = count;
+            }
+            status
+        }
+
+        /// The SDK's entry point, with the raw `instance_status_values`.
+        ///
+        /// # Safety
+        ///
+        /// As `export_module!`'s: `host` is null or valid until unload.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn obc_module_entry(
+            host: *const obc_host,
+        ) -> *const obc_module_vtable {
+            static VTABLE: obc_module_vtable = {
+                let mut v = obc_module_sdk::ffi::vtable::<super::Fixture>();
+                v.instance_status_values = Some(values);
+                v
+            };
+            // SAFETY: the caller's contract is the one `ffi::entry` needs.
+            unsafe { obc_module_sdk::ffi::entry(host, &VTABLE) }
+        }
+
+        /// The ABI this crate's SDK describes.
+        #[unsafe(no_mangle)]
+        pub extern "C" fn obc_module_abi_version() -> u32 {
+            obc_module_sdk::abi::OBC_MODULE_ABI_VERSION
+        }
+    }
 
     #[cfg(feature = "audio")]
     obc_module_sdk::export_module!(Fixture, audio);
 
-    /// The exports of `export_module!`, claiming ABI 1.0 (or 1.1), with a
-    /// vtable of that version's size: it ends before the audio entries of
-    /// 1.2.
-    #[cfg(any(feature = "abi-1-0", feature = "abi-1-1"))]
+    /// The exports of `export_module!`, claiming ABI 1.0 (or 1.1, or 1.2),
+    /// with a vtable of that version's size: it ends before the audio
+    /// entries of 1.2 (1.0 and 1.1), or before the status values of 1.3
+    /// (1.2).
+    #[cfg(any(feature = "abi-1-0", feature = "abi-1-1", feature = "abi-1-2"))]
     mod abi_1_0 {
         use obc_module_sdk::abi::{obc_host, obc_module_abi_pack, obc_module_vtable};
 
         /// The minor version claimed.
-        const MINOR: u16 = if cfg!(feature = "abi-1-0") { 0 } else { 1 };
+        const MINOR: u16 = if cfg!(feature = "abi-1-0") {
+            0
+        } else if cfg!(feature = "abi-1-1") {
+            1
+        } else {
+            2
+        };
 
-        /// The size of the vtable of ABI 1.0 and 1.1.
-        const SIZE: u32 = std::mem::offset_of!(obc_module_vtable, audio_instance_load) as u32;
+        /// The size of the vtable of that version.
+        const SIZE: u32 = if MINOR < 2 {
+            std::mem::offset_of!(obc_module_vtable, audio_instance_load) as u32
+        } else {
+            std::mem::offset_of!(obc_module_vtable, instance_status_values) as u32
+        };
 
-        /// ABI 1.0 or 1.1.
+        /// ABI 1.0, 1.1 or 1.2.
         #[unsafe(no_mangle)]
         pub extern "C" fn obc_module_abi_version() -> u32 {
             obc_module_abi_pack(1, MINOR)
         }
 
-        /// The SDK's entry point, with a vtable that says 1.0 or 1.1.
+        /// The SDK's entry point, with a vtable that says 1.0, 1.1 or 1.2.
         ///
         /// # Safety
         ///

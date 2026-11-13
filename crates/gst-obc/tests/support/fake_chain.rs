@@ -11,6 +11,10 @@
 //!   place, so `reset_temporal` drops it (as a stage that would carry the
 //!   previous source otherwise).
 //!
+//! While `lift` is loaded, the chain reports the status value `lift`/`y`,
+//! its luma, and while `tint` is, `tint`/`frames`, the frames since the
+//! load.
+//!
 //! It runs on host frames ([`FakeChainFactory::host`]) or on CUDA frames
 //! ([`FakeChainFactory::cuda`], written with `obc-gpu` memsets on the stream
 //! of the load), and records every call.
@@ -27,7 +31,7 @@ use std::time::Duration;
 
 use obc_backend::{
     BackendError, ChainFrame, ChainRequest, FrameKind, LoadReport, Params, StageChain,
-    StageChainFactory, StageId, StageList,
+    StageChainFactory, StageId, StageList, StageValue,
 };
 
 /// The chroma `tint` writes without a live `u`.
@@ -150,6 +154,8 @@ impl StageChainFactory for FakeChainFactory {
 struct Loaded {
     stages: Vec<StageId>,
     lift_y: u8,
+    /// Frames processed since the load.
+    frames: u64,
     kind: FrameKind,
     size: (u32, u32),
     context: *mut std::ffi::c_void,
@@ -213,6 +219,7 @@ impl StageChain for FakeChain {
         self.loaded = Some(Loaded {
             stages: req.stages.as_slice().to_vec(),
             lift_y: int(req.params.get("lift"), "y", FAKE_LIFT_Y),
+            frames: 0,
             kind: req.kind,
             size: (req.width, req.height),
             context: req.gpu.map_or(std::ptr::null_mut(), |g| g.context),
@@ -283,6 +290,7 @@ impl StageChain for FakeChain {
         if failure.is_none() {
             self.log.frames.fetch_add(1, Ordering::SeqCst);
             *self.log.last_live.lock().unwrap() = live.clone();
+            l.frames += 1;
         }
         let tint = if failure.is_some() {
             Some(FAKE_SCRIBBLE)
@@ -376,5 +384,28 @@ impl StageChain for FakeChain {
         if self.loaded.take().is_some() {
             self.log.unloads.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    fn status_values(&self) -> Vec<StageValue> {
+        let Some(l) = &self.loaded else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for s in &l.stages {
+            match s.as_str() {
+                "lift" => out.push(StageValue {
+                    stage: s.clone(),
+                    name: "y".into(),
+                    value: f64::from(l.lift_y),
+                }),
+                "tint" => out.push(StageValue {
+                    stage: s.clone(),
+                    name: "frames".into(),
+                    value: l.frames as f64,
+                }),
+                _ => {}
+            }
+        }
+        out
     }
 }

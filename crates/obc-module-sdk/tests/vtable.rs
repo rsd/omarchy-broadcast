@@ -9,7 +9,7 @@ use std::sync::{Mutex, OnceLock};
 use obc_module_sdk::abi::*;
 use obc_module_sdk::{
     Apply, ChainRequest, Error, Frame, FrameKind, Group, Instance, LoadReport, Module, Op, Param,
-    PixelFormat, ProbeReport, Role, Setting, SettingsDescription, Value,
+    PixelFormat, ProbeReport, Role, Setting, SettingsDescription, StatusValue, Value,
 };
 
 // ---------------------------------------------------------------------------
@@ -139,6 +139,14 @@ impl Instance for TestInstance {
     fn timings(&self) -> Vec<(String, f32)> {
         vec![("test".to_string(), 0.25)]
     }
+
+    /// The fresh frames processed since the load; none before the first.
+    fn status_values(&self) -> Vec<StatusValue> {
+        if self.frames == 0 {
+            return Vec::new();
+        }
+        vec![StatusValue::new("test", "frames", f64::from(self.frames))]
+    }
 }
 
 obc_module_sdk::export_module!(TestModule);
@@ -262,7 +270,7 @@ fn load(vt: &obc_module_vtable, instance: *mut obc_instance) -> (obc_status, obc
 
 #[test]
 fn abi_version_is_packed() {
-    assert_eq!(obc_module_abi_version(), obc_module_abi_pack(1, 2));
+    assert_eq!(obc_module_abi_version(), obc_module_abi_pack(1, 3));
     assert_eq!(obc_module_abi_major(obc_module_abi_version()), 1);
     let vt = vtable();
     assert_eq!(vt.struct_size as usize, size_of::<obc_module_vtable>());
@@ -432,6 +440,12 @@ fn load_and_process_a_host_nv12_frame() {
     // A second load is a switch.
     assert_eq!(load(vt, instance).1.reused_model, 1);
 
+    // No value before a frame.
+    assert_eq!(
+        status_values(vt, instance),
+        Vec::<(String, String, f64)>::new()
+    );
+
     let mut buf = vec![10u8; 4 * 2 + 4];
     let frame = nv12(&mut buf, 4, 2);
     // SAFETY: the frame's memory lives across the call; in place.
@@ -453,6 +467,11 @@ fn load_and_process_a_host_nv12_frame() {
         unsafe { vt.instance_process.unwrap()(instance, &repeat, &repeat, ptr::null(), 0) };
     assert_eq!(status, OBC_OK);
     assert_eq!(&buf[..8], &[12; 8], "the repeat was told apart");
+    assert_eq!(
+        status_values(vt, instance),
+        [("test".to_string(), "frames".to_string(), 1.0)],
+        "a repeat does not move the value"
+    );
 
     let (mut timings, mut n) = (ptr::null(), 0usize);
     // SAFETY: a live instance.
@@ -484,6 +503,46 @@ fn load_and_process_a_host_nv12_frame() {
     let status = unsafe { vt.instance_process.unwrap()(instance, &frame, &frame, ptr::null(), 0) };
     assert_eq!(status, OBC_ERR_STATE, "a frame after unload");
 
+    // SAFETY: destroyed once, the instance before the module.
+    unsafe {
+        vt.instance_destroy.unwrap()(instance);
+        vt.destroy.unwrap()(module);
+    }
+}
+
+/// What `instance_status_values` reports, copied.
+fn status_values(
+    vt: &obc_module_vtable,
+    instance: *mut obc_instance,
+) -> Vec<(String, String, f64)> {
+    let (mut out, mut n) = (ptr::null(), 99usize);
+    // SAFETY: a live instance; the outputs are writable.
+    let status = unsafe { vt.instance_status_values.unwrap()(instance, &mut out, &mut n) };
+    assert_eq!(status, OBC_OK);
+    if n == 0 {
+        assert!(out.is_null());
+        return Vec::new();
+    }
+    // SAFETY: `n` entries owned by the instance, valid until its next call.
+    let entries: &[obc_status_value] = unsafe { std::slice::from_raw_parts(out, n) };
+    entries
+        .iter()
+        .map(|v| {
+            assert_eq!(v.reserved0, 0);
+            (text(v.stage), text(v.name), v.value)
+        })
+        .collect()
+}
+
+#[test]
+fn status_values_refuse_null_outputs() {
+    let vt = vtable();
+    let module = init(vt, c"{}");
+    let instance = create(vt, module);
+    let mut n = 0usize;
+    // SAFETY: a live instance; a null output, which the module refuses.
+    let status = unsafe { vt.instance_status_values.unwrap()(instance, ptr::null_mut(), &mut n) };
+    assert_eq!(status, OBC_ERR_INVALID);
     // SAFETY: destroyed once, the instance before the module.
     unsafe {
         vt.instance_destroy.unwrap()(instance);

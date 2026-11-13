@@ -31,7 +31,9 @@ use obc_module_abi::{
 
 use crate::library::LogLevel;
 use crate::manifest::Manifest;
-use crate::module::{ModuleCore, ModuleError, RawParams, Status, owned_text};
+use crate::module::{
+    ModuleCore, ModuleError, RawParams, Status, owned_text, reported_entries, reported_name,
+};
 
 /// What [`AudioInstance::load`] loads, owned: the ABI's audio request with
 /// its strings.
@@ -583,7 +585,9 @@ impl AudioInstance {
     }
 
     /// The step times of the last processed block: `(step, ms)`; empty when
-    /// the module reports none.
+    /// the module reports none, and when the call fails or the list is
+    /// null, misaligned or longer than `MAX_REPORTED_ENTRIES` (step names
+    /// are cut to `MAX_REPORTED_NAME` bytes).
     pub fn timings(&self) -> Vec<(String, f32)> {
         let Some(f) = self.core.lib.vtable().instance_timings else {
             return Vec::new();
@@ -592,16 +596,16 @@ impl AudioInstance {
         // SAFETY: a live instance; `AudioInstance` is not `Sync`, so no
         // other call on it runs; the outputs are writable.
         let status = unsafe { f(self.raw, &mut out, &mut n) };
-        if status != OBC_OK || out.is_null() || n == 0 {
+        if status != OBC_OK {
             return Vec::new();
         }
         // SAFETY: `n` entries owned by the instance, valid until the next
         // call; copied now.
-        let entries = unsafe { std::slice::from_raw_parts(out, n) };
+        let entries = unsafe { reported_entries(out, n) };
         entries
             .iter()
             // SAFETY: NUL-terminated step names, as above.
-            .map(|t| (unsafe { owned_text(t.step) }, t.ms))
+            .map(|t| (unsafe { reported_name(t.step) }, t.ms))
             .collect()
     }
 }

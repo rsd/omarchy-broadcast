@@ -80,7 +80,7 @@
 //!   unwinds into the daemon. Do not build a module with `panic = "abort"`,
 //!   or a panic takes the daemon down with it;
 //! * keep every string handed back (JSON documents, error messages, timing
-//!   names) alive until the next call on the same object.
+//!   and status value names) alive until the next call on the same object.
 //!
 //! Log lines go to the daemon's log through [`log`].
 //!
@@ -124,6 +124,26 @@ pub use frame::{CudaHandles, Frame, FrameKind, PixelFormat};
 pub use request::{
     ChainFrames, ChainRequest, ChromaSiting, ColourMatrix, LoadReport, Param, Value,
 };
+
+/// A named numeric value a stage reports ([`Instance::status_values`]):
+/// the stage id, the value's name, unique within the stage, and the value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusValue {
+    pub stage: String,
+    pub name: String,
+    pub value: f64,
+}
+
+impl StatusValue {
+    /// The value `name` of stage `stage`.
+    pub fn new(stage: impl Into<String>, name: impl Into<String>, value: f64) -> StatusValue {
+        StatusValue {
+            stage: stage.into(),
+            name: name.into(),
+            value,
+        }
+    }
+}
 
 /// A module: the object the daemon creates once per loaded library (per
 /// enabled module), from the module's configuration.
@@ -227,6 +247,14 @@ pub trait Instance: Send + 'static {
     /// milliseconds)`, a step being a stage id or a step of the module's
     /// own (`convert-in`, `mask`, `composite`, `convert-out`).
     fn timings(&self) -> Vec<(String, f32)> {
+        Vec::new()
+    }
+
+    /// The named numeric values the loaded stages report after the last
+    /// processed frame (auto-frame's current zoom, for one), for the
+    /// daemon's status (ABI 1.3). Cheap: it is read after frames, on the
+    /// streaming thread. The default reports none.
+    fn status_values(&self) -> Vec<StatusValue> {
         Vec::new()
     }
 

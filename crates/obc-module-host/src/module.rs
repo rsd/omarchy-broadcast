@@ -31,13 +31,13 @@ use std::ffi::{CStr, CString, c_char};
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use obc_backend::{Availability, HostBgr, StageId, StageList, Value};
+use obc_backend::{Availability, HostBgr, StageId, StageList, StageValue, Value};
 use obc_module_abi::{
     OBC_ERR_FAILED, OBC_ERR_INVALID, OBC_ERR_PANIC, OBC_ERR_STAGE, OBC_ERR_STATE,
     OBC_ERR_UNAVAILABLE, OBC_ERR_UNSUPPORTED, OBC_FORMAT_BGR, OBC_FRAME_HOST, OBC_OK,
     obc_chain_request, obc_chroma_siting, obc_cuda, obc_format, obc_frame, obc_frame_kind,
     obc_instance, obc_load_report, obc_matrix, obc_module, obc_param, obc_plane, obc_status,
-    obc_timing, obc_value,
+    obc_status_value, obc_timing, obc_value,
 };
 use serde::Deserialize;
 
@@ -183,6 +183,65 @@ pub(crate) unsafe fn owned_text(ptr: *const c_char) -> String {
     unsafe { CStr::from_ptr(ptr) }
         .to_string_lossy()
         .into_owned()
+}
+
+/// The most entries the host reads from a list a module reports after a
+/// frame (its timings, its status values); a longer list is ignored whole.
+pub(crate) const MAX_REPORTED_ENTRIES: usize = 64;
+
+/// The most bytes the host keeps of a name in such a list (a step, a stage
+/// or a value name), cut at a character boundary.
+pub(crate) const MAX_REPORTED_NAME: usize = 64;
+
+/// The entries of a list a module reports after a frame: none when `out`
+/// is null or not aligned for `T`, or when `n` is 0 or more than
+/// [`MAX_REPORTED_ENTRIES`].
+///
+/// # Safety
+///
+/// When `out` is non-null and aligned and `n` within the bound, `out`
+/// points to `n` initialized entries that stay valid for `'a`.
+pub(crate) unsafe fn reported_entries<'a, T>(out: *const T, n: usize) -> &'a [T] {
+    if out.is_null() || !out.is_aligned() || n == 0 || n > MAX_REPORTED_ENTRIES {
+        return &[];
+    }
+    // SAFETY: by the caller's contract.
+    unsafe { std::slice::from_raw_parts(out, n) }
+}
+
+/// Copies a name from a list a module reports, cut to
+/// [`MAX_REPORTED_NAME`] bytes at a character boundary. It never reads
+/// past those bytes: a name without a NUL within them is cut there, so a
+/// module that forgets the terminator cannot make the host read on.
+///
+/// # Safety
+///
+/// `ptr` is null, or readable up to its NUL or [`MAX_REPORTED_NAME`]
+/// bytes, whichever comes first, during the call.
+pub(crate) unsafe fn reported_name(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut bytes = Vec::with_capacity(MAX_REPORTED_NAME);
+    for i in 0..MAX_REPORTED_NAME {
+        // SAFETY: by the caller's contract, the bytes before the NUL (or
+        // the bound) are readable; the loop stops at the first NUL.
+        let b = unsafe { ptr.add(i).read() } as u8;
+        if b == 0 {
+            break;
+        }
+        bytes.push(b);
+    }
+    // A cut inside a multi-byte character leaves it out, rather than a
+    // replacement character.
+    let valid = match std::str::from_utf8(&bytes) {
+        Err(e) if e.error_len().is_none() => e.valid_up_to(),
+        _ => bytes.len(),
+    };
+    let mut text = String::from_utf8_lossy(&bytes[..valid]).into_owned();
+    // Replacement characters can make the text longer than its bytes.
+    text.truncate(text.floor_char_boundary(MAX_REPORTED_NAME));
+    text
 }
 
 /// The module object of a loaded library.
@@ -1036,7 +1095,9 @@ impl Instance {
     }
 
     /// The step times of the last processed frame: `(step, ms)`; empty when
-    /// the module reports none.
+    /// the module reports none, and when the call fails or the list is
+    /// null, misaligned or longer than `MAX_REPORTED_ENTRIES` (step names
+    /// are cut to `MAX_REPORTED_NAME` bytes).
     pub fn timings(&self) -> Vec<(String, f32)> {
         let Some(f) = self.core.lib.vtable().instance_timings else {
             return Vec::new();
@@ -1045,16 +1106,54 @@ impl Instance {
         // SAFETY: a live instance; `Instance` is not `Sync`, so no other
         // call on it runs; the outputs are writable.
         let status = unsafe { f(self.raw, &mut out, &mut n) };
-        if status != OBC_OK || out.is_null() || n == 0 {
+        if status != OBC_OK {
             return Vec::new();
         }
         // SAFETY: `n` entries owned by the instance, valid until the next
         // call; copied now.
-        let entries = unsafe { std::slice::from_raw_parts(out, n) };
+        let entries = unsafe { reported_entries(out, n) };
         entries
             .iter()
             // SAFETY: NUL-terminated step names, as above.
-            .map(|t| (unsafe { owned_text(t.step) }, t.ms))
+            .map(|t| (unsafe { reported_name(t.step) }, t.ms))
+            .collect()
+    }
+
+    /// The status values the stages reported after the last processed
+    /// frame (ABI 1.3); empty when the module reports none, and from a
+    /// module built for an older ABI (its vtable has no such entry), and
+    /// when the call fails or the list is null, misaligned or longer than
+    /// `MAX_REPORTED_ENTRIES` (64). A value with an invalid stage id, an
+    /// empty name or a value that is not finite is skipped; names are cut
+    /// to `MAX_REPORTED_NAME` (64) bytes.
+    pub fn status_values(&self) -> Vec<StageValue> {
+        let Some(f) = self.core.lib.vtable().instance_status_values else {
+            return Vec::new();
+        };
+        let (mut out, mut n): (*const obc_status_value, usize) = (std::ptr::null(), 0);
+        // SAFETY: a live instance; `Instance` is not `Sync`, so no other
+        // call on it runs; the outputs are writable.
+        let status = unsafe { f(self.raw, &mut out, &mut n) };
+        if status != OBC_OK {
+            return Vec::new();
+        }
+        // SAFETY: `n` entries owned by the instance, valid until the next
+        // call; copied now.
+        let entries = unsafe { reported_entries(out, n) };
+        entries
+            .iter()
+            .filter_map(|v| {
+                // SAFETY: NUL-terminated strings, as above.
+                let (stage, name) = unsafe { (reported_name(v.stage), reported_name(v.name)) };
+                if name.is_empty() || !v.value.is_finite() {
+                    return None;
+                }
+                Some(StageValue {
+                    stage: StageId::new(stage).ok()?,
+                    name,
+                    value: v.value,
+                })
+            })
             .collect()
     }
 
@@ -1216,5 +1315,92 @@ formats = ["nv12"]
                 .as_ptr()
                 .is_null()
         );
+    }
+
+    /// A reported list is read only when it is non-null, aligned for its
+    /// entries and within the bound; a name is cut at a character boundary.
+    #[test]
+    fn reported_lists_and_names_are_bounded() {
+        let list = [obc_timing {
+            step: std::ptr::null(),
+            ms: 1.0,
+            reserved0: 0,
+        }; MAX_REPORTED_ENTRIES + 1];
+        let p = list.as_ptr();
+        // SAFETY: `p` points to the entries of `list`, alive for the test.
+        unsafe {
+            assert_eq!(reported_entries(p, 1).len(), 1);
+            assert_eq!(
+                reported_entries(p, MAX_REPORTED_ENTRIES).len(),
+                MAX_REPORTED_ENTRIES
+            );
+            assert!(reported_entries(p, MAX_REPORTED_ENTRIES + 1).is_empty());
+            assert!(reported_entries(p, 0).is_empty());
+            assert!(reported_entries(std::ptr::null::<obc_timing>(), 3).is_empty());
+            let misaligned = p.cast::<u8>().add(2).cast::<obc_timing>();
+            assert!(reported_entries(misaligned, 1).is_empty());
+        }
+
+        let name = |text: &str| {
+            let c = CString::new(text).unwrap();
+            // SAFETY: a NUL-terminated string alive for the call.
+            unsafe { reported_name(c.as_ptr()) }
+        };
+        assert_eq!(name("zoom"), "zoom");
+        assert_eq!(name(&"a".repeat(80)), "a".repeat(MAX_REPORTED_NAME));
+        // 63 bytes and a 2-byte character: the character is left out.
+        assert_eq!(name(&format!("{}ü", "a".repeat(63))), "a".repeat(63));
+        // SAFETY: null is allowed.
+        assert_eq!(unsafe { reported_name(std::ptr::null()) }, "");
+    }
+
+    /// A name with no NUL, exactly [`MAX_REPORTED_NAME`] bytes long, that
+    /// ends where an inaccessible page begins: reading one byte past the
+    /// bound would fault and kill the test.
+    #[test]
+    fn a_name_without_a_terminator_is_never_read_past_the_bound() {
+        use std::ffi::c_void;
+        unsafe extern "C" {
+            fn sysconf(name: i32) -> i64;
+            fn mmap(
+                addr: *mut c_void,
+                len: usize,
+                prot: i32,
+                flags: i32,
+                fd: i32,
+                off: i64,
+            ) -> *mut c_void;
+            fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
+            fn munmap(addr: *mut c_void, len: usize) -> i32;
+        }
+        const SC_PAGESIZE: i32 = 30;
+        const PROT_NONE: i32 = 0;
+        const PROT_READ_WRITE: i32 = 1 | 2;
+        const MAP_PRIVATE_ANONYMOUS: i32 = 0x02 | 0x20;
+        // SAFETY: plain libc calls on a mapping this test owns; the name
+        // pointer is in the first (readable) page.
+        unsafe {
+            let page = sysconf(SC_PAGESIZE) as usize;
+            let base = mmap(
+                std::ptr::null_mut(),
+                2 * page,
+                PROT_READ_WRITE,
+                MAP_PRIVATE_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert!(!base.is_null() && base as isize != -1, "mmap failed");
+            let guard = base.cast::<u8>().add(page);
+            assert_eq!(
+                mprotect(guard.cast(), page, PROT_NONE),
+                0,
+                "mprotect failed"
+            );
+            let name = guard.sub(MAX_REPORTED_NAME);
+            std::ptr::write_bytes(name, b'z', MAX_REPORTED_NAME);
+            let text = reported_name(name.cast::<c_char>());
+            assert_eq!(text, "z".repeat(MAX_REPORTED_NAME));
+            assert_eq!(munmap(base, 2 * page), 0);
+        }
     }
 }

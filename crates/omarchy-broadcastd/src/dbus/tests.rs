@@ -419,12 +419,14 @@ async fn every_property_reads_through_the_proxy() {
             config_serial: Some(1),
             // No microphone agent here: the mic host is off.
             mic: Some(obc_ipc::MicStatus::default()),
+            // Idle: no stage runs.
+            stage_values: Vec::new(),
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 15);
-    assert_eq!(INTERFACE_REVISION, obc_ipc::MEDIA_REVISION);
-    // GetAll returns the same twenty-eight properties.
+    assert_eq!(INTERFACE_REVISION, 16);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::STAGE_VALUES_REVISION);
+    // GetAll returns the same twenty-nine properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
         .destination(obc_ipc::BUS_NAME)
         .path(OBJECT_PATH)
@@ -469,6 +471,7 @@ async fn every_property_reads_through_the_proxy() {
             "PreviewConsumers",
             "SettingsRevision",
             "SettingsSchemaSerial",
+            "StageValues",
             "State",
             "Warning"
         ]
@@ -525,6 +528,7 @@ async fn every_property_reads_through_the_proxy() {
         "<arg name=\"bundled_dir\" type=\"s\" direction=\"out\"/>",
         "<arg name=\"items\" type=\"aa{sv}\" direction=\"out\"/>",
         "<property name=\"MediaSerial\" type=\"u\" access=\"read\"",
+        "<property name=\"StageValues\" type=\"a(ssd)\" access=\"read\"",
     ] {
         assert!(xml.contains(m), "{m} missing from {xml}");
     }
@@ -920,7 +924,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 15);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 16);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -1049,6 +1053,52 @@ async fn warning_names_a_dropped_effect_and_its_changes_are_announced() {
     assert_eq!(snap.warning, "");
 }
 
+/// `StageValues` carries what the running stages report, announced by
+/// `PropertiesChanged`, and is empty again when the camera goes idle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stage_values_are_a_property_and_their_changes_are_announced() {
+    let rig = Rig::new(
+        "[lifecycle]\nstart_debounce_ms = 0\nidle_grace_s = 0.0\n",
+        |w| {
+            w.stage_values = vec![obc_pipeline::effect::StageValue {
+                stage: obc_pipeline::effect::StageId::new("auto-frame").unwrap(),
+                name: "zoom".into(),
+                value: 1.24,
+            }];
+        },
+    )
+    .await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    assert!(proxy.stage_values().await.unwrap().is_empty(), "idle: none");
+    let seen = rig.record_changes().await;
+    rig.consumers(1);
+    wait_state(&proxy, State::Active).await;
+    until("the stage values", &seen, |s| {
+        s.iter()
+            .any(|e| e.starts_with("StageValues=") && e.contains("auto-frame"))
+    })
+    .await;
+    assert_eq!(
+        proxy.stage_values().await.unwrap(),
+        [obc_ipc::StageValue {
+            stage: "auto-frame".into(),
+            name: "zoom".into(),
+            value: 1.24,
+        }]
+    );
+    let snap = within("snapshot", Snapshot::fetch(&proxy)).await.unwrap();
+    assert_eq!(snap.stage_values.len(), 1);
+    rig.consumers(0);
+    wait_state(&proxy, State::Idle).await;
+    assert!(proxy.stage_values().await.unwrap().is_empty(), "idle again");
+    // Set, then cleared: two announcements, the value never repeated.
+    until("the stage values cleared", &seen, |s| {
+        s.iter().filter(|e| e.starts_with("StageValues=")).count() == 2
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_pipewire_properties_and_their_changes() {
     let rig = Rig::new(
@@ -1058,7 +1108,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 15);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 16);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -1174,7 +1224,7 @@ async fn preview_leases_by_bus_name_their_property_and_their_frames() {
     let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 15);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 16);
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
     let seen = rig.record_changes().await;
     let mut frames = proxy.receive_preview_frame().await.unwrap();

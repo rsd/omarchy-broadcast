@@ -800,6 +800,16 @@ impl Server {
         self.media_serial.load(Ordering::SeqCst)
     }
 
+    /// The named numeric values the running stages report about the last
+    /// frame, `(stage, name, value)`: auto-frame's `zoom`, for one. Empty
+    /// when the camera is idle or no stage reports. Announced when the set
+    /// changes or a value moves by 0.01 or more, at most every 250 ms
+    /// (revision 16).
+    #[zbus(property)]
+    fn stage_values(&self) -> Vec<obc_ipc::StageValue> {
+        self.snap().stage_values
+    }
+
     #[zbus(property)]
     fn interface_revision(&self) -> u32 {
         self.snap().interface_revision
@@ -854,6 +864,7 @@ async fn emit_change(emitter: &SignalEmitter<'_>, change: &Change) -> zbus::Resu
         | Change::ConfigSerial(v)
         | Change::MicConsumers(v) => emit_changed(emitter, name, v).await,
         Change::CameraControls(v) => emit_changed(emitter, name, v).await,
+        Change::StageValues(v) => emit_changed(emitter, name, v).await,
     }
 }
 

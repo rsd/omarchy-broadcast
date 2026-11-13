@@ -513,11 +513,11 @@ fn broken_modules_are_unavailable_with_their_reasons_and_the_process_lives() {
     // would abort the process) is called.
     let r = reason("org.test.major");
     assert!(
-        r.contains("module ABI 2.0") && r.contains("module ABI 1.2"),
+        r.contains("module ABI 2.0") && r.contains("module ABI 1.3"),
         "{r}"
     );
     let r = reason("org.test.minor");
-    assert!(r.contains("1.99, newer than") && r.contains("1.2"), "{r}");
+    assert!(r.contains("1.99, newer than") && r.contains("1.3"), "{r}");
     let r = reason("org.test.refuse");
     assert!(r.contains("refused this daemon"), "{r}");
     let r = reason("org.test.init");
@@ -649,7 +649,8 @@ fn a_panic_in_process_is_an_error_and_the_process_survives() {
 #[test]
 fn a_repeat_is_flagged_for_a_module_of_abi_1_1_and_reprocessed_by_one_of_1_0() {
     for (features, abi, flagged) in [
-        ("", "1.2", true),
+        ("", "1.3", true),
+        ("abi-1-2", "1.2", true),
         ("abi-1-1", "1.1", true),
         ("abi-1-0", "1.0", false),
     ] {
@@ -692,6 +693,107 @@ fn a_repeat_is_flagged_for_a_module_of_abi_1_1_and_reprocessed_by_one_of_1_0() {
         // through the chain too.
         assert_eq!(img.y, [70; 8], "{abi}");
     }
+}
+
+/// The status values of a module of ABI 1.3 cross the boundary as
+/// [`obc_backend::StageValue`]s, after each frame; a module of ABI 1.2 (a
+/// vtable that ends before the entry) and an unloaded chain report none.
+#[test]
+fn status_values_cross_from_a_module_of_abi_1_3_and_none_from_one_of_1_2() {
+    use obc_backend::StageValue;
+    let value = |name: &str, value: f64| StageValue {
+        stage: s("alpha"),
+        name: name.into(),
+        value,
+    };
+    for (features, abi, reports) in [("", "1.3", true), ("abi-1-2", "1.2", false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = own_copy(&fixture_lib(features), dir.path(), "fixture");
+        let m = manifest(
+            &fixture_manifest("org.test.fixture", &lib, 1),
+            dir.path(),
+            "fixture",
+        );
+        let module = Module::open(&m, &serde_json::json!({}), obc_module_host::stderr_log())
+            .expect("the fixture opens");
+        assert_eq!(
+            obc_module_host::library::version_text(module.library().abi_version()),
+            abi
+        );
+        let factory = ModuleChainFactory::new(module, &[s("alpha")]).unwrap();
+        let mut chain = factory.create().unwrap();
+        assert!(chain.status_values().is_empty(), "{abi}: nothing loaded");
+        chain
+            .load(&host_request(
+                &["alpha"],
+                params("alpha", &[("step", Value::Int(4))]),
+            ))
+            .unwrap();
+        let mut img = HostImage::new(4, 2, 50, 128);
+        let mut f = img.frame();
+        for _ in 0..2 {
+            chain
+                .process(ChainFrame::Host(&mut f), &BTreeMap::new())
+                .unwrap();
+        }
+        let expected = if reports {
+            vec![value("step", 4.0), value("frames", 2.0)]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(chain.status_values(), expected, "{abi}");
+        chain.unload();
+        assert!(chain.status_values().is_empty(), "{abi}: unloaded");
+    }
+}
+
+/// The host reads a module's status values defensively: a failed call, a
+/// null or misaligned list and one longer than the bound give none; bad
+/// entries (a value that is not finite, an empty or null name, a null or
+/// invalid stage id) are left out and long names cut at a character
+/// boundary. The fixture's `raw-status-values` answers each call with the
+/// next shape (see its documentation).
+#[test]
+fn status_values_from_a_misbehaving_module_are_bounded_and_filtered() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = own_copy(&fixture_lib("raw-status-values"), dir.path(), "fixture");
+    let m = manifest(
+        &fixture_manifest("org.test.fixture", &lib, 1),
+        dir.path(),
+        "fixture",
+    );
+    let module = Module::open(&m, &serde_json::json!({}), obc_module_host::stderr_log())
+        .expect("the fixture opens");
+    let factory = ModuleChainFactory::new(module, &[s("alpha")]).unwrap();
+    let mut chain = factory.create().unwrap();
+    chain
+        .load(&host_request(&["alpha"], BTreeMap::new()))
+        .unwrap();
+    let triples = |chain: &dyn obc_backend::StageChain| {
+        chain
+            .status_values()
+            .into_iter()
+            .map(|v| (v.stage.as_str().to_string(), v.name, v.value))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(triples(&*chain), [], "a failed call");
+    assert_eq!(triples(&*chain), [], "a null list");
+    assert_eq!(triples(&*chain), [], "a misaligned list");
+    assert_eq!(triples(&*chain), [], "65 entries, over the bound");
+    let at_bound = triples(&*chain);
+    assert_eq!(at_bound.len(), 64, "64 entries, at the bound");
+    assert_eq!(at_bound[63], ("alpha".to_string(), "v63".to_string(), 63.0));
+    let alpha = |name: &str, value: f64| ("alpha".to_string(), name.to_string(), value);
+    assert_eq!(
+        triples(&*chain),
+        [
+            alpha("zoom", 1.5),
+            alpha(&"ü".repeat(32), 2.0),
+            alpha(&"a".repeat(63), 2.0),
+        ],
+        "the bad entries are left out, the long names cut"
+    );
 }
 
 #[test]
@@ -894,6 +996,15 @@ fn the_backend_factory_carries_the_effect_through_the_abi() {
     let timings = backend.timings().unwrap();
     assert_eq!(timings.step_ms("alpha"), Some(1.0));
     assert_eq!(timings.step_ms("beta"), Some(3.0));
+    // The status values of ABI 1.3 reach the effect seam too.
+    let values = backend.status_values();
+    assert_eq!(
+        values
+            .iter()
+            .map(|v| (v.stage.as_str(), v.name.as_str(), v.value))
+            .collect::<Vec<_>>(),
+        [("alpha", "step", 3.0), ("alpha", "frames", 1.0)]
+    );
 
     assert_eq!(
         backend.reset_temporal(&gpu).unwrap(),
@@ -941,6 +1052,7 @@ fn the_backend_factory_carries_the_effect_through_the_abi() {
     ));
     backend.unload();
     assert!(backend.timings().is_none());
+    assert!(backend.status_values().is_empty());
 }
 
 /// The fixture with a `background` that takes CUDA and host frames, as the
@@ -1461,7 +1573,7 @@ fn an_audio_module_loads_only_through_the_audio_kinds_and_runs_blocks() {
     let module = registry.module("org.test.audio").unwrap().clone();
     assert_eq!(
         obc_module_host::library::version_text(module.library().abi_version()),
-        "1.2"
+        "1.3"
     );
     assert!(module.library().has_audio());
     assert!(module.matte_stages().is_empty());

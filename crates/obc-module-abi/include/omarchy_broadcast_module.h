@@ -27,8 +27,10 @@
  * * 1.2 adds audio: `obc_audio_buffer`, `obc_audio_request`,
  *   `obc_audio_load_report`, their constants and the vtable entries
  *   `audio_instance_load` and `audio_instance_process`.
+ * * 1.3 adds named status values: `obc_status_value` and the vtable
+ *   entry `instance_status_values`.
  */
-#define OBC_MODULE_ABI_MINOR 2
+#define OBC_MODULE_ABI_MINOR 3
 
 /**
  * The packed ABI version this crate describes: `major << 16 | minor`
@@ -602,6 +604,33 @@ typedef struct obc_audio_buffer {
 } obc_audio_buffer;
 
 /**
+ * A named numeric value a stage reports about the last processed frame
+ * (auto-frame's current zoom, for one). Since ABI 1.3.
+ */
+typedef struct obc_status_value {
+    /**
+     * The stage id the value belongs to. NUL-terminated.
+     */
+    const char *stage;
+    /**
+     * The name of the value, unique within the stage. NUL-terminated.
+     */
+    const char *name;
+    /**
+     * The value.
+     */
+    double value;
+    /**
+     * Zero.
+     */
+    uint32_t reserved0;
+    /**
+     * Zero.
+     */
+    uint32_t reserved1;
+} obc_status_value;
+
+/**
  * The module's entry points, returned by `obc_module_entry_fn`.
  *
  * Every entry is declared nullable; those marked required must be set. A
@@ -767,6 +796,15 @@ typedef struct obc_module_vtable {
                                          struct obc_audio_buffer *output,
                                          const struct obc_param *live,
                                          size_t n_live);
+    /**
+     * Since ABI 1.3. Nullable (null: the module reports no values). The
+     * status values of the last processed frame: `*out` points to `*n`
+     * entries owned by the instance (null and 0 when there are none),
+     * valid until the next call on the instance.
+     */
+    obc_status (*instance_status_values)(struct obc_instance *instance,
+                                         const struct obc_status_value **out,
+                                         size_t *n);
 } obc_module_vtable;
 
 /**

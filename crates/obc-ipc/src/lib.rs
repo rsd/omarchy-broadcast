@@ -128,7 +128,17 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// refused since (`<name> unavailable from the next start: <reason>`).
 /// Revision 15 added the media gallery ([`media`]): `GetMedia`,
 /// `ImportMedia`, `RemoveMedia` and the `MediaSerial` property.
-pub const INTERFACE_REVISION: u32 = 15;
+/// Revision 16 added the `StageValues` property ([`StageValue`]): the named
+/// numeric values the running stages report (auto-frame's zoom).
+pub const INTERFACE_REVISION: u32 = 16;
+/// The first [`INTERFACE_REVISION`] with the `StageValues` property.
+pub const STAGE_VALUES_REVISION: u32 = 16;
+/// The smallest move of a value that announces a change of
+/// `StageValues` (a change of the set always does).
+pub const STAGE_VALUE_STEP: f64 = 0.01;
+/// The shortest time between two announced changes of `StageValues`, in
+/// milliseconds: an easing value does not flood the bus.
+pub const STAGE_VALUES_PERIOD_MS: u64 = 250;
 /// The first [`INTERFACE_REVISION`] with the microphone: the `Mic*`
 /// properties, `MicStats`, `SetMicHost` and the `mic.*` settings.
 pub const MIC_REVISION: u32 = 13;
@@ -282,6 +292,20 @@ pub struct CameraInfo {
     /// USB `vid:pid` in lower-case hex (`1234:abcd`), empty if not a USB
     /// device.
     pub usb: String,
+}
+
+/// A named numeric value a running stage reports about the last frame, as
+/// listed by the `StageValues` property (revision 16): a D-Bus struct
+/// `(ssd)`. Auto-frame reports `("auto-frame", "zoom", z)`, the frame's
+/// height over the crop's (1.0 at the full frame).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct StageValue {
+    /// The stage id (`auto-frame`).
+    pub stage: String,
+    /// The value's name, unique within the stage (`zoom`).
+    pub name: String,
+    /// The value.
+    pub value: f64,
 }
 
 /// One image control of a camera: a D-Bus struct `(siiiiib)`, an entry of
@@ -515,6 +539,10 @@ pub struct Snapshot {
     /// The microphone (revision 13): `None` when the daemon does not offer
     /// it.
     pub mic: Option<MicStatus>,
+    /// `StageValues` (revision 16): the values the running stages report;
+    /// empty when the camera is idle, when no stage reports, and when the
+    /// daemon does not offer it.
+    pub stage_values: Vec<StageValue>,
     pub interface_revision: u32,
 }
 
@@ -546,6 +574,7 @@ impl Snapshot {
             backend_profile: None,
             config_serial: None,
             mic: None,
+            stage_values: Vec::new(),
             interface_revision: 0,
         }
     }
@@ -599,6 +628,9 @@ impl Snapshot {
             "MicProvider" => self.mic_mut().provider = deserialize_for_property(value)?,
             "MicLatencyMs" => self.mic_mut().latency_ms = deserialize_for_property(value)?,
             "MicError" => self.mic_mut().error = deserialize_for_property(value)?,
+            "StageValues" => {
+                self.stage_values = deserialize_for_property::<Vec<StageValue>>(value)?
+            }
             "InterfaceRevision" => self.interface_revision = deserialize_for_property(value)?,
             _ => {}
         }
@@ -679,7 +711,7 @@ impl Snapshot {
     /// `BackgroundImage`, `PipeWireConsumers`, `PipeWireOutput`, `Denoise`,
     /// `PreviewConsumers`, `CameraControls`, `SettingsRevision`,
     /// `SettingsSchemaSerial`, `ModulesSerial`, `BackendProfile`, `ConfigSerial`,
-    /// `Warning`, the `Mic*` properties) keep their
+    /// `Warning`, the `Mic*` properties, `StageValues`) keep their
     /// [`Snapshot::empty`] value when the daemon does not offer
     /// them (see [`is_unknown_property_error`]), and `LoopbackConsumers` is then
     /// `Consumers`, as [`Snapshot::from_properties`] does for a property
@@ -726,6 +758,7 @@ impl Snapshot {
             )?,
             config_serial: optional(proxy.config_serial().await.map(Some), empty.config_serial)?,
             mic: fetch_mic(proxy).await?,
+            stage_values: optional(proxy.stage_values().await, empty.stage_values)?,
             interface_revision: proxy.interface_revision().await?,
         })
     }
@@ -836,6 +869,35 @@ mod tests {
         assert!(Snapshot::from_properties([("State", &state), ("MicConsumers", &mic)]).is_err());
         assert_eq!(MicStatus::default().state, MIC_OFF);
         assert!(MIC_STATES.contains(&MIC_OFF));
+    }
+
+    #[test]
+    fn stage_values_are_read_and_empty_before_revision_16() {
+        assert_eq!(<StageValue as Type>::SIGNATURE.to_string(), "(ssd)");
+        assert_eq!(<Vec<StageValue> as Type>::SIGNATURE.to_string(), "a(ssd)");
+        let state = Variant::from("active");
+        let values = zbus::as_variant::to_owned_variant(&vec![StageValue {
+            stage: "auto-frame".into(),
+            name: "zoom".into(),
+            value: 1.24,
+        }])
+        .unwrap();
+        let snap =
+            Snapshot::from_properties([("State", &state), ("StageValues", &values)]).unwrap();
+        assert_eq!(
+            snap.stage_values,
+            [StageValue {
+                stage: "auto-frame".into(),
+                name: "zoom".into(),
+                value: 1.24,
+            }]
+        );
+        // From a daemon before revision 16: none.
+        let old = Snapshot::from_properties([("State", &state)]).unwrap();
+        assert!(old.stage_values.is_empty());
+        // A value of the wrong type is an error.
+        assert!(Snapshot::from_properties([("State", &state), ("StageValues", &state)]).is_err());
+        const { assert!(STAGE_VALUES_REVISION <= INTERFACE_REVISION) };
     }
 
     #[test]
@@ -1200,7 +1262,8 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, MEDIA_REVISION);
+        assert_eq!(INTERFACE_REVISION, STAGE_VALUES_REVISION);
+        const { assert!(MEDIA_REVISION < STAGE_VALUES_REVISION) };
         const { assert!(FORCED_REVISION < MEDIA_REVISION) };
         const { assert!(MIC_REVISION < FORCED_REVISION) };
         const { assert!(MODES_REVISION < MIC_REVISION) };

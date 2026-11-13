@@ -374,6 +374,9 @@ pub const STATS_PERIOD: Duration = Duration::from_secs(1);
 const POLL_STARTING: Duration = Duration::from_millis(50);
 /// How often a running session is checked for failures.
 const POLL_RUNNING: Duration = Duration::from_millis(250);
+/// The shortest time between two changes of `StageValues`
+/// ([`obc_ipc::STAGE_VALUES_PERIOD_MS`]).
+pub const STAGE_VALUES_PERIOD: Duration = Duration::from_millis(obc_ipc::STAGE_VALUES_PERIOD_MS);
 /// The longest the writer's placeholder is waited for while it decodes
 /// the fallback image: past it the image is said not to be readable, and
 /// the steps no longer come often for it (a decode that hung or died).
@@ -567,6 +570,7 @@ pub enum Change {
     MicProvider(String),
     MicLatencyMs(f64),
     MicError(String),
+    StageValues(Vec<obc_ipc::StageValue>),
 }
 
 impl Change {
@@ -600,6 +604,7 @@ impl Change {
             Change::MicProvider(_) => "MicProvider",
             Change::MicLatencyMs(_) => "MicLatencyMs",
             Change::MicError(_) => "MicError",
+            Change::StageValues(_) => "StageValues",
         }
     }
 }
@@ -812,6 +817,9 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Vec<Change> {
     if old.warning != new.warning {
         out.push(Change::Warning(new.warning.clone()));
     }
+    if old.stage_values != new.stage_values {
+        out.push(Change::StageValues(new.stage_values.clone()));
+    }
     if old.mic != new.mic {
         let (o, n) = (
             old.mic.clone().unwrap_or_default(),
@@ -944,6 +952,7 @@ pub fn preliminary_snapshot(paths: &Paths) -> Snapshot {
         config_serial: Some(1),
         // What the mic host runs is not known before the agent asked.
         mic: Some(obc_ipc::MicStatus::default()),
+        stage_values: Vec::new(),
         interface_revision: INTERFACE_REVISION,
     }
 }
@@ -1418,6 +1427,11 @@ pub struct Controller<B: MediaBackend> {
     effect_applied: Option<EffectRun>,
     /// When the effect's GPU time is logged next.
     effect_log_at: Option<Instant>,
+    /// `StageValues` as published: the stages' status values while a
+    /// session runs ([`Self::follow_stage_values`]), empty without one.
+    stage_values: Vec<obc_ipc::StageValue>,
+    /// When `stage_values` last changed.
+    stage_values_at: Option<Instant>,
     /// The modules were discovered and opened ([`Self::load_modules`]):
     /// until then nothing is known of what they provide, and `Warning`
     /// says nothing.
@@ -1841,6 +1855,8 @@ impl<B: MediaBackend> Controller<B> {
             enhance_seen: None,
             effect_applied: None,
             effect_log_at: None,
+            stage_values: Vec::new(),
+            stage_values_at: None,
             modules_loaded: load_modules,
             consumers: 0,
             loopback_consumers: 0,
@@ -3365,6 +3381,7 @@ impl<B: MediaBackend> Controller<B> {
             ),
             config_serial: Some(self.config_serial),
             mic: Some(self.mic_status.clone()),
+            stage_values: self.stage_values.clone(),
             interface_revision: INTERFACE_REVISION,
         };
         self.published.update(snap);
@@ -3817,11 +3834,52 @@ impl<B: MediaBackend> Controller<B> {
         if self.follow_effect(&report, now) {
             return true;
         }
+        self.follow_stage_values(&report.stage_values, now);
         for (id, status) in report.stages {
             self.poll_stage(&id, status, &report.status);
         }
         self.poll_enhance(report.enhance);
         false
+    }
+
+    /// Follows the stages' status values (`StageValues`): published when
+    /// the set of values changes (a stage, or a value's name) or a value
+    /// moves by [`obc_ipc::STAGE_VALUE_STEP`] or more, and at most every
+    /// [`STAGE_VALUES_PERIOD`], so a value that eases (auto-frame's zoom)
+    /// does not flood the bus. A move held back by the period is published
+    /// by a later poll. The session's end clears them at once
+    /// ([`Self::drop_session`]).
+    fn follow_stage_values(&mut self, values: &[obc_pipeline::effect::StageValue], now: Instant) {
+        let new: Vec<obc_ipc::StageValue> = values
+            .iter()
+            .map(|v| obc_ipc::StageValue {
+                stage: v.stage.to_string(),
+                name: v.name.clone(),
+                value: v.value,
+            })
+            .collect();
+        let old = &self.stage_values;
+        let same_set = new.len() == old.len()
+            && new
+                .iter()
+                .zip(old)
+                .all(|(n, o)| n.stage == o.stage && n.name == o.name);
+        let moved = !same_set
+            || new
+                .iter()
+                .zip(old)
+                .any(|(n, o)| (n.value - o.value).abs() >= obc_ipc::STAGE_VALUE_STEP);
+        if !moved {
+            return;
+        }
+        if self
+            .stage_values_at
+            .is_some_and(|t| now.saturating_duration_since(t) < STAGE_VALUES_PERIOD)
+        {
+            return;
+        }
+        self.stage_values = new;
+        self.stage_values_at = Some(now);
     }
 
     /// Follows the enhance stage of the current ingest. Its failure never
@@ -4546,6 +4604,8 @@ impl<B: MediaBackend> Controller<B> {
         self.effect_polled = false;
         self.effect_applied = None;
         self.effect_log_at = None;
+        self.stage_values.clear();
+        self.stage_values_at = None;
         self.enhance_seen = None;
         let stages = self.take_stage_failures();
         self.stages.clear();

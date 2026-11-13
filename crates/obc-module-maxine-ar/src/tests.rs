@@ -350,6 +350,37 @@ fn an_instance_unloads_when_nothing_was_loaded() {
     assert_eq!(i.framing(), framing::Framing::Medium);
     assert_eq!(i.face(), None);
     assert!(i.reset_temporal().unwrap().is_empty());
+    assert!(i.status_values().is_empty(), "no auto-frame, no zoom");
+}
+
+/// Auto-frame reports its zoom, 1.0 at the full frame included; without
+/// the stage there is none.
+#[test]
+fn auto_frame_reports_its_zoom() {
+    assert!(status_values_of(None).is_empty());
+    let mut f = framing::Framer::new(1920, 1080, Framing::Tight);
+    assert_eq!(
+        status_values_of(Some(&f)),
+        [StatusValue::new("auto-frame", "zoom", 1.0)]
+    );
+    let face = framing::Rect {
+        x: 930.0,
+        y: 510.0,
+        width: 60.0,
+        height: 60.0,
+    };
+    for i in 0..300 {
+        f.update(f64::from(i) / 30.0, Some(&face));
+    }
+    let v = status_values_of(Some(&f));
+    assert_eq!(
+        (v[0].stage.as_str(), v[0].name.as_str()),
+        (AUTO_FRAME, ZOOM_VALUE)
+    );
+    assert!(
+        v[0].value > 1.0 && (v[0].value - f.zoom()).abs() < 1e-12,
+        "{v:?}"
+    );
 }
 
 /// A raw chain request of `stages` for `width` x `height` NV12 CUDA frames

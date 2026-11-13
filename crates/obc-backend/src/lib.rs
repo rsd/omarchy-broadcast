@@ -816,6 +816,16 @@ impl StageTimings {
     }
 }
 
+/// A named numeric value a stage reports about the last processed frame
+/// (auto-frame's current zoom, for one): the stage, the value's name,
+/// unique within the stage, and the value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StageValue {
+    pub stage: StageId,
+    pub name: String,
+    pub value: f64,
+}
+
 /// Why a backend is unavailable or a call failed. Every variant carries a
 /// human-readable reason fit for the daemon's `Error` property: what went
 /// wrong and, where known, what to do about it.
@@ -938,6 +948,13 @@ pub trait InferenceBackend: Send {
     /// Per-stage GPU times of the most recent frame whose work has
     /// completed, if the backend measures them.
     fn timings(&self) -> Option<StageTimings>;
+
+    /// The status values the loaded stages report after the most recent
+    /// processed frame (a module of ABI 1.3 or later); empty when none
+    /// does. The default reports none.
+    fn status_values(&self) -> Vec<StageValue> {
+        Vec::new()
+    }
 
     /// Forgets the temporal state of the loaded stages and of the mask, so
     /// the next frame is treated as the first

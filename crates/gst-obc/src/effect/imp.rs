@@ -140,7 +140,10 @@
 //! read after the frame's stream synchronisation (a backend reports a frame
 //! only once its work has completed), under a `try_lock` of `Engine` so the
 //! streaming thread never waits for a load for it: while the worker holds
-//! the lock, that frame's figures are skipped.
+//! the lock, that frame's figures are skipped. The backend's status values
+//! (`InferenceBackend::status_values`, auto-frame's zoom for one) are read
+//! in the same `try_lock` and replace the element's; a skipped frame leaves
+//! them as they were.
 //!
 //! # A new source
 //!
@@ -276,7 +279,7 @@ use gst_video::VideoInfo;
 use obc_backend::{
     BackendError, BackendFactory, ColourSpec, DeviceNv12, EffectKind, FrameKind, FrameParams,
     GpuContext, HostNv12, InferenceBackend, LoadReport, LoadRequest, StageId, StageList,
-    StageTimings,
+    StageTimings, StageValue,
 };
 use obc_gpu::{ContextGuard, CuContext, CuStream, Event};
 
@@ -828,6 +831,9 @@ struct Shared {
     gpu_ms: Mutex<VecDeque<f32>>,
     /// The counters of every stage that has run, in the order it first ran.
     stage_figures: Mutex<Vec<(StageId, StageFigures)>>,
+    /// The status values the backend reported after the last processed
+    /// frame whose figures were read (see "Timings" in the module docs).
+    stage_values: Mutex<Vec<StageValue>>,
 }
 
 /// The counters of one stage.
@@ -1173,6 +1179,18 @@ impl ObcEffect {
                 c.fallback.error.clone(),
             )
         };
+        // Only the values of what is ready: a stage of the list that is,
+        // or one of the effect's chain while the effect is.
+        let stage_values = lock(&self.shared.stage_values)
+            .iter()
+            .filter(
+                |v| match stage_statuses.iter().find(|(s, _)| *s == v.stage) {
+                    Some((_, st)) => *st == EffectStatus::Ready,
+                    None => status == EffectStatus::Ready,
+                },
+            )
+            .cloned()
+            .collect();
         let gpu_window: Vec<f32> = lock(&self.shared.gpu_ms).iter().copied().collect();
         let stages = {
             let figures = lock(&self.shared.stage_figures);
@@ -1208,6 +1226,7 @@ impl ObcEffect {
             loads,
             cuda_active: s.cuda_active.load(Ordering::Relaxed),
             fallback_error,
+            stage_values,
         }
     }
 
@@ -1583,6 +1602,7 @@ impl ObcEffect {
     /// current, one of CUDA frames with its context pushed (leaked if that
     /// fails). Runs after the worker has been joined.
     fn release_gpu(&self) {
+        lock(&self.shared.stage_values).clear();
         let (gpu, cached, host_pool) = {
             let mut st = lock(&self.stream);
             (st.gpu.take(), st.cache.take(), st.host_pool.take())
@@ -1660,13 +1680,20 @@ impl ObcEffect {
     /// "Timings" in the module docs), if the backend has them. Never waits
     /// for the `Engine` lock: if the worker holds it (a load, a switch or an
     /// unload under way), this frame's figures are skipped.
-    fn stage_times(&self) -> Option<StageTimings> {
+    ///
+    /// The status values the backend reports after that frame come with
+    /// them; `None` when the lock was not taken (the values are then left
+    /// as they were).
+    fn stage_figures(&self) -> (Option<StageTimings>, Option<Vec<StageValue>>) {
         let e = match self.shared.engine.try_lock() {
             Ok(e) => e,
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::WouldBlock) => return (None, None),
         };
-        e.instance.as_ref()?.timings()
+        match e.instance.as_ref() {
+            Some(i) => (i.timings(), Some(i.status_values())),
+            None => (None, Some(Vec::new())),
+        }
     }
 
     /// Fills `out` for `action` and waits for it: on the element's CUDA
@@ -2023,8 +2050,9 @@ impl ObcEffect {
         st.raw_on_screen = raw_on_screen_after(st.raw_on_screen, ScreenEvent::Output(output));
         if r.processed {
             self.shared.processed.fetch_add(1, Ordering::Relaxed);
-            if !r.ran.is_empty() {
-                let times = self.stage_times();
+            if !r.ran.is_empty() || r.effect_ran {
+                let (times, values) = self.stage_figures();
+                update_stage_values(&mut lock(&self.shared.stage_values), values, &r);
                 let mut figures = lock(&self.shared.stage_figures);
                 for id in r.ran {
                     let i = match figures.iter().position(|(s, _)| *s == id) {
@@ -2052,6 +2080,18 @@ impl ObcEffect {
             self.shared.black.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Replaces `current` with the status values `read` after the frame `r`,
+/// of the chain loaded for it: the stages that ran on it and, when the
+/// effect ran, its `background` stage. `None` (the `Engine` lock was not
+/// taken, see "Timings" in the module docs) leaves `current` as it was.
+fn update_stage_values(current: &mut Vec<StageValue>, read: Option<Vec<StageValue>>, r: &Rendered) {
+    let Some(read) = read else { return };
+    *current = read
+        .into_iter()
+        .filter(|v| r.ran.contains(&v.stage) || (r.effect_ran && v.stage == StageId::BACKGROUND))
+        .collect();
 }
 
 /// What [`ObcEffect::run_frame`] wrote into a frame.
@@ -3431,7 +3471,8 @@ mod tests {
     use super::{
         BackendError, BackendFactory, ColourSpec, Control, EffectFallback, EffectKind,
         EffectSettings, EffectStatus, Format, FrameAction, InferenceBackend, NO_BACKEND, OnExit,
-        Refusals, StageId, background, decide, decide_frame, published_kind, refusals,
+        Refusals, Rendered, StageId, StageValue, background, decide, decide_frame, published_kind,
+        refusals, update_stage_values,
     };
     use crate::settings::StageRequest;
     use std::cell::Cell;
@@ -3442,6 +3483,52 @@ mod tests {
     /// `refresh_fallback` builds it.
     fn key_now(c: &Control, path: &Path) -> Option<super::FallbackKey> {
         c.fallback_wanted(background::FileStamp::of(path))
+    }
+
+    /// The values after a frame are those of its loaded chain; a frame
+    /// whose figures were skipped (the `Engine` lock not taken) keeps the
+    /// last ones.
+    #[test]
+    fn stage_values_follow_the_loaded_chain_and_survive_a_skipped_frame() {
+        let v = |stage: StageId, name: &str| StageValue {
+            stage,
+            name: name.into(),
+            value: 1.0,
+        };
+        let read = || {
+            vec![
+                v(StageId::DENOISE, "level"),
+                v(StageId::BACKGROUND, "coverage"),
+                v(StageId::RELIGHT, "stray"),
+            ]
+        };
+        let stages_alone = Rendered {
+            processed: true,
+            ran: vec![StageId::DENOISE],
+            ..Rendered::default()
+        };
+        let effect_alone = Rendered {
+            processed: true,
+            effect_ran: true,
+            ..Rendered::default()
+        };
+        let mut current = Vec::new();
+        update_stage_values(&mut current, Some(read()), &stages_alone);
+        assert_eq!(current, [v(StageId::DENOISE, "level")], "the stages alone");
+        update_stage_values(&mut current, None, &effect_alone);
+        assert_eq!(
+            current,
+            [v(StageId::DENOISE, "level")],
+            "a skipped frame keeps the last values"
+        );
+        update_stage_values(&mut current, Some(read()), &effect_alone);
+        assert_eq!(
+            current,
+            [v(StageId::BACKGROUND, "coverage")],
+            "only the effect ran"
+        );
+        update_stage_values(&mut current, Some(Vec::new()), &effect_alone);
+        assert!(current.is_empty(), "none reported");
     }
 
     #[test]

@@ -15,7 +15,9 @@ mod fake_backend;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fake_backend::{FAKE_BLUR_Y, FakeConfig, FakeFactory, FakeLog};
+use fake_backend::{
+    FAKE_BLUR_Y, FAKE_COVERAGE, FAKE_DENOISE_LEVEL, FakeConfig, FakeFactory, FakeLog,
+};
 use gst::prelude::*;
 use obc_core::config::VideoMemory;
 use obc_core::{AspectPolicy, OutputContract, PixelFormat};
@@ -184,6 +186,30 @@ fn a_system_memory_session_streams_through_the_effect_without_cuda() {
             .filter(|&&y| y == FAKE_BLUR_Y)
             .count()
             >= 10
+    });
+    assert_eq!(
+        session
+            .output()
+            .stage_values()
+            .iter()
+            .map(|v| (v.stage.as_str(), v.name.as_str(), v.value))
+            .collect::<Vec<_>>(),
+        [("background", "coverage", FAKE_COVERAGE)],
+        "the effect alone reports its own values only"
+    );
+    // A stage that reports a status value: its value after a frame.
+    session
+        .output()
+        .set_effect(&EffectSettings::of(EffectKind::Blur).with_stage(
+            obc_pipeline::effect::StageRequest::on(obc_pipeline::effect::StageId::DENOISE),
+        ))
+        .unwrap();
+    wait_for(Duration::from_secs(10), "the stage's status value", || {
+        session
+            .output()
+            .stage_values()
+            .iter()
+            .any(|v| v.stage.as_str() == "denoise" && v.value == FAKE_DENOISE_LEVEL)
     });
     assert!(writer.counts().forwarded > 0, "{:?}", writer.counts());
     session.stop().unwrap();

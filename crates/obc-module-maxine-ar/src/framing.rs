@@ -259,6 +259,12 @@ impl Framer {
         self.rect(self.current)
     }
 
+    /// The zoom now: the frame's height over the crop's, 1.0 at the full
+    /// frame, at most [`MAX_ZOOM`].
+    pub fn zoom(&self) -> f64 {
+        self.height / self.current.h
+    }
+
     /// Whether the crop is the full frame (to within half a pixel): no
     /// scaling is needed.
     pub fn is_full(&self) -> bool {
@@ -383,6 +389,24 @@ mod tests {
                 height: 1080.0
             }
         );
+    }
+
+    #[test]
+    fn the_zoom_is_the_frame_height_over_the_crop_height() {
+        let mut f = Framer::new(W, H, Framing::Tight);
+        assert_eq!(f.zoom(), 1.0, "the full frame");
+        // A small face, tight: the crop eases to the zoom cap.
+        let fc = face(960.0, 540.0, 60.0);
+        run(&mut f, 0.0, 10.0, 30.0, Some(&fc));
+        assert!((f.zoom() - MAX_ZOOM).abs() < 1e-6, "{}", f.zoom());
+        assert!((f.zoom() - 1080.0 / f.crop().height).abs() < 1e-9);
+        // Partway back to the full frame, between the two.
+        f.update(10.0 + HOLD_S + 0.5, None);
+        let z = f.zoom();
+        assert!(z > 1.0 && z < MAX_ZOOM, "{z}");
+        assert!((z - 1080.0 / f.crop().height).abs() < 1e-9);
+        f.reset();
+        assert_eq!(f.zoom(), 1.0);
     }
 
     #[test]

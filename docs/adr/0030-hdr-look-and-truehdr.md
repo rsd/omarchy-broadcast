@@ -26,7 +26,7 @@ The effect's debander is left at the SDK default, on; the stage does not set `De
 ### One TrueHDR stage for both outputs
 The stage is built so that a later 10-bit output would not run TrueHDR a second time. It keeps the 10-bit image TrueHDR wrote on the GPU, in memory it owns, after the tone map has read it. A later side output would hand that image on:
 - the **main output** stays 8-bit and carries the look (this decision);
-- a **side output**, an optional addition of module ABI 1.3 that a stage declares and the host routes to an output that can carry 10 bits, would carry the 10-bit image. It is not built, not in the ABI, and not reserved in it: ABI 1.3 is where it would be added, as an optional entry, so that a 1.0 to 1.2 module is unaffected.
+- a **side output**, an optional addition of module ABI 1.3 that a stage declares and the host routes to an output that can carry 10 bits, would carry the 10-bit image. It is not built, not in the ABI, and not reserved in it: a later minor version is where it would be added, as an optional entry, so that an older module is unaffected. *(Amendment, daemon 0.41.0: ABI 1.3 went to the status values of [ADR-0025](0025-loadable-modules.md), so the side output would now be ABI 1.4 or later.)*
 
 One TrueHDR pass per frame would thus feed both.
 
@@ -59,7 +59,7 @@ Phase (b) is a PipeWire `Video/Source` in P010 with BT.2020 and PQ colour keys, 
 | **TrueHDR as a daemon feature outside the module system** | The same reasons as for frame generation ([ADR-0027](0027-output-modes-frame-generation-and-privacy-fallback.md)): it would add a second path for a GPU feature that the ABI, the crash ledger, the failure rules and the pin and profile choice already handle |
 
 ## Future work
-- **ABI 1.3, an optional side output.** A stage declares a second output (the 10-bit image, a format and a colour description); the host routes it to an output that takes it and ignores it otherwise. Additive, as ABI 1.1 and 1.2 were.
+- **A later ABI minor (1.4 or later, since 1.3 carries the status values), an optional side output.** A stage declares a second output (the 10-bit image, a format and a colour description); the host routes it to an output that takes it and ignores it otherwise. Additive, as ABI 1.1 to 1.3 were.
 - **Phase (b), a 10-bit HDR PipeWire node** (P010, BT.2020, PQ colour keys, present only while the look is on), if the conditions above are met.
 - A test of a P010 node in OBS Studio, to turn the preliminary no-go into a decision.
 
