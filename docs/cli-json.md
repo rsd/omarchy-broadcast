@@ -39,6 +39,7 @@
 | `omarchy-broadcast media [list] [KIND] [--json]` | Lists the background gallery of `KIND` (`background`, the default, or `away`): the directories and one line per item, the bundled ones first (`GetMedia`). Never starts the daemon. See [Media](#media). | A `media` line, then one `media_item` line each. |
 | `omarchy-broadcast media import KIND PATH [--select] [--json]` | Copies an image, or from interface revision 18 a video or an animated image, into your gallery after the daemon has checked it, and prints the stored path (`ImportMedia`); with `--select`, also makes it the background and selects `replace` (`background`), or the away image (`away`). | One `media_import` object. |
 | `omarchy-broadcast media remove PATH` | Removes an item of your gallery (`RemoveMedia`). | No. |
+| `omarchy-broadcast media convert-command PATH` | Prints the `ffmpeg` command that converts a video into a WebM that plays without an NVIDIA GPU (interface revision 19, `GetConvertCommand`). See [Media](#media). | No. |
 | `omarchy-broadcast preview [--json] [--fps 15\|30]` | Holds a live preview lease on the daemon and prints a line for each frame it writes, until interrupted. See [Preview](#preview). | One object per line (NDJSON). |
 | `omarchy-broadcast watch` | Follows the daemon: a summary when it connects, then a line for each change and each `Stats` signal (about once per second while `active`), until interrupted. The summary ends with `| error: ...` and `| warning: ...` when they are set, and a change of either is a line (`warning: ...`, `warning: (cleared)`). | One object per line (NDJSON). |
 
@@ -67,7 +68,7 @@ omarchy-broadcast effect [none|blur|replace] [--strength X] [--image PATH]
 
 - `none`, `blur` and `replace` select the effect. `--strength X` (0.0 to 1.0) is accepted with `blur` only and `--image PATH` with `replace` only; giving one with another effect is a usage error (status `2`), as is a strength outside 0 to 1 or an image that does not exist or is not a regular file.
 - `PATH` is made absolute against the current directory, so the daemon, which has its own working directory, is always given an absolute path. The daemon requires a PNG, JPEG or still WebP file (an animated WebP is refused, and WebP needs the GStreamer decoder `webpdec`, in gst-plugins-bad: without it the file is refused with a reason that names it); other files are rejected by the daemon (status `1`) or fail when the effect starts (the daemon's `Error` property says why). The images of the gallery ([Media](#media)) are the ones a panel offers.
-- **`--image` with a video** (a daemon of interface revision 18 or later; an older daemon does not support one). `PATH` may be an MP4, M4V, MOV, MKV or WebM video, or the stored path of a video or an animation of the gallery: the daemon checks it as a video (the container and codec from the content; H.264, HEVC, VP9 or AV1, 8-bit 4:2:0, at most 512 MiB and 3840x2160; nothing is decoded) and plays it in a loop behind the person while `replace` is in force. The call can take a moment for a large file. A video the daemon refuses is rejected with status `1` and the reason, for example `the video file /home/user/loop.mp4: it is 7680x4320, larger than the 3840x2160 limit`. The video plays with the original on a machine with an NVIDIA GPU; in system memory only a CPU-ready video (VP9 profile 0 in WebM or Matroska, at most 1920x1080 and 30 fps) plays as it is, and any other plays after the daemon has made a playback copy in its cache, a still image (the poster) standing in meanwhile. `status` and `watch --json` carry the reason in `warning` while a still is shown ([dbus-api.md](dbus-api.md#video-backgrounds-revision-18)). `effect` prints the path as the `Image:` line, whether it names an image or a video.
+- **`--image` with a video** (a daemon of interface revision 18 or later; an older daemon does not support one). `PATH` may be an MP4, M4V, MOV, MKV or WebM video, or the stored path of a video or an animation of the gallery: the daemon checks it as a video (the container and codec from the content; H.264, HEVC, VP9 or AV1, 8-bit 4:2:0, at most 512 MiB and 3840x2160; nothing is decoded) and plays it in a loop behind the person while `replace` is in force. The call can take a moment for a large file. A video the daemon refuses is rejected with status `1` and the reason, for example `the video file /home/user/loop.mp4: it is 7680x4320, larger than the 3840x2160 limit`. The video plays with the original on a machine with an NVIDIA GPU; in system memory only a CPU-ready video (VP9 profile 0 in WebM or Matroska, at most 1920x1080 and 30 fps) plays as it is, and any other is shown as its poster, a still image, with a `warning` that names [`media convert-command`](#media) (a daemon of interface revision 19; revision 18 made a playback copy in its cache instead). `status` and `watch --json` carry the reason in `warning` while a still is shown ([dbus-api.md](dbus-api.md#video-backgrounds-revision-18)). `effect` prints the path as the `Image:` line, whether it names an image or a video.
 - The options are applied before the effect is selected (`SetBlurStrength` and `SetBackgroundImage`, then `SetEffect`), so the effect starts with them. If an option is rejected, the effect is not selected. `omarchy-broadcast effect replace` without `--image` uses the image the daemon already has (the earlier choice or the configuration's); with none, the daemon rejects it with the message `the replace effect needs a background image: set one with SetBackgroundImage first`.
 - The settings persist across restarts of the daemon and take precedence over `config.toml` ([dbus-api.md](dbus-api.md#video-effects)).
 - Status `1` also covers the daemon's `InvalidArgument` error (an unacceptable value, with its message on stderr).
@@ -391,12 +392,13 @@ The strings are bounded in bytes of their JSON encoding: a key (`id`) 128, a gro
 
 ## Media
 
-`omarchy-broadcast media` shows and manages the background gallery ([dbus-api.md](dbus-api.md#the-background-gallery-revision-15), [ADR-0032](adr/0032-background-gallery.md)): the images that `effect replace` can use as a background, and the images for the `away` kind, either bundled with the package or imported by the user. The daemon owns the gallery; the command wraps its three methods and needs a daemon of interface revision 15.
+`omarchy-broadcast media` shows and manages the background gallery ([dbus-api.md](dbus-api.md#the-background-gallery-revision-15), [ADR-0032](adr/0032-background-gallery.md)): the images that `effect replace` can use as a background, and the images for the `away` kind, either bundled with the package or imported by the user. The daemon owns the gallery; the command wraps its methods and needs a daemon of interface revision 15 (the folders of the gallery and the conversion command, revision 19). Your own gallery is two folders called `omarchy-broadcast`: the images in your Pictures folder (`$(xdg-user-dir PICTURES)`, else `~/Pictures`), the away images in its `away` folder, and the videos in your Videos folder (`$(xdg-user-dir VIDEOS)`, else `~/Videos`). A file you drop into one of them appears at the next listing.
 
 ```text
 omarchy-broadcast media [list] [KIND] [--json]
 omarchy-broadcast media import KIND PATH [--select] [--json]
 omarchy-broadcast media remove PATH
+omarchy-broadcast media convert-command PATH
 ```
 
 `KIND` is `background` or `away`; another value is a usage error (status `2`). `media` and `media list` without a kind list the backgrounds.
@@ -406,40 +408,61 @@ omarchy-broadcast media remove PATH
   ```text
   omarchy-broadcast media
   Bundled: /usr/share/omarchy-broadcast/media/backgrounds
-  Yours:   /home/user/.local/share/omarchy-broadcast/media/backgrounds
+  Yours:   /home/user/Pictures/omarchy-broadcast
+  Videos:  /home/user/Videos/omarchy-broadcast
   Dusk gradient  image  3840x2160  bundled  /usr/share/omarchy-broadcast/media/backgrounds/dusk-gradient.jpg
   Slow aurora  video  1920x1080  bundled  /usr/share/omarchy-broadcast/media/backgrounds/slow-aurora.webm
-  Office  image  1920x1080  yours  /home/user/.local/share/omarchy-broadcast/media/backgrounds/office.jpg
+  Office  image  1920x1080  yours  /home/user/Pictures/omarchy-broadcast/office.jpg
   ```
 
   ```text
   omarchy-broadcast media away
   Bundled: /usr/share/omarchy-broadcast/media/away
-  Yours:   /home/user/.local/share/omarchy-broadcast/media/away
+  Yours:   /home/user/Pictures/omarchy-broadcast/away
   No away items in the gallery
   ```
 
-  The two directories are printed whether or not they exist. The strings come from the daemon and are printed with control characters and bidirectional-text marks escaped, as in [Effect](#effect).
-- **`media import KIND PATH`** copies the image, or from interface revision 18 the video, into the user's gallery and prints the stored path alone, one line. `PATH` is made absolute against the current directory, so the daemon is always given an absolute path; a path that is not valid UTF-8 is a usage error (status `2`), since D-Bus cannot carry it. The daemon checks the file as it checks a background image: PNG, JPEG or still WebP, found from the content and not from the name, at most 32 MiB and 8192x8192 pixels, a complete first image, and a decoder installed for the format (WebP needs `webpdec`). From revision 18 a **video** (for the kind `background`) is stored as it is, after the check described under [`effect`](#effect): MP4, M4V, MOV, MKV or WebM holding H.264, HEVC, VP9 or AV1, 8-bit 4:2:0, at most 512 MiB and 3840x2160, found from the content; the stored file has the extension of its container and a file with the same content is not copied again. An **animated GIF, WebP or APNG** is converted with ffmpeg into a VP9 WebM (at most 1920x1080 and 30 fps), which is stored and is the item; without ffmpeg it is refused with `an animated image needs ffmpeg, which is not installed`. The import of a video or an animation takes as long as the copy and the check do, and for an animation as long as the conversion (up to 120 seconds; the command gives up after 600 s, see below). For the kind `away` a video or an animation is refused with `an away image must be a still image (PNG, JPEG or WebP)`. The stored name is made from the file's name (made safe, a suffix added when the name is taken, never overwriting a file), and a file with the same bytes as an image already in that directory is not copied again: its path is printed. The rules are in [dbus-api.md](dbus-api.md#the-background-gallery-revision-15).
+  The directories are printed whether or not they exist: `Bundled:`, `Yours:` and, from interface revision 19 when the daemon names one, `Videos:` (the folder of the kind's videos; there is none for `away`, and none when it is the same folder as `Yours:`). Under a video that does not play without an NVIDIA GPU (a daemon of revision 19), the line that follows gives its conversion command, as `media convert-command` does:
+
+  ```text
+  Clip  video  3840x2160  yours  /home/user/Videos/omarchy-broadcast/clip.mp4
+    Without the NVIDIA GPU it shows as a still; convert it with: ffmpeg -nostdin -n -protocol_whitelist file -i '/home/user/Videos/omarchy-broadcast/clip.mp4' …
+  ```
+
+  (The command is on that one line, whole; it is cut here.)
+
+  A command that a terminal would not show as it is (a control character in a path) is left out of the text, not altered; the JSON line has it. The strings come from the daemon and are printed with control characters and bidirectional-text marks escaped, as in [Effect](#effect).
+- **`media import KIND PATH`** copies the image, or from interface revision 18 the video, into the user's gallery (an image into your Pictures folder's `omarchy-broadcast`, a video or an animation's WebM into your Videos folder's) and prints the stored path alone, one line. `PATH` is made absolute against the current directory, so the daemon is always given an absolute path; a path that is not valid UTF-8 is a usage error (status `2`), since D-Bus cannot carry it. The daemon checks the file as it checks a background image: PNG, JPEG or still WebP, found from the content and not from the name, at most 32 MiB and 8192x8192 pixels, a complete first image, and a decoder installed for the format (WebP needs `webpdec`). From revision 18 a **video** (for the kind `background`) is stored as it is, after the check described under [`effect`](#effect): MP4, M4V, MOV, MKV or WebM holding H.264, HEVC, VP9 or AV1, 8-bit 4:2:0, at most 512 MiB and 3840x2160, found from the content; the stored file has the extension of its container and a file with the same content is not copied again. An **animated GIF, WebP or APNG** is converted with ffmpeg into a VP9 WebM (at most 1920x1080 and 30 fps), which is stored and is the item; without ffmpeg it is refused with `an animated image needs ffmpeg, which is not installed`. The import of a video or an animation takes as long as the copy and the check do, and for an animation as long as the conversion (up to 120 seconds; the command gives up after 600 s, see below). For the kind `away` a video or an animation is refused with `an away image must be a still image (PNG, JPEG or WebP)`. The stored name is made from the file's name (made safe, a suffix added when the name is taken, never overwriting a file), and a file with the same bytes as an image already in that directory is not copied again: its path is printed. The rules are in [dbus-api.md](dbus-api.md#the-background-gallery-revision-15).
   - **`--select`** then selects the stored image. For `background` it sets it as the background and selects `replace`, as `effect replace --image <stored path>` does (`SetBackgroundImage`, then `SetEffect`). For `away` (interface revision 17) it sets it as the away image, as `config set effect.fallback_image <stored path>` does (`SetConfig`, written to `config.d/50-panel.toml`); it does **not** switch `output.placeholder`, so the feed shows the away image where there is no camera picture only once `config set output.placeholder image` is also set ([dbus-api.md](dbus-api.md#the-away-image-revision-17), [ADR-0034](adr/0034-away-image.md)). For any other kind it is a usage error (status `2`): `--select applies to `background` or `away`, not `<kind>``. Against a daemon of interface revision 16 or lower, `away --select` is refused before anything is imported (`unsupported-daemon` with `--json`): the daemon cannot select an away image (its interface revision is N, that needs 17); update omarchy-broadcastd. If the import succeeds and the selection fails, the image stays in the gallery, and the message says so: `<path> was imported, but selecting it failed: <reason>` (status of the failure; with `--json` an `error` line with that message).
-- **`media remove PATH`** removes an item of the user's gallery and prints `Removed PATH`. `PATH` is as `media list` prints it (made absolute against the current directory, not resolved). A bundled item, or a path that is not an item of the user's gallery, is refused with status `1`; so is a file that the configuration names (`[effect] background_image` or `fallback_image`), with the key in the message. Removing the image that is the background in force clears that choice first, as `SetBackgroundImage` with an empty path does, which the daemon refuses while `replace` is selected and the configuration has no image: select another effect or image first.
-- `media` and `media list` never start the daemon and give up after 5 s; `media import` and `media remove` may start it through D-Bus activation. `media remove` gives up after 30 s; `media import` gives up after 600 s, since the daemon checks and copies a video of up to 512 MiB and converts an animation before it answers (the limit stays within the 610 s of the bar plugin's flow watchdog; the D-Bus connection sets no method timeout of its own).
+- **`media remove PATH`** removes an item of the user's gallery and prints `Removed PATH`. `PATH` is as `media list` prints it (made absolute against the current directory, not resolved). `PATH` may be in either of your folders. A bundled item, or a path that is not an item of the user's gallery (a file that is not an image or video, a hidden file, a file in another folder), is refused with status `1`; so is a file that the configuration names (`[effect] background_image` or `fallback_image`), with the key in the message. Removing the image that is the background in force clears that choice first, as `SetBackgroundImage` with an empty path does, which the daemon refuses while `replace` is selected and the configuration has no image: select another effect or image first.
+- **`media convert-command PATH`** (a daemon of interface revision 19; an older one is refused as unsupported, status `1`) prints the shell command that converts the video at `PATH` into a CPU-ready VP9 WebM, alone on one line, and runs nothing. It is for a machine without an NVIDIA GPU, where only VP9 profile 0 of at most 1920x1080 and 30 fps plays and any other video is shown as its poster with a `Warning` that names this command. `PATH` is made absolute against the current directory (the file need not be in the gallery; the daemon checks it as `SetBackgroundImage` does). The command writes `<name>-cpu.webm` into your Videos folder's `omarchy-broadcast` (the first free `<name>-cpu-<n>.webm` when that name is taken), where the result is listed with the other videos, and every path in it is single-quoted so that the line can be pasted into a shell:
+
+  ```text
+  $ omarchy-broadcast media convert-command ~/Videos/clip.mp4
+  ffmpeg -nostdin -n -protocol_whitelist file -i '/home/user/Videos/clip.mp4' -map 0:v:0 -an -sn -dn -map_metadata -1 -vf 'scale=w=max(2\,trunc(min(1\,min(1920/iw\,1080/ih))*iw/2)*2):h=max(2\,trunc(min(1\,min(1920/iw\,1080/ih))*ih/2)*2),setsar=1' -fpsmax 30 -pix_fmt yuv420p -c:v libvpx-vp9 -profile:v 0 -deadline realtime -cpu-used 8 -row-mt 1 -crf 32 -b:v 8M -g 60 -force_key_frames 'expr:gte(t,n_forced*2)' -f webm '/home/user/Videos/omarchy-broadcast/clip-cpu.webm'
+  ```
+
+  Exit status `0` when the command is printed. `1` when the daemon refuses: the file is not a video or the check refuses it, it already plays without an NVIDIA GPU (there is nothing to convert), a path is not UTF-8, the gallery is unavailable, or the daemon is older than revision 19; the reason is on standard error. `2` for a usage error (no `PATH`, or a path that is not valid UTF-8, which D-Bus cannot carry). `3` when the daemon is not running and cannot be started through D-Bus activation. A command that a terminal would not show as it is (a control character in a path) is refused with status `1` rather than altered, since an altered command would name another file. There is no `--json`: the output is the command alone. The command is also in `media list` (under the video) and in `media --json` (`convert_command`). The command is only printed: it may be slow, and the user runs it. It gives up after 30 s with status `4`.
+- `media` and `media list` never start the daemon and give up after 5 s; `media import`, `media remove` and `media convert-command` may start it through D-Bus activation. `media remove` gives up after 30 s; `media import` gives up after 600 s, since the daemon checks and copies a video of up to 512 MiB and converts an animation before it answers (the limit stays within the 610 s of the bar plugin's flow watchdog; the D-Bus connection sets no method timeout of its own).
 - Against a daemon of interface revision 14 or lower the commands print `omarchy-broadcast: the daemon does not support the media gallery (its interface revision is N, the gallery needs 15); update omarchy-broadcastd` and exit with status `1`; with `--json` they print an `error` line with the code `unsupported-daemon` instead.
 
 ### `media`, `media_item` and `media_import` lines
 
 `media --json` (and `media list --json`) prints one `media` line, then one `media_item` line per item, in the daemon's order (the bundled items, then the user's). The first line says how many follow, so a client reads exactly that many.
 
-`{"v":1,"type":"media","kind":"background","serial":3,"bundled_dir":"/usr/share/omarchy-broadcast/media/backgrounds","user_dir":"/home/u/.local/share/omarchy-broadcast/media/backgrounds","items":2,"items_truncated":false}`
+`{"v":1,"type":"media","kind":"background","serial":3,"bundled_dir":"/usr/share/omarchy-broadcast/media/backgrounds","user_dir":"/home/u/Pictures/omarchy-broadcast","video_dir":"/home/u/Videos/omarchy-broadcast","items":2,"items_truncated":false}`
 
 | Field | JSON type | Meaning |
 |---|---|---|
 | `v`, `type` | | `1`, `"media"`. |
 | `kind` | string | The kind listed: `"background"` or `"away"`. |
 | `serial` | number | The daemon's `MediaSerial` when the list was made. It restarts at 1 with the daemon: compare it only within one daemon run. |
-| `bundled_dir`, `user_dir` | string | The kind's directory in the package's read-only gallery and in the user's. Never clipped, since a client opens them; one over 3800 bytes of JSON encoding is `""`, and its items are left out. When both together would not fit the line, `bundled_dir` is `""` and its items are left out. |
+| `bundled_dir`, `user_dir` | string | The kind's directory in the package's read-only gallery and in the user's (for `background`, your Pictures folder's `omarchy-broadcast`; for `away`, its `away` folder). Never clipped, since a client opens them; one over 3800 bytes of JSON encoding is `""`, and its items are left out. |
+| `video_dir` | string | Only from interface revision 19 (the key is absent for an older daemon, which keeps its videos in `user_dir`): the folder of the kind's videos, your Videos folder's `omarchy-broadcast` (`GetMediaDirs`). `""` for `away`, and when it is the same folder as `user_dir`. Never clipped, as the others; its items (the user's items directly in it) are left out when it is `""` for its length. |
 | `items` | number | The number of `media_item` lines that follow (at most 500). |
 | `items_truncated` | boolean | `true` when items were left out: more than 500, an item whose paths are over the bound, or the items of a directory printed as `""`. |
+
+The directories together must fit the line's 4096 bytes, with 256 bytes kept for its other fields. Each directory is bounded to 3800 bytes alone, and the three are kept in this order: `user_dir` first, then `video_dir`, then `bundled_dir`. One that does not fit within the room the earlier ones leave is printed as `""` and its items are left out (`items_truncated` is `true`), so a line of three long directories drops `bundled_dir` first, then `video_dir`, and the user's own folder last. A user item belongs to `video_dir` when it is directly in it, else to `user_dir`.
 
 `{"v":1,"type":"media_item","kind":"background","path":"/usr/share/omarchy-broadcast/media/backgrounds/dusk-gradient.jpg","label":"Dusk gradient","bundled":true,"media_type":"image","width":3840,"height":2160,"duration_ms":0,"poster":""}`
 
@@ -447,21 +470,27 @@ omarchy-broadcast media remove PATH
 |---|---|---|
 | `v`, `type` | | `1`, `"media_item"`. |
 | `kind` | string | The kind of the list, as in the `media` line. |
-| `path` | string | The file's absolute path. Never clipped: an item whose `path` and `poster` together take more than 3800 bytes of JSON encoding is left out (and `items_truncated` is `true`). |
+| `path` | string | The file's absolute path. Never clipped: an item whose `path` and `poster` together take more than 3800 bytes of JSON encoding is left out (and `items_truncated` is `true`); for a video the bound is 3780 bytes, 20 less, so that its `cpu_ready` keeps the line within 4096. |
 | `label` | string | The name to show. Bounded to 96 bytes. |
 | `bundled` | boolean | `true` for an item of the package's gallery, which cannot be removed. |
 | `media_type` | string | `"image"`, or from interface revision 18 `"video"` (a video, and the conversion of an animated image). Show a value you do not know as it is. Bounded to 16 bytes. |
 | `width`, `height` | number | The size in pixels; `0` when unknown. |
 | `duration_ms` | number | `0` for a still image or when unknown; for a video, its length. |
 | `poster` | string | The path of a video's poster image (a JPEG in the daemon's cache); `""` for a still image, and for a video whose poster is not made yet (list again when the daemon's `MediaSerial` has moved). Counted with `path` in the bound above. |
+| `cpu_ready` | boolean | From interface revision 19, on a video's line only (absent for an image and from an older daemon): `true` when the video plays without an NVIDIA GPU as it is (VP9 profile 0 in WebM or Matroska, at most 1920x1080 and 30 fps), `false` when the CPU shows only its poster. |
+| `convert_command` | string | From interface revision 19, on the line of a video that is not CPU-ready, when the daemon gave a command: the shell command that converts it into a CPU-ready WebM in your Videos folder, as `media convert-command` prints it. Never clipped: a line that would pass 4096 bytes with it is printed without the key (the item stays; `media list` and `media convert-command` give the command whole). |
 
 A video, from interface revision 18:
 
-`{"v":1,"type":"media_item","kind":"background","path":"/usr/share/omarchy-broadcast/media/backgrounds/slow-aurora.webm","label":"Slow aurora","bundled":true,"media_type":"video","width":1920,"height":1080,"duration_ms":10000,"poster":"/home/u/.cache/omarchy-broadcast/posters/<sha256>.jpg"}`
+`{"v":1,"type":"media_item","kind":"background","path":"/usr/share/omarchy-broadcast/media/backgrounds/slow-aurora.webm","label":"Slow aurora","bundled":true,"media_type":"video","width":1920,"height":1080,"duration_ms":10000,"poster":"/home/u/.cache/omarchy-broadcast/posters/<sha256>.jpg","cpu_ready":true}`
+
+A video the CPU does not play, from interface revision 19 (the command is cut here; it is whole in the line):
+
+`{"v":1,"type":"media_item","kind":"background","path":"/home/u/Videos/omarchy-broadcast/clip.mp4","label":"Clip","bundled":false,"media_type":"video","width":3840,"height":2160,"duration_ms":8000,"poster":"/home/u/.cache/omarchy-broadcast/posters/<sha256>.jpg","cpu_ready":false,"convert_command":"ffmpeg -nostdin -n -protocol_whitelist file -i '/home/u/Videos/omarchy-broadcast/clip.mp4' …"}`
 
 `media import --json` prints one line:
 
-`{"v":1,"type":"media_import","kind":"background","path":"/home/u/.local/share/omarchy-broadcast/media/backgrounds/office.jpg","path_truncated":false,"selected":true}`
+`{"v":1,"type":"media_import","kind":"background","path":"/home/u/Pictures/omarchy-broadcast/office.jpg","path_truncated":false,"selected":true}`
 
 | Field | JSON type | Meaning |
 |---|---|---|
@@ -471,7 +500,7 @@ A video, from interface revision 18:
 | `path_truncated` | boolean | `true` when `path` was left out for its length. |
 | `selected` | boolean | `true` when `--select` was given and the image was selected as the background. |
 
-Strings are clipped as the [general rules](#general-rules) say. A failure is an `error` line (see [`error`](#error)); `media remove` has no `--json`.
+Strings are clipped as the [general rules](#general-rules) say. A failure is an `error` line (see [`error`](#error)); `media remove` and `media convert-command` have no `--json`.
 
 ## Preview
 

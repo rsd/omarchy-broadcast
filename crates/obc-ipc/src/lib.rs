@@ -54,7 +54,7 @@ pub use config::{
     CONFIG_REVISION, ConfigFileEntry, ConfigFiles, ConfigGroup, ConfigKind, ConfigRow,
     ConfigSchema, ConfigValue,
 };
-pub use media::{MEDIA_REVISION, MediaEntry, MediaReply};
+pub use media::{MEDIA_DIRS_REVISION, MEDIA_REVISION, MediaDirs, MediaEntry, MediaReply};
 pub use modules::{FORCED_REVISION, MODULES_REVISION, ModuleInfo, ModuleList, StageInfo};
 pub use settings::{
     Condition, ConditionOp, ResetScope, Setting, SettingChange, SettingKind, SettingValue,
@@ -132,8 +132,10 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// numeric values the running stages report (auto-frame's zoom).
 /// Revision 17 added the away image, with no new member
 /// ([`PLACEHOLDER_REVISION`]). Revision 18 added video backgrounds, with no
-/// new member ([`VIDEO_BACKGROUND_REVISION`]).
-pub const INTERFACE_REVISION: u32 = 18;
+/// new member ([`VIDEO_BACKGROUND_REVISION`]). Revision 19 dropped the
+/// playback copies for the CPU and gave the command that converts a video
+/// instead ([`CPU_CONVERT_REVISION`]).
+pub const INTERFACE_REVISION: u32 = 19;
 /// The first [`INTERFACE_REVISION`] with the `StageValues` property.
 pub const STAGE_VALUES_REVISION: u32 = 16;
 /// The first [`INTERFACE_REVISION`] with the away image, and no new member:
@@ -159,8 +161,24 @@ pub const PLACEHOLDER_REVISION: u32 = 17;
 /// prepared for playback on the CPU; a still is shown until it is ready`,
 /// or `…; the background is black until it is ready` with no still) and of
 /// a video that cannot play (`Video background <path> could not be played
-/// (<why>)`).
+/// (<why>)`). Revision 19 replaced the clauses of the preparation
+/// ([`CPU_CONVERT_REVISION`]).
 pub const VIDEO_BACKGROUND_REVISION: u32 = 18;
+/// The first [`INTERFACE_REVISION`] where the daemon no longer makes
+/// playback copies for the CPU, and gave the command that converts a
+/// video instead: in system memory a video that is not CPU-ready (VP9
+/// profile 0 in WebM or Matroska, at most 1920x1080 and 30 fps) is shown
+/// as its poster, and `Warning` says so and points at the command (`The
+/// video background is shown as a still: it can't play without an NVIDIA
+/// GPU; run omarchy-broadcast media convert-command '<path>' for the
+/// conversion command`, the path `<file>` when it would not fit or not
+/// show unchanged); `GetConvertCommand(s path) -> s` gives the command for
+/// any video, and `GetMedia`'s video items gain `cpu_ready` (b) and, when
+/// it is false, `convert_command` (s), the same command
+/// ([`media::MediaEntry`]). `GetMediaDirs(s kind) -> a{sv}` names a
+/// kind's user directories, the user's videos folder among them
+/// ([`media::MediaDirs`], [`media::MEDIA_DIRS_REVISION`]).
+pub const CPU_CONVERT_REVISION: u32 = 19;
 /// The smallest move of a value that announces a change of
 /// `StageValues` (a change of the set always does).
 pub const STAGE_VALUE_STEP: f64 = 0.01;
@@ -1290,7 +1308,8 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, VIDEO_BACKGROUND_REVISION);
+        assert_eq!(INTERFACE_REVISION, CPU_CONVERT_REVISION);
+        const { assert!(VIDEO_BACKGROUND_REVISION < CPU_CONVERT_REVISION) };
         const { assert!(PLACEHOLDER_REVISION < VIDEO_BACKGROUND_REVISION) };
         const { assert!(STAGE_VALUES_REVISION < PLACEHOLDER_REVISION) };
         const { assert!(MEDIA_REVISION < STAGE_VALUES_REVISION) };

@@ -207,10 +207,7 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
     let (commands, command_rx) = channel::<Command>();
     let media =
         MediaStore::from_env().inspect_err(|e| warning!("the media gallery is unavailable: {e}"));
-    // Video backgrounds: posters and playback copies of the gallery's cache
-    // (started now, its first job a prune once the controller names what
-    // the background in force needs).
-    let videos = GalleryVideos::new(media.as_ref().ok().cloned(), commands.clone());
+    let store = media.as_ref().ok().cloned();
     let conn = zbus::connection::Builder::session()
         .serve_at(
             OBJECT_PATH,
@@ -226,6 +223,31 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
     if bus.name_has_owner(name).await.map_err(zbus::Error::from)? {
         return Err(DaemonError::NameTaken);
     }
+
+    // The gallery of an earlier version moves to the pictures directory
+    // now: past the check above (which two daemons started at once may
+    // both pass: the move holds a lock of the old directory, so only one
+    // of them moves it), before the name is requested (no GetMedia is
+    // addressed to the daemon yet) and before the controller thread
+    // starts (its configuration is loaded after the managed file's paths
+    // are rewritten; the cache is pruned after, and the posters of videos
+    // a deferred migration left may go and are remade). Off the executor, and bounded in time (systemd's start
+    // timeout): a copy across file systems of large videos takes a
+    // moment, and what is left waits for the next start.
+    if let Some(store) = store.clone() {
+        let (config, state) = (paths.config.clone(), paths.state.clone());
+        let moved = tokio::task::spawn_blocking(move || {
+            crate::media::migrate::at_start(&store, &config, &state)
+        });
+        if let Err(e) = moved.await {
+            warning!("media: moving the old gallery failed: {e}");
+        }
+    }
+    // Video backgrounds: the posters of the gallery's cache. Its prune
+    // (the playback copies of earlier versions go, and the posters no video
+    // needs) starts once the controller names what the background in force
+    // needs: after the move above, never before it.
+    let videos = GalleryVideos::new(store, commands.clone());
 
     // No other instance: what is in the preview directory is stale.
     let runtime = paths.runtime.clone();
@@ -279,7 +301,7 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
                 if name_rx.blocking_recv().is_ok() {
                     ctrl.set_mic(mic_tx);
                     // Once the name is ours: its prune must not race
-                    // another instance's jobs in the same cache.
+                    // another instance's posters in the same cache.
                     ctrl.set_videos(Box::new(videos));
                     ctrl.load_modules(Instant::now());
                 }

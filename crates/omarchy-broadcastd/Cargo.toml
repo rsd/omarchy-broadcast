@@ -30,7 +30,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 libc = { workspace = true }
 clap = { workspace = true }
-# The content hashes naming posters and playback copies.
+# The content hashes naming posters.
 sha2 = { workspace = true }
 
 [features]

@@ -457,12 +457,20 @@ struct Mock {
     /// The user's gallery root ([`USER_MEDIA`] unless a test sets one);
     /// an import writes an empty file there when it exists.
     media_user: String,
+    /// The user's videos folder of a background (`GetMediaDirs`,
+    /// [`USER_VIDEOS`] unless a test sets one).
+    media_videos: String,
     /// `StageValues` (revision 16); none unless a test sets them.
     stage_values: Vec<obc_ipc::StageValue>,
+    /// `InterfaceRevision` ([`INTERFACE_REVISION`] unless a test sets an
+    /// older one; the members stay served).
+    revision: u32,
 }
 
 /// The mock's user gallery root.
 const USER_MEDIA: &str = "/home/u/.local/share/omarchy-broadcast/media";
+/// The mock's user videos folder of the backgrounds.
+const USER_VIDEOS: &str = "/home/u/Videos/omarchy-broadcast";
 
 /// The mock's gallery directories of `kind`: bundled and the user's under
 /// `user`.
@@ -501,6 +509,8 @@ fn media_item_in(
         height: 2160,
         duration_ms: 0,
         poster: String::new(),
+        cpu_ready: false,
+        convert_command: String::new(),
     }
 }
 
@@ -839,7 +849,9 @@ impl Mock {
             .into(),
             media_serial: 1,
             media_user: USER_MEDIA.into(),
+            media_videos: USER_VIDEOS.into(),
             stage_values: Vec::new(),
+            revision: INTERFACE_REVISION,
         }
     }
 
@@ -1815,6 +1827,35 @@ impl Mock {
         .to_wire())
     }
 
+    /// As the daemon: the user directory `GetMedia` gives and, for a
+    /// background, the videos folder (`""` for away).
+    async fn get_media_dirs(
+        &mut self,
+        kind: String,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> Result<VariantDict, IpcError> {
+        self.calls.push(format!("GetMediaDirs({kind})"));
+        if may_auto_start(&header) {
+            self.auto_start.push(format!("GetMediaDirs({kind})"));
+        }
+        if !self.media.contains_key(&kind) {
+            return Err(IpcError::InvalidArgument(format!(
+                "unknown media kind {kind:?}"
+            )));
+        }
+        let (_, user_dir) = media_dirs(&kind, &self.media_user);
+        let video_dir = if kind == "background" {
+            self.media_videos.clone()
+        } else {
+            String::new()
+        };
+        Ok(obc_ipc::MediaDirs {
+            user_dir,
+            video_dir,
+        }
+        .to_dict())
+    }
+
     /// Stores the file under its name in the user's directory; a `.txt`
     /// stands for a file that is not an image.
     async fn import_media(
@@ -1882,6 +1923,32 @@ impl Mock {
         Ok(())
     }
 
+    /// As the daemon, by name: a `.webm` already plays without the GPU,
+    /// another video (`.mp4`, `.mkv`, `.mov`) gets a command converting it
+    /// into the user's gallery, anything else is not a video.
+    async fn get_convert_command(&mut self, path: String) -> Result<String, IpcError> {
+        self.calls.push(format!("GetConvertCommand({path})"));
+        let p = std::path::Path::new(&path);
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default();
+        match ext {
+            "webm" => Err(IpcError::InvalidArgument(format!(
+                "the video file {path} already plays without an NVIDIA GPU: there is nothing \
+                 to convert"
+            ))),
+            "mp4" | "mkv" | "mov" => {
+                let stem = p.file_stem().unwrap().to_str().unwrap();
+                Ok(format!(
+                    "ffmpeg -nostdin -n -protocol_whitelist file -i '{path}' -f webm \
+                     '{}/{stem}-cpu.webm'",
+                    self.media_user
+                ))
+            }
+            _ => Err(IpcError::InvalidArgument(format!(
+                "the video file {path}: not an MP4, MOV, MKV or WebM file"
+            ))),
+        }
+    }
+
     #[zbus(property)]
     fn media_serial(&self) -> u32 {
         self.media_serial
@@ -1889,7 +1956,7 @@ impl Mock {
 
     #[zbus(property)]
     fn interface_revision(&self) -> u32 {
-        INTERFACE_REVISION
+        self.revision
     }
 }
 
@@ -7084,6 +7151,7 @@ fn media_lists_the_gallery_and_never_starts_the_daemon() {
     let human = format!(
         "Bundled: /usr/share/omarchy-broadcast/media/backgrounds\n\
          Yours:   {user}\n\
+         Videos:  {USER_VIDEOS}\n\
          Dusk  image  3840x2160  bundled  /usr/share/omarchy-broadcast/media/backgrounds/dusk.webp\n\
          Office  image  3840x2160  yours  {user}/office.png\n"
     );
@@ -7101,6 +7169,7 @@ fn media_lists_the_gallery_and_never_starts_the_daemon() {
     assert_eq!(v["kind"], "background");
     assert_eq!(v["serial"], 1);
     assert_eq!(v["user_dir"], user);
+    assert_eq!(v["video_dir"], USER_VIDEOS);
     assert_eq!(v["items"], 2);
     assert_eq!(v["items_truncated"], false);
     let items = &lines[1..];
@@ -7124,6 +7193,7 @@ fn media_lists_the_gallery_and_never_starts_the_daemon() {
         assert_eq!(out.status.code(), Some(0), "{args:?}: {}", out.stderr);
         let v = json_line(&out.stdout);
         assert_eq!(v["kind"], "away", "{args:?}");
+        assert_eq!(v["video_dir"], "", "{args:?}");
         assert_eq!(v["items"], 0);
     }
     let out = bus.run(&["media", "away"]);
@@ -7132,18 +7202,21 @@ fn media_lists_the_gallery_and_never_starts_the_daemon() {
         "{}",
         out.stdout
     );
+    // Away has no videos folder: no Videos line.
+    assert!(!out.stdout.contains("Videos:"), "{}", out.stdout);
 
     // Every read was made without starting the daemon.
     let mut auto = Vec::new();
     mock.with(|m| auto = m.auto_start.clone());
     assert_eq!(auto, Vec::<String>::new());
-    assert_eq!(
-        mock.take_calls()
-            .iter()
-            .filter(|c| c.starts_with("GetMedia"))
-            .count(),
-        7
-    );
+    let calls = mock.take_calls();
+    for method in ["GetMedia(", "GetMediaDirs("] {
+        assert_eq!(
+            calls.iter().filter(|c| c.starts_with(method)).count(),
+            7,
+            "{method} {calls:?}"
+        );
+    }
 
     // Usage errors, before any call.
     for args in [
@@ -7157,6 +7230,160 @@ fn media_lists_the_gallery_and_never_starts_the_daemon() {
         assert_eq!(out.status.code(), Some(2), "{args:?}: {}", out.stderr);
     }
     assert!(mock.take_calls().is_empty());
+}
+
+#[test]
+fn media_list_names_the_videos_folder_from_revision_19_only() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let user = "/home/u/.local/share/omarchy-broadcast/media/backgrounds";
+    let clip = format!("{USER_VIDEOS}/beach.webm");
+    mock.with(|m| {
+        m.media
+            .get_mut("background")
+            .unwrap()
+            .push(obc_ipc::MediaEntry {
+                path: clip.clone(),
+                media_type: "video".into(),
+                cpu_ready: true,
+                ..media_item("background", "beach.webm", "Beach", false)
+            });
+    });
+    // Revision 19: the videos folder under Yours, and `video_dir` on the
+    // `media` line; the video in it is listed.
+    let out = bus.run(&["media"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert!(
+        out.stdout.starts_with(&format!(
+            "Bundled: /usr/share/omarchy-broadcast/media/backgrounds\n\
+             Yours:   {user}\n\
+             Videos:  {USER_VIDEOS}\n"
+        )),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stdout.contains(&clip), "{}", out.stdout);
+    let out = bus.run(&["media", "--json"]);
+    let lines = json_lines(&out.stdout);
+    assert_eq!(lines[0]["video_dir"], USER_VIDEOS);
+    assert_eq!(lines[0]["items"], 2);
+    assert_eq!(lines[2]["path"], clip.as_str());
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "GetMedia(background)",
+            "GetMediaDirs(background)",
+            "GetMedia(background)",
+            "GetMediaDirs(background)"
+        ]
+    );
+
+    // A videos folder over the line's bound: "" and its items left out;
+    // `user_dir` stays and the line keeps within the cap (`json_line`).
+    let long = format!("/home/{}", "v/".repeat(1950));
+    mock.with(|m| {
+        m.media_videos = long.clone();
+        m.media.get_mut("background").unwrap()[1].path = format!("{long}/beach.webm");
+    });
+    let out = bus.run(&["media", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    let lines = json_lines(&out.stdout);
+    assert_eq!(lines.len(), 2, "{}", out.stdout);
+    assert_eq!(lines[0]["video_dir"], "");
+    assert_eq!(lines[0]["user_dir"], user);
+    assert_eq!(lines[0]["items"], 1);
+    assert_eq!(lines[0]["items_truncated"], true);
+    // The human list is not bounded.
+    let out = bus.run(&["media"]);
+    assert!(
+        out.stdout.contains(&format!("Videos:  {long}\n")),
+        "{}",
+        out.stdout
+    );
+
+    // Revision 18: GetMediaDirs is not asked, no key, no Videos line.
+    mock.with(|m| m.revision = 18);
+    mock.take_calls();
+    let out = bus.run(&["media", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    let lines = json_lines(&out.stdout);
+    assert!(lines[0].get("video_dir").is_none(), "{}", out.stdout);
+    assert_eq!(lines[0]["user_dir"], user);
+    let out = bus.run(&["media"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert!(!out.stdout.contains("Videos:"), "{}", out.stdout);
+    assert_eq!(
+        mock.take_calls(),
+        ["GetMedia(background)", "GetMedia(background)"]
+    );
+}
+
+#[test]
+fn media_convert_command_prints_the_daemons_command_alone() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let user = bus.dir.join("gallery").display().to_string();
+    mock.with(|m| m.media_user = user.clone());
+    // A relative path is given to the daemon made absolute against the
+    // current directory; the command alone is printed, on one line.
+    let cwd = bus.dir.join("videos");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let args = ["media", "convert-command", "beach day.mp4"];
+    let mut cmd = bus.cli(&args);
+    cmd.current_dir(&cwd);
+    let out = run_cmd(cmd, &args);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    let input = cwd.join("beach day.mp4").display().to_string();
+    assert_eq!(
+        out.stdout,
+        format!(
+            "ffmpeg -nostdin -n -protocol_whitelist file -i '{input}' -f webm \
+             '{user}/beach day-cpu.webm'\n"
+        )
+    );
+    assert_eq!(out.stderr, "");
+    assert_eq!(mock.take_calls(), [format!("GetConvertCommand({input})")]);
+    // The daemon's refusals: on stderr, exit 1, nothing on stdout.
+    for (path, why) in [
+        ("/v/ready.webm", "already plays without an NVIDIA GPU"),
+        ("/v/office.png", "not an MP4, MOV, MKV or WebM file"),
+    ] {
+        let out = bus.run(&["media", "convert-command", path]);
+        assert_eq!(out.status.code(), Some(1), "{path}: {}", out.stderr);
+        assert_eq!(out.stdout, "", "{path}");
+        assert!(
+            out.stderr.starts_with("omarchy-broadcast: ") && out.stderr.contains(why),
+            "{path}: {}",
+            out.stderr
+        );
+    }
+    // A usage error: no path, or an option it does not take.
+    for args in [
+        &["media", "convert-command"][..],
+        &["media", "convert-command", "/v/a.mp4", "--json"],
+    ] {
+        let out = bus.run(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", out.stderr);
+    }
+}
+
+#[test]
+fn media_convert_command_needs_revision_19_and_may_start_the_daemon() {
+    let bus = Bus::start();
+    let out = bus.run(&["media", "convert-command", "/v/a.mp4"]);
+    assert_eq!(out.status.code(), Some(3), "{}", out.stderr);
+    assert!(bus.activation_attempted());
+    let _old = OldDaemon::start(&bus, Rev15);
+    let out = bus.run(&["media", "convert-command", "/v/a.mp4"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert!(
+        out.stderr.contains(
+            "the daemon does not give the conversion command (its interface revision is 15, \
+             that needs 19)"
+        ),
+        "{}",
+        out.stderr
+    );
 }
 
 #[test]

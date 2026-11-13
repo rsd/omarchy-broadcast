@@ -172,6 +172,22 @@ pub struct VideoInfo {
     pub duration_ms: u64,
 }
 
+/// Whether `info` is a video the CPU plays: VP9 profile 0 in WebM or
+/// Matroska, at most 1920x1080 and 30 fps (a rate that is not stated is
+/// not ready). In system memory only such a video plays; any other shows
+/// its poster as a still, and the user is given the command that converts
+/// it ([`super::ffmpeg::cpu_convert_command`]).
+pub fn is_cpu_ready(info: &VideoInfo) -> bool {
+    use super::ffmpeg::{CPU_MAX_FPS, CPU_MAX_HEIGHT, CPU_MAX_WIDTH};
+    matches!(info.container, Container::WebM | Container::Matroska)
+        && info.codec == Codec::Vp9
+        && (info.profile.is_empty() || info.profile == "0")
+        && info.width <= CPU_MAX_WIDTH
+        && info.height <= CPU_MAX_HEIGHT
+        && info.fps_num > 0
+        && u64::from(info.fps_num) <= u64::from(CPU_MAX_FPS) * u64::from(info.fps_den.max(1))
+}
+
 /// Opens `path` for the check: without blocking, a regular file of at
 /// most [`MAX_VIDEO_BYTES`]. The reason names the path.
 pub fn open_video(path: &Path) -> Result<File, String> {

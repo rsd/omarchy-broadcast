@@ -132,12 +132,13 @@ impl Drop for PrivateBus {
     }
 }
 
-/// The media gallery of a rig: its two roots under the rig's directory.
+/// The media gallery of a rig: its roots under the rig's directory (the
+/// videos root a folder of its own, as a session's is).
 fn rig_media(dir: &std::path::Path) -> Result<MediaStore, MediaError> {
-    Ok(MediaStore::new(
-        dir.join("media-bundled"),
-        dir.join("media-user"),
-    ))
+    Ok(
+        MediaStore::new(dir.join("media-bundled"), dir.join("media-user"))
+            .with_video_root(dir.join("media-videos")),
+    )
 }
 
 impl Rig {
@@ -444,8 +445,9 @@ async fn every_property_reads_through_the_proxy() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 18);
-    assert_eq!(INTERFACE_REVISION, obc_ipc::VIDEO_BACKGROUND_REVISION);
+    assert_eq!(INTERFACE_REVISION, 19);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::CPU_CONVERT_REVISION);
+    assert_eq!(obc_ipc::VIDEO_BACKGROUND_REVISION, 18);
     assert_eq!(obc_ipc::PLACEHOLDER_REVISION, 17);
     // GetAll returns the same twenty-nine properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
@@ -546,6 +548,7 @@ async fn every_property_reads_through_the_proxy() {
         "<method name=\"GetMedia\">",
         "<method name=\"ImportMedia\">",
         "<method name=\"RemoveMedia\">",
+        "<method name=\"GetMediaDirs\">",
         "<arg name=\"bundled_dir\" type=\"s\" direction=\"out\"/>",
         "<arg name=\"items\" type=\"aa{sv}\" direction=\"out\"/>",
         "<property name=\"MediaSerial\" type=\"u\" access=\"read\"",
@@ -945,7 +948,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 18);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 19);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -1129,7 +1132,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 18);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 19);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -1245,7 +1248,7 @@ async fn preview_leases_by_bus_name_their_property_and_their_frames() {
     let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 18);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 19);
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
     let seen = rig.record_changes().await;
     let mut frames = proxy.receive_preview_frame().await.unwrap();
@@ -2268,10 +2271,7 @@ async fn the_gallery_lists_imports_and_removes() {
         list.bundled_dir,
         root.join("media-bundled/backgrounds").display().to_string()
     );
-    assert_eq!(
-        list.user_dir,
-        root.join("media-user/backgrounds").display().to_string()
-    );
+    assert_eq!(list.user_dir, root.join("media-user").display().to_string());
     assert_eq!(
         list.items,
         [obc_ipc::MediaEntry {
@@ -2283,6 +2283,8 @@ async fn the_gallery_lists_imports_and_removes() {
             height: 2160,
             duration_ms: 0,
             poster: String::new(),
+            cpu_ready: false,
+            convert_command: String::new(),
         }]
     );
     // The raw reply carries the documented keys.
@@ -2314,6 +2316,35 @@ async fn the_gallery_lists_imports_and_removes() {
     let msg = refused(within("GetMedia", proxy.media("wallpaper")).await);
     assert!(msg.contains("unknown media kind \"wallpaper\""), "{msg}");
 
+    // GetMediaDirs (revision 19): the user directory GetMedia gives and
+    // the videos root for a background; no videos folder for away, the
+    // same refusal as GetMedia for another kind.
+    let dirs = within("GetMediaDirs", proxy.media_dirs("background"))
+        .await
+        .unwrap();
+    assert_eq!(
+        dirs,
+        obc_ipc::MediaDirs {
+            user_dir: list.user_dir.clone(),
+            video_dir: root.join("media-videos").display().to_string(),
+        }
+    );
+    let raw = within("GetMediaDirs", proxy.get_media_dirs("away"))
+        .await
+        .unwrap();
+    let mut keys: Vec<&str> = raw.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["user_dir", "video_dir"]);
+    assert_eq!(
+        obc_ipc::MediaDirs::from_dict(&raw),
+        obc_ipc::MediaDirs {
+            user_dir: away.user_dir.clone(),
+            video_dir: String::new(),
+        }
+    );
+    let dirs_msg = refused(within("GetMediaDirs", proxy.media_dirs("wallpaper")).await);
+    assert_eq!(dirs_msg, msg);
+
     // An import stores the file and moves the serial.
     let src = root.join("src/Office view.png");
     put_file(&src, &png(1920, 1080, 2));
@@ -2323,7 +2354,7 @@ async fn the_gallery_lists_imports_and_removes() {
     )
     .await
     .unwrap();
-    let want = root.join("media-user/backgrounds/Office view.png");
+    let want = root.join("media-user/Office view.png");
     assert_eq!(stored, want.display().to_string());
     assert_eq!(fs::read(&want).unwrap(), png(1920, 1080, 2));
     media_serial_is(&proxy, &seen, 2).await;
@@ -2444,7 +2475,7 @@ async fn removing_the_background_in_force_clears_it_first() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_a_gallery_the_media_methods_fail_with_the_reason() {
-    let rig = Rig::with_media(|_| Err(MediaError::NoDataDir)).await;
+    let rig = Rig::with_media(|_| Err(MediaError::NoHome)).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
     let failed = |res: Result<(), IpcError>| match res {
@@ -2463,10 +2494,15 @@ async fn without_a_gallery_the_media_methods_fail_with_the_reason() {
                 .map(|_| ()),
         ),
         failed(within("RemoveMedia", proxy.remove_media("/a.png")).await),
+        failed(
+            within("GetMediaDirs", proxy.get_media_dirs("background"))
+                .await
+                .map(|_| ()),
+        ),
     ];
     for msg in msgs {
         assert!(
-            msg.contains("media gallery is unavailable: neither XDG_DATA_HOME nor HOME"),
+            msg.contains("media gallery is unavailable: HOME is not set"),
             "{msg}"
         );
     }
@@ -2556,7 +2592,7 @@ async fn get_media_lists_the_posters_found_and_announces_each_poster_made() {
     for name in ["slow-aurora.webm", "slow-aurora.poster.jpg"] {
         put_file(&bundled.join(name), &fs::read(asset(name)).unwrap());
     }
-    let user = root.join("media-user/backgrounds/mine.webm");
+    let user = root.join("media-user/mine.webm");
     put_file(&user, &fs::read(asset("drifting-bokeh.webm")).unwrap());
 
     let list = within("GetMedia", proxy.media("background")).await.unwrap();
@@ -2592,4 +2628,183 @@ async fn get_media_lists_the_posters_found_and_announces_each_poster_made() {
     // Listed again with every poster: nothing more is made.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(proxy.media_serial().await.unwrap(), 2);
+    // Both loops play without the GPU: no command (revision 19).
+    assert!(
+        list.items
+            .iter()
+            .all(|i| i.cpu_ready && i.convert_command.is_empty()),
+        "{:?}",
+        list.items
+    );
+
+    // An H.264 video does not: it comes with the command that converts it
+    // into the user's gallery.
+    let clip = root.join("media-user/fast clip.mp4");
+    let made = std::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i"])
+        .arg("testsrc2=size=64x48:rate=10")
+        .args(["-t", "0.3", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .arg(&clip)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !made {
+        eprintln!("skipped the rest: no libx264 encoder");
+        return;
+    }
+    let list = within("GetMedia", proxy.media("background")).await.unwrap();
+    let item = list
+        .find(&clip.display().to_string())
+        .expect("the clip is listed");
+    assert!(!item.cpu_ready);
+    assert_eq!(
+        item.convert_command,
+        crate::media::cpu_convert_command(&root.join("media-user"), &clip).unwrap()
+    );
+    assert!(
+        item.convert_command.ends_with(&format!(
+            "'{}'",
+            root.join("media-user/fast clip-cpu.webm").display()
+        )),
+        "{}",
+        item.convert_command
+    );
+    let raw = within("GetMedia", proxy.get_media("background"))
+        .await
+        .unwrap();
+    let keyed = |path: &str| {
+        raw.3
+            .iter()
+            .find(|d| {
+                d.get("path")
+                    .and_then(|v| String::try_from(v.try_clone().unwrap()).ok())
+                    .as_deref()
+                    == Some(path)
+            })
+            .map(|d| {
+                let mut k: Vec<String> = d.keys().cloned().collect();
+                k.sort_unstable();
+                k
+            })
+            .unwrap()
+    };
+    let keys = keyed(&clip.display().to_string());
+    assert!(
+        keys.contains(&"cpu_ready".to_string()) && keys.contains(&"convert_command".to_string())
+    );
+    let keys = keyed(&user.display().to_string());
+    assert!(
+        keys.contains(&"cpu_ready".to_string()) && !keys.contains(&"convert_command".to_string())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_convert_command_gives_the_gallerys_command_for_a_video_and_refuses_the_rest() {
+    let rig = Rig::new("", |_| {}).await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    let root = rig._dir.path();
+    let ask = |path: std::path::PathBuf| {
+        let proxy = &proxy;
+        async move {
+            within(
+                "GetConvertCommand",
+                proxy.get_convert_command(&path.display().to_string()),
+            )
+            .await
+        }
+    };
+    // A still, a missing file, a relative path, a file the check refuses:
+    // refused with the reason.
+    let still = root.join("office.png");
+    put_file(&still, b"\x89PNG\r\n\x1a\n");
+    let msg = refused(ask(still).await);
+    assert!(msg.contains("not an MP4, MOV, MKV or WebM file"), "{msg}");
+    let msg = refused(ask(root.join("gone.mp4")).await);
+    assert!(
+        msg.contains("gone.mp4") && msg.contains("unreadable"),
+        "{msg}"
+    );
+    let msg = refused(
+        within(
+            "GetConvertCommand",
+            proxy.get_convert_command("clips/a.mp4"),
+        )
+        .await,
+    );
+    assert!(msg.contains("absolute"), "{msg}");
+    let bad = root.join("bad.mp4");
+    put_file(&bad, b"\0\0\0\x18ftypisom\0\0\0\0");
+    let msg = refused(ask(bad).await);
+    assert!(msg.contains("the video file"), "{msg}");
+    // A video that plays without the GPU already: nothing to convert.
+    let ready = root.join("ready.webm");
+    fs::copy(asset("slow-aurora.webm"), &ready).unwrap();
+    let msg = refused(ask(ready).await);
+    assert!(msg.contains("already plays without an NVIDIA GPU"), "{msg}");
+    // An H.264 video outside the gallery: the very command `GetMedia`
+    // gives, written into the user's videos folder.
+    let clip = root.join("elsewhere/it's a clip.mp4");
+    fs::create_dir_all(clip.parent().unwrap()).unwrap();
+    let made = std::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i"])
+        .arg("testsrc2=size=64x48:rate=10")
+        .args(["-t", "0.3", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .arg(&clip)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !made {
+        eprintln!("skipped the rest: no ffmpeg with libx264");
+        return;
+    }
+    let gallery = root.join("media-videos");
+    let command = ask(clip.clone()).await.unwrap();
+    assert_eq!(
+        command,
+        crate::media::cpu_convert_command(&gallery, &clip).unwrap()
+    );
+    assert!(
+        command.ends_with(&format!(
+            "'{}'",
+            gallery.join("it'\\''s a clip-cpu.webm").display()
+        )),
+        "{command}"
+    );
+    // The same file in the videos folder: GetMedia gives the same
+    // command.
+    let listed = gallery.join("it's a clip.mp4");
+    fs::create_dir_all(&gallery).unwrap();
+    fs::copy(&clip, &listed).unwrap();
+    let list = within("GetMedia", proxy.media("background")).await.unwrap();
+    let item = list
+        .find(&listed.display().to_string())
+        .expect("the clip is listed");
+    assert_eq!(item.convert_command, ask(listed).await.unwrap());
+}
+
+#[test]
+fn get_media_dirs_gives_no_videos_folder_that_is_the_pictures_one() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let pictures = root.join("Pictures/omarchy-broadcast");
+    let shown = |p: &std::path::Path| p.display().to_string();
+    // One folder for both (the same path).
+    let one = MediaStore::new(root.join("bundled"), &pictures);
+    let dirs = media_dirs(&one, MediaKind::Background);
+    assert_eq!(dirs.user_dir, shown(&pictures));
+    assert_eq!(dirs.video_dir, "");
+    // The videos root a link to the pictures root.
+    fs::create_dir_all(&pictures).unwrap();
+    fs::create_dir_all(root.join("Videos")).unwrap();
+    let videos = root.join("Videos/omarchy-broadcast");
+    std::os::unix::fs::symlink(&pictures, &videos).unwrap();
+    let linked = MediaStore::new(root.join("bundled"), &pictures).with_video_root(&videos);
+    assert_eq!(media_dirs(&linked, MediaKind::Background).video_dir, "");
+    // A folder of its own is named; away never has one.
+    let own = root.join("Movies/omarchy-broadcast");
+    let two = MediaStore::new(root.join("bundled"), &pictures).with_video_root(&own);
+    assert_eq!(
+        media_dirs(&two, MediaKind::Background).video_dir,
+        shown(&own)
+    );
+    assert_eq!(media_dirs(&two, MediaKind::Away).video_dir, "");
 }

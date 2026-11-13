@@ -37,6 +37,11 @@
 //! `SetBackgroundImage` of a video runs the video check here, on the
 //! blocking pool, and hands its result to the controller with the
 //! command: the controller's thread never runs it (it can take seconds).
+//! `GetConvertCommand` (revision 19) runs the same check there, and
+//! answers with [`media::cpu_convert_command`], `GetMedia`'s command.
+//! `GetMediaDirs` (revision 19) names a kind's user directories, the
+//! videos root among them ([`media_dirs`]); `GetMedia`'s reply is a
+//! released signature and stays as it is.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -48,8 +53,8 @@ use std::sync::{Arc, Mutex};
 use futures_util::StreamExt;
 use obc_ipc::settings::{VariantDict, WireChange, camera_option};
 use obc_ipc::{
-    CameraControl, CameraControls, CameraInfo, INTERFACE, IpcError, MediaEntry, MediaReply,
-    OBJECT_PATH, SettingValue, Snapshot, State,
+    CameraControl, CameraControls, CameraInfo, INTERFACE, IpcError, MediaDirs, MediaEntry,
+    MediaReply, OBJECT_PATH, SettingValue, Snapshot, State,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use zbus::fdo::NameOwnerChangedStream;
@@ -218,8 +223,16 @@ fn path_text(path: &Path) -> Option<String> {
 }
 
 /// The item on the wire; `None` for a path that is not UTF-8, which D-Bus
-/// cannot carry (a poster that is not is left out).
-fn media_entry(item: &MediaItem) -> Option<MediaEntry> {
+/// cannot carry (a poster that is not is left out). A video that is not
+/// CPU-ready comes with the command that converts it into `convert_dir`
+/// (the videos root, [`MediaStore::convert_dir`]).
+fn media_entry(item: &MediaItem, convert_dir: &Path) -> Option<MediaEntry> {
+    let video = item.media_type == MediaType::Video;
+    let convert_command = if video && !item.cpu_ready {
+        media::cpu_convert_command(convert_dir, &item.path).unwrap_or_default()
+    } else {
+        String::new()
+    };
     Some(MediaEntry {
         path: path_text(&item.path)?,
         label: item.label.clone(),
@@ -233,7 +246,56 @@ fn media_entry(item: &MediaItem) -> Option<MediaEntry> {
             .as_deref()
             .and_then(path_text)
             .unwrap_or_default(),
+        cpu_ready: video && item.cpu_ready,
+        convert_command,
     })
+}
+
+/// `GetConvertCommand`'s answer for the video at `path`: the command that
+/// converts it into the user's videos folder
+/// ([`media::cpu_convert_command`], the very command `GetMedia` gives).
+/// Refused with `InvalidArgument` and the reason for a relative path, a
+/// file that is not a video or that the video check refuses, a video that
+/// already plays without the NVIDIA GPU, and when a path is not UTF-8.
+/// Opens and reads the file: never on the executor.
+fn convert_command_of(store: &MediaStore, path: &Path) -> Result<String, IpcError> {
+    if !path.is_absolute() {
+        return Err(media_error(MediaError::NotAbsolute(path.to_path_buf())));
+    }
+    let shown = path.display();
+    gst_obc::video_background::check_video_file(path)
+        .map_err(|e| IpcError::InvalidArgument(format!("the video file {shown}: {e}")))?;
+    let info = media::check_video(path).map_err(IpcError::InvalidArgument)?;
+    if media::is_cpu_ready(&info) {
+        return Err(IpcError::InvalidArgument(format!(
+            "the video file {shown} already plays without an NVIDIA GPU: there is nothing to \
+             convert"
+        )));
+    }
+    let dir = store.convert_dir();
+    media::cpu_convert_command(dir, path).ok_or_else(|| {
+        IpcError::InvalidArgument(format!(
+            "the conversion of {shown} cannot be given as a command: the videos folder {} is \
+             not UTF-8",
+            dir.display()
+        ))
+    })
+}
+
+/// The `GetMediaDirs` reply for `kind`: its user directory, as `GetMedia`
+/// gives it, and its videos directory ([`MediaStore::video_dir`]); `""`
+/// for a kind without one, and when it is the user directory itself (the
+/// same path, a link or a bind mount: [`MediaStore::user_dirs`]), so a
+/// client never lists one folder twice.
+fn media_dirs(store: &MediaStore, kind: MediaKind) -> MediaDirs {
+    MediaDirs {
+        user_dir: store.user_dir(kind).to_string_lossy().into_owned(),
+        video_dir: store
+            .user_dirs(kind)
+            .get(1)
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    }
 }
 
 /// The `GetMedia` reply for `kind`, at `serial`, and the videos listed
@@ -245,11 +307,15 @@ fn media_reply(store: &MediaStore, kind: MediaKind, serial: u32) -> (MediaReply,
         .filter(|i| i.media_type == MediaType::Video && i.poster.is_none())
         .map(|i| i.path.clone())
         .collect();
+    let convert_dir = store.convert_dir();
     let reply = MediaReply {
         serial,
         bundled_dir: store.bundled_dir(kind).to_string_lossy().into_owned(),
         user_dir: store.user_dir(kind).to_string_lossy().into_owned(),
-        items: items.iter().filter_map(media_entry).collect(),
+        items: items
+            .iter()
+            .filter_map(|i| media_entry(i, convert_dir))
+            .collect(),
     };
     (reply, missing)
 }
@@ -591,6 +657,17 @@ impl Server {
         Ok(reply.to_wire())
     }
 
+    /// The user directories of `kind`, `background` or `away` (revision
+    /// 19): `user_dir` (s), as `GetMedia` gives it, and `video_dir` (s),
+    /// where the kind's videos are stored (the videos root for
+    /// `background`, `""` for `away`). Refused as `GetMedia` is:
+    /// `InvalidArgument` for another kind, `Failed` without a gallery.
+    async fn get_media_dirs(&self, kind: String) -> Result<VariantDict, IpcError> {
+        let kind: MediaKind = kind.parse().map_err(media_error)?;
+        let store = self.store()?;
+        Ok(media_dirs(&store, kind).to_dict())
+    }
+
     /// Copies the image at `path` (absolute) into the user's gallery of
     /// `kind` after the checks of a background, and returns the stored
     /// path; a file of that gallery with the same bytes is returned
@@ -619,6 +696,21 @@ impl Server {
                 stored.display()
             ))
         })
+    }
+
+    /// The shell command that converts the video at `path` (absolute)
+    /// into a CPU-ready VP9 WebM in the user's gallery of backgrounds,
+    /// `<stem>-cpu.webm` (or the first free `<stem>-cpu-N.webm`): the
+    /// command `GetMedia` gives for a gallery video, for any file
+    /// (revision 19). The daemon checks the file, as `SetBackgroundImage`
+    /// does, and never runs the command. Refused with `InvalidArgument`
+    /// and the reason for a relative path, a file that is not a video or
+    /// that the check refuses, a video that already plays without the
+    /// NVIDIA GPU, and a gallery path that is not UTF-8; `Failed` without
+    /// a gallery.
+    async fn get_convert_command(&self, path: String) -> Result<String, IpcError> {
+        let store = self.store()?;
+        off_executor(move || convert_command_of(&store, Path::new(&path))).await
     }
 
     /// Removes the item at `path` from the user's gallery (revision 15).
@@ -651,7 +743,7 @@ impl Server {
                     return Err(media_error(MediaError::NotAUserItem(target)));
                 }
                 // Here, not on the controller: a video's content hash,
-                // which names its poster and playback copies.
+                // which names its poster.
                 store.warm_hash(&target);
                 Ok(())
             })

@@ -385,12 +385,40 @@ pub fn require_away_image(revision: u32) -> Result<(), Failure> {
     )))
 }
 
+/// Fails unless a daemon of interface revision `revision` gives the
+/// command that converts a video (`GetConvertCommand`).
+pub fn require_convert_command(revision: u32) -> Result<(), Failure> {
+    if revision >= obc_ipc::CPU_CONVERT_REVISION {
+        return Ok(());
+    }
+    Err(Failure::Unsupported(format!(
+        "the daemon does not give the conversion command (its interface revision is \
+         {revision}, that needs {}); update omarchy-broadcastd",
+        obc_ipc::CPU_CONVERT_REVISION
+    )))
+}
+
 /// `GetMedia(kind)` without starting the daemon, within [`READ_TIMEOUT`].
 pub async fn media(conn: &Connection, kind: &str) -> Result<obc_ipc::MediaReply, Failure> {
     let call = async {
         let proxy = proxy(conn).await?;
         proxy
             .media_no_autostart(kind)
+            .await
+            .map_err(no_autostart_error)
+    };
+    tokio::time::timeout(READ_TIMEOUT, call)
+        .await
+        .unwrap_or_else(|_| Err(timed_out(READ_TIMEOUT)))
+}
+
+/// `GetMediaDirs` of `kind` without starting the daemon, within
+/// [`READ_TIMEOUT`] (revision 19).
+pub async fn media_dirs(conn: &Connection, kind: &str) -> Result<obc_ipc::MediaDirs, Failure> {
+    let call = async {
+        let proxy = proxy(conn).await?;
+        proxy
+            .media_dirs_no_autostart(kind)
             .await
             .map_err(no_autostart_error)
     };

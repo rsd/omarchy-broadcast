@@ -3,7 +3,7 @@
 //! read once per daemon run however often it is listed, imported or
 //! removed.
 //!
-//! The hash names derived files (posters, playback copies) in the cache:
+//! The hash names derived files (posters) in the cache:
 //! the same bytes give the same name wherever the file lives, and a file
 //! edited in place gets a new name.
 
