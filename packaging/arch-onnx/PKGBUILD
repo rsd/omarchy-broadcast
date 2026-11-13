@@ -15,20 +15,19 @@
 # scripts/check-all.sh fails while they differ.
 #
 # The four model files (about 70 MB, Apache-2.0) are sources of this build,
-# checked by sha256. Until a release host publishes them (_onnx_models_url
-# below), makepkg takes them from a local directory, $startdir/models or
-# $OBC_ONNX_MODELS_DIR, under the catalogue's names
-# (crates/obc-module-onnx/model-sources/README.md says how they are made).
-# Without them makepkg stops at the missing sources.
+# downloaded from the omarchy-onnx-models release (_onnx_models_url below) and
+# checked by sha256. For an offline build, OBC_ONNX_MODELS_DIR names a
+# directory that holds them under the catalogue's names
+# (crates/obc-module-onnx/model-sources/README.md).
 #
 # Build (from packaging/arch-onnx, after packaging/arch):
-#   OBC_ONNX_MODELS_DIR=/path/to/models makepkg -s
+#   makepkg -s
 # Install the result with the core package:
 #   sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst omarchy-broadcast-onnx-git-*.pkg.tar.zst
 
 pkgname=omarchy-broadcast-onnx-git
 _pkgname=omarchy-broadcast
-pkgver=0.45.4
+pkgver=0.45.5
 pkgrel=1
 pkgdesc='Open-model cut-out (ONNX Runtime) module for omarchy-broadcast: background blur and replacement'
 arch=('x86_64')
@@ -87,34 +86,21 @@ _onnx_sums=(
   '07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9'
 )
 # The converted models are release assets of the omarchy-onnx-models
-# repository, which also holds their conversion scripts and licences. Each file
-# is checked against its sha256 above, whichever way it arrives.
-# PLACEHOLDER: that repository's first release is not published yet
-# (publishing it needs the user: a push), and the owner below is not final.
-# Once it is: set _onnx_models_owner (and _onnx_models_ver, the release tag
-# without the leading v) and enable the URL line. Until then the files come
-# from the local fallback directory.
-_onnx_models_owner='PLACEHOLDER-OWNER'
-_onnx_models_ver='1.0.0'  # the first omarchy-onnx-models release tag, v1.0.0 (not published yet)
-#_onnx_models_url="https://github.com/$_onnx_models_owner/omarchy-onnx-models/releases/download/v$_onnx_models_ver"
-# When it is set, the files are downloaded from "$_onnx_models_url/<name>".
-_onnx_models_url=''
-_onnx_models_dir=${OBC_ONNX_MODELS_DIR:-$startdir/models}
-_onnx_missing=()
+# repository (https://github.com/rsd/omarchy-onnx-models), which also holds
+# their conversion scripts and licences. makepkg downloads each from the
+# release and checks it against its sha256 above.
+_onnx_models_ver='1.0.0'  # the release tag without the leading v
+_onnx_models_url="https://github.com/rsd/omarchy-onnx-models/releases/download/v$_onnx_models_ver"
+# Optional offline override: with OBC_ONNX_MODELS_DIR set, the files are read
+# from that directory instead, under the same names (and the same sha256).
 for _f in "${_onnx_models[@]}"; do
-  if [[ -n $_onnx_models_url ]]; then
-    source+=("$_f::$_onnx_models_url/$_f")
+  if [[ -n ${OBC_ONNX_MODELS_DIR:-} ]]; then
+    source+=("$_f::file://$OBC_ONNX_MODELS_DIR/$_f")
   else
-    # The local fallback: a directory of files under the names above.
-    source+=("$_f::file://$_onnx_models_dir/$_f")
-    [[ -r $_onnx_models_dir/$_f ]] || _onnx_missing+=("$_f")
+    source+=("$_f::$_onnx_models_url/$_f")
   fi
 done
-if ((${#_onnx_missing[@]})); then
-  echo "$pkgname: model files not found in $_onnx_models_dir: ${_onnx_missing[*]}" >&2
-  echo "$pkgname: set _onnx_models_url in this PKGBUILD, or put the model files in \$OBC_ONNX_MODELS_DIR (default: \$startdir/models)" >&2
-fi
-unset _f _onnx_missing
+unset _f
 sha256sums+=("${_onnx_sums[@]}")
 
 pkgver() {
