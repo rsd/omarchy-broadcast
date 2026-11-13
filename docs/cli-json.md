@@ -6,7 +6,7 @@
 
 | Command | Does | `--json` |
 |---|---|---|
-| `omarchy-broadcast status` | Prints the state, whether the camera is enabled, the active camera, the number of consumers, the output mode, the effect (with noise removal, from interface revision 4), the values the running stages report (interface revision 16, for example `Auto-frame zoom: 1.24x`; see [Stage values](#stage-values)), the error text if there is one, and a `Warning:` line with the daemon's warning if there is one (interface revision 11: selected stages no module provides, which the stream continues without, or an effect that cannot run, while the stream is black or, with `on_failure = "none"`, shows the camera image). While the PipeWire output is configured, the consumers are shown with their split (`Consumers:  2 (loopback 1, PipeWire 1)`) and a `PipeWire:` line gives the output's state. | One `snapshot` object. |
+| `omarchy-broadcast status` | Prints the state, whether the camera is enabled, the active camera, the number of consumers, the output mode, the effect (with noise removal, from interface revision 4), the values the running stages report (interface revision 16, for example `Auto-frame zoom: 1.24x`; see [Stage values](#stage-values)), the error text if there is one, and a `Warning:` line with the daemon's warning if there is one (interface revision 11: selected stages no module provides, which the stream continues without, or an effect that cannot run, while the stream is black or, with `on_failure = "none"`, shows the camera image). While the PipeWire output is configured, the consumers are shown with their split (`Consumers:  2 (loopback 1, PipeWire 1)`) and a `PipeWire:` line gives the output's state. From interface revision 20 it ends with the active camera's health, as the lines of [Recommended settings and camera health](#recommended-settings-and-camera-health) say: `Delivers:`, `Damaged:`, one `Warning:` per warning and one `Suggest:` per suggestion. | One `snapshot` object. |
 | `omarchy-broadcast on` | Enables the camera (`SetEnabled(true)`), then prints the resulting state. | No. |
 | `omarchy-broadcast off` | Disables the camera, entering the privacy state `off` (`SetEnabled(false)`), then prints the resulting state. | No. |
 | `omarchy-broadcast cameras` | Lists the cameras in the daemon's order, the active one marked with `*`: name, USB `vid:pid` (`-` if none) and id. | One `cameras` object. |
@@ -40,8 +40,10 @@
 | `omarchy-broadcast media import KIND PATH [--select] [--json]` | Copies an image, or from interface revision 18 a video or an animated image, into your gallery after the daemon has checked it, and prints the stored path (`ImportMedia`); with `--select`, also makes it the background and selects `replace` (`background`), or the away image (`away`). | One `media_import` object. |
 | `omarchy-broadcast media remove PATH` | Removes an item of your gallery (`RemoveMedia`). | No. |
 | `omarchy-broadcast media convert-command PATH` | Prints the `ffmpeg` command that converts a video into a WebM that plays without an NVIDIA GPU (interface revision 19, `GetConvertCommand`). See [Media](#media). | No. |
+| `omarchy-broadcast recommended [--json]` | Lists what the recommended settings of the active camera's model would change (`label: now → recommended`), or says that the camera has none or is at them already (interface revision 20, the `CameraHealth` property). Never starts the daemon. See [Recommended settings and camera health](#recommended-settings-and-camera-health). | One `camera_health` object. |
+| `omarchy-broadcast recommended apply [--json]` | Puts the active camera's settings back to their defaults and sets the recommended values and the anti-flicker of your time zone, stored for that camera (`ApplyRecommendedSettings`); the capture mode and the effects are not changed. Prints the result read back. | A `camera_health` object after the change, or an `error` object. |
 | `omarchy-broadcast preview [--json] [--fps 15\|30]` | Holds a live preview lease on the daemon and prints a line for each frame it writes, until interrupted. See [Preview](#preview). | One object per line (NDJSON). |
-| `omarchy-broadcast watch` | Follows the daemon: a summary when it connects, then a line for each change and each `Stats` signal (about once per second while `active`), until interrupted. The summary ends with `| error: ...` and `| warning: ...` when they are set, and a change of either is a line (`warning: ...`, `warning: (cleared)`). | One object per line (NDJSON). |
+| `omarchy-broadcast watch` | Follows the daemon: a summary when it connects, then a line for each change and each `Stats` signal (about once per second while `active`), until interrupted. The summary ends with `| error: ...` and `| warning: ...` when they are set, and a change of either is a line (`warning: ...`, `warning: (cleared)`). From interface revision 20 a change of the camera's health is a `camera health: ...` line. | One object per line (NDJSON). |
 
 The word `next` is always the `NextCamera` command; select a camera whose name contains "next" by its id or `vid:pid`. The selectors and the errors they can raise are those of `SelectCamera` in [dbus-api.md](dbus-api.md#selectcameras-selector).
 
@@ -187,6 +189,38 @@ Lighting
 - Strings that come from the daemon are escaped in the human-readable output, as for `effect`.
 
 `controls` keeps working, with the five image controls only, and shares the storage of `settings`: a value set by one shows in the other. `controls reset` resets those five only; `settings reset` resets everything.
+
+## Recommended settings and camera health
+
+From interface revision 20 the daemon reports how well the active camera works and offers settings measured to suit its model ([dbus-api.md](dbus-api.md#camera-health-revision-20), [ADR-0036](adr/0036-camera-quirk-rows-and-camera-health.md)). `status` shows it, `recommended` lists the offer, and `recommended apply` takes it. Nothing is applied unless you run `recommended apply`.
+
+```text
+omarchy-broadcast status
+...
+Delivers:   19.5 of 30 fps
+Damaged:    12 frames dropped
+Warning:    Plug Example Cam into its own USB port: it shares a hub with USB Keyboard and 046d:c077, and its uncompressed 640x480 at 30 fps stream uses most of the hub's bandwidth, which can stall the keyboard or mouse and damage frames.
+Suggest:    Noise removal — This camera's picture is grainy: noise removal makes it cleaner.
+```
+
+- **`Delivers:`** only while the camera delivers below 95 % of its capture mode's rate (`delivered of nominal fps`); otherwise nothing.
+- **`Damaged:`** only when at least one damaged frame was dropped since the camera last opened (`1 frame dropped`, `12 frames dropped`).
+- **`Warning:`** one line per warning of the camera (the daemon's own `Warning:` line, about the stream, comes before them). **`Suggest:`** one line per suggestion: the label of the setting as the settings tree gives it (the setting's id when the tree cannot be read), a dash, and the reason. Turn a suggestion on with `omarchy-broadcast settings set effect.video.denoise on`. At most 4 warnings and 4 suggestions are shown. The lines are for the active camera only, and none appears with no camera or from an older daemon.
+
+```text
+omarchy-broadcast recommended
+Recommended settings for Example Cam (1234:abcd):
+  Sharpness: 3 → 5
+  Hue: -3 → 0
+Use them with: omarchy-broadcast recommended apply
+```
+
+- **`recommended`** prints the changes where they differ from now, at most 16, each as `label: current → recommended`; or `This camera has no recommended settings.`, `Already at the recommended settings.` or `No camera.`. It never starts the daemon.
+- **`recommended apply`** puts the camera's device settings back to their defaults, then sets the values of the camera's row and the power-line frequency of the time zone, stored for that camera as if you had set them (it may start the daemon through D-Bus activation and gives up after 30 s). It prints `Recommended settings applied to Example Cam (1234:abcd).`, followed by `Still different:` and the settings that the camera refused, if any. The camera must be the active one and have a row: otherwise the daemon refuses with `InvalidArgument` and the status is `1`. When the call succeeded but the read-back failed, the message says that the settings were applied and the status is that of the failure.
+- **In `watch`**, a change of the health prints a line such as `camera health: delivers 19.5 of 30 fps | 12 damaged frames dropped | warning: ... | suggest effect.video.denoise | 1 recommended changes` (`nothing to report` when there is nothing, `no camera` without one).
+- **Against a daemon below revision 20**, `recommended` and `recommended apply` print `omarchy-broadcast: the daemon does not support recommended settings (its interface revision is N, they need 20); update omarchy-broadcastd` and exit with status `1`; with `--json` an `error` line with the code `unsupported-daemon`. `status` simply has no health lines.
+
+The JSON form is the [`camera_health`](#camera_health) line.
 
 ## Microphone
 
@@ -523,8 +557,8 @@ omarchy-broadcast preview [--json] [--fps 15|30]
 
 ## Starting the daemon
 
-- `status`, `cameras`, `watch`, `preview`, `effect` without an effect, and `controls` and `settings` without a subcommand, `modules` (list, info, `profile` without an argument), `order` (show), `mic` (status) and `media` (list), never start the daemon. They read the properties with `org.freedesktop.DBus.Properties.GetAll` carrying the `NO_AUTO_START` flag, so looking at the daemon never launches it (`controls` also calls `GetCameraControls`, `settings` calls `GetSettings` and `media` calls `GetMedia`, with that flag). This is the read that the `obc-ipc` crate provides to Rust clients (`Snapshot::fetch_no_autostart`); [dbus-api.md](dbus-api.md#service-presence-and-activation) gives the `busctl` and `gdbus` equivalents.
-- `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`, `settings reset`, `modules enable`, `modules disable`, `modules profile <profile>`, `modules pin`, `order set`, `order reset`, `mic on`, `mic off`, `mic device`, `mic default`, `mic restore-default`, `media import` and `media remove` call methods without that flag: when the D-Bus activation file `br.com.dias.OmarchyBroadcast.service` is installed, the call starts the daemon, as `systemctl --user start omarchy-broadcastd` would. `off` on a stopped daemon therefore starts it and records the privacy state, which persists across restarts. Without an activation file, or if the start fails, the command reports that the daemon is not running.
+- `status`, `cameras`, `watch`, `preview`, `effect` without an effect, and `controls` and `settings` without a subcommand, `modules` (list, info, `profile` without an argument), `order` (show), `mic` (status), `media` (list) and `recommended` (without `apply`), never start the daemon. They read the properties with `org.freedesktop.DBus.Properties.GetAll` carrying the `NO_AUTO_START` flag, so looking at the daemon never launches it (`controls` also calls `GetCameraControls`, `settings` calls `GetSettings` and `media` calls `GetMedia`, with that flag). This is the read that the `obc-ipc` crate provides to Rust clients (`Snapshot::fetch_no_autostart`); [dbus-api.md](dbus-api.md#service-presence-and-activation) gives the `busctl` and `gdbus` equivalents.
+- `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`, `settings reset`, `modules enable`, `modules disable`, `modules profile <profile>`, `modules pin`, `order set`, `order reset`, `mic on`, `mic off`, `mic device`, `mic default`, `mic restore-default`, `media import`, `media remove` and `recommended apply` call methods without that flag: when the D-Bus activation file `br.com.dias.OmarchyBroadcast.service` is installed, the call starts the daemon, as `systemctl --user start omarchy-broadcastd` would. `off` on a stopped daemon therefore starts it and records the privacy state, which persists across restarts. Without an activation file, or if the start fails, the command reports that the daemon is not running.
 
 When the daemon is not running, the human-readable commands print one line to stderr, for example:
 
@@ -542,14 +576,14 @@ omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.O
 | `3` | The daemon is not running (its name has no owner, or D-Bus could not start it), or there is no D-Bus session bus. |
 | `4` | Any other D-Bus failure (an unexpected reply, a lost connection), a timeout, or a failed write to stdout. |
 
-`status`, `cameras`, `controls`, `settings`, `modules` (reads), `order` (show) and `media` (list) give up after 5 s, and `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`, `settings reset`, `media remove` and the changing forms of `modules` and `order` after 30 s (time for the daemon to be started), and `media import` after 600 s (an import waits for the daemon to check, copy or convert the file), with status `4`. `watch` gives each read of the properties 5 s as well (see [Daemon absent or gone](#daemon-absent-or-gone)). `omarchy-broadcast --help` lists the exit statuses.
+`status`, `cameras`, `controls`, `settings`, `modules` (reads), `order` (show), `media` (list) and `recommended` give up after 5 s, and `on`, `off`, `camera`, `effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`, `settings reset`, `media remove`, `recommended apply` and the changing forms of `modules` and `order` after 30 s (time for the daemon to be started), and `media import` after 600 s (an import waits for the daemon to check, copy or convert the file), with status `4`. `watch` gives each read of the properties 5 s as well (see [Daemon absent or gone](#daemon-absent-or-gone)). `omarchy-broadcast --help` lists the exit statuses.
 
 ## JSON output
 
 ### General rules
 
 - Every object is printed on one line, terminated by `\n`, in UTF-8. `watch --json` flushes stdout after every line.
-- Every object has the field **`v`**, the schema version (an integer, `1` in this version), and the field **`type`**, a string naming the line type: `snapshot`, `state`, `cameras`, `controls`, `settings_group`, `settings_delta`, `settings_clear`, `modules`, `module`, `order`, `config_group`, `config_files`, `config_changed`, `modules_changed`, `mic`, `media`, `media_item`, `media_import`, `stats`, `preview`, `frame` or `error`.
+- Every object has the field **`v`**, the schema version (an integer, `1` in this version), and the field **`type`**, a string naming the line type: `snapshot`, `state`, `cameras`, `controls`, `settings_group`, `settings_delta`, `settings_clear`, `modules`, `module`, `order`, `config_group`, `config_files`, `config_changed`, `modules_changed`, `mic`, `camera_health`, `media`, `media_item`, `media_import`, `stats`, `preview`, `frame` or `error`.
 - The order of the fields within an object is not significant.
 - A client must ignore fields it does not know, and lines whose `type` it does not know.
 - **Line length.** No line is longer than **4096 bytes**, newline excluded. To guarantee it, strings are bounded in bytes of their JSON encoding (escapes included). A longer string is cut at a character boundary and ends with the ellipsis character `…` (U+2026); the result is always valid JSON. The bounds:
@@ -565,6 +599,11 @@ omarchy-broadcast: omarchy-broadcastd is not running (no owner for br.com.dias.O
   | `effect` | 32 |
   | `background_image` | 256 |
   | `mic` `state` | 32 |
+  | `camera_health` `camera` | 96 |
+  | `camera_health` warning | 320 |
+  | `camera_health` suggestion `reason` | 160 |
+  | `camera_health` setting `id`, suggestion `value`, recommended `value` and `current` | 48, 32, 32 and 32 |
+  | `camera_health` recommended `label` | 48 |
   | `mic` `provider`, `mic` `error` | 256 |
   | `media_item` `label` | 96 |
   | `media_item` `media_type` | 16 |
@@ -589,7 +628,7 @@ An option value is bounded to 32 bytes, which is why the options of `mic.input.d
 - **Stage values.** At most **8** `stage_values` are listed, and the `stage` and `name` of each are bounded to **48** bytes. A value that is not a finite number is left out (JSON has none), before the count is applied. A daemon reports a handful.
 - **Control list.** At most **16** image controls are listed; `controls_truncated` is `true` when the daemon reported more (a daemon reports at most five). The names are bounded as in the table above.
 - **Settings lists.** An enum setting lists at most **16** options, a setting at most **4** `enabled_when` conditions, an `in` condition at most **8** operands (a list inside a list is printed empty), a `settings_group` line at most **8** settings and a `settings_delta` line at most **16** changes. A longer list is cut, in order. The lines are also packed by their encoded length, so no line passes the cap (see [`settings_group`](#settings_group)).
-- **A `snapshot` over the cap.** Twelve cameras with every string at its bound, and image controls with theirs, do not fit 4096 bytes together. Strings at those bounds do not occur in practice, but the guarantee holds: an over-cap `snapshot` gives up its controls first, one at a time (`controls` ends empty and `controls_truncated` is `true`), and only then its cameras (`cameras_truncated` is `true`). With realistic ids and names, twelve cameras and the controls fit. The two settings fields and the `warning` of a `snapshot` take the room of three cameras in that worst case, and its `mic` object (revision 13) the room of three more: with every string at its bound and no controls, a `snapshot` lists 6 of the 12 cameras (`cameras_truncated` is `true`), and a `cameras` line all 12. A `mic` line alone is far under the cap.
+- **A `snapshot` over the cap.** Twelve cameras with every string at its bound, and image controls with theirs, do not fit 4096 bytes together. Strings at those bounds do not occur in practice, but the guarantee holds: an over-cap `snapshot` gives up its controls first, one at a time (`controls` ends empty and `controls_truncated` is `true`), and only then its cameras (`cameras_truncated` is `true`). With realistic ids and names, twelve cameras and the controls fit. The two settings fields and the `warning` of a `snapshot` take the room of three cameras in that worst case, and its `mic` object (revision 13) the room of three more: with every string at its bound and no controls, a `snapshot` lists 6 of the 12 cameras (`cameras_truncated` is `true`), and a `cameras` line all 12. A `mic` line alone is far under the cap. The `camera_health` object (revision 20) is listed at most 4 warnings, 4 suggestions and 16 recommended changes; should a `snapshot` still pass the cap, it gives up its controls first, then the entries of the lists of its `camera_health` (the recommended changes first, then the suggestions, then the warnings), and only then its cameras; a `camera_health` line over the cap gives up its lists in the same order.
 
 ### State strings
 
@@ -629,6 +668,7 @@ Every property of the daemon at one moment. Printed by `status --json`, and by `
 | `modules_serial` | number | The daemon's `ModulesSerial`, the counter of the module list and the stage order (from 1); `0` from a daemon below interface revision 9. A client reads `modules list --json` and `order show --json` again when it changes. Printed by every command that prints a `snapshot`. |
 | `config_serial` | number | The daemon's `ConfigSerial`, the counter of the configuration schema and the file list (from 1); `0` from a daemon below interface revision 10. A client reads `config show --json` again when it changes. |
 | `mic` | object or null | The microphone (interface revision 13): `state`, `consumers`, `provider`, `latency_ms` and `error`, as in the [`mic`](#mic) line without its `v` and `type`. `null`, with the key present, from a daemon below revision 13. Not in `state` lines: a change is a `mic` line. |
+| `camera_health` | object or null | The active camera's health (interface revision 20): the fields of the [`camera_health`](#camera_health) line without its `v` and `type`. `null`, with the key present, from a daemon below revision 20. Not in `state` lines: a change is a `camera_health` line. |
 
 A **camera object**:
 
@@ -702,6 +742,24 @@ The microphone (interface revision 13): `{"v":1,"type":"mic","state":"active","c
 | `error` | string | `MicError`: why stages that are on cannot run; `""` if none. Bounded to 256 bytes. |
 
 Strings are clipped as the [general rules](#general-rules) say. The microphone is not part of `state` lines, so a change of the camera's state never carries it.
+
+### `camera_health`
+
+The active camera's health (interface revision 20, the `CameraHealth` property): `{"v":1,"type":"camera_health","camera":"usb-1234_abcd","delivered_fps":19.5,"nominal_fps":30.0,"corrupt_frames":0,"warnings":["..."],"suggestions":[{"setting":"effect.video.denoise","value":"on","reason":"..."}],"has_recommendation":true,"recommended":[{"setting":"camera.image.sharpness","label":"Sharpness","value":"5","current":"3"}]}`. Printed by `recommended --json`, by `recommended apply --json` (after the change) and by `watch --json` whenever it changes. The same fields are the `camera_health` object of a `snapshot`.
+
+| Field | JSON type | Meaning |
+|---|---|---|
+| `v`, `type` | | `1`, `"camera_health"`. |
+| `camera` | string | The id of the active camera; `""` when there is none, and then the other fields have their empty values. Bounded like a camera `id`. |
+| `delivered_fps` | number | The rate of good frames the camera delivers, in frames per second, to 0.1; `-1` until measured (also for a value that is not a finite number). It is measured from the frames that passed the corrupt-frame guard and kept per camera and capture mode while the daemon runs. |
+| `nominal_fps` | number | The rate of the capture mode in use; `-1` when it is not known. |
+| `corrupt_frames` | number | The damaged frames dropped since the camera last opened (integer, 0 or more). |
+| `warnings` | array of strings | Sentences for people (a shared USB hub, damaged frames); `[]` when none. At most 4, each bounded as above. |
+| `suggestions` | array | Effects worth turning on, at most 4: objects `{"setting":"effect.video.denoise","value":"on","reason":"..."}`; `setting` is a global setting id and `value` what `settings set` takes. Never one whose setting is on or cannot run here. |
+| `has_recommendation` | boolean | The camera's model has a row of recommended settings. |
+| `recommended` | array | The changes `recommended apply` would make, at most 16, only where they differ from now: objects `{"setting":"camera.image.sharpness","label":"Sharpness","value":"5","current":"3"}`, `value` and `current` being the display texts of the settings tree. `[]` when nothing would change and when there is no row. |
+
+A client shows "delivers short" when both rates are known (not `-1`) and `delivered_fps` is below 95 % of `nominal_fps`. The health is not part of `state` lines. `watch --json` prints the line when the property changes, which for the counters (the rate, the damaged frames) is at most every 2 s. The line of `recommended apply --json` is read back after the call, so its `recommended` is `[]` unless the camera refused a value; a refusal of the call is an `error` line.
 
 ### `settings_group`
 
@@ -834,7 +892,7 @@ The output is a stream of the line types above:
 
 1. A `snapshot` line, once the daemon has been read. The subscriptions to its signals are made before the read, so no change is lost in between.
    From a daemon of interface revision 7, the snapshot is followed by the full set of settings of the active camera (the `settings_group` lines, or one `settings_clear`; see [Client assembly rules](#client-assembly-rules)).
-2. Then, as events arrive (no polling): a `state` line per change of the scalar fields, a `cameras` line per change of the camera list, a `controls` line per change of the image controls of the active camera (from a daemon of interface revision 6), a `settings_delta` line per change of a camera setting (from revision 7), a new set of `settings_group` lines (or a `settings_clear`) when the structure of the settings changes, a `modules_changed` line when `ModulesSerial` moves (from revision 9), a `config_changed` line per `ConfigChanged` signal (from revision 10), and a `stats` line per `Stats` signal. A change notification that changes no value prints nothing.
+2. Then, as events arrive (no polling): a `state` line per change of the scalar fields, a `cameras` line per change of the camera list, a `controls` line per change of the image controls of the active camera (from a daemon of interface revision 6), a `settings_delta` line per change of a camera setting (from revision 7), a new set of `settings_group` lines (or a `settings_clear`) when the structure of the settings changes, a `modules_changed` line when `ModulesSerial` moves (from revision 9), a `config_changed` line per `ConfigChanged` signal (from revision 10), a `camera_health` line when the camera's health changes (from revision 20), and a `stats` line per `Stats` signal. A change notification that changes no value prints nothing.
 
 ### `config_changed` and `modules_changed`
 
@@ -893,6 +951,7 @@ A client treats `"active":false`, and any `error` line, as "no frames now", and 
 - **`v` stays 1 for the stage values.** `stage_values` is a new field in the existing `snapshot` and `state` lines, and `changed` may name it (as `"stage_values"`). Against a daemon of interface revision 15 or lower the key is still printed, with the value `[]`, as for `warning`. A client written for the earlier version ignores it.
 - **`v` stays 1 for the capture and output modes.** Interface revision 12 adds no field and no line type: a `settings_group` set gains a group `capture` before the others (with one `enum` setting, `camera.capture.mode`), the `config_group` row of `output.mode` becomes an editable `enum` with options, `effect.on_failure` may have `image` among its options, and `warning` has more clauses. A client written for the earlier version draws what it knows and ignores the rest; `interface_revision` 12 tells a client that they can appear.
 - **`v` stays 1 for the microphone.** `mic` is a new line type, printed by a new command and by `watch --json`; the `snapshot` gains the field `mic` (not in `state`, so `changed` never names it); a `settings_group`'s `group` gains the optional key `surface`, and the settings of the groups it marks have ids `mic.<group>.<name>` with scope `"global"`; `unsupported-daemon` for `mic` is an existing code. Against a daemon of interface revision 12 or lower `mic` is `null` in the snapshot, with the key present, and no `mic` line is printed. A client written for the earlier version ignores the field, the line and the key, and draws the microphone's groups with the other global ones. The settings schema stays 1.
+- **`v` stays 1 for the camera's health.** `camera_health` is a new line type, printed by a new command and by `watch --json`, and a new field in the existing `snapshot` line (not in `state`, so `changed` never names it). Against a daemon of interface revision 19 or lower the `snapshot` still prints the key, with the value `null`, as for `mic`: "no warnings" would claim a daemon that checks for them, and `watch --json` prints no `camera_health` line then. `recommended` and `recommended apply` are new commands (against an older daemon an `error` line with the existing code `unsupported-daemon`). The label of the capture mode in use in a `settings_group` line may read `640x480 · 19.5 of 30 fps`, which is a label like any other. A client written for the earlier version ignores all of it.
 - **`v` stays 1 for the gallery.** `media`, `media_item` and `media_import` are new line types, printed by a new command only (`watch --json` and the `snapshot` are unchanged); `unsupported-daemon` for `media` is an existing code. A client written for the earlier version never runs the command. `media_type` may later take the value `"video"`, and a client shows a value it does not know as it is; the keys `poster` and `duration_ms` are present now, with the values of a still image.
 - A **breaking change** raises `v`: a removed or renamed field or line type, a changed JSON type or meaning, a new state string, or a change to the rules above (line cap, outage behaviour).
 - **Not breaking**, made without raising `v`: a new field in an existing line type, a new line type, a new `error` code. Clients ignore what they do not know.
@@ -1027,6 +1086,7 @@ omarchy-broadcast preview --json
 - On `controls`, replace the record's image controls (they are also in `snapshot`, as `camera_controls`).
 - For the camera settings, keep one tree: on a complete set of `settings_group` lines (or `settings_clear`) replace it, on a `settings_delta` of the same `serial` update the listed settings' `value`, `stored`, `enabled` and `disabled_reason`, and on a `snapshot` drop it and wait for the set that follows (see [Client assembly rules](#client-assembly-rules)). Draw the tree generically, by `type`, and show `disabled_reason` for a setting that is not `enabled`.
 - Show `error` whenever it is non-empty, whatever the state.
+- To show the camera's health, read `camera_health` of the `snapshot` and replace it on each `camera_health` line (a daemon below revision 20 gives `null`: show nothing). Show "delivers short" from the two rates, each warning as text, and each suggestion as a hint whose action runs `omarchy-broadcast settings set <setting> <value>`; offer "Use recommended settings" while `recommended` is not empty and run `omarchy-broadcast recommended apply` only on the user's click.
 - To offer the background gallery, run `omarchy-broadcast media --json` when the panel opens (and after the daemon returns), read the `media` line and then exactly its `items` `media_item` lines, and read again when a later `media` line has a different `serial` within the same daemon run (the serial restarts at 1 with the daemon). Run `media import background PATH --select --json` for an image the user picked and `media remove PATH` for a removal, and show the message of a failure; do not copy into or delete from the gallery's directories yourself. Treat `items_truncated` as "the list is not complete". Only if `interface_revision` is 15 or more.
 - To stop, send `SIGTERM` or close the pipe.
 - To show the live preview, run `omarchy-broadcast preview --json` as a second long-lived child process next to `watch`, and only while the user wants the preview: it keeps the camera running. Open the `path` of each `frame` line (or reload the image from it) and keep the lease for as long as the preview is shown; stop the process to end it. The frame file is replaced by a rename, so a reader never sees a partial image.

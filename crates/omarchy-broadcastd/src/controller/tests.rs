@@ -1184,6 +1184,7 @@ fn every_transition_of_the_lifecycle_is_announced_in_order() {
             Change::MicConsumers(n) => format!("mic_consumers={n}"),
             Change::MicLatencyMs(v) => format!("mic_latency={v}"),
             Change::StageValues(v) => format!("stage_values={}", v.len()),
+            Change::CameraHealth(v) => format!("health={}", v.camera),
         })
         .collect();
     assert_eq!(
@@ -1205,6 +1206,7 @@ fn every_transition_of_the_lifecycle_is_announced_in_order() {
             "controls=:0",
             "settings_serial=2",
             "settings_revision=2",
+            "health=",
             "consumers=1",
             "loopback=1",
             "error=no camera is available",
@@ -15802,3 +15804,5 @@ fn the_video_check_panics_on_the_controllers_thread() {
     crate::media::probe::forbid_on_this_thread();
     let _ = crate::media::probe_video(&f);
 }
+
+mod health;

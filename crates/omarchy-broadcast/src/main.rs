@@ -12,6 +12,7 @@ mod model;
 mod modules;
 mod out;
 mod preview;
+mod recommended;
 mod watch;
 
 use std::future::Future;
@@ -55,12 +56,13 @@ Exit status:
 
 `status`, `cameras`, `watch`, `preview`, `effect` without an effect, `controls` and
 `settings` without a subcommand, `modules list`, `modules info`, `modules profile` without
-a profile, `order show`, `config show|get|files`, `mic` or `mic status` and `media` or
-`media list` never start the daemon. `on`, `off`, `camera`, `effect <effect>`, `denoise`,
-`controls set`, `controls reset`, `settings set`, `settings reset`, `modules
-enable|disable|profile <profile>|pin`, `order set|reset`, `config set|reset`, `mic
-on|off|device|default|restore-default` and `media import|remove|convert-command` may start it
-through D-Bus activation when its activation file is installed.
+a profile, `order show`, `config show|get|files`, `mic` or `mic status`, `media` or
+`media list` and `recommended` never start the daemon. `on`, `off`, `camera`,
+`effect <effect>`, `denoise`, `controls set`, `controls reset`, `settings set`,
+`settings reset`, `modules enable|disable|profile <profile>|pin`, `order set|reset`,
+`config set|reset`, `mic on|off|device|default|restore-default`,
+`media import|remove|convert-command` and `recommended apply` may start it through D-Bus
+activation when its activation file is installed.
 
 `--json` output is documented in docs/cli-json.md; the D-Bus interface in docs/dbus-api.md.";
 
@@ -276,6 +278,23 @@ enum Command {
         json: bool,
         #[command(subcommand)]
         action: Option<mic::MicAction>,
+    },
+    /// Show or use the recommended settings of the active camera: values
+    /// measured best for its model, and the anti-flicker of your time
+    /// zone.
+    ///
+    /// Without a subcommand, lists what they would change (`label: now →
+    /// recommended`). `recommended apply` puts the camera's settings back
+    /// to their defaults, then sets the recommended values, stored for
+    /// that camera; the capture mode and the effects are not changed.
+    #[command(args_conflicts_with_subcommands = true)]
+    Recommended {
+        /// Print one JSON object (`"type":"camera_health"`); only without
+        /// a subcommand.
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<recommended::RecommendedAction>,
     },
     /// Follow state changes and stats until interrupted.
     Watch {
@@ -516,7 +535,12 @@ async fn show(json: bool, view: View) -> u8 {
                 // --json` does: it carries every effect field.
                 (true, View::Status | View::Effect) => out::line(&json::snapshot_line(&s)),
                 (true, View::Cameras) => out::line(&json::cameras_line(&s)),
-                (false, View::Status) => out::print(&human::status_text(&s)),
+                (false, View::Status) => {
+                    let labels = suggestion_labels(&s).await;
+                    let label =
+                        |id: &str| labels.iter().find(|(i, _)| i == id).map(|(_, l)| l.clone());
+                    out::print(&human::status_text_with(&s, &label));
+                }
                 (false, View::Cameras) => out::print(&human::cameras_text(&s)),
                 (false, View::Effect) => out::print(&human::effect_text(&s)),
             }
@@ -524,6 +548,30 @@ async fn show(json: bool, view: View) -> u8 {
         }
         Err(f) => report(&f, json),
     }
+}
+
+/// The labels of the settings the active camera's health suggests, from
+/// the settings tree (read without starting the daemon); none when there
+/// is no suggestion or the tree cannot be read (`status` then names the
+/// setting by its id).
+async fn suggestion_labels(s: &Snapshot) -> Vec<(String, String)> {
+    let Some(h) = human::active_health(s).filter(|h| !h.suggestions.is_empty()) else {
+        return Vec::new();
+    };
+    let tree = async {
+        let conn = bus::connect().await?;
+        bus::settings_tree(&conn, "").await
+    };
+    let Ok(tree) = within(READ_TIMEOUT, tree).await else {
+        return Vec::new();
+    };
+    h.suggestions
+        .iter()
+        .filter_map(|sg| {
+            let label = tree.find(&sg.setting)?.label.clone();
+            Some((sg.setting.clone(), label))
+        })
+        .collect()
 }
 
 /// The method calls: `on`, `off`, `camera ...`. Prints the result read back
@@ -1078,6 +1126,9 @@ async fn run(job: Job) -> u8 {
             config::run(action.as_ref().unwrap_or(&show)).await
         }
         Job::Command(Command::Mic { json, action }) => mic::run(action.as_ref(), *json).await,
+        Job::Command(Command::Recommended { json, action }) => {
+            recommended::run(action.as_ref(), *json).await
+        }
         Job::Command(Command::Controls { json, action: None }) => show_controls(*json).await,
         Job::Command(Command::Controls {
             action: Some(action),

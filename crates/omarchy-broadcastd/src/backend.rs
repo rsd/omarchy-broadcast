@@ -19,6 +19,8 @@ use obc_pipeline::control_node::{CaptureFormat, NodeControl};
 use obc_pipeline::controls::CtrlInfo;
 use obc_pipeline::ctrl_events::CtrlEvent;
 use obc_pipeline::effect::{Availability, Params, StageId, StageValue};
+use obc_pipeline::frame_guard::CorruptFrames;
+use obc_pipeline::usb_topology::UsbPlacement;
 use obc_pipeline::xu::XuRow;
 
 use crate::camera::Camera;
@@ -310,6 +312,19 @@ pub struct EffectReport {
     /// processed (a module of ABI 1.3: auto-frame's zoom), the chains'
     /// first, then the effect element's; empty when none reports.
     pub stage_values: Vec<StageValue>,
+}
+
+/// What the running session's ingest measured of its camera
+/// ([`MediaBackend::ingest_health`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct IngestHealth {
+    /// The rate the camera delivers good frames at
+    /// ([`obc_pipeline::Session::delivered_fps`]); `None` until the
+    /// ingest has one.
+    pub delivered_fps: Option<f64>,
+    /// The damaged frames the ingest dropped since it started
+    /// ([`obc_pipeline::Session::corrupt_frames`]).
+    pub corrupt: CorruptFrames,
 }
 
 /// The state of the optional PipeWire output (`[pipewire] enabled`), the
@@ -732,4 +747,19 @@ pub trait MediaBackend: Send + 'static {
     /// Stops the control-event watcher, if one runs; no event of it is
     /// reported afterwards. Idempotent.
     fn unwatch_controls(&mut self);
+
+    /// What the running session's current ingest measured of its camera:
+    /// its delivered rate and the damaged frames it dropped (`None`: no
+    /// session, or no ingest). Reads counters only: cheap, any time.
+    fn ingest_health(&mut self) -> Option<IngestHealth>;
+
+    /// Where `camera` sits on the USB bus, and whether it shares a hub
+    /// with keyboards or mice ([`obc_pipeline::usb_topology::placement`]);
+    /// `None` for a camera not on USB. Reads sysfs only: safe at idle.
+    fn usb_placement(&mut self, camera: &Camera) -> Option<UsbPlacement>;
+
+    /// The local time zone's name (`Europe/Lisbon`): `TZ`, else the target
+    /// of `/etc/localtime` ([`crate::health::local_zone`]); `None` when
+    /// neither names one.
+    fn time_zone(&mut self) -> Option<String>;
 }

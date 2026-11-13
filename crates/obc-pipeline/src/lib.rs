@@ -33,7 +33,10 @@
 //! its frames to the persistent [`loopback::LoopbackWriter`], which owns the
 //! loopback device for the daemon's whole life and sends black placeholders
 //! while no output runs; [`live::LiveStats`] measures a running stream for
-//! the daemon's statistics. At each start on a loopback the writer also
+//! the daemon's statistics, and [`delivered_rate`] the rate a camera
+//! really delivers good frames at ([`Ingest::delivered_fps`]);
+//! [`usb_topology`] says where a camera sits on the USB bus and whether it
+//! shares a hub with HID devices. At each start on a loopback the writer also
 //! puts the crash cover in place ([`loopback_cover`]): a black timeout
 //! image the driver serves while no writer streams, so a consumer survives
 //! the daemon's crash and restart. The measurement modules
@@ -56,6 +59,7 @@ pub mod colour_range;
 pub mod control_node;
 pub mod controls;
 pub mod ctrl_events;
+pub mod delivered_rate;
 pub mod device;
 pub mod discovery;
 pub mod effect;
@@ -82,6 +86,7 @@ pub mod stamp;
 pub mod stats;
 #[cfg(test)]
 mod test_support;
+pub mod usb_topology;
 pub mod xu;
 
 pub use capability::{Capabilities, IngestPath, ModeChoice, choose_mode};
@@ -116,4 +121,5 @@ pub use pipeline::{
 pub use preview::{PreviewConfig, PreviewCounts, PreviewEncoder};
 pub use process::GpuStage;
 pub use session::{Session, SwitchTiming};
+pub use usb_topology::{SharedHub, UsbPlacement};
 pub use xu::{XuControl, XuRow, XuState};

@@ -385,6 +385,20 @@ pub fn require_away_image(revision: u32) -> Result<(), Failure> {
     )))
 }
 
+/// Fails unless a daemon of interface revision `revision` has the
+/// camera's health and its recommended settings (`CameraHealth`,
+/// `ApplyRecommendedSettings`).
+pub fn require_camera_health(revision: u32) -> Result<(), Failure> {
+    if revision >= obc_ipc::CAMERA_HEALTH_REVISION {
+        return Ok(());
+    }
+    Err(Failure::Unsupported(format!(
+        "the daemon does not support recommended settings (its interface revision is \
+         {revision}, they need {}); update omarchy-broadcastd",
+        obc_ipc::CAMERA_HEALTH_REVISION
+    )))
+}
+
 /// Fails unless a daemon of interface revision `revision` gives the
 /// command that converts a video (`GetConvertCommand`).
 pub fn require_convert_command(revision: u32) -> Result<(), Failure> {

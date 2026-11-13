@@ -1429,6 +1429,22 @@ impl MediaBackend for GstBackend {
         // Dropping it wakes the thread and joins it.
         self.watcher = None;
     }
+
+    fn ingest_health(&mut self) -> Option<super::IngestHealth> {
+        let r = self.running.as_ref()?;
+        Some(super::IngestHealth {
+            delivered_fps: r.session.delivered_fps(),
+            corrupt: r.session.corrupt_frames()?,
+        })
+    }
+
+    fn usb_placement(&mut self, camera: &Camera) -> Option<obc_pipeline::UsbPlacement> {
+        obc_pipeline::usb_topology::placement(&camera.path)
+    }
+
+    fn time_zone(&mut self) -> Option<String> {
+        crate::health::local_zone()
+    }
 }
 
 /// A camera node opened for its controls, with its Extension Unit rows.

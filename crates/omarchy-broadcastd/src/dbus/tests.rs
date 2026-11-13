@@ -442,14 +442,21 @@ async fn every_property_reads_through_the_proxy() {
             mic: Some(obc_ipc::MicStatus::default()),
             // Idle: no stage runs.
             stage_values: Vec::new(),
+            // Never streamed, no profile row, no USB: its mode's rate only.
+            camera_health: Some(obc_ipc::CameraHealth {
+                camera: "pci-b".into(),
+                nominal_fps: 30.0,
+                ..obc_ipc::CameraHealth::none()
+            }),
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 19);
-    assert_eq!(INTERFACE_REVISION, obc_ipc::CPU_CONVERT_REVISION);
+    assert_eq!(INTERFACE_REVISION, 20);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::CAMERA_HEALTH_REVISION);
+    assert_eq!(obc_ipc::CPU_CONVERT_REVISION, 19);
     assert_eq!(obc_ipc::VIDEO_BACKGROUND_REVISION, 18);
     assert_eq!(obc_ipc::PLACEHOLDER_REVISION, 17);
-    // GetAll returns the same twenty-nine properties.
+    // GetAll returns the same thirty properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
         .destination(obc_ipc::BUS_NAME)
         .path(OBJECT_PATH)
@@ -472,6 +479,7 @@ async fn every_property_reads_through_the_proxy() {
             "BackgroundImage",
             "BlurStrength",
             "CameraControls",
+            "CameraHealth",
             "Cameras",
             "ConfigSerial",
             "Consumers",
@@ -553,6 +561,8 @@ async fn every_property_reads_through_the_proxy() {
         "<arg name=\"items\" type=\"aa{sv}\" direction=\"out\"/>",
         "<property name=\"MediaSerial\" type=\"u\" access=\"read\"",
         "<property name=\"StageValues\" type=\"a(ssd)\" access=\"read\"",
+        "<property name=\"CameraHealth\" type=\"a{sv}\" access=\"read\"",
+        "<method name=\"ApplyRecommendedSettings\">",
     ] {
         assert!(xml.contains(m), "{m} missing from {xml}");
     }
@@ -948,7 +958,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 19);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 20);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -1132,7 +1142,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 19);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 20);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -1248,7 +1258,7 @@ async fn preview_leases_by_bus_name_their_property_and_their_frames() {
     let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 19);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 20);
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
     let seen = rig.record_changes().await;
     let mut frames = proxy.receive_preview_frame().await.unwrap();
@@ -2807,4 +2817,63 @@ fn get_media_dirs_gives_no_videos_folder_that_is_the_pictures_one() {
         shown(&own)
     );
     assert_eq!(media_dirs(&two, MediaKind::Away).video_dir, "");
+}
+
+/// `CameraHealth` (revision 20) through the proxy, announced when the
+/// camera changes; `ApplyRecommendedSettings` and its errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn camera_health_and_apply_recommended_settings() {
+    let rig = Rig::new("", |w| {
+        w.cameras = vec![
+            cam("usb-fhd", "FHD Camera", Some("5986:1193"), "/dev/video0"),
+            cam("usb-a", "Alpha Cam", Some("1111:0001"), "/dev/video2"),
+        ];
+    })
+    .await;
+    let proxy = rig.proxy().await;
+    wait_state(&proxy, State::Idle).await;
+    let health =
+        || async { obc_ipc::CameraHealth::from_dict(&proxy.camera_health().await.unwrap()) };
+    let deadline = Instant::now() + TIMEOUT;
+    while health().await.camera != "usb-fhd" {
+        assert!(Instant::now() < deadline, "{:?}", health().await);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let h = health().await;
+    assert!(h.has_recommendation);
+    assert_eq!(h.delivered_fps, obc_ipc::NOT_MEASURED);
+    assert_eq!(h.nominal_fps, 30.0);
+    // Its model's row is applied (nothing to write on a camera without
+    // controls); the active camera by "" or by its id.
+    within("Apply", proxy.apply_recommended_settings(""))
+        .await
+        .unwrap();
+    within("Apply", proxy.apply_recommended_settings("usb-fhd"))
+        .await
+        .unwrap();
+    for (camera, says) in [("nope", "no camera"), ("usb-a", "no recommended settings")] {
+        match within("Apply", proxy.apply_recommended_settings(camera)).await {
+            Err(e @ IpcError::InvalidArgument(_)) => {
+                assert_eq!(
+                    zbus::DBusError::name(&e).as_str(),
+                    "br.com.dias.OmarchyBroadcast1.Error.InvalidArgument"
+                );
+                assert!(e.message().contains(says), "{camera}: {e:?}");
+            }
+            other => panic!("{camera}: expected InvalidArgument, got {other:?}"),
+        }
+    }
+    // Another camera: announced at once.
+    let seen = rig.record_changes().await;
+    within("SelectCamera", proxy.select_camera("usb-a"))
+        .await
+        .unwrap();
+    until("CameraHealth of usb-a", &seen, |s| {
+        s.iter()
+            .any(|e| e.starts_with("CameraHealth=") && e.contains("usb-a"))
+    })
+    .await;
+    let h = health().await;
+    assert_eq!(h.camera, "usb-a");
+    assert!(!h.has_recommendation);
 }

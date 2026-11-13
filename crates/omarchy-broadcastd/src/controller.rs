@@ -334,6 +334,7 @@ use obc_pipeline::ctrl_events::{
 };
 use obc_pipeline::effect::{Params, StageId};
 use obc_pipeline::quirks;
+use obc_pipeline::usb_topology::UsbPlacement;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::backend::{
@@ -343,6 +344,7 @@ use crate::backend::{
 };
 use crate::camera::{self, Camera};
 use crate::gpu_cache;
+use crate::health::{self, DamageWindow};
 use crate::media::{self, MediaStore, VideoInfo, same_file};
 use crate::mic::{self, agent::MicEvent, agent::MicLink, agent::MicRequest};
 use crate::modules::{self, HostMemory, Modules, Plan};
@@ -378,6 +380,15 @@ const POLL_RUNNING: Duration = Duration::from_millis(250);
 /// The shortest time between two changes of `StageValues`
 /// ([`obc_ipc::STAGE_VALUES_PERIOD_MS`]).
 pub const STAGE_VALUES_PERIOD: Duration = Duration::from_millis(obc_ipc::STAGE_VALUES_PERIOD_MS);
+/// The shortest time between two changes of `CameraHealth`'s counters
+/// ([`obc_ipc::CAMERA_HEALTH_PERIOD_MS`]).
+pub const CAMERA_HEALTH_PERIOD: Duration = Duration::from_millis(obc_ipc::CAMERA_HEALTH_PERIOD_MS);
+/// The shortest time between two moves of the rate a capture mode's label
+/// shows ([`health::shown_rate`]): a label change is a structural change
+/// of the settings tree (clients read it again), and a rate that swings
+/// (a VX-800 between 17 and 23 fps) would otherwise move it at most polls.
+/// The label coming or going is not held back (its marks are apart).
+const LABEL_MOVE_PERIOD: Duration = Duration::from_secs(30);
 /// The longest the writer's placeholder is waited for while it decodes
 /// the fallback image: past it the image is said not to be readable, and
 /// the steps no longer come often for it (a decode that hung or died).
@@ -538,6 +549,8 @@ pub enum Command {
     Rescan,
     /// `SetMicHost(b)` (revision 13).
     SetMicHost(bool, Reply),
+    /// `ApplyRecommendedSettings(s)` (revision 20; empty: `ActiveCamera`).
+    ApplyRecommendedSettings(String, Reply),
     /// What the microphone's agent found or did ([`crate::mic::agent`]).
     Mic(MicEvent),
     /// The check and the poster of the video `source` asked for
@@ -583,6 +596,7 @@ pub enum Change {
     MicLatencyMs(f64),
     MicError(String),
     StageValues(Vec<obc_ipc::StageValue>),
+    CameraHealth(obc_ipc::CameraHealth),
 }
 
 impl Change {
@@ -617,6 +631,7 @@ impl Change {
             Change::MicLatencyMs(_) => "MicLatencyMs",
             Change::MicError(_) => "MicError",
             Change::StageValues(_) => "StageValues",
+            Change::CameraHealth(_) => "CameraHealth",
         }
     }
 }
@@ -832,6 +847,11 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Vec<Change> {
     if old.stage_values != new.stage_values {
         out.push(Change::StageValues(new.stage_values.clone()));
     }
+    if old.camera_health != new.camera_health {
+        out.push(Change::CameraHealth(
+            new.camera_health.clone().unwrap_or_default(),
+        ));
+    }
     if old.mic != new.mic {
         let (o, n) = (
             old.mic.clone().unwrap_or_default(),
@@ -965,6 +985,7 @@ pub fn preliminary_snapshot(paths: &Paths) -> Snapshot {
         // What the mic host runs is not known before the agent asked.
         mic: Some(obc_ipc::MicStatus::default()),
         stage_values: Vec::new(),
+        camera_health: Some(obc_ipc::CameraHealth::none()),
         interface_revision: INTERFACE_REVISION,
     }
 }
@@ -1482,6 +1503,34 @@ pub struct Controller<B: MediaBackend> {
     stage_values: Vec<obc_ipc::StageValue>,
     /// When `stage_values` last changed.
     stage_values_at: Option<Instant>,
+    /// The delivered rates published (`CameraHealth`, revision 20), by
+    /// camera id and capture mode: the last measurement of each, kept for
+    /// the daemon's life ([`Self::poll_health`]).
+    delivered: HashMap<(String, obc_core::VideoMode), f64>,
+    /// The rate the capture mode's label shows, by camera id and mode
+    /// ([`Self::mode_setting_of`]), and when the label last changed: only
+    /// the modes whose label shows one ([`health::shown_rate`]; a move at
+    /// most every [`LABEL_MOVE_PERIOD`]).
+    labelled: HashMap<(String, obc_core::VideoMode), (f64, Instant)>,
+    /// The damaged frames dropped since each camera last opened, as
+    /// published.
+    corrupt: HashMap<String, u64>,
+    /// When the counters (`delivered`, `corrupt`) were last published: at
+    /// most every [`CAMERA_HEALTH_PERIOD`].
+    counters_at: Option<Instant>,
+    /// The damaged-frame share of the open camera's stream.
+    damage: DamageWindow,
+    /// The cameras whose stream dropped [`health::DAMAGE_RATIO`] of its
+    /// frames or more over the last window measured, until they next open.
+    damaged: HashSet<String>,
+    /// Where each camera sits on the USB bus, by id: read when first
+    /// needed and again at each open; forgotten at a rescan.
+    placements: HashMap<String, Option<UsbPlacement>>,
+    /// The local time zone, read once (`Some(None)`: none known).
+    zone: Option<Option<String>>,
+    /// The cameras whose anti-flicker was set from the time zone (logged
+    /// at info once each).
+    mains_noted: HashSet<String>,
     /// The modules were discovered and opened ([`Self::load_modules`]):
     /// until then nothing is known of what they provide, and `Warning`
     /// says nothing.
@@ -1914,6 +1963,15 @@ impl<B: MediaBackend> Controller<B> {
             effect_log_at: None,
             stage_values: Vec::new(),
             stage_values_at: None,
+            delivered: HashMap::new(),
+            labelled: HashMap::new(),
+            corrupt: HashMap::new(),
+            counters_at: None,
+            damage: DamageWindow::default(),
+            damaged: HashSet::new(),
+            placements: HashMap::new(),
+            zone: None,
+            mains_noted: HashSet::new(),
             modules_loaded: load_modules,
             consumers: 0,
             loopback_consumers: 0,
@@ -2154,6 +2212,10 @@ impl<B: MediaBackend> Controller<B> {
             }
             Command::Rescan => self.rescan(now),
             Command::SetMicHost(on, reply) => self.set_mic_host(on, reply),
+            Command::ApplyRecommendedSettings(camera, reply) => {
+                let res = self.apply_recommended(&camera, now);
+                let _ = reply.send(res);
+            }
             Command::Mic(event) => self.mic_event(event),
             Command::VideoPoster {
                 source,
@@ -3459,6 +3521,7 @@ impl<B: MediaBackend> Controller<B> {
         }
         self.config_facts = (self.modules.serial(), facts);
         let effect = self.effect();
+        let camera_health = self.camera_health();
         // Computed once per publish, and logged where it changes.
         let warning = self.warning();
         if warning != self.warning_shown {
@@ -3500,6 +3563,7 @@ impl<B: MediaBackend> Controller<B> {
             config_serial: Some(self.config_serial),
             mic: Some(self.mic_status.clone()),
             stage_values: self.stage_values.clone(),
+            camera_health: Some(camera_health),
             interface_revision: INTERFACE_REVISION,
         };
         self.published.update(snap);
@@ -5128,6 +5192,7 @@ impl<B: MediaBackend> Controller<B> {
             let stats = self.backend.take_stats();
             self.published.stats(stats);
             self.next_stats = Some(now + STATS_PERIOD);
+            self.poll_health(now);
         }
     }
 
@@ -5311,6 +5376,8 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     fn rescan(&mut self, now: Instant) {
+        // A camera may have moved to another port.
+        self.placements.clear();
         let old = self.rescan_cameras();
         let nodes = |c: &[Camera]| c.iter().map(|c| c.path.clone()).collect::<Vec<PathBuf>>();
         // A node another camera took over changes the set as well.
@@ -6142,6 +6209,13 @@ impl<B: MediaBackend> Controller<B> {
         if let Some(s) = self.session.as_mut() {
             s.open = true;
         }
+        // A new stream: its counters start again, and where it sits on
+        // the bus is read again (it may have moved).
+        self.corrupt.insert(camera.id.clone(), 0);
+        self.counters_at = None;
+        self.damage.clear();
+        self.damaged.remove(&camera.id);
+        self.placements.remove(&camera.id);
         self.follow_frame_generation();
         let ids = self.apply_camera_controls(camera);
         self.start_watch(camera, &ids);
@@ -6159,9 +6233,18 @@ impl<B: MediaBackend> Controller<B> {
 
     /// The capture mode setting of camera `id` (`None`: no such camera, or
     /// its modes are not known).
+    /// The option of the mode it uses shows the rate it delivers in place
+    /// of its own (`640x480 · 19.5 of 30 fps`) while [`Self::labelled`]
+    /// has one for it ([`health::shown_rate`]).
     fn mode_setting_of(&self, id: &str) -> Option<obc_ipc::Setting> {
         let cam = self.cameras.iter().find(|c| c.id == id)?;
-        settings::mode_setting(&cam.modes, self.runtime.camera_modes.get(id))
+        let mut setting = settings::mode_setting(&cam.modes, self.runtime.camera_modes.get(id))?;
+        let m = cam.mode;
+        if let Some((fps, _)) = self.labelled.get(&(cam.id.clone(), m)) {
+            let value = mode_value(m.width, m.height, m.fps_num, m.fps_den);
+            health::mark_delivered(&mut setting, &value, *fps);
+        }
+        Some(setting)
     }
 
     /// The mode asked of camera `id`: the one the user chose for it, else
@@ -6976,6 +7059,9 @@ impl<B: MediaBackend> Controller<B> {
                     Err(why) => warning!("{why}"),
                 }
             }
+        }
+        if !state.values.contains_key(health::POWER_LINE) {
+            others |= self.write_mains(camera, &mut *node, &mut scan, &model);
         }
         if others {
             scan = node.enumerate();
@@ -7941,6 +8027,18 @@ impl<B: MediaBackend> Controller<B> {
     /// same. A change the state file cannot take fails it too
     /// ([`Self::settings_saved`]).
     fn reset(&mut self, camera: &str, what: ResetWhat, now: Instant) -> Result<(), IpcError> {
+        self.reset_with(camera, what, now, true)
+    }
+
+    /// [`Self::reset`], with a lifecycle step (and so a publish) at its end
+    /// when `step`.
+    fn reset_with(
+        &mut self,
+        camera: &str,
+        what: ResetWhat,
+        now: Instant,
+        step: bool,
+    ) -> Result<(), IpcError> {
         let cam = self.control_camera(camera)?;
         let open = self.is_open(&cam);
         let shown = self.active_camera() == cam.id;
@@ -8089,7 +8187,9 @@ impl<B: MediaBackend> Controller<B> {
             (None, Some(e)) => self.controls_unreadable(&cam, &e),
             (None, None) => {}
         }
-        self.reconcile(now);
+        if step {
+            self.reconcile(now);
+        }
         res
     }
 
@@ -8544,6 +8644,342 @@ impl<B: MediaBackend> Controller<B> {
             res = res.and(self.config_written(&format!("{key} reset"), r, None, now));
         }
         res
+    }
+}
+
+// ---- the camera's health (revision 20) ----
+
+impl<B: MediaBackend> Controller<B> {
+    /// The local time zone's name, read once.
+    fn zone(&mut self) -> Option<String> {
+        if self.zone.is_none() {
+            self.zone = Some(self.backend.time_zone());
+        }
+        self.zone.clone().flatten()
+    }
+
+    /// The mains frequency of the time zone ([`health::mains_hz`]).
+    fn mains(&mut self) -> Option<u32> {
+        self.zone().as_deref().and_then(health::mains_hz)
+    }
+
+    /// Whether a reset of `cam`'s settings meets the frame rate pin, so
+    /// that it puts `exposure_dynamic_framerate` back to 0 rather than to
+    /// its default ([`Self::write_defaults`]): open, the pin of its ingest;
+    /// closed, `[camera] fixed_framerate` (the reset forgets a value stored
+    /// for it, so the pin applies at the next open).
+    fn reset_pins(&self, cam: &Camera) -> bool {
+        if self.is_open(cam) {
+            self.session.as_ref().is_some_and(|s| s.pinned)
+        } else {
+            self.config.camera.fixed_framerate
+        }
+    }
+
+    /// Where `cam` sits on the USB bus, read once per open.
+    fn placement_of(&mut self, cam: &Camera) -> Option<UsbPlacement> {
+        if let Some(p) = self.placements.get(&cam.id) {
+            return p.clone();
+        }
+        let p = self.backend.usb_placement(cam);
+        self.placements.insert(cam.id.clone(), p.clone());
+        p
+    }
+
+    /// `CameraHealth` of `ActiveCamera` as it stands: the counters as
+    /// last published ([`Self::poll_health`]), the warnings, the
+    /// suggestions against the global settings, the recommended changes
+    /// against the published tree.
+    fn camera_health(&mut self) -> obc_ipc::CameraHealth {
+        let id = self.active_camera();
+        let Some(cam) = self.cameras.iter().find(|c| c.id == id).cloned() else {
+            return obc_ipc::CameraHealth::none();
+        };
+        let m = cam.mode;
+        let nominal = if m.fps_num > 0 && m.fps_den > 0 {
+            m.fps()
+        } else {
+            obc_ipc::NOT_MEASURED
+        };
+        let placement = self.placement_of(&cam);
+        let mut warnings: Vec<String> =
+            health::shared_hub_warning(&cam.name, placement.as_ref(), &m)
+                .into_iter()
+                .collect();
+        if self.damaged.contains(&cam.id) {
+            let hub = placement
+                .as_ref()
+                .filter(|_| health::hub_advice_needed(placement.as_ref(), &m));
+            warnings.push(health::damaged_warning(&cam.name, hub));
+        }
+        let profile = quirks::profile(cam.usb);
+        let lines = cam.modes.iter().map(|m| m.height).max();
+        let suggestions = health::suggestions(
+            profile.is_some_and(|p| p.noisy),
+            lines,
+            &self.global_settings(),
+        );
+        let mains = self.mains();
+        let pinned = self.reset_pins(&cam);
+        let recommended = match (profile, &self.settings_published) {
+            (Some(p), Some(tree)) if tree.camera == cam.id => {
+                health::recommended(tree, p.values, mains, pinned)
+            }
+            _ => Vec::new(),
+        };
+        obc_ipc::CameraHealth {
+            delivered_fps: self
+                .delivered
+                .get(&(cam.id.clone(), m))
+                .copied()
+                .unwrap_or(obc_ipc::NOT_MEASURED),
+            nominal_fps: nominal,
+            corrupt_frames: self.corrupt.get(&cam.id).copied().unwrap_or(0),
+            warnings,
+            suggestions,
+            has_recommendation: profile.is_some(),
+            recommended,
+            camera: cam.id,
+        }
+    }
+
+    /// At each stats tick of a running stream: what the ingest measured.
+    /// The damaged-frame share is judged at once (a warning appearing or
+    /// going is published at once); the counters (the delivered rate, kept
+    /// per camera and mode, and the damaged frames) are published at most
+    /// every [`CAMERA_HEALTH_PERIOD`].
+    fn poll_health(&mut self, now: Instant) {
+        let Some(cam) = self.session_camera().cloned() else {
+            return;
+        };
+        if !self.session.as_ref().is_some_and(|s| s.open) {
+            return;
+        }
+        let Some(measured) = self.backend.ingest_health() else {
+            return;
+        };
+        let m = cam.mode;
+        let corrupt = measured.corrupt.total();
+        let nominal = if m.fps_num > 0 && m.fps_den > 0 {
+            m.fps()
+        } else {
+            0.0
+        };
+        self.damage
+            .record(now, corrupt, measured.delivered_fps.unwrap_or(nominal));
+        let mut changed = false;
+        if let Some(ratio) = self.damage.ratio() {
+            let was = self.damaged.contains(&cam.id);
+            let damaged = health::damaged_now(was, ratio);
+            if damaged && !was {
+                warning!(
+                    "{}: {:.0} % of its frames were damaged over the last {} s",
+                    cam.label(),
+                    ratio * 100.0,
+                    health::DAMAGE_WINDOW.as_secs()
+                );
+                self.damaged.insert(cam.id.clone());
+                changed = true;
+            } else if !damaged && was {
+                info!("{}: its frames are no longer damaged", cam.label());
+                self.damaged.remove(&cam.id);
+                changed = true;
+            }
+        }
+        let due = self
+            .counters_at
+            .is_none_or(|t| now.saturating_duration_since(t) >= CAMERA_HEALTH_PERIOD);
+        if due {
+            self.counters_at = Some(now);
+            let key = (cam.id.clone(), m);
+            if let Some(fps) = measured
+                .delivered_fps
+                .filter(|f| f.is_finite() && *f >= 0.0)
+            {
+                let fps = health::round_fps(fps);
+                changed |= self.delivered.insert(key.clone(), fps) != Some(fps);
+                let old = self.labelled.get(&key).copied();
+                let shown = health::shown_rate(old.map(|(r, _)| r), fps, nominal);
+                match (old, shown) {
+                    (None, Some(r)) => {
+                        info!(
+                            "{} delivers {r:.1} of the {nominal:.0} fps of {m}",
+                            cam.label()
+                        );
+                        self.labelled.insert(key, (r, now));
+                        changed = true;
+                    }
+                    (Some(_), None) => {
+                        info!("{} delivers the {nominal:.0} fps of {m} again", cam.label());
+                        self.labelled.remove(&key);
+                        changed = true;
+                    }
+                    (Some((r0, at)), Some(r))
+                        if r != r0 && now.saturating_duration_since(at) >= LABEL_MOVE_PERIOD =>
+                    {
+                        self.labelled.insert(key, (r, now));
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+            changed |= self.corrupt.insert(cam.id.clone(), corrupt) != Some(corrupt);
+        }
+        if changed {
+            self.publish();
+        }
+    }
+
+    /// At an open of `camera` with nothing stored for its anti-flicker:
+    /// writes the mains frequency of the time zone, without storing it
+    /// (it is no choice of the user's; one stored wins). Logged at info
+    /// once per camera. Returns whether the write may have changed other
+    /// controls.
+    fn write_mains(
+        &mut self,
+        camera: &Camera,
+        node: &mut dyn ControlNode,
+        scan: &mut ControlScan,
+        model: &CameraSettings,
+    ) -> bool {
+        let Some(e) = model.by_name(health::POWER_LINE).cloned() else {
+            return false;
+        };
+        let Some(zone) = self.zone() else {
+            return false;
+        };
+        let Some(hz) = health::mains_hz(&zone) else {
+            debug!(
+                "{}: the time zone {zone} has no single mains frequency: its anti-flicker is \
+                 left as it is",
+                camera.label()
+            );
+            return false;
+        };
+        let Some(raw) = health::mains_raw(&e, hz) else {
+            return false;
+        };
+        if e.inactive() || e.flags & (CTRL_FLAG_READ_ONLY | CTRL_FLAG_DISABLED) != 0 {
+            return false;
+        }
+        if e.device == Some(raw) {
+            return false;
+        }
+        match Self::write_entry(node, scan, &e, raw) {
+            Ok(()) => {
+                let text = format!(
+                    "{}: anti-flicker set to {hz} Hz for the time zone {zone} (not stored: a \
+                     value set for it wins)",
+                    camera.label()
+                );
+                if self.mains_noted.insert(camera.id.clone()) {
+                    info!("{text}");
+                } else {
+                    debug!("{text}");
+                }
+                e.updates_others
+            }
+            Err(why) => {
+                warning!("{why}");
+                false
+            }
+        }
+    }
+
+    /// `camera`'s settings model now: from the last read of an open
+    /// camera, else from a read made now.
+    fn model_of(&mut self, camera: &Camera) -> Result<CameraSettings, IpcError> {
+        let open = self.is_open(camera);
+        let scan = match open.then(|| self.last_read(camera)).flatten() {
+            Some(scan) => scan,
+            None => self.scan_camera(camera, false).map_err(IpcError::Failed)?.1,
+        };
+        Ok(self.build_settings(camera, &scan))
+    }
+
+    /// `ApplyRecommendedSettings`: the camera's device settings back to
+    /// their defaults ([`Self::reset_with`] of the whole camera: not the
+    /// capture mode, not the effects), then the values of its model's row
+    /// and the power-line frequency of the time zone set through
+    /// `SetSetting`'s path and stored as the user's. One lifecycle step
+    /// (one publish) at the end, before the reply. `InvalidArgument` for
+    /// an unknown camera or one without a row; otherwise the first
+    /// failure, the rest carried out all the same.
+    fn apply_recommended(&mut self, camera: &str, now: Instant) -> Result<(), IpcError> {
+        let cam = self.control_camera(camera).map_err(|e| match e {
+            IpcError::NoSuchCamera(m) | IpcError::Unavailable(m) => IpcError::InvalidArgument(m),
+            other => other,
+        })?;
+        let Some(profile) = quirks::profile(cam.usb) else {
+            return Err(IpcError::InvalidArgument(format!(
+                "{} has no recommended settings",
+                cam.label()
+            )));
+        };
+        let mains = self.mains();
+        let pinned = self.reset_pins(&cam);
+        let mut res = self.reset_with(&cam.id, ResetWhat::Camera, now, false);
+        let writes = match self.model_of(&cam) {
+            Ok(model) => health::recommended_writes(&model, profile.values, mains, pinned)
+                .into_iter()
+                .filter_map(|(i, raw)| {
+                    let e = &model.entries[i];
+                    Some((e.setting.id.clone(), e.values.of(raw)?))
+                })
+                .collect(),
+            Err(e) => {
+                res = res.and(Err(e));
+                Vec::new()
+            }
+        };
+        let mut done = Vec::new();
+        for (id, value) in writes {
+            done.push(format!("{id} {}", value_text(&value)));
+            let req = SetRequest::Setting {
+                id,
+                value: Some(value),
+            };
+            match self.try_set(&cam.id, &req, now, false, false) {
+                SetOutcome::Done(r) => res = res.and(r),
+                // Written when its coalescing window ends, like any held
+                // write; nothing waits for it.
+                SetOutcome::Hold {
+                    camera,
+                    setting,
+                    name,
+                    due,
+                } => {
+                    let (reply, _) = tokio::sync::oneshot::channel();
+                    self.held.push(Held {
+                        camera,
+                        setting,
+                        name,
+                        req,
+                        reply,
+                        due,
+                    });
+                }
+            }
+        }
+        info!(
+            "recommended settings of {} ({}) applied: defaults{}{}",
+            cam.label(),
+            profile.model,
+            if done.is_empty() { "" } else { ", then " },
+            done.join(", ")
+        );
+        self.reconcile(now);
+        res
+    }
+}
+
+/// A setting value for a log line.
+fn value_text(v: &SettingValue) -> String {
+    match v {
+        SettingValue::Bool(b) => b.to_string(),
+        SettingValue::Int(i) => i.to_string(),
+        SettingValue::Str(s) => s.clone(),
+        other => format!("{other:?}"),
     }
 }
 
