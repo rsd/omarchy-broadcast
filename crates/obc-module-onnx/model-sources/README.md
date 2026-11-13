@@ -3,10 +3,10 @@
 The module's catalogue (`src/catalogue.rs`) names four ONNX files and their SHA-256. The weights are never committed here. They are published, together with their conversion scripts and licence notices, by the **omarchy-onnx-models** repository, which other projects can reuse. Its release assets follow this URL pattern:
 
 ```
-https://github.com/<owner>/omarchy-onnx-models/releases/download/<tag>/<file>
+https://github.com/rsd/omarchy-onnx-models/releases/download/<tag>/<file>
 ```
 
-The first tag is `v1.0.0`. The owner is not final yet: `<owner>` is a placeholder, as it is in `packaging/arch-onnx/PKGBUILD`, which downloads the files and checks each against its SHA-256.
+The current release is [`v1.0.0`](https://github.com/rsd/omarchy-onnx-models/releases/tag/v1.0.0); its assets are the four files below, `LICENSE-Apache-2.0`, `NOTICE`, `MANIFEST.toml` and `SHA256SUMS`. `packaging/arch-onnx/PKGBUILD` downloads the four files from it and checks each against the SHA-256 below; a file that differs fails the build.
 
 | Catalogue file | Made from | SHA-256 |
 |---|---|---|

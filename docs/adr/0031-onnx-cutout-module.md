@@ -6,6 +6,8 @@
 
 *Amendment (2026-11-13, later): two more behaviours, also described in [docs/setup/onnx.md](../setup/onnx.md).*
 
+*Amendment (2026-11-13, release): the model release is published, [omarchy-onnx-models v1.0.0](https://github.com/rsd/omarchy-onnx-models/releases/tag/v1.0.0). `packaging/arch-onnx/PKGBUILD` downloads the four files from it and checks their SHA-256; `OBC_ONNX_MODELS_DIR` remains as an optional offline override. The passages below that speak of a placeholder address or a local-directory fallback describe the state before this release.*
+
 - *The module restricts OpenCL before the first `openvino-gpu` session. OpenVINO's GPU plugin initialises OpenCL, and the OpenCL loader opens every driver in `/etc/OpenCL/vendors/`, NVIDIA's included: that woke a runtime-suspended NVIDIA GPU, kept `/dev/nvidia*` open until the daemon exited (against [ADR-0017](0017-cuda-checkpoint-parking.md)'s parking) and made the first session take about 2.7 s instead of about 0.1 s. The module now makes `$XDG_RUNTIME_DIR/omarchy-broadcast/opencl-vendors/` (mode 0700), links in it only the Intel GPU drivers' `.icd` files (those naming `libigdrcl`), and sets `OCL_ICD_VENDORS` to that directory, with a trailing slash, which the loader shipped with CUDA requires because it joins directory and file name without a separator. `OCL_ICD_FILENAMES` was rejected: both loaders add its drivers to the directory's instead of replacing them. Nothing is done when an `OCL_ICD_*` variable is already set (the user's override) or no Intel GPU driver is installed; the NPU and CPU engines load no OpenCL. The variable is set in the daemon's own environment, once, on the loading thread, and processes the daemon starts afterwards inherit it. Two loaders may be installed (ocl-icd's and CUDA's, which wins through `ld.so.conf.d/cuda.conf`); the setting works with both.*
 - *A refused switch keeps the previous engine in the daemon too. The statement that a failed switch keeps the previous chain held in the module, but the daemon showed black, because the effect element took any failed load as the effect's failure. A switch that keeps the effect and fails while the previous chain is loaded is now refused by the element ([ADR-0012](0012-video-effects-and-maxine-backend.md)): the chain keeps processing every frame, the effect stays ready, `Error` is untouched and `Warning` carries `<module>: <reason>; the previous setting keeps running`. The stored setting is not rewritten, so a refused explicit engine stays stored and is tried again at the next camera start, where it fails the load as ADR-0031's rule for explicit engines says (no fallback).*
 
@@ -93,7 +95,7 @@ The rule in [modules.md](../modules.md#threading-and-cuda-rules) says a video mo
 
 ## Future work
 - ~~**A daemon pipeline that runs the effect on host memory**, so that the module runs on a machine with no NVIDIA GPU.~~ Done 2026-11-12: [ADR-0033](0033-system-memory-pipeline.md).
-- **A published release host** for the model files, replacing the placeholder in `packaging/arch-onnx/PKGBUILD`.
+- ~~**A published release host** for the model files, replacing the placeholder in `packaging/arch-onnx/PKGBUILD`.~~ Done 2026-11-13: omarchy-onnx-models v1.0.0.
 - **A download on first use** for any model of unclear licence added to the catalogue.
 - Confirmation of the training-data terms of PP-HumanSeg and MODNet.
 
