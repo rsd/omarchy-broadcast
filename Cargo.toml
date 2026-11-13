@@ -22,7 +22,7 @@ members = [
     "crates/obc-module-afx",
     "crates/obc-module-onnx",
 ]
-# Built on its own, as a module outside the workspace would be (CI builds it).
+# Built on its own, as a module outside the workspace would be (scripts/check-all.sh builds it).
 exclude = [
     "examples/module-hello",
     "examples/module-hello-audio",
@@ -34,8 +34,8 @@ exclude = [
 ]
 
 [workspace.package]
-# Also the pkgver= of packaging/arch/PKGBUILD: bump both; CI checks they match.
-version = "0.45.1"
+# Also the pkgver= of packaging/arch/PKGBUILD: bump both; scripts/check-all.sh checks they match.
+version = "0.45.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Raul Dias"]

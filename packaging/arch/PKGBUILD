@@ -5,7 +5,7 @@
 # clones the repository, so uncommitted changes are not included. makepkg
 # rewrites pkgver= below on each build; that change need not be committed.
 # The committed pkgver= is the workspace version in Cargo.toml: a version
-# bump changes both files, and CI fails while they differ.
+# bump changes both files, and scripts/check-all.sh fails while they differ.
 #
 # Build (from packaging/arch):   makepkg -s
 # Install the result with:       sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst
@@ -72,7 +72,7 @@
 
 pkgname=omarchy-broadcast-git
 _pkgname=omarchy-broadcast
-pkgver=0.45.1
+pkgver=0.45.2
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API and a CLI'
 arch=('x86_64')

@@ -58,7 +58,7 @@ Once WirePlumber has probed the loopback while the writer streams, PipeWire also
 - The PipeWire output costs one CPU conversion and copy per frame while a consumer streams, and nothing otherwise. The camera and GPU lifecycle are unchanged.
 - `Consumers` changes meaning for clients that read it from a revision 3 daemon with the output on: it counts links as well. A client that needs the loopback alone reads `LoopbackConsumers`.
 - Both outputs share one timeline, so a PipeWire consumer sees what a loopback consumer sees, including black while idle.
-- The build gains an optional dependency (libpipewire, clang). The default build and the default CI job are unchanged; a second CI job builds and tests with the feature, and the Arch package is built with it.
+- The build gains an optional dependency (libpipewire, clang). The default build and its checks are unchanged; `scripts/check-all.sh` builds, lints and tests with the feature as a separate step, and the Arch package is built with it.
 - Tests: [../testing.md](../testing.md#the-pipewire-output).
 - Not supported: a PipeWire-only mode without v4l2loopback; a colour range or matrix announced to consumers.
 
