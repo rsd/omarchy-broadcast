@@ -333,6 +333,7 @@ use obc_pipeline::ctrl_events::{
     CTRL_CHANGE_FLAGS, CTRL_CHANGE_RANGE, CTRL_CHANGE_VALUE, CtrlEvent,
 };
 use obc_pipeline::effect::{Params, StageId};
+use obc_pipeline::quirks;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::backend::{
@@ -6494,13 +6495,16 @@ impl<B: MediaBackend> Controller<B> {
                     == (ev.minimum, ev.maximum, ev.step, ev.default_value))
     }
 
-    /// The image controls of `scan` as revision 6 shows them: the
-    /// [`IMAGE_CONTROLS`] the device has, readable and adjustable (not
+    /// The image controls of `camera`'s `scan` as revision 6 shows them:
+    /// the [`IMAGE_CONTROLS`] the device has and its quirk row does not
+    /// hide ([`quirks::hidden_controls`]), readable and adjustable (not
     /// disabled, read-only or inactive; an integer or a boolean), in that
     /// order.
-    fn image_controls(scan: &ControlScan) -> Vec<DeviceControl> {
+    fn image_controls(camera: &Camera, scan: &ControlScan) -> Vec<DeviceControl> {
+        let hidden = quirks::hidden_controls(camera.usb);
         IMAGE_CONTROLS
             .iter()
+            .filter(|(_, cid)| !hidden.contains(cid))
             .filter_map(|(name, cid)| {
                 let c = scan.controls.iter().find(|c| c.id == *cid)?;
                 let value = c.value.value()?;
@@ -6548,8 +6552,9 @@ impl<B: MediaBackend> Controller<B> {
             .collect()
     }
 
-    /// The settings of `camera` from `scan`, its notes logged (a warning
-    /// the first time for that camera and text).
+    /// The settings of `camera` from `scan` (without what its quirk row
+    /// hides), its notes logged (a warning the first time for that camera
+    /// and text).
     fn build_settings(&mut self, camera: &Camera, scan: &ControlScan) -> CameraSettings {
         let built = settings::build(&Inputs {
             camera: &camera.id,
@@ -6558,6 +6563,7 @@ impl<B: MediaBackend> Controller<B> {
             stored: self.runtime.camera_controls.get(&camera.id),
             open: self.is_open(camera),
             fixed_framerate: self.fixed_framerate_for(&camera.id),
+            hidden: &quirks::hidden_controls(camera.usb),
         });
         let mut built = built;
         built.global = self.global_settings();
@@ -6625,7 +6631,7 @@ impl<B: MediaBackend> Controller<B> {
         if self.active_camera() == camera.id {
             self.controls_view = CameraControls {
                 camera: camera.id.clone(),
-                controls: self.control_entries(camera, Self::image_controls(&scan)),
+                controls: self.control_entries(camera, Self::image_controls(camera, &scan)),
             };
             self.settings_scan = Some((camera.clone(), scan));
         }
@@ -6807,9 +6813,10 @@ impl<B: MediaBackend> Controller<B> {
     /// value is written (masters first), all through one open of its node.
     /// A stored value the device does not take now (no such control, out of
     /// its range, not an option) is skipped and kept; one whose control is
-    /// inactive is not written (it has no effect); one whose control could
-    /// not be read is skipped, kept and logged; a write that fails is
-    /// logged. None of it fails or stops the session. Each stored value is
+    /// inactive is not written (it has no effect); one whose control its
+    /// quirk row hides, or that is a menu without an item, is skipped and
+    /// kept quietly (a debug line); one whose control could not be read is
+    /// skipped, kept and logged; a write that fails is logged. None of it fails or stops the session. Each stored value is
     /// looked up by its name in the read it is written from: the masters'
     /// writes may make the camera read again, and a control can be in one
     /// read and not in the other (its read failed once). The views are built
@@ -6829,6 +6836,53 @@ impl<B: MediaBackend> Controller<B> {
         self.controls_unreadable = None;
         let pinned = self.session.as_ref().is_some_and(|s| s.pinned);
         let mut model = self.build_settings(camera, &scan);
+        if !model.hidden.is_empty() || !model.absent.is_empty() {
+            debug!(
+                "{}: {} controls hidden by its quirk row ({}), {} left out as menus without an \
+                 item ({})",
+                camera.label(),
+                model.hidden.len(),
+                model.hidden.join(", "),
+                model.absent.len(),
+                model.absent.join(", ")
+            );
+        }
+        // Hidden controls a program may have left broken: back to the
+        // device's default, once, before anything stored (a quirk row
+        // lists them; nothing else hidden is ever written).
+        let mut reset = false;
+        for id in quirks::reset_at_open(camera.usb) {
+            let Some(name) = scan
+                .controls
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.name.clone())
+            else {
+                debug!(
+                    "{}: control {id:#010x} not reset at open: the camera does not have it",
+                    camera.label()
+                );
+                continue;
+            };
+            let result = node
+                .query(id, &name)
+                .and_then(|info| node.set(id, &name, info.default_value));
+            match result {
+                Ok(()) => {
+                    reset = true;
+                    info!("{}: {name} put back to its default at open", camera.label());
+                }
+                Err(e) => warning!(
+                    "{}: {name} could not be put back to its default at open: {e}",
+                    camera.label()
+                ),
+            }
+        }
+        if reset {
+            scan = node.enumerate();
+            self.note_unreadable(camera, &scan);
+            model = self.build_settings(camera, &scan);
+        }
         let state = self
             .runtime
             .camera_controls
@@ -6929,7 +6983,13 @@ impl<B: MediaBackend> Controller<B> {
         }
         drop(node);
         for name in &left {
-            if unread.contains(name) {
+            if model.hidden.contains(name) || model.absent.contains(name) {
+                debug!(
+                    "{}: the stored {name} is not applied: the camera does not take it (kept \
+                     for the camera)",
+                    camera.label()
+                );
+            } else if unread.contains(name) {
                 warning!(
                     "{}: {name} could not be read when it opened: its stored value is not \
                      applied (kept for the camera)",
@@ -6980,7 +7040,7 @@ impl<B: MediaBackend> Controller<B> {
     fn get_camera_controls(&mut self, camera: &str) -> Result<Vec<CameraControl>, IpcError> {
         let cam = self.control_camera(camera)?;
         let (_, scan) = self.scan_camera(&cam, false).map_err(IpcError::Failed)?;
-        Ok(self.control_entries(&cam, Self::image_controls(&scan)))
+        Ok(self.control_entries(&cam, Self::image_controls(&cam, &scan)))
     }
 
     /// `GetSettings`: the published tree for `ActiveCamera` (`""` or its
@@ -7585,7 +7645,7 @@ impl<B: MediaBackend> Controller<B> {
             SetRequest::Control { name, value } => {
                 let not_exposed =
                     || IpcError::InvalidArgument(format!("{} does not expose {name}", cam.label()));
-                let image = Self::image_controls(&scan);
+                let image = Self::image_controls(&cam, &scan);
                 let control = image
                     .iter()
                     .find(|d| d.name == *name)
@@ -7900,7 +7960,7 @@ impl<B: MediaBackend> Controller<B> {
                     let model = self.build_settings(&cam, &found);
                     let indices: Vec<usize> = match &what {
                         ResetWhat::Image => {
-                            let image = Self::image_controls(&found);
+                            let image = Self::image_controls(&cam, &found);
                             (0..model.entries.len())
                                 .filter(|&i| image.iter().any(|d| d.name == model.entries[i].name))
                                 .collect()

@@ -885,7 +885,7 @@ impl MediaBackend for GstBackend {
                     .capabilities
                     .as_ref()
                     .and_then(|c| choose_mode(c, request))?;
-                let (serial, usb_path) = usb_origin(&d.path);
+                let origin = usb_origin(&d.path);
                 // The display name is set from the card name once the
                 // whole list is known (`camera::display_names`).
                 Some(Camera {
@@ -893,8 +893,9 @@ impl MediaBackend for GstBackend {
                     name: d.card.trim().to_string(),
                     card: d.card.clone(),
                     usb: d.usb,
-                    serial,
-                    usb_path,
+                    serial: origin.serial,
+                    product: origin.product,
+                    usb_path: origin.usb_path,
                     path: d.path.clone(),
                     mode: choice.mode,
                     modes: d
@@ -2007,6 +2008,7 @@ mod tests {
             card: "A".into(),
             usb: None,
             serial: None,
+            product: None,
             usb_path: None,
             path: "/dev/video9".into(),
             mode: "NV12:640x360@30".parse().unwrap(),

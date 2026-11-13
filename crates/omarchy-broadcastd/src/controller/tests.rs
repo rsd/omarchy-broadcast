@@ -4679,6 +4679,108 @@ fn stored_values_survive_a_restart_and_apply_at_the_next_open() {
 }
 
 #[test]
+fn controls_a_quirk_row_hides_are_never_shown_nor_written() {
+    let mut h = H::new("", with_controls);
+    // Stored before the camera was known to have a row.
+    h.set_control("", "brightness", 100, 0).unwrap();
+    h.set_control("", "sharpness", 10, 0).unwrap();
+    h.ctrl.flush_settings();
+    // The same camera as a Generalplus GENERAL WEBCAM: its brightness and
+    // contrast do nothing.
+    h.world().cameras[0].usb = Some("1b3f:2002".parse().unwrap());
+    h.restart();
+    let names: Vec<String> = h.view().1.into_iter().map(|(n, _, _)| n).collect();
+    assert_eq!(names, ["saturation", "sharpness", "backlight_compensation"]);
+    let read: Vec<String> = h
+        .get_controls("", 0)
+        .unwrap()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(read, names);
+    assert!(matches!(
+        h.set_control("", "brightness", 90, 0),
+        Err(IpcError::InvalidArgument(m)) if m.contains("does not expose brightness")
+    ));
+    assert!(h.writes().is_empty());
+    crate::log::take_lines();
+    // At the open the stored brightness is skipped quietly and kept.
+    h.activate(1000);
+    assert_eq!(h.writes(), [w("usb-a", "sharpness", 10)]);
+    let lines = crate::log::take_lines();
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("warning: ") && l.contains("brightness")),
+        "{lines:?}"
+    );
+    assert_eq!(
+        h.stored("usb-a").unwrap().values.get("brightness"),
+        Some(&100)
+    );
+    // A whole reset writes the defaults of what is shown only.
+    h.reset_controls("", 2000).unwrap();
+    assert_eq!(
+        h.writes(),
+        [
+            w("usb-a", "saturation", 128),
+            w("usb-a", "sharpness", 128),
+            w("usb-a", "backlight_compensation", 1),
+        ]
+    );
+}
+
+#[test]
+fn a_broken_hidden_control_listed_by_its_quirk_row_is_reset_at_every_open() {
+    use obc_pipeline::controls::CTRL_TYPE_BOOLEAN;
+    use obc_pipeline::quirks::{CID_AUTO_WHITE_BALANCE, CID_WHITE_BALANCE_TEMPERATURE};
+    let mut h = H::new("", |w| {
+        w.devices.insert(
+            "usb-a".into(),
+            FakeDevice {
+                controls: vec![
+                    node_control(
+                        CID_AUTO_WHITE_BALANCE,
+                        "White Balance, Automatic",
+                        CTRL_TYPE_BOOLEAN,
+                        (0, 1, 1),
+                        1,
+                        0,
+                        0,
+                    ),
+                    node_control(
+                        CID_WHITE_BALANCE_TEMPERATURE,
+                        "White Balance Temperature",
+                        CTRL_TYPE_INTEGER,
+                        (2800, 6500, 1),
+                        4000,
+                        2800,
+                        0,
+                    ),
+                ],
+                ..FakeDevice::default()
+            },
+        );
+        // A Microsoft LifeCam VX-800, left in manual white balance by
+        // another program.
+        w.cameras[0].usb = Some("045e:0766".parse().unwrap());
+    });
+    h.activate(1000);
+    assert_eq!(h.writes(), [w("usb-a", "white_balance_automatic", 1)]);
+    assert_eq!(
+        h.brio().control(CID_AUTO_WHITE_BALANCE).value.value(),
+        Some(1)
+    );
+    // Left manual again: put back at the next open, the temperature is
+    // never written.
+    h.consumers(0, 2000);
+    h.tick(10_000);
+    h.brio_mut(|d| d.change(CID_AUTO_WHITE_BALANCE, 0));
+    h.activate(20_000);
+    assert_eq!(h.writes(), [w("usb-a", "white_balance_automatic", 1)]);
+}
+
+#[test]
 fn reset_while_streaming_writes_the_defaults_and_forgets() {
     let mut h = H::new("", with_controls);
     h.set_control("", "sharpness", 10, 0).unwrap();

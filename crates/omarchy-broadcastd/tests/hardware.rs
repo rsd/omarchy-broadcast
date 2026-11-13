@@ -2550,6 +2550,7 @@ fn settings_tree_of_the_real_camera() {
                     })
             })
             .collect();
+    let hidden = obc_pipeline::quirks::hidden_controls(cam.usb.parse().ok());
     let built = omarchy_broadcastd::settings::build(&omarchy_broadcastd::settings::Inputs {
         camera: "test",
         controls: &found.controls,
@@ -2557,6 +2558,7 @@ fn settings_tree_of_the_real_camera() {
         stored: None,
         open: false,
         fixed_framerate: false,
+        hidden: &hidden,
     });
     for g in built.groups() {
         eprintln!("{} ({})", g.label, g.id);

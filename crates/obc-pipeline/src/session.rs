@@ -96,6 +96,12 @@ impl Session {
         self.ingest.as_ref().and_then(Ingest::poll_failure)
     }
 
+    /// The corrupt camera frames the current ingest dropped at its source
+    /// ([`Ingest::corrupt_frames`]); `None` without an ingest.
+    pub fn corrupt_frames(&self) -> Option<crate::frame_guard::CorruptFrames> {
+        self.ingest.as_ref().map(Ingest::corrupt_frames)
+    }
+
     /// Builds (but does not start) an ingest for `cfg` writing into this
     /// session's output, so the caller can inspect or probe it before
     /// [`Self::switch_to`].

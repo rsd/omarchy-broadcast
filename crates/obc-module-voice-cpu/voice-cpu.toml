@@ -6,7 +6,7 @@
 abi = 1
 id = "br.com.dias.voice-cpu"
 name = "Voice on the CPU"
-version = "0.45.5"
+version = "0.45.6"
 licence = "MIT OR Apache-2.0 (module); DeepFilterNet MIT OR Apache-2.0; nnnoiseless (RNNoise) BSD-3-Clause"
 kind = "audio-filter"
 library = "/usr/lib/omarchy-broadcast/modules/libobc_module_voice_cpu.so"
