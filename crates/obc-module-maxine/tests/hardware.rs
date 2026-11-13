@@ -34,6 +34,9 @@ use obc_module_host::{Module, ModuleBackendFactory, ModuleEnhancerFactory};
 const W: u32 = 1280;
 const H: u32 = 720;
 const FRAMES: usize = 30;
+/// The pause before each frame of the HDR look test: one frame at 60 fps
+/// (see that test).
+const HDR_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(17);
 
 const SDK_HINT: &str = "this test needs the Maxine SDK: install the maxine-vfx-sdk-local package \
      and load its environment (set -a; . /usr/share/maxine-vfx/maxine-vfx.env; set +a), or set \
@@ -527,6 +530,11 @@ fn gpu_frame_generation_interpolates_fresh_frames_and_holds_repeats() {
 /// failure on a frame (a frame on another stream than the load's) is the
 /// stage's: the chain drops it and passes the next frames through as they
 /// came.
+///
+/// Frames arrive at a camera's cadence, [`HDR_FRAME_INTERVAL`] apart.
+/// Run back to back, `TrueHDR` sometimes gives a frame an output that depends
+/// on the frames before it, which no synchronisation of the load's CUDA
+/// context removes; paced at a camera's cadence it does not.
 #[test]
 #[ignore = "needs the NVIDIA Maxine VFX SDK, the os-release override and an NVIDIA GPU"]
 fn gpu_the_hdr_look_runs_on_every_frame_and_a_failure_drops_only_it() {
@@ -563,6 +571,7 @@ fn gpu_the_hdr_look_runs_on_every_frame_and_a_failure_drops_only_it() {
                    input: &[u8],
                    repeat: bool|
          -> Result<Vec<u8>, BackendError> {
+            std::thread::sleep(HDR_FRAME_INTERVAL);
             frame.upload_packed(input).unwrap();
             let f = frame.frame();
             let cf = ChainFrame::Cuda { gpu: on, frame: &f };
