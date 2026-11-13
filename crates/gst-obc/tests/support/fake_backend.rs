@@ -17,7 +17,11 @@
 //! rules of `obc_backend::InferenceBackend`. Like a real backend, it reports
 //! a frame's stage timings (`timings`) only once that frame's work has
 //! completed on the GPU (a CUDA event recorded after it), so a caller that
-//! reads them before synchronising the stream gets none.
+//! reads them before synchronising the stream gets none. While the denoise
+//! stage is loaded it reports the status value `denoise`/`level`
+//! ([`FAKE_DENOISE_LEVEL`]), while an effect is loaded `background`/
+//! `coverage` ([`FAKE_COVERAGE`]), and whenever it is loaded a value of a
+//! stage it never loads ([`FAKE_STRAY_STAGE`]).
 //!
 //! It takes host frames too (`load_host`, `process_host`,
 //! `reset_temporal_host`, the factory's `kinds` listing both memories unless
@@ -42,6 +46,7 @@ use std::time::{Duration, Instant};
 use obc_backend::{
     BackendError, BackendFactory, DeviceNv12, EffectKind, FrameKind, FrameParams, GpuContext,
     HostNv12, InferenceBackend, LoadReport, LoadRequest, Params, StageId, StageList, StageTimings,
+    StageValue,
 };
 // The fake takes the relight stage's parameters as the Maxine backend does.
 use obc_backend_maxine::{RELIGHT_LIGHT, RelightLight, relight_frame};
@@ -55,6 +60,15 @@ pub const FAKE_REPLACE_Y: u8 = 100;
 pub const FAKE_DENOISE_Y: u8 = 60;
 /// The chroma (both U and V) the fake writes when the denoise stage ran.
 pub const FAKE_DENOISE_UV: u8 = 90;
+/// The status value `denoise`/`level` the fake reports while the denoise
+/// stage is loaded.
+pub const FAKE_DENOISE_LEVEL: f64 = 0.5;
+/// The status value `background`/`coverage` the fake reports while an
+/// effect (blur or replace) is loaded.
+pub const FAKE_COVERAGE: f64 = 0.25;
+/// The stage of the status value `stray` the fake reports whenever it is
+/// loaded: a stage it never loads, so the element must leave it out.
+pub const FAKE_STRAY_STAGE: StageId = StageId::ENHANCE;
 /// The denoise stage time the fake reports (`timings`), in ms, for a
 /// completed frame the stage ran on.
 pub const FAKE_DENOISE_MS: f32 = 0.25;
@@ -699,6 +713,27 @@ impl InferenceBackend for FakeBackend {
             }
             t
         })
+    }
+
+    fn status_values(&self) -> Vec<StageValue> {
+        let Some(kind) = self.loaded else {
+            return Vec::new();
+        };
+        let value = |stage: StageId, name: &str, value: f64| StageValue {
+            stage,
+            name: name.into(),
+            value,
+        };
+        let mut out = Vec::new();
+        if self.denoise {
+            out.push(value(StageId::DENOISE, "level", FAKE_DENOISE_LEVEL));
+        }
+        if kind != EffectKind::None {
+            out.push(value(StageId::BACKGROUND, "coverage", FAKE_COVERAGE));
+        }
+        // A stage that is not loaded: never reported by the element.
+        out.push(value(FAKE_STRAY_STAGE, "stray", 1.0));
+        out
     }
 
     fn reset_temporal(&mut self, gpu: &GpuContext) -> Result<StageList, BackendError> {

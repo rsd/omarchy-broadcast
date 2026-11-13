@@ -17,6 +17,7 @@ use obc_ipc::{
     CameraControl, CameraControls, Setting, SettingKind, SettingsTree, Snapshot, State, Stats,
 };
 
+use crate::json;
 use crate::model::{self, Changes};
 
 /// Whether `c` is a bidirectional formatting character: the embeddings and
@@ -147,6 +148,10 @@ pub fn status_text(s: &Snapshot) -> String {
     if let Some(d) = model::denoise(s) {
         out.push_str(&format!("Denoise:    {}\n", on_off(Some(d))));
     }
+    for v in shown_stage_values(s) {
+        out.push_str(&stage_value_text(v));
+        out.push('\n');
+    }
     if !s.error.is_empty() {
         out.push_str(&format!("Error:      {}\n", printable(&s.error)));
     }
@@ -154,6 +159,28 @@ pub fn status_text(s: &Snapshot) -> String {
         out.push_str(&format!("Warning:    {}\n", printable(&s.warning)));
     }
     out
+}
+
+/// The stage values shown: at most [`json::MAX_STAGE_VALUES`], as in the
+/// JSON.
+fn shown_stage_values(s: &Snapshot) -> impl Iterator<Item = &obc_ipc::StageValue> {
+    s.stage_values.iter().take(json::MAX_STAGE_VALUES)
+}
+
+/// One value a stage reports, for people: auto-frame's zoom as
+/// `Auto-frame zoom: 1.24x`, any other as `<stage> <name>: <value>`, each
+/// word cut to [`json::MAX_STAGE_VALUE_WORD_BYTES`] as in the JSON.
+pub fn stage_value_text(v: &obc_ipc::StageValue) -> String {
+    let value = if v.value.is_finite() {
+        format!("{:.2}", v.value)
+    } else {
+        "n/a".into()
+    };
+    if v.stage == "auto-frame" && v.name == "zoom" {
+        return format!("Auto-frame zoom: {value}x");
+    }
+    let word = |w: &str| printable(&json::clip(w, json::MAX_STAGE_VALUE_WORD_BYTES)).into_owned();
+    format!("{} {}: {value}", word(&v.stage), word(&v.name))
 }
 
 /// `effect`, and the result of `effect ...`: the effect, the blur strength
@@ -593,6 +620,11 @@ pub fn change_lines(s: &Snapshot, changes: &Changes) -> Vec<String> {
             "background_image" => format!("background image: {}", image(&s.background_image)),
             "denoise" => format!("denoise: {}", on_off(model::denoise(s))),
             "interface_revision" => format!("interface revision: {}", s.interface_revision),
+            "stage_values" if s.stage_values.is_empty() => "stage values: none".into(),
+            "stage_values" => {
+                let list: Vec<String> = shown_stage_values(s).map(stage_value_text).collect();
+                format!("stage values: {}", list.join(", "))
+            }
             other => format!("{other}: changed"),
         };
         lines.push(line);
@@ -685,6 +717,7 @@ mod tests {
             backend_profile: None,
             config_serial: None,
             mic: None,
+            stage_values: Vec::new(),
             interface_revision: 3,
         }
     }
@@ -1107,6 +1140,56 @@ mod tests {
         assert_eq!(enabled_text(&s), "Disabled (state: off)\n");
         s.active_camera = "platform-video2".into();
         assert_eq!(camera_text(&s), "Camera: Second\n");
+    }
+
+    #[test]
+    fn the_stage_values_read_for_people() {
+        let zoom = obc_ipc::StageValue {
+            stage: "auto-frame".into(),
+            name: "zoom".into(),
+            value: 1.2449,
+        };
+        assert_eq!(stage_value_text(&zoom), "Auto-frame zoom: 1.24x");
+        let other = obc_ipc::StageValue {
+            stage: "x".into(),
+            name: "level".into(),
+            value: f64::INFINITY,
+        };
+        assert_eq!(stage_value_text(&other), "x level: n/a");
+        let mut s = Snapshot::empty();
+        s.stage_values = vec![zoom];
+        assert!(status_text(&s).contains("\nAuto-frame zoom: 1.24x\n"));
+        let changes = model::diff(&Snapshot::empty(), &s);
+        assert_eq!(
+            change_lines(&s, &changes),
+            ["stage values: Auto-frame zoom: 1.24x"]
+        );
+        let changes = model::diff(&s, &Snapshot::empty());
+        assert_eq!(
+            change_lines(&Snapshot::empty(), &changes),
+            ["stage values: none"]
+        );
+        // Bounded as in the JSON: the count and each word.
+        let long = obc_ipc::StageValue {
+            stage: "s".repeat(100),
+            name: "n".repeat(100),
+            value: 2.0,
+        };
+        let line = stage_value_text(&long);
+        let (stage, rest) = line.split_once(' ').unwrap();
+        let name = rest.strip_suffix(": 2.00").unwrap();
+        assert!(stage.len() <= json::MAX_STAGE_VALUE_WORD_BYTES, "{line}");
+        assert!(name.len() <= json::MAX_STAGE_VALUE_WORD_BYTES, "{line}");
+        s.stage_values = vec![long; 20];
+        let text = status_text(&s);
+        assert_eq!(
+            text.matches(": 2.00\n").count(),
+            json::MAX_STAGE_VALUES,
+            "{text}"
+        );
+        let changes = model::diff(&Snapshot::empty(), &s);
+        let lines = change_lines(&s, &changes);
+        assert_eq!(lines[0].matches(": 2.00").count(), json::MAX_STAGE_VALUES);
     }
 
     #[test]

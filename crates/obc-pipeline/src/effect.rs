@@ -40,7 +40,7 @@ pub use gst_obc::{
     STATUS_MESSAGE, StageRequest, StageStats, fallback_unreadable, has_new_source_flag,
 };
 use obc_backend::BackendFactory;
-pub use obc_backend::{Availability, Params, StageId, Value};
+pub use obc_backend::{Availability, Params, StageId, StageValue, Value};
 
 use crate::pipeline::{PipelineError, names};
 

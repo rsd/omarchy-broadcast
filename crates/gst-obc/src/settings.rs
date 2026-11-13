@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 pub use obc_backend::{EffectKind, Params, StageId, Value};
-use obc_backend::{FrameParams, StageList};
+use obc_backend::{FrameParams, StageList, StageValue};
 
 /// What the element outputs while an effect is requested but failed
 /// (property `on-failure`, configuration `effect.on_failure`).
@@ -487,6 +487,10 @@ pub struct EffectStats {
     /// `None` while it can (or has not been tried yet), and with any other
     /// fallback.
     pub fallback_error: Option<String>,
+    /// The status values the backend reported after the last processed
+    /// frame (a module of ABI 1.3), of the stages that are ready; empty when
+    /// none reports.
+    pub stage_values: Vec<StageValue>,
 }
 
 /// The report of a fallback image that cannot be shown: `"Fallback image

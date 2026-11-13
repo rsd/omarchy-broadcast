@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     BackendError, ColourSpec, DeviceNv12, GpuContext, LoadReport, Params, StageId, StageList,
+    StageValue,
 };
 
 /// The memory a chain takes frames in.
@@ -281,6 +282,14 @@ pub trait StageChain: Send {
 
     /// Releases models, buffers and device resources. Idempotent.
     fn unload(&mut self);
+
+    /// The status values the loaded stages report after the most recent
+    /// processed frame, as
+    /// [`InferenceBackend::status_values`](crate::InferenceBackend::status_values)
+    /// does. The default reports none.
+    fn status_values(&self) -> Vec<StageValue> {
+        Vec::new()
+    }
 }
 
 /// Creates [`StageChain`]s and says what frames they take.

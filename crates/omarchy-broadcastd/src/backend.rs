@@ -18,7 +18,7 @@ pub use obc_module_host::{Module, ModuleEntry, SettingsDescription};
 use obc_pipeline::control_node::{CaptureFormat, NodeControl};
 use obc_pipeline::controls::CtrlInfo;
 use obc_pipeline::ctrl_events::CtrlEvent;
-use obc_pipeline::effect::{Availability, Params, StageId};
+use obc_pipeline::effect::{Availability, Params, StageId, StageValue};
 use obc_pipeline::xu::XuRow;
 
 use crate::camera::Camera;
@@ -284,6 +284,10 @@ pub struct EffectReport {
     /// fallback image (it shows black in its place), as
     /// [`obc_pipeline::effect::fallback_unreadable`] words it.
     pub fallback_error: Option<String>,
+    /// The status values the stages report after the last frame they
+    /// processed (a module of ABI 1.3: auto-frame's zoom), the chains'
+    /// first, then the effect element's; empty when none reports.
+    pub stage_values: Vec<StageValue>,
 }
 
 /// The state of the optional PipeWire output (`[pipewire] enabled`), the

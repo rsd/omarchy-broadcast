@@ -83,7 +83,7 @@ use gst_video::prelude::*;
 use obc_backend::DeviceNv12;
 use obc_backend::{
     BackendError, ChainFrame, ChainRequest, ColourSpec, FrameKind, GpuContext, HostNv12,
-    LoadReport, Params, StageChain, StageChainFactory, StageId, StageList,
+    LoadReport, Params, StageChain, StageChainFactory, StageId, StageList, StageValue,
 };
 use obc_gpu::{ContextGuard, CuContext, CuStream, DeviceNv12Buffer, PinnedHostBuffer};
 
@@ -435,6 +435,9 @@ struct Shared {
     cuda_active: AtomicBool,
     /// Frames each stage ran on, in the order the stages first ran.
     stage_frames: Mutex<Vec<(StageId, u64)>>,
+    /// The status values the chain reported after the last frame it
+    /// processed, of the stages that ran on it.
+    stage_values: Mutex<Vec<StageValue>>,
 }
 
 /// The element's CUDA objects, created on the streaming thread from the
@@ -565,6 +568,17 @@ impl ObcModule {
                 c.last_error.clone(),
             )
         };
+        // Only the values of the stages that are ready: a stage turned off
+        // or failed since its last frame reports nothing.
+        let stage_values = lock(&self.shared.stage_values)
+            .iter()
+            .filter(|v| {
+                statuses
+                    .iter()
+                    .any(|(s, st)| *s == v.stage && *st == EffectStatus::Ready)
+            })
+            .cloned()
+            .collect();
         let frames = lock(&self.shared.stage_frames);
         let stages = statuses
             .into_iter()
@@ -589,6 +603,7 @@ impl ObcModule {
             last_load_reused,
             last_error,
             cuda_active: s.cuda_active.load(Ordering::Relaxed),
+            stage_values,
         }
     }
 
@@ -808,6 +823,10 @@ impl ObcModule {
         drop(st);
         if !process {
             self.shared.passthrough.fetch_add(1, Ordering::Relaxed);
+            if !any {
+                // No stage is on: nothing reports.
+                lock(&self.shared.stage_values).clear();
+            }
         }
         let obj = self.obj();
         if obj.is_passthrough() == process {
@@ -921,6 +940,15 @@ impl ObcModule {
             // Refused when the job was made: never loaded.
             (FrameKind::Cuda, false) => {}
         }
+        // The values after a frame the chain ran on, of the stages that ran
+        // (the engine is held for the frame already: no wait).
+        let values = run.ran.as_ref().map(|ran| {
+            chain
+                .status_values()
+                .into_iter()
+                .filter(|v| ran.contains(&v.stage))
+                .collect()
+        });
         let unloaded = key.stages.is_empty() || run.chain_error.is_some();
         if unloaded {
             *loaded = None;
@@ -928,6 +956,7 @@ impl ObcModule {
         drop(e);
         Ok(Rendered {
             unloaded,
+            values,
             ran: run.ran,
             converted,
             failures: run.failures,
@@ -1033,6 +1062,8 @@ struct Rendered {
     /// Nothing is loaded any more.
     unloaded: bool,
     ran: Option<Vec<StageId>>,
+    /// The status values after the frame, when the chain ran on it.
+    values: Option<Vec<StageValue>>,
     converted: bool,
     failures: Vec<(StageId, String)>,
     rebuild: Vec<StageId>,
@@ -1611,6 +1642,7 @@ impl BaseTransformImpl for ObcModule {
     fn stop(&self) -> Result<(), gst::ErrorMessage> {
         self.stop_worker();
         self.release();
+        lock(&self.shared.stage_values).clear();
         let posted = {
             let mut c = lock(&self.shared.control);
             let before = c.report();
@@ -1715,6 +1747,10 @@ impl BaseTransformImpl for ObcModule {
                         Some((_, n)) => *n += 1,
                         None => frames.push((id.clone(), 1)),
                     }
+                }
+                drop(frames);
+                if let Some(values) = r.values {
+                    *lock(&s.stage_values) = values;
                 }
             }
             None => {

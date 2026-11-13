@@ -56,6 +56,10 @@ pub const MAX_ERROR_BYTES: usize = 512;
 pub const MAX_WARNING_BYTES: usize = 512;
 /// Bound of a camera id (`id`, `active_camera`).
 pub const MAX_ID_BYTES: usize = 96;
+/// At most this many `stage_values` are listed (revision 16).
+pub const MAX_STAGE_VALUES: usize = 8;
+/// Bound of a stage value's `stage` and `name`.
+pub const MAX_STAGE_VALUE_WORD_BYTES: usize = 48;
 /// Bound of a camera name (`name`, `active_camera_name`).
 pub const MAX_NAME_BYTES: usize = 64;
 /// Bound of a USB `vid:pid` (`usb`).
@@ -250,6 +254,32 @@ struct StateFields<'a> {
     /// `null` from a daemon too old to have it.
     denoise: Option<bool>,
     interface_revision: u32,
+    /// `StageValues` (revision 16); `[]` when none, and from a daemon too
+    /// old to have it.
+    stage_values: Vec<StageValueField<'a>>,
+}
+
+/// One entry of `stage_values`: `{"stage":"auto-frame","name":"zoom","value":1.24}`.
+#[derive(Serialize)]
+struct StageValueField<'a> {
+    stage: Cow<'a, str>,
+    name: Cow<'a, str>,
+    value: f64,
+}
+
+/// The `stage_values` of `s`: at most [`MAX_STAGE_VALUES`], a value that is
+/// not a finite number left out (JSON has none).
+fn stage_values_of(s: &Snapshot) -> Vec<StageValueField<'_>> {
+    s.stage_values
+        .iter()
+        .filter(|v| v.value.is_finite())
+        .take(MAX_STAGE_VALUES)
+        .map(|v| StageValueField {
+            stage: clip(&v.stage, MAX_STAGE_VALUE_WORD_BYTES),
+            name: clip(&v.name, MAX_STAGE_VALUE_WORD_BYTES),
+            value: v.value,
+        })
+        .collect()
 }
 
 impl<'a> StateFields<'a> {
@@ -272,6 +302,7 @@ impl<'a> StateFields<'a> {
             background_image: clip_start(&s.background_image, MAX_PATH_BYTES),
             denoise: model::denoise(s),
             interface_revision: s.interface_revision,
+            stage_values: stage_values_of(s),
         }
     }
 }
@@ -1080,6 +1111,7 @@ mod tests {
             backend_profile: None,
             config_serial: None,
             mic: None,
+            stage_values: Vec::new(),
             interface_revision: 4,
         }
     }
@@ -1106,6 +1138,42 @@ mod tests {
         let v = parse(&state_line(&s, &changes.fields));
         assert_eq!(v["warning"], s.warning.as_str());
         assert_eq!(v["changed"], serde_json::json!(["warning"]));
+    }
+
+    #[test]
+    fn stage_values_are_in_the_snapshot_and_state_lines_bounded() {
+        let mut s = sample();
+        assert_eq!(
+            parse(&snapshot_line(&s))["stage_values"],
+            serde_json::json!([])
+        );
+        let value = |stage: &str, value: f64| obc_ipc::StageValue {
+            stage: stage.into(),
+            name: "zoom".into(),
+            value,
+        };
+        let old = s.clone();
+        s.stage_values = vec![value("auto-frame", 1.24), value("x", f64::NAN)];
+        s.stage_values
+            .extend((0..20).map(|i| value(&"s".repeat(100 + i), 2.0)));
+        let v = parse(&snapshot_line(&s));
+        let list = v["stage_values"].as_array().unwrap();
+        assert_eq!(list.len(), MAX_STAGE_VALUES, "{v}");
+        assert_eq!(
+            list[0],
+            serde_json::json!({"stage": "auto-frame", "name": "zoom", "value": 1.24})
+        );
+        // The NaN is left out; long words are cut.
+        assert!(list.iter().all(|e| e["stage"] != "x"), "{v}");
+        assert!(list.iter().all(|e| e["value"].is_f64()), "{v}");
+        assert!(list[1]["stage"].as_str().unwrap().starts_with("sss"), "{v}");
+        assert!(list[1]["stage"].as_str().unwrap().len() <= MAX_STAGE_VALUE_WORD_BYTES);
+        let changes = model::diff(&old, &s);
+        assert_eq!(changes.fields, ["stage_values"]);
+        let v = parse(&state_line(&s, &changes.fields));
+        assert_eq!(v["stage_values"][0]["value"], 1.24);
+        // A NaN is not a change every time.
+        assert!(model::diff(&s, &s.clone()).is_empty());
     }
 
     #[test]

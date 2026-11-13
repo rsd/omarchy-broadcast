@@ -1187,6 +1187,7 @@ impl MediaBackend for GstBackend {
             reused: stats.last_load_reused,
             gpu_ms_p50: stats.gpu_ms_p50,
             fallback_error: stats.fallback_error,
+            stage_values: output.stage_values(),
         })
     }
 

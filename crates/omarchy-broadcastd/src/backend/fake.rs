@@ -172,6 +172,9 @@ pub struct World {
     /// What the effect report says of the effect element's fallback image
     /// (`EffectReport::fallback_error`).
     pub fallback_error: Option<String>,
+    /// What `effect_report` reports as the stages' status values while a
+    /// session runs.
+    pub stage_values: Vec<obc_pipeline::effect::StageValue>,
     /// What `loopback_holders` counts.
     pub holders: u32,
     pub holder_counts: u32,
@@ -432,6 +435,7 @@ impl Default for World {
             placeholder_decoding: false,
             placeholder_unreadable: None,
             fallback_error: None,
+            stage_values: Vec::new(),
             holders: 0,
             holder_counts: 0,
             holder_names: Vec::new(),
@@ -1165,6 +1169,7 @@ impl MediaBackend for FakeBackend {
             reused: false,
             gpu_ms_p50: Some(1.2),
             fallback_error: w.fallback_error.clone(),
+            stage_values: w.stage_values.clone(),
         })
     }
 

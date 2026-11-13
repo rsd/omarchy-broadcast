@@ -85,7 +85,7 @@ use obc_backend::DeviceNv12;
 use obc_module_sdk::{
     Apply, ChainRequest, ChromaSiting, ColourMatrix, Error, Frame, FrameKind, Group, Instance,
     LoadReport, Module, Op, Param, PixelFormat, ProbeReport, Role, Setting, SettingsDescription,
-    log, serde_json,
+    StatusValue, log, serde_json,
 };
 use serde::Deserialize;
 
@@ -964,6 +964,25 @@ impl Instance for ArInstance {
         self.replay = false;
         self.order.clear();
     }
+
+    /// While auto-frame is loaded, its zoom ([`ZOOM_VALUE`]).
+    fn status_values(&self) -> Vec<StatusValue> {
+        status_values_of(self.auto.as_ref().map(|a| &a.framer))
+    }
+}
+
+/// The name of auto-frame's status value: the zoom of the last fresh frame,
+/// the frame's height over the crop's (1.0 at the full frame). A repeat
+/// does not move it, since the crop moves on fresh frames only.
+pub const ZOOM_VALUE: &str = "zoom";
+
+/// The status values of a chain whose auto-frame stage has `framer` (none
+/// without the stage).
+fn status_values_of(framer: Option<&framing::Framer>) -> Vec<StatusValue> {
+    framer
+        .map(|f| StatusValue::new(AUTO_FRAME, ZOOM_VALUE, f.zoom()))
+        .into_iter()
+        .collect()
 }
 
 /// The loaded stages of a frame, for [`plan::run_fresh`].

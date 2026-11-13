@@ -465,6 +465,90 @@ fn a_zero_grace_stops_at_once() {
     assert_eq!(h.state(), State::Idle);
 }
 
+/// `StageValues` follows the stages' status values while a session runs:
+/// a change of the set or a move of 0.01 or more is published, at most
+/// every 250 ms (a move held back goes out at a later poll), a smaller move
+/// is not, and the session's end clears them at once.
+#[test]
+fn stage_values_are_published_on_a_change_at_most_every_250_ms() {
+    fn zoom(z: f64) -> Vec<obc_pipeline::effect::StageValue> {
+        vec![obc_pipeline::effect::StageValue {
+            stage: obc_pipeline::effect::StageId::new("auto-frame").unwrap(),
+            name: "zoom".into(),
+            value: z,
+        }]
+    }
+    fn published(z: f64) -> Vec<obc_ipc::StageValue> {
+        vec![obc_ipc::StageValue {
+            stage: "auto-frame".into(),
+            name: "zoom".into(),
+            value: z,
+        }]
+    }
+    let value_changes = |h: &mut H| -> Vec<Vec<obc_ipc::StageValue>> {
+        h.drain()
+            .0
+            .into_iter()
+            .filter_map(|c| match c {
+                Change::StageValues(v) => Some(v),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut h = H::new(
+        "[lifecycle]\nidle_grace_s = 0.0\nstart_debounce_ms = 0\n",
+        |_| {},
+    );
+    assert!(h.snap().stage_values.is_empty(), "idle: none");
+    h.consumers(1, 0);
+    assert_eq!(h.state(), State::Active);
+    h.tick(100);
+    assert!(h.snap().stage_values.is_empty(), "no stage reports");
+    h.drain();
+
+    // A new set: published at once.
+    h.world().stage_values = zoom(1.0);
+    h.tick(1000);
+    assert_eq!(h.snap().stage_values, published(1.0));
+    assert_eq!(value_changes(&mut h), [published(1.0)]);
+    // A move under 0.01: nothing, however long it lasts.
+    h.world().stage_values = zoom(1.009);
+    h.tick(1500);
+    h.tick(2500);
+    assert_eq!(h.snap().stage_values, published(1.0));
+    assert!(value_changes(&mut h).is_empty());
+    // A move of 0.01 or more: published.
+    h.world().stage_values = zoom(1.2);
+    h.tick(3000);
+    assert_eq!(value_changes(&mut h), [published(1.2)]);
+    // Easing: within 250 ms of the last change, held back; the poll after
+    // the period publishes the latest value.
+    h.world().stage_values = zoom(1.3);
+    h.tick(3100);
+    h.world().stage_values = zoom(1.35);
+    h.tick(3200);
+    assert_eq!(h.snap().stage_values, published(1.2));
+    assert!(value_changes(&mut h).is_empty());
+    h.tick(3250);
+    assert_eq!(value_changes(&mut h), [published(1.35)]);
+    // The stage stops reporting: the set changes, once the period allows.
+    h.world().stage_values = Vec::new();
+    h.tick(3300);
+    assert_eq!(h.snap().stage_values, published(1.35));
+    h.tick(3500);
+    assert!(h.snap().stage_values.is_empty());
+    assert_eq!(value_changes(&mut h), [Vec::new()]);
+
+    // The session ends: none at once, even within the period.
+    h.world().stage_values = zoom(1.5);
+    h.tick(4000);
+    assert_eq!(h.snap().stage_values, published(1.5));
+    h.consumers(0, 4010);
+    assert_eq!(h.state(), State::Idle);
+    assert!(h.snap().stage_values.is_empty(), "idle: none");
+    assert_eq!(value_changes(&mut h).last(), Some(&Vec::new()));
+}
+
 #[test]
 fn set_enabled_false_while_active_stops_the_session_and_keeps_the_writer() {
     let mut h = H::new("", |_| {});
@@ -1096,6 +1180,7 @@ fn every_transition_of_the_lifecycle_is_announced_in_order() {
             }
             Change::MicConsumers(n) => format!("mic_consumers={n}"),
             Change::MicLatencyMs(v) => format!("mic_latency={v}"),
+            Change::StageValues(v) => format!("stage_values={}", v.len()),
         })
         .collect();
     assert_eq!(

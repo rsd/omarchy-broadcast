@@ -82,6 +82,7 @@ fn layout_checks() -> String {
     size("obc_chain_request", size_of::<obc_chain_request>());
     size("obc_load_report", size_of::<obc_load_report>());
     size("obc_timing", size_of::<obc_timing>());
+    size("obc_status_value", size_of::<obc_status_value>());
     size("obc_audio_buffer", size_of::<obc_audio_buffer>());
     size("obc_audio_request", size_of::<obc_audio_request>());
     size("obc_audio_load_report", size_of::<obc_audio_load_report>());
@@ -120,6 +121,21 @@ fn layout_checks() -> String {
     );
     offset("obc_timing", "ms", offset_of!(obc_timing, ms));
     offset(
+        "obc_status_value",
+        "value",
+        offset_of!(obc_status_value, value),
+    );
+    offset(
+        "obc_status_value",
+        "reserved0",
+        offset_of!(obc_status_value, reserved0),
+    );
+    offset(
+        "obc_status_value",
+        "reserved1",
+        offset_of!(obc_status_value, reserved1),
+    );
+    offset(
         "obc_module_vtable",
         "init",
         offset_of!(obc_module_vtable, init),
@@ -143,6 +159,11 @@ fn layout_checks() -> String {
         "obc_module_vtable",
         "audio_instance_process",
         offset_of!(obc_module_vtable, audio_instance_process),
+    );
+    offset(
+        "obc_module_vtable",
+        "instance_status_values",
+        offset_of!(obc_module_vtable, instance_status_values),
     );
     offset(
         "obc_audio_buffer",

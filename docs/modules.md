@@ -2,7 +2,7 @@
 
 The effects of omarchy-broadcast are provided by **modules**: a TOML manifest and a shared library that exports a versioned C ABI. The daemon finds the manifests, loads the libraries of the modules that are enabled, and shows the settings each module describes in its clients, with no change to them. This page is the reference for module authors and for people who install modules. The design and the reasons for it are in [ADR-0025](adr/0025-loadable-modules.md), and for the audio kind (the microphone) in [ADR-0029](adr/0029-audio-modules-mic-host-and-worker.md); the daemon's side is in [architecture.md](architecture.md#modules), the D-Bus members in [dbus-api.md](dbus-api.md#modules) and the CLI in [cli-json.md](cli-json.md#modules-and-order).
 
-The module interface is **ABI 1.x (1.2 at present), and it is not yet declared stable**: until it is, it may change in breaking ways, so a module built outside this repository may need rebuilding against the matching SDK or header after an update of omarchy-broadcast. No module outside this repository exists yet, so a promise of stability (when a major version changes, and what a minor version may add) has not been made. The version rules the host enforces are in [The ABI](#the-abi-and-the-sdk), and they are unchanged by this.
+The module interface is **ABI 1.x (1.3 at present), and it is not yet declared stable**: until it is, it may change in breaking ways, so a module built outside this repository may need rebuilding against the matching SDK or header after an update of omarchy-broadcast. No module outside this repository exists yet, so a promise of stability (when a major version changes, and what a minor version may add) has not been made. The version rules the host enforces are in [The ABI](#the-abi-and-the-sdk), and they are unchanged by this.
 
 Where to look:
 
@@ -205,7 +205,9 @@ A module library exports two C symbols:
 **Version rules.** The host refuses a library whose major version is not its own, and one built for a **newer minor** version than its own, each with a reason naming both versions; the entry point is not called then. A library built for an older minor version of the same major version loads. A structure that can grow starts with `struct_size`, and a reader reads a field only when it fits in `struct_size`; vtable entries and fields are only ever appended; a vtable at least as large as that of ABI 1.0 is accepted, and an entry past its `struct_size` counts as not set. A boolean crossing the boundary is a `uint8_t`.
 
 **ABI 1.1** adds one thing, `OBC_FRAME_FLAG_REPEAT` (below). The change is additive: a library built for ABI 1.0 loads and runs unchanged, because the host hands a module only the `obc_frame::flags` bits that its ABI version defines, and clears the others on every frame. A module of ABI 1.0 therefore never sees the new flag and processes a repeat as any other frame. 
-**ABI 1.2** adds the audio kind ([Audio modules](#audio-modules)): the structures `obc_audio_request`, `obc_audio_load_report` and `obc_audio_buffer`, the constants `OBC_AUDIO_F32_PLANAR`, `OBC_AUDIO_FLAG_NEW_SOURCE`, `OBC_AUDIO_FLAG_DISCONT` and `OBC_MAX_AUDIO_CHANNELS`, and two vtable entries at the end, `audio_instance_load` and `audio_instance_process`. Nothing existing changes: a library built for ABI 1.0 or 1.1 has a vtable that ends before the new entries, which the host counts as not set, and loads and runs unchanged. The `obc-module-abi` and `obc-module-sdk` crates are 1.2.0.
+**ABI 1.2** adds the audio kind ([Audio modules](#audio-modules)): the structures `obc_audio_request`, `obc_audio_load_report` and `obc_audio_buffer`, the constants `OBC_AUDIO_F32_PLANAR`, `OBC_AUDIO_FLAG_NEW_SOURCE`, `OBC_AUDIO_FLAG_DISCONT` and `OBC_MAX_AUDIO_CHANNELS`, and two vtable entries at the end, `audio_instance_load` and `audio_instance_process`. Nothing existing changes: a library built for ABI 1.0 or 1.1 has a vtable that ends before the new entries, which the host counts as not set, and loads and runs unchanged. The `obc-module-abi` and `obc-module-sdk` crates were 1.2.0 with it.
+
+**ABI 1.3** adds named status values ([Status values](#status-values-abi-13)): the structure `obc_status_value` (32 bytes) and one vtable entry at the end, `instance_status_values`, which is nullable. Nothing existing changes: a library built for ABI 1.0, 1.1 or 1.2 has a vtable that ends before the new entry, which the host counts as not set, and loads and runs unchanged, reporting no values. The converse does not hold: a module built for 1.3 on a host of 1.2 is refused by the minor-version check above, since the host cannot know the entry. The `obc-module-abi` and `obc-module-sdk` crates are 1.3.0.
 
 **Stability.** The version numbers are the host's check, not yet a promise. ABI 1.x may still change in breaking ways, even without a change of the major version, until it is declared stable and its stability promise is stated (see [ADR-0025](adr/0025-loadable-modules.md)). A module built for one release of omarchy-broadcast may therefore need rebuilding, against the `obc-module-sdk` or the header of the matching release, after an update. The checks above are unchanged: a library of another major version, or of a newer minor version, is still refused with its reason.
 
@@ -222,7 +224,8 @@ A module library exports two C symbols:
 | `instance_process(instance, in, out, live, n_live)` | Required for a `video-stage` module, likewise. Runs one frame through the loaded chain. `out` equals `in` only for an in-place chain. The per-frame parameters apply from this frame |
 | `instance_reset_temporal(instance, &dropped_json)` | Forget temporal state (a new camera); returns, as a JSON array, the stage ids that could not keep running and were dropped |
 | `instance_unload` | Release what the last load loaded; the instance can be loaded again. Must cope with any failed load |
-| `instance_timings` | Optional: how long each step of the last frame took, for statistics |
+| `instance_timings` | Optional: how long each step of the last frame took, for statistics. The host reads it within the bounds of [Status values](#status-values-abi-13) |
+| `instance_status_values(instance, &values, &n)` | ABI 1.3, optional (null: the module reports no values). The named numeric values of the last processed frame, for the daemon's status, such as auto-frame's zoom. See [Status values](#status-values-abi-13) |
 | `audio_instance_load(instance, request, &report)` | ABI 1.2, required for an `audio-filter` module, null for the others. Loads a chain of audio stages for one block format; the report carries the load time, the warm-up, the block size chosen and the chain's algorithmic delay in samples |
 | `audio_instance_process(instance, in, out, live, n_live)` | ABI 1.2, required for an `audio-filter` module. Runs one block of audio through the loaded chain; `out` never overlaps `in`; the module may set the output's `voice_probability` |
 | `instance_park`, `instance_unpark` | Optional hooks for a stream that stops for a while. This version of the daemon does not call them (a session's instances are unloaded when it stops) |
@@ -237,9 +240,44 @@ A failing call returns a non-zero status: `OBC_ERR_INVALID` (1), `OBC_ERR_UNSUPP
 
 **Repeats** (ABI 1.1). The output clock emits a frame on every tick of the output rate. When no new camera frame has arrived since the last tick it emits the last one again: a **repeat**. The host marks it with `OBC_FRAME_FLAG_REPEAT` for a module built for ABI 1.1 or later (the Rust SDK: `Frame::is_repeat()`); the frame has the same picture as the previous call's, which that call has processed. A module may use the flag to skip work on a repeat, to answer it from what it keeps, or to tell a repeat from a fresh frame (a frame-generation stage makes a picture from two fresh frames); a module that ignores it processes the repeat as any frame, as a module of ABI 1.0 does. It still writes `output` on a repeat (an in-place chain's frame may be left as it came). In the daemon the flag reaches a module through an `obcmodule` element. The effect element, which runs the stages of the `background` provider, sends its last processed output on a repeat instead of running its chain, and processes the repeat only when it has no valid output to send ([ADR-0027](adr/0027-output-modes-frame-generation-and-privacy-fallback.md)).
 
-**The Rust SDK.** `obc-module-sdk` wraps all of this. A module is a `cdylib` crate that depends on the SDK, implements `Module` (`init`, `probe`, `settings`, optionally `check`, `create_instance`) and `Instance` (`unload`; `load` and `process` for video stages, which default to failing with `Unsupported`, so that an audio-only instance writes `no_video_stages!()` instead; optionally `reset_temporal`, `timings`, `park`, `unpark`; `Frame::is_new_source()` and `Frame::is_repeat()` tell the flags of a frame), and exports it with `obc_module_sdk::export_module!(MyModule);`. The macro defines the two symbols and the vtable. For every call it checks the pointers and the `struct_size` of every structure, converts the C structures to safe views (`Frame`, `ChainRequest`, `Param`), **catches a panic** (it becomes an error that carries the message, and never unwinds into the daemon: do not build a module with `panic = "abort"`) and keeps every string it hands back alive until the next call on the same object. Log lines go to the daemon's log with the `log` module of the SDK. An audio module also implements `AudioInstance` and is exported with `obc_module_sdk::export_module!(MyModule, audio);` ([Audio modules](#audio-modules)). A module outside this repository depends on the SDK through a path or a git dependency, as `examples/module-hello/Cargo.toml` shows for the path form. The example's `Cargo.lock` is committed and CI builds it with `--locked`.
+**The Rust SDK.** `obc-module-sdk` wraps all of this. A module is a `cdylib` crate that depends on the SDK, implements `Module` (`init`, `probe`, `settings`, optionally `check`, `create_instance`) and `Instance` (`unload`; `load` and `process` for video stages, which default to failing with `Unsupported`, so that an audio-only instance writes `no_video_stages!()` instead; optionally `reset_temporal`, `timings`, `status_values` (ABI 1.3), `park`, `unpark`; `Frame::is_new_source()` and `Frame::is_repeat()` tell the flags of a frame), and exports it with `obc_module_sdk::export_module!(MyModule);`. The macro defines the two symbols and the vtable. For every call it checks the pointers and the `struct_size` of every structure, converts the C structures to safe views (`Frame`, `ChainRequest`, `Param`), **catches a panic** (it becomes an error that carries the message, and never unwinds into the daemon: do not build a module with `panic = "abort"`) and keeps every string it hands back alive until the next call on the same object. Log lines go to the daemon's log with the `log` module of the SDK. An audio module also implements `AudioInstance` and is exported with `obc_module_sdk::export_module!(MyModule, audio);` ([Audio modules](#audio-modules)). A module outside this repository depends on the SDK through a path or a git dependency, as `examples/module-hello/Cargo.toml` shows for the path form. The example's `Cargo.lock` is committed and CI builds it with `--locked`.
 
 A module in another language implements the header directly: export the two symbols, fill in a vtable of `struct_size` bytes with the entries it supports, and follow the rules above and in the header's comments.
+
+### Status values (ABI 1.3)
+
+A stage can report **named numeric values** about the frame it has just processed, for the daemon to show: auto-frame's current zoom, for one. They are read-outs, not settings: the host never sends one back, and a client shows them next to the setting they relate to. The daemon publishes them as the `StageValues` property ([dbus-api.md](dbus-api.md#stage-values-revision-16)) and the CLI prints them ([cli-json.md](cli-json.md#stage-values)); the decision is recorded in [ADR-0025](adr/0025-loadable-modules.md).
+
+```c
+typedef struct obc_status_value {
+    const char *stage;   /* the stage id the value belongs to, NUL-terminated */
+    const char *name;    /* the value's name, unique within the stage, NUL-terminated */
+    double      value;
+    uint32_t    reserved0;   /* zero */
+    uint32_t    reserved1;   /* zero */
+} obc_status_value;          /* 32 bytes, 8-byte aligned */
+```
+
+`obc_status instance_status_values(obc_instance *instance, const obc_status_value **out, size_t *n)` returns, through `out` and `n`, the values after the last processed frame. The contract:
+
+- **When.** The host calls it after a frame, on the streaming thread and never while a call on the same instance runs, so it must be cheap: it reads what `instance_process` left, and does no work of its own.
+- **Ownership.** The array and the strings it points to belong to the instance and stay valid until the next call on that instance. The host copies them at once. With no values, set `*out` to null and `*n` to 0.
+- **What it reports.** The values of the stages that are loaded and have processed a frame. A stage that is not loaded reports nothing. A repeated frame (a repeat, ABI 1.1, see above) should leave a value as it was, if the stage did no work on it.
+- **Return.** `OBC_OK`. Any other status is read as "no values" for that call.
+
+**What the host accepts.** The host does not trust the list, because a bad one must not harm the daemon or its status:
+
+| Input | Result |
+|---|---|
+| A non-`OBC_OK` status, a null array or an array not aligned for `obc_status_value` | No values |
+| More than 64 entries, or none (`*n` of 0) | No values: a long list is ignored whole, not cut to its first 64 |
+| A name or stage longer than 64 bytes | Cut to 64 bytes at a character boundary |
+| An empty or null name, or a value that is `NaN` or infinite | That entry is left out |
+| A stage that is not a valid stage id, or null | That entry is left out |
+
+The same bounds (64 entries, names cut to 64 bytes, a null or misaligned array) now apply to what `instance_timings` returns. A value reaches a client only if the stage is also one that is ready: the daemon's elements keep the values of the stages that ran on the last frame and drop those of a stage that has been switched off or has failed, and of a stage the chain never loaded.
+
+**The Rust SDK.** Implement `Instance::status_values(&self) -> Vec<StatusValue>`, with `StatusValue::new(stage, name, value)`; it defaults to none, and the macro keeps the strings alive until the next call. The Maxine AR module is the model: while auto-frame is loaded it reports `("auto-frame", "zoom", frame height / crop height)`, where `1.00` is the full frame ([ADR-0028](adr/0028-maxine-ar-module.md)).
 
 ## Settings
 

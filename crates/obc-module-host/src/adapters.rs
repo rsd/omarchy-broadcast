@@ -50,7 +50,7 @@ use obc_backend::enhance::{
 use obc_backend::{
     BackendError, BackendFactory, ChainFrame, ChainRequest, ColourMatrix, DeviceNv12, EffectKind,
     FrameKind, FrameParams, GpuContext, HostNv12, InferenceBackend, LoadReport, LoadRequest,
-    Params, StageChain, StageChainFactory, StageId, StageList, StageTimings, Value,
+    Params, StageChain, StageChainFactory, StageId, StageList, StageTimings, StageValue, Value,
 };
 use obc_module_abi::{
     OBC_CHROMA_SITING_COSITED, OBC_CHROMA_SITING_JPEG, OBC_CHROMA_SITING_MPEG2, OBC_FORMAT_I420,
@@ -607,6 +607,14 @@ impl InferenceBackend for ModuleBackend {
         Some(t)
     }
 
+    /// What the module reports (ABI 1.3); none while nothing is loaded.
+    fn status_values(&self) -> Vec<StageValue> {
+        if !self.instance.is_loaded() {
+            return Vec::new();
+        }
+        self.instance.status_values()
+    }
+
     fn reset_temporal(&mut self, gpu: &GpuContext) -> Result<StageList, BackendError> {
         let _ = gpu;
         self.check_cuda()?;
@@ -961,6 +969,14 @@ impl StageChain for ModuleChain {
     fn unload(&mut self) {
         self.instance.unload();
         self.kind = None;
+    }
+
+    /// What the module reports (ABI 1.3); none while nothing is loaded.
+    fn status_values(&self) -> Vec<StageValue> {
+        if !self.instance.is_loaded() {
+            return Vec::new();
+        }
+        self.instance.status_values()
     }
 }
 

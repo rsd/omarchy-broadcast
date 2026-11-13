@@ -123,7 +123,9 @@ pub const OBC_MODULE_ABI_MAJOR: u32 = 1;
 /// * 1.2 adds audio: [`obc_audio_buffer`], [`obc_audio_request`],
 ///   [`obc_audio_load_report`], their constants and the vtable entries
 ///   `audio_instance_load` and `audio_instance_process`.
-pub const OBC_MODULE_ABI_MINOR: u32 = 2;
+/// * 1.3 adds named status values: [`obc_status_value`] and the vtable
+///   entry `instance_status_values`.
+pub const OBC_MODULE_ABI_MINOR: u32 = 3;
 
 /// The packed ABI version this crate describes: `major << 16 | minor`
 /// ([`obc_module_abi_pack`]).
@@ -599,6 +601,23 @@ pub struct obc_timing {
     pub reserved0: u32,
 }
 
+/// A named numeric value a stage reports about the last processed frame
+/// (auto-frame's current zoom, for one). Since ABI 1.3.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct obc_status_value {
+    /// The stage id the value belongs to. NUL-terminated.
+    pub stage: *const c_char,
+    /// The name of the value, unique within the stage. NUL-terminated.
+    pub name: *const c_char,
+    /// The value.
+    pub value: f64,
+    /// Zero.
+    pub reserved0: u32,
+    /// Zero.
+    pub reserved1: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Audio (ABI 1.2)
 // ---------------------------------------------------------------------------
@@ -891,6 +910,17 @@ pub struct obc_module_vtable {
             n_live: usize,
         ) -> obc_status,
     >,
+    /// Since ABI 1.3. Nullable (null: the module reports no values). The
+    /// status values of the last processed frame: `*out` points to `*n`
+    /// entries owned by the instance (null and 0 when there are none),
+    /// valid until the next call on the instance.
+    pub instance_status_values: Option<
+        unsafe extern "C" fn(
+            instance: *mut obc_instance,
+            out: *mut *const obc_status_value,
+            n: *mut usize,
+        ) -> obc_status,
+    >,
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,8 +1105,8 @@ mod tests {
 
     #[test]
     fn version_packing() {
-        assert_eq!(OBC_MODULE_ABI_VERSION, 0x0001_0002);
-        assert_eq!(obc_module_abi_pack(1, 2), OBC_MODULE_ABI_VERSION);
+        assert_eq!(OBC_MODULE_ABI_VERSION, 0x0001_0003);
+        assert_eq!(obc_module_abi_pack(1, 3), OBC_MODULE_ABI_VERSION);
         assert_eq!(obc_module_abi_pack(2, 7), 0x0002_0007);
         assert_eq!(obc_module_abi_major(0x0002_0007), 2);
         assert_eq!(obc_module_abi_minor(0x0002_0007), 7);
@@ -1240,10 +1270,23 @@ mod tests {
 
         assert_eq!(
             (
+                size_of::<obc_status_value>(),
+                align_of::<obc_status_value>()
+            ),
+            (32, 8)
+        );
+        assert_eq!(offset_of!(obc_status_value, stage), 0);
+        assert_eq!(offset_of!(obc_status_value, name), 8);
+        assert_eq!(offset_of!(obc_status_value, value), 16);
+        assert_eq!(offset_of!(obc_status_value, reserved0), 24);
+        assert_eq!(offset_of!(obc_status_value, reserved1), 28);
+
+        assert_eq!(
+            (
                 size_of::<obc_module_vtable>(),
                 align_of::<obc_module_vtable>()
             ),
-            (8 + 18 * 8, 8)
+            (8 + 19 * 8, 8)
         );
         assert_eq!(offset_of!(obc_module_vtable, struct_size), 0);
         assert_eq!(offset_of!(obc_module_vtable, abi_version), 4);
@@ -1266,6 +1309,8 @@ mod tests {
         // ABI 1.2.
         assert_eq!(offset_of!(obc_module_vtable, audio_instance_load), 136);
         assert_eq!(offset_of!(obc_module_vtable, audio_instance_process), 144);
+        // ABI 1.3.
+        assert_eq!(offset_of!(obc_module_vtable, instance_status_values), 152);
 
         assert_eq!(
             (

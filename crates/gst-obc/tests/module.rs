@@ -1088,6 +1088,61 @@ fn the_only_stage_switched_off_unloads_the_chain() {
     assert_eq!(get(&fake.log.unloads), 1, "nothing left to unload");
 }
 
+/// The chain's status values after a frame are in the stats, of the stages
+/// that ran and are ready; a stage switched off reports nothing any more,
+/// and neither does a stopped element.
+#[test]
+fn the_status_values_of_the_last_frame_are_in_the_stats() {
+    let fake = FakeChainFactory::host(FakeChainConfig::default());
+    let mut r = Rig::new(Some(fake.clone()), &[lift().with_param("y", 77i64), tint()]);
+    r.until_status("tint", EffectStatus::Ready);
+    r.until_status("lift", EffectStatus::Ready);
+    assert_eq!(r.frame(), lifted(77, Some(FAKE_TINT_UV)));
+    let values = |r: &Rig| {
+        r.module
+            .stats()
+            .stage_values
+            .iter()
+            .map(|v| (v.stage.to_string(), v.name.clone(), v.value))
+            .collect::<Vec<_>>()
+    };
+    let v = values(&r);
+    assert_eq!(v.len(), 2, "{v:?}");
+    assert_eq!(v[0], ("lift".into(), "y".into(), 77.0));
+    assert_eq!((v[1].0.as_str(), v[1].1.as_str()), ("tint", "frames"));
+    assert!(v[1].2 >= 1.0, "{v:?}");
+    // The next frame moves the count.
+    let before = v[1].2;
+    r.frame();
+    assert_eq!(values(&r)[1].2, before + 1.0);
+    // Lift off: only tint reports, once the chain runs without lift.
+    let mut off = lift();
+    off.enabled = false;
+    r.module.apply(&[off, tint()]).unwrap();
+    r.frames_until(Duration::from_secs(10), |_| {
+        last_load_without_lift(&fake) && get(&fake.log.loads) == 2
+    });
+    r.until_status("tint", EffectStatus::Ready);
+    r.frame();
+    let v = values(&r);
+    assert!(
+        v.iter().all(|(s, _, _)| s == "tint") && v.len() == 1,
+        "{v:?}"
+    );
+    r.stop();
+    assert!(values(&r).is_empty(), "stopped: none");
+}
+
+/// Whether the fake's last load left `lift` out.
+fn last_load_without_lift(fake: &FakeChainFactory) -> bool {
+    fake.log
+        .last_request
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|(stages, _)| !stages.iter().any(|s| s == "lift"))
+}
+
 #[test]
 fn stopping_unloads_and_a_restart_loads_again() {
     let fake = FakeChainFactory::host(FakeChainConfig {

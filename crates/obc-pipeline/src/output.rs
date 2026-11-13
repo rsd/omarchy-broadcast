@@ -852,6 +852,22 @@ impl Output {
         self.effect.as_ref().map(|fx| fx.stats())
     }
 
+    /// The status values the stages report after the last frame they
+    /// processed (a module of ABI 1.3: auto-frame's zoom, for one): those
+    /// of the module stage elements, in pipeline order, then the effect
+    /// element's. Empty when none reports.
+    pub fn stage_values(&self) -> Vec<obc_backend::StageValue> {
+        let mut out: Vec<obc_backend::StageValue> = self
+            .modules
+            .iter()
+            .flat_map(|(_, m)| m.stats().stage_values)
+            .collect();
+        if let Some(fx) = &self.effect {
+            out.extend(fx.stats().stage_values);
+        }
+        out
+    }
+
     /// The current effect settings; `None` without an effect element.
     pub fn effect_settings(&self) -> Option<EffectSettings> {
         self.effect.as_ref().map(|fx| fx.settings())

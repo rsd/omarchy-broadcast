@@ -457,6 +457,8 @@ struct Mock {
     /// The user's gallery root ([`USER_MEDIA`] unless a test sets one);
     /// an import writes an empty file there when it exists.
     media_user: String,
+    /// `StageValues` (revision 16); none unless a test sets them.
+    stage_values: Vec<obc_ipc::StageValue>,
 }
 
 /// The mock's user gallery root.
@@ -837,6 +839,7 @@ impl Mock {
             .into(),
             media_serial: 1,
             media_user: USER_MEDIA.into(),
+            stage_values: Vec::new(),
         }
     }
 
@@ -1453,6 +1456,11 @@ impl Mock {
     #[zbus(property)]
     fn warning(&self) -> String {
         self.warning.clone()
+    }
+
+    #[zbus(property)]
+    fn stage_values(&self) -> Vec<obc_ipc::StageValue> {
+        self.stage_values.clone()
     }
 
     #[zbus(property)]
@@ -2085,6 +2093,18 @@ impl MockDaemon {
         });
     }
 
+    /// `StageValues` is `values`, announced.
+    fn set_stage_values(&self, values: Vec<obc_ipc::StageValue>) {
+        let iface = self.iface();
+        self.rt.block_on(async {
+            iface.get_mut().await.stage_values = values;
+            let m = iface.get().await;
+            m.stage_values_changed(iface.signal_emitter())
+                .await
+                .unwrap();
+        });
+    }
+
     /// `Warning` is `text`, announced.
     fn set_warning(&self, text: &str) {
         let iface = self.iface();
@@ -2606,6 +2626,59 @@ impl Rev5 {
     }
 }
 
+/// A daemon of interface revision 15, as the CLI reads it: without
+/// `StageValues` (revision 16). The members the CLI reads with a default
+/// are left out, as for [`Rev6`].
+struct Rev15;
+
+#[interface(name = "br.com.dias.OmarchyBroadcast1")]
+impl Rev15 {
+    #[zbus(property)]
+    fn state(&self) -> State {
+        State::Active
+    }
+
+    #[zbus(property)]
+    fn error(&self) -> String {
+        String::new()
+    }
+
+    #[zbus(property)]
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    #[zbus(property)]
+    fn cameras(&self) -> Vec<CameraInfo> {
+        Vec::new()
+    }
+
+    #[zbus(property)]
+    fn active_camera(&self) -> String {
+        String::new()
+    }
+
+    #[zbus(property)]
+    fn output_mode(&self) -> String {
+        "NV12 1920x1080@30".into()
+    }
+
+    #[zbus(property)]
+    fn effect(&self) -> String {
+        "none".into()
+    }
+
+    #[zbus(property)]
+    fn consumers(&self) -> u32 {
+        1
+    }
+
+    #[zbus(property)]
+    fn interface_revision(&self) -> u32 {
+        15
+    }
+}
+
 /// A daemon of interface revision 6: the image controls but no camera
 /// settings (`GetSettings`, `SetSetting`, `ResetSettings` and their
 /// properties fail with `UnknownMethod` / `UnknownProperty`). As for
@@ -2770,6 +2843,74 @@ fn status_and_watch_show_the_warning() {
     assert_eq!(v["type"], "state", "{v}");
     assert_eq!(v["changed"], serde_json::json!(["warning"]), "{v}");
     assert_eq!(v["warning"], "", "{v}");
+}
+
+fn zoom(value: f64) -> Vec<obc_ipc::StageValue> {
+    vec![obc_ipc::StageValue {
+        stage: "auto-frame".into(),
+        name: "zoom".into(),
+        value,
+    }]
+}
+
+/// `stage_values` is always in the snapshot, `[]` when no stage reports;
+/// `status` shows auto-frame's zoom, and `watch --json` prints a `state`
+/// line when the values change.
+#[test]
+fn status_and_watch_show_the_stage_values() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let v = json_line(&bus.run(&["status", "--json"]).stdout);
+    assert_eq!(v["stage_values"], serde_json::json!([]), "{v}");
+    let out = bus.run(&["status"]);
+    assert!(!out.stdout.contains("zoom"), "{}", out.stdout);
+
+    mock.set_stage_values(zoom(1.24));
+    let out = bus.run(&["status"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(
+        out.stdout
+            .contains("Denoise:    off\nAuto-frame zoom: 1.24x\n"),
+        "{}",
+        out.stdout
+    );
+    let v = json_line(&bus.run(&["status", "--json"]).stdout);
+    assert_eq!(
+        v["stage_values"],
+        serde_json::json!([{"stage": "auto-frame", "name": "zoom", "value": 1.24}]),
+        "{v}"
+    );
+
+    let watch = bus.watch(&["watch", "--json"], None);
+    let v = watch.next_json("the first snapshot");
+    assert_eq!(v["type"], "snapshot", "{v}");
+    assert_eq!(v["stage_values"][0]["value"], 1.24, "{v}");
+    watch.settings_set("the settings after the snapshot");
+    mock.set_stage_values(zoom(1.5));
+    let v = watch.next_json("the new zoom");
+    assert_eq!(v["type"], "state", "{v}");
+    assert_eq!(v["changed"], serde_json::json!(["stage_values"]), "{v}");
+    assert_eq!(v["stage_values"][0]["value"], 1.5, "{v}");
+    mock.set_stage_values(Vec::new());
+    let v = watch.next_json("no zoom");
+    assert_eq!(v["changed"], serde_json::json!(["stage_values"]), "{v}");
+    assert_eq!(v["stage_values"], serde_json::json!([]), "{v}");
+}
+
+/// A daemon before revision 16 has no `StageValues`: `[]`, and no line
+/// for it in `status`.
+#[test]
+fn a_revision_15_daemon_has_no_stage_values() {
+    let bus = Bus::start();
+    let _old = OldDaemon::start(&bus, Rev15);
+    let out = bus.run(&["status", "--json"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let v = json_line(&out.stdout);
+    assert_eq!(v["interface_revision"], 15);
+    assert_eq!(v["stage_values"], serde_json::json!([]), "{v}");
+    let out = bus.run(&["status"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(!out.stdout.contains("zoom"), "{}", out.stdout);
 }
 
 #[test]

@@ -23,7 +23,7 @@ use obc_ipc::{
     SETTINGS_REVISION, Setting, SettingChange, SettingKind, SettingValue, SettingsGroup,
     SettingsTree, Snapshot, State, Stats, WARNING_REVISION,
 };
-use obc_ipc::{MIC_REVISION, MicStatus};
+use obc_ipc::{MIC_REVISION, MicStatus, StageValue};
 use obc_ipc::{ModuleInfo, ModuleList, StageInfo};
 use zbus::message::Flags;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
@@ -68,6 +68,18 @@ struct Mock {
     config_serial: u32,
     /// The microphone (revision 13).
     mic: MicStatus,
+    /// `StageValues` (revision 16): [`zoom`] until the mock's
+    /// `MockSetStageValues` changes it.
+    stage_values: Vec<StageValue>,
+}
+
+/// The mock's `StageValues` while enabled: auto-frame's zoom.
+fn zoom() -> Vec<StageValue> {
+    vec![StageValue {
+        stage: "auto-frame".into(),
+        name: "zoom".into(),
+        value: 1.24,
+    }]
 }
 
 /// The mock's microphone while its host runs.
@@ -353,6 +365,7 @@ impl Mock {
             config: mock_config(),
             config_serial: 1,
             mic: mic_on(),
+            stage_values: zoom(),
         }
     }
 
@@ -972,6 +985,23 @@ impl Mock {
     }
 
     #[zbus(property)]
+    fn stage_values(&self) -> Vec<StageValue> {
+        self.stage_values.clone()
+    }
+
+    /// The mock's own: sets `StageValues`, as the daemon does from its
+    /// stages.
+    async fn mock_set_stage_values(
+        &mut self,
+        values: Vec<StageValue>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        self.stage_values = values;
+        self.stage_values_changed(&emitter).await?;
+        Ok(())
+    }
+
+    #[zbus(property)]
     fn state(&self) -> State {
         self.state
     }
@@ -1269,11 +1299,13 @@ async fn proxy_reads_every_property() {
             backend_profile: Some("quality".into()),
             config_serial: Some(1),
             mic: Some(mic_on()),
+            stage_values: zoom(),
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 15);
-    assert_eq!(INTERFACE_REVISION, obc_ipc::MEDIA_REVISION);
+    assert_eq!(INTERFACE_REVISION, 16);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::STAGE_VALUES_REVISION);
+    assert_eq!(obc_ipc::MEDIA_REVISION, 15);
     assert_eq!(obc_ipc::FORCED_REVISION, 14);
     assert_eq!(MIC_REVISION, 13);
     assert_eq!(WARNING_REVISION, 11);
@@ -1311,6 +1343,7 @@ async fn a_revision_1_daemon_reads_with_defaults_for_the_newer_properties() {
         assert_eq!(snap.settings_schema_serial, None);
         assert_eq!(snap.warning, "");
         assert_eq!(snap.mic, None);
+        assert!(snap.stage_values.is_empty(), "before revision 16");
     }
     let no_autostart = within("snapshot", Snapshot::fetch_no_autostart(&client))
         .await
@@ -1557,6 +1590,58 @@ async fn proxy_calls_every_method_and_sees_changes() {
     assert_eq!(applied.blur_strength, 0.8);
     assert_eq!(applied.background_image, "/tmp/bg.png");
     assert!(applied.denoise);
+}
+
+/// `StageValues` reads through `GetAll` and the proxy, and its changes
+/// arrive as `PropertiesChanged` that apply to a snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stage_values_are_read_and_followed() {
+    let (_server, client) = pair().await;
+    let proxy = OmarchyBroadcastProxy::builder(&client)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(
+        within("StageValues", proxy.stage_values()).await.unwrap(),
+        zoom()
+    );
+    let props = fdo::PropertiesProxy::builder(&client)
+        .destination(obc_ipc::BUS_NAME)
+        .path(OBJECT_PATH)
+        .build()
+        .await
+        .unwrap();
+    let all = within("GetAll", props.get_all(INTERFACE.try_into().unwrap()))
+        .await
+        .unwrap();
+    let mut snap = Snapshot::from_properties(all.iter().map(|(k, v)| (k.as_str(), &**v))).unwrap();
+    assert_eq!(snap.stage_values, zoom());
+    let mut changed = props.receive_properties_changed().await.unwrap();
+    let none: (Vec<StageValue>,) = (Vec::new(),);
+    let call = proxy.inner().call_method("MockSetStageValues", &none);
+    within("MockSetStageValues", call).await.unwrap();
+    loop {
+        let signal = within("PropertiesChanged", changed.next())
+            .await
+            .expect("PropertiesChanged stream ended");
+        let args = signal.args().unwrap();
+        let mut done = false;
+        for (k, v) in args.changed_properties() {
+            snap.apply_property(k, v).unwrap();
+            done |= *k == "StageValues";
+        }
+        if done {
+            break;
+        }
+    }
+    assert!(snap.stage_values.is_empty(), "none any more");
+    assert!(
+        within("StageValues", proxy.stage_values())
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

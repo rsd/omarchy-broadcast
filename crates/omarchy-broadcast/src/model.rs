@@ -3,9 +3,9 @@
 
 use obc_ipc::{CameraInfo, Snapshot};
 
-/// The JSON names of the scalar fields of a `state` line, in output order
-/// (`docs/cli-json.md`).
-pub const STATE_FIELDS: [&str; 17] = [
+/// The JSON names of the fields of a `state` line, in output order
+/// (`docs/cli-json.md`): scalars, and the `stage_values` list.
+pub const STATE_FIELDS: [&str; 18] = [
     "state",
     "enabled",
     "error",
@@ -23,6 +23,7 @@ pub const STATE_FIELDS: [&str; 17] = [
     "background_image",
     "denoise",
     "interface_revision",
+    "stage_values",
 ];
 
 /// Whether the PipeWire output is part of the picture: configured (its
@@ -64,6 +65,15 @@ pub fn camera<'a>(snap: &'a Snapshot, id: &str) -> Option<&'a CameraInfo> {
 /// The name of the active camera, if it is listed.
 pub fn active_camera_name(snap: &Snapshot) -> Option<&str> {
     active_camera(snap).map(|c| c.name.as_str())
+}
+
+/// Whether the two snapshots have the same `StageValues`, bitwise (a NaN
+/// is not a change every time).
+fn same_stage_values(a: &Snapshot, b: &Snapshot) -> bool {
+    a.stage_values.len() == b.stage_values.len()
+        && a.stage_values.iter().zip(&b.stage_values).all(|(x, y)| {
+            x.stage == y.stage && x.name == y.name && x.value.to_bits() == y.value.to_bits()
+        })
 }
 
 /// What differs between two snapshots.
@@ -108,6 +118,7 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Changes {
         // As printed: from unknown to a value is a change.
         denoise(old) != denoise(new),
         old.interface_revision != new.interface_revision,
+        !same_stage_values(old, new),
     ];
     Changes {
         fields: STATE_FIELDS

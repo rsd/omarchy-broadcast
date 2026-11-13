@@ -72,7 +72,7 @@ use std::sync::Arc;
 use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
-use obc_backend::{FrameKind, StageChainFactory, StageList};
+use obc_backend::{FrameKind, StageChainFactory, StageList, StageValue};
 
 use crate::settings::{EffectStatus, StageId, StageRequest, StageStats};
 
@@ -112,6 +112,10 @@ pub struct ModuleStats {
     /// Whether the element holds CUDA resources (its stream and a context
     /// reference): only on CUDA frames with a stage requested.
     pub cuda_active: bool,
+    /// The status values the chain reported after the last frame it
+    /// processed (a module of ABI 1.3: auto-frame's zoom, for one), of the
+    /// stages that ran on it and are ready; empty when none reports.
+    pub stage_values: Vec<StageValue>,
 }
 
 impl ModuleStats {

@@ -204,6 +204,17 @@ const _: () = assert!(
             == VTABLE_SIZE_1_2
 );
 
+/// The size of the vtable of ABI 1.3, which appends
+/// `instance_status_values` to the 1.2 vtable.
+pub const VTABLE_SIZE_1_3: usize = VTABLE_SIZE_1_2 + size_of::<usize>();
+
+// `instance_status_values` is the last entry of ABI 1.3.
+const _: () = assert!(
+    std::mem::offset_of!(obc_module_vtable, instance_status_values) == VTABLE_SIZE_1_2
+        && std::mem::offset_of!(obc_module_vtable, instance_status_values) + size_of::<usize>()
+            == VTABLE_SIZE_1_3
+);
+
 /// The first minor version of ABI 1 with audio.
 pub const AUDIO_MINOR: u16 = 2;
 
@@ -472,17 +483,18 @@ mod tests {
         assert_eq!(check_abi_version(OBC_MODULE_ABI_VERSION), Ok(()));
         let e = check_abi_version(obc_module_abi_pack(2, 0)).unwrap_err();
         assert!(
-            e.contains("module ABI 2.0") && e.contains("module ABI 1.2"),
+            e.contains("module ABI 2.0") && e.contains("module ABI 1.3"),
             "{e}"
         );
         let e = check_abi_version(obc_module_abi_pack(0, 9)).unwrap_err();
         assert!(e.contains("0.9"), "{e}");
         let e = check_abi_version(obc_module_abi_pack(1, 7)).unwrap_err();
-        assert!(e.contains("1.7, newer than") && e.contains("1.2"), "{e}");
-        // A library built for ABI 1.0, 1.1 or 1.2 loads.
+        assert!(e.contains("1.7, newer than") && e.contains("1.3"), "{e}");
+        // A library built for ABI 1.0, 1.1, 1.2 or 1.3 loads.
         assert_eq!(check_abi_version(obc_module_abi_pack(1, 0)), Ok(()));
         assert_eq!(check_abi_version(obc_module_abi_pack(1, 1)), Ok(()));
         assert_eq!(check_abi_version(obc_module_abi_pack(1, 2)), Ok(()));
+        assert_eq!(check_abi_version(obc_module_abi_pack(1, 3)), Ok(()));
     }
 
     #[test]
@@ -492,7 +504,7 @@ mod tests {
             frame_flags_of(obc_module_abi_pack(1, 0)),
             OBC_FRAME_FLAG_NEW_SOURCE
         );
-        for minor in [1, 2] {
+        for minor in [1, 2, 3] {
             assert_eq!(
                 frame_flags_of(obc_module_abi_pack(1, minor)),
                 OBC_FRAME_FLAG_NEW_SOURCE | OBC_FRAME_FLAG_REPEAT
@@ -538,7 +550,22 @@ mod tests {
         // SAFETY: as above.
         let read = unsafe { read_vtable(&vt, VTABLE_SIZE_1_2) };
         assert!(read.audio_instance_load.is_some());
-        assert_eq!(VTABLE_SIZE_1_2, size_of::<obc_module_vtable>());
+        // A 1.2 vtable never has the status values of 1.3.
+        unsafe extern "C" fn values(
+            _: *mut obc_module_abi::obc_instance,
+            _: *mut *const obc_module_abi::obc_status_value,
+            _: *mut usize,
+        ) -> obc_module_abi::obc_status {
+            0
+        }
+        vt.instance_status_values = Some(values);
+        // SAFETY: as above.
+        let read = unsafe { read_vtable(&vt, VTABLE_SIZE_1_2) };
+        assert!(read.instance_status_values.is_none());
+        // SAFETY: as above.
+        let read = unsafe { read_vtable(&vt, VTABLE_SIZE_1_3) };
+        assert!(read.instance_status_values.is_some());
+        assert_eq!(VTABLE_SIZE_1_3, size_of::<obc_module_vtable>());
     }
 
     #[test]
