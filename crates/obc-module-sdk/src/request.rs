@@ -382,7 +382,7 @@ pub struct ChainFrames {
 }
 
 /// What [`crate::Instance::load`] reports.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LoadReport {
     /// How long the load took, in milliseconds.
     pub load_ms: f32,
@@ -390,6 +390,15 @@ pub struct LoadReport {
     pub warmup_ms: Option<f32>,
     /// Whether models of the previous load were reused.
     pub reused_model: bool,
+    /// What the user should know of this load, which succeeded, as one
+    /// line of text: a setting that could not be honoured, and what runs in
+    /// its place (an engine chosen in the settings that cannot run, and the
+    /// one the chain runs on instead). The host shows it while the chain
+    /// runs, and forgets it at the next load that reports none. Handed to a
+    /// host of ABI 1.5 or later only ([`obc_module_abi::obc_load_report`]'s
+    /// `notice`); an older host never sees it. A NUL byte in it is
+    /// replaced.
+    pub notice: Option<String>,
 }
 
 #[cfg(test)]

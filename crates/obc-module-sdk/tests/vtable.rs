@@ -105,6 +105,8 @@ impl Instance for TestInstance {
             load_ms: 1.5,
             warmup_ms: None,
             reused_model: reused,
+            notice: (req.param("test", "notice") == Some(Value::Bool(true)))
+                .then(|| "the chosen engine cannot run; using another".to_string()),
         })
     }
 
@@ -294,7 +296,7 @@ fn load(vt: &obc_module_vtable, instance: *mut obc_instance) -> (obc_status, obc
 
 #[test]
 fn abi_version_is_packed() {
-    assert_eq!(obc_module_abi_version(), obc_module_abi_pack(1, 4));
+    assert_eq!(obc_module_abi_version(), obc_module_abi_pack(1, 5));
     assert_eq!(obc_module_abi_major(obc_module_abi_version()), 1);
     let vt = vtable();
     assert_eq!(vt.struct_size as usize, size_of::<obc_module_vtable>());
@@ -818,6 +820,78 @@ fn unsupported_requests_fail_with_the_module_reason() {
         text(unsafe { vt.instance_last_error.unwrap()(instance) }),
         "host NV12 only"
     );
+    // SAFETY: destroyed once.
+    unsafe {
+        vt.instance_destroy.unwrap()(instance);
+        vt.destroy.unwrap()(module);
+    }
+}
+
+/// Loads the `test` stage with the boolean load-time parameter `key` set,
+/// for the frames of [`load`], into `report` (its `struct_size` as the
+/// caller set it).
+fn load_into(
+    vt: &obc_module_vtable,
+    instance: *mut obc_instance,
+    key: &CStr,
+    report: &mut obc_load_report,
+) -> obc_status {
+    let stages = [c"test".as_ptr()];
+    let params = [obc_param {
+        stage: c"test".as_ptr(),
+        key: key.as_ptr(),
+        value: obc_value::from_bool(true),
+    }];
+    let mut req = obc_chain_request::empty();
+    req.stages = stages.as_ptr();
+    req.n_stages = 1;
+    req.input_kind = OBC_FRAME_HOST;
+    req.input_format = OBC_FORMAT_NV12;
+    req.input_width = 4;
+    req.input_height = 2;
+    req.output_format = OBC_FORMAT_NV12;
+    req.output_width = 4;
+    req.output_height = 2;
+    req.matrix = OBC_MATRIX_BT601;
+    req.chroma_siting = OBC_CHROMA_SITING_MPEG2;
+    req.params = params.as_ptr();
+    req.n_params = 1;
+    // SAFETY: everything lives across the call.
+    unsafe { vt.instance_load.unwrap()(instance, &req, report) }
+}
+
+/// A load's notice (ABI 1.5) reaches a host whose report has room for it,
+/// until the next load; a host of ABI 1.4 (the report of 1.0's size) is
+/// served as before, its memory past the report never written.
+#[test]
+fn a_notice_is_written_only_when_the_report_has_room_for_it() {
+    let vt = vtable();
+    let module = init(vt, c"{}");
+    let instance = create(vt, module);
+
+    let mut report = obc_load_report::empty();
+    assert_eq!(load_into(vt, instance, c"notice", &mut report), OBC_OK);
+    assert!(!report.notice.is_null());
+    assert_eq!(
+        text(report.notice),
+        "the chosen engine cannot run; using another"
+    );
+    // A load without one says so with null.
+    let mut report = obc_load_report::empty();
+    report.notice = c"stale".as_ptr();
+    assert_eq!(load_into(vt, instance, c"plain", &mut report), OBC_OK);
+    assert!(report.notice.is_null());
+
+    // A host of ABI 1.4: the notice would lie past its structure.
+    let sentinel = c"the host's own memory";
+    let mut report = obc_load_report::empty();
+    report.struct_size = OBC_LOAD_REPORT_SIZE_1_0;
+    report.notice = sentinel.as_ptr();
+    assert_eq!(load_into(vt, instance, c"notice", &mut report), OBC_OK);
+    assert_eq!(report.struct_size, OBC_LOAD_REPORT_SIZE_1_0);
+    assert_eq!(report.load_ms, 1.5);
+    assert_eq!(report.notice, sentinel.as_ptr(), "never written");
+
     // SAFETY: destroyed once.
     unsafe {
         vt.instance_destroy.unwrap()(instance);

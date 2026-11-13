@@ -3,7 +3,7 @@ name = "obc-module-abi"
 description = "The versioned C ABI of omarchy-broadcast modules: #[repr(C)] types, constants and the generated C header"
 # Versioned with the module ABI (OBC_MODULE_ABI_MAJOR.MINOR), not with the
 # workspace: modules built outside the repository pin it.
-version = "1.4.0"
+version = "1.5.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

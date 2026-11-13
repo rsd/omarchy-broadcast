@@ -31,8 +31,10 @@
  *   entry `instance_status_values`.
  * * 1.4 adds the per-frame background: the vtable entry
  *   `instance_set_background` (see the crate documentation).
+ * * 1.5 adds the load's notice: `obc_load_report::notice`, the first
+ *   field appended to a structure (`OBC_LOAD_REPORT_SIZE_1_0`).
  */
-#define OBC_MODULE_ABI_MINOR 4
+#define OBC_MODULE_ABI_MINOR 5
 
 /**
  * The packed ABI version this crate describes: `major << 16 | minor`
@@ -75,6 +77,13 @@
  * The most planes a frame has.
  */
 #define OBC_MAX_PLANES 4
+
+/**
+ * `sizeof(obc_load_report)` in ABI 1.0 to 1.4, before
+ * `obc_load_report::notice` was appended: the smallest `struct_size` a
+ * reader accepts.
+ */
+#define OBC_LOAD_REPORT_SIZE_1_0 16
 
 /**
  * A bit of `obc_audio_buffer::flags`: this is the first block of a new
@@ -407,7 +416,10 @@ typedef struct obc_chain_request {
 
 /**
  * What `instance_load` reports. The host sets `struct_size` and zeroes the
- * rest; the module fills in the fields that fit in `struct_size`.
+ * rest; the module fills in the fields that fit in `struct_size`. A host of
+ * ABI 1.4 or older passes `OBC_LOAD_REPORT_SIZE_1_0`, so a module never
+ * writes `notice` for it; a module of ABI 1.4 or older never writes it, so
+ * the host reads the null it set.
  */
 typedef struct obc_load_report {
     /**
@@ -432,6 +444,14 @@ typedef struct obc_load_report {
      * Zero.
      */
     uint8_t reserved0[3];
+    /**
+     * Since ABI 1.5, written only when it fits in `struct_size`: what the
+     * user should know of a load that succeeded, as one line of text (an
+     * engine chosen in the settings that could not run, and the one the
+     * chain runs on in its place), or null for nothing. NUL-terminated,
+     * owned by the instance and valid until the next call on it.
+     */
+    const char *notice;
 } obc_load_report;
 
 /**

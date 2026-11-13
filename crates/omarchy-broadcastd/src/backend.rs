@@ -308,6 +308,11 @@ pub struct EffectReport {
     /// (`EffectStats::switch_error`): the previous setting keeps running,
     /// the effect is not failed. `None` while there is none.
     pub switch_error: Option<String>,
+    /// What the effect element's module said of the load in force, which
+    /// succeeded (a module's notice, ABI 1.5: an engine chosen in its
+    /// settings that cannot run, and the one it runs on instead), as it
+    /// words it (`EffectStats::load_notice`). `None` while there is none.
+    pub load_notice: Option<String>,
     /// The status values the stages report after the last frame they
     /// processed (a module of ABI 1.3: auto-frame's zoom), the chains'
     /// first, then the effect element's; empty when none reports.

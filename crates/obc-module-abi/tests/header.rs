@@ -119,6 +119,11 @@ fn layout_checks() -> String {
         "reused_model",
         offset_of!(obc_load_report, reused_model),
     );
+    offset(
+        "obc_load_report",
+        "notice",
+        offset_of!(obc_load_report, notice),
+    );
     offset("obc_timing", "ms", offset_of!(obc_timing, ms));
     offset(
         "obc_status_value",

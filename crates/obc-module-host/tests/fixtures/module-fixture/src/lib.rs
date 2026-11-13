@@ -47,6 +47,10 @@
 //! of the size of 1.4, its `instance_set_background` set: the host must
 //! never call it.
 //!
+//! A load with the string parameter `alpha`/`notice` reports it as the
+//! load's notice (ABI 1.5). With `abi-1-4` it is exported as one of ABI
+//! 1.4: the host must not read the notice the SDK writes for it.
+//!
 //! While `alpha` is loaded, the status values (ABI 1.3) report
 //! `alpha`/`step`, its step, and `alpha`/`frames`, the frames processed
 //! since the load; none otherwise.
@@ -338,6 +342,11 @@ mod module {
                 load_ms: 1.5,
                 warmup_ms: Some(0.5),
                 reused_model: reused,
+                // A notice of the load (ABI 1.5), when told one.
+                notice: req
+                    .param("alpha", "notice")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
             })
         }
 
@@ -581,6 +590,7 @@ mod module {
         feature = "abi-1-1",
         feature = "abi-1-2",
         feature = "abi-1-3",
+        feature = "abi-1-4",
         feature = "raw-status-values",
         feature = "audio"
     )))]
@@ -701,16 +711,18 @@ mod module {
     #[cfg(feature = "audio")]
     obc_module_sdk::export_module!(Fixture, audio);
 
-    /// The exports of `export_module!`, claiming ABI 1.0 (or 1.1, 1.2 or
-    /// 1.3), with a vtable of that version's size: it ends before the audio
-    /// entries of 1.2 (1.0 and 1.1), or before the status values of 1.3
-    /// (1.2). The 1.3 vtable is the whole of 1.4's, with the per-frame
-    /// background of 1.4 set, which the host must ignore by the version.
+    /// The exports of `export_module!`, claiming ABI 1.0 (or 1.1, 1.2, 1.3
+    /// or 1.4), with a vtable of that version's size: it ends before the
+    /// audio entries of 1.2 (1.0 and 1.1), or before the status values of
+    /// 1.3 (1.2). The 1.3 vtable is the whole of 1.4's, with the per-frame
+    /// background of 1.4 set, which the host must ignore by the version;
+    /// 1.4's is the whole vtable (1.5 added none).
     #[cfg(any(
         feature = "abi-1-0",
         feature = "abi-1-1",
         feature = "abi-1-2",
-        feature = "abi-1-3"
+        feature = "abi-1-3",
+        feature = "abi-1-4"
     ))]
     mod abi_1_0 {
         use obc_module_sdk::abi::{obc_host, obc_module_abi_pack, obc_module_vtable};
@@ -722,8 +734,10 @@ mod module {
             1
         } else if cfg!(feature = "abi-1-2") {
             2
-        } else {
+        } else if cfg!(feature = "abi-1-3") {
             3
+        } else {
+            4
         };
 
         /// The size of the vtable of that version.
@@ -735,14 +749,14 @@ mod module {
             size_of::<obc_module_vtable>() as u32
         };
 
-        /// ABI 1.0, 1.1, 1.2 or 1.3.
+        /// ABI 1.0, 1.1, 1.2, 1.3 or 1.4.
         #[unsafe(no_mangle)]
         pub extern "C" fn obc_module_abi_version() -> u32 {
             obc_module_abi_pack(1, MINOR)
         }
 
-        /// The SDK's entry point, with a vtable that says 1.0, 1.1, 1.2 or
-        /// 1.3.
+        /// The SDK's entry point, with a vtable that says 1.0, 1.1, 1.2,
+        /// 1.3 or 1.4.
         ///
         /// # Safety
         ///

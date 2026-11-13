@@ -14,14 +14,23 @@
 //! it from the module's check log:
 //!
 //! * a build without CUDA (the CPU wheel): `auto` runs on the CPU, and an
-//!   explicit `cuda` fails the load with "not in this ONNX Runtime build";
+//!   explicit `cuda` still loads, on a later engine of the automatic order
+//!   (never one before it), with a notice "NVIDIA CUDA was chosen and
+//!   cannot run: ... not in this ONNX Runtime build; using <engine>";
 //! * a build with CUDA and `CUDA_VISIBLE_DEVICES=""`: the CUDA and TensorRT
 //!   engines are reported unavailable with a reason, `auto` falls to the
-//!   CPU and the blur still works, and an explicit `cuda` fails the load;
+//!   CPU and the blur still works, and an explicit `cuda` loads on a later
+//!   engine with the same kind of notice;
 //! * a build with CUDA and a GPU: `auto` picks TensorRT or CUDA: CUDA when
 //!   TensorRT cannot start (TensorRT's libraries off the library path, as
 //!   when only the provider's `RUNPATH` finds them), with TensorRT's reason
-//!   logged.
+//!   logged; an explicit `cuda` runs on CUDA, with no notice.
+//!
+//! An explicit `openvino-npu` the build lacks loads on a later engine
+//! (OpenVINO GPU or CPU, or the CPU) with the notice, and never on
+//! TensorRT or CUDA; where the build has it, a load without a notice runs
+//! on it (a notice, from a machine without the device, is accepted and
+//! printed).
 //!
 //! One test: the module's log callback is process-wide, so the steps that
 //! read it run in order.
@@ -63,6 +72,57 @@ fn ran_on(lines: &[String]) -> String {
         .find_map(|l| l.split(" runs on ").nth(1))
         .map(|rest| rest.split([',', '(']).next().unwrap().trim().to_string())
         .unwrap_or_else(|| panic!("no engine line in {lines:#?}"))
+}
+
+/// Loads a blur chain with `engine` chosen explicitly and checks the
+/// outcome against `can_run` (`Some(true)`: the engine must run, with no
+/// notice; `Some(false)`: the load must succeed on another engine, with the
+/// notice; `None`: either, consistently). `later` are the labels of the
+/// engines after the chosen one in the automatic order. Returns the
+/// notice.
+fn load_explicit(
+    inst: &mut obc_module_host::Instance,
+    log: &Log,
+    engine: &str,
+    label: &str,
+    later: &[&str],
+    can_run: Option<bool>,
+) -> Option<String> {
+    log.take();
+    let report = inst
+        .load(&host_chain(
+            W as u32,
+            H as u32,
+            &[("mode", "blur"), ("engine", engine)],
+            None,
+        ))
+        .unwrap_or_else(|e| panic!("engine={engine} refused the load: {e:?}"));
+    let lines = log.take();
+    let used = ran_on(&lines);
+    eprintln!("engine={engine}: ran on {used}; notice {:?}", report.notice);
+    match &report.notice {
+        Some(notice) => {
+            assert_ne!(can_run, Some(true), "{label} can run: {notice}");
+            assert!(
+                notice.starts_with(&format!("{label} was chosen and cannot run: ")),
+                "{notice}"
+            );
+            assert!(notice.ends_with(&format!("; using {used}")), "{notice}");
+            assert!(
+                later.contains(&used.as_str()),
+                "{label} fell to {used}, not one of {later:?}"
+            );
+            assert!(
+                lines.iter().any(|l| l.contains(notice.as_str())),
+                "the notice is logged: {lines:#?}"
+            );
+        }
+        None => {
+            assert_ne!(can_run, Some(false), "{label} cannot run, yet no notice");
+            assert_eq!(used, label, "{lines:#?}");
+        }
+    }
+    report.notice
 }
 
 /// Runs `frame` through `module`'s instance into a copy; returns the copy.
@@ -190,7 +250,13 @@ fn with_onnx_runtime_and_the_models() {
             eprintln!("{why}");
         }
     } else {
-        assert_eq!(engine, "CPU", "{lines:#?}");
+        if npu_in_build {
+            // A build with OpenVINO: `auto` falls to it, not to the NVIDIA
+            // engines, when they are out.
+            assert!(!engine.starts_with("NVIDIA"), "{lines:#?}");
+        } else {
+            assert_eq!(engine, "CPU", "{lines:#?}");
+        }
         if eng.cuda_in_build {
             // The hidden GPU: both NVIDIA engines refused, with a reason.
             assert!(
@@ -284,31 +350,28 @@ fn with_onnx_runtime_and_the_models() {
     let out = run(&mut inst, &frame, 0);
     assert!((share(&out, 126) - grey).abs() < 0.02 && share(&out, 60) < 0.01);
 
-    // A failed switch keeps the previous chain running: an engine this
-    // build lacks fails the load, and the replace chain still runs.
+    // A switch to an engine this build lacks does not fail: it loads on a
+    // later engine, with a notice, and the new chain runs.
     if !npu_in_build {
-        let e = inst
-            .load(&host_chain(
-                W as u32,
-                H as u32,
-                &[("mode", "blur"), ("engine", "openvino-npu")],
-                None,
-            ))
-            .unwrap_err();
+        let notice = load_explicit(
+            &mut inst,
+            &log,
+            "openvino-npu",
+            "OpenVINO NPU",
+            &["OpenVINO GPU", "OpenVINO on the CPU", "CPU"],
+            Some(false),
+        )
+        .unwrap();
         assert!(
-            e.message.contains("not in this ONNX Runtime build"),
-            "{e:?}"
+            notice.contains("not in this ONNX Runtime build"),
+            "{notice}"
         );
-        assert!(inst.is_loaded(), "a failed switch unloaded the instance");
+        assert!(inst.is_loaded());
         let out = run(&mut inst, &frame, 0);
-        let still = (0..H)
-            .flat_map(|y| (0..W).map(move |x| (x, y)))
-            .filter(|&(x, y)| (i32::from(out.y(x, y)) - 126).abs() <= 1)
-            .count() as f64
-            / (W * H) as f64;
+        let k = kept(&frame, &out);
         assert!(
-            still > 0.03,
-            "the previous (replace) chain runs after the failed switch: {still}"
+            (0.03..0.97).contains(&k),
+            "the blur chain runs after the switch: {k}"
         );
     }
 
@@ -416,48 +479,62 @@ fn with_onnx_runtime_and_the_models() {
         }
     }
 
-    // An explicit engine that cannot run fails the load, with its reason,
-    // and nothing falls back.
-    if !eng.cuda_in_build || eng.cuda_hidden {
-        let e = inst
-            .load(&host_chain(
-                W as u32,
-                H as u32,
-                &[("mode", "blur"), ("engine", "cuda")],
-                None,
-            ))
-            .unwrap_err();
-        eprintln!("engine=cuda: {}", e.message);
-        assert!(
-            e.message
-                .starts_with("NVIDIA CUDA was chosen and cannot run: "),
-            "{}",
-            e.message
+    // An explicit engine that cannot run does not fail the load: it runs on
+    // a later engine of the automatic order, and the notice says why.
+    let cuda_later = ["OpenVINO NPU", "OpenVINO GPU", "OpenVINO on the CPU", "CPU"];
+    if eng.cuda_in_build && !eng.cuda_hidden {
+        let notice = load_explicit(
+            &mut inst,
+            &log,
+            "cuda",
+            "NVIDIA CUDA",
+            &cuda_later,
+            Some(true),
         );
-        if eng.cuda_in_build {
-            assert!(e.message.contains("CUDA not available"), "{}", e.message);
+        assert_eq!(notice, None);
+    } else {
+        let notice = load_explicit(
+            &mut inst,
+            &log,
+            "cuda",
+            "NVIDIA CUDA",
+            &cuda_later,
+            Some(false),
+        )
+        .unwrap();
+        let why = if eng.cuda_in_build {
+            "CUDA not available"
         } else {
-            assert!(
-                e.message.contains("not in this ONNX Runtime build"),
-                "{}",
-                e.message
-            );
-        }
+            "not in this ONNX Runtime build"
+        };
+        assert!(notice.contains(why), "{notice}");
+        assert!(!notice.contains("; using NVIDIA"), "{notice}");
     }
-    log.take();
-    if !npu_in_build {
-        let e = inst
-            .load(&host_chain(
-                W as u32,
-                H as u32,
-                &[("mode", "blur"), ("engine", "openvino-npu")],
-                None,
-            ))
-            .unwrap_err();
+    let npu_later = ["OpenVINO GPU", "OpenVINO on the CPU", "CPU"];
+    if npu_in_build {
+        // Whether the device is there is not known from the build alone:
+        // no notice means it ran on the NPU; a notice is checked as above.
+        load_explicit(
+            &mut inst,
+            &log,
+            "openvino-npu",
+            "OpenVINO NPU",
+            &npu_later,
+            None,
+        );
+    } else {
+        let notice = load_explicit(
+            &mut inst,
+            &log,
+            "openvino-npu",
+            "OpenVINO NPU",
+            &npu_later,
+            Some(false),
+        )
+        .unwrap();
         assert!(
-            e.message.contains("not in this ONNX Runtime build"),
-            "{}",
-            e.message
+            notice.contains("not in this ONNX Runtime build"),
+            "{notice}"
         );
     }
     inst.unload();

@@ -117,6 +117,7 @@ fn load_report(o: LoadOutcome) -> LoadReport {
         load_ms: f64::from(o.load_ms),
         warmup_ms: o.warmup_ms.map(f64::from),
         reused_model: o.reused_model,
+        notice: o.notice,
     }
 }
 

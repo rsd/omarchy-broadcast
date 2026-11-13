@@ -36,9 +36,10 @@
 //!   structure, and padding is spelled out as `reserved` fields that must be
 //!   zero, so a reader can tell which fields are present from
 //!   `struct_size` alone. A reader accepts any `struct_size` at least the
-//!   structure's size in ABI 1.0 (its size in this version: nothing has been
-//!   appended yet), larger or smaller than its own, and reads a field only
-//!   when it fits in `struct_size`; it rejects a smaller one
+//!   structure's size in ABI 1.0 (its size in this version unless its
+//!   documentation names a field appended since, as [`obc_load_report`]'s
+//!   `notice` of ABI 1.5), larger or smaller than its own, and reads a
+//!   field only when it fits in `struct_size`; it rejects a smaller one
 //!   ([`OBC_ERR_INVALID`]). A writer writes only the fields that fit in the
 //!   reader's `struct_size` when the reader set it (an output structure).
 //! * A boolean is a `uint8_t`, 0 for false and 1 for true; a reader takes
@@ -160,7 +161,9 @@ pub const OBC_MODULE_ABI_MAJOR: u32 = 1;
 ///   entry `instance_status_values`.
 /// * 1.4 adds the per-frame background: the vtable entry
 ///   `instance_set_background` (see the crate documentation).
-pub const OBC_MODULE_ABI_MINOR: u32 = 4;
+/// * 1.5 adds the load's notice: [`obc_load_report::notice`], the first
+///   field appended to a structure ([`OBC_LOAD_REPORT_SIZE_1_0`]).
+pub const OBC_MODULE_ABI_MINOR: u32 = 5;
 
 /// The packed ABI version this crate describes: `major << 16 | minor`
 /// ([`obc_module_abi_pack`]).
@@ -604,10 +607,18 @@ pub struct obc_chain_request {
     pub background: *const obc_frame,
 }
 
+/// `sizeof(obc_load_report)` in ABI 1.0 to 1.4, before
+/// [`obc_load_report::notice`] was appended: the smallest `struct_size` a
+/// reader accepts.
+pub const OBC_LOAD_REPORT_SIZE_1_0: u32 = 16;
+
 /// What `instance_load` reports. The host sets `struct_size` and zeroes the
-/// rest; the module fills in the fields that fit in `struct_size`.
+/// rest; the module fills in the fields that fit in `struct_size`. A host of
+/// ABI 1.4 or older passes [`OBC_LOAD_REPORT_SIZE_1_0`], so a module never
+/// writes `notice` for it; a module of ABI 1.4 or older never writes it, so
+/// the host reads the null it set.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct obc_load_report {
     /// `sizeof(obc_load_report)` as the host was built.
     pub struct_size: u32,
@@ -621,6 +632,12 @@ pub struct obc_load_report {
     pub reused_model: u8,
     /// Zero.
     pub reserved0: [u8; 3],
+    /// Since ABI 1.5, written only when it fits in `struct_size`: what the
+    /// user should know of a load that succeeded, as one line of text (an
+    /// engine chosen in the settings that could not run, and the one the
+    /// chain runs on in its place), or null for nothing. NUL-terminated,
+    /// owned by the instance and valid until the next call on it.
+    pub notice: *const c_char,
 }
 
 /// How long one step of the last processed frame took.
@@ -1076,6 +1093,21 @@ impl obc_load_report {
             warmup_ms: -1.0,
             reused_model: 0,
             reserved0: [0; 3],
+            notice: std::ptr::null(),
+        }
+    }
+}
+
+impl Default for obc_load_report {
+    /// Every field zero (`struct_size` included) and no notice.
+    fn default() -> Self {
+        obc_load_report {
+            struct_size: 0,
+            load_ms: 0.0,
+            warmup_ms: 0.0,
+            reused_model: 0,
+            reserved0: [0; 3],
+            notice: std::ptr::null(),
         }
     }
 }
@@ -1165,8 +1197,8 @@ mod tests {
 
     #[test]
     fn version_packing() {
-        assert_eq!(OBC_MODULE_ABI_VERSION, 0x0001_0004);
-        assert_eq!(obc_module_abi_pack(1, 4), OBC_MODULE_ABI_VERSION);
+        assert_eq!(OBC_MODULE_ABI_VERSION, 0x0001_0005);
+        assert_eq!(obc_module_abi_pack(1, 5), OBC_MODULE_ABI_VERSION);
         assert_eq!(obc_module_abi_pack(2, 7), 0x0002_0007);
         assert_eq!(obc_module_abi_major(0x0002_0007), 2);
         assert_eq!(obc_module_abi_minor(0x0002_0007), 7);
@@ -1315,13 +1347,19 @@ mod tests {
 
         assert_eq!(
             (size_of::<obc_load_report>(), align_of::<obc_load_report>()),
-            (16, 4)
+            (24, 8)
         );
         assert_eq!(offset_of!(obc_load_report, struct_size), 0);
         assert_eq!(offset_of!(obc_load_report, load_ms), 4);
         assert_eq!(offset_of!(obc_load_report, warmup_ms), 8);
         assert_eq!(offset_of!(obc_load_report, reused_model), 12);
         assert_eq!(offset_of!(obc_load_report, reserved0), 13);
+        // Appended in 1.5, after the whole of the 1.0 structure.
+        assert_eq!(offset_of!(obc_load_report, notice), 16);
+        assert_eq!(
+            OBC_LOAD_REPORT_SIZE_1_0 as usize,
+            offset_of!(obc_load_report, notice)
+        );
 
         assert_eq!((size_of::<obc_timing>(), align_of::<obc_timing>()), (16, 8));
         assert_eq!(offset_of!(obc_timing, step), 0);

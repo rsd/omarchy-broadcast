@@ -2745,6 +2745,7 @@ impl InferenceBackend for MaxineBackend {
                     load_ms: ms_since(t0) - c.warmup_ms.unwrap_or(0.0),
                     warmup_ms: c.warmup_ms,
                     reused_model: reuse && !c.loaded_model,
+                    notice: None,
                 })
             }
             Err(e) => {

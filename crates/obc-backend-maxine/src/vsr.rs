@@ -344,6 +344,7 @@ impl MaxineVsr {
             load_ms: ms_since(t),
             warmup_ms: None,
             reused_model: false,
+            notice: None,
         })
     }
 

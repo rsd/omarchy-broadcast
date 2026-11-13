@@ -10,10 +10,10 @@ use std::ptr;
 use std::sync::Mutex;
 
 use obc_module_abi::{
-    OBC_ERR_PANIC, OBC_MODULE_ABI_MAJOR, OBC_MODULE_ABI_VERSION, OBC_OK, obc_audio_buffer,
-    obc_audio_load_report, obc_audio_request, obc_chain_request, obc_frame, obc_host, obc_instance,
-    obc_load_report, obc_module, obc_module_abi_major, obc_module_vtable, obc_param, obc_status,
-    obc_status_value, obc_timing,
+    OBC_ERR_PANIC, OBC_LOAD_REPORT_SIZE_1_0, OBC_MODULE_ABI_MAJOR, OBC_MODULE_ABI_VERSION, OBC_OK,
+    obc_audio_buffer, obc_audio_load_report, obc_audio_request, obc_chain_request, obc_frame,
+    obc_host, obc_instance, obc_load_report, obc_module, obc_module_abi_major, obc_module_vtable,
+    obc_param, obc_status, obc_status_value, obc_timing,
 };
 
 use crate::audio::{AudioLoaded, buffers};
@@ -22,6 +22,10 @@ use crate::{
     AudioInstance, AudioRequest, ChainFrames, ChainRequest, Error, ErrorKind, Frame, Instance,
     Module, Param, PixelFormat,
 };
+
+/// The `struct_size` of a load report that has room for `notice` (ABI 1.5).
+const NOTICE_END: usize =
+    std::mem::offset_of!(obc_load_report, notice) + size_of::<*const c_char>();
 
 thread_local! {
     /// The error of the last call made with a null object, or of the last
@@ -110,6 +114,9 @@ struct InstanceBox<I> {
     audio: Option<AudioLoaded>,
     error: CString,
     dropped: CString,
+    /// The notice of the last successful load
+    /// ([`crate::LoadReport::notice`]), alive until the next one.
+    notice: CString,
     timing_steps: Vec<CString>,
     timings: Vec<obc_timing>,
     /// The strings and entries of the last `instance_status_values`.
@@ -308,6 +315,7 @@ unsafe extern "C" fn module_instance_create<M: Module>(
                     audio: None,
                     error: CString::default(),
                     dropped: CString::default(),
+                    notice: CString::default(),
                     timing_steps: Vec::new(),
                     timings: Vec::new(),
                     value_names: Vec::new(),
@@ -362,13 +370,15 @@ unsafe extern "C" fn instance_load<I: Instance>(
             }
             // SAFETY: non-null; only the first field is read before the
             // size is known.
+            // A host of ABI 1.4 or older passes the report without
+            // `notice` (ABI 1.5): accepted, and the notice is not written.
             let report_size = unsafe { (*out_report).struct_size } as usize;
-            if report_size < size_of::<obc_load_report>() {
+            if report_size < OBC_LOAD_REPORT_SIZE_1_0 as usize {
                 return Err(Error::invalid(format!(
-                    "load report struct_size {report_size} is smaller than {}",
-                    size_of::<obc_load_report>()
+                    "load report struct_size {report_size} is smaller than {OBC_LOAD_REPORT_SIZE_1_0}"
                 )));
             }
+            let has_notice = report_size >= NOTICE_END;
             // SAFETY: by the ABI contract, valid during the call.
             let req = unsafe { ChainRequest::from_ptr(request) }?;
             frames = Some(req.frames());
@@ -381,6 +391,17 @@ unsafe extern "C" fn instance_load<I: Instance>(
                         (*out_report).load_ms = report.load_ms;
                         (*out_report).warmup_ms = report.warmup_ms.unwrap_or(-1.0);
                         (*out_report).reused_model = u8::from(report.reused_model);
+                    }
+                    if has_notice {
+                        b.notice = report.notice.as_deref().map(c_string).unwrap_or_default();
+                        let notice = if report.notice.is_some() {
+                            b.notice.as_ptr()
+                        } else {
+                            ptr::null()
+                        };
+                        // SAFETY: as above, `notice` fits in `struct_size`;
+                        // the string lives until the next load replaces it.
+                        unsafe { (*out_report).notice = notice };
                     }
                     Ok(())
                 }

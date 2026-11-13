@@ -802,6 +802,7 @@ impl Instance for ArInstance {
             load_ms: start.elapsed().as_secs_f32() * 1000.0,
             warmup_ms: None,
             reused_model: reused,
+            notice: None,
         };
         self.replay = false;
         if wanted.eye.is_none() && wanted.auto.is_none() {

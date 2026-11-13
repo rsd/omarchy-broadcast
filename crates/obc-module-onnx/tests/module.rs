@@ -185,8 +185,9 @@ fn a_bad_configuration_makes_the_module_unavailable() {
 
 /// With `_host.cuda = false` the module makes no CUDA call: `auto` skips
 /// TensorRT and CUDA with the reason, an explicit `cuda` or `tensorrt`
-/// fails the load with it, and the CPU runs. Needs the runtime and models
-/// of the environment (`ORT_DYLIB_PATH`, `OBC_ONNX_MODEL_DIR`).
+/// falls back to an engine after them (OpenVINO or the CPU) with a notice
+/// that gives the reason. Needs the runtime and models of the environment
+/// (`ORT_DYLIB_PATH`, `OBC_ONNX_MODEL_DIR`).
 #[test]
 fn with_cuda_off_in_the_host_configuration_no_cuda_engine_is_tried() {
     const OFF: &str = "CUDA is off: the video pipeline runs in system memory";
@@ -212,17 +213,28 @@ fn with_cuda_off_in_the_host_configuration_no_cuda_engine_is_tried() {
         assert!(line.contains(OFF), "{line}");
     }
     let mut inst = module.create_instance().unwrap();
-    for engine in ["cuda", "tensorrt"] {
-        let e = inst
+    for (engine, label) in [("cuda", "NVIDIA CUDA"), ("tensorrt", "NVIDIA TensorRT")] {
+        log.take();
+        let report = inst
             .load(&common::host_chain(
                 1280,
                 720,
                 &[("mode", "blur"), ("engine", engine)],
                 None,
             ))
-            .unwrap_err();
-        assert!(e.message.contains(OFF), "{engine}: {e:?}");
-        assert!(!inst.is_loaded());
+            .unwrap();
+        let notice = report.notice.unwrap_or_default();
+        assert!(
+            notice.starts_with(&format!("{label} was chosen and cannot run: {OFF}; using ")),
+            "{engine}: {notice}"
+        );
+        assert!(!notice.ends_with("using NVIDIA CUDA"), "{notice}");
+        assert!(inst.is_loaded());
+        let lines = log.take();
+        assert!(
+            lines.iter().all(|l| !l.contains("runs on NVIDIA")),
+            "{lines:#?}"
+        );
     }
     log.take();
     inst.load(&common::host_chain(

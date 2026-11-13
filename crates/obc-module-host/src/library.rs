@@ -520,19 +520,20 @@ mod tests {
         assert_eq!(check_abi_version(OBC_MODULE_ABI_VERSION), Ok(()));
         let e = check_abi_version(obc_module_abi_pack(2, 0)).unwrap_err();
         assert!(
-            e.contains("module ABI 2.0") && e.contains("module ABI 1.4"),
+            e.contains("module ABI 2.0") && e.contains("module ABI 1.5"),
             "{e}"
         );
         let e = check_abi_version(obc_module_abi_pack(0, 9)).unwrap_err();
         assert!(e.contains("0.9"), "{e}");
         let e = check_abi_version(obc_module_abi_pack(1, 7)).unwrap_err();
-        assert!(e.contains("1.7, newer than") && e.contains("1.4"), "{e}");
-        // A library built for ABI 1.0, 1.1, 1.2, 1.3 or 1.4 loads.
+        assert!(e.contains("1.7, newer than") && e.contains("1.5"), "{e}");
+        // A library built for ABI 1.0 to 1.5 loads.
         assert_eq!(check_abi_version(obc_module_abi_pack(1, 0)), Ok(()));
         assert_eq!(check_abi_version(obc_module_abi_pack(1, 1)), Ok(()));
         assert_eq!(check_abi_version(obc_module_abi_pack(1, 2)), Ok(()));
         assert_eq!(check_abi_version(obc_module_abi_pack(1, 3)), Ok(()));
         assert_eq!(check_abi_version(obc_module_abi_pack(1, 4)), Ok(()));
+        assert_eq!(check_abi_version(obc_module_abi_pack(1, 5)), Ok(()));
     }
 
     #[test]
