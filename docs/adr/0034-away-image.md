@@ -1,0 +1,90 @@
+# ADR-0034: The away image: one still image, shown in place of black where there is no camera picture, behind two switches
+
+- **Status:** Accepted (2026-11-13), implemented in daemon 0.42.0 (`crates/obc-core`, `crates/obc-pipeline`, `crates/gst-obc`, `crates/obc-ipc`, `crates/omarchy-broadcastd`, `crates/omarchy-broadcast`), D-Bus revision 17. Amends [ADR-0027](0027-output-modes-frame-generation-and-privacy-fallback.md) (the privacy fallback image becomes the away image, and is also shown where there is no camera picture) and [ADR-0022](0022-crash-recovery-for-consumers.md) (the crash cover can show it). Builds on [ADR-0010](0010-phase-locked-output-clock.md) (the output clock and its placeholder), [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md) (the persistent writer, its placeholder and its hold), [ADR-0012](0012-video-effects-and-maxine-backend.md) (the effect element and its privacy rules), [ADR-0026](0026-config-d-and-managed-config.md) (the daemon never writes `config.toml`; the panel's choices go to `config.d/50-panel.toml`), [ADR-0032](0032-background-gallery.md) (the gallery and its kind `away`) and [ADR-0033](0033-system-memory-pipeline.md) (the system-memory path). Reference: [../dbus-api.md](../dbus-api.md#the-away-image-revision-17), [../cli-json.md](../cli-json.md#media), [../config.example.toml](../config.example.toml).
+
+## Context
+- Whatever the camera cannot show, the virtual camera shows black: the camera turned off, an idle camera, a start before its first frame, a session that cannot start, an input gap and, while the daemon is down, the crash cover. In a call, black looks like a fault. A user who turns the camera off on purpose, or whose camera is starting, has no way to say "I am away" with a picture instead.
+- [ADR-0027](0027-output-modes-frame-generation-and-privacy-fallback.md) added a still image for the one case in which the room must not be shown: `[effect] on_failure = "image"` shows `[effect] fallback_image` in place of black when privacy holds the feed. It kept black everywhere else and recorded a placeholder for the camera-off state as a separate decision, with its own setting and rules. This is that decision.
+- The image already exists, with its checks (format from the content, 32 MiB, 8192x8192 pixels, a decoder for the format), its decode off the streaming thread, its reload by file identity and its `Warning` clauses. [ADR-0032](0032-background-gallery.md) already has a gallery kind `away` that no package filled.
+- The privacy rule must stay exactly as it was: an effect that is to hide the camera never shows the room, and what is shown in its place is the user's `on_failure` choice. A second use of the image must not weaken or blur that.
+- A deliberate change by the user (an effect or a stage turned on or off, a session restarted for a module) is not an absence of the camera. Its brief stall already shows the last frame, and replacing that with an image for a fraction of a second would be a flicker the user caused.
+- The effect elements sit after the output clock ([ADR-0012](0012-video-effects-and-maxine-backend.md), [ADR-0027](0027-output-modes-frame-generation-and-privacy-fallback.md)). A placeholder frame that went through them would be blurred, replaced or blacked out like a camera frame, and would count in the effect's statistics.
+- The package may ship only what it may redistribute ([ADR-0032](0032-background-gallery.md)).
+
+## Decision
+**One image and two switches. The image is `[effect] fallback_image`, which is now called the *away image* and is editable. `[effect] on_failure` (privacy) and the new `[output] placeholder` (`black` or `image`, default `black`, live) each decide independently what is shown in their own cases. Under `placeholder = "image"` the away image replaces black wherever there is no camera picture. D-Bus revision 17 adds no member.**
+
+### One image, two switches
+- **Switch 1, `effect.on_failure`** is unchanged ([ADR-0027](0027-output-modes-frame-generation-and-privacy-fallback.md)): with `image` it shows the away image where privacy holds the feed. Its value `black` shows black there, whatever `output.placeholder` says. A privacy refusal (a session refused, a start tried again while privacy holds the feed, an effect that cannot run) follows this switch only.
+- **Switch 2, `output.placeholder`** says what shows where *nothing is to be hidden* and there is no camera picture. `black` is the behaviour of every earlier version. `image` shows the away image there.
+- The two are read separately because they answer different questions: whether the room may be shown, and what to show when there is no room to show. A user can want a black feed under a privacy failure and a card when the camera is off, or the other way round. Choosing an image does not turn the second switch on.
+
+### Where the away image shows (`placeholder = "image"`)
+- **The camera off**, while an application holds the virtual camera.
+- **A start, until the first frame**: from the moment an application holds the virtual camera, through the debounce and `starting`, until the session's first camera frame; and a start tried again.
+- **No session**: no camera, a session refused or failed, `error` where a loopback device exists.
+- **A stuck output.** The writer holds the last forwarded frame through a stall of the session's output for 1 second ([ADR-0011](0011-daemon-lifecycle-and-dbus-api.md), "The hold"); past that the writer's placeholder shows, and it is the away image.
+- **An input gap.** The session output's clock shows its placeholder once the camera has sent nothing for `output.input_gap_ms` (default 500 ms), and after a camera switch once the next camera's first frame has not arrived within `output.hold_timeout_s`.
+- **The crash cover.** The loopback's timeout image ([ADR-0022](0022-crash-recovery-for-consumers.md)) is the away image whenever `placeholder = "image"` and an image is set, whatever the writer's placeholder shows at the time, so a consumer sees it while the daemon is down. It is still never the last camera frame.
+
+### Where it never shows
+- **While a camera picture streams.**
+- **At a user's toggle.** The writer's hold keeps the last frame through the stall of an effect or stage switch, and a session restarted for a module that now provides a selected stage is covered by a restart hold: the writer keeps the last frame across it, for at most 3 seconds, until the new output attaches. A toggle shows neither black nor the away image. **The exception is privacy:** when the running session does not run the background effect that the new one is given under an `on_failure` that hides the camera, the last frame is the room the user now asks to hide, and it is not held.
+- **Under a privacy refusal**, where `on_failure` alone decides (see above).
+
+### Placeholder frames pass through the effect elements untouched
+The output clock marks a placeholder tick that pushes the away image with `PLACEHOLDER_FLAG` (the buffer flag after the repeat flag; module ABI unchanged, the flag is the host's own). The effect element and every module stage pass a marked frame downstream as it came: no backend or chain call, no replace, blur or warm-up black, no cache written or dropped, a pending temporal reset kept for the next camera frame, what was last on screen left as the last camera frame made it, and no count in the effect's statistics. The black placeholder is not marked and runs through them as before.
+
+### No black at the transitions
+- **The writer's placeholder holds the image whenever it is chosen.** Under `placeholder = "image"` with an image set, the writer's placeholder is the away image at all times: also while a session streams and while no application holds the virtual camera. The writer shows its placeholder only where nothing is forwarded and its hold has ended, so this shows nothing more; what it changes is that the image is already decoded when the camera turns off or a session stops, and shows from the first slot without a camera picture, not after a decode started at that moment. The one exception is a privacy hold under `on_failure = "black"`, which makes the placeholder black, set as soon as the session stops for privacy.
+- **A writer starts with it.** The image is given to a writer before it starts, and the writer waits for its decode, for at most 1 second, before its first placeholder: the daemon's start and its restart after a crash show the image from the first frame, while the previous writer's crash cover, which the driver keeps serving until a writer writes, shows it meanwhile. Past the bound the writer starts black and shows the image once decoded.
+- **A session's output leaves its slots to the writer while it decodes.** The session output decodes (and on CUDA uploads) its own copy at its start. Until that is ready its clock pushes nothing on a placeholder tick, instead of black, and the writer's placeholder (the same image) fills the slot. Any output that does not forward to the writer pushes black meanwhile, as before. Under `placeholder = "black"` nothing of this applies.
+
+### A still image, decoded on the CPU, no GPU wake
+The image is a still (PNG, JPEG, still WebP), decoded on the CPU on a thread of its own and cropped to fill the contract's frame; it is never decoded on the streaming thread. The writer, the session output's clock and the crash cover each hold a frame of it, and the same file is decoded once for the writer and the cover. While the camera is off nothing is decoded or uploaded on the GPU and the GPU stays released; a session's output uploads the decoded frame once per start into its own CUDA buffer, or pushes it as decoded in system memory ([ADR-0033](0033-system-memory-pipeline.md)).
+
+### How it is chosen
+- `effect.fallback_image` is an editable `path` row labelled "Away image" (`live`), and `output.placeholder` an `enum` row labelled "When there is no camera picture" (`live`). Both are written to `config.d/50-panel.toml` by `SetConfig` ([ADR-0026](0026-config-d-and-managed-config.md)); a value that a later file sets still wins and the daemon refuses the change, as for every key.
+- `omarchy-broadcast media import away PATH --select` imports the file into the user's gallery and sets `effect.fallback_image` to the stored path. It does **not** switch `output.placeholder`: choosing a picture and deciding to show it are two choices, and a user who only wants the image for privacy keeps black elsewhere. Against a daemon below revision 17 it is refused before anything is imported.
+- The package installs two bundled away images, `camera-off.jpg` and `away-soft.jpg`, made by `scripts/gen-backgrounds.sh` and recorded in `assets/media/away/SOURCES.toml` under the rule of [ADR-0032](0032-background-gallery.md) (the project's own work).
+
+### When the image cannot be shown
+Black is shown, with a `Warning`. The two clauses of the image's absence or fault are `output.placeholder is "image" but effect.fallback_image is not set: showing black` and `Away image <path> could not be read (<why>): showing black`. The second replaces the wording "Fallback image" for every report of the image (the writer's placeholder, the session output's clock placeholder and the effect element's own report); it is said once for the file when the writer and the output cannot read it. Since the writer holds the image whenever it is chosen, the clause is said whenever the file cannot be read, also while the camera streams. A decode that does not end within 10 seconds reads `not decoded within 10 s`. The clauses are in the `Warning` after the `on_failure` clause, in the order the daemon builds them; the line stays within 512 bytes.
+
+### Revision 17
+No property, method, signal or error name is added, as in revision 12. The schema gains `output.placeholder`; `effect.fallback_image` becomes editable and is relabelled; `Warning` gains the two clauses. A client built for revision 16 keeps working.
+
+## Consequences
+- A user can leave a picture in place of black when the camera is off, starting or failing, in a call, with one setting and one image.
+- Privacy is unchanged: `on_failure` governs every case in which the room might be shown, and the new switch cannot override it. A toggle never shows the away image, and only privacy limits that rule.
+- The effect elements need no knowledge of the image beyond the flag: no effect can alter it, and a module stage never sees it.
+- The crash cover can show a picture instead of black for an outage, which consumers see for as long as the daemon is down.
+- With `placeholder = "black"` (the default) nothing changes for an existing installation.
+- The user's choice is an editable row in the panel, and the CLI selects an image with one command.
+- Two more decodes of a still (the session output's and, shared with the writer, the cover's) happen on the CPU when the image is chosen; they are small and off the streaming thread. The writer decodes its copy at its start, whether or not anyone watches.
+- A session's output that has not decoded its copy yet sends nothing for its placeholder ticks, so its counts have placeholder ticks that were not emitted.
+
+### Known limits
+- **The new session's own placeholder after a module restart.** The restart hold covers only the time no output is attached. Once the new session's output attaches, its clock shows its own placeholder (black, or the away image) from its start until its first camera frame, so a restart for a module can show the away image briefly.
+- **The cover's re-install race.** A change of the cover's image installs it again while the writer streams, with the race window it has at the writer's start ([ADR-0022](0022-crash-recovery-for-consumers.md)): a program that opens the node in that instant gets a descriptor in timeout-image mode and must reopen it.
+- **The `Warning` for the session output's decode.** The session output decodes the file for its clock on its own; when only it cannot read the file, `Warning` says so although the writer's placeholder shows the image, and the clause is said once when both cannot.
+- **An away image changed mid-session.** If the away image changes (or its file is replaced) during a session and an input gap occurs while the session output is still decoding it, the output pushes nothing and the writer holds the last (effect-processed) frame for up to 1 s before its placeholder shows, where it used to show black after about 500 ms.
+- **Stills only.** A video or animated away image is not supported (the same limit as a background).
+
+## Alternatives considered
+
+| Alternative | Why rejected |
+|---|---|
+| **Two images** (a privacy image and an away image) | Two files to choose, two settings to explain, two sets of checks and two decodes for what a user thinks of as one picture. One image with two switches gives the same freedom of when to show it |
+| **A single switch** (the away image shown wherever privacy shows its image) | It would couple "hide the room" with "show a card when the camera is off". A user who wants black for a failing effect and a card for the camera off, or the opposite, could not have it, and a change to the new behaviour would alter what an existing `on_failure = "image"` installation shows |
+| **A pause state** (a state that shows the image while the camera is paused, between `off` and `idle`) | The lifecycle states are fixed ([ADR-0011](0011-daemon-lifecycle-and-dbus-api.md)) and a client treats the set as closed. The cases are the same ones that show black today; a new state would change the interface for what is a rendering choice |
+| **A video away image** | Not needed for the use: a still is decoded once and copied into each frame (as for the fallback image of [ADR-0027](0027-output-modes-frame-generation-and-privacy-fallback.md)). A video would need a per-frame source in the writer, the output and the cover |
+| **Showing the background under `replace` during gaps** | The replace background is the picture of the effect, not of the absence of the camera, and showing it in a gap would suggest the person is there. It also would make the gap's content depend on the effect's state, which the placeholder does not have |
+| **Passing placeholder frames through the effect** | The image would be blurred, replaced or blacked out like a camera frame, would count in the effect's statistics and would clear its temporal state. A flag that the elements pass through untouched keeps the effect stateless with respect to the placeholder |
+| **Showing the away image at a toggle** | A toggle is the user's own action, with the camera on, and the stall is short. The image would flicker in and out for a fraction of a second. The writer's hold already covers it, with the privacy exception |
+| **Switching `output.placeholder` when an away image is selected** | Choosing a file is not deciding to show it; `media import away --select` would change behaviour that the user did not ask to change. The two are two steps, and the CLI and the panel keep them apart |
+
+## What would change this decision
+- A request for different pictures for different cases (the camera off against a failing start): a second image key, and the two switches would become a choice per case.
+- A video or animated away image: a decision for a per-frame source, as for video backgrounds ([ADR-0032](0032-background-gallery.md)).
+- A flicker of the away image seen in practice at a restart for a module: the new output's clock would take over the writer's held frame, or the restart hold would extend to its first camera frame.

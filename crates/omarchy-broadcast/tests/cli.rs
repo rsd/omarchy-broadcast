@@ -1681,6 +1681,7 @@ impl Mock {
                     obc_ipc::ConfigValue::Str(_)
                 )
                 | (obc_ipc::ConfigKind::List, obc_ipc::ConfigValue::List(_))
+                | (obc_ipc::ConfigKind::Path, obc_ipc::ConfigValue::Str(_))
         );
         if !fits {
             return Err(IpcError::InvalidArgument(format!("{key}: wrong type")));
@@ -7215,15 +7216,55 @@ fn media_import_and_remove_change_the_gallery() {
     let out = bus.run(&["media", "--json"]);
     assert_eq!(json_lines(&out.stdout)[0]["serial"], 4);
 
-    // --select is for backgrounds only: a usage error, nothing sent.
-    let out = bus.run(&["media", "import", "away", "/pics/c.png", "--select"]);
-    assert_eq!(out.status.code(), Some(2), "{}", out.stderr);
-    assert!(
-        out.stderr
-            .contains("--select applies to `background`, not `away`"),
-        "{}",
-        out.stderr
+    // --select of an away image: the stored path becomes the away image
+    // (`effect.fallback_image`, through SetConfig).
+    mock.take_calls();
+    mock.with(|m| {
+        m.config[0].rows.push(config_row(
+            "effect.fallback_image",
+            "Away image",
+            obc_ipc::ConfigKind::Path,
+            obc_ipc::ConfigValue::Str(String::new()),
+        ))
+    });
+    let out = bus.run(&[
+        "media",
+        "import",
+        "away",
+        "/pics/c.png",
+        "--select",
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    let stored_away = format!("{user}/away/c.png");
+    assert_eq!(
+        json_line(&out.stdout),
+        serde_json::json!({"v": 1, "type": "media_import", "kind": "away",
+            "path": stored_away, "path_truncated": false, "selected": true})
     );
+    assert_eq!(
+        mock.take_calls(),
+        [
+            "ImportMedia(away, /pics/c.png)".to_string(),
+            format!("SetConfig(effect.fallback_image, Some(Str({stored_away:?})))"),
+        ]
+    );
+    let mut row = None;
+    mock.with(|m| {
+        row = m.config[0]
+            .rows
+            .iter()
+            .find(|r| r.id == "effect.fallback_image")
+            .cloned()
+    });
+    assert_eq!(
+        row.unwrap().value,
+        obc_ipc::ConfigValue::Str(stored_away.clone())
+    );
+    // Without --json: the stored path.
+    let out = bus.run(&["media", "import", "away", "/pics/d.png", "--select"]);
+    assert_eq!(out.status.code(), Some(0), "{}", out.stderr);
+    assert_eq!(out.stdout, format!("{user}/away/d.png\n"));
     mock.take_calls();
 
     // A refusal: exit 1 with the daemon's reason (on stdout with --json).

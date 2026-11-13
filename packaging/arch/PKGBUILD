@@ -72,7 +72,7 @@
 
 pkgname=omarchy-broadcast-git
 _pkgname=omarchy-broadcast
-pkgver=0.41.1
+pkgver=0.42.0
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API and a CLI'
 arch=('x86_64')
@@ -251,6 +251,11 @@ package() {
   # scripts/gen-backgrounds.sh) and the provenance of every file in it.
   install -Dm644 -t "$pkgdir/usr/share/$_pkgname/media/backgrounds" \
     assets/media/backgrounds/*.jpg assets/media/backgrounds/SOURCES.toml
+
+  # The bundled away images (shown in a call when the camera is off) and
+  # their provenance.
+  install -Dm644 -t "$pkgdir/usr/share/$_pkgname/media/away" \
+    assets/media/away/*.jpg assets/media/away/SOURCES.toml
 
   # Documentation, in the repository's layout so that links between the
   # shipped files resolve. Links to files that are not shipped (decision

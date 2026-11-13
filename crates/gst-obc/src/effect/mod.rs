@@ -84,6 +84,14 @@
 //!   temporal reset pending; otherwise it is processed. The cached memory
 //!   is shared, so a downstream element that writes in place writes into a
 //!   copy. Black frames and passed-through input leave no cache.
+//! * **The placeholder image**: a buffer carrying [`PLACEHOLDER_FLAG`] (the
+//!   output clock's away image, no camera picture) goes downstream as it
+//!   came, whatever the effect, its status or `on-failure`: no backend
+//!   call, no CUDA or pool work, no cache written or dropped, a pending
+//!   temporal reset kept for the next camera frame, and what was last on
+//!   screen (the start, toggle and new-source rules) left as the last
+//!   camera frame made it. It counts in no frame counter of the
+//!   statistics.
 //! * **Stopping** (PAUSED to READY) unloads the backend synchronously, with
 //!   the context pushed, before the element drops its context reference.
 //! * **System memory**: on caps without the CUDA memory feature the element
@@ -154,6 +162,26 @@ pub const REPEAT_FLAG: gst::BufferFlags =
 /// Whether `buffer` carries [`REPEAT_FLAG`].
 pub fn has_repeat_flag(buffer: &gst::BufferRef) -> bool {
     has_flag(buffer, REPEAT_FLAG)
+}
+
+/// The buffer flag that marks the output clock's **placeholder image**: the
+/// clock sets it on a placeholder tick that pushes the image the user chose
+/// to be seen without a camera picture (the "away image"), and clears it on
+/// every other buffer, the black placeholder included. Such a frame is no
+/// camera picture: `obceffect` and `obcmodule` pass it downstream as it
+/// came, with no backend or chain call, and leave every state of theirs as
+/// it was (the repeat cache, a pending temporal reset, what was last on
+/// screen; see their module docs).
+///
+/// It is the flag after [`REPEAT_FLAG`] (`GST_VIDEO_BUFFER_FLAG_LAST <<
+/// 2`), also free for video buffers. Set, clear and test it as that one
+/// ([`has_placeholder_flag`]).
+pub const PLACEHOLDER_FLAG: gst::BufferFlags =
+    gst::BufferFlags::from_bits_retain(gst_video::ffi::GST_VIDEO_BUFFER_FLAG_LAST << 2);
+
+/// Whether `buffer` carries [`PLACEHOLDER_FLAG`].
+pub fn has_placeholder_flag(buffer: &gst::BufferRef) -> bool {
+    has_flag(buffer, PLACEHOLDER_FLAG)
 }
 
 fn has_flag(buffer: &gst::BufferRef, flag: gst::BufferFlags) -> bool {

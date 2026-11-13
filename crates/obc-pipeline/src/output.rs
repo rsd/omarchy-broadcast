@@ -20,8 +20,9 @@
 //! The caps are fixed when the pipeline is built and never change, whatever
 //! feeds the slot. A dedicated clock thread pushes one buffer per tick of the
 //! contract frame rate ([`crate::clock::Pacer`]): the newest canonical frame
-//! (fresh), the last one again (repeat), or a black frame (placeholder)
-//! prepared once at start in CUDA memory. A pushed frame is a shallow copy
+//! (fresh), the last one again (repeat), or a placeholder: a black frame
+//! prepared once at start in CUDA memory, or the placeholder image (below).
+//! A pushed frame is a shallow copy
 //! of the slot's buffer, restamped (PTS = tick x period): the CUDA memory is
 //! shared, never copied. `v4l2sink` runs with `sync=false` because the
 //! pacing is the clock thread's.
@@ -100,6 +101,15 @@
 //! other buffer, so a module stage can tell a repeat from a fresh frame
 //! (`obcmodule` hands it to its chain as one).
 //!
+//! **Placeholder image flag.** A placeholder tick that pushes the
+//! placeholder image (below) is marked with [`gst_obc::PLACEHOLDER_FLAG`];
+//! the black placeholder and every camera frame are not. The effect element
+//! and every module stage pass a marked frame downstream untouched (no
+//! replace, blur, crop, warm-up black or `on_failure` frame, no backend or
+//! chain call, none of their state changed), so the image reaches the sink
+//! as it was decoded. The black placeholder still runs through them as
+//! before.
+//!
 //! **CUDA context.** The output pipeline's CUDA elements create the
 //! `GstCudaContext` when the pipeline opens; [`Output::cuda_context`] hands
 //! it to every ingest pipeline so canonical frames stay in one context.
@@ -118,9 +128,9 @@
 //!   ! <sink>
 //! ```
 //!
-//! The black placeholder is made on the CPU. The Process stage must be
-//! empty ([`GpuStage::Roundtrip`] runs on CUDA), and every module stage's
-//! chain must take host frames.
+//! The black placeholder (and the placeholder image) is made on the CPU.
+//! The Process stage must be empty ([`GpuStage::Roundtrip`] runs on CUDA),
+//! and every module stage's chain must take host frames.
 //!
 //! **Forwarding to a loopback writer.** With [`OutputSink::Writer`] the
 //! chain is the same up to and including the relabel and the contract
@@ -138,6 +148,45 @@
 //! output) shows the placeholder. A stopped output is detached, so a
 //! camera turned off shows the placeholder, never a frozen frame.
 //!
+//! **Placeholder image.** The placeholder can show a still image instead
+//! of black (the "away image"): [`OutputConfig::placeholder_image`] at
+//! build, [`Output::set_placeholder_image`] at any time after, with the
+//! semantics of the loopback writer's placeholder
+//! ([`crate::loopback::LoopbackWriter::set_placeholder_image`]) and its
+//! [`PlaceholderState`] ([`Output::placeholder_state`]). The image is
+//! cropped to fill the canonical frame, in the canonical size and colour
+//! ([`image_canonical_frame`]), decoded on the CPU on a thread of its own;
+//! the placeholder is black until it is ready, and stays black when the
+//! image cannot be read ([`PlaceholderState::Failed`]). An output that
+//! forwards to a loopback writer ([`OutputSink::Writer`]) pushes nothing
+//! at all on a placeholder tick while its image is
+//! [`PlaceholderState::Pending`] (from its start, while it decodes or
+//! uploads the image), instead of black: the writer's own placeholder, the
+//! same away image already decoded, fills the slot (nothing forwarded and
+//! no frame kept), so a session start shows the image and never black in
+//! between. Such a tick counts in [`OutputCounts::placeholder`], not in
+//! [`OutputCounts::emitted`]. Any other sink gets black meanwhile.
+//! Switching back to black is immediate. The last image decoded is kept, across black and
+//! across stops, until another path is asked for: the same file at the same
+//! path ([`FileStamp`]) is shown again without a decode. On a CUDA output
+//! the decoded frame is uploaded once per start into a CUDA buffer of the
+//! output's context (the one-shot pipeline the black frame is uploaded
+//! with); in system memory it is pushed as decoded. The clock thread only
+//! takes a reference to the frame in force, under a lock held for an
+//! assignment: it never decodes or uploads. The image asked for is the
+//! output's: kept across [`Output::stop`] and [`Output::start`]. While the
+//! output is stopped nothing is decoded or uploaded, so a stopped output
+//! never wakes the GPU; the decode (or, for an image already decoded, the
+//! upload) happens at the next start, and the stop drops every CUDA frame
+//! with the context. The stop never waits for an upload: one still in
+//! flight on a decode thread (a few milliseconds, at most the upload's
+//! five-second timeout on a wedged GPU) finishes with its own reference to
+//! the context, and its frame is dropped, never shown. A new [`Output`]
+//! starts from its
+//! [`OutputConfig::placeholder_image`]: an owner that builds one per
+//! session sets it there, and calls [`Output::set_placeholder_image`] when
+//! the image changes.
+//!
 //! **Loopback check.** [`Output::start`] compares what the loopback accepts
 //! with the contract once, before streaming
 //! ([`crate::pipeline::MediaPipeline::prepare`]).
@@ -151,13 +200,14 @@
 //! [`Output::health`] reports why.
 
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use gst::prelude::*;
+use gst_obc::background::FileStamp;
 use obc_core::{ColourRange, OutputContract, OutputFormat};
 use serde::Serialize;
 
@@ -165,7 +215,7 @@ use crate::clock::{Latest, Pacer, PacerConfig, PacerCounts, PhaseLockConfig, Ste
 use crate::effect::{EffectBackend, EffectSettings, EffectStats, EffectStatus, effect_element};
 use crate::frame::{Canonical, Frame, FrameWriter};
 use crate::ingest::CUDA_CONTEXT_TYPE;
-use crate::loopback::{WriterAttachment, WriterHandle};
+use crate::loopback::{PlaceholderState, WriterAttachment, WriterHandle, image_contract_frame};
 use crate::module::{ModulePlacement, ModuleStageSpec, ModuleStats, check_specs, module_element};
 use crate::pipeline::{
     MediaPipeline, PipelineError, StopError, add_linked, both_stopped, capsfilter, cuda_caps, make,
@@ -238,6 +288,11 @@ pub struct OutputConfig {
     /// unique; on system-memory frames every factory must take host
     /// frames.
     pub module_stages: Vec<ModuleStageSpec>,
+    /// The image the clock's placeholder shows in place of black (see the
+    /// module docs, "Placeholder image"): none by default (black). The
+    /// output starts with it; [`Output::set_placeholder_image`] changes it
+    /// while the output lives.
+    pub placeholder_image: Option<PathBuf>,
 }
 
 impl OutputConfig {
@@ -254,6 +309,7 @@ impl OutputConfig {
             effect: None,
             effect_backend: None,
             module_stages: Vec::new(),
+            placeholder_image: None,
         }
     }
 
@@ -484,6 +540,12 @@ pub struct Output {
     /// ([`OutputSink::Writer`]): set by a start that succeeded, dropped by
     /// the stop.
     attachment: Option<WriterAttachment>,
+    /// The image the clock's placeholder shows, shared with the clock
+    /// thread and the image's decode threads.
+    away: Arc<PlaceholderImage>,
+    /// Starts so far: tells a decode of an earlier start from one of the
+    /// current one.
+    starts: u64,
 }
 
 impl std::fmt::Debug for Output {
@@ -740,6 +802,8 @@ impl Output {
             })?;
         }
 
+        let away = Arc::new(PlaceholderImage::new(canonical, memory));
+        away.request(cfg.placeholder_image.as_deref());
         Ok(Output {
             pipeline: MediaPipeline::from_parts(pipeline, loopback_caps),
             appsrc,
@@ -757,6 +821,8 @@ impl Output {
             effect,
             modules,
             attachment: None,
+            away,
+            starts: 0,
         })
     }
 
@@ -889,6 +955,31 @@ impl Output {
         self.effect.as_ref().map(|fx| fx.settings())
     }
 
+    /// Switches the clock's placeholder (see the module docs,
+    /// "Placeholder image"): black (`None`, at once), or the image at
+    /// `image`, cropped to fill the canonical frame, decoded on a thread of
+    /// its own while the output runs (black until it is ready; black,
+    /// [`PlaceholderState::Failed`], when it cannot be read or uploaded).
+    /// The image already asked for is not decoded again unless the file at
+    /// its path is another one now ([`FileStamp`]); the last image decoded
+    /// is kept across black and across [`Self::stop`] and [`Self::start`],
+    /// until another path is asked for, and the same file asked for again
+    /// is shown at once. Never blocks for the decode or the upload. Kept
+    /// across [`Self::stop`] and [`Self::start`]; while the output is
+    /// stopped nothing is decoded or uploaded (the GPU is not woken), the
+    /// decode starts with the next start.
+    pub fn set_placeholder_image(&self, image: Option<&Path>) {
+        self.away.request(image);
+    }
+
+    /// What the clock's placeholder shows ([`Self::set_placeholder_image`]):
+    /// [`PlaceholderState::Pending`] while the image is decoded or
+    /// uploaded, and while the output is stopped with an image asked for
+    /// that it has not decoded yet.
+    pub fn placeholder_state(&self) -> PlaceholderState {
+        self.away.state()
+    }
+
     /// Sets the per-tick observer. Takes effect at [`Self::start`].
     pub fn set_observer(&mut self, observer: Option<EmitObserver>) {
         self.observer = observer;
@@ -911,6 +1002,7 @@ impl Output {
             .map_err(|e| self.pipeline.state_failure(e));
         if res.is_err() {
             let _ = self.pipeline.pipeline().set_state(gst::State::Null);
+            self.away.stopped();
             self.cuda = None;
         } else if let OutputSink::Writer(writer) = &self.cfg.sink {
             // Detached by the stop: see the module docs.
@@ -940,6 +1032,10 @@ impl Output {
             }
             VideoMemory::System => (None, black_frame(&self.canonical)),
         };
+        // Before the clock's first tick: an image ready on the CPU shows
+        // from the first placeholder on.
+        self.starts += 1;
+        self.away.started(self.starts, cuda.as_ref());
         self.cuda = cuda;
         self.pipeline
             .pipeline()
@@ -976,6 +1072,8 @@ impl Output {
             hold_request: Arc::clone(&self.hold_request),
             observer: self.observer.clone(),
             placeholder,
+            image: Arc::clone(&self.away),
+            covered: matches!(self.cfg.sink, OutputSink::Writer(_)),
             epoch: self.epoch,
             stop: Arc::clone(&stop),
         };
@@ -1146,6 +1244,8 @@ impl Output {
         let state = p.set_state(gst::State::Null);
         let (_, cur, _) = p.state(gst::ClockTime::from_seconds(5));
         self.slot.clear();
+        // The image's CUDA frames go with the context.
+        self.away.stopped();
         self.cuda = None;
         let clock = res.map_err(|error| StopError {
             error,
@@ -1167,6 +1267,385 @@ impl Drop for Output {
     }
 }
 
+/// One canonical frame (system memory, laid out as [`black_frame`])
+/// showing the image at `path`, cropped to fill the frame, in the
+/// canonical colour (BT.601, the contract's range): the loopback writer's
+/// [`image_contract_frame`] for an NV12 contract of the canonical size.
+/// Blocks for the decode.
+pub(crate) fn image_canonical_frame(
+    canonical: &Canonical,
+    path: &Path,
+) -> Result<gst::Buffer, String> {
+    let contract = OutputContract {
+        width: canonical.width,
+        height: canonical.height,
+        range: canonical.range,
+        format: OutputFormat::Nv12,
+        ..OutputContract::default()
+    };
+    image_contract_frame(&contract, path)
+}
+
+/// The image the output clock's placeholder shows (see the module docs,
+/// "Placeholder image"), shared by the [`Output`], its clock thread and
+/// the image's decode threads.
+///
+/// Locks are taken in the order `gate`, `request`, `shown`; `shown` is
+/// held only for an assignment or a reference count, so the clock thread
+/// never waits on a decode or an upload. A decode thread's upload holds no
+/// lock; the start's (on the starting thread) holds `gate` alone.
+#[derive(Debug)]
+struct PlaceholderImage {
+    canonical: Canonical,
+    memory: VideoMemory,
+    /// The running start (its number) and its CUDA context (`None` in
+    /// system memory); `None` while the output is stopped. Held across the
+    /// publication of an uploaded frame: once [`Self::stopped`] has taken
+    /// it, no CUDA frame of that start is published any more (an upload
+    /// still in flight on a decode thread finishes with its own reference
+    /// to the context, and its frame is dropped).
+    gate: Mutex<Option<(u64, Option<gst::Context>)>>,
+    request: Mutex<ImageRequest>,
+    /// The frame a placeholder tick pushes, in the output's memory; `None`:
+    /// the black one.
+    shown: Mutex<Option<gst::Buffer>>,
+}
+
+/// What a placeholder tick shows ([`PlaceholderImage::for_tick`]).
+#[derive(Debug)]
+enum TickImage {
+    Black,
+    /// The image asked for is not ready yet.
+    Pending,
+    Image(gst::Buffer),
+}
+
+/// The image asked for of a [`PlaceholderImage`], and what it reached.
+#[derive(Debug)]
+struct ImageRequest {
+    /// The image asked for (`None`: black), with the file at its path then.
+    image: Option<(PathBuf, Option<FileStamp>)>,
+    /// Counts the requests: a decode's result is kept only if no later one
+    /// was made.
+    serial: u64,
+    state: PlaceholderState,
+    /// The running start, as in `gate` (set and cleared under this lock,
+    /// after `gate`).
+    running: Option<u64>,
+    /// The last image decoded, in system memory, with the file it was
+    /// decoded from. Kept across black and stops; dropped when another
+    /// path is asked for. A failed decode is never kept.
+    decoded: Option<((PathBuf, FileStamp), gst::Buffer)>,
+    /// That image in CUDA memory of the running start, and the start; on
+    /// CUDA outputs only, dropped by the stop.
+    uploaded: Option<(u64, (PathBuf, FileStamp), gst::Buffer)>,
+}
+
+/// The `(path, stamp)` an image asked for is kept as, once decoded: none
+/// for a path that could not be stat'ed.
+fn image_key(image: &Option<(PathBuf, Option<FileStamp>)>) -> Option<(PathBuf, FileStamp)> {
+    match image {
+        Some((p, Some(stamp))) => Some((p.clone(), *stamp)),
+        _ => None,
+    }
+}
+
+impl PlaceholderImage {
+    fn new(canonical: Canonical, memory: VideoMemory) -> Self {
+        PlaceholderImage {
+            canonical,
+            memory,
+            gate: Mutex::new(None),
+            request: Mutex::new(ImageRequest {
+                image: None,
+                serial: 0,
+                state: PlaceholderState::Black,
+                running: None,
+                decoded: None,
+                uploaded: None,
+            }),
+            shown: Mutex::new(None),
+        }
+    }
+
+    fn lock_request(&self) -> std::sync::MutexGuard<'_, ImageRequest> {
+        self.request.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn show(&self, frame: Option<gst::Buffer>) {
+        let old = std::mem::replace(
+            &mut *self.shown.lock().unwrap_or_else(|e| e.into_inner()),
+            frame,
+        );
+        // Released outside the lock the clock thread takes.
+        drop(old);
+    }
+
+    /// The frame a placeholder tick pushes instead of black, if any.
+    fn shown(&self) -> Option<gst::Buffer> {
+        self.shown.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// What a placeholder tick of the clock shows now: the image, black,
+    /// or nothing yet (the image asked for still being decoded or
+    /// uploaded). Both locks are only ever held for an assignment, a clone
+    /// or a thread spawn: never across a decode or an upload.
+    fn for_tick(&self) -> TickImage {
+        let r = self.lock_request();
+        if r.state == PlaceholderState::Pending {
+            return TickImage::Pending;
+        }
+        match self.shown() {
+            Some(b) => TickImage::Image(b),
+            None => TickImage::Black,
+        }
+    }
+
+    fn state(&self) -> PlaceholderState {
+        self.lock_request().state.clone()
+    }
+
+    /// [`Output::set_placeholder_image`].
+    fn request(self: &Arc<Self>, image: Option<&Path>) {
+        let want = image.map(|p| (p.to_path_buf(), FileStamp::of(p)));
+        let mut r = self.lock_request();
+        if r.image == want {
+            return;
+        }
+        r.serial += 1;
+        // Another image asked for: the one kept is not shown again.
+        if let Some((p, _)) = &want {
+            if r.decoded.as_ref().is_some_and(|((dp, _), _)| dp != p) {
+                r.decoded = None;
+            }
+            if r.uploaded.as_ref().is_some_and(|(_, (up, _), _)| up != p) {
+                r.uploaded = None;
+            }
+        }
+        r.image = want;
+        self.apply(&mut r);
+    }
+
+    /// Makes the placeholder follow `r` (its image asked for, what is
+    /// decoded and uploaded, whether the output runs): shows what is ready,
+    /// and starts the decode or upload that is missing.
+    fn apply(self: &Arc<Self>, r: &mut ImageRequest) {
+        let Some((path, _)) = &r.image else {
+            r.state = PlaceholderState::Black;
+            self.show(None);
+            return;
+        };
+        let path = path.clone();
+        let key = image_key(&r.image);
+        if let (Some(start), Some(k), Some((up_start, up_key, b))) = (r.running, &key, &r.uploaded)
+            && start == *up_start
+            && k == up_key
+        {
+            self.show(Some(b.clone()));
+            r.state = PlaceholderState::Image;
+            return;
+        }
+        self.show(None);
+        let decoded = match (&key, &r.decoded) {
+            (Some(k), Some((dk, b))) if k == dk => Some(b.clone()),
+            _ => None,
+        };
+        let Some(start) = r.running else {
+            // Decoded (or uploaded) at the next start.
+            r.state = if decoded.is_some() {
+                PlaceholderState::Image
+            } else {
+                PlaceholderState::Pending
+            };
+            return;
+        };
+        if self.memory == VideoMemory::System
+            && let Some(b) = &decoded
+        {
+            self.show(Some(b.clone()));
+            r.state = PlaceholderState::Image;
+            return;
+        }
+        r.state = PlaceholderState::Pending;
+        let (this, serial) = (Arc::clone(self), r.serial);
+        let spawned = std::thread::Builder::new()
+            .name("obc-output-image".into())
+            .spawn({
+                let path = path.clone();
+                move || this.load(start, serial, &path, key, decoded)
+            });
+        if let Err(e) = spawned {
+            r.state = PlaceholderState::Failed(gst_obc::fallback_unreadable(
+                &path,
+                &format!("no thread to decode it: {e}"),
+            ));
+        }
+    }
+
+    /// The decode thread of request `serial` for start `start`: decodes the
+    /// image at `path` on the CPU (unless `decoded` already holds it),
+    /// keeps it, then [`Self::deliver`]s it.
+    fn load(
+        &self,
+        start: u64,
+        serial: u64,
+        path: &Path,
+        key: Option<(PathBuf, FileStamp)>,
+        decoded: Option<gst::Buffer>,
+    ) {
+        let frame = match decoded {
+            Some(b) => b,
+            None => match image_canonical_frame(&self.canonical, path) {
+                Ok(b) => {
+                    let mut r = self.lock_request();
+                    if r.serial != serial {
+                        return;
+                    }
+                    if let Some(k) = key.clone() {
+                        r.decoded = Some((k, b.clone()));
+                    }
+                    b
+                }
+                Err(why) => {
+                    let mut r = self.lock_request();
+                    if r.serial == serial {
+                        r.state =
+                            PlaceholderState::Failed(gst_obc::fallback_unreadable(path, &why));
+                    }
+                    return;
+                }
+            },
+        };
+        self.deliver(start, serial, path, key, frame);
+    }
+
+    /// Publishes the decoded `frame` of request `serial` for start `start`,
+    /// uploaded first on a CUDA output, unless the output stopped (or
+    /// started again) or a later request was made meanwhile. No lock is
+    /// held across the upload (it may wait seconds on a wedged GPU), so
+    /// [`Output::stop`] never waits for it; it uploads with its own
+    /// reference to the start's context, and its frame is dropped unless
+    /// that start still runs when it is done.
+    fn deliver(
+        &self,
+        start: u64,
+        serial: u64,
+        path: &Path,
+        key: Option<(PathBuf, FileStamp)>,
+        frame: gst::Buffer,
+    ) {
+        let cuda = {
+            let gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            match &*gate {
+                None => {
+                    // Stopped: shown from the next start, without a decode.
+                    let mut r = self.lock_request();
+                    if r.serial == serial && r.decoded.is_some() {
+                        r.state = PlaceholderState::Image;
+                    }
+                    return;
+                }
+                Some((running, _)) if *running != start => return,
+                Some((_, cuda)) => cuda.clone(),
+            }
+        };
+        let frame = match &cuda {
+            Some(ctx) => upload_frame(&self.canonical, ctx, frame).map_err(|e| e.to_string()),
+            None => Ok(frame),
+        };
+        // Dropped after the locks are released, if not published.
+        let mut unused = None;
+        {
+            let gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            let mut r = self.lock_request();
+            let current = gate.as_ref().is_some_and(|(running, _)| *running == start)
+                && r.serial == serial
+                && r.running == Some(start);
+            match frame {
+                Ok(b) if !current => unused = Some(b),
+                Err(_) if !current => {}
+                Ok(b) => {
+                    if cuda.is_some()
+                        && let Some(k) = key
+                    {
+                        r.uploaded = Some((start, k, b.clone()));
+                    }
+                    self.show(Some(b));
+                    r.state = PlaceholderState::Image;
+                }
+                Err(why) => {
+                    r.state = PlaceholderState::Failed(gst_obc::fallback_unreadable(
+                        path,
+                        &format!("it could not be uploaded: {why}"),
+                    ));
+                }
+            }
+        }
+        drop(unused);
+        drop(cuda);
+    }
+
+    /// Start `start` of the output, with its CUDA context (`None` in system
+    /// memory), before the clock's first tick: an image already decoded is
+    /// shown at once (uploaded here on a CUDA output, with the request lock
+    /// released, so a [`Output::set_placeholder_image`] meanwhile does not
+    /// wait for it), another one is decoded on its own thread.
+    fn started(self: &Arc<Self>, start: u64, cuda: Option<&gst::Context>) {
+        let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        *gate = Some((start, cuda.cloned()));
+        let mut r = self.lock_request();
+        r.running = Some(start);
+        r.uploaded = None;
+        let wanted = match (cuda, image_key(&r.image), &r.decoded) {
+            (Some(ctx), Some(k), Some((dk, b))) if k == *dk => Some((ctx, k, b.clone(), r.serial)),
+            _ => None,
+        };
+        if let Some((ctx, k, b, serial)) = wanted {
+            drop(r);
+            let uploaded = upload_frame(&self.canonical, ctx, b);
+            r = self.lock_request();
+            // A request made meanwhile is followed below instead.
+            if r.serial == serial {
+                match uploaded {
+                    Ok(up) => r.uploaded = Some((start, k, up)),
+                    Err(e) => {
+                        self.show(None);
+                        r.state = PlaceholderState::Failed(gst_obc::fallback_unreadable(
+                            &k.0,
+                            &format!("it could not be uploaded: {e}"),
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+        self.apply(&mut r);
+        drop(r);
+        drop(gate);
+    }
+
+    /// The output stopped (or its start failed): once this returns no
+    /// frame of its memory is published or kept but the decoded one (system
+    /// memory). Never waits for an upload of a decode thread.
+    fn stopped(&self) {
+        let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        *gate = None;
+        let mut r = self.lock_request();
+        r.running = None;
+        let uploaded = r.uploaded.take();
+        self.show(None);
+        if r.state == PlaceholderState::Pending
+            && image_key(&r.image)
+                .is_some_and(|k| r.decoded.as_ref().is_some_and(|(dk, _)| *dk == k))
+        {
+            r.state = PlaceholderState::Image;
+        }
+        drop(r);
+        drop(gate);
+        drop(uploaded);
+    }
+}
+
 /// Everything the clock thread owns.
 struct ClockContext {
     pacer: Pacer,
@@ -1175,7 +1654,14 @@ struct ClockContext {
     counters: Arc<Counters>,
     hold_request: Arc<Mutex<Option<(u64, Instant)>>>,
     observer: Option<EmitObserver>,
+    /// The black placeholder of this start.
     placeholder: gst::Buffer,
+    /// What a placeholder tick shows instead, when an image is ready.
+    image: Arc<PlaceholderImage>,
+    /// The output forwards to a loopback writer, whose own placeholder
+    /// covers a slot this clock leaves empty: a placeholder tick pushes
+    /// nothing while the image is pending, instead of black.
+    covered: bool,
     epoch: Instant,
     stop: Arc<StopSignal>,
 }
@@ -1229,6 +1715,7 @@ impl ClockContext {
                 && latest
                     .as_ref()
                     .is_some_and(|e| e.frame.source_id != last_fresh_source);
+            let mut image = None;
             let (source, origin_info) = match (kind, &latest) {
                 (TickKind::Fresh | TickKind::Repeat, Some(e)) => (
                     &e.frame.buffer,
@@ -1239,7 +1726,28 @@ impl ClockContext {
                         arrived_at: self.epoch + Duration::from_nanos(e.arrived_ns),
                     }),
                 ),
-                _ => (&self.placeholder, None),
+                _ => {
+                    // A reference taken under a short lock: never a decode
+                    // or an upload on this thread.
+                    match self.image.for_tick() {
+                        TickImage::Image(b) => image = Some(b),
+                        // Nothing pushed: the writer's placeholder (the
+                        // same away image) fills the slot. Counted as a
+                        // placeholder, not emitted.
+                        TickImage::Pending if self.covered => {
+                            drop(latest);
+                            // A gap in the pushed stream: the next buffer
+                            // pushed is a discontinuity.
+                            discont = true;
+                            self.counters
+                                .placeholder
+                                .store(self.pacer.counts().placeholder, Ordering::Relaxed);
+                            continue;
+                        }
+                        TickImage::Pending | TickImage::Black => {}
+                    }
+                    (image.as_ref().unwrap_or(&self.placeholder), None)
+                }
             };
             // Shallow copy: new metadata, same (shared) CUDA memory.
             let mut buffer = source.copy();
@@ -1267,6 +1775,11 @@ impl ClockContext {
                     b.set_flags(gst_obc::REPEAT_FLAG);
                 } else {
                     b.unset_flags(gst_obc::REPEAT_FLAG);
+                }
+                if image.is_some() {
+                    b.set_flags(gst_obc::PLACEHOLDER_FLAG);
+                } else {
+                    b.unset_flags(gst_obc::PLACEHOLDER_FLAG);
                 }
             }
             drop(latest);
@@ -1380,12 +1893,22 @@ fn black_frame(canonical: &Canonical) -> gst::Buffer {
     buffer
 }
 
-/// One black canonical frame in CUDA memory of the context `cuda`, made by
-/// uploading [`black_frame`] through a one-shot pipeline:
-/// `appsrc ! cudaupload ! capsfilter (canonical) ! appsink`.
+/// One black canonical frame in CUDA memory of the context `cuda`
+/// ([`upload_frame`] of [`black_frame`]).
 fn make_placeholder(
     canonical: &Canonical,
     cuda: &gst::Context,
+) -> Result<gst::Buffer, PipelineError> {
+    upload_frame(canonical, cuda, black_frame(canonical))
+}
+
+/// The canonical `frame` (system memory, laid out as [`black_frame`]) in
+/// CUDA memory of the context `cuda`, uploaded through a one-shot pipeline:
+/// `appsrc ! cudaupload ! capsfilter (canonical) ! appsink`.
+fn upload_frame(
+    canonical: &Canonical,
+    cuda: &gst::Context,
+    frame: gst::Buffer,
 ) -> Result<gst::Buffer, PipelineError> {
     let pipeline = gst::Pipeline::with_name("obc-placeholder");
     let src_caps = parse_caps(&format!("{},framerate=0/1", canonical.system_caps_string()))?;
@@ -1410,7 +1933,9 @@ fn make_placeholder(
     let p = MediaPipeline::from_parts(pipeline, None);
     p.play()?;
 
-    let pushed = src.push_buffer(black_frame(canonical)).is_ok() && src.end_of_stream().is_ok();
+    let mut frame = frame;
+    frame.make_mut().set_pts(gst::ClockTime::ZERO);
+    let pushed = src.push_buffer(frame).is_ok() && src.end_of_stream().is_ok();
     let sample = if pushed {
         sink.try_pull_sample(gst::ClockTime::from_seconds(5))
     } else {
@@ -1597,6 +2122,214 @@ mod tests {
         .unwrap();
         o.start().unwrap();
         o
+    }
+
+    const IMAGE_ELEMENTS: &[&str] = &[
+        "appsrc",
+        "capssetter",
+        "fakesink",
+        "videotestsrc",
+        "pngenc",
+        "pngdec",
+        "filesink",
+        "videoconvert",
+        "videocrop",
+        "videoscale",
+    ];
+
+    /// The luma of each buffer reaching the output's sink: `Some(y)` when
+    /// the frame is uniform (every luma byte `y`, every chroma byte 128),
+    /// `None` otherwise.
+    fn watch_luma(o: &Output) -> Arc<Mutex<Vec<Option<u8>>>> {
+        let log: Arc<Mutex<Vec<Option<u8>>>> = Arc::default();
+        let pad = o
+            .pipeline()
+            .element(names::LOOPBACK)
+            .and_then(|e| e.static_pad("sink"))
+            .unwrap();
+        let l = Arc::clone(&log);
+        pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+            if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
+                let info = pad
+                    .current_caps()
+                    .and_then(|c| gst_video::VideoInfo::from_caps(&c).ok())
+                    .unwrap();
+                let map = b.map_readable().unwrap();
+                let luma_end =
+                    info.offset()[0] + info.stride()[0] as usize * info.height() as usize;
+                let y = map[0];
+                let uniform = map.len() == info.size()
+                    && map[..luma_end].iter().all(|&b| b == y)
+                    && map[luma_end..].iter().all(|&b| b == 128);
+                l.lock().unwrap().push(uniform.then_some(y));
+            }
+            gst::PadProbeReturn::Ok
+        });
+        log
+    }
+
+    fn wait_until(limit: Duration, what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + limit;
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    const BLACK: Option<u8> = Some(16);
+    const WHITE: Option<u8> = Some(235);
+
+    /// Waits for `n` more buffers at the sink after the one in flight, and
+    /// returns them.
+    fn next_buffers(log: &Mutex<Vec<Option<u8>>>, n: usize) -> Vec<Option<u8>> {
+        let from = log.lock().unwrap().len() + 1;
+        wait_until(Duration::from_secs(10), "buffers at the sink", || {
+            log.lock().unwrap().len() >= from + n
+        });
+        log.lock().unwrap()[from..from + n].to_vec()
+    }
+
+    /// The clock's placeholder in system memory (no frame is ever written,
+    /// so every tick is one): black, the image once decoded, black again at
+    /// once when cleared, the same file shown again at once (also after a
+    /// restart), a file replaced at the same path read again, and an
+    /// unreadable one black with its reason. CPU only.
+    #[test]
+    fn the_placeholder_shows_the_image_in_system_memory() {
+        require_elements(IMAGE_ELEMENTS);
+        let dir = tempfile::tempdir().unwrap();
+        let png = crate::test_support::white_png(dir.path(), 160, 120);
+        let mut o = cpu_output_started();
+        let log = watch_luma(&o);
+        assert_eq!(o.placeholder_state(), PlaceholderState::Black);
+        assert_eq!(next_buffers(&log, 3), [BLACK; 3]);
+
+        o.set_placeholder_image(Some(&png));
+        wait_until(Duration::from_secs(10), "the image decoded", || {
+            o.placeholder_state() == PlaceholderState::Image
+        });
+        assert_eq!(next_buffers(&log, 5), [WHITE; 5]);
+        // Asked for again unchanged: nothing happens.
+        o.set_placeholder_image(Some(&png));
+        assert_eq!(o.placeholder_state(), PlaceholderState::Image);
+
+        o.set_placeholder_image(None);
+        assert_eq!(o.placeholder_state(), PlaceholderState::Black);
+        assert_eq!(next_buffers(&log, 3), [BLACK; 3]);
+        // The same file again: at once, no decode.
+        o.set_placeholder_image(Some(&png));
+        assert_eq!(o.placeholder_state(), PlaceholderState::Image);
+        assert_eq!(next_buffers(&log, 3), [WHITE; 3]);
+
+        // Kept across a restart, shown from the first placeholder on.
+        o.stop().unwrap();
+        assert_eq!(o.placeholder_state(), PlaceholderState::Image);
+        log.lock().unwrap().clear();
+        o.start().unwrap();
+        assert_eq!(o.placeholder_state(), PlaceholderState::Image);
+        wait_until(Duration::from_secs(10), "buffers after the restart", || {
+            log.lock().unwrap().len() >= 3
+        });
+        assert!(log.lock().unwrap().iter().all(|y| *y == WHITE), "{log:?}");
+
+        // Replaced at the same path by a file that is no image: read
+        // afresh, black and Failed.
+        o.set_placeholder_image(None);
+        let moved = dir.path().join("moved.png");
+        std::fs::rename(&png, &moved).unwrap();
+        std::fs::write(&png, b"not an image").unwrap();
+        o.set_placeholder_image(Some(&png));
+        assert_ne!(o.placeholder_state(), PlaceholderState::Image);
+        wait_until(Duration::from_secs(10), "the new file read", || {
+            matches!(o.placeholder_state(), PlaceholderState::Failed(_))
+        });
+        let PlaceholderState::Failed(why) = o.placeholder_state() else {
+            unreachable!()
+        };
+        assert!(why.contains("showing black"), "{why}");
+        assert_eq!(next_buffers(&log, 3), [BLACK; 3]);
+
+        // A missing file: Failed, black.
+        o.set_placeholder_image(Some(&dir.path().join("gone.png")));
+        wait_until(Duration::from_secs(10), "the missing file failed", || {
+            matches!(o.placeholder_state(), PlaceholderState::Failed(_))
+        });
+        assert_eq!(next_buffers(&log, 3), [BLACK; 3]);
+        o.stop().unwrap();
+    }
+
+    /// An image given in the config, or asked for while the output is
+    /// stopped, is not decoded before the start (pending), then shown.
+    /// CPU only.
+    #[test]
+    fn an_image_asked_for_while_stopped_is_decoded_at_the_start() {
+        require_elements(IMAGE_ELEMENTS);
+        let dir = tempfile::tempdir().unwrap();
+        let png = crate::test_support::white_png(dir.path(), 64, 64);
+        let contract: OutputContract = "320x240@30".parse().unwrap();
+        let mut cfg = OutputConfig::new(contract, OutputSink::Fake);
+        cfg.placeholder_image = Some(png.clone());
+        let mut o = Output::build_in(cfg, VideoMemory::System).unwrap();
+        let log = watch_luma(&o);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(o.placeholder_state(), PlaceholderState::Pending);
+        assert!(
+            o.away.lock_request().decoded.is_none(),
+            "decoded while stopped"
+        );
+        o.start().unwrap();
+        wait_until(Duration::from_secs(10), "the image decoded", || {
+            o.placeholder_state() == PlaceholderState::Image
+        });
+        assert_eq!(next_buffers(&log, 3), [WHITE; 3]);
+        o.stop().unwrap();
+        // Black asked for while stopped: black from the start on.
+        o.set_placeholder_image(None);
+        log.lock().unwrap().clear();
+        o.start().unwrap();
+        wait_until(Duration::from_secs(10), "buffers", || {
+            log.lock().unwrap().len() >= 3
+        });
+        assert!(log.lock().unwrap().iter().all(|y| *y == BLACK), "{log:?}");
+    }
+
+    /// The placeholder image on a CUDA output: uploaded once per start
+    /// into the output's context, downloaded white at the sink; black at
+    /// once when cleared, and again at once when asked for again.
+    #[test]
+    #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+    fn gpu_the_placeholder_shows_the_image_in_cuda_memory() {
+        require_elements(IMAGE_ELEMENTS);
+        require_elements(&["cudaupload", "cudadownload"]);
+        let dir = tempfile::tempdir().unwrap();
+        let png = crate::test_support::white_png(dir.path(), 160, 120);
+        let contract: OutputContract = "320x240@30".parse().unwrap();
+        let mut o = Output::build(OutputConfig::new(contract, OutputSink::Fake)).unwrap();
+        let log = watch_luma(&o);
+        o.start().unwrap();
+        assert_eq!(next_buffers(&log, 3), [BLACK; 3]);
+        o.set_placeholder_image(Some(&png));
+        wait_until(Duration::from_secs(10), "the image uploaded", || {
+            o.placeholder_state() == PlaceholderState::Image
+        });
+        assert_eq!(next_buffers(&log, 5), [WHITE; 5]);
+        o.set_placeholder_image(None);
+        assert_eq!(next_buffers(&log, 3), [BLACK; 3]);
+        o.set_placeholder_image(Some(&png));
+        assert_eq!(o.placeholder_state(), PlaceholderState::Image);
+        assert_eq!(next_buffers(&log, 3), [WHITE; 3]);
+        // A restart uploads the image kept, before the first tick.
+        o.stop().unwrap();
+        assert!(o.away.lock_request().uploaded.is_none(), "CUDA frame kept");
+        assert!(o.away.shown().is_none());
+        log.lock().unwrap().clear();
+        o.start().unwrap();
+        assert_eq!(o.placeholder_state(), PlaceholderState::Image);
+        wait_until(Duration::from_secs(10), "buffers", || {
+            log.lock().unwrap().len() >= 3
+        });
+        assert!(log.lock().unwrap().iter().all(|y| *y == WHITE), "{log:?}");
+        o.stop().unwrap();
     }
 
     /// An output forwarding to a writer is attached to it from a start that

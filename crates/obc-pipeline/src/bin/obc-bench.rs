@@ -4393,7 +4393,11 @@ mod tests {
                 holds_expired: 1,
             }
         );
-        assert_eq!(d.fresh + d.repeat + d.placeholder, d.emitted);
+        // Every tick decided is fresh, a repeat or a placeholder; a
+        // placeholder tick skipped while a writer output's away image is
+        // still decoded pushes nothing (the writer's placeholder fills the
+        // slot) and no counter tells it apart: emitted is at most the sum.
+        assert!(d.fresh + d.repeat + d.placeholder >= d.emitted);
         // Never negative, even for snapshots in the wrong order.
         assert_eq!(
             counts_delta(&b, &a),

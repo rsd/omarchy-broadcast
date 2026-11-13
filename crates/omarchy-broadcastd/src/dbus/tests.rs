@@ -424,8 +424,8 @@ async fn every_property_reads_through_the_proxy() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 16);
-    assert_eq!(INTERFACE_REVISION, obc_ipc::STAGE_VALUES_REVISION);
+    assert_eq!(INTERFACE_REVISION, 17);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::PLACEHOLDER_REVISION);
     // GetAll returns the same twenty-nine properties.
     let props = fdo::PropertiesProxy::builder(&rig.client)
         .destination(obc_ipc::BUS_NAME)
@@ -924,7 +924,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 16);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 17);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -1108,7 +1108,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 16);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 17);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -1224,7 +1224,7 @@ async fn preview_leases_by_bus_name_their_property_and_their_frames() {
     let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 16);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 17);
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
     let seen = rig.record_changes().await;
     let mut frames = proxy.receive_preview_frame().await.unwrap();

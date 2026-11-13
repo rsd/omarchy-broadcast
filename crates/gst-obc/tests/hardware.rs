@@ -553,6 +553,34 @@ fn gpu_none_passes_the_input_buffer_through_without_cuda() {
     rig.stop();
 }
 
+/// The output clock's placeholder image on CUDA frames: the input buffer
+/// itself, under blur while it loads (camera frames black) and once it is
+/// ready, with no backend call.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_the_placeholder_image_passes_through_on_cuda_frames() {
+    let fake = FakeFactory::new(FakeConfig {
+        load_delay: Duration::from_millis(300),
+        ..FakeConfig::default()
+    });
+    let mut rig = Rig::new(
+        Some(Arc::clone(&fake)),
+        &EffectSettings::of(EffectKind::Blur),
+    );
+    assert_eq!(rig.frame(), Seen::Black, "loading");
+    assert_eq!(rig.frame_with(gst_obc::PLACEHOLDER_FLAG), Seen::Input);
+    assert_eq!(rig.out_memory.lock().unwrap().last(), Some(&rig.in_memory));
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    let processes = get(&fake.log.processes);
+    for _ in 0..3 {
+        assert_eq!(rig.frame_with(gst_obc::PLACEHOLDER_FLAG), Seen::Input);
+        assert_eq!(rig.out_memory.lock().unwrap().last(), Some(&rig.in_memory));
+    }
+    assert_eq!(get(&fake.log.processes), processes, "no effect ran");
+    assert_ne!(rig.frame(), Seen::Input, "a camera frame is processed");
+    rig.stop();
+}
+
 #[test]
 #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
 fn gpu_a_toggle_mid_stream_keeps_the_input_until_ready_and_switches_never_show_it() {
@@ -855,7 +883,7 @@ fn gpu_an_unreadable_fallback_image_shows_black_and_says_why() {
     let why = rig.effect.stats().fallback_error.unwrap();
     assert!(
         why.starts_with(&format!(
-            "Fallback image {} could not be read (",
+            "Away image {} could not be read (",
             missing.display()
         )) && why.ends_with("): showing black")
             && why.contains("unreadable"),

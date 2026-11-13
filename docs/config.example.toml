@@ -32,8 +32,9 @@
 # key ("Overridden by config.d/90-local.toml"); remove it from that file to
 # change it again. The keys the dialog and `omarchy-broadcast config set`
 # can change are: [camera] fixed_framerate; [output] mode, format, aspect,
-# hold_timeout_s and input_gap_ms; [lifecycle] idle_grace_s and
-# start_debounce_ms; [video] memory; [effect] on_failure; [pipewire] enabled and offer_nv12;
+# hold_timeout_s, input_gap_ms and placeholder; [lifecycle] idle_grace_s and
+# start_debounce_ms; [video] memory; [effect] on_failure and fallback_image;
+# [pipewire] enabled and offer_nv12;
 # [mic] enabled, device, pipeline_depth, idle_exit_s and gpu_policy; and in
 # [modules] profile, enabled.<id>, forced.<id> and pin.<stage>. Everything else,
 # including the [effect] defaults (which a choice made in the panel overrides),
@@ -112,15 +113,33 @@ format = "nv12"
 aspect = "crop"
 
 # Seconds a camera switch holds the last frame while waiting for the next
-# camera's first frame; black frames follow if it has not arrived.
+# camera's first frame; the placeholder (black frames, or the away image: see
+# placeholder) follows if it has not arrived.
 # Greater than 0, at most 60.
 # Default: 3.0
 hold_timeout_s = 3.0
 
-# Milliseconds without a camera frame after which black frames replace
-# repeats of the last one. 1 to 60000.
+# Milliseconds without a camera frame after which the placeholder (black
+# frames, or the away image: see placeholder) replaces repeats of the last
+# one. 1 to 60000.
 # Default: 500
 input_gap_ms = 500
+
+# What the virtual camera shows while there is no camera picture: the camera
+# off, a start before its first frame, a session that cannot start or
+# stream, an input gap (see input_gap_ms), and the loopback's crash cover
+# while the daemon is down.
+#   "black" black frames;
+#   "image" the away image, the still image of [effect] fallback_image
+#           (below), in place of the black frames. An image that is not set
+#           or cannot be read shows black, with the reason in the Warning
+#           property.
+# It is never shown while a camera picture streams, and not at a toggle of
+# an effect or a stage: the last frame is held through it. Where privacy
+# holds the feed (an effect that hides the camera cannot run), on_failure
+# decides what is shown, not this. Changes at once, with no restart.
+# Default: "black"
+placeholder = "black"
 
 [loopback]
 # Card label of the v4l2loopback device to write to (exact match), as set
@@ -267,8 +286,10 @@ relight_brightness = 100
 #           of the black frames, scaled to fill the frame: while an effect
 #           starts or has failed, and while the virtual camera is held back
 #           for privacy. The camera off, an idle camera and the gaps of a
-#           camera switch stay black. An image that is not set or cannot be
-#           read shows black, with the reason in the Warning property. This
+#           camera switch stay black, unless [output] placeholder = "image"
+#           shows the away image there too. An image that is not set or
+#           cannot be read shows black, with the reason in the Warning
+#           property. This
 #           option is offered in the setup dialog only while fallback_image
 #           is set;
 #   "none"  the camera image without the effect, with the reason in the
@@ -283,14 +304,21 @@ relight_brightness = 100
 # Default: "black"
 on_failure = "black"
 
-# The still image that on_failure = "image" shows: an absolute path to a PNG
-# or JPEG file (at most 32 MiB and 8192x8192 pixels, as for background_image),
-# scaled with a centre crop to fill the frame. It is read when it is first
-# shown, not when the effect loads, and again when a configuration reload
-# finds another file at the path (an unchanged file is not read again). An
-# image that is not decoded within 10 seconds counts as unreadable. Set in
-# this file only: the setup dialog
-# shows it and does not change it. A still image only.
+# The away image: the still image that on_failure = "image" shows, and that
+# [output] placeholder = "image" shows where there is no camera picture. An
+# absolute path to a PNG, JPEG or still WebP file (at most 32 MiB and
+# 8192x8192 pixels, as for background_image), scaled with a centre crop to
+# fill the frame. It is read when it is first needed (with the [output]
+# placeholder set to "image", as the virtual camera starts, so that it
+# shows without black frames first), not when the effect loads, and again
+# when a configuration reload finds another file at the path (an unchanged
+# file is not read again). An image that is not decoded within
+# 10 seconds counts as unreadable. It can be set here, from the setup dialog
+# or with `omarchy-broadcast config set effect.fallback_image PATH` (which
+# write config.d/50-panel.toml, a later file than this one, so they win over
+# this file), and by `omarchy-broadcast media import away PATH --select`. A
+# still image only. The package installs two away images under
+# /usr/share/omarchy-broadcast/media/away.
 # Default: "" (no image). Example:
 # fallback_image = "/home/user/Pictures/away.png"
 

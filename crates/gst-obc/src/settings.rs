@@ -493,11 +493,13 @@ pub struct EffectStats {
     pub stage_values: Vec<StageValue>,
 }
 
-/// The report of a fallback image that cannot be shown: `"Fallback image
+/// The report of an away image (`effect.fallback_image`) that cannot be
+/// shown, by the effect element, the loopback writer's placeholder and
+/// crash cover, and the output clock's placeholder alike: `"Away image
 /// <path> could not be read (<why>): showing black"`.
 pub fn fallback_unreadable(path: &std::path::Path, why: &str) -> String {
     format!(
-        "Fallback image {} could not be read ({why}): showing black",
+        "Away image {} could not be read ({why}): showing black",
         path.display()
     )
 }

@@ -25,7 +25,9 @@
 //! nothing, so they fail open: a stage that fails alone is dropped and the
 //! others run; any other failure passes the frames through unprocessed.
 //! The element resets the chain's temporal state on the first frame of each
-//! new source ([`crate::effect::NEW_SOURCE_FLAG`]).
+//! new source ([`crate::effect::NEW_SOURCE_FLAG`]), and passes the output
+//! clock's placeholder image through untouched, with no chain call
+//! ([`crate::effect::PLACEHOLDER_FLAG`]).
 
 use std::fmt;
 use std::sync::Arc;

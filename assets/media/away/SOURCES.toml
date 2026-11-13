@@ -1,0 +1,23 @@
+# Provenance of every file bundled in this directory (installed to
+# /usr/share/omarchy-broadcast/media/away/). One [[item]] per file, in
+# display order. Generated items are original work, made by the script named
+# in `source` and licensed with the repository. Photographs may only be added
+# if they are CC0-1.0, with the source URL in `source`.
+
+[[item]]
+file = "camera-off.jpg"
+title = "Camera off"
+author = "omarchy-broadcast contributors"
+licence = "MIT OR Apache-2.0"
+source = "scripts/gen-backgrounds.sh"
+retrieved = "2026-11-13"
+edits = "none"
+
+[[item]]
+file = "away-soft.jpg"
+title = "Away, soft"
+author = "omarchy-broadcast contributors"
+licence = "MIT OR Apache-2.0"
+source = "scripts/gen-backgrounds.sh"
+retrieved = "2026-11-13"
+edits = "none"

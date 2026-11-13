@@ -20,6 +20,31 @@ pub(crate) fn require_elements(factories: &[&str]) {
     assert!(missing.is_empty(), "{}", missing_elements(&missing));
 }
 
+/// A white PNG of `w x h` in `dir` (`away.png`), made with
+/// `videotestsrc ! pngenc`.
+pub(crate) fn white_png(dir: &std::path::Path, w: u32, h: u32) -> std::path::PathBuf {
+    use gst::prelude::*;
+    let path = dir.join("away.png");
+    let p = gst::parse::launch(&format!(
+        "videotestsrc num-buffers=1 pattern=white ! video/x-raw,format=RGB,width={w},\
+         height={h} ! pngenc snapshot=true ! filesink location={}",
+        path.display()
+    ))
+    .unwrap();
+    p.set_state(gst::State::Playing).unwrap();
+    let m = p
+        .bus()
+        .unwrap()
+        .timed_pop_filtered(
+            gst::ClockTime::from_seconds(10),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        )
+        .unwrap();
+    assert_eq!(m.type_(), gst::MessageType::Eos, "{m:?}");
+    p.set_state(gst::State::Null).unwrap();
+    path
+}
+
 /// Fails unless no element of `pipeline` (bins included) comes from the
 /// `nvcodec` plugin or is a CUDA element: a system-memory pipeline builds
 /// where that plugin does not load.

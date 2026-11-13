@@ -154,7 +154,13 @@
 //! **fresh** (frames that arrived and were replaced in between are counted as
 //! **superseded**); otherwise the last frame is emitted again (**repeat**)
 //! while it is younger than the gap threshold; after that, and before any
-//! frame arrived, the output's black frame (**placeholder**).
+//! frame arrived, the output's placeholder (**placeholder**): its black
+//! frame, or the placeholder image when one is ready
+//! ([`crate::output::Output::set_placeholder_image`]). The pacer decides
+//! the kind of tick only; which placeholder frame is pushed is the
+//! output's, and an output forwarding to the loopback writer pushes none
+//! while its image is still being decoded (the writer's placeholder fills
+//! that slot).
 //!
 //! **Hold.** A deliberate source switch arms a hold ([`Pacer::hold`]) naming
 //! the new source and a deadline. While it holds, the last frame is repeated
@@ -313,7 +319,7 @@ pub enum TickKind {
     Fresh,
     /// The last emitted frame, again.
     Repeat,
-    /// The black placeholder frame.
+    /// The placeholder frame: black, or the output's placeholder image.
     Placeholder,
 }
 

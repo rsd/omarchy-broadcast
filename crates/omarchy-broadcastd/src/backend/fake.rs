@@ -117,6 +117,19 @@ impl FakeDevice {
     }
 }
 
+/// A call of the backend that changes what the feed shows, in
+/// [`World::image_events`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageEvent {
+    /// `stop_session`.
+    StopSession,
+    /// `set_placeholder` (the writer's placeholder), with its image.
+    Placeholder(Option<PathBuf>),
+    /// `set_output_placeholder` (the session output's clock placeholder),
+    /// with its image.
+    OutputPlaceholder(Option<PathBuf>),
+}
+
 /// A fake field of view (the [`FIELD_OF_VIEW`] row).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FakeFov {
@@ -163,12 +176,39 @@ pub struct World {
     /// The image given again to the placeholder that already showed it
     /// (the real writer reads it again if the file was replaced), in order.
     pub placeholder_resends: Vec<PathBuf>,
+    /// Every `set_output_placeholder` made while a session ran, in order
+    /// (the running session's [`SessionParams::placeholder_image`] follows
+    /// it, as the real output does).
+    pub output_placeholder_sets: Vec<Option<PathBuf>>,
+    /// Every `stop_session`, `set_placeholder` and
+    /// `set_output_placeholder`, in order (also the calls that change
+    /// nothing).
+    pub image_events: Vec<ImageEvent>,
     /// The placeholder image is still being decoded: neither shown nor
     /// known to be unreadable (`placeholder_pending`).
     pub placeholder_decoding: bool,
     /// Why the writer cannot decode the placeholder image: reported by
     /// `placeholder_failure` while an image is asked for and a writer runs.
     pub placeholder_unreadable: Option<String>,
+    /// Why the running session output cannot decode its clock
+    /// placeholder's image: reported by `output_placeholder_failure` while
+    /// a session runs with an image asked for.
+    pub output_placeholder_unreadable: Option<String>,
+    /// The image the writer's crash cover shows (`None`: black), kept
+    /// across writers as the real backend keeps it.
+    pub cover_image: Option<PathBuf>,
+    /// Every switch of the crash cover's image (`set_cover_image` that
+    /// changed it), in order.
+    pub cover_image_sets: Vec<Option<PathBuf>>,
+    /// The cover's image given again (read again if the file was
+    /// replaced), in order.
+    pub cover_image_resends: Vec<PathBuf>,
+    /// The writer's placeholder image and crash cover image each writer
+    /// was started with (what the backend kept then), in order.
+    pub writer_start_images: Vec<(Option<PathBuf>, Option<PathBuf>)>,
+    /// Every `hold_across_restart` made while a writer ran, with whether a
+    /// session ran then.
+    pub restart_holds: Vec<bool>,
     /// What the effect report says of the effect element's fallback image
     /// (`EffectReport::fallback_error`).
     pub fallback_error: Option<String>,
@@ -431,9 +471,17 @@ impl Default for World {
             writer_failure: None,
             placeholder: None,
             placeholder_sets: Vec::new(),
+            writer_start_images: Vec::new(),
             placeholder_resends: Vec::new(),
+            output_placeholder_sets: Vec::new(),
+            image_events: Vec::new(),
             placeholder_decoding: false,
             placeholder_unreadable: None,
+            output_placeholder_unreadable: None,
+            cover_image: None,
+            cover_image_sets: Vec::new(),
+            cover_image_resends: Vec::new(),
+            restart_holds: Vec::new(),
             fallback_error: None,
             stage_values: Vec::new(),
             holders: 0,
@@ -883,6 +931,8 @@ impl MediaBackend for FakeBackend {
         }
         w.writer = Some((node.clone(), *contract));
         w.writer_starts += 1;
+        let images = (w.placeholder.clone(), w.cover_image.clone());
+        w.writer_start_images.push(images);
         Ok(node)
     }
 
@@ -926,6 +976,8 @@ impl MediaBackend for FakeBackend {
 
     fn set_placeholder(&mut self, image: Option<&Path>) {
         let mut w = self.world();
+        w.image_events
+            .push(ImageEvent::Placeholder(image.map(Path::to_path_buf)));
         if w.placeholder.as_deref() != image {
             let image = image.map(Path::to_path_buf);
             w.placeholder = image.clone();
@@ -943,13 +995,49 @@ impl MediaBackend for FakeBackend {
     fn placeholder_failure(&mut self) -> Option<String> {
         let w = self.world();
         w.writer.as_ref()?;
-        let path = w.placeholder.as_ref()?;
+        w.placeholder.as_ref()?;
         if w.placeholder_decoding {
             return None;
         }
-        w.placeholder_unreadable
-            .as_ref()
-            .map(|why| obc_pipeline::effect::fallback_unreadable(path, why))
+        w.placeholder_unreadable.clone()
+    }
+
+    fn set_cover_image(&mut self, image: Option<&Path>) {
+        let mut w = self.world();
+        if w.cover_image.as_deref() != image {
+            let image = image.map(Path::to_path_buf);
+            w.cover_image = image.clone();
+            w.cover_image_sets.push(image);
+        } else if let Some(p) = image {
+            w.cover_image_resends.push(p.to_path_buf());
+        }
+    }
+
+    fn hold_across_restart(&mut self) {
+        let mut w = self.world();
+        if w.writer.is_some() {
+            let session = w.session.is_some();
+            w.restart_holds.push(session);
+        }
+    }
+
+    fn output_placeholder_failure(&mut self) -> Option<String> {
+        let w = self.world();
+        let (params, _) = w.session.as_ref()?;
+        params.placeholder_image.as_ref()?;
+        w.output_placeholder_unreadable.clone()
+    }
+
+    fn set_output_placeholder(&mut self, image: Option<&Path>) {
+        let mut w = self.world();
+        let image = image.map(Path::to_path_buf);
+        w.image_events
+            .push(ImageEvent::OutputPlaceholder(image.clone()));
+        let w = &mut *w;
+        if let Some((params, _)) = w.session.as_mut() {
+            params.placeholder_image.clone_from(&image);
+            w.output_placeholder_sets.push(image);
+        }
     }
 
     fn loopback_holders(&mut self, _node: &Path) -> u32 {
@@ -1047,6 +1135,7 @@ impl MediaBackend for FakeBackend {
     }
 
     fn stop_session(&mut self) {
+        self.world().image_events.push(ImageEvent::StopSession);
         // All of it stopped, then the real parker parks if it stopped
         // cleanly.
         let mut running = self.running();

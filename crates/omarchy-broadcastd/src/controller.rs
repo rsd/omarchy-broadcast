@@ -314,7 +314,7 @@ use obc_core::config::{
 use obc_core::config_d::{self, ConfigSet, ManagedEdit, OverridePolicy, WriteError};
 use obc_core::config_schema::{self, ModuleFact, RegistryFacts, StageFact};
 use obc_core::modules::{BackendProfile, StoredValue, legacy};
-use obc_core::{EffectMode, EffectOnFailure, ModeRequest, OutputContract};
+use obc_core::{EffectMode, EffectOnFailure, ModeRequest, OutputContract, OutputPlaceholder};
 use obc_ipc::settings::ResetScope;
 use obc_ipc::{
     CameraControl, CameraControls, CameraInfo, INTERFACE_REVISION, IpcError, SettingChange,
@@ -1060,6 +1060,18 @@ impl Fallback for EffectRun {
     }
 }
 
+/// The `Warning` clause of the away image (`effect.fallback_image`, under
+/// the name the user chose it by) that the writer's placeholder or the
+/// session output's clock placeholder cannot show: `Away image <path> could
+/// not be read (<why>): showing black`, whether privacy holds the feed or
+/// there is no camera picture.
+fn away_unreadable(path: &Path, why: &str) -> String {
+    format!(
+        "Away image {} could not be read ({why}): showing black",
+        path.display()
+    )
+}
+
 /// The text of an effect that cannot run where it is an error: a fault
 /// (`Error`) or a method's answer.
 fn effect_failure_text(effect: &impl Fallback, reason: &str) -> String {
@@ -1270,6 +1282,10 @@ struct Streaming {
     contract: OutputContract,
     /// Where the session keeps its frames, from its start to its stop.
     memory: VideoMemory,
+    /// The image the session output's clock placeholder was last given
+    /// (`None`: black): [`SessionParams::placeholder_image`] at the start,
+    /// then [`Controller::sync_placeholder`].
+    placeholder_image: Option<PathBuf>,
 }
 
 /// What [`Controller::start_session_once`] asks of the start that called
@@ -1362,8 +1378,16 @@ pub struct Controller<B: MediaBackend> {
     /// The image the writer's placeholder was last given (`None`: black).
     placeholder_set: Option<PathBuf>,
     /// Why the writer's placeholder cannot show that image (a `Warning`
-    /// clause).
+    /// clause, [`away_unreadable`]).
     placeholder_failure: Option<String>,
+    /// Why the running session output's clock placeholder cannot show its
+    /// away image (a `Warning` clause, [`away_unreadable`]); `None` when the
+    /// writer's clause already names the same file.
+    output_placeholder_failure: Option<String>,
+    /// The image the writer's crash cover was last given (`None`: black):
+    /// the away image of `output.placeholder = "image"`, whatever the
+    /// placeholder shows now ([`Self::sync_placeholder`]).
+    cover_set: Option<PathBuf>,
     /// The writer is still decoding that image: whether it can show it is
     /// not known yet, so the steps come often until it is
     /// ([`Self::next_wakeup`]).
@@ -1839,6 +1863,8 @@ impl<B: MediaBackend> Controller<B> {
             privacy_hold: None,
             placeholder_set: None,
             placeholder_failure: None,
+            output_placeholder_failure: None,
+            cover_set: None,
             placeholder_pending: false,
             placeholder_pending_since: None,
             placeholder_overdue: false,
@@ -2823,11 +2849,33 @@ impl<B: MediaBackend> Controller<B> {
     /// Stops the running session when a new one would run a selected stage
     /// that it cannot ([`Self::restart_for`]); the lifecycle starts the new
     /// one. Whether it was stopped.
+    ///
+    /// A deliberate restart, never a failure: the writer holds the
+    /// session's last frame across it
+    /// ([`MediaBackend::hold_across_restart`], at most
+    /// [`obc_pipeline::LoopbackWriter::RESTART_HOLD`]), so a user's toggle
+    /// shows neither black nor the away image while the camera reopens.
+    /// Except when the running session does not run the background effect
+    /// that the new one is given under an `on_failure` that hides the
+    /// camera ([`Self::refuses_passthrough`]): its last frame is the room
+    /// the user now asks to hide, never held. Known limit: the hold covers only the time no output is attached;
+    /// once the new session's output attaches, its clock shows its own
+    /// placeholder (black, or the away image) from its start until its
+    /// first camera frame.
     fn restart_for_modules(&mut self) -> bool {
         let Some(what) = self.restart_for() else {
             return false;
         };
         info!("a module provides {what} now: restarting the camera to run it");
+        let hidden = self.refuses_passthrough()
+            && (self.passthrough.is_some()
+                || !self
+                    .plan
+                    .as_ref()
+                    .is_some_and(|p| self.runs_in(p, &StageId::BACKGROUND)));
+        if !hidden {
+            self.backend.hold_across_restart();
+        }
         self.drop_session();
         true
     }
@@ -3229,6 +3277,7 @@ impl<B: MediaBackend> Controller<B> {
             effect: self.effect_run(),
             backends: self.current_plan().backends(),
             memory: self.session_memory(),
+            placeholder_image: self.output_image(),
         }
     }
 
@@ -3413,8 +3462,10 @@ impl<B: MediaBackend> Controller<B> {
                 "an effect under on_failure = \"{}\" is not in the session: stopping it",
                 self.effect().on_failure
             );
-            self.drop_session();
-            self.privacy_hold = Some(PrivacyHold::Guard);
+            // What privacy shows replaces the away image before the
+            // session stops, so the writer's placeholder never shows it
+            // (nor a camera frame) under the hold.
+            self.drop_session_held(|c| c.privacy_hold = Some(PrivacyHold::Guard));
         }
         let had_session = self.session.is_some();
         self.decide(now);
@@ -3642,6 +3693,9 @@ impl<B: MediaBackend> Controller<B> {
         sink: &obc_core::SinkSelector,
         now: Instant,
     ) -> Result<(), crate::backend::WriterError> {
+        // The placeholder's image first: the new writer decodes it before
+        // its first placeholder.
+        self.give_writer_images();
         let node = self.backend.start_writer(sink, &contract)?;
         let offer_nv12 = self.config.pipewire.offer_nv12;
         let pipewire = self
@@ -4361,6 +4415,7 @@ impl<B: MediaBackend> Controller<B> {
             enhance: false,
             enhance_params: Params::new(),
             contract: params.contract,
+            placeholder_image: params.placeholder_image.clone(),
         });
         // `starting` is announced before the (slow) start; the settings it
         // changes (what is installed for this GPU, learnt once it is up)
@@ -4587,8 +4642,27 @@ impl<B: MediaBackend> Controller<B> {
     /// the causes still standing. The modules then follow the memory the
     /// next session starts in ([`Self::follow_memory`]).
     fn drop_session(&mut self) {
+        self.drop_session_with(|_| {});
+    }
+
+    /// [`Self::drop_session`] for privacy: `hold` sets the privacy hold
+    /// once the session is taken, and the writer is given what the hold
+    /// shows ([`Self::give_writer_images`]: black under
+    /// `on_failure = "black"`) before the session stops, so no placeholder
+    /// slot between the two shows the away image.
+    fn drop_session_held(&mut self, hold: impl FnOnce(&mut Self)) {
+        self.drop_session_with(|c| {
+            hold(c);
+            c.give_writer_images();
+        });
+    }
+
+    /// [`Self::drop_session`], with `before_stop` run once the session is
+    /// taken and before the backend stops it.
+    fn drop_session_with(&mut self, before_stop: impl FnOnce(&mut Self)) {
         self.stop_watch();
         let dropped = self.session.take().is_some();
+        before_stop(self);
         if dropped {
             self.backend.stop_session();
         }
@@ -4731,18 +4805,72 @@ impl<B: MediaBackend> Controller<B> {
         effect.mode != EffectMode::None && effect.on_failure.hides()
     }
 
-    /// The image the writer's placeholder shows now: the fallback image
-    /// while privacy holds the feed ([`Self::privacy_hold`]: enabled, a
-    /// consumer, and either no session with the hold's fault still
-    /// standing, or a session started again under the hold that has not
-    /// streamed yet) and a background effect is selected with
-    /// `on_failure = "image"` and an image; `None` (black) in every other
-    /// case: off, idle, a camera switch's gap of a session that streamed or
-    /// another fault. A hold that no longer applies is forgotten: once the
-    /// session's first frame reached the output, its frames take over and
-    /// the hold ends. A start tried again under the hold so keeps the image
-    /// (a still, never the camera) until then, not black meanwhile.
-    fn placeholder_image(&mut self) -> Option<PathBuf> {
+    /// The away image of `output.placeholder = "image"`: what a
+    /// placeholder shows in place of black while the feed has no camera
+    /// picture; `None` (black) under `"black"` or with no
+    /// `effect.fallback_image`.
+    fn away_image(&self) -> Option<PathBuf> {
+        match self.config.output.placeholder {
+            OutputPlaceholder::Image => self.config.effect.fallback_image.clone(),
+            OutputPlaceholder::Black => None,
+        }
+    }
+
+    /// The image the writer's placeholder shows now, and whether privacy
+    /// holds the feed; `None`: black. While a privacy hold stands
+    /// ([`Self::privacy_holds`]) with a background effect selected, the
+    /// placeholder follows `effect.on_failure` (switch 1): `"image"` shows
+    /// `effect.fallback_image`, `"black"` black, whatever
+    /// `output.placeholder` says. Otherwise it follows `output.placeholder`
+    /// (switch 2, [`Self::away_image`]) at all times, also while a session
+    /// streams and with no consumer: the writer shows its placeholder only
+    /// where nothing is forwarded and its hold has ended (no session, a
+    /// start before its first frame, a stall or a failure), and an image
+    /// already decoded when the camera turns off or a session stops shows
+    /// from the first placeholder slot on, never black while it would be
+    /// decoded. A toggle is covered by the writer's hold, not by this.
+    fn placeholder_image(&mut self) -> Option<(PathBuf, bool)> {
+        let holds = self.privacy_holds();
+        self.placeholder_choice(holds)
+    }
+
+    /// The image the session output's clock placeholder shows: what the
+    /// writer's placeholder would ([`Self::placeholder_image`]) for a
+    /// session started (or starting) under the hold that has not streamed
+    /// yet: black while a privacy hold stands under `on_failure =
+    /// "black"`, never the away image.
+    fn output_image(&self) -> Option<PathBuf> {
+        let live = self.session.as_ref().is_some_and(|s| s.live);
+        let holds =
+            self.privacy_hold.is_some() && !live && self.runtime.enabled && self.consumers > 0;
+        self.placeholder_choice(holds).map(|(p, _)| p)
+    }
+
+    /// [`Self::placeholder_image`] with whether privacy holds the feed
+    /// given (`holds`).
+    fn placeholder_choice(&self, holds: bool) -> Option<(PathBuf, bool)> {
+        if holds {
+            let effect = self.effect();
+            if effect.mode != EffectMode::None {
+                match effect.on_failure {
+                    EffectOnFailure::Image => return effect.fallback_image.map(|p| (p, true)),
+                    EffectOnFailure::Black => return None,
+                    // Shown since: the hold no longer hides anything.
+                    EffectOnFailure::None => {}
+                }
+            }
+        }
+        self.away_image().map(|p| (p, false))
+    }
+
+    /// Whether privacy holds the feed now ([`Self::privacy_hold`]:
+    /// enabled, a consumer, and either no session with the hold's fault
+    /// still standing, or a session started again under the hold that has
+    /// not streamed yet). A hold that no longer applies is forgotten: once
+    /// the session's first frame reached the output, its frames take over
+    /// and the hold ends. A start tried again under the hold so keeps what
+    /// the hold shows (a still or black, never the camera) until then.
+    fn privacy_holds(&mut self) -> bool {
         let live = self.session.as_ref().is_some_and(|s| s.live);
         if live || !self.runtime.enabled || self.consumers == 0 {
             self.privacy_hold = None;
@@ -4755,27 +4883,50 @@ impl<B: MediaBackend> Controller<B> {
         {
             self.privacy_hold = None;
         }
-        let effect = self.effect();
-        if self.privacy_hold.is_none()
-            || effect.mode == EffectMode::None
-            || effect.on_failure != EffectOnFailure::Image
-        {
-            return None;
-        }
-        effect.fallback_image
+        self.privacy_hold.is_some()
     }
 
     /// Gives the writer's placeholder the image it shows now
-    /// ([`Self::placeholder_image`]) when that changed, and reads whether
-    /// it can.
+    /// ([`Self::placeholder_image`]) when that changed, the crash cover and
+    /// the session output's clock placeholder the away image
+    /// ([`Self::away_image`]) when that changed, and reads whether they
+    /// can show them.
     fn sync_placeholder(&mut self) {
-        let want = self.placeholder_image();
+        self.give_writer_images();
+        // The session output's clock placeholder (an input gap past the
+        // hold) shows what the writer's would ([`Self::placeholder_image`]):
+        // the away image whenever it is chosen, black while a privacy hold
+        // stands under `on_failure = "black"`.
+        let want = self.placeholder_image().map(|(p, _)| p);
+        if let Some(s) = self.session.as_mut()
+            && s.placeholder_image != want
+        {
+            self.backend.set_output_placeholder(want.as_deref());
+            s.placeholder_image.clone_from(&want);
+        }
+        self.read_placeholders();
+    }
+
+    /// Gives the writer's placeholder ([`Self::placeholder_image`]) and its
+    /// crash cover ([`Self::away_image`]) their images when they changed.
+    /// Also before a writer starts ([`Self::try_writer`]): the backend
+    /// keeps them and hands them to the new writer, which decodes its
+    /// placeholder's image before its first placeholder
+    /// ([`obc_pipeline::LoopbackWriter::start`]), so a writer started with
+    /// an away image (the daemon's start, a restart after a crash) does
+    /// not show black first.
+    fn give_writer_images(&mut self) {
+        let (want, privacy) = match self.placeholder_image() {
+            Some((p, privacy)) => (Some(p), privacy),
+            None => (None, false),
+        };
         if want != self.placeholder_set {
             match &want {
-                Some(p) => info!(
-                    "privacy holds the feed: the placeholder shows the fallback image {}",
+                Some(p) if privacy => info!(
+                    "privacy holds the feed: the placeholder shows the away image {}",
                     p.display()
                 ),
+                Some(p) => info!("the placeholder shows the away image {}", p.display()),
                 None if self.placeholder_set.is_some() => info!("the placeholder is black again"),
                 None => {}
             }
@@ -4783,6 +4934,19 @@ impl<B: MediaBackend> Controller<B> {
             self.placeholder_set = want;
             self.restart_placeholder_wait();
         }
+        let away = self.away_image();
+        // The crash cover shows the away image whenever it is chosen, so
+        // the feed shows it while the daemon is down, whatever the
+        // placeholder showed last.
+        if away != self.cover_set {
+            self.backend.set_cover_image(away.as_deref());
+            self.cover_set = away;
+        }
+    }
+
+    /// Reads whether the writer's placeholder and the session output's
+    /// clock placeholder can show their images (`Warning`'s clauses).
+    fn read_placeholders(&mut self) {
         self.placeholder_pending =
             self.placeholder_set.is_some() && self.backend.placeholder_pending();
         if !self.placeholder_pending {
@@ -4790,7 +4954,7 @@ impl<B: MediaBackend> Controller<B> {
         }
         self.placeholder_failure = match &self.placeholder_set {
             Some(p) if self.placeholder_pending && self.placeholder_overdue => {
-                Some(obc_pipeline::effect::fallback_unreadable(
+                Some(away_unreadable(
                     p,
                     &format!(
                         "not decoded within {} s",
@@ -4798,7 +4962,29 @@ impl<B: MediaBackend> Controller<B> {
                     ),
                 ))
             }
-            Some(_) => self.backend.placeholder_failure(),
+            Some(p) => self
+                .backend
+                .placeholder_failure()
+                .map(|why| away_unreadable(p, &why)),
+            None => None,
+        };
+        // The output's own decode of that file, said once: the writer's
+        // clause already names it when it cannot read it either.
+        let output = self
+            .session
+            .as_ref()
+            .and_then(|s| s.placeholder_image.clone());
+        self.output_placeholder_failure = match output {
+            Some(p)
+                if self.placeholder_failure.is_some()
+                    && self.placeholder_set.as_ref() == Some(&p) =>
+            {
+                None
+            }
+            Some(p) => self
+                .backend
+                .output_placeholder_failure()
+                .map(|why| away_unreadable(&p, &why)),
             None => None,
         };
     }
@@ -4823,8 +5009,10 @@ impl<B: MediaBackend> Controller<B> {
 
     /// `Warning`'s clauses of the fallback image: `on_failure = "image"`
     /// without one (black is shown in its place, whenever the camera is
-    /// hidden), and an image the writer's placeholder or the running
-    /// session's effect element cannot read.
+    /// hidden), `output.placeholder = "image"` without one (black is shown
+    /// while there is no camera picture), and an image the writer's
+    /// placeholder, the running session output's clock placeholder or its
+    /// effect element cannot read.
     fn fallback_warnings(&self) -> Vec<String> {
         let effect = self.effect();
         let mut out = Vec::new();
@@ -4835,7 +5023,17 @@ impl<B: MediaBackend> Controller<B> {
                     .to_string(),
             );
         }
+        if self.config.output.placeholder == OutputPlaceholder::Image
+            && effect.fallback_image.is_none()
+        {
+            out.push(
+                "output.placeholder is \"image\" but effect.fallback_image is not set: showing \
+                 black"
+                    .to_string(),
+            );
+        }
         out.extend(self.placeholder_failure.clone());
+        out.extend(self.output_placeholder_failure.clone());
         if self.session.is_some() {
             out.extend(self.fallback_failure.clone());
         }
@@ -5622,7 +5820,13 @@ impl<B: MediaBackend> Controller<B> {
         match effect.on_failure {
             EffectOnFailure::Black | EffectOnFailure::Image => {
                 info!("stopping the camera: the session refused the effect");
-                self.drop_session();
+                // What privacy shows replaces the away image before the
+                // session stops, so the writer's placeholder never shows
+                // it (nor a camera frame) under the hold.
+                self.drop_session_held(|c| {
+                    c.privacy_hold = Some(PrivacyHold::Fault(msg.clone()));
+                    c.fault = Some(msg.clone());
+                });
                 self.set_privacy_fault(msg.clone());
             }
             EffectOnFailure::None => {
@@ -7711,6 +7915,24 @@ impl<B: MediaBackend> Controller<B> {
         if let Some(p) = &self.placeholder_set {
             self.backend.set_placeholder(Some(p));
             self.restart_placeholder_wait();
+        }
+        // The crash cover's likewise, when it stays the same.
+        if let Some(p) = &self.cover_set
+            && self.away_image().as_ref() == Some(p)
+        {
+            self.backend.set_cover_image(Some(p));
+        }
+        // The session output's away image likewise, when it stays the
+        // same; a new choice reaches it at the next publish
+        // ([`Self::sync_placeholder`]).
+        let away = self.away_image();
+        if let Some(p) = &away
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.placeholder_image == away)
+        {
+            self.backend.set_output_placeholder(Some(p));
         }
         let old_cameras = self.rescan_cameras();
         // The streaming camera's mode changed: reopen it in the new mode.

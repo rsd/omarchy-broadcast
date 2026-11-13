@@ -21,11 +21,21 @@
 # script at build time) and are original work, licensed with the repository
 # (MIT OR Apache-2.0). Their provenance is in SOURCES.toml next to them.
 #
-# Usage: scripts/gen-backgrounds.sh [output-directory]
+# It also makes the two "away image" stills for the away gallery, into
+# assets/media/away/ (the picture shown in a call when the camera is off):
+#   camera-off  calm indigo-graphite card, a faint centred camera-with-a-slash
+#               glyph (basic shapes, no text)
+#   away-soft   the same card without the glyph
+# The away images are made after the backgrounds with their own fixed seeds,
+# so they never change the backgrounds' bytes.
+#
+# Usage: scripts/gen-backgrounds.sh [backgrounds-directory [away-directory]]
+# (the away directory defaults to "away" next to the backgrounds directory)
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 out=${1:-$root/assets/media/backgrounds}
+away_out=${2:-$(dirname -- "$out")/away}
 W=3840
 H=2160
 SIZE=${W}x${H}
@@ -59,13 +69,15 @@ vignette() {
   magick -size "$SIZE" "radial-gradient:white-gray($2%)" "miff:$1"
 }
 
-# finish SRC NAME SEED ATTENUATE: add fixed-seed noise before the 8-bit
-# quantisation (dithering against banding) and write NAME.jpg.
+# finish SRC NAME SEED ATTENUATE [DIR]: add fixed-seed noise before the 8-bit
+# quantisation (dithering against banding) and write NAME.jpg into DIR
+# (default: the backgrounds directory).
 finish() {
+  local dir=${5:-$out}
   magick "$1" -seed "$3" -attenuate "$4" +noise Gaussian \
     -colorspace sRGB -depth 8 -strip -interlace Plane \
-    -sampling-factor 4:2:0 -quality 90 "$out/$2.jpg"
-  echo "wrote $out/$2.jpg"
+    -sampling-factor 4:2:0 -quality 90 "$dir/$2.jpg"
+  echo "wrote $dir/$2.jpg"
 }
 
 # discs SEED COUNT RMIN RMAX R G B ALPHAMAX FILE: a black layer of soft
@@ -184,9 +196,46 @@ graphite_img() {
   finish "$work/graphite.miff" graphite 67 0.5
 }
 
+# --- away images -------------------------------------------------------------
+# camera_glyph FILE: a greyscale mask (white glyph on black) of a camera with a
+# slash through it, centred, about a sixth of the height tall. Outlined shapes
+# with round joins; the slash knocks a gap out of the body so it reads clearly.
+camera_glyph() {
+  local cx=$((W / 2)) cy=$((H / 2)) cap='stroke-linecap round stroke-linejoin round'
+  magick -size "$SIZE" xc:black -fill none -stroke white -strokewidth 24 \
+    -draw "$cap roundrectangle $((cx - 250)),$((cy - 130)) $((cx + 250)),$((cy + 150)) 56,56" \
+    -draw "$cap polyline $((cx - 110)),$((cy - 130)) $((cx - 80)),$((cy - 190)) $((cx + 80)),$((cy - 190)) $((cx + 110)),$((cy - 130))" \
+    -draw "$cap circle $cx,$((cy + 10)) $((cx + 84)),$((cy + 10))" \
+    -stroke black -strokewidth 76 \
+    -draw "$cap line $((cx - 290)),$((cy - 200)) $((cx + 290)),$((cy + 230))" \
+    -stroke white -strokewidth 24 \
+    -draw "$cap line $((cx - 290)),$((cy - 200)) $((cx + 290)),$((cy + 230))" \
+    -blur 0x0.8 "miff:$1"
+}
+
+away_images() {
+  mkdir -p -- "$away_out"
+  clut "$work/away.clut" '#101118' '#181a26' '#242840' '#303656'
+  # Soft light a little above the middle, falling off toward the corners.
+  field 'exp(-(((i/w-0.5)*1.3)^2 + ((j/h-0.42)*1.0)^2) / (2*0.42^2))' "$work/away.field"
+  vignette "$work/away.vig" 70
+  magick "$work/away.field" "$work/away.clut" -clut \
+    "$work/away.vig" -compose multiply -composite \
+    "miff:$work/away.card"
+  finish "$work/away.card" away-soft 83 0.5 "$away_out"
+
+  camera_glyph "$work/away.glyph"
+  # Light grey glyph at about 35 % opacity.
+  magick "$work/away.card" -size "$SIZE" xc:'#d6d9e2' \
+    \( "$work/away.glyph" -alpha off -colorspace Gray -evaluate multiply 0.35 \) \
+    -compose over -composite "miff:$work/away.marked"
+  finish "$work/away.marked" camera-off 83 0.5 "$away_out"
+}
+
 dusk
 studio
 warm_bokeh
 cool_bokeh
 shapes
 graphite_img
+away_images

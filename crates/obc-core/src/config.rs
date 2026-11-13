@@ -26,7 +26,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::modules::{ModulesConfig, ModulesState, StoredValue, legacy, valid_module_id};
 use crate::{
     AspectPolicy, CameraSelector, ColourRange, DEFAULT_SINK_LABEL, EffectMode, EffectOnFailure,
-    ModeRequest, OutputContract, OutputFormat, RelightLight, SinkSelector, fmt_size_rate,
+    ModeRequest, OutputContract, OutputFormat, OutputPlaceholder, RelightLight, SinkSelector,
+    fmt_size_rate,
 };
 
 /// Config schema version this build reads.
@@ -212,6 +213,11 @@ pub struct OutputConfig {
     /// Milliseconds without input before placeholders replace repeats.
     #[serde(deserialize_with = "de_input_gap")]
     pub input_gap_ms: u64,
+    /// What the placeholder shows while there is no camera picture: black,
+    /// or the away image (`effect.fallback_image`; black when it is not
+    /// set or cannot be read, with a `Warning`).
+    #[serde(serialize_with = "ser_display", deserialize_with = "de_from_str")]
+    pub placeholder: OutputPlaceholder,
 }
 
 impl Default for OutputConfig {
@@ -222,6 +228,7 @@ impl Default for OutputConfig {
             aspect: AspectPolicy::default(),
             hold_timeout_s: 3.0,
             input_gap_ms: 500,
+            placeholder: OutputPlaceholder::Black,
         }
     }
 }
@@ -2110,6 +2117,7 @@ format = "i420"
 aspect = "letterbox"
 hold_timeout_s = 1.5
 input_gap_ms = 250
+placeholder = "image"
 
 [loopback]
 label = "My Cam"
@@ -2161,6 +2169,7 @@ offer_nv12 = false
         assert_eq!(c.output.aspect, AspectPolicy::Letterbox);
         assert_eq!(c.hold_timeout(), Duration::from_millis(1500));
         assert_eq!(c.input_gap(), Duration::from_millis(250));
+        assert_eq!(c.output.placeholder, OutputPlaceholder::Image);
         assert_eq!(c.sink_selector(), SinkSelector::Path("/dev/video11".into()));
         assert_eq!(c.loopback.label, "My Cam");
         assert_eq!(c.idle_grace(), Duration::ZERO);
@@ -2256,6 +2265,7 @@ offer_nv12 = false
             "aspect",
             "hold_timeout_s",
             "input_gap_ms",
+            "placeholder",
             "label",
             "device",
             "idle_grace_s",
@@ -2528,6 +2538,11 @@ offer_nv12 = false
                 "[effect]\non_failure = \"raw\"",
                 "effect.on_failure",
                 "unsupported effect failure policy",
+            ),
+            (
+                "[output]\nplaceholder = \"none\"",
+                "output.placeholder",
+                "unsupported placeholder",
             ),
             (
                 "[effect]\nfallback_image = \"away.png\"",
@@ -2902,6 +2917,12 @@ offer_nv12 = false
         assert_eq!(c.effect.relight_brightness, 100);
         assert_eq!(c.effect.on_failure, EffectOnFailure::Black);
         assert_eq!(c.effect.fallback_image, None);
+        // The placeholder is black by default; `image` needs no image
+        // either (black, and a `Warning`, without one).
+        assert_eq!(c.output.placeholder, OutputPlaceholder::Black);
+        let c = parse("[output]\nplaceholder = \"image\"\n").unwrap();
+        assert_eq!(c.output.placeholder, OutputPlaceholder::Image);
+        assert_eq!(parse(&c.to_toml()).unwrap(), c);
         // `image` needs no image: without one it shows black (the daemon
         // says so in `Warning`). An empty path is none, as for the
         // background.

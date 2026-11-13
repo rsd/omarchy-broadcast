@@ -73,7 +73,12 @@
 //! The writer's placeholder ([`MediaBackend::set_placeholder`]): the image
 //! asked for is kept here and given to every writer started, which decodes
 //! it for its own contract on a thread of its own
-//! ([`LoopbackWriter::set_placeholder_image`]).
+//! ([`LoopbackWriter::set_placeholder_image`]). The session output's clock
+//! placeholder ([`MediaBackend::set_output_placeholder`]) starts from
+//! [`SessionParams::placeholder_image`] and follows the calls while the
+//! session runs ([`Output::set_placeholder_image`]). The crash cover's
+//! image ([`MediaBackend::set_cover_image`]) is kept here likewise and
+//! given to every writer started ([`LoopbackWriter::set_cover_image`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -98,7 +103,7 @@ use obc_pipeline::pipeline::names;
 use obc_pipeline::stats::{cpu_usage, online_cpus, self_cpu_ticks, ticks_per_sec};
 use obc_pipeline::xu::{SYSFS_ROOT, XuControl, XuRow, find_xu_controls};
 use obc_pipeline::{
-    ConsumerCover, CtrlNotice, CtrlWatcher, DiscoveryRoute, EffectFallback, EffectKind,
+    ConsumerCover, CoverShows, CtrlNotice, CtrlWatcher, DiscoveryRoute, EffectFallback, EffectKind,
     EffectSettings, FrameTap, IngestConfig, LiveStats, LoopbackWriter, Output, OutputConfig,
     OutputSink, PipelineError, PlaceholderState, PreviewConfig, PreviewEncoder, Session, StopError,
     WriterCounts, WriterHandle, WriterSink, choose_mode, effect_backend_available_with,
@@ -261,6 +266,14 @@ pub struct GstBackend {
     watch_generation: WatchGeneration,
     /// The image the writer's placeholder shows (`None`: black).
     placeholder: Option<PathBuf>,
+    /// The image the writer's crash cover shows (`None`: black).
+    cover_image: Option<PathBuf>,
+    /// The image the running session output's clock placeholder was asked
+    /// to show (`None`: black, or no session).
+    output_placeholder: Option<PathBuf>,
+    /// What the running writer's crash cover was last logged to show
+    /// ([`Self::log_cover_shows`]); `None` before its first install.
+    cover_logged: Option<CoverShows>,
 }
 
 /// The writer's one tap: the PipeWire output's, the preview encoder's, or
@@ -306,6 +319,9 @@ impl GstBackend {
             watcher: None,
             watch_generation: 0,
             placeholder: None,
+            cover_image: None,
+            output_placeholder: None,
+            cover_logged: None,
         })
     }
 
@@ -388,10 +404,45 @@ impl GstBackend {
         let mut writer = LoopbackWriter::build(contract, sink)?;
         writer.on_consumer_cover(Some(Arc::new(log_consumer_cover)));
         writer.set_placeholder_image(self.placeholder.as_deref());
+        writer.set_cover_image(self.cover_image.as_deref());
         writer.start()?;
         self.writer = Some(writer);
+        self.cover_logged = None;
         self.start_encoder();
         Ok(())
+    }
+
+    /// Logs what the running writer's crash cover shows (black, the away
+    /// image, or black in its place and why) once a cover is
+    /// in place, and again whenever that changes. Read here, at the
+    /// controller's steps: the cover's report ([`log_consumer_cover`]),
+    /// which logs the install and its timeout at once, is not told what
+    /// the image shows.
+    fn log_cover_shows(&mut self) {
+        let Some(w) = &self.writer else {
+            return;
+        };
+        if !matches!(w.consumer_cover(), ConsumerCover::Ready { .. }) {
+            return;
+        }
+        let shows = w.cover_shows();
+        if self.cover_logged.as_ref() == Some(&shows) {
+            return;
+        }
+        match &shows {
+            CoverShows::Black => crate::info!("crash cover shows black"),
+            CoverShows::Image => crate::info!(
+                "crash cover shows the away image{}",
+                self.cover_image
+                    .as_ref()
+                    .map(|p| format!(" {}", p.display()))
+                    .unwrap_or_default()
+            ),
+            CoverShows::BlackForImage(why) => {
+                crate::warning!("crash cover shows black in place of the away image: {why}")
+            }
+        }
+        self.cover_logged = Some(shows);
     }
 
     /// The GPU parker: a measurement hook (turn parking off, read the last
@@ -629,15 +680,31 @@ fn delivered_between(from: &WriterCounts, to: &WriterCounts) -> u64 {
     accepted.saturating_sub(dropped)
 }
 
-/// Logs a writer start's crash cover outcome
+/// The reason alone of a clause the pipeline words for `path` with
+/// [`obc_pipeline::effect::fallback_unreadable`]: the caller words its own
+/// clause. Found by the function's own shape (each part around the path and
+/// the reason it puts in), not by its text; a clause of another shape is
+/// kept whole as the reason.
+fn unreadable_reason(path: &Path, clause: &str) -> String {
+    const MARK: &str = "\u{1}";
+    let shape = obc_pipeline::effect::fallback_unreadable(path, MARK);
+    shape
+        .split_once(MARK)
+        .and_then(|(head, tail)| clause.strip_prefix(head)?.strip_suffix(tail))
+        .unwrap_or(clause)
+        .to_string()
+}
+
+/// Logs a writer start's (or a re-install's) crash cover outcome
 /// (`obc_pipeline::loopback_cover`): a consumer of the loopback keeps
-/// receiving black frames if the daemon dies, or a warning saying why it
-/// would not.
+/// receiving the timeout image if the daemon dies, or a warning saying why
+/// it would not. What the image shows is logged by
+/// [`GstBackend::log_cover_shows`].
 fn log_consumer_cover(cover: &ConsumerCover) {
     match cover {
         ConsumerCover::Ready { timeout_ms } => crate::info!(
-            "crash cover: black timeout image, timeout {timeout_ms} ms (consumers keep \
-             receiving black frames if the daemon stops writing)"
+            "crash cover in place, timeout {timeout_ms} ms (consumers keep receiving its \
+             timeout image if the daemon stops writing)"
         ),
         ConsumerCover::Failed(why) => crate::warning!(
             "crash cover not in place: {why}; a consumer may lose the camera if the daemon \
@@ -782,6 +849,9 @@ fn build_output(
     ocfg.effect = Some(effect_settings(&params.effect));
     ocfg.effect_backend = effect_backend(&params.backends);
     ocfg.module_stages = module_stages(&params.effect, &params.backends);
+    // The away image of `output.placeholder = "image"` (`None`: black),
+    // shown by the clock's placeholder past the hold.
+    ocfg.placeholder_image.clone_from(&params.placeholder_image);
     // A failure for want of CUDA is not parked after (`StartError::no_cuda`).
     let mut output = Output::build_in(ocfg, params.memory).map_err(|e| {
         *fault = StartFault::of(&e, params.memory);
@@ -910,6 +980,8 @@ impl MediaBackend for GstBackend {
     }
 
     fn writer_failure(&mut self) -> Option<String> {
+        // Polled at each step: the cover's image is logged from here.
+        self.log_cover_shows();
         let w = self.writer.as_ref()?;
         w.health()
             .err()
@@ -938,8 +1010,47 @@ impl MediaBackend for GstBackend {
     }
 
     fn placeholder_failure(&mut self) -> Option<String> {
+        let path = self.placeholder.as_deref()?;
         match self.writer.as_ref()?.placeholder_state() {
-            PlaceholderState::Failed(why) => Some(why),
+            PlaceholderState::Failed(clause) => Some(unreadable_reason(path, &clause)),
+            _ => None,
+        }
+    }
+
+    fn set_cover_image(&mut self, image: Option<&Path>) {
+        if self.cover_image.as_deref() != image {
+            match image {
+                Some(p) => crate::info!("the crash cover's image is {}", p.display()),
+                None => crate::info!("the crash cover's image is black"),
+            }
+            self.cover_image = image.map(Path::to_path_buf);
+        }
+        if let Some(w) = &self.writer {
+            w.set_cover_image(image);
+        }
+    }
+
+    fn hold_across_restart(&mut self) {
+        if let Some(w) = &self.writer {
+            w.hold_across_restart(LoopbackWriter::RESTART_HOLD);
+        }
+    }
+
+    fn set_output_placeholder(&mut self, image: Option<&Path>) {
+        if let Some(r) = &self.running {
+            match image {
+                Some(p) => crate::info!("the session output's placeholder shows {}", p.display()),
+                None => crate::info!("the session output's placeholder is black"),
+            }
+            r.session.output().set_placeholder_image(image);
+            self.output_placeholder = image.map(Path::to_path_buf);
+        }
+    }
+
+    fn output_placeholder_failure(&mut self) -> Option<String> {
+        let path = self.output_placeholder.as_deref()?;
+        match self.running.as_ref()?.session.output().placeholder_state() {
+            PlaceholderState::Failed(clause) => Some(unreadable_reason(path, &clause)),
             _ => None,
         }
     }
@@ -984,6 +1095,8 @@ impl MediaBackend for GstBackend {
         if let Some(r) = self.running.as_mut() {
             r.counts = counts;
         }
+        self.output_placeholder
+            .clone_from(&params.placeholder_image);
         Ok(())
     }
 
@@ -1504,6 +1617,18 @@ mod tests {
         assert!(!e.held && !e.revertible);
     }
 
+    #[test]
+    fn an_unreadable_image_clause_gives_its_reason_alone() {
+        let path = Path::new("/srv/away (copy).png");
+        let why = "the image file is unreadable: (gone)";
+        let clause = obc_pipeline::effect::fallback_unreadable(path, why);
+        assert_eq!(unreadable_reason(path, &clause), why);
+        // Another path's clause, or another shape: kept whole.
+        let other = obc_pipeline::effect::fallback_unreadable(Path::new("/srv/b.png"), why);
+        assert_eq!(unreadable_reason(path, &other), other);
+        assert_eq!(unreadable_reason(path, "no such file"), "no such file");
+    }
+
     fn stop_err(what: &str, reached_null: bool) -> Result<(), StopError> {
         Err(StopError {
             error: PipelineError::State(what.into()),
@@ -1868,6 +1993,7 @@ mod tests {
             effect: run.clone(),
             backends: Default::default(),
             memory: VideoMemory::Cuda,
+            placeholder_image: None,
         };
         let camera = Camera {
             id: "usb-a".into(),

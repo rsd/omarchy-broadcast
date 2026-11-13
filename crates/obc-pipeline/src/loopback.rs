@@ -26,10 +26,15 @@
 //!   to fill the contract's frame and laid out as the black one
 //!   ([`image_contract_frame`]), decoded on a thread of its own: the
 //!   placeholder stays black until the image is ready, and when it cannot be
-//!   read ([`PlaceholderState::Failed`]). Switching back to black is
-//!   immediate. The last image decoded is kept: asked for again while the
+//!   read ([`PlaceholderState::Failed`]). An image asked for before
+//!   [`LoopbackWriter::start`] (or just after) is waited for before the
+//!   first placeholder, for at most [`WriterConfig::image_wait`] (1 s by
+//!   default), so a writer started with an image (the daemon's start, its
+//!   restart after a crash, while the crash cover of the previous one still
+//!   serves the image) shows it from its first frame. Switching back to
+//!   black is immediate. The last image decoded is kept: asked for again while the
 //!   file at its path is the same one, it is shown at once, never black
-//!   meanwhile. The crash cover stays black whatever the placeholder shows.
+//!   meanwhile. The crash cover has an image of its own (below).
 //!   While an output is attached, the placeholder gives way to the hold
 //!   (below) for as long as the hold lasts.
 //! * **Forwarded frames.** [`WriterHandle::push`], called by the active
@@ -55,6 +60,19 @@
 //!   forwards (the effect element's `on_failure`), which reach the
 //!   consumer at once and then are what is held. Without an attach the
 //!   writer never holds.
+//! * **Restart hold.** A deliberate restart of the session (a module that
+//!   now provides a selected stage) stops one output and starts another.
+//!   Called before it, [`LoopbackWriter::hold_across_restart`] opens a
+//!   window (its `bound`, [`LoopbackWriter::RESTART_HOLD`] by default):
+//!   a last detach within it keeps the kept frame and holds it in the
+//!   placeholder's slots, as during an attached stall, until an output
+//!   attaches again (the attached rules then apply) or the window ends
+//!   (the placeholder then resumes). Without the call a detach drops the
+//!   kept frame as above, so a camera turned off or a privacy stop shows
+//!   the placeholder, never a frozen frame. The new output's clock pushes
+//!   its own placeholder from its start until its first camera frame
+//!   ([`crate::clock`]): the restart hold covers the gap with no output
+//!   only.
 //!
 //! **Timestamps.** Every buffer pushed, placeholder or forwarded, gets the
 //! writer's own timestamp: PTS = the `CLOCK_MONOTONIC` time of the push
@@ -73,11 +91,24 @@
 //! **Crash cover.** At each start on a loopback, once the second buffer
 //! reaches `v4l2sink` (the first has then set the device's format and
 //! allocated its buffers, on the same streaming thread), a helper thread
-//! uploads a black timeout image and sets the driver's `timeout`
-//! ([`crate::loopback_cover`]), so a consumer keeps receiving (black)
-//! frames while no writer streams: after the daemon died, until its restart
-//! writes again. The timeout stays above the writer's worst gap between
-//! two frames ([`WriterConfig::placeholder_after`] plus a period), so it
+//! uploads a timeout image and sets the driver's `timeout`
+//! ([`crate::loopback_cover`]), so a consumer keeps receiving frames while
+//! no writer streams: after the daemon died, until its restart writes
+//! again. The timeout image is the cover image
+//! ([`LoopbackWriter::set_cover_image`], the user's away image), independent
+//! of the placeholder: black with none, and while it is first decoded; the
+//! image once decoded (its frame is already laid out as the device's
+//! frames, and when the device's format says otherwise the cover is black,
+//! [`CoverShows::BlackForImage`] saying why); black, with the reason in
+//! [`CoverShows::BlackForImage`] and [`LoopbackWriter::cover_image_state`],
+//! when it cannot be read. When its frame changes after the start's upload,
+//! the cover is installed again, on a helper thread of its own; a
+//! placeholder switch or a camera turned on or off installs nothing.
+//! [`LoopbackWriter::cover_shows`] tells what the last install put in
+//! place. Never the last camera frame: the image is the user's chosen
+//! picture, not the camera. The timeout stays above the writer's worst
+//! gap between two frames ([`WriterConfig::placeholder_after`] plus a
+//! period), so it
 //! never fires while the writer runs. The hold does not change that gap: a
 //! held frame is pushed in a placeholder's slot, on the placeholder
 //! thread's grid. The outcome is
@@ -126,7 +157,9 @@ use obc_core::OutputContract;
 use serde::Serialize;
 
 use crate::frame::Canonical;
-use crate::loopback_cover::{ConsumerCover, CoverPlan, CoverReport, CoverSlot};
+use crate::loopback_cover::{
+    ConsumerCover, CoverPlan, CoverReport, CoverShows, CoverSlot, FrameLayout,
+};
 use crate::output::{
     OutputSink, StopSignal, check_sink_range, contract_caps_string, frames_src, run_recording_panic,
 };
@@ -152,6 +185,10 @@ pub struct WriterConfig {
     /// How long without a forwarded frame before the placeholder thread
     /// pushes placeholders again.
     pub placeholder_after: Duration,
+    /// How long a start waits, before its first placeholder, for the
+    /// placeholder's image still being decoded
+    /// ([`LoopbackWriter::start`]).
+    pub image_wait: Duration,
 }
 
 impl WriterConfig {
@@ -166,11 +203,15 @@ impl WriterConfig {
             placeholder_after: Duration::from_nanos(
                 Self::PLACEHOLDER_AFTER_PERIODS * contract.frame_duration_ns(),
             ),
+            image_wait: Self::IMAGE_WAIT,
         }
     }
 
     pub const DEFAULT_QUEUE_BUFFERS: u32 = 3;
     pub const PLACEHOLDER_AFTER_PERIODS: u64 = 2;
+    /// The default [`Self::image_wait`]: a still decodes in tens of
+    /// milliseconds; past a second the start does not wait any longer.
+    pub const IMAGE_WAIT: Duration = Duration::from_secs(1);
 }
 
 /// A snapshot of the writer's counters.
@@ -234,9 +275,17 @@ struct PushState {
     /// The id of the next [`WriterHandle::attach`].
     next_attachment: u64,
     /// The last forwarded frame `appsrc` accepted while attached, by
-    /// reference (its memory is not copied). Dropped by the last detach,
-    /// past the hold, and at the writer's start and stop.
+    /// reference (its memory is not copied). Dropped by the last detach
+    /// (unless it starts a restart hold), past the hold, and at the
+    /// writer's start and stop.
     kept: Option<gst::Buffer>,
+    /// The window of [`LoopbackWriter::hold_across_restart`]: until then, a
+    /// last detach starts a restart hold instead of dropping `kept`.
+    /// Consumed by that detach and by an attach.
+    restart_window: Option<Instant>,
+    /// The restart hold in force (no output attached): `kept` is held until
+    /// then, or until an output attaches.
+    restart_hold: Option<Instant>,
     /// Sees every accepted buffer; behind the push lock, so a call never
     /// overlaps [`LoopbackWriter::set_tap`].
     tap: TapSlot,
@@ -261,6 +310,13 @@ struct Shared {
     error: Mutex<Option<String>>,
     /// What the placeholder thread pushes, and the image asked for.
     frame: Mutex<PlaceholderFrame>,
+    /// The crash cover's image asked for
+    /// ([`LoopbackWriter::set_cover_image`]); the cover is told each change
+    /// under this lock, so in the order of the changes. Never held with
+    /// `frame`.
+    cover_image: Mutex<StillRequest>,
+    /// The crash cover.
+    cover: Arc<CoverSlot>,
 }
 
 /// The placeholder in force ([`LoopbackWriter::set_placeholder_image`]).
@@ -268,6 +324,14 @@ struct Shared {
 struct PlaceholderFrame {
     /// The frame pushed: the black one, or the image once decoded.
     buffer: gst::Buffer,
+    /// The image asked for, and what it reached.
+    request: StillRequest,
+}
+
+/// A still image asked for (the placeholder's or the crash cover's), and
+/// what it reached.
+#[derive(Debug)]
+struct StillRequest {
     /// The image asked for (`None`: black), with the file at its path
     /// then ([`gst_obc::background::FileStamp`]).
     image: Option<(PathBuf, Option<FileStamp>)>,
@@ -279,10 +343,109 @@ struct PlaceholderFrame {
     /// could be stat'ed): shown at once when the same is asked for again.
     /// Kept across black; dropped when another path is asked for. A failed
     /// decode is never kept.
-    decoded: Option<((PathBuf, FileStamp), gst::Buffer)>,
+    decoded: Option<DecodedImage>,
 }
 
-/// What the writer's placeholder shows.
+/// An image decoded into a frame of the contract, with the file it was
+/// decoded from.
+type DecodedImage = ((PathBuf, FileStamp), gst::Buffer);
+
+/// What a new request of a [`StillRequest`] calls for.
+#[derive(Debug)]
+enum Asked {
+    /// The image already asked for, the file at its path the same.
+    Unchanged,
+    /// Black.
+    Black,
+    /// The image, already decoded: shown at once.
+    Ready(gst::Buffer),
+    /// The image at that path, to decode for request `serial`.
+    Decode(u64, PathBuf),
+}
+
+impl StillRequest {
+    fn new() -> Self {
+        StillRequest {
+            image: None,
+            serial: 0,
+            state: PlaceholderState::Black,
+            decoded: None,
+        }
+    }
+
+    /// Asks for `image` (`None`: black). `shared`: the other request's
+    /// decoded image, taken over when it is of the same file, so the same
+    /// file is decoded once for both.
+    fn ask(&mut self, image: Option<&Path>, shared: Option<DecodedImage>) -> Asked {
+        let want = image.map(|p| (p.to_path_buf(), FileStamp::of(p)));
+        if self.image == want {
+            return Asked::Unchanged;
+        }
+        self.serial += 1;
+        // Another image asked for: the one kept is not shown again.
+        if let Some((p, _)) = &want
+            && self.decoded.as_ref().is_some_and(|((dp, _), _)| dp != p)
+        {
+            self.decoded = None;
+        }
+        let key = match &want {
+            Some((p, Some(stamp))) => Some((p.clone(), *stamp)),
+            _ => None,
+        };
+        if let (Some(k), Some((sk, b))) = (&key, shared)
+            && *k == sk
+        {
+            self.decoded = Some((sk, b));
+        }
+        self.image = want;
+        match (&key, &self.decoded, image) {
+            (Some(k), Some((dk, b)), _) if k == dk => {
+                self.state = PlaceholderState::Image;
+                Asked::Ready(b.clone())
+            }
+            (_, _, None) => {
+                self.state = PlaceholderState::Black;
+                Asked::Black
+            }
+            (_, _, Some(p)) => {
+                self.state = PlaceholderState::Pending;
+                Asked::Decode(self.serial, p.to_path_buf())
+            }
+        }
+    }
+
+    /// The decode of request `serial` of the image at `path` ended with
+    /// `frame`: the image (kept) or the reason it cannot be shown, as
+    /// [`gst_obc::fallback_unreadable`] words it; `None` when a later
+    /// request was made meanwhile.
+    fn decoded(
+        &mut self,
+        serial: u64,
+        path: &Path,
+        frame: Result<gst::Buffer, String>,
+    ) -> Option<Result<gst::Buffer, String>> {
+        if self.serial != serial {
+            return None;
+        }
+        Some(match frame {
+            Ok(b) => {
+                if let Some((p, Some(stamp))) = &self.image {
+                    self.decoded = Some(((p.clone(), *stamp), b.clone()));
+                }
+                self.state = PlaceholderState::Image;
+                Ok(b)
+            }
+            Err(why) => {
+                let why = gst_obc::fallback_unreadable(path, &why);
+                self.state = PlaceholderState::Failed(why.clone());
+                Err(why)
+            }
+        })
+    }
+}
+
+/// What the writer's placeholder shows (and, for
+/// [`LoopbackWriter::cover_image_state`], the crash cover's image).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlaceholderState {
     /// Black: no image is asked for.
@@ -328,6 +491,25 @@ impl PushState {
     /// output attached.
     fn hold(&self) -> Option<Duration> {
         self.attachments.last().map(|&(_, hold)| hold)
+    }
+
+    /// Whether the kept frame is held at `now`: while an output is
+    /// attached, within its bound of the last forwarded frame
+    /// ([`hold_due`]); with none, while a restart hold lasts.
+    fn holding(&self, now: Instant) -> bool {
+        if self.attachments.is_empty() {
+            self.restart_hold.is_some_and(|until| now < until)
+        } else {
+            hold_due(self.hold(), self.last_forward, now)
+        }
+    }
+
+    /// Ends every hold and returns the kept frame, for the caller to drop
+    /// after the lock (the writer's start and stop).
+    fn end_holds(&mut self) -> Option<gst::Buffer> {
+        self.restart_window = None;
+        self.restart_hold = None;
+        self.kept.take()
     }
 }
 
@@ -384,15 +566,16 @@ impl Shared {
             (buffer, producer)
         } else if !placeholder_due(st.last_forward, now, after) {
             return Pushed::NotDue(placeholder_due_at(st.last_forward, after).unwrap_or(now));
-        } else if hold_due(st.hold(), st.last_forward, now)
+        } else if st.holding(now)
             && let Some(kept) = &st.kept
         {
             // A shallow copy: new metadata, the forwarded frame's memory.
             (kept.copy(), Producer::Held)
         } else {
-            // Past the hold (a wedged output): the placeholder, as without
-            // an output attached.
+            // Past the hold (a wedged output, a restart past its bound):
+            // the placeholder, as without an output attached.
             expired = st.kept.take();
+            st.restart_hold = None;
             (buffer, producer)
         };
         let (pushed, replaced) = self.push_locked(&mut st, buffer, producer, now);
@@ -531,12 +714,19 @@ impl WriterHandle {
     /// fill within `hold` of the last forwarded frame is filled by that frame
     /// again ([`WriterCounts::held`]). Attachments are counted, so two
     /// outputs handing over to each other each hold their own; the bound is
-    /// the last live attachment's. Never blocks beyond the push lock.
+    /// the last live attachment's. An attach ends a restart hold
+    /// ([`LoopbackWriter::hold_across_restart`]) and its window. Never
+    /// blocks beyond the push lock.
     pub fn attach(&self, hold: Duration) -> WriterAttachment {
         let mut st = self.shared.lock();
         let id = st.next_attachment;
         st.next_attachment += 1;
         st.attachments.push((id, hold));
+        // A new output ends a restart hold: from now on the kept frame is
+        // held only as for any attached output, within `hold` of the last
+        // forwarded frame.
+        st.restart_window = None;
+        st.restart_hold = None;
         WriterAttachment {
             shared: Arc::clone(&self.shared),
             id,
@@ -555,7 +745,9 @@ impl WriterHandle {
 /// dropping it detaches that output, and only that one. With no output
 /// attached any more, the kept frame is dropped at once and the placeholder
 /// resumes [`WriterConfig::placeholder_after`] after the last forwarded
-/// frame, as before any attach.
+/// frame, as before any attach; within the window of
+/// [`LoopbackWriter::hold_across_restart`], the kept frame is held instead,
+/// until the next attach or the window's end.
 #[must_use = "the output is detached when the attachment is dropped"]
 pub struct WriterAttachment {
     shared: Arc<Shared>,
@@ -575,7 +767,15 @@ impl Drop for WriterAttachment {
         let mut st = self.shared.lock();
         st.attachments.retain(|&(id, _)| id != self.id);
         let released = if st.attachments.is_empty() {
-            st.kept.take()
+            // Within the window of a deliberate restart, the kept frame
+            // stays held until its bound or the next attach.
+            match st.restart_window.take() {
+                Some(until) if Instant::now() < until && st.kept.is_some() => {
+                    st.restart_hold = Some(until);
+                    None
+                }
+                _ => st.kept.take(),
+            }
         } else {
             None
         };
@@ -610,6 +810,9 @@ pub struct LoopbackWriter {
     thread: Option<PlaceholderThread>,
     cover: Arc<CoverSlot>,
     cover_probe: Option<CoverProbe>,
+    /// How the writer's frames are laid out (the crash cover's image
+    /// check).
+    frame_layout: FrameLayout,
 }
 
 impl std::fmt::Debug for LoopbackWriter {
@@ -698,6 +901,29 @@ pub(crate) fn black_contract_frame(
     Ok(gst::Buffer::from_mut_slice(data))
 }
 
+/// How `GstVideoInfo` lays out a frame of the writer's caps for
+/// `contract`: the layout of [`black_contract_frame`] and
+/// [`image_contract_frame`].
+pub(crate) fn frame_layout(contract: &OutputContract) -> Result<FrameLayout, PipelineError> {
+    let s = writer_caps_string(contract);
+    let caps: gst::Caps = s.parse().map_err(|_| PipelineError::Caps(s.clone()))?;
+    let info = gst_video::VideoInfo::from_caps(&caps).map_err(|_| PipelineError::Caps(s))?;
+    let planes = info.n_planes() as usize;
+    let (mut strides, mut offsets) = ([0; 3], [0; 3]);
+    for i in 0..planes.min(3) {
+        strides[i] = usize::try_from(info.stride()[i]).unwrap_or(0);
+        offsets[i] = info.offset()[i];
+    }
+    Ok(FrameLayout {
+        fourcc: crate::loopback_cover::fourcc(contract.format),
+        height: info.height(),
+        planes,
+        strides,
+        offsets,
+        size: info.size(),
+    })
+}
+
 impl LoopbackWriter {
     /// [`Self::build_with`] the default [`WriterConfig`].
     pub fn build(contract: OutputContract, sink: WriterSink) -> Result<Self, PipelineError> {
@@ -750,11 +976,10 @@ impl LoopbackWriter {
             error: Mutex::default(),
             frame: Mutex::new(PlaceholderFrame {
                 buffer: black_contract_frame(&contract)?,
-                image: None,
-                serial: 0,
-                state: PlaceholderState::Black,
-                decoded: None,
+                request: StillRequest::new(),
             }),
+            cover_image: Mutex::new(StillRequest::new()),
+            cover: Arc::default(),
         });
         let recorder = Arc::downgrade(&shared);
         pipeline
@@ -780,10 +1005,11 @@ impl LoopbackWriter {
             pipeline: MediaPipeline::from_parts(pipeline, loopback_caps),
             placeholder: black_contract_frame(&contract)?,
             cfg,
-            shared,
             thread: None,
-            cover: Arc::default(),
+            cover: Arc::clone(&shared.cover),
             cover_probe: None,
+            frame_layout: frame_layout(&contract)?,
+            shared,
         })
     }
 
@@ -791,6 +1017,16 @@ impl LoopbackWriter {
     /// goes to PLAYING and starts the placeholder thread. A second call
     /// does nothing. On error the pipeline is back in NULL. A start after
     /// [`Self::stop`] opens the device again and negotiates again.
+    ///
+    /// When the placeholder's image is still being decoded
+    /// ([`PlaceholderState::Pending`]: asked for before the start, or just
+    /// before it), the placeholder thread waits for it before its first
+    /// placeholder, for at most [`WriterConfig::image_wait`]: the first
+    /// placeholder is the image, not black. Past that bound it starts
+    /// black and shows the image once it is ready. Nothing is written
+    /// meanwhile (a crash cover of an earlier writer keeps serving its
+    /// image); a frame forwarded meanwhile is pushed as always. The start
+    /// itself never waits.
     pub fn start(&mut self) -> Result<(), PipelineError> {
         if self.thread.is_some() {
             return Ok(());
@@ -798,8 +1034,9 @@ impl LoopbackWriter {
         let res = self.start_inner();
         if res.is_err() {
             self.shared.lock().running = false;
-            let _ = self.pipeline.pipeline().set_state(gst::State::Null);
+            // Disarmed before the device closes (see `stop`).
             self.end_cover();
+            let _ = self.pipeline.pipeline().set_state(gst::State::Null);
         }
         res
     }
@@ -816,19 +1053,20 @@ impl LoopbackWriter {
             st.running = true;
             st.pushes = 0;
             st.last_forward = None;
-            st.kept.take()
+            st.end_holds()
         };
         // Dropped outside the push lock.
         drop(kept);
         let stop = Arc::new(StopSignal::default());
         let failure: Arc<Mutex<Option<String>>> = Arc::default();
         let (shared, after) = (Arc::clone(&self.shared), self.cfg.placeholder_after);
+        let image_until = Instant::now() + self.cfg.image_wait;
         let (thread_stop, thread_failure) = (Arc::clone(&stop), Arc::clone(&failure));
         let handle = std::thread::Builder::new()
             .name("obc-placeholder".into())
             .spawn(move || {
                 run_recording_panic(
-                    move || placeholder_loop(&shared, after, &thread_stop),
+                    move || placeholder_loop(&shared, after, image_until, &thread_stop),
                     &thread_failure,
                 )
             })
@@ -856,6 +1094,7 @@ impl LoopbackWriter {
             black: Canonical::of(&self.cfg.contract).black(),
             writer_worst_gap: self.cfg.placeholder_after
                 + Duration::from_nanos(self.shared.period_ns),
+            frame: self.frame_layout,
         };
         let Some(pad) = self
             .pipeline
@@ -876,7 +1115,10 @@ impl LoopbackWriter {
             if seen.fetch_add(1, Ordering::Relaxed) == 0 {
                 return gst::PadProbeReturn::Ok;
             }
-            flag.store(true, Ordering::Release);
+            // Claimed by `end_cover` first: it removes the probe.
+            if flag.swap(true, Ordering::AcqRel) {
+                return gst::PadProbeReturn::Ok;
+            }
             if let Some(plan) = plan.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 slot.spawn_helper(generation, plan);
             }
@@ -885,18 +1127,29 @@ impl LoopbackWriter {
         self.cover_probe = Some(CoverProbe { pad, id, fired });
     }
 
-    /// Ends the crash cover's part of a start, with the pipeline in NULL (no
-    /// buffer flows): the probe removed if it has not fired, the helper
-    /// thread joined, a cover still pending reported off.
+    /// Ends the crash cover's part of a start, before the pipeline goes to
+    /// NULL (the device still open, no push accepted any more): the probe
+    /// removed unless it fired (whichever of the two claims it first acts),
+    /// no install or re-install started from here on, the helper threads
+    /// joined (an install in flight completes on the open device), a cover
+    /// still pending reported off.
     fn end_cover(&mut self) {
         if let Some(p) = self.cover_probe.take()
-            && !p.fired.load(Ordering::Acquire)
+            && !p.fired.swap(true, Ordering::AcqRel)
             && let Some(id) = p.id
         {
             p.pad.remove_probe(id);
         }
+        self.cover.disarm();
         self.cover.join_helper();
         self.cover.cancel();
+    }
+
+    /// What the timeout image of the crash cover shows, as last installed
+    /// (see the module docs, "Crash cover"): [`CoverShows::Black`] before
+    /// any install.
+    pub fn cover_shows(&self) -> CoverShows {
+        self.cover.shows()
     }
 
     /// The crash cover of the current (or last) start: see
@@ -933,61 +1186,67 @@ impl LoopbackWriter {
     /// again, unless the file at its path is another one now (replaced at
     /// the same path: [`FileStamp`]). The last image decoded is kept across
     /// black, until another path is asked for: the same file asked for
-    /// again is shown at once ([`PlaceholderState::Image`], no decode).
-    /// Never blocks for the
-    /// decode; kept across [`Self::stop`] and [`Self::start`].
+    /// again is shown at once ([`PlaceholderState::Image`], no decode), and
+    /// so is the file the crash cover has decoded
+    /// ([`Self::set_cover_image`]). Never blocks for the decode; kept
+    /// across [`Self::stop`] and [`Self::start`]. Independent of the crash
+    /// cover: it changes nothing of what the cover shows.
     pub fn set_placeholder_image(&self, image: Option<&Path>) {
-        let want = image.map(|p| (p.to_path_buf(), FileStamp::of(p)));
-        let serial = {
-            let mut f = self.shared.frame.lock().unwrap_or_else(|e| e.into_inner());
-            if f.image == want {
-                return;
-            }
-            f.serial += 1;
-            // Another image asked for: the one kept is not shown again.
-            if let Some((p, _)) = &want
-                && f.decoded.as_ref().is_some_and(|((dp, _), _)| dp != p)
-            {
-                f.decoded = None;
-            }
-            let cached = match (&want, &f.decoded) {
-                (Some((p, Some(stamp))), Some(((dp, ds), b))) if p == dp && stamp == ds => {
-                    Some(b.clone())
-                }
-                _ => None,
-            };
-            f.image = want;
-            if let Some(b) = cached {
+        let shared = self.lock_cover_image().decoded.clone();
+        let mut f = self.shared.frame.lock().unwrap_or_else(|e| e.into_inner());
+        let (serial, path) = match f.request.ask(image, shared) {
+            Asked::Unchanged => return,
+            Asked::Ready(b) => {
                 f.buffer = b;
-                f.state = PlaceholderState::Image;
                 return;
             }
-            f.buffer = self.placeholder.clone();
-            f.state = if image.is_some() {
-                PlaceholderState::Pending
-            } else {
-                PlaceholderState::Black
-            };
-            f.serial
+            Asked::Black => {
+                f.buffer = self.placeholder.clone();
+                return;
+            }
+            Asked::Decode(serial, path) => {
+                f.buffer = self.placeholder.clone();
+                (serial, path)
+            }
         };
+        drop(f);
+        let shared = Arc::clone(&self.shared);
+        let decoded = move |frame| {
+            let mut f = shared.frame.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(Ok(b)) = f.request.decoded(serial, &path, frame) {
+                f.buffer = b;
+            }
+        };
+        self.decode(image, "obc-placeholder-image", decoded);
+    }
+
+    /// Decodes the image at `image` into a frame of the contract on a
+    /// thread named `name`, and hands the outcome to `done` there (or here,
+    /// when no thread can be started).
+    fn decode(
+        &self,
+        image: Option<&Path>,
+        name: &str,
+        done: impl FnOnce(Result<gst::Buffer, String>) + Send + 'static,
+    ) {
         let Some(path) = image.map(Path::to_path_buf) else {
             return;
         };
-        let (shared, contract) = (Arc::clone(&self.shared), self.cfg.contract);
-        let p = path.clone();
+        let contract = self.cfg.contract;
+        let done = Arc::new(Mutex::new(Some(done)));
+        let on_thread = Arc::clone(&done);
         let spawned = std::thread::Builder::new()
-            .name("obc-placeholder-image".into())
+            .name(name.into())
             .spawn(move || {
-                let frame = image_contract_frame(&contract, &p);
-                placeholder_decoded(&shared, serial, &p, frame);
+                let frame = image_contract_frame(&contract, &path);
+                if let Some(done) = on_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    done(frame);
+                }
             });
-        if let Err(e) = spawned {
-            placeholder_decoded(
-                &self.shared,
-                serial,
-                &path,
-                Err(format!("no thread to decode it: {e}")),
-            );
+        if let Err(e) = spawned
+            && let Some(done) = done.lock().unwrap_or_else(|e| e.into_inner()).take()
+        {
+            done(Err(format!("no thread to decode it: {e}")));
         }
     }
 
@@ -997,8 +1256,105 @@ impl LoopbackWriter {
             .frame
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .request
             .state
             .clone()
+    }
+
+    fn lock_cover_image(&self) -> MutexGuard<'_, StillRequest> {
+        self.shared
+            .cover_image
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Sets the crash cover's image (see the module docs, "Crash cover"):
+    /// black (`None`, at once), or the image at `image`
+    /// ([`image_contract_frame`]), decoded once on a thread of its own and
+    /// never on the caller's. Independent of the placeholder
+    /// ([`Self::set_placeholder_image`]): the cover shows its image whether
+    /// or not the placeholder shows one, and a placeholder switch or a
+    /// camera turned on or off changes nothing of it. The same file as the
+    /// one the placeholder has decoded is taken from it, not decoded again;
+    /// the image already asked for, the file at its path the same
+    /// ([`FileStamp`]), changes nothing, and the last image decoded is kept
+    /// across black, as for the placeholder. While another image is
+    /// decoded, the cover keeps what it shows; once it is ready the cover
+    /// shows it. An image that cannot be read leaves the cover black:
+    /// [`Self::cover_image_state`] is [`PlaceholderState::Failed`] with the
+    /// reason, and [`Self::cover_shows`] reports
+    /// [`CoverShows::BlackForImage`] with it. The cover is installed again
+    /// (on a helper thread) only when the frame it shows changes: the image
+    /// becomes ready, another one replaces it, or black replaces it. Kept
+    /// across [`Self::stop`] and [`Self::start`]; a start installs what it
+    /// is then.
+    pub fn set_cover_image(&self, image: Option<&Path>) {
+        let shared = self
+            .shared
+            .frame
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request
+            .decoded
+            .clone();
+        let mut c = self.lock_cover_image();
+        let (serial, path) = match c.ask(image, shared) {
+            Asked::Unchanged => return,
+            Asked::Ready(b) => {
+                self.shared.cover.set_image(Some(b), None);
+                return;
+            }
+            Asked::Black => {
+                self.shared.cover.set_image(None, None);
+                return;
+            }
+            // The cover keeps what it shows until the decode ends.
+            Asked::Decode(serial, path) => (serial, path),
+        };
+        drop(c);
+        let shared = Arc::clone(&self.shared);
+        let decoded = move |frame| {
+            let mut c = shared.cover_image.lock().unwrap_or_else(|e| e.into_inner());
+            match c.decoded(serial, &path, frame) {
+                Some(Ok(b)) => shared.cover.set_image(Some(b), None),
+                Some(Err(why)) => shared.cover.set_image(None, Some(why)),
+                None => {}
+            }
+        };
+        self.decode(image, "obc-cover-image", decoded);
+    }
+
+    /// The crash cover's image ([`Self::set_cover_image`]):
+    /// [`PlaceholderState::Black`] with none asked for,
+    /// [`PlaceholderState::Pending`] while it is decoded,
+    /// [`PlaceholderState::Image`] once ready, and
+    /// [`PlaceholderState::Failed`] (the cover black) with the reason it
+    /// cannot be read.
+    pub fn cover_image_state(&self) -> PlaceholderState {
+        self.lock_cover_image().state.clone()
+    }
+
+    /// The longest [`Self::hold_across_restart`] is meant to hold: long
+    /// enough for a session to stop and the next one to attach its output,
+    /// short enough that a restart that never comes back turns to the
+    /// placeholder within seconds.
+    pub const RESTART_HOLD: Duration = Duration::from_secs(3);
+
+    /// Holds the last forwarded frame across a deliberate restart of the
+    /// session (see the module docs, "Hold"): when the attached output
+    /// detaches within `bound` of this call, the writer keeps filling the
+    /// placeholder's slots with its last frame, as during an attached
+    /// stall, until an output attaches again or `bound` (from this call)
+    /// has passed, instead of turning to the placeholder at once. A call
+    /// replaces the window of an earlier one; the window is consumed by
+    /// the first detach that leaves no output attached, and by an attach.
+    /// With no frame kept (no output attached, or past its hold), nothing
+    /// is held. Never for a stop that must hide the camera (the camera
+    /// turned off, a privacy drop): those detach without this call, and the
+    /// placeholder follows as before. [`Self::RESTART_HOLD`] is the bound
+    /// meant for a session restart. Never blocks beyond the push lock.
+    pub fn hold_across_restart(&self, bound: Duration) {
+        self.shared.lock().restart_window = Some(Instant::now() + bound);
     }
 
     /// A handle for the active output to forward its frames with.
@@ -1064,7 +1420,7 @@ impl LoopbackWriter {
         let kept = {
             let mut st = self.shared.lock();
             st.running = false;
-            st.kept.take()
+            st.end_holds()
         };
         drop(kept);
         if let Some(t) = self.thread.take() {
@@ -1080,10 +1436,12 @@ impl LoopbackWriter {
                 ));
             }
         }
+        // The cover is disarmed while the device is still open: a decode
+        // finishing now cannot start a re-install on a closed device.
+        self.end_cover();
         let p = self.pipeline.pipeline();
         let state = p.set_state(gst::State::Null);
         let (_, cur, _) = p.state(gst::ClockTime::from_seconds(5));
-        self.end_cover();
         res?;
         state.map_err(|e| PipelineError::State(e.to_string()))?;
         if cur != gst::State::Null {
@@ -1099,18 +1457,40 @@ impl Drop for LoopbackWriter {
     }
 }
 
+/// How often the placeholder thread looks whether the image it waits for
+/// at the start is decoded ([`LoopbackWriter::start`]).
+const IMAGE_WAIT_POLL: Duration = Duration::from_millis(5);
+
 /// The placeholder thread: one placeholder per contract period, on its own
 /// grid (resynchronised, never bursting, after a stall longer than a
 /// period). While frames are forwarded it sleeps until the instant
 /// placeholders would be due, and starts a new grid there: they resume
 /// [`WriterConfig::placeholder_after`] after the last forwarded frame, not
-/// on the next tick of the old grid.
-fn placeholder_loop(shared: &Shared, after: Duration, stop: &StopSignal) {
+/// on the next tick of the old grid. Before its first placeholder it waits
+/// until `image_until` for an image still being decoded.
+fn placeholder_loop(shared: &Shared, after: Duration, image_until: Instant, stop: &StopSignal) {
     let period = Duration::from_nanos(shared.period_ns.max(1));
     let mut next = Instant::now();
+    let mut waiting = true;
     loop {
         if stop.wait_until(next) {
             return;
+        }
+        if waiting {
+            let pending = shared
+                .frame
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .request
+                .state
+                == PlaceholderState::Pending;
+            let now = Instant::now();
+            if pending && now < image_until {
+                next = (now + IMAGE_WAIT_POLL).min(image_until);
+                continue;
+            }
+            waiting = false;
+            next = now;
         }
         // A shallow copy: new metadata, the placeholder frame's memory.
         let placeholder = shared
@@ -1131,31 +1511,6 @@ fn placeholder_loop(shared: &Shared, after: Duration, stop: &StopSignal) {
     }
 }
 
-/// The decode `serial` of the placeholder image at `path` ended with
-/// `frame`: it becomes the placeholder (or its reason is kept, black in its
-/// place), unless a later request was made.
-fn placeholder_decoded(
-    shared: &Shared,
-    serial: u64,
-    path: &Path,
-    frame: Result<gst::Buffer, String>,
-) {
-    let mut f = shared.frame.lock().unwrap_or_else(|e| e.into_inner());
-    if f.serial != serial {
-        return;
-    }
-    match frame {
-        Ok(b) => {
-            if let Some((p, Some(stamp))) = &f.image {
-                f.decoded = Some(((p.clone(), *stamp), b.clone()));
-            }
-            f.buffer = b;
-            f.state = PlaceholderState::Image;
-        }
-        Err(why) => f.state = PlaceholderState::Failed(gst_obc::fallback_unreadable(path, &why)),
-    }
-}
-
 /// The writer on the CPU: a `fakesink` in place of `v4l2sink`, the real
 /// writer code otherwise. Frame counts and order are asserted; the times
 /// compared are lower bounds, except the hand-over bounds of the core
@@ -1171,7 +1526,7 @@ mod tests {
     use crate::ingest::Ingest;
     use crate::output::{Output, OutputConfig};
     use crate::session::Session;
-    use crate::test_support::require_elements;
+    use crate::test_support::{require_elements, white_png};
     use obc_core::config::VideoMemory;
 
     const ELEMENTS: &[&str] = &[
@@ -1277,29 +1632,6 @@ mod tests {
             format,
             .."320x240@30".parse().unwrap()
         }
-    }
-
-    /// A white PNG of `w x h` in `dir`.
-    fn white_png(dir: &Path, w: u32, h: u32) -> PathBuf {
-        let path = dir.join("away.png");
-        let p = gst::parse::launch(&format!(
-            "videotestsrc num-buffers=1 pattern=white ! video/x-raw,format=RGB,width={w},\
-             height={h} ! pngenc snapshot=true ! filesink location={}",
-            path.display()
-        ))
-        .unwrap();
-        p.set_state(gst::State::Playing).unwrap();
-        let m = p
-            .bus()
-            .unwrap()
-            .timed_pop_filtered(
-                gst::ClockTime::from_seconds(10),
-                &[gst::MessageType::Eos, gst::MessageType::Error],
-            )
-            .unwrap();
-        assert_eq!(m.type_(), gst::MessageType::Eos, "{m:?}");
-        p.set_state(gst::State::Null).unwrap();
-        path
     }
 
     const IMAGE_ELEMENTS: &[&str] = &[
@@ -1418,7 +1750,7 @@ mod tests {
             };
             assert!(
                 why.starts_with(&format!(
-                    "Fallback image {} could not be read (the image file is unreadable",
+                    "Away image {} could not be read (the image file is unreadable",
                     missing.display()
                 )) && why.ends_with("): showing black"),
                 "{why}"
@@ -1495,6 +1827,165 @@ mod tests {
         w.set_placeholder_image(Some(&png));
         assert_eq!(w.placeholder_state(), PlaceholderState::Pending);
         w.stop().unwrap();
+    }
+
+    /// The crash cover has an image of its own: the placeholder's never
+    /// reaches it, a cover image is decoded once (the same file the
+    /// placeholder decoded is shared, not decoded again, and the other way
+    /// round), the cover keeps its frame while another image is decoded,
+    /// an unreadable image leaves it black with the reason, and black is
+    /// at once.
+    #[test]
+    fn the_cover_image_is_independent_of_the_placeholder() {
+        require_elements(ELEMENTS);
+        require_elements(IMAGE_ELEMENTS);
+        let dir = tempfile::tempdir().unwrap();
+        let png = white_png(dir.path(), 160, 160);
+        let w = LoopbackWriter::build(small(OutputFormat::Nv12), WriterSink::Fake).unwrap();
+        let cover = || w.cover.image().map(|b| b.as_ptr());
+        let placeholder = || w.shared.frame.lock().unwrap().buffer.as_ptr();
+        assert_eq!(w.cover_image_state(), PlaceholderState::Black);
+        // The placeholder's image is not the cover's.
+        w.set_placeholder_image(Some(&png));
+        wait_until(Duration::from_secs(10), "the image decoded", || {
+            w.placeholder_state() == PlaceholderState::Image
+        });
+        assert!(cover().is_none(), "the placeholder reached the cover");
+        // The same file for the cover: taken from the placeholder at once.
+        w.set_cover_image(Some(&png));
+        assert_eq!(w.cover_image_state(), PlaceholderState::Image);
+        assert_eq!(cover(), Some(placeholder()), "decoded once, shared");
+        // Placeholder switches change nothing of the cover.
+        w.set_placeholder_image(None);
+        assert_eq!(w.placeholder_state(), PlaceholderState::Black);
+        assert!(cover().is_some());
+        let shown = cover();
+        // Another image: the cover keeps its frame while it is decoded;
+        // unreadable, it is black with the reason.
+        let missing = dir.path().join("gone.png");
+        w.set_cover_image(Some(&missing));
+        assert_ne!(w.cover_image_state(), PlaceholderState::Image);
+        wait_until(Duration::from_secs(10), "the decode failed", || {
+            matches!(w.cover_image_state(), PlaceholderState::Failed(_))
+        });
+        assert!(cover().is_none(), "black for an unreadable image");
+        let PlaceholderState::Failed(why) = w.cover_image_state() else {
+            unreachable!()
+        };
+        assert!(why.contains("could not be read"), "{why}");
+        assert_eq!(w.cover_shows(), CoverShows::BlackForImage(why));
+        assert_eq!(w.placeholder_state(), PlaceholderState::Black);
+        // The first image again: the cover dropped it when another path
+        // was asked for, the placeholder kept it, so it is shared at once.
+        w.set_placeholder_image(Some(&png));
+        assert_eq!(w.placeholder_state(), PlaceholderState::Image);
+        w.set_cover_image(Some(&png));
+        assert_eq!(w.cover_image_state(), PlaceholderState::Image);
+        assert_eq!(cover(), shown);
+        // Black at once, and the reason gone.
+        w.set_cover_image(None);
+        assert_eq!(w.cover_image_state(), PlaceholderState::Black);
+        assert!(cover().is_none());
+        assert_eq!(w.cover_shows(), CoverShows::Black);
+        // A cover decoded first is shared with the placeholder.
+        let other = dir.path().join("other.png");
+        std::fs::copy(&png, &other).unwrap();
+        w.set_cover_image(Some(&other));
+        wait_until(Duration::from_secs(10), "the cover image decoded", || {
+            w.cover_image_state() == PlaceholderState::Image
+        });
+        w.set_placeholder_image(Some(&other));
+        assert_eq!(w.placeholder_state(), PlaceholderState::Image);
+        assert_eq!(cover(), Some(placeholder()));
+        assert_ne!(cover(), shown, "another file");
+    }
+
+    /// A start with the placeholder's image still being decoded waits for
+    /// it before its first placeholder: the first frame at the sink is the
+    /// image, never black. Past [`WriterConfig::image_wait`] it starts
+    /// black and shows the image once ready; an image that cannot be read
+    /// ends the wait at once.
+    #[test]
+    fn a_start_waits_for_its_placeholder_image_before_the_first_placeholder() {
+        require_elements(ELEMENTS);
+        require_elements(IMAGE_ELEMENTS);
+        let dir = tempfile::tempdir().unwrap();
+        let png = white_png(dir.path(), 1920, 1080);
+        let start = |wait: Duration, image: &Path| {
+            let mut cfg = WriterConfig::new(small(OutputFormat::Nv12), WriterSink::Fake);
+            cfg.image_wait = wait;
+            let mut w = LoopbackWriter::build_with(cfg).unwrap();
+            let log = watch_sink(&w);
+            w.set_placeholder_image(Some(image));
+            assert_eq!(w.placeholder_state(), PlaceholderState::Pending);
+            w.start().unwrap();
+            (w, log)
+        };
+        let buffers = |log: &Mutex<SinkLog>, n: usize| {
+            wait_until(Duration::from_secs(10), "buffers at the sink", || {
+                log.lock().unwrap().buffers.len() >= n
+            });
+            log.lock().unwrap().buffers.clone()
+        };
+        // The default bound: the image from the first frame on.
+        let (mut w, log) = start(WriterConfig::IMAGE_WAIT, &png);
+        let seen = buffers(&log, 5);
+        assert!(seen.iter().all(|b| b.white), "{seen:?}");
+        assert_eq!(w.placeholder_state(), PlaceholderState::Image);
+        w.stop().unwrap();
+        // No wait: black first, the image once decoded.
+        let (mut w, log) = start(Duration::ZERO, &png);
+        assert!(buffers(&log, 1)[0].black);
+        wait_until(Duration::from_secs(10), "the image", || {
+            log.lock().unwrap().buffers.iter().any(|b| b.white)
+        });
+        w.stop().unwrap();
+        // Unreadable: the wait ends with the failure, black.
+        let (mut w, log) = start(Duration::from_secs(60), &dir.path().join("gone.png"));
+        assert!(buffers(&log, 3).iter().all(|b| b.black));
+        assert!(matches!(w.placeholder_state(), PlaceholderState::Failed(_)));
+        w.stop().unwrap();
+    }
+
+    /// An output forwarding to the writer leaves its placeholder slots to
+    /// the writer while its own decode of the image is pending (from its
+    /// start): the writer's placeholder, already the image, fills them, so
+    /// no black frame reaches the sink. Then the output's own image, then
+    /// the writer's again after the stop. System memory, CPU only.
+    #[test]
+    fn a_writer_output_leaves_its_slots_to_the_writer_while_its_image_is_decoded() {
+        require_elements(ELEMENTS);
+        require_elements(IMAGE_ELEMENTS);
+        let dir = tempfile::tempdir().unwrap();
+        let png = white_png(dir.path(), 3840, 2160);
+        let contract = small(OutputFormat::Nv12);
+        let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+        w.set_placeholder_image(Some(&png));
+        let log = watch_sink(&w);
+        w.start().unwrap();
+        wait_until(Duration::from_secs(20), "the writer's image", || {
+            w.placeholder_state() == PlaceholderState::Image
+        });
+        let mut cfg = OutputConfig::new(contract, OutputSink::Writer(w.handle()));
+        cfg.placeholder_image = Some(png.clone());
+        let mut o = Output::build_in(cfg, VideoMemory::System).unwrap();
+        o.start().unwrap();
+        wait_until(Duration::from_secs(20), "the output's image", || {
+            o.placeholder_state() == PlaceholderState::Image
+        });
+        wait_until(Duration::from_secs(10), "forwarded frames", || {
+            w.counts().forwarded >= 5
+        });
+        o.stop().unwrap();
+        let c = w.counts();
+        wait_until(Duration::from_secs(10), "the placeholder again", || {
+            w.counts().placeholder >= c.placeholder + 3
+        });
+        w.stop().unwrap();
+        let log = log.lock().unwrap();
+        let black = log.buffers.iter().filter(|b| b.black).count();
+        assert_eq!(black, 0, "{} buffers, {black} black", log.buffers.len());
+        assert!(log.buffers.iter().all(|b| b.white));
     }
 
     #[test]
@@ -2112,6 +2603,127 @@ mod tests {
             "the placeholder {:?} after the frame, bound {bound:?}",
             first - pushed
         );
+    }
+
+    /// Within the window of `hold_across_restart`, the last detach keeps
+    /// the last forwarded frame held (its very memory, no placeholder)
+    /// until the window ends; the placeholder then resumes, and nothing is
+    /// held after it. The window counts from the call. Bounds on time are
+    /// lower bounds, or generous upper ones (docs/testing.md).
+    #[test]
+    fn a_restart_hold_keeps_the_last_frame_until_its_bound() {
+        require_elements(ELEMENTS);
+        let contract = small(OutputFormat::Nv12);
+        let bound = Duration::from_millis(500);
+        let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+        let seen = record_tap(&mut w);
+        let h = w.handle();
+        w.start().unwrap();
+        wait_until(Duration::from_secs(10), "placeholders", || {
+            w.counts().placeholder >= 2
+        });
+        let attachment = h.attach(Duration::from_secs(60));
+        let frame = black_contract_frame(&contract).unwrap();
+        let forwarded = frame.map_readable().unwrap().as_ptr() as usize;
+        assert!(h.push(frame.clone()));
+        wait_until(Duration::from_secs(10), "held frames", || {
+            w.counts().held >= 2
+        });
+        let called = Instant::now();
+        w.hold_across_restart(bound);
+        drop(attachment);
+        let detached = w.counts();
+        wait_until(Duration::from_secs(10), "held after the detach", || {
+            w.counts().held >= detached.held + 3
+        });
+        wait_until(
+            Duration::from_secs(10),
+            "the placeholder past the bound",
+            || w.counts().placeholder >= detached.placeholder + 3,
+        );
+        let resumed = w.counts();
+        std::thread::sleep(Duration::from_millis(100));
+        let end = w.counts();
+        w.stop().unwrap();
+        assert_eq!(end.held, resumed.held, "held past the bound");
+
+        let seen = seen.lock().unwrap().clone();
+        let after: Vec<&TapEntry> = seen.iter().filter(|t| t.at >= called).collect();
+        let first_placeholder = after
+            .iter()
+            .position(|t| t.data != forwarded)
+            .expect("the placeholder after the bound");
+        assert!(first_placeholder >= 3, "{after:?}");
+        assert!(
+            after[first_placeholder..]
+                .iter()
+                .all(|t| t.data != forwarded),
+            "held after the placeholder resumed"
+        );
+        let period = Duration::from_nanos(contract.frame_duration_ns());
+        let at = after[first_placeholder].at - called;
+        println!("the placeholder {at:?} after the call, bound {bound:?}");
+        assert!(
+            at >= bound - period,
+            "the placeholder {at:?} after the call"
+        );
+        assert!(at < bound + Duration::from_secs(2), "{at:?}");
+        assert_pts_increasing(&seen);
+    }
+
+    /// A restart hold ends at the next attach (the attached rules apply
+    /// then: with a zero bound, nothing is held), and the window is used
+    /// once. A detach after the window has passed shows the placeholder at
+    /// once, as without the call.
+    #[test]
+    fn a_new_attach_ends_the_restart_hold_and_a_late_detach_has_none() {
+        require_elements(ELEMENTS);
+        let contract = small(OutputFormat::Nv12);
+        let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+        let h = w.handle();
+        w.start().unwrap();
+        wait_until(Duration::from_secs(10), "placeholders", || {
+            w.counts().placeholder >= 2
+        });
+        let held_then_placeholder = |w: &LoopbackWriter| {
+            let c = w.counts();
+            wait_until(Duration::from_secs(10), "the placeholder", || {
+                w.counts().placeholder >= c.placeholder + 3
+            });
+            let c = w.counts();
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(w.counts().held, c.held, "held: {c:?} -> {:?}", w.counts());
+        };
+        let attachment = h.attach(Duration::from_secs(60));
+        assert!(h.push(black_contract_frame(&contract).unwrap()));
+        w.hold_across_restart(Duration::from_secs(60));
+        drop(attachment);
+        let c = w.counts();
+        wait_until(Duration::from_secs(10), "held after the detach", || {
+            w.counts().held >= c.held + 3
+        });
+        // The new output attaches: the restart hold ends.
+        let next = h.attach(Duration::ZERO);
+        held_then_placeholder(&w);
+        // The window was used: its detach drops the kept frame.
+        assert!(h.push(black_contract_frame(&contract).unwrap()));
+        drop(next);
+        held_then_placeholder(&w);
+
+        // A window that passed before the detach: the placeholder at once.
+        let attachment = h.attach(Duration::from_secs(60));
+        assert!(h.push(black_contract_frame(&contract).unwrap()));
+        w.hold_across_restart(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(60));
+        let c = w.counts();
+        drop(attachment);
+        wait_until(Duration::from_secs(10), "the placeholder", || {
+            w.counts().placeholder >= c.placeholder + 3
+        });
+        let late = w.counts();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(w.counts().held, late.held, "held after a late detach");
+        w.stop().unwrap();
     }
 
     /// An output ending in [`OutputSink::Writer`] forwards to the writer:

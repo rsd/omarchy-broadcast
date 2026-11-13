@@ -132,14 +132,17 @@ The service is ready (`Type=dbus`) once it owns its bus name, which it requests 
 
 A clean restart (`systemctl --user restart omarchy-broadcastd`, an upgrade) is invisible to applications that hold the virtual camera: the old writer sends placeholders until it closes and the new one starts within about 50 ms.
 
-If the daemon crashes, the unit restarts it after 250 ms (`RestartSec=250ms`). The camera picture returns once the new process has opened the camera and initialised CUDA, which takes seconds; until then applications see black. To keep Chromium-based applications (Chrome, Edge, Teams, Zoom in the browser, Discord, Slack and other Electron applications) from losing the camera in that time, the daemon prepares the loopback at every writer start: it uploads a black image and sets the driver's `timeout`, so the driver keeps serving black frames after the daemon is gone ([loopback.md](loopback.md#what-the-daemon-sets-on-the-device), [ADR-0022](../adr/0022-crash-recovery-for-consumers.md)). The outcome is in the journal:
+If the daemon crashes, the unit restarts it after 250 ms (`RestartSec=250ms`). The camera picture returns once the new process has opened the camera and initialised CUDA, which takes seconds; until then applications see the crash cover's image: black, or the away image when `[output] placeholder = "image"` and `[effect] fallback_image` are set ([ADR-0034](../adr/0034-away-image.md)). To keep Chromium-based applications (Chrome, Edge, Teams, Zoom in the browser, Discord, Slack and other Electron applications) from losing the camera in that time, the daemon prepares the loopback at every writer start: it uploads the cover's image (black, or the away image) and sets the driver's `timeout`, so the driver keeps serving that image after the daemon is gone ([loopback.md](loopback.md#what-the-daemon-sets-on-the-device), [ADR-0022](../adr/0022-crash-recovery-for-consumers.md)). The outcome is in the journal:
 
 ```text
-crash cover: black timeout image, timeout 250 ms (consumers keep receiving black frames if the daemon stops writing)
+crash cover in place, timeout 250 ms (consumers keep receiving its timeout image if the daemon stops writing)
+crash cover shows black
+crash cover shows the away image <path>
+crash cover shows black in place of the away image: <reason>
 crash cover not in place: <reason>; a consumer may lose the camera if the daemon crashes
 ```
 
-The warning is only that: the daemon runs, an older v4l2loopback without the controls included.
+The warning is only that: the daemon runs, an older v4l2loopback without the controls included. The `crash cover shows` lines are logged once a cover is in place and again whenever what it shows changes; the last one is a warning that the away image cannot be shown, with its reason, and black is shown instead ([ADR-0034](../adr/0034-away-image.md)).
 
 A crash loop is stopped: after 5 starts within 60 s (`StartLimitBurst=5`, `StartLimitIntervalSec=60`) systemd stops restarting the unit and it is `failed`. Manual starts and restarts count too. Bring it back with:
 

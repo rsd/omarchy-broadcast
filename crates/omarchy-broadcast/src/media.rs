@@ -1,7 +1,7 @@
 //! `media`: the gallery of backgrounds and away images the daemon offers
 //! (interface revision 15): list a kind's items, import a file into the
-//! user's gallery (and select it as the background), remove an item of the
-//! user's gallery.
+//! user's gallery (and select it as the background, or from revision 17
+//! as the away image), remove an item of the user's gallery.
 //!
 //! `media` and `media list` never start the daemon; `media import` and
 //! `media remove` may, through D-Bus activation.
@@ -43,6 +43,20 @@ pub const MAX_LABEL_BYTES: usize = 96;
 /// The longest `media_type` in JSON, in bytes.
 const MAX_TYPE_BYTES: usize = 16;
 
+/// The configuration key an away image selected by `media import away
+/// --select` is written to.
+pub const AWAY_IMAGE_KEY: &str = "effect.fallback_image";
+
+/// The kinds `media import --select` can select.
+const SELECTABLE: [&str; 2] = [obc_ipc::media::KIND_BACKGROUND, obc_ipc::media::KIND_AWAY];
+
+/// The usage error of `media import KIND --select` for a kind that cannot
+/// be selected (`None`: it can), checked before anything is sent.
+pub fn select_refusal(kind: &str) -> Option<String> {
+    (!SELECTABLE.contains(&kind))
+        .then(|| format!("--select applies to `background` or `away`, not `{kind}`"))
+}
+
 /// The subcommands of `media`.
 #[derive(Subcommand, Clone)]
 pub enum MediaAction {
@@ -66,8 +80,12 @@ pub enum MediaAction {
         /// The file. A relative path is taken from the current directory;
         /// the daemon is given the absolute path.
         path: PathBuf,
-        /// Then select it: as `effect replace --image <stored path>` does
-        /// (only for `background`).
+        /// Then select it: a background as `effect replace --image <stored
+        /// path>` does; an away image as the away image
+        /// (`config set effect.fallback_image <stored path>`). Selecting an
+        /// away image does not switch `output.placeholder`: set it to
+        /// `image` (`config set output.placeholder image`) for the feed to
+        /// show it while there is no camera picture.
         #[arg(long)]
         select: bool,
         /// Print one JSON line (`"type":"media_import"`).
@@ -264,7 +282,7 @@ pub fn media_lines(kind: &str, reply: &MediaReply) -> Vec<String> {
 /// `{"v":1,"type":"media_import","kind":K,"path":P,"path_truncated":B,
 /// "selected":B}`: the stored path of an import (never clipped: `""` with
 /// `path_truncated` when its encoding is over [`MAX_PATH_BYTES`]), and
-/// whether it was then selected as the background.
+/// whether it was then selected (as the background, or as the away image).
 pub fn import_line(kind: &str, path: &str, selected: bool) -> String {
     let fits = encoded_len(path) <= MAX_PATH_BYTES;
     to_line(&ImportLine {
@@ -309,7 +327,8 @@ pub async fn run_list(kind: Option<&str>, json: bool) -> u8 {
 
 /// `media import KIND PATH [--select] [--json]`, the path already made
 /// absolute: the import, then with `select` the background set to the
-/// stored file and `replace` selected.
+/// stored file and `replace` selected, or (`away`) the stored file set as
+/// `effect.fallback_image` (`SetConfig`, revision 17).
 pub async fn run_import(kind: &str, path: &str, select: bool, json: bool) -> u8 {
     // The stored path, once the daemon has imported the file: a failure
     // after that is the selection's, and the message says so.
@@ -322,12 +341,21 @@ pub async fn run_import(kind: &str, path: &str, select: bool, json: bool) -> u8 
             .await
             .map_err(|e| bus::classify(&e, true))?;
         bus::require_media(revision)?;
+        let away = kind == obc_ipc::media::KIND_AWAY;
+        if select && away {
+            bus::require_away_image(revision)?;
+        }
         let path = proxy
             .import_media(kind, path)
             .await
             .map_err(bus::classify_ipc)?;
         *stored.borrow_mut() = Some(path.clone());
-        if select {
+        if select && away {
+            proxy
+                .set_config_value(AWAY_IMAGE_KEY, &obc_ipc::ConfigValue::Str(path.clone()))
+                .await
+                .map_err(bus::classify_ipc)?;
+        } else if select {
             proxy
                 .set_background_image(&path)
                 .await
@@ -426,6 +454,17 @@ mod tests {
                 serde_json::from_str(l).unwrap()
             })
             .collect()
+    }
+
+    #[test]
+    fn only_backgrounds_and_away_images_can_be_selected() {
+        for kind in obc_ipc::media::KINDS {
+            assert_eq!(select_refusal(kind), None, "{kind}");
+        }
+        assert_eq!(
+            select_refusal("sound").as_deref(),
+            Some("--select applies to `background` or `away`, not `sound`")
+        );
     }
 
     #[test]

@@ -49,6 +49,8 @@ pub enum CoreError {
     InvalidEffect(String),
     #[error("unsupported effect failure policy {0:?} (supported: black, image, none)")]
     InvalidEffectOnFailure(String),
+    #[error("unsupported placeholder {0:?} (supported: black, image)")]
+    InvalidOutputPlaceholder(String),
     #[error("unknown relighting light {0:?} (supported: warm, neutral, cool)")]
     InvalidRelightLight(String),
     #[error("invalid USB id {0:?} (expected vid:pid in hex, e.g. 1234:abcd)")]
@@ -358,6 +360,50 @@ impl FromStr for EffectOnFailure {
             "none" => Ok(EffectOnFailure::None),
             "image" => Ok(EffectOnFailure::Image),
             _ => Err(CoreError::InvalidEffectOnFailure(s.to_string())),
+        }
+    }
+}
+
+/// What the virtual camera shows while there is no camera picture
+/// (`[output] placeholder`): the camera off, a start before its first
+/// frame, a session that cannot start or stream, an input gap past the
+/// hold. Never while the camera picture streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputPlaceholder {
+    /// Black frames.
+    #[default]
+    Black,
+    /// The still image of `effect.fallback_image` (the "away image") in
+    /// place of the black frames (black when it is not set or cannot be
+    /// read, with a `Warning` saying so).
+    Image,
+}
+
+impl OutputPlaceholder {
+    /// `black` or `image`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OutputPlaceholder::Black => "black",
+            OutputPlaceholder::Image => "image",
+        }
+    }
+}
+
+impl fmt::Display for OutputPlaceholder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for OutputPlaceholder {
+    type Err = CoreError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "black" => Ok(OutputPlaceholder::Black),
+            "image" => Ok(OutputPlaceholder::Image),
+            _ => Err(CoreError::InvalidOutputPlaceholder(s.to_string())),
         }
     }
 }
@@ -1180,6 +1226,17 @@ mod tests {
         assert_eq!(EffectOnFailure::Image.to_string(), "image");
         assert!(EffectOnFailure::Black.hides() && EffectOnFailure::Image.hides());
         assert!(!EffectOnFailure::None.hides());
+        assert_eq!(
+            "Image".parse::<OutputPlaceholder>().unwrap(),
+            OutputPlaceholder::Image
+        );
+        assert_eq!(
+            " black ".parse::<OutputPlaceholder>().unwrap(),
+            OutputPlaceholder::Black
+        );
+        assert!("none".parse::<OutputPlaceholder>().is_err());
+        assert_eq!(OutputPlaceholder::default(), OutputPlaceholder::Black);
+        assert_eq!(OutputPlaceholder::Image.to_string(), "image");
     }
 
     #[test]
