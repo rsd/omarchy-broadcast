@@ -620,11 +620,11 @@ fn effect_error(e: PipelineError) -> String {
 }
 
 /// The frames that reached the loopback between two snapshots of the
-/// writer's counters: those `appsrc` accepted (forwarded or placeholder),
-/// less those it dropped from its full queue.
+/// writer's counters: those `appsrc` accepted (forwarded, held or
+/// placeholder), less those it dropped from its full queue.
 fn delivered_between(from: &WriterCounts, to: &WriterCounts) -> u64 {
-    let accepted =
-        (to.forwarded + to.placeholder).saturating_sub(from.forwarded + from.placeholder);
+    let total = |c: &WriterCounts| c.forwarded + c.held + c.placeholder;
+    let accepted = total(to).saturating_sub(total(from));
     let dropped = to.queue_dropped.saturating_sub(from.queue_dropped);
     accepted.saturating_sub(dropped)
 }
@@ -1714,6 +1714,13 @@ mod tests {
         // The drop counter read a frame the accepted counters had not yet
         // (two reads, not one snapshot): never below zero.
         assert_eq!(delivered_between(&counts(10, 0, 0), &counts(10, 0, 1)), 0);
+        // Held frames (the last frame repeated during a switch) reached the
+        // loopback as well.
+        let held = |held| WriterCounts {
+            held,
+            ..counts(40, 0, 0)
+        };
+        assert_eq!(delivered_between(&held(2), &held(11)), 9);
     }
 
     #[cfg(feature = "pipewire")]

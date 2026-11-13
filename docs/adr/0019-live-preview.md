@@ -53,7 +53,7 @@ The encoder uses no CUDA and the frames are in system memory, so nothing new cal
 ## Consequences
 - Revision 5 is additive: a client built for revision 4 ignores the new members. `Consumers` has a different meaning only while a lease is held; a client that needs the processes holding the loopback reads `LoopbackConsumers`.
 - While a preview runs, the daemon spends CPU on scaling, conversion and JPEG encoding at most 15 or 30 times per second, and nothing otherwise. The camera, the GPU and the effect pipeline are unchanged.
-- The preview is what applications get, including black placeholders and the black that precedes an effect: a user sees what a video call would see. It has no frames of its own to keep consistent with the stream.
+- The preview is what applications get, including black placeholders and the black that precedes an effect: a user sees what a video call would see. Frames the writer repeats while the output stalls (a stage switched on or off, [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md), "The hold") reach the tap like any other, so the preview shows the last frame, not black, across a toggle. It has no frames of its own to keep consistent with the stream.
 - Frames are not a stream with delivery guarantees: they are the latest image. A slow reader or encoder skips frames; the file always holds a complete one.
 - Known limitations:
   - A `PreviewFrame` may arrive after the reply of `ReleasePreview`.

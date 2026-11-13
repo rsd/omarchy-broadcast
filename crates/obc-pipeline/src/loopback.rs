@@ -30,11 +30,31 @@
 //!   immediate. The last image decoded is kept: asked for again while the
 //!   file at its path is the same one, it is shown at once, never black
 //!   meanwhile. The crash cover stays black whatever the placeholder shows.
+//!   While an output is attached, the placeholder gives way to the hold
+//!   (below) for as long as the hold lasts.
 //! * **Forwarded frames.** [`WriterHandle::push`], called by the active
 //!   output (an [`OutputSink::Writer`](crate::output::OutputSink::Writer)
 //!   output ends in an `appsink` that forwards every buffer). The buffer is
 //!   made writable for its metadata only: the memory is shared, never
 //!   copied.
+//! * **Hold.** While an output is attached ([`WriterHandle::attach`],
+//!   until its [`WriterAttachment`] is dropped), the writer keeps a reference to
+//!   the last forwarded frame `appsrc` accepted (its memory is not copied),
+//!   and a slot the placeholder thread would fill within the attach's
+//!   `hold` of that frame is filled by it again: a shallow copy, restamped
+//!   like any push, counted in [`WriterCounts::held`]. A stall of the
+//!   output's streaming thread (a deliberate switch of the effect, under
+//!   its engine lock, or a module loading) then shows the last frame, not
+//!   black. Past `hold` (a wedged output) the kept frame is dropped and the
+//!   placeholder resumes; the last detach drops it at once, so a stopped
+//!   output (the camera off) is followed by the placeholder
+//!   [`WriterConfig::placeholder_after`] after its last frame, as without
+//!   an attach. The writer's start and stop drop it too. This is
+//!   privacy-safe: a held frame is one a consumer was already shown, and a
+//!   real failure is covered by black (or image) frames the output itself
+//!   forwards (the effect element's `on_failure`), which reach the
+//!   consumer at once and then are what is held. Without an attach the
+//!   writer never holds.
 //!
 //! **Timestamps.** Every buffer pushed, placeholder or forwarded, gets the
 //! writer's own timestamp: PTS = the `CLOCK_MONOTONIC` time of the push
@@ -58,12 +78,14 @@
 //! frames while no writer streams: after the daemon died, until its restart
 //! writes again. The timeout stays above the writer's worst gap between
 //! two frames ([`WriterConfig::placeholder_after`] plus a period), so it
-//! never fires while the writer runs. The outcome is
+//! never fires while the writer runs. The hold does not change that gap: a
+//! held frame is pushed in a placeholder's slot, on the placeholder
+//! thread's grid. The outcome is
 //! [`LoopbackWriter::consumer_cover`]; a failure (an older driver without
 //! the controls) never stops the writer. Nothing is reset at the stop.
 //!
 //! **Tap.** [`LoopbackWriter::set_tap`] installs a [`FrameTap`]: every
-//! buffer `appsrc` accepted, placeholder and forwarded alike, is handed to
+//! buffer `appsrc` accepted, placeholder, forwarded and held alike, is handed to
 //! it after the restamp (the writer's PTS, duration and offset, exactly as
 //! the sink sees them), under the push lock, so tap order is push order.
 //! The optional PipeWire output (module `pipewire`, cargo feature
@@ -158,6 +180,10 @@ pub struct WriterCounts {
     pub placeholder: u64,
     /// Forwarded frames `appsrc` accepted.
     pub forwarded: u64,
+    /// Repeats of the last forwarded frame `appsrc` accepted, pushed in a
+    /// placeholder's slot while an output is attached (see the module docs,
+    /// "Hold").
+    pub held: u64,
     /// Pushes refused: by `appsrc` (flushing, stopped), or because the
     /// writer was not running.
     pub push_failed: u64,
@@ -201,6 +227,16 @@ struct PushState {
     last_push: Option<Instant>,
     /// When the last forwarded frame was pushed (accepted or not).
     last_forward: Option<Instant>,
+    /// The live [`WriterAttachment`]s, by id, in attach order, with their
+    /// hold bound: while one is, the last forwarded frame is kept and held,
+    /// for the last one's bound.
+    attachments: Vec<(u64, Duration)>,
+    /// The id of the next [`WriterHandle::attach`].
+    next_attachment: u64,
+    /// The last forwarded frame `appsrc` accepted while attached, by
+    /// reference (its memory is not copied). Dropped by the last detach,
+    /// past the hold, and at the writer's start and stop.
+    kept: Option<gst::Buffer>,
     /// Sees every accepted buffer; behind the push lock, so a call never
     /// overlaps [`LoopbackWriter::set_tap`].
     tap: TapSlot,
@@ -219,6 +255,7 @@ struct Shared {
     state: Mutex<PushState>,
     placeholder: AtomicU64,
     forwarded: AtomicU64,
+    held: AtomicU64,
     push_failed: AtomicU64,
     /// The first ERROR the pipeline posted.
     error: Mutex<Option<String>>,
@@ -264,6 +301,8 @@ pub enum PlaceholderState {
 enum Producer {
     Placeholder,
     Forwarded,
+    /// The last forwarded frame again, in a placeholder's slot.
+    Held,
 }
 
 /// Whether the placeholder thread pushes at `now`: only when no forwarded
@@ -276,6 +315,20 @@ fn placeholder_due(last_forward: Option<Instant>, now: Instant, after: Duration)
 /// (`None`: none was forwarded, they are due).
 fn placeholder_due_at(last_forward: Option<Instant>, after: Duration) -> Option<Instant> {
     last_forward.map(|t| t + after)
+}
+
+/// Whether the kept frame is held at `now`: an output is attached (its
+/// bound `hold`) and the last forwarded frame is less than `hold` old.
+fn hold_due(hold: Option<Duration>, last_forward: Option<Instant>, now: Instant) -> bool {
+    hold.is_some_and(|hold| last_forward.is_some_and(|t| now < t + hold))
+}
+
+impl PushState {
+    /// The bound of the hold: the last live attachment's, `None` with no
+    /// output attached.
+    fn hold(&self) -> Option<Duration> {
+        self.attachments.last().map(|&(_, hold)| hold)
+    }
 }
 
 /// The outcome of a push.
@@ -320,21 +373,51 @@ impl Shared {
 
     /// Stamps `buffer` on the writer's timeline and pushes it, under the
     /// push lock. A placeholder is pushed only if [`placeholder_due`]
-    /// (`after`).
-    fn push(&self, mut buffer: gst::Buffer, producer: Producer, after: Duration) -> Pushed {
+    /// (`after`), and is replaced by the kept frame while [`hold_due`].
+    fn push(&self, buffer: gst::Buffer, producer: Producer, after: Duration) -> Pushed {
         let mut st = self.lock();
         let now = Instant::now();
-        if producer == Producer::Forwarded {
+        // Dropped after the lock is released.
+        let mut expired = None;
+        let (buffer, producer) = if producer == Producer::Forwarded {
             st.last_forward = Some(now);
+            (buffer, producer)
         } else if !placeholder_due(st.last_forward, now, after) {
             return Pushed::NotDue(placeholder_due_at(st.last_forward, after).unwrap_or(now));
-        }
+        } else if hold_due(st.hold(), st.last_forward, now)
+            && let Some(kept) = &st.kept
+        {
+            // A shallow copy: new metadata, the forwarded frame's memory.
+            (kept.copy(), Producer::Held)
+        } else {
+            // Past the hold (a wedged output): the placeholder, as without
+            // an output attached.
+            expired = st.kept.take();
+            (buffer, producer)
+        };
+        let (pushed, replaced) = self.push_locked(&mut st, buffer, producer, now);
+        drop(st);
+        // A buffer of the output's pool goes back to it here, outside the
+        // push lock.
+        drop((expired, replaced));
+        pushed
+    }
+
+    /// [`Self::push`] once the frame is chosen; also returns the kept frame
+    /// a forwarded one replaced, for the caller to drop after the lock.
+    fn push_locked(
+        &self,
+        st: &mut PushState,
+        mut buffer: gst::Buffer,
+        producer: Producer,
+        now: Instant,
+    ) -> (Pushed, Option<gst::Buffer>) {
         if !st.running {
             // A placeholder racing the stop is not a failure.
             if producer == Producer::Forwarded {
                 self.push_failed.fetch_add(1, Ordering::Relaxed);
             }
-            return Pushed::Refused;
+            return (Pushed::Refused, None);
         }
         let pts = next_pts(
             st.last_pts_ns,
@@ -355,25 +438,33 @@ impl Shared {
                 b.unset_flags(gst::BufferFlags::DISCONT);
             }
         }
-        // A reference for the tap (no copy), kept only when one is set.
-        let tapped = st.tap.0.as_ref().map(|_| buffer.clone());
+        // A reference (no copy) for the tap, and for the hold while an
+        // output is attached; taken only when needed.
+        let keep = producer == Producer::Forwarded && !st.attachments.is_empty();
+        let reference = (st.tap.0.is_some() || keep).then(|| buffer.clone());
         let accepted = self.appsrc.push_buffer(buffer).is_ok();
         if accepted {
-            if let (Some(tap), Some(b)) = (&st.tap.0, &tapped) {
+            if let (Some(tap), Some(b)) = (&st.tap.0, &reference) {
                 tap(b);
             }
+            let replaced = if keep {
+                std::mem::replace(&mut st.kept, reference)
+            } else {
+                None
+            };
             st.last_pts_ns = Some(pts);
             st.pushes += 1;
             st.last_push = Some(now);
             match producer {
                 Producer::Placeholder => &self.placeholder,
                 Producer::Forwarded => &self.forwarded,
+                Producer::Held => &self.held,
             }
             .fetch_add(1, Ordering::Relaxed);
-            Pushed::Accepted
+            (Pushed::Accepted, replaced)
         } else {
             self.push_failed.fetch_add(1, Ordering::Relaxed);
-            Pushed::Refused
+            (Pushed::Refused, None)
         }
     }
 
@@ -382,6 +473,7 @@ impl Shared {
         WriterCounts {
             placeholder: self.placeholder.load(Ordering::Relaxed),
             forwarded: self.forwarded.load(Ordering::Relaxed),
+            held: self.held.load(Ordering::Relaxed),
             push_failed: self.push_failed.load(Ordering::Relaxed),
             queue_dropped: self.appsrc.property::<u64>("dropped"),
             last_push,
@@ -432,6 +524,64 @@ impl WriterHandle {
 
     pub fn counts(&self) -> WriterCounts {
         self.shared.counts()
+    }
+
+    /// Attaches an output (see the module docs, "Hold"): until the returned
+    /// [`WriterAttachment`] is dropped, a slot the placeholder thread would
+    /// fill within `hold` of the last forwarded frame is filled by that frame
+    /// again ([`WriterCounts::held`]). Attachments are counted, so two
+    /// outputs handing over to each other each hold their own; the bound is
+    /// the last live attachment's. Never blocks beyond the push lock.
+    pub fn attach(&self, hold: Duration) -> WriterAttachment {
+        let mut st = self.shared.lock();
+        let id = st.next_attachment;
+        st.next_attachment += 1;
+        st.attachments.push((id, hold));
+        WriterAttachment {
+            shared: Arc::clone(&self.shared),
+            id,
+        }
+    }
+
+    /// The bounds of the live attachments, in attach order (tests).
+    #[cfg(test)]
+    pub(crate) fn attached_holds(&self) -> Vec<Duration> {
+        let st = self.shared.lock();
+        st.attachments.iter().map(|&(_, hold)| hold).collect()
+    }
+}
+
+/// An output attached to a [`LoopbackWriter`] ([`WriterHandle::attach`]);
+/// dropping it detaches that output, and only that one. With no output
+/// attached any more, the kept frame is dropped at once and the placeholder
+/// resumes [`WriterConfig::placeholder_after`] after the last forwarded
+/// frame, as before any attach.
+#[must_use = "the output is detached when the attachment is dropped"]
+pub struct WriterAttachment {
+    shared: Arc<Shared>,
+    id: u64,
+}
+
+impl std::fmt::Debug for WriterAttachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriterAttachment")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for WriterAttachment {
+    fn drop(&mut self) {
+        let mut st = self.shared.lock();
+        st.attachments.retain(|&(id, _)| id != self.id);
+        let released = if st.attachments.is_empty() {
+            st.kept.take()
+        } else {
+            None
+        };
+        drop(st);
+        // A buffer of the output's pool goes back to it outside the lock.
+        drop(released);
     }
 }
 
@@ -595,6 +745,7 @@ impl LoopbackWriter {
             state: Mutex::default(),
             placeholder: AtomicU64::new(0),
             forwarded: AtomicU64::new(0),
+            held: AtomicU64::new(0),
             push_failed: AtomicU64::new(0),
             error: Mutex::default(),
             frame: Mutex::new(PlaceholderFrame {
@@ -660,12 +811,15 @@ impl LoopbackWriter {
             .pipeline()
             .set_state(gst::State::Playing)
             .map_err(|e| PipelineError::State(e.to_string()))?;
-        {
+        let kept = {
             let mut st = self.shared.lock();
             st.running = true;
             st.pushes = 0;
             st.last_forward = None;
-        }
+            st.kept.take()
+        };
+        // Dropped outside the push lock.
+        drop(kept);
         let stop = Arc::new(StopSignal::default());
         let failure: Arc<Mutex<Option<String>>> = Arc::default();
         let (shared, after) = (Arc::clone(&self.shared), self.cfg.placeholder_after);
@@ -907,7 +1061,12 @@ impl LoopbackWriter {
     pub fn stop(&mut self) -> Result<(), PipelineError> {
         let mut res = Ok(());
         // No push can be in flight past this point.
-        self.shared.lock().running = false;
+        let kept = {
+            let mut st = self.shared.lock();
+            st.running = false;
+            st.kept.take()
+        };
+        drop(kept);
         if let Some(t) = self.thread.take() {
             t.stop.set();
             let joined = t.handle.join();
@@ -1706,6 +1865,253 @@ mod tests {
         }
         // The producer's buffer keeps its own (absent) timestamp.
         assert_eq!(pushed.pts(), None);
+    }
+
+    /// Unattached, the writer never holds: the placeholder follows the last
+    /// forwarded frame. Attached, the last forwarded frame (its very memory,
+    /// at the tap) fills the placeholder's slots, until the hold bound has
+    /// passed or the output detaches; the placeholder then resumes.
+    #[test]
+    fn an_attached_output_has_its_last_frame_held_not_the_placeholder() {
+        require_elements(ELEMENTS);
+        let contract = small(OutputFormat::Nv12);
+        let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+        let seen: Arc<Mutex<Vec<usize>>> = Arc::default();
+        let s = Arc::clone(&seen);
+        w.set_tap(Some(Arc::new(move |b: &gst::Buffer| {
+            s.lock()
+                .unwrap()
+                .push(b.map_readable().unwrap().as_ptr() as usize);
+        })));
+        let h = w.handle();
+        let frame = || black_contract_frame(&contract).unwrap();
+        let address = |b: &gst::Buffer| b.map_readable().unwrap().as_ptr() as usize;
+        // Every frame forwarded stays alive, so no two share an address.
+        let mut alive = Vec::new();
+        // Forwards three frames, 5 ms apart; the last one's memory.
+        let mut forward = || {
+            let mut last = 0;
+            for _ in 0..3 {
+                let b = frame();
+                last = address(&b);
+                assert!(h.push(b.clone()));
+                alive.push(b);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            last
+        };
+        w.start().unwrap();
+        wait_until(Duration::from_secs(10), "placeholders", || {
+            w.counts().placeholder >= 2
+        });
+
+        // Unattached: as before any attach.
+        let c0 = w.counts();
+        forward();
+        wait_until(Duration::from_secs(10), "the placeholder again", || {
+            w.counts().placeholder >= c0.placeholder + 3
+        });
+        assert_eq!(w.counts().held, 0, "{:?}", w.counts());
+
+        // Attached: the last frame, while within the hold.
+        let attachment = h.attach(Duration::from_secs(2));
+        let last = forward();
+        let c1 = w.counts();
+        wait_until(Duration::from_secs(1), "held frames", || {
+            w.counts().held >= c1.held + 3
+        });
+        let c2 = w.counts();
+        assert_eq!(c2.placeholder, c1.placeholder, "{c1:?} -> {c2:?}");
+        let tapped = seen.lock().unwrap().clone();
+        let first = tapped.iter().position(|&a| a == last).unwrap();
+        let held = &tapped[first + 1..];
+        assert!(held.len() >= 3, "{held:x?}");
+        assert!(
+            held.iter().all(|&a| a == last),
+            "the held memory is not the last forwarded frame's: {last:#x} {held:x?}"
+        );
+
+        // Past the hold: the placeholder resumes, and nothing is held.
+        wait_until(
+            Duration::from_secs(10),
+            "the placeholder past the hold",
+            || w.counts().placeholder >= c2.placeholder + 3,
+        );
+        let c3 = w.counts();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(w.counts().held, c3.held, "held past the hold");
+
+        // Detached: the placeholder at once (after `placeholder_after`),
+        // never the kept frame.
+        let c4 = w.counts();
+        forward();
+        drop(attachment);
+        wait_until(
+            Duration::from_secs(1),
+            "the placeholder after a detach",
+            || w.counts().placeholder >= c4.placeholder + 3,
+        );
+        let c5 = w.counts();
+        assert_eq!(c5.held, c4.held, "held after a detach: {c4:?} -> {c5:?}");
+        w.stop().unwrap();
+    }
+
+    /// A buffer the tap saw: when, its memory, its PTS.
+    #[derive(Debug, Clone, Copy)]
+    struct TapEntry {
+        at: Instant,
+        data: usize,
+        pts: u64,
+    }
+
+    /// Installs a tap recording every buffer `appsrc` accepted.
+    fn record_tap(w: &mut LoopbackWriter) -> Arc<Mutex<Vec<TapEntry>>> {
+        let seen: Arc<Mutex<Vec<TapEntry>>> = Arc::default();
+        let s = Arc::clone(&seen);
+        w.set_tap(Some(Arc::new(move |b: &gst::Buffer| {
+            let entry = TapEntry {
+                at: Instant::now(),
+                data: b.map_readable().unwrap().as_ptr() as usize,
+                pts: b.pts().map(|p| p.nseconds()).unwrap_or(u64::MAX),
+            };
+            s.lock().unwrap().push(entry);
+        })));
+        seen
+    }
+
+    fn assert_pts_increasing(seen: &[TapEntry]) {
+        for pair in seen.windows(2) {
+            assert!(
+                pair[1].pts > pair[0].pts,
+                "PTS not strictly increasing at the tap: {pair:?}"
+            );
+        }
+    }
+
+    /// Detached in the middle of a hold (the camera turned off during a
+    /// switch): the placeholder takes over within `placeholder_after` plus
+    /// a period (the last forwarded frame is long past `placeholder_after`,
+    /// so within a period), and nothing is held after the detach. The
+    /// upper bound on time is generous (docs/testing.md); the measured
+    /// delay is printed.
+    #[test]
+    fn a_detach_during_a_hold_resumes_the_placeholder() {
+        require_elements(ELEMENTS);
+        let contract = small(OutputFormat::Nv12);
+        let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+        let seen = record_tap(&mut w);
+        let h = w.handle();
+        w.start().unwrap();
+        wait_until(Duration::from_secs(10), "placeholders", || {
+            w.counts().placeholder >= 2
+        });
+        let attachment = h.attach(Duration::from_secs(60));
+        let frame = black_contract_frame(&contract).unwrap();
+        let forwarded = frame.map_readable().unwrap().as_ptr() as usize;
+        assert!(h.push(frame.clone()));
+        wait_until(Duration::from_secs(10), "held frames", || {
+            w.counts().held >= 3
+        });
+
+        drop(attachment);
+        let detached = Instant::now();
+        assert!(h.attached_holds().is_empty());
+        let at_detach = w.counts();
+        wait_until(
+            Duration::from_secs(10),
+            "the placeholder after the detach",
+            || w.counts().placeholder >= at_detach.placeholder + 3,
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let end = w.counts();
+        w.stop().unwrap();
+        assert_eq!(
+            end.held, at_detach.held,
+            "held after the detach: {at_detach:?} -> {end:?}"
+        );
+        let seen = seen.lock().unwrap().clone();
+        let after: Vec<&TapEntry> = seen.iter().filter(|t| t.at >= detached).collect();
+        assert!(
+            after.iter().all(|t| t.data != forwarded),
+            "the kept frame after the detach: {after:?}"
+        );
+        let first = after.first().expect("a placeholder after the detach");
+        let delay = first.at - detached;
+        println!("placeholder {delay:?} after the detach");
+        let period = Duration::from_nanos(contract.frame_duration_ns());
+        assert!(
+            delay < w.cfg.placeholder_after + period + Duration::from_secs(1),
+            "the placeholder {delay:?} after the detach"
+        );
+        assert_pts_increasing(&seen);
+    }
+
+    /// The hold lasts its bound: from the last forwarded frame, only that
+    /// frame (held, PTS strictly increasing) until the bound has passed,
+    /// then the placeholder, and nothing held after it. The first
+    /// placeholder never comes before the bound (it cannot: the push
+    /// checks the bound under its lock); its upper bound is generous
+    /// (docs/testing.md), the measured hold is printed.
+    #[test]
+    fn a_hold_lasts_its_bound_then_the_placeholder_resumes() {
+        require_elements(ELEMENTS);
+        let contract = small(OutputFormat::Nv12);
+        let period = Duration::from_nanos(contract.frame_duration_ns());
+        let bound = Duration::from_millis(400);
+        let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+        let seen = record_tap(&mut w);
+        let h = w.handle();
+        w.start().unwrap();
+        wait_until(Duration::from_secs(10), "placeholders", || {
+            w.counts().placeholder >= 2
+        });
+        let _attachment = h.attach(bound);
+        let frame = black_contract_frame(&contract).unwrap();
+        let forwarded = frame.map_readable().unwrap().as_ptr() as usize;
+        let before = Instant::now();
+        assert!(h.push(frame.clone()));
+        let pushed = Instant::now();
+        let c0 = w.counts();
+        wait_until(
+            Duration::from_secs(10),
+            "the placeholder past the bound",
+            || w.counts().placeholder > c0.placeholder,
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        let end = w.counts();
+        w.stop().unwrap();
+
+        let seen = seen.lock().unwrap().clone();
+        let start = seen.iter().position(|t| t.data == forwarded).unwrap();
+        let tail = &seen[start..];
+        let resumed = tail.iter().position(|t| t.data != forwarded).unwrap();
+        let (held, after) = tail.split_at(resumed);
+        let held = &held[1..];
+        assert!(!held.is_empty(), "nothing held: {:?}", w.counts());
+        assert_eq!(held.len() as u64, end.held - c0.held, "{c0:?} -> {end:?}");
+        assert!(
+            after.iter().all(|t| t.data != forwarded),
+            "held after the placeholder resumed: {after:?}"
+        );
+        assert_pts_increasing(tail);
+        assert_pts_increasing(&seen);
+
+        let first = after[0].at;
+        println!(
+            "held {} frames, the placeholder {:?} after the frame",
+            held.len(),
+            first - pushed
+        );
+        assert!(
+            first >= before + bound - period,
+            "the placeholder {:?} after the frame, within the bound {bound:?}",
+            first - before
+        );
+        assert!(
+            first < pushed + bound + Duration::from_secs(2),
+            "the placeholder {:?} after the frame, bound {bound:?}",
+            first - pushed
+        );
     }
 
     /// An output ending in [`OutputSink::Writer`] forwards to the writer:

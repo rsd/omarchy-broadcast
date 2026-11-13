@@ -128,7 +128,15 @@
 //! to the writer ([`crate::loopback::WriterHandle::push`]) by reference: the
 //! writer, not this output, owns the device, restamps the frames and runs
 //! the loopback check ([`crate::loopback`]). The writer's contract must be
-//! this output's.
+//! this output's. While streaming (from [`Output::start`] to its stop,
+//! drop included) the output is attached to the writer
+//! ([`crate::loopback::WriterHandle::attach`], bound the shorter of
+//! [`OutputConfig::hold_timeout`] and [`Output::STALL_HOLD`]): a stall of
+//! this output's streaming thread (a deliberate switch of the effect, a
+//! module loading) is covered by the writer repeating the last frame
+//! forwarded, not by its placeholder. A stall past the bound (a wedged
+//! output) shows the placeholder. A stopped output is detached, so a
+//! camera turned off shows the placeholder, never a frozen frame.
 //!
 //! **Loopback check.** [`Output::start`] compares what the loopback accepts
 //! with the contract once, before streaming
@@ -157,7 +165,7 @@ use crate::clock::{Latest, Pacer, PacerConfig, PacerCounts, PhaseLockConfig, Ste
 use crate::effect::{EffectBackend, EffectSettings, EffectStats, EffectStatus, effect_element};
 use crate::frame::{Canonical, Frame, FrameWriter};
 use crate::ingest::CUDA_CONTEXT_TYPE;
-use crate::loopback::WriterHandle;
+use crate::loopback::{WriterAttachment, WriterHandle};
 use crate::module::{ModulePlacement, ModuleStageSpec, ModuleStats, check_specs, module_element};
 use crate::pipeline::{
     MediaPipeline, PipelineError, StopError, add_linked, both_stopped, capsfilter, cuda_caps, make,
@@ -200,7 +208,10 @@ pub struct OutputConfig {
     /// catch-up burst of the clock.
     pub queue_buffers: u32,
     /// How long a source switch holds the last frame while waiting for the
-    /// new source ([`Output::hold_for`]).
+    /// new source ([`Output::hold_for`]); also, up to
+    /// [`Output::STALL_HOLD`], how long a loopback writer this output
+    /// forwards to holds its last frame while it sends none
+    /// ([`crate::loopback::WriterHandle::attach`]).
     pub hold_timeout: Duration,
     /// The output clock's phase lock ([`crate::clock`]).
     pub phase_lock: PhaseLockConfig,
@@ -469,6 +480,10 @@ pub struct Output {
     effect: Option<gst_obc::ObcEffect>,
     /// The module stage elements, by spec name, in pipeline order.
     modules: Vec<(String, gst_obc::ObcModule)>,
+    /// This output attached to the writer it forwards to
+    /// ([`OutputSink::Writer`]): set by a start that succeeded, dropped by
+    /// the stop.
+    attachment: Option<WriterAttachment>,
 }
 
 impl std::fmt::Debug for Output {
@@ -741,6 +756,7 @@ impl Output {
             memory,
             effect,
             modules,
+            attachment: None,
         })
     }
 
@@ -896,9 +912,23 @@ impl Output {
         if res.is_err() {
             let _ = self.pipeline.pipeline().set_state(gst::State::Null);
             self.cuda = None;
+        } else if let OutputSink::Writer(writer) = &self.cfg.sink {
+            // Detached by the stop: see the module docs.
+            self.attachment = Some(writer.attach(self.cfg.hold_timeout.min(Self::STALL_HOLD)));
         }
         res
     }
+
+    /// The longest a loopback writer this output forwards to holds its
+    /// last frame while the output sends none (see the module docs,
+    /// "Forwarding to a loopback writer"), unless
+    /// [`OutputConfig::hold_timeout`] is shorter. Long enough to cover a
+    /// deliberate stall of the streaming thread (a stage or effect switch
+    /// can take longer than one frame period), short enough that a real stall (a pipeline
+    /// error, a dead clock, a module stuck) still turns to the writer's
+    /// placeholder within a second, rather than leaving the last live frame
+    /// frozen on the consumer.
+    pub const STALL_HOLD: Duration = Duration::from_secs(1);
 
     fn start_inner(&mut self) -> Result<(), PipelineError> {
         self.pipeline.prepare()?;
@@ -1090,6 +1120,9 @@ impl Output {
     /// as the thread is joined all the same.
     pub fn stop_checked(&mut self) -> Result<(), StopError> {
         let mut res = Ok(());
+        // Detached before the pipeline goes to NULL: the writer's
+        // placeholder follows a stopped output.
+        drop(self.attachment.take());
         if let Some(clock) = self.clock.take() {
             // An unexpected end is judged before the stop flag is set.
             let ended = clock.failure();
@@ -1564,6 +1597,65 @@ mod tests {
         .unwrap();
         o.start().unwrap();
         o
+    }
+
+    /// An output forwarding to a writer is attached to it from a start that
+    /// succeeded to its stop (a second start adds nothing, a restart
+    /// attaches again, a drop detaches), bound the shorter of its
+    /// `hold_timeout` and [`Output::STALL_HOLD`]; a start that fails leaves
+    /// it unattached. The failure is a `filesrc` on a missing file added to
+    /// the output's pipeline: it fails the change to PAUSED. CPU only.
+    #[test]
+    fn a_writer_output_is_attached_from_a_successful_start_to_its_stop() {
+        use crate::loopback::{LoopbackWriter, WriterSink};
+        require_elements(&["appsrc", "capssetter", "appsink", "fakesink", "filesrc"]);
+        let contract: OutputContract = "320x240@30".parse().unwrap();
+        let w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+        let h = w.handle();
+        let output = |hold_timeout| {
+            let mut cfg = OutputConfig::new(contract, OutputSink::Writer(w.handle()));
+            cfg.hold_timeout = hold_timeout;
+            Output::build_in(cfg, VideoMemory::System).unwrap()
+        };
+
+        let mut o = output(Duration::from_secs(60));
+        assert!(h.attached_holds().is_empty());
+        o.start().unwrap();
+        assert_eq!(h.attached_holds(), [Output::STALL_HOLD]);
+        o.start().unwrap();
+        assert_eq!(h.attached_holds(), [Output::STALL_HOLD]);
+        o.stop().unwrap();
+        assert!(h.attached_holds().is_empty());
+        o.start().unwrap();
+        assert_eq!(h.attached_holds(), [Output::STALL_HOLD], "re-attached");
+        o.stop().unwrap();
+        assert!(h.attached_holds().is_empty());
+
+        let bad = gst::ElementFactory::make("filesrc")
+            .property("location", "/nonexistent/obc-output-start-failure")
+            .build()
+            .unwrap();
+        o.pipeline().pipeline().add(&bad).unwrap();
+        assert!(o.start().is_err());
+        assert!(!o.is_running());
+        assert!(h.attached_holds().is_empty(), "attached by a failed start");
+        bad.set_state(gst::State::Null).unwrap();
+        o.pipeline().pipeline().remove(&bad).unwrap();
+        o.start().unwrap();
+        assert_eq!(h.attached_holds(), [Output::STALL_HOLD]);
+
+        // A shorter hold_timeout is the bound; each output has its own
+        // attachment, and the drop ends only its own.
+        let mut short = output(Duration::from_millis(200));
+        short.start().unwrap();
+        assert_eq!(
+            h.attached_holds(),
+            [Output::STALL_HOLD, Duration::from_millis(200)]
+        );
+        drop(o);
+        assert_eq!(h.attached_holds(), [Duration::from_millis(200)]);
+        drop(short);
+        assert!(h.attached_holds().is_empty());
     }
 
     /// A clock thread that panicked is an error, but the pipeline is taken
