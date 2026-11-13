@@ -89,7 +89,7 @@ use obc_gpu::{ContextGuard, CuContext, CuStream, DeviceNv12Buffer, PinnedHostBuf
 
 use super::{ModuleStats, STATUS_MESSAGE, chain_kind};
 use crate::cuda::{self, MAP_CUDA};
-use crate::effect::{has_new_source_flag, has_repeat_flag};
+use crate::effect::{has_new_source_flag, has_placeholder_flag, has_repeat_flag};
 use crate::settings::{EffectStatus, StageRequest, StageStats};
 use crate::video::{CudaFrame, colour_of, input_context};
 
@@ -798,6 +798,16 @@ impl ObcModule {
     /// passthrough to match, creating the CUDA objects when a stage has to
     /// run on CUDA frames.
     fn prepare_frame(&self, inbuf: &gst::BufferRef) {
+        if has_placeholder_flag(inbuf) {
+            // The output's placeholder image: passed as it came, no state
+            // touched (see the module docs).
+            lock(&self.stream).process = false;
+            let obj = self.obj();
+            if !obj.is_passthrough() {
+                obj.set_passthrough(true);
+            }
+            return;
+        }
         let (any, ready, live) = {
             let c = lock(&self.shared.control);
             (c.any_effective(), c.ready, Arc::clone(&c.live))

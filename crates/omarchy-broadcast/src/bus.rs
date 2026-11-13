@@ -372,6 +372,19 @@ pub fn require_media(revision: u32) -> Result<(), Failure> {
     )))
 }
 
+/// Fails unless a daemon of interface revision `revision` takes the away
+/// image (`effect.fallback_image`) from `SetConfig`.
+pub fn require_away_image(revision: u32) -> Result<(), Failure> {
+    if revision >= obc_ipc::PLACEHOLDER_REVISION {
+        return Ok(());
+    }
+    Err(Failure::Unsupported(format!(
+        "the daemon cannot select an away image (its interface revision is {revision}, that \
+         needs {}); update omarchy-broadcastd",
+        obc_ipc::PLACEHOLDER_REVISION
+    )))
+}
+
 /// `GetMedia(kind)` without starting the daemon, within [`READ_TIMEOUT`].
 pub async fn media(conn: &Connection, kind: &str) -> Result<obc_ipc::MediaReply, Failure> {
     let call = async {
@@ -515,6 +528,14 @@ mod tests {
 
     fn fdo_error(e: fdo::Error) -> zbus::Error {
         zbus::Error::FDO(Box::new(e))
+    }
+
+    #[test]
+    fn selecting_an_away_image_needs_revision_17() {
+        assert!(require_away_image(obc_ipc::PLACEHOLDER_REVISION).is_ok());
+        let e = require_away_image(16).unwrap_err();
+        assert_eq!(e.json_code(), "unsupported-daemon");
+        assert!(e.message().contains("revision is 16"), "{}", e.message());
     }
 
     #[test]

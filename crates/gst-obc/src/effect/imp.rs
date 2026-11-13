@@ -190,6 +190,23 @@
 //! price of the cache, on every processed frame a module downstream writes
 //! into. A re-sent frame counts in no frame counter of the statistics.
 //!
+//! # The placeholder image
+//!
+//! The output clock marks a placeholder tick that pushes its image (the
+//! away image, not a camera frame) with
+//! [`PLACEHOLDER_FLAG`](super::PLACEHOLDER_FLAG). [`decide`] does not run
+//! on it: `prepare_frame` returns before anything else, with the frame
+//! passed through (BaseTransform passthrough: the input buffer, no pool
+//! buffer, no CUDA object made, no backend call), whatever the effect,
+//! its status, its warm-up or `on-failure`. The image is no camera
+//! picture, so it has nothing to hide, and replacing, blurring or blacking
+//! it would undo the choice of showing it. Nothing of the stream state is
+//! touched: the cache is neither written nor dropped (a repeat after the
+//! placeholder still finds it, valid as before), a pending temporal reset
+//! waits for the next camera frame, and `StreamState::raw_on_screen` and
+//! `toggle_found` stay as the last camera frame left them. The frame
+//! counts in no frame counter of the statistics.
+//!
 //! # The fallback image
 //!
 //! With `on-failure=image` and a `fallback-image`, the image is wanted for
@@ -283,7 +300,7 @@ use obc_backend::{
 };
 use obc_gpu::{ContextGuard, CuContext, CuStream, Event};
 
-use super::{STATUS_MESSAGE, has_new_source_flag, has_repeat_flag};
+use super::{STATUS_MESSAGE, has_new_source_flag, has_placeholder_flag, has_repeat_flag};
 use crate::background;
 use crate::cuda::{self, MAP_CUDA};
 use crate::settings::{
@@ -2894,16 +2911,16 @@ impl ObjectImpl for ObcEffect {
                 glib::ParamSpecString::builder("on-failure")
                     .nick("On failure")
                     .blurb(
-                        "Output after a failure: black | image (the fallback image) | none \
+                        "Output after a failure: black | image (the away image) | none \
                          (the unprocessed input)",
                     )
                     .default_value(Some("black"))
                     .flags(rw)
                     .build(),
                 glib::ParamSpecString::builder("fallback-image")
-                    .nick("Fallback image")
+                    .nick("Away image")
                     .blurb(
-                        "Absolute path of the image shown in place of black with \
+                        "Absolute path of the away image shown in place of black with \
                          on-failure=image (empty: none, black)",
                     )
                     .default_value(Some(""))
@@ -3323,6 +3340,19 @@ impl ObcEffect {
     /// match, creating the CUDA objects when the frame needs them (or the
     /// stages alone need them loaded: they pass frames through until then).
     fn prepare_frame(&self, inbuf: &gst::BufferRef) {
+        if has_placeholder_flag(inbuf) {
+            // The output's placeholder image: passed as it came, no state
+            // touched (see the module docs).
+            let mut st = lock(&self.stream);
+            st.action = FrameAction::Passthrough;
+            st.resend = false;
+            drop(st);
+            let obj = self.obj();
+            if !obj.is_passthrough() {
+                obj.set_passthrough(true);
+            }
+            return;
+        }
         // A new source's room was never shown: the hold applies to it.
         let (raw_on_screen, toggle_found) = {
             let mut st = lock(&self.stream);

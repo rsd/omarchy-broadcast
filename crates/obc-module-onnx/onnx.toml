@@ -7,7 +7,7 @@
 abi = 1
 id = "br.com.dias.onnx-cutout"
 name = "Open-model cut-out"
-version = "0.41.1"
+version = "0.42.0"
 licence = "MIT OR Apache-2.0 (module); models Apache-2.0 (MediaPipe, PP-HumanSeg, MODNet)"
 kind = "video-stage"
 library = "/usr/lib/omarchy-broadcast/modules/libobc_module_onnx.so"

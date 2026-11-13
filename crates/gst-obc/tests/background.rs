@@ -465,7 +465,7 @@ fn the_fallback_image_decodes_to_yuv_in_the_colour_asked() {
     assert_eq!(
         gst_obc::fallback_unreadable(&missing, &e),
         format!(
-            "Fallback image {} could not be read ({e}): showing black",
+            "Away image {} could not be read ({e}): showing black",
             missing.display()
         )
     );

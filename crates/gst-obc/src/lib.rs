@@ -7,8 +7,9 @@
 //!   status, the status of each stage, statistics); see [`effect`] for its
 //!   behaviour.
 //! * [`NEW_SOURCE_FLAG`]: the buffer flag the output clock marks the first
-//!   frame of a new source with, and [`REPEAT_FLAG`] the one it marks a
-//!   repeated frame with.
+//!   frame of a new source with, [`REPEAT_FLAG`] the one it marks a
+//!   repeated frame with, and [`PLACEHOLDER_FLAG`] the one it marks its
+//!   placeholder image with (passed through untouched).
 //! * [`EffectSettings`] (with its [`StageRequest`]s), [`EffectFallback`],
 //!   [`EffectStatus`], [`EffectStats`] (with its [`StageStats`]): what it
 //!   is asked to do and what it reports.
@@ -27,8 +28,8 @@ mod settings;
 mod video;
 
 pub use effect::{
-    ELEMENT_NAME, NEW_SOURCE_FLAG, ObcEffect, REPEAT_FLAG, STATUS_MESSAGE, from_element,
-    has_new_source_flag, has_repeat_flag, register,
+    ELEMENT_NAME, NEW_SOURCE_FLAG, ObcEffect, PLACEHOLDER_FLAG, REPEAT_FLAG, STATUS_MESSAGE,
+    from_element, has_new_source_flag, has_placeholder_flag, has_repeat_flag, register,
 };
 pub use enhance::{EnhanceStats, ObcEnhance};
 pub use module::{ModuleStats, ObcModule};

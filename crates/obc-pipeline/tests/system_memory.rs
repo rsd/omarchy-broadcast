@@ -25,7 +25,7 @@ use obc_pipeline::effect::EffectKind;
 use obc_pipeline::pipeline::{ingest_adapter, names};
 use obc_pipeline::{
     EffectBackend, EffectSettings, EffectStatus, Ingest, LoopbackWriter, MediaPipeline, Output,
-    OutputConfig, OutputSink, Session, WriterSink,
+    OutputConfig, OutputSink, PlaceholderState, Session, WriterSink,
 };
 
 /// Every element these tests build.
@@ -259,6 +259,81 @@ fn a_cuda_only_backend_fails_the_effect_on_a_system_memory_session() {
         lumas.lock().unwrap()
     );
     assert_eq!(FakeLog::get(&log.processes), 0);
+}
+
+/// A white PNG of `w x h` in `dir`.
+fn white_png(dir: &std::path::Path, w: u32, h: u32) -> std::path::PathBuf {
+    let path = dir.join("away.png");
+    let p = gst::parse::launch(&format!(
+        "videotestsrc num-buffers=1 pattern=white ! video/x-raw,format=RGB,width={w},\
+         height={h} ! pngenc snapshot=true ! filesink location={}",
+        path.display()
+    ))
+    .unwrap();
+    p.set_state(gst::State::Playing).unwrap();
+    let m = p
+        .bus()
+        .unwrap()
+        .timed_pop_filtered(
+            gst::ClockTime::from_seconds(10),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        )
+        .unwrap();
+    assert_eq!(m.type_(), gst::MessageType::Eos, "{m:?}");
+    p.set_state(gst::State::Null).unwrap();
+    path
+}
+
+/// The output clock's placeholder image reaches the sink as decoded
+/// through an effect in force: never blurred or blacked, and the backend
+/// never runs on it. The black placeholder before it is the effect's
+/// (black under blur at a start), as before. No camera: every tick is a
+/// placeholder. CPU only.
+#[test]
+fn the_placeholder_image_passes_the_effect_untouched() {
+    require_elements(ELEMENTS);
+    require_elements(&["pngenc", "pngdec", "filesink", "videoconvert", "videoscale"]);
+    let dir = tempfile::tempdir().unwrap();
+    let png = white_png(dir.path(), 160, 120);
+    let contract: OutputContract = "320x240@30".parse().unwrap();
+    let fake = FakeFactory::new(FakeConfig::default());
+    let log: Arc<FakeLog> = Arc::clone(&fake.log);
+    let mut cfg = OutputConfig::new(contract, OutputSink::Fake);
+    cfg.effect = Some(EffectSettings::of(EffectKind::Blur));
+    cfg.effect_backend = Some(EffectBackend::new(fake.clone()));
+    let output = Output::build_in(cfg, VideoMemory::System).expect("build output");
+    let lumas = centre_luma(&output, 320, 240);
+    let session = Session::new(output).expect("start output");
+    wait_for(Duration::from_secs(10), "the effect to load", || {
+        session.output().effect_status() == EffectStatus::Ready
+    });
+    wait_for(Duration::from_secs(10), "black placeholders", || {
+        lumas.lock().unwrap().len() >= 5
+    });
+    session.output().set_placeholder_image(Some(&png));
+    wait_for(Duration::from_secs(10), "the image decoded", || {
+        session.output().placeholder_state() == PlaceholderState::Image
+    });
+    // The tick in flight may still be a black one.
+    let from = lumas.lock().unwrap().len() + 1;
+    let processes = FakeLog::get(&log.processes);
+    wait_for(Duration::from_secs(10), "image placeholders", || {
+        lumas.lock().unwrap().len() >= from + 10
+    });
+    let seen = lumas.lock().unwrap()[from..].to_vec();
+    assert!(
+        seen.iter().all(|&y| y == 235),
+        "the image, untouched: {seen:?}"
+    );
+    assert!(
+        FakeLog::get(&log.processes) <= processes + 1,
+        "the backend ran on the image"
+    );
+    assert!(
+        processes > 0,
+        "the black placeholder ran through the effect"
+    );
+    session.stop().unwrap();
 }
 
 /// A session forwarding to a started writer, blur loaded and showing, on

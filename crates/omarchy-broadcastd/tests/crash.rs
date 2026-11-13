@@ -638,7 +638,7 @@ fn wait_cover(log: &Arc<Mutex<Vec<String>>>, what: &str) -> String {
             .cloned()
         {
             assert!(
-                line.contains("crash cover: black timeout image"),
+                line.contains("crash cover in place"),
                 "{what}: the crash cover is not in place: {line}"
             );
             return line;

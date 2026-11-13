@@ -302,6 +302,25 @@ fn the_new_source_flag_is_a_free_video_buffer_flag() {
     assert!(gst_obc::has_new_source_flag(&b));
 }
 
+/// The placeholder flag is a free video buffer flag, apart from the other
+/// two, read with its helper.
+#[test]
+fn the_placeholder_flag_is_a_free_video_buffer_flag_of_its_own() {
+    let f = gst_obc::PLACEHOLDER_FLAG;
+    assert_eq!(f.bits().count_ones(), 1);
+    assert!(!f.intersects(gst::BufferFlags::all()), "a core buffer flag");
+    assert!(f.bits() > gst_video::ffi::GST_VIDEO_BUFFER_FLAG_INTERLACED);
+    assert!(!f.intersects(gst_obc::NEW_SOURCE_FLAG | gst_obc::REPEAT_FLAG));
+    gst::init().unwrap();
+    let mut b = gst::Buffer::new();
+    assert!(!gst_obc::has_placeholder_flag(&b));
+    b.get_mut().unwrap().set_flags(f);
+    let c = b.copy();
+    assert!(gst_obc::has_placeholder_flag(&c));
+    assert!(!gst_obc::has_repeat_flag(&c));
+    assert!(!gst_obc::has_new_source_flag(&c));
+}
+
 #[test]
 fn status_changes_are_posted_on_the_bus() {
     let (e, fx) = element();
@@ -976,7 +995,7 @@ fn host_an_unreadable_fallback_image_shows_black_and_says_why() {
     let why = rig.effect.stats().fallback_error.unwrap();
     assert!(
         why.starts_with(&format!(
-            "Fallback image {} could not be read (",
+            "Away image {} could not be read (",
             missing.display()
         )) && why.ends_with("): showing black"),
         "{why}"
@@ -1311,6 +1330,76 @@ fn host_a_repeat_re_sends_the_last_processed_frame_and_runs_no_effect() {
     assert_eq!(get(&fake.log.processes), processes + 2);
     assert_eq!(get(&fake.log.last_strength_milli), 900);
     assert_eq!(rig.input_now(), rig.input_bytes, "the input was written");
+    assert_no_cuda(&rig, &fake);
+    rig.stop();
+}
+
+/// The output clock's placeholder image (a buffer with the placeholder
+/// flag) leaves the effect byte for byte as it came, the input buffer
+/// itself, in every state: while the effect loads at a start (where a
+/// camera frame is black), under blur and replace, after a failure. No
+/// backend call, no frame counted, and the repeat cache stays valid.
+#[test]
+fn host_the_placeholder_image_passes_through_untouched_under_every_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let bg = png(dir.path(), "bg.png", "smpte", 80, 60);
+    let fake = FakeFactory::new(FakeConfig {
+        load_delay: Duration::from_millis(300),
+        ..FakeConfig::default()
+    });
+    let mut rig = HostRig::new(
+        Some(Arc::clone(&fake)),
+        &EffectSettings::of(EffectKind::Blur),
+    );
+    let away = |rig: &mut HostRig| {
+        let bytes = rig.bytes_with(gst_obc::PLACEHOLDER_FLAG);
+        assert_eq!(bytes, rig.input_bytes, "the image is untouched");
+        assert_eq!(rig.last_sent().0, rig.in_memory, "the input buffer itself");
+    };
+    // A start while blur loads: camera frames black, the image as it is.
+    assert_eq!(rig.frame(), Seen::Black, "loading");
+    away(&mut rig);
+    assert_eq!(rig.frame(), Seen::Black, "a camera frame is still black");
+    rig.frames_until(Duration::from_secs(5), status_is(EffectStatus::Ready));
+
+    // Blur ready, a processed frame cached.
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    let cached = rig.last_sent().0;
+    let processes = get(&fake.log.processes);
+    let stats = rig.effect.stats();
+    for _ in 0..3 {
+        away(&mut rig);
+    }
+    assert_eq!(get(&fake.log.processes), processes, "no effect ran");
+    let after = rig.effect.stats();
+    assert_eq!(after.frames_processed, stats.frames_processed);
+    assert_eq!(after.frames_passthrough, stats.frames_passthrough);
+    assert_eq!(after.frames_black, stats.frames_black);
+    // The cache is still valid: a repeat re-sends it, no effect runs.
+    assert_eq!(rig.frame_with(gst_obc::REPEAT_FLAG), Seen::FakeBlur);
+    assert_eq!(rig.last_sent().0, cached, "the cached output");
+    assert_eq!(get(&fake.log.processes), processes);
+
+    // Replace ready: the image is never swapped for the background.
+    rig.effect
+        .apply(&EffectSettings {
+            background: Some(bg),
+            ..EffectSettings::of(EffectKind::Replace)
+        })
+        .unwrap();
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeReplace);
+    let processes = get(&fake.log.processes);
+    away(&mut rig);
+    assert_eq!(get(&fake.log.processes), processes, "no effect ran");
+    assert_eq!(rig.frame(), Seen::FakeReplace);
+
+    // A failure (on-failure black): camera frames black, the image as it is.
+    fake.set(|c| c.fail_process = Some("fake frame failure".into()));
+    assert_eq!(rig.frame(), Seen::Black);
+    assert!(failed(&rig));
+    away(&mut rig);
+    assert_eq!(rig.frame(), Seen::Black);
     assert_no_cuda(&rig, &fake);
     rig.stop();
 }

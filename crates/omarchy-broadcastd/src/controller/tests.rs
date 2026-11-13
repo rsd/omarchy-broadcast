@@ -11,7 +11,7 @@ use tempfile::TempDir;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::*;
-use crate::backend::fake::{FakeBackend, Hook, Shown, World};
+use crate::backend::fake::{FakeBackend, Hook, ImageEvent, Shown, World};
 use crate::camera::tests::cam;
 use crate::log::Level;
 
@@ -10036,6 +10036,15 @@ impl H {
     fn session_params(&self) -> SessionParams {
         self.world().session.as_ref().expect("a session").0.clone()
     }
+
+    /// The running session's output placeholder image, `None` without a
+    /// session or with black.
+    fn session_params_or_none(&self) -> Option<PathBuf> {
+        self.world()
+            .session
+            .as_ref()
+            .and_then(|(p, _)| p.placeholder_image.clone())
+    }
 }
 
 #[test]
@@ -11896,7 +11905,7 @@ fn an_unreadable_fallback_image_is_black_with_a_warning() {
     assert_eq!(
         warning,
         format!(
-            "Fallback image {AWAY} could not be read (the image file is unreadable: gone): \
+            "Away image {AWAY} could not be read (the image file is unreadable: gone): \
              showing black"
         )
     );
@@ -11950,7 +11959,7 @@ fn a_session_under_image_gives_the_element_the_image_and_reports_what_it_cannot_
     assert!(placeholder_sets(&h).is_empty());
     // The element cannot read it: said only while the effect has failed
     // (until then the image is not what shows).
-    let why = format!("Fallback image {AWAY} could not be read (no such file): showing black");
+    let why = format!("Away image {AWAY} could not be read (no such file): showing black");
     h.world().fallback_error = Some(why.clone());
     h.world().effect_status = EffectStatus::Ready;
     h.tick(500);
@@ -11977,6 +11986,594 @@ fn a_reload_to_image_stops_a_session_without_its_effect_and_shows_the_image() {
     assert!(h.world().session.is_none(), "{:?}", h.snap());
     assert_eq!(h.state(), State::Error);
     assert_eq!(h.world().placeholder, Some(PathBuf::from(AWAY)));
+}
+
+// ---- the away image (`output.placeholder = "image"`) ----
+
+fn away_config(extra: &str) -> String {
+    format!("[output]\nplaceholder = \"image\"\n[effect]\nfallback_image = \"{AWAY}\"\n{extra}")
+}
+
+fn away() -> Option<PathBuf> {
+    Some(PathBuf::from(AWAY))
+}
+
+/// The writer's placeholder holds the away image from the writer's start
+/// on, whatever the camera does: it shows only where nothing is forwarded
+/// (the camera off, a start before its first frame, a stall), and is
+/// already decoded when the camera turns off, so the feed never shows
+/// black while it would be decoded.
+#[test]
+fn the_writer_s_placeholder_holds_the_away_image_from_its_start_whatever_the_camera_does() {
+    let mut h = H::new(&away_config(""), |_| {});
+    // Given before the writer starts, nobody watching yet.
+    h.tick(100);
+    assert_eq!(h.world().writer_start_images, [(away(), away())]);
+    assert_eq!(placeholder_sets(&h), [away()]);
+    h.activate(0);
+    // Streaming: still the image (nothing shows it while frames are
+    // forwarded).
+    assert_eq!(h.world().placeholder, away());
+    // The camera off with an application holding the feed: the image,
+    // already given.
+    h.call(|r| Command::SetEnabled(false, r), 1000).unwrap();
+    assert_eq!(h.state(), State::Off);
+    assert_eq!(h.world().placeholder, away());
+    h.call(|r| Command::SetEnabled(true, r), 2000).unwrap();
+    h.tick(2300);
+    assert_eq!(h.state(), State::Active, "{:?}", h.snap());
+    h.call(|r| Command::SetEnabled(false, r), 3000).unwrap();
+    h.consumers(0, 3500);
+    h.tick(3600);
+    assert_eq!(h.world().placeholder, away());
+    // Never switched: no black in between at any transition.
+    assert_eq!(placeholder_sets(&h), [away()]);
+    assert_eq!(h.snap().warning, "");
+}
+
+/// A writer started again (a crash restart is the daemon's first start,
+/// a rebuild for a new contract) is given the away image before it
+/// starts, so it decodes it before its first placeholder.
+#[test]
+fn a_writer_started_again_is_given_the_away_image_before_its_start() {
+    let mut h = H::new(&away_config(""), |_| {});
+    h.activate(0);
+    h.world().writer_failure = Some("v4l2sink: gone".into());
+    h.tick(1000);
+    h.tick(1000 + WRITER_RETRY.as_millis() as u64 + 100);
+    let starts = h.world().writer_start_images.clone();
+    assert!(starts.len() >= 2, "{starts:?}");
+    assert!(starts.iter().all(|i| *i == (away(), away())), "{starts:?}");
+    // Under the default, black.
+    let mut h = H::new(&format!("[effect]\nfallback_image = \"{AWAY}\"\n"), |_| {});
+    h.tick(100);
+    assert_eq!(h.world().writer_start_images, [(None, None)]);
+}
+
+#[test]
+fn the_away_image_shows_while_a_start_waits_for_its_first_frame() {
+    let mut h = H::new(&away_config(""), |w| w.frames = false);
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Starting, "{:?}", h.snap());
+    assert_eq!(h.world().placeholder, away());
+    h.world().frames = true;
+    h.tick(400);
+    assert_eq!(h.state(), State::Active, "{:?}", h.snap());
+    // Kept while the camera streams: its frames take over.
+    assert_eq!(h.world().placeholder, away());
+    assert_eq!(placeholder_sets(&h), [away()]);
+}
+
+#[test]
+fn the_away_image_shows_while_a_start_is_refused_or_there_is_no_camera() {
+    // A session that cannot start at all (not for privacy).
+    let mut h = H::new(&away_config(""), |w| {
+        w.fail_start = Some("output pipeline: no".into())
+    });
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Error, "{:?}", h.snap());
+    assert!(h.world().session.is_none());
+    assert_eq!(h.world().placeholder, away());
+    // No camera: an error, the image.
+    let mut h = H::new(&away_config(""), |w| w.cameras.clear());
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Error, "{:?}", h.snap());
+    assert_eq!(h.world().placeholder, away());
+    // The camera lost mid-stream with no other: the image once the
+    // session is gone.
+    let mut h = H::new(&away_config(""), |w| w.cameras.truncate(1));
+    h.activate(0);
+    assert_eq!(h.world().placeholder, away());
+    h.world().failure = Some(crate::backend::Failure::Camera("unplugged".into()));
+    h.world().cameras.clear();
+    h.tick(1000);
+    h.tick(1100);
+    assert_ne!(h.state(), State::Active, "{:?}", h.snap());
+    assert_eq!(h.world().placeholder, away());
+}
+
+#[test]
+fn black_keeps_every_no_picture_case_black() {
+    let black = format!("[effect]\nfallback_image = \"{AWAY}\"\n");
+    let mut h = H::new(&black, |w| w.frames = false);
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Starting);
+    h.call(|r| Command::SetEnabled(false, r), 1000).unwrap();
+    let mut e = H::new(&black, |w| w.cameras.clear());
+    e.consumers(1, 0);
+    e.tick(300);
+    assert_eq!(e.state(), State::Error);
+    assert!(placeholder_sets(&h).is_empty());
+    assert!(placeholder_sets(&e).is_empty());
+    assert_eq!(h.session_params_or_none(), None);
+}
+
+#[test]
+fn a_refused_start_under_black_on_failure_is_black_whatever_the_placeholder_says() {
+    // Privacy holds the feed with `on_failure = "black"`: a privacy
+    // refusal follows switch 1, not `output.placeholder`.
+    let mut h = H::new(
+        &away_config("mode = \"blur\"\non_failure = \"black\"\n"),
+        |w| w.fail_start_effects = Some("obc-module: no CUDA memory".into()),
+    );
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Error);
+    assert_eq!(h.world().session_starts, 0);
+    // The away image while the start runs (no camera picture yet), black
+    // once privacy refused it.
+    assert_eq!(h.world().placeholder, None);
+    assert_eq!(placeholder_sets(&h), [away(), None]);
+    // The camera turned off ends the hold: no camera picture, the away
+    // image.
+    h.call(|r| Command::SetEnabled(false, r), 1000).unwrap();
+    assert_eq!(h.state(), State::Off);
+    assert_eq!(h.world().placeholder, away());
+    // The crash cover shows the away image throughout.
+    assert_eq!(h.world().cover_image_sets, [away()]);
+}
+
+/// A streaming session stopped for privacy under `on_failure = "black"`
+/// (a setting it refuses): the writer's placeholder, which held the away
+/// image while the camera streamed, is black from the stop on; the camera
+/// turned off afterwards shows the away image again.
+#[test]
+fn a_privacy_stop_of_a_streaming_session_under_black_turns_the_away_image_black() {
+    let mut h = H::new(&away_config(""), |_| {});
+    let image = h.image();
+    h.set_image(&image, 0).unwrap();
+    h.activate(0);
+    assert_eq!(h.world().placeholder, away());
+    h.world().fail_set_effect = Some("the background image is unreadable".into());
+    assert!(h.set_effect("replace", 1000).is_err());
+    assert_eq!(h.state(), State::Error);
+    assert!(h.world().session.is_none());
+    assert_eq!(h.world().placeholder, None);
+    assert_eq!(placeholder_sets(&h), [away(), None]);
+    h.call(|r| Command::SetEnabled(false, r), 2000).unwrap();
+    assert_eq!(h.world().placeholder, away());
+    // The crash cover shows the away image throughout.
+    assert_eq!(h.world().cover_image_sets, [away()]);
+}
+
+/// The position of `event` in the fake backend's ordered log of image
+/// calls and session stops, from `from` on.
+fn event_at(h: &H, from: usize, event: &ImageEvent) -> Option<usize> {
+    h.world().image_events[from..]
+        .iter()
+        .position(|e| e == event)
+        .map(|i| i + from)
+}
+
+/// A privacy stop of a streaming session (a refused setting under
+/// `on_failure = "black"`) gives the writer black before the session
+/// stops: no placeholder slot between the two shows the away image.
+#[test]
+fn a_refused_setting_gives_the_writer_black_before_the_session_stops() {
+    let mut h = H::new(&away_config(""), |_| {});
+    let image = h.image();
+    h.set_image(&image, 0).unwrap();
+    h.activate(0);
+    let from = h.world().image_events.len();
+    h.world().fail_set_effect = Some("the background image is unreadable".into());
+    assert!(h.set_effect("replace", 1000).is_err());
+    assert!(h.world().session.is_none());
+    let black = event_at(&h, from, &ImageEvent::Placeholder(None));
+    let stop = event_at(&h, from, &ImageEvent::StopSession);
+    assert!(
+        black.is_some() && stop.is_some() && black < stop,
+        "{:?}",
+        h.world().image_events[from..].to_vec()
+    );
+}
+
+/// The guard's stop of a session streaming without its effect under
+/// `on_failure = "black"` gives the writer black before the session stops,
+/// and the start tried again under the hold gives its output black too.
+#[test]
+fn the_guard_gives_the_writer_black_before_the_session_stops() {
+    let none = format!(
+        "{}mode = \"blur\"\non_failure = \"none\"\n",
+        away_config("")
+    );
+    let mut h = streaming_without_effects(&none);
+    assert_eq!(h.world().placeholder, away());
+    let from = h.world().image_events.len();
+    h.ctrl.config.effect.on_failure = EffectOnFailure::Black;
+    h.tick(1000);
+    let black = event_at(&h, from, &ImageEvent::Placeholder(None));
+    let stop = event_at(&h, from, &ImageEvent::StopSession);
+    assert!(
+        black.is_some() && stop.is_some() && black < stop,
+        "{:?}",
+        h.world().image_events[from..].to_vec()
+    );
+    // Never the away image again while the hold stands.
+    let after = h.world().image_events[black.unwrap()..].to_vec();
+    assert!(
+        !after.contains(&ImageEvent::Placeholder(away()))
+            && !after.contains(&ImageEvent::OutputPlaceholder(away())),
+        "{after:?}"
+    );
+    // The start tried again is refused for privacy: still held, black.
+    assert!(h.ctrl.privacy_hold.is_some());
+    assert_eq!(h.world().placeholder, None);
+}
+
+/// The session output's clock placeholder is what the writer's would show:
+/// black for a session started under a privacy hold with
+/// `on_failure = "black"`, the image under `"image"` or with no hold.
+#[test]
+fn a_session_started_under_the_hold_with_black_has_a_black_output_placeholder() {
+    let black = away_config("mode = \"blur\"\non_failure = \"black\"\n");
+    let mut h = H::new(&black, |_| {});
+    h.consumers(1, 0);
+    h.ctrl.privacy_hold = Some(PrivacyHold::Guard);
+    assert_eq!(h.ctrl.session_params().placeholder_image, None);
+    // Started under the hold (not streamed yet): black at its start.
+    let mut h = H::new(&black, |w| w.frames = false);
+    h.consumers(1, 0);
+    h.ctrl.privacy_hold = Some(PrivacyHold::Guard);
+    h.tick(300);
+    assert_eq!(h.state(), State::Starting, "{:?}", h.snap());
+    assert_eq!(h.session_params().placeholder_image, None);
+    assert!(
+        !h.world()
+            .image_events
+            .contains(&ImageEvent::OutputPlaceholder(away())),
+        "{:?}",
+        h.world().image_events
+    );
+    // Its first frame ends the hold: the away image reaches the output.
+    h.world().frames = true;
+    h.tick(400);
+    assert_eq!(h.state(), State::Active, "{:?}", h.snap());
+    assert_eq!(h.ctrl.privacy_hold, None);
+    assert_eq!(h.session_params().placeholder_image, away());
+    // Under `"image"`, the image under the hold.
+    let image = away_config("mode = \"blur\"\non_failure = \"image\"\n");
+    let mut h = H::new(&image, |_| {});
+    h.consumers(1, 0);
+    h.ctrl.privacy_hold = Some(PrivacyHold::Guard);
+    assert_eq!(h.ctrl.session_params().placeholder_image, away());
+    // No hold: the away image.
+    let h = H::new(&black, |_| {});
+    assert_eq!(h.ctrl.session_params().placeholder_image, away());
+}
+
+#[test]
+fn a_refused_start_under_image_on_failure_shows_the_image() {
+    let mut h = H::new(
+        &away_config("mode = \"blur\"\non_failure = \"image\"\n"),
+        |w| w.fail_start_effects = Some("obc-module: no CUDA memory".into()),
+    );
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Error);
+    assert_eq!(h.world().session_starts, 0);
+    assert_eq!(placeholder_sets(&h), [away()]);
+    // And under `output.placeholder = "black"` the same: switch 1 decides.
+    let image =
+        format!("[effect]\nmode = \"blur\"\non_failure = \"image\"\nfallback_image = \"{AWAY}\"\n");
+    let mut h = H::new(&image, |w| {
+        w.fail_start_effects = Some("obc-module: no CUDA memory".into())
+    });
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Error);
+    assert_eq!(placeholder_sets(&h), [away()]);
+    assert!(
+        h.world().cover_image_sets.is_empty(),
+        "the cover stays black"
+    );
+}
+
+#[test]
+fn the_away_image_without_a_path_or_unreadable_is_black_with_a_warning() {
+    const NO_IMAGE: &str =
+        "output.placeholder is \"image\" but effect.fallback_image is not set: showing black";
+    let mut h = H::new("[output]\nplaceholder = \"image\"\n", |_| {});
+    assert_eq!(h.snap().warning, NO_IMAGE);
+    h.activate(0);
+    h.call(|r| Command::SetEnabled(false, r), 1000).unwrap();
+    assert!(placeholder_sets(&h).is_empty());
+    assert_eq!(h.snap().warning, NO_IMAGE);
+    assert_eq!(h.session_params_or_none(), None);
+    // Both switches on "image" and no image: one clause each, in order.
+    let h = H::new(
+        "[output]\nplaceholder = \"image\"\n[effect]\non_failure = \"image\"\n",
+        |_| {},
+    );
+    assert_eq!(
+        h.snap().warning,
+        format!(
+            "effect.on_failure is \"image\" but effect.fallback_image is not set: showing \
+             black; {NO_IMAGE}"
+        )
+    );
+    // Set but unreadable: said while it is asked for, which is always
+    // (the writer holds it while the camera streams too).
+    let unreadable = format!(
+        "Away image {AWAY} could not be read (the image file is unreadable: gone): showing black"
+    );
+    let mut h = H::new(&away_config(""), |w| {
+        w.placeholder_unreadable = Some("the image file is unreadable: gone".into())
+    });
+    h.activate(0);
+    assert_eq!(h.snap().warning, unreadable);
+    h.call(|r| Command::SetEnabled(false, r), 1000).unwrap();
+    assert_eq!(h.snap().warning, unreadable);
+    // Black chosen: nothing asked for, nothing said.
+    h.set_config(
+        "output.placeholder",
+        obc_ipc::ConfigValue::Str("black".into()),
+    )
+    .unwrap();
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn an_away_image_decode_that_never_ends_is_reported_after_ten_seconds() {
+    let mut h = H::new(&away_config(""), |w| w.placeholder_decoding = true);
+    h.activate(0);
+    h.call(|r| Command::SetEnabled(false, r), 1000).unwrap();
+    h.tick(1100);
+    assert_eq!(h.snap().warning, "");
+    h.tick(11_200);
+    assert_eq!(
+        h.snap().warning,
+        format!("Away image {AWAY} could not be read (not decoded within 10 s): showing black")
+    );
+}
+
+#[test]
+fn the_session_output_gets_the_away_image_at_start_and_on_change() {
+    let mut h = H::new(&away_config(""), |_| {});
+    h.activate(0);
+    assert_eq!(h.session_params().placeholder_image, away());
+    assert!(h.world().output_placeholder_sets.is_empty());
+    // Switched to black live, without a restart.
+    let starts = h.world().session_starts;
+    h.set_config(
+        "output.placeholder",
+        obc_ipc::ConfigValue::Str("black".into()),
+    )
+    .unwrap();
+    assert_eq!(h.managed_key("output.placeholder"), Some("black".into()));
+    assert_eq!(h.world().output_placeholder_sets, [None]);
+    assert_eq!(h.session_params().placeholder_image, None);
+    // Back to the image, then another image: each reaches the output.
+    h.set_config(
+        "output.placeholder",
+        obc_ipc::ConfigValue::Str("image".into()),
+    )
+    .unwrap();
+    h.set_config(
+        "effect.fallback_image",
+        obc_ipc::ConfigValue::Str("/srv/other.png".into()),
+    )
+    .unwrap();
+    assert_eq!(
+        h.world().output_placeholder_sets,
+        [None, away(), Some(PathBuf::from("/srv/other.png"))]
+    );
+    assert_eq!(h.world().session_starts, starts, "applied live");
+    assert_eq!(h.state(), State::Active);
+    // The writer's placeholder follows the same choices, live.
+    assert_eq!(
+        placeholder_sets(&h),
+        [away(), None, away(), Some(PathBuf::from("/srv/other.png"))]
+    );
+    // A reload gives the image again (the file may have been replaced).
+    let sets = h.world().output_placeholder_sets.len();
+    h.call(|r| Command::ReloadConfig(Some(r)), 3000).unwrap();
+    assert_eq!(h.world().output_placeholder_sets.len(), sets + 1);
+    // Under the default, the output's placeholder is black.
+    let mut h = H::new("", |_| {});
+    h.activate(0);
+    assert_eq!(h.session_params().placeholder_image, None);
+}
+
+#[test]
+fn a_new_away_image_set_while_off_replaces_the_one_shown() {
+    let mut h = H::new(&away_config(""), |_| {});
+    h.activate(0);
+    h.call(|r| Command::SetEnabled(false, r), 1000).unwrap();
+    assert_eq!(h.world().placeholder, away());
+    h.set_config(
+        "effect.fallback_image",
+        obc_ipc::ConfigValue::Str("/srv/other.png".into()),
+    )
+    .unwrap();
+    assert_eq!(h.world().placeholder, Some(PathBuf::from("/srv/other.png")));
+    assert_eq!(
+        h.managed_key("effect.fallback_image"),
+        Some("/srv/other.png".into())
+    );
+    // Cleared: black, and the clause that says why.
+    h.set_config(
+        "effect.fallback_image",
+        obc_ipc::ConfigValue::Str(String::new()),
+    )
+    .unwrap();
+    assert_eq!(h.world().placeholder, None);
+    assert!(
+        h.snap()
+            .warning
+            .starts_with("output.placeholder is \"image\""),
+        "{:?}",
+        h.snap()
+    );
+    assert_eq!(h.state(), State::Off);
+}
+
+#[test]
+fn the_crash_cover_gets_the_away_image_at_start_and_on_change() {
+    let mut h = H::new(&away_config(""), |_| {});
+    // Given before any camera: the cover shows it from the writer's start
+    // (the backend keeps it across writers), while streaming too.
+    h.activate(0);
+    assert_eq!(h.world().cover_image_sets, [away()]);
+    assert_eq!(h.world().cover_image, away());
+    assert_eq!(
+        h.world().placeholder,
+        away(),
+        "kept while the camera streams"
+    );
+    // Another image, then black: each reaches the cover, live.
+    h.set_config(
+        "effect.fallback_image",
+        obc_ipc::ConfigValue::Str("/srv/other.png".into()),
+    )
+    .unwrap();
+    h.set_config(
+        "output.placeholder",
+        obc_ipc::ConfigValue::Str("black".into()),
+    )
+    .unwrap();
+    assert_eq!(
+        h.world().cover_image_sets,
+        [away(), Some(PathBuf::from("/srv/other.png")), None]
+    );
+    // A reload gives the image again (the file may have been replaced).
+    h.set_config(
+        "output.placeholder",
+        obc_ipc::ConfigValue::Str("image".into()),
+    )
+    .unwrap();
+    assert!(h.world().cover_image_resends.is_empty());
+    h.call(|r| Command::ReloadConfig(Some(r)), 3000).unwrap();
+    assert_eq!(
+        h.world().cover_image_resends,
+        [PathBuf::from("/srv/other.png")]
+    );
+    // Under the default, never.
+    let mut h = H::new(&format!("[effect]\nfallback_image = \"{AWAY}\"\n"), |_| {});
+    h.activate(0);
+    h.call(|r| Command::SetEnabled(false, r), 1000).unwrap();
+    assert!(h.world().cover_image_sets.is_empty());
+}
+
+#[test]
+fn the_session_output_s_unreadable_away_image_is_said_once() {
+    let why = "the image file is unreadable: gone";
+    let clause = format!("Away image {AWAY} could not be read ({why}): showing black");
+    // The output alone cannot read it: said while the session runs.
+    let mut h = H::new(&away_config(""), |w| {
+        w.output_placeholder_unreadable = Some(why.into())
+    });
+    h.activate(0);
+    assert_eq!(h.snap().warning, clause);
+    // The session gone (the camera off): the writer's clause alone, and
+    // the writer reads it.
+    h.call(|r| Command::SetEnabled(false, r), 1000).unwrap();
+    assert_eq!(h.snap().warning, "");
+    // Both cannot read the same file: one clause.
+    let mut h = H::new(&away_config(""), |w| {
+        w.output_placeholder_unreadable = Some(why.into());
+        w.placeholder_unreadable = Some(why.into());
+        w.frames = false;
+    });
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Starting, "{:?}", h.snap());
+    assert_eq!(h.world().placeholder, away());
+    assert!(h.world().session.is_some());
+    assert_eq!(h.snap().warning, clause);
+    // Under black: nothing asked of the output, nothing said.
+    let mut h = H::new(&format!("[effect]\nfallback_image = \"{AWAY}\"\n"), |w| {
+        w.output_placeholder_unreadable = Some(why.into())
+    });
+    h.activate(0);
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn only_a_module_change_restart_holds_the_last_frame() {
+    // A stage that only a new session can run, its module enabled: the
+    // writer holds the camera picture across the restart.
+    let mut h = H::new(&away_config("denoise = true\n"), |_| {});
+    h.set_module(MAXINE_MODULE, false, 0);
+    h.activate(100);
+    assert!(h.world().restart_holds.is_empty());
+    h.set_module(MAXINE_MODULE, true, 1000);
+    h.tick(1400);
+    assert_eq!(h.world().session_starts, 2);
+    assert_eq!(h.world().restart_holds, [true], "right before the stop");
+    assert_eq!(h.state(), State::Active);
+    // The background effect selected under `on_failure = "black"` in a
+    // session without it: the restart is not held (its last frame is the
+    // room the effect now hides).
+    let mut h = H::new(&away_config(""), |_| {});
+    h.set_module(MAXINE_MODULE, false, 0);
+    h.activate(100);
+    h.set_module(MAXINE_MODULE, true, 1000);
+    h.tick(1400);
+    h.set_effect("blur", 2000).unwrap();
+    h.tick(2400);
+    assert_eq!(h.world().session_starts, 2);
+    assert!(h.world().restart_holds.is_empty());
+    // Under `on_failure = "none"` (the camera may be shown): held.
+    let mut h = H::new(&away_config("on_failure = \"none\"\n"), |_| {});
+    h.set_module(MAXINE_MODULE, false, 0);
+    h.activate(100);
+    h.set_module(MAXINE_MODULE, true, 1000);
+    h.tick(1400);
+    h.set_effect("blur", 2000).unwrap();
+    h.tick(2400);
+    assert_eq!(h.world().session_starts, 2);
+    assert_eq!(h.world().restart_holds, [true]);
+    // The guard's privacy stop: no hold (the room is never shown).
+    let none = format!(
+        "{}mode = \"blur\"\non_failure = \"none\"\n",
+        away_config("")
+    );
+    let mut h = streaming_without_effects(&none);
+    h.reload(
+        &away_config("mode = \"blur\"\non_failure = \"black\"\n"),
+        1000,
+    )
+    .unwrap();
+    assert!(h.world().session.is_none(), "{:?}", h.snap());
+    assert!(h.world().restart_holds.is_empty());
+    // A failure: no hold.
+    let mut h = H::new(&away_config(""), |w| w.cameras.truncate(1));
+    h.activate(0);
+    h.world().failure = Some(crate::backend::Failure::Camera("unplugged".into()));
+    h.world().cameras.clear();
+    h.tick(1000);
+    h.tick(1100);
+    assert!(h.world().session.is_none());
+    assert!(h.world().restart_holds.is_empty());
+    // The camera turned off: no hold.
+    let mut h = H::new(&away_config(""), |_| {});
+    h.activate(0);
+    h.call(|r| Command::SetEnabled(false, r), 1000).unwrap();
+    assert!(h.world().restart_holds.is_empty());
 }
 
 // ---- the guard and the start agree on a session without its effects ----
@@ -12166,7 +12763,7 @@ fn an_unreadable_fallback_image_is_said_within_a_poll_of_its_decode_ending() {
     assert!(
         h.snap()
             .warning
-            .starts_with(&format!("Fallback image {AWAY} could not be read")),
+            .starts_with(&format!("Away image {AWAY} could not be read")),
         "{:?}",
         h.snap()
     );
@@ -12201,7 +12798,7 @@ fn a_fallback_image_decode_that_never_ends_is_said_unreadable_at_its_limit() {
     h.ctrl.tick(now);
     assert_eq!(
         h.snap().warning,
-        format!("Fallback image {AWAY} could not be read (not decoded within 10 s): showing black")
+        format!("Away image {AWAY} could not be read (not decoded within 10 s): showing black")
     );
     assert!(h.ctrl.next_wakeup(now) > POLL_RUNNING);
     // A decode that ends after all (the image shown): nothing to say.
@@ -12444,7 +13041,7 @@ fn a_start_refused_again_under_the_hold_keeps_the_fallback_image() {
 fn the_element_s_fallback_image_failure_ends_with_its_session() {
     let mut h = H::new(&image_config(""), |w| w.effect_slow = true);
     h.activate(0);
-    let why = format!("Fallback image {AWAY} could not be read (no such file): showing black");
+    let why = format!("Away image {AWAY} could not be read (no such file): showing black");
     h.world().fallback_error = Some(why.clone());
     h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
     h.tick(1000);

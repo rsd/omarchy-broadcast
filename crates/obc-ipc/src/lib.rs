@@ -130,9 +130,19 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// `ImportMedia`, `RemoveMedia` and the `MediaSerial` property.
 /// Revision 16 added the `StageValues` property ([`StageValue`]): the named
 /// numeric values the running stages report (auto-frame's zoom).
-pub const INTERFACE_REVISION: u32 = 16;
+/// Revision 17 added the away image, with no new member
+/// ([`PLACEHOLDER_REVISION`]).
+pub const INTERFACE_REVISION: u32 = 17;
 /// The first [`INTERFACE_REVISION`] with the `StageValues` property.
 pub const STAGE_VALUES_REVISION: u32 = 16;
+/// The first [`INTERFACE_REVISION`] with the away image, and no new member:
+/// the config row `output.placeholder` (`black` or `image`: what the feed
+/// shows while there is no camera picture), `effect.fallback_image` made
+/// an editable `path` row ("Away image"), and the `Warning` clauses of the
+/// away image (`output.placeholder is "image" but effect.fallback_image is
+/// not set: showing black`, `Away image <path> could not be read (<why>):
+/// showing black`).
+pub const PLACEHOLDER_REVISION: u32 = 17;
 /// The smallest move of a value that announces a change of
 /// `StageValues` (a change of the set always does).
 pub const STAGE_VALUE_STEP: f64 = 0.01;
@@ -1262,7 +1272,8 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, STAGE_VALUES_REVISION);
+        assert_eq!(INTERFACE_REVISION, PLACEHOLDER_REVISION);
+        const { assert!(STAGE_VALUES_REVISION < PLACEHOLDER_REVISION) };
         const { assert!(MEDIA_REVISION < STAGE_VALUES_REVISION) };
         const { assert!(FORCED_REVISION < MEDIA_REVISION) };
         const { assert!(MIC_REVISION < FORCED_REVISION) };

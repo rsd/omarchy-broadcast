@@ -61,6 +61,13 @@
 //!   [`StageChain::process_repeat`](obc_backend::StageChain::process_repeat)
 //!   instead of `process`; a module of ABI 1.1 sees the flag, one of 1.0
 //!   processes the repeat as any frame.
+//! * **The placeholder image**: a buffer carrying
+//!   [`PLACEHOLDER_FLAG`](crate::PLACEHOLDER_FLAG) (the output clock's away
+//!   image, no camera picture) is passed through as it came, whatever the
+//!   stages: no chain call (a frame generation chain neither sees nor holds
+//!   it), no CUDA object made, no host copy, a pending temporal reset kept
+//!   for the next camera frame, and no frame counter or status value
+//!   changed.
 //! * **Stopping** (PAUSED to READY) unloads the chain synchronously (with
 //!   the CUDA context current for a CUDA chain), then releases the host
 //!   copy, the stream and the context reference.

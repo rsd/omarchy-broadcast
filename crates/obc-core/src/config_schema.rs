@@ -299,6 +299,15 @@ pub const CORE_KEYS: &[KeySpec] = &[
         apply: Apply::Reload,
     },
     KeySpec {
+        key: "output.placeholder",
+        group: "output",
+        label: "When there is no camera picture",
+        description: "Black frames, or the away image, while the camera is off, starting or failing.",
+        kind: SpecKind::Enum(&[("black", "Black"), ("image", "Away image")]),
+        editable: true,
+        apply: Apply::Live,
+    },
+    KeySpec {
         key: "video.memory",
         group: "video",
         label: "Video memory",
@@ -465,10 +474,10 @@ pub const CORE_KEYS: &[KeySpec] = &[
     KeySpec {
         key: "effect.fallback_image",
         group: "effect",
-        label: "Fallback image",
-        description: "The image that hides the camera when an effect can't run, with Hide the camera: image. Set it in the configuration file.",
+        label: "Away image",
+        description: "A PNG, JPEG or WebP still shown in place of black frames: with Hide the camera: image, and when there is no camera picture.",
         kind: SpecKind::Path,
-        editable: false,
+        editable: true,
         apply: Apply::Live,
     },
     KeySpec {

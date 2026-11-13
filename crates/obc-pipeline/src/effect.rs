@@ -30,14 +30,16 @@
 //! `denoise` and `denoise-reason`). A failure of a stage drops the stage and
 //! never fails the effect. The output clock marks the first frame
 //! of each new source with [`NEW_SOURCE_FLAG`], on which the element resets
-//! the backend's temporal state.
+//! the backend's temporal state, and its placeholder image with
+//! [`PLACEHOLDER_FLAG`], which the element passes through untouched.
 
 use std::fmt;
 use std::sync::Arc;
 
 pub use gst_obc::{
     EffectFallback, EffectKind, EffectSettings, EffectStats, EffectStatus, NEW_SOURCE_FLAG,
-    STATUS_MESSAGE, StageRequest, StageStats, fallback_unreadable, has_new_source_flag,
+    PLACEHOLDER_FLAG, STATUS_MESSAGE, StageRequest, StageStats, fallback_unreadable,
+    has_new_source_flag, has_placeholder_flag,
 };
 use obc_backend::BackendFactory;
 pub use obc_backend::{Availability, Params, StageId, StageValue, Value};

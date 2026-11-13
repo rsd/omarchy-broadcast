@@ -956,6 +956,36 @@ fn a_repeat_goes_to_the_chain_as_a_repeat() {
     assert_eq!(get(&fake.log.repeats), 1, "the next fresh frame is not one");
 }
 
+/// The output clock's placeholder image goes through every stage
+/// untouched: no chain call (not even as a repeat), no frame counted; the
+/// next camera frame is processed as before.
+#[test]
+fn the_placeholder_image_passes_through_without_a_chain_call() {
+    let fake = FakeChainFactory::host(FakeChainConfig::default());
+    let mut r = Rig::new(Some(fake.clone()), &[tint()]);
+    r.until_status("tint", EffectStatus::Ready);
+    assert_eq!(r.frame(), tinted(FAKE_TINT_UV));
+    let (frames, repeats, resets) = (
+        get(&fake.log.frames),
+        get(&fake.log.repeats),
+        get(&fake.log.resets),
+    );
+    let stats = r.module.stats();
+    for _ in 0..3 {
+        let out = r.frame_bytes_with(gst_obc::PLACEHOLDER_FLAG);
+        assert_bytes(&out, &r.input_bytes, "the placeholder image");
+    }
+    assert_eq!(get(&fake.log.frames), frames, "no chain call");
+    assert_eq!(get(&fake.log.repeats), repeats);
+    assert_eq!(get(&fake.log.resets), resets);
+    let after = r.module.stats();
+    assert_eq!(after.frames_processed, stats.frames_processed);
+    assert_eq!(after.frames_passthrough, stats.frames_passthrough);
+    assert_eq!(after.stage_values, stats.stage_values);
+    assert_eq!(r.frame(), tinted(FAKE_TINT_UV), "a camera frame again");
+    assert_eq!(get(&fake.log.frames), frames + 1);
+}
+
 /// The repeat flag as the session's output carries it: set by the output
 /// clock (here appsrc), through an element that writes every frame into a
 /// new buffer and copies the input's metadata with BaseTransform's

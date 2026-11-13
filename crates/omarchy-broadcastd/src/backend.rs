@@ -124,6 +124,11 @@ pub struct SessionParams {
     /// until it stops. In [`VideoMemory::System`] the session makes no
     /// CUDA call: no CUDA element, no NVML, no parking.
     pub memory: VideoMemory,
+    /// The image the output clock's placeholder shows in place of black
+    /// (`output.placeholder = "image"`: the away image), `None` for black.
+    /// The output starts with it; [`MediaBackend::set_output_placeholder`]
+    /// changes it while the session runs.
+    pub placeholder_image: Option<PathBuf>,
 }
 
 /// One stage of a chain the session runs, with its parameters: those read
@@ -519,8 +524,8 @@ pub trait MediaBackend: Send + 'static {
     /// decoded off the controller thread: the placeholder stays black until
     /// it is ready, and when it cannot be read
     /// ([`Self::placeholder_failure`]). Kept across writers: a new writer
-    /// shows it too, decoded for its contract. The crash cover stays black.
-    /// Never blocks. The image already shown, given again, is read again
+    /// shows it too, decoded for its contract. The crash cover does not
+    /// follow it ([`Self::set_cover_image`]). Never blocks. The image already shown, given again, is read again
     /// only when the file at its path was replaced (a reload re-sends it).
     fn set_placeholder(&mut self, image: Option<&Path>);
 
@@ -530,10 +535,49 @@ pub trait MediaBackend: Send + 'static {
     fn placeholder_pending(&mut self) -> bool;
 
     /// Why the image [`Self::set_placeholder`] asked for cannot be shown
-    /// (black is, in its place), once known, as
-    /// [`obc_pipeline::effect::fallback_unreadable`] words it; `None` while it is shown,
-    /// still decoding, or not asked for, and while no writer runs.
+    /// (black is, in its place), once known: the reason alone, without the
+    /// path (the caller words the clause); `None` while it is shown, still
+    /// decoding, or not asked for, and while no writer runs.
     fn placeholder_failure(&mut self) -> Option<String>;
+
+    /// Sets the image the writer's crash cover (the v4l2loopback timeout
+    /// image, shown while the daemon is not writing) shows: black (`None`),
+    /// or the image at `image`
+    /// ([`obc_pipeline::LoopbackWriter::set_cover_image`]: decoded off the
+    /// controller thread, black until it is ready or when it cannot be
+    /// read). Independent of [`Self::set_placeholder`], and kept across
+    /// writers: a new writer's cover starts with it. The image already
+    /// asked for, given again, is read again only when the file at its
+    /// path was replaced. Never blocks.
+    fn set_cover_image(&mut self, image: Option<&Path>);
+
+    /// Holds the last frame the running writer forwarded across a
+    /// deliberate restart of the session (the controller stops it to start
+    /// another at once), for at most
+    /// [`obc_pipeline::LoopbackWriter::RESTART_HOLD`]
+    /// ([`obc_pipeline::LoopbackWriter::hold_across_restart`]): the
+    /// placeholder does not replace the camera picture meanwhile. Called
+    /// right before the session is stopped, never for a failure or a
+    /// privacy stop. Nothing without a writer. Never blocks.
+    fn hold_across_restart(&mut self);
+
+    /// Sets what the running session output's clock placeholder shows
+    /// (an input gap past the hold): black (`None`), or the image at
+    /// `image` ([`obc_pipeline::Output::set_placeholder_image`]: decoded off
+    /// the controller thread, black until it is ready or when it cannot be
+    /// read). The image already asked for, given again, is read again only
+    /// when the file at its path was replaced. Nothing without a session:
+    /// the next one starts from [`SessionParams::placeholder_image`]. Never
+    /// blocks.
+    fn set_output_placeholder(&mut self, image: Option<&Path>);
+
+    /// Why the running session output's clock placeholder cannot show the
+    /// image [`Self::set_output_placeholder`] (or
+    /// [`SessionParams::placeholder_image`]) asked for, once known
+    /// ([`obc_pipeline::Output::placeholder_state`]): the reason alone, as
+    /// for [`Self::placeholder_failure`]; `None` while it is shown, still
+    /// decoding, or not asked for, and without a session.
+    fn output_placeholder_failure(&mut self) -> Option<String>;
 
     /// The number of other processes holding the loopback `node` open,
     /// counted now (the consumer watcher's count can lag a fresh open).

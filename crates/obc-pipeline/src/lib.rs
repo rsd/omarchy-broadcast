@@ -101,7 +101,7 @@ pub use loopback::{
     FrameTap, LoopbackWriter, PlaceholderState, WriterAttachment, WriterConfig, WriterCounts,
     WriterHandle, WriterSink, image_contract_frame, writer_caps_string,
 };
-pub use loopback_cover::{ConsumerCover, CoverReport};
+pub use loopback_cover::{ConsumerCover, CoverReport, CoverShows};
 pub use module::{ModulePlacement, ModuleStageSpec, ModuleStats};
 pub use output::{
     EmitInfo, EmitObserver, FrameOrigin, Output, OutputConfig, OutputCounts, OutputSink,

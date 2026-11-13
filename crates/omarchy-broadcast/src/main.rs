@@ -975,12 +975,8 @@ fn job(cli: Cli) -> Result<Job, clap::Error> {
                 }),
             ..
         } => {
-            if select && kind != obc_ipc::media::KIND_BACKGROUND {
-                return Err(media_usage(
-                    "import",
-                    ErrorKind::ArgumentConflict,
-                    format!("--select applies to `background`, not `{kind}`"),
-                ));
+            if select && let Some(msg) = media::select_refusal(&kind) {
+                return Err(media_usage("import", ErrorKind::ArgumentConflict, msg));
             }
             let path = media::absolute_text(&path)
                 .map_err(|m| media_usage("import", ErrorKind::ValueValidation, m))?;

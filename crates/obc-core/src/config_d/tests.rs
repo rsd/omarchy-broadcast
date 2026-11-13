@@ -497,6 +497,42 @@ fn invalid_values_are_refused_before_anything_is_written() {
 }
 
 #[test]
+fn the_away_image_and_the_placeholder_are_written_to_the_managed_file() {
+    let d = Dir::new();
+    let original = "[effect]\nfallback_image = \"/srv/early.png\"\n";
+    d.write("config.toml", original);
+    let set = |key: &str, v: &str| {
+        set_config(&d.config_toml(), &facts(), key, &ConfigValue::Str(v.into()))
+    };
+    let s = set("effect.fallback_image", "/home/u/away.png").unwrap();
+    assert_eq!(
+        s.config.effect.fallback_image,
+        Some("/home/u/away.png".into())
+    );
+    assert_eq!(s.source("effect.fallback_image"), MANAGED_REL);
+    let s = set("output.placeholder", "image").unwrap();
+    assert_eq!(s.config.output.placeholder, crate::OutputPlaceholder::Image);
+    assert!(d.read(MANAGED_REL).contains("placeholder = \"image\""));
+    // The same checks as in the file: absolute, a known option.
+    let e = set("effect.fallback_image", "away.png").unwrap_err();
+    assert!(matches!(e, WriteError::Invalid(_)), "{e:?}");
+    assert!(e.to_string().contains("effect.fallback_image"), "{e}");
+    let e = set("output.placeholder", "none").unwrap_err();
+    assert!(e.to_string().contains("not one of"), "{e}");
+    // Empty clears, over the earlier file's image too.
+    let s = set("effect.fallback_image", "").unwrap();
+    assert_eq!(s.config.effect.fallback_image, None);
+    assert_eq!(d.read("config.toml"), original);
+    // A later file wins: the write is refused.
+    d.write(
+        "config.d/90-local.toml",
+        "[effect]\nfallback_image = \"/srv/late.png\"\n",
+    );
+    let e = set("effect.fallback_image", "/home/u/away.png").unwrap_err();
+    assert_eq!(e.to_string(), "Overridden by config.d/90-local.toml");
+}
+
+#[test]
 fn a_key_set_by_a_later_file_is_refused() {
     let d = Dir::new();
     d.write("config.d/90-local.toml", "[output]\naspect = \"crop\"\n");

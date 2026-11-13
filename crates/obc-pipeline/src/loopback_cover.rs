@@ -13,7 +13,10 @@
 //! `timeout` milliseconds, until a writer writes again or the last opener
 //! closes. The timer keeps re-arming itself after the writer's process is
 //! gone, which is the point. The image the driver allocates is zero-filled
-//! (green in NV12), so the writer uploads its own first.
+//! (green in NV12), so the writer uploads its own first: black, or the
+//! cover image the writer is given
+//! ([`crate::loopback::LoopbackWriter::set_cover_image`], the user's "away
+//! image").
 //!
 //! One tick is one frame for one reader, not for each of them: the first
 //! reader to dequeue after a tick clears the flag (the driver copies the
@@ -27,14 +30,25 @@
 //!
 //! [`install`], run by [`crate::loopback::LoopbackWriter`] once its
 //! `v4l2sink` has set its format and allocated its buffers on the device
-//! (the timeout image is sized to that format), at every writer start:
+//! (the timeout image is sized to that format), at every writer start, and
+//! again whenever the cover image changes after that (see
+//! "Re-installs" below):
 //!
-//! 1. **A black timeout image**, at the device's format as `VIDIOC_G_FMT`
-//!    reports it: the luma plane (`bytesperline` x `height` bytes) at the
-//!    contract's black (Y = 16, limited range), the rest of `sizeimage`
-//!    (NV12's interleaved chroma plane, I420's two) at 128. Black, never the
-//!    last frame: a camera image left on screen by a dead daemon would show
-//!    the user after they believe the camera is off. The upload protocol of
+//! 1. **The timeout image**, at the device's format as `VIDIOC_G_FMT`
+//!    reports it ([`fill_cover`]). While the cover image is decoded
+//!    ([`crate::loopback::LoopbackWriter::cover_image_state`] is
+//!    [`crate::loopback::PlaceholderState::Image`]), that frame,
+//!    copied byte for byte: it is a frame of the contract laid out as
+//!    `GstVideoInfo` lays out the writer's caps, which is the device's
+//!    layout as long as `bytesperline`, `height` and `sizeimage` say so
+//!    ([`frame_fits`]); when they do not, black, and the outcome says why
+//!    ([`CoverShows::BlackForImage`]). Otherwise black: the luma plane
+//!    (`bytesperline` x `height` bytes) at the contract's black (Y = 16,
+//!    limited range), the rest of `sizeimage` (NV12's interleaved chroma
+//!    plane, I420's two) at 128. Never the last frame: a camera image left
+//!    on screen by a dead daemon would show the user after they believe the
+//!    camera is off. The cover image is no camera frame: it is the
+//!    picture the user chose to be seen instead. The upload protocol of
 //!    v4l2loopback 0.15.4: the `timeout_image_io` button control sets a
 //!    device-wide flag, and every `open()` of the node while it is set
 //!    (and nobody holds the timeout image) gives a descriptor in
@@ -73,9 +87,37 @@
 //!    v4l2loopback 0.15.4); a driver whose maximum is not positive cannot
 //!    have a timeout (0 turns it off) and fails the cover.
 //!
+//! **Re-installs.** When the frame of the cover image changes after the
+//! start's install was handed to its helper (the image becomes ready,
+//! another one replaces it once decoded, black is asked for, or the image
+//! cannot be read), the writer hands the cover the new frame
+//! ([`CoverSlot::set_image`]) and the whole of
+//! [`install`] runs again on a helper thread of its own: the button is
+//! pressed again and the race window is the same as at the start (the
+//! writer is streaming in both cases; nothing runs between the button, the
+//! `open()` and the `VIDIOC_REQBUFS`). In v4l2loopback 0.15.4 the timeout
+//! image allocated by the first install is reused (`VIDIOC_REQBUFS` in
+//! timeout-image mode allocates one only when there is none), the cover's
+//! descriptor gives its timeout token back on `VIDIOC_REQBUFS` with no
+//! buffer or on close, and the timer never copies the image while the
+//! writer streams (the `timeout` stays above its worst gap), so the image
+//! is rewritten in place with no reader seeing a half-written one.
+//! Installs never overlap: they run one at a time under one lock (a second
+//! button press while the first's descriptor holds the timeout token would
+//! open a descriptor that is not in timeout-image mode and leave the mode
+//! pending), and each reads the frame to show when it runs, so the last
+//! one shows the last change. Each outcome is reported like the start's (a
+//! failed re-install says so, the previous image staying in place). Only
+//! the cover image counts: the writer's placeholder switching (black, its
+//! own image, a camera turned on or off) installs nothing. A stop disarms
+//! the cover while the device is still open, so nothing is started once it
+//! closes (not even by a decode ending during the stop), and joins the
+//! installs running.
+//!
 //! Nothing is reset when the writer stops: the cover must outlive the
 //! process. After a clean stop, a reader still holding the device gets the
-//! black image every `timeout` milliseconds instead of a frozen last frame.
+//! timeout image (black, or the cover image) every `timeout`
+//! milliseconds instead of a frozen last frame.
 //! The controls are device-wide and reset only by a module reload;
 //! `keep_format` and `sustain_framerate` are never touched.
 //!
@@ -128,7 +170,9 @@ pub enum ConsumerCover {
     /// The writer started; the cover goes in once its first frame reached
     /// the device.
     Pending,
-    /// The black timeout image is uploaded and the driver's `timeout` set.
+    /// The timeout image is uploaded (black, or the cover image:
+    /// [`crate::loopback::LoopbackWriter::cover_shows`]) and the driver's
+    /// `timeout` set.
     Ready { timeout_ms: u32 },
     /// Not in place, and why (a driver without the controls included). The
     /// writer runs regardless.
@@ -136,7 +180,8 @@ pub enum ConsumerCover {
 }
 
 /// Called with each writer start's cover outcome once it is known
-/// ([`ConsumerCover::Ready`] or [`ConsumerCover::Failed`]), on the cover's
+/// ([`ConsumerCover::Ready`] or [`ConsumerCover::Failed`]), and with the
+/// outcome of each re-install (see the module docs), on the cover's
 /// helper thread: it must not block for long.
 pub type CoverReport = Arc<dyn Fn(&ConsumerCover) + Send + Sync>;
 
@@ -398,6 +443,130 @@ pub(crate) fn fill_black(
     Ok(())
 }
 
+/// What the timeout image of an installed cover shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoverShows {
+    /// Black: no cover image asked for
+    /// ([`crate::loopback::LoopbackWriter::set_cover_image`]), or not
+    /// decoded yet.
+    Black,
+    /// The cover image.
+    Image,
+    /// Black in place of the cover image, and why: the image cannot be
+    /// read (the reason as `gst_obc::fallback_unreadable` words it), or the
+    /// device's format does not lay frames out as the image frame is.
+    BlackForImage(String),
+}
+
+/// How one of the writer's frames is laid out in memory, as
+/// `GstVideoInfo` lays out the writer's caps: plane strides and offsets,
+/// and the frame's size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrameLayout {
+    pub fourcc: u32,
+    pub height: u32,
+    pub planes: usize,
+    pub strides: [usize; 3],
+    pub offsets: [usize; 3],
+    pub size: usize,
+}
+
+/// Whether frames laid out as `frame` are frames of the device's format
+/// `device` byte for byte: the same fourcc and height, the luma stride
+/// `bytesperline`, the chroma planes where single-planar V4L2 puts them
+/// (NV12: one plane of `bytesperline`; YU12: two of `bytesperline / 2`,
+/// each `ceil(height / 2)` rows) and the size `sizeimage`. The reason
+/// names what differs.
+pub(crate) fn frame_fits(device: &ImageLayout, frame: &FrameLayout) -> Result<(), String> {
+    let bpl = device.bytesperline as usize;
+    let luma = bpl * device.height as usize;
+    let chroma_rows = (device.height as usize).div_ceil(2);
+    let (planes, strides, offsets) = if device.fourcc == fourcc(OutputFormat::Nv12) {
+        (2, [bpl, bpl, 0], [0, luma, 0])
+    } else if device.fourcc == fourcc(OutputFormat::I420) {
+        let c = bpl / 2;
+        (3, [bpl, c, c], [0, luma, luma + c * chroma_rows])
+    } else {
+        return Err(format!(
+            "the device carries {} frames",
+            fourcc_string(device.fourcc)
+        ));
+    };
+    let device_says = || {
+        format!(
+            "{} {}x{} lines, {} bytes",
+            fourcc_string(device.fourcc),
+            device.bytesperline,
+            device.height,
+            device.sizeimage
+        )
+    };
+    if frame.fourcc != device.fourcc
+        || frame.height != device.height
+        || frame.planes != planes
+        || frame.strides[..planes] != strides[..planes]
+        || frame.offsets[..planes] != offsets[..planes]
+        || frame.size != device.sizeimage as usize
+    {
+        return Err(format!(
+            "the device's format ({}) does not lay frames out as the image frame is ({} {} \
+             rows, strides {:?}, offsets {:?}, {} bytes)",
+            device_says(),
+            fourcc_string(frame.fourcc),
+            frame.height,
+            &frame.strides[..frame.planes.min(3)],
+            &frame.offsets[..frame.planes.min(3)],
+            frame.size
+        ));
+    }
+    Ok(())
+}
+
+/// What the timeout image of a device of format `device` shows when the
+/// cover image is `image` (its frame layout; `None`: black):
+/// the image when its frame is a frame of the device's format
+/// ([`frame_fits`]), black otherwise, saying why.
+pub(crate) fn cover_choice(device: &ImageLayout, image: Option<&FrameLayout>) -> CoverShows {
+    match image.map(|frame| frame_fits(device, frame)) {
+        None => CoverShows::Black,
+        Some(Ok(())) => CoverShows::Image,
+        Some(Err(why)) => CoverShows::BlackForImage(why),
+    }
+}
+
+/// Writes the cover into `timeout` (the mapped timeout image of a device of
+/// format `device`): the cover image `image` (its layout and bytes)
+/// when [`cover_choice`] picks it, black (`black`, [`fill_black`])
+/// otherwise. What it wrote. Bytes past `sizeimage` are left as they are.
+pub(crate) fn fill_cover(
+    timeout: &mut [u8],
+    device: &ImageLayout,
+    black: (u8, u8),
+    image: Option<(&FrameLayout, &[u8])>,
+) -> Result<CoverShows, String> {
+    let shows = cover_choice(device, image.map(|(layout, _)| layout));
+    match (&shows, image) {
+        (CoverShows::Image, Some((_, bytes))) => {
+            let size = device.sizeimage as usize;
+            let Some(frame) = bytes.get(..size) else {
+                return Err(format!(
+                    "the image frame ({} bytes) is smaller than a frame ({size} bytes)",
+                    bytes.len()
+                ));
+            };
+            let Some(dst) = timeout.get_mut(..size) else {
+                return Err(format!(
+                    "the timeout image ({} bytes) is smaller than a frame ({size} bytes)",
+                    timeout.len()
+                ));
+            };
+            dst.copy_from_slice(frame);
+        }
+        _ => fill_black(timeout, device, black)?,
+    }
+    Ok(shows)
+}
+
 /// A shared mapping of the timeout image, unmapped when dropped.
 struct Mapping {
     ptr: *mut libc::c_void,
@@ -450,11 +619,22 @@ pub(crate) struct CoverPlan {
     pub black: (u8, u8),
     /// The writer's longest gap between two frames while it is alive.
     pub writer_worst_gap: Duration,
+    /// How the writer lays out its frames, the cover image's included.
+    pub frame: FrameLayout,
 }
 
-/// Puts the crash cover on `plan.device` (see the module docs): the black
-/// timeout image, then the `timeout` control. The `timeout` set, in ms.
-pub(crate) fn install(plan: &CoverPlan) -> Result<u32, String> {
+/// What [`install`] put in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Installed {
+    /// The `timeout` set, in ms.
+    pub timeout_ms: u32,
+    pub shows: CoverShows,
+}
+
+/// Puts the crash cover on `plan.device` (see the module docs): the
+/// timeout image (the cover image `image`, a frame laid out as
+/// `plan.frame`, or black: [`fill_cover`]), then the `timeout` control.
+pub(crate) fn install(plan: &CoverPlan, image: Option<&[u8]>) -> Result<Installed, String> {
     let device = plan.device.display();
     // Read-only: the control ioctls do not need more, and its close raises
     // no IN_CLOSE_WRITE.
@@ -481,19 +661,22 @@ pub(crate) fn install(plan: &CoverPlan) -> Result<u32, String> {
             timeout.info.maximum
         ));
     };
-    if let Err(failure) = upload_black(&fd1, plan, image_io.id) {
-        // upload_black's descriptors are closed: a pending mode is free to
-        // be taken back.
-        return Err(if failure.left_pending {
-            pending_mode_failure(
-                &failure.why,
-                &device.to_string(),
-                &clear_timeout_image_io(&plan.device),
-            )
-        } else {
-            failure.why
-        });
-    }
+    let shows = match upload_image(&fd1, plan, image, image_io.id) {
+        Ok(shows) => shows,
+        Err(failure) => {
+            // upload_image's descriptors are closed: a pending mode is free to
+            // be taken back.
+            return Err(if failure.left_pending {
+                pending_mode_failure(
+                    &failure.why,
+                    &device.to_string(),
+                    &clear_timeout_image_io(&plan.device),
+                )
+            } else {
+                failure.why
+            });
+        }
+    };
     controls::ioctl_ctrl_on(
         &fd1,
         VIDIOC_S_CTRL,
@@ -501,10 +684,13 @@ pub(crate) fn install(plan: &CoverPlan) -> Result<u32, String> {
         i32::try_from(ms).unwrap_or(i32::MAX),
     )
     .map_err(|e| format!("setting `{TIMEOUT}` to {ms} ms on {device}: {e}"))?;
-    Ok(ms)
+    Ok(Installed {
+        timeout_ms: ms,
+        shows,
+    })
 }
 
-/// Why [`upload_black`] failed, and whether the button's timeout-image mode
+/// Why [`upload_image`] failed, and whether the button's timeout-image mode
 /// may still be pending (the failure came between the button and the
 /// `VIDIOC_REQBUFS` that takes the mode back).
 #[derive(Debug)]
@@ -605,9 +791,14 @@ fn clear_with(
     Ok(pending)
 }
 
-/// Uploads the black timeout image (the module docs, step 1). `fd1` is any
-/// descriptor of the node.
-fn upload_black(fd1: &fs::File, plan: &CoverPlan, image_io_id: u32) -> Result<(), UploadFailure> {
+/// Uploads the timeout image (the module docs, step 1): `image` or black
+/// ([`fill_cover`]). `fd1` is any descriptor of the node.
+fn upload_image(
+    fd1: &fs::File,
+    plan: &CoverPlan,
+    image: Option<&[u8]>,
+    image_io_id: u32,
+) -> Result<CoverShows, UploadFailure> {
     let device = plan.device.display();
     let mut req = output_request(1);
     controls::ioctl_ctrl_on(fd1, VIDIOC_S_CTRL, image_io_id, 1).map_err(|e| {
@@ -628,12 +819,17 @@ fn upload_black(fd1: &fs::File, plan: &CoverPlan, image_io_id: u32) -> Result<()
         ),
         left_pending: true,
     })?;
-    upload_on(&fd2, plan, &mut req).map_err(UploadFailure::after)
+    upload_on(&fd2, plan, image, &mut req).map_err(UploadFailure::after)
 }
 
-/// The rest of [`upload_black`], on `fd2`, the descriptor that took the
+/// The rest of [`upload_image`], on `fd2`, the descriptor that took the
 /// timeout image with `req` (which took the mode back).
-fn upload_on(fd2: &fs::File, plan: &CoverPlan, req: &mut V4l2RequestBuffers) -> Result<(), String> {
+fn upload_on(
+    fd2: &fs::File,
+    plan: &CoverPlan,
+    image: Option<&[u8]>,
+    req: &mut V4l2RequestBuffers,
+) -> Result<CoverShows, String> {
     let device = plan.device.display();
     // From here on, closing fd2 also gives the image back.
     // SAFETY: all-zero is a valid `struct v4l2_format`.
@@ -671,7 +867,7 @@ fn upload_on(fd2: &fs::File, plan: &CoverPlan, req: &mut V4l2RequestBuffers) -> 
     }
     let mut map = Mapping::new(fd2, buf.length as usize, offset)
         .map_err(|e| format!("cannot map the timeout image of {device}: {e}"))?;
-    fill_black(
+    let shows = fill_cover(
         map.bytes(),
         &ImageLayout {
             fourcc: pix.pixelformat,
@@ -680,6 +876,7 @@ fn upload_on(fd2: &fs::File, plan: &CoverPlan, req: &mut V4l2RequestBuffers) -> 
             sizeimage: pix.sizeimage,
         },
         plan.black,
+        image.map(|bytes| (&plan.frame, bytes)),
     )
     .map_err(|e| format!("{device}: {e}"))?;
     drop(map);
@@ -690,7 +887,7 @@ fn upload_on(fd2: &fs::File, plan: &CoverPlan, req: &mut V4l2RequestBuffers) -> 
     req.count = 0;
     // SAFETY: VIDIOC_REQBUFS takes a `struct v4l2_requestbuffers`.
     let _ = unsafe { ioctl_rw(fd2, VIDIOC_REQBUFS, req) };
-    Ok(())
+    Ok(shows)
 }
 
 /// The cover's outcome for the writer's current start, its report, and the
@@ -699,14 +896,30 @@ fn upload_on(fd2: &fs::File, plan: &CoverPlan, req: &mut V4l2RequestBuffers) -> 
 pub(crate) struct CoverSlot {
     state: Mutex<SlotState>,
     changed: Condvar,
-    helper: Mutex<Option<JoinHandle<()>>>,
+    /// The helper threads not joined yet (an install, re-installs).
+    helpers: Mutex<Vec<JoinHandle<()>>>,
+    /// What the cover shows: the cover image's frame, or `None` for black,
+    /// with the reason the image asked for cannot be read (black then).
+    /// The frame is read by each install when it runs.
+    image: Mutex<(Option<gst::Buffer>, Option<String>)>,
+    /// Held by an install from its first ioctl to its last: installs never
+    /// overlap (a second button press while the first's descriptor holds
+    /// the timeout image would leave the mode pending).
+    install: Mutex<()>,
 }
 
 struct SlotState {
     cover: ConsumerCover,
+    shows: CoverShows,
     /// Bumped at every start and stop: an outcome for an older one is
     /// dropped.
     generation: u64,
+    /// The plan of the current start, once its install was handed to a
+    /// helper: a re-install uses it. Cleared by a stop.
+    armed: Option<CoverPlan>,
+    /// Set by [`CoverSlot::disarm`] until the next start: no install or
+    /// re-install is started any more, not even the start's own.
+    disarmed: bool,
     report: Option<CoverReport>,
 }
 
@@ -714,7 +927,10 @@ impl Default for SlotState {
     fn default() -> Self {
         SlotState {
             cover: ConsumerCover::Off,
+            shows: CoverShows::Black,
             generation: 0,
+            armed: None,
+            disarmed: false,
             report: None,
         }
     }
@@ -738,8 +954,20 @@ impl CoverSlot {
         let mut st = self.lock();
         st.generation += 1;
         st.cover = ConsumerCover::Pending;
+        st.armed = None;
+        st.disarmed = false;
         self.changed.notify_all();
         st.generation
+    }
+
+    /// The end of a writer start, before [`Self::join_helper`] and before
+    /// the device is closed: no install or re-install is started any more
+    /// (an image ready now, or the start's trigger firing late, starts
+    /// nothing) until the next [`Self::begin`].
+    pub(crate) fn disarm(&self) {
+        let mut st = self.lock();
+        st.armed = None;
+        st.disarmed = true;
     }
 
     /// A writer stop (after [`Self::join_helper`]): a cover still pending
@@ -747,22 +975,27 @@ impl CoverSlot {
     pub(crate) fn cancel(&self) {
         let mut st = self.lock();
         st.generation += 1;
+        st.armed = None;
         if st.cover == ConsumerCover::Pending {
             st.cover = ConsumerCover::Off;
         }
         self.changed.notify_all();
     }
 
-    /// Records the outcome of start `generation` and reports it, unless a
-    /// later start or a stop came first.
-    pub(crate) fn finish(&self, generation: u64, outcome: Result<u32, String>) {
+    /// Records the outcome of an install (or re-install) for start
+    /// `generation` and reports it, unless a later start or a stop came
+    /// first.
+    pub(crate) fn finish(&self, generation: u64, outcome: Result<Installed, String>) {
         let (cover, report) = {
             let mut st = self.lock();
             if st.generation != generation {
                 return;
             }
             st.cover = match outcome {
-                Ok(timeout_ms) => ConsumerCover::Ready { timeout_ms },
+                Ok(Installed { timeout_ms, shows }) => {
+                    st.shows = shows;
+                    ConsumerCover::Ready { timeout_ms }
+                }
                 Err(why) => ConsumerCover::Failed(why),
             };
             self.changed.notify_all();
@@ -775,6 +1008,32 @@ impl CoverSlot {
 
     pub(crate) fn get(&self) -> ConsumerCover {
         self.lock().cover.clone()
+    }
+
+    /// The image frame an install would show now (`None`: black).
+    #[cfg(test)]
+    pub(crate) fn image(&self) -> Option<gst::Buffer> {
+        self.image
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+            .clone()
+    }
+
+    /// What the timeout image of the last install that succeeded shows;
+    /// black there while the cover image cannot be read is
+    /// [`CoverShows::BlackForImage`] with the reason.
+    pub(crate) fn shows(&self) -> CoverShows {
+        let unreadable = self
+            .image
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .clone();
+        match (self.lock().shows.clone(), unreadable) {
+            (CoverShows::Black, Some(why)) => CoverShows::BlackForImage(why),
+            (shows, _) => shows,
+        }
     }
 
     /// The outcome once it is no longer pending, or after `limit` (then
@@ -800,32 +1059,117 @@ impl CoverSlot {
         self.lock().report = report;
     }
 
-    /// Installs `plan` on a helper thread, for start `generation`. Never
-    /// blocks the caller (a streaming thread) beyond the thread's spawn.
+    /// Installs `plan` on a helper thread, for start `generation`, and
+    /// keeps it for re-installs ([`Self::set_image`]). Never blocks the
+    /// caller (a streaming thread) beyond the thread's spawn.
     pub(crate) fn spawn_helper(self: &Arc<Self>, generation: u64, plan: CoverPlan) {
-        let slot = Arc::clone(self);
-        let spawned = std::thread::Builder::new()
-            .name("obc-cover".into())
-            .spawn(move || slot.finish(generation, install(&plan)));
-        match spawned {
-            Ok(handle) => {
-                let old = self
-                    .helper
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .replace(handle);
-                // A previous start's helper, long done (stop joins it).
-                drop(old);
-            }
-            Err(e) => self.finish(generation, Err(format!("cannot start its thread: {e}"))),
+        let mut st = self.lock();
+        if st.generation != generation || st.disarmed {
+            return;
+        }
+        st.armed = Some(plan.clone());
+        if let Err(why) = self.spawn_locked(generation, plan, false) {
+            drop(st);
+            self.finish(generation, Err(why));
         }
     }
 
-    /// Waits for the helper thread, if one ran: its few ioctls are done and
-    /// its descriptors closed when this returns.
+    /// Sets what the cover shows: the cover image's frame (`Some`, laid out
+    /// as the plan's [`CoverPlan::frame`]) or black (`None`), with the
+    /// reason the image asked for cannot be read (`unreadable`, black
+    /// then). When the frame changes and the current start's install has
+    /// been handed to a helper already, the cover is installed again, on a
+    /// helper thread of its own (never blocking the caller); an install
+    /// still to come reads it when it runs. A change of `unreadable` alone
+    /// installs nothing (the cover is black either way): it changes what
+    /// [`Self::shows`] reports.
+    pub(crate) fn set_image(
+        self: &Arc<Self>,
+        image: Option<gst::Buffer>,
+        unreadable: Option<String>,
+    ) {
+        {
+            let mut current = self.image.lock().unwrap_or_else(|e| e.into_inner());
+            current.1 = unreadable;
+            let same = match (&current.0, &image) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.as_ptr() == b.as_ptr(),
+                _ => false,
+            };
+            if same {
+                return;
+            }
+            let old = std::mem::replace(&mut current.0, image);
+            drop(current);
+            drop(old);
+        }
+        let st = self.lock();
+        let Some(plan) = st.armed.clone() else {
+            return;
+        };
+        let generation = st.generation;
+        if let Err(why) = self.spawn_locked(generation, plan, true) {
+            drop(st);
+            self.finish(generation, Err(why));
+        }
+    }
+
+    /// The helper thread of an install (`again`: a re-install) of `plan`,
+    /// spawned with the state locked (so a stop's [`Self::disarm`] either
+    /// comes first or sees it in `helpers`). The helper runs under the
+    /// install lock and reads the image when it runs: the last install
+    /// shows the image of the last change.
+    fn spawn_locked(
+        self: &Arc<Self>,
+        generation: u64,
+        plan: CoverPlan,
+        again: bool,
+    ) -> Result<(), String> {
+        let slot = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("obc-cover".into())
+            .spawn(move || {
+                let _one = slot.install.lock().unwrap_or_else(|e| e.into_inner());
+                let image = slot
+                    .image
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0
+                    .clone();
+                let map = image.as_ref().and_then(|b| b.map_readable().ok());
+                let outcome = install(&plan, map.as_ref().map(|m| m.as_slice())).map_err(|why| {
+                    if again {
+                        format!("installing it again for a new cover image: {why}")
+                    } else {
+                        why
+                    }
+                });
+                drop(map);
+                slot.finish(generation, outcome);
+            });
+        match spawned {
+            Ok(handle) => {
+                let mut helpers = self.helpers.lock().unwrap_or_else(|e| e.into_inner());
+                // Finished helpers are joined now (a no-op).
+                let (done, live): (Vec<_>, Vec<_>) =
+                    helpers.drain(..).partition(JoinHandle::is_finished);
+                *helpers = live;
+                helpers.push(handle);
+                drop(helpers);
+                for h in done {
+                    let _ = h.join();
+                }
+                Ok(())
+            }
+            Err(e) => Err(format!("cannot start its thread: {e}")),
+        }
+    }
+
+    /// Waits for the helper threads, if any ran: their few ioctls are done
+    /// and their descriptors closed when this returns.
     pub(crate) fn join_helper(&self) {
-        let handle = self.helper.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(h) = handle {
+        let handles = std::mem::take(&mut *self.helpers.lock().unwrap_or_else(|e| e.into_inner()));
+        for h in handles {
             let _ = h.join();
         }
     }
@@ -1099,15 +1443,154 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_missing_node_fails_the_cover() {
-        let plan = CoverPlan {
+    /// NV12 at `w x h` as `GstVideoInfo` lays it out for even sizes with
+    /// a width that is a multiple of 4.
+    fn nv12_frame(w: u32, h: u32) -> FrameLayout {
+        let luma = (w * h) as usize;
+        FrameLayout {
+            fourcc: fourcc(OutputFormat::Nv12),
+            height: h,
+            planes: 2,
+            strides: [w as usize, w as usize, 0],
+            offsets: [0, luma, 0],
+            size: luma * 3 / 2,
+        }
+    }
+
+    fn nv12_device(bytesperline: u32, h: u32) -> ImageLayout {
+        ImageLayout {
+            fourcc: fourcc(OutputFormat::Nv12),
+            bytesperline,
+            height: h,
+            sizeimage: bytesperline * h * 3 / 2,
+        }
+    }
+
+    fn missing_node_plan() -> CoverPlan {
+        CoverPlan {
             device: "/nonexistent/obc-no-such-video-node".into(),
             format: OutputFormat::Nv12,
             black: (16, 128),
             writer_worst_gap: Duration::from_millis(100),
+            frame: nv12_frame(320, 240),
+        }
+    }
+
+    /// The frame layout the writer has, as `GstVideoInfo` computes it,
+    /// fits the device's format v4l2loopback reports for the same caps
+    /// (NV12 1920x1080: 1920 bytes per line, 3110400 bytes), in both
+    /// formats.
+    #[test]
+    fn the_writers_frames_fit_the_devices_format() {
+        gst::init().unwrap();
+        for (format, w, h) in [
+            (OutputFormat::Nv12, 1920, 1080),
+            (OutputFormat::Nv12, 1280, 720),
+            (OutputFormat::I420, 1920, 1080),
+            (OutputFormat::I420, 640, 480),
+        ] {
+            let contract = obc_core::OutputContract {
+                format,
+                width: w,
+                height: h,
+                ..obc_core::OutputContract::default()
+            };
+            let frame = crate::loopback::frame_layout(&contract).unwrap();
+            let device = ImageLayout {
+                fourcc: fourcc(format),
+                bytesperline: w,
+                height: h,
+                sizeimage: w * h * 3 / 2,
+            };
+            assert_eq!(frame_fits(&device, &frame), Ok(()), "{format:?} {w}x{h}");
+        }
+    }
+
+    /// The cover shows black with no image, the image when its frame is a
+    /// frame of the device's format, and black with the reason otherwise
+    /// (another stride, size, height or fourcc).
+    #[test]
+    fn the_cover_shows_the_image_only_when_the_device_format_is_its_layout() {
+        let frame = nv12_frame(320, 240);
+        let device = nv12_device(320, 240);
+        assert_eq!(cover_choice(&device, None), CoverShows::Black);
+        assert_eq!(cover_choice(&device, Some(&frame)), CoverShows::Image);
+        let padded = ImageLayout {
+            bytesperline: 384,
+            ..nv12_device(384, 240)
         };
-        let e = install(&plan).unwrap_err();
+        let bigger = ImageLayout {
+            sizeimage: device.sizeimage + 4096,
+            ..device
+        };
+        let taller = ImageLayout {
+            height: 248,
+            sizeimage: 320 * 248 * 3 / 2,
+            ..device
+        };
+        let i420 = ImageLayout {
+            fourcc: fourcc(OutputFormat::I420),
+            ..device
+        };
+        let yuyv = ImageLayout {
+            fourcc: u32::from_le_bytes(*b"YUYV"),
+            ..device
+        };
+        for bad in [padded, bigger, taller, i420, yuyv] {
+            match cover_choice(&bad, Some(&frame)) {
+                CoverShows::BlackForImage(why) => {
+                    assert!(why.contains("the device"), "{why}");
+                }
+                other => panic!("{bad:?}: {other:?}"),
+            }
+            // Black is still written, at the device's own layout.
+            if bad.fourcc == device.fourcc {
+                let mut timeout = vec![0u8; bad.sizeimage as usize];
+                let image = vec![200u8; frame.size];
+                let shows =
+                    fill_cover(&mut timeout, &bad, (16, 128), Some((&frame, &image))).unwrap();
+                assert!(matches!(shows, CoverShows::BlackForImage(_)));
+                assert_eq!(timeout[0], 16);
+                assert!(!timeout.contains(&200), "image bytes in a black cover");
+            }
+        }
+    }
+
+    /// The cover's bytes: the image frame, byte for byte up to
+    /// `sizeimage` (the page-aligned tail untouched), or black.
+    #[test]
+    fn the_cover_writes_the_image_or_black() {
+        let frame = nv12_frame(320, 240);
+        let device = nv12_device(320, 240);
+        let image: Vec<u8> = (0..frame.size).map(|i| (i % 251) as u8).collect();
+        let len = frame.size.div_ceil(4096) * 4096;
+        let mut timeout = vec![7u8; len];
+        let shows = fill_cover(&mut timeout, &device, (16, 128), Some((&frame, &image))).unwrap();
+        assert_eq!(shows, CoverShows::Image);
+        assert_eq!(&timeout[..frame.size], &image[..]);
+        assert!(timeout[frame.size..].iter().all(|&b| b == 7));
+        let shows = fill_cover(&mut timeout, &device, (16, 128), None).unwrap();
+        assert_eq!(shows, CoverShows::Black);
+        assert!(timeout[..320 * 240].iter().all(|&b| b == 16));
+        assert!(timeout[320 * 240..frame.size].iter().all(|&b| b == 128));
+        // An image frame or a timeout image too short is refused.
+        let e = fill_cover(
+            &mut timeout,
+            &device,
+            (16, 128),
+            Some((&frame, &image[..100])),
+        )
+        .unwrap_err();
+        assert!(e.contains("image frame"), "{e}");
+        let mut short = vec![0u8; 100];
+        let e = fill_cover(&mut short, &device, (16, 128), Some((&frame, &image))).unwrap_err();
+        assert!(e.contains("timeout image"), "{e}");
+    }
+
+    #[test]
+    fn a_missing_node_fails_the_cover() {
+        let plan = missing_node_plan();
+        let e = install(&plan, None).unwrap_err();
         assert!(e.contains("cannot open"), "{e}");
         assert!(LoopbackControls::query(&plan.device).is_err());
     }
@@ -1117,6 +1600,12 @@ mod tests {
     /// at the outcome or after its limit.
     #[test]
     fn the_slot_keeps_the_outcome_of_the_current_start() {
+        let ready = |timeout_ms| {
+            Ok(Installed {
+                timeout_ms,
+                shows: CoverShows::Black,
+            })
+        };
         let slot = Arc::new(CoverSlot::default());
         assert_eq!(slot.get(), ConsumerCover::Off);
         let reports = Arc::new(AtomicUsize::new(0));
@@ -1137,7 +1626,7 @@ mod tests {
             std::thread::spawn(move || slot.wait(Duration::from_secs(10)))
         };
         std::thread::sleep(Duration::from_millis(20));
-        slot.finish(g1, Ok(250));
+        slot.finish(g1, ready(250));
         assert_eq!(
             waiter.join().unwrap(),
             ConsumerCover::Ready { timeout_ms: 250 }
@@ -1150,7 +1639,7 @@ mod tests {
         let g2 = slot.begin();
         slot.cancel();
         assert_eq!(slot.get(), ConsumerCover::Off);
-        slot.finish(g2, Ok(250));
+        slot.finish(g2, ready(250));
         assert_eq!(slot.get(), ConsumerCover::Off);
 
         let g3 = slot.begin();
@@ -1167,17 +1656,124 @@ mod tests {
 
         // The helper thread reports a failed install, and is joined.
         let g4 = slot.begin();
-        slot.spawn_helper(
-            g4,
-            CoverPlan {
-                device: "/nonexistent/obc-no-such-video-node".into(),
-                format: OutputFormat::Nv12,
-                black: (16, 128),
-                writer_worst_gap: Duration::ZERO,
-            },
-        );
+        slot.spawn_helper(g4, missing_node_plan());
         slot.join_helper();
         assert!(matches!(slot.get(), ConsumerCover::Failed(e) if e.contains("cannot open")));
         assert_eq!(reports.load(Ordering::Relaxed), 3);
+    }
+
+    /// A change of the image after the start's install was handed to a
+    /// helper installs the cover again (reported, said to be a
+    /// re-install); an unchanged image does not; before the install and
+    /// after a stop nothing is started, and an install still to come
+    /// reads the image when it runs. The installs fail here (no device):
+    /// their reports are what is counted.
+    #[test]
+    fn a_new_cover_image_installs_the_cover_again() {
+        gst::init().unwrap();
+        let slot = Arc::new(CoverSlot::default());
+        let seen: Arc<Mutex<Vec<ConsumerCover>>> = Arc::default();
+        let s = Arc::clone(&seen);
+        slot.set_report(Some(Arc::new(move |c: &ConsumerCover| {
+            s.lock().unwrap().push(c.clone());
+        })));
+        let image = gst::Buffer::from_mut_slice(vec![0u8; 16]);
+        // Before any start: nothing to install again.
+        slot.set_image(Some(image.clone()), None);
+        slot.join_helper();
+        assert!(seen.lock().unwrap().is_empty());
+
+        let g = slot.begin();
+        // Started, its install not handed over yet: nothing either.
+        slot.set_image(None, None);
+        slot.join_helper();
+        assert!(seen.lock().unwrap().is_empty());
+        slot.spawn_helper(g, missing_node_plan());
+        slot.join_helper();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        slot.set_image(Some(image.clone()), None);
+        slot.join_helper();
+        // The same frame again: no install.
+        slot.set_image(Some(image.clone()), None);
+        slot.join_helper();
+        slot.set_image(None, None);
+        slot.join_helper();
+        slot.set_image(None, None);
+        slot.join_helper();
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 3, "{seen:?}");
+            for c in &seen[1..] {
+                assert!(
+                    matches!(c, ConsumerCover::Failed(e) if e.contains("installing it again for a new cover image")),
+                    "{c:?}"
+                );
+            }
+        }
+        // Stopped: no install.
+        slot.disarm();
+        slot.cancel();
+        slot.set_image(Some(image), None);
+        slot.join_helper();
+        assert_eq!(seen.lock().unwrap().len(), 3);
+    }
+
+    /// A stop disarms the cover first: once disarmed, neither the start's
+    /// trigger firing late nor a new image starts an install, and the next
+    /// start arms it again.
+    #[test]
+    fn a_disarmed_cover_starts_no_install() {
+        gst::init().unwrap();
+        let slot = Arc::new(CoverSlot::default());
+        let seen = Arc::new(AtomicUsize::new(0));
+        let s = Arc::clone(&seen);
+        slot.set_report(Some(Arc::new(move |_: &ConsumerCover| {
+            s.fetch_add(1, Ordering::Relaxed);
+        })));
+        let g = slot.begin();
+        slot.spawn_helper(g, missing_node_plan());
+        slot.join_helper();
+        assert_eq!(seen.load(Ordering::Relaxed), 1);
+        slot.disarm();
+        slot.set_image(Some(gst::Buffer::from_mut_slice(vec![0u8; 16])), None);
+        slot.spawn_helper(g, missing_node_plan());
+        slot.join_helper();
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            1,
+            "an install after the disarm"
+        );
+        slot.cancel();
+        let g = slot.begin();
+        slot.spawn_helper(g, missing_node_plan());
+        slot.join_helper();
+        assert_eq!(seen.load(Ordering::Relaxed), 2, "the next start installs");
+    }
+
+    /// An unreadable cover image: black in place, and the reason in what
+    /// the cover is said to show; the reason alone installs nothing.
+    #[test]
+    fn an_unreadable_cover_image_shows_black_with_the_reason() {
+        gst::init().unwrap();
+        let slot = Arc::new(CoverSlot::default());
+        let seen = Arc::new(AtomicUsize::new(0));
+        let s = Arc::clone(&seen);
+        slot.set_report(Some(Arc::new(move |_: &ConsumerCover| {
+            s.fetch_add(1, Ordering::Relaxed);
+        })));
+        let g = slot.begin();
+        slot.spawn_helper(g, missing_node_plan());
+        slot.join_helper();
+        assert_eq!(slot.shows(), CoverShows::Black);
+        slot.set_image(None, Some("Away image x could not be read".into()));
+        slot.join_helper();
+        assert_eq!(seen.load(Ordering::Relaxed), 1, "black either way");
+        assert_eq!(
+            slot.shows(),
+            CoverShows::BlackForImage("Away image x could not be read".into())
+        );
+        slot.set_image(None, None);
+        assert_eq!(slot.shows(), CoverShows::Black);
     }
 }

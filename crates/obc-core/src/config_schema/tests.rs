@@ -100,6 +100,7 @@ fn the_core_table_is_well_formed() {
     let parses = |key: &str, v: &str| match key {
         "output.format" => crate::OutputFormat::from_str(v).is_ok(),
         "output.aspect" => crate::AspectPolicy::from_str(v).is_ok(),
+        "output.placeholder" => crate::OutputPlaceholder::from_str(v).is_ok(),
         "effect.mode" => crate::EffectMode::from_str(v).is_ok(),
         "effect.relight_light" => crate::RelightLight::from_str(v).is_ok(),
         "effect.on_failure" => crate::EffectOnFailure::from_str(v).is_ok(),
@@ -137,10 +138,12 @@ fn the_editable_and_apply_table_is_the_decided_one() {
             "output.aspect",
             "output.hold_timeout_s",
             "output.input_gap_ms",
+            "output.placeholder",
             "video.memory",
             "lifecycle.idle_grace_s",
             "lifecycle.start_debounce_ms",
             "effect.on_failure",
+            "effect.fallback_image",
             "pipewire.enabled",
             "pipewire.offer_nv12",
             "mic.enabled",
@@ -162,6 +165,7 @@ fn the_editable_and_apply_table_is_the_decided_one() {
             || (k.key.starts_with("effect.") && k.key != "effect.maxine_root")
             || k.key == "camera.preference"
             || k.key == "camera.mode"
+            || k.key == "output.placeholder"
             || [
                 "mic.enabled",
                 "mic.device",
@@ -479,7 +483,8 @@ fn on_failure_offers_the_image_only_with_a_fallback_image() {
     );
     let image = find(&groups, "effect.fallback_image");
     assert_eq!(image.kind, RowKind::Path);
-    assert!(!image.editable);
+    assert_eq!(image.label, "Away image");
+    assert!(image.editable && image.enabled);
     assert_eq!(image.value, ConfigValue::Str(String::new()));
     assert_eq!(image.default, None);
 
@@ -535,8 +540,37 @@ fn on_failure_is_written_as_one_of_the_options_the_daemon_computed() {
     for (v, _) in on_failure_options(&effect) {
         assert!(crate::EffectOnFailure::from_str(&v).is_ok(), "{v}");
     }
-    // The image row cannot be written: paths are set in the file.
-    assert!(!lookup("effect.fallback_image", &facts).unwrap().editable);
+    // The image row is a path the panel writes (the away image).
+    let info = lookup("effect.fallback_image", &facts).unwrap();
+    assert!(info.editable);
+    assert_eq!(info.kind, RowKind::Path);
+    assert_eq!(info.apply, Apply::Live);
+}
+
+#[test]
+fn the_placeholder_row_offers_black_and_the_away_image_live() {
+    let (_tmp, set) = load(&[]);
+    let groups = config_schema(&set, &facts());
+    let r = find(&groups, "output.placeholder");
+    assert_eq!(r.label, "When there is no camera picture");
+    assert!(r.editable && r.enabled);
+    assert_eq!(r.apply, Apply::Live);
+    assert_eq!(r.value, ConfigValue::Str("black".into()));
+    assert_eq!(r.default, Some(ConfigValue::Str("black".into())));
+    assert_eq!(options(r), [("black", "Black"), ("image", "Away image")]);
+    let (_tmp, set) = load(&[(MANAGED_REL, "[output]\nplaceholder = \"image\"\n")]);
+    let groups = config_schema(&set, &facts());
+    let r = find(&groups, "output.placeholder");
+    assert_eq!(r.value, ConfigValue::Str("image".into()));
+    assert_eq!(r.source, MANAGED_REL);
+    let kind = lookup("output.placeholder", &facts()).unwrap().kind;
+    let e = to_toml(
+        "output.placeholder",
+        &kind,
+        &ConfigValue::Str("none".into()),
+    )
+    .unwrap_err();
+    assert!(e.contains("is not one of: black, image"), "{e}");
 }
 
 #[test]
