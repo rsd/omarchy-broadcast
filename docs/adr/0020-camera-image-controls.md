@@ -1,6 +1,6 @@
 # ADR-0020: Camera image controls: a per-camera allowlist, written whenever the camera opens
 
-- **Status:** Accepted (2026-11-09). Extends [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md) (the D-Bus API as revision 6, additive, and the runtime state file) and [ADR-0009](0009-ingest-process-output.md) (the camera and its controls belong to the ingest stage). Amended 2026-11-10 by [ADR-0023](0023-settings-schema.md): see [Amendment](#amendment-2026-11-10).
+- **Status:** Accepted (2026-11-09). Extends [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md) (the D-Bus API as revision 6, additive, and the runtime state file) and [ADR-0009](0009-ingest-process-output.md) (the camera and its controls belong to the ingest stage). Amended 2026-11-10 by [ADR-0023](0023-settings-schema.md): see [Amendment](#amendment-2026-11-10). See also [ADR-0036](0036-camera-quirk-rows-and-camera-health.md): recommended settings are an offer applied only on request, and the power-line frequency of the time zone is written at an open when nothing is stored (the one value the daemon sets unasked).
 
 ## Context
 - A UVC camera keeps its image controls on the device, and other software changes them. A camera was found with sharpness 255, saturation 179, contrast 77 and backlight compensation 0: the picture had halos around edges and oversaturated colour, and nothing in the daemon could improve it. The user needs to adjust these controls and to put them back, for each camera, without another tool.

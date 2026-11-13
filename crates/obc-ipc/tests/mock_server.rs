@@ -23,7 +23,7 @@ use obc_ipc::{
     SETTINGS_REVISION, Setting, SettingChange, SettingKind, SettingValue, SettingsGroup,
     SettingsTree, Snapshot, State, Stats, WARNING_REVISION,
 };
-use obc_ipc::{MIC_REVISION, MicStatus, StageValue};
+use obc_ipc::{CameraHealth, MIC_REVISION, MicStatus, Recommended, StageValue};
 use obc_ipc::{ModuleInfo, ModuleList, StageInfo};
 use zbus::message::Flags;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
@@ -71,6 +71,29 @@ struct Mock {
     /// `StageValues` (revision 16): [`zoom`] until the mock's
     /// `MockSetStageValues` changes it.
     stage_values: Vec<StageValue>,
+    /// `CameraHealth` (revision 20): [`health`] until
+    /// `ApplyRecommendedSettings` empties its `recommended`.
+    camera_health: CameraHealth,
+}
+
+/// The mock's `CameraHealth`: the first camera delivers short, with one
+/// recommended change.
+fn health() -> CameraHealth {
+    CameraHealth {
+        camera: "usb-1234_abcd".into(),
+        delivered_fps: 19.5,
+        nominal_fps: 30.0,
+        corrupt_frames: 4,
+        warnings: vec!["Plug First Camera into its own USB port.".into()],
+        suggestions: Vec::new(),
+        has_recommendation: true,
+        recommended: vec![Recommended {
+            setting: "camera.image.sharpness".into(),
+            label: "Sharpness".into(),
+            value: "5".into(),
+            current: "128".into(),
+        }],
+    }
 }
 
 /// The mock's `StageValues` while enabled: auto-frame's zoom.
@@ -366,6 +389,7 @@ impl Mock {
             config_serial: 1,
             mic: mic_on(),
             stage_values: zoom(),
+            camera_health: health(),
         }
     }
 
@@ -989,6 +1013,33 @@ impl Mock {
         self.stage_values.clone()
     }
 
+    #[zbus(property)]
+    fn camera_health(&self) -> VariantDict {
+        self.camera_health.to_dict()
+    }
+
+    /// As the daemon: `InvalidArgument` for an unknown camera or one
+    /// without a row; otherwise nothing differs from the recommendation
+    /// any more, announced before the reply.
+    async fn apply_recommended_settings(
+        &mut self,
+        camera: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        let at = self
+            .controls_of(&camera)
+            .map_err(|e| IpcError::InvalidArgument(e.to_string()))?;
+        if at != 0 {
+            return Err(IpcError::InvalidArgument(format!(
+                "{} has no recommended settings",
+                self.cameras[at].name
+            )));
+        }
+        self.camera_health.recommended.clear();
+        self.camera_health_changed(&emitter).await?;
+        Ok(())
+    }
+
     /// The mock's own: sets `StageValues`, as the daemon does from its
     /// stages.
     async fn mock_set_stage_values(
@@ -1300,11 +1351,13 @@ async fn proxy_reads_every_property() {
             config_serial: Some(1),
             mic: Some(mic_on()),
             stage_values: zoom(),
+            camera_health: Some(health()),
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 19);
-    assert_eq!(INTERFACE_REVISION, obc_ipc::CPU_CONVERT_REVISION);
+    assert_eq!(INTERFACE_REVISION, 20);
+    assert_eq!(obc_ipc::CAMERA_HEALTH_REVISION, 20);
+    assert_eq!(obc_ipc::CPU_CONVERT_REVISION, 19);
     assert_eq!(obc_ipc::VIDEO_BACKGROUND_REVISION, 18);
     assert_eq!(obc_ipc::PLACEHOLDER_REVISION, 17);
     assert_eq!(obc_ipc::STAGE_VALUES_REVISION, 16);
@@ -1347,6 +1400,7 @@ async fn a_revision_1_daemon_reads_with_defaults_for_the_newer_properties() {
         assert_eq!(snap.warning, "");
         assert_eq!(snap.mic, None);
         assert!(snap.stage_values.is_empty(), "before revision 16");
+        assert_eq!(snap.camera_health, None, "before revision 20");
     }
     let no_autostart = within("snapshot", Snapshot::fetch_no_autostart(&client))
         .await
@@ -1645,6 +1699,62 @@ async fn stage_values_are_read_and_followed() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// `CameraHealth` reads through `GetAll` and the proxy, and
+/// `ApplyRecommendedSettings` changes it, announced as `PropertiesChanged`
+/// that apply to a snapshot; its refusals map back by name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn camera_health_is_read_and_followed() {
+    let (_server, client) = pair().await;
+    let proxy = OmarchyBroadcastProxy::builder(&client)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .unwrap();
+    let dict = within("CameraHealth", proxy.camera_health()).await.unwrap();
+    assert_eq!(CameraHealth::from_dict(&dict), health());
+    let props = fdo::PropertiesProxy::builder(&client)
+        .destination(obc_ipc::BUS_NAME)
+        .path(OBJECT_PATH)
+        .build()
+        .await
+        .unwrap();
+    let all = within("GetAll", props.get_all(INTERFACE.try_into().unwrap()))
+        .await
+        .unwrap();
+    let mut snap = Snapshot::from_properties(all.iter().map(|(k, v)| (k.as_str(), &**v))).unwrap();
+    assert_eq!(snap.camera_health, Some(health()));
+    let mut changed = props.receive_properties_changed().await.unwrap();
+    match within("Apply", proxy.apply_recommended_settings("nope")).await {
+        Err(IpcError::InvalidArgument(_)) => {}
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+    match within("Apply", proxy.apply_recommended_settings("platform-video2")).await {
+        Err(IpcError::InvalidArgument(m)) => assert!(m.contains("no recommended"), "{m}"),
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+    within("Apply", proxy.apply_recommended_settings(""))
+        .await
+        .unwrap();
+    loop {
+        let signal = within("PropertiesChanged", changed.next())
+            .await
+            .expect("PropertiesChanged stream ended");
+        let args = signal.args().unwrap();
+        let mut done = false;
+        for (k, v) in args.changed_properties() {
+            snap.apply_property(k, v).unwrap();
+            done |= *k == "CameraHealth";
+        }
+        if done {
+            break;
+        }
+    }
+    let h = snap.camera_health.unwrap();
+    assert!(h.recommended.is_empty());
+    assert!(h.has_recommendation);
+    assert!(h.delivers_short());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

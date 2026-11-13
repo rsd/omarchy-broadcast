@@ -24,6 +24,9 @@
 //!
 //! The microphone's fields (revision 13) are in the snapshot (`mic`), and
 //! a change of them prints a `mic` line (or, for a person, a `mic:` line).
+//! The camera's health (revision 20) likewise: `camera_health` in the
+//! snapshot, a `camera_health` line (or a `camera health:` line) when it
+//! changes; never in `state` lines.
 //!
 //! Also with `--json`: a `modules_changed` line when `ModulesSerial` moves
 //! (revision 9), and a `config_changed` line for each `ConfigChanged`
@@ -77,6 +80,9 @@ impl Printer {
             }
             if let (true, Some(m)) = (changes.mic, &s.mic) {
                 out::line(&json::mic_line(m));
+            }
+            if let (true, Some(h)) = (changes.health, model::camera_health(s)) {
+                out::line(&json::camera_health_line(h));
             }
         } else {
             for line in human::change_lines(s, changes) {

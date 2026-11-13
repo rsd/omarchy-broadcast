@@ -45,6 +45,7 @@ use zbus::{Connection, DBusError, OwnedVariant, Type, Variant};
 
 pub mod client;
 pub mod config;
+pub mod health;
 pub mod media;
 pub mod modules;
 pub mod settings;
@@ -53,6 +54,10 @@ pub use client::OmarchyBroadcastProxy;
 pub use config::{
     CONFIG_REVISION, ConfigFileEntry, ConfigFiles, ConfigGroup, ConfigKind, ConfigRow,
     ConfigSchema, ConfigValue,
+};
+pub use health::{
+    CAMERA_HEALTH_PERIOD_MS, CAMERA_HEALTH_REVISION, CameraHealth, DELIVERS_SHORT_RATIO,
+    NOT_MEASURED, Recommended, Suggestion,
 };
 pub use media::{MEDIA_DIRS_REVISION, MEDIA_REVISION, MediaDirs, MediaEntry, MediaReply};
 pub use modules::{FORCED_REVISION, MODULES_REVISION, ModuleInfo, ModuleList, StageInfo};
@@ -134,8 +139,15 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// ([`PLACEHOLDER_REVISION`]). Revision 18 added video backgrounds, with no
 /// new member ([`VIDEO_BACKGROUND_REVISION`]). Revision 19 dropped the
 /// playback copies for the CPU and gave the command that converts a video
-/// instead ([`CPU_CONVERT_REVISION`]).
-pub const INTERFACE_REVISION: u32 = 19;
+/// instead ([`CPU_CONVERT_REVISION`]). Revision 20 added the
+/// `CameraHealth` property ([`CameraHealth`]: the rate the active camera
+/// really delivers, its damaged frames, warnings about its USB placement
+/// and damaged frames, effect suggestions and the recommended settings of
+/// its model) and `ApplyRecommendedSettings`; the rate in the label of the
+/// capture mode in use reads `<delivered> of <nominal> fps` once the camera
+/// is measured below [`DELIVERS_SHORT_RATIO`] of its rate
+/// ([`CAMERA_HEALTH_REVISION`]).
+pub const INTERFACE_REVISION: u32 = 20;
 /// The first [`INTERFACE_REVISION`] with the `StageValues` property.
 pub const STAGE_VALUES_REVISION: u32 = 16;
 /// The first [`INTERFACE_REVISION`] with the away image, and no new member:
@@ -589,6 +601,9 @@ pub struct Snapshot {
     /// empty when the camera is idle, when no stage reports, and when the
     /// daemon does not offer it.
     pub stage_values: Vec<StageValue>,
+    /// `CameraHealth` (revision 20): what the daemon knows about the active
+    /// camera's health; `None` when the daemon does not offer it.
+    pub camera_health: Option<CameraHealth>,
     pub interface_revision: u32,
 }
 
@@ -621,6 +636,7 @@ impl Snapshot {
             config_serial: None,
             mic: None,
             stage_values: Vec::new(),
+            camera_health: None,
             interface_revision: 0,
         }
     }
@@ -676,6 +692,10 @@ impl Snapshot {
             "MicError" => self.mic_mut().error = deserialize_for_property(value)?,
             "StageValues" => {
                 self.stage_values = deserialize_for_property::<Vec<StageValue>>(value)?
+            }
+            "CameraHealth" => {
+                let dict: settings::VariantDict = deserialize_for_property(value)?;
+                self.camera_health = Some(CameraHealth::from_dict(&dict));
             }
             "InterfaceRevision" => self.interface_revision = deserialize_for_property(value)?,
             _ => {}
@@ -757,7 +777,7 @@ impl Snapshot {
     /// `BackgroundImage`, `PipeWireConsumers`, `PipeWireOutput`, `Denoise`,
     /// `PreviewConsumers`, `CameraControls`, `SettingsRevision`,
     /// `SettingsSchemaSerial`, `ModulesSerial`, `BackendProfile`, `ConfigSerial`,
-    /// `Warning`, the `Mic*` properties, `StageValues`) keep their
+    /// `Warning`, the `Mic*` properties, `StageValues`, `CameraHealth`) keep their
     /// [`Snapshot::empty`] value when the daemon does not offer
     /// them (see [`is_unknown_property_error`]), and `LoopbackConsumers` is then
     /// `Consumers`, as [`Snapshot::from_properties`] does for a property
@@ -805,6 +825,13 @@ impl Snapshot {
             config_serial: optional(proxy.config_serial().await.map(Some), empty.config_serial)?,
             mic: fetch_mic(proxy).await?,
             stage_values: optional(proxy.stage_values().await, empty.stage_values)?,
+            camera_health: optional(
+                proxy
+                    .camera_health()
+                    .await
+                    .map(|d| Some(CameraHealth::from_dict(&d))),
+                empty.camera_health,
+            )?,
             interface_revision: proxy.interface_revision().await?,
         })
     }
@@ -944,6 +971,27 @@ mod tests {
         // A value of the wrong type is an error.
         assert!(Snapshot::from_properties([("State", &state), ("StageValues", &state)]).is_err());
         const { assert!(STAGE_VALUES_REVISION <= INTERFACE_REVISION) };
+    }
+
+    #[test]
+    fn camera_health_is_read_and_none_before_revision_20() {
+        let state = Variant::from("active");
+        let health = CameraHealth {
+            camera: "cam".into(),
+            delivered_fps: 19.5,
+            nominal_fps: 30.0,
+            corrupt_frames: 3,
+            warnings: vec!["A warning.".into()],
+            ..CameraHealth::none()
+        };
+        let dict = zbus::as_variant::to_owned_variant(&health.to_dict()).unwrap();
+        let snap = Snapshot::from_properties([("State", &state), ("CameraHealth", &dict)]).unwrap();
+        assert_eq!(snap.camera_health, Some(health));
+        // From a daemon before revision 20: none.
+        let old = Snapshot::from_properties([("State", &state)]).unwrap();
+        assert_eq!(old.camera_health, None);
+        // A value of the wrong type is an error.
+        assert!(Snapshot::from_properties([("State", &state), ("CameraHealth", &state)]).is_err());
     }
 
     #[test]
@@ -1308,7 +1356,8 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, CPU_CONVERT_REVISION);
+        assert_eq!(INTERFACE_REVISION, CAMERA_HEALTH_REVISION);
+        const { assert!(CPU_CONVERT_REVISION < CAMERA_HEALTH_REVISION) };
         const { assert!(VIDEO_BACKGROUND_REVISION < CPU_CONVERT_REVISION) };
         const { assert!(PLACEHOLDER_REVISION < VIDEO_BACKGROUND_REVISION) };
         const { assert!(STAGE_VALUES_REVISION < PLACEHOLDER_REVISION) };

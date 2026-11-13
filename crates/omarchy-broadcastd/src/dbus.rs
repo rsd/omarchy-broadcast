@@ -657,6 +657,17 @@ impl Server {
         Ok(reply.to_wire())
     }
 
+    /// Puts the device settings of `camera` (`""`: the active camera) back
+    /// to their defaults (not the capture mode, not the effects), then
+    /// writes its model's recommended values and the power-line frequency
+    /// of the time zone, stored as the user's (revision 20). Replies once
+    /// the result is published. `InvalidArgument` for an unknown camera or
+    /// one without recommended settings.
+    async fn apply_recommended_settings(&self, camera: String) -> Result<(), IpcError> {
+        self.call(|r| Command::ApplyRecommendedSettings(camera, r))
+            .await
+    }
+
     /// The user directories of `kind`, `background` or `away` (revision
     /// 19): `user_dir` (s), as `GetMedia` gives it, and `video_dir` (s),
     /// where the kind's videos are stored (the videos root for
@@ -989,6 +1000,17 @@ impl Server {
         self.snap().stage_values
     }
 
+    /// What the daemon knows about the active camera's health, `a{sv}`
+    /// (`obc_ipc::CameraHealth`): the rate it delivers, its damaged frames,
+    /// warnings, effect suggestions and the recommended settings.
+    /// Announced at once when the camera changes or a warning, a
+    /// suggestion or a recommended change appears or goes, otherwise at
+    /// most every 2 s (revision 20).
+    #[zbus(property)]
+    fn camera_health(&self) -> VariantDict {
+        self.snap().camera_health.unwrap_or_default().to_dict()
+    }
+
     #[zbus(property)]
     fn interface_revision(&self) -> u32 {
         self.snap().interface_revision
@@ -1044,6 +1066,7 @@ async fn emit_change(emitter: &SignalEmitter<'_>, change: &Change) -> zbus::Resu
         | Change::MicConsumers(v) => emit_changed(emitter, name, v).await,
         Change::CameraControls(v) => emit_changed(emitter, name, v).await,
         Change::StageValues(v) => emit_changed(emitter, name, v).await,
+        Change::CameraHealth(v) => emit_changed(emitter, name, &v.to_dict()).await,
     }
 }
 

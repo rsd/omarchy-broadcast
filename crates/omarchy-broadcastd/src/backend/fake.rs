@@ -458,6 +458,19 @@ pub struct World {
     pub watch_stops: u32,
     /// Starting a watcher fails with this.
     pub fail_watch: Option<String>,
+    /// What `ingest_health` reports as the delivered rate while an ingest
+    /// runs.
+    pub delivered_fps: Option<f64>,
+    /// What `ingest_health` reports as the damaged frames dropped while an
+    /// ingest runs (the test raises them as the stream goes).
+    pub corrupt: obc_pipeline::frame_guard::CorruptFrames,
+    /// Where each camera sits on the USB bus (`usb_placement`), by id; a
+    /// camera without an entry is not on USB.
+    pub placements: std::collections::HashMap<String, obc_pipeline::UsbPlacement>,
+    /// The `usb_placement` reads.
+    pub placement_reads: u32,
+    /// The time zone `time_zone` gives (`None`: none known).
+    pub time_zone: Option<String>,
 }
 
 impl Default for World {
@@ -592,6 +605,11 @@ impl Default for World {
             watch_starts: 0,
             watch_stops: 0,
             fail_watch: None,
+            delivered_fps: None,
+            corrupt: obc_pipeline::frame_guard::CorruptFrames::default(),
+            placements: std::collections::HashMap::new(),
+            placement_reads: 0,
+            time_zone: None,
         }
     }
 }
@@ -1401,6 +1419,26 @@ impl MediaBackend for FakeBackend {
         if w.watch.take().is_some() {
             w.watch_stops += 1;
         }
+    }
+
+    fn ingest_health(&mut self) -> Option<super::IngestHealth> {
+        let w = self.world();
+        // An ingest runs while the session has a camera.
+        w.session.as_ref().and_then(|(_, cam)| cam.as_ref())?;
+        Some(super::IngestHealth {
+            delivered_fps: w.delivered_fps,
+            corrupt: w.corrupt,
+        })
+    }
+
+    fn usb_placement(&mut self, camera: &Camera) -> Option<obc_pipeline::UsbPlacement> {
+        let mut w = self.world();
+        w.placement_reads += 1;
+        w.placements.get(&camera.id).cloned()
+    }
+
+    fn time_zone(&mut self) -> Option<String> {
+        self.world().time_zone.clone()
     }
 }
 

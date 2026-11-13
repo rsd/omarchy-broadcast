@@ -14,7 +14,8 @@ use std::borrow::Cow;
 use std::fmt::Write as _;
 
 use obc_ipc::{
-    CameraControl, CameraControls, Setting, SettingKind, SettingsTree, Snapshot, State, Stats,
+    CameraControl, CameraControls, CameraHealth, Setting, SettingKind, SettingsTree, Snapshot,
+    State, Stats,
 };
 
 use crate::json;
@@ -123,7 +124,17 @@ pub fn consumers_label(s: &Snapshot) -> String {
 /// `status`: one field per line; the PipeWire output's state while it is
 /// involved, the strength with `blur`, the image with `replace`, and noise
 /// removal after the effect (unless the daemon is too old to have it).
+#[cfg(test)]
 pub fn status_text(s: &Snapshot) -> String {
+    status_text_with(s, &|_| None)
+}
+
+/// [`status_text`], with the active camera's health (revision 20) last:
+/// `Delivers:` while it delivers short of its mode's rate, `Damaged:` once
+/// it dropped a damaged frame, a `Warning:` line per warning and a
+/// `Suggest:` line per suggestion, the setting named by its label
+/// (`label`: from the settings tree; the id when it gives none).
+pub fn status_text_with(s: &Snapshot, label: &dyn Fn(&str) -> Option<String>) -> String {
     let mut out = format!(
         "State:      {}\n\
          Enabled:    {}\n\
@@ -158,7 +169,136 @@ pub fn status_text(s: &Snapshot) -> String {
     if !s.warning.is_empty() {
         out.push_str(&format!("Warning:    {}\n", printable(&s.warning)));
     }
+    if let Some(h) = active_health(s) {
+        out.push_str(&health_lines(h, label));
+    }
     out
+}
+
+/// `CameraHealth` when it is the active camera's (revision 20).
+pub fn active_health(s: &Snapshot) -> Option<&CameraHealth> {
+    model::camera_health(s).filter(|h| !h.camera.is_empty() && h.camera == s.active_camera)
+}
+
+/// A rate as printed: whole when it is, else one decimal.
+fn fps_text(fps: f64) -> String {
+    if (fps - fps.round()).abs() < 0.05 {
+        format!("{}", fps.round() as i64)
+    } else {
+        format!("{fps:.1}")
+    }
+}
+
+/// The health lines of `status` (see [`status_text_with`]), each list cut
+/// as in the JSON.
+fn health_lines(h: &CameraHealth, label: &dyn Fn(&str) -> Option<String>) -> String {
+    let mut out = String::new();
+    if h.delivers_short() {
+        out.push_str(&format!(
+            "Delivers:   {:.1} of {} fps\n",
+            h.delivered_fps,
+            fps_text(h.nominal_fps)
+        ));
+    }
+    if h.corrupt_frames > 0 {
+        out.push_str(&format!(
+            "Damaged:    {} frame{} dropped\n",
+            h.corrupt_frames,
+            if h.corrupt_frames == 1 { "" } else { "s" }
+        ));
+    }
+    for w in h.warnings.iter().take(json::MAX_HEALTH_WARNINGS) {
+        out.push_str(&format!("Warning:    {}\n", printable(w)));
+    }
+    for sg in h.suggestions.iter().take(json::MAX_SUGGESTIONS) {
+        let name = label(&sg.setting).unwrap_or_else(|| sg.setting.clone());
+        out.push_str(&format!(
+            "Suggest:    {} \u{2014} {}\n",
+            printable(&name),
+            printable(&sg.reason)
+        ));
+    }
+    out
+}
+
+/// `recommended`: the changes "Use recommended settings" would make to
+/// the active camera (`label: current → value`), or why there are none.
+pub fn recommended_text(s: &Snapshot, h: &CameraHealth) -> String {
+    if h.camera.is_empty() {
+        return "No camera.\n".into();
+    }
+    if !h.has_recommendation {
+        return "This camera has no recommended settings.\n".into();
+    }
+    if h.recommended.is_empty() {
+        return "Already at the recommended settings.\n".into();
+    }
+    let mut out = format!(
+        "Recommended settings for {}:\n",
+        camera_label_of(s, &h.camera)
+    );
+    for r in h.recommended.iter().take(json::MAX_RECOMMENDED) {
+        out.push_str(&format!(
+            "  {}: {} \u{2192} {}\n",
+            printable(&r.label),
+            printable(&r.current),
+            printable(&r.value)
+        ));
+    }
+    out.push_str("Use them with: omarchy-broadcast recommended apply\n");
+    out
+}
+
+/// After `recommended apply`: what is left to change, if anything (a
+/// camera may refuse a value).
+pub fn recommended_applied_text(s: &Snapshot, h: &CameraHealth) -> String {
+    let mut out = format!(
+        "Recommended settings applied to {}.\n",
+        camera_label_of(s, &h.camera)
+    );
+    if !h.recommended.is_empty() {
+        out.push_str("Still different:\n");
+        for r in h.recommended.iter().take(json::MAX_RECOMMENDED) {
+            out.push_str(&format!(
+                "  {}: {} (recommended {})\n",
+                printable(&r.label),
+                printable(&r.current),
+                printable(&r.value)
+            ));
+        }
+    }
+    out
+}
+
+/// `watch`: the camera's health after a change, in one line.
+pub fn health_change_line(h: &CameraHealth) -> String {
+    if h.camera.is_empty() {
+        return "camera health: no camera".into();
+    }
+    let mut parts = Vec::new();
+    if h.delivered_fps >= 0.0 && h.delivered_fps.is_finite() {
+        parts.push(format!(
+            "delivers {:.1} of {} fps",
+            h.delivered_fps,
+            fps_text(h.nominal_fps)
+        ));
+    }
+    if h.corrupt_frames > 0 {
+        parts.push(format!("{} damaged frames dropped", h.corrupt_frames));
+    }
+    for w in h.warnings.iter().take(json::MAX_HEALTH_WARNINGS) {
+        parts.push(format!("warning: {}", printable(w)));
+    }
+    for sg in h.suggestions.iter().take(json::MAX_SUGGESTIONS) {
+        parts.push(format!("suggest {}", printable(&sg.setting)));
+    }
+    if !h.recommended.is_empty() {
+        parts.push(format!("{} recommended changes", h.recommended.len()));
+    }
+    if parts.is_empty() {
+        parts.push("nothing to report".into());
+    }
+    format!("camera health: {}", parts.join(" | "))
 }
 
 /// The stage values shown: at most [`json::MAX_STAGE_VALUES`], as in the
@@ -653,6 +793,9 @@ pub fn change_lines(s: &Snapshot, changes: &Changes) -> Vec<String> {
     if let (true, Some(m)) = (changes.mic, &s.mic) {
         lines.push(mic_change_line(m));
     }
+    if let (true, Some(h)) = (changes.health, model::camera_health(s)) {
+        lines.push(health_change_line(h));
+    }
     lines
 }
 
@@ -718,6 +861,7 @@ mod tests {
             config_serial: None,
             mic: None,
             stage_values: Vec::new(),
+            camera_health: None,
             interface_revision: 3,
         }
     }
@@ -804,6 +948,7 @@ mod tests {
             cameras: false,
             controls: false,
             mic: false,
+            health: false,
         };
         assert_eq!(change_lines(&s, &changes), ["preview consumers: 0"]);
     }
@@ -1558,6 +1703,106 @@ mod tests {
         assert_eq!(
             mic_change_line(&on),
             "mic: active | consumers 2 | mic-denoise: voice | latency 20.0 ms | error: e\\x1b"
+        );
+    }
+
+    fn health() -> obc_ipc::CameraHealth {
+        obc_ipc::CameraHealth {
+            camera: "usb-1234_abcd".into(),
+            delivered_fps: 19.5,
+            nominal_fps: 30.0,
+            corrupt_frames: 12,
+            warnings: vec!["Plug First Camera into its own USB port.\x1b".into()],
+            suggestions: vec![obc_ipc::Suggestion {
+                setting: "effect.video.denoise".into(),
+                value: "on".into(),
+                reason: "This camera's picture is grainy.".into(),
+            }],
+            has_recommendation: true,
+            recommended: vec![obc_ipc::Recommended {
+                setting: "camera.image.sharpness".into(),
+                label: "Sharpness".into(),
+                value: "5".into(),
+                current: "3".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn status_shows_the_active_cameras_health() {
+        let mut s = sample();
+        s.active_camera = "usb-1234_abcd".into();
+        s.camera_health = Some(health());
+        s.interface_revision = obc_ipc::CAMERA_HEALTH_REVISION;
+        let label = |id: &str| (id == "effect.video.denoise").then(|| "Noise removal".to_string());
+        let text = status_text_with(&s, &label);
+        assert!(
+            text.ends_with(
+                "Delivers:   19.5 of 30 fps\n\
+                 Damaged:    12 frames dropped\n\
+                 Warning:    Plug First Camera into its own USB port.\\x1b\n\
+                 Suggest:    Noise removal \u{2014} This camera's picture is grainy.\n"
+            ),
+            "{text}"
+        );
+        // Without the label, the id; at its rate and undamaged, no line.
+        let mut h = health();
+        h.delivered_fps = 29.9;
+        h.corrupt_frames = 0;
+        h.warnings.clear();
+        s.camera_health = Some(h);
+        let text = status_text(&s);
+        assert!(
+            !text.contains("Delivers:") && !text.contains("Damaged:"),
+            "{text}"
+        );
+        assert!(text.ends_with(
+            "Suggest:    effect.video.denoise \u{2014} This camera's picture is grainy.\n"
+        ));
+        // Another camera's health, or none: nothing.
+        s.active_camera = "platform-video2".into();
+        assert!(!status_text(&s).contains("Suggest:"));
+        s.camera_health = None;
+        assert!(!status_text(&s).contains("Suggest:"));
+    }
+
+    #[test]
+    fn the_recommended_texts() {
+        let mut s = sample();
+        s.active_camera = "usb-1234_abcd".into();
+        let h = health();
+        assert_eq!(
+            recommended_text(&s, &h),
+            "Recommended settings for First Camera (1234:abcd):\n  Sharpness: 3 \u{2192} 5\n\
+             Use them with: omarchy-broadcast recommended apply\n"
+        );
+        let mut done = h.clone();
+        done.recommended.clear();
+        assert_eq!(
+            recommended_text(&s, &done),
+            "Already at the recommended settings.\n"
+        );
+        assert_eq!(
+            recommended_applied_text(&s, &done),
+            "Recommended settings applied to First Camera (1234:abcd).\n"
+        );
+        assert!(recommended_applied_text(&s, &h).contains("Still different:\n  Sharpness: 3"));
+        let mut none = h.clone();
+        none.has_recommendation = false;
+        none.recommended.clear();
+        assert_eq!(
+            recommended_text(&s, &none),
+            "This camera has no recommended settings.\n"
+        );
+        assert_eq!(
+            recommended_text(&s, &obc_ipc::CameraHealth::none()),
+            "No camera.\n"
+        );
+        assert_eq!(
+            health_change_line(&h),
+            "camera health: delivers 19.5 of 30 fps | 12 damaged frames dropped | warning: Plug \
+             First Camera into its own USB port.\\x1b | suggest effect.video.denoise | 1 \
+             recommended changes"
         );
     }
 }

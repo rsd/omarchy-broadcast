@@ -835,6 +835,16 @@ impl Ingest {
             .map(|g| g.counts())
             .unwrap_or_default()
     }
+
+    /// The rate the camera delivers good frames at, in frames per second:
+    /// the frames its frame guard passes, timed from their PTS over a
+    /// sliding window of about 5 s, the first 15 frames of the stream not
+    /// counted ([`crate::delivered_rate`]). `None` until the window spans
+    /// 3 s, once no good frame has come for a second, and for a source
+    /// that is not a camera.
+    pub fn delivered_fps(&self) -> Option<f64> {
+        self.guard_frames.as_ref().and_then(|g| g.delivered_fps())
+    }
 }
 
 #[cfg(test)]
@@ -2599,6 +2609,67 @@ mod camera_head_tests {
         assert_eq!(guard.counts().flagged, dropped);
         assert_eq!(stats.pending() as u64, total - dropped);
         ingest.stop().unwrap();
+    }
+
+    /// The ingest reports the rate of the frames its camera's guard
+    /// passes ([`Ingest::delivered_fps`]): a camera stamping a frame every
+    /// 51.4 ms (the Generalplus sensor, 19.45 fps for a nominal 30) for
+    /// 5 s. Nothing before the first frame, nothing for an ingest that is
+    /// not a camera. CPU only.
+    #[test]
+    fn the_delivered_rate_comes_from_the_camera_guard() {
+        require_elements(&[
+            "appsrc",
+            "queue",
+            "videocrop",
+            "videoconvertscale",
+            "appsink",
+        ]);
+        let caps = "video/x-raw,format=NV12,width=160,height=120,framerate=30/1,\
+                    colorimetry=2:4:5:1";
+        let src = camera_src(caps);
+        let head = camera_chain(
+            src.clone().upcast(),
+            "test",
+            caps,
+            PixelFormat::Nv12,
+            2,
+            VideoMemory::System,
+            ColourRange::Limited,
+            None,
+        )
+        .unwrap();
+        let guard = Arc::clone(&head.guard);
+        let slot = Arc::new(Slot::new());
+        let mut ingest = Ingest::from_head(
+            head.chain,
+            head.format,
+            (160, 120),
+            AspectPolicy::Crop,
+            system_writer(&slot, &"320x240@30".parse().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(ingest.delivered_fps(), None, "not a camera ingest");
+        ingest.guard_frames = Some(guard);
+        ingest.start_with(None).unwrap();
+        assert_eq!(ingest.delivered_fps(), None, "no frame yet");
+        for n in 0..(5_000 / 51 + 1) {
+            let mut b = gst::Buffer::from_slice(vec![16u8; 160 * 120 * 3 / 2]);
+            b.get_mut()
+                .unwrap()
+                .set_pts(gst::ClockTime::from_nseconds(n * 51_400_000));
+            src.push_buffer(b).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let fps = loop {
+            if let Some(fps) = ingest.delivered_fps() {
+                break fps;
+            }
+            assert!(Instant::now() < deadline, "no rate");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        ingest.stop().unwrap();
+        assert!((fps - 19.455).abs() < 0.01, "{fps}");
     }
 
     /// `cudaconvertscale` converts a range-only difference: full-range NV12

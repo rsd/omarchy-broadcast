@@ -102,6 +102,13 @@ impl Session {
         self.ingest.as_ref().map(Ingest::corrupt_frames)
     }
 
+    /// The rate the current ingest's camera delivers good frames at
+    /// ([`Ingest::delivered_fps`]); `None` without an ingest, and while the
+    /// ingest has no rate yet.
+    pub fn delivered_fps(&self) -> Option<f64> {
+        self.ingest.as_ref().and_then(Ingest::delivered_fps)
+    }
+
     /// Builds (but does not start) an ingest for `cfg` writing into this
     /// session's output, so the caller can inspect or probe it before
     /// [`Self::switch_to`].
@@ -999,5 +1006,107 @@ mod tests {
             seen.iter().any(|(_, _, luma)| *luma > 128),
             "no pattern frame reached the sink"
         );
+    }
+
+    /// How many ingest pipelines are open at once: above NULL (a camera's
+    /// device is open from NULL -> READY to READY -> NULL) and in PAUSED or
+    /// PLAYING, with the most of each seen, and every state change in
+    /// order, for the failure message.
+    #[derive(Debug, Default)]
+    struct Concurrency {
+        open: i32,
+        max_open: i32,
+        active: i32,
+        max_active: i32,
+        log: Vec<(u64, gst::State, gst::State)>,
+    }
+
+    /// Counts `ingest`'s pipeline in `seen` ([`Concurrency`]), from its
+    /// own state changes on its bus, synchronously, on the thread making
+    /// them. The bus is not flushed on the way to NULL, so the change to
+    /// NULL is seen ([`failing_stops`]).
+    fn count_open(ingest: &Ingest, seen: &Arc<Mutex<Concurrency>>) {
+        let id = ingest.source_id();
+        let pipeline = ingest.pipeline().pipeline();
+        pipeline.set_auto_flush_bus(false);
+        let pipeline = pipeline.downgrade();
+        let seen = Arc::clone(seen);
+        ingest.pipeline().bus().set_sync_handler(move |_, msg| {
+            if let gst::MessageView::StateChanged(c) = msg.view()
+                && let Some(p) = pipeline.upgrade()
+                && msg.src() == Some(p.upcast_ref::<gst::Object>())
+            {
+                use gst::State::{Null, Paused, Ready};
+                let mut s = seen.lock().unwrap();
+                s.log.push((id, c.old(), c.current()));
+                match (c.old(), c.current()) {
+                    (Null, Ready) => s.open += 1,
+                    (Ready, Null) => s.open -= 1,
+                    (Ready, Paused) => s.active += 1,
+                    (Paused, Ready) => s.active -= 1,
+                    _ => {}
+                }
+                s.max_open = s.max_open.max(s.open);
+                s.max_active = s.max_active.max(s.active);
+            }
+            gst::BusSyncReply::Pass
+        });
+    }
+
+    /// (f) One stream at a time: across a run of switches, never more than
+    /// one ingest pipeline is open (above NULL, so never two in PAUSED or
+    /// PLAYING either). The run has a switch requested while the previous
+    /// one still holds (its source's first frame is held back 400 ms by a
+    /// queue), a switch to a source that fails to start, and three
+    /// switches back to back, each old source stopped while it streams.
+    #[test]
+    fn a_switch_never_has_two_ingests_open() {
+        let (mut session, _ticks) = cpu_session(OutputConfig::DEFAULT_HOLD_TIMEOUT);
+        let seen: Arc<Mutex<Concurrency>> = Arc::default();
+        let first = pattern(&session, None);
+        count_open(&first, &seen);
+        stream(&mut session, first);
+        // A test pattern is no camera: it has no delivered rate.
+        assert_eq!(session.delivered_fps(), None);
+
+        let slow = pattern(&session, Some(4 * GAP));
+        let slow_id = slow.source_id();
+        count_open(&slow, &seen);
+        session.switch_to(slow).expect("switch to the slow source");
+        let next = pattern(&session, None);
+        count_open(&next, &seen);
+        assert_eq!(
+            session.output().first_fresh(slow_id),
+            None,
+            "the switch to the slow source still holds"
+        );
+        assert_eq!(session.output().counts().holds_released, 0);
+        session.switch_to(next).expect("switch while holding");
+
+        let bad = broken(&session);
+        count_open(&bad, &seen);
+        assert!(session.switch_to(bad).is_err(), "the broken source");
+        let mut last = 0;
+        for _ in 0..3 {
+            let next = pattern(&session, None);
+            last = next.source_id();
+            count_open(&next, &seen);
+            session.switch_to(next).expect("back-to-back switch");
+        }
+        wait_for(
+            &mut session,
+            Duration::from_secs(10),
+            "the last source's first frame",
+            |s| s.output().first_fresh(last).is_some(),
+        );
+        session.stop().expect("teardown");
+
+        let s = seen.lock().unwrap();
+        assert_eq!((s.max_open, s.max_active), (1, 1), "{:?}", s.log);
+        // Seven ingests, each opened once (the broken one too: it fails
+        // READY -> PAUSED) and closed.
+        let opened = s.log.iter().filter(|(_, o, _)| *o == gst::State::Null);
+        assert_eq!(opened.count(), 7, "{:?}", s.log);
+        assert_eq!((s.open, s.active), (0, 0), "{:?}", s.log);
     }
 }

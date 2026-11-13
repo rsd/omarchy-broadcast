@@ -14,6 +14,11 @@
 //!   or that break the picture when written. The settings model leaves
 //!   them out, and nothing stored for them is written to the camera.
 //!
+//! * [`CameraProfile`]: what a measurement found best for a camera model:
+//!   the control values to offer as "recommended settings" (never applied
+//!   without the user asking: the controls are the user's, ADR-0020), and
+//!   whether its picture is noisy enough to suggest noise removal.
+//!
 //! The Extension Unit rows of [`crate::xu`] follow the same principle for
 //! vendor settings.
 
@@ -163,6 +168,65 @@ pub fn is_hidden(usb: Option<UsbId>, cid: u32) -> bool {
     hidden_controls(usb).contains(&cid)
 }
 
+/// What a measurement found best for one camera model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CameraProfile {
+    /// The camera model.
+    pub usb: UsbId,
+    /// The recommended settings: every control at the camera's default,
+    /// except these `(V4L2 control id, value)` pairs. An empty list means
+    /// "the defaults are best". The power-line frequency is never listed:
+    /// it follows the region, not the camera.
+    pub values: &'static [(u32, i64)],
+    /// Whether the picture is noisy at its usual light (temporal noise in
+    /// the mid-tones above about 1 code value, or noise removal measured
+    /// to clean it visibly): noise removal is suggested.
+    pub noisy: bool,
+    /// The camera's name, for logs and the documentation.
+    pub model: &'static str,
+}
+
+/// Measured in the camera survey of 2026-11-13 (daylight, static scene).
+pub const CAMERA_PROFILES: &[CameraProfile] = &[
+    // Sharpness 5 gives +17 % detail with no halo (7 shows halos); hue 0
+    // undoes the -3 that other software leaves. Noise removal: -60 %.
+    CameraProfile {
+        usb: usb(0x5986, 0x1193),
+        values: &[(crate::controls::CID_SHARPNESS, 5), (CID_HUE, 0)],
+        noisy: true,
+        model: "FHD Camera (laptop)",
+    },
+    // Defaults are best; noise removal gains about 20 %, not suggested.
+    CameraProfile {
+        usb: usb(0x046d, 0x0843),
+        values: &[],
+        noisy: false,
+        model: "Logitech Webcam C930e",
+    },
+    // Defaults are best; noise removal -35 %.
+    CameraProfile {
+        usb: usb(0x1b3f, 0x2002),
+        values: &[],
+        noisy: true,
+        model: "Generalplus GENERAL WEBCAM",
+    },
+    // Defaults are best (manual exposure and gain only add noise);
+    // mid-tone temporal noise 1.15.
+    CameraProfile {
+        usb: usb(0x045e, 0x0766),
+        values: &[],
+        noisy: true,
+        model: "Microsoft LifeCam VX-800",
+    },
+];
+
+/// The profile of the camera `usb` ([`CAMERA_PROFILES`]); `None` for a
+/// camera with no row (no recommendation is offered).
+pub fn profile(usb: Option<UsbId>) -> Option<&'static CameraProfile> {
+    let u = usb?;
+    CAMERA_PROFILES.iter().find(|p| p.usb == u)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +265,25 @@ mod tests {
         }
         for (i, a) in CONTROL_QUIRKS.iter().enumerate() {
             assert!(CONTROL_QUIRKS[i + 1..].iter().all(|b| b.usb != a.usb));
+        }
+    }
+
+    #[test]
+    fn profiles_by_model() {
+        let fhd = profile(Some(usb(0x5986, 0x1193))).unwrap();
+        assert!(fhd.values.contains(&(crate::controls::CID_SHARPNESS, 5)));
+        assert!(fhd.noisy);
+        assert!(profile(Some(VX800)).unwrap().values.is_empty());
+        assert!(!profile(Some(C930E)).unwrap().noisy);
+        assert!(profile(Some(BRIO)).is_none());
+        assert!(profile(None).is_none());
+        for (i, a) in CAMERA_PROFILES.iter().enumerate() {
+            assert!(CAMERA_PROFILES[i + 1..].iter().all(|b| b.usb != a.usb));
+            // Never a hidden control, never the power-line frequency.
+            for (cid, _) in a.values {
+                assert!(!is_hidden(Some(a.usb), *cid), "{}", a.model);
+                assert_ne!(*cid, 0x0098_0918, "{}", a.model);
+            }
         }
     }
 

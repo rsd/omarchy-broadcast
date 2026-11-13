@@ -239,6 +239,16 @@ pub trait OmarchyBroadcast {
     /// gallery. Revision 19 ([`crate::MEDIA_DIRS_REVISION`]).
     fn get_media_dirs(&self, kind: &str) -> Result<VariantDict, IpcError>;
 
+    /// Puts the device settings of `camera` (an id of `Cameras`; `""`: the
+    /// active camera) back to the camera's defaults (not the capture mode,
+    /// not the effects), then writes the values of its model's row of
+    /// recommended settings and the power-line frequency of the time zone,
+    /// stored as the user's (as `SetSetting` stores them). Replies once the
+    /// result is published (`CameraHealth`'s `recommended` then lists what
+    /// still differs). `InvalidArgument` for an unknown camera or one
+    /// without a row. Revision 20 ([`crate::CAMERA_HEALTH_REVISION`]).
+    fn apply_recommended_settings(&self, camera: &str) -> Result<(), IpcError>;
+
     /// Roughly once per second while `active`; `-1` marks a value that
     /// cannot be measured.
 
@@ -423,6 +433,16 @@ pub trait OmarchyBroadcast {
     /// [`crate::STAGE_VALUES_PERIOD_MS`] milliseconds. Revision 16.
     #[zbus(property)]
     fn stage_values(&self) -> zbus::Result<Vec<crate::StageValue>>;
+
+    /// What the daemon knows about the active camera's health, `a{sv}`
+    /// ([`crate::CameraHealth`], read with [`crate::CameraHealth::from_dict`]):
+    /// the rate it really delivers, its damaged frames, warnings, effect
+    /// suggestions and the recommended settings. Announced at once when the
+    /// camera changes or a warning, suggestion or recommended change
+    /// appears or goes, otherwise at most every
+    /// [`crate::CAMERA_HEALTH_PERIOD_MS`] milliseconds. Revision 20.
+    #[zbus(property)]
+    fn camera_health(&self) -> zbus::Result<VariantDict>;
 
     /// Revision of the interface the daemon implements.
     #[zbus(property)]

@@ -49,6 +49,14 @@ pub fn settings_revision(snap: &Snapshot) -> Option<u32> {
     snap.settings_revision.filter(|_| has_settings(snap))
 }
 
+/// `CameraHealth`; `None` from a daemon too old to have it (before
+/// [`obc_ipc::CAMERA_HEALTH_REVISION`]).
+pub fn camera_health(snap: &Snapshot) -> Option<&obc_ipc::CameraHealth> {
+    snap.camera_health
+        .as_ref()
+        .filter(|_| snap.interface_revision >= obc_ipc::CAMERA_HEALTH_REVISION)
+}
+
 /// The entry of `ActiveCamera` in `Cameras`, if it is listed.
 pub fn active_camera(snap: &Snapshot) -> Option<&CameraInfo> {
     camera(snap, &snap.active_camera)
@@ -88,11 +96,13 @@ pub struct Changes {
     pub controls: bool,
     /// Whether one of the microphone's properties changed (revision 13).
     pub mic: bool,
+    /// Whether `CameraHealth` changed (revision 20).
+    pub health: bool,
 }
 
 impl Changes {
     pub fn is_empty(&self) -> bool {
-        self.fields.is_empty() && !self.cameras && !self.controls && !self.mic
+        self.fields.is_empty() && !self.cameras && !self.controls && !self.mic && !self.health
     }
 }
 
@@ -130,6 +140,7 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Changes {
         cameras: old.cameras != new.cameras,
         controls: old.camera_controls != new.camera_controls,
         mic: old.mic != new.mic,
+        health: old.camera_health != new.camera_health,
     }
 }
 
@@ -162,7 +173,8 @@ mod tests {
                 fields: vec!["state", "consumers"],
                 cameras: false,
                 controls: false,
-                mic: false
+                mic: false,
+                health: false
             }
         );
 
@@ -190,7 +202,8 @@ mod tests {
                 ],
                 cameras: true,
                 controls: false,
-                mic: false
+                mic: false,
+                health: false
             }
         );
         assert_eq!(active_camera_name(&new), Some("A2"));
@@ -267,7 +280,8 @@ mod tests {
                 fields: Vec::new(),
                 cameras: false,
                 controls: true,
-                mic: false
+                mic: false,
+                health: false
             }
         );
         assert!(!changes.is_empty());

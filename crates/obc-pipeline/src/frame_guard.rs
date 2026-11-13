@@ -51,12 +51,19 @@
 //! [`LOG_INTERVAL`], never one line per frame. Drops not yet summarised
 //! when the ingest stops are summarised then ([`FrameGuard::flush_log`],
 //! also when the guard is dropped).
+//!
+//! **Delivered rate.** The guard also times the frames it passes, from
+//! their PTS ([`crate::delivered_rate`], [`FrameGuard::delivered_fps`],
+//! [`crate::Ingest::delivered_fps`]): the rate the camera really delivers
+//! good frames at, which can be below its nominal rate.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gst::prelude::*;
+
+use crate::delivered_rate::DeliveredRate;
 
 /// How far from its end a JPEG's EOI marker may sit. A UVC camera may pad a
 /// frame after the marker (zero bytes, or a payload's alignment); 1 KiB
@@ -200,6 +207,8 @@ pub struct FrameGuard {
     /// Flagged frames since the start, while none had passed.
     flagged_run: AtomicU64,
     log: Mutex<LogState>,
+    /// The timestamps of the passed frames, for the delivered rate.
+    rate: Mutex<DeliveredRate>,
 }
 
 impl FrameGuard {
@@ -217,6 +226,7 @@ impl FrameGuard {
             drop_flagged: AtomicBool::new(true),
             flagged_run: AtomicU64::new(0),
             log: Mutex::new(LogState::default()),
+            rate: Mutex::new(DeliveredRate::new()),
         }
     }
 
@@ -240,7 +250,26 @@ impl FrameGuard {
             let map = buffer.map_readable().ok();
             judge_frame(false, map.as_deref(), true, require_eoi)
         };
-        self.record(verdict, Instant::now())
+        let now = Instant::now();
+        let drop = self.record(verdict, now);
+        if !drop {
+            self.rate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record(buffer.pts().map(gst::ClockTime::nseconds), now);
+        }
+        drop
+    }
+
+    /// The rate of the good frames this guard has passed, in frames per
+    /// second, measured from their PTS over a sliding window
+    /// ([`crate::delivered_rate`]); `None` until the window holds enough
+    /// frames, and once the frames have stopped.
+    pub fn delivered_fps(&self) -> Option<f64> {
+        self.rate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fps(Instant::now())
     }
 
     /// Records `verdict` (at `now`, for the logs): whether to drop.
@@ -593,6 +622,16 @@ mod tests {
         mjpeg: bool,
         buffers: Vec<gst::Buffer>,
     ) -> (CorruptFrames, u64) {
+        let (guard, passed) = run_through_guard(caps, mjpeg, buffers);
+        (guard.counts(), passed)
+    }
+
+    /// [`push_through_guard`], returning the guard itself.
+    fn run_through_guard(
+        caps: &str,
+        mjpeg: bool,
+        buffers: Vec<gst::Buffer>,
+    ) -> (Arc<FrameGuard>, u64) {
         require_elements(&["appsrc", "fakesink"]);
         let pipeline = gst::Pipeline::with_name("guard-test");
         let src = gst_app::AppSrc::builder()
@@ -630,7 +669,7 @@ mod tests {
             .expect("EOS or error");
         assert!(matches!(msg.view(), gst::MessageView::Eos(_)), "{msg:?}");
         pipeline.set_state(gst::State::Null).unwrap();
-        (guard.counts(), seen.load(Ordering::Relaxed))
+        (guard, seen.load(Ordering::Relaxed))
     }
 
     fn stamped(bytes: Vec<u8>, n: u64, corrupted: bool) -> gst::Buffer {
@@ -690,5 +729,36 @@ mod tests {
             }
         );
         assert_eq!(passed, 2);
+    }
+
+    /// On a pipeline: the delivered rate counts only the frames the guard
+    /// passes, from their PTS. 4 s of a camera stamping a frame every
+    /// 33.3 ms, every third frame flagged corrupted: 20 fps delivered.
+    /// CPU only.
+    #[test]
+    fn the_delivered_rate_counts_only_the_passed_frames() {
+        require_elements(&["appsrc", "fakesink"]);
+        let caps = "video/x-raw,format=GRAY8,width=4,height=4,framerate=30/1";
+        let period = 1_000_000_000 / 30;
+        let buffers = (0..(15 + 120 + 1) * 3 / 2)
+            .map(|n: u64| {
+                let mut b = gst::Buffer::from_slice(vec![0u8; 16]);
+                let r = b.get_mut().unwrap();
+                r.set_pts(gst::ClockTime::from_nseconds(n * period));
+                // Never the first frames: the flag would be forgiven
+                // ([`FLAGGED_GRACE`]) before any frame had passed.
+                if n % 3 == 2 {
+                    r.set_flags(gst::BufferFlags::CORRUPTED);
+                }
+                b
+            })
+            .collect();
+        let (guard, passed) = run_through_guard(caps, false, buffers);
+        assert_eq!(passed + guard.counts().flagged, 204);
+        assert_eq!(guard.counts().flagged, 68);
+        let fps = guard.delivered_fps().expect("a rate");
+        assert!((fps - 20.0).abs() < 0.2, "{fps}");
+        // A guard that has passed nothing has no rate.
+        assert_eq!(FrameGuard::new("idle", false).delivered_fps(), None);
     }
 }

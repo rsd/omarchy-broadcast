@@ -462,6 +462,9 @@ struct Mock {
     media_videos: String,
     /// `StageValues` (revision 16); none unless a test sets them.
     stage_values: Vec<obc_ipc::StageValue>,
+    /// `CameraHealth` (revision 20): the first camera never measured,
+    /// unless a test sets more.
+    camera_health: obc_ipc::CameraHealth,
     /// `InterfaceRevision` ([`INTERFACE_REVISION`] unless a test sets an
     /// older one; the members stay served).
     revision: u32,
@@ -851,6 +854,11 @@ impl Mock {
             media_user: USER_MEDIA.into(),
             media_videos: USER_VIDEOS.into(),
             stage_values: Vec::new(),
+            camera_health: obc_ipc::CameraHealth {
+                camera: "usb-1234_abcd".into(),
+                nominal_fps: 30.0,
+                ..obc_ipc::CameraHealth::none()
+            },
             revision: INTERFACE_REVISION,
         }
     }
@@ -1958,6 +1966,31 @@ impl Mock {
     fn interface_revision(&self) -> u32 {
         self.revision
     }
+
+    #[zbus(property)]
+    fn camera_health(&self) -> VariantDict {
+        self.camera_health.to_dict()
+    }
+
+    /// As the daemon: `InvalidArgument` without a row; otherwise nothing
+    /// differs from the recommendation any more, announced before the
+    /// reply.
+    async fn apply_recommended_settings(
+        &mut self,
+        camera: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> Result<(), IpcError> {
+        self.calls
+            .push(format!("ApplyRecommendedSettings({camera})"));
+        if !self.camera_health.has_recommendation {
+            return Err(IpcError::InvalidArgument(
+                "First Camera (usb-1234_abcd) has no recommended settings".into(),
+            ));
+        }
+        self.camera_health.recommended.clear();
+        self.camera_health_changed(&emitter).await?;
+        Ok(())
+    }
 }
 
 impl Mock {
@@ -2168,6 +2201,18 @@ impl MockDaemon {
             iface.get_mut().await.stage_values = values;
             let m = iface.get().await;
             m.stage_values_changed(iface.signal_emitter())
+                .await
+                .unwrap();
+        });
+    }
+
+    /// `CameraHealth` is `h`, announced.
+    fn set_camera_health(&self, h: obc_ipc::CameraHealth) {
+        let iface = self.iface();
+        self.rt.block_on(async {
+            iface.get_mut().await.camera_health = h;
+            let m = iface.get().await;
+            m.camera_health_changed(iface.signal_emitter())
                 .await
                 .unwrap();
         });
@@ -7620,4 +7665,223 @@ fn media_list_never_starts_the_daemon_but_import_and_remove_may() {
         out.stderr
     );
     assert!(bus.activation_attempted());
+}
+
+// ---------------------------------------------------------------------------
+// The camera's health (revision 20)
+
+/// The first camera delivering short, with damaged frames, a warning, a
+/// suggestion and one recommended change.
+fn short_health() -> obc_ipc::CameraHealth {
+    obc_ipc::CameraHealth {
+        camera: "usb-1234_abcd".into(),
+        delivered_fps: 19.5,
+        nominal_fps: 30.0,
+        corrupt_frames: 12,
+        warnings: vec!["Plug First Camera into its own USB port.".into()],
+        suggestions: vec![obc_ipc::Suggestion {
+            setting: "effect.video.denoise".into(),
+            value: "on".into(),
+            reason: "This camera's picture is grainy: noise removal makes it cleaner.".into(),
+        }],
+        has_recommendation: true,
+        recommended: vec![obc_ipc::Recommended {
+            setting: "camera.image.sharpness".into(),
+            label: "Sharpness".into(),
+            value: "5".into(),
+            current: "3".into(),
+        }],
+    }
+}
+
+/// `status` adds the health lines (the suggestion named by its label in
+/// the settings tree), `status --json` the `camera_health` object; a
+/// healthy camera adds nothing to `status`.
+#[test]
+fn status_shows_the_camera_health() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let out = bus.run(&["status"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(!out.stdout.contains("Delivers:"), "{}", out.stdout);
+    let v = json_line(&bus.run(&["status", "--json"]).stdout);
+    assert_eq!(
+        v["camera_health"],
+        serde_json::json!({
+            "camera": "usb-1234_abcd",
+            "delivered_fps": -1.0,
+            "nominal_fps": 30.0,
+            "corrupt_frames": 0,
+            "warnings": [],
+            "suggestions": [],
+            "has_recommendation": false,
+            "recommended": []
+        }),
+        "{v}"
+    );
+
+    mock.set_global(mock_global());
+    mock.set_camera_health(short_health());
+    let out = bus.run(&["status"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(
+        out.stdout.ends_with(
+            "Delivers:   19.5 of 30 fps\n\
+             Damaged:    12 frames dropped\n\
+             Warning:    Plug First Camera into its own USB port.\n\
+             Suggest:    Noise removal \u{2014} This camera's picture is grainy: noise removal \
+             makes it cleaner.\n"
+        ),
+        "{}",
+        out.stdout
+    );
+    let v = json_line(&bus.run(&["status", "--json"]).stdout);
+    let h = &v["camera_health"];
+    assert_eq!(h["delivered_fps"], 19.5, "{v}");
+    assert_eq!(h["corrupt_frames"], 12, "{v}");
+    assert_eq!(
+        h["suggestions"][0]["setting"], "effect.video.denoise",
+        "{v}"
+    );
+    assert_eq!(h["suggestions"][0]["value"], "on", "{v}");
+    assert_eq!(h["has_recommendation"], true, "{v}");
+    assert_eq!(
+        h["recommended"],
+        serde_json::json!([{
+            "setting": "camera.image.sharpness",
+            "label": "Sharpness",
+            "value": "5",
+            "current": "3"
+        }]),
+        "{v}"
+    );
+    // Reading never starts the daemon.
+    assert!(!bus.activation_attempted());
+}
+
+/// `watch --json` prints a `camera_health` line when it changes, never in
+/// `state` lines; `watch` a `camera health:` line.
+#[test]
+fn watch_prints_a_camera_health_line_when_it_changes() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    let watch = bus.watch(&["watch", "--json"], None);
+    let v = watch.next_json("the first snapshot");
+    assert_eq!(v["type"], "snapshot", "{v}");
+    assert_eq!(v["camera_health"]["delivered_fps"], -1.0, "{v}");
+    watch.settings_set("the settings after the snapshot");
+    mock.set_camera_health(short_health());
+    let v = watch.next_json("the camera health");
+    assert_eq!(v["type"], "camera_health", "{v}");
+    assert_eq!(v["camera"], "usb-1234_abcd", "{v}");
+    assert_eq!(v["delivered_fps"], 19.5, "{v}");
+    assert_eq!(v["warnings"].as_array().unwrap().len(), 1, "{v}");
+    assert!(v.get("changed").is_none(), "{v}");
+    watch.quiet_for(Duration::from_millis(300), "nothing else changed");
+
+    let watch = bus.watch(&["watch"], None);
+    watch.next("the summary");
+    let mut h = short_health();
+    h.corrupt_frames = 13;
+    mock.set_camera_health(h);
+    let line = watch.next("the camera health");
+    assert!(
+        line.starts_with("camera health: delivers 19.5 of 30 fps | 13 damaged frames dropped"),
+        "{line}"
+    );
+}
+
+#[test]
+fn recommended_shows_and_applies_the_recommended_settings() {
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    // No row: said so, and apply is refused.
+    let out = bus.run(&["recommended"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(out.stdout, "This camera has no recommended settings.\n");
+    let out = bus.run(&["recommended", "apply"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("has no recommended settings"),
+        "{}",
+        out.stderr
+    );
+    let out = bus.run(&["recommended", "apply", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    let v = json_line(&out.stdout);
+    assert_eq!(v["type"], "error", "{v}");
+
+    mock.set_camera_health(short_health());
+    let out = bus.run(&["recommended"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "Recommended settings for First Camera (1234:abcd):\n  Sharpness: 3 \u{2192} 5\n\
+         Use them with: omarchy-broadcast recommended apply\n"
+    );
+    let out = bus.run(&["recommended", "--json"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let v = json_line(&out.stdout);
+    assert_eq!(v["type"], "camera_health", "{v}");
+    assert_eq!(v["recommended"][0]["value"], "5", "{v}");
+    assert!(!bus.activation_attempted());
+    mock.take_calls();
+
+    let out = bus.run(&["recommended", "apply"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "Recommended settings applied to First Camera (1234:abcd).\n"
+    );
+    assert_eq!(mock.take_calls(), ["ApplyRecommendedSettings()"]);
+    let out = bus.run(&["recommended"]);
+    assert_eq!(out.stdout, "Already at the recommended settings.\n");
+    mock.set_camera_health(short_health());
+    let out = bus.run(&["recommended", "apply", "--json"]);
+    assert!(out.status.success(), "{}", out.stderr);
+    let v = json_line(&out.stdout);
+    assert_eq!(v["type"], "camera_health", "{v}");
+    assert_eq!(v["recommended"], serde_json::json!([]), "{v}");
+    assert_eq!(v["has_recommendation"], true, "{v}");
+    // `--json` goes with no subcommand but `apply`'s own.
+    let out = bus.run(&["recommended", "--json", "apply"]);
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr);
+}
+
+/// A daemon before revision 20: `camera_health` is null (even when it
+/// serves something by that name), and `recommended` says it is too old.
+#[test]
+fn an_older_daemon_has_no_camera_health() {
+    let bus = Bus::start();
+    let _old = OldDaemon::start(&bus, Rev15);
+    let v = json_line(&bus.run(&["status", "--json"]).stdout);
+    assert_eq!(v.get("camera_health"), Some(&Value::Null), "{v}");
+    let out = bus.run(&["recommended"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("does not support recommended settings"),
+        "{}",
+        out.stderr
+    );
+    let out = bus.run(&["recommended", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert_eq!(json_line(&out.stdout)["code"], "unsupported-daemon");
+    drop(_old);
+
+    let bus = Bus::start();
+    let mock = MockDaemon::start(&bus);
+    mock.with(|m| m.revision = 19);
+    mock.set_camera_health(short_health());
+    let v = json_line(&bus.run(&["status", "--json"]).stdout);
+    assert_eq!(v["camera_health"], Value::Null, "{v}");
+    let out = bus.run(&["status"]);
+    assert!(!out.stdout.contains("Delivers:"), "{}", out.stdout);
+    let out = bus.run(&["recommended", "apply"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("update omarchy-broadcastd"),
+        "{}",
+        out.stderr
+    );
+    assert!(mock.take_calls().is_empty());
 }

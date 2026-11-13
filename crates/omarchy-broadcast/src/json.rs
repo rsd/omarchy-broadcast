@@ -29,12 +29,21 @@
 //! like the others, after the camera's, and are shown with no camera too;
 //! every setting object carries its `scope` (`camera` or `global`, clipped
 //! to [`MAX_SCOPE_BYTES`]), which a client routes by.
+//!
+//! The camera's health (revision 20) is the `camera_health` of a `snapshot`
+//! line (`null` before revision 20) and the body of a `camera_health` line
+//! ([`camera_health_line`]): its lists are cut at [`MAX_HEALTH_WARNINGS`],
+//! [`MAX_SUGGESTIONS`] and [`MAX_RECOMMENDED`], and further (the
+//! recommended changes first, then the suggestions, then the warnings)
+//! should a line still exceed the cap; a `snapshot` line cuts them after
+//! its image controls and before its cameras.
 
 use std::borrow::Cow;
 
 use obc_ipc::{
-    CameraControl, CameraControls, CameraInfo, Condition, MicStatus, SETTINGS_SCHEMA, Setting,
-    SettingChange, SettingKind, SettingValue, SettingsGroup, SettingsTree, Snapshot, Stats,
+    CameraControl, CameraControls, CameraHealth, CameraInfo, Condition, MicStatus, SETTINGS_SCHEMA,
+    Setting, SettingChange, SettingKind, SettingValue, SettingsGroup, SettingsTree, Snapshot,
+    Stats,
 };
 use serde::Serialize;
 
@@ -128,6 +137,19 @@ pub const MAX_HINT_BYTES: usize = 16;
 /// Bound of a setting's `scope` (`camera` or `global`, or one a newer
 /// daemon adds).
 pub const MAX_SCOPE_BYTES: usize = 16;
+/// At most this many `camera_health` warnings are listed (revision 20).
+pub const MAX_HEALTH_WARNINGS: usize = 4;
+/// Bound of a `camera_health` warning.
+pub const MAX_HEALTH_WARNING_BYTES: usize = 320;
+/// At most this many `camera_health` suggestions are listed.
+pub const MAX_SUGGESTIONS: usize = 4;
+/// Bound of a suggestion's `reason`.
+pub const MAX_SUGGESTION_REASON_BYTES: usize = 160;
+/// At most this many `camera_health` recommended changes are listed.
+pub const MAX_RECOMMENDED: usize = 16;
+/// Bound of a recommended change's `value` and `current` (as an option
+/// label's).
+pub const MAX_RECOMMENDED_VALUE_BYTES: usize = MAX_OPTION_LABEL_BYTES;
 /// Appended to a clipped string.
 pub const ELLIPSIS: &str = "\u{2026}";
 
@@ -307,6 +329,148 @@ impl<'a> StateFields<'a> {
     }
 }
 
+/// A rate of `camera_health` as printed: a finite, non-negative value, or
+/// `-1` (not measured).
+fn rate(value: f64) -> f64 {
+    if value.is_finite() && value >= 0.0 {
+        value
+    } else {
+        obc_ipc::NOT_MEASURED
+    }
+}
+
+/// One suggestion of `camera_health`.
+#[derive(Serialize)]
+struct SuggestionField<'a> {
+    setting: Cow<'a, str>,
+    value: Cow<'a, str>,
+    reason: Cow<'a, str>,
+}
+
+/// One recommended change of `camera_health`.
+#[derive(Serialize)]
+struct RecommendedField<'a> {
+    setting: Cow<'a, str>,
+    label: Cow<'a, str>,
+    value: Cow<'a, str>,
+    current: Cow<'a, str>,
+}
+
+/// How many entries of each `camera_health` list are printed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HealthLimits {
+    warnings: usize,
+    suggestions: usize,
+    recommended: usize,
+}
+
+impl HealthLimits {
+    /// The bounds, or fewer when `h` has fewer.
+    fn of(h: &CameraHealth) -> Self {
+        HealthLimits {
+            warnings: h.warnings.len().min(MAX_HEALTH_WARNINGS),
+            suggestions: h.suggestions.len().min(MAX_SUGGESTIONS),
+            recommended: h.recommended.len().min(MAX_RECOMMENDED),
+        }
+    }
+
+    /// One entry fewer: a recommended change, else a suggestion, else a
+    /// warning; `false` when every list is empty already.
+    fn shrink(&mut self) -> bool {
+        let list = if self.recommended > 0 {
+            &mut self.recommended
+        } else if self.suggestions > 0 {
+            &mut self.suggestions
+        } else if self.warnings > 0 {
+            &mut self.warnings
+        } else {
+            return false;
+        };
+        *list -= 1;
+        true
+    }
+}
+
+/// The camera's health (revision 20): the `camera_health` of a `snapshot`
+/// line, and the body of a `camera_health` line.
+#[derive(Serialize)]
+struct HealthFields<'a> {
+    camera: Cow<'a, str>,
+    delivered_fps: f64,
+    nominal_fps: f64,
+    corrupt_frames: u64,
+    warnings: Vec<Cow<'a, str>>,
+    suggestions: Vec<SuggestionField<'a>>,
+    has_recommendation: bool,
+    recommended: Vec<RecommendedField<'a>>,
+}
+
+impl<'a> HealthFields<'a> {
+    fn of(h: &'a CameraHealth, limits: HealthLimits) -> Self {
+        HealthFields {
+            camera: clip(&h.camera, MAX_ID_BYTES),
+            delivered_fps: rate(h.delivered_fps),
+            nominal_fps: rate(h.nominal_fps),
+            corrupt_frames: h.corrupt_frames,
+            warnings: h
+                .warnings
+                .iter()
+                .take(limits.warnings)
+                .map(|w| clip(w, MAX_HEALTH_WARNING_BYTES))
+                .collect(),
+            suggestions: h
+                .suggestions
+                .iter()
+                .take(limits.suggestions)
+                .map(|s| SuggestionField {
+                    setting: clip(&s.setting, MAX_SETTING_ID_BYTES),
+                    value: clip(&s.value, MAX_OPTION_VALUE_BYTES),
+                    reason: clip(&s.reason, MAX_SUGGESTION_REASON_BYTES),
+                })
+                .collect(),
+            has_recommendation: h.has_recommendation,
+            recommended: h
+                .recommended
+                .iter()
+                .take(limits.recommended)
+                .map(|r| RecommendedField {
+                    setting: clip(&r.setting, MAX_SETTING_ID_BYTES),
+                    label: clip(&r.label, MAX_LABEL_BYTES),
+                    value: clip(&r.value, MAX_RECOMMENDED_VALUE_BYTES),
+                    current: clip(&r.current, MAX_RECOMMENDED_VALUE_BYTES),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct HealthLine<'a> {
+    v: u32,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(flatten)]
+    fields: HealthFields<'a>,
+}
+
+/// `{"v":1,"type":"camera_health",...}`: the camera's health (revision
+/// 20), printed by `recommended --json`, `recommended apply --json` and
+/// by `watch --json` when it changes. Its lists are cut should the line
+/// exceed [`MAX_LINE_BYTES`].
+pub fn camera_health_line(h: &CameraHealth) -> String {
+    let mut limits = HealthLimits::of(h);
+    loop {
+        let line = to_line(&HealthLine {
+            v: VERSION,
+            kind: "camera_health",
+            fields: HealthFields::of(h, limits),
+        });
+        if line.len() <= MAX_LINE_BYTES || !limits.shrink() {
+            return line;
+        }
+    }
+}
+
 fn cameras_of<'a>(s: &'a Snapshot, limit: usize) -> (Vec<Camera<'a>>, bool) {
     let list = s
         .cameras
@@ -435,6 +599,8 @@ struct SnapshotLine<'a> {
     config_serial: u32,
     /// The microphone; `null` before revision 13.
     mic: Option<MicFields<'a>>,
+    /// The camera's health; `null` before revision 20.
+    camera_health: Option<HealthFields<'a>>,
 }
 
 #[derive(Serialize)]
@@ -561,9 +727,10 @@ pub fn modules_changed_line(serial: u32) -> String {
 
 /// `{"v":1,"type":"snapshot",...}`: every property. Should the line exceed
 /// [`MAX_LINE_BYTES`] (which only strings and lists at their bounds can
-/// make it do), its image controls are cut first, then its cameras.
+/// make it do), its image controls are cut first, then the lists of its
+/// `camera_health`, then its cameras.
 pub fn snapshot_line(s: &Snapshot) -> String {
-    let build = |camera_limit: usize, control_limit: usize| {
+    let build = |camera_limit: usize, control_limit: usize, health: Option<HealthLimits>| {
         let (cameras, cameras_truncated) = cameras_of(s, camera_limit);
         to_line(&SnapshotLine {
             v: VERSION,
@@ -580,6 +747,9 @@ pub fn snapshot_line(s: &Snapshot) -> String {
             modules_serial: s.modules_serial.unwrap_or(0),
             config_serial: s.config_serial.unwrap_or(0),
             mic: s.mic.as_ref().map(MicFields::of),
+            camera_health: model::camera_health(s)
+                .zip(health)
+                .map(|(h, l)| HealthFields::of(h, l)),
         })
     };
     let mut cameras = MAX_CAMERAS;
@@ -587,15 +757,19 @@ pub fn snapshot_line(s: &Snapshot) -> String {
         .camera_controls
         .as_ref()
         .map_or(0, |c| c.controls.len().min(MAX_CONTROLS));
+    let mut health = model::camera_health(s).map(HealthLimits::of);
     loop {
-        let line = build(cameras, controls);
-        if line.len() <= MAX_LINE_BYTES || (cameras == 0 && controls == 0) {
+        let line = build(cameras, controls, health);
+        if line.len() <= MAX_LINE_BYTES {
             return line;
         }
         if controls > 0 {
             controls -= 1;
-        } else {
+        } else if health.as_mut().is_some_and(HealthLimits::shrink) {
+        } else if cameras > 0 {
             cameras -= 1;
+        } else {
+            return line;
         }
     }
 }
@@ -1112,6 +1286,7 @@ mod tests {
             config_serial: None,
             mic: None,
             stage_values: Vec::new(),
+            camera_health: None,
             interface_revision: 4,
         }
     }
@@ -2256,5 +2431,150 @@ mod tests {
         assert_eq!(parse(&lines[0])["group"]["surface"], "mic");
         let lines = settings_lines(&tree(group(None)));
         assert!(parse(&lines[0])["group"].get("surface").is_none());
+    }
+
+    fn health() -> CameraHealth {
+        CameraHealth {
+            camera: "usb-1234_abcd".into(),
+            delivered_fps: 19.5,
+            nominal_fps: 30.0,
+            corrupt_frames: 7,
+            warnings: vec!["Plug it into its own USB port.".into()],
+            suggestions: vec![obc_ipc::Suggestion {
+                setting: "effect.video.denoise".into(),
+                value: "on".into(),
+                reason: "This camera's picture is grainy.".into(),
+            }],
+            has_recommendation: true,
+            recommended: vec![obc_ipc::Recommended {
+                setting: "camera.image.sharpness".into(),
+                label: "Sharpness".into(),
+                value: "5".into(),
+                current: "3".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn the_camera_health_line_and_the_snapshots_camera_health() {
+        let h = health();
+        let v = parse(&camera_health_line(&h));
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "v": 1,
+                "type": "camera_health",
+                "camera": "usb-1234_abcd",
+                "delivered_fps": 19.5,
+                "nominal_fps": 30.0,
+                "corrupt_frames": 7,
+                "warnings": ["Plug it into its own USB port."],
+                "suggestions": [{
+                    "setting": "effect.video.denoise",
+                    "value": "on",
+                    "reason": "This camera's picture is grainy."
+                }],
+                "has_recommendation": true,
+                "recommended": [{
+                    "setting": "camera.image.sharpness",
+                    "label": "Sharpness",
+                    "value": "5",
+                    "current": "3"
+                }]
+            })
+        );
+        // Before revision 20: null, the key present.
+        let mut s = sample();
+        let v = parse(&snapshot_line(&s));
+        assert_eq!(v.get("camera_health"), Some(&Value::Null));
+        s.camera_health = Some(h.clone());
+        // Served by a daemon below revision 20: still null.
+        s.interface_revision = 19;
+        assert_eq!(parse(&snapshot_line(&s))["camera_health"], Value::Null);
+        s.interface_revision = obc_ipc::CAMERA_HEALTH_REVISION;
+        let v = parse(&snapshot_line(&s));
+        assert_eq!(v["camera_health"]["delivered_fps"], 19.5);
+        assert_eq!(v["camera_health"]["recommended"][0]["current"], "3");
+        // Not measured, and a rate that is no number: -1.
+        let mut none = CameraHealth::none();
+        none.nominal_fps = f64::NAN;
+        let v = parse(&camera_health_line(&none));
+        assert_eq!(v["delivered_fps"], -1.0);
+        assert_eq!(v["nominal_fps"], -1.0);
+        assert_eq!(v["camera"], "");
+        // Never in a state line.
+        assert!(
+            parse(&state_line(&s, &model::STATE_FIELDS))
+                .get("camera_health")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_camera_health_at_its_worst_stays_under_the_cap() {
+        let nasty = "\u{1}".repeat(2000);
+        let h = CameraHealth {
+            camera: nasty.clone(),
+            delivered_fps: 2.225_073_858_507_201_4e-308,
+            nominal_fps: 2.225_073_858_507_201_4e-308,
+            corrupt_frames: u64::MAX,
+            warnings: vec![nasty.clone(); 10],
+            suggestions: vec![
+                obc_ipc::Suggestion {
+                    setting: nasty.clone(),
+                    value: nasty.clone(),
+                    reason: nasty.clone(),
+                };
+                10
+            ],
+            has_recommendation: true,
+            recommended: vec![
+                obc_ipc::Recommended {
+                    setting: nasty.clone(),
+                    label: nasty.clone(),
+                    value: nasty.clone(),
+                    current: nasty.clone(),
+                };
+                40
+            ],
+        };
+        let line = camera_health_line(&h);
+        assert!(line.len() <= MAX_LINE_BYTES, "{} bytes", line.len());
+        let v = parse(&line);
+        // The recommended changes go first; the warnings stay whole.
+        assert_eq!(v["warnings"].as_array().unwrap().len(), MAX_HEALTH_WARNINGS);
+        assert_eq!(v["suggestions"].as_array().unwrap().len(), MAX_SUGGESTIONS);
+        assert!(v["recommended"].as_array().unwrap().len() < MAX_RECOMMENDED);
+        assert!(v["warnings"][0].as_str().unwrap().ends_with(ELLIPSIS));
+        assert!(v["camera"].as_str().unwrap().ends_with(ELLIPSIS));
+        // In a snapshot at its worst: under the cap, the health's lists cut
+        // before the cameras.
+        let mut s = sample();
+        s.error = nasty.clone();
+        s.warning = nasty.clone();
+        s.cameras = (0..100)
+            .map(|i| cam(&format!("{i}{nasty}"), &nasty, &nasty))
+            .collect();
+        s.camera_health = Some(h);
+        s.interface_revision = obc_ipc::CAMERA_HEALTH_REVISION;
+        let line = snapshot_line(&s);
+        assert!(line.len() <= MAX_LINE_BYTES, "{} bytes", line.len());
+        let v = parse(&line);
+        assert!(!v["cameras"].as_array().unwrap().is_empty());
+        assert!(
+            v["camera_health"]["recommended"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        // A short health is kept whole beside the usual cameras.
+        let mut s = sample();
+        s.camera_health = Some(health());
+        s.interface_revision = obc_ipc::CAMERA_HEALTH_REVISION;
+        let v = parse(&snapshot_line(&s));
+        assert_eq!(
+            v["camera_health"]["recommended"].as_array().unwrap().len(),
+            1
+        );
     }
 }
