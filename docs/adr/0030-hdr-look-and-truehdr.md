@@ -46,6 +46,11 @@ Phase (b) is a PipeWire `Video/Source` in P010 with BT.2020 and PQ colour keys, 
 - The stage is in the effect element's order after `relight`. A module that provides `hdr` as a second provider would take the same slot; the pin row appears with no change, as for any stage.
 - Known limit: banding on smooth gradients from 8-bit sources is mitigated by the debander, which is on, and not ruled out (see "The debander stays at its default").
 
+## Known limitation: frames run much faster than a camera delivers them
+Run back to back, much faster than a camera delivers them, NVIDIA's TrueHDR sometimes gives a frame an output that depends on the frames before it. Synchronising the CUDA context does not remove it, so the behaviour is inside the library and not in the stage's stream ordering. At a camera's cadence, up to 60 fps, every frame's output was exact in testing. The output can be configured above 60 fps (up to 240 fps); whether the HDR stage then receives frames close enough together to show the effect is untested, and it would appear as faint temporal blending or flicker. The daemon's own GPU test paces its frames at one 60 fps frame for this reason (`HDR_FRAME_INTERVAL` in `crates/obc-module-maxine/tests/hardware.rs`).
+
+**Decision:** no restriction for now. The HDR look is not disabled or rate-limited at any output rate; this is a documented known limitation, tested up to 60 fps. It is revisited if the effect is seen at a higher output rate.
+
 ## Alternatives considered
 
 | Alternative | Why rejected |
