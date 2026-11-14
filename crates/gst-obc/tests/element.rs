@@ -1177,10 +1177,12 @@ fn host_on_failure_freeze_repeats_the_last_processed_frame_never_the_input() {
     // And the camera moves on: the frozen frame is never this input.
     rig.set_input(shifted_input(80));
 
+    assert!(rig.effect.stats().freeze_held, "an effect frame is held");
     fake.set(|c| c.fail_process = Some("fake frame failure".into()));
     let black = rig.effect.stats().frames_black;
     assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), last);
     assert!(failed(&rig));
+    assert!(rig.effect.stats().freeze_held);
     let (memory, pts, _) = rig.last_sent();
     assert_ne!(memory, rig.in_memory, "a new buffer");
     assert_eq!(
@@ -1284,6 +1286,7 @@ fn host_freeze_with_nothing_processed_shows_the_image_or_black() {
         assert_eq!(rig.frame(), Seen::Image);
     }
     assert_eq!(rig.effect.stats().fallback_error, None);
+    assert!(!rig.effect.stats().freeze_held, "nothing processed to hold");
     rig.stop();
 
     let mut rig = HostRig::new(Some(Arc::clone(&fake)), &frozen(EffectKind::Blur));
@@ -1345,6 +1348,7 @@ fn host_new_caps_or_a_stop_drop_the_frozen_frame() {
         failed(r) && r.effect.status().reason() == Some("fake load failure")
     });
     assert!(seen.iter().all(|s| *s == Seen::FullBlack), "{seen:?}");
+    assert!(!rig.effect.stats().freeze_held, "new caps drop it");
     for _ in 0..3 {
         assert_eq!(rig.frame(), Seen::FullBlack);
     }
@@ -1407,6 +1411,7 @@ fn host_the_input_shown_drops_the_frozen_frame() {
     assert_eq!(classify(&last, &rig.input_bytes), Seen::FakeBlur);
 
     // Off: the camera.
+    assert!(rig.effect.stats().freeze_held);
     rig.effect
         .apply(&EffectSettings {
             fallback: EffectFallback::Freeze,
@@ -1414,6 +1419,7 @@ fn host_the_input_shown_drops_the_frozen_frame() {
         })
         .unwrap();
     assert_eq!(rig.frame(), Seen::Input);
+    assert!(!rig.effect.stats().freeze_held, "the camera shown drops it");
     wait_for("no unload", || get(&fake.log.unloads) == 1);
 
     // On again, a load that fails: the input while it loads (a toggle),

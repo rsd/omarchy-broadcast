@@ -15,6 +15,7 @@ use std::str::FromStr;
 
 use serde::Serialize;
 
+pub mod battery_saver;
 pub mod config;
 pub mod config_d;
 pub mod config_schema;

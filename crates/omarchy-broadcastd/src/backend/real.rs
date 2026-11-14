@@ -86,6 +86,7 @@ use std::sync::atomic::AtomicU32;
 use std::time::{Duration, Instant};
 
 use gst::prelude::*;
+use obc_core::battery_saver::{PowerProfile, PowerSource};
 use obc_core::config::VideoMemory;
 use obc_core::{EffectMode, EffectOnFailure, ModeRequest, OutputContract, SinkSelector};
 use obc_ipc::Stats;
@@ -274,6 +275,8 @@ pub struct GstBackend {
     /// What the running writer's crash cover was last logged to show
     /// ([`Self::log_cover_shows`]); `None` before its first install.
     cover_logged: Option<CoverShows>,
+    /// power-profiles-daemon's profile, as its watcher last read it.
+    power_profiles: Option<crate::power::ProfileCache>,
 }
 
 /// The writer's one tap: the PipeWire output's, the preview encoder's, or
@@ -322,6 +325,7 @@ impl GstBackend {
             cover_image: None,
             output_placeholder: None,
             cover_logged: None,
+            power_profiles: None,
         })
     }
 
@@ -329,6 +333,13 @@ impl GstBackend {
     /// ([`MediaBackend::watch_controls`]) going to `reporter`.
     pub fn with_control_reporter(mut self, reporter: ControlEventReporter) -> Self {
         self.control_reporter = Some(reporter);
+        self
+    }
+
+    /// The backend with power-profiles-daemon's profile read from `cache`
+    /// ([`MediaBackend::power_profile`]; without one, it is not running).
+    pub fn with_power_profiles(mut self, cache: crate::power::ProfileCache) -> Self {
+        self.power_profiles = Some(cache);
         self
     }
 
@@ -1304,6 +1315,7 @@ impl MediaBackend for GstBackend {
             load_ms: stats.last_load_ms,
             reused: stats.last_load_reused,
             gpu_ms_p50: stats.gpu_ms_p50,
+            freeze_held: stats.freeze_held,
             fallback_error: stats.fallback_error,
             background_error: stats.background_error,
             switch_error: stats.switch_error,
@@ -1368,6 +1380,22 @@ impl MediaBackend for GstBackend {
         obc_gpu::presence::probe_process(registered)
             .unusable_reason()
             .map(str::to_string)
+    }
+
+    fn power_source(&mut self) -> PowerSource {
+        crate::power::power_source(std::path::Path::new(crate::power::POWER_SUPPLY_ROOT))
+    }
+
+    fn power_profile(&mut self) -> PowerProfile {
+        self.power_profiles
+            .as_ref()
+            .map_or(PowerProfile::Unavailable, crate::power::ProfileCache::get)
+    }
+
+    fn follow_power_profile(&mut self, on: bool) {
+        if let Some(cache) = &self.power_profiles {
+            cache.follow(on);
+        }
     }
 
     fn open_camera_controls(

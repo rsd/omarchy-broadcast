@@ -518,6 +518,11 @@ pub struct EffectStats {
     pub stages: Vec<StageStats>,
     /// Frames the backend processed.
     pub frames_processed: u64,
+    /// With `on-failure=freeze`: a frozen frame is held (the last output
+    /// an effect processed), so a failure shows it; false before the
+    /// effect produced a frame, and once the frozen frame is dropped (the
+    /// camera shown as it is, the stages alone, new caps, a stop).
+    pub freeze_held: bool,
     /// Black frames output (warm-up, or a failure with `on-failure=black`),
     /// or with `on-failure=image` the fallback image in their place, or
     /// with `on-failure=freeze` the frozen frame (or the image) there.

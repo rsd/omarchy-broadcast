@@ -11,7 +11,9 @@
 //!   (the file that sets the value in force, relative to the configuration
 //!   directory; `""` for the default), `overridden_by` s (`""` or the file
 //!   after the managed one that sets it), `apply` s (`live`, `reload` or
-//!   `restart`), `enabled` b and `disabled_reason` s; then by type (bool:
+//!   `restart`), `enabled` b, `disabled_reason` s and (revision 22)
+//!   `notice` s (a note on the value now, such as a change that waits for
+//!   the camera to restart; `""` when none); then by type (bool:
 //!   `value`/`default` b; int: `min`, `max`, `step` and `value`/`default`
 //!   x, an optional `unit` s; float: the same in d; enum: `options` a(ss)
 //!   and `value`/`default` s; string and path: `value`/`default` s; list:
@@ -251,6 +253,10 @@ pub struct ConfigRow {
     pub enabled: bool,
     /// Why not, when not enabled; empty when enabled.
     pub disabled_reason: String,
+    /// A note on the value now (revision 22), such as a change that waits
+    /// for the camera to restart; empty when none, and from an older
+    /// daemon.
+    pub notice: String,
 }
 
 fn put_value(d: &mut VariantDict, key: &str, v: &ConfigValue) {
@@ -287,6 +293,7 @@ impl ConfigRow {
             "disabled_reason",
             Variant::from(self.disabled_reason.as_str()),
         );
+        put(&mut d, "notice", Variant::from(self.notice.as_str()));
         match &self.kind {
             ConfigKind::Int {
                 min,
@@ -353,6 +360,7 @@ impl ConfigRow {
             apply: text("apply"),
             enabled: get_bool(e, "enabled").unwrap_or(true),
             disabled_reason: text("disabled_reason"),
+            notice: text("notice"),
         })
     }
 }
@@ -527,6 +535,7 @@ mod tests {
             apply: APPLY_RELOAD.into(),
             enabled: true,
             disabled_reason: String::new(),
+            notice: String::new(),
         }
     }
 
@@ -546,6 +555,7 @@ mod tests {
         aspect.overridden_by = "config.d/90-local.toml".into();
         aspect.enabled = false;
         aspect.disabled_reason = "Overridden by config.d/90-local.toml".into();
+        aspect.notice = "Applies when the camera restarts".into();
         let mut preference = row(
             "camera.preference",
             ConfigKind::List,
@@ -655,6 +665,7 @@ mod tests {
             ("apply", "s"),
             ("enabled", "b"),
             ("disabled_reason", "s"),
+            ("notice", "s"),
             ("description", "s"),
         ] {
             assert_eq!(
@@ -727,6 +738,8 @@ mod tests {
         assert_eq!(rows[3].value, ConfigValue::Bool(true));
         assert!(rows[3].enabled && !rows[3].editable);
         assert_eq!(rows[3].source, "");
+        // An older daemon sends no notice: none.
+        assert_eq!(rows[3].notice, "");
     }
 
     #[test]

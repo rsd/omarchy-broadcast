@@ -136,6 +136,7 @@ fn config_row(id: &str, kind: ConfigKind, value: ConfigValue, default: ConfigVal
         apply: APPLY_RELOAD.into(),
         enabled: true,
         disabled_reason: String::new(),
+        notice: String::new(),
     }
 }
 
@@ -1355,7 +1356,8 @@ async fn proxy_reads_every_property() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 21);
+    assert_eq!(INTERFACE_REVISION, 22);
+    assert_eq!(obc_ipc::BATTERY_SAVER_REVISION, 22);
     assert_eq!(obc_ipc::PRIVACY_REVISION, 21);
     assert_eq!(obc_ipc::CAMERA_HEALTH_REVISION, 20);
     assert_eq!(obc_ipc::CPU_CONVERT_REVISION, 19);

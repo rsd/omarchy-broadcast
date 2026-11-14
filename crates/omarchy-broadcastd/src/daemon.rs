@@ -54,6 +54,7 @@ use crate::controller::{
 use crate::dbus::{Server, run_owner_watch, run_publisher, subscribe_owners};
 use crate::hotplug::{CameraWatcher, SECOND_SCAN, SETTLE};
 use crate::media::MediaStore;
+use crate::power::{ProfileCache, run_profile_watch};
 use crate::preview::PreviewDir;
 use crate::{error, info, warning};
 
@@ -254,6 +255,15 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
     remove_preview_files(runtime.as_deref());
     let owners = subscribe_owners(&conn).await?;
     tokio::spawn(run_owner_watch(owners, commands.clone()));
+    // The battery saver's power profile: followed on the system bus into
+    // a cache the controller reads without waiting, only while the mode is
+    // `power_profile` (the controller says so through the backend), and
+    // never starting power-profiles-daemon.
+    let profiles = ProfileCache::default();
+    let tx = commands.clone();
+    tokio::spawn(run_profile_watch(profiles.clone(), move || {
+        let _ = tx.send(Command::PowerChanged);
+    }));
 
     let hook = consumer_watcher(&commands)?;
     let reporter = pipewire_reporter(&commands);
@@ -285,7 +295,9 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
         .name("obc-controller".into())
         .spawn(move || {
             let res = GstBackend::new(Some(reporter), Some(previews)).map(|backend| {
-                let backend = backend.with_control_reporter(controls);
+                let backend = backend
+                    .with_control_reporter(controls)
+                    .with_power_profiles(profiles);
                 // Controller::new_without_modules makes the first writer
                 // attempt.
                 let mut ctrl = Controller::new_without_modules(
