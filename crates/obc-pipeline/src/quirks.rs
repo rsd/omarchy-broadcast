@@ -18,6 +18,11 @@
 //!   the control values to offer as "recommended settings" (never applied
 //!   without the user asking: the controls are the user's, ADR-0020), and
 //!   whether its picture is noisy enough to suggest noise removal.
+//! * [`StatusQuirk`]: what the daemon can tell of a camera's state from
+//!   its frames or its HID interface, for the camera status of
+//!   `CameraHealth`: a closed privacy shutter seen as flat black frames
+//!   ([`crate::shutter`]), and the way it faces from an input report
+//!   ([`OrientationReport`], [`crate::hid_orientation`]).
 //!
 //! The Extension Unit rows of [`crate::xu`] follow the same principle for
 //! vendor settings.
@@ -133,6 +138,50 @@ pub const CONTROL_QUIRKS: &[ControlQuirk] = &[
     },
 ];
 
+/// How the settings tree names one standard control of one camera model,
+/// where the stock label does not say it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlLabel {
+    /// The camera model.
+    pub usb: UsbId,
+    /// The V4L2 control id.
+    pub cid: u32,
+    /// Replaces the setting's label; `None` keeps the stock one.
+    pub label: Option<&'static str>,
+    /// A sentence for people, shown with the setting.
+    pub description: &'static str,
+    /// The camera's name, for logs and the documentation.
+    pub model: &'static str,
+}
+
+/// Labels and descriptions of the MX Brio's standard controls.
+pub const CONTROL_LABELS: &[ControlLabel] = &[
+    // The firmware's HDR mode is the backlight compensation control, and
+    // it holds the camera to 30 fps.
+    ControlLabel {
+        usb: usb(0x046d, 0x0944),
+        cid: crate::controls::CID_BACKLIGHT_COMPENSATION,
+        label: Some("HDR"),
+        description: "HDR limits the camera to 30 fps",
+        model: "Logitech MX Brio",
+    },
+    // Our `keep_framerate` is this control with the opposite sense.
+    ControlLabel {
+        usb: usb(0x046d, 0x0944),
+        cid: crate::controls::CID_EXPOSURE_AUTO_PRIORITY,
+        label: None,
+        description: "Logi Tune calls this Low light compensation, with the opposite sense: on here is off there",
+        model: "Logitech MX Brio",
+    },
+];
+
+/// The label row of control `cid` on the camera `usb` ([`CONTROL_LABELS`]);
+/// `None` for `None` or a control with no row.
+pub fn control_label(usb: Option<UsbId>, cid: u32) -> Option<&'static ControlLabel> {
+    let u = usb?;
+    CONTROL_LABELS.iter().find(|l| l.usb == u && l.cid == cid)
+}
+
 /// The control ids the camera `usb` hides ([`CONTROL_QUIRKS`]), in table
 /// order; empty for `None` or a camera with no row.
 pub fn hidden_controls(usb: Option<UsbId>) -> Vec<u32> {
@@ -223,6 +272,80 @@ pub fn profile(usb: Option<UsbId>) -> Option<&'static CameraProfile> {
     CAMERA_PROFILES.iter().find(|p| p.usb == u)
 }
 
+/// An input report of a camera's HID interface that says which way the
+/// camera faces: report `report_id`, whose byte `byte` (0-based, the
+/// report id at 0) is `flipped` while the camera is turned down to the
+/// desk and any other value while it faces ahead
+/// ([`crate::hid_orientation`]). The daemon only reads it: it never writes
+/// to the HID interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrientationReport {
+    /// The report id (the report's first byte).
+    pub report_id: u8,
+    /// The byte that tells the orientation.
+    pub byte: usize,
+    /// Its value while the camera faces the desk.
+    pub flipped: u8,
+}
+
+/// What the frames or the HID interface of one camera model say of its
+/// state, where the camera reports it no other way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusQuirk {
+    /// The camera model.
+    pub usb: UsbId,
+    /// A closed privacy shutter gives perfectly flat frames at the black
+    /// level (and no HID report or control change): the ingest watches its
+    /// luma for them ([`crate::shutter`]).
+    pub flat_black_shutter: bool,
+    /// The input report saying whether the camera faces the desk (Show
+    /// Mode); `None` for a camera that sends none.
+    pub orientation_report: Option<OrientationReport>,
+    /// The camera's name, for logs and the documentation.
+    pub model: &'static str,
+}
+
+/// Measured on 2026-11-14.
+pub const STATUS_QUIRKS: &[StatusQuirk] = &[
+    // The mechanical shutter sends no HID report and changes no UVC
+    // control; closed, the raw NV12 and YUYV frames are luma 16 at every
+    // pixel (minimum = mean = 16.0). Show Mode: turned down to the desk,
+    // the HID interface sends input report 0x55 (vendor page 0xFFA1, 7
+    // bytes with the id) with byte 5 at 01, and 00 upright
+    // (`55 00 00 a4 00 01 00`); sent on a change only, and it can bounce
+    // during the motion.
+    StatusQuirk {
+        usb: usb(0x046d, 0x0944),
+        flat_black_shutter: true,
+        orientation_report: Some(OrientationReport {
+            report_id: 0x55,
+            byte: 5,
+            flipped: 0x01,
+        }),
+        model: "Logitech MX Brio",
+    },
+];
+
+/// The status row of the camera `usb` ([`STATUS_QUIRKS`]); `None` for
+/// `None` or a camera with no row.
+pub fn status_quirk(usb: Option<UsbId>) -> Option<&'static StatusQuirk> {
+    let u = usb?;
+    STATUS_QUIRKS.iter().find(|q| q.usb == u)
+}
+
+/// Whether the ingest watches the camera `usb` for a closed privacy
+/// shutter ([`StatusQuirk::flat_black_shutter`]).
+pub fn flat_black_shutter(usb: Option<UsbId>) -> bool {
+    status_quirk(usb).is_some_and(|q| q.flat_black_shutter)
+}
+
+/// The input report that says which way the camera `usb` faces
+/// ([`StatusQuirk::orientation_report`]); `None` for a camera that sends
+/// none.
+pub fn orientation_report(usb: Option<UsbId>) -> Option<&'static OrientationReport> {
+    status_quirk(usb).and_then(|q| q.orientation_report.as_ref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +389,24 @@ mod tests {
     }
 
     #[test]
+    fn control_labels_are_unique_and_found() {
+        for (i, a) in CONTROL_LABELS.iter().enumerate() {
+            assert!(
+                CONTROL_LABELS[i + 1..]
+                    .iter()
+                    .all(|b| (b.usb, b.cid) != (a.usb, a.cid)),
+                "{}",
+                a.model
+            );
+            assert!(!a.description.is_empty());
+        }
+        let hdr = control_label(Some(BRIO), crate::controls::CID_BACKLIGHT_COMPENSATION).unwrap();
+        assert_eq!(hdr.label, Some("HDR"));
+        assert!(control_label(Some(C930E), crate::controls::CID_BACKLIGHT_COMPENSATION).is_none());
+        assert!(control_label(None, crate::controls::CID_BACKLIGHT_COMPENSATION).is_none());
+    }
+
+    #[test]
     fn profiles_by_model() {
         let fhd = profile(Some(usb(0x5986, 0x1193))).unwrap();
         assert!(fhd.values.contains(&(crate::controls::CID_SHARPNESS, 5)));
@@ -282,6 +423,40 @@ mod tests {
                 assert_ne!(*cid, 0x0098_0918, "{}", a.model);
             }
         }
+    }
+
+    #[test]
+    fn status_rows_are_unique_and_found() {
+        for (i, a) in STATUS_QUIRKS.iter().enumerate() {
+            assert!(
+                STATUS_QUIRKS[i + 1..].iter().all(|b| b.usb != a.usb),
+                "{}",
+                a.model
+            );
+        }
+        assert!(status_quirk(Some(BRIO)).unwrap().flat_black_shutter);
+        assert!(flat_black_shutter(Some(BRIO)));
+        assert!(status_quirk(Some(C930E)).is_none());
+        assert!(!flat_black_shutter(Some(C930E)));
+        assert!(!flat_black_shutter(None));
+        assert_eq!(
+            orientation_report(Some(BRIO)),
+            Some(&OrientationReport {
+                report_id: 0x55,
+                byte: 5,
+                flipped: 0x01,
+            })
+        );
+        assert!(orientation_report(Some(C930E)).is_none());
+        assert!(orientation_report(None).is_none());
+        for q in STATUS_QUIRKS {
+            // The byte is past the report id.
+            if let Some(r) = q.orientation_report {
+                assert!(r.byte >= 1, "{}", q.model);
+            }
+        }
+        // The row is no recommendation: the MX Brio has no profile.
+        assert!(profile(Some(BRIO)).is_none());
     }
 
     #[test]

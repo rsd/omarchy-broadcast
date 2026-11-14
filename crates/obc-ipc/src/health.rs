@@ -1,4 +1,5 @@
-//! What the daemon knows about the active camera's health (revision 20):
+//! What the daemon knows about the active camera's health (revision 20,
+//! its camera status keys revision 26):
 //! the `CameraHealth` property (`a{sv}`), read into [`CameraHealth`] and
 //! written back.
 //!
@@ -19,9 +20,23 @@
 //! the row's values and the power-line frequency of the time zone, stored
 //! as the user's.
 //!
-//! A change is announced at once when the camera changes or a warning, a
-//! suggestion or the recommended changes appear or go, and otherwise (the
-//! counters) at most every [`CAMERA_HEALTH_PERIOD_MS`] milliseconds.
+//! The camera status keys (revision 26, [`crate::CAMERA_STATUS_REVISION`]):
+//! `shutter` (s, the camera's privacy shutter as its frames show it while
+//! it streams: [`SHUTTER_OPEN`], [`SHUTTER_CLOSED`], or `""` when unknown:
+//! a camera the daemon cannot tell it of, not streaming, or not sampled
+//! yet), `show_mode` (s, which way a camera that turns faces, as its HID
+//! interface reports it: [`SHOW_MODE_NORMAL`], [`SHOW_MODE_DESK_VIEW`]
+//! (turned down to the desk), or `""` for a camera that reports no such
+//! thing, or while it is unknown or cannot be read) and `status` (as,
+//! lines for people describing the camera's state now, such as `Shutter
+//! closed` and `Show Mode: desk view`; empty when there is nothing to
+//! say). An older daemon sends none of them: they read as `""` and
+//! empty.
+//!
+//! A change is announced at once when the camera changes, a warning, a
+//! suggestion or the recommended changes appear or go, or the shutter or
+//! the Show Mode changes, and otherwise (the counters) at most every
+//! [`CAMERA_HEALTH_PERIOD_MS`] milliseconds.
 //!
 //! Reading is tolerant, as for the settings channel: a key missing or of
 //! another type reads as its empty value, keys this crate does not know
@@ -38,6 +53,20 @@ use crate::settings::{
 /// The first [`crate::INTERFACE_REVISION`] with `CameraHealth` and
 /// `ApplyRecommendedSettings`.
 pub const CAMERA_HEALTH_REVISION: u32 = 20;
+
+/// `shutter`: the privacy shutter is open (the camera shows a picture).
+/// From [`crate::CAMERA_STATUS_REVISION`].
+pub const SHUTTER_OPEN: &str = "open";
+/// `shutter`: the privacy shutter is closed (the camera's frames are flat
+/// black). From [`crate::CAMERA_STATUS_REVISION`].
+pub const SHUTTER_CLOSED: &str = "closed";
+
+/// `show_mode`: the camera faces ahead. From
+/// [`crate::CAMERA_STATUS_REVISION`].
+pub const SHOW_MODE_NORMAL: &str = "normal";
+/// `show_mode`: the camera is turned down to the desk (the Logitech MX
+/// Brio's Show Mode). From [`crate::CAMERA_STATUS_REVISION`].
+pub const SHOW_MODE_DESK_VIEW: &str = "desk_view";
 
 /// `delivered_fps` and `nominal_fps` before they are known.
 pub const NOT_MEASURED: f64 = -1.0;
@@ -95,6 +124,16 @@ pub struct CameraHealth {
     pub has_recommendation: bool,
     /// What `ApplyRecommendedSettings` would change.
     pub recommended: Vec<Recommended>,
+    /// The privacy shutter: [`SHUTTER_OPEN`], [`SHUTTER_CLOSED`], or `""`
+    /// when unknown. From [`crate::CAMERA_STATUS_REVISION`].
+    pub shutter: String,
+    /// Which way the camera faces: [`SHOW_MODE_NORMAL`],
+    /// [`SHOW_MODE_DESK_VIEW`], or `""` when it reports no such thing or
+    /// it is unknown. From [`crate::CAMERA_STATUS_REVISION`].
+    pub show_mode: String,
+    /// Lines for people describing the camera's state now; empty when
+    /// none. From [`crate::CAMERA_STATUS_REVISION`].
+    pub status: Vec<String>,
 }
 
 impl Default for CameraHealth {
@@ -115,6 +154,9 @@ impl CameraHealth {
             suggestions: Vec::new(),
             has_recommendation: false,
             recommended: Vec::new(),
+            shutter: String::new(),
+            show_mode: String::new(),
+            status: Vec::new(),
         }
     }
 
@@ -165,6 +207,9 @@ impl CameraHealth {
             })
             .collect();
         d.insert("recommended".into(), to_owned(&recommended));
+        put(&mut d, "shutter", Variant::from(self.shutter.as_str()));
+        put(&mut d, "show_mode", Variant::from(self.show_mode.as_str()));
+        d.insert("status".into(), to_owned(&self.status));
         d
     }
 
@@ -181,6 +226,16 @@ impl CameraHealth {
         };
         let field =
             |d: &Entries<'_, '_>, key: &str| get_str(d, key).unwrap_or_default().to_string();
+        let strings = |key: &str| -> Vec<String> {
+            e.get(key)
+                .and_then(|v| list_of(v))
+                .map(|l| {
+                    l.iter()
+                        .filter_map(|v| str_of(v).map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         CameraHealth {
             camera: text("camera"),
             delivered_fps: rate("delivered_fps"),
@@ -192,15 +247,7 @@ impl CameraHealth {
                     _ => None,
                 })
                 .unwrap_or_default(),
-            warnings: e
-                .get("warnings")
-                .and_then(|v| list_of(v))
-                .map(|l| {
-                    l.iter()
-                        .filter_map(|v| str_of(v).map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            warnings: strings("warnings"),
             suggestions: dicts("suggestions")
                 .iter()
                 .filter_map(|d| {
@@ -223,6 +270,9 @@ impl CameraHealth {
                     })
                 })
                 .collect(),
+            shutter: text("shutter"),
+            show_mode: text("show_mode"),
+            status: strings("status"),
         }
     }
 }
@@ -266,6 +316,9 @@ mod tests {
                 value: "5".into(),
                 current: "3".into(),
             }],
+            shutter: SHUTTER_CLOSED.into(),
+            show_mode: SHOW_MODE_DESK_VIEW.into(),
+            status: vec!["Shutter closed".into(), "Show Mode: desk view".into()],
         }
     }
 
@@ -288,11 +341,17 @@ mod tests {
         assert_eq!(sig("suggestions"), "aa{sv}");
         assert_eq!(sig("has_recommendation"), "b");
         assert_eq!(sig("recommended"), "aa{sv}");
+        assert_eq!(sig("shutter"), "s");
+        assert_eq!(sig("show_mode"), "s");
+        assert_eq!(sig("status"), "as");
         assert_eq!(CameraHealth::from_dict(&over_the_wire(&d)), h);
         // Empty lists keep their element signature.
         let none = CameraHealth::none().to_dict();
         assert_eq!(none["suggestions"].value_signature().to_string(), "aa{sv}");
         assert_eq!(none["warnings"].value_signature().to_string(), "as");
+        assert_eq!(none["status"].value_signature().to_string(), "as");
+        assert_eq!(none["shutter"].value_signature().to_string(), "s");
+        assert_eq!(none["show_mode"].value_signature().to_string(), "s");
         assert_eq!(
             CameraHealth::from_dict(&over_the_wire(&none)),
             CameraHealth::none()
@@ -322,6 +381,28 @@ mod tests {
         assert!(h.warnings.is_empty());
         assert!(h.suggestions.is_empty());
         assert_eq!(h.recommended, sample().recommended);
+    }
+
+    #[test]
+    fn an_older_daemon_reads_as_no_camera_status() {
+        // Revision 25 sent no shutter, show mode or status keys.
+        let mut d = sample().to_dict();
+        d.remove("shutter");
+        d.remove("show_mode");
+        d.remove("status");
+        let h = CameraHealth::from_dict(&over_the_wire(&d));
+        assert_eq!(h.shutter, "");
+        assert_eq!(h.show_mode, "");
+        assert!(h.status.is_empty());
+        assert_eq!(h.camera, sample().camera);
+        // Another type reads as empty.
+        d.insert("shutter".into(), variant(Variant::from(true)));
+        d.insert("show_mode".into(), variant(Variant::from(1u32)));
+        d.insert("status".into(), variant(Variant::from("Shutter closed")));
+        let h = CameraHealth::from_dict(&over_the_wire(&d));
+        assert_eq!((h.shutter.as_str(), h.status.len()), ("", 0));
+        assert_eq!(h.show_mode, "");
+        assert_eq!(crate::CAMERA_STATUS_REVISION, 26);
     }
 
     #[test]

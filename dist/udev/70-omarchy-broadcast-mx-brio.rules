@@ -1,0 +1,15 @@
+# Omarchy Broadcast: access to the Logitech MX Brio's HID interface.
+#
+# The MX Brio (USB 046d:0944) reports its Show Mode (desk view or normal) as a
+# HID input report. The daemon reads it from the camera's hidraw node, only
+# while the camera streams. A hidraw node belongs to root by default, so this
+# rule tags the nodes of that one USB device with "uaccess": systemd-logind then
+# grants the user of the active local seat an ACL on the node (read and write).
+# The daemon opens it read-only and never writes to it.
+#
+# No other device is matched. The file must sort before 73-seat-late.rules, which
+# is where the uaccess tag is turned into the ACL.
+#
+# Without this rule the daemon still works: the Show Mode status stays unknown.
+
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="0944", TAG+="uaccess"

@@ -47,7 +47,9 @@ use tokio::signal::unix::{SignalKind, signal};
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 
 use crate::backend::real::GstBackend;
-use crate::backend::{ControlEventReporter, PipeWireReporter, PreviewReporter};
+use crate::backend::{
+    ControlEventReporter, OrientationReporter, PipeWireReporter, PreviewReporter,
+};
 use crate::consumers::ConsumerWatcher;
 use crate::controller::{
     self, Command, Controller, GalleryVideos, Paths, Published, preliminary_snapshot,
@@ -213,6 +215,16 @@ fn control_reporter(commands: &Sender<Command>) -> ControlEventReporter {
     })
 }
 
+/// The orientation watcher's reporter: which way the active camera faces
+/// goes to the controller, with the generation of the watcher that read
+/// it, on the same command channel.
+fn orientation_reporter(commands: &Sender<Command>) -> OrientationReporter {
+    let tx = commands.clone();
+    Arc::new(move |generation, event| {
+        let _ = tx.send(Command::Orientation(generation, event));
+    })
+}
+
 async fn serve(paths: Paths) -> Result<(), DaemonError> {
     let io = |what: &str| {
         let what = what.to_string();
@@ -297,6 +309,7 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
     let reporter = pipewire_reporter(&commands);
     let previews = preview_reporter(&published);
     let controls = control_reporter(&commands);
+    let orientation = orientation_reporter(&commands);
     let tx = commands.clone();
     let cameras = CameraWatcher::spawn(PathBuf::from("/dev"), SETTLE, SECOND_SCAN, move || {
         let _ = tx.send(Command::Rescan);
@@ -325,6 +338,7 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
             let res = GstBackend::new(Some(reporter), Some(previews)).map(|backend| {
                 let backend = backend
                     .with_control_reporter(controls)
+                    .with_orientation_reporter(orientation)
                     .with_power_profiles(profiles);
                 // Controller::new_without_modules makes the first writer
                 // attempt.

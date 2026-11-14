@@ -3840,9 +3840,6 @@ fn settings_hw_enumerates_every_control() {
             ("exposure_compensation", 10),
             ("vibrance", 10),
             ("temperature_compensation", 10),
-            ("rightsight", 22),
-            ("rightsight_speed", 22),
-            ("rightsight_distance", 22),
         ]
     );
 }
@@ -3998,7 +3995,7 @@ fn mx_brio_xu_rows(
 
 /// The MX Brio's Extension Unit rows, read only: each one is probed
 /// (`GET_LEN`, `GET_INFO`, `GET_CUR`, `GET_DEF`) and printed, with the
-/// whole RightSight block. Nothing is written. Needs an MX Brio.
+/// whole control of a multi-byte row. Nothing is written. Needs an MX Brio.
 #[test]
 #[ignore = "needs OBC_TEST_CAMERA attached (an MX Brio, 046d:0944); reads only"]
 fn settings_hw_mx_brio_extension_units_read_only() {
@@ -4045,10 +4042,10 @@ fn settings_hw_mx_brio_extension_units_read_only() {
 
 /// The MX Brio's Extension Unit rows, written: for each, a value of the
 /// row other than the current one is written and read back, then the
-/// starting value is written back and read back (also on a panic). For the
-/// RightSight rows every byte of the 30-byte block but the row's own and
-/// byte 4 must be what it was right before each write (the other two
-/// RightSight bytes included). Never touches a unit's other selectors.
+/// starting value is written back and read back (also on a panic). For a
+/// multi-byte row every byte of the control but the row's own and byte 4
+/// must be what it was right before each write. Never touches a unit's
+/// other selectors.
 /// Writes to the camera, so it needs `OBC_TEST_XU_WRITE=1` as well as an
 /// MX Brio; stop omarchy-broadcastd first so it does not write stored
 /// values meanwhile.
@@ -4463,6 +4460,48 @@ fn settings_hw_a_control_change_raises_an_event() {
     eprintln!("{name} = {other}: event after {:?}", t.elapsed());
     obc_pipeline::controls::set_ctrl(&path, id, start).unwrap();
     expect(start);
+    let t = Instant::now();
+    watcher.stop();
+    assert!(
+        t.elapsed() < Duration::from_secs(1),
+        "stop took {:?}",
+        t.elapsed()
+    );
+}
+
+/// Show Mode: the MX Brio's `hidraw` node is found from its video node,
+/// opens read-only, and the watcher learns its orientation from the
+/// camera's own report when it is flipped by hand within the wait, then
+/// stops at once. It only reads the reports the camera sends: no
+/// `GET_REPORT` (it hangs the MX Brio's firmware) and no write.
+#[test]
+#[ignore = "needs OBC_TEST_CAMERA attached (an MX Brio, 046d:0944) with read access to its hidraw node; flip it once by hand within 20 s of the start"]
+fn settings_hw_the_brio_reports_its_show_mode() {
+    use obc_pipeline::hid_orientation::{
+        OrientationNotice, OrientationWatcher, SETTLE, hidraw_of_node,
+    };
+    init();
+    let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
+    let (path, usb) = settings_camera();
+    assert_eq!(usb, Some(MX_BRIO), "this test needs an MX Brio");
+    let report = *obc_pipeline::quirks::orientation_report(usb).unwrap();
+    let node = hidraw_of_node(
+        std::path::Path::new(obc_pipeline::xu::SYSFS_ROOT),
+        &path,
+        report.report_id,
+    )
+    .unwrap();
+    eprintln!("Show Mode node: {}", node.display());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let watcher = OrientationWatcher::start(&node, report, SETTLE, move |n| {
+        let _ = tx.send(n);
+    })
+    .unwrap();
+    let n = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("an orientation within 20 s");
+    eprintln!("Show Mode: {n:?}");
+    assert!(matches!(n, OrientationNotice::Changed(_)), "{n:?}");
     let t = Instant::now();
     watcher.stop();
     assert!(

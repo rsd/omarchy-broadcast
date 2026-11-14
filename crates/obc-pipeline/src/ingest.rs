@@ -59,6 +59,12 @@
 //! repeats the last good frame. [`Ingest::corrupt_frames`] counts them
 //! ([`crate::frame_guard`]).
 //!
+//! **Privacy shutter.** A camera whose status row says a closed shutter
+//! gives flat black frames ([`crate::quirks::StatusQuirk`]) has its luma
+//! sampled a few times a second, on the camera source (raw) or after
+//! `jpegdec` (MJPEG); [`Ingest::shutter`] says what it shows
+//! ([`crate::shutter`]).
+//!
 //! **One CUDA context.** [`Ingest::start`] sets the output pipeline's CUDA
 //! context on the ingest pipeline before it opens anything, so canonical
 //! frames reach the output as CUDA memory of the same context, without a
@@ -122,6 +128,7 @@ use crate::pipeline::{
     CameraHead, MediaPipeline, PipelineError, StopError, add_linked, both_stopped, camera_head,
     capsfilter, cuda_caps, make, names,
 };
+use crate::shutter::{ShutterState, ShutterWatch};
 use obc_core::config::VideoMemory;
 
 /// The GStreamer context type that carries a `GstCudaContext`.
@@ -509,6 +516,9 @@ pub struct Ingest {
     failure: Mutex<Option<String>>,
     /// The camera's corrupt-frame guard (a camera ingest only).
     guard_frames: Option<Arc<FrameGuard>>,
+    /// The camera's closed-shutter watch ([`crate::shutter`]), for a camera
+    /// with a status row saying so.
+    shutter: Option<Arc<ShutterWatch>>,
 }
 
 impl Ingest {
@@ -525,6 +535,7 @@ impl Ingest {
             chain: head,
             format: tail_format,
             guard,
+            shutter,
         } = camera_head(
             &cfg.camera,
             &cfg.mode,
@@ -551,6 +562,7 @@ impl Ingest {
         ingest.fixed_framerate = cfg.fixed_framerate;
         ingest.path = Some(path);
         ingest.guard_frames = Some(guard);
+        ingest.shutter = shutter;
         Ok(ingest)
     }
 
@@ -641,6 +653,7 @@ impl Ingest {
             enhance,
             failure: Mutex::new(None),
             guard_frames: None,
+            shutter: None,
         })
     }
 
@@ -844,6 +857,15 @@ impl Ingest {
     /// that is not a camera.
     pub fn delivered_fps(&self) -> Option<f64> {
         self.guard_frames.as_ref().and_then(|g| g.delivered_fps())
+    }
+
+    /// Whether the camera's privacy shutter is open or closed, as its
+    /// frames say ([`crate::shutter`]); `None` for a camera without a
+    /// status row saying a closed shutter shows in its frames, before its
+    /// first frame was sampled, and for a source that is not a camera.
+    /// Reads an atomic: cheap, any time.
+    pub fn shutter(&self) -> Option<ShutterState> {
+        self.shutter.as_ref().and_then(|w| w.state())
     }
 }
 
@@ -1210,7 +1232,7 @@ mod tests {
     /// The JPEG of a `size` x `size` I420 frame of one full-range luma
     /// value `y` and one chroma pair `(u, v)`, as a camera's MJPEG carries
     /// it.
-    fn full_range_jpeg(y: u8, (u, v): (u8, u8), size: usize) -> Vec<u8> {
+    pub(super) fn full_range_jpeg(y: u8, (u, v): (u8, u8), size: usize) -> Vec<u8> {
         let pipeline = gst::parse::launch(&format!(
             "appsrc name=in format=time caps=video/x-raw,format=I420,width={size},\
              height={size},framerate=30/1 ! jpegenc quality=100 ! appsink name=out"
@@ -2617,6 +2639,106 @@ mod camera_head_tests {
         assert_eq!(guard.counts().flagged, dropped);
         assert_eq!(stats.pending() as u64, total - dropped);
         ingest.stop().unwrap();
+    }
+
+    /// A camera whose status row says a closed shutter gives flat black
+    /// frames (the MX Brio) has its luma watched, raw on the camera source
+    /// and MJPEG after the decoder (a JPEG of luma 16 from `jpegenc`
+    /// standing in for the camera's): 1.5 s of flat black closes its
+    /// shutter ([`Ingest::shutter`]). A camera without the row has no
+    /// watch. CPU only.
+    ///
+    /// The frames are pushed in one burst, faster than `jpegdec` decodes
+    /// them on a loaded machine, and the MJPEG watch sits after the leaky
+    /// camera queue: a queue of the camera's two buffers would drop all
+    /// but the last few, and the decoder's watch would see less than the
+    /// second of stream time a close takes. The queue here holds every
+    /// frame pushed, so none is dropped.
+    #[test]
+    fn a_camera_with_a_status_row_watches_for_a_closed_shutter() {
+        require_elements(&[
+            "appsrc",
+            "queue",
+            "jpegdec",
+            "jpegenc",
+            "videobalance",
+            "capssetter",
+            "videocrop",
+            "videoconvertscale",
+            "appsink",
+        ]);
+        const BRIO: UsbId = UsbId {
+            vendor: 0x046d,
+            product: 0x0944,
+        };
+        let nv12 = "video/x-raw,format=NV12,width=160,height=120,framerate=30/1,\
+                    colorimetry=2:4:5:1";
+        let mjpeg = "image/jpeg,width=160,height=160,framerate=30/1";
+        let mut flat = vec![16u8; 160 * 120];
+        flat.resize(160 * 120 * 3 / 2, 128);
+        let jpeg = super::tests::full_range_jpeg(16, (128, 128), 160);
+        // 1.5 s at 30 fps; the queue holds them all (see the doc).
+        const FRAMES: u32 = 46;
+        for (caps, format, frame, usb, want) in [
+            (nv12, PixelFormat::Nv12, &flat, Some(BRIO), true),
+            (mjpeg, PixelFormat::Mjpeg, &jpeg, Some(BRIO), true),
+            (nv12, PixelFormat::Nv12, &flat, Some(C930E), false),
+            (nv12, PixelFormat::Nv12, &flat, None, false),
+        ] {
+            let src = camera_src(caps);
+            let head = camera_chain(
+                src.clone().upcast(),
+                "test",
+                caps,
+                format,
+                FRAMES,
+                VideoMemory::System,
+                ColourRange::Limited,
+                usb,
+            )
+            .unwrap();
+            assert_eq!(head.shutter.is_some(), want, "{format} {usb:?}");
+            let shutter = head.shutter.clone();
+            let size = if format == PixelFormat::Mjpeg {
+                (160, 160)
+            } else {
+                (160, 120)
+            };
+            let slot = Arc::new(Slot::new());
+            let mut ingest = Ingest::from_head(
+                head.chain,
+                head.format,
+                size,
+                AspectPolicy::Crop,
+                system_writer(&slot, &"320x240@30".parse().unwrap()),
+            )
+            .unwrap();
+            assert_eq!(ingest.shutter(), None, "not a camera ingest");
+            ingest.shutter = shutter;
+            ingest.start_with(None).unwrap();
+            for n in 0..u64::from(FRAMES) {
+                let mut b = gst::Buffer::from_slice(frame.clone());
+                b.get_mut()
+                    .unwrap()
+                    .set_pts(gst::ClockTime::from_mseconds(33 * n));
+                src.push_buffer(b).unwrap();
+            }
+            if want {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while ingest.shutter() != Some(ShutterState::Closed) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{format}: {:?}",
+                        ingest.shutter()
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(100));
+                assert_eq!(ingest.shutter(), None, "{usb:?}");
+            }
+            ingest.stop().unwrap();
+        }
     }
 
     /// The ingest reports the rate of the frames its camera's guard

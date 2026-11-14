@@ -36,8 +36,12 @@
 //! the daemon's statistics, and [`delivered_rate`] the rate a camera
 //! really delivers good frames at ([`Ingest::delivered_fps`]);
 //! [`usb_topology`] says where a camera sits on the USB bus and whether it
-//! shares a hub with HID devices. At each start on a loopback the writer also
-//! puts the crash cover in place ([`loopback_cover`]): a black timeout
+//! shares a hub with HID devices, and [`shutter`] whether a camera that
+//! says it no other way has its privacy shutter closed
+//! ([`Ingest::shutter`]), and [`hid_orientation`] which way a camera that
+//! reports it on its HID interface faces (the MX Brio's Show Mode). At
+//! each start on a loopback the writer also puts the crash cover in place
+//! ([`loopback_cover`]): a black timeout
 //! image the driver serves while no writer streams, so a consumer survives
 //! the daemon's crash and restart. The measurement modules
 //! (`instrument`, `stats`, `gpu`, `stamp`) serve `obc-bench`. With the
@@ -67,6 +71,7 @@ pub mod frame;
 pub mod frame_guard;
 pub mod geometry;
 pub mod gpu;
+pub mod hid_orientation;
 pub mod ingest;
 pub mod instrument;
 pub mod live;
@@ -81,6 +86,7 @@ pub mod preview;
 pub mod process;
 pub mod quirks;
 pub mod session;
+pub mod shutter;
 pub mod slot;
 pub mod stamp;
 pub mod stats;
@@ -121,5 +127,6 @@ pub use pipeline::{
 pub use preview::{PreviewConfig, PreviewCounts, PreviewEncoder};
 pub use process::GpuStage;
 pub use session::{Session, SwitchTiming};
+pub use shutter::ShutterState;
 pub use usb_topology::{SharedHub, UsbPlacement};
 pub use xu::{XuControl, XuRow, XuState};

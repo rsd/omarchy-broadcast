@@ -97,6 +97,10 @@ pub struct Known {
     /// The option ids and labels of a menu, by the device's index. An item
     /// the device reports that is not listed gets `m<index>`.
     pub options: &'static [KnownOption],
+    /// How a client shows an int's raw value, `(offset, scale)`
+    /// (`obc_ipc::settings::IntDisplay`): for a relative control whose raw
+    /// middle means no change. The published numbers stay raw.
+    pub display: Option<(i64, i64)>,
 }
 
 /// The `cid` of a catalogue entry for an Extension Unit row.
@@ -165,6 +169,7 @@ const fn known(name: &'static str, cid: u32, group: &'static str, label: &'stati
         inverted: false,
         rule: None,
         options: &[],
+        display: None,
     }
 }
 
@@ -175,6 +180,11 @@ const fn ruled(mut k: Known, rule: Rule) -> Known {
 
 const fn with_unit(mut k: Known, unit: &'static str) -> Known {
     k.unit = Some(unit);
+    k
+}
+
+const fn with_display(mut k: Known, offset: i64, scale: i64) -> Known {
+    k.display = Some((offset, scale));
     k
 }
 
@@ -225,11 +235,19 @@ pub const CATALOGUE: &[Known] = &[
         known("blue_balance", 0x0098_090f, "white_balance", "Blue balance"),
         WB_RULE,
     ),
-    known(
-        "temperature_compensation",
-        XU,
-        "white_balance",
-        "Temperature compensation",
+    // 0x32 (50) is 0 K, about 40 K a step (`obc_pipeline::xu`).
+    with_display(
+        with_unit(
+            known(
+                "temperature_compensation",
+                XU,
+                "white_balance",
+                "Temperature compensation",
+            ),
+            "K",
+        ),
+        50,
+        40,
     ),
     known(
         "do_white_balance",
@@ -254,11 +272,16 @@ pub const CATALOGUE: &[Known] = &[
         EXPOSURE_RULE,
     ),
     known("gain", 0x0098_0913, "exposure", "Gain"),
-    known(
-        "exposure_compensation",
-        XU,
-        "exposure",
-        "Exposure compensation",
+    // 0x80 (128) is no compensation; what a step is in EV is not known.
+    with_display(
+        known(
+            "exposure_compensation",
+            XU,
+            "exposure",
+            "Exposure compensation",
+        ),
+        128,
+        1,
     ),
     Known {
         id_name: Some("keep_framerate"),
@@ -295,9 +318,6 @@ pub const CATALOGUE: &[Known] = &[
     known("pan_reset", 0x009a_0906, "focus", "Recentre pan"),
     known("tilt_reset", 0x009a_0907, "focus", "Recentre tilt"),
     known("field_of_view", XU, "focus", "Field of view"),
-    known("rightsight", XU, "focus", "RightSight"),
-    known("rightsight_speed", XU, "focus", "Framing speed"),
-    known("rightsight_distance", XU, "focus", "Framing distance"),
     known("show_mode", XU, "focus", "Show Mode"),
 ];
 

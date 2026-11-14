@@ -372,6 +372,9 @@ pub(crate) struct CameraHead {
     pub format: &'static str,
     /// The corrupt-frame guard on the camera source ([`crate::frame_guard`]).
     pub guard: Arc<FrameGuard>,
+    /// The closed-shutter watch, for a camera with a status row saying so
+    /// ([`crate::shutter`]).
+    pub shutter: Option<Arc<crate::shutter::ShutterWatch>>,
 }
 
 /// The camera end of an ingest chain of canonical frames in `memory`, up
@@ -418,6 +421,12 @@ pub(crate) fn camera_head(
 ///   relabel, so `videoconvert` keeps the relabelled range.
 /// * A raw camera with a USB id and no row gets the range watch
 ///   ([`crate::colour_range::watch_range`]), which only logs.
+/// * A camera whose status row says a closed shutter gives flat black
+///   frames ([`crate::quirks::flat_black_shutter`]) gets the shutter watch
+///   ([`crate::shutter::watch`]): on `src`'s `src` pad, after the guard,
+///   for a raw format; on the decoder's `src` pad for MJPEG, where either
+///   black level counts ([`crate::shutter::FlatBlack::DecodedMjpeg`]:
+///   `jpegdec` puts out full range, and the closed level is unmeasured).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn camera_chain(
     src: gst::Element,
@@ -466,12 +475,26 @@ pub(crate) fn camera_chain(
         labelled = limited_range_relabel(&balance)?;
         chain.extend([balance, labelled.clone()]);
     }
-    let (adapter, format) = ingest_adapter(&labelled, format, memory, range)?;
+    let (adapter, upload) = ingest_adapter(&labelled, format, memory, range)?;
+    let shutter = if !crate::quirks::flat_black_shutter(usb) {
+        None
+    } else if format == PixelFormat::Mjpeg {
+        adapter.iter().find(|e| e.name() == DECODE).and_then(|d| {
+            crate::shutter::watch(
+                d,
+                PixelFormat::I420,
+                crate::shutter::FlatBlack::DecodedMjpeg,
+            )
+        })
+    } else {
+        crate::shutter::watch(&chain[0], format, crate::shutter::FlatBlack::Raw)
+    };
     chain.extend(adapter);
     Ok(CameraHead {
         chain,
-        format,
+        format: upload,
         guard,
+        shutter,
     })
 }
 

@@ -68,11 +68,11 @@
 //!   camera's, and are there with no camera too. [`diff`] covers them.
 
 use obc_core::config::{CameraControlState, valid_control_name};
-use obc_core::{ModeRequest, VideoMode};
+use obc_core::{ModeRequest, UsbId, VideoMode};
 use obc_ipc::settings::SCOPE_CAMERA;
 use obc_ipc::{
-    Condition, ConditionOp, Setting, SettingChange, SettingKind, SettingValue, SettingsGroup,
-    SettingsTree, valid_setting_id,
+    Condition, ConditionOp, IntDisplay, Setting, SettingChange, SettingKind, SettingValue,
+    SettingsGroup, SettingsTree, valid_setting_id,
 };
 use obc_pipeline::capability::{
     Capabilities, INPUT_MAX_OPTIONS, input_mode_choices, mode_label, mode_value,
@@ -83,6 +83,7 @@ use obc_pipeline::controls::{
     CTRL_FLAG_UPDATE, CTRL_TYPE_BOOLEAN, CTRL_TYPE_BUTTON, CTRL_TYPE_INTEGER,
     CTRL_TYPE_INTEGER_MENU, CTRL_TYPE_MENU,
 };
+use obc_pipeline::quirks::control_label;
 use obc_pipeline::xu::{FIELD_OF_VIEW, XU_ROWS, XuKind, XuRow, XuState};
 
 pub mod catalogue;
@@ -201,6 +202,10 @@ pub struct Inputs<'a> {
     /// The V4L2 ids of the controls its quirk row hides
     /// (`obc_pipeline::quirks::hidden_controls` of its USB id).
     pub hidden: &'a [u32],
+    /// The camera's USB id: its label rows
+    /// (`obc_pipeline::quirks::control_label`) rename a control and add a
+    /// description.
+    pub usb: Option<UsbId>,
 }
 
 /// What a setting is written to.
@@ -260,7 +265,7 @@ pub struct Entry {
     pub default: Option<i32>,
     /// The device's flags (`V4L2_CTRL_FLAG_*`). An Extension Unit row has
     /// none but `V4L2_CTRL_FLAG_UPDATE` when it shares its control with
-    /// other rows (the MX Brio's RightSight block): a write of it rewrites
+    /// other rows (bytes of one multi-byte control): a write of it rewrites
     /// their bytes too, so every control is read again after it.
     pub flags: u32,
     /// Another published setting depends on this one, or the device says a
@@ -365,6 +370,8 @@ struct Candidate {
     id: String,
     label: String,
     unit: Option<String>,
+    /// The int display transform, `(offset, scale)` ([`Known::display`]).
+    display: Option<(i64, i64)>,
     target: Target,
     values: Values,
     device: Option<i32>,
@@ -378,6 +385,8 @@ struct Candidate {
     unknown_xu: Option<&'static str>,
     /// The option labels, in the order of `values`.
     labels: Vec<String>,
+    /// A sentence for people ([`obc_pipeline::quirks::CONTROL_LABELS`]).
+    description: Option<String>,
 }
 
 /// The settings of a camera (see the module docs).
@@ -392,7 +401,13 @@ pub fn build(inp: &Inputs<'_>) -> CameraSettings {
             hidden.push(name.to_string());
             continue;
         }
-        if let Some(cand) = control_candidate(c, seq, &mut notes, &mut absent) {
+        if let Some(mut cand) = control_candidate(c, seq, &mut notes, &mut absent) {
+            if let Some(l) = control_label(inp.usb, c.id) {
+                if let Some(label) = l.label {
+                    cand.label = label.to_string();
+                }
+                cand.description = Some(l.description.to_string());
+            }
             if found.iter().any(|f| f.name == cand.name) {
                 notes.push(format!(
                     "{} ({:#010x}) has the name of another control: left out",
@@ -444,6 +459,7 @@ pub fn build(inp: &Inputs<'_>) -> CameraSettings {
             disabled_reason: reason.to_string(),
             enabled_when: conditions.into_iter().map(|(_, cond)| cond).collect(),
             hint: hint(&c.values),
+            description: c.description.clone(),
         };
         entries.push(Entry {
             group: c.group,
@@ -526,6 +542,7 @@ pub fn mode_setting(modes: &[VideoMode], stored: Option<&ModeRequest>) -> Option
         disabled_reason: String::new(),
         enabled_when: Vec::new(),
         hint: None,
+        description: None,
     })
 }
 
@@ -663,6 +680,7 @@ fn control_candidate(
         id,
         label,
         unit: k.and_then(|k| k.unit).map(str::to_string),
+        display: k.and_then(|k| k.display),
         target: Target::Ctrl(c.id),
         values,
         device,
@@ -676,6 +694,7 @@ fn control_candidate(
         rule: k.and_then(|k| k.rule),
         unknown_xu: None,
         labels,
+        description: None,
     })
 }
 
@@ -740,6 +759,7 @@ fn xu_candidate(x: &XuReading, seq: usize, notes: &mut Vec<String>) -> Candidate
         Some((i, k)) => ((i, 0), k.group, k.label.to_string()),
         None => ((CATALOGUE.len(), seq), OTHER, row.label.to_string()),
     };
+    let known = known.map(|(_, k)| k);
     let (values, labels, range) = match row.kind {
         XuKind::Menu { options, .. } => {
             let mut values: Vec<(String, i32)> = options
@@ -768,7 +788,8 @@ fn xu_candidate(x: &XuReading, seq: usize, notes: &mut Vec<String>) -> Candidate
         name: row.name.to_string(),
         id: format!("camera.{group}.{}", row.name),
         label,
-        unit: None,
+        unit: known.and_then(|k| k.unit).map(str::to_string),
+        display: known.and_then(|k| k.display),
         target: Target::Xu(row),
         values,
         device: Some(i32::from(x.state.current)),
@@ -786,14 +807,19 @@ fn xu_candidate(x: &XuReading, seq: usize, notes: &mut Vec<String>) -> Candidate
             .is_none()
             .then_some(row.unknown_reason),
         labels,
+        description: None,
     }
 }
 
 /// Whether another row of `obc_pipeline::xu::XU_ROWS` is a byte of the
 /// same control as `row` (the same unit GUID and selector).
 fn shares_control(row: &XuRow) -> bool {
-    XU_ROWS
-        .iter()
+    shares_control_in(XU_ROWS, row)
+}
+
+/// Whether another row of `rows` is a byte of the same control as `row`.
+fn shares_control_in(rows: &[XuRow], row: &XuRow) -> bool {
+    rows.iter()
         .any(|r| r.name != row.name && r.guid == row.guid && r.selector == row.selector)
 }
 
@@ -913,6 +939,9 @@ fn kind(c: &Candidate, raw: Option<i32>) -> SettingKind {
             default: default.into(),
             value: raw.into(),
             unit: c.unit.clone(),
+            display: c
+                .display
+                .map(|(offset, scale)| IntDisplay { offset, scale }),
         },
         // An Extension Unit off/on row is on for byte 1 only: another byte
         // is no option of it (greyed), not on.

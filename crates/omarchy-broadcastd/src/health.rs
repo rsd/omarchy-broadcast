@@ -30,6 +30,12 @@
 //!   [`LABEL_OFF_RATIO`]; the rate shown moves by [`LABEL_FPS_STEP`].
 //! - **Mains frequency** ([`mains_hz`]): 50 or 60 Hz by time zone, `None`
 //!   where a country has both (Japan) or the zone says nothing.
+//! - **Camera status** ([`shutter_status`], revision 26): the privacy
+//!   shutter as the camera's frames show it ([`obc_pipeline::shutter`]),
+//!   and a line for people while it is closed ([`SHUTTER_CLOSED_STATUS`]);
+//!   and which way a camera that reports it on its HID interface faces
+//!   ([`show_mode_status`], [`obc_pipeline::hid_orientation`]), with its
+//!   line while known.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -37,6 +43,8 @@ use std::time::{Duration, Instant};
 
 use obc_core::VideoMode;
 use obc_ipc::{Recommended, SettingKind, SettingValue, Suggestion};
+use obc_pipeline::ShutterState;
+use obc_pipeline::hid_orientation::Orientation;
 use obc_pipeline::usb_topology::{SharedHub, UsbPlacement, raw_bytes_per_second};
 
 use crate::settings::catalogue::DYNAMIC_FRAMERATE;
@@ -329,6 +337,52 @@ pub fn shared_hub_warning(
             mode_words(mode)
         )
     })
+}
+
+/// The status line of a camera whose privacy shutter is closed.
+pub const SHUTTER_CLOSED_STATUS: &str = "Shutter closed";
+
+/// `CameraHealth`'s `shutter` and its `status` lines for a camera whose
+/// shutter is in `state` (`None`: unknown): `"open"` and none, `"closed"`
+/// and [`SHUTTER_CLOSED_STATUS`], `""` and none.
+pub fn shutter_status(state: Option<ShutterState>) -> (String, Vec<String>) {
+    match state {
+        Some(ShutterState::Open) => (obc_ipc::SHUTTER_OPEN.to_string(), Vec::new()),
+        Some(ShutterState::Closed) => (
+            obc_ipc::SHUTTER_CLOSED.to_string(),
+            vec![SHUTTER_CLOSED_STATUS.to_string()],
+        ),
+        None => (String::new(), Vec::new()),
+    }
+}
+
+/// The status line of a camera turned down to the desk.
+pub const SHOW_MODE_DESK_VIEW_STATUS: &str = "Show Mode: desk view";
+/// The status line of a camera that reports its orientation, facing ahead.
+pub const SHOW_MODE_NORMAL_STATUS: &str = "Show Mode: normal";
+
+/// The status line of a camera facing `o`.
+pub fn show_mode_line(o: Orientation) -> &'static str {
+    match o {
+        Orientation::Normal => SHOW_MODE_NORMAL_STATUS,
+        Orientation::DeskView => SHOW_MODE_DESK_VIEW_STATUS,
+    }
+}
+
+/// `CameraHealth`'s `show_mode` and its `status` line for a camera facing
+/// `o` (`None`: it reports no orientation, or it is unknown): `"normal"`
+/// or `"desk_view"` with [`show_mode_line`], `""` and none.
+pub fn show_mode_status(o: Option<Orientation>) -> (String, Option<String>) {
+    match o {
+        Some(o) => {
+            let value = match o {
+                Orientation::Normal => obc_ipc::SHOW_MODE_NORMAL,
+                Orientation::DeskView => obc_ipc::SHOW_MODE_DESK_VIEW,
+            };
+            (value.to_string(), Some(show_mode_line(o).to_string()))
+        }
+        None => (String::new(), None),
+    }
 }
 
 /// The damaged-frames warning of the camera `name`; with the hub advice

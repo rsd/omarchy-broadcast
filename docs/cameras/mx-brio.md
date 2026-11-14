@@ -45,8 +45,8 @@ All work through `uvcvideo` with no extra software (measured). V4L2 names as sho
 | Auto exposure | `auto_exposure` | Manual, Aperture Priority (the camera's auto); default auto |
 | Shutter | `exposure_time_absolute` | 3 to 2047 in 100 us units (0.3 to 204.7 ms), default 156; active in manual mode only |
 | Gain ("ISO") | `gain` | 0 to 255, default 0; measured to change nothing visible |
-| Keep frame rate in low light | `exposure_dynamic_framerate` | 0 or 1, default 0. This is UVC AE priority; **1 allows the frame rate to drop**. Logi Tune calls it "Low light compensation" (decoded: unit 1, selector `0x03`, 1 byte). No effect on the frame rate in a lit room (measured); untested in the dark |
-| HDR | `backlight_compensation` | 0 or 1, **default 1**. This is UVC backlight compensation; Logi Tune's "HDR" switch is this control (decoded: unit 3, selector `0x01`, 2 bytes, `0000` off, `0100` on). **With it on, 1080p60 MJPEG is capped at 30 fps** (measured, see [Frame rate and HDR](#frame-rate-and-hdr)) |
+| Keep frame rate in low light | `exposure_dynamic_framerate` | 0 or 1, default 0. This is UVC AE priority; **1 allows the frame rate to drop**. Logi Tune calls it "Low light compensation" (decoded: unit 1, selector `0x03`, 1 byte). No effect on the frame rate in a lit room (measured); untested in the dark. omarchy-broadcast keeps its setting `keep_framerate` ("Keep 30 fps in low light", on is raw 0) and describes it as Logi Tune's "Low light compensation" with the opposite sense |
+| HDR | `backlight_compensation` | 0 or 1, **default 1**. This is UVC backlight compensation; Logi Tune's "HDR" switch is this control (decoded: unit 3, selector `0x01`, 2 bytes, `0000` off, `0100` on). **With it on, 1080p60 MJPEG is capped at 30 fps** (measured, see [Frame rate and HDR](#frame-rate-and-hdr)). omarchy-broadcast labels the setting "HDR" on this camera, with the description "HDR limits the camera to 30 fps" |
 | White balance | `white_balance_automatic`, `white_balance_temperature` | auto default on; 2800 to 7500 K, default 5000 |
 | Brightness, contrast, saturation | `brightness`, `contrast`, `saturation` | 0 to 255, default 128 |
 | Sharpness | `sharpness` | 0 to 255, default 128; measured to change nothing visible in a dim scene (re-check in good light) |
@@ -73,9 +73,9 @@ Little-endian throughout. "Seen" is what Logi Tune was observed writing. "Min, m
 | White balance offset ("temperature compensation") | `49e40215-...` (10) | `0x15` | 1 | about 40 K per step; `0x32` is 0 K; `0x39` = +280 K; seen 36 to 58 | 0, 100, 50 (`0x32`) | Read-verified: the default confirms the zero point |
 | Framing zoom (RightSight companion) | `49e40215-...` (10) | `0x06` | 2 | mirrors V4L2 `zoom_absolute` (same value, range 100 to 400, `100` = 1x); seen `0x64` to `0x89` | 100, 400, 100 | Read-verified: **not a separate control** |
 | Unknown | `49e40215-...` (10) | `0x12` | 1 | reads `0x32`; no Logi Tune control touches it; same shape as the white balance offset, possibly a tint offset (unverified) | 0, 100, 50 | **Do not write** |
-| RightSight on/off | `29144c1f-...` (22) | `0x01` | 30 | byte 1: `00` off, `01` on | none (see below) | Decoded, read on Linux |
-| RightSight framing speed | `29144c1f-...` (22) | `0x01` | 30 | byte 2: `00` slower, `01` default, `02` faster | none | Decoded, read on Linux |
-| RightSight framing distance | `29144c1f-...` (22) | `0x01` | 30 | byte 3: `00` closer, `01` default, `02` farther | none | Decoded, read on Linux |
+| RightSight on/off | `29144c1f-...` (22) | `0x01` | 30 | byte 1: `00` off, `01` on | none (see below) | Decoded, read on Linux; setting it did not start tracking (see below) |
+| RightSight framing speed | `29144c1f-...` (22) | `0x01` | 30 | byte 2: `00` slower, `01` default, `02` faster | none | Decoded, read on Linux; not exposed |
+| RightSight framing distance | `29144c1f-...` (22) | `0x01` | 30 | byte 3: `00` closer, `01` default, `02` farther | none | Decoded, read on Linux; not exposed |
 | Framing pan/tilt (RightSight companion) | `ffe52d21-...` (11) | `0x0c` | 8 | two int32 arc-seconds (pan, tilt), `0, 0` is centre; mirrors V4L2 `pan_absolute` and `tilt_absolute` | +/-72000 each, step 3600 (1 degree), default `0, 0` | Read-verified: **not a separate control** |
 
 The RightSight block (unit 22, selector `0x01`) answers `GET_MIN`, `GET_MAX`, `GET_RES` and `GET_DEF` with the current bytes, so it reports no range of its own; the value sets above come from Logi Tune's captures. Its current content was `01 00 01 01 5a 01` followed by zeros, with RightSight off.
@@ -84,7 +84,9 @@ The RightSight block (unit 22, selector `0x01`) answers `GET_MIN`, `GET_MAX`, `G
 
 Unit 22, selector `0x01`, 30 bytes. Logi Tune always writes the whole block. Byte 0 is constant `01`; bytes 1 to 3 are the settings above; byte 4 read back as `5a` and once as `50`, byte 5 as `01`, bytes 6 to 29 are zero. The meaning of bytes 0, 4 and 5 is unknown, so a writer must **read the block first and change only the documented byte**, never write a fixed block.
 
-When RightSight is switched on, and after each distance change (not after a speed change), Logi Tune also writes two companion controls (unit 10 selector `0x06`, unit 11 selector `0x0c`). Read on Linux, these mirror the standard V4L2 `zoom_absolute` and `pan_absolute`/`tilt_absolute` controls exactly (same value, range and step), so the companion writes are the standard zoom, pan and tilt and need no extension-unit access. During 20 s of movement Logi Tune sent only three framing writes, so tracking appears to run inside the camera and the companion writes look like a starting frame. Whether the camera tracks without that starting frame is an open question.
+When RightSight is switched on, and after each distance change (not after a speed change), Logi Tune also writes two companion controls (unit 10 selector `0x06`, unit 11 selector `0x0c`). Read on Linux, these mirror the standard V4L2 `zoom_absolute` and `pan_absolute`/`tilt_absolute` controls exactly (same value, range and step), so the companion writes are the standard zoom, pan and tilt and need no extension-unit access. During 20 s of movement Logi Tune sent only three framing writes, so the companion writes look like a starting frame, sent occasionally.
+
+**Measured (2026-11-14): the block alone does not make the camera track.** On Linux, setting the block's on byte (byte 1), and also writing Logi Tune's centred starting frame through the standard zoom, pan and tilt controls, did not make the camera follow a moving subject: in two 30 s recordings the picture never followed. The likely explanation is that the block stores the RightSight *preference* (the camera's face button toggles the same byte), while Logi Tune does the face tracking on the PC and sends zoom and pan targets only now and then, which is what the three framing writes in 20 s of movement look like. omarchy-broadcast therefore does not expose the block or the companion controls as RightSight settings; the face-following stage of omarchy-broadcast replaces the feature (see [Support in omarchy-broadcast](#support-in-omarchy-broadcast)). The block stays documented here for reference. Interface revisions 24 to 26 of omarchy-broadcast did publish it as three settings, which revision 27 removed ([dbus-api.md](../dbus-api.md#logitech-extension-unit-settings-revision-24)).
 
 ### Safety rule
 
@@ -156,8 +158,8 @@ Measured unless noted.
 | JPEG | The MJPEG stream is 4:2:2; some hardware JPEG decoders reject it. |
 | Colour range | YUYV and NV12 are **limited range, as labelled** (black at 16, highlights stop at 235), re-measured in two different scenes; MJPEG decodes to full range. Software that relabels this camera's raw modes as full range washes the picture out. |
 | Field of view, zoom, pan, tilt | Work as above. Pan and tilt are a digital crop, not a motor. |
-| Show Mode (auto-flip) | The image flips in the camera when it is tilted down to a desk, with no host software. The orientation is reported on the HID interface, report `0x55` (vendor page `0xFFA1`, 7 bytes including the report ID): byte 5 is `01` flipped and `00` upright, and it can bounce `1/0/1` during the motion. Report `0x0a` (31 bytes, vendor page `0xFF01`) follows each change and is not decoded. During the flip only the inactive `exposure_time_absolute` read-back changed (625 to the default 156 and back), so Show Mode appears to switch the camera's auto-exposure state. |
-| Privacy shutter | Mechanical. Closing it sends no HID report and changes no UVC control; the only sign is a **perfectly flat black frame, luma exactly 16** (limited-range black, min = mean = 16.0), which software can detect. |
+| Show Mode (auto-flip) | The image flips in the camera when it is tilted down to a desk, with no host software. The orientation is reported on the HID interface, report `0x55` (vendor page `0xFFA1`, 7 bytes including the report ID): byte 5 is `01` flipped and `00` upright, and it can bounce `1/0/1` during the motion. Report `0x0a` (31 bytes, vendor page `0xFF01`) follows each change and is not decoded. During the flip only the inactive `exposure_time_absolute` read-back changed (625 to the default 156 and back), so Show Mode appears to switch the camera's auto-exposure state. omarchy-broadcast reads report `0x55` while the camera streams and shows it as the camera's Show Mode status ([Camera status](#camera-status-in-omarchy-broadcast)). |
+| Privacy shutter | Mechanical. Closing it sends no HID report and changes no UVC control; the only sign is a **perfectly flat black frame, luma exactly 16** (limited-range black, min = mean = 16.0), which software can detect; omarchy-broadcast does ([Camera status](#camera-status-in-omarchy-broadcast)). Measured on the raw NV12 and YUYV frames; the black level of the MJPEG stream with the shutter closed has not been measured. |
 | Microphone | `snd-usb-audio`, card "Brio", `S16_LE` stereo at 48, 32 and 16 kHz, UAC terminal type `0x0403` (speakerphone, no echo reduction). Left and right are bit-identical, so the camera sends one mixed channel twice. `Headset Capture Volume` is a hardware gain of +18 to +54 dB in 1 dB steps. Whether beamforming runs is not confirmed. |
 | HID interface | A telephony headset interface (Phone Mute, Hook Switch, Mute LED) plus Logitech vendor reports. No sensor page, so no standard orientation sensor. `hid-input` does not map it, so nothing reaches the desktop. |
 | Settings stored in the camera | Values set by other software persist across power cycles (the field of view read 65 degrees against a default of 90). A consumer that cares should write its own values at every open. |
@@ -194,6 +196,8 @@ omarchy-broadcast reads the camera through `uvcvideo` and publishes a virtual ca
 
 - **Settings tree** for every standard control above, stored per camera and written at every open, plus extension-unit rows for this camera (field of view, and the settings in [Support in omarchy-broadcast](#support-in-omarchy-broadcast); `crates/obc-pipeline/src/xu.rs`).
 - **Camera health:** the delivered frame rate against the nominal one, damaged frames, shared-hub warnings.
+- **Camera status:** whether the privacy shutter is closed (detected from the flat black frames) and which way the camera faces (Show Mode, read from its HID interface), shown as lines such as `Shutter closed` and `Show Mode: desk view`; with an away image chosen, the virtual camera shows it while the shutter is closed. See [Camera status](#camera-status-in-omarchy-broadcast).
+- **Labels:** `backlight_compensation` is shown as "HDR", with a description that says it limits the camera to 30 fps, and `keep_framerate` has a description that names Logi Tune's "Low light compensation" and its opposite sense.
 - **Colour range:** the quirk that treated this camera's raw modes as full range was removed in 0.49.1 after the measurement above.
 - **Anti-flicker default** from the time zone when none is chosen.
 - **Replacements for Logitech features that cannot run on Linux:** RightSight is replaced by a face-following digital pan and zoom stage (needs an NVIDIA GPU and the Maxine AR SDK); the camera's AI microphone suppression by a virtual microphone with Maxine, DeepFilterNet or RNNoise processing; Logitech's apps by one settings tree used by the CLI and the bar panel.
@@ -209,18 +213,32 @@ For this camera only (`046d:0944`), omarchy-broadcast exposes the decoded extens
 | `camera.exposure.exposure_compensation` | integer | 0 to 255, 128 | unit 10, `0x13` |
 | `camera.image.vibrance` | integer | 0 to 255, 128 | unit 10, `0x14` |
 | `camera.white_balance.temperature_compensation` | integer | 0 to 100, 50 (0 K); about 40 K per step | unit 10, `0x15` |
-| `camera.focus.rightsight` | on/off | off | unit 22, `0x01`, byte 1 |
-| `camera.focus.rightsight_speed` | slower, default, faster | default | unit 22, `0x01`, byte 2 |
-| `camera.focus.rightsight_distance` | closer, default, farther | default | unit 22, `0x01`, byte 3 |
+
+The two compensations are shown as offsets from their zero point, with an explicit sign: exposure compensation as `+0` at the default and `-3` at a raw 125, temperature compensation as `+0 K` at the default and `+280 K` at a raw 57. The raw values in the table are what the range, `settings set` and the state file use ([dbus-api.md](../dbus-api.md#the-tree)).
+
+RightSight is not offered (see [The RightSight block](#the-rightsight-block)).
 
 How the settings are guarded:
 
 - **Matched by GUID**, never by unit ID, and only the listed selectors are ever written.
-- **Read before write.** The RightSight rows read the 30-byte block first and change only their own byte, so the bytes whose meaning is unknown are written back unchanged.
+- **Read before write.** A row that names one byte of a longer control reads the whole control first and changes only that byte, so the bytes whose meaning is unknown are written back unchanged. No row of this camera uses it today (it was written for the RightSight block); it is covered by test-only rows.
 - **Unknown values are greyed.** A value the camera reports outside the documented set is shown as unknown and disabled rather than guessed.
 - **Never written:** unit 10 selector `0x12` (unknown), and the framing zoom and pan/tilt selectors, which are the standard zoom, pan and tilt controls and are set through those.
 
-The face-following pan and zoom stage described above remains the replacement for RightSight where the camera's own framing is not wanted or not available.
+The face-following pan and zoom stage described above is the replacement for RightSight.
+
+### Camera status in omarchy-broadcast
+
+Two states of this camera reach the daemon through no standard control, and omarchy-broadcast reads both for this camera only (`046d:0944`); the camera's `CameraHealth` carries them as `shutter`, `show_mode` and `status` ([dbus-api.md](../dbus-api.md#camera-status-revision-26)).
+
+**Privacy shutter.** The shutter sends no signal, so the daemon looks at the picture: a sparse 16 x 9 grid of luma values, sampled at most every 250 ms from the raw frames (on the camera pad) or after the JPEG decoder (MJPEG). The shutter is reported closed after at least 1 s of perfectly flat black (raw: no spread at a mean of 15 to 17, the limited-range black measured above; decoded MJPEG: the same, or no spread at a mean of 1 or less, because the MJPEG black level is unmeasured) and open again at the first frame that is not. A dark room never matches: its frames carry sensor noise, so their luma is not flat. With an away image chosen the virtual camera shows it while the shutter is closed; with none, the camera's black passes through. A closed state is kept across a reopen or a restart of the stream on the same camera.
+
+**Show Mode status.** Not the Show Mode on/off setting above (`camera.focus.show_mode`, which switches the camera's automatic flip), but which way the camera faces now: HID input report `0x55` on the camera's own HID interface, byte 5, `01` facing the desk and `00` upright. The daemon finds the `hidraw` node of this camera's USB device by sysfs (the HID device whose report descriptor declares report `0x55`), and waits for the camera's reports, taking a value once it has held for 1.5 s because it bounces while the camera moves. The orientation is unknown until the camera's first report, which it sends when it is turned. It only reads the reports the camera sends: nothing is written to the HID interface and no request is made of it.
+
+> **Warning: never send `GET_REPORT` for report `0x55`.** Asking the camera for the report's current value (`HIDIOCGINPUT` on the `hidraw` node, a USB `GET_REPORT` control request, 64-byte buffer) hangs its firmware. Measured: the first request returned 0 bytes, the next three timed out (`ETIMEDOUT`), the fifth failed with `EPROTO`, and the camera then stopped answering and dropped off USB (`device not responding to setup address`); in a full daemon run the same request coincided with the Thunderbolt xHCI host controller dying (`HC died`). Read the interrupt-IN reports only.
+
+- **Only while the camera streams.** An open `hidraw` node makes the HID driver ask for remote wakeup, which this camera does not support, so an open node would keep it from suspending when idle. The Show Mode status is therefore unknown (`""`) whenever the camera is not streaming.
+- **Read access to the node is needed.** A `hidraw` node is readable by root only by default. When the daemon cannot open it, the status stays unknown and one warning per camera names the node and says that read access is needed, for example through a udev rule that tags the node `uaccess`. The Arch package ships one for this camera, `/usr/lib/udev/rules.d/70-omarchy-broadcast-mx-brio.rules` (in a checkout, `dist/udev/70-omarchy-broadcast-mx-brio.rules`): it matches the `hidraw` nodes of USB `046d:0944` and nothing else, and systemd-logind then gives the user of the active local seat an ACL on the node, read and write. The daemon opens it read-only and never writes. A per-user or manual install copies the rule with root ([daemon.md](../setup/daemon.md#the-udev-rule-for-the-mx-brio)); a camera that is already connected needs a replug for the rule to apply.
 
 ## Feature status
 
@@ -228,22 +246,22 @@ The face-following pan and zoom stage described above remains the replacement fo
 |---|---|---|
 | 4K30 (MJPEG), 1440p, 1080p60, 720p60 | Yes | Works |
 | Exposure, shutter, gain, white balance, brightness, contrast, saturation, sharpness, focus, anti-flicker | Yes, standard controls | Works |
-| HDR switch | `backlight_compensation` | Works (relabel only); on caps 1080p60 at 30 fps |
-| Low light compensation | `exposure_dynamic_framerate` | Works (relabel only); effect on frame rate in the dark untested |
+| HDR switch | `backlight_compensation` | Works, labelled "HDR" with a description in omarchy-broadcast; on caps 1080p60 at 30 fps |
+| Low light compensation | `exposure_dynamic_framerate` | Works, described in omarchy-broadcast as the opposite sense of "Keep 30 fps in low light"; effect on frame rate in the dark untested |
 | Field of view | Extension unit, selector `0x05` | Works |
 | Digital zoom, pan, tilt | Yes | Works |
 | Show Mode auto-flip | Runs in the camera | Works |
+| Show Mode status (desk view or normal) | HID report `0x55`, byte 5 | Supported in omarchy-broadcast, read-only and only while streaming; needs read access to the camera's `hidraw` node, which the udev rule shipped with the Arch package gives the user of the active seat |
 | Show Mode on/off | XU `0x0d` | Read-verified, in omarchy-broadcast; writes pending |
 | Exposure compensation | XU `0x13` | Read-verified, in omarchy-broadcast; writes pending |
 | Vibrance | XU `0x14` | Read-verified, in omarchy-broadcast; writes pending |
 | White balance offset | XU `0x15` | Read-verified, in omarchy-broadcast; writes pending |
-| RightSight on/off, speed, distance | XU block, unit 22 | Decoded, read on Linux, in omarchy-broadcast; writes pending; tracking appears to run in the camera |
-| RightSight starting frame (zoom, pan, tilt) | Standard `zoom_absolute`, `pan_absolute`, `tilt_absolute` | Works |
+| RightSight auto-framing | XU block, unit 22, plus standard zoom, pan and tilt | Not supported: tracking runs in Logi Tune on the host; the camera's flag alone does nothing (measured, see [The RightSight block](#the-rightsight-block)) |
 | RightSight auto-framing without the camera | Replaced by a host-side stage | Replaced |
 | AI microphone noise suppression | Not reachable | Replaced by a virtual microphone |
 | Microphone, hardware gain | Yes | Works |
 | Beamforming, AI face-based enhancement | Not confirmed | Unknown |
-| Shutter state to the OS | Flat-frame detection only | Missing as a signal; detectable in software |
+| Shutter state to the OS | Flat-frame detection only | Missing as a signal; detected from the frames in omarchy-broadcast (`Shutter closed`, and the away image shown while closed) |
 | Tint | Not offered by Logitech's software for this camera, despite firmware notes; unit 10 selector `0x12` may be it (unverified) | Missing |
 | Presets | Software side only; Logitech's filters are host-side presets of standard controls | Partial |
 | LED mode control | See below | Missing, on purpose |
@@ -261,10 +279,11 @@ The face-following pan and zoom stage described above remains the replacement fo
 ## Open questions
 
 1. Exposure compensation: how much exposure one step is worth (EV per step). The range is settled (0 to 255, default 128, step 1).
-2. RightSight: does the camera start tracking without the starting frame (zoom, pan and tilt set to the values Logi Tune writes)? What are block bytes 0, 4 and 5?
+2. RightSight: is the tracking done only by Logi Tune on the host, as the capture and the measurement suggest? What are block bytes 0, 4 and 5?
 3. Unit 10 selector `0x12` (0 to 100, default 50): meaning unknown, possibly a tint offset; never written.
 4. Frame rate in the dark: with HDR off, does low light compensation (`exposure_dynamic_framerate`) or the camera's auto exposure still lower the rate, and is that the cause of the 20 fps seen in a dim room?
 5. Whether writes to the decoded extension-unit controls behave on Linux as they do under Logi Tune. This page will be updated as each is verified.
+6. The black level of the MJPEG stream with the privacy shutter closed: the raw frames are luma 16, but the decoded MJPEG may be 16 or the full-range 0 (omarchy-broadcast accepts both until it is measured).
 
 Settled by read-only queries on Linux (2026-11-14): all eight extension-unit GUIDs match; the white balance offset zero point is `0x32` (50); the ranges and defaults of the single-byte controls (table above); the companion writes are the standard zoom, pan and tilt; HDR, not low light compensation, caps 1080p60 MJPEG at 30 fps in a lit room.
 

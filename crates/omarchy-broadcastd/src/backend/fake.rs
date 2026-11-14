@@ -513,12 +513,31 @@ pub struct World {
     pub watch_stops: u32,
     /// Starting a watcher fails with this.
     pub fail_watch: Option<String>,
+    /// The orientation watcher that runs: (camera id, its report).
+    pub orientation_watch: Option<(String, obc_pipeline::quirks::OrientationReport)>,
+    /// The generation of the last orientation watcher started (0: none
+    /// yet).
+    pub orientation_generation: WatchGeneration,
+    pub orientation_starts: u32,
+    /// Running orientation watchers stopped (alone or replaced).
+    pub orientation_stops: u32,
+    /// Starting an orientation watcher fails with this (a node that is
+    /// missing or cannot be read).
+    pub fail_orientation: Option<String>,
     /// What `ingest_health` reports as the delivered rate while an ingest
     /// runs.
     pub delivered_fps: Option<f64>,
     /// What `ingest_health` reports as the damaged frames dropped while an
     /// ingest runs (the test raises them as the stream goes).
     pub corrupt: obc_pipeline::frame_guard::CorruptFrames,
+    /// What `ingest_health` reports of the camera's privacy shutter while
+    /// an ingest runs.
+    pub shutter: Option<obc_pipeline::ShutterState>,
+    /// The writer's mask ([`MediaBackend::set_mask`]), kept across writers
+    /// as the real backend keeps it.
+    pub mask: bool,
+    /// Every `set_mask` that changed it, in order.
+    pub mask_sets: Vec<bool>,
     /// Where each camera sits on the USB bus (`usb_placement`), by id; a
     /// camera without an entry is not on USB.
     pub placements: std::collections::HashMap<String, obc_pipeline::UsbPlacement>,
@@ -667,8 +686,16 @@ impl Default for World {
             watch_starts: 0,
             watch_stops: 0,
             fail_watch: None,
+            orientation_watch: None,
+            orientation_generation: 0,
+            orientation_starts: 0,
+            orientation_stops: 0,
+            fail_orientation: None,
             delivered_fps: None,
             corrupt: obc_pipeline::frame_guard::CorruptFrames::default(),
+            shutter: None,
+            mask: false,
+            mask_sets: Vec::new(),
             placements: std::collections::HashMap::new(),
             placement_reads: 0,
             time_zone: None,
@@ -1118,6 +1145,14 @@ impl MediaBackend for FakeBackend {
         }
     }
 
+    fn set_mask(&mut self, on: bool) {
+        let mut w = self.world();
+        if w.mask != on {
+            w.mask = on;
+            w.mask_sets.push(on);
+        }
+    }
+
     fn output_placeholder_failure(&mut self) -> Option<String> {
         let w = self.world();
         let (params, _) = w.session.as_ref()?;
@@ -1514,6 +1549,29 @@ impl MediaBackend for FakeBackend {
         }
     }
 
+    fn watch_orientation(
+        &mut self,
+        camera: &Camera,
+        report: obc_pipeline::quirks::OrientationReport,
+    ) -> Result<WatchGeneration, String> {
+        self.unwatch_orientation();
+        let mut w = self.world();
+        w.orientation_starts += 1;
+        if let Some(e) = w.fail_orientation.clone() {
+            return Err(e);
+        }
+        w.orientation_generation += 1;
+        w.orientation_watch = Some((camera.id.clone(), report));
+        Ok(w.orientation_generation)
+    }
+
+    fn unwatch_orientation(&mut self) {
+        let mut w = self.world();
+        if w.orientation_watch.take().is_some() {
+            w.orientation_stops += 1;
+        }
+    }
+
     fn ingest_health(&mut self) -> Option<super::IngestHealth> {
         let w = self.world();
         // An ingest runs while the session has a camera.
@@ -1521,6 +1579,7 @@ impl MediaBackend for FakeBackend {
         Some(super::IngestHealth {
             delivered_fps: w.delivered_fps,
             corrupt: w.corrupt,
+            shutter: w.shutter,
         })
     }
 
@@ -1962,7 +2021,7 @@ impl EffectRun {
 
 #[test]
 fn the_fake_offers_and_writes_other_extension_unit_rows() {
-    use obc_pipeline::xu::{RIGHTSIGHT, VIBRANCE};
+    use obc_pipeline::xu::{SHOW_MODE, TEMPERATURE_COMPENSATION, VIBRANCE};
     let mut backend = FakeBackend::default();
     let camera = crate::camera::tests::cam("usb-mx", "MX Brio", Some("046d:0944"), "/dev/video0");
     let mut device = brio_device();
@@ -1973,7 +2032,7 @@ fn the_fake_offers_and_writes_other_extension_unit_rows() {
             default: 128,
         },
         FakeXu {
-            row: &RIGHTSIGHT,
+            row: &SHOW_MODE,
             current: 0,
             default: 0,
         },
@@ -1997,15 +2056,15 @@ fn the_fake_offers_and_writes_other_extension_unit_rows() {
         [
             ("field_of_view", 2, Some("65")),
             ("vibrance", 128, Some("128")),
-            ("rightsight", 0, Some("off")),
+            ("show_mode", 0, Some("off")),
         ]
     );
     node.xu_set(&VIBRANCE, "200").unwrap();
-    node.xu_set(&RIGHTSIGHT, "on").unwrap();
+    node.xu_set(&SHOW_MODE, "on").unwrap();
     assert_eq!(node.xu_current(&VIBRANCE), Ok(200));
-    assert_eq!(node.xu_current(&RIGHTSIGHT), Ok(1));
+    assert_eq!(node.xu_current(&SHOW_MODE), Ok(1));
     assert!(node.xu_set(&VIBRANCE, "256").is_err());
-    assert!(node.xu_set(&obc_pipeline::xu::SHOW_MODE, "on").is_err());
+    assert!(node.xu_set(&TEMPERATURE_COMPENSATION, "60").is_err());
     assert_eq!(
         backend.world().xu_writes,
         [

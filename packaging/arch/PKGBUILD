@@ -69,10 +69,17 @@
 #
 # The C header of the module interface is installed in
 # /usr/include/omarchy-broadcast, for modules built out of tree.
+#
+# A udev rule for the Logitech MX Brio (USB 046d:0944) is installed in
+# /usr/lib/udev/rules.d: it tags the camera's hidraw nodes with uaccess, so
+# that the user of the active local seat gets access to the node, which the
+# daemon reads (read-only, only while streaming) for the Show Mode status. It
+# matches no other device. Replug the camera, or run `udevadm trigger`, to
+# apply it to a camera that is already connected.
 
 pkgname=omarchy-broadcast-git
 _pkgname=omarchy-broadcast
-pkgver=0.51.0
+pkgver=0.52.0
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API and a CLI'
 arch=('x86_64')
@@ -242,6 +249,12 @@ package() {
   # The C header of the module interface, for modules built out of tree.
   install -Dm644 -t "$pkgdir/usr/include/$_pkgname" \
     crates/obc-module-abi/include/omarchy_broadcast_module.h
+
+  # The udev rule that lets the user of the active seat open the MX Brio's
+  # hidraw node (the daemon reads the Show Mode from it). It sorts before
+  # 73-seat-late.rules, where the uaccess tag becomes an ACL.
+  install -Dm644 dist/udev/70-omarchy-broadcast-mx-brio.rules \
+    "$pkgdir/usr/lib/udev/rules.d/70-omarchy-broadcast-mx-brio.rules"
 
   # The project's licences, and the notices that the code statically linked
   # into the CPU voice module and the audio worker requires (nnnoiseless,

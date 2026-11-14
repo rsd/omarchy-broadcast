@@ -268,6 +268,7 @@ pub fn build(inp: &Inputs<'_>) -> Vec<GlobalEntry> {
                 disabled_reason: String::new(),
                 enabled_when: Vec::new(),
                 hint: Some(hint.into()),
+                description: None,
             };
         let mut mode = setting(
             MODE,
@@ -297,6 +298,7 @@ pub fn build(inp: &Inputs<'_>) -> Vec<GlobalEntry> {
                 default: percent(config.blur_strength),
                 value: percent(effect.blur_strength),
                 unit: Some("%".into()),
+                display: None,
             },
             runtime.blur_strength.is_some(),
             "slider",
@@ -462,6 +464,7 @@ fn module_setting(
             default: def,
             value: v,
             unit: unit.clone(),
+            display: None,
         },
         (
             SettingType::Enum { options, .. },
@@ -484,6 +487,7 @@ fn module_setting(
         disabled_reason: reason,
         enabled_when,
         hint: d.hint.clone(),
+        description: None,
     })
 }
 

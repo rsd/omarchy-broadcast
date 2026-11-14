@@ -2559,6 +2559,7 @@ fn settings_tree_of_the_real_camera() {
         open: false,
         fixed_framerate: false,
         hidden: &hidden,
+        usb: None,
     });
     for g in built.groups() {
         eprintln!("{} ({})", g.label, g.id);
@@ -2586,9 +2587,6 @@ fn settings_tree_of_the_real_camera() {
             "camera.exposure.exposure_compensation",
             "camera.image.vibrance",
             "camera.white_balance.temperature_compensation",
-            "camera.focus.rightsight",
-            "camera.focus.rightsight_speed",
-            "camera.focus.rightsight_distance",
         ] {
             assert!(built.get(id).is_some(), "{id}");
         }

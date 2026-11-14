@@ -13,7 +13,8 @@
 //! - a setting: `id` s, `label` s, `type` s, `scope` s, `stored` b,
 //!   `enabled` b, `disabled_reason` s, `enabled_when` a(ssv), then by type
 //!   (int: `min`, `max`, `step`, `default`, `value` x and an optional
-//!   `unit` s; bool: `default`, `value` b; enum: `options` a(ss),
+//!   `unit` s, and from revision 27 an optional `display_offset` x and
+//!   `display_scale` x ([`IntDisplay`]); bool: `default`, `value` b; enum: `options` a(ss),
 //!   `default`, `value` s; action: none), and an optional `hint` s;
 //! - `SettingsChanged(u revision, u serial, a(sa{sv}) changes)`, a change
 //!   being `(id, {value v, stored b, enabled b, disabled_reason s})`, with
@@ -220,6 +221,9 @@ pub enum SettingKind {
         value: i64,
         /// A unit to show after the value (`K`, `×100 µs`), if any.
         unit: Option<String>,
+        /// How a client shows the value (revision 27), if not as it is:
+        /// `min`, `max`, `step`, `default` and `value` stay raw.
+        display: Option<IntDisplay>,
     },
     /// `type` `enum`: one of `options`, each `(value id, label)`; `default`
     /// and `value` are option value ids.
@@ -233,6 +237,51 @@ pub enum SettingKind {
     /// A type this crate does not know, by its wire name. Clients skip such
     /// a setting.
     Unknown(String),
+}
+
+/// How a client shows the raw value of an int setting:
+/// `(value - offset) * scale` with an explicit sign, then the unit (`+0`,
+/// `-3`, `+280 K`). Only for display: what a client writes, and every
+/// number of the setting, stays raw. On the bus `display_offset` x and
+/// `display_scale` x (revision 27); a setting without them is shown as it
+/// is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntDisplay {
+    /// The raw value shown as 0.
+    pub offset: i64,
+    /// What one raw step is in the shown unit (> 0).
+    pub scale: i64,
+}
+
+impl IntDisplay {
+    /// The shown number of the raw value `raw`: `(raw - offset) * scale`
+    /// (saturating).
+    pub fn shown(&self, raw: i64) -> i64 {
+        raw.saturating_sub(self.offset).saturating_mul(self.scale)
+    }
+
+    /// The shown text of `raw`: the signed number (`+0`, `-3`, `+280`),
+    /// then a space and `unit` when there is one (`+280 K`).
+    pub fn format(&self, raw: i64, unit: Option<&str>) -> String {
+        let n = self.shown(raw);
+        match unit {
+            Some(u) if !u.is_empty() => format!("{n:+} {u}"),
+            _ => format!("{n:+}"),
+        }
+    }
+
+    /// The transform of a setting dictionary: `None` without a
+    /// `display_offset`, with one of the wrong type, or with a
+    /// `display_scale` of the wrong type or not above 0; an absent
+    /// `display_scale` is 1.
+    fn from_entries(e: &Entries<'_, '_>) -> Option<IntDisplay> {
+        let offset = get_int(e, "display_offset")?;
+        let scale = match e.get("display_scale") {
+            None => 1,
+            Some(_) => get_int(e, "display_scale")?,
+        };
+        (scale > 0).then_some(IntDisplay { offset, scale })
+    }
 }
 
 impl SettingKind {
@@ -290,11 +339,16 @@ pub struct Setting {
     /// A widget suggestion: `slider` (int), `switch` (bool), `segmented`
     /// (enum).
     pub hint: Option<String>,
+    /// A sentence for people (revision 26): what the setting does or what
+    /// it is called elsewhere. `None` (no `description` key) when there is
+    /// nothing to add to the label.
+    pub description: Option<String>,
 }
 
 impl Setting {
     /// The setting dictionary: every common key, the keys of its type, and
-    /// `unit` and `hint` when set. A [`SettingKind::Unknown`] writes its
+    /// `unit`, `display_offset` and `display_scale`, `hint` and
+    /// `description` when set. A [`SettingKind::Unknown`] writes its
     /// type name and no type key.
     pub fn to_dict(&self) -> VariantDict {
         let mut d = VariantDict::new();
@@ -327,6 +381,7 @@ impl Setting {
                 default,
                 value,
                 unit,
+                display,
             } => {
                 put(&mut d, "min", Variant::from(*min));
                 put(&mut d, "max", Variant::from(*max));
@@ -335,6 +390,10 @@ impl Setting {
                 put(&mut d, "value", Variant::from(*value));
                 if let Some(unit) = unit {
                     put(&mut d, "unit", Variant::from(unit.as_str()));
+                }
+                if let Some(display) = display {
+                    put(&mut d, "display_offset", Variant::from(display.offset));
+                    put(&mut d, "display_scale", Variant::from(display.scale));
                 }
             }
             SettingKind::Enum {
@@ -355,13 +414,17 @@ impl Setting {
         if let Some(hint) = &self.hint {
             put(&mut d, "hint", Variant::from(hint.as_str()));
         }
+        if let Some(description) = &self.description {
+            put(&mut d, "description", Variant::from(description.as_str()));
+        }
         d
     }
 
     /// The setting a dictionary describes, or `None` when it is malformed:
     /// a common key or a key of its (known) type missing or of the wrong
     /// type, or an id that is not a [`valid_setting_id`]. Unknown keys are
-    /// ignored; a `unit` or `hint` of the wrong type is read as absent; a
+    /// ignored; a `unit`, `hint` or `description` of the wrong type is read as absent, and so
+    /// is a display transform of the wrong type or with a scale not above 0; a
     /// condition or an option that does not decode is dropped alone.
     pub fn from_dict(dict: &VariantDict) -> Option<Setting> {
         Setting::from_entries(&entries_of_dict(dict))
@@ -385,6 +448,7 @@ impl Setting {
                 default: get_int(e, "default")?,
                 value: get_int(e, "value")?,
                 unit: get_str(e, "unit").map(str::to_string),
+                display: IntDisplay::from_entries(e),
             },
             "enum" => SettingKind::Enum {
                 options: list_of(e.get("options")?)?
@@ -421,6 +485,7 @@ impl Setting {
             disabled_reason: get_str(e, "disabled_reason")?.to_string(),
             enabled_when,
             hint: get_str(e, "hint").map(str::to_string),
+            description: get_str(e, "description").map(str::to_string),
         })
     }
 }
@@ -770,6 +835,7 @@ mod tests {
             disabled_reason: String::new(),
             enabled_when: Vec::new(),
             hint: None,
+            description: None,
         }
     }
 
@@ -783,6 +849,7 @@ mod tests {
                 default: 4000,
                 value: 5000,
                 unit: Some("K".into()),
+                display: None,
             },
         );
         temp.enabled = false;
@@ -803,6 +870,7 @@ mod tests {
                 default: i64::MIN,
                 value: -1,
                 unit: None,
+                display: None,
             },
         );
         exposure.enabled_when = vec![
@@ -975,6 +1043,22 @@ mod tests {
     }
 
     #[test]
+    fn a_description_round_trips_and_is_absent_when_none() {
+        let mut s = base("camera.image.backlight_compensation", SettingKind::Action);
+        assert!(!s.to_dict().contains_key("description"));
+        assert_eq!(Setting::from_dict(&s.to_dict()).unwrap().description, None);
+        s.description = Some("HDR limits the camera to 30 fps".into());
+        let d = s.to_dict();
+        assert!(d.contains_key("description"));
+        assert_eq!(Setting::from_dict(&d), Some(s.clone()));
+        assert_eq!(over_the_wire(&d), d);
+        // A description of the wrong type is read as absent.
+        let mut bad = d.clone();
+        bad.insert("description".into(), to_owned(&7u32));
+        assert_eq!(Setting::from_dict(&bad).unwrap().description, None);
+    }
+
+    #[test]
     fn a_global_tree_without_a_camera_round_trips() {
         let mut mode = base(
             "effect.background.mode",
@@ -1135,6 +1219,113 @@ mod tests {
         let got = Setting::from_dict(&d).unwrap();
         assert_eq!(got.hint, None);
         assert!(matches!(got.kind, SettingKind::Int { unit: None, .. }));
+    }
+
+    /// The MX Brio's temperature compensation as the daemon publishes it:
+    /// raw 0..=100, 50 is 0 K, 40 K a step.
+    fn compensation() -> Setting {
+        base(
+            "camera.white_balance.temperature_compensation",
+            SettingKind::Int {
+                min: 0,
+                max: 100,
+                step: 1,
+                default: 50,
+                value: 57,
+                unit: Some("K".into()),
+                display: Some(IntDisplay {
+                    offset: 50,
+                    scale: 40,
+                }),
+            },
+        )
+    }
+
+    #[test]
+    fn a_display_transform_is_two_int_keys_and_round_trips() {
+        let s = compensation();
+        let d = s.to_dict();
+        let sig = |k: &str| d[k].value_signature().to_string();
+        assert_eq!(
+            (sig("display_offset"), sig("display_scale")),
+            ("x".into(), "x".into())
+        );
+        assert_eq!(i64::try_from(&d["display_offset"]).unwrap(), 50);
+        assert_eq!(i64::try_from(&d["display_scale"]).unwrap(), 40);
+        // The numbers stay raw.
+        assert_eq!(i64::try_from(&d["value"]).unwrap(), 57);
+        assert_eq!(i64::try_from(&d["min"]).unwrap(), 0);
+        assert_eq!(Setting::from_dict(&d).as_ref(), Some(&s));
+        assert_eq!(Setting::from_dict(&over_the_wire(&d)).as_ref(), Some(&s));
+        // None: neither key.
+        let plain = &every_type()[0];
+        let d = plain.to_dict();
+        assert!(!d.contains_key("display_offset") && !d.contains_key("display_scale"));
+    }
+
+    #[test]
+    fn a_display_transform_is_decoded_tolerantly() {
+        let display = |d: &VariantDict| match Setting::from_dict(d).unwrap().kind {
+            SettingKind::Int { display, .. } => display,
+            k => panic!("{k:?}"),
+        };
+        let s = compensation();
+        // No scale: 1. Any integer type.
+        let mut d = s.to_dict();
+        d.remove("display_scale");
+        d.insert("display_offset".into(), owned(Variant::from(128u16)));
+        assert_eq!(
+            display(&d),
+            Some(IntDisplay {
+                offset: 128,
+                scale: 1
+            })
+        );
+        // A wrong-typed offset or scale, or a scale not above 0: none, and
+        // the setting itself still decodes.
+        for (key, bad) in [
+            ("display_offset", Variant::from("50")),
+            ("display_offset", Variant::from(true)),
+            ("display_scale", Variant::from("40")),
+            ("display_scale", Variant::from(0i64)),
+            ("display_scale", Variant::from(-40i64)),
+            ("display_scale", Variant::from(u64::MAX)),
+        ] {
+            let mut d = s.to_dict();
+            d.insert(key.into(), owned(bad.clone()));
+            assert_eq!(display(&d), None, "{key} {bad:?}");
+        }
+        // A scale without an offset: none.
+        let mut d = s.to_dict();
+        d.remove("display_offset");
+        assert_eq!(display(&d), None);
+    }
+
+    #[test]
+    fn a_display_transform_shows_a_signed_number_then_the_unit() {
+        let t = IntDisplay {
+            offset: 50,
+            scale: 40,
+        };
+        assert_eq!(t.shown(57), 280);
+        assert_eq!(t.shown(50), 0);
+        assert_eq!(t.shown(0), -2000);
+        assert_eq!(t.format(57, Some("K")), "+280 K");
+        assert_eq!(t.format(49, Some("K")), "-40 K");
+        assert_eq!(t.format(50, Some("K")), "+0 K");
+        let e = IntDisplay {
+            offset: 128,
+            scale: 1,
+        };
+        assert_eq!(e.format(128, None), "+0");
+        assert_eq!(e.format(125, None), "-3");
+        assert_eq!(e.format(255, Some("")), "+127");
+        // Saturating, never a panic.
+        let big = IntDisplay {
+            offset: i64::MIN,
+            scale: i64::MAX,
+        };
+        assert_eq!(big.shown(i64::MAX), i64::MAX);
     }
 
     #[test]
