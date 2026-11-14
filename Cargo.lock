@@ -29,6 +29,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "alsa"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3f93573e7ddb15145d27c58c0fa0a452faad9f5452ac17ed4554ea035ea9b71"
+dependencies = [
+ "alsa-sys",
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
+name = "alsa-sys"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0320138053ef93099f168102c37b46ac0b9c53affc56ef7696633ad5477e2be"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "annotate-snippets"
 version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -811,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "gst-obc"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "gstreamer",
  "gstreamer-app",
@@ -1439,21 +1462,21 @@ dependencies = [
 
 [[package]]
 name = "obc-audio"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "obc-backend"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "obc-backend-maxine"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "libc",
  "libloading 0.8.9",
@@ -1464,7 +1487,7 @@ dependencies = [
 
 [[package]]
 name = "obc-core"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -1474,7 +1497,7 @@ dependencies = [
 
 [[package]]
 name = "obc-gpu"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "libloading 0.8.9",
  "obc-backend",
@@ -1483,7 +1506,7 @@ dependencies = [
 
 [[package]]
 name = "obc-ipc"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "futures-util",
  "serde",
@@ -1494,7 +1517,7 @@ dependencies = [
 
 [[package]]
 name = "obc-mic-shim"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "libc",
  "obc-audio",
@@ -1509,7 +1532,7 @@ dependencies = [
 
 [[package]]
 name = "obc-module-afx"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "libloading 0.8.9",
  "obc-backend",
@@ -1521,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "obc-module-host"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "libloading 0.8.9",
  "obc-backend",
@@ -1534,7 +1557,7 @@ dependencies = [
 
 [[package]]
 name = "obc-module-maxine"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "obc-backend",
  "obc-backend-maxine",
@@ -1548,7 +1571,7 @@ dependencies = [
 
 [[package]]
 name = "obc-module-maxine-ar"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "libc",
  "libloading 0.8.9",
@@ -1563,7 +1586,7 @@ dependencies = [
 
 [[package]]
 name = "obc-module-onnx"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "libloading 0.9.0",
  "obc-backend",
@@ -1589,7 +1612,7 @@ dependencies = [
 
 [[package]]
 name = "obc-module-voice-cpu"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "deep_filter",
  "ndarray 0.15.6",
@@ -1603,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "obc-pipeline"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1636,7 +1659,7 @@ dependencies = [
 
 [[package]]
 name = "omarchy-broadcast"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1651,8 +1674,9 @@ dependencies = [
 
 [[package]]
 name = "omarchy-broadcast-audiod"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
+ "alsa",
  "libc",
  "obc-audio",
  "obc-backend",
@@ -1669,7 +1693,7 @@ dependencies = [
 
 [[package]]
 name = "omarchy-broadcastd"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "anyhow",
  "clap",

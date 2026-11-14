@@ -606,6 +606,20 @@ pub const CORE_KEYS: &[KeySpec] = &[
         apply: Apply::Reload,
     },
     KeySpec {
+        key: MIC_HARDWARE_GAIN,
+        group: "mic",
+        label: "Microphone hardware gain",
+        description: "The USB microphone's own capture gain, set when it appears. Unset leaves it as it is. The input volume in PipeWire moves it too.",
+        kind: SpecKind::Float {
+            min: crate::config::limits::MIN_MIC_HARDWARE_GAIN_DB,
+            max: crate::config::limits::MAX_MIC_HARDWARE_GAIN_DB,
+            step: 0.5,
+            unit: "dB",
+        },
+        editable: true,
+        apply: Apply::Live,
+    },
+    KeySpec {
         key: "mic.force_conflicts",
         group: "mic",
         label: "Stack conflicting effects",
@@ -682,6 +696,10 @@ pub const VIDEO_MEMORY: &str = "video.memory";
 /// and whose notice is [`RegistryFacts::battery_saver_notice`]; not
 /// enabled unless `video.memory` is `auto`.
 pub const BATTERY_SAVER: &str = "video.battery_saver";
+/// `mic.hardware_gain_db`, which may be unset: unset, its row has no
+/// default and the value 0 dB, from no file (`source` empty); the device
+/// keeps its own gain then.
+pub const MIC_HARDWARE_GAIN: &str = "mic.hardware_gain_db";
 
 /// The description of `effect.privacy`.
 const PRIVACY_NOTE: &str = "Off shows the camera as it is when the requested effect cannot run: refused, failed, its module lost, or still loading at a start. On hides it.";
@@ -1050,6 +1068,9 @@ pub fn config_schema(set: &ConfigSet, facts: &RegistryFacts) -> Vec<ConfigGroup>
         let value = match spec.key {
             PRIVACY => ConfigValue::Bool(effect.privacy_on()),
             PRIVACY_MODE => ConfigValue::Str(effect.privacy_mode_in_force().as_str().to_string()),
+            MIC_HARDWARE_GAIN => {
+                ConfigValue::Float(set.config.mic.hardware_gain_db.unwrap_or_default())
+            }
             _ => value_in(&current, spec.key, &kind),
         };
         let source = set.source(spec.key);
@@ -1062,6 +1083,8 @@ pub fn config_schema(set: &ConfigSet, facts: &RegistryFacts) -> Vec<ConfigGroup>
         }
         let default = match (&kind, value_in(&defaults, spec.key, &kind)) {
             (RowKind::Path, ConfigValue::Str(s)) if s.is_empty() => None,
+            // Unset by default: no value to go back to.
+            _ if spec.key == MIC_HARDWARE_GAIN => None,
             (_, d) => Some(d),
         };
         let choice = set.config.video.memory;

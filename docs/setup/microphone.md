@@ -137,6 +137,7 @@ The settings are in the settings tree, which `omarchy-broadcast settings` shows 
 |---|---|
 | `mic.input.enabled` ("Noise and echo processing") | The master switch. Off, the microphone's audio passes unchanged, at the same delay: never muted |
 | `mic.input.device` ("Input device") | The microphone captured (above) |
+| `mic.input.hardware_gain_db` ("Hardware gain", in dB; daemon interface revision 25) | The capture gain of a USB microphone's own mixer, in the range the device reports. Offered only while the microphone captured is a USB device with one capture volume control; [Hardware gain](#hardware-gain-of-a-usb-microphone) |
 | `mic.input.make_default`, `mic.input.restore_default` | The actions behind `mic default` and `mic restore-default` |
 | `mic.noise.enabled` ("Noise removal") | Noise removal on or off |
 | `mic.noise.strength` ("Strength", 0 to 100 %) | How much noise goes. One control for every provider of noise removal: each engine maps it its own way. 100 % is the strongest. Applies live, with no break in the sound |
@@ -150,6 +151,20 @@ omarchy-broadcast settings set mic.input.enabled off     # raw audio through the
 ```
 
 A module installed later adds its own settings to the same page (the GPU module's switch and strength for room echo removal, for instance), and a setting that cannot be changed now is shown with the reason.
+
+### Hardware gain of a USB microphone
+
+A USB microphone has its own capture gain, applied in the device before any software sees the sound. `mic.input.hardware_gain_db` sets it in whole dB, within the range the device reports (the Logitech MX Brio's `Headset` control, for example, runs from +18 to +54 dB in 1 dB steps):
+
+```sh
+omarchy-broadcast settings set mic.input.hardware_gain_db 36
+omarchy-broadcast config set mic.hardware_gain_db 36.0    # the same, as a configuration key
+```
+
+- The setting appears only when the microphone being captured is a USB audio device whose card has one capture volume control. With several, the control is taken only when it is named `Mic`, `Headset`, `Capture` or `Microphone`; otherwise the setting is absent rather than a guess. A value outside the device's range is refused.
+- The gain is applied when you set it (setting the same value again applies it again), and each time the microphone appears: plugging it in, the worker starting, the mic host starting. While `hardware_gain_db` is unset, which is the default, the gain of the device is never touched. Changes made elsewhere are followed, so the setting shows the device's gain.
+- **It is the same control as the source's volume in PipeWire.** PipeWire's ALSA profile binds this hardware control to the volume of the physical microphone: changing that volume (`wpctl set-volume`, a volume slider) changes the hardware gain, and the other way round. The last writer wins. The setting pins the gain at the moments it is applied and does not fight a change you make in between. This is the reason to have it: once the Omarchy Broadcast Mic is the default source, the system's volume slider moves the volume of the virtual microphone, not that of the physical one.
+- A write that fails is tried again only when the microphone, the value or an ALSA event from the card changes, not on a timer. If the daemon restarts while the audio worker keeps running, the worker applies the configured gain once more, overriding a change made meanwhile through the source's volume.
 
 ### Choosing the engine
 
@@ -174,6 +189,7 @@ The `[mic]` keys are in [config.example.toml](../config.example.toml); the panel
 | `idle_exit_s` | `30` | Seconds with no audio from the source and no call from the daemon or the panel before the worker exits and frees its memory (and a GPU); 0 never exits |
 | `gpu_warm_s` | `30` | Seconds after the last application stops recording that the GPU stages (for instance studio voice) stay loaded, so the next recording starts with them already processing instead of waiting for the model to load; 0 to 86400, 0 drops them at once. The worker does not exit while they are kept, so a value above `idle_exit_s` keeps the worker, and the GPU, awake that much longer ([below](#what-it-does-with-the-gpu)) |
 | `gpu_policy` | `"always"` | When a GPU module may be used: `always`, `with-camera` (only in a microphone session that starts while the camera runs) or `never`. A stage the GPU may not run runs on the best CPU module that offers it. A level meter alone never wakes the GPU |
+| `hardware_gain_db` | unset | The capture gain of a USB microphone, in dB; unset never touches the device's gain ([below](#hardware-gain-of-a-usb-microphone)) |
 | `force_conflicts` | `false` | Run effects that their modules declare as excluding each other, together (studio voice with noise or room echo removal, [below](#studio-voice-excludes-noise-and-echo-removal)). For testing; set in a file |
 
 Which module provides a stage is chosen as for video: by rank, by the backend profile (`omarchy-broadcast modules profile battery` prefers a CPU module over a GPU one) and by pin (`omarchy-broadcast modules pin mic-denoise MODULE`). `omarchy-broadcast modules` lists the audio modules with their stages next to the video ones.
@@ -329,6 +345,7 @@ journalctl --user -u omarchy-broadcastd                                # the dae
 ## What it touches
 
 - **PipeWire and WirePlumber.** Only on your explicit actions: `mic default` writes WirePlumber's default-source setting (`default.configured.audio.source` in its `default` metadata) and sets the target of the capture stream, which WirePlumber stores in its own saved state for that stream (restore-stream). `mic restore-default`, and `mic off` when the Omarchy Broadcast Mic is the default, write the default back in two steps, both to `default.configured.audio.source`: first a connected hardware microphone, then the remembered default microphone; then they delete the target. The first step keeps a hardware microphone more recent than the Omarchy Broadcast Mic in WirePlumber's history of configured defaults, so that the Omarchy Broadcast Mic does not become the default by itself when the remembered microphone is unplugged. If no other microphone is connected, only the remembered one is written. Nothing else is written to WirePlumber, and your own WirePlumber configuration files are never touched.
+- **The microphone's ALSA mixer.** The audio worker reads the capture control of the captured USB microphone, and listens for its changes, to offer the hardware gain setting. It writes that one control only when `[mic] hardware_gain_db` is set (it is unset by default), on the occasions above, and never changes any other control.
 - **Files.** `config.d/50-panel.toml` (the daemon's managed drop-in, with `[mic]`), the daemon's state file (the previous default microphone and the module settings), `audio-settings.json` and `audio-modules-crash.json` in the state directory, the worker's socket in `$XDG_RUNTIME_DIR/omarchy-broadcast/`, and the installed units, plugin and module. The worker holds audio in memory only; these processes store and send no audio.
 - **The GPU.** A GPU module is loaded only while an application records from the source (a level meter does not count) and the policy allows it; the worker keeps it for `gpu_warm_s` after the last recording, exits after the idle time and releases it. The Maxine audio module's SDK runs in the worker only, with the worker's own `LD_PRELOAD` and library path from its drop-in; the real `/etc/os-release` and the camera daemon are not touched.
 

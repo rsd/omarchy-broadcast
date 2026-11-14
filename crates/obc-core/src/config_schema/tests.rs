@@ -158,6 +158,7 @@ fn the_editable_and_apply_table_is_the_decided_one() {
             "mic.idle_exit_s",
             "mic.gpu_warm_s",
             "mic.gpu_policy",
+            "mic.hardware_gain_db",
             "modules.profile",
         ]
     );
@@ -178,6 +179,7 @@ fn the_editable_and_apply_table_is_the_decided_one() {
                 "mic.device",
                 "mic.idle_exit_s",
                 "mic.gpu_warm_s",
+                "mic.hardware_gain_db",
                 "mic.force_conflicts",
             ]
             .contains(&k.key);
@@ -733,6 +735,7 @@ fn the_mic_rows_carry_their_values_and_take_writes() {
             "mic.idle_exit_s",
             "mic.gpu_warm_s",
             "mic.gpu_policy",
+            "mic.hardware_gain_db",
             "mic.force_conflicts"
         ]
     );
@@ -770,6 +773,55 @@ fn the_mic_rows_carry_their_values_and_take_writes() {
             "mic.gpu_policy",
             &info.kind,
             &ConfigValue::Str("sometimes".into())
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn the_hardware_gain_row_is_unset_by_default_and_takes_a_number() {
+    let (_tmp, set) = load(&[]);
+    let groups = config_schema(&set, &facts());
+    let r = find(&groups, "mic.hardware_gain_db");
+    // Unset: no default, from no file, the device left as it is.
+    assert_eq!(r.value, ConfigValue::Float(0.0));
+    assert_eq!(r.default, None);
+    assert_eq!(r.source, "");
+    assert!(r.editable && r.enabled);
+    assert_eq!(r.apply, Apply::Live);
+    assert_eq!(
+        r.kind,
+        RowKind::Float {
+            min: -100.0,
+            max: 100.0,
+            step: 0.5,
+            unit: Some("dB".into()),
+        }
+    );
+    let (_tmp, set) = load(&[(MANAGED_REL, "[mic]\nhardware_gain_db = 38.0\n")]);
+    let groups = config_schema(&set, &facts());
+    let r = find(&groups, "mic.hardware_gain_db");
+    assert_eq!(r.value, ConfigValue::Float(38.0));
+    assert_eq!(r.default, None);
+    assert_eq!(r.source, MANAGED_REL);
+    let info = lookup("mic.hardware_gain_db", &RegistryFacts::default()).unwrap();
+    assert_eq!(
+        to_toml("mic.hardware_gain_db", &info.kind, &ConfigValue::Int(40)),
+        Ok(toml::Value::Float(40.0))
+    );
+    assert!(
+        to_toml(
+            "mic.hardware_gain_db",
+            &info.kind,
+            &ConfigValue::Float(f64::NAN)
+        )
+        .is_err()
+    );
+    assert!(
+        to_toml(
+            "mic.hardware_gain_db",
+            &info.kind,
+            &ConfigValue::Str("loud".into())
         )
         .is_err()
     );

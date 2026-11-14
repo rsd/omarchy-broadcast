@@ -12,8 +12,9 @@
 //!
 //! - [`groups`]: the `mic.*` settings of the tree, after the camera's and
 //!   the effects' groups, each with `surface` `mic`: the daemon's own
-//!   `input` group (`mic.input.enabled` and `mic.input.device`, which are
-//!   the config keys `mic.enabled` and `mic.device`; the actions
+//!   `input` group (`mic.input.enabled`, `mic.input.device` and, while the
+//!   worker reports one, `mic.input.hardware_gain_db`, which are the config
+//!   keys `mic.enabled`, `mic.device` and `mic.hardware_gain_db`; the actions
 //!   `mic.input.make_default` and `mic.input.restore_default`), then the
 //!   audio modules' groups as the worker describes them ([`parse_groups`]:
 //!   one group per id, the active provider's, decision G4), their values
@@ -68,6 +69,10 @@ pub const INPUT_LABEL: &str = "Microphone";
 pub const ENABLED: &str = "mic.input.enabled";
 /// The microphone captured (the config key [`KEY_DEVICE`]).
 pub const DEVICE: &str = "mic.input.device";
+/// The microphone's hardware capture gain, in whole dB (the config key
+/// [`KEY_HARDWARE_GAIN`]): offered while the worker reports the control
+/// ([`HardwareGain`]).
+pub const HARDWARE_GAIN: &str = "mic.input.hardware_gain_db";
 /// The action that makes the Omarchy Broadcast Mic the default microphone.
 pub const MAKE_DEFAULT: &str = "mic.input.make_default";
 /// The action that makes the previous default microphone the default
@@ -77,6 +82,9 @@ pub const RESTORE_DEFAULT: &str = "mic.input.restore_default";
 pub const KEY_ENABLED: &str = "mic.enabled";
 /// The config key of [`DEVICE`].
 pub const KEY_DEVICE: &str = "mic.device";
+/// The config key of [`HARDWARE_GAIN`] (a float: the setting's whole dB
+/// are one way of writing it).
+pub const KEY_HARDWARE_GAIN: &str = "mic.hardware_gain_db";
 
 /// The most options `mic.input.device` offers, `default` included.
 pub const MAX_DEVICES: usize = 16;
@@ -146,6 +154,41 @@ pub struct Catalogue {
     pub modules: Vec<ModuleInfo>,
     /// The hardware sources, `(node.name, description)`.
     pub devices: Vec<(String, String)>,
+    /// The captured microphone's hardware gain, from the worker's status
+    /// ([`parse_hardware_gain`]); `None` when it reports none.
+    pub hardware_gain: Option<HardwareGain>,
+}
+
+/// The hardware capture gain the worker reports (its status's
+/// `hardware_gain`), in dB.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HardwareGain {
+    /// The ALSA control it is.
+    pub control: String,
+    /// The gain now.
+    pub db: f64,
+    /// The range's ends.
+    pub min_db: f64,
+    pub max_db: f64,
+    /// The step (0 for a control of one value).
+    pub step_db: f64,
+    /// The device holds the configured value.
+    pub applied: bool,
+}
+
+impl HardwareGain {
+    /// The range in whole dB, `(min, max, step)`: the ends rounded inwards,
+    /// the step always 1 (the worker rounds a value to the device's own
+    /// step: a coarser setting step would refuse values off its grid, the
+    /// one shown among them); `None` when no whole dB lies within it.
+    pub fn whole_db(&self) -> Option<(i64, i64, i64)> {
+        let (min, max) = (self.min_db.ceil(), self.max_db.floor());
+        if min > max {
+            return None;
+        }
+        // Within the bounds the parse keeps, so the casts are exact.
+        Some((min as i64, max as i64, 1))
+    }
 }
 
 /// What [`groups`] needs.
@@ -317,6 +360,29 @@ fn input_group(inp: &Inputs<'_>) -> SettingsGroup {
     );
     enabled.hint = Some("switch".into());
     let entries = device_entries(&inp.catalogue.devices, &mic.device);
+    let gain = inp.catalogue.hardware_gain.as_ref().and_then(|g| {
+        let (min, max, step) = g.whole_db()?;
+        let value = (g.db.round() as i64).clamp(min, max);
+        let mut s = bound(
+            setting(
+                HARDWARE_GAIN,
+                "Hardware gain",
+                SettingKind::Int {
+                    min,
+                    max,
+                    step,
+                    // Unset leaves the device as it is: its gain now.
+                    default: value,
+                    value,
+                    unit: Some("dB".into()),
+                },
+            ),
+            KEY_HARDWARE_GAIN,
+            inp.config_set,
+        );
+        s.hint = Some("slider".into());
+        Some(s)
+    });
     let device = bound(
         setting(
             DEVICE,
@@ -363,7 +429,10 @@ fn input_group(inp: &Inputs<'_>) -> SettingsGroup {
     SettingsGroup {
         id: INPUT.into(),
         label: INPUT_LABEL.into(),
-        settings: vec![enabled, device, make, restore],
+        settings: [Some(enabled), Some(device), gain, Some(make), Some(restore)]
+            .into_iter()
+            .flatten()
+            .collect(),
         surface: Some(SURFACE_MIC.into()),
     }
 }
@@ -504,6 +573,10 @@ pub fn check(
     Ok(match (id, stored) {
         (ENABLED, StoredValue::Bool(b)) => Write::Config(KEY_ENABLED, C::Bool(b)),
         (DEVICE, StoredValue::Str(s)) => Write::Config(KEY_DEVICE, C::Str(s)),
+        // Within the reported range (checked above), so within the key's.
+        (HARDWARE_GAIN, StoredValue::Int(i)) => {
+            Write::Config(KEY_HARDWARE_GAIN, C::Float(i as f64))
+        }
         (id, v) => Write::Value(id.to_string(), v),
     })
 }
@@ -547,13 +620,14 @@ pub fn module_group_ids(groups: &[SettingsGroup], group: &str) -> Option<Vec<Str
 
 /// The config keys the `input` group's reset removes from the managed
 /// file.
-pub const INPUT_KEYS: [&str; 2] = [KEY_ENABLED, KEY_DEVICE];
+pub const INPUT_KEYS: [&str; 3] = [KEY_ENABLED, KEY_DEVICE, KEY_HARDWARE_GAIN];
 
 /// The config key of the daemon's own setting `id`, if it has one.
 pub fn config_key_of(id: &str) -> Option<&'static str> {
     match id {
         ENABLED => Some(KEY_ENABLED),
         DEVICE => Some(KEY_DEVICE),
+        HARDWARE_GAIN => Some(KEY_HARDWARE_GAIN),
         _ => None,
     }
 }
@@ -571,8 +645,19 @@ fn json_of(v: &StoredValue) -> Json {
 /// `audio-settings.json`), as compact JSON text: `[mic]`, the backend
 /// profile, the pins of the `mic-*` stages, the modules' `mic.*` values of
 /// the state file, the modules disabled, whether the camera session runs,
-/// and `mic.force_conflicts` (as `forced_conflicts`).
-pub fn snapshot(config: &Config, runtime: &RuntimeState, camera_active: bool) -> String {
+/// `mic.force_conflicts` (as `forced_conflicts`), `mic.hardware_gain_db`
+/// (`null` when unset: the worker leaves the device's gain as it is) and
+/// `gain_serial` (as `hardware_gain_serial`: the controller's count of
+/// explicit sets of the gain, so that setting the configured value again
+/// applies it again). A key is only ever added in this version: a worker
+/// that does not know it ignores it, and one that misses it takes its
+/// default.
+pub fn snapshot(
+    config: &Config,
+    runtime: &RuntimeState,
+    camera_active: bool,
+    gain_serial: u64,
+) -> String {
     let mic = &config.mic;
     let depth = if mic.pipeline_depth == 0 {
         json!({ "cpu": 1, "gpu": 2 })
@@ -614,6 +699,8 @@ pub fn snapshot(config: &Config, runtime: &RuntimeState, camera_active: bool) ->
         "values": values,
         "disabled_modules": disabled,
         "forced_conflicts": mic.force_conflicts,
+        "hardware_gain_db": mic.hardware_gain_db,
+        "hardware_gain_serial": gain_serial,
     })
     .to_string()
 }
@@ -899,6 +986,46 @@ pub fn parse_devices(doc: &Json) -> Vec<(String, String)> {
         })
         .take(MAX_DEVICES)
         .collect()
+}
+
+/// The hardware gain of the worker's status (its `hardware_gain` object),
+/// or `None` when it is `null`, missing or does not read: a number not
+/// finite or outside the configuration's bounds, the ends the wrong way
+/// round, a negative step. A status without the key is pending (the
+/// worker has not read the device yet): see [`gain_pending`].
+pub fn parse_hardware_gain(status: &Json) -> Option<HardwareGain> {
+    use obc_core::config::limits::{MAX_MIC_HARDWARE_GAIN_DB, MIN_MIC_HARDWARE_GAIN_DB};
+    let g = status.get("hardware_gain")?.as_object()?;
+    let num = |k: &str| {
+        g.get(k)
+            .and_then(Json::as_f64)
+            .filter(|v| (MIN_MIC_HARDWARE_GAIN_DB..=MAX_MIC_HARDWARE_GAIN_DB).contains(v))
+    };
+    let (db, min_db, max_db) = (num("db")?, num("min_db")?, num("max_db")?);
+    let step_db = g
+        .get("step_db")
+        .and_then(Json::as_f64)
+        .filter(|v| (0.0..=MAX_MIC_HARDWARE_GAIN_DB - MIN_MIC_HARDWARE_GAIN_DB).contains(v))?;
+    if min_db > max_db {
+        return None;
+    }
+    Some(HardwareGain {
+        control: clean(
+            g.get("control").and_then(Json::as_str).unwrap_or_default(),
+            LABEL_MAX,
+        ),
+        db,
+        min_db,
+        max_db,
+        step_db,
+        applied: g.get("applied").and_then(Json::as_bool).unwrap_or(false),
+    })
+}
+
+/// Whether the worker's status leaves its hardware gain out: not read yet
+/// (the worker starting), so the gain known before stands.
+pub fn gain_pending(status: &Json) -> bool {
+    status.get("hardware_gain").is_none()
 }
 
 /// `GetModules`: the daemon's modules, an audio module (which the daemon

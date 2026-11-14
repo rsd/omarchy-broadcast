@@ -706,8 +706,14 @@ struct Control {
     /// set by every load (none when it reports none), kept while that chain
     /// runs (a refused switch included), and cleared when nothing is loaded
     /// after a job, on a failure of the effect, a revocation, new caps and a
-    /// stop.
+    /// stop. A job that finds the chain loaded (a retry after a failure of
+    /// the effect) shows [`Control::chain_notice`] again.
     load_notice: Option<String>,
+    /// The notice the load of the chain loaded on the backend reported: as
+    /// [`Control::load_notice`], but kept through a failure of the effect,
+    /// which leaves that chain loaded, so the job that finds it loaded
+    /// again shows it ([`ObcEffect::fail`]).
+    chain_notice: Option<String>,
     /// The reason the worker gave the effect's failure ([`LOST_CHAIN`],
     /// never the refusal's) when a refused switch found the previous chain
     /// lost (`worker_loop`): the frame that lost it, failing after,
@@ -792,6 +798,7 @@ impl Default for Control {
             switch_error: None,
             switch_refused: None,
             load_notice: None,
+            chain_notice: None,
             lost_switch: None,
             stop: false,
             last_load_ms: None,
@@ -887,8 +894,16 @@ impl Control {
     /// Forgets what the chain in force had: a refused switch
     /// ([`Self::clear_switch`]), the load's notice and a failure given in
     /// place of a lost chain's reason ([`Control::lost_switch`]). On a
-    /// failure of the effect, a revocation, new caps and a stop.
+    /// revocation, new caps and a stop.
     fn end_chain(&mut self) {
+        self.fail_chain();
+        self.chain_notice = None;
+    }
+
+    /// As [`Self::end_chain`] on a failure of the effect, which leaves the
+    /// chain loaded: its notice is no longer shown, but kept
+    /// ([`Control::chain_notice`]).
+    fn fail_chain(&mut self) {
         self.clear_switch();
         self.load_notice = None;
         self.lost_switch = None;
@@ -2050,8 +2065,9 @@ impl ObcEffect {
                 }
                 c.status = EffectStatus::Failed(reason);
                 // The chain kept in place of a refused switch has failed
-                // too: the failure says it all.
-                c.end_chain();
+                // too: the failure says it all. The chain stays loaded,
+                // and its notice is shown again when it runs again.
+                c.fail_chain();
                 before.changed(c.report())
             }
         };
@@ -3448,10 +3464,12 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                 c.last_load_ms = Some(r.load_ms + r.warmup_ms.unwrap_or(0.0));
                 c.last_load_reused = r.reused_model;
                 c.load_notice.clone_from(&r.notice);
+                c.chain_notice.clone_from(&r.notice);
             }
             // The notice is of the chain in force: none when nothing is.
             if c.loaded_kind.is_none() {
                 c.load_notice = None;
+                c.chain_notice = None;
             }
             if c.generation == job.generation {
                 for (stage, reason) in &stage_failures {
@@ -3466,6 +3484,12 @@ fn worker_loop(shared: Arc<Shared>, element: glib::WeakRef<super::ObcEffect>) {
                         // refused ones: the refusal stands.
                         if !job.substituted {
                             c.clear_switch();
+                        }
+                        // The chain found loaded runs again (a retry after
+                        // a failure of the effect): so does its notice.
+                        if matches!(outcome, Outcome::AlreadyLoaded) {
+                            let ctl = &mut *c;
+                            ctl.load_notice.clone_from(&ctl.chain_notice);
                         }
                         if effect {
                             c.status = EffectStatus::Ready;

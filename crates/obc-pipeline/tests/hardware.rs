@@ -3639,7 +3639,8 @@ fn control<'a>(found: &'a obc_pipeline::Enumeration, name: &str) -> &'a obc_pipe
 
 /// Every control the camera reports, printed; each one's range and value
 /// are consistent. On an MX Brio, its known controls are all there with
-/// their ids, types, ranges and menus, and the field-of-view unit resolves.
+/// their ids, types, ranges and menus, and its Extension Unit rows resolve
+/// (units 10 and 22).
 #[test]
 #[ignore = "needs OBC_TEST_CAMERA attached"]
 fn settings_hw_enumerates_every_control() {
@@ -3831,7 +3832,19 @@ fn settings_hw_enumerates_every_control() {
     )
     .unwrap();
     let units: Vec<(&str, u8)> = xu.iter().map(|x| (x.row().name, x.unit())).collect();
-    assert_eq!(units, [("field_of_view", 10)]);
+    assert_eq!(
+        units,
+        [
+            ("field_of_view", 10),
+            ("show_mode", 10),
+            ("exposure_compensation", 10),
+            ("vibrance", 10),
+            ("temperature_compensation", 10),
+            ("rightsight", 22),
+            ("rightsight_speed", 22),
+            ("rightsight_distance", 22),
+        ]
+    );
 }
 
 /// Exposure: with auto exposure set to manual the exposure time's
@@ -3938,6 +3951,198 @@ impl Drop for RestoreFov<'_> {
             Ok(()) => eprintln!("restored field_of_view = {}", self.option),
             Err(e) => eprintln!("could not restore field_of_view to {}: {e}", self.option),
         }
+    }
+}
+
+/// Puts an Extension Unit row back to the option the test found when
+/// dropped.
+struct RestoreXu<'a> {
+    xu: obc_pipeline::XuControl,
+    node: &'a obc_pipeline::ControlNode,
+    option: &'static str,
+}
+
+impl Drop for RestoreXu<'_> {
+    fn drop(&mut self) {
+        let name = self.xu.row().name;
+        match self.xu.set(self.node, self.option) {
+            Ok(()) => eprintln!("restored {name} = {}", self.option),
+            Err(e) => eprintln!("could not restore {name} to {}: {e}", self.option),
+        }
+    }
+}
+
+/// The MX Brio's Extension Unit rows other than the field of view (which
+/// has its own test), resolved on the test camera: it must be an MX Brio
+/// whose descriptors carry every one.
+fn mx_brio_xu_rows(
+    path: &std::path::Path,
+    usb: Option<obc_core::UsbId>,
+) -> Vec<obc_pipeline::XuControl> {
+    use obc_pipeline::xu::{SYSFS_ROOT, find_xu_controls, rows_for};
+    assert_eq!(usb, Some(MX_BRIO), "this test needs an MX Brio (046d:0944)");
+    let found = find_xu_controls(std::path::Path::new(SYSFS_ROOT), path).unwrap();
+    let want: Vec<&str> = rows_for(MX_BRIO)
+        .iter()
+        .map(|r| r.name)
+        .filter(|n| *n != "field_of_view")
+        .collect();
+    let found: Vec<obc_pipeline::XuControl> = found
+        .into_iter()
+        .filter(|x| x.row().name != "field_of_view")
+        .collect();
+    let names: Vec<&str> = found.iter().map(|x| x.row().name).collect();
+    assert_eq!(names, want, "the MX Brio's rows did not all resolve");
+    found
+}
+
+/// The MX Brio's Extension Unit rows, read only: each one is probed
+/// (`GET_LEN`, `GET_INFO`, `GET_CUR`, `GET_DEF`) and printed, with the
+/// whole RightSight block. Nothing is written. Needs an MX Brio.
+#[test]
+#[ignore = "needs OBC_TEST_CAMERA attached (an MX Brio, 046d:0944); reads only"]
+fn settings_hw_mx_brio_extension_units_read_only() {
+    use obc_pipeline::ControlNode;
+    init();
+    let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
+    let (path, usb) = settings_camera();
+    let rows = mx_brio_xu_rows(&path, usb);
+    let node = ControlNode::open(&path, false).unwrap();
+    for x in &rows {
+        let r = x.row();
+        let state = x
+            .probe(&node)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{}: the device does not agree with the row", r.name));
+        eprintln!(
+            "{}: unit {} selector {:#04x} byte {} of {} GET_INFO {:#04x} GET_CUR {:#04x} ({:?}) \
+             GET_DEF {:?} (default {})",
+            r.name,
+            x.unit(),
+            r.selector,
+            r.offset,
+            r.size,
+            state.info,
+            state.current,
+            state.current_option.map(|o| o.id),
+            state.default_raw,
+            state.default.id
+        );
+        let block = x.current_bytes(&node).unwrap();
+        assert_eq!(block.len(), usize::from(r.size), "{}", r.name);
+        assert_eq!(block[usize::from(r.offset)], state.current, "{}", r.name);
+        if r.size > 1 {
+            eprintln!("  {}: GET_CUR block {block:02x?}", r.name);
+        }
+        if state.current_option.is_none() {
+            eprintln!(
+                "  {}: {:#04x} is no value of the row (greyed by the daemon)",
+                r.name, state.current
+            );
+        }
+    }
+}
+
+/// The MX Brio's Extension Unit rows, written: for each, a value of the
+/// row other than the current one is written and read back, then the
+/// starting value is written back and read back (also on a panic). For the
+/// RightSight rows every byte of the 30-byte block but the row's own and
+/// byte 4 must be what it was right before each write (the other two
+/// RightSight bytes included). Never touches a unit's other selectors.
+/// Writes to the camera, so it needs `OBC_TEST_XU_WRITE=1` as well as an
+/// MX Brio; stop omarchy-broadcastd first so it does not write stored
+/// values meanwhile.
+#[test]
+#[ignore = "needs OBC_TEST_CAMERA attached (an MX Brio, 046d:0944) and OBC_TEST_XU_WRITE=1 (writes its extension-unit settings, then puts them back)"]
+fn settings_hw_mx_brio_extension_units_write_and_restore() {
+    use obc_pipeline::ControlNode;
+    use obc_pipeline::xu::XuKind;
+    init();
+    assert_eq!(
+        std::env::var("OBC_TEST_XU_WRITE").as_deref(),
+        Ok("1"),
+        "this test writes the camera's extension-unit settings: set OBC_TEST_XU_WRITE=1"
+    );
+    let _g = CAMERA.lock().unwrap_or_else(|e| e.into_inner());
+    let (path, usb) = settings_camera();
+    let rows = mx_brio_xu_rows(&path, usb);
+    let node = ControlNode::open(&path, true).unwrap();
+    // The block byte the camera was seen changing on its own (0x5a, then
+    // 0x50) between two reads with nothing written: it is printed, not
+    // compared.
+    const DRIFTING: usize = 4;
+    // A block's bytes but the row's own and the drifting one, which must
+    // stay as read; none for a one-byte row.
+    let others = |x: &obc_pipeline::XuControl, block: &[u8]| -> Vec<(usize, u8)> {
+        if x.row().size == 1 {
+            return Vec::new();
+        }
+        let own = usize::from(x.row().offset);
+        block
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(i, _)| *i != own && *i != DRIFTING)
+            .collect()
+    };
+    for x in rows {
+        let r = x.row();
+        let state = x
+            .probe(&node)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{}: the device does not agree with the row", r.name));
+        let start = state.current_option.unwrap_or_else(|| {
+            panic!(
+                "{}: unknown starting byte {:#04x}: not touching it",
+                r.name, state.current
+            )
+        });
+        let target = match r.kind {
+            XuKind::Range { max, .. } if start.value < max => start.value + 1,
+            XuKind::Range { .. } => start.value - 1,
+            _ => {
+                r.options()
+                    .iter()
+                    .find(|o| o.id != start.id)
+                    .expect("a second option")
+                    .value
+            }
+        };
+        let target = r.option_for_value(target).expect("a value of the row");
+        let restore = RestoreXu {
+            xu: x,
+            node: &node,
+            option: start.id,
+        };
+        for (want, label) in [(target, "test value"), (start, "starting value")] {
+            let before = x.current_bytes(&node).unwrap();
+            eprintln!(
+                "{}: {} -> {} ({label})",
+                r.name,
+                before[usize::from(r.offset)],
+                want.id
+            );
+            x.set(&node, want.id).unwrap();
+            let after = x.current_bytes(&node).unwrap();
+            assert_eq!(x.current(&node).unwrap(), want.value, "{}", r.name);
+            assert_eq!(after[usize::from(r.offset)], want.value, "{}", r.name);
+            if r.size > 1 {
+                eprintln!("  before {before:02x?}\n  after  {after:02x?}");
+                eprintln!(
+                    "  byte {DRIFTING} (not compared): {:#04x} -> {:#04x}",
+                    before[DRIFTING], after[DRIFTING]
+                );
+            }
+            assert_eq!(
+                others(&x, &after),
+                others(&x, &before),
+                "{}: a byte outside the row's changed",
+                r.name
+            );
+        }
+        // Back at the start already: the guard reads, and writes nothing.
+        drop(restore);
+        assert_eq!(x.current(&node).unwrap(), start.value, "{}", r.name);
     }
 }
 

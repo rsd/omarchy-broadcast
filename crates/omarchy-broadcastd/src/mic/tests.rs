@@ -61,7 +61,187 @@ fn catalogue() -> Catalogue {
             ("alsa_input.usb-a".into(), "USB A".into()),
             ("alsa_input.usb-b".into(), String::new()),
         ],
+        hardware_gain: None,
     }
+}
+
+/// The worker's status with a hardware gain (an MX Brio's `Headset`
+/// control: +18 to +54 dB in 1 dB steps, at +40 dB).
+fn status_with_gain(db: f64) -> Json {
+    json!({"state": "active", "hardware_gain": {
+        "control": "Headset", "db": db, "min_db": 18.0, "max_db": 54.0,
+        "step_db": 1.0, "applied": false}})
+}
+
+#[test]
+fn the_hardware_gain_is_read_from_the_workers_status() {
+    let g = parse_hardware_gain(&status_with_gain(40.0)).unwrap();
+    assert_eq!(
+        g,
+        HardwareGain {
+            control: "Headset".into(),
+            db: 40.0,
+            min_db: 18.0,
+            max_db: 54.0,
+            step_db: 1.0,
+            applied: false,
+        }
+    );
+    assert_eq!(g.whole_db(), Some((18, 54, 1)));
+    // None reported, or one that does not read.
+    assert_eq!(parse_hardware_gain(&json!({"state": "active"})), None);
+    assert_eq!(parse_hardware_gain(&json!({"hardware_gain": null})), None);
+    for (key, bad) in [
+        ("db", json!("40")),
+        ("min_db", json!(-1000.0)),
+        ("max_db", json!(1.0)),
+        ("step_db", json!(-1.0)),
+    ] {
+        let mut s = status_with_gain(40.0);
+        s["hardware_gain"][key] = bad;
+        assert_eq!(parse_hardware_gain(&s), None, "{key}");
+    }
+    // A fractional range is rounded inwards, the step always 1 dB (the
+    // worker rounds to the device's step).
+    let frac = HardwareGain {
+        min_db: -12.5,
+        max_db: 33.7,
+        step_db: 0.375,
+        ..g.clone()
+    };
+    assert_eq!(frac.whole_db(), Some((-12, 33, 1)));
+    let coarse = HardwareGain {
+        step_db: 1.5,
+        ..g.clone()
+    };
+    assert_eq!(coarse.whole_db(), Some((18, 54, 1)));
+    // No whole dB within it: not offered.
+    let narrow = HardwareGain {
+        min_db: 3.2,
+        max_db: 3.8,
+        step_db: 0.0,
+        ..g
+    };
+    assert_eq!(narrow.whole_db(), None);
+}
+
+#[test]
+fn the_hardware_gain_is_an_input_setting_bound_to_its_config_key() {
+    use obc_core::config_schema::ConfigValue as C;
+    let config = Config::default();
+    let runtime = RuntimeState::default();
+    let mut cat = catalogue();
+    cat.hardware_gain = parse_hardware_gain(&status_with_gain(40.4));
+    let g = groups_of(&config, &runtime, &cat, true);
+    let ids: Vec<&str> = g[0].settings.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            ENABLED,
+            DEVICE,
+            HARDWARE_GAIN,
+            MAKE_DEFAULT,
+            RESTORE_DEFAULT
+        ]
+    );
+    let s = find(&g, HARDWARE_GAIN).unwrap();
+    assert_eq!(s.label, "Hardware gain");
+    assert!(!s.stored);
+    assert_eq!(
+        s.kind,
+        SettingKind::Int {
+            min: 18,
+            max: 54,
+            step: 1,
+            default: 40,
+            value: 40,
+            unit: Some("dB".into())
+        }
+    );
+    assert_eq!(
+        check(&g, HARDWARE_GAIN, Some(&SettingValue::Int(30))),
+        Ok(Write::Config(KEY_HARDWARE_GAIN, C::Float(30.0)))
+    );
+    for bad in [17, 55] {
+        assert!(
+            matches!(
+                check(&g, HARDWARE_GAIN, Some(&SettingValue::Int(bad))),
+                Err(Refusal::Invalid(_))
+            ),
+            "{bad}"
+        );
+    }
+    assert!(matches!(
+        check(&g, HARDWARE_GAIN, Some(&SettingValue::Bool(true))),
+        Err(Refusal::Invalid(_))
+    ));
+    assert_eq!(config_key_of(HARDWARE_GAIN), Some(KEY_HARDWARE_GAIN));
+    assert!(INPUT_KEYS.contains(&KEY_HARDWARE_GAIN));
+    // Stored once the managed file sets it.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::create_dir_all(dir.path().join("config.d")).unwrap();
+    std::fs::write(
+        dir.path().join(MANAGED_REL),
+        "[mic]\nhardware_gain_db = 38.5\n",
+    )
+    .unwrap();
+    let set = ConfigSet::load(&path).unwrap();
+    let g = groups(&Inputs {
+        config: &set.config,
+        config_set: &set,
+        runtime: &runtime,
+        catalogue: &cat,
+        host_on: true,
+    });
+    assert!(find(&g, HARDWARE_GAIN).unwrap().stored);
+    // No gain reported: no setting.
+    cat.hardware_gain = None;
+    let g = groups_of(&config, &runtime, &cat, true);
+    assert!(find(&g, HARDWARE_GAIN).is_none());
+}
+
+#[test]
+fn a_coarse_device_step_refuses_no_whole_db_in_range() {
+    // A 1.5 dB step from -6 dB, at 10.5 dB: every whole dB is taken (the
+    // worker rounds), the one shown and the ends among them.
+    let config = Config::default();
+    let runtime = RuntimeState::default();
+    let mut cat = catalogue();
+    cat.hardware_gain = Some(HardwareGain {
+        control: "Mic".into(),
+        db: 10.5,
+        min_db: -6.0,
+        max_db: 18.0,
+        step_db: 1.5,
+        applied: false,
+    });
+    let g = groups_of(&config, &runtime, &cat, true);
+    let s = find(&g, HARDWARE_GAIN).unwrap();
+    let SettingKind::Int {
+        min,
+        max,
+        step,
+        value,
+        ..
+    } = s.kind
+    else {
+        panic!("{:?}", s.kind)
+    };
+    assert_eq!((min, max, step), (-6, 18, 1));
+    for v in [min, max, value, -5, 0, 7, 17] {
+        assert!(
+            check(&g, HARDWARE_GAIN, Some(&SettingValue::Int(v))).is_ok(),
+            "{v}"
+        );
+    }
+}
+
+#[test]
+fn a_status_without_the_gain_is_pending() {
+    assert!(gain_pending(&json!({"state": "active"})));
+    assert!(!gain_pending(&json!({"hardware_gain": null})));
+    assert!(!gain_pending(&status_with_gain(40.0)));
 }
 
 fn groups_of(
@@ -408,7 +588,7 @@ fn the_snapshot_carries_the_config_values_pins_and_disabled_modules() {
     let mut config = Config::default();
     let mut runtime = RuntimeState::default();
     let parse = |text: String| serde_json::from_str::<Json>(&text).unwrap();
-    let d = parse(snapshot(&config, &runtime, false));
+    let d = parse(snapshot(&config, &runtime, false, 0));
     assert_eq!(
         d,
         json!({
@@ -416,11 +596,21 @@ fn the_snapshot_carries_the_config_values_pins_and_disabled_modules() {
             "pipeline_depth": {"cpu": 1, "gpu": 2}, "idle_exit_s": 30,
             "gpu_warm_s": 30, "gpu_policy": "always", "camera_active": false, "profile": "quality",
             "pins": {}, "values": {}, "disabled_modules": [], "forced_conflicts": false,
+            "hardware_gain_db": null, "hardware_gain_serial": 0,
         })
+    );
+    config.mic.hardware_gain_db = Some(38.5);
+    assert_eq!(
+        parse(snapshot(&config, &runtime, false, 0))["hardware_gain_db"],
+        json!(38.5)
+    );
+    assert_eq!(
+        parse(snapshot(&config, &runtime, false, 7))["hardware_gain_serial"],
+        json!(7)
     );
     config.mic.force_conflicts = true;
     assert_eq!(
-        parse(snapshot(&config, &runtime, false))["forced_conflicts"],
+        parse(snapshot(&config, &runtime, false, 0))["forced_conflicts"],
         json!(true)
     );
     config.mic.enabled = false;
@@ -450,7 +640,7 @@ fn the_snapshot_carries_the_config_values_pins_and_disabled_modules() {
     runtime
         .settings
         .insert("mic.input.enabled".into(), StoredValue::Bool(true));
-    let d = parse(snapshot(&config, &runtime, true));
+    let d = parse(snapshot(&config, &runtime, true, 0));
     assert_eq!(d["enabled"], json!(false));
     assert_eq!(d["device"], json!("alsa_input.usb-a"));
     assert_eq!(d["pipeline_depth"], json!(3));
@@ -1101,6 +1291,55 @@ async fn the_workers_signals_become_the_status_and_mic_stats() {
             .contains(&Call::ResetModule("audio".into()))
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_change_of_the_hardware_gain_alone_is_a_new_catalogue() {
+    let worker = FakeWorker::default();
+    worker.0.lock().unwrap().installed = true;
+    let rig = Rig::start(worker, FakeUnits::default(), Vec::new());
+    let e = rig.until(|e| matches!(e, MicEvent::Catalogue(_))).await;
+    let MicEvent::Catalogue(c) = e else { panic!() };
+    assert_eq!(c.hardware_gain, None);
+    let gain_of = |e: &MicEvent| match e {
+        MicEvent::Catalogue(c) => c.hardware_gain.as_ref().map(|g| g.db),
+        _ => None,
+    };
+    rig.events
+        .send(WorkerEvent::Status(status_with_gain(40.0).to_string()))
+        .unwrap();
+    let e = rig.until(|e| gain_of(e).is_some()).await;
+    assert_eq!(gain_of(&e), Some(40.0));
+    // The gain moved (another writer, or the worker applying the config):
+    // nothing else changed, and the controller hears of it all the same.
+    rig.events
+        .send(WorkerEvent::Status(status_with_gain(30.0).to_string()))
+        .unwrap();
+    let e = rig.until(|e| gain_of(e) == Some(30.0)).await;
+    let MicEvent::Catalogue(c) = e else { panic!() };
+    assert_eq!(c.groups.len(), 2);
+    // The worker starting again: its gain pending (left out of the
+    // status), the gain known stands; the next one it reports follows.
+    rig.events
+        .send(WorkerEvent::Status(json!({"state": "active"}).to_string()))
+        .unwrap();
+    rig.events
+        .send(WorkerEvent::Status(status_with_gain(31.0).to_string()))
+        .unwrap();
+    let e = rig.until(|e| matches!(e, MicEvent::Catalogue(_))).await;
+    assert_eq!(
+        gain_of(&e),
+        Some(31.0),
+        "the pending status dropped the gain"
+    );
+    // No gain reported any more (another device): gone from the catalogue.
+    rig.events
+        .send(WorkerEvent::Status(
+            json!({"state": "active", "hardware_gain": null}).to_string(),
+        ))
+        .unwrap();
+    rig.until(|e| matches!(e, MicEvent::Catalogue(c) if c.hardware_gain.is_none()))
+        .await;
 }
 
 #[tokio::test]

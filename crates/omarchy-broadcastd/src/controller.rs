@@ -1735,6 +1735,10 @@ pub struct Controller<B: MediaBackend> {
     mic_catalogue: mic::Catalogue,
     /// The audio settings snapshot last sent to the agent.
     mic_sent: Option<String>,
+    /// Explicit sets of `mic.hardware_gain_db` (`SetSetting`, `SetConfig`)
+    /// since the start: in the snapshot, so that setting the configured
+    /// value again applies it again.
+    mic_gain_serial: u64,
     /// `mic.device` as of the last snapshot sent (`None` before the first):
     /// a change while the Omarchy Broadcast Mic is the default re-pins the
     /// capture side.
@@ -2117,6 +2121,7 @@ impl<B: MediaBackend> Controller<B> {
             mic_status: obc_ipc::MicStatus::default(),
             mic_catalogue: mic::Catalogue::default(),
             mic_sent: None,
+            mic_gain_serial: 0,
             mic_device_sent: None,
             mic_serial: 0,
         };
@@ -3272,11 +3277,20 @@ impl<B: MediaBackend> Controller<B> {
 
     /// Ends the writer's restart hold ([`Self::restart_for_modules`]) when
     /// one may be in force: the new session is not to show the frame the
-    /// last one left ([`MediaBackend::end_restart_hold`]). Called when the
-    /// session is dropped (before a restart opens a new hold), when no
-    /// session is wanted (the camera turned off while no session runs,
-    /// between a restart and the next start) and when a hold taken while
-    /// the camera could be shown meets a policy that now hides it
+    /// last one left ([`MediaBackend::end_restart_hold`]); forgets it.
+    /// Called on every session drop ([`Self::drop_session_with`]), before
+    /// the session is taken and before a restart arms a new hold: a stop,
+    /// a failed start, a restart. A restart that carries the hold on
+    /// ([`Self::restart_for_modules`]) forgets it first, so its drop ends
+    /// nothing, except for a hold taken while the camera could be shown
+    /// that meets a policy now hiding it: kept, and ended by the drop.
+    /// The start in system memory after a failed CUDA start
+    /// ([`Self::start_session_once`]) carries it over its drop the same way.
+    /// Also called when no session is wanted ([`Self::decide`]: the camera
+    /// turned off between a restart and the next start), when a start
+    /// leaves no session ([`Self::start_session`]: no camera, a fault, a
+    /// disable queued), and when a hold taken while the camera could be
+    /// shown meets a policy that now hides it
     /// ([`Self::end_unhidden_restart_hold`]).
     fn end_restart_hold(&mut self) {
         if self.restart_held.take().is_some() {
@@ -7801,6 +7815,9 @@ impl<B: MediaBackend> Controller<B> {
         self.settle_pending_move(now);
         let facts = self.schema_facts();
         let res = config_d::set_config(&self.paths.config, &facts, key, &value);
+        if key == mic::KEY_HARDWARE_GAIN && res.is_ok() {
+            self.mic_gain_serial += 1;
+        }
         // Enabling a module is the same as `SetModuleEnabled`: one the
         // crash ledger disabled is forgiven.
         let forgive = match (key.strip_prefix(config_schema::ENABLED_PREFIX), &value) {
@@ -8775,7 +8792,12 @@ impl<B: MediaBackend> Controller<B> {
         let Some(link) = &self.mic else {
             return;
         };
-        let text = mic::snapshot(&self.config, &self.runtime, self.camera_active());
+        let text = mic::snapshot(
+            &self.config,
+            &self.runtime,
+            self.camera_active(),
+            self.mic_gain_serial,
+        );
         if self.mic_sent.as_deref() != Some(text.as_str()) {
             if link.send(MicRequest::Snapshot(text.clone())).is_err() {
                 debug!("the microphone's agent is gone");
@@ -8831,6 +8853,9 @@ impl<B: MediaBackend> Controller<B> {
                 self.settle_pending_move(now);
                 let facts = self.schema_facts();
                 let res = config_d::set_config(&self.paths.config, &facts, key, &value);
+                if key == mic::KEY_HARDWARE_GAIN && res.is_ok() {
+                    self.mic_gain_serial += 1;
+                }
                 self.config_written(&format!("{key} set"), res, None, now)
             }
             mic::Write::Value(id, v) => {

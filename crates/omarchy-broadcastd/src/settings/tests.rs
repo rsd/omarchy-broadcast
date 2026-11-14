@@ -7,7 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use obc_pipeline::control_node::{MenuItem, MenuItemValue};
 use obc_pipeline::controls::CtrlInfo;
-use obc_pipeline::xu::FIELD_OF_VIEW;
+use obc_pipeline::xu::{
+    EXPOSURE_COMPENSATION, FIELD_OF_VIEW, RIGHTSIGHT, RIGHTSIGHT_DISTANCE, RIGHTSIGHT_SPEED,
+    SHOW_MODE, TEMPERATURE_COMPENSATION, VIBRANCE,
+};
 
 use super::*;
 
@@ -173,9 +176,42 @@ fn fov(current: u8) -> XuReading {
             current,
             current_option: FIELD_OF_VIEW.option_for_value(current),
             default_raw: Some(0),
-            default: &FIELD_OF_VIEW.options[0],
+            default: FIELD_OF_VIEW.fallback_default(),
         },
     }
+}
+
+/// An Extension Unit row as probed, with its `current` and `default`
+/// bytes.
+fn reading(row: &'static XuRow, current: u8, default: u8) -> XuReading {
+    XuReading {
+        row,
+        state: XuState {
+            info: 0x03,
+            current,
+            current_option: row.option_for_value(current),
+            default_raw: Some(default),
+            default: row
+                .option_for_value(default)
+                .unwrap_or_else(|| row.fallback_default()),
+        },
+    }
+}
+
+/// The MX Brio's rows as Logi Tune last left them: field of view 65°, Show
+/// Mode on, exposure compensation 0 EV, vibrance 128, white-balance offset
+/// +280 K, RightSight off at the default speed and distance.
+fn mx_brio_xu() -> Vec<XuReading> {
+    vec![
+        fov(0x02),
+        reading(&SHOW_MODE, 1, 0),
+        reading(&EXPOSURE_COMPENSATION, 0x80, 0x80),
+        reading(&VIBRANCE, 0x80, 0x80),
+        reading(&TEMPERATURE_COMPENSATION, 0x39, 0x32),
+        reading(&RIGHTSIGHT, 0, 0),
+        reading(&RIGHTSIGHT_SPEED, 1, 1),
+        reading(&RIGHTSIGHT_DISTANCE, 1, 1),
+    ]
 }
 
 fn stored(values: &[(&str, i32)]) -> CameraControlState {
@@ -1364,4 +1400,367 @@ fn the_capture_mode_is_the_first_group_and_its_changes_are_diffed() {
         .structural
     );
     assert_eq!(diff(&a, &with(None)), None);
+}
+
+#[test]
+fn the_mx_brio_extension_unit_rows_are_typed_settings() {
+    let mut c = Case::brio();
+    c.xu = mx_brio_xu();
+    c.open = true;
+    let s = c.build();
+    let int = |min: i64, max: i64, default: i64, value: i64| SettingKind::Int {
+        min,
+        max,
+        step: 1,
+        default,
+        value,
+        unit: None,
+    };
+    let rows: [(&str, &str, SettingKind, &str); 7] = [
+        (
+            "camera.image.vibrance",
+            "Vibrance",
+            int(0, 255, 128, 128),
+            "slider",
+        ),
+        (
+            "camera.white_balance.temperature_compensation",
+            "Temperature compensation",
+            int(0, 100, 0x32, 0x39),
+            "slider",
+        ),
+        (
+            "camera.exposure.exposure_compensation",
+            "Exposure compensation",
+            int(0, 255, 128, 128),
+            "slider",
+        ),
+        (
+            "camera.focus.rightsight",
+            "RightSight",
+            SettingKind::Bool {
+                default: false,
+                value: false,
+            },
+            "switch",
+        ),
+        (
+            "camera.focus.rightsight_speed",
+            "Framing speed",
+            SettingKind::Enum {
+                options: vec![
+                    ("slower".into(), "Slower".into()),
+                    ("default".into(), "Default".into()),
+                    ("faster".into(), "Faster".into()),
+                ],
+                default: "default".into(),
+                value: "default".into(),
+            },
+            "segmented",
+        ),
+        (
+            "camera.focus.rightsight_distance",
+            "Framing distance",
+            SettingKind::Enum {
+                options: vec![
+                    ("closer".into(), "Closer".into()),
+                    ("default".into(), "Default".into()),
+                    ("farther".into(), "Farther".into()),
+                ],
+                default: "default".into(),
+                value: "default".into(),
+            },
+            "segmented",
+        ),
+        (
+            "camera.focus.show_mode",
+            "Show Mode",
+            SettingKind::Bool {
+                default: false,
+                value: true,
+            },
+            "switch",
+        ),
+    ];
+    for (id, label, kind, hint) in rows {
+        let st = setting(&s, id);
+        assert_eq!((st.label.as_str(), &st.kind), (label, &kind), "{id}");
+        assert_eq!(st.hint.as_deref(), Some(hint), "{id}");
+        assert!(st.enabled, "{id}");
+        assert!(st.enabled_when.is_empty(), "{id}");
+        assert!(matches!(s.get(id).unwrap().target, Target::Xu(_)), "{id}");
+    }
+    // Their place: after their group's standard controls, the RightSight
+    // rows and Show Mode after the field of view.
+    let ids = ids(&s);
+    let at = |id: &str| ids.iter().position(|i| *i == id).unwrap();
+    assert_eq!(
+        at("camera.image.vibrance"),
+        at("camera.image.saturation") + 1
+    );
+    assert!(
+        at("camera.white_balance.temperature_compensation")
+            > at("camera.white_balance.white_balance_temperature")
+    );
+    assert!(at("camera.exposure.exposure_compensation") > at("camera.exposure.gain"));
+    let focus = &ids[at("camera.focus.field_of_view")..];
+    assert_eq!(
+        focus,
+        [
+            "camera.focus.field_of_view",
+            "camera.focus.rightsight",
+            "camera.focus.rightsight_speed",
+            "camera.focus.rightsight_distance",
+            "camera.focus.show_mode",
+        ]
+    );
+    // The field of view as before.
+    let f = setting(&s, "camera.focus.field_of_view");
+    assert_eq!(f.kind.value(), str_value("65"));
+    assert!(f.enabled);
+
+    // A write's raw value is the byte, and the byte is the row's option
+    // the backend writes.
+    let raw = |id: &str, v: SettingValue| s.check(id, Some(&v)).map(|(_, r)| r);
+    let option = |id: &str, raw: i32| {
+        let Target::Xu(row) = s.get(id).unwrap().target else {
+            panic!("{id}")
+        };
+        row.option_for_value(u8::try_from(raw).unwrap())
+            .map(|o| o.id)
+    };
+    for (id, v, want_raw, want_option) in [
+        (
+            "camera.focus.show_mode",
+            SettingValue::Bool(false),
+            0,
+            "off",
+        ),
+        ("camera.focus.rightsight", SettingValue::Bool(true), 1, "on"),
+        (
+            "camera.focus.rightsight_speed",
+            SettingValue::Str("faster".into()),
+            2,
+            "faster",
+        ),
+        (
+            "camera.focus.rightsight_distance",
+            SettingValue::Str("closer".into()),
+            0,
+            "closer",
+        ),
+        (
+            "camera.exposure.exposure_compensation",
+            SettingValue::Int(0),
+            0,
+            "0",
+        ),
+        (
+            "camera.exposure.exposure_compensation",
+            SettingValue::Int(255),
+            255,
+            "255",
+        ),
+        ("camera.image.vibrance", SettingValue::Int(0), 0, "0"),
+        ("camera.image.vibrance", SettingValue::Int(255), 255, "255"),
+        (
+            "camera.white_balance.temperature_compensation",
+            SettingValue::Int(0),
+            0,
+            "0",
+        ),
+        (
+            "camera.white_balance.temperature_compensation",
+            SettingValue::Int(100),
+            100,
+            "100",
+        ),
+    ] {
+        let r = raw(id, v).unwrap();
+        assert_eq!(r, want_raw, "{id}");
+        assert_eq!(option(id, r), Some(want_option), "{id}");
+    }
+    // Out of a range, not an option, the wrong type: refused.
+    for (id, v) in [
+        (
+            "camera.exposure.exposure_compensation",
+            SettingValue::Int(-1),
+        ),
+        (
+            "camera.exposure.exposure_compensation",
+            SettingValue::Int(256),
+        ),
+        (
+            "camera.white_balance.temperature_compensation",
+            SettingValue::Int(-1),
+        ),
+        (
+            "camera.white_balance.temperature_compensation",
+            SettingValue::Int(101),
+        ),
+        ("camera.image.vibrance", SettingValue::Int(256)),
+        ("camera.image.vibrance", SettingValue::Int(-1)),
+        (
+            "camera.focus.rightsight_speed",
+            SettingValue::Str("fast".into()),
+        ),
+        ("camera.focus.rightsight", SettingValue::Str("on".into())),
+        ("camera.focus.show_mode", SettingValue::Int(1)),
+    ] {
+        assert!(
+            matches!(raw(id, v.clone()), Err(Refusal::Invalid(_))),
+            "{id} {v:?}"
+        );
+    }
+    // A stored value outside the range is not written at an open.
+    let e = s.get("camera.exposure.exposure_compensation").unwrap();
+    assert!(e.check_raw(256).is_err());
+    assert!(e.check_raw(-1).is_err());
+    assert!(e.check_raw(130).is_ok());
+    let e = s
+        .get("camera.white_balance.temperature_compensation")
+        .unwrap();
+    assert!(e.check_raw(101).is_err());
+    assert!(e.check_raw(100).is_ok());
+    let e = s.get("camera.focus.rightsight").unwrap();
+    assert!(e.check_raw(2).is_err());
+}
+
+#[test]
+fn an_mx_brio_row_with_an_unknown_byte_is_greyed_with_its_reason() {
+    const REASON: &str = "The camera reports a value this version does not know";
+    let mut c = Case::brio();
+    c.xu = mx_brio_xu();
+    // Exposure compensation knows every byte: 0x70 is a value.
+    c.xu[2] = reading(&EXPOSURE_COMPENSATION, 0x70, 0x80);
+    c.xu[4] = reading(&TEMPERATURE_COMPENSATION, 101, 0x32);
+    c.xu[1] = reading(&SHOW_MODE, 2, 0);
+    c.xu[6] = reading(&RIGHTSIGHT_SPEED, 3, 9);
+    c.open = true;
+    let s = c.build();
+    for id in [
+        "camera.white_balance.temperature_compensation",
+        "camera.focus.show_mode",
+        "camera.focus.rightsight_speed",
+    ] {
+        assert_eq!(greyed(&s, id).as_deref(), Some(REASON), "{id}");
+    }
+    assert_eq!(greyed(&s, "camera.exposure.exposure_compensation"), None);
+    assert_eq!(
+        value(&s, "camera.exposure.exposure_compensation"),
+        Some(SettingValue::Int(0x70))
+    );
+    assert_eq!(
+        value(&s, "camera.white_balance.temperature_compensation"),
+        Some(SettingValue::Int(101))
+    );
+    // An off/on byte that is neither 0 nor 1 is no option: not on.
+    assert_eq!(
+        setting(&s, "camera.focus.show_mode").kind,
+        SettingKind::Bool {
+            default: false,
+            value: false,
+        }
+    );
+    assert_eq!(value(&s, "camera.focus.rightsight_speed"), str_value("m3"));
+    // An unknown default: the row's fallback default.
+    let SettingKind::Enum { default, .. } = &setting(&s, "camera.focus.rightsight_speed").kind
+    else {
+        panic!()
+    };
+    assert_eq!(default, "default");
+    // The others stay enabled; the field of view keeps its own reason.
+    for id in [
+        "camera.image.vibrance",
+        "camera.focus.rightsight",
+        "camera.focus.field_of_view",
+    ] {
+        assert_eq!(greyed(&s, id), None, "{id}");
+    }
+    c.xu[0] = fov(0x07);
+    assert_eq!(
+        greyed(&c.build(), "camera.focus.field_of_view").as_deref(),
+        Some(REASON_XU_UNKNOWN)
+    );
+    assert_eq!(
+        REASON_XU_UNKNOWN,
+        "The camera reports a field of view this version does not know"
+    );
+    // A Brio (046d:085e): its rows are the field of view only.
+    let brio = obc_core::UsbId {
+        vendor: 0x046d,
+        product: 0x085e,
+    };
+    let mut c = Case::brio();
+    c.xu = obc_pipeline::xu::rows_for(brio)
+        .into_iter()
+        .map(|row| reading(row, 0, 0))
+        .collect();
+    let s = c.build();
+    let xu: Vec<&str> = s
+        .entries
+        .iter()
+        .filter(|e| matches!(e.target, Target::Xu(_)))
+        .map(|e| e.setting.id.as_str())
+        .collect();
+    assert_eq!(xu, ["camera.focus.field_of_view"]);
+}
+
+#[test]
+fn an_off_on_extension_unit_byte_is_on_for_1_only() {
+    for (byte, on, known) in [
+        (0, false, true),
+        (1, true, true),
+        (2, false, false),
+        (0xff, false, false),
+    ] {
+        for row in [&SHOW_MODE, &RIGHTSIGHT] {
+            let mut c = Case::brio();
+            c.xu = vec![reading(row, byte, 0)];
+            c.open = true;
+            let s = c.build();
+            let id = format!("camera.focus.{}", row.name);
+            assert_eq!(
+                setting(&s, &id).kind,
+                SettingKind::Bool {
+                    default: false,
+                    value: on,
+                },
+                "{id} {byte}"
+            );
+            assert_eq!(greyed(&s, &id).is_none(), known, "{id} {byte}");
+        }
+    }
+}
+
+#[test]
+fn a_write_of_a_rightsight_row_reads_the_other_two_again() {
+    let mut c = Case::brio();
+    c.xu = mx_brio_xu();
+    c.open = true;
+    let s = c.build();
+    // The three bytes of one control: each a write that reads the rest.
+    for id in [
+        "camera.focus.rightsight",
+        "camera.focus.rightsight_speed",
+        "camera.focus.rightsight_distance",
+    ] {
+        let e = s.get(id).unwrap();
+        assert!(e.updates_others, "{id}");
+        assert_eq!(e.flags, CTRL_FLAG_UPDATE, "{id}");
+        assert!(!e.inactive(), "{id}");
+        assert!(e.setting.enabled, "{id}");
+    }
+    // A row with a control of its own: nothing else to read.
+    for id in [
+        "camera.focus.field_of_view",
+        "camera.focus.show_mode",
+        "camera.exposure.exposure_compensation",
+        "camera.image.vibrance",
+        "camera.white_balance.temperature_compensation",
+    ] {
+        let e = s.get(id).unwrap();
+        assert!(!e.updates_others, "{id}");
+        assert_eq!(e.flags, 0, "{id}");
+    }
 }

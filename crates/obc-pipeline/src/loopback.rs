@@ -877,6 +877,10 @@ pub struct LoopbackWriter {
     /// How the writer's frames are laid out (the crash cover's image
     /// check).
     frame_layout: FrameLayout,
+    /// Holds each image decode started from now until opened (tests): a
+    /// pending decode observed without racing its thread.
+    #[cfg(test)]
+    decode_gate: Option<Arc<tests::DecodeGate>>,
 }
 
 impl std::fmt::Debug for LoopbackWriter {
@@ -1073,6 +1077,8 @@ impl LoopbackWriter {
             cover: Arc::clone(&shared.cover),
             cover_probe: None,
             frame_layout: frame_layout(&contract)?,
+            #[cfg(test)]
+            decode_gate: None,
             shared,
         })
     }
@@ -1299,9 +1305,15 @@ impl LoopbackWriter {
         let contract = self.cfg.contract;
         let done = Arc::new(Mutex::new(Some(done)));
         let on_thread = Arc::clone(&done);
+        #[cfg(test)]
+        let gate = self.decode_gate.clone();
         let spawned = std::thread::Builder::new()
             .name(name.into())
             .spawn(move || {
+                #[cfg(test)]
+                if let Some(gate) = gate {
+                    gate.wait();
+                }
                 let frame = image_contract_frame(&contract, &path);
                 if let Some(done) = on_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
                     done(frame);
@@ -1715,6 +1727,56 @@ mod tests {
         log
     }
 
+    /// Holds the image decodes of a writer ([`LoopbackWriter::gate_decodes`])
+    /// until opened: closed, the decode is pending however fast it would
+    /// end (a missing file fails at once), so its state is no race.
+    #[derive(Debug, Default)]
+    pub(super) struct DecodeGate {
+        open: Mutex<bool>,
+        opened: std::sync::Condvar,
+    }
+
+    impl DecodeGate {
+        /// Blocks the decode thread until the gate is opened.
+        pub(super) fn wait(&self) {
+            let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+            while !*open {
+                open = self.opened.wait(open).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+
+        fn open(&self) {
+            *self.open.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            self.opened.notify_all();
+        }
+    }
+
+    /// A closed [`DecodeGate`]; opened by [`Self::open`], or when dropped
+    /// (a failing test leaves no decode thread blocked).
+    struct GateHandle(Arc<DecodeGate>);
+
+    impl GateHandle {
+        fn open(&self) {
+            self.0.open();
+        }
+    }
+
+    impl Drop for GateHandle {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    impl LoopbackWriter {
+        /// Holds every image decode started from now until the handle
+        /// opens (the one before, if any, stays as it is).
+        fn gate_decodes(&mut self) -> GateHandle {
+            let gate = Arc::new(DecodeGate::default());
+            self.decode_gate = Some(Arc::clone(&gate));
+            GateHandle(gate)
+        }
+    }
+
     fn wait_until(limit: Duration, what: &str, mut done: impl FnMut() -> bool) {
         let deadline = Instant::now() + limit;
         while !done() {
@@ -1903,8 +1965,10 @@ mod tests {
         std::fs::write(&other, b"not an image").unwrap();
         w.set_placeholder_image(Some(&other));
         w.set_placeholder_image(None);
+        let gate = w.gate_decodes();
         w.set_placeholder_image(Some(&png));
         assert_eq!(w.placeholder_state(), PlaceholderState::Pending);
+        gate.open();
         wait_until(Duration::from_secs(10), "the image decoded again", || {
             w.placeholder_state() == PlaceholderState::Image
         });
@@ -1920,8 +1984,10 @@ mod tests {
         });
         // A failed decode is not kept: asked for again, read again.
         w.set_placeholder_image(None);
+        let gate = w.gate_decodes();
         w.set_placeholder_image(Some(&png));
         assert_eq!(w.placeholder_state(), PlaceholderState::Pending);
+        gate.open();
         w.stop().unwrap();
     }
 
@@ -2012,10 +2078,13 @@ mod tests {
             cfg.image_wait = wait;
             let mut w = LoopbackWriter::build_with(cfg).unwrap();
             let log = watch_sink(&w);
+            // Pending until the test opens the gate, however fast the
+            // decode would end.
+            let gate = w.gate_decodes();
             w.set_placeholder_image(Some(image));
             assert_eq!(w.placeholder_state(), PlaceholderState::Pending);
             w.start().unwrap();
-            (w, log)
+            (w, log, gate)
         };
         let buffers = |log: &Mutex<SinkLog>, n: usize| {
             wait_until(Duration::from_secs(10), "buffers at the sink", || {
@@ -2024,20 +2093,24 @@ mod tests {
             log.lock().unwrap().buffers.clone()
         };
         // The default bound: the image from the first frame on.
-        let (mut w, log) = start(WriterConfig::IMAGE_WAIT, &png);
+        let (mut w, log, gate) = start(WriterConfig::IMAGE_WAIT, &png);
+        gate.open();
         let seen = buffers(&log, 5);
         assert!(seen.iter().all(|b| b.white), "{seen:?}");
         assert_eq!(w.placeholder_state(), PlaceholderState::Image);
         w.stop().unwrap();
         // No wait: black first, the image once decoded.
-        let (mut w, log) = start(Duration::ZERO, &png);
+        let (mut w, log, gate) = start(Duration::ZERO, &png);
         assert!(buffers(&log, 1)[0].black);
+        gate.open();
         wait_until(Duration::from_secs(10), "the image", || {
             log.lock().unwrap().buffers.iter().any(|b| b.white)
         });
         w.stop().unwrap();
         // Unreadable: the wait ends with the failure, black.
-        let (mut w, log) = start(Duration::from_secs(60), &dir.path().join("gone.png"));
+        let (mut w, log, gate) = start(Duration::from_secs(60), &dir.path().join("gone.png"));
+        assert!(log.lock().unwrap().buffers.is_empty(), "no wait");
+        gate.open();
         assert!(buffers(&log, 3).iter().all(|b| b.black));
         assert!(matches!(w.placeholder_state(), PlaceholderState::Failed(_)));
         w.stop().unwrap();
@@ -2214,7 +2287,8 @@ mod tests {
 
     /// (a) Placeholder only: the writer alone sends black frames of the
     /// contract (caps, size, content) at no more than the contract rate:
-    /// the k-th has a PTS of at least k periods. One caps negotiation.
+    /// the k-th has a PTS of at least k periods after the start. One caps
+    /// negotiation.
     #[test]
     fn alone_the_writer_sends_black_frames_at_the_contract_rate() {
         require_elements(ELEMENTS);
@@ -2249,11 +2323,17 @@ mod tests {
                 assert!(b.black, "{format} #{k} is not black");
                 assert_eq!(b.duration, Some(period));
                 assert_eq!(b.data, first, "{format} #{k}: the one black frame");
-                // Never faster than the contract rate.
-                let since_first = b.pts - log.buffers[0].pts;
+                // Never faster than the contract rate. Measured from the
+                // start, not from frame #0: the loop schedules on a grid
+                // from its thread's start but stamps the push time, so a
+                // late push (#0 most often) is followed by a shorter gap.
+                // The k-th is planned at least k periods after the thread
+                // started (a resync only moves the grid later), which is
+                // after `mono_start`, and its PTS is not before its push:
+                // exact, no tolerance.
                 assert!(
-                    since_first >= k as u64 * period,
-                    "{format} #{k}: pts {}",
+                    b.pts >= mono_start + k as u64 * period,
+                    "{format} #{k}: pts {} less than {k} periods after the start {mono_start}",
                     b.pts
                 );
                 // CLOCK_MONOTONIC at the push.

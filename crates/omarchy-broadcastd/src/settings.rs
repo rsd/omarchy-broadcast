@@ -29,8 +29,11 @@
 //! - **Values.** The raw device value maps to the setting's: an int as it
 //!   is, a bool as `raw != 0` (the opposite for the inverted
 //!   `camera.exposure.keep_framerate`), a menu item to its option id, an
-//!   Extension Unit byte to its row option. Stored values are raw, under the
-//!   control's name.
+//!   Extension Unit byte by its row's kind (`obc_pipeline::xu::XuKind`): a
+//!   menu row's to its option id, an off/on row's as a bool (`true` for 1
+//!   only: a byte that is neither 0 nor 1 is no option, published `false`
+//!   and greyed), a range row's as an int in the range. Stored values are
+//!   raw, under the control's name.
 //! - **Effective value** (what is published): while the session has the
 //!   camera open, the device's; otherwise the stored value, else raw 0 for
 //!   `exposure_dynamic_framerate` when the next open pins it
@@ -39,8 +42,9 @@
 //!   else the device's.
 //! - **Enabled.** Not when the device flags the control disabled or
 //!   read-only ([`REASON_FIXED`]) or grabbed ([`REASON_GRABBED`]), nor an
-//!   Extension Unit row whose current byte it does not know
-//!   ([`REASON_XU_UNKNOWN`]). A control with a catalogue rule is enabled
+//!   Extension Unit row whose current byte is none of its values (outside
+//!   a range row's range), with the row's reason (`XuRow::unknown_reason`;
+//!   the field of view's is [`REASON_XU_UNKNOWN`]). A control with a catalogue rule is enabled
 //!   while the rule holds over its master's effective value and, while the
 //!   camera is open, the device does not flag it inactive (its reason is the
 //!   rule's); a rule whose master the camera does not expose (or exposes as
@@ -79,7 +83,7 @@ use obc_pipeline::controls::{
     CTRL_FLAG_UPDATE, CTRL_TYPE_BOOLEAN, CTRL_TYPE_BUTTON, CTRL_TYPE_INTEGER,
     CTRL_TYPE_INTEGER_MENU, CTRL_TYPE_MENU,
 };
-use obc_pipeline::xu::{XuRow, XuState};
+use obc_pipeline::xu::{FIELD_OF_VIEW, XU_ROWS, XuKind, XuRow, XuState};
 
 pub mod catalogue;
 pub mod effects;
@@ -118,8 +122,9 @@ pub const REASON_FIXED: &str = "The camera does not allow changing this";
 pub const REASON_GRABBED: &str = "The camera does not allow changing this while it streams";
 /// Why an inactive control without a catalogue rule is greyed.
 pub const REASON_INACTIVE: &str = "The camera does not allow changing this now";
-/// Why an Extension Unit setting with an unknown current byte is greyed.
-pub const REASON_XU_UNKNOWN: &str = "The camera reports a field of view this version does not know";
+/// Why the field of view is greyed while its current byte is unknown (each
+/// Extension Unit row has its own: `XuRow::unknown_reason`).
+pub const REASON_XU_UNKNOWN: &str = FIELD_OF_VIEW.unknown_reason;
 
 /// A device string made safe to show: C0 and C1 control characters, the
 /// bidirectional embeddings, overrides and isolates (U+202A to U+202E,
@@ -253,7 +258,10 @@ pub struct Entry {
     pub device: Option<i32>,
     /// The raw default (`None`: an action).
     pub default: Option<i32>,
-    /// The device's flags (`V4L2_CTRL_FLAG_*`; 0 for an Extension Unit row).
+    /// The device's flags (`V4L2_CTRL_FLAG_*`). An Extension Unit row has
+    /// none but `V4L2_CTRL_FLAG_UPDATE` when it shares its control with
+    /// other rows (the MX Brio's RightSight block): a write of it rewrites
+    /// their bytes too, so every control is read again after it.
     pub flags: u32,
     /// Another published setting depends on this one, or the device says a
     /// change of it may change others (`V4L2_CTRL_FLAG_UPDATE`): after a
@@ -365,8 +373,9 @@ struct Candidate {
     /// The int range and step.
     range: (i64, i64, i64),
     rule: Option<Rule>,
-    /// The device's current byte is not one the row knows.
-    unknown_xu: bool,
+    /// The device's current byte is not one the row knows: the row's
+    /// reason.
+    unknown_xu: Option<&'static str>,
     /// The option labels, in the order of `values`.
     labels: Vec<String>,
 }
@@ -665,7 +674,7 @@ fn control_candidate(
             i64::from(info.step.max(1)),
         ),
         rule: k.and_then(|k| k.rule),
-        unknown_xu: false,
+        unknown_xu: None,
         labels,
     })
 }
@@ -719,7 +728,11 @@ fn menu_options(
     (options, labels)
 }
 
-/// The candidate of an Extension Unit row.
+/// The candidate of an Extension Unit row: an enum of a menu row's
+/// options, a bool of an off/on row, an int of a range row (step 1).
+/// Flagged `V4L2_CTRL_FLAG_UPDATE` when another known row shares its
+/// control (unit GUID and selector): after a write of one, the others are
+/// read again.
 fn xu_candidate(x: &XuReading, seq: usize, notes: &mut Vec<String>) -> Candidate {
     let row = x.row;
     let known = catalogue::by_name(row.name).filter(|(_, k)| k.cid == XU);
@@ -727,20 +740,28 @@ fn xu_candidate(x: &XuReading, seq: usize, notes: &mut Vec<String>) -> Candidate
         Some((i, k)) => ((i, 0), k.group, k.label.to_string()),
         None => ((CATALOGUE.len(), seq), OTHER, row.label.to_string()),
     };
-    let mut options: Vec<(String, i32)> = row
-        .options
-        .iter()
-        .map(|o| (o.id.to_string(), i32::from(o.value)))
-        .collect();
-    let mut labels: Vec<String> = row.options.iter().map(|o| o.label.to_string()).collect();
-    if options.len() > MAX_OPTIONS {
-        notes.push(format!(
-            "{} has more than {MAX_OPTIONS} options: the last are left out",
-            row.name
-        ));
-        options.truncate(MAX_OPTIONS);
-        labels.truncate(MAX_OPTIONS);
-    }
+    let (values, labels, range) = match row.kind {
+        XuKind::Menu { options, .. } => {
+            let mut values: Vec<(String, i32)> = options
+                .iter()
+                .map(|o| (o.id.to_string(), i32::from(o.value)))
+                .collect();
+            let mut labels: Vec<String> = options.iter().map(|o| o.label.to_string()).collect();
+            if values.len() > MAX_OPTIONS {
+                notes.push(format!(
+                    "{} has more than {MAX_OPTIONS} options: the last are left out",
+                    row.name
+                ));
+                values.truncate(MAX_OPTIONS);
+                labels.truncate(MAX_OPTIONS);
+            }
+            (Values::Options(values), labels, (0, 0, 1))
+        }
+        XuKind::Bool => (Values::Bool { inverted: false }, Vec::new(), (0, 1, 1)),
+        XuKind::Range { min, max, .. } => {
+            (Values::Int, Vec::new(), (i64::from(min), i64::from(max), 1))
+        }
+    };
     Candidate {
         group,
         order,
@@ -749,15 +770,31 @@ fn xu_candidate(x: &XuReading, seq: usize, notes: &mut Vec<String>) -> Candidate
         label,
         unit: None,
         target: Target::Xu(row),
-        values: Values::Options(options),
+        values,
         device: Some(i32::from(x.state.current)),
         default: Some(i32::from(x.state.default.value)),
-        flags: 0,
-        range: (0, 0, 1),
+        flags: if shares_control(row) {
+            CTRL_FLAG_UPDATE
+        } else {
+            0
+        },
+        range,
         rule: None,
-        unknown_xu: x.state.current_option.is_none(),
+        unknown_xu: x
+            .state
+            .current_option
+            .is_none()
+            .then_some(row.unknown_reason),
         labels,
     }
+}
+
+/// Whether another row of `obc_pipeline::xu::XU_ROWS` is a byte of the
+/// same control as `row` (the same unit GUID and selector).
+fn shares_control(row: &XuRow) -> bool {
+    XU_ROWS
+        .iter()
+        .any(|r| r.name != row.name && r.guid == row.guid && r.selector == row.selector)
 }
 
 /// The candidate's effective raw value (see the module docs).
@@ -843,8 +880,8 @@ fn enabled(
     if c.flags & CTRL_FLAG_GRABBED != 0 {
         return (false, REASON_GRABBED);
     }
-    if c.unknown_xu {
-        return (false, REASON_XU_UNKNOWN);
+    if let Some(reason) = c.unknown_xu {
+        return (false, reason);
     }
     let inactive = c.flags & CTRL_FLAG_INACTIVE != 0;
     match c.rule {
@@ -877,10 +914,18 @@ fn kind(c: &Candidate, raw: Option<i32>) -> SettingKind {
             value: raw.into(),
             unit: c.unit.clone(),
         },
-        Values::Bool { inverted } => SettingKind::Bool {
-            default: (default != 0) != *inverted,
-            value: (raw != 0) != *inverted,
-        },
+        // An Extension Unit off/on row is on for byte 1 only: another byte
+        // is no option of it (greyed), not on.
+        Values::Bool { inverted } => {
+            let on = |raw: i32| match c.target {
+                Target::Xu(_) => raw == 1,
+                Target::Ctrl(_) => raw != 0,
+            };
+            SettingKind::Bool {
+                default: on(default) != *inverted,
+                value: on(raw) != *inverted,
+            }
+        }
         Values::Options(o) => SettingKind::Enum {
             options: o
                 .iter()

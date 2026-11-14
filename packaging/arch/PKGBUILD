@@ -72,7 +72,7 @@
 
 pkgname=omarchy-broadcast-git
 _pkgname=omarchy-broadcast
-pkgver=0.50.0
+pkgver=0.51.0
 pkgrel=1
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API and a CLI'
 arch=('x86_64')
@@ -92,6 +92,7 @@ depends=(
   'nvidia-utils'           # libcuda.so.1 (CUDA driver API) and libnvidia-ml.so.1 (NVML GPU load)
   'V4L2LOOPBACK-MODULE'    # the loopback kernel module, e.g. v4l2loopback-dkms
   'libpipewire'            # libpipewire-0.3.so.0: the optional PipeWire camera node
+  'alsa-lib'               # libasound.so.2: the audio worker's hardware microphone gain
 )
 makedepends=(
   'cargo'

@@ -1356,7 +1356,9 @@ async fn proxy_reads_every_property() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 23);
+    assert_eq!(INTERFACE_REVISION, 25);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::MIC_HARDWARE_GAIN_REVISION);
+    assert_eq!(obc_ipc::CAMERA_XU_SETTINGS_REVISION, 24);
     assert_eq!(obc_ipc::BATTERY_SAVER_AUTO_REVISION, 23);
     assert_eq!(obc_ipc::BATTERY_SAVER_REVISION, 22);
     assert_eq!(obc_ipc::PRIVACY_REVISION, 21);

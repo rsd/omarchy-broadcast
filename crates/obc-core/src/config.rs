@@ -102,6 +102,12 @@ pub mod limits {
     pub const MAX_MIC_GPU_WARM_S: u64 = MAX_MIC_IDLE_EXIT_S;
     /// `mic.device`: at most this many bytes.
     pub const MAX_MIC_DEVICE_BYTES: usize = 256;
+    /// `mic.hardware_gain_db`: this to [`MAX_MIC_HARDWARE_GAIN_DB`] dB, a
+    /// sanity bound only: the audio worker clamps the value to the range the
+    /// device reports when it applies it.
+    pub const MIN_MIC_HARDWARE_GAIN_DB: f64 = -100.0;
+    /// `mic.hardware_gain_db`: [`MIN_MIC_HARDWARE_GAIN_DB`] to this dB.
+    pub const MAX_MIC_HARDWARE_GAIN_DB: f64 = 100.0;
 }
 
 /// A config file that cannot be used. The previous config stays in force.
@@ -612,6 +618,15 @@ pub struct MicConfig {
     /// with noise or room echo removal) together, for testing; off, the
     /// conflicting stages are greyed.
     pub force_conflicts: bool,
+    /// The capture gain of the microphone's hardware (its ALSA mixer's
+    /// capture volume), in dB, that the audio worker sets on a USB
+    /// microphone whenever it appears; rounded to the device's step and
+    /// clamped to its range then. Unset (`None`, the default) leaves the
+    /// device's gain as it is. PipeWire shows the same control as the
+    /// source's volume: a later change there wins until the device appears
+    /// again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardware_gain_db: Option<f64>,
 }
 
 impl Default for MicConfig {
@@ -624,6 +639,7 @@ impl Default for MicConfig {
             gpu_warm_s: 30,
             gpu_policy: MicGpuPolicy::Always,
             force_conflicts: false,
+            hardware_gain_db: None,
         }
     }
 }
@@ -676,6 +692,19 @@ impl MicConfig {
                     self.gpu_warm_s
                 ),
             ));
+        }
+        if let Some(db) = self.hardware_gain_db {
+            let range = limits::MIN_MIC_HARDWARE_GAIN_DB..=limits::MAX_MIC_HARDWARE_GAIN_DB;
+            if !db.is_finite() || !range.contains(&db) {
+                return Err((
+                    "mic.hardware_gain_db",
+                    format!(
+                        "must be {} to {} dB, got {db}",
+                        limits::MIN_MIC_HARDWARE_GAIN_DB,
+                        limits::MAX_MIC_HARDWARE_GAIN_DB
+                    ),
+                ));
+            }
         }
         Ok(())
     }
@@ -2407,6 +2436,7 @@ offer_nv12 = false
         expected.effect.background_image = Some("/home/user/Pictures/background.png".into());
         expected.effect.fallback_image = Some("/home/user/Pictures/away.png".into());
         expected.effect.maxine_root = Some("/home/user/.local/opt/maxine/VideoFX".into());
+        expected.mic.hardware_gain_db = Some(36.0);
         expected.modules = ModulesConfig {
             dirs: vec!["/home/user/omarchy-modules".into()],
             disabled: vec!["org.example.hello".into()],
@@ -2455,6 +2485,7 @@ offer_nv12 = false
             "idle_exit_s",
             "gpu_warm_s",
             "gpu_policy",
+            "hardware_gain_db",
             "force_conflicts",
             "battery_saver",
         ] {
@@ -2850,6 +2881,26 @@ offer_nv12 = false
                 "mic.gpu_policy",
                 "unknown variant",
             ),
+            (
+                "[mic]\nhardware_gain_db = 120.0",
+                "mic.hardware_gain_db",
+                "must be -100 to 100 dB",
+            ),
+            (
+                "[mic]\nhardware_gain_db = -101",
+                "mic.hardware_gain_db",
+                "must be -100 to 100 dB",
+            ),
+            (
+                "[mic]\nhardware_gain_db = nan",
+                "mic.hardware_gain_db",
+                "must be -100 to 100 dB",
+            ),
+            (
+                "[mic]\nhardware_gain_db = \"loud\"",
+                "mic.hardware_gain_db",
+                "invalid type",
+            ),
         ];
         for (text, key, reason) in cases {
             let e = parse(text).unwrap_err();
@@ -3128,7 +3179,8 @@ offer_nv12 = false
     fn the_mic_section_reads_and_defaults() {
         let c = parse(
             "[mic]\nenabled = false\ndevice = \"alsa_input.usb-x\"\npipeline_depth = 3\n\
-             idle_exit_s = 0\ngpu_warm_s = 5\ngpu_policy = \"with-camera\"\nforce_conflicts = true",
+             idle_exit_s = 0\ngpu_warm_s = 5\ngpu_policy = \"with-camera\"\nforce_conflicts = true\n\
+             hardware_gain_db = 40.5",
         )
         .unwrap();
         assert_eq!(
@@ -3141,8 +3193,25 @@ offer_nv12 = false
                 gpu_warm_s: 5,
                 gpu_policy: MicGpuPolicy::WithCamera,
                 force_conflicts: true,
+                hardware_gain_db: Some(40.5),
             }
         );
+        // A whole number is a number of dB too; the bounds are taken.
+        assert_eq!(
+            parse("[mic]\nhardware_gain_db = 30")
+                .unwrap()
+                .mic
+                .hardware_gain_db,
+            Some(30.0)
+        );
+        for edge in ["-100.0", "100"] {
+            let c = parse(&format!("[mic]\nhardware_gain_db = {edge}")).unwrap();
+            assert_eq!(c.mic.hardware_gain_db.map(f64::abs), Some(100.0));
+        }
+        // Unset: the device is left as it is, and nothing is written back.
+        assert_eq!(Config::default().mic.hardware_gain_db, None);
+        let text = toml::to_string(&Config::default()).unwrap();
+        assert!(!text.contains("hardware_gain_db"), "{text}");
         assert_eq!(MicGpuPolicy::WithCamera.as_str(), "with-camera");
         let d = Config::default().mic;
         assert!(d.enabled);
