@@ -2346,6 +2346,44 @@ fn host_a_load_notice_is_reported_while_its_chain_runs() {
     assert_no_cuda(&rig, &fake);
 }
 
+/// A frame failure hides the notice with the effect failed, but the chain
+/// that carries it stays loaded: the retry that finds it loaded (nothing
+/// loads again, so no load reports it) shows the notice again, for the
+/// fallback is still in force.
+#[test]
+fn host_a_load_notice_returns_with_its_chain_after_a_frame_failure() {
+    const NOTICE: &str = "Engine A was chosen and cannot run: no device; using B";
+    let fake = FakeFactory::new(FakeConfig {
+        load_notice: Some(NOTICE.into()),
+        ..FakeConfig::default()
+    });
+    let mut rig = HostRig::new(Some(Arc::clone(&fake)), &blur_chair(false));
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert_eq!(rig.effect.stats().load_notice.as_deref(), Some(NOTICE));
+    let loads = get(&fake.log.loads);
+
+    fake.set(|c| c.fail_process = Some("fake frame failure".into()));
+    rig.frames_until(Duration::from_secs(5), |r| {
+        matches!(r.effect.status(), EffectStatus::Failed(_))
+    });
+    assert_eq!(
+        rig.effect.stats().load_notice,
+        None,
+        "hidden under the failure"
+    );
+
+    fake.set(|c| c.fail_process = None);
+    let same = rig.effect.settings();
+    rig.effect.apply(&same).unwrap();
+    rig.frames_until(Duration::from_secs(5), status_is(EffectStatus::Ready));
+    assert_eq!(get(&fake.log.loads), loads, "the chain was found loaded");
+    assert_eq!(rig.effect.stats().load_notice.as_deref(), Some(NOTICE));
+    wait_posted(&rig, "load-notice", NOTICE);
+    rig.stop();
+    assert_eq!(rig.effect.stats().load_notice, None, "a stop clears it");
+    assert_no_cuda(&rig, &fake);
+}
+
 /// New caps end a refused switch at once: nothing of it stays loaded, and
 /// the full reload loads the settings or fails.
 #[test]

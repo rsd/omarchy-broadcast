@@ -32,6 +32,23 @@ pub struct StageStatus {
     pub reason: String,
 }
 
+/// The microphone's hardware capture gain (see [`crate::mixer`]), in dB.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HardwareGain {
+    /// The ALSA control (simple element) it is.
+    pub control: String,
+    /// The gain now.
+    pub db: f64,
+    /// The range's ends.
+    pub min_db: f64,
+    pub max_db: f64,
+    /// The step (0 for a control of one value).
+    pub step_db: f64,
+    /// The device holds the value `[mic] hardware_gain_db` asks for (set
+    /// by the worker, not changed since); false while it is unset.
+    pub applied: bool,
+}
+
 /// The status. See the module documentation.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Status {
@@ -66,6 +83,12 @@ pub struct Status {
     pub voice: f64,
     /// Every audio stage offered.
     pub stages: Vec<StageStatus>,
+    /// The hardware gain of the microphone captured; `null` when it is
+    /// not a USB device with one capture control (or not known); left out
+    /// while pending (the gain thread has not handled a device yet: the
+    /// daemon keeps the gain it knew).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardware_gain: crate::mixer::Published,
 }
 
 impl Default for Status {
@@ -84,6 +107,7 @@ impl Default for Status {
             misses: 0,
             voice: -1.0,
             stages: Vec::new(),
+            hardware_gain: None,
         }
     }
 }

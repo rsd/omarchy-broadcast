@@ -9,8 +9,10 @@
 //! * The registry feeds the [`Graph`]: every node, every link, the
 //!   `default` metadata's properties. Stream input nodes (the consumers)
 //!   are bound to learn whether they are monitors (`stream.monitor`,
-//!   `resample.peaks`: properties the registry does not carry), and the
-//!   microphone node to set its `ProcessLatency`.
+//!   `resample.peaks`: properties the registry does not carry), the
+//!   hardware sources to learn their ALSA side (card, USB: for the
+//!   hardware gain, [`crate::mixer`]), and the microphone node to set its
+//!   `ProcessLatency`.
 //! * Requests travel over a channel and are answered on the thread, in
 //!   order, against the graph as it is (our own metadata writes applied at
 //!   once). The consumer count is published after every change and read
@@ -51,9 +53,10 @@ use spa::pod::serialize::PodSerializer;
 use spa::pod::{Object, Pod, Property, Value};
 use spa::utils::result::AsyncSeq;
 
-use super::graph::{Graph, MIC_NODE, MetaWrite, NodeInfo, is_monitor};
+use super::graph::{AlsaProps, Graph, MIC_NODE, MetaWrite, NodeInfo, is_monitor};
 use super::{
-    CONSUMERS_DEBOUNCE, Consumers, Debounce, PipeWireControl, PipeWireError, SourceDevice,
+    AlsaSources, CONSUMERS_DEBOUNCE, Consumers, Debounce, PipeWireControl, PipeWireError,
+    SourceDevice,
 };
 use crate::engine::lock;
 use crate::{debug, info, warning};
@@ -92,10 +95,24 @@ enum Cmd {
 struct Published {
     /// The consumers, raw; `None` while not connected and synced.
     consumers: Option<Consumers>,
+    /// The sources' ALSA side; `None` while not connected and synced.
+    sources: Option<AlsaSources>,
+    /// Moves whenever `sources` changes.
+    sources_serial: u64,
     /// Connected, not synced yet.
     pending: bool,
     /// The first connection failed or synced: requests may go.
     ready: bool,
+}
+
+impl Published {
+    /// Sets the sources, moving the serial when they changed.
+    fn set_sources(&mut self, sources: Option<AlsaSources>) {
+        if self.sources != sources {
+            self.sources = sources;
+            self.sources_serial = self.sources_serial.wrapping_add(1);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -109,6 +126,9 @@ impl Common {
     fn publish(&self, consumers: Option<Consumers>, pending: bool) {
         let mut p = lock(&self.published);
         p.consumers = consumers;
+        if consumers.is_none() {
+            p.set_sources(None);
+        }
         p.pending = pending && consumers.is_none();
         if !p.ready && !p.pending {
             p.ready = true;
@@ -244,6 +264,15 @@ impl PipeWireControl for Live {
         self.sender().is_some() && lock(&self.common.published).pending
     }
 
+    fn alsa_sources(&self) -> Option<AlsaSources> {
+        self.sender()?;
+        lock(&self.common.published).sources.clone()
+    }
+
+    fn alsa_sources_serial(&self) -> u64 {
+        lock(&self.common.published).sources_serial
+    }
+
     fn set_latency(&self, samples: Option<u32>) {
         if let Some(tx) = self.sender() {
             let _ = tx.send(Cmd::Latency(samples));
@@ -309,6 +338,8 @@ impl Ctx {
         let synced = *self.synced.borrow();
         let consumers = synced.then(|| self.graph.borrow().consumers());
         self.common.publish(consumers, !synced);
+        let sources = synced.then(|| self.graph.borrow().alsa_sources());
+        lock(&self.common.published).set_sources(sources);
     }
 
     /// Sets the wanted `ProcessLatency` again if the node reported another
@@ -447,14 +478,15 @@ fn props_of(
     g.props.and_then(|p| p.get(key)).map(str::to_string)
 }
 
-/// A node global: into the graph; a stream input or our microphone bound.
+/// A node global: into the graph; a stream input, a hardware source or our
+/// microphone bound.
 fn on_node(ctx: &Rc<Ctx>, g: &pw::registry::GlobalObject<&spa::utils::dict::DictRef>) {
     let name = props_of(g, "node.name").unwrap_or_default();
     let class = props_of(g, "media.class").unwrap_or_default();
     let description = props_of(g, "node.description")
         .or_else(|| props_of(g, "node.nick"))
         .unwrap_or_else(|| name.clone());
-    let follow = class.starts_with("Stream/Input") || name == MIC_NODE;
+    let stream_input = class.starts_with("Stream/Input");
     ctx.graph.borrow_mut().add_node(
         g.id,
         NodeInfo {
@@ -466,8 +498,11 @@ fn on_node(ctx: &Rc<Ctx>, g: &pw::registry::GlobalObject<&spa::utils::dict::Dict
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
             monitor: None,
+            alsa: None,
         },
     );
+    let device = ctx.graph.borrow().is_device(g.id);
+    let follow = stream_input || name == MIC_NODE || device;
     if !follow {
         return;
     }
@@ -495,8 +530,12 @@ fn on_node(ctx: &Rc<Ctx>, g: &pw::registry::GlobalObject<&spa::utils::dict::Dict
                 }
                 let props = info.props();
                 let get = |k: &str| props.and_then(|p| p.get(k));
-                let monitor = is_monitor(get("stream.monitor"), get("resample.peaks"));
-                ctx.graph.borrow_mut().set_monitor(id, monitor);
+                if device {
+                    ctx.graph.borrow_mut().set_alsa(id, AlsaProps::of(get));
+                } else {
+                    let monitor = is_monitor(get("stream.monitor"), get("resample.peaks"));
+                    ctx.graph.borrow_mut().set_monitor(id, monitor);
+                }
                 ctx.publish();
             });
         })

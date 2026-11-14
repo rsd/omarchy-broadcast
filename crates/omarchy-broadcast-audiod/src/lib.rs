@@ -12,6 +12,8 @@
 //! * [`snapshot`]: the audio settings the daemon pushes (and writes);
 //! * [`dbus`]: the internal control interface;
 //! * [`pipewire`]: the PipeWire side, behind a trait;
+//! * [`mixer`]: the microphone's hardware capture gain (ALSA), behind a
+//!   trait;
 //! * [`status`]: what `GetStatus` says.
 
 pub mod chain;
@@ -20,6 +22,7 @@ pub mod engine;
 pub mod host;
 pub mod listener;
 pub mod log;
+pub mod mixer;
 pub mod pipewire;
 pub mod snapshot;
 pub mod status;
@@ -143,7 +146,8 @@ pub fn run(opts: Options) -> ExitCode {
     } else {
         Box::new(pipewire::Live::new())
     };
-    let shared = Arc::new(Shared::new(host, snap, control));
+    let shared =
+        Arc::new(Shared::new(host, snap, control).with_mixer(Box::new(mixer::Alsa::default())));
     let engine = Engine::new(shared.clone(), socket);
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Exit>();
     let thread = std::thread::Builder::new()

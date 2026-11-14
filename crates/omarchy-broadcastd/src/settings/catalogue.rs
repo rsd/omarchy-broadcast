@@ -188,6 +188,7 @@ pub const CATALOGUE: &[Known] = &[
     known("brightness", 0x0098_0900, "image", "Brightness"),
     known("contrast", 0x0098_0901, "image", "Contrast"),
     known("saturation", 0x0098_0902, "image", "Saturation"),
+    known("vibrance", XU, "image", "Vibrance"),
     ruled(known("hue", 0x0098_0903, "image", "Hue"), HUE_RULE),
     known("hue_automatic", 0x0098_0919, "image", "Automatic hue"),
     known("gamma", 0x0098_0910, "image", "Gamma"),
@@ -225,6 +226,12 @@ pub const CATALOGUE: &[Known] = &[
         WB_RULE,
     ),
     known(
+        "temperature_compensation",
+        XU,
+        "white_balance",
+        "Temperature compensation",
+    ),
+    known(
         "do_white_balance",
         0x0098_090d,
         "white_balance",
@@ -247,6 +254,12 @@ pub const CATALOGUE: &[Known] = &[
         EXPOSURE_RULE,
     ),
     known("gain", 0x0098_0913, "exposure", "Gain"),
+    known(
+        "exposure_compensation",
+        XU,
+        "exposure",
+        "Exposure compensation",
+    ),
     Known {
         id_name: Some("keep_framerate"),
         inverted: true,
@@ -282,6 +295,10 @@ pub const CATALOGUE: &[Known] = &[
     known("pan_reset", 0x009a_0906, "focus", "Recentre pan"),
     known("tilt_reset", 0x009a_0907, "focus", "Recentre tilt"),
     known("field_of_view", XU, "focus", "Field of view"),
+    known("rightsight", XU, "focus", "RightSight"),
+    known("rightsight_speed", XU, "focus", "Framing speed"),
+    known("rightsight_distance", XU, "focus", "Framing distance"),
+    known("show_mode", XU, "focus", "Show Mode"),
 ];
 
 /// The catalogue entry of the control `cid` (not an Extension Unit row).

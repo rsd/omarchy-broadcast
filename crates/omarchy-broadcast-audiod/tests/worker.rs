@@ -12,7 +12,10 @@ use obc_audio::proto::RefuseReason;
 use omarchy_broadcast_audiod::engine::{Engine, Exit, Shared};
 use omarchy_broadcast_audiod::host::{GpuGate, Host};
 use omarchy_broadcast_audiod::listener;
-use omarchy_broadcast_audiod::pipewire::{Consumers, PipeWireControl, PipeWireError, SourceDevice};
+use omarchy_broadcast_audiod::mixer::{Mixer, Reading};
+use omarchy_broadcast_audiod::pipewire::{
+    AlsaSource, AlsaSources, Consumers, PipeWireControl, PipeWireError, SourceDevice,
+};
 use omarchy_broadcast_audiod::snapshot::Snapshot;
 use serde_json::json;
 
@@ -1460,4 +1463,182 @@ fn a_connection_after_a_grace_ended_with_no_plugin_decides_afresh() {
             assert!(w.run_until(&mut p, 2 * SEC, |s| s.denoise_provider().is_none()));
         }
     }
+}
+
+// ---- the hardware gain: the engine in process, a fake mixer ----
+
+/// The ALSA side [`GainPipeWire`] reports, and its serial.
+type FakeSources = Arc<Mutex<(u64, Option<AlsaSources>)>>;
+
+/// A PipeWire whose hardware sources the test sets.
+struct GainPipeWire(FakeSources);
+
+impl PipeWireControl for GainPipeWire {
+    fn devices(&self) -> Result<Vec<SourceDevice>, PipeWireError> {
+        Err(PipeWireError::Unavailable("fake".into()))
+    }
+
+    fn make_default(&self, _target: &str) -> Result<String, PipeWireError> {
+        Err(PipeWireError::Unavailable("fake".into()))
+    }
+
+    fn restore_default(&self, _previous: &str) -> Result<(), PipeWireError> {
+        Err(PipeWireError::Unavailable("fake".into()))
+    }
+
+    fn consumers(&self) -> Option<Consumers> {
+        Some(Consumers::default())
+    }
+
+    fn alsa_sources(&self) -> Option<AlsaSources> {
+        self.0.lock().unwrap().1.clone()
+    }
+
+    fn alsa_sources_serial(&self) -> u64 {
+        self.0.lock().unwrap().0
+    }
+}
+
+/// Every call the engine's gain thread made of [`GainMixer`].
+#[derive(Debug, Default)]
+struct GainCalls {
+    reads: usize,
+    sets: Vec<f64>,
+    db: f64,
+}
+
+/// One capture control, `Headset`, +18..+54 dB in 1 dB steps.
+struct GainMixer(Arc<Mutex<GainCalls>>);
+
+impl Mixer for GainMixer {
+    fn capture_controls(&mut self, _card: &str) -> Result<Vec<String>, String> {
+        Ok(vec!["Headset".into()])
+    }
+
+    fn read(&mut self, _card: &str, control: &str) -> Result<Reading, String> {
+        let mut c = self.0.lock().unwrap();
+        c.reads += 1;
+        Ok(Reading {
+            control: control.into(),
+            db: c.db,
+            min_db: 18.0,
+            max_db: 54.0,
+            step_db: 1.0,
+        })
+    }
+
+    fn set_db(&mut self, _card: &str, _control: &str, db: f64) -> Result<(), String> {
+        let mut c = self.0.lock().unwrap();
+        c.sets.push(db);
+        c.db = db;
+        Ok(())
+    }
+}
+
+/// The engine hands the gain thread the device and the value only when
+/// they (or the serial) change, and the status changes only with the
+/// reading: pending before PipeWire's sources are known.
+#[test]
+fn the_engine_hands_the_gain_over_on_change_only() {
+    let env = Env::new();
+    let snapshot = |serial: u64, warm: u64| {
+        Snapshot::parse(
+            &json!({
+                "version": 1,
+                "device": "alsa_input.usb-brio",
+                "idle_exit_s": 0,
+                "gpu_warm_s": warm,
+                "hardware_gain_db": 35.0,
+                "hardware_gain_serial": serial,
+            })
+            .to_string(),
+        )
+        .unwrap()
+    };
+    let host = Host::load(
+        obc_core::config::Config::default(),
+        &[],
+        None,
+        &snapshot(0, 0),
+        Arc::new(|_, _, _| {}),
+    );
+    let sources: FakeSources = Arc::new(Mutex::new((0, None)));
+    let calls: Arc<Mutex<GainCalls>> = Arc::new(Mutex::new(GainCalls {
+        db: 40.0,
+        ..GainCalls::default()
+    }));
+    let shared = Arc::new(
+        Shared::new(
+            host,
+            snapshot(0, 0),
+            Box::new(GainPipeWire(sources.clone())),
+        )
+        .with_mixer(Box::new(GainMixer(calls.clone()))),
+    );
+    let mut status = shared.status.subscribe();
+    let socket = env.sockets.path().join("gain.sock");
+    let engine = Engine::new(shared.clone(), listener::bind(&socket).unwrap());
+    let engine = std::thread::spawn(move || engine.run());
+    let stop = |engine: std::thread::JoinHandle<Exit>| {
+        shared.shutdown.store(true, Ordering::SeqCst);
+        engine.join().unwrap()
+    };
+    let wait = |what: &str, cond: &dyn Fn() -> bool| {
+        let end = Instant::now() + 5 * SEC;
+        while !cond() {
+            assert!(Instant::now() < end, "never {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+
+    // PipeWire not synced: nothing handed over, the gain pending.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(shared.status.borrow().hardware_gain, None);
+    assert_eq!(calls.lock().unwrap().reads, 0);
+
+    // The device appears: set once, and reported.
+    *sources.lock().unwrap() = (
+        1,
+        Some(AlsaSources {
+            capture: None,
+            captured: None,
+            sources: vec![AlsaSource {
+                id: 33,
+                name: "alsa_input.usb-brio".into(),
+                card: Some("0".into()),
+                usb: true,
+            }],
+        }),
+    );
+    wait("applied", &|| {
+        shared
+            .status
+            .borrow()
+            .hardware_gain
+            .clone()
+            .flatten()
+            .is_some_and(|g| g.applied && g.db == 35.0)
+    });
+    assert_eq!(calls.lock().unwrap().sets, [35.0]);
+
+    // Many turns of the loop, the sources' serial moving with the same
+    // sources: nothing handed over (no read), no status change.
+    let reads = calls.lock().unwrap().reads;
+    status.mark_unchanged();
+    for n in 2..12 {
+        sources.lock().unwrap().0 = n;
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert_eq!(calls.lock().unwrap().reads, reads, "handed over again");
+    assert!(!status.has_changed().unwrap(), "{:?}", *status.borrow());
+
+    // Another snapshot, the same gain and serial: nothing set.
+    shared.apply_snapshot(snapshot(0, 5));
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(calls.lock().unwrap().sets, [35.0]);
+
+    // The same value set again (another serial): set again.
+    shared.apply_snapshot(snapshot(1, 5));
+    wait("set again", &|| calls.lock().unwrap().sets.len() == 2);
+    assert_eq!(stop(engine), Exit::Shutdown);
 }

@@ -25,6 +25,8 @@ tokio = { workspace = true }
 libc = { workspace = true }
 # The PipeWire side (default source, capture pinning, consumers, latency).
 pipewire = { workspace = true }
+# The microphone's hardware capture gain (its ALSA mixer element).
+alsa = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

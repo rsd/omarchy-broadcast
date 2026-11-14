@@ -8349,22 +8349,49 @@ impl H {
 /// The example module, built (once per test binary) out of tree as a
 /// third party builds it, with a manifest naming it in a `modules.d`
 /// directory of its own; the directory is returned (kept by the caller).
+///
+/// The library the manifest names is the test's own copy, in that
+/// directory: a build of the example by another test process (another
+/// test binary, or a session's run in the same checkout, after a change
+/// to the module SDK) removes the shared build's library and links it
+/// again, and a module opened meanwhile would not be installed. Only the
+/// read below meets that build: a build of ours waits for it (cargo's
+/// lock on the target directory) and leaves the library in place.
 fn hello_modules_dir() -> TempDir {
-    static BUILT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-    let lib = BUILT.get_or_init(|| {
+    static BUILT: std::sync::OnceLock<(std::path::PathBuf, Vec<u8>)> = std::sync::OnceLock::new();
+    let (target, bytes) = BUILT.get_or_init(|| {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let target = repo.join("target/daemon-module-tests");
-        let status = std::process::Command::new(env!("CARGO"))
-            .args(["build", "--quiet", "--locked", "--manifest-path"])
-            .arg(repo.join("examples/module-hello/Cargo.toml"))
-            .arg("--target-dir")
-            .arg(&target)
-            .status()
-            .expect("run cargo");
-        assert!(status.success(), "building the example module failed");
-        target.join("debug/libobc_module_hello.so")
+        let built = target.join("debug/libobc_module_hello.so");
+        let build = || {
+            let status = std::process::Command::new(env!("CARGO"))
+                .args(["build", "--quiet", "--locked", "--manifest-path"])
+                .arg(repo.join("examples/module-hello/Cargo.toml"))
+                .arg("--target-dir")
+                .arg(&target)
+                .status()
+                .expect("run cargo");
+            assert!(status.success(), "building the example module failed");
+        };
+        for _ in 0..3 {
+            build();
+            match fs::read(&built) {
+                Ok(bytes) => return (target, bytes),
+                // Another process's build is linking it again.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => panic!("{}: {e}", built.display()),
+            }
+        }
+        panic!(
+            "{} was rebuilt by another process at each of 3 builds",
+            built.display()
+        );
     });
-    let dir = tempfile::tempdir().unwrap();
+    // In the target directory, where the build runs code: a temporary
+    // directory may be mounted without execution.
+    let dir = tempfile::tempdir_in(target).unwrap();
+    let lib = dir.path().join("libobc_module_hello.so");
+    fs::write(&lib, bytes).unwrap();
     let manifest = fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/module-hello/hello.toml"),
@@ -12938,6 +12965,71 @@ fn the_system_memory_fallback_of_a_restart_keeps_its_hold() {
     assert!(w.restart_hold_ends.is_empty(), "{:?}", w.restart_hold_ends);
 }
 
+/// After one batch that turned privacy on and enabled the example module
+/// while a restart hold taken under `none` was in force
+/// ([`restart_held_for`]): the hold was ended before the restart it
+/// caused stopped the session (the frame kept may be the room), and the
+/// new session started hidden, with the effect, its first frame not the
+/// room.
+fn assert_privacy_batch_ended_the_hold(h: &mut H, what: &str) {
+    {
+        let w = h.world();
+        assert_eq!(w.session_starts, 3, "{what}: restarted for the module");
+        // Ended once, with the running session still in the backend: the
+        // re-armed hold below has no frame of it to keep.
+        assert_eq!(w.restart_hold_ends, [true], "{what}");
+        // The running session ran the background effect: its restart
+        // holds again, under the hiding policy.
+        assert_eq!(w.restart_holds, [true, true], "{what}");
+        let (params, _) = w.session.as_ref().expect("a new session");
+        assert_eq!(
+            (params.effect.mode, params.effect.on_failure),
+            (EffectMode::Blur, EffectOnFailure::Black),
+            "{what}: started hidden"
+        );
+        assert!(stage_on(&params.effect, "hello"), "{what}");
+    }
+    assert_eq!(h.ctrl.passthrough, None, "{what}: no bare fallback");
+    assert_eq!(h.ctrl.restart_held, Some(true), "{what}");
+    // The new session's frames go live under the policy; nothing more is
+    // ended.
+    h.world().frames = true;
+    h.tick(1400);
+    assert_eq!(h.state(), State::Active, "{what}");
+    assert_eq!(h.ctrl.restart_held, None, "{what}");
+    assert_eq!(h.world().restart_hold_ends, [true], "{what}: ended once");
+}
+
+#[test]
+fn a_module_write_that_also_turns_privacy_on_ends_a_hold_that_could_show_the_camera() {
+    // The restart held under `none` (blur, the camera may be shown), its
+    // new session not live yet. A drop-in turning privacy on, written by
+    // hand and not reloaded, comes in with the next module write: one
+    // configuration change turns privacy on and enables a module whose
+    // stage the running session cannot run.
+    let effect = "mode = \"blur\"\non_failure = \"none\"\n";
+    let (mut h, _dir) = restart_held_for(effect, false, MAXINE_MODULE);
+    assert_eq!(h.ctrl.restart_held, Some(false));
+    h.write_drop_in("40-privacy.toml", "[effect]\nprivacy = true\n");
+    h.set_module(HELLO_MODULE, true, 1200);
+    assert_privacy_batch_ended_the_hold(&mut h, "module write");
+}
+
+#[test]
+fn a_reload_that_turns_privacy_on_and_enables_a_module_ends_a_hold_that_could_show_the_camera() {
+    // As above, the batch a reload: privacy on and the example module
+    // enabled in one drop-in.
+    let effect = "mode = \"blur\"\non_failure = \"none\"\n";
+    let (mut h, _dir) = restart_held_for(effect, false, MAXINE_MODULE);
+    assert_eq!(h.ctrl.restart_held, Some(false));
+    h.write_drop_in(
+        "90-batch.toml",
+        &format!("[effect]\nprivacy = true\n[modules.enabled]\n\"{HELLO_MODULE}\" = true\n"),
+    );
+    h.call(|r| Command::ReloadConfig(Some(r)), 1200).unwrap();
+    assert_privacy_batch_ended_the_hold(&mut h, "reload");
+}
+
 // ---- the guard and the start agree on a session without its effects ----
 
 const BLUR_BLACK: &str = "[effect]\nmode = \"blur\"\non_failure = \"black\"\n";
@@ -13456,6 +13548,7 @@ fn mic_catalogue() -> mic::Catalogue {
             {"id": "voice", "kind": "audio-filter", "name": "Voice", "status": "available",
              "enabled": true}]})),
         devices: vec![("alsa_input.usb-a".into(), "USB A".into())],
+        hardware_gain: None,
     }
 }
 
@@ -13595,6 +13688,53 @@ fn the_microphone_settings_follow_the_worker_and_write_where_they_belong() {
     let last = s.last().unwrap();
     assert_eq!(last["enabled"], serde_json::json!(true));
     assert_eq!(last["values"], serde_json::json!({}));
+}
+
+#[test]
+fn setting_the_hardware_gain_to_its_configured_value_again_applies_it_again() {
+    let mut h = H::new("", |_| {});
+    let mut rx = h.mic_link();
+    let mut catalogue = mic_catalogue();
+    catalogue.hardware_gain = Some(mic::HardwareGain {
+        control: "Headset".into(),
+        db: 40.0,
+        min_db: 18.0,
+        max_db: 54.0,
+        step_db: 1.0,
+        applied: false,
+    });
+    h.mic(MicEvent::Catalogue(catalogue));
+    let s = H::mic_snapshots(&mut rx);
+    assert_eq!(s.last().unwrap()["hardware_gain_serial"], 0);
+    let gain = |rx: &mut UnboundedReceiver<MicRequest>| {
+        let s = H::mic_snapshots(rx);
+        let last = s.last().expect("no snapshot sent");
+        (
+            last["hardware_gain_db"].as_f64(),
+            last["hardware_gain_serial"].as_u64(),
+        )
+    };
+    h.set_setting(mic::HARDWARE_GAIN, SettingValue::Int(40), 0)
+        .unwrap();
+    assert_eq!(gain(&mut rx), (Some(40.0), Some(1)));
+    // The same value again (the device moved meanwhile, elsewhere): the
+    // config text is the same, the snapshot is not.
+    h.set_setting(mic::HARDWARE_GAIN, SettingValue::Int(40), 0)
+        .unwrap();
+    assert_eq!(gain(&mut rx), (Some(40.0), Some(2)));
+    // `SetConfig` of the key, the same.
+    h.set_config("mic.hardware_gain_db", obc_ipc::ConfigValue::Float(40.0))
+        .unwrap();
+    assert_eq!(gain(&mut rx), (Some(40.0), Some(3)));
+    // A refused value, another key: no serial.
+    assert!(
+        h.set_setting(mic::HARDWARE_GAIN, SettingValue::Int(100), 0)
+            .is_err()
+    );
+    assert!(H::mic_snapshots(&mut rx).is_empty());
+    h.set_setting(mic::ENABLED, SettingValue::Bool(false), 0)
+        .unwrap();
+    assert_eq!(gain(&mut rx), (Some(40.0), Some(3)));
 }
 
 #[test]

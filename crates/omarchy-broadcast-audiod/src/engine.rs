@@ -94,6 +94,7 @@ use obc_audio::shm::{SLOT_FLAG_NEW_STREAM, SLOT_FLAG_RAW, WORKER_FLAG_PROCESSING
 use crate::chain::{Chain, Event, crossfade, load_group};
 use crate::host::{GpuGate, Host, LoadKey, Plan};
 use crate::listener::Socket;
+use crate::mixer::{self, Link, Mixer, Target};
 use crate::pipewire::PipeWireControl;
 use crate::snapshot::{GpuPolicy, Snapshot};
 use crate::status::{StageStatus, State, Status};
@@ -151,6 +152,12 @@ pub struct Shared {
     pub gpu_gate: Mutex<GpuGate>,
     /// The bus side, while the worker owns its name (for the idle exit).
     pub bus: Mutex<Option<tokio::sync::mpsc::UnboundedSender<BusCmd>>>,
+    /// The microphone's mixer, until the processing thread hands it to
+    /// the gain thread ([`crate::mixer::Link`]); none: no hardware gain.
+    pub mixer: Mutex<Option<Box<dyn Mixer>>>,
+    /// The hardware gain's last reading, which the gain thread publishes
+    /// (pending until it handled a device).
+    pub hardware_gain: Arc<Mutex<mixer::Published>>,
 }
 
 /// What the processing thread asks of the bus side.
@@ -187,7 +194,15 @@ impl Shared {
             pipewire,
             gpu_gate: Mutex::new(GpuGate::default()),
             bus: Mutex::new(None),
+            mixer: Mutex::new(None),
+            hardware_gain: Arc::default(),
         }
+    }
+
+    /// With `mixer` for the hardware gain.
+    pub fn with_mixer(self, mixer: Box<dyn Mixer>) -> Shared {
+        *lock(&self.mixer) = Some(mixer);
+        self
     }
 
     /// Counts a D-Bus call in flight (and as activity) until the guard
@@ -342,6 +357,13 @@ pub struct Engine {
     renegotiating: Option<Instant>,
     /// [`Engine::session_depth`] at the last plan, for the status.
     open_depth: u32,
+    /// The gain thread, while the engine runs.
+    gain: Option<Link>,
+    /// The device, the value and its serial handed to it last.
+    gain_sent: Option<(Option<Target>, Option<f64>, u64)>,
+    /// The snapshot generation and the sources' serial `gain_sent` was
+    /// worked out at: nothing to do while both stay.
+    gain_seen: Option<(u64, u64)>,
     /// The loads of the GPU plan a recorder last used since the gate last
     /// closed: a close by the consumers is held (the warm grace) while the
     /// plan in force still has them.
@@ -410,6 +432,9 @@ impl Engine {
             watchdog: Arc::new(Watchdog::new()),
             renegotiating: None,
             open_depth: 1,
+            gain: None,
+            gain_sent: None,
+            gain_seen: None,
             recorded: None,
             warm_since: None,
             stale: None,
@@ -634,8 +659,47 @@ impl Engine {
         }
     }
 
+    /// Hands the gain thread the device the hardware gain is set on, the
+    /// value wanted and its serial, when any changed (see
+    /// [`crate::mixer`]): never a mixer call here, and the sources only
+    /// read when the snapshot or they changed. Nothing is handed in while
+    /// PipeWire's sources are not known (not connected and synced): the
+    /// gain thread stays as it is (pending, at the start).
+    fn follow_gain(&mut self) {
+        let Some(link) = &self.gain else {
+            return;
+        };
+        let seen = (
+            self.shared.generation.load(Ordering::SeqCst),
+            self.shared.pipewire.alsa_sources_serial(),
+        );
+        if self.gain_seen == Some(seen) {
+            return;
+        }
+        self.gain_seen = Some(seen);
+        let Some(sources) = self.shared.pipewire.alsa_sources() else {
+            return;
+        };
+        let next = {
+            let s = lock(&self.shared.snapshot);
+            let target = mixer::resolve(&sources, &s.device);
+            (target, s.hardware_gain_db, s.hardware_gain_serial)
+        };
+        if self.gain_sent.as_ref() != Some(&next) {
+            link.send(next.0.clone(), next.1, next.2);
+            self.gain_sent = Some(next);
+        }
+    }
+
     /// Runs until idle or shut down.
     pub fn run(mut self) -> Exit {
+        let mixer = lock(&self.shared.mixer).take();
+        if let Some(m) = mixer {
+            match Link::spawn(m, self.shared.hardware_gain.clone()) {
+                Ok(l) => self.gain = Some(l),
+                Err(e) => warning!("cannot start the hardware gain thread: {e}"),
+            }
+        }
         let watchdog = {
             let w = self.watchdog.clone();
             std::thread::Builder::new()
@@ -650,6 +714,7 @@ impl Engine {
                 break Exit::Shutdown;
             }
             self.follow_snapshot();
+            self.follow_gain();
             self.follow_gate();
             self.follow_depth();
             self.drive_loads();
@@ -664,6 +729,7 @@ impl Engine {
         if let Ok(w) = watchdog {
             let _ = w.join();
         }
+        drop(self.gain.take());
         if self.endpoint.take().is_some() {
             info!("closing the connection to the mic plugin");
         }
@@ -1278,6 +1344,7 @@ impl Engine {
                 .and_then(Chain::voice)
                 .map_or(-1.0, f64::from),
             stages,
+            hardware_gain: lock(&self.shared.hardware_gain).clone(),
         }
     }
 }

@@ -35,7 +35,8 @@
 # hold_timeout_s, input_gap_ms and placeholder; [lifecycle] idle_grace_s and
 # start_debounce_ms; [video] memory and battery_saver; [effect] privacy, privacy_mode and fallback_image;
 # [pipewire] enabled and offer_nv12;
-# [mic] enabled, device, pipeline_depth, idle_exit_s, gpu_warm_s and gpu_policy; and in
+# [mic] enabled, device, pipeline_depth, idle_exit_s, gpu_warm_s, gpu_policy and
+# hardware_gain_db; and in
 # [modules] profile, enabled.<id>, forced.<id> and pin.<stage>. Everything else,
 # including the [effect] defaults (which a choice made in the panel overrides),
 # is set here. `omarchy-broadcast config show` lists every key with the file
@@ -472,7 +473,8 @@ offer_nv12 = true
 # worker. The microphone keeps working whatever stops: without processing,
 # its sound passes through unchanged. The panel's Mic tab and
 # `omarchy-broadcast config set` can change enabled, device, pipeline_depth,
-# idle_exit_s, gpu_warm_s and gpu_policy; force_conflicts is set here only.
+# idle_exit_s, gpu_warm_s, gpu_policy and hardware_gain_db; force_conflicts is
+# set here only.
 
 # Process the microphone. Off, the sound passes through unchanged; it is
 # never muted.
@@ -514,6 +516,21 @@ gpu_warm_s = 30
 # at all, and the Mic tab says why. An NPU and the CPU may always be used.
 # Default: "always"
 gpu_policy = "always"
+
+# The capture gain of a USB microphone's own mixer (ALSA), in dB, set by the
+# audio worker when the microphone appears and whenever this value is set.
+# Unset, the device's gain is never touched. Applied to the captured USB
+# microphone only, and only where its card has one capture volume control (a
+# card with several is taken only when one is named Mic, Headset, Capture or
+# Microphone). The worker rounds the value to the device's step and clamps it
+# to the device's range, which the Mic tab shows. Finite, -100 to 100.
+# PipeWire's ALSA profile binds this same control to the physical source's
+# volume: changing that volume (wpctl, a volume slider) changes this gain too,
+# and the last change wins; this value is applied again only when it is set,
+# or when the microphone appears, and does not fight a change in between.
+# Example: the Logitech MX Brio's `Headset` control runs from +18 to +54 dB.
+# Default: unset (the gain is left as it is)
+# hardware_gain_db = 36.0
 
 # Run microphone effects that their modules declare as excluding each other
 # (Studio Voice with noise or room echo removal) together. Intended for

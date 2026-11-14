@@ -2580,5 +2580,17 @@ fn settings_tree_of_the_real_camera() {
         assert!(built.get("camera.focus.field_of_view").is_some());
         assert!(built.get("camera.exposure.keep_framerate").is_some());
         assert!(built.get("camera.image.sharpness").is_some());
+        // The MX Brio's other Extension Unit rows.
+        for id in [
+            "camera.focus.show_mode",
+            "camera.exposure.exposure_compensation",
+            "camera.image.vibrance",
+            "camera.white_balance.temperature_compensation",
+            "camera.focus.rightsight",
+            "camera.focus.rightsight_speed",
+            "camera.focus.rightsight_distance",
+        ] {
+            assert!(built.get(id).is_some(), "{id}");
+        }
     }
 }

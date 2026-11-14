@@ -65,6 +65,9 @@ pub struct FakeDevice {
     pub links: Vec<(u32, u32, Vec<i32>)>,
     /// Its field of view (the Logitech row), if it has one.
     pub fov: Option<FakeFov>,
+    /// Its other Extension Unit rows (the MX Brio's), in scan order after
+    /// the field of view.
+    pub xu: Vec<FakeXu>,
     /// The capture format `capture_format` reads.
     pub format: CaptureFormat,
     /// Writes to these control ids fail (the device refuses them).
@@ -77,6 +80,7 @@ impl Default for FakeDevice {
             controls: Vec::new(),
             links: Vec::new(),
             fov: None,
+            xu: Vec::new(),
             format: CaptureFormat {
                 width: 1920,
                 height: 1080,
@@ -144,6 +148,31 @@ pub struct FakeFov {
     pub default: u8,
     /// Writing this byte changes the capture format to this one.
     pub changes_format: Option<(u8, CaptureFormat)>,
+}
+
+/// A fake Extension Unit row other than the field of view: its row, the
+/// current and the default (`GET_DEF`) byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeXu {
+    pub row: &'static XuRow,
+    pub current: u8,
+    pub default: u8,
+}
+
+/// What a probe of `row` reads with the bytes `current` and `default`.
+fn xu_reading(row: &'static XuRow, current: u8, default: u8) -> XuReading {
+    XuReading {
+        row,
+        state: XuState {
+            info: 0x03,
+            current,
+            current_option: row.option_for_value(current),
+            default_raw: Some(default),
+            default: row
+                .option_for_value(default)
+                .unwrap_or_else(|| row.fallback_default()),
+        },
+    }
 }
 
 /// The fake media world.
@@ -1571,6 +1600,14 @@ impl FakeControlNode {
             .filter(|_| row.name == FIELD_OF_VIEW.name)
             .ok_or_else(|| format!("{path}: no {}", row.name))
     }
+
+    fn xu_of<'a>(&self, w: &'a mut World, row: &'static XuRow) -> Result<&'a mut FakeXu, String> {
+        let path = self.camera.path.display().to_string();
+        w.devices
+            .get_mut(&self.camera.id)
+            .and_then(|d| d.xu.iter_mut().find(|x| x.row.name == row.name))
+            .ok_or_else(|| format!("{path}: no {}", row.name))
+    }
 }
 
 impl ControlNode for FakeControlNode {
@@ -1599,18 +1636,8 @@ impl ControlNode for FakeControlNode {
             let xu = d
                 .fov
                 .iter()
-                .map(|f| XuReading {
-                    row: &FIELD_OF_VIEW,
-                    state: XuState {
-                        info: 0x03,
-                        current: f.current,
-                        current_option: FIELD_OF_VIEW.option_for_value(f.current),
-                        default_raw: Some(f.default),
-                        default: FIELD_OF_VIEW
-                            .option_for_value(f.default)
-                            .unwrap_or(&FIELD_OF_VIEW.options[0]),
-                    },
-                })
+                .map(|f| xu_reading(&FIELD_OF_VIEW, f.current, f.default))
+                .chain(d.xu.iter().map(|x| xu_reading(x.row, x.current, x.default)))
                 .collect();
             return ControlScan {
                 controls,
@@ -1728,11 +1755,15 @@ impl ControlNode for FakeControlNode {
             .option(option)
             .ok_or_else(|| format!("{option:?} is not an option of {}", row.name))?
             .value;
-        let fov = self.fov_of(&mut w, row)?;
-        fov.current = byte;
-        let change = fov.changes_format.filter(|(b, _)| *b == byte);
-        if let (Some((_, format)), Some(d)) = (change, w.devices.get_mut(&self.camera.id)) {
-            d.format = format;
+        if row.name == FIELD_OF_VIEW.name {
+            let fov = self.fov_of(&mut w, row)?;
+            fov.current = byte;
+            let change = fov.changes_format.filter(|(b, _)| *b == byte);
+            if let (Some((_, format)), Some(d)) = (change, w.devices.get_mut(&self.camera.id)) {
+                d.format = format;
+            }
+        } else {
+            self.xu_of(&mut w, row)?.current = byte;
         }
         w.xu_writes
             .push((self.camera.id.clone(), option.to_string()));
@@ -1741,7 +1772,10 @@ impl ControlNode for FakeControlNode {
 
     fn xu_current(&mut self, row: &'static XuRow) -> Result<u8, String> {
         let mut w = lock(&self.world);
-        Ok(self.fov_of(&mut w, row)?.current)
+        if row.name == FIELD_OF_VIEW.name {
+            return Ok(self.fov_of(&mut w, row)?.current);
+        }
+        Ok(self.xu_of(&mut w, row)?.current)
     }
 }
 
@@ -1924,4 +1958,59 @@ impl EffectRun {
             other => panic!("no relighting brightness: {other:?}"),
         }
     }
+}
+
+#[test]
+fn the_fake_offers_and_writes_other_extension_unit_rows() {
+    use obc_pipeline::xu::{RIGHTSIGHT, VIBRANCE};
+    let mut backend = FakeBackend::default();
+    let camera = crate::camera::tests::cam("usb-mx", "MX Brio", Some("046d:0944"), "/dev/video0");
+    let mut device = brio_device();
+    device.xu = vec![
+        FakeXu {
+            row: &VIBRANCE,
+            current: 128,
+            default: 128,
+        },
+        FakeXu {
+            row: &RIGHTSIGHT,
+            current: 0,
+            default: 0,
+        },
+    ];
+    backend.world().devices.insert("usb-mx".into(), device);
+    let mut node = backend.open_camera_controls(&camera, true).unwrap();
+    let scan = node.enumerate();
+    let rows: Vec<(&str, u8, Option<&str>)> = scan
+        .xu
+        .iter()
+        .map(|x| {
+            (
+                x.row.name,
+                x.state.current,
+                x.state.current_option.map(|o| o.id),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("field_of_view", 2, Some("65")),
+            ("vibrance", 128, Some("128")),
+            ("rightsight", 0, Some("off")),
+        ]
+    );
+    node.xu_set(&VIBRANCE, "200").unwrap();
+    node.xu_set(&RIGHTSIGHT, "on").unwrap();
+    assert_eq!(node.xu_current(&VIBRANCE), Ok(200));
+    assert_eq!(node.xu_current(&RIGHTSIGHT), Ok(1));
+    assert!(node.xu_set(&VIBRANCE, "256").is_err());
+    assert!(node.xu_set(&obc_pipeline::xu::SHOW_MODE, "on").is_err());
+    assert_eq!(
+        backend.world().xu_writes,
+        [
+            ("usb-mx".to_string(), "200".to_string()),
+            ("usb-mx".to_string(), "on".to_string()),
+        ]
+    );
 }

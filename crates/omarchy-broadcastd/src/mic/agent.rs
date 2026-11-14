@@ -39,7 +39,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use zbus::proxy::{CacheProperties, MethodFlags};
 use zbus::{Connection, DBusError};
 
-use super::{Catalogue, HOST_UNIT, LEGACY_UNITS, parse_devices, parse_groups, parse_modules};
+use super::{
+    Catalogue, HOST_UNIT, LEGACY_UNITS, gain_pending, parse_devices, parse_groups,
+    parse_hardware_gain, parse_modules,
+};
 use crate::controller::{Command, Published, Reply};
 use crate::{debug, info, warning};
 
@@ -281,6 +284,7 @@ impl<W: Worker, U: Units> Agent<W, U> {
         self.refresh_catalogue(true, true).await;
         self.refresh_status().await;
         self.send_status();
+        self.send_catalogue();
         let mut tick = tokio::time::interval(HOST_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await;
@@ -576,6 +580,9 @@ impl<W: Worker, U: Units> Agent<W, U> {
                 self.send_status();
                 // What the stages run on decides what is greyed.
                 self.refresh_catalogue(false, false).await;
+                // A change of the gain alone reaches the controller even
+                // when the worker's catalogue cannot be read now.
+                self.send_catalogue();
             }
             WorkerEvent::Stats(overruns, misses, voice) => {
                 if self
@@ -654,7 +661,20 @@ impl<W: Worker, U: Units> Agent<W, U> {
             }
         }
         self.catalogue = next;
-        if self.sent_catalogue.as_ref() != Some(&self.catalogue) {
+        self.send_catalogue();
+    }
+
+    /// Tells the controller the catalogue, once the worker answered and
+    /// when it changed, its hardware gain that of the worker's last status
+    /// (kept while no worker runs, and while the worker's is pending: the
+    /// device keeps its gain meanwhile).
+    fn send_catalogue(&mut self) {
+        if let Some(status) = &self.worker_status
+            && !gain_pending(status)
+        {
+            self.catalogue.hardware_gain = parse_hardware_gain(status);
+        }
+        if self.catalogue.known && self.sent_catalogue.as_ref() != Some(&self.catalogue) {
             self.sent_catalogue = Some(self.catalogue.clone());
             self.send(MicEvent::Catalogue(self.catalogue.clone()));
         }

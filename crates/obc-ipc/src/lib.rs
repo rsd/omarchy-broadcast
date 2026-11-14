@@ -151,8 +151,38 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// added the battery saver, with no new member
 /// ([`BATTERY_SAVER_REVISION`]). Revision 23 added the battery saver's
 /// `auto` mode, now the default, with no new member
-/// ([`BATTERY_SAVER_AUTO_REVISION`]).
-pub const INTERFACE_REVISION: u32 = 23;
+/// ([`BATTERY_SAVER_AUTO_REVISION`]). Revision 24 added the MX Brio's
+/// extension-unit settings, with no new member
+/// ([`CAMERA_XU_SETTINGS_REVISION`]). Revision 25 added the microphone's
+/// hardware capture gain, with no new member
+/// ([`MIC_HARDWARE_GAIN_REVISION`]).
+pub const INTERFACE_REVISION: u32 = 25;
+/// The first [`INTERFACE_REVISION`] with the microphone's hardware capture
+/// gain, and no new member: the config row `mic.hardware_gain_db` (dB,
+/// optional) and the mic settings tree's `mic.input.hardware_gain_db` (an
+/// `int` in whole dB, unit `dB`; its `min`, `max` and `step` are the
+/// device's range as the audio worker reports it, and it is offered only
+/// while the captured microphone is a USB device with one capture volume
+/// control). The gain is applied only while the row is set, and re-applied
+/// whenever the device appears; unset, the device's gain is left as it is.
+/// It is the same ALSA control PipeWire shows as the physical source's
+/// volume, so setting it pins that volume.
+pub const MIC_HARDWARE_GAIN_REVISION: u32 = 25;
+/// The first [`INTERFACE_REVISION`] with the MX Brio's extension-unit
+/// settings, and no new member: on a Logitech MX Brio (USB 046d:0944) the
+/// camera settings tree may carry `camera.focus.show_mode` (a `bool`),
+/// `camera.exposure.exposure_compensation` (an `int`, relative: its
+/// default is no compensation), `camera.image.vibrance` (an `int`),
+/// `camera.white_balance.temperature_compensation` (an `int`, an offset of
+/// the automatic white balance; its default is no offset),
+/// `camera.focus.rightsight` (a `bool`), and
+/// `camera.focus.rightsight_speed` (`slower`, `default`, `faster`) and
+/// `camera.focus.rightsight_distance` (`closer`, `default`, `farther`),
+/// enums. The ranges of the ints are published in the setting's `min` and
+/// `max`, not fixed here. Each is offered only when the camera agrees with
+/// its row, and greyed with the reason `The camera reports a value this
+/// version does not know` while it reports a value outside them.
+pub const CAMERA_XU_SETTINGS_REVISION: u32 = 24;
 /// The first [`INTERFACE_REVISION`] where `video.battery_saver` accepts
 /// `auto`, and no new member: the saver is active on battery or while
 /// power-profiles-daemon's active profile is `power-saver` (as `on_battery`
@@ -1389,7 +1419,9 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, BATTERY_SAVER_AUTO_REVISION);
+        assert_eq!(INTERFACE_REVISION, MIC_HARDWARE_GAIN_REVISION);
+        const { assert!(CAMERA_XU_SETTINGS_REVISION < MIC_HARDWARE_GAIN_REVISION) };
+        const { assert!(BATTERY_SAVER_AUTO_REVISION < CAMERA_XU_SETTINGS_REVISION) };
         const { assert!(BATTERY_SAVER_REVISION < BATTERY_SAVER_AUTO_REVISION) };
         const { assert!(PRIVACY_REVISION < BATTERY_SAVER_REVISION) };
         const { assert!(CAMERA_HEALTH_REVISION < PRIVACY_REVISION) };

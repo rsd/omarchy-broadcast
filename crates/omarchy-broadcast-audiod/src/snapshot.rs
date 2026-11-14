@@ -124,6 +124,33 @@ pub struct Snapshot {
     pub disabled_modules: Vec<String>,
     /// Run stages together that declare a conflict (for testing).
     pub forced_conflicts: bool,
+    /// The microphone's hardware capture gain, in dB (see
+    /// [`crate::mixer`]); `None` leaves the device's gain as it is. Read
+    /// leniently, also by [`Snapshot::parse`]: anything but a finite number
+    /// is `None`.
+    #[serde(deserialize_with = "lenient_db")]
+    pub hardware_gain_db: Option<f64>,
+    /// The daemon's count of explicit sets of the hardware gain: another
+    /// one applies `hardware_gain_db` again, even when it is the same value
+    /// (see [`crate::mixer`]). Read leniently: anything but a whole number
+    /// of `u64` is 0.
+    #[serde(deserialize_with = "lenient_serial")]
+    pub hardware_gain_serial: u64,
+}
+
+/// A whole number, else 0.
+fn lenient_serial<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_u64().unwrap_or(0))
+}
+
+/// A number of dB, else `None` (absent, `null`, another type, out of the
+/// configuration's sanity bound).
+fn lenient_db<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    use obc_core::config::limits::{MAX_MIC_HARDWARE_GAIN_DB, MIN_MIC_HARDWARE_GAIN_DB};
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_f64()
+        .filter(|db| (MIN_MIC_HARDWARE_GAIN_DB..=MAX_MIC_HARDWARE_GAIN_DB).contains(db)))
 }
 
 impl Default for Snapshot {
@@ -142,6 +169,8 @@ impl Default for Snapshot {
             values: BTreeMap::new(),
             disabled_modules: Vec::new(),
             forced_conflicts: false,
+            hardware_gain_db: None,
+            hardware_gain_serial: 0,
         }
     }
 }
@@ -409,6 +438,40 @@ mod tests {
         );
         // ApplySnapshot stays strict.
         assert!(Snapshot::parse(r#"{"version":1,"pins":7}"#).is_err());
+    }
+
+    #[test]
+    fn the_hardware_gain_is_a_number_of_db_else_unset() {
+        let gain = |text: &str| Snapshot::parse(text).unwrap().hardware_gain_db;
+        assert_eq!(gain(r#"{"version":1,"hardware_gain_db":38.5}"#), Some(38.5));
+        assert_eq!(gain(r#"{"version":1,"hardware_gain_db":-6}"#), Some(-6.0));
+        assert_eq!(gain(r#"{"version":1}"#), None);
+        assert_eq!(gain(r#"{"version":1,"hardware_gain_db":null}"#), None);
+        // Not a number, or out of the configuration's bound: unset, also
+        // for ApplySnapshot (a newer daemon's value never fails the rest).
+        assert_eq!(gain(r#"{"version":1,"hardware_gain_db":"loud"}"#), None);
+        assert_eq!(gain(r#"{"version":1,"hardware_gain_db":1000}"#), None);
+        assert_eq!(Snapshot::default().hardware_gain_db, None);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(FILE);
+        std::fs::write(
+            &p,
+            r#"{"version":1,"hardware_gain_db":{"x":1},"enabled":false}"#,
+        )
+        .unwrap();
+        let (s, note) = Snapshot::load(&p);
+        assert_eq!((s.hardware_gain_db, s.enabled, note), (None, false, None));
+    }
+
+    #[test]
+    fn the_hardware_gain_serial_is_a_whole_number_else_zero() {
+        let serial = |text: &str| Snapshot::parse(text).unwrap().hardware_gain_serial;
+        assert_eq!(serial(r#"{"version":1,"hardware_gain_serial":7}"#), 7);
+        assert_eq!(serial(r#"{"version":1}"#), 0);
+        assert_eq!(serial(r#"{"version":1,"hardware_gain_serial":null}"#), 0);
+        assert_eq!(serial(r#"{"version":1,"hardware_gain_serial":-1}"#), 0);
+        assert_eq!(serial(r#"{"version":1,"hardware_gain_serial":1.5}"#), 0);
+        assert_eq!(serial(r#"{"version":1,"hardware_gain_serial":"x"}"#), 0);
     }
 
     #[test]

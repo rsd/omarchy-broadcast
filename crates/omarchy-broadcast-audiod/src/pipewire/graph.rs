@@ -22,7 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{Consumers, PipeWireError, SourceDevice};
+use super::{AlsaSource, AlsaSources, Consumers, PipeWireError, SourceDevice};
 
 /// The `node.name` of the microphone (the mic host's playback side).
 pub const MIC_NODE: &str = "omarchy-broadcast-mic";
@@ -70,6 +70,34 @@ pub struct NodeInfo {
     /// `resample.peaks`: a level meter): `None` until its properties are
     /// known.
     pub monitor: Option<bool>,
+    /// Its ALSA side: `None` until its properties are known (only a
+    /// device's are read).
+    pub alsa: Option<AlsaProps>,
+}
+
+/// The ALSA side of a node, from its properties.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AlsaProps {
+    /// The card index: `api.alsa.pcm.card`, else `alsa.card` (digits only).
+    pub card: Option<String>,
+    /// A USB audio device: `alsa.driver_name` is `snd_usb_audio`, or
+    /// `device.bus` is `usb`.
+    pub usb: bool,
+}
+
+impl AlsaProps {
+    /// The ALSA side of a node whose property `key` is `get(key)`.
+    pub fn of<'a>(get: impl Fn(&str) -> Option<&'a str>) -> AlsaProps {
+        let card = ["api.alsa.pcm.card", "alsa.card"]
+            .into_iter()
+            .filter_map(&get)
+            .map(str::trim)
+            .find(|c| !c.is_empty() && c.len() <= 4 && c.bytes().all(|b| b.is_ascii_digit()))
+            .map(str::to_string);
+        let usb =
+            get("alsa.driver_name") == Some("snd_usb_audio") || get("device.bus") == Some("usb");
+        AlsaProps { card, usb }
+    }
 }
 
 impl NodeInfo {
@@ -136,7 +164,61 @@ impl Graph {
         if info.monitor.is_none() {
             info.monitor = self.nodes.get(&id).and_then(|n| n.monitor);
         }
+        if info.alsa.is_none() {
+            info.alsa = self.nodes.get(&id).and_then(|n| n.alsa.clone());
+        }
         self.nodes.insert(id, info);
+    }
+
+    /// The properties of node `id` give its ALSA side.
+    pub fn set_alsa(&mut self, id: u32, alsa: AlsaProps) {
+        if let Some(n) = self.nodes.get_mut(&id) {
+            n.alsa = Some(alsa);
+        }
+    }
+
+    /// Whether node `id` is a source a user may record from (whose
+    /// properties, its ALSA side, it is bound for).
+    pub fn is_device(&self, id: u32) -> bool {
+        self.nodes.get(&id).is_some_and(NodeInfo::is_device)
+    }
+
+    /// The device the mic host's capture side is linked from (by the
+    /// lowest link id), when it runs and is linked to one.
+    pub fn captured(&self) -> Option<(u32, &NodeInfo)> {
+        let (capture, _) = self.node_by_name(CAPTURE_NODE)?;
+        self.links
+            .values()
+            .filter(|(_, input)| *input == capture)
+            .find_map(|(out, _)| {
+                self.nodes
+                    .get(out)
+                    .filter(|n| n.is_device())
+                    .map(|n| (*out, n))
+            })
+    }
+
+    /// The devices' ALSA side (of those whose properties are known) and
+    /// what the mic host captures.
+    pub fn alsa_sources(&self) -> AlsaSources {
+        AlsaSources {
+            capture: self.node_by_name(CAPTURE_NODE).map(|(id, _)| id),
+            captured: self.captured().map(|(_, n)| n.name.clone()),
+            sources: self
+                .nodes
+                .iter()
+                .filter(|(_, n)| n.is_device())
+                .filter_map(|(id, n)| {
+                    let a = n.alsa.as_ref()?;
+                    Some(AlsaSource {
+                        id: *id,
+                        name: n.name.clone(),
+                        card: a.card.clone(),
+                        usb: a.usb,
+                    })
+                })
+                .collect(),
+        }
     }
 
     /// The properties of node `id` say whether it is a monitor.
@@ -448,6 +530,7 @@ mod tests {
             serial: Some(serial.to_string()),
             priority: 0,
             monitor: None,
+            alsa: None,
         }
     }
 
@@ -919,5 +1002,80 @@ mod tests {
         assert_eq!(g.default_source(), None);
         assert_eq!(name_of_json("{}"), None);
         assert_eq!(name_of_json("x"), None);
+    }
+
+    #[test]
+    fn the_alsa_side_is_read_from_the_properties() {
+        let props = |pairs: &'static [(&'static str, &'static str)]| {
+            AlsaProps::of(|k| pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| *v))
+        };
+        assert_eq!(
+            props(&[
+                ("api.alsa.pcm.card", "0"),
+                ("alsa.card", "7"),
+                ("alsa.driver_name", "snd_usb_audio")
+            ]),
+            AlsaProps {
+                card: Some("0".into()),
+                usb: true
+            }
+        );
+        assert_eq!(
+            props(&[("alsa.card", "3"), ("device.bus", "usb")]),
+            AlsaProps {
+                card: Some("3".into()),
+                usb: true
+            }
+        );
+        // A PCI card, a card that is not a number, no ALSA at all.
+        assert_eq!(
+            props(&[("api.alsa.pcm.card", "1"), ("device.bus", "pci")]),
+            AlsaProps {
+                card: Some("1".into()),
+                usb: false
+            }
+        );
+        assert_eq!(props(&[("api.alsa.pcm.card", "hw:0")]).card, None);
+        assert_eq!(props(&[]), AlsaProps::default());
+    }
+
+    #[test]
+    fn the_captured_device_is_the_capture_sides_link_source() {
+        let mut g = graph();
+        g.set_alsa(
+            10,
+            AlsaProps {
+                card: Some("0".into()),
+                usb: true,
+            },
+        );
+        // Kept when the node's registry entry is seen again.
+        g.add_node(10, node("usb-a", "Audio/Source", 110));
+        let s = g.alsa_sources();
+        assert_eq!(s.capture, Some(20));
+        assert_eq!(s.captured, None, "not linked yet");
+        assert_eq!(
+            s.sources,
+            [AlsaSource {
+                id: 10,
+                name: "usb-a".into(),
+                card: Some("0".into()),
+                usb: true
+            }],
+            "usb-b's properties are not known yet"
+        );
+        // The mic node feeding a recorder is not what the capture side
+        // captures; the links into the capture node are.
+        g.add_node(30, node("rec", "Stream/Input/Audio", 130));
+        g.add_link(40, 21, 30);
+        g.add_link(41, 11, 20);
+        g.add_link(42, 11, 20);
+        assert_eq!(g.alsa_sources().captured.as_deref(), Some("usb-b"));
+        assert!(g.is_device(11) && !g.is_device(20) && !g.is_device(21));
+        g.remove(41);
+        g.remove(42);
+        g.remove(20);
+        let s = g.alsa_sources();
+        assert_eq!((s.capture, s.captured), (None, None));
     }
 }

@@ -25,6 +25,36 @@ pub struct SourceDevice {
     pub description: String,
 }
 
+/// What PipeWire says of a hardware source's ALSA side (the properties of
+/// its node, which the registry does not carry: the node is bound for
+/// them).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlsaSource {
+    /// Its node id.
+    pub id: u32,
+    /// Its `node.name`.
+    pub name: String,
+    /// Its ALSA card index (`api.alsa.pcm.card`, else `alsa.card`), when it
+    /// is an ALSA device.
+    pub card: Option<String>,
+    /// Whether it is a USB audio device (`alsa.driver_name` is
+    /// `snd_usb_audio`, or `device.bus` is `usb`).
+    pub usb: bool,
+}
+
+/// The sources' ALSA side and what the mic host captures, for the
+/// hardware gain ([`crate::mixer`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AlsaSources {
+    /// The node id of the mic host's capture side, while it runs.
+    pub capture: Option<u32>,
+    /// The `node.name` of the device the capture side is linked from, when
+    /// it is linked to one.
+    pub captured: Option<String>,
+    /// The hardware sources whose properties are known.
+    pub sources: Vec<AlsaSource>,
+}
+
 /// The links on the microphone node, by kind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Consumers {
@@ -95,6 +125,19 @@ pub trait PipeWireControl: Send + Sync {
     /// The delay the microphone adds now, in samples, for its
     /// `ProcessLatency` (`None`: leave it as it is). Never blocks.
     fn set_latency(&self, _samples: Option<u32>) {}
+
+    /// The sources' ALSA side and what the mic host captures, read without
+    /// a round trip; `None` while PipeWire is not connected and synced.
+    fn alsa_sources(&self) -> Option<AlsaSources> {
+        None
+    }
+
+    /// A count that moves whenever [`PipeWireControl::alsa_sources`] would
+    /// say something else: read every turn, so that the sources are only
+    /// copied when they changed.
+    fn alsa_sources_serial(&self) -> u64 {
+        0
+    }
 
     /// Lets PipeWire go (the worker exits).
     fn shutdown(&self) {}
