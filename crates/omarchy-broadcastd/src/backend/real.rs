@@ -82,7 +82,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use gst::prelude::*;
@@ -100,16 +100,16 @@ use obc_pipeline::gpu::GpuSampler;
 use obc_pipeline::hid_orientation::{self, OrientationNotice, OrientationWatcher};
 use obc_pipeline::ingest::EnhanceBackend;
 use obc_pipeline::module::{ModulePlacement, ModuleStageSpec};
-use obc_pipeline::output::NO_CUDA_CONTEXT;
+use obc_pipeline::output::{EmitInfo, EmitObserver, NO_CUDA_CONTEXT};
 use obc_pipeline::pipeline::names;
 use obc_pipeline::stats::{cpu_usage, online_cpus, self_cpu_ticks, ticks_per_sec};
 use obc_pipeline::xu::{SYSFS_ROOT, XuControl, XuRow, find_xu_controls};
 use obc_pipeline::{
     ConsumerCover, CoverShows, CtrlNotice, CtrlWatcher, DiscoveryRoute, EffectFallback, EffectKind,
     EffectSettings, FrameTap, IngestConfig, LiveStats, LoopbackWriter, Output, OutputConfig,
-    OutputSink, PipelineError, PlaceholderState, PreviewConfig, PreviewEncoder, Session, StopError,
-    WriterCounts, WriterHandle, WriterSink, choose_mode, effect_backend_available_with,
-    list_cameras, scan_sysfs, select_sink,
+    OutputSink, PipelineError, PlaceholderState, PrepareError, PreviewConfig, PreviewEncoder,
+    Session, StopError, WriterCounts, WriterHandle, WriterSink, choose_mode,
+    effect_backend_available_with, list_cameras, scan_sysfs, select_sink,
 };
 
 use super::park::{Parker, StartError, StopFailure, StopSession};
@@ -165,6 +165,93 @@ struct Running {
     chains: Vec<String>,
     /// Where the session keeps its frames.
     memory: VideoMemory,
+    /// What the output prepared alongside ([`MediaBackend::prepare_session`])
+    /// runs, while one is: the session's [`Self::effect_backend`] and
+    /// [`Self::chains`] once it is committed.
+    next: Option<Next>,
+}
+
+/// What the output a session prepares alongside its own runs
+/// ([`Running::next`]); the output itself is the [`Session`]'s.
+struct Next {
+    /// Its ticks count in the session's statistics ([`LiveStats`]): set at
+    /// the commit, so that the two outputs are never counted together.
+    counted: Arc<AtomicBool>,
+    effect_backend: Option<obc_pipeline::EffectBackend>,
+    /// The enhancer of the session's later ingests (the current one keeps
+    /// its own).
+    enhance: Option<EnhanceBackend>,
+    chains: Vec<String>,
+    /// The image its clock placeholder was built with (`None`: black).
+    placeholder: Option<PathBuf>,
+}
+
+impl Running {
+    /// Stops the prepared output, if any. One that did not reach NULL
+    /// makes the session's stop unclean, as a camera switch's does
+    /// ([`Self::unclean`]).
+    fn discard_next(&mut self) {
+        if self.next.take().is_none() && self.session.prepared().is_none() {
+            return;
+        }
+        if let Err(e) = self.session.discard_prepared() {
+            crate::warning!("stopping the output prepared alongside: {e}");
+            if !e.reached_null && self.unclean.is_none() {
+                self.unclean = Some(format!("the output prepared alongside: {e}"));
+            }
+        }
+    }
+}
+
+/// `observer`, called only while `counted` is set (a prepared output's
+/// ticks, [`Next::counted`]).
+fn gated_observer(observer: EmitObserver, counted: Arc<AtomicBool>) -> EmitObserver {
+    Arc::new(move |e: &EmitInfo| {
+        if counted.load(Ordering::Acquire) {
+            observer(e);
+        }
+    })
+}
+
+/// What a failed [`Session::prepare_output`] means for the session: its
+/// error, and why the session's stop is now unclean
+/// ([`Running::unclean`]), when the output it was given did not reach NULL
+/// after its failed start (as [`start_failed`] judges a failed start).
+fn prepare_failed(e: PrepareError) -> (String, Option<String>) {
+    let error = format!("output pipeline: {}", e.error);
+    let unclean = match e.cleanup {
+        Ok(()) => None,
+        Err(s) if s.reached_null => {
+            crate::debug!("stopping the output prepared alongside after its failure: {s}");
+            None
+        }
+        Err(s) => Some(format!("the output prepared alongside: {s}")),
+    };
+    (error, unclean)
+}
+
+/// The least free GPU memory a second output chain is built with next to
+/// the running one ([`MediaBackend::overlap_headroom`]), in bytes.
+const OVERLAP_MIN_FREE: u64 = 1 << 30;
+
+/// Whether a GPU of `total` bytes, `used` of them in use, `ours` of them by
+/// this process, has room for a second chain next to the running one: free
+/// memory at least what this process uses, and at least
+/// [`OVERLAP_MIN_FREE`]. The reason when it has not.
+fn headroom(total: u64, used: u64, ours: u64) -> Result<(), String> {
+    if total == 0 {
+        return Err("NVML reports no GPU memory".into());
+    }
+    let free = total.saturating_sub(used);
+    let need = ours.max(OVERLAP_MIN_FREE);
+    if free < need {
+        return Err(format!(
+            "{} MiB of GPU memory free, {} MiB needed to build the new effects alongside",
+            free >> 20,
+            need >> 20
+        ));
+    }
+    Ok(())
 }
 
 impl StopSession for Running {
@@ -578,6 +665,8 @@ impl GstBackend {
         params: &SessionParams,
         camera: &Camera,
     ) -> Result<(), String> {
+        // The next ingest writes into the session's output only.
+        running.discard_next();
         let cfg = Self::ingest_config(params, camera, running.enhance.as_ref());
         let ingest = running
             .session
@@ -840,6 +929,7 @@ fn build_session(
             .map(|m| m.name.clone())
             .collect(),
         memory: params.memory,
+        next: None,
     })
 }
 
@@ -872,6 +962,30 @@ fn build_output(
     fault: &mut StartFault,
     prepare: impl FnOnce(&mut Output),
 ) -> Result<Output, StartError> {
+    let mut output = configure_output(params, sink, fault)?;
+    prepare(&mut output);
+    // The mapping (`start_failed`) is unit-tested; this wiring only by the
+    // hardware tests.
+    if let Err(e) = output.start() {
+        *fault = StartFault::of(&e, params.memory);
+        return Err(
+            start_failed(format!("output pipeline: {e}"), output.stop_checked())
+                .for_want_of_cuda(fault.no_cuda),
+        );
+    }
+    Ok(output)
+}
+
+/// Builds the output of a session of `params` into `sink`, in the
+/// session's memory, without starting it: what [`build_output`] starts, and
+/// what [`MediaBackend::prepare_session`] hands to
+/// [`Session::prepare_output`], which starts it with the running output's
+/// CUDA context. `fault` as for [`build_output`].
+fn configure_output(
+    params: &SessionParams,
+    sink: OutputSink,
+    fault: &mut StartFault,
+) -> Result<Output, StartError> {
     let mut ocfg = OutputConfig::new(params.contract, sink);
     ocfg.gap_threshold = params.input_gap;
     ocfg.hold_timeout = params.hold_timeout;
@@ -890,21 +1004,59 @@ fn build_output(
     // shown by the clock's placeholder past the hold.
     ocfg.placeholder_image.clone_from(&params.placeholder_image);
     // A failure for want of CUDA is not parked after (`StartError::no_cuda`).
-    let mut output = Output::build_in(ocfg, params.memory).map_err(|e| {
+    Output::build_in(ocfg, params.memory).map_err(|e| {
         *fault = StartFault::of(&e, params.memory);
         StartError::from(format!("output pipeline: {e}")).for_want_of_cuda(fault.no_cuda)
-    })?;
-    prepare(&mut output);
-    // The mapping (`start_failed`) is unit-tested; this wiring only by the
-    // hardware tests.
-    if let Err(e) = output.start() {
-        *fault = StartFault::of(&e, params.memory);
-        return Err(
-            start_failed(format!("output pipeline: {e}"), output.stop_checked())
-                .for_want_of_cuda(fault.no_cuda),
-        );
+    })
+}
+
+/// What `output` of `session` reports of its effect element and of its
+/// module chains `chains` (by element name), with the enhance stage of the
+/// session's ingest: [`MediaBackend::effect_report`] of the running output,
+/// [`MediaBackend::prepared_report`] of the prepared one.
+fn output_report(session: &Session, output: &Output, chains: &[String]) -> EffectReport {
+    let status = |s| match s {
+        obc_pipeline::EffectStatus::Off => EffectStatus::Off,
+        obc_pipeline::EffectStatus::Loading => EffectStatus::Loading,
+        obc_pipeline::EffectStatus::Ready => EffectStatus::Ready,
+        obc_pipeline::EffectStatus::Failed(r) => EffectStatus::Failed(r),
+    };
+    let stats = output.effect_stats().unwrap_or_default();
+    let mut stages: Vec<(StageId, EffectStatus)> = output
+        .effect_settings()
+        .map(|s| s.stages)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            let st = status(output.stage_status(s.id.as_str()));
+            (s.id, st)
+        })
+        .collect();
+    for name in chains {
+        for s in output.module_stages(name).unwrap_or_default() {
+            let st = status(output.module_stage_status(name, s.id.as_str()));
+            stages.push((s.id, st));
+        }
     }
-    Ok(output)
+    EffectReport {
+        status: status(output.effect_status()),
+        stages,
+        // Read from the element, not the bus (the ingest's failure poll
+        // would hide it).
+        enhance: session
+            .ingest()
+            .and_then(obc_pipeline::Ingest::enhance_status)
+            .map_or(EffectStatus::Off, status),
+        load_ms: stats.last_load_ms,
+        reused: stats.last_load_reused,
+        gpu_ms_p50: stats.gpu_ms_p50,
+        freeze_held: stats.freeze_held,
+        fallback_error: stats.fallback_error,
+        background_error: stats.background_error,
+        switch_error: stats.switch_error,
+        load_notice: stats.load_notice,
+        stage_values: output.stage_values(),
+    }
 }
 
 impl MediaBackend for GstBackend {
@@ -1160,9 +1312,151 @@ impl MediaBackend for GstBackend {
     }
 
     fn stop_session(&mut self) {
+        if let Some(r) = self.running.as_mut() {
+            r.discard_next();
+        }
         // All of the session stopped first; parked only if it stopped
         // cleanly (`Parker::stop_session`).
         self.parker.stop_session(&mut self.running);
+    }
+
+    fn overlap_headroom(&mut self) -> Result<(), String> {
+        let r = self
+            .running
+            .as_ref()
+            .ok_or_else(|| "no session is running".to_string())?;
+        // NVML runs next to a session in CUDA memory already (the GPU
+        // statistics): its device, asked now rather than its last sample,
+        // which may still count an output discarded since.
+        let gpu = r
+            .gpu
+            .as_ref()
+            .ok_or_else(|| "NVML is not running next to the session".to_string())?;
+        let now = obc_pipeline::gpu::memory_now(gpu.info().index)?;
+        let ours = now
+            .proc_mem_bytes
+            .ok_or_else(|| "NVML does not report this process's GPU memory".to_string())?;
+        headroom(now.total_bytes, now.used_bytes, ours)
+    }
+
+    fn prepare_session(&mut self, params: &SessionParams) -> Result<(), SessionError> {
+        let writer = self.writer.as_ref().map(LoopbackWriter::handle);
+        let stamp = self.stamp;
+        let running = self
+            .running
+            .as_mut()
+            .ok_or_else(|| SessionError::from("no session is running".to_string()))?;
+        running.discard_next();
+        if params.memory != running.memory || params.memory == VideoMemory::System {
+            return Err(SessionError::from(format!(
+                "an output is prepared alongside only in CUDA memory, next to a session in \
+                 the same memory (asked {:?}, the session runs in {:?})",
+                params.memory, running.memory
+            )));
+        }
+        let writer = writer
+            .ok_or_else(|| SessionError::from("no loopback writer is running".to_string()))?;
+        // Its frames are refused until the commit promotes its feed.
+        let sink = OutputSink::Writer(writer.standby());
+        let mut fault = StartFault::default();
+        let mut output = configure_output(params, sink, &mut fault).map_err(|e| SessionError {
+            message: e.error,
+            contract: fault.contract,
+            no_cuda: fault.no_cuda,
+        })?;
+        // Counted in the session's statistics from the commit only: until
+        // then the consumer sees the running output's frames.
+        let counted = Arc::new(AtomicBool::new(false));
+        output.set_observer(Some(gated_observer(
+            running.live.observer(),
+            Arc::clone(&counted),
+        )));
+        if stamp {
+            stamp_forwarded(&output);
+        }
+        // Started there, with the running output's CUDA context.
+        if let Err(e) = running.session.prepare_output(output) {
+            let (error, unclean) = prepare_failed(*e);
+            if unclean.is_some() && running.unclean.is_none() {
+                // Its CUDA elements may still run: the session's stop will
+                // not park, as after an unclean camera switch.
+                running.unclean = unclean;
+            }
+            return Err(SessionError::from(error));
+        }
+        running.next = Some(Next {
+            counted,
+            effect_backend: effect_backend(&params.backends),
+            enhance: enhance_backend(&params.backends),
+            chains: module_stages(&params.effect, &params.backends)
+                .iter()
+                .map(|m| m.name.clone())
+                .collect(),
+            placeholder: params.placeholder_image.clone(),
+        });
+        Ok(())
+    }
+
+    fn prepared_report(&mut self) -> Option<super::PreparedReport> {
+        let r = self.running.as_ref()?;
+        let next = r.next.as_ref()?;
+        let output = r.session.prepared()?;
+        Some(super::PreparedReport {
+            effect: output_report(&r.session, output, &next.chains),
+            first_frame: r.session.prepared_first_fresh().is_some(),
+            failure: output
+                .health()
+                .err()
+                .map(|e| format!("output pipeline failed: {e}")),
+        })
+    }
+
+    fn commit_prepared(&mut self) -> Result<(), String> {
+        let r = self
+            .running
+            .as_mut()
+            .ok_or_else(|| "no session is running".to_string())?;
+        let next = r
+            .next
+            .take()
+            .ok_or_else(|| "no output is prepared".to_string())?;
+        // Its frames are the consumer's from the promotion on, which the
+        // commit below makes before it stops the previous output (a stop
+        // that may take a while): counted from just before it, so none
+        // after the promotion goes uncounted; the few it emits between
+        // this store and the promotion are counted although the previous
+        // output's were the consumer's then.
+        next.counted.store(true, Ordering::Release);
+        let handover = match r.session.commit_prepared() {
+            Ok(h) => h,
+            Err(e) => {
+                next.counted.store(false, Ordering::Release);
+                return Err(e.to_string());
+            }
+        };
+        crate::debug!(
+            "output handed over {} ms after the commit was asked",
+            handover.promoted_at.elapsed().as_millis()
+        );
+        if let Err(e) = handover.previous_stop {
+            crate::warning!("stopping the output handed over from: {e}");
+            if !e.reached_null && r.unclean.is_none() {
+                // Its CUDA elements may still run: the session's stop will
+                // not park, as after an unclean camera switch.
+                r.unclean = Some(format!("the output handed over from: {e}"));
+            }
+        }
+        r.effect_backend = next.effect_backend;
+        r.enhance = next.enhance;
+        r.chains = next.chains;
+        self.output_placeholder = next.placeholder;
+        Ok(())
+    }
+
+    fn discard_prepared(&mut self) {
+        if let Some(r) = self.running.as_mut() {
+            r.discard_next();
+        }
     }
 
     fn first_frame(&mut self) -> bool {
@@ -1315,49 +1609,7 @@ impl MediaBackend for GstBackend {
     fn effect_report(&mut self) -> Option<EffectReport> {
         let running = self.running.as_ref()?;
         let session = &running.session;
-        let output = session.output();
-        let status = |s| match s {
-            obc_pipeline::EffectStatus::Off => EffectStatus::Off,
-            obc_pipeline::EffectStatus::Loading => EffectStatus::Loading,
-            obc_pipeline::EffectStatus::Ready => EffectStatus::Ready,
-            obc_pipeline::EffectStatus::Failed(r) => EffectStatus::Failed(r),
-        };
-        let stats = output.effect_stats().unwrap_or_default();
-        let mut stages: Vec<(StageId, EffectStatus)> = output
-            .effect_settings()
-            .map(|s| s.stages)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| {
-                let st = status(output.stage_status(s.id.as_str()));
-                (s.id, st)
-            })
-            .collect();
-        for name in &running.chains {
-            for s in output.module_stages(name).unwrap_or_default() {
-                let st = status(output.module_stage_status(name, s.id.as_str()));
-                stages.push((s.id, st));
-            }
-        }
-        Some(EffectReport {
-            status: status(output.effect_status()),
-            stages,
-            // Read from the element, not the bus (the ingest's failure poll
-            // would hide it).
-            enhance: session
-                .ingest()
-                .and_then(obc_pipeline::Ingest::enhance_status)
-                .map_or(EffectStatus::Off, status),
-            load_ms: stats.last_load_ms,
-            reused: stats.last_load_reused,
-            gpu_ms_p50: stats.gpu_ms_p50,
-            freeze_held: stats.freeze_held,
-            fallback_error: stats.fallback_error,
-            background_error: stats.background_error,
-            switch_error: stats.switch_error,
-            load_notice: stats.load_notice,
-            stage_values: output.stage_values(),
-        })
+        Some(output_report(session, session.output(), &running.chains))
     }
 
     fn discover_modules(&mut self, dirs: &[PathBuf]) -> Vec<ModuleEntry> {
@@ -1739,6 +1991,26 @@ mod tests {
     }
 
     #[test]
+    fn a_second_chain_needs_free_memory_of_the_processs_use_and_one_gib() {
+        const MIB: u64 = 1 << 20;
+        // 8 GiB, 6 used, 1.5 of them ours: 2 GiB free, enough.
+        assert_eq!(headroom(8192 * MIB, 6144 * MIB, 1536 * MIB), Ok(()));
+        // Ours above what is free.
+        let e = headroom(8192 * MIB, 6144 * MIB, 3072 * MIB).unwrap_err();
+        assert_eq!(
+            e,
+            "2048 MiB of GPU memory free, 3072 MiB needed to build the new effects alongside"
+        );
+        // A small use still needs 1 GiB.
+        assert!(headroom(8192 * MIB, 7680 * MIB, 100 * MIB).is_err());
+        assert_eq!(headroom(8192 * MIB, 7168 * MIB, 100 * MIB), Ok(()));
+        // Nothing known of the device.
+        assert!(headroom(0, 0, 0).is_err());
+        // More used than there is: nothing free.
+        assert!(headroom(MIB, 2 * MIB, 0).is_err());
+    }
+
+    #[test]
     fn only_errors_of_the_contract_revert_it() {
         let refused = PipelineError::LoopbackRefused {
             device: "/dev/video11".into(),
@@ -1874,6 +2146,66 @@ mod tests {
                 "output pipeline: state change failed: ended in Paused, not Null"
             )
         );
+    }
+
+    #[test]
+    fn a_failed_prepare_is_unclean_only_when_its_stop_left_it_outside_null() {
+        let e = |cleanup| PrepareError {
+            error: PipelineError::Caps("another size".into()),
+            cleanup,
+        };
+        let error = format!(
+            "output pipeline: {}",
+            PipelineError::Caps("another size".into())
+        );
+        assert_eq!(prepare_failed(e(Ok(()))), (error.clone(), None));
+        assert_eq!(
+            prepare_failed(e(stop_err("the output clock thread panicked", true))),
+            (error.clone(), None)
+        );
+        assert_eq!(
+            prepare_failed(e(stop_err("ended in Paused, not Null", false))),
+            (
+                error,
+                Some(format!(
+                    "the output prepared alongside: {}",
+                    PipelineError::State("ended in Paused, not Null".into())
+                ))
+            )
+        );
+    }
+
+    /// A prepared output's ticks reach the session's statistics only once
+    /// it is committed.
+    #[test]
+    fn a_prepared_output_is_counted_from_its_commit() {
+        let seen = Arc::new(AtomicU32::new(0));
+        let s = Arc::clone(&seen);
+        let counted = Arc::new(AtomicBool::new(false));
+        let observer = gated_observer(
+            Arc::new(move |_: &EmitInfo| {
+                s.fetch_add(1, Ordering::SeqCst);
+            }),
+            Arc::clone(&counted),
+        );
+        let now = Instant::now();
+        let tick = EmitInfo {
+            tick: 0,
+            pts_ns: 0,
+            kind: obc_pipeline::TickKind::Fresh,
+            origin: None,
+            emitted_at: now,
+            grid_at: now,
+            phase_offset_ns: 0,
+            phase_locked: false,
+            pushed: true,
+            queue_level: 0,
+        };
+        observer(&tick);
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+        counted.store(true, Ordering::Release);
+        observer(&tick);
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
     }
 
     /// The writer's one tap feeds whichever of the PipeWire output and the

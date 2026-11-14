@@ -132,6 +132,52 @@ impl GpuSampler {
     }
 }
 
+/// The memory of a GPU now, as NVML reports it ([`memory_now`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryNow {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    /// Device memory attributed to this process, if NVML reports it.
+    pub proc_mem_bytes: Option<u64>,
+}
+
+/// Asks NVML for the memory of device `index` now: one query, not a
+/// sample of the [`GpuSampler`], which may be up to its interval old.
+/// NVML is initialised for the call and shut down after it (NVML counts
+/// its initialisations: a sampler running meanwhile keeps its own), so
+/// the call wakes a runtime-suspended dGPU as [`GpuSampler::start`] does;
+/// it makes no CUDA call.
+pub fn memory_now(index: u32) -> Result<MemoryNow, String> {
+    let nvml = Nvml::builder()
+        .lib_path(std::ffi::OsStr::new("libnvidia-ml.so.1"))
+        .init()
+        .map_err(|e| format!("NVML init failed: {e}"))?;
+    let device = nvml
+        .device_by_index(index)
+        .map_err(|e| format!("NVML device {index}: {e}"))?;
+    let mem = device
+        .memory_info()
+        .map_err(|e| format!("NVML device {index} memory: {e}"))?;
+    let pid = std::process::id();
+    let proc_mem_bytes = device
+        .running_compute_processes()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|p| p.pid == pid)
+        .and_then(|p| match p.used_gpu_memory {
+            UsedGpuMemory::Used(b) => Some(b),
+            UsedGpuMemory::Unavailable => None,
+        });
+    let now = MemoryNow {
+        total_bytes: mem.total,
+        used_bytes: mem.used,
+        proc_mem_bytes,
+    };
+    nvml.shutdown()
+        .map_err(|e| format!("nvmlShutdown failed: {e}"))?;
+    Ok(now)
+}
+
 fn sample_loop(
     nvml: &Nvml,
     index: u32,

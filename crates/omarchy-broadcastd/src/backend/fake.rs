@@ -22,8 +22,8 @@ use obc_pipeline::xu::{FIELD_OF_VIEW, XuRow, XuState};
 use super::park::{ParkOps, Parker, StartError, StopFailure, StopSession};
 use super::{
     Backends, ControlNode, ControlScan, EffectReport, EffectRun, EffectStatus, Failure,
-    MediaBackend, Module, ModuleEntry, OpenedModule, PipeWireGeneration, PreviewRequest,
-    SessionError, SessionParams, WatchGeneration, WriterError,
+    MediaBackend, Module, ModuleEntry, OpenedModule, PipeWireGeneration, PreparedReport,
+    PreviewRequest, SessionError, SessionParams, WatchGeneration, WriterError,
 };
 use crate::camera::Camera;
 use crate::controller::output_mode_string;
@@ -545,6 +545,38 @@ pub struct World {
     pub placement_reads: u32,
     /// The time zone `time_zone` gives (`None`: none known).
     pub time_zone: Option<String>,
+    /// `overlap_headroom` fails with this (`None`: the GPU has room).
+    pub no_headroom: Option<String>,
+    /// The `overlap_headroom` calls.
+    pub headroom_checks: u32,
+    /// `prepare_session` fails with this.
+    pub fail_prepare: Option<String>,
+    /// The output prepared alongside the running session: its params
+    /// (`None`: none is).
+    pub prepared: Option<SessionParams>,
+    /// Every `prepare_session` that prepared an output, in order (its
+    /// params).
+    pub prepares: Vec<SessionParams>,
+    /// The `commit_prepared` that handed over.
+    pub commits: u32,
+    /// The prepared outputs discarded (by `discard_prepared`, a stop or a
+    /// camera switch).
+    pub discards: u32,
+    /// What the prepared output's effect reports (`None`: off for `none`,
+    /// failed without an effect module, else ready). The test changes it
+    /// while the output is prepared.
+    pub prepared_effect: Option<EffectStatus>,
+    /// What the prepared output reports for its other stages, by id; a
+    /// stage on is `Ready` unless set here.
+    pub prepared_stages: std::collections::BTreeMap<String, EffectStatus>,
+    /// The stages, by id, the prepared output was built without (a chain
+    /// its module could not make): absent from its report, and from the
+    /// session's after the commit.
+    pub prepared_omitted: std::collections::BTreeSet<String>,
+    /// The prepared output has emitted a frame of the current ingest.
+    pub prepared_frames: bool,
+    /// The prepared output's pipeline failed with this.
+    pub prepared_failure: Option<String>,
 }
 
 impl Default for World {
@@ -699,6 +731,18 @@ impl Default for World {
             placements: std::collections::HashMap::new(),
             placement_reads: 0,
             time_zone: None,
+            no_headroom: None,
+            headroom_checks: 0,
+            fail_prepare: None,
+            prepared: None,
+            prepares: Vec::new(),
+            commits: 0,
+            discards: 0,
+            prepared_effect: None,
+            prepared_stages: std::collections::BTreeMap::new(),
+            prepared_omitted: std::collections::BTreeSet::new(),
+            prepared_frames: true,
+            prepared_failure: None,
         }
     }
 }
@@ -829,6 +873,38 @@ impl World {
             _ if hidden == Shown::Camera => Shown::Black,
             _ => hidden,
         })
+    }
+
+    /// Stops the prepared output, if any, counted in `discards`.
+    fn discard_prepared(&mut self) {
+        if self.prepared.take().is_some() {
+            self.discards += 1;
+        }
+    }
+
+    /// What the prepared output's effect reports now
+    /// ([`World::prepared_effect`]).
+    fn prepared_effect_status(&self, params: &SessionParams) -> EffectStatus {
+        if let Some(s) = &self.prepared_effect {
+            return s.clone();
+        }
+        if params.effect.mode == EffectMode::None {
+            EffectStatus::Off
+        } else if params.backends.effect.is_none() {
+            EffectStatus::Failed(NO_BACKEND.into())
+        } else {
+            EffectStatus::Ready
+        }
+    }
+
+    /// What the prepared output reports for its stage `s`
+    /// ([`World::prepared_stages`]).
+    fn prepared_stage_status(&self, s: &super::StageRun) -> EffectStatus {
+        match (s.enabled, self.prepared_stages.get(s.id.as_str())) {
+            (false, _) => EffectStatus::Off,
+            (true, Some(st)) => st.clone(),
+            (true, None) => EffectStatus::Ready,
+        }
     }
 
     /// The camera the session streams from.
@@ -1029,6 +1105,7 @@ impl MediaBackend for FakeBackend {
         contract: &OutputContract,
     ) -> Result<PathBuf, WriterError> {
         let mut w = self.world();
+        w.discard_prepared();
         w.session = None;
         w.writer = None;
         w.stop_pipewire();
@@ -1253,6 +1330,7 @@ impl MediaBackend for FakeBackend {
 
     fn switch_camera(&mut self, params: &SessionParams, camera: &Camera) -> Result<(), String> {
         let mut w = self.world();
+        w.discard_prepared();
         w.ingest_fixed_framerate.push(params.fixed_framerate);
         w.ingest_enhance.push(params.effect.enhance);
         w.ingest_enhance_params
@@ -1268,11 +1346,124 @@ impl MediaBackend for FakeBackend {
     }
 
     fn stop_session(&mut self) {
+        self.world().discard_prepared();
         self.world().image_events.push(ImageEvent::StopSession);
         // All of it stopped, then the real parker parks if it stopped
         // cleanly.
         let mut running = self.running();
         self.parker().stop_session(&mut running);
+    }
+
+    fn overlap_headroom(&mut self) -> Result<(), String> {
+        let mut w = self.world();
+        w.headroom_checks += 1;
+        w.no_headroom.clone().map_or(Ok(()), Err)
+    }
+
+    fn prepare_session(&mut self, params: &SessionParams) -> Result<(), SessionError> {
+        let mut w = self.world();
+        w.discard_prepared();
+        let Some((running, _)) = w.session.as_ref() else {
+            return Err(SessionError::from("no session is running".to_string()));
+        };
+        if params.memory != running.memory || params.memory == VideoMemory::System {
+            return Err(SessionError::from(format!(
+                "cannot prepare an output in {:?} memory next to one in {:?} memory",
+                params.memory, running.memory
+            )));
+        }
+        if let Some(e) = w.fail_prepare.clone() {
+            return Err(SessionError::from(e));
+        }
+        w.prepared = Some(params.clone());
+        w.prepares.push(params.clone());
+        Ok(())
+    }
+
+    fn prepared_report(&mut self) -> Option<PreparedReport> {
+        let w = self.world();
+        let params = w.prepared.as_ref()?;
+        let stages = params
+            .effect
+            .stages
+            .iter()
+            .chain(params.effect.chains.iter().flat_map(|c| c.stages.iter()))
+            .filter(|s| !w.prepared_omitted.contains(s.id.as_str()))
+            .map(|s| (s.id.clone(), w.prepared_stage_status(s)))
+            .collect();
+        Some(PreparedReport {
+            effect: EffectReport {
+                status: w.prepared_effect_status(params),
+                stages,
+                enhance: w.enhance_status.clone(),
+                load_ms: Some(120.0),
+                reused: false,
+                gpu_ms_p50: Some(1.2),
+                freeze_held: false,
+                fallback_error: None,
+                background_error: None,
+                switch_error: None,
+                load_notice: None,
+                stage_values: Vec::new(),
+            },
+            first_frame: w.prepared_frames && w.streaming().is_some(),
+            failure: w.prepared_failure.clone(),
+        })
+    }
+
+    fn commit_prepared(&mut self) -> Result<(), String> {
+        let mut w = self.world();
+        let params = w.prepared.take().ok_or("no output is prepared")?;
+        let w = &mut *w;
+        let Some((running, _)) = w.session.as_ref() else {
+            return Err("no session is running".into());
+        };
+        // The ingest is kept: what it was built with stays.
+        let params = SessionParams {
+            fixed_framerate: running.fixed_framerate,
+            effect: EffectRun {
+                enhance: running.effect.enhance,
+                enhance_params: running.effect.enhance_params.clone(),
+                ..params.effect
+            },
+            ..params
+        };
+        let effect = w.prepared_effect_status(&params);
+        let stages: Vec<(String, EffectStatus)> = params
+            .effect
+            .stages
+            .iter()
+            .chain(params.effect.chains.iter().flat_map(|c| c.stages.iter()))
+            .filter(|s| !w.prepared_omitted.contains(s.id.as_str()))
+            .map(|s| (s.id.to_string(), w.prepared_stage_status(s)))
+            .collect();
+        if let Some((running, _)) = w.session.as_mut() {
+            *running = params.clone();
+        }
+        w.commits += 1;
+        // The new output's element: its own backend, the effect it was
+        // prepared with, in the state the prepared output reported.
+        w.effect_revoked = false;
+        w.freeze_held = false;
+        w.apply_effect(&params.effect);
+        w.effect_status = effect;
+        for (id, st) in stages {
+            match id.as_str() {
+                "denoise" => w.denoise_status = st,
+                "relight" => w.relight_status = st,
+                _ => {
+                    w.stage_status.insert(id, st);
+                }
+            }
+        }
+        w.prepared_stages.clear();
+        w.prepared_omitted.clear();
+        w.prepared_effect = None;
+        Ok(())
+    }
+
+    fn discard_prepared(&mut self) {
+        self.world().discard_prepared();
     }
 
     fn first_frame(&mut self) -> bool {

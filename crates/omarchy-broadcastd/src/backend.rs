@@ -346,6 +346,24 @@ pub struct EffectReport {
     pub stage_values: Vec<StageValue>,
 }
 
+/// What the output prepared alongside the running session's reports
+/// ([`MediaBackend::prepared_report`]): what its effect element and module
+/// stages report, as [`MediaBackend::effect_report`] does for the running
+/// output, whether it has emitted a frame of the current ingest, and why
+/// its pipeline failed, if it did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedReport {
+    /// The prepared output's effect and stages (its `enhance` is the
+    /// current ingest's, which both outputs share).
+    pub effect: EffectReport,
+    /// The prepared output has emitted its first fresh frame of the current
+    /// ingest ([`obc_pipeline::Session::prepared_first_fresh`]): a frame
+    /// through its whole chain, not one its effect has processed.
+    pub first_frame: bool,
+    /// Why the prepared output's pipeline failed (`None`: it runs).
+    pub failure: Option<String>,
+}
+
 /// What the running session's ingest measured of its camera
 /// ([`MediaBackend::ingest_health`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -683,14 +701,56 @@ pub trait MediaBackend: Send + 'static {
 
     /// Makes `camera` the running session's ingest, replacing the current
     /// one (the output holds the last frame meanwhile). On error the
-    /// session has no ingest.
+    /// session has no ingest. An output prepared alongside
+    /// ([`Self::prepare_session`]) is discarded first.
     fn switch_camera(&mut self, params: &SessionParams, camera: &Camera) -> Result<(), String>;
 
     /// Stops the session: camera closed, its controls restored, CUDA
     /// context released, then the GPU parked if the session stopped cleanly
     /// (see [`park`]; a session that did not, or a park that fails, leaves
-    /// it awake). A session in system memory is not parked. Idempotent.
+    /// it awake). A session in system memory is not parked. An output
+    /// prepared alongside ([`Self::prepare_session`]) is discarded first.
+    /// Idempotent.
     fn stop_session(&mut self);
+
+    /// Whether the GPU has room for a second output chain next to the
+    /// running session's (the two-phase effect switch,
+    /// [`Self::prepare_session`]): the device's free memory is at least what
+    /// this process uses on it now, and at least 1 GiB, as NVML reports
+    /// them when asked (not a sample taken before: an output discarded
+    /// since no longer counts). The reason when it has not, or when NVML
+    /// cannot tell (no session in CUDA memory, NVML unavailable, the
+    /// process's usage not reported). One NVML query, no CUDA call.
+    fn overlap_headroom(&mut self) -> Result<(), String>;
+
+    /// Builds the output of a session of `params` (its effect element,
+    /// module chains and backends) alongside the running session's, on a
+    /// standby feed of the writer, and prepares it on the running ingest
+    /// ([`obc_pipeline::Session::prepare_output`]): the consumer still sees
+    /// the running output's frames only, the camera is not touched. An
+    /// output prepared before is discarded first. Fails, nothing prepared,
+    /// when no session runs, `params` is in another memory than the running
+    /// session's or in system memory, or the build or start fails. The
+    /// ingest-side parts of `params` (camera, enhancement, fixed frame
+    /// rate) are not used: the ingest is kept.
+    fn prepare_session(&mut self, params: &SessionParams) -> Result<(), SessionError>;
+
+    /// The output prepared by [`Self::prepare_session`] (`None`: none is).
+    fn prepared_report(&mut self) -> Option<PreparedReport>;
+
+    /// Hands the running session over to the prepared output
+    /// ([`obc_pipeline::Session::commit_prepared`]): the consumer's stream
+    /// turns to it between two frames, the ingest is kept, the previous
+    /// output is stopped. From then on the session reports the prepared
+    /// output (its effect, stages, chains and effect backend). A previous
+    /// output that did not stop cleanly is logged, and the session's stop
+    /// will not park the GPU. Fails, changing nothing, without a prepared
+    /// output.
+    fn commit_prepared(&mut self) -> Result<(), String>;
+
+    /// Stops the prepared output, if any; the running session never
+    /// noticed.
+    fn discard_prepared(&mut self);
 
     /// Whether the current ingest (since the last start or switch) has
     /// delivered a frame to the output.

@@ -57,6 +57,13 @@ fn beta() -> Camera {
     cam("usb-b", "Beta Cam", Some("2222:0002"), "/dev/video2")
 }
 
+/// The GPU has no room for the new effects next to the running ones
+/// ([`World::no_headroom`]): a module change restarts the session instead
+/// of switching alongside, as the tests of the restart and its hold need.
+fn no_headroom(w: &mut World) {
+    w.no_headroom = Some("no room on the GPU".into());
+}
+
 /// A controller over a fake world, its files in a temporary directory and
 /// time counted in milliseconds from `t0`.
 struct H {
@@ -9829,7 +9836,7 @@ fn disabling_the_effect_module_drops_its_stages_and_keeps_the_feed_and_the_other
 fn a_session_started_with_its_effect_module_disabled_follows_on_failure_and_restarts_once_enabled()
 {
     for on_failure in ON_FAILURE {
-        let mut h = H::new(&blur_with(on_failure), |_| {});
+        let mut h = H::new(&blur_with(on_failure), no_headroom);
         h.set_module(MAXINE_MODULE, false, 0);
         h.activate(100);
         assert_follows_on_failure(&h, on_failure, MAXINE_DISABLED);
@@ -10289,7 +10296,7 @@ fn an_effect_selected_while_its_module_is_disabled_is_given_once_it_is_enabled_a
 
 #[test]
 fn an_effect_selected_after_its_module_is_enabled_restarts_a_session_started_without_it() {
-    let mut h = H::new("", |_| {});
+    let mut h = H::new("", no_headroom);
     h.set_module(MAXINE_MODULE, false, 0);
     h.activate(100);
     assert!(h.session_params().backends.effect.is_none());
@@ -10316,7 +10323,7 @@ fn an_effect_selected_after_its_module_is_enabled_restarts_a_session_started_wit
 
 #[test]
 fn a_stage_of_a_module_enabled_mid_session_comes_back_by_one_restart() {
-    let mut h = H::new("[effect]\ndenoise = true\n", |_| {});
+    let mut h = H::new("[effect]\ndenoise = true\n", no_headroom);
     h.set_module(MAXINE_MODULE, false, 0);
     h.activate(100);
     assert!(!stage_on(&h.session_params().effect, "denoise"));
@@ -10410,6 +10417,7 @@ fn a_pin_to_another_module_keeps_the_running_stage_until_the_next_start() {
 fn an_effect_its_module_can_no_longer_run_moves_to_the_module_that_can() {
     const CUT: &str = "org.example.cutout";
     let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+        no_headroom(w);
         w.modules = vec![npu_module(CUT, StageId::BACKGROUND, "matte")];
     });
     h.activate(0);
@@ -10431,6 +10439,80 @@ fn an_effect_its_module_can_no_longer_run_moves_to_the_module_that_can() {
     assert_eq!(h.applied(), Some(EffectMode::Blur));
     let snap = h.snap();
     assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", ""));
+}
+
+/// The running session keeps showing its effect while the new one is
+/// built alongside: `h` streams, a switch away from its effect module is
+/// being prepared, the new effect still loading.
+fn assert_keeps_the_running_effect(h: &H, what: &str) {
+    let w = h.world();
+    assert_eq!(w.commits, 0, "{what}");
+    assert_eq!(w.session_starts, 1, "{what}");
+    assert_eq!(
+        w.effect.as_ref().map(|e| e.mode),
+        Some(EffectMode::Blur),
+        "{what}: the effect was dropped"
+    );
+    assert!(!w.effect_revoked, "{what}: the effect was revoked");
+    assert_eq!(w.shown(), Some(Shown::Effect), "{what}");
+    drop(w);
+    let warning = h.snap().warning;
+    assert!(!warning.contains("effect blur"), "{what}: {warning:?}");
+}
+
+#[test]
+fn an_effect_its_module_can_no_longer_run_moves_alongside_to_the_module_that_can() {
+    const CUT: &str = "org.example.cutout";
+    for on_failure in ["off", "black"] {
+        // Maxine's cut-out cannot run any more (a probe), or Maxine is
+        // disabled: the other module's is built alongside.
+        for disable in [false, true] {
+            let what = format!("{on_failure}, disabled {disable}");
+            let config = blur_with(on_failure);
+            let mut h = H::new(&config, |w| {
+                w.modules = vec![npu_module(CUT, StageId::BACKGROUND, "matte")];
+                w.prepared_effect = Some(EffectStatus::Loading);
+            });
+            h.activate(0);
+            assert_eq!(effect_module(&h).as_deref(), Some(MAXINE_MODULE));
+            let sets = h.world().effect_sets.len();
+            if disable {
+                h.set_module(MAXINE_MODULE, false, 1000);
+            } else {
+                h.world().features = Some(stage_missing(&StageId::BACKGROUND, "no model"));
+                h.reload(&config, 1000).unwrap();
+            }
+            assert_eq!(h.world().prepares.len(), 1, "{what}: prepared alongside");
+            for ms in [1100, 1400, 5000] {
+                h.tick(ms);
+                assert_keeps_the_running_effect(&h, &format!("{what}, {ms} ms"));
+            }
+            assert_eq!(effect_module(&h).as_deref(), Some(MAXINE_MODULE));
+            assert!(
+                h.world().effect_sets[sets..]
+                    .iter()
+                    .all(|e| e.mode == EffectMode::Blur),
+                "{what}: {:?}",
+                h.world().effect_sets[sets..].to_vec()
+            );
+            // Ready: the other module's takes over, no restart.
+            h.world().prepared_effect = None;
+            h.tick(5050);
+            {
+                let w = h.world();
+                assert_eq!((w.commits, w.session_starts), (1, 1), "{what}");
+                assert_eq!(w.shown(), Some(Shown::Effect), "{what}");
+            }
+            assert_eq!(effect_module(&h).as_deref(), Some(CUT), "{what}");
+            assert_eq!(h.applied(), Some(EffectMode::Blur));
+            let snap = h.snap();
+            assert_eq!(
+                (snap.error.as_str(), snap.warning.as_str()),
+                ("", ""),
+                "{what}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -10657,7 +10739,10 @@ fn dropped_stages_of_two_modules_are_two_clauses() {
 #[test]
 fn a_chain_module_toggled_mid_session_drops_and_restores_its_stage() {
     let dir = hello_modules_dir();
-    let mut h = H::new(&modules_config(dir.path()), |w| w.real_modules = true);
+    let mut h = H::new(&modules_config(dir.path()), |w| {
+        w.real_modules = true;
+        no_headroom(w);
+    });
     h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
         .unwrap();
     h.activate(100);
@@ -12732,7 +12817,10 @@ fn the_session_output_s_unreadable_away_image_is_said_once() {
 fn only_a_module_change_restart_holds_the_last_frame() {
     // A stage that only a new session can run, its module enabled: the
     // writer holds the camera picture across the restart.
-    let mut h = H::new(&away_config("privacy = true\ndenoise = true\n"), |_| {});
+    let mut h = H::new(
+        &away_config("privacy = true\ndenoise = true\n"),
+        no_headroom,
+    );
     h.set_module(MAXINE_MODULE, false, 0);
     h.activate(100);
     assert!(h.world().restart_holds.is_empty());
@@ -12744,7 +12832,7 @@ fn only_a_module_change_restart_holds_the_last_frame() {
     // The background effect selected under `on_failure = "black"` in a
     // session without it: the restart is not held (its last frame is the
     // room the effect now hides).
-    let mut h = H::new(&away_config("privacy = true\n"), |_| {});
+    let mut h = H::new(&away_config("privacy = true\n"), no_headroom);
     h.set_module(MAXINE_MODULE, false, 0);
     h.activate(100);
     h.set_module(MAXINE_MODULE, true, 1000);
@@ -12754,7 +12842,7 @@ fn only_a_module_change_restart_holds_the_last_frame() {
     assert_eq!(h.world().session_starts, 2);
     assert!(h.world().restart_holds.is_empty());
     // Under `on_failure = "none"` (the camera may be shown): held.
-    let mut h = H::new(&away_config("on_failure = \"none\"\n"), |_| {});
+    let mut h = H::new(&away_config("on_failure = \"none\"\n"), no_headroom);
     h.set_module(MAXINE_MODULE, false, 0);
     h.activate(100);
     h.set_module(MAXINE_MODULE, true, 1000);
@@ -12786,7 +12874,7 @@ fn only_a_module_change_restart_holds_the_last_frame() {
     assert!(h.world().session.is_none());
     assert!(h.world().restart_holds.is_empty());
     // The camera turned off: no hold.
-    let mut h = H::new(&away_config("privacy = true\n"), |_| {});
+    let mut h = H::new(&away_config("privacy = true\n"), no_headroom);
     h.activate(0);
     h.call(|r| Command::SetEnabled(false, r), 1000).unwrap();
     assert!(h.world().restart_holds.is_empty());
@@ -12796,7 +12884,7 @@ fn only_a_module_change_restart_holds_the_last_frame() {
 fn a_restart_hold_ends_when_the_camera_turns_off_before_the_next_frame() {
     // SetEnabled(false) queued during the new session's output build: the
     // session is dropped before a camera frame, and the hold with it.
-    let mut h = H::new(&away_config("denoise = true\n"), |_| {});
+    let mut h = H::new(&away_config("denoise = true\n"), no_headroom);
     h.set_module(MAXINE_MODULE, false, 0);
     h.activate(100);
     let published = h.ctrl.published.clone();
@@ -12811,7 +12899,7 @@ fn a_restart_hold_ends_when_the_camera_turns_off_before_the_next_frame() {
     assert_eq!(h.world().restart_hold_ends, [true], "ended once");
     // Queued before the restart: the new session never starts, and the
     // hold ends with no session.
-    let mut h = H::new(&away_config("denoise = true\n"), |_| {});
+    let mut h = H::new(&away_config("denoise = true\n"), no_headroom);
     h.set_module(MAXINE_MODULE, false, 0);
     h.activate(100);
     h.ctrl.published.request_disable();
@@ -12820,7 +12908,7 @@ fn a_restart_hold_ends_when_the_camera_turns_off_before_the_next_frame() {
     assert_eq!(h.world().restart_holds, [true]);
     assert_eq!(h.world().restart_hold_ends, [false]);
     // A new start that fails: ended.
-    let mut h = H::new(&away_config("denoise = true\n"), |_| {});
+    let mut h = H::new(&away_config("denoise = true\n"), no_headroom);
     h.set_module(MAXINE_MODULE, false, 0);
     h.activate(100);
     h.world().fail_start = Some("no output".into());
@@ -12830,7 +12918,7 @@ fn a_restart_hold_ends_when_the_camera_turns_off_before_the_next_frame() {
     assert!(!h.world().restart_hold_ends.is_empty());
     // A normal restart: the new session's frames end the hold in the
     // writer; nothing is asked of it, then or later.
-    let mut h = H::new(&away_config("denoise = true\n"), |_| {});
+    let mut h = H::new(&away_config("denoise = true\n"), no_headroom);
     h.set_module(MAXINE_MODULE, false, 0);
     h.activate(100);
     h.set_module(MAXINE_MODULE, true, 1000);
@@ -12852,7 +12940,7 @@ fn a_restart_hold_ends_when_privacy_turns_on_before_the_next_frame() {
             "mode = \"blur\"\non_failure = \"{policy}\"\ndenoise = true\n"
         ))
     };
-    let mut h = H::new(&blur("none"), |_| {});
+    let mut h = H::new(&blur("none"), no_headroom);
     h.set_module(MAXINE_MODULE, false, 0);
     h.activate(100);
     h.world().frames = false;
@@ -12879,7 +12967,10 @@ const HELLO_MODULE: &str = "org.example.hello";
 fn restart_held_for(effect: &str, effect_on: bool, first: &str) -> (H, TempDir) {
     let dir = hello_modules_dir();
     let config = format!("{}[effect]\n{effect}", modules_config(dir.path()));
-    let mut h = H::new(&config, |w| w.real_modules = true);
+    let mut h = H::new(&config, |w| {
+        w.real_modules = true;
+        no_headroom(w);
+    });
     h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
         .unwrap();
     h.set_module(HELLO_MODULE, false, 0);
@@ -12948,7 +13039,7 @@ fn the_system_memory_fallback_of_a_restart_keeps_its_hold() {
     // The new session's CUDA output fails for want of CUDA: it never
     // attached to the writer, and the start in system memory goes on
     // under the hold.
-    let mut h = H::new("[effect]\ndenoise = true\n", |_| {});
+    let mut h = H::new("[effect]\ndenoise = true\n", no_headroom);
     h.set_module(MAXINE_MODULE, false, 0);
     h.activate(100);
     h.world().frames = false;
@@ -12963,6 +13054,832 @@ fn the_system_memory_fallback_of_a_restart_keeps_its_hold() {
     assert!(w.session.is_some());
     assert_eq!(w.restart_holds, [true]);
     assert!(w.restart_hold_ends.is_empty(), "{:?}", w.restart_hold_ends);
+}
+
+// ---- the two-phase effect switch: the new effects built alongside ----
+
+/// A session started without the Maxine module, noise removal selected,
+/// live: enabling the module at 1000 ms switches to a session that runs
+/// noise removal, alongside, with the prepared output's noise removal
+/// reporting `denoise` meanwhile.
+fn switching_denoise(denoise: EffectStatus) -> H {
+    let mut h = H::new("[effect]\ndenoise = true\n", |_| {});
+    h.set_module(MAXINE_MODULE, false, 0);
+    h.activate(100);
+    h.world().prepared_stages.insert("denoise".into(), denoise);
+    h.set_module(MAXINE_MODULE, true, 1000);
+    {
+        let w = h.world();
+        assert_eq!(w.prepares.len(), 1, "prepared alongside");
+        assert_eq!(w.headroom_checks, 1);
+    }
+    h
+}
+
+/// The effect module of the session as the backend runs it.
+fn effect_module(h: &H) -> Option<String> {
+    h.session_params()
+        .backends
+        .effect
+        .as_ref()
+        .map(|m| m.id.clone())
+}
+
+#[test]
+fn a_module_change_switches_alongside_without_reopening_the_camera() {
+    let mut h = switching_denoise(EffectStatus::Loading);
+    let ingests = h.world().ingests.clone();
+    // Built with what a start would run, on the same ingest.
+    {
+        let w = h.world();
+        let prepared = w.prepared.as_ref().expect("prepared");
+        assert_eq!(
+            prepared.backends.effect.as_ref().map(|m| m.id.as_str()),
+            Some(MAXINE_MODULE)
+        );
+        assert!(stage_on(&prepared.effect, "denoise"));
+        assert_eq!(prepared.memory, VideoMemory::Cuda);
+    }
+    // Loading: the running session streams on, untouched.
+    h.tick(1100);
+    h.tick(1150);
+    {
+        let w = h.world();
+        assert_eq!(w.commits, 0);
+        assert_eq!(w.discards, 0);
+        assert_eq!((w.session_starts, w.session_stops), (1, 0));
+        assert!(w.restart_holds.is_empty());
+    }
+    assert_eq!(effect_module(&h), None, "the running session's");
+    assert_eq!(h.state(), State::Active);
+    assert!(h.ctrl.next_wakeup(h.at(1150)) <= POLL_STARTING);
+    // Ready: it takes over, the camera never reopened, nothing held.
+    h.world().prepared_stages.clear();
+    h.tick(1200);
+    {
+        let w = h.world();
+        assert_eq!(w.commits, 1);
+        assert_eq!(w.discards, 0);
+        assert_eq!((w.session_starts, w.session_stops), (1, 0));
+        assert_eq!(w.ingests, ingests, "the camera was not reopened");
+        assert!(w.restart_holds.is_empty());
+        assert!(w.restart_hold_ends.is_empty());
+        assert!(w.prepared.is_none());
+        assert_eq!(w.denoise_status, EffectStatus::Ready);
+    }
+    assert_eq!(effect_module(&h).as_deref(), Some(MAXINE_MODULE));
+    assert!(stage_on(&h.session_params().effect, "denoise"));
+    assert_eq!(
+        h.ctrl
+            .plan
+            .as_ref()
+            .and_then(|p| p.provider(&StageId::DENOISE)),
+        Some(MAXINE_MODULE)
+    );
+    assert!(h.ctrl.preparing.is_none());
+    assert_eq!(h.ctrl.restart_held, None);
+    assert_eq!(h.state(), State::Active);
+    let snap = h.snap();
+    assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", ""));
+    // Switched once: nothing more to switch to.
+    h.tick(1500);
+    h.tick(2000);
+    let w = h.world();
+    assert_eq!((w.prepares.len(), w.commits, w.session_starts), (1, 1, 1));
+}
+
+#[test]
+fn the_current_effects_stream_until_the_new_ones_are_ready() {
+    let mut h = switching_denoise(EffectStatus::Loading);
+    let before = h.session_params();
+    let sets = h.world().effect_sets.len();
+    // Up to the bound, nothing changes for the running session.
+    for ms in [1100, 5000, 20_000, 30_900] {
+        h.tick(ms);
+        let w = h.world();
+        assert_eq!(w.commits, 0, "{ms} ms");
+        assert_eq!(w.session.as_ref().map(|(p, _)| p), Some(&before));
+        assert_eq!(w.effect_sets.len(), sets);
+        assert_eq!(w.session_starts, 1);
+    }
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(
+        h.snap().warning,
+        "noise removal unavailable: it runs once the new effects are ready"
+    );
+    h.world().prepared_stages.clear();
+    h.tick(30_950);
+    assert_eq!(h.world().commits, 1, "within the bound");
+}
+
+#[test]
+fn a_module_change_restarts_when_it_cannot_switch_alongside() {
+    // The GPU has no room for a second chain: restarted, as before.
+    let mut h = H::new("[effect]\ndenoise = true\n", no_headroom);
+    h.set_module(MAXINE_MODULE, false, 0);
+    h.activate(100);
+    h.set_module(MAXINE_MODULE, true, 1000);
+    h.tick(1400);
+    {
+        let w = h.world();
+        assert_eq!(w.headroom_checks, 1);
+        assert!(w.prepares.is_empty());
+        assert_eq!(w.session_starts, 2);
+        assert_eq!(w.restart_holds, [true]);
+    }
+    assert_eq!(h.state(), State::Active);
+    // A session in system memory: restarted, the GPU not even asked.
+    const CUT: &str = "org.example.cutout";
+    let mut h = H::new(
+        "[video]\nmemory = \"system\"\n[effect]\nmode = \"blur\"\non_failure = \"none\"\n",
+        |w| w.modules = vec![npu_module(CUT, StageId::BACKGROUND, "matte")],
+    );
+    h.set_module(CUT, false, 0);
+    h.activate(100);
+    assert_eq!(h.session_params().memory, VideoMemory::System);
+    h.set_module(CUT, true, 1000);
+    h.tick(1400);
+    {
+        let w = h.world();
+        assert_eq!(w.headroom_checks, 0);
+        assert!(w.prepares.is_empty());
+        assert_eq!(w.session_starts, 2);
+        assert_eq!(w.restart_holds, [true]);
+    }
+    assert_eq!(effect_module(&h).as_deref(), Some(CUT));
+    // Enhancement is the ingest's: restarted, the camera reopened with it.
+    let mut h = H::new("[effect]\nenhance = true\n", |w| {
+        w.cameras = vec![small(alpha())]
+    });
+    h.set_module(MAXINE_MODULE, false, 0);
+    h.activate(100);
+    h.set_module(MAXINE_MODULE, true, 1000);
+    h.tick(1400);
+    let w = h.world();
+    assert!(w.prepares.is_empty());
+    assert_eq!(w.session_starts, 2);
+    assert_eq!(w.restart_holds, [true]);
+    assert_eq!(w.ingest_enhance.last(), Some(&true));
+}
+
+/// A session of the example module's `hello` stage and the background
+/// effect under `effect` (Maxine's), started without the example module
+/// and live, the module then enabled at 1000 ms with the prepared output's
+/// background effect reporting `background`.
+fn switching_hello(effect: &str, background: EffectStatus) -> (H, TempDir) {
+    let dir = hello_modules_dir();
+    let config = format!("{}[effect]\n{effect}", modules_config(dir.path()));
+    let mut h = H::new(&config, |w| w.real_modules = true);
+    h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
+        .unwrap();
+    h.set_module(HELLO_MODULE, false, 0);
+    h.activate(100);
+    h.world().prepared_effect = Some(background);
+    h.set_module(HELLO_MODULE, true, 1000);
+    assert_eq!(h.world().prepares.len(), 1, "prepared alongside");
+    (h, dir)
+}
+
+#[test]
+fn under_privacy_the_switch_waits_for_the_effect_and_never_shows_the_room() {
+    let blur = "mode = \"blur\"\non_failure = \"black\"\n";
+    let (mut h, _dir) = switching_hello(blur, EffectStatus::Loading);
+    // The new chain's stage is ready, its effect is not: the running
+    // session's effect is what the consumer sees.
+    for ms in [1100, 1200, 2000] {
+        h.tick(ms);
+        let w = h.world();
+        assert_eq!(w.commits, 0, "{ms} ms");
+        assert_eq!(w.shown(), Some(Shown::Effect), "{ms} ms");
+        assert_eq!(w.session_stops, 0);
+    }
+    assert_eq!(h.ctrl.passthrough, None);
+    // A setting changed meanwhile reaches the new effects once they take
+    // over.
+    h.set_strength(0.3, 2050).unwrap();
+    h.world().prepared_effect = None;
+    h.tick(2100);
+    assert_eq!(
+        h.world().effect.as_ref().map(|e| e.blur_strength),
+        Some(0.3)
+    );
+    {
+        let w = h.world();
+        assert_eq!(w.commits, 1);
+        assert_eq!(w.shown(), Some(Shown::Effect));
+        let (params, _) = w.session.as_ref().expect("a session");
+        assert_eq!(
+            (params.effect.mode, params.effect.on_failure),
+            (EffectMode::Blur, EffectOnFailure::Black)
+        );
+        assert!(stage_on(&params.effect, "hello"));
+        assert_eq!((w.session_starts, w.session_stops), (1, 0));
+        assert!(w.restart_holds.is_empty());
+    }
+    assert_eq!(h.snap().warning, "");
+}
+
+#[test]
+fn a_privacy_change_while_switching_discards_the_new_effects() {
+    let dir = hello_modules_dir();
+    let config = |policy: &str| {
+        format!(
+            "{}[effect]\nmode = \"blur\"\non_failure = \"{policy}\"\n",
+            modules_config(dir.path())
+        )
+    };
+    let mut h = H::new(&config("none"), |w| w.real_modules = true);
+    h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
+        .unwrap();
+    h.set_module(HELLO_MODULE, false, 0);
+    h.activate(100);
+    h.world().prepared_effect = Some(EffectStatus::Loading);
+    h.set_module(HELLO_MODULE, true, 1000);
+    assert_eq!(h.world().prepares.len(), 1);
+    // Privacy turned on: what was built under the old policy goes, and
+    // the switch is built again under the new one.
+    h.reload(&config("black"), 1100).unwrap();
+    {
+        let w = h.world();
+        assert_eq!(w.discards, 1);
+        assert_eq!(w.commits, 0);
+        assert_eq!(w.prepares.len(), 2);
+        assert_eq!(
+            w.prepares[1].effect.on_failure,
+            EffectOnFailure::Black,
+            "under the policy now"
+        );
+        // The running session follows the policy meanwhile.
+        assert_eq!(w.shown(), Some(Shown::Effect));
+        assert_eq!(w.session_stops, 0);
+    }
+    assert!(h.ctrl.preparing.as_ref().is_some_and(|p| p.hiding));
+    h.world().prepared_effect = None;
+    h.tick(1200);
+    let w = h.world();
+    assert_eq!(w.commits, 1);
+    let (params, _) = w.session.as_ref().expect("a session");
+    assert_eq!(params.effect.on_failure, EffectOnFailure::Black);
+}
+
+#[test]
+fn a_switch_that_fails_keeps_the_current_effects_and_says_so() {
+    let blur = "mode = \"blur\"\non_failure = \"black\"\n";
+    let (mut h, _dir) = switching_hello(blur, EffectStatus::Failed("no model".into()));
+    h.tick(1100);
+    let before = h.session_params();
+    {
+        let w = h.world();
+        assert_eq!((w.discards, w.commits), (1, 0));
+        assert_eq!((w.session_starts, w.session_stops), (1, 0));
+        assert!(w.restart_holds.is_empty());
+        assert_eq!(w.shown(), Some(Shown::Effect));
+    }
+    let clause = h.snap().warning;
+    assert!(
+        clause
+            .contains("could not switch: effect blur: no model; the current effects keep running"),
+        "{clause:?}"
+    );
+    assert_eq!(h.state(), State::Active);
+    // Not tried again for the same target, nor restarted for.
+    h.tick(1500);
+    h.tick(3000);
+    h.set_strength(0.3, 3100).unwrap();
+    {
+        let w = h.world();
+        assert_eq!(w.prepares.len(), 1);
+        assert_eq!(w.session_starts, 1);
+        assert_eq!(
+            w.session.as_ref().map(|(p, _)| &p.backends),
+            Some(&before.backends)
+        );
+    }
+    assert!(h.snap().warning.contains("could not switch"));
+    // Another target (the stage turned off): the clause goes.
+    h.set_setting("effect.hello.enabled", SettingValue::Bool(false), 3200)
+        .unwrap();
+    assert!(
+        !h.snap().warning.contains("could not switch"),
+        "{:?}",
+        h.snap()
+    );
+    assert_eq!(h.world().prepares.len(), 1);
+}
+
+#[test]
+fn a_stage_the_new_effects_were_built_without_is_not_waited_for() {
+    // Noise removal's chain could not be made: the prepared output runs
+    // without it, as a start would, and takes over once the rest is ready.
+    let mut h = H::new("[effect]\ndenoise = true\nrelight = true\n", |_| {});
+    h.set_module(MAXINE_MODULE, false, 0);
+    h.activate(100);
+    {
+        let mut w = h.world();
+        w.prepared_omitted.insert("denoise".into());
+        w.prepared_stages
+            .insert("relight".into(), EffectStatus::Loading);
+    }
+    h.set_module(MAXINE_MODULE, true, 1000);
+    assert_eq!(h.world().prepares.len(), 1);
+    h.tick(1100);
+    assert_eq!(h.world().commits, 0, "relighting is still loading");
+    h.world().prepared_stages.clear();
+    h.tick(1200);
+    let w = h.world();
+    assert_eq!((w.commits, w.discards, w.session_starts), (1, 0, 1));
+    assert!(w.restart_holds.is_empty());
+}
+
+#[test]
+fn a_switch_not_ready_in_time_restarts_once() {
+    // A slow load alone would have worked by a restart: the session
+    // restarts with the new effects, once, nothing remembered.
+    let mut h = switching_denoise(EffectStatus::Loading);
+    h.tick(30_900);
+    assert_eq!(h.world().discards, 0, "within the bound");
+    h.tick(31_000);
+    h.tick(31_400);
+    {
+        let w = h.world();
+        assert_eq!((w.discards, w.commits), (1, 0));
+        assert_eq!(w.session_starts, 2, "restarted");
+        assert_eq!(w.restart_holds.len(), 1);
+    }
+    assert!(h.ctrl.switch_failed.is_none());
+    assert!(stage_on(&h.session_params().effect, "denoise"));
+    assert_eq!(effect_module(&h).as_deref(), Some(MAXINE_MODULE));
+    let warning = h.snap().warning;
+    assert!(!warning.contains("could not switch"), "{warning:?}");
+    h.tick(31_500);
+    h.tick(35_000);
+    let w = h.world();
+    assert_eq!(w.prepares.len(), 1, "not again");
+    assert_eq!(w.session_starts, 2, "once");
+}
+
+#[test]
+fn a_failed_switch_after_disabling_the_running_module_restarts() {
+    // The background effect moves from Maxine, disabled, to the other
+    // module; the new effects fail: the current ones run a module no
+    // longer enabled, so the session restarts at once. Until then the
+    // current effects run as they did: the room is never shown for it,
+    // nor hidden.
+    const CUT: &str = "org.example.cutout";
+    for on_failure in ["none", "black"] {
+        let mut h = H::new(&blur_with(on_failure), |w| {
+            w.modules = vec![npu_module(CUT, StageId::BACKGROUND, "matte")];
+            w.prepared_effect = Some(EffectStatus::Loading);
+        });
+        h.activate(0);
+        assert_eq!(effect_module(&h).as_deref(), Some(MAXINE_MODULE));
+        h.set_module(MAXINE_MODULE, false, 1000);
+        for ms in [1100, 1400] {
+            h.tick(ms);
+            assert_keeps_the_running_effect(&h, &format!("{on_failure}, {ms} ms"));
+        }
+        h.world().prepared_effect = Some(EffectStatus::Failed("matte failed".into()));
+        h.tick(1500);
+        h.tick(1900);
+        let w = h.world();
+        assert_eq!(w.prepares.len(), 1, "{on_failure}");
+        assert_eq!((w.discards, w.commits), (1, 0), "{on_failure}");
+        assert_eq!(w.session_starts, 2, "{on_failure}: restarted");
+        let (params, _) = w.session.as_ref().expect("a session");
+        assert_eq!(
+            params.backends.effect.as_ref().map(|m| m.id.as_str()),
+            Some(CUT),
+            "{on_failure}"
+        );
+    }
+}
+
+#[test]
+fn a_switch_in_progress_goes_with_the_session_or_its_camera() {
+    // The camera turned off.
+    let mut h = switching_denoise(EffectStatus::Loading);
+    h.call(|r| Command::SetEnabled(false, r), 1100).unwrap();
+    assert_eq!(h.world().discards, 1);
+    assert!(h.ctrl.preparing.is_none());
+    assert_eq!(h.world().commits, 0);
+    // The output failed.
+    let mut h = switching_denoise(EffectStatus::Loading);
+    h.world().failure = Some(crate::backend::Failure::Output("gone".into()));
+    h.tick(1100);
+    assert_eq!(h.world().discards, 1);
+    assert!(h.ctrl.preparing.is_none());
+    // The last consumer left, past the grace.
+    let mut h = switching_denoise(EffectStatus::Loading);
+    h.consumers(0, 1100);
+    h.tick(60_000);
+    assert!(h.world().session.is_none());
+    let w = h.world();
+    assert_eq!((w.discards, w.commits), (1, 0));
+    drop(w);
+    // Another camera picked: the new effects go, and are built again on
+    // its ingest once it streams.
+    let mut h = switching_denoise(EffectStatus::Loading);
+    h.call(|r| Command::SelectCamera("usb-b".into(), r), 1100)
+        .unwrap();
+    assert_eq!(h.world().discards, 1);
+    assert_eq!(h.world().streaming(), Some("usb-b"));
+    h.tick(1200);
+    h.tick(1500);
+    {
+        let w = h.world();
+        assert_eq!(w.prepares.len(), 2, "prepared again on the new ingest");
+        assert!(w.prepared.is_some());
+        assert_eq!(w.session_starts, 1);
+    }
+    assert!(
+        h.ctrl
+            .preparing
+            .as_ref()
+            .is_some_and(|p| p.camera == "usb-b")
+    );
+    h.world().prepared_stages.clear();
+    h.tick(1600);
+    let w = h.world();
+    assert_eq!((w.commits, w.session_starts), (1, 1));
+    assert_eq!(w.denoise_status, EffectStatus::Ready);
+}
+
+const CUTOUT: &str = "org.example.cutout";
+
+/// A live session of Maxine's blur under `on_failure` ([`blur_with`]),
+/// another module offering the cut-out, which Maxine stops being able to
+/// run at 1000 ms: disabled (`disable`), else its probe lost the stage.
+/// The other module's cut-out is prepared alongside, loading.
+fn switching_cutout(on_failure: &str, disable: bool) -> H {
+    let config = blur_with(on_failure);
+    let mut h = H::new(&config, |w| {
+        w.modules = vec![npu_module(CUTOUT, StageId::BACKGROUND, "matte")];
+        w.prepared_effect = Some(EffectStatus::Loading);
+    });
+    h.activate(0);
+    assert_eq!(effect_module(&h).as_deref(), Some(MAXINE_MODULE));
+    if disable {
+        h.set_module(MAXINE_MODULE, false, 1000);
+    } else {
+        h.world().features = Some(stage_missing(&StageId::BACKGROUND, "no model"));
+        h.reload(&config, 1000).unwrap();
+    }
+    assert_eq!(h.world().prepares.len(), 1, "prepared alongside");
+    h
+}
+
+/// Under a policy that hides the camera, the room is never what the
+/// consumer sees.
+fn assert_never_the_room(h: &H, on_failure: &str, what: &str) {
+    if on_failure != "off" && on_failure != "none" {
+        assert_ne!(h.world().shown(), Some(Shown::Camera), "{what}");
+    }
+}
+
+#[test]
+fn a_failed_switch_restarts_when_the_current_effect_can_no_longer_run() {
+    // Maxine stays enabled but its probe lost the cut-out; the other
+    // module's fails too: the session cannot keep its effect, so it
+    // restarts, and nothing says the current effects keep running.
+    for on_failure in ["off", "black"] {
+        let mut h = switching_cutout(on_failure, false);
+        h.tick(1100);
+        assert_keeps_the_running_effect(&h, on_failure);
+        h.world().prepared_effect = Some(EffectStatus::Failed("no room".into()));
+        h.tick(1200);
+        assert!(
+            !h.snap().warning.contains("keep running"),
+            "{on_failure}: {:?}",
+            h.snap().warning
+        );
+        assert!(h.ctrl.switch_failed.is_none(), "{on_failure}");
+        h.tick(1600);
+        let w = h.world();
+        assert_eq!((w.discards, w.commits), (1, 0), "{on_failure}");
+        assert_eq!(w.session_starts, 2, "{on_failure}: restarted");
+        let (params, _) = w.session.as_ref().expect("a session");
+        assert_eq!(
+            params.backends.effect.as_ref().map(|m| m.id.as_str()),
+            Some(CUTOUT),
+            "{on_failure}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_switch_is_restarted_for_once_the_current_effect_loses_its_module() {
+    // A switch for the example module's stage fails while Maxine's blur
+    // runs: remembered, the blur kept. Then Maxine's probe loses the
+    // cut-out: the memory no longer holds, the session restarts.
+    for on_failure in ["none", "black"] {
+        let blur = format!("mode = \"blur\"\non_failure = \"{on_failure}\"\n");
+        let (mut h, dir) = switching_hello(&blur, EffectStatus::Loading);
+        h.world()
+            .prepared_stages
+            .insert("hello".into(), EffectStatus::Failed("no room".into()));
+        h.tick(1100);
+        assert!(h.ctrl.switch_failed.is_some(), "{on_failure}");
+        assert!(
+            h.snap()
+                .warning
+                .contains("the current effects keep running"),
+            "{on_failure}"
+        );
+        assert_eq!(h.world().session_starts, 1);
+        h.world().features = Some(stage_missing(&StageId::BACKGROUND, "no model"));
+        let config = format!("{}[effect]\n{blur}", modules_config(dir.path()));
+        h.reload(&config, 1200).unwrap();
+        assert_never_the_room(&h, on_failure, on_failure);
+        assert!(
+            !h.snap().warning.contains("keep running"),
+            "{on_failure}: {:?}",
+            h.snap().warning
+        );
+        for ms in [1250, 1300, 1700] {
+            h.tick(ms);
+            assert_never_the_room(&h, on_failure, &format!("{on_failure}, {ms} ms"));
+            assert!(!h.snap().warning.contains("keep running"), "{on_failure}");
+        }
+        assert_eq!(h.world().session_starts, 2, "{on_failure}: restarted");
+        assert!(h.ctrl.switch_failed.is_none(), "{on_failure}");
+    }
+}
+
+#[test]
+fn a_failed_switch_is_restarted_for_once_its_module_pinned_away_is_disabled() {
+    // The cut-out module runs the blur (Maxine was disabled at the
+    // start); Maxine enabled and pinned for the cut-out: the switch to it
+    // (and its noise removal) fails while the cut-out module's blur keeps
+    // running, remembered. That module then disabled leaves what a start
+    // would run as it was: the memory no longer holds all the same.
+    for on_failure in ["off", "black"] {
+        let mut h = H::new(&format!("{}denoise = true\n", blur_with(on_failure)), |w| {
+            w.modules = vec![npu_module(CUTOUT, StageId::BACKGROUND, "matte")];
+        });
+        h.set_module(MAXINE_MODULE, false, 0);
+        h.activate(100);
+        assert_eq!(effect_module(&h).as_deref(), Some(CUTOUT));
+        h.world()
+            .prepared_stages
+            .insert("denoise".into(), EffectStatus::Failed("no room".into()));
+        h.set_module(MAXINE_MODULE, true, 1000);
+        h.call(
+            |r| Command::SetStagePin("background".into(), MAXINE_MODULE.into(), r),
+            1000,
+        )
+        .unwrap();
+        h.tick(1100);
+        h.tick(1200);
+        assert!(h.ctrl.switch_failed.is_some(), "{on_failure}");
+        assert!(
+            h.snap()
+                .warning
+                .contains("the current effects keep running"),
+            "{on_failure}: {:?}",
+            h.snap().warning
+        );
+        assert_eq!(h.world().session_starts, 1, "{on_failure}");
+        assert_eq!(effect_module(&h).as_deref(), Some(CUTOUT));
+        let target = h.ctrl.target_key();
+        h.set_module(CUTOUT, false, 1300);
+        assert_eq!(h.ctrl.target_key(), target, "{on_failure}: the same target");
+        assert_never_the_room(&h, on_failure, on_failure);
+        assert!(!h.snap().warning.contains("keep running"), "{on_failure}");
+        h.tick(1400);
+        h.tick(1800);
+        let w = h.world();
+        assert_eq!(w.session_starts, 2, "{on_failure}: restarted");
+        let (params, _) = w.session.as_ref().expect("a session");
+        assert_eq!(
+            params.backends.effect.as_ref().map(|m| m.id.as_str()),
+            Some(MAXINE_MODULE),
+            "{on_failure}"
+        );
+    }
+}
+
+#[test]
+fn a_kept_effect_no_module_provides_any_more_is_not_called_unavailable_while_switching() {
+    // Maxine, running the blur and noise removal, disabled: another module
+    // offers noise removal, none the cut-out. While the switch is built,
+    // the blur Maxine still runs is not said to be unavailable; once the
+    // switch fails it restarts, the blur then following the policy.
+    const DN: &str = "org.example.denoise";
+    for on_failure in ["off", "black"] {
+        let config = format!("{}denoise = true\n", blur_with(on_failure));
+        let mut h = H::new(&config, |w| {
+            w.modules = vec![npu_module(DN, StageId::DENOISE, "pre-matte")];
+            w.prepared_stages
+                .insert("denoise".into(), EffectStatus::Loading);
+        });
+        h.activate(0);
+        assert_eq!(effect_module(&h).as_deref(), Some(MAXINE_MODULE));
+        h.set_module(MAXINE_MODULE, false, 1000);
+        assert_eq!(
+            h.world().prepares.len(),
+            1,
+            "{on_failure}: prepared alongside"
+        );
+        for ms in [1100, 1400] {
+            h.tick(ms);
+            assert_keeps_the_running_effect(&h, &format!("{on_failure}, {ms} ms"));
+            let warning = h.snap().warning;
+            assert!(
+                !warning.contains("unavailable"),
+                "{on_failure}: {warning:?}"
+            );
+        }
+        h.world()
+            .prepared_stages
+            .insert("denoise".into(), EffectStatus::Failed("no room".into()));
+        h.tick(1500);
+        assert!(!h.snap().warning.contains("keep running"), "{on_failure}");
+        h.tick(1900);
+        assert_eq!(h.world().session_starts, 2, "{on_failure}: restarted");
+        assert_never_the_room(&h, on_failure, on_failure);
+    }
+}
+
+#[test]
+fn a_switch_away_from_a_disabled_module_not_ready_in_time_restarts() {
+    for on_failure in ["off", "black"] {
+        let mut h = switching_cutout(on_failure, true);
+        for ms in [1100, 20_000, 30_900] {
+            h.tick(ms);
+            assert_keeps_the_running_effect(&h, &format!("{on_failure}, {ms} ms"));
+        }
+        h.tick(31_000);
+        h.tick(31_400);
+        let w = h.world();
+        assert_eq!((w.discards, w.commits), (1, 0), "{on_failure}");
+        assert_eq!(w.session_starts, 2, "{on_failure}: restarted");
+        let (params, _) = w.session.as_ref().expect("a session");
+        assert_eq!(
+            params.backends.effect.as_ref().map(|m| m.id.as_str()),
+            Some(CUTOUT),
+            "{on_failure}"
+        );
+    }
+}
+
+#[test]
+fn a_switch_away_from_a_disabled_module_that_no_longer_stands_drops_what_was_kept() {
+    // The module switched to disabled too: nothing to switch to, and the
+    // blur Maxine (disabled) ran goes as a disabled module's stage does.
+    for on_failure in ["off", "black"] {
+        let mut h = switching_cutout(on_failure, true);
+        h.tick(1100);
+        assert_keeps_the_running_effect(&h, on_failure);
+        h.set_module(CUTOUT, false, 1200);
+        assert!(h.ctrl.preparing.is_none(), "{on_failure}");
+        assert_eq!(h.world().discards, 1, "{on_failure}");
+        h.tick(1300);
+        assert_never_the_room(&h, on_failure, on_failure);
+        let w = h.world();
+        assert_eq!(w.session_starts, 1, "{on_failure}: no restart");
+        if on_failure == "off" {
+            assert_eq!(w.effect.as_ref().map(|e| e.mode), Some(EffectMode::None));
+        } else {
+            assert!(w.effect_revoked, "{on_failure}");
+        }
+        drop(w);
+        assert!(h.snap().warning.contains("effect blur"), "{on_failure}");
+    }
+}
+
+#[test]
+fn a_camera_switch_while_switching_away_from_a_disabled_module_prepares_again() {
+    for on_failure in ["off", "black"] {
+        let mut h = switching_cutout(on_failure, true);
+        h.tick(1100);
+        h.call(|r| Command::SelectCamera("usb-b".into(), r), 1200)
+            .unwrap();
+        assert_eq!(h.world().discards, 1, "{on_failure}");
+        assert_never_the_room(&h, on_failure, on_failure);
+        assert!(!h.world().effect_revoked, "{on_failure}");
+        h.tick(1300);
+        h.tick(1600);
+        assert_eq!(h.world().prepares.len(), 2, "{on_failure}: prepared again");
+        assert_keeps_the_running_effect(&h, on_failure);
+        h.world().prepared_effect = None;
+        h.tick(1700);
+        let w = h.world();
+        assert_eq!((w.commits, w.session_starts), (1, 1), "{on_failure}");
+        assert_eq!(w.streaming(), Some("usb-b"));
+        drop(w);
+        assert_eq!(effect_module(&h).as_deref(), Some(CUTOUT), "{on_failure}");
+    }
+}
+
+#[test]
+fn a_switch_held_back_for_a_camera_switch_keeps_the_bound_of_its_first_preparation() {
+    // Prepared at 1000 ms, the camera picked at 25 s: held back while the
+    // new camera does not stream (`frames`), or prepared again on it once
+    // it does; either way the disabled module's code runs no longer than
+    // the bound from the first preparation, and the session restarts for
+    // the new effects then.
+    for on_failure in ["off", "black"] {
+        for streams in [false, true] {
+            let what = format!("{on_failure}, streams {streams}");
+            let mut h = switching_cutout(on_failure, true);
+            h.tick(1100);
+            h.tick(20_000);
+            h.tick(25_000);
+            assert_keeps_the_running_effect(&h, &what);
+            h.world().frames = streams;
+            h.call(|r| Command::SelectCamera("usb-b".into(), r), 25_000)
+                .unwrap();
+            for ms in [25_100, 28_000, 30_900] {
+                h.tick(ms);
+                assert_never_the_room(&h, on_failure, &format!("{what}, {ms} ms"));
+                assert!(h.ctrl.switching_from(), "{what}, {ms} ms");
+                assert_eq!(h.world().session_starts, 1, "{what}, {ms} ms");
+            }
+            assert_eq!(
+                h.ctrl.switch_pending.is_some(),
+                !streams,
+                "{what}: held back, or prepared again"
+            );
+            assert!(h.ctrl.next_wakeup(h.at(30_900)) <= Duration::from_millis(100));
+            h.tick(31_000);
+            h.tick(31_400);
+            // Restarted at the bound, the camera streaming or not.
+            assert!(!h.ctrl.switching_from(), "{what}");
+            assert_eq!(h.world().session_starts, 2, "{what}: restarted");
+            h.world().frames = true;
+            h.tick(31_800);
+            let w = h.world();
+            assert_eq!(w.commits, 0, "{what}");
+            assert_eq!(w.session_starts, 2, "{what}: once");
+            let (params, _) = w.session.as_ref().expect("a session");
+            assert_eq!(
+                params.backends.effect.as_ref().map(|m| m.id.as_str()),
+                Some(CUTOUT),
+                "{what}"
+            );
+        }
+    }
+}
+
+#[test]
+fn privacy_turned_on_while_switching_away_from_a_disabled_module_never_shows_the_room() {
+    let mut h = switching_cutout("none", true);
+    h.tick(1100);
+    assert_keeps_the_running_effect(&h, "none");
+    h.reload(&blur_with("black"), 1200).unwrap();
+    assert_ne!(h.world().shown(), Some(Shown::Camera));
+    {
+        let w = h.world();
+        assert_eq!(w.discards, 1);
+        assert_eq!(w.prepares.len(), 2, "prepared again");
+        assert_eq!(w.prepares[1].effect.on_failure, EffectOnFailure::Black);
+    }
+    for ms in [1300, 1600, 2000] {
+        h.tick(ms);
+        assert_ne!(h.world().shown(), Some(Shown::Camera), "{ms} ms");
+        assert_eq!(h.world().session_starts, 1);
+    }
+    h.world().prepared_effect = None;
+    h.tick(2100);
+    let w = h.world();
+    assert_eq!((w.commits, w.session_starts), (1, 1));
+    assert_eq!(w.shown(), Some(Shown::Effect));
+    let (params, _) = w.session.as_ref().expect("a session");
+    assert_eq!(params.effect.on_failure, EffectOnFailure::Black);
+}
+
+#[test]
+fn a_mode_change_while_switching_away_from_a_disabled_module_shows_at_once() {
+    // Privacy off: the kept effect follows the mode and the image in
+    // force, and the switch is prepared again for them.
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("office.png");
+    std::fs::write(&image, b"png").unwrap();
+    let mut h = switching_cutout("off", true);
+    h.tick(1100);
+    h.set_image(image.to_str().unwrap(), 1200).unwrap();
+    h.set_effect("replace", 1200).unwrap();
+    {
+        let w = h.world();
+        let e = w.effect.as_ref().expect("an effect");
+        assert_eq!(e.mode, EffectMode::Replace, "at once");
+        assert_eq!(e.background_image.as_deref(), Some(image.as_path()));
+        assert!(!w.effect_revoked);
+        assert_eq!(w.session_starts, 1);
+        let last = w.prepares.last().expect("prepared");
+        assert_eq!(last.effect.mode, EffectMode::Replace, "prepared again");
+    }
+    h.set_strength(0.2, 1300).unwrap();
+    assert_eq!(
+        h.world().effect.as_ref().map(|e| (e.mode, e.blur_strength)),
+        Some((EffectMode::Replace, 0.2))
+    );
+    h.world().prepared_effect = None;
+    h.tick(1400);
+    let w = h.world();
+    assert_eq!((w.commits, w.session_starts), (1, 1));
+    let (params, _) = w.session.as_ref().expect("a session");
+    assert_eq!(params.effect.mode, EffectMode::Replace);
 }
 
 /// After one batch that turned privacy on and enabled the example module

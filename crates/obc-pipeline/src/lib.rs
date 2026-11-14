@@ -126,7 +126,7 @@ pub use pipeline::{
 };
 pub use preview::{PreviewConfig, PreviewCounts, PreviewEncoder};
 pub use process::GpuStage;
-pub use session::{Session, SwitchTiming};
+pub use session::{Handover, PrepareError, Session, SwitchTiming};
 pub use shutter::ShutterState;
 pub use usb_topology::{SharedHub, UsbPlacement};
 pub use xu::{XuControl, XuRow, XuState};

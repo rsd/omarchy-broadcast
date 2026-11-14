@@ -519,6 +519,9 @@ pub struct Ingest {
     /// The camera's closed-shutter watch ([`crate::shutter`]), for a camera
     /// with a status row saying so.
     shutter: Option<Arc<ShutterWatch>>,
+    /// A clone of the writer its sink writes with: the session retargets
+    /// it to a prepared output ([`crate::frame`], "Fan-out").
+    writer: FrameWriter,
 }
 
 impl Ingest {
@@ -638,7 +641,7 @@ impl Ingest {
             .find_map(|e| gst_obc::enhance::from_element(e).cloned());
         let mut chain = head;
         chain.extend(tail);
-        chain.push(frames_sink(names::FRAMES_SINK, writer));
+        chain.push(frames_sink(names::FRAMES_SINK, writer.clone()));
         add_linked(&pipeline, &chain)?;
         Ok(Ingest {
             pipeline: MediaPipeline::from_parts(pipeline, None),
@@ -654,6 +657,7 @@ impl Ingest {
             failure: Mutex::new(None),
             guard_frames: None,
             shutter: None,
+            writer,
         })
     }
 
@@ -799,6 +803,11 @@ impl Ingest {
         }
         let camera = self.camera.as_ref()?;
         (!camera.exists()).then(|| format!("camera {} disappeared", camera.display()))
+    }
+
+    /// The writer its sink writes with (a clone sharing its targets).
+    pub(crate) fn frame_writer(&self) -> &FrameWriter {
+        &self.writer
     }
 
     /// The id of the source in the frames it writes ([`crate::frame::Frame::source_id`]).

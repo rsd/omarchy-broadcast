@@ -88,6 +88,30 @@
 //!   frame; a last detach outside the window (the new output stopped
 //!   before its first frame: the camera turned off) ends the hold and
 //!   drops the kept frame the same way.
+//! * **Feeds and standby.** Every [`WriterHandle`] pushes for a feed. The
+//!   writer accepts the forwarded frames of one feed, the current one, and
+//!   refuses those of every other: not pushed, nothing of the writer's
+//!   state touched (the hold, the kept frame, the placeholder's timing, a
+//!   restart hold), counted in [`WriterCounts::standby_refused`] and not
+//!   in [`WriterCounts::push_failed`]. Until a standby feed is made, there
+//!   is only the first one, and every handle pushes as if there were no
+//!   feeds at all. [`WriterHandle::standby`] makes a new feed, refused from
+//!   the start: an output built on it (a session's next output, prepared
+//!   while the current one streams, [`crate::session::Session::prepare_output`])
+//!   runs, attaches and forwards, and the consumer sees none of it.
+//!   [`WriterHandle::promote`] makes its feed the current one, under the
+//!   push lock that serialises pushes, so the switch falls between two
+//!   pushes: every frame before it is the old feed's, every frame after it
+//!   the new one's, and from then on the old output's frames are refused
+//!   the same way. Promotion is not a restart: it neither starts nor ends a
+//!   hold. The promoted feed's first frame replaces the kept frame as any
+//!   forwarded frame does (and ends a restart hold in force under the
+//!   attached rules above, as the new output's first frame would); a
+//!   refused frame does neither. A standby output attaches like any other
+//!   (attachments are counted), so after a promotion the old output's
+//!   detach is not the last one, and the kept frame stays while the
+//!   promoted output is attached. [`LoopbackWriter::handle`] hands out a
+//!   handle of the current feed.
 //! * **Mask.** While [`LoopbackWriter::set_mask`] is on, a forwarded frame
 //!   is replaced by the placeholder's image before it is pushed: the
 //!   consumer sees the image the placeholder shows, in the forwarded
@@ -255,6 +279,11 @@ pub struct WriterCounts {
     /// Pushes refused: by `appsrc` (flushing, stopped), or because the
     /// writer was not running.
     pub push_failed: u64,
+    /// Forwarded frames refused because their feed is not the current one
+    /// (a standby output's before its promotion, the old output's after
+    /// it; see the module docs, "Feeds and standby"). Never pushed, and
+    /// not counted in [`Self::push_failed`].
+    pub standby_refused: u64,
     /// Of the frames accepted, those `appsrc` dropped because its queue was
     /// full (they never reached the sink).
     pub queue_dropped: u64,
@@ -321,6 +350,11 @@ struct PushState {
     /// Sees every accepted buffer; behind the push lock, so a call never
     /// overlaps [`LoopbackWriter::set_tap`].
     tap: TapSlot,
+    /// The feed whose forwarded frames are accepted (see the module docs,
+    /// "Feeds and standby"): 0, the first one, until a promotion.
+    current_feed: u64,
+    /// The id of the next [`WriterHandle::standby`] feed.
+    next_feed: u64,
 }
 
 /// State shared by the writer, its handles and its placeholder thread.
@@ -338,6 +372,7 @@ struct Shared {
     forwarded: AtomicU64,
     held: AtomicU64,
     push_failed: AtomicU64,
+    standby_refused: AtomicU64,
     masked: AtomicU64,
     /// Forwarded frames are replaced by the placeholder's image
     /// ([`LoopbackWriter::set_mask`]).
@@ -602,7 +637,9 @@ impl Shared {
     /// Stamps `buffer` on the writer's timeline and pushes it, under the
     /// push lock. A placeholder is pushed only if [`placeholder_due`]
     /// (`after`), and is replaced by the kept frame while [`hold_due`].
-    fn push(&self, buffer: gst::Buffer, producer: Producer, after: Duration) -> Pushed {
+    /// A forwarded frame of a feed other than the current one is refused
+    /// before anything else (see the module docs, "Feeds and standby").
+    fn push(&self, buffer: gst::Buffer, producer: Producer, feed: u64, after: Duration) -> Pushed {
         // Before the push lock: the placeholder's lock is never taken
         // under it. A forwarded frame the image replaces stays in the
         // shadowed binding and goes back to its pool when it drops, at the
@@ -612,6 +649,13 @@ impl Shared {
             None => (buffer, false),
         };
         let mut st = self.lock();
+        if producer == Producer::Forwarded && feed != st.current_feed {
+            drop(st);
+            self.standby_refused.fetch_add(1, Ordering::Relaxed);
+            // The frame goes back to its pool here, outside the push lock.
+            drop(buffer);
+            return Pushed::Refused;
+        }
         let now = Instant::now();
         // Dropped after the lock is released.
         let mut expired = None;
@@ -747,6 +791,7 @@ impl Shared {
             forwarded: self.forwarded.load(Ordering::Relaxed),
             held: self.held.load(Ordering::Relaxed),
             push_failed: self.push_failed.load(Ordering::Relaxed),
+            standby_refused: self.standby_refused.load(Ordering::Relaxed),
             queue_dropped: self.appsrc.property::<u64>("dropped"),
             masked: self.masked.load(Ordering::Relaxed),
             last_push,
@@ -755,18 +800,23 @@ impl Shared {
 }
 
 /// Pushes forwarded frames into a [`LoopbackWriter`]. Cheap to clone, and
-/// `Send + Sync`: the active output's streaming thread holds one. Two
-/// handles are equal when they feed the same writer.
+/// `Send + Sync`: the active output's streaming thread holds one. Each
+/// handle pushes for a feed (see the module docs, "Feeds and standby"),
+/// which its clones share. Two handles are equal when they feed the same
+/// writer, whatever their feeds.
 #[derive(Clone)]
 pub struct WriterHandle {
     shared: Arc<Shared>,
     after: Duration,
+    /// The feed this handle pushes for.
+    feed: u64,
 }
 
 impl std::fmt::Debug for WriterHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WriterHandle")
             .field("contract", &self.shared.contract)
+            .field("feed", &self.feed)
             .finish_non_exhaustive()
     }
 }
@@ -784,10 +834,51 @@ impl WriterHandle {
     /// contract), restamped on the writer's timeline; its memory is not
     /// copied. While frames arrive, the placeholder thread pushes nothing.
     /// Returns whether `appsrc` accepted it (`false` while the writer is not
-    /// running, counted in [`WriterCounts::push_failed`]). Never blocks
-    /// beyond the push lock.
+    /// running, counted in [`WriterCounts::push_failed`], and while this
+    /// handle's feed is not the current one, counted in
+    /// [`WriterCounts::standby_refused`]). Never blocks beyond the push
+    /// lock.
     pub fn push(&self, buffer: gst::Buffer) -> bool {
-        self.shared.push(buffer, Producer::Forwarded, self.after) == Pushed::Accepted
+        self.shared
+            .push(buffer, Producer::Forwarded, self.feed, self.after)
+            == Pushed::Accepted
+    }
+
+    /// A handle of a new feed, on standby (see the module docs, "Feeds and
+    /// standby"): its pushes are refused, counted in
+    /// [`WriterCounts::standby_refused`], until [`Self::promote`] makes it
+    /// the current feed. For the output a session prepares while its
+    /// current one streams ([`crate::session::Session::prepare_output`]).
+    /// Never blocks beyond the push lock.
+    pub fn standby(&self) -> WriterHandle {
+        let mut st = self.shared.lock();
+        // Feed 0 is the first one; standby feeds count from 1.
+        st.next_feed = st.next_feed.max(1);
+        let feed = st.next_feed;
+        st.next_feed += 1;
+        WriterHandle {
+            shared: Arc::clone(&self.shared),
+            after: self.after,
+            feed,
+        }
+    }
+
+    /// Makes this handle's feed the current one, at once: under the push
+    /// lock, so between two pushes. From then on its frames are accepted
+    /// and those of every other feed (the previous output's) are refused,
+    /// counted in [`WriterCounts::standby_refused`]. Neither starts nor
+    /// ends a hold, nor touches the kept frame: the feed's next frame
+    /// replaces it as any forwarded frame does (module docs, "Feeds and
+    /// standby"). Promoting the current feed does nothing. Never blocks
+    /// beyond the push lock.
+    pub fn promote(&self) {
+        self.shared.lock().current_feed = self.feed;
+    }
+
+    /// Whether this handle's feed is the current one: its pushes reach the
+    /// writer's `appsrc` (see [`Self::standby`] and [`Self::promote`]).
+    pub fn is_current_feed(&self) -> bool {
+        self.shared.lock().current_feed == self.feed
     }
 
     /// The contract of the frames the writer carries.
@@ -1087,6 +1178,7 @@ impl LoopbackWriter {
             masked: AtomicU64::new(0),
             mask: AtomicBool::new(false),
             push_failed: AtomicU64::new(0),
+            standby_refused: AtomicU64::new(0),
             error: Mutex::default(),
             frame: Mutex::new(PlaceholderFrame {
                 buffer: black_contract_frame(&contract)?,
@@ -1525,11 +1617,14 @@ impl LoopbackWriter {
         self.shared.mask.load(Ordering::Relaxed)
     }
 
-    /// A handle for the active output to forward its frames with.
+    /// A handle for the active output to forward its frames with: of the
+    /// current feed (see the module docs, "Feeds and standby"; the first
+    /// one until a promotion, the last one promoted after).
     pub fn handle(&self) -> WriterHandle {
         WriterHandle {
             shared: Arc::clone(&self.shared),
             after: self.cfg.placeholder_after,
+            feed: self.shared.lock().current_feed,
         }
     }
 
@@ -1667,7 +1762,8 @@ fn placeholder_loop(shared: &Shared, after: Duration, image_until: Instant, stop
             .unwrap_or_else(|e| e.into_inner())
             .buffer
             .copy();
-        if let Pushed::NotDue(due) = shared.push(placeholder, Producer::Placeholder, after) {
+        // A placeholder is of no feed: the feed given is not looked at.
+        if let Pushed::NotDue(due) = shared.push(placeholder, Producer::Placeholder, 0, after) {
             next = due;
             continue;
         }
@@ -3469,5 +3565,247 @@ mod tests {
             counts.forwarded as usize > last_fwd - first_fwd,
             "{counts:?}"
         );
+    }
+
+    /// Feeds without a standby (see the module docs, "Feeds and standby"):
+    /// every handle, and every clone, pushes as before, and nothing is
+    /// refused. A standby feed's pushes are refused, counted in
+    /// `standby_refused` and not `push_failed`, and change nothing else;
+    /// promoted, its pushes are accepted and the old feed's refused, and
+    /// the writer hands out handles of the promoted feed. Promoting again
+    /// turns back.
+    #[test]
+    fn a_standby_feed_is_refused_until_promoted_then_the_old_one_is() {
+        require_elements(ELEMENTS);
+        let contract = small(OutputFormat::Nv12);
+        let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+        let h = w.handle();
+        let other = w.handle();
+        let frame = || black_contract_frame(&contract).unwrap();
+        w.start().unwrap();
+        assert!(h.is_current_feed() && other.is_current_feed());
+        assert!(h.push(frame()) && other.push(frame()) && h.clone().push(frame()));
+        let c0 = w.counts();
+        assert_eq!((c0.forwarded, c0.standby_refused), (3, 0), "{c0:?}");
+
+        let standby = h.standby();
+        assert_eq!(standby, h, "the same writer");
+        assert!(!standby.is_current_feed());
+        assert!(!standby.push(frame()), "a standby push was accepted");
+        assert!(!standby.clone().push(frame()));
+        assert!(h.push(frame()), "the current feed was refused");
+        let c1 = w.counts();
+        assert_eq!(
+            (c1.forwarded, c1.standby_refused, c1.push_failed),
+            (c0.forwarded + 1, 2, c0.push_failed),
+            "{c1:?}"
+        );
+
+        standby.promote();
+        assert!(standby.is_current_feed() && !h.is_current_feed());
+        assert!(!h.push(frame()) && !other.push(frame()), "the old feed");
+        assert!(standby.push(frame()), "the promoted feed was refused");
+        assert!(w.handle().is_current_feed(), "a handle of the old feed");
+        assert!(w.handle().push(frame()));
+        // A second standby feed is refused too, the promoted one goes on.
+        let second = standby.standby();
+        assert!(!second.push(frame()));
+        let c2 = w.counts();
+        assert_eq!(
+            (c2.forwarded, c2.standby_refused, c2.push_failed),
+            (c1.forwarded + 2, c1.standby_refused + 3, c1.push_failed),
+            "{c2:?}"
+        );
+        // Back to the first feed.
+        h.promote();
+        assert!(h.push(frame()) && !standby.push(frame()));
+        w.stop().unwrap();
+    }
+
+    /// The promotion is atomic: with an old and a standby feed pushing
+    /// distinct frames from two threads, the frames the writer accepted
+    /// (at the tap, by memory) are the old feed's up to one push and the
+    /// promoted feed's from the next on, never one of the old after one of
+    /// the new; neither feed's frame is ever accepted on the wrong side.
+    #[test]
+    fn a_promotion_falls_between_two_pushes() {
+        require_elements(ELEMENTS);
+        let contract = small(OutputFormat::Nv12);
+        let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+        let seen = record_tap(&mut w);
+        let old = w.handle();
+        let new = old.standby();
+        w.start().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        // Each feed's frames stay alive, so no two share an address.
+        let pusher = |h: WriterHandle| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut sent = Vec::new();
+                while !stop.load(Ordering::Relaxed) && sent.len() < 400 {
+                    let b = black_contract_frame(&contract).unwrap();
+                    h.push(b.clone());
+                    sent.push(b);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                sent
+            })
+        };
+        let (a, b) = (pusher(old.clone()), pusher(new.clone()));
+        wait_until(Duration::from_secs(10), "old frames", || {
+            w.counts().forwarded >= 20
+        });
+        new.promote();
+        let promoted = w.counts();
+        wait_until(Duration::from_secs(10), "new frames", || {
+            w.counts().forwarded >= promoted.forwarded + 20
+        });
+        stop.store(true, Ordering::Relaxed);
+        let (old_frames, new_frames) = (a.join().unwrap(), b.join().unwrap());
+        w.stop().unwrap();
+        let address = |b: &gst::Buffer| b.map_readable().unwrap().as_ptr() as usize;
+        let old_set: std::collections::HashSet<usize> = old_frames.iter().map(address).collect();
+        let new_set: std::collections::HashSet<usize> = new_frames.iter().map(address).collect();
+        let tapped = seen.lock().unwrap().clone();
+        let feed: Vec<char> = tapped
+            .iter()
+            .filter_map(|t| {
+                if old_set.contains(&t.data) {
+                    Some('o')
+                } else if new_set.contains(&t.data) {
+                    Some('n')
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let first_new = feed.iter().position(|&c| c == 'n').expect("new frames");
+        assert!(first_new >= 20, "new frames before the promotion");
+        assert!(
+            feed[first_new..].iter().all(|&c| c == 'n'),
+            "an old frame after the promotion: {}",
+            feed.iter().collect::<String>()
+        );
+        let end = w.counts();
+        assert_eq!(
+            end.forwarded as usize,
+            feed.len(),
+            "accepted frames of neither feed: {end:?}"
+        );
+        assert!(end.standby_refused > 0 && end.push_failed == 0, "{end:?}");
+        assert_pts_increasing(&tapped);
+    }
+
+    /// A standby output attaches like any other: once promoted, its first
+    /// frame replaces the kept one (the held frames are its memory), the
+    /// old output's detach is not the last and keeps it, and nothing of the
+    /// standby feed was kept or held before the promotion. The promoted
+    /// output's detach, the last, drops the kept frame.
+    #[test]
+    fn a_promoted_feed_takes_over_the_kept_frame_and_the_old_detach_keeps_it() {
+        require_elements(ELEMENTS);
+        let contract = small(OutputFormat::Nv12);
+        let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+        let seen = record_tap(&mut w);
+        let old = w.handle();
+        let new = old.standby();
+        let data = |b: &gst::Buffer| b.map_readable().unwrap().as_ptr() as usize;
+        w.start().unwrap();
+        let old_attachment = old.attach(Duration::from_secs(60));
+        let old_frame = black_contract_frame(&contract).unwrap();
+        let old_data = data(&old_frame);
+        assert!(old.push(old_frame));
+        let new_attachment = new.attach(Duration::from_secs(60));
+        let standby_frame = black_contract_frame(&contract).unwrap();
+        let standby_data = data(&standby_frame);
+        assert!(!new.push(standby_frame.clone()));
+        still_held(&w);
+        let tapped = seen.lock().unwrap().clone();
+        assert!(tapped.iter().all(|t| t.data != standby_data), "{tapped:?}");
+        assert_eq!(tapped.last().map(|t| t.data), Some(old_data));
+
+        new.promote();
+        // Promotion alone changes no frame: the old one is still held.
+        let promoted = Instant::now();
+        still_held(&w);
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|t| t.at >= promoted)
+                .all(|t| t.data == old_data)
+        );
+        let new_frame = black_contract_frame(&contract).unwrap();
+        let new_data = data(&new_frame);
+        let forwarded = Instant::now();
+        assert!(new.push(new_frame));
+        drop(old_attachment);
+        still_held(&w);
+        let after: Vec<usize> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.at >= forwarded)
+            .map(|t| t.data)
+            .collect();
+        assert!(after.len() >= 4, "{after:x?}");
+        assert!(after.iter().all(|&a| a == new_data), "{after:x?}");
+        drop(new_attachment);
+        held_then_placeholder(&w);
+        w.stop().unwrap();
+        drop(standby_frame);
+    }
+
+    /// Promotion is not a restart (see the module docs, "Feeds and
+    /// standby"): during a restart hold, a standby feed's frames are
+    /// refused and neither end it nor replace the held frame; the
+    /// promotion neither ends nor starts one; the promoted feed's first
+    /// frame, its output attached, ends it under the attached rules. A
+    /// promotion with no restart hold in force starts none.
+    #[test]
+    fn a_promotion_neither_starts_nor_ends_a_restart_hold() {
+        require_elements(ELEMENTS);
+        let contract = small(OutputFormat::Nv12);
+        let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+        let seen = record_tap(&mut w);
+        let old = w.handle();
+        let data = |b: &gst::Buffer| b.map_readable().unwrap().as_ptr() as usize;
+        w.start().unwrap();
+        let attachment = old.attach(Duration::ZERO);
+        let old_frame = black_contract_frame(&contract).unwrap();
+        let old_data = data(&old_frame);
+        assert!(old.push(old_frame));
+        w.hold_across_restart(Duration::from_secs(60));
+        drop(attachment);
+        assert!(old.restart_holding());
+
+        let new = old.standby();
+        let next = new.attach(Duration::ZERO);
+        let refused = Instant::now();
+        assert!(!new.push(black_contract_frame(&contract).unwrap()));
+        assert!(new.restart_holding(), "ended by a refused frame");
+        still_held(&w);
+        new.promote();
+        assert!(new.restart_holding(), "ended by the promotion");
+        still_held(&w);
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|t| t.at >= refused)
+                .all(|t| t.data == old_data),
+            "not the old output's frame"
+        );
+        assert!(new.push(black_contract_frame(&contract).unwrap()));
+        assert!(!new.restart_holding(), "held past the promoted first frame");
+        held_then_placeholder(&w);
+
+        // No restart hold: a promotion starts none.
+        let third = new.standby();
+        third.promote();
+        assert!(!third.restart_holding());
+        drop(next);
+        held_then_placeholder(&w);
+        w.stop().unwrap();
     }
 }
