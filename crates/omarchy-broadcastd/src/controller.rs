@@ -56,7 +56,11 @@
 //! `[effect]`. A change applies to the running session without restarting
 //! it. When an effect a module provides cannot load or run (found out
 //! before the camera opens, at its load, or on a frame), the session never
-//! stops for it and the state is never `error`; `effect.on_failure`
+//! stops for it and the state is never `error`; the privacy policy
+//! (`effect.privacy` and `effect.privacy_mode`, resolved to one policy by
+//! [`EffectConfig::policy`]: `none` with privacy off, the default, else
+//! `black`, `image` for the `away` mode or `freeze`; `image` and `freeze`
+//! follow every rule `black` does, and only change what the frames show)
 //! decides what the feed shows: `black` keeps the camera open with the
 //! effect element's frames black (the room hidden, the consumers keep the
 //! device), the state `starting`/`active` as usual; `none` streams the
@@ -83,9 +87,9 @@
 //! ([`Standing`], [`Controller::dropped_stages`]). Noise removal,
 //! relighting, enhancement (where it applies to the camera) and a module's
 //! own stages (once a module has described its switch in this process) are
-//! dropped (the session is given them off), whatever `on_failure` says,
+//! dropped (the session is given them off), whatever the privacy policy says,
 //! and the feed keeps streaming with the stages that still have a module.
-//! The background effect follows `on_failure` instead, as a provided
+//! The background effect follows the privacy policy instead, as a provided
 //! effect that cannot load does ([`Controller::fails_closed`]): with
 //! `black` or `image` it is asked of the effect element all the same,
 //! which fails it and shows black or the fallback image (an output always
@@ -93,7 +97,7 @@
 //! effect), so the room is never shown for want of a module; with `none`
 //! it is dropped (the camera image). A session that loses the module it
 //! started the effect with ([`Controller::background_lost`]) follows
-//! `on_failure` too, with the camera kept open: under `black` or `image`
+//! the privacy policy too, with the camera kept open: under `black` or `image`
 //! the effect element drops that module's backend instance and fails the
 //! effect at once ([`Controller::follow_effect_backend`]), and takes it
 //! back once the module can run it again, the effect given again with no
@@ -116,7 +120,7 @@
 //!
 //! Noise removal (`denoise`) is a stage of its own, before the effect or
 //! alone with `none`. It hides nothing, so its failure never stops the
-//! session, whatever `effect.on_failure` says: the session streams on
+//! session, whatever the privacy policy says: the session streams on
 //! without the stage, the state does not change, and `Error` says why
 //! (an effect failure is in `Warning`, never over it). It is not checked before the session starts; a failure arrives
 //! through the effect report. The failure is cleared when the stage becomes
@@ -1068,6 +1072,9 @@ pub fn check_background_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// How a message names privacy off, the policy that shows the camera.
+const PRIVACY_OFF: &str = "effect.privacy is off";
+
 /// The background effect and its fallback, of the settings in force or of
 /// what a session was given.
 trait Fallback {
@@ -1080,7 +1087,7 @@ impl Fallback for EffectConfig {
         self.mode
     }
     fn on_failure(&self) -> EffectOnFailure {
-        self.on_failure
+        self.policy()
     }
 }
 
@@ -1109,12 +1116,12 @@ fn away_unreadable(path: &Path, why: &str) -> String {
 /// (`Error`) or a method's answer.
 fn effect_failure_text(effect: &impl Fallback, reason: &str) -> String {
     match effect.on_failure() {
-        EffectOnFailure::Black | EffectOnFailure::Image => {
+        EffectOnFailure::Black | EffectOnFailure::Image | EffectOnFailure::Freeze => {
             format!("effect {} unavailable: {reason}", effect.mode())
         }
         EffectOnFailure::None => format!(
             "effect {} unavailable: {reason}; the camera image is shown without the effect \
-             (effect.on_failure = \"none\")",
+             ({PRIVACY_OFF})",
             effect.mode()
         ),
     }
@@ -1122,9 +1129,9 @@ fn effect_failure_text(effect: &impl Fallback, reason: &str) -> String {
 
 /// The `Warning` clause of the background effect, provided by a module
 /// but unable to load or run (`reason`): the session streams on, with
-/// `effect.on_failure = "black"` the effect element's frames black until
-/// the effect runs (with `"image"` the fallback image), with `"none"` the
-/// camera image. The reason is made
+/// privacy on the effect element's frames black until the effect runs
+/// (the away image under `away`, the last frame under `freeze`), with
+/// privacy off the camera image. The reason is made
 /// safe to show and bounded ([`STAGE_REASON_MAX`], as a stage's in
 /// `Error`: a module's hint at its end survives).
 fn effect_warning_text(effect: &impl Fallback, reason: &str) -> String {
@@ -1138,9 +1145,13 @@ fn effect_warning_text(effect: &impl Fallback, reason: &str) -> String {
             "effect {} unavailable: {reason}; the fallback image is shown until it can run",
             effect.mode()
         ),
+        EffectOnFailure::Freeze => format!(
+            "effect {} unavailable: {reason}; the last frame is held until it can run",
+            effect.mode()
+        ),
         EffectOnFailure::None => format!(
             "effect {} unavailable: {reason}; the camera image is shown without the effect \
-             (effect.on_failure = \"none\")",
+             ({PRIVACY_OFF})",
             effect.mode()
         ),
     }
@@ -1399,12 +1410,12 @@ pub struct Controller<B: MediaBackend> {
     /// A lifecycle fault: `error` until its cause can have changed.
     fault: Option<String>,
     /// Privacy holds the feed: no session streams because the effect, under
-    /// an `on_failure` that hides the camera, refused it (the fault it set)
+    /// a privacy policy that hides the camera, refused it (the fault it set)
     /// or the guard dropped it ([`Self::streams_without_black_effect`]).
     /// Held until a session streams (is live): with no session, while that
     /// fault stands; a start tried again under the hold keeps it until its
     /// first frame, or until it is refused or fails. Disabled or without a
-    /// consumer, it ends. With `on_failure = "image"` the writer's
+    /// consumer, it ends. With the `away` mode the writer's
     /// placeholder shows the fallback image meanwhile
     /// ([`Self::placeholder_image`]).
     privacy_hold: Option<PrivacyHold>,
@@ -1461,7 +1472,7 @@ pub struct Controller<B: MediaBackend> {
     /// saved at once, so its caller learns whether it survives a restart.
     save_failure: Option<String>,
     /// The background effect, provided by a module, cannot load or run:
-    /// the session streams on (with `effect.on_failure = "black"` the
+    /// the session streams on (with privacy on (`black`) the
     /// effect element's frames black, the room hidden; with `"none"` the
     /// camera image), and this is the first clause of `Warning`
     /// ([`effect_warning_text`]). Cleared when the effect becomes ready,
@@ -1671,7 +1682,7 @@ enum Standing {
     /// No module provides it (none installed or enabled, its module
     /// disabled, refused, crashed or unavailable, the stage not
     /// installed): the stage is dropped and the feed streams on without
-    /// it; the background effect follows `on_failure`
+    /// it; the background effect follows the privacy policy
     /// ([`Controller::fails_closed`]). The module that would run it (its
     /// name) and why it cannot, for `Warning`.
     Missing {
@@ -1836,7 +1847,7 @@ impl<B: MediaBackend> Controller<B> {
         load_modules: bool,
     ) -> Self {
         let (config_set, error) = match ConfigSet::load(&paths.config) {
-            Ok(set) => (set, String::new()),
+            Ok(set) => (migrate_on_failure(&paths, set), String::new()),
             Err(e) => {
                 let msg = format!("{e}; running on the default configuration");
                 error!("{msg}");
@@ -2519,7 +2530,7 @@ impl<B: MediaBackend> Controller<B> {
     fn effect_run_with(&self, plan: &Plan) -> EffectRun {
         let effect = self.effect();
         // A background effect no module of the plan can run follows
-        // `on_failure` ([`Self::fails_closed`]): asked of the effect element
+        // the privacy policy ([`Self::fails_closed`]): asked of the effect element
         // all the same under `black` and `image` (it fails, and shows black
         // or the fallback image), dropped under `none` (the camera image).
         let mode = if self.runs_in(plan, &StageId::BACKGROUND) || self.fails_closed(plan) {
@@ -2527,6 +2538,7 @@ impl<B: MediaBackend> Controller<B> {
         } else {
             EffectMode::None
         };
+        let on_failure = effect.policy();
         let (background_image, background_video) = self.background_parts(effect.background_image);
         EffectRun {
             mode,
@@ -2534,7 +2546,7 @@ impl<B: MediaBackend> Controller<B> {
             background_image,
             // Played only under `replace`.
             background_video: background_video.filter(|_| mode == EffectMode::Replace),
-            on_failure: effect.on_failure,
+            on_failure,
             fallback_image: effect.fallback_image,
             stages: plan
                 .effect_stages
@@ -2576,9 +2588,9 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     /// A selected background effect that no module of `plan` can run is
-    /// asked of the effect element all the same: under an `on_failure`
-    /// that hides the camera (`black`, `image`) the element fails it and
-    /// shows what `on_failure` says, as for a provided effect that cannot
+    /// asked of the effect element all the same: under a privacy policy
+    /// that hides the camera (`black`, `image`, `freeze`) the element
+    /// fails it and shows what the privacy policy says, as for a provided effect that cannot
     /// load, so the room is never shown for want of a module (a module
     /// conflict, disabled, a failed open or probe, the crash ledger, none
     /// installed, a pin to nothing). Also for a session that lost the
@@ -2587,7 +2599,7 @@ impl<B: MediaBackend> Controller<B> {
     /// with a media backend that cannot have it do so, the effect is
     /// dropped (the element would go on with that module's instance).
     fn fails_closed(&self, plan: &Plan) -> bool {
-        self.effect().on_failure.hides()
+        self.effect().policy().hides()
             && (!self.background_lost(plan) || self.backend.can_revoke_effect_backend())
     }
 
@@ -2609,7 +2621,7 @@ impl<B: MediaBackend> Controller<B> {
     /// can, [`Standing::Elsewhere`], while the effect is asked closed of
     /// this one, [`Self::fails_closed`]), in the words of a provided
     /// effect that cannot load ([`effect_warning_text`]): the module that
-    /// would provide it and why it cannot, and what `on_failure` shows
+    /// would provide it and why it cannot, and what the privacy policy shows
     /// meanwhile. `None` otherwise, and for a session that lost its module
     /// and drops the effect ([`Self::fails_closed`]: the stage is dropped,
     /// [`dropped_text`]).
@@ -2626,7 +2638,7 @@ impl<B: MediaBackend> Controller<B> {
             _ => return None,
         };
         let effect = self.effect();
-        if effect.on_failure.hides()
+        if effect.policy().hides()
             && self.background_lost(plan)
             && !self.backend.can_revoke_effect_backend()
         {
@@ -2732,7 +2744,7 @@ impl<B: MediaBackend> Controller<B> {
             }
         }
         stages.push(StageId::ENHANCE);
-        // A background effect with a clause of its own follows `on_failure`
+        // A background effect with a clause of its own follows the privacy policy
         // ([`Self::background_absent`]).
         if self.background_absent(plan).is_some() {
             stages.retain(|s| *s != StageId::BACKGROUND);
@@ -3016,7 +3028,7 @@ impl<B: MediaBackend> Controller<B> {
     /// [`obc_pipeline::LoopbackWriter::RESTART_HOLD`]), so a user's toggle
     /// shows neither black nor the away image while the camera reopens.
     /// Except when the running session does not run the background effect
-    /// that the new one is given under an `on_failure` that hides the
+    /// that the new one is given under a privacy policy that hides the
     /// camera ([`Self::refuses_passthrough`]): its last frame is the room
     /// the user now asks to hide, never held. Known limit: the hold covers only the time no output is attached;
     /// once the new session's output attaches, its clock shows its own
@@ -3091,7 +3103,7 @@ impl<B: MediaBackend> Controller<B> {
     /// given again (followed from its load) when one can, also when it was
     /// asked while none could (the element failed it).
     /// An effect the session streams without because it failed
-    /// (`on_failure = "none"`) is not given again here: only a control
+    /// (privacy off) is not given again here: only a control
     /// call or a reload retries it. With no background effect to run (none
     /// selected, or dropped), the failure of one is not what the feed
     /// shows: cleared, so a module enabled again gives it again. Whether
@@ -3104,7 +3116,7 @@ impl<B: MediaBackend> Controller<B> {
         }
         if run.mode == effect.mode {
             // Asked while no module of the plan could run it (the element
-            // failed it, showing what `on_failure` says): a module can now,
+            // failed it, showing what the privacy policy says): a module can now,
             // so the element tries it again.
             if run.mode != EffectMode::None
                 && self.background_closed
@@ -3247,7 +3259,7 @@ impl<B: MediaBackend> Controller<B> {
     /// background effect dropped or given again
     /// ([`Self::follow_background`]), in one change of the session; nothing
     /// else is. In particular an effect the session started without
-    /// (rejected by [`Self::effect_check`] with `on_failure = "none"`) is
+    /// (rejected by [`Self::effect_check`] with privacy off) is
     /// not requested again: only a control call or a reload retries it.
     fn follow_stages(&mut self) {
         self.follow_effect_backend();
@@ -3542,8 +3554,8 @@ impl<B: MediaBackend> Controller<B> {
         };
         facts.output_modes = self.output_mode_options();
         facts.no_frame_generation = self.session_memory() == VideoMemory::System;
-        facts.on_failure_options =
-            config_schema::on_failure_options(&self.config_set.config.effect);
+        facts.privacy_mode_options =
+            config_schema::privacy_mode_options(&self.config_set.config.effect);
         facts.video_memory = Some(self.memory.clone());
         if facts != self.config_facts.1 {
             self.bump_config();
@@ -3621,8 +3633,8 @@ impl<B: MediaBackend> Controller<B> {
             // change), the room is never shown: the lifecycle starts a
             // session with the effect, or none.
             warning!(
-                "an effect under on_failure = \"{}\" is not in the session: stopping it",
-                self.effect().on_failure
+                "an effect under privacy (mode {}) is not in the session: stopping it",
+                self.effect().privacy_mode_in_force()
             );
             // What privacy shows replaces the away image before the
             // session stops, so the writer's placeholder never shows it
@@ -3651,7 +3663,7 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     /// A session started now would be given a background effect, under an
-    /// `on_failure` that hides the camera, and so is never started without
+    /// the privacy policy that hides the camera, and so is never started without
     /// its effects ([`Self::start_passthrough`]): the effect is selected,
     /// whether or not a module of a fresh plan can run it
     /// ([`Self::fails_closed`]). The one test the guard and the start both
@@ -4263,7 +4275,7 @@ impl<B: MediaBackend> Controller<B> {
 
     /// The running session's effect, which a module provides, cannot load
     /// or run, for `reason`. The session never stops for it: with
-    /// `on_failure = "black"` the effect element's frames are black (the
+    /// privacy on (`black`) the effect element's frames are black (the
     /// room hidden, the consumers keep the device), the state stays
     /// `starting`/`active`; with `"none"` it keeps streaming without the
     /// effect. `Warning` says why, either way ([`Self::effect_failure`]):
@@ -4522,9 +4534,9 @@ impl<B: MediaBackend> Controller<B> {
         self.hold_background();
         // A selected stage no module provides is dropped (the effect run
         // has it off): the session streams on without it, whatever
-        // `on_failure` says, and `Warning` says why. But the background
+        // the privacy policy says, and `Warning` says why. But the background
         // effect: under `black` or `image` it is asked of the effect element
-        // all the same, which fails it and shows what `on_failure` says
+        // all the same, which fails it and shows what the privacy policy says
         // ([`Self::fails_closed`]).
         let mut params = self.session_params();
         self.effect_failure = None;
@@ -4533,7 +4545,7 @@ impl<B: MediaBackend> Controller<B> {
         self.enhance_seen = None;
         // The effect is checked before the camera is opened. Settings the
         // output cannot be built with (`replace` without a readable
-        // image) are a fault with `on_failure = "black"`: the camera stays
+        // image) are a fault with privacy on (`black`): the camera stays
         // closed. A provided effect that cannot run is not: with `black`
         // the session starts with it all the same, the effect element's
         // frames black until it runs, and `Warning` says why. With
@@ -4546,18 +4558,18 @@ impl<B: MediaBackend> Controller<B> {
                 .and_then(|()| self.effect_check(&params.effect));
             if let Err(reason) = res {
                 match params.effect.on_failure {
-                    EffectOnFailure::Black | EffectOnFailure::Image if settings.is_err() => {
+                    policy if policy.hides() && settings.is_err() => {
                         self.plan = None;
                         self.hold_background();
                         self.set_privacy_fault(effect_failure_text(&params.effect, &reason));
                         return Again::No;
                     }
-                    EffectOnFailure::Black | EffectOnFailure::Image => {
+                    policy if policy.hides() => {
                         warning!("effect {} cannot run: {reason}", params.effect.mode);
                         self.effect_failure = Some(effect_warning_text(&params.effect, &reason));
                         refused = Some(reason);
                     }
-                    EffectOnFailure::None => {
+                    _ => {
                         warning!("effect {} cannot run: {reason}", params.effect.mode);
                         self.effect_failure = Some(effect_warning_text(&params.effect, &reason));
                         params.effect.mode = EffectMode::None;
@@ -4656,8 +4668,8 @@ impl<B: MediaBackend> Controller<B> {
         // effect in this step (once) or the next.
         if self.streams_without_black_effect() {
             warning!(
-                "the effect can run now under on_failure = \"{}\": not streaming without it",
-                self.effect().on_failure
+                "the effect can run now under privacy (mode {}): not streaming without it",
+                self.effect().privacy_mode_in_force()
             );
             self.drop_session();
             self.privacy_hold = Some(PrivacyHold::Guard);
@@ -4743,11 +4755,12 @@ impl<B: MediaBackend> Controller<B> {
 
     /// The running session's effect element keeps its backend while the
     /// module the session started the background effect with can run it.
-    /// Under an `on_failure` that hides the camera (`black`, `image`), a
-    /// session that lost that module ([`Self::background_lost`]: disabled,
-    /// a failed probe, a failed reopen on a reload) has the element drop
-    /// its backend instance ([`MediaBackend::revoke_effect_backend`]): it
-    /// fails the effect at once and shows black or the fallback image, the
+    /// Under a privacy policy that hides the camera (`black`, `image`,
+    /// `freeze`), a session that lost that module
+    /// ([`Self::background_lost`]: disabled, a failed probe, a failed
+    /// reopen on a reload) has the element drop its backend instance
+    /// ([`MediaBackend::revoke_effect_backend`]): it fails the effect at
+    /// once and shows black, the fallback image or the last frame, the
     /// effect still asked of it ([`Self::fails_closed`]) and the camera
     /// kept open. Once the module can run it again (or the effect is no
     /// longer to be hidden), the element takes its backend back
@@ -4768,7 +4781,7 @@ impl<B: MediaBackend> Controller<B> {
     fn follow_effect_backend(&mut self) {
         let revoke = self.session.is_some()
             && self.effect().mode != EffectMode::None
-            && self.effect().on_failure.hides()
+            && self.effect().policy().hides()
             && self.backend.can_revoke_effect_backend()
             && self.plan.as_ref().is_some_and(|p| self.background_lost(p));
         if revoke == self.background_revoked {
@@ -4818,7 +4831,7 @@ impl<B: MediaBackend> Controller<B> {
     /// [`Self::drop_session`] for privacy: `hold` sets the privacy hold
     /// once the session is taken, and the writer is given what the hold
     /// shows ([`Self::give_writer_images`]: black under
-    /// `on_failure = "black"`) before the session stops, so no placeholder
+    /// privacy on (`black`)) before the session stops, so no placeholder
     /// slot between the two shows the away image.
     fn drop_session_held(&mut self, hold: impl FnOnce(&mut Self)) {
         self.drop_session_with(|c| {
@@ -4895,7 +4908,7 @@ impl<B: MediaBackend> Controller<B> {
     /// module stages (an empty plan: the frames pass through), so that the
     /// application that opened the virtual camera gets the camera rather
     /// than an error. Not when a background effect is asked with
-    /// `on_failure = "black"` (the user's choice is black over an
+    /// privacy on (`black`) (the user's choice is black over an
     /// unprocessed picture), nor when there is nothing to drop. The params
     /// it started with, `None` if it was not tried or failed too.
     fn start_passthrough(&mut self, params: &SessionParams, why: &str) -> Option<SessionParams> {
@@ -4965,14 +4978,14 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     /// [`Self::set_fault`] for a session refused for privacy: the effect
-    /// cannot run and `on_failure` hides the camera. While the fault
+    /// cannot run and the privacy policy hides the camera. While the fault
     /// stands, privacy holds the feed ([`Self::privacy_hold`]).
     fn set_privacy_fault(&mut self, msg: String) {
         self.privacy_hold = Some(PrivacyHold::Fault(msg.clone()));
         self.fault_is(msg);
     }
 
-    /// A background effect is asked of the session with an `on_failure`
+    /// A background effect is asked of the session with a privacy policy
     /// that hides the camera: the session never streams without it.
     fn hides_effect(effect: &EffectRun) -> bool {
         effect.mode != EffectMode::None && effect.on_failure.hides()
@@ -4992,8 +5005,9 @@ impl<B: MediaBackend> Controller<B> {
     /// The image the writer's placeholder shows now, and whether privacy
     /// holds the feed; `None`: black. While a privacy hold stands
     /// ([`Self::privacy_holds`]) with a background effect selected, the
-    /// placeholder follows `effect.on_failure` (switch 1): `"image"` shows
-    /// `effect.fallback_image`, `"black"` black, whatever
+    /// placeholder follows the privacy mode (switch 1): `away` shows
+    /// `effect.fallback_image`, `freeze` too when it is set (the hold has
+    /// no processed frame to hold), else black; `black` black, whatever
     /// `output.placeholder` says. Otherwise it follows `output.placeholder`
     /// (switch 2, [`Self::away_image`]) at all times, also while a session
     /// streams and with no consumer: the writer shows its placeholder only
@@ -5010,8 +5024,8 @@ impl<B: MediaBackend> Controller<B> {
     /// The image the session output's clock placeholder shows: what the
     /// writer's placeholder would ([`Self::placeholder_image`]) for a
     /// session started (or starting) under the hold that has not streamed
-    /// yet: black while a privacy hold stands under `on_failure =
-    /// "black"`, never the away image.
+    /// yet: black while a privacy hold stands under privacy on
+    /// (`black`), never the away image.
     fn output_image(&self) -> Option<PathBuf> {
         let live = self.session.as_ref().is_some_and(|s| s.live);
         let holds =
@@ -5025,8 +5039,14 @@ impl<B: MediaBackend> Controller<B> {
         if holds {
             let effect = self.effect();
             if effect.mode != EffectMode::None {
-                match effect.on_failure {
-                    EffectOnFailure::Image => return effect.fallback_image.map(|p| (p, true)),
+                match effect.policy() {
+                    // The daemon's hold has no processed frame to hold:
+                    // `freeze` shows the away image when one is set, else
+                    // black, as the effect element does before a first
+                    // frame.
+                    EffectOnFailure::Image | EffectOnFailure::Freeze => {
+                        return effect.fallback_image.map(|p| (p, true));
+                    }
                     EffectOnFailure::Black => return None,
                     // Shown since: the hold no longer hides anything.
                     EffectOnFailure::None => {}
@@ -5069,7 +5089,7 @@ impl<B: MediaBackend> Controller<B> {
         // The session output's clock placeholder (an input gap past the
         // hold) shows what the writer's would ([`Self::placeholder_image`]):
         // the away image whenever it is chosen, black while a privacy hold
-        // stands under `on_failure = "black"`.
+        // stands under privacy on (`black`).
         let want = self.placeholder_image().map(|(p, _)| p);
         if let Some(s) = self.session.as_mut()
             && s.placeholder_image != want
@@ -5180,18 +5200,19 @@ impl<B: MediaBackend> Controller<B> {
         self.placeholder_overdue = false;
     }
 
-    /// `Warning`'s clauses of the fallback image: `on_failure = "image"`
+    /// `Warning`'s clauses of the fallback image: privacy's `away` mode
     /// without one (black is shown in its place, whenever the camera is
-    /// hidden), `output.placeholder = "image"` without one (black is shown
+    /// hidden; `freeze` falls back to black without one, as it says, with
+    /// no clause), `output.placeholder = "image"` without one (black is shown
     /// while there is no camera picture), and an image the writer's
     /// placeholder, the running session output's clock placeholder or its
     /// effect element cannot read.
     fn fallback_warnings(&self) -> Vec<String> {
         let effect = self.effect();
         let mut out = Vec::new();
-        if effect.on_failure == EffectOnFailure::Image && effect.fallback_image.is_none() {
+        if effect.policy() == EffectOnFailure::Image && effect.fallback_image.is_none() {
             out.push(
-                "effect.on_failure is \"image\" but effect.fallback_image is not set: showing \
+                "effect.privacy_mode is \"away\" but effect.fallback_image is not set: showing \
                  black"
                     .to_string(),
             );
@@ -6060,7 +6081,7 @@ impl<B: MediaBackend> Controller<B> {
         // it); with no effect selected, or under `none` (the retry loads
         // it, the frames black meanwhile), it is no longer true.
         let effect = self.effect();
-        if effect.mode == EffectMode::None || effect.on_failure == EffectOnFailure::None {
+        if effect.mode == EffectMode::None || effect.policy() == EffectOnFailure::None {
             self.effect_failure = None;
         }
         if stages {
@@ -6149,14 +6170,14 @@ impl<B: MediaBackend> Controller<B> {
     /// The session refused `effect` for `reason` (settings its output
     /// cannot take: an image that can no longer be read). The session
     /// still runs what it had before, which may show the room, so with
-    /// `on_failure = "black"` it stops and the state is `error` (the
+    /// privacy on (`black`) it stops and the state is `error` (the
     /// writer's placeholder keeps the stream black); with `"none"` it
     /// streams on without the effect and `Warning` says why. The error the
     /// method answers.
     fn effect_refused(&mut self, effect: EffectRun, reason: &str) -> IpcError {
         let msg = effect_failure_text(&effect, reason);
         match effect.on_failure {
-            EffectOnFailure::Black | EffectOnFailure::Image => {
+            EffectOnFailure::Black | EffectOnFailure::Image | EffectOnFailure::Freeze => {
                 info!("stopping the camera: the session refused the effect");
                 // What privacy shows replaces the away image before the
                 // session stops, so the writer's placeholder never shows
@@ -7397,13 +7418,13 @@ impl<B: MediaBackend> Controller<B> {
 
     /// The facts the config schema is made from: the modules', the
     /// options of `output.mode` ([`Self::output_mode_options`]) and those of
-    /// `effect.on_failure` (the image only with one configured).
+    /// the privacy policy (the image only with one configured).
     fn schema_facts(&self) -> RegistryFacts {
         let mut facts = registry_facts(&self.modules, &self.memory);
         facts.output_modes = self.output_mode_options();
         facts.no_frame_generation = self.session_memory() == VideoMemory::System;
-        facts.on_failure_options =
-            config_schema::on_failure_options(&self.config_set.config.effect);
+        facts.privacy_mode_options =
+            config_schema::privacy_mode_options(&self.config_set.config.effect);
         facts
     }
 
@@ -8227,6 +8248,7 @@ impl<B: MediaBackend> Controller<B> {
     fn reload(&mut self, now: Instant) -> Result<(), IpcError> {
         let res = match ConfigSet::load(&self.paths.config) {
             Ok(set) => {
+                let set = migrate_on_failure(&self.paths, set);
                 // Choices a start or an earlier reload could not move
                 // move now.
                 let set = if self.state_damaged.is_none() {
@@ -8342,8 +8364,10 @@ impl<B: MediaBackend> Controller<B> {
         // again, which retries a failed effect. A fallback image is given
         // again even when nothing changed, and so is the placeholder's: the
         // file at its path may have been replaced, and is read again if so.
-        let image = self.effect().on_failure == EffectOnFailure::Image
-            && self.effect().fallback_image.is_some();
+        let image = matches!(
+            self.effect().policy(),
+            EffectOnFailure::Image | EffectOnFailure::Freeze
+        ) && self.effect().fallback_image.is_some();
         if self.session.is_some() {
             let _ = self.apply_effect_with(image);
         }
@@ -9026,6 +9050,49 @@ fn in_force(config: &Config, runtime: &RuntimeState) -> Config {
     c
 }
 
+/// Replaces the legacy privacy policy (`effect.on_failure`) of the managed
+/// file of `set` with `effect.privacy` and `effect.privacy_mode`
+/// ([`config_d::migrate_managed_on_failure`]); `config.toml` and the other
+/// files are never written. Then, when a legacy key that some file still
+/// sets gives nothing in force because both privacy keys are set (or
+/// privacy is, over `none`), says so in one line.
+/// Returns the set in force afterwards (`set` itself when the write fails,
+/// the legacy key then read as before, and the move tried at the next
+/// load).
+fn migrate_on_failure(paths: &Paths, set: ConfigSet) -> ConfigSet {
+    let edits = config_d::migrate_managed_on_failure(&set);
+    let set = if edits.is_empty() {
+        set
+    } else {
+        let managed = config_d::managed_path(&paths.config);
+        match config_d::persist_managed(&paths.config, &edits, OverridePolicy::Ignore) {
+            Ok(new) => {
+                info!(
+                    "effect.on_failure in {} is replaced by effect.privacy and \
+                     effect.privacy_mode",
+                    managed.display()
+                );
+                new
+            }
+            Err(e) => {
+                error!(
+                    "effect.on_failure in {} cannot be replaced by the privacy keys: {e}; it \
+                     stays in force, and is replaced at the next start or reload",
+                    managed.display()
+                );
+                set
+            }
+        }
+    };
+    if set.config.effect.legacy_on_failure_ignored() {
+        info!(
+            "effect.on_failure in {} is ignored: the privacy keys set override it",
+            set.source(config_schema::LEGACY_ON_FAILURE)
+        );
+    }
+    set
+}
+
 /// Moves the module choices of `runtime` (the state file's enabled
 /// modules, stage order, profile and pins) into the managed file of `set`
 /// ([`config_d::migrate_modules_state`]): the managed file is written first
@@ -9135,7 +9202,7 @@ fn registry_facts(modules: &Modules, memory: &EffectiveMemory) -> RegistryFacts 
             .collect(),
         stages,
         output_modes: Vec::new(),
-        on_failure_options: Vec::new(),
+        privacy_mode_options: Vec::new(),
         video_memory: Some(memory.clone()),
         // The callers that know of a running session set its memory's.
         no_frame_generation: memory.memory == VideoMemory::System,

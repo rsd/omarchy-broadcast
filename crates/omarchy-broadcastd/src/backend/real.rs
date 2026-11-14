@@ -599,6 +599,7 @@ fn effect_settings(e: &EffectRun) -> EffectSettings {
             EffectOnFailure::Black => EffectFallback::Black,
             EffectOnFailure::None => EffectFallback::None,
             EffectOnFailure::Image => EffectFallback::Image,
+            EffectOnFailure::Freeze => EffectFallback::Freeze,
         },
         fallback_image: e.fallback_image.clone(),
         stages: e.stages.iter().map(stage_request).collect(),

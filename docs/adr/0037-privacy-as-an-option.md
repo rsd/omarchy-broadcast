@@ -1,0 +1,73 @@
+# ADR-0037: Privacy is an option: showing the camera when an effect cannot run is the default, hiding it is a switch with three modes
+
+- **Status:** Accepted (2026-11-13), implemented in daemon 0.48.0 (`crates/obc-core`, `crates/obc-pipeline`, `crates/gst-obc`, `crates/obc-ipc`, `crates/omarchy-broadcastd`, `crates/omarchy-broadcast`), D-Bus revision 21. Reverses the rule, held since [ADR-0012](0012-video-effects-and-maxine-backend.md) and restated in [ADR-0025](0025-loadable-modules.md), that the raw camera image is never shown while an effect is requested: the rule now holds only with privacy on. Amends [ADR-0027](0027-output-modes-frame-generation-and-privacy-fallback.md) (the privacy switch and "Start without effects"), [ADR-0034](0034-away-image.md) (switch 1 of the two switches), [ADR-0012](0012-video-effects-and-maxine-backend.md), [ADR-0025](0025-loadable-modules.md), [ADR-0033](0033-system-memory-pipeline.md), [ADR-0018](0018-video-noise-removal.md) and [ADR-0026](0026-config-d-and-managed-config.md) (the editable keys and the daemon's managed file). Builds on [ADR-0011](0011-daemon-lifecycle-and-dbus-api.md) (the writer, its placeholder and its hold), [ADR-0023](0023-settings-schema.md) and [ADR-0026](0026-config-d-and-managed-config.md) (the configuration schema and the file layers). Reference: [../dbus-api.md](../dbus-api.md#privacy-as-an-option-revision-21), [../cli-json.md](../cli-json.md#config), [../config.example.toml](../config.example.toml).
+
+## Context
+- Until this decision the daemon's answer to an effect that cannot run was fixed by `[effect] on_failure`, whose default `black` hides the camera: black frames (or, with `image`, the away image), the camera open, a `Warning` with the reason. The rule behind it, "the raw camera image is never shown while an effect is requested", applied to every such case.
+- Under that rule a missing effect hid the camera for every cause: an install without an effect module able to run on its hardware, a module that was disabled or lost, a model that is still loading as the camera starts or a new source is used.
+- On 2026-11-13 the project decided that hiding the camera is a choice, with showing the camera as the default. Every guarantee of the earlier rule is kept for those who turn privacy on.
+- The hiding options are black, a still picture (the away image, [ADR-0034](0034-away-image.md)) and the last frame the effect produced (freeze).
+- The configuration already has the pieces: one still image (`effect.fallback_image`, the away image), one placeholder switch (`output.placeholder`, which is not privacy) and the file layers of [ADR-0026](0026-config-d-and-managed-config.md), in which the daemon writes only `config.d/50-panel.toml`. An installation may have `[effect] on_failure` in any of them.
+- The effect element sits after the output clock and sees every processed frame; the writer sees only what is forwarded to it and cannot tell a processed frame from a raw one ([ADR-0011](0011-daemon-lifecycle-and-dbus-api.md)).
+
+## Decision
+Privacy hiding is opt-in: by default the camera stays visible when an effect cannot run, and the user can choose to hide it (black, the away image or a frozen frame).
+
+**Two keys replace one. `[effect] privacy` (a `bool`, default `false`) says whether the camera is hidden when the requested effect cannot run; `[effect] privacy_mode` (`black`, `away` or `freeze`, default `black`) says what is shown instead while it is. Both are editable and live. The old `[effect] on_failure` is still read and translated. An installation with nothing set changes from hiding the camera to showing it. D-Bus revision 21 adds no member.**
+
+### Privacy off (the default)
+When the requested effect cannot run the camera is shown as it is: no black, no image. This covers every cause that [ADR-0012](0012-video-effects-and-maxine-backend.md) and [ADR-0025](0025-loadable-modules.md) put under the rule: an effect refused or failed, its module lost while a session runs, and an effect still loading at a start or at a new source. The stream stays `active`, the camera stays open, `Warning` gives the reason and ends `(effect.privacy is off)`, and the effect applies by itself once it can run, with no restart.
+
+- **A start without effects is allowed.** When the session output cannot start with its effects, the daemon starts it again at the same format without them ([ADR-0027](0027-output-modes-frame-generation-and-privacy-fallback.md)), whatever the effect selected. The reconcile guard, which stops a session that streams without its background effect while privacy applies, does not stop a session for it.
+- A user who turns an effect on while the picture is on screen sees it continue until the effect is ready, as before; the difference is only where the room was never on screen.
+
+### Privacy on: three modes
+With privacy on every rule of the earlier `black` and `image` holds, unchanged: the camera is never opened raw for an effect that is to hide it, a session is refused rather than started without its effect, an effect that no module can run is asked of the element all the same and fails there, a lost module gives the mode's picture from the next frame, a refused or failed start leaves the writer's placeholder, and settings the stream cannot be built with (`replace` without a readable image) close the camera with the reason in `Error`.
+
+- **`black`**: black frames. The behaviour of the old default.
+- **`away`**: the away image, the single image `[effect] fallback_image` of [ADR-0034](0034-away-image.md); no new key. An image that is not set or cannot be read shows black, with a `Warning` (`effect.privacy_mode is "away" but effect.fallback_image is not set: showing black`, or `Away image <path> could not be read (<why>): showing black`).
+- **`freeze`**: the effect element repeats the last frame the effect produced under the current request, for as long as the effect cannot run. With none yet (a cold start, after a change of the caps, after the raw camera was shown) it shows the away image if one is set, else black. Where the daemon holds the feed with no session (a start that privacy refuses, the writer's placeholder under a privacy hold) there is no processed frame, so freeze shows the away image if set, else black. Every fail-closed rule of `black` and `away` holds for `freeze`: a frozen frame is only ever a frame the effect produced, never a raw one, and it is dropped when a raw or stages-only frame goes out, on a stop and on a change of the caps. Frozen frames count as black frames in the effect's statistics.
+- **Cost of `freeze`.** The element keeps a reference to the last frame the effect produced, in the memory of the path (device or system, [ADR-0033](0033-system-memory-pipeline.md)); no frame is copied while the effect runs. One frame is copied per frozen tick.
+
+### The camera-off, start and input-gap placeholders are not privacy
+`[output] placeholder` ([ADR-0034](0034-away-image.md)) keeps deciding what is shown where there is no camera picture and nothing is to be hidden: the camera off, an idle camera, a start before the first frame, an input gap and the crash cover. Neither of the two privacy keys changes them.
+
+### How it is chosen
+- Both keys are rows of the configuration schema, written to `config.d/50-panel.toml` by `SetConfig` and refused when a later file sets them, as every key ([ADR-0026](0026-config-d-and-managed-config.md)). `effect.privacy` is labelled "Hide the camera when an effect can't run". `effect.privacy_mode` is labelled "Show instead of the camera", with the options "Black", "Away image" (offered once an away image is chosen, or when it is the value in force) and "Last frame"; it is greyed while privacy is off, with the reason `Turn on "Hide the camera when an effect can't run" to change this`.
+- The mode keeps its value while privacy is off, so turning privacy on again restores the last choice.
+
+### The key `on_failure` is still read
+- **Reading.** Each new key that is set in no file takes its value from `[effect] on_failure`: `black` gives privacy on, mode `black`; `image` gives on, `away`; `none` gives off, with the mode unchanged. A key that is set wins for itself, so `on_failure = "black"` with `privacy_mode = "freeze"` is privacy on with `freeze`.
+- **Writing.** `SetConfig` of `effect.on_failure` over D-Bus is accepted and translated into the new keys. The command line does not take the old key: `omarchy-broadcast config set` types its value from the schema row, which no longer exists, so `config set effect.on_failure` is refused as an unknown key and the new keys are set instead. `ResetConfig` of it removes all three from the managed file. The daemon rewrites its own `config.d/50-panel.toml` at start and at reload: an `on_failure` there whose value is in force becomes the new keys, and one that a later file overrides is only removed. `config.toml` and the other files are never written.
+- **Reporting.** The two privacy rows report "Overridden by <file>" when the value in force comes from a legacy `on_failure` in a file after `50-panel.toml`, so a refused write names the file that wins. The schema has no row for `effect.on_failure` from revision 21.
+
+### Revision 21
+No property, method, signal or error name is added, as in revisions 12 and 17. The schema gains the rows `effect.privacy` and `effect.privacy_mode` and loses `effect.on_failure`; `SetConfig` and `ResetConfig` keep accepting the old key; `Warning` names privacy off as `(effect.privacy is off)` and the away image of privacy as `effect.privacy_mode is "away" …`. A client that reads the schema rows shows the new rows without change; a client that offers `effect.on_failure` by name checks `InterfaceRevision` and, from 21, offers the two new keys. The benchmark tool `obc-bench` takes `away` and `freeze` for `--effect-on-failure`.
+
+## Consequences
+- An installation that sets nothing now shows the camera when an effect cannot run, instead of black. A user who wants the earlier behaviour turns privacy on, with one switch, and gets exactly the earlier `black`.
+- A user who had `on_failure = "black"` or `"image"` set keeps that behaviour: the old key is read, and the daemon moves a value from its own managed file into the new keys at its next start or reload.
+- The panel has a switch and, below it, a mode; the mode is not a second way of turning privacy off. The three modes share the single away image, so no new file or setting needs choosing.
+- Under `freeze` a call keeps a picture of the last frame the effect produced while an effect reloads or fails, at the cost of a picture that does not move; no raw frame can reach it.
+- The element's cost with privacy off is nil; with `freeze` one extra reference to a frame the element already holds.
+- Every document that said the room is never shown now says "with privacy on".
+
+### Known limits
+- **A new privacy key set in an earlier configuration file wins over a legacy `on_failure` in a later file, and the later file's request is not reported.** A new key that is set wins for itself, whichever file sets it; the legacy key stands only for a key that no file sets, so a later file cannot override an earlier one through the old name. With `privacy = false` in `config.toml` and `on_failure = "black"` in a later `90-admin.toml`, privacy is off, the row does not say "Overridden by", and nothing is logged. The remedy is to set the new key in the later file or to remove it from the earlier.
+- **A reset of `effect.on_failure` is refused as a whole when a later file sets any of `on_failure`, `privacy` or `privacy_mode`,** as a reset of any key is refused when a later file sets it.
+- **If rewriting `config.d/50-panel.toml` during the migration fails, a reset of the privacy row changes nothing until the file is rewritten.**
+- **A frozen picture does not move.** In a call a participant sees a still picture of the person until the effect runs again; it shows what the effect produced, so the background stays hidden, but it is stale. It is the user's choice among three.
+- **Freeze has no frame in the writer.** A refused start and the writer's placeholder under a privacy hold show the away image if one is set, else black, not a frozen frame (see the alternatives).
+- **An install that depended on the old default** (no keys, a camera that went black without the SDK) changes behaviour on upgrading to 0.48.0. The migration cannot tell the old default from a choice, so such an install shows the camera until privacy is turned on.
+
+## Alternatives considered
+
+| Alternative | Why rejected |
+|---|---|
+| **Keep "never raw" as the default** and add only the new modes | It keeps a black feed for every installation whose effect cannot run, including those that have nothing set to hide. The decision of 2026-11-13 is that hiding the camera is a choice, so the default is showing it |
+| **A second privacy image**, separate from the away image | One image is one file to choose, one set of checks and one decode. [ADR-0034](0034-away-image.md) already rejected two images; the three modes give the same freedom of when to show it |
+| **A single enum key** (`on_failure` with a fourth value `freeze`) | The panel's switch ("hide the camera when an effect can't run") and the mode ("what to show instead") are separate settings: one says whether the camera may be hidden, the other says what is shown in its place. A single enum folds the switch into the list, so turning privacy off loses the mode the user chose, and the dialog cannot grey the mode while privacy is off. A bool and a mode keep both, and read `on_failure` for what it was |
+| **Removing `on_failure`** without reading it | A configuration written for 0.47.0 or earlier would change behaviour without a message; reading it keeps `black` and `image` installations as they were |
+| **Freeze in the writer** (hold the last forwarded frame for any privacy hold) | The writer has no processed frame: it sees what the session forwards, and cannot tell a processed frame from a raw one. A frozen frame there could be the room. The effect element knows which frame it produced, so freeze lives there, and the writer uses the away image or black |
+| **Freeze by copying every frame** | A copy per frame is a cost even while the effect runs. Keeping a reference to the last produced frame costs nothing while it runs and one copy per frozen tick |
+| **Translating `on_failure` in every file** | The daemon writes only its own managed file ([ADR-0026](0026-config-d-and-managed-config.md)); files that a person wrote are left as written and read through the rule above |

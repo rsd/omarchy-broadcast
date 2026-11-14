@@ -2,8 +2,9 @@
 //! `config.d/` in lexical order, each later file winning key by key
 //! ([`ConfigSet`]); the one drop-in the daemon writes,
 //! `config.d/50-panel.toml` ([`persist_managed`], [`set_config`],
-//! [`reset_config`]); and the move of the module choices from the state
-//! file into it ([`migrate_modules_state`]).
+//! [`reset_config`]); the move of the module choices from the state file
+//! into it ([`migrate_modules_state`]); and the replacement of its legacy
+//! `effect.on_failure` by the privacy keys ([`migrate_managed_on_failure`]).
 //!
 //! # Loading
 //!
@@ -42,6 +43,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use crate::EffectOnFailure;
 use crate::config::{
     Config, ConfigError, RuntimeState, create_temp, line_of_key, parse_error, remove_stale_temps,
 };
@@ -488,8 +490,22 @@ impl ConfigSet {
     }
 
     /// The file that sets the value in force of the leaf `key`, relative
-    /// to [`Self::dir`]; `""` when no file does (the default).
+    /// to [`Self::dir`]; `""` when no file does (the default). For
+    /// `effect.privacy` and `effect.privacy_mode` when they are not set,
+    /// the file of the legacy `effect.on_failure` when it stands for them
+    /// ([`crate::config::EffectConfig::privacy_from_legacy`],
+    /// [`crate::config::EffectConfig::privacy_mode_from_legacy`]).
     pub fn source(&self, key: &str) -> &str {
+        let effect = &self.config.effect;
+        let key = match key {
+            config_schema::PRIVACY if effect.privacy_from_legacy() => {
+                config_schema::LEGACY_ON_FAILURE
+            }
+            config_schema::PRIVACY_MODE if effect.privacy_mode_from_legacy() => {
+                config_schema::LEGACY_ON_FAILURE
+            }
+            key => key,
+        };
         self.provenance.get(key).map_or("", String::as_str)
     }
 
@@ -816,12 +832,20 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// ([`config_schema::lookup`]) that is editable, converts `value` to the
 /// key's type ([`config_schema::to_toml`]), then [`persist_managed`] with
 /// [`OverridePolicy::Refuse`].
+///
+/// The legacy key `effect.on_failure` (a client written before
+/// `effect.privacy`) is accepted: `black`, `image` or `none`, written as
+/// the privacy keys it stands for ([`legacy_on_failure_edits`]).
 pub fn set_config(
     config_toml: &Path,
     facts: &RegistryFacts,
     key: &str,
     value: &ConfigValue,
 ) -> Result<ConfigSet, WriteError> {
+    if key == config_schema::LEGACY_ON_FAILURE {
+        let edits = legacy_on_failure_edits(facts, value)?;
+        return persist_managed(config_toml, &edits, OverridePolicy::Refuse);
+    }
     let spec =
         config_schema::lookup(key, facts).ok_or_else(|| WriteError::UnknownKey(key.into()))?;
     if !spec.editable {
@@ -835,17 +859,69 @@ pub fn set_config(
     )
 }
 
+/// The edits of a `SetConfig` of the legacy `effect.on_failure` to
+/// `value`: `black` and `image` set `effect.privacy` on with the mode
+/// `black` or `away` (refused, as a write of the mode would be, when the
+/// away image is not offered), `none` sets it off and leaves the mode; the
+/// legacy key is removed from the managed file.
+fn legacy_on_failure_edits(
+    facts: &RegistryFacts,
+    value: &ConfigValue,
+) -> Result<Vec<ManagedEdit>, WriteError> {
+    let key = config_schema::LEGACY_ON_FAILURE;
+    let ConfigValue::Str(s) = value else {
+        return Err(WriteError::Invalid(format!(
+            "{key}: expects one of its options"
+        )));
+    };
+    let policy: EffectOnFailure = s
+        .parse()
+        .map_err(|e: crate::CoreError| WriteError::Invalid(format!("{key}: {e}")))?;
+    let (on, mode) = policy.privacy_keys();
+    let mut edits = vec![ManagedEdit::Set(
+        config_schema::PRIVACY.into(),
+        toml::Value::Boolean(on),
+    )];
+    if let Some(mode) = mode {
+        let kind = config_schema::lookup(config_schema::PRIVACY_MODE, facts)
+            .map(|k| k.kind)
+            .ok_or_else(|| WriteError::UnknownKey(config_schema::PRIVACY_MODE.into()))?;
+        let value = config_schema::to_toml(
+            config_schema::PRIVACY_MODE,
+            &kind,
+            &ConfigValue::Str(mode.as_str().into()),
+        )
+        .map_err(WriteError::Invalid)?;
+        edits.push(ManagedEdit::Set(config_schema::PRIVACY_MODE.into(), value));
+    }
+    edits.push(ManagedEdit::Remove(key.into()));
+    Ok(edits)
+}
+
 /// `ResetConfig(key)`: removes `key` from the managed file, so that the
 /// value of an earlier file (or the default) is in force. The same checks
 /// as [`set_config`]; a key the managed file does not set writes nothing.
 /// A value the managed file sets is removed whatever the schema says of
 /// its key (an entry for a module no longer installed, or a stage no
-/// longer offered, is cleared this way).
+/// longer offered, is cleared this way). A reset of the legacy
+/// `effect.on_failure` removes it with `effect.privacy` and
+/// `effect.privacy_mode`, which stand for it now.
 pub fn reset_config(
     config_toml: &Path,
     facts: &RegistryFacts,
     key: &str,
 ) -> Result<ConfigSet, WriteError> {
+    if key == config_schema::LEGACY_ON_FAILURE {
+        let edits: Vec<ManagedEdit> = [
+            config_schema::PRIVACY,
+            config_schema::PRIVACY_MODE,
+            config_schema::LEGACY_ON_FAILURE,
+        ]
+        .into_iter()
+        .map(|k| ManagedEdit::Remove(k.into()))
+        .collect();
+        return persist_managed(config_toml, &edits, OverridePolicy::Refuse);
+    }
     let in_managed = || {
         load_for_write(config_toml)
             .is_ok_and(|set| table_get(&set.managed, key).is_some_and(|v| !v.is_table()))
@@ -861,6 +937,45 @@ pub fn reset_config(
         &[ManagedEdit::Remove(key.into())],
         OverridePolicy::Refuse,
     )
+}
+
+/// The edits that replace the legacy `effect.on_failure` of the managed
+/// file of `set` with the privacy keys it stands for (none when the
+/// managed file does not set it), keeping the policy in force. Only when
+/// the legacy value in force is the managed file's (no later file sets
+/// the key) is it translated, each privacy key on its own: `effect.privacy`
+/// when no file sets it (`black` and `image` on, `none` off), and
+/// `effect.privacy_mode` when no file sets it and the value names a mode
+/// (`black` or `away`). Otherwise it is overridden, and only removed. The
+/// daemon writes them at a load ([`persist_managed`] with
+/// [`OverridePolicy::Ignore`]); no other file is changed, so a legacy key
+/// in `config.toml` or another drop-in stays and is read as before.
+pub fn migrate_managed_on_failure(set: &ConfigSet) -> Vec<ManagedEdit> {
+    let key = config_schema::LEGACY_ON_FAILURE;
+    if table_get(&set.managed, key).is_none() {
+        return Vec::new();
+    }
+    let mut edits = Vec::new();
+    let effect = &set.config.effect;
+    if set.provenance.get(key).is_some_and(|f| f == MANAGED_REL)
+        && let Some(policy) = effect.on_failure
+    {
+        let (on, mode) = policy.privacy_keys();
+        if effect.privacy.is_none() {
+            edits.push(ManagedEdit::Set(
+                config_schema::PRIVACY.into(),
+                toml::Value::Boolean(on),
+            ));
+        }
+        if let (None, Some(mode)) = (effect.privacy_mode, mode) {
+            edits.push(ManagedEdit::Set(
+                config_schema::PRIVACY_MODE.into(),
+                toml::Value::String(mode.as_str().into()),
+            ));
+        }
+    }
+    edits.push(ManagedEdit::Remove(key.into()));
+    edits
 }
 
 /// The module choices of a state file moved into the managed file

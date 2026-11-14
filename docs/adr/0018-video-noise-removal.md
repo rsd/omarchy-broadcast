@@ -35,9 +35,9 @@
 
 ### Failure policy: fail open
 - Noise removal hides nothing, so its failure is not a privacy failure. If the stage cannot load or run (the SDK or the feature library is missing, the size is out of range, a run fails), the stream continues without it: with `none`, the camera image; with `blur` or `replace`, the effect without noise removal.
-- `[effect] on_failure` does not apply to the stage and the daemon does not enter `error`. `Error` says `noise removal unavailable: <reason>; the camera image is shown without it`.
+- `[effect] on_failure` does not apply to the stage and the daemon does not enter `error`. `Error` says `noise removal unavailable: <reason>; the camera image is shown without it`. *Amendment (daemon 0.48.0, D-Bus revision 21, [ADR-0037](0037-privacy-as-an-option.md)): the key is now `effect.privacy` with `effect.privacy_mode`; it does not apply to the stage either*
 - A frame whose noise-removal run fails under `blur` or `replace` is processed again without the stage, so no raw frame appears.
-- If the whole chain fails (the green screen, for example), that is the effect's failure and follows `on_failure` as before (black by default).
+- If the whole chain fails (the green screen, for example), that is the effect's failure and follows `on_failure` as before (black by default). *Amendment (daemon 0.48.0, D-Bus revision 21, [ADR-0037](0037-privacy-as-an-option.md)): it follows the privacy setting: with the default, privacy off, the camera shows; with privacy on, black, the away image or the last frame*
 - The failure is cleared when the stage is ready again, on an effect method (`SetDenoise` included), on a configuration reload, or at the end of the session.
 - `Error` precedence, first applicable: writer missing, fault, effect failure, noise-removal failure, damaged state file.
 - A noise-removal failure seen while the effect is loading or ready is confirmed one poll later before it is reported, so that an effect failure that was read a moment apart is not blamed on the stage.

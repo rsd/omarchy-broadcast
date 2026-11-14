@@ -892,6 +892,69 @@ fn host_a_start_or_a_new_source_while_the_effect_loads_is_black() {
     rig.stop();
 }
 
+/// With `on-failure=none` (privacy off) the camera is shown as it is
+/// whenever the effect cannot run, byte for byte: at a start while it
+/// loads, on a new source while it loads, on new caps once the effect was
+/// shown, and after it failed. Never black.
+#[test]
+fn host_on_failure_none_shows_the_input_while_the_effect_loads_or_failed() {
+    let fake = FakeFactory::new(FakeConfig {
+        load_delay: Duration::from_millis(300),
+        ..FakeConfig::default()
+    });
+    let open = EffectSettings {
+        fallback: EffectFallback::None,
+        ..EffectSettings::of(EffectKind::Blur)
+    };
+    // A start: the input until the effect is ready.
+    let mut rig = HostRig::new(Some(Arc::clone(&fake)), &open);
+    let warm = rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert!(warm.len() >= 3, "{warm:?}");
+    assert!(held_then(&warm, Seen::Input, Seen::FakeBlur), "{warm:?}");
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    rig.stop();
+
+    // none, then blur mid-stream, and a new source while it loads: the
+    // input on both sides of it.
+    let mut rig = HostRig::new(Some(Arc::clone(&fake)), &EffectSettings::default());
+    assert_eq!(rig.frame(), Seen::Input);
+    rig.effect.apply(&open).unwrap();
+    assert_eq!(rig.frame(), Seen::Input);
+    assert_eq!(rig.effect.status(), EffectStatus::Loading);
+    assert_eq!(rig.frame_with(gst_obc::NEW_SOURCE_FLAG), Seen::Input);
+    let rest = rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert!(held_then(&rest, Seen::Input, Seen::FakeBlur), "{rest:?}");
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+
+    // New caps once the effect was shown: a reload, the input (or the
+    // chain still loaded) until it is ready, never black.
+    let loads = get(&fake.log.loads);
+    fake.set(|c| c.switch_delay = Duration::from_millis(300));
+    let caps: gst::Caps = SYSTEM_FULL.parse().unwrap();
+    rig.src.set_caps(Some(&caps));
+    rig.caps = caps;
+    let reload = rig.frames_until(Duration::from_secs(10), |r| {
+        get(&fake.log.loads) > loads && r.effect.status() == EffectStatus::Ready
+    });
+    assert!(reload.contains(&Seen::Input), "{reload:?}");
+    assert!(
+        reload
+            .iter()
+            .all(|s| matches!(s, Seen::Input | Seen::FakeBlur)),
+        "{reload:?}"
+    );
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+
+    // A failure: the input, copied.
+    fake.set(|c| c.fail_process = Some("fake frame failure".into()));
+    assert_eq!(rig.frame(), Seen::Input);
+    assert!(failed(&rig));
+    assert_eq!(rig.frame(), Seen::Input);
+    assert_eq!(rig.effect.stats().frames_black, 0, "never black");
+    assert_no_cuda(&rig, &fake);
+    rig.stop();
+}
+
 #[test]
 fn host_black_is_the_black_of_the_caps_range() {
     let fake = FakeFactory::new(FakeConfig {
@@ -1071,6 +1134,300 @@ fn host_failures_show_black_or_the_input_as_configured() {
     );
     assert_eq!(rig.effect.stats().frames_passthrough, passed + 1);
     assert_eq!(rig.input_now(), rig.input_bytes);
+    assert_no_cuda(&rig, &fake);
+    rig.stop();
+}
+
+/// Settings of `kind` with `on-failure=freeze`.
+fn frozen(kind: EffectKind) -> EffectSettings {
+    EffectSettings {
+        fallback: EffectFallback::Freeze,
+        ..EffectSettings::of(kind)
+    }
+}
+
+/// The input of the rig with every Y byte raised by `dy`: another camera
+/// picture, so a fake effect frame made from it differs in its first row.
+fn shifted_input(dy: u8) -> Vec<u8> {
+    let mut bytes = host_input_bytes();
+    for b in &mut bytes[..(W * H) as usize] {
+        *b += dy;
+    }
+    bytes
+}
+
+/// `on-failure=freeze`: wherever black would show, the last frame the
+/// effect processed, byte for byte, in a new buffer with the frame's own
+/// timestamp: a frame failure, a repeat, a new source, a retry while it
+/// loads and once it has failed again, a module that lost its chain and a
+/// revoked backend. Never the input; the frozen frames count as black.
+#[test]
+fn host_on_failure_freeze_repeats_the_last_processed_frame_never_the_input() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let settings = frozen(EffectKind::Blur);
+    let mut rig = HostRig::new(Some(Arc::clone(&fake)), &settings);
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    let first = rig.bytes_with(gst::BufferFlags::empty());
+    assert_eq!(classify(&first, &rig.input_bytes), Seen::FakeBlur);
+    // The last processed frame, of another picture than the first.
+    rig.set_input(shifted_input(40));
+    let last = rig.bytes_with(gst::BufferFlags::empty());
+    assert_eq!(classify(&last, &rig.input_bytes), Seen::FakeBlur);
+    assert_ne!(last, first);
+    // And the camera moves on: the frozen frame is never this input.
+    rig.set_input(shifted_input(80));
+
+    fake.set(|c| c.fail_process = Some("fake frame failure".into()));
+    let black = rig.effect.stats().frames_black;
+    assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), last);
+    assert!(failed(&rig));
+    let (memory, pts, _) = rig.last_sent();
+    assert_ne!(memory, rig.in_memory, "a new buffer");
+    assert_eq!(
+        pts,
+        Some(gst::ClockTime::from_nseconds(rig.pts - 33_333_333)),
+        "with the frame's own timestamp"
+    );
+    for flags in [
+        gst::BufferFlags::empty(),
+        gst_obc::REPEAT_FLAG,
+        gst_obc::NEW_SOURCE_FLAG,
+        gst::BufferFlags::empty(),
+    ] {
+        assert_eq!(rig.bytes_with(flags), last, "{flags:?}");
+    }
+    assert_eq!(rig.effect.stats().frames_black, black + 5);
+
+    // Healthy again (the chain is still loaded: the frames are the
+    // effect's at once, or frozen until then), then a module that loses
+    // its chain mid-session freezes on the newest effect frame.
+    fake.set(|c| c.fail_process = None);
+    rig.effect.apply(&settings).unwrap();
+    let seen = rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert!(
+        seen.iter()
+            .all(|s| matches!(s, Seen::Other | Seen::FakeBlur)),
+        "{seen:?}"
+    );
+    let newest = rig.bytes_with(gst::BufferFlags::empty());
+    assert_eq!(classify(&newest, &rig.input_bytes), Seen::FakeBlur);
+    rig.set_input(shifted_input(20));
+    fake.set(|c| c.lose_chain_on_process = Some("the module panicked".into()));
+    assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), newest);
+    assert!(failed(&rig));
+    assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), newest);
+
+    // A retry that fails to load, nothing loaded: frozen while it loads
+    // and once it has failed.
+    fake.set(|c| {
+        c.fail_load = Some("fake load failure".into());
+        c.load_delay = Duration::from_millis(200);
+    });
+    rig.effect.apply(&settings).unwrap();
+    assert_eq!(rig.effect.status(), EffectStatus::Loading);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !failed(&rig) {
+        assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), newest);
+        assert!(Instant::now() < deadline, "the retry never failed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        rig.effect.status(),
+        EffectStatus::Failed("fake load failure".into())
+    );
+    assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), newest);
+
+    // A backend taken away: still the frozen frame.
+    rig.effect.revoke_backend();
+    assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), newest);
+
+    // The effect turned off: the camera, as the user asked.
+    rig.effect
+        .apply(&EffectSettings {
+            fallback: EffectFallback::Freeze,
+            ..EffectSettings::default()
+        })
+        .unwrap();
+    assert_eq!(rig.frame(), Seen::Input);
+    assert_eq!(rig.input_now(), rig.input_bytes);
+    assert_no_cuda(&rig, &fake);
+    rig.stop();
+}
+
+/// `on-failure=freeze` with nothing processed yet (a start whose load
+/// fails): the away image when one is set and decoded, black before it and
+/// without one, and black with the image's error when it cannot be read.
+#[test]
+fn host_freeze_with_nothing_processed_shows_the_image_or_black() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = png(dir.path(), "away.png", "white", 40, 40);
+    let fake = FakeFactory::new(FakeConfig {
+        fail_load: Some("fake load failure".into()),
+        ..FakeConfig::default()
+    });
+    let with_image = EffectSettings {
+        fallback_image: Some(image),
+        ..frozen(EffectKind::Blur)
+    };
+    let mut rig = HostRig::new(Some(Arc::clone(&fake)), &with_image);
+    let seen = rig.frames_until(Duration::from_secs(10), failed);
+    assert!(
+        seen.iter().all(|s| matches!(s, Seen::Black | Seen::Image)),
+        "{seen:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rig.frame() != Seen::Image {
+        assert!(Instant::now() < deadline, "the image never showed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::Image);
+    }
+    assert_eq!(rig.effect.stats().fallback_error, None);
+    rig.stop();
+
+    let mut rig = HostRig::new(Some(Arc::clone(&fake)), &frozen(EffectKind::Blur));
+    let seen = rig.frames_until(Duration::from_secs(10), failed);
+    assert!(seen.iter().all(|s| *s == Seen::Black), "{seen:?}");
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::Black);
+    }
+    rig.stop();
+
+    let missing = dir.path().join("gone.png");
+    let unreadable = EffectSettings {
+        fallback_image: Some(missing.clone()),
+        ..frozen(EffectKind::Blur)
+    };
+    let mut rig = HostRig::new(Some(Arc::clone(&fake)), &unreadable);
+    let seen = rig.frames_until(Duration::from_secs(10), |r| {
+        failed(r) && r.effect.stats().fallback_error.is_some()
+    });
+    assert!(seen.iter().all(|s| *s == Seen::Black), "{seen:?}");
+    assert_eq!(rig.frame(), Seen::Black);
+    let why = rig.effect.stats().fallback_error.unwrap();
+    assert!(
+        why.starts_with(&format!(
+            "Away image {} could not be read (",
+            missing.display()
+        )),
+        "{why}"
+    );
+    assert_no_cuda(&rig, &fake);
+    rig.stop();
+}
+
+/// The frozen frame is of the caps it was made with: new caps drop it (the
+/// frames after them are black of the new range, never the old frame), and
+/// so does a stop. (A chain still loaded would process the first frames of
+/// the new caps until the reload: the frozen frame would then be one of
+/// those. Here the chain is lost first, so nothing is processed.)
+#[test]
+fn host_new_caps_or_a_stop_drop_the_frozen_frame() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let settings = frozen(EffectKind::Blur);
+    let mut rig = HostRig::new(Some(Arc::clone(&fake)), &settings);
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    let last = rig.bytes_with(gst::BufferFlags::empty());
+    assert_eq!(classify(&last, &rig.input_bytes), Seen::FakeBlur);
+    // A module that loses its chain: frozen, and nothing loaded can process
+    // a frame of the new caps below.
+    fake.set(|c| c.lose_chain_on_process = Some("the module panicked".into()));
+    assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), last);
+    assert!(failed(&rig));
+
+    // Full range now: a full reload, which fails.
+    fake.set(|c| c.fail_load = Some("fake load failure".into()));
+    let caps: gst::Caps = SYSTEM_FULL.parse().unwrap();
+    rig.src.set_caps(Some(&caps));
+    rig.caps = caps;
+    let seen = rig.frames_until(Duration::from_secs(10), |r| {
+        failed(r) && r.effect.status().reason() == Some("fake load failure")
+    });
+    assert!(seen.iter().all(|s| *s == Seen::FullBlack), "{seen:?}");
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::FullBlack);
+    }
+
+    // Processed again on these caps, then stopped and started: the start
+    // that fails is black, not the frame from before the stop.
+    fake.set(|c| c.fail_load = None);
+    rig.effect.apply(&settings).unwrap();
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    fake.set(|c| c.fail_load = Some("fake load failure".into()));
+    rig.stop();
+    rig.pipeline.set_state(gst::State::Playing).unwrap();
+    let seen = rig.frames_until(Duration::from_secs(10), failed);
+    assert!(seen.iter().all(|s| *s == Seen::FullBlack), "{seen:?}");
+    assert_eq!(rig.frame(), Seen::FullBlack);
+    assert_no_cuda(&rig, &fake);
+    rig.stop();
+}
+
+/// The placeholder image passes through and never becomes the frozen
+/// frame: a failure after it shows the last frame the effect processed.
+#[test]
+fn host_a_placeholder_frame_never_becomes_the_frozen_frame() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let mut rig = HostRig::new(Some(Arc::clone(&fake)), &frozen(EffectKind::Blur));
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    let last = rig.bytes_with(gst::BufferFlags::empty());
+    assert_eq!(classify(&last, &rig.input_bytes), Seen::FakeBlur);
+    let camera = rig.input_bytes.clone();
+    rig.set_input(shifted_input(60));
+    for _ in 0..3 {
+        assert_eq!(rig.frame_with(gst_obc::PLACEHOLDER_FLAG), Seen::Input);
+    }
+    rig.set_input(camera);
+    fake.set(|c| c.fail_process = Some("fake frame failure".into()));
+    assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), last);
+    assert!(failed(&rig));
+    // A placeholder while failed passes through too, and changes nothing.
+    rig.set_input(shifted_input(60));
+    assert_eq!(rig.frame_with(gst_obc::PLACEHOLDER_FLAG), Seen::Input);
+    rig.set_input(shifted_input(10));
+    assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), last);
+    assert_no_cuda(&rig, &fake);
+    rig.stop();
+}
+
+/// The frozen frame does not outlive the camera shown as it is: once the
+/// effect is turned off (the input) and on again (the input while it
+/// loads), a failure shows black, never the effect frame from before.
+/// A frame frozen under the current request is kept (the failure test
+/// above).
+#[test]
+fn host_the_input_shown_drops_the_frozen_frame() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let settings = frozen(EffectKind::Blur);
+    let mut rig = HostRig::new(Some(Arc::clone(&fake)), &settings);
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    let last = rig.bytes_with(gst::BufferFlags::empty());
+    assert_eq!(classify(&last, &rig.input_bytes), Seen::FakeBlur);
+
+    // Off: the camera.
+    rig.effect
+        .apply(&EffectSettings {
+            fallback: EffectFallback::Freeze,
+            ..EffectSettings::default()
+        })
+        .unwrap();
+    assert_eq!(rig.frame(), Seen::Input);
+    wait_for("no unload", || get(&fake.log.unloads) == 1);
+
+    // On again, a load that fails: the input while it loads (a toggle),
+    // then black: the frame frozen before the camera was shown is gone.
+    fake.set(|c| {
+        c.fail_load = Some("fake load failure".into());
+        c.load_delay = Duration::from_millis(200);
+    });
+    rig.effect.apply(&settings).unwrap();
+    let seen = rig.frames_until(Duration::from_secs(10), failed);
+    assert!(held_then(&seen, Seen::Input, Seen::Black), "{seen:?}");
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::Black);
+    }
     assert_no_cuda(&rig, &fake);
     rig.stop();
 }

@@ -33,7 +33,7 @@
 # change it again. The keys the dialog and `omarchy-broadcast config set`
 # can change are: [camera] fixed_framerate; [output] mode, format, aspect,
 # hold_timeout_s, input_gap_ms and placeholder; [lifecycle] idle_grace_s and
-# start_debounce_ms; [video] memory; [effect] on_failure and fallback_image;
+# start_debounce_ms; [video] memory; [effect] privacy, privacy_mode and fallback_image;
 # [pipewire] enabled and offer_nv12;
 # [mic] enabled, device, pipeline_depth, idle_exit_s, gpu_warm_s and gpu_policy; and in
 # [modules] profile, enabled.<id>, forced.<id> and pin.<stage>. Everything else,
@@ -136,8 +136,9 @@ input_gap_ms = 500
 #           property.
 # It is never shown while a camera picture streams, and not at a toggle of
 # an effect or a stage: the last frame is held through it. Where privacy
-# holds the feed (an effect that hides the camera cannot run), on_failure
-# decides what is shown, not this. Changes at once, with no restart.
+# holds the feed (privacy is on and an effect that hides the camera cannot
+# run), privacy_mode decides what is shown, not this. Changes at once, with
+# no restart.
 # Default: "black"
 placeholder = "black"
 
@@ -190,8 +191,8 @@ memory = "auto"
 # Video effects run on the GPU with the NVIDIA Maxine Video Effects SDK,
 # which is not part of omarchy-broadcast and must be installed separately; see
 # docs/setup/maxine.md. Without it the daemon runs normally, and a requested
-# effect fails as described under on_failure, or, when no effect module
-# provides it at all, is left out as described there.
+# effect fails as described under privacy, or, when no effect module
+# provides it at all, is handled as described there.
 #
 # A choice made at run time (SetEffect, SetBlurStrength, SetBackgroundImage,
 # SetDenoise, `omarchy-broadcast effect ...`, `omarchy-broadcast denoise ...`,
@@ -222,7 +223,7 @@ blur_strength = 0.5
 # of a phone photo, is ignored), scaled with a centre crop to fill the
 # frame. Required when mode = "replace".
 # The file is read when the effect starts; a file that is missing or cannot
-# be decoded then is an effect failure (see on_failure).
+# be decoded then is an effect failure (see privacy).
 # It may also be a video (interface revision 18): an MP4, M4V, MOV, MKV or
 # WebM file holding H.264, HEVC, VP9 or AV1, 8-bit 4:2:0, at most 512 MiB and
 # 3840x2160, played in a loop behind the person (the audio is ignored). A
@@ -242,7 +243,7 @@ blur_strength = 0.5
 # Video noise removal: reduces the grain of a dim or small camera sensor.
 # It runs before the effect, or alone with mode = "none". If it cannot run
 # (the SDK or its noise removal feature is missing), the camera image is
-# shown without it, with the reason in Error, whatever on_failure says.
+# shown without it, with the reason in Error, whatever privacy says.
 # Default: false
 denoise = false
 
@@ -285,39 +286,69 @@ relight_direction = 0
 # Default: 100
 relight_brightness = 100
 
-# What the virtual camera shows when the requested effect cannot run (the
-# SDK is missing, a model or the background image fails to load, a frame
-# fails). The stream never stops for it and the state stays active:
-#   "black" black frames, so the background is never shown, with the
-#           reason in the Warning property. It is retried on the next
-#           control call (e.g. selecting the effect again), configuration
-#           reload, module enabled again or camera start, and the effect
-#           replaces the black frames once it runs. Settings the stream
-#           cannot be built with (replace without a readable image) close
-#           the camera instead, with the reason in Error;
-#   "image" as "black", with the image of fallback_image (below) in place
-#           of the black frames, scaled to fill the frame: while an effect
-#           starts or has failed, and while the virtual camera is held back
-#           for privacy. The camera off, an idle camera and the gaps of a
-#           camera switch stay black, unless [output] placeholder = "image"
-#           shows the away image there too. An image that is not set or
-#           cannot be read shows black, with the reason in the Warning
-#           property. This
-#           option is offered in the setup dialog only while fallback_image
-#           is set;
-#   "none"  the camera image without the effect, with the reason in the
-#           Warning property (in Error before interface revision 11).
-# The reason in Warning is at most 400 bytes; the journal has it whole.
-# This applies to an effect that a module provides. An effect that no module
-# provides (no effect module installed or enabled, its module disabled or
-# disabled after crashing the daemon, or its SDK feature not installed) is
-# left out whatever this says: the camera image is shown with the other
-# stages, the state stays active, the reason is in the Warning property, and
-# the effect applies by itself once a module provides it.
-# Default: "black"
-on_failure = "black"
+# Privacy: whether the virtual camera hides the camera when the requested
+# effect cannot run (the SDK or the module is missing, a model or the
+# background image fails to load, a frame fails, the module is lost while
+# the session runs, or the effect is still loading as the camera starts or
+# a new camera is used). The stream never stops for it and the state stays
+# active.
+#   off  (the default) the camera image is shown as it is, without the
+#        effect, with the reason in the Warning property. A session may
+#        start without its effects, and the effect applies by itself once it
+#        can run. The background is not hidden while the effect is not
+#        running, so leave privacy on if that matters;
+#   on   the camera image is never shown in place of an effect that is to
+#        hide it. What is shown is privacy_mode (below). The effect is
+#        retried on the next control call (e.g. selecting the effect
+#        again), configuration reload, module enabled again or camera start,
+#        and it replaces what is shown once it runs. Settings the stream
+#        cannot be built with (replace without a readable image) close the
+#        camera instead, with the reason in Error.
+# Changes at once, with no restart. It is a switch of the setup dialog
+# ("Hide the camera when an effect can't run") and can be set with
+# `omarchy-broadcast config set effect.privacy true`.
+# This applies to an effect that a module provides, and to one that no
+# module provides (no effect module installed or enabled, its module
+# disabled or disabled after crashing the daemon, or its SDK feature not
+# installed): with privacy on, that is shown as privacy_mode says; with
+# privacy off, the camera image is shown with the other stages, the state
+# stays active, the reason is in the Warning property, and the effect
+# applies by itself once a module provides it.
+# Default: false. The line is left commented out, without a space after the
+# "#": an unset key lets the older on_failure (below) stand for it, and
+# setting it here is deliberate.
+#privacy = false
+#
+# What privacy shows instead of the camera:
+#   "black"  black frames, so the background is never shown;
+#   "away"   the away image, the still image of fallback_image (below),
+#            scaled to fill the frame. An image that is not set or cannot be
+#            read shows black, with the reason in the Warning property. The
+#            setup dialog offers it once an away image is chosen;
+#   "freeze" the last frame the effect produced under the current request,
+#            repeated until the effect runs. With none yet (the camera just
+#            started, the size of the picture changed, or the camera image
+#            was shown before) the away image if one is set, else black.
+#            Where the daemon holds the feed with no session (a start that
+#            privacy refuses) the same: the away image if set, else black.
+# It has no effect while privacy is off; the setup dialog greys it. The
+# camera off, an idle camera, a start before the first frame and the gaps
+# of a camera switch are not privacy: [output] placeholder decides them.
+# Changes at once, with no restart.
+# Default: "black". Commented out like privacy.
+#privacy_mode = "black"
+#
+# The older key on_failure ("black", "image" or "none") is still read:
+# each of privacy and privacy_mode that is not set takes its value from it
+# ("black": privacy on, mode black; "image": on, away; "none": off). A new
+# key set in an earlier file wins over on_failure in a later one. The daemon
+# does not write it any more: it turns an on_failure in its own
+# config.d/50-panel.toml into the new keys, and `omarchy-broadcast config set`
+# takes the new keys only. Prefer the new keys in files you write; this file
+# is never rewritten.
+#on_failure = "black"
 
-# The away image: the still image that on_failure = "image" shows, and that
+# The away image: the still image that privacy_mode = "away" shows, and that
 # [output] placeholder = "image" shows where there is no camera picture. An
 # absolute path to a PNG, JPEG or still WebP file (at most 32 MiB and
 # 8192x8192 pixels, as for background_image), scaled with a centre crop to
@@ -344,7 +375,7 @@ on_failure = "black"
 # so); this key; /opt/nvidia/maxine/videofx when that directory exists
 # (where the maxine-vfx-sdk-local package installs it); else the library
 # search path. A missing directory is found out when an effect starts (see
-# on_failure). The root is taken when the SDK is first loaded, by the first
+# privacy). The root is taken when the SDK is first loaded, by the first
 # effect or noise removal the daemon starts or checks; the SDK then stays
 # loaded, so a different root takes effect only after the daemon is
 # restarted (a reload that changes it says so in the log). Which features of

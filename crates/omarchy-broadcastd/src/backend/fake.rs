@@ -44,6 +44,10 @@ pub enum Shown {
     Black,
     /// The fallback image.
     Image,
+    /// The last frame the effect produced (privacy's `freeze` mode); the
+    /// fake does not tell it from the away image or black that the
+    /// element shows before a first frame.
+    Frozen,
 }
 
 /// A fake camera with any controls ([`World::devices`]): types, menus and
@@ -722,9 +726,9 @@ impl World {
 
     /// What the running session's output shows, as the effect element
     /// decides it (`None` without a session): the camera image for `none`
-    /// and for a failed effect under `on_failure = "none"`, black or the
-    /// fallback image for a failed effect under `black` or `image` and
-    /// while one loads, the effect once it is ready.
+    /// and for a failed effect with privacy off, black, the fallback image
+    /// or the held frame for a failed effect with privacy on (`black`,
+    /// `away`, `freeze`) and while one loads, the effect once it is ready.
     pub fn shown(&self) -> Option<Shown> {
         self.session.as_ref()?;
         let effect = self.effect.as_ref()?;
@@ -734,6 +738,7 @@ impl World {
         let hidden = match effect.on_failure {
             EffectOnFailure::Black => Shown::Black,
             EffectOnFailure::Image => Shown::Image,
+            EffectOnFailure::Freeze => Shown::Frozen,
             EffectOnFailure::None => Shown::Camera,
         };
         Some(match &self.effect_status {

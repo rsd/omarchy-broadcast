@@ -26,8 +26,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::modules::{ModulesConfig, ModulesState, StoredValue, legacy, valid_module_id};
 use crate::{
     AspectPolicy, CameraSelector, ColourRange, DEFAULT_SINK_LABEL, EffectMode, EffectOnFailure,
-    ModeRequest, OutputContract, OutputFormat, OutputPlaceholder, RelightLight, SinkSelector,
-    fmt_size_rate,
+    ModeRequest, OutputContract, OutputFormat, OutputPlaceholder, PrivacyMode, RelightLight,
+    SinkSelector, fmt_size_rate,
 };
 
 /// Config schema version this build reads.
@@ -326,11 +326,37 @@ pub struct EffectConfig {
     /// (100: unchanged).
     #[serde(deserialize_with = "de_relight_brightness")]
     pub relight_brightness: u32,
-    /// What the virtual camera shows when the effect cannot run.
-    #[serde(serialize_with = "ser_display", deserialize_with = "de_from_str")]
-    pub on_failure: EffectOnFailure,
-    /// The still image shown in place of black frames with
-    /// `on_failure = "image"`: an absolute path, empty (`None`) by default.
+    /// The legacy failure policy (`black`, `image` or `none`), read for
+    /// configurations written before `privacy` and `privacy_mode`. It stands
+    /// for each of them that is not set ([`Self::policy`]); the daemon
+    /// replaces it in its managed file and never writes it.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_display",
+        deserialize_with = "de_some_from_str"
+    )]
+    pub on_failure: Option<EffectOnFailure>,
+    /// Hide the camera when a requested effect cannot run (refused,
+    /// failed, its module lost, or still loading at a start). `None` when
+    /// not set: off, unless the legacy `on_failure` says otherwise.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_state_bool"
+    )]
+    pub privacy: Option<bool>,
+    /// What privacy shows in place of the camera: `black`, `away` (the
+    /// away image) or `freeze` (the last frame the effect produced).
+    /// `None` when not set: that of the legacy `on_failure`, else `black`.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_display",
+        deserialize_with = "de_some_from_str"
+    )]
+    pub privacy_mode: Option<PrivacyMode>,
+    /// The away image: the still image shown in place of black frames by
+    /// privacy's `away` mode (and `freeze` before a first frame) and by
+    /// `[output] placeholder = "image"`: an absolute path, empty (`None`)
+    /// by default.
     /// Whether the file can be read is found out when it is shown, not
     /// here; without it, or when it cannot be read, the frames are black.
     #[serde(
@@ -355,6 +381,75 @@ pub struct EffectConfig {
 }
 
 impl EffectConfig {
+    /// The failure policy in force: privacy and its mode each resolved on
+    /// its own ([`Self::privacy_in_force`], [`Self::privacy_mode_in_force`]),
+    /// so that a key set alone keeps the other one's legacy value.
+    pub fn policy(&self) -> EffectOnFailure {
+        EffectOnFailure::of_privacy(self.privacy_in_force(), self.privacy_mode_in_force())
+    }
+
+    /// Whether privacy is on ([`Self::policy`] hides the camera).
+    pub fn privacy_on(&self) -> bool {
+        self.policy().hides()
+    }
+
+    /// The privacy switch in force: `privacy` when set, else that of the
+    /// legacy `on_failure` (`black` and `image` on, `none` off), else off.
+    pub fn privacy_in_force(&self) -> bool {
+        self.privacy
+            .or_else(|| self.on_failure.map(|l| l.privacy_keys().0))
+            .unwrap_or(false)
+    }
+
+    /// The privacy mode in force: `privacy_mode` when set, else that of
+    /// the legacy `on_failure` (`black` black, `image` away; `none` has
+    /// none), else `black`.
+    pub fn privacy_mode_in_force(&self) -> PrivacyMode {
+        self.privacy_mode
+            .or_else(|| self.legacy_privacy_mode())
+            .unwrap_or_default()
+    }
+
+    /// Whether the value in force of `privacy` comes from the legacy
+    /// `on_failure` (`privacy` is not set, the legacy key is).
+    pub fn privacy_from_legacy(&self) -> bool {
+        self.privacy.is_none() && self.on_failure.is_some()
+    }
+
+    /// Whether the value in force of `privacy_mode` comes from the legacy
+    /// `on_failure` (`privacy_mode` is not set, the legacy key is and
+    /// names a mode).
+    pub fn privacy_mode_from_legacy(&self) -> bool {
+        self.privacy_mode.is_none() && self.legacy_privacy_mode().is_some()
+    }
+
+    /// The mode the legacy `on_failure` stands for, when it is set and
+    /// names one.
+    fn legacy_privacy_mode(&self) -> Option<PrivacyMode> {
+        self.on_failure.and_then(|l| l.privacy_keys().1)
+    }
+
+    /// The legacy `on_failure` is set but gives nothing in force: `privacy`
+    /// is set, and so is `privacy_mode` (or the legacy key names no mode).
+    pub fn legacy_on_failure_ignored(&self) -> bool {
+        self.on_failure.is_some() && !self.privacy_from_legacy() && !self.privacy_mode_from_legacy()
+    }
+
+    /// Sets `privacy` and `privacy_mode` to stand for `policy` (`none`:
+    /// privacy off, the mode unset), and clears the legacy `on_failure`.
+    pub fn set_policy(&mut self, policy: EffectOnFailure) {
+        let (on, mode) = policy.privacy_keys();
+        self.privacy = Some(on);
+        self.privacy_mode = mode;
+        self.on_failure = None;
+    }
+
+    /// This configuration with [`Self::set_policy`] applied.
+    pub fn with_policy(mut self, policy: EffectOnFailure) -> Self {
+        self.set_policy(policy);
+        self
+    }
+
     /// The default blur strength.
     pub const DEFAULT_BLUR_STRENGTH: f64 = 0.5;
     /// The default relighting brightness, in percent.
@@ -429,7 +524,9 @@ impl Default for EffectConfig {
             relight_light: RelightLight::Neutral,
             relight_direction: 0,
             relight_brightness: Self::DEFAULT_RELIGHT_BRIGHTNESS,
-            on_failure: EffectOnFailure::Black,
+            on_failure: None,
+            privacy: None,
+            privacy_mode: None,
             fallback_image: None,
             maxine_root: None,
         }
@@ -1226,6 +1323,24 @@ fn de_device<'de, D: Deserializer<'de>>(d: D) -> Result<Option<PathBuf>, D::Erro
     Ok(Some(v))
 }
 
+/// `Some` of a string parsed with [`FromStr`] (an optional key).
+fn de_some_from_str<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    de_from_str(d).map(Some)
+}
+
+/// An optional value by its [`fmt::Display`] (skipped when `None`).
+fn ser_opt_display<S: Serializer, T: fmt::Display>(v: &Option<T>, s: S) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(v) => s.collect_str(v),
+        None => s.serialize_none(),
+    }
+}
+
 /// A string parsed with [`FromStr`]; its error is the message.
 fn de_from_str<'de, D, T>(d: D) -> Result<T, D::Error>
 where
@@ -1845,8 +1960,8 @@ impl RuntimeState {
     }
 
     /// The effect settings in force: each key of `config` overridden by
-    /// this state's value when it has one (`on_failure`, `fallback_image`
-    /// and `maxine_root` are config only).
+    /// this state's value when it has one (`on_failure`, `privacy`,
+    /// `privacy_mode`, `fallback_image` and `maxine_root` are config only).
     pub fn effect_over(&self, config: &EffectConfig) -> EffectConfig {
         EffectConfig {
             mode: self.effect.unwrap_or(config.mode),
@@ -1863,6 +1978,8 @@ impl RuntimeState {
             relight_direction: self.relight_direction.unwrap_or(config.relight_direction),
             relight_brightness: self.relight_brightness.unwrap_or(config.relight_brightness),
             on_failure: config.on_failure,
+            privacy: config.privacy,
+            privacy_mode: config.privacy_mode,
             fallback_image: config.fallback_image.clone(),
             maxine_root: config.maxine_root.clone(),
         }
@@ -2155,7 +2272,8 @@ relight = true
 relight_light = "warm"
 relight_direction = -45
 relight_brightness = 150
-on_failure = "none"
+privacy = true
+privacy_mode = "freeze"
 fallback_image = "/home/u/Pictures/away.png"
 maxine_root = "/home/u/sdk/VideoFX"
 
@@ -2204,7 +2322,9 @@ offer_nv12 = false
                 relight_light: RelightLight::Warm,
                 relight_direction: -45,
                 relight_brightness: 150,
-                on_failure: EffectOnFailure::None,
+                on_failure: None,
+                privacy: Some(true),
+                privacy_mode: Some(PrivacyMode::Freeze),
                 fallback_image: Some("/home/u/Pictures/away.png".into()),
                 maxine_root: Some("/home/u/sdk/VideoFX".into()),
             }
@@ -2315,6 +2435,82 @@ offer_nv12 = false
                 "{key} missing from docs/config.example.toml"
             );
         }
+    }
+
+    #[test]
+    fn privacy_resolves_from_the_new_keys_else_the_legacy_on_failure() {
+        let policy = |text: &str| parse(&format!("[effect]\n{text}")).unwrap().effect;
+        // The legacy key alone: its value.
+        for (legacy, want, mode) in [
+            ("black", EffectOnFailure::Black, PrivacyMode::Black),
+            ("image", EffectOnFailure::Image, PrivacyMode::Away),
+            ("none", EffectOnFailure::None, PrivacyMode::Black),
+        ] {
+            let e = policy(&format!("on_failure = \"{legacy}\"\n"));
+            assert_eq!(e.policy(), want, "{legacy}");
+            assert_eq!(e.privacy_mode_in_force(), mode, "{legacy}");
+            assert!(!e.legacy_on_failure_ignored());
+        }
+        // The new keys.
+        for (text, want) in [
+            ("privacy = false\n", EffectOnFailure::None),
+            ("privacy = true\n", EffectOnFailure::Black),
+            (
+                "privacy = true\nprivacy_mode = \"away\"\n",
+                EffectOnFailure::Image,
+            ),
+            (
+                "privacy = true\nprivacy_mode = \"freeze\"\n",
+                EffectOnFailure::Freeze,
+            ),
+            ("privacy_mode = \"freeze\"\n", EffectOnFailure::None),
+        ] {
+            assert_eq!(policy(text).policy(), want, "{text}");
+        }
+        // Each new key wins over the legacy one for itself; the key not set
+        // keeps the legacy value.
+        let e = policy("on_failure = \"black\"\nprivacy = false\n");
+        assert_eq!(e.policy(), EffectOnFailure::None);
+        assert!(!e.privacy_from_legacy() && e.privacy_mode_from_legacy());
+        assert!(!e.legacy_on_failure_ignored(), "the mode is still its own");
+        let e = policy("on_failure = \"none\"\nprivacy_mode = \"freeze\"\n");
+        assert_eq!(e.policy(), EffectOnFailure::None, "none is privacy off");
+        assert_eq!(e.privacy_mode_in_force(), PrivacyMode::Freeze);
+        assert!(!e.legacy_on_failure_ignored(), "privacy is still its own");
+        // Legacy black and a mode of the panel: privacy stays on, with the
+        // mode chosen (and so after privacy alone is reset).
+        let e = policy("on_failure = \"black\"\nprivacy_mode = \"freeze\"\n");
+        assert_eq!(e.policy(), EffectOnFailure::Freeze);
+        assert!(e.privacy_from_legacy() && !e.privacy_mode_from_legacy());
+        let e = policy("on_failure = \"black\"\nprivacy_mode = \"away\"\n");
+        assert_eq!(e.policy(), EffectOnFailure::Image);
+        // Legacy image and privacy on: the away image stays the mode.
+        let e = policy("on_failure = \"image\"\nprivacy = true\n");
+        assert_eq!(e.policy(), EffectOnFailure::Image);
+        assert_eq!(e.privacy_mode_in_force(), PrivacyMode::Away);
+        // Wholly ignored: both new keys set, or privacy set over `none`
+        // (which names no mode).
+        let e = policy("on_failure = \"image\"\nprivacy = true\nprivacy_mode = \"black\"\n");
+        assert_eq!(e.policy(), EffectOnFailure::Black);
+        assert!(e.legacy_on_failure_ignored());
+        let e = policy("on_failure = \"none\"\nprivacy = true\n");
+        assert_eq!(e.policy(), EffectOnFailure::Black);
+        assert!(e.legacy_on_failure_ignored());
+        // Set in code: the new keys, the legacy one cleared.
+        let e = policy("on_failure = \"image\"\n").with_policy(EffectOnFailure::Freeze);
+        assert_eq!(
+            (e.on_failure, e.privacy, e.privacy_mode),
+            (None, Some(true), Some(PrivacyMode::Freeze))
+        );
+        let e = e.with_policy(EffectOnFailure::None);
+        assert_eq!((e.privacy, e.privacy_mode), (Some(false), None));
+        // Round trip: only the keys that are set are written.
+        let c = parse("[effect]\nprivacy = true\nprivacy_mode = \"away\"\n").unwrap();
+        let text = c.to_toml();
+        assert!(text.contains("privacy = true") && text.contains("privacy_mode = \"away\""));
+        assert!(!text.contains("on_failure"), "{text}");
+        assert_eq!(parse(&text).unwrap(), c);
+        assert!(!Config::default().to_toml().contains("privacy"));
     }
 
     #[test]
@@ -2557,6 +2753,21 @@ offer_nv12 = false
                 "[effect]\non_failure = \"raw\"",
                 "effect.on_failure",
                 "unsupported effect failure policy",
+            ),
+            (
+                "[effect]\non_failure = \"freeze\"",
+                "effect.on_failure",
+                "unsupported effect failure policy",
+            ),
+            (
+                "[effect]\nprivacy_mode = \"image\"",
+                "effect.privacy_mode",
+                "unsupported privacy mode",
+            ),
+            (
+                "[effect]\nprivacy = \"on\"",
+                "effect.privacy",
+                "invalid type",
             ),
             (
                 "[output]\nplaceholder = \"none\"",
@@ -2940,7 +3151,13 @@ offer_nv12 = false
         assert_eq!(c.effect.relight_light, RelightLight::Neutral);
         assert_eq!(c.effect.relight_direction, 0);
         assert_eq!(c.effect.relight_brightness, 100);
-        assert_eq!(c.effect.on_failure, EffectOnFailure::Black);
+        // Privacy is off by default: the camera shows when an effect
+        // cannot run.
+        assert_eq!(c.effect.on_failure, None);
+        assert_eq!((c.effect.privacy, c.effect.privacy_mode), (None, None));
+        assert_eq!(c.effect.policy(), EffectOnFailure::None);
+        assert!(!c.effect.privacy_on());
+        assert_eq!(c.effect.privacy_mode_in_force(), PrivacyMode::Black);
         assert_eq!(c.effect.fallback_image, None);
         // The placeholder is black by default; `image` needs no image
         // either (black, and a `Warning`, without one).
@@ -2952,7 +3169,7 @@ offer_nv12 = false
         // says so in `Warning`). An empty path is none, as for the
         // background.
         let c = parse("[effect]\non_failure = \"image\"\nfallback_image = \"\"\n").unwrap();
-        assert_eq!(c.effect.on_failure, EffectOnFailure::Image);
+        assert_eq!(c.effect.policy(), EffectOnFailure::Image);
         assert_eq!(c.effect.fallback_image, None);
         assert!(!c.to_toml().contains("fallback_image"));
         let c = parse("[effect]\non_failure = \"image\"\nfallback_image = \"/nowhere/x.png\"\n")
@@ -3678,7 +3895,9 @@ reset_all = false
             relight_light: RelightLight::Cool,
             relight_direction: 30,
             relight_brightness: 80,
-            on_failure: EffectOnFailure::Image,
+            on_failure: None,
+            privacy: Some(true),
+            privacy_mode: Some(PrivacyMode::Away),
             fallback_image: Some("/cfg/away.png".into()),
             maxine_root: Some("/cfg/sdk".into()),
         };
@@ -3710,7 +3929,9 @@ reset_all = false
                 relight_light: RelightLight::Warm,
                 relight_direction: -90,
                 relight_brightness: 200,
-                on_failure: EffectOnFailure::Image,
+                on_failure: None,
+                privacy: Some(true),
+                privacy_mode: Some(PrivacyMode::Away),
                 fallback_image: Some("/cfg/away.png".into()),
                 maxine_root: Some("/cfg/sdk".into()),
             }

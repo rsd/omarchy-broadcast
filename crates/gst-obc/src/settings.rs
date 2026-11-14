@@ -17,7 +17,10 @@ pub enum EffectFallback {
     /// closed).
     #[default]
     Black,
-    /// The input, unprocessed: the user opted into showing the raw image.
+    /// The input, unprocessed: the user opted into showing the raw image,
+    /// after a failure and whenever the effect cannot run yet (while it
+    /// loads, at a start and on a new source as well): no frame is ever
+    /// black for the effect's sake.
     None,
     /// As [`EffectFallback::Black`], with the still image of
     /// [`EffectSettings::fallback_image`] (cropped to fill the frame) in
@@ -25,6 +28,15 @@ pub enum EffectFallback {
     /// decoded, and when it cannot be read (reported in
     /// [`EffectStats::fallback_error`]).
     Image,
+    /// The last frame the effect processed, sent again with the current
+    /// timestamps in place of every black frame, until the effect produces
+    /// a frame again or is turned off. With no such frame yet (at the start,
+    /// after new caps), as [`EffectFallback::Image`]. The held frame
+    /// survives a failure, a reload and a new source of the same caps; it is
+    /// dropped on new caps, when the element stops, and by any frame that
+    /// shows the camera unprocessed (the effect off, or turned on
+    /// mid-stream while it loads).
+    Freeze,
 }
 
 impl EffectFallback {
@@ -34,12 +46,17 @@ impl EffectFallback {
             EffectFallback::Black => "black",
             EffectFallback::None => "none",
             EffectFallback::Image => "image",
+            EffectFallback::Freeze => "freeze",
         }
     }
 
-    /// Whether the input stays hidden after a failure: `black` and `image`.
+    /// Whether the input stays hidden after a failure: `black`, `image` and
+    /// `freeze`.
     pub fn hides(self) -> bool {
-        matches!(self, EffectFallback::Black | EffectFallback::Image)
+        matches!(
+            self,
+            EffectFallback::Black | EffectFallback::Image | EffectFallback::Freeze
+        )
     }
 }
 
@@ -51,13 +68,16 @@ impl fmt::Display for EffectFallback {
 
 impl FromStr for EffectFallback {
     type Err = String;
-    /// Parses `black`, `none` or `image`, ignoring ASCII case.
+    /// Parses `black`, `none`, `image` or `freeze`, ignoring ASCII case.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "black" => Ok(EffectFallback::Black),
             "none" => Ok(EffectFallback::None),
             "image" => Ok(EffectFallback::Image),
-            _ => Err(format!("unknown on-failure value {s:?} (black|image|none)")),
+            "freeze" => Ok(EffectFallback::Freeze),
+            _ => Err(format!(
+                "unknown on-failure value {s:?} (black|image|freeze|none)"
+            )),
         }
     }
 }
@@ -138,7 +158,8 @@ pub struct EffectSettings {
     pub background: Option<PathBuf>,
     /// The output after a failure (`on-failure`).
     pub fallback: EffectFallback,
-    /// The still image of [`EffectFallback::Image`] (`fallback-image`): an
+    /// The still image of [`EffectFallback::Image`] (`fallback-image`), also
+    /// shown by [`EffectFallback::Freeze`] while it has no frame: an
     /// absolute path. Read when it is first shown, never loaded with the
     /// effect.
     pub fallback_image: Option<PathBuf>,
@@ -498,7 +519,8 @@ pub struct EffectStats {
     /// Frames the backend processed.
     pub frames_processed: u64,
     /// Black frames output (warm-up, or a failure with `on-failure=black`),
-    /// or with `on-failure=image` the fallback image in their place.
+    /// or with `on-failure=image` the fallback image in their place, or
+    /// with `on-failure=freeze` the frozen frame (or the image) there.
     pub frames_black: u64,
     /// Frames passed through untouched (`none`, or a failure with
     /// `on-failure=none`), and input frames copied unprocessed into an
@@ -521,8 +543,9 @@ pub struct EffectStats {
     /// and a context reference): false until an effect is first requested
     /// on a running stream, and again after the element stops.
     pub cuda_active: bool,
-    /// With `on-failure=image`: why the fallback image cannot be shown
-    /// (black is, in its place), as [`fallback_unreadable`] words it.
+    /// With `on-failure=image` (and `freeze`, where it shows the image): why
+    /// the fallback image cannot be shown (black is, in its place), as
+    /// [`fallback_unreadable`] words it.
     /// `None` while it can (or has not been tried yet), and with any other
     /// fallback.
     pub fallback_error: Option<String>,
@@ -597,7 +620,8 @@ pub(crate) enum FrameAction {
     #[default]
     Passthrough,
     /// A black frame in a new output buffer (with `on-failure=image`, the
-    /// fallback image when it is ready).
+    /// fallback image when it is ready; with `on-failure=freeze`, the
+    /// frozen frame, else the image when it is ready).
     Black,
     /// The loaded effect into a new output buffer (black if, by the time
     /// the backend is locked, nothing is loaded any more).
@@ -607,9 +631,10 @@ pub(crate) enum FrameAction {
 /// The decision of the privacy rules (ADR-0012): the raw input is shown only
 /// for `none`, or after a failure with `on-failure=none` (and, through
 /// [`decide_frame`], while an effect turned on mid-stream loads with the
-/// room already on screen); an effect that is not loaded yet shows black
-/// (`image` is `black` here: the frame is then filled with the fallback
-/// image); a loaded effect (the requested one, or the previous one while the
+/// room already on screen, and with `on-failure=none` while any effect
+/// loads); an effect that is not loaded yet shows black
+/// (`image` and `freeze` are `black` here: the frame is then filled with the
+/// fallback image, or the frozen frame); a loaded effect (the requested one, or the previous one while the
 /// requested one loads) processes the frame.
 ///
 /// `loaded` says a chain usable for the request is loaded: for blur and
@@ -633,10 +658,8 @@ pub(crate) fn decide(
         };
     }
     match (status, fallback) {
-        (EffectStatus::Failed(_), EffectFallback::Black | EffectFallback::Image) => {
-            FrameAction::Black
-        }
-        (EffectStatus::Failed(_), EffectFallback::None) => FrameAction::Passthrough,
+        (EffectStatus::Failed(_), f) if f.hides() => FrameAction::Black,
+        (EffectStatus::Failed(_), _) => FrameAction::Passthrough,
         _ if loaded => FrameAction::Process,
         _ => FrameAction::Black,
     }
@@ -647,7 +670,10 @@ pub(crate) fn decide(
 ///
 /// A requested effect (blur or replace) that is not loaded and has not
 /// failed holds black (or the fallback image) only when the room is not on
-/// screen already. `raw_on_screen` says the last frame output was the
+/// screen already, and only under a fallback that hides
+/// ([`EffectFallback::hides`]): with `on-failure=none` it is never held,
+/// so a start and a new source show the input while the effect loads, as
+/// a failure does. `raw_on_screen` says the last frame output was the
 /// unprocessed picture: the input passed through, or processed by the
 /// stages alone (they hide nothing). Then a black hold would protect
 /// nothing, so the frame gets what `none` with the same stages would: the
@@ -658,9 +684,9 @@ pub(crate) fn decide(
 ///
 /// `raw_on_screen` is false at a start (the first frames of the element)
 /// and on a new source, and after any frame that went out black or
-/// processed by an effect, so the hold stays for a start, a new camera,
-/// and once the effect has been shown; a failure takes `on-failure` as
-/// before.
+/// processed by an effect, so under a hiding fallback the hold stays for a
+/// start, a new camera, and once the effect has been shown; a failure
+/// takes `on-failure` as before.
 pub(crate) fn decide_frame(
     kind: EffectKind,
     status: &EffectStatus,
@@ -672,7 +698,7 @@ pub(crate) fn decide_frame(
 ) -> (EffectKind, FrameAction) {
     let toggle = kind != EffectKind::None
         && !loaded
-        && raw_on_screen
+        && (raw_on_screen || !fallback.hides())
         && !matches!(status, EffectStatus::Failed(_));
     if toggle {
         let none = EffectKind::None;
@@ -844,12 +870,25 @@ mod tests {
             "raw"
                 .parse::<EffectFallback>()
                 .unwrap_err()
-                .contains("black|image|none")
+                .contains("black|image|freeze|none")
         );
         assert_eq!(EffectFallback::default().to_string(), "black");
+        // The element's default fails closed; the element tests that build
+        // settings with `EffectSettings::of` rely on it to hide the input
+        // (the daemon chooses its own policy and sets it explicitly).
+        assert_eq!(
+            EffectSettings::of(EffectKind::Blur).fallback,
+            EffectFallback::Black
+        );
         assert_eq!("Image".parse::<EffectFallback>(), Ok(EffectFallback::Image));
         assert_eq!(EffectFallback::Image.to_string(), "image");
         assert!(EffectFallback::Image.hides() && !EffectFallback::None.hides());
+        assert_eq!(
+            "FREEZE".parse::<EffectFallback>(),
+            Ok(EffectFallback::Freeze)
+        );
+        assert_eq!(EffectFallback::Freeze.to_string(), "freeze");
+        assert!(EffectFallback::Freeze.hides() && EffectFallback::Black.hides());
         let s = EffectSettings {
             fallback_image: Some("away.png".into()),
             ..EffectSettings::default()
@@ -1056,6 +1095,7 @@ mod tests {
             for fb in [
                 EffectFallback::Black,
                 EffectFallback::Image,
+                EffectFallback::Freeze,
                 EffectFallback::None,
             ] {
                 for loaded in [false, true] {
@@ -1093,12 +1133,15 @@ mod tests {
         );
         assert_eq!(decide(Blur, &EffectStatus::Ready, fb, true, false), Process);
         assert_eq!(decide(Blur, &failed, fb, true, false), Black);
-        // `image` is decided as `black` (the frame gets the image).
+        // `image` and `freeze` are decided as `black` (the frame gets the
+        // image, or the frozen frame).
         for status in [&EffectStatus::Loading, &failed] {
-            assert_eq!(
-                decide(Replace, status, EffectFallback::Image, false, false),
-                Black
-            );
+            for fb in [EffectFallback::Image, EffectFallback::Freeze] {
+                assert_eq!(decide(Replace, status, fb, false, false), Black);
+                assert_eq!(decide(Blur, status, fb, true, false), {
+                    if *status == failed { Black } else { Process }
+                });
+            }
         }
         assert_eq!(
             decide(Blur, &failed, EffectFallback::None, true, false),
@@ -1119,6 +1162,7 @@ mod tests {
             for fb in [
                 EffectFallback::Black,
                 EffectFallback::Image,
+                EffectFallback::Freeze,
                 EffectFallback::None,
             ] {
                 // Loading (or reloading): the input, never black.
@@ -1139,6 +1183,7 @@ mod tests {
         let fallbacks = [
             EffectFallback::Black,
             EffectFallback::Image,
+            EffectFallback::Freeze,
             EffectFallback::None,
         ];
         for kind in [Blur, Replace] {
@@ -1159,12 +1204,20 @@ mod tests {
                     // The stages not loaded (or the instance mid-load).
                     assert_eq!(at(false, true, true), (None, Passthrough));
                     // A start, a new source, or an effect (or black) already
-                    // shown: the hold, black or the image.
+                    // shown: the hold, black or the image; with
+                    // on-failure=none never a hold, what `none` gives.
                     for any_loaded in [false, true] {
                         for stages in [false, true] {
+                            let want = if fb.hides() {
+                                (kind, Black)
+                            } else if any_loaded && stages {
+                                (None, Process)
+                            } else {
+                                (None, Passthrough)
+                            };
                             assert_eq!(
                                 at(any_loaded, stages, false),
-                                (kind, Black),
+                                want,
                                 "{kind} {status} {fb} {any_loaded} {stages}"
                             );
                         }
@@ -1250,6 +1303,17 @@ mod tests {
             raw,
         );
         assert_eq!(action, FrameAction::Black);
+        // With on-failure=none the new source is the input while it loads.
+        let none = decide_frame(
+            EffectKind::Blur,
+            &EffectStatus::Loading,
+            EffectFallback::None,
+            false,
+            false,
+            false,
+            raw,
+        );
+        assert_eq!(none, (EffectKind::None, FrameAction::Passthrough));
     }
 
     #[test]
@@ -1273,8 +1337,17 @@ mod tests {
     /// never the input.
     #[test]
     fn once_the_effect_or_black_is_shown_an_unloaded_effect_never_gives_the_input() {
+        for fb in [
+            EffectFallback::Black,
+            EffectFallback::Image,
+            EffectFallback::Freeze,
+        ] {
+            never_the_input_once_hidden(fb);
+        }
+    }
+
+    fn never_the_input_once_hidden(fb: EffectFallback) {
         use FrameAction::*;
-        let fb = EffectFallback::Black;
         let blur = EffectKind::Blur;
         let loading = EffectStatus::Loading;
         let mut raw = raw_on_screen_after(false, ScreenEvent::Output(FrameOutput::Input));
@@ -1298,6 +1371,32 @@ mod tests {
             assert_eq!(step(false), Black);
         }
         assert_eq!(step(true), Process);
+    }
+
+    /// With `on-failure=none` (privacy off) an effect that cannot run is
+    /// never black: at a start, on a new source, after the effect was
+    /// shown, and once it failed, the frame is what `none` gives.
+    #[test]
+    fn with_on_failure_none_an_unloaded_effect_is_never_black() {
+        let fb = EffectFallback::None;
+        let failed = EffectStatus::Failed("x".into());
+        for kind in [EffectKind::Blur, EffectKind::Replace] {
+            for status in [EffectStatus::Loading, EffectStatus::Ready, failed.clone()] {
+                for any_loaded in [false, true] {
+                    for stages in [false, true] {
+                        for raw in [false, true] {
+                            let (_, action) =
+                                decide_frame(kind, &status, fb, false, any_loaded, stages, raw);
+                            assert_ne!(
+                                action,
+                                FrameAction::Black,
+                                "{kind} {status} {any_loaded} {stages} {raw}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

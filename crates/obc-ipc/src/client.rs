@@ -389,8 +389,8 @@ pub trait OmarchyBroadcast {
     /// What runs other than the user asked, without being an error, empty
     /// if nothing: the selected stages no module provides (the feed
     /// streams without them), and an effect a module provides that cannot
-    /// run (the feed black with `on_failure = "black"`, the camera image
-    /// with `"none"`). One line of
+    /// run (the feed black, the away image or the last frame with
+    /// `effect.privacy` on, the camera image with it off). One line of
     /// clauses joined by `; `, for people, not to be parsed. Revision 11.
     #[zbus(property)]
     fn warning(&self) -> zbus::Result<String>;

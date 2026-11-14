@@ -104,8 +104,8 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// the `Warning` property: a selected stage that no module provides is
 /// dropped, the feed keeps streaming without it, and `Warning` says so;
 /// an effect a module provides that cannot load or run no longer stops
-/// the feed (with `on_failure = "black"` its frames are black, with
-/// `"none"` the camera image shows) and `Warning` says why. Neither is
+/// the feed (with privacy on its frames are black, with it off the
+/// camera image shows) and `Warning` says why. Neither is
 /// `Error` and the `error` state any more. Revision 12 added the capture
 /// and output modes, with no new member: the camera setting
 /// `camera.capture.mode` (group `capture`, first: `auto` or a `WxH@FPS`
@@ -146,8 +146,21 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// its model) and `ApplyRecommendedSettings`; the rate in the label of the
 /// capture mode in use reads `<delivered> of <nominal> fps` once the camera
 /// is measured below [`DELIVERS_SHORT_RATIO`] of its rate
-/// ([`CAMERA_HEALTH_REVISION`]).
-pub const INTERFACE_REVISION: u32 = 20;
+/// ([`CAMERA_HEALTH_REVISION`]). Revision 21 made privacy an option,
+/// off by default, with no new member ([`PRIVACY_REVISION`]).
+pub const INTERFACE_REVISION: u32 = 21;
+/// The first [`INTERFACE_REVISION`] with privacy as an option, and no new
+/// member: the config rows `effect.privacy` (a `bool`, off by default:
+/// the camera shows as it is when a requested effect cannot run) and
+/// `effect.privacy_mode` (`black`, `away` or `freeze`: what shows instead
+/// while privacy is on; not enabled while it is off, with a reason that
+/// says to turn it on) replace the row `effect.on_failure`. A `SetConfig` of
+/// `effect.on_failure` (`black`, `image`, `none`) is still accepted and
+/// written as the two keys; a `ResetConfig` of it resets both. The
+/// `Warning` clause of the away image privacy cannot show reads
+/// `effect.privacy_mode is "away" but effect.fallback_image is not set:
+/// showing black`, and privacy off is named `effect.privacy is off`.
+pub const PRIVACY_REVISION: u32 = 21;
 /// The first [`INTERFACE_REVISION`] with the `StageValues` property.
 pub const STAGE_VALUES_REVISION: u32 = 16;
 /// The first [`INTERFACE_REVISION`] with the away image, and no new member:
@@ -1356,7 +1369,8 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, CAMERA_HEALTH_REVISION);
+        assert_eq!(INTERFACE_REVISION, PRIVACY_REVISION);
+        const { assert!(CAMERA_HEALTH_REVISION < PRIVACY_REVISION) };
         const { assert!(CPU_CONVERT_REVISION < CAMERA_HEALTH_REVISION) };
         const { assert!(VIDEO_BACKGROUND_REVISION < CPU_CONVERT_REVISION) };
         const { assert!(PLACEHOLDER_REVISION < VIDEO_BACKGROUND_REVISION) };
