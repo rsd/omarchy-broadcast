@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use obc_core::battery_saver::{PowerProfile, PowerSource};
 use obc_core::config::VideoMemory;
 use obc_core::{
     AspectPolicy, EffectMode, EffectOnFailure, ModeRequest, OutputContract, SinkSelector,
@@ -295,6 +296,11 @@ pub struct EffectReport {
     pub reused: bool,
     /// Median GPU time of one processed frame, in milliseconds.
     pub gpu_ms_p50: Option<f64>,
+    /// Privacy's `freeze` holds a frozen frame (the last output the effect
+    /// processed), which a failure of the effect shows
+    /// ([`gst_obc::EffectStats::freeze_held`]): false before the effect
+    /// produced a frame in the session, and once the frame is dropped.
+    pub freeze_held: bool,
     /// With `on_failure = "image"`: why the effect element cannot show the
     /// fallback image (it shows black in its place), as
     /// [`obc_pipeline::effect::fallback_unreadable`] words it.
@@ -730,6 +736,22 @@ pub trait MediaBackend: Send + 'static {
     /// without `cuInit`, and GStreamer's registry. It makes no CUDA call and
     /// loads no plugin, so it may run at idle and while the GPU is parked.
     fn cuda_unusable(&mut self) -> Option<String>;
+
+    /// What the machine's power supplies show, for the battery saver
+    /// ([`crate::power::power_source`]): a sysfs read, cheap and at any
+    /// time.
+    fn power_source(&mut self) -> PowerSource;
+
+    /// power-profiles-daemon's active profile, for the battery saver, as
+    /// last read off the system bus by its watcher
+    /// ([`crate::power::ProfileCache`]): never waits on D-Bus.
+    fn power_profile(&mut self) -> PowerProfile;
+
+    /// Whether power-profiles-daemon's profile is followed (the battery
+    /// saver's mode is `power_profile`): its watcher runs only then
+    /// ([`crate::power::ProfileCache::follow`]). Cheap, called at each read
+    /// of the power state.
+    fn follow_power_profile(&mut self, on: bool);
 
     /// Opens `camera`'s node for its controls (for writing as well when
     /// `write`): one open for the whole operation, its enumerations,

@@ -1149,4 +1149,4 @@ pub async fn run_owner_watch(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

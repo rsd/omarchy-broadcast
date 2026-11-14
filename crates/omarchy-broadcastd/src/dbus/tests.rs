@@ -48,14 +48,23 @@ struct Rig {
 
 /// A private `dbus-daemon` on a socket in a short temporary directory,
 /// killed when dropped.
-struct PrivateBus {
-    address: String,
+pub(crate) struct PrivateBus {
+    pub(crate) address: String,
     child: std::process::Child,
     _sockets: TempDir,
 }
 
 impl PrivateBus {
     fn start(dir: &std::path::Path) -> PrivateBus {
+        PrivateBus::start_with_services(dir, None)
+    }
+
+    /// A private bus whose activatable services are the `.service` files
+    /// of `services` (none without it).
+    pub(crate) fn start_with_services(
+        dir: &std::path::Path,
+        services: Option<&std::path::Path>,
+    ) -> PrivateBus {
         use std::io::BufRead;
         const DBUS_DAEMON: &str = "/usr/bin/dbus-daemon";
         assert!(
@@ -86,14 +95,18 @@ impl PrivateBus {
   <type>session</type>
   <listen>unix:dir={}</listen>
   <auth>EXTERNAL</auth>
-  <policy context="default">
+{}  <policy context="default">
     <allow send_destination="*" eavesdrop="true"/>
     <allow eavesdrop="true"/>
     <allow own="*"/>
   </policy>
 </busconfig>
 "#,
-                sockets.path().display()
+                sockets.path().display(),
+                services.map_or(String::new(), |d| format!(
+                    "  <servicedir>{}</servicedir>\n",
+                    d.display()
+                )),
             ),
         )
         .unwrap();
@@ -117,7 +130,7 @@ impl PrivateBus {
         }
     }
 
-    async fn connect(&self) -> Connection {
+    pub(crate) async fn connect(&self) -> Connection {
         connection::Builder::address(self.address.as_str())
             .build()
             .await
@@ -451,8 +464,9 @@ async fn every_property_reads_through_the_proxy() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 21);
-    assert_eq!(INTERFACE_REVISION, obc_ipc::PRIVACY_REVISION);
+    assert_eq!(INTERFACE_REVISION, 22);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::BATTERY_SAVER_REVISION);
+    assert_eq!(obc_ipc::PRIVACY_REVISION, 21);
     assert_eq!(obc_ipc::CAMERA_HEALTH_REVISION, 20);
     assert_eq!(obc_ipc::CPU_CONVERT_REVISION, 19);
     assert_eq!(obc_ipc::VIDEO_BACKGROUND_REVISION, 18);
@@ -963,7 +977,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 21);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 22);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -1152,7 +1166,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 21);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 22);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -1268,7 +1282,7 @@ async fn preview_leases_by_bus_name_their_property_and_their_frames() {
     let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 21);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 22);
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
     let seen = rig.record_changes().await;
     let mut frames = proxy.receive_preview_frame().await.unwrap();

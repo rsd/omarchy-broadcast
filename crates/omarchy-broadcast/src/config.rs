@@ -153,7 +153,8 @@ fn unit_of(kind: &ConfigKind) -> Option<&str> {
     }
 }
 
-/// One row: `  <id> = <value> [unit]  (<label>; <where>[; read only][; applies ...])`.
+/// One row: `  <id> = <value> [unit]  (<label>; <where>[; read only][; applies
+/// ...])`; a row's notice is printed in place of its `applies ...`.
 pub fn row_text(r: &ConfigRow) -> String {
     let mut value = printable(&value_text(&r.value)).into_owned();
     if value.is_empty() {
@@ -175,7 +176,10 @@ pub fn row_text(r: &ConfigRow) -> String {
     } else if !r.enabled && !r.disabled_reason.is_empty() {
         notes.push(printable(&r.disabled_reason).into_owned());
     }
-    if r.editable {
+    if !r.notice.is_empty() {
+        // It says when the change applies, for this row now.
+        notes.push(printable(&r.notice).into_owned());
+    } else if r.editable {
         notes.push(
             match r.apply.as_str() {
                 obc_ipc::config::APPLY_LIVE => "applies at once",
@@ -302,6 +306,7 @@ struct RowJson<'a> {
     apply: Cow<'a, str>,
     enabled: bool,
     disabled_reason: Cow<'a, str>,
+    notice: Cow<'a, str>,
 }
 
 impl<'a> RowJson<'a> {
@@ -352,6 +357,7 @@ impl<'a> RowJson<'a> {
             apply: clip(&r.apply, MAX_GROUP_ID_BYTES),
             enabled: r.enabled,
             disabled_reason: clip(&r.disabled_reason, MAX_DESCRIPTION_BYTES),
+            notice: clip(&r.notice, MAX_DESCRIPTION_BYTES),
         }
     }
 }
@@ -659,6 +665,7 @@ mod tests {
             apply: "reload".into(),
             enabled: true,
             disabled_reason: String::new(),
+            notice: String::new(),
         }
     }
 
@@ -720,6 +727,15 @@ mod tests {
         r.editable = false;
         r.overridden_by.clear();
         assert!(row_text(&r).contains("; read only)"));
+        // A notice comes last, in place of when the change applies.
+        r.editable = true;
+        r.notice = "Applies when the camera restarts".into();
+        let text = row_text(&r);
+        assert!(
+            text.ends_with("; Applies when the camera restarts)\n"),
+            "{text}"
+        );
+        assert!(!text.contains("applies at"), "{text}");
     }
 
     #[test]

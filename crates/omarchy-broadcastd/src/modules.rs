@@ -55,7 +55,9 @@ use std::path::{Path, PathBuf};
 
 use obc_core::config::{Config, EffectiveMemory, MemoryChoice, RuntimeState, VideoMemory};
 use obc_core::modules::{BackendProfile, StoredValue};
-use obc_module_host::registry::{FRAME_GENERATION, Profile, REASON_CUDA_OFF, REASON_NEEDS_CUDA};
+use obc_module_host::registry::{
+    FRAME_GENERATION, Profile, REASON_BATTERY_SAVER, REASON_CUDA_OFF, REASON_NEEDS_CUDA,
+};
 use obc_module_host::settings::{Apply, Role};
 use obc_module_host::{
     CrashLedger, ModuleStatus, Registry, SettingDesc, SettingType, SettingsDescription, Slot,
@@ -189,11 +191,14 @@ pub enum HostMemory {
 impl HostMemory {
     /// The modules' view of the effective memory `m`: in system memory,
     /// the reason is [`REASON_CUDA_OFF`] when the configuration chose it,
-    /// else [`REASON_NEEDS_CUDA`] (`auto` found no usable CUDA).
+    /// [`REASON_BATTERY_SAVER`] when the battery saver did (`auto`, CUDA
+    /// usable), else [`REASON_NEEDS_CUDA`] (`auto` found no usable CUDA,
+    /// or a CUDA start failed).
     pub fn of(m: &EffectiveMemory) -> HostMemory {
         match (m.memory, m.choice) {
             (VideoMemory::Cuda, _) => HostMemory::Cuda,
             (VideoMemory::System, MemoryChoice::System) => HostMemory::System(REASON_CUDA_OFF),
+            (VideoMemory::System, _) if m.battery_saver => HostMemory::System(REASON_BATTERY_SAVER),
             (VideoMemory::System, _) => HostMemory::System(REASON_NEEDS_CUDA),
         }
     }
@@ -2021,9 +2026,12 @@ mod tests {
 
     #[test]
     fn the_host_key_says_cuda_is_off_only_in_system_memory() {
-        use obc_core::config::{Config, MemoryChoice, resolve_memory};
+        use obc_core::battery_saver::{BatterySaver, PowerProfile, PowerSource, saver_state};
+        use obc_core::config::{Config, MemoryChoice, resolve_memory, resolve_memory_saving};
 
-        use super::{HostMemory, REASON_CUDA_OFF, REASON_NEEDS_CUDA, module_config};
+        use super::{
+            HostMemory, REASON_BATTERY_SAVER, REASON_CUDA_OFF, REASON_NEEDS_CUDA, module_config,
+        };
         let config = Config::default();
         let cuda = module_config(&config, "org.example.m", Some((8, 9)), false);
         assert_eq!(
@@ -2047,6 +2055,32 @@ mod tests {
         assert_eq!(
             of(MemoryChoice::System, None),
             HostMemory::System(REASON_CUDA_OFF)
+        );
+        // The battery saver: its own reason, CUDA off for the modules.
+        let saver = saver_state(
+            BatterySaver::Always,
+            &PowerSource::External,
+            &PowerProfile::Unavailable,
+        );
+        let saving = HostMemory::of(&resolve_memory_saving(
+            MemoryChoice::Auto,
+            None,
+            Some(&saver),
+        ));
+        assert_eq!(saving, HostMemory::System(REASON_BATTERY_SAVER));
+        assert!(saving.cuda_off());
+        assert_eq!(
+            REASON_BATTERY_SAVER,
+            "Needs CUDA; battery saver runs the video pipeline in system memory"
+        );
+        // Without usable CUDA the probe's reason stands.
+        assert_eq!(
+            HostMemory::of(&resolve_memory_saving(
+                MemoryChoice::Auto,
+                Some("no NVIDIA driver is loaded"),
+                Some(&saver),
+            )),
+            HostMemory::System(REASON_NEEDS_CUDA)
         );
         assert!(!HostMemory::Cuda.cuda_off());
         assert!(HostMemory::System(REASON_CUDA_OFF).cuda_off());

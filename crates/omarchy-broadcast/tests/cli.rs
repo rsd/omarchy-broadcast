@@ -2045,6 +2045,7 @@ fn config_row(
         apply: "reload".into(),
         enabled: true,
         disabled_reason: String::new(),
+        notice: String::new(),
     }
 }
 
@@ -6553,7 +6554,7 @@ fn config_shows_gets_sets_resets_and_lists_the_files() {
                 "description": "Help for lifecycle.idle_grace_s", "type": "int",
                 "value": 5, "default": 5, "min": 0, "max": 3600, "step": 1, "unit": "s",
                 "editable": true, "source": "config.toml", "overridden_by": "",
-                "apply": "live", "enabled": true, "disabled_reason": ""
+                "apply": "live", "enabled": true, "disabled_reason": "", "notice": ""
             })
         );
         let modules = &lines[2]["group"]["settings"];

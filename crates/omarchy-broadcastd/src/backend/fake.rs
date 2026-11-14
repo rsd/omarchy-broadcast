@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use obc_core::battery_saver::{PowerProfile, PowerSource};
 use obc_core::config::VideoMemory;
 use obc_core::{EffectMode, EffectOnFailure, ModeRequest, OutputContract, SinkSelector, VideoMode};
 use obc_gpu::{GpuError, NothingToPark, ParkError, ParkOutcome, UnparkOutcome};
@@ -289,6 +290,19 @@ pub struct World {
     pub cuda_unusable: Option<String>,
     /// The CUDA presence probes made.
     pub cuda_probes: u32,
+    /// What the power supplies show (`power_source`): AC power by default.
+    pub power_source: PowerSource,
+    /// power-profiles-daemon's profile (`power_profile`): not running by
+    /// default.
+    pub power_profile: PowerProfile,
+    /// The power reads made (`power_source`).
+    pub power_reads: u32,
+    /// Whether power-profiles-daemon's profile is followed, as last asked
+    /// (`follow_power_profile`).
+    pub profile_followed: bool,
+    /// Privacy's `freeze` holds a frame (`EffectReport::freeze_held`):
+    /// false again at each session start.
+    pub freeze_held: bool,
     /// The next session stop is unclean, with this (taken by that stop):
     /// a pipeline left short of NULL.
     pub fail_stop: Option<String>,
@@ -536,6 +550,11 @@ impl Default for World {
             start_memories: Vec::new(),
             cuda_unusable: None,
             cuda_probes: 0,
+            power_source: PowerSource::External,
+            power_profile: PowerProfile::Unavailable,
+            power_reads: 0,
+            profile_followed: false,
+            freeze_held: false,
             fail_start_effects: None,
             fail_stop: None,
             fail_stop_at_null: None,
@@ -1142,6 +1161,7 @@ impl MediaBackend for FakeBackend {
                 w.session_unclean = None;
                 w.session = Some((params.clone(), None));
                 w.session_starts += 1;
+                w.freeze_held = false;
                 w.effect_revoked = false;
                 w.apply_effect(&params.effect);
                 Ok(FakeSession(Arc::clone(&world), memory))
@@ -1292,6 +1312,7 @@ impl MediaBackend for FakeBackend {
             load_ms: Some(120.0),
             reused: false,
             gpu_ms_p50: Some(1.2),
+            freeze_held: w.freeze_held,
             fallback_error: w.fallback_error.clone(),
             background_error: w.background_error.clone(),
             switch_error: w.switch_error.clone(),
@@ -1380,6 +1401,20 @@ impl MediaBackend for FakeBackend {
         let mut w = self.world();
         w.cuda_probes += 1;
         w.cuda_unusable.clone()
+    }
+
+    fn power_source(&mut self) -> PowerSource {
+        let mut w = self.world();
+        w.power_reads += 1;
+        w.power_source.clone()
+    }
+
+    fn power_profile(&mut self) -> PowerProfile {
+        self.world().power_profile.clone()
+    }
+
+    fn follow_power_profile(&mut self, on: bool) {
+        self.world().profile_followed = on;
     }
 
     fn compute_capability(&mut self) -> Option<(u32, u32)> {

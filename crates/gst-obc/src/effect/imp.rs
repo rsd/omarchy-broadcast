@@ -1287,6 +1287,9 @@ struct Shared {
     /// Mirrors `VideoCtl::refused`, so the streaming thread clears a
     /// refusal without taking the control lock on every frame.
     video_refused: AtomicBool,
+    /// Mirrors `StreamState::freeze` being some, for the statistics
+    /// ([`EffectStats::freeze_held`]): read without waiting for a frame.
+    freeze_held: AtomicBool,
 }
 
 /// The counters of one stage.
@@ -1709,6 +1712,7 @@ impl ObcEffect {
             status,
             stages,
             frames_processed: s.processed.load(Ordering::Relaxed),
+            freeze_held: s.freeze_held.load(Ordering::Relaxed),
             frames_black: s.black.load(Ordering::Relaxed),
             frames_passthrough: s.passthrough.load(Ordering::Relaxed),
             gpu_ms_p50: percentile(&gpu_window, 50.0),
@@ -2218,6 +2222,7 @@ impl ObcEffect {
                 st.host_pool.take(),
             )
         };
+        self.shared.freeze_held.store(false, Ordering::Relaxed);
         // The cached and the frozen output are memory of our pool and
         // context: gone first.
         drop(cached);
@@ -2688,6 +2693,15 @@ impl ObcEffect {
         Ok(r)
     }
 
+    /// Sets the frozen frame (`StreamState::freeze`), and
+    /// [`Shared::freeze_held`] with it.
+    fn set_freeze(&self, st: &mut StreamState, freeze: Option<gst::Buffer>) {
+        self.shared
+            .freeze_held
+            .store(freeze.is_some(), Ordering::Relaxed);
+        st.freeze = freeze;
+    }
+
     /// Records what a frame written by [`Self::run_frame`] got, once its
     /// work is done: the cache flag, what is on screen, the counters, the
     /// stage times and `gpu_ms` (the frame's GPU time, if measured).
@@ -2708,7 +2722,7 @@ impl ObcEffect {
         // The camera shown unprocessed ends the frozen frame (see "The
         // frozen frame" in the module docs).
         if matches!(output, FrameOutput::Input | FrameOutput::Stages) {
-            st.freeze = None;
+            self.set_freeze(st, None);
         }
         if r.processed {
             self.shared.processed.fetch_add(1, Ordering::Relaxed);
@@ -4591,7 +4605,7 @@ impl BaseTransformImpl for ObcEffect {
         st.reset_pending = false;
         st.resend = false;
         st.cache = None;
-        st.freeze = None;
+        self.set_freeze(&mut st, None);
         st.effect_output = false;
         st.raw_on_screen = raw_on_screen_after(st.raw_on_screen, ScreenEvent::Reset);
         st.toggle_found = None;
@@ -4633,7 +4647,7 @@ impl BaseTransformImpl for ObcEffect {
             }
             if st.caps.as_ref() != Some(incaps) {
                 st.cache = None;
-                st.freeze = None;
+                self.set_freeze(&mut st, None);
                 st.raw_on_screen = raw_on_screen_after(st.raw_on_screen, ScreenEvent::Reset);
                 st.toggle_found = None;
             }
@@ -4779,7 +4793,7 @@ impl BaseTransformImpl for ObcEffect {
             && st.fallback == EffectFallback::Freeze
             && let GenerateOutputSuccess::Buffer(buffer) = &out
         {
-            st.freeze = Some(buffer.clone());
+            self.set_freeze(&mut st, Some(buffer.clone()));
         }
         if std::mem::take(&mut st.processed)
             && let GenerateOutputSuccess::Buffer(buffer) = &out
@@ -4960,7 +4974,7 @@ impl ObcEffect {
             st.raw_on_screen =
                 raw_on_screen_after(st.raw_on_screen, ScreenEvent::Output(FrameOutput::Input));
             // The camera shown as it is: the frozen frame ends with it.
-            st.freeze = None;
+            self.set_freeze(&mut st, None);
         }
         if !found {
             st.toggle_found = None;
@@ -4968,7 +4982,7 @@ impl ObcEffect {
         // Only `freeze` keeps a frozen frame: another fallback lets the
         // buffer go back to the pool.
         if fallback != EffectFallback::Freeze {
-            st.freeze = None;
+            self.set_freeze(&mut st, None);
         }
         st.action = action;
         st.generation = generation;

@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::battery_saver::{BatterySaver, SaverState};
 use crate::modules::{ModulesConfig, ModulesState, StoredValue, legacy, valid_module_id};
 use crate::{
     AspectPolicy, CameraSelector, ColourRange, DEFAULT_SINK_LABEL, EffectMode, EffectOnFailure,
@@ -743,10 +744,14 @@ pub struct EffectiveMemory {
     pub memory: VideoMemory,
     /// The configuration's choice it was made from.
     pub choice: MemoryChoice,
-    /// Why `auto` chose system memory (the probe's reason, or the CUDA
-    /// error of a start that fell back); `None` when the choice is
-    /// explicit or `auto` chose CUDA.
+    /// Why `auto` chose system memory (the probe's reason, the CUDA
+    /// error of a start that fell back, or the battery saver's
+    /// [`SaverState::memory_reason`]); `None` when the choice is explicit
+    /// or `auto` chose CUDA.
     pub reason: Option<String>,
+    /// `auto` chose system memory for the battery saver alone: CUDA is
+    /// usable.
+    pub battery_saver: bool,
 }
 
 impl EffectiveMemory {
@@ -756,6 +761,7 @@ impl EffectiveMemory {
             memory: VideoMemory::System,
             choice: MemoryChoice::Auto,
             reason: Some(reason.into()),
+            battery_saver: false,
         }
     }
 
@@ -785,7 +791,8 @@ impl EffectiveMemory {
 }
 
 /// The log form, after `video memory: `: `system (auto: no NVIDIA driver
-/// is loaded)`, `cuda (auto)`, `system (set in the configuration)`.
+/// is loaded)`, `system (auto: battery saver, on battery)`, `cuda (auto)`,
+/// `system (set in the configuration)`.
 impl fmt::Display for EffectiveMemory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let memory = self.memory.as_str();
@@ -803,16 +810,32 @@ impl fmt::Display for EffectiveMemory {
 /// when usable, else system memory with that reason; `cuda` and `system`
 /// are what they say, whatever the probe found (`cuda` never falls back).
 pub fn resolve_memory(choice: MemoryChoice, cuda_unusable: Option<&str>) -> EffectiveMemory {
-    let (memory, reason) = match (choice, cuda_unusable) {
-        (MemoryChoice::Auto, None) => (VideoMemory::Cuda, None),
-        (MemoryChoice::Auto, Some(r)) => (VideoMemory::System, Some(r.to_string())),
-        (MemoryChoice::Cuda, _) => (VideoMemory::Cuda, None),
-        (MemoryChoice::System, _) => (VideoMemory::System, None),
+    resolve_memory_saving(choice, cuda_unusable, None)
+}
+
+/// [`resolve_memory`] with the battery saver's state: under `auto`, when
+/// CUDA is usable and the saver is active, system memory with the saver's
+/// reason ([`SaverState::memory_reason`]). A probe that finds CUDA
+/// unusable keeps its own reason: the saver then changes nothing. `cuda`
+/// and `system` ignore the saver.
+pub fn resolve_memory_saving(
+    choice: MemoryChoice,
+    cuda_unusable: Option<&str>,
+    saver: Option<&SaverState>,
+) -> EffectiveMemory {
+    let saving = saver.filter(|s| s.active);
+    let (memory, reason, battery_saver) = match (choice, cuda_unusable, saving) {
+        (MemoryChoice::Auto, Some(r), _) => (VideoMemory::System, Some(r.to_string()), false),
+        (MemoryChoice::Auto, None, Some(s)) => (VideoMemory::System, Some(s.memory_reason()), true),
+        (MemoryChoice::Auto, None, None) => (VideoMemory::Cuda, None, false),
+        (MemoryChoice::Cuda, ..) => (VideoMemory::Cuda, None, false),
+        (MemoryChoice::System, ..) => (VideoMemory::System, None, false),
     };
     EffectiveMemory {
         memory,
         choice,
         reason,
+        battery_saver,
     }
 }
 
@@ -823,6 +846,11 @@ pub struct VideoConfig {
     /// Where the frames are kept: `auto` (the default), `cuda` or
     /// `system`. A change applies at the next camera start.
     pub memory: MemoryChoice,
+    /// When `auto` keeps the frames in system memory although CUDA is
+    /// usable: `off`, `on_battery` (the default), `power_profile` or
+    /// `always` ([`crate::battery_saver`]). A change applies at the next
+    /// camera start.
+    pub battery_saver: BatterySaver,
 }
 
 impl Default for Config {
@@ -2427,6 +2455,7 @@ offer_nv12 = false
             "gpu_warm_s",
             "gpu_policy",
             "force_conflicts",
+            "battery_saver",
         ] {
             assert!(
                 EXAMPLE.lines().any(|l| l
@@ -2971,6 +3000,117 @@ offer_nv12 = false
             d.ends_with("\u{2026} Applies at the next camera start."),
             "{d}"
         );
+    }
+
+    #[test]
+    fn the_battery_saver_moves_auto_to_system_memory_only_where_cuda_is_usable() {
+        use crate::battery_saver::{BatterySaver, PowerProfile, PowerSource, saver_state};
+        let saver =
+            |mode, power: PowerSource| saver_state(mode, &power, &PowerProfile::Unavailable);
+        let on = saver(BatterySaver::OnBattery, PowerSource::Battery);
+        let off = saver(BatterySaver::OnBattery, PowerSource::External);
+        let always = saver(BatterySaver::Always, PowerSource::External);
+        let pp = saver_state(
+            BatterySaver::PowerProfile,
+            &PowerSource::External,
+            &PowerProfile::Active("power-saver".into()),
+        );
+        let probe = "no NVIDIA driver is loaded";
+        // (choice, probe, saver) -> (memory, log, the saver's doing)
+        let cases = [
+            (
+                MemoryChoice::Auto,
+                None,
+                Some(&on),
+                VideoMemory::System,
+                "system (auto: battery saver, on battery)",
+                true,
+            ),
+            (
+                MemoryChoice::Auto,
+                None,
+                Some(&pp),
+                VideoMemory::System,
+                "system (auto: battery saver, power profile power-saver)",
+                true,
+            ),
+            (
+                MemoryChoice::Auto,
+                None,
+                Some(&always),
+                VideoMemory::System,
+                "system (auto: battery saver, always)",
+                true,
+            ),
+            (
+                MemoryChoice::Auto,
+                None,
+                Some(&off),
+                VideoMemory::Cuda,
+                "cuda (auto)",
+                false,
+            ),
+            (
+                MemoryChoice::Auto,
+                None,
+                None,
+                VideoMemory::Cuda,
+                "cuda (auto)",
+                false,
+            ),
+            // No usable CUDA: the probe's reason, whatever the saver.
+            (
+                MemoryChoice::Auto,
+                Some(probe),
+                Some(&on),
+                VideoMemory::System,
+                "system (auto: no NVIDIA driver is loaded)",
+                false,
+            ),
+            // Explicit choices ignore the saver.
+            (
+                MemoryChoice::Cuda,
+                None,
+                Some(&always),
+                VideoMemory::Cuda,
+                "cuda (set in the configuration)",
+                false,
+            ),
+            (
+                MemoryChoice::System,
+                None,
+                Some(&off),
+                VideoMemory::System,
+                "system (set in the configuration)",
+                false,
+            ),
+        ];
+        for (choice, probe, saver, memory, log, by_saver) in cases {
+            let m = resolve_memory_saving(choice, probe, saver);
+            assert_eq!((m.memory, m.to_string().as_str()), (memory, log));
+            assert_eq!(m.battery_saver, by_saver, "{log}");
+        }
+        assert_eq!(
+            resolve_memory_saving(MemoryChoice::Auto, None, Some(&on)).description(),
+            "Now: system memory, battery saver, on battery. Applies at the next camera start."
+        );
+        assert_eq!(
+            resolve_memory_saving(MemoryChoice::Auto, None, None),
+            resolve_memory(MemoryChoice::Auto, None)
+        );
+        // The default saver mode.
+        assert_eq!(
+            Config::default().video.battery_saver,
+            BatterySaver::OnBattery
+        );
+        assert_eq!(
+            parse("[video]\nbattery_saver = \"power_profile\"\n")
+                .unwrap()
+                .video
+                .battery_saver,
+            BatterySaver::PowerProfile
+        );
+        assert!(parse("[video]\nbattery_saver = \"sometimes\"\n").is_err());
     }
 
     #[test]

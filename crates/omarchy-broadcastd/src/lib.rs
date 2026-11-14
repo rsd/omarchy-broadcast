@@ -45,5 +45,6 @@ pub mod log;
 pub mod media;
 pub mod mic;
 pub mod modules;
+pub mod power;
 pub mod preview;
 pub mod settings;

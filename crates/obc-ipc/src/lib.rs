@@ -147,8 +147,20 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// capture mode in use reads `<delivered> of <nominal> fps` once the camera
 /// is measured below [`DELIVERS_SHORT_RATIO`] of its rate
 /// ([`CAMERA_HEALTH_REVISION`]). Revision 21 made privacy an option,
-/// off by default, with no new member ([`PRIVACY_REVISION`]).
-pub const INTERFACE_REVISION: u32 = 21;
+/// off by default, with no new member ([`PRIVACY_REVISION`]). Revision 22
+/// added the battery saver, with no new member
+/// ([`BATTERY_SAVER_REVISION`]).
+pub const INTERFACE_REVISION: u32 = 22;
+/// The first [`INTERFACE_REVISION`] with the battery saver, and no new
+/// member: the config row `video.battery_saver` (`off`, `on_battery`,
+/// `power_profile` or `always`: when `video.memory = "auto"` runs the next
+/// camera session in system memory although CUDA is usable; not enabled
+/// under `cuda` or `system`), and the `notice` key of every config row
+/// ([`ConfigRow::notice`]; `""` when none), which `video.battery_saver`
+/// sets to `Applies when the camera restarts` while the saver decides
+/// otherwise than when the running session started, in a way that changes
+/// its memory.
+pub const BATTERY_SAVER_REVISION: u32 = 22;
 /// The first [`INTERFACE_REVISION`] with privacy as an option, and no new
 /// member: the config rows `effect.privacy` (a `bool`, off by default:
 /// the camera shows as it is when a requested effect cannot run) and
@@ -1369,7 +1381,8 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, PRIVACY_REVISION);
+        assert_eq!(INTERFACE_REVISION, BATTERY_SAVER_REVISION);
+        const { assert!(PRIVACY_REVISION < BATTERY_SAVER_REVISION) };
         const { assert!(CAMERA_HEALTH_REVISION < PRIVACY_REVISION) };
         const { assert!(CPU_CONVERT_REVISION < CAMERA_HEALTH_REVISION) };
         const { assert!(VIDEO_BACKGROUND_REVISION < CPU_CONVERT_REVISION) };

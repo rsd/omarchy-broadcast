@@ -33,7 +33,7 @@
 # change it again. The keys the dialog and `omarchy-broadcast config set`
 # can change are: [camera] fixed_framerate; [output] mode, format, aspect,
 # hold_timeout_s, input_gap_ms and placeholder; [lifecycle] idle_grace_s and
-# start_debounce_ms; [video] memory; [effect] privacy, privacy_mode and fallback_image;
+# start_debounce_ms; [video] memory and battery_saver; [effect] privacy, privacy_mode and fallback_image;
 # [pipewire] enabled and offer_nv12;
 # [mic] enabled, device, pipeline_depth, idle_exit_s, gpu_warm_s and gpu_policy; and in
 # [modules] profile, enabled.<id>, forced.<id> and pin.<stage>. Everything else,
@@ -186,6 +186,39 @@ start_debounce_ms = 300
 # applies at the next camera start.
 # Default: "auto"
 memory = "auto"
+
+# When "auto" keeps the frames in system memory although CUDA is usable, so
+# that the NVIDIA GPU is not woken (the battery saver). It acts only while
+# `memory` is "auto"; with "cuda" or "system" it is ignored, and the settings
+# show it greyed.
+#   - "off": never.
+#   - "on_battery": while the machine runs on its battery. The daemon reads
+#     /sys/class/power_supply: it is on battery when the machine has a battery
+#     and no external supply (mains, USB or USB-C power delivery, wireless) is
+#     online. A battery of a peripheral (a mouse, a headset) never counts, and
+#     a machine without a battery is never on battery. A supply that cannot
+#     be read is skipped; when none can be read the machine is taken as
+#     being on AC power, and the row says so.
+#   - "power_profile": while power-profiles-daemon's active profile is
+#     "power-saver" (read on the system bus, from org.freedesktop.UPower.
+#     PowerProfiles or net.hadess.PowerProfiles). The daemon never starts
+#     that service. Without it, the saver follows the battery as
+#     "on_battery" does, and the row says "power-profiles-daemon is not
+#     running: following the battery instead".
+#   - "always": every camera session.
+# While the saver is active a camera session makes no CUDA call: the
+# modules are told CUDA is off, the open-model cut-out runs on OpenVINO (the
+# Intel NPU or GPU) or on the CPU, and the stages that need CUDA are
+# unavailable with the reason "Needs CUDA; battery saver runs the video
+# pipeline in system memory". Where CUDA is unusable anyway, the reason found
+# for that is the one shown. The decision is made at each camera start and a
+# running session is never torn down: the row's notice says "Applies when the
+# camera restarts" while the saver now decides otherwise than the session did.
+# The log line reads `video memory: system (auto: battery saver, on battery)`
+# (or `power profile power-saver`, or `always`), and the description of
+# `memory` says so in `omarchy-broadcast config show`.
+# Default: "on_battery"
+battery_saver = "on_battery"
 
 [effect]
 # Video effects run on the GPU with the NVIDIA Maxine Video Effects SDK,

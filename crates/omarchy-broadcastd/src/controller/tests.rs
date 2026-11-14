@@ -2218,7 +2218,7 @@ fn black(reason: &str) -> String {
 /// `Warning` of a selected `blur` that cannot run for `reason`, with
 /// `on_failure = "image"`.
 fn imaged(reason: &str) -> String {
-    format!("effect blur unavailable: {reason}; the fallback image is shown until it can run")
+    format!("effect blur unavailable: {reason}; the away image is shown until it can run")
 }
 
 /// `Warning` of a selected `blur` that cannot run for `reason`, with
@@ -8451,8 +8451,16 @@ fn closed(on_failure: &str, reason: &str) -> String {
 }
 
 /// `Warning` of a selected `blur` that cannot run for `reason`, with
-/// privacy on in the mode `freeze`.
+/// privacy on in the mode `freeze`, before the effect produced a frame in
+/// the session: the away image is shown (the tests' `freeze` sets one).
 fn frozen(reason: &str) -> String {
+    imaged(reason)
+}
+
+/// `Warning` of a selected `blur` that cannot run for `reason`, with
+/// privacy on in the mode `freeze`, once the effect produced a frame in
+/// the session.
+fn held(reason: &str) -> String {
     format!("effect blur unavailable: {reason}; the last frame is held until it can run")
 }
 
@@ -12152,7 +12160,7 @@ fn a_session_under_image_gives_the_element_the_image_and_reports_what_it_cannot_
     assert_eq!(
         warning,
         format!(
-            "effect blur unavailable: processing a frame failed; the fallback image is shown \
+            "effect blur unavailable: processing a frame failed; the away image is shown \
              until it can run; {why}"
         )
     );
@@ -16043,6 +16051,74 @@ fn under_freeze_the_element_is_given_freeze_and_the_away_image() {
 }
 
 #[test]
+fn the_freeze_clause_says_what_is_shown_whether_a_frame_is_held_or_not() {
+    let why = "processing a frame failed";
+    // The element holds an effect frame: the last one is held.
+    let mut h = H::new(&blur_with("freeze"), |w| w.effect_slow = true);
+    h.activate(0);
+    h.world().freeze_held = true;
+    h.tick(500);
+    h.world().effect_status = EffectStatus::Failed(why.into());
+    h.tick(1000);
+    assert_eq!(h.snap().warning, held(why));
+    // Frames of the denoise stage alone hold no frame (the element drops
+    // the frozen frame on them): blur failing then shows the away image,
+    // and black without a readable one, never "the last frame".
+    let denoised = format!("{}denoise = true\n", blur_with("freeze"));
+    let mut h = H::new(&denoised, |w| w.effect_slow = true);
+    h.activate(0);
+    h.tick(500);
+    assert!(!h.world().freeze_held);
+    h.world().effect_status = EffectStatus::Failed(why.into());
+    h.tick(1000);
+    assert_eq!(
+        h.snap().warning,
+        format!("effect blur unavailable: {why}; the away image is shown until it can run")
+    );
+    let mut h = H::new(&denoised, |w| w.effect_slow = true);
+    h.activate(0);
+    let unreadable = format!("Away image {AWAY} could not be read (gone): showing black");
+    h.world().fallback_error = Some(unreadable.clone());
+    h.world().effect_status = EffectStatus::Failed(why.into());
+    h.tick(1000);
+    assert_eq!(h.snap().warning, format!("{}; {unreadable}", black(why)));
+    // None held, no away image set: black.
+    let mut h = H::new(
+        "[effect]\nmode = \"blur\"\nprivacy = true\nprivacy_mode = \"freeze\"\n",
+        |w| w.effect_slow = true,
+    );
+    h.activate(0);
+    h.world().effect_status = EffectStatus::Failed(why.into());
+    h.tick(1000);
+    assert_eq!(h.snap().warning, black(why));
+    // A frame held, then dropped by the element (new caps, a camera
+    // switch): no longer "the last frame".
+    let mut h = H::new(&blur_with("freeze"), |w| w.effect_slow = true);
+    h.activate(0);
+    h.world().freeze_held = true;
+    h.tick(500);
+    h.world().freeze_held = false;
+    h.tick(800);
+    h.world().effect_status = EffectStatus::Failed(why.into());
+    h.tick(1000);
+    assert_eq!(h.snap().warning, frozen(why));
+    // A new session starts with no frame held (the element is new).
+    let mut h = H::new(&blur_with("freeze"), |w| w.effect_slow = true);
+    h.activate(0);
+    h.world().freeze_held = true;
+    h.tick(500);
+    h.consumers(0, 600);
+    h.tick(60_000);
+    assert!(h.world().session.is_none(), "{:?}", h.snap());
+    h.consumers(1, 61_000);
+    h.tick(62_000);
+    assert!(h.world().session.is_some(), "{:?}", h.snap());
+    h.world().effect_status = EffectStatus::Failed(why.into());
+    h.tick(63_000);
+    assert_eq!(h.snap().warning, frozen(why));
+}
+
+#[test]
 fn a_privacy_hold_under_freeze_shows_the_away_image_when_set_else_black() {
     // A start refused under `freeze` has no processed frame to hold: the
     // writer's placeholder shows the away image.
@@ -16185,4 +16261,424 @@ fn the_daemon_replaces_a_managed_on_failure_with_the_privacy_keys() {
     h.write_drop_in("50-panel.toml", "[effect]\nprivacy = false\n");
     h.reload(config, 2000).unwrap();
     assert_eq!(h.ctrl.config.effect.policy(), EffectOnFailure::None);
+}
+
+// ---- the battery saver (`[video] battery_saver`) ----
+
+use obc_core::battery_saver::{PowerProfile, PowerSource};
+use obc_module_host::registry::REASON_BATTERY_SAVER;
+
+const SAVER: &str = "video.battery_saver";
+const RESTARTS: &str = "Applies when the camera restarts";
+
+impl H {
+    /// The `video.battery_saver` row's notice.
+    fn saver_notice(&mut self) -> String {
+        self.row(SAVER).notice
+    }
+}
+
+#[test]
+fn on_battery_a_start_runs_in_system_memory_and_wakes_no_gpu() {
+    let mut h = H::new("", |w| w.power_source = PowerSource::Battery);
+    let lines = crate::log::take_lines();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("video memory: "))
+            .collect::<Vec<_>>(),
+        ["video memory: system (auto: battery saver, on battery)"],
+        "{lines:?}"
+    );
+    // CUDA-only stages are unavailable with the saver's reason, and every
+    // module is told CUDA is off.
+    assert_eq!(
+        h.stage_listed(MAXINE_MODULE, "denoise"),
+        (false, REASON_BATTERY_SAVER.to_string())
+    );
+    assert_eq!(h.opened_with(MAXINE_MODULE)["_host"]["cuda"], false);
+    assert_eq!(
+        h.row("video.memory").description,
+        "Now: system memory, battery saver, on battery. Applies at the next camera start."
+    );
+    let saver = h.row(SAVER);
+    assert_eq!(
+        saver.description,
+        "Keeps the NVIDIA GPU asleep by processing video in system memory. Now: active, on \
+         battery."
+    );
+    assert!(saver.enabled);
+    assert_eq!(saver.notice, "");
+    h.activate_then_idle(0);
+    let w = h.world();
+    assert_eq!(w.start_memories, [VideoMemory::System]);
+    assert_eq!((w.parks, w.unparks), (0, 0));
+    assert!(w.gpu_log.is_empty(), "{:?}", w.gpu_log);
+    assert!(!w.cuda_initialised);
+    assert_eq!(w.cc_reads, 0);
+}
+
+#[test]
+fn each_mode_and_power_state_decides_the_memory_only_under_auto() {
+    use VideoMemory::{Cuda, System};
+    let powers = [
+        PowerSource::Battery,
+        PowerSource::External,
+        PowerSource::NoBattery,
+        PowerSource::Unreadable("EIO".into()),
+    ];
+    let profiles = [
+        PowerProfile::Unavailable,
+        PowerProfile::Active("power-saver".into()),
+        PowerProfile::Active("balanced".into()),
+    ];
+    for mode in ["off", "on_battery", "power_profile", "always"] {
+        for power in &powers {
+            for profile in &profiles {
+                for choice in ["auto", "cuda", "system"] {
+                    let on_battery = *power == PowerSource::Battery;
+                    let saving = match mode {
+                        "off" => false,
+                        "always" => true,
+                        "on_battery" => on_battery,
+                        _ => match profile {
+                            PowerProfile::Active(p) => p == "power-saver",
+                            PowerProfile::Unavailable => on_battery,
+                        },
+                    };
+                    let want = match choice {
+                        "cuda" => Cuda,
+                        "system" => System,
+                        _ if saving => System,
+                        _ => Cuda,
+                    };
+                    let config =
+                        format!("[video]\nmemory = \"{choice}\"\nbattery_saver = \"{mode}\"\n");
+                    let (p, pr) = (power.clone(), profile.clone());
+                    let mut h = H::new(&config, move |w| {
+                        w.power_source = p;
+                        w.power_profile = pr;
+                    });
+                    h.activate(0);
+                    let what = format!("{mode}, {power:?}, {profile:?}, {choice}");
+                    assert_eq!(h.session_params().memory, want, "{what}");
+                    assert_eq!(h.world().start_memories, [want], "{what}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_saver_row_is_greyed_unless_video_memory_is_automatic() {
+    for (memory, enabled) in [("auto", true), ("cuda", false), ("system", false)] {
+        let mut h = H::new(&format!("[video]\nmemory = \"{memory}\"\n"), |_| {});
+        let r = h.row(SAVER);
+        assert_eq!(r.enabled, enabled, "{memory}");
+        assert_eq!(
+            r.disabled_reason,
+            if enabled {
+                ""
+            } else {
+                "Set video processing to automatic to use this"
+            }
+        );
+        assert_eq!(r.value, obc_ipc::ConfigValue::Str("on_battery".into()));
+        assert_eq!(r.apply, "reload");
+    }
+}
+
+#[test]
+fn a_power_change_mid_session_never_restarts_it_and_the_row_says_when_it_applies() {
+    let mut h = H::new("", |_| {});
+    h.activate(0);
+    assert_eq!(h.session_params().memory, VideoMemory::Cuda);
+    assert_eq!(h.saver_notice(), "");
+    // Unplugged: read again on the poll, the session kept.
+    h.world().power_source = PowerSource::Battery;
+    let serial = h.snap().config_serial;
+    h.tick(4000);
+    assert_eq!(h.saver_notice(), RESTARTS);
+    assert_ne!(h.snap().config_serial, serial, "ConfigChanged follows");
+    assert!(
+        h.row(SAVER)
+            .description
+            .ends_with("Now: active, on battery."),
+        "{}",
+        h.row(SAVER).description
+    );
+    assert_eq!(h.world().session_starts, 1, "the session is not restarted");
+    assert_eq!(h.session_params().memory, VideoMemory::Cuda);
+    // Plugged in again: the decision matches the session, the notice goes.
+    h.world().power_source = PowerSource::External;
+    h.tick(8000);
+    assert_eq!(h.saver_notice(), "");
+    // Unplugged, then the session ends: no notice once it stopped, and the
+    // next start runs in system memory.
+    h.world().power_source = PowerSource::Battery;
+    h.tick(12_000);
+    assert_eq!(h.saver_notice(), RESTARTS);
+    h.consumers(0, 13_000);
+    h.tick(19_000);
+    assert_eq!(h.state(), State::Idle);
+    assert_eq!(h.saver_notice(), "");
+    h.activate(20_000);
+    assert_eq!(h.session_params().memory, VideoMemory::System);
+    assert_eq!(h.saver_notice(), "");
+    assert_eq!(
+        h.world().start_memories,
+        [VideoMemory::Cuda, VideoMemory::System]
+    );
+    // Plugged in mid-session: the session keeps system memory, and says it.
+    h.world().power_source = PowerSource::External;
+    h.tick(24_000);
+    assert_eq!(h.saver_notice(), RESTARTS);
+    assert_eq!(h.session_params().memory, VideoMemory::System);
+}
+
+#[test]
+fn a_mode_change_mid_session_applies_at_the_next_start() {
+    let mut h = H::new("", |_| {});
+    h.activate(0);
+    h.set_config(SAVER, obc_ipc::ConfigValue::Str("always".into()))
+        .unwrap();
+    assert_eq!(h.world().session_starts, 1);
+    assert_eq!(h.session_params().memory, VideoMemory::Cuda);
+    assert_eq!(h.saver_notice(), RESTARTS);
+    assert!(
+        h.row("video.memory")
+            .description
+            .starts_with("Now: system memory, battery saver, always."),
+        "{}",
+        h.row("video.memory").description
+    );
+    // Back to off: matches the session again.
+    h.set_config(SAVER, obc_ipc::ConfigValue::Str("off".into()))
+        .unwrap();
+    assert_eq!(h.saver_notice(), "");
+    // Under an explicit memory the saver is greyed and gives no notice.
+    h.set_config(SAVER, obc_ipc::ConfigValue::Str("always".into()))
+        .unwrap();
+    h.set_config("video.memory", obc_ipc::ConfigValue::Str("cuda".into()))
+        .unwrap();
+    assert_eq!(h.saver_notice(), "");
+    assert!(!h.row(SAVER).enabled);
+}
+
+#[test]
+fn the_power_profile_is_followed_and_its_absence_is_said() {
+    let mut h = H::new("[video]\nbattery_saver = \"power_profile\"\n", |_| {});
+    assert_eq!(
+        h.row(SAVER).description,
+        "Now: power-profiles-daemon is not running: following the battery instead; inactive, \
+         on AC power."
+    );
+    // The watcher saw the service start with the power-saver profile.
+    h.world().power_profile = PowerProfile::Active("power-saver".into());
+    let serial = h.snap().config_serial;
+    assert!(h.ctrl.handle(Command::PowerChanged, h.at(100)));
+    assert_ne!(h.snap().config_serial, serial);
+    assert!(
+        h.row(SAVER)
+            .description
+            .ends_with("Now: active, power profile power-saver."),
+        "{}",
+        h.row(SAVER).description
+    );
+    h.activate(1000);
+    assert_eq!(h.session_params().memory, VideoMemory::System);
+    assert!(
+        crate::log::take_lines()
+            .iter()
+            .any(|l| l == "video memory: system (auto: battery saver, power profile power-saver)")
+    );
+    // Balanced mid-session: the notice, read from the cache by the poll.
+    h.world().power_profile = PowerProfile::Active("balanced".into());
+    h.tick(5000);
+    assert_eq!(h.saver_notice(), RESTARTS);
+}
+
+#[test]
+fn without_usable_cuda_the_saver_changes_nothing() {
+    let mut h = H::new("[video]\nbattery_saver = \"always\"\n", |w| {
+        w.cuda_unusable = Some(NO_DRIVER.into());
+    });
+    assert_eq!(
+        h.stage_listed(MAXINE_MODULE, "denoise"),
+        (false, REASON_NEEDS_CUDA.to_string())
+    );
+    assert_eq!(
+        h.row("video.memory").description,
+        format!("Now: system memory, {NO_DRIVER}. Applies at the next camera start.")
+    );
+    h.activate(0);
+    h.set_config(SAVER, obc_ipc::ConfigValue::Str("off".into()))
+        .unwrap();
+    h.tick(5000);
+    assert_eq!(h.saver_notice(), "", "system memory either way");
+}
+
+#[test]
+fn the_power_supplies_are_read_only_when_a_mode_needs_them() {
+    for (mode, reads) in [("off", false), ("always", false), ("on_battery", true)] {
+        let h = H::new(&format!("[video]\nbattery_saver = \"{mode}\"\n"), |_| {});
+        assert_eq!(h.world().power_reads > 0, reads, "{mode}");
+    }
+}
+
+#[test]
+fn while_idle_a_power_change_is_followed_at_once_off_the_start_path() {
+    let mut h = H::new("", |_| {});
+    let opens = h.opens_of(MAXINE_MODULE);
+    assert!(cuda_on(&h.opened_with(MAXINE_MODULE)));
+    // Unplugged while idle, then the watcher's (or the poll's) read: the
+    // memory of the next start, both rows and the modules follow now, and
+    // ConfigChanged says so.
+    h.world().power_source = PowerSource::Battery;
+    let serial = h.snap().config_serial;
+    assert!(h.ctrl.handle(Command::PowerChanged, h.at(100)));
+    assert_ne!(h.snap().config_serial, serial, "ConfigChanged follows");
+    assert_eq!(
+        h.row("video.memory").description,
+        "Now: system memory, battery saver, on battery. Applies at the next camera start."
+    );
+    assert!(
+        h.row(SAVER)
+            .description
+            .ends_with("Now: active, on battery."),
+        "{}",
+        h.row(SAVER).description
+    );
+    assert_eq!(h.opens_of(MAXINE_MODULE), opens + 1, "reopened now");
+    assert_eq!(h.opened_with(MAXINE_MODULE)["_host"]["cuda"], false);
+    assert_eq!(
+        h.stage_listed(MAXINE_MODULE, "denoise"),
+        (false, REASON_BATTERY_SAVER.to_string())
+    );
+    // The start finds the modules ready for its memory: no reopen there.
+    h.activate(1000);
+    assert_eq!(h.session_params().memory, VideoMemory::System);
+    assert_eq!(h.opens_of(MAXINE_MODULE), opens + 1);
+    // Nothing changed: no ConfigChanged.
+    let serial = h.snap().config_serial;
+    assert!(h.ctrl.handle(Command::PowerChanged, h.at(1500)));
+    assert_eq!(h.snap().config_serial, serial);
+}
+
+#[test]
+fn while_idle_the_power_supplies_are_read_at_the_idle_cadence() {
+    let mut h = H::new("", |_| {});
+    h.tick(0);
+    let reads = h.world().power_reads;
+    // Not faster than the idle cadence, however often the loop wakes.
+    for ms in (1000..60_000).step_by(1000) {
+        h.tick(ms);
+    }
+    assert_eq!(h.world().power_reads, reads);
+    // Due within the idle wake.
+    assert!(h.ctrl.next_wakeup(h.at(59_000)) <= Duration::from_secs(1));
+    // Unplugged: the next read finds it, the rows follow, ConfigChanged.
+    h.world().power_source = PowerSource::Battery;
+    let serial = h.snap().config_serial;
+    h.tick(60_000);
+    assert_eq!(h.world().power_reads, reads + 1);
+    assert_ne!(h.snap().config_serial, serial);
+    assert!(
+        h.row("video.memory")
+            .description
+            .starts_with("Now: system memory, battery saver, on battery."),
+        "{}",
+        h.row("video.memory").description
+    );
+    assert_eq!(h.opened_with(MAXINE_MODULE)["_host"]["cuda"], false);
+}
+
+#[test]
+fn the_notice_is_only_for_the_savers_own_changes() {
+    // `video.memory` from `system` to `auto` on AC power, mid-session: the
+    // memory a start would choose changes, but not by the saver.
+    let mut h = H::new("[video]\nmemory = \"system\"\n", |_| {});
+    h.activate(0);
+    h.set_config("video.memory", obc_ipc::ConfigValue::Str("auto".into()))
+        .unwrap();
+    assert_eq!(h.session_params().memory, VideoMemory::System);
+    assert_eq!(h.saver_notice(), "");
+    // CUDA found unusable at a reload, mid-session in CUDA: not the
+    // saver's either.
+    let mut h = H::new("", |_| {});
+    h.activate(0);
+    h.world().cuda_unusable = Some(NO_DRIVER.into());
+    h.reload("", 1000).unwrap();
+    assert!(
+        h.row("video.memory")
+            .description
+            .starts_with(&format!("Now: system memory, {NO_DRIVER}")),
+        "{}",
+        h.row("video.memory").description
+    );
+    assert_eq!(h.saver_notice(), "");
+    // A session the saver put in system memory, the saver now inactive:
+    // the notice.
+    let mut h = H::new("", |w| w.power_source = PowerSource::Battery);
+    h.activate(0);
+    h.world().power_source = PowerSource::External;
+    h.tick(4000);
+    assert_eq!(h.saver_notice(), RESTARTS);
+}
+
+#[test]
+fn a_second_start_in_the_other_memory_reopens_the_modules_and_never_unparks_for_system() {
+    let mut h = H::new("", |_| {});
+    h.activate_then_idle(0);
+    assert_eq!(h.world().start_memories, [VideoMemory::Cuda]);
+    assert!(cuda_on(&h.opened_with(MAXINE_MODULE)));
+    let opens = h.opens_of(MAXINE_MODULE);
+    // Unplugged while parked, unseen until the start (no read due yet).
+    h.world().power_source = PowerSource::Battery;
+    h.activate(7000);
+    {
+        let w = h.world();
+        assert_eq!(w.start_memories, [VideoMemory::Cuda, VideoMemory::System]);
+        assert!(w.parked, "a system-memory session leaves the GPU parked");
+        assert_eq!((w.parks, w.unparks), (1, 0));
+    }
+    assert_eq!(h.opens_of(MAXINE_MODULE), opens + 1);
+    assert_eq!(h.opened_with(MAXINE_MODULE)["_host"]["cuda"], false);
+    // Back on AC, the session stopped then started again: CUDA, the
+    // modules reopened with CUDA, the GPU unparked for it.
+    h.consumers(0, 8000);
+    h.tick(14_000);
+    assert_eq!(h.state(), State::Idle);
+    h.world().power_source = PowerSource::External;
+    let opens = h.opens_of(MAXINE_MODULE);
+    h.activate(15_000);
+    let w = h.world();
+    assert_eq!(
+        w.start_memories,
+        [VideoMemory::Cuda, VideoMemory::System, VideoMemory::Cuda]
+    );
+    assert_eq!(w.unparks, 1);
+    drop(w);
+    assert!(h.opens_of(MAXINE_MODULE) > opens);
+    assert!(cuda_on(&h.opened_with(MAXINE_MODULE)));
+}
+
+#[test]
+fn power_profiles_daemon_is_followed_only_under_power_profile() {
+    let mut h = H::new("", |_| {});
+    assert!(!h.world().profile_followed);
+    h.set_config(SAVER, obc_ipc::ConfigValue::Str("power_profile".into()))
+        .unwrap();
+    assert!(h.world().profile_followed);
+    h.set_config(SAVER, obc_ipc::ConfigValue::Str("always".into()))
+        .unwrap();
+    assert!(!h.world().profile_followed);
+    let h = H::new("[video]\nbattery_saver = \"power_profile\"\n", |_| {});
+    assert!(h.world().profile_followed);
+}
+
+/// Whether a module's configuration says CUDA is usable (`_host.cuda` is
+/// said only when it is off).
+fn cuda_on(config: &serde_json::Value) -> bool {
+    config["_host"].get("cuda").is_none()
 }

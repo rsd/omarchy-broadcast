@@ -111,6 +111,10 @@ fn the_core_table_is_well_formed() {
         "video.memory" => {
             toml::from_str::<crate::config::VideoConfig>(&format!("memory = \"{v}\"")).is_ok()
         }
+        "video.battery_saver" => {
+            toml::from_str::<crate::config::VideoConfig>(&format!("battery_saver = \"{v}\""))
+                .is_ok()
+        }
         other => panic!("enum {other} not checked"),
     };
     for k in CORE_KEYS {
@@ -140,6 +144,7 @@ fn the_editable_and_apply_table_is_the_decided_one() {
             "output.input_gap_ms",
             "output.placeholder",
             "video.memory",
+            "video.battery_saver",
             "lifecycle.idle_grace_s",
             "lifecycle.start_debounce_ms",
             "effect.privacy",
@@ -778,7 +783,7 @@ fn the_video_memory_row_states_the_memory_in_force() {
     let video = groups.iter().find(|g| g.id == "video").unwrap();
     assert_eq!(
         video.rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-        ["video.memory"]
+        ["video.memory", "video.battery_saver"]
     );
     let r = find(&groups, VIDEO_MEMORY);
     assert_eq!(r.value, ConfigValue::Str("system".into()));
@@ -853,4 +858,121 @@ fn the_output_mode_row_mentions_frame_generation_only_where_it_can_run() {
         "Size and frame rate of the virtual camera."
     );
     assert!(full.starts_with(&find(&groups, OUTPUT_MODE).description));
+}
+
+#[test]
+fn the_battery_saver_row_offers_the_modes_and_states_the_saver_now() {
+    use crate::battery_saver::{
+        BATTERY_SAVER_NOTICE, BatterySaver, PowerProfile, PowerSource, saver_state,
+    };
+    let (_tmp, set) = load(&[]);
+    let groups = config_schema(&set, &facts());
+    let r = find(&groups, BATTERY_SAVER);
+    assert_eq!(r.label, "Battery saver");
+    assert_eq!(r.value, ConfigValue::Str("on_battery".into()));
+    assert_eq!(r.default, Some(ConfigValue::Str("on_battery".into())));
+    assert!(r.editable && r.enabled, "{r:?}");
+    assert_eq!(r.disabled_reason, "");
+    assert_eq!(r.notice, "");
+    assert_eq!(r.apply, Apply::Reload);
+    let RowKind::Enum { options } = &r.kind else {
+        panic!("{:?}", r.kind)
+    };
+    assert_eq!(
+        options
+            .iter()
+            .map(|(v, l)| (v.as_str(), l.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("off", "Off"),
+            ("on_battery", "On battery"),
+            ("power_profile", "Follow the power profile"),
+            ("always", "Always"),
+        ]
+    );
+    // Without the daemon's word, the fixed text.
+    assert_eq!(r.description, core_key(BATTERY_SAVER).unwrap().description);
+    assert!(r.description.contains("next camera start"));
+
+    // With it, whether it is active and why; and the notice.
+    let facts = RegistryFacts {
+        battery_saver: Some(saver_state(
+            BatterySaver::OnBattery,
+            &PowerSource::Battery,
+            &PowerProfile::Unavailable,
+        )),
+        battery_saver_notice: BATTERY_SAVER_NOTICE.into(),
+        ..facts()
+    };
+    let groups = config_schema(&set, &facts);
+    let r = find(&groups, BATTERY_SAVER);
+    assert_eq!(
+        r.description,
+        "Keeps the NVIDIA GPU asleep by processing video in system memory. Now: active, on \
+         battery."
+    );
+    assert_eq!(r.notice, "Applies when the camera restarts");
+    // No other row carries it.
+    assert!(
+        groups
+            .iter()
+            .flat_map(|g| &g.rows)
+            .filter(|r| r.id != BATTERY_SAVER)
+            .all(|r| r.notice.is_empty())
+    );
+}
+
+#[test]
+fn the_battery_saver_row_is_greyed_unless_video_memory_is_automatic() {
+    for (memory, enabled) in [("auto", true), ("cuda", false), ("system", false)] {
+        let (_tmp, set) = load(&[(
+            MANAGED_REL,
+            &format!("[video]\nmemory = \"{memory}\"\nbattery_saver = \"always\"\n"),
+        )]);
+        let groups = config_schema(&set, &facts());
+        let r = find(&groups, BATTERY_SAVER);
+        assert_eq!(r.value, ConfigValue::Str("always".into()));
+        assert_eq!(r.enabled, enabled, "{memory}");
+        assert!(r.editable, "{memory}: still written");
+        assert_eq!(
+            r.disabled_reason,
+            if enabled {
+                ""
+            } else {
+                "Set video processing to automatic to use this"
+            },
+            "{memory}"
+        );
+    }
+    // An override's reason stays first.
+    let (_tmp, set) = load(&[
+        (MANAGED_REL, "[video]\nmemory = \"cuda\"\n"),
+        (
+            "config.d/90-local.toml",
+            "[video]\nbattery_saver = \"off\"\n",
+        ),
+    ]);
+    let r = find(&config_schema(&set, &facts()), BATTERY_SAVER).clone();
+    assert!(!r.enabled);
+    assert_eq!(r.disabled_reason, "Overridden by config.d/90-local.toml");
+}
+
+#[test]
+fn a_battery_saver_write_is_checked_against_its_options() {
+    let info = lookup(BATTERY_SAVER, &RegistryFacts::default()).unwrap();
+    assert!(info.editable);
+    assert_eq!(info.apply, Apply::Reload);
+    assert_eq!(
+        to_toml(
+            BATTERY_SAVER,
+            &info.kind,
+            &ConfigValue::Str("power_profile".into())
+        ),
+        Ok(toml::Value::String("power_profile".into()))
+    );
+    let e = to_toml(BATTERY_SAVER, &info.kind, &ConfigValue::Str("on".into())).unwrap_err();
+    assert!(
+        e.contains("\"on\" is not one of: off, on_battery, power_profile, always"),
+        "{e}"
+    );
 }

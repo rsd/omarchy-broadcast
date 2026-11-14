@@ -96,7 +96,8 @@
 //! ([`Registry::set_memory`]): in CUDA memory (the default) or in system
 //! memory ([`FrameKind::Host`]). In system memory a stage whose manifest
 //! `frames` does not list `host` cannot run, with the reason the caller
-//! gives ([`REASON_NEEDS_CUDA`], [`REASON_CUDA_OFF`]), exactly as a stage
+//! gives ([`REASON_NEEDS_CUDA`], [`REASON_CUDA_OFF`],
+//! [`REASON_BATTERY_SAVER`]), exactly as a stage
 //! whose probe said it cannot: the providers, the pins, the profile, the
 //! requirements and the module statuses follow from it, so a stage falls
 //! to a provider that takes host frames when there is one. The module
@@ -149,6 +150,10 @@ pub const REASON_NEEDS_CUDA: &str = "Needs an NVIDIA GPU (CUDA)";
 /// The reason of a stage that takes CUDA frames only, when the
 /// configuration sets the video pipeline to system memory.
 pub const REASON_CUDA_OFF: &str = "Needs CUDA; the video pipeline is set to system memory";
+/// The reason of a stage that takes CUDA frames only, when the battery
+/// saver runs the video pipeline in system memory although CUDA is usable.
+pub const REASON_BATTERY_SAVER: &str =
+    "Needs CUDA; battery saver runs the video pipeline in system memory";
 
 /// The longest module name a reason gives ("Conflicts with <name> (<id>)"),
 /// in bytes.

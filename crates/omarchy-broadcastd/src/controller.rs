@@ -35,6 +35,25 @@
 //! The effective memory is reported by the log and the description of the
 //! `video.memory` configuration row.
 //!
+//! **Battery saver.** Under `auto` with CUDA usable, a camera start runs in
+//! system memory while the battery saver is active (`[video]
+//! battery_saver`: on battery, on power-profiles-daemon's `power-saver`
+//! profile, or always; [`obc_core::battery_saver`]), so that the NVIDIA GPU
+//! is not woken. The power supplies are read at each camera start and
+//! reload ([`MediaBackend::power_source`]), the profile is the cached one
+//! its watcher keeps ([`MediaBackend::power_profile`], no D-Bus wait; the
+//! watcher runs only under `power_profile`,
+//! [`MediaBackend::follow_power_profile`]). The power state is read again
+//! every [`POWER_POLL`] while a session runs and every [`POWER_POLL_IDLE`]
+//! while idle, and at each change of the profile
+//! ([`Command::PowerChanged`]). While idle a change is followed at once:
+//! the memory of the next start is resolved again and given to the
+//! modules (reopened then, off the start path). A running session is never
+//! restarted for it: the `video.battery_saver` row carries a notice while
+//! the saver's decision differs from the one the session started under
+//! and would change its memory. A change of either row's description or
+//! of the notice moves `ConfigSerial` (`ConfigChanged`).
+//!
 //! A session (camera + output) runs only while it is wanted: enabled,
 //! the writer running, no fault, and a consumer present for the start
 //! debounce, or (once running) a consumer present or gone for less than the
@@ -311,9 +330,10 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use obc_core::battery_saver::{BATTERY_SAVER_NOTICE, PowerSource, SaverState, saver_state};
 use obc_core::config::{
     CAMERA_CONTROL_NAMES, Config, EffectConfig, EffectiveMemory, MemoryChoice, RuntimeState,
-    VideoMemory, resolve_memory,
+    VideoMemory, resolve_memory_saving,
 };
 use obc_core::config_d::{self, ConfigSet, ManagedEdit, OverridePolicy, WriteError};
 use obc_core::config_schema::{self, ModuleFact, RegistryFacts, StageFact};
@@ -399,6 +419,12 @@ const LABEL_MOVE_PERIOD: Duration = Duration::from_secs(30);
 const PLACEHOLDER_DECODE_LIMIT: Duration = Duration::from_secs(10);
 /// The longest sleep with nothing scheduled.
 const IDLE_WAKE: Duration = Duration::from_secs(60);
+/// How often the power state is read again while a session runs, for the
+/// battery saver's notice.
+pub const POWER_POLL: Duration = Duration::from_secs(3);
+/// How often the power state is read again while idle, for the memory of
+/// the next start and the battery saver's row: the idle wake's cadence.
+pub const POWER_POLL_IDLE: Duration = IDLE_WAKE;
 /// How often the effect's GPU time is logged (debug) while it runs.
 const EFFECT_LOG_PERIOD: Duration = Duration::from_secs(60);
 /// The largest background image `SetBackgroundImage` accepts (the effect
@@ -551,6 +577,10 @@ pub enum Command {
     PipeWire(PipeWireGeneration, PipeWireEvent),
     /// Video nodes appeared or disappeared: scan the cameras again.
     Rescan,
+    /// power-profiles-daemon's profile changed, or the service came or
+    /// went ([`crate::power::run_profile_watch`]): the battery saver is
+    /// read again.
+    PowerChanged,
     /// `SetMicHost(b)` (revision 13).
     SetMicHost(bool, Reply),
     /// `ApplyRecommendedSettings(s)` (revision 20; empty: `ActiveCamera`).
@@ -1127,28 +1157,50 @@ fn effect_failure_text(effect: &impl Fallback, reason: &str) -> String {
     }
 }
 
+/// What privacy's `freeze` shows in place of an effect that cannot run
+/// ([`Controller::frozen_shows`]): the frozen frame while the effect
+/// element holds one (the last frame the effect produced, until the camera
+/// shown as it is, the stages alone, new caps or a camera switch drop it);
+/// else the away image when one is set and can be read, else black.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Frozen {
+    LastFrame,
+    AwayImage,
+    Black,
+}
+
 /// The `Warning` clause of the background effect, provided by a module
 /// but unable to load or run (`reason`): the session streams on, with
 /// privacy on the effect element's frames black until the effect runs
-/// (the away image under `away`, the last frame under `freeze`), with
-/// privacy off the camera image. The reason is made
+/// (the away image under `away`; under `freeze` what `frozen` says is
+/// shown), with privacy off the camera image. The reason is made
 /// safe to show and bounded ([`STAGE_REASON_MAX`], as a stage's in
 /// `Error`: a module's hint at its end survives).
-fn effect_warning_text(effect: &impl Fallback, reason: &str) -> String {
+fn effect_warning_text(effect: &impl Fallback, reason: &str, frozen: Frozen) -> String {
     let reason = settings::sanitise(reason, STAGE_REASON_MAX);
-    match effect.on_failure() {
-        EffectOnFailure::Black => format!(
+    let black = || {
+        format!(
             "effect {} unavailable: {reason}; the video is black until it can run",
             effect.mode()
-        ),
-        EffectOnFailure::Image => format!(
-            "effect {} unavailable: {reason}; the fallback image is shown until it can run",
+        )
+    };
+    let away = || {
+        format!(
+            "effect {} unavailable: {reason}; the away image is shown until it can run",
             effect.mode()
-        ),
-        EffectOnFailure::Freeze => format!(
-            "effect {} unavailable: {reason}; the last frame is held until it can run",
-            effect.mode()
-        ),
+        )
+    };
+    match effect.on_failure() {
+        EffectOnFailure::Black => black(),
+        EffectOnFailure::Image => away(),
+        EffectOnFailure::Freeze => match frozen {
+            Frozen::LastFrame => format!(
+                "effect {} unavailable: {reason}; the last frame is held until it can run",
+                effect.mode()
+            ),
+            Frozen::AwayImage => away(),
+            Frozen::Black => black(),
+        },
         EffectOnFailure::None => format!(
             "effect {} unavailable: {reason}; the camera image is shown without the effect \
              ({PRIVACY_OFF})",
@@ -1326,6 +1378,10 @@ struct Streaming {
     contract: OutputContract,
     /// Where the session keeps its frames, from its start to its stop.
     memory: VideoMemory,
+    /// The battery saver chose that memory (system memory, CUDA usable):
+    /// the `video.battery_saver` row's notice compares the saver's decision
+    /// now with it ([`Controller::saver_notice`]).
+    saver: bool,
     /// The image the session output's clock placeholder was last given
     /// (`None`: black): [`SessionParams::placeholder_image`] at the start,
     /// then [`Controller::sync_placeholder`].
@@ -1646,6 +1702,18 @@ pub struct Controller<B: MediaBackend> {
     /// CUDA output failed for want of CUDA). System memory stays in force
     /// until the next reload.
     memory_fallback: Option<String>,
+    /// Why the CUDA presence probe found CUDA unusable at the last
+    /// resolution of [`Self::memory`] (`None`: usable, or not probed).
+    cuda_probe: Option<String>,
+    /// The battery saver as last read ([`Self::read_saver`]).
+    saver: SaverState,
+    /// The power supplies could not be read at the last read: logged once.
+    power_unreadable: bool,
+    /// When the power state was last read by [`Self::poll_power`].
+    power_polled_at: Option<Instant>,
+    /// Privacy's `freeze` holds a frozen frame in the running session's
+    /// effect element, as last polled ([`EffectReport::freeze_held`]).
+    freeze_held: bool,
     published: Published,
     sink_hook: Option<SinkHook>,
     /// The microphone's agent ([`crate::mic::agent`]); `None` without one
@@ -1913,7 +1981,10 @@ impl<B: MediaBackend> Controller<B> {
         let mut backend = backend;
         // Before the modules open: their configuration and what they offer
         // depend on it.
-        let memory = memory_of(&mut backend, &config, None);
+        let (saver, power) = saver_of(&mut backend, &config);
+        let power_unreadable = note_power(&power, false);
+        let cuda_probe = probe_of(&mut backend, &config, None);
+        let memory = effective_memory(&config, None, cuda_probe.as_deref(), &saver);
         info!("video memory: {memory}");
         let modules = if load_modules {
             Modules::load(
@@ -2025,6 +2096,11 @@ impl<B: MediaBackend> Controller<B> {
             compute_capability_learnt: false,
             memory,
             memory_fallback: None,
+            cuda_probe,
+            saver,
+            power_unreadable,
+            power_polled_at: None,
+            freeze_held: false,
             published,
             sink_hook,
             mic: None,
@@ -2227,6 +2303,11 @@ impl<B: MediaBackend> Controller<B> {
                 self.reconcile(now);
             }
             Command::Rescan => self.rescan(now),
+            Command::PowerChanged => {
+                if self.power_changed() {
+                    self.publish();
+                }
+            }
             Command::SetMicHost(on, reply) => self.set_mic_host(on, reply),
             Command::ApplyRecommendedSettings(camera, reply) => {
                 let res = self.apply_recommended(&camera, now);
@@ -2294,6 +2375,9 @@ impl<B: MediaBackend> Controller<B> {
         }
         if let Some(t) = self.next_stats {
             at(t);
+        }
+        if let Some(t) = self.power_poll_due() {
+            at(t.max(now));
         }
         // The placeholder image's decode ends off this thread: its outcome
         // (a `Warning` when it cannot be read) is looked for soon, until
@@ -2430,17 +2514,119 @@ impl<B: MediaBackend> Controller<B> {
         plan
     }
 
-    /// Resolves [`Self::memory`] again ([`memory_of`]), logged when it
-    /// changed.
+    /// Resolves [`Self::memory`] again ([`effective_memory`]), with the
+    /// battery saver read again ([`Self::read_saver`]) and the CUDA
+    /// presence probe made again ([`probe_of`]); logged when it changed.
     fn resolve_memory(&mut self) {
-        let memory = memory_of(
+        self.read_saver();
+        self.settle_memory();
+    }
+
+    /// Resolves [`Self::memory`] again from the battery saver as last read
+    /// ([`Self::saver`]), with the CUDA presence probe made again
+    /// ([`probe_of`]); logged when it changed.
+    fn settle_memory(&mut self) {
+        self.cuda_probe = probe_of(
             &mut self.backend,
             &self.config,
             self.memory_fallback.as_deref(),
         );
+        let memory = effective_memory(
+            &self.config,
+            self.memory_fallback.as_deref(),
+            self.cuda_probe.as_deref(),
+            &self.saver,
+        );
         if memory != self.memory {
             info!("video memory: {memory}");
             self.memory = memory;
+        }
+    }
+
+    /// Reads the power state again and the battery saver's state of it
+    /// ([`saver_of`]); whether that changed.
+    fn read_saver(&mut self) -> bool {
+        let (saver, power) = saver_of(&mut self.backend, &self.config);
+        self.power_unreadable = note_power(&power, self.power_unreadable);
+        if saver == self.saver {
+            return false;
+        }
+        debug!(
+            "battery saver ({}): {}, {}",
+            saver.mode.as_str(),
+            if saver.active { "active" } else { "inactive" },
+            saver.why
+        );
+        self.saver = saver;
+        true
+    }
+
+    /// The power state read again, as the battery saver uses it
+    /// ([`Self::read_saver`]): while idle, a change of the saver is followed
+    /// at once ([`Self::settle_memory`], [`Self::give_memory`]), so the
+    /// memory the `video.memory` row describes and what the modules offer
+    /// are the next start's, and the modules are reopened now rather than
+    /// on the start path. A running session keeps its memory. Whether the
+    /// saver changed (the publication that follows carries it).
+    fn power_changed(&mut self) -> bool {
+        if !self.read_saver() {
+            return false;
+        }
+        if self.session.is_none() {
+            self.settle_memory();
+            self.give_memory();
+        }
+        true
+    }
+
+    /// When [`Self::poll_power`] reads the power state next: [`POWER_POLL`]
+    /// after the last read while a session runs, [`POWER_POLL_IDLE`] while
+    /// idle; `None` before the first poll (due at once).
+    fn power_poll_due(&self) -> Option<Instant> {
+        let t = self.power_polled_at?;
+        Some(if self.session.is_some() {
+            t + POWER_POLL
+        } else {
+            t + POWER_POLL_IDLE
+        })
+    }
+
+    /// Reads the power state again when due ([`Self::power_poll_due`],
+    /// [`Self::power_changed`]): for the notice of the
+    /// `video.battery_saver` row ([`Self::saver_notice`]) while a session
+    /// runs, for the next start's memory and the rows' descriptions while
+    /// idle; the publication that follows carries them.
+    fn poll_power(&mut self, now: Instant) {
+        if self.power_poll_due().is_some_and(|t| now < t) {
+            return;
+        }
+        self.power_polled_at = Some(now);
+        self.power_changed();
+    }
+
+    /// The notice of the `video.battery_saver` row: while a session runs
+    /// under `auto` and the battery saver now decides otherwise than at its
+    /// start (its mode or the power state changed) in a way that changes
+    /// the memory a start would choose, that the change applies when the
+    /// camera restarts; else none. A memory change that is not the saver's
+    /// (`video.memory` changed, CUDA found unusable) gives no notice here.
+    fn saver_notice(&self) -> String {
+        let Some(s) = &self.session else {
+            return String::new();
+        };
+        if self.config.video.memory != MemoryChoice::Auto {
+            return String::new();
+        }
+        let now = effective_memory(
+            &self.config,
+            self.memory_fallback.as_deref(),
+            self.cuda_probe.as_deref(),
+            &self.saver,
+        );
+        if now.memory != s.memory && now.battery_saver != s.saver {
+            BATTERY_SAVER_NOTICE.to_string()
+        } else {
+            String::new()
         }
     }
 
@@ -2452,12 +2638,19 @@ impl<B: MediaBackend> Controller<B> {
             .map_or(self.memory.memory, |s| s.memory)
     }
 
-    /// Resolves the effective video memory again ([`memory_of`]), logged
-    /// when it changed, and gives it to the modules unless a session runs
-    /// (it keeps its own). What the modules then offer is published with
-    /// the next snapshot (their serial moves).
+    /// Resolves the effective video memory again ([`Self::resolve_memory`]),
+    /// logged when it changed, and gives it to the modules unless a session
+    /// runs (it keeps its own). What the modules then offer is published
+    /// with the next snapshot (their serial moves).
     fn follow_memory(&mut self) {
         self.resolve_memory();
+        self.give_memory();
+    }
+
+    /// Gives [`Self::memory`] to the modules unless a session runs: those
+    /// that change between CUDA and system memory are reopened
+    /// ([`Modules::set_memory`]).
+    fn give_memory(&mut self) {
         if self.session.is_some() {
             return;
         }
@@ -2644,7 +2837,7 @@ impl<B: MediaBackend> Controller<B> {
         {
             return None;
         }
-        Some(effect_warning_text(&effect, &why))
+        Some(effect_warning_text(&effect, &why, self.frozen_shows()))
     }
 
     /// Whether the module of `plan` for `stage` can run it now.
@@ -3557,6 +3750,8 @@ impl<B: MediaBackend> Controller<B> {
         facts.privacy_mode_options =
             config_schema::privacy_mode_options(&self.config_set.config.effect);
         facts.video_memory = Some(self.memory.clone());
+        facts.battery_saver = Some(self.saver.clone());
+        facts.battery_saver_notice = self.saver_notice();
         if facts != self.config_facts.1 {
             self.bump_config();
         }
@@ -3625,6 +3820,7 @@ impl<B: MediaBackend> Controller<B> {
     // ---- the step ----
 
     fn reconcile(&mut self, now: Instant) {
+        self.poll_power(now);
         self.watch_placeholder(now);
         self.check_writer(now);
         self.check_session(now);
@@ -4059,6 +4255,7 @@ impl<B: MediaBackend> Controller<B> {
             EffectStatus::Failed(_) => report.fallback_error.clone(),
             _ => None,
         };
+        self.freeze_held = report.freeze_held;
         self.background_failure.clone_from(&report.background_error);
         self.switch_failure.clone_from(&report.switch_error);
         self.load_notice.clone_from(&report.load_notice);
@@ -4286,8 +4483,27 @@ impl<B: MediaBackend> Controller<B> {
     fn effect_failed(&mut self, reason: &str) -> bool {
         let effect = self.effect();
         warning!("effect {} failed: {reason}", effect.mode);
-        self.effect_failure = Some(effect_warning_text(&effect, reason));
+        self.effect_failure = Some(effect_warning_text(&effect, reason, self.frozen_shows()));
         false
+    }
+
+    /// What privacy's `freeze` shows now in place of the effect
+    /// ([`Frozen`]): the last frame while the running session's effect
+    /// element holds one ([`Self::freeze_held`]); else the away image,
+    /// unless none is set or it is known not to be readable (by the effect
+    /// element, or by the writer's placeholder given the same file); else
+    /// black.
+    fn frozen_shows(&self) -> Frozen {
+        if self.session.is_some() && self.freeze_held {
+            return Frozen::LastFrame;
+        }
+        let image = self.effect().fallback_image;
+        let unreadable = self.fallback_failure.is_some()
+            || (self.placeholder_failure.is_some() && self.placeholder_set == image);
+        match image {
+            Some(_) if !unreadable => Frozen::AwayImage,
+            _ => Frozen::Black,
+        }
     }
 
     fn session_label(&self) -> String {
@@ -4566,12 +4782,20 @@ impl<B: MediaBackend> Controller<B> {
                     }
                     policy if policy.hides() => {
                         warning!("effect {} cannot run: {reason}", params.effect.mode);
-                        self.effect_failure = Some(effect_warning_text(&params.effect, &reason));
+                        self.effect_failure = Some(effect_warning_text(
+                            &params.effect,
+                            &reason,
+                            self.frozen_shows(),
+                        ));
                         refused = Some(reason);
                     }
                     _ => {
                         warning!("effect {} cannot run: {reason}", params.effect.mode);
-                        self.effect_failure = Some(effect_warning_text(&params.effect, &reason));
+                        self.effect_failure = Some(effect_warning_text(
+                            &params.effect,
+                            &reason,
+                            self.frozen_shows(),
+                        ));
                         params.effect.mode = EffectMode::None;
                     }
                 }
@@ -4584,6 +4808,7 @@ impl<B: MediaBackend> Controller<B> {
         }
         self.session = Some(Streaming {
             memory: params.memory,
+            saver: self.memory.battery_saver && params.memory == self.memory.memory,
             camera: first.id.clone(),
             node: first.path.clone(),
             failed: Vec::new(),
@@ -4859,6 +5084,7 @@ impl<B: MediaBackend> Controller<B> {
         self.next_stats = None;
         self.effect_seen = None;
         self.effect_polled = false;
+        self.freeze_held = false;
         self.effect_applied = None;
         self.effect_log_at = None;
         self.stage_values.clear();
@@ -6190,7 +6416,8 @@ impl<B: MediaBackend> Controller<B> {
             }
             EffectOnFailure::None => {
                 warning!("{msg}");
-                self.effect_failure = Some(effect_warning_text(&effect, reason));
+                self.effect_failure =
+                    Some(effect_warning_text(&effect, reason, self.frozen_shows()));
                 // Streaming on without the effect, as `none` says.
                 let off = EffectRun {
                     mode: EffectMode::None,
@@ -7425,6 +7652,8 @@ impl<B: MediaBackend> Controller<B> {
         facts.no_frame_generation = self.session_memory() == VideoMemory::System;
         facts.privacy_mode_options =
             config_schema::privacy_mode_options(&self.config_set.config.effect);
+        facts.battery_saver = Some(self.saver.clone());
+        facts.battery_saver_notice = self.saver_notice();
         facts
     }
 
@@ -9149,21 +9378,70 @@ fn migrate_choices(paths: &Paths, set: ConfigSet, runtime: &mut RuntimeState) ->
     }
 }
 
-/// The effective video memory of `config`: under `auto`, system memory for
-/// `fallback` when a start fell back to it (until the next reload), else
-/// what the CUDA presence probe finds; `cuda` and `system` are what they
-/// say, with no probe.
-fn memory_of<B: MediaBackend>(
+/// The CUDA presence probe's finding for `config`: why CUDA is unusable,
+/// `None` when it is usable. Probed only under `auto` with no `fallback`
+/// in force: `cuda` and `system` need no probe, and a fallback stands until
+/// the next reload.
+fn probe_of<B: MediaBackend>(
     backend: &mut B,
     config: &Config,
     fallback: Option<&str>,
+) -> Option<String> {
+    (config.video.memory == MemoryChoice::Auto && fallback.is_none())
+        .then(|| backend.cuda_unusable())
+        .flatten()
+}
+
+/// The effective video memory of `config`: under `auto`, system memory for
+/// `fallback` when a start fell back to it (until the next reload), else
+/// for what the CUDA presence probe found (`probe`, [`probe_of`]), else for
+/// the battery saver when it is active, else CUDA; `cuda` and `system` are
+/// what they say.
+fn effective_memory(
+    config: &Config,
+    fallback: Option<&str>,
+    probe: Option<&str>,
+    saver: &SaverState,
 ) -> EffectiveMemory {
     match (config.video.memory, fallback) {
         (MemoryChoice::Auto, Some(why)) => EffectiveMemory::auto_system(why),
-        (MemoryChoice::Auto, None) => {
-            resolve_memory(MemoryChoice::Auto, backend.cuda_unusable().as_deref())
+        (choice, _) => resolve_memory_saving(choice, probe, Some(saver)),
+    }
+}
+
+/// The battery saver's state under `config` and the power supplies it was
+/// read from: the supplies are read now, power-profiles-daemon's profile
+/// is the backend's cached one (only under `power_profile`).
+fn saver_of<B: MediaBackend>(backend: &mut B, config: &Config) -> (SaverState, PowerSource) {
+    use obc_core::battery_saver::{BatterySaver, PowerProfile};
+    let mode = config.video.battery_saver;
+    let power = match mode {
+        BatterySaver::OnBattery | BatterySaver::PowerProfile => backend.power_source(),
+        // Not read: nothing of it is used.
+        BatterySaver::Off | BatterySaver::Always => PowerSource::External,
+    };
+    // power-profiles-daemon is followed only while a mode reads it.
+    backend.follow_power_profile(mode == BatterySaver::PowerProfile);
+    let profile = match mode {
+        BatterySaver::PowerProfile => backend.power_profile(),
+        _ => PowerProfile::Unavailable,
+    };
+    (saver_state(mode, &power, &profile), power)
+}
+
+/// Logs power supplies that could not be read (`was`: already logged),
+/// once until they can be read again; whether they cannot.
+fn note_power(power: &PowerSource, was: bool) -> bool {
+    match power {
+        PowerSource::Unreadable(why) => {
+            if !was {
+                info!(
+                    "battery saver: the power supply could not be read ({why}): taken as AC power"
+                );
+            }
+            true
         }
-        (choice, _) => resolve_memory(choice, None),
+        _ => false,
     }
 }
 
@@ -9206,6 +9484,9 @@ fn registry_facts(modules: &Modules, memory: &EffectiveMemory) -> RegistryFacts 
         video_memory: Some(memory.clone()),
         // The callers that know of a running session set its memory's.
         no_frame_generation: memory.memory == VideoMemory::System,
+        // The callers set the battery saver's.
+        battery_saver: None,
+        battery_saver_notice: String::new(),
     }
 }
 
@@ -9298,6 +9579,7 @@ fn ipc_group(g: config_schema::ConfigGroup) -> obc_ipc::ConfigGroup {
                 apply: r.apply.as_str().to_string(),
                 enabled: r.enabled,
                 disabled_reason: r.disabled_reason,
+                notice: r.notice,
             })
             .collect(),
     }

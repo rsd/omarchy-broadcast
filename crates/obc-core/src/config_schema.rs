@@ -19,7 +19,8 @@
 //! "Overridden by <file>".
 
 use crate::PrivacyMode;
-use crate::config::{Config, EffectConfig, EffectiveMemory};
+use crate::battery_saver::{BATTERY_SAVER_NOTE, BATTERY_SAVER_OFF_REASON, SaverState};
+use crate::config::{Config, EffectConfig, EffectiveMemory, MemoryChoice};
 use crate::config_d::{ConfigSet, table_get};
 use crate::modules::{FRAME_GENERATION_STAGE, valid_module_id, valid_stage_id};
 
@@ -316,6 +317,20 @@ pub const CORE_KEYS: &[KeySpec] = &[
             ("auto", "Automatic"),
             ("cuda", "GPU memory (CUDA)"),
             ("system", "System memory"),
+        ]),
+        editable: true,
+        apply: Apply::Reload,
+    },
+    KeySpec {
+        key: "video.battery_saver",
+        group: "video",
+        label: "Battery saver",
+        description: BATTERY_SAVER_NOTE,
+        kind: SpecKind::Enum(&[
+            ("off", "Off"),
+            ("on_battery", "On battery"),
+            ("power_profile", "Follow the power profile"),
+            ("always", "Always"),
         ]),
         editable: true,
         apply: Apply::Reload,
@@ -662,6 +677,10 @@ pub const PRIVACY: &str = "effect.privacy";
 pub const LEGACY_ON_FAILURE: &str = "effect.on_failure";
 /// The key whose description is that of [`RegistryFacts::video_memory`].
 pub const VIDEO_MEMORY: &str = "video.memory";
+/// The key whose description is that of [`RegistryFacts::battery_saver`],
+/// and whose notice is [`RegistryFacts::battery_saver_notice`]; not
+/// enabled unless `video.memory` is `auto`.
+pub const BATTERY_SAVER: &str = "video.battery_saver";
 
 /// The description of `effect.privacy`.
 const PRIVACY_NOTE: &str = "Off shows the camera as it is when the requested effect cannot run: refused, failed, its module lost, or still loading at a start. On hides it.";
@@ -760,6 +779,14 @@ pub struct RegistryFacts {
     /// Frame generation cannot run (the video pipeline runs in system
     /// memory): the description of `output.mode` does not mention it.
     pub no_frame_generation: bool,
+    /// Whether the battery saver is active and why: the description of
+    /// `video.battery_saver` is then [`SaverState::description`]. `None`:
+    /// the row's fixed description.
+    pub battery_saver: Option<SaverState>,
+    /// The notice of `video.battery_saver` (empty: none): the saver now
+    /// decides otherwise than when the running session started, and that
+    /// changes the memory a start would choose.
+    pub battery_saver_notice: String,
 }
 
 impl RegistryFacts {
@@ -914,6 +941,9 @@ pub struct ConfigRow {
     pub enabled: bool,
     /// Why not, when not enabled; empty when enabled.
     pub disabled_reason: String,
+    /// A note on the row's value now, such as a change that waits for the
+    /// camera to restart; empty when none.
+    pub notice: String,
 }
 
 /// A group of rows.
@@ -994,6 +1024,7 @@ fn row(
         apply,
         enabled,
         disabled_reason,
+        notice: String::new(),
     }
 }
 
@@ -1032,9 +1063,11 @@ pub fn config_schema(set: &ConfigSet, facts: &RegistryFacts) -> Vec<ConfigGroup>
             (RowKind::Path, ConfigValue::Str(s)) if s.is_empty() => None,
             (_, d) => Some(d),
         };
-        let description = match (spec.key, &facts.video_memory) {
-            (VIDEO_MEMORY, Some(m)) => m.description(),
-            (OUTPUT_MODE, _) if facts.no_frame_generation => OUTPUT_MODE_NOTE_PLAIN.to_string(),
+        let choice = set.config.video.memory;
+        let description = match (spec.key, &facts.video_memory, &facts.battery_saver) {
+            (VIDEO_MEMORY, Some(m), _) => m.description(),
+            (BATTERY_SAVER, _, Some(saver)) => saver.description(choice),
+            (OUTPUT_MODE, ..) if facts.no_frame_generation => OUTPUT_MODE_NOTE_PLAIN.to_string(),
             _ => spec.description.to_string(),
         };
         let mut row = row(
@@ -1054,6 +1087,14 @@ pub fn config_schema(set: &ConfigSet, facts: &RegistryFacts) -> Vec<ConfigGroup>
         if spec.key == PRIVACY_MODE && row.enabled && !effect.privacy_on() {
             row.enabled = false;
             row.disabled_reason = PRIVACY_OFF_REASON.to_string();
+        }
+        // The battery saver acts only under `auto`: greyed otherwise.
+        if spec.key == BATTERY_SAVER {
+            if row.enabled && choice != MemoryChoice::Auto {
+                row.enabled = false;
+                row.disabled_reason = BATTERY_SAVER_OFF_REASON.to_string();
+            }
+            row.notice.clone_from(&facts.battery_saver_notice);
         }
         row
     };
