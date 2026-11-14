@@ -3,7 +3,7 @@
 //! with no row ([`watch_range`]).
 //!
 //! **A quirk row.** A camera listed in [`crate::quirks::RANGE_QUIRKS`]
-//! sends full-range frames in a raw format (YUY2, or NV12 for the MX Brio)
+//! sends full-range frames in a raw format (YUY2)
 //! under a limited-range label. Its USB id comes from sysfs, by the camera
 //! node's device number ([`camera_usb_id`], with
 //! [`crate::xu::usb_device_of_node`]). The ingest then treats its frames as

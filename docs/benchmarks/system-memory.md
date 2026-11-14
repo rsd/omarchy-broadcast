@@ -70,9 +70,11 @@ The cameras' colour description against the levels they send (the luma range ove
 | FHD, MJPEG | decoded as full range (`1:4:0:0`) | 0 to 255 | full, as labelled |
 | FHD, YUYV | limited (`2:4:5:1`) | 22 to 235 | limited, as labelled |
 | MX Brio, MJPEG | decoded as full range | 0 to 255 | full, as labelled |
-| MX Brio, YUYV and NV12 | limited (`2:4:5:1`) | 0 to 255 | **full range, labelled limited** |
+| MX Brio, YUYV and NV12 | limited (`2:4:5:1`) | 0 to 255 (not reproduced, see below) | ~~full range, labelled limited~~ limited, as labelled |
 
 The loopback's output (NV12, limited): luma 18 to 235 from the FHD camera (MJPEG, correct), and 0 to 255 from the MX Brio's NV12, because the pipeline trusts the label of a raw camera on both memory paths ([ADR-0033](../adr/0033-system-memory-pipeline.md), known limitations).
+
+**Correction (2026-11-14): the MX Brio's 0 to 255 did not reproduce.** Controlled re-measurements with the camera connected (fixed settings, formats alternated MJPEG, YUYV, NV12, MJPEG at 1920x1080@30) show its YUYV and NV12 to be limited range as labelled: black at 16, highlights stopping at 235, the raw luma within 1 to 4 levels of 16 + MJPEG x 219/255 at every percentile, and 0.00 to 0.13 % of the samples outside 16 to 235. The MX Brio YUYV and NV12 row and the MX Brio output figure above are kept as the record of that run and are superseded by this paragraph; the cause of the first reading is not known. The FHD camera's rows are unaffected.
 
 ## Interpretation
 
