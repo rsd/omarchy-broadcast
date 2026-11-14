@@ -39,8 +39,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::mpsc::{Sender, channel};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use obc_core::config_d::ConfigSet;
 use obc_ipc::{BUS_NAME, OBJECT_PATH};
 use tokio::signal::unix::{SignalKind, signal};
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
@@ -64,6 +65,23 @@ pub const EXIT_FAILURE: u8 = 1;
 /// daemon is already running). `omarchy-broadcastd.service` does not restart
 /// on it.
 pub const EXIT_NAME_TAKEN: u8 = 3;
+
+/// How long the start waits for the first read of power-profiles-daemon's
+/// profile, under a battery saver mode that reads it
+/// ([`ProfileCache::follow_and_read`]); past it the start carries on with
+/// the profile unavailable, as before the read, and the watcher's read
+/// that follows is taken as any change of the profile.
+pub const FIRST_PROFILE_READ: Duration = Duration::from_millis(500);
+
+/// Whether the battery saver's mode in the configuration at `config` reads
+/// power-profiles-daemon's profile: as the controller loads it, the
+/// defaults when it cannot be loaded.
+fn saver_reads_profile(config: &Path) -> bool {
+    ConfigSet::load(config)
+        .map(|s| s.config.video.battery_saver)
+        .unwrap_or_default()
+        .reads_power_profile()
+}
 
 /// Command-line options.
 #[derive(Debug, Clone, Default)]
@@ -256,14 +274,24 @@ async fn serve(paths: Paths) -> Result<(), DaemonError> {
     let owners = subscribe_owners(&conn).await?;
     tokio::spawn(run_owner_watch(owners, commands.clone()));
     // The battery saver's power profile: followed on the system bus into
-    // a cache the controller reads without waiting, only while the mode is
-    // `power_profile` (the controller says so through the backend), and
-    // never starting power-profiles-daemon.
+    // a cache the controller reads without waiting, only while the mode
+    // reads it (`power_profile`, `auto`; the controller says so through
+    // the backend), and never starting power-profiles-daemon.
     let profiles = ProfileCache::default();
     let tx = commands.clone();
     tokio::spawn(run_profile_watch(profiles.clone(), move || {
         let _ = tx.send(Command::PowerChanged);
     }));
+    // The controller's first decision of the saver (the memory the modules
+    // open with) is taken from the profile as read, not from an empty
+    // cache: the first read is waited for, briefly.
+    if saver_reads_profile(&paths.config) && !profiles.follow_and_read(FIRST_PROFILE_READ).await {
+        info!(
+            "battery saver: power-profiles-daemon's profile was not read within {} ms: \
+             following the battery until it is",
+            FIRST_PROFILE_READ.as_millis()
+        );
+    }
 
     let hook = consumer_watcher(&commands)?;
     let reporter = pipewire_reporter(&commands);
@@ -425,4 +453,32 @@ fn lost_bus() -> DaemonError {
     DaemonError::Other(
         "lost the session bus connection: exiting (the service manager restarts the daemon)".into(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_start_waits_for_the_profile_only_under_a_mode_that_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        // No file, and the defaults: `auto` reads it.
+        assert!(saver_reads_profile(&config));
+        for (mode, reads) in [
+            ("off", false),
+            ("auto", true),
+            ("on_battery", false),
+            ("power_profile", true),
+            ("always", false),
+        ] {
+            std::fs::write(&config, format!("[video]\nbattery_saver = \"{mode}\"\n")).unwrap();
+            assert_eq!(saver_reads_profile(&config), reads, "{mode}");
+        }
+        // A configuration that cannot be loaded: the defaults, as the
+        // controller runs on.
+        std::fs::write(&config, "[video\n").unwrap();
+        assert!(saver_reads_profile(&config));
+        assert!(FIRST_PROFILE_READ <= Duration::from_millis(500));
+    }
 }

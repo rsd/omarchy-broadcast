@@ -192,6 +192,11 @@ memory = "auto"
 # `memory` is "auto"; with "cuda" or "system" it is ignored, and the settings
 # show it greyed.
 #   - "off": never.
+#   - "auto": while the machine runs on its battery or power-profiles-daemon's
+#     active profile is "power-saver" (so on AC power, with Power saver chosen
+#     in the desktop's power menu, the saver applies). Without
+#     power-profiles-daemon it follows the battery exactly as "on_battery"
+#     does, and the row says so.
 #   - "on_battery": while the machine runs on its battery. The daemon reads
 #     /sys/class/power_supply: it is on battery when the machine has a battery
 #     and no external supply (mains, USB or USB-C power delivery, wireless) is
@@ -214,11 +219,15 @@ memory = "auto"
 # for that is the one shown. The decision is made at each camera start and a
 # running session is never torn down: the row's notice says "Applies when the
 # camera restarts" while the saver now decides otherwise than the session did.
+# Under "auto" and "power_profile" the daemon waits up to 500 ms at its start
+# for its first read of the profile, so that the first camera start already
+# honours it.
 # The log line reads `video memory: system (auto: battery saver, on battery)`
-# (or `power profile power-saver`, or `always`), and the description of
+# (or `power profile power-saver`, or `always`; when both hold under "auto",
+# `on battery`), and the description of
 # `memory` says so in `omarchy-broadcast config show`.
-# Default: "on_battery"
-battery_saver = "on_battery"
+# Default: "auto"
+battery_saver = "auto"
 
 [effect]
 # Video effects run on the GPU with the NVIDIA Maxine Video Effects SDK,

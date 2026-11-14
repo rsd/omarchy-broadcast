@@ -6,10 +6,11 @@
 //! controller reads. The controller thread never waits on D-Bus.
 //!
 //! The task follows the profile only while the controller asks for it
-//! ([`ProfileCache::follow`]: the mode is `power_profile`); otherwise it
-//! holds no system bus connection. It never starts power-profiles-daemon:
-//! the service is D-Bus activatable, so a call to its name would start it
-//! (on a machine that manages power otherwise, such as with TLP). Its
+//! ([`ProfileCache::follow`]: the mode is `power_profile` or `auto`);
+//! otherwise it holds no system bus connection. It never starts
+//! power-profiles-daemon: the service is D-Bus activatable, so a call to
+//! its name would start it (on a machine that manages power otherwise,
+//! such as with TLP). Its
 //! property is read only while its name has an owner, and with
 //! `NO_AUTO_START`; the service starting later is learnt from
 //! `NameOwnerChanged`. A failure of the bus is retried, every
@@ -205,11 +206,15 @@ pub const RETRY_MAX: Duration = Duration::from_secs(60);
 /// [`run_profile_watch`], read by the controller (through the backend)
 /// without waiting. [`PowerProfile::Unavailable`] until the first read,
 /// and while it is not followed. With it, whether the controller wants it
-/// followed ([`Self::follow`]), which starts and stops the watcher.
+/// followed ([`Self::follow`]), which starts and stops the watcher; and
+/// whether the watcher has read it since ([`Self::follow_and_read`]).
 #[derive(Debug, Clone)]
 pub struct ProfileCache {
     profile: Arc<Mutex<PowerProfile>>,
     wanted: watch::Sender<bool>,
+    /// Whether the watcher has read the profile (or failed to reach the
+    /// bus) since it was last asked to follow it.
+    read: watch::Sender<bool>,
 }
 
 impl Default for ProfileCache {
@@ -217,6 +222,7 @@ impl Default for ProfileCache {
         ProfileCache {
             profile: Arc::new(Mutex::new(PowerProfile::Unavailable)),
             wanted: watch::channel(false).0,
+            read: watch::channel(false).0,
         }
     }
 }
@@ -241,14 +247,40 @@ impl ProfileCache {
     }
 
     /// Whether the profile is to be followed (the battery saver's mode is
-    /// `power_profile`): the watcher follows it from now on, or stops and
-    /// lets go of the system bus. Cheap when nothing changes.
+    /// `power_profile` or `auto`): the watcher follows it from now on, or
+    /// stops and lets go of the system bus. Cheap when nothing changes.
     pub fn follow(&self, on: bool) {
-        self.wanted.send_if_modified(|w| {
+        let started = self.wanted.send_if_modified(|w| {
             let changed = *w != on;
             *w = on;
             changed
-        });
+        }) && on;
+        if started {
+            self.read.send_replace(false);
+        }
+    }
+
+    /// Follows the profile ([`Self::follow`]) and waits, up to `bound`,
+    /// for the watcher's first read of it: the profile is then
+    /// [`Self::get`]'s, or [`PowerProfile::Unavailable`] for a service
+    /// that is not running or a bus that could not be reached. Whether
+    /// the read came in time; past `bound` the cache is left as it is
+    /// (unavailable until the read) and the watcher carries on. Returns at
+    /// once when the profile was already read since it is followed. For
+    /// the daemon's start, so the first decision of the battery saver is
+    /// not taken before the profile is known.
+    pub async fn follow_and_read(&self, bound: Duration) -> bool {
+        self.follow(true);
+        let mut read = self.read.subscribe();
+        matches!(
+            tokio::time::timeout(bound, read.wait_for(|r| *r)).await,
+            Ok(Ok(_))
+        )
+    }
+
+    /// Notes that the watcher read the profile, or found it could not.
+    fn note_read(&self) {
+        self.read.send_replace(true);
     }
 
     /// Whether the profile is to be followed now.
@@ -395,6 +427,8 @@ async fn watch_profiles<F, Fut>(
         if cache.set(PowerProfile::Unavailable) {
             changed();
         }
+        // Unavailable is the answer until the retry.
+        cache.note_read();
         tokio::select! {
             () = tokio::time::sleep(retry) => {}
             stop = wanted.wait_for(|w| !*w) => drop(stop),
@@ -454,6 +488,7 @@ async fn follow_on(
         if cache.set(profile) {
             changed();
         }
+        cache.note_read();
         // Its properties are followed while it runs.
         let mut props = match service {
             Some(i) => {
@@ -795,7 +830,9 @@ mod tests {
                 },
                 Duration::from_millis(10),
             ));
-            // Long enough for the reads and the subscriptions.
+            // The first read (the daemon's start waits for it), then long
+            // enough for the subscriptions.
+            assert!(cache.follow_and_read(Duration::from_secs(5)).await);
             tokio::time::sleep(Duration::from_millis(500)).await;
             assert_eq!(cache.get(), PowerProfile::Unavailable);
             assert_eq!(connects.load(Ordering::SeqCst), 1, "no failure");
@@ -896,6 +933,95 @@ mod tests {
             cache.follow(true);
             until(&cache, &PowerProfile::Active("balanced".into())).await;
             assert_eq!(connects.load(Ordering::SeqCst), 2);
+            task.abort();
+        });
+    }
+
+    /// The daemon's start waits for the first read: the running service's
+    /// profile is in the cache once the wait returns; a service that is
+    /// not running, or a bus that fails, answers at once as unavailable;
+    /// a bus that does not answer is waited for only up to the bound.
+    #[test]
+    fn the_first_read_is_waited_for_within_a_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = PrivateBus::start_with_services(dir.path(), None);
+        let on_bus = |cache: &ProfileCache| {
+            let address = bus.address.clone();
+            tokio::spawn(watch_profiles(
+                cache.clone(),
+                || {},
+                move || {
+                    let a = address.clone();
+                    async move { zbus::connection::Builder::address(a.as_str()).build().await }
+                },
+                Duration::from_millis(10),
+            ))
+        };
+        let bound = Duration::from_secs(5);
+        runtime().block_on(async {
+            // No service: read, unavailable.
+            let cache = ProfileCache::default();
+            let task = on_bus(&cache);
+            assert!(cache.follow_and_read(bound).await);
+            assert_eq!(cache.get(), PowerProfile::Unavailable);
+            task.abort();
+
+            // The service runs on power-saver: read before the wait ends.
+            let (name, path, _) = POWER_PROFILES[0];
+            let service = bus.connect().await;
+            service
+                .object_server()
+                .at(path, FakeProfiles("power-saver".into()))
+                .await
+                .unwrap();
+            service.request_name(name).await.unwrap();
+            let cache = ProfileCache::default();
+            let task = on_bus(&cache);
+            assert!(cache.follow_and_read(bound).await);
+            assert!(cache.followed());
+            assert_eq!(cache.get(), PowerProfile::Active("power-saver".into()));
+            // Read already: at once.
+            let t = Instant::now();
+            assert!(cache.follow_and_read(bound).await);
+            assert!(t.elapsed() < Duration::from_secs(1));
+            // Followed again after a stop: a fresh read is waited for.
+            cache.follow(false);
+            until(&cache, &PowerProfile::Unavailable).await;
+            assert!(cache.follow_and_read(bound).await);
+            assert_eq!(cache.get(), PowerProfile::Active("power-saver".into()));
+            task.abort();
+
+            // A bus that fails: unavailable at once, retried later.
+            let cache = ProfileCache::default();
+            let task = tokio::spawn(watch_profiles(
+                cache.clone(),
+                || {},
+                || async { Err(zbus::Error::Failure("no bus".into())) },
+                Duration::from_secs(60),
+            ));
+            let t = Instant::now();
+            assert!(cache.follow_and_read(bound).await);
+            assert!(t.elapsed() < Duration::from_secs(1));
+            assert_eq!(cache.get(), PowerProfile::Unavailable);
+            task.abort();
+
+            // A bus that never answers: given up at the bound, the watcher
+            // carrying on.
+            let cache = ProfileCache::default();
+            let task = tokio::spawn(watch_profiles(
+                cache.clone(),
+                || {},
+                std::future::pending::<zbus::Result<Connection>>,
+                Duration::from_millis(10),
+            ));
+            let t = Instant::now();
+            assert!(!cache.follow_and_read(Duration::from_millis(100)).await);
+            let waited = t.elapsed();
+            assert!(waited >= Duration::from_millis(100), "{waited:?}");
+            assert!(waited < Duration::from_secs(2), "{waited:?}");
+            assert_eq!(cache.get(), PowerProfile::Unavailable);
+            assert!(cache.followed());
+            assert!(!task.is_finished());
             task.abort();
         });
     }

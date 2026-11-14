@@ -295,8 +295,10 @@ pub struct World {
     pub cuda_probes: u32,
     /// What the power supplies show (`power_source`): AC power by default.
     pub power_source: PowerSource,
-    /// power-profiles-daemon's profile (`power_profile`): not running by
-    /// default.
+    /// power-profiles-daemon's profile: not running by default. Read
+    /// (`power_profile`) only while it is followed (`profile_followed`),
+    /// as the real cache, which is [`PowerProfile::Unavailable`] otherwise;
+    /// a follow is read at once (as the daemon's start waits for it).
     pub power_profile: PowerProfile,
     /// The power reads made (`power_source`).
     pub power_reads: u32,
@@ -1422,7 +1424,12 @@ impl MediaBackend for FakeBackend {
     }
 
     fn power_profile(&mut self) -> PowerProfile {
-        self.world().power_profile.clone()
+        let w = self.world();
+        if w.profile_followed {
+            w.power_profile.clone()
+        } else {
+            PowerProfile::Unavailable
+        }
     }
 
     fn follow_power_profile(&mut self, on: bool) {

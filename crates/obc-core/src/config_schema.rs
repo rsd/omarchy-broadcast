@@ -328,6 +328,7 @@ pub const CORE_KEYS: &[KeySpec] = &[
         description: BATTERY_SAVER_NOTE,
         kind: SpecKind::Enum(&[
             ("off", "Off"),
+            ("auto", "On battery or power saver"),
             ("on_battery", "On battery"),
             ("power_profile", "Follow the power profile"),
             ("always", "Always"),

@@ -847,9 +847,10 @@ pub struct VideoConfig {
     /// `system`. A change applies at the next camera start.
     pub memory: MemoryChoice,
     /// When `auto` keeps the frames in system memory although CUDA is
-    /// usable: `off`, `on_battery` (the default), `power_profile` or
-    /// `always` ([`crate::battery_saver`]). A change applies at the next
-    /// camera start.
+    /// usable: `off`, `auto` (the default: on battery or on
+    /// power-profiles-daemon's `power-saver` profile), `on_battery`,
+    /// `power_profile` or `always` ([`crate::battery_saver`]). A change
+    /// applies at the next camera start.
     pub battery_saver: BatterySaver,
 }
 
@@ -3099,10 +3100,20 @@ offer_nv12 = false
             resolve_memory(MemoryChoice::Auto, None)
         );
         // The default saver mode.
-        assert_eq!(
-            Config::default().video.battery_saver,
-            BatterySaver::OnBattery
-        );
+        assert_eq!(Config::default().video.battery_saver, BatterySaver::Auto);
+        assert_eq!(VideoConfig::default().battery_saver, BatterySaver::Auto);
+        for (word, mode) in [
+            ("auto", BatterySaver::Auto),
+            ("on_battery", BatterySaver::OnBattery),
+        ] {
+            assert_eq!(
+                parse(&format!("[video]\nbattery_saver = \"{word}\"\n"))
+                    .unwrap()
+                    .video
+                    .battery_saver,
+                mode
+            );
+        }
         assert_eq!(
             parse("[video]\nbattery_saver = \"power_profile\"\n")
                 .unwrap()
