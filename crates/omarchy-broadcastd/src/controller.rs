@@ -404,6 +404,10 @@ pub const STATS_PERIOD: Duration = Duration::from_secs(1);
 const POLL_STARTING: Duration = Duration::from_millis(50);
 /// How often a running session is checked for failures.
 const POLL_RUNNING: Duration = Duration::from_millis(250);
+/// How long the new effects prepared alongside the running session have
+/// to be ready ([`Controller::poll_prepared`]): past it the session
+/// restarts for them instead ([`Controller::switch_timed_out`]).
+pub const PREPARE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The shortest time between two changes of `StageValues`
 /// ([`obc_ipc::STAGE_VALUES_PERIOD_MS`]).
 pub const STAGE_VALUES_PERIOD: Duration = Duration::from_millis(obc_ipc::STAGE_VALUES_PERIOD_MS);
@@ -1256,6 +1260,27 @@ fn plan_ids(plan: &Plan) -> (Option<&str>, Option<&str>, Vec<(&str, &str)>) {
     )
 }
 
+/// [`plan_ids`], owned: what a two-phase switch is prepared for
+/// ([`Preparing::key`]).
+type PlanKey = (Option<String>, Option<String>, Vec<(String, String)>);
+
+fn plan_key(plan: &Plan) -> PlanKey {
+    let (effect, enhance, chains) = plan_ids(plan);
+    (
+        effect.map(str::to_string),
+        enhance.map(str::to_string),
+        chains
+            .into_iter()
+            .map(|(c, m)| (c.to_string(), m.to_string()))
+            .collect(),
+    )
+}
+
+/// What a session started now would run, as a failed two-phase switch
+/// remembers it ([`SwitchFailed::target`]): the modules of its plan, the
+/// background effect and each stage with whether it is on.
+type TargetKey = (PlanKey, EffectMode, Vec<(String, bool)>);
+
 /// The longest failure reason `Error` carries for a stage, and `Warning`
 /// for the background effect, in bytes.
 const STAGE_REASON_MAX: usize = 400;
@@ -1268,6 +1293,11 @@ const LABEL_MAX: usize = obc_module_host::settings::LABEL_MAX;
 /// running session does not run (started without that module): only a new
 /// session runs it.
 const REASON_NEXT_START: &str = "it runs when the camera next starts";
+
+/// [`REASON_NEXT_START`] while the new effects are built alongside the
+/// running session's ([`Controller::preparing`]): the stage runs once they
+/// take over, the camera not reopened.
+const REASON_SWITCHING: &str = "it runs once the new effects are ready";
 
 /// The `Error` text of stage `id`, labelled `label`, that cannot run (the
 /// session streams on without it): the reason made safe to show and
@@ -1392,6 +1422,58 @@ struct Streaming {
     /// (`None`: black): [`SessionParams::placeholder_image`] at the start,
     /// then [`Controller::sync_placeholder`].
     placeholder_image: Option<PathBuf>,
+}
+
+/// A two-phase effect switch in progress ([`Controller::restart_for_modules`]):
+/// the output of the session a start would run now is built alongside the
+/// running one, on the same ingest, while the running one keeps streaming;
+/// once ready it takes over between two frames, the camera never reopened
+/// ([`Controller::poll_prepared`]).
+#[derive(Debug, Clone)]
+struct Preparing {
+    /// The label of what the new session runs that the running one cannot
+    /// ([`Controller::restart_for`]).
+    what: String,
+    /// The plan it runs, and its modules.
+    plan: Plan,
+    key: PlanKey,
+    /// What it was built with.
+    params: SessionParams,
+    /// The privacy policy in force when it was built: whether a session
+    /// started then would hide the camera
+    /// ([`Controller::refuses_passthrough`]) and what the effect's failure
+    /// shows. Another policy discards it.
+    hiding: bool,
+    on_failure: EffectOnFailure,
+    /// The background effect selected then.
+    mode: EffectMode,
+    /// The memory a session started then would run in.
+    memory: EffectiveMemory,
+    /// The camera the running session streamed then.
+    camera: String,
+    /// When it was built: it has [`PREPARE_TIMEOUT`] to be ready.
+    since: Instant,
+}
+
+/// A two-phase switch that failed while the current effects could keep
+/// running ([`Controller::switch_failed`]): not prepared again for the same
+/// target, and `Warning` says so, until the target changes.
+#[derive(Debug, Clone, PartialEq)]
+struct SwitchFailed {
+    target: TargetKey,
+    /// The `Warning` clause.
+    clause: String,
+}
+
+/// Where the output prepared alongside stands ([`Controller::readiness`]).
+#[derive(Debug, Clone, PartialEq)]
+enum Readiness {
+    /// What it runs is still loading.
+    Loading,
+    /// Everything it is to run is ready.
+    Ready,
+    /// The background effect or a stage failed, why.
+    Failed(String),
 }
 
 /// What [`Controller::start_session_once`] asks of the start that called
@@ -1714,6 +1796,22 @@ pub struct Controller<B: MediaBackend> {
     /// in the writer before (the new session's first frame, its bound),
     /// which makes that call a harmless one.
     restart_held: Option<bool>,
+    /// A two-phase effect switch in progress: the new effects are built
+    /// alongside the running session's ([`Self::restart_for_modules`]).
+    /// Discarded with the session ([`Self::drop_session_with`]), and when
+    /// what it was built for no longer stands ([`Self::prepare_outdated`]).
+    preparing: Option<Preparing>,
+    /// A switch in progress was discarded for a camera switch or reopen
+    /// ([`Self::suspend_prepare`]): switching is decided again once the
+    /// camera streams again ([`Self::poll_prepared`]), the running session
+    /// keeping what it runs meanwhile ([`Self::switching_from`]), for no
+    /// longer than [`PREPARE_TIMEOUT`] from when the switch was first
+    /// prepared, the instant held here. Ends with the session.
+    switch_pending: Option<Instant>,
+    /// The last two-phase switch failed while the current effects could
+    /// keep running: the target it was for, not prepared again until it
+    /// changes, and the `Warning` clause saying so. Ends with the session.
+    switch_failed: Option<SwitchFailed>,
     /// The running session's output could not start with its effects and
     /// module stages and streams without them (its plan is empty): the
     /// `Warning` clause saying so. Ends with the session.
@@ -2136,6 +2234,9 @@ impl<B: MediaBackend> Controller<B> {
             background_closed: false,
             background_revoked: false,
             restart_held: None,
+            preparing: None,
+            switch_pending: None,
+            switch_failed: None,
             passthrough: None,
             marked: Vec::new(),
             compute_capability,
@@ -2426,6 +2527,14 @@ impl<B: MediaBackend> Controller<B> {
         }
         if let Some(t) = self.next_stats {
             at(t);
+        }
+        // The new effects prepared alongside are watched as a start is.
+        if self.preparing.is_some() {
+            at(now + POLL_STARTING);
+        }
+        // A switch held back while the camera reopens has its bound.
+        if let Some(since) = self.switch_pending {
+            at((since + PREPARE_TIMEOUT).max(now));
         }
         if let Some(t) = self.power_poll_due() {
             at(t.max(now));
@@ -2768,8 +2877,92 @@ impl<B: MediaBackend> Controller<B> {
     /// run is never requested, so it raises no error; the choice stays in
     /// force and applies once it can run). Enhancement is off here: it is
     /// the ingest's, given per camera ([`Self::session_params_for`]).
+    ///
+    /// While the session switches away from what it runs
+    /// ([`Self::switching_from`]), what it runs of a module that can no
+    /// longer run it is kept as it was given ([`Self::keep_switched_from`]).
     fn effect_run(&self) -> EffectRun {
-        self.effect_run_with(&self.current_plan())
+        let plan = self.current_plan();
+        let mut run = self.effect_run_with(&plan);
+        if self.switching_from() {
+            self.keep_switched_from(&plan, &mut run);
+        }
+        run
+    }
+
+    /// A switch to new effects is in progress ([`Self::preparing`]), or due
+    /// once the camera streams again ([`Self::switch_pending`]): the running
+    /// session keeps running exactly what it ran until the new effects take
+    /// over ([`Self::commit_switch`]) or the switch ends otherwise. Its
+    /// background effect and the stages of a module it switches away from
+    /// (disabled, or no longer able to run them) are neither dropped, nor
+    /// revoked ([`Self::follow_effect_backend`]), nor given off, and
+    /// `Warning` does not call them unavailable; that module's code keeps
+    /// running meanwhile, bounded by the preparation ([`PREPARE_TIMEOUT`]).
+    /// A switch that ends without taking over applies what was kept
+    /// ([`Self::switch_failed`], [`Self::hold_restart`]).
+    fn switching_from(&self) -> bool {
+        self.session.is_some() && (self.preparing.is_some() || self.switch_pending.is_some())
+    }
+
+    /// [`Self::switching_from`]: `run`, what the running session of `plan`
+    /// would be given now, keeps what it was given ([`Self::effect_applied`])
+    /// of what `plan` can no longer run: its background effect, while one
+    /// is selected, and each stage still selected.
+    ///
+    /// The background effect kept follows the effect settings in force
+    /// (mode, strength, image or video): the element runs it on the
+    /// instance it has, which runs the background stage in every mode, so
+    /// a mode changed while the new effects are prepared (and prepared
+    /// again for it, [`Self::prepare_outdated`]) shows at once, never the
+    /// mode or image of before.
+    fn keep_switched_from(&self, plan: &Plan, run: &mut EffectRun) {
+        let Some(applied) = &self.effect_applied else {
+            return;
+        };
+        let effect = self.effect();
+        if run.mode == EffectMode::None
+            && applied.mode != EffectMode::None
+            && effect.mode != EffectMode::None
+            && !self.runs_in(plan, &StageId::BACKGROUND)
+        {
+            // As [`Self::effect_run_with`] gives it to a module that runs
+            // it (the strength is given whatever the mode).
+            let (image, video) = self.background_parts(effect.background_image);
+            run.mode = effect.mode;
+            run.background_image = image;
+            run.background_video = video.filter(|_| effect.mode == EffectMode::Replace);
+        }
+        for s in run
+            .stages
+            .iter_mut()
+            .chain(run.chains.iter_mut().flat_map(|c| c.stages.iter_mut()))
+        {
+            if let Some(was) = applied.stage(s.id.as_str())
+                && was.enabled
+                && !s.enabled
+                && !self.runs_in(plan, &s.id)
+                && self.selected(plan, &s.id)
+            {
+                *s = was.clone();
+            }
+        }
+    }
+
+    /// [`Self::switching_from`], and the running session still runs `stage`
+    /// (as it was last given, [`Self::effect_applied`]): `Warning` does not
+    /// call it unavailable.
+    fn kept_switching(&self, stage: &StageId) -> bool {
+        if !self.switching_from() {
+            return false;
+        }
+        let Some(applied) = &self.effect_applied else {
+            return false;
+        };
+        if *stage == StageId::BACKGROUND {
+            return applied.mode != EffectMode::None && !self.background_revoked;
+        }
+        applied.stage(stage.as_str()).is_some_and(|s| s.enabled)
     }
 
     fn effect_run_with(&self, plan: &Plan) -> EffectRun {
@@ -2875,11 +3068,17 @@ impl<B: MediaBackend> Controller<B> {
             return None;
         }
         let why = match self.standing(plan, &StageId::BACKGROUND) {
+            // Still run by the session it switches away from.
+            Standing::Missing { .. } | Standing::Elsewhere
+                if self.kept_switching(&StageId::BACKGROUND) =>
+            {
+                return None;
+            }
             Standing::Missing { module, reason } => match module {
                 Some(name) => format!("{name}: {reason}"),
                 None => reason,
             },
-            Standing::Elsewhere if self.fails_closed(plan) => REASON_NEXT_START.to_string(),
+            Standing::Elsewhere if self.fails_closed(plan) => self.next_start_reason().to_string(),
             _ => return None,
         };
         let effect = self.effect();
@@ -2890,6 +3089,17 @@ impl<B: MediaBackend> Controller<B> {
             return None;
         }
         Some(effect_warning_text(&effect, &why, self.frozen_shows()))
+    }
+
+    /// Why a stage that only a new session runs is not running
+    /// ([`Standing::Elsewhere`]): [`REASON_NEXT_START`], or
+    /// [`REASON_SWITCHING`] while a switch is built alongside.
+    fn next_start_reason(&self) -> &'static str {
+        if self.preparing.is_some() {
+            REASON_SWITCHING
+        } else {
+            REASON_NEXT_START
+        }
     }
 
     /// Whether the module of `plan` for `stage` can run it now.
@@ -2997,11 +3207,13 @@ impl<B: MediaBackend> Controller<B> {
         stages
             .iter()
             .filter_map(|s| match self.standing(plan, s) {
+                // Still run by the session it switches away from.
+                Standing::Missing { .. } | Standing::Elsewhere if self.kept_switching(s) => None,
                 Standing::Missing { module, reason } => Some((self.label_of(s), module, reason)),
                 // Run only by a new session: the second pass of a session
                 // start never restarts ([`Self::start_session`]).
                 Standing::Elsewhere => {
-                    Some((self.label_of(s), None, REASON_NEXT_START.to_string()))
+                    Some((self.label_of(s), None, self.next_start_reason().to_string()))
                 }
                 _ => None,
             })
@@ -3068,6 +3280,7 @@ impl<B: MediaBackend> Controller<B> {
                 .chain(self.fallback_warnings())
                 .chain(self.video_warnings())
                 .chain(self.switch_warning())
+                .chain(self.overlap_warning())
                 .chain(self.load_notice_warning())
                 .chain(still_video)
                 .chain(dropped_text(&dropped))
@@ -3097,6 +3310,19 @@ impl<B: MediaBackend> Controller<B> {
             self.effect_module_label(),
             settings::sanitise(why, STAGE_REASON_MAX)
         ))
+    }
+
+    /// `Warning`'s clause of a two-phase switch that failed while the
+    /// current effects keep running ([`Self::switch_failed`]): what the new
+    /// session would run, the reason, made safe to show and bounded as the
+    /// other clauses, and that the current effects keep running: only while
+    /// they do ([`Self::old_chain_runs`]).
+    fn overlap_warning(&self) -> Option<String> {
+        self.session.as_ref()?;
+        if !self.old_chain_runs() {
+            return None;
+        }
+        self.switch_failed.as_ref().map(|f| f.clause.clone())
     }
 
     /// `Warning`'s clause of what the running session's effect module said
@@ -3243,17 +3469,18 @@ impl<B: MediaBackend> Controller<B> {
     /// again ([`Self::follow_background`]) and, with `enhance`, the ingest
     /// reopened with or without enhancement ([`Self::follow_enhance`]),
     /// the camera kept open otherwise. When a new session would run a
-    /// selected stage that this one cannot ([`Self::restart_for`]), the
-    /// session is stopped instead, and the lifecycle starts a new one with
-    /// it (the camera reopened): an output built without a module cannot
-    /// take it later; without `restart` (the second pass of a session
-    /// start, [`Self::start_session`]) it never is. Whether the session was
-    /// stopped.
+    /// selected stage that this one cannot ([`Self::restart_for`]), it
+    /// switches to the new one ([`Self::restart_for_modules`]): built
+    /// alongside where it can, else stopped instead and the lifecycle
+    /// starts a new one with it (the camera reopened): an output built
+    /// without a module cannot take it later; without `restart` (the second
+    /// pass of a session start, [`Self::start_session`]) it never is.
+    /// Whether the session was stopped.
     fn follow_modules(&mut self, enhance: bool, now: Instant, restart: bool) -> bool {
         if self.session.is_none() {
             return false;
         }
-        if restart && self.restart_for_modules() {
+        if restart && self.restart_for_modules(now) {
             return true;
         }
         self.follow_stages();
@@ -3263,9 +3490,546 @@ impl<B: MediaBackend> Controller<B> {
         false
     }
 
-    /// Stops the running session when a new one would run a selected stage
-    /// that it cannot ([`Self::restart_for`]); the lifecycle starts the new
-    /// one. Whether it was stopped.
+    /// When a new session would run a selected stage that the running one
+    /// cannot ([`Self::restart_for`]), switches to it: without reopening the
+    /// camera where it can ([`Self::overlap_refusal`]), the new effects
+    /// built alongside the running ones on the same ingest and taking over
+    /// once ready ([`Self::prepare_switch`], [`Self::poll_prepared`]), the
+    /// running session streaming meanwhile; else by a restart
+    /// ([`Self::hold_restart`]). A switch that failed while the current
+    /// effects keep running ([`Self::switch_failed`]) is not tried again for
+    /// the same target, nor restarted for. A switch in progress for what no
+    /// longer stands ([`Self::prepare_outdated`]) is discarded first.
+    /// Whether the session was stopped.
+    fn restart_for_modules(&mut self, now: Instant) -> bool {
+        self.restart_for_modules_since(now)
+    }
+
+    /// [`Self::restart_for_modules`], a switch prepared now given its
+    /// [`PREPARE_TIMEOUT`] from `since` (a switch held back for a camera
+    /// reopen keeps the bound of its first preparation,
+    /// [`Self::poll_pending`]).
+    ///
+    /// The memory of a failed switch holds only while the current effects
+    /// do keep running ([`Self::old_chain_runs`]): once they cannot (a
+    /// module disabled, a probe or a pin that takes a stage they run from
+    /// them), it is forgotten and the session restarts for the new effects.
+    fn restart_for_modules_since(&mut self, since: Instant) -> bool {
+        if let Some(why) = self.prepare_outdated() {
+            self.abort_prepare(why);
+        }
+        let Some((what, enhance)) = self.restart_for() else {
+            self.abort_prepare("the running session runs what is selected");
+            self.switch_pending = None;
+            self.switch_failed = None;
+            return false;
+        };
+        if self.preparing.is_some() {
+            return false;
+        }
+        let target = self.target_key();
+        if let Some(f) = &self.switch_failed {
+            if f.target == target {
+                if self.old_chain_runs() {
+                    return false;
+                }
+                info!("{what}: the current effects can no longer run what they ran");
+                self.switch_failed = None;
+                self.hold_restart(&what);
+                return true;
+            }
+            self.switch_failed = None;
+        }
+        match self.overlap_refusal(enhance) {
+            Some(why) => info!("{what}: not switching alongside ({why})"),
+            None => match self.prepare_switch(&what, since) {
+                Ok(stopped) => return stopped,
+                Err(why) => info!("{what}: not switching alongside ({why})"),
+            },
+        }
+        self.hold_restart(&what);
+        true
+    }
+
+    /// Why the running session cannot switch to a new one without
+    /// reopening the camera ([`Self::restart_for_modules`]), `None` when it
+    /// can: it streams (a camera frame reached its output) with its effects
+    /// in CUDA memory, a session started now would run in CUDA memory on
+    /// the same camera, output contract and enhancer, what it needs is not
+    /// enhancement (`enhance`: the ingest's), and the GPU has room for a
+    /// second chain ([`MediaBackend::overlap_headroom`]).
+    fn overlap_refusal(&mut self, enhance: bool) -> Option<String> {
+        let s = self.session.as_ref()?;
+        if !s.live || s.awaiting.is_some() || !s.open {
+            return Some("the camera is not streaming yet".into());
+        }
+        if self.passthrough.is_some() {
+            return Some("the session streams without its effects".into());
+        }
+        if s.memory != VideoMemory::Cuda || self.next_memory().memory != VideoMemory::Cuda {
+            return Some("system memory".into());
+        }
+        if enhance {
+            return Some("enhancement is the camera's ingest".into());
+        }
+        if self.chosen_camera().is_none_or(|c| c.id != s.camera) {
+            return Some("a new session would start on another camera".into());
+        }
+        if self.output_contract() != s.contract {
+            return Some("the output contract changed".into());
+        }
+        if !self.same_ingest(&self.fresh_plan()) {
+            return Some("a new session would build the camera's ingest otherwise".into());
+        }
+        self.backend.overlap_headroom().err()
+    }
+
+    /// A session of `plan` would build the running session's ingest as it
+    /// is: with the enhance stage or without it as it was built, and with
+    /// it, from the same module with the same load-time parameters.
+    fn same_ingest(&self, plan: &Plan) -> bool {
+        let (Some(s), Some(camera)) = (&self.session, self.session_camera()) else {
+            return false;
+        };
+        let wants = self.enhance_for_with(plan, camera);
+        if wants != s.enhance {
+            return false;
+        }
+        if !wants {
+            return true;
+        }
+        let id = |p: Option<&Plan>| p.and_then(|p| p.enhance.as_ref()).map(|m| m.id.clone());
+        id(Some(plan)) == id(self.plan.as_ref())
+            && self
+                .modules
+                .stage_run(plan, &self.config, &self.runtime, &StageId::ENHANCE)
+                .params
+                == s.enhance_params
+    }
+
+    /// The memory a session started now would run in, as the battery saver
+    /// decides it now ([`effective_memory`]; [`Self::memory`] is resolved
+    /// only at a start while a session runs).
+    fn next_memory(&self) -> EffectiveMemory {
+        effective_memory(
+            &self.config,
+            self.memory_fallback.as_deref(),
+            self.cuda_probe.as_deref(),
+            &self.saver,
+        )
+    }
+
+    /// What a session started now would run ([`TargetKey`]).
+    fn target_key(&self) -> TargetKey {
+        let plan = self.fresh_plan();
+        let run = self.effect_run_with(&plan);
+        let stages = run
+            .stages
+            .iter()
+            .chain(run.chains.iter().flat_map(|c| c.stages.iter()))
+            .map(|s| (s.id.to_string(), s.enabled))
+            .collect();
+        (plan_key(&plan), run.mode, stages)
+    }
+
+    /// Builds the output of the session a start would run now alongside
+    /// the running one, on its ingest ([`MediaBackend::prepare_session`]),
+    /// with the params a start would give it ([`Self::session_params_with`])
+    /// but the ingest's own (its fixed frame rate and enhancement), and
+    /// follows it ([`Self::preparing`]). The effect is checked first as a
+    /// start checks it: settings or a module that refuse it are the start
+    /// path's to handle (`Err`, with why: restarted instead). A build that
+    /// fails is the switch's failure ([`Self::switch_failed`]): whether that
+    /// stopped the session.
+    fn prepare_switch(&mut self, what: &str, since: Instant) -> Result<bool, String> {
+        let plan = self.fresh_plan();
+        let mut params = self.session_params_with(&plan);
+        let Some(s) = self.session.as_ref() else {
+            return Err("no session".into());
+        };
+        let camera = s.camera.clone();
+        params.fixed_framerate = s.pinned;
+        params.effect.enhance = s.enhance;
+        params.effect.enhance_params = s.enhance_params.clone();
+        if params.effect.mode != EffectMode::None {
+            Self::effect_settings_check(&params.effect)?;
+            self.effect_check_with(&params.effect, &plan)?;
+        }
+        let effect = self.effect();
+        info!("a module provides {what} now: preparing the new effects alongside");
+        // From here the new modules' code runs: marked in the crash ledger
+        // until the session stops.
+        self.mark_running_with(&plan, &params.effect);
+        let built = self.backend.prepare_session(&params);
+        self.preparing = Some(Preparing {
+            what: what.to_string(),
+            key: plan_key(&plan),
+            plan,
+            params,
+            hiding: self.refuses_passthrough(),
+            on_failure: effect.policy(),
+            mode: effect.mode,
+            memory: self.next_memory(),
+            camera,
+            since,
+        });
+        Ok(match built {
+            Ok(()) => false,
+            Err(e) => self.switch_failed(&e.message),
+        })
+    }
+
+    /// Why the switch in progress ([`Self::preparing`]) is no longer what a
+    /// switch would build now, `None` while it is (or none is in
+    /// progress): the session stopped, its camera reopened or switched,
+    /// the privacy policy, the background effect or the memory a start
+    /// would choose changed, or the modules a start would run did.
+    fn prepare_outdated(&self) -> Option<&'static str> {
+        let p = self.preparing.as_ref()?;
+        let Some(s) = &self.session else {
+            return Some("the session stopped");
+        };
+        if s.camera != p.camera || !s.live || s.awaiting.is_some() || !s.open {
+            return Some("the camera was reopened");
+        }
+        let effect = self.effect();
+        if self.refuses_passthrough() != p.hiding || effect.policy() != p.on_failure {
+            return Some("the privacy policy changed");
+        }
+        if effect.mode != p.mode {
+            return Some("the background effect changed");
+        }
+        if self.next_memory() != p.memory {
+            return Some("the video memory changed");
+        }
+        if plan_key(&self.fresh_plan()) != p.key {
+            return Some("the modules changed again");
+        }
+        None
+    }
+
+    /// Discards the switch in progress, if any, for `why`; the running
+    /// session never noticed.
+    fn abort_prepare(&mut self, why: &str) {
+        if self.preparing.take().is_some() {
+            info!("not switching to the new effects: {why}");
+            self.backend.discard_prepared();
+        }
+    }
+
+    /// [`Self::abort_prepare`] for a camera switch or reopen (`why`): the
+    /// switch is decided again once the camera streams again
+    /// ([`Self::switch_pending`]), within the bound of its first
+    /// preparation.
+    fn suspend_prepare(&mut self, why: &str) {
+        if let Some(since) = self.preparing.as_ref().map(|p| p.since) {
+            self.abort_prepare(why);
+            self.switch_pending = Some(since);
+        }
+    }
+
+    /// The switch held back for a camera switch or reopen
+    /// ([`Self::switch_pending`]), prepared first at `since`: decided again
+    /// once the camera streams again, prepared anew within the same bound
+    /// ([`Self::restart_for_modules_since`]). Past [`PREPARE_TIMEOUT`] it is
+    /// held back no longer, streaming or not: the session restarts for
+    /// the new effects, as a switch not ready in time does
+    /// ([`Self::switch_timed_out`]), or, with nothing to switch to any
+    /// more, what was kept follows the modules.
+    fn poll_pending(&mut self, now: Instant, since: Instant) {
+        if now.saturating_duration_since(since) >= PREPARE_TIMEOUT {
+            self.switch_pending = None;
+            match self.restart_for() {
+                Some((what, _)) => {
+                    warning!(
+                        "{what}: the camera did not stream again within {} s of the switch: \
+                         restarting the camera for the new effects",
+                        PREPARE_TIMEOUT.as_secs()
+                    );
+                    self.hold_restart(&what);
+                }
+                None => self.follow_stages(),
+            }
+            return;
+        }
+        if !self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.live && s.awaiting.is_none() && s.open)
+        {
+            return;
+        }
+        self.switch_pending = None;
+        info!("the camera streams again: switching is decided again");
+        if !self.restart_for_modules_since(since) && self.preparing.is_none() {
+            // Nothing to switch to any more: what was kept follows the
+            // modules now.
+            self.follow_stages();
+        }
+    }
+
+    /// Follows the switch in progress ([`Self::preparing`]), at each
+    /// lifecycle step: discarded when what it was built for no longer
+    /// stands, and switching is decided again ([`Self::restart_for_modules`]:
+    /// prepared anew, or restarted); committed once the prepared output has
+    /// a camera frame through its chain and everything it is to run is ready
+    /// ([`Self::readiness`], [`Self::commit_switch`]); failed when its
+    /// pipeline, its background effect or one of its stages fails
+    /// ([`Self::switch_failed`]); restarted for when it is not ready within
+    /// [`PREPARE_TIMEOUT`] ([`Self::switch_timed_out`]).
+    ///
+    /// A switch discarded for a camera switch or reopen
+    /// ([`Self::switch_pending`]) is decided again once the camera streams
+    /// again, within its bound ([`Self::poll_pending`]).
+    fn poll_prepared(&mut self, now: Instant) {
+        if self.preparing.is_none() {
+            if let Some(since) = self.switch_pending
+                && self.session.is_some()
+            {
+                self.poll_pending(now, since);
+            }
+            return;
+        }
+        if let Some(why) = self.prepare_outdated() {
+            self.abort_prepare(why);
+            if !self.restart_for_modules(now) && self.preparing.is_none() {
+                // Nothing prepared any more: what was kept follows the
+                // modules now.
+                self.follow_stages();
+            }
+            return;
+        }
+        let Some(report) = self.backend.prepared_report() else {
+            self.switch_failed("the output prepared alongside is gone");
+            return;
+        };
+        if let Some(f) = &report.failure {
+            self.switch_failed(f);
+            return;
+        }
+        let Some(p) = &self.preparing else { return };
+        let since = p.since;
+        match self.readiness(p, &report.effect) {
+            Readiness::Failed(why) => {
+                self.switch_failed(&why);
+                return;
+            }
+            Readiness::Ready if report.first_frame => {
+                self.commit_switch(now);
+                return;
+            }
+            Readiness::Ready | Readiness::Loading => {}
+        }
+        if now.saturating_duration_since(since) >= PREPARE_TIMEOUT {
+            self.switch_timed_out();
+        }
+    }
+
+    /// The switch in progress was not ready within [`PREPARE_TIMEOUT`]: a
+    /// slow load, not a failure of the new effects, which a restart runs
+    /// (and waits for, as any start): discarded, and the session restarted
+    /// for them once ([`Self::hold_restart`]), nothing remembered.
+    fn switch_timed_out(&mut self) {
+        let Some(p) = self.preparing.take() else {
+            return;
+        };
+        self.backend.discard_prepared();
+        warning!(
+            "{}: the new effects were not ready within {} s: restarting the camera for them",
+            p.what,
+            PREPARE_TIMEOUT.as_secs()
+        );
+        self.hold_restart(&p.what);
+    }
+
+    /// Where the output prepared for `p` stands, from its `report`: ready
+    /// once its background effect is ready, when its plan runs one and one
+    /// is selected, and every stage on that its plan runs is ready (with
+    /// the `none` effect the effect's own status stays off: the stages
+    /// say); failed with the first failure of those.
+    fn readiness(&self, p: &Preparing, report: &EffectReport) -> Readiness {
+        let mut loading = false;
+        if p.params.effect.mode != EffectMode::None && self.runs_in(&p.plan, &StageId::BACKGROUND) {
+            match &report.status {
+                EffectStatus::Ready => {}
+                EffectStatus::Failed(r) => {
+                    return Readiness::Failed(format!("effect {}: {r}", p.params.effect.mode));
+                }
+                EffectStatus::Off | EffectStatus::Loading => loading = true,
+            }
+        }
+        let run = &p.params.effect;
+        for s in run
+            .stages
+            .iter()
+            .chain(run.chains.iter().flat_map(|c| c.stages.iter()))
+            .filter(|s| s.enabled && self.runs_in(&p.plan, &s.id))
+        {
+            match report
+                .stages
+                .iter()
+                .find(|(id, _)| *id == s.id)
+                .map(|(_, st)| st)
+            {
+                Some(EffectStatus::Ready) => {}
+                Some(EffectStatus::Failed(r)) => {
+                    return Readiness::Failed(format!(
+                        "{}: {r}",
+                        self.modules.stage_label(s.id.as_str())
+                    ));
+                }
+                Some(EffectStatus::Off | EffectStatus::Loading) => loading = true,
+                // Not built (a chain whose module could not make it, which
+                // the output runs without, as a start does): not awaited.
+                None => {}
+            }
+        }
+        if loading {
+            Readiness::Loading
+        } else {
+            Readiness::Ready
+        }
+    }
+
+    /// The switch in progress takes over ([`MediaBackend::commit_prepared`]):
+    /// the session runs its plan and backends from now on, as a start of it
+    /// would have (the camera, kept open, still streams), the effect
+    /// settings changed meanwhile are given to it ([`Self::apply_effect`]).
+    /// No restart hold is taken. A commit that fails is the switch's
+    /// failure.
+    fn commit_switch(&mut self, now: Instant) {
+        let Some(p) = self.preparing.take() else {
+            return;
+        };
+        if let Err(e) = self.backend.commit_prepared() {
+            self.preparing = Some(p);
+            self.switch_failed(&e);
+            return;
+        }
+        info!(
+            "switched to the new effects without a restart ({} ms)",
+            now.saturating_duration_since(p.since).as_millis()
+        );
+        self.switch_failed = None;
+        self.switch_pending = None;
+        // The old chain's values and log period are not the new one's.
+        self.stage_values.clear();
+        self.stage_values_at = None;
+        self.effect_log_at = None;
+        self.background_planned = self.runs_in(&p.plan, &StageId::BACKGROUND);
+        self.plan = Some(p.plan);
+        self.background_revoked = false;
+        self.background_closed = false;
+        self.hold_background();
+        // What the new output was built with, followed from its load.
+        self.effect_applied = Some(p.params.effect.clone());
+        self.effect_seen = None;
+        self.effect_failure = None;
+        self.fallback_failure = None;
+        self.background_failure = None;
+        self.switch_failure = None;
+        self.load_notice = None;
+        self.freeze_held = false;
+        if self.take_stage_failures() {
+            self.error = self.standing_error();
+        }
+        self.stages.clear();
+        if let Some(s) = self.session.as_mut() {
+            s.placeholder_image.clone_from(&p.params.placeholder_image);
+        }
+        self.sync_placeholder();
+        if let Err(e) = self.apply_effect() {
+            debug!("the effects after the switch: {e:?}");
+        }
+    }
+
+    /// The switch in progress failed for `reason`: discarded. While the
+    /// current effects keep running (everything they run, their modules
+    /// still run, [`Self::old_chain_runs`]), they do, and `Warning` says so
+    /// until the target changes or they no longer can
+    /// ([`Self::switch_failed`]); else (a module they run was disabled, or
+    /// can no longer run their background effect or a stage they kept) the
+    /// session restarts at once ([`Self::hold_restart`]). Whether the
+    /// session was stopped.
+    fn switch_failed(&mut self, reason: &str) -> bool {
+        let Some(p) = self.preparing.take() else {
+            return false;
+        };
+        self.backend.discard_prepared();
+        warning!("{}: could not switch to the new effects: {reason}", p.what);
+        if self.old_chain_runs() {
+            self.switch_failed = Some(SwitchFailed {
+                target: self.target_key(),
+                clause: format!(
+                    "{}: could not switch: {}; the current effects keep running",
+                    settings::sanitise(&p.what, LABEL_MAX),
+                    settings::sanitise(reason, STAGE_REASON_MAX)
+                ),
+            });
+            // What the session kept while switching follows the modules
+            // now.
+            self.follow_stages();
+            return false;
+        }
+        info!("the current effects can no longer run what they ran");
+        self.switch_failed = None;
+        self.hold_restart(&p.what);
+        true
+    }
+
+    /// The running session's effects keep running as they are once nothing
+    /// is kept for a switch ([`Self::keep_switched_from`]): every module of
+    /// its plan may still run ([`Self::old_chain_allowed`]), and nothing it
+    /// runs would be dropped or revoked ([`Self::follow_stages`]) — its
+    /// background effect, while one is selected and it runs one, is run by
+    /// its module ([`Self::background_lost`] is not), and so is each stage
+    /// it runs that is still selected.
+    fn old_chain_runs(&self) -> bool {
+        if !self.old_chain_allowed() {
+            return false;
+        }
+        let (Some(plan), Some(applied)) = (&self.plan, &self.effect_applied) else {
+            return true;
+        };
+        if applied.mode != EffectMode::None
+            && self.effect().mode != EffectMode::None
+            && (self.background_lost(plan) || self.background_revoked)
+        {
+            return false;
+        }
+        applied
+            .stages
+            .iter()
+            .chain(applied.chains.iter().flat_map(|c| c.stages.iter()))
+            .filter(|s| s.enabled)
+            .all(|s| self.runs_in(plan, &s.id) || !self.selected(plan, &s.id))
+    }
+
+    /// Every module of the running session's backends (its effect
+    /// element's, its enhancer, its chains', [`Plan::backends`]) is still
+    /// available, or is the module it keeps for its background effect and
+    /// can still run it ([`Modules::hold`]): a module the user disabled
+    /// since is not, even when the session dropped what it ran of it.
+    fn old_chain_allowed(&self) -> bool {
+        let Some(plan) = &self.plan else {
+            return true;
+        };
+        let background = plan.provider(&StageId::BACKGROUND);
+        let backends = plan.backends();
+        backends
+            .effect
+            .iter()
+            .chain(backends.enhance.iter())
+            .chain(backends.chains.iter().map(|(_, m)| m))
+            .all(|m| {
+                self.modules.status(&m.id) == Some(obc_module_host::ModuleStatus::Available)
+                    || (background == Some(m.id.as_str())
+                        && self.runs_in(plan, &StageId::BACKGROUND))
+            })
+    }
+
+    /// Stops the running session for a new one that runs `what`, which it
+    /// cannot ([`Self::restart_for`]); the lifecycle starts the new one.
     ///
     /// A deliberate restart, never a failure: the writer holds the
     /// session's last frame across it
@@ -3281,10 +4045,7 @@ impl<B: MediaBackend> Controller<B> {
     /// clock's placeholder (black, or the away image) shows; or until a
     /// stop, the camera turned off, a failed start or a policy that now
     /// hides the camera ends it first ([`Self::end_restart_hold`]).
-    fn restart_for_modules(&mut self) -> bool {
-        let Some(what) = self.restart_for() else {
-            return false;
-        };
+    fn hold_restart(&mut self, what: &str) {
         info!("a module provides {what} now: restarting the camera to run it");
         let hiding = self.refuses_passthrough();
         let hidden = hiding
@@ -3309,7 +4070,6 @@ impl<B: MediaBackend> Controller<B> {
                 c.restart_held = Some(hiding);
             }
         });
-        true
     }
 
     /// Ends the writer's restart hold ([`Self::restart_for_modules`]) when
@@ -3367,7 +4127,10 @@ impl<B: MediaBackend> Controller<B> {
     /// next start), and a new session of the same modules as the running
     /// one runs nothing more (so a session is never restarted again for
     /// what it just started with).
-    fn restart_for(&self) -> Option<String> {
+    ///
+    /// With the label, whether what it names is enhancement (the ingest's
+    /// stage: only a new ingest runs it).
+    fn restart_for(&self) -> Option<(String, bool)> {
         self.session.as_ref()?;
         let plan = self.plan.as_ref()?;
         let next = self.fresh_plan();
@@ -3375,7 +4138,7 @@ impl<B: MediaBackend> Controller<B> {
             return None;
         }
         if self.standing(plan, &StageId::BACKGROUND) == Standing::Elsewhere {
-            return Some("the background effect".into());
+            return Some(("the background effect".into(), false));
         }
         let runs_here = |id: &StageId| self.runs_in(plan, id);
         let then = self.effect_run_with(&next);
@@ -3385,7 +4148,7 @@ impl<B: MediaBackend> Controller<B> {
             .chain(then.chains.iter().flat_map(|c| c.stages.iter()))
             .find(|s| s.enabled && !runs_here(&s.id))
         {
-            return Some(self.modules.stage_label(s.id.as_str()));
+            return Some((self.modules.stage_label(s.id.as_str()), false));
         }
         let enhance = StageId::ENHANCE;
         if next.enhance.is_some()
@@ -3397,7 +4160,7 @@ impl<B: MediaBackend> Controller<B> {
                 .session_camera()
                 .is_some_and(|c| self.enhance_applies(c) == effects::Applies::Yes)
         {
-            return Some(self.modules.stage_label(enhance.as_str()));
+            return Some((self.modules.stage_label(enhance.as_str()), true));
         }
         None
     }
@@ -3492,13 +4255,17 @@ impl<B: MediaBackend> Controller<B> {
     /// module provides it, it is on and can run, and it applies to the
     /// camera.
     fn enhance_for(&self, camera: &Camera) -> bool {
-        let plan = self.current_plan();
+        self.enhance_for_with(&self.current_plan(), camera)
+    }
+
+    /// [`Self::enhance_for`] for a session of `plan`.
+    fn enhance_for_with(&self, plan: &Plan, camera: &Camera) -> bool {
         // The stage takes CUDA frames.
         self.session_memory() == VideoMemory::Cuda
             && plan.enhance.is_some()
             && self
                 .modules
-                .stage_on(&plan, &self.config, &self.runtime, &StageId::ENHANCE)
+                .stage_on(plan, &self.config, &self.runtime, &StageId::ENHANCE)
             && self.enhance_installed() != Some(false)
             && self.enhance_applies(camera) == effects::Applies::Yes
     }
@@ -3746,14 +4513,20 @@ impl<B: MediaBackend> Controller<B> {
     }
 
     fn session_params(&self) -> SessionParams {
+        self.session_params_with(&self.current_plan())
+    }
+
+    /// The params of a session of `plan` ([`Self::session_params`]: the
+    /// running session's plan, else the one a start would run).
+    fn session_params_with(&self, plan: &Plan) -> SessionParams {
         SessionParams {
             contract: self.output_contract(),
             aspect: self.config.output.aspect,
             hold_timeout: self.config.hold_timeout(),
             input_gap: self.config.input_gap(),
             fixed_framerate: self.config.camera.fixed_framerate,
-            effect: self.effect_run(),
-            backends: self.current_plan().backends(),
+            effect: self.effect_run_with(plan),
+            backends: plan.backends(),
             memory: self.session_memory(),
             placeholder_image: self.output_image(),
         }
@@ -3938,6 +4711,7 @@ impl<B: MediaBackend> Controller<B> {
         self.watch_placeholder(now);
         self.check_writer(now);
         self.check_session(now);
+        self.poll_prepared(now);
         if self.streams_without_black_effect() {
             // However it came to this (a control call, a reload, a module
             // change), the room is never shown: the lifecycle starts a
@@ -4748,6 +5522,7 @@ impl<B: MediaBackend> Controller<B> {
                 s.enhance_params = params.effect.enhance_params.clone();
             }
             self.mark_running(&params.effect);
+            self.suspend_prepare("the camera is switched");
             match self.backend.switch_camera(&params, cam) {
                 Ok(()) => {
                     info!(
@@ -5047,9 +5822,15 @@ impl<B: MediaBackend> Controller<B> {
     /// runs and that are not marked yet are set. A marker stays until the
     /// session stops: a module that ran may keep its code loaded.
     fn mark_running(&mut self, effect: &EffectRun) {
-        let Some(plan) = &self.plan else {
+        let Some(plan) = self.plan.clone() else {
             return;
         };
+        self.mark_running_with(&plan, effect);
+    }
+
+    /// [`Self::mark_running`] for a session of `plan` (the one a two-phase
+    /// switch prepares, [`Self::prepare_switch`]).
+    fn mark_running_with(&mut self, plan: &Plan, effect: &EffectRun) {
         let new: Vec<String> = plan
             .running_ids(effect)
             .into_iter()
@@ -5080,6 +5861,11 @@ impl<B: MediaBackend> Controller<B> {
     /// is dropped before ([`Self::effect_run_with`]), never a failure.
     fn effect_check(&mut self, effect: &EffectRun) -> Result<(), String> {
         let plan = self.current_plan();
+        self.effect_check_with(effect, &plan)
+    }
+
+    /// [`Self::effect_check`] for a session of `plan`.
+    fn effect_check_with(&mut self, effect: &EffectRun, plan: &Plan) -> Result<(), String> {
         let Some(module) = &plan.effect else {
             return Ok(());
         };
@@ -5131,7 +5917,13 @@ impl<B: MediaBackend> Controller<B> {
     /// taken back, the effect's failure for want of it
     /// ([`Self::effect_failure`]) is over: the effect reads as loading
     /// until it is ready, as at a start.
+    ///
+    /// While the session switches away from its effect module
+    /// ([`Self::switching_from`]), the element keeps its backend as it is.
     fn follow_effect_backend(&mut self) {
+        if self.switching_from() {
+            return;
+        }
         let revoke = self.session.is_some()
             && self.effect().mode != EffectMode::None
             && self.effect().policy().hides()
@@ -5196,6 +5988,11 @@ impl<B: MediaBackend> Controller<B> {
     /// [`Self::drop_session`], with `before_stop` run once the session is
     /// taken and before the backend stops it.
     fn drop_session_with(&mut self, before_stop: impl FnOnce(&mut Self)) {
+        // The new effects prepared alongside go first, and a failed switch
+        // with the session it kept.
+        self.abort_prepare("the session stops");
+        self.switch_pending = None;
+        self.switch_failed = None;
         self.stop_watch();
         // The camera's HID node is read only while it streams: an open
         // node keeps the camera from autosuspending.
@@ -5939,6 +6736,7 @@ impl<B: MediaBackend> Controller<B> {
             }
             info!("switching to {}", cam.label());
             self.mark_running(&params.effect);
+            self.suspend_prepare("the camera is switched");
             match self.backend.switch_camera(&params, &cam) {
                 Ok(()) => self.camera_opened(&cam),
                 Err(e) => {
@@ -6462,7 +7260,7 @@ impl<B: MediaBackend> Controller<B> {
         // A stage selected now that a module provides but the running
         // session cannot run (started without that module): a new session
         // runs it ([`Self::restart_for`]).
-        self.restart_for_modules();
+        self.restart_for_modules(now);
         if self.session.is_some()
             && let Err(e) = self.apply_effect()
         {
@@ -6879,6 +7677,7 @@ impl<B: MediaBackend> Controller<B> {
             s.enhance_params = params.effect.enhance_params.clone();
         }
         self.mark_running(&params.effect);
+        self.suspend_prepare("the camera is reopened");
         match self.backend.switch_camera(&params, cam) {
             Ok(()) => {
                 self.camera_opened(cam);

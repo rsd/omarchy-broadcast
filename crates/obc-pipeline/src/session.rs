@@ -18,10 +18,45 @@
 //! builds ([`Session::build_ingest`]) write canonical frames in that
 //! memory, and in system memory no pipeline of the session holds a CUDA
 //! context.
+//!
+//! **Output handover.** A change of the output itself (another effect
+//! element or module chain) need not stop the camera. The next output is
+//! built and prepared while the current one streams
+//! ([`Session::prepare_output`]): it is started, given the current
+//! output's CUDA context ([`crate::output::OutputConfig::cuda_context`];
+//! none in system memory), and the current ingest writes every frame into
+//! its slot too, the same buffer by reference ([`crate::frame`],
+//! "Fan-out"). An output forwarding to a loopback writer is prepared on a
+//! standby feed ([`crate::loopback::WriterHandle::standby`]): it forwards,
+//! and the writer refuses its frames, so the consumer still sees the
+//! current output's only. Once the prepared output has processed a frame
+//! of the ingest ([`Session::prepared_first_fresh`]), the commit
+//! ([`Session::commit_prepared`]) promotes its feed (one push lock, so the
+//! consumer's stream turns from one output to the other between two
+//! frames, nothing held, no placeholder), points the ingest at its slot
+//! only, makes it the session's output and only then stops the previous
+//! one. [`Session::discard_prepared`] stops the prepared output instead;
+//! the current one never noticed. The ingest is never stopped or rebuilt.
+//!
+//! **Source ids across a handover.** Source ids come from each output's
+//! own counter ([`Output::frame_writer`]). The current ingest keeps its id
+//! in both outputs: its frames carry it into the prepared output's slot,
+//! so [`Output::first_fresh`] of the prepared output, and of the session's
+//! output after the commit, takes the current ingest's
+//! [`Ingest::source_id`]. A prepared output's counter continues after the
+//! current output's, so a source built after the commit
+//! ([`Session::build_ingest`]) never shares an id with one built before.
+//!
+//! **A prepared output and the ingest.** A source switch
+//! ([`Session::switch_to`]) and [`Session::stop_ingest`] discard the
+//! prepared output first: the next ingest writes into the session's output
+//! only (as [`Session::build_ingest`] builds it), so the prepared one would
+//! be left without frames. Dropping or stopping the session stops the
+//! ingest, then the prepared output, then the output.
 
 use std::time::{Duration, Instant};
 
-use crate::ingest::{Ingest, IngestConfig};
+use crate::ingest::{Ingest, IngestConfig, cuda_context_object};
 use crate::output::Output;
 use crate::pipeline::{PipelineError, StopError, both_stopped};
 use obc_core::config::VideoMemory;
@@ -60,12 +95,41 @@ impl SwitchTiming {
     }
 }
 
-/// The output plus its current ingest. Dropping it stops the ingest first,
-/// then the output.
+/// What [`Session::commit_prepared`] did.
+#[derive(Debug)]
+pub struct Handover {
+    /// The previous output, stopped (its counts stay readable).
+    pub previous: Output,
+    /// How its stop went. An error does not undo the handover: the prepared
+    /// output is the session's either way.
+    pub previous_stop: Result<(), StopError>,
+    /// When the prepared output's writer feed was promoted: from then on
+    /// the consumer sees its frames only. When the output forwards to no
+    /// writer, when the ingest was pointed at its slot only.
+    pub promoted_at: Instant,
+}
+
+/// Why [`Session::prepare_output`] prepared nothing: the refusal or the
+/// failed start, and how the output it was given stopped after it (its
+/// [`Output::stop_checked`]: a start that failed may leave a pipeline
+/// outside NULL, which the caller must not take for a clean stop).
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct PrepareError {
+    pub error: PipelineError,
+    /// How the output stopped: an output refused before its start was
+    /// never started, and stopped in NULL.
+    pub cleanup: Result<(), StopError>,
+}
+
+/// The output plus its current ingest, and the next output while one is
+/// prepared (see the module docs, "Output handover"). Dropping it stops the
+/// ingest first, then the prepared output, then the output.
 #[derive(Debug)]
 pub struct Session {
-    // Field order is drop order: ingest before output.
+    // Field order is drop order: ingest, prepared output, output.
     ingest: Option<Ingest>,
+    prepared: Option<Output>,
     output: Output,
     last_switch: Option<SwitchTiming>,
 }
@@ -76,6 +140,7 @@ impl Session {
         output.start()?;
         Ok(Session {
             ingest: None,
+            prepared: None,
             output,
             last_switch: None,
         })
@@ -83,6 +148,172 @@ impl Session {
 
     pub fn output(&self) -> &Output {
         &self.output
+    }
+
+    /// The output prepared to take over ([`Self::prepare_output`]), until
+    /// it is committed or discarded.
+    pub fn prepared(&self) -> Option<&Output> {
+        self.prepared.as_ref()
+    }
+
+    /// Prepares `next` to take over from the session's output, while that
+    /// one keeps streaming (see the module docs, "Output handover"): `next`
+    /// is given the output's CUDA context (CUDA memory: set as
+    /// [`OutputConfig::cuda_context`](crate::output::OutputConfig::cuda_context)
+    /// before it starts; already running, it must have been started with
+    /// that context), started if it is not running, and from then on the
+    /// current ingest writes each frame into its slot too. Its source ids
+    /// continue after the output's (module docs, "Source ids across a
+    /// handover"). An output already prepared is discarded first.
+    ///
+    /// `next` must take the output's canonical frames (same contract size
+    /// and colour, same [`Output::memory`]), and forward to the same
+    /// loopback writer as the output when that one does, on a standby feed
+    /// ([`crate::loopback::WriterHandle::standby`]), or to no writer when
+    /// it does not: [`PipelineError::Caps`] or [`PipelineError::State`]
+    /// otherwise. On a refusal or a start that fails, `next` is stopped
+    /// ([`Output::stop_checked`], its result in [`PrepareError::cleanup`])
+    /// and dropped, and nothing is prepared; the output never noticed.
+    pub fn prepare_output(&mut self, mut next: Output) -> Result<(), Box<PrepareError>> {
+        if let Err(e) = self.discard_prepared() {
+            eprintln!("the output prepared before did not stop cleanly: {e}");
+        }
+        if let Err(error) = self.start_prepared(&mut next) {
+            let cleanup = next.stop_checked();
+            return Err(Box::new(PrepareError { error, cleanup }));
+        }
+        if let Some(ingest) = &self.ingest {
+            ingest.frame_writer().fan_out(Some(next.slot_target()));
+        }
+        self.prepared = Some(next);
+        Ok(())
+    }
+
+    /// Checks `next` against the session's output and starts it with its
+    /// CUDA context ([`Self::prepare_output`]).
+    fn start_prepared(&self, next: &mut Output) -> Result<(), PipelineError> {
+        if next.memory() != self.output.memory() || next.canonical() != self.output.canonical() {
+            return Err(PipelineError::Caps(format!(
+                "a prepared output must take the session's canonical frames ({:?} in {:?} \
+                 memory), not {:?} in {:?} memory",
+                self.output.canonical(),
+                self.output.memory(),
+                next.canonical(),
+                next.memory()
+            )));
+        }
+        match (self.output.writer(), next.writer()) {
+            (None, None) => {}
+            (Some(current), Some(w)) if current == w && !w.is_current_feed() => {}
+            (Some(current), Some(w)) if current == w => {
+                return Err(PipelineError::State(
+                    "a prepared output must forward on a standby feed of the writer \
+                     (WriterHandle::standby), not on its current one"
+                        .into(),
+                ));
+            }
+            _ => {
+                return Err(PipelineError::State(
+                    "a prepared output must forward to the session output's loopback writer, \
+                     or to none when the session's output does not"
+                        .into(),
+                ));
+            }
+        }
+        if self.output.memory() == VideoMemory::Cuda {
+            let cuda = self.output.cuda_context().cloned().ok_or_else(|| {
+                PipelineError::Cuda(
+                    "the output is not running: it has no CUDA context to share".into(),
+                )
+            })?;
+            if next.is_running() {
+                let object = |c: &gst::Context| cuda_context_object(c);
+                if next.cuda_context().and_then(object).is_none()
+                    || next.cuda_context().and_then(object) != object(&cuda)
+                {
+                    return Err(PipelineError::Cuda(
+                        "a running prepared output must use the session output's CUDA context \
+                         (OutputConfig::cuda_context)"
+                            .into(),
+                    ));
+                }
+            } else {
+                next.share_cuda_context(Some(cuda));
+            }
+        }
+        next.continue_sources_from(&self.output);
+        next.start()
+    }
+
+    /// When the prepared output emitted its first fresh frame of the
+    /// current ingest ([`Output::first_fresh`] of the ingest's
+    /// [`Ingest::source_id`]): it has a camera frame through its whole
+    /// chain, and a commit hands over without a gap. `None` without a
+    /// prepared output or an ingest, and until then. A frame through its
+    /// chain is not one its effect has processed: an effect still loading
+    /// shows its fallback ([`Output::effect_status`],
+    /// [`Output::stage_status`] and [`Output::module_stage_status`] say when
+    /// what it runs is ready; under the `none` effect with a stage on, the
+    /// effect's own status is [`crate::effect::EffectStatus::Off`]).
+    pub fn prepared_first_fresh(&self) -> Option<Instant> {
+        let id = self.ingest.as_ref()?.source_id();
+        self.prepared.as_ref()?.first_fresh(id)
+    }
+
+    /// Hands the session over to the prepared output (see the module docs,
+    /// "Output handover"): promotes its writer feed, so the consumer sees
+    /// its frames from the next push on and the previous output's no more
+    /// ([`crate::loopback::WriterHandle::promote`]), points the current
+    /// ingest at its slot only, makes it the session's output, and only
+    /// then stops the previous output, returned in the [`Handover`] with
+    /// how its stop went. The ingest is untouched. Fails with
+    /// [`PipelineError::State`], changing nothing, when no output is
+    /// prepared.
+    pub fn commit_prepared(&mut self) -> Result<Handover, PipelineError> {
+        let next = self
+            .prepared
+            .take()
+            .ok_or_else(|| PipelineError::State("no output is prepared".into()))?;
+        // The consumer's stream turns here, between two pushes.
+        if let Some(w) = next.writer() {
+            w.promote();
+        }
+        let promoted_at = Instant::now();
+        if let Some(ingest) = &self.ingest {
+            ingest.frame_writer().retarget(next.slot_target());
+        }
+        let mut previous = std::mem::replace(&mut self.output, next);
+        // After the promotion: its last frames are refused, and its detach
+        // is not the writer's last (the new output is attached).
+        let previous_stop = previous.stop_checked();
+        Ok(Handover {
+            previous,
+            previous_stop,
+            promoted_at,
+        })
+    }
+
+    /// Stops the prepared output, if any, after the ingest has stopped
+    /// writing into its slot; the session's output never noticed (its
+    /// writer feed still the current one). Its stop's error, if it failed;
+    /// nothing is prepared afterwards either way.
+    pub fn discard_prepared(&mut self) -> Result<(), StopError> {
+        let Some(mut next) = self.prepared.take() else {
+            return Ok(());
+        };
+        if let Some(ingest) = &self.ingest {
+            ingest.frame_writer().fan_out(None);
+        }
+        next.stop_checked()
+    }
+
+    /// Discards the prepared output before the ingest changes (see the
+    /// module docs, "A prepared output and the ingest"); a stop that fails
+    /// is logged.
+    fn discard_for_ingest_change(&mut self) {
+        if let Err(e) = self.discard_prepared() {
+            eprintln!("the prepared output did not stop cleanly: {e}");
+        }
     }
 
     pub fn ingest(&self) -> Option<&Ingest> {
@@ -134,7 +365,8 @@ impl Session {
     /// for `next` runs to its timeout
     /// ([`OutputConfig::hold_timeout`](crate::output::OutputConfig::hold_timeout),
     /// 3 s by default): the output repeats the last frame that long, then
-    /// sends placeholders.
+    /// sends placeholders. An output prepared is discarded first (see the
+    /// module docs, "A prepared output and the ingest").
     pub fn switch_to(&mut self, next: Ingest) -> Result<SwitchTiming, PipelineError> {
         self.switch_at(next, Instant::now())
     }
@@ -154,6 +386,7 @@ impl Session {
         next: Ingest,
         requested: Instant,
     ) -> Result<SwitchTiming, PipelineError> {
+        self.discard_for_ingest_change();
         let mut timing = SwitchTiming {
             source_id: next.source_id(),
             requested,
@@ -235,16 +468,20 @@ impl Session {
         Some(t.clone())
     }
 
-    /// Stops the current ingest, if any; the output keeps running.
+    /// Stops the current ingest, if any; the output keeps running. An
+    /// output prepared is discarded first (see the module docs, "A
+    /// prepared output and the ingest").
     pub fn stop_ingest(&mut self) -> Result<(), PipelineError> {
+        self.discard_for_ingest_change();
         match self.ingest.take() {
             Some(i) => i.stop(),
             None => Ok(()),
         }
     }
 
-    /// Stops the ingest, then the output, reporting the first failure (one
-    /// that left a pipeline outside NULL first).
+    /// Stops the ingest, then the prepared output (if any), then the
+    /// output, reporting the first failure (one that left a pipeline
+    /// outside NULL first).
     pub fn stop(self) -> Result<(), PipelineError> {
         self.stop_checked().map_err(Into::into)
     }
@@ -257,8 +494,12 @@ impl Session {
             Some(i) => i.stop_checked(),
             None => Ok(()),
         };
+        let prepared = match self.prepared.take() {
+            Some(mut p) => p.stop_checked(),
+            None => Ok(()),
+        };
         let output = self.output.stop_checked();
-        both_stopped(ingest, output)
+        both_stopped(both_stopped(ingest, prepared), output)
     }
 }
 
@@ -1115,5 +1356,141 @@ mod tests {
         let opened = s.log.iter().filter(|(_, o, _)| *o == gst::State::Null);
         assert_eq!(opened.count(), 7, "{:?}", s.log);
         assert_eq!((s.open, s.active), (0, 0), "{:?}", s.log);
+    }
+
+    /// (h) An output prepared and committed: the ingest writes into both
+    /// slots meanwhile (the prepared output emits the source's frames,
+    /// under the same source id, while the output keeps emitting them), and
+    /// after the commit the session's output is the prepared one, fed by
+    /// the same ingest pipeline, never restarted; the previous output is
+    /// stopped and returned, and its ticks end. Source ids handed out after
+    /// the commit continue after every earlier one.
+    #[test]
+    fn a_committed_output_takes_over_the_same_ingest() {
+        let (mut session, old_ticks) = cpu_session(OutputConfig::DEFAULT_HOLD_TIMEOUT);
+        let first = pattern(&session, None);
+        let id = stream(&mut session, first);
+        let ingest = session.ingest().unwrap().pipeline().pipeline().clone();
+        let (next, new_ticks) = cpu_output("320x240@30".parse().unwrap(), GAP);
+        assert_eq!(session.prepared_first_fresh(), None, "nothing prepared");
+        session.prepare_output(next).expect("prepare");
+        assert!(session.prepared().unwrap().is_running());
+        wait_for(
+            &mut session,
+            Duration::from_secs(10),
+            "the prepared output's first frame",
+            |s| s.prepared_first_fresh().is_some(),
+        );
+        let old_fresh = session.output().counts().fresh;
+        wait_for(&mut session, Duration::from_secs(10), "both fed", |s| {
+            s.prepared().unwrap().counts().fresh >= 10
+                && s.output().counts().fresh >= old_fresh + 10
+        });
+        assert!(
+            session.prepared().unwrap().frame_writer().source_id() > id,
+            "a prepared output's ids continue after the output's"
+        );
+
+        let handover = session.commit_prepared().expect("commit");
+        handover.previous_stop.expect("the previous output stopped");
+        assert!(!handover.previous.is_running());
+        assert!(session.prepared().is_none());
+        assert!(session.output().first_fresh(id).is_some(), "{id}");
+        let fresh = session.output().counts().fresh;
+        wait_for(&mut session, Duration::from_secs(10), "frames after", |s| {
+            s.output().counts().fresh >= fresh + 10
+        });
+        assert_eq!(session.ingest().map(Ingest::source_id), Some(id));
+        assert_eq!(session.ingest().unwrap().pipeline().pipeline(), &ingest);
+        assert_eq!(ingest.current_state(), gst::State::Playing);
+        let later = session.output().frame_writer().source_id();
+        assert!(later > id, "{later} after {id}");
+        let ended = old_ticks.lock().unwrap().len();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            old_ticks.lock().unwrap().len(),
+            ended,
+            "the old clock ticks"
+        );
+        assert!(matches!(
+            session.commit_prepared(),
+            Err(PipelineError::State(_))
+        ));
+        session.stop().expect("teardown");
+        let t = new_ticks.lock().unwrap();
+        assert!(
+            t.iter().filter_map(|e| e.origin).all(|o| o.source_id == id),
+            "a frame of another source"
+        );
+        assert!(
+            t.iter().filter(|e| e.kind == TickKind::Fresh).count() >= 20,
+            "{} ticks",
+            t.len()
+        );
+    }
+
+    /// (i) A prepared output is discarded by a source switch and by an
+    /// ingest stop (its ticks end), and by [`Session::discard_prepared`];
+    /// the session's output keeps streaming throughout. An output of
+    /// another canonical size is refused.
+    #[test]
+    fn a_switch_or_an_ingest_stop_discards_the_prepared_output() {
+        let (mut session, _) = cpu_session(OutputConfig::DEFAULT_HOLD_TIMEOUT);
+        let first = pattern(&session, None);
+        stream(&mut session, first);
+        let prepare = |session: &mut Session| {
+            let (next, ticks) = cpu_output("320x240@30".parse().unwrap(), GAP);
+            session.prepare_output(next).expect("prepare");
+            wait_for(session, Duration::from_secs(10), "its first frame", |s| {
+                s.prepared_first_fresh().is_some()
+            });
+            ticks
+        };
+        let assert_stopped = |ticks: &Ticks| {
+            let n = ticks.lock().unwrap().len();
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(ticks.lock().unwrap().len(), n, "a discarded output ticks");
+        };
+
+        let ticks = prepare(&mut session);
+        let next = pattern(&session, None);
+        let next_id = next.source_id();
+        session.switch_to(next).expect("switch");
+        assert!(session.prepared().is_none(), "kept across a switch");
+        assert_stopped(&ticks);
+        wait_for(
+            &mut session,
+            Duration::from_secs(10),
+            "the new source",
+            |s| s.output().first_fresh(next_id).is_some(),
+        );
+
+        let ticks = prepare(&mut session);
+        session.stop_ingest().unwrap();
+        assert!(session.prepared().is_none(), "kept across an ingest stop");
+        assert_stopped(&ticks);
+
+        let again = pattern(&session, None);
+        stream(&mut session, again);
+        let ticks = prepare(&mut session);
+        session.discard_prepared().expect("discard");
+        assert_stopped(&ticks);
+        let fresh = session.output().counts().fresh;
+        wait_for(&mut session, Duration::from_secs(10), "the output", |s| {
+            s.output().counts().fresh >= fresh + 10
+        });
+        session.discard_prepared().expect("nothing to discard");
+
+        let (other, _) = cpu_output("640x480@30".parse().unwrap(), GAP);
+        let refused = session.prepare_output(other).expect_err("another size");
+        assert!(matches!(
+            *refused,
+            PrepareError {
+                error: PipelineError::Caps(_),
+                cleanup: Ok(())
+            }
+        ));
+        assert!(session.prepared().is_none());
+        session.stop().expect("teardown");
     }
 }

@@ -869,7 +869,8 @@ fn a_closed_shutter_stays_masked_across_a_reopen_of_the_same_camera() {
 fn a_closed_shutter_stays_masked_across_a_module_restart() {
     use obc_pipeline::ShutterState::{Closed, Open};
     let mut h = H::new(&away_config("denoise = true\n"), |w| {
-        w.cameras = vec![brio()]
+        w.cameras = vec![brio()];
+        no_headroom(w);
     });
     h.set_module(MAXINE_MODULE, false, 0);
     h.activate(100);

@@ -12,8 +12,19 @@
 //! the whole stream runs on the CPU and makes no CUDA call. Every pipeline
 //! of a session uses the same memory: an ingest takes it from the
 //! [`FrameWriter`] the output hands out.
+//!
+//! **Fan-out.** A writer writes into one output's slot, and, while a
+//! session prepares its next output ([`crate::session::Session::prepare_output`]),
+//! into that output's slot too: the same frame in both, by reference (the
+//! buffer is shared, never copied), with the writer's one source id, each
+//! slot with its own sequence number and arrival time (ns since its own
+//! output's epoch). The session then makes the prepared output's slot the
+//! only one ([`crate::session::Session::commit_prepared`]) or drops it
+//! ([`crate::session::Session::discard_prepared`]). Every clone of a writer
+//! (the ingest's sink holds one) follows these changes; a frame being
+//! written while one happens lands in the slots of before or of after.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use obc_core::config::VideoMemory;
@@ -90,12 +101,36 @@ pub struct Frame {
     pub source_pts_ns: Option<u64>,
 }
 
-/// Writes one source's canonical frames into the output's slot. Handed out
-/// by [`crate::output::Output::frame_writer`], one per ingest pipeline.
+/// One slot a writer writes into, with the epoch of its arrival times.
+#[derive(Debug, Clone)]
+pub(crate) struct SlotTarget {
+    pub(crate) slot: Arc<Slot<Frame>>,
+    pub(crate) epoch: Instant,
+}
+
+impl SlotTarget {
+    fn put(&self, frame: Frame) -> u64 {
+        let arrived = u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.slot.put(frame, arrived)
+    }
+}
+
+/// Where a writer writes (see the module docs, "Fan-out").
+#[derive(Debug)]
+struct Targets {
+    /// The current output's slot.
+    primary: SlotTarget,
+    /// The prepared output's slot, written too.
+    also: Option<SlotTarget>,
+}
+
+/// Writes one source's canonical frames into the output's slot (and into
+/// a prepared output's too, see the module docs, "Fan-out"). Handed out by
+/// [`crate::output::Output::frame_writer`], one per ingest pipeline.
 #[derive(Debug, Clone)]
 pub struct FrameWriter {
-    slot: Arc<Slot<Frame>>,
-    epoch: Instant,
+    /// Shared by every clone, so a retarget reaches the ingest's sink.
+    targets: Arc<Mutex<Targets>>,
     source_id: u64,
     canonical: Canonical,
     memory: VideoMemory,
@@ -111,12 +146,38 @@ impl FrameWriter {
         canonical: Canonical,
     ) -> Self {
         FrameWriter {
-            slot,
-            epoch,
+            targets: Arc::new(Mutex::new(Targets {
+                primary: SlotTarget { slot, epoch },
+                also: None,
+            })),
             source_id,
             canonical,
             memory: VideoMemory::Cuda,
         }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Targets> {
+        // No code path panics while holding the lock; recover regardless.
+        self.targets.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Writes every frame into `also` as well (`None`: no longer), from the
+    /// next frame on (see the module docs, "Fan-out").
+    pub(crate) fn fan_out(&self, also: Option<SlotTarget>) {
+        let old = std::mem::replace(&mut self.lock().also, also);
+        // Its slot (and the frame in it) is released outside the lock.
+        drop(old);
+    }
+
+    /// Writes every frame into `primary` only, from the next frame on: a
+    /// prepared output's slot becomes the writer's own (see the module
+    /// docs, "Fan-out").
+    pub(crate) fn retarget(&self, primary: SlotTarget) {
+        let old = {
+            let mut t = self.lock();
+            (std::mem::replace(&mut t.primary, primary), t.also.take())
+        };
+        drop(old);
     }
 
     /// The same writer for frames in `memory`.
@@ -139,19 +200,27 @@ impl FrameWriter {
         self.canonical
     }
 
-    /// Replaces the slot's frame with `buffer`. O(1): a short lock, no
-    /// GStreamer call, no copy.
+    /// Replaces the slot's frame with `buffer` (and a prepared output's,
+    /// with the same buffer, see the module docs, "Fan-out"); returns its
+    /// sequence number in the current output's slot. O(1): short locks
+    /// (the slots are taken under the writer's own, then written after
+    /// it), no GStreamer call, no copy.
     pub fn put(&self, buffer: gst::Buffer) -> u64 {
         let source_pts_ns = buffer.pts().map(|p| p.nseconds());
-        let arrived = u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        self.slot.put(
-            Frame {
-                buffer,
-                source_id: self.source_id,
-                source_pts_ns,
-            },
-            arrived,
-        )
+        let (primary, also) = {
+            let t = self.lock();
+            (t.primary.clone(), t.also.clone())
+        };
+        let frame = Frame {
+            buffer,
+            source_id: self.source_id,
+            source_pts_ns,
+        };
+        if let Some(also) = also {
+            // A reference: the buffer is shared, never copied.
+            also.put(frame.clone());
+        }
+        primary.put(frame)
     }
 }
 
@@ -201,5 +270,50 @@ mod tests {
         assert_eq!(e.frame.source_id, 7);
         assert_eq!(e.frame.source_pts_ns, Some(42));
         assert_eq!(slot.written(), 1);
+    }
+
+    /// A fanned-out writer (see the module docs, "Fan-out") puts each frame
+    /// into both slots, the same buffer (no copy), its one source id, each
+    /// slot with its own sequence number; a clone follows the change. A
+    /// retarget writes into the new slot only; a fan-out ended writes into
+    /// the first slot only.
+    #[test]
+    fn a_fanned_out_writer_shares_each_frame_then_retargets() {
+        gst::init().unwrap();
+        let canonical = Canonical::of(&OutputContract::default());
+        let (a, b) = (Arc::new(Slot::new()), Arc::new(Slot::new()));
+        let w = FrameWriter::new(Arc::clone(&a), Instant::now(), 3, canonical);
+        let sink_side = w.clone();
+        let buffer = || gst::Buffer::with_size(16).unwrap();
+        sink_side.put(buffer());
+        w.fan_out(Some(SlotTarget {
+            slot: Arc::clone(&b),
+            epoch: Instant::now(),
+        }));
+        let shared = buffer();
+        assert_eq!(
+            sink_side.put(shared.clone()),
+            2,
+            "the first slot's sequence"
+        );
+        let (ea, eb) = (a.latest().unwrap(), b.latest().unwrap());
+        assert_eq!((ea.seq, eb.seq), (2, 1));
+        assert_eq!((ea.frame.source_id, eb.frame.source_id), (3, 3));
+        assert_eq!(ea.frame.buffer.as_ptr(), shared.as_ptr(), "a copy");
+        assert_eq!(eb.frame.buffer.as_ptr(), shared.as_ptr(), "a copy");
+
+        w.fan_out(None);
+        sink_side.put(buffer());
+        assert_eq!((a.written(), b.written()), (3, 1));
+        w.fan_out(Some(SlotTarget {
+            slot: Arc::clone(&b),
+            epoch: Instant::now(),
+        }));
+        w.retarget(SlotTarget {
+            slot: Arc::clone(&b),
+            epoch: Instant::now(),
+        });
+        assert_eq!(sink_side.put(buffer()), 2, "the new slot's sequence");
+        assert_eq!((a.written(), b.written()), (3, 2), "written twice");
     }
 }

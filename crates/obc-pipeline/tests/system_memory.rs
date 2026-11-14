@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fake_backend::{
-    FAKE_BLUR_Y, FAKE_COVERAGE, FAKE_DENOISE_LEVEL, FakeConfig, FakeFactory, FakeLog,
+    FAKE_BLUR_Y, FAKE_COVERAGE, FAKE_DENOISE_LEVEL, FAKE_DENOISE_Y, FakeConfig, FakeFactory,
+    FakeLog,
 };
 use gst::prelude::*;
 use obc_core::config::VideoMemory;
@@ -724,6 +725,211 @@ fn a_hiding_new_session_ends_the_hold_and_the_room_never_follows() {
         end.held, ended.held,
         "held after the end: {ended:?} -> {end:?}"
     );
+    session.stop().unwrap();
+    writer.stop().unwrap();
+}
+
+/// Counts the state changes of `ingest`'s pipeline itself, from now on
+/// (on its bus, synchronously): a camera closed and reopened changes it.
+fn count_state_changes(ingest: &Ingest) -> Arc<Mutex<Vec<(gst::State, gst::State)>>> {
+    let changes: Arc<Mutex<Vec<(gst::State, gst::State)>>> = Arc::default();
+    let c = Arc::clone(&changes);
+    let pipeline = ingest.pipeline().pipeline().downgrade();
+    ingest.pipeline().bus().set_sync_handler(move |_, msg| {
+        if let gst::MessageView::StateChanged(s) = msg.view()
+            && let Some(p) = pipeline.upgrade()
+            && msg.src() == Some(p.upcast_ref::<gst::Object>())
+        {
+            c.lock().unwrap().push((s.old(), s.current()));
+        }
+        gst::BusSyncReply::Pass
+    });
+    changes
+}
+
+/// The next output of a session forwarding to `writer`, on a standby feed
+/// of it: the denoise stage alone (Y = `FAKE_DENOISE_Y`, where the
+/// session's blur is `FAKE_BLUR_Y`), on a fake backend that takes 500 ms
+/// to load, as a module enabled.
+fn standby_output(writer: &LoopbackWriter) -> Output {
+    use obc_pipeline::effect::{StageId, StageRequest};
+    let contract = *writer.handle().contract();
+    let slow = FakeFactory::new(FakeConfig {
+        load_delay: Duration::from_millis(500),
+        ..FakeConfig::default()
+    });
+    let mut cfg = OutputConfig::new(contract, OutputSink::Writer(writer.handle().standby()));
+    cfg.effect =
+        Some(EffectSettings::of(EffectKind::None).with_stage(StageRequest::on(StageId::DENOISE)));
+    cfg.effect_backend = Some(EffectBackend::new(slow));
+    Output::build_in(cfg, VideoMemory::System).expect("build the next output")
+}
+
+/// An output handover (a module enabled without a restart): the next
+/// output, built on a standby feed of the writer, is prepared while the
+/// session's blurred output streams, fed by the same ingest. While its
+/// effect loads and runs, every frame reaching the writer is the old
+/// output's (blurred), its own frames refused; after the commit every
+/// frame is the new output's (denoised), the old output stopped. Across
+/// the whole handover the writer sends no placeholder and holds nothing,
+/// and the camera is never closed: the same ingest pipeline, its source
+/// id and state unchanged. CPU only.
+#[test]
+fn an_output_handover_swaps_the_writer_feed_without_a_gap_or_a_camera_restart() {
+    let (mut writer, _fake, mut session) = blurred_session();
+    let lumas = writer_luma(&writer);
+    let ingest = session.ingest().unwrap();
+    let id = ingest.source_id();
+    let camera = ingest.pipeline().pipeline().clone();
+    let changes = count_state_changes(ingest);
+    let next = standby_output(&writer);
+    let next_lumas = centre_luma(&next, 320, 240);
+    let before = writer.counts();
+    let from = lumas.lock().unwrap().len();
+
+    session
+        .prepare_output(next)
+        .expect("prepare the next output");
+    assert!(session.prepared().is_some());
+    wait_for(Duration::from_secs(10), "the next output's frames", || {
+        session.prepared_first_fresh().is_some()
+            && session.prepared().unwrap().stage_status("denoise") == EffectStatus::Ready
+            && next_lumas
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|&&y| y == FAKE_DENOISE_Y)
+                .count()
+                >= 10
+    });
+    let prepared = writer.counts();
+    assert!(
+        prepared.standby_refused >= before.standby_refused + 10
+            && prepared.forwarded >= before.forwarded + 10,
+        "{before:?} -> {prepared:?}"
+    );
+    assert_eq!(
+        (prepared.placeholder, prepared.held, prepared.push_failed),
+        (before.placeholder, before.held, before.push_failed),
+        "{before:?} -> {prepared:?}"
+    );
+    let during = lumas.lock().unwrap()[from..].to_vec();
+    assert!(
+        during.len() >= 10 && during.iter().all(|&y| y == FAKE_BLUR_Y),
+        "a frame of the next output before the commit: {during:?}"
+    );
+
+    let at = lumas.lock().unwrap().len();
+    let handover = session.commit_prepared().expect("commit");
+    handover.previous_stop.expect("the old output stopped");
+    assert!(!handover.previous.is_running());
+    assert!(session.prepared().is_none());
+    let refused = writer.counts().standby_refused;
+    wait_for(Duration::from_secs(10), "the new output's frames", || {
+        lumas.lock().unwrap()[at..]
+            .iter()
+            .filter(|&&y| y == FAKE_DENOISE_Y)
+            .count()
+            >= 15
+    });
+    let after = writer.counts();
+    assert_eq!(
+        (after.placeholder, after.held, after.push_failed),
+        (before.placeholder, before.held, before.push_failed),
+        "a gap across the commit: {before:?} -> {after:?}"
+    );
+    assert_eq!(after.standby_refused, refused, "refused after the commit");
+    let seen = lumas.lock().unwrap()[at..].to_vec();
+    let first = seen.iter().position(|&y| y == FAKE_DENOISE_Y).unwrap();
+    assert!(
+        seen[..first].iter().all(|&y| y == FAKE_BLUR_Y)
+            && seen[first..].iter().all(|&y| y == FAKE_DENOISE_Y),
+        "not the old output's frames, then the new one's only: {seen:?}"
+    );
+
+    // The same camera throughout.
+    let ingest = session.ingest().unwrap();
+    assert_eq!(ingest.source_id(), id);
+    assert_eq!(ingest.pipeline().pipeline(), &camera);
+    assert_eq!(camera.current_state(), gst::State::Playing);
+    assert!(
+        changes.lock().unwrap().is_empty(),
+        "{:?}",
+        changes.lock().unwrap()
+    );
+    assert!(session.output().first_fresh(id).is_some());
+    assert_eq!(session.output().writer(), Some(&writer.handle()));
+    assert!(session.output().writer().unwrap().is_current_feed());
+
+    // The camera off: the placeholder follows, as after any session.
+    session.stop().unwrap();
+    let off = writer.counts();
+    wait_for(
+        Duration::from_secs(1),
+        "the placeholder after the stop",
+        || writer.counts().placeholder >= off.placeholder + 5,
+    );
+    let end = writer.counts();
+    writer.stop().unwrap();
+    assert_eq!(
+        end.held, off.held,
+        "held after the stop: {off:?} -> {end:?}"
+    );
+}
+
+/// A prepared output discarded (the module change cancelled): the
+/// session's output never noticed (its frames, blurred, reach the writer
+/// throughout, nothing held, no placeholder), and the discarded output's
+/// clock stops. An output forwarding on the writer's current feed is
+/// refused, the session unchanged. CPU only.
+#[test]
+fn a_discarded_output_leaves_the_session_streaming() {
+    let (mut writer, _fake, mut session) = blurred_session();
+    let lumas = writer_luma(&writer);
+    let current = {
+        let contract = *writer.handle().contract();
+        let cfg = OutputConfig::new(contract, OutputSink::Writer(writer.handle()));
+        Output::build_in(cfg, VideoMemory::System).unwrap()
+    };
+    assert!(
+        session.prepare_output(current).is_err(),
+        "an output on the current feed was prepared"
+    );
+    assert!(session.prepared().is_none());
+
+    let before = writer.counts();
+    let from = lumas.lock().unwrap().len();
+    session
+        .prepare_output(standby_output(&writer))
+        .expect("prepare");
+    wait_for(Duration::from_secs(10), "the next output's frames", || {
+        session.prepared_first_fresh().is_some()
+            && writer.counts().standby_refused >= before.standby_refused + 10
+    });
+    let ticks = |s: &Session| s.prepared().unwrap().counts().emitted;
+    assert!(ticks(&session) > 0);
+    session.discard_prepared().expect("discard");
+    assert!(session.prepared().is_none());
+    let discarded = writer.counts();
+    wait_for(Duration::from_secs(10), "the output's frames", || {
+        writer.counts().forwarded >= discarded.forwarded + 10
+    });
+    let end = writer.counts();
+    assert_eq!(
+        end.standby_refused, discarded.standby_refused,
+        "the discarded output still forwards: {discarded:?} -> {end:?}"
+    );
+    assert_eq!(
+        (end.placeholder, end.held, end.push_failed),
+        (before.placeholder, before.held, before.push_failed),
+        "{before:?} -> {end:?}"
+    );
+    let seen = lumas.lock().unwrap()[from..].to_vec();
+    assert!(
+        seen.iter().all(|&y| y == FAKE_BLUR_Y),
+        "not the session's own frames: {seen:?}"
+    );
+    assert!(session.output().writer().unwrap().is_current_feed());
     session.stop().unwrap();
     writer.stop().unwrap();
 }

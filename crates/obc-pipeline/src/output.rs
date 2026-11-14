@@ -113,7 +113,12 @@
 //!
 //! **CUDA context.** The output pipeline's CUDA elements create the
 //! `GstCudaContext` when the pipeline opens; [`Output::cuda_context`] hands
-//! it to every ingest pipeline so canonical frames stay in one context.
+//! it to every ingest pipeline so canonical frames stay in one context. An
+//! output built with [`OutputConfig::cuda_context`] (a session's next
+//! output, fed by the current ingest while the current output still runs,
+//! [`crate::session::Session::prepare_output`]) opens no context of its
+//! own: its pipeline is given that one before it opens, as an ingest's is,
+//! so the frames of the one ingest are valid in both outputs.
 //!
 //! **System memory.** [`Output::build_in`] with [`VideoMemory::System`]
 //! carries canonical frames in system memory, with no CUDA element and no
@@ -154,7 +159,11 @@
 //! first, and in the new one until its first camera frame. The held frame
 //! then stays until that frame, or until the writer's bound ends the hold
 //! and this clock's placeholder resumes. Such a tick counts in
-//! [`OutputCounts::placeholder`], not in [`OutputCounts::emitted`].
+//! [`OutputCounts::placeholder`], not in [`OutputCounts::emitted`]. An
+//! output built on a standby feed of the writer
+//! ([`crate::loopback::WriterHandle::standby`]) runs, attaches and forwards
+//! the same way, and the writer refuses its frames until the feed is
+//! promoted ([`crate::session::Session::commit_prepared`]).
 //!
 //! **Placeholder image.** The placeholder can show a still image instead
 //! of black (the "away image"): [`OutputConfig::placeholder_image`] at
@@ -223,7 +232,7 @@ use crate::clock::{Latest, Pacer, PacerConfig, PacerCounts, PhaseLockConfig, Ste
 use crate::effect::{
     EffectBackend, EffectSettings, EffectStats, EffectStatus, effect_element_with_video,
 };
-use crate::frame::{Canonical, Frame, FrameWriter};
+use crate::frame::{Canonical, Frame, FrameWriter, SlotTarget};
 use crate::ingest::CUDA_CONTEXT_TYPE;
 use crate::loopback::{PlaceholderState, WriterAttachment, WriterHandle, image_contract_frame};
 use crate::module::{ModulePlacement, ModuleStageSpec, ModuleStats, check_specs, module_element};
@@ -309,6 +318,14 @@ pub struct OutputConfig {
     /// output starts with it; [`Output::set_placeholder_image`] changes it
     /// while the output lives.
     pub placeholder_image: Option<PathBuf>,
+    /// The `GstCudaContext` the output's CUDA elements take instead of
+    /// opening their own (see the module docs, "CUDA context"): another
+    /// output's ([`Output::cuda_context`]), so that one ingest's frames are
+    /// valid in both. Set on the pipeline at [`Output::start`], before it
+    /// opens; [`Output::cuda_context`] is then this one. `None` (the
+    /// default): the elements open their own. Ignored in system memory.
+    /// [`crate::session::Session::prepare_output`] sets it.
+    pub cuda_context: Option<gst::Context>,
 }
 
 impl OutputConfig {
@@ -327,6 +344,7 @@ impl OutputConfig {
             effect_background_video: None,
             module_stages: Vec::new(),
             placeholder_image: None,
+            cuda_context: None,
         }
     }
 
@@ -1073,10 +1091,28 @@ impl Output {
     pub const STALL_HOLD: Duration = Duration::from_secs(1);
 
     fn start_inner(&mut self) -> Result<(), PipelineError> {
+        if self.memory == VideoMemory::Cuda
+            && let Some(shared) = &self.cfg.cuda_context
+        {
+            if shared.context_type() != CUDA_CONTEXT_TYPE {
+                return Err(PipelineError::Cuda(format!(
+                    "an output shares a {CUDA_CONTEXT_TYPE} context, not {}",
+                    shared.context_type()
+                )));
+            }
+            // Before NULL -> READY: the CUDA elements take it instead of
+            // creating their own, as an ingest's do.
+            self.pipeline.pipeline().set_context(shared);
+        }
         self.pipeline.prepare()?;
         let (cuda, placeholder) = match self.memory {
             VideoMemory::Cuda => {
-                let cuda = self.acquire_cuda_context()?;
+                let cuda = match &self.cfg.cuda_context {
+                    // Given before the elements reached READY (above, on
+                    // `prepare`'s way there they asked for it).
+                    Some(shared) => shared.clone(),
+                    None => self.acquire_cuda_context()?,
+                };
                 let placeholder = make_placeholder(&self.canonical, &cuda)?;
                 (Some(cuda), placeholder)
             }
@@ -1160,6 +1196,38 @@ impl Output {
     /// The CUDA context ingest pipelines must use (after [`Self::start`]).
     pub fn cuda_context(&self) -> Option<&gst::Context> {
         self.cuda.as_ref()
+    }
+
+    /// Uses `cuda` as [`OutputConfig::cuda_context`] from the next start.
+    pub(crate) fn share_cuda_context(&mut self, cuda: Option<gst::Context>) {
+        self.cfg.cuda_context = cuda;
+    }
+
+    /// The slot this output's clock reads, for a writer to write into
+    /// ([`crate::frame`], "Fan-out").
+    pub(crate) fn slot_target(&self) -> SlotTarget {
+        SlotTarget {
+            slot: Arc::clone(&self.slot),
+            epoch: self.epoch,
+        }
+    }
+
+    /// Makes the source ids this output hands out continue after those
+    /// `other` has handed out, so a source of `other` writing into this
+    /// output too ([`crate::frame`], "Fan-out") never shares its id with a
+    /// later source of this one.
+    pub(crate) fn continue_sources_from(&self, other: &Output) {
+        let next = other.next_source.load(Ordering::Relaxed);
+        self.next_source.fetch_max(next, Ordering::Relaxed);
+    }
+
+    /// The loopback writer this output forwards to
+    /// ([`OutputSink::Writer`]); `None` for another sink.
+    pub fn writer(&self) -> Option<&WriterHandle> {
+        match &self.cfg.sink {
+            OutputSink::Writer(w) => Some(w),
+            _ => None,
+        }
     }
 
     /// A writer for a new source; each call allocates a new source id.
@@ -2391,6 +2459,48 @@ mod tests {
         });
         assert!(log.lock().unwrap().iter().all(|y| *y == WHITE), "{log:?}");
         o.stop().unwrap();
+    }
+
+    /// An output built with another output's CUDA context
+    /// ([`OutputConfig::cuda_context`]) opens none of its own: no
+    /// `gst.cuda.context` is created on its bus, and its context, the one
+    /// ingest pipelines take, carries the first output's `GstCudaContext`,
+    /// so one ingest's frames are valid in both.
+    #[test]
+    #[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+    fn gpu_an_output_shares_another_outputs_cuda_context() {
+        require_elements(&["cudadownload", "capssetter", "fakesink"]);
+        let contract: OutputContract = "320x240@30".parse().unwrap();
+        let mut first = Output::build(OutputConfig::new(contract, OutputSink::Fake)).unwrap();
+        first.start().unwrap();
+        let cuda = first.cuda_context().cloned().expect("the first's context");
+        let mut cfg = OutputConfig::new(contract, OutputSink::Fake);
+        cfg.cuda_context = Some(cuda.clone());
+        let mut second = Output::build(cfg).unwrap();
+        let created = Arc::new(AtomicU64::new(0));
+        let c = Arc::clone(&created);
+        second.pipeline().bus().set_sync_handler(move |_, msg| {
+            if let gst::MessageView::HaveContext(h) = msg.view()
+                && h.context().context_type() == CUDA_CONTEXT_TYPE
+            {
+                c.fetch_add(1, Ordering::Relaxed);
+            }
+            gst::BusSyncReply::Pass
+        });
+        second.start().unwrap();
+        let object = crate::ingest::cuda_context_object;
+        assert!(object(&cuda).is_some());
+        assert_eq!(
+            second.cuda_context().and_then(object),
+            object(&cuda),
+            "the second output's context is not the first's"
+        );
+        assert_eq!(created.load(Ordering::Relaxed), 0, "a context was created");
+        wait_until(Duration::from_secs(10), "the second's ticks", || {
+            second.counts().emitted >= 5
+        });
+        second.stop().unwrap();
+        first.stop().unwrap();
     }
 
     /// An output forwarding to a writer is attached to it from a start that
