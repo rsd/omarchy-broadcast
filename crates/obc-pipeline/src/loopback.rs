@@ -62,17 +62,32 @@
 //!   writer never holds.
 //! * **Restart hold.** A deliberate restart of the session (a module that
 //!   now provides a selected stage) stops one output and starts another.
-//!   Called before it, [`LoopbackWriter::hold_across_restart`] opens a
-//!   window (its `bound`, [`LoopbackWriter::RESTART_HOLD`] by default):
-//!   a last detach within it keeps the kept frame and holds it in the
-//!   placeholder's slots, as during an attached stall, until an output
-//!   attaches again (the attached rules then apply) or the window ends
-//!   (the placeholder then resumes). Without the call a detach drops the
-//!   kept frame as above, so a camera turned off or a privacy stop shows
-//!   the placeholder, never a frozen frame. The new output's clock pushes
-//!   its own placeholder from its start until its first camera frame
-//!   ([`crate::clock`]): the restart hold covers the gap with no output
-//!   only.
+//!   Called before it, [`LoopbackWriter::hold_across_restart`] starts the
+//!   restart hold, bounded by its `bound` ([`LoopbackWriter::RESTART_HOLD`]
+//!   by default), and opens a window of the same length for the stopping
+//!   output's detach. While the hold is in force
+//!   ([`WriterHandle::restart_holding`]), the kept frame fills every
+//!   placeholder slot, attached or not, whatever the attached bound, and
+//!   the clock of an output forwarding to the writer pushes nothing on a
+//!   placeholder tick ([`crate::output`], "Forwarding to a loopback
+//!   writer"): neither the stopping output's (its camera stops before it
+//!   does, and its clock would turn to placeholders after the gap
+//!   threshold) nor the new output's, from its start until its first
+//!   camera frame. So from the call to the new output's first frame (raw,
+//!   or processed by its effect) the consumer sees the last frame, never
+//!   the placeholder. The stopping output's frames, forwarded while it is
+//!   still attached (within the window) or late, once detached, are shown
+//!   and kept in place of the earlier one, and do not end the hold; a
+//!   last detach within the window keeps the hold, and consumes the
+//!   window. The first frame forwarded by an output attached after that
+//!   ends the hold, and the attached rules apply from then on. Past the
+//!   bound (a session that never comes back) the kept frame is dropped
+//!   and the placeholder resumes, the new output's clock's included.
+//!   Without the call a detach drops the kept frame as above, so a camera
+//!   turned off or a privacy stop shows the placeholder, never a frozen
+//!   frame; a last detach outside the window (the new output stopped
+//!   before its first frame: the camera turned off) ends the hold and
+//!   drops the kept frame the same way.
 //!
 //! **Timestamps.** Every buffer pushed, placeholder or forwarded, gets the
 //! writer's own timestamp: PTS = the `CLOCK_MONOTONIC` time of the push
@@ -274,17 +289,18 @@ struct PushState {
     attachments: Vec<(u64, Duration)>,
     /// The id of the next [`WriterHandle::attach`].
     next_attachment: u64,
-    /// The last forwarded frame `appsrc` accepted while attached, by
-    /// reference (its memory is not copied). Dropped by the last detach
-    /// (unless it starts a restart hold), past the hold, and at the
-    /// writer's start and stop.
+    /// The last forwarded frame `appsrc` accepted while attached or during
+    /// a restart hold, by reference (its memory is not copied). Dropped by
+    /// the last detach (unless it starts a restart hold), past the hold,
+    /// and at the writer's start and stop.
     kept: Option<gst::Buffer>,
     /// The window of [`LoopbackWriter::hold_across_restart`]: until then, a
     /// last detach starts a restart hold instead of dropping `kept`.
     /// Consumed by that detach and by an attach.
     restart_window: Option<Instant>,
-    /// The restart hold in force (no output attached): `kept` is held until
-    /// then, or until an output attaches.
+    /// The restart hold in force: `kept` is held until then, or until a
+    /// frame is forwarded while an output is attached (the new output's
+    /// first), or that output detaches.
     restart_hold: Option<Instant>,
     /// Sees every accepted buffer; behind the push lock, so a call never
     /// overlaps [`LoopbackWriter::set_tap`].
@@ -493,15 +509,21 @@ impl PushState {
         self.attachments.last().map(|&(_, hold)| hold)
     }
 
-    /// Whether the kept frame is held at `now`: while an output is
-    /// attached, within its bound of the last forwarded frame
-    /// ([`hold_due`]); with none, while a restart hold lasts.
+    /// Whether the kept frame is held at `now`: during a restart hold,
+    /// until its bound (attached or not: the last forwarded frame is the
+    /// previous output's, so the attached output's own bound does not
+    /// apply to it); otherwise while an output is attached, within its
+    /// bound of the last forwarded frame ([`hold_due`]).
     fn holding(&self, now: Instant) -> bool {
-        if self.attachments.is_empty() {
-            self.restart_hold.is_some_and(|until| now < until)
-        } else {
-            hold_due(self.hold(), self.last_forward, now)
+        match self.restart_hold {
+            Some(until) => now < until,
+            None => hold_due(self.hold(), self.last_forward, now),
         }
+    }
+
+    /// Whether a restart hold is in force at `now` with a frame to hold.
+    fn restart_holding(&self, now: Instant) -> bool {
+        self.kept.is_some() && self.restart_hold.is_some_and(|until| now < until)
     }
 
     /// Ends every hold and returns the kept frame, for the caller to drop
@@ -567,6 +589,21 @@ impl Shared {
         let mut expired = None;
         let (buffer, producer) = if producer == Producer::Forwarded {
             st.last_forward = Some(now);
+            // The new output's first frame ends a restart hold; a frame of
+            // the stopping one (attached within the window, or late, with
+            // none attached) does not. A hold past its bound is over.
+            // Assumed: the stopping output forwards nothing once the next
+            // one is attached (the controller stops a session, its output
+            // reaching NULL in `Output::stop_checked`, before it starts the
+            // next), since a push does not say which output it comes from;
+            // a late frame then would end the hold early, the attached
+            // rules (and the new output's clock placeholder) applying
+            // before its first frame.
+            if (!st.attachments.is_empty() && st.restart_window.is_none())
+                || st.restart_hold.is_some_and(|until| now >= until)
+            {
+                st.restart_hold = None;
+            }
             (buffer, producer)
         } else if !placeholder_due(st.last_forward, now, after) {
             return Pushed::NotDue(placeholder_due_at(st.last_forward, after).unwrap_or(now));
@@ -628,8 +665,11 @@ impl Shared {
             }
         }
         // A reference (no copy) for the tap, and for the hold while an
-        // output is attached; taken only when needed.
-        let keep = producer == Producer::Forwarded && !st.attachments.is_empty();
+        // output is attached or a restart hold lasts (a late frame of the
+        // stopping output, shown, is the one held after it); taken only
+        // when needed.
+        let keep = producer == Producer::Forwarded
+            && (!st.attachments.is_empty() || st.restart_hold.is_some());
         let reference = (st.tap.0.is_some() || keep).then(|| buffer.clone());
         let accepted = self.appsrc.push_buffer(buffer).is_ok();
         if accepted {
@@ -720,23 +760,34 @@ impl WriterHandle {
     /// fill within `hold` of the last forwarded frame is filled by that frame
     /// again ([`WriterCounts::held`]). Attachments are counted, so two
     /// outputs handing over to each other each hold their own; the bound is
-    /// the last live attachment's. An attach ends a restart hold
-    /// ([`LoopbackWriter::hold_across_restart`]) and its window. Never
-    /// blocks beyond the push lock.
+    /// the last live attachment's. An attach consumes the window of
+    /// [`LoopbackWriter::hold_across_restart`]; a restart hold in force
+    /// lasts past it, until the attached output forwards its first frame
+    /// (see the module docs, "Restart hold"). Never blocks beyond the push
+    /// lock.
     pub fn attach(&self, hold: Duration) -> WriterAttachment {
         let mut st = self.shared.lock();
         let id = st.next_attachment;
         st.next_attachment += 1;
         st.attachments.push((id, hold));
-        // A new output ends a restart hold: from now on the kept frame is
-        // held only as for any attached output, within `hold` of the last
-        // forwarded frame.
         st.restart_window = None;
-        st.restart_hold = None;
         WriterAttachment {
             shared: Arc::clone(&self.shared),
             id,
         }
+    }
+
+    /// Whether a restart hold is in force ([`LoopbackWriter::hold_across_restart`],
+    /// module docs "Restart hold"): from that call, the last frame
+    /// forwarded is held, through the stopping output's stop, until the
+    /// next output forwards its first frame or the bound passes. The
+    /// output clock of a forwarding output asks it on each placeholder
+    /// tick, and pushes nothing while it is: its placeholder would be
+    /// shown (black, or the away image) in place of the held frame, and in
+    /// the new output it would end the hold. Never blocks beyond the push
+    /// lock.
+    pub fn restart_holding(&self) -> bool {
+        self.shared.lock().restart_holding(Instant::now())
     }
 
     /// The bounds of the live attachments, in attach order (tests).
@@ -753,7 +804,9 @@ impl WriterHandle {
 /// resumes [`WriterConfig::placeholder_after`] after the last forwarded
 /// frame, as before any attach; within the window of
 /// [`LoopbackWriter::hold_across_restart`], the kept frame is held instead,
-/// until the next attach or the window's end.
+/// until the next output's first forwarded frame or the window's end. A
+/// last detach while that restart hold is in force (the next output
+/// stopped before its first frame) ends it and drops the kept frame.
 #[must_use = "the output is detached when the attachment is dropped"]
 pub struct WriterAttachment {
     shared: Arc<Shared>,
@@ -774,13 +827,18 @@ impl Drop for WriterAttachment {
         st.attachments.retain(|&(id, _)| id != self.id);
         let released = if st.attachments.is_empty() {
             // Within the window of a deliberate restart, the kept frame
-            // stays held until its bound or the next attach.
+            // stays held until the next output's first forwarded frame or
+            // the bound; outside it (no window, or the next output stopped
+            // before its first frame) the hold ends and the frame goes.
             match st.restart_window.take() {
                 Some(until) if Instant::now() < until && st.kept.is_some() => {
                     st.restart_hold = Some(until);
                     None
                 }
-                _ => st.kept.take(),
+                _ => {
+                    st.restart_hold = None;
+                    st.kept.take()
+                }
             }
         } else {
             None
@@ -1341,26 +1399,58 @@ impl LoopbackWriter {
     }
 
     /// The longest [`Self::hold_across_restart`] is meant to hold: long
-    /// enough for a session to stop and the next one to attach its output,
+    /// enough for a session to stop and the next one to forward its first
+    /// camera frame (the camera reopened, the effect's modules loaded),
     /// short enough that a restart that never comes back turns to the
     /// placeholder within seconds.
     pub const RESTART_HOLD: Duration = Duration::from_secs(3);
 
     /// Holds the last forwarded frame across a deliberate restart of the
-    /// session (see the module docs, "Hold"): when the attached output
-    /// detaches within `bound` of this call, the writer keeps filling the
-    /// placeholder's slots with its last frame, as during an attached
-    /// stall, until an output attaches again or `bound` (from this call)
-    /// has passed, instead of turning to the placeholder at once. A call
-    /// replaces the window of an earlier one; the window is consumed by
-    /// the first detach that leaves no output attached, and by an attach.
-    /// With no frame kept (no output attached, or past its hold), nothing
-    /// is held. Never for a stop that must hide the camera (the camera
-    /// turned off, a privacy drop): those detach without this call, and the
-    /// placeholder follows as before. [`Self::RESTART_HOLD`] is the bound
+    /// session (see the module docs, "Restart hold"): from this call, the
+    /// writer fills the placeholder's slots with its last frame, as during
+    /// an attached stall, and the clocks of the outputs forwarding to it
+    /// push no placeholder ([`WriterHandle::restart_holding`]), through
+    /// the attached output's stop (when it detaches within `bound` of this
+    /// call) until the next output forwards its first frame or `bound`
+    /// (from this call) has passed, instead of turning to the placeholder.
+    /// A call replaces the window and the hold of an earlier one; the
+    /// window is consumed by the first detach that leaves no output
+    /// attached, and by an attach. With no frame kept (no output attached,
+    /// or past its hold), nothing is held. Never for a stop that must hide
+    /// the camera (the camera turned off, a privacy drop): those detach
+    /// without this call, and the placeholder follows as before; one that
+    /// comes while a hold is in force ends it with
+    /// [`Self::end_restart_hold`]. [`Self::RESTART_HOLD`] is the bound
     /// meant for a session restart. Never blocks beyond the push lock.
     pub fn hold_across_restart(&self, bound: Duration) {
-        self.shared.lock().restart_window = Some(Instant::now() + bound);
+        let mut st = self.shared.lock();
+        let until = Instant::now() + bound;
+        st.restart_window = Some(until);
+        if st.kept.is_some() {
+            st.restart_hold = Some(until);
+        }
+    }
+
+    /// Ends a restart hold ([`Self::hold_across_restart`]) at once, and
+    /// its window: the kept frame is dropped and the placeholder resumes
+    /// [`WriterConfig::placeholder_after`] after the last forwarded frame
+    /// (the clock of an output still attached resumes its own placeholder
+    /// too, [`WriterHandle::restart_holding`] being false). For a restart
+    /// that turns into a stop that must hide the camera before the next
+    /// output's first frame (the camera turned off, privacy turned on, the
+    /// writer or the new start failed): the frame held is the camera's
+    /// last, never shown past that. With no hold in force, only the kept
+    /// frame is dropped (a stall of an attached output then shows the
+    /// placeholder). Never blocks beyond the push lock.
+    pub fn end_restart_hold(&self) {
+        let released = {
+            let mut st = self.shared.lock();
+            st.restart_window = None;
+            st.restart_hold = None;
+            st.kept.take()
+        };
+        // A buffer of an output's pool goes back to it outside the lock.
+        drop(released);
     }
 
     /// A handle for the active output to forward its frames with.
@@ -2747,41 +2837,96 @@ mod tests {
         assert_pts_increasing(&seen);
     }
 
-    /// A restart hold ends at the next attach (the attached rules apply
-    /// then: with a zero bound, nothing is held), and the window is used
-    /// once. A detach after the window has passed shows the placeholder at
-    /// once, as without the call.
+    /// Waits for three more placeholders, then checks that nothing more
+    /// is held.
+    fn held_then_placeholder(w: &LoopbackWriter) {
+        let c = w.counts();
+        wait_until(Duration::from_secs(10), "the placeholder", || {
+            w.counts().placeholder >= c.placeholder + 3
+        });
+        let c = w.counts();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(w.counts().held, c.held, "held: {c:?} -> {:?}", w.counts());
+    }
+
+    /// Waits for three more held frames, with no placeholder meanwhile.
+    fn still_held(w: &LoopbackWriter) {
+        let c = w.counts();
+        wait_until(Duration::from_secs(10), "held frames", || {
+            w.counts().held >= c.held + 3
+        });
+        assert_eq!(
+            w.counts().placeholder,
+            c.placeholder,
+            "{c:?} -> {:?}",
+            w.counts()
+        );
+    }
+
+    /// A restart hold is in force from the call: the stopping output's
+    /// frames (still attached, its own bound zero) are kept and do not end
+    /// it, and its placeholder slots are held. It lasts past the next
+    /// attach (also of bound zero), until the attached output forwards its
+    /// first frame: from then on the attached rules apply (with a zero
+    /// bound, nothing is held), the kept frame's memory is never pushed
+    /// again, and the window is used once. A detach after the window has
+    /// passed shows the placeholder at once, as without the call.
     #[test]
-    fn a_new_attach_ends_the_restart_hold_and_a_late_detach_has_none() {
+    fn a_restart_hold_lasts_past_the_attach_until_the_first_forwarded_frame() {
         require_elements(ELEMENTS);
         let contract = small(OutputFormat::Nv12);
         let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+        let seen = record_tap(&mut w);
         let h = w.handle();
         w.start().unwrap();
         wait_until(Duration::from_secs(10), "placeholders", || {
             w.counts().placeholder >= 2
         });
-        let held_then_placeholder = |w: &LoopbackWriter| {
-            let c = w.counts();
-            wait_until(Duration::from_secs(10), "the placeholder", || {
-                w.counts().placeholder >= c.placeholder + 3
-            });
-            let c = w.counts();
-            std::thread::sleep(Duration::from_millis(100));
-            assert_eq!(w.counts().held, c.held, "held: {c:?} -> {:?}", w.counts());
-        };
-        let attachment = h.attach(Duration::from_secs(60));
+        let attachment = h.attach(Duration::ZERO);
         assert!(h.push(black_contract_frame(&contract).unwrap()));
+        assert!(!h.restart_holding(), "held before the restart");
         w.hold_across_restart(Duration::from_secs(60));
+        assert!(h.restart_holding(), "not held from the call");
+        still_held(&w);
+        // A frame of the stopping output, still attached: kept, the hold
+        // goes on.
+        let old = black_contract_frame(&contract).unwrap();
+        let old_data = old.map_readable().unwrap().as_ptr() as usize;
+        let pushed = Instant::now();
+        assert!(h.push(old));
+        assert!(h.restart_holding(), "ended by the stopping output");
+        still_held(&w);
+        let tapped = seen.lock().unwrap().clone();
+        assert!(
+            tapped
+                .iter()
+                .filter(|t| t.at >= pushed)
+                .all(|t| t.data == old_data),
+            "not the stopping output's last frame: {tapped:?}"
+        );
         drop(attachment);
-        let c = w.counts();
-        wait_until(Duration::from_secs(10), "held after the detach", || {
-            w.counts().held >= c.held + 3
-        });
-        // The new output attaches: the restart hold ends.
+        assert!(h.restart_holding());
+        still_held(&w);
+        // The new output attaches: the restart hold goes on.
         let next = h.attach(Duration::ZERO);
+        assert!(h.restart_holding(), "ended by the attach");
+        still_held(&w);
+        // Its first frame ends it.
+        let first = black_contract_frame(&contract).unwrap();
+        let first_data = first.map_readable().unwrap().as_ptr() as usize;
+        let forwarded = Instant::now();
+        assert!(h.push(first));
+        assert!(!h.restart_holding(), "held past the first frame");
         held_then_placeholder(&w);
-        // The window was used: its detach drops the kept frame.
+        // Before any later buffer could reuse the old frame's memory.
+        let tapped = seen.lock().unwrap().clone();
+        let after: Vec<&TapEntry> = tapped.iter().filter(|t| t.at >= forwarded).collect();
+        assert_eq!(after.first().map(|t| t.data), Some(first_data), "{after:?}");
+        assert!(
+            after.iter().all(|t| t.data != old_data),
+            "the old frame after the new one: {after:?}"
+        );
+        // The window was used: the detach drops the kept frame.
         assert!(h.push(black_contract_frame(&contract).unwrap()));
         drop(next);
         held_then_placeholder(&w);
@@ -2791,15 +2936,184 @@ mod tests {
         assert!(h.push(black_contract_frame(&contract).unwrap()));
         w.hold_across_restart(Duration::from_millis(20));
         std::thread::sleep(Duration::from_millis(60));
-        let c = w.counts();
         drop(attachment);
-        wait_until(Duration::from_secs(10), "the placeholder", || {
-            w.counts().placeholder >= c.placeholder + 3
-        });
-        let late = w.counts();
-        std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(w.counts().held, late.held, "held after a late detach");
+        assert!(!h.restart_holding());
+        held_then_placeholder(&w);
         w.stop().unwrap();
+        assert_pts_increasing(&seen.lock().unwrap());
+    }
+
+    /// A restart hold's bound ends it once the new output is attached too
+    /// (it never forwards a frame: a wedged session), whatever that
+    /// output's own bound: the placeholder then resumes and nothing more
+    /// is held. Bounds on time are lower bounds,
+    /// or generous upper ones (docs/testing.md).
+    #[test]
+    fn the_bound_ends_a_restart_hold_carried_past_the_attach() {
+        require_elements(ELEMENTS);
+        let contract = small(OutputFormat::Nv12);
+        let bound = Duration::from_millis(500);
+        let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+        let h = w.handle();
+        w.start().unwrap();
+        let attachment = h.attach(Duration::from_secs(60));
+        assert!(h.push(black_contract_frame(&contract).unwrap()));
+        let called = Instant::now();
+        w.hold_across_restart(bound);
+        drop(attachment);
+        let next = h.attach(Duration::from_secs(60));
+        still_held(&w);
+        let c = w.counts();
+        wait_until(
+            Duration::from_secs(10),
+            "the placeholder past the bound",
+            || w.counts().placeholder > c.placeholder,
+        );
+        let at = called.elapsed();
+        assert!(!h.restart_holding(), "held past the bound");
+        let period = Duration::from_nanos(contract.frame_duration_ns());
+        assert!(
+            at >= bound - period,
+            "the placeholder {at:?} after the call"
+        );
+        assert!(at < bound + Duration::from_secs(2), "{at:?}");
+        held_then_placeholder(&w);
+        drop(next);
+        w.stop().unwrap();
+    }
+
+    /// A late frame of the stopping output, forwarded after its detach
+    /// (no output attached), is shown and held in place of the frame kept
+    /// before it, and does not end the restart hold.
+    #[test]
+    fn a_late_frame_of_the_stopping_output_is_held_and_keeps_the_restart_hold() {
+        require_elements(ELEMENTS);
+        let contract = small(OutputFormat::Nv12);
+        let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+        let seen = record_tap(&mut w);
+        let h = w.handle();
+        w.start().unwrap();
+        let attachment = h.attach(Duration::from_secs(60));
+        assert!(h.push(black_contract_frame(&contract).unwrap()));
+        w.hold_across_restart(Duration::from_secs(60));
+        drop(attachment);
+        let late = black_contract_frame(&contract).unwrap();
+        let late_data = late.map_readable().unwrap().as_ptr() as usize;
+        let pushed = Instant::now();
+        assert!(h.push(late));
+        assert!(h.restart_holding(), "ended by a late frame");
+        still_held(&w);
+        let tapped = seen.lock().unwrap().clone();
+        let after: Vec<&TapEntry> = tapped.iter().filter(|t| t.at >= pushed).collect();
+        assert!(after.len() >= 4, "{after:?}");
+        assert!(after.iter().all(|t| t.data == late_data), "{after:?}");
+        w.stop().unwrap();
+    }
+
+    /// The new output stopped during a restart hold, before its first
+    /// frame (the camera turned off): the hold ends and the kept frame is
+    /// dropped, so the placeholder follows at once.
+    #[test]
+    fn a_detach_during_a_restart_hold_ends_it() {
+        require_elements(ELEMENTS);
+        let contract = small(OutputFormat::Nv12);
+        let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+        let h = w.handle();
+        w.start().unwrap();
+        let attachment = h.attach(Duration::from_secs(60));
+        assert!(h.push(black_contract_frame(&contract).unwrap()));
+        w.hold_across_restart(Duration::from_secs(60));
+        drop(attachment);
+        let next = h.attach(Duration::from_secs(60));
+        still_held(&w);
+        drop(next);
+        assert!(!h.restart_holding(), "held past the new output's stop");
+        held_then_placeholder(&w);
+        w.stop().unwrap();
+    }
+
+    /// `end_restart_hold` during a restart hold (a stop that must hide the
+    /// camera before the next output's first frame) ends it at once, with
+    /// no output attached or with the new one attached: the kept frame is
+    /// dropped (nothing more is held, whatever the attached bound) and the
+    /// placeholder resumes. Called with no hold in force, it does nothing
+    /// visible.
+    #[test]
+    fn ending_a_restart_hold_drops_the_kept_frame() {
+        require_elements(ELEMENTS);
+        let contract = small(OutputFormat::Nv12);
+        let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+        let h = w.handle();
+        w.start().unwrap();
+        w.end_restart_hold();
+        wait_until(Duration::from_secs(10), "placeholders", || {
+            w.counts().placeholder >= 2
+        });
+        // No output attached.
+        let attachment = h.attach(Duration::from_secs(60));
+        assert!(h.push(black_contract_frame(&contract).unwrap()));
+        w.hold_across_restart(Duration::from_secs(60));
+        drop(attachment);
+        still_held(&w);
+        w.end_restart_hold();
+        assert!(!h.restart_holding(), "held past the end");
+        held_then_placeholder(&w);
+        // The new output attached, before its first frame.
+        let attachment = h.attach(Duration::from_secs(60));
+        assert!(h.push(black_contract_frame(&contract).unwrap()));
+        w.hold_across_restart(Duration::from_secs(60));
+        drop(attachment);
+        let next = h.attach(Duration::from_secs(60));
+        still_held(&w);
+        w.end_restart_hold();
+        assert!(!h.restart_holding(), "held past the end");
+        held_then_placeholder(&w);
+        // The window went with it: the next output's detach holds nothing.
+        drop(next);
+        held_then_placeholder(&w);
+        w.stop().unwrap();
+    }
+
+    /// A second `hold_across_restart` while a restart hold is in force,
+    /// the new output attached before its first frame (a second module
+    /// toggle): that output is now the stopping one, its frames kept
+    /// without ending the hold, which lasts from the second call's bound
+    /// past the first's, through its detach, until the next output's
+    /// first frame.
+    #[test]
+    fn a_second_restart_during_a_restart_hold_carries_it_on() {
+        require_elements(ELEMENTS);
+        let contract = small(OutputFormat::Nv12);
+        let first_bound = Duration::from_millis(300);
+        let mut w = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+        let seen = record_tap(&mut w);
+        let h = w.handle();
+        w.start().unwrap();
+        let attachment = h.attach(Duration::ZERO);
+        assert!(h.push(black_contract_frame(&contract).unwrap()));
+        w.hold_across_restart(first_bound);
+        drop(attachment);
+        let second = h.attach(Duration::ZERO);
+        w.hold_across_restart(Duration::from_secs(60));
+        assert!(h.restart_holding());
+        // Its frame (the second output, stopping now) does not end it.
+        assert!(h.push(black_contract_frame(&contract).unwrap()));
+        assert!(h.restart_holding(), "ended by the stopping output");
+        std::thread::sleep(first_bound * 2);
+        assert!(h.restart_holding(), "ended by the first call's bound");
+        still_held(&w);
+        drop(second);
+        assert!(h.restart_holding(), "ended by the stopping output's detach");
+        still_held(&w);
+        let third = h.attach(Duration::ZERO);
+        assert!(h.restart_holding(), "ended by the attach");
+        assert!(h.push(black_contract_frame(&contract).unwrap()));
+        assert!(!h.restart_holding(), "held past the first frame");
+        held_then_placeholder(&w);
+        drop(third);
+        held_then_placeholder(&w);
+        w.stop().unwrap();
+        assert_pts_increasing(&seen.lock().unwrap());
     }
 
     /// An output ending in [`OutputSink::Writer`] forwards to the writer:

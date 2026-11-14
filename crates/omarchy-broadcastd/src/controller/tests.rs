@@ -12765,6 +12765,179 @@ fn only_a_module_change_restart_holds_the_last_frame() {
     assert!(h.world().restart_holds.is_empty());
 }
 
+#[test]
+fn a_restart_hold_ends_when_the_camera_turns_off_before_the_next_frame() {
+    // SetEnabled(false) queued during the new session's output build: the
+    // session is dropped before a camera frame, and the hold with it.
+    let mut h = H::new(&away_config("denoise = true\n"), |_| {});
+    h.set_module(MAXINE_MODULE, false, 0);
+    h.activate(100);
+    let published = h.ctrl.published.clone();
+    h.world().during_start = Some(Hook(Box::new(move || published.request_disable())));
+    h.set_module(MAXINE_MODULE, true, 1000);
+    assert_eq!(h.world().restart_holds, [true]);
+    assert!(h.world().session.is_none());
+    // Ended before the new session's output stops.
+    assert_eq!(h.world().restart_hold_ends, [true]);
+    h.call(|r| Command::SetEnabled(false, r), 1100).unwrap();
+    h.tick(1400);
+    assert_eq!(h.world().restart_hold_ends, [true], "ended once");
+    // Queued before the restart: the new session never starts, and the
+    // hold ends with no session.
+    let mut h = H::new(&away_config("denoise = true\n"), |_| {});
+    h.set_module(MAXINE_MODULE, false, 0);
+    h.activate(100);
+    h.ctrl.published.request_disable();
+    h.set_module(MAXINE_MODULE, true, 1000);
+    assert_eq!(h.world().session_starts, 1);
+    assert_eq!(h.world().restart_holds, [true]);
+    assert_eq!(h.world().restart_hold_ends, [false]);
+    // A new start that fails: ended.
+    let mut h = H::new(&away_config("denoise = true\n"), |_| {});
+    h.set_module(MAXINE_MODULE, false, 0);
+    h.activate(100);
+    h.world().fail_start = Some("no output".into());
+    h.set_module(MAXINE_MODULE, true, 1000);
+    assert!(h.world().session.is_none());
+    assert_eq!(h.world().restart_holds, [true]);
+    assert!(!h.world().restart_hold_ends.is_empty());
+    // A normal restart: the new session's frames end the hold in the
+    // writer; nothing is asked of it, then or later.
+    let mut h = H::new(&away_config("denoise = true\n"), |_| {});
+    h.set_module(MAXINE_MODULE, false, 0);
+    h.activate(100);
+    h.set_module(MAXINE_MODULE, true, 1000);
+    h.tick(1400);
+    assert_eq!(h.state(), State::Active);
+    assert!(h.world().restart_hold_ends.is_empty());
+    h.call(|r| Command::SetEnabled(false, r), 2000).unwrap();
+    assert!(h.world().restart_hold_ends.is_empty(), "after it went live");
+}
+
+#[test]
+fn a_restart_hold_ends_when_privacy_turns_on_before_the_next_frame() {
+    // Blur under `none` (the camera may be shown): the restart is held.
+    // Privacy turned on (`black`) before the new session's first camera
+    // frame: the frame held may be the room, so the hold ends, while the
+    // session runs on with the effect.
+    let blur = |policy: &str| {
+        away_config(&format!(
+            "mode = \"blur\"\non_failure = \"{policy}\"\ndenoise = true\n"
+        ))
+    };
+    let mut h = H::new(&blur("none"), |_| {});
+    h.set_module(MAXINE_MODULE, false, 0);
+    h.activate(100);
+    h.world().frames = false;
+    h.set_module(MAXINE_MODULE, true, 1000);
+    h.tick(1100);
+    assert_eq!(h.world().session_starts, 2);
+    assert_eq!(h.world().restart_holds, [true]);
+    assert!(h.world().restart_hold_ends.is_empty());
+    h.reload(&blur("black"), 1200).unwrap();
+    assert!(h.world().session.is_some(), "{:?}", h.snap());
+    assert_eq!(h.world().session_starts, 2, "restarted");
+    assert_eq!(h.world().restart_hold_ends, [true]);
+    h.tick(1300);
+    assert_eq!(h.world().restart_hold_ends, [true], "ended once");
+}
+
+/// The example module's id ([`hello_modules_dir`]).
+const HELLO_MODULE: &str = "org.example.hello";
+
+/// A session started without the example module and, unless `effect_on`,
+/// without the effect module, its stages selected under `effect`, then
+/// restarted for the module `first` enabled before its first camera
+/// frame: a restart hold in force.
+fn restart_held_for(effect: &str, effect_on: bool, first: &str) -> (H, TempDir) {
+    let dir = hello_modules_dir();
+    let config = format!("{}[effect]\n{effect}", modules_config(dir.path()));
+    let mut h = H::new(&config, |w| w.real_modules = true);
+    h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
+        .unwrap();
+    h.set_module(HELLO_MODULE, false, 0);
+    h.set_module(MAXINE_MODULE, effect_on, 0);
+    h.activate(100);
+    h.world().frames = false;
+    h.set_module(first, true, 1000);
+    h.tick(1100);
+    {
+        let w = h.world();
+        assert_eq!(w.session_starts, 2);
+        assert_eq!(w.restart_holds, [true]);
+        assert!(w.restart_hold_ends.is_empty());
+    }
+    (h, dir)
+}
+
+#[test]
+fn a_second_module_restart_before_the_first_frame_carries_the_hold_on() {
+    // A second restart for a module before the new session's first camera
+    // frame: the hold is not ended in between (that would drop the frame
+    // kept, and the new hold would have nothing to hold), it is asked
+    // again right before the stop.
+    let (mut h, _dir) = restart_held_for("denoise = true\n", false, MAXINE_MODULE);
+    h.set_module(HELLO_MODULE, true, 1200);
+    h.tick(1300);
+    {
+        let w = h.world();
+        assert_eq!(w.session_starts, 3);
+        assert_eq!(w.restart_holds, [true, true]);
+        assert!(w.restart_hold_ends.is_empty(), "{:?}", w.restart_hold_ends);
+    }
+    // The third session's frames end it in the writer: nothing is asked.
+    h.world().frames = true;
+    h.tick(1400);
+    assert_eq!(h.state(), State::Active);
+    h.call(|r| Command::SetEnabled(false, r), 2000).unwrap();
+    assert!(h.world().restart_hold_ends.is_empty(), "after it went live");
+    // Turned off before then: ended once.
+    let (mut h, _dir) = restart_held_for("denoise = true\n", false, MAXINE_MODULE);
+    h.set_module(HELLO_MODULE, true, 1200);
+    h.call(|r| Command::SetEnabled(false, r), 1300).unwrap();
+    h.tick(1400);
+    assert_eq!(h.world().restart_hold_ends, [true]);
+}
+
+#[test]
+fn a_second_restart_that_hides_the_camera_ends_the_hold() {
+    // The first restart held (no effect: the camera may be shown); the
+    // background effect then selected under `black`, no module of the
+    // running session able to run it: the hold ends (the frame kept is
+    // the room), and the restart for the effect module holds nothing.
+    let (mut h, _dir) = restart_held_for("on_failure = \"black\"\n", false, HELLO_MODULE);
+    h.set_effect("blur", 1200).unwrap();
+    h.tick(1250);
+    h.set_module(MAXINE_MODULE, true, 1300);
+    h.tick(1400);
+    let w = h.world();
+    assert_eq!(w.session_starts, 3);
+    assert_eq!(w.restart_holds, [true], "not held again");
+    assert_eq!(w.restart_hold_ends, [true], "ended once");
+}
+
+#[test]
+fn the_system_memory_fallback_of_a_restart_keeps_its_hold() {
+    // The new session's CUDA output fails for want of CUDA: it never
+    // attached to the writer, and the start in system memory goes on
+    // under the hold.
+    let mut h = H::new("[effect]\ndenoise = true\n", |_| {});
+    h.set_module(MAXINE_MODULE, false, 0);
+    h.activate(100);
+    h.world().frames = false;
+    h.world().fail_start_no_cuda = Some(NO_CUDADOWNLOAD.into());
+    h.set_module(MAXINE_MODULE, true, 1000);
+    h.tick(1100);
+    let w = h.world();
+    assert_eq!(
+        w.start_memories,
+        [VideoMemory::Cuda, VideoMemory::Cuda, VideoMemory::System]
+    );
+    assert!(w.session.is_some());
+    assert_eq!(w.restart_holds, [true]);
+    assert!(w.restart_hold_ends.is_empty(), "{:?}", w.restart_hold_ends);
+}
+
 // ---- the guard and the start agree on a session without its effects ----
 
 const BLUR_BLACK: &str = "[effect]\nmode = \"blur\"\non_failure = \"black\"\n";

@@ -214,6 +214,9 @@ pub struct World {
     /// Every `hold_across_restart` made while a writer ran, with whether a
     /// session ran then.
     pub restart_holds: Vec<bool>,
+    /// Every `end_restart_hold` made while a writer ran, with whether a
+    /// session ran then.
+    pub restart_hold_ends: Vec<bool>,
     /// What the effect report says of the effect element's fallback image
     /// (`EffectReport::fallback_error`).
     pub fallback_error: Option<String>,
@@ -522,6 +525,7 @@ impl Default for World {
             cover_image_sets: Vec::new(),
             cover_image_resends: Vec::new(),
             restart_holds: Vec::new(),
+            restart_hold_ends: Vec::new(),
             fallback_error: None,
             background_error: None,
             switch_error: None,
@@ -1072,6 +1076,14 @@ impl MediaBackend for FakeBackend {
         if w.writer.is_some() {
             let session = w.session.is_some();
             w.restart_holds.push(session);
+        }
+    }
+
+    fn end_restart_hold(&mut self) {
+        let mut w = self.world();
+        if w.writer.is_some() {
+            let session = w.session.is_some();
+            w.restart_hold_ends.push(session);
         }
     }
 

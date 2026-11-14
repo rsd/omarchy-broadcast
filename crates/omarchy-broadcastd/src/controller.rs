@@ -1679,6 +1679,14 @@ pub struct Controller<B: MediaBackend> {
     /// ([`Self::follow_effect_backend`]): the module the session started
     /// the background effect with can no longer run it.
     background_revoked: bool,
+    /// A restart hold asked of the writer ([`Self::restart_for_modules`])
+    /// may be in force: `Some(hiding)`, with whether a session started
+    /// then would hide the camera ([`Self::refuses_passthrough`]). Taken
+    /// by [`Self::end_restart_hold`], forgotten once the new session is
+    /// live ([`Self::end_unhidden_restart_hold`]); the hold may have ended
+    /// in the writer before (the new session's first frame, its bound),
+    /// which makes that call a harmless one.
+    restart_held: Option<bool>,
     /// The running session's output could not start with its effects and
     /// module stages and streams without them (its plan is empty): the
     /// `Warning` clause saying so. Ends with the session.
@@ -2090,6 +2098,7 @@ impl<B: MediaBackend> Controller<B> {
             background_planned: false,
             background_closed: false,
             background_revoked: false,
+            restart_held: None,
             passthrough: None,
             marked: Vec::new(),
             compute_capability,
@@ -3223,26 +3232,72 @@ impl<B: MediaBackend> Controller<B> {
     /// Except when the running session does not run the background effect
     /// that the new one is given under a privacy policy that hides the
     /// camera ([`Self::refuses_passthrough`]): its last frame is the room
-    /// the user now asks to hide, never held. Known limit: the hold covers only the time no output is attached;
-    /// once the new session's output attaches, its clock shows its own
-    /// placeholder (black, or the away image) from its start until its
-    /// first camera frame.
+    /// the user now asks to hide, never held. The hold lasts until the new
+    /// session's output forwards its first camera frame (its clock sends
+    /// no placeholder meanwhile), or until the bound, after which that
+    /// clock's placeholder (black, or the away image) shows; or until a
+    /// stop, the camera turned off, a failed start or a policy that now
+    /// hides the camera ends it first ([`Self::end_restart_hold`]).
     fn restart_for_modules(&mut self) -> bool {
         let Some(what) = self.restart_for() else {
             return false;
         };
         info!("a module provides {what} now: restarting the camera to run it");
-        let hidden = self.refuses_passthrough()
+        let hiding = self.refuses_passthrough();
+        let hidden = hiding
             && (self.passthrough.is_some()
                 || !self
                     .plan
                     .as_ref()
                     .is_some_and(|p| self.runs_in(p, &StageId::BACKGROUND)));
-        if !hidden {
-            self.backend.hold_across_restart();
+        // A restart before the last one's new session went live carries
+        // its hold on (the writer's frame kept, [`Self::end_restart_hold`]
+        // would drop it): forgotten, the drop does not end it, and the
+        // call below re-arms it. Not when the frame kept may be the room
+        // a policy hiding the camera now hides (a hold taken while it
+        // could be shown): the drop ends it first.
+        if !hidden && !(hiding && self.restart_held == Some(false)) {
+            self.restart_held = None;
         }
-        self.drop_session();
+        // Once the session is taken, before its output stops.
+        self.drop_session_with(|c| {
+            if !hidden {
+                c.backend.hold_across_restart();
+                c.restart_held = Some(hiding);
+            }
+        });
         true
+    }
+
+    /// Ends the writer's restart hold ([`Self::restart_for_modules`]) when
+    /// one may be in force: the new session is not to show the frame the
+    /// last one left ([`MediaBackend::end_restart_hold`]). Called when the
+    /// session is dropped (before a restart opens a new hold), when no
+    /// session is wanted (the camera turned off while no session runs,
+    /// between a restart and the next start) and when a hold taken while
+    /// the camera could be shown meets a policy that now hides it
+    /// ([`Self::end_unhidden_restart_hold`]).
+    fn end_restart_hold(&mut self) {
+        if self.restart_held.take().is_some() {
+            self.backend.end_restart_hold();
+        }
+    }
+
+    /// A restart hold taken while the camera could be shown (its frame
+    /// may be the room) ends once a session started now would hide it
+    /// ([`Self::refuses_passthrough`]: privacy turned on, or an effect
+    /// selected, under a hiding policy), with a session or none: the
+    /// held frame is never shown under that policy, not even until the
+    /// new session's first frame.
+    fn end_unhidden_restart_hold(&mut self) {
+        if self.session.as_ref().is_some_and(|s| s.live) {
+            // The new session's frames reached the output: they ended the
+            // hold in the writer, and the session follows the policy.
+            self.restart_held = None;
+        } else if self.restart_held == Some(false) && self.refuses_passthrough() {
+            info!("the camera is to be hidden now: not holding its last frame");
+            self.end_restart_hold();
+        }
     }
 
     /// What a session started now would run, of what the user selected,
@@ -3837,6 +3892,7 @@ impl<B: MediaBackend> Controller<B> {
             // (nor a camera frame) under the hold.
             self.drop_session_held(|c| c.privacy_hold = Some(PrivacyHold::Guard));
         }
+        self.end_unhidden_restart_hold();
         let had_session = self.session.is_some();
         self.decide(now);
         if !had_session && self.session.is_some() {
@@ -4670,6 +4726,10 @@ impl<B: MediaBackend> Controller<B> {
                             .is_some_and(|t| now >= t + self.config.start_debounce())
                 }
             };
+        if !wanted {
+            // Between a restart and the next start: no new session comes.
+            self.end_restart_hold();
+        }
         if wanted && self.session.is_none() {
             self.start_session(now);
         } else if !wanted && self.session.is_some() {
@@ -4705,6 +4765,11 @@ impl<B: MediaBackend> Controller<B> {
                 // already.
                 Again::SystemMemory => announce = false,
             }
+        }
+        if self.session.is_none() {
+            // No new session after a restart (no camera, a fault, a
+            // disable queued): nothing comes to end the hold.
+            self.end_restart_hold();
         }
     }
 
@@ -4846,7 +4911,11 @@ impl<B: MediaBackend> Controller<B> {
                 e.message
             );
             self.memory_fallback = Some(format!("CUDA could not start: {}", e.message));
+            // The output never attached to the writer: a restart hold
+            // stands for the start in system memory, under the same policy.
+            let held = self.restart_held.take();
             self.drop_session();
+            self.restart_held = held;
             return Again::SystemMemory;
         }
         if let Err(e) = started
@@ -5069,6 +5138,9 @@ impl<B: MediaBackend> Controller<B> {
     /// taken and before the backend stops it.
     fn drop_session_with(&mut self, before_stop: impl FnOnce(&mut Self)) {
         self.stop_watch();
+        // A restart hold of a session dropped before its first frame (a
+        // failed start, a stop) ends, with a session or none.
+        self.end_restart_hold();
         let dropped = self.session.take().is_some();
         before_stop(self);
         if dropped {

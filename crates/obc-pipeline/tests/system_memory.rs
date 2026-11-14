@@ -457,3 +457,273 @@ fn a_stop_during_a_switch_stall_hands_over_to_the_placeholder() {
         "held after the stop: {stopped:?} -> {end:?}"
     );
 }
+
+/// A new session's output forwarding to `writer`, blur on the fake
+/// backend, started with no source yet (its clock has only placeholder
+/// ticks), as the daemon builds one after a restart.
+fn next_session(writer: &LoopbackWriter, fake: &Arc<FakeFactory>) -> Session {
+    let contract = *writer.handle().contract();
+    let mut cfg = OutputConfig::new(contract, OutputSink::Writer(writer.handle()));
+    cfg.effect = Some(EffectSettings::of(EffectKind::Blur));
+    cfg.effect_backend = Some(EffectBackend::new(fake.clone()));
+    let output = Output::build_in(cfg, VideoMemory::System).expect("build output");
+    Session::new(output).expect("start output")
+}
+
+/// A deliberate restart (a module enabled): the writer holds the stopped
+/// session's last frame across it. The stopping session's camera stops
+/// first, and its clock, past the gap threshold, sends no placeholder; nor
+/// does the new session's clock while it has no camera frame. So from the
+/// call to the new session's first frame the writer pushes held frames
+/// only, never a placeholder; that frame ends the hold. The camera turned
+/// off after it shows the placeholder, nothing held. CPU only.
+#[test]
+fn a_restart_holds_the_last_frame_until_the_new_sessions_first_frame() {
+    let (mut writer, fake, mut session) = blurred_session();
+    let h = writer.handle();
+    let called = writer.counts();
+    writer.hold_across_restart(LoopbackWriter::RESTART_HOLD);
+    // The camera's stop is slow: past the 500 ms gap threshold.
+    session.stop_ingest().unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    let slow = writer.counts();
+    assert!(h.restart_holding(), "{called:?} -> {slow:?}");
+    assert_eq!(
+        slow.placeholder, called.placeholder,
+        "{called:?} -> {slow:?}"
+    );
+    assert!(slow.held >= called.held + 5, "{called:?} -> {slow:?}");
+    let skipped = session.output().counts();
+    assert!(skipped.placeholder >= 5, "{skipped:?}");
+    session.stop().unwrap();
+    let stopped = writer.counts();
+    assert_eq!(
+        stopped.placeholder, called.placeholder,
+        "{called:?} -> {stopped:?}"
+    );
+    let mut session = next_session(&writer, &fake);
+    // About 9 periods without a camera frame.
+    std::thread::sleep(Duration::from_millis(300));
+    let waiting = writer.counts();
+    assert!(h.restart_holding(), "{stopped:?} -> {waiting:?}");
+    assert_eq!(
+        waiting.placeholder, stopped.placeholder,
+        "{stopped:?} -> {waiting:?}"
+    );
+    assert_eq!(
+        waiting.forwarded, stopped.forwarded,
+        "{stopped:?} -> {waiting:?}"
+    );
+    assert!(
+        waiting.held >= stopped.held + 5,
+        "{stopped:?} -> {waiting:?}"
+    );
+    let skipped = session.output().counts();
+    assert!(skipped.placeholder >= 5, "{skipped:?}");
+    assert_eq!(skipped.emitted, 0, "{skipped:?}");
+
+    let ingest = yuy2_pattern(session.output());
+    session.switch_to(ingest).expect("start source");
+    wait_for(Duration::from_secs(10), "the new session's frames", || {
+        writer.counts().forwarded >= waiting.forwarded + 10
+    });
+    let streaming = writer.counts();
+    assert!(!h.restart_holding(), "held past the first frame");
+    assert_eq!(
+        streaming.placeholder, stopped.placeholder,
+        "placeholders across the restart: {stopped:?} -> {streaming:?}"
+    );
+
+    session.stop().unwrap();
+    let off = writer.counts();
+    wait_for(
+        Duration::from_secs(1),
+        "the placeholder after the stop",
+        || writer.counts().placeholder >= off.placeholder + 5,
+    );
+    let end = writer.counts();
+    writer.stop().unwrap();
+    assert_eq!(
+        end.held, off.held,
+        "held after the stop: {off:?} -> {end:?}"
+    );
+}
+
+/// A stop without `hold_across_restart` (the camera turned off, a privacy
+/// stop, a failure) followed by a new session: nothing is held, and the
+/// new session's clock forwards its own placeholder while it has no
+/// camera frame, as before. CPU only.
+#[test]
+fn a_restart_without_the_hold_shows_the_new_outputs_placeholder() {
+    let (mut writer, fake, session) = blurred_session();
+    let h = writer.handle();
+    session.stop().unwrap();
+    let stopped = writer.counts();
+    let session = next_session(&writer, &fake);
+    wait_for(
+        Duration::from_secs(10),
+        "the new output's placeholder",
+        || session.output().counts().emitted >= 5,
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    let end = writer.counts();
+    assert!(!h.restart_holding());
+    assert!(
+        end.forwarded >= stopped.forwarded + 5,
+        "{stopped:?} -> {end:?}"
+    );
+    assert_eq!(
+        end.held, stopped.held,
+        "held without the call: {stopped:?} -> {end:?}"
+    );
+    session.stop().unwrap();
+    writer.stop().unwrap();
+}
+
+/// A restart whose new session never gets a camera frame (a wedged
+/// camera): past the restart hold's bound, the new output's clock
+/// forwards its placeholder again and nothing more is held. CPU only.
+#[test]
+fn a_restart_hold_past_its_bound_hands_over_to_the_new_outputs_placeholder() {
+    let (mut writer, fake, session) = blurred_session();
+    let h = writer.handle();
+    let bound = Duration::from_millis(500);
+    writer.hold_across_restart(bound);
+    session.stop().unwrap();
+    let stopped = writer.counts();
+    let session = next_session(&writer, &fake);
+    wait_for(
+        Duration::from_secs(10),
+        "the new output's placeholder",
+        || writer.counts().forwarded >= stopped.forwarded + 5,
+    );
+    assert!(!h.restart_holding(), "held past the bound");
+    let resumed = writer.counts();
+    assert!(
+        resumed.held > stopped.held,
+        "nothing held: {stopped:?} -> {resumed:?}"
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    let end = writer.counts();
+    assert_eq!(
+        end.held, resumed.held,
+        "held past the bound: {resumed:?} -> {end:?}"
+    );
+    session.stop().unwrap();
+    writer.stop().unwrap();
+}
+
+/// The centre luma of every buffer the writer accepts (forwarded, held
+/// or placeholder), NV12 at 320x240.
+fn writer_luma(writer: &LoopbackWriter) -> Arc<Mutex<Vec<u8>>> {
+    let lumas: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let l = Arc::clone(&lumas);
+    writer.set_tap(Some(Arc::new(move |b: &gst::Buffer| {
+        if let Ok(map) = b.map_readable() {
+            l.lock().unwrap().push(map[120 * 320 + 160]);
+        }
+    })));
+    lumas
+}
+
+/// A restart whose new session's effect hides the camera while it loads
+/// (blur under `on-failure=black`, privacy turned on for the new
+/// session): the held frame is the room, unprocessed; the new output's
+/// first frame, black, ends the hold, and no frame of the room follows:
+/// black, then blurred. `end_restart_hold` (privacy turned on before the
+/// new session starts) drops the held frame at once: the writer's
+/// placeholder follows, never the room. CPU only.
+#[test]
+fn a_hiding_new_session_ends_the_hold_and_the_room_never_follows() {
+    require_elements(ELEMENTS);
+    let contract: OutputContract = "320x240@30".parse().unwrap();
+    let mut writer = LoopbackWriter::build(contract, WriterSink::Fake).unwrap();
+    writer.start().unwrap();
+    let h = writer.handle();
+    let lumas = writer_luma(&writer);
+    let raw_session = || {
+        let cfg = OutputConfig::new(contract, OutputSink::Writer(writer.handle()));
+        let output = Output::build_in(cfg, VideoMemory::System).expect("build output");
+        let mut session = Session::new(output).expect("start output");
+        let ingest = yuy2_pattern(session.output());
+        session.switch_to(ingest).expect("start source");
+        wait_for(Duration::from_secs(10), "the room", || {
+            let l = lumas.lock().unwrap();
+            l.len() >= 5 && l.iter().rev().take(5).all(|&y| y == 235)
+        });
+        session
+    };
+    let fake = FakeFactory::new(FakeConfig {
+        load_delay: Duration::from_millis(400),
+        ..FakeConfig::default()
+    });
+
+    // The new session's hidden frames end the hold.
+    let session = raw_session();
+    writer.hold_across_restart(LoopbackWriter::RESTART_HOLD);
+    session.stop().unwrap();
+    assert!(h.restart_holding());
+    let stopped = writer.counts();
+    let from = lumas.lock().unwrap().len();
+    let mut session = next_session(&writer, &fake);
+    let ingest = yuy2_pattern(session.output());
+    session.switch_to(ingest).expect("start source");
+    wait_for(Duration::from_secs(10), "blurred frames", || {
+        lumas.lock().unwrap()[from..]
+            .iter()
+            .filter(|&&y| y == FAKE_BLUR_Y)
+            .count()
+            >= 5
+    });
+    assert!(!h.restart_holding(), "held past the first frame");
+    let seen = lumas.lock().unwrap()[from..].to_vec();
+    let first = seen
+        .iter()
+        .position(|&y| y != 235)
+        .expect("a frame of the new session");
+    assert_eq!(
+        seen[first], 16,
+        "not black while the effect loads: {seen:?}"
+    );
+    assert!(
+        seen[first..].iter().all(|&y| y != 235),
+        "the room after the new session's first frame: {seen:?}"
+    );
+    assert_eq!(
+        writer.counts().placeholder,
+        stopped.placeholder,
+        "{stopped:?} -> {:?}",
+        writer.counts()
+    );
+    session.stop().unwrap();
+
+    // Ended before the new session starts: the placeholder, never the
+    // room, and the new session's clock pushes its own placeholder.
+    let session = raw_session();
+    writer.hold_across_restart(LoopbackWriter::RESTART_HOLD);
+    session.stop().unwrap();
+    assert!(h.restart_holding());
+    writer.end_restart_hold();
+    assert!(!h.restart_holding());
+    let ended = writer.counts();
+    let from = lumas.lock().unwrap().len();
+    let session = next_session(&writer, &fake);
+    wait_for(
+        Duration::from_secs(10),
+        "the new output's placeholder",
+        || session.output().counts().emitted >= 5,
+    );
+    let end = writer.counts();
+    let seen = lumas.lock().unwrap()[from..].to_vec();
+    assert!(seen.len() >= 5, "{seen:?}");
+    assert!(
+        seen.iter().all(|&y| y != 235),
+        "the room after the end of the hold: {seen:?}"
+    );
+    assert_eq!(
+        end.held, ended.held,
+        "held after the end: {ended:?} -> {end:?}"
+    );
+    session.stop().unwrap();
+    writer.stop().unwrap();
+}
