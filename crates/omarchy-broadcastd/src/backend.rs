@@ -606,6 +606,14 @@ pub trait MediaBackend: Send + 'static {
     /// privacy stop. Nothing without a writer. Never blocks.
     fn hold_across_restart(&mut self);
 
+    /// Ends the hold of [`Self::hold_across_restart`] at once
+    /// ([`obc_pipeline::LoopbackWriter::end_restart_hold`]): the frame held
+    /// is dropped and the placeholder shows. For a restart that turns into
+    /// a stop that must hide the camera before the new session's first
+    /// frame (the camera turned off, privacy turned on, a failed start).
+    /// Nothing without a writer. Never blocks.
+    fn end_restart_hold(&mut self);
+
     /// Sets what the running session output's clock placeholder shows
     /// (an input gap past the hold): black (`None`), or the image at
     /// `image` ([`obc_pipeline::Output::set_placeholder_image`]: decoded off

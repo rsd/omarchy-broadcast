@@ -1051,6 +1051,12 @@ impl MediaBackend for GstBackend {
         }
     }
 
+    fn end_restart_hold(&mut self) {
+        if let Some(w) = &self.writer {
+            w.end_restart_hold();
+        }
+    }
+
     fn set_output_placeholder(&mut self, image: Option<&Path>) {
         if let Some(r) = &self.running {
             match image {

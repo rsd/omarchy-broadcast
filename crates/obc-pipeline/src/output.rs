@@ -147,7 +147,14 @@
 //! module loading) is covered by the writer repeating the last frame
 //! forwarded, not by its placeholder. A stall past the bound (a wedged
 //! output) shows the placeholder. A stopped output is detached, so a
-//! camera turned off shows the placeholder, never a frozen frame.
+//! camera turned off shows the placeholder, never a frozen frame. While
+//! the writer holds the last frame across a deliberate restart
+//! ([`crate::loopback::WriterHandle::restart_holding`]), a placeholder
+//! tick pushes nothing at all: in the stopping output, whose camera stops
+//! first, and in the new one until its first camera frame. The held frame
+//! then stays until that frame, or until the writer's bound ends the hold
+//! and this clock's placeholder resumes. Such a tick counts in
+//! [`OutputCounts::placeholder`], not in [`OutputCounts::emitted`].
 //!
 //! **Placeholder image.** The placeholder can show a still image instead
 //! of black (the "away image"): [`OutputConfig::placeholder_image`] at
@@ -1116,7 +1123,10 @@ impl Output {
             observer: self.observer.clone(),
             placeholder,
             image: Arc::clone(&self.away),
-            covered: matches!(self.cfg.sink, OutputSink::Writer(_)),
+            writer: match &self.cfg.sink {
+                OutputSink::Writer(w) => Some(w.clone()),
+                _ => None,
+            },
             epoch: self.epoch,
             stop: Arc::clone(&stop),
         };
@@ -1701,10 +1711,12 @@ struct ClockContext {
     placeholder: gst::Buffer,
     /// What a placeholder tick shows instead, when an image is ready.
     image: Arc<PlaceholderImage>,
-    /// The output forwards to a loopback writer, whose own placeholder
-    /// covers a slot this clock leaves empty: a placeholder tick pushes
-    /// nothing while the image is pending, instead of black.
-    covered: bool,
+    /// The loopback writer this output forwards to, whose own placeholder
+    /// (or the frame it holds) covers a slot this clock leaves empty: a
+    /// placeholder tick pushes nothing while the image is pending, instead
+    /// of black, nor while the writer holds the last frame across a
+    /// restart ([`WriterHandle::restart_holding`]).
+    writer: Option<WriterHandle>,
     epoch: Instant,
     stop: Arc<StopSignal>,
 }
@@ -1772,21 +1784,27 @@ impl ClockContext {
                 _ => {
                     // A reference taken under a short lock: never a decode
                     // or an upload on this thread.
-                    match self.image.for_tick() {
+                    let tick = self.image.for_tick();
+                    // Nothing pushed while the writer holds the previous
+                    // output's last frame (a deliberate restart: a
+                    // placeholder would end the hold), nor while the image
+                    // is pending (the writer's placeholder, the same away
+                    // image, fills the slot). Counted as a placeholder,
+                    // not emitted.
+                    if let Some(w) = &self.writer
+                        && (matches!(tick, TickImage::Pending) || w.restart_holding())
+                    {
+                        drop(latest);
+                        // A gap in the pushed stream: the next buffer
+                        // pushed is a discontinuity.
+                        discont = true;
+                        self.counters
+                            .placeholder
+                            .store(self.pacer.counts().placeholder, Ordering::Relaxed);
+                        continue;
+                    }
+                    match tick {
                         TickImage::Image(b) => image = Some(b),
-                        // Nothing pushed: the writer's placeholder (the
-                        // same away image) fills the slot. Counted as a
-                        // placeholder, not emitted.
-                        TickImage::Pending if self.covered => {
-                            drop(latest);
-                            // A gap in the pushed stream: the next buffer
-                            // pushed is a discontinuity.
-                            discont = true;
-                            self.counters
-                                .placeholder
-                                .store(self.pacer.counts().placeholder, Ordering::Relaxed);
-                            continue;
-                        }
                         TickImage::Pending | TickImage::Black => {}
                     }
                     (image.as_ref().unwrap_or(&self.placeholder), None)
