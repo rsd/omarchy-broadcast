@@ -1751,7 +1751,7 @@ mod tests {
         let mut s = sample();
         s.warning = format!(
             "effect replace unavailable: {reason}; the camera image is shown without the \
-             effect (effect.on_failure = \"none\")"
+             effect (effect.privacy is off)"
         );
         for line in [snapshot_line(&s), state_line(&s, &model::STATE_FIELDS)] {
             let v = parse(&line);

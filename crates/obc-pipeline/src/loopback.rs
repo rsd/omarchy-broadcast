@@ -56,8 +56,8 @@
 //!   [`WriterConfig::placeholder_after`] after its last frame, as without
 //!   an attach. The writer's start and stop drop it too. This is
 //!   privacy-safe: a held frame is one a consumer was already shown, and a
-//!   real failure is covered by black (or image) frames the output itself
-//!   forwards (the effect element's `on_failure`), which reach the
+//!   real failure is covered by black, image or held frames the output
+//!   itself forwards (the effect element's fallback), which reach the
 //!   consumer at once and then are what is held. Without an attach the
 //!   writer never holds.
 //! * **Restart hold.** A deliberate restart of the session (a module that

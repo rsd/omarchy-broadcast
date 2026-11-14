@@ -2226,13 +2226,13 @@ fn imaged(reason: &str) -> String {
 fn shown_without(reason: &str) -> String {
     format!(
         "effect blur unavailable: {reason}; the camera image is shown without the effect \
-         (effect.on_failure = \"none\")"
+         (effect.privacy is off)"
     )
 }
 
 #[test]
 fn an_unavailable_effect_with_black_streams_black_with_a_warning_and_a_call_retries() {
-    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+    let mut h = H::new("[effect]\nprivacy = true\nmode = \"blur\"\n", |w| {
         w.effect_unavailable = Some("libVideoFX.so not found".into())
     });
     h.activate(0);
@@ -2285,7 +2285,7 @@ fn settings_the_output_cannot_be_built_with_are_still_an_error_with_black() {
     // `replace` with an image that cannot be read: not a module's failure,
     // and the output cannot be built with it.
     let mut h = H::new(
-        "[effect]\nmode = \"replace\"\nbackground_image = \"/nonexistent.png\"\n",
+        "[effect]\nprivacy = true\nmode = \"replace\"\nbackground_image = \"/nonexistent.png\"\n",
         |_| {},
     );
     h.activate_expecting_error();
@@ -2341,7 +2341,9 @@ impl H {
 
 #[test]
 fn an_effect_failure_with_black_streams_black_with_a_warning_and_a_call_retries() {
-    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| w.effect_slow = true);
+    let mut h = H::new("[effect]\nprivacy = true\nmode = \"blur\"\n", |w| {
+        w.effect_slow = true
+    });
     h.activate(0);
     assert_eq!(h.world().effect_status, EffectStatus::Loading);
     h.world().effect_status = EffectStatus::Ready;
@@ -2381,7 +2383,7 @@ fn an_effect_failure_with_black_streams_black_with_a_warning_and_a_call_retries(
     let snap = h.snap();
     assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", ""));
     // A failure at load, at start, is the same, in the same step.
-    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+    let mut h = H::new("[effect]\nprivacy = true\nmode = \"blur\"\n", |w| {
         w.effect_fail = Some("the model did not load".into())
     });
     h.activate(0);
@@ -2391,7 +2393,8 @@ fn an_effect_failure_with_black_streams_black_with_a_warning_and_a_call_retries(
     assert_eq!(h.world().ingests.len(), 1, "the camera is open");
     // A reload retries it too: once it loads, the warning clears.
     h.world().effect_fail = None;
-    h.reload("[effect]\nmode = \"blur\"\n", 1000).unwrap();
+    h.reload("[effect]\nprivacy = true\nmode = \"blur\"\n", 1000)
+        .unwrap();
     assert_eq!(h.world().effect_status, EffectStatus::Ready);
     assert_eq!(h.snap().warning, "");
     assert_eq!(h.world().session_starts, 1);
@@ -2460,7 +2463,7 @@ fn an_effect_failure_with_none_keeps_streaming_with_the_reason_in_the_warning() 
 
 #[test]
 fn a_setting_the_session_refuses_with_black_is_an_error() {
-    let mut h = H::new("", |_| {});
+    let mut h = H::new("[effect]\nprivacy = true\n", |_| {});
     let image = h.image();
     h.set_image(&image, 0).unwrap();
     h.activate(0);
@@ -2776,7 +2779,7 @@ fn an_effect_failure_is_in_the_warning_and_a_denoise_failure_in_error() {
 
 #[test]
 fn a_fault_ends_a_denoise_failure_with_the_session() {
-    let config = "[effect]\nmode = \"blur\"\ndenoise = true\n";
+    let config = "[effect]\nprivacy = true\nmode = \"blur\"\ndenoise = true\n";
     let mut h = H::new(config, |w| w.denoise_fail = Some(NO_DENOISE.into()));
     h.activate(0);
     h.tick(500);
@@ -8415,23 +8418,42 @@ const DROPPED_BLUR: &str = "effect blur unavailable: NVIDIA Maxine video effects
 /// Why a selected `blur` no installed module provides cannot run.
 const NO_MODULE: &str = "No installed module provides it";
 
-/// The `[effect]` of a selected `blur` with `on_failure` (the image
-/// configured for `image`).
+/// The `[effect]` of a selected `blur` under the policy `on_failure`:
+/// the legacy `on_failure` values (`black`, `image` with the image
+/// configured, `none`), `off` (no privacy key: privacy off by default),
+/// or `freeze` (privacy on with the mode `freeze`, the away image set).
 fn blur_with(on_failure: &str) -> String {
     match on_failure {
         "image" => image_config(""),
+        "off" => "[effect]\nmode = \"blur\"\n".to_string(),
+        "freeze" => format!(
+            "[effect]\nmode = \"blur\"\nprivacy = true\nprivacy_mode = \"freeze\"\n\
+             fallback_image = \"{AWAY}\"\n"
+        ),
         _ => format!("[effect]\nmode = \"blur\"\non_failure = \"{on_failure}\"\n"),
     }
 }
 
+/// The policy of `blur_with(on_failure)` shows the camera.
+fn shows_camera(on_failure: &str) -> bool {
+    matches!(on_failure, "none" | "off")
+}
+
 /// `Warning` of a selected `blur` that cannot run for `reason`, under
-/// `on_failure`.
+/// `on_failure` ([`blur_with`]).
 fn closed(on_failure: &str, reason: &str) -> String {
     match on_failure {
         "black" => black(reason),
         "image" => imaged(reason),
+        "freeze" => frozen(reason),
         _ => shown_without(reason),
     }
+}
+
+/// `Warning` of a selected `blur` that cannot run for `reason`, with
+/// privacy on in the mode `freeze`.
+fn frozen(reason: &str) -> String {
+    format!("effect blur unavailable: {reason}; the last frame is held until it can run")
 }
 
 /// The running session follows `on_failure` for a selected `blur` that
@@ -8456,7 +8478,7 @@ fn assert_follows_on_failure(h: &H, on_failure: &str, why: &str) {
     assert_eq!(snap.effect, "blur", "{on_failure}: the choice is kept");
     let w = h.world();
     let given = w.effect.clone().expect("the session has an effect");
-    if on_failure == "none" {
+    if shows_camera(on_failure) {
         assert_eq!(given.mode, EffectMode::None, "the camera image");
         assert_eq!(w.effect_status, EffectStatus::Off);
     } else {
@@ -8466,19 +8488,21 @@ fn assert_follows_on_failure(h: &H, on_failure: &str, why: &str) {
             "{on_failure}: the element shows its fallback: {:?}",
             w.effect_status
         );
-        let want = if on_failure == "image" {
-            EffectOnFailure::Image
-        } else {
-            EffectOnFailure::Black
+        let want = match on_failure {
+            "image" => EffectOnFailure::Image,
+            "freeze" => EffectOnFailure::Freeze,
+            _ => EffectOnFailure::Black,
         };
         assert_eq!(given.on_failure, want);
-        if on_failure == "image" {
+        if on_failure == "image" || on_failure == "freeze" {
             assert_eq!(given.fallback_image, Some(PathBuf::from(AWAY)));
         }
     }
 }
 
-const ON_FAILURE: [&str; 3] = ["black", "image", "none"];
+/// The policies every "follows the policy" test runs under: the legacy
+/// `on_failure` values, privacy off by default, and the `freeze` mode.
+const ON_FAILURE: [&str; 5] = ["black", "image", "none", "off", "freeze"];
 
 #[test]
 fn a_background_effect_with_no_module_to_run_it_follows_on_failure() {
@@ -9705,7 +9729,7 @@ fn stage_on(effect: &EffectRun, id: &str) -> bool {
 fn disabling_the_effect_module_drops_its_stages_and_keeps_the_feed_and_the_others() {
     let dir = hello_modules_dir();
     let config = format!(
-        "{}[effect]\nmode = \"blur\"\ndenoise = true\n",
+        "{}[effect]\nprivacy = true\nmode = \"blur\"\ndenoise = true\n",
         modules_config(dir.path())
     );
     // An effect element that cannot drop its backend mid-session (the
@@ -9806,7 +9830,9 @@ fn a_session_started_with_its_effect_module_disabled_follows_on_failure_and_rest
 #[test]
 fn a_runtime_failure_of_a_provided_effect_follows_on_failure_and_never_stops_the_feed() {
     // `black`: the element's frames black, `Warning` says why.
-    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| w.effect_slow = true);
+    let mut h = H::new("[effect]\nprivacy = true\nmode = \"blur\"\n", |w| {
+        w.effect_slow = true
+    });
     h.activate(0);
     h.world().effect_status = EffectStatus::Ready;
     h.tick(500);
@@ -9867,7 +9893,7 @@ fn a_black_failure_keeps_its_whole_reason_in_the_warning_and_the_journal() {
         reason.len()
     );
     // At run time.
-    let mut h = H::new("[effect]\nmode = \"blur\"\n", |_| {});
+    let mut h = H::new("[effect]\nprivacy = true\nmode = \"blur\"\n", |_| {});
     h.activate(0);
     crate::log::take_lines();
     h.world().effect_status = EffectStatus::Failed(reason.clone());
@@ -9881,7 +9907,7 @@ fn a_black_failure_keeps_its_whole_reason_in_the_warning_and_the_journal() {
         "{lines:?}"
     );
     // At the start, the module's check refusing it.
-    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+    let mut h = H::new("[effect]\nprivacy = true\nmode = \"blur\"\n", |w| {
         w.effect_unavailable = Some(reason.clone())
     });
     crate::log::take_lines();
@@ -9988,7 +10014,7 @@ fn re_enabling_the_module_gives_a_failed_effect_again() {
 
 #[test]
 fn a_refused_setting_at_start_with_black_names_the_effect_in_error() {
-    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+    let mut h = H::new("[effect]\nprivacy = true\nmode = \"blur\"\n", |w| {
         w.effect_unavailable = Some("the module refuses a strength of 2".into());
         w.fail_start = Some("output pipeline: the effect element did not link".into());
     });
@@ -9998,7 +10024,7 @@ fn a_refused_setting_at_start_with_black_names_the_effect_in_error() {
         "effect blur unavailable: the module refuses a strength of 2"
     );
     // The build's own failure is its error when the effect's check passed.
-    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+    let mut h = H::new("[effect]\nprivacy = true\nmode = \"blur\"\n", |w| {
         w.fail_start = Some("output pipeline: the effect element did not link".into());
     });
     h.activate_expecting_error();
@@ -10010,7 +10036,9 @@ fn a_refused_setting_at_start_with_black_names_the_effect_in_error() {
 
 #[test]
 fn an_effect_method_keeps_the_black_warning_until_the_effect_reports() {
-    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| w.effect_slow = true);
+    let mut h = H::new("[effect]\nprivacy = true\nmode = \"blur\"\n", |w| {
+        w.effect_slow = true
+    });
     h.activate(0);
     h.world().effect_status = EffectStatus::Failed("no model".into());
     h.tick(500);
@@ -10048,7 +10076,9 @@ fn an_effect_method_keeps_the_black_warning_until_the_effect_reports() {
     h.set_effect("blur", 1000).unwrap();
     assert_eq!(h.snap().warning, "");
     // And with the effect turned off under `black`, it goes too.
-    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| w.effect_slow = true);
+    let mut h = H::new("[effect]\nprivacy = true\nmode = \"blur\"\n", |w| {
+        w.effect_slow = true
+    });
     h.activate(0);
     h.world().effect_status = EffectStatus::Failed("no model".into());
     h.tick(500);
@@ -10095,11 +10125,14 @@ fn under_black_a_provided_effect_that_fails_is_never_given_off() {
     // shows the room: every effect the session is given is the effect
     // selected, under `black` (the element's frames black while it fails).
     for case in ["start", "load", "run", "method"] {
-        let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| match case {
-            "start" => w.effect_unavailable = Some("no model".into()),
-            "load" => w.effect_fail = Some("no model".into()),
-            _ => {}
-        });
+        let mut h = H::new(
+            "[effect]\nprivacy = true\nmode = \"blur\"\n",
+            |w| match case {
+                "start" => w.effect_unavailable = Some("no model".into()),
+                "load" => w.effect_fail = Some("no model".into()),
+                _ => {}
+            },
+        );
         h.activate(0);
         if case == "run" || case == "method" {
             h.world().effect_status = EffectStatus::Failed("no model".into());
@@ -10194,7 +10227,7 @@ impl H {
 
 #[test]
 fn an_effect_selected_while_its_module_is_disabled_is_given_once_it_is_enabled_again() {
-    let mut h = H::new("", |_| {});
+    let mut h = H::new("[effect]\nprivacy = true\n", |_| {});
     h.activate(0);
     h.set_module(MAXINE_MODULE, false, 1000);
     // Asked of the element, which has dropped the module's backend: black
@@ -10447,7 +10480,7 @@ fn a_session_start_that_learns_another_provider_starts_again_in_the_same_step() 
 #[test]
 fn a_provider_lost_again_on_the_second_start_pass_is_named_in_the_warning() {
     const CUT: &str = "org.example.cutout";
-    let mut h = H::new("[effect]\nmode = \"blur\"\n", |w| {
+    let mut h = H::new("[effect]\nprivacy = true\nmode = \"blur\"\n", |w| {
         w.modules = vec![npu_module(CUT, StageId::BACKGROUND, "matte")];
         w.features = Some(all_installed());
         // Learnt once the GPU is up: Maxine has no cut-out model for it,
@@ -10506,7 +10539,7 @@ const NO_HELLO: &str = "warm tint unavailable: Hello tint: Disabled";
 
 #[test]
 fn every_dropped_stage_is_named_in_the_warning_with_its_modules_reason() {
-    let config = "[effect]\nmode = \"blur\"\ndenoise = true\nrelight = true\n";
+    let config = "[effect]\nprivacy = true\nmode = \"blur\"\ndenoise = true\nrelight = true\n";
     // An effect element that cannot drop its backend mid-session: the
     // background effect is one of the dropped stages.
     let mut h = H::new(config, |w| w.revoke_unsupported = true);
@@ -10567,7 +10600,10 @@ fn the_warning_gives_why_a_stage_is_not_installed() {
 #[test]
 fn dropped_stages_of_two_modules_are_two_clauses() {
     let dir = hello_modules_dir();
-    let config = format!("{}[effect]\nmode = \"blur\"\n", modules_config(dir.path()));
+    let config = format!(
+        "{}[effect]\nprivacy = true\nmode = \"blur\"\n",
+        modules_config(dir.path())
+    );
     let mut h = H::new(&config, |w| w.real_modules = true);
     h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
         .unwrap();
@@ -11833,9 +11869,9 @@ fn streaming_without_effects(config: &str) -> H {
 
 #[test]
 fn a_blur_switched_on_in_a_session_without_its_effects_is_never_shown_raw() {
-    // No effect selected (`black`, the default): the session streams
+    // No effect selected (privacy on, `black`): the session streams
     // without the effect element.
-    let mut h = streaming_without_effects("");
+    let mut h = streaming_without_effects("[effect]\nprivacy = true\n");
     let starts = h.world().session_starts;
     // Blur switched on: never the raw picture. The session is started
     // again with the effect; it still cannot start, and under `black` it
@@ -11867,12 +11903,12 @@ fn a_reload_to_black_stops_a_session_that_streams_without_its_effect() {
     // However `black` comes to be in force, the next step stops such a
     // session.
     let mut h = streaming_without_effects(none);
-    h.ctrl.config.effect.on_failure = EffectOnFailure::Black;
+    h.ctrl.config.effect.set_policy(EffectOnFailure::Black);
     h.tick(1000);
     assert!(h.world().session.is_none(), "{:?}", h.snap());
     // No effect selected: nothing is withheld, the session stands.
     let mut h = streaming_without_effects(none);
-    h.ctrl.config.effect.on_failure = EffectOnFailure::Black;
+    h.ctrl.config.effect.set_policy(EffectOnFailure::Black);
     h.ctrl.config.effect.mode = EffectMode::None;
     h.tick(1000);
     assert!(h.world().session.is_some());
@@ -12065,7 +12101,7 @@ fn an_unreadable_fallback_image_is_black_with_a_warning() {
 #[test]
 fn image_without_a_fallback_image_is_black_with_a_warning() {
     const NO_IMAGE: &str =
-        "effect.on_failure is \"image\" but effect.fallback_image is not set: showing black";
+        "effect.privacy_mode is \"away\" but effect.fallback_image is not set: showing black";
     let mut h = H::new("[effect]\nmode = \"blur\"\non_failure = \"image\"\n", |w| {
         w.fail_start_effects = Some("obc-module: no CUDA memory".into())
     });
@@ -12288,7 +12324,7 @@ fn a_refused_start_under_black_on_failure_is_black_whatever_the_placeholder_says
 /// turned off afterwards shows the away image again.
 #[test]
 fn a_privacy_stop_of_a_streaming_session_under_black_turns_the_away_image_black() {
-    let mut h = H::new(&away_config(""), |_| {});
+    let mut h = H::new(&away_config("privacy = true\n"), |_| {});
     let image = h.image();
     h.set_image(&image, 0).unwrap();
     h.activate(0);
@@ -12319,7 +12355,7 @@ fn event_at(h: &H, from: usize, event: &ImageEvent) -> Option<usize> {
 /// stops: no placeholder slot between the two shows the away image.
 #[test]
 fn a_refused_setting_gives_the_writer_black_before_the_session_stops() {
-    let mut h = H::new(&away_config(""), |_| {});
+    let mut h = H::new(&away_config("privacy = true\n"), |_| {});
     let image = h.image();
     h.set_image(&image, 0).unwrap();
     h.activate(0);
@@ -12348,7 +12384,7 @@ fn the_guard_gives_the_writer_black_before_the_session_stops() {
     let mut h = streaming_without_effects(&none);
     assert_eq!(h.world().placeholder, away());
     let from = h.world().image_events.len();
-    h.ctrl.config.effect.on_failure = EffectOnFailure::Black;
+    h.ctrl.config.effect.set_policy(EffectOnFailure::Black);
     h.tick(1000);
     let black = event_at(&h, from, &ImageEvent::Placeholder(None));
     let stop = event_at(&h, from, &ImageEvent::StopSession);
@@ -12456,7 +12492,7 @@ fn the_away_image_without_a_path_or_unreadable_is_black_with_a_warning() {
     assert_eq!(
         h.snap().warning,
         format!(
-            "effect.on_failure is \"image\" but effect.fallback_image is not set: showing \
+            "effect.privacy_mode is \"away\" but effect.fallback_image is not set: showing \
              black; {NO_IMAGE}"
         )
     );
@@ -12661,7 +12697,7 @@ fn the_session_output_s_unreadable_away_image_is_said_once() {
 fn only_a_module_change_restart_holds_the_last_frame() {
     // A stage that only a new session can run, its module enabled: the
     // writer holds the camera picture across the restart.
-    let mut h = H::new(&away_config("denoise = true\n"), |_| {});
+    let mut h = H::new(&away_config("privacy = true\ndenoise = true\n"), |_| {});
     h.set_module(MAXINE_MODULE, false, 0);
     h.activate(100);
     assert!(h.world().restart_holds.is_empty());
@@ -12673,7 +12709,7 @@ fn only_a_module_change_restart_holds_the_last_frame() {
     // The background effect selected under `on_failure = "black"` in a
     // session without it: the restart is not held (its last frame is the
     // room the effect now hides).
-    let mut h = H::new(&away_config(""), |_| {});
+    let mut h = H::new(&away_config("privacy = true\n"), |_| {});
     h.set_module(MAXINE_MODULE, false, 0);
     h.activate(100);
     h.set_module(MAXINE_MODULE, true, 1000);
@@ -12706,7 +12742,7 @@ fn only_a_module_change_restart_holds_the_last_frame() {
     assert!(h.world().session.is_none(), "{:?}", h.snap());
     assert!(h.world().restart_holds.is_empty());
     // A failure: no hold.
-    let mut h = H::new(&away_config(""), |w| w.cameras.truncate(1));
+    let mut h = H::new(&away_config("privacy = true\n"), |w| w.cameras.truncate(1));
     h.activate(0);
     h.world().failure = Some(crate::backend::Failure::Camera("unplugged".into()));
     h.world().cameras.clear();
@@ -12715,7 +12751,7 @@ fn only_a_module_change_restart_holds_the_last_frame() {
     assert!(h.world().session.is_none());
     assert!(h.world().restart_holds.is_empty());
     // The camera turned off: no hold.
-    let mut h = H::new(&away_config(""), |_| {});
+    let mut h = H::new(&away_config("privacy = true\n"), |_| {});
     h.activate(0);
     h.call(|r| Command::SetEnabled(false, r), 1000).unwrap();
     assert!(h.world().restart_holds.is_empty());
@@ -15180,6 +15216,7 @@ fn in_system_memory_with_only_a_cuda_cut_out_the_effect_follows_on_failure() {
             match on_failure {
                 "black" => assert_eq!(shown, Some(Shown::Black)),
                 "image" => assert_eq!(shown, Some(Shown::Image)),
+                "freeze" => assert_eq!(shown, Some(Shown::Frozen)),
                 // `none`: the effect is off, the camera image shown (the
                 // user's choice), as with no module at all.
                 _ => assert_eq!(shown, Some(Shown::Camera)),
@@ -15408,7 +15445,10 @@ fn a_cuda_session_plays_the_original_with_no_clause() {
 #[test]
 fn a_system_memory_session_plays_a_cpu_ready_video_as_it_is() {
     use crate::media::{Codec, Container};
-    let mut h = H::new("[video]\nmemory = \"system\"\n", |_| {});
+    let mut h = H::new(
+        "[video]\nmemory = \"system\"\n[effect]\nprivacy = true\n",
+        |_| {},
+    );
     let v = h.videos();
     let clip = h.video("loop.webm", video_info(Container::WebM, Codec::Vp9));
     h.set_image(&clip.display().to_string(), 0).unwrap();
@@ -15427,7 +15467,10 @@ fn a_system_memory_session_plays_a_cpu_ready_video_as_it_is() {
 #[test]
 fn a_video_not_cpu_ready_shows_its_poster_and_says_how_to_convert_it() {
     use crate::media::{Codec, Container};
-    let mut h = H::new("[video]\nmemory = \"system\"\n", |_| {});
+    let mut h = H::new(
+        "[video]\nmemory = \"system\"\n[effect]\nprivacy = true\n",
+        |_| {},
+    );
     let _v = h.videos();
     let office = h.still("office.png");
     let clip = h.video("it's a clip.mp4", video_info(Container::Mp4, Codec::H264));
@@ -15738,7 +15781,7 @@ fn a_configured_video_is_kept_by_the_prune_and_points_at_its_command() {
     let clip = dir.path().join("clip.mp4");
     fs::write(&clip, b"\0\0\0\x18ftypisom\0\0\0\0").unwrap();
     let config = format!(
-        "[video]\nmemory = \"system\"\n[effect]\nmode = \"replace\"\nbackground_image = \"{}\"\n",
+        "[video]\nmemory = \"system\"\n[effect]\nprivacy = true\nmode = \"replace\"\nbackground_image = \"{}\"\n",
         clip.display()
     );
     let mut h = H::new(&config, |_| {});
@@ -15769,7 +15812,10 @@ fn a_configured_video_is_kept_by_the_prune_and_points_at_its_command() {
 #[test]
 fn a_video_not_checked_yet_shows_the_still_in_system_memory_until_its_check() {
     use crate::media::{Codec, Container};
-    let mut h = H::new("[video]\nmemory = \"system\"\n", |_| {});
+    let mut h = H::new(
+        "[video]\nmemory = \"system\"\n[effect]\nprivacy = true\n",
+        |_| {},
+    );
     let v = h.videos();
     let office = h.still("office.png");
     h.set_image(&office.display().to_string(), 0).unwrap();
@@ -15827,7 +15873,10 @@ fn the_controller_never_runs_the_video_check() {
     // daemon's own service checks it on the poster's thread and answers
     // through the command channel; the controller (on this thread, where
     // a check panics) only takes the answer.
-    let mut h = H::new("[video]\nmemory = \"system\"\n", |_| {});
+    let mut h = H::new(
+        "[video]\nmemory = \"system\"\n[effect]\nprivacy = true\n",
+        |_| {},
+    );
     let (tx, rx) = std::sync::mpsc::channel();
     h.ctrl
         .set_videos(Box::new(super::GalleryVideos::new(None, tx)));
@@ -15860,3 +15909,280 @@ fn the_video_check_panics_on_the_controllers_thread() {
 }
 
 mod health;
+
+// ---- privacy as an option (revision 21) ----
+
+/// The `[effect]` of a selected `blur` with privacy off: nothing set (the
+/// default), set off, and set off with a mode (which then means nothing).
+const PRIVACY_OFF: [&str; 3] = [
+    "[effect]\nmode = \"blur\"\n",
+    "[effect]\nmode = \"blur\"\nprivacy = false\n",
+    "[effect]\nmode = \"blur\"\nprivacy = false\nprivacy_mode = \"freeze\"\n",
+];
+
+#[test]
+fn with_privacy_off_an_effect_that_cannot_run_at_a_start_shows_the_camera() {
+    for config in PRIVACY_OFF {
+        let mut h = H::new(config, |w| {
+            w.effect_unavailable = Some("libVideoFX.so not found".into())
+        });
+        h.activate(0);
+        assert_eq!(h.applied(), Some(EffectMode::None), "{config}");
+        assert_eq!(h.state(), State::Active, "{config}");
+        let snap = h.snap();
+        assert_eq!(snap.warning, shown_without("libVideoFX.so not found"));
+        assert_eq!(snap.error, "", "{config}");
+        assert_eq!(h.world().shown(), Some(Shown::Camera), "{config}");
+    }
+}
+
+#[test]
+fn with_privacy_off_a_failed_effect_shows_the_camera() {
+    for config in PRIVACY_OFF {
+        let mut h = H::new(config, |_| {});
+        h.activate(0);
+        h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
+        h.tick(1000);
+        assert_eq!(h.state(), State::Active, "{config}");
+        assert_eq!(h.world().shown(), Some(Shown::Camera), "{config}");
+        assert_eq!(
+            h.snap().warning,
+            shown_without("processing a frame failed"),
+            "{config}"
+        );
+        let e = h.world().effect.clone().unwrap();
+        assert_eq!(e.on_failure, EffectOnFailure::None, "{config}");
+    }
+}
+
+#[test]
+fn with_privacy_off_a_refused_setting_streams_on_without_the_effect() {
+    for config in PRIVACY_OFF {
+        let mut h = H::new(config, |_| {});
+        let image = h.image();
+        h.set_image(&image, 0).unwrap();
+        h.activate(0);
+        h.world().fail_set_effect = Some("the background image is unreadable".into());
+        let e = h.set_effect("replace", 1000).unwrap_err();
+        assert!(
+            e.to_string().contains("effect.privacy is off"),
+            "{config}: {e}"
+        );
+        assert_eq!(h.state(), State::Active, "{config}");
+        assert!(h.world().session.is_some(), "{config}: not stopped");
+        assert_eq!(h.applied(), Some(EffectMode::None), "{config}");
+    }
+}
+
+#[test]
+fn with_privacy_off_a_session_that_loses_its_background_module_shows_the_camera() {
+    for loss in LOSSES {
+        let what = format!("{loss:?} with privacy off");
+        let mut h = loss.session("off");
+        let ingests = h.world().ingests.len();
+        let why = loss.lose(&mut h, "off");
+        h.tick(1400);
+        assert_same_session(&h, ingests, &what);
+        assert_eq!(h.world().shown(), Some(Shown::Camera), "{what}");
+        assert_eq!(h.snap().warning, shown_without(&why), "{what}");
+    }
+}
+
+#[test]
+fn with_privacy_off_a_session_starts_without_its_effects_and_is_not_stopped() {
+    for config in PRIVACY_OFF {
+        // The output cannot start with its effects: it starts without them.
+        let mut h = streaming_without_effects(config);
+        assert_eq!(h.state(), State::Active, "{config}");
+        // No reconcile guard: the session stands.
+        h.tick(1000);
+        h.tick(5000);
+        assert!(h.world().session.is_some(), "{config}: {:?}", h.snap());
+        assert_eq!(h.world().session_stops, 0, "{config}");
+    }
+    // Privacy switched on by a write: the guard stops it at once.
+    let mut h = streaming_without_effects(PRIVACY_OFF[0]);
+    h.set_config("effect.privacy", obc_ipc::ConfigValue::Bool(true))
+        .unwrap();
+    h.tick(1000);
+    assert!(h.world().session.is_none(), "{:?}", h.snap());
+    assert_eq!(h.state(), State::Error);
+}
+
+#[test]
+fn with_privacy_off_a_start_while_the_effect_loads_is_not_refused() {
+    for config in PRIVACY_OFF {
+        let mut h = H::new(config, |w| w.effect_slow = true);
+        h.activate(0);
+        assert_eq!(h.state(), State::Active, "{config}");
+        assert_eq!(h.world().session_starts, 1, "{config}");
+        let e = h.world().effect.clone().unwrap();
+        assert_eq!(
+            (e.mode, e.on_failure),
+            (EffectMode::Blur, EffectOnFailure::None),
+            "{config}"
+        );
+        assert_eq!(h.snap().error, "", "{config}");
+    }
+}
+
+#[test]
+fn under_freeze_the_element_is_given_freeze_and_the_away_image() {
+    let mut h = H::new(&blur_with("freeze"), |w| w.effect_slow = true);
+    h.activate(0);
+    let e = h.world().effect.clone().unwrap();
+    assert_eq!(
+        (e.mode, e.on_failure, e.fallback_image),
+        (EffectMode::Blur, EffectOnFailure::Freeze, away())
+    );
+    h.world().effect_status = EffectStatus::Failed("processing a frame failed".into());
+    h.tick(1000);
+    assert_eq!(h.world().shown(), Some(Shown::Frozen));
+    assert_eq!(h.snap().warning, frozen("processing a frame failed"));
+    assert_eq!(h.state(), State::Active);
+}
+
+#[test]
+fn a_privacy_hold_under_freeze_shows_the_away_image_when_set_else_black() {
+    // A start refused under `freeze` has no processed frame to hold: the
+    // writer's placeholder shows the away image.
+    let mut h = H::new(&blur_with("freeze"), |w| {
+        w.fail_start_effects = Some("obc-module: no CUDA memory".into())
+    });
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Error);
+    assert_eq!(h.world().session_starts, 0, "never streamed without it");
+    assert_eq!(h.world().placeholder, away());
+    assert_eq!(h.snap().warning, "", "freeze with an image: no clause");
+    // Without an away image: black, and no clause (freeze says black).
+    let mut h = H::new(
+        "[effect]\nmode = \"blur\"\nprivacy = true\nprivacy_mode = \"freeze\"\n",
+        |w| w.fail_start_effects = Some("obc-module: no CUDA memory".into()),
+    );
+    h.consumers(1, 0);
+    h.tick(300);
+    assert_eq!(h.state(), State::Error);
+    assert_eq!(h.world().session_starts, 0);
+    assert_eq!(h.world().placeholder, None);
+    assert!(placeholder_sets(&h).is_empty());
+    assert_eq!(h.snap().warning, "");
+    // Under `away` without one, black with the clause.
+    let h = H::new(
+        "[effect]\nmode = \"blur\"\nprivacy = true\nprivacy_mode = \"away\"\n",
+        |_| {},
+    );
+    assert_eq!(
+        h.snap().warning,
+        "effect.privacy_mode is \"away\" but effect.fallback_image is not set: showing black"
+    );
+}
+
+#[test]
+fn the_privacy_rows_are_in_the_schema_and_the_mode_is_greyed_while_off() {
+    let mut h = H::new(&format!("[effect]\nfallback_image = \"{AWAY}\"\n"), |_| {});
+    let schema = h.schema();
+    assert!(schema.find("effect.on_failure").is_none());
+    let p = h.row("effect.privacy");
+    assert_eq!(p.value, obc_ipc::ConfigValue::Bool(false));
+    assert!(p.editable && p.enabled);
+    let m = h.row("effect.privacy_mode");
+    assert_eq!(m.value, obc_ipc::ConfigValue::Str("black".into()));
+    assert!(!m.enabled);
+    assert_eq!(m.disabled_reason, config_schema::PRIVACY_OFF_REASON);
+    match &m.kind {
+        obc_ipc::ConfigKind::Enum { options } => {
+            let values: Vec<&str> = options.iter().map(|(v, _)| v.as_str()).collect();
+            assert_eq!(values, ["black", "away", "freeze"], "the away image is set");
+        }
+        other => panic!("{other:?}"),
+    }
+    h.set_config("effect.privacy", obc_ipc::ConfigValue::Bool(true))
+        .unwrap();
+    h.set_config(
+        "effect.privacy_mode",
+        obc_ipc::ConfigValue::Str("freeze".into()),
+    )
+    .unwrap();
+    assert_eq!(h.ctrl.config.effect.policy(), EffectOnFailure::Freeze);
+    let m = h.row("effect.privacy_mode");
+    assert!(m.enabled, "{}", m.disabled_reason);
+    assert_eq!(m.value, obc_ipc::ConfigValue::Str("freeze".into()));
+}
+
+#[test]
+fn a_legacy_on_failure_write_is_taken_as_the_privacy_keys() {
+    let mut h = H::new("", |_| {});
+    use obc_ipc::ConfigValue as V;
+    h.set_config("effect.on_failure", V::Str("black".into()))
+        .unwrap();
+    assert_eq!(h.ctrl.config.effect.policy(), EffectOnFailure::Black);
+    let text = fs::read_to_string(h.config_d("50-panel.toml")).unwrap();
+    assert!(text.contains("privacy = true"), "{text}");
+    assert!(text.contains("privacy_mode = \"black\""), "{text}");
+    assert!(!text.contains("on_failure"), "{text}");
+    // No away image: `image` is refused, as the mode would be.
+    assert!(matches!(
+        h.set_config("effect.on_failure", V::Str("image".into())),
+        Err(IpcError::InvalidArgument(_))
+    ));
+    h.set_config("effect.on_failure", V::Str("none".into()))
+        .unwrap();
+    assert_eq!(h.ctrl.config.effect.policy(), EffectOnFailure::None);
+    assert!(matches!(
+        h.set_config("effect.on_failure", V::Str("freeze".into())),
+        Err(IpcError::InvalidArgument(_))
+    ));
+    // A reset of it resets both keys.
+    h.call(|r| Command::ResetConfig("effect.on_failure".into(), r), 0)
+        .unwrap();
+    let text = fs::read_to_string(h.config_d("50-panel.toml")).unwrap();
+    assert!(!text.contains("privacy"), "{text}");
+    assert!(!h.paths.config.exists(), "config.toml is never written");
+}
+
+#[test]
+fn the_daemon_replaces_a_managed_on_failure_with_the_privacy_keys() {
+    for (legacy, want) in [
+        ("black", EffectOnFailure::Black),
+        ("image", EffectOnFailure::Image),
+        ("none", EffectOnFailure::None),
+    ] {
+        let config = format!("[effect]\nfallback_image = \"{AWAY}\"\n");
+        let mut h = H::new(&config, |_| {});
+        h.write_drop_in(
+            "50-panel.toml",
+            &format!("[effect]\non_failure = \"{legacy}\"\n"),
+        );
+        // At a start.
+        h.restart();
+        assert_eq!(h.ctrl.config.effect.policy(), want, "{legacy}");
+        let text = fs::read_to_string(h.config_d("50-panel.toml")).unwrap();
+        assert!(!text.contains("on_failure"), "{legacy}: {text}");
+        assert!(
+            text.contains(&format!("privacy = {}", want.hides())),
+            "{legacy}: {text}"
+        );
+        assert_eq!(fs::read_to_string(&h.paths.config).unwrap(), config);
+        // At a reload.
+        h.write_drop_in(
+            "50-panel.toml",
+            &format!("[effect]\non_failure = \"{legacy}\"\n"),
+        );
+        h.reload(&config, 1000).unwrap();
+        assert_eq!(h.ctrl.config.effect.policy(), want, "{legacy}");
+        let text = fs::read_to_string(h.config_d("50-panel.toml")).unwrap();
+        assert!(!text.contains("on_failure"), "{legacy}: {text}");
+    }
+    // A legacy key in config.toml is read, and never written.
+    let config = "[effect]\nmode = \"blur\"\non_failure = \"black\"\n";
+    let mut h = H::new(config, |_| {});
+    assert_eq!(h.ctrl.config.effect.policy(), EffectOnFailure::Black);
+    h.reload(config, 1000).unwrap();
+    assert_eq!(fs::read_to_string(&h.paths.config).unwrap(), config);
+    assert!(!h.config_d("50-panel.toml").exists());
+    // A privacy key in a drop-in wins over it.
+    h.write_drop_in("50-panel.toml", "[effect]\nprivacy = false\n");
+    h.reload(config, 2000).unwrap();
+    assert_eq!(h.ctrl.config.effect.policy(), EffectOnFailure::None);
+}

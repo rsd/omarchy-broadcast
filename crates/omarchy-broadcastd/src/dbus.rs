@@ -825,8 +825,9 @@ impl Server {
     /// What runs other than the user asked, without being an error: the
     /// selected stages no module provides, dropped while the feed streams
     /// on without them, and an effect a module provides that cannot run
-    /// (the feed black with `on_failure = "black"`, the camera image with
-    /// `"none"`); one line, empty when none (revision 11).
+    /// (the feed black, the away image or the last frame with
+    /// `effect.privacy` on, the camera image with it off); one line, empty
+    /// when none (revision 11).
     #[zbus(property)]
     fn warning(&self) -> String {
         self.snap().warning

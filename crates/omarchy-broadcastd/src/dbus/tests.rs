@@ -451,8 +451,9 @@ async fn every_property_reads_through_the_proxy() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 20);
-    assert_eq!(INTERFACE_REVISION, obc_ipc::CAMERA_HEALTH_REVISION);
+    assert_eq!(INTERFACE_REVISION, 21);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::PRIVACY_REVISION);
+    assert_eq!(obc_ipc::CAMERA_HEALTH_REVISION, 20);
     assert_eq!(obc_ipc::CPU_CONVERT_REVISION, 19);
     assert_eq!(obc_ipc::VIDEO_BACKGROUND_REVISION, 18);
     assert_eq!(obc_ipc::PLACEHOLDER_REVISION, 17);
@@ -846,7 +847,11 @@ fn invalid_argument(res: Result<(), IpcError>) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn effect_methods_properties_and_their_errors() {
-    let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
+    let rig = Rig::new(
+        "[effect]\nprivacy = true\n[lifecycle]\nstart_debounce_ms = 0\n",
+        |_| {},
+    )
+    .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
     let seen = rig.record_changes().await;
@@ -929,7 +934,7 @@ async fn effect_methods_properties_and_their_errors() {
     assert_eq!(proxy.blur_strength().await.unwrap(), 0.75);
     assert_eq!(proxy.state().await.unwrap(), State::Idle);
 
-    // While active: an effect that fails to load with on_failure black
+    // While active: an effect that fails to load with privacy on (black)
     // keeps the session, its frames black, with the reason in Warning;
     // selecting the effect again retries.
     rig.world().effect_fail = Some("the model did not load".into());
@@ -958,7 +963,7 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 20);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 21);
     assert!(!proxy.denoise().await.unwrap());
     let seen = rig.record_changes().await;
 
@@ -1010,7 +1015,8 @@ async fn set_denoise_the_property_its_changes_and_a_failure_in_error() {
     assert_eq!(proxy.state().await.unwrap(), State::Active);
 }
 
-/// An effect that fails with `on_failure = "none"` (revision 11): the
+/// An effect that fails with privacy off (the legacy `on_failure = "none"`
+/// here, revision 11): the
 /// camera image streams on, the reason in `Warning`, `Error` empty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_none_failure_is_in_warning_and_error_stays_empty() {
@@ -1026,7 +1032,7 @@ async fn a_none_failure_is_in_warning_and_error_stays_empty() {
     wait_state(&proxy, State::Active).await;
     within("SetEffect", proxy.set_effect("blur")).await.unwrap();
     let want = "effect blur unavailable: the model did not load; the camera image is shown \
-                without the effect (effect.on_failure = \"none\")";
+                without the effect (effect.privacy is off)";
     assert_eq!(proxy.warning().await.unwrap(), want);
     assert_eq!(proxy.error().await.unwrap(), "");
     assert_eq!(proxy.state().await.unwrap(), State::Active);
@@ -1045,11 +1051,15 @@ async fn a_none_failure_is_in_warning_and_error_stays_empty() {
 }
 
 /// `Warning` (revision 11): a selected effect no module provides follows
-/// `on_failure` (black by default), announced in `Warning`, never in
+/// the privacy policy (here on, black), announced in `Warning`, never in
 /// `Error` or the state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn warning_names_a_dropped_effect_and_its_changes_are_announced() {
-    let rig = Rig::new("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
+    let rig = Rig::new(
+        "[effect]\nprivacy = true\n[lifecycle]\nstart_debounce_ms = 0\n",
+        |_| {},
+    )
+    .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
     assert_eq!(proxy.warning().await.unwrap(), "");
@@ -1142,7 +1152,7 @@ async fn the_pipewire_properties_and_their_changes() {
     .await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 20);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 21);
     // The preliminary snapshot says `off`; the controller's first one has
     // the writer and its PipeWire output, connecting.
     let deadline = Instant::now() + TIMEOUT;
@@ -1258,7 +1268,7 @@ async fn preview_leases_by_bus_name_their_property_and_their_frames() {
     let rig = Rig::on_bus("[lifecycle]\nstart_debounce_ms = 0\n", |_| {}).await;
     let proxy = rig.proxy().await;
     wait_state(&proxy, State::Idle).await;
-    assert_eq!(proxy.interface_revision().await.unwrap(), 20);
+    assert_eq!(proxy.interface_revision().await.unwrap(), 21);
     assert_eq!(proxy.preview_consumers().await.unwrap(), 0);
     let seen = rig.record_changes().await;
     let mut frames = proxy.receive_preview_frame().await.unwrap();

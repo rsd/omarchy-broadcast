@@ -178,8 +178,10 @@ struct Args {
     /// Background image of the replace effect (an absolute path).
     #[arg(long)]
     background: Option<PathBuf>,
-    /// Output after an effect failure: black | none (the raw input).
-    #[arg(long, default_value = "black")]
+    /// Output after an effect failure, as the daemon's privacy modes:
+    /// black | away (the away image; also `image`) | freeze (the last
+    /// processed frame) | none (the raw input: privacy off).
+    #[arg(long, default_value = "black", value_parser = effect_fallback)]
     effect_on_failure: EffectFallback,
     /// Add the video noise removal stage before the effect (alone with
     /// `--effect none`). Needs --effect.
@@ -460,6 +462,15 @@ fn non_negative_ms(s: &str) -> Result<f64, String> {
         ));
     }
     Ok(v)
+}
+
+/// `--effect-on-failure`: an [`EffectFallback`] name, or `away`, the
+/// daemon's name of the image mode (`effect.privacy_mode`).
+fn effect_fallback(s: &str) -> Result<EffectFallback, String> {
+    if s.trim().eq_ignore_ascii_case("away") {
+        return Ok(EffectFallback::Image);
+    }
+    s.parse()
 }
 
 fn unit_interval(s: &str) -> Result<f32, String> {
@@ -3913,6 +3924,15 @@ mod tests {
         assert_eq!(a.effect, Some(EffectKind::Blur));
         let s = a.effect_settings(EffectKind::Blur);
         assert_eq!((s.blur_strength, s.fallback), (0.8, EffectFallback::Black));
+        for (v, want) in [
+            ("away", EffectFallback::Image),
+            ("image", EffectFallback::Image),
+            ("freeze", EffectFallback::Freeze),
+            ("none", EffectFallback::None),
+        ] {
+            let a = parse(&["--effect", "blur", "--effect-on-failure", v]).unwrap();
+            assert_eq!(a.effect_settings(EffectKind::Blur).fallback, want, "{v}");
+        }
         assert!(a.check_effect().is_ok());
         assert_eq!(a.effect_cycle(), [EffectKind::None, EffectKind::Blur]);
         for (flag, v) in [

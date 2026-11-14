@@ -879,3 +879,240 @@ fn a_write_creates_the_missing_directories() {
     assert_eq!(set.config.output.hold_timeout_s, 2.0);
     assert!(managed_path(&config_toml).is_file());
 }
+
+#[test]
+fn the_privacy_keys_are_written_to_the_managed_file() {
+    let d = Dir::new();
+    d.write(
+        "config.toml",
+        "[effect]\nfallback_image = \"/srv/away.png\"\n",
+    );
+    let s = set_config(
+        &d.config_toml(),
+        &facts(),
+        config_schema::PRIVACY,
+        &ConfigValue::Bool(true),
+    )
+    .unwrap();
+    assert_eq!(s.config.effect.policy(), EffectOnFailure::Black);
+    let s = set_config(
+        &d.config_toml(),
+        &facts(),
+        config_schema::PRIVACY_MODE,
+        &ConfigValue::Str("freeze".into()),
+    )
+    .unwrap();
+    assert_eq!(s.config.effect.policy(), EffectOnFailure::Freeze);
+    let text = d.read(MANAGED_REL);
+    assert!(text.contains("privacy = true"), "{text}");
+    assert!(text.contains("privacy_mode = \"freeze\""), "{text}");
+}
+
+#[test]
+fn a_legacy_on_failure_write_is_translated_into_the_privacy_keys() {
+    let d = Dir::new();
+    let original = "[effect]\non_failure = \"black\"\n";
+    d.write("config.toml", original);
+    let mut f = facts();
+    let legacy = |f: &RegistryFacts, v: &str| {
+        set_config(
+            &d.config_toml(),
+            f,
+            config_schema::LEGACY_ON_FAILURE,
+            &ConfigValue::Str(v.into()),
+        )
+    };
+    // `none`: privacy off, no mode.
+    let s = legacy(&f, "none").unwrap();
+    assert_eq!(s.config.effect.policy(), EffectOnFailure::None);
+    assert_eq!(table_get(&s.managed, "effect.privacy_mode"), None);
+    assert_eq!(table_get(&s.managed, "effect.on_failure"), None);
+    // `black`: on, black.
+    let s = legacy(&f, "black").unwrap();
+    assert_eq!(
+        (s.config.effect.privacy, s.config.effect.privacy_mode),
+        (Some(true), Some(crate::PrivacyMode::Black))
+    );
+    // `image` is refused while the away image is not offered, as a write
+    // of the mode would be; with it offered, it is on, away.
+    let e = legacy(&f, "image").unwrap_err();
+    assert!(e.to_string().contains("is not one of"), "{e}");
+    f.privacy_mode_options = config_schema::privacy_mode_options(&crate::config::EffectConfig {
+        fallback_image: Some("/srv/away.png".into()),
+        ..Default::default()
+    });
+    let s = legacy(&f, "image").unwrap();
+    assert_eq!(s.config.effect.policy(), EffectOnFailure::Image);
+    // Not a legacy value, or not a string: refused.
+    for v in ["freeze", "raw"] {
+        let e = legacy(&f, v).unwrap_err();
+        assert!(matches!(e, WriteError::Invalid(_)), "{v}: {e:?}");
+        assert!(e.to_string().contains("effect.on_failure"), "{e}");
+    }
+    let e = set_config(
+        &d.config_toml(),
+        &f,
+        config_schema::LEGACY_ON_FAILURE,
+        &ConfigValue::Bool(true),
+    )
+    .unwrap_err();
+    assert!(matches!(e, WriteError::Invalid(_)), "{e:?}");
+    let text = d.read(MANAGED_REL);
+    assert!(!text.contains("on_failure"), "{text}");
+    // A reset of the legacy key removes the privacy keys too.
+    let s = reset_config(&d.config_toml(), &f, config_schema::LEGACY_ON_FAILURE).unwrap();
+    assert_eq!(table_get(&s.managed, "effect.privacy"), None);
+    assert_eq!(table_get(&s.managed, "effect.privacy_mode"), None);
+    // config.toml's legacy key is in force again.
+    assert_eq!(s.config.effect.policy(), EffectOnFailure::Black);
+    assert_eq!(d.read("config.toml"), original);
+}
+
+#[test]
+fn the_managed_on_failure_is_migrated_to_the_privacy_keys() {
+    for (legacy, want) in [
+        ("black", EffectOnFailure::Black),
+        ("image", EffectOnFailure::Image),
+        ("none", EffectOnFailure::None),
+    ] {
+        let d = Dir::new();
+        let original = "[output]\nplaceholder = \"image\"\n";
+        d.write("config.toml", original);
+        d.write(
+            MANAGED_REL,
+            &format!("[effect]\non_failure = \"{legacy}\"\nfallback_image = \"/a.png\"\n"),
+        );
+        let set = d.load().unwrap();
+        assert_eq!(set.config.effect.policy(), want, "{legacy}");
+        let edits = migrate_managed_on_failure(&set);
+        assert!(
+            edits.contains(&ManagedEdit::Remove("effect.on_failure".into())),
+            "{legacy}: {edits:?}"
+        );
+        let set = persist_managed(&d.config_toml(), &edits, OverridePolicy::Ignore).unwrap();
+        // The policy in force is the same, from the new keys.
+        assert_eq!(set.config.effect.policy(), want, "{legacy}");
+        assert_eq!(set.config.effect.on_failure, None, "{legacy}");
+        assert_eq!(set.config.effect.privacy, Some(want.hides()), "{legacy}");
+        let text = d.read(MANAGED_REL);
+        assert!(!text.contains("on_failure"), "{legacy}: {text}");
+        assert!(text.contains("fallback_image"), "{legacy}: other keys stay");
+        assert_eq!(d.read("config.toml"), original, "{legacy}");
+        // Once done, nothing more to do.
+        assert!(migrate_managed_on_failure(&set).is_empty(), "{legacy}");
+    }
+}
+
+#[test]
+fn the_migration_only_drops_an_on_failure_the_new_keys_override() {
+    let d = Dir::new();
+    d.write("config.toml", "[effect]\nprivacy = true\n");
+    d.write(MANAGED_REL, "[effect]\non_failure = \"none\"\n");
+    let set = d.load().unwrap();
+    assert!(set.config.effect.legacy_on_failure_ignored());
+    assert_eq!(set.config.effect.policy(), EffectOnFailure::Black);
+    let edits = migrate_managed_on_failure(&set);
+    assert_eq!(edits, [ManagedEdit::Remove("effect.on_failure".into())]);
+    let set = persist_managed(&d.config_toml(), &edits, OverridePolicy::Ignore).unwrap();
+    assert_eq!(set.config.effect.policy(), EffectOnFailure::Black);
+    // A legacy key in config.toml alone is never touched.
+    let d = Dir::new();
+    d.write("config.toml", "[effect]\non_failure = \"black\"\n");
+    let set = d.load().unwrap();
+    assert!(migrate_managed_on_failure(&set).is_empty());
+}
+
+#[test]
+fn a_privacy_key_of_the_panel_keeps_the_other_from_a_legacy_on_failure() {
+    let d = Dir::new();
+    d.write("config.toml", "[effect]\non_failure = \"black\"\n");
+    let mut f = facts();
+    f.privacy_mode_options = config_schema::privacy_mode_options(&crate::config::EffectConfig {
+        fallback_image: Some("/srv/away.png".into()),
+        ..Default::default()
+    });
+    let mode = |v: &str| {
+        set_config(
+            &d.config_toml(),
+            &f,
+            config_schema::PRIVACY_MODE,
+            &ConfigValue::Str(v.into()),
+        )
+        .unwrap()
+    };
+    // Last frame chosen over the legacy black: privacy stays on.
+    assert_eq!(
+        mode("freeze").config.effect.policy(),
+        EffectOnFailure::Freeze
+    );
+    // Privacy set, then reset, with the mode left: on again from the legacy key.
+    let s = set_config(
+        &d.config_toml(),
+        &f,
+        config_schema::PRIVACY,
+        &ConfigValue::Bool(false),
+    )
+    .unwrap();
+    assert_eq!(s.config.effect.policy(), EffectOnFailure::None);
+    let s = reset_config(&d.config_toml(), &f, config_schema::PRIVACY).unwrap();
+    assert_eq!(s.config.effect.policy(), EffectOnFailure::Freeze);
+    // Legacy image, privacy on from the panel: the away image stays.
+    let d = Dir::new();
+    d.write("config.toml", "[effect]\non_failure = \"image\"\n");
+    let s = set_config(
+        &d.config_toml(),
+        &f,
+        config_schema::PRIVACY,
+        &ConfigValue::Bool(true),
+    )
+    .unwrap();
+    assert_eq!(s.config.effect.policy(), EffectOnFailure::Image);
+}
+
+#[test]
+fn the_migration_only_translates_a_managed_on_failure_in_force() {
+    // A later drop-in sets the legacy key: the managed one is only removed,
+    // and the later file's value stays in force.
+    let d = Dir::new();
+    d.write(MANAGED_REL, "[effect]\non_failure = \"none\"\n");
+    d.write("config.d/90-x.toml", "[effect]\non_failure = \"black\"\n");
+    let set = d.load().unwrap();
+    assert_eq!(set.config.effect.policy(), EffectOnFailure::Black);
+    let edits = migrate_managed_on_failure(&set);
+    assert_eq!(edits, [ManagedEdit::Remove("effect.on_failure".into())]);
+    let set = persist_managed(&d.config_toml(), &edits, OverridePolicy::Ignore).unwrap();
+    assert_eq!(set.config.effect.policy(), EffectOnFailure::Black);
+    assert_eq!(
+        set.overridden_by(config_schema::PRIVACY),
+        "config.d/90-x.toml"
+    );
+    // A panel write of either key is then refused: the later file wins.
+    for (key, value) in [
+        (config_schema::PRIVACY, ConfigValue::Bool(false)),
+        (
+            config_schema::PRIVACY_MODE,
+            ConfigValue::Str("freeze".into()),
+        ),
+    ] {
+        let e = set_config(&d.config_toml(), &facts(), key, &value).unwrap_err();
+        assert!(matches!(e, WriteError::Overridden { .. }), "{key}: {e:?}");
+    }
+    // Only the key no file sets is translated: privacy set elsewhere, the
+    // mode from the managed legacy `image`.
+    let d = Dir::new();
+    d.write("config.toml", "[effect]\nprivacy = true\n");
+    d.write(MANAGED_REL, "[effect]\non_failure = \"image\"\n");
+    let set = d.load().unwrap();
+    assert_eq!(set.config.effect.policy(), EffectOnFailure::Image);
+    let edits = migrate_managed_on_failure(&set);
+    assert_eq!(
+        edits,
+        [
+            ManagedEdit::Set("effect.privacy_mode".into(), "away".into()),
+            ManagedEdit::Remove("effect.on_failure".into())
+        ]
+    );
+    let set = persist_managed(&d.config_toml(), &edits, OverridePolicy::Ignore).unwrap();
+    assert_eq!(set.config.effect.policy(), EffectOnFailure::Image);
+    assert!(set.config.effect.on_failure.is_none());
+}

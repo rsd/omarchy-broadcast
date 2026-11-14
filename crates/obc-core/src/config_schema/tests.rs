@@ -103,7 +103,7 @@ fn the_core_table_is_well_formed() {
         "output.placeholder" => crate::OutputPlaceholder::from_str(v).is_ok(),
         "effect.mode" => crate::EffectMode::from_str(v).is_ok(),
         "effect.relight_light" => crate::RelightLight::from_str(v).is_ok(),
-        "effect.on_failure" => crate::EffectOnFailure::from_str(v).is_ok(),
+        "effect.privacy_mode" => crate::PrivacyMode::from_str(v).is_ok(),
         "modules.profile" => crate::modules::BackendProfile::from_str(v).is_ok(),
         "mic.gpu_policy" => {
             toml::from_str::<crate::config::MicConfig>(&format!("gpu_policy = \"{v}\"")).is_ok()
@@ -142,7 +142,8 @@ fn the_editable_and_apply_table_is_the_decided_one() {
             "video.memory",
             "lifecycle.idle_grace_s",
             "lifecycle.start_debounce_ms",
-            "effect.on_failure",
+            "effect.privacy",
+            "effect.privacy_mode",
             "effect.fallback_image",
             "pipewire.enabled",
             "pipewire.offer_nv12",
@@ -467,22 +468,33 @@ fn options(r: &ConfigRow) -> Vec<(&str, &str)> {
 }
 
 #[test]
-fn on_failure_offers_the_image_only_with_a_fallback_image() {
-    // No image: black and the camera.
+fn privacy_is_off_by_default_and_its_mode_offers_the_away_image_only_with_one() {
+    // Nothing set: privacy off, the mode black, greyed with the reason.
     let (_tmp, set) = load(&[]);
     let groups = config_schema(&set, &facts());
-    let r = find(&groups, "effect.on_failure");
-    assert_eq!(r.label, "When an effect can't run");
-    assert!(r.editable);
-    assert_eq!(r.value, ConfigValue::Str("black".into()));
-    assert_eq!(r.default, Some(ConfigValue::Str("black".into())));
-    assert_eq!(
-        options(r),
-        [
-            ("black", "Hide the camera: black"),
-            ("none", "Show the camera")
-        ]
+    assert!(
+        groups
+            .iter()
+            .all(|g| g.rows.iter().all(|r| r.id != "effect.on_failure")),
+        "the legacy key has no row"
     );
+    let p = find(&groups, "effect.privacy");
+    assert_eq!(p.label, "Hide the camera when an effect can't run");
+    assert_eq!(p.kind, RowKind::Bool);
+    assert!(p.editable && p.enabled);
+    assert_eq!(p.apply, Apply::Live);
+    assert_eq!(p.value, ConfigValue::Bool(false));
+    assert_eq!(p.default, Some(ConfigValue::Bool(false)));
+    assert_eq!(p.source, "");
+    let m = find(&groups, "effect.privacy_mode");
+    assert_eq!(m.label, "Show instead of the camera");
+    assert!(m.editable);
+    assert_eq!(m.apply, Apply::Live);
+    assert_eq!(m.value, ConfigValue::Str("black".into()));
+    assert_eq!(m.default, Some(ConfigValue::Str("black".into())));
+    assert_eq!(options(m), [("black", "Black"), ("freeze", "Last frame")]);
+    assert!(!m.enabled);
+    assert_eq!(m.disabled_reason, PRIVACY_OFF_REASON);
     let image = find(&groups, "effect.fallback_image");
     assert_eq!(image.kind, RowKind::Path);
     assert_eq!(image.label, "Away image");
@@ -490,63 +502,186 @@ fn on_failure_offers_the_image_only_with_a_fallback_image() {
     assert_eq!(image.value, ConfigValue::Str(String::new()));
     assert_eq!(image.default, None);
 
-    // With one: the image too, between them.
+    // With an image and privacy on: the away image too, between them, and
+    // the mode enabled.
     let (_tmp, set) = load(&[(
         "config.toml",
-        "[effect]\nfallback_image = \"/srv/away.png\"\n",
+        "[effect]\nprivacy = true\nfallback_image = \"/srv/away.png\"\n",
     )]);
     let groups = config_schema(&set, &facts());
+    let p = find(&groups, "effect.privacy");
+    assert_eq!(p.value, ConfigValue::Bool(true));
+    assert_eq!(p.source, "config.toml");
+    let m = find(&groups, "effect.privacy_mode");
+    assert!(m.enabled, "{}", m.disabled_reason);
     assert_eq!(
-        options(find(&groups, "effect.on_failure")),
+        options(m),
         [
-            ("black", "Hide the camera: black"),
-            ("image", "Hide the camera: image"),
-            ("none", "Show the camera")
+            ("black", "Black"),
+            ("away", "Away image"),
+            ("freeze", "Last frame")
         ]
     );
     let image = find(&groups, "effect.fallback_image");
     assert_eq!(image.value, ConfigValue::Str("/srv/away.png".into()));
     assert_eq!(image.source, "config.toml");
 
-    // `image` in force without an image: still an option.
-    let (_tmp, set) = load(&[("config.toml", "[effect]\non_failure = \"image\"\n")]);
+    // `away` in force without an image: still an option.
+    let (_tmp, set) = load(&[(
+        "config.toml",
+        "[effect]\nprivacy = true\nprivacy_mode = \"away\"\n",
+    )]);
     let groups = config_schema(&set, &facts());
-    let r = find(&groups, "effect.on_failure");
-    assert_eq!(r.value, ConfigValue::Str("image".into()));
-    assert_eq!(options(r).len(), 3);
-    assert_eq!(options(r)[1], ("image", "Hide the camera: image"));
+    let m = find(&groups, "effect.privacy_mode");
+    assert_eq!(m.value, ConfigValue::Str("away".into()));
+    assert_eq!(options(m).len(), 3);
+    assert_eq!(options(m)[1], ("away", "Away image"));
 }
 
 #[test]
-fn on_failure_is_written_as_one_of_the_options_the_daemon_computed() {
+fn the_privacy_rows_show_a_legacy_on_failure_in_force() {
+    for (legacy, on, mode) in [
+        ("black", true, "black"),
+        ("image", true, "away"),
+        ("none", false, "black"),
+    ] {
+        let (_tmp, set) = load(&[(
+            "config.toml",
+            &format!("[effect]\non_failure = \"{legacy}\"\n"),
+        )]);
+        let groups = config_schema(&set, &facts());
+        let p = find(&groups, "effect.privacy");
+        assert_eq!(p.value, ConfigValue::Bool(on), "{legacy}");
+        assert_eq!(p.source, "config.toml", "{legacy}: the legacy key's file");
+        let m = find(&groups, "effect.privacy_mode");
+        assert_eq!(m.value, ConfigValue::Str(mode.into()), "{legacy}");
+        assert_eq!(m.enabled, on, "{legacy}");
+        assert!(options(m).iter().any(|(v, _)| *v == mode), "{legacy}");
+    }
+    // A new key set in a later file: the legacy key is ignored.
+    let (_tmp, set) = load(&[
+        ("config.toml", "[effect]\non_failure = \"black\"\n"),
+        (MANAGED_REL, "[effect]\nprivacy = false\n"),
+    ]);
+    let groups = config_schema(&set, &facts());
+    let p = find(&groups, "effect.privacy");
+    assert_eq!(p.value, ConfigValue::Bool(false));
+    assert_eq!(p.source, MANAGED_REL);
+}
+
+#[test]
+fn the_privacy_rows_take_each_unset_key_from_the_legacy_on_failure() {
+    // Legacy black, a mode of the panel: privacy on (the legacy file), the
+    // mode of the panel, enabled.
+    let (_tmp, set) = load(&[
+        ("config.toml", "[effect]\non_failure = \"black\"\n"),
+        (MANAGED_REL, "[effect]\nprivacy_mode = \"freeze\"\n"),
+    ]);
+    let groups = config_schema(&set, &facts());
+    let p = find(&groups, "effect.privacy");
+    assert_eq!(p.value, ConfigValue::Bool(true));
+    assert_eq!(p.source, "config.toml");
+    assert!(p.enabled, "{}", p.disabled_reason);
+    let m = find(&groups, "effect.privacy_mode");
+    assert_eq!(m.value, ConfigValue::Str("freeze".into()));
+    assert_eq!(m.source, MANAGED_REL);
+    assert!(m.enabled, "{}", m.disabled_reason);
+    // Legacy image, privacy of the panel: the mode is the legacy file's.
+    let (_tmp, set) = load(&[
+        ("config.toml", "[effect]\non_failure = \"image\"\n"),
+        (MANAGED_REL, "[effect]\nprivacy = true\n"),
+    ]);
+    let groups = config_schema(&set, &facts());
+    let m = find(&groups, "effect.privacy_mode");
+    assert_eq!(m.value, ConfigValue::Str("away".into()));
+    assert_eq!(m.source, "config.toml");
+}
+
+#[test]
+fn a_legacy_on_failure_after_the_managed_file_overrides_the_privacy_rows() {
+    let (_tmp, set) = load(&[
+        (MANAGED_REL, "[effect]\non_failure = \"none\"\n"),
+        ("config.d/90-x.toml", "[effect]\non_failure = \"black\"\n"),
+    ]);
+    let groups = config_schema(&set, &facts());
+    for id in ["effect.privacy", "effect.privacy_mode"] {
+        let r = find(&groups, id);
+        assert_eq!(r.source, "config.d/90-x.toml", "{id}");
+        assert_eq!(r.overridden_by, "config.d/90-x.toml", "{id}");
+        assert!(!r.enabled, "{id}");
+        assert_eq!(
+            r.disabled_reason, "Overridden by config.d/90-x.toml",
+            "{id}"
+        );
+    }
+    assert_eq!(
+        find(&groups, "effect.privacy").value,
+        ConfigValue::Bool(true)
+    );
+    // The panel's own keys are not overridden by a legacy key they win
+    // over: privacy set by the panel stays editable; the mode, which the
+    // legacy key still gives, does not.
+    let (_tmp, set) = load(&[
+        (MANAGED_REL, "[effect]\nprivacy = false\n"),
+        ("config.d/90-x.toml", "[effect]\non_failure = \"image\"\n"),
+    ]);
+    let groups = config_schema(&set, &facts());
+    let p = find(&groups, "effect.privacy");
+    assert!(p.enabled, "{}", p.disabled_reason);
+    assert_eq!(p.source, MANAGED_REL);
+    let m = find(&groups, "effect.privacy_mode");
+    assert_eq!(m.disabled_reason, "Overridden by config.d/90-x.toml");
+}
+
+#[test]
+fn the_privacy_mode_is_written_as_one_of_the_options_the_daemon_computed() {
     let mut effect = crate::config::EffectConfig::default();
-    assert_eq!(on_failure_options(&effect).len(), 2);
-    // Without computed options, those of the defaults: no image.
-    let kind = lookup(ON_FAILURE, &RegistryFacts::default()).unwrap().kind;
-    let image = ConfigValue::Str("image".into());
-    let e = to_toml(ON_FAILURE, &kind, &image).unwrap_err();
-    assert!(e.contains("is not one of: black, none"), "{e}");
-    assert!(to_toml(ON_FAILURE, &kind, &ConfigValue::Str("none".into())).is_ok());
-    // With an image configured, the image is accepted.
+    assert_eq!(privacy_mode_options(&effect).len(), 2);
+    // Without computed options, those of the defaults: no away image.
+    let kind = lookup(PRIVACY_MODE, &RegistryFacts::default())
+        .unwrap()
+        .kind;
+    let away = ConfigValue::Str("away".into());
+    let e = to_toml(PRIVACY_MODE, &kind, &away).unwrap_err();
+    assert!(e.contains("is not one of: black, freeze"), "{e}");
+    assert!(to_toml(PRIVACY_MODE, &kind, &ConfigValue::Str("freeze".into())).is_ok());
+    // With an image configured, the away image is accepted.
     effect.fallback_image = Some("/srv/away.png".into());
     let facts = RegistryFacts {
-        on_failure_options: on_failure_options(&effect),
+        privacy_mode_options: privacy_mode_options(&effect),
         ..facts()
     };
-    let kind = lookup(ON_FAILURE, &facts).unwrap().kind;
+    let kind = lookup(PRIVACY_MODE, &facts).unwrap().kind;
     assert_eq!(
-        to_toml(ON_FAILURE, &kind, &image).unwrap(),
-        toml::Value::String("image".into())
+        to_toml(PRIVACY_MODE, &kind, &away).unwrap(),
+        toml::Value::String("away".into())
     );
     // Every option parses as the configuration reads it.
-    for (v, _) in on_failure_options(&effect) {
-        assert!(crate::EffectOnFailure::from_str(&v).is_ok(), "{v}");
+    for (v, _) in privacy_mode_options(&effect) {
+        assert!(crate::PrivacyMode::from_str(&v).is_ok(), "{v}");
     }
+    // The switch is a bool; the legacy key is no row.
+    let info = lookup(PRIVACY, &facts).unwrap();
+    assert!(info.editable);
+    assert_eq!(info.kind, RowKind::Bool);
+    assert!(lookup(LEGACY_ON_FAILURE, &facts).is_none());
     // The image row is a path the panel writes (the away image).
     let info = lookup("effect.fallback_image", &facts).unwrap();
     assert!(info.editable);
     assert_eq!(info.kind, RowKind::Path);
     assert_eq!(info.apply, Apply::Live);
+}
+
+#[test]
+fn an_overridden_privacy_mode_gives_the_override_as_its_reason() {
+    let (_tmp, set) = load(&[(
+        "config.d/90-local.toml",
+        "[effect]\nprivacy_mode = \"freeze\"\n",
+    )]);
+    let groups = config_schema(&set, &facts());
+    let m = find(&groups, "effect.privacy_mode");
+    assert!(!m.enabled);
+    assert_eq!(m.disabled_reason, "Overridden by config.d/90-local.toml");
 }
 
 #[test]

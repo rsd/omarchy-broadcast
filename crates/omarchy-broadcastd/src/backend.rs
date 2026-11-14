@@ -183,9 +183,11 @@ pub struct EffectRun {
     /// `None` without one or while only its still can be shown. Changing it alone reloads nothing: the
     /// background in force stays until the new video's first frame.
     pub background_video: Option<PathBuf>,
-    /// What shows when the background effect cannot run.
+    /// What shows when the background effect cannot run: the policy of
+    /// `effect.privacy` and `effect.privacy_mode`.
     pub on_failure: EffectOnFailure,
-    /// The image shown in place of black with `on_failure = "image"`.
+    /// The away image: shown in place of black under the `away` privacy
+    /// mode, and under `freeze` while no frame has been processed yet.
     pub fallback_image: Option<PathBuf>,
     /// The other stages of the effect element, in order.
     pub stages: Vec<StageRun>,

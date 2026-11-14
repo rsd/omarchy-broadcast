@@ -49,6 +49,8 @@ pub enum CoreError {
     InvalidEffect(String),
     #[error("unsupported effect failure policy {0:?} (supported: black, image, none)")]
     InvalidEffectOnFailure(String),
+    #[error("unsupported privacy mode {0:?} (supported: black, away, freeze)")]
+    InvalidPrivacyMode(String),
     #[error("unsupported placeholder {0:?} (supported: black, image)")]
     InvalidOutputPlaceholder(String),
     #[error("unknown relighting light {0:?} (supported: warm, neutral, cool)")]
@@ -311,37 +313,69 @@ impl FromStr for EffectMode {
     }
 }
 
-/// What the virtual camera shows when a requested effect cannot run.
+/// What the virtual camera shows when a requested effect cannot run: the
+/// one policy resolved from `effect.privacy` and `effect.privacy_mode`
+/// (or, when neither is set, from the legacy `effect.on_failure`; see
+/// [`config::EffectConfig::policy`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectOnFailure {
     /// Black frames, the camera closed and the daemon in `error`: the
-    /// background stays hidden (fails closed).
-    #[default]
+    /// background stays hidden (fails closed). Privacy on, `black`.
     Black,
     /// The camera image without the effect, with the reason in `Error`.
+    /// Privacy off (the default).
+    #[default]
     None,
     /// As [`EffectOnFailure::Black`], with the still image of
     /// `effect.fallback_image` in place of the black frames (black when it
-    /// is not set or cannot be read, with a `Warning` saying so).
+    /// is not set or cannot be read, with a `Warning` saying so). Privacy
+    /// on, `away`.
     Image,
+    /// As [`EffectOnFailure::Black`], with the last frame the effect
+    /// produced held in place of the black frames; with none yet, the away
+    /// image when one is set, else black. Privacy on, `freeze`.
+    Freeze,
 }
 
 impl EffectOnFailure {
-    /// `black`, `none` or `image`.
+    /// `black`, `none`, `image` or `freeze`.
     pub fn as_str(self) -> &'static str {
         match self {
             EffectOnFailure::Black => "black",
             EffectOnFailure::None => "none",
             EffectOnFailure::Image => "image",
+            EffectOnFailure::Freeze => "freeze",
         }
     }
 
-    /// Whether the camera is hidden when the effect cannot run: `black` and
-    /// `image` hide it (every privacy rule treats them alike), `none` shows
-    /// it.
+    /// Whether the camera is hidden when the effect cannot run: `black`,
+    /// `image` and `freeze` hide it (every privacy rule treats them alike),
+    /// `none` shows it.
     pub fn hides(self) -> bool {
-        matches!(self, EffectOnFailure::Black | EffectOnFailure::Image)
+        !matches!(self, EffectOnFailure::None)
+    }
+
+    /// The policy of `effect.privacy` and `effect.privacy_mode`: off is
+    /// [`EffectOnFailure::None`], on follows the mode.
+    pub fn of_privacy(privacy: bool, mode: PrivacyMode) -> EffectOnFailure {
+        match (privacy, mode) {
+            (false, _) => EffectOnFailure::None,
+            (true, PrivacyMode::Black) => EffectOnFailure::Black,
+            (true, PrivacyMode::Away) => EffectOnFailure::Image,
+            (true, PrivacyMode::Freeze) => EffectOnFailure::Freeze,
+        }
+    }
+
+    /// The `effect.privacy` and `effect.privacy_mode` this policy stands
+    /// for: `none` is privacy off, with no mode.
+    pub fn privacy_keys(self) -> (bool, Option<PrivacyMode>) {
+        match self {
+            EffectOnFailure::None => (false, None),
+            EffectOnFailure::Black => (true, Some(PrivacyMode::Black)),
+            EffectOnFailure::Image => (true, Some(PrivacyMode::Away)),
+            EffectOnFailure::Freeze => (true, Some(PrivacyMode::Freeze)),
+        }
     }
 }
 
@@ -351,6 +385,8 @@ impl fmt::Display for EffectOnFailure {
     }
 }
 
+/// Parses a value of the legacy key `effect.on_failure`: `black`, `image`
+/// or `none` (`freeze` was never one of its values).
 impl FromStr for EffectOnFailure {
     type Err = CoreError;
 
@@ -360,6 +396,51 @@ impl FromStr for EffectOnFailure {
             "none" => Ok(EffectOnFailure::None),
             "image" => Ok(EffectOnFailure::Image),
             _ => Err(CoreError::InvalidEffectOnFailure(s.to_string())),
+        }
+    }
+}
+
+/// What privacy shows in place of the camera when it hides it
+/// (`effect.privacy_mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyMode {
+    /// Black frames.
+    #[default]
+    Black,
+    /// The away image (`effect.fallback_image`).
+    Away,
+    /// The last frame the effect produced; with none yet, the away image
+    /// when one is set, else black.
+    Freeze,
+}
+
+impl PrivacyMode {
+    /// `black`, `away` or `freeze`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrivacyMode::Black => "black",
+            PrivacyMode::Away => "away",
+            PrivacyMode::Freeze => "freeze",
+        }
+    }
+}
+
+impl fmt::Display for PrivacyMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for PrivacyMode {
+    type Err = CoreError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "black" => Ok(PrivacyMode::Black),
+            "away" => Ok(PrivacyMode::Away),
+            "freeze" => Ok(PrivacyMode::Freeze),
+            _ => Err(CoreError::InvalidPrivacyMode(s.to_string())),
         }
     }
 }
@@ -1217,7 +1298,11 @@ mod tests {
             EffectOnFailure::None
         );
         assert!("raw".parse::<EffectOnFailure>().is_err());
-        assert_eq!(EffectOnFailure::default(), EffectOnFailure::Black);
+        assert_eq!(EffectOnFailure::default(), EffectOnFailure::None);
+        assert!(
+            "freeze".parse::<EffectOnFailure>().is_err(),
+            "not a legacy value"
+        );
         assert_eq!(EffectOnFailure::None.to_string(), "none");
         assert_eq!(
             "Image".parse::<EffectOnFailure>().unwrap(),
@@ -1225,7 +1310,22 @@ mod tests {
         );
         assert_eq!(EffectOnFailure::Image.to_string(), "image");
         assert!(EffectOnFailure::Black.hides() && EffectOnFailure::Image.hides());
+        assert!(EffectOnFailure::Freeze.hides());
         assert!(!EffectOnFailure::None.hides());
+        assert_eq!(EffectOnFailure::Freeze.as_str(), "freeze");
+        for mode in [PrivacyMode::Black, PrivacyMode::Away, PrivacyMode::Freeze] {
+            assert_eq!(mode.as_str().parse::<PrivacyMode>().unwrap(), mode);
+            assert_eq!(
+                EffectOnFailure::of_privacy(false, mode),
+                EffectOnFailure::None
+            );
+            let on = EffectOnFailure::of_privacy(true, mode);
+            assert!(on.hides());
+            assert_eq!(on.privacy_keys(), (true, Some(mode)));
+        }
+        assert_eq!(EffectOnFailure::None.privacy_keys(), (false, None));
+        assert!("raw".parse::<PrivacyMode>().is_err());
+        assert_eq!(PrivacyMode::default(), PrivacyMode::Black);
         assert_eq!(
             "Image".parse::<OutputPlaceholder>().unwrap(),
             OutputPlaceholder::Image

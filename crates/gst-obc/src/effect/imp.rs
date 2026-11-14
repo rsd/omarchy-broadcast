@@ -25,8 +25,15 @@
 //! # A toggle mid-stream, a start, a new source, a failure
 //!
 //! A requested effect (blur or replace) that is not loaded yet holds black
-//! (with `on-failure=image`, the fallback image) only where the room it
-//! hides was never on screen. The streaming thread keeps
+//! (with `on-failure=image`, the fallback image; with `freeze`, the frozen
+//! frame) only where the room it hides was never on screen, and only under
+//! a fallback that hides. With `on-failure=none` (privacy off) it is never
+//! held: every frame the effect cannot run on yet is decided as a toggle
+//! frame below (what `none` gives: the input, or the stages alone), at a
+//! start, on a new source and on a reload alike, and a frame decided for
+//! the effect that finds it unloaded under the lock is the input copied,
+//! as after a failure. The rest of this section is the hiding fallbacks'.
+//! The streaming thread keeps
 //! `StreamState::raw_on_screen`: the last frame output was the unprocessed
 //! picture, the input passed through or copied, or processed by the stages
 //! alone (they hide nothing). It is set by such a frame and cleared by any
@@ -133,7 +140,8 @@
 //!   is processing frames on could fail those frames or capture their
 //!   work.
 //! * **A failure** of the effect or of its module takes `on-failure`
-//!   (black, the image, or with `none` the input), whatever was on screen.
+//!   (black, the image, the frozen frame, or with `none` the input),
+//!   whatever was on screen.
 //!   A revoked backend (`ObcEffect::revoke_backend`) is such a failure,
 //!   from the next frame decided: its status is failed, so no toggle
 //!   applies, and its new request number and epoch end any effect a
@@ -172,7 +180,8 @@
 //!   lock a frame decided for an effect is black if only the stages are
 //!   loaded). Mid-stream the frames are those of `none` until the effect is
 //!   ready (the stages' while they are loaded, else the input); at a start
-//!   or on a new source they are black (see "A toggle mid-stream" above).
+//!   or on a new source they are black under a hiding fallback, those of
+//!   `none` with `on-failure=none` (see "A toggle mid-stream" above).
 //! * Every other change (turning a stage on or off under an effect, a new
 //!   load-time parameter of a stage, blur and replace with stages, an effect
 //!   to `none` with stages) is a switch on the loaded instance, done under
@@ -311,6 +320,46 @@
 //! ready, or when it cannot be read or uploaded, those frames are black
 //! and the reason is reported (`FallbackCtl::error`: the statistics and the
 //! status message).
+//!
+//! # The frozen frame
+//!
+//! With `on-failure=freeze`, every frame decided black and every failed
+//! frame `on-failure` hides gets the last output an effect processed
+//! (`StreamState::freeze`), copied into the frame's new output buffer with
+//! the frame's own timestamps and flags: frame after frame, repeats
+//! included, until the effect processes a frame again or is turned off.
+//! It is set in `generate_output` from a frame `render` processed through
+//! an effect (`StreamState::effect_output`): never the input (passed
+//! through or copied), a frame processed by the stages alone (they hide
+//! nothing), a black, image or frozen frame, a re-sent repeat (the cache's
+//! frame, already an effect's), nor the placeholder image (passed through
+//! before any decision). Without one (at a start, after new caps) such a
+//! frame gets what `image` gives: the fallback image when one is set and
+//! decoded, else black, with the image's error reported as for `image`.
+//!
+//! The frozen frame survives a failure, a retry, a reload and a new source
+//! of the same caps, so a camera switch that fails shows the last picture
+//! of the previous camera. It is dropped on new caps (another size, format,
+//! colour or memory: `set_caps`), on a stop (`release_gpu`, before the
+//! context reference: it is memory of the element's pool and context), by
+//! a frame decided under another fallback, and by any frame that goes out
+//! as the unprocessed camera (the input passed through or copied, or the
+//! stages alone: the effect off, or turned on mid-stream while it loads),
+//! so a later failure never shows a picture from before the camera was
+//! last shown as it is. The placeholder image is not the camera: it keeps
+//! it. A flush keeps it. What hides the input
+//! is chosen in one place for both memories (`run_frame`, through `Cover`),
+//! and only the copy differs: on the element's stream for CUDA frames, row
+//! by row on the CPU for system memory.
+//!
+//! Its cost: holding it copies nothing. The frozen frame is a reference to
+//! the very buffer pushed downstream, as the repeat cache holds it, and on
+//! the same terms: its memory stays shared, so nothing downstream writes
+//! it (an element writing in place writes into a copy, the price the cache
+//! already pays on every processed frame), and the pool cannot hand it out
+//! again (the pools have no maximum). One output buffer stays out of the
+//! pool while it is held. Each frame shown frozen costs one frame copy
+//! (device to device, or on the CPU), as the fallback image does.
 //!
 //! # The video background
 //!
@@ -939,7 +988,11 @@ impl Control {
     fn fallback_path(&self) -> Option<&PathBuf> {
         let path = self.settings.fallback_image.as_ref()?;
         self.format.as_ref()?;
-        (self.settings.fallback == EffectFallback::Image).then_some(path)
+        matches!(
+            self.settings.fallback,
+            EffectFallback::Image | EffectFallback::Freeze
+        )
+        .then_some(path)
     }
 
     /// The fallback image the settings and the caps want, if any, the file
@@ -1426,6 +1479,13 @@ struct StreamState {
     toggle_found: Option<(u64, u64)>,
     /// The last processed output, while it is valid.
     cache: Option<Cached>,
+    /// `render` processed this frame through an effect (not the stages
+    /// alone): with `on-failure=freeze` its output becomes the frozen frame.
+    effect_output: bool,
+    /// With `on-failure=freeze`, the last output buffer an effect processed
+    /// (see "The frozen frame" in the module docs): a reference to the very
+    /// buffer pushed downstream, as the cache holds it.
+    freeze: Option<gst::Buffer>,
     /// The frame is a fresh camera frame (no repeat): the video background
     /// may advance on it.
     fresh: bool,
@@ -2149,12 +2209,19 @@ impl ObcEffect {
     /// fails). Runs after the worker has been joined.
     fn release_gpu(&self) {
         lock(&self.shared.stage_values).clear();
-        let (gpu, cached, host_pool) = {
+        let (gpu, cached, frozen, host_pool) = {
             let mut st = lock(&self.stream);
-            (st.gpu.take(), st.cache.take(), st.host_pool.take())
+            (
+                st.gpu.take(),
+                st.cache.take(),
+                st.freeze.take(),
+                st.host_pool.take(),
+            )
         };
-        // The cached output is memory of our pool and context: gone first.
+        // The cached and the frozen output are memory of our pool and
+        // context: gone first.
         drop(cached);
+        drop(frozen);
         if let Some(pool) = host_pool {
             let _ = pool.set_active(false);
         }
@@ -2264,29 +2331,30 @@ impl ObcEffect {
         // Whatever this frame becomes, the previous output is no longer the
         // last one.
         st.processed = false;
+        st.effect_output = false;
         st.cache = None;
         let info = st.info.clone().ok_or("no caps negotiated")?;
         let format = st.format.clone().ok_or("no caps negotiated")?;
-        // What hides the input: the fallback image with `image`, else black.
-        let image = match st.fallback {
-            EffectFallback::Image => st.fallback_frame.clone(),
-            _ => None,
+        // What hides the input: the frozen frame with `freeze`, the fallback
+        // image with `image` (and `freeze` before its first frame), else
+        // black. Held here, apart from the stream state the frame borrows.
+        let (frozen, image) = match st.fallback {
+            EffectFallback::Freeze => (st.freeze.clone(), st.fallback_frame.clone()),
+            EffectFallback::Image => (None, st.fallback_frame.clone()),
+            _ => (None, None),
+        };
+        let cover = Cover {
+            frozen: frozen.as_ref(),
+            image: image.as_ref(),
         };
         if !format.cuda {
-            return self.render_host(st, inbuf, outbuf, &info, &format, image.as_ref());
+            return self.render_host(st, inbuf, outbuf, &info, &format, cover);
         }
         let lib = cuda::gst_cuda()?;
         // Taken for the frame (the decision below borrows the rest of the
         // stream state), and always put back.
         let mut gpu = st.gpu.take().ok_or("no CUDA resources")?;
-        let result = self.render_cuda(
-            st,
-            (&mut gpu, lib),
-            (inbuf, outbuf),
-            &info,
-            &format,
-            image.as_ref(),
-        );
+        let result = self.render_cuda(st, (&mut gpu, lib), (inbuf, outbuf), &info, &format, cover);
         st.gpu = Some(gpu);
         result
     }
@@ -2299,7 +2367,7 @@ impl ObcEffect {
         (inbuf, outbuf): (&gst::Buffer, &mut gst::BufferRef),
         info: &VideoInfo,
         format: &Format,
-        image: Option<&Arc<FallbackFrame>>,
+        cover: Cover<'_>,
     ) -> Result<(), String> {
         // SAFETY: our context reference is live.
         let _guard = unsafe { ContextGuard::push(gpu.cu_ctx) }.map_err(|e| e.to_string())?;
@@ -2312,8 +2380,10 @@ impl ObcEffect {
             )
         }?;
         let stream = gpu.cu_stream;
-        // The input stays mapped until the stream has finished reading it.
+        // The input, and the frozen frame when one is shown, stay mapped
+        // until the stream has finished reading them.
         let mut input_frame: Option<CudaFrame> = None;
+        let mut frozen_frame: Option<CudaFrame> = None;
         // Every exit from here waits for the stream before the frames are
         // unmapped (this guard drops before them), so an early return never
         // releases the input, or hands out the output, while work queued on
@@ -2331,15 +2401,17 @@ impl ObcEffect {
                 inbuf,
                 dst: out.nv12(),
                 input: &mut input_frame,
+                frozen: &mut frozen_frame,
                 src: None,
             };
-            self.run_frame(st, format, image, &mut px)?
+            self.run_frame(st, format, cover, &mut px)?
         };
         sync_on_exit.disarm();
         // SAFETY: our own stream. Waiting here also ends this frame's read
         // of the input (see the module docs for why).
         unsafe { obc_gpu::stream_synchronize(stream) }.map_err(|e| e.to_string())?;
         drop(input_frame);
+        drop(frozen_frame);
         drop(out);
         let gpu_ms = if rendered.processed {
             Event::elapsed_ms(&gpu.start, &gpu.end).ok()
@@ -2359,7 +2431,7 @@ impl ObcEffect {
         outbuf: &mut gst::BufferRef,
         info: &VideoInfo,
         format: &Format,
-        image: Option<&Arc<FallbackFrame>>,
+        cover: Cover<'_>,
     ) -> Result<(), String> {
         let out = gst_video::VideoFrameRef::from_buffer_ref_writable(outbuf, info)
             .map_err(|_| "could not map an output frame for writing")?;
@@ -2374,7 +2446,7 @@ impl ObcEffect {
                 _input: None,
                 src: None,
             };
-            self.run_frame(st, format, image, &mut px)?
+            self.run_frame(st, format, cover, &mut px)?
         };
         // No GPU time on the CPU path.
         self.account(st, rendered, None);
@@ -2389,7 +2461,7 @@ impl ObcEffect {
         &self,
         st: &mut StreamState,
         format: &Format,
-        image: Option<&Arc<FallbackFrame>>,
+        cover: Cover<'_>,
         px: &mut P,
     ) -> Result<Rendered, String> {
         let mut r = Rendered::default();
@@ -2397,7 +2469,7 @@ impl ObcEffect {
             FrameAction::Passthrough => {
                 return Err("internal: passthrough frame in transform".into());
             }
-            FrameAction::Black => px.fill_hidden(image, format.black)?,
+            FrameAction::Black => px.fill_hidden(cover, format.black)?,
             FrameAction::Process => {
                 px.map_input()?;
                 let params = Arc::clone(&st.frame);
@@ -2595,23 +2667,21 @@ impl ObcEffect {
                         r.copied = true;
                     }
                     // The effect failed (recorded above).
-                    Some(Err(_)) => match st.fallback {
-                        EffectFallback::Black | EffectFallback::Image => {
-                            px.fill_hidden(image, format.black)?
-                        }
-                        EffectFallback::None => {
-                            px.copy_input()?;
-                            r.copied = true;
-                        }
-                    },
-                    // Unloaded since the decision: the input for `none`
-                    // (nothing to hide), black for an effect, never the
-                    // input.
-                    None if alone => {
+                    Some(Err(_)) if st.fallback.hides() => px.fill_hidden(cover, format.black)?,
+                    Some(Err(_)) => {
                         px.copy_input()?;
                         r.copied = true;
                     }
-                    None => px.fill_hidden(image, format.black)?,
+                    // Unloaded since the decision: the input for `none`
+                    // (nothing to hide) and with `on-failure=none` (the
+                    // effect cannot run: the camera as it is), black for
+                    // an effect under a fallback that hides, never the
+                    // input.
+                    None if alone || !st.fallback.hides() => {
+                        px.copy_input()?;
+                        r.copied = true;
+                    }
+                    None => px.fill_hidden(cover, format.black)?,
                 }
             }
         }
@@ -2625,6 +2695,7 @@ impl ObcEffect {
         // Only a processed frame is cached (`generate_output`); black or
         // the input leaves no cache behind.
         st.processed = r.processed;
+        st.effect_output = r.processed && r.effect_ran;
         // The room stays on screen after the input or the stages alone;
         // black or an effect frame ends it.
         let output = match (r.processed, r.effect_ran, r.copied) {
@@ -2634,6 +2705,11 @@ impl ObcEffect {
             (false, _, false) => FrameOutput::Hidden,
         };
         st.raw_on_screen = raw_on_screen_after(st.raw_on_screen, ScreenEvent::Output(output));
+        // The camera shown unprocessed ends the frozen frame (see "The
+        // frozen frame" in the module docs).
+        if matches!(output, FrameOutput::Input | FrameOutput::Stages) {
+            st.freeze = None;
+        }
         if r.processed {
             self.shared.processed.fetch_add(1, Ordering::Relaxed);
             if !r.ran.is_empty() || r.effect_ran {
@@ -2696,6 +2772,17 @@ struct Rendered {
     serial: u64,
 }
 
+/// What hides the input in a frame the element fills instead of showing
+/// it (`FramePixels::fill_hidden`), in this order: the frozen frame
+/// (`on-failure=freeze`), the fallback image of the output's size
+/// (`image`, and `freeze` while there is no frozen frame), black.
+#[derive(Clone, Copy, Default)]
+struct Cover<'a> {
+    /// The last output an effect processed, of the negotiated caps.
+    frozen: Option<&'a gst::Buffer>,
+    image: Option<&'a Arc<FallbackFrame>>,
+}
+
 /// The pixel work of one output frame in the memory of the negotiated caps:
 /// [`CudaPixels`] on the element's stream, [`HostPixels`] on the CPU. What
 /// a frame gets is decided once, in [`ObcEffect::run_frame`], for both.
@@ -2704,14 +2791,11 @@ trait FramePixels {
     fn kind(&self) -> FrameKind;
     /// Maps the input for reading (a frame to process only).
     fn map_input(&mut self) -> Result<(), String>;
-    /// Fills the output with what hides the input: the fallback image
-    /// `image` when there is one of the output's size, else black of
-    /// `black`.
-    fn fill_hidden(
-        &mut self,
-        image: Option<&Arc<FallbackFrame>>,
-        black: ColourSpec,
-    ) -> Result<(), String>;
+    /// Fills the output with what hides the input ([`Cover`]): the frozen
+    /// frame copied when there is one (and it can be mapped), else the
+    /// fallback image when there is one of the output's size, else black
+    /// of `black`.
+    fn fill_hidden(&mut self, cover: Cover<'_>, black: ColourSpec) -> Result<(), String>;
     /// Copies the mapped input into the output.
     fn copy_input(&mut self) -> Result<(), String>;
     /// The backend's temporal reset, for this memory.
@@ -2852,6 +2936,9 @@ struct CudaPixels<'a> {
     /// The input once mapped, owned by the caller so that it stays mapped
     /// until the stream has finished reading it.
     input: &'a mut Option<CudaFrame>,
+    /// The frozen frame once mapped to be copied, owned by the caller for
+    /// the same reason.
+    frozen: &'a mut Option<CudaFrame>,
     src: Option<DeviceNv12>,
 }
 
@@ -2886,14 +2973,40 @@ impl FramePixels for CudaPixels<'_> {
         Ok(())
     }
 
-    fn fill_hidden(
-        &mut self,
-        image: Option<&Arc<FallbackFrame>>,
-        black: ColourSpec,
-    ) -> Result<(), String> {
+    fn fill_hidden(&mut self, cover: Cover<'_>, black: ColourSpec) -> Result<(), String> {
         let stream = self.gpu.cu_stream;
+        if let Some(buffer) = cover.frozen {
+            let mem = buffer.peek_memory(0);
+            // SAFETY: the frozen frame is an output buffer of our own CUDA
+            // pool, so a GstCudaMemory of our context; the sync only waits
+            // for its producer.
+            unsafe { (self.lib.gst_cuda_memory_sync)(mem.as_mut_ptr().cast()) };
+            // SAFETY: read-only CUDA map of a live buffer of the negotiated
+            // caps, which the caller holds until the frame is done; the
+            // memory is shared, so nothing writes it.
+            let mapped = unsafe {
+                CudaFrame::map(
+                    buffer.as_mut_ptr(),
+                    self.info,
+                    gst::ffi::GST_MAP_READ | MAP_CUDA,
+                )
+            };
+            match mapped {
+                Ok(frame) => {
+                    let src = frame.nv12();
+                    *self.frozen = Some(frame);
+                    // SAFETY: both are mapped CUDA frames of our context, of
+                    // the same caps, in different buffers; the frozen one
+                    // is only read and stays mapped until the stream is
+                    // synchronised (`frozen` is the caller's).
+                    return unsafe { obc_gpu::copy_nv12_async(&src, &self.dst, stream) }
+                        .map_err(|e| e.to_string());
+                }
+                Err(e) => gst::warning!(CAT, imp = self.fx, "the frozen frame: {e}"),
+            }
+        }
         self.fx
-            .fill_hidden(self.gpu, image, &self.dst, black, stream)
+            .fill_hidden(self.gpu, cover.image, &self.dst, black, stream)
     }
 
     fn copy_input(&mut self) -> Result<(), String> {
@@ -2992,13 +3105,28 @@ impl FramePixels for HostPixels<'_> {
         Ok(())
     }
 
-    fn fill_hidden(
-        &mut self,
-        image: Option<&Arc<FallbackFrame>>,
-        black: ColourSpec,
-    ) -> Result<(), String> {
-        if let Some(img) =
-            image.filter(|i| (i.width, i.height) == (self.dst.width, self.dst.height))
+    fn fill_hidden(&mut self, cover: Cover<'_>, black: ColourSpec) -> Result<(), String> {
+        if let Some(buffer) = cover.frozen {
+            match gst_video::VideoFrameRef::from_buffer_ref_readable(buffer.as_ref(), self.info) {
+                Ok(frame) => {
+                    let src = host_nv12(&frame);
+                    // SAFETY: `src` is the frozen frame mapped for reading in
+                    // `frame` (alive for the call), only read; `dst` the
+                    // output mapped for writing in `_out`: another buffer
+                    // (the frozen one is held, so the pool cannot hand it
+                    // out), of the same caps.
+                    return unsafe { copy_nv12(&src, &mut self.dst) };
+                }
+                Err(_) => gst::warning!(
+                    CAT,
+                    imp = self.fx,
+                    "the frozen frame could not be mapped for reading"
+                ),
+            }
+        }
+        if let Some(img) = cover
+            .image
+            .filter(|i| (i.width, i.height) == (self.dst.width, self.dst.height))
         {
             // SAFETY: `dst` is the output frame mapped for writing in
             // `_out`, accessed through nothing else.
@@ -4221,7 +4349,8 @@ impl ObjectImpl for ObcEffect {
                 glib::ParamSpecString::builder("on-failure")
                     .nick("On failure")
                     .blurb(
-                        "Output after a failure: black | image (the away image) | none \
+                        "Output after a failure: black | image (the away image) | freeze \
+                         (the last processed frame, else the away image) | none \
                          (the unprocessed input)",
                     )
                     .default_value(Some("black"))
@@ -4231,7 +4360,8 @@ impl ObjectImpl for ObcEffect {
                     .nick("Away image")
                     .blurb(
                         "Absolute path of the away image shown in place of black with \
-                         on-failure=image (empty: none, black)",
+                         on-failure=image, and with freeze before any frame is processed \
+                         (empty: none, black)",
                     )
                     .default_value(Some(""))
                     .flags(rw)
@@ -4461,6 +4591,8 @@ impl BaseTransformImpl for ObcEffect {
         st.reset_pending = false;
         st.resend = false;
         st.cache = None;
+        st.freeze = None;
+        st.effect_output = false;
         st.raw_on_screen = raw_on_screen_after(st.raw_on_screen, ScreenEvent::Reset);
         st.toggle_found = None;
         Ok(())
@@ -4501,6 +4633,7 @@ impl BaseTransformImpl for ObcEffect {
             }
             if st.caps.as_ref() != Some(incaps) {
                 st.cache = None;
+                st.freeze = None;
                 st.raw_on_screen = raw_on_screen_after(st.raw_on_screen, ScreenEvent::Reset);
                 st.toggle_found = None;
             }
@@ -4640,6 +4773,14 @@ impl BaseTransformImpl for ObcEffect {
     fn generate_output(&self) -> Result<GenerateOutputSuccess, gst::FlowError> {
         let out = self.parent_generate_output()?;
         let mut st = lock(&self.stream);
+        // The frozen frame is the buffer pushed, held as the cache holds
+        // it: no copy here (see "The frozen frame" in the module docs).
+        if std::mem::take(&mut st.effect_output)
+            && st.fallback == EffectFallback::Freeze
+            && let GenerateOutputSuccess::Buffer(buffer) = &out
+        {
+            st.freeze = Some(buffer.clone());
+        }
         if std::mem::take(&mut st.processed)
             && let GenerateOutputSuccess::Buffer(buffer) = &out
             && let Some(caps) = st.caps.clone()
@@ -4818,9 +4959,16 @@ impl ObcEffect {
         if action == FrameAction::Passthrough {
             st.raw_on_screen =
                 raw_on_screen_after(st.raw_on_screen, ScreenEvent::Output(FrameOutput::Input));
+            // The camera shown as it is: the frozen frame ends with it.
+            st.freeze = None;
         }
         if !found {
             st.toggle_found = None;
+        }
+        // Only `freeze` keeps a frozen frame: another fallback lets the
+        // buffer go back to the pool.
+        if fallback != EffectFallback::Freeze {
+            st.freeze = None;
         }
         st.action = action;
         st.generation = generation;

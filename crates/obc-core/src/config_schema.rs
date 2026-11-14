@@ -18,7 +18,7 @@
 //! after the managed one sets is overridden: not enabled, with the reason
 //! "Overridden by <file>".
 
-use crate::EffectOnFailure;
+use crate::PrivacyMode;
 use crate::config::{Config, EffectConfig, EffectiveMemory};
 use crate::config_d::{ConfigSet, table_get};
 use crate::modules::{FRAME_GENERATION_STAGE, valid_module_id, valid_stage_id};
@@ -125,7 +125,7 @@ pub enum SpecKind {
     Enum(&'static [(&'static str, &'static str)]),
     /// One of the options the daemon computes at run time
     /// ([`RegistryFacts::output_modes`] for `output.mode`,
-    /// [`RegistryFacts::on_failure_options`] for `effect.on_failure`).
+    /// [`RegistryFacts::privacy_mode_options`] for `effect.privacy_mode`).
     Runtime,
     String,
     Path,
@@ -463,10 +463,19 @@ pub const CORE_KEYS: &[KeySpec] = &[
         apply: Apply::Live,
     },
     KeySpec {
-        key: "effect.on_failure",
+        key: "effect.privacy",
         group: "effect",
-        label: "When an effect can't run",
-        description: "Hide the camera with black frames or your image, or show the camera without the effect.",
+        label: "Hide the camera when an effect can't run",
+        description: PRIVACY_NOTE,
+        kind: SpecKind::Bool,
+        editable: true,
+        apply: Apply::Live,
+    },
+    KeySpec {
+        key: "effect.privacy_mode",
+        group: "effect",
+        label: "Show instead of the camera",
+        description: PRIVACY_MODE_NOTE,
         kind: SpecKind::Runtime,
         editable: true,
         apply: Apply::Live,
@@ -475,7 +484,7 @@ pub const CORE_KEYS: &[KeySpec] = &[
         key: "effect.fallback_image",
         group: "effect",
         label: "Away image",
-        description: "A PNG, JPEG or WebP still shown in place of black frames: with Hide the camera: image, and when there is no camera picture.",
+        description: "A PNG, JPEG or WebP still shown in place of black frames: by privacy's Away image, and when there is no camera picture.",
         kind: SpecKind::Path,
         editable: true,
         apply: Apply::Live,
@@ -643,14 +652,28 @@ const RUNTIME_NOTE_MODE: &str =
 
 /// The key whose options are the output modes of [`RegistryFacts`].
 pub const OUTPUT_MODE: &str = "output.mode";
-/// The key whose options are [`RegistryFacts::on_failure_options`].
-pub const ON_FAILURE: &str = "effect.on_failure";
+/// The key whose options are [`RegistryFacts::privacy_mode_options`].
+pub const PRIVACY_MODE: &str = "effect.privacy_mode";
+/// The privacy switch.
+pub const PRIVACY: &str = "effect.privacy";
+/// The legacy failure policy: no row of the schema, but a `SetConfig` or
+/// `ResetConfig` of it is taken as one of [`PRIVACY`] and
+/// [`PRIVACY_MODE`] ([`crate::config_d::set_config`]).
+pub const LEGACY_ON_FAILURE: &str = "effect.on_failure";
 /// The key whose description is that of [`RegistryFacts::video_memory`].
 pub const VIDEO_MEMORY: &str = "video.memory";
 
+/// The description of `effect.privacy`.
+const PRIVACY_NOTE: &str = "Off shows the camera as it is when the requested effect cannot run: refused, failed, its module lost, or still loading at a start. On hides it.";
+/// The description of `effect.privacy_mode`.
+const PRIVACY_MODE_NOTE: &str = "What privacy shows. Away image appears once an away image is chosen. Last frame: the effect's last frame; with none yet, the away image if set, else black.";
+/// Why `effect.privacy_mode` is not enabled while privacy is off.
+pub const PRIVACY_OFF_REASON: &str =
+    "Turn on \"Hide the camera when an effect can't run\" to change this";
+
 /// The options of the [`SpecKind::Runtime`] key `key`. For
-/// `effect.on_failure`, those of `facts`, else those of `config` (else of
-/// the defaults: black and none).
+/// `effect.privacy_mode`, those of `facts`, else those of `config` (else
+/// of the defaults: black and the last frame).
 fn runtime_options(
     key: &str,
     facts: &RegistryFacts,
@@ -658,21 +681,24 @@ fn runtime_options(
 ) -> Vec<(String, String)> {
     match key {
         OUTPUT_MODE => facts.output_modes.clone(),
-        ON_FAILURE if !facts.on_failure_options.is_empty() => facts.on_failure_options.clone(),
-        ON_FAILURE => on_failure_options(&config.map(|c| c.effect.clone()).unwrap_or_default()),
+        PRIVACY_MODE if !facts.privacy_mode_options.is_empty() => {
+            facts.privacy_mode_options.clone()
+        }
+        PRIVACY_MODE => privacy_mode_options(&config.map(|c| c.effect.clone()).unwrap_or_default()),
         _ => Vec::new(),
     }
 }
 
-/// The options of `effect.on_failure` for `effect`, `(value, label)`:
-/// black, then the image (offered only when `effect.fallback_image` is
-/// set, or when it is the value in force), then none.
-pub fn on_failure_options(effect: &EffectConfig) -> Vec<(String, String)> {
-    let image = effect.fallback_image.is_some() || effect.on_failure == EffectOnFailure::Image;
+/// The options of `effect.privacy_mode` for `effect`, `(value, label)`:
+/// black, then the away image (offered only when `effect.fallback_image`
+/// is set, or when it is the mode in force), then the last frame.
+pub fn privacy_mode_options(effect: &EffectConfig) -> Vec<(String, String)> {
+    let away =
+        effect.fallback_image.is_some() || effect.privacy_mode_in_force() == PrivacyMode::Away;
     [
-        (EffectOnFailure::Black, "Hide the camera: black", true),
-        (EffectOnFailure::Image, "Hide the camera: image", image),
-        (EffectOnFailure::None, "Show the camera", true),
+        (PrivacyMode::Black, "Black", true),
+        (PrivacyMode::Away, "Away image", away),
+        (PrivacyMode::Freeze, "Last frame", true),
     ]
     .into_iter()
     .filter(|(_, _, offered)| *offered)
@@ -723,10 +749,10 @@ pub struct RegistryFacts {
     /// can make), with the configured value among them. Empty: none is
     /// accepted.
     pub output_modes: Vec<(String, String)>,
-    /// The options of `effect.on_failure` ([`on_failure_options`] of the
-    /// configuration in force). Empty: those of the configuration the
+    /// The options of `effect.privacy_mode` ([`privacy_mode_options`] of
+    /// the configuration in force). Empty: those of the configuration the
     /// schema is made of, or for a write those of the defaults.
-    pub on_failure_options: Vec<(String, String)>,
+    pub privacy_mode_options: Vec<(String, String)>,
     /// The video memory in force and why: the description of
     /// `video.memory` is then [`EffectiveMemory::description`]. `None`: the
     /// row's fixed description.
@@ -984,7 +1010,17 @@ pub fn config_schema(set: &ConfigSet, facts: &RegistryFacts) -> Vec<ConfigGroup>
     let defaults = serialized(&Config::default());
     let core_row = |spec: &KeySpec| {
         let mut kind = spec.kind.row_kind_of(spec.key, facts, Some(&set.config));
-        let value = value_in(&current, spec.key, &kind);
+        let effect = &set.config.effect;
+        // The privacy rows show the values in force, which the legacy
+        // `on_failure` sets for each of them that is not set; their source
+        // (and the file overriding them) is then that of the legacy key
+        // ([`ConfigSet::source`]).
+        let value = match spec.key {
+            PRIVACY => ConfigValue::Bool(effect.privacy_on()),
+            PRIVACY_MODE => ConfigValue::Str(effect.privacy_mode_in_force().as_str().to_string()),
+            _ => value_in(&current, spec.key, &kind),
+        };
+        let source = set.source(spec.key);
         // The value in force is always an option.
         if let (RowKind::Enum { options }, ConfigValue::Str(v)) = (&mut kind, &value)
             && spec.kind == SpecKind::Runtime
@@ -1001,7 +1037,7 @@ pub fn config_schema(set: &ConfigSet, facts: &RegistryFacts) -> Vec<ConfigGroup>
             (OUTPUT_MODE, _) if facts.no_frame_generation => OUTPUT_MODE_NOTE_PLAIN.to_string(),
             _ => spec.description.to_string(),
         };
-        row(
+        let mut row = row(
             set,
             spec.key.to_string(),
             spec.label,
@@ -1011,8 +1047,15 @@ pub fn config_schema(set: &ConfigSet, facts: &RegistryFacts) -> Vec<ConfigGroup>
             default,
             spec.editable,
             spec.apply,
-            set.source(spec.key),
-        )
+            source,
+        );
+        // The mode means nothing while privacy is off: greyed, with the
+        // reason (an override's reason stays first).
+        if spec.key == PRIVACY_MODE && row.enabled && !effect.privacy_on() {
+            row.enabled = false;
+            row.disabled_reason = PRIVACY_OFF_REASON.to_string();
+        }
+        row
     };
     let modules = &set.config.modules;
     GROUPS

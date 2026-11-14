@@ -35,7 +35,7 @@ With both the Maxine and the ONNX module installed, `background` is provided by 
 
 The virtual camera held 30 fps with no dropped frame in every row. The blur adds about 25 to 27 % of one core at 1080p and about 16 % at 720p; the rest is the camera's own decode and conversion, which is the cost of an MJPEG camera in any case. This is a high-end laptop CPU: a machine with four low-power cores is expected to take two to three times as long per frame, which has not been measured. A 720p camera mode into a 720p output costs about 40 % less (25 % against 42 %); a 720p output from a 1080p camera does not, because the camera is still decoded at 1080p and then scaled (43 %). Method and the per-step figures: [../benchmarks/system-memory.md](../benchmarks/system-memory.md). `threads` in the module's table sets the CPU threads (see the module's [README](../../crates/obc-module-onnx/README.md)); more threads shorten a frame and cost more CPU in total.
 
-The privacy rules are the same as with CUDA: the room is never shown while an effect is on and cannot run (black frames by default, or the image of `[effect] on_failure`), the picture goes black at a start until the matte is ready, and turning the blur on mid-stream keeps the picture for under a frame on the CPU and then switches with no black frame ([ADR-0033](../adr/0033-system-memory-pipeline.md)).
+The privacy rules are the same as with CUDA: with privacy on (`[effect] privacy`) the room is never shown while an effect is on and cannot run (black frames, the away image or the last frame, by `privacy_mode`), the picture goes black at a start until the matte is ready, and with privacy off, the default, the camera is shown instead, and turning the blur on mid-stream keeps the picture for under a frame on the CPU and then switches with no black frame ([ADR-0033](../adr/0033-system-memory-pipeline.md)).
 
 ## 1. What you need
 
@@ -170,7 +170,7 @@ A change of either setting is a **switch** while the camera runs: the previous m
 
 **A switch that cannot load is refused, and the picture does not change.** If the new model or engine cannot start (a model file or replacement image that cannot be read, a stage that fails to load; an engine you chose that cannot run is not one of these, it falls back, section 4), the previous one keeps processing every frame: the picture stays the cut-out it was, never black and never the away image, and the effect stays ready. `Error` stays empty, and `Warning` says why, with the clause `<module>: <reason>; the previous setting keeps running`. The setting itself is not rewritten: what you chose stays chosen, and the settings keep showing it, so the engine that runs and the engine that is stored can differ until you act. The refused value is tried again only when you change it or apply the unchanged settings again; other changes meanwhile (turning a stage on, blur to replace, another camera) load against the model and engine that run. Turning the effect off, or a new camera format, ends the refusal.
 
-A refused value that is still stored is tried at the next camera start, where black or the away image is allowed: if it fails to load there, the effect fails as `on_failure` says. Set the setting back to avoid it.
+A refused value that is still stored is tried at the next camera start, where black or the away image is allowed: if it fails to load there, the effect fails as the privacy setting says. Set the setting back to avoid it.
 
 Each refused value is remembered separately: two values that both cannot load are not retried alternately, and selecting a background video does not try a refused value again. If the running chain is lost while a new setting is loading, the effect fails with the reason for the loss, not with the refusal.
 
@@ -191,9 +191,9 @@ On a laptop, `[video] memory = "system"` keeps the NVIDIA GPU out of the effect 
 
 The load says so: `Warning` gains the clause `<module name>: <Requested> was chosen and cannot run: <reason>; using <engine>`. The clause ends when a load runs the chosen engine, at stop, with a new camera format, and when the effect is turned off. A live switch to an engine that cannot run succeeds the same way, on the fallback; it is not a refused switch.
 
-Only when no later engine starts does the load fail, with `<Chosen> was chosen and cannot run: <reason>; no later engine could run it (<engine>: <reason>; ...)`, or without the list when no engine follows the chosen one (the CPU provider, the last), and `on_failure` applies. Turning the effect off and on again with such an engine stored therefore does not go black.
+Only when no later engine starts does the load fail, with `<Chosen> was chosen and cannot run: <reason>; no later engine could run it (<engine>: <reason>; ...)`, or without the list when no engine follows the chosen one (the CPU provider, the last), and the privacy setting applies. Turning the effect off and on again with such an engine stored therefore does not go black.
 
-**The matte never fails open.** As with Maxine, a frame that fails in the cut-out fails the whole chain and the effect follows `[effect] on_failure` (black by default): the raw camera image is never shown in place of a cut-out that failed. A model that fails to load leaves what was running as it was.
+**The matte never fails open.** As with Maxine, a frame that fails in the cut-out fails the whole chain and the effect follows the privacy setting (`[effect] privacy`, off by default; its `privacy_mode` says what is shown): with privacy on the raw camera image is never shown in place of a cut-out that failed, and with it off the camera is shown. A model that fails to load leaves what was running as it was.
 
 ### Measured on each engine
 

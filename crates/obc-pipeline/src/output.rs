@@ -75,7 +75,8 @@
 //! output stops, the element unloads its backend (with the context current)
 //! before the pipeline releases the CUDA context; on system-memory frames
 //! it makes no CUDA call, and an effect whose backend takes CUDA frames
-//! only fails with that reason (`on_failure` decides what is shown).
+//! only fails with that reason (the element's fallback decides what is
+//! shown).
 //!
 //! **Module stages.** Each entry of [`OutputConfig::module_stages`] adds
 //! one `obcmodule` element ([`crate::module`]) for the output's whole life,
@@ -105,7 +106,7 @@
 //! placeholder image (below) is marked with [`gst_obc::PLACEHOLDER_FLAG`];
 //! the black placeholder and every camera frame are not. The effect element
 //! and every module stage pass a marked frame downstream untouched (no
-//! replace, blur, crop, warm-up black or `on_failure` frame, no backend or
+//! replace, blur, crop, warm-up black or fallback frame, no backend or
 //! chain call, none of their state changed), so the image reaches the sink
 //! as it was decoded. The black placeholder still runs through them as
 //! before.

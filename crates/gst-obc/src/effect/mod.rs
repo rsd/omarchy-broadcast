@@ -13,7 +13,7 @@
 //!   `replace`), `blur-strength` (0 to 1, default 0.5; applies on the next
 //!   frame), `background` (an absolute path, or empty), `background-video`
 //!   (an absolute path, or empty; [`ObcEffect::set_background_video`]),
-//!   `on-failure` (`black`, `image`, `none`), `fallback-image` (an absolute
+//!   `on-failure` (`black`, `image`, `freeze`, `none`), `fallback-image` (an absolute
 //!   path, or empty); read-only `status`. The stackable stages have no
 //!   property: [`ObcEffect::apply`] sets them with the rest
 //!   ([`EffectSettings::stages`], each a [`StageId`](obc_backend::StageId)
@@ -51,7 +51,8 @@
 //!   switches to the stages alone).
 //! * **Failures** (no backend, a failed load, a frame or a background
 //!   image) set [`EffectStatus::Failed`]; the element then outputs black
-//!   (`on-failure=black`) or the input (`on-failure=none`). A backend
+//!   (`on-failure=black`), the away image (`image`), the frozen frame
+//!   (`freeze`) or the input (`on-failure=none`). A backend
 //!   taken away while running ([`ObcEffect::revoke_backend`]: its module
 //!   can no longer run the effect) is such a failure at once; the instance
 //!   is dropped, and a factory set after it loads again.
@@ -79,6 +80,14 @@
 //!   read, the frames are black; the reason is in
 //!   [`EffectStats::fallback_error`] and in the status message's
 //!   `fallback-image-error` field (empty while there is none).
+//! * **The frozen frame** (`on-failure=freeze`): every frame the element
+//!   would output black shows instead the last frame an effect processed,
+//!   copied into a new buffer with the frame's own timestamps, until the
+//!   effect processes a frame again or is turned off. Never the input, the
+//!   stages alone, a black or image frame, nor the placeholder image. With
+//!   no such frame yet (at a start, after new caps) it shows what `image`
+//!   shows. It survives a failure, a reload and a new source of the same
+//!   caps, and is dropped on new caps and on a stop.
 //! * **The video background** (`background-video`, replace only): a video
 //!   played in a loop behind the person
 //!   ([`crate::video_background`]: NVDEC into the element's own CUDA

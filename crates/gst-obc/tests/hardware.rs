@@ -761,6 +761,52 @@ fn gpu_a_start_or_a_new_source_while_the_effect_loads_is_black() {
     assert_eq!(get(&fake.log.wrong_context), 0);
 }
 
+/// With `on-failure=none` (privacy off) on CUDA frames the camera is shown
+/// as it is whenever the effect cannot run, byte for byte: at a start
+/// while it loads, on a new source while it loads, and after a failure.
+/// Never black.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_on_failure_none_shows_the_input_while_the_effect_loads_or_failed() {
+    let fake = FakeFactory::new(FakeConfig {
+        load_delay: Duration::from_millis(600),
+        ..FakeConfig::default()
+    });
+    let open = EffectSettings {
+        fallback: EffectFallback::None,
+        ..EffectSettings::of(EffectKind::Blur)
+    };
+    // A start: the input until the effect is ready.
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &open);
+    let warm = rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert!(warm.len() >= 5, "{warm:?}");
+    assert!(held_then(&warm, Seen::Input, Seen::FakeBlur), "{warm:?}");
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    rig.stop();
+
+    // none, then blur mid-stream, and a new source while it loads: the
+    // input on both sides of it.
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &EffectSettings::default());
+    assert_eq!(rig.frame(), Seen::Input);
+    rig.effect.apply(&open).unwrap();
+    assert_eq!(rig.frame(), Seen::Input);
+    assert_eq!(rig.effect.status(), EffectStatus::Loading);
+    assert_eq!(rig.frame_with(gst_obc::NEW_SOURCE_FLAG), Seen::Input);
+    let rest = rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert!(held_then(&rest, Seen::Input, Seen::FakeBlur), "{rest:?}");
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+
+    // A failure: the input, copied.
+    fake.set(|c| c.fail_process = Some("fake frame failure".into()));
+    assert_eq!(rig.frame(), Seen::Input);
+    assert!(failed(&rig));
+    assert_eq!(rig.frame(), Seen::Input);
+    assert_eq!(rig.input_now(), rig.input_bytes);
+    assert_eq!(rig.effect.stats().frames_black, 0, "never black");
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
 /// A white PNG of `width x height` for the fallback image (its NV12 in the
 /// rig's limited range: Y 235, U = V = 128).
 fn white_png(dir: &Path, width: u32, height: u32) -> std::path::PathBuf {
@@ -2888,6 +2934,309 @@ fn gpu_a_downstream_in_place_write_does_not_change_the_cached_frame() {
         3,
         "the module ran on every repeat"
     );
+    rig.stop();
+}
+
+/// Settings of `kind` with `on-failure=freeze`.
+fn frozen(kind: EffectKind) -> EffectSettings {
+    EffectSettings {
+        fallback: EffectFallback::Freeze,
+        ..EffectSettings::of(kind)
+    }
+}
+
+/// Every Y byte `y` and every chroma byte 128.
+fn is_flat(frame: &[u8], y: u8) -> bool {
+    let (luma, uv) = frame.split_at((W * H) as usize);
+    luma.iter().all(|b| *b == y) && uv.iter().all(|b| *b == 128)
+}
+
+/// `on-failure=freeze` on CUDA frames: wherever black would show, the
+/// last frame an effect processed (replace after blur: the replace frame),
+/// byte for byte, in a new buffer of the element's pool: a frame failure,
+/// a repeat, a new source, a module that lost its chain, a retry that
+/// fails to load and a revoked backend. Never the input; the frozen frames
+/// count as black.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_on_failure_freeze_repeats_the_last_processed_frame_never_the_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeFactory::new(FakeConfig::default());
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &frozen(EffectKind::Blur));
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+    let replace = EffectSettings {
+        background: Some(background(dir.path())),
+        ..frozen(EffectKind::Replace)
+    };
+    rig.effect.apply(&replace).unwrap();
+    let seen = rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert!(
+        seen.iter()
+            .all(|s| matches!(s, Seen::FakeBlur | Seen::FakeReplace)),
+        "{seen:?}"
+    );
+    let last = rig.bytes_with(gst::BufferFlags::empty());
+    assert_eq!(classify(&last, &rig.input_bytes), Seen::FakeReplace);
+
+    fake.set(|c| c.fail_process = Some("fake frame failure".into()));
+    let black = rig.effect.stats().frames_black;
+    assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), last);
+    assert!(failed(&rig));
+    let out = *rig.out_memory.lock().unwrap().last().unwrap();
+    assert_ne!(out, rig.in_memory, "a buffer of the element's pool");
+    for flags in [
+        gst::BufferFlags::empty(),
+        gst_obc::REPEAT_FLAG,
+        gst_obc::NEW_SOURCE_FLAG,
+        gst::BufferFlags::empty(),
+    ] {
+        assert_eq!(rig.bytes_with(flags), last, "{flags:?}");
+    }
+    assert_eq!(rig.effect.stats().frames_black, black + 5);
+
+    // Healthy again, then a module that loses its chain mid-session, then a
+    // retry that fails to load with nothing loaded: frozen throughout.
+    fake.set(|c| c.fail_process = None);
+    rig.effect.apply(&replace).unwrap();
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeReplace);
+    fake.set(|c| c.lose_chain_on_process = Some("the module panicked".into()));
+    assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), last);
+    assert!(failed(&rig));
+    fake.set(|c| {
+        c.fail_load = Some("fake load failure".into());
+        c.load_delay = Duration::from_millis(200);
+    });
+    rig.effect.apply(&replace).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rig.effect.status() != EffectStatus::Failed("fake load failure".into()) {
+        assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), last);
+        assert!(Instant::now() < deadline, "the retry never failed");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), last);
+    rig.effect.revoke_backend();
+    assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), last);
+
+    // The effect turned off: the camera, as the user asked.
+    rig.effect
+        .apply(&EffectSettings {
+            fallback: EffectFallback::Freeze,
+            ..EffectSettings::default()
+        })
+        .unwrap();
+    assert_eq!(rig.frame(), Seen::Input);
+    assert_eq!(rig.input_now(), rig.input_bytes);
+    assert_eq!(rig.caps_events.load(Ordering::SeqCst), 1);
+    rig.stop();
+    assert!(!rig.effect.stats().cuda_active);
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
+/// The frozen frame does not outlive the camera shown as it is, on CUDA
+/// frames: once the effect is turned off (the input) and on again (the
+/// input while it loads), a failure shows black, never the effect frame
+/// from before.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_the_input_shown_drops_the_frozen_frame() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let settings = frozen(EffectKind::Blur);
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &settings);
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    assert_eq!(rig.frame(), Seen::FakeBlur);
+
+    rig.effect
+        .apply(&EffectSettings {
+            fallback: EffectFallback::Freeze,
+            ..EffectSettings::default()
+        })
+        .unwrap();
+    assert_eq!(rig.frame(), Seen::Input);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while get(&fake.log.unloads) == 0 {
+        assert!(Instant::now() < deadline, "no unload");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    fake.set(|c| {
+        c.fail_load = Some("fake load failure".into());
+        c.load_delay = Duration::from_millis(200);
+    });
+    rig.effect.apply(&settings).unwrap();
+    let seen = rig.frames_until(Duration::from_secs(10), failed);
+    assert!(held_then(&seen, Seen::Input, Seen::Black), "{seen:?}");
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::Black);
+    }
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
+/// `on-failure=freeze` on CUDA frames with nothing processed yet (a start
+/// whose load fails): the away image once decoded, black before it, and
+/// black without one.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_freeze_with_nothing_processed_shows_the_image_or_black() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = white_png(dir.path(), 400, 400);
+    let fake = FakeFactory::new(FakeConfig {
+        fail_load: Some("fake load failure".into()),
+        ..FakeConfig::default()
+    });
+    let with_image = EffectSettings {
+        fallback_image: Some(image),
+        ..frozen(EffectKind::Blur)
+    };
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &with_image);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let bytes = rig.bytes_with(gst::BufferFlags::empty());
+        if is_white(&bytes) && failed(&rig) {
+            break;
+        }
+        assert!(
+            is_white(&bytes) || classify(&bytes, &rig.input_bytes) == Seen::Black,
+            "only black or the image: {:?}",
+            classify(&bytes, &rig.input_bytes)
+        );
+        assert!(Instant::now() < deadline, "the image never showed");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    for _ in 0..3 {
+        assert!(is_white(&rig.bytes_with(gst::BufferFlags::empty())));
+    }
+    assert_eq!(rig.effect.stats().fallback_error, None);
+    rig.stop();
+
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &frozen(EffectKind::Blur));
+    let seen = rig.frames_until(Duration::from_secs(10), failed);
+    assert!(seen.iter().all(|s| *s == Seen::Black), "{seen:?}");
+    for _ in 0..3 {
+        assert_eq!(rig.frame(), Seen::Black);
+    }
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
+/// New caps on CUDA frames (another colour range) drop the frozen frame:
+/// the frames after them are black of the new range, never the old frame.
+/// The chain is lost first, so no frame of the new caps is processed.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_new_caps_drop_the_frozen_frame() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &frozen(EffectKind::Blur));
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    let last = rig.bytes_with(gst::BufferFlags::empty());
+    assert_eq!(classify(&last, &rig.input_bytes), Seen::FakeBlur);
+    fake.set(|c| c.lose_chain_on_process = Some("the module panicked".into()));
+    assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), last);
+    assert!(failed(&rig));
+
+    fake.set(|c| c.fail_load = Some("fake load failure".into()));
+    let full: gst::Caps = CANONICAL
+        .replace("colorimetry=2:4:5:1", "colorimetry=1:4:5:1")
+        .parse()
+        .unwrap();
+    assert_ne!(full, CANONICAL.parse::<gst::Caps>().unwrap());
+    rig.src.set_caps(Some(&full));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let bytes = rig.bytes_with(gst::BufferFlags::empty());
+        assert!(
+            is_flat(&bytes, 0),
+            "full-range black: {:?}",
+            classify(&bytes, &rig.input_bytes)
+        );
+        if rig.effect.status() == EffectStatus::Failed("fake load failure".into()) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the reload never failed");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    for _ in 0..3 {
+        assert!(is_flat(&rig.bytes_with(gst::BufferFlags::empty()), 0));
+    }
+    rig.stop();
+    assert_eq!(get(&fake.log.wrong_context), 0);
+}
+
+/// The placeholder image passes through on CUDA frames and never becomes
+/// the frozen frame.
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_placeholder_frame_never_becomes_the_frozen_frame() {
+    let fake = FakeFactory::new(FakeConfig::default());
+    let mut rig = Rig::new(Some(Arc::clone(&fake)), &frozen(EffectKind::Blur));
+    rig.frames_until(Duration::from_secs(10), status_is(EffectStatus::Ready));
+    let last = rig.bytes_with(gst::BufferFlags::empty());
+    assert_eq!(classify(&last, &rig.input_bytes), Seen::FakeBlur);
+    for _ in 0..3 {
+        assert_eq!(rig.frame_with(gst_obc::PLACEHOLDER_FLAG), Seen::Input);
+    }
+    fake.set(|c| c.fail_process = Some("fake frame failure".into()));
+    assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), last);
+    assert!(failed(&rig));
+    assert_eq!(rig.frame_with(gst_obc::PLACEHOLDER_FLAG), Seen::Input);
+    assert_eq!(rig.bytes_with(gst::BufferFlags::empty()), last);
+    rig.stop();
+}
+
+/// The frozen frame is the buffer the effect pushed, held without a copy:
+/// a module downstream that writes in place writes into a copy of it, so
+/// every frozen frame it gets is the effect's frame, bumped once by the
+/// module (never twice).
+#[test]
+#[ignore = "needs an NVIDIA GPU with the GStreamer CUDA elements"]
+fn gpu_a_downstream_in_place_write_does_not_change_the_frozen_frame() {
+    use fake_chain::{FAKE_BUMP_Y, FakeChainConfig, FakeChainFactory};
+    gst_obc::module::register().unwrap();
+    let fake = FakeFactory::new(FakeConfig::default());
+    let mut rig = Rig::with_downstream(
+        Some(Arc::clone(&fake) as Arc<dyn BackendFactory>),
+        &frozen(EffectKind::Blur),
+        "obcmodule name=m ! ",
+    );
+    let module = rig
+        .pipeline
+        .by_name("m")
+        .unwrap()
+        .downcast::<gst_obc::ObcModule>()
+        .unwrap();
+    let chain = FakeChainFactory::cuda(FakeChainConfig::default());
+    module.set_factory(Some(
+        Arc::clone(&chain) as Arc<dyn obc_backend::StageChainFactory>
+    ));
+    module
+        .apply(&[StageRequest::on(StageId::new("bump").unwrap())])
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rig.effect.status() != EffectStatus::Ready
+        || module.stage_status("bump") != EffectStatus::Ready
+    {
+        assert!(Instant::now() < deadline, "not ready");
+        rig.frame();
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let once = FAKE_BLUR_Y.wrapping_add(FAKE_BUMP_Y);
+    assert!(is_flat(&rig.bytes_with(gst::BufferFlags::empty()), once));
+    fake.set(|c| c.fail_process = Some("fake frame failure".into()));
+    for flags in [
+        gst::BufferFlags::empty(),
+        gst_obc::REPEAT_FLAG,
+        gst::BufferFlags::empty(),
+    ] {
+        let out = rig.bytes_with(flags);
+        assert!(
+            is_flat(&out, once),
+            "the frozen frame changed: Y {}",
+            out[0]
+        );
+    }
+    assert!(failed(&rig));
     rig.stop();
 }
 
