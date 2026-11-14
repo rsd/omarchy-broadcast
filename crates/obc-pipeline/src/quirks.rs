@@ -55,14 +55,10 @@ impl RangeQuirk {
 }
 
 /// Measured: luma spans 0–255 (or close to it) on a static, well-lit scene
-/// under a limited label (a survey of the cameras at hand, 2026-11-13; the MX Brio
-/// earlier, see `docs/architecture.md`, Known limitations).
+/// under a limited label (a survey of the cameras at hand, 2026-11-13). The
+/// Logitech MX Brio is not listed: re-measured on 2026-11-14, its YUYV and
+/// NV12 are limited range, as labelled.
 pub const RANGE_QUIRKS: &[RangeQuirk] = &[
-    RangeQuirk {
-        usb: usb(0x046d, 0x0944),
-        formats: &[PixelFormat::Yuy2, PixelFormat::Nv12],
-        model: "Logitech MX Brio",
-    },
     RangeQuirk {
         usb: usb(0x1b3f, 0x2002),
         formats: &[PixelFormat::Yuy2],
@@ -243,8 +239,9 @@ mod tests {
             Some(GENERALPLUS),
             PixelFormat::Yuy2
         ));
-        assert!(full_range_despite_label(Some(BRIO), PixelFormat::Yuy2));
-        assert!(full_range_despite_label(Some(BRIO), PixelFormat::Nv12));
+        // A correctly labelled camera (the MX Brio, measured): no row.
+        assert!(!full_range_despite_label(Some(BRIO), PixelFormat::Yuy2));
+        assert!(!full_range_despite_label(Some(BRIO), PixelFormat::Nv12));
         // Decoded MJPEG is full range and labelled so: never a quirk.
         assert!(!full_range_despite_label(
             Some(GENERALPLUS),

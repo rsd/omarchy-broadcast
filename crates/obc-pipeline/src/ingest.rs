@@ -2224,7 +2224,7 @@ mod camera_head_tests {
 
     /// The elements the camera head builds, per range fix: a quirk camera
     /// gets the relabel right after its capsfilter in CUDA memory (on the
-    /// CPU convert and the GPU-direct path alike) and under a full
+    /// CPU convert path) and under a full
     /// contract, the levels after the queue in system memory under a
     /// limited one; a camera with no row, or MJPEG, gets neither. Built,
     /// not started (no CUDA element is in the head).
@@ -2265,17 +2265,25 @@ mod camera_head_tests {
                 INGEST_CAPS
             ]
         );
+        // A second row (Generalplus, YUY2) gets the same relabel.
         assert_eq!(
             head(
-                PixelFormat::Nv12,
+                yuy2,
                 VideoMemory::Cuda,
                 Limited,
                 Some(UsbId {
-                    vendor: 0x046d,
-                    product: 0x0944
+                    vendor: 0x1b3f,
+                    product: 0x2002
                 })
             ),
-            [CAMERA, CAMERA_CAPS, RANGE_QUIRK_RELABEL, QUEUE]
+            [
+                CAMERA,
+                CAMERA_CAPS,
+                RANGE_QUIRK_RELABEL,
+                QUEUE,
+                INGEST_CONVERT,
+                INGEST_CAPS
+            ]
         );
         assert_eq!(
             head(yuy2, VideoMemory::System, Limited, Some(VX800)),
