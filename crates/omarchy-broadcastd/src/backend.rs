@@ -756,9 +756,9 @@ pub trait MediaBackend: Send + 'static {
     fn power_profile(&mut self) -> PowerProfile;
 
     /// Whether power-profiles-daemon's profile is followed (the battery
-    /// saver's mode is `power_profile`): its watcher runs only then
-    /// ([`crate::power::ProfileCache::follow`]). Cheap, called at each read
-    /// of the power state.
+    /// saver's mode is `power_profile` or `auto`): its watcher runs only
+    /// then ([`crate::power::ProfileCache::follow`]). Cheap, called at each
+    /// read of the power state.
     fn follow_power_profile(&mut self, on: bool);
 
     /// Opens `camera`'s node for its controls (for writing as well when

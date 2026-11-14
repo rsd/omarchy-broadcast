@@ -37,12 +37,13 @@
 //!
 //! **Battery saver.** Under `auto` with CUDA usable, a camera start runs in
 //! system memory while the battery saver is active (`[video]
-//! battery_saver`: on battery, on power-profiles-daemon's `power-saver`
-//! profile, or always; [`obc_core::battery_saver`]), so that the NVIDIA GPU
+//! battery_saver`: on battery or on power-profiles-daemon's `power-saver`
+//! profile (`auto`, the default), on either alone, or always;
+//! [`obc_core::battery_saver`]), so that the NVIDIA GPU
 //! is not woken. The power supplies are read at each camera start and
 //! reload ([`MediaBackend::power_source`]), the profile is the cached one
 //! its watcher keeps ([`MediaBackend::power_profile`], no D-Bus wait; the
-//! watcher runs only under `power_profile`,
+//! watcher runs only under `power_profile` and `auto`,
 //! [`MediaBackend::follow_power_profile`]). The power state is read again
 //! every [`POWER_POLL`] while a session runs and every [`POWER_POLL_IDLE`]
 //! while idle, and at each change of the profile
@@ -9483,20 +9484,23 @@ fn effective_memory(
 
 /// The battery saver's state under `config` and the power supplies it was
 /// read from: the supplies are read now, power-profiles-daemon's profile
-/// is the backend's cached one (only under `power_profile`).
+/// is the backend's cached one (only under `power_profile` and `auto`).
 fn saver_of<B: MediaBackend>(backend: &mut B, config: &Config) -> (SaverState, PowerSource) {
-    use obc_core::battery_saver::{BatterySaver, PowerProfile};
+    use obc_core::battery_saver::PowerProfile;
     let mode = config.video.battery_saver;
-    let power = match mode {
-        BatterySaver::OnBattery | BatterySaver::PowerProfile => backend.power_source(),
-        // Not read: nothing of it is used.
-        BatterySaver::Off | BatterySaver::Always => PowerSource::External,
+    let reads_profile = mode.reads_power_profile();
+    // Not read: nothing of it is used.
+    let power = if mode.reads_power_source() {
+        backend.power_source()
+    } else {
+        PowerSource::External
     };
     // power-profiles-daemon is followed only while a mode reads it.
-    backend.follow_power_profile(mode == BatterySaver::PowerProfile);
-    let profile = match mode {
-        BatterySaver::PowerProfile => backend.power_profile(),
-        _ => PowerProfile::Unavailable,
+    backend.follow_power_profile(reads_profile);
+    let profile = if reads_profile {
+        backend.power_profile()
+    } else {
+        PowerProfile::Unavailable
     };
     (saver_state(mode, &power, &profile), power)
 }

@@ -869,8 +869,8 @@ fn the_battery_saver_row_offers_the_modes_and_states_the_saver_now() {
     let groups = config_schema(&set, &facts());
     let r = find(&groups, BATTERY_SAVER);
     assert_eq!(r.label, "Battery saver");
-    assert_eq!(r.value, ConfigValue::Str("on_battery".into()));
-    assert_eq!(r.default, Some(ConfigValue::Str("on_battery".into())));
+    assert_eq!(r.value, ConfigValue::Str("auto".into()));
+    assert_eq!(r.default, Some(ConfigValue::Str("auto".into())));
     assert!(r.editable && r.enabled, "{r:?}");
     assert_eq!(r.disabled_reason, "");
     assert_eq!(r.notice, "");
@@ -885,6 +885,7 @@ fn the_battery_saver_row_offers_the_modes_and_states_the_saver_now() {
             .collect::<Vec<_>>(),
         [
             ("off", "Off"),
+            ("auto", "On battery or power saver"),
             ("on_battery", "On battery"),
             ("power_profile", "Follow the power profile"),
             ("always", "Always"),
@@ -972,7 +973,7 @@ fn a_battery_saver_write_is_checked_against_its_options() {
     );
     let e = to_toml(BATTERY_SAVER, &info.kind, &ConfigValue::Str("on".into())).unwrap_err();
     assert!(
-        e.contains("\"on\" is not one of: off, on_battery, power_profile, always"),
+        e.contains("\"on\" is not one of: off, auto, on_battery, power_profile, always"),
         "{e}"
     );
 }

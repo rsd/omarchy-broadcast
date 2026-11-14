@@ -149,8 +149,16 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// ([`CAMERA_HEALTH_REVISION`]). Revision 21 made privacy an option,
 /// off by default, with no new member ([`PRIVACY_REVISION`]). Revision 22
 /// added the battery saver, with no new member
-/// ([`BATTERY_SAVER_REVISION`]).
-pub const INTERFACE_REVISION: u32 = 22;
+/// ([`BATTERY_SAVER_REVISION`]). Revision 23 added the battery saver's
+/// `auto` mode, now the default, with no new member
+/// ([`BATTERY_SAVER_AUTO_REVISION`]).
+pub const INTERFACE_REVISION: u32 = 23;
+/// The first [`INTERFACE_REVISION`] where `video.battery_saver` accepts
+/// `auto`, and no new member: the saver is active on battery or while
+/// power-profiles-daemon's active profile is `power-saver` (as `on_battery`
+/// when that service is not running). `auto` is the default from this
+/// revision on; before, `on_battery` was.
+pub const BATTERY_SAVER_AUTO_REVISION: u32 = 23;
 /// The first [`INTERFACE_REVISION`] with the battery saver, and no new
 /// member: the config row `video.battery_saver` (`off`, `on_battery`,
 /// `power_profile` or `always`: when `video.memory = "auto"` runs the next
@@ -1381,7 +1389,8 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, BATTERY_SAVER_REVISION);
+        assert_eq!(INTERFACE_REVISION, BATTERY_SAVER_AUTO_REVISION);
+        const { assert!(BATTERY_SAVER_REVISION < BATTERY_SAVER_AUTO_REVISION) };
         const { assert!(PRIVACY_REVISION < BATTERY_SAVER_REVISION) };
         const { assert!(CAMERA_HEALTH_REVISION < PRIVACY_REVISION) };
         const { assert!(CPU_CONVERT_REVISION < CAMERA_HEALTH_REVISION) };

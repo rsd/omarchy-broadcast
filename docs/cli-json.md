@@ -358,7 +358,7 @@ omarchy-broadcast config files [--json]
     output.placeholder = black  (When there is no camera picture; default; applies at once)
   Video processing
     video.memory = auto  (Video memory; default; applies at the next camera start)
-    video.battery_saver = on_battery  (Battery saver; default; Applies when the camera restarts)
+    video.battery_saver = auto  (Battery saver; default; Applies when the camera restarts)
   Effect
     effect.privacy = false  (Hide the camera when an effect can't run; default; applies at once)
     effect.privacy_mode = black  (Show instead of the camera; default; Turn on "Hide the camera when an effect can't run" to change this; applies at once)

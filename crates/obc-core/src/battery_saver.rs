@@ -1,6 +1,8 @@
 //! The battery saver (`[video] battery_saver`): under `video.memory =
 //! "auto"`, a camera session runs in system memory while the saver is
-//! active, so that the NVIDIA GPU is never woken for it. This module holds
+//! active, so that the NVIDIA GPU is never woken for it. The default mode,
+//! `auto`, activates it on battery or on power-profiles-daemon's
+//! `power-saver` profile. This module holds
 //! the decision from what the daemon reads of the machine (the power
 //! supplies, power-profiles-daemon's active profile), and the words the
 //! configuration row and the log use for it. Reading the machine is the
@@ -17,8 +19,12 @@ use crate::config_schema::DESCRIPTION_MAX;
 pub enum BatterySaver {
     /// Never.
     Off,
-    /// While the machine runs on its battery.
+    /// While the machine runs on its battery, or power-profiles-daemon's
+    /// active profile is `power-saver`; as [`BatterySaver::OnBattery`]
+    /// when that service is not running. The default.
     #[default]
+    Auto,
+    /// While the machine runs on its battery.
     OnBattery,
     /// While power-profiles-daemon's active profile is `power-saver`; as
     /// [`BatterySaver::OnBattery`] when that service is not running.
@@ -28,14 +34,35 @@ pub enum BatterySaver {
 }
 
 impl BatterySaver {
-    /// The configuration's spelling: `off`, `on_battery`,
+    /// The configuration's spelling: `off`, `auto`, `on_battery`,
     /// `power_profile`, `always`.
     pub fn as_str(self) -> &'static str {
         match self {
             BatterySaver::Off => "off",
+            BatterySaver::Auto => "auto",
             BatterySaver::OnBattery => "on_battery",
             BatterySaver::PowerProfile => "power_profile",
             BatterySaver::Always => "always",
+        }
+    }
+
+    /// Whether the mode reads the power supplies: `on_battery`,
+    /// `power_profile` (its fallback) and `auto`. The one place that says
+    /// so: [`saver_state`] ignores what a mode does not read.
+    pub fn reads_power_source(self) -> bool {
+        match self {
+            BatterySaver::OnBattery | BatterySaver::PowerProfile | BatterySaver::Auto => true,
+            BatterySaver::Off | BatterySaver::Always => false,
+        }
+    }
+
+    /// Whether the mode reads power-profiles-daemon's profile:
+    /// `power_profile` and `auto`. The daemon follows the service only
+    /// then.
+    pub fn reads_power_profile(self) -> bool {
+        match self {
+            BatterySaver::PowerProfile | BatterySaver::Auto => true,
+            BatterySaver::Off | BatterySaver::OnBattery | BatterySaver::Always => false,
         }
     }
 }
@@ -65,7 +92,7 @@ pub enum PowerProfile {
 }
 
 /// The profile of power-profiles-daemon that activates the saver under
-/// [`BatterySaver::PowerProfile`].
+/// [`BatterySaver::PowerProfile`] and [`BatterySaver::Auto`].
 pub const POWER_SAVER_PROFILE: &str = "power-saver";
 
 /// Whether the battery saver is active, and why ([`saver_state`]).
@@ -77,60 +104,91 @@ pub struct SaverState {
     /// camera session runs in system memory.
     pub active: bool,
     /// Why, as a user reads it: `on battery`, `on AC power`, `no
-    /// battery`, `power profile power-saver`, `always`, `turned off`.
+    /// battery`, `power profile power-saver`, `always`, `turned off`;
+    /// under [`BatterySaver::Auto`] while inactive, both facts, such as
+    /// `on AC power, power profile balanced`.
     pub why: String,
-    /// Under [`BatterySaver::PowerProfile`]: power-profiles-daemon is not
-    /// running, so the battery is followed instead.
+    /// Under [`BatterySaver::PowerProfile`] or [`BatterySaver::Auto`]:
+    /// power-profiles-daemon is not running, so the battery is followed
+    /// instead.
     pub no_power_profiles: bool,
 }
 
 impl Default for SaverState {
-    /// Inactive, under the default mode, on AC power.
+    /// Inactive, under the default mode, on AC power: nothing read yet, so
+    /// nothing is claimed of power-profiles-daemon.
     fn default() -> Self {
-        saver_state(
-            BatterySaver::default(),
-            &PowerSource::External,
-            &PowerProfile::Unavailable,
-        )
+        SaverState {
+            mode: BatterySaver::default(),
+            active: false,
+            why: battery_why(&PowerSource::External).to_string(),
+            no_power_profiles: false,
+        }
     }
+}
+
+/// Whether the power supplies activate the saver: on battery only.
+fn battery_triggers(power: &PowerSource) -> bool {
+    matches!(power, PowerSource::Battery)
+}
+
+/// What the power supplies are, as a user reads it. Supplies that could
+/// not be read are taken as AC power.
+fn battery_why(power: &PowerSource) -> &'static str {
+    match power {
+        PowerSource::Battery => "on battery",
+        PowerSource::External => "on AC power",
+        PowerSource::NoBattery => "no battery",
+        PowerSource::Unreadable(_) => "the power supply could not be read, taken as AC power",
+    }
+}
+
+/// Whether power-profiles-daemon's profile `p` activates the saver.
+fn profile_triggers(p: &str) -> bool {
+    p == POWER_SAVER_PROFILE
+}
+
+/// What power-profiles-daemon's profile `p` is, as a user reads it.
+fn profile_why(p: &str) -> String {
+    format!("power profile {p}")
 }
 
 /// The saver's state under `mode`, given the power supplies and
 /// power-profiles-daemon's profile. `on_battery` follows `power`;
-/// `power_profile` follows `profile` (active on [`POWER_SAVER_PROFILE`]),
-/// and `power` when power-profiles-daemon is unavailable; `off` and
-/// `always` are what they say. Supplies that could not be read are taken
-/// as AC power.
+/// `power_profile` follows `profile` (active on [`POWER_SAVER_PROFILE`]);
+/// `auto` follows both, the battery named first when both activate it;
+/// `power_profile` and `auto` follow `power` alone when
+/// power-profiles-daemon is unavailable; `off` and `always` are what they
+/// say. Supplies that could not be read are taken as AC power.
 pub fn saver_state(mode: BatterySaver, power: &PowerSource, profile: &PowerProfile) -> SaverState {
-    let state = |active: bool, why: &str, no_power_profiles: bool| SaverState {
+    let state = |active: bool, why: String, no_power_profiles: bool| SaverState {
         mode,
         active,
-        why: why.to_string(),
+        why,
         no_power_profiles,
     };
-    let by_battery = |no_power_profiles: bool| match power {
-        PowerSource::Battery => state(true, "on battery", no_power_profiles),
-        PowerSource::External => state(false, "on AC power", no_power_profiles),
-        PowerSource::NoBattery => state(false, "no battery", no_power_profiles),
-        PowerSource::Unreadable(_) => state(
-            false,
-            "the power supply could not be read, taken as AC power",
-            no_power_profiles,
-        ),
-    };
-    match mode {
-        BatterySaver::Off => state(false, "turned off", false),
-        BatterySaver::Always => state(true, "always", false),
-        BatterySaver::OnBattery => by_battery(false),
-        BatterySaver::PowerProfile => match profile {
-            PowerProfile::Active(p) => SaverState {
-                mode,
-                active: p == POWER_SAVER_PROFILE,
-                why: format!("power profile {p}"),
-                no_power_profiles: false,
-            },
-            PowerProfile::Unavailable => by_battery(true),
-        },
+    let by_battery =
+        |missing: bool| state(battery_triggers(power), battery_why(power).into(), missing);
+    match (mode, profile) {
+        (BatterySaver::Off, _) => state(false, "turned off".into(), false),
+        (BatterySaver::Always, _) => state(true, "always".into(), false),
+        (BatterySaver::OnBattery, _) => by_battery(false),
+        (BatterySaver::PowerProfile | BatterySaver::Auto, PowerProfile::Unavailable) => {
+            by_battery(true)
+        }
+        (BatterySaver::PowerProfile, PowerProfile::Active(p)) => {
+            state(profile_triggers(p), profile_why(p), false)
+        }
+        (BatterySaver::Auto, PowerProfile::Active(p)) => {
+            if battery_triggers(power) {
+                by_battery(false)
+            } else if profile_triggers(p) {
+                state(true, profile_why(p), false)
+            } else {
+                let why = format!("{}, {}", battery_why(power), profile_why(p));
+                state(false, why, false)
+            }
+        }
     }
 }
 
@@ -216,6 +274,7 @@ mod tests {
     fn the_modes_parse_as_spelled() {
         for mode in [
             BatterySaver::Off,
+            BatterySaver::Auto,
             BatterySaver::OnBattery,
             BatterySaver::PowerProfile,
             BatterySaver::Always,
@@ -227,7 +286,152 @@ mod tests {
             }
             assert_eq!(toml::from_str::<M>(&text).unwrap().m, mode);
         }
-        assert_eq!(BatterySaver::default(), BatterySaver::OnBattery);
+        assert_eq!(BatterySaver::Auto.as_str(), "auto");
+        assert_eq!(BatterySaver::default(), BatterySaver::Auto);
+    }
+
+    #[test]
+    fn each_mode_reads_what_it_follows() {
+        let modes = [
+            (BatterySaver::Off, false, false),
+            (BatterySaver::Auto, true, true),
+            (BatterySaver::OnBattery, true, false),
+            (BatterySaver::PowerProfile, true, true),
+            (BatterySaver::Always, false, false),
+        ];
+        for (mode, power, profile) in modes {
+            assert_eq!(mode.reads_power_source(), power, "{mode:?}");
+            assert_eq!(mode.reads_power_profile(), profile, "{mode:?}");
+        }
+        // What a mode does not read changes nothing of its state.
+        let profiles = [
+            PowerProfile::Unavailable,
+            PowerProfile::Active("power-saver".into()),
+            PowerProfile::Active("balanced".into()),
+        ];
+        for (mode, power, profile) in modes {
+            for p in &ALL {
+                for pr in &profiles {
+                    let read_p = if power { p } else { &PowerSource::External };
+                    let read_pr = if profile {
+                        pr
+                    } else {
+                        &PowerProfile::Unavailable
+                    };
+                    assert_eq!(
+                        saver_state(mode, p, pr),
+                        saver_state(mode, read_p, read_pr),
+                        "{mode:?} {p:?} {pr:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_state_is_inactive_on_ac_and_claims_nothing_of_the_profile() {
+        let d = SaverState::default();
+        assert_eq!(d.mode, BatterySaver::Auto);
+        assert!(!d.active);
+        assert_eq!(d.why, "on AC power");
+        assert!(!d.no_power_profiles);
+    }
+
+    #[test]
+    fn auto_follows_the_battery_or_the_power_saver_profile() {
+        let saver = PowerProfile::Active("power-saver".into());
+        let balanced = PowerProfile::Active("balanced".into());
+        let unreadable = "the power supply could not be read, taken as AC power";
+        let cases: [(PowerSource, &PowerProfile, bool, String); 8] = [
+            // Battery wins the wording when both hold.
+            (PowerSource::Battery, &saver, true, "on battery".into()),
+            (PowerSource::Battery, &balanced, true, "on battery".into()),
+            (
+                PowerSource::External,
+                &saver,
+                true,
+                "power profile power-saver".into(),
+            ),
+            (
+                PowerSource::External,
+                &balanced,
+                false,
+                "on AC power, power profile balanced".into(),
+            ),
+            (
+                PowerSource::NoBattery,
+                &saver,
+                true,
+                "power profile power-saver".into(),
+            ),
+            (
+                PowerSource::NoBattery,
+                &balanced,
+                false,
+                "no battery, power profile balanced".into(),
+            ),
+            (
+                PowerSource::Unreadable("EIO".into()),
+                &saver,
+                true,
+                "power profile power-saver".into(),
+            ),
+            (
+                PowerSource::Unreadable("EIO".into()),
+                &balanced,
+                false,
+                format!("{unreadable}, power profile balanced"),
+            ),
+        ];
+        for (power, profile, active, why) in cases {
+            let s = saver_state(BatterySaver::Auto, &power, profile);
+            assert_eq!((s.active, &s.why), (active, &why), "{power:?} {profile:?}");
+            assert!(!s.no_power_profiles, "{power:?} {profile:?}");
+            assert_eq!(s.mode, BatterySaver::Auto);
+        }
+        // Without the service: as `on_battery`, and it says so.
+        for p in &ALL {
+            let s = saver_state(BatterySaver::Auto, p, &PowerProfile::Unavailable);
+            let b = saver_state(BatterySaver::OnBattery, p, &PowerProfile::Unavailable);
+            assert_eq!((s.active, &s.why), (b.active, &b.why));
+            assert!(s.no_power_profiles);
+        }
+        assert_eq!(
+            saver_state(BatterySaver::Auto, &PowerSource::External, &saver).memory_reason(),
+            "battery saver, power profile power-saver"
+        );
+    }
+
+    #[test]
+    fn auto_rows_keep_the_fixed_part_in_the_common_cases() {
+        let row = |power: PowerSource, profile: &str| {
+            saver_state(
+                BatterySaver::Auto,
+                &power,
+                &PowerProfile::Active(profile.into()),
+            )
+            .description(MemoryChoice::Auto)
+        };
+        for power in [
+            PowerSource::Battery,
+            PowerSource::External,
+            PowerSource::NoBattery,
+        ] {
+            for profile in ["power-saver", "balanced", "performance"] {
+                let d = row(power.clone(), profile);
+                assert!(d.starts_with(BATTERY_SAVER_ABOUT), "{d}");
+                assert!(d.len() <= DESCRIPTION_MAX, "{} bytes: {d}", d.len());
+            }
+        }
+        assert_eq!(
+            row(PowerSource::External, "balanced"),
+            "Keeps the NVIDIA GPU asleep by processing video in system memory. \
+             Now: inactive, on AC power, power profile balanced."
+        );
+        // Too long with the fixed part: shortened, still said.
+        let d = row(PowerSource::Unreadable("EIO".into()), "performance");
+        assert!(d.len() <= DESCRIPTION_MAX, "{} bytes: {d}", d.len());
+        assert!(d.contains("power profile performance"), "{d}");
     }
 
     #[test]

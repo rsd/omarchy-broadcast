@@ -16444,6 +16444,12 @@ use obc_module_host::registry::REASON_BATTERY_SAVER;
 const SAVER: &str = "video.battery_saver";
 const RESTARTS: &str = "Applies when the camera restarts";
 
+/// power-profiles-daemon running on its `balanced` profile: under the
+/// default mode, `auto`, the battery alone decides then.
+fn balanced() -> PowerProfile {
+    PowerProfile::Active("balanced".into())
+}
+
 impl H {
     /// The `video.battery_saver` row's notice.
     fn saver_notice(&mut self) -> String {
@@ -16453,7 +16459,11 @@ impl H {
 
 #[test]
 fn on_battery_a_start_runs_in_system_memory_and_wakes_no_gpu() {
-    let mut h = H::new("", |w| w.power_source = PowerSource::Battery);
+    // The default mode, `auto`, with power-profiles-daemon on `balanced`.
+    let mut h = H::new("", |w| {
+        w.power_source = PowerSource::Battery;
+        w.power_profile = balanced();
+    });
     let lines = crate::log::take_lines();
     assert_eq!(
         lines
@@ -16505,19 +16515,21 @@ fn each_mode_and_power_state_decides_the_memory_only_under_auto() {
         PowerProfile::Active("power-saver".into()),
         PowerProfile::Active("balanced".into()),
     ];
-    for mode in ["off", "on_battery", "power_profile", "always"] {
+    for mode in ["off", "auto", "on_battery", "power_profile", "always"] {
         for power in &powers {
             for profile in &profiles {
                 for choice in ["auto", "cuda", "system"] {
                     let on_battery = *power == PowerSource::Battery;
+                    let by_profile = match profile {
+                        PowerProfile::Active(p) => p == "power-saver",
+                        PowerProfile::Unavailable => on_battery,
+                    };
                     let saving = match mode {
                         "off" => false,
                         "always" => true,
                         "on_battery" => on_battery,
-                        _ => match profile {
-                            PowerProfile::Active(p) => p == "power-saver",
-                            PowerProfile::Unavailable => on_battery,
-                        },
+                        "auto" => on_battery || by_profile,
+                        _ => by_profile,
                     };
                     let want = match choice {
                         "cuda" => Cuda,
@@ -16556,14 +16568,14 @@ fn the_saver_row_is_greyed_unless_video_memory_is_automatic() {
                 "Set video processing to automatic to use this"
             }
         );
-        assert_eq!(r.value, obc_ipc::ConfigValue::Str("on_battery".into()));
+        assert_eq!(r.value, obc_ipc::ConfigValue::Str("auto".into()));
         assert_eq!(r.apply, "reload");
     }
 }
 
 #[test]
 fn a_power_change_mid_session_never_restarts_it_and_the_row_says_when_it_applies() {
-    let mut h = H::new("", |_| {});
+    let mut h = H::new("", |w| w.power_profile = balanced());
     h.activate(0);
     assert_eq!(h.session_params().memory, VideoMemory::Cuda);
     assert_eq!(h.saver_notice(), "");
@@ -16693,7 +16705,13 @@ fn without_usable_cuda_the_saver_changes_nothing() {
 
 #[test]
 fn the_power_supplies_are_read_only_when_a_mode_needs_them() {
-    for (mode, reads) in [("off", false), ("always", false), ("on_battery", true)] {
+    for (mode, reads) in [
+        ("off", false),
+        ("always", false),
+        ("on_battery", true),
+        ("power_profile", true),
+        ("auto", true),
+    ] {
         let h = H::new(&format!("[video]\nbattery_saver = \"{mode}\"\n"), |_| {});
         assert_eq!(h.world().power_reads > 0, reads, "{mode}");
     }
@@ -16701,7 +16719,7 @@ fn the_power_supplies_are_read_only_when_a_mode_needs_them() {
 
 #[test]
 fn while_idle_a_power_change_is_followed_at_once_off_the_start_path() {
-    let mut h = H::new("", |_| {});
+    let mut h = H::new("", |w| w.power_profile = balanced());
     let opens = h.opens_of(MAXINE_MODULE);
     assert!(cuda_on(&h.opened_with(MAXINE_MODULE)));
     // Unplugged while idle, then the watcher's (or the poll's) read: the
@@ -16837,17 +16855,112 @@ fn a_second_start_in_the_other_memory_reopens_the_modules_and_never_unparks_for_
 }
 
 #[test]
-fn power_profiles_daemon_is_followed_only_under_power_profile() {
+fn power_profiles_daemon_is_followed_only_under_power_profile_and_auto() {
+    // `auto`, the default, follows it.
     let mut h = H::new("", |_| {});
-    assert!(!h.world().profile_followed);
-    h.set_config(SAVER, obc_ipc::ConfigValue::Str("power_profile".into()))
-        .unwrap();
     assert!(h.world().profile_followed);
-    h.set_config(SAVER, obc_ipc::ConfigValue::Str("always".into()))
-        .unwrap();
+    for (mode, followed) in [
+        ("on_battery", false),
+        ("power_profile", true),
+        ("always", false),
+        ("auto", true),
+        ("off", false),
+    ] {
+        h.set_config(SAVER, obc_ipc::ConfigValue::Str(mode.into()))
+            .unwrap();
+        assert_eq!(h.world().profile_followed, followed, "{mode}");
+    }
+    for mode in ["power_profile", "auto"] {
+        let h = H::new(&format!("[video]\nbattery_saver = \"{mode}\"\n"), |_| {});
+        assert!(h.world().profile_followed, "{mode}");
+    }
+    let h = H::new("[video]\nbattery_saver = \"on_battery\"\n", |_| {});
     assert!(!h.world().profile_followed);
-    let h = H::new("[video]\nbattery_saver = \"power_profile\"\n", |_| {});
-    assert!(h.world().profile_followed);
+}
+
+#[test]
+fn leaving_a_mode_that_reads_the_profile_stops_following_it() {
+    for from in ["auto", "power_profile"] {
+        let mut h = H::new(&format!("[video]\nbattery_saver = \"{from}\"\n"), |w| {
+            w.power_profile = PowerProfile::Active("power-saver".into());
+        });
+        assert!(h.world().profile_followed, "{from}");
+        assert!(
+            h.row(SAVER)
+                .description
+                .ends_with("Now: active, power profile power-saver."),
+            "{from}: {}",
+            h.row(SAVER).description
+        );
+        h.set_config(SAVER, obc_ipc::ConfigValue::Str("on_battery".into()))
+            .unwrap();
+        assert!(!h.world().profile_followed, "{from}");
+        // The cache is no longer kept: nothing of the profile is read.
+        assert_eq!(h.ctrl.backend.power_profile(), PowerProfile::Unavailable);
+        assert!(
+            h.row(SAVER)
+                .description
+                .ends_with("Now: inactive, on AC power."),
+            "{from}: {}",
+            h.row(SAVER).description
+        );
+        // Back: followed again, the profile read again.
+        h.set_config(SAVER, obc_ipc::ConfigValue::Str(from.into()))
+            .unwrap();
+        assert!(h.world().profile_followed, "{from}");
+        assert_eq!(
+            h.ctrl.backend.power_profile(),
+            PowerProfile::Active("power-saver".into())
+        );
+        assert!(
+            h.row(SAVER)
+                .description
+                .ends_with("Now: active, power profile power-saver."),
+            "{from}: {}",
+            h.row(SAVER).description
+        );
+    }
+}
+
+#[test]
+fn by_default_on_ac_the_power_saver_profile_runs_a_start_in_system_memory() {
+    let mut h = H::new("", |w| {
+        w.power_source = PowerSource::External;
+        w.power_profile = PowerProfile::Active("power-saver".into());
+    });
+    let lines = crate::log::take_lines();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("video memory: "))
+            .collect::<Vec<_>>(),
+        ["video memory: system (auto: battery saver, power profile power-saver)"],
+        "{lines:?}"
+    );
+    assert_eq!(
+        h.row("video.memory").description,
+        "Now: system memory, battery saver, power profile power-saver. Applies at the next \
+         camera start."
+    );
+    assert_eq!(
+        h.row(SAVER).description,
+        "Keeps the NVIDIA GPU asleep by processing video in system memory. Now: active, power \
+         profile power-saver."
+    );
+    h.activate_then_idle(0);
+    let w = h.world();
+    assert_eq!(w.start_memories, [VideoMemory::System]);
+    assert_eq!((w.parks, w.unparks), (0, 0));
+    assert!(!w.cuda_initialised);
+    drop(w);
+    // Balanced on AC: inactive, both facts said.
+    h.world().power_profile = PowerProfile::Active("balanced".into());
+    assert!(h.ctrl.handle(Command::PowerChanged, h.at(20_000)));
+    assert_eq!(
+        h.row(SAVER).description,
+        "Keeps the NVIDIA GPU asleep by processing video in system memory. Now: inactive, on \
+         AC power, power profile balanced."
+    );
 }
 
 /// Whether a module's configuration says CUDA is usable (`_host.cuda` is
