@@ -214,6 +214,7 @@ fn setting(id: &str, label: &str, kind: SettingKind) -> Setting {
         disabled_reason: String::new(),
         enabled_when: Vec::new(),
         hint: None,
+        description: None,
     }
 }
 
@@ -375,6 +376,7 @@ fn input_group(inp: &Inputs<'_>) -> SettingsGroup {
                     default: value,
                     value,
                     unit: Some("dB".into()),
+                    display: None,
                 },
             ),
             KEY_HARDWARE_GAIN,
@@ -780,6 +782,7 @@ fn parse_setting(v: &Json) -> Option<Setting> {
                     .get("unit")
                     .and_then(Json::as_str)
                     .map(|u| clean(u, TAG_MAX)),
+                display: None,
             }
         }
         "enum" => {
@@ -855,6 +858,7 @@ fn parse_setting(v: &Json) -> Option<Setting> {
             .get("hint")
             .and_then(Json::as_str)
             .map(|h| clean(h, TAG_MAX)),
+        description: None,
     })
 }
 

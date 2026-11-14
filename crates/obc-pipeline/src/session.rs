@@ -109,6 +109,13 @@ impl Session {
         self.ingest.as_ref().and_then(Ingest::delivered_fps)
     }
 
+    /// Whether the current ingest's camera has its privacy shutter open or
+    /// closed ([`Ingest::shutter`]); `None` without an ingest, and while
+    /// its frames say nothing of it.
+    pub fn shutter(&self) -> Option<crate::shutter::ShutterState> {
+        self.ingest.as_ref().and_then(Ingest::shutter)
+    }
+
     /// Builds (but does not start) an ingest for `cfg` writing into this
     /// session's output, so the caller can inspect or probe it before
     /// [`Self::switch_to`].

@@ -567,6 +567,7 @@ fn setting(id: &str, label: &str, kind: SettingKind, hint: Option<&str>) -> Sett
         disabled_reason: String::new(),
         enabled_when: Vec::new(),
         hint: hint.map(String::from),
+        description: None,
     }
 }
 
@@ -584,6 +585,7 @@ fn int(
         default,
         value,
         unit: None,
+        display: None,
     };
     setting(id, label, kind, Some("slider"))
 }
@@ -7692,6 +7694,9 @@ fn short_health() -> obc_ipc::CameraHealth {
             value: "5".into(),
             current: "3".into(),
         }],
+        shutter: obc_ipc::SHUTTER_CLOSED.into(),
+        show_mode: obc_ipc::SHOW_MODE_NORMAL.into(),
+        status: vec!["Shutter closed".into()],
     }
 }
 
@@ -7716,7 +7721,10 @@ fn status_shows_the_camera_health() {
             "warnings": [],
             "suggestions": [],
             "has_recommendation": false,
-            "recommended": []
+            "recommended": [],
+            "shutter": "",
+            "show_mode": "",
+            "status": []
         }),
         "{v}"
     );
@@ -7729,6 +7737,7 @@ fn status_shows_the_camera_health() {
         out.stdout.ends_with(
             "Delivers:   19.5 of 30 fps\n\
              Damaged:    12 frames dropped\n\
+             Status:     Shutter closed\n\
              Warning:    Plug First Camera into its own USB port.\n\
              Suggest:    Noise removal \u{2014} This camera's picture is grainy: noise removal \
              makes it cleaner.\n"
@@ -7746,6 +7755,9 @@ fn status_shows_the_camera_health() {
     );
     assert_eq!(h["suggestions"][0]["value"], "on", "{v}");
     assert_eq!(h["has_recommendation"], true, "{v}");
+    assert_eq!(h["shutter"], "closed", "{v}");
+    assert_eq!(h["show_mode"], "normal", "{v}");
+    assert_eq!(h["status"], serde_json::json!(["Shutter closed"]), "{v}");
     assert_eq!(
         h["recommended"],
         serde_json::json!([{
@@ -7777,6 +7789,8 @@ fn watch_prints_a_camera_health_line_when_it_changes() {
     assert_eq!(v["camera"], "usb-1234_abcd", "{v}");
     assert_eq!(v["delivered_fps"], 19.5, "{v}");
     assert_eq!(v["warnings"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["shutter"], "closed", "{v}");
+    assert_eq!(v["status"][0], "Shutter closed", "{v}");
     assert!(v.get("changed").is_none(), "{v}");
     watch.quiet_for(Duration::from_millis(300), "nothing else changed");
 
@@ -7787,7 +7801,10 @@ fn watch_prints_a_camera_health_line_when_it_changes() {
     mock.set_camera_health(h);
     let line = watch.next("the camera health");
     assert!(
-        line.starts_with("camera health: delivers 19.5 of 30 fps | 13 damaged frames dropped"),
+        line.starts_with(
+            "camera health: delivers 19.5 of 30 fps | 13 damaged frames dropped | Shutter closed \
+             | warning:"
+        ),
         "{line}"
     );
 }

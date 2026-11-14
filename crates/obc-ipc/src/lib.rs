@@ -57,13 +57,14 @@ pub use config::{
 };
 pub use health::{
     CAMERA_HEALTH_PERIOD_MS, CAMERA_HEALTH_REVISION, CameraHealth, DELIVERS_SHORT_RATIO,
-    NOT_MEASURED, Recommended, Suggestion,
+    NOT_MEASURED, Recommended, SHOW_MODE_DESK_VIEW, SHOW_MODE_NORMAL, SHUTTER_CLOSED, SHUTTER_OPEN,
+    Suggestion,
 };
 pub use media::{MEDIA_DIRS_REVISION, MEDIA_REVISION, MediaDirs, MediaEntry, MediaReply};
 pub use modules::{FORCED_REVISION, MODULES_REVISION, ModuleInfo, ModuleList, StageInfo};
 pub use settings::{
-    Condition, ConditionOp, ResetScope, Setting, SettingChange, SettingKind, SettingValue,
-    SettingsGroup, SettingsTree, valid_setting_id,
+    Condition, ConditionOp, IntDisplay, ResetScope, Setting, SettingChange, SettingKind,
+    SettingValue, SettingsGroup, SettingsTree, valid_setting_id,
 };
 
 /// Well-known name of the daemon on the session bus.
@@ -155,8 +156,28 @@ pub const INTERFACE: &str = "br.com.dias.OmarchyBroadcast1";
 /// extension-unit settings, with no new member
 /// ([`CAMERA_XU_SETTINGS_REVISION`]). Revision 25 added the microphone's
 /// hardware capture gain, with no new member
-/// ([`MIC_HARDWARE_GAIN_REVISION`]).
-pub const INTERFACE_REVISION: u32 = 25;
+/// ([`MIC_HARDWARE_GAIN_REVISION`]). Revision 26 added the optional
+/// `description` of a setting and the camera status keys of `CameraHealth`,
+/// with no new member ([`CAMERA_STATUS_REVISION`]). Revision 27 added the
+/// optional `display_offset` and `display_scale` of an int setting and
+/// removed the MX Brio's RightSight settings (`camera.focus.rightsight*`),
+/// with no new member ([`DISPLAY_OFFSET_REVISION`]).
+pub const INTERFACE_REVISION: u32 = 27;
+/// The first [`INTERFACE_REVISION`] with the optional `display_offset` and
+/// `display_scale` (both `x`) of an `int` setting
+/// ([`settings::IntDisplay`]), and no new member: a client shows the value
+/// as `(value - display_offset) * display_scale` with an explicit sign,
+/// then the unit; `min`, `max`, `step`, `default`, `value` and what
+/// `SetSetting` takes stay raw. An absent `display_scale` is 1. A key a
+/// client does not know is ignored, so an older client shows the raw
+/// value.
+pub const DISPLAY_OFFSET_REVISION: u32 = 27;
+/// The first [`INTERFACE_REVISION`] with the optional `description` of a
+/// setting (a sentence for people, a `description` key of the setting
+/// dictionary, absent when there is none) and the camera status keys of
+/// [`CameraHealth`], and no new member. A key a client does not know is
+/// ignored, so an older client shows neither.
+pub const CAMERA_STATUS_REVISION: u32 = 26;
 /// The first [`INTERFACE_REVISION`] with the microphone's hardware capture
 /// gain, and no new member: the config row `mic.hardware_gain_db` (dB,
 /// optional) and the mic settings tree's `mic.input.hardware_gain_db` (an
@@ -174,12 +195,14 @@ pub const MIC_HARDWARE_GAIN_REVISION: u32 = 25;
 /// `camera.exposure.exposure_compensation` (an `int`, relative: its
 /// default is no compensation), `camera.image.vibrance` (an `int`),
 /// `camera.white_balance.temperature_compensation` (an `int`, an offset of
-/// the automatic white balance; its default is no offset),
-/// `camera.focus.rightsight` (a `bool`), and
-/// `camera.focus.rightsight_speed` (`slower`, `default`, `faster`) and
-/// `camera.focus.rightsight_distance` (`closer`, `default`, `farther`),
-/// enums. The ranges of the ints are published in the setting's `min` and
-/// `max`, not fixed here. Each is offered only when the camera agrees with
+/// the automatic white balance; its default is no offset). The ranges of
+/// the ints are published in the setting's `min` and `max`, not fixed
+/// here; from [`DISPLAY_OFFSET_REVISION`] the two compensations publish a
+/// display offset (`display_offset`, and `display_scale` 40 with unit `K`
+/// for the temperature compensation). Revisions 24 to 26 also carried
+/// `camera.focus.rightsight` (a `bool`), `camera.focus.rightsight_speed`
+/// and `camera.focus.rightsight_distance` (enums); revision 27 removed
+/// them. Each is offered only when the camera agrees with
 /// its row, and greyed with the reason `The camera reports a value this
 /// version does not know` while it reports a value outside them.
 pub const CAMERA_XU_SETTINGS_REVISION: u32 = 24;
@@ -1419,7 +1442,9 @@ mod tests {
             (None, None)
         );
         assert!(old.interface_revision < SETTINGS_REVISION);
-        assert_eq!(INTERFACE_REVISION, MIC_HARDWARE_GAIN_REVISION);
+        assert_eq!(INTERFACE_REVISION, DISPLAY_OFFSET_REVISION);
+        const { assert!(CAMERA_STATUS_REVISION < DISPLAY_OFFSET_REVISION) };
+        const { assert!(MIC_HARDWARE_GAIN_REVISION < CAMERA_STATUS_REVISION) };
         const { assert!(CAMERA_XU_SETTINGS_REVISION < MIC_HARDWARE_GAIN_REVISION) };
         const { assert!(BATTERY_SAVER_AUTO_REVISION < CAMERA_XU_SETTINGS_REVISION) };
         const { assert!(BATTERY_SAVER_REVISION < BATTERY_SAVER_AUTO_REVISION) };

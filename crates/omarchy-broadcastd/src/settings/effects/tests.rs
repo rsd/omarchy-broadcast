@@ -190,7 +190,8 @@ fn the_values_and_defaults_are_the_effect_settings() {
             step: 1,
             default: 34,
             value: 34,
-            unit: Some("%".into())
+            unit: Some("%".into()),
+            display: None,
         }
     );
     assert_eq!(blur.hint.as_deref(), Some("slider"));
@@ -483,7 +484,8 @@ fn relighting_is_a_switch_with_three_settings_of_its_light() {
             step: 5,
             default: 0,
             value: 0,
-            unit: Some("°".into())
+            unit: Some("°".into()),
+            display: None,
         }
     );
     let b = get(&e, BRIGHTNESS);
@@ -499,7 +501,8 @@ fn relighting_is_a_switch_with_three_settings_of_its_light() {
             step: 5,
             default: 100,
             value: 100,
-            unit: Some("%".into())
+            unit: Some("%".into()),
+            display: None,
         }
     );
     // Off: the three are greyed until it is on.

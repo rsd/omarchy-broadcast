@@ -97,6 +97,7 @@ use obc_pipeline::control_node::CaptureFormat;
 use obc_pipeline::controls::CtrlInfo;
 use obc_pipeline::effect::{Availability, StageId, StageRequest};
 use obc_pipeline::gpu::GpuSampler;
+use obc_pipeline::hid_orientation::{self, OrientationNotice, OrientationWatcher};
 use obc_pipeline::ingest::EnhanceBackend;
 use obc_pipeline::module::{ModulePlacement, ModuleStageSpec};
 use obc_pipeline::output::NO_CUDA_CONTEXT;
@@ -115,8 +116,9 @@ use super::park::{Parker, StartError, StopFailure, StopSession};
 use super::{
     Backends, ControlEvent, ControlEventReporter, ControlNode, ControlScan, EffectReport,
     EffectRun, EffectStatus, Failure, MediaBackend, Module, ModuleEntry, OpenedModule,
-    PipeWireEvent, PipeWireGeneration, PipeWireReporter, PipeWireState, Placement, PreviewReporter,
-    PreviewRequest, SessionError, SessionParams, StageRun, WatchGeneration, WriterError,
+    OrientationEvent, OrientationReporter, PipeWireEvent, PipeWireGeneration, PipeWireReporter,
+    PipeWireState, Placement, PreviewReporter, PreviewRequest, SessionError, SessionParams,
+    StageRun, WatchGeneration, WriterError,
 };
 use crate::camera::{Camera, stable_id, usb_origin};
 use crate::consumers::{NodeId, count_holders, holder_names};
@@ -265,10 +267,19 @@ pub struct GstBackend {
     watcher: Option<CtrlWatcher>,
     /// The generation of the last watcher started (0: none yet).
     watch_generation: WatchGeneration,
+    /// Where the orientation events go (`None`: no watcher can start).
+    orientation_reporter: Option<OrientationReporter>,
+    /// The orientation watcher of the active camera.
+    orientation_watcher: Option<OrientationWatcher>,
+    /// The generation of the last orientation watcher started (0: none
+    /// yet).
+    orientation_generation: WatchGeneration,
     /// The image the writer's placeholder shows (`None`: black).
     placeholder: Option<PathBuf>,
     /// The image the writer's crash cover shows (`None`: black).
     cover_image: Option<PathBuf>,
+    /// The writer's mask is on ([`MediaBackend::set_mask`]).
+    mask: bool,
     /// The image the running session output's clock placeholder was asked
     /// to show (`None`: black, or no session).
     output_placeholder: Option<PathBuf>,
@@ -321,8 +332,12 @@ impl GstBackend {
             control_reporter: None,
             watcher: None,
             watch_generation: 0,
+            orientation_reporter: None,
+            orientation_watcher: None,
+            orientation_generation: 0,
             placeholder: None,
             cover_image: None,
+            mask: false,
             output_placeholder: None,
             cover_logged: None,
             power_profiles: None,
@@ -333,6 +348,13 @@ impl GstBackend {
     /// ([`MediaBackend::watch_controls`]) going to `reporter`.
     pub fn with_control_reporter(mut self, reporter: ControlEventReporter) -> Self {
         self.control_reporter = Some(reporter);
+        self
+    }
+
+    /// The backend with the orientation events of its watchers
+    /// ([`MediaBackend::watch_orientation`]) going to `reporter`.
+    pub fn with_orientation_reporter(mut self, reporter: OrientationReporter) -> Self {
+        self.orientation_reporter = Some(reporter);
         self
     }
 
@@ -416,6 +438,7 @@ impl GstBackend {
         writer.on_consumer_cover(Some(Arc::new(log_consumer_cover)));
         writer.set_placeholder_image(self.placeholder.as_deref());
         writer.set_cover_image(self.cover_image.as_deref());
+        writer.set_mask(self.mask);
         writer.start()?;
         self.writer = Some(writer);
         self.cover_logged = None;
@@ -1057,6 +1080,13 @@ impl MediaBackend for GstBackend {
         }
     }
 
+    fn set_mask(&mut self, on: bool) {
+        self.mask = on;
+        if let Some(w) = &self.writer {
+            w.set_mask(on);
+        }
+    }
+
     fn set_output_placeholder(&mut self, image: Option<&Path>) {
         if let Some(r) = &self.running {
             match image {
@@ -1466,11 +1496,47 @@ impl MediaBackend for GstBackend {
         self.watcher = None;
     }
 
+    fn watch_orientation(
+        &mut self,
+        camera: &Camera,
+        report: obc_pipeline::quirks::OrientationReport,
+    ) -> Result<WatchGeneration, String> {
+        self.unwatch_orientation();
+        let Some(reporter) = self.orientation_reporter.clone() else {
+            return Err("orientation events are not reported by this backend".into());
+        };
+        let node =
+            hid_orientation::hidraw_of_node(Path::new(SYSFS_ROOT), &camera.path, report.report_id)
+                .map_err(|e| format!("{}: no HID node for its Show Mode: {e}", camera.label()))?;
+        self.orientation_generation += 1;
+        let generation = self.orientation_generation;
+        let watcher =
+            OrientationWatcher::start(&node, report, hid_orientation::SETTLE, move |notice| {
+                reporter(
+                    generation,
+                    match notice {
+                        OrientationNotice::Changed(o) => OrientationEvent::Changed(o),
+                        OrientationNotice::Ended(e) => OrientationEvent::Ended(e.to_string()),
+                    },
+                );
+            })
+            .map_err(|e| hid_open_error(&camera.label(), &node, &e))?;
+        self.orientation_watcher = Some(watcher);
+        Ok(generation)
+    }
+
+    fn unwatch_orientation(&mut self) {
+        // Dropping it signals the thread and returns at once, without
+        // joining it; the thread closes the node itself when it ends.
+        self.orientation_watcher = None;
+    }
+
     fn ingest_health(&mut self) -> Option<super::IngestHealth> {
         let r = self.running.as_ref()?;
         Some(super::IngestHealth {
             delivered_fps: r.session.delivered_fps(),
             corrupt: r.session.corrupt_frames()?,
+            shutter: r.session.shutter(),
         })
     }
 
@@ -1627,9 +1693,41 @@ fn wants_cuda(e: &PipelineError) -> bool {
     }
 }
 
+/// Why the `hidraw` node `node` of the camera `label` could not be opened
+/// for its orientation watcher, `e` the open's error: names the node, and
+/// for a node without read access says that the user needs it (such as a
+/// udev `uaccess` rule gives).
+fn hid_open_error(label: &str, node: &Path, e: &std::io::Error) -> String {
+    let node = node.display();
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        format!(
+            "{label}: its Show Mode is not shown: its HID node {node} cannot be read: {e}; \
+             read access to {node} is needed (such as a udev uaccess rule gives)"
+        )
+    } else {
+        format!("{label}: its Show Mode is not shown: its HID node {node} cannot be opened: {e}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unreadable_hid_node_is_named_with_the_access_it_needs() {
+        let node = Path::new("/dev/hidraw3");
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert_eq!(
+            hid_open_error("MX Brio", node, &denied),
+            "MX Brio: its Show Mode is not shown: its HID node /dev/hidraw3 cannot be read: \
+             Permission denied (os error 13); read access to /dev/hidraw3 is needed (such as \
+             a udev uaccess rule gives)"
+        );
+        let gone = std::io::Error::from_raw_os_error(libc::ENOENT);
+        let text = hid_open_error("MX Brio", node, &gone);
+        assert!(text.contains("/dev/hidraw3 cannot be opened"), "{text}");
+        assert!(!text.contains("read access"), "{text}");
+    }
 
     fn counts(forwarded: u64, placeholder: u64, queue_dropped: u64) -> WriterCounts {
         WriterCounts {

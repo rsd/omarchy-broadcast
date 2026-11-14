@@ -155,7 +155,8 @@ fn the_hardware_gain_is_an_input_setting_bound_to_its_config_key() {
             step: 1,
             default: 40,
             value: 40,
-            unit: Some("dB".into())
+            unit: Some("dB".into()),
+            display: None,
         }
     );
     assert_eq!(
@@ -276,7 +277,8 @@ fn the_worker_groups_are_one_per_id_the_active_providers() {
             step: 5,
             default: 80,
             value: 80,
-            unit: Some("%".into())
+            unit: Some("%".into()),
+            display: None,
         }
     );
     assert_eq!(noise.settings[1].enabled_when.len(), 1);

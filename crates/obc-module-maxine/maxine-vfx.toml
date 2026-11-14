@@ -4,7 +4,7 @@
 abi = 1
 id = "br.com.dias.maxine-vfx"
 name = "NVIDIA Maxine video effects"
-version = "0.51.0"
+version = "0.52.0"
 licence = "MIT OR Apache-2.0 (module); NVIDIA Maxine SDK under its own licence"
 kind = "video-stage"
 library = "/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so"

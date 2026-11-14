@@ -88,6 +88,18 @@
 //!   frame; a last detach outside the window (the new output stopped
 //!   before its first frame: the camera turned off) ends the hold and
 //!   drops the kept frame the same way.
+//! * **Mask.** While [`LoopbackWriter::set_mask`] is on, a forwarded frame
+//!   is replaced by the placeholder's image before it is pushed: the
+//!   consumer sees the image the placeholder shows, in the forwarded
+//!   frame's slot, stamped and counted as a forwarded frame (and in
+//!   [`WriterCounts::masked`]), held as it would be. Only an image does
+//!   that: while the placeholder is black (none asked for, still decoding,
+//!   unreadable) the forwarded frames pass as they are. The output, its
+//!   clock and every measure of the stream are untouched: the frames keep
+//!   coming, only what the consumer sees of them changes. The daemon masks
+//!   a camera whose privacy shutter is closed ([`crate::shutter`]), so the
+//!   feed shows the away image in place of its black. Off at the build,
+//!   kept across [`LoopbackWriter::stop`] and [`LoopbackWriter::start`].
 //!
 //! **Timestamps.** Every buffer pushed, placeholder or forwarded, gets the
 //! writer's own timestamp: PTS = the `CLOCK_MONOTONIC` time of the push
@@ -246,6 +258,10 @@ pub struct WriterCounts {
     /// Of the frames accepted, those `appsrc` dropped because its queue was
     /// full (they never reached the sink).
     pub queue_dropped: u64,
+    /// Of the forwarded frames accepted, those replaced by the
+    /// placeholder's image while the mask is on
+    /// ([`LoopbackWriter::set_mask`]).
+    pub masked: u64,
     /// When the last accepted push happened.
     #[serde(skip)]
     pub last_push: Option<Instant>,
@@ -322,6 +338,10 @@ struct Shared {
     forwarded: AtomicU64,
     held: AtomicU64,
     push_failed: AtomicU64,
+    masked: AtomicU64,
+    /// Forwarded frames are replaced by the placeholder's image
+    /// ([`LoopbackWriter::set_mask`]).
+    mask: AtomicBool,
     /// The first ERROR the pipeline posted.
     error: Mutex<Option<String>>,
     /// What the placeholder thread pushes, and the image asked for.
@@ -583,6 +603,14 @@ impl Shared {
     /// push lock. A placeholder is pushed only if [`placeholder_due`]
     /// (`after`), and is replaced by the kept frame while [`hold_due`].
     fn push(&self, buffer: gst::Buffer, producer: Producer, after: Duration) -> Pushed {
+        // Before the push lock: the placeholder's lock is never taken
+        // under it. A forwarded frame the image replaces stays in the
+        // shadowed binding and goes back to its pool when it drops, at the
+        // end of this function, outside the push lock.
+        let (buffer, masked) = match self.masked_frame(producer) {
+            Some(image) => (image, true),
+            None => (buffer, false),
+        };
         let mut st = self.lock();
         let now = Instant::now();
         // Dropped after the lock is released.
@@ -621,6 +649,9 @@ impl Shared {
         };
         let (pushed, leftover) = self.push_locked(&mut st, buffer, producer, now);
         drop(st);
+        if masked && pushed == Pushed::Accepted {
+            self.masked.fetch_add(1, Ordering::Relaxed);
+        }
         // A buffer of the output's pool goes back to it here, outside the
         // push lock.
         drop((expired, leftover));
@@ -697,6 +728,18 @@ impl Shared {
         }
     }
 
+    /// The placeholder's image to push in place of a forwarded frame while
+    /// the mask is on ([`LoopbackWriter::set_mask`]): a shallow copy;
+    /// `None` for another producer, with the mask off, and while the
+    /// placeholder shows no image.
+    fn masked_frame(&self, producer: Producer) -> Option<gst::Buffer> {
+        if producer != Producer::Forwarded || !self.mask.load(Ordering::Relaxed) {
+            return None;
+        }
+        let f = self.frame.lock().unwrap_or_else(|e| e.into_inner());
+        (f.request.state == PlaceholderState::Image).then(|| f.buffer.copy())
+    }
+
     fn counts(&self) -> WriterCounts {
         let last_push = self.lock().last_push;
         WriterCounts {
@@ -705,6 +748,7 @@ impl Shared {
             held: self.held.load(Ordering::Relaxed),
             push_failed: self.push_failed.load(Ordering::Relaxed),
             queue_dropped: self.appsrc.property::<u64>("dropped"),
+            masked: self.masked.load(Ordering::Relaxed),
             last_push,
         }
     }
@@ -1040,6 +1084,8 @@ impl LoopbackWriter {
             placeholder: AtomicU64::new(0),
             forwarded: AtomicU64::new(0),
             held: AtomicU64::new(0),
+            masked: AtomicU64::new(0),
+            mask: AtomicBool::new(false),
             push_failed: AtomicU64::new(0),
             error: Mutex::default(),
             frame: Mutex::new(PlaceholderFrame {
@@ -1463,6 +1509,20 @@ impl LoopbackWriter {
         };
         // A buffer of an output's pool goes back to it outside the lock.
         drop(released);
+    }
+
+    /// Turns the mask on or off (see the module docs, "Mask"): while on,
+    /// each forwarded frame is replaced by the placeholder's image, when
+    /// it shows one ([`PlaceholderState::Image`]); the next forwarded frame
+    /// after it is turned off is shown as it is. Changes nothing of the
+    /// placeholder, the hold or the crash cover. Never blocks.
+    pub fn set_mask(&self, on: bool) {
+        self.shared.mask.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the mask is on ([`Self::set_mask`]).
+    pub fn masked(&self) -> bool {
+        self.shared.mask.load(Ordering::Relaxed)
     }
 
     /// A handle for the active output to forward its frames with.
@@ -1921,6 +1981,58 @@ mod tests {
             assert!(log.caps_events.len() <= 1, "never renegotiated");
             assert!(log.buffers.iter().all(|b| b.black || b.white), "{format:?}");
         }
+    }
+
+    /// With the mask on, forwarded frames are replaced by the
+    /// placeholder's image, counted as forwarded and as masked; with the
+    /// mask off, or the placeholder black, they pass as they are.
+    #[test]
+    fn the_mask_shows_the_placeholder_image_in_place_of_forwarded_frames() {
+        require_elements(ELEMENTS);
+        require_elements(IMAGE_ELEMENTS);
+        let dir = tempfile::tempdir().unwrap();
+        let png = white_png(dir.path(), 160, 160);
+        let contract = small(OutputFormat::Nv12);
+        // Placeholders only 10 s after a forwarded frame: every buffer at
+        // the sink after the first forwarded one is a forwarded one.
+        let mut cfg = WriterConfig::new(contract, WriterSink::Fake);
+        cfg.placeholder_after = Duration::from_secs(10);
+        let mut w = LoopbackWriter::build_with(cfg).unwrap();
+        assert!(!w.masked(), "off at the build");
+        let h = w.handle();
+        let log = watch_sink(&w);
+        w.start().unwrap();
+        let count = || log.lock().unwrap().buffers.len();
+        let push = |n: usize| {
+            let from = count();
+            for _ in 0..n {
+                assert!(h.push(black_contract_frame(&contract).unwrap()));
+            }
+            wait_until(Duration::from_secs(10), "the forwarded frames", || {
+                count() >= from + n
+            });
+            log.lock().unwrap().buffers[from..from + n].to_vec()
+        };
+        push(1);
+        w.set_placeholder_image(Some(&png));
+        wait_until(Duration::from_secs(10), "the image decoded", || {
+            w.placeholder_state() == PlaceholderState::Image
+        });
+        assert!(push(3).iter().all(|b| b.black), "the mask off");
+        w.set_mask(true);
+        assert!(w.masked());
+        assert!(push(3).iter().all(|b| b.white), "the image in their place");
+        assert_eq!(w.counts().masked, 3);
+        // A black placeholder masks nothing.
+        w.set_placeholder_image(None);
+        assert!(push(2).iter().all(|b| b.black));
+        assert_eq!(w.counts().masked, 3);
+        w.set_placeholder_image(Some(&png));
+        w.set_mask(false);
+        assert!(push(2).iter().all(|b| b.black), "the mask off again");
+        let counts = w.counts();
+        assert_eq!((counts.forwarded, counts.masked), (11, 3));
+        w.stop().unwrap();
     }
 
     /// The image asked for again after black, the file at its path the

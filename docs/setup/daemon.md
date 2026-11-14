@@ -26,6 +26,7 @@ The package installs:
 - the unit `/usr/lib/systemd/user/omarchy-broadcastd.service`;
 - the D-Bus activation file `/usr/share/dbus-1/services/br.com.dias.OmarchyBroadcast.service`;
 - the Maxine module, `/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so`, with its manifest in `/usr/lib/omarchy-broadcast/modules.d/` ([maxine.md](maxine.md#the-maxine-module), [../modules.md](../modules.md)), and the C header of the module interface, `/usr/include/omarchy-broadcast/omarchy_broadcast_module.h`;
+- the udev rule for the MX Brio, `/usr/lib/udev/rules.d/70-omarchy-broadcast-mx-brio.rules`, which lets the daemon read the camera's Show Mode ([below](#the-udev-rule-for-the-mx-brio));
 - the licences and this documentation, in `/usr/share/doc/omarchy-broadcast/`;
 - the optional drop-ins as inactive examples in `/usr/share/doc/omarchy-broadcast/examples/systemd/` (`wireplumber.service.d/omarchy-broadcast.conf`, see "Discovery by PipeWire", and `omarchy-broadcastd.service.d/maxine.conf`, see [maxine.md](maxine.md#3-enable-the-drop-in)).
 
@@ -60,7 +61,7 @@ Behaviour:
 - A Maxine manifest at `${XDG_DATA_HOME:-~/.local/share}/omarchy-broadcast/modules.d/maxine-vfx.toml` that it did not write, such as the hand-made copy of the manual recipe in [maxine.md](maxine.md), has no mark, so the script refuses it. Remove that file and the library its `library` line names, then run the script again. This applies to `--uninstall` as well.
 - The data directory must be an absolute path made only of letters, digits and `._/@+-` for an install: its path is written into the Maxine manifest, and with `--mic` into the microphone's unit. Otherwise the script exits with status 2.
 - It runs no `systemctl` command and enables nothing; it prints the next steps. A running daemon never reloads a module library: after a run that rebuilt the module, restart the daemon (`systemctl --user restart omarchy-broadcastd`).
-- It does not install the WirePlumber drop-in. The Omarchy bar plugin is a separate project (the omarchy-broadcast-plugin repository).
+- It does not install the udev rule for the MX Brio, which needs root ([below](#the-udev-rule-for-the-mx-brio)), nor the WirePlumber drop-in. The Omarchy bar plugin is a separate project (the omarchy-broadcast-plugin repository).
 - It warns when a unit in `~/.config/systemd/user` exists, because that location takes precedence (see below).
 
 Options: `--mic` also installs the optional noise-removed microphone ([microphone.md](microphone.md)), `--dry-run` prints every action and changes nothing, `--no-build` installs the binaries and the module library already in `${CARGO_TARGET_DIR:-target}/release`, `--uninstall` removes what the script installed (the Maxine module's library and manifest included), `--help` shows the usage. Exit status: 0 done; 1 refused (a target path holds a file the script did not install, or the unit is still enabled on `--uninstall`) or the build failed; 2 usage error or unusable environment.
@@ -114,6 +115,20 @@ systemctl --user enable --now omarchy-broadcastd
    If the service was enabled before from an older copy of the unit, run `systemctl --user reenable omarchy-broadcastd` so that it is wanted by `default.target`.
 
 The same drop-in applies to the other two routes (step 4); the package does not install it.
+
+### The udev rule for the MX Brio
+
+The daemon reads the Logitech MX Brio's Show Mode (desk view or normal) from the camera's HID interface, only while the camera streams ([../cameras/mx-brio.md](../cameras/mx-brio.md#camera-status-in-omarchy-broadcast)). A `hidraw` node belongs to root by default, so without access to it the status stays unknown; nothing else is affected. The rule `dist/udev/70-omarchy-broadcast-mx-brio.rules` tags the `hidraw` nodes of USB `046d:0944`, and of no other device, with `uaccess`: systemd-logind then gives the user of the active local seat an ACL on the node, read and write. The daemon opens it read-only and never writes to it.
+
+The Arch package installs the rule in `/usr/lib/udev/rules.d/`. The per-user install and the manual install do not (`scripts/install-user.sh` does not install it), because a rule needs root. To add it from a checkout:
+
+```sh
+sudo install -Dm644 dist/udev/70-omarchy-broadcast-mx-brio.rules \
+    /etc/udev/rules.d/70-omarchy-broadcast-mx-brio.rules
+sudo udevadm control --reload
+```
+
+Then unplug and replug the camera: the rule applies to a node when it is created. The file name must sort before `73-seat-late.rules`, where systemd turns the `uaccess` tag into the ACL; keep the `70-` prefix.
 
 ### Which unit is used
 
@@ -327,7 +342,7 @@ systemctl --user disable --now omarchy-broadcastd
 
 Then, depending on how it was installed:
 
-- Arch package: `sudo pacman -R omarchy-broadcast-git`. Remove any drop-in you copied from the examples. The bar plugin is not part of the package; see the omarchy-broadcast-plugin repository for removing it.
+- Arch package: `sudo pacman -R omarchy-broadcast-git`, which removes the udev rule too. Remove any drop-in you copied from the examples. The bar plugin is not part of the package; see the omarchy-broadcast-plugin repository for removing it.
 - Per-user install: `scripts/install-user.sh --uninstall` from the checkout. It removes only the files it installed, the Maxine module's library and manifest among them, and refuses while the unit is still enabled, hence the command above comes first. A hand-made Maxine manifest stops it too; remove the files named in [maxine.md](maxine.md#8-uninstall) first.
 - Manual install:
 
@@ -339,3 +354,5 @@ Then, depending on how it was installed:
   ```
 
 Finish with `systemctl --user daemon-reload`.
+
+On the last two routes, also remove the udev rule if you copied it: `sudo rm /etc/udev/rules.d/70-omarchy-broadcast-mx-brio.rules`, then `sudo udevadm control --reload`.

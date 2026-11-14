@@ -286,6 +286,7 @@ fn fhd_model(open: bool) -> CameraSettings {
         open,
         fixed_framerate: false,
         hidden: &[],
+        usb: None,
     })
 }
 
@@ -371,6 +372,7 @@ fn the_frame_rate_pin_is_the_recommended_dynamic_framerate() {
             open: true,
             fixed_framerate: true,
             hidden: &[],
+            usb: None,
         })
     };
     // At the pin's 0 after the reset: nothing to change.
@@ -406,6 +408,7 @@ fn values_display_as_the_tree_shows_them() {
         default: 0,
         value: 0,
         unit: Some("K".into()),
+        display: None,
     };
     assert_eq!(display(&int, &SettingValue::Int(4000)), "4000 K");
     let b = SettingKind::Bool {
@@ -445,6 +448,7 @@ fn switch(id: &str, on: bool, enabled: bool) -> GlobalEntry {
             },
             enabled_when: Vec::new(),
             hint: None,
+            description: None,
         },
     }
 }
@@ -540,4 +544,34 @@ fn the_shown_rate_has_hysteresis_and_moves_by_its_step() {
     }
     assert_eq!(changes, 1);
     assert_eq!(shown, Some(28.4));
+}
+
+#[test]
+fn the_shutter_reads_open_closed_or_unknown() {
+    assert_eq!(
+        shutter_status(Some(ShutterState::Open)),
+        ("open".to_string(), Vec::new())
+    );
+    assert_eq!(
+        shutter_status(Some(ShutterState::Closed)),
+        ("closed".to_string(), vec!["Shutter closed".to_string()])
+    );
+    assert_eq!(shutter_status(None), (String::new(), Vec::new()));
+}
+
+#[test]
+fn the_show_mode_reads_normal_desk_view_or_unknown() {
+    use obc_pipeline::hid_orientation::Orientation;
+    assert_eq!(
+        show_mode_status(Some(Orientation::Normal)),
+        ("normal".to_string(), Some("Show Mode: normal".to_string()))
+    );
+    assert_eq!(
+        show_mode_status(Some(Orientation::DeskView)),
+        (
+            "desk_view".to_string(),
+            Some("Show Mode: desk view".to_string())
+        )
+    );
+    assert_eq!(show_mode_status(None), (String::new(), None));
 }

@@ -93,6 +93,9 @@ fn health() -> CameraHealth {
             value: "5".into(),
             current: "128".into(),
         }],
+        shutter: obc_ipc::SHUTTER_OPEN.into(),
+        show_mode: obc_ipc::SHOW_MODE_NORMAL.into(),
+        status: vec!["Show Mode: normal".into()],
     }
 }
 
@@ -216,6 +219,7 @@ fn setting(id: &str, label: &str, kind: SettingKind) -> Setting {
         disabled_reason: String::new(),
         enabled_when: Vec::new(),
         hint: None,
+        description: None,
     }
 }
 
@@ -230,6 +234,7 @@ fn mock_settings() -> Vec<SettingsGroup> {
             default: 4000,
             value: 4000,
             unit: Some("K".into()),
+            display: None,
         },
     );
     temperature.enabled = false;
@@ -255,6 +260,7 @@ fn mock_settings() -> Vec<SettingsGroup> {
                         default: 128,
                         value: 128,
                         unit: None,
+                        display: None,
                     },
                 ),
                 setting(
@@ -1356,8 +1362,9 @@ async fn proxy_reads_every_property() {
             interface_revision: INTERFACE_REVISION,
         }
     );
-    assert_eq!(INTERFACE_REVISION, 25);
-    assert_eq!(INTERFACE_REVISION, obc_ipc::MIC_HARDWARE_GAIN_REVISION);
+    assert_eq!(INTERFACE_REVISION, 27);
+    assert_eq!(INTERFACE_REVISION, obc_ipc::DISPLAY_OFFSET_REVISION);
+    assert_eq!(obc_ipc::CAMERA_STATUS_REVISION, 26);
     assert_eq!(obc_ipc::CAMERA_XU_SETTINGS_REVISION, 24);
     assert_eq!(obc_ipc::BATTERY_SAVER_AUTO_REVISION, 23);
     assert_eq!(obc_ipc::BATTERY_SAVER_REVISION, 22);

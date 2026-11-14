@@ -33,10 +33,13 @@
 //! The camera's health (revision 20) is the `camera_health` of a `snapshot`
 //! line (`null` before revision 20) and the body of a `camera_health` line
 //! ([`camera_health_line`]): its lists are cut at [`MAX_HEALTH_WARNINGS`],
-//! [`MAX_SUGGESTIONS`] and [`MAX_RECOMMENDED`], and further (the
-//! recommended changes first, then the suggestions, then the warnings)
-//! should a line still exceed the cap; a `snapshot` line cuts them after
-//! its image controls and before its cameras.
+//! [`MAX_SUGGESTIONS`], [`MAX_RECOMMENDED`] and [`MAX_HEALTH_STATUS`], and
+//! further (the recommended changes first, then the suggestions, then the
+//! warnings, then the status lines) should a line still exceed the cap; a
+//! `snapshot` line cuts them after its image controls and before its
+//! cameras. From revision 26 it also carries the camera's `shutter` and
+//! `show_mode` (`""` when unknown) and its `status` lines; an older
+//! daemon's read as `""` and `[]`.
 
 use std::borrow::Cow;
 
@@ -134,6 +137,8 @@ pub const MAX_CONDITION_VALUES: usize = 8;
 pub const MAX_OP_BYTES: usize = 8;
 /// Bound of a setting's `hint`.
 pub const MAX_HINT_BYTES: usize = 16;
+/// Bound of a setting's `description` (revision 26).
+pub const MAX_DESCRIPTION_BYTES: usize = 160;
 /// Bound of a setting's `scope` (`camera` or `global`, or one a newer
 /// daemon adds).
 pub const MAX_SCOPE_BYTES: usize = 16;
@@ -141,6 +146,14 @@ pub const MAX_SCOPE_BYTES: usize = 16;
 pub const MAX_HEALTH_WARNINGS: usize = 4;
 /// Bound of a `camera_health` warning.
 pub const MAX_HEALTH_WARNING_BYTES: usize = 320;
+/// At most this many `camera_health` status lines are listed (revision
+/// 26).
+pub const MAX_HEALTH_STATUS: usize = 4;
+/// Bound of a `camera_health` status line.
+pub const MAX_HEALTH_STATUS_BYTES: usize = 96;
+/// Bound of `camera_health`'s `shutter` and `show_mode` (`open`,
+/// `desk_view`, or one a newer daemon adds).
+pub const MAX_HEALTH_STATE_BYTES: usize = 16;
 /// At most this many `camera_health` suggestions are listed.
 pub const MAX_SUGGESTIONS: usize = 4;
 /// Bound of a suggestion's `reason`.
@@ -362,6 +375,7 @@ struct HealthLimits {
     warnings: usize,
     suggestions: usize,
     recommended: usize,
+    status: usize,
 }
 
 impl HealthLimits {
@@ -371,11 +385,13 @@ impl HealthLimits {
             warnings: h.warnings.len().min(MAX_HEALTH_WARNINGS),
             suggestions: h.suggestions.len().min(MAX_SUGGESTIONS),
             recommended: h.recommended.len().min(MAX_RECOMMENDED),
+            status: h.status.len().min(MAX_HEALTH_STATUS),
         }
     }
 
     /// One entry fewer: a recommended change, else a suggestion, else a
-    /// warning; `false` when every list is empty already.
+    /// warning, else a status line; `false` when every list is empty
+    /// already.
     fn shrink(&mut self) -> bool {
         let list = if self.recommended > 0 {
             &mut self.recommended
@@ -383,6 +399,8 @@ impl HealthLimits {
             &mut self.suggestions
         } else if self.warnings > 0 {
             &mut self.warnings
+        } else if self.status > 0 {
+            &mut self.status
         } else {
             return false;
         };
@@ -403,6 +421,9 @@ struct HealthFields<'a> {
     suggestions: Vec<SuggestionField<'a>>,
     has_recommendation: bool,
     recommended: Vec<RecommendedField<'a>>,
+    shutter: Cow<'a, str>,
+    show_mode: Cow<'a, str>,
+    status: Vec<Cow<'a, str>>,
 }
 
 impl<'a> HealthFields<'a> {
@@ -439,6 +460,14 @@ impl<'a> HealthFields<'a> {
                     value: clip(&r.value, MAX_RECOMMENDED_VALUE_BYTES),
                     current: clip(&r.current, MAX_RECOMMENDED_VALUE_BYTES),
                 })
+                .collect(),
+            shutter: clip(&h.shutter, MAX_HEALTH_STATE_BYTES),
+            show_mode: clip(&h.show_mode, MAX_HEALTH_STATE_BYTES),
+            status: h
+                .status
+                .iter()
+                .take(limits.status)
+                .map(|l| clip(l, MAX_HEALTH_STATUS_BYTES))
                 .collect(),
         }
     }
@@ -933,10 +962,20 @@ struct SettingJson<'a> {
     step: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     unit: Option<Cow<'a, str>>,
+    /// Revision 27: an int is shown as `(value - display_offset) *
+    /// display_scale`, signed; both absent when it is shown as it is, as
+    /// on the bus.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_offset: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_scale: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<Vec<OptionJson<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<Cow<'a, str>>,
+    /// Revision 26; absent when the setting has none, as on the bus.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<Cow<'a, str>>,
 }
 
 impl<'a> SettingJson<'a> {
@@ -966,8 +1005,14 @@ impl<'a> SettingJson<'a> {
             max: None,
             step: None,
             unit: None,
+            display_offset: None,
+            display_scale: None,
             options: None,
             hint: s.hint.as_deref().map(|h| clip(h, MAX_HINT_BYTES)),
+            description: s
+                .description
+                .as_deref()
+                .map(|d| clip(d, MAX_DESCRIPTION_BYTES)),
         };
         match &s.kind {
             SettingKind::Bool { default, value } => {
@@ -982,6 +1027,7 @@ impl<'a> SettingJson<'a> {
                 default,
                 value,
                 unit,
+                display,
             } => {
                 j.kind = "int";
                 j.value = Some(JsonValue::Int(*value));
@@ -990,6 +1036,8 @@ impl<'a> SettingJson<'a> {
                 j.max = Some(*max);
                 j.step = Some(*step);
                 j.unit = unit.as_deref().map(|u| clip(u, MAX_UNIT_BYTES));
+                j.display_offset = display.map(|d| d.offset);
+                j.display_scale = display.map(|d| d.scale);
             }
             SettingKind::Enum {
                 options,
@@ -1889,6 +1937,7 @@ mod tests {
             disabled_reason: String::new(),
             enabled_when: Vec::new(),
             hint: None,
+            description: None,
         }
     }
 
@@ -1903,6 +1952,7 @@ mod tests {
                 default: 156,
                 value: 1250,
                 unit: Some("\u{d7}100 \u{b5}s".into()),
+                display: None,
             },
         );
         time.enabled = false;
@@ -1938,6 +1988,7 @@ mod tests {
         );
         keep.stored = true;
         keep.hint = Some("switch".into());
+        keep.description = Some("Off lets the camera lower its frame rate in low light".into());
         SettingsTree {
             revision: 12,
             serial: 3,
@@ -1989,7 +2040,7 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert_eq!(
             lines[0],
-            r#"{"v":1,"type":"settings_group","schema":1,"rev":12,"serial":3,"camera":"usb-046d_0944","index":0,"count":2,"part":1,"parts":1,"group":{"id":"exposure","label":"Exposure","settings":[{"id":"camera.exposure.auto_exposure","label":"Exposure mode","scope":"camera","type":"enum","value":"aperture_priority","default":"aperture_priority","stored":false,"enabled":true,"disabled_reason":"","enabled_when":[],"options":[{"value":"manual","label":"Manual"},{"value":"aperture_priority","label":"Auto"}],"hint":"segmented"},{"id":"camera.exposure.exposure_time_absolute","label":"Exposure time","scope":"camera","type":"int","value":1250,"default":156,"stored":false,"enabled":false,"disabled_reason":"Set exposure to manual to change this","enabled_when":[{"id":"camera.exposure.auto_exposure","op":"in","value":["manual","shutter_priority"]}],"min":3,"max":2047,"step":1,"unit":"×100 µs"},{"id":"camera.exposure.keep_framerate","label":"Keep 30 fps in low light","scope":"camera","type":"bool","value":false,"default":true,"stored":true,"enabled":true,"disabled_reason":"","enabled_when":[],"hint":"switch"}]}}"#
+            r#"{"v":1,"type":"settings_group","schema":1,"rev":12,"serial":3,"camera":"usb-046d_0944","index":0,"count":2,"part":1,"parts":1,"group":{"id":"exposure","label":"Exposure","settings":[{"id":"camera.exposure.auto_exposure","label":"Exposure mode","scope":"camera","type":"enum","value":"aperture_priority","default":"aperture_priority","stored":false,"enabled":true,"disabled_reason":"","enabled_when":[],"options":[{"value":"manual","label":"Manual"},{"value":"aperture_priority","label":"Auto"}],"hint":"segmented"},{"id":"camera.exposure.exposure_time_absolute","label":"Exposure time","scope":"camera","type":"int","value":1250,"default":156,"stored":false,"enabled":false,"disabled_reason":"Set exposure to manual to change this","enabled_when":[{"id":"camera.exposure.auto_exposure","op":"in","value":["manual","shutter_priority"]}],"min":3,"max":2047,"step":1,"unit":"×100 µs"},{"id":"camera.exposure.keep_framerate","label":"Keep 30 fps in low light","scope":"camera","type":"bool","value":false,"default":true,"stored":true,"enabled":true,"disabled_reason":"","enabled_when":[],"hint":"switch","description":"Off lets the camera lower its frame rate in low light"}]}}"#
         );
         assert_eq!(
             lines[1],
@@ -2041,6 +2092,7 @@ mod tests {
                 disabled_reason: "Not installed".into(),
                 enabled_when: Vec::new(),
                 hint: Some("switch".into()),
+                description: None,
             }],
             surface: None,
         };
@@ -2227,6 +2279,7 @@ mod tests {
                 })
                 .collect(),
             hint: Some(nasty.clone()),
+            description: None,
         }
     }
 
@@ -2245,6 +2298,10 @@ mod tests {
                 default: i64::MIN,
                 value: i64::MIN,
                 unit: Some(nasty.clone()),
+                display: Some(obc_ipc::IntDisplay {
+                    offset: i64::MIN,
+                    scale: i64::MIN,
+                }),
             },
             SettingKind::Bool {
                 default: false,
@@ -2401,6 +2458,57 @@ mod tests {
     }
 
     #[test]
+    fn an_int_carries_its_display_transform_when_it_has_one() {
+        let int = |display| {
+            setting(
+                "camera.white_balance.temperature_compensation",
+                "Temperature compensation",
+                SettingKind::Int {
+                    min: 0,
+                    max: 100,
+                    step: 1,
+                    default: 50,
+                    value: 57,
+                    unit: Some("K".into()),
+                    display,
+                },
+            )
+        };
+        let tree = |s| SettingsTree {
+            revision: 1,
+            serial: 1,
+            camera: "usb-046d_0944".into(),
+            groups: vec![SettingsGroup {
+                id: "white_balance".into(),
+                label: "White balance".into(),
+                settings: vec![s],
+                surface: None,
+            }],
+        };
+        let lines = settings_lines(&tree(int(Some(obc_ipc::IntDisplay {
+            offset: 50,
+            scale: 40,
+        }))));
+        let v = parse(&lines[0]);
+        let s = &v["group"]["settings"][0];
+        assert_eq!(s["display_offset"], 50);
+        assert_eq!(s["display_scale"], 40);
+        // The numbers stay raw.
+        assert_eq!(
+            (s["value"].clone(), s["default"].clone()),
+            (57.into(), 50.into())
+        );
+        assert_eq!((s["min"].clone(), s["max"].clone()), (0.into(), 100.into()));
+        assert_eq!(s["unit"], "K");
+        assert!(lines[0].contains(r#""unit":"K","display_offset":50,"display_scale":40"#));
+        // None: neither key.
+        let lines = settings_lines(&tree(int(None)));
+        let v = parse(&lines[0]);
+        let s = &v["group"]["settings"][0];
+        assert!(s.get("display_offset").is_none() && s.get("display_scale").is_none());
+    }
+
+    #[test]
     fn a_settings_group_line_carries_its_surface_when_it_has_one() {
         let group = |surface: Option<&str>| SettingsGroup {
             id: "noise".into(),
@@ -2418,6 +2526,7 @@ mod tests {
                 disabled_reason: String::new(),
                 enabled_when: Vec::new(),
                 hint: None,
+                description: None,
             }],
             surface: surface.map(str::to_string),
         };
@@ -2452,6 +2561,9 @@ mod tests {
                 value: "5".into(),
                 current: "3".into(),
             }],
+            shutter: obc_ipc::SHUTTER_CLOSED.into(),
+            show_mode: obc_ipc::SHOW_MODE_DESK_VIEW.into(),
+            status: vec!["Shutter closed".into(), "Show Mode: desk view".into()],
         }
     }
 
@@ -2480,8 +2592,26 @@ mod tests {
                     "label": "Sharpness",
                     "value": "5",
                     "current": "3"
-                }]
+                }],
+                "shutter": "closed",
+                "show_mode": "desk_view",
+                "status": ["Shutter closed", "Show Mode: desk view"]
             })
+        );
+        // An older daemon's (no camera status keys): empty, the keys there.
+        let v = parse(&camera_health_line(&CameraHealth {
+            shutter: String::new(),
+            show_mode: String::new(),
+            status: Vec::new(),
+            ..h.clone()
+        }));
+        assert_eq!(
+            (&v["shutter"], &v["show_mode"], &v["status"]),
+            (
+                &Value::from(""),
+                &Value::from(""),
+                &Value::Array(Vec::new())
+            )
         );
         // Before revision 20: null, the key present.
         let mut s = sample();
@@ -2537,6 +2667,9 @@ mod tests {
                 };
                 40
             ],
+            shutter: nasty.clone(),
+            show_mode: nasty.clone(),
+            status: vec![nasty.clone(); 10],
         };
         let line = camera_health_line(&h);
         assert!(line.len() <= MAX_LINE_BYTES, "{} bytes", line.len());
@@ -2547,6 +2680,9 @@ mod tests {
         assert!(v["recommended"].as_array().unwrap().len() < MAX_RECOMMENDED);
         assert!(v["warnings"][0].as_str().unwrap().ends_with(ELLIPSIS));
         assert!(v["camera"].as_str().unwrap().ends_with(ELLIPSIS));
+        assert!(v["shutter"].as_str().unwrap().ends_with(ELLIPSIS));
+        assert!(v["show_mode"].as_str().unwrap().ends_with(ELLIPSIS));
+        assert!(v["status"].as_array().unwrap().len() <= MAX_HEALTH_STATUS);
         // In a snapshot at its worst: under the cap, the health's lists cut
         // before the cameras.
         let mut s = sample();

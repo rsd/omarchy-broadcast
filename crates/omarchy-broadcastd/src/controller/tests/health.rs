@@ -1,7 +1,9 @@
 //! `CameraHealth` (revision 20) against the fake backend: the delivered
 //! rate and the capture mode's label, the shared-hub and damaged-frames
 //! warnings, the suggestions, the recommended settings and
-//! `ApplyRecommendedSettings`, and the anti-flicker of the time zone.
+//! `ApplyRecommendedSettings`, the anti-flicker of the time zone, and the
+//! privacy shutter (revision 26) with the away image it shows, and the
+//! Show Mode read from the camera's HID interface.
 
 use obc_ipc::CameraHealth;
 use obc_pipeline::control_node::{MenuItem, MenuItemValue};
@@ -711,4 +713,343 @@ fn the_anti_flicker_follows_the_time_zone_at_an_open_unless_stored() {
             "{zone:?}"
         );
     }
+}
+
+/// A Logitech MX Brio in NV12: its status row says a closed privacy
+/// shutter shows as flat black frames.
+fn brio() -> Camera {
+    let mut c = cam("usb-brio", "MX Brio", Some("046d:0944"), "/dev/video2");
+    c.mode = mode("NV12:1920x1080@30");
+    c.modes = vec![c.mode];
+    c
+}
+
+/// The shutter as the ingest reads it: published at once when it changes
+/// (not on the counters' cadence), `Shutter closed` while closed, and with
+/// an away image chosen the writer's mask on while closed, so the feed
+/// shows the image in place of the camera's black. The session streams on
+/// untouched throughout; the camera off forgets the shutter and lifts the
+/// mask.
+#[test]
+fn a_closed_shutter_is_published_at_once_and_shows_the_away_image() {
+    use obc_pipeline::ShutterState::{Closed, Open};
+    let mut h = H::new(&away_config(""), |w| w.cameras = vec![brio()]);
+    let health = h.health();
+    assert_eq!((health.shutter.as_str(), health.status.len()), ("", 0));
+    h.activate(0);
+    h.world().shutter = Some(Open);
+    h.tick(1300);
+    let health = h.health();
+    assert_eq!(health.shutter, obc_ipc::SHUTTER_OPEN);
+    assert!(health.status.is_empty());
+    assert!(!h.world().mask);
+    h.drain();
+    let starts = h.world().session_starts;
+
+    // Closed: published at the next stats tick, the counters not due yet
+    // (2 s).
+    h.world().shutter = Some(Closed);
+    h.tick(2300);
+    let changes = h.health_changes();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].shutter, obc_ipc::SHUTTER_CLOSED);
+    assert_eq!(changes[0].status, ["Shutter closed"]);
+    assert!(h.world().mask, "the away image in place of the black");
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.world().session_starts, starts, "no restart");
+    assert!(h.world().session.is_some());
+
+    // Open again: cleared at once.
+    h.world().shutter = Some(Open);
+    h.tick(3300);
+    let health = h.health();
+    assert_eq!(health.shutter, obc_ipc::SHUTTER_OPEN);
+    assert!(health.status.is_empty());
+    assert_eq!(h.world().mask_sets, [true, false]);
+
+    // Closed, then the camera off: the shutter is unknown, the mask off.
+    h.world().shutter = Some(Closed);
+    h.tick(4300);
+    assert!(h.world().mask);
+    h.call(|r| Command::SetEnabled(false, r), 4500).unwrap();
+    assert_eq!(h.state(), State::Off);
+    assert!(!h.world().mask);
+    assert_eq!(h.health().shutter, "");
+    assert!(h.health().status.is_empty());
+    assert_eq!(h.world().session_starts, starts);
+}
+
+/// With no away image a closed shutter is published, and the camera's
+/// black shows as it is: the mask stays off. An away image chosen while
+/// it is closed masks the feed; unchosen, the mask goes.
+#[test]
+fn without_an_away_image_a_closed_shutter_leaves_the_feed_alone() {
+    let mut h = H::new("", |w| w.cameras = vec![brio()]);
+    h.activate(0);
+    h.world().shutter = Some(obc_pipeline::ShutterState::Closed);
+    h.tick(1300);
+    let health = h.health();
+    assert_eq!(health.shutter, obc_ipc::SHUTTER_CLOSED);
+    assert_eq!(health.status, ["Shutter closed"]);
+    assert!(h.world().mask_sets.is_empty());
+    h.reload(&away_config(""), 1500).unwrap();
+    h.tick(2300);
+    assert!(h.world().mask, "{:?}", h.snap());
+    h.reload("", 2500).unwrap();
+    h.tick(3300);
+    assert!(!h.world().mask);
+    assert_eq!(h.health().shutter, obc_ipc::SHUTTER_CLOSED);
+}
+
+/// A camera without a status row has no detector: its shutter is unknown.
+#[test]
+fn a_camera_without_a_status_row_has_no_shutter() {
+    let mut h = H::new(&away_config(""), |w| w.cameras = vec![c930e()]);
+    h.activate(0);
+    h.tick(1300);
+    assert_eq!(h.health().shutter, "");
+    assert!(!h.world().mask);
+}
+
+impl H {
+    /// An event of the orientation watcher of `generation` at `ms`.
+    fn orient(&mut self, generation: WatchGeneration, event: OrientationEvent, ms: u64) {
+        let now = self.at(ms);
+        assert!(
+            self.ctrl
+                .handle(Command::Orientation(generation, event), now)
+        );
+    }
+}
+
+/// A new ingest of the same camera (a mode change: a reopen) says nothing
+/// of the shutter until its first sample: a closed one stays closed and
+/// masked until the new frames say it is open. Another camera forgets it.
+#[test]
+fn a_closed_shutter_stays_masked_across_a_reopen_of_the_same_camera() {
+    use obc_pipeline::ShutterState::{Closed, Open};
+    let mut b = brio();
+    b.modes.push(mode("NV12:1280x720@30"));
+    let mut h = H::new(&away_config(""), |w| w.cameras = vec![b, c930e()]);
+    h.activate(0);
+    h.world().shutter = Some(Closed);
+    h.tick(1300);
+    assert!(h.world().mask);
+    // The mode changed: a new ingest, which has sampled nothing yet.
+    h.world().shutter = None;
+    h.set_setting(settings::MODE, str_value("1280x720@30"), 1500)
+        .unwrap();
+    assert_eq!(h.world().ingests.len(), 2, "reopened");
+    h.tick(2300);
+    h.tick(3300);
+    assert_eq!(h.health().shutter, obc_ipc::SHUTTER_CLOSED);
+    assert_eq!(h.world().mask_sets, [true], "never lifted");
+    // Its frames say open: lifted at once.
+    h.world().shutter = Some(Open);
+    h.tick(4300);
+    assert_eq!(h.health().shutter, obc_ipc::SHUTTER_OPEN);
+    assert_eq!(h.world().mask_sets, [true, false]);
+    // Closed again, then another camera: forgotten, the mask lifted, and
+    // the new camera's unknown reading is not taken for closed.
+    h.world().shutter = Some(Closed);
+    h.tick(5300);
+    assert!(h.world().mask);
+    h.world().shutter = None;
+    h.call(|r| Command::SelectCamera("usb-c930e".into(), r), 5500)
+        .unwrap();
+    h.tick(6300);
+    assert!(!h.world().mask);
+    assert_eq!(h.health().shutter, "");
+}
+
+/// A module change restarts the session (its last frame held): a closed
+/// shutter stays masked across it until the new session's frames say it
+/// is open.
+#[test]
+fn a_closed_shutter_stays_masked_across_a_module_restart() {
+    use obc_pipeline::ShutterState::{Closed, Open};
+    let mut h = H::new(&away_config("denoise = true\n"), |w| {
+        w.cameras = vec![brio()]
+    });
+    h.set_module(MAXINE_MODULE, false, 0);
+    h.activate(100);
+    h.world().shutter = Some(Closed);
+    h.tick(1400);
+    assert!(h.world().mask);
+    h.world().shutter = None;
+    h.set_module(MAXINE_MODULE, true, 1500);
+    h.tick(1900);
+    assert_eq!(h.world().session_starts, 2, "restarted");
+    assert_eq!(h.world().restart_holds, [true]);
+    h.tick(3300);
+    assert_eq!(h.state(), State::Active);
+    assert_eq!(h.health().shutter, obc_ipc::SHUTTER_CLOSED);
+    assert_eq!(h.world().mask_sets, [true], "never lifted");
+    h.world().shutter = Some(Open);
+    h.tick(4300);
+    assert_eq!(h.world().mask_sets, [true, false]);
+}
+
+/// The MX Brio's Show Mode, read from its HID interface only while the
+/// session has it open (streaming): an open `hidraw` node would keep the
+/// idle camera from autosuspending. Unknown until the watcher reports,
+/// then published at once with its status line, after `Shutter closed`
+/// when both show. The session stopping (idle) stops the watcher and
+/// clears it; another camera does too; an event of a stopped watcher
+/// changes nothing; a watcher that ended by itself (unplugged) leaves it
+/// unknown, not started again until the cameras are scanned again.
+#[test]
+fn the_show_mode_is_read_only_while_the_camera_streams() {
+    use obc_pipeline::hid_orientation::Orientation::{DeskView, Normal};
+    let mut h = H::new("", |w| w.cameras = vec![brio(), c930e()]);
+    // Idle: no watcher, the node stays closed.
+    assert_eq!(h.world().orientation_watch, None);
+    assert_eq!(h.world().orientation_starts, 0);
+    let health = h.health();
+    assert_eq!(health.show_mode, "");
+    assert!(health.status.is_empty());
+    h.tick(5000);
+    assert_eq!(h.world().orientation_starts, 0, "not while idle");
+
+    // Streaming: the watcher starts with the session.
+    h.activate(6000);
+    let (camera, report) = h.world().orientation_watch.clone().expect("watching");
+    assert_eq!(camera, "usb-brio");
+    assert_eq!(
+        (report.report_id, report.byte, report.flipped),
+        (0x55, 5, 1)
+    );
+    let generation = h.world().orientation_generation;
+    assert_eq!(h.health().show_mode, "");
+    h.drain();
+
+    // Turned down to the desk: published at once, no tick needed.
+    h.orient(generation, OrientationEvent::Changed(DeskView), 7000);
+    let changes = h.health_changes();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].show_mode, obc_ipc::SHOW_MODE_DESK_VIEW);
+    assert_eq!(changes[0].status, ["Show Mode: desk view"]);
+    h.orient(generation, OrientationEvent::Changed(Normal), 8000);
+    let changes = h.health_changes();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].show_mode, obc_ipc::SHOW_MODE_NORMAL);
+    assert_eq!(changes[0].status, ["Show Mode: normal"]);
+    // The same value again: nothing to announce.
+    h.orient(generation, OrientationEvent::Changed(Normal), 8100);
+    assert!(h.health_changes().is_empty());
+    // With the shutter closed: both lines, the shutter's first.
+    h.world().shutter = Some(obc_pipeline::ShutterState::Closed);
+    h.tick(9300);
+    assert_eq!(h.health().status, ["Shutter closed", "Show Mode: normal"]);
+    assert_eq!(h.world().orientation_starts, 1);
+    h.world().shutter = None;
+
+    // Idle: the session stops, the watcher with it, the Show Mode cleared.
+    h.consumers(0, 10_000);
+    h.tick(30_000);
+    assert_eq!(h.state(), State::Idle);
+    assert!(h.world().session.is_none());
+    assert_eq!(h.world().orientation_watch, None);
+    assert_eq!(h.world().orientation_stops, 1);
+    let health = h.health();
+    assert_eq!(health.show_mode, "");
+    assert!(health.status.is_empty());
+    // An event of the stopped watcher changes nothing.
+    h.orient(generation, OrientationEvent::Changed(DeskView), 30_100);
+    assert_eq!(h.health().show_mode, "");
+
+    // Streaming again: a new watcher, unknown until it reports; the old
+    // one's events are ignored.
+    h.activate(31_000);
+    let again = h.world().orientation_generation;
+    assert!(again > generation);
+    assert_eq!(h.world().orientation_starts, 2);
+    assert_eq!(h.health().show_mode, "");
+    h.orient(generation, OrientationEvent::Changed(DeskView), 31_400);
+    assert_eq!(h.health().show_mode, "");
+    h.orient(again, OrientationEvent::Changed(DeskView), 31_500);
+    assert_eq!(h.health().show_mode, obc_ipc::SHOW_MODE_DESK_VIEW);
+
+    // Another camera: the watcher stops, the Show Mode is cleared.
+    h.call(|r| Command::SelectCamera("usb-c930e".into(), r), 32_000)
+        .unwrap();
+    assert_eq!(h.world().orientation_watch, None);
+    assert_eq!(h.world().orientation_stops, 2);
+    let health = h.health();
+    assert_eq!(
+        (health.camera.as_str(), health.show_mode.as_str()),
+        ("usb-c930e", "")
+    );
+    assert!(health.status.is_empty());
+    // Back: a new watcher.
+    h.call(|r| Command::SelectCamera("usb-brio".into(), r), 33_000)
+        .unwrap();
+    let back = h.world().orientation_generation;
+    assert!(back > again);
+    h.orient(back, OrientationEvent::Changed(Normal), 33_100);
+    assert_eq!(h.health().show_mode, obc_ipc::SHOW_MODE_NORMAL);
+
+    // Unplugged: the watcher ends by itself; unknown, not restarted by the
+    // steps that follow, restarted by the next scan.
+    h.orient(
+        back,
+        OrientationEvent::Ended("No such device".into()),
+        34_000,
+    );
+    assert_eq!(h.world().orientation_watch, None);
+    let health = h.health();
+    assert_eq!(health.show_mode, "");
+    assert!(health.status.is_empty());
+    let starts = h.world().orientation_starts;
+    h.tick(35_000);
+    h.tick(36_000);
+    assert_eq!(h.world().orientation_starts, starts);
+    h.rescan(37_000);
+    assert_eq!(h.world().orientation_starts, starts + 1);
+    assert!(h.world().orientation_watch.is_some());
+}
+
+/// A camera whose HID node is missing or cannot be read: the Show Mode is
+/// unknown (`""`, no line), one warning names the problem, and the watcher
+/// is not retried at every step nor at each new session; a scan tries
+/// again without warning again. A camera without an orientation report
+/// never gets a watcher.
+#[test]
+fn an_unreadable_hid_node_leaves_the_show_mode_unknown_and_warns_once() {
+    let why = "MX Brio: its Show Mode is not shown: its HID node /dev/hidraw0 cannot be read: \
+               Permission denied (os error 13); read access to /dev/hidraw0 is needed (such \
+               as a udev uaccess rule gives)";
+    crate::log::take_lines();
+    let mut h = H::new("", |w| {
+        w.cameras = vec![brio()];
+        w.fail_orientation = Some(why.into());
+    });
+    assert_eq!(h.world().orientation_starts, 0, "not while idle");
+    h.activate(1000);
+    let health = h.health();
+    assert_eq!(health.show_mode, "");
+    assert!(health.status.is_empty());
+    assert_eq!(h.world().orientation_starts, 1);
+    h.tick(3000);
+    h.tick(5000);
+    assert_eq!(h.world().orientation_starts, 1, "no retry at each step");
+    // Idle, then streaming again: not retried.
+    h.consumers(0, 6000);
+    h.tick(30_000);
+    assert_eq!(h.state(), State::Idle);
+    h.activate(31_000);
+    assert_eq!(h.world().orientation_starts, 1, "no retry at each session");
+    h.rescan(32_000);
+    assert_eq!(h.world().orientation_starts, 2);
+    assert_eq!(h.health().show_mode, "");
+    let warned: Vec<String> = crate::log::take_lines()
+        .into_iter()
+        .filter(|l| l.contains("Show Mode"))
+        .collect();
+    assert_eq!(warned, [format!("warning: {why}")]);
+
+    let mut h = H::new("", |w| w.cameras = vec![c930e()]);
+    h.activate(0);
+    assert_eq!(h.world().orientation_starts, 0);
+    assert_eq!(h.health().show_mode, "");
 }

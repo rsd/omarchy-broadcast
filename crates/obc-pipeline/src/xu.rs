@@ -29,9 +29,9 @@
 //! with the row again (its size, get and set), then `GET_CUR` of the whole
 //! control; nothing is written when any of them fails or disagrees, or the
 //! byte is already the one asked for, else the read with only the row's
-//! byte changed is written back. The other bytes of a longer control (the
-//! MX Brio's RightSight block) are never invented or cached: they are
-//! those of that fresh read.
+//! byte changed is written back. The other bytes of a longer control (a
+//! row whose size is more than one byte, its byte at an offset in it) are
+//! never invented or cached: they are those of that fresh read.
 //!
 //! A row is offered only when the device agrees ([`XuControl::probe`]):
 //! `GET_LEN` equals the row's size and `GET_INFO` says it can be read and
@@ -249,10 +249,6 @@ impl XuRow {
 /// Brio; found by GUID, never by unit id).
 pub const LOGITECH_UNIT_GUID: &str = "49e40215-f434-47fe-b158-0e885023e51b";
 
-/// The Logitech unit of the RightSight auto-framing block (unit 22 on an
-/// MX Brio).
-pub const RIGHTSIGHT_UNIT_GUID: &str = "29144c1f-658d-4f47-a40f-0ed339428bf0";
-
 /// A Logitech unit an MX Brio carries that no row may reach.
 pub const LOGITECH_DENIED_UNIT_GUID: &str = "ffe52d21-8030-4e2c-82d9-f587d00540bd";
 
@@ -278,9 +274,19 @@ fn is_denied(guid: &str, selector: u8) -> bool {
         .any(|(g, sel)| g.eq_ignore_ascii_case(guid) && sel.is_none_or(|s| s == selector))
 }
 
-/// Whether `row` is exactly one of [`XU_ROWS`] (every field).
+/// The rows a query may be issued for: [`XU_ROWS`], and in this module's
+/// own unit tests the test-only rows of a multi-byte block (no camera has
+/// them; they keep the read-modify-write of a longer control tested).
+fn known_rows() -> impl Iterator<Item = &'static XuRow> {
+    let rows = XU_ROWS.iter();
+    #[cfg(test)]
+    let rows = rows.chain(tests::TEST_BLOCK_ROWS.iter());
+    rows
+}
+
+/// Whether `row` is exactly one of [`known_rows`] (every field).
 fn is_known_row(row: &XuRow) -> bool {
-    XU_ROWS.contains(row)
+    known_rows().any(|r| r == row)
 }
 
 /// The Logitech MX Brio (USB 046d:0944).
@@ -396,90 +402,6 @@ pub const TEMPERATURE_COMPENSATION: XuRow = XuRow {
     unknown_reason: UNKNOWN_VALUE,
 };
 
-/// The size of the MX Brio's RightSight block (selector 1 of
-/// [`RIGHTSIGHT_UNIT_GUID`]): byte 1 is on or off, byte 2 the framing
-/// speed, byte 3 the framing distance; the others are copied from a fresh
-/// read on every write. The device answers every `GET_*` of it with the
-/// same bytes, so it publishes no range: speed and distance stay 0 to 2.
-pub const RIGHTSIGHT_BLOCK: u16 = 30;
-
-/// The MX Brio's RightSight auto-framing, on or off.
-pub const RIGHTSIGHT: XuRow = XuRow {
-    name: "rightsight",
-    label: "RightSight",
-    usb_ids: MX_BRIO,
-    guid: RIGHTSIGHT_UNIT_GUID,
-    selector: 0x01,
-    size: RIGHTSIGHT_BLOCK,
-    offset: 1,
-    kind: XuKind::Bool,
-    unknown_reason: UNKNOWN_VALUE,
-};
-
-/// How fast RightSight follows.
-pub const RIGHTSIGHT_SPEED: XuRow = XuRow {
-    name: "rightsight_speed",
-    label: "Framing speed",
-    usb_ids: MX_BRIO,
-    guid: RIGHTSIGHT_UNIT_GUID,
-    selector: 0x01,
-    size: RIGHTSIGHT_BLOCK,
-    offset: 2,
-    kind: XuKind::Menu {
-        options: &[
-            XuOption {
-                id: "slower",
-                label: "Slower",
-                value: 0,
-            },
-            XuOption {
-                id: "default",
-                label: "Default",
-                value: 1,
-            },
-            XuOption {
-                id: "faster",
-                label: "Faster",
-                value: 2,
-            },
-        ],
-        default: 1,
-    },
-    unknown_reason: UNKNOWN_VALUE,
-};
-
-/// How close RightSight frames.
-pub const RIGHTSIGHT_DISTANCE: XuRow = XuRow {
-    name: "rightsight_distance",
-    label: "Framing distance",
-    usb_ids: MX_BRIO,
-    guid: RIGHTSIGHT_UNIT_GUID,
-    selector: 0x01,
-    size: RIGHTSIGHT_BLOCK,
-    offset: 3,
-    kind: XuKind::Menu {
-        options: &[
-            XuOption {
-                id: "closer",
-                label: "Closer",
-                value: 0,
-            },
-            XuOption {
-                id: "default",
-                label: "Default",
-                value: 1,
-            },
-            XuOption {
-                id: "farther",
-                label: "Farther",
-                value: 2,
-            },
-        ],
-        default: 1,
-    },
-    unknown_reason: UNKNOWN_VALUE,
-};
-
 /// Every Extension Unit setting known.
 pub const XU_ROWS: &[XuRow] = &[
     FIELD_OF_VIEW,
@@ -487,9 +409,6 @@ pub const XU_ROWS: &[XuRow] = &[
     EXPOSURE_COMPENSATION,
     VIBRANCE,
     TEMPERATURE_COMPENSATION,
-    RIGHTSIGHT,
-    RIGHTSIGHT_SPEED,
-    RIGHTSIGHT_DISTANCE,
 ];
 
 /// The rows that apply to the camera with USB id `usb`, in table order.
@@ -768,8 +687,7 @@ fn check_xu_query(
             target.guid
         )));
     }
-    if !XU_ROWS
-        .iter()
+    if !known_rows()
         .any(|r| r.guid == target.guid && r.selector == selector && r.size == target.size)
     {
         return Err(refused(format!(
@@ -1115,7 +1033,7 @@ mod tests {
             .iter()
             .map(|r| (r.name, r.label, r.guid, r.selector, r.size, r.offset))
             .collect();
-        let (a, b) = (LOGITECH_UNIT_GUID, RIGHTSIGHT_UNIT_GUID);
+        let a = LOGITECH_UNIT_GUID;
         assert_eq!(
             rows,
             [
@@ -1138,13 +1056,9 @@ mod tests {
                     1,
                     0
                 ),
-                ("rightsight", "RightSight", b, 0x01, 30, 1),
-                ("rightsight_speed", "Framing speed", b, 0x01, 30, 2),
-                ("rightsight_distance", "Framing distance", b, 0x01, 30, 3),
             ]
         );
         assert_eq!(SHOW_MODE.kind, XuKind::Bool);
-        assert_eq!(RIGHTSIGHT.kind, XuKind::Bool);
         assert_eq!(
             EXPOSURE_COMPENSATION.kind,
             XuKind::Range {
@@ -1172,20 +1086,9 @@ mod tests {
         let ids = |r: &XuRow| -> Vec<(&str, u8)> {
             r.options().iter().map(|o| (o.id, o.value)).collect()
         };
-        assert_eq!(
-            ids(&RIGHTSIGHT_SPEED),
-            [("slower", 0), ("default", 1), ("faster", 2)]
-        );
-        assert_eq!(
-            ids(&RIGHTSIGHT_DISTANCE),
-            [("closer", 0), ("default", 1), ("farther", 2)]
-        );
         assert_eq!(ids(&SHOW_MODE), [("off", 0), ("on", 1)]);
         for (r, def) in [
             (&SHOW_MODE, "off"),
-            (&RIGHTSIGHT, "off"),
-            (&RIGHTSIGHT_SPEED, "default"),
-            (&RIGHTSIGHT_DISTANCE, "default"),
             (&EXPOSURE_COMPENSATION, "128"),
             (&VIBRANCE, "128"),
             (&TEMPERATURE_COMPENSATION, "50"),
@@ -1197,10 +1100,13 @@ mod tests {
             );
             assert_eq!(r.usb_ids, [(0x046d, 0x0944)], "{}", r.name);
         }
-        // Every row: a valid GUID, its byte inside its size, at least one
-        // option, distinct option ids and bytes, a fallback default that is
-        // one of its options, a distinct name.
-        for (i, row) in XU_ROWS.iter().enumerate() {
+        // Every row (the test-only block rows too): a valid GUID, its byte
+        // inside its size, at least one option, distinct option ids and
+        // bytes, a fallback default that is one of its options, a distinct
+        // name.
+        let known: Vec<&XuRow> = known_rows().collect();
+        assert_eq!(known.len(), XU_ROWS.len() + TEST_BLOCK_ROWS.len());
+        for (i, row) in known.iter().enumerate() {
             assert!(row.guid_bytes().is_some(), "{}", row.name);
             assert!(row.offset < row.size, "{}", row.name);
             let options = row.options();
@@ -1218,7 +1124,7 @@ mod tests {
             };
             assert_eq!(row.fallback_default().value, default, "{}", row.name);
             assert!(options.contains(row.fallback_default()), "{}", row.name);
-            assert!(XU_ROWS[i + 1..].iter().all(|r| r.name != row.name));
+            assert!(known[i + 1..].iter().all(|r| r.name != row.name));
         }
     }
 
@@ -1264,8 +1170,8 @@ mod tests {
             assert_eq!(SHOW_MODE.option(bad), None, "{bad:?}");
         }
         assert_eq!(SHOW_MODE.option_for_value(2), None);
-        assert_eq!(RIGHTSIGHT_SPEED.option("1"), None);
-        assert_eq!(RIGHTSIGHT_SPEED.option_for_value(3), None);
+        assert_eq!(TEST_BLOCK_SPEED.option("1"), None);
+        assert_eq!(TEST_BLOCK_SPEED.option_for_value(3), None);
     }
 
     #[test]
@@ -1283,9 +1189,6 @@ mod tests {
                 "exposure_compensation",
                 "vibrance",
                 "temperature_compensation",
-                "rightsight",
-                "rightsight_speed",
-                "rightsight_distance",
             ]
         );
         // The Brio: the field of view only.
@@ -1294,7 +1197,14 @@ mod tests {
             product: 0x085e,
         };
         assert_eq!(rows_for(brio), [&FIELD_OF_VIEW]);
-        for (vendor, product) in [(0x046d, 0x0943), (0x1234, 0x0944), (0, 0)] {
+        // The test-only block rows are no camera's.
+        let (vendor, product) = TEST_USB_ID;
+        for (vendor, product) in [
+            (0x046d, 0x0943),
+            (0x1234, 0x0944),
+            (0, 0),
+            (vendor, product),
+        ] {
             assert!(rows_for(UsbId { vendor, product }).is_empty());
         }
     }
@@ -1546,7 +1456,7 @@ mod tests {
         assert!(check_xu_query(&rogue, 11, 9, UVC_GET_CUR, 5).is_err());
         // A row's selector and size under another unit's GUID: refused.
         for (guid, sel, size) in [
-            (RIGHTSIGHT_UNIT_GUID, 5, 1),
+            (TEST_BLOCK_UNIT_GUID, 5, 1),
             (LOGITECH_UNIT_GUID, 1, 30),
             ("2c49d16a-32b8-4485-3ea8-643a152362f2", 5, 1),
         ] {
@@ -1608,11 +1518,140 @@ mod tests {
         assert!(!device_agrees(r, 1, 0x00));
     }
 
-    /// The RightSight unit's GUID in descriptor byte order.
-    const RIGHTSIGHT_GUID: [u8; 16] = [
-        0x1f, 0x4c, 0x14, 0x29, 0x8d, 0x65, 0x47, 0x4f, 0xa4, 0x0f, 0x0e, 0xd3, 0x39, 0x42, 0x8b,
-        0xf0,
+    /// A USB id no camera has: the test-only block rows'.
+    const TEST_USB_ID: (u16, u16) = (0xfffe, 0xfffd);
+
+    /// The unit of the test-only block rows: a GUID no camera carries.
+    const TEST_BLOCK_UNIT_GUID: &str = "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9";
+
+    /// [`TEST_BLOCK_UNIT_GUID`] in descriptor byte order.
+    const TEST_BLOCK_GUID: [u8; 16] = [
+        0x3e, 0x2d, 0x1c, 0x0b, 0x50, 0x4f, 0x17, 0x46, 0x82, 0x93, 0xa4, 0xb5, 0xc6, 0xd7, 0xe8,
+        0xf9,
     ];
+
+    /// The size of the test-only block: selector 1 of
+    /// [`TEST_BLOCK_UNIT_GUID`], byte 1 on or off, bytes 2 and 3 a menu
+    /// each; the others are copied from a fresh read on every write.
+    const TEST_BLOCK: u16 = 30;
+
+    /// A test-only multi-byte control's byte 1, off or on.
+    const TEST_BLOCK_ON: XuRow = XuRow {
+        name: "test_block_on",
+        label: "Block on",
+        usb_ids: &[TEST_USB_ID],
+        guid: TEST_BLOCK_UNIT_GUID,
+        selector: 0x01,
+        size: TEST_BLOCK,
+        offset: 1,
+        kind: XuKind::Bool,
+        unknown_reason: UNKNOWN_VALUE,
+    };
+
+    /// The test-only block's byte 2, a menu.
+    const TEST_BLOCK_SPEED: XuRow = XuRow {
+        name: "test_block_speed",
+        label: "Block speed",
+        offset: 2,
+        kind: XuKind::Menu {
+            options: &[
+                XuOption {
+                    id: "slower",
+                    label: "Slower",
+                    value: 0,
+                },
+                XuOption {
+                    id: "default",
+                    label: "Default",
+                    value: 1,
+                },
+                XuOption {
+                    id: "faster",
+                    label: "Faster",
+                    value: 2,
+                },
+            ],
+            default: 1,
+        },
+        ..TEST_BLOCK_ON
+    };
+
+    /// The test-only block's byte 3, a menu.
+    const TEST_BLOCK_DISTANCE: XuRow = XuRow {
+        name: "test_block_distance",
+        label: "Block distance",
+        offset: 3,
+        kind: XuKind::Menu {
+            options: &[
+                XuOption {
+                    id: "closer",
+                    label: "Closer",
+                    value: 0,
+                },
+                XuOption {
+                    id: "default",
+                    label: "Default",
+                    value: 1,
+                },
+                XuOption {
+                    id: "farther",
+                    label: "Farther",
+                    value: 2,
+                },
+            ],
+            default: 1,
+        },
+        ..TEST_BLOCK_ON
+    };
+
+    /// The rows [`known_rows`] adds in this module's tests only.
+    pub(super) const TEST_BLOCK_ROWS: &[XuRow] =
+        &[TEST_BLOCK_ON, TEST_BLOCK_SPEED, TEST_BLOCK_DISTANCE];
+
+    #[test]
+    fn the_test_block_rows() {
+        assert_eq!(parse_guid(TEST_BLOCK_UNIT_GUID), Some(TEST_BLOCK_GUID));
+        let rows: Vec<(&str, u16, u16)> = TEST_BLOCK_ROWS
+            .iter()
+            .map(|r| (r.name, r.size, r.offset))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("test_block_on", 30, 1),
+                ("test_block_speed", 30, 2),
+                ("test_block_distance", 30, 3),
+            ]
+        );
+        let ids = |r: &XuRow| -> Vec<(&str, u8)> {
+            r.options().iter().map(|o| (o.id, o.value)).collect()
+        };
+        assert_eq!(ids(&TEST_BLOCK_ON), [("off", 0), ("on", 1)]);
+        assert_eq!(
+            ids(&TEST_BLOCK_SPEED),
+            [("slower", 0), ("default", 1), ("faster", 2)]
+        );
+        assert_eq!(
+            ids(&TEST_BLOCK_DISTANCE),
+            [("closer", 0), ("default", 1), ("farther", 2)]
+        );
+        for (r, def) in [
+            (&TEST_BLOCK_ON, "off"),
+            (&TEST_BLOCK_SPEED, "default"),
+            (&TEST_BLOCK_DISTANCE, "default"),
+        ] {
+            assert_eq!(r.fallback_default().id, def, "{}", r.name);
+            // Never a production row, never on the deny list.
+            assert!(!XU_ROWS.contains(r), "{}", r.name);
+            assert!(!is_denied(r.guid, r.selector), "{}", r.name);
+            assert!(is_known_row(r), "{}", r.name);
+        }
+        assert!(
+            !XU_ROWS
+                .iter()
+                .any(|r| r.guid.eq_ignore_ascii_case(TEST_BLOCK_UNIT_GUID))
+        );
+    }
 
     /// One control of a [`FakeIo`].
     #[derive(Debug, Clone)]
@@ -1672,8 +1711,7 @@ mod tests {
                 assert!(XU_QUERIES.contains(q), "{q:#x}");
                 assert!(*sel != 0x12, "unit {unit} selector 0x12");
                 assert!(*sel != 0x06, "unit {unit} selector 0x06");
-                let sizes: Vec<usize> = XU_ROWS
-                    .iter()
+                let sizes: Vec<usize> = known_rows()
                     .filter(|r| r.selector == *sel)
                     .map(|r| usize::from(r.size))
                     .collect();
@@ -1729,8 +1767,8 @@ mod tests {
         }
     }
 
-    /// The RightSight block as an MX Brio reads: byte 0 0x01, off, speed
-    /// and distance default, byte 4 `b4`, byte 5 0x01, then a non-zero
+    /// The test block as a camera reads it: byte 0 0x01, off, speed and
+    /// distance default, byte 4 `b4`, byte 5 0x01, then a non-zero
     /// pattern (a write that zeroed or invented them would show).
     fn block(b4: u8) -> Vec<u8> {
         let mut d = vec![0x01, 0x00, 0x01, 0x01, b4, 0x01];
@@ -1739,7 +1777,7 @@ mod tests {
         d
     }
 
-    fn rightsight_ctl(unit: u8, cur: Vec<u8>) -> FakeCtl {
+    fn block_ctl(unit: u8, cur: Vec<u8>) -> FakeCtl {
         FakeCtl {
             unit,
             selector: 0x01,
@@ -1758,26 +1796,27 @@ mod tests {
     fn the_new_rows_resolve_by_guid_not_by_unit_id() {
         let both = [
             extension_unit(10, &FOV_GUID),
-            extension_unit(22, &RIGHTSIGHT_GUID),
+            extension_unit(22, &TEST_BLOCK_GUID),
         ]
         .concat();
         let elsewhere = [
             extension_unit(22, &FOV_GUID),
-            extension_unit(4, &RIGHTSIGHT_GUID),
+            extension_unit(4, &TEST_BLOCK_GUID),
         ]
         .concat();
         for (tail, a, b) in [(both, 10, 22), (elsewhere, 22, 4)] {
             let desc = camera(&tail, &[]);
-            for row in XU_ROWS {
+            for row in known_rows() {
                 let unit = XuControl::resolve(row, &desc, 1).map(|x| x.unit());
-                let want = if row.guid == RIGHTSIGHT_UNIT_GUID {
+                let want = if row.guid == TEST_BLOCK_UNIT_GUID {
                     b
                 } else {
                     a
                 };
                 assert_eq!(unit, Some(want), "{}", row.name);
             }
-            // Through sysfs: every MX Brio row, the Brio's field of view.
+            // Through sysfs: every MX Brio row (no test block row: it is
+            // no camera's), the Brio's field of view.
             let (root, node) = fake_sysfs("046d\n", "0944\n", &desc);
             let found: Vec<(&str, u8)> = find_xu_controls(root.path(), &node)
                 .unwrap()
@@ -1786,21 +1825,21 @@ mod tests {
                 .collect();
             assert_eq!(found.len(), XU_ROWS.len());
             assert_eq!(found[0], ("field_of_view", a));
-            assert_eq!(found[5], ("rightsight", b));
-            assert_eq!(found[7], ("rightsight_distance", b));
+            assert_eq!(found[4], ("temperature_compensation", a));
+            assert!(found.iter().all(|(_, unit)| *unit == a));
             let (root, node) = fake_sysfs("046d\n", "085e\n", &desc);
             let found = find_xu_controls(root.path(), &node).unwrap();
             assert_eq!(found.len(), 1);
             assert_eq!(found[0].row().name, "field_of_view");
         }
-        // The Logitech unit alone: no RightSight rows.
+        // The Logitech unit alone: no block rows.
         let desc = camera(&extension_unit(10, &FOV_GUID), &[]);
-        assert!(XuControl::resolve(&RIGHTSIGHT, &desc, 1).is_none());
+        assert!(XuControl::resolve(&TEST_BLOCK_ON, &desc, 1).is_none());
         assert_eq!(
             XuControl::resolve(&SHOW_MODE, &desc, 1).map(|x| x.unit()),
             Some(10)
         );
-        assert_eq!(RIGHTSIGHT.guid_bytes(), Some(RIGHTSIGHT_GUID));
+        assert_eq!(TEST_BLOCK_ON.guid_bytes(), Some(TEST_BLOCK_GUID));
     }
 
     #[test]
@@ -1810,7 +1849,7 @@ mod tests {
             one_byte(10, 0x14, 0x80, 0x80),
             one_byte(10, 0x15, 0x39, 0x32),
             one_byte(10, 0x0d, 0x01, 0x00),
-            rightsight_ctl(22, block(0x5a)),
+            block_ctl(22, block(0x5a)),
         ]);
         let cases: [(&'static XuRow, u8, &[&str]); 7] = [
             (
@@ -1821,9 +1860,9 @@ mod tests {
             (&TEMPERATURE_COMPENSATION, 10, &["101", "255", "-1", "050"]),
             (&VIBRANCE, 10, &["256", "-1", "07", ""]),
             (&SHOW_MODE, 10, &["1", "2", "true", "On"]),
-            (&RIGHTSIGHT, 22, &["1", "true"]),
-            (&RIGHTSIGHT_SPEED, 22, &["2", "fast", "Faster"]),
-            (&RIGHTSIGHT_DISTANCE, 22, &["0", "far"]),
+            (&TEST_BLOCK_ON, 22, &["1", "true"]),
+            (&TEST_BLOCK_SPEED, 22, &["2", "fast", "Faster"]),
+            (&TEST_BLOCK_DISTANCE, 22, &["0", "far"]),
         ];
         for (row, unit, bad) in cases {
             for id in bad {
@@ -1867,11 +1906,11 @@ mod tests {
     fn a_failed_read_writes_nothing() {
         for (row, ctl) in [
             (&VIBRANCE, one_byte(10, 0x14, 0x80, 0x80)),
-            (&RIGHTSIGHT, rightsight_ctl(22, block(0x5a))),
+            (&TEST_BLOCK_ON, block_ctl(22, block(0x5a))),
         ] {
             let mut io = FakeIo::with(std::slice::from_ref(&ctl));
             io.fail = vec![UVC_GET_CUR];
-            let id = if row.name == "rightsight" {
+            let id = if row.kind == XuKind::Bool {
                 "on"
             } else {
                 "200"
@@ -1892,11 +1931,11 @@ mod tests {
     }
 
     #[test]
-    fn the_rightsight_block_is_read_modified_and_written_whole() {
-        let mut io = FakeIo::with(&[rightsight_ctl(22, block(0x5a))]);
-        let on = control(&RIGHTSIGHT, 22);
-        let speed = control(&RIGHTSIGHT_SPEED, 22);
-        let distance = control(&RIGHTSIGHT_DISTANCE, 22);
+    fn a_block_is_read_modified_and_written_whole() {
+        let mut io = FakeIo::with(&[block_ctl(22, block(0x5a))]);
+        let on = control(&TEST_BLOCK_ON, 22);
+        let speed = control(&TEST_BLOCK_SPEED, 22);
+        let distance = control(&TEST_BLOCK_DISTANCE, 22);
         let steps: [(XuControl, &str, usize, u8, u8); 3] = [
             (on, "on", 1, 1, 0x5a),
             (speed, "faster", 2, 2, 0x50),
@@ -1946,15 +1985,15 @@ mod tests {
         let mut cur = block(0x5a);
         cur[1] = 1;
         cur[3] = 2;
-        let mut io = FakeIo::with(&[rightsight_ctl(22, cur)]);
+        let mut io = FakeIo::with(&[block_ctl(22, cur)]);
         io.ctl(22, 1).def[2] = 2;
-        let s = control(&RIGHTSIGHT, 22)
+        let s = control(&TEST_BLOCK_ON, 22)
             .probe_with(&mut io)
             .unwrap()
             .unwrap();
         assert_eq!((s.current, s.current_option.map(|o| o.id)), (1, Some("on")));
         assert_eq!((s.default_raw, s.default.id), (Some(0), "off"));
-        let s = control(&RIGHTSIGHT_SPEED, 22)
+        let s = control(&TEST_BLOCK_SPEED, 22)
             .probe_with(&mut io)
             .unwrap()
             .unwrap();
@@ -1962,7 +2001,7 @@ mod tests {
             (s.current, s.default_raw, s.default.id),
             (1, Some(2), "faster")
         );
-        let s = control(&RIGHTSIGHT_DISTANCE, 22)
+        let s = control(&TEST_BLOCK_DISTANCE, 22)
             .probe_with(&mut io)
             .unwrap()
             .unwrap();
@@ -1976,7 +2015,7 @@ mod tests {
         // An unknown byte; a failing GET_DEF: the row's fallback default.
         io.ctl(22, 1).cur[2] = 7;
         io.fail = vec![UVC_GET_DEF];
-        let s = control(&RIGHTSIGHT_SPEED, 22)
+        let s = control(&TEST_BLOCK_SPEED, 22)
             .probe_with(&mut io)
             .unwrap()
             .unwrap();
@@ -1986,7 +2025,10 @@ mod tests {
         for len in [1, 29, 31, 0] {
             io.ctl(22, 1).len = len;
             io.log.clear();
-            assert_eq!(control(&RIGHTSIGHT, 22).probe_with(&mut io).unwrap(), None);
+            assert_eq!(
+                control(&TEST_BLOCK_ON, 22).probe_with(&mut io).unwrap(),
+                None
+            );
             assert_eq!(io.codes(), [UVC_GET_LEN, UVC_GET_INFO], "{len}");
         }
         io.assert_only_allowed();
@@ -2048,10 +2090,10 @@ mod tests {
             assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
             assert!(io.log.is_empty());
         }
-        // The RightSight block: its size only.
+        // The test block: its size only.
         let allow = [XuTarget {
             unit: 22,
-            guid: RIGHTSIGHT_UNIT_GUID,
+            guid: TEST_BLOCK_UNIT_GUID,
             selector: 1,
             size: 30,
         }];
@@ -2098,7 +2140,7 @@ mod tests {
         assert!((0..=255).all(|s| is_denied(LOGITECH_DENIED_UNIT_GUID, s)));
         assert!(!XU_ROWS.iter().any(|r| is_denied(r.guid, r.selector)));
         assert!(!is_denied(LOGITECH_UNIT_GUID, 0x05));
-        assert!(!is_denied(RIGHTSIGHT_UNIT_GUID, 0x06));
+        assert!(!is_denied(TEST_BLOCK_UNIT_GUID, 0x06));
     }
 
     /// A row made outside [`XU_ROWS`] on the denied unit, with the field
@@ -2108,17 +2150,17 @@ mod tests {
         ..FIELD_OF_VIEW
     };
 
-    /// A row made outside [`XU_ROWS`]: the RightSight block's selector and
+    /// A row made outside the known rows: the test block's selector and
     /// size, on the Logitech unit.
     static ROGUE_BLOCK: XuRow = XuRow {
         guid: LOGITECH_UNIT_GUID,
-        ..RIGHTSIGHT
+        ..TEST_BLOCK_ON
     };
 
     /// A row equal to a known one but for its byte.
     static ROGUE_OFFSET: XuRow = XuRow {
         offset: 4,
-        ..RIGHTSIGHT
+        ..TEST_BLOCK_ON
     };
 
     #[test]
@@ -2127,7 +2169,7 @@ mod tests {
         let desc = camera(
             &[
                 extension_unit(10, &FOV_GUID),
-                extension_unit(22, &RIGHTSIGHT_GUID),
+                extension_unit(22, &TEST_BLOCK_GUID),
                 extension_unit(9, &rogue_guid),
             ]
             .concat(),
@@ -2140,7 +2182,7 @@ mod tests {
             let mut io = FakeIo::with(&[
                 one_byte(9, 5, 0, 0),
                 one_byte(10, 1, 0, 0),
-                rightsight_ctl(22, block(0x5a)),
+                block_ctl(22, block(0x5a)),
             ]);
             io.ctl(10, 1).len = 30;
             io.ctl(10, 1).cur = block(0x5a);
@@ -2162,7 +2204,7 @@ mod tests {
             Some(10)
         );
         assert_eq!(
-            XuControl::resolve(&RIGHTSIGHT, &desc, 1).map(|x| x.unit()),
+            XuControl::resolve(&TEST_BLOCK_ON, &desc, 1).map(|x| x.unit()),
             Some(22)
         );
     }
@@ -2174,7 +2216,7 @@ mod tests {
         for (row, mut ctl, id) in [
             (&VIBRANCE, one_byte(10, 0x14, 0x80, 0x80), "200"),
             (&SHOW_MODE, one_byte(10, 0x0d, 0, 0), "on"),
-            (&RIGHTSIGHT, rightsight_ctl(22, block(0x5a)), "on"),
+            (&TEST_BLOCK_ON, block_ctl(22, block(0x5a)), "on"),
         ] {
             for (len, info) in [(ctl.len + 1, 0x03), (0, 0x03), (ctl.len, 0x01)] {
                 ctl.len = len;
@@ -2272,7 +2314,7 @@ mod tests {
         assert_eq!(usb.descriptors, desc);
         assert_eq!(usb.configuration, Some(1));
         assert!(usb.dir.ends_with("usb1/1-2"), "{}", usb.dir.display());
-        // The Logitech unit's rows; not the RightSight ones (no such unit).
+        // The Logitech unit's rows.
         let found: Vec<(&str, u8)> = find_xu_controls(root.path(), &node)
             .unwrap()
             .iter()

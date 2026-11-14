@@ -358,14 +358,16 @@ use obc_pipeline::ctrl_events::{
     CTRL_CHANGE_FLAGS, CTRL_CHANGE_RANGE, CTRL_CHANGE_VALUE, CtrlEvent,
 };
 use obc_pipeline::effect::{Params, StageId};
+use obc_pipeline::hid_orientation::Orientation;
 use obc_pipeline::quirks;
+use obc_pipeline::shutter::ShutterState;
 use obc_pipeline::usb_topology::UsbPlacement;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::backend::{
     ControlEvent, ControlNode, ControlScan, EffectReport, EffectRun, EffectStatus, Failure,
-    MediaBackend, PipeWireEvent, PipeWireGeneration, PipeWireState, PreviewRequest, SessionParams,
-    StageRun, WatchGeneration,
+    MediaBackend, OrientationEvent, PipeWireEvent, PipeWireGeneration, PipeWireState,
+    PreviewRequest, SessionParams, StageRun, WatchGeneration,
 };
 use crate::camera::{self, Camera};
 use crate::gpu_cache;
@@ -546,6 +548,9 @@ pub enum Command {
     /// An event of the control-event watcher of that generation (through
     /// the backend's reporter).
     ControlEvent(WatchGeneration, ControlEvent),
+    /// An event of the orientation watcher of that generation (through the
+    /// backend's reporter).
+    Orientation(WatchGeneration, OrientationEvent),
     /// `GetModules()`.
     GetModules(ModulesReply),
     /// `SetModuleEnabled(s, b)`.
@@ -1595,6 +1600,14 @@ pub struct Controller<B: MediaBackend> {
     /// The cameras whose stream dropped [`health::DAMAGE_RATIO`] of its
     /// frames or more over the last window measured, until they next open.
     damaged: HashSet<String>,
+    /// The open camera's privacy shutter as its frames show it, with the
+    /// camera's id, as the last stats tick read it ([`Self::poll_health`]);
+    /// a closed one is kept while a new ingest of the same camera says
+    /// nothing yet (a reopen, a restart). Forgotten when the session
+    /// leaves for another camera or stops (other than to restart).
+    shutter: Option<(String, ShutterState)>,
+    /// The writer's mask is on ([`Self::sync_mask`]).
+    masked: bool,
     /// Where each camera sits on the USB bus, by id: read when first
     /// needed and again at each open; forgotten at a rescan.
     placements: HashMap<String, Option<UsbPlacement>>,
@@ -1662,6 +1675,19 @@ pub struct Controller<B: MediaBackend> {
     watch_failed: Option<String>,
     /// A control event asked for a read of the camera at this instant.
     event_refresh_at: Option<Instant>,
+    /// The running orientation watcher, with the id of the camera it reads
+    /// ([`Self::sync_orientation`]).
+    orientation_watch: Option<(String, WatchGeneration)>,
+    /// The active camera's orientation as its watcher last reported it,
+    /// with the camera's id; forgotten when the watcher stops.
+    orientation: Option<(String, Orientation)>,
+    /// The camera whose orientation watcher could not start or ended by
+    /// itself: not started again until the active camera changes or the
+    /// cameras are scanned again.
+    orientation_failed: Option<String>,
+    /// The cameras whose orientation watcher could not start, already
+    /// warned of (once per camera while the daemon runs).
+    orientation_warned: HashSet<String>,
     /// The modules: what is installed and enabled, and what each offers
     /// ([`crate::modules`]).
     modules: Modules,
@@ -2069,6 +2095,8 @@ impl<B: MediaBackend> Controller<B> {
             counters_at: None,
             damage: DamageWindow::default(),
             damaged: HashSet::new(),
+            shutter: None,
+            masked: false,
             placements: HashMap::new(),
             zone: None,
             mains_noted: HashSet::new(),
@@ -2097,6 +2125,10 @@ impl<B: MediaBackend> Controller<B> {
             settings_save_at: None,
             watch: None,
             watch_failed: None,
+            orientation_watch: None,
+            orientation: None,
+            orientation_failed: None,
+            orientation_warned: HashSet::new(),
             event_refresh_at: None,
             modules,
             plan: None,
@@ -2264,6 +2296,10 @@ impl<B: MediaBackend> Controller<B> {
                 self.control_event(generation, event, now);
                 self.reconcile(now);
             }
+            Command::Orientation(generation, event) => {
+                self.orientation_event(generation, event);
+                self.reconcile(now);
+            }
             Command::GetModules(reply) => {
                 let _ = reply.send(Ok(self.module_list()));
             }
@@ -2417,6 +2453,7 @@ impl<B: MediaBackend> Controller<B> {
         self.leases.clear();
         self.apply_preview();
         self.drop_session();
+        self.stop_orientation();
         self.backend.stop_writer();
         self.writer = None;
         self.notify_sink(None, Instant::now());
@@ -3296,6 +3333,12 @@ impl<B: MediaBackend> Controller<B> {
         if self.restart_held.take().is_some() {
             self.backend.end_restart_hold();
         }
+        // Between sessions, the shutter kept across a restart
+        // ([`Self::drop_session_with`]) goes with its hold.
+        if self.session.is_none() && self.shutter.is_some() {
+            self.shutter = None;
+            self.sync_mask();
+        }
     }
 
     /// A restart hold taken while the camera could be shown (its frame
@@ -3787,6 +3830,7 @@ impl<B: MediaBackend> Controller<B> {
         if self.controls_view.camera != self.active_camera() {
             self.refresh_controls();
         }
+        self.sync_orientation();
         self.read_holders();
         let delta = if settings {
             let tree = self.current_settings();
@@ -4692,7 +4736,7 @@ impl<B: MediaBackend> Controller<B> {
     /// Starts the ingest on `cam` ([`Self::try_cameras`]).
     fn open_candidate(&mut self, cam: &Camera, now: Instant) -> Result<(), String> {
         {
-            self.leaving_camera();
+            self.leaving_camera(&cam.id);
             let params = self.session_params_for(cam);
             if let Some(s) = self.session.as_mut() {
                 s.camera = cam.id.clone();
@@ -5153,6 +5197,9 @@ impl<B: MediaBackend> Controller<B> {
     /// taken and before the backend stops it.
     fn drop_session_with(&mut self, before_stop: impl FnOnce(&mut Self)) {
         self.stop_watch();
+        // The camera's HID node is read only while it streams: an open
+        // node keeps the camera from autosuspending.
+        self.stop_orientation();
         // A restart hold of a session dropped before its first frame (a
         // failed start, a stop) ends, with a session or none.
         self.end_restart_hold();
@@ -5161,6 +5208,13 @@ impl<B: MediaBackend> Controller<B> {
         if dropped {
             self.backend.stop_session();
         }
+        // A deliberate restart (a hold armed by `before_stop`) keeps the
+        // camera's shutter, so a closed one stays masked when the new
+        // session's frames come; any other stop forgets it.
+        if self.restart_held.is_none() {
+            self.shutter = None;
+        }
+        self.sync_mask();
         // The modules' code stopped (cleanly: the daemon is still here).
         self.plan = None;
         self.background_revoked = false;
@@ -5399,6 +5453,7 @@ impl<B: MediaBackend> Controller<B> {
     /// can show them.
     fn sync_placeholder(&mut self) {
         self.give_writer_images();
+        self.sync_mask();
         // The session output's clock placeholder (an input gap past the
         // hold) shows what the writer's would ([`Self::placeholder_image`]):
         // the away image whenever it is chosen, black while a privacy hold
@@ -5743,6 +5798,8 @@ impl<B: MediaBackend> Controller<B> {
     fn rescan(&mut self, now: Instant) {
         // A camera may have moved to another port.
         self.placements.clear();
+        // Its HID node may have come back: its orientation is tried again.
+        self.orientation_failed = None;
         let old = self.rescan_cameras();
         let nodes = |c: &[Camera]| c.iter().map(|c| c.path.clone()).collect::<Vec<PathBuf>>();
         // A node another camera took over changes the set as well.
@@ -5869,7 +5926,7 @@ impl<B: MediaBackend> Controller<B> {
             s.failed.clear();
         }
         if self.session.as_ref().is_some_and(|s| s.node != cam.path) {
-            self.leaving_camera();
+            self.leaving_camera(&cam.id);
             let params = self.session_params_for(&cam);
             if let Some(s) = self.session.as_mut() {
                 s.camera = cam.id.clone();
@@ -6587,11 +6644,27 @@ impl<B: MediaBackend> Controller<B> {
         self.start_watch(camera, &ids);
     }
 
-    /// The session is about to leave the camera it has open (a switch, a
-    /// reopen, a fail-over): its watcher stops, a settings change not
-    /// saved yet is saved first, and an enhancement failure of that ingest
-    /// ends with it.
-    fn leaving_camera(&mut self) {
+    /// The session is about to leave the camera it has open for camera
+    /// `next` (a switch, a reopen, a fail-over): its watcher stops, a
+    /// settings change not saved yet is saved first, and an enhancement
+    /// failure of that ingest ends with it. For another camera its
+    /// privacy shutter is forgotten and its orientation watcher stops; a
+    /// reopen of the same camera (a new ingest: a mode change) keeps both,
+    /// so a closed shutter stays masked until the new ingest's frames say
+    /// it is open ([`Self::poll_health`]).
+    fn leaving_camera(&mut self, next: &str) {
+        // Another camera's frames say what its shutter shows.
+        if self.shutter.as_ref().is_some_and(|(cam, _)| cam != next) {
+            self.shutter = None;
+            self.sync_mask();
+        }
+        if self
+            .orientation_watch
+            .as_ref()
+            .is_some_and(|(cam, _)| cam != next)
+        {
+            self.stop_orientation();
+        }
         self.stop_watch();
         self.flush_settings();
         self.clear_enhance_failure();
@@ -6793,7 +6866,7 @@ impl<B: MediaBackend> Controller<B> {
     /// params it takes now. A failure is the camera's
     /// ([`Self::camera_failed`]), and the error returned.
     fn reopen_camera(&mut self, cam: &Camera, now: Instant) -> Result<(), IpcError> {
-        self.leaving_camera();
+        self.leaving_camera(&cam.id);
         let params = self.session_params_for(cam);
         if let Some(s) = self.session.as_mut() {
             // A camera that has not delivered yet keeps its deadline: reopens
@@ -7013,6 +7086,7 @@ impl<B: MediaBackend> Controller<B> {
             open: self.is_open(camera),
             fixed_framerate: self.fixed_framerate_for(&camera.id),
             hidden: &quirks::hidden_controls(camera.usb),
+            usb: camera.usb,
         });
         let mut built = built;
         built.global = self.global_settings();
@@ -9109,6 +9183,9 @@ impl<B: MediaBackend> Controller<B> {
             }
             _ => Vec::new(),
         };
+        let (shutter, mut status) = health::shutter_status(self.shutter_of(&cam.id));
+        let (show_mode, line) = health::show_mode_status(self.orientation_of(&cam.id));
+        status.extend(line);
         obc_ipc::CameraHealth {
             delivered_fps: self
                 .delivered
@@ -9121,13 +9198,172 @@ impl<B: MediaBackend> Controller<B> {
             suggestions,
             has_recommendation: profile.is_some(),
             recommended,
+            shutter,
+            show_mode,
+            status,
             camera: cam.id,
+        }
+    }
+
+    /// Which way camera `id` faces, as its orientation watcher last
+    /// reported it ([`Self::orientation`]); `None` while unknown.
+    fn orientation_of(&self, id: &str) -> Option<Orientation> {
+        match &self.orientation {
+            Some((cam, o)) if cam == id => Some(*o),
+            _ => None,
+        }
+    }
+
+    /// Runs the orientation watcher on the camera the session has open
+    /// when its status row has an orientation report
+    /// ([`quirks::orientation_report`]), and none otherwise: started when
+    /// the session opens such a camera, stopped when it leaves it or stops
+    /// (another camera, the camera idle or off, unplugged). Never while the
+    /// camera is idle: an open `hidraw` node makes the HID driver ask for
+    /// remote wakeup, which a camera without it (the MX Brio) cannot give,
+    /// so it would never autosuspend. A watcher that cannot start is warned
+    /// of once per camera, and the orientation stays unknown; it is not
+    /// tried again until the session opens another camera or the cameras
+    /// are scanned again ([`Self::orientation_failed`]), so a node that
+    /// cannot be read is never retried in a loop.
+    fn sync_orientation(&mut self) {
+        let open = self.session.as_ref().filter(|s| s.open);
+        let wanted = open
+            .and_then(|s| self.cameras.iter().find(|c| c.id == s.camera))
+            .and_then(|c| Some((c.clone(), *quirks::orientation_report(c.usb)?)));
+        let Some((cam, report)) = wanted else {
+            if open.is_some() {
+                // Another camera open: the failed one is tried again later.
+                self.orientation_failed = None;
+            }
+            self.stop_orientation();
+            return;
+        };
+        if self
+            .orientation_watch
+            .as_ref()
+            .is_some_and(|(watched, _)| *watched == cam.id)
+        {
+            return;
+        }
+        self.stop_orientation();
+        if self.orientation_failed.as_deref() == Some(cam.id.as_str()) {
+            return;
+        }
+        self.orientation_failed = None;
+        match self.backend.watch_orientation(&cam, report) {
+            Ok(generation) => {
+                debug!("reading the Show Mode of {} from its HID node", cam.label());
+                self.orientation_watch = Some((cam.id.clone(), generation));
+            }
+            Err(e) => {
+                if self.orientation_warned.insert(cam.id.clone()) {
+                    warning!("{e}");
+                } else {
+                    debug!("{e}");
+                }
+                self.orientation_failed = Some(cam.id);
+            }
+        }
+    }
+
+    /// Stops the orientation watcher, if one runs, and forgets the
+    /// orientation it reported.
+    fn stop_orientation(&mut self) {
+        if self.orientation_watch.take().is_some() {
+            self.backend.unwatch_orientation();
+        }
+        self.orientation = None;
+    }
+
+    /// An event of the orientation watcher of `generation`: ignored unless
+    /// it is the running one's. A settled orientation is kept (and
+    /// published at once by the step that follows); a watcher that ended
+    /// by itself (the camera unplugged) is dropped, the orientation
+    /// unknown, and not started again until the active camera changes or
+    /// the cameras are scanned again.
+    fn orientation_event(&mut self, generation: WatchGeneration, event: OrientationEvent) {
+        let Some((cam, _)) = self
+            .orientation_watch
+            .as_ref()
+            .filter(|(_, g)| *g == generation)
+            .cloned()
+        else {
+            debug!("event of orientation watcher {generation}, which no longer runs, ignored");
+            return;
+        };
+        match event {
+            OrientationEvent::Changed(o) => {
+                if self.orientation_of(&cam) != Some(o) {
+                    let label = self
+                        .cameras
+                        .iter()
+                        .find(|c| c.id == cam)
+                        .map_or_else(|| cam.clone(), Camera::label);
+                    info!("{label}: {}", health::show_mode_line(o));
+                }
+                self.orientation = Some((cam, o));
+            }
+            OrientationEvent::Ended(why) => {
+                info!("the camera's Show Mode reports ended: {why}");
+                self.stop_orientation();
+                self.orientation_failed = Some(cam);
+            }
+        }
+    }
+
+    /// The privacy shutter of camera `id` as its frames show it, while the
+    /// session has it open ([`Self::shutter`]); `None` otherwise, and while
+    /// its frames say nothing of it.
+    fn shutter_of(&self, id: &str) -> Option<ShutterState> {
+        let open = self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.open && s.camera == id);
+        match &self.shutter {
+            Some((cam, state)) if open && cam == id => Some(*state),
+            _ => None,
+        }
+    }
+
+    /// Turns the writer's mask on while the open camera's privacy shutter
+    /// is closed and an away image is chosen ([`Self::away_image`]), and
+    /// off otherwise ([`MediaBackend::set_mask`]): the feed then shows the
+    /// away image in place of the camera's black, the session streaming on
+    /// untouched (its frames still arrive, so no watchdog and no measure
+    /// sees a gap). With no away image the camera's black shows as it is.
+    /// Privacy holds are not involved: the mask applies to forwarded
+    /// frames only, which none lets through. Kept on between the sessions
+    /// of a restart, so the new session's first frames are masked too.
+    fn sync_mask(&mut self) {
+        // While the session has the camera, or between the sessions of a
+        // restart (the shutter is kept only then, [`Self::drop_session_with`]).
+        let closed = match &self.shutter {
+            Some((cam, ShutterState::Closed)) => {
+                self.session.as_ref().is_none_or(|s| s.camera == *cam)
+            }
+            _ => false,
+        };
+        let image = if closed { self.away_image() } else { None };
+        let want = image.is_some();
+        if want != self.masked {
+            match &image {
+                Some(p) => info!(
+                    "the camera's shutter is closed: the feed shows the away image {}",
+                    p.display()
+                ),
+                None => info!("the feed shows the camera again"),
+            }
+            self.backend.set_mask(want);
+            self.masked = want;
         }
     }
 
     /// At each stats tick of a running stream: what the ingest measured.
     /// The damaged-frame share is judged at once (a warning appearing or
-    /// going is published at once); the counters (the delivered rate, kept
+    /// going is published at once), and so is the privacy shutter (a
+    /// change is published at once, and the publish turns the writer's mask
+    /// on or off, [`Self::sync_mask`]); the counters (the delivered rate, kept
     /// per camera and mode, and the damaged frames) are published at most
     /// every [`CAMERA_HEALTH_PERIOD`].
     fn poll_health(&mut self, now: Instant) {
@@ -9141,6 +9377,28 @@ impl<B: MediaBackend> Controller<B> {
             return;
         };
         let m = cam.mode;
+        let mut changed = false;
+        // A change of the shutter is published at once. A new ingest on
+        // the same camera (a mode change, a restart) says nothing until its
+        // first sample: a closed shutter stays closed until it says open.
+        let kept = matches!(&self.shutter, Some((id, ShutterState::Closed)) if *id == cam.id);
+        let shutter = match measured.shutter {
+            None if kept => self.shutter.clone(),
+            s => s.map(|s| (cam.id.clone(), s)),
+        };
+        if shutter != self.shutter {
+            match (&self.shutter, measured.shutter) {
+                (_, Some(ShutterState::Closed)) => {
+                    info!("{}: its privacy shutter is closed", cam.label());
+                }
+                (Some((_, ShutterState::Closed)), _) => {
+                    info!("{}: its privacy shutter is open again", cam.label());
+                }
+                _ => {}
+            }
+            self.shutter = shutter;
+            changed = true;
+        }
         let corrupt = measured.corrupt.total();
         let nominal = if m.fps_num > 0 && m.fps_den > 0 {
             m.fps()
@@ -9149,7 +9407,6 @@ impl<B: MediaBackend> Controller<B> {
         };
         self.damage
             .record(now, corrupt, measured.delivered_fps.unwrap_or(nominal));
-        let mut changed = false;
         if let Some(ratio) = self.damage.ratio() {
             let was = self.damaged.contains(&cam.id);
             let damaged = health::damaged_now(was, ratio);

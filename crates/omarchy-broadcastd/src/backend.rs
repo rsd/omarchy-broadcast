@@ -21,6 +21,9 @@ use obc_pipeline::controls::CtrlInfo;
 use obc_pipeline::ctrl_events::CtrlEvent;
 use obc_pipeline::effect::{Availability, Params, StageId, StageValue};
 use obc_pipeline::frame_guard::CorruptFrames;
+use obc_pipeline::hid_orientation::Orientation;
+use obc_pipeline::quirks::OrientationReport;
+use obc_pipeline::shutter::ShutterState;
 use obc_pipeline::usb_topology::UsbPlacement;
 use obc_pipeline::xu::XuRow;
 
@@ -98,6 +101,22 @@ pub enum ControlEvent {
 /// sent them, from the watcher's thread (the daemon forwards them to the
 /// controller as [`crate::controller::Command::ControlEvent`]).
 pub type ControlEventReporter = Arc<dyn Fn(WatchGeneration, ControlEvent) + Send + Sync>;
+
+/// What an orientation watcher reports ([`MediaBackend::watch_orientation`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrientationEvent {
+    /// The camera's orientation settled at this value (the first one the
+    /// watcher learnt, or a change).
+    Changed(Orientation),
+    /// The watcher ended by itself, for this reason (the node went away).
+    Ended(String),
+}
+
+/// Receives the orientation events, with the generation of the watcher
+/// that sent them, from the watcher's thread (the daemon forwards them to
+/// the controller as [`crate::controller::Command::Orientation`]).
+/// Generations count as [`WatchGeneration`]s do, on a counter of their own.
+pub type OrientationReporter = Arc<dyn Fn(WatchGeneration, OrientationEvent) + Send + Sync>;
 
 #[cfg(test)]
 pub mod fake;
@@ -338,6 +357,10 @@ pub struct IngestHealth {
     /// The damaged frames the ingest dropped since it started
     /// ([`obc_pipeline::Session::corrupt_frames`]).
     pub corrupt: CorruptFrames,
+    /// The camera's privacy shutter, as its frames show it
+    /// ([`obc_pipeline::Session::shutter`]); `None` for a camera without a
+    /// status row saying so, and before its first frame was sampled.
+    pub shutter: Option<ShutterState>,
 }
 
 /// The state of the optional PipeWire output (`[pipewire] enabled`), the
@@ -614,6 +637,15 @@ pub trait MediaBackend: Send + 'static {
     /// Nothing without a writer. Never blocks.
     fn end_restart_hold(&mut self);
 
+    /// Turns the writer's mask on or off
+    /// ([`obc_pipeline::LoopbackWriter::set_mask`]): while on, each frame
+    /// the session forwards is replaced by the writer's placeholder image
+    /// when it shows one, so the feed shows the away image in place of a
+    /// camera whose privacy shutter is closed. The session, its output and
+    /// its measures are untouched. Kept across writers: a new writer starts
+    /// with it. Never blocks.
+    fn set_mask(&mut self, on: bool);
+
     /// Sets what the running session output's clock placeholder shows
     /// (an input gap past the hold): black (`None`), or the image at
     /// `image` ([`obc_pipeline::Output::set_placeholder_image`]: decoded off
@@ -784,6 +816,24 @@ pub trait MediaBackend: Send + 'static {
     /// Stops the control-event watcher, if one runs; no event of it is
     /// reported afterwards. Idempotent.
     fn unwatch_controls(&mut self);
+
+    /// Starts reading which way `camera` faces from the input report
+    /// `report` of its HID interface ([`obc_pipeline::hid_orientation`]),
+    /// replacing the orientation watcher that runs (stopped first): its
+    /// `hidraw` node, found through sysfs, opened read-only; nothing is
+    /// ever written to it. Each orientation that settled goes to the
+    /// backend's [`OrientationReporter`] with the returned generation.
+    /// `Err` with a sentence naming the node when it is not found or
+    /// cannot be read (read access is needed).
+    fn watch_orientation(
+        &mut self,
+        camera: &Camera,
+        report: OrientationReport,
+    ) -> Result<WatchGeneration, String>;
+
+    /// Stops the orientation watcher, if one runs; no event of it is
+    /// reported afterwards. Idempotent.
+    fn unwatch_orientation(&mut self);
 
     /// What the running session's current ingest measured of its camera:
     /// its delivered rate and the damaged frames it dropped (`None`: no

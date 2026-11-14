@@ -207,6 +207,11 @@ fn health_lines(h: &CameraHealth, label: &dyn Fn(&str) -> Option<String>) -> Str
             if h.corrupt_frames == 1 { "" } else { "s" }
         ));
     }
+    // The camera's state now (revision 26): `Shutter closed`, `Show Mode:
+    // desk view`.
+    for line in h.status.iter().take(json::MAX_HEALTH_STATUS) {
+        out.push_str(&format!("Status:     {}\n", printable(line)));
+    }
     for w in h.warnings.iter().take(json::MAX_HEALTH_WARNINGS) {
         out.push_str(&format!("Warning:    {}\n", printable(w)));
     }
@@ -285,6 +290,9 @@ pub fn health_change_line(h: &CameraHealth) -> String {
     }
     if h.corrupt_frames > 0 {
         parts.push(format!("{} damaged frames dropped", h.corrupt_frames));
+    }
+    for line in h.status.iter().take(json::MAX_HEALTH_STATUS) {
+        parts.push(printable(line).into_owned());
     }
     for w in h.warnings.iter().take(json::MAX_HEALTH_WARNINGS) {
         parts.push(format!("warning: {}", printable(w)));
@@ -451,12 +459,23 @@ pub enum Only<'a> {
     Setting(&'a str),
 }
 
-/// A setting's value as printed: an int with its unit, a bool as `on` or
-/// `off`, an enum as its option's label (its value id when no option has
-/// it), `action` for an action.
+/// A setting's value as printed: an int with its unit (one with a display
+/// transform, revision 27, as its shown value then the raw one that
+/// `settings set` takes: `+280 K (raw 57)`), a bool as `on` or `off`, an
+/// enum as its option's label (its value id when no option has it),
+/// `action` for an action.
 fn setting_value(s: &Setting) -> String {
     match &s.kind {
         SettingKind::Bool { value, .. } => on_off(Some(*value)).into(),
+        SettingKind::Int {
+            value,
+            unit,
+            display: Some(d),
+            ..
+        } => {
+            let unit = unit.as_deref().map(printable);
+            format!("{} (raw {value})", d.format(*value, unit.as_deref()))
+        }
         SettingKind::Int { value, unit, .. } => match unit {
             Some(u) if !u.is_empty() => format!("{value} {}", printable(u)),
             _ => value.to_string(),
@@ -1409,6 +1428,7 @@ mod tests {
             disabled_reason: String::new(),
             enabled_when: Vec::new(),
             hint: None,
+            description: None,
         };
         let mut time = setting(
             "camera.exposure.exposure_time_absolute",
@@ -1420,6 +1440,7 @@ mod tests {
                 default: 156,
                 value: 1250,
                 unit: Some("\u{d7}100 \u{b5}s".into()),
+                display: None,
             },
         );
         time.enabled = false;
@@ -1456,6 +1477,7 @@ mod tests {
                             default: 128,
                             value: 128,
                             unit: None,
+                            display: None,
                         },
                     )],
                     surface: None,
@@ -1552,6 +1574,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_int_with_a_display_transform_shows_its_signed_value_then_the_raw_one() {
+        use obc_ipc::IntDisplay;
+        let int = |value: i64, unit: Option<&str>, offset: i64, scale: i64| Setting {
+            id: "camera.white_balance.temperature_compensation".into(),
+            label: "Temperature compensation".into(),
+            kind: SettingKind::Int {
+                min: 0,
+                max: 100,
+                step: 1,
+                default: offset,
+                value,
+                unit: unit.map(str::to_string),
+                display: Some(IntDisplay { offset, scale }),
+            },
+            scope: "camera".into(),
+            stored: false,
+            enabled: true,
+            disabled_reason: String::new(),
+            enabled_when: Vec::new(),
+            hint: None,
+            description: None,
+        };
+        for (value, unit, offset, scale, want) in [
+            (57, Some("K"), 50, 40, "+280 K (raw 57)"),
+            (49, Some("K"), 50, 40, "-40 K (raw 49)"),
+            (50, Some("K"), 50, 40, "+0 K (raw 50)"),
+            (128, None, 128, 1, "+0 (raw 128)"),
+            (125, None, 128, 1, "-3 (raw 125)"),
+            (130, Some(""), 128, 1, "+2 (raw 130)"),
+            (1, Some("\u{1b}[2J"), 0, 1, "+1 \\x1b[2J (raw 1)"),
+        ] {
+            assert_eq!(
+                setting_value(&int(value, unit, offset, scale)),
+                want,
+                "{value} {unit:?}"
+            );
+        }
+        // What `settings set` takes stays raw.
+        let mut tree = settings_tree();
+        tree.groups[0].settings = vec![int(57, Some("K"), 50, 40)];
+        let text = settings_text(&sample(), &tree, Only::Group("image"));
+        assert!(
+            text.contains(
+                "Temperature compensation  +280 K (raw 57)  \
+                 camera.white_balance.temperature_compensation  0..100\n"
+            ),
+            "{text}"
+        );
+    }
+
     /// The global groups of a revision-8 daemon.
     fn global_groups() -> Vec<obc_ipc::SettingsGroup> {
         let setting = |id: &str, label: &str, kind| Setting {
@@ -1564,6 +1637,7 @@ mod tests {
             disabled_reason: String::new(),
             enabled_when: Vec::new(),
             hint: None,
+            description: None,
         };
         let mode = setting(
             "effect.background.mode",
@@ -1588,6 +1662,7 @@ mod tests {
                 default: 50,
                 value: 50,
                 unit: Some("%".into()),
+                display: None,
             },
         );
         blur.enabled = false;
@@ -1725,6 +1800,8 @@ mod tests {
                 value: "5".into(),
                 current: "3".into(),
             }],
+            status: vec!["Shutter closed".into(), "Show Mode: desk \x1bview".into()],
+            ..obc_ipc::CameraHealth::none()
         }
     }
 
@@ -1740,6 +1817,8 @@ mod tests {
             text.ends_with(
                 "Delivers:   19.5 of 30 fps\n\
                  Damaged:    12 frames dropped\n\
+                 Status:     Shutter closed\n\
+                 Status:     Show Mode: desk \\x1bview\n\
                  Warning:    Plug First Camera into its own USB port.\\x1b\n\
                  Suggest:    Noise removal \u{2014} This camera's picture is grainy.\n"
             ),
@@ -1750,6 +1829,7 @@ mod tests {
         h.delivered_fps = 29.9;
         h.corrupt_frames = 0;
         h.warnings.clear();
+        h.status.clear();
         s.camera_health = Some(h);
         let text = status_text(&s);
         assert!(
@@ -1800,9 +1880,9 @@ mod tests {
         );
         assert_eq!(
             health_change_line(&h),
-            "camera health: delivers 19.5 of 30 fps | 12 damaged frames dropped | warning: Plug \
-             First Camera into its own USB port.\\x1b | suggest effect.video.denoise | 1 \
-             recommended changes"
+            "camera health: delivers 19.5 of 30 fps | 12 damaged frames dropped | Shutter closed \
+             | Show Mode: desk \\x1bview | warning: Plug First Camera into its own USB port.\\x1b \
+             | suggest effect.video.denoise | 1 recommended changes"
         );
     }
 }
