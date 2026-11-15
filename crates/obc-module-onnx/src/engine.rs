@@ -651,10 +651,7 @@ pub fn static_reasons(library: &Path, cuda: bool) -> Reasons {
         let reason = if engine.uses_cuda() && !cuda {
             REASON_CUDA_OFF.to_string()
         } else if !has(lib) {
-            format!(
-                "{REASON_NOT_IN_BUILD} (no libonnxruntime_providers_{lib}.so beside {})",
-                library.display()
-            )
+            not_in_build_reason(lib, library)
         } else if engine.uses_cuda() && cuda_hidden {
             "CUDA not available: CUDA_VISIBLE_DEVICES hides every GPU".to_string()
         } else if engine.uses_cuda() && no_nvidia {
@@ -665,6 +662,21 @@ pub fn static_reasons(library: &Path, cuda: bool) -> Reasons {
         out.push((engine, reason));
     }
     out
+}
+
+/// The reason for a provider library that is not beside `library`: what is
+/// missing, and the package that has it (Arch's omarchy-onnxruntime names, with
+/// a generic fallback for other systems).
+fn not_in_build_reason(lib: &str, library: &Path) -> String {
+    let (package, name) = match lib {
+        "tensorrt" => ("onnxruntime-provider-tensorrt-cuda13", "TensorRT"),
+        "cuda" => ("onnxruntime-provider-cuda13-*", "CUDA"),
+        _ => ("onnxruntime-provider-openvino", "OpenVINO"),
+    };
+    format!(
+        "{REASON_NOT_IN_BUILD} (no libonnxruntime_providers_{lib}.so beside {}): install {package}, or an ONNX Runtime build with the {name} provider",
+        library.display()
+    )
 }
 
 /// Builds the provider's registration for `engine`.
@@ -1396,6 +1408,29 @@ mod tests {
             r.unwrap_err()
                 .starts_with("No engine could run the model (")
         );
+    }
+
+    #[test]
+    fn a_missing_provider_library_names_the_package_to_install() {
+        let lib = Path::new("/usr/lib/libonnxruntime.so");
+        for (p, pkg, name) in [
+            (
+                "tensorrt",
+                "onnxruntime-provider-tensorrt-cuda13",
+                "TensorRT",
+            ),
+            ("cuda", "onnxruntime-provider-cuda13-*", "CUDA"),
+            ("openvino", "onnxruntime-provider-openvino", "OpenVINO"),
+        ] {
+            let r = not_in_build_reason(p, lib);
+            assert!(r.starts_with(REASON_NOT_IN_BUILD), "{r}");
+            assert!(
+                r.contains(&format!(
+                    "(no libonnxruntime_providers_{p}.so beside /usr/lib/libonnxruntime.so): install {pkg}, or an ONNX Runtime build with the {name} provider"
+                )),
+                "{r}"
+            );
+        }
     }
 
     #[test]
