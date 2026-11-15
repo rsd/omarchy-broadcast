@@ -8,7 +8,7 @@ This page covers installing the module, its runtime and its models, choosing the
 
 ## Using it on a machine without an NVIDIA GPU
 
-The module needs no NVIDIA GPU, and neither does the daemon's effect path. When the machine has no usable CUDA, the daemon keeps the video frames in system memory ([ADR-0033](../adr/0033-system-memory-pipeline.md)) and hands the module host frames. Install an ONNX Runtime build (`onnxruntime-cpu` is enough; `onnxruntime-full` adds the Intel engines; section 2), the module and the models (section 3), and the blur and the replacement work.
+The module needs no NVIDIA GPU, and neither does the daemon's effect path. When the machine has no usable CUDA, the daemon keeps the video frames in system memory ([ADR-0033](../adr/0033-system-memory-pipeline.md)) and hands the module host frames. Install an ONNX Runtime build (`onnxruntime-cpu` or `onnxruntime-core` is enough; the omarchy-onnxruntime provider packages add the Intel and NVIDIA engines; section 2), the module and the models (section 3), and the blur and the replacement work.
 
 **What the daemon decides, and how to see it.** `[video] memory` in `config.toml` is `auto` by default: CUDA when the NVIDIA driver is loaded and lists a GPU, `libcuda.so.1` opens, `CUDA_VISIBLE_DEVICES` does not hide every GPU and GStreamer's CUDA elements are installed; otherwise system memory. The daemon logs the choice and the reason, once per change:
 
@@ -54,7 +54,7 @@ The privacy rules are the same as with CUDA: with privacy on (`[effect] privacy`
 | Item | Requirement |
 |---|---|
 | The module | Installed from the package `omarchy-broadcast-onnx-git` or by `scripts/install-user.sh` (section 3) |
-| ONNX Runtime | `libonnxruntime.so`, version 1.29 or newer. Recommended: `onnxruntime-full`, which has the CPU, CUDA, TensorRT and OpenVINO engines in one library. `onnxruntime-cpu` and `onnxruntime-opt-cuda` also work (section 2) |
+| ONNX Runtime | `libonnxruntime.so`, version 1.29 or newer. Recommended: `onnxruntime-core` plus the provider packages of the engines you use (CUDA, TensorRT, OpenVINO), from omarchy-onnxruntime. `onnxruntime-cpu` and `onnxruntime-opt-cuda` also work (section 2) |
 | The models | Four `.onnx` files, in one of the directories of section 3. A single file is enough to use that model |
 | An NVIDIA GPU | Not needed: the CPU engine runs the model, and the daemon runs the effect path in system memory when it finds no usable CUDA (see above). An NVIDIA GPU adds the TensorRT and CUDA engines, and an Intel CPU, GPU or NPU the OpenVINO engines (with a runtime that has them) |
 
@@ -62,12 +62,22 @@ Without ONNX Runtime, or without any model file, the module still loads and `oma
 
 ## 2. Install ONNX Runtime
 
-**Recommended: `onnxruntime-full`.** It is a package of the omarchy-onnxruntime repository, <https://github.com/rsd/omarchy-onnxruntime>, which builds ONNX Runtime 1.29.0 with the CPU, CUDA, TensorRT and OpenVINO providers in one library (OpenVINO runs on an Intel CPU, GPU and NPU). Each provider is a library of its own beside `libonnxruntime.so` and is loaded only when it is asked for, so a vendor runtime that is not installed disables that provider and nothing else. Install the package from that repository, then the vendor runtimes of the engines you want. They are optional dependencies of the package:
+**Recommended: `onnxruntime-core` and the provider packages you need.** They are built by the omarchy-onnxruntime repository, <https://github.com/rsd/omarchy-onnxruntime>, from one build of ONNX Runtime 1.29.0, split into one package per engine:
+
+| Package | Engine |
+|---|---|
+| `onnxruntime-core` | `libonnxruntime.so` with the CPU engine. It works on its own. Replaces and conflicts with the earlier single package `onnxruntime-full` |
+| `onnxruntime-provider-cuda13-<preset>` (preset `sm120`, `rtx`, `all` or a list of architectures) | The CUDA engine. Needs `cuda`, `cudnn` and `nvidia-utils` |
+| `onnxruntime-provider-tensorrt-cuda13` | The TensorRT engine. Needs the CUDA provider and `tensorrt` |
+| `onnxruntime-provider-openvino` | The OpenVINO engines (Intel CPU, GPU and NPU). Needs `openvino` |
+| `python-onnxruntime-core` | The Python module (not used by the module) |
+
+Each provider is a library of its own beside `libonnxruntime.so` and is loaded only when it is asked for, so a provider that is not installed, or whose vendor runtime is missing, disables that engine and nothing else. Install `onnxruntime-core` and the providers for the hardware you have (a subset is fine), together in one `pacman -U`, after the vendor runtimes of those engines; the procedure, with the order of the steps, is in the repository's [docs/install.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/install.md). AMD GPUs have no engine at present: ONNX Runtime removed the ROCm provider in 1.23, and a MIGraphX provider package (`onnxruntime-provider-migraphx`) is planned. The vendor runtimes of each engine are:
 
 | Engine | Packages |
 |---|---|
 | NVIDIA CUDA | `cuda`, `cudnn`, `nvidia-utils` |
-| NVIDIA TensorRT | TensorRT 11: `nvidia-tensorrt-sdk` (under `/opt/nvidia/tensorrt`) or the AUR's `tensorrt` (under `/usr`); see "TensorRT's library path" below |
+| NVIDIA TensorRT | TensorRT 11, as the package `tensorrt`: the AUR's `tensorrt` (under `/usr`) or `nvidia-tensorrt-sdk-local` from omarchy-nvidia-sdks (under `/opt/nvidia/tensorrt`); see "TensorRT's library path" below |
 | OpenVINO, Intel CPU | `openvino` |
 | OpenVINO, Intel GPU | `openvino-intel-gpu-plugin`, `intel-compute-runtime` |
 | OpenVINO, Intel NPU | `openvino-intel-npu-plugin`, `intel-npu-driver`, `level-zero-loader` |
@@ -85,7 +95,7 @@ The CUDA provider of `onnxruntime-opt-cuda` also needs cuDNN (the `cudnn` packag
 
 Which engines you get depends on what the build includes. The module asks the loaded library which providers it has and checks that each provider's library (`libonnxruntime_providers_<name>.so`) is beside `libonnxruntime.so`; it tries only the engines that pass. A build with more providers lights the other engines up with no change to the module.
 
-The module looks for the library in this order: `$ORT_DYLIB_PATH`; `ort_library` in `[module."br.com.dias.onnx-cutout"]` of `config.toml`; then `libonnxruntime.so.1` and `libonnxruntime.so` in the system's library path. ONNX Runtime allows one environment per process: the first library the daemon opens stays until the daemon restarts. The environment also lives for the whole process: with `onnxruntime-full` 1.29.0 and OpenVINO 2026.4.1, a program that releases the environment after it used OpenVINO crashes when it exits. The module never releases it, not when the cut-out unloads, not when an instance is dropped and not at exit, and a test (`tests/exit.rs`) checks that a process that ran a model on OpenVINO exits cleanly.
+The module looks for the library in this order: `$ORT_DYLIB_PATH`; `ort_library` in `[module."br.com.dias.onnx-cutout"]` of `config.toml`; then `libonnxruntime.so.1` and `libonnxruntime.so` in the system's library path. ONNX Runtime allows one environment per process: the first library the daemon opens stays until the daemon restarts. The environment also lives for the whole process: with the omarchy-onnxruntime build of 1.29.0 and OpenVINO 2026.4.1, a program that releases the environment after it used OpenVINO crashes when it exits. The module never releases it, not when the cut-out unloads, not when an instance is dropped and not at exit, and a test (`tests/exit.rs`) checks that a process that ran a model on OpenVINO exits cleanly.
 
 ### TensorRT's library path
 
@@ -209,7 +219,7 @@ Only when no later engine starts does the load fail, with `<Chosen> was chosen a
 
 ### Measured on each engine
 
-The same model and frames on each engine of `onnxruntime-full` 1.29.0. Conditions: an Intel Core Ultra 9 275HX laptop with a GeForce RTX 5080 Laptop GPU (compute capability sm120) and the integrated Intel GPU and NPU; TensorRT 11.4.0, CUDA 13 and OpenVINO 2026.4.1; the default model (MediaPipe landscape); the module's hardware test, which runs CUDA NV12 frames of a 1280x720 test image with the blur; medians. Another application was streaming a camera from the GPU during the runs, so the figures are indicative. Every engine kept the same 32.8 % of the picture: the matte is identical.
+The same model and frames on each engine of the omarchy-onnxruntime build of 1.29.0 (measured on its earlier single package, `onnxruntime-full`; the library is the same). Conditions: an Intel Core Ultra 9 275HX laptop with a GeForce RTX 5080 Laptop GPU (compute capability sm120) and the integrated Intel GPU and NPU; TensorRT 11.4.0, CUDA 13 and OpenVINO 2026.4.1; the default model (MediaPipe landscape); the module's hardware test, which runs CUDA NV12 frames of a 1280x720 test image with the blur; medians. Another application was streaming a camera from the GPU during the runs, so the figures are indicative. Every engine kept the same 32.8 % of the picture: the matte is identical.
 
 Times are per frame, in milliseconds. "Mask" is the model's own run; "all steps" is the module's whole frame: convert in, mask, composite and convert out. "Session create" is the time to load the model on the engine, and "first run" the time of the first frame.
 
@@ -234,7 +244,7 @@ The module writes one line per engine to the daemon's log (`journalctl --user -u
 
 | Reason | Means |
 |---|---|
-| `not in this ONNX Runtime build (no libonnxruntime_providers_<x>.so beside ...)` | The loaded library has no such provider, or its provider library is not next to `libonnxruntime.so`. The engine is not tried: `auto` skips it, and a chosen engine falls back to a later one with this reason in the notice. Install a build that has it (section 2) |
+| `not in this ONNX Runtime build (no libonnxruntime_providers_<x>.so beside ...)` | The loaded library has no such provider, or its provider library is not next to `libonnxruntime.so`. The engine is not tried: `auto` skips it, and a chosen engine falls back to a later one with this reason in the notice. Install the provider package for the engine (the message names it) or a build that has it (section 2) |
 | `CUDA not available: ...` | The CUDA provider is there; the GPU or its libraries are not. The CUDA error follows, for example `no CUDA-capable device is detected`, or a missing `libcudnn.so.9` |
 | `TensorRT not available: TensorRT's libraries are not on the daemon's library path (... not found; add TensorRT's lib directory to LD_LIBRARY_PATH)` | TensorRT's builder library cannot be found by name. TensorRT is not started (it would crash the process), `auto` moves on to CUDA, and a chosen `tensorrt` falls back to CUDA (or a later engine) with a notice. Add TensorRT's directory for the daemon (section 2, "TensorRT's library path") |
 | `TensorRT not available: TensorRT <ver> has no builder library for this GPU (sm<NN>)` | TensorRT's libraries are found, but the installed TensorRT ships no builder library for this GPU's architecture. Use a TensorRT version that supports the GPU, or another engine |
@@ -277,8 +287,8 @@ The NVIDIA GPU then stays asleep under `openvino-gpu`; the log says whether the 
 | `modules` lists the stage `unavailable: ONNX Runtime not installed (libonnxruntime.so not found)` | No `libonnxruntime.so` where the module looks | Install a package of section 2, or set `ORT_DYLIB_PATH` in the daemon's environment or `ort_library` in the module's table, then restart the daemon |
 | `unavailable: No cut-out model installed (searched: ...)` | No model file in the directories listed | Install the models (section 3). The message names the directories searched |
 | A model fails to load with a checksum or file error | The file is not the catalogue's: a different conversion, a truncated copy | Use the files that the package or the checkout's scripts produce; their checksums are in the module's README |
-| The model runs on the CPU although you have an NVIDIA GPU | `auto` found nothing better: the installed build is `onnxruntime-cpu`, or the CUDA reason says why (`CUDA not available: ...`) | Install `onnxruntime-full` (or `onnxruntime-opt-cuda`) and `cudnn`, and read the reason in the log (section 5) |
-| The log says TensorRT's libraries are not on the daemon's library path, and the model runs on CUDA | The daemon's `LD_LIBRARY_PATH` lacks TensorRT's directory (`/opt/nvidia/tensorrt/lib` with `nvidia-tensorrt-sdk`) | Add the drop-in of section 2, "TensorRT's library path", then reload systemd and restart the daemon |
+| The model runs on the CPU although you have an NVIDIA GPU | `auto` found nothing better: the installed build is `onnxruntime-cpu`, or the CUDA reason says why (`CUDA not available: ...`) | Install `onnxruntime-core` with a CUDA provider package (or `onnxruntime-opt-cuda`) and `cudnn`, and read the reason in the log (section 5) |
+| The log says TensorRT's libraries are not on the daemon's library path, and the model runs on CUDA | The daemon's `LD_LIBRARY_PATH` lacks TensorRT's directory (`/opt/nvidia/tensorrt/lib` with `nvidia-tensorrt-sdk-local`) | Add the drop-in of section 2, "TensorRT's library path", then reload systemd and restart the daemon |
 | `Warning` says `<engine> was chosen and cannot run: <reason>; using <other engine>` | The engine you chose cannot run here; the module runs the first later engine of the order that starts. The stored setting is unchanged | Read the reason and fix it, or choose `auto` or the engine that runs |
 | The load fails with `<engine> was chosen and cannot run: ...; no later engine could run it (...)` | The chosen engine and every engine after it in the order failed | Read the reasons in the list; choose `auto` or an engine that can run |
 | After changing the engine or model the picture did not change, and `Warning` ends `the previous setting keeps running` | The new setting could not load; the previous one keeps running by design | Read the reason before the semicolon and fix it, or set the setting back; change it again or apply it again to try it once more |

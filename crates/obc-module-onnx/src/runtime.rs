@@ -362,7 +362,7 @@ pub fn tensorrt_names_linked(provider: &Path) -> Vec<&'static str> {
 ///
 /// This lookup is the module's, which has no `RUNPATH`: it searches
 /// `LD_LIBRARY_PATH`, then the loader's cache and default directories. A
-/// provider library may carry one (onnxruntime-full's TensorRT provider
+/// provider library may carry one (the omarchy-onnxruntime TensorRT provider
 /// has `RUNPATH /opt/nvidia/tensorrt/lib`) and find `libnvinfer` where
 /// this lookup does not; then this is `None`, and TensorRT is not started
 /// ([`crate::engine`]): `libnvinfer`'s own `dlopen` of its builder

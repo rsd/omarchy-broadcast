@@ -24,7 +24,7 @@ The library is `crates/obc-module-onnx/target/release/libobc_module_onnx.so`. No
 
 ## Installing
 
-1. **ONNX Runtime**, 1.29 or later. Recommended: `onnxruntime-full` from <https://github.com/rsd/omarchy-onnxruntime>, one library with the CPU, CUDA, TensorRT and OpenVINO engines (each provider is loaded only when asked for, so a missing vendor runtime disables only that provider; see its [docs/engines.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/engines.md) for the vendor packages and [docs/results.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/results.md) for figures). Alternatives on Arch: `onnxruntime-cpu`, or `onnxruntime-opt-cuda` for NVIDIA's CUDA engine (any package that provides `onnxruntime`). TensorRT also needs its library directory on the daemon's `LD_LIBRARY_PATH` (see "TensorRT's library path" below).
+1. **ONNX Runtime**, 1.29 or later. Recommended: `onnxruntime-core` plus the provider packages you need (`onnxruntime-provider-cuda13-<preset>`, `onnxruntime-provider-tensorrt-cuda13`, `onnxruntime-provider-openvino`) from <https://github.com/rsd/omarchy-onnxruntime>, installed together in one `pacman -U` (see its [docs/install.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/install.md)); each provider is loaded only when asked for, so a missing vendor runtime disables only that engine; see its [docs/engines.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/engines.md) for the vendor packages and [docs/results.md](https://github.com/rsd/omarchy-onnxruntime/blob/main/docs/results.md) for figures. Alternatives on Arch: `onnxruntime-cpu`, or `onnxruntime-opt-cuda` for NVIDIA's CUDA engine (any package that provides `onnxruntime`). TensorRT also needs its library directory on the daemon's `LD_LIBRARY_PATH` (see "TensorRT's library path" below).
 2. **The module**: the library and the manifest in a `modules.d` directory, with `library` pointing at the library:
 
    ```sh
@@ -84,7 +84,7 @@ Environment:
 | `OCL_ICD_VENDORS`, `OCL_ICD_FILENAMES`, ... (`OCL_ICD_*`) | Read by the OpenCL loader. When none is set, the module sets `OCL_ICD_VENDORS` itself when it is opened, whether or not `openvino-gpu` is used (see "OpenCL and the NVIDIA GPU"); when any is set, it leaves them alone |
 | `XDG_DATA_HOME`, `XDG_CACHE_HOME` | The user's model directory and the engine caches (`$XDG_CACHE_HOME/omarchy-broadcast/trt/`, `.../openvino/`) |
 
-ONNX Runtime allows one environment per process: the first library the daemon opens stays until it restarts. The environment lives for the whole process and is never released: with `onnxruntime-full` 1.29.0 and OpenVINO 2026.4.1, releasing it after OpenVINO was used crashes the process at exit. The module keeps it in a `static` (`RUNTIME` in `src/runtime.rs`) that nothing drops, at unload, at instance drop or at exit; `tests/exit.rs` guards this.
+ONNX Runtime allows one environment per process: the first library the daemon opens stays until it restarts. The environment lives for the whole process and is never released: with the omarchy-onnxruntime build of 1.29.0 and OpenVINO 2026.4.1, releasing it after OpenVINO was used crashes the process at exit. The module keeps it in a `static` (`RUNTIME` in `src/runtime.rs`) that nothing drops, at unload, at instance drop or at exit; `tests/exit.rs` guards this.
 
 ## Engines
 
@@ -122,7 +122,7 @@ The module logs one line per engine, in the daemon's log (`journalctl --user -u 
 
 | Reason | Means |
 |---|---|
-| `not in this ONNX Runtime build (no libonnxruntime_providers_<x>.so beside …)` | The runtime has no such provider, or its library is not beside `libonnxruntime.so`: the engine is not tried; install a build that has it |
+| `not in this ONNX Runtime build (no libonnxruntime_providers_<x>.so beside …)` | The runtime has no such provider, or its library is not beside `libonnxruntime.so`: the engine is not tried; install the provider package the reason names, or a build that has it |
 | `CUDA not available: …` | The CUDA provider is there, the GPU or its libraries are not (the CUDA error follows: `no CUDA-capable device is detected`, a missing `libcudnn.so.9`) |
 | `TensorRT not available: TensorRT's libraries are not on the daemon's library path (… not found; add TensorRT's lib directory to LD_LIBRARY_PATH)` | TensorRT's builder library cannot be found by name; TensorRT is not started, `auto` moves on to CUDA, a chosen `tensorrt` falls back with a notice |
 | `TensorRT not available: TensorRT <ver> has no builder library for this GPU (sm<NN>)` | The installed TensorRT ships no builder library for this GPU |

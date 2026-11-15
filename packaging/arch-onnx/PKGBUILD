@@ -27,7 +27,7 @@
 
 pkgname=omarchy-broadcast-onnx-git
 _pkgname=omarchy-broadcast
-pkgver=0.53.0
+pkgver=0.53.1
 pkgrel=1
 pkgdesc='Open-model cut-out (ONNX Runtime) module for omarchy-broadcast: background blur and replacement'
 arch=('x86_64')
@@ -42,7 +42,7 @@ license=('MIT OR Apache-2.0' 'Apache-2.0' 'ISC')
 #
 # onnxruntime is the Arch package name, and the name every variant provides
 # (onnxruntime-cpu, -cuda, -opt-cuda, -rocm, -opt-rocm each have
-# provides=onnxruntime=1.29.0). onnxruntime-full (another repository) has
+# provides=onnxruntime=1.29.0). onnxruntime-core (another repository) has
 # provides=("onnxruntime=1.29.0" 'libonnxruntime.so') and conflicts with
 # every Arch variant, so it satisfies onnxruntime>=1.29 too. The module opens
 # libonnxruntime.so at run time (nothing links against it) and needs the C
@@ -58,9 +58,10 @@ makedepends=(
   'git'
 )
 optdepends=(
-  'onnxruntime-opt-cuda: ONNX Runtime with the NVIDIA GPU (CUDA execution provider), instead of the CPU one'
-  'cudnn: needed by the CUDA execution provider of onnxruntime-opt-cuda'
-  'onnxruntime-full: the TensorRT and OpenVINO engines need an ONNX Runtime build that includes them (planned package)'
+  'onnxruntime-core: ONNX Runtime with the CPU engine (or any Arch onnxruntime-* variant)'
+  'onnxruntime-provider-cuda: the CUDA engine (onnxruntime-provider-cuda13-<preset> from omarchy-onnxruntime; or Arch onnxruntime-opt-cuda, with cudnn)'
+  'onnxruntime-provider-tensorrt-cuda13: the TensorRT engine (omarchy-onnxruntime)'
+  'onnxruntime-provider-openvino: the OpenVINO engines (Intel CPU, GPU, NPU; omarchy-onnxruntime)'
 )
 # No LTO, as in the core (packaging/arch).
 options=('!lto')
