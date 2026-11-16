@@ -20,3 +20,6 @@ ngc-cli/
 *vfx_sdk*
 nvVideoEffects*.tar*
 *.run
+
+# Local clones of the AUR repositories (scripts/aur.sh --aur aur/omarchy-broadcast-git)
+/aur/
