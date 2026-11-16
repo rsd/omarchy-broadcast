@@ -39,6 +39,10 @@ abi-1-3 = []
 # The fixture module itself, exported as a module of ABI 1.4 (a module
 # built before ABI 1.5): the notice its loads report must never be read.
 abi-1-4 = []
+# The fixture module itself, exported as a module of ABI 1.5 (a module
+# built before ABI 1.6): the standing compatibility test of later hosts,
+# which must hand it nothing newer than 1.5.
+abi-1-5 = []
 # The fixture module itself, its `instance_status_values` replaced by a raw
 # function that answers each call with the next shape of a fixed sequence
 # (a failure, a null or misaligned list, a list too long, bad entries), for
@@ -49,6 +53,10 @@ raw-status-values = []
 # Its failures are chosen by load parameters and environment variables
 # (see src/lib.rs).
 audio = []
+# The audio-filter module of `audio`, with the video entries
+# `instance_load` and `instance_process` left null, as ABI 1.6 allows a
+# module of another kind than video-stage.
+audio-null-video = ["audio"]
 
 [dependencies]
 obc-module-sdk = { path = "../../../../obc-module-sdk" }

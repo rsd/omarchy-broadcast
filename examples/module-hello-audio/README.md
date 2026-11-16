@@ -8,14 +8,16 @@ It provides one audio stage, `mic-enhance`, which changes the level of the
 microphone by a gain in decibels and can mix in a 1 kHz test tone. It runs
 on the CPU, on blocks of 480 samples of mono audio at 48 kHz. Its settings
 appear with the microphone's settings (the group's `surface` is `mic`) as a
-"Hello voice" group:
+"Hello voice" group, `x_example_hello_audio` (the vendor form
+`x_<vendor>_<name>` of a group of a module's own; the stage id is a
+well-known one of the registry):
 
 | Setting id | Type | Meaning |
 |---|---|---|
-| `mic.hello.enabled` | switch | Turns the stage on and off |
-| `mic.hello.gain` | -12 to 12 dB, step 1, default 0 | The gain; applies from the next block |
-| `mic.hello.tone` | switch | Mixes a 1 kHz sine into the voice; applies at the next load |
-| `mic.hello.tone_level` | 0 to 100 %, step 5, default 10 | The tone's peak level, in percent of full scale; applies at the next load |
+| `mic.x_example_hello_audio.enabled` | switch | Turns the stage on and off |
+| `mic.x_example_hello_audio.gain` | -12 to 12 dB, step 1, default 0 | The gain; applies from the next block |
+| `mic.x_example_hello_audio.tone` | switch | Mixes a 1 kHz sine into the voice; applies at the next load |
+| `mic.x_example_hello_audio.tone_level` | 0 to 100 %, step 5, default 10 | The tone's peak level, in percent of full scale; applies at the next load |
 
 An audio module is loaded by the audio worker, a process of its own, never
 by the video daemon, which lists the module and never opens its library.

@@ -691,13 +691,9 @@ impl AudioInstance for AfxInstance {
                 c.stages().join(" + "),
                 c.latency()
             );
-            return Ok(AudioLoadReport {
-                load_ms,
-                warmup_ms: None,
-                frame_samples: None,
-                latency_samples: c.latency(),
-                reused_model: true,
-            });
+            return Ok(AudioLoadReport::new(load_ms)
+                .with_latency_samples(c.latency())
+                .with_reused_model(true));
         }
         // Built aside: a failed switch keeps the chain in force.
         let mut effects = Vec::new();
@@ -738,13 +734,9 @@ impl AudioInstance for AfxInstance {
             latency
         );
         self.chain = Some(chain);
-        Ok(AudioLoadReport {
-            load_ms,
-            warmup_ms: Some(warmup.min(load_ms)),
-            frame_samples: None,
-            latency_samples: latency,
-            reused_model: false,
-        })
+        Ok(AudioLoadReport::new(load_ms)
+            .with_warmup_ms(warmup.min(load_ms))
+            .with_latency_samples(latency))
     }
 
     fn process_audio(

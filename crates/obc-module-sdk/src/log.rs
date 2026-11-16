@@ -18,7 +18,10 @@ use obc_module_abi::{
 };
 
 /// A log level.
+///
+/// A later release may add levels: a `match` on it has a catch-all arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum Level {
     /// An error the user should see.
     Error,

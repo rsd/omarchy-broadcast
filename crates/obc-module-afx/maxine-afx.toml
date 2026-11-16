@@ -4,9 +4,10 @@
 # the NVIDIA Maxine Audio Effects SDK at run time, which is not part of
 # omarchy-broadcast (see its documentation).
 abi = 1
+abi_minor = 6
 id = "br.com.dias.maxine-afx"
 name = "NVIDIA Maxine audio effects"
-version = "0.54.0"
+version = "0.55.0"
 licence = "MIT OR Apache-2.0 (module); NVIDIA Maxine Audio Effects SDK under its own licence"
 kind = "audio-filter"
 library = "/usr/lib/omarchy-broadcast/modules/libobc_module_afx.so"

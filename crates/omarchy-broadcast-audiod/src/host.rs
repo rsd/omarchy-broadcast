@@ -224,17 +224,15 @@ fn fit(kind: &SettingType, v: &Json) -> Option<Value> {
             .as_str()
             .filter(|s| options.iter().any(|(o, _)| o == s))
             .map(|s| Value::Str(s.to_string())),
-        SettingType::Action => None,
     }
 }
 
-/// The default of a setting of type `kind` (`None` for an action).
+/// The default of a setting of type `kind`.
 fn default_of(kind: &SettingType) -> Option<Value> {
     match kind {
         SettingType::Bool { default } => Some(Value::Bool(*default)),
         SettingType::Int { default, .. } => Some(Value::Int(*default)),
         SettingType::Enum { default, .. } => Some(Value::Str(default.clone())),
-        SettingType::Action => None,
     }
 }
 
@@ -865,7 +863,7 @@ impl Host {
                         .collect::<Vec<_>>()
                 );
             }
-            SettingType::Bool { .. } | SettingType::Action => {}
+            SettingType::Bool { .. } => {}
         }
         if let Some(def) = default_of(&s.kind) {
             d["default"] = json_of(&def);

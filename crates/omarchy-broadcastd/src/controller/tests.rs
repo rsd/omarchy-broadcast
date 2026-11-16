@@ -8772,16 +8772,20 @@ fn a_module_from_a_modules_dir_shows_its_group_and_a_write_reaches_its_stage() {
         (hello.status.as_str(), hello.reason.as_str()),
         ("available", "")
     );
-    assert_eq!(hello.stages[0].id, "hello");
+    assert_eq!(hello.stages[0].id, "x-example-hello");
     assert!(hello.stages[0].selected);
     assert_eq!(
         h.global_groups(),
-        ["background", "video", "lighting", "hello"]
+        ["background", "video", "lighting", "x_example_hello"]
     );
-    let on = h.setting("effect.hello.enabled");
+    let on = h.setting("effect.x_example_hello.enabled");
     assert_eq!(on.kind.value(), Some(SettingValue::Bool(false)));
-    h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
-        .unwrap();
+    h.set_setting(
+        "effect.x_example_hello.enabled",
+        SettingValue::Bool(true),
+        0,
+    )
+    .unwrap();
     h.activate(100);
     {
         let w = h.world();
@@ -8791,25 +8795,29 @@ fn a_module_from_a_modules_dir_shows_its_group_and_a_write_reaches_its_stage() {
         assert!(params.backends.chains[0].1.module.is_some(), "loaded");
         let chain = &params.effect.chains[0];
         assert_eq!(chain.placement, Placement::AfterEffect);
-        assert_eq!(chain.stages[0].id.as_str(), "hello");
+        assert_eq!(chain.stages[0].id.as_str(), "x-example-hello");
         assert!(chain.stages[0].enabled);
     }
     // A live parameter reaches the running stage, without a reload.
-    let default = match h.setting("effect.hello.strength").kind {
+    let default = match h.setting("effect.x_example_hello.strength").kind {
         SettingKind::Int { default, .. } => default,
         other => panic!("{other:?}"),
     };
     let new = if default == 30 { 40 } else { 30 };
-    h.set_setting("effect.hello.strength", SettingValue::Int(new), 500)
-        .unwrap();
+    h.set_setting(
+        "effect.x_example_hello.strength",
+        SettingValue::Int(new),
+        500,
+    )
+    .unwrap();
     let w = h.world();
     let last = w.effect_sets.last().expect("given to the session");
-    let stage = last.stage("hello").unwrap();
+    let stage = last.stage("x-example-hello").unwrap();
     assert_eq!(
         stage.live.get("strength"),
         Some(&obc_pipeline::effect::Value::Int(new))
     );
-    assert!(w.stage_status.is_empty() || w.stage_status.contains_key("hello"));
+    assert!(w.stage_status.is_empty() || w.stage_status.contains_key("x-example-hello"));
 }
 
 #[test]
@@ -9781,8 +9789,12 @@ fn disabling_the_effect_module_drops_its_stages_and_keeps_the_feed_and_the_other
         w.real_modules = true;
         w.revoke_unsupported = true;
     });
-    h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
-        .unwrap();
+    h.set_setting(
+        "effect.x_example_hello.enabled",
+        SettingValue::Bool(true),
+        0,
+    )
+    .unwrap();
     h.activate(100);
     assert_eq!(h.applied(), Some(EffectMode::Blur));
     assert_eq!(h.snap().warning, "");
@@ -9801,7 +9813,7 @@ fn disabling_the_effect_module_drops_its_stages_and_keeps_the_feed_and_the_other
     let last = h.last_effect();
     assert_eq!(last.mode, EffectMode::None);
     assert!(!stage_on(&last, "denoise") && !stage_on(&last, "relight"));
-    assert!(stage_on(&last, "hello"), "{last:?}");
+    assert!(stage_on(&last, "x-example-hello"), "{last:?}");
     // Every selected stage of the disabled module, in one clause.
     let dropped = "effect blur, noise removal unavailable: NVIDIA Maxine video effects: Disabled";
     let snap = h.snap();
@@ -9818,7 +9830,7 @@ fn disabling_the_effect_module_drops_its_stages_and_keeps_the_feed_and_the_other
     h.set_module(MAXINE_MODULE, true, 6000);
     let last = h.last_effect();
     assert_eq!(last.mode, EffectMode::Blur);
-    assert!(stage_on(&last, "denoise") && stage_on(&last, "hello"));
+    assert!(stage_on(&last, "denoise") && stage_on(&last, "x-example-hello"));
     {
         let w = h.world();
         assert_eq!(w.session_starts, 1, "no restart");
@@ -10722,8 +10734,12 @@ fn dropped_stages_of_two_modules_are_two_clauses() {
         modules_config(dir.path())
     );
     let mut h = H::new(&config, |w| w.real_modules = true);
-    h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
-        .unwrap();
+    h.set_setting(
+        "effect.x_example_hello.enabled",
+        SettingValue::Bool(true),
+        0,
+    )
+    .unwrap();
     h.activate(100);
     h.set_module(MAXINE_MODULE, false, 1000);
     h.set_module(HELLO, false, 1100);
@@ -10733,7 +10749,7 @@ fn dropped_stages_of_two_modules_are_two_clauses() {
         ("", &*format!("{}; {NO_HELLO}", black(MAXINE_DISABLED)))
     );
     assert_eq!(h.state(), State::Active);
-    assert!(!stage_on(&h.last_effect(), "hello"));
+    assert!(!stage_on(&h.last_effect(), "x-example-hello"));
 }
 
 #[test]
@@ -10743,20 +10759,24 @@ fn a_chain_module_toggled_mid_session_drops_and_restores_its_stage() {
         w.real_modules = true;
         no_headroom(w);
     });
-    h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
-        .unwrap();
+    h.set_setting(
+        "effect.x_example_hello.enabled",
+        SettingValue::Bool(true),
+        0,
+    )
+    .unwrap();
     h.activate(100);
-    assert!(stage_on(&h.session_params().effect, "hello"));
+    assert!(stage_on(&h.session_params().effect, "x-example-hello"));
     let ingests = h.world().ingests.len();
     // Disabled: off in the running session, named in the warning.
     h.set_module(HELLO, false, 1000);
-    assert!(!stage_on(&h.last_effect(), "hello"));
+    assert!(!stage_on(&h.last_effect(), "x-example-hello"));
     let snap = h.snap();
     assert_eq!((snap.error.as_str(), snap.warning.as_str()), ("", NO_HELLO));
     assert_eq!(h.state(), State::Active);
     // Enabled again: back in the same session, the camera kept open.
     h.set_module(HELLO, true, 2000);
-    assert!(stage_on(&h.last_effect(), "hello"));
+    assert!(stage_on(&h.last_effect(), "x-example-hello"));
     assert_eq!(h.snap().warning, "");
     {
         let w = h.world();
@@ -10777,7 +10797,7 @@ fn a_chain_module_toggled_mid_session_drops_and_restores_its_stage() {
     h.tick(72_400);
     assert_eq!(h.state(), State::Active);
     assert_eq!(h.world().session_starts, 3);
-    assert!(stage_on(&h.session_params().effect, "hello"));
+    assert!(stage_on(&h.session_params().effect, "x-example-hello"));
     assert_eq!(h.snap().warning, "");
 }
 
@@ -12971,8 +12991,12 @@ fn restart_held_for(effect: &str, effect_on: bool, first: &str) -> (H, TempDir) 
         w.real_modules = true;
         no_headroom(w);
     });
-    h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
-        .unwrap();
+    h.set_setting(
+        "effect.x_example_hello.enabled",
+        SettingValue::Bool(true),
+        0,
+    )
+    .unwrap();
     h.set_module(HELLO_MODULE, false, 0);
     h.set_module(MAXINE_MODULE, effect_on, 0);
     h.activate(100);
@@ -13222,7 +13246,7 @@ fn a_module_change_restarts_when_it_cannot_switch_alongside() {
     assert_eq!(w.ingest_enhance.last(), Some(&true));
 }
 
-/// A session of the example module's `hello` stage and the background
+/// A session of the example module's `x-example-hello` stage and the background
 /// effect under `effect` (Maxine's), started without the example module
 /// and live, the module then enabled at 1000 ms with the prepared output's
 /// background effect reporting `background`.
@@ -13230,8 +13254,12 @@ fn switching_hello(effect: &str, background: EffectStatus) -> (H, TempDir) {
     let dir = hello_modules_dir();
     let config = format!("{}[effect]\n{effect}", modules_config(dir.path()));
     let mut h = H::new(&config, |w| w.real_modules = true);
-    h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
-        .unwrap();
+    h.set_setting(
+        "effect.x_example_hello.enabled",
+        SettingValue::Bool(true),
+        0,
+    )
+    .unwrap();
     h.set_module(HELLO_MODULE, false, 0);
     h.activate(100);
     h.world().prepared_effect = Some(background);
@@ -13272,7 +13300,7 @@ fn under_privacy_the_switch_waits_for_the_effect_and_never_shows_the_room() {
             (params.effect.mode, params.effect.on_failure),
             (EffectMode::Blur, EffectOnFailure::Black)
         );
-        assert!(stage_on(&params.effect, "hello"));
+        assert!(stage_on(&params.effect, "x-example-hello"));
         assert_eq!((w.session_starts, w.session_stops), (1, 0));
         assert!(w.restart_holds.is_empty());
     }
@@ -13289,8 +13317,12 @@ fn a_privacy_change_while_switching_discards_the_new_effects() {
         )
     };
     let mut h = H::new(&config("none"), |w| w.real_modules = true);
-    h.set_setting("effect.hello.enabled", SettingValue::Bool(true), 0)
-        .unwrap();
+    h.set_setting(
+        "effect.x_example_hello.enabled",
+        SettingValue::Bool(true),
+        0,
+    )
+    .unwrap();
     h.set_module(HELLO_MODULE, false, 0);
     h.activate(100);
     h.world().prepared_effect = Some(EffectStatus::Loading);
@@ -13357,8 +13389,12 @@ fn a_switch_that_fails_keeps_the_current_effects_and_says_so() {
     }
     assert!(h.snap().warning.contains("could not switch"));
     // Another target (the stage turned off): the clause goes.
-    h.set_setting("effect.hello.enabled", SettingValue::Bool(false), 3200)
-        .unwrap();
+    h.set_setting(
+        "effect.x_example_hello.enabled",
+        SettingValue::Bool(false),
+        3200,
+    )
+    .unwrap();
     assert!(
         !h.snap().warning.contains("could not switch"),
         "{:?}",
@@ -13574,9 +13610,10 @@ fn a_failed_switch_is_restarted_for_once_the_current_effect_loses_its_module() {
     for on_failure in ["none", "black"] {
         let blur = format!("mode = \"blur\"\non_failure = \"{on_failure}\"\n");
         let (mut h, dir) = switching_hello(&blur, EffectStatus::Loading);
-        h.world()
-            .prepared_stages
-            .insert("hello".into(), EffectStatus::Failed("no room".into()));
+        h.world().prepared_stages.insert(
+            "x-example-hello".into(),
+            EffectStatus::Failed("no room".into()),
+        );
         h.tick(1100);
         assert!(h.ctrl.switch_failed.is_some(), "{on_failure}");
         assert!(
@@ -13904,7 +13941,7 @@ fn assert_privacy_batch_ended_the_hold(h: &mut H, what: &str) {
             (EffectMode::Blur, EffectOnFailure::Black),
             "{what}: started hidden"
         );
-        assert!(stage_on(&params.effect, "hello"), "{what}");
+        assert!(stage_on(&params.effect, "x-example-hello"), "{what}");
     }
     assert_eq!(h.ctrl.passthrough, None, "{what}: no bare fallback");
     assert_eq!(h.ctrl.restart_held, Some(true), "{what}");

@@ -6,8 +6,9 @@
 use std::marker::PhantomData;
 
 use obc_module_abi::{
-    OBC_AUDIO_F32_PLANAR, OBC_AUDIO_FLAG_DISCONT, OBC_AUDIO_FLAG_NEW_SOURCE,
-    OBC_MAX_AUDIO_CHANNELS, obc_audio_buffer, obc_audio_request,
+    OBC_AUDIO_BUFFER_SIZE_1_2, OBC_AUDIO_F32_PLANAR, OBC_AUDIO_FLAG_DISCONT,
+    OBC_AUDIO_FLAG_NEW_SOURCE, OBC_AUDIO_REQUEST_SIZE_1_2, OBC_MAX_AUDIO_CHANNELS,
+    obc_audio_buffer, obc_audio_request,
 };
 
 use crate::request::stage_ids;
@@ -17,7 +18,11 @@ use crate::{Error, Param, Value};
 /// [`AudioRequest`] but its stages and parameters. A load that keeps the
 /// format of the loaded chain is a switch; one with another format is a
 /// reload ([`crate::AudioInstance::load_audio`]).
+///
+/// The SDK makes it ([`AudioRequest::format`]); it may gain fields in a
+/// later release, as the request does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct AudioFormat {
     /// Samples per second.
     pub sample_rate: u32,
@@ -28,6 +33,12 @@ pub struct AudioFormat {
     /// The samples per channel per block the host proposed.
     pub frame_samples: u32,
 }
+
+// The views read the whole structures once `struct_size` reaches the base
+// size: sound while no field has been appended. A field appended in a later
+// minor version is read only when it fits in `struct_size`.
+const _: () = assert!(size_of::<obc_audio_request>() == OBC_AUDIO_REQUEST_SIZE_1_2 as usize);
+const _: () = assert!(size_of::<obc_audio_buffer>() == OBC_AUDIO_BUFFER_SIZE_1_2 as usize);
 
 /// The audio chain [`crate::AudioInstance::load_audio`] is asked to load: a
 /// checked view of an [`obc_audio_request`], valid for the duration of the
@@ -41,7 +52,7 @@ pub struct AudioRequest<'a> {
 
 impl<'a> AudioRequest<'a> {
     /// A view of the request at `ptr`, checked: refused when null, smaller
-    /// than this ABI version's request, with a channel count of 0 or more
+    /// than the request of ABI 1.2 ([`OBC_AUDIO_REQUEST_SIZE_1_2`]), with a channel count of 0 or more
     /// than [`OBC_MAX_AUDIO_CHANNELS`], a rate or block size of 0, or when a
     /// stage id or a parameter is invalid.
     ///
@@ -57,13 +68,13 @@ impl<'a> AudioRequest<'a> {
         // SAFETY: non-null and readable; only the first field is read
         // before the size is known.
         let size = unsafe { (*ptr).struct_size } as usize;
-        if size < size_of::<obc_audio_request>() {
+        if size < OBC_AUDIO_REQUEST_SIZE_1_2 as usize {
             return Err(Error::invalid(format!(
-                "audio request struct_size {size} is smaller than {}",
-                size_of::<obc_audio_request>()
+                "audio request struct_size {size} is smaller than {OBC_AUDIO_REQUEST_SIZE_1_2}"
             )));
         }
-        // SAFETY: at least as large as `obc_audio_request`.
+        // SAFETY: at least the base size, the size of `obc_audio_request`
+        // (asserted above).
         let raw = unsafe { &*ptr };
         for (what, n) in [
             ("channels_in", raw.channels_in),
@@ -150,7 +161,22 @@ impl<'a> AudioRequest<'a> {
 }
 
 /// What [`crate::AudioInstance::load_audio`] reports.
+///
+/// Built with [`AudioLoadReport::new`] and the `with_` methods, or from
+/// [`AudioLoadReport::default`] by assigning the fields: the structure may
+/// gain fields in a later release, so it cannot be written as a literal
+/// outside this crate.
+///
+/// ```
+/// use obc_module_sdk::AudioLoadReport;
+///
+/// let report = AudioLoadReport::new(40.0)
+///     .with_latency_samples(480)
+///     .with_reused_model(true);
+/// assert_eq!(report.frame_samples, None);
+/// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[non_exhaustive]
 pub struct AudioLoadReport {
     /// How long the load took, in milliseconds.
     pub load_ms: f32,
@@ -164,6 +190,44 @@ pub struct AudioLoadReport {
     pub latency_samples: u32,
     /// Whether models of the previous load were reused.
     pub reused_model: bool,
+}
+
+impl AudioLoadReport {
+    /// The report of a load that took `load_ms` milliseconds, with no
+    /// warm-up, the request's block size, no delay and no reused model.
+    pub fn new(load_ms: f32) -> Self {
+        AudioLoadReport {
+            load_ms,
+            ..AudioLoadReport::default()
+        }
+    }
+
+    /// Sets how long the warm-up took, in milliseconds: a number, or
+    /// `None` for no warm-up.
+    pub fn with_warmup_ms(mut self, warmup_ms: impl Into<Option<f32>>) -> Self {
+        self.warmup_ms = warmup_ms.into();
+        self
+    }
+
+    /// Sets the block size the chain takes
+    /// ([`AudioLoadReport::frame_samples`]): a number, or `None` for the
+    /// request's.
+    pub fn with_frame_samples(mut self, frame_samples: impl Into<Option<u32>>) -> Self {
+        self.frame_samples = frame_samples.into();
+        self
+    }
+
+    /// Sets the chain's algorithmic delay in samples.
+    pub fn with_latency_samples(mut self, latency_samples: u32) -> Self {
+        self.latency_samples = latency_samples;
+        self
+    }
+
+    /// Sets whether models of the previous load were reused.
+    pub fn with_reused_model(mut self, reused_model: bool) -> Self {
+        self.reused_model = reused_model;
+        self
+    }
 }
 
 /// The planes of a buffer at `raw`, checked against the format the
@@ -339,8 +403,8 @@ pub(crate) struct AudioLoaded {
 }
 
 /// Views of the input and output blocks at `input` and `output`, checked
-/// against `loaded`: refused when null, smaller than this ABI version's
-/// buffer, of another format, rate, channel count or block size, with a
+/// against `loaded`: refused when null, smaller than the buffer of ABI
+/// 1.2 ([`OBC_AUDIO_BUFFER_SIZE_1_2`]), of another format, rate, channel count or block size, with a
 /// null or misaligned plane, or when two planes overlap (the input's with
 /// the output's, or two of the output's). The output's voice probability
 /// is set to unknown.
@@ -363,15 +427,14 @@ pub(crate) unsafe fn buffers<'a>(
         // SAFETY: non-null and readable; only the first field is read
         // before the size is known.
         let size = unsafe { (*p).struct_size } as usize;
-        if size < size_of::<obc_audio_buffer>() {
+        if size < OBC_AUDIO_BUFFER_SIZE_1_2 as usize {
             return Err(Error::invalid(format!(
-                "{what}: audio buffer struct_size {size} is smaller than {}",
-                size_of::<obc_audio_buffer>()
+                "{what}: audio buffer struct_size {size} is smaller than {OBC_AUDIO_BUFFER_SIZE_1_2}"
             )));
         }
     }
-    // SAFETY: at least as large as `obc_audio_buffer`, by the caller's
-    // contract valid for `'a`.
+    // SAFETY: at least the base size, the size of `obc_audio_buffer`
+    // (asserted above), by the caller's contract valid for `'a`.
     let inp = unsafe { &*input };
     // SAFETY: as above; read through a copy, written through the pointer.
     let out = unsafe { *output };

@@ -13,14 +13,20 @@ use serde::{Deserialize, Serialize};
 /// {"stages":[{"id":"denoise","available":true},
 ///            {"id":"relight","available":false,"reason":"Not installed"}]}
 /// ```
+///
+/// Built with [`ProbeReport::new`] and its methods: the structure may gain
+/// fields in a later release.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ProbeReport {
     /// One entry per stage the module provides.
     pub stages: Vec<StageProbe>,
 }
 
-/// The availability of one stage.
+/// The availability of one stage, added with [`ProbeReport::available`]
+/// or [`ProbeReport::unavailable`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StageProbe {
     /// The stage id.
     pub id: String,
@@ -77,7 +83,12 @@ impl ProbeReport {
 /// `_`; at most 48 bytes). A setting with a `stage` and the
 /// [`Role::Enable`] role switches that stage on and off; one with a `stage`
 /// and a `key` is a parameter of the stage, applied as its [`Apply`] says.
+///
+/// Built with [`SettingsDescription::new`], [`Group::new`] and the
+/// constructors of [`Setting`], and their methods: these structures may gain
+/// fields in a later release.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SettingsDescription {
     /// The groups, in display order.
     pub groups: Vec<Group>,
@@ -108,6 +119,7 @@ impl SettingsDescription {
 
 /// A group of settings, shown together under its label.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Group {
     /// The group id, the `<group>` of its settings' ids.
     pub id: String,
@@ -147,16 +159,23 @@ impl Group {
 }
 
 /// The type of a setting, with the keys of that type (the `type` key of the
-/// JSON).
+/// JSON). Made by the constructors of [`Setting`].
+///
+/// A later release may add types, for settings types of a later ABI minor
+/// version, and keys to a type: a `match` on it has a catch-all arm, and a
+/// pattern of a type ends in `..`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum SettingKind {
     /// `bool`: a switch.
+    #[non_exhaustive]
     Bool {
         /// The default value.
         default: bool,
     },
     /// `int`: `min..=max`, counted from `min` in steps of `step`.
+    #[non_exhaustive]
     Int {
         /// The smallest value.
         min: i64,
@@ -171,27 +190,30 @@ pub enum SettingKind {
         unit: Option<String>,
     },
     /// `enum`: one of `options`, each `(value id, label)`.
+    #[non_exhaustive]
     Enum {
         /// The options, in display order.
         options: Vec<(String, String)>,
         /// The default option's value id.
         default: String,
     },
-    /// `action`: no value; setting it fires the action.
-    Action,
 }
 
-/// What a setting with a `stage` is to that stage.
+/// What a setting with a `stage` is to that stage. A later release may add
+/// roles: a `match` on it has a catch-all arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Role {
     /// The setting switches the stage on and off (a `bool`).
     Enable,
 }
 
-/// When a parameter's new value takes effect.
+/// When a parameter's new value takes effect. A later release may add
+/// moments: a `match` on it has a catch-all arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Apply {
     /// From the next frame, as a per-frame parameter, without a reload.
     Live,
@@ -201,9 +223,11 @@ pub enum Apply {
     Restart,
 }
 
-/// The operator of a [`Condition`].
+/// The operator of a [`Condition`]. A later release may add operators: a
+/// `match` on it has a catch-all arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Op {
     /// The setting's value equals the operand.
     Eq,
@@ -214,8 +238,10 @@ pub enum Op {
 }
 
 /// An `enabled_when` condition: `[id, op, value]` in JSON. A setting is
-/// enabled while all its conditions hold.
+/// enabled while all its conditions hold. Added with
+/// [`Setting::enabled_when`], or made from an `(id, op, value)` tuple.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 #[serde(
     from = "(String, Op, serde_json::Value)",
     into = "(String, Op, serde_json::Value)"
@@ -242,8 +268,10 @@ impl From<Condition> for (String, Op, serde_json::Value) {
     }
 }
 
-/// One setting.
+/// One setting, made with [`Setting::bool`], [`Setting::int`] or
+/// [`Setting::enumeration`] and set up with the methods.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Setting {
     /// The id, `effect.<group>.<name>`.
     pub id: String,
@@ -343,11 +371,6 @@ impl Setting {
                 default: default.into(),
             },
         )
-    }
-
-    /// An `action` setting.
-    pub fn action(id: impl Into<String>, label: impl Into<String>) -> Self {
-        Setting::with_kind(id, label, SettingKind::Action)
     }
 
     /// Sets the stage the setting belongs to.
@@ -457,8 +480,7 @@ mod tests {
                         .key("direction")
                         .apply(Apply::Live)
                         .hint("slider"),
-                )
-                .setting(Setting::action("effect.lighting.reset", "Reset")),
+                ),
         );
         let value: serde_json::Value = serde_json::from_str(&desc.to_json()).unwrap();
         assert_eq!(
@@ -473,8 +495,7 @@ mod tests {
                  "disabled_reason":"Turn on relighting to change this"},
                 {"id":"effect.lighting.direction","label":"Direction","type":"int","min":-90,"max":90,
                  "step":5,"default":0,"unit":"°","stage":"relight","key":"direction","apply":"live",
-                 "hint":"slider"},
-                {"id":"effect.lighting.reset","label":"Reset","type":"action"}]}]})
+                 "hint":"slider"}]}]})
         );
         assert_eq!(
             SettingsDescription::from_json(&desc.to_json()).unwrap(),
@@ -499,6 +520,15 @@ mod tests {
             SettingsDescription::from_json(&desc.to_json()).unwrap(),
             desc
         );
+    }
+
+    #[test]
+    fn there_is_no_action_type() {
+        // A module setting of the type `action` reaches no module: the type
+        // is not in the module settings vocabulary.
+        let json = r#"{"groups":[{"id":"a","label":"A","settings":[
+            {"id":"effect.a.reset","label":"Reset","type":"action"}]}]}"#;
+        assert!(SettingsDescription::from_json(json).is_err());
     }
 
     #[test]

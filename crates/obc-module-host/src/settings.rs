@@ -32,7 +32,11 @@
 //! * a label is non-empty and at most [`LABEL_MAX`] bytes;
 //! * `int`: `min <= default <= max`, `step > 0`; `enum`: 1 to
 //!   [`MAX_OPTIONS`] options of unique values and valid labels, the default
-//!   one of them; `bool`, `action`: nothing more; another type is dropped;
+//!   one of them; `bool`: nothing more; another type is dropped, and so is
+//!   a type the module's minor version of the ABI does not define
+//!   ([`crate::gating::SETTING_TYPES`]). `action` is not a module settings
+//!   type (since ABI 1.6: no module ever received one): such a setting is
+//!   dropped with its reason;
 //! * `stage` is a stage of the module's manifest; `role: "enable"` needs a
 //!   `bool` with a stage; `key` needs a stage, and its `apply` defaults to
 //!   `reload`; `apply` needs a key;
@@ -43,8 +47,10 @@
 use std::collections::BTreeSet;
 
 use obc_backend::StageId;
+use obc_module_abi::OBC_MODULE_ABI_MINOR;
 use serde::Deserialize;
 
+use crate::gating;
 use crate::manifest::ModuleKind;
 
 /// The most settings a module describes.
@@ -200,18 +206,15 @@ pub enum SettingType {
         /// The default value.
         default: String,
     },
-    /// An action: no value.
-    Action,
 }
 
 impl SettingType {
-    /// The wire name (`bool`, `int`, `enum`, `action`).
+    /// The wire name (`bool`, `int`, `enum`).
     pub fn as_str(&self) -> &'static str {
         match self {
             SettingType::Bool { .. } => "bool",
             SettingType::Int { .. } => "int",
             SettingType::Enum { .. } => "enum",
-            SettingType::Action => "action",
         }
     }
 }
@@ -346,6 +349,7 @@ impl RawSetting {
         group: &str,
         stages: &[StageId],
         kind: ModuleKind,
+        minor: u16,
     ) -> Result<SettingDesc, String> {
         let id = self.id;
         let prefix = format!("{}{group}.", id_prefix(kind));
@@ -356,6 +360,19 @@ impl RawSetting {
             ));
         }
         check_label(&format!("setting {id}"), &self.label)?;
+        if self.kind == "action" {
+            return Err(format!(
+                "setting {id} is an action: actions are not module settings (they reach no \
+                 module)"
+            ));
+        }
+        if gating::setting_type(minor, &self.kind) == Some(false) {
+            return Err(format!(
+                "setting {id} has the type {:?}, which the module's module ABI 1.{minor} does \
+                 not define",
+                self.kind
+            ));
+        }
         let default = self.default;
         let kind = match self.kind.as_str() {
             "bool" => SettingType::Bool {
@@ -420,7 +437,6 @@ impl RawSetting {
                 }
                 SettingType::Enum { options, default }
             }
-            "action" => SettingType::Action,
             other => {
                 return Err(format!(
                     "setting {id} has a type {other:?} this daemon does not know"
@@ -505,6 +521,18 @@ pub fn parse_settings_for(
     json: &str,
     stages: &[StageId],
     kind: ModuleKind,
+    drop_line: impl FnMut(String),
+) -> Result<SettingsDescription, String> {
+    parse_settings_of(json, stages, kind, OBC_MODULE_ABI_MINOR as u16, drop_line)
+}
+
+/// [`parse_settings_for`] for a module built for minor version `minor` of
+/// the ABI: a settings type that version does not define is dropped too.
+pub fn parse_settings_of(
+    json: &str,
+    stages: &[StageId],
+    kind: ModuleKind,
+    minor: u16,
     mut drop_line: impl FnMut(String),
 ) -> Result<SettingsDescription, String> {
     let core = core_group(kind);
@@ -561,7 +589,7 @@ pub fn parse_settings_for(
         for raw in group.settings {
             let parsed = serde_json::from_value::<RawSetting>(raw)
                 .map_err(|e| format!("a setting of the group {} is malformed: {e}", group.id))
-                .and_then(|s| s.validate(&group.id, stages, kind));
+                .and_then(|s| s.validate(&group.id, stages, kind, minor));
             match parsed {
                 Err(e) => drop_line(format!("a setting was dropped: {e}")),
                 Ok(s) if ids.contains(&s.id) => {
@@ -616,8 +644,7 @@ mod tests {
              "disabled_reason":"Turn on relighting to change this"},
             {"id":"effect.lighting.direction","label":"Light direction","type":"int","min":-90,
              "max":90,"step":5,"default":0,"unit":"°","stage":"relight","key":"direction",
-             "apply":"live"},
-            {"id":"effect.lighting.go","label":"Go","type":"action"}
+             "apply":"live"}
         ]}]})
     }
 
@@ -629,7 +656,7 @@ mod tests {
         let g = &d.groups[0];
         assert_eq!(
             (g.id.as_str(), g.label.as_str(), g.settings.len()),
-            ("lighting", "Lighting", 4)
+            ("lighting", "Lighting", 3)
         );
         let relight = d.enable_of("relight").unwrap();
         assert_eq!(relight.id, "effect.lighting.relight");
@@ -664,10 +691,45 @@ mod tests {
             (dir.apply, dir.stage.as_ref()),
             (Some(Apply::Live), Some(&StageId::RELIGHT))
         );
-        assert_eq!(
-            d.setting("effect.lighting.go").unwrap().kind,
-            SettingType::Action
+    }
+
+    /// Decision of ABI 1.6: an action is not a module setting. It is
+    /// dropped with its reason, as an invalid setting, and the rest stays.
+    #[test]
+    fn an_action_setting_is_dropped_with_its_reason() {
+        let mut doc = lighting();
+        doc["groups"][0]["settings"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":"effect.lighting.go","label":"Go","type":"action"}));
+        let (d, dropped) = parse(doc);
+        assert_eq!(d.groups[0].settings.len(), 3);
+        assert!(d.setting("effect.lighting.go").is_none());
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert!(
+            dropped[0].contains("effect.lighting.go is an action"),
+            "{}",
+            dropped[0]
         );
+    }
+
+    /// A settings type is taken only from a module whose minor version
+    /// defines it; every type of this host is of 1.0.
+    #[test]
+    fn settings_types_are_gated_by_the_module_minor() {
+        let doc = lighting().to_string();
+        for minor in 0..=OBC_MODULE_ABI_MINOR as u16 {
+            let mut dropped = Vec::new();
+            let d = parse_settings_of(&doc, &stages(), ModuleKind::VideoStage, minor, |l| {
+                dropped.push(l)
+            })
+            .unwrap();
+            assert_eq!(
+                (d.groups[0].settings.len(), dropped.len()),
+                (3, 0),
+                "1.{minor}"
+            );
+        }
     }
 
     #[test]
@@ -704,7 +766,7 @@ mod tests {
             json!({"id":"effect.lighting.relight","label":"Again","type":"bool","default":true}),
         );
         let (d, dropped) = parse(doc);
-        assert_eq!(d.groups[0].settings.len(), 4, "the valid ones stay");
+        assert_eq!(d.groups[0].settings.len(), 3, "the valid ones stay");
         assert_eq!(dropped.len(), bad.len() + 1, "{dropped:#?}");
         assert!(dropped.last().unwrap().contains("described twice"));
     }

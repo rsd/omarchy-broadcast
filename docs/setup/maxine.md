@@ -10,7 +10,7 @@ Background: [../research/maxine-linux.md](../research/maxine-linux.md) (access, 
 
 ## The Maxine module
 
-The module is the library `libobc_module_maxine.so` and a manifest, `maxine-vfx.toml`, which gives it the id `br.com.dias.maxine-vfx`. The Arch package `omarchy-broadcast-maxine-vfx-git` (one of the packages built from one `PKGBUILD`, which depends on the core `omarchy-broadcast-git` of the same build and on `maxine-vfx-sdk-local`) installs the library as `/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so` and the manifest in `/usr/lib/omarchy-broadcast/modules.d/`, where the daemon looks for manifests; the manifest names the library by absolute path. The module contains no NVIDIA code: it opens the SDK when an effect loads, so a build from a checkout installs and loads on a machine without the SDK or an NVIDIA GPU. Without the package, the daemon does not list the module. An effect that cannot load then fails with the reason (in the daemon's `Error` property), and where an SDK tree is found but lacks a feature, the stage that needs it is unavailable ("Not installed").
+The module is the library `libobc_module_maxine.so` and a manifest, `maxine-vfx.toml`, which gives it the id `br.com.dias.maxine-vfx`. The Arch package `omarchy-broadcast-maxine-vfx-git` (one of the packages built from one `PKGBUILD`, which depends on the module ABI that the core `omarchy-broadcast-git` provides and on `maxine-vfx-sdk-local`) installs the library as `/usr/lib/omarchy-broadcast/modules/libobc_module_maxine.so` and the manifest in `/usr/lib/omarchy-broadcast/modules.d/`, where the daemon looks for manifests; the manifest names the library by absolute path. The module contains no NVIDIA code: it opens the SDK when an effect loads, so a build from a checkout installs and loads on a machine without the SDK or an NVIDIA GPU. Without the package, the daemon does not list the module. An effect that cannot load then fails with the reason (in the daemon's `Error` property), and where an SDK tree is found but lacks a feature, the stage that needs it is unavailable ("Not installed").
 
 It provides these stages ([../modules.md](../modules.md#the-manifest) explains the fields):
 
@@ -101,7 +101,7 @@ Licence: the SDK is under NVIDIA's licence and is for your own machine only. oma
 The daemon needs the os-release shim from the moment it starts (see below). It does not need a systemd drop-in for it: with the SDK package installed, `omarchy-broadcastd` applies the package's environment to itself when it starts, and logs that it did. Install the packages, restart the daemon, and check the log:
 
 ```bash
-# the module package, with the core of the same build; it depends on maxine-vfx-sdk-local
+# the module package, with the core; it depends on the module ABI the core provides and on maxine-vfx-sdk-local
 sudo pacman -U omarchy-broadcast-git-*.pkg.tar.zst omarchy-broadcast-maxine-vfx-git-*.pkg.tar.zst
 systemctl --user restart omarchy-broadcastd.service
 journalctl --user -u omarchy-broadcastd | grep 'SDK environment'
@@ -271,7 +271,7 @@ Problems with the SDK itself (download, package, architecture) are in omarchy-nv
 
 Two more effects run on the NVIDIA Maxine **AR** SDK, through a second module of omarchy-broadcast, `br.com.dias.maxine-ar` ([ADR-0028](../adr/0028-maxine-ar-module.md)): **eye contact**, which redirects the eyes towards the camera, and **auto-framing**, a digital pan and zoom that keeps the face in frame. The AR SDK is a separate personal download from the Video Effects SDK; omarchy-nvidia-sdks packages it as `maxine-ar-sdk-local`. Everything on this page about not distributing the SDK (section 9) applies to it too.
 
-The module is the library `libobc_module_maxine_ar.so` and the manifest `maxine-ar.toml`. The Arch package `omarchy-broadcast-maxine-ar-git` installs it and depends on `maxine-ar-sdk-local` (and on the core of the same build); `scripts/install-user.sh` installs it for the current user in the same way as the Maxine module (see "From a checkout" under [The Maxine module](#the-maxine-module)). It opens the SDK at run time, so it installs and loads without the SDK or an NVIDIA GPU. Without the SDK, or without the models the effect needs for your GPU, the effect's setting is greyed with the reason, for example `Maxine AR SDK not installed` or `No face detection models for this GPU (sm_120)`. Check it with `omarchy-broadcast modules` and `omarchy-broadcast modules info br.com.dias.maxine-ar`.
+The module is the library `libobc_module_maxine_ar.so` and the manifest `maxine-ar.toml`. The Arch package `omarchy-broadcast-maxine-ar-git` installs it and depends on `maxine-ar-sdk-local` (and on the module ABI that the core provides); `scripts/install-user.sh` installs it for the current user in the same way as the Maxine module (see "From a checkout" under [The Maxine module](#the-maxine-module)). It opens the SDK at run time, so it installs and loads without the SDK or an NVIDIA GPU. Without the SDK, or without the models the effect needs for your GPU, the effect's setting is greyed with the reason, for example `Maxine AR SDK not installed` or `No face detection models for this GPU (sm_120)`. Check it with `omarchy-broadcast modules` and `omarchy-broadcast modules info br.com.dias.maxine-ar`.
 
 | Stage | Setting | SDK features and models needed |
 |---|---|---|

@@ -9,6 +9,11 @@
 //!   [`discovery::scan`]); reads manifests only, never a library;
 //! * [`library`]: opens a library and checks its ABI version before
 //!   anything else of it runs ([`library::Library::open`]);
+//! * [`gating`]: what a module of each minor version of the ABI is shown
+//!   (the host presents itself as a host of the module's minor version);
+//! * [`namespaces`]: the well-known stage ids and settings groups, the
+//!   vendor form of private ones, and the reserved configuration keys and
+//!   status value names;
 //! * [`module`]: the safe handles over a loaded module ([`Module`]: probe,
 //!   settings, instances) and its instances ([`module::Instance`]);
 //! * [`audio`]: the instances of an `audio-filter` module
@@ -40,9 +45,11 @@ pub mod adapters;
 pub mod audio;
 pub mod crash;
 pub mod discovery;
+pub mod gating;
 pub mod library;
 pub mod manifest;
 pub mod module;
+pub mod namespaces;
 pub mod registry;
 pub mod settings;
 

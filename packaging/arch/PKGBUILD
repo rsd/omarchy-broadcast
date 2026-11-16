@@ -18,8 +18,13 @@
 #   omarchy-broadcast-maxine-afx-git  the NVIDIA Maxine audio effects module of
 #                                     the microphone (needs maxine-afx-sdk-local)
 #   omarchy-broadcast-onnx-git        the open-model cut-out module (ONNX Runtime)
-# Each module package depends on the core of the same build: the module
-# interface is not pinned across versions.
+# A module package does not depend on one version of the core but on the
+# module interface (the module ABI): the core provides
+# omarchy-broadcast-module-abi=<major>.<minor>, and a module package requires
+# that virtual package at the minor it was built for or later, and below the
+# next major. A minor version of the interface only adds, so a newer core
+# keeps running an older module; the daemon refuses a module built for a
+# newer minor than its own, and a module of another major version.
 #
 # Build (from packaging/arch):   makepkg -s
 # Install the core with the modules wanted, for example:
@@ -103,8 +108,13 @@ pkgname=(
   'omarchy-broadcast-onnx-git'
 )
 _pkgname=omarchy-broadcast
-pkgver=0.54.0
+pkgver=0.55.0
 pkgrel=1
+# The module ABI (<major>.<minor>) that the core provides and that the module
+# packages require. It must equal OBC_MODULE_ABI_MAJOR.OBC_MODULE_ABI_MINOR in
+# crates/obc-module-abi/include/omarchy_broadcast_module.h; the core's
+# package() fails when it does not.
+_module_abi=1.6
 pkgdesc='GPU virtual camera daemon for v4l2loopback, with a D-Bus API and a CLI'
 arch=('x86_64')
 # The project is MIT OR Apache-2.0. The CPU voice module statically includes
@@ -211,10 +221,19 @@ check() {
 }
 
 package_omarchy-broadcast-git() {
-  provides=("$_pkgname")
+  provides=("$_pkgname" "$_pkgname-module-abi=$_module_abi")
   conflicts=("$_pkgname")
 
   cd "$_pkgname"
+
+  # The module ABI this package provides is the one of the header it ships.
+  local abi_major abi_minor
+  abi_major=$(sed -n 's/^#define OBC_MODULE_ABI_MAJOR \([0-9][0-9]*\)$/\1/p' \
+    crates/obc-module-abi/include/omarchy_broadcast_module.h)
+  abi_minor=$(sed -n 's/^#define OBC_MODULE_ABI_MINOR \([0-9][0-9]*\)$/\1/p' \
+    crates/obc-module-abi/include/omarchy_broadcast_module.h)
+  [[ "$abi_major.$abi_minor" == "$_module_abi" ]] ||
+    { echo "_module_abi is $_module_abi, but the header says $abi_major.$abi_minor" >&2; return 1; }
 
   install -Dm755 -t "$pkgdir/usr/bin" \
     target/release/omarchy-broadcastd \
@@ -342,11 +361,12 @@ _install_licences() {
 package_omarchy-broadcast-maxine-vfx-git() {
   pkgdesc='NVIDIA Maxine video effects module for omarchy-broadcast: background blur and replacement, video noise removal'
   license=('MIT OR Apache-2.0' 'ISC')
-  # The module of this very build (see the header). maxine-vfx-sdk-local holds
-  # the SDK, which the module loads at run time, and its environment, which
-  # the daemon applies at start.
+  # The module ABI range (see the header). maxine-vfx-sdk-local holds the SDK,
+  # which the module loads at run time, and its environment, which the daemon
+  # applies at start.
   depends=(
-    "omarchy-broadcast-git=$pkgver-$pkgrel"
+    "$_pkgname-module-abi>=$_module_abi"
+    "$_pkgname-module-abi<2"
     'libgcc'
     'glibc'
     'maxine-vfx-sdk-local'
@@ -373,7 +393,8 @@ package_omarchy-broadcast-maxine-ar-git() {
   license=('MIT OR Apache-2.0' 'ISC')
   # Likewise, with the AR SDK of maxine-ar-sdk-local.
   depends=(
-    "omarchy-broadcast-git=$pkgver-$pkgrel"
+    "$_pkgname-module-abi>=$_module_abi"
+    "$_pkgname-module-abi<2"
     'libgcc'
     'glibc'
     'maxine-ar-sdk-local'
@@ -400,7 +421,8 @@ package_omarchy-broadcast-maxine-afx-git() {
   # environment the audio worker applies at start. The worker loads this
   # module; the daemon only lists its manifest.
   depends=(
-    "omarchy-broadcast-git=$pkgver-$pkgrel"
+    "$_pkgname-module-abi>=$_module_abi"
+    "$_pkgname-module-abi<2"
     'libgcc'
     'glibc'
     'maxine-afx-sdk-local'
@@ -437,7 +459,8 @@ package_omarchy-broadcast-onnx-git() {
   # the C API of 1.29 or later. The default model (MediaPipe landscape) is a
   # dependency; the others are optional.
   depends=(
-    "omarchy-broadcast-git=$pkgver-$pkgrel"
+    "$_pkgname-module-abi>=$_module_abi"
+    "$_pkgname-module-abi<2"
     'libgcc'
     'glibc'
     'onnxruntime>=1.29'

@@ -10,7 +10,8 @@ use std::ptr;
 use std::sync::Mutex;
 
 use obc_module_abi::{
-    OBC_ERR_PANIC, OBC_LOAD_REPORT_SIZE_1_0, OBC_MODULE_ABI_MAJOR, OBC_MODULE_ABI_VERSION, OBC_OK,
+    OBC_AUDIO_LOAD_REPORT_SIZE_1_2, OBC_ERR_PANIC, OBC_HOST_SIZE_1_0, OBC_LOAD_REPORT_SIZE_1_0,
+    OBC_LOAD_REPORT_SIZE_1_5, OBC_MODULE_ABI_MAJOR, OBC_MODULE_ABI_VERSION, OBC_OK,
     obc_audio_buffer, obc_audio_load_report, obc_audio_request, obc_chain_request, obc_frame,
     obc_host, obc_instance, obc_load_report, obc_module, obc_module_abi_major, obc_module_vtable,
     obc_param, obc_status, obc_status_value, obc_timing,
@@ -22,10 +23,6 @@ use crate::{
     AudioInstance, AudioRequest, ChainFrames, ChainRequest, Error, ErrorKind, Frame, Instance,
     Module, Param, PixelFormat,
 };
-
-/// The `struct_size` of a load report that has room for `notice` (ABI 1.5).
-const NOTICE_END: usize =
-    std::mem::offset_of!(obc_load_report, notice) + size_of::<*const c_char>();
 
 thread_local! {
     /// The error of the last call made with a null object, or of the last
@@ -378,7 +375,7 @@ unsafe extern "C" fn instance_load<I: Instance>(
                     "load report struct_size {report_size} is smaller than {OBC_LOAD_REPORT_SIZE_1_0}"
                 )));
             }
-            let has_notice = report_size >= NOTICE_END;
+            let has_notice = report_size >= OBC_LOAD_REPORT_SIZE_1_5 as usize;
             // SAFETY: by the ABI contract, valid during the call.
             let req = unsafe { ChainRequest::from_ptr(request) }?;
             frames = Some(req.frames());
@@ -483,10 +480,10 @@ unsafe extern "C" fn audio_instance_load<I: AudioInstance>(
             // SAFETY: non-null; only the first field is read before the
             // size is known.
             let report_size = unsafe { (*out_report).struct_size } as usize;
-            if report_size < size_of::<obc_audio_load_report>() {
+            if report_size < OBC_AUDIO_LOAD_REPORT_SIZE_1_2 as usize {
                 return Err(Error::invalid(format!(
-                    "audio load report struct_size {report_size} is smaller than {}",
-                    size_of::<obc_audio_load_report>()
+                    "audio load report struct_size {report_size} is smaller than \
+                     {OBC_AUDIO_LOAD_REPORT_SIZE_1_2}"
                 )));
             }
             // SAFETY: by the ABI contract, valid during the call.
@@ -866,6 +863,16 @@ where
     v
 }
 
+// `entry` and `audio_instance_load` read and write the whole structures once
+// `struct_size` reaches the base size: sound while no field has been
+// appended to them.
+const _: () = assert!(size_of::<obc_host>() == OBC_HOST_SIZE_1_0 as usize);
+const _: () =
+    assert!(size_of::<obc_audio_load_report>() == OBC_AUDIO_LOAD_REPORT_SIZE_1_2 as usize);
+// `instance_load` writes `notice` once `struct_size` reaches the 1.5 size,
+// which is the whole of the current structure.
+const _: () = assert!(size_of::<obc_load_report>() == OBC_LOAD_REPORT_SIZE_1_5 as usize);
+
 /// The body of `obc_module_entry`: checks `host` (non-null, large enough,
 /// the same ABI major version), keeps its log callback and returns
 /// `vtable`; null when the host is refused.
@@ -885,10 +892,11 @@ pub unsafe fn entry(
         // SAFETY: non-null and readable; only the first field is read
         // before the size is known.
         let size = unsafe { (*host).struct_size } as usize;
-        if size < size_of::<obc_host>() {
+        if size < OBC_HOST_SIZE_1_0 as usize {
             return false;
         }
-        // SAFETY: at least as large as `obc_host`.
+        // SAFETY: at least the base size, the size of `obc_host` (asserted
+        // below).
         let host = unsafe { &*host };
         if u32::from(obc_module_abi_major(host.abi_version)) != OBC_MODULE_ABI_MAJOR {
             return false;

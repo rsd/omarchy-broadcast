@@ -274,7 +274,7 @@ omarchy-broadcast order reset
       background (matte, nvidia-gpu, rank 300) selected
       relight (post-matte, nvidia-gpu, rank 300) unavailable: Not installed
   org.example.hello  Hello tint 0.1.0  disabled: Disabled (disabled)
-      hello (post-composite, cpu, rank 100) unavailable: Disabled
+      x-example-hello (post-composite, cpu, rank 100) unavailable: Disabled
   ```
 
 - **`modules info ID`** prints one module in full: id, name, version, licence, kind, description, library, manifest, `Enabled:` (`yes` or `no`), `Status:`, a `Forced: conflicts are not enforced (modules.forced.<id>)` line when the module is forced (revision 14) and its stages. A module that is not installed is exit status 1 (`No module <id> is installed`).

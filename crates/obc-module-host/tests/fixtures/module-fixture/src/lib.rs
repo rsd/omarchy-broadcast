@@ -49,11 +49,25 @@
 //!
 //! A load with the string parameter `alpha`/`notice` reports it as the
 //! load's notice (ABI 1.5). With `abi-1-4` it is exported as one of ABI
-//! 1.4: the host must not read the notice the SDK writes for it.
+//! 1.4: the host must not read the notice the SDK writes for it. With
+//! `abi-1-5` it is exported as one of ABI 1.5, the standing compatibility
+//! test of hosts of later minor versions.
+//!
+//! Exported as one of an older version (`abi-1-0` to `abi-1-5`), it logs
+//! what crosses the ABI raw, before the SDK reads it: every load
+//! `fixture-abi load request_size=<n> report_size=<n> kind=<k> format=<f>
+//! matrix=<m> siting=<s> values=<kinds>` (the `struct_size`s the host set,
+//! the request's constants and the value kinds of its parameters) and every
+//! frame `fixture-abi process flags=<in>/<out> size=<in>/<out>
+//! kind=<k> format=<f> values=<kinds>`.
+//!
+//! With `audio-null-video` it is the `audio` module with the video entries
+//! `instance_load` and `instance_process` left null (ABI 1.6).
 //!
 //! While `alpha` is loaded, the status values (ABI 1.3) report
 //! `alpha`/`step`, its step, and `alpha`/`frames`, the frames processed
-//! since the load; none otherwise.
+//! since the load, and with the load-time string `alpha`/`value_name` a
+//! value of that name, 1.0; none otherwise.
 //!
 //! With `raw-status-values` it is the same module of ABI 1.3, but its
 //! `instance_status_values` ignores the instance and answers call `k`
@@ -140,6 +154,7 @@ mod module {
             Value::Int(i) => i.to_string(),
             Value::Float(f) => format!("{f}"),
             Value::Str(s) => (*s).to_string(),
+            other => format!("{other:?}"),
         }
     }
 
@@ -265,6 +280,9 @@ mod module {
         step: u8,
         /// Frames processed since the last load (ABI 1.3 status values).
         frames: u32,
+        /// The name of an extra status value, the load-time string
+        /// `alpha`/`value_name`.
+        value_name: Option<String>,
         /// The audio side.
         #[cfg_attr(not(feature = "audio"), allow(dead_code))]
         audio: AudioState,
@@ -334,20 +352,23 @@ mod module {
             let reused = !self.stages.is_empty();
             self.stages = req.stages().iter().map(|s| s.to_string()).collect();
             self.frames = 0;
+            self.value_name = req
+                .param("alpha", "value_name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             self.step = req
                 .param("alpha", "step")
                 .and_then(|v| v.as_int())
                 .map_or(10, |s| s.clamp(0, 255) as u8);
-            Ok(LoadReport {
-                load_ms: 1.5,
-                warmup_ms: Some(0.5),
-                reused_model: reused,
-                // A notice of the load (ABI 1.5), when told one.
-                notice: req
-                    .param("alpha", "notice")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-            })
+            let mut report = LoadReport::new(1.5)
+                .with_warmup_ms(0.5)
+                .with_reused_model(reused);
+            // A notice of the load (ABI 1.5), when told one.
+            report.notice = req
+                .param("alpha", "notice")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            Ok(report)
         }
 
         fn process(
@@ -409,10 +430,14 @@ mod module {
             if !self.stages.iter().any(|s| s == "alpha") {
                 return Vec::new();
             }
-            vec![
+            let mut values = vec![
                 StatusValue::new("alpha", "step", f64::from(self.step)),
                 StatusValue::new("alpha", "frames", f64::from(self.frames)),
-            ]
+            ];
+            if let Some(name) = &self.value_name {
+                values.push(StatusValue::new("alpha", name.as_str(), 1.0));
+            }
+            values
         }
 
         const LIVE_BACKGROUND: bool = true;
@@ -509,13 +534,10 @@ mod module {
                     fail_at: env_number("OBC_FIXTURE_AUDIO_FAIL_AT"),
                     sleep_ms: env_number("OBC_FIXTURE_AUDIO_SLEEP_MS").unwrap_or(0),
                 };
-                Ok(AudioLoadReport {
-                    load_ms: 2.0,
-                    warmup_ms: None,
-                    frame_samples,
-                    latency_samples: 10 * req.stages().len() as u32,
-                    reused_model: reused,
-                })
+                Ok(AudioLoadReport::new(2.0)
+                    .with_frame_samples(frame_samples)
+                    .with_latency_samples(10 * req.stages().len() as u32)
+                    .with_reused_model(reused))
             }
 
             fn process_audio(
@@ -591,6 +613,7 @@ mod module {
         feature = "abi-1-2",
         feature = "abi-1-3",
         feature = "abi-1-4",
+        feature = "abi-1-5",
         feature = "raw-status-values",
         feature = "audio"
     )))]
@@ -708,24 +731,148 @@ mod module {
         }
     }
 
-    #[cfg(feature = "audio")]
+    #[cfg(all(feature = "audio", not(feature = "audio-null-video")))]
     obc_module_sdk::export_module!(Fixture, audio);
 
-    /// The exports of `export_module!`, claiming ABI 1.0 (or 1.1, 1.2, 1.3
-    /// or 1.4), with a vtable of that version's size: it ends before the
-    /// audio entries of 1.2 (1.0 and 1.1), or before the status values of
-    /// 1.3 (1.2). The 1.3 vtable is the whole of 1.4's, with the per-frame
+    /// The exports of `export_module!(_, audio)`, with the video entries
+    /// null.
+    #[cfg(feature = "audio-null-video")]
+    mod audio_null_video {
+        use obc_module_sdk::abi::{obc_host, obc_module_vtable};
+
+        /// The SDK's entry point, with the video entries null.
+        ///
+        /// # Safety
+        ///
+        /// As `export_module!`'s: `host` is null or valid until unload.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn obc_module_entry(
+            host: *const obc_host,
+        ) -> *const obc_module_vtable {
+            static VTABLE: obc_module_vtable = {
+                let mut v = obc_module_sdk::ffi::audio_vtable::<super::Fixture>();
+                v.instance_load = None;
+                v.instance_process = None;
+                v
+            };
+            // SAFETY: the caller's contract is the one `ffi::entry` needs.
+            unsafe { obc_module_sdk::ffi::entry(host, &VTABLE) }
+        }
+
+        /// The ABI this crate's SDK describes.
+        #[unsafe(no_mangle)]
+        pub extern "C" fn obc_module_abi_version() -> u32 {
+            obc_module_sdk::abi::OBC_MODULE_ABI_VERSION
+        }
+    }
+
+    /// The exports of `export_module!`, claiming ABI 1.0 (or 1.1 to 1.5),
+    /// with a vtable of that version's size: it ends before the audio
+    /// entries of 1.2 (1.0 and 1.1), or before the status values of 1.3
+    /// (1.2). The 1.3 vtable is the whole of 1.4's, with the per-frame
     /// background of 1.4 set, which the host must ignore by the version;
-    /// 1.4's is the whole vtable (1.5 added none).
+    /// 1.4's and 1.5's are the whole vtable (1.5 and 1.6 added none). The
+    /// loads and frames are logged raw first (see the crate documentation).
     #[cfg(any(
         feature = "abi-1-0",
         feature = "abi-1-1",
         feature = "abi-1-2",
         feature = "abi-1-3",
-        feature = "abi-1-4"
+        feature = "abi-1-4",
+        feature = "abi-1-5"
     ))]
     mod abi_1_0 {
-        use obc_module_sdk::abi::{obc_host, obc_module_abi_pack, obc_module_vtable};
+        use obc_module_sdk::abi::{
+            obc_chain_request, obc_frame, obc_host, obc_instance, obc_load_report,
+            obc_module_abi_pack, obc_module_vtable, obc_param, obc_status,
+        };
+
+        /// The SDK's vtable, whose loads and frames the raw ones pass on to.
+        const SDK: obc_module_vtable = obc_module_sdk::ffi::vtable::<super::Fixture>();
+
+        /// The value kinds of `n` parameters at `params`, comma-separated.
+        ///
+        /// # Safety
+        ///
+        /// `params` is null or points to `n` parameters.
+        unsafe fn kinds(params: *const obc_param, n: usize) -> String {
+            if params.is_null() || n == 0 {
+                return String::new();
+            }
+            // SAFETY: by the caller's contract.
+            let params = unsafe { std::slice::from_raw_parts(params, n) };
+            let kinds: Vec<String> = params.iter().map(|p| p.value.kind.to_string()).collect();
+            kinds.join(",")
+        }
+
+        /// The SDK's load, logged raw first.
+        ///
+        /// # Safety
+        ///
+        /// As the vtable entry's.
+        unsafe extern "C" fn load(
+            instance: *mut obc_instance,
+            request: *const obc_chain_request,
+            report: *mut obc_load_report,
+        ) -> obc_status {
+            if !request.is_null() && !report.is_null() {
+                // SAFETY: the host's request and report, valid for the call;
+                // only their 1.0 fields are read.
+                let (req, report_size) = unsafe { (&*request, (*report).struct_size) };
+                obc_module_sdk::log::log(
+                    obc_module_sdk::log::Level::Info,
+                    &format!(
+                        "fixture-abi load request_size={} report_size={report_size} kind={} \
+                         format={} matrix={} siting={} values={}",
+                        req.struct_size,
+                        req.input_kind,
+                        req.input_format,
+                        req.matrix,
+                        req.chroma_siting,
+                        // SAFETY: the request's parameters.
+                        unsafe { kinds(req.params, req.n_params) }
+                    ),
+                );
+            }
+            let f = SDK.instance_load.expect("the SDK sets it");
+            // SAFETY: the host's arguments, passed on.
+            unsafe { f(instance, request, report) }
+        }
+
+        /// The SDK's frame, logged raw first.
+        ///
+        /// # Safety
+        ///
+        /// As the vtable entry's.
+        unsafe extern "C" fn process(
+            instance: *mut obc_instance,
+            input: *const obc_frame,
+            output: *const obc_frame,
+            live: *const obc_param,
+            n_live: usize,
+        ) -> obc_status {
+            if !input.is_null() && !output.is_null() {
+                // SAFETY: the host's frames, valid for the call.
+                let (i, o) = unsafe { (&*input, &*output) };
+                obc_module_sdk::log::log(
+                    obc_module_sdk::log::Level::Info,
+                    &format!(
+                        "fixture-abi process flags={}/{} size={}/{} kind={} format={} values={}",
+                        i.flags,
+                        o.flags,
+                        i.struct_size,
+                        o.struct_size,
+                        i.kind,
+                        i.format,
+                        // SAFETY: the frame's parameters.
+                        unsafe { kinds(live, n_live) }
+                    ),
+                );
+            }
+            let f = SDK.instance_process.expect("the SDK sets it");
+            // SAFETY: the host's arguments, passed on.
+            unsafe { f(instance, input, output, live, n_live) }
+        }
 
         /// The minor version claimed.
         const MINOR: u16 = if cfg!(feature = "abi-1-0") {
@@ -736,8 +883,10 @@ mod module {
             2
         } else if cfg!(feature = "abi-1-3") {
             3
-        } else {
+        } else if cfg!(feature = "abi-1-4") {
             4
+        } else {
+            5
         };
 
         /// The size of the vtable of that version.
@@ -749,14 +898,14 @@ mod module {
             size_of::<obc_module_vtable>() as u32
         };
 
-        /// ABI 1.0, 1.1, 1.2, 1.3 or 1.4.
+        /// ABI 1.0 to 1.5.
         #[unsafe(no_mangle)]
         pub extern "C" fn obc_module_abi_version() -> u32 {
             obc_module_abi_pack(1, MINOR)
         }
 
-        /// The SDK's entry point, with a vtable that says 1.0, 1.1, 1.2,
-        /// 1.3 or 1.4.
+        /// The SDK's entry point, with a vtable that says 1.0 to 1.5, and the
+        /// raw load and frame.
         ///
         /// # Safety
         ///
@@ -766,9 +915,11 @@ mod module {
             host: *const obc_host,
         ) -> *const obc_module_vtable {
             static VTABLE: obc_module_vtable = {
-                let mut v = obc_module_sdk::ffi::vtable::<super::Fixture>();
+                let mut v = SDK;
                 v.abi_version = obc_module_abi_pack(1, MINOR);
                 v.struct_size = SIZE;
+                v.instance_load = Some(load);
+                v.instance_process = Some(process);
                 v
             };
             // SAFETY: the caller's contract is the one `ffi::entry` needs.

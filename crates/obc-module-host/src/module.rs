@@ -42,9 +42,11 @@ use obc_module_abi::{
 use serde::Deserialize;
 
 use crate::audio::AudioInstance;
+use crate::gating::{self, Constant, HostStruct};
 use crate::library::{Library, LogLevel, LogSink, frame_flags_of};
 use crate::manifest::{LoadKinds, Manifest, Slot};
-use crate::settings::{SettingsDescription, parse_settings_for};
+use crate::namespaces;
+use crate::settings::{SettingsDescription, parse_settings_of};
 
 /// The reason of a stage the manifest declares and the probe does not
 /// report.
@@ -390,6 +392,43 @@ pub fn parse_probe(
         .collect())
 }
 
+/// The configuration a module of minor version `minor` is given: for a
+/// module of ABI 1.6 or later ([`gating::RESERVED_NAMES_MINOR`]), `config`
+/// less its keys that start with `_` other than those the host defines
+/// ([`namespaces::HOST_KEYS`]); for an older module, `config` whole, as a
+/// host of 1.5 passed it. Each such key is reported to `warn`.
+fn host_config(
+    config: &serde_json::Value,
+    minor: u16,
+    mut warn: impl FnMut(String),
+) -> serde_json::Value {
+    let reserved = namespaces::reserved_config_keys(config);
+    if reserved.is_empty() {
+        return config.clone();
+    }
+    if !gating::enforces_reserved_names(minor) {
+        for key in reserved {
+            warn(format!(
+                "the configuration key {key:?} starts with `_`, which is reserved for the host: \
+                 it is passed to this module of ABI 1.{minor}, but not to a module of ABI 1.6 \
+                 or later"
+            ));
+        }
+        return config.clone();
+    }
+    let mut config = config.clone();
+    if let Some(o) = config.as_object_mut() {
+        for key in reserved {
+            o.remove(&key);
+            warn(format!(
+                "the configuration key {key:?} was not passed to the module: keys starting with \
+                 `_` are reserved for the host"
+            ));
+        }
+    }
+    config
+}
+
 impl Module {
     /// Opens the library of `manifest` and creates the module object from
     /// `config` (the module's configuration table; `{}` when it has none),
@@ -408,8 +447,17 @@ impl Module {
     /// [`Module::open`] in a host that loads `kinds`: a module of another
     /// kind is refused before its library is opened. An `audio-filter`
     /// module's library must be of ABI 1.2 or later and have the audio
-    /// entries ([`Library::audio_refusal`]); it is refused before `init`
-    /// otherwise.
+    /// entries ([`Library::audio_refusal`]), a `video-stage` module's must
+    /// have `instance_load` and `instance_process`
+    /// ([`Library::video_refusal`]), and a library built for an older minor
+    /// version than the manifest's `abi_minor` is refused; each before
+    /// `init`.
+    ///
+    /// A stage id of neither the well-known nor the vendor form is warned
+    /// about in the module's log ([`namespaces::stage_id_warning`]), and a
+    /// configuration key starting with `_` that the host does not define is
+    /// not passed to a module of ABI 1.6 or later, with a warning (an older
+    /// module is passed it, with the warning: [`gating::RESERVED_NAMES_MINOR`]).
     pub fn open_for(
         manifest: &Manifest,
         config: &serde_json::Value,
@@ -420,11 +468,29 @@ impl Module {
             return Err(reason);
         }
         let lib = Library::open(&manifest.library, &manifest.id, log.clone())?;
-        if manifest.kind.is_audio()
-            && let Some(reason) = lib.audio_refusal()
-        {
+        if u32::from(lib.abi_minor()) < manifest.abi_minor {
+            return Err(format!(
+                "The library is built for module ABI {}, older than the module ABI 1.{} its \
+                 manifest needs",
+                crate::library::version_text(lib.abi_version()),
+                manifest.abi_minor
+            ));
+        }
+        let refusal = if manifest.kind.is_audio() {
+            lib.audio_refusal()
+        } else {
+            lib.video_refusal()
+        };
+        if let Some(reason) = refusal {
             return Err(reason);
         }
+        let warn = |line: String| log(&manifest.id, LogLevel::Warn, &line);
+        for stage in &manifest.stages {
+            if let Some(w) = namespaces::stage_id_warning(stage.id.as_str()) {
+                warn(w);
+            }
+        }
+        let config = host_config(config, lib.abi_minor(), &warn);
         let config = CString::new(config.to_string())
             .map_err(|_| "the module's configuration contains a NUL byte".to_string())?;
         let init = lib.vtable().init.expect("checked at open");
@@ -547,10 +613,22 @@ impl Module {
             .expect("checked at open");
         let json = self.core.json_call("The settings description", f)?;
         let stages: Vec<StageId> = self.manifest.stages.iter().map(|s| s.id.clone()).collect();
-        let settings = parse_settings_for(&json, &stages, self.manifest.kind, |line| {
-            self.core.log(LogLevel::Warn, &line)
-        })
+        let settings = parse_settings_of(
+            &json,
+            &stages,
+            self.manifest.kind,
+            self.core.lib.abi_minor(),
+            |line| self.core.log(LogLevel::Warn, &line),
+        )
         .map_err(|e| ModuleError::host(Status::Failed, e))?;
+        // The first read only: the groups are warned about once.
+        if self.core.settings.get().is_none() {
+            for g in &settings.groups {
+                if let Some(w) = namespaces::group_id_warning(&g.id, self.manifest.kind) {
+                    self.core.log(LogLevel::Warn, &w);
+                }
+            }
+        }
         let _ = self.core.settings.set(settings.clone());
         Ok(settings)
     }
@@ -584,6 +662,7 @@ impl Module {
             loaded: None,
             poisoned: None,
             matte: self.matte_stages(),
+            reserved_value_logged: std::cell::Cell::new(false),
         })
     }
 
@@ -742,6 +821,13 @@ impl RawParams {
         })
     }
 
+    /// The value kinds of the parameters, to gate ([`gate`]).
+    pub(crate) fn value_kinds(&self) -> impl Iterator<Item = Constant> + '_ {
+        self.params
+            .iter()
+            .map(|p| Constant::ValueKind(p.value.kind))
+    }
+
     pub(crate) fn as_ptr(&self) -> *const obc_param {
         if self.params.is_empty() {
             std::ptr::null()
@@ -753,6 +839,21 @@ impl RawParams {
     pub(crate) fn len(&self) -> usize {
         self.params.len()
     }
+}
+
+/// Refuses, with [`Status::Unsupported`] and before the module is called,
+/// a call that would hand a module of minor version `minor` a constant its
+/// version does not define ([`gating::refusal`]).
+pub(crate) fn gate(
+    minor: u16,
+    constants: impl IntoIterator<Item = Constant>,
+) -> Result<(), ModuleError> {
+    for c in constants {
+        if let Some(reason) = gating::refusal(minor, c) {
+            return Err(ModuleError::host(Status::Unsupported, reason));
+        }
+    }
+    Ok(())
 }
 
 /// A host BGR frame over `image`.
@@ -798,7 +899,8 @@ pub struct LoadOutcome {
 /// instance).
 unsafe fn notice_of(report: &obc_load_report, abi_version: u32) -> Option<String> {
     let end = std::mem::offset_of!(obc_load_report, notice) + size_of::<*const c_char>();
-    if obc_module_abi::obc_module_abi_minor(abi_version) < 5 || (report.struct_size as usize) < end
+    if gating::minor_of(abi_version) < gating::LOAD_NOTICE_MINOR
+        || (report.struct_size as usize) < end
     {
         return None;
     }
@@ -820,6 +922,9 @@ pub struct Instance {
     poisoned: Option<String>,
     /// The module's matte stages ([`Module::matte_stages`]).
     matte: Vec<StageId>,
+    /// Whether the drop of a status value of a reserved name was logged
+    /// (once per instance).
+    reserved_value_logged: std::cell::Cell<bool>,
 }
 
 // SAFETY: an instance is used through `&mut self` (or `&self` for reads
@@ -854,6 +959,12 @@ impl Instance {
     /// The module id.
     pub fn module_id(&self) -> &str {
         &self.core.id
+    }
+
+    /// The minor version of the ABI the module is built for: what the host
+    /// presents itself as ([`crate::gating`]).
+    fn minor(&self) -> u16 {
+        self.core.lib.abi_minor()
     }
 
     /// Whether a chain is loaded, as far as the host knows.
@@ -936,8 +1047,31 @@ impl Instance {
                 .iter()
                 .map(|(s, k, v)| (s.as_str(), k.as_str(), v)),
         )?;
-        let background = spec.background.as_deref().map(bgr_frame);
+        let minor = self.minor();
+        gate(
+            minor,
+            [
+                Constant::FrameKind(spec.kind),
+                Constant::Format(spec.input_format),
+                Constant::Format(spec.output_format),
+                Constant::Matrix(spec.matrix),
+                Constant::ChromaSiting(spec.chroma_siting),
+            ]
+            .into_iter()
+            .chain(
+                spec.background
+                    .as_ref()
+                    .map(|_| Constant::Format(OBC_FORMAT_BGR)),
+            )
+            .chain(params.value_kinds()),
+        )?;
+        let background = spec.background.as_deref().map(|b| {
+            let mut f = bgr_frame(b);
+            f.struct_size = gating::struct_size(HostStruct::Frame, minor);
+            f
+        });
         let mut req = obc_chain_request::empty();
+        req.struct_size = gating::struct_size(HostStruct::ChainRequest, minor);
         req.stages = ptrs.as_ptr();
         req.n_stages = ptrs.len();
         req.input_kind = spec.kind;
@@ -954,7 +1088,10 @@ impl Instance {
         req.background = background
             .as_ref()
             .map_or(std::ptr::null(), |f| f as *const obc_frame);
+        // The report of the module's version: a module of ABI 1.4 or older
+        // is handed the 1.0 size, without room for the notice of 1.5.
         let mut report = obc_load_report::empty();
+        report.struct_size = gating::struct_size(HostStruct::LoadReport, minor);
         let f = self
             .core
             .lib
@@ -1025,6 +1162,18 @@ impl Instance {
             ));
         }
         let params = RawParams::new(live.iter().copied())?;
+        let minor = self.minor();
+        gate(
+            minor,
+            [
+                Constant::FrameKind(input.kind),
+                Constant::Format(input.format),
+                Constant::FrameKind(output.kind),
+                Constant::Format(output.format),
+            ]
+            .into_iter()
+            .chain(params.value_kinds()),
+        )?;
         let f = self
             .core
             .lib
@@ -1037,6 +1186,9 @@ impl Instance {
         let (mut input, mut output) = (*input, *output);
         input.flags &= known;
         output.flags &= known;
+        let size = gating::struct_size(HostStruct::Frame, minor);
+        input.struct_size = input.struct_size.min(size);
+        output.struct_size = output.struct_size.min(size);
         // SAFETY: a live instance; the frames by the caller's contract (the
         // copies describe the same memory); the parameters live across the
         // call.
@@ -1153,8 +1305,12 @@ impl Instance {
     /// module built for an older ABI (its vtable has no such entry), and
     /// when the call fails or the list is null, misaligned or longer than
     /// `MAX_REPORTED_ENTRIES` (64). A value with an invalid stage id, an
-    /// empty name or a value that is not finite is skipped; names are cut
-    /// to `MAX_REPORTED_NAME` (64) bytes.
+    /// empty name or a value that is not finite is skipped, and so is one
+    /// whose name starts with `obc.` (the host's, logged once per
+    /// instance) from a module of ABI 1.6 or later
+    /// ([`gating::RESERVED_NAMES_MINOR`]); from an older module such a
+    /// value is kept, as a host of 1.5 kept it, and logged once per
+    /// instance. Names are cut to `MAX_REPORTED_NAME` (64) bytes.
     pub fn status_values(&self) -> Vec<StageValue> {
         let Some(f) = self.core.lib.vtable().instance_status_values else {
             return Vec::new();
@@ -1176,6 +1332,29 @@ impl Instance {
                 let (stage, name) = unsafe { (reported_name(v.stage), reported_name(v.name)) };
                 if name.is_empty() || !v.value.is_finite() {
                     return None;
+                }
+                if namespaces::is_reserved_value_name(&name) {
+                    let minor = self.core.lib.abi_minor();
+                    let enforced = gating::enforces_reserved_names(minor);
+                    if !self.reserved_value_logged.replace(true) {
+                        let line = if enforced {
+                            format!(
+                                "the status value {stage}/{name} was dropped: names starting \
+                                 with `obc.` are reserved for the host (logged once)"
+                            )
+                        } else {
+                            format!(
+                                "the status value {stage}/{name} starts with `obc.`, which is \
+                                 reserved for the host: it is kept from this module of ABI \
+                                 1.{minor}, but dropped from a module of ABI 1.6 or later \
+                                 (logged once)"
+                            )
+                        };
+                        self.core.log(LogLevel::Warn, &line);
+                    }
+                    if enforced {
+                        return None;
+                    }
                 }
                 Some(StageValue {
                     stage: StageId::new(stage).ok()?,
@@ -1258,9 +1437,15 @@ impl Instance {
             }
         }
         // The flags of the module's ABI version only, as for frames.
+        if let Some(frame) = background {
+            gate(self.minor(), [Constant::FrameKind(frame.kind)])?;
+        }
         let frame = background.map(|f| {
             let mut f = *f;
             f.flags &= frame_flags_of(self.core.lib.abi_version());
+            f.struct_size = f
+                .struct_size
+                .min(gating::struct_size(HostStruct::Frame, self.minor()));
             f
         });
         let ptr = frame
@@ -1284,41 +1469,52 @@ impl Instance {
         }
         Ok(())
     }
-
-    /// The stream stops for a while (ADR 0017): the module may release what
-    /// it rebuilds quickly. A module without the hook does nothing.
-    pub fn park(&mut self) -> Result<(), ModuleError> {
-        let Some(f) = self.core.lib.vtable().instance_park else {
-            return Ok(());
-        };
-        // SAFETY: a live instance.
-        let status = unsafe { f(self.raw) };
-        if status != OBC_OK {
-            let chain = self.chain.clone();
-            return Err(self.fail(status, "a park", &chain));
-        }
-        Ok(())
-    }
-
-    /// The stream resumes after [`Instance::park`].
-    pub fn unpark(&mut self) -> Result<(), ModuleError> {
-        let Some(f) = self.core.lib.vtable().instance_unpark else {
-            return Ok(());
-        };
-        // SAFETY: a live instance.
-        let status = unsafe { f(self.raw) };
-        if status != OBC_OK {
-            let chain = self.chain.clone();
-            return Err(self.fail(status, "an unpark", &chain));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// A configuration key starting with `_` that the host does not
+    /// define is not passed to a module of ABI 1.6 or later, with a
+    /// warning; `_host` is. A module of ABI 1.5 or older is passed it, as a
+    /// host of 1.5 passed it, with a warning.
+    #[test]
+    fn reserved_configuration_keys_are_not_passed() {
+        let config = serde_json::json!({"_host": {"cuda": false}, "_x": 1, "sdk_root": "/s"});
+        let mut warned = Vec::new();
+        let passed = host_config(&config, gating::RESERVED_NAMES_MINOR, |w| warned.push(w));
+        assert_eq!(
+            passed,
+            serde_json::json!({"_host": {"cuda": false}, "sdk_root": "/s"})
+        );
+        assert_eq!(warned.len(), 1);
+        assert!(warned[0].contains("\"_x\" was not passed"), "{}", warned[0]);
+        let plain = serde_json::json!({"a": 1});
+        assert_eq!(
+            host_config(&plain, gating::RESERVED_NAMES_MINOR, |_| panic!(
+                "no warning"
+            )),
+            plain
+        );
+        // The old side: passed whole, with the warning.
+        for minor in 0..gating::RESERVED_NAMES_MINOR {
+            let mut warned = Vec::new();
+            assert_eq!(
+                host_config(&config, minor, |w| warned.push(w)),
+                config,
+                "1.{minor}"
+            );
+            assert_eq!(warned.len(), 1, "1.{minor}");
+            assert!(
+                warned[0].contains("\"_x\" starts with `_`")
+                    && warned[0].contains(&format!("passed to this module of ABI 1.{minor}")),
+                "{}",
+                warned[0]
+            );
+        }
+    }
 
     /// The notice (ABI 1.5) is read from a module that knows it and a
     /// report with room for it only: a module of ABI 1.4 never has one,

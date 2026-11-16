@@ -4,15 +4,20 @@
 use std::ffi::{CStr, c_char};
 
 use obc_module_abi::{
-    OBC_CHROMA_SITING_COSITED, OBC_CHROMA_SITING_JPEG, OBC_CHROMA_SITING_MPEG2, OBC_MATRIX_BT601,
-    OBC_MATRIX_BT709, OBC_MATRIX_BT2020, OBC_VALUE_BOOL, OBC_VALUE_FLOAT, OBC_VALUE_INT,
-    OBC_VALUE_STRING, obc_chain_request, obc_param,
+    OBC_CHAIN_REQUEST_SIZE_1_0, OBC_CHROMA_SITING_COSITED, OBC_CHROMA_SITING_JPEG,
+    OBC_CHROMA_SITING_MPEG2, OBC_MATRIX_BT601, OBC_MATRIX_BT709, OBC_MATRIX_BT2020, OBC_VALUE_BOOL,
+    OBC_VALUE_FLOAT, OBC_VALUE_INT, OBC_VALUE_STRING, obc_chain_request, obc_chroma_siting,
+    obc_matrix, obc_param,
 };
 
 use crate::{CudaHandles, Error, Frame, FrameKind, PixelFormat};
 
 /// The value of a parameter, borrowed from the call.
+///
+/// A later release may add variants, for value kinds of a later ABI minor
+/// version: a `match` on it has a catch-all arm.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum Value<'a> {
     /// A boolean (a `bool` setting).
     Bool(bool),
@@ -61,6 +66,10 @@ impl<'a> Value<'a> {
 
 /// One parameter of one stage: the `stage` and `key` of a setting the
 /// module described, and its value.
+///
+/// It mirrors `obc_param`, which is frozen for the life of major 1
+/// (the structure has no `struct_size` and never grows), so it is not
+/// `#[non_exhaustive]`: a module may build one with a struct literal.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Param<'a> {
     /// The stage id.
@@ -113,7 +122,10 @@ pub(crate) unsafe fn stage_ids<'a>(
 
 impl<'a> Param<'a> {
     /// A view of `raw`, checked: refused when a string is null or not
-    /// UTF-8, or the value kind is unknown.
+    /// UTF-8 ([`ErrorKind::Invalid`](crate::ErrorKind::Invalid)), or the
+    /// value kind is one this SDK does not know
+    /// ([`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported), as a
+    /// module answers a constant it does not know).
     ///
     /// # Safety
     ///
@@ -132,7 +144,7 @@ impl<'a> Param<'a> {
                 Value::Str(unsafe { host_str(raw.value.data.s, "parameter value") }?)
             }
             other => {
-                return Err(Error::invalid(format!(
+                return Err(Error::unsupported(format!(
                     "parameter {stage}.{key} has unknown value kind {other}"
                 )));
             }
@@ -173,7 +185,11 @@ impl<'a> Param<'a> {
 }
 
 /// The YUV colour matrix of a chain.
+///
+/// A later release may name more codes, which until then are `Other`: a
+/// `match` on it has a catch-all arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ColourMatrix {
     /// ITU-R BT.601.
     Bt601,
@@ -185,8 +201,34 @@ pub enum ColourMatrix {
     Other(u32),
 }
 
+impl ColourMatrix {
+    /// The matrix of an `OBC_MATRIX_*` code.
+    pub fn from_raw(code: obc_matrix) -> Self {
+        match code {
+            OBC_MATRIX_BT601 => ColourMatrix::Bt601,
+            OBC_MATRIX_BT709 => ColourMatrix::Bt709,
+            OBC_MATRIX_BT2020 => ColourMatrix::Bt2020,
+            other => ColourMatrix::Other(other),
+        }
+    }
+
+    /// The `OBC_MATRIX_*` code.
+    pub fn to_raw(self) -> obc_matrix {
+        match self {
+            ColourMatrix::Bt601 => OBC_MATRIX_BT601,
+            ColourMatrix::Bt709 => OBC_MATRIX_BT709,
+            ColourMatrix::Bt2020 => OBC_MATRIX_BT2020,
+            ColourMatrix::Other(code) => code,
+        }
+    }
+}
+
 /// Where the chroma samples of a chain's frames sit.
+///
+/// A later release may name more codes, which until then are `Other`: a
+/// `match` on it has a catch-all arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ChromaSiting {
     /// MPEG-2: horizontally co-sited, vertically centred.
     Mpeg2,
@@ -196,6 +238,33 @@ pub enum ChromaSiting {
     Cosited,
     /// A code this SDK does not know.
     Other(u32),
+}
+
+// The view reads the whole structure once `struct_size` reaches the base
+// size: sound while no field has been appended. A field appended in a later
+// minor version is read only when it fits in `struct_size`.
+const _: () = assert!(size_of::<obc_chain_request>() == OBC_CHAIN_REQUEST_SIZE_1_0 as usize);
+
+impl ChromaSiting {
+    /// The siting of an `OBC_CHROMA_SITING_*` code.
+    pub fn from_raw(code: obc_chroma_siting) -> Self {
+        match code {
+            OBC_CHROMA_SITING_MPEG2 => ChromaSiting::Mpeg2,
+            OBC_CHROMA_SITING_JPEG => ChromaSiting::Jpeg,
+            OBC_CHROMA_SITING_COSITED => ChromaSiting::Cosited,
+            other => ChromaSiting::Other(other),
+        }
+    }
+
+    /// The `OBC_CHROMA_SITING_*` code.
+    pub fn to_raw(self) -> obc_chroma_siting {
+        match self {
+            ChromaSiting::Mpeg2 => OBC_CHROMA_SITING_MPEG2,
+            ChromaSiting::Jpeg => OBC_CHROMA_SITING_JPEG,
+            ChromaSiting::Cosited => OBC_CHROMA_SITING_COSITED,
+            ChromaSiting::Other(code) => code,
+        }
+    }
 }
 
 /// The chain [`crate::Instance::load`] is asked to load: a checked view of
@@ -210,7 +279,7 @@ pub struct ChainRequest<'a> {
 
 impl<'a> ChainRequest<'a> {
     /// A view of the request at `ptr`, checked: refused when null, smaller
-    /// than this ABI version's request, or when a stage id, a parameter or
+    /// than the request of ABI 1.0 ([`OBC_CHAIN_REQUEST_SIZE_1_0`]), or when a stage id, a parameter or
     /// the background frame is invalid.
     ///
     /// # Safety
@@ -225,13 +294,13 @@ impl<'a> ChainRequest<'a> {
         // SAFETY: non-null and readable; only the first field is read
         // before the size is known.
         let size = unsafe { (*ptr).struct_size } as usize;
-        if size < size_of::<obc_chain_request>() {
+        if size < OBC_CHAIN_REQUEST_SIZE_1_0 as usize {
             return Err(Error::invalid(format!(
-                "chain request struct_size {size} is smaller than {}",
-                size_of::<obc_chain_request>()
+                "chain request struct_size {size} is smaller than {OBC_CHAIN_REQUEST_SIZE_1_0}"
             )));
         }
-        // SAFETY: at least as large as `obc_chain_request`.
+        // SAFETY: at least the base size, the size of `obc_chain_request`
+        // (asserted above).
         let raw = unsafe { &*ptr };
         // SAFETY: forwarded from the caller.
         let stages = unsafe { stage_ids(raw.stages, raw.n_stages) }?;
@@ -303,22 +372,12 @@ impl<'a> ChainRequest<'a> {
 
     /// The YUV matrix.
     pub fn matrix(&self) -> ColourMatrix {
-        match self.raw.matrix {
-            OBC_MATRIX_BT601 => ColourMatrix::Bt601,
-            OBC_MATRIX_BT709 => ColourMatrix::Bt709,
-            OBC_MATRIX_BT2020 => ColourMatrix::Bt2020,
-            other => ColourMatrix::Other(other),
-        }
+        ColourMatrix::from_raw(self.raw.matrix)
     }
 
     /// The chroma siting.
     pub fn chroma_siting(&self) -> ChromaSiting {
-        match self.raw.chroma_siting {
-            OBC_CHROMA_SITING_MPEG2 => ChromaSiting::Mpeg2,
-            OBC_CHROMA_SITING_JPEG => ChromaSiting::Jpeg,
-            OBC_CHROMA_SITING_COSITED => ChromaSiting::Cosited,
-            other => ChromaSiting::Other(other),
-        }
+        ChromaSiting::from_raw(self.raw.chroma_siting)
     }
 
     /// `true` for full range, `false` for limited range (any non-zero byte
@@ -359,7 +418,11 @@ impl<'a> ChainRequest<'a> {
 /// its stages, parameters and background. A load that keeps the frames of
 /// the loaded chain is a switch; one with other frames is a reload
 /// ([`crate::Instance::load`]).
+///
+/// The SDK makes it ([`ChainRequest::frames`]); it may gain fields in a
+/// later release, as the request does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChainFrames {
     /// The kind of the frames.
     pub kind: FrameKind,
@@ -382,7 +445,22 @@ pub struct ChainFrames {
 }
 
 /// What [`crate::Instance::load`] reports.
+///
+/// Built with [`LoadReport::new`] and the `with_` methods, or from
+/// [`LoadReport::default`] by assigning the fields: the structure may gain
+/// fields in a later release, so it cannot be written as a literal outside
+/// this crate.
+///
+/// ```
+/// use obc_module_sdk::LoadReport;
+///
+/// let report = LoadReport::new(12.5)
+///     .with_warmup_ms(3.0)
+///     .with_notice("TensorRT is not available: the chain runs on CUDA");
+/// assert!(!report.reused_model);
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct LoadReport {
     /// How long the load took, in milliseconds.
     pub load_ms: f32,
@@ -399,6 +477,36 @@ pub struct LoadReport {
     /// `notice`); an older host never sees it. A NUL byte in it is
     /// replaced.
     pub notice: Option<String>,
+}
+
+impl LoadReport {
+    /// The report of a load that took `load_ms` milliseconds, with no
+    /// warm-up, no reused model and no notice.
+    pub fn new(load_ms: f32) -> Self {
+        LoadReport {
+            load_ms,
+            ..LoadReport::default()
+        }
+    }
+
+    /// Sets how long the warm-up took, in milliseconds: a number, or
+    /// `None` for no warm-up.
+    pub fn with_warmup_ms(mut self, warmup_ms: impl Into<Option<f32>>) -> Self {
+        self.warmup_ms = warmup_ms.into();
+        self
+    }
+
+    /// Sets whether models of the previous load were reused.
+    pub fn with_reused_model(mut self, reused_model: bool) -> Self {
+        self.reused_model = reused_model;
+        self
+    }
+
+    /// Sets the notice of the load ([`LoadReport::notice`]).
+    pub fn with_notice(mut self, notice: impl Into<String>) -> Self {
+        self.notice = Some(notice.into());
+        self
+    }
 }
 
 #[cfg(test)]
@@ -465,6 +573,9 @@ mod tests {
         // SAFETY: as above.
         let e = unsafe { Param::from_raw(&raw) }.unwrap_err();
         assert!(e.message().contains("unknown value kind"), "{e}");
+        // A constant the module does not know: unsupported, not invalid.
+        assert_eq!(e.kind(), crate::ErrorKind::Unsupported);
+        assert_eq!(e.status(), obc_module_abi::OBC_ERR_UNSUPPORTED);
         raw.value = obc_value::from_str_ptr(c"\xff".as_ptr());
         // SAFETY: as above.
         assert!(
@@ -473,6 +584,38 @@ mod tests {
                 .message()
                 .contains("UTF-8")
         );
+    }
+
+    #[test]
+    fn colour_codes_round_trip() {
+        for code in [OBC_MATRIX_BT601, OBC_MATRIX_BT709, OBC_MATRIX_BT2020, 77] {
+            assert_eq!(ColourMatrix::from_raw(code).to_raw(), code);
+        }
+        assert_eq!(ColourMatrix::from_raw(77), ColourMatrix::Other(77));
+        for code in [
+            OBC_CHROMA_SITING_MPEG2,
+            OBC_CHROMA_SITING_JPEG,
+            OBC_CHROMA_SITING_COSITED,
+            77,
+        ] {
+            assert_eq!(ChromaSiting::from_raw(code).to_raw(), code);
+        }
+        assert_eq!(ChromaSiting::from_raw(77), ChromaSiting::Other(77));
+    }
+
+    #[test]
+    fn load_reports_build() {
+        let report = LoadReport::new(2.0)
+            .with_warmup_ms(1.0)
+            .with_reused_model(true)
+            .with_notice("runs on CUDA");
+        assert_eq!(
+            (report.load_ms, report.warmup_ms, report.reused_model),
+            (2.0, Some(1.0), true)
+        );
+        assert_eq!(report.notice.as_deref(), Some("runs on CUDA"));
+        assert_eq!(LoadReport::new(0.0), LoadReport::default());
+        assert_eq!(LoadReport::new(0.0).with_warmup_ms(None).warmup_ms, None);
     }
 
     #[test]

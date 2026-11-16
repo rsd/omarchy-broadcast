@@ -3,6 +3,7 @@
 //!
 //! ```toml
 //! abi = 1
+//! abi_minor = 6                         # optional: the lowest minor needed
 //! id = "org.example.hello"
 //! name = "Hello tint"
 //! version = "0.1.0"
@@ -58,8 +59,11 @@
 //!
 //! [`Manifest::parse`] refuses unknown keys, so a typo makes the module
 //! unavailable with the parse error as the reason instead of being ignored.
-//! A manifest of another ABI major version parses (so that it can be listed
-//! with its reason) but is never loaded ([`Manifest::abi_mismatch`]).
+//! A manifest of another ABI major version, or one whose optional
+//! `abi_minor` (the lowest minor version the module needs, since ABI 1.6;
+//! 0 when absent) is newer than this host's, is listed with that reason but
+//! never loaded ([`Manifest::abi_mismatch`]); the version is read before the
+//! strict parse, so such a manifest's unknown keys do not hide it.
 //!
 //! Which kinds a host loads is its [`LoadKinds`]: the video daemon loads
 //! video stages only ([`LoadKinds::Video`], the default) and lists audio
@@ -71,8 +75,38 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use obc_backend::StageId;
-use obc_module_abi::{OBC_MAX_AUDIO_CHANNELS, OBC_MODULE_ABI_MAJOR};
+use obc_module_abi::{OBC_MAX_AUDIO_CHANNELS, OBC_MODULE_ABI_MAJOR, OBC_MODULE_ABI_MINOR};
 use serde::Deserialize;
+
+/// Why a manifest of ABI `major` that needs minor version `minor` is not
+/// loaded by this host, or `None` when it can be.
+fn abi_reason(major: i64, minor: i64) -> Option<String> {
+    if major != i64::from(OBC_MODULE_ABI_MAJOR) {
+        return Some(format!(
+            "Built for module ABI {major}; this daemon supports module ABI {OBC_MODULE_ABI_MAJOR}"
+        ));
+    }
+    (minor > i64::from(OBC_MODULE_ABI_MINOR)).then(|| {
+        format!(
+            "Needs module ABI {OBC_MODULE_ABI_MAJOR}.{minor}; this daemon has module ABI \
+             {OBC_MODULE_ABI_MAJOR}.{OBC_MODULE_ABI_MINOR}"
+        )
+    })
+}
+
+/// Why a manifest that does not parse strictly is not loaded for its ABI
+/// version (another major version, or a newer minor one), read leniently
+/// from its `abi` and `abi_minor` keys; `None` when they are this host's,
+/// or missing or not integers.
+pub fn version_reason(text: &str) -> Option<String> {
+    let table: toml::Table = toml::from_str(text).ok()?;
+    let major = table.get("abi")?.as_integer()?;
+    let minor = match table.get("abi_minor") {
+        None => 0,
+        Some(v) => v.as_integer()?,
+    };
+    abi_reason(major, minor)
+}
 
 /// The longest module id, in bytes.
 pub const MODULE_ID_MAX: usize = 64;
@@ -432,6 +466,11 @@ pub struct Manifest {
     pub path: PathBuf,
     /// The ABI major version the module is built for.
     pub abi: u32,
+    /// The lowest minor version of the ABI the module needs (`abi_minor`,
+    /// since ABI 1.6; 0 when absent). A host of an older minor version does
+    /// not load it ([`Manifest::abi_mismatch`]), and a library built for an
+    /// older minor version than this is refused.
+    pub abi_minor: u32,
     /// The module id (reverse-DNS, [`valid_module_id`]).
     pub id: String,
     /// The name shown.
@@ -464,6 +503,8 @@ pub struct Manifest {
 #[serde(deny_unknown_fields)]
 struct RawManifest {
     abi: u32,
+    #[serde(default)]
+    abi_minor: u32,
     id: String,
     name: String,
     version: String,
@@ -755,9 +796,20 @@ impl Manifest {
     /// Parses and validates the text of the manifest at `path`; `path`
     /// resolves a relative `library`. The error is the reason shown for the
     /// module.
+    ///
+    /// The ABI version is read first, leniently: a manifest written for a
+    /// later minor version (`abi_minor` newer than this host's) or another
+    /// major version may carry keys this host does not know, so when the
+    /// strict parse fails the reason is the version's ([`version_reason`]),
+    /// not the parse error.
     pub fn parse(text: &str, path: &Path) -> Result<Manifest, String> {
-        let raw: RawManifest = toml::from_str(text)
-            .map_err(|e| format!("the manifest is malformed: {}", e.message()))?;
+        let raw: RawManifest = match toml::from_str(text) {
+            Ok(raw) => raw,
+            Err(e) => {
+                return Err(version_reason(text)
+                    .unwrap_or_else(|| format!("the manifest is malformed: {}", e.message())));
+            }
+        };
         Manifest::validate(raw, path).map_err(|e| format!("the manifest is invalid: {e}"))
     }
 
@@ -797,6 +849,7 @@ impl Manifest {
         Ok(Manifest {
             path: path.to_path_buf(),
             abi: raw.abi,
+            abi_minor: raw.abi_minor,
             id: raw.id,
             name: non_empty("name", raw.name)?,
             version: non_empty("version", raw.version)?,
@@ -816,15 +869,11 @@ impl Manifest {
         self.stages.iter().find(|s| s.id == id)
     }
 
-    /// Why the module is not loaded because of its ABI major version, or
-    /// `None` when it is this host's.
+    /// Why the module is not loaded because of its ABI version, or `None`
+    /// when this host can load it: another major version, or a minor
+    /// version (`abi_minor`) newer than this host's.
     pub fn abi_mismatch(&self) -> Option<String> {
-        (self.abi != OBC_MODULE_ABI_MAJOR).then(|| {
-            format!(
-                "Built for module ABI {}; this daemon supports module ABI {OBC_MODULE_ABI_MAJOR}",
-                self.abi
-            )
-        })
+        abi_reason(i64::from(self.abi), i64::from(self.abi_minor))
     }
 
     /// Why the module is not loaded at all by the video daemon (another ABI
@@ -1295,6 +1344,38 @@ channels = 2
             "{reason}"
         );
         assert_eq!(m.unloadable_reason(), Some(reason));
+    }
+
+    /// `abi_minor` is optional (0); a newer one than this host's is listed
+    /// with the version it needs, also when the manifest has keys of that
+    /// later version that this host's strict parse refuses.
+    #[test]
+    fn a_newer_abi_minor_is_listed_with_the_version_it_needs() {
+        let m = parse(HELLO).unwrap();
+        assert_eq!((m.abi_minor, m.abi_mismatch()), (0, None));
+        let ours = parse(&HELLO.replace("abi = 1", "abi = 1\nabi_minor = 6")).unwrap();
+        assert_eq!((ours.abi_minor, ours.abi_mismatch()), (6, None));
+        let newer = parse(&HELLO.replace("abi = 1", "abi = 1\nabi_minor = 99")).unwrap();
+        let reason = newer.abi_mismatch().unwrap();
+        assert_eq!(
+            reason,
+            format!("Needs module ABI 1.99; this daemon has module ABI 1.{OBC_MODULE_ABI_MINOR}")
+        );
+        assert_eq!(newer.unloadable_reason(), Some(reason.clone()));
+        // A key of the later version: the reason is the version's.
+        let later = HELLO.replace("abi = 1", "abi = 1\nabi_minor = 99\nlater_key = true");
+        assert_eq!(parse(&later).unwrap_err(), reason);
+        // An unknown key in a manifest of this version stays a parse error.
+        let typo = HELLO.replace("abi = 1", "abi = 1\nabi_minr = 6");
+        assert!(parse(&typo).unwrap_err().contains("malformed"));
+        // Another major version with keys this host does not know.
+        let two = HELLO.replace("abi = 1", "abi = 2\nnew_key = 1");
+        assert!(parse(&two).unwrap_err().contains("Built for module ABI 2"));
+        assert!(
+            parse(&HELLO.replace("abi = 1", "abi = 1\nabi_minor = \"six\""))
+                .unwrap_err()
+                .contains("malformed")
+        );
     }
 
     #[test]

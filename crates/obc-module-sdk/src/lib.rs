@@ -101,13 +101,35 @@
 //! `Instance: Send`. State shared between the module and its instances
 //! belongs in an `Arc` (with its own locking) handed to each instance.
 //!
-//! # Stability
+//! # Versions and stability
 //!
-//! The ABI this crate wraps (ABI 1.x, [`abi`]) is not yet declared stable.
-//! Until it is, it may change in breaking ways, even without a change of the
-//! major version. A module built with this crate may therefore need
-//! rebuilding, against the matching release of this crate, after an update
-//! of omarchy-broadcast.
+//! The module ABI ([`abi`]) is stable from ABI 1.6: a module library built
+//! for ABI 1.N loads and behaves as documented on every host of ABI 1.M with
+//! M >= N, and a host refuses a library of a newer minor version than its
+//! own. The two crates are versioned as follows.
+//!
+//! * **`obc-module-abi`** follows the ABI version: its release 1.N.x
+//!   describes ABI 1.N, and a patch release changes comments only. Its
+//!   semver holds by construction, since a minor version of the ABI only
+//!   appends.
+//! * **`obc-module-sdk`**, this crate, has its own semver, independent of
+//!   the ABI and of omarchy-broadcast. A minor or patch release keeps the
+//!   source of a module compiling; a major release may break it. Each
+//!   release emits one ABI minor version (what the exported
+//!   `obc_module_abi_version` returns): release 2.0 emits module ABI 1.6.
+//!   A module built with a release needs a host of that ABI minor version
+//!   or later: build with an older release of this crate to support older
+//!   hosts.
+//!
+//! To keep additions from being source breaks, the structures a module
+//! builds ([`LoadReport`], [`AudioLoadReport`], [`StatusValue`], and the
+//! documents [`ProbeReport`] and [`SettingsDescription`] with their parts)
+//! are `#[non_exhaustive]`: a module makes them with their constructors and
+//! methods, or from `Default` by assigning fields, never as a literal. The enumerations a later release may
+//! extend ([`ErrorKind`], [`Value`], [`FrameKind`], [`PixelFormat`],
+//! [`SettingKind`], among others) are `#[non_exhaustive]` too, so a `match`
+//! on one has a catch-all arm. A method added to [`Module`], [`Instance`]
+//! or [`AudioInstance`] in a minor release has a default.
 
 pub use obc_module_abi as abi;
 /// Re-exported so a module needs no direct dependency to read its
@@ -136,10 +158,16 @@ pub use request::{
 
 /// A named numeric value a stage reports ([`Instance::status_values`]):
 /// the stage id, the value's name, unique within the stage, and the value.
+/// Made with [`StatusValue::new`]: it may gain fields in a later release.
+/// Names starting with `obc.` are the host's, which drops such a value.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct StatusValue {
+    /// The stage id.
     pub stage: String,
+    /// The name of the value, unique within the stage.
     pub name: String,
+    /// The value.
     pub value: f64,
 }
 

@@ -108,7 +108,7 @@ fn a_reload_switches_chains_without_a_gap() {
     env.hello();
     let base = json!({
         "version": 1, "idle_exit_s": 0,
-        "values": { "mic.hello.enabled": true, "mic.hello.gain": -6 },
+        "values": { "mic.x_example_hello_audio.enabled": true, "mic.x_example_hello_audio.gain": -6 },
     });
     env.snapshot(base.clone());
     let w = env.spawn();
@@ -122,7 +122,7 @@ fn a_reload_switches_chains_without_a_gap() {
 
     // A live parameter: no reload.
     let mut live = base.clone();
-    live["values"]["mic.hello.gain"] = json!(0);
+    live["values"]["mic.x_example_hello_audio.gain"] = json!(0);
     bus.call("ApplySnapshot", Some(&live.to_string())).unwrap();
     let n = p.out.len();
     assert!(p.run_until(5 * SEC, |o| o.len() > n + 10
@@ -137,7 +137,7 @@ fn a_reload_switches_chains_without_a_gap() {
     // A load-time parameter (the test tone): a new chain loads while the
     // old one keeps processing, then takes over.
     let mut tone = live.clone();
-    tone["values"]["mic.hello.tone"] = json!(true);
+    tone["values"]["mic.x_example_hello_audio.tone"] = json!(true);
     bus.call("ApplySnapshot", Some(&tone.to_string())).unwrap();
     // The switch happens on a block: audio keeps flowing meanwhile.
     let end = std::time::Instant::now() + 5 * SEC;
@@ -497,7 +497,8 @@ fn the_gpu_policy_is_enforced_and_with_camera_decided_per_session() {
     env.bus = Some(bus.address.clone());
     gpu_fixture_and_hello(&mut env);
     let snap = |mut extra: serde_json::Value| {
-        extra["values"] = json!({ "mic.fixture.gain": 100, "mic.hello.enabled": true });
+        extra["values"] =
+            json!({ "mic.fixture.gain": 100, "mic.x_example_hello_audio.enabled": true });
         fixture_snapshot(100, extra)
     };
     env.snapshot(snap(json!({ "gpu_policy": "never" })));
@@ -669,7 +670,7 @@ fn a_chain_that_fails_while_the_next_warms_up_hands_over_to_it() {
         .push(("OBC_FIXTURE_AUDIO_FAIL_AT".into(), "40".into()));
     let base = json!({
         "version": 1, "idle_exit_s": 0,
-        "values": { "mic.hello.enabled": false, "mic.hello.gain": -6 },
+        "values": { "mic.x_example_hello_audio.enabled": false, "mic.x_example_hello_audio.gain": -6 },
     });
     env.snapshot(base.clone());
     let w = env.spawn();
@@ -692,7 +693,7 @@ fn a_chain_that_fails_while_the_next_warms_up_hands_over_to_it() {
     // A new chain (the example module added): loaded while no block comes,
     // so it warms up on the very block the fixture fails.
     let mut more = base.clone();
-    more["values"]["mic.hello.enabled"] = json!(true);
+    more["values"]["mic.x_example_hello_audio.enabled"] = json!(true);
     bus.call("ApplySnapshot", Some(&more.to_string())).unwrap();
     let end = std::time::Instant::now() + 5 * SEC;
     while w.log_text().matches("chain loaded").count() < 2 {
@@ -794,7 +795,8 @@ fn a_deeper_pipeline_is_negotiated_again() {
     env.bus = Some(bus.address.clone());
     gpu_fixture_and_hello(&mut env);
     let snap = |mut extra: serde_json::Value| {
-        extra["values"] = json!({ "mic.fixture.gain": 100, "mic.hello.enabled": true });
+        extra["values"] =
+            json!({ "mic.fixture.gain": 100, "mic.x_example_hello_audio.enabled": true });
         fixture_snapshot(100, extra)
     };
     env.snapshot(snap(json!({ "gpu_policy": "never" })));
@@ -974,7 +976,7 @@ impl Drop for InProcess {
 /// The snapshot of the warm tests: every stage on, `gpu_warm_s` as given;
 /// `values` in `extra` are set over those.
 fn warm_snapshot(extra: serde_json::Value) -> Snapshot {
-    let mut values = json!({ "mic.fixture.gain": 100, "mic.hello.enabled": true });
+    let mut values = json!({ "mic.fixture.gain": 100, "mic.x_example_hello_audio.enabled": true });
     if let Some(v) = extra.get("values").and_then(|v| v.as_object()) {
         for (k, x) in v {
             values[k] = x.clone();

@@ -1,6 +1,7 @@
 //! An example omarchy-broadcast module, built with `obc-module-sdk`.
 //!
-//! It provides one stage, `hello`, which tints the picture warm: on host
+//! It provides one stage, `x-example-hello` (the vendor form of a stage of
+//! a module's own), which tints the picture warm: on host
 //! NV12 frames, in place, it moves every chroma sample towards red and away
 //! from blue by an amount set with the `strength` setting (0 to 100). Luma
 //! is never touched, so the picture keeps its brightness and detail.
@@ -8,7 +9,8 @@
 //! The module shows the whole surface a module implements:
 //!
 //! * [`Module::probe`]: the stage needs nothing, so it is always available;
-//! * [`Module::settings`]: a `hello` group with an on/off switch for the
+//! * [`Module::settings`]: an `x_example_hello` group (the vendor form of a
+//!   group) with an on/off switch for the
 //!   stage and a live `strength` parameter;
 //! * [`Instance::load`]: reads the load-time strength and the colour range;
 //! * [`Instance::process`]: reads the per-frame strength and tints.
@@ -19,7 +21,7 @@ use obc_module_sdk::{
 };
 
 /// The stage id.
-pub const STAGE: &str = "hello";
+pub const STAGE: &str = "x-example-hello";
 /// The parameter key of the strength.
 pub const STRENGTH_KEY: &str = "strength";
 /// The strength when none is given.
@@ -44,16 +46,16 @@ impl Module for HelloModule {
 
     fn settings(&self) -> SettingsDescription {
         SettingsDescription::new().group(
-            Group::new("hello", "Hello module")
+            Group::new("x_example_hello", "Hello module")
                 .setting(
-                    Setting::bool("effect.hello.enabled", "Warm tint", false)
+                    Setting::bool("effect.x_example_hello.enabled", "Warm tint", false)
                         .stage(STAGE)
                         .role(Role::Enable)
                         .hint("switch"),
                 )
                 .setting(
                     Setting::int(
-                        "effect.hello.strength",
+                        "effect.x_example_hello.strength",
                         "Strength",
                         0,
                         100,
@@ -64,7 +66,7 @@ impl Module for HelloModule {
                     .stage(STAGE)
                     .key(STRENGTH_KEY)
                     .apply(Apply::Live)
-                    .enabled_when("effect.hello.enabled", Op::Eq, true)
+                    .enabled_when("effect.x_example_hello.enabled", Op::Eq, true)
                     .disabled_reason("Turn on the warm tint to change this")
                     .hint("slider"),
                 ),
@@ -76,7 +78,7 @@ impl Module for HelloModule {
     }
 }
 
-/// One `hello` chain.
+/// One `x-example-hello` chain.
 #[derive(Debug, Default)]
 pub struct HelloInstance {
     strength: i64,
@@ -234,9 +236,9 @@ mod tests {
     }
 
     fn loaded(strength: Option<i64>) -> HelloInstance {
-        let stages = [c"hello".as_ptr()];
+        let stages = [c"x-example-hello".as_ptr()];
         let params = strength.map(|s| obc_param {
-            stage: c"hello".as_ptr(),
+            stage: c"x-example-hello".as_ptr(),
             key: c"strength".as_ptr(),
             value: obc_value::from_int(s),
         });
@@ -351,23 +353,23 @@ mod tests {
         let module = HelloModule::init(serde_json::json!({})).unwrap();
         assert_eq!(
             module.probe().to_json(),
-            r#"{"stages":[{"id":"hello","available":true}]}"#
+            r#"{"stages":[{"id":"x-example-hello","available":true}]}"#
         );
         let json: serde_json::Value = serde_json::from_str(&module.settings().to_json()).unwrap();
         let group = &json["groups"][0];
         assert_eq!(
             (group["id"].as_str(), group["label"].as_str()),
-            (Some("hello"), Some("Hello module"))
+            (Some("x_example_hello"), Some("Hello module"))
         );
         let enabled = &group["settings"][0];
-        assert_eq!(enabled["id"], "effect.hello.enabled");
+        assert_eq!(enabled["id"], "effect.x_example_hello.enabled");
         assert_eq!(
             (enabled["type"].as_str(), enabled["role"].as_str()),
             (Some("bool"), Some("enable"))
         );
-        assert_eq!(enabled["stage"], "hello");
+        assert_eq!(enabled["stage"], STAGE);
         let strength = &group["settings"][1];
-        assert_eq!(strength["id"], "effect.hello.strength");
+        assert_eq!(strength["id"], "effect.x_example_hello.strength");
         assert_eq!(
             (
                 &strength["min"],
@@ -388,13 +390,13 @@ mod tests {
         );
         assert_eq!(
             strength["enabled_when"],
-            serde_json::json!([["effect.hello.enabled", "eq", true]])
+            serde_json::json!([["effect.x_example_hello.enabled", "eq", true]])
         );
     }
 
     #[test]
     fn refuses_other_frames() {
-        let stages = [c"hello".as_ptr()];
+        let stages = [c"x-example-hello".as_ptr()];
         let mut raw = obc_chain_request::empty();
         raw.stages = stages.as_ptr();
         raw.n_stages = 1;

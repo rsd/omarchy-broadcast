@@ -288,13 +288,12 @@ pub fn fits(kind: &SettingType, v: &StoredValue) -> bool {
     }
 }
 
-/// The default of a setting of type `kind` (`None` for an action).
+/// The default of a setting of type `kind`.
 pub fn default_of(kind: &SettingType) -> Option<StoredValue> {
     match kind {
         SettingType::Bool { default } => Some(StoredValue::Bool(*default)),
         SettingType::Int { default, .. } => Some(StoredValue::Int(*default)),
         SettingType::Enum { default, .. } => Some(StoredValue::Str(default.clone())),
-        SettingType::Action => None,
     }
 }
 

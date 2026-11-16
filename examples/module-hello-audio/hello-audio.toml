@@ -4,6 +4,7 @@
 # relative to this file). The audio worker loads it; the video daemon lists
 # it and never opens it.
 abi = 1
+abi_minor = 6
 id = "org.example.hello-audio"
 name = "Hello voice"
 version = "0.1.0"
