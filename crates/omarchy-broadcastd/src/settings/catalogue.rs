@@ -148,6 +148,16 @@ pub const AUTO_EXPOSURE_OPTIONS: &[KnownOption] = &[
     (3, "aperture_priority", "Aperture priority"),
 ];
 
+/// Controls the camera drives itself under an automatic master, for the
+/// recommendation only, as `(control, master, master option ids)`: while
+/// the master holds one of those options the camera rewrites the control
+/// within seconds, so recommending a value for it never clears. Unlike a
+/// [`Rule`] it greys nothing: the control stays settable in the UI (a
+/// Logitech C930e's gain is changed by its auto exposure, yet a user may
+/// still write it). Add a row for each control found to behave so.
+pub const AUTO_DRIVEN: &[(&str, &str, &[&str])] =
+    &[("gain", "auto_exposure", &["auto", "aperture_priority"])];
+
 /// The label of `auto_exposure`'s item 3 when the device has no item 0.
 pub const AUTO_EXPOSURE_ALONE: &str = "Auto";
 

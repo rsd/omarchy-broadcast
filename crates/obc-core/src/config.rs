@@ -1638,17 +1638,35 @@ pub struct RuntimeState {
     /// default microphone" made the Omarchy Broadcast Mic the default: the
     /// one made the default again by the restore action and when the mic
     /// host is turned off. The daemon's own record; `None` while the
-    /// Omarchy Broadcast Mic is not made the default by it. Read leniently:
-    /// a value that is not a string is dropped.
+    /// Omarchy Broadcast Mic is not made the default by it. Another "Use as
+    /// default microphone" while the Omarchy Broadcast Mic is the configured
+    /// default keeps it (a non-empty one; the audio worker then names the
+    /// device the capture side is pinned to, not the user's default). Read
+    /// leniently: a value that is not a string is dropped.
     #[serde(
         skip_serializing_if = "Option::is_none",
         deserialize_with = "de_mic_previous_default"
     )]
     pub mic_previous_default: Option<String>,
+    /// The real default microphone in force (a PipeWire `node.name`) when
+    /// "Use as default microphone" made the Omarchy Broadcast Mic the
+    /// default, as the audio worker saw it: with the configured default
+    /// unplugged it differs from `mic_previous_default`. Recorded and
+    /// cleared with `mic_previous_default` (another "Use as default
+    /// microphone" while the Omarchy Broadcast Mic is the configured
+    /// default keeps both), and given to the worker in the audio settings snapshot: the
+    /// capture side follows it with `[mic] device = "default"`, and the
+    /// restore makes it the default where `mic_previous_default` is
+    /// unplugged. Read leniently: a value that is not a string is dropped.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_mic_previous_default"
+    )]
+    pub mic_previous_in_force: Option<String>,
 }
 
-/// `mic_previous_default`, leniently: a string, else nothing; never an
-/// error.
+/// `mic_previous_default` (and `mic_previous_in_force`), leniently: a
+/// string, else nothing; never an error.
 fn de_mic_previous_default<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     let value = toml::Value::deserialize(d)?;
     Ok(value.as_str().map(str::to_string))
@@ -1750,6 +1768,7 @@ impl Default for RuntimeState {
             camera_modes: BTreeMap::new(),
             output_good: None,
             mic_previous_default: None,
+            mic_previous_in_force: None,
         }
     }
 }
@@ -3246,6 +3265,46 @@ offer_nv12 = false
         assert_eq!(back.mic_previous_default, None);
         let text = toml::to_string(&RuntimeState::default()).unwrap();
         assert!(!text.contains("mic_previous_default"), "{text}");
+    }
+
+    #[test]
+    fn the_source_in_force_beside_the_previous_default_is_kept_and_read_leniently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let st = RuntimeState {
+            mic_previous_default: Some("alsa_input.usb-cmedia".into()),
+            mic_previous_in_force: Some("alsa_input.pci-dmic".into()),
+            ..RuntimeState::default()
+        };
+        st.save(&path).unwrap();
+        let (back, damaged) = RuntimeState::load(&path);
+        assert_eq!(damaged, None);
+        assert_eq!(
+            (
+                back.mic_previous_default.as_deref(),
+                back.mic_previous_in_force.as_deref()
+            ),
+            (Some("alsa_input.usb-cmedia"), Some("alsa_input.pci-dmic"))
+        );
+        // Not a string: dropped, the rest kept, the file not damaged.
+        std::fs::write(
+            &path,
+            "enabled = true\nmic_previous_default = \"alsa_input.x\"\nmic_previous_in_force = [1]\n",
+        )
+        .unwrap();
+        let (back, damaged) = RuntimeState::load(&path);
+        assert_eq!(damaged, None);
+        assert_eq!(back.mic_previous_in_force, None);
+        assert_eq!(back.mic_previous_default.as_deref(), Some("alsa_input.x"));
+        // A file of before it: none.
+        std::fs::write(
+            &path,
+            "enabled = true\nmic_previous_default = \"alsa_input.x\"\n",
+        )
+        .unwrap();
+        assert_eq!(RuntimeState::load(&path).0.mic_previous_in_force, None);
+        let text = toml::to_string(&RuntimeState::default()).unwrap();
+        assert!(!text.contains("mic_previous_in_force"), "{text}");
     }
 
     #[test]

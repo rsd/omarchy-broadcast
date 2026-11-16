@@ -14,7 +14,8 @@ use omarchy_broadcast_audiod::host::{GpuGate, Host};
 use omarchy_broadcast_audiod::listener;
 use omarchy_broadcast_audiod::mixer::{Mixer, Reading};
 use omarchy_broadcast_audiod::pipewire::{
-    AlsaSource, AlsaSources, Consumers, PipeWireControl, PipeWireError, SourceDevice,
+    AlsaSource, AlsaSources, Consumers, PipeWireControl, PipeWireError, PreviousDefault,
+    SourceDevice,
 };
 use omarchy_broadcast_audiod::snapshot::Snapshot;
 use serde_json::json;
@@ -434,6 +435,8 @@ fn the_control_interface_lists_describes_and_applies() {
     let e = bus.call("GetDevices", None).unwrap_err();
     assert!(e.contains("NotSupported"), "{e}");
     let e = bus.call("MakeDefault", Some("x")).unwrap_err();
+    assert!(e.contains("NotSupported"), "{e}");
+    let e = bus.call("Pin", Some("x")).unwrap_err();
     assert!(e.contains("NotSupported"), "{e}");
     // Nothing persisted.
     let on_disk: serde_json::Value =
@@ -930,11 +933,19 @@ impl PipeWireControl for FakePipeWire {
         Err(PipeWireError::Unavailable("fake".into()))
     }
 
-    fn make_default(&self, _target: &str) -> Result<String, PipeWireError> {
+    fn make_default(&self, _target: &str) -> Result<PreviousDefault, PipeWireError> {
         Err(PipeWireError::Unavailable("fake".into()))
     }
 
-    fn restore_default(&self, _previous: &str) -> Result<(), PipeWireError> {
+    fn restore_default(
+        &self,
+        _previous: &str,
+        _in_force: Option<&str>,
+    ) -> Result<(), PipeWireError> {
+        Err(PipeWireError::Unavailable("fake".into()))
+    }
+
+    fn pin(&self, _target: &str, _in_force: Option<&str>) -> Result<(), PipeWireError> {
         Err(PipeWireError::Unavailable("fake".into()))
     }
 
@@ -1480,11 +1491,19 @@ impl PipeWireControl for GainPipeWire {
         Err(PipeWireError::Unavailable("fake".into()))
     }
 
-    fn make_default(&self, _target: &str) -> Result<String, PipeWireError> {
+    fn make_default(&self, _target: &str) -> Result<PreviousDefault, PipeWireError> {
         Err(PipeWireError::Unavailable("fake".into()))
     }
 
-    fn restore_default(&self, _previous: &str) -> Result<(), PipeWireError> {
+    fn restore_default(
+        &self,
+        _previous: &str,
+        _in_force: Option<&str>,
+    ) -> Result<(), PipeWireError> {
+        Err(PipeWireError::Unavailable("fake".into()))
+    }
+
+    fn pin(&self, _target: &str, _in_force: Option<&str>) -> Result<(), PipeWireError> {
         Err(PipeWireError::Unavailable("fake".into()))
     }
 

@@ -55,6 +55,10 @@ pub const WORKER_INTERFACE: &str = "br.com.dias.OmarchyBroadcast.AudioWorker1";
 
 /// How often the mic host's unit state is read.
 pub const HOST_POLL: Duration = Duration::from_secs(5);
+/// How many host polls a pin that failed is tried again at (the mic
+/// host's capture node, or the device, not in PipeWire yet), before it is
+/// only logged: about half a minute.
+pub const PIN_RETRIES: u32 = 6;
 /// The longest a call to the worker or the service manager may take.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// The longest [`SystemdUnits`] waits for a start or stop job to finish
@@ -79,9 +83,14 @@ pub enum MicRequest {
     /// "Use as default microphone", the capture side pinned to `target`
     /// (empty: the previous default).
     MakeDefault { target: String, reply: Reply },
-    /// `mic.device` changed while the Omarchy Broadcast Mic is the default:
-    /// the capture side is pinned to `target` (empty: the previous default)
-    /// again, while the mic host runs. Nothing is recorded or answered.
+    /// `mic.device` is `target` (empty: `default`), sent at the start and
+    /// at every change: the capture side is pinned to it now while the mic
+    /// host runs, whether or not the Omarchy Broadcast Mic is the default,
+    /// and again whenever the mic host comes on and after a restore of the
+    /// default (the worker's `Pin`, which never changes the default; with
+    /// `default`, it unpins only while the Omarchy Broadcast Mic is not the
+    /// default). Nothing is recorded or answered; a device that is not
+    /// connected is only logged.
     Repin { target: String },
     /// "Use the previous default microphone".
     RestoreDefault { previous: String, reply: Reply },
@@ -100,8 +109,19 @@ pub enum MicEvent {
     /// The worker's modules, settings and devices.
     Catalogue(Catalogue),
     /// The Omarchy Broadcast Mic is the default microphone now; `previous`
-    /// was (empty when not known). Kept, then `reply` answered.
-    DefaultMade { previous: String, reply: Reply },
+    /// was (empty when not known), and `in_force` was the real source in
+    /// force then (`None` when the worker saw none, as when ours was the
+    /// default in force already, or an older worker that does not tell it).
+    /// `already`: ours was the configured default before the call, so that
+    /// `previous` is the pin in force and a previous default on record is
+    /// kept, with its source in force (`false` from an older worker that
+    /// does not tell it). Kept, then `reply` answered.
+    DefaultMade {
+        previous: String,
+        in_force: Option<String>,
+        already: bool,
+        reply: Reply,
+    },
     /// The previous default microphone is the default again (`Ok`), or not.
     DefaultRestored {
         result: Result<(), IpcError>,
@@ -126,6 +146,7 @@ pub enum Call {
     ApplySnapshot(String),
     MakeDefault(String),
     RestoreDefault(String),
+    Pin(String),
     ResetModule(String),
 }
 
@@ -145,6 +166,8 @@ pub struct WorkerError {
     /// No worker (not installed, not running for a call that does not
     /// start it) or no PipeWire for it: `Unavailable`.
     pub unavailable: bool,
+    /// The worker does not have the method (an older one, still running).
+    pub unknown_method: bool,
     pub message: String,
 }
 
@@ -234,8 +257,28 @@ pub struct Agent<W: Worker, U: Units> {
     pending: VecDeque<MicRequest>,
     /// The previous default the worker named at the last "Use as default
     /// microphone" here, until a restore: `mic off` restores it even when
-    /// the controller had not recorded it yet.
+    /// the controller had not recorded it yet. Another one while ours was
+    /// the configured default already (the worker's `already`) keeps it.
     made_previous: Option<String>,
+    /// `mic.device` as the controller last told it ([`MicRequest::Repin`];
+    /// empty: `default`), `None` before it did.
+    pin_target: Option<String>,
+    /// The capture side is to be pinned to `pin_target` ([`Agent::pin`]).
+    pin_due: bool,
+    /// How often the pin due failed: it is tried again at each host poll,
+    /// up to [`PIN_RETRIES`] times (the mic host's capture node, or the
+    /// device, may not be in PipeWire yet just after a start).
+    pin_failures: u32,
+    /// The `capture_serial` of the worker's last status (`None` while no
+    /// worker runs, or with a worker that does not tell it): when it
+    /// moves, the mic host's capture node is a new one, not pinned yet.
+    capture_seen: Option<u64>,
+    /// "Use as default microphone" succeeded here, and no restore since:
+    /// a worker without `Pin` is asked to move the pin with `MakeDefault`
+    /// (idempotent while ours is the default) instead.
+    default_made: bool,
+    /// How often the mic host's unit state is read ([`HOST_POLL`]).
+    host_poll: Duration,
 }
 
 impl<W: Worker, U: Units> Agent<W, U> {
@@ -259,7 +302,19 @@ impl<W: Worker, U: Units> Agent<W, U> {
             sent_catalogue: None,
             pending: VecDeque::new(),
             made_previous: None,
+            pin_target: None,
+            pin_due: false,
+            pin_failures: 0,
+            capture_seen: None,
+            default_made: false,
+            host_poll: HOST_POLL,
         }
+    }
+
+    /// The agent, its host poll every `every` instead of [`HOST_POLL`].
+    pub fn with_host_poll(mut self, every: Duration) -> Self {
+        self.host_poll = every;
+        self
     }
 
     /// Runs until the controller drops its link: the requests queued at
@@ -281,11 +336,12 @@ impl<W: Worker, U: Units> Agent<W, U> {
         // take a while (the worker starting): the panel does not ask to
         // turn on a microphone that is on meanwhile.
         self.send_status();
+        self.pin().await;
         self.refresh_catalogue(true, true).await;
         self.refresh_status().await;
         self.send_status();
         self.send_catalogue();
-        let mut tick = tokio::time::interval(HOST_POLL);
+        let mut tick = tokio::time::interval(self.host_poll);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await;
         loop {
@@ -302,6 +358,7 @@ impl<W: Worker, U: Units> Agent<W, U> {
                 _ = tick.tick() => {
                     self.refresh_host().await;
                     self.send_status();
+                    self.pin_at_poll().await;
                 }
             }
         }
@@ -351,6 +408,7 @@ impl<W: Worker, U: Units> Agent<W, U> {
             Ok(r) => r,
             Err(_) => Err(WorkerError {
                 unavailable: false,
+                unknown_method: false,
                 message: format!(
                     "the audio worker did not answer {} within {} s",
                     name.split('(').next().unwrap_or(&name),
@@ -424,17 +482,29 @@ impl<W: Worker, U: Units> Agent<W, U> {
                     result,
                     reply,
                 });
+                // A mic host that came on captures the device chosen.
+                self.pin().await;
             }
             MicRequest::MakeDefault { target, reply } => {
                 match self.call(Call::MakeDefault(target)).await {
                     Ok(text) => {
-                        let previous = serde_json::from_str::<Json>(&text)
-                            .ok()
-                            .and_then(|v| v.get("previous")?.as_str().map(str::to_string))
-                            .unwrap_or_default();
-                        if !previous.is_empty() {
+                        let doc = serde_json::from_str::<Json>(&text).ok();
+                        let name = |key: &str| {
+                            doc.as_ref()
+                                .and_then(|v| v.get(key)?.as_str().map(str::to_string))
+                        };
+                        let previous = name("previous").unwrap_or_default();
+                        let in_force = name("in_force").filter(|n| !n.is_empty());
+                        let already = doc
+                            .as_ref()
+                            .and_then(|v| v.get("already")?.as_bool())
+                            .unwrap_or(false);
+                        // Ours the configured default already: `previous`
+                        // is the pin in force, the one known here stays.
+                        if !previous.is_empty() && !(already && self.made_previous.is_some()) {
                             self.made_previous = Some(previous.clone());
                         }
+                        self.default_made = true;
                         info!(
                             "the Omarchy Broadcast Mic is the default microphone (previously {})",
                             if previous.is_empty() {
@@ -443,7 +513,12 @@ impl<W: Worker, U: Units> Agent<W, U> {
                                 previous.as_str()
                             }
                         );
-                        self.send(MicEvent::DefaultMade { previous, reply });
+                        self.send(MicEvent::DefaultMade {
+                            previous,
+                            in_force,
+                            already,
+                            reply,
+                        });
                     }
                     Err(e) => {
                         let _ =
@@ -452,20 +527,16 @@ impl<W: Worker, U: Units> Agent<W, U> {
                 }
             }
             MicRequest::Repin { target } => {
-                self.refresh_host().await;
-                if !self.host_on {
+                self.pin_target = Some(target);
+                self.pin_soon();
+                // Queued before the start (the first snapshot's): pinned
+                // once the first status is out, which a worker starting
+                // for the pin would hold up.
+                if self.sent_status.is_none() {
                     return;
                 }
-                // The worker's `MakeDefault` is idempotent here: it only
-                // moves the pin, and never names our own node as the
-                // previous default, so the record stays as it is.
-                match self.call(Call::MakeDefault(target.clone())).await {
-                    Ok(_) => info!("the Omarchy Broadcast Mic captures {target:?} now"),
-                    Err(e) => warning!(
-                        "the capture side cannot be pinned to {target:?} ({})",
-                        e.message
-                    ),
-                }
+                self.refresh_host().await;
+                self.pin().await;
             }
             MicRequest::RestoreDefault { previous, reply } => {
                 let result = self
@@ -473,10 +544,18 @@ impl<W: Worker, U: Units> Agent<W, U> {
                     .await
                     .map(|_| {
                         self.made_previous = None;
+                        self.default_made = false;
                         info!("the default microphone is {previous:?} again")
                     })
                     .map_err(|e| e.to_ipc("the previous default microphone cannot be restored"));
+                let restored = result.is_ok();
                 self.send(MicEvent::DefaultRestored { result, reply });
+                // The restore unpinned the capture side: a device chosen
+                // is captured again (with `default` it stays unpinned).
+                if restored && self.pin_target.as_deref().is_some_and(|t| !t.is_empty()) {
+                    self.pin_soon();
+                    self.pin().await;
+                }
             }
             MicRequest::ResetModule(id) => match self.call(Call::ResetModule(id.clone())).await {
                 Ok(was) => {
@@ -531,6 +610,7 @@ impl<W: Worker, U: Units> Agent<W, U> {
             Ok(_) => {
                 restored = true;
                 self.made_previous = None;
+                self.default_made = false;
                 info!(
                     "the default microphone is {} (if it was the Omarchy Broadcast Mic)",
                     if prev.is_empty() {
@@ -566,15 +646,20 @@ impl<W: Worker, U: Units> Agent<W, U> {
                 self.refresh_status().await;
                 self.refresh_catalogue(false, true).await;
                 self.send_status();
+                self.pin().await;
             }
             WorkerEvent::Owner(false) => {
                 debug!("the audio worker is gone");
                 self.worker_status = None;
+                self.capture_seen = None;
                 self.send_status();
             }
             WorkerEvent::Status(text) => {
                 match serde_json::from_str::<Json>(&text) {
-                    Ok(v) => self.worker_status = Some(v),
+                    Ok(v) => {
+                        self.worker_status = Some(v);
+                        self.follow_capture();
+                    }
                     Err(e) => debug!("StatusChanged: not JSON ({e})"),
                 }
                 self.send_status();
@@ -583,6 +668,7 @@ impl<W: Worker, U: Units> Agent<W, U> {
                 // A change of the gain alone reaches the controller even
                 // when the worker's catalogue cannot be read now.
                 self.send_catalogue();
+                self.pin().await;
             }
             WorkerEvent::Stats(overruns, misses, voice) => {
                 if self
@@ -596,8 +682,10 @@ impl<W: Worker, U: Units> Agent<W, U> {
         }
     }
 
-    /// Reads whether the mic host runs.
+    /// Reads whether the mic host runs; one that comes on is due to have
+    /// its capture side pinned ([`Agent::pin`]).
     async fn refresh_host(&mut self) {
+        let was = self.host_on;
         self.host_on = match self.unit(self.units.active(HOST_UNIT), HOST_UNIT).await {
             Ok(on) => on,
             Err(e) => {
@@ -605,6 +693,126 @@ impl<W: Worker, U: Units> Agent<W, U> {
                 false
             }
         };
+        if self.host_on && !was {
+            self.pin_soon();
+        }
+    }
+
+    /// The capture side is due to be pinned, tried at once.
+    fn pin_soon(&mut self) {
+        self.pin_due = true;
+        self.pin_failures = 0;
+    }
+
+    /// A new capture node (the worker's `capture_serial` moved, or was
+    /// first seen since the worker started) is due to be pinned: the mic
+    /// host or PipeWire restarted, maybe between two host polls.
+    fn follow_capture(&mut self) {
+        let Some(serial) = self
+            .worker_status
+            .as_ref()
+            .and_then(|s| s.get("capture_serial")?.as_u64())
+        else {
+            return;
+        };
+        if self.capture_seen != Some(serial) {
+            self.capture_seen = Some(serial);
+            self.pin_soon();
+        }
+    }
+
+    /// [`Agent::pin`] at a host poll: also a pin that failed is tried
+    /// again.
+    async fn pin_at_poll(&mut self) {
+        self.pin_now(true).await;
+    }
+
+    /// Pins the capture side to the device chosen, when that is due and
+    /// the controller told it, while the mic host runs (the worker's `Pin`,
+    /// whether or not the Omarchy Broadcast Mic is the default; it never
+    /// changes the default). A pin that fails is tried again at each host
+    /// poll, up to [`PIN_RETRIES`] times, then only logged once: a device
+    /// that is not connected fails nothing else. A worker without `Pin`
+    /// (an older one, still running) is asked as before
+    /// ([`Agent::pin_as_before`]).
+    async fn pin(&mut self) {
+        self.pin_now(false).await;
+    }
+
+    async fn pin_now(&mut self, at_poll: bool) {
+        if !self.pin_due || (self.pin_failures > 0 && !at_poll) {
+            return;
+        }
+        let Some(target) = self.pin_target.clone().filter(|_| self.host_on) else {
+            // Due again when the host comes on.
+            self.pin_due = false;
+            return;
+        };
+        let what = pinned_to(&target);
+        match self.call(Call::Pin(target.clone())).await {
+            Ok(_) => {
+                self.pin_due = false;
+                if target.is_empty() {
+                    debug!("the Omarchy Broadcast Mic captures the default microphone");
+                } else {
+                    info!("the Omarchy Broadcast Mic captures {what}");
+                }
+            }
+            Err(e) if e.unknown_method => {
+                self.pin_due = false;
+                self.pin_as_before(target).await;
+            }
+            Err(e) if self.pin_failures < PIN_RETRIES => {
+                self.pin_failures += 1;
+                debug!(
+                    "the capture side cannot be pinned to {what} yet ({}): trying again",
+                    e.message
+                );
+            }
+            Err(e) => {
+                self.pin_due = false;
+                if e.unavailable {
+                    debug!(
+                        "the capture side cannot be pinned to {what} ({})",
+                        e.message
+                    );
+                } else {
+                    warning!(
+                        "the capture side cannot be pinned to {what} ({})",
+                        e.message
+                    );
+                }
+            }
+        }
+    }
+
+    /// A worker older than `Pin`: the capture side is moved with
+    /// `MakeDefault`, idempotent (it only moves the pin, and never names
+    /// our own node as the previous default) only while ours is the default
+    /// as recorded here; else it is left as it is until the worker runs
+    /// the new version (it exits when idle).
+    async fn pin_as_before(&mut self, target: String) {
+        let what = pinned_to(&target);
+        if !self.default_made {
+            debug!(
+                "the audio worker cannot pin the capture side (an older version runs): {what} \
+                 is captured once it is restarted"
+            );
+            return;
+        }
+        match self.call(Call::MakeDefault(target)).await {
+            Ok(_) => info!("the Omarchy Broadcast Mic captures {what} now"),
+            Err(e) if e.unavailable => {
+                debug!(
+                    "the capture side cannot be pinned to {what} ({})",
+                    e.message
+                )
+            }
+            Err(e) => warning!(
+                "the capture side cannot be pinned to {what} ({})",
+                e.message
+            ),
+        }
     }
 
     /// Reads the worker's status, while it runs.
@@ -620,6 +828,7 @@ impl<W: Worker, U: Units> Agent<W, U> {
                 None
             }
         };
+        self.follow_capture();
     }
 
     /// Reads the worker's modules and settings (and its devices, with
@@ -694,6 +903,15 @@ impl<W: Worker, U: Units> Agent<W, U> {
     }
 }
 
+/// How a pin's target is named in the log.
+fn pinned_to(target: &str) -> String {
+    if target.is_empty() {
+        "the default microphone".into()
+    } else {
+        format!("{target:?}")
+    }
+}
+
 async fn next_event(events: &mut Option<UnboundedReceiver<WorkerEvent>>) -> Option<WorkerEvent> {
     match events {
         Some(e) => e.recv().await,
@@ -714,6 +932,16 @@ fn unavailable(e: &zbus::Error) -> bool {
     match e {
         zbus::Error::MethodError(name, _, _) => NAMES.contains(&name.as_str()),
         zbus::Error::FDO(f) => NAMES.contains(&f.name().as_str()),
+        _ => false,
+    }
+}
+
+/// Whether `e` says the worker has no such method (an older one).
+fn unknown_method(e: &zbus::Error) -> bool {
+    const NAME: &str = "org.freedesktop.DBus.Error.UnknownMethod";
+    match e {
+        zbus::Error::MethodError(name, _, _) => name.as_str() == NAME,
+        zbus::Error::FDO(f) => f.name().as_str() == NAME,
         _ => false,
     }
 }
@@ -773,6 +1001,12 @@ impl BusWorker {
                     .await?;
                 String::new()
             }
+            Call::Pin(t) => {
+                proxy
+                    .call_with_flags::<_, _, ()>("Pin", flags, &(t,))
+                    .await?;
+                String::new()
+            }
             Call::ResetModule(id) => {
                 let was: Option<bool> = proxy.call_with_flags("ResetModule", flags, &(id,)).await?;
                 was.unwrap_or(false).to_string()
@@ -799,6 +1033,7 @@ impl Worker for BusWorker {
     async fn call(&self, call: Call, activate: bool) -> Result<String, WorkerError> {
         self.invoke(call, activate).await.map_err(|e| WorkerError {
             unavailable: unavailable(&e),
+            unknown_method: unknown_method(&e),
             message: message(&e),
         })
     }

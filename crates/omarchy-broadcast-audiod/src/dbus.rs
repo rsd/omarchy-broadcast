@@ -117,24 +117,57 @@ impl Worker {
 
     /// Makes the microphone the default source, its capture side pinned to
     /// `target` (empty: the previous default); returns
-    /// `{"previous": name}` (empty when not known).
+    /// `{"previous": name, "in_force": name, "already": bool}`: the previous
+    /// default (empty when not known), the real source in force before
+    /// (`null` when none), which the daemon records and gives back in the
+    /// snapshot's `previous_in_force`, and whether the microphone was the
+    /// configured default already before the call (then `previous` is the
+    /// pin in force, and the daemon keeps what it recorded before).
     async fn make_default(&self, target: String) -> fdo::Result<String> {
         let _call = self.shared.call();
         let shared = self.shared.clone();
-        let previous = blocking(move || shared.pipewire.make_default(&target))
+        let made = blocking(move || shared.pipewire.make_default(&target))
             .await?
             .map_err(pw_error)?;
-        Ok(json!({ "previous": previous }).to_string())
+        Ok(json!({
+            "previous": made.previous,
+            "in_force": made.in_force,
+            "already": made.already,
+        })
+        .to_string())
     }
 
     /// Makes `previous` the default source again (if the microphone still
-    /// is) and unpins the capture side.
+    /// is) and unpins the capture side; the snapshot's `previous_in_force`,
+    /// when connected, goes under `previous` in WirePlumber's history (see
+    /// [`crate::pipewire::PipeWireControl::restore_default`]).
     async fn restore_default(&self, previous: String) -> fdo::Result<()> {
         let _call = self.shared.call();
         let shared = self.shared.clone();
-        blocking(move || shared.pipewire.restore_default(&previous))
-            .await?
-            .map_err(pw_error)
+        blocking(move || {
+            let in_force = lock(&shared.snapshot).previous_in_force.clone();
+            shared
+                .pipewire
+                .restore_default(&previous, in_force.as_deref())
+        })
+        .await?
+        .map_err(pw_error)
+    }
+
+    /// Pins the capture side to `target` (empty: the default), whether or
+    /// not the microphone is the default; never changes the default. With
+    /// `default` while the microphone is the default, the snapshot's
+    /// `previous_in_force` is captured when it is connected (see
+    /// [`crate::pipewire::PipeWireControl::pin`]).
+    async fn pin(&self, target: String) -> fdo::Result<()> {
+        let _call = self.shared.call();
+        let shared = self.shared.clone();
+        blocking(move || {
+            let in_force = lock(&shared.snapshot).previous_in_force.clone();
+            shared.pipewire.pin(&target, in_force.as_deref())
+        })
+        .await?
+        .map_err(pw_error)
     }
 
     /// The status now.
@@ -250,5 +283,123 @@ async fn run_signals(conn: Connection, shared: Arc<Shared>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::host::Host;
+    use crate::pipewire::{PipeWireControl, PreviousDefault, SourceDevice};
+
+    /// The `(method, first argument, in_force)` of every call to
+    /// [`Recording`].
+    type Calls = Arc<Mutex<Vec<(&'static str, String, Option<String>)>>>;
+
+    /// A PipeWire that records what it is asked, and answers `MakeDefault`
+    /// with `made`.
+    struct Recording {
+        calls: Calls,
+        made: PreviousDefault,
+    }
+
+    impl PipeWireControl for Recording {
+        fn devices(&self) -> Result<Vec<SourceDevice>, PipeWireError> {
+            Ok(Vec::new())
+        }
+
+        fn make_default(&self, target: &str) -> Result<PreviousDefault, PipeWireError> {
+            lock(&self.calls).push(("make_default", target.into(), None));
+            Ok(self.made.clone())
+        }
+
+        fn restore_default(
+            &self,
+            previous: &str,
+            in_force: Option<&str>,
+        ) -> Result<(), PipeWireError> {
+            lock(&self.calls).push(("restore_default", previous.into(), in_force.map(Into::into)));
+            Ok(())
+        }
+
+        fn pin(&self, target: &str, in_force: Option<&str>) -> Result<(), PipeWireError> {
+            lock(&self.calls).push(("pin", target.into(), in_force.map(Into::into)));
+            Ok(())
+        }
+
+        fn consumers(&self) -> Option<crate::pipewire::Consumers> {
+            None
+        }
+    }
+
+    fn worker(snapshot: &str, made: PreviousDefault) -> (Worker, Calls) {
+        let snapshot = Snapshot::parse(snapshot).unwrap();
+        let host = Host::load(
+            obc_core::config::Config::default(),
+            &[],
+            None,
+            &snapshot,
+            Arc::new(|_, _, _| {}),
+        );
+        let calls = Calls::default();
+        let pipewire = Recording {
+            calls: calls.clone(),
+            made,
+        };
+        let shared = Arc::new(Shared::new(host, snapshot, Box::new(pipewire)));
+        (Worker { shared }, calls)
+    }
+
+    /// `RestoreDefault` and `Pin` hand PipeWire the snapshot's
+    /// `previous_in_force` (none when it has none), read at the call.
+    #[tokio::test]
+    async fn restore_and_pin_read_the_source_in_force_of_the_snapshot() {
+        let (w, calls) = worker(
+            r#"{"version":1,"previous_in_force":"alsa_input.dmic"}"#,
+            PreviousDefault::default(),
+        );
+        w.restore_default("alsa_input.cmedia".into()).await.unwrap();
+        w.pin(String::new()).await.unwrap();
+        // A snapshot applied since: the new value.
+        *lock(&w.shared.snapshot) = Snapshot::parse(r#"{"version":1}"#).unwrap();
+        w.restore_default("alsa_input.cmedia".into()).await.unwrap();
+        w.pin("alsa_input.c930e".into()).await.unwrap();
+        let dmic = Some("alsa_input.dmic".to_string());
+        assert_eq!(
+            *lock(&calls),
+            [
+                ("restore_default", "alsa_input.cmedia".into(), dmic.clone()),
+                ("pin", String::new(), dmic),
+                ("restore_default", "alsa_input.cmedia".into(), None),
+                ("pin", "alsa_input.c930e".into(), None),
+            ]
+        );
+    }
+
+    /// `MakeDefault` tells the previous default, the source in force and
+    /// whether the microphone was the configured default already.
+    #[tokio::test]
+    async fn make_default_replies_previous_in_force_and_already() {
+        let (w, calls) = worker(
+            r#"{"version":1}"#,
+            PreviousDefault {
+                previous: "alsa_input.c930e".into(),
+                in_force: None,
+                already: true,
+            },
+        );
+        let reply: serde_json::Value =
+            serde_json::from_str(&w.make_default("alsa_input.c930e".into()).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            reply,
+            json!({ "previous": "alsa_input.c930e", "in_force": null, "already": true })
+        );
+        assert_eq!(
+            *lock(&calls),
+            [("make_default", "alsa_input.c930e".into(), None)]
+        );
     }
 }

@@ -136,6 +136,22 @@ pub struct Snapshot {
     /// of `u64` is 0.
     #[serde(deserialize_with = "lenient_serial")]
     pub hardware_gain_serial: u64,
+    /// The real source in force when the daemon made the microphone the
+    /// default (a `node.name`, from the worker's `MakeDefault` reply), kept
+    /// by the daemon until the previous default is restored: the capture
+    /// side follows it with `device = "default"` while the microphone is
+    /// the default, and a restore puts it under the previous default in
+    /// WirePlumber's history (see [`crate::pipewire::PipeWireControl`]).
+    /// `None` when not recorded. Read leniently, also by
+    /// [`Snapshot::parse`]: anything but a non-empty string is `None`.
+    #[serde(deserialize_with = "lenient_name")]
+    pub previous_in_force: Option<String>,
+}
+
+/// A non-empty string, else `None`.
+fn lenient_name<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_str().filter(|s| !s.is_empty()).map(str::to_string))
 }
 
 /// A whole number, else 0.
@@ -171,6 +187,7 @@ impl Default for Snapshot {
             forced_conflicts: false,
             hardware_gain_db: None,
             hardware_gain_serial: 0,
+            previous_in_force: None,
         }
     }
 }
@@ -472,6 +489,35 @@ mod tests {
         assert_eq!(serial(r#"{"version":1,"hardware_gain_serial":-1}"#), 0);
         assert_eq!(serial(r#"{"version":1,"hardware_gain_serial":1.5}"#), 0);
         assert_eq!(serial(r#"{"version":1,"hardware_gain_serial":"x"}"#), 0);
+    }
+
+    #[test]
+    fn the_previous_source_in_force_is_a_name_else_unset() {
+        let in_force = |text: &str| Snapshot::parse(text).unwrap().previous_in_force;
+        assert_eq!(
+            in_force(r#"{"version":1,"previous_in_force":"alsa_input.dmic"}"#).as_deref(),
+            Some("alsa_input.dmic")
+        );
+        assert_eq!(in_force(r#"{"version":1}"#), None);
+        assert_eq!(Snapshot::default().previous_in_force, None);
+        // Anything else: unset, also for ApplySnapshot.
+        for bad in ["null", "\"\"", "7", "[\"x\"]", "{\"name\":\"x\"}"] {
+            let text = format!(r#"{{"version":1,"previous_in_force":{bad}}}"#);
+            assert_eq!(in_force(&text), None, "{bad}");
+        }
+        // In the file: the others kept, no note.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(FILE);
+        std::fs::write(
+            &p,
+            r#"{"version":1,"previous_in_force":7,"enabled":false,"device":"alsa_input.x"}"#,
+        )
+        .unwrap();
+        let (s, note) = Snapshot::load(&p);
+        assert_eq!(
+            (s.previous_in_force, s.enabled, s.device.as_str(), note),
+            (None, false, "alsa_input.x", None)
+        );
     }
 
     #[test]

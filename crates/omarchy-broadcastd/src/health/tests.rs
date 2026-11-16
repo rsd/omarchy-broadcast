@@ -575,3 +575,127 @@ fn the_show_mode_reads_normal_desk_view_or_unknown() {
     );
     assert_eq!(show_mode_status(None), (String::new(), None));
 }
+
+const AUTO_EXPOSURE: u32 = 0x009a_0901;
+const EXPOSURE_TIME: u32 = 0x009a_0902;
+const GAIN: u32 = 0x0098_0913;
+const WB_AUTO: u32 = 0x0098_090c;
+
+/// Auto exposure (item 1 manual, 3 aperture priority; default
+/// `ae_default`, now `ae`), exposure time, gain and white balance
+/// (automatic: `wb_default`, `wb`), none flagged inactive, the dependents
+/// off their defaults.
+fn auto_model(ae_default: i32, ae: i32, wb_default: i32, wb: i32) -> CameraSettings {
+    let controls = vec![
+        menu(
+            AUTO_EXPOSURE,
+            "Auto Exposure",
+            &[(1, "Manual Mode"), (3, "Aperture Priority Mode")],
+            ae_default,
+            ae,
+        ),
+        node_control(
+            EXPOSURE_TIME,
+            "Exposure Time, Absolute",
+            CTRL_TYPE_INTEGER,
+            (3, 2047, 1),
+            166,
+            300,
+            0,
+        ),
+        node_control(GAIN, "Gain", CTRL_TYPE_INTEGER, (0, 255, 1), 0, 130, 0),
+        node_control(
+            WB_AUTO,
+            "White Balance, Automatic",
+            CTRL_TYPE_BOOLEAN,
+            (0, 1, 1),
+            wb_default,
+            wb,
+            0,
+        ),
+        node_control(
+            WB_TEMP,
+            "White Balance Temperature",
+            CTRL_TYPE_INTEGER,
+            (2800, 6500, 1),
+            4600,
+            3000,
+            0,
+        ),
+    ];
+    build(&Inputs {
+        camera: "auto",
+        controls: &controls,
+        xu: &[],
+        stored: None,
+        open: true,
+        fixed_framerate: false,
+        hidden: &[],
+        usb: None,
+    })
+}
+
+fn listed(model: &CameraSettings, name: &str) -> bool {
+    let id = &model.by_name(name).unwrap().setting.id;
+    recommended(model, &[], None, false)
+        .iter()
+        .any(|r| &r.setting == id)
+}
+
+#[test]
+fn gain_is_not_recommended_while_auto_exposure_drives_it() {
+    // Aperture priority now and by default: the camera owns the gain.
+    let auto = auto_model(3, 3, 0, 0);
+    assert!(!listed(&auto, "gain"));
+    // Manual now and by default: the gain is the user's.
+    let manual = auto_model(1, 1, 0, 0);
+    assert!(listed(&manual, "gain"));
+}
+
+#[test]
+fn a_ruled_setting_is_not_recommended_under_its_masters_automatic_value() {
+    let auto = auto_model(3, 3, 1, 1);
+    assert!(!listed(&auto, "exposure_time_absolute"));
+    assert!(!listed(&auto, "white_balance_temperature"));
+    let manual = auto_model(1, 1, 0, 0);
+    assert!(listed(&manual, "exposure_time_absolute"));
+    assert!(listed(&manual, "white_balance_temperature"));
+}
+
+#[test]
+fn the_masters_target_decides_not_its_current_value() {
+    // Manual now, aperture priority recommended: after the reset the
+    // camera drives the dependents; the master's own row stays.
+    let model = auto_model(3, 1, 1, 0);
+    assert!(listed(&model, "auto_exposure"));
+    assert!(listed(&model, "white_balance_automatic"));
+    assert!(!listed(&model, "gain"));
+    assert!(!listed(&model, "exposure_time_absolute"));
+    assert!(!listed(&model, "white_balance_temperature"));
+    // The other way: automatic now, manual recommended: they are listed.
+    let model = auto_model(1, 3, 0, 1);
+    assert!(listed(&model, "gain"));
+    assert!(listed(&model, "exposure_time_absolute"));
+    assert!(listed(&model, "white_balance_temperature"));
+}
+
+#[test]
+fn the_apply_lists_keep_the_auto_driven_settings() {
+    let model = auto_model(3, 3, 1, 1);
+    let names: Vec<&str> = recommended_targets(&model, &[], None, false)
+        .iter()
+        .map(|(i, _)| model.entries[*i].name.as_str())
+        .collect();
+    for n in [
+        "gain",
+        "exposure_time_absolute",
+        "white_balance_temperature",
+        "auto_exposure",
+    ] {
+        assert!(names.contains(&n), "{n} in {names:?}");
+    }
+    // Rows are written whatever the camera drives.
+    let writes = recommended_writes(&model, &[(GAIN, 10)], None, false);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(model.entries[writes[0].0].name, "gain");
+}

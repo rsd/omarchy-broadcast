@@ -1863,9 +1863,9 @@ pub struct Controller<B: MediaBackend> {
     /// since the start: in the snapshot, so that setting the configured
     /// value again applies it again.
     mic_gain_serial: u64,
-    /// `mic.device` as of the last snapshot sent (`None` before the first):
-    /// a change while the Omarchy Broadcast Mic is the default re-pins the
-    /// capture side.
+    /// `mic.device` as last told to the agent (`None` before the first):
+    /// the first and every change re-pin the capture side
+    /// ([`MicRequest::Repin`]).
     mic_device_sent: Option<String>,
     /// Bumped when the worker's modules change: `ModulesSerial` is the
     /// registry's serial plus this.
@@ -9677,14 +9677,12 @@ impl<B: MediaBackend> Controller<B> {
             }
             self.mic_sent = Some(text);
         }
-        // The device chosen changed while ours is the default: the capture
-        // side follows at once (the record of the previous default stays).
+        // The device chosen, first and at every change: the agent pins the
+        // capture side to it, whether or not ours is the default, now and
+        // whenever the mic host comes on (the record of the previous
+        // default stays).
         let device = self.config.mic.device.clone();
-        let changed = self
-            .mic_device_sent
-            .as_deref()
-            .is_some_and(|sent| sent != device);
-        if changed && self.runtime.mic_previous_default.is_some() {
+        if self.mic_device_sent.as_deref() != Some(device.as_str()) {
             let target = match device.as_str() {
                 obc_core::config::MIC_DEVICE_DEFAULT => String::new(),
                 d => d.to_string(),
@@ -9800,14 +9798,22 @@ impl<B: MediaBackend> Controller<B> {
         });
     }
 
-    /// Records the default microphone made by the agent (`None`: the
-    /// Omarchy Broadcast Mic is no longer the default) and saves it; a
-    /// save that fails is logged and answered.
-    fn remember_default(&mut self, previous: Option<String>) -> Result<(), IpcError> {
-        if self.runtime.mic_previous_default == previous {
+    /// Records the default microphone made by the agent and the real one
+    /// in force then (both `None`: the Omarchy Broadcast Mic is no longer
+    /// the default) and saves them; a save that fails is logged and
+    /// answered.
+    fn remember_default(
+        &mut self,
+        previous: Option<String>,
+        in_force: Option<String>,
+    ) -> Result<(), IpcError> {
+        if self.runtime.mic_previous_default == previous
+            && self.runtime.mic_previous_in_force == in_force
+        {
             return Ok(());
         }
         self.runtime.mic_previous_default = previous;
+        self.runtime.mic_previous_in_force = in_force;
         self.save_state()
     }
 
@@ -9825,13 +9831,40 @@ impl<B: MediaBackend> Controller<B> {
                 self.mic_catalogue = catalogue;
                 self.publish();
             }
-            MicEvent::DefaultMade { previous, reply } => {
-                let res = self.remember_default(Some(previous));
+            MicEvent::DefaultMade {
+                previous,
+                in_force,
+                already,
+                reply,
+            } => {
+                // Ours the configured default already (the worker's
+                // `already`): `previous` is the pin in force, not the
+                // default the user had; a previous default on record stays,
+                // with its source in force.
+                let on_record = self
+                    .runtime
+                    .mic_previous_default
+                    .as_deref()
+                    .is_some_and(|p| !p.is_empty());
+                let res = if already && on_record {
+                    Ok(())
+                } else {
+                    // None from the worker (ours the default in force
+                    // already, or an older worker): the source on record
+                    // stays, never replaced by ours.
+                    let in_force = in_force.or_else(|| {
+                        self.runtime
+                            .mic_previous_default
+                            .as_ref()
+                            .and(self.runtime.mic_previous_in_force.clone())
+                    });
+                    self.remember_default(Some(previous), in_force)
+                };
                 self.publish();
                 let _ = reply.send(res);
             }
             MicEvent::DefaultRestored { result, reply } => {
-                let res = result.and_then(|()| self.remember_default(None));
+                let res = result.and_then(|()| self.remember_default(None, None));
                 self.publish();
                 let _ = reply.send(res);
             }
@@ -9841,7 +9874,7 @@ impl<B: MediaBackend> Controller<B> {
                 reply,
             } => {
                 let saved = if restored {
-                    self.remember_default(None)
+                    self.remember_default(None, None)
                 } else {
                     Ok(())
                 };

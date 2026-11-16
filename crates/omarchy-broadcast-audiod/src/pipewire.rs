@@ -55,6 +55,22 @@ pub struct AlsaSources {
     pub sources: Vec<AlsaSource>,
 }
 
+/// What "use as default microphone" recorded
+/// ([`PipeWireControl::make_default`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreviousDefault {
+    /// The previous default's `node.name` (empty when not known).
+    pub previous: String,
+    /// The real source in force before ours was made the default
+    /// (`default.audio.source`, a connected device, never ours); `None`
+    /// when there was none, as when ours was the default in force already.
+    pub in_force: Option<String>,
+    /// Ours was the configured default already, before the writes: then
+    /// `previous` is the pin in force, and the caller keeps the previous
+    /// default (and source in force) it recorded before.
+    pub already: bool,
+}
+
 /// The links on the microphone node, by kind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Consumers {
@@ -97,19 +113,36 @@ pub trait PipeWireControl: Send + Sync {
     /// the default in force when the previous one is unplugged), so
     /// that it never loops onto itself nor picks between equal-priority
     /// mics. Returns the previous default's `node.name` (empty when not
-    /// known), for [`PipeWireControl::restore_default`]; called again, it
-    /// never returns the microphone itself (see
+    /// known), for [`PipeWireControl::restore_default`], and the real
+    /// source in force before (for its `in_force`); called again, it never
+    /// returns the microphone itself as either (see
     /// [`graph::Graph::make_default`]).
-    fn make_default(&self, target: &str) -> Result<String, PipeWireError>;
+    fn make_default(&self, target: &str) -> Result<PreviousDefault, PipeWireError>;
 
     /// Makes `previous` the default source again, if the microphone is
     /// still the default (WirePlumber's choice when `previous` is empty),
-    /// and unpins the capture side; with another connected device (the
-    /// pinned one, else WirePlumber's own choice) written under `previous`
-    /// in WirePlumber's history, so that ours does not become the default by
-    /// itself when `previous` is unplugged. With no other device connected,
-    /// it still can (see [`graph::Graph::restore_default`]).
-    fn restore_default(&self, previous: &str) -> Result<(), PipeWireError>;
+    /// and unpins the capture side; with another connected device
+    /// (`in_force`, the source in force recorded by
+    /// [`PipeWireControl::make_default`], when it is connected and not
+    /// `previous`; else WirePlumber's own choice among the devices other
+    /// than `previous` and the pinned one, the pinned one only when there
+    /// is no other; never ours) written under `previous` in WirePlumber's
+    /// history, so that ours does not become the default by itself when
+    /// `previous` is unplugged, and the system uses that device then. With
+    /// no other device connected, ours still can (see
+    /// [`graph::Graph::restore_default`]).
+    fn restore_default(&self, previous: &str, in_force: Option<&str>) -> Result<(), PipeWireError>;
+
+    /// Pins the capture side to `target` (a device's `node.name`; empty:
+    /// the default), whether or not the microphone is the default, and
+    /// never changes the default: while it is, to `target`, else to
+    /// `in_force` (the source in force recorded by
+    /// [`PipeWireControl::make_default`]) when it is connected, else as
+    /// [`PipeWireControl::make_default`] pins (never unpinned); while it is
+    /// not, to `target`, or unpinned with none. Fails when `target` is not
+    /// connected or the mic host does not run (see
+    /// [`graph::Graph::pin_writes`]).
+    fn pin(&self, target: &str, in_force: Option<&str>) -> Result<(), PipeWireError>;
 
     /// The consumers of the microphone node, debounced
     /// ([`CONSUMERS_DEBOUNCE`]); `None` when unknown.
@@ -136,6 +169,14 @@ pub trait PipeWireControl: Send + Sync {
     /// say something else: read every turn, so that the sources are only
     /// copied when they changed.
     fn alsa_sources_serial(&self) -> u64 {
+        0
+    }
+
+    /// A count that moves whenever the mic host's capture node appears,
+    /// goes, or is replaced by another (a new node id or `object.serial`),
+    /// including through a lost PipeWire connection: a new capture node is
+    /// not pinned yet. Never blocks.
+    fn capture_serial(&self) -> u64 {
         0
     }
 
@@ -206,11 +247,19 @@ impl PipeWireControl for Unavailable {
         Err(PipeWireError::Unavailable(REASON_UNAVAILABLE.into()))
     }
 
-    fn make_default(&self, _target: &str) -> Result<String, PipeWireError> {
+    fn make_default(&self, _target: &str) -> Result<PreviousDefault, PipeWireError> {
         Err(PipeWireError::Unavailable(REASON_UNAVAILABLE.into()))
     }
 
-    fn restore_default(&self, _previous: &str) -> Result<(), PipeWireError> {
+    fn restore_default(
+        &self,
+        _previous: &str,
+        _in_force: Option<&str>,
+    ) -> Result<(), PipeWireError> {
+        Err(PipeWireError::Unavailable(REASON_UNAVAILABLE.into()))
+    }
+
+    fn pin(&self, _target: &str, _in_force: Option<&str>) -> Result<(), PipeWireError> {
         Err(PipeWireError::Unavailable(REASON_UNAVAILABLE.into()))
     }
 

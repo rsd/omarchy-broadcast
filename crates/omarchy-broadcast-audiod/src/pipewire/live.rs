@@ -56,7 +56,7 @@ use spa::utils::result::AsyncSeq;
 use super::graph::{AlsaProps, Graph, MIC_NODE, MetaWrite, NodeInfo, is_monitor};
 use super::{
     AlsaSources, CONSUMERS_DEBOUNCE, Consumers, Debounce, PipeWireControl, PipeWireError,
-    SourceDevice,
+    PreviousDefault, SourceDevice,
 };
 use crate::engine::lock;
 use crate::{debug, info, warning};
@@ -84,8 +84,9 @@ type Reply<T> = Sender<Result<T, PipeWireError>>;
 
 enum Cmd {
     Devices(Reply<Vec<SourceDevice>>),
-    MakeDefault(String, Reply<String>),
-    Restore(String, Reply<()>),
+    MakeDefault(String, Reply<PreviousDefault>),
+    Restore(String, Option<String>, Reply<()>),
+    Pin(String, Option<String>, Reply<()>),
     Latency(Option<u32>),
     Quit,
 }
@@ -99,6 +100,11 @@ struct Published {
     sources: Option<AlsaSources>,
     /// Moves whenever `sources` changes.
     sources_serial: u64,
+    /// The mic host's capture node (its id and `object.serial`); `None`
+    /// while it is not there, or not connected and synced.
+    capture: Option<(u32, Option<String>)>,
+    /// Moves whenever `capture` changes.
+    capture_serial: u64,
     /// Connected, not synced yet.
     pending: bool,
     /// The first connection failed or synced: requests may go.
@@ -111,6 +117,14 @@ impl Published {
         if self.sources != sources {
             self.sources = sources;
             self.sources_serial = self.sources_serial.wrapping_add(1);
+        }
+    }
+
+    /// Sets the capture node, moving its serial when it changed.
+    fn set_capture(&mut self, capture: Option<(u32, Option<String>)>) {
+        if self.capture != capture {
+            self.capture = capture;
+            self.capture_serial = self.capture_serial.wrapping_add(1);
         }
     }
 }
@@ -128,6 +142,7 @@ impl Common {
         p.consumers = consumers;
         if consumers.is_none() {
             p.set_sources(None);
+            p.set_capture(None);
         }
         p.pending = pending && consumers.is_none();
         if !p.ready && !p.pending {
@@ -244,14 +259,21 @@ impl PipeWireControl for Live {
         self.request(Cmd::Devices)
     }
 
-    fn make_default(&self, target: &str) -> Result<String, PipeWireError> {
+    fn make_default(&self, target: &str) -> Result<PreviousDefault, PipeWireError> {
         let target = target.to_string();
         self.request(|r| Cmd::MakeDefault(target, r))
     }
 
-    fn restore_default(&self, previous: &str) -> Result<(), PipeWireError> {
+    fn restore_default(&self, previous: &str, in_force: Option<&str>) -> Result<(), PipeWireError> {
         let previous = previous.to_string();
-        self.request(|r| Cmd::Restore(previous, r))
+        let in_force = in_force.map(str::to_string);
+        self.request(|r| Cmd::Restore(previous, in_force, r))
+    }
+
+    fn pin(&self, target: &str, in_force: Option<&str>) -> Result<(), PipeWireError> {
+        let target = target.to_string();
+        let in_force = in_force.map(str::to_string);
+        self.request(|r| Cmd::Pin(target, in_force, r))
     }
 
     fn consumers(&self) -> Option<Consumers> {
@@ -271,6 +293,10 @@ impl PipeWireControl for Live {
 
     fn alsa_sources_serial(&self) -> u64 {
         lock(&self.common.published).sources_serial
+    }
+
+    fn capture_serial(&self) -> u64 {
+        lock(&self.common.published).capture_serial
     }
 
     fn set_latency(&self, samples: Option<u32>) {
@@ -339,7 +365,12 @@ impl Ctx {
         let consumers = synced.then(|| self.graph.borrow().consumers());
         self.common.publish(consumers, !synced);
         let sources = synced.then(|| self.graph.borrow().alsa_sources());
-        lock(&self.common.published).set_sources(sources);
+        let capture = synced
+            .then(|| self.graph.borrow().capture_identity())
+            .flatten();
+        let mut p = lock(&self.common.published);
+        p.set_sources(sources);
+        p.set_capture(capture);
     }
 
     /// Sets the wanted `ProcessLatency` again if the node reported another
@@ -766,21 +797,45 @@ fn handle(cmd: Cmd, conn: Option<&Conn>, latency: &mut Option<u32>) -> bool {
         }
         Cmd::MakeDefault(target, r) => {
             let res = ctx.ok_or_else(unavailable).and_then(|c| {
-                let (previous, writes) = c.graph.borrow().make_default(&target)?;
-                write(c, &writes)?;
+                let made = c.graph.borrow().make_default(&target)?;
+                write(c, &made.writes)?;
                 info!(
-                    "{MIC_NODE} is the default source (previous {previous:?}, capture pinned to {:?})",
+                    "{MIC_NODE} is the default source (previous {:?}, in force {:?}, capture \
+                     pinned to {:?})",
+                    made.previous,
+                    made.in_force.as_deref().unwrap_or_default(),
                     c.graph.borrow().pin().unwrap_or_default()
                 );
-                Ok(previous)
+                Ok(PreviousDefault {
+                    previous: made.previous,
+                    in_force: made.in_force,
+                    already: made.already,
+                })
             });
             let _ = r.send(res);
         }
-        Cmd::Restore(previous, r) => {
+        Cmd::Restore(previous, in_force, r) => {
             let res = ctx.ok_or_else(unavailable).and_then(|c| {
-                let writes = c.graph.borrow().restore_default(&previous);
+                let writes = c
+                    .graph
+                    .borrow()
+                    .restore_default(&previous, in_force.as_deref());
                 write(c, &writes)?;
                 info!("default source restored ({previous:?}), capture unpinned");
+                Ok(())
+            });
+            let _ = r.send(res);
+        }
+        Cmd::Pin(target, in_force, r) => {
+            let res = ctx.ok_or_else(unavailable).and_then(|c| {
+                let writes = c.graph.borrow().pin_writes(&target, in_force.as_deref())?;
+                write(c, &writes)?;
+                if !writes.is_empty() {
+                    info!(
+                        "capture pinned to {:?} (device {target:?})",
+                        c.graph.borrow().pin().unwrap_or_default()
+                    );
+                }
                 Ok(())
             });
             let _ = r.send(res);
@@ -905,6 +960,29 @@ mod tests {
         assert!(!p.pending && p.ready, "a failure ends the wait");
     }
 
+    /// The capture node's serial moves when it appears, goes or is
+    /// replaced, also through a lost connection, and only then.
+    #[test]
+    fn the_capture_serial_moves_with_the_capture_node() {
+        let c = Common::default();
+        let set = |capture: Option<(u32, Option<String>)>| {
+            lock(&c.published).set_capture(capture);
+            lock(&c.published).capture_serial
+        };
+        assert_eq!(lock(&c.published).capture_serial, 0);
+        assert_eq!(set(Some((20, Some("120".into())))), 1);
+        assert_eq!(set(Some((20, Some("120".into())))), 1);
+        // The same id, another serial: the mic host restarted.
+        assert_eq!(set(Some((20, Some("130".into())))), 2);
+        assert_eq!(set(None), 3);
+        assert_eq!(set(Some((20, Some("130".into())))), 4);
+        // The connection lost: gone too.
+        c.publish(None, false);
+        assert_eq!(lock(&c.published).capture_serial, 5);
+        c.publish(None, false);
+        assert_eq!(lock(&c.published).capture_serial, 5);
+    }
+
     #[test]
     fn process_latency_pod_round_trips() {
         let bytes = process_latency_pod(1920);
@@ -932,7 +1010,11 @@ mod tests {
         live.shutdown();
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(matches!(
-            live.restore_default(""),
+            live.restore_default("", None),
+            Err(PipeWireError::Unavailable(_))
+        ));
+        assert!(matches!(
+            live.pin("", None),
             Err(PipeWireError::Unavailable(_))
         ));
         assert_eq!(live.consumers(), None);

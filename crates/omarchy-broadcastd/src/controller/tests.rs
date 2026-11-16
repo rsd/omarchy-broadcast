@@ -14806,6 +14806,8 @@ fn the_default_microphone_is_made_remembered_and_restored() {
     assert_eq!(target, "", "the device is the default: the previous one");
     h.mic(MicEvent::DefaultMade {
         previous: "alsa_input.usb-a".into(),
+        in_force: Some("alsa_input.pci-dmic".into()),
+        already: false,
         reply: r,
     });
     reply.try_recv().unwrap().unwrap();
@@ -14813,6 +14815,52 @@ fn the_default_microphone_is_made_remembered_and_restored() {
         h.persisted().mic_previous_default.as_deref(),
         Some("alsa_input.usb-a")
     );
+    // The real source in force then: kept, and told to the worker.
+    assert_eq!(
+        h.persisted().mic_previous_in_force.as_deref(),
+        Some("alsa_input.pci-dmic")
+    );
+    let sent = H::mic_snapshots(&mut rx);
+    assert_eq!(
+        sent.last().unwrap()["previous_in_force"],
+        "alsa_input.pci-dmic",
+        "{sent:?}"
+    );
+    // Made the default again, ours the configured default already: the
+    // worker names the pin in force as the previous one and tells none in
+    // force; the record stays, both of it, never the pin nor ours.
+    let mut reply = h.send_set("", mic::MAKE_DEFAULT, Some(SettingValue::Bool(true)), 0);
+    let Some(MicRequest::MakeDefault { reply: r, .. }) = std::iter::from_fn(|| rx.try_recv().ok())
+        .find(|r| matches!(r, MicRequest::MakeDefault { .. }))
+    else {
+        panic!("MakeDefault not sent")
+    };
+    h.mic(MicEvent::DefaultMade {
+        previous: "alsa_input.usb-c930e".into(),
+        in_force: None,
+        already: true,
+        reply: r,
+    });
+    reply.try_recv().unwrap().unwrap();
+    let st = h.persisted();
+    assert_eq!(
+        (
+            st.mic_previous_default.as_deref(),
+            st.mic_previous_in_force.as_deref()
+        ),
+        (Some("alsa_input.usb-a"), Some("alsa_input.pci-dmic"))
+    );
+    // "Use the previous default microphone" asks for the first one.
+    let mut restore = h.send_set("", mic::RESTORE_DEFAULT, Some(SettingValue::Bool(true)), 0);
+    let Some(MicRequest::RestoreDefault { previous, .. }) =
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|r| matches!(r, MicRequest::RestoreDefault { .. }))
+    else {
+        panic!("RestoreDefault not sent")
+    };
+    assert_eq!(previous, "alsa_input.usb-a");
+    // Dropped unanswered: the record stays.
+    assert!(restore.try_recv().is_err());
     assert!(h.setting(mic::RESTORE_DEFAULT).enabled);
     // Still offered: the user may have picked another microphone since.
     assert!(h.setting(mic::MAKE_DEFAULT).enabled);
@@ -14845,10 +14893,144 @@ fn the_default_microphone_is_made_remembered_and_restored() {
     });
     reply.try_recv().unwrap().unwrap();
     assert_eq!(h.persisted().mic_previous_default, None);
+    assert_eq!(h.persisted().mic_previous_in_force, None);
+    let sent = H::mic_snapshots(&mut rx);
+    assert!(
+        sent.last().unwrap()["previous_in_force"].is_null(),
+        "{sent:?}"
+    );
 }
 
 #[test]
-fn choosing_another_microphone_re_pins_the_capture_side_while_ours_is_the_default() {
+fn a_make_with_ours_the_default_already_keeps_only_a_real_record() {
+    let mut h = H::new("", |_| {});
+    let mut rx = h.mic_link();
+    h.mic(MicEvent::Catalogue(mic_catalogue()));
+    h.host_on();
+    let mut make = |h: &mut H, previous: &str, in_force: Option<&str>, already: bool| {
+        let mut reply = h.send_set("", mic::MAKE_DEFAULT, Some(SettingValue::Bool(true)), 0);
+        let Some(MicRequest::MakeDefault { reply: r, .. }) =
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .find(|r| matches!(r, MicRequest::MakeDefault { .. }))
+        else {
+            panic!("MakeDefault not sent")
+        };
+        h.mic(MicEvent::DefaultMade {
+            previous: previous.into(),
+            in_force: in_force.map(Into::into),
+            already,
+            reply: r,
+        });
+        reply.try_recv().unwrap().unwrap();
+        let st = h.persisted();
+        (st.mic_previous_default, st.mic_previous_in_force)
+    };
+    // Ours the default already (made by an earlier daemon, the record
+    // lost): with nothing on record, what the worker names is recorded.
+    assert_eq!(
+        make(&mut h, "alsa_input.usb-a", None, true),
+        (Some("alsa_input.usb-a".into()), None)
+    );
+    // Only a known previous default is kept: an empty one on record (an
+    // older daemon's) is replaced.
+    h.ctrl.runtime.mic_previous_default = Some(String::new());
+    assert_eq!(
+        make(
+            &mut h,
+            "alsa_input.usb-b",
+            Some("alsa_input.pci-dmic"),
+            true
+        ),
+        (
+            Some("alsa_input.usb-b".into()),
+            Some("alsa_input.pci-dmic".into())
+        )
+    );
+    // Then kept.
+    assert_eq!(
+        make(&mut h, "alsa_input.usb-c", None, true),
+        (
+            Some("alsa_input.usb-b".into()),
+            Some("alsa_input.pci-dmic".into())
+        )
+    );
+    // Not already (or an older worker, which does not tell it): replaced.
+    assert_eq!(
+        make(&mut h, "alsa_input.usb-c", Some("alsa_input.usb-d"), false),
+        (
+            Some("alsa_input.usb-c".into()),
+            Some("alsa_input.usb-d".into())
+        )
+    );
+}
+
+#[test]
+fn the_restore_action_forgets_the_source_in_force_with_the_previous_default() {
+    let mut h = H::new("", |_| {});
+    let mut rx = h.mic_link();
+    h.mic(MicEvent::Catalogue(mic_catalogue()));
+    h.host_on();
+    // An older worker tells no source in force: none recorded.
+    let mut reply = h.send_set("", mic::MAKE_DEFAULT, Some(SettingValue::Bool(true)), 0);
+    let Some(MicRequest::MakeDefault { reply: r, .. }) = std::iter::from_fn(|| rx.try_recv().ok())
+        .find(|r| matches!(r, MicRequest::MakeDefault { .. }))
+    else {
+        panic!("MakeDefault not sent")
+    };
+    h.mic(MicEvent::DefaultMade {
+        previous: "alsa_input.usb-a".into(),
+        in_force: None,
+        already: false,
+        reply: r,
+    });
+    reply.try_recv().unwrap().unwrap();
+    assert_eq!(h.persisted().mic_previous_in_force, None);
+    // A newer one does, at the next "use as default".
+    let mut reply = h.send_set("", mic::MAKE_DEFAULT, Some(SettingValue::Bool(true)), 0);
+    let Some(MicRequest::MakeDefault { reply: r, .. }) = std::iter::from_fn(|| rx.try_recv().ok())
+        .find(|r| matches!(r, MicRequest::MakeDefault { .. }))
+    else {
+        panic!("MakeDefault not sent")
+    };
+    h.mic(MicEvent::DefaultMade {
+        previous: "alsa_input.usb-a".into(),
+        in_force: Some("alsa_input.pci-dmic".into()),
+        already: false,
+        reply: r,
+    });
+    reply.try_recv().unwrap().unwrap();
+    assert_eq!(
+        h.persisted().mic_previous_in_force.as_deref(),
+        Some("alsa_input.pci-dmic")
+    );
+    // "Use the previous default microphone": both forgotten.
+    let mut reply = h.send_set("", mic::RESTORE_DEFAULT, Some(SettingValue::Bool(true)), 0);
+    let Some(MicRequest::RestoreDefault { previous, reply: r }) =
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|r| matches!(r, MicRequest::RestoreDefault { .. }))
+    else {
+        panic!("RestoreDefault not sent")
+    };
+    assert_eq!(previous, "alsa_input.usb-a");
+    h.mic(MicEvent::DefaultRestored {
+        result: Ok(()),
+        reply: r,
+    });
+    reply.try_recv().unwrap().unwrap();
+    let st = h.persisted();
+    assert_eq!(
+        (st.mic_previous_default, st.mic_previous_in_force),
+        (None, None)
+    );
+    let sent = H::mic_snapshots(&mut rx);
+    assert!(
+        sent.last().unwrap()["previous_in_force"].is_null(),
+        "{sent:?}"
+    );
+}
+
+#[test]
+fn the_microphone_chosen_re_pins_the_capture_side_whether_or_not_ours_is_the_default() {
     let repins = |rx: &mut UnboundedReceiver<MicRequest>| -> Vec<String> {
         std::iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|r| match r {
@@ -14859,12 +15041,23 @@ fn choosing_another_microphone_re_pins_the_capture_side_while_ours_is_the_defaul
     };
     let mut h = H::new("", |_| {});
     let mut rx = h.mic_link();
+    // Told at once (the agent pins when the host runs or comes on).
+    assert_eq!(repins(&mut rx), [String::new()]);
     h.mic(MicEvent::Catalogue(mic_catalogue()));
     h.host_on();
-    // Ours is not the default: the choice is only the next target.
+    assert!(repins(&mut rx).is_empty());
+    // Ours is not the default: the capture side follows the choice all
+    // the same.
     h.set_setting(mic::DEVICE, SettingValue::Str("alsa_input.usb-a".into()), 0)
         .unwrap();
-    assert!(repins(&mut rx).is_empty());
+    assert_eq!(repins(&mut rx), ["alsa_input.usb-a"]);
+    // Back to the default, ours not the default: unpinned by the agent.
+    h.set_setting(mic::DEVICE, SettingValue::Str("default".into()), 0)
+        .unwrap();
+    assert_eq!(repins(&mut rx), [String::new()]);
+    h.set_setting(mic::DEVICE, SettingValue::Str("alsa_input.usb-a".into()), 0)
+        .unwrap();
+    assert_eq!(repins(&mut rx), ["alsa_input.usb-a"]);
     // Made the default (the record kept) ...
     let mut reply = h.send_set("", mic::MAKE_DEFAULT, Some(SettingValue::Bool(true)), 0);
     let Ok(MicRequest::MakeDefault { target, reply: r }) =
@@ -14877,6 +15070,8 @@ fn choosing_another_microphone_re_pins_the_capture_side_while_ours_is_the_defaul
     assert_eq!(target, "alsa_input.usb-a");
     h.mic(MicEvent::DefaultMade {
         previous: "alsa_input.usb-b".into(),
+        in_force: None,
+        already: false,
         reply: r,
     });
     reply.try_recv().unwrap().unwrap();
@@ -14895,6 +15090,9 @@ fn choosing_another_microphone_re_pins_the_capture_side_while_ours_is_the_defaul
     assert!(repins(&mut rx).is_empty());
     h.set_setting(mic::DEVICE, SettingValue::Str("alsa_input.usb-a".into()), 0)
         .unwrap();
+    assert_eq!(repins(&mut rx), ["alsa_input.usb-a"]);
+    // A new agent (the daemon's start): told again, the host maybe running.
+    let mut rx = h.mic_link();
     assert_eq!(repins(&mut rx), ["alsa_input.usb-a"]);
 }
 

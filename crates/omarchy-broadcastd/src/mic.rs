@@ -651,7 +651,11 @@ fn json_of(v: &StoredValue) -> Json {
 /// (`null` when unset: the worker leaves the device's gain as it is) and
 /// `gain_serial` (as `hardware_gain_serial`: the controller's count of
 /// explicit sets of the gain, so that setting the configured value again
-/// applies it again). A key is only ever added in this version: a worker
+/// applies it again) and the state file's `mic_previous_in_force` (as
+/// `previous_in_force`, `null` when not recorded: the real source in force
+/// when the Omarchy Broadcast Mic was made the default, which the worker's
+/// `Pin` of the default and `RestoreDefault` read). A key is only ever
+/// added in this version: a worker
 /// that does not know it ignores it, and one that misses it takes its
 /// default.
 pub fn snapshot(
@@ -703,6 +707,7 @@ pub fn snapshot(
         "forced_conflicts": mic.force_conflicts,
         "hardware_gain_db": mic.hardware_gain_db,
         "hardware_gain_serial": gain_serial,
+        "previous_in_force": runtime.mic_previous_in_force,
     })
     .to_string()
 }

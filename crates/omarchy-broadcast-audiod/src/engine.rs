@@ -1345,6 +1345,7 @@ impl Engine {
                 .map_or(-1.0, f64::from),
             stages,
             hardware_gain: lock(&self.shared.hardware_gain).clone(),
+            capture_serial: self.shared.pipewire.capture_serial(),
         }
     }
 }
