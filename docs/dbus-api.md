@@ -618,7 +618,7 @@ When `[camera] fixed_framerate` is on, the daemon pins this control to 0 while a
 
 ### Labels and descriptions of a camera model
 
-From revision 26 a camera model can give one of its standard controls another label, and a `description`, where the stock label does not say what the control does on that camera. The names are a data row of the model (`CONTROL_LABELS`, looked up by USB id, see [architecture.md](architecture.md#camera-settings)). Only the `label` and the `description` change: the id, the type, the range, the default, the stored value and the rules of the setting are those of every other camera, so a value stored for the setting and a client that knows its id keep working across cameras. A camera without a row has the stock label and no `description`. Today's rows are the Logitech MX Brio's (`046d:0944`):
+From revision 26 a camera model can give one of its standard controls another label, and a `description`, where the stock label does not say what the control does on that camera. The names are a data row of the model (`CONTROL_LABELS`, looked up by USB id, see [architecture.md](architecture.md#camera-settings)). Only the `label` and the `description` change: the id, the type, the range, the default, the stored value and the rules of the setting are those of every other camera, so a value stored for the setting and a client that knows its id keep working across cameras. A camera without a row has the stock label and no `description`. The Logitech MX Brio's rows (`046d:0944`):
 
 | Setting | Label | `description` |
 |---|---|---|
@@ -626,6 +626,14 @@ From revision 26 a camera model can give one of its standard controls another la
 | `camera.exposure.keep_framerate` | `Keep 30 fps in low light` (unchanged) | `Logi Tune calls this Low light compensation, with the opposite sense: on here is off there` |
 
 The first is what the camera's firmware calls HDR: it is the standard backlight compensation control, and measured on the camera, with it on 1080p60 MJPEG is held at 30 fps even in a lit room ([cameras/mx-brio.md](cameras/mx-brio.md#frame-rate-and-hdr)). The second is the [inverted switch](#the-inverted-switch): Logitech's software shows the same control as "Low light compensation", where on lets the frame rate drop, so a user who knows that name must be told that the sense is the opposite.
+
+The Logitech Webcam C930e (`046d:0843`) keeps every stock label and gives three settings a `description`, from measurements on the camera ([cameras/logitech-c930e.md](cameras/logitech-c930e.md#standard-uvc-controls)):
+
+| Setting | `description` |
+|---|---|
+| `camera.focus.pan_absolute` | `Pan moves the picture only while zoomed in` |
+| `camera.focus.tilt_absolute` | `Tilt moves the picture only while zoomed in` |
+| `camera.exposure.gain` | `With automatic exposure the camera sets the gain itself; set exposure to manual to choose it` |
 
 ### Field of view
 
