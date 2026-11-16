@@ -279,8 +279,9 @@ impl Sdk {
             NVCV_ERR_TRT_ENGINE | NVCV_ERR_CUDA_KERNEL if call.starts_with("NvAR_Load") => {
                 format!(
                     "{base}: on a distribution the SDK does not list this is its /etc/os-release \
-                     check; run the daemon with the os-release override of the \
-                     maxine-ar-sdk-local package (LD_PRELOAD of its shim and MAXINE_OS_RELEASE)"
+                     check; install the maxine-ar-sdk-local package: the daemon applies its \
+                     os-release override (LD_PRELOAD of its shim and MAXINE_OS_RELEASE) when it \
+                     starts and logs it, unless OBC_NO_SDK_ENV is set"
                 )
             }
             _ => base,

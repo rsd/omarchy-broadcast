@@ -39,22 +39,20 @@ step() {
 # The committed pkgver= is the workspace version; makepkg's pkgver() appends
 # .rN.gHASH to it, so that form is accepted too.
 check_pkgbuild_versions() {
-    local cargo_version pkgbuild pkgbuild_version
+    local cargo_version pkgbuild=packaging/arch/PKGBUILD pkgbuild_version
     cargo_version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
     if [ -z "$cargo_version" ]; then
         echo "no version in Cargo.toml [workspace.package]" >&2
         return 1
     fi
-    for pkgbuild in packaging/arch/PKGBUILD packaging/arch-onnx/PKGBUILD; do
-        pkgbuild_version=$(sed -n 's/^pkgver=//p' "$pkgbuild")
-        case $pkgbuild_version in
-            "$cargo_version" | "$cargo_version".r*) ;;
-            *)
-                echo "$pkgbuild pkgver=$pkgbuild_version differs from Cargo.toml version $cargo_version" >&2
-                return 1
-                ;;
-        esac
-    done
+    pkgbuild_version=$(sed -n 's/^pkgver=//p' "$pkgbuild")
+    case $pkgbuild_version in
+        "$cargo_version" | "$cargo_version".r*) ;;
+        *)
+            echo "$pkgbuild pkgver=$pkgbuild_version differs from Cargo.toml version $cargo_version" >&2
+            return 1
+            ;;
+    esac
 }
 
 # One example module, outside the workspace, through its own manifest.

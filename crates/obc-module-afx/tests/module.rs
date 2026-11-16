@@ -9,8 +9,8 @@
 //! The SDK finds its feature libraries on the library search path, which
 //! the dynamic linker reads at process start: a test that uses the effects
 //! runs in a child process of this binary started with `LD_LIBRARY_PATH`
-//! leading to its tree ([`fixture`]), as the worker's drop-in starts the
-//! worker.
+//! leading to its tree ([`fixture`]), as the worker starts once it has
+//! applied the SDK package's environment to itself.
 
 mod support;
 
@@ -1011,7 +1011,7 @@ fn a_stage_that_fails_to_load_fails_alone_and_leaks_no_effect() {
     assert!(e.message.contains("(dereverb)"), "{}", e.message);
     assert!(e.message.contains("Load returned 1"), "{}", e.message);
     assert!(
-        e.message.contains("maxine-afx.conf"),
+        e.message.contains("maxine-afx-sdk-local"),
         "the hint: {}",
         e.message
     );
@@ -1337,13 +1337,13 @@ fn the_search_path_may_lead_to_the_libraries_through_links() {
 }
 
 /// Without a library search path that leads to the feature libraries (a
-/// worker started without the drop-in): every stage unavailable, with a
-/// reason that names the drop-in; the check and the load fail naming the
-/// variable and the drop-in; no effect is created, and the working
+/// worker started without the SDK package's environment): every stage
+/// unavailable, with a reason that names the package; the check and the
+/// load fail naming the variable and the package; no effect is created, and the working
 /// directory is never changed. In this test's own process, whose
 /// `LD_LIBRARY_PATH` does not name the tree.
 #[test]
-fn without_the_search_path_every_stage_fails_naming_the_drop_in() {
+fn without_the_search_path_every_stage_fails_naming_the_package() {
     if is_child() {
         return;
     }
@@ -1355,7 +1355,7 @@ fn without_the_search_path_every_stage_fails_naming_the_drop_in() {
     let probe = module.probe().unwrap();
     let reason = Availability::NotInstalled(obc_module_afx::REASON_NO_SEARCH_PATH.into());
     assert!(probe.iter().all(|(_, a)| *a == reason), "{probe:?}");
-    assert!(obc_module_afx::REASON_NO_SEARCH_PATH.contains(DROP_IN));
+    assert!(obc_module_afx::REASON_NO_SEARCH_PATH.contains(PACKAGE));
     let e = module.check(&[s(DENOISE)]).unwrap_err();
     assert_eq!(e.status, Status::Unavailable);
     for stages in [&[DENOISE][..], &[DEREVERB, DENOISE], &[ENHANCE]] {
@@ -1363,7 +1363,7 @@ fn without_the_search_path_every_stage_fails_naming_the_drop_in() {
         let e = inst.load(&spec(stages, &[])).unwrap_err();
         assert_eq!(e.status, Status::Stage, "{e:?}");
         assert!(
-            e.message.contains("LD_LIBRARY_PATH") && e.message.contains(DROP_IN),
+            e.message.contains("LD_LIBRARY_PATH") && e.message.contains(PACKAGE),
             "{}",
             e.message
         );
@@ -1372,5 +1372,5 @@ fn without_the_search_path_every_stage_fails_naming_the_drop_in() {
     assert_eq!(std::env::current_dir().unwrap(), cwd);
 }
 
-/// The drop-in the reasons name.
-const DROP_IN: &str = "omarchy-broadcast-audiod.service.d/maxine-afx.conf";
+/// The SDK package the reasons name.
+const PACKAGE: &str = "maxine-afx-sdk-local";

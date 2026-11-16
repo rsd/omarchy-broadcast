@@ -55,7 +55,7 @@ The privacy rules are the same as with CUDA: with privacy on (`[effect] privacy`
 |---|---|
 | The module | Installed from the package `omarchy-broadcast-onnx-git` or by `scripts/install-user.sh` (section 3) |
 | ONNX Runtime | `libonnxruntime.so`, version 1.29 or newer. Recommended: `onnxruntime-core` plus the provider packages of the engines you use (CUDA, TensorRT, OpenVINO), from omarchy-onnxruntime. `onnxruntime-cpu` and `onnxruntime-opt-cuda` also work (section 2) |
-| The models | Four `.onnx` files, in one of the directories of section 3. A single file is enough to use that model |
+| The models | One package per model, `omarchy-onnx-model-<id>`, or the `.onnx` files in one of the directories of section 3. A single file is enough to use that model |
 | An NVIDIA GPU | Not needed: the CPU engine runs the model, and the daemon runs the effect path in system memory when it finds no usable CUDA (see above). An NVIDIA GPU adds the TensorRT and CUDA engines, and an Intel CPU, GPU or NPU the OpenVINO engines (with a runtime that has them) |
 
 Without ONNX Runtime, or without any model file, the module still loads and `omarchy-broadcast modules` lists its stage as `unavailable`, with the reason: `ONNX Runtime not installed (libonnxruntime.so not found)` or `No cut-out model installed (searched: ...)`. Nothing else is affected.
@@ -117,13 +117,18 @@ systemctl --user restart omarchy-broadcastd
 
 The `-` makes a missing file no error. The setting applies to the daemon's unit only. Do not put TensorRT's directory on `LD_LIBRARY_PATH` in a login profile: the directory holds only TensorRT's own libraries, but the rule of [maxine.md](maxine.md) stands, that a library path set for every program you start can shadow the system's libraries.
 
-**With the Maxine module.** The Maxine drop-in's environment file also sets `LD_LIBRARY_PATH`, and when two files set the same variable the later one wins (the value is replaced, not extended). Drop-ins are read in the order of their file names, and `onnx-tensorrt.conf` sorts after `maxine.conf`, so TensorRT's value is the one the daemon gets. That does no harm to the Maxine module, which loads its libraries from its SDK root by absolute path and does not need `LD_LIBRARY_PATH` ([maxine.md](maxine.md)). Keep this name, or another that sorts after `maxine.conf`.
+**With the Maxine module.** The daemon applies the Maxine SDK package's environment itself, and never applies that environment's `LD_LIBRARY_PATH`, which would put the SDK's bundled CUDA and TensorRT libraries ahead of the engines of ONNX Runtime ([maxine.md](maxine.md#3-the-sdk-environment)). The value you give the unit above is the one the daemon runs with, and the Maxine module, which loads its libraries from its SDK root by absolute path, does not need it ([maxine.md](maxine.md)). If you still have the `maxine.conf` drop-in of an earlier version, remove it (it is not needed any more): it sets `LD_LIBRARY_PATH` too, and when two files set a variable the later one in the order of the file names wins, so the TensorRT drop-in would have to sort after it.
 
 ## 3. Install the module and the models
 
-**From the Arch package.** The module and its models are a package of their own, `omarchy-broadcast-onnx-git`, with its own `PKGBUILD` in `packaging/arch-onnx/`, built after the core `omarchy-broadcast-git` (`packaging/arch/`). It depends on the core of the same commit (the module interface is not pinned across versions) and on `onnxruntime>=1.29`, which any variant of section 2 satisfies. It installs the library and the manifest under `/usr/lib/omarchy-broadcast/`, the models in `/usr/share/omarchy-broadcast/models/onnx/` and the licence files in `/usr/share/licenses/omarchy-broadcast-onnx-git/`. It is a separate package because the ONNX Runtime variants conflict with one another: the core must not pull one in.
+**From the Arch package.** The module is one package of the split build of `packaging/arch/PKGBUILD`, `omarchy-broadcast-onnx-git`, built with the core `omarchy-broadcast-git` and the other module packages. It depends on the core of the same build (the module interface is not pinned across versions), on `onnxruntime>=1.29`, which any variant of section 2 satisfies, and on the package of the default model, `omarchy-onnx-model-mediapipe-landscape`. It installs the library and the manifest under `/usr/lib/omarchy-broadcast/`. It is a separate package because the ONNX Runtime variants conflict with one another: the core must not pull one in. Its optional dependencies are the other model packages and the engines, as the virtual names `onnxruntime-provider-cuda`, `onnxruntime-provider-tensorrt` and `onnxruntime-provider-openvino` (section 2).
 
-The four model files (about 70 MB) are sources of that build. `makepkg` downloads them from the `v1.0.0` release of the omarchy-onnx-models repository, `https://github.com/rsd/omarchy-onnx-models/releases/download/v1.0.0/<file>`, and checks each against the SHA-256 pinned in `packaging/arch-onnx/PKGBUILD`; a file that differs fails the build. From `packaging/arch-onnx`: `makepkg -s`. For an offline build, `OBC_ONNX_MODELS_DIR=/path/to/models makepkg -s` reads the files from a directory instead, with the same checks. The core package never needs them.
+**The models are packages of their own**, one per model, from the [omarchy-onnx-models](https://github.com/rsd/omarchy-onnx-models) repository (`packaging/arch/PKGBUILD` there). The name is `omarchy-onnx-model-<id>`, with the model's id from the table below, and the version is that of the repository's release (1.0.0, the `v1.0.0` release assets, each checked against the release's SHA-256 at build time). Each installs its one `.onnx` file in `/usr/share/omarchy-onnx-models/`, with that model's licence and notice in `/usr/share/licenses/omarchy-onnx-model-<id>/`. They are kept apart from the module for two reasons: the four files are about 70 MB, which a `-git` rebuild of the module would otherwise download again each time, and each model has its own licence terms. The default model's package is a dependency of the module; install the others when you want to choose them:
+
+```bash
+sudo pacman -U omarchy-onnx-model-mediapipe-landscape-*.pkg.tar.zst   # the default
+sudo pacman -U omarchy-onnx-model-modnet-*.pkg.tar.zst                  # optional
+```
 
 **From a checkout.** `scripts/install-user.sh` builds and installs the module for the current user, without root: the library in `~/.local/share/omarchy-broadcast/modules/` and its manifest in `~/.local/share/omarchy-broadcast/modules.d/`. Give it the models with `OBC_ONNX_MODELS_DIR`, a directory that holds the four files under their catalogue names; the script checks each against its SHA-256 and copies them to `~/.local/share/omarchy-broadcast/models/onnx/`:
 
@@ -138,9 +143,10 @@ Without the variable the module is installed and shows as unavailable until the 
 1. `model_dir` in `[module."br.com.dias.onnx-cutout"]` of `config.toml`;
 2. `$OBC_ONNX_MODEL_DIR`;
 3. `$XDG_DATA_HOME/omarchy-broadcast/models/onnx/` (by default `~/.local/share/omarchy-broadcast/models/onnx/`);
-4. `/usr/share/omarchy-broadcast/models/onnx/`.
+4. `/usr/share/omarchy-onnx-models/`, where the model packages install;
+5. `/usr/share/omarchy-broadcast/models/onnx/` (the directory of the earlier single package, still searched).
 
-**The models** are the project's own conversions to ONNX of the upstream releases, which keep the weights of the originals. They are published, with the scripts that make them and their checksums, as release assets of the [omarchy-onnx-models](https://github.com/rsd/omarchy-onnx-models) repository ([`crates/obc-module-onnx/model-sources/README.md`](../../crates/obc-module-onnx/model-sources/README.md) points to it). Each file is checked against its SHA-256 when it loads; a missing or different file fails the load, with a reason that names the file and the directories searched.
+**The models** are the project's own conversions to ONNX of the upstream releases, which keep the weights of the originals. They are published, with the scripts that make them and their checksums, as release assets of the [omarchy-onnx-models](https://github.com/rsd/omarchy-onnx-models) repository ([`crates/obc-module-onnx/model-sources/README.md`](../../crates/obc-module-onnx/model-sources/README.md) points to it). Each file is checked against its SHA-256 when it loads; a missing or different file fails the load, with a reason that names the file, the package to install (`omarchy-onnx-model-<id>`) and the directories searched.
 
 | Setting value | File | Upstream |
 |---|---|---|
@@ -300,4 +306,4 @@ The NVIDIA GPU then stays asleep under `openvino-gpu`; the log says whether the 
 
 ## 9. Uninstall
 
-`scripts/install-user.sh --uninstall` removes what the script installed, the module's library, manifest and models included. The package is removed with `sudo pacman -R omarchy-broadcast-onnx-git`. The TensorRT engine cache is under `$XDG_CACHE_HOME/omarchy-broadcast/` (by default `~/.cache/omarchy-broadcast/`) and may be deleted at any time; it is rebuilt on the next use.
+`scripts/install-user.sh --uninstall` removes what the script installed, the module's library, manifest and models included. The packages are removed with `sudo pacman -R omarchy-broadcast-onnx-git`, and `sudo pacman -R omarchy-onnx-model-<id>` for each model package you installed (the module package leaves the default model's package installed, as a dependency that nothing else needs: `pacman -Rs` removes it with the module). The TensorRT engine cache is under `$XDG_CACHE_HOME/omarchy-broadcast/` (by default `~/.cache/omarchy-broadcast/`) and may be deleted at any time; it is rebuilt on the next use.

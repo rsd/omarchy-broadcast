@@ -420,6 +420,9 @@ impl Env {
                 "PIPEWIRE_RUNTIME_DIR",
                 self.sockets.path().join("no-pipewire"),
             )
+            // Never the SDK environment the worker applies to itself at
+            // start: the same worker on any machine.
+            .env(obc_core::sdk_env::OPT_OUT, "1")
             .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::null())
             .stdout(Stdio::null())

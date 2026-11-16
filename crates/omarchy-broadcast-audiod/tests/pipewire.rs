@@ -187,6 +187,8 @@ fn worker(sandbox: &Path, snapshot: &Path) -> Proc {
         sandbox,
         "worker",
         Command::new(env!("CARGO_BIN_EXE_omarchy-broadcast-audiod"))
+            // Never the SDK environment the worker applies to itself.
+            .env(obc_core::sdk_env::OPT_OUT, "1")
             .arg("-v")
             .arg("--snapshot")
             .arg(snapshot)

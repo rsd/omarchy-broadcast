@@ -1,8 +1,8 @@
 //! The module over the real NVIDIA Maxine Audio Effects SDK and GPU.
 //! Ignored by default, and each test does nothing unless `MAXINE_AFX_ROOT`
-//! names the SDK. The process must start as the worker's drop-in
-//! (`omarchy-broadcast-audiod.service.d/maxine-afx.conf`) starts the
-//! worker: with the package's environment file, whose `LD_LIBRARY_PATH`
+//! names the SDK. The process must start as the worker runs once it has
+//! applied the SDK package's environment to itself: with the package's
+//! environment file, whose `LD_LIBRARY_PATH`
 //! leads to the feature libraries (the module requires it), and the SDK's
 //! os-release shim preloaded where the distribution needs it:
 //!

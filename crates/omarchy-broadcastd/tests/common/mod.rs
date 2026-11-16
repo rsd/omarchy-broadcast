@@ -268,6 +268,9 @@ impl DaemonEnv {
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_STATE_HOME", &self.state_home)
             .env("XDG_RUNTIME_DIR", &self.runtime_dir)
+            // Never the SDK environment the daemon applies to itself at
+            // start: the test's own environment, on any machine.
+            .env(obc_core::sdk_env::OPT_OUT, "1")
             .stdin(Stdio::null());
         if let Some(dir) = MAXINE_MODULES.get() {
             c.env("OBC_MODULE_PATH", dir);

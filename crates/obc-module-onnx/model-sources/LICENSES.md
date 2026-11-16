@@ -1,6 +1,6 @@
 # Licences of the cut-out models
 
-The open-model cut-out runs four third-party models. Their weights are not in this repository: they are installed beside the module (see the module's [README](../README.md#models)). Each is distributed under the Apache License, Version 2.0, whose text is in [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0) and must be shipped with the files.
+The open-model cut-out runs four third-party models. Their weights are not in this repository: each model is installed as a package of its own, `omarchy-onnx-model-<id>`, from the omarchy-onnx-models repository, with its licence and notice (see the module's [README](../README.md#models)). Each is distributed under the Apache License, Version 2.0, whose text is in [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0) and must be shipped with the files.
 
 **Modified files (Apache-2.0 §4(b)).** The MediaPipe and PP-HumanSeg files are not the upstream files: they were converted by the omarchy-broadcast project from the upstream releases to ONNX (MediaPipe: TFLite to ONNX, with one custom operator replaced by standard ONNX operators; PP-HumanSeg: a Paddle inference model re-saved with a static input shape, then exported to ONNX). The conversion changes the file format, not the weights. How each file was made, and its checksum, is recorded in the omarchy-onnx-models repository, which publishes the files (see [README.md](README.md)). The MODNet file is the upstream ONNX export, unmodified.
 

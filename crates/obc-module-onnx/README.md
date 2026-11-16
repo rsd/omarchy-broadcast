@@ -34,12 +34,13 @@ The library is `crates/obc-module-onnx/target/release/libobc_module_onnx.so`. No
    sed -i 's|^library = .*|library = "libobc_module_onnx.so"|' "$dir/onnx.toml"
    ```
 
-3. **The models**<a id="models"></a>, under the file names of the catalogue, in a model directory (the first that has the file is used):
+3. **The models**<a id="models"></a>: on Arch, the per-model packages `omarchy-onnx-model-<id>` (the default is `omarchy-onnx-model-mediapipe-landscape`) from <https://github.com/rsd/omarchy-onnx-models>, which install the files in `/usr/share/omarchy-onnx-models/`. Otherwise the files, under the file names of the catalogue, in a model directory (the first that has the file is used):
 
    1. the module configuration's `model_dir`;
    2. `$OBC_ONNX_MODEL_DIR`;
    3. `$XDG_DATA_HOME/omarchy-broadcast/models/onnx/` (by default `~/.local/share/omarchy-broadcast/models/onnx/`);
-   4. `/usr/share/omarchy-broadcast/models/onnx/`.
+   4. `/usr/share/omarchy-onnx-models/` (the model packages);
+   5. `/usr/share/omarchy-broadcast/models/onnx/`.
 
    | Model setting | File | SHA-256 |
    |---|---|---|
@@ -48,7 +49,7 @@ The library is `crates/obc-module-onnx/target/release/libobc_module_onnx.so`. No
    | `pphumanseg-v2-lite` | `pp_humansegv2_lite_192x192.onnx` | `ca96b4436f1ce6a76059e8902e20a9617f6829fb11f6c6c9e876563e6352e6b4` |
    | `modnet` | `modnet_photographic.onnx` | `07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9` |
 
-   Each file is checked against its SHA-256 when it loads; a missing or different file fails the load, with a reason that names the file and the directories searched. Install [model-sources/LICENSE-APACHE-2.0](model-sources/LICENSE-APACHE-2.0) and [model-sources/LICENSES.md](model-sources/LICENSES.md) with the files. The files, their conversion scripts and their checksums are published by the omarchy-onnx-models repository; see [model-sources/README.md](model-sources/README.md).
+   Each file is checked against its SHA-256 when it loads; a missing or different file fails the load, with a reason that names the file, the package to install and the directories searched. Install [model-sources/LICENSE-APACHE-2.0](model-sources/LICENSE-APACHE-2.0) and [model-sources/LICENSES.md](model-sources/LICENSES.md) with the files. The files, their conversion scripts and their checksums are published by the omarchy-onnx-models repository; see [model-sources/README.md](model-sources/README.md).
 
 4. `systemctl --user restart omarchy-broadcastd`, then `omarchy-broadcast modules`: the module is listed with its stage, or with the reason it cannot run.
 
@@ -104,7 +105,7 @@ The module asks the loaded runtime which providers it was built with and checks 
 EnvironmentFile=-/usr/share/nvidia-tensorrt/nvidia-tensorrt.env
 ```
 
-then `systemctl --user daemon-reload` and restart the daemon. A TensorRT under `/usr/lib` (the AUR's `tensorrt`) needs nothing. The name sorts after the Maxine drop-in's `maxine.conf`, whose environment file also sets `LD_LIBRARY_PATH` (the later file wins); the Maxine module loads its libraries by absolute path and does not need it. The full procedure is in [docs/setup/onnx.md](../../docs/setup/onnx.md).
+then `systemctl --user daemon-reload` and restart the daemon. A TensorRT under `/usr/lib` (the AUR's `tensorrt`) needs nothing. The daemon never applies the Maxine SDK environment's own `LD_LIBRARY_PATH` (its bundled CUDA and TensorRT libraries would shadow these engines), so the value of this drop-in is the one it runs with; a `maxine.conf` drop-in of an earlier version, which sets it too, is no longer needed and is best removed. The full procedure is in [docs/setup/onnx.md](../../docs/setup/onnx.md).
 
 **The first use of TensorRT** builds an engine for the model and the GPU: from about 6 to 45 seconds. The log says `preparing the TensorRT engine for <model> (first use: this takes a while)…`, then `the TensorRT engine for <model> is ready`, and the load's time (`load_ms`) includes it; later loads read the cache in under a second. A load runs on the effect element's worker thread when the effect is turned on or the camera starts: the picture is then black (at a start) or the camera as it was (turning the effect on mid-stream) until it is ready. A **change of a setting** while the effect runs is a switch, which the streaming thread waits for. So under `auto`, a switch to a model whose TensorRT engine is not in the cache does not build it: it runs on CUDA for now, and the log says `TensorRT engine not built yet; using CUDA for now. It builds at the next camera start.` An explicit `tensorrt` never falls back: its switch builds the engine, and the log says the feed pauses until it is ready.
 

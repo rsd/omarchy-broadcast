@@ -65,20 +65,22 @@
 # SDK). Without its SDK the daemon lists a module greyed out, with the reason,
 # so there is no flag for it. The SDKs and the os-release shim they need come
 # from the maxine-vfx-sdk-local and maxine-ar-sdk-local packages (built from
-# the omarchy-nvidia-sdks repository), and the Maxine drop-in that uses them
-# is a manual step, printed at the end (docs/setup/maxine.md, section 3). The
-# The Maxine audio module (--audio only, like the CPU voice module) is built
-# and installed the same way: it loads its SDK (the maxine-afx-sdk-local
-# package) at run time, and the worker's drop-in that uses it is a manual step,
-# printed at the end (dist/systemd/omarchy-broadcast-audiod.service.d/maxine-afx.conf).
-# The daemon loads a module library once and never reloads it: restart a running
+# the omarchy-nvidia-sdks repository). The Maxine audio module (--audio only,
+# like the CPU voice module) is built and installed the same way: it loads its
+# SDK (the maxine-afx-sdk-local package) at run time. No drop-in is needed for
+# any of them: at start, the installed daemon and audio worker find the SDK
+# environment those packages install (in /usr/share/maxine-vfx,
+# /usr/share/maxine-ar and /usr/share/maxine-afx) and apply it themselves,
+# logging what they applied (OBC_NO_SDK_ENV=1 turns that off). A Maxine
+# drop-in copied by hand for an earlier version keeps working, but is no
+# longer needed. The daemon loads a module library once and never reloads it: restart a running
 # daemon to pick up a rebuilt module. An earlier version of this script
 # installed its own copy of the shim in ~/.local/lib/omarchy-broadcast; a
 # re-run removes that copy (see Ownership).
 #
 # It runs no systemctl command and enables nothing; it prints the next steps.
-# It does not install the WirePlumber drop-in, the Maxine drop-in or, without
-# --mic or --audio, a microphone. The Omarchy bar plugin is a separate project.
+# It does not install the WirePlumber drop-in or, without --mic or --audio, a
+# microphone. The Omarchy bar plugin is a separate project.
 #
 # The two microphones are alternatives: --mic installs the ADR 0014 units
 # (omarchy-broadcast-mic@rnnoise and @deepfilter, one fixed engine each) and
@@ -286,7 +288,6 @@ voice_manifest_dst=$data_dir/omarchy-broadcast/modules.d/$VOICE_MODULE_MANIFEST
 afx_manifest_src=$repo/crates/$AFX_MODULE_CRATE/$AFX_MODULE_MANIFEST
 afx_lib_dst=$data_dir/omarchy-broadcast/modules/$AFX_MODULE_LIB
 afx_manifest_dst=$data_dir/omarchy-broadcast/modules.d/$AFX_MODULE_MANIFEST
-afx_dropin_src=$repo/dist/systemd/omarchy-broadcast-audiod.service.d/maxine-afx.conf
 module_manifest_src=$repo/crates/$MODULE_CRATE/$MODULE_MANIFEST
 module_dir=$data_dir/omarchy-broadcast/modules
 notices_dst=$module_dir/$NOTICES_NAME
@@ -300,9 +301,11 @@ onnx_lib_dst=$module_dir/$ONNX_MODULE_LIB
 onnx_manifest_dst=$data_dir/omarchy-broadcast/modules.d/$ONNX_MODULE_MANIFEST
 onnx_models_root=$data_dir/omarchy-broadcast/models
 onnx_models_dir=$onnx_models_root/onnx
-maxine_src=$repo/dist/systemd/omarchy-broadcastd.service.d/maxine.conf
-# The user's Maxine drop-in, if any: only read, never written.
+# The Maxine drop-ins a user may have copied for an earlier version, if any:
+# only read, never written. They are no longer needed (the daemon and the
+# worker apply the SDK environment themselves).
 maxine_dropin=$config_dir/systemd/user/omarchy-broadcastd.service.d/maxine.conf
+afx_dropin=$config_dir/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf
 
 bin_dsts=()
 for b in "${BINARIES[@]}"; do bin_dsts+=("$bin_dir/$b"); done
@@ -375,22 +378,18 @@ legacy_shim_note() {
 $intro
 $(printf '%q' "$maxine_dropin")
 preloads that shim from ~/.local/lib/omarchy-broadcast, so it no longer
-works. Replace it with the current
-dist/systemd/omarchy-broadcastd.service.d/maxine.conf after installing the
-maxine-vfx-sdk-local package (docs/setup/maxine.md, section 3):
-  install -Dm644 $(printf '%q' "$maxine_src") $(printf '%q' "$maxine_dropin")
-or remove it:
+works. Remove it: it is no longer needed, as the daemon applies the SDK
+environment of the maxine-vfx-sdk-local package itself (docs/setup/maxine.md):
   rm $(printf '%q' "$maxine_dropin")
-then reload:
   systemctl --user daemon-reload
 EOF
   else
     cat <<EOF
 
 $intro
-A Maxine drop-in that still points at it is out of date: replace it with the
-current dist/systemd/omarchy-broadcastd.service.d/maxine.conf, which uses the
-maxine-vfx-sdk-local package (docs/setup/maxine.md, section 3), or remove it.
+A Maxine drop-in that still points at it is out of date: remove it. It is no
+longer needed, as the daemon applies the SDK environment of the
+maxine-vfx-sdk-local package itself (docs/setup/maxine.md).
 EOF
   fi
 }
@@ -715,7 +714,7 @@ host_exec_re='^ExecStart=/usr/bin/pipewire -c omarchy-broadcast-mic\.conf$'
 worker_exec_re='^ExecStart=/usr/bin/omarchy-broadcast-audiod$'
 plugin_re='^([[:space:]]*)plugin = "libomarchy_broadcast_mic"$'
 if ((want_audio)); then
-  for f in "$host_unit_src" "$host_conf_src" "$worker_unit_src" "$worker_socket_src" "$worker_dbus_src" "$voice_manifest_src" "$afx_manifest_src" "$afx_dropin_src" "$notices_src"; do
+  for f in "$host_unit_src" "$host_conf_src" "$worker_unit_src" "$worker_socket_src" "$worker_dbus_src" "$voice_manifest_src" "$afx_manifest_src" "$notices_src"; do
     [[ -f $f ]] || die "missing $f"
   done
   for spec in "$host_exec_re|$host_unit_src" "$worker_exec_re|$worker_unit_src" "$plugin_re|$host_conf_src" "$lib_re|$voice_manifest_src" "$lib_re|$afx_manifest_src"; do
@@ -998,10 +997,9 @@ cat <<EOF
 
 The NVIDIA Maxine video effects module $module_state ($(printf '%q' "$module_lib_dst")).
 Without the Maxine SDK the daemon lists it greyed out, with the reason. To use
-it (docs/setup/maxine.md, section 3), install the maxine-vfx-sdk-local package
-(built from the omarchy-nvidia-sdks repository), then run the daemon with it:
-  install -Dm644 $(printf '%q' "$maxine_src") $(printf '%q' "$maxine_dropin")
-  systemctl --user daemon-reload
+it (docs/setup/maxine.md), install the maxine-vfx-sdk-local package (built from
+the omarchy-nvidia-sdks repository), then restart the daemon, which applies
+the SDK environment itself at start (no drop-in is needed):
   systemctl --user restart omarchy-broadcastd
 A running daemon never reloads a module library: restart it to pick up a
 rebuilt module.
@@ -1019,9 +1017,12 @@ or later (the Arch package onnxruntime).
 EOF
 else
   have_models=0
-  for f in "${ONNX_MODELS[@]}"; do [[ -e $onnx_models_dir/$f ]] && have_models=1; done
+  models_pkg_dir=/usr/share/omarchy-onnx-models
+  for f in "${ONNX_MODELS[@]}"; do
+    [[ -e $onnx_models_dir/$f || -e $models_pkg_dir/$f ]] && have_models=1
+  done
   if ((!have_models)); then
-    printf '\nThe open-model cut-out module %s; it shows "model not installed" until its models are: re-run with OBC_ONNX_MODELS_DIR=<directory of the four .onnx files> (crates/obc-module-onnx/README.md).\n' "$module_state"
+    printf '\nThe open-model cut-out module %s; it shows "model not installed" until a model is: install the package omarchy-onnx-model-mediapipe-landscape (the default; omarchy-onnx-model-<id> for the others, models land in %s), or re-run with OBC_ONNX_MODELS_DIR=<directory of the four .onnx files> (crates/obc-module-onnx/README.md).\n' "$module_state" "$models_pkg_dir"
   fi
 fi
 if ((${#legacy_rm[@]})); then
@@ -1033,6 +1034,16 @@ maxine-vfx-sdk-local package provides it now."
 maxine-vfx-sdk-local package provides it now."
   fi
 fi
+for f in "$maxine_dropin" "$afx_dropin"; do
+  # The shim note above already covers a drop-in that preloads the shim.
+  if ((${#legacy_rm[@]})) && [[ $f == "$maxine_dropin" ]] &&
+    grep -qF -- .local/lib/omarchy-broadcast "$f" 2>/dev/null; then
+    continue
+  fi
+  if [[ -f $f ]]; then
+    printf '\nThe Maxine drop-in %q is no longer needed: the installed daemon and\nworker apply the SDK environment themselves. To remove it:\n  rm %q\n  systemctl --user daemon-reload\n' "$f" "$f"
+  fi
+done
 if ((want_mic)); then
   cat <<EOF
 
@@ -1057,9 +1068,8 @@ mic host only if no ADR 0014 unit (omarchy-broadcast-mic@...) is enabled:
   systemctl --user enable --now omarchy-broadcast-mic.service
 The NVIDIA Maxine audio effects module $module_state ($(printf '%q' "$afx_lib_dst")).
 To use it, install the maxine-afx-sdk-local package (built from
-omarchy-nvidia-sdks) and copy the worker's drop-in:
-  install -Dm644 $(printf '%q' "$afx_dropin_src") $(printf '%q' "$config_dir/systemd/user/omarchy-broadcast-audiod.service.d/maxine-afx.conf")
-Without it the Maxine stages report why they are unavailable, and the CPU
-module keeps the microphone working.
+omarchy-nvidia-sdks): the worker applies the SDK environment itself at start,
+so no drop-in is needed. Without it the Maxine stages report why they are
+unavailable, and the CPU module keeps the microphone working.
 EOF
 fi

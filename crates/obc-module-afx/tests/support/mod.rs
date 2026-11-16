@@ -4,8 +4,9 @@
 //! made of them; the module opened from it with the audio kinds, as the
 //! audio worker opens it; and child processes of a test binary started
 //! with a library search path that leads to a tree's feature libraries, as
-//! the worker's drop-in starts the worker (the dynamic linker reads
-//! `LD_LIBRARY_PATH` once, at process start).
+//! the worker starts once it has applied the SDK package's environment
+//! to itself (the dynamic linker reads `LD_LIBRARY_PATH` once, at process
+//! start).
 
 #![allow(dead_code)] // each test binary uses part of it
 
@@ -174,8 +175,8 @@ impl Tree {
         }
     }
 
-    /// The library search path the worker's drop-in would set for this
-    /// tree: each feature's `lib` directory.
+    /// The library search path the SDK package's environment would set
+    /// for this tree: each feature's `lib` directory.
     pub fn search_path(&self) -> OsString {
         let mut path = OsString::new();
         for (i, (feature, _, _)) in FEATURES.iter().enumerate() {

@@ -257,7 +257,11 @@ impl Module for OnnxModule {
                 .collect();
             return ProbeReport::new().unavailable(
                 STAGE,
-                format!("No cut-out model installed (searched: {})", dirs.join(", ")),
+                format!(
+                    "No cut-out model installed (install omarchy-onnx-model-{}, or another omarchy-onnx-model-<id>; searched: {})",
+                    catalogue::DEFAULT_MODEL,
+                    dirs.join(", ")
+                ),
             );
         }
         for (engine, reason) in engine::static_reasons(&library, self.shared.cuda) {
@@ -917,6 +921,32 @@ mod tests {
     use super::*;
     use obc_module_sdk::{Role, SettingKind};
     use serde_json::json;
+
+    #[test]
+    fn the_probe_without_a_model_names_the_default_package_and_the_directories() {
+        let d = tempfile::tempdir().unwrap();
+        let lib = d.path().join("libonnxruntime.so");
+        std::fs::write(&lib, b"").unwrap();
+        let m = OnnxModule {
+            shared: Arc::new(Shared {
+                library: LibrarySource::Env(lib),
+                model_dirs: vec![d.path().to_path_buf()],
+                threads: 1,
+                caches: Caches { root: None },
+                cuda: false,
+            }),
+        };
+        let report = m.probe();
+        let stage = &report.stages[0];
+        assert!(!stage.available);
+        let reason = stage.reason.as_deref().unwrap();
+        assert!(
+            reason.contains("omarchy-onnx-model-mediapipe-landscape"),
+            "{reason}"
+        );
+        assert!(reason.contains("omarchy-onnx-model-<id>"), "{reason}");
+        assert!(reason.contains(&d.path().display().to_string()), "{reason}");
+    }
 
     #[test]
     fn the_settings_are_the_model_and_the_engine_of_the_background() {

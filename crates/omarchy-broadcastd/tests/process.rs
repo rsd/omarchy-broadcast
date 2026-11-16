@@ -64,12 +64,13 @@ fn without_a_session_bus_it_fails() {
     // A short socket path: the bus is missing, not unaddressable.
     let sockets = common::socket_dir();
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_omarchy-broadcastd"));
-    cmd.env(
-        "DBUS_SESSION_BUS_ADDRESS",
-        format!("unix:path={}", sockets.path().join("no-bus").display()),
-    )
-    .env("XDG_CONFIG_HOME", dir.path())
-    .env("XDG_STATE_HOME", dir.path());
+    cmd.env(obc_core::sdk_env::OPT_OUT, "1")
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", sockets.path().join("no-bus").display()),
+        )
+        .env("XDG_CONFIG_HOME", dir.path())
+        .env("XDG_STATE_HOME", dir.path());
     let (code, stderr) = run(cmd, Duration::from_secs(10));
     assert_eq!(code, Some(1), "{stderr}");
     assert!(stderr.contains("D-Bus"), "{stderr}");
@@ -78,6 +79,7 @@ fn without_a_session_bus_it_fails() {
 #[test]
 fn usage() {
     let help = std::process::Command::new(env!("CARGO_BIN_EXE_omarchy-broadcastd"))
+        .env(obc_core::sdk_env::OPT_OUT, "1")
         .arg("--help")
         .output()
         .unwrap();
@@ -87,6 +89,7 @@ fn usage() {
         assert!(text.contains(flag), "{text}");
     }
     let bad = std::process::Command::new(env!("CARGO_BIN_EXE_omarchy-broadcastd"))
+        .env(obc_core::sdk_env::OPT_OUT, "1")
         .arg("--bogus")
         .output()
         .unwrap();

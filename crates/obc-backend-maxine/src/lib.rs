@@ -102,8 +102,9 @@
 //! the loader found the SDK in. An open that would take the SDK from
 //! anywhere else is refused until the process restarts ([`root_conflict`]).
 //! On a distribution the SDK does not list, the process also needs the
-//! os-release override from the moment it starts (`docs/setup/maxine.md`,
-//! sections 3 and 4).
+//! os-release override from the moment it starts: `omarchy-broadcastd`
+//! applies that of the `maxine-vfx-sdk-local` package to itself when it
+//! starts (`docs/setup/maxine.md`, sections 3 and 4).
 
 use std::cell::RefCell;
 use std::ffi::{CString, c_void};
@@ -698,7 +699,8 @@ fn explain(sdk: &Sdk, call: &str, code: NvCvStatus, model_dir: &Path) -> String 
         }
         ffi::NVCV_ERR_CUDA_KERNEL if call.starts_with("NvVFX_Load") => format!(
             "{base}: the SDK rejected this distribution (its model loader reads \
-             /etc/os-release). Run the process with the os-release override \
+             /etc/os-release). Install the maxine-vfx-sdk-local package: the daemon applies \
+             its os-release override when it starts and logs it, unless OBC_NO_SDK_ENV is set \
              (docs/setup/maxine.md, section 3)"
         ),
         ffi::NVCV_ERR_FILE => format!(
