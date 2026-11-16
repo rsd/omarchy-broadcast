@@ -680,6 +680,7 @@ mod tests {
     const BRIO: &str = include_str!("../tests/data/mx-brio-046d-0944.v4l2-ctl.txt");
     const FHD: &str = include_str!("../tests/data/fhd-camera-5986-1193-colour.v4l2-ctl.txt");
     const FHD_IR: &str = include_str!("../tests/data/fhd-camera-5986-1193-ir.v4l2-ctl.txt");
+    const C930E: &str = include_str!("../tests/data/logitech-c930e-046d-0843.v4l2-ctl.txt");
 
     fn req(s: &str) -> ModeRequest {
         s.parse().unwrap()
@@ -1028,6 +1029,87 @@ mod tests {
         assert_eq!(c.mode, mode("YUY2:640x360@30"));
         assert!(c.exact);
         assert_eq!(c.ingest, IngestPath::CpuConvert);
+    }
+
+    #[test]
+    fn parses_c930e_fixture() {
+        let c = parse_v4l2_ctl(C930E);
+        assert_eq!(c.formats(), vec![PixelFormat::Yuy2, PixelFormat::Mjpeg]);
+        assert!(c.other_formats.is_empty());
+        assert!(c.is_colour());
+        assert_eq!(c.modes.len(), 217);
+        assert!(c.modes.contains(&mode("MJPEG:1920x1080@30")));
+        assert!(c.modes.contains(&mode("YUY2:1920x1080@5")));
+        assert!(c.modes.contains(&mode("YUY2:2560x1472@2")));
+        assert!(c.modes.contains(&mode("YUY2:1600x896@15/2")));
+        // No 60 fps mode at any size, and no 2560x1472 in MJPEG.
+        assert!(!c.modes.iter().any(|m| m.fps_num > 30 * m.fps_den));
+        assert!(!c.modes.contains(&mode("MJPEG:2560x1472@2")));
+    }
+
+    #[test]
+    fn c930e_input_choices_are_mjpeg_sizes_at_30_and_24() {
+        let list = input_mode_choices(&parse_v4l2_ctl(C930E), INPUT_MAX_OPTIONS);
+        assert_eq!(
+            values(&list),
+            vec![
+                "1920x1080@30",
+                "1920x1080@24",
+                "1600x896@30",
+                "1600x896@24",
+                "1280x720@30",
+                "1280x720@24",
+                "1024x576@30",
+                "1024x576@24",
+                "960x540@30",
+                "960x540@24",
+                "800x600@30",
+                "848x480@30",
+                "800x448@30",
+                "640x480@30",
+                "640x360@30",
+            ]
+        );
+    }
+
+    #[test]
+    fn c930e_1080p30_is_mjpeg_exact() {
+        let c = pick(C930E, "1920x1080@30");
+        assert_eq!(c.mode, mode("MJPEG:1920x1080@30"));
+        assert!(c.exact);
+        assert_eq!(c.ingest, IngestPath::CpuDecode);
+        assert!(c.differences.is_empty());
+        // YUYV asked for: 1080p YUYV runs at 5 fps only, so the rate wins.
+        let c = pick(C930E, "YUY2:1920x1080@30");
+        assert_eq!(c.mode, mode("MJPEG:1920x1080@30"));
+        assert!(!c.exact);
+    }
+
+    #[test]
+    fn c930e_60_fps_requests_degrade_to_30_mjpeg() {
+        // The default `camera.mode` (1080p60) on a camera without 60 fps.
+        let c = pick(C930E, "1920x1080@60");
+        assert_eq!(c.mode, mode("MJPEG:1920x1080@30"));
+        assert!(!c.exact);
+        assert_eq!(c.ingest, IngestPath::CpuDecode);
+        assert_eq!(c.differences, vec!["fps 60 -> 30".to_string()]);
+        // 720p60: YUYV 720p is 10 fps at best, MJPEG 30.
+        let c = pick(C930E, "1280x720@60");
+        assert_eq!(c.mode, mode("MJPEG:1280x720@30"));
+        assert!(!c.exact);
+        assert_eq!(c.differences, vec!["fps 60 -> 30".to_string()]);
+    }
+
+    #[test]
+    fn c930e_small_sizes_take_raw_on_the_tie() {
+        let c = pick(C930E, "640x360@30");
+        assert_eq!(c.mode, mode("YUY2:640x360@30"));
+        assert!(c.exact);
+        assert_eq!(c.ingest, IngestPath::CpuConvert);
+        // 960x540 YUYV is 15 fps at best: MJPEG.
+        let c = pick(C930E, "960x540@30");
+        assert_eq!(c.mode, mode("MJPEG:960x540@30"));
+        assert!(c.exact);
     }
 
     #[test]

@@ -35,6 +35,12 @@ pub const CID_HUE: u32 = 0x0098_0903;
 pub const CID_AUTO_WHITE_BALANCE: u32 = 0x0098_090c;
 /// `V4L2_CID_WHITE_BALANCE_TEMPERATURE`
 pub const CID_WHITE_BALANCE_TEMPERATURE: u32 = 0x0098_091a;
+/// `V4L2_CID_GAIN`
+pub const CID_GAIN: u32 = 0x0098_0913;
+/// `V4L2_CID_PAN_ABSOLUTE`
+pub const CID_PAN_ABSOLUTE: u32 = 0x009a_0908;
+/// `V4L2_CID_TILT_ABSOLUTE`
+pub const CID_TILT_ABSOLUTE: u32 = 0x009a_0909;
 
 const fn usb(vendor: u16, product: u16) -> UsbId {
     UsbId { vendor, product }
@@ -154,7 +160,7 @@ pub struct ControlLabel {
     pub model: &'static str,
 }
 
-/// Labels and descriptions of the MX Brio's standard controls.
+/// Labels and descriptions of standard controls, by camera model.
 pub const CONTROL_LABELS: &[ControlLabel] = &[
     // The firmware's HDR mode is the backlight compensation control, and
     // it holds the camera to 30 fps.
@@ -172,6 +178,34 @@ pub const CONTROL_LABELS: &[ControlLabel] = &[
         label: None,
         description: "Logi Tune calls this Low light compensation, with the opposite sense: on here is off there",
         model: "Logitech MX Brio",
+    },
+    // Measured on 2026-11-16: the digital pan and tilt move the picture
+    // only while zoomed in (at zoom 100 a full-range pan or tilt leaves the
+    // picture unchanged; at 200 both move it).
+    ControlLabel {
+        usb: usb(0x046d, 0x0843),
+        cid: CID_PAN_ABSOLUTE,
+        label: None,
+        description: "Pan moves the picture only while zoomed in",
+        model: "Logitech Webcam C930e",
+    },
+    ControlLabel {
+        usb: usb(0x046d, 0x0843),
+        cid: CID_TILT_ABSOLUTE,
+        label: None,
+        description: "Tilt moves the picture only while zoomed in",
+        model: "Logitech Webcam C930e",
+    },
+    // Measured on 2026-11-16: with automatic exposure the camera drives the
+    // gain itself (a written value is replaced within seconds); with manual
+    // exposure the written gain sets the brightness, although the camera
+    // then reports other values for it.
+    ControlLabel {
+        usb: usb(0x046d, 0x0843),
+        cid: CID_GAIN,
+        label: None,
+        description: "With automatic exposure the camera sets the gain itself; set exposure to manual to choose it",
+        model: "Logitech Webcam C930e",
     },
 ];
 
@@ -403,6 +437,11 @@ mod tests {
         let hdr = control_label(Some(BRIO), crate::controls::CID_BACKLIGHT_COMPENSATION).unwrap();
         assert_eq!(hdr.label, Some("HDR"));
         assert!(control_label(Some(C930E), crate::controls::CID_BACKLIGHT_COMPENSATION).is_none());
+        for cid in [CID_PAN_ABSOLUTE, CID_TILT_ABSOLUTE, CID_GAIN] {
+            let row = control_label(Some(C930E), cid).unwrap();
+            assert_eq!(row.label, None, "{cid:#x}");
+            assert!(control_label(Some(BRIO), cid).is_none(), "{cid:#x}");
+        }
         assert!(control_label(None, crate::controls::CID_BACKLIGHT_COMPENSATION).is_none());
     }
 

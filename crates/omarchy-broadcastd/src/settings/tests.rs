@@ -867,6 +867,41 @@ fn the_brio_labels_and_describes_two_standard_controls() {
 }
 
 #[test]
+fn the_c930e_describes_its_gain_pan_and_tilt() {
+    let mut c = Case::brio();
+    c.usb = Some(UsbId {
+        vendor: 0x046d,
+        product: 0x0843,
+    });
+    let s = c.build();
+    for (id, text) in [
+        ("camera.focus.pan_absolute", "only while zoomed in"),
+        ("camera.focus.tilt_absolute", "only while zoomed in"),
+        ("camera.exposure.gain", "set exposure to manual"),
+    ] {
+        let x = setting(&s, id);
+        assert!(
+            x.description.as_deref().is_some_and(|d| d.contains(text)),
+            "{id}: {:?}",
+            x.description
+        );
+    }
+    // The labels and every other setting stay stock.
+    assert_eq!(setting(&s, "camera.exposure.gain").label, "Gain");
+    let backlight = setting(&s, "camera.image.backlight_compensation");
+    assert_eq!(backlight.label, "Backlight compensation");
+    assert_eq!(backlight.description, None);
+    assert_eq!(
+        s.groups()
+            .iter()
+            .flat_map(|g| g.settings.iter())
+            .filter(|x| x.description.is_some())
+            .count(),
+        3
+    );
+}
+
+#[test]
 fn keep_framerate_is_the_inverted_dynamic_framerate() {
     let id = "camera.exposure.keep_framerate";
     let mut c = Case::brio();

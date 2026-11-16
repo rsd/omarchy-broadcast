@@ -1179,6 +1179,10 @@ mod tests {
                 include_str!("../tests/data/fhd-camera-5986-1193-ir.v4l2-ctl.txt"),
                 include_str!("../tests/data/fhd-camera-5986-1193-ir.gst-device-monitor.txt"),
             ),
+            (
+                include_str!("../tests/data/logitech-c930e-046d-0843.v4l2-ctl.txt"),
+                include_str!("../tests/data/logitech-c930e-046d-0843.gst-device-monitor.txt"),
+            ),
         ] {
             let a = parse_v4l2_ctl(ctl);
             let b = capabilities_from_gst(&monitor_caps(mon));
