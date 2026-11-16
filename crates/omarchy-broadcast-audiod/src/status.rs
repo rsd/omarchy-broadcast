@@ -89,6 +89,14 @@ pub struct Status {
     /// daemon keeps the gain it knew).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hardware_gain: crate::mixer::Published,
+    /// A count that moves whenever the mic host's capture node appears in
+    /// PipeWire, goes, or is replaced by another (a new id or
+    /// `object.serial`: the mic host or PipeWire restarted), so that the
+    /// daemon pins the new one (see
+    /// [`crate::pipewire::PipeWireControl::capture_serial`]); 0 until
+    /// PipeWire was first reached. Its value means nothing across worker
+    /// runs.
+    pub capture_serial: u64,
 }
 
 impl Default for Status {
@@ -108,6 +116,7 @@ impl Default for Status {
             voice: -1.0,
             stages: Vec::new(),
             hardware_gain: None,
+            capture_serial: 0,
         }
     }
 }

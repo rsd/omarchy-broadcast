@@ -437,6 +437,8 @@ fn inner() {
     assert_eq!(configured_source(&d).as_deref(), Some("obc-test-mic-a"));
     let r = bus.json("MakeDefault", Some(""));
     assert_eq!(r["previous"], "obc-test-mic-a", "{r}");
+    // The real source in force then, for the daemon to record.
+    assert_eq!(r["in_force"], "obc-test-mic-a", "{r}");
     let d = wait_dump("ours the default, pinned to mic A", secs(5), |d| {
         let capture = id_of(d, "omarchy-broadcast-mic.capture").unwrap();
         configured_source(d).as_deref() == Some("omarchy-broadcast-mic")
@@ -492,6 +494,11 @@ fn inner() {
         configured_source(&d).as_deref(),
         Some("omarchy-broadcast-mic")
     );
+    // The worker tells that it sees a capture node (the daemon pins a new
+    // one again when this moves).
+    bus.wait_status("the capture node seen", |s| {
+        s["capture_serial"].as_u64().is_some_and(|n| n > 0)
+    });
     // Idempotent across a worker restart: the previous default is the pin.
     let r = bus.json("MakeDefault", Some("obc-test-mic-b"));
     assert_eq!(r["previous"], "obc-test-mic-b", "{r}");
@@ -539,6 +546,27 @@ fn inner() {
     // Restore: mic A the default again, the capture side unpinned.
     bus.unit("RestoreDefault", "obc-test-mic-a");
     wait_dump("mic A the default, unpinned", secs(5), |d| {
+        let capture = id_of(d, "omarchy-broadcast-mic.capture").unwrap();
+        configured_source(d).as_deref() == Some("obc-test-mic-a")
+            && meta_get(d, capture, "target.object").is_none()
+            && linked(d, "obc-test-mic-a", "omarchy-broadcast-mic.capture")
+    });
+    // The device chosen pins the capture side with ours not the default,
+    // and never changes the default; the default unpins it again.
+    bus.unit("Pin", "obc-test-mic-b");
+    wait_dump("pinned to mic B, mic A the default", secs(5), |d| {
+        let capture = id_of(d, "omarchy-broadcast-mic.capture").unwrap();
+        configured_source(d).as_deref() == Some("obc-test-mic-a")
+            && meta_get(d, capture, "target.object").map(|v| text(&v))
+                == serial_of(d, "obc-test-mic-b")
+            && linked(d, "obc-test-mic-b", "omarchy-broadcast-mic.capture")
+    });
+    let e = bus
+        .call::<String>("Pin", Some("obc-no-such-mic"))
+        .unwrap_err();
+    assert!(e.contains("InvalidArgs"), "{e}");
+    bus.unit("Pin", "");
+    wait_dump("unpinned again", secs(5), |d| {
         let capture = id_of(d, "omarchy-broadcast-mic.capture").unwrap();
         configured_source(d).as_deref() == Some("obc-test-mic-a")
             && meta_get(d, capture, "target.object").is_none()

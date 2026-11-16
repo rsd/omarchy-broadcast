@@ -47,9 +47,9 @@ use obc_pipeline::ShutterState;
 use obc_pipeline::hid_orientation::Orientation;
 use obc_pipeline::usb_topology::{SharedHub, UsbPlacement, raw_bytes_per_second};
 
-use crate::settings::catalogue::DYNAMIC_FRAMERATE;
+use crate::settings::catalogue::{AUTO_DRIVEN, DYNAMIC_FRAMERATE};
 use crate::settings::effects::GlobalEntry;
-use crate::settings::{CameraSettings, Entry, Target, Values};
+use crate::settings::{CameraSettings, Entry, Target, Values, holds};
 
 /// A raw stream of at least this many bytes per second on a hub shared
 /// with HID devices draws the shared-hub warning: well above what a
@@ -621,17 +621,23 @@ pub fn display(kind: &SettingKind, value: &SettingValue) -> String {
 /// The changes "Use recommended settings" would make to `model`: each
 /// setting whose recommended value ([`recommended_targets`]) differs from
 /// its published one, in the tree's order; `pinned` as for
-/// [`recommended_targets`].
+/// [`recommended_targets`]. Left out: a setting the camera drives itself
+/// ([`auto_owned`]) once the recommendation is applied, which would be
+/// overwritten within seconds and never clear.
 pub fn recommended(
     model: &CameraSettings,
     row: &[(u32, i64)],
     mains: Option<u32>,
     pinned: bool,
 ) -> Vec<Recommended> {
-    recommended_targets(model, row, mains, pinned)
-        .into_iter()
-        .filter_map(|(i, raw)| {
+    let targets = recommended_targets(model, row, mains, pinned);
+    targets
+        .iter()
+        .filter_map(|&(i, raw)| {
             let e = &model.entries[i];
+            if auto_owned(model, &targets, e) {
+                return None;
+            }
             let target = e.values.of(raw)?;
             let current = e.setting.kind.value()?;
             (target != current).then(|| Recommended {
@@ -642,6 +648,42 @@ pub fn recommended(
             })
         })
         .collect()
+}
+
+/// The value of the master `m` once `targets` are applied: its target when
+/// it is among them, else its published value.
+fn value_after(
+    model: &CameraSettings,
+    targets: &[(usize, i32)],
+    m: &Entry,
+) -> Option<SettingValue> {
+    targets
+        .iter()
+        .find(|(i, _)| std::ptr::eq(&model.entries[*i], m))
+        .and_then(|(_, raw)| m.values.of(*raw))
+        .or_else(|| m.setting.kind.value())
+}
+
+/// Whether the camera drives `e` itself once `targets` are applied: a
+/// condition of its `enabled_when` does not hold for its master's value
+/// then, or it is in [`AUTO_DRIVEN`] and its master holds an automatic
+/// option. A master the model lacks leaves it not owned.
+fn auto_owned(model: &CameraSettings, targets: &[(usize, i32)], e: &Entry) -> bool {
+    let ruled = e.setting.enabled_when.iter().any(|cond| {
+        model
+            .get(&cond.id)
+            .is_some_and(|m| !holds(cond, value_after(model, targets, m)))
+    });
+    ruled
+        || AUTO_DRIVEN
+            .iter()
+            .filter(|(control, _, _)| *control == e.name)
+            .any(|(_, master, auto)| {
+                model.by_name(master).is_some_and(|m| {
+                    matches!(value_after(model, targets, m),
+                        Some(SettingValue::Str(id)) if auto.contains(&id.as_str()))
+                })
+            })
 }
 
 /// The rate the capture mode's label shows next, given the one it shows

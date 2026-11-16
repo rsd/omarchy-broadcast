@@ -12,7 +12,8 @@ use obc_ipc::{IpcError, MicStatus, ModuleInfo, SettingKind, SettingValue, Snapsh
 use serde_json::{Value as Json, json};
 
 use super::agent::{
-    Agent, Call, MicEvent, MicRequest, UnitError, Units, Worker, WorkerError, WorkerEvent,
+    Agent, Call, HOST_POLL, MicEvent, MicRequest, PIN_RETRIES, UnitError, Units, Worker,
+    WorkerError, WorkerEvent,
 };
 use super::*;
 use crate::controller::{Command, Note, Published};
@@ -599,8 +600,15 @@ fn the_snapshot_carries_the_config_values_pins_and_disabled_modules() {
             "gpu_warm_s": 30, "gpu_policy": "always", "camera_active": false, "profile": "quality",
             "pins": {}, "values": {}, "disabled_modules": [], "forced_conflicts": false,
             "hardware_gain_db": null, "hardware_gain_serial": 0,
+            "previous_in_force": null,
         })
     );
+    runtime.mic_previous_in_force = Some("alsa_input.pci-dmic".into());
+    assert_eq!(
+        parse(snapshot(&config, &runtime, false, 0))["previous_in_force"],
+        json!("alsa_input.pci-dmic")
+    );
+    runtime.mic_previous_in_force = None;
     config.mic.hardware_gain_db = Some(38.5);
     assert_eq!(
         parse(snapshot(&config, &runtime, false, 0))["hardware_gain_db"],
@@ -762,6 +770,7 @@ fn kind(c: &Call) -> &'static str {
         Call::ApplySnapshot(_) => "ApplySnapshot",
         Call::MakeDefault(_) => "MakeDefault",
         Call::RestoreDefault(_) => "RestoreDefault",
+        Call::Pin(_) => "Pin",
         Call::ResetModule(_) => "ResetModule",
     }
 }
@@ -789,6 +798,7 @@ impl Worker for FakeWorker {
         if !w.running && !(activate && w.installed) {
             return Err(WorkerError {
                 unavailable: true,
+                unknown_method: false,
                 message: "no audio worker".into(),
             });
         }
@@ -856,6 +866,16 @@ struct Rig {
 
 impl Rig {
     fn start(worker: FakeWorker, units: FakeUnits, queued: Vec<MicRequest>) -> Rig {
+        Self::start_polling(worker, units, queued, HOST_POLL)
+    }
+
+    /// [`Rig::start`], the host's state read every `every`.
+    fn start_polling(
+        worker: FakeWorker,
+        units: FakeUnits,
+        queued: Vec<MicRequest>,
+        every: Duration,
+    ) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let (published, notes) = Published::new(Snapshot::empty());
         let (ctx, commands) = std::sync::mpsc::channel();
@@ -870,7 +890,8 @@ impl Rig {
             ctx,
             published,
             Some(dir.path().join("state").join(SNAPSHOT_FILE)),
-        );
+        )
+        .with_host_poll(every);
         tokio::spawn(agent.run(rrx, erx));
         Rig {
             worker,
@@ -1134,15 +1155,57 @@ async fn make_default_hands_back_the_previous_default() {
     let e = rig
         .until(|e| matches!(e, MicEvent::DefaultMade { .. }))
         .await;
-    let MicEvent::DefaultMade { previous, .. } = e else {
+    let MicEvent::DefaultMade {
+        previous, in_force, ..
+    } = e
+    else {
         panic!()
     };
-    assert_eq!(previous, "alsa_input.usb-a");
+    // An older worker: no source in force told.
+    assert_eq!((previous.as_str(), in_force), ("alsa_input.usb-a", None));
+    // A newer one tells the real source in force then (`null`, or empty:
+    // none).
+    for (reply_doc, want) in [
+        (
+            json!({"previous": "alsa_input.usb-a", "in_force": "alsa_input.pci-dmic"}),
+            Some("alsa_input.pci-dmic"),
+        ),
+        (
+            json!({"previous": "alsa_input.usb-a", "in_force": null}),
+            None,
+        ),
+        (
+            json!({"previous": "alsa_input.usb-a", "in_force": ""}),
+            None,
+        ),
+    ] {
+        rig.worker
+            .0
+            .lock()
+            .unwrap()
+            .replies
+            .insert("MakeDefault", Ok(reply_doc.to_string()));
+        let (tx, _rx) = reply();
+        rig.requests
+            .send(MicRequest::MakeDefault {
+                target: String::new(),
+                reply: tx,
+            })
+            .unwrap();
+        let e = rig
+            .until(|e| matches!(e, MicEvent::DefaultMade { .. }))
+            .await;
+        let MicEvent::DefaultMade { in_force, .. } = e else {
+            panic!()
+        };
+        assert_eq!(in_force.as_deref(), want, "{reply_doc}");
+    }
     // A worker that cannot: the reply says why, nothing is recorded.
     rig.worker.0.lock().unwrap().replies.insert(
         "MakeDefault",
         Err(WorkerError {
             unavailable: true,
+            unknown_method: false,
             message: "no PipeWire".into(),
         }),
     );
@@ -1159,12 +1222,387 @@ async fn make_default_hands_back_the_previous_default() {
     }
 }
 
+/// The targets of the `Pin` calls made so far.
+fn pinned(r: &Rig) -> Vec<String> {
+    r.worker
+        .0
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter_map(|c| match c {
+            Call::Pin(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn set_host(units: &FakeUnits, on: bool) {
+    units.0.lock().unwrap().active.insert(HOST_UNIT.into(), on);
+}
+
 #[tokio::test]
-async fn a_repin_asks_the_worker_only_while_the_host_runs_and_records_nothing() {
+async fn a_repin_pins_only_while_the_host_runs_never_makes_the_default_and_records_nothing() {
     let worker = FakeWorker::default();
     worker.0.lock().unwrap().installed = true;
     let units = FakeUnits::default();
     let rig = Rig::start(worker, units.clone(), Vec::new());
+    rig.until(|e| matches!(e, MicEvent::Catalogue(_))).await;
+    // The host is off: nothing is asked.
+    rig.requests
+        .send(MicRequest::Repin {
+            target: "alsa_input.usb-b".into(),
+        })
+        .unwrap();
+    rig.settle().await;
+    assert!(pinned(&rig).is_empty());
+    // On: the worker is asked to pin, with the target (empty: the
+    // default), whether or not ours is the default; never `MakeDefault`,
+    // and no event comes of it.
+    set_host(&units, true);
+    for target in ["alsa_input.usb-b", ""] {
+        rig.requests
+            .send(MicRequest::Repin {
+                target: target.into(),
+            })
+            .unwrap();
+    }
+    rig.wait_for("both re-pins", |r| pinned(r).len() == 2).await;
+    assert_eq!(pinned(&rig), ["alsa_input.usb-b", ""]);
+    rig.settle().await;
+    assert!(!rig.calls().contains(&"MakeDefault"));
+    while let Ok(e) = rig.commands.try_recv() {
+        assert!(
+            !matches!(e, Command::Mic(MicEvent::DefaultMade { .. })),
+            "{e:?}"
+        );
+    }
+    // A worker that cannot (a device not connected): only logged, the
+    // agent goes on.
+    rig.worker.0.lock().unwrap().replies.insert(
+        "Pin",
+        Err(WorkerError {
+            unavailable: false,
+            unknown_method: false,
+            message: "x is not a microphone PipeWire knows now".into(),
+        }),
+    );
+    rig.requests
+        .send(MicRequest::Repin { target: "x".into() })
+        .unwrap();
+    rig.wait_for("the failing re-pin", |r| pinned(r).len() == 3)
+        .await;
+}
+
+#[tokio::test]
+async fn the_device_chosen_is_pinned_when_the_host_comes_on() {
+    let worker = FakeWorker::default();
+    worker.0.lock().unwrap().installed = true;
+    let units = FakeUnits::default();
+    let rig = Rig::start_polling(worker, units.clone(), Vec::new(), Duration::from_millis(50));
+    rig.until(|e| matches!(e, MicEvent::Catalogue(_))).await;
+    rig.requests
+        .send(MicRequest::Repin {
+            target: "alsa_input.usb-b".into(),
+        })
+        .unwrap();
+    rig.settle().await;
+    assert!(pinned(&rig).is_empty());
+    // `mic on`: pinned once the host runs.
+    let (reply, mut rx) = reply();
+    rig.requests
+        .send(MicRequest::Host {
+            on: true,
+            previous: None,
+            reply,
+        })
+        .unwrap();
+    rig.until(|e| matches!(e, MicEvent::HostDone { .. })).await;
+    rig.wait_for("the pin on `mic on`", |r| pinned(r).len() == 1)
+        .await;
+    assert_eq!(pinned(&rig), ["alsa_input.usb-b"]);
+    assert!(rx.try_recv().is_err(), "answered by the controller");
+    // The polls of a host that stays on pin nothing more.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(pinned(&rig).len(), 1);
+    // Off, then on by hand (systemctl): the poll sees it and pins again.
+    set_host(&units, false);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    set_host(&units, true);
+    rig.wait_for("the pin on a host seen on", |r| pinned(r).len() == 2)
+        .await;
+    assert_eq!(pinned(&rig), ["alsa_input.usb-b", "alsa_input.usb-b"]);
+}
+
+#[tokio::test]
+async fn at_start_with_the_host_running_the_device_chosen_is_pinned_once() {
+    let worker = FakeWorker::default();
+    worker.0.lock().unwrap().installed = true;
+    let units = FakeUnits::default();
+    set_host(&units, true);
+    let rig = Rig::start(
+        worker,
+        units,
+        vec![
+            MicRequest::Snapshot("{\"version\":1}".into()),
+            MicRequest::Repin {
+                target: "alsa_input.usb-b".into(),
+            },
+        ],
+    );
+    // The status goes out first (no worker start holds it up).
+    let e = rig.next().await;
+    assert!(matches!(e, MicEvent::Status(_)), "{e:?}");
+    rig.until(|e| matches!(e, MicEvent::Catalogue(_))).await;
+    rig.settle().await;
+    assert_eq!(pinned(&rig), ["alsa_input.usb-b"]);
+}
+
+#[tokio::test]
+async fn a_restore_pins_the_device_chosen_again_and_the_default_stays_unpinned() {
+    let worker = FakeWorker::default();
+    worker.0.lock().unwrap().installed = true;
+    let units = FakeUnits::default();
+    set_host(&units, true);
+    let rig = Rig::start(worker, units, Vec::new());
+    rig.until(|e| matches!(e, MicEvent::Catalogue(_))).await;
+    let restore = |rig: &Rig| {
+        let (reply, _rx) = reply();
+        rig.requests
+            .send(MicRequest::RestoreDefault {
+                previous: "alsa_input.usb-a".into(),
+                reply,
+            })
+            .unwrap();
+    };
+    rig.requests
+        .send(MicRequest::Repin {
+            target: "alsa_input.usb-b".into(),
+        })
+        .unwrap();
+    rig.wait_for("the first pin", |r| pinned(r).len() == 1)
+        .await;
+    restore(&rig);
+    let e = rig
+        .until(|e| matches!(e, MicEvent::DefaultRestored { .. }))
+        .await;
+    assert!(matches!(
+        e,
+        MicEvent::DefaultRestored { result: Ok(()), .. }
+    ));
+    rig.wait_for("the pin after the restore", |r| pinned(r).len() == 2)
+        .await;
+    let calls = rig.calls();
+    let restored = calls.iter().rposition(|c| *c == "RestoreDefault").unwrap();
+    assert_eq!(calls[restored + 1..], ["Pin"]);
+    // A restore that fails pins nothing.
+    rig.worker.0.lock().unwrap().replies.insert(
+        "RestoreDefault",
+        Err(WorkerError {
+            unavailable: false,
+            unknown_method: false,
+            message: "no".into(),
+        }),
+    );
+    restore(&rig);
+    rig.until(|e| matches!(e, MicEvent::DefaultRestored { .. }))
+        .await;
+    rig.settle().await;
+    assert_eq!(pinned(&rig).len(), 2);
+    rig.worker
+        .0
+        .lock()
+        .unwrap()
+        .replies
+        .remove("RestoreDefault");
+    // `default`: unpinned by the restore, and left so.
+    rig.requests
+        .send(MicRequest::Repin {
+            target: String::new(),
+        })
+        .unwrap();
+    rig.wait_for("the unpin", |r| pinned(r).len() == 3).await;
+    restore(&rig);
+    rig.until(|e| matches!(e, MicEvent::DefaultRestored { .. }))
+        .await;
+    rig.settle().await;
+    assert_eq!(pinned(&rig), ["alsa_input.usb-b", "alsa_input.usb-b", ""]);
+}
+
+#[tokio::test]
+async fn a_pin_that_fails_is_tried_again_at_each_poll_a_bounded_number_of_times() {
+    let worker = FakeWorker::default();
+    worker.0.lock().unwrap().installed = true;
+    worker.0.lock().unwrap().replies.insert(
+        "Pin",
+        Err(WorkerError {
+            unavailable: false,
+            unknown_method: false,
+            message: "Omarchy Broadcast Mic is not running".into(),
+        }),
+    );
+    let units = FakeUnits::default();
+    set_host(&units, true);
+    let rig = Rig::start_polling(worker, units, Vec::new(), Duration::from_millis(50));
+    rig.until(|e| matches!(e, MicEvent::Catalogue(_))).await;
+    rig.requests
+        .send(MicRequest::Repin {
+            target: "alsa_input.usb-b".into(),
+        })
+        .unwrap();
+    // Tried at once, then at each poll.
+    let tries = 1 + PIN_RETRIES as usize;
+    rig.wait_for("the retries", |r| pinned(r).len() == tries)
+        .await;
+    // Then only logged: no more tries.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(pinned(&rig).len(), tries);
+    // A pin due afresh is tried at once, and again at the polls.
+    rig.requests
+        .send(MicRequest::Repin {
+            target: "alsa_input.usb-a".into(),
+        })
+        .unwrap();
+    rig.wait_for("the new pin's tries", |r| pinned(r).len() == tries + 2)
+        .await;
+    // Once the mic host's capture node is there, the retry succeeds and
+    // the tries end.
+    rig.worker.0.lock().unwrap().replies.remove("Pin");
+    rig.wait_for("the pin that succeeds", |r| pinned(r).len() == tries + 3)
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(pinned(&rig).len(), tries + 3);
+}
+
+#[tokio::test]
+async fn a_pin_that_failed_waits_for_the_next_poll() {
+    let worker = FakeWorker::default();
+    worker.0.lock().unwrap().installed = true;
+    worker.0.lock().unwrap().replies.insert(
+        "Pin",
+        Err(WorkerError {
+            unavailable: false,
+            unknown_method: false,
+            message: "Omarchy Broadcast Mic is not running".into(),
+        }),
+    );
+    let units = FakeUnits::default();
+    set_host(&units, true);
+    // No poll comes in this test.
+    let rig = Rig::start_polling(worker, units, Vec::new(), Duration::from_secs(3600));
+    rig.until(|e| matches!(e, MicEvent::Catalogue(_))).await;
+    rig.requests
+        .send(MicRequest::Repin {
+            target: "alsa_input.usb-b".into(),
+        })
+        .unwrap();
+    rig.wait_for("the first try", |r| pinned(r).len() == 1)
+        .await;
+    // A worker's status, or the host's state read for a request, is no
+    // retry.
+    rig.events
+        .send(WorkerEvent::Status(
+            json!({"state": "passthrough"}).to_string(),
+        ))
+        .unwrap();
+    let (r, _rx) = reply();
+    rig.requests
+        .send(MicRequest::Host {
+            on: true,
+            previous: None,
+            reply: r,
+        })
+        .unwrap();
+    rig.until(|e| matches!(e, MicEvent::HostDone { .. })).await;
+    rig.settle().await;
+    assert_eq!(pinned(&rig).len(), 1);
+}
+
+#[tokio::test]
+async fn a_new_capture_node_is_pinned_again_between_two_polls() {
+    let worker = FakeWorker::default();
+    {
+        let mut w = worker.0.lock().unwrap();
+        w.installed = true;
+        w.replies.insert(
+            "GetStatus",
+            Ok(json!({"state": "passthrough", "capture_serial": 1}).to_string()),
+        );
+    }
+    let units = FakeUnits::default();
+    set_host(&units, true);
+    // The poll never comes in this test: only the worker's status tells.
+    let rig = Rig::start_polling(worker, units, Vec::new(), Duration::from_secs(3600));
+    rig.until(|e| matches!(e, MicEvent::Catalogue(_))).await;
+    rig.requests
+        .send(MicRequest::Repin {
+            target: "alsa_input.usb-b".into(),
+        })
+        .unwrap();
+    rig.wait_for("the pin", |r| pinned(r).len() == 1).await;
+    let status = |serial: Option<u64>| {
+        let mut v = json!({"state": "passthrough"});
+        if let Some(n) = serial {
+            v["capture_serial"] = json!(n);
+        }
+        rig.events.send(WorkerEvent::Status(v.to_string())).unwrap();
+    };
+    // The worker running: its first status's serial was seen already.
+    rig.events.send(WorkerEvent::Owner(true)).unwrap();
+    rig.settle().await;
+    status(Some(1));
+    rig.settle().await;
+    assert_eq!(pinned(&rig).len(), 1);
+    // The mic host restarted (systemctl restart, within one poll): its
+    // capture node goes and comes back, each a move of the serial.
+    status(Some(2));
+    rig.wait_for("the pin of a capture node gone", |r| pinned(r).len() == 2)
+        .await;
+    status(Some(3));
+    rig.wait_for("the pin of the new capture node", |r| pinned(r).len() == 3)
+        .await;
+    assert_eq!(pinned(&rig), ["alsa_input.usb-b"; 3]);
+    // A worker that does not tell it: nothing more.
+    status(None);
+    rig.settle().await;
+    assert_eq!(pinned(&rig).len(), 3);
+    // The worker gone and back (PipeWire restarted while it did not run):
+    // its first serial is a new capture node to pin.
+    rig.events.send(WorkerEvent::Owner(false)).unwrap();
+    rig.settle().await;
+    status(Some(1));
+    rig.wait_for("the pin after the worker came back", |r| {
+        pinned(r).len() == 4
+    })
+    .await;
+    // With the host off, nothing is pinned.
+    set_host(&rig.units, false);
+    rig.requests
+        .send(MicRequest::Repin {
+            target: "alsa_input.usb-b".into(),
+        })
+        .unwrap();
+    rig.settle().await;
+    status(Some(7));
+    rig.settle().await;
+    assert_eq!(pinned(&rig).len(), 4);
+}
+
+#[tokio::test]
+async fn a_worker_without_pin_is_asked_to_make_the_default_only_while_ours_is_made_default() {
+    let unknown = || {
+        Err(WorkerError {
+            unavailable: false,
+            unknown_method: true,
+            message: "Unknown method Pin".into(),
+        })
+    };
+    let worker = FakeWorker::default();
+    worker.0.lock().unwrap().installed = true;
+    worker.0.lock().unwrap().replies.insert("Pin", unknown());
+    let units = FakeUnits::default();
+    set_host(&units, true);
+    let rig = Rig::start_polling(worker, units, Vec::new(), Duration::from_millis(50));
     rig.until(|e| matches!(e, MicEvent::Catalogue(_))).await;
     let made = |r: &Rig| -> Vec<String> {
         r.worker
@@ -1179,51 +1617,83 @@ async fn a_repin_asks_the_worker_only_while_the_host_runs_and_records_nothing() 
             })
             .collect()
     };
-    // The host is off: nothing is asked.
+    // Ours not made the default here: given up, never retried, and never
+    // `MakeDefault` (it would make ours the default).
     rig.requests
         .send(MicRequest::Repin {
             target: "alsa_input.usb-b".into(),
         })
         .unwrap();
-    rig.settle().await;
+    rig.wait_for("the pin tried", |r| pinned(r).len() == 1)
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(pinned(&rig).len(), 1);
     assert!(made(&rig).is_empty());
-    // On: the worker is asked, with the target (empty: the previous
-    // default), and no event comes of it.
-    units
-        .0
-        .lock()
-        .unwrap()
-        .active
-        .insert(HOST_UNIT.into(), true);
-    for target in ["alsa_input.usb-b", ""] {
-        rig.requests
-            .send(MicRequest::Repin {
-                target: target.into(),
-            })
-            .unwrap();
-    }
-    rig.wait_for("both re-pins", |r| made(r).len() == 2).await;
-    assert_eq!(made(&rig), ["alsa_input.usb-b", ""]);
+    // Made the default: the pin moves with `MakeDefault`, as before `Pin`.
+    let (r, _rx) = reply();
+    rig.requests
+        .send(MicRequest::MakeDefault {
+            target: String::new(),
+            reply: r,
+        })
+        .unwrap();
+    rig.until(|e| matches!(e, MicEvent::DefaultMade { .. }))
+        .await;
+    rig.requests
+        .send(MicRequest::Repin {
+            target: "alsa_input.usb-a".into(),
+        })
+        .unwrap();
+    rig.wait_for("the old way", |r| made(r).len() == 2).await;
+    assert_eq!(made(&rig), ["", "alsa_input.usb-a"]);
+    // Restored: given up again.
+    let (r, _rx) = reply();
+    rig.requests
+        .send(MicRequest::RestoreDefault {
+            previous: "alsa_input.usb-a".into(),
+            reply: r,
+        })
+        .unwrap();
+    rig.until(|e| matches!(e, MicEvent::DefaultRestored { .. }))
+        .await;
+    rig.wait_for("the pin after the restore", |r| pinned(r).len() == 3)
+        .await;
+    rig.requests
+        .send(MicRequest::Repin {
+            target: String::new(),
+        })
+        .unwrap();
+    rig.wait_for("the last pin tried", |r| pinned(r).len() == 4)
+        .await;
     rig.settle().await;
-    while let Ok(e) = rig.commands.try_recv() {
-        assert!(
-            !matches!(e, Command::Mic(MicEvent::DefaultMade { .. })),
-            "{e:?}"
-        );
-    }
-    // A worker that cannot: only logged, the agent goes on.
+    assert_eq!(made(&rig).len(), 2);
+    // Any other failure of `Pin` never falls back.
     rig.worker.0.lock().unwrap().replies.insert(
-        "MakeDefault",
+        "Pin",
         Err(WorkerError {
             unavailable: false,
-            message: "no such node".into(),
+            unknown_method: false,
+            message: "no mic host".into(),
         }),
     );
+    let (r, _rx) = reply();
     rig.requests
-        .send(MicRequest::Repin { target: "x".into() })
+        .send(MicRequest::MakeDefault {
+            target: String::new(),
+            reply: r,
+        })
         .unwrap();
-    rig.wait_for("the failing re-pin", |r| made(r).len() == 3)
+    rig.until(|e| matches!(e, MicEvent::DefaultMade { .. }))
         .await;
+    rig.requests
+        .send(MicRequest::Repin {
+            target: "alsa_input.usb-b".into(),
+        })
+        .unwrap();
+    rig.wait_for("a failing pin", |r| pinned(r).len() == 5)
+        .await;
+    rig.settle().await;
+    assert_eq!(made(&rig).len(), 3, "only the MakeDefault asked for");
 }
 
 #[tokio::test]
@@ -1392,6 +1862,71 @@ async fn mic_off_behind_an_inflight_make_default_still_restores() {
     rig.until(|e| matches!(e, MicEvent::HostDone { .. })).await;
     let calls = rig.worker.0.lock().unwrap().calls.clone();
     assert_eq!(calls.last(), Some(&Call::RestoreDefault(String::new())));
+}
+
+#[tokio::test]
+async fn a_make_with_ours_the_default_already_keeps_the_previous_default_known_here() {
+    let worker = FakeWorker::default();
+    worker.0.lock().unwrap().installed = true;
+    let rig = Rig::start(worker, FakeUnits::default(), Vec::new());
+    let make = |doc: serde_json::Value| {
+        rig.worker
+            .0
+            .lock()
+            .unwrap()
+            .replies
+            .insert("MakeDefault", Ok(doc.to_string()));
+        let (tx, _rx) = reply();
+        rig.requests
+            .send(MicRequest::MakeDefault {
+                target: String::new(),
+                reply: tx,
+            })
+            .unwrap();
+    };
+    let made = || async {
+        let e = rig
+            .until(|e| matches!(e, MicEvent::DefaultMade { .. }))
+            .await;
+        let MicEvent::DefaultMade {
+            previous, already, ..
+        } = e
+        else {
+            panic!()
+        };
+        (previous, already)
+    };
+    let off = || async {
+        let (tx, _rx) = reply();
+        rig.requests
+            .send(MicRequest::Host {
+                on: false,
+                previous: None,
+                reply: tx,
+            })
+            .unwrap();
+        rig.until(|e| matches!(e, MicEvent::HostDone { .. })).await;
+        rig.worker.0.lock().unwrap().calls.last().cloned()
+    };
+    make(json!({"previous": "alsa_input.cmedia", "in_force": "alsa_input.dmic"}));
+    assert_eq!(made().await, ("alsa_input.cmedia".into(), false));
+    // Again, ours the configured default already: the worker names the pin
+    // in force; told to the controller, but the one known here stays.
+    make(json!({"previous": "alsa_input.c930e", "in_force": null, "already": true}));
+    assert_eq!(made().await, ("alsa_input.c930e".into(), true));
+    // `mic off` before the controller's record reached the request: the
+    // first one is restored.
+    assert_eq!(
+        off().await,
+        Some(Call::RestoreDefault("alsa_input.cmedia".into()))
+    );
+    // Nothing known here: `already` records what the worker names.
+    make(json!({"previous": "alsa_input.c930e", "already": true}));
+    made().await;
+    assert_eq!(
+        off().await,
+        Some(Call::RestoreDefault("alsa_input.c930e".into()))
+    );
 }
 
 #[tokio::test]

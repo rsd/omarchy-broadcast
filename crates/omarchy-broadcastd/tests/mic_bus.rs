@@ -39,6 +39,7 @@ async fn within<F: std::future::Future>(what: &str, f: F) -> F::Output {
 struct Seen {
     snapshots: Vec<String>,
     restored: Vec<String>,
+    pinned: Vec<String>,
 }
 
 struct FakeWorker(Arc<Mutex<Seen>>);
@@ -66,6 +67,9 @@ impl FakeWorker {
     async fn restore_default(&self, previous: String) {
         self.0.lock().unwrap().restored.push(previous);
     }
+    async fn pin(&self, target: String) {
+        self.0.lock().unwrap().pinned.push(target);
+    }
     async fn reset_module(&self, id: String) -> zbus::fdo::Result<bool> {
         if id == "nope" {
             return Err(zbus::fdo::Error::InvalidArgs("No module nope".into()));
@@ -81,6 +85,44 @@ impl FakeWorker {
         misses: u32,
         voice: f64,
     ) -> zbus::Result<()>;
+}
+
+/// A worker older than `Pin`.
+struct OldWorker;
+
+#[interface(name = "br.com.dias.OmarchyBroadcast.AudioWorker1")]
+impl OldWorker {
+    async fn get_status(&self) -> String {
+        r#"{"state":"passthrough"}"#.into()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_without_a_method_says_so_apart_from_other_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let bus = PrivateBus::start(dir.path());
+    let conn = connect(&bus).await;
+    let worker = BusWorker::new(conn.clone());
+    let e = within("Pin", worker.call(Call::Pin(String::new()), false))
+        .await
+        .unwrap_err();
+    assert!(e.unavailable && !e.unknown_method, "{e:?}");
+    let _worker_conn = zbus::connection::Builder::address(bus.address.as_str())
+        .serve_at(WORKER_PATH, OldWorker)
+        .name(WORKER_BUS_NAME)
+        .build()
+        .await
+        .unwrap();
+    let e = within("Pin", worker.call(Call::Pin("alsa_input.x".into()), true))
+        .await
+        .unwrap_err();
+    assert!(e.unknown_method && !e.unavailable, "{e:?}");
+    assert_eq!(
+        within("GetStatus", worker.call(Call::GetStatus, false))
+            .await
+            .as_deref(),
+        Ok(r#"{"state":"passthrough"}"#)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -136,6 +178,7 @@ async fn the_worker_is_called_by_name_and_followed_while_it_runs() {
         (Call::MakeDefault("t".into()), r#"{"previous":"was-t"}"#),
         (Call::ApplySnapshot("{\"version\":1}".into()), ""),
         (Call::RestoreDefault("prev".into()), ""),
+        (Call::Pin("alsa_input.x".into()), ""),
         (Call::ResetModule("voice".into()), "true"),
     ] {
         let what = format!("{call:?}");
@@ -153,13 +196,14 @@ async fn the_worker_is_called_by_name_and_followed_while_it_runs() {
     .await
     .unwrap_err();
     assert!(
-        !e.unavailable && e.message.contains("No module nope"),
+        !e.unavailable && !e.unknown_method && e.message.contains("No module nope"),
         "{e:?}"
     );
     {
         let s = seen.lock().unwrap();
         assert_eq!(s.snapshots, ["{\"version\":1}"]);
         assert_eq!(s.restored, ["prev"]);
+        assert_eq!(s.pinned, ["alsa_input.x"]);
     }
 
     // Its signals.

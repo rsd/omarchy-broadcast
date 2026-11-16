@@ -876,7 +876,7 @@ fn conditions(c: &Candidate, all: &[Candidate]) -> Vec<(usize, Condition)> {
 }
 
 /// Whether `cond` holds for the master's value.
-fn holds(cond: &Condition, master: Option<SettingValue>) -> bool {
+pub(crate) fn holds(cond: &Condition, master: Option<SettingValue>) -> bool {
     let Some(v) = master else {
         return true;
     };

@@ -40,18 +40,20 @@ pub enum MicAction {
     /// Choose the microphone it captures: `default` (the system's choice)
     /// or a PipeWire node name, as the Mic panel lists them.
     ///
-    /// The choice takes effect once the Omarchy Broadcast Mic is the
-    /// default microphone (`mic default`, or at once when it already is);
-    /// until then it captures the system's default microphone.
+    /// The choice takes effect at once while the microphone is on,
+    /// whether or not the Omarchy Broadcast Mic is the default microphone.
+    /// With `default` it captures the system's default microphone while
+    /// the Omarchy Broadcast Mic is not the default.
     Device {
         /// `default`, or the node name, e.g. `alsa_input.usb-...`.
         name: String,
     },
     /// Make the Omarchy Broadcast Mic the default microphone (the one
-    /// before is remembered).
+    /// before, and the microphone in use at that moment, are remembered).
     Default,
     /// Make the microphone that was the default before `mic default` the
-    /// default again.
+    /// default again; when it is unplugged, the microphone that was in
+    /// use before comes back.
     RestoreDefault,
 }
 
